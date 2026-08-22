@@ -1,0 +1,441 @@
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#ifndef FLASHINFER_CAKE_BATCH_DEEPGEMM_BODY_FILE
+#error "FLASHINFER_CAKE_BATCH_DEEPGEMM_BODY_FILE must name one exported Cake source"
+#endif
+#ifndef FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL
+#error "FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL must name the exported kernel symbol"
+#endif
+#ifndef FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT
+#error "FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT must identify the shape bucket"
+#endif
+#ifndef FLASHINFER_CAKE_BATCH_DEEPGEMM_N
+#error "FLASHINFER_CAKE_BATCH_DEEPGEMM_N must identify the output width"
+#endif
+#ifndef FLASHINFER_CAKE_BATCH_DEEPGEMM_K
+#error "FLASHINFER_CAKE_BATCH_DEEPGEMM_K must identify the reduction width"
+#endif
+#ifndef FLASHINFER_CAKE_BATCH_DEEPGEMM_SMEM_BYTES
+#error "FLASHINFER_CAKE_BATCH_DEEPGEMM_SMEM_BYTES must identify dynamic shared memory"
+#endif
+#ifndef FLASHINFER_CAKE_BATCH_DEEPGEMM_TARGET_KIND
+#error "FLASHINFER_CAKE_BATCH_DEEPGEMM_TARGET_KIND must identify the exact target"
+#endif
+
+#include <cuda.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <cstdint>
+
+#include "tvm_ffi_utils.h"
+
+// The exported source is frozen and self-contained. Rename its private
+// fixed-width aliases and tensor-map stand-ins at the include boundary so
+// they do not collide with CUDA or libc declarations already in this TU.
+#define uint8_t cake_batch_generated_uint8_t
+#define uint16_t cake_batch_generated_uint16_t
+#define uint32_t cake_batch_generated_uint32_t
+#define uint64_t cake_batch_generated_uint64_t
+#define int32_t cake_batch_generated_int32_t
+#define int16_t cake_batch_generated_int16_t
+#define CakeTensorMap cake_batch_generated_CakeTensorMap
+#define CakeTensorMapPack cake_batch_generated_CakeTensorMapPack
+#define CUtensorMap cake_batch_generated_CUtensorMap
+#include FLASHINFER_CAKE_BATCH_DEEPGEMM_BODY_FILE
+#undef uint8_t
+#undef uint16_t
+#undef uint32_t
+#undef uint64_t
+#undef int32_t
+#undef int16_t
+#undef CakeTensorMap
+#undef CakeTensorMapPack
+#undef CUtensorMap
+
+namespace flashinfer::cake_batch_deepgemm_fp8 {
+
+constexpr int32_t kVariantN128K512 = 0;
+constexpr int32_t kVariantN512K128 = 1;
+constexpr int32_t kVariantN4096K7168 = 2;
+constexpr int32_t kVariantLargeNK = 3;
+constexpr int32_t kVariantShortMN6144K7168 = 4;
+constexpr int32_t kVariantPackScalesM224 = 5;
+constexpr int32_t kVariantSwapM224 = 6;
+constexpr int32_t kVariantTail128 = 7;
+constexpr int32_t kVariantM32N4096K7168S6E1 = 8;
+constexpr int32_t kVariantM32N4096K7168S5E2 = 9;
+constexpr int32_t kVariantM32N7168K2048S5E3 = 10;
+constexpr int32_t kVariantM32N7168K2048S5E2 = 11;
+constexpr int32_t kTargetSM100a = 1000;
+constexpr int32_t kTargetSM103a = 1003;
+constexpr uint32_t kMaxGenericPersistentCtas = 156;
+
+static_assert(FLASHINFER_CAKE_BATCH_DEEPGEMM_TARGET_KIND == kTargetSM100a ||
+                  FLASHINFER_CAKE_BATCH_DEEPGEMM_TARGET_KIND == kTargetSM103a,
+              "Cake batch DeepGEMM FP8 requires exact SM100a or SM103a");
+static_assert(FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT >= kVariantN128K512 &&
+                  FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT <= kVariantM32N7168K2048S5E2,
+              "unknown Cake batch DeepGEMM FP8 variant");
+
+inline void CheckCuda(cudaError_t status, const char* operation) {
+  TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
+}
+
+inline void CheckTarget(int32_t device_id) {
+  int major = 0;
+  int minor = 0;
+  CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
+            "cudaDeviceGetAttribute(major)");
+  CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
+            "cudaDeviceGetAttribute(minor)");
+  constexpr int32_t expected_minor =
+      FLASHINFER_CAKE_BATCH_DEEPGEMM_TARGET_KIND == kTargetSM103a ? 3 : 0;
+  TVM_FFI_ICHECK(major == 10 && minor == expected_minor)
+      << "this Cake batch DeepGEMM FP8 module requires exact compute capability 10."
+      << expected_minor << ", got " << major << "." << minor;
+}
+
+inline bool IsSupportedBatch(int64_t batch) {
+  return batch == 1 || batch == 4 || batch == 6 || batch == 8 || batch == 32 || batch == 64 ||
+         batch == 128 || batch == 256;
+}
+
+inline bool IsSupportedM(int64_t batch, int64_t m) {
+  if (m == 128 || m == 256 || m == 512 || m == 1024 || m == 4096) return true;
+  return (m == 8192 || m == 16384) && batch * m <= 16384;
+}
+
+inline bool IsSupportedNK(int64_t n, int64_t k) {
+#if FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 0 || FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 1 || \
+    FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 2
+  return n == FLASHINFER_CAKE_BATCH_DEEPGEMM_N && k == FLASHINFER_CAKE_BATCH_DEEPGEMM_K;
+#elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 3 || FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 4
+  return (n == 7168 && k == 2048) || (n == 6144 && k == 7168) || (n == 7168 && k == 3072) ||
+         (n == 4096 && k == 4096) || (n == 4096 && k == 2048);
+#elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 5 || FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 6
+  return (n == 7168 && k == 2048) || (n == 6144 && k == 7168) || (n == 7168 && k == 3072) ||
+         (n == 4096 && k == 4096) || (n == 4096 && k == 2048) || (n == 4096 && k == 7168);
+#elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 7
+  return n == 7168 && k == 2048;
+#else
+  return n == FLASHINFER_CAKE_BATCH_DEEPGEMM_N && k == FLASHINFER_CAKE_BATCH_DEEPGEMM_K;
+#endif
+}
+
+inline void CheckDescriptor(const TensorView& desc, const TensorView& reference, const char* name) {
+  CHECK_CUDA(desc);
+  CHECK_DEVICE(reference, desc);
+  CHECK_INPUT_TYPE(desc, dl_uint8);
+  CHECK_CONTIGUOUS(desc);
+  TVM_FFI_ICHECK(desc.ndim() == 1 && desc.numel() == 128)
+      << name << " must be one 128-byte device CUtensorMap";
+}
+
+void Run(TensorView a, TensorView b, TensorView a_scale, TensorView b_scale, TensorView masked_m,
+         TensorView out, TensorView a_desc, TensorView b_desc, TensorView c_desc,
+         TensorView sfa_packed, TensorView sfb_packed, int64_t expected_m, int64_t compute_m_cap) {
+  CHECK_CUDA(a);
+  const int32_t device_id = a.device().device_id;
+  ffi::CUDADeviceGuard device_guard(device_id);
+  CheckTarget(device_id);
+
+  CHECK_CUDA(b);
+  CHECK_CUDA(a_scale);
+  CHECK_CUDA(b_scale);
+  CHECK_CUDA(masked_m);
+  CHECK_CUDA(out);
+  CHECK_CUDA(sfa_packed);
+  CHECK_CUDA(sfb_packed);
+  CHECK_DEVICE(a, b);
+  CHECK_DEVICE(a, a_scale);
+  CHECK_DEVICE(a, b_scale);
+  CHECK_DEVICE(a, masked_m);
+  CHECK_DEVICE(a, out);
+  CHECK_DEVICE(a, sfa_packed);
+  CHECK_DEVICE(a, sfb_packed);
+  CHECK_INPUT_TYPE(a, dl_float8_e4m3fn);
+  CHECK_INPUT_TYPE(b, dl_float8_e4m3fn);
+#if FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT >= 8
+  CHECK_INPUT_TYPE(a_scale, dl_int32);
+  CHECK_INPUT_TYPE(b_scale, dl_int32);
+#else
+  CHECK_INPUT_TYPE(a_scale, dl_float32);
+  CHECK_INPUT_TYPE(b_scale, dl_float32);
+#endif
+  CHECK_INPUT_TYPE(masked_m, dl_int32);
+  CHECK_INPUT_TYPE(out, dl_bfloat16);
+#if FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT >= 8
+  CHECK_INPUT_TYPE(sfa_packed, dl_uint8);
+  CHECK_INPUT_TYPE(sfb_packed, dl_uint8);
+#else
+  CHECK_INPUT_TYPE(sfa_packed, dl_int32);
+  CHECK_INPUT_TYPE(sfb_packed, dl_int32);
+#endif
+  CHECK_CONTIGUOUS(a);
+  CHECK_CONTIGUOUS(b);
+#if FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT < 8
+  CHECK_CONTIGUOUS(a_scale);
+  CHECK_CONTIGUOUS(b_scale);
+#endif
+  CHECK_CONTIGUOUS(masked_m);
+  CHECK_CONTIGUOUS(out);
+#if FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT < 8
+  CHECK_CONTIGUOUS(sfa_packed);
+  CHECK_CONTIGUOUS(sfb_packed);
+#endif
+
+  TVM_FFI_ICHECK(a.ndim() == 3 && b.ndim() == 3) << "a and b must be rank-3 tensors";
+  const int64_t batch = a.size(0);
+  const int64_t m = a.size(1);
+  const int64_t n = b.size(1);
+  const int64_t k = a.size(2);
+  TVM_FFI_ICHECK(IsSupportedBatch(batch)) << "unsupported Cake batch size " << batch;
+  TVM_FFI_ICHECK(IsSupportedM(batch, m)) << "unsupported Cake M shape " << m;
+  TVM_FFI_ICHECK(IsSupportedNK(n, k)) << "unsupported Cake N/K shape " << n << "/" << k;
+  TVM_FFI_ICHECK(a.size(2) == k) << "a must have shape [B,M," << k << "]";
+  TVM_FFI_ICHECK(b.size(0) == batch && b.size(1) == n && b.size(2) == k)
+      << "b must have shape [B," << n << "," << k << "]";
+#if FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT >= 8
+  TVM_FFI_ICHECK(batch == 64 && (m == 256 || m == 512))
+      << "the packed-M32 route requires B64 and M256 or M512";
+  TVM_FFI_ICHECK(a_scale.ndim() == 3 && a_scale.size(0) == batch && a_scale.size(1) == m &&
+                 a_scale.size(2) == k / 512)
+      << "packed a_scale must have shape [B,M,K/512]";
+  TVM_FFI_ICHECK(b_scale.ndim() == 3 && b_scale.size(0) == batch && b_scale.size(1) == n &&
+                 b_scale.size(2) == k / 512)
+      << "packed b_scale must have shape [B,N,K/512]";
+#else
+  TVM_FFI_ICHECK(a_scale.ndim() == 3 && a_scale.size(0) == batch && a_scale.size(1) == m &&
+                 a_scale.size(2) == k / 128)
+      << "a_scale must have shape [B,M,K/128]";
+  TVM_FFI_ICHECK(b_scale.ndim() == 3 && b_scale.size(0) == batch && b_scale.size(1) == n / 128 &&
+                 b_scale.size(2) == k / 128)
+      << "b_scale must have shape [B,N/128,K/128]";
+#endif
+  TVM_FFI_ICHECK(masked_m.ndim() == 1 && masked_m.numel() == batch)
+      << "masked_m must have shape [B]";
+  TVM_FFI_ICHECK(out.ndim() == 3 && out.size(0) == batch && out.size(1) == m && out.size(2) == n)
+      << "out must have shape [B,M,N]";
+  TVM_FFI_ICHECK(expected_m >= 0 && expected_m <= m)
+      << "expected_m must be in [0,M], got " << expected_m;
+#if FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 5 || FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 6 || \
+    FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 7
+  const int64_t packed_cols = k / (128 * 4);
+  TVM_FFI_ICHECK(sfa_packed.ndim() == 3 && sfa_packed.size(0) == batch &&
+                 sfa_packed.size(1) == packed_cols && sfa_packed.size(2) == m)
+      << "sfa_packed must have shape [B,K/512,M]";
+  TVM_FFI_ICHECK(sfb_packed.ndim() == 3 && sfb_packed.size(0) == batch &&
+                 sfb_packed.size(1) == packed_cols && sfb_packed.size(2) == n / 128)
+      << "sfb_packed must have shape [B,K/512,N/128]";
+  TVM_FFI_ICHECK(compute_m_cap > 0 && compute_m_cap <= m)
+      << "compute_m_cap must be in (0,M], got " << compute_m_cap;
+#endif
+#if FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 7
+  TVM_FFI_ICHECK(batch == 64 && m == 256 && n == 7168 && k == 2048)
+      << "the tail128 route requires B64/M256/N7168/K2048";
+#endif
+
+  CheckDescriptor(a_desc, a, "a_desc");
+  CheckDescriptor(b_desc, a, "b_desc");
+#if FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 1 || FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 6 || \
+    FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT >= 8
+  CheckDescriptor(c_desc, a, "c_desc");
+#else
+  (void)c_desc;
+#endif
+#if FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT >= 8
+  CheckDescriptor(sfa_packed, a, "sfa_desc");
+  CheckDescriptor(sfb_packed, a, "sfb_desc");
+#endif
+
+  int32_t num_sms = 0;
+  CheckCuda(cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device_id),
+            "cudaDeviceGetAttribute(multiProcessorCount)");
+  TVM_FFI_ICHECK(num_sms > 0) << "device reports no streaming multiprocessors";
+  const auto stream = get_stream(a.device());
+  CheckCuda(cudaFuncSetAttribute(FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL,
+                                 cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 FLASHINFER_CAKE_BATCH_DEEPGEMM_SMEM_BYTES),
+            "cudaFuncSetAttribute(max dynamic shared memory)");
+
+  cudaLaunchConfig_t config{};
+#if FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 5
+  config.blockDim = dim3(512, 1, 1);
+#elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT >= 8
+  config.blockDim = dim3(256, 1, 1);
+#else
+  config.blockDim = dim3(192, 1, 1);
+#endif
+  config.dynamicSmemBytes = FLASHINFER_CAKE_BATCH_DEEPGEMM_SMEM_BYTES;
+  config.stream = stream;
+  cudaLaunchAttribute attrs[2]{};
+
+  auto* a_tma = reinterpret_cast<cake_batch_generated_CakeTensorMap const*>(a_desc.data_ptr());
+  auto* b_tma = reinterpret_cast<cake_batch_generated_CakeTensorMap const*>(b_desc.data_ptr());
+  auto* a_sf = reinterpret_cast<float*>(a_scale.data_ptr());
+  auto* b_sf = reinterpret_cast<float*>(b_scale.data_ptr());
+  auto* mask = reinterpret_cast<int*>(masked_m.data_ptr());
+  auto* output = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  auto* packed_a = reinterpret_cast<int*>(sfa_packed.data_ptr());
+  auto* packed_b = reinterpret_cast<int*>(sfb_packed.data_ptr());
+
+#if FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 0
+  const uint32_t max_chunks = static_cast<uint32_t>(batch * ((m + 255) / 256));
+  const uint32_t clusters = std::max<uint32_t>(1, std::min<uint32_t>(num_sms / 2, max_chunks));
+  config.gridDim = dim3(clusters * 2, 1, 1);
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim.x = 2;
+  attrs[0].val.clusterDim.y = 1;
+  attrs[0].val.clusterDim.z = 1;
+  attrs[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
+  attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
+  config.attrs = attrs;
+  config.numAttrs = 2;
+  CheckCuda(
+      cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma, a_sf, b_sf,
+                         mask, output, static_cast<int32_t>(batch), static_cast<int32_t>(m)),
+      "Cake N128/K512 launch");
+#elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 1
+  const uint32_t m_tile_bound = static_cast<uint32_t>((expected_m + 127) / 128 + 1);
+  config.gridDim = dim3(static_cast<uint32_t>(batch) * m_tile_bound * 4, 1, 1);
+  auto* c_tma = reinterpret_cast<cake_batch_generated_CakeTensorMap const*>(c_desc.data_ptr());
+  CheckCuda(
+      cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma, c_tma, a_sf,
+                         b_sf, mask, static_cast<uint32_t>(batch), static_cast<uint32_t>(m), 4u),
+      "Cake N512/K128 launch");
+#elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 2
+  config.gridDim = dim3(static_cast<uint32_t>(num_sms), 1, 1);
+  CheckCuda(cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma,
+                               reinterpret_cast<int*>(a_scale.data_ptr()),
+                               reinterpret_cast<int*>(b_scale.data_ptr()), output, mask,
+                               static_cast<uint32_t>(batch), static_cast<uint32_t>(m)),
+            "Cake N4096/K7168 launch");
+#elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 3
+  const uint32_t grid_n = static_cast<uint32_t>(n / 128);
+  const uint32_t k_tiles = static_cast<uint32_t>(k / 256);
+  const uint32_t sf_cols = static_cast<uint32_t>(k / 128);
+  const uint32_t scheduled_pair_blocks = static_cast<uint32_t>((expected_m + 255) / 256 + 1);
+  const uint64_t scheduled_tiles = static_cast<uint64_t>(batch) * scheduled_pair_blocks * grid_n;
+  const uint32_t clusters = std::max<uint32_t>(
+      1, std::min<uint32_t>({static_cast<uint32_t>(num_sms / 2), kMaxGenericPersistentCtas / 2,
+                             static_cast<uint32_t>(scheduled_tiles)}));
+  config.gridDim = dim3(clusters * 2, 1, 1);
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim.x = 2;
+  attrs[0].val.clusterDim.y = 1;
+  attrs[0].val.clusterDim.z = 1;
+  attrs[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
+  attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
+  config.attrs = attrs;
+  config.numAttrs = 2;
+  CheckCuda(cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma,
+                               reinterpret_cast<int*>(a_scale.data_ptr()),
+                               reinterpret_cast<int*>(b_scale.data_ptr()), mask, output,
+                               static_cast<uint32_t>(batch), static_cast<uint32_t>(m), grid_n,
+                               k_tiles, sf_cols, scheduled_pair_blocks),
+            "Cake large-N/K launch");
+#elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 4
+  const uint32_t grid_n = static_cast<uint32_t>(n / 128);
+  const uint32_t k_tiles = static_cast<uint32_t>(k / 256);
+  const uint32_t sf_cols = static_cast<uint32_t>(k / 128);
+  const uint32_t scheduled_m_blocks = static_cast<uint32_t>((expected_m + 127) / 128 + 1);
+  const uint64_t scheduled_tiles = static_cast<uint64_t>(batch) * scheduled_m_blocks * grid_n;
+  config.gridDim = dim3(
+      std::max<uint32_t>(1, std::min<uint32_t>(num_sms, static_cast<uint32_t>(scheduled_tiles))), 1,
+      1);
+  CheckCuda(cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma,
+                               reinterpret_cast<int*>(a_scale.data_ptr()),
+                               reinterpret_cast<int*>(b_scale.data_ptr()), mask, output,
+                               static_cast<uint32_t>(batch), static_cast<uint32_t>(m), grid_n,
+                               k_tiles, sf_cols, scheduled_m_blocks),
+            "Cake short-M N6144/K7168 launch");
+#elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 5
+  const uint32_t scale_pack_blocks =
+      static_cast<uint32_t>(batch) *
+      (static_cast<uint32_t>((m + 47) / 48) + static_cast<uint32_t>((n / 128 + 47) / 48));
+  config.gridDim = dim3(scale_pack_blocks, 1, 1);
+  CheckCuda(cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL,
+                               reinterpret_cast<int*>(a_scale.data_ptr()),
+                               reinterpret_cast<int*>(b_scale.data_ptr()), packed_a, packed_b,
+                               static_cast<uint32_t>(batch), static_cast<uint32_t>(m),
+                               static_cast<uint32_t>(n), static_cast<uint32_t>(k)),
+            "Cake packed-M224 scale-pack launch");
+#elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 6
+  config.gridDim = dim3(std::max(2, num_sms - num_sms % 2), 1, 1);
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim.x = 2;
+  attrs[0].val.clusterDim.y = 1;
+  attrs[0].val.clusterDim.z = 1;
+  attrs[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
+  attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
+  config.attrs = attrs;
+  config.numAttrs = 2;
+  auto* c_tma = reinterpret_cast<cake_batch_generated_CakeTensorMap const*>(c_desc.data_ptr());
+  CheckCuda(cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma, c_tma,
+                               packed_a, packed_b, mask, static_cast<uint32_t>(batch),
+                               static_cast<uint32_t>(m), static_cast<uint32_t>(compute_m_cap),
+                               static_cast<uint32_t>(n), static_cast<uint32_t>(k)),
+            "Cake packed-M224 GEMM launch");
+#elif FLASHINFER_CAKE_BATCH_DEEPGEMM_VARIANT == 7
+  const uint32_t grid_n = static_cast<uint32_t>(n / 128);
+  const uint32_t k_tiles = static_cast<uint32_t>(k / 256);
+  const uint32_t sf_cols = static_cast<uint32_t>(k / 128);
+  const uint32_t scheduled_m_blocks = static_cast<uint32_t>((expected_m + 127) / 128 + 1);
+  const uint64_t scheduled_tiles = static_cast<uint64_t>(batch) * scheduled_m_blocks * grid_n;
+  config.gridDim = dim3(
+      std::max<uint32_t>(1, std::min<uint32_t>(num_sms, static_cast<uint32_t>(scheduled_tiles))), 1,
+      1);
+  CheckCuda(
+      cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma, packed_a,
+                         packed_b, mask, output, static_cast<uint32_t>(batch),
+                         static_cast<uint32_t>(m), grid_n, k_tiles, sf_cols, scheduled_m_blocks),
+      "Cake packed-M224 tail128 launch");
+#else
+  const int32_t cta_reserve = static_cast<int32_t>(compute_m_cap);
+  TVM_FFI_ICHECK(cta_reserve >= 0 && cta_reserve < num_sms)
+      << "packed-M32 CTA reserve must be in [0,num_sms), got " << cta_reserve;
+  int32_t raw_ctas = std::max(2, num_sms - cta_reserve);
+  raw_ctas -= raw_ctas % 2;
+  config.gridDim = dim3(static_cast<uint32_t>(raw_ctas), 1, 1);
+  attrs[0].id = cudaLaunchAttributeClusterDimension;
+  attrs[0].val.clusterDim.x = 2;
+  attrs[0].val.clusterDim.y = 1;
+  attrs[0].val.clusterDim.z = 1;
+  attrs[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
+  attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
+  config.attrs = attrs;
+  config.numAttrs = 2;
+  auto* c_tma = reinterpret_cast<cake_batch_generated_CakeTensorMap const*>(c_desc.data_ptr());
+  auto* sfa_tma =
+      reinterpret_cast<cake_batch_generated_CakeTensorMap const*>(sfa_packed.data_ptr());
+  auto* sfb_tma =
+      reinterpret_cast<cake_batch_generated_CakeTensorMap const*>(sfb_packed.data_ptr());
+  CheckCuda(cudaLaunchKernelEx(&config, FLASHINFER_CAKE_BATCH_DEEPGEMM_KERNEL, a_tma, b_tma, c_tma,
+                               sfa_tma, sfb_tma, mask, static_cast<uint32_t>(batch),
+                               static_cast<uint32_t>(m), static_cast<uint32_t>(n),
+                               static_cast<uint32_t>(k)),
+            "Cake packed-M32 GEMM launch");
+#endif
+}
+
+}  // namespace flashinfer::cake_batch_deepgemm_fp8
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::cake_batch_deepgemm_fp8::Run);

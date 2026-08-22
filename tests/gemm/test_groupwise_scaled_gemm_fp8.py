@@ -324,17 +324,21 @@ def test_fp8_groupwise_group_deepgemm(
 @pytest.mark.parametrize("nk", [(128, 512), (512, 128), (4096, 7168), (7168, 2048)])
 @pytest.mark.parametrize("group_size", [1, 4, 8, 64, 128, 256])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("backend", ["deepgemm", "cake"])
 def test_fp8_groupwise_batch_deepgemm_masked(
     m,
     nk,
     group_size,
     out_dtype,
+    backend,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip(
             "batch_deepgemm_fp8_nt_groupwise is only supported on SM100, SM103, SM107."
         )
+    if backend == "cake" and compute_capability[1] not in (0, 3):
+        pytest.skip("Cake batch DeepGEMM FP8 is only supported on SM100 and SM103.")
     torch.random.manual_seed(0)
     n, k = nk
     a = torch.randn((group_size, m, k), device="cuda", dtype=torch.float32)
@@ -360,11 +364,192 @@ def test_fp8_groupwise_batch_deepgemm_masked(
         masked_m,
         expected_m,
         out_dtype=out_dtype,
+        backend=backend,
     )
     for i in range(group_size):
         torch.testing.assert_close(
             out[i][: masked_m[i]], ref[i][: masked_m[i]], atol=3e-2, rtol=3e-2
         )
+
+
+@pytest.mark.parametrize(
+    ("nk", "expected_m", "masked_m_values"),
+    [
+        ((6144, 7168), 1228, (1057, 1325, 833, 1197, 1203, 1235)),
+        ((6144, 7168), 24, (21, 15, 20, 14, 20, 22)),
+        ((7168, 3072), 24, (20, 24, 16, 17, 24, 21)),
+        ((4096, 4096), 24, (16, 18, 17, 20, 25, 16)),
+        ((4096, 2048), 24, (21, 18, 24, 20, 20, 16)),
+    ],
+)
+def test_fp8_groupwise_batch_deepgemm_cake_deepgemm_benchmark_shapes(
+    nk,
+    expected_m,
+    masked_m_values,
+):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake batch DeepGEMM FP8 is only supported on SM100 and SM103.")
+
+    torch.random.manual_seed(0)
+    group_size, m = 6, 4096
+    n, k = nk
+    a_fp8 = torch.randint(
+        -2, 3, (group_size, m, k), device="cuda", dtype=torch.int8
+    ).to(torch.float8_e4m3fn)
+    b_fp8 = torch.randint(
+        -2, 3, (group_size, n, k), device="cuda", dtype=torch.int8
+    ).to(torch.float8_e4m3fn)
+    a_scale = torch.ones((group_size, m, k // 128), device="cuda", dtype=torch.float32)
+    b_scale = torch.ones(
+        (group_size, n // 128, k // 128), device="cuda", dtype=torch.float32
+    )
+    masked_m = torch.tensor(masked_m_values, device="cuda", dtype=torch.int32)
+
+    out = batch_deepgemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        out_dtype=torch.bfloat16,
+        backend="cake",
+    )
+    for i, valid_rows in enumerate(masked_m_values):
+        for row in {0, valid_rows - 1}:
+            reference = torch.mv(b_fp8[i].float(), a_fp8[i, row].float())
+            torch.testing.assert_close(
+                out[i, row].float(), reference, atol=0.1, rtol=0.1
+            )
+
+
+@pytest.mark.parametrize(
+    ("group_size", "m", "nk", "masked_m_values"),
+    [
+        (
+            64,
+            256,
+            (7168, 2048),
+            tuple(200 + (index % 4) * 16 for index in range(64)),
+        ),
+        (1, 8192, (7168, 2048), (32,)),
+        (1, 16384, (4096, 7168), (64,)),
+        (8, 1024, (4096, 7168), (397, 653, 935, 441, 733, 555, 725, 320)),
+    ],
+)
+def test_fp8_groupwise_batch_deepgemm_cake_packed_m224_routes(
+    group_size,
+    m,
+    nk,
+    masked_m_values,
+):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake batch DeepGEMM FP8 is only supported on SM100 and SM103.")
+
+    torch.random.manual_seed(0)
+    n, k = nk
+    a_fp8 = torch.randint(
+        -2, 3, (group_size, m, k), device="cuda", dtype=torch.int8
+    ).to(torch.float8_e4m3fn)
+    b_fp8 = torch.randint(
+        -2, 3, (group_size, n, k), device="cuda", dtype=torch.int8
+    ).to(torch.float8_e4m3fn)
+    a_scale = torch.ones((group_size, m, k // 128), device="cuda", dtype=torch.float32)
+    b_scale = torch.ones(
+        (group_size, n // 128, k // 128), device="cuda", dtype=torch.float32
+    )
+    masked_m = torch.tensor(masked_m_values, device="cuda", dtype=torch.int32)
+    expected_m = min(sum(masked_m_values) // group_size + 1, m)
+
+    out = batch_deepgemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        out_dtype=torch.bfloat16,
+        backend="cake",
+    )
+    groups_to_check = range(group_size) if group_size <= 8 else (0, 1, 2, 3, 63)
+    for group in groups_to_check:
+        valid_rows = masked_m_values[group]
+        for row in {0, min(223, valid_rows - 1), valid_rows - 1}:
+            reference = torch.mv(b_fp8[group].float(), a_fp8[group, row].float())
+            torch.testing.assert_close(
+                out[group, row].float(), reference, atol=0.1, rtol=0.1
+            )
+
+
+@pytest.mark.parametrize(
+    ("m", "nk", "expected_m"),
+    [
+        (256, (4096, 7168), 1),
+        (256, (4096, 7168), 8),
+        (256, (7168, 2048), 1),
+        (256, (7168, 2048), 8),
+        (512, (4096, 7168), 8),
+        (512, (7168, 2048), 8),
+    ],
+)
+def test_fp8_groupwise_batch_deepgemm_cake_native_packed_scales(
+    m,
+    nk,
+    expected_m,
+):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in ((10, 0), (10, 3)):
+        pytest.skip("Cake batch DeepGEMM FP8 is only supported on SM100 and SM103.")
+
+    torch.random.manual_seed(0)
+    group_size = 64
+    n, k = nk
+    a_fp8 = torch.randint(
+        -2, 3, (group_size, m, k), device="cuda", dtype=torch.int8
+    ).to(torch.float8_e4m3fn)
+    b_fp8 = torch.randint(
+        -2, 3, (group_size, n, k), device="cuda", dtype=torch.int8
+    ).to(torch.float8_e4m3fn)
+    packed_cols = k // 512
+    packed_one = 0x7F7F7F7F
+    a_scale_storage = torch.full(
+        (group_size, packed_cols, m),
+        packed_one,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    b_scale_storage = torch.full(
+        (group_size, packed_cols, n),
+        packed_one,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    a_scale = a_scale_storage.as_strided(
+        (group_size, m, packed_cols), (m * packed_cols, 1, m)
+    )
+    b_scale = b_scale_storage.as_strided(
+        (group_size, n, packed_cols), (n * packed_cols, 1, n)
+    )
+    masked_m = torch.full((group_size,), expected_m, device="cuda", dtype=torch.int32)
+
+    out = batch_deepgemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        out_dtype=torch.bfloat16,
+        backend="cake",
+    )
+    for group in (0, 1, 31, 63):
+        for row in (0, expected_m - 1):
+            reference = torch.mv(b_fp8[group].float(), a_fp8[group, row].float())
+            torch.testing.assert_close(
+                out[group, row].float(), reference, atol=0.1, rtol=0.1
+            )
 
 
 @pytest.mark.parametrize("m", [128, 512])

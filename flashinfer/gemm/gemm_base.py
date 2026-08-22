@@ -8910,7 +8910,9 @@ def _check_batch_deepgemm_fp8_nt_groupwise(
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["deepgemm", "cake"] = "deepgemm",
 ) -> bool:
+    del backend
     from flashinfer.deep_gemm import _check_m_grouped_fp8_gemm_nt_masked_problem_size
 
     if out is None:
@@ -8924,9 +8926,166 @@ def _check_batch_deepgemm_fp8_nt_groupwise(
     )
 
 
+@supported_compute_capability([100, 103])
+def _check_batch_deepgemm_fp8_nt_groupwise_cake(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["deepgemm", "cake"] = "cake",
+) -> bool:
+    del backend
+    if a.ndim != 3 or b.ndim != 3:
+        raise ValueError("Cake batch DeepGEMM FP8 requires rank-3 a and b")
+    batch, m, k = a.shape
+    if b.shape[0] != batch or b.shape[2] != k:
+        raise ValueError("Cake batch DeepGEMM FP8 requires matching B and K")
+    n = b.shape[1]
+    if (n, k) not in {
+        (128, 512),
+        (512, 128),
+        (4096, 7168),
+        (7168, 2048),
+        (6144, 7168),
+        (7168, 3072),
+        (4096, 4096),
+        (4096, 2048),
+    }:
+        raise ValueError(f"Cake batch DeepGEMM FP8 does not support N={n}, K={k}")
+    if batch not in {1, 4, 6, 8, 32, 64, 128, 256}:
+        raise ValueError(f"Cake batch DeepGEMM FP8 does not support B={batch}")
+    if m not in {128, 256, 512, 1024, 4096, 8192, 16384}:
+        raise ValueError(f"Cake batch DeepGEMM FP8 does not support M={m}")
+    if m in {8192, 16384} and batch * m > 16384:
+        raise ValueError(f"Cake batch DeepGEMM FP8 does not support B*M={batch * m}")
+    if scale_granularity_mnk != (1, 128, 128):
+        raise ValueError(
+            "Cake batch DeepGEMM FP8 requires scale granularity (1,128,128)"
+        )
+    if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
+        raise ValueError("Cake batch DeepGEMM FP8 requires float8_e4m3fn a and b")
+    packed_scales = a_scale.dtype == torch.int32 and b_scale.dtype == torch.int32
+    if not packed_scales and (
+        a_scale.dtype != torch.float32 or b_scale.dtype != torch.float32
+    ):
+        raise ValueError(
+            "Cake batch DeepGEMM FP8 requires both scales to be float32 or "
+            "packed int32 UE8M0"
+        )
+    if masked_m.dtype != torch.int32 or masked_m.shape != (batch,):
+        raise ValueError(
+            "Cake batch DeepGEMM FP8 requires int32 masked_m with shape [B]"
+        )
+    if packed_scales:
+        if (
+            batch != 64
+            or m not in {256, 512}
+            or (n, k)
+            not in {
+                (4096, 7168),
+                (7168, 2048),
+            }
+        ):
+            raise ValueError(
+                "Cake packed UE8M0 scales support the serving boundary "
+                "B=64, M in {256,512}, and N/K in {(4096,7168),(7168,2048)}"
+            )
+        packed_cols = k // 512
+        if a_scale.shape != (batch, m, packed_cols):
+            raise ValueError("Cake packed UE8M0 requires a_scale shape [B,M,K/512]")
+        if b_scale.shape != (batch, n, packed_cols):
+            raise ValueError("Cake packed UE8M0 requires b_scale shape [B,N,K/512]")
+        if a_scale.stride() != (m * packed_cols, 1, m):
+            raise ValueError(
+                "Cake packed UE8M0 requires MN-major a_scale stride [M*K/512,1,M]"
+            )
+        if b_scale.stride() != (n * packed_cols, 1, n):
+            raise ValueError(
+                "Cake packed UE8M0 requires MN-major b_scale stride [N*K/512,1,N]"
+            )
+    else:
+        if a_scale.shape != (batch, m, k // 128):
+            raise ValueError(
+                "Cake batch DeepGEMM FP8 requires a_scale shape [B,M,K/128]"
+            )
+        if b_scale.shape != (batch, n // 128, k // 128):
+            raise ValueError(
+                "Cake batch DeepGEMM FP8 requires b_scale shape [B,N/128,K/128]"
+            )
+        if not a_scale.is_contiguous() or not b_scale.is_contiguous():
+            raise ValueError("Cake float32 scales must be contiguous")
+    if not all(
+        tensor.is_cuda and tensor.is_contiguous() for tensor in (a, b, masked_m)
+    ) or not (a_scale.is_cuda and b_scale.is_cuda):
+        raise ValueError(
+            "Cake batch DeepGEMM FP8 data and mask must be contiguous CUDA "
+            "tensors, and scales must be CUDA tensors"
+        )
+    if not isinstance(expected_m, int) or not 0 <= expected_m <= m:
+        raise ValueError(
+            "Cake batch DeepGEMM FP8 expected_m must be an integer in [0,M]"
+        )
+    result_dtype = out.dtype if out is not None else (out_dtype or torch.bfloat16)
+    if result_dtype != torch.bfloat16:
+        raise ValueError("Cake batch DeepGEMM FP8 requires bfloat16 output")
+    if out is not None and (
+        out.shape != (batch, m, n) or out.device != a.device or not out.is_contiguous()
+    ):
+        raise ValueError(
+            "Cake batch DeepGEMM FP8 out must be contiguous [B,M,N] on a.device"
+        )
+    if any(tensor.device != a.device for tensor in (b, a_scale, b_scale, masked_m)):
+        raise ValueError("Cake batch DeepGEMM FP8 inputs must share one CUDA device")
+    return True
+
+
+def _batch_deepgemm_fp8_nt_groupwise_impl(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    a_scale: torch.Tensor,
+    b_scale: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    scale_granularity_mnk: Tuple[int, int, int],
+    out: Optional[torch.Tensor],
+    out_dtype: Optional[torch.dtype],
+    backend: Literal["deepgemm", "cake"],
+) -> torch.Tensor:
+    if out is None:
+        out_dtype = out_dtype or torch.bfloat16
+        out = torch.empty(
+            a.shape[0], a.shape[1], b.shape[1], dtype=out_dtype, device=a.device
+        )
+
+    if backend == "cake":
+        from ..jit.gemm.cake_batch_deepgemm import run_cake_batch_deepgemm_fp8
+
+        run_cake_batch_deepgemm_fp8(a, b, a_scale, b_scale, masked_m, out, expected_m)
+    else:
+        from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
+
+        m_grouped_fp8_gemm_nt_masked(
+            (a, a_scale),
+            (b, b_scale),
+            out,
+            masked_m,
+            expected_m,
+            scale_granularity_mnk,
+        )
+
+    return out
+
+
 @backend_requirement(
-    {},
-    common_check=_check_batch_deepgemm_fp8_nt_groupwise,
+    {
+        "deepgemm": _check_batch_deepgemm_fp8_nt_groupwise,
+        "cake": _check_batch_deepgemm_fp8_nt_groupwise_cake,
+    },
 )
 @flashinfer_api(trace=batch_deepgemm_fp8_nt_groupwise_trace)
 def batch_deepgemm_fp8_nt_groupwise(
@@ -8939,6 +9098,7 @@ def batch_deepgemm_fp8_nt_groupwise(
     scale_granularity_mnk: Tuple[int, int, int] = (1, 128, 128),
     out: Optional[torch.Tensor] = None,  # (batch_size, m, n)
     out_dtype: Optional[torch.dtype] = None,
+    backend: Literal["deepgemm", "cake"] = "deepgemm",
 ):
     r"""Perform batch matrix multiplication with FP8 data types using DeepGEMM backend.
 
@@ -8969,11 +9129,16 @@ def batch_deepgemm_fp8_nt_groupwise(
     a_scale : torch.Tensor
         Scaling factors for tensor `a` of shape ``(batch_size, m, k // block_size)`` with ``torch.float32`` dtype.
         These are typically generated from per-token quantization of the original float32 tensor.
+        With ``backend="cake"``, the SGLang serving boundary also accepts native
+        MN-major packed UE8M0 ``torch.int32`` scales of shape
+        ``(batch_size, m, k // 512)`` without conversion.
 
     b_scale : torch.Tensor
         Scaling factors for tensor `b` of shape ``(batch_size, n // block_size, k // block_size)``
         with ``torch.float32`` dtype. These are typically generated from per-block quantization
         of the original float32 tensor for each group.
+        With ``backend="cake"``, packed UE8M0 scales use shape
+        ``(batch_size, n, k // 512)`` and the same MN-major layout as DeepGEMM.
 
     masked_m : torch.Tensor
         Masking tensor of shape ``(batch_size,)`` with ``torch.int32`` dtype. Each element
@@ -8997,6 +9162,9 @@ def batch_deepgemm_fp8_nt_groupwise(
     out_dtype : Optional[torch.dtype], optional
         Data type of the output tensor. If `out` is provided, this parameter is ignored.
         Default is ``torch.bfloat16``.
+
+    backend : {"deepgemm", "cake"}, optional
+        Kernel backend. The default ``"deepgemm"`` preserves the existing behavior.
 
     Returns
     -------
@@ -9044,19 +9212,31 @@ def batch_deepgemm_fp8_nt_groupwise(
     - All input tensors must be on the same CUDA device
     - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
     """
-    from flashinfer.deep_gemm import m_grouped_fp8_gemm_nt_masked
-
-    if out is None:
-        out_dtype = out_dtype or torch.bfloat16
-        out = torch.empty(
-            a.shape[0], a.shape[1], b.shape[1], dtype=out_dtype, device=a.device
+    if backend == "cake":
+        return _batch_deepgemm_fp8_nt_groupwise_impl(
+            a,
+            b,
+            a_scale,
+            b_scale,
+            masked_m,
+            expected_m,
+            scale_granularity_mnk,
+            out,
+            out_dtype,
+            backend="cake",
         )
-
-    m_grouped_fp8_gemm_nt_masked(
-        (a, a_scale), (b, b_scale), out, masked_m, expected_m, scale_granularity_mnk
+    return _batch_deepgemm_fp8_nt_groupwise_impl(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        masked_m,
+        expected_m,
+        scale_granularity_mnk,
+        out,
+        out_dtype,
+        backend="deepgemm",
     )
-
-    return out
 
 
 @functools.cache
