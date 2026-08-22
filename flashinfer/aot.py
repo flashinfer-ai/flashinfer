@@ -61,6 +61,14 @@ from .jit.fp4_quantization import (
 )
 from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
 from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
+from .jit.cake_kda import (
+    CakeKDATarget,
+    gen_cake_kda_m128_unbounded_softplus_module,
+)
+from .jit.cake_kda_decode import (
+    CAKE_KDA_DECODE_DIRECT_VARIANTS,
+    gen_cake_kda_decode_module,
+)
 from .jit.flash_kda import (
     FlashKDATarget,
     gen_flash_kda_m64_module,
@@ -526,12 +534,21 @@ def gen_all_modules(
     has_flash_kda_prefill_sm100f = sm_capabilities.get(
         "flash_kda_prefill_sm100f", False
     )
+    has_cake_kda_prefill_sm100a = sm_capabilities.get("cake_kda_prefill_sm100a", False)
+    has_cake_kda_prefill_sm103a = sm_capabilities.get("cake_kda_prefill_sm103a", False)
     has_flash_kda_decode_sm100a_legacy = sm_capabilities.get(
         "flash_kda_decode_sm100a_legacy", False
     )
     has_flash_kda_decode_sm100f = sm_capabilities.get("flash_kda_decode_sm100f", False)
     has_flash_kda_decode_sm103a_direct = sm_capabilities.get(
         "flash_kda_decode_sm103a_direct", False
+    )
+    has_cake_kda_decode_sm100a_legacy = sm_capabilities.get(
+        "cake_kda_decode_sm100a_legacy", False
+    )
+    has_cake_kda_decode_sm100f = sm_capabilities.get("cake_kda_decode_sm100f", False)
+    has_cake_kda_decode_sm103a_direct = sm_capabilities.get(
+        "cake_kda_decode_sm103a_direct", False
     )
     has_flash_kda_packed_t1_sm100a = sm_capabilities.get(
         "flash_kda_packed_t1_sm100a", False
@@ -581,6 +598,18 @@ def gen_all_modules(
             )
             jit_specs.append(gen_flash_kda_persistent_m128_module(flash_kda_target))
 
+    # The Cake-owned unbounded-softplus export remains an exact-architecture
+    # artifact on B200 and B300.
+    cake_kda_targets: tuple[tuple[CakeKDATarget, bool], ...] = (
+        ("sm100a", has_cake_kda_prefill_sm100a),
+        ("sm103a", has_cake_kda_prefill_sm103a),
+    )
+    for cake_kda_target, enabled in cake_kda_targets:
+        if enabled:
+            jit_specs.append(
+                gen_cake_kda_m128_unbounded_softplus_module(cake_kda_target)
+            )
+
     # CUDA 12.8 predates the SM100-family target, so B200 keeps one exact
     # SM100a module for every frozen body. CUDA 12.9+ builds the 23-body
     # family portfolio once for both CC 10.0 and CC 10.3. GB300 additionally
@@ -600,6 +629,24 @@ def gen_all_modules(
         jit_specs.extend(
             gen_flash_kda_decode_module(variant, "sm103a")
             for variant in FLASH_KDA_DECODE_DIRECT_VARIANTS
+        )
+
+    # The Cake-owned direct T1 kernels follow the same legacy/family/exact
+    # target policy as the provenanced FlashKDA decode portfolio.
+    if has_cake_kda_decode_sm100a_legacy:
+        jit_specs.extend(
+            gen_cake_kda_decode_module(variant, "sm100a")
+            for variant in CAKE_KDA_DECODE_DIRECT_VARIANTS
+        )
+    if has_cake_kda_decode_sm100f:
+        jit_specs.extend(
+            gen_cake_kda_decode_module(variant, "sm100f")
+            for variant in CAKE_KDA_DECODE_DIRECT_VARIANTS
+        )
+    if has_cake_kda_decode_sm103a_direct:
+        jit_specs.extend(
+            gen_cake_kda_decode_module(variant, "sm103a")
+            for variant in CAKE_KDA_DECODE_DIRECT_VARIANTS
         )
 
     # Packed Kimi K3 decode follows the same legacy-exact/family split.
@@ -1101,6 +1148,14 @@ def detect_sm_capabilities():
             bool(flash_kda_family_arches & compilation_context.TARGET_CUDA_ARCHS)
             and cuda_version >= Version("12.9")
         ),
+        "cake_kda_prefill_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
+        ),
+        "cake_kda_prefill_sm103a": (
+            (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.9")
+        ),
         "sm100f": has_sm("compute_100", "12.9"),
         "flash_kda_decode_sm100a_legacy": (
             (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
@@ -1111,6 +1166,18 @@ def detect_sm_capabilities():
         )
         and cuda_version >= Version("12.9"),
         "flash_kda_decode_sm103a_direct": bool(
+            flash_kda_decode_sm103_arches & compilation_context.TARGET_CUDA_ARCHS
+        )
+        and cuda_version >= Version("12.9"),
+        "cake_kda_decode_sm100a_legacy": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and Version("12.8") <= cuda_version < Version("12.9")
+        ),
+        "cake_kda_decode_sm100f": bool(
+            flash_kda_family_arches & compilation_context.TARGET_CUDA_ARCHS
+        )
+        and cuda_version >= Version("12.9"),
+        "cake_kda_decode_sm103a_direct": bool(
             flash_kda_decode_sm103_arches & compilation_context.TARGET_CUDA_ARCHS
         )
         and cuda_version >= Version("12.9"),

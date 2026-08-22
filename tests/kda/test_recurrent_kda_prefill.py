@@ -30,6 +30,7 @@ kda_decode_api = importlib.import_module("flashinfer.kda_decode")
 kda_api = importlib.import_module("flashinfer.kda")
 kda_prefill_api = importlib.import_module("flashinfer.kda_prefill")
 kda_prefill_cute_api = importlib.import_module("flashinfer.kda_prefill_cute")
+cake_kda_jit_api = importlib.import_module("flashinfer.jit.cake_kda")
 
 
 def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
@@ -39,6 +40,25 @@ def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
         is kda_prefill_api.RecurrentKDAPrefillWorkspace
     )
     assert flashinfer.RecurrentKDAPrefillWrapper is RecurrentKDAPrefillWrapper
+
+
+def test_cake_kda_prefill_jit_surface_includes_checkpoint_aligned_bt64():
+    assert cake_kda_jit_api.CAKE_KDA_VARIANTS == (
+        "m128_unbounded_softplus",
+        "m128_bt64_unbounded_softplus",
+    )
+    for target in ("sm100a", "sm103a"):
+        n32_uri = cake_kda_jit_api.get_cake_kda_uri("m128_unbounded_softplus", target)
+        bt64_uri = cake_kda_jit_api.get_cake_kda_uri(
+            "m128_bt64_unbounded_softplus", target
+        )
+        assert n32_uri != bt64_uri
+        assert bt64_uri.endswith(f"_8f5147c17f_{target}")
+    csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
+    assert (csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus.cu").is_file()
+    assert (
+        csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus_binding.cu"
+    ).is_file()
 
 
 def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device):
@@ -521,12 +541,12 @@ def test_cute_dsl_engine_workspace_query_does_not_read_device_offsets(monkeypatc
     assert kernel_module.workspace_size(cu_seqlens, heads=64) == 0
 
 
-def _strict_prefill_kwargs(inputs):
+def _strict_prefill_kwargs(inputs, *, lower_bound=-5.0):
     return {
         **inputs,
         "use_qk_l2norm_in_kernel": True,
         "use_gate_in_kernel": True,
-        "lower_bound": -5.0,
+        "lower_bound": lower_bound,
         "beta_is_logit": True,
     }
 
@@ -635,7 +655,7 @@ def test_public_prefill_auto_falls_back_for_non_tensor_arguments(
     assert recurrent_kda(**kwargs) is sentinel
 
 
-def _reference(inputs, *, lower_bound=-5.0, scale=None):
+def _reference(inputs, *, lower_bound=-5.0, scale=None, checkpoint_every_n_tokens=0):
     q = inputs["q"]
     batch_size, seq_len, num_heads, head_dim = q.shape
     scale = head_dim**-0.5 if scale is None else scale
@@ -644,10 +664,15 @@ def _reference(inputs, *, lower_bound=-5.0, scale=None):
     v_flat = inputs["v"].float().reshape(-1, num_heads, head_dim)
     g_flat = inputs["g"].float().reshape(-1, num_heads, head_dim)
     beta_flat = torch.sigmoid(inputs["beta"].float().reshape(-1, num_heads))
-    gate = lower_bound * torch.sigmoid(
-        torch.exp(inputs["A_log"]).reshape(1, num_heads, 1)
-        * (g_flat + inputs["dt_bias"].reshape(1, num_heads, head_dim))
-    )
+    gate_input = g_flat + inputs["dt_bias"].reshape(1, num_heads, head_dim)
+    if lower_bound is None:
+        gate = -torch.exp(inputs["A_log"]).reshape(1, num_heads, 1) * F.softplus(
+            gate_input
+        )
+    else:
+        gate = lower_bound * torch.sigmoid(
+            torch.exp(inputs["A_log"]).reshape(1, num_heads, 1) * gate_input
+        )
     decay = torch.exp(gate)
     if inputs["cu_seqlens"] is None:
         offsets = [index * seq_len for index in range(batch_size + 1)]
@@ -662,8 +687,14 @@ def _reference(inputs, *, lower_bound=-5.0, scale=None):
     else:
         state = inputs["initial_state"].clone()
     out = torch.empty_like(q_flat)
+    checkpoints = []
     for sequence in range(len(offsets) - 1):
-        for token in range(offsets[sequence], offsets[sequence + 1]):
+        if checkpoint_every_n_tokens:
+            checkpoints.append(state[sequence].clone())
+        sequence_length = offsets[sequence + 1] - offsets[sequence]
+        for local_token, token in enumerate(
+            range(offsets[sequence], offsets[sequence + 1]), start=1
+        ):
             state_f32 = state[sequence].float()
             decayed = state_f32 * decay[token].unsqueeze(1)
             predicted = torch.einsum("hk,hvk->hv", k_flat[token], decayed)
@@ -674,7 +705,16 @@ def _reference(inputs, *, lower_bound=-5.0, scale=None):
                 "hk,hvk->hv", q_flat[token], state[sequence].float()
             )
             out[token] = (scale * projected).to(torch.bfloat16)
-    return out.reshape_as(q), state
+            if (
+                checkpoint_every_n_tokens
+                and local_token % checkpoint_every_n_tokens == 0
+                and local_token < sequence_length
+            ):
+                checkpoints.append(state[sequence].clone())
+    result = (out.reshape_as(q), state)
+    if checkpoint_every_n_tokens:
+        return (*result, torch.stack(checkpoints))
+    return result
 
 
 def _h12_bf16_residual_carriers(torch, *, value, prediction, beta_logit):
@@ -951,6 +991,25 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
 
 
 def test_variant_selector_exposes_specialized_routes_only_when_requested():
+    assert (
+        kda_prefill_api._select_flash_kda_prefill_variant(
+            fixed_layout=False,
+            num_sequences=2,
+            num_heads=4,
+            unbounded_softplus=True,
+        )
+        == "m128_unbounded_softplus"
+    )
+    assert (
+        kda_prefill_api._select_flash_kda_prefill_variant(
+            fixed_layout=False,
+            num_sequences=2,
+            num_heads=4,
+            unbounded_softplus=True,
+            use_bt64_unbounded_softplus=True,
+        )
+        == "m128_bt64_unbounded_softplus"
+    )
     assert (
         kda_prefill_api._select_flash_kda_prefill_variant(
             fixed_layout=True,
@@ -1231,6 +1290,128 @@ def test_frozen_route_and_ffi_abi(
         assert args[27] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
     if num_heads % 8 != 0:
         assert args[5].data_ptr() != inputs["beta"].data_ptr()
+
+
+@pytest.mark.parametrize("num_heads", [4, 8, 16, 32])
+@pytest.mark.parametrize(
+    ("compute_capability", "expected_target"),
+    [((10, 0), "sm100a"), ((10, 3), "sm103a")],
+)
+def test_unbounded_softplus_prefill_routes_to_cake_runtime_head_module(
+    cuda_device, monkeypatch, num_heads, compute_capability, expected_target
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: compute_capability,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_is_cuda_version_at_least", lambda version: True
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    routes = []
+
+    def get_cake_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(
+        kda_prefill_api, "_get_cake_kda_prefill_module", get_cake_module
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        lambda variant, target: pytest.fail(
+            f"unbounded route reached provenanced FlashKDA module {variant}/{target}"
+        ),
+    )
+    inputs = _make_inputs(
+        seq_lens=[33, 65],
+        num_heads=num_heads,
+        packed=True,
+    )
+    output, state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs, lower_bound=None),
+        output=torch.empty_like(inputs["q"]),
+    )
+
+    assert output.shape == inputs["q"].shape
+    assert state is None
+    assert routes == [("m128_unbounded_softplus", expected_target)]
+    (args,) = module.calls
+    assert len(args) == 28
+    assert args[18] == num_heads
+    assert args[26] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "checkpoint_every_n_tokens", "checkpoint_cu_starts", "expected"),
+    [
+        (4, 64, [0, 2, 5], "m128_bt64_unbounded_softplus"),
+        (4, 32, [0, 3, 8], "m128_unbounded_softplus"),
+        (8, 64, [0, 2, 5], "m128_unbounded_softplus"),
+    ],
+)
+def test_unbounded_softplus_bt64_route_is_checkpoint_and_head_specific(
+    cuda_device,
+    monkeypatch,
+    num_heads,
+    checkpoint_every_n_tokens,
+    checkpoint_cu_starts,
+    expected,
+):
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_is_cuda_version_at_least", lambda version: True
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    routes = []
+
+    def get_cake_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(
+        kda_prefill_api, "_get_cake_kda_prefill_module", get_cake_module
+    )
+    inputs = _make_inputs(
+        seq_lens=[65, 131],
+        num_heads=num_heads,
+        packed=True,
+    )
+    checkpoint_cu_starts_tensor = torch.tensor(
+        checkpoint_cu_starts, dtype=torch.int64, device=cuda_device
+    )
+    state_checkpoints = torch.empty(
+        (checkpoint_cu_starts[-1], num_heads, 128, 128),
+        dtype=torch.bfloat16,
+        device=cuda_device,
+    )
+
+    output, state, returned_checkpoints = recurrent_kda(
+        **_strict_prefill_kwargs(inputs, lower_bound=None),
+        output=torch.empty_like(inputs["q"]),
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts_tensor,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        backend="cake",
+    )
+
+    assert output.shape == inputs["q"].shape
+    assert state is None
+    assert returned_checkpoints is state_checkpoints
+    assert routes == [(expected, "sm100a")]
+    (args,) = module.calls
+    assert len(args) == 28
+    assert args[14].data_ptr() == state_checkpoints.data_ptr()
+    assert args[15].data_ptr() == checkpoint_cu_starts_tensor.data_ptr()
+    assert args[18] == num_heads
+    assert args[24] == checkpoint_every_n_tokens
+    assert args[26] == 0.0
 
 
 @pytest.mark.parametrize("sm_count", [148, 152])
@@ -2460,6 +2641,144 @@ def test_cute_dsl_padded_indexed_state_matches_cake(
         torch.testing.assert_close(
             cute_value.float(), cake_value.float(), atol=1e-2, rtol=1e-2
         )
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "checkpoint_every_n_tokens"),
+    [
+        (1, 64),
+        (2, 64),
+        (4, 32),
+        (4, 64),
+        (8, 64),
+        (16, 64),
+        (32, 64),
+    ],
+)
+def test_frozen_unbounded_softplus_tp_shapes_strided_beta_state_and_checkpoints(
+    flash_kda_device, num_heads, checkpoint_every_n_tokens
+):
+    inputs = _make_inputs(
+        seq_lens=[65, 131],
+        num_heads=num_heads,
+        packed=True,
+        initial_state=True,
+        seed=2088 + num_heads,
+    )
+    compact_initial_state = inputs["initial_state"].clone()
+    beta_carrier = torch.empty(
+        (inputs["q"].shape[1], num_heads + 16),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+    )
+    beta_carrier[:, 8 : 8 + num_heads].copy_(inputs["beta"][0])
+    inputs["beta"] = beta_carrier[None, :, 8 : 8 + num_heads]
+    expected_output, expected_state, expected_checkpoints = _reference(
+        {**inputs, "initial_state": compact_initial_state},
+        lower_bound=None,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+    )
+
+    state_slot_numel = num_heads * 128 * 128
+    state_storage = torch.zeros(
+        (5, state_slot_numel + 64),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+    )
+    state_pool = state_storage.as_strided(
+        (5, num_heads, 128, 128),
+        (state_storage.stride(0), 128 * 128, 128, 1),
+    )
+    state_indices = torch.tensor([1, 3], dtype=torch.int32, device=flash_kda_device)
+    state_indices_i64 = state_indices.to(torch.int64)
+    state_pool[state_indices_i64] = compact_initial_state
+    untouched_before = state_pool[[0, 2, 4]].clone()
+    inputs["initial_state"] = state_pool
+    checkpoint_counts = [
+        (seq_len + checkpoint_every_n_tokens - 1) // checkpoint_every_n_tokens
+        for seq_len in (65, 131)
+    ]
+    checkpoint_cu_starts = torch.tensor(
+        [0, checkpoint_counts[0], sum(checkpoint_counts)],
+        dtype=torch.int64,
+        device=flash_kda_device,
+    )
+    state_checkpoints = torch.empty(
+        (sum(checkpoint_counts), num_heads, 128, 128),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+    )
+
+    actual_output, actual_state, actual_checkpoints = recurrent_kda(
+        **_strict_prefill_kwargs(inputs, lower_bound=None),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        ssm_state_indices=state_indices,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+    )
+
+    assert actual_state is state_pool
+    assert actual_checkpoints is state_checkpoints
+    assert inputs["beta"].data_ptr() == beta_carrier[:, 8 : 8 + num_heads].data_ptr()
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        state_pool[state_indices_i64].float(),
+        expected_state.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        actual_checkpoints.float(),
+        expected_checkpoints.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(state_pool[[0, 2, 4]], untouched_before)
+
+
+def test_frozen_unbounded_softplus_h32_prefix_resume_matches_uninterrupted(
+    flash_kda_device,
+):
+    """A BF16 radix checkpoint must reproduce uninterrupted prefill exactly."""
+
+    inputs = _make_inputs(
+        seq_lens=[321],
+        num_heads=32,
+        packed=False,
+        initial_state=True,
+        seed=2091,
+    )
+    initial_state = inputs["initial_state"].clone()
+
+    def run_slice(start, end, state):
+        sliced = {
+            **inputs,
+            "q": inputs["q"][:, start:end],
+            "k": inputs["k"][:, start:end],
+            "v": inputs["v"][:, start:end],
+            "g": inputs["g"][:, start:end],
+            "beta": inputs["beta"][:, start:end],
+            "initial_state": state,
+        }
+        return recurrent_kda(
+            **_strict_prefill_kwargs(sliced, lower_bound=None),
+            output_final_state=True,
+        )
+
+    full_output, full_state = run_slice(0, 321, initial_state.clone())
+    resumed_state = initial_state.clone()
+    prefix_output, returned_prefix_state = run_slice(0, 256, resumed_state)
+    assert returned_prefix_state is resumed_state
+    suffix_output, returned_suffix_state = run_slice(256, 321, resumed_state)
+    assert returned_suffix_state is resumed_state
+
+    resumed_output = torch.cat((prefix_output, suffix_output), dim=1)
+    torch.testing.assert_close(resumed_output, full_output, atol=0, rtol=0)
+    torch.testing.assert_close(returned_suffix_state, full_state, atol=0, rtol=0)
 
 
 def test_frozen_prefill_m64_matches_reference(flash_kda_device):
