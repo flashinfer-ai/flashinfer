@@ -25,7 +25,7 @@ from flashinfer.deep_gemm import get_col_major_tma_aligned_packed_tensor
 from flashinfer.grouped_mm import moe_gemm_mxfp8_nt_groupwise
 from flashinfer.grouped_mm.cute_sm120_mxfp8_groupwise.core import (
     _CuteSm120Mxfp8MoeRunner,
-    _MXFP8_MOE_TACTICS,
+    _MXFP8_MOE_PLAIN_TACTICS_GRANK32,
     _MXFP8_MOE_TACTICS_GRANK128,
 )
 from flashinfer.utils import is_sm120a_supported
@@ -436,7 +436,7 @@ def test_moe_gemm_mxfp8_nt_groupwise_gated(
 @pytest.mark.parametrize("is_gated", [False, True])
 @pytest.mark.parametrize(
     "k_gran,tactic",
-    [(32, tactic) for tactic in _MXFP8_MOE_TACTICS]
+    [(32, tactic) for tactic in _MXFP8_MOE_PLAIN_TACTICS_GRANK32]
     + [(128, tactic) for tactic in _MXFP8_MOE_TACTICS_GRANK128],
 )
 @pytest.mark.parametrize(
@@ -447,6 +447,8 @@ def test_moe_gemm_mxfp8_nt_groupwise_gated(
 def test_moe_gemm_mxfp8_nt_groupwise_forced_tactic(
     tactic, is_gated, k_gran, expert_rows, physical_n, k
 ):
+    if is_gated and k_gran == 32 and tactic[1:] == (128, 128):
+        pytest.skip("GranK=32 gated MXFP8 does not expose (128, 128) tuned tactic")
     skip_if_not_sm120()
     torch.random.manual_seed(0)
     num_groups = 4
