@@ -22,7 +22,7 @@ deterministic tiny Llama. Reproduce in an isolated CPU environment with::
         torch==2.8.0 torchvision==0.23.0
     python -m pip install nvidia-modelopt[hf]==0.45.0 \
         transformers==5.2.0 safetensors==0.7.0
-    python tests/moe/generate_modelopt_nvfp4_golden.py
+    python tests/moe_ep/generate_modelopt_nvfp4_golden.py
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-"""SM90 push runners for NVFP4 W4A8 and W4A16-RS weights."""
+"""SM90 push runner for packed and folded NVFP4 W4A8 weights."""
 
 from __future__ import annotations
 
@@ -9,12 +9,10 @@ from typing import Any, Protocol, TypeAlias, cast
 
 import torch
 
-from ......fused_moe.sm90_nvfp4_repack import (
-    NVFP4RSWeightView,
+from .nvfp4_repack import (
     NVFP4SM90WeightViewV3,
     NVFP4SM90WeightViewV4,
 )
-from .nvfp4_rs_gemm import create_sm90_push_nvfp4_rs_gemm_runner
 from .nvfp4_w4a8_gemm import (
     _W4A8ScheduleWorkspace,
     create_sm90_push_nvfp4_w4a8_gemm,
@@ -25,7 +23,7 @@ from .nvfp4_weights import (
     Sm90PushNvFp4HotFoldedWeights,
     Sm90PushNvFp4Weights,
 )
-from .protocol import Sm90PushCombine, Sm90PushPipe, _run_guarded_phase
+from .protocol import Sm90PushPipe, _run_guarded_phase
 from .runner import Sm90PushMoERunner
 
 W4A8WeightView: TypeAlias = NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4
@@ -222,8 +220,6 @@ class _LegacyW4A8PairEngine:
     def validate_weights(self, weights: object) -> None:
         if not isinstance(weights, Sm90PushNvFp4Weights):
             raise TypeError("legacy W4A8 engine requires Sm90PushNvFp4Weights")
-        if weights.nvfp4_mode != "w4a8":
-            raise ValueError("legacy W4A8 engine requires w4a8 weights")
         for view in (weights.w13, weights.w2):
             if not isinstance(view, (NVFP4SM90WeightViewV3, NVFP4SM90WeightViewV4)):
                 raise TypeError("legacy W4A8 engine requires two W4A8 views")
@@ -686,8 +682,6 @@ class _DualW4A8PairEngine:
         )
 
     def _validate_packed(self, packed: Sm90PushNvFp4Weights) -> None:
-        if packed.nvfp4_mode != "w4a8":
-            raise ValueError("dual packed weights must use W4A8")
         for view in (packed.w13, packed.w2):
             if not isinstance(view, (NVFP4SM90WeightViewV3, NVFP4SM90WeightViewV4)):
                 raise TypeError("dual packed weights must contain W4A8 views")
@@ -731,10 +725,6 @@ class _DualW4A8PairEngine:
 class Sm90PushNvFp4MoERunner(Sm90PushMoERunner):
     """Two-phase SM90 push runner selected by a typed NVFP4 weight bundle."""
 
-    # W4A8 binds a pair engine; W4A16-RS binds the FFI runner objects.
-    fc1: Any
-    fc2: Any
-
     def __init__(
         self,
         pipe: Sm90PushPipe,
@@ -744,9 +734,6 @@ class Sm90PushNvFp4MoERunner(Sm90PushMoERunner):
             | Sm90PushNvFp4DualWeights
         ),
         *,
-        rs_n_tactic: int = 64,
-        rs_stages: int = 3,
-        rs_stage_k: int = 64,
         tma_cache_capacity: int = 128,
         n64_expected_m_per_sm: float = 4.0,
         payload_layout: int = 4,
@@ -763,12 +750,6 @@ class Sm90PushNvFp4MoERunner(Sm90PushMoERunner):
             raise TypeError("weights must be a typed SM90 push NVFP4 bundle")
         self._init_round_state(pipe)
         self.weights = weights
-        self.nvfp4_mode = (
-            weights.nvfp4_mode if isinstance(weights, Sm90PushNvFp4Weights) else "w4a8"
-        )
-        self._rs_n_tactic = int(rs_n_tactic)
-        self._rs_stages = int(rs_stages)
-        self._rs_stage_k = int(rs_stage_k)
         self._tma_cache_capacity = int(tma_cache_capacity)
         self._n64_expected_m_per_sm = float(n64_expected_m_per_sm)
         self._payload_layout = int(payload_layout)
@@ -777,42 +758,24 @@ class Sm90PushNvFp4MoERunner(Sm90PushMoERunner):
         def _local_init() -> tuple[object, ...]:
             if pipe.config.fuse_fc1_epilogue:
                 raise ValueError("SM90 push NVFP4 does not support fused FC1")
-            if self.nvfp4_mode == "w4a8":
-                packed = None
-                if isinstance(weights, Sm90PushNvFp4Weights):
-                    packed = weights
-                elif isinstance(weights, Sm90PushNvFp4HotFoldedWeights):
-                    packed = weights.cold_nvfp4
-                elif isinstance(weights, Sm90PushNvFp4DualWeights):
-                    packed = weights.packed_nvfp4
-                if packed is not None:
-                    layout = cast(W4A8WeightView, packed.w13).manifest.layout_version
-                    if layout != self._payload_layout:
-                        raise ValueError(
-                            "NVFP4 payload layout does not match the runner config"
-                        )
-                    if layout == 3 and not self._allow_legacy_layout:
-                        raise ValueError(
-                            "NVFP4 payload layout 3 requires allow_legacy_layout=True"
-                        )
-                self._init_w4a8(weights)
-            else:
-                if not isinstance(weights, Sm90PushNvFp4Weights):
-                    raise TypeError("W4A16-RS requires Sm90PushNvFp4Weights")
-                if pipe.config.combine_dtype is not Sm90PushCombine.BF16:
-                    raise ValueError("W4A16-RS supports only BF16 combine wire")
-                if pipe.config.fuse_act:
-                    raise ValueError("W4A16-RS requires fuse_act=False")
-                if (
-                    self._rs_n_tactic,
-                    self._rs_stages,
-                    self._rs_stage_k,
-                ) != (64, 3, 64):
-                    raise ValueError("W4A16-RS supports only the N64/S3/K64 tactic")
-                self._init_rs(
-                    cast(NVFP4RSWeightView, weights.w13),
-                    cast(NVFP4RSWeightView, weights.w2),
-                )
+            packed = None
+            if isinstance(weights, Sm90PushNvFp4Weights):
+                packed = weights
+            elif isinstance(weights, Sm90PushNvFp4HotFoldedWeights):
+                packed = weights.cold_nvfp4
+            elif isinstance(weights, Sm90PushNvFp4DualWeights):
+                packed = weights.packed_nvfp4
+            if packed is not None:
+                layout = cast(W4A8WeightView, packed.w13).manifest.layout_version
+                if layout != self._payload_layout:
+                    raise ValueError(
+                        "NVFP4 payload layout does not match the runner config"
+                    )
+                if layout == 3 and not self._allow_legacy_layout:
+                    raise ValueError(
+                        "NVFP4 payload layout 3 requires allow_legacy_layout=True"
+                    )
+            self._init_w4a8(weights)
 
             return self.execution_identity
 
@@ -824,41 +787,12 @@ class Sm90PushNvFp4MoERunner(Sm90PushMoERunner):
         )
         if any(identity != identities[0] for identity in identities[1:]):
             raise RuntimeError("NVFP4 execution identity must match on every EP rank")
-        if self.nvfp4_mode == "w4a8":
-            self._w4a8_engine.prepare_fp8_collective(self)
+        self._w4a8_engine.prepare_fp8_collective(self)
         self._bound_weights = weights
         self._validated_weights[id(weights)] = weakref.ref(weights)
 
-    def _validate_rs_weights(
-        self,
-        w13: NVFP4RSWeightView,
-        w2: NVFP4RSWeightView,
-    ) -> None:
-        if not isinstance(w13, NVFP4RSWeightView) or not isinstance(
-            w2, NVFP4RSWeightView
-        ):
-            raise TypeError("W4A16-RS weights must contain two RS views")
-        w13.__post_init__()
-        w2.__post_init__()
-        pipe = self.pipe
-        device = pipe.device
-        if w13.payload.device != device or w2.payload.device != device:
-            raise ValueError("W4A16-RS weights must be on the pipe device")
-        if tuple(w13.payload.shape[:3]) != (
-            pipe.E,
-            (2 * self.I) // 64,
-            pipe.H // 16,
-        ):
-            raise ValueError("W4A16-RS w13 logical shape must be (E, 2I, H)")
-        if tuple(w2.payload.shape[:3]) != (
-            pipe.E,
-            pipe.H // 64,
-            self.I // 16,
-        ):
-            raise ValueError("W4A16-RS w2 logical shape must be (E, H, I)")
-
     def bind_weights(self, weights: object) -> None:
-        """Bind a same-mode, same-geometry NVFP4 bundle while idle."""
+        """Bind a same-geometry NVFP4 bundle while idle."""
         self._require_weight_bindable()
         if weights is self._bound_weights:
             return
@@ -874,29 +808,12 @@ class Sm90PushNvFp4MoERunner(Sm90PushMoERunner):
                 "sm90_push NVFP4 weights must be a typed bundle, "
                 f"got {type(weights).__name__}"
             )
-        mode = (
-            weights.nvfp4_mode if isinstance(weights, Sm90PushNvFp4Weights) else "w4a8"
-        )
-        if mode != self.nvfp4_mode:
-            raise ValueError("sm90_push NVFP4 rebound weights must preserve nvfp4_mode")
-
         cached = self._validated_weights.get(id(weights))
         if cached is None or cached() is not weights:
-            if self.nvfp4_mode == "w4a8":
-                self._w4a8_engine.validate_weights(weights)
-            else:
-                rs_weights = cast(Sm90PushNvFp4Weights, weights)
-                w13_rs = cast(NVFP4RSWeightView, rs_weights.w13)
-                w2_rs = cast(NVFP4RSWeightView, rs_weights.w2)
-                self._validate_rs_weights(w13_rs, w2_rs)
+            self._w4a8_engine.validate_weights(weights)
             self._validated_weights[id(weights)] = weakref.ref(weights)
 
-        if self.nvfp4_mode == "w4a8":
-            self._w4a8_engine.bind_validated_weights(weights)
-        else:
-            rs_weights = cast(Sm90PushNvFp4Weights, weights)
-            self.w13_rs = cast(NVFP4RSWeightView, rs_weights.w13)
-            self.w2_rs = cast(NVFP4RSWeightView, rs_weights.w2)
+        self._w4a8_engine.bind_validated_weights(weights)
         self.weights = weights
         self._bound_weights = weights
 
@@ -983,192 +900,40 @@ class Sm90PushNvFp4MoERunner(Sm90PushMoERunner):
         )
         engine.warm_legacy(self)
 
-    def _new_rs_runner(self, n: int, k: int):
-        runner = create_sm90_push_nvfp4_rs_gemm_runner(
-            "rs_wgmma",
-            self._rs_n_tactic,
-            self._rs_stages,
-            self._rs_stage_k,
-            use_environment=False,
-        )
-        size = int(
-            runner.get_workspace_size(
-                self._padded_max_rows,
-                self.pipe.E,
-                n,
-                k,
-            )
-        )
-        workspace = torch.empty(
-            max(size, 1), dtype=torch.uint8, device=self.pipe.device
-        )
-        runner.configure_workspace(workspace)
-        return runner, workspace
-
-    def _init_rs(
-        self,
-        w13: NVFP4RSWeightView,
-        w2: NVFP4RSWeightView,
-    ) -> None:
-        if not isinstance(w13, NVFP4RSWeightView) or not isinstance(
-            w2, NVFP4RSWeightView
-        ):
-            raise TypeError("W4A16-RS weights must contain two RS views")
-        pipe = self.pipe
-        self._padded_max_rows = _align(pipe.m_cap + 7 * pipe.E)
-        actual_rows = _align(pipe.m_cap)
-        device = pipe.device
-        if w13.payload.device != device or w2.payload.device != device:
-            raise ValueError("W4A16-RS weights must be on the pipe device")
-        if int(w13.payload.shape[0]) != pipe.E:
-            raise ValueError("W4A16-RS w13 expert count does not match the pipe")
-        two_i = int(w13.payload.shape[1]) * 64
-        if two_i <= 0 or two_i % 256 or int(w13.payload.shape[2]) * 16 != pipe.H:
-            raise ValueError("W4A16-RS w13 logical shape must be (E, 2I, H)")
-        self.I = two_i // 2
-        if tuple(w2.payload.shape[:3]) != (
-            pipe.E,
-            pipe.H // 64,
-            self.I // 16,
-        ):
-            raise ValueError("W4A16-RS w2 logical shape must be (E, H, I)")
-        self.w13_rs = w13
-        self.w2_rs = w2
-        self.execution_identity = ("w4a16-rs-v1", pipe.E)
-        self.a1 = torch.empty(
-            self._padded_max_rows, pipe.H, dtype=torch.bfloat16, device=device
-        )
-        self.meta = torch.empty(actual_rows, 4, dtype=torch.int32, device=device)
-        self.h = torch.empty(
-            self._padded_max_rows,
-            2 * self.I,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        self.a2 = torch.empty(
-            self._padded_max_rows,
-            self.I,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        self.y = torch.empty(
-            self._padded_max_rows,
-            pipe.H,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        self.real_to_padded = torch.empty(actual_rows, dtype=torch.int32, device=device)
-        self.rs_offsets = torch.empty(pipe.E + 1, dtype=torch.int64, device=device)
-        self.rs_tile_prefix = torch.empty(pipe.E + 1, dtype=torch.int64, device=device)
-        self.rs_m_dev = torch.zeros(1, dtype=torch.int32, device=device)
-        self.fc1, self.fc1_workspace = self._new_rs_runner(2 * self.I, pipe.H)
-        self.fc2, self.fc2_workspace = self._new_rs_runner(pipe.H, self.I)
-        offsets = torch.zeros(pipe.E + 1, dtype=torch.int64, device=device)
-        prefix = torch.zeros_like(offsets)
-        self.fc1.grouped_run_padded(
-            self.h,
-            self.a1,
-            w13.payload,
-            w13.scales,
-            w13.alpha,
-            offsets,
-            prefix,
-            True,
-        )
-        self.fc2.grouped_run_padded(
-            self.y,
-            self.a2,
-            w2.payload,
-            w2.scales,
-            w2.alpha,
-            offsets,
-            prefix,
-            True,
-        )
-        torch.cuda.synchronize()
-
     def _round_compact(self) -> None:
-        if self.nvfp4_mode == "w4a8":
-            self.pipe.proto_compact(self.a1, self.sfa1, self.meta, self.row_expert)
-            return
-        self.pipe.proto_compact_bf16_padded(
-            self.a1,
-            self.meta,
-            self.real_to_padded,
-            self.rs_offsets,
-            self.rs_tile_prefix,
-            self.rs_m_dev,
-            self._rs_n_tactic,
-        )
+        self.pipe.proto_compact(self.a1, self.sfa1, self.meta, self.row_expert)
 
     def _round_fc1(self) -> None:
-        if self.nvfp4_mode == "w4a8":
-            self._w4a8_engine.run_fc1(self)
-            return
-        self.fc1.grouped_run_padded(
-            self.h,
-            self.a1,
-            self.w13_rs.payload,
-            self.w13_rs.scales,
-            self.w13_rs.alpha,
-            self.rs_offsets,
-            self.rs_tile_prefix,
-            True,
-        )
+        self._w4a8_engine.run_fc1(self)
 
     def _round_activation(self) -> None:
         pipe = self.pipe
-        if self.nvfp4_mode == "w4a8":
-            if pipe.config.fuse_act:
-                pipe.proto_silu_mul_quant(self.h, self.a2, self.sfa2, self.row_expert)
-                return
-            if self._g is None:
-                raise RuntimeError("W4A8 unfused activation buffer is unavailable")
-            pipe.module.sm90_silu_mul_gated(
-                self._g, self.h, pipe._m_dev, self._g.shape[0]
-            )
-            pipe.module.sm90_quant_grouped(
-                self.a2,
-                self.sfa2,
-                self._g,
-                pipe._offsets,
-                pipe._pad_base,
-                pipe._m_dev,
-                pipe._p_dev,
-                self.row_expert,
-                self._g.shape[0],
-            )
+        if pipe.config.fuse_act:
+            pipe.proto_silu_mul_quant(self.h, self.a2, self.sfa2, self.row_expert)
             return
-        pipe.module.sm90_silu_mul_gated(
+        if self._g is None:
+            raise RuntimeError("W4A8 unfused activation buffer is unavailable")
+        pipe.module.sm90_silu_mul_gated(self._g, self.h, pipe._m_dev, self._g.shape[0])
+        pipe.module.sm90_quant_grouped(
             self.a2,
-            self.h,
-            self.rs_m_dev,
-            self.a2.shape[0],
+            self.sfa2,
+            self._g,
+            pipe._offsets,
+            pipe._pad_base,
+            pipe._m_dev,
+            pipe._p_dev,
+            self.row_expert,
+            self._g.shape[0],
         )
 
     def _round_activation_stage(self) -> str | None:
-        return "act_quant" if self.nvfp4_mode == "w4a8" else "activation"
+        return "act_quant"
 
     def _round_fc2(self) -> None:
-        if self.nvfp4_mode == "w4a8":
-            self._w4a8_engine.run_fc2(self)
-            return
-        self.fc2.grouped_run_padded(
-            self.y,
-            self.a2,
-            self.w2_rs.payload,
-            self.w2_rs.scales,
-            self.w2_rs.alpha,
-            self.rs_offsets,
-            self.rs_tile_prefix,
-            True,
-        )
+        self._w4a8_engine.run_fc2(self)
 
     def _round_combine(self) -> None:
-        if self.nvfp4_mode == "w4a8":
-            self.pipe.proto_combine(self.y, self.meta)
-            return
-        self.pipe.proto_combine_mapped(self.y, self.meta, self.real_to_padded)
+        self.pipe.proto_combine(self.y, self.meta)
 
     def _release_resources(self) -> None:
         super()._release_resources()
@@ -1176,12 +941,6 @@ class Sm90PushNvFp4MoERunner(Sm90PushMoERunner):
         if engine is not None:
             engine.destroy()
         self._w4a8_engine = None
-        self.fc1 = None
-        self.fc2 = None
-        self.fc1_workspace = None
-        self.fc2_workspace = None
-        self.w13_rs = None
-        self.w2_rs = None
         self.weights = None
         self.a1 = None
         self.sfa1 = None
@@ -1192,10 +951,6 @@ class Sm90PushNvFp4MoERunner(Sm90PushMoERunner):
         self.sfa2 = None
         self.y = None
         self._g = None
-        self.real_to_padded = None
-        self.rs_offsets = None
-        self.rs_tile_prefix = None
-        self.rs_m_dev = None
 
 
 __all__ = ["Sm90PushNvFp4MoERunner"]

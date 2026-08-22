@@ -125,10 +125,6 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 "sm90_fp8_nvfp4_bf16_push_cuda activation staging requires intermediate_size <= 16384"
             )
-        if config.nvfp4_mode not in ("w4a8", "w4a16_rs"):
-            raise MoEEpConfigError(
-                "sm90_fp8_nvfp4_bf16_push_cuda nvfp4_mode must be 'w4a8' or 'w4a16_rs'"
-            )
         if config.weight_policy not in ("packed", "folded", "hot_folded", "dual"):
             raise MoEEpConfigError(
                 "sm90_fp8_nvfp4_bf16_push_cuda weight_policy must be packed, folded, "
@@ -166,10 +162,6 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
                     "(577.6 MiB measured versus 241.5 MiB packed and 336.1 MiB "
                     "folded) and requires acknowledge_dual_residency=True"
                 )
-        if config.nvfp4_mode != "w4a8" and config.weight_policy != "packed":
-            raise MoEEpConfigError(
-                "non-packed weight policies require nvfp4_mode='w4a8'"
-            )
         if type(config.tma_cache_capacity) is not int or not (
             1 <= config.tma_cache_capacity <= 128
         ):
@@ -194,11 +186,7 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 "sm90_fp8_nvfp4_bf16_push_cuda allow_legacy_layout must be a bool"
             )
-        if (
-            config.nvfp4_mode == "w4a8"
-            and config.payload_layout == 3
-            and not config.allow_legacy_layout
-        ):
+        if config.payload_layout == 3 and not config.allow_legacy_layout:
             raise MoEEpConfigError(
                 "sm90_fp8_nvfp4_bf16_push_cuda payload_layout=3 is a legacy oracle and requires "
                 "allow_legacy_layout=True"
@@ -223,40 +211,6 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             raise MoEEpConfigError(
                 "sm90_fp8_nvfp4_bf16_push_cuda residual_scheme must be 'generic' or 'pow2'"
             )
-        if config.nvfp4_mode == "w4a16_rs":
-            if config.group_size != 128 or config.residual_scheme != "generic":
-                raise MoEEpConfigError(
-                    "sm90_fp8_nvfp4_bf16_push_cuda w4a16_rs requires group_size=128 and "
-                    "residual_scheme='generic'"
-                )
-            if config.combine_dtype != "bf16" or config.grouped_combine:
-                raise MoEEpConfigError(
-                    "sm90_fp8_nvfp4_bf16_push_cuda w4a16_rs requires combine_dtype='bf16' "
-                    "and grouped_combine=False"
-                )
-            if config.fuse_act:
-                raise MoEEpConfigError(
-                    "sm90_fp8_nvfp4_bf16_push_cuda w4a16_rs requires fuse_act=False"
-                )
-            if config.rs_n_tactic != 64:
-                raise MoEEpConfigError(
-                    "sm90_fp8_nvfp4_bf16_push_cuda rs_n_tactic must be 64"
-                )
-            if config.rs_stages != 3:
-                raise MoEEpConfigError(
-                    "sm90_fp8_nvfp4_bf16_push_cuda rs_stages must be 3"
-                )
-            if config.rs_stage_k != 64:
-                raise MoEEpConfigError(
-                    "sm90_fp8_nvfp4_bf16_push_cuda rs_stage_k must be 64"
-                )
-            if (
-                fleet_params.token_hidden_size % config.rs_stage_k
-                or config.intermediate_size % config.rs_stage_k
-            ):
-                raise MoEEpConfigError(
-                    "sm90_fp8_nvfp4_bf16_push_cuda RS K dimensions must be divisible by rs_stage_k"
-                )
         try:
             capacity_factor = float(config.capacity_factor)
         except (TypeError, ValueError) as exc:
@@ -294,7 +248,6 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             intermediate_size=config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
             num_local_experts=fleet_params.num_experts // self.ep_world_size,
-            nvfp4_mode=config.nvfp4_mode,
             group_size=config.group_size,
             residual_scheme=config.residual_scheme,
             payload_layout=config.payload_layout,
@@ -317,7 +270,6 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             intermediate_size=config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
             num_local_experts=fleet_params.num_experts // self.ep_world_size,
-            nvfp4_mode=config.nvfp4_mode,
             group_size=config.group_size,
             residual_scheme=config.residual_scheme,
             payload_layout=config.payload_layout,
@@ -390,9 +342,6 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             runner = Sm90PushNvFp4MoERunner(
                 pipe,
                 transformed_weights,
-                rs_n_tactic=config.rs_n_tactic,
-                rs_stages=config.rs_stages,
-                rs_stage_k=config.rs_stage_k,
                 tma_cache_capacity=config.tma_cache_capacity,
                 n64_expected_m_per_sm=float(config.n64_expected_m_per_sm),
                 payload_layout=config.payload_layout,
@@ -421,7 +370,7 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
                 transformed_weights,
                 (Sm90PushNvFp4HotFoldedWeights, Sm90PushNvFp4DualWeights),
             )
-            else (config.nvfp4_mode,)
+            else ("packed-w4a8",)
         )
         return (
             "sm90_fp8_nvfp4_bf16_push_cuda",
@@ -434,7 +383,6 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             fleet_params.token_hidden_size,
             config.intermediate_size,
             config.top_k,
-            config.nvfp4_mode,
             config.weight_policy,
             config.hot_expert_count,
             config.acknowledge_dual_residency,
@@ -447,9 +395,6 @@ class Sm90PushNvFp4MegaKernelBackend(MegaKernelBackend):
             config.dedup_dispatch,
             config.grouped_combine,
             config.fuse_act,
-            config.rs_n_tactic,
-            config.rs_stages,
-            config.rs_stage_k,
             config.tma_cache_capacity,
             float(config.n64_expected_m_per_sm),
             config.payload_layout,

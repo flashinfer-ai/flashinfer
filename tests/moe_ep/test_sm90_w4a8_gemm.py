@@ -23,8 +23,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.fused_moe.nvfp4_checkpoint import NVFP4Checkpoint
-from flashinfer.fused_moe.sm90_nvfp4_repack import (
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_checkpoint import (
+    NVFP4Checkpoint,
+)
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_repack import (
     build_w4a8_v4_views,
     repack_nvfp4_sm90_v3,
 )
@@ -40,7 +42,7 @@ from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_w4a8_gemm i
     load_sm90_push_nvfp4_w4a8_gemm_module,
 )
 from flashinfer.utils import is_sm90a_supported
-from tests.moe._nvfp4_w4a8_oracle import simulate_w4a8_operand_bytes
+from tests.moe_ep._nvfp4_w4a8_oracle import simulate_w4a8_operand_bytes
 
 
 requires_sm90 = pytest.mark.skipif(
@@ -1088,8 +1090,12 @@ def test_sm90_w4a8_sparse_expert_mapping_uses_source_offsets_and_scale_rows():
 def test_sm90_w4a8_rejects_invalid_untrusted_offsets():
     code = r"""
 import torch
-from flashinfer.fused_moe.nvfp4_checkpoint import NVFP4Checkpoint
-from flashinfer.fused_moe.sm90_nvfp4_repack import repack_nvfp4_sm90_v3
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_checkpoint import (
+    NVFP4Checkpoint,
+)
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_repack import (
+    repack_nvfp4_sm90_v3,
+)
 from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
     create_sm90_push_nvfp4_w4a8_gemm,
 )

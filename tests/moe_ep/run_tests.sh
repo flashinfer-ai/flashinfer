@@ -107,14 +107,7 @@ os._exit(rc)
 }
 
 run_unit() {
-  pytest_no_finalize tests/moe_ep/ \
-    tests/moe/test_nvfp4_checkpoint.py \
-    tests/moe/test_nvfp4_folded_accuracy.py \
-    tests/moe/test_sm90_nvfp4_folded_fp8.py \
-    tests/moe/test_sm90_nvfp4_repack.py \
-    tests/moe/test_sm90_nvfp4_repack_v3.py \
-    tests/moe/test_sm90_push_runner_orchestration.py \
-    tests/moe/test_sm90_push_w4a8.py -v \
+  pytest_no_finalize tests/moe_ep/ -v \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
     --ignore=tests/moe_ep/test_moe_ep_layer_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
@@ -151,11 +144,10 @@ run_sm90_fp8_nvfp4_bf16_push_cuda() {
 
   "${PY}" -m pytest \
     "${MOE_EP_PYTEST_FLAGS[@]}" \
-    tests/gemm/test_sm90_w4a8_gemm.py \
-    tests/gemm/test_sm90_w4a8_payload_v4_contract.py \
-    tests/gemm/test_sm90_w4a8_tma_cache.py \
-    tests/gemm/test_sm90_nvfp4_rs_wgmma.py \
-    tests/moe/test_sm90_nvfp4_folded_fp8.py \
+    tests/moe_ep/test_sm90_w4a8_gemm.py \
+    tests/moe_ep/test_sm90_w4a8_payload_v4_contract.py \
+    tests/moe_ep/test_sm90_w4a8_tma_cache.py \
+    tests/moe_ep/test_sm90_nvfp4_folded_fp8.py \
     tests/moe_ep/test_sm90_fp8_nvfp4_bf16_push_cuda_backend_cpu.py \
     tests/moe_ep/test_sm90_fp8_nvfp4_bf16_push_cuda_backend.py \
     tests/moe_ep/test_sm90_fp8_nvfp4_bf16_push_cuda_hot_folded.py -v || rc=1

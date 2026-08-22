@@ -41,7 +41,9 @@ def _make_backend(config, *, process_group=None, rank=1, world_size=2):
 
 
 def _make_w4a8_bundle():
-    from flashinfer.fused_moe.sm90_nvfp4_repack import NVFP4SM90WeightViewV3
+    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_repack import (
+        NVFP4SM90WeightViewV3,
+    )
     from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_weights import (
         Sm90PushNvFp4Weights,
     )
@@ -51,7 +53,6 @@ def _make_w4a8_bundle():
     object.__setattr__(w13, "manifest", SimpleNamespace(expert_mapping=(0, 1)))
     object.__setattr__(w2, "manifest", SimpleNamespace(expert_mapping=(0, 1)))
     bundle = object.__new__(Sm90PushNvFp4Weights)
-    object.__setattr__(bundle, "nvfp4_mode", "w4a8")
     object.__setattr__(bundle, "w13", w13)
     object.__setattr__(bundle, "w2", w2)
     return bundle
@@ -70,7 +71,6 @@ def _make_w4a8_runner(weights):
     runner._state = _RunnerState.IDLE
     runner._bound_weights = weights
     runner._validated_weights = {id(weights): weakref.ref(weights)}
-    runner.nvfp4_mode = "w4a8"
     runner.weights = weights
     engine = object.__new__(_LegacyW4A8PairEngine)
     engine.total_experts = 2
@@ -78,41 +78,6 @@ def _make_w4a8_runner(weights):
     engine.fc2 = mock.Mock()
     runner._w4a8_engine = engine
     return runner
-
-
-def test_nvfp4_production_rs_runner_uses_frozen_kernel_variant(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
-        nvfp4_runner,
-    )
-
-    calls = []
-
-    class _FakeRsRunner:
-        def get_workspace_size(self, *_args):
-            return 0
-
-        def configure_workspace(self, _workspace):
-            return None
-
-    def _create(*args, **kwargs):
-        calls.append((args, kwargs))
-        return _FakeRsRunner()
-
-    monkeypatch.setattr(
-        nvfp4_runner,
-        "create_sm90_push_nvfp4_rs_gemm_runner",
-        _create,
-    )
-    runner = object.__new__(nvfp4_runner.Sm90PushNvFp4MoERunner)
-    runner._rs_n_tactic = 64
-    runner._rs_stages = 3
-    runner._rs_stage_k = 64
-    runner._padded_max_rows = 128
-    runner.pipe = SimpleNamespace(E=2, device="cpu")
-
-    runner._new_rs_runner(64, 128)
-
-    assert calls == [(("rs_wgmma", 64, 3, 64), {"use_environment": False})]
 
 
 def test_nvfp4_staging_rebinds_layer_weights_and_records_lease():
@@ -248,7 +213,6 @@ def test_nvfp4_workspace_pool_key_covers_construction_state():
         variants = (
             replace(config, intermediate_size=384),
             replace(config, top_k=4),
-            replace(config, nvfp4_mode="w4a16_rs"),
             replace(config, group_size=64),
             replace(config, residual_scheme="pow2"),
             replace(config, capacity_factor=0.5),
@@ -257,9 +221,6 @@ def test_nvfp4_workspace_pool_key_covers_construction_state():
             replace(config, fuse_act=False),
             replace(config, payload_dtype="bf16"),
             replace(config, combine_dtype="bf16", grouped_combine=False),
-            replace(config, rs_n_tactic=96),
-            replace(config, rs_stages=4),
-            replace(config, rs_stage_k=128),
             replace(config, allow_unverified_p2p=True),
             replace(config, init_timeout_s=30.0),
             replace(config, tma_cache_capacity=1),
@@ -390,36 +351,6 @@ def test_nvfp4_rejects_invalid_w4a8_tuning_config(changes, message):
         mock.patch.object(backend_module, "_validate_sm90_arch"),
         mock.patch.object(backend_module, "validate_mega_fleet_params"),
         pytest.raises(MoEEpConfigError, match=message),
-    ):
-        _make_backend(config).validate_init(bootstrap, fleet)
-
-
-def test_nvfp4_rs_ignores_the_w4a8_payload_layout_selector():
-    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
-        Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig,
-    )
-    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_nvfp4_bf16_push_cuda import (
-        backend as backend_module,
-    )
-
-    fleet = SimpleNamespace(
-        num_experts=8,
-        max_tokens_per_rank=64,
-        token_hidden_size=128,
-    )
-    bootstrap = SimpleNamespace(world_size=2, stream=0)
-    config = Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
-        intermediate_size=128,
-        top_k=2,
-        nvfp4_mode="w4a16_rs",
-        payload_layout=4,
-        combine_dtype="bf16",
-        grouped_combine=False,
-        fuse_act=False,
-    )
-    with (
-        mock.patch.object(backend_module, "_validate_sm90_arch"),
-        mock.patch.object(backend_module, "validate_mega_fleet_params"),
     ):
         _make_backend(config).validate_init(bootstrap, fleet)
 

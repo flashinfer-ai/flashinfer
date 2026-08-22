@@ -25,7 +25,7 @@ import sys
 import pytest
 import torch
 
-from flashinfer.fused_moe.nvfp4_checkpoint import (
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_checkpoint import (
     NVFP4Checkpoint,
     load_modelopt_nvfp4_state_dict,
     reference_dequantize_nvfp4 as canonical_dequantize_nvfp4,
@@ -149,7 +149,9 @@ def _load_safetensors_subset(
 
 
 def test_canonical_checkpoint_decoder_imports_only_stdlib_and_torch():
-    spec = find_spec("flashinfer.fused_moe.nvfp4_checkpoint")
+    spec = find_spec(
+        "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_checkpoint"
+    )
     assert spec is not None and spec.origin is not None
     source_path = Path(spec.origin)
     tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))

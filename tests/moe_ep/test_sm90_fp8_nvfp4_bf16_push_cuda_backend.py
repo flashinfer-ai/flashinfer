@@ -10,7 +10,9 @@ from unittest import mock
 import pytest
 import torch
 
-from flashinfer.fused_moe.nvfp4_checkpoint import reference_dequantize_nvfp4
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_checkpoint import (
+    reference_dequantize_nvfp4,
+)
 
 from ._sm90_push_fp8_reference import reference_moe
 
@@ -169,7 +171,6 @@ def _build_layer(
     rank: int,
     device: torch.device,
     *,
-    nvfp4_mode: str,
     payload_dtype: str,
     combine_dtype: str,
     grouped_combine: bool,
@@ -215,7 +216,6 @@ def _build_layer(
             state_dict,
             w13_prefix="w13",
             w2_prefix="w2",
-            nvfp4_mode=nvfp4_mode,
             device=device,
         )
     process_group = None
@@ -242,12 +242,11 @@ def _build_layer(
             megakernel=Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
                 intermediate_size=INTERMEDIATE,
                 top_k=TOP_K,
-                nvfp4_mode=nvfp4_mode,
                 payload_dtype=payload_dtype,
                 combine_dtype=combine_dtype,
                 grouped_combine=grouped_combine,
                 dedup_dispatch=dedup_dispatch,
-                fuse_act=(nvfp4_mode == "w4a8" if fuse_act is None else fuse_act),
+                fuse_act=(True if fuse_act is None else fuse_act),
                 capacity_factor=capacity_factor,
             ),
             quantize_input=True,
@@ -326,35 +325,29 @@ def _cosine(output: torch.Tensor, reference: torch.Tensor) -> float:
     )
 
 
-def _assert_close(mode: str, output: torch.Tensor, reference: torch.Tensor) -> None:
+def _assert_close(output: torch.Tensor, reference: torch.Tensor) -> None:
     assert torch.isfinite(output.float()).all()
     normalized_l2 = _normalized_l2(output, reference)
     cosine = _cosine(output, reference)
-    if mode == "w4a8":
-        # This end-to-end gate includes routing, two quantized GEMMs, activation
-        # quantization, and combine. Direct W4A8 tests enforce tighter byte and
-        # numerical oracles for the individual GEMM path.
-        assert normalized_l2 <= 0.35, f"W4A8 normalized L2={normalized_l2:.6f}"
-        assert cosine >= 0.95, f"W4A8 cosine={cosine:.6f}"
-    else:
-        assert normalized_l2 <= 0.12
-        assert cosine >= 0.99
+    # This end-to-end gate includes routing, two quantized GEMMs, activation
+    # quantization, and combine. Direct W4A8 tests enforce tighter byte and
+    # numerical oracles for the individual GEMM path.
+    assert normalized_l2 <= 0.35, f"W4A8 normalized L2={normalized_l2:.6f}"
+    assert cosine >= 0.95, f"W4A8 cosine={cosine:.6f}"
 
 
 @requires_sm90
 @pytest.mark.parametrize(
-    "nvfp4_mode,payload_dtype,combine_dtype,grouped_combine,dedup_dispatch,fuse_act",
+    "payload_dtype,combine_dtype,grouped_combine,dedup_dispatch,fuse_act",
     [
-        ("w4a8", "fp8", "fp8", True, True, True),
-        ("w4a8", "fp8", "bf16", False, False, True),
-        ("w4a8", "bf16", "fp8", True, True, True),
-        ("w4a8", "bf16", "bf16", False, True, True),
-        ("w4a8", "fp8", "fp8", True, True, False),
-        ("w4a16_rs", "fp8", "bf16", False, True, False),
+        ("fp8", "fp8", True, True, True),
+        ("fp8", "bf16", False, False, True),
+        ("bf16", "fp8", True, True, True),
+        ("bf16", "bf16", False, True, True),
+        ("fp8", "fp8", True, True, False),
     ],
 )
 def test_public_ep1_forward_configs(
-    nvfp4_mode: str,
     payload_dtype: str,
     combine_dtype: str,
     grouped_combine: bool,
@@ -366,7 +359,6 @@ def test_public_ep1_forward_configs(
         1,
         0,
         device,
-        nvfp4_mode=nvfp4_mode,
         payload_dtype=payload_dtype,
         combine_dtype=combine_dtype,
         grouped_combine=grouped_combine,
@@ -379,7 +371,7 @@ def test_public_ep1_forward_configs(
     reference = _reference(x, ids, weights, w13, w2)
     assert output.shape == x.shape
     assert output.dtype == torch.bfloat16
-    _assert_close(nvfp4_mode, output, reference)
+    _assert_close(output, reference)
 
 
 @requires_sm90
@@ -389,7 +381,6 @@ def test_public_ep1_capacity_factor_quarter_happy_path() -> None:
         1,
         0,
         device,
-        nvfp4_mode="w4a8",
         payload_dtype="fp8",
         combine_dtype="fp8",
         grouped_combine=True,
@@ -398,7 +389,7 @@ def test_public_ep1_capacity_factor_quarter_happy_path() -> None:
     x, ids, weights = _make_inputs(8, LOCAL_EXPERTS, 29, device)
     output = _forward(layer, x, ids, weights)
     torch.cuda.synchronize()
-    _assert_close("w4a8", output, _reference(x, ids, weights, w13, w2))
+    _assert_close(output, _reference(x, ids, weights, w13, w2))
 
 
 @requires_sm90
@@ -408,7 +399,6 @@ def test_modelopt_transformed_weights_run_without_preprocessing() -> None:
         1,
         0,
         device,
-        nvfp4_mode="w4a8",
         payload_dtype="bf16",
         combine_dtype="bf16",
         grouped_combine=False,
@@ -417,7 +407,7 @@ def test_modelopt_transformed_weights_run_without_preprocessing() -> None:
     x, ids, weights = _make_inputs(8, LOCAL_EXPERTS, 31, device)
     output = _forward(layer, x, ids, weights)
     torch.cuda.synchronize()
-    _assert_close("w4a8", output, _reference(x, ids, weights, w13, w2))
+    _assert_close(output, _reference(x, ids, weights, w13, w2))
 
 
 @requires_sm90_fp8
@@ -501,7 +491,6 @@ def test_folded_fp8_error_matches_online_w4a8() -> None:
     online_weights = make_transformed_weights_from_checkpoints(
         w13_checkpoint,
         w2_checkpoint,
-        nvfp4_mode="w4a8",
         group_size=128,
         residual_scheme="generic",
     )
@@ -514,7 +503,6 @@ def test_folded_fp8_error_matches_online_w4a8() -> None:
         Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
             intermediate_size=INTERMEDIATE,
             top_k=TOP_K,
-            nvfp4_mode="w4a8",
             group_size=128,
             residual_scheme="generic",
             payload_dtype="bf16",
@@ -561,7 +549,7 @@ def test_folded_fp8_error_matches_online_w4a8() -> None:
     online_cosine_error = max(0.0, 1.0 - online_cosine)
     folded_cosine_error = max(0.0, 1.0 - folded_cosine)
 
-    _assert_close("w4a8", online_output, reference)
+    _assert_close(online_output, reference)
     assert torch.isfinite(folded_output.float()).all()
     assert folded_l2 < 0.10
     assert folded_cosine > 0.997
@@ -693,21 +681,16 @@ def test_bf16_checkpoint_quantization_is_chunk_invariant(monkeypatch) -> None:
 
 
 @requires_sm90
-@pytest.mark.parametrize(
-    "nvfp4_mode,fuse_act",
-    [("w4a8", True), ("w4a8", False), ("w4a16_rs", False)],
-)
-def test_public_ep1_graph_replay(nvfp4_mode: str, fuse_act: bool) -> None:
+@pytest.mark.parametrize("fuse_act", [True, False])
+def test_public_ep1_graph_replay(fuse_act: bool) -> None:
     device = torch.device("cuda", 0)
-    rs_mode = nvfp4_mode == "w4a16_rs"
     layer, _, _ = _build_layer(
         1,
         0,
         device,
-        nvfp4_mode=nvfp4_mode,
         payload_dtype="fp8",
-        combine_dtype="bf16" if rs_mode else "fp8",
-        grouped_combine=not rs_mode,
+        combine_dtype="fp8",
+        grouped_combine=True,
         fuse_act=fuse_act,
     )
     inputs = [
@@ -746,18 +729,13 @@ def test_public_ep1_graph_replay(nvfp4_mode: str, fuse_act: bool) -> None:
 
 
 @requires_sm90
-@pytest.mark.parametrize("nvfp4_mode", ["w4a8", "w4a16_rs"])
-def test_public_ep1_two_layers_share_workspace_and_graph_replay(
-    nvfp4_mode: str,
-) -> None:
+def test_public_ep1_two_layers_share_workspace_and_graph_replay() -> None:
     device = torch.device("cuda", 0)
-    rs_mode = nvfp4_mode == "w4a16_rs"
     config = {
-        "nvfp4_mode": nvfp4_mode,
         "payload_dtype": "fp8",
-        "combine_dtype": "bf16" if rs_mode else "fp8",
-        "grouped_combine": not rs_mode,
-        "fuse_act": not rs_mode,
+        "combine_dtype": "fp8",
+        "grouped_combine": True,
+        "fuse_act": True,
     }
     first, _, _ = _build_layer(1, 0, device, weight_seed=101, **config)
     second, _, _ = _build_layer(1, 0, device, weight_seed=102, **config)
@@ -801,19 +779,16 @@ def test_public_ep1_two_layers_share_workspace_and_graph_replay(
 
 
 @requires_sm90
-@pytest.mark.parametrize("nvfp4_mode", ["w4a8", "w4a16_rs"])
-def test_public_ep1_destroy_is_idempotent(nvfp4_mode: str) -> None:
+def test_public_ep1_destroy_is_idempotent() -> None:
     device = torch.device("cuda", 0)
-    rs_mode = nvfp4_mode == "w4a16_rs"
     layer, _, _ = _build_layer(
         1,
         0,
         device,
-        nvfp4_mode=nvfp4_mode,
         payload_dtype="fp8",
-        combine_dtype="bf16" if rs_mode else "fp8",
-        grouped_combine=not rs_mode,
-        fuse_act=not rs_mode,
+        combine_dtype="fp8",
+        grouped_combine=True,
+        fuse_act=True,
     )
     x, ids, weights = _make_inputs(8, LOCAL_EXPERTS, 97, device)
     _forward(layer, x, ids, weights)
@@ -834,14 +809,13 @@ def _dist_setup() -> tuple[int, int]:
 
 @requires_dist
 @pytest.mark.parametrize(
-    "nvfp4_mode,payload_dtype,combine_dtype,grouped_combine,route_mode",
+    "payload_dtype,combine_dtype,grouped_combine,route_mode",
     [
-        ("w4a8", "fp8", "fp8", True, "all_remote"),
-        ("w4a16_rs", "bf16", "bf16", False, "random"),
+        ("fp8", "fp8", True, "all_remote"),
+        ("bf16", "bf16", False, "random"),
     ],
 )
 def test_public_multirank_forward_configs(
-    nvfp4_mode: str,
     payload_dtype: str,
     combine_dtype: str,
     grouped_combine: bool,
@@ -855,7 +829,6 @@ def test_public_multirank_forward_configs(
         world_size,
         rank,
         device,
-        nvfp4_mode=nvfp4_mode,
         payload_dtype=payload_dtype,
         combine_dtype=combine_dtype,
         grouped_combine=grouped_combine,
@@ -870,7 +843,7 @@ def test_public_multirank_forward_configs(
     )
     output = _forward(layer, x, ids, weights)
     torch.cuda.synchronize()
-    _assert_close(nvfp4_mode, output, _reference(x, ids, weights, w13, w2))
+    _assert_close(output, _reference(x, ids, weights, w13, w2))
     dist.barrier()
 
 
@@ -884,7 +857,6 @@ def test_public_multirank_uneven_empty_and_recovery() -> None:
         world_size,
         rank,
         device,
-        nvfp4_mode="w4a8",
         payload_dtype="fp8",
         combine_dtype="fp8",
         grouped_combine=True,
@@ -901,7 +873,7 @@ def test_public_multirank_uneven_empty_and_recovery() -> None:
     torch.cuda.synchronize()
     assert output.shape == x.shape
     if num_tokens:
-        _assert_close("w4a8", output, _reference(x, ids, weights, w13, w2))
+        _assert_close(output, _reference(x, ids, weights, w13, w2))
     x, ids, weights = _make_inputs(
         TOKEN_CAPACITY,
         LOCAL_EXPERTS * world_size,
@@ -911,5 +883,5 @@ def test_public_multirank_uneven_empty_and_recovery() -> None:
     )
     recovered = _forward(layer, x, ids, weights)
     torch.cuda.synchronize()
-    _assert_close("w4a8", recovered, _reference(x, ids, weights, w13, w2))
+    _assert_close(recovered, _reference(x, ids, weights, w13, w2))
     dist.barrier()

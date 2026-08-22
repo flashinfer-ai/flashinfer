@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import pytest
 import torch
 
@@ -14,79 +12,6 @@ from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.runner import (
 
 class _FakeStream:
     cuda_stream = 1
-
-
-def test_nvfp4_rs_runner_rejects_fused_activation(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import nvfp4_runner
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_weights import (
-        Sm90PushNvFp4Weights,
-    )
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.protocol import (
-        Sm90PushCombine,
-    )
-
-    weights = object.__new__(Sm90PushNvFp4Weights)
-    object.__setattr__(weights, "nvfp4_mode", "w4a16_rs")
-    object.__setattr__(weights, "w13", object())
-    object.__setattr__(weights, "w2", object())
-    pipe = SimpleNamespace(
-        config=SimpleNamespace(
-            fuse_fc1_epilogue=False,
-            combine_dtype=Sm90PushCombine.BF16,
-            fuse_act=True,
-        ),
-        _comm=object(),
-        rank=0,
-    )
-    monkeypatch.setattr(
-        nvfp4_runner,
-        "_run_guarded_phase",
-        lambda _comm, _rank, _name, callback: callback(),
-    )
-
-    with pytest.raises(ValueError, match="W4A16-RS requires fuse_act=False"):
-        Sm90PushNvFp4MoERunner(pipe, weights)
-
-
-@pytest.mark.parametrize(
-    "field,value",
-    [
-        ("rs_n_tactic", 128),
-        ("rs_stages", 2),
-        ("rs_stage_k", 128),
-    ],
-)
-def test_nvfp4_rs_runner_rejects_unsupported_tactic(monkeypatch, field, value):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import nvfp4_runner
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_weights import (
-        Sm90PushNvFp4Weights,
-    )
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.protocol import (
-        Sm90PushCombine,
-    )
-
-    weights = object.__new__(Sm90PushNvFp4Weights)
-    object.__setattr__(weights, "nvfp4_mode", "w4a16_rs")
-    object.__setattr__(weights, "w13", object())
-    object.__setattr__(weights, "w2", object())
-    pipe = SimpleNamespace(
-        config=SimpleNamespace(
-            fuse_fc1_epilogue=False,
-            combine_dtype=Sm90PushCombine.BF16,
-            fuse_act=False,
-        ),
-        _comm=object(),
-        rank=0,
-    )
-    monkeypatch.setattr(
-        nvfp4_runner,
-        "_run_guarded_phase",
-        lambda _comm, _rank, _name, callback: callback(),
-    )
-
-    kwargs = {field: value}
-    with pytest.raises(ValueError, match="supports only the N64/S3/K64 tactic"):
-        Sm90PushNvFp4MoERunner(pipe, weights, **kwargs)
 
 
 class _FakePipe:
@@ -173,38 +98,8 @@ def _run(runner):
 
 def test_nvfp4_static_tactic_defaults():
     config = Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(intermediate_size=128, top_k=2)
-    assert config.nvfp4_mode == "w4a8"
-    assert (config.rs_n_tactic, config.rs_stages, config.rs_stage_k) == (64, 3, 64)
-
-
-def test_nvfp4_backend_freezes_rs_experiment_knobs(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import nvfp4_runner
-
-    ffi_runner = SimpleNamespace(
-        get_workspace_size=lambda *_args: 0,
-        configure_workspace=lambda _workspace: None,
-    )
-    calls = []
-
-    def _create(*args, **kwargs):
-        calls.append((args, kwargs))
-        return ffi_runner
-
-    monkeypatch.setattr(
-        nvfp4_runner,
-        "create_sm90_push_nvfp4_rs_gemm_runner",
-        _create,
-    )
-    runner = object.__new__(Sm90PushNvFp4MoERunner)
-    runner._rs_n_tactic = 64
-    runner._rs_stages = 3
-    runner._rs_stage_k = 64
-    runner._padded_max_rows = 128
-    runner.pipe = SimpleNamespace(E=2, device=torch.device("cpu"))
-
-    runner._new_rs_runner(128, 128)
-
-    assert calls == [(("rs_wgmma", 64, 3, 64), {"use_environment": False})]
+    assert config.payload_layout == 4
+    assert config.tma_cache_capacity == 128
 
 
 def test_nvfp4_runner_reuses_the_fp8_transaction_state_machine():

@@ -51,10 +51,6 @@ _CUDA_RESOURCES = (
     "src/nvfp4_w4a8_gemm/kernel_instantiation.cuh",
     "src/nvfp4_w4a8_gemm/kernel_launchers.cuh",
     "src/nvfp4_w4a8_gemm/scheduler.cuh",
-    "src/nvfp4_rs_gemm/sm90_nvfp4_rs_binding.cu",
-    "src/nvfp4_rs_gemm/decode.cuh",
-    "src/nvfp4_rs_gemm/scheduler.cuh",
-    "src/nvfp4_rs_gemm/sm90_nvfp4_rs_kernel.cuh",
 )
 _PYTHON_RESOURCES = (
     "__init__.py",
@@ -64,8 +60,9 @@ _PYTHON_RESOURCES = (
     "shim/protocol.py",
     "shim/runner.py",
     "shim/weights.py",
+    "shim/nvfp4_checkpoint.py",
+    "shim/nvfp4_repack.py",
     "shim/nvfp4_runner.py",
-    "shim/nvfp4_rs_gemm.py",
     "shim/nvfp4_w4a8_gemm.py",
     "shim/nvfp4_weights.py",
 )
@@ -128,8 +125,6 @@ def test_sm90_push_package_data_contains_cuda_sources():
     assert '"src/fp8_gemm/*.cuh"' in package_block
     assert '"src/nvfp4_w4a8_gemm/*.cu"' in package_block
     assert '"src/nvfp4_w4a8_gemm/*.cuh"' in package_block
-    assert '"src/nvfp4_rs_gemm/*.cu"' in package_block
-    assert '"src/nvfp4_rs_gemm/*.cuh"' in package_block
 
 
 def test_sm90_push_runtime_resources_expose_packaged_cuda_sources():
@@ -216,7 +211,8 @@ def test_sm90_push_nvfp4_shim_imports_resolve_to_top_level_packages():
     package = "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim"
 
     for filename in (
-        "nvfp4_rs_gemm.py",
+        "nvfp4_checkpoint.py",
+        "nvfp4_repack.py",
         "nvfp4_runner.py",
         "nvfp4_w4a8_gemm.py",
         "nvfp4_weights.py",
@@ -511,64 +507,45 @@ def test_sm90_push_weights_do_not_depend_on_trace_templates():
     assert "flashinfer_api" not in source
 
 
-@pytest.mark.parametrize("module_name", ["nvfp4_w4a8_gemm", "nvfp4_rs_gemm"])
-def test_sm90_push_nvfp4_gemm_requires_cuda_12_0(module_name, tmp_path, monkeypatch):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import shim
+def test_sm90_push_nvfp4_gemm_requires_cuda_12_0(tmp_path, monkeypatch):
+    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
+        nvfp4_w4a8_gemm as module,
+    )
 
-    module = getattr(shim, module_name)
     monkeypatch.setattr(module, "is_cuda_version_at_least", lambda _version: False)
     monkeypatch.setattr(module.jit_env, "FLASHINFER_GEN_SRC_DIR", tmp_path)
 
-    def generator():
-        if module_name == "nvfp4_w4a8_gemm":
-            return module.gen_sm90_push_nvfp4_w4a8_gemm_module()
-        return module.gen_sm90_push_nvfp4_rs_gemm_module(use_environment=False)
-
     with pytest.raises(RuntimeError, match=r"requires CUDA 12\.0"):
-        generator()
+        module.gen_sm90_push_nvfp4_w4a8_gemm_module()
 
     assert not any(tmp_path.iterdir())
 
 
 def test_sm90_push_nvfp4_launchers_use_direct_runtime_launches():
-    for directory in ("nvfp4_w4a8_gemm", "nvfp4_rs_gemm"):
-        source = "\n".join(
-            _package_text(*relative_path.split("/"))
-            for relative_path in _CUDA_RESOURCES
-            if relative_path.startswith(f"src/{directory}/")
-            and relative_path.endswith((".cu", ".cuh"))
-        )
-        assert "<<<" in source
-        assert "cudaKernel_t" not in source
-        assert "cudaLaunchKernelEx" not in source
+    source = "\n".join(
+        _package_text(*relative_path.split("/"))
+        for relative_path in _CUDA_RESOURCES
+        if relative_path.startswith("src/nvfp4_w4a8_gemm/")
+        and relative_path.endswith((".cu", ".cuh"))
+    )
+    assert "<<<" in source
+    assert "cudaKernel_t" not in source
+    assert "cudaLaunchKernelEx" not in source
 
 
-@pytest.mark.parametrize("module_name", ["nvfp4_w4a8_gemm", "nvfp4_rs_gemm"])
-def test_sm90_push_nvfp4_uri_covers_sources_dependencies_and_cuda_flags(
-    module_name, monkeypatch
-):
+def test_sm90_push_nvfp4_uri_covers_sources_dependencies_and_cuda_flags(monkeypatch):
     from dataclasses import replace
 
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import shim
+    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
+        nvfp4_w4a8_gemm as module,
+    )
 
-    module = getattr(shim, module_name)
     snapshot = module._capture_source_snapshot()
-    if module_name == "nvfp4_w4a8_gemm":
 
-        def w4a8_digest(value):
-            return module._source_digest(value)
+    def digest(value):
+        return module._source_digest(value)
 
-        digest = w4a8_digest
-        original_flags = module._cuda_flags()
-    else:
-        knobs = module._experiment_knobs(use_environment=False)
-        arguments = ("rs_wgmma", 64, 3, 64, knobs)
-
-        def rs_digest(value):
-            return module._source_digest(*arguments, snapshot=value)
-
-        digest = rs_digest
-        original_flags = module._cuda_flags(*arguments)
+    original_flags = module._cuda_flags()
 
     source_digest = digest(snapshot)
     assert digest(replace(snapshot, layout_cuh=snapshot.layout_cuh + b"\nchanged")) != (
@@ -582,13 +559,11 @@ def test_sm90_push_nvfp4_uri_covers_sources_dependencies_and_cuda_flags(
     assert digest(snapshot) != source_digest
 
 
-@pytest.mark.parametrize("module_name", ["nvfp4_w4a8_gemm", "nvfp4_rs_gemm"])
-def test_sm90_push_nvfp4_uri_canonicalizes_crlf_sources(
-    module_name, tmp_path, monkeypatch
-):
-    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import shim
+def test_sm90_push_nvfp4_uri_canonicalizes_crlf_sources(tmp_path, monkeypatch):
+    from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim import (
+        nvfp4_w4a8_gemm as module,
+    )
 
-    module = getattr(shim, module_name)
     lf_dir = tmp_path / "lf"
     crlf_dir = tmp_path / "crlf"
     lf_dir.mkdir()
@@ -599,14 +574,8 @@ def test_sm90_push_nvfp4_uri_canonicalizes_crlf_sources(
         (crlf_dir / name).write_bytes(content.replace(b"\n", b"\r\n"))
 
     monkeypatch.setattr(module, "_source_directory", lambda: lf_dir)
-    if module_name == "nvfp4_w4a8_gemm":
-        lf_uri = module.get_sm90_push_nvfp4_w4a8_gemm_uri()
-    else:
-        lf_uri = module.get_sm90_push_nvfp4_rs_gemm_uri()
+    lf_uri = module.get_sm90_push_nvfp4_w4a8_gemm_uri()
     monkeypatch.setattr(module, "_source_directory", lambda: crlf_dir)
-    if module_name == "nvfp4_w4a8_gemm":
-        crlf_uri = module.get_sm90_push_nvfp4_w4a8_gemm_uri()
-    else:
-        crlf_uri = module.get_sm90_push_nvfp4_rs_gemm_uri()
+    crlf_uri = module.get_sm90_push_nvfp4_w4a8_gemm_uri()
 
     assert crlf_uri == lf_uri

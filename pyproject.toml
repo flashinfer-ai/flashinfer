@@ -97,8 +97,6 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
   "src/fp8_gemm/*.cuh",
   "src/nvfp4_w4a8_gemm/*.cu",
   "src/nvfp4_w4a8_gemm/*.cuh",
-  "src/nvfp4_rs_gemm/*.cu",
-  "src/nvfp4_rs_gemm/*.cuh",
 ]
 "flashinfer.data" = ["csrc/**", "include/**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]

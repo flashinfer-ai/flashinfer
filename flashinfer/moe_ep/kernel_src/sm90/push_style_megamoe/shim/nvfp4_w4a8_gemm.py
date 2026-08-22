@@ -507,7 +507,7 @@ class Sm90W4A8GroupedGemm:
         shared_schedule_workspace: Optional[_W4A8ScheduleWorkspace] = None,
         counter_bank: int = 0,
     ) -> None:
-        from ......fused_moe.sm90_nvfp4_repack import (
+        from .nvfp4_repack import (
             NVFP4SM90WeightViewV3,
             NVFP4SM90WeightViewV4,
         )

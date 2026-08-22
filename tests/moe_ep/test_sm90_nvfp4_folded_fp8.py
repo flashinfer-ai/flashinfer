@@ -19,8 +19,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flashinfer.fused_moe.nvfp4_checkpoint import NVFP4Checkpoint
-from flashinfer.fused_moe.sm90_nvfp4_repack import NVFP4SM90WeightViewV4
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_checkpoint import (
+    NVFP4Checkpoint,
+)
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_repack import (
+    NVFP4SM90WeightViewV4,
+)
 from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
     fold_nvfp4_checkpoint_to_fp8_blockscale,
     make_sm90_push_folded_fp8_weights_from_checkpoints,
@@ -417,7 +421,6 @@ def test_folded_fp8_bundle_is_rejected_by_nvfp4_backend_contract() -> None:
             intermediate_size=128,
             hidden_size=128,
             num_local_experts=1,
-            nvfp4_mode="w4a8",
             group_size=128,
             residual_scheme="generic",
         )

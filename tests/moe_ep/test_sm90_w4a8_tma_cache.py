@@ -19,12 +19,14 @@ from pathlib import Path
 
 import torch
 
-from flashinfer.fused_moe.sm90_nvfp4_repack import repack_nvfp4_sm90_v3
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_repack import (
+    repack_nvfp4_sm90_v3,
+)
 from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_w4a8_gemm import (
     create_sm90_push_nvfp4_w4a8_gemm,
     get_sm90_push_nvfp4_w4a8_gemm_uri,
 )
-from tests.gemm.test_sm90_w4a8_gemm import (
+from tests.moe_ep.test_sm90_w4a8_gemm import (
     _checkpoint,
     _grouped_reference,
     _nonuniform_activation_scales,

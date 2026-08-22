@@ -7,20 +7,17 @@ from typing import Literal, cast
 
 import torch
 
-from ......fused_moe.nvfp4_checkpoint import (
+from .nvfp4_checkpoint import (
     NVFP4Checkpoint,
     load_modelopt_nvfp4_state_dict,
 )
-from ......fused_moe.sm90_nvfp4_repack import (
-    NVFP4RSWeightView,
+from .nvfp4_repack import (
     NVFP4SM90WeightViewV3,
     NVFP4SM90WeightViewV4,
-    build_nvfp4_rs_weight_view,
     repack_nvfp4_sm90_w4a8,
 )
 from .weights import Sm90PushWeights, _per_block_cast_128x128
 
-NvFp4Mode = Literal["w4a8", "w4a16_rs"]
 NvFp4WeightPolicy = Literal["packed", "folded", "hot_folded", "dual"]
 
 _E2M1_VALUES = (
@@ -189,34 +186,17 @@ def make_sm90_push_folded_fp8_weights_from_checkpoints(
 class Sm90PushNvFp4Weights:
     """FC1 and FC2 views tagged with their consuming kernel layout."""
 
-    nvfp4_mode: NvFp4Mode
-    w13: NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4 | NVFP4RSWeightView
-    w2: NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4 | NVFP4RSWeightView
+    w13: NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4
+    w2: NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4
 
     def __post_init__(self) -> None:
-        if self.nvfp4_mode == "w4a8":
-            valid_views = isinstance(
-                self.w13, (NVFP4SM90WeightViewV3, NVFP4SM90WeightViewV4)
-            ) and isinstance(self.w2, (NVFP4SM90WeightViewV3, NVFP4SM90WeightViewV4))
-        elif self.nvfp4_mode == "w4a16_rs":
-            valid_views = isinstance(self.w13, NVFP4RSWeightView) and isinstance(
-                self.w2, NVFP4RSWeightView
-            )
-        else:
-            raise ValueError(
-                f"nvfp4_mode must be 'w4a8' or 'w4a16_rs', got {self.nvfp4_mode!r}"
-            )
+        valid_views = isinstance(
+            self.w13, (NVFP4SM90WeightViewV3, NVFP4SM90WeightViewV4)
+        ) and isinstance(self.w2, (NVFP4SM90WeightViewV3, NVFP4SM90WeightViewV4))
         if not valid_views:
-            raise TypeError(
-                f"{self.nvfp4_mode} weights contain incompatible view types"
-            )
-        if self.nvfp4_mode == "w4a8":
-            w13 = cast(NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4, self.w13)
-            w2 = cast(NVFP4SM90WeightViewV3 | NVFP4SM90WeightViewV4, self.w2)
-            if w13.manifest.layout_version != w2.manifest.layout_version:
-                raise ValueError(
-                    "W4A8 FC1 and FC2 views must use the same layout version"
-                )
+            raise TypeError("W4A8 weights contain incompatible view types")
+        if self.w13.manifest.layout_version != self.w2.manifest.layout_version:
+            raise ValueError("W4A8 FC1 and FC2 views must use the same layout version")
 
 
 def _tensor_bytes(tensor: torch.Tensor) -> int:
@@ -281,8 +261,6 @@ class Sm90PushNvFp4HotFoldedWeights:
                 raise TypeError(
                     "cold_nvfp4 must be Sm90PushNvFp4Weights for a non-empty suffix"
                 )
-            if self.cold_nvfp4.nvfp4_mode != "w4a8":
-                raise ValueError("hot-folded cold weights must use w4a8")
             expected_mapping = tuple(range(self.hot_experts, self.total_experts))
             for view in (self.cold_nvfp4.w13, self.cold_nvfp4.w2):
                 if not isinstance(view, (NVFP4SM90WeightViewV3, NVFP4SM90WeightViewV4)):
@@ -337,8 +315,6 @@ class Sm90PushNvFp4DualWeights:
     def __post_init__(self) -> None:
         if not isinstance(self.packed_nvfp4, Sm90PushNvFp4Weights):
             raise TypeError("packed_nvfp4 must be Sm90PushNvFp4Weights")
-        if self.packed_nvfp4.nvfp4_mode != "w4a8":
-            raise ValueError("dual weights require packed W4A8 views")
         if not isinstance(self.folded_fp8, Sm90PushWeights):
             raise TypeError("folded_fp8 must be Sm90PushWeights")
         w13 = cast(
@@ -589,7 +565,7 @@ def make_sm90_push_nvfp4_hot_folded_weights_from_checkpoints(
     cold_nvfp4 = (
         None
         if cold_w13 is None or cold_w2 is None
-        else Sm90PushNvFp4Weights("w4a8", cold_w13, cold_w2)
+        else Sm90PushNvFp4Weights(cold_w13, cold_w2)
     )
     return Sm90PushNvFp4HotFoldedWeights(
         hot_experts=hot_experts,
@@ -603,7 +579,6 @@ def make_sm90_push_nvfp4_weights_from_checkpoints(
     w13: NVFP4Checkpoint,
     w2: NVFP4Checkpoint,
     *,
-    nvfp4_mode: NvFp4Mode = "w4a8",
     group_size: int = 128,
     residual_scheme: str = "generic",
     payload_layout: Literal[3, 4] = 4,
@@ -616,46 +591,23 @@ def make_sm90_push_nvfp4_weights_from_checkpoints(
         raise ValueError("w13 and w2 checkpoints must share a device")
     if w13.expert_mapping != w2.expert_mapping:
         raise ValueError("w13 and w2 checkpoints must share an expert mapping")
-    if nvfp4_mode == "w4a8":
-        if payload_layout not in (3, 4):
-            raise ValueError("payload_layout must be 3 or 4")
-        w13_view = repack_nvfp4_sm90_w4a8(
-            w13,
-            group_size=group_size,
-            residual_scheme=residual_scheme,
-            payload_layout=payload_layout,
-            allow_legacy_layout=payload_layout == 3,
-        )
-        w2_view = repack_nvfp4_sm90_w4a8(
-            w2,
-            group_size=group_size,
-            residual_scheme=residual_scheme,
-            payload_layout=payload_layout,
-            allow_legacy_layout=payload_layout == 3,
-        )
-        return Sm90PushNvFp4Weights(
-            nvfp4_mode,
-            w13_view,
-            w2_view,
-        )
-    if nvfp4_mode == "w4a16_rs":
-        expected_mapping = tuple(range(w13.logical_shape[0]))
-        if w13.expert_mapping != expected_mapping:
-            raise ValueError("w4a16_rs requires identity-ordered local experts")
-        return Sm90PushNvFp4Weights(
-            nvfp4_mode,
-            build_nvfp4_rs_weight_view(
-                w13.packed_e2m1,
-                w13.scale_e4m3_per16,
-                w13.global_alpha_per_expert.contiguous(),
-            ),
-            build_nvfp4_rs_weight_view(
-                w2.packed_e2m1,
-                w2.scale_e4m3_per16,
-                w2.global_alpha_per_expert.contiguous(),
-            ),
-        )
-    raise ValueError(f"nvfp4_mode must be 'w4a8' or 'w4a16_rs', got {nvfp4_mode!r}")
+    if payload_layout not in (3, 4):
+        raise ValueError("payload_layout must be 3 or 4")
+    w13_view = repack_nvfp4_sm90_w4a8(
+        w13,
+        group_size=group_size,
+        residual_scheme=residual_scheme,
+        payload_layout=payload_layout,
+        allow_legacy_layout=payload_layout == 3,
+    )
+    w2_view = repack_nvfp4_sm90_w4a8(
+        w2,
+        group_size=group_size,
+        residual_scheme=residual_scheme,
+        payload_layout=payload_layout,
+        allow_legacy_layout=payload_layout == 3,
+    )
+    return Sm90PushNvFp4Weights(w13_view, w2_view)
 
 
 def make_sm90_push_nvfp4_dual_weights_from_checkpoints(
@@ -671,7 +623,6 @@ def make_sm90_push_nvfp4_dual_weights_from_checkpoints(
     packed = make_sm90_push_nvfp4_weights_from_checkpoints(
         w13,
         w2,
-        nvfp4_mode="w4a8",
         group_size=group_size,
         residual_scheme=residual_scheme,
         payload_layout=payload_layout,
@@ -730,7 +681,6 @@ def load_sm90_push_nvfp4_modelopt_weights(
     *,
     w13_prefix: str,
     w2_prefix: str,
-    nvfp4_mode: NvFp4Mode = "w4a8",
     group_size: int = 128,
     residual_scheme: str = "generic",
     payload_layout: Literal[3, 4] = 4,
@@ -747,7 +697,6 @@ def load_sm90_push_nvfp4_modelopt_weights(
     return make_sm90_push_nvfp4_weights_from_checkpoints(
         w13,
         w2,
-        nvfp4_mode=nvfp4_mode,
         group_size=group_size,
         residual_scheme=residual_scheme,
         payload_layout=payload_layout,
@@ -871,7 +820,7 @@ def load_sm90_push_nvfp4_modelopt_hot_folded_weights(
     cold_nvfp4 = (
         None
         if cold_w13 is None or cold_w2 is None
-        else Sm90PushNvFp4Weights("w4a8", cold_w13, cold_w2)
+        else Sm90PushNvFp4Weights(cold_w13, cold_w2)
     )
     return Sm90PushNvFp4HotFoldedWeights(
         hot_experts=hot_experts,
@@ -882,7 +831,6 @@ def load_sm90_push_nvfp4_modelopt_hot_folded_weights(
 
 
 __all__ = [
-    "NvFp4Mode",
     "NvFp4ResidencyEstimate",
     "NvFp4WeightPolicy",
     "Sm90PushNvFp4DualWeights",

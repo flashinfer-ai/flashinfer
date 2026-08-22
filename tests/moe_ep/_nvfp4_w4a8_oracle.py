@@ -22,7 +22,9 @@ import math
 
 import torch
 
-from flashinfer.fused_moe.nvfp4_checkpoint import NVFP4Checkpoint
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_checkpoint import (
+    NVFP4Checkpoint,
+)
 
 
 E4M3_MAX = 448.0

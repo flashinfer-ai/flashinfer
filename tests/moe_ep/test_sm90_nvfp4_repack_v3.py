@@ -8,32 +8,26 @@ from dataclasses import replace
 import pytest
 import torch
 
-import flashinfer.fused_moe.sm90_nvfp4_repack as repack_module
-from flashinfer.fused_moe.nvfp4_checkpoint import (
+import flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_repack as repack_module
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_checkpoint import (
     NVFP4Checkpoint,
     reference_dequantize_nvfp4,
 )
-from flashinfer.fused_moe.sm90_nvfp4_repack import (
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_repack import (
     _build_w4a8_v3_legacy_oracle,
-    NVFP4_RS_LAYOUT_VERSION,
     NVFP4_SM90_K_ALIGNMENT,
     NVFP4_SM90_LAYOUT_VERSION,
     NVFP4_SM90_STAGE_LAYOUT_VERSION,
     NVFP4SM90WeightViewV4,
     NVFP4V3Manifest,
     NVFP4V4Manifest,
-    build_nvfp4_rs_weight_view,
     build_w4a8_v4_views,
-    convert_nvfp4_rs_v2_to_v3,
     reference_dequantize_nvfp4_sm90_v3_promoted,
     repack_nvfp4_sm90_w4a8,
     repack_nvfp4_sm90_v3,
-    repack_nvfp4_sm90_v3_selected,
-    unpack_nvfp4_payload_v2,
-    unpack_nvfp4_scales_v2,
     unpack_nvfp4_sm90_v3,
 )
-from tests.moe._nvfp4_w4a8_oracle import (
+from tests.moe_ep._nvfp4_w4a8_oracle import (
     simulate_w4a8,
     simulate_w4a8_operand_bytes,
 )
@@ -916,104 +910,6 @@ def test_v3_streaming_promotion_and_hash_chunks_preserve_semantics(monkeypatch):
     )
 
 
-def test_v3_selected_policy_materializes_homogeneous_buckets_and_fallback():
-    checkpoint = _checkpoint(experts=3)
-    selection = {
-        "mode": "per_expert",
-        "residual_scheme": "generic",
-        "group_size": None,
-        "experts": [
-            {"expert_id": 10, "group_size": 32},
-            {"expert_id": 11, "group_size": 128},
-            {"expert_id": 12, "group_size": None, "fallback": "W4A16"},
-        ],
-    }
-    bundle = repack_nvfp4_sm90_v3_selected(checkpoint, selection)
-    bundle.verify_checksums()
-    assert bundle.expert_mapping == (10, 11, 12)
-    assert [bucket.manifest.group_size for bucket in bundle.promoted_buckets] == [
-        32,
-        128,
-    ]
-    assert [bucket.manifest.expert_mapping for bucket in bundle.promoted_buckets] == [
-        (10,),
-        (11,),
-    ]
-    for bucket in bundle.promoted_buckets:
-        expert_id = bucket.manifest.expert_mapping[0]
-        source_index = checkpoint.expert_mapping.index(expert_id)
-        expected = simulate_w4a8(checkpoint, bucket.manifest.group_size, "generic")[
-            source_index : source_index + 1
-        ]
-        torch.testing.assert_close(
-            reference_dequantize_nvfp4_sm90_v3_promoted(bucket),
-            expected,
-            rtol=0,
-            atol=0,
-        )
-    assert bundle.w4a16_fallback is not None
-    assert bundle.w4a16_fallback.expert_mapping == (12,)
-    torch.testing.assert_close(
-        reference_dequantize_nvfp4(bundle.w4a16_fallback),
-        reference_dequantize_nvfp4(checkpoint)[2:3],
-        rtol=0,
-        atol=0,
-    )
-
-
-def test_v3_selected_policy_requires_exact_expert_coverage():
-    checkpoint = _checkpoint()
-    selection = {
-        "mode": "model",
-        "residual_scheme": "pow2",
-        "group_size": 64,
-        "experts": [{"expert_id": 10, "group_size": 64}],
-    }
-    with pytest.raises(ValueError, match="cover checkpoint experts exactly"):
-        repack_nvfp4_sm90_v3_selected(checkpoint, selection)
-
-
-def test_v3_selected_policy_rejects_lossy_integer_metadata():
-    checkpoint = _checkpoint()
-    valid = {
-        "mode": "model",
-        "residual_scheme": "generic",
-        "group_size": 32,
-        "experts": [
-            {"expert_id": 10, "group_size": 32},
-            {"expert_id": 11, "group_size": 32},
-        ],
-    }
-
-    lossy_expert = {
-        **valid,
-        "experts": [
-            {"expert_id": 10.9, "group_size": 32},
-            {"expert_id": 11, "group_size": 32},
-        ],
-    }
-    with pytest.raises(TypeError, match="expert_id must be an integer"):
-        repack_nvfp4_sm90_v3_selected(checkpoint, lossy_expert)
-
-    lossy_expert_group = {
-        **valid,
-        "experts": [
-            {"expert_id": 10, "group_size": 32.9},
-            {"expert_id": 11, "group_size": 32},
-        ],
-    }
-    with pytest.raises(TypeError, match="group_size must be an integer or None"):
-        repack_nvfp4_sm90_v3_selected(checkpoint, lossy_expert_group)
-
-    lossy_model_group = {**valid, "group_size": 32.0}
-    with pytest.raises(TypeError, match="model selection group_size"):
-        repack_nvfp4_sm90_v3_selected(checkpoint, lossy_model_group)
-
-    bundle = repack_nvfp4_sm90_v3_selected(checkpoint, valid)
-    with pytest.raises(TypeError, match="expert_mapping entries must be integers"):
-        replace(bundle, expert_mapping=(10.9, 11))
-
-
 def test_v3_manifest_rejects_version_and_field_mismatch():
     view = repack_nvfp4_sm90_v3(_checkpoint(), group_size=32, residual_scheme="pow2")
     wrong_version = view.manifest.to_dict()
@@ -1040,111 +936,3 @@ def test_v3_manifest_rejects_version_and_field_mismatch():
     wrong_w13_layout["w13_layout"] = "up_then_gate"
     with pytest.raises(ValueError, match="w13_layout must be 'gate_then_up'"):
         NVFP4V3Manifest.from_dict(wrong_w13_layout)
-
-
-def test_explicit_v2_to_v3_conversion_and_version_gate():
-    checkpoint = _checkpoint(
-        physical_n=64,
-        physical_k=32,
-        logical_n=63,
-        logical_k=31,
-    )
-    v2 = build_nvfp4_rs_weight_view(
-        checkpoint.packed_e2m1,
-        checkpoint.scale_e4m3_per16,
-        checkpoint.global_alpha,
-    )
-    v3 = convert_nvfp4_rs_v2_to_v3(
-        v2,
-        source_layout_version=NVFP4_RS_LAYOUT_VERSION,
-        logical_shape=checkpoint.logical_shape,
-        expert_mapping=checkpoint.expert_mapping,
-        source_format_version=checkpoint.source_format_version,
-        alpha_scope="per_expert",
-        group_size=64,
-        residual_scheme="generic",
-    )
-    restored = unpack_nvfp4_sm90_v3(v3)
-    torch.testing.assert_close(
-        reference_dequantize_nvfp4(restored),
-        reference_dequantize_nvfp4(checkpoint),
-        rtol=0,
-        atol=0,
-    )
-    with pytest.raises(ValueError, match="source layout version mismatch"):
-        convert_nvfp4_rs_v2_to_v3(
-            v2,
-            source_layout_version=NVFP4_SM90_LAYOUT_VERSION,
-            logical_shape=checkpoint.logical_shape,
-            expert_mapping=checkpoint.expert_mapping,
-            source_format_version=checkpoint.source_format_version,
-            alpha_scope="per_expert",
-            group_size=64,
-            residual_scheme="generic",
-        )
-
-
-def test_v2_and_v3_consumers_reject_the_other_layout_view():
-    checkpoint = _checkpoint(
-        physical_n=64,
-        physical_k=32,
-        logical_n=63,
-        logical_k=31,
-    )
-    v2 = build_nvfp4_rs_weight_view(
-        checkpoint.packed_e2m1,
-        checkpoint.scale_e4m3_per16,
-        checkpoint.global_alpha,
-    )
-    v3 = repack_nvfp4_sm90_v3(
-        checkpoint,
-        group_size=32,
-        residual_scheme="generic",
-    )
-
-    with pytest.raises(TypeError, match="view must be NVFP4SM90WeightViewV3"):
-        unpack_nvfp4_sm90_v3(v2)
-    with pytest.raises(ValueError, match="payload fragment shape is invalid"):
-        unpack_nvfp4_payload_v2(v3.packed_e2m1)
-    with pytest.raises(ValueError, match=r"scales must be E4M3 \[E,Nt,Kt,64\]"):
-        unpack_nvfp4_scales_v2(v3.scale_e4m3_per16)
-    with pytest.raises(TypeError, match="view must be NVFP4RSWeightView"):
-        convert_nvfp4_rs_v2_to_v3(
-            v3,
-            source_layout_version=NVFP4_RS_LAYOUT_VERSION,
-            logical_shape=checkpoint.logical_shape,
-            expert_mapping=checkpoint.expert_mapping,
-            source_format_version=checkpoint.source_format_version,
-            alpha_scope="per_expert",
-            group_size=32,
-            residual_scheme="generic",
-        )
-
-
-def test_v2_to_v3_requires_explicit_alpha_scope_and_preserves_per_tensor():
-    checkpoint = _checkpoint(
-        experts=2,
-        physical_n=64,
-        physical_k=32,
-        logical_n=63,
-        logical_k=31,
-        scalar_alpha=True,
-    )
-    v2 = build_nvfp4_rs_weight_view(
-        checkpoint.packed_e2m1,
-        checkpoint.scale_e4m3_per16,
-        checkpoint.global_alpha,
-    )
-    v3 = convert_nvfp4_rs_v2_to_v3(
-        v2,
-        source_layout_version=NVFP4_RS_LAYOUT_VERSION,
-        logical_shape=checkpoint.logical_shape,
-        expert_mapping=checkpoint.expert_mapping,
-        source_format_version=checkpoint.source_format_version,
-        alpha_scope="per_tensor",
-        group_size=32,
-        residual_scheme="pow2",
-    )
-    assert v3.manifest.alpha_scope == "per_tensor"
-    assert v3.global_alpha.ndim == 0
-    assert v3.global_alpha.item() == checkpoint.global_alpha.item()

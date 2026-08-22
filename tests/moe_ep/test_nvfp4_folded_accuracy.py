@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from flashinfer.fused_moe.nvfp4_checkpoint import (
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_checkpoint import (
     NVFP4Checkpoint,
     load_modelopt_nvfp4_state_dict,
     reference_dequantize_nvfp4,
@@ -18,7 +18,7 @@ from flashinfer.fused_moe.nvfp4_checkpoint import (
 from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe import (
     fold_nvfp4_checkpoint_to_fp8_blockscale,
 )
-from tests.moe.test_nvfp4_checkpoint import _load_safetensors_subset
+from tests.moe_ep.test_nvfp4_checkpoint import _load_safetensors_subset
 
 
 _GOLDEN = Path(__file__).with_name("data") / "modelopt_w4a16_nvfp4_v1.safetensors"

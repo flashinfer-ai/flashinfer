@@ -9,11 +9,6 @@ from .gemm import (
 from .protocol import Sm90PushCombine, Sm90PushConfig, Sm90PushPayload, Sm90PushPipe
 from .runner import Sm90PushMoERunner
 from .nvfp4_runner import Sm90PushNvFp4MoERunner
-from .nvfp4_rs_gemm import (
-    create_sm90_push_nvfp4_rs_gemm_runner,
-    gen_sm90_push_nvfp4_rs_gemm_module,
-    get_sm90_push_nvfp4_rs_gemm_uri,
-)
 from .nvfp4_w4a8_gemm import (
     create_sm90_push_nvfp4_w4a8_gemm,
     gen_sm90_push_nvfp4_w4a8_gemm_module,
@@ -65,9 +60,6 @@ __all__ = [
     "create_sm90_push_nvfp4_w4a8_gemm",
     "gen_sm90_push_nvfp4_w4a8_gemm_module",
     "get_sm90_push_nvfp4_w4a8_gemm_uri",
-    "create_sm90_push_nvfp4_rs_gemm_runner",
-    "gen_sm90_push_nvfp4_rs_gemm_module",
-    "get_sm90_push_nvfp4_rs_gemm_uri",
     "load_sm90_push_nvfp4_modelopt_weights",
     "load_sm90_push_nvfp4_modelopt_folded_fp8_weights",
     "load_sm90_push_nvfp4_modelopt_hot_folded_weights",

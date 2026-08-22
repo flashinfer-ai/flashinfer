@@ -15,7 +15,16 @@
 #include <type_traits>
 
 #include "decode.cuh"
+// The vendored header exposes three non-inline device helpers. This JIT builds
+// several translation units but uses the private PTX controls below, so keep
+// the unused vendor definitions local to each translation unit.
+#define warpgroup_arrive static flashinfer_w4a8_unused_warpgroup_arrive
+#define warpgroup_commit_batch static flashinfer_w4a8_unused_warpgroup_commit_batch
+#define warpgroup_fence_operand static flashinfer_w4a8_unused_warpgroup_fence_operand
 #include "nv_internal/tensorrt_llm/deep_gemm/mma_utils.cuh"
+#undef warpgroup_fence_operand
+#undef warpgroup_commit_batch
+#undef warpgroup_arrive
 #include "nv_internal/tensorrt_llm/deep_gemm/nvrtc_cutlass.cuh"
 #include "scheduler.cuh"
 
@@ -40,6 +49,20 @@ namespace sm90_w4a8 {
 
 constexpr int kSm90OptInSharedMemoryBytes = 232448;
 constexpr int kProducerNamedBarrier = 0;
+
+// These controls must inline so the operand fences constrain the caller's
+// accumulator registers around each asynchronous WGMMA group.
+static __device__ __forceinline__ void wgmma_fence() {
+  asm volatile("wgmma.fence.sync.aligned;\n" ::: "memory");
+}
+
+static __device__ __forceinline__ void wgmma_commit() {
+  asm volatile("wgmma.commit_group.sync.aligned;\n" ::: "memory");
+}
+
+static __device__ __forceinline__ void wgmma_fence_operand(float& reg) {
+  asm volatile("" : "+f"(reg)::"memory");
+}
 
 template <int BlockM, int BlockN, int GroupSize, ResidualScheme Scheme, int PipelineStages>
 struct alignas(1024) W4A8SharedStorage {
@@ -452,7 +475,7 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
           for (int i = 0; i < WGMMA::kNumAccum; ++i) {
             asm volatile("" : "=f"(partial[i]));
           }
-          deep_gemm::warpgroup_arrive();
+          wgmma_fence();
 #pragma unroll
           for (int mma = 0; mma < kMmaPerGroup; ++mma) {
             const int k_local = group * GroupSize + mma * WGMMA::K;
@@ -462,16 +485,16 @@ __device__ __forceinline__ void grouped_w4a8_kernel_body(
                 deep_gemm::make_smem_desc(storage.decoded_weight[stage] + k_local, 1);
             WGMMA::wgmma(desc_a, desc_b, partial, mma != 0);
           }
-          deep_gemm::warpgroup_commit_batch();
+          wgmma_commit();
 
 #pragma unroll
           for (int i = 0; i < WGMMA::kNumAccum; ++i) {
-            deep_gemm::warpgroup_fence_operand(partial[i]);
+            wgmma_fence_operand(partial[i]);
           }
           deep_gemm::warpgroup_wait<0>();
 #pragma unroll
           for (int i = 0; i < WGMMA::kNumAccum; ++i) {
-            deep_gemm::warpgroup_fence_operand(partial[i]);
+            wgmma_fence_operand(partial[i]);
           }
           const float* current_group_scales =
               quant_group_scales<BlockM, BlockN, GroupSize, Scheme, PipelineStages>(

@@ -21,7 +21,6 @@ class Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig:
     intermediate_size: int
     top_k: int
     kernel_name: str = "sm90_fp8_nvfp4_bf16_push_cuda"
-    nvfp4_mode: Literal["w4a8", "w4a16_rs"] = "w4a8"
     weight_policy: Literal["packed", "folded", "hot_folded", "dual"] = "packed"
     hot_expert_count: int = 0
     acknowledge_dual_residency: bool = False
@@ -33,9 +32,6 @@ class Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig:
     fuse_act: bool = True
     payload_dtype: Literal["fp8", "bf16"] = "fp8"
     combine_dtype: Literal["fp8", "bf16"] = "fp8"
-    rs_n_tactic: Literal[64] = 64
-    rs_stages: Literal[3] = 3
-    rs_stage_k: Literal[64] = 64
     tma_cache_capacity: int = 128
     n64_expected_m_per_sm: float = 4.0
     payload_layout: Literal[3, 4] = 4

@@ -7,7 +7,9 @@ from typing import Literal
 import pytest
 import torch
 
-from flashinfer.fused_moe.nvfp4_checkpoint import reference_dequantize_nvfp4
+from flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe.shim.nvfp4_checkpoint import (
+    reference_dequantize_nvfp4,
+)
 
 from ._sm90_push_fp8_reference import reference_moe
 from .test_sm90_fp8_nvfp4_bf16_push_cuda_backend import (
@@ -48,7 +50,6 @@ def _nvfp4_config(
     return Sm90_Fp8_Nvfp4_Bf16_PushCuda_MegaMoeConfig(
         intermediate_size=INTERMEDIATE,
         top_k=TOP_K,
-        nvfp4_mode="w4a8",
         payload_dtype="bf16",
         combine_dtype="bf16",
         grouped_combine=False,
@@ -86,7 +87,6 @@ def test_hot_folded_endpoints_match_existing_engines(
         hybrid = make_transformed_weights_from_checkpoints(
             w13,
             w2,
-            nvfp4_mode="w4a8",
             group_size=128,
             residual_scheme="generic",
             payload_layout=payload_layout,
