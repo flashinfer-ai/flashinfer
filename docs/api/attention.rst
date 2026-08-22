@@ -218,6 +218,41 @@ SM120 NVFP4 Attention
     nvfp4_attention_sm120_fwd
 
 
+Wan Hybrid Attention
+--------------------
+
+.. currentmodule:: flashinfer.wan_hybrid
+
+The explicit ``wan_hybrid`` path accepts raw post-RoPE BF16 Q/K/V tensors for
+the fixed ``B=1, S=4800, H=40, D=128`` NHD noncausal serving contract. It uses
+a reusable caller-owned workspace and writes to a required caller-owned BF16
+output buffer. Query availability before selecting this path; it is not part of
+automatic attention routing.
+
+The workspace allocates its two-level packed value and scale storage once and
+retains stable attention-ready views across calls. Reusing the same workspace
+therefore avoids per-call storage allocation and supports CUDA Graph replay;
+callers should treat all workspace internals as opaque. Prewarm once with the
+same Q, K, output, and workspace tensors before graph capture. A workspace must
+not be used concurrently by multiple calls.
+
+Both value preparation and attention enqueue asynchronously on the caller's
+current PyTorch CUDA stream. The API does not synchronize and reports itself
+unavailable until its architecture-specific attention implementation is linked.
+
+``benchmarks/bench_wan_hybrid_attention.py`` runs the complete raw-input path
+against production SGLang FA4 in both paired orders using cold-L2 CUPTI
+activity timing. The benchmark also enforces the numerical, repeatability,
+caller-owned output, and allocation-reuse contract.
+
+.. autosummary::
+    :toctree: ../generated
+
+    WanHybridAttentionWorkspace
+    is_wan_hybrid_attention_available
+    wan_hybrid_attention
+
+
 flashinfer.mla
 ==============
 
