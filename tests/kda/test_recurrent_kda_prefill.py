@@ -2402,6 +2402,35 @@ def test_cute_dsl_checkpoints_match_cake(
         )
 
 
+def test_prefill_without_cute_dsl_experimental_falls_back_to_cake(
+    flash_kda_device, monkeypatch
+):
+    if not kda_prefill_cute_api._is_cute_dsl_kda_runtime_available():
+        pytest.skip("reference output requires nvidia-cutlass-dsl>=4.7.0")
+    run_kwargs = _strict_prefill_kwargs(
+        _make_inputs(seq_lens=(33,), num_heads=12, packed=False, seed=4711)
+    )
+    expected = recurrent_kda(**run_kwargs, backend="cute-dsl")
+
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_runtime_available",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_run_cute_dsl_kda_prefill",
+        lambda **kwargs: pytest.fail("auto must not reach the CuTe DSL kernel"),
+    )
+
+    fallback = recurrent_kda(**run_kwargs)
+    torch.testing.assert_close(
+        fallback[0].float(), expected[0].float(), atol=1e-2, rtol=1e-2
+    )
+    with pytest.raises(ImportError, match=r"nvidia-cutlass-dsl>=4\.7\.0"):
+        recurrent_kda(**run_kwargs, backend="cute-dsl")
+
+
 @pytest.mark.parametrize(
     ("seq_lens", "num_heads", "packed"),
     [((17,), 96, False), ((17, 33), 12, True)],
