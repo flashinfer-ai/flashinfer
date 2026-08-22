@@ -23,6 +23,7 @@ from ..fused_moe.utils import (
 from ..utils import _get_cache_buf, get_native_fp4_dtype
 
 from .gemm_base import (
+    _grow_workspace,
     CUDNN_AVAILABLE,
     DEFAULT_WORKSPACE_SIZE,
     UIDs,
@@ -268,7 +269,7 @@ def execute_cudnn_bf16_fp4_graph(
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
     if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+        workspace_buffer = _grow_workspace(workspace_buffer, workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
     handle = _get_cudnn_handle(a.device, stream)
@@ -331,7 +332,7 @@ def execute_cudnn_bf16_fp4_graph_override_shape(
         override_strides,
     )
     if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+        workspace_buffer = _grow_workspace(workspace_buffer, workspace_size)
 
     if plan_index < 0:
         graph.execute(
