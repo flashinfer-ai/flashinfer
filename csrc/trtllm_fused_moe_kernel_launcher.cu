@@ -56,7 +56,7 @@ enum class RoutingInputMode {
 struct RoutingMetadataBuffers {
   // Stable FFI width.
   // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.tensors.
-  static constexpr int64_t kNumTensors = 9;
+  static constexpr int64_t kNumTensors = 10;
   // FFI[0] live padded size.
   // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.total_num_padded_tokens.
   Tensor total_num_padded_tokens;
@@ -64,32 +64,37 @@ struct RoutingMetadataBuffers {
   // Sync with
   // flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.expanded_idx_to_permuted_idx.
   Tensor expanded_idx_to_permuted_idx;
-  // FFI[2] permuted-to-token map.
+  // FFI[2] permuted-to-expanded map used by Mn (LoRA) bias. Empty when the
+  // operation has no Mn body.
+  // Sync with
+  // flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.permuted_idx_to_expanded_idx.
+  Tensor permuted_idx_to_expanded_idx;
+  // FFI[3] permuted-to-token map.
   // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.permuted_idx_to_token_idx.
   Tensor permuted_idx_to_token_idx;
-  // FFI[3] routing weights.
+  // FFI[4] routing weights.
   // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.expert_weights.
   Tensor expert_weights;
-  // FFI[4] histogram scratch.
+  // FFI[5] histogram scratch.
   // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.expert_count_histogram.
   Tensor expert_count_histogram;
-  // FFI[5] expert counts.
+  // FFI[6] expert counts.
   // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.num_tokens_per_expert.
   Tensor num_tokens_per_expert;
-  // FFI[6] CTA batch map.
+  // FFI[7] CTA batch map.
   // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.cta_idx_xy_to_batch_idx.
   Tensor cta_idx_xy_to_batch_idx;
-  // FFI[7] CTA limits.
+  // FFI[8] CTA limits.
   // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.cta_idx_xy_to_mn_limit.
   Tensor cta_idx_xy_to_mn_limit;
-  // FFI[8] live CTA count.
+  // FFI[9] live CTA count.
   // Sync with flashinfer/fused_moe/core.py:TrtllmMoERoutingMetadataSlot.num_non_exiting_ctas.
   Tensor num_non_exiting_ctas;
 
-  /** Decode one exact stable nine-tensor routing ABI. */
+  /** Decode one exact stable ten-tensor routing ABI. */
   static RoutingMetadataBuffers from_ffi(Array<Tensor> const& tensors) {
     TVM_FFI_ICHECK_EQ(tensors.size(), kNumTensors)
-        << "Routing metadata requires exactly nine tensors.";
+        << "Routing metadata requires exactly ten tensors.";
     return from_flat_ffi(tensors, 0);
   }
 
@@ -97,17 +102,24 @@ struct RoutingMetadataBuffers {
   static RoutingMetadataBuffers from_flat_ffi(Array<Tensor> const& tensors, int64_t offset) {
     TVM_FFI_ICHECK_GE(offset, 0) << "Routing metadata offset must be nonnegative.";
     TVM_FFI_ICHECK_GE(tensors.size(), offset + kNumTensors)
-        << "Routing metadata requires nine tensors at the requested offset.";
-    return {tensors[offset],     tensors[offset + 1], tensors[offset + 2],
-            tensors[offset + 3], tensors[offset + 4], tensors[offset + 5],
-            tensors[offset + 6], tensors[offset + 7], tensors[offset + 8]};
+        << "Routing metadata requires ten tensors at the requested offset.";
+    return {tensors[offset],     tensors[offset + 1], tensors[offset + 2], tensors[offset + 3],
+            tensors[offset + 4], tensors[offset + 5], tensors[offset + 6], tensors[offset + 7],
+            tensors[offset + 8], tensors[offset + 9]};
   }
 
   /** Encode one typed routing record in the existing public FFI order. */
   Array<Tensor> to_ffi() const {
-    return {total_num_padded_tokens, expanded_idx_to_permuted_idx, permuted_idx_to_token_idx,
-            expert_weights,          expert_count_histogram,       num_tokens_per_expert,
-            cta_idx_xy_to_batch_idx, cta_idx_xy_to_mn_limit,       num_non_exiting_ctas};
+    return {total_num_padded_tokens,
+            expanded_idx_to_permuted_idx,
+            permuted_idx_to_expanded_idx,
+            permuted_idx_to_token_idx,
+            expert_weights,
+            expert_count_histogram,
+            num_tokens_per_expert,
+            cta_idx_xy_to_batch_idx,
+            cta_idx_xy_to_mn_limit,
+            num_non_exiting_ctas};
   }
 
   /** Bind this routing record to a concrete MoE workspace and tile geometry. */
@@ -121,7 +133,10 @@ struct RoutingMetadataBuffers {
         static_cast<int32_t*>(expanded_idx_to_permuted_idx.data_ptr());
     workspace.permuted_idx_to_token_idx =
         static_cast<int32_t*>(permuted_idx_to_token_idx.data_ptr());
-    workspace.permuted_idx_to_expanded_idx = nullptr;
+    workspace.permuted_idx_to_expanded_idx =
+        permuted_idx_to_expanded_idx.numel() == 0
+            ? nullptr
+            : static_cast<int32_t*>(permuted_idx_to_expanded_idx.data_ptr());
     workspace.expert_weights = expert_weights.data_ptr();
     workspace.cta_idx_xy_to_batch_idx = static_cast<int32_t*>(cta_idx_xy_to_batch_idx.data_ptr());
     workspace.cta_idx_xy_to_mn_limit = static_cast<int32_t*>(cta_idx_xy_to_mn_limit.data_ptr());
@@ -705,6 +720,10 @@ inline void validateRoutingMetadata(RoutingMetadataBuffers const& metadata, int6
   check_1d(metadata.total_num_padded_tokens, dl_int32, 1, "total_num_padded_tokens");
   check_1d(metadata.expanded_idx_to_permuted_idx, dl_int32, num_tokens * top_k,
            "expanded_idx_to_permuted_idx");
+  check_1d(metadata.permuted_idx_to_expanded_idx, dl_int32, 0, "permuted_idx_to_expanded_idx");
+  TVM_FFI_ICHECK(metadata.permuted_idx_to_expanded_idx.size(0) == 0 ||
+                 metadata.permuted_idx_to_expanded_idx.size(0) >= max_num_padded_tokens)
+      << "permuted_idx_to_expanded_idx is too small.";
   check_1d(metadata.permuted_idx_to_token_idx, dl_int32, max_num_padded_tokens + 1,
            "permuted_idx_to_token_idx");
   check_1d(metadata.expert_count_histogram, dl_int32, histogram_size, "expert_count_histogram");
@@ -753,7 +772,10 @@ inline moe::dev::routing::routingPrecomputed::Data makePrecomputedRoutingData(
   data.mPtrPermutedIdxSize = static_cast<int32_t*>(metadata.total_num_padded_tokens.data_ptr());
   data.mPtrExpandedIdxToPermutedIdx =
       static_cast<int32_t*>(metadata.expanded_idx_to_permuted_idx.data_ptr());
-  data.mPtrPermutedIdxToExpandedIdx = nullptr;
+  data.mPtrPermutedIdxToExpandedIdx =
+      metadata.permuted_idx_to_expanded_idx.numel() == 0
+          ? nullptr
+          : static_cast<int32_t*>(metadata.permuted_idx_to_expanded_idx.data_ptr());
   data.mPtrPermutedIdxToTokenIdx =
       static_cast<int32_t*>(metadata.permuted_idx_to_token_idx.data_ptr());
   data.mPtrTopKWeights = metadata.expert_weights.data_ptr();
@@ -780,7 +802,7 @@ inline moe::dev::routing::routingPrecomputed::Data makePrecomputedRoutingData(
 inline std::vector<RoutingMetadataBuffers> routingMetadataFromFfi(
     Array<Tensor> const& flat_routing_metadata, int64_t num_tiles) {
   TVM_FFI_ICHECK_EQ(flat_routing_metadata.size(), num_tiles * RoutingMetadataBuffers::kNumTensors)
-      << "Flat routing metadata must contain nine tensors per tile.";
+      << "Flat routing metadata must contain ten tensors per tile.";
   std::vector<RoutingMetadataBuffers> records;
   records.reserve(num_tiles);
   for (int64_t tile_index = 0; tile_index < num_tiles; ++tile_index) {
@@ -4409,7 +4431,7 @@ void trtllm_moe_canonicalize_routing(
 Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
     TensorView topk_ids, int64_t num_experts, int64_t top_k, int64_t local_expert_offset,
     int64_t local_num_experts, Array<int64_t> tile_tokens_dims, int64_t routing_input_mode,
-    Optional<Tensor> topk_weights) {
+    Optional<Tensor> topk_weights, bool needs_permuted_idx_to_expanded_idx) {
   // Validate shared routing inputs once before allocating tile-dependent output records.
   ffi::CUDADeviceGuard device_guard(topk_ids.device().device_id);
   auto const input_mode = validateMultiTileRoutingInputs(
@@ -4435,6 +4457,8 @@ Array<Tensor> trtllm_moe_allocate_routing_metadata_multi_tile(
     RoutingMetadataBuffers metadata{
         alloc_tensor({1}, dl_int32, topk_ids.device()),
         alloc_tensor({num_tokens * top_k}, dl_int32, topk_ids.device()),
+        alloc_tensor({needs_permuted_idx_to_expanded_idx ? max_num_padded_tokens : 0}, dl_int32,
+                     topk_ids.device()),
         alloc_tensor({max_num_padded_tokens + 1}, dl_int32, topk_ids.device()),
         input_mode == RoutingInputMode::UnpackedPrecomputed
             ? topk_weights.value()
