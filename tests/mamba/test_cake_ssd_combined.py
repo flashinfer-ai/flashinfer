@@ -367,25 +367,30 @@ def test_cake_ssd_combined_writes_selected_checkpoint_state(varlen, state_dtype)
     SSDCombined(**constructor, backend="cake").run(*tensors, **full_arguments)
 
     x, dt, A, B, C = tensors
+    packed_batch_index = 0 if varlen else sequence_index
     prefix_tensors = (
         x[
-            sequence_index : sequence_index + 1, sequence_start:checkpoint_token
+            packed_batch_index : packed_batch_index + 1,
+            sequence_start:checkpoint_token,
         ].contiguous(),
         dt[
-            sequence_index : sequence_index + 1, sequence_start:checkpoint_token
+            packed_batch_index : packed_batch_index + 1,
+            sequence_start:checkpoint_token,
         ].contiguous(),
         A,
         B[
-            sequence_index : sequence_index + 1, sequence_start:checkpoint_token
+            packed_batch_index : packed_batch_index + 1,
+            sequence_start:checkpoint_token,
         ].contiguous(),
         C[
-            sequence_index : sequence_index + 1, sequence_start:checkpoint_token
+            packed_batch_index : packed_batch_index + 1,
+            sequence_start:checkpoint_token,
         ].contiguous(),
     )
     prefix_arguments = {
         **arguments,
         "z": arguments["z"][
-            sequence_index : sequence_index + 1,
+            packed_batch_index : packed_batch_index + 1,
             sequence_start:checkpoint_token,
         ].contiguous(),
         "initial_states": arguments["initial_states"][
