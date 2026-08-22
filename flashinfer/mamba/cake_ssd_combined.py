@@ -165,9 +165,9 @@ def _bind_prepared_sequence_arguments(
     stage_arg_plans: Sequence[tuple[str, Sequence[Sequence[str]]]],
     stage_values: Mapping[str, Mapping[str, object]],
     stage_grids: Mapping[str, tuple[int, int, int]],
-    cuda_stream: int,
+    cuda_stream: Optional[int],
 ) -> tuple[object, ...]:
-    """Flatten complete stage plans before appending the explicit stream."""
+    """Flatten complete stage plans and an exporter-declared stream argument."""
 
     arguments: list[object] = []
     for stage, arg_plan in stage_arg_plans:
@@ -180,7 +180,8 @@ def _bind_prepared_sequence_arguments(
                 stage_grids[stage],
             )
         )
-    arguments.append(cuda_stream)
+    if cuda_stream is not None:
+        arguments.append(cuda_stream)
     return tuple(arguments)
 
 
@@ -200,6 +201,7 @@ def _run_generated_program(
     stage_order = profile.get("stage_order")
     stages = profile.get("stages")
     launch_count = profile.get("launch_count")
+    stream_abi = profile.get("stream_abi")
     if (
         not isinstance(entry, str)
         or not isinstance(stage_order, list)
@@ -207,6 +209,7 @@ def _run_generated_program(
         or not all(isinstance(stage, str) for stage in stage_order)
         or not isinstance(stages, dict)
         or launch_count != len(stage_order)
+        or stream_abi not in {"explicit", "implicit"}
     ):
         raise RuntimeError(
             f"Cake SSDCombined generated program {name!r} has unresolved launch ABI"
@@ -229,7 +232,7 @@ def _run_generated_program(
         stage_arg_plans,
         stage_values,
         stage_grids,
-        cuda_stream,
+        cuda_stream if stream_abi == "explicit" else None,
     )
     module = _load_generated_program(name, arch, device_index)
     launch = getattr(module, entry, None)
@@ -1021,24 +1024,6 @@ class CakeSSDCombined:
             if chunk_offsets is not None
             else self._dummy(x.device, torch.int32)
         )
-        if mode_varlen and scan_route != _ROUTE_PREFIX_VARLEN:
-            with torch.cuda.device(x.device):
-                _load_program("metadata", arch, device_index).run(
-                    seq_i32,
-                    seq_i64,
-                    chunk_indices_arg,
-                    chunk_offsets_arg,
-                    workspace["starts"],
-                    workspace["lengths"],
-                    workspace["sequence_offsets"],
-                    num_segments,
-                    num_sequences,
-                    seqlen,
-                    int(seq_idx_int64),
-                    (num_segments + _THREADS - 1) // _THREADS,
-                    1,
-                    1,
-                )
         if mode_varlen and (seq_chunk_cumsum is None or update_seq_chunk_cumsum):
             with torch.cuda.device(x.device):
                 seq_chunk_cumsum = self._compute_seq_chunk_cumsum(
@@ -1069,24 +1054,55 @@ class CakeSSDCombined:
             workspace["dt_bias_float"].copy_(dt_bias)
             dt_bias_float = workspace["dt_bias_float"]
         if scan_route != _ROUTE_PREFIX_VARLEN:
-            preprocess_grid = (num_segments * self.nheads + _THREADS - 1) // _THREADS
+            preprocess_profile = _generated_program_profile("preprocess", arch)
+            preprocess_stages = preprocess_profile.get("stages")
+            preprocess_stage = (
+                preprocess_stages.get("preprocess")
+                if isinstance(preprocess_stages, dict)
+                else None
+            )
+            preprocess_block = (
+                preprocess_stage.get("block")
+                if isinstance(preprocess_stage, dict)
+                else None
+            )
+            if (
+                not isinstance(preprocess_block, list)
+                or len(preprocess_block) != 3
+                or not all(isinstance(value, int) for value in preprocess_block)
+                or preprocess_block[0] <= 0
+            ):
+                raise RuntimeError(
+                    "Cake SSDCombined generated preprocess program has no block"
+                )
+            preprocess_values, preprocess_grid = _direct_preprocess_inputs(
+                dt=dt_float,
+                A=A,
+                dt_bias=dt_bias_float,
+                segment_starts=workspace["starts"],
+                segment_lengths=workspace["lengths"],
+                chunk_indices=chunk_indices_arg,
+                chunk_offsets=chunk_offsets_arg,
+                delta=workspace["delta"],
+                cumsum=workspace["cumsum"],
+                num_segments=num_segments,
+                nheads=self.nheads,
+                seqlen=seqlen,
+                mode_varlen=mode_varlen,
+                dt_softplus=bool(dt_softplus),
+                dt_limit=(dt_min, dt_max),
+                threads=preprocess_block[0],
+            )
             with torch.cuda.device(x.device):
-                _load_program("preprocess", arch, device_index).run(
-                    dt_float,
-                    A,
-                    dt_bias_float,
-                    workspace["starts"],
-                    workspace["lengths"],
-                    workspace["delta"],
-                    workspace["cumsum"],
-                    num_segments,
-                    self.nheads,
-                    int(bool(dt_softplus)),
-                    dt_min,
-                    dt_max,
-                    preprocess_grid,
-                    1,
-                    1,
+                _run_generated_program(
+                    "preprocess",
+                    arch,
+                    device_index,
+                    stage_values={"preprocess": preprocess_values},
+                    stage_grids={"preprocess": preprocess_grid},
+                    cuda_stream=int(
+                        torch.cuda.current_stream(x.device).cuda_stream
+                    ),
                 )
 
         d_arg = D if D is not None else self._dummy(x.device, torch.bfloat16)
@@ -1125,13 +1141,61 @@ class CakeSSDCombined:
         state_key = "f16" if self.state_dtype == torch.float16 else "bf16"
         mode_key = "varlen" if mode_varlen else "batched"
         sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
-        grid = min(num_sequences * self.nheads, sm_count)
+        grid = _persistent_grid_size(
+            total_work=num_sequences * self.nheads,
+            sm_count=sm_count,
+        )
         with torch.cuda.device(x.device):
             # x/B/C are consumed through their stride-aware TMA descriptors.
             # The generated source retains dead raw-pointer ABI slots for the
             # same buffers; pass a valid packed dummy so those legacy host
             # checks do not reject the descriptor-compatible public views.
             unused_bf16 = self._dummy(x.device, torch.bfloat16)
+            main_values: dict[str, object] = {
+                "x_map": x,
+                "b_map": B,
+                "c_map": C,
+                "out_map": out,
+                "x": unused_bf16,
+                "dt": dt_float,
+                "delta_precomputed": workspace["delta"],
+                "cumsum_precomputed": workspace["cumsum"],
+                "A": A,
+                "B_tensor": unused_bf16,
+                "C": unused_bf16,
+                "D": d_arg,
+                "z": z_arg,
+                "dt_bias": dt_bias_float,
+                "initial_states": initial_arg,
+                "final_states": final_states_arg,
+                "checkpoint_states": checkpoint_states_arg,
+                "checkpoint_token_indices": checkpoint_token_indices_arg,
+                "checkpoint_state_slots": checkpoint_state_slots_arg,
+                "seq_idx_i32": seq_i32,
+                "seq_idx_i64": seq_i64,
+                "chunk_indices": chunk_indices_arg,
+                "chunk_offsets": chunk_offsets_arg,
+                "seq_chunk_cumsum": cumsum_arg,
+                "out_native": out,
+                "nheads": self.nheads,
+                "ngroups": self.ngroups,
+                "batch": batch,
+                "seqlen": seqlen,
+                "nchunks": nchunks,
+                "sequence_count": num_sequences,
+                "num_logical_chunks": num_segments if mode_varlen else nchunks,
+                "mode_varlen": int(mode_varlen),
+                "has_seq_chunk_cumsum": int(seq_chunk_cumsum is not None),
+                "seq_idx_int64": int(seq_idx_int64),
+                "D_mode": d_mode,
+                "has_z": int(z is not None),
+                "has_initial": int(initial_states is not None),
+                "dt_softplus": int(bool(dt_softplus)),
+                "dt_min": dt_min,
+                "dt_max": dt_max,
+                "write_final_states": int(return_final_states),
+                "checkpoint_state_count": checkpoint_state_count,
+            }
             if scan_route == _ROUTE_PREFIX_VARLEN:
                 program_name = f"prefix_{state_key}_varlen"
                 profile = _generated_program_profile(program_name, arch)
@@ -1181,51 +1245,6 @@ class CakeSSDCombined:
                     total_work=num_sequences * self.nheads,
                     sm_count=sm_count,
                 )
-                main_values: dict[str, object] = {
-                    "x_map": x,
-                    "b_map": B,
-                    "c_map": C,
-                    "out_map": out,
-                    "x": unused_bf16,
-                    "dt": dt_float,
-                    "delta_precomputed": workspace["delta"],
-                    "cumsum_precomputed": workspace["cumsum"],
-                    "A": A,
-                    "B_tensor": unused_bf16,
-                    "C": unused_bf16,
-                    "D": d_arg,
-                    "z": z_arg,
-                    "dt_bias": dt_bias_float,
-                    "initial_states": initial_arg,
-                    "final_states": final_states_arg,
-                    "checkpoint_states": checkpoint_states_arg,
-                    "checkpoint_token_indices": checkpoint_token_indices_arg,
-                    "checkpoint_state_slots": checkpoint_state_slots_arg,
-                    "seq_idx_i32": seq_i32,
-                    "seq_idx_i64": seq_i64,
-                    "chunk_indices": chunk_indices_arg,
-                    "chunk_offsets": chunk_offsets_arg,
-                    "seq_chunk_cumsum": cumsum_arg,
-                    "out_native": out,
-                    "nheads": self.nheads,
-                    "ngroups": self.ngroups,
-                    "batch": batch,
-                    "seqlen": seqlen,
-                    "nchunks": nchunks,
-                    "sequence_count": num_sequences,
-                    "num_logical_chunks": num_segments,
-                    "mode_varlen": 1,
-                    "has_seq_chunk_cumsum": int(seq_chunk_cumsum is not None),
-                    "seq_idx_int64": int(seq_idx_int64),
-                    "D_mode": d_mode,
-                    "has_z": int(z is not None),
-                    "has_initial": int(initial_states is not None),
-                    "dt_softplus": int(bool(dt_softplus)),
-                    "dt_min": dt_min,
-                    "dt_max": dt_max,
-                    "write_final_states": int(return_final_states),
-                    "checkpoint_state_count": checkpoint_state_count,
-                }
                 _run_generated_program(
                     program_name,
                     arch,
@@ -1241,53 +1260,19 @@ class CakeSSDCombined:
                     cuda_stream=int(torch.cuda.current_stream(x.device).cuda_stream),
                 )
             else:
-                _load_program(f"{state_key}_{mode_key}", arch, device_index).run(
-                    x,
-                    B,
-                    C,
-                    out,
-                    unused_bf16,
-                    dt_float,
-                    workspace["delta"],
-                    workspace["cumsum"],
-                    A,
-                    unused_bf16,
-                    unused_bf16,
-                    d_arg,
-                    z_arg,
-                    dt_bias_float,
-                    initial_arg,
-                    final_states_arg,
-                    checkpoint_states_arg,
-                    checkpoint_token_indices_arg,
-                    checkpoint_state_slots_arg,
-                    seq_i32,
-                    seq_i64,
-                    chunk_indices_arg,
-                    chunk_offsets_arg,
-                    cumsum_arg,
-                    out,
-                    self.nheads,
-                    self.ngroups,
-                    batch,
-                    seqlen,
-                    nchunks,
-                    num_sequences,
-                    num_segments if mode_varlen else nchunks,
-                    int(mode_varlen),
-                    int(seq_chunk_cumsum is not None),
-                    int(seq_idx_int64),
-                    d_mode,
-                    int(z is not None),
-                    int(initial_states is not None),
-                    int(bool(dt_softplus)),
-                    dt_min,
-                    dt_max,
-                    int(return_final_states),
-                    checkpoint_state_count,
-                    grid,
-                    1,
-                    1,
+                family = (
+                    "shallow"
+                    if scan_route == _ROUTE_SHALLOW_VARLEN
+                    else "exact"
+                )
+                program_name = f"{family}_{state_key}_{mode_key}"
+                _run_generated_program(
+                    program_name,
+                    arch,
+                    device_index,
+                    stage_values={"main": main_values},
+                    stage_grids={"main": (grid, 1, 1)},
+                    cuda_stream=int(torch.cuda.current_stream(x.device).cuda_stream),
                 )
         out_view = out.permute(0, 3, 4, 1, 2).reshape(
             batch, seqlen, self.nheads, _HEADDIM

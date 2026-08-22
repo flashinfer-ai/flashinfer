@@ -1608,21 +1608,32 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     calls = {}
 
-    class Program:
-        def __init__(self, name):
-            self.name = name
-
-        def run(self, *args):
-            calls[self.name] = args
-
     monkeypatch.setattr(module, "_target_arch", lambda *_: "sm_103a")
     monkeypatch.setattr(module, "_cuda_device_index", lambda _: 0)
     monkeypatch.setattr(
         module,
-        "_load_program",
-        lambda name, _arch, _device_index: Program(name),
+        "_generated_program_profile",
+        lambda name, _arch: {
+            "stages": {
+                "preprocess": {"block": [128, 1, 1]}
+                if name == "preprocess"
+                else {}
+            }
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_run_generated_program",
+        lambda name, _arch, _device_index, **kwargs: calls.__setitem__(
+            name, kwargs
+        ),
     )
     monkeypatch.setattr(torch.cuda, "device", lambda *_: nullcontext())
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda *_: SimpleNamespace(cuda_stream=0x1234),
+    )
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
@@ -1677,9 +1688,10 @@ def test_source_runner_forwards_softplus_and_checkpoint_count(monkeypatch):
         checkpoint_states=checkpoint_states,
     )
 
-    assert calls["preprocess"][-6] == 0
-    assert calls["bf16_batched"][-8] == 0
-    assert calls["bf16_batched"][-4] == checkpoint_states.shape[0]
+    assert calls["preprocess"]["stage_values"]["preprocess"]["dt_softplus"] == 0
+    main = calls["exact_bf16_batched"]["stage_values"]["main"]
+    assert main["dt_softplus"] == 0
+    assert main["checkpoint_state_count"] == checkpoint_states.shape[0]
     assert isinstance(first, tuple) and isinstance(second, tuple)
     assert first[0].data_ptr() != second[0].data_ptr()
     assert first[1].data_ptr() != second[1].data_ptr()
@@ -1860,6 +1872,7 @@ def test_source_generated_program_runs_catalog_entry(monkeypatch):
         lambda *_: {
             "entry": "run",
             "launch_count": 2,
+            "stream_abi": "explicit",
             "stage_order": ["preprocess", "main"],
             "stages": {
                 "preprocess": {
@@ -1895,6 +1908,46 @@ def test_source_generated_program_runs_catalog_entry(monkeypatch):
     assert calls == [("dt", 32, "x", 128, 148, 0x1234)]
 
 
+def test_source_generated_single_program_uses_implicit_stream(monkeypatch):
+    module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    calls = []
+
+    class Generated:
+        def run(self, *args):
+            calls.append(args)
+
+    monkeypatch.setattr(
+        module,
+        "_generated_program_profile",
+        lambda *_: {
+            "entry": "run",
+            "launch_count": 1,
+            "stream_abi": "implicit",
+            "stage_order": ["main"],
+            "stages": {
+                "main": {
+                    "arg_plan": [
+                        ["tma_buffer", "x_map"],
+                        ["grid", "grid_x"],
+                    ]
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(module, "_load_generated_program", lambda *_: Generated())
+
+    module._run_generated_program(
+        "exact_bf16_batched",
+        "sm_103a",
+        0,
+        stage_values={"main": {"x_map": "x"}},
+        stage_grids={"main": (148, 1, 1)},
+        cuda_stream=0x1234,
+    )
+
+    assert calls == [("x", 148)]
+
+
 def test_source_generated_program_rejects_unresolved_launch_abi(monkeypatch):
     module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
     monkeypatch.setattr(
@@ -1903,6 +1956,7 @@ def test_source_generated_program_rejects_unresolved_launch_abi(monkeypatch):
         lambda *_: {
             "entry": "run",
             "launch_count": 1,
+            "stream_abi": "explicit",
             "stage_order": ["preprocess", "main"],
             "stages": {},
         },
@@ -1928,15 +1982,30 @@ def test_source_generated_catalog_is_terminal_and_active():
     assert catalog["source_status"] == "terminal"
     assert catalog["prefix_route_selected"] is True
     assert set(catalog["programs"]) == {
+        "preprocess",
+        "exact_bf16_batched",
+        "exact_bf16_varlen",
+        "exact_f16_batched",
+        "exact_f16_varlen",
+        "shallow_bf16_varlen",
+        "shallow_f16_varlen",
         "prefix_bf16_varlen",
         "prefix_f16_varlen",
     }
-    for program in catalog["programs"].values():
+    for name, program in catalog["programs"].items():
         assert set(program) == {"sm_100a", "sm_103a"}
         for profile in program.values():
-            assert profile["launch_count"] == 2
-            assert profile["stage_order"] == ["preprocess", "main"]
-            assert len(profile["device_sources"]) == 2
+            if name.startswith("prefix_"):
+                assert profile["launch_count"] == 2
+                assert profile["stream_abi"] == "explicit"
+                assert profile["stage_order"] == ["preprocess", "main"]
+                assert len(profile["device_sources"]) == 2
+            else:
+                assert profile["launch_count"] == 1
+                assert profile["stream_abi"] == "implicit"
+                expected_stage = "preprocess" if name == "preprocess" else "main"
+                assert profile["stage_order"] == [expected_stage]
+                assert len(profile["device_sources"]) == 1
             sources = [profile["host_source"], *profile["device_sources"]]
             for source in sources:
                 path = module._source_dir() / "generated" / source["path"]
