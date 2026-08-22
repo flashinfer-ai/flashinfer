@@ -5694,11 +5694,7 @@ def mm_mxfp8(
 
     tuner = AutoTuner.get()
 
-    tuning_config = (
-        _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
-        if backends == ["cute-dsl"]
-        else _MM_MXFP8_TUNING_CONFIG
-    )
+    tuning_config = _get_mm_mxfp8_tuning_config(backends)
 
     inputs = [
         a,
@@ -7036,6 +7032,21 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     use_cuda_graph=True,
     use_cold_l2_cache=True,
 )
+
+
+_MM_MXFP8_TRTLLM_TUNING_CONFIG = replace(
+    _MM_MXFP8_TUNING_CONFIG,
+    use_cuda_graph=True,
+    use_cold_l2_cache=True,
+)
+
+
+def _get_mm_mxfp8_tuning_config(backends: list[str]) -> TuningConfig:
+    if backends == ["cute-dsl"]:
+        return _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
+    if backends == ["trtllm"]:
+        return _MM_MXFP8_TRTLLM_TUNING_CONFIG
+    return _MM_MXFP8_TUNING_CONFIG
 
 
 @backend_requirement(
