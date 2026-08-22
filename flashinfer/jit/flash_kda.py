@@ -74,9 +74,9 @@ _FLASH_KDA_MODULE_IDENTS = {
     "small_bh_m128": "73369168de",
     "bt16_prepare": "2c6cc4c1f6",
     "bt16_prepare_beta_tma": "d9394ce430",
-    "bt16_chain_m64_s7": "fcd14b4039",
-    "bt16_chain_m64_s8": "7e93b641ff",
-    "bt16_chain_m64_s9": "b60dad9a63",
+    "bt16_chain_m64_s7": "350dbb8897",
+    "bt16_chain_m64_s8": "9e1ea1ef2d",
+    "bt16_chain_m64_s9": "e83ce16115",
 }
 
 _FLASH_KDA_BINDING_STEMS = {
