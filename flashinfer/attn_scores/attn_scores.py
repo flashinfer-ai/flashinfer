@@ -1000,12 +1000,24 @@ def fp8_paged_mqa_logits(
                          wider than ceil(context_lens[b] / block_size) when a
                          length is not a multiple of 128 (context_len=257 with
                          block_size=64 needs 6 columns, not 5).  Extra entries
-                         may be any valid index (0); too few is an out-of-bounds
-                         read.  FLASHINFER_VALIDATE_INPUTS=1 checks at runtime.
+                         may be any valid index (0).  This is a hard
+                         precondition, not a checked argument: too few columns
+                         is a device-side out-of-bounds READ, i.e. undefined
+                         behaviour -- it may return corrupt logits, or fault and
+                         poison the CUDA context.
         max_context_len: int  maximum KV sequence length; must be >=
                          max(context_lens).  The output row is sized from this
                          while the schedule follows context_lens, so a smaller
-                         value is an out-of-bounds write.
+                         value is a device-side out-of-bounds WRITE, likewise
+                         undefined behaviour.
+
+                         Both preconditions above are the caller's to satisfy.
+                         FLASHINFER_VALIDATE_INPUTS=1 raises on a violation
+                         instead, but it is a development aid only: it is off by
+                         default, and it is skipped during CUDA-graph capture
+                         because the device-to-host copy it needs is illegal
+                         there.  Neither setting makes the kernel itself safe
+                         against a violated contract.
         output_dtype:    output tensor dtype (float32 or float16)
         epi_dtype:       epilogue accumulation dtype (float32 or float16)
         acc_dtype:       MMA accumulator dtype (float32 or float16)
@@ -1293,12 +1305,24 @@ def fp4_paged_mqa_logits(
                          wider than ceil(context_lens[b] / block_size) when a
                          length is not a multiple of 128 (context_len=257 with
                          block_size=64 needs 6 columns, not 5).  Extra entries
-                         may be any valid index (0); too few is an out-of-bounds
-                         read.  FLASHINFER_VALIDATE_INPUTS=1 checks at runtime.
+                         may be any valid index (0).  This is a hard
+                         precondition, not a checked argument: too few columns
+                         is a device-side out-of-bounds READ, i.e. undefined
+                         behaviour -- it may return corrupt logits, or fault and
+                         poison the CUDA context.
         max_context_len: int  maximum KV sequence length; must be >=
                          max(context_lens).  The output row is sized from this
                          while the schedule follows context_lens, so a smaller
-                         value is an out-of-bounds write.
+                         value is a device-side out-of-bounds WRITE, likewise
+                         undefined behaviour.
+
+                         Both preconditions above are the caller's to satisfy.
+                         FLASHINFER_VALIDATE_INPUTS=1 raises on a violation
+                         instead, but it is a development aid only: it is off by
+                         default, and it is skipped during CUDA-graph capture
+                         because the device-to-host copy it needs is illegal
+                         there.  Neither setting makes the kernel itself safe
+                         against a violated contract.
         sf_vec_size:     number of FP4 values sharing one UE8M0 scale factor.
                          Determines both sf_q's packing and the scale-factor
                          bytes of each fused KV row (head_dim/sf_vec_size).
