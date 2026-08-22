@@ -1,0 +1,159 @@
+import pytest
+import torch
+
+from flashinfer import autotune, mm_bf16
+from flashinfer.autotuner import AutoTuner
+from flashinfer.gemm.gemm_base import (
+    _BF16_GEMM_SM100_TUNING_CONFIG,
+    _cudnn_gemm_bf16_runner,
+    _get_cache_buf,
+    get_mm_bf16_cublaslt_module,
+    DEFAULT_WORKSPACE_SIZE,
+)
+from flashinfer.utils import get_compute_capability
+
+
+def _skip_unless_supported(backend: str):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    cc = compute_capability[0] * 10 + compute_capability[1]
+    if not mm_bf16.is_compute_capability_supported(cc):
+        pytest.skip(f"mm_bf16 not supported on sm{cc}.")
+    if not mm_bf16.is_backend_supported(backend, cc):
+        pytest.skip(f"{backend} backend not supported on sm{cc}.")
+
+
+def _make_inputs(m: int, n: int, k: int):
+    # a is row-major (k-major); b is (k, n) column-major, matching the
+    # layouts mm_bf16 expects and the stride flags bf16_gemm_sm100 captures.
+    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    return a, b
+
+
+def _search_bf16_gemm_cache(runner, a, b, out):
+    workspace_buffer = _get_cache_buf(
+        "mm_bf16_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+    )
+    # bf16_gemm_sm100's inputs layout: [a, b, bias, pdl, out, workspace];
+    # bias=None and pdl=False are represented as torch.Size([0]) in the
+    # autotuner's input_shapes.
+    return AutoTuner.get().search_cache(
+        "bf16_gemm",
+        [runner],
+        (
+            a.shape,
+            b.shape,
+            torch.Size([0]),
+            torch.Size([0]),
+            out.shape,
+            workspace_buffer.shape,
+        ),
+        _BF16_GEMM_SM100_TUNING_CONFIG,
+        inputs=[a, b, None, False, out, workspace_buffer],
+    )
+
+
+@pytest.mark.parametrize(
+    "pre_tune,tune_mode,expected_cache_hit",
+    [
+        (False, False, False),  # Cold inference: no cache hit
+        (False, True, True),  # Tune in this call: cache hit
+        (True, False, True),  # Warm cache then inference: cache hit
+    ],
+    ids=["cold_infer", "tune_now", "warm_then_infer"],
+)
+@pytest.mark.parametrize(
+    "m,n,k",
+    [
+        # Test power-of-2 dimensions
+        (128, 64, 256),
+        (2048, 256, 512),
+        # Test non power-of-2 dimensions
+        (48, 80, 64),
+        (200, 2048, 200),
+    ],
+)
+def test_autotuner_gemm(pre_tune, tune_mode, expected_cache_hit, m, n, k):
+    _skip_unless_supported("cudnn")
+
+    autotuner = AutoTuner.get()
+    # Keep each test independent from other parametrized runs.
+    autotuner.clear_cache()
+
+    a, b = _make_inputs(m, n, k)
+
+    if pre_tune:
+        with autotune(tune_mode=True):
+            mm_bf16(a, b, backend="cudnn")
+
+    with autotune(tune_mode=tune_mode):
+        out = mm_bf16(a, b, backend="cudnn")
+
+    assert out.isfinite().all()
+
+    is_a_k_major = a.stride(-1) == 1
+    is_b_k_major = b.stride(-2) == 1
+    is_cache_hit, runner_id, tactic, stored_profile = _search_bf16_gemm_cache(
+        _cudnn_gemm_bf16_runner(is_a_k_major=is_a_k_major, is_b_k_major=is_b_k_major),
+        a,
+        b,
+        out,
+    )
+
+    assert is_cache_hit == expected_cache_hit
+    if is_cache_hit:
+        assert runner_id == 0
+        # Tactic == -1 would mean the fallback path was chosen (no hit),
+        # which contradicts the hit.
+        assert tactic >= 0
+        assert stored_profile is not None
+
+
+@pytest.mark.parametrize("backend", ["cudnn", "cublaslt"])
+def test_autotuner_gemm_cross_bucket_m(backend):
+    """Tune at one M bucket, then run inference at a non-bucket M.
+
+    The cuBLASLt algo list is enumerated at the *real* shape, so a tactic
+    tuned against a different (bucketed) M may be out of range for the
+    runtime algo list. This must NOT raise (the runner clamps an
+    out-of-range index back to the heuristic default), and the autotuner
+    must still reuse the tuned bucket entry for the non-bucket M — the
+    runner's cache-key extras must not contain the raw M, and the
+    workspace scratch size (which a backend may grow mid-tuning) must not
+    leak into the cache key.
+    """
+    _skip_unless_supported(backend)
+
+    autotuner = AutoTuner.get()
+    autotuner.clear_cache()
+
+    n, k = 64, 256
+    # Tuning at M=256 profiles all buckets up to 256 (incl. 128). A runtime
+    # M=100 rounds up to bucket 128, so real-M (100) != bucket-M (128).
+    tune_m, run_m = 256, 100
+
+    # 1) Tune over the bucket range.
+    a, b = _make_inputs(tune_m, n, k)
+    with autotune(tune_mode=True):
+        mm_bf16(a, b, backend=backend)
+
+    # 2) Run at a non-bucket M. Must not raise (out-of-range tactic is
+    #    clamped) and must produce finite output.
+    a, b = _make_inputs(run_m, n, k)
+    out = mm_bf16(a, b, backend=backend)
+    assert out.isfinite().all()
+
+    # 3) The tuned bucket entry must be reused for the non-bucket M.
+    if backend == "cudnn":
+        runner = _cudnn_gemm_bf16_runner(
+            is_a_k_major=a.stride(-1) == 1,
+            is_b_k_major=b.stride(-2) == 1,
+        )
+    else:
+        runner = get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner()
+    is_cache_hit, runner_id, tactic, stored_profile = _search_bf16_gemm_cache(
+        runner, a, b, out
+    )
+    assert is_cache_hit
+    assert tactic >= 0
+    assert stored_profile is not None
