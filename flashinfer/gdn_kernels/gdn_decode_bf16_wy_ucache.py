@@ -75,7 +75,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 from cutlass import const_expr
 import cutlass.cute as cute
-import cutlass.cute.experimental  # noqa: F401  # side effect: registers cute.experimental.jit
 import cutlass.utils as utils
 from cutlass.cute.arch import sync_threads
 from cutlass.cute.nvgpu import cpasync
@@ -721,7 +720,7 @@ class GdnDecodeUCacheKernel:
         # never read its writes.
         self._launch_pdl = bool(launch_pdl)
 
-    @cute.experimental.jit
+    @cute.jit
     def __call__(
         self,
         gQ: cute.Tensor,
@@ -800,7 +799,7 @@ class GdnDecodeUCacheKernel:
             use_pdl=self._launch_pdl,
         )
 
-    @cute.experimental.kernel
+    @cute.kernel
     def kernel(
         self,
         gQ: cute.Tensor,
