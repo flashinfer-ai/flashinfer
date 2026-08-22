@@ -17,6 +17,7 @@ import torch
 from .jit.cake_fmha import (
     CakeFmhaTarget,
     get_cake_fmha_manifest,
+    _is_cake_fmha_decode_native_bf16_available,
     load_cake_fmha_context_bf16_module,
     load_cake_fmha_context_fp8_module,
     load_cake_fmha_context_nvfp4_module,
@@ -163,7 +164,25 @@ def cake_fmha_route_is_optimized(
 ) -> bool:
     """Return whether ``route`` has a fully authenticated runnable adapter."""
 
-    return route is not None and all(
+    if route is None:
+        return False
+    if (
+        isinstance(route, CakeFmhaDecodeRoute)
+        and route.component == "decode_native_bf16"
+        and not _is_cake_fmha_decode_native_bf16_available(
+            route.target,
+            route.batch_size,
+            route.q_len,
+            route.num_q_heads,
+            route.num_kv_heads,
+            has_sink=route.has_sink,
+            has_window=route.has_window,
+            use_scale_ptr=route.use_scale_ptr,
+            retain_kv_l2=route.retain_kv_l2,
+        )
+    ):
+        return False
+    return all(
         component in _AUTHENTICATED_JIT_COMPONENTS
         for component in _route_components(route)
     )
@@ -601,7 +620,7 @@ def select_cake_fmha_decode_route(
     local_blocks = max(1, (max_seq_len + 127) // 128)
 
     def route(component, *, selected_page_size: int = page_size):
-        return CakeFmhaDecodeRoute(
+        candidate = CakeFmhaDecodeRoute(
             target=_cake_fmha_target(device),
             batch_size=batch_size,
             q_len=q_len,
@@ -614,6 +633,11 @@ def select_cake_fmha_decode_route(
             component=component,
             page_size=selected_page_size,
         )
+        if component == "decode_native_bf16" and not cake_fmha_route_is_optimized(
+            candidate
+        ):
+            return None
+        return candidate
 
     dtypes = (query.dtype, key_cache.dtype, value_cache.dtype, out.dtype)
     no_block_scales = key_block_scales is None and value_block_scales is None

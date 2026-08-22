@@ -273,11 +273,12 @@ def _validate_decode_quant_nvfp4_specialization(
     return {"PAGE_SIZE": page_size}
 
 
-def _get_component_launch_sources(
+def _get_component_member(
     component_name: str,
-    target: CakeFmhaTarget,
     selector: Mapping[str, int],
-) -> tuple[Path, Path]:
+    *,
+    required: bool,
+) -> dict[str, Any] | None:
     component = get_cake_fmha_manifest()["components"][component_name]
     normalized_selector = dict(sorted(selector.items()))
     matches = [
@@ -285,14 +286,106 @@ def _get_component_launch_sources(
         for member in component["source_family"]
         if member.get("selector") == normalized_selector
     ]
-    if len(matches) != 1:
+    if len(matches) > 1 or (required and len(matches) != 1):
         raise RuntimeError(
             "Cake FMHA component selector is not unique: "
             f"{component_name} {normalized_selector!r}"
         )
+    return matches[0] if matches else None
+
+
+@functools.cache
+def _resolve_decode_native_bf16_selector(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    *,
+    has_sink: bool,
+    has_window: bool,
+    use_scale_ptr: bool,
+    retain_kv_l2: bool,
+) -> dict[str, int] | None:
+    semantic_selector = _validate_decode_native_specialization(
+        target,
+        batch_size,
+        q_len,
+        num_q_heads,
+        num_kv_heads,
+        has_sink=has_sink,
+        has_window=has_window,
+        use_scale_ptr=use_scale_ptr,
+        retain_kv_l2=retain_kv_l2,
+    )
+    exact_selector = {
+        **semantic_selector,
+        "BATCH_SIZE": batch_size,
+        "Q_LEN": q_len,
+        "NUM_Q_HEADS": num_q_heads,
+        "NUM_KV_HEADS": num_kv_heads,
+    }
+    if (
+        _get_component_member(
+            "decode_native_bf16", exact_selector, required=False
+        )
+        is not None
+    ):
+        return dict(sorted(exact_selector.items()))
+    if (
+        _get_component_member(
+            "decode_native_bf16", semantic_selector, required=False
+        )
+        is not None
+    ):
+        return dict(sorted(semantic_selector.items()))
+    return None
+
+
+def _is_cake_fmha_decode_native_bf16_available(
+    target: CakeFmhaTarget,
+    batch_size: int,
+    q_len: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    *,
+    has_sink: bool,
+    has_window: bool,
+    use_scale_ptr: bool,
+    retain_kv_l2: bool,
+) -> bool:
+    """Return whether the authenticated manifest contains this BF16 route."""
+
+    return (
+        _resolve_decode_native_bf16_selector(
+            target,
+            batch_size,
+            q_len,
+            num_q_heads,
+            num_kv_heads,
+            has_sink=has_sink,
+            has_window=has_window,
+            use_scale_ptr=use_scale_ptr,
+            retain_kv_l2=retain_kv_l2,
+        )
+        is not None
+    )
+
+
+def _get_component_launch_sources(
+    component_name: str,
+    target: CakeFmhaTarget,
+    selector: Mapping[str, int],
+) -> tuple[Path, Path]:
+    component = get_cake_fmha_manifest()["components"][component_name]
+    member = _get_component_member(component_name, selector, required=True)
+    assert member is not None
     csrc_dir = get_cake_fmha_csrc_dir()
-    body = csrc_dir / matches[0]["sources"][_TARGET_MANIFEST_ARCH[target]]
-    launch_binding = csrc_dir / component["binding_source"]
+    body = csrc_dir / member["sources"][_TARGET_MANIFEST_ARCH[target]]
+    launch_override = member.get("launch_override") or {}
+    launch_binding = csrc_dir / launch_override.get(
+        "binding_source", component["binding_source"]
+    )
     for source in (body, launch_binding):
         if not source.is_file():
             raise FileNotFoundError(f"Cake FMHA JIT source not found: {source}")
@@ -1067,7 +1160,7 @@ def gen_cake_fmha_decode_native_bf16_module(
 ) -> JitSpec:
     """Build one authenticated decode-native BF16 specialization."""
 
-    selector = _validate_decode_native_specialization(
+    selector = _resolve_decode_native_bf16_selector(
         target,
         batch_size,
         q_len,
@@ -1078,6 +1171,10 @@ def gen_cake_fmha_decode_native_bf16_module(
         use_scale_ptr=use_scale_ptr,
         retain_kv_l2=retain_kv_l2,
     )
+    if selector is None:
+        raise RuntimeError(
+            "Cake FMHA decode-native BF16 specialization is absent from the manifest"
+        )
     sources = _get_component_sources(
         "decode_native_bf16",
         target,

@@ -187,6 +187,141 @@ def test_cake_fmha_decode_native_bf16_jit_selects_one_manifest_member(
     assert "-DCAKE_FMHA_USE_SCALE_PTR=1" in spec.extra_cuda_cflags
 
 
+@pytest.mark.parametrize(
+    ("target", "manifest_arch"),
+    (("sm100a", "sm_100a"), ("sm103a", "sm_103a")),
+)
+def test_cake_fmha_decode_native_bf16_jit_selects_all_exact_manifest_members(
+    monkeypatch, target, manifest_arch
+) -> None:
+    import flashinfer.jit.core as jit_core
+    from flashinfer.jit import cake_fmha as cake_jit
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    component = get_cake_fmha_manifest()["components"]["decode_native_bf16"]
+    exact_members = [
+        member
+        for member in component["source_family"]
+        if "BATCH_SIZE" in member["selector"]
+    ]
+    assert len(exact_members) == 5
+
+    selected_batches = set()
+    csrc_dir = cake_jit.get_cake_fmha_csrc_dir()
+    for member in exact_members:
+        selector = member["selector"]
+        selected_batches.add(selector["BATCH_SIZE"])
+        spec = gen_cake_fmha_decode_native_bf16_module(
+            target,
+            selector["BATCH_SIZE"],
+            selector["Q_LEN"],
+            selector["NUM_Q_HEADS"],
+            selector["NUM_KV_HEADS"],
+            has_sink=bool(selector["HAS_SINK"]),
+            has_window=bool(selector["HAS_WINDOW"]),
+            use_scale_ptr=bool(selector["USE_SCALE_PTR"]),
+            retain_kv_l2=bool(selector["RETAIN_KV_L2"]),
+        )
+        assert Path(spec.sources[0]) == csrc_dir / member["sources"][manifest_arch]
+        launch_override = member.get("launch_override") or {}
+        expected_binding = launch_override.get(
+            "binding_source", component["binding_source"]
+        )
+        assert Path(spec.sources[1]) == csrc_dir / expected_binding
+
+        route = cake_api.CakeFmhaDecodeRoute(
+            target=target,
+            batch_size=selector["BATCH_SIZE"],
+            q_len=selector["Q_LEN"],
+            num_q_heads=selector["NUM_Q_HEADS"],
+            num_kv_heads=selector["NUM_KV_HEADS"],
+            has_sink=bool(selector["HAS_SINK"]),
+            has_window=bool(selector["HAS_WINDOW"]),
+            use_scale_ptr=bool(selector["USE_SCALE_PTR"]),
+            retain_kv_l2=bool(selector["RETAIN_KV_L2"]),
+        )
+        assert cake_api.cake_fmha_route_is_optimized(route)
+
+        if selector["BATCH_SIZE"] == 4:
+            assert Path(spec.sources[1]).name == (
+                "cake_fmha_decode_native_bf16_b4_exact_cga_binding.cu"
+            )
+        if selector["BATCH_SIZE"] == 256:
+            assert selector == {
+                "BATCH_SIZE": 256,
+                "HAS_SINK": 1,
+                "HAS_WINDOW": 0,
+                "NUM_KV_HEADS": 4,
+                "NUM_Q_HEADS": 32,
+                "Q_LEN": 1,
+                "RETAIN_KV_L2": 0,
+                "USE_SCALE_PTR": 0,
+            }
+
+    assert selected_batches == {4, 128, 256}
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize(
+    ("has_sink", "retain_kv_l2"),
+    ((True, False), (False, False), (False, True), (True, True)),
+)
+def test_cake_fmha_decode_native_bf16_absent_selectors_fall_back_to_compat(
+    monkeypatch, target, has_sink, retain_kv_l2
+) -> None:
+    compat_sentinel = object()
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    monkeypatch.setattr(
+        cake_api,
+        "load_cake_fmha_compat_module",
+        lambda selected_target: (
+            compat_sentinel
+            if selected_target == target
+            else pytest.fail("compat target mismatch")
+        ),
+    )
+    monkeypatch.setattr(
+        cake_api,
+        "load_cake_fmha_decode_native_bf16_module",
+        lambda *args, **kwargs: pytest.fail("absent BF16 selector must not load"),
+    )
+
+    batch_size = 2
+    query = torch.empty((batch_size, 4, 128), dtype=torch.bfloat16)
+    key = torch.empty((4, 2, 16, 128), dtype=torch.bfloat16)
+    max_seq_len = 31 if retain_kv_l2 else 1153
+    route = cake_api.select_cake_fmha_decode_route(
+        query.device,
+        query=query,
+        key_cache=key,
+        value_cache=torch.empty_like(key),
+        out=torch.empty_like(query),
+        workspace_buffer=torch.empty(4096, dtype=torch.uint8),
+        block_tables=torch.zeros((batch_size, 2), dtype=torch.int32),
+        seq_lens=torch.full((batch_size,), max_seq_len, dtype=torch.int32),
+        batch_size=batch_size,
+        q_len=1,
+        max_seq_len=max_seq_len,
+        window_left=127,
+        bmm1_scale=torch.ones(1, dtype=torch.float32),
+        bmm2_scale=1.0,
+        o_scale=1.0,
+        sinks=torch.zeros(4, dtype=torch.float32) if has_sink else None,
+        kv_layout="HND",
+        uses_shared_paged_kv_idx=True,
+        cum_seq_lens_q=None,
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=None,
+        enable_block_sparse_attention=False,
+    )
+    assert route is None
+    assert (
+        cake_api.get_cake_fmha_decode_module(torch.device("cpu"), route)
+        is compat_sentinel
+    )
+
+
 def test_cake_fmha_decode_native_fp16_nhd_jit_selects_one_manifest_member(
     monkeypatch,
 ) -> None:
