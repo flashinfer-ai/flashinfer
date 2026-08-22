@@ -563,6 +563,26 @@ inline CUtensorMap EncodeValueTma(const TensorView& tensor) {
   const int64_t d1 = tensor.size(tensor.ndim() - 1);
   const int64_t d2 = tensor.size(tensor.ndim() - 2);
   const int64_t outer2 = tensor.numel() / (d1 * d2);
+  if constexpr (ValueRows == 128 && ChunkTokens == 16) {
+    TVM_FFI_ICHECK(d1 >= ValueRows && d1 % 64 == 0 && d2 >= 1 && outer2 > 0)
+        << "v cannot encode the (64, 1, 16, 1) split-panel TMA box";
+    uint64_t global_dim[4] = {64, static_cast<uint64_t>(d2), static_cast<uint64_t>(outer2),
+                              static_cast<uint64_t>(d1 / 64)};
+    uint64_t global_strides[3] = {static_cast<uint64_t>(d1 * sizeof(__nv_bfloat16)),
+                                  static_cast<uint64_t>(d1 * d2 * sizeof(__nv_bfloat16)),
+                                  static_cast<uint64_t>(64 * sizeof(__nv_bfloat16))};
+    uint32_t box_dim[4] = {64, 1, ChunkTokens, 1};
+    uint32_t elem_strides[4] = {1, 1, 1, 1};
+    CUtensorMap tensor_map{};
+    const CUresult result =
+        cuTensorMapEncodeTiled(&tensor_map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, tensor.data_ptr(),
+                               global_dim, global_strides, box_dim, elem_strides,
+                               CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+                               CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TVM_FFI_ICHECK(result == CUDA_SUCCESS)
+        << "cuTensorMapEncodeTiled failed for split-panel v with CUresult=" << int(result);
+    return tensor_map;
+  }
   uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2),
                             static_cast<uint64_t>(outer2)};
   TVM_FFI_ICHECK(global_dim[0] >= ValueRows && global_dim[1] >= 1 && global_dim[2] > 0)

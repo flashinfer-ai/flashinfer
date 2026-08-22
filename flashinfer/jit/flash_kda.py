@@ -70,8 +70,8 @@ _FLASH_KDA_TARGET_DEFINE = {
 # refreshed export or binding specialization after an in-place package upgrade.
 _FLASH_KDA_MODULE_IDENTS = {
     "m64": "9a5566f3be",
-    "m128": "564a06c652",
-    "m128_n16": "65709d917f",
+    "m128": "ae83f7331a",
+    "m128_n16": "bfc7b64cd3",
     # Generated body, binding, and shared binding header, separated by NUL
     # bytes without a trailing separator. Keep this route's cache key tied to
     # all compiled content.
