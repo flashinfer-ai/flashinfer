@@ -74,6 +74,9 @@ sequence use the small-BH owner/helper schedule when all eight CTAs per task
 can reside concurrently. Calls outside that measured region continue through
 the existing direct or fallback route; it is not a public-input allowlist.
 
+At maximum sequence length 16 or below, H96 uses the N32 schedule to retain
+the qualified BF16 error bound; H12 and other qualified head counts retain N16.
+
 The frozen H12 N16 schedule's residual recurrence rounds four intermediates
 through BF16: the state/K
 prediction, the V-minus-prediction delta, sigmoid beta, and the post-beta

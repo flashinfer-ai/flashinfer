@@ -1082,6 +1082,14 @@ def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
         == "direct_m128"
     )
     assert (
+        kda_prefill_api._direct_m128_route(num_heads=96, max_sequence_length=16)
+        == "direct_m128"
+    )
+    assert (
+        kda_prefill_api._direct_m128_route(num_heads=12, max_sequence_length=16)
+        == "direct_m128_n16"
+    )
+    assert (
         kda_prefill_api._bt16_chunks_per_prepare_cta(num_heads=12, total_chunks=128)
         == 1
     )
@@ -2819,21 +2827,37 @@ def test_frozen_prefill_m64_matches_reference(flash_kda_device):
 
 
 @pytest.mark.parametrize(
-    ("packed", "num_heads", "has_initial_state"),
-    [(False, 64, True), (True, 2, False)],
+    (
+        "packed",
+        "num_heads",
+        "has_initial_state",
+        "seq_lens",
+        "output_final_state",
+        "seed",
+        "compare_eager_control",
+    ),
+    [
+        (False, 64, True, (2,), True, 2028, False),
+        (True, 2, False, (1, 2), True, 2028, False),
+        (True, 96, True, (16,), False, 11018, True),
+    ],
 )
 def test_frozen_prefill_cuda_graph_capture_and_replay(
     flash_kda_device,
     packed,
     num_heads,
     has_initial_state,
+    seq_lens,
+    output_final_state,
+    seed,
+    compare_eager_control,
 ):
     inputs = _make_inputs(
-        seq_lens=[1, 2] if packed else [2],
+        seq_lens=seq_lens,
         num_heads=num_heads,
         packed=packed,
         initial_state=has_initial_state,
-        seed=2028,
+        seed=seed,
     )
     initial_state_seed = (
         inputs["initial_state"].clone() if inputs["initial_state"] is not None else None
@@ -2848,7 +2872,13 @@ def test_frozen_prefill_cuda_graph_capture_and_replay(
     )
     output = torch.empty_like(inputs["q"])
     seq_order = (
-        torch.tensor([1, 0], dtype=torch.int32, device=flash_kda_device)
+        torch.arange(
+            len(seq_lens) - 1,
+            -1,
+            -1,
+            dtype=torch.int32,
+            device=flash_kda_device,
+        )
         if packed
         else None
     )
@@ -2859,13 +2889,21 @@ def test_frozen_prefill_cuda_graph_capture_and_replay(
     call_kwargs = {
         **_strict_prefill_kwargs(inputs),
         "output": output,
-        "output_final_state": True,
+        "output_final_state": output_final_state,
         "seq_order": seq_order,
         "prefill_workspace": workspace,
         "backend": "cake",
     }
     with torch.cuda.stream(capture_stream):
-        recurrent_kda(**call_kwargs)
+        warm_output, warm_state = recurrent_kda(**call_kwargs)
+    capture_stream.synchronize()
+    observed_warm_state = (
+        inputs["initial_state"] if inputs["initial_state"] is not None else warm_state
+    )
+    assert observed_warm_state is not None
+    with torch.cuda.stream(capture_stream):
+        warm_output_control = warm_output.clone()
+        warm_state_control = observed_warm_state.clone()
         if initial_state_seed is not None:
             inputs["initial_state"].copy_(initial_state_seed)
         output.zero_()
@@ -2884,23 +2922,48 @@ def test_frozen_prefill_cuda_graph_capture_and_replay(
     torch.cuda.synchronize()
 
     assert captured_output.data_ptr() == output.data_ptr()
-    if inputs["initial_state"] is None:
+    if not output_final_state:
+        assert captured_state is None
+    elif inputs["initial_state"] is None:
+        assert captured_state is not None
         assert captured_state.data_ptr() == workspace._state_scratch.data_ptr()
     else:
         assert captured_state is inputs["initial_state"]
     assert workspace._captured
-    torch.testing.assert_close(
-        captured_output.float(),
-        expected_output.float(),
-        atol=1e-2,
-        rtol=1e-2,
+    observed_captured_state = (
+        inputs["initial_state"]
+        if inputs["initial_state"] is not None
+        else captured_state
     )
-    torch.testing.assert_close(
-        captured_state.float(),
-        expected_state.float(),
-        atol=1e-2,
-        rtol=1e-2,
-    )
+    assert observed_captured_state is not None
+    if compare_eager_control:
+        torch.testing.assert_close(
+            warm_output_control.float(),
+            expected_output.float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        torch.testing.assert_close(
+            warm_state_control.float(),
+            expected_state.float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        assert torch.equal(captured_output, warm_output_control)
+        assert torch.equal(observed_captured_state, warm_state_control)
+    else:
+        torch.testing.assert_close(
+            captured_output.float(),
+            expected_output.float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+        torch.testing.assert_close(
+            observed_captured_state.float(),
+            expected_state.float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
 
 
 @pytest.mark.parametrize("num_heads", [12, 64])
