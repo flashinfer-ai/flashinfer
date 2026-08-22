@@ -1868,6 +1868,49 @@ def test_gpu_arch_resolves_from_requested_device():
             torch.cuda.set_device(cur)
 
 
+def test_launch_rejects_arch_it_cannot_run(monkeypatch):
+    """A launch target whose arch differs from the current device must raise.
+
+    CuTe-DSL does not reject a --gpu-arch the current device cannot execute: it
+    compiles, exports, reloads and then fails only on first invocation (measured
+    on sm_100a for sm_90a, sm_103a and sm_80). Exporting and reloading does not
+    help because load_module performs no architecture check, so the mismatch has
+    to be caught before the caller receives the callable.
+
+    The arch lookup is stubbed so the check is exercised on a single-GPU host;
+    the real heterogeneous path is covered separately. Regression for PR #4365
+    review r3824968121.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    from flashinfer.attn_scores import attn_scores as A
+
+    cur = torch.cuda.current_device()
+    other = cur + 1  # need not exist: only the arch lookup is consulted
+
+    # Same device: must never raise, regardless of what the lookup returns.
+    monkeypatch.setattr(A, "_cached_gpu_arch", lambda i: "sm_100a")
+    assert A._arch_for_launch(cur, "fp8_paged_mqa_logits") == "sm_100a"
+
+    # Different device, same arch: allowed here (a same-arch device mismatch is
+    # a stream-placement concern, deliberately out of this check's scope).
+    assert A._arch_for_launch(other, "fp8_paged_mqa_logits") == "sm_100a"
+
+    # Different device, different arch: rejected, and the message must name
+    # both devices and both archs so the fix is obvious.
+    monkeypatch.setattr(
+        A, "_cached_gpu_arch", lambda i: "sm_100a" if i == other else "sm_90a"
+    )
+    with pytest.raises(ValueError) as e:
+        A._arch_for_launch(other, "fp8_paged_mqa_logits")
+    msg = str(e.value)
+    assert "fp8_paged_mqa_logits" in msg
+    assert "sm_100a" in msg and "sm_90a" in msg
+    assert f"cuda:{other}" in msg and f"cuda:{cur}" in msg
+    assert "torch.cuda.device" in msg, "the error should say how to fix it"
+
+
 def test_arch_is_part_of_the_compile_cache_key():
     """Two architectures must not share a compiled-kernel cache entry.
 

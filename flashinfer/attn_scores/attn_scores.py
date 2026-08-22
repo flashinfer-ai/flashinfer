@@ -172,6 +172,43 @@ def _cached_gpu_arch(device_index: int) -> str:
     return f"sm_{major}{minor_str}"
 
 
+def _arch_for_launch(device_index: int, fn_name: str) -> str:
+    """Codegen arch for a launch, rejecting a target this process cannot run.
+
+    CuTe-DSL does not reject a ``--gpu-arch`` the current device cannot
+    execute.  Measured on sm_100a: sm_90a, sm_103a and sm_80 each compile
+    cleanly, export, reload, and then raise only on first invocation.
+    Exporting and reloading does not help -- ``load_module`` performs no
+    architecture check -- so a mismatch has to be caught here, before the
+    caller is handed a callable with no execution engine.
+
+    Only the *arch* is checked, and only when the tensors are on a device
+    other than the current one.  A same-arch device mismatch (two identical
+    GPUs) is a separate concern: the launch takes the current device's
+    stream, which is wrong independently of codegen, and is not addressed
+    here.
+
+    ``precompile_paged_mqa_logits`` deliberately does NOT use this: building a
+    foreign-arch artifact for another worker to load later is its documented
+    job, and it never invokes what it builds.
+    """
+    arch = _cached_gpu_arch(device_index)
+    current = torch.cuda.current_device()
+    if device_index != current:
+        runnable = _cached_gpu_arch(current)
+        if arch != runnable:
+            raise ValueError(
+                f"{fn_name}: tensors are on cuda:{device_index} ({arch}) but the "
+                f"current CUDA device is cuda:{current} ({runnable}). The kernel "
+                f"would be generated for {arch} and launched from a {runnable} "
+                f"context; CuTe-DSL accepts that at compile time and fails only "
+                f"on invocation, so it is rejected here instead. Make the target "
+                f"current, e.g. `with torch.cuda.device({device_index}):`, or "
+                f"move the tensors to cuda:{current}."
+            )
+    return arch
+
+
 @functools.cache
 def _cached_num_sms(device_index: int) -> int:
     """Cache SM count per device — get_device_sm_count has non-trivial overhead."""
@@ -789,7 +826,9 @@ def _gpu_schedule(
         aligned_b,
         _SPLIT_KV,
         num_sms,
-        _cached_gpu_arch(get_device_index(schedule_meta.device)),
+        _arch_for_launch(
+            get_device_index(schedule_meta.device), "compute_paged_mqa_logits_schedule"
+        ),
     )
     compiled(context_lens, schedule_meta, batch_size)
 
@@ -1118,7 +1157,7 @@ def fp8_paged_mqa_logits(
         cutlass_acc,
         cutlass_out,
         num_epi_subtiles,
-        _cached_gpu_arch(get_device_index(q.device)),
+        _arch_for_launch(get_device_index(q.device), "fp8_paged_mqa_logits"),
     )
 
     # FP8 tensor passed as uint8 view (DLPack lacks float8 support)
@@ -1440,7 +1479,7 @@ def fp4_paged_mqa_logits(
         cutlass_out,
         num_epi_subtiles,
         is_kv_sf_interleaved,
-        _cached_gpu_arch(get_device_index(q.device)),
+        _arch_for_launch(get_device_index(q.device), "fp4_paged_mqa_logits"),
     )
     compiled(
         kv_flat,
