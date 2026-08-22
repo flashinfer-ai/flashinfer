@@ -110,6 +110,15 @@ from .mxfp8 import (
     mxfp8_mega_launch_thunk,
     mxfp8_mega_moe,
 )
+from .bf16_mxfp8 import (
+    MegaMoEBf16Mxfp8Config,
+    MegaMoEBf16Mxfp8Frontend,
+    MegaMoEBf16Mxfp8Inputs,
+    MegaMoEBf16Mxfp8SymmBuffer,
+    get_symm_buffer_for_bf16_mxfp8_mega_moe,
+    bf16_mxfp8_mega_launch_thunk,
+    bf16_mxfp8_mega_moe,
+)
 from .bf16 import (
     MegaMoEBf16Config,
     MegaMoEBf16Frontend,
@@ -133,8 +142,10 @@ from .tuner import (
 # Online (warmup-time) collective knob autotuning.
 from .autotune import (
     autotune_bf16_mega_moe,
+    autotune_bf16_mxfp8_mega_moe,
     autotune_knobs,
     bf16_candidates,
+    bf16_mxfp8_candidates,
     autotune_mxfp8_mega_moe,
     autotune_nvfp4_mega_moe,
     mxfp8_candidates,
@@ -208,6 +219,14 @@ __all__ = [
     "get_symm_buffer_for_mxfp8_mega_moe",
     "mxfp8_mega_launch_thunk",
     "mxfp8_mega_moe",
+    # mixed MXFP8-weight/BF16-activation
+    "MegaMoEBf16Mxfp8Config",
+    "MegaMoEBf16Mxfp8Frontend",
+    "MegaMoEBf16Mxfp8Inputs",
+    "MegaMoEBf16Mxfp8SymmBuffer",
+    "get_symm_buffer_for_bf16_mxfp8_mega_moe",
+    "bf16_mxfp8_mega_launch_thunk",
+    "bf16_mxfp8_mega_moe",
     # bf16
     "MegaMoEBf16Config",
     "MegaMoEBf16Frontend",
@@ -227,8 +246,10 @@ __all__ = [
     # autotune
     "autotune_knobs",
     "autotune_bf16_mega_moe",
+    "autotune_bf16_mxfp8_mega_moe",
     "autotune_mxfp8_mega_moe",
     "autotune_nvfp4_mega_moe",
+    "bf16_mxfp8_candidates",
     "mxfp8_candidates",
     "nvfp4_candidates",
 ]

@@ -1,4 +1,4 @@
-"""Mega-path MXFP8 weight preprocessing for CuTeDSL MegaMoE."""
+"""Mixed MXFP8-weight/BF16-activation MegaMoE weight preprocessing."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ TransformedMegaWeights = Tuple[
     Tuple["torch.Tensor", "torch.Tensor"],
 ]
 
-Mxfp8Kind = Literal["mxfp8_e4m3", "mxfp8_e5m2"]
+Bf16Mxfp8Kind = Literal["bf16_mxfp8_e4m3", "bf16_mxfp8_e5m2"]
 
 
 def _fc1_weight_from_w13(
@@ -35,37 +35,29 @@ def _fc1_weight_from_w13(
         raise ValueError(
             f"expected w13 with {2 * i} rows (gate||up), got shape {tuple(w13.shape)}"
         )
-    return (
-        _interleave_gate_up_32(w13, intermediate_size=2 * i)
-        .transpose(1, 2)
-        .contiguous()
-    )
+    return _interleave_gate_up_16(w13, intermediate_size=2 * i).transpose(1, 2)
 
 
-def _interleave_gate_up_32(
+def _interleave_gate_up_16(
     tensor: "torch.Tensor", *, intermediate_size: int
 ) -> "torch.Tensor":
-    from ......kernel_src.cutedsl_megamoe import Mxfp8BlockSize
-
     return interleave_gate_up(
         tensor,
         intermediate_size=intermediate_size,
-        block_size=Mxfp8BlockSize,
-        kernel_name="MXFP8 MegaMOE",
+        block_size=16,
+        kernel_name="mixed MXFP8/BF16 MegaMOE",
     )
 
 
 def _fc1_kernel_weight_from_canonical_mxfp8(
     w13: "torch.Tensor", *, intermediate_size: int
 ) -> "torch.Tensor":
-    return (
-        _interleave_gate_up_32(w13, intermediate_size=2 * intermediate_size)
-        .transpose(1, 2)
-        .contiguous()
-    )
+    return _interleave_gate_up_16(
+        w13, intermediate_size=2 * intermediate_size
+    ).transpose(1, 2)
 
 
-def _is_mxfp8_weight(weight: "torch.Tensor", *, kind: Mxfp8Kind) -> bool:
+def _is_mxfp8_weight(weight: "torch.Tensor", *, kind: Bf16Mxfp8Kind) -> bool:
     return weight.dtype == _mxfp8_data_dtype(kind)
 
 
@@ -74,7 +66,7 @@ def preprocess_mega_weights(
     *,
     intermediate_size: int,
     hidden_size: int,
-    kind: Mxfp8Kind = "mxfp8_e4m3",
+    kind: Bf16Mxfp8Kind = "bf16_mxfp8_e4m3",
     gate_up_clamp: float | None = None,
     activation_clamp: float | None = None,
 ) -> TransformedMegaWeights:
@@ -155,8 +147,8 @@ def preprocess_mega_weights(
             fc1_weight = _fc1_kernel_weight_from_canonical_mxfp8(
                 weights.w13, intermediate_size=intermediate_size
             )
-            fc2_weight = weights.w2.transpose(1, 2).contiguous()
-            w13_scale = _interleave_gate_up_32(w13_scale_in, intermediate_size=fc1_out)
+            fc2_weight = weights.w2.transpose(1, 2)
+            w13_scale = _interleave_gate_up_16(w13_scale_in, intermediate_size=fc1_out)
         else:
             raise ValueError(
                 "pre-quantized MXFP8 weights must be in kernel layout "
@@ -198,13 +190,13 @@ def preprocess_mega_weights(
                 fc2_hw,
                 kind=kind,
             )
-            fc1_q_parts.append(fc1_q.transpose(0, 1))
+            fc1_q_parts.append(fc1_q)
             fc1_sf_parts.append(fc1_sf)
-            fc2_q_parts.append(fc2_q.transpose(0, 1))
+            fc2_q_parts.append(fc2_q)
             fc2_sf_parts.append(fc2_sf)
 
-        fc1_weight = torch.stack(fc1_q_parts, dim=0)
-        fc2_weight = torch.stack(fc2_q_parts, dim=0)
+        fc1_weight = torch.stack(fc1_q_parts, dim=0).transpose(1, 2)
+        fc2_weight = torch.stack(fc2_q_parts, dim=0).transpose(1, 2)
         fc1_sf_swizzled = [_swizzle_expert_scales(sf) for sf in fc1_sf_parts]
         fc2_sf_swizzled = [_swizzle_expert_scales(sf) for sf in fc2_sf_parts]
 
@@ -225,7 +217,7 @@ def validate_transformed_mega_weights(
     *,
     intermediate_size: int,
     hidden_size: int,
-    kind: Mxfp8Kind = "mxfp8_e4m3",
+    kind: Bf16Mxfp8Kind = "bf16_mxfp8_e4m3",
     world_size: int,
     num_experts: int,
 ) -> None:

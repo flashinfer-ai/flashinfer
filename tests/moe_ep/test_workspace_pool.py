@@ -3,8 +3,8 @@
 Without pooling every ``MoEEpMegaLayer`` allocates its own symmetric-heap
 workspace + compiled session (43x at DeepSeek-scale — the vLLM integration
 carried this as a wrapper-side cache). CPU tests cover the pool/refcount
-semantics and the base-class wiring; the GPU test proves two real nvfp4
-layers share one buffer and stay numerically correct through destroy.
+semantics and the base-class wiring; the GPU tests prove two real layers
+share one buffer and stay numerically correct through destroy.
 """
 
 from __future__ import annotations
@@ -148,6 +148,33 @@ def test_base_prepare_workspace_unpooled_when_key_none():
     ws1.destroy.assert_called_once()
 
 
+def _assert_two_layers_share_one_symm_buffer(
+    make_layer, tensors, *, warmup_with_tensors=False
+):
+    import torch
+
+    layer1 = make_layer(seed=100)
+    layer2 = make_layer(seed=100)
+    warmup_args = (tensors,) if warmup_with_tensors else ()
+    try:
+        layer1.warmup(*warmup_args)
+        layer2.warmup(*warmup_args)
+        assert layer1._workspace is layer2._workspace, "buffer not shared"
+
+        y1 = layer1.forward(tensors).clone()
+        y2 = layer2.forward(tensors)
+        torch.cuda.synchronize()
+        assert torch.equal(y1, y2), "shared-buffer layers disagree"
+
+        # First destroy must NOT free the shared buffer out from under layer2.
+        layer1.destroy()
+        y2b = layer2.forward(tensors)
+        torch.cuda.synchronize()
+        assert torch.equal(y2b, y2)
+    finally:
+        layer2.destroy()
+
+
 @pytest.mark.arch_blackwell
 def test_two_nvfp4_layers_share_one_symm_buffer(monkeypatch):
     """Two same-geometry layers: one buffer, one compile, correct numerics."""
@@ -210,34 +237,95 @@ def test_two_nvfp4_layers_share_one_symm_buffer(monkeypatch):
             ),
         )
 
-    layer1 = _layer(seed=100)
-    layer2 = _layer(seed=100)  # same weights -> same math
-    try:
-        layer1.warmup()
-        layer2.warmup()
-        assert layer1._workspace is layer2._workspace, "buffer not shared"
+    g = torch.Generator(device="cuda").manual_seed(9)
+    tensors = MoEEpTensors(
+        hidden_states=torch.randn(
+            32, hidden, dtype=torch.bfloat16, device="cuda", generator=g
+        ),
+        topk_ids=(torch.arange(32 * topk, device="cuda") % num_experts).view(32, topk),
+        topk_weights=torch.full((32, topk), 0.25, dtype=torch.float32, device="cuda"),
+    )
+    _assert_two_layers_share_one_symm_buffer(_layer, tensors)
 
-        g = torch.Generator(device="cuda").manual_seed(9)
-        t = MoEEpTensors(
-            hidden_states=torch.randn(
-                32, hidden, dtype=torch.bfloat16, device="cuda", generator=g
+
+@pytest.mark.arch_blackwell
+def test_two_bf16_mxfp8_layers_share_one_symm_buffer(monkeypatch):
+    """Two same-geometry mixed layers share a workspace through destroy."""
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from flashinfer.utils import get_compute_capability
+
+    cap = get_compute_capability(torch.device("cuda"))
+    if cap[0] != 10:
+        pytest.skip(f"needs sm_100/sm_103; got sm_{cap[0]}{cap[1]}")
+    pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpMegaLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+        Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    )
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    hidden, intermediate, num_experts, topk, max_tokens = 1024, 1024, 4, 2, 64
+
+    def _layer(seed: int) -> MoEEpMegaLayer:
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        w13 = torch.randn(
+            num_experts,
+            2 * intermediate,
+            hidden,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        w2 = torch.randn(
+            num_experts,
+            hidden,
+            intermediate,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        return MoEEpMegaLayer(
+            bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
+            fleet_params=FleetParams(
+                num_experts=num_experts,
+                max_tokens_per_rank=max_tokens,
+                token_hidden_size=hidden,
             ),
-            topk_ids=(torch.arange(32 * topk, device="cuda") % num_experts).view(
-                32, topk
-            ),
-            topk_weights=torch.full(
-                (32, topk), 0.25, dtype=torch.float32, device="cuda"
+            weights=MoEWeightPack(w13=w13, w2=w2),
+            backend=MegaConfig(
+                megakernel=Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
+                    intermediate_size=intermediate,
+                    top_k=topk,
+                ),
+                quantize_input=True,
+                preprocess_weights=True,
             ),
         )
-        y1 = layer1.forward(t).clone()
-        y2 = layer2.forward(t)
-        torch.cuda.synchronize()
-        assert torch.equal(y1, y2), "shared-buffer layers disagree"
 
-        # First destroy must NOT free the shared buffer out from under layer2.
-        layer1.destroy()
-        y2b = layer2.forward(t)
-        torch.cuda.synchronize()
-        assert torch.equal(y2b, y2)
-    finally:
-        layer2.destroy()
+    generator = torch.Generator(device="cuda").manual_seed(9)
+    tensors = MoEEpTensors(
+        hidden_states=torch.randn(
+            32,
+            hidden,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        ),
+        topk_ids=(torch.arange(32 * topk, device="cuda") % num_experts).view(32, topk),
+        topk_weights=torch.full(
+            (32, topk),
+            0.5,
+            dtype=torch.float32,
+            device="cuda",
+        ),
+    )
+    _assert_two_layers_share_one_symm_buffer(_layer, tensors, warmup_with_tensors=True)

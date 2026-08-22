@@ -1,4 +1,4 @@
-"""Stage BF16 activations and routing for BF16 MegaMoE."""
+"""Stage BF16 activations and routing for SM100 MegaMoE."""
 
 from __future__ import annotations
 
@@ -30,14 +30,8 @@ def validate_bf16_forward_inputs(
     fleet_params,
     *,
     top_k: int,
-    quantize_input: bool,
     scales: torch.Tensor | None = None,
 ) -> None:
-    if not quantize_input:
-        raise MoEEpConfigError(
-            "BF16 MegaMoE has no pre-quantized activation path; "
-            "set MegaConfig.quantize_input=True."
-        )
     if scales is not None:
         raise MoEEpConfigError("BF16 MegaMoE does not accept MoEEpTensors.scales.")
     validate_mega_forward_inputs(
