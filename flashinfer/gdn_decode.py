@@ -223,6 +223,18 @@ def gated_delta_rule_decode_pretranspose(
       ``>= 128``, and ``V`` must be a multiple of 8 (the pretranspose tile
       size ``TILE_V``).
     """
+    # The decode kernels are CuTe-DSL kernels and a DSL release that predates the
+    # device surfaces as a bare ``KeyError: 'sm_107a'`` from inside kernel
+    # compilation.  Fail with the standard, actionable message instead.  These
+    # kernels do not pin an arch (see ``_compile_options``), so they still run
+    # against the family target and ``native_only=False`` keeps the
+    # ``CUTE_DSL_ARCH=sm_100f`` escape hatch working.  Imported lazily:
+    # ``cute_dsl.utils`` imports ``cutlass`` at module scope and GDN must still
+    # import without nvidia-cutlass-dsl installed.
+    from .cute_dsl.utils import require_cute_dsl_arch
+
+    require_cute_dsl_arch(q.device, native_only=False)
+
     # Validate input shapes
     B, T, H, K = q.shape
     _, _, HV, V = v.shape
@@ -547,6 +559,18 @@ def gated_delta_rule_decode(
       (``TILE_V_SMALL_NT``).
     - State layout is k-major: ``[B, HV, K, V]`` (no transpose needed).
     """
+    # The decode kernels are CuTe-DSL kernels and a DSL release that predates the
+    # device surfaces as a bare ``KeyError: 'sm_107a'`` from inside kernel
+    # compilation.  Fail with the standard, actionable message instead.  These
+    # kernels do not pin an arch (see ``_compile_options``), so they still run
+    # against the family target and ``native_only=False`` keeps the
+    # ``CUTE_DSL_ARCH=sm_100f`` escape hatch working.  Imported lazily:
+    # ``cute_dsl.utils`` imports ``cutlass`` at module scope and GDN must still
+    # import without nvidia-cutlass-dsl installed.
+    from .cute_dsl.utils import require_cute_dsl_arch
+
+    require_cute_dsl_arch(q.device, native_only=False)
+
     # Validate input shapes
     B, T, H, K = q.shape
     assert T == 1, f"Decode only supports T=1, got T={T}"
@@ -744,6 +768,18 @@ def gated_delta_rule_mtp(
     - State layout is K-last: ``[pool_size, HV, V, K]``.
     - Optimized for speculative decoding verification scenarios.
     """
+    # The decode kernels are CuTe-DSL kernels and a DSL release that predates the
+    # device surfaces as a bare ``KeyError: 'sm_107a'`` from inside kernel
+    # compilation.  Fail with the standard, actionable message instead.  These
+    # kernels do not pin an arch (see ``_compile_options``), so they still run
+    # against the family target and ``native_only=False`` keeps the
+    # ``CUTE_DSL_ARCH=sm_100f`` escape hatch working.  Imported lazily:
+    # ``cute_dsl.utils`` imports ``cutlass`` at module scope and GDN must still
+    # import without nvidia-cutlass-dsl installed.
+    from .cute_dsl.utils import require_cute_dsl_arch
+
+    require_cute_dsl_arch(q.device, native_only=False)
+
     # Handle deprecation of disable_state_update default value
     if disable_state_update is None:
         logger.warning_once(

@@ -6,7 +6,24 @@ import torch
 from tests.trace.reference_utils import _check
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+def _radix_cutlass_supported() -> bool:
+    """The trace fixes ``backend="radix_cutlass"``, which is not offered on every
+    compute capability (e.g. SM107/Rubin)."""
+    if not torch.cuda.is_available():
+        return False
+    import flashinfer
+    from flashinfer.utils import get_compute_capability
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    return flashinfer.top_k_varlen.is_backend_supported(
+        "radix_cutlass", major * 10 + minor
+    )
+
+
+@pytest.mark.skipif(
+    not _radix_cutlass_supported(),
+    reason="top_k_varlen radix_cutlass backend is unsupported on this compute capability",
+)
 @pytest.mark.parametrize(
     "shape_kwargs",
     [

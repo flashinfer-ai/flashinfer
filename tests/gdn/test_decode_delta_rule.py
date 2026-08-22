@@ -24,6 +24,8 @@ import random
 import torch
 import pytest
 
+from tests.test_helpers.test_helpers import skip_if_cute_dsl_arch_unsupported
+
 pytestmark = pytest.mark.long_running
 
 
@@ -59,6 +61,11 @@ except ImportError:
 
 def _skip_if_not_sm90_or_later():
     """Skip test if not Hopper (SM90+) or Blackwell (SM100+) architecture."""
+    # The decode kernels are CuTe-DSL kernels; an older DSL raises a bare
+    # KeyError (e.g. 'sm_107a' on CuTe DSL 4.7 / Rubin).  Environment gap, so
+    # skip.  native_only=False: these kernels do not pin an arch and still run
+    # against the family target.
+    skip_if_cute_dsl_arch_unsupported(torch.device("cuda"), native_only=False)
     cc = get_compute_capability(torch.device("cuda"))
     if cc[0] not in [9, 10, 11, 12]:
         pytest.skip(f"GDN decode requires SM90+ or SM100+, but got SM{cc[0]}{cc[1]}")

@@ -22,6 +22,30 @@ def skip_on_gpu_arch_error(func):
     return wrapper
 
 
+def skip_if_cute_dsl_arch_unsupported(
+    device: torch.device = None, native_only: bool = True
+) -> None:
+    """Skip when the installed CuTe DSL cannot target ``device``'s architecture.
+
+    Kernels that compile with ``cute.GPUArch(f"sm_{major}{minor}a")`` need the
+    DSL to know that exact arch; a DSL release older than the device raises a
+    bare ``KeyError`` (e.g. ``KeyError: 'sm_107a'`` for Rubin on CuTe DSL 4.7).
+    That is an environment gap, not a kernel bug, so tests skip rather than fail.
+    Pass ``native_only=False`` for kernels that only need family-portable
+    features and can run against the ``sm_*0f`` target.
+    """
+    if device is None:
+        device = torch.device("cuda")
+    from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+
+    major, minor = torch.cuda.get_device_capability(device)
+    if not is_cute_dsl_arch_supported(major, minor, native_only=native_only):
+        pytest.skip(
+            f"the installed CuTe DSL cannot target sm_{major}{minor} "
+            "(needs a DSL release that knows this architecture)"
+        )
+
+
 def clear_cuda_cache(device: torch.device) -> None:
     total_memory = get_device_properties(device).total_memory
     reserved_memory = torch.cuda.memory_reserved()

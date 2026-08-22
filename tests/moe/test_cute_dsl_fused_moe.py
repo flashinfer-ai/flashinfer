@@ -1568,11 +1568,31 @@ class TestCuteDslFusedMoeFunctional:
     ):
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
-        if activation_type == ActivationType.Relu2 and is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
-                "(SwiGLU) activation path"
-            )
+        if is_sm107():
+            # Documented gaps in the Rubin (SM107) cute-dsl MoE kernels; the
+            # library raises NotImplementedError for each.  Skip rather than
+            # fail so the suite reports "not implemented yet", not "broken".
+            if activation_type == ActivationType.Relu2:
+                pytest.skip(
+                    "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
+                    "(SwiGLU) activation path"
+                )
+            if activation_type == ActivationType.GegluTanh:
+                pytest.skip(
+                    "Rubin (SM107) gather grouped GEMM implements SwiGLU only; "
+                    "GegluTanh is not supported yet"
+                )
+            if use_per_token_activation:
+                pytest.skip(
+                    "Rubin (SM107) gather grouped GEMM does not support "
+                    "use_a_per_token_scale yet"
+                )
+            if not use_fused_finalize:
+                pytest.skip(
+                    "Rubin (SM107) finalize grouped GEMM always performs the "
+                    "fused atomic finalize; use_fused_finalize=False is "
+                    "unsupported"
+                )
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_local_experts = num_experts
@@ -2222,11 +2242,19 @@ class TestCuteDslMoEWrapper:
         from flashinfer import autotune
         from flashinfer import CuteDslMoEWrapper
 
-        if activation_type == ActivationType.Relu2 and is_sm107():
-            pytest.skip(
-                "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
-                "(SwiGLU) activation path"
-            )
+        if is_sm107():
+            # Documented gaps in the Rubin (SM107) cute-dsl MoE kernels; the
+            # library raises NotImplementedError for each.
+            if activation_type == ActivationType.Relu2:
+                pytest.skip(
+                    "Rubin (SM107) cute-dsl MoE kernels only implement the gated "
+                    "(SwiGLU) activation path"
+                )
+            if activation_type == ActivationType.GegluTanh:
+                pytest.skip(
+                    "Rubin (SM107) gather grouped GEMM implements SwiGLU only; "
+                    "GegluTanh is not supported yet"
+                )
 
         _, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         num_tokens, hidden_size, intermediate_size = 256, 256, 512

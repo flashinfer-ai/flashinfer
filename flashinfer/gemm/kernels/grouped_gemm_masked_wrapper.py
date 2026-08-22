@@ -38,7 +38,7 @@ import torch
 from flashinfer.utils import get_compute_capability
 from flashinfer.api_logging import flashinfer_api
 from flashinfer.trace.templates.gemm import grouped_gemm_nt_masked_trace
-from flashinfer.cute_dsl.utils import get_num_sm
+from flashinfer.cute_dsl.utils import get_num_sm, is_rubin_cute_dsl_available
 
 
 @flashinfer_api(trace=grouped_gemm_nt_masked_trace)
@@ -193,6 +193,15 @@ def grouped_gemm_nt_masked(
         # ----------------------------------------------------------------
         # SM107 (Rubin)
         # ----------------------------------------------------------------
+        # The Rubin kernel imports ``cutlass.utils.rubin_helpers`` at module
+        # scope, which only exists from CuTe DSL 4.8.  Report that as the usual
+        # NotImplementedError rather than letting a ModuleNotFoundError escape.
+        if not is_rubin_cute_dsl_available():
+            raise NotImplementedError(
+                "The SM107 (Rubin) CuTe DSL masked grouped GEMM requires CuTe "
+                "DSL >= 4.8, which provides cutlass.utils.rubin_helpers; the "
+                "installed CuTe DSL does not have it."
+            )
         from .grouped_gemm_masked_rubin import _grouped_gemm_nt_masked_sm107
 
         # Extract Blackwell-style kwargs and translate to Rubin conventions

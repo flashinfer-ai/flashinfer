@@ -21,6 +21,8 @@ import random
 import math
 
 import pytest
+
+from tests.test_helpers.test_helpers import skip_if_cute_dsl_arch_unsupported
 import torch
 
 from .reference_delta_rule import exclusive_cumsum
@@ -82,6 +84,10 @@ FIXUP_KERNEL_KINDS = ["simt_row4", "simt_row8", "hmma"]
 def _skip_if_cp_unsupported():
     """Skip test if context parallelism is unsupported."""
     device = torch.device("cuda")
+    # Every GDN backend is a CuTe-DSL kernel compiled for the device's own
+    # arch; an older DSL raises a bare KeyError (e.g. 'sm_107a' on CuTe DSL
+    # 4.7 / Rubin).  Treat that as an environment gap and skip.
+    skip_if_cute_dsl_arch_unsupported(device)
     if is_sm100a_supported(device):
         cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
         if cuda_major < 13:
