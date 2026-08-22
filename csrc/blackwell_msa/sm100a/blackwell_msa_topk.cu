@@ -257,4 +257,3 @@ kernel_minimax_sparse_topk_select_sm100(float* __restrict__ max_score, int* __re
 }
 
 } // extern "C"
-

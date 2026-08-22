@@ -2158,4 +2158,3 @@ kernel_minimax_sparse_prefill_union_sm100(const __grid_constant__ CUtensorMap q,
 }
 
 } // extern "C"
-
