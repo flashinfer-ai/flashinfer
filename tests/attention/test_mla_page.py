@@ -6,9 +6,16 @@ import torch
 
 import flashinfer
 from flashinfer.fp4_quantization import e2m1_and_ufp8sf_scale_to_float
+from flashinfer.utils import get_compute_capability
 
 CKV_DIM = 512
 KPE_DIM = 64
+
+
+def _skip_if_fp8_e4m3_unsupported():
+    major, minor = get_compute_capability(torch.device("cuda:0"))
+    if major < 8:
+        pytest.skip(f"SM{major}{minor} does not support FP8 E4M3 tensors")
 
 
 def calculate_last_page_len(kv_len: List[int], page_size: int):
@@ -295,6 +302,7 @@ def test_nvfp4_quantize_append_paged_mla_kv_cache(
 
 
 def test_nvfp4_quantize_append_paged_mla_kv_cache_dequant_close():
+    _skip_if_fp8_e4m3_unsupported()
     torch.manual_seed(0)
     device = "cuda:0"
     kv_len, page_size = [45, 8, 25], 16
@@ -374,6 +382,7 @@ def test_nvfp4_quantize_append_paged_mla_kv_cache_dequant_close():
 
 @pytest.mark.parametrize("bad_scale", [0.0, -1.0, float("inf"), float("nan")])
 def test_nvfp4_quantize_append_paged_mla_kv_cache_rejects_bad_scale(bad_scale):
+    _skip_if_fp8_e4m3_unsupported()
     device = "cuda:0"
     (
         nnz_kv,
@@ -413,6 +422,7 @@ def test_nvfp4_quantize_append_paged_mla_kv_cache_rejects_bad_scale(bad_scale):
 
 
 def test_dense_mla_decode_rejects_packed_uint8_cache():
+    _skip_if_fp8_e4m3_unsupported()
     device = "cuda:0"
     query = torch.randn(1, 1, 128, CKV_DIM + KPE_DIM, device=device).to(
         torch.float8_e4m3fn
