@@ -621,6 +621,105 @@ def test_sparse_mla_sm120_decode_dsv4_dual_large_extra_topk() -> None:
     torch.testing.assert_close(output.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
 
 
+def test_sparse_mla_sm120_decode_dsv4_autotune_covers_extra_topk_buckets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """One tuning pass covers every power-of-2 extra_topk bucket at or below
+    the tuned width; wider widths stay on the heuristic until re-tuned."""
+    from flashinfer import autotune
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.mla._sparse_mla_sm120 import _decode_dsv4_hot_cache
+
+    # Keep a previously saved default disk cache from resolving tactics here.
+    monkeypatch.setenv("FLASHINFER_AUTOTUNE_DIR", str(tmp_path))
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, num_heads, topk = 4, 16, 128
+    d_qk, d_v = 512, 512
+    pbs, num_blocks = 64, 16
+    s_kv = num_blocks * pbs
+
+    def make_cache() -> tuple[torch.Tensor, torch.Tensor]:
+        """Random packed DSv4 cache and its dequantized reference."""
+        bf16 = (
+            torch.randn(num_blocks, pbs, 1, d_qk, device=device, dtype=torch.bfloat16)
+            / 10.0
+        ).clamp(-1, 1)
+        packed = quantize_kv_dsv4(bf16)
+        return packed, dequantize_kv_dsv4(packed)
+
+    main_packed, main_dequant = make_cache()
+    extra_packed, extra_dequant = make_cache()
+    virtual_kv = torch.cat(
+        [main_dequant.reshape(-1, d_qk), extra_dequant.reshape(-1, d_qk)], dim=0
+    ).reshape(-1, 1, 1, d_qk)
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    main_idx = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    sm_scale = d_qk**-0.5
+
+    def run(extra_topk: int) -> None:
+        """Decode with a secondary cache of this width and check the output."""
+        extra_idx = torch.randint(
+            0, s_kv, (num_tokens, extra_topk), device=device, dtype=torch.int32
+        )
+        output = torch.zeros(
+            (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+        )
+        out_lse = torch.zeros(
+            (num_tokens, num_heads), dtype=torch.float32, device=device
+        )
+        mid_out, mid_lse = _make_decode_scratch(
+            num_tokens, num_heads, topk, d_v, device, extra_topk=extra_topk
+        )
+        sparse_mla_sm120_paged_attention(
+            q,
+            main_packed,
+            main_idx,
+            output,
+            out_lse,
+            sm_scale,
+            d_v=d_v,
+            extra_kv_cache=extra_packed,
+            extra_indices=extra_idx,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+        )
+        ref_out, _ = _ref_sparse_attn(
+            q,
+            virtual_kv,
+            torch.cat([main_idx, extra_idx + s_kv], dim=-1),
+            sm_scale,
+            d_v,
+        )
+        torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+
+    def tuned_tactic(extra_topk: int) -> int | None:
+        """Tactic the hot cache recorded for this width, if one was tuned."""
+        return next(
+            (t for k, t in _decode_dsv4_hot_cache.items() if k[3] == extra_topk), None
+        )
+
+    tuner = AutoTuner.get()
+    tuner.clear_cache()
+    _decode_dsv4_hot_cache.clear()
+    try:
+        with autotune(True):
+            run(1024)
+        for extra_topk in (256, 384, 1024):
+            run(extra_topk)
+            assert tuned_tactic(extra_topk) is not None, extra_topk
+        run(2048)
+        assert tuned_tactic(2048) is None
+    finally:
+        tuner.clear_cache()
+        _decode_dsv4_hot_cache.clear()
+
+
 _DSV3_2_DECODE_HEADS = [8, 16, 32, 64, 128]
 
 

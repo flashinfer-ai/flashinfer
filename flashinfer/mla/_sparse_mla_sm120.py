@@ -59,6 +59,7 @@ from ..autotuner import (
 )
 from ..jit.mla import gen_sparse_mla_sm120_module
 from ..utils import (
+    last_positive_power_of_2,
     register_custom_op,
     register_fake_op,
     supported_compute_capability,
@@ -839,11 +840,12 @@ def _get_sparse_mla_decode_dsv4_module():
             attn_sink = inputs[7] if len(inputs) > 7 else None
             extra_indices = inputs[8] if len(inputs) > 8 else None
             extra_topk_length = inputs[9] if len(inputs) > 9 else None
-            extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
+            # extra_topk is bucketed by the tuning config; pinning its exact
+            # value here would turn every untuned width into a cache miss.
             return (
                 topk_length is not None,
                 attn_sink is not None,
-                int(extra_topk),
+                extra_indices is not None,
                 extra_topk_length is not None,
             )
 
@@ -856,7 +858,7 @@ def _get_sparse_mla_decode_dsv4_module():
             topk = indices.shape[-1]
             extra_indices = inputs[8] if len(inputs) > 8 else None
             extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-            num_splits = (topk + _BI - 1) // _BI + (extra_topk + _BI - 1) // _BI
+            num_splits = _decode_dsv4_num_splits(topk, extra_topk)
             # tactic encodes chunks_per_block (1..num_splits).
             return list(range(1, num_splits + 1))
 
@@ -885,7 +887,7 @@ def _get_sparse_mla_decode_dsv4_module():
                 extra_topk_length = kwargs.get("extra_topk_length")
             topk = indices.shape[-1]  # 2D [T, topk] or 3D [T, 1, topk]
             extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-            num_splits = (topk + _BI - 1) // _BI + (extra_topk + _BI - 1) // _BI
+            num_splits = _decode_dsv4_num_splits(topk, extra_topk)
             cpb_override = tactic if tactic > 0 else -1
             module.sparse_mla_sm120_decode_dsv4(
                 q,
@@ -921,6 +923,33 @@ def _decode_dsv4_map_to_token_bucket(x):
         if x <= b:
             return b
     return buckets[-1]
+
+
+def _decode_dsv4_num_splits(topk: int, extra_topk: int = 0) -> int:
+    """Split-K partitions: one per ``_BI``-wide tile of each index set."""
+    return (topk + _BI - 1) // _BI + (extra_topk + _BI - 1) // _BI
+
+
+def _decode_dsv4_map_to_extra_topk_bucket(x: int) -> int:
+    """Round extra_topk down to a power of 2, at least one ``_BI`` tile.
+
+    Rounding down keeps every tuned tactic valid: chunks_per_block must not
+    exceed num_splits, which only grows with extra_topk, and the C++ launcher
+    silently falls back to its heuristic on an out-of-range override.
+    """
+    return max(_BI, last_positive_power_of_2(x))
+
+
+def _decode_dsv4_extra_topk_buckets(x: int) -> tuple[int, ...]:
+    """Power-of-2 extra_topk buckets from one tile up to x's bucket, so one
+    tuning pass at the largest served width also covers the smaller ones."""
+    top = _decode_dsv4_map_to_extra_topk_bucket(x)
+    buckets = []
+    b = _BI
+    while b <= top:
+        buckets.append(b)
+        b *= 2
+    return tuple(buckets)
 
 
 def _decode_dsv4_init_q(shapes, dtype, device):
@@ -963,16 +992,51 @@ def _decode_dsv4_inputs_pre_hook(inputs):
 
 
 @functools.cache
-def _decode_dsv4_tuning_config() -> TuningConfig:
-    return TuningConfig(
-        dynamic_tensor_specs=(
-            DynamicTensorSpec(
-                input_idx=(0, 1, 6, 8, 9),
-                dim_idx=(0, 0, 0, 0, 0),
-                gen_tuning_buckets=_decode_dsv4_num_token_buckets,
-                map_to_tuning_buckets=_decode_dsv4_map_to_token_bucket,
-            ),
+def _decode_dsv4_tuning_config(has_extra: bool) -> TuningConfig:
+    """Decode-dsv4 tuning config; ``has_extra`` is ``extra_indices is not None``.
+
+    With a secondary cache, extra_topk (last dim of extra_indices) is a second
+    tuned axis and the split count of mid_out/mid_lse follows it. A ``None``
+    extra_indices has no such dim, hence the flag.
+    """
+    dynamic_tensor_specs: tuple[DynamicTensorSpec, ...] = (
+        DynamicTensorSpec(
+            input_idx=(0, 1, 6, 8, 9),
+            dim_idx=(0, 0, 0, 0, 0),
+            gen_tuning_buckets=_decode_dsv4_num_token_buckets,
+            map_to_tuning_buckets=_decode_dsv4_map_to_token_bucket,
         ),
+    )
+    # Constrain T (dim 0) of all output/scratch tensors to q's T so the
+    # autotuner's synthesised q propagates to mid_out (2), mid_lse (3),
+    # output (4), out_lse (5). Without these constraints, the kernel
+    # writes past the real tensors' T dim → IMA.
+    constraint_specs: tuple[ConstraintSpec, ...] = (
+        ConstraintSpec(2, 0, lambda shapes: shapes[0][0]),  # mid_out
+        ConstraintSpec(3, 0, lambda shapes: shapes[0][0]),  # mid_lse
+        ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),  # output
+        ConstraintSpec(5, 0, lambda shapes: shapes[0][0]),  # out_lse
+    )
+    if has_extra:
+        dynamic_tensor_specs += (
+            DynamicTensorSpec(
+                input_idx=(8,),
+                dim_idx=(-1,),
+                gen_tuning_buckets=_decode_dsv4_extra_topk_buckets,
+                map_to_tuning_buckets=_decode_dsv4_map_to_extra_topk_bucket,
+            ),
+        )
+
+        def _num_splits(shapes):
+            """Scratch split count (dim 2) for the profile's bucketed widths."""
+            return _decode_dsv4_num_splits(shapes[1][-1], shapes[8][-1])
+
+        constraint_specs += (
+            ConstraintSpec(2, 2, _num_splits),  # mid_out
+            ConstraintSpec(3, 2, _num_splits),  # mid_lse
+        )
+    return TuningConfig(
+        dynamic_tensor_specs=dynamic_tensor_specs,
         tensor_initializers=(
             (0, _decode_dsv4_init_q),
             (1, _decode_dsv4_init_indices),
@@ -981,16 +1045,7 @@ def _decode_dsv4_tuning_config() -> TuningConfig:
             (9, _decode_dsv4_init_topk_length),
         ),
         inputs_pre_hook=_decode_dsv4_inputs_pre_hook,
-        # Constrain T (dim 0) of all output/scratch tensors to q's T so the
-        # autotuner's synthesised q propagates to mid_out (2), mid_lse (3),
-        # output (4), out_lse (5). Without these constraints, the kernel
-        # writes past the real tensors' T dim → IMA.
-        constraint_specs=(
-            ConstraintSpec(2, 0, lambda shapes: shapes[0][0]),  # mid_out
-            ConstraintSpec(3, 0, lambda shapes: shapes[0][0]),  # mid_lse
-            ConstraintSpec(4, 0, lambda shapes: shapes[0][0]),  # output
-            ConstraintSpec(5, 0, lambda shapes: shapes[0][0]),  # out_lse
-        ),
+        constraint_specs=constraint_specs,
     )
 
 
@@ -1240,7 +1295,10 @@ def sparse_mla_sm120_decode_dsv4(
     - ``chunks_per_block`` explicitly given → use that value directly (no
       autotuning).
     - Otherwise, if a ``with autotune(...)`` context is active or a previous
-      tuning run cached this shape → use the AutoTuner's choice.
+      tuning run cached this shape → use the AutoTuner's choice. Tuning
+      sweeps the num_tokens buckets and, with a secondary cache, power-of-2
+      ``extra_topk`` buckets up to the tuned width; lookups round
+      ``extra_topk`` down, so tune with the largest width you serve.
     - Otherwise → fall back to the C++ closed-form heuristic.
 
     Parameters
@@ -1311,9 +1369,7 @@ def sparse_mla_sm120_decode_dsv4(
     if not tuner.is_tuning_mode:
         T_bucket = _decode_dsv4_map_to_token_bucket(q.shape[0])
         extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-        num_splits = (indices.shape[-1] + _BI - 1) // _BI + (
-            extra_topk + _BI - 1
-        ) // _BI
+        num_splits = _decode_dsv4_num_splits(indices.shape[-1], extra_topk)
         hot_key = (
             T_bucket,
             q.shape[1],
@@ -1336,7 +1392,7 @@ def sparse_mla_sm120_decode_dsv4(
     chosen, tactic = tuner.choose_one(
         "sparse_mla_sm120_decode_dsv4",
         [runner],
-        _decode_dsv4_tuning_config(),
+        _decode_dsv4_tuning_config(extra_indices is not None),
         inputs,
         **forward_kwargs,
     )
@@ -1345,9 +1401,7 @@ def sparse_mla_sm120_decode_dsv4(
     if int(tactic) > 0:
         T_bucket = _decode_dsv4_map_to_token_bucket(q.shape[0])
         extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-        num_splits = (indices.shape[-1] + _BI - 1) // _BI + (
-            extra_topk + _BI - 1
-        ) // _BI
+        num_splits = _decode_dsv4_num_splits(indices.shape[-1], extra_topk)
         hot_key = (
             T_bucket,
             q.shape[1],

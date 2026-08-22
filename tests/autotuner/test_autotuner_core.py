@@ -20,6 +20,8 @@ from flashinfer.mla._core import (
 )
 from flashinfer.mla._sparse_mla_sm120 import (
     _decode_dsv3_2_tuning_config,
+    _decode_dsv4_extra_topk_buckets,
+    _decode_dsv4_map_to_extra_topk_bucket,
     _decode_dsv4_tuning_config,
 )
 from flashinfer.tllm_enums import (
@@ -2007,14 +2009,82 @@ def test_mla_decode_tuning_config_is_memoized(
 def test_sparse_mla_tuning_config_initializer_indices():
     """Sparse MLA configs retain each initializer's original input index."""
 
-    assert set(dict(_decode_dsv4_tuning_config().tensor_initializers)) == {
-        0,
-        1,
-        6,
-        8,
-        9,
-    }
+    for has_extra in (False, True):
+        initializers = _decode_dsv4_tuning_config(has_extra).tensor_initializers
+        assert set(dict(initializers)) == {0, 1, 6, 8, 9}
     assert set(dict(_decode_dsv3_2_tuning_config().tensor_initializers)) == {0, 1, 6}
+
+
+@pytest.mark.parametrize(
+    "extra_topk,expected_bucket,expected_buckets",
+    [
+        (32, 64, (64,)),
+        (100, 64, (64,)),
+        (1024, 1024, (64, 128, 256, 512, 1024)),
+        (1536, 1024, (64, 128, 256, 512, 1024)),
+        (8192, 8192, (64, 128, 256, 512, 1024, 2048, 4096, 8192)),
+    ],
+)
+def test_sparse_mla_dsv4_extra_topk_buckets(
+    extra_topk, expected_bucket, expected_buckets
+):
+    """extra_topk rounds down to a power of 2 (at least one 64-wide tile) and
+    one tuning pass generates every bucket from one tile up to that value."""
+    assert _decode_dsv4_map_to_extra_topk_bucket(extra_topk) == expected_bucket
+    assert _decode_dsv4_extra_topk_buckets(extra_topk) == expected_buckets
+
+
+def _sparse_mla_dsv4_decode_shapes(num_tokens, num_heads, topk, extra_topk):
+    """Input shapes in the order sparse_mla_sm120_decode_dsv4 hands to the tuner.
+
+    ``extra_topk == 0`` stands for ``extra_indices=None`` (shape ``(0,)``).
+    """
+    num_splits = (topk + 63) // 64 + (extra_topk + 63) // 64
+    has_extra = extra_topk > 0
+    return (
+        (num_tokens, num_heads, 512),  # q
+        (num_tokens, topk),  # indices
+        (num_tokens, num_heads, num_splits, 512),  # mid_out
+        (num_tokens, num_heads, num_splits),  # mid_lse
+        (num_tokens, num_heads, 512),  # output
+        (num_tokens, num_heads),  # out_lse
+        (num_tokens,),  # topk_length
+        (num_heads,),  # attn_sink
+        (num_tokens, extra_topk) if has_extra else (0,),  # extra_indices
+        (num_tokens,) if has_extra else (0,),  # extra_topk_length
+    )
+
+
+@pytest.mark.parametrize(
+    "extra_topk,expected_bucket", [(256, 256), (1536, 1024), (8192, 8192)]
+)
+def test_find_nearest_profile_sparse_mla_dsv4_buckets_extra_topk(
+    extra_topk, expected_bucket
+):
+    """With a secondary cache the profile buckets extra_topk and wildcards the
+    split count of the scratch tensors, so all widths in a bucket share one
+    cache entry."""
+    config = _decode_dsv4_tuning_config(True)
+    profile = AutoTuner._find_nearest_profile(
+        _sparse_mla_dsv4_decode_shapes(58, 32, 128, extra_topk), config
+    )
+    assert profile[8] == (64, expected_bucket)
+    assert profile[2] == (-1, 32, -1, 512)
+    assert profile[3] == (-1, 32, -1)
+    assert profile == AutoTuner._find_nearest_profile(
+        _sparse_mla_dsv4_decode_shapes(58, 32, 128, expected_bucket), config
+    )
+
+
+def test_find_nearest_profile_sparse_mla_dsv4_without_extra():
+    """Without a secondary cache only the token axis is dynamic."""
+    profile = AutoTuner._find_nearest_profile(
+        _sparse_mla_dsv4_decode_shapes(58, 32, 128, 0),
+        _decode_dsv4_tuning_config(False),
+    )
+    assert profile[1] == (64, 128)
+    assert profile[2] == (-1, 32, 2, 512)
+    assert profile[8] == (64,)
 
 
 def test_find_nearest_profile_cache_dedups_mla_decode_config():
