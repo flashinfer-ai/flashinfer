@@ -164,7 +164,7 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t, int64_t, int64_t> moeA2ADispatchO
     TensorView tokenSelectedExperts, Array<Tensor> inputPayloads, TensorView workspace,
     TensorView metainfo, int64_t runtimeMaxTokensPerRank, int64_t epRank, int64_t epSize,
     int64_t topK, int64_t numExperts, bool enablePdl, Optional<TensorView> eplbLocalStats,
-    bool enableRankMask, Optional<TensorView> activeRankMask) {
+    bool enableRankMask, Optional<TensorView> activeRankMask, Optional<int64_t> invalidExpertId) {
   using tl_throughput::PayloadDescriptor;
 
   CHECK_INPUT(tokenSelectedExperts);
@@ -275,6 +275,11 @@ Tuple<Array<int64_t>, Array<int64_t>, int64_t, int64_t, int64_t> moeA2ADispatchO
   params.eplb_local_stats =
       enableEplb ? static_cast<int32_t const*>(eplbLocalStats.value().data_ptr()) : nullptr;
   params.token_selected_experts = static_cast<int32_t const*>(tokenSelectedExperts.data_ptr());
+  if (invalidExpertId.has_value()) {
+    params.invalid_expert_id = static_cast<int32_t>(invalidExpertId.value());
+  } else {
+    params.invalid_expert_id = -1;
+  }
   params.num_payloads = numPayloads;
   std::copy(payloadDescriptors.begin(), payloadDescriptors.end(), params.payloads);
 
