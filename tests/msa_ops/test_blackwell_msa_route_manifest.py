@@ -23,22 +23,23 @@ def test_route_manifest_covers_exactly_the_production_specializations():
 
     assert manifest["schema_version"] == 1
     assert manifest["attention_topk"] == 16
-    assert manifest["reachable_specialization_count"] == 32
-    assert len(routes) == 32
-    assert len({route["id"] for route in routes}) == 32
+    assert manifest["reachable_specialization_count"] == 36
+    assert len(routes) == 36
+    assert len({route["id"] for route in routes}) == 36
     assert Counter(route["family"] for route in routes) == {
         "topk_select": 1,
         "union_prefill": 12,
         "m64_prefill_override": 1,
         "long_bf16_reverse_prefill": 7,
-        "direct_m16_decode": 6,
+        "direct_m16_decode": 8,
         "fp8_kv_q1_exact_override": 2,
         "fp8_kv_q1_xform2": 2,
         "uniform_fp8_qkv_decode": 1,
+        "exact_reverse_prefill": 2,
     }
     assert set(manifest["family_predicates"]) == {route["family"] for route in routes}
     assert all(manifest["family_predicates"].values())
-    assert sum(len(route["architectures"]) for route in routes) == 57
+    assert sum(len(route["architectures"]) for route in routes) == 65
     assert all(route["source_units"] for route in routes)
 
 

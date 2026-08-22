@@ -37,7 +37,8 @@ SM120/SM121-only; the compute capability 10.0/10.3 attention backend requires
 separate contiguous K and V tensors and does not make implicit copies.
 The compute capability 10.0/10.3 backend uses TopK16 as its generic contract
 and additionally retains four shape-exact routes: paged BF16 decode at
-B64/Q8/KV65536/TopK32, paged BF16 decode at B2/Q1/KV257/TopK4, flat
+B64/Q8/KV65536/TopK32, 512-thread paged BF16 decode at
+B2/Q1/KV257/TopK4, flat
 BF16-query/FP8-KV prefill at B3/Q1024/KV8192/TopK8, and paged BF16 prefill at
 B3/Q4096/KV8192/TopK4. Neighboring non-TopK16 shapes fail closed instead of
 entering a generic kernel. The decode path uses direct persistent M16

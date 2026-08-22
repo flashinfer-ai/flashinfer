@@ -29,7 +29,7 @@
 #define int32_t blackwell_msa_generated_int32_t
 #define int16_t blackwell_msa_generated_int16_t
 #define CUtensorMap BlackwellMsaGeneratedTensorMap
-#include "blackwell_msa_long_prefill_paged_bf16_gqa16_sm103.cu"
+#include "blackwell_msa_reverse_prefill_bf16_paged_topk4_qload4.cu"
 #undef CUtensorMap
 #undef uint8_t
 #undef uint16_t
@@ -131,40 +131,38 @@ inline int64_t HostCheckedExtentAdd(int64_t lhs, int64_t rhs, const char* formul
   return lhs + rhs;
 }
 
-// 4D TMA descriptor for buffer 'q' — compiled from the
+// 2D TMA descriptor for buffer 'q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_q(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
-      << "TMA source 'q' must have at least 3 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
+      << "TMA source 'q' must have at least 2 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'q' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
-  int64_t d2 = t.size(t.ndim() - 2);
-  int64_t d3 = t.size(t.ndim() - 3);
-  TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
+  TVM_FFI_CHECK(d1 > 0, ValueError)
       << "TMA source 'q' trailing dims must be positive";
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'q' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[4] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(d3)};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
+  int64_t outer1 = t.numel() / (d1);
+  CheckDenseLeadingFold(t, 1, "q");
+  int64_t s2 = t.stride(t.ndim() - 2) * 1;
+  TVM_FFI_CHECK(s2 > 0, ValueError)
+      << "TMA source 'q' physical strides must be positive";
+  uint64_t global_dim[2] = {(uint64_t)(d1), (uint64_t)(outer1)};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0, ValueError)
       << "TMA descriptor for 'q' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 16u <= global_dim[1] && 1u <= global_dim[2] && 1u <= global_dim[3], ValueError)
-      << "TMA box (64, 16, 1, 1) exceeds resolved global dims for 'q'";
-  uint64_t global_strides[3] = {
-      (uint64_t)((d1 * 16) / 8),
-      (uint64_t)((64 * 16) / 8),
-      (uint64_t)(((d2 * d1) * 16) / 8),
+  TVM_FFI_CHECK(64u <= global_dim[0] && 1u <= global_dim[1], ValueError)
+      << "TMA box (64, 1) exceeds resolved global dims for 'q'";
+  uint64_t global_strides[1] = {
+      (uint64_t)((s2 * 16) / 8),
   };
-  uint32_t box_dim[4] = {64u, 16u, 1u, 1u};
-  uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
+  uint32_t box_dim[2] = {64u, 1u};
+  uint32_t elem_strides[2] = {1u, 1u};
   CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
+      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (4D, 'q') failed: CUresult=" << (int)r;
+      << "cuTensorMapEncodeTiled (2D, 'q') failed: CUresult=" << (int)r;
   return tm;
 }
 
@@ -242,14 +240,13 @@ inline CUtensorMap EncodeTma_v(const TensorView& t) {
   return tm;
 }
 
-void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_scheduler_metadata, TensorView arg_k2q_row_ptr, TensorView arg_k2q_qsplit_indices, TensorView arg_partial_o, TensorView arg_partial_scale, TensorView arg_partial_lse, TensorView arg_partial_temperature_lse, TensorView arg_out, TensorView arg_cu_seqlens_q, TensorView arg_cu_seqlens_k, TensorView arg_q_offsets, TensorView arg_kv_lens, TensorView arg_page_table, int64_t arg_q_group_segment_end_128, int64_t arg_q_group_segment_end_64, int64_t arg_q_group_segment_end_32, int64_t arg_q_group_segment_end_16, int64_t arg_q_group_segment_end_8, int64_t arg_q_group_segment_end_4, int64_t arg_q_group_segment_end_2, int64_t arg_total_q, int64_t arg_num_q_heads, int64_t arg_num_kv_heads, int64_t arg_total_rows, int64_t arg_nnz_per_head, int64_t arg_work_capacity, int64_t arg_num_work_items, int64_t arg_topk, int64_t arg_max_pages, int64_t arg_causal, int64_t arg_derive_q_offset, double arg_softmax_scale_log2, double arg_lse_temperature_scale, int64_t arg_return_temperature_lse, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t cuda_stream) {
+void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_scheduler_metadata, TensorView arg_k2q_row_ptr, TensorView arg_k2q_qsplit_indices, TensorView arg_partial_o, TensorView arg_partial_scale, TensorView arg_partial_lse, TensorView arg_partial_temperature_lse, TensorView arg_cu_seqlens_q, TensorView arg_cu_seqlens_k, TensorView arg_q_offsets, TensorView arg_kv_lens, TensorView arg_page_table, int64_t arg_q_group_segment_end_21, int64_t arg_q_group_segment_end_20, int64_t arg_q_group_segment_end_19, int64_t arg_q_group_segment_end_18, int64_t arg_q_group_segment_end_17, int64_t arg_q_group_segment_end_16, int64_t arg_q_group_segment_end_15, int64_t arg_q_group_segment_end_14, int64_t arg_q_group_segment_end_13, int64_t arg_q_group_segment_end_12, int64_t arg_q_group_segment_end_11, int64_t arg_q_group_segment_end_10, int64_t arg_q_group_segment_end_9, int64_t arg_q_group_segment_end_8, int64_t arg_q_group_segment_end_7, int64_t arg_q_group_segment_end_6, int64_t arg_q_group_segment_end_5, int64_t arg_q_group_segment_end_4, int64_t arg_q_group_segment_end_3, int64_t arg_q_group_segment_end_2, int64_t arg_total_q, int64_t arg_num_q_heads, int64_t arg_num_kv_heads, int64_t arg_total_rows, int64_t arg_nnz_per_head, int64_t arg_work_capacity, int64_t arg_num_work_items, int64_t arg_topk, int64_t arg_max_pages, int64_t arg_causal, int64_t arg_derive_q_offset, double arg_softmax_scale_log2, double arg_lse_temperature_scale, int64_t arg_return_temperature_lse, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t cuda_stream) {
   TVM_FFI_CHECK(cuda_stream >= 0, ValueError) << "cuda_stream must be non-negative";
   CheckCudaTensor(arg_q, "q");
   ffi::CUDADeviceGuard device_guard(arg_q.device().device_id);
   CheckBlackwellMsaTarget(arg_q.device().device_id);
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
   CheckDtype(arg_q, "q", 4, 16, 1);
-  CheckContiguous(arg_q, "q");
   CheckCudaTensor(arg_k, "k");
   CheckDtype(arg_k, "k", 4, 16, 1);
   CheckContiguous(arg_k, "k");
@@ -269,7 +266,7 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   CheckDtype(arg_partial_o, "partial_o", 1, 8, 1);
   CheckContiguous(arg_partial_o, "partial_o");
   CheckCudaTensor(arg_partial_scale, "partial_scale");
-  CheckDtype(arg_partial_scale, "partial_scale", 4, 16, 1);
+  CheckDtype(arg_partial_scale, "partial_scale", 2, 32, 1);
   CheckContiguous(arg_partial_scale, "partial_scale");
   CheckCudaTensor(arg_partial_lse, "partial_lse");
   CheckDtype(arg_partial_lse, "partial_lse", 2, 32, 1);
@@ -277,9 +274,6 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   CheckCudaTensor(arg_partial_temperature_lse, "partial_temperature_lse");
   CheckDtype(arg_partial_temperature_lse, "partial_temperature_lse", 2, 32, 1);
   CheckContiguous(arg_partial_temperature_lse, "partial_temperature_lse");
-  CheckCudaTensor(arg_out, "out");
-  CheckDtype(arg_out, "out", 4, 16, 1);
-  CheckContiguous(arg_out, "out");
   CheckCudaTensor(arg_cu_seqlens_q, "cu_seqlens_q");
   CheckDtype(arg_cu_seqlens_q, "cu_seqlens_q", 0, 32, 1);
   CheckContiguous(arg_cu_seqlens_q, "cu_seqlens_q");
@@ -295,23 +289,62 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   CheckCudaTensor(arg_page_table, "page_table");
   CheckDtype(arg_page_table, "page_table", 0, 32, 1);
   CheckContiguous(arg_page_table, "page_table");
-  TVM_FFI_CHECK(arg_q_group_segment_end_128 >= -2147483648LL && arg_q_group_segment_end_128 <= 2147483647LL, ValueError)
-      << "scalar 'q_group_segment_end_128' value " << arg_q_group_segment_end_128
+  TVM_FFI_CHECK(arg_q_group_segment_end_21 >= -2147483648LL && arg_q_group_segment_end_21 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_21' value " << arg_q_group_segment_end_21
       << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(arg_q_group_segment_end_64 >= -2147483648LL && arg_q_group_segment_end_64 <= 2147483647LL, ValueError)
-      << "scalar 'q_group_segment_end_64' value " << arg_q_group_segment_end_64
+  TVM_FFI_CHECK(arg_q_group_segment_end_20 >= -2147483648LL && arg_q_group_segment_end_20 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_20' value " << arg_q_group_segment_end_20
       << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(arg_q_group_segment_end_32 >= -2147483648LL && arg_q_group_segment_end_32 <= 2147483647LL, ValueError)
-      << "scalar 'q_group_segment_end_32' value " << arg_q_group_segment_end_32
+  TVM_FFI_CHECK(arg_q_group_segment_end_19 >= -2147483648LL && arg_q_group_segment_end_19 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_19' value " << arg_q_group_segment_end_19
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_q_group_segment_end_18 >= -2147483648LL && arg_q_group_segment_end_18 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_18' value " << arg_q_group_segment_end_18
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_q_group_segment_end_17 >= -2147483648LL && arg_q_group_segment_end_17 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_17' value " << arg_q_group_segment_end_17
       << " is outside i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(arg_q_group_segment_end_16 >= -2147483648LL && arg_q_group_segment_end_16 <= 2147483647LL, ValueError)
       << "scalar 'q_group_segment_end_16' value " << arg_q_group_segment_end_16
       << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_q_group_segment_end_15 >= -2147483648LL && arg_q_group_segment_end_15 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_15' value " << arg_q_group_segment_end_15
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_q_group_segment_end_14 >= -2147483648LL && arg_q_group_segment_end_14 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_14' value " << arg_q_group_segment_end_14
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_q_group_segment_end_13 >= -2147483648LL && arg_q_group_segment_end_13 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_13' value " << arg_q_group_segment_end_13
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_q_group_segment_end_12 >= -2147483648LL && arg_q_group_segment_end_12 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_12' value " << arg_q_group_segment_end_12
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_q_group_segment_end_11 >= -2147483648LL && arg_q_group_segment_end_11 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_11' value " << arg_q_group_segment_end_11
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_q_group_segment_end_10 >= -2147483648LL && arg_q_group_segment_end_10 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_10' value " << arg_q_group_segment_end_10
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_q_group_segment_end_9 >= -2147483648LL && arg_q_group_segment_end_9 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_9' value " << arg_q_group_segment_end_9
+      << " is outside i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(arg_q_group_segment_end_8 >= -2147483648LL && arg_q_group_segment_end_8 <= 2147483647LL, ValueError)
       << "scalar 'q_group_segment_end_8' value " << arg_q_group_segment_end_8
       << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_q_group_segment_end_7 >= -2147483648LL && arg_q_group_segment_end_7 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_7' value " << arg_q_group_segment_end_7
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_q_group_segment_end_6 >= -2147483648LL && arg_q_group_segment_end_6 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_6' value " << arg_q_group_segment_end_6
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_q_group_segment_end_5 >= -2147483648LL && arg_q_group_segment_end_5 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_5' value " << arg_q_group_segment_end_5
+      << " is outside i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(arg_q_group_segment_end_4 >= -2147483648LL && arg_q_group_segment_end_4 <= 2147483647LL, ValueError)
       << "scalar 'q_group_segment_end_4' value " << arg_q_group_segment_end_4
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_q_group_segment_end_3 >= -2147483648LL && arg_q_group_segment_end_3 <= 2147483647LL, ValueError)
+      << "scalar 'q_group_segment_end_3' value " << arg_q_group_segment_end_3
       << " is outside i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(arg_q_group_segment_end_2 >= -2147483648LL && arg_q_group_segment_end_2 <= 2147483647LL, ValueError)
       << "scalar 'q_group_segment_end_2' value " << arg_q_group_segment_end_2
@@ -361,7 +394,6 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   CheckSameCudaDevice(arg_partial_scale, arg_q, "partial_scale", "q");
   CheckSameCudaDevice(arg_partial_lse, arg_q, "partial_lse", "q");
   CheckSameCudaDevice(arg_partial_temperature_lse, arg_q, "partial_temperature_lse", "q");
-  CheckSameCudaDevice(arg_out, arg_q, "out", "q");
   CheckSameCudaDevice(arg_cu_seqlens_q, arg_q, "cu_seqlens_q", "q");
   CheckSameCudaDevice(arg_cu_seqlens_k, arg_q, "cu_seqlens_k", "q");
   CheckSameCudaDevice(arg_q_offsets, arg_q, "q_offsets", "q");
@@ -448,18 +480,30 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   void* p_partial_scale = arg_partial_scale.data_ptr();
   void* p_partial_lse = arg_partial_lse.data_ptr();
   void* p_partial_temperature_lse = arg_partial_temperature_lse.data_ptr();
-  void* p_out = arg_out.data_ptr();
   void* p_cu_seqlens_q = arg_cu_seqlens_q.data_ptr();
   void* p_cu_seqlens_k = arg_cu_seqlens_k.data_ptr();
   void* p_q_offsets = arg_q_offsets.data_ptr();
   void* p_kv_lens = arg_kv_lens.data_ptr();
   void* p_page_table = arg_page_table.data_ptr();
-  int32_t v_q_group_segment_end_128 = (int32_t)arg_q_group_segment_end_128;
-  int32_t v_q_group_segment_end_64 = (int32_t)arg_q_group_segment_end_64;
-  int32_t v_q_group_segment_end_32 = (int32_t)arg_q_group_segment_end_32;
+  int32_t v_q_group_segment_end_21 = (int32_t)arg_q_group_segment_end_21;
+  int32_t v_q_group_segment_end_20 = (int32_t)arg_q_group_segment_end_20;
+  int32_t v_q_group_segment_end_19 = (int32_t)arg_q_group_segment_end_19;
+  int32_t v_q_group_segment_end_18 = (int32_t)arg_q_group_segment_end_18;
+  int32_t v_q_group_segment_end_17 = (int32_t)arg_q_group_segment_end_17;
   int32_t v_q_group_segment_end_16 = (int32_t)arg_q_group_segment_end_16;
+  int32_t v_q_group_segment_end_15 = (int32_t)arg_q_group_segment_end_15;
+  int32_t v_q_group_segment_end_14 = (int32_t)arg_q_group_segment_end_14;
+  int32_t v_q_group_segment_end_13 = (int32_t)arg_q_group_segment_end_13;
+  int32_t v_q_group_segment_end_12 = (int32_t)arg_q_group_segment_end_12;
+  int32_t v_q_group_segment_end_11 = (int32_t)arg_q_group_segment_end_11;
+  int32_t v_q_group_segment_end_10 = (int32_t)arg_q_group_segment_end_10;
+  int32_t v_q_group_segment_end_9 = (int32_t)arg_q_group_segment_end_9;
   int32_t v_q_group_segment_end_8 = (int32_t)arg_q_group_segment_end_8;
+  int32_t v_q_group_segment_end_7 = (int32_t)arg_q_group_segment_end_7;
+  int32_t v_q_group_segment_end_6 = (int32_t)arg_q_group_segment_end_6;
+  int32_t v_q_group_segment_end_5 = (int32_t)arg_q_group_segment_end_5;
   int32_t v_q_group_segment_end_4 = (int32_t)arg_q_group_segment_end_4;
+  int32_t v_q_group_segment_end_3 = (int32_t)arg_q_group_segment_end_3;
   int32_t v_q_group_segment_end_2 = (int32_t)arg_q_group_segment_end_2;
   int32_t v_total_q = (int32_t)arg_total_q;
   int32_t v_num_q_heads = (int32_t)arg_num_q_heads;
@@ -475,19 +519,19 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   float v_softmax_scale_log2 = (float)arg_softmax_scale_log2;
   float v_lse_temperature_scale = (float)arg_lse_temperature_scale;
   int32_t v_return_temperature_lse = (int32_t)arg_return_temperature_lse;
-  void* kargs[] = {&p_q, &p_k, &p_v, &p_scheduler_metadata, &p_k2q_row_ptr, &p_k2q_qsplit_indices, &p_partial_o, &p_partial_scale, &p_partial_lse, &p_partial_temperature_lse, &p_out, &p_cu_seqlens_q, &p_cu_seqlens_k, &p_q_offsets, &p_kv_lens, &p_page_table, &v_q_group_segment_end_128, &v_q_group_segment_end_64, &v_q_group_segment_end_32, &v_q_group_segment_end_16, &v_q_group_segment_end_8, &v_q_group_segment_end_4, &v_q_group_segment_end_2, &v_total_q, &v_num_q_heads, &v_num_kv_heads, &v_total_rows, &v_nnz_per_head, &v_work_capacity, &v_num_work_items, &v_topk, &v_max_pages, &v_causal, &v_derive_q_offset, &v_softmax_scale_log2, &v_lse_temperature_scale, &v_return_temperature_lse};
+  void* kargs[] = {&p_q, &p_k, &p_v, &p_scheduler_metadata, &p_k2q_row_ptr, &p_k2q_qsplit_indices, &p_partial_o, &p_partial_scale, &p_partial_lse, &p_partial_temperature_lse, &p_cu_seqlens_q, &p_cu_seqlens_k, &p_q_offsets, &p_kv_lens, &p_page_table, &v_q_group_segment_end_21, &v_q_group_segment_end_20, &v_q_group_segment_end_19, &v_q_group_segment_end_18, &v_q_group_segment_end_17, &v_q_group_segment_end_16, &v_q_group_segment_end_15, &v_q_group_segment_end_14, &v_q_group_segment_end_13, &v_q_group_segment_end_12, &v_q_group_segment_end_11, &v_q_group_segment_end_10, &v_q_group_segment_end_9, &v_q_group_segment_end_8, &v_q_group_segment_end_7, &v_q_group_segment_end_6, &v_q_group_segment_end_5, &v_q_group_segment_end_4, &v_q_group_segment_end_3, &v_q_group_segment_end_2, &v_total_q, &v_num_q_heads, &v_num_kv_heads, &v_total_rows, &v_nnz_per_head, &v_work_capacity, &v_num_work_items, &v_topk, &v_max_pages, &v_causal, &v_derive_q_offset, &v_softmax_scale_log2, &v_lse_temperature_scale, &v_return_temperature_lse};
 
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(512u, 1u, 1u);
 
   cudaError_t status = cudaFuncSetAttribute(
-      kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100, cudaFuncAttributeMaxDynamicSharedMemorySize, 148480);
+      kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_fp8partial_temp1reuse_sm100, cudaFuncAttributeMaxDynamicSharedMemorySize, 148480);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "cudaFuncSetAttribute(kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100) failed: " << cudaGetErrorString(status);
-  status = cudaLaunchKernel(reinterpret_cast<const void*>(kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100), grid, block, kargs,
+      << "cudaFuncSetAttribute(kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_fp8partial_temp1reuse_sm100) failed: " << cudaGetErrorString(status);
+  status = cudaLaunchKernel(reinterpret_cast<const void*>(kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_fp8partial_temp1reuse_sm100), grid, block, kargs,
                             148480u, stream);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100 launch failed: " << cudaGetErrorString(status);
+      << "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_fp8partial_temp1reuse_sm100 launch failed: " << cudaGetErrorString(status);
 }
 
 }  // namespace flashinfer::blackwell_msa

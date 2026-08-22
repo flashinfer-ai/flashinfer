@@ -33,9 +33,9 @@ def test_source_inventory_is_complete_and_hash_locked() -> None:
         for path in (_CSRC_DIR / target).glob("*.cu")
     }
 
-    assert len(entries) == 63
+    assert len(entries) == 75
     assert set(_INVENTORY["targets"]) == {"sm100a", "sm103a"}
-    assert len(actual_paths) == 126
+    assert len(actual_paths) == 150
     assert actual_paths == expected_paths
     for entry in entries:
         base = _CSRC_DIR / entry["target"] / f"blackwell_msa_{entry['source_unit']}"

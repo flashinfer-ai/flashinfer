@@ -53,7 +53,7 @@ def test_exact_non16_decode_routes_and_neighbors_fail_closed() -> None:
         topk=4,
         k_outer_dim=6,
         max_pages=3,
-    ) == "decode_m16_bf16_paged_topk4_active8"
+    ) == "decode_m16_bf16_paged_topk4_exact512"
     assert _exact_non16_decode_variant(
         **common,
         batch_size=64,

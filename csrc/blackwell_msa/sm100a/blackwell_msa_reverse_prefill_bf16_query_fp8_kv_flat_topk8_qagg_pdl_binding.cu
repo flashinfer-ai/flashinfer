@@ -29,7 +29,7 @@
 #define int32_t blackwell_msa_generated_int32_t
 #define int16_t blackwell_msa_generated_int16_t
 #define CUtensorMap BlackwellMsaGeneratedTensorMap
-#include "blackwell_msa_long_prefill_paged_bf16_gqa16_sm103.cu"
+#include "blackwell_msa_reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl.cu"
 #undef CUtensorMap
 #undef uint8_t
 #undef uint16_t
@@ -168,81 +168,73 @@ inline CUtensorMap EncodeTma_q(const TensorView& t) {
   return tm;
 }
 
-// 4D TMA descriptor for buffer 'k' — compiled from the
+// 3D TMA descriptor for buffer 'k' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_k(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'k' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
+      << "TMA source 'k' must have at least 3 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'k' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
   int64_t d2 = t.size(t.ndim() - 2);
-  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+  int64_t d3 = t.size(t.ndim() - 3);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
       << "TMA source 'k' trailing dims must be positive";
-  int64_t outer2 = t.numel() / (d1 * d2);
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'k' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[4] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(outer2)};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
+  uint64_t global_dim[3] = {(uint64_t)(128), (uint64_t)(d3), (uint64_t)(d2)};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'k' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3], ValueError)
-      << "TMA box (64, 64, 1, 1) exceeds resolved global dims for 'k'";
-  uint64_t global_strides[3] = {
-      (uint64_t)((d1 * 16) / 8),
-      (uint64_t)((64 * 16) / 8),
-      (uint64_t)(((d2 * d1) * 16) / 8),
+  TVM_FFI_CHECK(128u <= global_dim[0] && 1u <= global_dim[2], ValueError)
+      << "TMA box (128, 64, 1) exceeds resolved global dims for 'k'";
+  uint64_t global_strides[2] = {
+      (uint64_t)(((d2 * d1) * 8) / 8),
+      (uint64_t)((d1 * 8) / 8),
   };
-  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
+  uint32_t box_dim[3] = {128u, 64u, 1u};
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
-      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (4D, 'k') failed: CUresult=" << (int)r;
+      << "cuTensorMapEncodeTiled (3D, 'k') failed: CUresult=" << (int)r;
   return tm;
 }
 
-// 4D TMA descriptor for buffer 'v' — compiled from the
+// 3D TMA descriptor for buffer 'v' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
 inline CUtensorMap EncodeTma_v(const TensorView& t) {
-  TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
-      << "TMA source 'v' must have at least 2 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
+      << "TMA source 'v' must have at least 3 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'v' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
   int64_t d2 = t.size(t.ndim() - 2);
-  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+  int64_t d3 = t.size(t.ndim() - 3);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
       << "TMA source 'v' trailing dims must be positive";
-  int64_t outer2 = t.numel() / (d1 * d2);
-  TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'v' extent " << d1
-      << " must divide exactly by " << 64;
-  uint64_t global_dim[4] = {(uint64_t)(64), (uint64_t)(d2), (uint64_t)((d1 / 64)), (uint64_t)(outer2)};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
+  uint64_t global_dim[3] = {(uint64_t)(128), (uint64_t)(d3), (uint64_t)(d2)};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'v' resolved a non-positive global dim";
-  TVM_FFI_CHECK(64u <= global_dim[0] && 1u <= global_dim[2] && 1u <= global_dim[3], ValueError)
-      << "TMA box (64, 64, 1, 1) exceeds resolved global dims for 'v'";
-  uint64_t global_strides[3] = {
-      (uint64_t)((d1 * 16) / 8),
-      (uint64_t)((64 * 16) / 8),
-      (uint64_t)(((d2 * d1) * 16) / 8),
+  TVM_FFI_CHECK(128u <= global_dim[0] && 1u <= global_dim[2], ValueError)
+      << "TMA box (128, 64, 1) exceeds resolved global dims for 'v'";
+  uint64_t global_strides[2] = {
+      (uint64_t)(((d2 * d1) * 8) / 8),
+      (uint64_t)((d1 * 8) / 8),
   };
-  uint32_t box_dim[4] = {64u, 64u, 1u, 1u};
-  uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
+  uint32_t box_dim[3] = {128u, 64u, 1u};
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm{};
   CUresult r = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
+      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, t.data_ptr(), global_dim, global_strides, box_dim, elem_strides,
       CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
       CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
-      << "cuTensorMapEncodeTiled (4D, 'v') failed: CUresult=" << (int)r;
+      << "cuTensorMapEncodeTiled (3D, 'v') failed: CUresult=" << (int)r;
   return tm;
 }
 
-void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_scheduler_metadata, TensorView arg_k2q_row_ptr, TensorView arg_k2q_qsplit_indices, TensorView arg_partial_o, TensorView arg_partial_scale, TensorView arg_partial_lse, TensorView arg_partial_temperature_lse, TensorView arg_out, TensorView arg_cu_seqlens_q, TensorView arg_cu_seqlens_k, TensorView arg_q_offsets, TensorView arg_kv_lens, TensorView arg_page_table, int64_t arg_q_group_segment_end_128, int64_t arg_q_group_segment_end_64, int64_t arg_q_group_segment_end_32, int64_t arg_q_group_segment_end_16, int64_t arg_q_group_segment_end_8, int64_t arg_q_group_segment_end_4, int64_t arg_q_group_segment_end_2, int64_t arg_total_q, int64_t arg_num_q_heads, int64_t arg_num_kv_heads, int64_t arg_total_rows, int64_t arg_nnz_per_head, int64_t arg_work_capacity, int64_t arg_num_work_items, int64_t arg_topk, int64_t arg_max_pages, int64_t arg_causal, int64_t arg_derive_q_offset, double arg_softmax_scale_log2, double arg_lse_temperature_scale, int64_t arg_return_temperature_lse, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t cuda_stream) {
+void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_scheduler_metadata, TensorView arg_k2q_row_ptr, TensorView arg_k2q_qsplit_indices, TensorView arg_partial_o, TensorView arg_partial_lse, TensorView arg_partial_temperature_lse, TensorView arg_completion_counts, TensorView arg_cu_seqlens_q, TensorView arg_cu_seqlens_k, TensorView arg_q_offsets, TensorView arg_kv_lens, TensorView arg_page_table, int64_t arg_total_q, int64_t arg_num_q_heads, int64_t arg_num_kv_heads, int64_t arg_total_rows, int64_t arg_nnz_per_head, int64_t arg_work_capacity, int64_t arg_num_work_items, int64_t arg_topk, int64_t arg_max_pages, int64_t arg_causal, int64_t arg_derive_q_offset, double arg_softmax_scale_log2, double arg_lse_temperature_scale, int64_t arg_return_temperature_lse, int64_t grid_x, int64_t grid_y, int64_t grid_z, int64_t cuda_stream) {
   TVM_FFI_CHECK(cuda_stream >= 0, ValueError) << "cuda_stream must be non-negative";
   CheckCudaTensor(arg_q, "q");
   ffi::CUDADeviceGuard device_guard(arg_q.device().device_id);
@@ -251,10 +243,10 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   CheckDtype(arg_q, "q", 4, 16, 1);
   CheckContiguous(arg_q, "q");
   CheckCudaTensor(arg_k, "k");
-  CheckDtype(arg_k, "k", 4, 16, 1);
+  CheckDtype(arg_k, "k", 1, 8, 1);
   CheckContiguous(arg_k, "k");
   CheckCudaTensor(arg_v, "v");
-  CheckDtype(arg_v, "v", 4, 16, 1);
+  CheckDtype(arg_v, "v", 1, 8, 1);
   CheckContiguous(arg_v, "v");
   CheckCudaTensor(arg_scheduler_metadata, "scheduler_metadata");
   CheckDtype(arg_scheduler_metadata, "scheduler_metadata", 0, 32, 1);
@@ -266,20 +258,17 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   CheckDtype(arg_k2q_qsplit_indices, "k2q_qsplit_indices", 0, 32, 1);
   CheckContiguous(arg_k2q_qsplit_indices, "k2q_qsplit_indices");
   CheckCudaTensor(arg_partial_o, "partial_o");
-  CheckDtype(arg_partial_o, "partial_o", 1, 8, 1);
+  CheckDtype(arg_partial_o, "partial_o", 10, 8, 1);
   CheckContiguous(arg_partial_o, "partial_o");
-  CheckCudaTensor(arg_partial_scale, "partial_scale");
-  CheckDtype(arg_partial_scale, "partial_scale", 4, 16, 1);
-  CheckContiguous(arg_partial_scale, "partial_scale");
   CheckCudaTensor(arg_partial_lse, "partial_lse");
   CheckDtype(arg_partial_lse, "partial_lse", 2, 32, 1);
   CheckContiguous(arg_partial_lse, "partial_lse");
   CheckCudaTensor(arg_partial_temperature_lse, "partial_temperature_lse");
   CheckDtype(arg_partial_temperature_lse, "partial_temperature_lse", 2, 32, 1);
   CheckContiguous(arg_partial_temperature_lse, "partial_temperature_lse");
-  CheckCudaTensor(arg_out, "out");
-  CheckDtype(arg_out, "out", 4, 16, 1);
-  CheckContiguous(arg_out, "out");
+  CheckCudaTensor(arg_completion_counts, "completion_counts");
+  CheckDtype(arg_completion_counts, "completion_counts", 1, 32, 1);
+  CheckContiguous(arg_completion_counts, "completion_counts");
   CheckCudaTensor(arg_cu_seqlens_q, "cu_seqlens_q");
   CheckDtype(arg_cu_seqlens_q, "cu_seqlens_q", 0, 32, 1);
   CheckContiguous(arg_cu_seqlens_q, "cu_seqlens_q");
@@ -295,27 +284,6 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   CheckCudaTensor(arg_page_table, "page_table");
   CheckDtype(arg_page_table, "page_table", 0, 32, 1);
   CheckContiguous(arg_page_table, "page_table");
-  TVM_FFI_CHECK(arg_q_group_segment_end_128 >= -2147483648LL && arg_q_group_segment_end_128 <= 2147483647LL, ValueError)
-      << "scalar 'q_group_segment_end_128' value " << arg_q_group_segment_end_128
-      << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(arg_q_group_segment_end_64 >= -2147483648LL && arg_q_group_segment_end_64 <= 2147483647LL, ValueError)
-      << "scalar 'q_group_segment_end_64' value " << arg_q_group_segment_end_64
-      << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(arg_q_group_segment_end_32 >= -2147483648LL && arg_q_group_segment_end_32 <= 2147483647LL, ValueError)
-      << "scalar 'q_group_segment_end_32' value " << arg_q_group_segment_end_32
-      << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(arg_q_group_segment_end_16 >= -2147483648LL && arg_q_group_segment_end_16 <= 2147483647LL, ValueError)
-      << "scalar 'q_group_segment_end_16' value " << arg_q_group_segment_end_16
-      << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(arg_q_group_segment_end_8 >= -2147483648LL && arg_q_group_segment_end_8 <= 2147483647LL, ValueError)
-      << "scalar 'q_group_segment_end_8' value " << arg_q_group_segment_end_8
-      << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(arg_q_group_segment_end_4 >= -2147483648LL && arg_q_group_segment_end_4 <= 2147483647LL, ValueError)
-      << "scalar 'q_group_segment_end_4' value " << arg_q_group_segment_end_4
-      << " is outside i32 range [-2147483648, 2147483647]";
-  TVM_FFI_CHECK(arg_q_group_segment_end_2 >= -2147483648LL && arg_q_group_segment_end_2 <= 2147483647LL, ValueError)
-      << "scalar 'q_group_segment_end_2' value " << arg_q_group_segment_end_2
-      << " is outside i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(arg_total_q >= -2147483648LL && arg_total_q <= 2147483647LL, ValueError)
       << "scalar 'total_q' value " << arg_total_q
       << " is outside i32 range [-2147483648, 2147483647]";
@@ -358,10 +326,9 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   CheckSameCudaDevice(arg_k2q_row_ptr, arg_q, "k2q_row_ptr", "q");
   CheckSameCudaDevice(arg_k2q_qsplit_indices, arg_q, "k2q_qsplit_indices", "q");
   CheckSameCudaDevice(arg_partial_o, arg_q, "partial_o", "q");
-  CheckSameCudaDevice(arg_partial_scale, arg_q, "partial_scale", "q");
   CheckSameCudaDevice(arg_partial_lse, arg_q, "partial_lse", "q");
   CheckSameCudaDevice(arg_partial_temperature_lse, arg_q, "partial_temperature_lse", "q");
-  CheckSameCudaDevice(arg_out, arg_q, "out", "q");
+  CheckSameCudaDevice(arg_completion_counts, arg_q, "completion_counts", "q");
   CheckSameCudaDevice(arg_cu_seqlens_q, arg_q, "cu_seqlens_q", "q");
   CheckSameCudaDevice(arg_cu_seqlens_k, arg_q, "cu_seqlens_k", "q");
   CheckSameCudaDevice(arg_q_offsets, arg_q, "q_offsets", "q");
@@ -375,53 +342,41 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   int64_t host_extent_0 = 128;
   TVM_FFI_CHECK(arg_q.size(2) == host_extent_0, ValueError)
       << "q dimension 2 must be equal " << host_extent_0      << ", got " << arg_q.size(2);
-  TVM_FFI_CHECK(arg_k.ndim() == 4, ValueError)
-      << "k must have rank 4, got " << arg_k.ndim();
+  TVM_FFI_CHECK(arg_k.ndim() == 3, ValueError)
+      << "k must have rank 3, got " << arg_k.ndim();
   int64_t host_extent_1 = 128;
-  TVM_FFI_CHECK(arg_k.size(2) >= host_extent_1, ValueError)
-      << "k dimension 2 must be at least " << host_extent_1      << ", got " << arg_k.size(2);
+  TVM_FFI_CHECK(arg_k.size(2) == host_extent_1, ValueError)
+      << "k dimension 2 must be equal " << host_extent_1      << ", got " << arg_k.size(2);
+  TVM_FFI_CHECK(arg_v.ndim() == 3, ValueError)
+      << "v must have rank 3, got " << arg_v.ndim();
   int64_t host_extent_2 = 128;
-  TVM_FFI_CHECK(arg_k.size(3) >= host_extent_2, ValueError)
-      << "k dimension 3 must be at least " << host_extent_2      << ", got " << arg_k.size(3);
-  TVM_FFI_CHECK(arg_v.ndim() == 4, ValueError)
-      << "v must have rank 4, got " << arg_v.ndim();
+  TVM_FFI_CHECK(arg_v.size(2) == host_extent_2, ValueError)
+      << "v dimension 2 must be equal " << host_extent_2      << ", got " << arg_v.size(2);
   int64_t host_extent_3 = 128;
-  TVM_FFI_CHECK(arg_v.size(2) >= host_extent_3, ValueError)
-      << "v dimension 2 must be at least " << host_extent_3      << ", got " << arg_v.size(2);
-  int64_t host_extent_4 = 128;
-  TVM_FFI_CHECK(arg_v.size(3) >= host_extent_4, ValueError)
-      << "v dimension 3 must be at least " << host_extent_4      << ", got " << arg_v.size(3);
-  int64_t host_extent_5 = 128;
-  host_extent_5 = HostCheckedExtentMul(host_extent_5, HostCheckedExtentValue(static_cast<int64_t>(arg_topk), "topk"), "128 * topk * total_q * num_q_heads");
-  host_extent_5 = HostCheckedExtentMul(host_extent_5, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "128 * topk * total_q * num_q_heads");
-  host_extent_5 = HostCheckedExtentMul(host_extent_5, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "128 * topk * total_q * num_q_heads");
-  TVM_FFI_CHECK(arg_partial_o.numel() >= host_extent_5, ValueError)
-      << "partial_o requires at least " << (host_extent_5)      << " TensorView storage elements, got " << arg_partial_o.numel();
+  host_extent_3 = HostCheckedExtentMul(host_extent_3, HostCheckedExtentValue(static_cast<int64_t>(arg_topk), "topk"), "128 * topk * total_q * num_q_heads");
+  host_extent_3 = HostCheckedExtentMul(host_extent_3, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "128 * topk * total_q * num_q_heads");
+  host_extent_3 = HostCheckedExtentMul(host_extent_3, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "128 * topk * total_q * num_q_heads");
+  TVM_FFI_CHECK(arg_partial_o.numel() >= host_extent_3, ValueError)
+      << "partial_o requires at least " << (host_extent_3)      << " TensorView storage elements, got " << arg_partial_o.numel();
+  int64_t host_extent_4 = 1;
+  host_extent_4 = HostCheckedExtentMul(host_extent_4, HostCheckedExtentValue(static_cast<int64_t>(arg_topk), "topk"), "topk * total_q * num_q_heads");
+  host_extent_4 = HostCheckedExtentMul(host_extent_4, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "topk * total_q * num_q_heads");
+  host_extent_4 = HostCheckedExtentMul(host_extent_4, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "topk * total_q * num_q_heads");
+  TVM_FFI_CHECK(arg_partial_lse.numel() >= host_extent_4, ValueError)
+      << "partial_lse requires at least " << (host_extent_4)      << " TensorView storage elements, got " << arg_partial_lse.numel();
+  int64_t host_extent_5 = 1;
+  host_extent_5 = HostCheckedExtentMul(host_extent_5, HostCheckedExtentValue(static_cast<int64_t>(arg_topk), "topk"), "topk * total_q * num_q_heads");
+  host_extent_5 = HostCheckedExtentMul(host_extent_5, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "topk * total_q * num_q_heads");
+  host_extent_5 = HostCheckedExtentMul(host_extent_5, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "topk * total_q * num_q_heads");
+  TVM_FFI_CHECK(arg_partial_temperature_lse.numel() >= host_extent_5, ValueError)
+      << "partial_temperature_lse requires at least " << (host_extent_5)      << " TensorView storage elements, got " << arg_partial_temperature_lse.numel();
   int64_t host_extent_6 = 1;
-  host_extent_6 = HostCheckedExtentMul(host_extent_6, HostCheckedExtentValue(static_cast<int64_t>(arg_topk), "topk"), "topk * total_q * num_q_heads");
-  host_extent_6 = HostCheckedExtentMul(host_extent_6, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "topk * total_q * num_q_heads");
-  host_extent_6 = HostCheckedExtentMul(host_extent_6, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "topk * total_q * num_q_heads");
-  TVM_FFI_CHECK(arg_partial_lse.numel() >= host_extent_6, ValueError)
-      << "partial_lse requires at least " << (host_extent_6)      << " TensorView storage elements, got " << arg_partial_lse.numel();
-  int64_t host_extent_7 = 1;
-  host_extent_7 = HostCheckedExtentMul(host_extent_7, HostCheckedExtentValue(static_cast<int64_t>(arg_topk), "topk"), "topk * total_q * num_q_heads");
-  host_extent_7 = HostCheckedExtentMul(host_extent_7, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "topk * total_q * num_q_heads");
-  host_extent_7 = HostCheckedExtentMul(host_extent_7, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "topk * total_q * num_q_heads");
-  TVM_FFI_CHECK(arg_partial_temperature_lse.numel() >= host_extent_7, ValueError)
-      << "partial_temperature_lse requires at least " << (host_extent_7)      << " TensorView storage elements, got " << arg_partial_temperature_lse.numel();
-  int64_t host_extent_8 = 1;
-  host_extent_8 = HostCheckedExtentMul(host_extent_8, HostCheckedExtentValue(static_cast<int64_t>(arg_num_kv_heads), "num_kv_heads"), "num_kv_heads * total_rows");
-  host_extent_8 = HostCheckedExtentMul(host_extent_8, HostCheckedExtentValue(static_cast<int64_t>(arg_total_rows), "total_rows"), "num_kv_heads * total_rows");
-  TVM_FFI_CHECK(arg_k2q_row_ptr.numel() >= host_extent_8, ValueError)
-      << "k2q_row_ptr requires at least " << (host_extent_8)      << " TensorView storage elements, got " << arg_k2q_row_ptr.numel();
-  int64_t host_extent_9 = 4;
-  host_extent_9 = HostCheckedExtentMul(host_extent_9, HostCheckedExtentValue(static_cast<int64_t>(arg_topk), "topk"), "4 * topk * total_q * num_q_heads");
-  host_extent_9 = HostCheckedExtentMul(host_extent_9, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "4 * topk * total_q * num_q_heads");
-  host_extent_9 = HostCheckedExtentMul(host_extent_9, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "4 * topk * total_q * num_q_heads");
-  TVM_FFI_CHECK(arg_partial_scale.numel() >= host_extent_9, ValueError)
-      << "partial_scale requires at least " << (host_extent_9)      << " TensorView storage elements, got " << arg_partial_scale.numel();
-  TVM_FFI_CHECK(arg_max_pages >= 1, ValueError)
-      << "max_pages must be >= " << 1      << ", got " << arg_max_pages;
+  host_extent_6 = HostCheckedExtentMul(host_extent_6, HostCheckedExtentValue(static_cast<int64_t>(arg_num_kv_heads), "num_kv_heads"), "num_kv_heads * total_rows");
+  host_extent_6 = HostCheckedExtentMul(host_extent_6, HostCheckedExtentValue(static_cast<int64_t>(arg_total_rows), "total_rows"), "num_kv_heads * total_rows");
+  TVM_FFI_CHECK(arg_k2q_row_ptr.numel() >= host_extent_6, ValueError)
+      << "k2q_row_ptr requires at least " << (host_extent_6)      << " TensorView storage elements, got " << arg_k2q_row_ptr.numel();
+  TVM_FFI_CHECK(arg_max_pages >= 0, ValueError)
+      << "max_pages must be >= " << 0      << ", got " << arg_max_pages;
   TVM_FFI_CHECK(arg_total_q >= 1, ValueError)
       << "total_q must be >= " << 1      << ", got " << arg_total_q;
   TVM_FFI_CHECK(arg_num_q_heads >= 1, ValueError)
@@ -445,22 +400,14 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   void* p_k2q_row_ptr = arg_k2q_row_ptr.data_ptr();
   void* p_k2q_qsplit_indices = arg_k2q_qsplit_indices.data_ptr();
   void* p_partial_o = arg_partial_o.data_ptr();
-  void* p_partial_scale = arg_partial_scale.data_ptr();
   void* p_partial_lse = arg_partial_lse.data_ptr();
   void* p_partial_temperature_lse = arg_partial_temperature_lse.data_ptr();
-  void* p_out = arg_out.data_ptr();
+  void* p_completion_counts = arg_completion_counts.data_ptr();
   void* p_cu_seqlens_q = arg_cu_seqlens_q.data_ptr();
   void* p_cu_seqlens_k = arg_cu_seqlens_k.data_ptr();
   void* p_q_offsets = arg_q_offsets.data_ptr();
   void* p_kv_lens = arg_kv_lens.data_ptr();
   void* p_page_table = arg_page_table.data_ptr();
-  int32_t v_q_group_segment_end_128 = (int32_t)arg_q_group_segment_end_128;
-  int32_t v_q_group_segment_end_64 = (int32_t)arg_q_group_segment_end_64;
-  int32_t v_q_group_segment_end_32 = (int32_t)arg_q_group_segment_end_32;
-  int32_t v_q_group_segment_end_16 = (int32_t)arg_q_group_segment_end_16;
-  int32_t v_q_group_segment_end_8 = (int32_t)arg_q_group_segment_end_8;
-  int32_t v_q_group_segment_end_4 = (int32_t)arg_q_group_segment_end_4;
-  int32_t v_q_group_segment_end_2 = (int32_t)arg_q_group_segment_end_2;
   int32_t v_total_q = (int32_t)arg_total_q;
   int32_t v_num_q_heads = (int32_t)arg_num_q_heads;
   int32_t v_num_kv_heads = (int32_t)arg_num_kv_heads;
@@ -475,19 +422,19 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   float v_softmax_scale_log2 = (float)arg_softmax_scale_log2;
   float v_lse_temperature_scale = (float)arg_lse_temperature_scale;
   int32_t v_return_temperature_lse = (int32_t)arg_return_temperature_lse;
-  void* kargs[] = {&p_q, &p_k, &p_v, &p_scheduler_metadata, &p_k2q_row_ptr, &p_k2q_qsplit_indices, &p_partial_o, &p_partial_scale, &p_partial_lse, &p_partial_temperature_lse, &p_out, &p_cu_seqlens_q, &p_cu_seqlens_k, &p_q_offsets, &p_kv_lens, &p_page_table, &v_q_group_segment_end_128, &v_q_group_segment_end_64, &v_q_group_segment_end_32, &v_q_group_segment_end_16, &v_q_group_segment_end_8, &v_q_group_segment_end_4, &v_q_group_segment_end_2, &v_total_q, &v_num_q_heads, &v_num_kv_heads, &v_total_rows, &v_nnz_per_head, &v_work_capacity, &v_num_work_items, &v_topk, &v_max_pages, &v_causal, &v_derive_q_offset, &v_softmax_scale_log2, &v_lse_temperature_scale, &v_return_temperature_lse};
+  void* kargs[] = {&p_q, &p_k, &p_v, &p_scheduler_metadata, &p_k2q_row_ptr, &p_k2q_qsplit_indices, &p_partial_o, &p_partial_lse, &p_partial_temperature_lse, &p_completion_counts, &p_cu_seqlens_q, &p_cu_seqlens_k, &p_q_offsets, &p_kv_lens, &p_page_table, &v_total_q, &v_num_q_heads, &v_num_kv_heads, &v_total_rows, &v_nnz_per_head, &v_work_capacity, &v_num_work_items, &v_topk, &v_max_pages, &v_causal, &v_derive_q_offset, &v_softmax_scale_log2, &v_lse_temperature_scale, &v_return_temperature_lse};
 
   dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   dim3 block(512u, 1u, 1u);
 
   cudaError_t status = cudaFuncSetAttribute(
-      kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100, cudaFuncAttributeMaxDynamicSharedMemorySize, 148480);
+      kernel_minimax_sparse_reverse_prefill_fp8_gqa16_qagg_pdl_sm100, cudaFuncAttributeMaxDynamicSharedMemorySize, 132096);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "cudaFuncSetAttribute(kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100) failed: " << cudaGetErrorString(status);
-  status = cudaLaunchKernel(reinterpret_cast<const void*>(kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100), grid, block, kargs,
-                            148480u, stream);
+      << "cudaFuncSetAttribute(kernel_minimax_sparse_reverse_prefill_fp8_gqa16_qagg_pdl_sm100) failed: " << cudaGetErrorString(status);
+  status = cudaLaunchKernel(reinterpret_cast<const void*>(kernel_minimax_sparse_reverse_prefill_fp8_gqa16_qagg_pdl_sm100), grid, block, kargs,
+                            132096u, stream);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100 launch failed: " << cudaGetErrorString(status);
+      << "kernel_minimax_sparse_reverse_prefill_fp8_gqa16_qagg_pdl_sm100 launch failed: " << cudaGetErrorString(status);
 }
 
 }  // namespace flashinfer::blackwell_msa

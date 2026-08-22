@@ -403,12 +403,17 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
   host_extent_5 = HostCheckedExtentMul(host_extent_5, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "topk * total_q * num_q_heads");
   TVM_FFI_CHECK(arg_partial_temperature_lse.numel() >= host_extent_5, ValueError)
       << "partial_temperature_lse requires at least " << (host_extent_5)      << " TensorView storage elements, got " << arg_partial_temperature_lse.numel();
-  int64_t host_extent_6 = 2;
-  host_extent_6 = HostCheckedExtentMul(host_extent_6, HostCheckedExtentValue(static_cast<int64_t>(arg_topk), "topk"), "2 * topk * total_q * num_q_heads");
-  host_extent_6 = HostCheckedExtentMul(host_extent_6, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "2 * topk * total_q * num_q_heads");
-  host_extent_6 = HostCheckedExtentMul(host_extent_6, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "2 * topk * total_q * num_q_heads");
-  TVM_FFI_CHECK(arg_partial_scale.numel() >= host_extent_6, ValueError)
-      << "partial_scale requires at least " << (host_extent_6)      << " TensorView storage elements, got " << arg_partial_scale.numel();
+  int64_t host_extent_6 = 1;
+  host_extent_6 = HostCheckedExtentMul(host_extent_6, HostCheckedExtentValue(static_cast<int64_t>(arg_num_kv_heads), "num_kv_heads"), "num_kv_heads * total_rows");
+  host_extent_6 = HostCheckedExtentMul(host_extent_6, HostCheckedExtentValue(static_cast<int64_t>(arg_total_rows), "total_rows"), "num_kv_heads * total_rows");
+  TVM_FFI_CHECK(arg_k2q_row_ptr.numel() >= host_extent_6, ValueError)
+      << "k2q_row_ptr requires at least " << (host_extent_6)      << " TensorView storage elements, got " << arg_k2q_row_ptr.numel();
+  int64_t host_extent_7 = 2;
+  host_extent_7 = HostCheckedExtentMul(host_extent_7, HostCheckedExtentValue(static_cast<int64_t>(arg_topk), "topk"), "2 * topk * total_q * num_q_heads");
+  host_extent_7 = HostCheckedExtentMul(host_extent_7, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "2 * topk * total_q * num_q_heads");
+  host_extent_7 = HostCheckedExtentMul(host_extent_7, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "2 * topk * total_q * num_q_heads");
+  TVM_FFI_CHECK(arg_partial_scale.numel() >= host_extent_7, ValueError)
+      << "partial_scale requires at least " << (host_extent_7)      << " TensorView storage elements, got " << arg_partial_scale.numel();
   TVM_FFI_CHECK(arg_max_pages >= 0, ValueError)
       << "max_pages must be >= " << 0      << ", got " << arg_max_pages;
   TVM_FFI_CHECK(arg_total_q >= 1, ValueError)
@@ -425,11 +430,6 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_sc
       << "topk must be <= " << 16      << ", got " << arg_topk;
   TVM_FFI_CHECK(arg_total_rows >= 1, ValueError)
       << "total_rows must be >= " << 1      << ", got " << arg_total_rows;
-  int64_t host_extent_7 = 1;
-  host_extent_7 = HostCheckedExtentMul(host_extent_7, HostCheckedExtentValue(static_cast<int64_t>(arg_total_q), "total_q"), "total_q * num_q_heads");
-  host_extent_7 = HostCheckedExtentMul(host_extent_7, HostCheckedExtentValue(static_cast<int64_t>(arg_num_q_heads), "num_q_heads"), "total_q * num_q_heads");
-  TVM_FFI_CHECK(arg_total_rows == host_extent_7, ValueError)
-      << "total_rows must equal " << host_extent_7      << ", got " << arg_total_rows;
 
 
   CUtensorMap p_q = EncodeTma_q(arg_q);

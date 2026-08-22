@@ -2,16 +2,17 @@
   "schema_version": 1,
   "operation": "blackwell_msa",
   "attention_topk": 16,
-  "reachable_specialization_count": 32,
+  "reachable_specialization_count": 36,
   "family_predicates": {
     "topk_select": "public top-k selection with topk=16",
     "union_prefill": "prefill not selected by the M64 override or long-context reverse route; BF16 GQA8/GQA16 and paged causal GQA16 use dedicated source retraces",
     "m64_prefill_override": "FLASHINFER_MSA_PREFILL_SCHEDULE=m64, flat BF16 GQA16, eager execution, and maximum KV length at most 8192",
     "long_bf16_reverse_prefill": "batch 1 BF16 causal TopK16 prefill, total_q at least 8192, default query offset, and either flat GQA16 KV length at least 8192, paged GQA8 max_pages at least 64, or paged GQA16 max_pages greater than 64",
-    "direct_m16_decode": "decode not selected by a direct FP8 Q1 or uniform-FP8 override; one selected-block persistent M16 kernel handles Q1 and multi-token decode",
+    "direct_m16_decode": "decode not selected by a direct FP8 Q1 or uniform-FP8 override; TopK16 uses one selected-block persistent M16 kernel, while the frozen paged BF16 TopK32 and TopK4 coordinates use dedicated exact units",
     "fp8_kv_q1_exact_override": "BF16-query FP8-KV causal Q1 exact serving shapes selected by the explicit exact schedule",
     "fp8_kv_q1_xform2": "BF16-query FP8-KV causal Q1 serving shapes selected by the explicit xform2 schedule",
-    "uniform_fp8_qkv_decode": "paged causal uniform FP8 Q/K/V, Q1 through Q32, force_fused=True, and default query offset"
+    "uniform_fp8_qkv_decode": "paged causal uniform FP8 Q/K/V, Q1 through Q32, force_fused=True, and default query offset",
+    "exact_reverse_prefill": "shape-exact causal non-TopK16 reverse prefill for the flat BF16-query FP8-KV TopK8 and paged BF16 TopK4 serving coordinates"
   },
   "reachable_specializations": [
     {
@@ -268,6 +269,28 @@
       ]
     },
     {
+      "id": "direct_m16_decode.bf16_paged_topk32_exact",
+      "family": "direct_m16_decode",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_m16_bf16_paged_topk32"
+      ]
+    },
+    {
+      "id": "direct_m16_decode.bf16_paged_topk4_exact512",
+      "family": "direct_m16_decode",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "decode_m16_bf16_paged_topk4_exact512"
+      ]
+    },
+    {
       "id": "direct_m16_decode.fp16_flat",
       "family": "direct_m16_decode",
       "architectures": [
@@ -365,6 +388,30 @@
       "source_units": [
         "decode_uniform_fp8_qkv_paged"
       ]
+    },
+    {
+      "id": "exact_reverse_prefill.bf16_query_fp8_kv_flat_topk8",
+      "family": "exact_reverse_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl",
+        "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl_reduce"
+      ]
+    },
+    {
+      "id": "exact_reverse_prefill.bf16_paged_topk4",
+      "family": "exact_reverse_prefill",
+      "architectures": [
+        "sm100",
+        "sm103"
+      ],
+      "source_units": [
+        "reverse_prefill_bf16_paged_topk4_qload4",
+        "reverse_prefill_bf16_paged_topk4_qload4_const4_reduce"
+      ]
     }
   ],
   "excluded_unreachable_helpers": [
@@ -417,6 +464,36 @@
         "binding_sha256": "f5ea39679a3a1dabc5b9a720f88aedf6ee30fc3a83abf7e9e6671841de450b61",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_m16_bf16_paged_topk32",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "ee22d3485d663e55fa3f13365c8b48f923b254572d2bcd80ef570c208078a560",
+        "vendored_sha256": "203511178d5041a0811b73fcc5529056da8c5a545ce3160f129bb0dd72104746",
+        "binding_sha256": "a595cfa8ffbed839b9780140bb07f9b85ffdab731b3adbf40171b7627ceffd41",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_runtime_topk_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "decode_m16_bf16_paged_topk4_exact512",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "2fb46ddcef07f38ae98a4a19008f48259502baf2ced6aaada309f5efa29c98ea",
+        "vendored_sha256": "7c74a61867fc7d3ee6c6bae9c15f448438519b8831cb0b2a4de328a3226df924",
+        "binding_sha256": "3a2b086a0146e4099199d6cd7e6db96ebc3bb15d2e0fdbab0f9240eb53fb827a",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_b2_q1_kv257_h8_hkv1_k4_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
           "infinity_identifier": 27
@@ -564,7 +641,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "e3cb196f82b1a21bf74b5d41b05873f3e6a020c36f04f1708f8a703daccae16c",
         "vendored_sha256": "cb587f06a01ec47b5adec1097fc94439866adf0108cd1489b349f4b00d39ae04",
-        "binding_sha256": "d0b9d8c5e756e610edaa7b1cf4e22358b9d846ec0118dde26f0a353ada17029f",
+        "binding_sha256": "bf03d4c074e1901680ab67d4537b1b37de6de794443da6cd8df17dc63407a06b",
         "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
         "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
         "replacement_counts": {
@@ -579,7 +656,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "495c0340f2f02bc5d9eb9a3f0be0068faaa85fca56f32f3025ee0fe37789826c",
         "vendored_sha256": "95751076c63d9a875c140013fba44851180eecb7454434e8ad8e232522c5983b",
-        "binding_sha256": "50a690308c7f892d99014c4f2da8c96d18f07e2d6106d256160ca229bcb2d3bb",
+        "binding_sha256": "6ec4f0ebe1912a5469318155fed11d1d95e0dc1e6a5959297455bcd4c52b8835",
         "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
         "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
         "replacement_counts": {
@@ -594,7 +671,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "75e25466802b6699501a0ffd26da6cf9d8b57a37a7fb9427eb8e3f96668041c9",
         "vendored_sha256": "ee70d2c6ca8ccc941f60e91e35111b739f8d1ee3bed5301ccaaebbde0baccec8",
-        "binding_sha256": "a17088722e348adea9502ebf8b70904f3df87775c45dde9ef13a2f0442390124",
+        "binding_sha256": "2eee94b4df8213730ee3520f0d978a194abc33933b8aa8e8cad5b292ff770956",
         "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
         "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
         "replacement_counts": {
@@ -609,7 +686,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "33556791b2fe1818aee075ae123754493991180f5c7b1b36f9e00f6d4005b255",
         "vendored_sha256": "a6fc6a11d7bcc2c909aeed376957efdb5883a56d02c5ac406e69a351527019f6",
-        "binding_sha256": "e133a5195bc41b1500dacec189596986ae2c7f9d10c7faf4e9ba1013f4c735c3",
+        "binding_sha256": "c191b81ec1dfe939f1e26c6b91c6d594c9321bf194b6410a659d9db23040f578",
         "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
         "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
         "replacement_counts": {
@@ -860,6 +937,66 @@
       },
       {
         "target": "sm100a",
+        "source_unit": "reverse_prefill_bf16_paged_topk4_qload4",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "0f9992b0fe4e36c7d6f87fb9f4a40b6c362ba27a204ddc512c8faf7e93998841",
+        "vendored_sha256": "7beb023b5549012282284bc542fede7719db35f91942f27e7fadd7a9e9f57bcd",
+        "binding_sha256": "1c5df744b683065686dfbc4349c0b674e739bc7b083d002e08c14aa1fa9d1fe5",
+        "arg_plan_sha256": "8f141ecaac0df32d9132f7d6f86c775999ffc126cbab75698cfe5f53341d0f49",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_fp8partial_temp1reuse_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 39
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "reverse_prefill_bf16_paged_topk4_qload4_const4_reduce",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "aed1a024d38666c5a17dc17521009fe00016869861b1e27d68ac7ecdb7acc4ba",
+        "vendored_sha256": "42f28e0ba061b664109cd29de614c8769d4d038e4e583af12b9457a24636b138",
+        "binding_sha256": "264aa76d3f3fc23992b44c7a90fba37aabca81f543f58cfcc11bab040b1d56e0",
+        "arg_plan_sha256": "b4109e642ce8e586f48a7893f0b56c5a0b3e2cebc82b756ee06a6356d64bc6c3",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_topk4_eighthwarp16_metaparallel_const4_qload4fp8partial_temp1reuse_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 6
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "b460009599b408ed8829f95c3ebf23b16b9fcdbbcb16436d139fd370c88821dc",
+        "vendored_sha256": "abad0c7aa281c85bc828a8122e5c35cae0d36a27ab5603712ae3e61ed5d92482",
+        "binding_sha256": "c8680e03ec8703b8aced3965c88209f0a7059108e1dddabc745c771794299a0b",
+        "arg_plan_sha256": "4ef1f904499e6c684526d703ab834a24874e664f1d4ccf459b4dde24f5895150",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_fp8_gqa16_qagg_pdl_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 39
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm100a",
+        "source_unit": "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl_reduce",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "952aa39f0fe7879cd93c1d9c2da8824ed04634c07435922b18ddc3ddc867a9bb",
+        "vendored_sha256": "467c952cac2f9074ead0c3420f03164c763569c6c1c17f7c6eb3a8c404b2a6ed",
+        "binding_sha256": "980b34fdfc5050659e17bdcfda55b8d96563caaba275a81c7faf9472baf9aae4",
+        "arg_plan_sha256": "5669d6f9ae746f0c1b71d7978233e29b753cdd3915849924aa74ae14ce022fe1",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_unscaled_fp8_qagg_pdl_dualcohort_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 9
+        },
+        "programmatic_stream_serialization": true
+      },
+      {
+        "target": "sm100a",
         "source_unit": "topk",
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "9dd70a7e7df4815e0bdf3654bb9b976e9b4a25fecacf15b1cdf2fcdea4b21841",
@@ -897,6 +1034,36 @@
         "binding_sha256": "f5ea39679a3a1dabc5b9a720f88aedf6ee30fc3a83abf7e9e6671841de450b61",
         "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
         "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_m16_bf16_paged_topk32",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "ee22d3485d663e55fa3f13365c8b48f923b254572d2bcd80ef570c208078a560",
+        "vendored_sha256": "203511178d5041a0811b73fcc5529056da8c5a545ce3160f129bb0dd72104746",
+        "binding_sha256": "a595cfa8ffbed839b9780140bb07f9b85ffdab731b3adbf40171b7627ceffd41",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_runtime_topk_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 27
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "decode_m16_bf16_paged_topk4_exact512",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "2fb46ddcef07f38ae98a4a19008f48259502baf2ced6aaada309f5efa29c98ea",
+        "vendored_sha256": "7c74a61867fc7d3ee6c6bae9c15f448438519b8831cb0b2a4de328a3226df924",
+        "binding_sha256": "3a2b086a0146e4099199d6cd7e6db96ebc3bb15d2e0fdbab0f9240eb53fb827a",
+        "arg_plan_sha256": "7d4e7cd0de0bc595558e315db30c14ecfd0a964a706195446b360385f9154155",
+        "kernel_entry": "kernel_minimax_sparse_decode_m16_paged_b2_q1_kv257_h8_hkv1_k4_sm100",
         "replacement_counts": {
           "tensor_map_identifier": 1,
           "infinity_identifier": 27
@@ -1044,7 +1211,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "7c8aa364b98face6dead72484df270051419ee09946464da65789cca317e14b1",
         "vendored_sha256": "3af9f5ea4c0c99708b5b5dfcfe4c7acf2e834ba08964c7f71add1c89c73d895d",
-        "binding_sha256": "2db3a23581ed10e35aa03f6ce16fa1074718ef1413c44efc041b23cdd05a116b",
+        "binding_sha256": "3325b6498c15c8cc37ddbbc2444b921efd6145f3ab323248940ec2bf145a5561",
         "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
         "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
         "replacement_counts": {
@@ -1059,7 +1226,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "bf7c035e6e2c48c454459ad6cffe3517d800b3ecd2aec600b86740c9a21eb761",
         "vendored_sha256": "fbf7ee0f6c9eccd175f3b8fa130924926f502c7a8e6603913b2490906496cc98",
-        "binding_sha256": "e173c8dff5b891770c6eea9918274b528864f8545f744c0ef2e99b5c99e19248",
+        "binding_sha256": "d069b0910964d25a1e84dec7d61fadf8b89fc1265556508e92af24b38a9d2d94",
         "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
         "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
         "replacement_counts": {
@@ -1074,7 +1241,7 @@
         "normalization_schema": "blackwell-msa-identifiers-v1",
         "generated_input_sha256": "acec3cb3f9531bbedf1d2ac70674272bce18749a1da69a6e4f40892be4e6bfce",
         "vendored_sha256": "9ac785478d9ea08112c963f99778ae8ac1b6f40667b86e6d79ef11eaabdb71cb",
-        "binding_sha256": "06d166f816d9189490f73f39fe3f5c70fe3ad23135169ed4e0b60f2cb53f401d",
+        "binding_sha256": "33de25c80f1fe78f9945e2bde66a446e7efb7a91af55e985686557c5ab20ffab",
         "arg_plan_sha256": "439c761fe3ec9256297310721e5d5a8852e2d2286cc177ccdca9b33393c1964e",
         "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_nobar_sm100",
         "replacement_counts": {
@@ -1322,6 +1489,66 @@
           "infinity_identifier": 23
         },
         "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "reverse_prefill_bf16_paged_topk4_qload4",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "0f9992b0fe4e36c7d6f87fb9f4a40b6c362ba27a204ddc512c8faf7e93998841",
+        "vendored_sha256": "7beb023b5549012282284bc542fede7719db35f91942f27e7fadd7a9e9f57bcd",
+        "binding_sha256": "1c5df744b683065686dfbc4349c0b674e739bc7b083d002e08c14aa1fa9d1fe5",
+        "arg_plan_sha256": "8f141ecaac0df32d9132f7d6f86c775999ffc126cbab75698cfe5f53341d0f49",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_paged_bf16_gqa4_qload4_fp8partial_temp1reuse_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 39
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "reverse_prefill_bf16_paged_topk4_qload4_const4_reduce",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "aed1a024d38666c5a17dc17521009fe00016869861b1e27d68ac7ecdb7acc4ba",
+        "vendored_sha256": "42f28e0ba061b664109cd29de614c8769d4d038e4e583af12b9457a24636b138",
+        "binding_sha256": "264aa76d3f3fc23992b44c7a90fba37aabca81f543f58cfcc11bab040b1d56e0",
+        "arg_plan_sha256": "b4109e642ce8e586f48a7893f0b56c5a0b3e2cebc82b756ee06a6356d64bc6c3",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_topk4_eighthwarp16_metaparallel_const4_qload4fp8partial_temp1reuse_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 6
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "b460009599b408ed8829f95c3ebf23b16b9fcdbbcb16436d139fd370c88821dc",
+        "vendored_sha256": "abad0c7aa281c85bc828a8122e5c35cae0d36a27ab5603712ae3e61ed5d92482",
+        "binding_sha256": "c8680e03ec8703b8aced3965c88209f0a7059108e1dddabc745c771794299a0b",
+        "arg_plan_sha256": "4ef1f904499e6c684526d703ab834a24874e664f1d4ccf459b4dde24f5895150",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_fp8_gqa16_qagg_pdl_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 39
+        },
+        "programmatic_stream_serialization": false
+      },
+      {
+        "target": "sm103a",
+        "source_unit": "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl_reduce",
+        "normalization_schema": "blackwell-msa-identifiers-v1",
+        "generated_input_sha256": "952aa39f0fe7879cd93c1d9c2da8824ed04634c07435922b18ddc3ddc867a9bb",
+        "vendored_sha256": "467c952cac2f9074ead0c3420f03164c763569c6c1c17f7c6eb3a8c404b2a6ed",
+        "binding_sha256": "980b34fdfc5050659e17bdcfda55b8d96563caaba275a81c7faf9472baf9aae4",
+        "arg_plan_sha256": "5669d6f9ae746f0c1b71d7978233e29b753cdd3915849924aa74ae14ce022fe1",
+        "kernel_entry": "kernel_minimax_sparse_reverse_prefill_combine_unscaled_fp8_qagg_pdl_dualcohort_sm100",
+        "replacement_counts": {
+          "tensor_map_identifier": 1,
+          "infinity_identifier": 9
+        },
+        "programmatic_stream_serialization": true
       },
       {
         "target": "sm103a",

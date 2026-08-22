@@ -391,7 +391,7 @@ SHAPE_MANIFEST: tuple[MSAShape, ...] = (
         ),
         selection_rationale=(
             "Freezes a partial-final-page boundary with four selected blocks; "
-            "exercises the exact active8 direct-M16 tail path."
+            "exercises the exact 512-thread direct-M16 tail path."
         ),
         operation="sparse_decode",
         batch_size=2,

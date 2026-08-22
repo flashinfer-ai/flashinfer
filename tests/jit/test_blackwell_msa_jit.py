@@ -42,6 +42,9 @@ def test_variant_manifest_matches_each_target_source_directory() -> None:
         "long_prefill_paged_bf16_gqa16_direct_group_sm100"
         not in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET["sm103a"]
     )
+    for variants in blackwell_msa.BLACKWELL_MSA_VARIANTS_BY_TARGET.values():
+        assert "decode_m16_bf16_paged_topk4_exact512" in variants
+        assert not any("active8" in variant for variant in variants)
 
 
 @pytest.mark.parametrize(

@@ -631,7 +631,7 @@ def _exact_non16_decode_variant(
         and k_outer_dim == 6
         and max_pages == 3
     ):
-        return "decode_m16_bf16_paged_topk4_active8"
+        return "decode_m16_bf16_paged_topk4_exact512"
     return None
 
 
