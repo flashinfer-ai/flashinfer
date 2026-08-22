@@ -1,4 +1,3 @@
-import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -103,15 +102,31 @@ def test_debug_jit_does_not_propagate_ndebug(monkeypatch):
     assert "-DNDEBUG" not in spec.extra_cuda_cflags
 
 
+class _FakePopen:
+    """Minimal stand-in for subprocess.Popen used by run_ninja.
+
+    Iterating ``stdout`` yields the captured lines (mirroring the real
+    line-buffered pipe); ``wait()`` returns the configured exit code.
+    """
+
+    def __init__(self, command, output="", returncode=0):
+        self.command = command
+        self.stdout = iter(output.splitlines(keepends=True))
+        self._returncode = returncode
+
+    def wait(self):
+        return self._returncode
+
+
 def test_run_ninja_uses_max_jobs(monkeypatch, tmp_path):
     commands = []
 
-    def fake_run(command, **kwargs):
+    def fake_popen(command, **kwargs):
         commands.append(command)
-        return subprocess.CompletedProcess(command, 0)
+        return _FakePopen(command, output="", returncode=0)
 
     monkeypatch.setenv("MAX_JOBS", "8")
-    monkeypatch.setattr(cpp_ext.subprocess, "run", fake_run)
+    monkeypatch.setattr(cpp_ext.subprocess, "Popen", fake_popen)
 
     cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)
 
@@ -127,6 +142,179 @@ def test_run_ninja_uses_max_jobs(monkeypatch, tmp_path):
             "8",
         ]
     ]
+
+
+def test_summarize_ninja_missing_cuda_header():
+    output = (
+        "[1/3] nvcc ... -c fp4_gemm_cutlass.cu -o fp4_gemm_cutlass.cuda.o\n"
+        "FAILED: fp4_gemm_cutlass.cuda.o\n"
+        "In file included from cutlass/util/reference/device/tensor_fill.h:52:\n"
+        "cutlass/util/reference/device/tensor_fill.h:52:10: fatal error: "
+        "curand_kernel.h: No such file or directory\n"
+        "   52 | #include <curand_kernel.h>\n"
+        "      |          ^~~~~~~~~~~~~~~~~\n"
+        "compilation terminated.\n"
+        "ninja: build stopped: subcommand failed.\n"
+    )
+
+    summary = cpp_ext.summarize_ninja_build_failure(output)
+
+    assert "fatal error: curand_kernel.h" in summary
+    assert "FLASHINFER_EXTRA_CUDAFLAGS" in summary
+    assert "site-packages/nvidia" in summary
+
+
+def test_summarize_ninja_missing_non_cuda_header_uses_generic_hint():
+    output = (
+        "[1/2] c++ ... -c widget.cpp -o widget.o\n"
+        "FAILED: widget.o\n"
+        "widget.cpp:3:10: fatal error: myproject/widget.hpp: "
+        "No such file or directory\n"
+        "compilation terminated.\n"
+        "ninja: build stopped: subcommand failed.\n"
+    )
+
+    summary = cpp_ext.summarize_ninja_build_failure(output)
+
+    assert "fatal error: myproject/widget.hpp" in summary
+    # A non-CUDA header must get generic include-path guidance, not the
+    # CUDA-wheel hint that points at site-packages/nvidia.
+    assert "site-packages/nvidia" not in summary
+    assert "FLASHINFER_EXTRA_CUDAFLAGS" in summary
+
+
+def test_summarize_ninja_missing_cuh_header_uses_cuda_hint():
+    output = (
+        "[1/2] nvcc ... -c kernel.cu -o kernel.cuda.o\n"
+        "FAILED: kernel.cuda.o\n"
+        "kernel.cu:5:10: fatal error: cuda/foo.cuh: "
+        "No such file or directory\n"
+        "compilation terminated.\n"
+        "ninja: build stopped: subcommand failed.\n"
+    )
+
+    summary = cpp_ext.summarize_ninja_build_failure(output)
+
+    # A CUDA device header (.cuh) must be recognized so it gets an include-path
+    # hint, not be dropped for lacking a .h/.hpp suffix. The "cuda/" path segment
+    # marks it CUDA-related, so it should get the CUDA-wheel hint.
+    assert "fatal error: cuda/foo.cuh" in summary
+    assert "site-packages/nvidia" in summary
+    assert "FLASHINFER_EXTRA_CUDAFLAGS" in summary
+
+
+def test_summarize_ninja_oom_exit_137():
+    output = (
+        "[7/32] nvcc ... -c fp4_gemm_cutlass___nv_bfloat16_128_32_256.cu ...\n"
+        "FAILED: [code=137] fp4_gemm_cutlass___nv_bfloat16_128_32_256.cuda.o\n"
+        "ninja: build stopped: subcommand failed.\n"
+    )
+
+    summary = cpp_ext.summarize_ninja_build_failure(output)
+
+    assert "exit 137" in summary
+    assert "MAX_JOBS" in summary
+    # No compiler error line, so it should fall back to ninja's FAILED marker.
+    assert "First error: FAILED: [code=137]" in summary
+
+
+def test_summarize_ninja_cannot_find_lcuda():
+    output = (
+        "[3/3] c++ ... -o fp4_gemm_cutlass_sm120.so\n"
+        "FAILED: fp4_gemm_cutlass_sm120.so\n"
+        "/usr/bin/ld: cannot find -lcuda: No such file or directory\n"
+        "collect2: error: ld returned 1 exit status\n"
+        "ninja: build stopped: subcommand failed.\n"
+    )
+
+    summary = cpp_ext.summarize_ninja_build_failure(output)
+
+    assert "cannot find -lcuda" in summary
+    assert "FLASHINFER_EXTRA_LDFLAGS" in summary
+    assert "First error: /usr/bin/ld: cannot find -lcuda" in summary
+
+
+def test_summarize_ninja_generic_error_without_hint():
+    output = (
+        "[1/2] nvcc ... -c foo.cu -o foo.cuda.o\n"
+        "FAILED: foo.cuda.o\n"
+        "foo.cu:10:5: error: expected ';' before '}' token\n"
+        "ninja: build stopped: subcommand failed.\n"
+    )
+
+    summary = cpp_ext.summarize_ninja_build_failure(output)
+
+    assert "First error: foo.cu:10:5: error: expected ';'" in summary
+    assert "Hint(s):" not in summary
+
+
+def test_summarize_ninja_nvcc_fatal_unsupported_arch():
+    # nvcc driver diagnostics use "nvcc fatal   :" (no "error", padded spacing)
+    # and must still be picked up as the first error line.
+    output = (
+        "[1/1] nvcc ... -c kernel.cu -o kernel.cuda.o\n"
+        "FAILED: kernel.cuda.o\n"
+        "nvcc fatal   : Unsupported gpu architecture 'compute_120'\n"
+        "ninja: build stopped: subcommand failed.\n"
+    )
+
+    summary = cpp_ext.summarize_ninja_build_failure(output)
+
+    assert "First error: nvcc fatal" in summary
+    assert "Unsupported gpu architecture" in summary
+
+
+def test_summarize_ninja_returns_empty_when_nothing_notable():
+    assert cpp_ext.summarize_ninja_build_failure("") == ""
+    assert cpp_ext.summarize_ninja_build_failure("[1/2] nvcc ...\n[2/2] done\n") == ""
+
+
+def test_run_ninja_failure_message_includes_summary(monkeypatch, tmp_path):
+    output = (
+        "FAILED: mod.cuda.o\n"
+        "foo.cu:1:2: fatal error: curand_kernel.h: No such file or directory\n"
+    )
+
+    def fake_popen(command, **kwargs):
+        return _FakePopen(command, output=output, returncode=1)
+
+    monkeypatch.setattr(cpp_ext.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=False)
+
+    message = str(exc_info.value)
+    # Full output is preserved, and the distilled summary is appended at the end.
+    assert output in message
+    assert "flashinfer JIT build error summary" in message
+    assert "FLASHINFER_EXTRA_CUDAFLAGS" in message
+
+
+def test_run_ninja_verbose_failure_streams_and_summarizes(
+    monkeypatch, tmp_path, capsys
+):
+    output = (
+        "[1/1] nvcc ... -c mod.cu -o mod.cuda.o\n"
+        "FAILED: mod.cuda.o\n"
+        "foo.cu:1:2: fatal error: curand_kernel.h: No such file or directory\n"
+    )
+
+    def fake_popen(command, **kwargs):
+        return _FakePopen(command, output=output, returncode=1)
+
+    monkeypatch.setattr(cpp_ext.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        cpp_ext.run_ninja(tmp_path, tmp_path / "build.ninja", verbose=True)
+
+    # Even in verbose mode (output streamed live), the text is captured so the
+    # failure message still carries the full output and the distilled summary.
+    message = str(exc_info.value)
+    assert "fatal error: curand_kernel.h" in message
+    assert "flashinfer JIT build error summary" in message
+    # And it was teed to stdout as it arrived.
+    streamed = capsys.readouterr().out
+    assert "FAILED: mod.cuda.o" in streamed
 
 
 def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):

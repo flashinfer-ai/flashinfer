@@ -350,6 +350,112 @@ def _get_num_workers() -> Optional[int]:
     return None
 
 
+def summarize_ninja_build_failure(output: str) -> str:
+    """Extract a concise, actionable summary from verbose ninja build output.
+
+    ``ninja -v`` emits hundreds of lines, and the real cause (a compiler ``fatal
+    error:``, a linker ``ld:`` line, or an OOM-killed job) is buried in the
+    middle. This scans the captured output for the first real error line and
+    appends hints for a few well-known failure causes. It is a message-only
+    helper and never changes build behavior.
+
+    Returns a short multi-line string, or ``""`` when nothing notable is found.
+    """
+    if not output:
+        return ""
+
+    lines = output.splitlines()
+
+    first_error: Optional[str] = None
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # gcc/nvcc host: "path:line: fatal error: ..." or "path:line: error: ...".
+        # nvcc driver diagnostics have no "error" and use padded spacing before
+        # the colon, e.g. "nvcc fatal   : Unsupported gpu architecture ...";
+        # the \bfatal(?:\s+error)?\s*: branch covers those as well as bare
+        # "fatal:". linker: "ld: ...", "/usr/bin/ld: ...", "ld.lld: ...".
+        if (
+            "fatal error:" in stripped
+            or re.search(r"\bfatal(?:\s+error)?\s*:", stripped)
+            or re.search(r":\s*error:", stripped)
+            or re.search(r"(?:^|[\s/])ld(?:\.\w+)?:\s", line)
+        ):
+            first_error = stripped
+            break
+    if first_error is None:
+        # No compiler/linker error line (e.g. an OOM-killed job): fall back to
+        # ninja's own "FAILED:" marker so the summary still points somewhere.
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("FAILED:"):
+                first_error = stripped
+                break
+
+    hints: List[str] = []
+    # Exit 137 == 128 + SIGKILL(9); ninja prints "FAILED: [code=137]" when a
+    # compile job is OOM-killed under memory pressure.
+    if "code=137" in output:
+        hints.append(
+            "A compile job was killed (exit 137), typically the OOM killer under "
+            "memory pressure. Lower parallelism with MAX_JOBS=<n> and/or "
+            "FLASHINFER_NVCC_THREADS=<n> (total memory ~= MAX_JOBS x "
+            "FLASHINFER_NVCC_THREADS x per-thread usage)."
+        )
+    # A header was not found. Tailor the hint: recognizably CUDA-related headers
+    # get the pip-wheel CUDA layout guidance (the usual culprit); anything else
+    # gets generic include-path guidance so we don't point users at
+    # site-packages/nvidia for an unrelated header.
+    header_match = re.search(
+        r"([\w./+-]+\.(?:h|hpp|cuh)):\s*No such file or directory", output
+    )
+    if header_match:
+        header = header_match.group(1)
+        # Markers are matched against path segments / filename tokens (bounded by
+        # start/end or a /_.- separator) so a directory like "myproject/" or a
+        # name like "execute.h" cannot accidentally trip "cute"/"cub".
+        cuda_header_marker = re.compile(
+            r"(?:^|[/_.-])"
+            r"(?:cuda\w*|cutlass|cccl|cub|cute|thrust|cublas\w*|cudnn|curand\w*"
+            r"|cusparse|cusolver|cufft|nvrtc|nvtx|cooperative_groups"
+            r"|driver_types|vector_types|device_launch_parameters)"
+            r"(?:$|[/_.-])"
+        )
+        is_cuda_header = cuda_header_marker.search(header.lower()) is not None
+        if is_cuda_header:
+            hints.append(
+                f"A CUDA header ({header}) was not found. With pip-wheel CUDA "
+                "installs the CUDA headers live under site-packages/nvidia/*/include; "
+                'add them via FLASHINFER_EXTRA_CUDAFLAGS="-I<path>" (and '
+                "FLASHINFER_EXTRA_CFLAGS for host compilation)."
+            )
+        else:
+            hints.append(
+                f"A header ({header}) was not found. Add the directory that "
+                'contains it via FLASHINFER_EXTRA_CUDAFLAGS="-I<path>" (and '
+                "FLASHINFER_EXTRA_CFLAGS for host compilation)."
+            )
+    # Linker cannot find the CUDA driver stub library.
+    if re.search(r"cannot find -lcuda\b", output):
+        hints.append(
+            "The linker could not find libcuda (-lcuda). Point it at the driver "
+            'stub directory via FLASHINFER_EXTRA_LDFLAGS="-L<dir>" (e.g. '
+            "$CUDA_HOME/lib64/stubs, or the system driver library directory)."
+        )
+
+    if first_error is None and not hints:
+        return ""
+
+    parts: List[str] = []
+    if first_error is not None:
+        parts.append("First error: " + first_error)
+    if hints:
+        parts.append("Hint(s):")
+        parts.extend("  - " + hint for hint in hints)
+    return "\n".join(parts)
+
+
 def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     command = [
@@ -366,17 +472,34 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
 
     sys.stdout.flush()
     sys.stderr.flush()
-    try:
-        subprocess.run(
-            command,
-            stdout=None if verbose else subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=str(workdir.resolve()),
-            check=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as e:
+    # Always capture ninja output, even when verbose. subprocess.run with
+    # stdout=None (the old verbose path) streams to the terminal but leaves
+    # CalledProcessError.output empty, so the failure message and the distilled
+    # summary were dropped on verbose builds. Tee each line to stdout as it
+    # arrives to preserve live progress while still accumulating the full text.
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=str(workdir.resolve()),
+        text=True,
+    )
+    captured: List[str] = []
+    assert process.stdout is not None
+    for line in process.stdout:
+        captured.append(line)
+        if verbose:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+    returncode = process.wait()
+    if returncode != 0:
+        output = "".join(captured)
         msg = "Ninja build failed."
-        if e.output:
-            msg += " Ninja output:\n" + e.output
-        raise RuntimeError(msg) from e
+        if output:
+            msg += " Ninja output:\n" + output
+            summary = summarize_ninja_build_failure(output)
+            if summary:
+                # Repeat the distilled cause at the very end so it is the last
+                # thing printed after the full (often long) ninja output.
+                msg += "\n\n===== flashinfer JIT build error summary =====\n" + summary
+        raise RuntimeError(msg)
