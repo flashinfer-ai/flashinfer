@@ -129,8 +129,12 @@ fi
 echo "Cleaning previous builds..."
 rm -rf -- dist build ./*.egg-info
 
-# Build the wheel using the build module for better isolation
-echo "Building wheel..."
+# Build the wheel using the build module for better isolation.
+# PIP_CONSTRAINT pins apache-tvm-ffi inside the isolated build env: it is a
+# header-only ABI dependency, so whatever is resolved here becomes the ABI of every
+# .so in this wheel. The package metadata deliberately keeps a range instead.
+export PIP_CONSTRAINT="${SCRIPT_DIR}/build_constraints.txt"
+echo "Building wheel (PIP_CONSTRAINT=${PIP_CONSTRAINT})..."
 python -m build --wheel
 
 echo ""
@@ -138,6 +142,15 @@ echo "✓ Build completed successfully"
 echo ""
 echo "Built wheels:"
 ls -lh dist/
+
+# The kernels above take their ABI from the apache-tvm-ffi resolved during the build,
+# and nothing in the wheel records that. Check the artifact actually loads on the floor
+# of the range it advertises. Set FLASHINFER_SKIP_ABI_VERIFY=1 for offline builds.
+if [ "${FLASHINFER_SKIP_ABI_VERIFY:-0}" != "1" ]; then
+  echo "::group::Verify tvm-ffi ABI against the declared range"
+  python "${SCRIPT_DIR}/verify_jit_cache_abi.py" dist/*.whl
+  echo "::endgroup::"
+fi
 
 # Verify version and git version
 echo ""

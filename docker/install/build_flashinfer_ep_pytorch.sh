@@ -90,7 +90,7 @@ cd "${FI_SRC}"
 # without this upgrade.
 PIP_CONSTRAINT="" pip install --no-cache-dir -U \
     "setuptools>=77" "packaging>=24" \
-    "apache-tvm-ffi>=0.1.6,!=0.1.8,!=0.1.8.post0,<0.2"
+    "apache-tvm-ffi>=0.1.10,<0.2"
 PIP_CONSTRAINT="" BUILD_NIXL_EP=0 \
     pip install --no-cache-dir --no-build-isolation -e .
 

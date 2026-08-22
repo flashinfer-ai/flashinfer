@@ -1,0 +1,12 @@
+# pip constraints for release builds of flashinfer-jit-cache.
+#
+# apache-tvm-ffi is a header-only ABI dependency, so the version resolved while
+# building freezes the ABI of every .so in the wheel. The package metadata keeps a
+# range (consumers must not be forced onto one release); this file pins the single
+# version our published wheels are built against, so the same source tree cannot
+# produce different ABIs on different days. Consumed via PIP_CONSTRAINT in
+# scripts/build_flashinfer_jit_cache_whl.sh.
+#
+# Must stay inside the range declared in requirements.txt — enforced by
+# tests/utils/test_dependency_constraints.py.
+apache-tvm-ffi==0.1.13.post2
