@@ -36,7 +36,7 @@ def gen_moe_utils_module() -> JitSpec:
       output slice before GEMM2 finalize. Mirrors TRT-LLM's
       ``moe_output_memset_inplace`` Path A.
     - moeActivation: Apply activation functions with optional FP4 quantization
-    - moeSort: Sort tokens by expert assignment (DeepSeekV3 routing)
+    - moeSort: Sort tokens by precomputed expert assignment
     """
     # Lazy imports to avoid circular dependency:
     # artifacts.py imports from jit.cubin_loader, which triggers jit/__init__.py,
@@ -97,15 +97,13 @@ def gen_moe_utils_module() -> JitSpec:
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/memoryUtils.cu",
             # Routing kernels for moe_sort
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_deepseek.cu",
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_post_topk_block.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_block.cu",
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_post_topk_cluster.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster.cu",
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_post_topk_cluster_large.cu",
             jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_cluster_large.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_entry.cu",
+            / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom_post_topk_entry.cu",
             jit_env.FLASHINFER_CSRC_DIR
             / "fused_moe/trtllm_backend/trtllm_fused_moe_routing_common.cu",
         ],
