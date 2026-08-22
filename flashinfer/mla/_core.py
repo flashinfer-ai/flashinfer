@@ -3813,6 +3813,13 @@ def trtllm_batch_decode_with_kv_cache_mla(
         )
         sparse_mla_top_k_lens = sparse_mla_top_k_lens.contiguous()
 
+    if kv_cache.dtype == torch.uint8 and sparse_mla_top_k <= 0:
+        raise NotImplementedError(
+            "Dense MLA decode does not support packed uint8 KV caches yet: no "
+            "backend has an NVFP4 MLA decode kernel. The NVFP4 MLA cache write "
+            "path is available via nvfp4_quantize_append_paged_mla_kv_cache."
+        )
+
     backend = _validate_mla_dcp_args(
         query=query,
         backend=backend,

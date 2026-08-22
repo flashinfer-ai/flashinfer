@@ -482,3 +482,110 @@ void append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
   TVM_FFI_ICHECK(success) << "AppendPagedKVMlaCache failed to dispatch with dtype "
                           << ckv_cache.dtype();
 }
+
+void nvfp4_quantize_append_paged_mla_kv_cache(TensorView append_ckv, TensorView append_kpe,
+                                              TensorView batch_indices, TensorView positions,
+                                              TensorView ckv_cache, TensorView ckv_sf_cache,
+                                              TensorView kpe_cache, TensorView kv_indices,
+                                              TensorView kv_indptr, TensorView kv_last_page_len,
+                                              double ckv_scale, double kpe_scale) {
+  CHECK_LAST_DIM_CONTIGUOUS(append_ckv);
+  CHECK_LAST_DIM_CONTIGUOUS(append_kpe);
+  CHECK_INPUT(batch_indices);
+  CHECK_INPUT(positions);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(ckv_cache);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(ckv_sf_cache);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(kpe_cache);
+  CHECK_INPUT(kv_indices);
+  CHECK_INPUT(kv_indptr);
+  CHECK_INPUT(kv_last_page_len);
+  CHECK_DIM(2, append_ckv);
+  CHECK_DIM(2, append_kpe);
+  CHECK_DIM(1, batch_indices);
+  CHECK_DIM(1, positions);
+  CHECK_DIM(3, ckv_cache);
+  CHECK_DIM(3, ckv_sf_cache);
+  CHECK_DIM(3, kpe_cache);
+  CHECK_DIM(1, kv_indices);
+  CHECK_DIM(1, kv_indptr);
+  CHECK_DIM(1, kv_last_page_len);
+  CHECK_DEVICE(append_kpe, append_ckv);
+  CHECK_DEVICE(batch_indices, append_ckv);
+  CHECK_DEVICE(positions, append_ckv);
+  CHECK_DEVICE(ckv_cache, append_ckv);
+  CHECK_DEVICE(ckv_sf_cache, append_ckv);
+  CHECK_DEVICE(kpe_cache, append_ckv);
+  CHECK_DEVICE(kv_indices, append_ckv);
+  CHECK_DEVICE(kv_indptr, append_ckv);
+  CHECK_DEVICE(kv_last_page_len, append_ckv);
+
+  TVM_FFI_ICHECK(append_ckv.dtype() == dl_float16 || append_ckv.dtype() == dl_bfloat16)
+      << "append_ckv must be float16 or bfloat16";
+  TVM_FFI_ICHECK(append_kpe.dtype() == append_ckv.dtype())
+      << "append_ckv and append_kpe must have the same dtype";
+  TVM_FFI_ICHECK(ckv_cache.dtype() == dl_uint8) << "ckv_cache must be a uint8 packed NVFP4 tensor";
+  TVM_FFI_ICHECK(ckv_sf_cache.dtype() == dl_float8_e4m3fn)
+      << "ckv_sf_cache must be a float8_e4m3fn tensor";
+  TVM_FFI_ICHECK(kpe_cache.dtype() == dl_float8_e4m3fn)
+      << "kpe_cache must be a float8_e4m3fn tensor";
+  TVM_FFI_ICHECK(batch_indices.dtype() == dl_int32) << "batch_indices must be int32";
+  TVM_FFI_ICHECK(positions.dtype() == dl_int32) << "positions must be int32";
+  TVM_FFI_ICHECK(kv_indices.dtype() == dl_int32) << "kv_indices must be int32";
+  TVM_FFI_ICHECK(kv_indptr.dtype() == dl_int32) << "kv_indptr must be int32";
+  TVM_FFI_ICHECK(kv_last_page_len.dtype() == dl_int32) << "kv_last_page_len must be int32";
+  TVM_FFI_ICHECK(std::isfinite(ckv_scale) && std::isfinite(kpe_scale) && ckv_scale > 0.0 &&
+                 kpe_scale > 0.0)
+      << "ckv_scale and kpe_scale must be positive finite global decode scales";
+
+  const unsigned int nnz = append_ckv.size(0);
+  const unsigned int batch_size = kv_last_page_len.size(0);
+  TVM_FFI_ICHECK_EQ(kv_indptr.size(0), batch_size + 1);
+  TVM_FFI_ICHECK_EQ(batch_indices.size(0), nnz);
+  TVM_FFI_ICHECK_EQ(positions.size(0), nnz);
+  TVM_FFI_ICHECK_EQ(append_kpe.size(0), nnz);
+
+  const unsigned int page_size = ckv_cache.size(1);
+  const unsigned int ckv_dim = append_ckv.size(1);
+  const unsigned int kpe_dim = append_kpe.size(1);
+  TVM_FFI_ICHECK_EQ(ckv_dim, 512);
+  TVM_FFI_ICHECK_EQ(kpe_dim, 64);
+  TVM_FFI_ICHECK_EQ(ckv_cache.size(2) * 2, ckv_dim);
+  TVM_FFI_ICHECK_EQ(ckv_sf_cache.size(2) * 16, ckv_dim);
+  TVM_FFI_ICHECK_EQ(kpe_cache.size(2), kpe_dim);
+  TVM_FFI_ICHECK_EQ(ckv_sf_cache.size(0), ckv_cache.size(0));
+  TVM_FFI_ICHECK_EQ(kpe_cache.size(0), ckv_cache.size(0));
+  TVM_FFI_ICHECK_EQ(ckv_sf_cache.size(1), page_size);
+  TVM_FFI_ICHECK_EQ(kpe_cache.size(1), page_size);
+
+  auto ckv_strides = ckv_cache.strides();
+  auto kpe_strides = kpe_cache.strides();
+  auto ckv_sf_strides = ckv_sf_cache.strides();
+  const size_t ckv_sf_stride_page = ckv_sf_strides[0];
+  const size_t ckv_sf_stride_n = ckv_sf_strides[1];
+  const size_t append_ckv_stride_n = append_ckv.strides()[0];
+  const size_t append_kpe_stride_n = append_kpe.strides()[0];
+
+  ffi::CUDADeviceGuard device_guard(append_ckv.device().device_id);
+  const cudaStream_t stream = get_stream(append_ckv.device());
+  bool success = DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(append_ckv.dtype(), c_type, [&] {
+    paged_kv_mla_t<uint8_t, int32_t> paged_mla_kv(
+        page_size, ckv_cache.size(2), kpe_dim, batch_size,
+        static_cast<uint8_t*>(ckv_cache.data_ptr()), ckv_strides.data(),
+        static_cast<uint8_t*>(kpe_cache.data_ptr()), kpe_strides.data(),
+        static_cast<int32_t*>(kv_indices.data_ptr()), static_cast<int32_t*>(kv_indptr.data_ptr()),
+        static_cast<int32_t*>(kv_last_page_len.data_ptr()));
+    cudaError_t status = NVFP4QuantizeAppendPagedKVMlaCache(
+        paged_mla_kv, static_cast<c_type*>(append_ckv.data_ptr()),
+        static_cast<c_type*>(append_kpe.data_ptr()),
+        static_cast<int32_t*>(batch_indices.data_ptr()),
+        static_cast<int32_t*>(positions.data_ptr()), nnz, append_ckv_stride_n, append_kpe_stride_n,
+        static_cast<uint8_t*>(ckv_sf_cache.data_ptr()), ckv_sf_stride_page, ckv_sf_stride_n,
+        static_cast<float>(ckv_scale), static_cast<float>(kpe_scale), stream);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "NVFP4QuantizeAppendPagedKVMlaCache failed with error: " << cudaGetErrorString(status);
+    return true;
+  });
+
+  TVM_FFI_ICHECK(success) << "NVFP4QuantizeAppendPagedKVMlaCache failed to dispatch with dtype "
+                          << append_ckv.dtype();
+}
