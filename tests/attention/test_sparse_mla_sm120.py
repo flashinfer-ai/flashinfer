@@ -621,13 +621,17 @@ def test_sparse_mla_sm120_decode_dsv4_dual_large_extra_topk() -> None:
     torch.testing.assert_close(output.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_decode_dsv4_autotune_covers_extra_topk_buckets() -> None:
+def test_sparse_mla_sm120_decode_dsv4_autotune_covers_extra_topk_buckets(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
     """One tuning pass covers every power-of-2 extra_topk bucket at or below
     the tuned width; wider widths stay on the heuristic until re-tuned."""
     from flashinfer import autotune
     from flashinfer.autotuner import AutoTuner
     from flashinfer.mla._sparse_mla_sm120 import _decode_dsv4_hot_cache
 
+    # Keep a previously saved default disk cache from resolving tactics here.
+    monkeypatch.setenv("FLASHINFER_AUTOTUNE_DIR", str(tmp_path))
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_tokens, num_heads, topk = 4, 16, 128
@@ -636,6 +640,7 @@ def test_sparse_mla_sm120_decode_dsv4_autotune_covers_extra_topk_buckets() -> No
     s_kv = num_blocks * pbs
 
     def make_cache() -> tuple[torch.Tensor, torch.Tensor]:
+        """Random packed DSv4 cache and its dequantized reference."""
         bf16 = (
             torch.randn(num_blocks, pbs, 1, d_qk, device=device, dtype=torch.bfloat16)
             / 10.0
@@ -658,6 +663,7 @@ def test_sparse_mla_sm120_decode_dsv4_autotune_covers_extra_topk_buckets() -> No
     sm_scale = d_qk**-0.5
 
     def run(extra_topk: int) -> None:
+        """Decode with a secondary cache of this width and check the output."""
         extra_idx = torch.randint(
             0, s_kv, (num_tokens, extra_topk), device=device, dtype=torch.int32
         )
@@ -693,7 +699,7 @@ def test_sparse_mla_sm120_decode_dsv4_autotune_covers_extra_topk_buckets() -> No
         torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
 
     def tuned_tactic(extra_topk: int) -> int | None:
-        # The hot cache only records tactics resolved from tuned entries.
+        """Tactic the hot cache recorded for this width, if one was tuned."""
         return next(
             (t for k, t in _decode_dsv4_hot_cache.items() if k[3] == extra_topk), None
         )

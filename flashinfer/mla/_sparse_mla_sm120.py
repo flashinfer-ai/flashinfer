@@ -1027,8 +1027,8 @@ def _decode_dsv4_tuning_config(has_extra: bool) -> TuningConfig:
             ),
         )
 
-        # num_splits (dim 2) of the scratch follows the bucketed extra_topk.
         def _num_splits(shapes):
+            """Scratch split count (dim 2) for the profile's bucketed widths."""
             return _decode_dsv4_num_splits(shapes[1][-1], shapes[8][-1])
 
         constraint_specs += (
