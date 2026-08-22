@@ -2,6 +2,12 @@
 
 *Design Document  ·  v0.1  ·  March 2026*
 
+> [!IMPORTANT]
+> This file preserves the original design discussion. Sections 2–8 are
+> aspirational and their snippets are not runnable API examples. The
+> [MVP As-Built Reference](#mvp-as-built-reference) is the authoritative
+> description of the current pack-based `MoELayer` API.
+
 ## 1. Motivation
 
 FlashInfer currently exposes MoE functionality through a family of flat, positional-argument functions:
@@ -32,55 +38,34 @@ Problems this creates:
 
 ### Example Overview
 
-```
-# --- Define config once ---
+```python
 config = MoEConfig(
     routing=RoutingConfig(
-        num_experts=256,
+        num_experts=32,
         top_k=8,
         method=RoutingMethodType.DeepSeekV3,
     ),
-    quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
-    experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    backends=[TrtllmFp4Config(extra_backend_params...), CutlassConfig(extra_backend_params...)],
+    quant=QuantConfig(variant=QuantVariant.NVFP4),
+    experts=ExpertConfig(intermediate_size=512, local_num_experts=32),
+    activation=SwiGLU(),
+    backend=BackendOptions((CuteDslConfig(), TrtllmFp4Config())),
+    execution=ExecutionConfig(tune_max_num_tokens=8192),
 )
-# --- Find possible backends ---
-backends = MoELayer.find_backends(**config)
-# this contains {"trtllm_fp4":TrtllmFp4Config(), "cutlass_fp4":CutlassConfig()}
-# or {"trtllm_fp4":"unsupported reason...", "cutlass_fp4":CutlassConfig()}
-# more modification to the backends' parameters could be done here
-backends=["trtllm_fp4":TrtllmFp4Config(extra_backend_params...),"cutlass_fp4":CutlassConfig(extra_backend_params...)]
-# --- Prepare Inputs Data ---
+
+# Prepare one native weight view for each candidate backend at model load.
 weight_pack = MoEWeightPack()
-# the data is possibly obtained through helper functions then added here
-weight_pack.prepare_for("trtllm_fp4", trtllm_weights) weight_pack.prepare_for("cutlass_fp4", cutlass_weights)
-act_pack = MoEActivationPack(
-    hidden_states_q=cute_dsl_data["x"],
-    hidden_states_scale=x_sf,
-    selected_experts=cute_dsl_data["token_selected_experts"],
-    final_scales=cute_dsl_data["token_final_scales"],
+weight_pack.prepare_for(
+    "cute_dsl_nvfp4",
+    CuteDslConfig.prepare_weights(w1_bf16, w2_bf16, ...),
 )
-tensors = (act_pack, weight_pack)
-# --- Eager (heuristic backend) ---
-output = moe_layer(tensors, **config, backends=backends)  # optional backends selection
-# --- Autotuned eager ---
+weight_pack.prepare_for(
+    "trtllm_fp4_routed",
+    TrtllmFp4Config.prepare_weights(w1_bf16, w2_bf16, ...),
+)
+
+layer = MoELayer(config)
 with autotune(True):
-    for tensors in calibration_data:
-        output = moe_layer(tensors, **config)
-# --- Production layer (amortized, cached) ---
-layer = MoELayer(**config)
-layer = layer.get_tuned_layer(tensors)  # ensures selection has been done
-output = layer(tensors)
-# --- Benchmark ---
-layer.benchmark(Gemm1Tensors)   # isolate gemm1
-layer.benchmark_all()           # full breakdown
-# --- Variant via immutable replace ---
-fp8_config = dataclasses.replace(config, quant=QuantConfig(QuantDtype.FP8))
-fp8_layer  = MoELayer(**fp8_config)
-# --- Repro from issue log ---
-repro = MoERepro.from_file("user_issue.log")
-repro.run()
-repro.benchmark_all()
+    output = layer(activation_pack, weight_pack)
 ```
 
 ## 3. Config Hierarchy
@@ -92,7 +77,7 @@ All configs are frozen dataclasses registered with TVM's object system. The hier
 | RoutingConfig | num_experts, top_k, routing method, grouping params, scaling factor |
 | QuantConfig | dtype (fp4/fp8/bf16), granularity (per-tensor/per-token/block) |
 | ExpertConfig | intermediate_size, local sharding params |
-| ActivationConfig | activation type (swiglu/geglu/relu2/identity) |
+| ActivationConfig | common base for typed activation values and their scalar parameters |
 | BackendOptions | ordered candidate set via \| operator |
 | ExecutionConfig | enable_pdl, tune_max_num_tokens |
 | MoEFinalizeConfig | do_finalize, use_fused_finalize |
@@ -116,44 +101,42 @@ class RoutingConfig:
 
 Individual backend configs provided in an ordered list. The autotuner or heuristic selects among valid candidates at runtime.
 
-```
-# Single backend
-backends = [TrtllmFp4Config()]
-# Multiple candidates — autotuner or heuristic picks best
-backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]
-# | is associative, returns BackendOptions
-# CutlassConfig is always the universal fallback
-```
+```python
+# NVFP4 candidates share one logical quantization contract.
+nvfp4_backends = BackendOptions((CuteDslConfig(), TrtllmFp4Config()))
 
-Each backend config declares its own preconditions:
-
-```
-class TrtllmFp4Config:
-    @classmethod
-    def supported(cls, arch: int) -> bool:
-        return arch >= 90  # Hopper+
-class CutlassConfig:
-    @classmethod
-    def supported(cls, arch: int) -> bool:
-        return True  # universal fallback
+# CUTLASS configurations are quantization-specific, not universal fallbacks.
+bf16_backend = BackendOptions((CutlassBf16Config(),))
+w4a16_backend = BackendOptions((CutlassW4A16Config(),))
 ```
 
-### 3.3 MoEConfig — \*\*unpack protocol
+Each backend config declares architecture support; its runner additionally
+checks quantization, routing, activation, finalization, and EP constraints
+before build or launch.
 
-MoEConfig implements keys() and __getitem__ so it can be unpacked directly with \*\*. This allows the same config object to be passed to both the eager function and MoELayer.
+### 3.3 MoEConfig composition
 
-```
+`MoEConfig` is passed directly to `MoELayer` and can be varied immutably with
+`dataclasses.replace`.
+
+```python
 config = MoEConfig(
     routing=RoutingConfig(num_experts=256, top_k=8, method=RoutingMethodType.DeepSeekV3),
-    quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
+    quant=QuantConfig(variant=QuantVariant.NVFP4),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    backends=[TrtllmFp4Config(), CutlassConfig()],
+    activation=SwiGLU(),
+    backend=BackendOptions((CuteDslConfig(), TrtllmFp4Config())),
 )
-# Unpack into any call accepting these kwargs
-output = moe_layer(tensors, **config)
-layer  = MoELayer(**config)
-# Immutable variant
-fp8_config = dataclasses.replace(config, quant=QuantConfig(QuantDtype.FP8))
+layer = MoELayer(config)
+
+# Backends are quantization-specific, so a variant change must carry a matching
+# backend: CuteDslConfig and TrtllmFp4Config do not support MxFp8, and reusing
+# them here would leave MoELayer with no usable runner.
+fp8_config = dataclasses.replace(
+    config,
+    quant=QuantConfig(variant=QuantVariant.MxFp8),
+    backend=BackendOptions((TrtllmFp8BlockConfig(),)),
+)
 ```
 
 ## 4. Public API
@@ -644,7 +627,7 @@ The aspirational API in §2–§4 (eager `moe_layer(...)`, `MoETensors`, `find_b
 import torch
 from flashinfer.fused_moe import (
     MoEConfig, RoutingConfig, QuantConfig, QuantVariant, ExpertConfig,
-    ActivationConfig, ExecutionConfig, MoELayer,
+    SwiGLU, ExecutionConfig, MoELayer,
     MoEActivationPack, MoEWeightPack, CuteDslConfig, TrtllmFp4Config,
 )
 from flashinfer.fused_moe.api import BackendOptions
@@ -655,7 +638,7 @@ config = MoEConfig(
     routing=RoutingConfig(num_experts=32, top_k=2),
     quant=QuantConfig(variant=QuantVariant.NVFP4),       # MVP: NVFP4 only
     experts=ExpertConfig(intermediate_size=512, local_num_experts=32),
-    activation=ActivationConfig(),                       # MVP: Swiglu only
+    activation=SwiGLU(alpha=1.0, beta=0.0),              # typed + hashable
     backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
     execution=ExecutionConfig(tune_max_num_tokens=8192),
 )
@@ -692,8 +675,53 @@ Key mechanisms (and where they live):
 - **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` (backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7).
 - **Two-stage cross-backend autotune** (`MoELayer._select_winner`, runners' delegation): for each candidate, the `AutoTuner.choose_one` picks the best *within-backend tactic* (each backend tuned in its own native input schema), then `bench_gpu_time` compares the candidates at their winning tactics and the fastest backend is dispatched. A single `choose_one` over both runners is not possible because their input schemas differ — hence the explicit two stages.
 - **Winner caching is per token-bucket** (`map_to_hybrid_bucket`): reusing one `MoELayer` across token counts re-selects per bucket; `winner_backend` reports the most-recent choice and `reset_winner()` clears the cache.
-- **Fail-fast scope** (`MoELayer._validate_mvp_scope`): non-NVFP4 quant or non-Swiglu activation raises `NotImplementedError` at construction.
+- **Fail-fast scope:** each runner declares quantization and typed-activation
+  capabilities; unsupported pairs are filtered before build and direct-runner
+  calls raise a specific `NotImplementedError`.
 - **Runners delegate** to canonical inner runners (`CuteDslFusedMoENvfp4Runner` / `core.MoERunner`); the unified adapters only translate Packs ⇄ the inner runner's native tensor list.
+
+### Typed activation values and backend parity
+
+The unreleased enum-wrapper/singleton spelling was replaced by frozen values:
+`SwiGLU(alpha, beta, limit)`, `SiTU(gate_scale, linear_scale, clamp_limit)`,
+`GeGLU()`, `ReLU2()`, `GeGLUTanh()`, `SwiGLUStep(limit)`, and `Identity()`.
+Every value exposes `.type` and `.is_gated`; scalar fields participate in
+equality, hashing, repr serialization, and tactic-cache identity. Per-expert
+`gemm1_alpha` / `gemm1_beta` / `gemm1_clamp_limit` tensors remain in
+`MoEWeightPack` backend views and override the scalar-expanded preparation view.
+
+`SiTU.linear_scale` is the linear-branch soft-clamp scale, applied as
+`linear_scale * tanh(linear / linear_scale)`. It accepts `None` for the
+unclamped linear branch, which only the CuTe-DSL scalar ABI can express: the
+TRT-LLM path carries the value in a per-expert `gemm1_beta` float tensor that
+has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
+silently dropping the parameter. The default stays `1.0`, so cross-backend
+parity is unchanged unless `None` is requested explicitly.
+
+The truthful unified support matrix follows the already executable flat path:
+
+| Runner / quantization | Unified activations |
+| --- | --- |
+| TRTLLM BF16 | SwiGLU (typed scalars), ReLU2 |
+| TRTLLM FP8 per-tensor | SwiGLU (default scalars), ReLU2 |
+| TRTLLM DeepSeek block FP8 | SwiGLU (typed scalars) |
+| TRTLLM MXFP8 block FP8 | SwiGLU (typed scalars), GeGLU, ReLU2 |
+| TRTLLM NVFP4 / MXFP4 | SwiGLU (typed scalars), GeGLU, SiTU, ReLU2 |
+| TRTLLM W4A16 | SwiGLU |
+| TRTLLM MxInt4 | SwiGLU (typed scalars) |
+| CUTLASS BF16 / W4A16 | SwiGLU (typed scalars), SwiGLUStep, GeGLUTanh, ReLU2 |
+| CuTe-DSL NVFP4 / W4A16 | SwiGLU (typed scalars), GeGLUTanh, ReLU2, SiTU (typed scalars) |
+| b12x NVFP4 | SwiGLU (default scalars), GeGLUTanh, ReLU2 |
+| b12x W4A16 | SwiGLU (default scalars), ReLU2 |
+
+CuTe-DSL SiTU uses its existing scalar ABI (`situ_beta` and
+`situ_linear_beta`); its flat kernel does not expose a separate SiTU
+`clamp_limit`, so that non-default field is rejected. b12x W4A16 keeps its
+flat-proven SwiGLU/ReLU2 subset. Identity is modeled for configuration
+completeness but is not advertised by a unified runner because no current
+weight-preparation + launcher combination proves it end-to-end without kernel
+changes. Weight preparation computes GEMM1 rows from `activation.is_gated`
+(`2I` gated, `I` non-gated) and passes that fact into TRTLLM row permutations.
 
 ### Today's MVP Cut
 
