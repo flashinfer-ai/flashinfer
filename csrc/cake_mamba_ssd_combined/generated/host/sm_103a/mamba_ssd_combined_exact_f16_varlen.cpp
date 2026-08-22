@@ -16,8 +16,8 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487);
-TVM_FFI_EMBED_CUBIN(prefix_factorized_segment_preprocess_onewarp_a104f24f9d);
+TVM_FFI_EMBED_CUBIN(factorized_persistent_segment_preprocess_77140386cb);
+TVM_FFI_EMBED_CUBIN(mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae);
 
 namespace cake_host_shim {
 
@@ -160,7 +160,7 @@ inline bool CakeConfigureDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_i
 namespace stage_preprocess {
 
 inline auto& Kernel() {
-  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(prefix_factorized_segment_preprocess_onewarp_a104f24f9d, "kernel_prefix_factorized_segment_preprocess_onewarp");
+  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(factorized_persistent_segment_preprocess_77140386cb, "kernel_factorized_persistent_segment_preprocess");
   return kernel;
 }
 
@@ -273,7 +273,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_dt, TensorView arg_
   prepared.v_dt_min = (float)arg_dt_min;
   prepared.v_dt_max = (float)arg_dt_max;
   prepared.grid = tvm::ffi::dim3((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
-  prepared.block = tvm::ffi::dim3(32u, 1u, 1u);
+  prepared.block = tvm::ffi::dim3(128u, 1u, 1u);
   prepared.kargs[0] = &prepared.p_dt;
   prepared.kargs[1] = &prepared.p_A;
   prepared.kargs[2] = &prepared.p_dt_bias;
@@ -490,7 +490,7 @@ inline CUtensorMap EncodeTma_out_map(const TensorView& t) {
 }
 
 inline auto& Kernel() {
-  static auto kernel = EmbedCubinModule_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1", 149248);
+  static auto kernel = EmbedCubinModule_mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_mamba_ssd_q_tmem_alias_f16_varlen", 231936);
   return kernel;
 }
 
@@ -814,7 +814,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
 
 inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
-      prepared.kernel->Launch(prepared.kargs, prepared.grid, prepared.block, stream, 149248u));
+      prepared.kernel->Launch(prepared.kargs, prepared.grid, prepared.block, stream, 231936u));
 }
 }  // namespace stage_main
 

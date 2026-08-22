@@ -165,9 +165,9 @@ def _bind_prepared_sequence_arguments(
     stage_arg_plans: Sequence[tuple[str, Sequence[Sequence[str]]]],
     stage_values: Mapping[str, Mapping[str, object]],
     stage_grids: Mapping[str, tuple[int, int, int]],
-    cuda_stream: Optional[int],
+    cuda_stream: int,
 ) -> tuple[object, ...]:
-    """Flatten complete stage plans and an exporter-declared stream argument."""
+    """Flatten complete stage plans and their explicit stream argument."""
 
     arguments: list[object] = []
     for stage, arg_plan in stage_arg_plans:
@@ -180,8 +180,7 @@ def _bind_prepared_sequence_arguments(
                 stage_grids[stage],
             )
         )
-    if cuda_stream is not None:
-        arguments.append(cuda_stream)
+    arguments.append(cuda_stream)
     return tuple(arguments)
 
 
@@ -209,7 +208,7 @@ def _run_generated_program(
         or not all(isinstance(stage, str) for stage in stage_order)
         or not isinstance(stages, dict)
         or launch_count != len(stage_order)
-        or stream_abi not in {"explicit", "implicit"}
+        or stream_abi != "explicit"
     ):
         raise RuntimeError(
             f"Cake SSDCombined generated program {name!r} has unresolved launch ABI"
@@ -232,7 +231,7 @@ def _run_generated_program(
         stage_arg_plans,
         stage_values,
         stage_grids,
-        cuda_stream if stream_abi == "explicit" else None,
+        cuda_stream,
     )
     module = _load_generated_program(name, arch, device_index)
     launch = getattr(module, entry, None)
@@ -241,46 +240,6 @@ def _run_generated_program(
             f"Cake SSDCombined generated program {name!r} has no entry {entry!r}"
         )
     launch(*arguments)
-
-
-_PROGRAMS = {
-    "metadata": (
-        "cake_mamba_ssd_metadata_device.cu",
-        "cake_mamba_ssd_metadata_host.cpp",
-        "factorized_packed_varlen_metadata_984da5abcd",
-        True,
-    ),
-    "preprocess": (
-        "cake_mamba_ssd_preprocess_device.cu",
-        "cake_mamba_ssd_preprocess_host.cpp",
-        "factorized_persistent_segment_preprocess_c87a05c3ab",
-        True,
-    ),
-    "bf16_batched": (
-        "cake_mamba_ssd_bf16_batched_device.cu",
-        "cake_mamba_ssd_bf16_batched_host.cpp",
-        "mamba_ssd_q_tmem_alias_bf16_batched_591ed736f5",
-        True,
-    ),
-    "bf16_varlen": (
-        "cake_mamba_ssd_bf16_varlen_device.cu",
-        "cake_mamba_ssd_bf16_varlen_host.cpp",
-        "mamba_ssd_q_tmem_alias_bf16_varlen_b3467d0b30",
-        True,
-    ),
-    "f16_batched": (
-        "cake_mamba_ssd_f16_batched_device.cu",
-        "cake_mamba_ssd_f16_batched_host.cpp",
-        "mamba_ssd_q_tmem_alias_f16_batched_1f3eea15ba",
-        True,
-    ),
-    "f16_varlen": (
-        "cake_mamba_ssd_f16_varlen_device.cu",
-        "cake_mamba_ssd_f16_varlen_host.cpp",
-        "mamba_ssd_q_tmem_alias_f16_varlen_f8de0d30e2",
-        True,
-    ),
-}
 
 
 def _source_dir() -> Path:
@@ -398,69 +357,6 @@ def _nvcc() -> Path:
     if candidate is None:
         raise RuntimeError("nvcc is required to build the Cake SSDCombined backend")
     return Path(candidate).resolve()
-
-
-@functools.cache
-def _load_program(name: str, arch: str, device_index: int):
-    if name not in _PROGRAMS:
-        raise ValueError(f"unknown Cake SSDCombined program: {name}")
-    device_name, host_name, module_ident, use_fast_math = _PROGRAMS[name]
-    source_dir = _source_dir()
-    device_source = source_dir / device_name
-    host_source = source_dir / host_name
-    if not device_source.is_file() or not host_source.is_file():
-        raise RuntimeError(f"Cake SSDCombined source package is incomplete for {name}")
-
-    nvcc = _nvcc()
-    digest = hashlib.sha256()
-    digest.update(device_source.read_bytes())
-    digest.update(host_source.read_bytes())
-    digest.update(arch.encode())
-    digest.update(str(nvcc).encode())
-    digest.update(str(use_fast_math).encode())
-    key = digest.hexdigest()[:16]
-    module_name = f"cake_mamba_ssd_{name}_{arch}_cuda{device_index}_{key}"
-    build_dir = jit_env.FLASHINFER_JIT_DIR / module_name
-    build_dir.mkdir(parents=True, exist_ok=True)
-    cubin_path = build_dir / f"{module_ident}.cubin"
-    lock_path = build_dir / f"{module_ident}.lock"
-    with FileLock(lock_path, thread_local=False):
-        # The cubin and TVM-FFI extension share this directory.  Serialize the
-        # full build/load transaction and double-check after acquiring the
-        # process lock so concurrent serving workers cannot publish partial
-        # artifacts or race cpp.load_inline's ninja files.
-        if not cubin_path.is_file():
-            temporary_cubin = build_dir / f"{module_ident}.{os.getpid()}.tmp.cubin"
-            command = [
-                str(nvcc),
-                "-cubin",
-                f"-arch={arch}",
-                "--std=c++17",
-                "-O3",
-                "-I",
-                str(nvcc.parent.parent / "include"),
-            ]
-            if use_fast_math:
-                command.append("--use_fast_math")
-            command.extend((str(device_source), "-o", str(temporary_cubin)))
-            process = subprocess.run(command, text=True, capture_output=True)
-            if process.returncode != 0:
-                temporary_cubin.unlink(missing_ok=True)
-                raise RuntimeError(
-                    f"Cake SSDCombined nvcc failed for {name} "
-                    f"({arch}):\n{process.stderr}"
-                )
-            os.replace(temporary_cubin, cubin_path)
-
-        return cpp.load_inline(
-            module_name,
-            cpp_sources=host_source.read_text(encoding="utf-8"),
-            embed_cubin={module_ident: cubin_path.read_bytes()},
-            extra_include_paths=[str(nvcc.parent.parent / "include")],
-            extra_cflags=["-O3"],
-            extra_ldflags=["-lcuda"],
-            build_directory=str(build_dir),
-        )
 
 
 @functools.cache
@@ -1053,57 +949,67 @@ class CakeSSDCombined:
         else:
             workspace["dt_bias_float"].copy_(dt_bias)
             dt_bias_float = workspace["dt_bias_float"]
-        if scan_route != _ROUTE_PREFIX_VARLEN:
-            preprocess_profile = _generated_program_profile("preprocess", arch)
-            preprocess_stages = preprocess_profile.get("stages")
-            preprocess_stage = (
-                preprocess_stages.get("preprocess")
-                if isinstance(preprocess_stages, dict)
-                else None
+        state_key = "f16" if self.state_dtype == torch.float16 else "bf16"
+        mode_key = "varlen" if mode_varlen else "batched"
+        family = (
+            "prefix"
+            if scan_route == _ROUTE_PREFIX_VARLEN
+            else "shallow"
+            if scan_route == _ROUTE_SHALLOW_VARLEN
+            else "exact"
+        )
+        program_name = f"{family}_{state_key}_{mode_key}"
+        program_profile = _generated_program_profile(program_name, arch)
+        program_stages = program_profile.get("stages")
+        preprocess_stage = (
+            program_stages.get("preprocess")
+            if isinstance(program_stages, dict)
+            else None
+        )
+        preprocess_block = (
+            preprocess_stage.get("block")
+            if isinstance(preprocess_stage, dict)
+            else None
+        )
+        if (
+            not isinstance(preprocess_block, list)
+            or len(preprocess_block) != 3
+            or not all(isinstance(value, int) for value in preprocess_block)
+            or preprocess_block[0] <= 0
+        ):
+            raise RuntimeError(
+                f"Cake SSDCombined generated program {program_name!r} "
+                "has no preprocess block"
             )
-            preprocess_block = (
-                preprocess_stage.get("block")
-                if isinstance(preprocess_stage, dict)
-                else None
+        preprocess_values, preprocess_grid = _direct_preprocess_inputs(
+            dt=dt_float,
+            A=A,
+            dt_bias=dt_bias_float,
+            segment_starts=workspace["starts"],
+            segment_lengths=workspace["lengths"],
+            chunk_indices=chunk_indices_arg,
+            chunk_offsets=chunk_offsets_arg,
+            delta=workspace["delta"],
+            cumsum=workspace["cumsum"],
+            num_segments=num_segments,
+            nheads=self.nheads,
+            seqlen=seqlen,
+            mode_varlen=mode_varlen,
+            dt_softplus=bool(dt_softplus),
+            dt_limit=(dt_min, dt_max),
+            threads=preprocess_block[0],
+        )
+        sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
+        if scan_route == _ROUTE_PREFIX_VARLEN:
+            preprocess_grid = (
+                max(1, min(preprocess_grid[0], sm_count)),
+                preprocess_grid[1],
+                preprocess_grid[2],
             )
-            if (
-                not isinstance(preprocess_block, list)
-                or len(preprocess_block) != 3
-                or not all(isinstance(value, int) for value in preprocess_block)
-                or preprocess_block[0] <= 0
-            ):
-                raise RuntimeError(
-                    "Cake SSDCombined generated preprocess program has no block"
-                )
-            preprocess_values, preprocess_grid = _direct_preprocess_inputs(
-                dt=dt_float,
-                A=A,
-                dt_bias=dt_bias_float,
-                segment_starts=workspace["starts"],
-                segment_lengths=workspace["lengths"],
-                chunk_indices=chunk_indices_arg,
-                chunk_offsets=chunk_offsets_arg,
-                delta=workspace["delta"],
-                cumsum=workspace["cumsum"],
-                num_segments=num_segments,
-                nheads=self.nheads,
-                seqlen=seqlen,
-                mode_varlen=mode_varlen,
-                dt_softplus=bool(dt_softplus),
-                dt_limit=(dt_min, dt_max),
-                threads=preprocess_block[0],
-            )
-            with torch.cuda.device(x.device):
-                _run_generated_program(
-                    "preprocess",
-                    arch,
-                    device_index,
-                    stage_values={"preprocess": preprocess_values},
-                    stage_grids={"preprocess": preprocess_grid},
-                    cuda_stream=int(
-                        torch.cuda.current_stream(x.device).cuda_stream
-                    ),
-                )
+        grid = _persistent_grid_size(
+            total_work=num_sequences * self.nheads,
+            sm_count=sm_count,
+        )
 
         d_arg = D if D is not None else self._dummy(x.device, torch.bfloat16)
         if D is not None and D.ndim == 2 and not self.d_has_hdim:
@@ -1138,13 +1044,6 @@ class CakeSSDCombined:
             else self._dummy(x.device, torch.int32)
         )
         d_mode = 0 if D is None else 2 if self.d_has_hdim and D.ndim == 2 else 1
-        state_key = "f16" if self.state_dtype == torch.float16 else "bf16"
-        mode_key = "varlen" if mode_varlen else "batched"
-        sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
-        grid = _persistent_grid_size(
-            total_work=num_sequences * self.nheads,
-            sm_count=sm_count,
-        )
         with torch.cuda.device(x.device):
             # x/B/C are consumed through their stride-aware TMA descriptors.
             # The generated source retains dead raw-pointer ABI slots for the
@@ -1196,84 +1095,20 @@ class CakeSSDCombined:
                 "write_final_states": int(return_final_states),
                 "checkpoint_state_count": checkpoint_state_count,
             }
-            if scan_route == _ROUTE_PREFIX_VARLEN:
-                program_name = f"prefix_{state_key}_varlen"
-                profile = _generated_program_profile(program_name, arch)
-                stages = profile.get("stages")
-                preprocess_stage = (
-                    stages.get("preprocess") if isinstance(stages, dict) else None
-                )
-                preprocess_block = (
-                    preprocess_stage.get("block")
-                    if isinstance(preprocess_stage, dict)
-                    else None
-                )
-                if (
-                    not isinstance(preprocess_block, list)
-                    or len(preprocess_block) != 3
-                    or not all(isinstance(value, int) for value in preprocess_block)
-                    or preprocess_block[0] <= 0
-                ):
-                    raise RuntimeError(
-                        f"Cake SSDCombined generated program {program_name!r} "
-                        "has no preprocess block"
-                    )
-                preprocess_values, preprocess_grid = _direct_preprocess_inputs(
-                    dt=dt_float,
-                    A=A,
-                    dt_bias=dt_bias_float,
-                    segment_starts=workspace["starts"],
-                    segment_lengths=workspace["lengths"],
-                    chunk_indices=chunk_indices_arg,
-                    chunk_offsets=chunk_offsets_arg,
-                    delta=workspace["delta"],
-                    cumsum=workspace["cumsum"],
-                    num_segments=num_segments,
-                    nheads=self.nheads,
-                    seqlen=seqlen,
-                    mode_varlen=True,
-                    dt_softplus=bool(dt_softplus),
-                    dt_limit=(dt_min, dt_max),
-                    threads=preprocess_block[0],
-                )
-                preprocess_grid = (
-                    max(1, min(preprocess_grid[0], sm_count)),
-                    preprocess_grid[1],
-                    preprocess_grid[2],
-                )
-                prefix_grid = _persistent_grid_size(
-                    total_work=num_sequences * self.nheads,
-                    sm_count=sm_count,
-                )
-                _run_generated_program(
-                    program_name,
-                    arch,
-                    device_index,
-                    stage_values={
-                        "preprocess": preprocess_values,
-                        "main": main_values,
-                    },
-                    stage_grids={
-                        "preprocess": preprocess_grid,
-                        "main": (prefix_grid, 1, 1),
-                    },
-                    cuda_stream=int(torch.cuda.current_stream(x.device).cuda_stream),
-                )
-            else:
-                family = (
-                    "shallow"
-                    if scan_route == _ROUTE_SHALLOW_VARLEN
-                    else "exact"
-                )
-                program_name = f"{family}_{state_key}_{mode_key}"
-                _run_generated_program(
-                    program_name,
-                    arch,
-                    device_index,
-                    stage_values={"main": main_values},
-                    stage_grids={"main": (grid, 1, 1)},
-                    cuda_stream=int(torch.cuda.current_stream(x.device).cuda_stream),
-                )
+            _run_generated_program(
+                program_name,
+                arch,
+                device_index,
+                stage_values={
+                    "preprocess": preprocess_values,
+                    "main": main_values,
+                },
+                stage_grids={
+                    "preprocess": preprocess_grid,
+                    "main": (grid, 1, 1),
+                },
+                cuda_stream=int(torch.cuda.current_stream(x.device).cuda_stream),
+            )
         out_view = out.permute(0, 3, 4, 1, 2).reshape(
             batch, seqlen, self.nheads, _HEADDIM
         )

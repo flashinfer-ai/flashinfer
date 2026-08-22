@@ -7,6 +7,97 @@
           {
             "arg_plan": [
               [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
+          },
+          {
+            "arg_plan": [
+              [
                 "tma_buffer",
                 "x_map"
               ],
@@ -202,17 +293,18 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85.cu",
-            "sha256": "6b7fe5daade832065bb198b5dfd868c4298b38299accfeb251b52a9bb7ec8a8c",
+            "sha256": "e60d92ce7bb4dcfcd0e8c9d83a8e07098f8e1f9adac96047284d463ce7152ca6",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
-          "path": "host/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85.cpp",
-          "sha256": "6e38bd625fa2c856b907e4931e51be337670e0f449329b8513db0c4afa3e489c"
+          "path": "host/sm_100a/mamba_ssd_combined_exact_bf16_batched.cpp",
+          "sha256": "005ba12d1842c008397ee41b9c7dd259afeb145add0ace249a469a0f71094883"
         },
-        "launch_count": 1,
+        "launch_count": 2,
         "stage_order": [
+          "preprocess",
           "main"
         ],
         "stages": {
@@ -414,14 +506,196 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85.cu",
-            "sha256": "6b7fe5daade832065bb198b5dfd868c4298b38299accfeb251b52a9bb7ec8a8c",
+            "sha256": "e60d92ce7bb4dcfcd0e8c9d83a8e07098f8e1f9adac96047284d463ce7152ca6",
             "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
           }
         },
-        "stream_abi": "implicit"
+        "stream_abi": "explicit"
       },
       "sm_103a": {
         "device_sources": [
+          {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
+          },
           {
             "arg_plan": [
               [
@@ -620,17 +894,18 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85.cu",
-            "sha256": "6b7fe5daade832065bb198b5dfd868c4298b38299accfeb251b52a9bb7ec8a8c",
+            "sha256": "e60d92ce7bb4dcfcd0e8c9d83a8e07098f8e1f9adac96047284d463ce7152ca6",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
-          "path": "host/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85.cpp",
-          "sha256": "6e38bd625fa2c856b907e4931e51be337670e0f449329b8513db0c4afa3e489c"
+          "path": "host/sm_103a/mamba_ssd_combined_exact_bf16_batched.cpp",
+          "sha256": "005ba12d1842c008397ee41b9c7dd259afeb145add0ace249a469a0f71094883"
         },
-        "launch_count": 1,
+        "launch_count": 2,
         "stage_order": [
+          "preprocess",
           "main"
         ],
         "stages": {
@@ -832,11 +1107,102 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85.cu",
-            "sha256": "6b7fe5daade832065bb198b5dfd868c4298b38299accfeb251b52a9bb7ec8a8c",
+            "sha256": "e60d92ce7bb4dcfcd0e8c9d83a8e07098f8e1f9adac96047284d463ce7152ca6",
             "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
           }
         },
-        "stream_abi": "implicit"
+        "stream_abi": "explicit"
       }
     },
     "exact_bf16_varlen": {
@@ -845,6 +1211,97 @@
           {
             "arg_plan": [
               [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
+          },
+          {
+            "arg_plan": [
+              [
                 "tma_buffer",
                 "x_map"
               ],
@@ -1040,17 +1497,18 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379.cu",
-            "sha256": "3b08f007203e39f10481c630d4587ae035d3b7bfddb386af639c8aa7a9bb66b7",
+            "sha256": "551153a1485e35d953a3f51cadc7151f45ef32b070e5eaa2b593b3b549d38ca9",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
-          "path": "host/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379.cpp",
-          "sha256": "b197afdf4318f6503a600cd99d82400301cec244725729eed226f68f890b4417"
+          "path": "host/sm_100a/mamba_ssd_combined_exact_bf16_varlen.cpp",
+          "sha256": "bc81b8d63b0b3419cfe498aad4cf1426edf9def4ca418d9813ef12d1858ac13e"
         },
-        "launch_count": 1,
+        "launch_count": 2,
         "stage_order": [
+          "preprocess",
           "main"
         ],
         "stages": {
@@ -1252,14 +1710,196 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379.cu",
-            "sha256": "3b08f007203e39f10481c630d4587ae035d3b7bfddb386af639c8aa7a9bb66b7",
+            "sha256": "551153a1485e35d953a3f51cadc7151f45ef32b070e5eaa2b593b3b549d38ca9",
             "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
           }
         },
-        "stream_abi": "implicit"
+        "stream_abi": "explicit"
       },
       "sm_103a": {
         "device_sources": [
+          {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
+          },
           {
             "arg_plan": [
               [
@@ -1458,17 +2098,18 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379.cu",
-            "sha256": "3b08f007203e39f10481c630d4587ae035d3b7bfddb386af639c8aa7a9bb66b7",
+            "sha256": "551153a1485e35d953a3f51cadc7151f45ef32b070e5eaa2b593b3b549d38ca9",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
-          "path": "host/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379.cpp",
-          "sha256": "b197afdf4318f6503a600cd99d82400301cec244725729eed226f68f890b4417"
+          "path": "host/sm_103a/mamba_ssd_combined_exact_bf16_varlen.cpp",
+          "sha256": "bc81b8d63b0b3419cfe498aad4cf1426edf9def4ca418d9813ef12d1858ac13e"
         },
-        "launch_count": 1,
+        "launch_count": 2,
         "stage_order": [
+          "preprocess",
           "main"
         ],
         "stages": {
@@ -1670,11 +2311,102 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_bf16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379.cu",
-            "sha256": "3b08f007203e39f10481c630d4587ae035d3b7bfddb386af639c8aa7a9bb66b7",
+            "sha256": "551153a1485e35d953a3f51cadc7151f45ef32b070e5eaa2b593b3b549d38ca9",
             "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
           }
         },
-        "stream_abi": "implicit"
+        "stream_abi": "explicit"
       }
     },
     "exact_f16_batched": {
@@ -1683,6 +2415,97 @@
           {
             "arg_plan": [
               [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
+          },
+          {
+            "arg_plan": [
+              [
                 "tma_buffer",
                 "x_map"
               ],
@@ -1878,17 +2701,18 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_batched_811b6649da",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cu",
-            "sha256": "3d3d316fe5a18da308e046f09fe852178b9cbc2b6be6091933925ce9ff0d658d",
+            "sha256": "6010317638ba1de4e4eca05d2499fa52b062ab4a343bcf0fedca673550be3692",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
-          "path": "host/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cpp",
-          "sha256": "cbebc7651f064cb6f1a08dc32a99f69fd362bd5ec49301c2ba685d22ef7594a9"
+          "path": "host/sm_100a/mamba_ssd_combined_exact_f16_batched.cpp",
+          "sha256": "9eea13ed027584c983baaaf0228dc0af45d4ea6cc440d83b3c210a5b69283b62"
         },
-        "launch_count": 1,
+        "launch_count": 2,
         "stage_order": [
+          "preprocess",
           "main"
         ],
         "stages": {
@@ -2090,14 +2914,196 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_batched_811b6649da",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cu",
-            "sha256": "3d3d316fe5a18da308e046f09fe852178b9cbc2b6be6091933925ce9ff0d658d",
+            "sha256": "6010317638ba1de4e4eca05d2499fa52b062ab4a343bcf0fedca673550be3692",
             "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
           }
         },
-        "stream_abi": "implicit"
+        "stream_abi": "explicit"
       },
       "sm_103a": {
         "device_sources": [
+          {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
+          },
           {
             "arg_plan": [
               [
@@ -2296,17 +3302,18 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_batched_811b6649da",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cu",
-            "sha256": "3d3d316fe5a18da308e046f09fe852178b9cbc2b6be6091933925ce9ff0d658d",
+            "sha256": "6010317638ba1de4e4eca05d2499fa52b062ab4a343bcf0fedca673550be3692",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
-          "path": "host/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cpp",
-          "sha256": "cbebc7651f064cb6f1a08dc32a99f69fd362bd5ec49301c2ba685d22ef7594a9"
+          "path": "host/sm_103a/mamba_ssd_combined_exact_f16_batched.cpp",
+          "sha256": "9eea13ed027584c983baaaf0228dc0af45d4ea6cc440d83b3c210a5b69283b62"
         },
-        "launch_count": 1,
+        "launch_count": 2,
         "stage_order": [
+          "preprocess",
           "main"
         ],
         "stages": {
@@ -2508,11 +3515,102 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_batched",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_batched_811b6649da",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cu",
-            "sha256": "3d3d316fe5a18da308e046f09fe852178b9cbc2b6be6091933925ce9ff0d658d",
+            "sha256": "6010317638ba1de4e4eca05d2499fa52b062ab4a343bcf0fedca673550be3692",
             "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
           }
         },
-        "stream_abi": "implicit"
+        "stream_abi": "explicit"
       }
     },
     "exact_f16_varlen": {
@@ -2521,6 +3619,97 @@
           {
             "arg_plan": [
               [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
+          },
+          {
+            "arg_plan": [
+              [
                 "tma_buffer",
                 "x_map"
               ],
@@ -2716,17 +3905,18 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cu",
-            "sha256": "e2f33140e2bf7f0b3d4fcb3ff57e541aec533cedd10ac0715dff88f45bcb2e2b",
+            "sha256": "5b7009fea3b475ec5497ef3cdd1b44ec2b50c0855ac0d6f0407ed48a31b641fe",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
-          "path": "host/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cpp",
-          "sha256": "33ecc00c51e13417697d61c8abe6a597e3bc449437b04b474771e345da4dfc69"
+          "path": "host/sm_100a/mamba_ssd_combined_exact_f16_varlen.cpp",
+          "sha256": "cdddeaa7e5bc08870d079f5e739e1a93135a9ff6019b3c9a620a9439893a19e5"
         },
-        "launch_count": 1,
+        "launch_count": 2,
         "stage_order": [
+          "preprocess",
           "main"
         ],
         "stages": {
@@ -2928,14 +4118,196 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae",
             "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cu",
-            "sha256": "e2f33140e2bf7f0b3d4fcb3ff57e541aec533cedd10ac0715dff88f45bcb2e2b",
+            "sha256": "5b7009fea3b475ec5497ef3cdd1b44ec2b50c0855ac0d6f0407ed48a31b641fe",
             "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
           }
         },
-        "stream_abi": "implicit"
+        "stream_abi": "explicit"
       },
       "sm_103a": {
         "device_sources": [
+          {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
+          },
           {
             "arg_plan": [
               [
@@ -3134,17 +4506,18 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cu",
-            "sha256": "e2f33140e2bf7f0b3d4fcb3ff57e541aec533cedd10ac0715dff88f45bcb2e2b",
+            "sha256": "5b7009fea3b475ec5497ef3cdd1b44ec2b50c0855ac0d6f0407ed48a31b641fe",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
-          "path": "host/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cpp",
-          "sha256": "33ecc00c51e13417697d61c8abe6a597e3bc449437b04b474771e345da4dfc69"
+          "path": "host/sm_103a/mamba_ssd_combined_exact_f16_varlen.cpp",
+          "sha256": "cdddeaa7e5bc08870d079f5e739e1a93135a9ff6019b3c9a620a9439893a19e5"
         },
-        "launch_count": 1,
+        "launch_count": 2,
         "stage_order": [
+          "preprocess",
           "main"
         ],
         "stages": {
@@ -3346,11 +4719,102 @@
             "kernel_name": "kernel_mamba_ssd_q_tmem_alias_f16_varlen",
             "module_ident": "mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae",
             "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cu",
-            "sha256": "e2f33140e2bf7f0b3d4fcb3ff57e541aec533cedd10ac0715dff88f45bcb2e2b",
+            "sha256": "5b7009fea3b475ec5497ef3cdd1b44ec2b50c0855ac0d6f0407ed48a31b641fe",
             "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
           }
         },
-        "stream_abi": "implicit"
+        "stream_abi": "explicit"
       }
     },
     "prefix_bf16_varlen": {
@@ -3645,14 +5109,14 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_e3f87857c3",
             "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_e3f87857c3.cu",
-            "sha256": "e10f32976a505f1edb61a74ae6b5fe8f9ebc03b76562c4912115af6c9dbf66b1",
+            "sha256": "8983e331ec81e5c4fa8d5402a597aa160ecc9900a7683102b848041c315cde56",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-          "sha256": "9c6d168557358d4aefd127384586f3fa8eb690c37851b2fb1bff562c06217109"
+          "sha256": "46394fe953da8581146af79f66738140fc130cf88babb76a9b482a753da80f68"
         },
         "launch_count": 2,
         "stage_order": [
@@ -3858,7 +5322,7 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_e3f87857c3",
             "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_e3f87857c3.cu",
-            "sha256": "e10f32976a505f1edb61a74ae6b5fe8f9ebc03b76562c4912115af6c9dbf66b1",
+            "sha256": "8983e331ec81e5c4fa8d5402a597aa160ecc9900a7683102b848041c315cde56",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -4246,14 +5710,14 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_e3f87857c3",
             "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_e3f87857c3.cu",
-            "sha256": "e10f32976a505f1edb61a74ae6b5fe8f9ebc03b76562c4912115af6c9dbf66b1",
+            "sha256": "8983e331ec81e5c4fa8d5402a597aa160ecc9900a7683102b848041c315cde56",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-          "sha256": "9c6d168557358d4aefd127384586f3fa8eb690c37851b2fb1bff562c06217109"
+          "sha256": "46394fe953da8581146af79f66738140fc130cf88babb76a9b482a753da80f68"
         },
         "launch_count": 2,
         "stage_order": [
@@ -4459,7 +5923,7 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_e3f87857c3",
             "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_e3f87857c3.cu",
-            "sha256": "e10f32976a505f1edb61a74ae6b5fe8f9ebc03b76562c4912115af6c9dbf66b1",
+            "sha256": "8983e331ec81e5c4fa8d5402a597aa160ecc9900a7683102b848041c315cde56",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -4849,14 +6313,14 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487",
             "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487.cu",
-            "sha256": "99bc581aca099ec722125f91290c3055d79249ebeb39a5fa1b5da9238dd6cd67",
+            "sha256": "29edbd2fafd63faa0d2b814f05a4f7feab4f8861506cbe3e1ad1602a037c8c1f",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_r12_f16_varlen.cpp",
-          "sha256": "bde8339cb8330f3e55c0fb98d3f884e2750f89fb2d9dd9a8f4b5c399a3278ec9"
+          "sha256": "0f2172295d949f06db50903acec27628773f23173a7533a0e4cd2d563c2077cb"
         },
         "launch_count": 2,
         "stage_order": [
@@ -5062,7 +6526,7 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487",
             "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487.cu",
-            "sha256": "99bc581aca099ec722125f91290c3055d79249ebeb39a5fa1b5da9238dd6cd67",
+            "sha256": "29edbd2fafd63faa0d2b814f05a4f7feab4f8861506cbe3e1ad1602a037c8c1f",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -5450,14 +6914,14 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487",
             "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487.cu",
-            "sha256": "99bc581aca099ec722125f91290c3055d79249ebeb39a5fa1b5da9238dd6cd67",
+            "sha256": "29edbd2fafd63faa0d2b814f05a4f7feab4f8861506cbe3e1ad1602a037c8c1f",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_r12_f16_varlen.cpp",
-          "sha256": "bde8339cb8330f3e55c0fb98d3f884e2750f89fb2d9dd9a8f4b5c399a3278ec9"
+          "sha256": "0f2172295d949f06db50903acec27628773f23173a7533a0e4cd2d563c2077cb"
         },
         "launch_count": 2,
         "stage_order": [
@@ -5663,7 +7127,7 @@
             "kernel_name": "kernel_mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1",
             "module_ident": "mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487",
             "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487.cu",
-            "sha256": "99bc581aca099ec722125f91290c3055d79249ebeb39a5fa1b5da9238dd6cd67",
+            "sha256": "29edbd2fafd63faa0d2b814f05a4f7feab4f8861506cbe3e1ad1602a037c8c1f",
             "tma_abi": "grid_constant"
           },
           "preprocess": {
@@ -5761,410 +7225,103 @@
         "stream_abi": "explicit"
       }
     },
-    "preprocess": {
-      "sm_100a": {
-        "device_sources": [
-          {
-            "arg_plan": [
-              [
-                "buffer",
-                "dt"
-              ],
-              [
-                "buffer",
-                "A"
-              ],
-              [
-                "buffer",
-                "dt_bias"
-              ],
-              [
-                "buffer",
-                "segment_starts"
-              ],
-              [
-                "buffer",
-                "segment_lengths"
-              ],
-              [
-                "buffer",
-                "chunk_indices"
-              ],
-              [
-                "buffer",
-                "chunk_offsets"
-              ],
-              [
-                "buffer",
-                "delta"
-              ],
-              [
-                "buffer",
-                "cumsum"
-              ],
-              [
-                "parameter",
-                "num_segments"
-              ],
-              [
-                "parameter",
-                "nheads"
-              ],
-              [
-                "parameter",
-                "seqlen"
-              ],
-              [
-                "parameter",
-                "direct_varlen_metadata"
-              ],
-              [
-                "parameter",
-                "dt_softplus"
-              ],
-              [
-                "parameter",
-                "dt_min"
-              ],
-              [
-                "parameter",
-                "dt_max"
-              ],
-              [
-                "grid",
-                "grid_x"
-              ],
-              [
-                "grid",
-                "grid_y"
-              ],
-              [
-                "grid",
-                "grid_z"
-              ]
-            ],
-            "block": [
-              128,
-              1,
-              1
-            ],
-            "compile_flags": [],
-            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
-            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
-            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
-            "tma_abi": "pointer"
-          }
-        ],
-        "entry": "run",
-        "host_source": {
-          "path": "host/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cpp",
-          "sha256": "bb0a3432626d78db4cc618e23fd89d5fa11cb56d483e43db196437530d345275"
-        },
-        "launch_count": 1,
-        "stage_order": [
-          "preprocess"
-        ],
-        "stages": {
-          "preprocess": {
-            "arg_plan": [
-              [
-                "buffer",
-                "dt"
-              ],
-              [
-                "buffer",
-                "A"
-              ],
-              [
-                "buffer",
-                "dt_bias"
-              ],
-              [
-                "buffer",
-                "segment_starts"
-              ],
-              [
-                "buffer",
-                "segment_lengths"
-              ],
-              [
-                "buffer",
-                "chunk_indices"
-              ],
-              [
-                "buffer",
-                "chunk_offsets"
-              ],
-              [
-                "buffer",
-                "delta"
-              ],
-              [
-                "buffer",
-                "cumsum"
-              ],
-              [
-                "parameter",
-                "num_segments"
-              ],
-              [
-                "parameter",
-                "nheads"
-              ],
-              [
-                "parameter",
-                "seqlen"
-              ],
-              [
-                "parameter",
-                "direct_varlen_metadata"
-              ],
-              [
-                "parameter",
-                "dt_softplus"
-              ],
-              [
-                "parameter",
-                "dt_min"
-              ],
-              [
-                "parameter",
-                "dt_max"
-              ],
-              [
-                "grid",
-                "grid_x"
-              ],
-              [
-                "grid",
-                "grid_y"
-              ],
-              [
-                "grid",
-                "grid_z"
-              ]
-            ],
-            "block": [
-              128,
-              1,
-              1
-            ],
-            "compile_flags": [],
-            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
-            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
-            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
-            "tma_abi": "pointer"
-          }
-        },
-        "stream_abi": "implicit"
-      },
-      "sm_103a": {
-        "device_sources": [
-          {
-            "arg_plan": [
-              [
-                "buffer",
-                "dt"
-              ],
-              [
-                "buffer",
-                "A"
-              ],
-              [
-                "buffer",
-                "dt_bias"
-              ],
-              [
-                "buffer",
-                "segment_starts"
-              ],
-              [
-                "buffer",
-                "segment_lengths"
-              ],
-              [
-                "buffer",
-                "chunk_indices"
-              ],
-              [
-                "buffer",
-                "chunk_offsets"
-              ],
-              [
-                "buffer",
-                "delta"
-              ],
-              [
-                "buffer",
-                "cumsum"
-              ],
-              [
-                "parameter",
-                "num_segments"
-              ],
-              [
-                "parameter",
-                "nheads"
-              ],
-              [
-                "parameter",
-                "seqlen"
-              ],
-              [
-                "parameter",
-                "direct_varlen_metadata"
-              ],
-              [
-                "parameter",
-                "dt_softplus"
-              ],
-              [
-                "parameter",
-                "dt_min"
-              ],
-              [
-                "parameter",
-                "dt_max"
-              ],
-              [
-                "grid",
-                "grid_x"
-              ],
-              [
-                "grid",
-                "grid_y"
-              ],
-              [
-                "grid",
-                "grid_z"
-              ]
-            ],
-            "block": [
-              128,
-              1,
-              1
-            ],
-            "compile_flags": [],
-            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
-            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
-            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
-            "tma_abi": "pointer"
-          }
-        ],
-        "entry": "run",
-        "host_source": {
-          "path": "host/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cpp",
-          "sha256": "bb0a3432626d78db4cc618e23fd89d5fa11cb56d483e43db196437530d345275"
-        },
-        "launch_count": 1,
-        "stage_order": [
-          "preprocess"
-        ],
-        "stages": {
-          "preprocess": {
-            "arg_plan": [
-              [
-                "buffer",
-                "dt"
-              ],
-              [
-                "buffer",
-                "A"
-              ],
-              [
-                "buffer",
-                "dt_bias"
-              ],
-              [
-                "buffer",
-                "segment_starts"
-              ],
-              [
-                "buffer",
-                "segment_lengths"
-              ],
-              [
-                "buffer",
-                "chunk_indices"
-              ],
-              [
-                "buffer",
-                "chunk_offsets"
-              ],
-              [
-                "buffer",
-                "delta"
-              ],
-              [
-                "buffer",
-                "cumsum"
-              ],
-              [
-                "parameter",
-                "num_segments"
-              ],
-              [
-                "parameter",
-                "nheads"
-              ],
-              [
-                "parameter",
-                "seqlen"
-              ],
-              [
-                "parameter",
-                "direct_varlen_metadata"
-              ],
-              [
-                "parameter",
-                "dt_softplus"
-              ],
-              [
-                "parameter",
-                "dt_min"
-              ],
-              [
-                "parameter",
-                "dt_max"
-              ],
-              [
-                "grid",
-                "grid_x"
-              ],
-              [
-                "grid",
-                "grid_y"
-              ],
-              [
-                "grid",
-                "grid_z"
-              ]
-            ],
-            "block": [
-              128,
-              1,
-              1
-            ],
-            "compile_flags": [],
-            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
-            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
-            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
-            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
-            "tma_abi": "pointer"
-          }
-        },
-        "stream_abi": "implicit"
-      }
-    },
     "shallow_bf16_varlen": {
       "sm_100a": {
         "device_sources": [
           {
             "arg_plan": [
               [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
+          },
+          {
+            "arg_plan": [
+              [
                 "tma_buffer",
                 "x_map"
               ],
@@ -6360,17 +7517,18 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296",
             "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296.cu",
-            "sha256": "2a6e0b397da639a24dac9783371195e95b18b23346596cf2d67e02ba3a85889c",
+            "sha256": "dec99ab5a2287c3414843a3e031d1d1923e5a99fdc53eaf7952939b4c173ae9a",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
-          "path": "host/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296.cpp",
-          "sha256": "940952e6e3172d8b1049dda64be000f25e392bdec40143ef1884f80bda0b04f1"
+          "path": "host/sm_100a/mamba_ssd_combined_r7_bf16_varlen.cpp",
+          "sha256": "12620c2109a7f0396880863687f3450b5100296bd60519453e9aca656bb5f029"
         },
-        "launch_count": 1,
+        "launch_count": 2,
         "stage_order": [
+          "preprocess",
           "main"
         ],
         "stages": {
@@ -6572,14 +7730,196 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296",
             "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296.cu",
-            "sha256": "2a6e0b397da639a24dac9783371195e95b18b23346596cf2d67e02ba3a85889c",
+            "sha256": "dec99ab5a2287c3414843a3e031d1d1923e5a99fdc53eaf7952939b4c173ae9a",
             "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
           }
         },
-        "stream_abi": "implicit"
+        "stream_abi": "explicit"
       },
       "sm_103a": {
         "device_sources": [
+          {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
+          },
           {
             "arg_plan": [
               [
@@ -6778,17 +8118,18 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296",
             "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296.cu",
-            "sha256": "2a6e0b397da639a24dac9783371195e95b18b23346596cf2d67e02ba3a85889c",
+            "sha256": "dec99ab5a2287c3414843a3e031d1d1923e5a99fdc53eaf7952939b4c173ae9a",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
-          "path": "host/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296.cpp",
-          "sha256": "940952e6e3172d8b1049dda64be000f25e392bdec40143ef1884f80bda0b04f1"
+          "path": "host/sm_103a/mamba_ssd_combined_r7_bf16_varlen.cpp",
+          "sha256": "12620c2109a7f0396880863687f3450b5100296bd60519453e9aca656bb5f029"
         },
-        "launch_count": 1,
+        "launch_count": 2,
         "stage_order": [
+          "preprocess",
           "main"
         ],
         "stages": {
@@ -6990,11 +8331,102 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296",
             "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296.cu",
-            "sha256": "2a6e0b397da639a24dac9783371195e95b18b23346596cf2d67e02ba3a85889c",
+            "sha256": "dec99ab5a2287c3414843a3e031d1d1923e5a99fdc53eaf7952939b4c173ae9a",
             "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
           }
         },
-        "stream_abi": "implicit"
+        "stream_abi": "explicit"
       }
     },
     "shallow_f16_varlen": {
@@ -7003,6 +8435,97 @@
           {
             "arg_plan": [
               [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
+          },
+          {
+            "arg_plan": [
+              [
                 "tma_buffer",
                 "x_map"
               ],
@@ -7198,17 +8721,18 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7",
             "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cu",
-            "sha256": "9814093f0097f048cb0092f75e94b116f10788f495c03487af87dbbc6c040f90",
+            "sha256": "80359148d117854dd2b7300a9014768774519fcdafeb9835998140ece3d254ec",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
-          "path": "host/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cpp",
-          "sha256": "27a382d22a5c951c5965abb4e54fba1d2209abd0ae6e113be4e52d08037dc94d"
+          "path": "host/sm_100a/mamba_ssd_combined_r7_f16_varlen.cpp",
+          "sha256": "ae99304c1a8e9c1abf5942c95912b1160b327e8c6241d3f8ecfa8e97ead9f829"
         },
-        "launch_count": 1,
+        "launch_count": 2,
         "stage_order": [
+          "preprocess",
           "main"
         ],
         "stages": {
@@ -7410,14 +8934,196 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7",
             "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cu",
-            "sha256": "9814093f0097f048cb0092f75e94b116f10788f495c03487af87dbbc6c040f90",
+            "sha256": "80359148d117854dd2b7300a9014768774519fcdafeb9835998140ece3d254ec",
             "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
           }
         },
-        "stream_abi": "implicit"
+        "stream_abi": "explicit"
       },
       "sm_103a": {
         "device_sources": [
+          {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
+          },
           {
             "arg_plan": [
               [
@@ -7616,17 +9322,18 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7",
             "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cu",
-            "sha256": "9814093f0097f048cb0092f75e94b116f10788f495c03487af87dbbc6c040f90",
+            "sha256": "80359148d117854dd2b7300a9014768774519fcdafeb9835998140ece3d254ec",
             "tma_abi": "grid_constant"
           }
         ],
         "entry": "run",
         "host_source": {
-          "path": "host/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cpp",
-          "sha256": "27a382d22a5c951c5965abb4e54fba1d2209abd0ae6e113be4e52d08037dc94d"
+          "path": "host/sm_103a/mamba_ssd_combined_r7_f16_varlen.cpp",
+          "sha256": "ae99304c1a8e9c1abf5942c95912b1160b327e8c6241d3f8ecfa8e97ead9f829"
         },
-        "launch_count": 1,
+        "launch_count": 2,
         "stage_order": [
+          "preprocess",
           "main"
         ],
         "stages": {
@@ -7828,16 +9535,107 @@
             "kernel_name": "kernel_mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen",
             "module_ident": "mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7",
             "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cu",
-            "sha256": "9814093f0097f048cb0092f75e94b116f10788f495c03487af87dbbc6c040f90",
+            "sha256": "80359148d117854dd2b7300a9014768774519fcdafeb9835998140ece3d254ec",
             "tma_abi": "grid_constant"
+          },
+          "preprocess": {
+            "arg_plan": [
+              [
+                "buffer",
+                "dt"
+              ],
+              [
+                "buffer",
+                "A"
+              ],
+              [
+                "buffer",
+                "dt_bias"
+              ],
+              [
+                "buffer",
+                "segment_starts"
+              ],
+              [
+                "buffer",
+                "segment_lengths"
+              ],
+              [
+                "buffer",
+                "chunk_indices"
+              ],
+              [
+                "buffer",
+                "chunk_offsets"
+              ],
+              [
+                "buffer",
+                "delta"
+              ],
+              [
+                "buffer",
+                "cumsum"
+              ],
+              [
+                "parameter",
+                "num_segments"
+              ],
+              [
+                "parameter",
+                "nheads"
+              ],
+              [
+                "parameter",
+                "seqlen"
+              ],
+              [
+                "parameter",
+                "direct_varlen_metadata"
+              ],
+              [
+                "parameter",
+                "dt_softplus"
+              ],
+              [
+                "parameter",
+                "dt_min"
+              ],
+              [
+                "parameter",
+                "dt_max"
+              ],
+              [
+                "grid",
+                "grid_x"
+              ],
+              [
+                "grid",
+                "grid_y"
+              ],
+              [
+                "grid",
+                "grid_z"
+              ]
+            ],
+            "block": [
+              128,
+              1,
+              1
+            ],
+            "compile_flags": [],
+            "kernel_name": "kernel_factorized_persistent_segment_preprocess",
+            "module_ident": "factorized_persistent_segment_preprocess_77140386cb",
+            "path": "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
+            "sha256": "64b883eee437e7887d0dbc8a352a147b27af694fb49deb7bc6e1a95589716e06",
+            "tma_abi": "pointer"
           }
         },
-        "stream_abi": "implicit"
+        "stream_abi": "explicit"
       }
     }
   },
   "schema_version": 1,
-  "source_archive_sha256": "b3b695210ee75eb391a14129605951e7728b187fb203b3a9ff54521a4079ca85",
+  "source_archive_sha256": "c04f0c0dcabc83d93252ce9cb0e580984a70bd0a464a37f6f7b0e9b427a6acfb",
   "source_inventory": [
     {
       "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
@@ -7845,35 +9643,35 @@
     },
     {
       "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296.cu",
-      "sha256": "2a6e0b397da639a24dac9783371195e95b18b23346596cf2d67e02ba3a85889c"
+      "sha256": "dec99ab5a2287c3414843a3e031d1d1923e5a99fdc53eaf7952939b4c173ae9a"
     },
     {
       "path": "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cu",
-      "sha256": "9814093f0097f048cb0092f75e94b116f10788f495c03487af87dbbc6c040f90"
+      "sha256": "80359148d117854dd2b7300a9014768774519fcdafeb9835998140ece3d254ec"
     },
     {
       "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_e3f87857c3.cu",
-      "sha256": "e10f32976a505f1edb61a74ae6b5fe8f9ebc03b76562c4912115af6c9dbf66b1"
+      "sha256": "8983e331ec81e5c4fa8d5402a597aa160ecc9900a7683102b848041c315cde56"
     },
     {
       "path": "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487.cu",
-      "sha256": "99bc581aca099ec722125f91290c3055d79249ebeb39a5fa1b5da9238dd6cd67"
+      "sha256": "29edbd2fafd63faa0d2b814f05a4f7feab4f8861506cbe3e1ad1602a037c8c1f"
     },
     {
       "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85.cu",
-      "sha256": "6b7fe5daade832065bb198b5dfd868c4298b38299accfeb251b52a9bb7ec8a8c"
+      "sha256": "e60d92ce7bb4dcfcd0e8c9d83a8e07098f8e1f9adac96047284d463ce7152ca6"
     },
     {
       "path": "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379.cu",
-      "sha256": "3b08f007203e39f10481c630d4587ae035d3b7bfddb386af639c8aa7a9bb66b7"
+      "sha256": "551153a1485e35d953a3f51cadc7151f45ef32b070e5eaa2b593b3b549d38ca9"
     },
     {
       "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cu",
-      "sha256": "3d3d316fe5a18da308e046f09fe852178b9cbc2b6be6091933925ce9ff0d658d"
+      "sha256": "6010317638ba1de4e4eca05d2499fa52b062ab4a343bcf0fedca673550be3692"
     },
     {
       "path": "device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cu",
-      "sha256": "e2f33140e2bf7f0b3d4fcb3ff57e541aec533cedd10ac0715dff88f45bcb2e2b"
+      "sha256": "5b7009fea3b475ec5497ef3cdd1b44ec2b50c0855ac0d6f0407ed48a31b641fe"
     },
     {
       "path": "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_a104f24f9d.cu",
@@ -7885,35 +9683,35 @@
     },
     {
       "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296.cu",
-      "sha256": "2a6e0b397da639a24dac9783371195e95b18b23346596cf2d67e02ba3a85889c"
+      "sha256": "dec99ab5a2287c3414843a3e031d1d1923e5a99fdc53eaf7952939b4c173ae9a"
     },
     {
       "path": "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cu",
-      "sha256": "9814093f0097f048cb0092f75e94b116f10788f495c03487af87dbbc6c040f90"
+      "sha256": "80359148d117854dd2b7300a9014768774519fcdafeb9835998140ece3d254ec"
     },
     {
       "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_e3f87857c3.cu",
-      "sha256": "e10f32976a505f1edb61a74ae6b5fe8f9ebc03b76562c4912115af6c9dbf66b1"
+      "sha256": "8983e331ec81e5c4fa8d5402a597aa160ecc9900a7683102b848041c315cde56"
     },
     {
       "path": "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487.cu",
-      "sha256": "99bc581aca099ec722125f91290c3055d79249ebeb39a5fa1b5da9238dd6cd67"
+      "sha256": "29edbd2fafd63faa0d2b814f05a4f7feab4f8861506cbe3e1ad1602a037c8c1f"
     },
     {
       "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85.cu",
-      "sha256": "6b7fe5daade832065bb198b5dfd868c4298b38299accfeb251b52a9bb7ec8a8c"
+      "sha256": "e60d92ce7bb4dcfcd0e8c9d83a8e07098f8e1f9adac96047284d463ce7152ca6"
     },
     {
       "path": "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379.cu",
-      "sha256": "3b08f007203e39f10481c630d4587ae035d3b7bfddb386af639c8aa7a9bb66b7"
+      "sha256": "551153a1485e35d953a3f51cadc7151f45ef32b070e5eaa2b593b3b549d38ca9"
     },
     {
       "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cu",
-      "sha256": "3d3d316fe5a18da308e046f09fe852178b9cbc2b6be6091933925ce9ff0d658d"
+      "sha256": "6010317638ba1de4e4eca05d2499fa52b062ab4a343bcf0fedca673550be3692"
     },
     {
       "path": "device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cu",
-      "sha256": "e2f33140e2bf7f0b3d4fcb3ff57e541aec533cedd10ac0715dff88f45bcb2e2b"
+      "sha256": "5b7009fea3b475ec5497ef3cdd1b44ec2b50c0855ac0d6f0407ed48a31b641fe"
     },
     {
       "path": "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_a104f24f9d.cu",
@@ -7921,75 +9719,75 @@
     },
     {
       "path": "host/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cpp",
-      "sha256": "bb0a3432626d78db4cc618e23fd89d5fa11cb56d483e43db196437530d345275"
+      "sha256": "0d8b386574f75c894ba4a7abde2a94e96a927d8d792dfa969ff219dc26cfecef"
+    },
+    {
+      "path": "host/sm_100a/mamba_ssd_combined_exact_bf16_batched.cpp",
+      "sha256": "005ba12d1842c008397ee41b9c7dd259afeb145add0ace249a469a0f71094883"
+    },
+    {
+      "path": "host/sm_100a/mamba_ssd_combined_exact_bf16_varlen.cpp",
+      "sha256": "bc81b8d63b0b3419cfe498aad4cf1426edf9def4ca418d9813ef12d1858ac13e"
+    },
+    {
+      "path": "host/sm_100a/mamba_ssd_combined_exact_f16_batched.cpp",
+      "sha256": "9eea13ed027584c983baaaf0228dc0af45d4ea6cc440d83b3c210a5b69283b62"
+    },
+    {
+      "path": "host/sm_100a/mamba_ssd_combined_exact_f16_varlen.cpp",
+      "sha256": "cdddeaa7e5bc08870d079f5e739e1a93135a9ff6019b3c9a620a9439893a19e5"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-      "sha256": "9c6d168557358d4aefd127384586f3fa8eb690c37851b2fb1bff562c06217109"
+      "sha256": "46394fe953da8581146af79f66738140fc130cf88babb76a9b482a753da80f68"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_r12_f16_varlen.cpp",
-      "sha256": "bde8339cb8330f3e55c0fb98d3f884e2750f89fb2d9dd9a8f4b5c399a3278ec9"
+      "sha256": "0f2172295d949f06db50903acec27628773f23173a7533a0e4cd2d563c2077cb"
     },
     {
-      "path": "host/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296.cpp",
-      "sha256": "940952e6e3172d8b1049dda64be000f25e392bdec40143ef1884f80bda0b04f1"
+      "path": "host/sm_100a/mamba_ssd_combined_r7_bf16_varlen.cpp",
+      "sha256": "12620c2109a7f0396880863687f3450b5100296bd60519453e9aca656bb5f029"
     },
     {
-      "path": "host/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cpp",
-      "sha256": "27a382d22a5c951c5965abb4e54fba1d2209abd0ae6e113be4e52d08037dc94d"
-    },
-    {
-      "path": "host/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85.cpp",
-      "sha256": "6e38bd625fa2c856b907e4931e51be337670e0f449329b8513db0c4afa3e489c"
-    },
-    {
-      "path": "host/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379.cpp",
-      "sha256": "b197afdf4318f6503a600cd99d82400301cec244725729eed226f68f890b4417"
-    },
-    {
-      "path": "host/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cpp",
-      "sha256": "cbebc7651f064cb6f1a08dc32a99f69fd362bd5ec49301c2ba685d22ef7594a9"
-    },
-    {
-      "path": "host/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cpp",
-      "sha256": "33ecc00c51e13417697d61c8abe6a597e3bc449437b04b474771e345da4dfc69"
+      "path": "host/sm_100a/mamba_ssd_combined_r7_f16_varlen.cpp",
+      "sha256": "ae99304c1a8e9c1abf5942c95912b1160b327e8c6241d3f8ecfa8e97ead9f829"
     },
     {
       "path": "host/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cpp",
-      "sha256": "bb0a3432626d78db4cc618e23fd89d5fa11cb56d483e43db196437530d345275"
+      "sha256": "0d8b386574f75c894ba4a7abde2a94e96a927d8d792dfa969ff219dc26cfecef"
+    },
+    {
+      "path": "host/sm_103a/mamba_ssd_combined_exact_bf16_batched.cpp",
+      "sha256": "005ba12d1842c008397ee41b9c7dd259afeb145add0ace249a469a0f71094883"
+    },
+    {
+      "path": "host/sm_103a/mamba_ssd_combined_exact_bf16_varlen.cpp",
+      "sha256": "bc81b8d63b0b3419cfe498aad4cf1426edf9def4ca418d9813ef12d1858ac13e"
+    },
+    {
+      "path": "host/sm_103a/mamba_ssd_combined_exact_f16_batched.cpp",
+      "sha256": "9eea13ed027584c983baaaf0228dc0af45d4ea6cc440d83b3c210a5b69283b62"
+    },
+    {
+      "path": "host/sm_103a/mamba_ssd_combined_exact_f16_varlen.cpp",
+      "sha256": "cdddeaa7e5bc08870d079f5e739e1a93135a9ff6019b3c9a620a9439893a19e5"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-      "sha256": "9c6d168557358d4aefd127384586f3fa8eb690c37851b2fb1bff562c06217109"
+      "sha256": "46394fe953da8581146af79f66738140fc130cf88babb76a9b482a753da80f68"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_r12_f16_varlen.cpp",
-      "sha256": "bde8339cb8330f3e55c0fb98d3f884e2750f89fb2d9dd9a8f4b5c399a3278ec9"
+      "sha256": "0f2172295d949f06db50903acec27628773f23173a7533a0e4cd2d563c2077cb"
     },
     {
-      "path": "host/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296.cpp",
-      "sha256": "940952e6e3172d8b1049dda64be000f25e392bdec40143ef1884f80bda0b04f1"
+      "path": "host/sm_103a/mamba_ssd_combined_r7_bf16_varlen.cpp",
+      "sha256": "12620c2109a7f0396880863687f3450b5100296bd60519453e9aca656bb5f029"
     },
     {
-      "path": "host/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cpp",
-      "sha256": "27a382d22a5c951c5965abb4e54fba1d2209abd0ae6e113be4e52d08037dc94d"
-    },
-    {
-      "path": "host/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85.cpp",
-      "sha256": "6e38bd625fa2c856b907e4931e51be337670e0f449329b8513db0c4afa3e489c"
-    },
-    {
-      "path": "host/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379.cpp",
-      "sha256": "b197afdf4318f6503a600cd99d82400301cec244725729eed226f68f890b4417"
-    },
-    {
-      "path": "host/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cpp",
-      "sha256": "cbebc7651f064cb6f1a08dc32a99f69fd362bd5ec49301c2ba685d22ef7594a9"
-    },
-    {
-      "path": "host/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cpp",
-      "sha256": "33ecc00c51e13417697d61c8abe6a597e3bc449437b04b474771e345da4dfc69"
+      "path": "host/sm_103a/mamba_ssd_combined_r7_f16_varlen.cpp",
+      "sha256": "ae99304c1a8e9c1abf5942c95912b1160b327e8c6241d3f8ecfa8e97ead9f829"
     }
   ],
   "source_status": "terminal"
