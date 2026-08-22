@@ -2185,6 +2185,11 @@ def _log_function_outputs(func_name: str, result: Any, level: int) -> None:
 # Read by tests/trace/test_fi_trace_template_consistency.py to auto-discover
 # all registered templates without requiring manual maintenance.
 _TRACE_REGISTRY: List[Tuple[Callable, Any, str]] = []
+# Keep invocation-time resolvers separate so the long-standing
+# ``(original, template, label)`` registry shape remains stable for collectors.
+# Trace Apply uses this mapping to select the same template as ``fi_trace`` for
+# each live call instead of unconditionally taking the first variant.
+_TRACE_DISPATCHERS: Dict[Callable, Callable] = {}
 
 
 def _attach_fi_trace(
@@ -2247,6 +2252,7 @@ def _attach_fi_trace(
                     for tpl in getattr(trace_template, "templates", ())
                     if isinstance(tpl, TraceTemplate)
                 )
+                _TRACE_DISPATCHERS[original] = trace_template
                 for tpl in dispatch_templates:
                     _label = tpl.name_prefix or tpl.op_type
                     _TRACE_REGISTRY.append((original, tpl, _label))

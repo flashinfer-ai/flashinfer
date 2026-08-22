@@ -32,7 +32,7 @@ from flashinfer.autotuner import (
     DynamicTensorSpec,
 )
 from ..trace.templates.attention import (
-    mla_paged_decode_trace,
+    mla_paged_decode_trace_dispatch,
     trtllm_batch_decode_mla_trace_dispatch,
     xqa_batch_decode_mla_trace,
 )
@@ -1960,6 +1960,15 @@ def get_batch_mla_module(backend, *args):
     return gen_batch_mla_module(backend, *args).build_and_load()
 
 
+def _all_query_lengths_are_one(qo_indptr_host: torch.Tensor) -> bool:
+    query_lengths = qo_indptr_host[1:] - qo_indptr_host[:-1]
+    return bool(
+        query_lengths.numel() > 0
+        and qo_indptr_host[0].item() == 0
+        and (query_lengths == 1).all().item()
+    )
+
+
 class BatchMLAPagedAttentionWrapper:
     r"""Wrapper class for MLA (`Multi-head Latent Attention <https://arxiv.org/abs/2405.04434>`_)
     PagedAttention on DeepSeek models. This kernel can be used in decode, and incremental prefill
@@ -2105,6 +2114,8 @@ class BatchMLAPagedAttentionWrapper:
         """
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
+        self._all_query_lengths_one: Optional[bool] = None
+        self._planned_total_q: Optional[int] = None
 
         if backend == "cutlass":
             self._backend = backend
@@ -2229,6 +2240,8 @@ class BatchMLAPagedAttentionWrapper:
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
         kv_len_arr_host = kv_len_arr.to("cpu")
+        self._all_query_lengths_one = _all_query_lengths_are_one(qo_indptr_host)
+        self._planned_total_q = int(qo_indptr_host[-1].item())
 
         if self._use_cuda_graph:
             self._qo_indptr_buf.copy_(qo_indptr, non_blocking=True)
@@ -2305,7 +2318,7 @@ class BatchMLAPagedAttentionWrapper:
         kpe_scale: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
-    @flashinfer_api(trace=mla_paged_decode_trace)
+    @flashinfer_api(trace=mla_paged_decode_trace_dispatch)
     def run(
         self,
         q_nope: torch.Tensor,

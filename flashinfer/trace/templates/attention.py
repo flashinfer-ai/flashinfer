@@ -2070,6 +2070,38 @@ mla_paged_prefill_trace = TraceTemplate(
     init=_mla_paged_prefill_init,
 )
 
+
+def mla_paged_decode_trace_dispatch(**kwargs):
+    """Select decode only when the installed MLA plan is compatible.
+
+    The shared production ``run()`` also handles causal and multi-token calls,
+    while this trace schema describes non-causal, one-query-per-request decode.
+    Calls without a wrapper retain the historical direct ``fi_trace`` default;
+    live calls with missing or incompatible plan state return no template.
+    """
+    wrapper = kwargs.get("self")
+    if wrapper is None:
+        return mla_paged_decode_trace
+
+    causal = getattr(wrapper, "_causal", None)
+    all_query_lengths_one = getattr(wrapper, "_all_query_lengths_one", None)
+    planned_total_q = getattr(wrapper, "_planned_total_q", None)
+    q_nope = kwargs.get("q_nope")
+    if (
+        causal is False
+        and all_query_lengths_one is True
+        and planned_total_q is not None
+        and q_nope is not None
+        and int(q_nope.shape[0]) == planned_total_q
+    ):
+        return mla_paged_decode_trace
+    return None
+
+
+mla_paged_decode_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    mla_paged_decode_trace
+]
+
 # ── DSA (Dense Sparse Attention) paged ────────────────────────────────────────
 
 

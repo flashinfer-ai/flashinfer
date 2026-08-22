@@ -729,6 +729,8 @@ def test_mla_paged_fi_trace():
         kpe_scale=1.0,
     )
     _check_defn(defn, "mla_paged", "BatchMLAPagedAttentionWrapper")
+    assert defn["name"].startswith("mla_paged_decode")
+    assert "stage:decode" in defn["tags"]
     axes = defn["axes"]
     assert axes["num_qo_heads"]["value"] == num_qo_heads
     assert axes["head_dim_ckv"]["value"] == head_dim_ckv
