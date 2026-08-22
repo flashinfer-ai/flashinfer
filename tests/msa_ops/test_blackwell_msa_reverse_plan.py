@@ -23,9 +23,11 @@ def _frozen_q2k(shape, seed: int) -> torch.Tensor:
         for local_q in range(shape.seqlen_q):
             visible = min(blocks, (offset + local_q + 128) // 128)
             for head in range(shape.num_kv_heads):
-                selected = torch.randperm(visible, generator=generator)[
-                    : shape.topk
-                ].sort().values
+                selected = (
+                    torch.randperm(visible, generator=generator)[: shape.topk]
+                    .sort()
+                    .values
+                )
                 q2k[head, q_base + local_q] = selected.to(torch.int32)
     return q2k.contiguous()
 
@@ -149,9 +151,7 @@ def test_warmed_topk4_capture_hit_does_not_read_host(monkeypatch) -> None:
             AssertionError("warmed capture hit attempted a host snapshot")
         ),
     )
-    monkeypatch.setattr(
-        torch.cuda, "is_current_stream_capturing", lambda: True
-    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     assert (
         plan.prepare_bf16_paged_topk4_plan(
             q2k,
@@ -179,9 +179,7 @@ def test_qagg_capture_miss_fails_before_host_snapshot(monkeypatch) -> None:
             AssertionError("capture miss attempted a host snapshot")
         ),
     )
-    monkeypatch.setattr(
-        torch.cuda, "is_current_stream_capturing", lambda: True
-    )
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="prepared before CUDA graph capture"):
         plan.prepare_fp8_topk8_qagg_plan(
             q2k,

@@ -112,9 +112,7 @@ def balanced_target_q_per_cta(
     if shape.num_q_heads % shape.num_kv_heads:
         raise ValueError("num_q_heads must be divisible by num_kv_heads")
     total_refs_upper = shape.total_q * shape.topk * shape.num_kv_heads
-    total_groups_upper = _ceil_div(
-        max(total_refs_upper, 1), shape.q_tokens_per_group
-    )
+    total_groups_upper = _ceil_div(max(total_refs_upper, 1), shape.q_tokens_per_group)
     desired_cap = 296 if shape.route == _FP8_TOPK8_SHAPE.route else 256
     desired_work_items = min(max(sm_count * 2, 1), desired_cap)
     target_groups_per_cta = min(
@@ -122,12 +120,8 @@ def balanced_target_q_per_cta(
         max(1, _ceil_div(total_groups_upper, desired_work_items)),
     )
     occupancy_target = target_groups_per_cta * shape.q_tokens_per_group
-    sink_balance_cap = max(
-        shape.q_tokens_per_group, shape.topk * _BLOCK_KV * 2
-    )
-    target = min(
-        max(occupancy_target, shape.q_tokens_per_group), sink_balance_cap
-    )
+    sink_balance_cap = max(shape.q_tokens_per_group, shape.topk * _BLOCK_KV * 2)
+    target = min(max(occupancy_target, shape.q_tokens_per_group), sink_balance_cap)
     return _ceil_div(target, shape.q_tokens_per_group) * shape.q_tokens_per_group
 
 
@@ -154,9 +148,7 @@ def analyze_reverse_schedule(
     _validate_cpu_q2k(shape, q2k)
     rows_per_batch = _ceil_div(shape.seqlen_kv, _BLOCK_KV)
     total_rows = shape.batch_size * rows_per_batch
-    row_counts = [
-        [0 for _ in range(total_rows)] for _ in range(shape.num_kv_heads)
-    ]
+    row_counts = [[0 for _ in range(total_rows)] for _ in range(shape.num_kv_heads)]
     for head in range(shape.num_kv_heads):
         for q_abs in range(shape.total_q):
             batch_idx = q_abs // shape.seqlen_q
@@ -176,9 +168,7 @@ def analyze_reverse_schedule(
         for row_linear, row_count in enumerate(head_counts):
             edge_count += row_count
             max_row_count = max(max_row_count, row_count)
-            packed_m128_groups += _ceil_div(
-                row_count, shape.q_tokens_per_group
-            )
+            packed_m128_groups += _ceil_div(row_count, shape.q_tokens_per_group)
             chunks = _ceil_div(row_count, target_q_per_cta)
             if chunks > 1:
                 split_row_count += 1
@@ -230,8 +220,7 @@ def build_reverse_schedule_inputs(
     _validate_cpu_q2k(shape, q2k)
     geometry = analyze_reverse_schedule(shape, sm_count=sm_count, q2k=q2k)
     rows: list[list[list[int]]] = [
-        [[] for _ in range(geometry.total_rows)]
-        for _ in range(shape.num_kv_heads)
+        [[] for _ in range(geometry.total_rows)] for _ in range(shape.num_kv_heads)
     ]
     rows_per_batch = _ceil_div(shape.seqlen_kv, _BLOCK_KV)
     for head in range(shape.num_kv_heads):
@@ -243,17 +232,14 @@ def build_reverse_schedule_inputs(
                 if 0 <= kv_block_idx < rows_per_batch:
                     row_linear = kv_block_idx * shape.batch_size + batch_idx
                     rows[head][row_linear].append(
-                        local_q
-                        | ((slot & _QSPLIT_SLOT_MASK) << _QSPLIT_SLOT_SHIFT)
+                        local_q | ((slot & _QSPLIT_SLOT_MASK) << _QSPLIT_SLOT_SHIFT)
                     )
 
     nnz_per_head = shape.total_q * shape.topk
     row_ptr = torch.zeros(
         (shape.num_kv_heads, geometry.total_rows + 1), dtype=torch.int32
     )
-    qsplit = torch.full(
-        (shape.num_kv_heads, nnz_per_head), -1, dtype=torch.int32
-    )
+    qsplit = torch.full((shape.num_kv_heads, nnz_per_head), -1, dtype=torch.int32)
     for head, head_rows in enumerate(rows):
         cursor = 0
         for row_linear, payload in enumerate(head_rows):
@@ -330,15 +316,11 @@ def _build_qagg_cohorts(
         -1,
         dtype=torch.int32,
     )
-    counts = torch.zeros(
-        (shape.total_q, shape.num_kv_heads), dtype=torch.int32
-    )
+    counts = torch.zeros((shape.total_q, shape.num_kv_heads), dtype=torch.int32)
     latest = torch.full_like(counts, -1)
     for work_idx, item in enumerate(geometry.work_items):
         row_begin = int(row_ptr[item.head_kv, item.row_linear]) + item.q_begin
-        payload = qsplit[
-            item.head_kv, row_begin : row_begin + item.q_count
-        ]
+        payload = qsplit[item.head_kv, row_begin : row_begin + item.q_count]
         if payload.numel() != item.q_count or bool(torch.any(payload < 0).item()):
             raise RuntimeError("reverse worklist does not cover its CSR payload")
         q_abs = (payload & _QSPLIT_Q_MASK) + item.batch_idx * shape.seqlen_q
@@ -390,16 +372,11 @@ def build_fp8_topk8_qagg_plan(
         )
     geometry, metadata = _batch_major_work_order(geometry, metadata)
     split_counts = (
-        (q2k_cpu >= 0)
-        .sum(dim=2, dtype=torch.int32)
-        .transpose(0, 1)
-        .contiguous()
+        (q2k_cpu >= 0).sum(dim=2, dtype=torch.int32).transpose(0, 1).contiguous()
     )
     if not bool(torch.all(split_counts == shape.topk).item()):
         raise RuntimeError("TopK8 qagg reducer requires eight live slots per row")
-    q_order, contributors = _build_qagg_cohorts(
-        shape, geometry, row_ptr, qsplit
-    )
+    q_order, contributors = _build_qagg_cohorts(shape, geometry, row_ptr, qsplit)
     return {
         "geometry": geometry,
         "scheduler_metadata": metadata,
@@ -440,9 +417,7 @@ def build_bf16_paged_topk4_plan(
     ]
     if not group_counts or min(group_counts) < 1 or max(group_counts) > 21:
         raise RuntimeError("paged TopK4 group counts must be in [1, 21]")
-    order = sorted(
-        range(len(group_counts)), key=group_counts.__getitem__, reverse=True
-    )
+    order = sorted(range(len(group_counts)), key=group_counts.__getitem__, reverse=True)
     metadata = torch.cat(
         (
             active.index_select(0, torch.tensor(order, dtype=torch.long)),
@@ -461,10 +436,7 @@ def build_bf16_paged_topk4_plan(
     if running + counts_by_group[1] != geometry.work_count:
         raise RuntimeError("paged TopK4 segment ends do not cover all work")
     split_counts = (
-        (q2k_cpu >= 0)
-        .sum(dim=2, dtype=torch.int32)
-        .transpose(0, 1)
-        .contiguous()
+        (q2k_cpu >= 0).sum(dim=2, dtype=torch.int32).transpose(0, 1).contiguous()
     )
     if not bool(torch.all(split_counts == shape.topk).item()):
         raise RuntimeError("paged TopK4 reducer requires four live slots per row")
@@ -515,10 +487,7 @@ def _cached_uploaded_plan(
         state.get("signature") == signature
         and isinstance(cached_owners, tuple)
         and len(cached_owners) == len(owners)
-        and all(
-            cached_owners[index] is tensor
-            for index, tensor in enumerate(owners)
-        )
+        and all(cached_owners[index] is tensor for index, tensor in enumerate(owners))
     )
 
 
@@ -570,9 +539,7 @@ def _prepare_uploaded_plan(
         return state
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(f"{route} plan must be prepared before CUDA graph capture")
-    q2k_cpu = q2k_indices.detach().to(
-        device="cpu", dtype=torch.int32
-    ).contiguous()
+    q2k_cpu = q2k_indices.detach().to(device="cpu", dtype=torch.int32).contiguous()
     built = build(q2k_cpu, sm_count=sm_count)
     state.clear()
     state.update(

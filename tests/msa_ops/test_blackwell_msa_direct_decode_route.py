@@ -32,50 +32,62 @@ def test_exact_non16_decode_routes_and_neighbors_fail_closed() -> None:
         q_dtype=torch.bfloat16,
         k_dtype=torch.bfloat16,
     )
-    assert _exact_non16_decode_variant(
-        **common,
-        batch_size=64,
-        total_q=512,
-        seqlen_q=8,
-        num_q_heads=64,
-        num_kv_heads=4,
-        topk=32,
-        k_outer_dim=32768,
-        max_pages=512,
-    ) == "decode_m16_bf16_paged_topk32"
-    assert _exact_non16_decode_variant(
-        **common,
-        batch_size=2,
-        total_q=2,
-        seqlen_q=1,
-        num_q_heads=8,
-        num_kv_heads=1,
-        topk=4,
-        k_outer_dim=6,
-        max_pages=3,
-    ) == "decode_m16_bf16_paged_topk4_exact512"
-    assert _exact_non16_decode_variant(
-        **common,
-        batch_size=64,
-        total_q=512,
-        seqlen_q=8,
-        num_q_heads=64,
-        num_kv_heads=4,
-        topk=32,
-        k_outer_dim=32767,
-        max_pages=512,
-    ) is None
-    assert _exact_non16_decode_variant(
-        **{**common, "capturing": True},
-        batch_size=2,
-        total_q=2,
-        seqlen_q=1,
-        num_q_heads=8,
-        num_kv_heads=1,
-        topk=4,
-        k_outer_dim=6,
-        max_pages=3,
-    ) is None
+    assert (
+        _exact_non16_decode_variant(
+            **common,
+            batch_size=64,
+            total_q=512,
+            seqlen_q=8,
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=32,
+            k_outer_dim=32768,
+            max_pages=512,
+        )
+        == "decode_m16_bf16_paged_topk32"
+    )
+    assert (
+        _exact_non16_decode_variant(
+            **common,
+            batch_size=2,
+            total_q=2,
+            seqlen_q=1,
+            num_q_heads=8,
+            num_kv_heads=1,
+            topk=4,
+            k_outer_dim=6,
+            max_pages=3,
+        )
+        == "decode_m16_bf16_paged_topk4_exact512"
+    )
+    assert (
+        _exact_non16_decode_variant(
+            **common,
+            batch_size=64,
+            total_q=512,
+            seqlen_q=8,
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=32,
+            k_outer_dim=32767,
+            max_pages=512,
+        )
+        is None
+    )
+    assert (
+        _exact_non16_decode_variant(
+            **{**common, "capturing": True},
+            batch_size=2,
+            total_q=2,
+            seqlen_q=1,
+            num_q_heads=8,
+            num_kv_heads=1,
+            topk=4,
+            k_outer_dim=6,
+            max_pages=3,
+        )
+        is None
+    )
 
 
 def test_exact_non16_prefill_routes_and_neighbors_fail_closed() -> None:
@@ -97,9 +109,7 @@ def test_exact_non16_prefill_routes_and_neighbors_fail_closed() -> None:
         capturing=False,
     )
     assert _is_exact_fp8_topk8_qagg_prefill(**qagg)
-    assert not _is_exact_fp8_topk8_qagg_prefill(
-        **{**qagg, "capturing": True}
-    )
+    assert not _is_exact_fp8_topk8_qagg_prefill(**{**qagg, "capturing": True})
     assert not _is_exact_fp8_topk8_qagg_prefill(
         **{
             **qagg,

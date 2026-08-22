@@ -697,9 +697,7 @@ def _is_exact_bf16_topk4_qload4_prefill(
         and batch_size == 3
         and q.dtype == k.dtype == v.dtype == torch.bfloat16
         and tuple(q.shape) == (12288, 8, _HEAD_DIM)
-        and tuple(k.shape)
-        == tuple(v.shape)
-        == (192, 2, _BLOCK_SIZE, _HEAD_DIM)
+        and tuple(k.shape) == tuple(v.shape) == (192, 2, _BLOCK_SIZE, _HEAD_DIM)
         and tuple(q2k_indices.shape) == (2, 12288, 4)
         and tuple(cu_q.shape) == tuple(cu_k.shape) == (4,)
         and tuple(page_table.shape) == (3, 64)
@@ -1530,9 +1528,7 @@ def _enqueue_exact_topk4_pair(
         reducer_grid,
         _outputs,
     ) = parts
-    producer_variant: BlackwellMSAVariant = (
-        "reverse_prefill_bf16_paged_topk4_qload4"
-    )
+    producer_variant: BlackwellMSAVariant = "reverse_prefill_bf16_paged_topk4_qload4"
     reducer_variant: BlackwellMSAVariant = (
         "reverse_prefill_bf16_paged_topk4_qload4_const4_reduce"
     )
@@ -1626,9 +1622,10 @@ def _run_exact_bf16_topk4_qload4_prefill(
                     reducer_grid,
                     tuple(_tensor_signature(tensor) for tensor in outputs),
                 )
-                if not isinstance(graph_state, dict) or graph_state.get(
-                    "signature"
-                ) != graph_signature:
+                if (
+                    not isinstance(graph_state, dict)
+                    or graph_state.get("signature") != graph_signature
+                ):
                     _enqueue_exact_topk4_pair(
                         target=target, parts=parts, stream_ptr=stream_ptr
                     )
@@ -1650,9 +1647,7 @@ def _run_exact_bf16_topk4_qload4_prefill(
                     }
                     state["graph_state"] = graph_state
                 graph_state["graph"].replay()
-            _record_successful_launch(
-                workspace, signature, capturing=capturing
-            )
+            _record_successful_launch(workspace, signature, capturing=capturing)
             return outputs
         except BaseException:
             state.clear()
@@ -2127,9 +2122,7 @@ def blackwell_msa_sparse_attention(
             requested_schedule=requested_prefill_schedule,
         )
         topk = int(q2k_indices.shape[2])
-        if topk != _ATTENTION_TOPK and not (
-            use_topk8_qagg or use_topk4_qload4
-        ):
+        if topk != _ATTENTION_TOPK and not (use_topk8_qagg or use_topk4_qload4):
             raise ValueError(
                 "non-TopK16 Blackwell MSA attention is restricted to exact routes"
             )
