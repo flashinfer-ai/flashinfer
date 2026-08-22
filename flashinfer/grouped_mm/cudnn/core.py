@@ -20,7 +20,11 @@ from typing import Optional
 
 import torch
 
-from ...gemm.gemm_base import _get_real_fp4_shape_from_packed_uint8
+from ...gemm.gemm_base import (
+    DEFAULT_WORKSPACE_SIZE,
+    _check_cudnn_plan_build_not_capturing,
+    _get_real_fp4_shape_from_packed_uint8,
+)
 from ...utils import _get_cache_buf
 
 # ---------------------------------------------------------------------------
@@ -209,6 +213,7 @@ def _build_cudnn_moe_grouped_gemm_graph(
         output_cudnn_dtype
     )
 
+    _check_cudnn_plan_build_not_capturing("grouped GEMM")
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -283,7 +288,9 @@ def _run_cudnn_moe_grouped_gemm(
     if alpha is not None:
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
-    workspace = _get_cache_buf("grouped_mm_workspace", ws, a.device)
+    workspace = _get_cache_buf(
+        "grouped_mm_workspace", max(ws, DEFAULT_WORKSPACE_SIZE), a.device
+    )
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
@@ -407,6 +414,7 @@ def _build_cudnn_moe_block_scale_grouped_gemm_graph(
         output_cudnn_dtype
     )
 
+    _check_cudnn_plan_build_not_capturing("grouped GEMM")
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -494,7 +502,9 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
     if alpha is not None:
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
-    workspace = _get_cache_buf("grouped_mm_mxfp8_workspace", ws, a.device)
+    workspace = _get_cache_buf(
+        "grouped_mm_mxfp8_workspace", max(ws, DEFAULT_WORKSPACE_SIZE), a.device
+    )
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
@@ -599,7 +609,9 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
     if alpha is not None:
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
-    workspace = _get_cache_buf("grouped_mm_fp4_workspace", ws, a.device)
+    workspace = _get_cache_buf(
+        "grouped_mm_fp4_workspace", max(ws, DEFAULT_WORKSPACE_SIZE), a.device
+    )
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:

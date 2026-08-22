@@ -20,7 +20,7 @@ import functools
 import math
 from enum import Enum
 from functools import lru_cache
-from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.version
@@ -225,6 +225,13 @@ SINGLE_KERNEL_TMP_SIZE = 32 * 1024 * 1024
 
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 
+# Buffers displaced by a growing _get_cache_buf request.  A cached buffer that has
+# already been handed out may have had its device address captured into a CUDA
+# graph, so dropping the last reference here would let the caching allocator reuse
+# that block while those graphs still write through it.  Retiring instead of
+# freeing costs at most one stale buffer per growth event and per name.
+_cache_buf_retired: List[torch.Tensor] = []
+
 
 def _get_cache_buf(
     name: str, bytes: int, device: torch.device, zero_init: bool = False
@@ -232,6 +239,8 @@ def _get_cache_buf(
     key = (name, device)
     buf = _cache_buf.get(key)
     if buf is None or buf.size(0) < bytes:
+        if buf is not None:
+            _cache_buf_retired.append(buf)
         if zero_init:
             buf = torch.zeros(bytes, dtype=torch.uint8, device=device)
         else:
