@@ -84,7 +84,12 @@ _DIRECT_MICRO_MAX_N = 512
 # Test/bench hook: force one backend ("direct_micro", "micro", "static",
 # "dynamic"). Deliberately module-level (a monkeypatch target), not an env var.
 _FORCED_BACKEND: str | None = None
-_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 640
+# Static-vs-dynamic cutover for the compact NVFP4 MoE, in routed pairs.
+# Re-tuned on RTX 5090 after the gate+up FC1 fusion (single A load, one
+# pipeline): static wins <= 256 pairs, ties at 512, and dynamic leads from
+# 544 pairs onward. Keep static for the sparse decode band, hand the rest
+# to the queue-driven dynamic kernel.
+_STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT = 512
 _STATIC_COMPACT_CUTOVER_PAIRS = _STATIC_COMPACT_CUTOVER_PAIRS_DEFAULT
 _STATIC_COMPACT_CUTOVER_PAIRS_CACHE: Dict[str, int] = {}
 
