@@ -27,20 +27,19 @@ namespace flash_kda {
 static_assert(THREADS == 512);
 static_assert(SMEM_TOTAL == FLASHINFER_BT16_CHAIN_SMEM_BYTES);
 
-void RunBt16Chain(
-    TensorView ws_qd, TensorView ws_kd, TensorView ws_w, TensorView ws_qk, TensorView ws_diag,
-    TensorView v, TensorView cu_seqlens, TensorView cu_chunks,
-    TensorView seq_order, TensorView initial_state, TensorView out, TensorView final_state,
-    TensorView descriptor_storage, int64_t prepare_descriptors, int64_t num_heads,
-    int64_t use_initial_state, int64_t store_final_state, double scale, int64_t grid_x,
-    int64_t cuda_stream) {
+void RunBt16Chain(TensorView ws_qd, TensorView ws_kd, TensorView ws_w, TensorView ws_qk,
+                  TensorView ws_diag, TensorView v, TensorView cu_seqlens, TensorView cu_chunks,
+                  TensorView seq_order, TensorView initial_state, TensorView out,
+                  TensorView final_state, TensorView descriptor_storage,
+                  int64_t prepare_descriptors, int64_t num_heads, int64_t use_initial_state,
+                  int64_t store_final_state, double scale, int64_t grid_x, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   const int32_t device_id = v.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  const int64_t num_seqs = CheckBt16ChainInputs(
-      ws_qd, ws_kd, ws_w, ws_qk, ws_diag, v, cu_seqlens, cu_chunks, seq_order, initial_state,
-      out, final_state, descriptor_storage, prepare_descriptors, num_heads, use_initial_state,
-      store_final_state, scale);
+  const int64_t num_seqs =
+      CheckBt16ChainInputs(ws_qd, ws_kd, ws_w, ws_qk, ws_diag, v, cu_seqlens, cu_chunks, seq_order,
+                           initial_state, out, final_state, descriptor_storage, prepare_descriptors,
+                           num_heads, use_initial_state, store_final_state, scale);
 
   constexpr int32_t kSmemBytes = FLASHINFER_BT16_CHAIN_SMEM_BYTES;
   CheckDynamicSmemCapacity(device_id, kSmemBytes);
@@ -52,9 +51,8 @@ void RunBt16Chain(
   TVM_FFI_ICHECK(grid_x == expected_grid_x && grid_x <= std::numeric_limits<uint32_t>::max())
       << "BT16 chain grid_x must equal 2 * N * H (" << expected_grid_x << "), got " << grid_x;
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  const Bt16ChainTmaPointers tma =
-      EncodeBt16ChainTma(ws_qd, ws_kd, ws_w, ws_qk, ws_diag, v, out, descriptor_storage,
-                         prepare_descriptors, stream);
+  const Bt16ChainTmaPointers tma = EncodeBt16ChainTma(
+      ws_qd, ws_kd, ws_w, ws_qk, ws_diag, v, out, descriptor_storage, prepare_descriptors, stream);
   const dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
   const dim3 block(THREADS, 1, 1);
   FLASHINFER_BT16_CHAIN_KERNEL<<<grid, block, kSmemBytes, stream>>>(

@@ -493,10 +493,7 @@ def _bt16_chunks_per_prepare_cta(*, num_heads: int, total_chunks: int) -> int:
         if total_chunks <= _FLASH_KDA_BT16_H12_CPC1_MAX_TOTAL_CHUNKS:
             return 1
         return _FLASH_KDA_BT16_H12_CHUNKS_PER_PREP_CTA
-    if (
-        num_heads * total_chunks
-        >= _FLASH_KDA_BT16_GENERAL_HIGH_WORK_MIN_CHUNK_HEADS
-    ):
+    if num_heads * total_chunks >= _FLASH_KDA_BT16_GENERAL_HIGH_WORK_MIN_CHUNK_HEADS:
         return _FLASH_KDA_BT16_GENERAL_HIGH_WORK_CHUNKS_PER_PREP_CTA
     return _FLASH_KDA_BT16_GENERAL_LOW_WORK_CHUNKS_PER_PREP_CTA
 
@@ -552,17 +549,11 @@ def _should_use_bt16_prepare_chain(
             _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks + sm_count - 1
         ) // sm_count
         if chain_waves <= 1:
-            min_sequence_length = (
-                _FLASH_KDA_BT16_N16_ONE_CHAIN_WAVE_MIN_SEQUENCE_LENGTH
-            )
+            min_sequence_length = _FLASH_KDA_BT16_N16_ONE_CHAIN_WAVE_MIN_SEQUENCE_LENGTH
         elif chain_waves == 2:
-            min_sequence_length = (
-                _FLASH_KDA_BT16_N16_TWO_CHAIN_WAVE_MIN_SEQUENCE_LENGTH
-            )
+            min_sequence_length = _FLASH_KDA_BT16_N16_TWO_CHAIN_WAVE_MIN_SEQUENCE_LENGTH
         else:
-            min_sequence_length = (
-                _FLASH_KDA_BT16_N16_MULTI_WAVE_MIN_SEQUENCE_LENGTH
-            )
+            min_sequence_length = _FLASH_KDA_BT16_N16_MULTI_WAVE_MIN_SEQUENCE_LENGTH
         max_tasks = _FLASH_KDA_BT16_N16_MAX_DIRECT_WAVES * sm_count
     elif total_tasks <= _FLASH_KDA_SMALL_BH_MAX_TASKS:
         min_sequence_length = _FLASH_KDA_BT16_LONG_MIN_SEQUENCE_LENGTH
@@ -574,10 +565,7 @@ def _should_use_bt16_prepare_chain(
         compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
         and 0 < total_tasks <= max_tasks
         and max_sequence_length >= min_sequence_length
-        and (
-            n16_alternative
-            or _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks <= sm_count
-        )
+        and (n16_alternative or _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks <= sm_count)
     )
 
 
@@ -687,7 +675,7 @@ def _select_bt16_physical_variants(
     num_sequences: int,
     num_heads: int,
     max_sequence_length: int,
-) -> tuple[str, str, bool]:
+) -> tuple["FlashKDAVariant", "FlashKDAVariant", bool]:
     dense_wavefront = _should_use_bt16_dense_wavefront(
         compute_capability=compute_capability,
         sm_count=sm_count,
@@ -696,13 +684,17 @@ def _select_bt16_physical_variants(
         num_heads=num_heads,
         max_sequence_length=max_sequence_length,
     )
-    prepare_variant = (
+    prepare_variant: Literal["bt16_prepare", "bt16_prepare_beta_tma"] = (
         "bt16_prepare_beta_tma"
-        if dense_wavefront
-        and num_heads % _FLASH_KDA_BETA_TMA_HEADS_PER_BOX == 0
+        if dense_wavefront and num_heads % _FLASH_KDA_BETA_TMA_HEADS_PER_BOX == 0
         else "bt16_prepare"
     )
     total_tasks = num_sequences * num_heads
+    chain_variant: Literal[
+        "bt16_chain_m64_s7",
+        "bt16_chain_m64_s8",
+        "bt16_chain_m64_s9",
+    ]
     if _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks > sm_count:
         chain_variant = "bt16_chain_m64_s7"
     elif total_tasks <= 8:
@@ -1292,12 +1284,7 @@ def _bt16_workspace(
         numel=factor_numel,
         capture_error="BT16 w workspace is not large enough for capture",
     ).view_as(qd)
-    qk_numel = (
-        num_heads
-        * total_chunks
-        * _FLASH_KDA_BT16_CHUNK
-        * _FLASH_KDA_BT16_CHUNK
-    )
+    qk_numel = num_heads * total_chunks * _FLASH_KDA_BT16_CHUNK * _FLASH_KDA_BT16_CHUNK
     qk = _workspace_buffer(
         workspace=workspace,
         attribute="_bt16_qk",
@@ -1323,9 +1310,7 @@ def _bt16_workspace(
     chunks_per_cta = _bt16_chunks_per_prepare_cta(
         num_heads=num_heads, total_chunks=total_chunks
     )
-    prepare_ctas = (
-        (total_chunks + chunks_per_cta - 1) // chunks_per_cta
-    ) * num_heads
+    prepare_ctas = ((total_chunks + chunks_per_cta - 1) // chunks_per_cta) * num_heads
     prepare_ctas = _wave_quantized_bt16_prepare_ctas(
         rectangular_ctas=prepare_ctas,
         num_heads=num_heads,
@@ -1612,7 +1597,7 @@ def _run_bt16_prepare_chain(
         prepare_variant: prepare_signature,
         chain_variant: chain_signature,
     }
-    prepare_flags: dict[str, int] = {}
+    prepare_flags: dict["FlashKDAVariant", int] = {}
     for variant, signature in signatures.items():
         warmed_signature = workspace._descriptor_signatures.get(variant)
         if capturing and warmed_signature != signature:
@@ -1797,9 +1782,7 @@ def _run_flash_kda_prefill(
         )
     max_sequence_length = max(sequence_lengths)
     route = (
-        _direct_m128_route(
-            num_heads=num_heads, max_sequence_length=max_sequence_length
-        )
+        _direct_m128_route(num_heads=num_heads, max_sequence_length=max_sequence_length)
         if needs_direct_m128
         else _select_flash_kda_bf16_route(
             compute_capability=compute_capability,
@@ -1819,6 +1802,14 @@ def _run_flash_kda_prefill(
         _FLASH_KDA_ROUTE_SMALL_BH_M128,
     ):
         persistent_plan = None
+    variant: Literal[
+        "bt16",
+        "m64",
+        "m128",
+        "m128_n16",
+        "persistent_m128",
+        "small_bh_m128",
+    ]
     if use_bt16:
         variant = "bt16"
     elif route == _FLASH_KDA_ROUTE_M64:

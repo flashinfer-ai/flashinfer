@@ -1,3 +1,4 @@
+// clang-format off
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -1310,4 +1311,3 @@ kernel_flashkda_bf16_bt16_chain_m64(__nv_bfloat16* __restrict__ ws_qd, CakeTenso
 }
 
 } // extern "C"
-
