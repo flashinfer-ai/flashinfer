@@ -180,6 +180,7 @@ def test_long_row_dispatch_is_exact(
         ("sm_100a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head"),
         ("sm_103a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head_h32"),
         ("sm_100a", (128,), torch.bfloat16, (1, 1, 1), "cp_prefill_bf16"),
+        ("sm_103a", (384,), torch.float16, (2, 2, 8), "cp_prefill_generic"),
         ("sm_100a", (65,), torch.bfloat16, (1, 1, 2), "cp_prefill_generic_bf16"),
         ("sm_100a", (128, 129), torch.float16, (4, 2, 2), "cp_prefill_generic"),
     ],
@@ -753,6 +754,64 @@ def test_read_seq_lens_uses_adjacent_offsets(dtype: torch.dtype) -> None:
     cu_seqlens = torch.tensor([0, 2, 5], dtype=dtype)
 
     assert cake._read_seq_lens(cu_seqlens, total_tokens=5, expected=(2, 3)) == (2, 3)
+
+
+@pytest.mark.skipif(
+    not _CAKE_SM100_CUDA13_AVAILABLE,
+    reason="requires an SM100a or SM103a GPU with CUDA 13+",
+)
+def test_odd_cp_chunk_uses_generic_kernel_and_matches_cute() -> None:
+    from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
+        cp_delta_rule_dsl_sm100,
+    )
+
+    torch.manual_seed(4278)
+    total, hq, hv, dim = 384, 2, 8, 128
+    q = torch.randn((total, hq, dim), dtype=torch.float16, device="cuda")
+    k = torch.nn.functional.normalize(
+        torch.randn((total, hq, dim), dtype=torch.float32, device="cuda"),
+        p=2.0,
+        dim=-1,
+    ).to(torch.float16)
+    v = torch.randn((total, hv, dim), dtype=torch.float16, device="cuda")
+    alpha = 1.0 - torch.rand((total, hv), dtype=torch.float32, device="cuda") / total
+    beta = torch.rand((total, hv), dtype=torch.float32, device="cuda").sigmoid()
+    cu_seqlens = torch.tensor([0, total], dtype=torch.int64, device="cuda")
+    expected_output = torch.empty((total, hv, dim), dtype=q.dtype, device="cuda")
+    expected_state = torch.empty((1, hv, dim, dim), dtype=torch.float32, device="cuda")
+    cp_delta_rule_dsl_sm100(
+        expected_output,
+        expected_state,
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        cu_seqlens,
+        dim**-0.5,
+        max_seqlen=total,
+        cp_chunk_len=192,
+    )
+
+    output_state = torch.empty_like(expected_state)
+    prepared = cake.prepare_cake_gdn_cp_prefill(
+        q,
+        k,
+        v,
+        alpha,
+        beta,
+        cu_seqlens,
+        None,
+        seq_lens=(total,),
+        output_state=output_state,
+    )
+    assert prepared.plan.cp_chunk_len == 192
+    assert prepared.plan.prefill_kernel == "cp_prefill_generic"
+    output, final_state = prepared.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(output, expected_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(final_state, expected_state, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.skipif(
