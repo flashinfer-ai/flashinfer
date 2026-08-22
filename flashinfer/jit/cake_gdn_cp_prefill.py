@@ -20,6 +20,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -57,6 +58,34 @@ def _source_dir() -> Path:
         "frozen CAKE GDN CP-prefill sources were not found; checked "
         f"{installed} and {checkout}"
     )
+
+
+@functools.cache
+def cake_gdn_cp_nvcc_version() -> tuple[int, int]:
+    """Return the version of the nvcc executable used by the Cake JIT."""
+
+    nvcc = Path(get_cuda_path()) / "bin" / "nvcc"
+    if not nvcc.is_file():
+        raise RuntimeError(f"nvcc was not found at {nvcc}")
+    result = subprocess.run(
+        [str(nvcc), "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"failed to query the Cake GDN CP-prefill nvcc at {nvcc}:\n"
+            f"{result.stdout}"
+        )
+    match = re.search(r"\brelease\s+(\d+)\.(\d+)\b", result.stdout)
+    if match is None:
+        raise RuntimeError(
+            f"could not parse the Cake GDN CP-prefill nvcc version at {nvcc}:\n"
+            f"{result.stdout}"
+        )
+    return int(match.group(1)), int(match.group(2))
 
 
 @functools.cache
@@ -207,4 +236,8 @@ def load_cake_gdn_cp_kernel(name: str, arch: CakeGDNCPArch):
     return module[host["entry"]]
 
 
-__all__ = ["CakeGDNCPArch", "load_cake_gdn_cp_kernel"]
+__all__ = [
+    "CakeGDNCPArch",
+    "cake_gdn_cp_nvcc_version",
+    "load_cake_gdn_cp_kernel",
+]

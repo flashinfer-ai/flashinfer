@@ -29,12 +29,21 @@ from flashinfer.jit import cake_gdn_cp_prefill as cake_jit
 from flashinfer.utils import is_sm100a_supported
 
 
-_CAKE_SM100_CUDA13_AVAILABLE = (
-    torch.cuda.is_available()
-    and is_sm100a_supported(torch.device("cuda"))
-    and torch.version.cuda is not None
-    and int(torch.version.cuda.split(".")[0]) >= 13
-)
+def _cake_sm100_toolchain_available() -> bool:
+    if not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")):
+        return False
+    minimum = {(10, 0): (12, 8), (10, 3): (12, 9)}.get(
+        torch.cuda.get_device_capability()
+    )
+    if minimum is None or gdn_prefill._cake_gdn_cp_nvcc_version is None:
+        return False
+    try:
+        return gdn_prefill._cake_gdn_cp_nvcc_version() >= minimum
+    except RuntimeError:
+        return False
+
+
+_CAKE_SM100_AVAILABLE = _cake_sm100_toolchain_available()
 
 
 def _source_root() -> Path:
@@ -645,6 +654,7 @@ def test_public_dispatch_preserves_auto_and_explicit_cp_routes(
         lambda *_args, **_kwargs: heuristic_matches,
     )
     monkeypatch.setattr(gdn_prefill.torch.version, "cuda", "13.0")
+    monkeypatch.setattr(gdn_prefill, "_cake_gdn_cp_nvcc_version", lambda: (13, 0))
     monkeypatch.setattr(
         gdn_prefill,
         "_chunk_gated_delta_rule_cake_sm100",
@@ -671,6 +681,79 @@ def test_public_dispatch_preserves_auto_and_explicit_cp_routes(
 
 
 @pytest.mark.parametrize(
+    ("capability", "torch_cuda", "nvcc_version", "expected_error"),
+    [
+        ((10, 0), "12.0", (12, 8), None),
+        ((10, 0), "13.0", (12, 7), "requires nvcc 12.8"),
+        ((10, 3), "12.9", (12, 9), None),
+        ((10, 3), "13.0", (12, 8), "requires nvcc 12.9"),
+    ],
+)
+def test_public_dispatch_gates_cake_with_its_jit_nvcc(
+    monkeypatch: pytest.MonkeyPatch,
+    capability: tuple[int, int],
+    torch_cuda: str,
+    nvcc_version: tuple[int, int],
+    expected_error: str | None,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _device: 148)
+    monkeypatch.setattr(
+        gdn_prefill, "get_compute_capability", lambda _device: capability
+    )
+    monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _device: "Blackwell")
+    monkeypatch.setattr(gdn_prefill.torch.version, "cuda", torch_cuda)
+    monkeypatch.setattr(
+        gdn_prefill, "_cake_gdn_cp_nvcc_version", lambda: nvcc_version
+    )
+    monkeypatch.setattr(
+        gdn_prefill,
+        "_chunk_gated_delta_rule_cake_sm100",
+        lambda *_args, **_kwargs: calls.append("cake"),
+    )
+
+    q = torch.zeros((2, 1, 128), dtype=torch.float16)
+    kwargs = dict(
+        cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+        use_cp=True,
+    )
+    if expected_error is not None:
+        with pytest.raises(ValueError, match=expected_error):
+            gdn_prefill.chunk_gated_delta_rule(q, q, q, **kwargs)
+        assert calls == []
+        return
+
+    output = gdn_prefill.chunk_gated_delta_rule(q, q, q, **kwargs)
+    assert output.shape == q.shape
+    assert calls == ["cake"]
+
+
+def test_public_dispatch_preserves_cute_cp_cuda13_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _device: 148)
+    monkeypatch.setattr(gdn_prefill, "get_compute_capability", lambda _device: (10, 3))
+    monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _device: "NVIDIA GB300")
+    monkeypatch.setattr(gdn_prefill.torch.version, "cuda", "12.9")
+    monkeypatch.setattr(gdn_prefill, "_cake_gdn_cp_nvcc_version", lambda: (12, 9))
+    monkeypatch.setattr(
+        gdn_prefill, "cp_delta_rule_dsl_sm100", lambda *_args, **_kwargs: None
+    )
+
+    q = torch.zeros((2, 1, 128), dtype=torch.float16)
+    fp8_state = torch.empty((1, 1, 128, 128), dtype=torch.float8_e4m3fn)
+    with pytest.raises(ValueError, match="DSL kernel requires CUDA 13"):
+        gdn_prefill.chunk_gated_delta_rule(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            initial_state=fp8_state,
+            use_cp=True,
+        )
+
+
+@pytest.mark.parametrize(
     ("extension", "expected_route"),
     [
         ("checkpoint", "cake"),
@@ -689,6 +772,7 @@ def test_public_dispatch_preserves_upstream_sm100_cp_extensions(
     monkeypatch.setattr(gdn_prefill, "get_compute_capability", lambda _device: (10, 0))
     monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _device: "NVIDIA B200")
     monkeypatch.setattr(gdn_prefill.torch.version, "cuda", "13.0")
+    monkeypatch.setattr(gdn_prefill, "_cake_gdn_cp_nvcc_version", lambda: (13, 0))
     monkeypatch.setattr(
         gdn_prefill,
         "_chunk_gated_delta_rule_cake_sm100",
@@ -736,6 +820,7 @@ def test_public_dispatch_fails_closed_when_cake_is_unavailable(
     monkeypatch.setattr(gdn_prefill, "get_compute_capability", lambda _device: (10, 0))
     monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _device: "NVIDIA B200")
     monkeypatch.setattr(gdn_prefill.torch.version, "cuda", "13.0")
+    monkeypatch.setattr(gdn_prefill, "_cake_gdn_cp_nvcc_version", lambda: (13, 0))
     monkeypatch.setattr(gdn_prefill, "_chunk_gated_delta_rule_cake_sm100", None)
 
     q = torch.zeros((2, 1, 128), dtype=torch.float16)
@@ -757,8 +842,8 @@ def test_read_seq_lens_uses_adjacent_offsets(dtype: torch.dtype) -> None:
 
 
 @pytest.mark.skipif(
-    not _CAKE_SM100_CUDA13_AVAILABLE,
-    reason="requires an SM100a or SM103a GPU with CUDA 13+",
+    not _CAKE_SM100_AVAILABLE,
+    reason="requires an SM100a or SM103a GPU with a supported Cake nvcc toolchain",
 )
 def test_odd_cp_chunk_uses_generic_kernel_and_matches_cute() -> None:
     from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
@@ -815,8 +900,8 @@ def test_odd_cp_chunk_uses_generic_kernel_and_matches_cute() -> None:
 
 
 @pytest.mark.skipif(
-    not _CAKE_SM100_CUDA13_AVAILABLE,
-    reason="requires an SM100a or SM103a GPU with CUDA 13+",
+    not _CAKE_SM100_AVAILABLE,
+    reason="requires an SM100a or SM103a GPU with a supported Cake nvcc toolchain",
 )
 @pytest.mark.parametrize(
     ("total", "hq", "hv"),
@@ -894,8 +979,8 @@ def test_frozen_graph_matches_pr4078_and_preserves_inputs(
 
 
 @pytest.mark.skipif(
-    not _CAKE_SM100_CUDA13_AVAILABLE,
-    reason="requires an SM100a or SM103a GPU with CUDA 13+",
+    not _CAKE_SM100_AVAILABLE,
+    reason="requires an SM100a or SM103a GPU with a supported Cake nvcc toolchain",
 )
 def test_public_checkpoint_matches_cute_on_caller_stream_and_cuda_graph(
     monkeypatch: pytest.MonkeyPatch,
@@ -1052,8 +1137,8 @@ def _allocate_state_pool(
 
 
 @pytest.mark.skipif(
-    not _CAKE_SM100_CUDA13_AVAILABLE,
-    reason="requires an SM100a or SM103a GPU with CUDA 13+",
+    not _CAKE_SM100_AVAILABLE,
+    reason="requires an SM100a or SM103a GPU with a supported Cake nvcc toolchain",
 )
 @pytest.mark.parametrize(
     "case",
@@ -1272,8 +1357,8 @@ def test_generic_backend_matches_pr4078_state_and_lifecycle(
 
 
 @pytest.mark.skipif(
-    not _CAKE_SM100_CUDA13_AVAILABLE,
-    reason="requires an SM100a or SM103a GPU with CUDA 13+",
+    not _CAKE_SM100_AVAILABLE,
+    reason="requires an SM100a or SM103a GPU with a supported Cake nvcc toolchain",
 )
 def test_public_dispatcher_uses_only_cake_for_indexed_inplace_gqa(
     monkeypatch: pytest.MonkeyPatch,

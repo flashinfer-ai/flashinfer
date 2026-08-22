@@ -35,7 +35,11 @@ from typing import Sequence
 import torch
 import tvm_ffi
 
-from ...jit.cake_gdn_cp_prefill import CakeGDNCPArch, load_cake_gdn_cp_kernel
+from ...jit.cake_gdn_cp_prefill import (
+    CakeGDNCPArch,
+    cake_gdn_cp_nvcc_version as _cake_gdn_cp_nvcc_version,
+    load_cake_gdn_cp_kernel,
+)
 
 _BLOCK = 64
 _HEAD_DIM = 128
@@ -236,6 +240,9 @@ def _build_plan(
     ):
         t_kernel = "t_precompute_gb300_hv48_min6"
     max_seqlen = max(seq_lens)
+    # The specialized prefill schedules compile out the padded second member
+    # of each 64-token block pair.  A sequence tail or the selected CP chunk
+    # can independently require that padding, so either one selects generic.
     generic_tail = cp_chunk_len % (2 * _BLOCK) != 0 or any(
         length % (2 * _BLOCK) != 0 for length in seq_lens
     )
