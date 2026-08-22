@@ -73,8 +73,10 @@ def test_tma_parameters_are_passed_by_grid_constant_value() -> None:
         source = (
             _CSRC_DIR / entry["target"] / f"blackwell_msa_{source_unit}.cu"
         ).read_text()
-        tma_free = source_unit == "topk" or source_unit.startswith(
-            "long_prefill_reduce_"
+        tma_free = (
+            source_unit == "topk"
+            or source_unit.startswith("long_prefill_reduce_")
+            or source_unit.endswith("_reduce")
         )
         if tma_free:
             assert not tma_parameter.search(source)
