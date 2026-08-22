@@ -415,6 +415,16 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                                                         gamma_cg0 = 0.0f;
                                                     }
                                                 }
+                                                if (block_cg0 >= num_valid_blocks - 1) {
+                                                    int final_t_threshold_cg0 = valid_tokens_cg0 - 33;
+                                                    if (final_t_threshold_cg0 < 0) {
+                                                        final_t_threshold_cg0 = 0;
+                                                    }
+                                                    if (t_row_cg0 != t_col_cg0 && t_row_cg0 < final_t_threshold_cg0) {
+                                                        t_valid_cg0 = 0;
+                                                        gamma_cg0 = 0.0f;
+                                                    }
+                                                }
                                                 if (t_valid_cg0 != 0) {
                                                     float _exp2_15 = approx_exp2(t_col_logs_cg0[t_col_log_item_cg0] - t_row_logs_cg0[t_row_log_group_cg0]);
                                                     gamma_cg0 = _exp2_15;
@@ -425,6 +435,16 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                                                 qk_valid_cg0 = ((t_row_cg0 >= t_col_cg0) ? 1 : 0);
                                                 if (block_cg0 >= num_valid_blocks - 1) {
                                                     if (t_row_cg0 >= valid_tokens_cg0 || t_col_cg0 >= valid_tokens_cg0) {
+                                                        qk_valid_cg0 = 0;
+                                                        qk_scale_cg0 = 0.0f;
+                                                    }
+                                                }
+                                                if (block_cg0 >= num_valid_blocks - 1) {
+                                                    int final_qk_threshold_cg0 = valid_tokens_cg0 - 33;
+                                                    if (final_qk_threshold_cg0 < 0) {
+                                                        final_qk_threshold_cg0 = 0;
+                                                    }
+                                                    if (t_row_cg0 != t_col_cg0 && t_col_cg0 < final_qk_threshold_cg0) {
                                                         qk_valid_cg0 = 0;
                                                         qk_scale_cg0 = 0.0f;
                                                     }
@@ -612,7 +632,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                 unsigned int state_input_stage_cg1 = 0;
                 unsigned int state_input_empty_phase_cg1 = 1;
                 #pragma unroll 1
-                for (int __2 = 0; __2 < num_padded_blocks_1; __2++) {
+                for (int block_cg1 = 0; block_cg1 < num_padded_blocks_1; block_cg1++) {
                     mbarrier_wait(load_gate_full_addr + (gate_stage_cg1) * 8, gate_phase_cg1);
                     int gate_base_cg1 = gate_stage_cg1 * 64;
                     mbarrier_wait(kv_acc_full_addr + (kv_stage_cg1) * 8, kv_full_phase_cg1);
@@ -756,12 +776,17 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                     #pragma unroll
                     for (int vks_pair_cg1 = 0; vks_pair_cg1 < 16; vks_pair_cg1++) {
                         {
-                            uint32_t _bf16x2_sub_0;
-                            asm volatile("sub.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_sub_0) : "r"(v_frag_lo_cg1[vks_pair_cg1]), "r"(ks_frag_lo_cg1_f16[vks_pair_cg1]));
-                            vks_bits_lo_cg1[vks_pair_cg1] = _bf16x2_sub_0;
-                            uint32_t _bf16x2_sub_1;
-                            asm volatile("sub.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_sub_1) : "r"(v_frag_hi_cg1[vks_pair_cg1]), "r"(ks_frag_hi_cg1_f16[vks_pair_cg1]));
-                            vks_bits_hi_cg1[vks_pair_cg1] = _bf16x2_sub_1;
+                            if (block_cg1 >= num_valid_blocks_1 - 1) {
+                                vks_bits_lo_cg1[vks_pair_cg1] = v_frag_lo_cg1[vks_pair_cg1];
+                                vks_bits_hi_cg1[vks_pair_cg1] = v_frag_hi_cg1[vks_pair_cg1];
+                            } else {
+                                uint32_t _bf16x2_sub_0;
+                                asm volatile("sub.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_sub_0) : "r"(v_frag_lo_cg1[vks_pair_cg1]), "r"(ks_frag_lo_cg1_f16[vks_pair_cg1]));
+                                vks_bits_lo_cg1[vks_pair_cg1] = _bf16x2_sub_0;
+                                uint32_t _bf16x2_sub_1;
+                                asm volatile("sub.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_sub_1) : "r"(v_frag_hi_cg1[vks_pair_cg1]), "r"(ks_frag_hi_cg1_f16[vks_pair_cg1]));
+                                vks_bits_hi_cg1[vks_pair_cg1] = _bf16x2_sub_1;
+                            }
                         }
                     }
                     asm volatile(
@@ -787,6 +812,40 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                             for (int _ls = 0; _ls < 16; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(qs_frag_early_cg1)[_ls], _scale2_3);
                         }
+                        if (block_cg1 >= num_valid_blocks_1 - 1) {
+                            qs_frag_early_cg1[0] = 0.0f;
+                            qs_frag_early_cg1[1] = 0.0f;
+                            qs_frag_early_cg1[2] = 0.0f;
+                            qs_frag_early_cg1[3] = 0.0f;
+                            qs_frag_early_cg1[4] = 0.0f;
+                            qs_frag_early_cg1[5] = 0.0f;
+                            qs_frag_early_cg1[6] = 0.0f;
+                            qs_frag_early_cg1[7] = 0.0f;
+                            qs_frag_early_cg1[8] = 0.0f;
+                            qs_frag_early_cg1[9] = 0.0f;
+                            qs_frag_early_cg1[10] = 0.0f;
+                            qs_frag_early_cg1[11] = 0.0f;
+                            qs_frag_early_cg1[12] = 0.0f;
+                            qs_frag_early_cg1[13] = 0.0f;
+                            qs_frag_early_cg1[14] = 0.0f;
+                            qs_frag_early_cg1[15] = 0.0f;
+                            qs_frag_early_cg1[16] = 0.0f;
+                            qs_frag_early_cg1[17] = 0.0f;
+                            qs_frag_early_cg1[18] = 0.0f;
+                            qs_frag_early_cg1[19] = 0.0f;
+                            qs_frag_early_cg1[20] = 0.0f;
+                            qs_frag_early_cg1[21] = 0.0f;
+                            qs_frag_early_cg1[22] = 0.0f;
+                            qs_frag_early_cg1[23] = 0.0f;
+                            qs_frag_early_cg1[24] = 0.0f;
+                            qs_frag_early_cg1[25] = 0.0f;
+                            qs_frag_early_cg1[26] = 0.0f;
+                            qs_frag_early_cg1[27] = 0.0f;
+                            qs_frag_early_cg1[28] = 0.0f;
+                            qs_frag_early_cg1[29] = 0.0f;
+                            qs_frag_early_cg1[30] = 0.0f;
+                            qs_frag_early_cg1[31] = 0.0f;
+                        }
                         asm volatile(
                             "tcgen05.st.sync.aligned.16x256b.x8.b32"
                             " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32};"
@@ -809,6 +868,40 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                             #pragma unroll
                             for (int _ls = 0; _ls < 16; _ls++)
                                 mul_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_1)[_ls], _scale2_4);
+                        }
+                        if (block_cg1 >= num_valid_blocks_1 - 1) {
+                            _tmem_load_1[0] = 0.0f;
+                            _tmem_load_1[1] = 0.0f;
+                            _tmem_load_1[2] = 0.0f;
+                            _tmem_load_1[3] = 0.0f;
+                            _tmem_load_1[4] = 0.0f;
+                            _tmem_load_1[5] = 0.0f;
+                            _tmem_load_1[6] = 0.0f;
+                            _tmem_load_1[7] = 0.0f;
+                            _tmem_load_1[8] = 0.0f;
+                            _tmem_load_1[9] = 0.0f;
+                            _tmem_load_1[10] = 0.0f;
+                            _tmem_load_1[11] = 0.0f;
+                            _tmem_load_1[12] = 0.0f;
+                            _tmem_load_1[13] = 0.0f;
+                            _tmem_load_1[14] = 0.0f;
+                            _tmem_load_1[15] = 0.0f;
+                            _tmem_load_1[16] = 0.0f;
+                            _tmem_load_1[17] = 0.0f;
+                            _tmem_load_1[18] = 0.0f;
+                            _tmem_load_1[19] = 0.0f;
+                            _tmem_load_1[20] = 0.0f;
+                            _tmem_load_1[21] = 0.0f;
+                            _tmem_load_1[22] = 0.0f;
+                            _tmem_load_1[23] = 0.0f;
+                            _tmem_load_1[24] = 0.0f;
+                            _tmem_load_1[25] = 0.0f;
+                            _tmem_load_1[26] = 0.0f;
+                            _tmem_load_1[27] = 0.0f;
+                            _tmem_load_1[28] = 0.0f;
+                            _tmem_load_1[29] = 0.0f;
+                            _tmem_load_1[30] = 0.0f;
+                            _tmem_load_1[31] = 0.0f;
                         }
                         asm volatile(
                             "tcgen05.st.sync.aligned.16x256b.x8.b32"
@@ -974,7 +1067,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                 }
                 mbarrier_arrive(kv_acc_empty_addr + (kv_stage_cg1) * 8);
                 #pragma unroll
-                for (int __3 = 0; __3 < 2; __3++) {
+                for (int __2 = 0; __2 < 2; __2++) {
                     mbarrier_wait(o_store_empty_addr + (o_stage_cg1) * 8, o_empty_phase_cg1);
                     o_stage_cg1 += 1;
                     if (o_stage_cg1 == 2) { o_stage_cg1 = 0; o_empty_phase_cg1 ^= 1; }
@@ -1021,7 +1114,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                 unsigned int acc_stage_qk = 0;
                 unsigned int acc_phase_qk = 1;
                 #pragma unroll 2
-                for (int __4 = 0; __4 < num_padded_blocks_2; __4++) {
+                for (int __3 = 0; __3 < num_padded_blocks_2; __3++) {
                     {
                         mbarrier_wait(load_q_full_addr + (q_stage_qk) * 8, q_phase_qk);
                         mbarrier_wait(load_k_full_addr + (k_stage_qk) * 8, k_phase_qk);
@@ -1210,25 +1303,25 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                         if (v_stage == 3) { v_stage = 0; _phase_load_v_empty ^= 1; }
                     }
                     #pragma unroll
-                    for (int __5 = 0; __5 < 2; __5++) {
+                    for (int __4 = 0; __4 < 2; __4++) {
                         mbarrier_wait(load_q_empty_addr + (q_stage) * 8, _phase_load_q_empty);
                         q_stage += 1;
                         if (q_stage == 2) { q_stage = 0; _phase_load_q_empty ^= 1; }
                     }
                     #pragma unroll
-                    for (int __6 = 0; __6 < 3; __6++) {
+                    for (int __5 = 0; __5 < 3; __5++) {
                         mbarrier_wait(load_k_empty_addr + (k_stage) * 8, _phase_load_k_empty);
                         k_stage += 1;
                         if (k_stage == 3) { k_stage = 0; _phase_load_k_empty ^= 1; }
                     }
                     #pragma unroll
-                    for (int __7 = 0; __7 < 3; __7++) {
+                    for (int __6 = 0; __6 < 3; __6++) {
                         mbarrier_wait(load_v_empty_addr + (v_stage) * 8, _phase_load_v_empty);
                         v_stage += 1;
                         if (v_stage == 3) { v_stage = 0; _phase_load_v_empty ^= 1; }
                     }
                     #pragma unroll
-                    for (int __8 = 0; __8 < 2; __8++) {
+                    for (int __7 = 0; __7 < 2; __7++) {
                         mbarrier_wait(load_t_empty_addr + (t_stage) * 8, _phase_load_t_empty);
                         t_stage += 1;
                         if (t_stage == 2) { t_stage = 0; _phase_load_t_empty ^= 1; }
@@ -1286,7 +1379,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                 kv_stage_state += 1;
                 if (kv_stage_state == 1) { kv_stage_state = 0; kv_empty_phase_state ^= 1; }
                 #pragma unroll 1
-                for (int __9 = 0; __9 < num_padded_blocks_4; __9++) {
+                for (int __8 = 0; __8 < num_padded_blocks_4; __8++) {
                     {
                         mbarrier_wait(load_q_full_addr + (q_stage_state) * 8, q_phase_state);
                         mbarrier_wait(load_k_full_addr + (k_stage_state) * 8, k_phase_state);
@@ -1830,7 +1923,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                     if (o_epi_stage == 2) { o_epi_stage = 0; o_ready_phase ^= 1; }
                 }
                 #pragma unroll
-                for (int __10 = 0; __10 < 5; __10++) {
+                for (int __9 = 0; __9 < 5; __9++) {
                     mbarrier_wait(load_gate_empty_addr + (gate_stage) * 8, gate_empty_phase);
                     gate_stage += 1;
                     if (gate_stage == 5) { gate_stage = 0; gate_empty_phase ^= 1; }
