@@ -68,8 +68,8 @@ _FLASH_KDA_TARGET_DEFINE = {
 # refreshed export or binding specialization after an in-place package upgrade.
 _FLASH_KDA_MODULE_IDENTS = {
     "m64": "9a5566f3be",
-    "m128": "ea022a2f1f",
-    "m128_n16": "ef8b47d690",
+    "m128": "ae83f7331a",
+    "m128_n16": "bfc7b64cd3",
     "persistent_m128": "64bc19d01c",
     "small_bh_m128": "73369168de",
     "bt16_prepare": "2c6cc4c1f6",
