@@ -995,27 +995,24 @@ def test_variant_selector_exposes_specialized_routes_only_when_requested():
     (
         "compute_capability",
         "sm_count",
-        "fixed_layout",
         "num_sequences",
         "num_heads",
         "sequence_length",
         "expected",
     ),
     [
-        ((10, 0), 148, True, 1, 8, 2048, True),
-        ((10, 3), 152, True, 2, 4, 65536, True),
-        ((10, 3), 64, True, 8, 1, 131072, True),
-        ((10, 0), 63, True, 8, 1, 2048, False),
-        ((10, 0), 148, False, 1, 8, 2048, False),
-        ((10, 0), 148, True, 1, 8, 2047, False),
-        ((10, 0), 148, True, 3, 3, 2048, False),
-        ((10, 0), 148, True, 1, 9, 2048, False),
+        ((10, 0), 148, 1, 8, 2048, True),
+        ((10, 3), 152, 2, 4, 65536, True),
+        ((10, 3), 64, 8, 1, 131072, True),
+        ((10, 0), 63, 8, 1, 2048, False),
+        ((10, 0), 148, 1, 8, 2047, False),
+        ((10, 0), 148, 3, 3, 2048, False),
+        ((10, 0), 148, 1, 9, 2048, False),
     ],
 )
 def test_small_bh_owner_helper_policy_matches_residency_contract(
     compute_capability,
     sm_count,
-    fixed_layout,
     num_sequences,
     num_heads,
     sequence_length,
@@ -1025,13 +1022,194 @@ def test_small_bh_owner_helper_policy_matches_residency_contract(
         kda_prefill_api._should_use_small_bh_owner_helper(
             compute_capability=compute_capability,
             sm_count=sm_count,
-            fixed_layout=fixed_layout,
             num_sequences=num_sequences,
             num_heads=num_heads,
             sequence_length=sequence_length,
         )
         is expected
     )
+
+
+@pytest.mark.parametrize(
+    (
+        "fixed_layout",
+        "num_sequences",
+        "num_heads",
+        "uniform_sequences",
+        "max_sequence_length",
+        "expected_route",
+    ),
+    [
+        (True, 1, 64, True, 4096, "bt16_prepare_chain_m64"),
+        (True, 1, 12, True, 512, "bt16_prepare_chain_m64"),
+        (True, 8, 12, True, 1024, "direct_m128"),
+        (False, 8, 12, False, 3072, "bt16_prepare_chain_m64"),
+        (True, 1, 1, True, 65_535, "small_bh_owner_helper_m128"),
+        (True, 1, 1, True, 65_536, "bt16_prepare_chain_m64"),
+        (True, 1, 64, True, 512, "independent_dvsplit_m64"),
+    ],
+)
+def test_bt16_route_policy_matches_measured_crossovers(
+    fixed_layout,
+    num_sequences,
+    num_heads,
+    uniform_sequences,
+    max_sequence_length,
+    expected_route,
+):
+    assert (
+        kda_prefill_api._select_flash_kda_bf16_route(
+            compute_capability=(10, 3),
+            sm_count=152,
+            fixed_layout=fixed_layout,
+            num_sequences=num_sequences,
+            num_heads=num_heads,
+            uniform_sequences=uniform_sequences,
+            max_sequence_length=max_sequence_length,
+        )
+        == expected_route
+    )
+
+
+def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
+    assert (
+        kda_prefill_api._direct_m128_route(
+            num_heads=64, max_sequence_length=16
+        )
+        == "direct_m128_n16"
+    )
+    assert (
+        kda_prefill_api._direct_m128_route(
+            num_heads=64, max_sequence_length=17
+        )
+        == "direct_m128"
+    )
+    assert kda_prefill_api._bt16_chunks_per_prepare_cta(
+        num_heads=12, total_chunks=128
+    ) == 1
+    assert kda_prefill_api._bt16_chunks_per_prepare_cta(
+        num_heads=12, total_chunks=129
+    ) == 4
+    assert kda_prefill_api._bt16_chunks_per_prepare_cta(
+        num_heads=64, total_chunks=255
+    ) == 6
+    assert kda_prefill_api._bt16_chunks_per_prepare_cta(
+        num_heads=64, total_chunks=256
+    ) == 8
+
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 3),
+        sm_count=152,
+        fixed_layout=True,
+        num_sequences=1,
+        num_heads=64,
+        max_sequence_length=4096,
+    ) == ("bt16_prepare_beta_tma", "bt16_chain_m64_s8", True)
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 3),
+        sm_count=152,
+        fixed_layout=True,
+        num_sequences=1,
+        num_heads=8,
+        max_sequence_length=65_536,
+    ) == ("bt16_prepare", "bt16_chain_m64_s9", False)
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 0),
+        sm_count=148,
+        fixed_layout=False,
+        num_sequences=8,
+        num_heads=12,
+        max_sequence_length=3072,
+    ) == ("bt16_prepare", "bt16_chain_m64_s7", False)
+
+
+def test_bt16_two_stage_adapter_forwards_stable_wrapper_abis(monkeypatch):
+    prepare_module = _RecorderModule()
+    chain_module = _RecorderModule()
+    modules = {
+        "bt16_prepare_beta_tma": prepare_module,
+        "bt16_chain_m64_s8": chain_module,
+    }
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        lambda variant, target: modules[variant],
+    )
+    q = torch.empty((1, 1, 1, 1), dtype=torch.bfloat16)
+    factor = torch.empty((1, 1, 1, 1), dtype=torch.bfloat16)
+    qk = torch.empty((1, 1, 1, 1, 1), dtype=torch.bfloat16)
+    diag = torch.empty((1, 1, 1, 1), dtype=torch.float32)
+    cu_chunks = torch.tensor([0, 256], dtype=torch.int32)
+    chunk_to_seq = torch.zeros(256, dtype=torch.int32)
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_bt16_workspace",
+        lambda **kwargs: (
+            cu_chunks,
+            chunk_to_seq,
+            factor,
+            factor.clone(),
+            factor.clone(),
+            qk,
+            diag,
+            256,
+            760,
+        ),
+    )
+    workspace = SimpleNamespace(
+        _descriptor_signatures={},
+        _descriptor_storages={
+            variant: torch.empty(896, dtype=torch.uint8) for variant in modules
+        },
+    )
+    cu_seqlens = torch.tensor([0, 4096], dtype=torch.int64)
+    seq_order = torch.tensor([0], dtype=torch.int32)
+    state = torch.empty((1, 1, 1, 1), dtype=torch.bfloat16)
+    output = torch.empty_like(q)
+
+    kda_prefill_api._run_bt16_prepare_chain(
+        workspace=workspace,
+        target="sm100f",
+        q=q,
+        k=q,
+        v=q,
+        g=q,
+        beta=torch.empty((1, 1, 1), dtype=torch.bfloat16),
+        A_log=torch.empty(64, dtype=torch.float32),
+        dt_bias=torch.empty((64, 128), dtype=torch.float32),
+        cu_seqlens=cu_seqlens,
+        seq_order=seq_order,
+        initial_state=state,
+        out=output,
+        final_state=state,
+        offsets=(0, 4096),
+        num_heads=64,
+        sm_count=152,
+        compute_capability=(10, 3),
+        fixed_layout=True,
+        max_sequence_length=4096,
+        use_initial_state=True,
+        store_final_state=True,
+        scale=0.125,
+        lower_bound=-5.0,
+        stream_ptr=17,
+        capturing=False,
+    )
+
+    (prepare_args,) = prepare_module.calls
+    assert len(prepare_args) == 21
+    assert prepare_args[6] is cu_seqlens
+    assert prepare_args[7] is cu_chunks
+    assert prepare_args[8] is chunk_to_seq
+    assert prepare_args[15] == 1
+    assert prepare_args[16:21] == (256, 64, -5.0, 760, 17)
+    (chain_args,) = chain_module.calls
+    assert len(chain_args) == 20
+    assert chain_args[6] is cu_seqlens
+    assert chain_args[7] is cu_chunks
+    assert chain_args[8] is seq_order
+    assert chain_args[12].dtype == torch.uint8
+    assert chain_args[13:20] == (1, 64, 1, 1, 0.125, 128, 17)
 
 
 def test_h96_uniform_n128_uses_exact_n16_only_on_148_sm():
@@ -1135,7 +1313,7 @@ def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
 @pytest.mark.parametrize(
     ("packed", "num_heads", "expected_variant"),
     [
-        (False, 64, "m64"),
+        (False, 64, "m128"),
         (True, 64, "m128"),
         (True, 2, "m128"),
         (False, 12, "m128_n16"),

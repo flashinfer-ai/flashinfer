@@ -16,7 +16,9 @@
 
 The default case set combines the original H64/H96 coverage, six H12 shapes
 representing Kimi-K3's per-rank head count under TP8, and four fixed-layout
-small-BH shapes. ``--case-set`` can select each group independently.
+small-BH shapes. ``--case-set production`` selects the 29-shape inference
+portfolio used to qualify the BT16 prepare/chain route, including fixed,
+packed, irregular-tail, high-sequence-count, and long-context cases.
 
 The FlashInfer candidate is always invoked through the public
 ``recurrent_kda`` API. ``--candidate-route dispatcher`` measures the natural
@@ -24,8 +26,8 @@ device/shape policy, while ``nonpersistent`` supplies the same explicit
 workspace and packed sequence order used by the historical benchmark to keep
 B200 on the direct schedule family. ``--backend`` selects one public API
 backend per invocation; compare auto, CuTe DSL, and Cake with separate commands
-over the same case set. The resolved backend, schedule variant, and target are
-recorded during untimed warmup. With
+over the same case set. The resolved backend, logical schedule, physical module
+variants, and target are recorded during untimed warmup. With
 ``--flash-kda-peer``, two commit-verified MoonshotAI/FlashKDA measurements are
 reported:
 
@@ -61,6 +63,8 @@ FLASH_KDA_PEER_COMMIT = "1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b"
 FLASH_KDA_CUTLASS_COMMIT = "5c149f52a436782210263fb2f19b354443a61c6a"
 DEFAULT_LEGACY_STATE_ROTATIONS = 1024
 DEFAULT_H12_STATE_ROTATIONS = 4096
+DEFAULT_PRODUCTION_STATE_BUDGET_BYTES = 8 * 1024**3
+_CUPTI_ESTIMATE_CALLS_PER_BLOCK = 1 + 5
 SUPPORTED_FLASH_KDA_ARCHS = {(10, 0): "sm100a", (10, 3): "sm103a"}
 BENCHMARKS_DIR = Path(__file__).resolve().parent
 H12_PRESET = BENCHMARKS_DIR / "presets" / "recurrent_kda_prefill_h12.json"
@@ -157,6 +161,122 @@ SMALL_BH_CASES = (
     Case("h1_fixed_1048576", 1, (1048576,), False, 11003),
 )
 CASES = LEGACY_CASES + H12_CASES + SMALL_BH_CASES
+
+# This public, executable inventory is intentionally expressed with tuple
+# multiplication for the large uniform packed cases. It preserves every shape
+# without checking in megabytes of repeated JSON integers.
+PRODUCTION_CASES = (
+    Case("h96_fixed_8192", 96, (8192,), False, 10000),
+    Case("h96_mixed_varlen", 96, (1300, 547, 2048, 963, 271, 3063), True, 10001),
+    Case("h96_uniform_varlen", 96, (1024,) * 8, True, 10002),
+    Case("h64_fixed_8192", 64, (8192,), False, 10003),
+    Case("h64_mixed_varlen", 64, (1300, 547, 2048, 963, 271, 3063), True, 10004),
+    Case("h64_uniform_varlen", 64, (1024,) * 8, True, 10005),
+    Case("h32_fixed_8192", 32, (8192,), False, 11000),
+    Case("h32_mixed_varlen", 32, (1300, 547, 2048, 963, 271, 3063), True, 11001),
+    Case("h96_uniform_n16", 96, (1024,) * 16, True, 11002),
+    Case("h96_uniform_n32_holdout", 96, (1024,) * 32, True, 11003),
+    Case("h96_uniform_n64", 96, (1024,) * 64, True, 11004),
+    Case("h96_uniform_n128_holdout", 96, (1024,) * 128, True, 11005),
+    Case("h96_uniform_n256", 96, (1024,) * 256, True, 11006),
+    Case("h96_short_varlen", 96, (64, 128, 256), True, 11007),
+    Case("h96_irregular_tail_varlen", 96, (17, 33, 65), True, 11008),
+    Case("h16_fixed_16384", 16, (16384,), False, 11009),
+    Case("h16_fixed_32768_holdout", 16, (32768,), False, 11010),
+    Case("h16_fixed_65536", 16, (65536,), False, 11011),
+    Case("h8_fixed_65536", 8, (65536,), False, 11012),
+    Case("h4_fixed_65536_holdout", 4, (65536,), False, 11013),
+    Case("h4_tail_seq1_to_15", 4, tuple(range(1, 16)), True, 11014),
+    Case("h1_fixed_1048576", 1, (1048576,), False, 11015),
+    Case("h96_fixed_37", 96, (37,), False, 11016),
+    Case("h96_fixed_97", 96, (97,), False, 11017),
+    Case("h96_packed_n1_16", 96, (16,), True, 11018),
+    Case("h96_packed_uniform_n2_t16", 96, (16, 16), True, 11019),
+    Case("h1_fixed_131072", 1, (131072,), False, 11020),
+    Case("h1_packed_n1_131072", 1, (131072,), True, 11021),
+    Case("h1_packed_524288_524288", 1, (524288, 524288), True, 11022),
+)
+
+_BT16_PREPARE_VARIANTS = frozenset(
+    ("bt16_prepare", "bt16_prepare_beta_tma")
+)
+_BT16_CHAIN_VARIANTS = frozenset(
+    (
+        "bt16_chain_m64_s7",
+        "bt16_chain_m64_s8",
+        "bt16_chain_m64_s9",
+    )
+)
+
+
+def _resolve_recorded_cake_route(
+    routes: list[tuple[str, str]],
+) -> tuple[str, str, list[str]]:
+    """Normalize one-stage and BT16 two-stage Cake warmup observations."""
+
+    if len(routes) == 1:
+        variant, target = routes[0]
+        if (
+            variant not in _BT16_PREPARE_VARIANTS
+            and variant not in _BT16_CHAIN_VARIANTS
+        ):
+            return variant, target, [variant]
+    if len(routes) == 2:
+        (prepare_variant, prepare_target), (chain_variant, chain_target) = routes
+        if (
+            prepare_variant in _BT16_PREPARE_VARIANTS
+            and chain_variant in _BT16_CHAIN_VARIANTS
+            and prepare_target == chain_target
+        ):
+            return (
+                "bt16_prepare_chain_m64",
+                prepare_target,
+                [prepare_variant, chain_variant],
+            )
+    raise RuntimeError(
+        "expected one Cake module or one ordered BT16 prepare/chain pair "
+        f"during warmup, got {routes}"
+    )
+
+
+def _default_state_rotations(case: Case) -> int:
+    base = (
+        DEFAULT_H12_STATE_ROTATIONS
+        if case in H12_CASES
+        else DEFAULT_LEGACY_STATE_ROTATIONS
+    )
+    if case not in PRODUCTION_CASES:
+        return base
+    state_bytes = len(case.seq_lens) * case.num_heads * 128 * 128 * 2
+    budget_capacity = max(8, DEFAULT_PRODUCTION_STATE_BUDGET_BYTES // state_bytes)
+    return min(base, budget_capacity)
+
+
+def _timing_iteration_budget(
+    *,
+    state_rotation_capacity: int,
+    warmup_ms: int,
+    bench_ms: int,
+) -> tuple[int, int]:
+    """Fit explicit CUPTI dry/repeat iterations into one rotating-state block."""
+
+    available = state_rotation_capacity - _CUPTI_ESTIMATE_CALLS_PER_BLOCK
+    if available < 2:
+        raise ValueError(
+            "state rotations must cover six CUPTI estimate calls plus at "
+            "least one dry run and one measured iteration"
+        )
+    desired_dry = max(1, warmup_ms)
+    desired_repeat = max(1, bench_ms)
+    desired_total = desired_dry + desired_repeat
+    if desired_total <= available:
+        return desired_dry, desired_repeat
+    dry_run_iters = max(1, round(available * desired_dry / desired_total))
+    repeat_iters = available - dry_run_iters
+    if repeat_iters < 1:
+        repeat_iters = 1
+        dry_run_iters = available - 1
+    return dry_run_iters, repeat_iters
 
 
 def _require_cupti() -> None:
@@ -487,9 +607,14 @@ def _make_case(
         sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
         resolved_variant = "decomp" if decomp_ctas <= sm_count else "engine"
         resolved_target = "bt16"
-    elif len(resolved_cake_routes) == 1:
+        resolved_physical_variants = [resolved_variant]
+    elif resolved_cake_routes:
         resolved_backend = "cake"
-        resolved_variant, resolved_target = resolved_cake_routes[0]
+        (
+            resolved_variant,
+            resolved_target,
+            resolved_physical_variants,
+        ) = _resolve_recorded_cake_route(resolved_cake_routes)
     else:
         raise RuntimeError(
             "expected one recurrent-KDA prefill route during warmup, got "
@@ -503,6 +628,7 @@ def _make_case(
         "total_tokens": total_tokens,
         "layout": "packed" if case.packed else "fixed",
         "variant": resolved_variant,
+        "physical_variants": resolved_physical_variants,
         "target": resolved_target,
         "candidate_route": candidate_route,
         "requested_backend": candidate_backend,
@@ -576,12 +702,16 @@ def _measure(
     *,
     warmup_ms: int,
     bench_ms: int,
+    dry_run_iters: int,
+    repeat_iters: int,
 ) -> tuple[float, list[float]]:
     measurements = bench_gpu_time(
         run,
         enable_cupti=True,
         cold_l2_cache=True,
         use_cuda_graph=False,
+        dry_run_iters=dry_run_iters,
+        repeat_iters=repeat_iters,
         dry_run_time_ms=warmup_ms,
         repeat_time_ms=bench_ms,
     )
@@ -595,11 +725,12 @@ def main() -> None:
     parser.add_argument("--bench-ms", type=int, default=100)
     parser.add_argument(
         "--case-set",
-        choices=("all", "legacy", "h12", "small_bh"),
+        choices=("all", "legacy", "h12", "small_bh", "production"),
         default="all",
         help=(
             "Run all cases, the original H64/H96 cases, the Kimi-K3 TP8 H12 "
-            "cases, or the fixed-layout small-BH cases."
+            "cases, the fixed-layout small-BH cases, or the complete "
+            "29-shape production portfolio."
         ),
     )
     parser.add_argument(
@@ -704,16 +835,30 @@ def main() -> None:
         "legacy": LEGACY_CASES,
         "h12": H12_CASES,
         "small_bh": SMALL_BH_CASES,
+        "production": PRODUCTION_CASES,
     }[args.case_set]
     results = []
     for case in selected_cases:
         state_rotations = args.state_rotations
         if state_rotations is None:
-            state_rotations = (
-                DEFAULT_H12_STATE_ROTATIONS
-                if case in H12_CASES
-                else DEFAULT_LEGACY_STATE_ROTATIONS
-            )
+            state_rotations = _default_state_rotations(case)
+        dry_run_iters, repeat_iters = _timing_iteration_budget(
+            state_rotation_capacity=state_rotations,
+            warmup_ms=args.warmup_ms,
+            bench_ms=args.bench_ms,
+        )
+        timing_iteration_budget = {
+            "cupti_estimate_calls": _CUPTI_ESTIMATE_CALLS_PER_BLOCK,
+            "dry_run_iters": dry_run_iters,
+            "repeat_iters": repeat_iters,
+            "total_stateful_calls_per_block": (
+                _CUPTI_ESTIMATE_CALLS_PER_BLOCK
+                + dry_run_iters
+                + repeat_iters
+            ),
+            "state_rotation_capacity": state_rotations,
+            "low_sample_count": repeat_iters < 10,
+        }
         prepared = _make_case(
             case,
             state_rotations=state_rotations,
@@ -731,9 +876,21 @@ def main() -> None:
                 prepared.candidate_run,
                 warmup_ms=args.warmup_ms,
                 bench_ms=args.bench_ms,
+                dry_run_iters=dry_run_iters,
+                repeat_iters=repeat_iters,
             )
             candidate_block_medians = [candidate_ms]
             result["correctness_peer"] = "not_requested"
+            stateful_calls = prepared.state_cursors["pr"][0]
+            if (
+                stateful_calls
+                != timing_iteration_budget["total_stateful_calls_per_block"]
+            ):
+                raise RuntimeError(
+                    "CUPTI candidate call count no longer matches the explicit "
+                    f"iteration budget: {stateful_calls}"
+                )
+            result["state_slots_used_per_block"] = {"pr": [stateful_calls]}
         else:
             assert prepared.peer_adapted_run is not None
             correctness = _check_peer(prepared)
@@ -762,11 +919,23 @@ def main() -> None:
                     run,
                     warmup_ms=args.warmup_ms,
                     bench_ms=args.bench_ms,
+                    dry_run_iters=dry_run_iters,
+                    repeat_iters=repeat_iters,
                 )
                 block_medians[backend].append(block_median)
                 samples[backend].extend(block_samples)
                 if backend in state_slots_used:
-                    state_slots_used[backend].append(prepared.state_cursors[backend][0])
+                    stateful_calls = prepared.state_cursors[backend][0]
+                    if (
+                        stateful_calls
+                        != timing_iteration_budget["total_stateful_calls_per_block"]
+                    ):
+                        raise RuntimeError(
+                            "CUPTI stateful call count no longer matches the "
+                            f"explicit iteration budget for {backend}: "
+                            f"{stateful_calls}"
+                        )
+                    state_slots_used[backend].append(stateful_calls)
             del run
 
             candidate_block_medians = block_medians["pr"]
@@ -809,6 +978,7 @@ def main() -> None:
                 "timing_scope": ("public_recurrent_kda_with_inplace_state_update"),
                 "warmup_ms": args.warmup_ms,
                 "bench_ms": args.bench_ms,
+                "timing_iteration_budget": timing_iteration_budget,
             }
         )
         results.append(result)
