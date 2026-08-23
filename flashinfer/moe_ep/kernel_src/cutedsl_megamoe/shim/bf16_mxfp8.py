@@ -299,16 +299,17 @@ class MegaMoEBf16Mxfp8Frontend:
             use_stg_fc1=False,
         )
         local_bytes, shared_bytes = kernel.get_workspace_sizes()
+        shared_workspace = sym_zeros((shared_bytes,), torch.uint8)
+        symmetric_base, peer_offsets_list = _compute_peer_offsets(
+            shared_workspace, c.world_size
+        )
         mega = _CompiledMega(
             compiled=None,
             kernel=kernel,
             local_workspace=torch.zeros(local_bytes, dtype=torch.uint8, device="cuda"),
-            shared_workspace=sym_zeros((shared_bytes,), torch.uint8),
-            symmetric_base=0,
-            peer_offsets_list=[],
-        )
-        mega.symmetric_base, mega.peer_offsets_list = _compute_peer_offsets(
-            mega.shared_workspace, c.world_size
+            shared_workspace=shared_workspace,
+            symmetric_base=symmetric_base,
+            peer_offsets_list=peer_offsets_list,
         )
         kwargs = self._runtime_kwargs(inputs, mega)
         kwargs["max_active_clusters"] = max_active_clusters
