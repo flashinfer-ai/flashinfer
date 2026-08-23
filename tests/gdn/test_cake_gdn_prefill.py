@@ -1037,6 +1037,9 @@ def test_public_checkpoint_matches_cute_on_caller_stream_and_cuda_graph(
 
     expected_output = torch.empty_like(output)
     expected_state = torch.empty_like(output_state)
+    # Match the public forced-CP dispatcher, which passes total_seq_len as
+    # max_seqlen. Checkpointing refines state publication only; it does not
+    # change the source-visible output chunking.
     cp_delta_rule_dsl_sm100(
         expected_output,
         expected_state,
@@ -1047,7 +1050,7 @@ def test_public_checkpoint_matches_cute_on_caller_stream_and_cuda_graph(
         beta,
         cu_seqlens,
         1.0 / 128**0.5,
-        max_seqlen=max(seq_lens),
+        max_seqlen=total,
     )
     expected_checkpoints = []
     token_start = 0
