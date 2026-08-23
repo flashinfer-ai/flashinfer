@@ -186,16 +186,16 @@ def test_generated_source_inventory_and_hashes() -> None:
     root = _source_root()
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["schema"] == "flashinfer-pr4078-cake-only-standalone-export-v3"
+    assert "generator_commit" not in manifest
+    assert "measured_commit" not in manifest
     assert manifest["baseline_revision"] == ("6cb2e70995d92edbc443b1bfc317ecacac907640")
     assert manifest["support_contract"]["external_fallbacks_allowed"] == 0
     assert manifest["support_contract"]["focus_contract"] == {
         "row_count": 150,
-        "path": "design_doc/active/eval_contract_flashinfer_blackwell_gdn_cp_prefill.shapes/part-000.jsonl",
         "canonical_stream_sha256": "d4f3fad233af91b8afac35271d6848df8f0f090b08f17807b9e2830139dd37ab",
     }
     assert manifest["support_contract"]["full_regression_contract"] == {
         "row_count": 822,
-        "path": "design_doc/active/eval_contract_flashinfer_blackwell_gdn_cp_prefill.regression/part-000.jsonl",
         "canonical_stream_sha256": "0dff83c89b9a17f67e0a2db9bb9c20ed77506fa3b38cc55d7772864021553592",
     }
     assert manifest["support_contract"]["checkpoint"] == {
@@ -1163,7 +1163,7 @@ def test_public_checkpoint_matches_cute_on_caller_stream_and_cuda_graph(
     )
 
     # The pinned source extension is process-global and can change behavior
-    # after unrelated Loom/Cake compilations in the same pytest session. Keep
+    # after unrelated kernel compilations in the same pytest session. Keep
     # the numeric oracle in a fresh process; candidate execution stays here.
     expected_output, expected_state, expected_checkpoints_tensor = (
         _fresh_checkpoint_oracle(

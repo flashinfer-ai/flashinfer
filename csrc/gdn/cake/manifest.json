@@ -7152,7 +7152,6 @@
       ]
     }
   ],
-  "generator_commit": "4a0b9d034b7fa192d1424e68769be15ce2442b94",
   "kernels": [
     {
       "abi": [
@@ -7596,9 +7595,9 @@
           ]
         ],
         "entry": "run_mn_precompute",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1_117abc3cae",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_mn_precompute_v1_3cd0d4c066",
         "path": "host/cake_mn_precompute.cc",
-        "sha256": "aaf148c30d7cdb0abd3e8ca64731887c50972472ae8bcf2a95f43d2576fcf0d7",
+        "sha256": "7d3bfa53f09c3d4f289e612591dc90b9a0bab908318f6cccca332a523d8acd62",
         "size_bytes": 21770
       },
       "name": "mn_precompute",
@@ -7742,9 +7741,9 @@
           ]
         ],
         "entry": "run_mn_precompute_bf16",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_mn_precompute_bf16_v1_457cbd51c4",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_mn_precompute_bf16_v1_c81c79b1af",
         "path": "host/cake_mn_precompute_bf16.cc",
-        "sha256": "91db6cabad13396f132285bfdae90a2f13b658e21a49d5e2ff831186e80a45f1",
+        "sha256": "e9d33af002e724a8ac0c62bc951b67ba9542e262c19f63ce1a97567e4c3614ce",
         "size_bytes": 21798
       },
       "name": "mn_precompute_bf16",
@@ -8734,9 +8733,9 @@
           ]
         ],
         "entry": "run_state_fixup_utcmma64",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_fixup_utcmma64_v1_1607602329",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_fixup_utcmma64_v1_3f88fd15f2",
         "path": "host/cake_state_fixup_utcmma64.cc",
-        "sha256": "86e1cd5cd782769fb15ec9935715bd72a6317cee5ef8ce5e56667e164b5db400",
+        "sha256": "b40598efe62517de8e2b88f076de1baf302d8c53231703539ccc8fa9b0e9bb5a",
         "size_bytes": 20828
       },
       "name": "state_fixup_utcmma64",
@@ -8864,9 +8863,9 @@
           ]
         ],
         "entry": "run_state_fixup_utcmma128",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_fixup_utcmma128_v1_22e9991c03",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_fixup_utcmma128_v1_cacbdb1d1b",
         "path": "host/cake_state_fixup_utcmma128.cc",
-        "sha256": "765c50e66ad2e0d17b5f9b293b7d3da16317322bd8d50aab2b960f5fbe372ecd",
+        "sha256": "89a20ee93b5cca71c5480c2b228139fa19bcc5bdb7848f5d4a09f6febe10ec3c",
         "size_bytes": 20836
       },
       "name": "state_fixup_utcmma128",
@@ -9042,9 +9041,9 @@
           ]
         ],
         "entry": "run_cp_prefill",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_v1_a02e820e1e",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_v1_45f8126318",
         "path": "host/cake_cp_prefill.cc",
-        "sha256": "b99120d09ab1b7f9e272a86914fd10856c39598cb654d72278f0e47fba75a221",
+        "sha256": "5f11377105d13438aa2355a8039e2db651493a93fd70f0ab6fa3c52ab4a9fcc3",
         "size_bytes": 26905
       },
       "name": "cp_prefill",
@@ -9220,9 +9219,9 @@
           ]
         ],
         "entry": "run_cp_prefill_equal_head",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1_332a802beb",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1_46661a9ba9",
         "path": "host/cake_cp_prefill_equal_head.cc",
-        "sha256": "66903b58afe1d9e3d15a0ba3d1d6292cb03914edbdbe5d09a51bb435028f7868",
+        "sha256": "c053afa9078b5152fdac3393a607821850b0d05fbcf7b0f94da583996dbcada4",
         "size_bytes": 26960
       },
       "name": "cp_prefill_equal_head",
@@ -9398,9 +9397,9 @@
           ]
         ],
         "entry": "run_cp_prefill_equal_head_h32",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_h32_v1_5ddc0e5eb1",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_equal_head_h32_v1_418925623d",
         "path": "host/cake_cp_prefill_equal_head_h32.cc",
-        "sha256": "6f5972279ce0e4228bc7e91ad77c8212c3409411bdf7a6f061cc8aac77556efd",
+        "sha256": "0460dd3d5774525fec39d321eaae7dad3f6479801101b3754b791382e3c5bf35",
         "size_bytes": 26980
       },
       "name": "cp_prefill_equal_head_h32",
@@ -9575,9 +9574,9 @@
           ]
         ],
         "entry": "run_cp_prefill_bf16",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1_7b1fe720a9",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1_df695798b3",
         "path": "host/cake_cp_prefill_bf16.cc",
-        "sha256": "b2270b8e9580d135e3b3a545a7174c5634bfcca2d055a5b3bea2d74b79662b19",
+        "sha256": "837f8d0f0bee0eb5972c4d96895e3024d11c6de59caae9cc9e88255f57c3350e",
         "size_bytes": 26935
       },
       "name": "cp_prefill_bf16",
@@ -9753,9 +9752,9 @@
           ]
         ],
         "entry": "run_cp_prefill_generic",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_v1_88029f4be1",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_v1_0c0bd70c21",
         "path": "host/cake_cp_prefill_generic.cc",
-        "sha256": "54b301bdc8cb17cb762fcf450fd6835415fd5074491fc7c0412f724521ca74ff",
+        "sha256": "457832c8cf5e176db219227f0531b28e37ef1d621327883a464f699d347d022b",
         "size_bytes": 26945
       },
       "name": "cp_prefill_generic",
@@ -9931,9 +9930,9 @@
           ]
         ],
         "entry": "run_cp_prefill_generic_bf16",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1_059e6bc862",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1_1359a5e249",
         "path": "host/cake_cp_prefill_generic_bf16.cc",
-        "sha256": "f3fb943cdb7646c597684f9b3e6c011cb2c12739a25eb48a566abdbcbaf11da8",
+        "sha256": "59e3492f88fc1e381fafa3b9a9c3d04f8aa148edf2789cd4ccb39339651aa925",
         "size_bytes": 26975
       },
       "name": "cp_prefill_generic_bf16",
@@ -10010,7 +10009,6 @@
     "stage4_tail_dispatch": "exact-full-block kernel iff every sequence length is divisible by 128; otherwise generic-tail kernel",
     "tensor_map_abi": "grid_constant for every TMA-backed stage; no process-lifetime descriptor arena"
   },
-  "measured_commit": "48da33f13b5a42c8451c2e826387cfa65f2c5578",
   "schema": "flashinfer-pr4078-cake-only-standalone-export-v3",
   "selected_seed": "flashinfer_pr4078_exact_tail_qs_vks_cudagraph_v1",
   "selected_stage4_flags": {
@@ -10053,12 +10051,10 @@
     },
     "focus_contract": {
       "canonical_stream_sha256": "d4f3fad233af91b8afac35271d6848df8f0f090b08f17807b9e2830139dd37ab",
-      "path": "design_doc/active/eval_contract_flashinfer_blackwell_gdn_cp_prefill.shapes/part-000.jsonl",
       "row_count": 150
     },
     "full_regression_contract": {
       "canonical_stream_sha256": "0dff83c89b9a17f67e0a2db9bb9c20ed77506fa3b38cc55d7772864021553592",
-      "path": "design_doc/active/eval_contract_flashinfer_blackwell_gdn_cp_prefill.regression/part-000.jsonl",
       "row_count": 822
     },
     "head_mapping": {
