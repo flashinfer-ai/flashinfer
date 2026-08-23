@@ -2895,6 +2895,50 @@ def test_cute_dsl_padded_indexed_state_matches_cake(
         )
 
 
+@pytest.mark.parametrize("num_sequences", [171, 256])
+def test_cute_dsl_packed_tensor_map_stride_above_int32_matches_cake(
+    flash_kda_device,
+    num_sequences,
+):
+    # The natural stride of the unused packed-batch mode is
+    # 128 * (171 * 1024) * 96 = 2,151,677,952 BF16 elements, just above
+    # signed Int32.  The singleton mode must not make the TensorMap invalid.
+    inputs = _make_inputs(
+        seq_lens=(1024,) * num_sequences,
+        num_heads=96,
+        packed=True,
+        initial_state=True,
+        seed=2197,
+    )
+    initial_state = inputs["initial_state"]
+    assert initial_state is not None
+    initial_state_seed = initial_state.clone()
+
+    cake_output, cake_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+    assert cake_state is initial_state
+    cake_state = cake_state.clone()
+
+    initial_state.copy_(initial_state_seed)
+    cute_output, cute_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cute-dsl",
+    )
+    assert cute_state is initial_state
+    torch.testing.assert_close(
+        cute_output.float(), cake_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        cute_state.float(), cake_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
 def test_frozen_prefill_m64_matches_reference(flash_kda_device):
     inputs = _make_inputs(
         seq_lens=[2],
