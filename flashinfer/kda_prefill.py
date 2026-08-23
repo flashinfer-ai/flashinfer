@@ -132,6 +132,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
             for variant in (
                 "m64",
                 "m128",
+                "m128_tensor_state_decay",
                 "m128_h12_short",
                 "m128_h12_long",
                 "m128_n16",
@@ -586,6 +587,28 @@ def _direct_m128_route(*, num_heads: int, max_sequence_length: int = 0) -> str:
     )
 
 
+def _should_use_n32_tensor_state_decay(
+    *,
+    compute_capability: tuple[int, int],
+    route: str,
+    uniform_sequences: bool,
+    num_heads: int,
+    total_tasks: int,
+    max_sequence_length: int,
+) -> bool:
+    """Select the measured full-tile tensor-core state-decay schedule."""
+
+    return (
+        compute_capability == (10, 3)
+        and route == _FLASH_KDA_ROUTE_DIRECT_M128
+        and uniform_sequences
+        and num_heads >= 64
+        and total_tasks >= 96
+        and max_sequence_length >= 256
+        and max_sequence_length % 32 == 0
+    )
+
+
 def _select_flash_kda_bf16_route(
     *,
     compute_capability: tuple[int, int],
@@ -707,7 +730,10 @@ def _select_bt16_physical_variants(
     ]
     if _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks > sm_count:
         chain_variant = "bt16_chain_m64_s7"
-    elif total_tasks <= 8:
+    elif total_tasks <= 8 or (
+        prepare_variant == "bt16_prepare_beta_tma"
+        and _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks <= sm_count
+    ):
         chain_variant = "bt16_chain_m64_s9"
     else:
         chain_variant = "bt16_chain_m64_s8"
@@ -1881,6 +1907,18 @@ def _run_flash_kda_prefill(
         )
     )
     use_bt16 = route == _FLASH_KDA_ROUTE_BT16_M64
+    use_tensor_state_decay = (
+        state_indices is None
+        and checkpoint_every_n_tokens == 0
+        and _should_use_n32_tensor_state_decay(
+            compute_capability=compute_capability,
+            route=route,
+            uniform_sequences=uniform_sequences,
+            num_heads=num_heads,
+            total_tasks=num_sequences * num_heads,
+            max_sequence_length=max_sequence_length,
+        )
+    )
     if route in (
         _FLASH_KDA_ROUTE_DIRECT_M128_N16,
         _FLASH_KDA_ROUTE_BT16_M64,
@@ -1892,6 +1930,7 @@ def _run_flash_kda_prefill(
         "bt16",
         "m64",
         "m128",
+        "m128_tensor_state_decay",
         "m128_h12_short",
         "m128_h12_long",
         "m128_n16",
@@ -1904,6 +1943,8 @@ def _run_flash_kda_prefill(
         variant = "m64"
     elif route == _FLASH_KDA_ROUTE_SMALL_BH_M128:
         variant = "small_bh_m128"
+    elif use_tensor_state_decay:
+        variant = "m128_tensor_state_decay"
     elif persistent_plan is not None:
         variant = "persistent_m128"
     elif route == _FLASH_KDA_ROUTE_DIRECT_M128_N16:

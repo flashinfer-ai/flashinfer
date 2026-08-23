@@ -16,7 +16,7 @@
 
 // Frozen generated kernel export; do not edit by hand.
 // Generated schedule 'flashkda_bf16_fused_m128'; module
-// flashkda_bf16_fused_m128_bfc7b64cd3.
+// flashkda_bf16_fused_m128_b4614a4ae4.
 // clang-format off
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
@@ -36,7 +36,23 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define FLASH_KDA_INF CUDART_INF_F
 #define TMEM_NCOLS 240
 #define TMEM_TMEM_STATE_OFFSET 64
+#define TMEM_TMEM_STATE_DECAY0_OFFSET 64
+#define TMEM_TMEM_STATE_DECAY1_OFFSET 80
+#define TMEM_TMEM_STATE_DECAY2_OFFSET 96
+#define TMEM_TMEM_STATE_DECAY3_OFFSET 112
+#define TMEM_TMEM_STATE_DECAY4_OFFSET 128
+#define TMEM_TMEM_STATE_DECAY5_OFFSET 144
+#define TMEM_TMEM_STATE_DECAY6_OFFSET 160
+#define TMEM_TMEM_STATE_DECAY7_OFFSET 176
 #define TMEM_TMEM_STATE_INP_OFFSET 0
+#define TMEM_TMEM_STATE_INP_DECAY0_OFFSET 0
+#define TMEM_TMEM_STATE_INP_DECAY1_OFFSET 8
+#define TMEM_TMEM_STATE_INP_DECAY2_OFFSET 16
+#define TMEM_TMEM_STATE_INP_DECAY3_OFFSET 24
+#define TMEM_TMEM_STATE_INP_DECAY4_OFFSET 32
+#define TMEM_TMEM_STATE_INP_DECAY5_OFFSET 40
+#define TMEM_TMEM_STATE_INP_DECAY6_OFFSET 48
+#define TMEM_TMEM_STATE_INP_DECAY7_OFFSET 56
 #define TMEM_TMEM_U_ACC_OFFSET 224
 #define TMEM_TMEM_U2_INP_OFFSET 224
 #define TMEM_TMEM_U2_ACC_OFFSET 208
@@ -122,6 +138,33 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define SMEM_SMEM_GATE_BIAS_ALL_OFF 116816
 #define SMEM_SMEM_GATE_BIAS_ALL_STAGE_BYTES 512
 #define SMEM_SMEM_GATE_BIAS_ALL_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG_RAW_OFF 1024
+#define SMEM_SMEM_STATE_DECAY_DIAG_RAW_STAGE_BYTES 4096
+#define SMEM_SMEM_STATE_DECAY_DIAG_RAW_STRIDE 4096
+#define SMEM_SMEM_STATE_DECAY_DIAG0_OFF 1024
+#define SMEM_SMEM_STATE_DECAY_DIAG0_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG0_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG1_OFF 1536
+#define SMEM_SMEM_STATE_DECAY_DIAG1_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG1_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG2_OFF 2048
+#define SMEM_SMEM_STATE_DECAY_DIAG2_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG2_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG3_OFF 2560
+#define SMEM_SMEM_STATE_DECAY_DIAG3_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG3_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG4_OFF 3072
+#define SMEM_SMEM_STATE_DECAY_DIAG4_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG4_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG5_OFF 3584
+#define SMEM_SMEM_STATE_DECAY_DIAG5_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG5_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG6_OFF 4096
+#define SMEM_SMEM_STATE_DECAY_DIAG6_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG6_STRIDE 512
+#define SMEM_SMEM_STATE_DECAY_DIAG7_OFF 4608
+#define SMEM_SMEM_STATE_DECAY_DIAG7_STAGE_BYTES 512
+#define SMEM_SMEM_STATE_DECAY_DIAG7_STRIDE 512
 #define SMEM_SMEM_V_ALL_OFF 16512
 #define SMEM_SMEM_V_ALL_STAGE_BYTES 90112
 #define SMEM_SMEM_V_ALL_STRIDE 90112
@@ -698,6 +741,24 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
     const int smem_gate_rate_all_addr = smem + 22084;
     float* smem_gate_bias_all = reinterpret_cast<float*>(smem_raw + 116816);
     const int smem_gate_bias_all_addr = smem + 116816;
+    unsigned int* smem_state_decay_diag_raw = reinterpret_cast<unsigned int*>(smem_raw + 1024);
+    const int smem_state_decay_diag_raw_addr = smem + 1024;
+    __nv_bfloat16* smem_state_decay_diag0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
+    const int smem_state_decay_diag0_addr = smem + 1024;
+    __nv_bfloat16* smem_state_decay_diag1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1536);
+    const int smem_state_decay_diag1_addr = smem + 1536;
+    __nv_bfloat16* smem_state_decay_diag2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2048);
+    const int smem_state_decay_diag2_addr = smem + 2048;
+    __nv_bfloat16* smem_state_decay_diag3 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 2560);
+    const int smem_state_decay_diag3_addr = smem + 2560;
+    __nv_bfloat16* smem_state_decay_diag4 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 3072);
+    const int smem_state_decay_diag4_addr = smem + 3072;
+    __nv_bfloat16* smem_state_decay_diag5 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 3584);
+    const int smem_state_decay_diag5_addr = smem + 3584;
+    __nv_bfloat16* smem_state_decay_diag6 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4096);
+    const int smem_state_decay_diag6_addr = smem + 4096;
+    __nv_bfloat16* smem_state_decay_diag7 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 4608);
+    const int smem_state_decay_diag7_addr = smem + 4608;
     __nv_bfloat16* smem_v_all = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16512);
     const int smem_v_all_addr = smem + 16512;
     float* smem_gate_all = reinterpret_cast<float*>(smem_raw + 13312);
@@ -711,8 +772,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
     unsigned int* smem_work_item_resolved = reinterpret_cast<unsigned int*>(smem_raw + 116756);
     const int smem_work_item_resolved_addr = smem + 116756;
 
-    // Mbarrier init (25 groups, 107 barriers)
-    // Mbarriers at smem_raw[0..856)
+    // Mbarrier init (23 groups, 97 barriers)
+    // Mbarriers at smem_raw[0..776)
 
     if (warp == 10) {
         // --- pipeline 'chunk_pipe' ---
@@ -735,10 +796,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
         // --- pipeline 'checkpoint_pipe' ---
         // checkpoint_ready: 2 barriers, init_count=4
         // checkpoint_free: 2 barriers, init_count=1
-        // --- pipeline 'chunk_pipe' ---
-        // prep_diag_ready: 5 barriers, init_count=2
-        // prep_inv16_ready: 5 barriers, init_count=2
         // work_item_ready: 1 barriers, init_count=1
+        // --- pipeline 'chunk_pipe' ---
         // aux_pairwise_inputs_ready: 5 barriers, init_count=1
         // aux_pairwise_consumed: 5 barriers, init_count=1
         // aux_inverse_ready: 5 barriers, init_count=1
@@ -777,14 +836,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
         for (int _bar = lane; _bar < 2; _bar += 32) {
             mbarrier_init(smem + 576 + _bar * 8, 4);
         }
-        for (int _bar = lane; _bar < 2; _bar += 32) {
+        for (int _bar = lane; _bar < 23; _bar += 32) {
             mbarrier_init(smem + 592 + _bar * 8, 1);
-        }
-        for (int _bar = lane; _bar < 10; _bar += 32) {
-            mbarrier_init(smem + 608 + _bar * 8, 2);
-        }
-        for (int _bar = lane; _bar < 21; _bar += 32) {
-            mbarrier_init(smem + 688 + _bar * 8, 1);
         }
         asm volatile("fence.mbarrier_init.release.cluster;");
     }
@@ -792,9 +845,9 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
     __syncwarp();
 
     // TMEM alloc (256 columns, 240 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 856);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 776);
     if (warp == 0) {
-        int _tmem_hold = smem + 856;
+        int _tmem_hold = smem + 776;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(256) : "memory");
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
     }
@@ -821,18 +874,32 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
     #define tmem_dealloc_ready_addr (mbar_base + 568)
     #define checkpoint_ready_addr (mbar_base + 576)
     #define checkpoint_free_addr (mbar_base + 592)
-    #define prep_diag_ready_addr (mbar_base + 608)
-    #define prep_inv16_ready_addr (mbar_base + 648)
-    #define work_item_ready_addr (mbar_base + 688)
-    #define aux_pairwise_inputs_ready_addr (mbar_base + 696)
-    #define aux_pairwise_consumed_addr (mbar_base + 736)
-    #define aux_inverse_ready_addr (mbar_base + 776)
-    #define short_beta_ready_addr (mbar_base + 816)
+    #define work_item_ready_addr (mbar_base + 608)
+    #define aux_pairwise_inputs_ready_addr (mbar_base + 616)
+    #define aux_pairwise_consumed_addr (mbar_base + 656)
+    #define aux_inverse_ready_addr (mbar_base + 696)
+    #define short_beta_ready_addr (mbar_base + 736)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
     const int tmem_tmem_state = taddr + 64;
+    const int tmem_tmem_state_decay0 = taddr + 64;
+    const int tmem_tmem_state_decay1 = taddr + 80;
+    const int tmem_tmem_state_decay2 = taddr + 96;
+    const int tmem_tmem_state_decay3 = taddr + 112;
+    const int tmem_tmem_state_decay4 = taddr + 128;
+    const int tmem_tmem_state_decay5 = taddr + 144;
+    const int tmem_tmem_state_decay6 = taddr + 160;
+    const int tmem_tmem_state_decay7 = taddr + 176;
     const int tmem_tmem_state_inp = taddr;
+    const int tmem_tmem_state_inp_decay0 = taddr;
+    const int tmem_tmem_state_inp_decay1 = taddr + 8;
+    const int tmem_tmem_state_inp_decay2 = taddr + 16;
+    const int tmem_tmem_state_inp_decay3 = taddr + 24;
+    const int tmem_tmem_state_inp_decay4 = taddr + 32;
+    const int tmem_tmem_state_inp_decay5 = taddr + 40;
+    const int tmem_tmem_state_inp_decay6 = taddr + 48;
+    const int tmem_tmem_state_inp_decay7 = taddr + 56;
     const int tmem_tmem_u_acc = taddr + 224;
     const int tmem_tmem_u2_inp = taddr + 224;
     const int tmem_tmem_u2_acc = taddr + 208;
@@ -1113,18 +1180,20 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                         "tcgen05.st.sync.aligned.32x32b.x16.b32"
                         " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
                         :: "r"(taddr + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_2 * 16)), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[0])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[1])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[2])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[3])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[4])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[5])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[6])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[7])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[8])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[9])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[10])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[11])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[12])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[13])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[14])), "r"(*reinterpret_cast<const uint32_t*>(&_tmem_load_1_bf16[15])));
-                    float state_scale[16];
-                    #pragma unroll
-                    for (int state_half = 0; state_half < 2; state_half++) {
+                    {
+                        float state_scale[16];
                         #pragma unroll
-                        for (int state_col = 0; state_col < 16; state_col++) {
-                            state_scale[state_col] = smem_restore_factor_all[compute_stage * 5376 + (unsigned int)(state_col_block_2 * 32) + (unsigned int)(state_half * 16) + (unsigned int)state_col];
+                        for (int state_half = 0; state_half < 2; state_half++) {
+                            #pragma unroll
+                            for (int state_col = 0; state_col < 16; state_col++) {
+                                state_scale[state_col] = smem_restore_factor_all[compute_stage * 5376 + (unsigned int)(state_col_block_2 * 32) + (unsigned int)(state_half * 16) + (unsigned int)state_col];
+                            }
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 8; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_1 + state_half * 16))[_ls], reinterpret_cast<const float2*>(state_scale)[_ls]);
                         }
-                        #pragma unroll
-                        for (int _ls = 0; _ls < 8; _ls++)
-                            mul_f32x2_inplace(&reinterpret_cast<float2*>((_tmem_load_1 + state_half * 16))[_ls], reinterpret_cast<const float2*>(state_scale)[_ls]);
+                        tmem_st_x32_f32(state_addr, _tmem_load_1);
                     }
-                    tmem_st_x32_f32(state_addr, _tmem_load_1);
                     {
                         if (state_col_block_2 == 1) {
                             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
@@ -1642,10 +1711,10 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     {
                         __nv_bfloat16 beta0_bf16 = smem_prep_beta_bf16_all[stage_f32 * 2 + row0];
                         __nv_bfloat16 beta1_bf16 = smem_prep_beta_bf16_all[stage_f32 * 2 + row1];
-                        float _cvt_f32_14 = __bfloat162float(beta0_bf16);
-                        beta0 = _cvt_f32_14;
-                        float _cvt_f32_15 = __bfloat162float(beta1_bf16);
-                        beta1 = _cvt_f32_15;
+                        float _cvt_f32_24 = __bfloat162float(beta0_bf16);
+                        beta0 = _cvt_f32_24;
+                        float _cvt_f32_25 = __bfloat162float(beta1_bf16);
+                        beta1 = _cvt_f32_25;
                     }
                     float l_values[8];
                     l_values[0] = 0.0f;
@@ -1657,44 +1726,44 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     l_values[6] = 0.0f;
                     l_values[7] = 0.0f;
                     if (row0 > col0) {
-                        __nv_bfloat16 _cvt_bf16_6 = __float2bfloat16(acc[0] * beta0);
-                        float _cvt_f32_16 = __bfloat162float(_cvt_bf16_6);
-                        l_values[0] = _cvt_f32_16;
+                        __nv_bfloat16 _cvt_bf16_14 = __float2bfloat16(acc[0] * beta0);
+                        float _cvt_f32_26 = __bfloat162float(_cvt_bf16_14);
+                        l_values[0] = _cvt_f32_26;
                     }
                     if (row0 > col0 + 1) {
-                        __nv_bfloat16 _cvt_bf16_7 = __float2bfloat16(acc[1] * beta0);
-                        float _cvt_f32_17 = __bfloat162float(_cvt_bf16_7);
-                        l_values[1] = _cvt_f32_17;
+                        __nv_bfloat16 _cvt_bf16_15 = __float2bfloat16(acc[1] * beta0);
+                        float _cvt_f32_27 = __bfloat162float(_cvt_bf16_15);
+                        l_values[1] = _cvt_f32_27;
                     }
                     if (row1 > col0) {
-                        __nv_bfloat16 _cvt_bf16_8 = __float2bfloat16(acc[2] * beta1);
-                        float _cvt_f32_18 = __bfloat162float(_cvt_bf16_8);
-                        l_values[2] = _cvt_f32_18;
+                        __nv_bfloat16 _cvt_bf16_16 = __float2bfloat16(acc[2] * beta1);
+                        float _cvt_f32_28 = __bfloat162float(_cvt_bf16_16);
+                        l_values[2] = _cvt_f32_28;
                     }
                     if (row1 > col0 + 1) {
-                        __nv_bfloat16 _cvt_bf16_9 = __float2bfloat16(acc[3] * beta1);
-                        float _cvt_f32_19 = __bfloat162float(_cvt_bf16_9);
-                        l_values[3] = _cvt_f32_19;
+                        __nv_bfloat16 _cvt_bf16_17 = __float2bfloat16(acc[3] * beta1);
+                        float _cvt_f32_29 = __bfloat162float(_cvt_bf16_17);
+                        l_values[3] = _cvt_f32_29;
                     }
                     if (row0 > col0 + 8) {
-                        __nv_bfloat16 _cvt_bf16_10 = __float2bfloat16(acc[4] * beta0);
-                        float _cvt_f32_20 = __bfloat162float(_cvt_bf16_10);
-                        l_values[4] = _cvt_f32_20;
+                        __nv_bfloat16 _cvt_bf16_18 = __float2bfloat16(acc[4] * beta0);
+                        float _cvt_f32_30 = __bfloat162float(_cvt_bf16_18);
+                        l_values[4] = _cvt_f32_30;
                     }
                     if (row0 > col0 + 9) {
-                        __nv_bfloat16 _cvt_bf16_11 = __float2bfloat16(acc[5] * beta0);
-                        float _cvt_f32_21 = __bfloat162float(_cvt_bf16_11);
-                        l_values[5] = _cvt_f32_21;
+                        __nv_bfloat16 _cvt_bf16_19 = __float2bfloat16(acc[5] * beta0);
+                        float _cvt_f32_31 = __bfloat162float(_cvt_bf16_19);
+                        l_values[5] = _cvt_f32_31;
                     }
                     if (row1 > col0 + 8) {
-                        __nv_bfloat16 _cvt_bf16_12 = __float2bfloat16(acc[6] * beta1);
-                        float _cvt_f32_22 = __bfloat162float(_cvt_bf16_12);
-                        l_values[6] = _cvt_f32_22;
+                        __nv_bfloat16 _cvt_bf16_20 = __float2bfloat16(acc[6] * beta1);
+                        float _cvt_f32_32 = __bfloat162float(_cvt_bf16_20);
+                        l_values[6] = _cvt_f32_32;
                     }
                     if (row1 > col0 + 9) {
-                        __nv_bfloat16 _cvt_bf16_13 = __float2bfloat16(acc[7] * beta1);
-                        float _cvt_f32_23 = __bfloat162float(_cvt_bf16_13);
-                        l_values[7] = _cvt_f32_23;
+                        __nv_bfloat16 _cvt_bf16_21 = __float2bfloat16(acc[7] * beta1);
+                        float _cvt_f32_33 = __bfloat162float(_cvt_bf16_21);
+                        l_values[7] = _cvt_f32_33;
                     }
                     unsigned int l_frag[4];
                     #pragma unroll
@@ -2356,8 +2425,6 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
             unsigned int _phase_qk_raw_full = 0;
             unsigned int _phase_short_beta_ready = 0;
             unsigned int _phase_aux_pairwise_consumed = 0;
-            unsigned int _phase_prep_diag_ready = 0;
-            unsigned int _phase_prep_inv16_ready = 0;
             unsigned int _phase_aux_inverse_ready = 0;
             #pragma unroll 1
             for (int prep_iter = 0; prep_iter < num_prep_iters; prep_iter++) {
@@ -2375,11 +2442,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 if (chunk_is_full_1 != 0) {
                     if (prep_local_warp == 0) {
                         if (elect_sync()) {
-                            mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, 4352);
+                            mbarrier_arrive_expect_tx(gate_raw_full_addr + (prep_stage) * 8, 4096);
                             tma_3d_gmem2smem(smem_g_raw_addr + prep_stage * 21504, g_tma, 0, head_idx_3, (int)(bos_4 + (long long)(chunk_idx_3 * 16)), gate_raw_full_addr + (prep_stage) * 8);
-                            {
-                                tma_2d_gmem2smem(smem_beta_raw_addr + prep_stage * 21504, beta_tma, ((0) ? 0 : head_idx_3 / 8 * 8), (int)(((0) ? (bos_4 + (long long)(chunk_idx_3 * 16)) / 2 : bos_4 + (long long)(chunk_idx_3 * 16))), gate_raw_full_addr + (prep_stage) * 8);
-                            }
                             mbarrier_arrive_expect_tx(qk_raw_full_addr + (prep_stage) * 8, 8192);
                             tma_4d_gmem2smem(smem_kd_addr + prep_stage * 21504, k_tma, 0, (int)(bos_4 + (long long)(chunk_idx_3 * 16)), head_idx_3, 0, qk_raw_full_addr + (prep_stage) * 8);
                         }
@@ -2389,23 +2453,8 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                         float beta_logit = 0.0f;
                         {
                             {
-                                unsigned int beta_raw_pair[1];
-                                asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&beta_raw_pair[0])) : "r"(smem_beta_raw_addr + prep_stage * 21504 + (unsigned int)(lane * 16) + (unsigned int)(head_idx_3 % 8 / 2 * 4)));
-                                float beta_raw_pair_f32[2];
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        "shl.b32 %0, %2, 16;\n\t"
-                                        "and.b32 %1, %2, 0xffff0000;\n\t"
-                                        "}\n"
-                                        : "=f"((&beta_raw_pair_f32[_pair * 2])[0]), "=f"((&beta_raw_pair_f32[_pair * 2])[1])
-                                        : "r"(beta_raw_pair[_pair]));
-                                }
-                                beta_logit = beta_raw_pair_f32[0];
-                                if (head_idx_3 % 2 != 0) {
-                                    beta_logit = beta_raw_pair_f32[1];
-                                }
+                                long long beta_token = bos_4 + (long long)(chunk_idx_3 * 16 + lane);
+                                beta_logit = (float)beta[beta_token * beta_token_stride + (long long)head_idx_3];
                             }
                         }
                         float _tanh_approx_1;
@@ -2459,13 +2508,13 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     asm volatile("barrier.sync %0, 128;" :: "r"(10 + prep_instance) : "memory");
                 }
                 if (prep_local_warp == 2 && lane < 16) {
-                    long long beta_token = bos_4 + (long long)(chunk_idx_3 * 16 + lane);
+                    long long beta_token_1 = bos_4 + (long long)(chunk_idx_3 * 16 + lane);
                     float beta_value = early_beta_value;
                     if (chunk_is_full_1 == 0) {
-                        if (beta_token < eos_4) {
-                            float beta_logit_1 = (float)beta[beta_token * (long long)num_heads + (long long)head_idx_3];
+                        if (beta_token_1 < eos_4) {
+                            float beta_logit_1 = (float)beta[beta_token_1 * (long long)num_heads + (long long)head_idx_3];
                             {
-                                beta_logit_1 = (float)beta[beta_token * beta_token_stride + (long long)head_idx_3];
+                                beta_logit_1 = (float)beta[beta_token_1 * beta_token_stride + (long long)head_idx_3];
                             }
                             float _tanh_approx_3;
                             asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_3) : "f"(beta_logit_1 * 0.5f));
@@ -2571,16 +2620,20 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     for (int value_idx_4 = 0; value_idx_4 < 8; value_idx_4++) {
                         k_raw_vec[value_idx_4] = packed_0_f32[value_idx_4];
                     }
-                    float q_sum = 0.0f;
-                    float k_sum = 0.0f;
-                    for (int elem_in_segment = 0; elem_in_segment < 8; elem_in_segment++) {
-                        float q_raw = q_raw_vec[elem_in_segment];
-                        float k_raw = k_raw_vec[elem_in_segment];
-                        float _fma_0 = __fmaf_rn(q_raw, q_raw, q_sum);
-                        q_sum = _fma_0;
-                        float _fma_1 = __fmaf_rn(k_raw, k_raw, k_sum);
-                        k_sum = _fma_1;
+                    float2 _f2_7 = make_float2(0.0f, 0.0f);
+                    float2 q_sum_pair = _f2_7;
+                    float2 _f2_8 = make_float2(0.0f, 0.0f);
+                    float2 k_sum_pair = _f2_8;
+                    for (int elem_pair = 0; elem_pair < 4; elem_pair++) {
+                        float2 _f2_9 = make_float2(q_raw_vec[elem_pair * 2], q_raw_vec[elem_pair * 2 + 1]);
+                        float2 q_raw_pair = _f2_9;
+                        float2 _f2_10 = make_float2(k_raw_vec[elem_pair * 2], k_raw_vec[elem_pair * 2 + 1]);
+                        float2 k_raw_pair = _f2_10;
+                        q_sum_pair = fma_f32x2(q_raw_pair, q_raw_pair, q_sum_pair);
+                        k_sum_pair = fma_f32x2(k_raw_pair, k_raw_pair, k_sum_pair);
                     }
+                    float q_sum = q_sum_pair.x + q_sum_pair.y;
+                    float k_sum = k_sum_pair.x + k_sum_pair.y;
                     float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, q_sum, 8);
                     q_sum += _shfl_xor_0;
                     float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, k_sum, 8);
@@ -2612,15 +2665,15 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                     float qd_vec[8];
                     float kd_vec[8];
                     float ki_vec[8];
-                    for (int elem_in_segment_1 = 0; elem_in_segment_1 < 8; elem_in_segment_1++) {
-                        int col = segment * 8 + elem_in_segment_1;
+                    for (int elem_in_segment = 0; elem_in_segment < 8; elem_in_segment++) {
+                        int col = segment * 8 + elem_in_segment;
                         float prefix = smem_gate_all[stage_f32_1 + row * 128 + col];
                         float common_log2 = smem_gate_all[stage_f32_1 + 1024 + col];
                         float _exp2_2 = approx_exp2(prefix - common_log2);
                         float decay = _exp2_2;
-                        qd_vec[elem_in_segment_1] = decay;
-                        kd_vec[elem_in_segment_1] = decay;
-                        ki_vec[elem_in_segment_1] = k_raw_vec[elem_in_segment_1] / decay;
+                        qd_vec[elem_in_segment] = decay;
+                        kd_vec[elem_in_segment] = decay;
+                        ki_vec[elem_in_segment] = k_raw_vec[elem_in_segment] / decay;
                     }
                     #pragma unroll
                     for (int _ls = 0; _ls < 4; _ls++)
@@ -2876,16 +2929,16 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                         #pragma unroll
                         for (int restore_elem = 0; restore_elem < 8; restore_elem++) {
                             int restore_col = restore_segment * 8 + restore_elem;
-                            __nv_bfloat16 _cvt_bf16_3 = __float2bfloat16(restore_ki_values[restore_elem]);
-                            float _cvt_f32_11 = __bfloat162float(_cvt_bf16_3);
-                            float restore_ki_carrier = _cvt_f32_11;
+                            __nv_bfloat16 _cvt_bf16_11 = __float2bfloat16(restore_ki_values[restore_elem]);
+                            float _cvt_f32_21 = __bfloat162float(_cvt_bf16_11);
+                            float restore_ki_carrier = _cvt_f32_21;
                             float restore_total = smem_restore_factor_all[stage_f32_0 + restore_col];
-                            __nv_bfloat16 _cvt_bf16_4 = __float2bfloat16(restore_total);
-                            float _cvt_f32_12 = __bfloat162float(_cvt_bf16_4);
-                            float restore_total_carrier = _cvt_f32_12;
-                            __nv_bfloat16 _cvt_bf16_5 = __float2bfloat16(restore_ki_carrier * restore_total_carrier);
-                            float _cvt_f32_13 = __bfloat162float(_cvt_bf16_5);
-                            restore_kr_values[restore_elem] = _cvt_f32_13;
+                            __nv_bfloat16 _cvt_bf16_12 = __float2bfloat16(restore_total);
+                            float _cvt_f32_22 = __bfloat162float(_cvt_bf16_12);
+                            float restore_total_carrier = _cvt_f32_22;
+                            __nv_bfloat16 _cvt_bf16_13 = __float2bfloat16(restore_ki_carrier * restore_total_carrier);
+                            float _cvt_f32_23 = __bfloat162float(_cvt_bf16_13);
+                            restore_kr_values[restore_elem] = _cvt_f32_23;
                         }
                         unsigned int packed_0_1[4];
                         #pragma unroll
@@ -2950,7 +3003,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
                 }
                 for (int _advance = 0; _advance < 5; _advance++) {
                     prep_stage += 1;
-                    if (prep_stage == 5) { prep_stage = 0; _phase_raw_inputs_free ^= 1; _phase_gate_raw_full ^= 1; _phase_smem_free ^= 1; _phase_v_free ^= 1; _phase_qk_raw_full ^= 1; _phase_short_beta_ready ^= 1; _phase_aux_pairwise_consumed ^= 1; _phase_prep_diag_ready ^= 1; _phase_prep_inv16_ready ^= 1; _phase_aux_inverse_ready ^= 1; }
+                    if (prep_stage == 5) { prep_stage = 0; _phase_raw_inputs_free ^= 1; _phase_gate_raw_full ^= 1; _phase_smem_free ^= 1; _phase_v_free ^= 1; _phase_qk_raw_full ^= 1; _phase_short_beta_ready ^= 1; _phase_aux_pairwise_consumed ^= 1; _phase_aux_inverse_ready ^= 1; }
                 }
             }
         }
@@ -2960,3 +3013,4 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, FlashKDATensorMap
 }
 
 } // extern "C"
+// clang-format on

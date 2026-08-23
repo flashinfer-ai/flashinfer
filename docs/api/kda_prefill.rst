@@ -67,12 +67,19 @@ CUDA 12.8 predates the family target, so CC 10.0 uses legacy exact
 ``sm_100f`` module per schedule for both CC 10.0 and CC 10.3. Cache keys also
 include the frozen module identity so an older schedule cannot satisfy a
 refreshed request. Runtime routing remains device-specific: persistent M128
-is restricted to measured 148/152-SM CC 10.0 devices, while CC 10.3 uses the
-direct schedules. On either capability, fixed-layout calls with at most eight
-total sequence/head tasks, at most eight heads, and at least 2,048 tokens per
-sequence use the small-BH owner/helper schedule when all eight CTAs per task
-can reside concurrently. Calls outside that measured region continue through
-the existing direct or fallback route; it is not a public-input allowlist.
+is restricted to measured 148/152-SM CC 10.0 devices. CC 10.3 uses the direct
+schedules, with a tensor-core state-decay specialization for uniform, complete
+N32 work when there are at least 64 heads, at least 96 sequence/head tasks,
+and the maximum sequence length is a multiple of 32 and at least 256. Mixed or
+partial N32 tails retain scalar state decay. On either capability, fixed-layout
+calls with at most eight total sequence/head tasks, at most eight heads, and at
+least 2,048 tokens per sequence use the small-BH owner/helper schedule when all
+eight CTAs per task can reside concurrently. Calls outside that measured region
+continue through the existing direct or fallback route; it is not a public-input
+allowlist.
+
+The dense beta-TMA BT16 one-wave route uses the S9 chain schedule when both
+value-split CTAs for every task fit in one device wave.
 
 At maximum sequence length 16 or below, H96 uses the N32 schedule to retain
 the qualified BF16 error bound; H12 and other qualified head counts retain N16.

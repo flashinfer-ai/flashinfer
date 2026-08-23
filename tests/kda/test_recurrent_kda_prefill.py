@@ -951,6 +951,48 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
     )
 
 
+@pytest.mark.parametrize(
+    (
+        "compute_capability",
+        "route",
+        "uniform_sequences",
+        "num_heads",
+        "total_tasks",
+        "max_sequence_length",
+        "expected",
+    ),
+    [
+        ((10, 3), "direct_m128", True, 96, 96, 8192, True),
+        ((10, 3), "direct_m128", True, 64, 512, 1024, True),
+        ((10, 0), "direct_m128", True, 96, 96, 8192, False),
+        ((10, 3), "direct_m128", False, 96, 96, 8192, False),
+        ((10, 3), "direct_m128", True, 96, 96, 8191, False),
+        ((10, 3), "direct_m128", True, 64, 64, 1024, False),
+        ((10, 3), "independent_dvsplit_m64", True, 96, 96, 8192, False),
+    ],
+)
+def test_n32_tensor_state_decay_policy_matches_measured_region(
+    compute_capability,
+    route,
+    uniform_sequences,
+    num_heads,
+    total_tasks,
+    max_sequence_length,
+    expected,
+):
+    assert (
+        kda_prefill_api._should_use_n32_tensor_state_decay(
+            compute_capability=compute_capability,
+            route=route,
+            uniform_sequences=uniform_sequences,
+            num_heads=num_heads,
+            total_tasks=total_tasks,
+            max_sequence_length=max_sequence_length,
+        )
+        is expected
+    )
+
+
 def test_variant_selector_exposes_specialized_routes_only_when_requested():
     assert (
         kda_prefill_api._select_flash_kda_prefill_variant(
@@ -1115,7 +1157,7 @@ def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
         num_sequences=1,
         num_heads=64,
         max_sequence_length=4096,
-    ) == ("bt16_prepare_beta_tma", "bt16_chain_m64_s8", True)
+    ) == ("bt16_prepare_beta_tma", "bt16_chain_m64_s9", True)
     assert kda_prefill_api._select_bt16_physical_variants(
         compute_capability=(10, 3),
         sm_count=152,
@@ -1147,7 +1189,7 @@ def test_bt16_two_stage_adapter_reuses_descriptors_across_state_rotations(monkey
     chain_module = _RecorderModule()
     modules = {
         "bt16_prepare_beta_tma": prepare_module,
-        "bt16_chain_m64_s8": chain_module,
+        "bt16_chain_m64_s9": chain_module,
     }
     monkeypatch.setattr(
         kda_prefill_api,
@@ -1520,6 +1562,101 @@ def test_h12_n32_specializations_reach_ffi(
     assert len(args) == 28
     assert tuple(args[5].shape) == expected_beta_tma_shape
     assert (args[5].data_ptr() == inputs["beta"].data_ptr()) is expect_alias
+
+
+def test_sm103_uniform_n32_tensor_state_decay_reaches_m128_ffi(
+    cuda_device,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 3)
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_is_cuda_version_at_least", lambda version: True
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_flash_kda_device_sm_count", lambda device: 152
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(seq_lens=[256], num_heads=96, packed=False)
+    recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        backend="cake",
+    )
+
+    assert routes == [("m128_tensor_state_decay", "sm100f")]
+    assert len(module.calls[0]) == 28
+
+
+def test_frozen_sm103_tensor_state_decay_matches_scalar_control(
+    flash_kda_device,
+    monkeypatch,
+):
+    if get_compute_capability(flash_kda_device) != (10, 3):
+        pytest.skip("tensor-core state decay is selected only on CC 10.3")
+
+    inputs = _make_inputs(
+        seq_lens=[256],
+        num_heads=96,
+        packed=False,
+        initial_state=True,
+        seed=25696,
+    )
+    initial_state_seed = inputs["initial_state"].clone()
+    routes = []
+    get_module = kda_prefill_api._get_flash_kda_prefill_module
+
+    def recording_get_module(variant, target):
+        routes.append((variant, target))
+        return get_module(variant, target)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        recording_get_module,
+    )
+    actual_output, actual_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+    actual_output = actual_output.clone()
+    actual_state = actual_state.clone()
+
+    inputs["initial_state"].copy_(initial_state_seed)
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_n32_tensor_state_decay",
+        lambda **kwargs: False,
+    )
+    expected_output, expected_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    expected_target = kda_prefill_api._select_flash_kda_prefill_target(flash_kda_device)
+    assert routes == [
+        ("m128_tensor_state_decay", expected_target),
+        ("m128", expected_target),
+    ]
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
 
 
 def test_pair_packed_h12_beta_requires_an_even_dense_carrier(cuda_device):
@@ -3174,7 +3311,7 @@ def test_cute_dsl_packed_tensor_map_stride_above_int32_matches_cake(
 
 def test_frozen_prefill_m64_matches_reference(flash_kda_device):
     inputs = _make_inputs(
-        seq_lens=[2],
+        seq_lens=[512],
         num_heads=64,
         packed=False,
         initial_state=True,
@@ -3192,6 +3329,7 @@ def test_frozen_prefill_m64_matches_reference(flash_kda_device):
         **_strict_prefill_kwargs(inputs),
         output=output,
         output_final_state=True,
+        backend="cake",
     )
 
     assert actual_output.data_ptr() == output.data_ptr()

@@ -30,6 +30,7 @@ from .core import (
 FlashKDAVariant = Literal[
     "m64",
     "m128",
+    "m128_tensor_state_decay",
     "m128_h12_short",
     "m128_h12_long",
     "m128_n16",
@@ -47,6 +48,7 @@ FlashKDATarget = Literal["sm100a", "sm100f"]
 FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "m64",
     "m128",
+    "m128_tensor_state_decay",
     "m128_h12_short",
     "m128_h12_long",
     "m128_n16",
@@ -73,16 +75,17 @@ _FLASH_KDA_TARGET_DEFINE = {
 # implementation. This prevents an installed JIT/AOT cache from satisfying a
 # refreshed export or binding specialization after an in-place package upgrade.
 _FLASH_KDA_MODULE_IDENTS = {
-    "m64": "9a5566f3be",
-    "m128": "ae83f7331a",
-    "m128_h12_short": "fe0a070282",
-    "m128_h12_long": "9e4219f788",
-    "m128_n16": "bfc7b64cd3",
+    "m64": "942c2fbe91",
+    "m128": "1e4650d41d",
+    "m128_tensor_state_decay": "0d8d9e6964",
+    "m128_h12_short": "d25044154d",
+    "m128_h12_long": "88cedfb168",
+    "m128_n16": "b4614a4ae4",
     # Generated body, binding, and shared binding header, separated by NUL
     # bytes without a trailing separator. Keep this route's cache key tied to
     # all compiled content.
     "m128_n16_checkpoint": "3fce0271a4",
-    "persistent_m128": "aae6c933e8",
+    "persistent_m128": "be9bb4cea9",
     "small_bh_m128": "84472afa2f",
     "bt16_prepare": "2c6cc4c1f6",
     "bt16_prepare_beta_tma": "d9394ce430",
@@ -94,6 +97,7 @@ _FLASH_KDA_MODULE_IDENTS = {
 _FLASH_KDA_BINDING_STEMS = {
     "m64": "flashkda_bf16_fused_m64",
     "m128": "flashkda_bf16_fused_m128",
+    "m128_tensor_state_decay": "flashkda_bf16_fused_m128",
     "m128_h12_short": "cake_flashkda_bf16_fused_m128_h12",
     "m128_h12_long": "cake_flashkda_bf16_fused_m128_h12",
     "m128_n16": "cake_flashkda_bf16_fused_m128_n16",
@@ -108,6 +112,7 @@ _FLASH_KDA_BINDING_STEMS = {
 }
 
 _FLASH_KDA_VARIANT_DEFINES = {
+    "m128_tensor_state_decay": "-DFLASHINFER_FLASH_KDA_TENSOR_STATE_DECAY=1",
     "m128_h12_short": "-DFLASHINFER_FLASH_KDA_H12_SHORT=1",
     "m128_h12_long": "-DFLASHINFER_FLASH_KDA_H12_LONG=1",
 }
@@ -209,6 +214,14 @@ def gen_flash_kda_m128_module(target: FlashKDATarget) -> JitSpec:
     return gen_flash_kda_module("m128", target)
 
 
+def gen_flash_kda_m128_tensor_state_decay_module(
+    target: FlashKDATarget,
+) -> JitSpec:
+    """Generate the full-tile SM103 tensor state-decay M128 module."""
+
+    return gen_flash_kda_module("m128_tensor_state_decay", target)
+
+
 def gen_flash_kda_m128_h12_short_module(target: FlashKDATarget) -> JitSpec:
     """Generate the short-sequence H12 N32 M128 module."""
 
@@ -296,6 +309,12 @@ def load_flash_kda_m128_module(target: FlashKDATarget):
     return load_flash_kda_module("m128", target)
 
 
+def load_flash_kda_m128_tensor_state_decay_module(target: FlashKDATarget):
+    """Load the full-tile SM103 tensor state-decay M128 module."""
+
+    return load_flash_kda_module("m128_tensor_state_decay", target)
+
+
 def load_flash_kda_m128_h12_short_module(target: FlashKDATarget):
     """Load the short-sequence H12 N32 M128 module."""
 
@@ -363,6 +382,7 @@ __all__ = [
     "gen_flash_kda_bt16_prepare_module",
     "gen_flash_kda_m64_module",
     "gen_flash_kda_m128_module",
+    "gen_flash_kda_m128_tensor_state_decay_module",
     "gen_flash_kda_m128_h12_short_module",
     "gen_flash_kda_m128_h12_long_module",
     "gen_flash_kda_m128_n16_module",
@@ -374,6 +394,7 @@ __all__ = [
     "get_flash_kda_uri",
     "load_flash_kda_m64_module",
     "load_flash_kda_m128_module",
+    "load_flash_kda_m128_tensor_state_decay_module",
     "load_flash_kda_m128_h12_short_module",
     "load_flash_kda_m128_h12_long_module",
     "load_flash_kda_m128_n16_module",

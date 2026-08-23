@@ -22,17 +22,17 @@ from flashinfer.jit import flash_kda
 _H12_CASES = (
     (
         "m128_h12_short",
-        "fe0a070282",
+        "d25044154d",
         "-DFLASHINFER_FLASH_KDA_H12_SHORT=1",
         "cake_flashkda_bf16_fused_m128_h12_short.cu",
-        "d53eb6c03047625fce5c365c0e217bbd511fe64abf20112a1cfff496b27c39ad",
+        "3472d562b61a2eb865f4a075cbae14bf199a357abc2d9476127350106be40b27",
     ),
     (
         "m128_h12_long",
-        "9e4219f788",
+        "88cedfb168",
         "-DFLASHINFER_FLASH_KDA_H12_LONG=1",
         "cake_flashkda_bf16_fused_m128_h12_long.cu",
-        "abbebbc936a6af5a35c7cb5497b1c40136079896904edda6d10ef986556584c3",
+        "edc4085329fa659498b0a790407579afc0aeab48bac08b6b57e5de462e7754f7",
     ),
 )
 
@@ -88,3 +88,36 @@ def test_h12_prefill_jit_spec_and_frozen_source(
 def test_h12_prefill_variants_are_in_the_aot_inventory():
     assert "m128_h12_short" in flash_kda.FLASH_KDA_VARIANTS
     assert "m128_h12_long" in flash_kda.FLASH_KDA_VARIANTS
+
+
+@pytest.mark.parametrize(
+    ("target", "target_define"),
+    (
+        ("sm100a", "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=0"),
+        ("sm100f", "-DFLASHINFER_FLASH_KDA_TARGET_FAMILY=100"),
+    ),
+)
+def test_tensor_state_decay_jit_spec_and_frozen_source(target, target_define):
+    flash_kda.gen_flash_kda_module.cache_clear()
+    spec = flash_kda.gen_flash_kda_module("m128_tensor_state_decay", target)
+
+    assert spec.name == f"flash_kda_bf16_m128_tensor_state_decay_0d8d9e6964_{target}"
+    assert spec.sources == [
+        flash_kda._get_flash_kda_csrc_dir() / "flashkda_bf16_fused_m128_binding.cu"
+    ]
+    assert "-DFLASHINFER_FLASH_KDA_TENSOR_STATE_DECAY=1" in spec.extra_cuda_cflags
+    assert target_define in spec.extra_cuda_cflags
+    assert sum("-gencode=arch=compute_" in flag for flag in spec.extra_cuda_cflags) == 1
+
+    frozen_source = (
+        flash_kda._get_flash_kda_csrc_dir()
+        / "cake_flashkda_bf16_fused_m128_tensor_state_decay.cu"
+    )
+    payload = frozen_source.read_bytes()
+    assert hashlib.sha256(payload).hexdigest() == (
+        "c84b37d139728dba0f96d021825695922dc2ed080d99d3530734b9ef7bfaea50"
+    )
+    assert "flashkda_bf16_fused_m128_0d8d9e6964." in payload.decode()
+    assert "m128_tensor_state_decay" in flash_kda.FLASH_KDA_VARIANTS
+
+    flash_kda.gen_flash_kda_module.cache_clear()

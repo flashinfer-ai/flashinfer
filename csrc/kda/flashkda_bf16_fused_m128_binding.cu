@@ -27,7 +27,11 @@
 #define FlashKDATensorMap flashkda_generated_FlashKDATensorMap
 #define FlashKDATensorMapPack flashkda_generated_FlashKDATensorMapPack
 #define CUtensorMap flashkda_generated_CUtensorMap
+#if defined(FLASHINFER_FLASH_KDA_TENSOR_STATE_DECAY)
+#include "cake_flashkda_bf16_fused_m128_tensor_state_decay.cu"
+#else
 #include "flashkda_bf16_fused_m128.cu"
+#endif
 #undef CUtensorMap
 #undef FlashKDATensorMapPack
 #undef FlashKDATensorMap
@@ -47,7 +51,11 @@ namespace flash_kda {
 constexpr int kThreads = 1024;
 static_assert(STORE_BACKWARD_TAPE == 0);
 static_assert(SPLIT_WORK_ITEMS == 0);
+#if defined(FLASHINFER_FLASH_KDA_TENSOR_STATE_DECAY)
+static_assert(SMEM_TOTAL == 232064);
+#else
 static_assert(SMEM_TOTAL == 227968);
+#endif
 
 void RunM128(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
              TensorView beta_tma, TensorView A_log, TensorView dt_bias, TensorView cu_seqlens,
