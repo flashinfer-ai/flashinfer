@@ -1,8 +1,16 @@
-// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-// SPDX-License-Identifier: Apache-2.0
-// Generated source. Do not edit.
-#include <stdint.h>
-#include <cuda.h>
+typedef signed char        int8_t;
+typedef unsigned char      uint8_t;
+typedef unsigned short     uint16_t;
+typedef unsigned int       uint32_t;
+typedef unsigned long long uint64_t;
+typedef signed int         int32_t;
+typedef short int          int16_t;
+struct __align__(128) FlashInferTensorMap { uint64_t opaque[16]; };
+template <int N>
+struct __align__(128) FlashInferTensorMapPack { FlashInferTensorMap maps[N]; };
+
+typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
+
 #include <cuda_bf16.h>
 
 __device__ __forceinline__ int make_warp_uniform(int x) {
@@ -167,97 +175,265 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
         }
         __syncthreads();
         if (num_payloads > 0) {
-            unsigned long long source_base_0 = (unsigned long long)local_token_idx * (unsigned long long)payload_0_bytes;
-            #pragma unroll 1
-            for (int byte_0 = tid; byte_0 < payload_0_bytes; byte_0 += 256) {
-                uint8_t byte_value_0 = payload_0[source_base_0 + (unsigned long long)byte_0];
+            unsigned long long source_base = (unsigned long long)local_token_idx * (unsigned long long)payload_0_bytes;
+            if (payload_0_bytes % 16 == 0) {
+                int* payload_i32 = reinterpret_cast<int*>(payload_0);
+                int* workspace_i32_0 = reinterpret_cast<int*>(workspace);
                 #pragma unroll 1
-                for (int k_0 = 0; k_0 < top_k; k_0++) {
-                    int target_rank_0 = smem_target_ranks[k_0];
-                    int send_index_0 = smem_send_indices[k_0];
-                    if (send_index_0 >= 0) {
-                        unsigned long long destination_0 = (unsigned long long)target_rank_0 * workspace_stride_bytes + payload_0_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_0) * (unsigned long long)payload_0_bytes + (unsigned long long)byte_0;
-                        workspace[destination_0] = byte_value_0;
+                for (int byte_offset = tid * 16; byte_offset < payload_0_bytes; byte_offset += 4096) {
+                    int _vec_load_0[4];
+                    {
+                        int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32 + (source_base + (unsigned long long)byte_offset) / 4);
+                        _vec_load_0[0 + 0] = _iv4.x;
+                        _vec_load_0[0 + 1] = _iv4.y;
+                        _vec_load_0[0 + 2] = _iv4.z;
+                        _vec_load_0[0 + 3] = _iv4.w;
+                    }
+                    #pragma unroll 1
+                    for (int k_1 = 0; k_1 < top_k; k_1++) {
+                        int target_rank_1 = smem_target_ranks[k_1];
+                        int send_index_1 = smem_send_indices[k_1];
+                        if (send_index_1 >= 0) {
+                            unsigned long long destination = (unsigned long long)target_rank_1 * workspace_stride_bytes + payload_0_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_1) * (unsigned long long)payload_0_bytes + (unsigned long long)byte_offset;
+                            {
+                                int4 _iv4 = make_int4(_vec_load_0[0 + 0], _vec_load_0[0 + 1], _vec_load_0[0 + 2], _vec_load_0[0 + 3]);
+                                *reinterpret_cast<int4*>(workspace_i32_0 + destination / 4) = _iv4;
+                            }
+                        }
+                    }
+                }
+            } else {
+                #pragma unroll 1
+                for (int byte_offset_1 = tid; byte_offset_1 < payload_0_bytes; byte_offset_1 += 256) {
+                    uint8_t byte_value = payload_0[source_base + (unsigned long long)byte_offset_1];
+                    #pragma unroll 1
+                    for (int k_2 = 0; k_2 < top_k; k_2++) {
+                        int target_rank_2 = smem_target_ranks[k_2];
+                        int send_index_2 = smem_send_indices[k_2];
+                        if (send_index_2 >= 0) {
+                            unsigned long long destination_1 = (unsigned long long)target_rank_2 * workspace_stride_bytes + payload_0_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_2) * (unsigned long long)payload_0_bytes + (unsigned long long)byte_offset_1;
+                            workspace[destination_1] = byte_value;
+                        }
                     }
                 }
             }
         }
         if (num_payloads > 1) {
             unsigned long long source_base_1 = (unsigned long long)local_token_idx * (unsigned long long)payload_1_bytes;
-            #pragma unroll 1
-            for (int byte_1 = tid; byte_1 < payload_1_bytes; byte_1 += 256) {
-                uint8_t byte_value_1 = payload_1[source_base_1 + (unsigned long long)byte_1];
+            if (payload_1_bytes % 16 == 0) {
+                int* payload_i32_1 = reinterpret_cast<int*>(payload_1);
+                int* workspace_i32_0_1 = reinterpret_cast<int*>(workspace);
                 #pragma unroll 1
-                for (int k_1 = 0; k_1 < top_k; k_1++) {
-                    int target_rank_1 = smem_target_ranks[k_1];
-                    int send_index_1 = smem_send_indices[k_1];
-                    if (send_index_1 >= 0) {
-                        unsigned long long destination_1 = (unsigned long long)target_rank_1 * workspace_stride_bytes + payload_1_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_1) * (unsigned long long)payload_1_bytes + (unsigned long long)byte_1;
-                        workspace[destination_1] = byte_value_1;
+                for (int byte_offset_2 = tid * 16; byte_offset_2 < payload_1_bytes; byte_offset_2 += 4096) {
+                    int _vec_load_1[4];
+                    {
+                        int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32_1 + (source_base_1 + (unsigned long long)byte_offset_2) / 4);
+                        _vec_load_1[0 + 0] = _iv4.x;
+                        _vec_load_1[0 + 1] = _iv4.y;
+                        _vec_load_1[0 + 2] = _iv4.z;
+                        _vec_load_1[0 + 3] = _iv4.w;
+                    }
+                    #pragma unroll 1
+                    for (int k_3 = 0; k_3 < top_k; k_3++) {
+                        int target_rank_3 = smem_target_ranks[k_3];
+                        int send_index_3 = smem_send_indices[k_3];
+                        if (send_index_3 >= 0) {
+                            unsigned long long destination_2 = (unsigned long long)target_rank_3 * workspace_stride_bytes + payload_1_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_3) * (unsigned long long)payload_1_bytes + (unsigned long long)byte_offset_2;
+                            {
+                                int4 _iv4 = make_int4(_vec_load_1[0 + 0], _vec_load_1[0 + 1], _vec_load_1[0 + 2], _vec_load_1[0 + 3]);
+                                *reinterpret_cast<int4*>(workspace_i32_0_1 + destination_2 / 4) = _iv4;
+                            }
+                        }
+                    }
+                }
+            } else {
+                #pragma unroll 1
+                for (int byte_offset_3 = tid; byte_offset_3 < payload_1_bytes; byte_offset_3 += 256) {
+                    uint8_t byte_value_1 = payload_1[source_base_1 + (unsigned long long)byte_offset_3];
+                    #pragma unroll 1
+                    for (int k_4 = 0; k_4 < top_k; k_4++) {
+                        int target_rank_4 = smem_target_ranks[k_4];
+                        int send_index_4 = smem_send_indices[k_4];
+                        if (send_index_4 >= 0) {
+                            unsigned long long destination_3 = (unsigned long long)target_rank_4 * workspace_stride_bytes + payload_1_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_4) * (unsigned long long)payload_1_bytes + (unsigned long long)byte_offset_3;
+                            workspace[destination_3] = byte_value_1;
+                        }
                     }
                 }
             }
         }
         if (num_payloads > 2) {
             unsigned long long source_base_2 = (unsigned long long)local_token_idx * (unsigned long long)payload_2_bytes;
-            #pragma unroll 1
-            for (int byte_2 = tid; byte_2 < payload_2_bytes; byte_2 += 256) {
-                uint8_t byte_value_2 = payload_2[source_base_2 + (unsigned long long)byte_2];
+            if (payload_2_bytes % 16 == 0) {
+                int* payload_i32_2 = reinterpret_cast<int*>(payload_2);
+                int* workspace_i32_0_2 = reinterpret_cast<int*>(workspace);
                 #pragma unroll 1
-                for (int k_2 = 0; k_2 < top_k; k_2++) {
-                    int target_rank_2 = smem_target_ranks[k_2];
-                    int send_index_2 = smem_send_indices[k_2];
-                    if (send_index_2 >= 0) {
-                        unsigned long long destination_2 = (unsigned long long)target_rank_2 * workspace_stride_bytes + payload_2_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_2) * (unsigned long long)payload_2_bytes + (unsigned long long)byte_2;
-                        workspace[destination_2] = byte_value_2;
+                for (int byte_offset_4 = tid * 16; byte_offset_4 < payload_2_bytes; byte_offset_4 += 4096) {
+                    int _vec_load_2[4];
+                    {
+                        int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32_2 + (source_base_2 + (unsigned long long)byte_offset_4) / 4);
+                        _vec_load_2[0 + 0] = _iv4.x;
+                        _vec_load_2[0 + 1] = _iv4.y;
+                        _vec_load_2[0 + 2] = _iv4.z;
+                        _vec_load_2[0 + 3] = _iv4.w;
+                    }
+                    #pragma unroll 1
+                    for (int k_5 = 0; k_5 < top_k; k_5++) {
+                        int target_rank_5 = smem_target_ranks[k_5];
+                        int send_index_5 = smem_send_indices[k_5];
+                        if (send_index_5 >= 0) {
+                            unsigned long long destination_4 = (unsigned long long)target_rank_5 * workspace_stride_bytes + payload_2_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_5) * (unsigned long long)payload_2_bytes + (unsigned long long)byte_offset_4;
+                            {
+                                int4 _iv4 = make_int4(_vec_load_2[0 + 0], _vec_load_2[0 + 1], _vec_load_2[0 + 2], _vec_load_2[0 + 3]);
+                                *reinterpret_cast<int4*>(workspace_i32_0_2 + destination_4 / 4) = _iv4;
+                            }
+                        }
+                    }
+                }
+            } else {
+                #pragma unroll 1
+                for (int byte_offset_5 = tid; byte_offset_5 < payload_2_bytes; byte_offset_5 += 256) {
+                    uint8_t byte_value_2 = payload_2[source_base_2 + (unsigned long long)byte_offset_5];
+                    #pragma unroll 1
+                    for (int k_6 = 0; k_6 < top_k; k_6++) {
+                        int target_rank_6 = smem_target_ranks[k_6];
+                        int send_index_6 = smem_send_indices[k_6];
+                        if (send_index_6 >= 0) {
+                            unsigned long long destination_5 = (unsigned long long)target_rank_6 * workspace_stride_bytes + payload_2_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_6) * (unsigned long long)payload_2_bytes + (unsigned long long)byte_offset_5;
+                            workspace[destination_5] = byte_value_2;
+                        }
                     }
                 }
             }
         }
         if (num_payloads > 3) {
             unsigned long long source_base_3 = (unsigned long long)local_token_idx * (unsigned long long)payload_3_bytes;
-            #pragma unroll 1
-            for (int byte_3 = tid; byte_3 < payload_3_bytes; byte_3 += 256) {
-                uint8_t byte_value_3 = payload_3[source_base_3 + (unsigned long long)byte_3];
+            if (payload_3_bytes % 16 == 0) {
+                int* payload_i32_3 = reinterpret_cast<int*>(payload_3);
+                int* workspace_i32_0_3 = reinterpret_cast<int*>(workspace);
                 #pragma unroll 1
-                for (int k_3 = 0; k_3 < top_k; k_3++) {
-                    int target_rank_3 = smem_target_ranks[k_3];
-                    int send_index_3 = smem_send_indices[k_3];
-                    if (send_index_3 >= 0) {
-                        unsigned long long destination_3 = (unsigned long long)target_rank_3 * workspace_stride_bytes + payload_3_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_3) * (unsigned long long)payload_3_bytes + (unsigned long long)byte_3;
-                        workspace[destination_3] = byte_value_3;
+                for (int byte_offset_6 = tid * 16; byte_offset_6 < payload_3_bytes; byte_offset_6 += 4096) {
+                    int _vec_load_3[4];
+                    {
+                        int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32_3 + (source_base_3 + (unsigned long long)byte_offset_6) / 4);
+                        _vec_load_3[0 + 0] = _iv4.x;
+                        _vec_load_3[0 + 1] = _iv4.y;
+                        _vec_load_3[0 + 2] = _iv4.z;
+                        _vec_load_3[0 + 3] = _iv4.w;
+                    }
+                    #pragma unroll 1
+                    for (int k_7 = 0; k_7 < top_k; k_7++) {
+                        int target_rank_7 = smem_target_ranks[k_7];
+                        int send_index_7 = smem_send_indices[k_7];
+                        if (send_index_7 >= 0) {
+                            unsigned long long destination_6 = (unsigned long long)target_rank_7 * workspace_stride_bytes + payload_3_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_7) * (unsigned long long)payload_3_bytes + (unsigned long long)byte_offset_6;
+                            {
+                                int4 _iv4 = make_int4(_vec_load_3[0 + 0], _vec_load_3[0 + 1], _vec_load_3[0 + 2], _vec_load_3[0 + 3]);
+                                *reinterpret_cast<int4*>(workspace_i32_0_3 + destination_6 / 4) = _iv4;
+                            }
+                        }
+                    }
+                }
+            } else {
+                #pragma unroll 1
+                for (int byte_offset_7 = tid; byte_offset_7 < payload_3_bytes; byte_offset_7 += 256) {
+                    uint8_t byte_value_3 = payload_3[source_base_3 + (unsigned long long)byte_offset_7];
+                    #pragma unroll 1
+                    for (int k_8 = 0; k_8 < top_k; k_8++) {
+                        int target_rank_8 = smem_target_ranks[k_8];
+                        int send_index_8 = smem_send_indices[k_8];
+                        if (send_index_8 >= 0) {
+                            unsigned long long destination_7 = (unsigned long long)target_rank_8 * workspace_stride_bytes + payload_3_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_8) * (unsigned long long)payload_3_bytes + (unsigned long long)byte_offset_7;
+                            workspace[destination_7] = byte_value_3;
+                        }
                     }
                 }
             }
         }
         if (num_payloads > 4) {
             unsigned long long source_base_4 = (unsigned long long)local_token_idx * (unsigned long long)payload_4_bytes;
-            #pragma unroll 1
-            for (int byte_4 = tid; byte_4 < payload_4_bytes; byte_4 += 256) {
-                uint8_t byte_value_4 = payload_4[source_base_4 + (unsigned long long)byte_4];
+            if (payload_4_bytes % 16 == 0) {
+                int* payload_i32_4 = reinterpret_cast<int*>(payload_4);
+                int* workspace_i32_0_4 = reinterpret_cast<int*>(workspace);
                 #pragma unroll 1
-                for (int k_4 = 0; k_4 < top_k; k_4++) {
-                    int target_rank_4 = smem_target_ranks[k_4];
-                    int send_index_4 = smem_send_indices[k_4];
-                    if (send_index_4 >= 0) {
-                        unsigned long long destination_4 = (unsigned long long)target_rank_4 * workspace_stride_bytes + payload_4_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_4) * (unsigned long long)payload_4_bytes + (unsigned long long)byte_4;
-                        workspace[destination_4] = byte_value_4;
+                for (int byte_offset_8 = tid * 16; byte_offset_8 < payload_4_bytes; byte_offset_8 += 4096) {
+                    int _vec_load_4[4];
+                    {
+                        int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32_4 + (source_base_4 + (unsigned long long)byte_offset_8) / 4);
+                        _vec_load_4[0 + 0] = _iv4.x;
+                        _vec_load_4[0 + 1] = _iv4.y;
+                        _vec_load_4[0 + 2] = _iv4.z;
+                        _vec_load_4[0 + 3] = _iv4.w;
+                    }
+                    #pragma unroll 1
+                    for (int k_9 = 0; k_9 < top_k; k_9++) {
+                        int target_rank_9 = smem_target_ranks[k_9];
+                        int send_index_9 = smem_send_indices[k_9];
+                        if (send_index_9 >= 0) {
+                            unsigned long long destination_8 = (unsigned long long)target_rank_9 * workspace_stride_bytes + payload_4_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_9) * (unsigned long long)payload_4_bytes + (unsigned long long)byte_offset_8;
+                            {
+                                int4 _iv4 = make_int4(_vec_load_4[0 + 0], _vec_load_4[0 + 1], _vec_load_4[0 + 2], _vec_load_4[0 + 3]);
+                                *reinterpret_cast<int4*>(workspace_i32_0_4 + destination_8 / 4) = _iv4;
+                            }
+                        }
+                    }
+                }
+            } else {
+                #pragma unroll 1
+                for (int byte_offset_9 = tid; byte_offset_9 < payload_4_bytes; byte_offset_9 += 256) {
+                    uint8_t byte_value_4 = payload_4[source_base_4 + (unsigned long long)byte_offset_9];
+                    #pragma unroll 1
+                    for (int k_10 = 0; k_10 < top_k; k_10++) {
+                        int target_rank_10 = smem_target_ranks[k_10];
+                        int send_index_10 = smem_send_indices[k_10];
+                        if (send_index_10 >= 0) {
+                            unsigned long long destination_9 = (unsigned long long)target_rank_10 * workspace_stride_bytes + payload_4_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_10) * (unsigned long long)payload_4_bytes + (unsigned long long)byte_offset_9;
+                            workspace[destination_9] = byte_value_4;
+                        }
                     }
                 }
             }
         }
         if (num_payloads > 5) {
             unsigned long long source_base_5 = (unsigned long long)local_token_idx * (unsigned long long)payload_5_bytes;
-            #pragma unroll 1
-            for (int byte_5 = tid; byte_5 < payload_5_bytes; byte_5 += 256) {
-                uint8_t byte_value_5 = payload_5[source_base_5 + (unsigned long long)byte_5];
+            if (payload_5_bytes % 16 == 0) {
+                int* payload_i32_5 = reinterpret_cast<int*>(payload_5);
+                int* workspace_i32_0_5 = reinterpret_cast<int*>(workspace);
                 #pragma unroll 1
-                for (int k_5 = 0; k_5 < top_k; k_5++) {
-                    int target_rank_5 = smem_target_ranks[k_5];
-                    int send_index_5 = smem_send_indices[k_5];
-                    if (send_index_5 >= 0) {
-                        unsigned long long destination_5 = (unsigned long long)target_rank_5 * workspace_stride_bytes + payload_5_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_5) * (unsigned long long)payload_5_bytes + (unsigned long long)byte_5;
-                        workspace[destination_5] = byte_value_5;
+                for (int byte_offset_10 = tid * 16; byte_offset_10 < payload_5_bytes; byte_offset_10 += 4096) {
+                    int _vec_load_5[4];
+                    {
+                        int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32_5 + (source_base_5 + (unsigned long long)byte_offset_10) / 4);
+                        _vec_load_5[0 + 0] = _iv4.x;
+                        _vec_load_5[0 + 1] = _iv4.y;
+                        _vec_load_5[0 + 2] = _iv4.z;
+                        _vec_load_5[0 + 3] = _iv4.w;
+                    }
+                    #pragma unroll 1
+                    for (int k_11 = 0; k_11 < top_k; k_11++) {
+                        int target_rank_11 = smem_target_ranks[k_11];
+                        int send_index_11 = smem_send_indices[k_11];
+                        if (send_index_11 >= 0) {
+                            unsigned long long destination_10 = (unsigned long long)target_rank_11 * workspace_stride_bytes + payload_5_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_11) * (unsigned long long)payload_5_bytes + (unsigned long long)byte_offset_10;
+                            {
+                                int4 _iv4 = make_int4(_vec_load_5[0 + 0], _vec_load_5[0 + 1], _vec_load_5[0 + 2], _vec_load_5[0 + 3]);
+                                *reinterpret_cast<int4*>(workspace_i32_0_5 + destination_10 / 4) = _iv4;
+                            }
+                        }
+                    }
+                }
+            } else {
+                #pragma unroll 1
+                for (int byte_offset_11 = tid; byte_offset_11 < payload_5_bytes; byte_offset_11 += 256) {
+                    uint8_t byte_value_5 = payload_5[source_base_5 + (unsigned long long)byte_offset_11];
+                    #pragma unroll 1
+                    for (int k_12 = 0; k_12 < top_k; k_12++) {
+                        int target_rank_12 = smem_target_ranks[k_12];
+                        int send_index_12 = smem_send_indices[k_12];
+                        if (send_index_12 >= 0) {
+                            unsigned long long destination_11 = (unsigned long long)target_rank_12 * workspace_stride_bytes + payload_5_offset + ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index_12) * (unsigned long long)payload_5_bytes + (unsigned long long)byte_offset_11;
+                            workspace[destination_11] = byte_value_5;
+                        }
                     }
                 }
             }
@@ -283,16 +459,16 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
         is_last_token = _shfl_0;
         if (is_last_token != 0) {
             #pragma unroll 1
-            for (int target_rank_6 = lane; target_rank_6 < ep_size; target_rank_6 += 32) {
+            for (int target_rank_13 = lane; target_rank_13 < ep_size; target_rank_13 += 32) {
                 int rank_is_active_1 = 1;
                 if (enable_rank_mask) {
                     unsigned long long completion_bit_one = 1;
-                    unsigned long long target_bit_1 = completion_bit_one << (unsigned long long)target_rank_6;
+                    unsigned long long target_bit_1 = completion_bit_one << (unsigned long long)target_rank_13;
                     rank_is_active_1 = (((active_rank_mask & target_bit_1) != 0) ? 1 : 0);
                 }
                 if (rank_is_active_1 != 0) {
-                    unsigned long long send_counter_index_1 = (local_workspace_base + send_counters_offset) / 4 + (unsigned long long)target_rank_6;
-                    unsigned long long recv_counter_index = ((unsigned long long)target_rank_6 * workspace_stride_bytes + recv_counters_offset) / 4 + (unsigned long long)ep_rank;
+                    unsigned long long send_counter_index_1 = (local_workspace_base + send_counters_offset) / 4 + (unsigned long long)target_rank_13;
+                    unsigned long long recv_counter_index = ((unsigned long long)target_rank_13 * workspace_stride_bytes + recv_counters_offset) / 4 + (unsigned long long)ep_rank;
                     workspace_i32[recv_counter_index] = workspace_i32[send_counter_index_1];
                 }
             }
@@ -383,7 +559,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_flashinfer_mnnvl_moe_alltoall_stage_combine(uint8_t* __restrict__ payload, uint8_t* __restrict__ workspace, unsigned long long workspace_stride_bytes, unsigned long long flag_val_offset, unsigned long long destination_offset, unsigned long long payload_bytes, int ep_rank, bool enable_pdl)
+kernel_flashinfer_mnnvl_moe_alltoall_stage_combine(uint8_t* __restrict__ payload, uint8_t* __restrict__ workspace, unsigned long long workspace_stride_bytes, unsigned long long flag_val_offset, unsigned long long destination_offset, unsigned long long payload_bytes, bool advance_generation, int ep_rank, bool enable_pdl)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -398,18 +574,38 @@ kernel_flashinfer_mnnvl_moe_alltoall_stage_combine(uint8_t* __restrict__ payload
         asm volatile("griddepcontrol.wait;" ::: "memory");
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    if (bid == 0) {
-        if (tid == 0) {
-            unsigned int* workspace_u32 = reinterpret_cast<unsigned int*>(workspace);
-            unsigned long long flag_index = ((unsigned long long)ep_rank * workspace_stride_bytes + flag_val_offset) / 4;
-            workspace_u32[flag_index] = workspace_u32[flag_index] + 1;
+    if (advance_generation) {
+        if (bid == 0) {
+            if (tid == 0) {
+                unsigned int* workspace_u32 = reinterpret_cast<unsigned int*>(workspace);
+                unsigned long long flag_index = ((unsigned long long)ep_rank * workspace_stride_bytes + flag_val_offset) / 4;
+                workspace_u32[flag_index] = workspace_u32[flag_index] + 1;
+            }
         }
     }
     unsigned long long linear_thread = (unsigned long long)bid * 256 + (unsigned long long)tid;
     unsigned long long thread_stride = (unsigned long long)num_bids * 256;
+    unsigned long long vector_bytes = payload_bytes / 16 * 16;
+    int* payload_i32 = reinterpret_cast<int*>(payload);
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
     #pragma unroll 1
-    for (unsigned long long byte_index = linear_thread; byte_index < payload_bytes; byte_index += thread_stride) {
-        workspace[destination_offset + byte_index] = payload[byte_index];
+    for (unsigned long long byte_index = linear_thread * 16; byte_index < vector_bytes; byte_index += thread_stride * 16) {
+        int _vec_load_0[4];
+        {
+            int4 _iv4 = *reinterpret_cast<const int4*>(payload_i32 + byte_index / 4);
+            _vec_load_0[0 + 0] = _iv4.x;
+            _vec_load_0[0 + 1] = _iv4.y;
+            _vec_load_0[0 + 2] = _iv4.z;
+            _vec_load_0[0 + 3] = _iv4.w;
+        }
+        {
+            int4 _iv4 = make_int4(_vec_load_0[0 + 0], _vec_load_0[0 + 1], _vec_load_0[0 + 2], _vec_load_0[0 + 3]);
+            *reinterpret_cast<int4*>(workspace_i32 + (destination_offset + byte_index) / 4) = _iv4;
+        }
+    }
+    #pragma unroll 1
+    for (unsigned long long byte_index_1 = vector_bytes + linear_thread; byte_index_1 < payload_bytes; byte_index_1 += thread_stride) {
+        workspace[destination_offset + byte_index_1] = payload[byte_index_1];
     }
 }
 
@@ -426,7 +622,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_stage_combine(uint8_t* __restrict__ payload
 extern "C" {
 
 __global__ __launch_bounds__(64) void
-kernel_flashinfer_mnnvl_moe_alltoall_publish_combine(uint8_t* __restrict__ workspace, unsigned long long workspace_stride_bytes, unsigned long long flag_val_offset, unsigned long long completion_flags_offset, int ep_rank, int ep_size, bool enable_pdl, bool enable_rank_mask, unsigned long long active_rank_mask)
+kernel_flashinfer_mnnvl_moe_alltoall_publish_combine(uint8_t* __restrict__ workspace, unsigned long long workspace_stride_bytes, unsigned long long flag_val_offset, unsigned long long completion_flags_offset, bool advance_generation, int ep_rank, int ep_size, bool enable_pdl, bool enable_rank_mask, unsigned long long active_rank_mask)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -443,6 +639,12 @@ kernel_flashinfer_mnnvl_moe_alltoall_publish_combine(uint8_t* __restrict__ works
         asm volatile("griddepcontrol.wait;" ::: "memory");
     }
     unsigned long long expected_index = (local_workspace_base + flag_val_offset) / 4;
+    if (advance_generation) {
+        if (tid == 0) {
+            workspace_u32[expected_index] = workspace_u32[expected_index] + 1;
+        }
+        __syncthreads();
+    }
     unsigned int expected_value = workspace_u32[expected_index];
     asm volatile("fence.release.sys;" ::: "memory");
     if (tid < ep_size) {
@@ -518,6 +720,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_1(uint8_t* __restrict__ works
     if (token < local_num_tokens) {
         unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
         unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
         #pragma unroll 1
         for (int column = tid; column < elements_per_token; column += 256) {
             float contributions[TOP_K];
@@ -527,8 +736,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_1(uint8_t* __restrict__ works
             }
             #pragma unroll
             for (int route = 0; route < TOP_K; route++) {
-                int target_rank = workspace_i32[target_base + (unsigned long long)route];
-                int send_index = workspace_i32[send_base + (unsigned long long)route];
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
                 if (target_rank >= 0 && send_index >= 0) {
                     unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
                     unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
@@ -654,6 +863,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_2(uint8_t* __restrict__ works
     if (token < local_num_tokens) {
         unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
         unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
         #pragma unroll 1
         for (int column = tid; column < elements_per_token; column += 256) {
             float contributions[TOP_K];
@@ -663,8 +879,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_2(uint8_t* __restrict__ works
             }
             #pragma unroll
             for (int route = 0; route < TOP_K; route++) {
-                int target_rank = workspace_i32[target_base + (unsigned long long)route];
-                int send_index = workspace_i32[send_base + (unsigned long long)route];
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
                 if (target_rank >= 0 && send_index >= 0) {
                     unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
                     unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
@@ -791,6 +1007,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_4(uint8_t* __restrict__ works
     if (token < local_num_tokens) {
         unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
         unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
         #pragma unroll 1
         for (int column = tid; column < elements_per_token; column += 256) {
             float contributions[TOP_K];
@@ -800,8 +1023,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_4(uint8_t* __restrict__ works
             }
             #pragma unroll
             for (int route = 0; route < TOP_K; route++) {
-                int target_rank = workspace_i32[target_base + (unsigned long long)route];
-                int send_index = workspace_i32[send_base + (unsigned long long)route];
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
                 if (target_rank >= 0 && send_index >= 0) {
                     unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
                     unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
@@ -928,6 +1151,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_6(uint8_t* __restrict__ works
     if (token < local_num_tokens) {
         unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
         unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
         #pragma unroll 1
         for (int column = tid; column < elements_per_token; column += 256) {
             float contributions[TOP_K];
@@ -937,8 +1167,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_6(uint8_t* __restrict__ works
             }
             #pragma unroll
             for (int route = 0; route < TOP_K; route++) {
-                int target_rank = workspace_i32[target_base + (unsigned long long)route];
-                int send_index = workspace_i32[send_base + (unsigned long long)route];
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
                 if (target_rank >= 0 && send_index >= 0) {
                     unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
                     unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
@@ -1065,6 +1295,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_8(uint8_t* __restrict__ works
     if (token < local_num_tokens) {
         unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
         unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
         #pragma unroll 1
         for (int column = tid; column < elements_per_token; column += 256) {
             float contributions[TOP_K];
@@ -1074,8 +1311,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_8(uint8_t* __restrict__ works
             }
             #pragma unroll
             for (int route = 0; route < TOP_K; route++) {
-                int target_rank = workspace_i32[target_base + (unsigned long long)route];
-                int send_index = workspace_i32[send_base + (unsigned long long)route];
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
                 if (target_rank >= 0 && send_index >= 0) {
                     unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
                     unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
@@ -1202,6 +1439,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_10(uint8_t* __restrict__ work
     if (token < local_num_tokens) {
         unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
         unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
         #pragma unroll 1
         for (int column = tid; column < elements_per_token; column += 256) {
             float contributions[TOP_K];
@@ -1211,8 +1455,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_10(uint8_t* __restrict__ work
             }
             #pragma unroll
             for (int route = 0; route < TOP_K; route++) {
-                int target_rank = workspace_i32[target_base + (unsigned long long)route];
-                int send_index = workspace_i32[send_base + (unsigned long long)route];
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
                 if (target_rank >= 0 && send_index >= 0) {
                     unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
                     unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
@@ -1339,6 +1583,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_12(uint8_t* __restrict__ work
     if (token < local_num_tokens) {
         unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
         unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
         #pragma unroll 1
         for (int column = tid; column < elements_per_token; column += 256) {
             float contributions[TOP_K];
@@ -1348,8 +1599,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_12(uint8_t* __restrict__ work
             }
             #pragma unroll
             for (int route = 0; route < TOP_K; route++) {
-                int target_rank = workspace_i32[target_base + (unsigned long long)route];
-                int send_index = workspace_i32[send_base + (unsigned long long)route];
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
                 if (target_rank >= 0 && send_index >= 0) {
                     unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
                     unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
@@ -1481,6 +1732,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_14(uint8_t* __restrict__ work
     if (token < local_num_tokens) {
         unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
         unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
         #pragma unroll 1
         for (int column = tid; column < elements_per_token; column += 256) {
             float contributions[TOP_K];
@@ -1490,8 +1748,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_14(uint8_t* __restrict__ work
             }
             #pragma unroll
             for (int route = 0; route < TOP_K; route++) {
-                int target_rank = workspace_i32[target_base + (unsigned long long)route];
-                int send_index = workspace_i32[send_base + (unsigned long long)route];
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
                 if (target_rank >= 0 && send_index >= 0) {
                     unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
                     unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
@@ -1623,6 +1881,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_16(uint8_t* __restrict__ work
     if (token < local_num_tokens) {
         unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
         unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
         #pragma unroll 1
         for (int column = tid; column < elements_per_token; column += 256) {
             float contributions[TOP_K];
@@ -1632,8 +1897,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_16(uint8_t* __restrict__ work
             }
             #pragma unroll
             for (int route = 0; route < TOP_K; route++) {
-                int target_rank = workspace_i32[target_base + (unsigned long long)route];
-                int send_index = workspace_i32[send_base + (unsigned long long)route];
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
                 if (target_rank >= 0 && send_index >= 0) {
                     unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
                     unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
@@ -1764,6 +2029,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_18(uint8_t* __restrict__ work
     if (token < local_num_tokens) {
         unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
         unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
         #pragma unroll 1
         for (int column = tid; column < elements_per_token; column += 256) {
             float contributions[TOP_K];
@@ -1773,8 +2045,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_18(uint8_t* __restrict__ work
             }
             #pragma unroll
             for (int route = 0; route < TOP_K; route++) {
-                int target_rank = workspace_i32[target_base + (unsigned long long)route];
-                int send_index = workspace_i32[send_base + (unsigned long long)route];
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
                 if (target_rank >= 0 && send_index >= 0) {
                     unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
                     unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
@@ -1906,6 +2178,13 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_22(uint8_t* __restrict__ work
     if (token < local_num_tokens) {
         unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
         unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * (unsigned long long)TOP_K;
+        int target_ranks[TOP_K];
+        int send_indices[TOP_K];
+        #pragma unroll
+        for (int route_load = 0; route_load < TOP_K; route_load++) {
+            target_ranks[route_load] = workspace_i32[target_base + (unsigned long long)route_load];
+            send_indices[route_load] = workspace_i32[send_base + (unsigned long long)route_load];
+        }
         #pragma unroll 1
         for (int column = tid; column < elements_per_token; column += 256) {
             float contributions[TOP_K];
@@ -1915,8 +2194,8 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_22(uint8_t* __restrict__ work
             }
             #pragma unroll
             for (int route = 0; route < TOP_K; route++) {
-                int target_rank = workspace_i32[target_base + (unsigned long long)route];
-                int send_index = workspace_i32[send_base + (unsigned long long)route];
+                int target_rank = target_ranks[route];
+                int send_index = send_indices[route];
                 if (target_rank >= 0 && send_index >= 0) {
                     unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
                     unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
@@ -2025,6 +2304,181 @@ kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_22(uint8_t* __restrict__ work
 
 #define FLASHINFER_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
+#define THREADS 256
+
+extern "C" {
+
+__global__ __launch_bounds__(256) void
+kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8(uint8_t* __restrict__ workspace, uint8_t* __restrict__ output, unsigned long long workspace_stride_bytes, unsigned long long topk_target_ranks_offset, unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset, int max_tokens_per_rank, int local_num_tokens, int elements_per_token, int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank, bool use_low_precision, bool enable_pdl)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    // === Task calls (dependency order) ===
+    if (enable_pdl) {
+        asm volatile("griddepcontrol.wait;" ::: "memory");
+    }
+    int* workspace_i32 = reinterpret_cast<int*>(workspace);
+    __nv_bfloat16* workspace_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+    __nv_bfloat16* output_bf16 = reinterpret_cast<__nv_bfloat16*>(output);
+    unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+    int token = bid;
+    if (token < local_num_tokens) {
+        unsigned long long target_base = (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * 8;
+        unsigned long long send_base = (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * 8;
+        #pragma unroll 1
+        for (int column = tid * 8; column < elements_per_token; column += 2048) {
+            float contributions[64];
+            contributions[0] = 0.0f;
+            contributions[1] = 0.0f;
+            contributions[2] = 0.0f;
+            contributions[3] = 0.0f;
+            contributions[4] = 0.0f;
+            contributions[5] = 0.0f;
+            contributions[6] = 0.0f;
+            contributions[7] = 0.0f;
+            contributions[8] = 0.0f;
+            contributions[9] = 0.0f;
+            contributions[10] = 0.0f;
+            contributions[11] = 0.0f;
+            contributions[12] = 0.0f;
+            contributions[13] = 0.0f;
+            contributions[14] = 0.0f;
+            contributions[15] = 0.0f;
+            contributions[16] = 0.0f;
+            contributions[17] = 0.0f;
+            contributions[18] = 0.0f;
+            contributions[19] = 0.0f;
+            contributions[20] = 0.0f;
+            contributions[21] = 0.0f;
+            contributions[22] = 0.0f;
+            contributions[23] = 0.0f;
+            contributions[24] = 0.0f;
+            contributions[25] = 0.0f;
+            contributions[26] = 0.0f;
+            contributions[27] = 0.0f;
+            contributions[28] = 0.0f;
+            contributions[29] = 0.0f;
+            contributions[30] = 0.0f;
+            contributions[31] = 0.0f;
+            contributions[32] = 0.0f;
+            contributions[33] = 0.0f;
+            contributions[34] = 0.0f;
+            contributions[35] = 0.0f;
+            contributions[36] = 0.0f;
+            contributions[37] = 0.0f;
+            contributions[38] = 0.0f;
+            contributions[39] = 0.0f;
+            contributions[40] = 0.0f;
+            contributions[41] = 0.0f;
+            contributions[42] = 0.0f;
+            contributions[43] = 0.0f;
+            contributions[44] = 0.0f;
+            contributions[45] = 0.0f;
+            contributions[46] = 0.0f;
+            contributions[47] = 0.0f;
+            contributions[48] = 0.0f;
+            contributions[49] = 0.0f;
+            contributions[50] = 0.0f;
+            contributions[51] = 0.0f;
+            contributions[52] = 0.0f;
+            contributions[53] = 0.0f;
+            contributions[54] = 0.0f;
+            contributions[55] = 0.0f;
+            contributions[56] = 0.0f;
+            contributions[57] = 0.0f;
+            contributions[58] = 0.0f;
+            contributions[59] = 0.0f;
+            contributions[60] = 0.0f;
+            contributions[61] = 0.0f;
+            contributions[62] = 0.0f;
+            contributions[63] = 0.0f;
+            #pragma unroll
+            for (int route = 0; route < 8; route++) {
+                int target_rank = workspace_i32[target_base + (unsigned long long)route];
+                int send_index = workspace_i32[send_base + (unsigned long long)route];
+                if (target_rank >= 0 && send_index >= 0) {
+                    unsigned long long payload_item = ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank + (unsigned long long)send_index) * (unsigned long long)elements_per_token + (unsigned long long)column;
+                    unsigned long long byte_index = (unsigned long long)target_rank * workspace_stride_bytes + combine_payload_offset + payload_item * (unsigned long long)payload_element_bytes;
+                    float _vec_load_0[8];
+                    {
+                        const uint4* _vptr_0 = reinterpret_cast<const uint4*>(workspace_bf16 + byte_index / 2);
+                        uint4 _vld_0[1];
+                        #pragma unroll
+                        for (int _blk = 0; _blk < 1; _blk++) {
+                            _vld_0[_blk] = _vptr_0[_blk];
+                            uint32_t* _vpairs_0 = reinterpret_cast<uint32_t*>(&_vld_0[_blk]);
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 4; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
+                                    : "r"(_vpairs_0[_pair]));
+                            }
+                        }
+                    }
+                    #pragma unroll
+                    for (int element = 0; element < 8; element++) {
+                        float value = _vec_load_0[element];
+                        if (use_low_precision) {
+                            float _fp8_rt_0;
+                            uint16_t _e4m3x2_1;
+                            uint32_t _f16x2_1;
+                            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_1) : "f"(0.0f), "f"(value));
+                            asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_1) : "h"(_e4m3x2_1));
+                            uint16_t _fp8_h0_1 = (uint16_t)(_f16x2_1 & 0xFFFFu);
+                            asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_1));
+                            value = _fp8_rt_0;
+                        }
+                        contributions[route * 8 + element] = value;
+                    }
+                }
+            }
+            #pragma unroll
+            for (int element_1 = 0; element_1 < 8; element_1++) {
+                contributions[element_1] = contributions[element_1] + contributions[8 + element_1];
+                contributions[16 + element_1] = contributions[16 + element_1] + contributions[24 + element_1];
+                contributions[32 + element_1] = contributions[32 + element_1] + contributions[40 + element_1];
+                contributions[48 + element_1] = contributions[48 + element_1] + contributions[56 + element_1];
+                contributions[element_1] = contributions[element_1] + contributions[16 + element_1];
+                contributions[32 + element_1] = contributions[32 + element_1] + contributions[48 + element_1];
+                contributions[element_1] = contributions[element_1] + contributions[32 + element_1];
+            }
+            {
+                __nv_bfloat162 _pk[4];
+                _pk[0] = __floats2bfloat162_rn(contributions[0 + 0], contributions[0 + 1]);
+                _pk[1] = __floats2bfloat162_rn(contributions[0 + 2], contributions[0 + 3]);
+                _pk[2] = __floats2bfloat162_rn(contributions[0 + 4], contributions[0 + 5]);
+                _pk[3] = __floats2bfloat162_rn(contributions[0 + 6], contributions[0 + 7]);
+                *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(output_bf16 + ((unsigned long long)token * (unsigned long long)elements_per_token + (unsigned long long)column)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+            }
+        }
+    }
+    if (enable_pdl) {
+        if (warp == 0) {
+            if (elect_sync()) {
+                asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+            }
+        }
+    }
+}
+
+} // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
 #define THREADS 32
 
 extern "C" {
@@ -2053,17 +2507,18 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(uint8_t* __restrict__ accu
     }
     int column = block_column * block_size + lane;
     int active_lane = ((block_size > lane) ? 1 : 0);
-    float value = 0.0f;
+    float lane_value[1];
+    lane_value[0] = 0.0f;
     if (active_lane != 0) {
         unsigned long long accumulated_item = (unsigned long long)token * (unsigned long long)elements_per_token + (unsigned long long)column;
-        float value_0 = 0.0f;
+        float value = 0.0f;
         if (payload_dtype_code == 0) {
             __nv_bfloat16* source_bf16 = reinterpret_cast<__nv_bfloat16*>(accumulated);
-            value_0 = (float)source_bf16[accumulated_item * (unsigned long long)payload_element_bytes / 2];
+            value = (float)source_bf16[accumulated_item * (unsigned long long)payload_element_bytes / 2];
         }
         if (payload_dtype_code == 1) {
             __half* source_f16 = reinterpret_cast<__half*>(accumulated);
-            value_0 = (float)source_f16[accumulated_item * (unsigned long long)payload_element_bytes / 2];
+            value = (float)source_f16[accumulated_item * (unsigned long long)payload_element_bytes / 2];
         }
         if (payload_dtype_code == 2) {
             uint8_t* source_fp8 = reinterpret_cast<uint8_t*>(accumulated);
@@ -2076,15 +2531,15 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(uint8_t* __restrict__ accu
                 uint16_t _h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
                 asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_vec_load_0[0]) : "h"(_h0_0));
             }
-            value_0 = _vec_load_0[0];
+            value = _vec_load_0[0];
         }
         if (payload_dtype_code == 3) {
             float* source_f32 = reinterpret_cast<float*>(accumulated);
-            value_0 = source_f32[accumulated_item * (unsigned long long)payload_element_bytes / 4];
+            value = source_f32[accumulated_item * (unsigned long long)payload_element_bytes / 4];
         }
-        value = value_0;
+        lane_value[0] = value;
     }
-    float scaled_value = value;
+    float scaled_value = lane_value[0];
     float _fabs_0 = fabsf(scaled_value);
     float block_max = _fabs_0;
     float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, block_max, 16);
@@ -2188,12 +2643,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(uint8_t* __restrict__ accu
             scales_u8[scale_index] = scale_byte;
         }
     }
-    float normalized = 0.0f;
-    if (quant_mode == 3) {
-        normalized = value * actual_scale;
-    } else {
-        normalized = scaled_value * actual_scale;
-    }
+    float normalized = scaled_value * actual_scale;
     if (quant_mode == 1) {
         if (active_lane != 0) {
             {

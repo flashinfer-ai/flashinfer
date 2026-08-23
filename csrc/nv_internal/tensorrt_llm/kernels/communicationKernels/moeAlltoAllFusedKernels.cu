@@ -62,6 +62,10 @@ DECLARE_COMBINE_TOP_K(22)
 
 #undef DECLARE_COMBINE_TOP_K
 
+extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8(
+    uint8_t*, uint8_t*, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, int, int, int, int, int, int, int, bool, bool);
+
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine(
     uint8_t*, uint8_t*, uint8_t*, uint8_t*, uint8_t*, int, int, int, int, int, float, int, int,
     bool);
@@ -160,6 +164,11 @@ void preloadCombineKernel(int top_k) {
 #undef PRELOAD_COMBINE_TOP_K
 }
 
+bool useBf16TopK8Combine(MoeA2ACombineParams const& params) {
+  return params.top_k == 8 && params.dtype == nvinfer1::DataType::kBF16 &&
+         params.elements_per_token % 8 == 0;
+}
+
 uint8_t* localWorkspace(uint8_t* workspace, uint64_t stride, int rank) {
   return workspace + static_cast<uint64_t>(rank) * stride;
 }
@@ -237,7 +246,12 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
                 kernel_flashinfer_mnnvl_moe_alltoall_stage_combine);
   preloadKernel("mnnvl_moe_alltoall_publish_combine",
                 kernel_flashinfer_mnnvl_moe_alltoall_publish_combine);
-  preloadCombineKernel(params.top_k);
+  if (useBf16TopK8Combine(params)) {
+    preloadKernel("mnnvl_moe_alltoall_combine_bf16_topk8",
+                  kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8);
+  } else {
+    preloadCombineKernel(params.top_k);
+  }
   if (params.quant_mode != MoeA2ACombineQuantMode::NONE) {
     preloadKernel("mnnvl_moe_alltoall_quantize_combine",
                   kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine);
@@ -251,7 +265,8 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
                 params.elements_per_token * dtypeBytes(params.dtype);
   int const grid = payload_bytes == 0
                        ? 1
-                       : std::min(128, ceilDiv(payload_bytes, uint64_t{kCombineThreads}));
+                       : std::min(128, ceilDiv(payload_bytes,
+                                              uint64_t{kCombineThreads * 16}));
   launchWithPdlWhenEnabled(
       "mnnvl_moe_alltoall_stage_combine", params.enable_pdl,
       kernel_flashinfer_mnnvl_moe_alltoall_stage_combine, grid, kCombineThreads, 0, params.stream,
@@ -289,6 +304,18 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   int const output_dtype_code =
       params.use_low_precision ? kDTypeBFloat16 : dtypeCode(params.dtype);
   int const grid = std::max(params.local_num_tokens, 1);
+  if (useBf16TopK8Combine(params)) {
+    launchWithPdlWhenEnabled(
+        "mnnvl_moe_alltoall_combine_bf16_topk8", params.enable_pdl,
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8, grid, kCombineThreads, 0,
+        params.stream, params.workspace, static_cast<uint8_t*>(accumulation),
+        params.workspace_stride_bytes, byteOffset(params.topk_target_ranks, rank_workspace),
+        byteOffset(params.topk_send_indices, rank_workspace),
+        byteOffset(params.recv_buffers[params.ep_rank], rank_workspace),
+        params.max_tokens_per_rank, params.local_num_tokens, params.elements_per_token,
+        dtypeBytes(params.dtype), dtypeCode(params.dtype), output_dtype_code, params.ep_rank,
+        params.use_low_precision, params.enable_pdl);
+  } else {
 #define LAUNCH_COMBINE_TOP_K(TOP_K)                                                       \
   case TOP_K:                                                                             \
     launchWithPdlWhenEnabled(                                                              \
@@ -319,6 +346,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
       FLASHINFER_CHECK(false, "unsupported top_k for moe_a2a_combine: ", params.top_k);
   }
 #undef LAUNCH_COMBINE_TOP_K
+  }
 
   if (!quantized || params.local_num_tokens == 0) {
     return;
