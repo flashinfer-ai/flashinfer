@@ -3761,7 +3761,7 @@ def trtllm_batch_decode_with_kv_cache(
                     bmm2_scale = float(bmm2_scale.item())
             run_func = cake_module.cake_paged_attention_decode
 
-        run_func(
+        run_args = [
             out,
             out_scale_factor,
             query,
@@ -3795,9 +3795,15 @@ def trtllm_batch_decode_with_kv_cache(
             lse_stride_heads,
             enable_block_sparse_attention,
             None,  # sparse_mla_top_k_lens
-            bf16q_fp8kv_transform_mode_value,
-            None,  # use_fp16_softmax
-        )
+        ]
+        if backend != "cake":
+            run_args.extend(
+                (
+                    bf16q_fp8kv_transform_mode_value,
+                    None,  # use_fp16_softmax
+                )
+            )
+        run_func(*run_args)
 
         result_out = (
             out

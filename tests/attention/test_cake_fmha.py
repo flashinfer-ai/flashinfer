@@ -1650,6 +1650,41 @@ def test_cake_fmha_context_bf16_exact_route_loads_exact_member(monkeypatch) -> N
     }
 
 
+def test_cake_fmha_context_fp8_route_omits_bf16_exact_profile(monkeypatch) -> None:
+    sentinel = object()
+    observed = {}
+
+    def load(*args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return sentinel
+
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm103a")
+    monkeypatch.setattr(cake_api, "load_cake_fmha_context_fp8_module", load)
+    route = cake_api.CakeFmhaContextRoute(
+        target="sm103a",
+        component="context_fp8",
+        num_m_blocks=1,
+        num_q_heads=32,
+        num_kv_heads=4,
+        pack_g=8,
+        page_size=64,
+        l2_swizzle=8,
+        is_causal=True,
+        return_lse=False,
+        enable_sink=False,
+    )
+    assert cake_api.get_cake_fmha_context_module(torch.device("cpu"), route) is sentinel
+    assert observed == {
+        "args": ("sm103a", 1, 32, 4, 8, 64, 8),
+        "kwargs": {
+            "is_causal": True,
+            "return_lse": False,
+            "enable_sink": False,
+        },
+    }
+
+
 @pytest.mark.parametrize(
     ("component", "loader_name"),
     [
@@ -1796,6 +1831,7 @@ def test_cake_public_decode_route_miss_canonicalizes_only_pinned_noop_skip(
     )
 
     assert result.shape == query.shape
+    assert len(observed["args"]) == 33
     assert observed["args"][26] == expected_ffi_value
 
 

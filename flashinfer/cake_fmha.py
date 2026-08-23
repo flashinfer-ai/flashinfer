@@ -1354,12 +1354,7 @@ def get_cake_fmha_context_module(
                 stacklevel=2,
             )
             return load_cake_fmha_compat_module(route.target)
-    loader = (
-        load_cake_fmha_context_bf16_module
-        if route.component == "context_bf16"
-        else load_cake_fmha_context_fp8_module
-    )
-    return loader(
+    common_args = (
         route.target,
         route.num_m_blocks,
         route.num_q_heads,
@@ -1367,11 +1362,19 @@ def get_cake_fmha_context_module(
         route.pack_g,
         route.page_size,
         route.l2_swizzle,
-        is_causal=route.is_causal,
-        return_lse=route.return_lse,
-        enable_sink=route.enable_sink,
-        exact_profile=route.exact_profile,
     )
+    common_kwargs = {
+        "is_causal": route.is_causal,
+        "return_lse": route.return_lse,
+        "enable_sink": route.enable_sink,
+    }
+    if route.component == "context_bf16":
+        return load_cake_fmha_context_bf16_module(
+            *common_args,
+            **common_kwargs,
+            exact_profile=route.exact_profile,
+        )
+    return load_cake_fmha_context_fp8_module(*common_args, **common_kwargs)
 
 
 def cake_fmha_manifest() -> dict[str, Any]:
