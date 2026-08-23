@@ -26,10 +26,6 @@ def main(input_path: Path, output_path: Path) -> None:
         dtype=q.dtype,
         device="cuda",
     )
-    from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
-        cp_delta_rule_dsl_sm100,
-    )
-
     cu_seqlens = payload.get("cu_seqlens")
     if cu_seqlens is None:
         cu_seqlens = torch.tensor(
@@ -48,20 +44,32 @@ def main(input_path: Path, output_path: Path) -> None:
         )
         expected_state.copy_(expected_initial)
         state_indices = payload["state_indices"].to(device="cuda", dtype=torch.int64)
-        cp_delta_rule_dsl_sm100(
-            expected_output,
-            expected_state,
-            q,
-            k,
-            v,
-            alpha,
-            beta,
-            cu_seqlens,
-            scale,
-            initial_state=expected_initial,
-            state_indices=state_indices,
-            max_seqlen=total,
-        )
+        q_expanded = q.repeat_interleave(state_heads // q.shape[1], dim=1)
+        k_expanded = k.repeat_interleave(state_heads // k.shape[1], dim=1)
+        v_expanded = v.repeat_interleave(state_heads // v.shape[1], dim=1)
+        token_start = 0
+        for seq_index, seq_len in enumerate(seq_lens):
+            state_row = int(state_indices[seq_index])
+            state = expected_initial[state_row].transpose(-1, -2).float().clone()
+            for local_index in range(seq_len):
+                token = token_start + local_index
+                old_state = alpha[token].reshape(-1, 1, 1) * state
+                old_value = torch.einsum(
+                    "hd,hdv->hv", k_expanded[token].float(), old_state
+                )
+                new_value = beta[token].reshape(-1, 1) * v_expanded[token].float()
+                new_value += (1.0 - beta[token].reshape(-1, 1)) * old_value
+                state = old_state - k_expanded[token].float().unsqueeze(
+                    -1
+                ) * old_value.unsqueeze(-2)
+                state += k_expanded[token].float().unsqueeze(-1) * new_value.unsqueeze(
+                    -2
+                )
+                expected_output[token] = scale * torch.einsum(
+                    "hd,hdv->hv", q_expanded[token].float(), state
+                )
+            expected_state[state_row] = state.transpose(-1, -2)
+            token_start += seq_len
         if not torch.equal(expected_initial, expected_initial_before):
             raise RuntimeError("fresh semantic oracle mutated initial state")
         expected_checkpoints = torch.empty(
@@ -70,6 +78,10 @@ def main(input_path: Path, output_path: Path) -> None:
             device="cuda",
         )
     elif mode == "checkpoint_per_sequence":
+        from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
+            cp_delta_rule_dsl_sm100,
+        )
+
         source_state = torch.empty(
             (len(seq_lens), state_heads, q.shape[-1], q.shape[-1]),
             dtype=torch.float32,
