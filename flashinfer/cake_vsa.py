@@ -812,6 +812,7 @@ def _run_fp16(
             plan["num_kv_heads"],
             topk,
             1,
+            0,  # uniform_q_len; use cu_seqlens_q for the direct route
             0,
             0,
             0,

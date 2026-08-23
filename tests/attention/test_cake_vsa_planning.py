@@ -354,6 +354,37 @@ def test_fp16_gqa_metadata_uses_each_kv_head_group(monkeypatch):
     torch.testing.assert_close(q2k[1], torch.full_like(q2k[1], 3))
 
 
+def test_fp16_gqa_launch_passes_uniform_q_len(monkeypatch):
+    launched = []
+    module = types.SimpleNamespace(run=lambda *args: launched.append(args))
+    monkeypatch.setattr(cake_vsa, "_load_module", lambda _profile, _arch: module)
+    monkeypatch.setattr(cake_vsa, "_arch_for_device", lambda _device: "sm_100a")
+    monkeypatch.setattr(
+        cake_vsa,
+        "_fp16_metadata",
+        lambda _plan, q: (q, q, q, q, q, q, 2),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tvm_ffi",
+        types.SimpleNamespace(use_torch_stream=contextlib.nullcontext),
+    )
+    tensor = torch.empty((1,))
+    plan = {
+        "M": 256,
+        "num_qo_heads": 8,
+        "num_kv_heads": 1,
+        "sm_scale": None,
+        "head_dim": 128,
+    }
+
+    cake_vsa._run_fp16(plan, tensor, tensor, tensor, tensor, tensor, False)
+
+    assert len(launched) == 1
+    assert len(launched[0]) == 28
+    assert launched[0][12:21] == (256, 8, 1, 2, 1, 0, 0, 0, 0)
+
+
 def test_ultrasparse_route_rejects_non_six_topk_before_launch(monkeypatch):
     q = torch.empty((1,), dtype=torch.bfloat16)
     plan = {
