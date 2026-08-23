@@ -399,12 +399,17 @@ void cake_paged_attention_context(
   CUtensorMap h_k = EncodeTmaPagedKv(key_cache, "key_cache");
   CUtensorMap h_v = EncodeTmaPagedKv(value_cache, "value_cache");
 #endif
-  void* p_q = TmaDeviceSlot(h_q, query.device().device_id, stream);
-  void* p_k = TmaDeviceSlot(h_k, query.device().device_id, stream);
-  void* p_v = TmaDeviceSlot(h_v, query.device().device_id, stream);
+  auto const* p_q = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_q, query.device().device_id, stream));
+  auto const* p_k = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_k, query.device().device_id, stream));
+  auto const* p_v = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_v, query.device().device_id, stream));
 #if CAKE_FMHA_CONTEXT_NVFP4
-  void* p_ksf = TmaDeviceSlot(h_ksf, query.device().device_id, stream);
-  void* p_vsf = TmaDeviceSlot(h_vsf, query.device().device_id, stream);
+  auto const* p_ksf = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_ksf, query.device().device_id, stream));
+  auto const* p_vsf = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_vsf, query.device().device_id, stream));
 #endif
 
   constexpr int units_per_batch = NUM_Q_HEADS / PACK_G;

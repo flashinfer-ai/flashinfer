@@ -664,6 +664,7 @@ def test_cake_fmha_context_nvfp4_jit_selects_fused_member(
     ).read_text(encoding="utf-8")
     assert "cake_fmha_launch_context_nvfp4(" in adapter
     assert "cake_fmha_launch_context_nvfp4_dequant" not in adapter
+    assert adapter.count("reinterpret_cast<CakeFmhaTensorMap const*>") >= 5
     assert "unsigned int grid_x = total_tiles;" in adapter
 
 
