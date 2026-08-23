@@ -3,7 +3,7 @@
     "sm_100a",
     "sm_103a"
   ],
-  "export_content_sha256": "8890d3fd9b2172221a949871e801a97a37ec3dfc1f294312953bcbff85f0d021",
+  "export_content_sha256": "0aca2368a333ba0703e10d169b537dce35c820705fcaa706314e4eb991802fc7",
   "profiles": [
     {
       "arg_plan": [
@@ -298,23 +298,23 @@
       "device": {
         "sm_100a": {
           "path": "cake_vsa_blk64_persistent_ws_m64n256_sm_100a.cu",
-          "sha256": "ddb700a35a73e36edf545d281b0c621c8972885385661e707d2a2d215efce768",
-          "size_bytes": 101955
+          "sha256": "ea4ee828a75c48810f65a719200591735799ccedb9d2edad5d1dbaa7c0b093df",
+          "size_bytes": 103242
         },
         "sm_103a": {
           "path": "cake_vsa_blk64_persistent_ws_m64n256_sm_103a.cu",
-          "sha256": "ddb700a35a73e36edf545d281b0c621c8972885385661e707d2a2d215efce768",
-          "size_bytes": 101955
+          "sha256": "ea4ee828a75c48810f65a719200591735799ccedb9d2edad5d1dbaa7c0b093df",
+          "size_bytes": 103242
         }
       },
-      "dynamic_smem_bytes": 231936,
+      "dynamic_smem_bytes": 232448,
       "host": {
         "path": "cake_vsa_blk64_persistent_ws_m64n256_host.cpp",
-        "sha256": "6b9c95c445833dd7e097c1c51323a35c8d23832044a0dc98dec4102680e53797",
+        "sha256": "1553a5d16e0b55ec9f3f3ff11107fb216a693c682aa4ea6a2b1f2d3101ae044f",
         "size_bytes": 23375
       },
       "kernel_symbol": "kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100",
-      "module_ident": "flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100_9bebd5eecd",
+      "module_ident": "flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100_9dccd2326c",
       "profile": "blk64_persistent_ws_m64n256",
       "schedule_symbol": "flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100",
       "threads": 384

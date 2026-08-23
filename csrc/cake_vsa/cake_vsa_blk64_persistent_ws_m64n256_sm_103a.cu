@@ -31,10 +31,10 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define SMEM_SCALE_SMEM_OFF 214016
 #define SMEM_SCALE_SMEM_STAGE_BYTES 1536
 #define SMEM_SCALE_SMEM_STRIDE 1536
-#define SMEM_PARTIAL_SMEM_OFF 215552
+#define SMEM_PARTIAL_SMEM_OFF 216064
 #define SMEM_PARTIAL_SMEM_STAGE_BYTES 16384
 #define SMEM_PARTIAL_SMEM_STRIDE 16384
-#define SMEM_TOTAL 231936
+#define SMEM_TOTAL 232448
 #define THREADS 384
 
 #include <math_constants.h>
@@ -523,8 +523,8 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
     const int v_smem_addr = smem + 17408;
     float* scale_smem = reinterpret_cast<float*>(smem_raw + 214016);
     const int scale_smem_addr = smem + 214016;
-    float* partial_smem = reinterpret_cast<float*>(smem_raw + 215552);
-    const int partial_smem_addr = smem + 215552;
+    float* partial_smem = reinterpret_cast<float*>(smem_raw + 216064);
+    const int partial_smem_addr = smem + 216064;
 
     // Mbarrier init (13 groups, 17 barriers)
     // Mbarriers at smem_raw[0..136)
@@ -995,10 +995,14 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                         float2 _reg_reduce_sum2_27 = make_float2(0.0f, 0.0f);
                         softmax_block_sum(&_tmem_load_0[0], &_reg_reduce_sum2_27);
                         softmax_block_sum(&_tmem_load_0[32], &_reg_reduce_sum2_27);
-                        softmax_block_sum(&_tmem_load_0[64], &_reg_reduce_sum2_27);
-                        softmax_block_sum(&_tmem_load_0[96], &_reg_reduce_sum2_27);
                         float _tmem_load_0_sum = _reg_reduce_sum2_27.x + _reg_reduce_sum2_27.y;
-                        float block_sum = _tmem_load_0_sum;
+                        float block_sum_lo = _tmem_load_0_sum;
+                        float2 _reg_reduce_sum2_28 = make_float2(0.0f, 0.0f);
+                        softmax_block_sum(&_tmem_load_0[(64) + 0], &_reg_reduce_sum2_28);
+                        softmax_block_sum(&_tmem_load_0[(64) + 32], &_reg_reduce_sum2_28);
+                        float _tmem_load_0_sum_0 = _reg_reduce_sum2_28.x + _reg_reduce_sum2_28.y;
+                        float block_sum_hi = _tmem_load_0_sum_0;
+                        float block_sum = block_sum_lo + block_sum_hi;
                         mbarrier_wait(corr_done_addr, _phase_corr_done_0);
                         _phase_corr_done_0 ^= 1;
                         row_sum = row_sum * acc_scale + block_sum;
@@ -1015,6 +1019,7 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
     if (warp >= 4 && warp <= 7) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 224;");
         { // correction_main
+            unsigned int _phase_p_empty_0_1 = 1;
             unsigned int _phase_corr_sig_0 = 0;
             unsigned int _phase_o_full_0 = 0;
             #pragma unroll 1
@@ -1041,6 +1046,8 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                     int stat_slot_1 = warp_in_role_1 * 32 + lane;
                     int partner_slot = (warp_in_role_1 ^ 2) * 32 + lane;
                     int row_addr = tmem_row_origin_1 << 16;
+                    mbarrier_wait(p_empty_addr, _phase_p_empty_0_1);
+                    _phase_p_empty_0_1 ^= 1;
                     mbarrier_arrive(p_full_addr);
                     mbarrier_wait(corr_sig_addr, _phase_corr_sig_0);
                     _phase_corr_sig_0 ^= 1;
@@ -1049,6 +1056,8 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                     for (int _group_index = 1; _group_index < group_count_1; _group_index++) {
                         mbarrier_wait(corr_sig_addr, _phase_corr_sig_0);
                         _phase_corr_sig_0 ^= 1;
+                        mbarrier_wait(p_empty_addr, _phase_p_empty_0_1);
+                        _phase_p_empty_0_1 ^= 1;
                         float acc_scale_1 = scale_smem[stat_slot_1];
                         int _vote_0 = __any_sync(0xFFFFFFFF, acc_scale_1 < 1.0f);
                         if (_vote_0 != 0) {
@@ -1057,6 +1066,7 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                             tmem_ld_x32(&_tmem_load_1[32], taddr + 128 + (unsigned int)row_addr + 32);
                             tmem_ld_x32(&_tmem_load_1[64], taddr + 128 + (unsigned int)row_addr + 64);
                             tmem_ld_x32(&_tmem_load_1[96], taddr + 128 + (unsigned int)row_addr + 96);
+                            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                             const float2 _scale2_0 = {acc_scale_1, acc_scale_1};
                             #pragma unroll
                             for (int _ls = 0; _ls < 64; _ls++)
@@ -1086,9 +1096,20 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                     float local_scale = ((final_sum > 0.0f) ? _exp2_1 : 0.0f);
                     float _exp2_2 = approx_exp2((partner_max - max_total_safe) * softmax_scale_log2);
                     float partner_scale = ((partner_sum > 0.0f) ? _exp2_2 : 0.0f);
-                    float sum_total = final_sum * local_scale + partner_sum * partner_scale;
-                    float _rcp_0 = approx_rcp(sum_total);
-                    float local_weight = ((sum_total > 0.0f) ? local_scale * _rcp_0 : 0.0f);
+                    float sum_total;
+                    if (warp_in_role_1 < 2) {
+                        sum_total = final_sum * local_scale + partner_sum * partner_scale;
+                    } else {
+                        sum_total = partner_sum * partner_scale + final_sum * local_scale;
+                    }
+                    if (warp_in_role_1 < 2) {
+                        float _rcp_0 = approx_rcp(sum_total);
+                        scale_smem[384 + my_row_1] = ((sum_total > 0.0f) ? _rcp_0 : 0.0f);
+                    }
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile("barrier.sync 8, 128;" ::: "memory");
+                    float inv_sum_total = scale_smem[384 + my_row_1];
+                    float local_weight = local_scale * inv_sum_total;
                     float _tmem_load_2[128];
                     tmem_ld_x32(&_tmem_load_2[0], taddr + 128 + (unsigned int)row_addr);
                     tmem_ld_x32(&_tmem_load_2[32], taddr + 128 + (unsigned int)row_addr + 32);
@@ -1123,7 +1144,7 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                             for (int offset = 0; offset < 32; offset += 4) {
                                 float _partial_smem_reg_0[4];
                                 {
-                                    const float* _smem_ptr = (const float*)(smem_raw + 215552 + (unsigned int)((row_base + offset) * 4));
+                                    const float* _smem_ptr = (const float*)(smem_raw + 216064 + (unsigned int)((row_base + offset) * 4));
                                     #pragma unroll
                                     for (int _lr = 0; _lr < 4; _lr++)
                                         _partial_smem_reg_0[_lr] = _smem_ptr[_lr];
