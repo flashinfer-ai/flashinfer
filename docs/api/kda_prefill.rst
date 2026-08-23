@@ -141,7 +141,7 @@ contract so the launch path does not synchronize to inspect them.
 
 Native checkpoints use a preallocated BF16
 ``state_checkpoints[C,H,V,K]``, int64 ``checkpoint_cu_starts[N+1]``, and a
-positive ``checkpoint_every_n_tokens`` divisible by 32. KDA checkpoints are
+positive ``checkpoint_every_n_tokens`` divisible by 16. KDA checkpoints are
 states *before* each interval: every non-empty sequence contributes its
 initial state as row zero, followed by states after one, two, ... intervals
 that strictly precede its end. Consequently each sequence contributes

@@ -39,7 +39,7 @@ _FLASH_KDA_HEAD_DIM = 128
 _FLASH_KDA_BETA_TMA_HEADS_PER_BOX = 8
 _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES = 6 * 128
-_FLASH_KDA_SMALL_BH_DESCRIPTOR_STORAGE_BYTES = 7 * 128
+_FLASH_KDA_SEVEN_DESCRIPTOR_STORAGE_BYTES = 7 * 128
 _FLASH_KDA_PERSISTENT_MIN_BALANCED_CTAS = 128
 _FLASH_KDA_LPT_MAX_IMBALANCE_NUMERATOR = 21
 _FLASH_KDA_LPT_MAX_IMBALANCE_DENOMINATOR = 20
@@ -78,8 +78,8 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._descriptor_storages = {
             variant: torch.empty(
                 (
-                    _FLASH_KDA_SMALL_BH_DESCRIPTOR_STORAGE_BYTES
-                    if variant == "small_bh_m128"
+                    _FLASH_KDA_SEVEN_DESCRIPTOR_STORAGE_BYTES
+                    if variant in ("m128_n16_checkpoint", "small_bh_m128")
                     else _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES
                 ),
                 dtype=torch.uint8,
@@ -89,6 +89,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
                 "m64",
                 "m128",
                 "m128_n16",
+                "m128_n16_checkpoint",
                 "persistent_m128",
                 "small_bh_m128",
             )
@@ -349,7 +350,7 @@ def _flash_kda_prefill_is_eligible(
     if (
         checkpoint_every_n_tokens < 0
         or checkpoint_every_n_tokens > torch.iinfo(torch.int32).max
-        or checkpoint_every_n_tokens % 32 != 0
+        or checkpoint_every_n_tokens % 16 != 0
     ):
         return False
     if checkpoint_every_n_tokens:
@@ -943,12 +944,15 @@ def _descriptor_signature(
     beta_tma: torch.Tensor,
     out: torch.Tensor,
     packet_workspace: Optional[torch.Tensor] = None,
+    state_checkpoints: Optional[torch.Tensor] = None,
 ) -> tuple:
     signature = tuple(
         _tensor_descriptor_signature(tensor) for tensor in (q, k, v, g, beta_tma, out)
     )
     if packet_workspace is not None:
         signature += (_tensor_descriptor_signature(packet_workspace),)
+    if state_checkpoints is not None:
+        signature += (_tensor_descriptor_signature(state_checkpoints),)
     return signature
 
 
@@ -1196,7 +1200,9 @@ def _run_flash_kda_prefill(
             num_heads=num_heads,
             sm_count=sm_count,
         )
-    use_exact_n16 = _requires_exact_n16_recurrence(
+    use_exact_n16 = (
+        checkpoint_every_n_tokens != 0 and checkpoint_every_n_tokens % 32 != 0
+    ) or _requires_exact_n16_recurrence(
         sm_count=sm_count,
         fixed_layout=fixed_layout,
         num_sequences=num_sequences,
@@ -1214,6 +1220,8 @@ def _run_flash_kda_prefill(
         use_small_bh_m128=small_bh_candidate,
         use_exact_n16=use_exact_n16,
     )
+    if checkpoint_every_n_tokens and variant == "m128_n16":
+        variant = "m128_n16_checkpoint"
     if fixed_layout:
         cu_seqlens_i64 = _fixed_cu_seqlens(
             device=q.device, batch_size=batch_size, seq_len=seq_len
@@ -1379,6 +1387,9 @@ def _run_flash_kda_prefill(
             beta_tma=beta_tma,
             out=out_buf,
             packet_workspace=packet_workspace,
+            state_checkpoints=(
+                state_checkpoints if variant == "m128_n16_checkpoint" else None
+            ),
         )
         warmed_signature = workspace._descriptor_signatures.get(variant)
         if capturing:
