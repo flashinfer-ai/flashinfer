@@ -258,6 +258,13 @@ def _build_plan(
         prefill_kernel = f"cp_prefill_generic{dtype_suffix}"
     else:
         prefill_kernel = f"cp_prefill{dtype_suffix}"
+    # The exact UTCMMA schedules intentionally retain their positive-only
+    # barrier topology.  The Cake SIMT fixup owns mixed empty/nonempty batches.
+    fixup_kernel = (
+        "state_fixup_simt_row4"
+        if any(length == 0 for length in seq_lens)
+        else _choose_fixup_kind(len(seq_lens) * num_sab_heads, num_sms)
+    )
     return CakeGDNCPPrefillPlan(
         seq_lens=seq_lens,
         arch=arch,
@@ -285,7 +292,7 @@ def _build_plan(
         max_cp_chunks_per_seq=_ceil_div(max_seqlen, cp_chunk_len),
         t_kernel=t_kernel,
         mn_kernel=f"mn_precompute{dtype_suffix}",
-        fixup_kernel=_choose_fixup_kind(len(seq_lens) * num_sab_heads, num_sms),
+        fixup_kernel=fixup_kernel,
         prefill_kernel=prefill_kernel,
     )
 
