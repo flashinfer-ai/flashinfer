@@ -29,7 +29,7 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_final_v1_b3bc977174);
+TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_final_v1_91e2ec269e);
 
 namespace cake_host_shim {
 
@@ -183,6 +183,70 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
           << ", expected " << expected;
     }
   }
+}
+
+// CUDA 13.4 adds an oversized shared-memory mode (function/launch attribute
+// SHARED_MEMORY_MODE = 3) that lets a kernel exceed the standard
+// MaxSharedMemoryPerBlockOptin ceiling up to device attribute 150
+// (OversizedSharedMemoryPerBlock), at the cost of an 8 KiB L1 carveout.
+#if (TVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API && defined(CUDA_VERSION) && CUDA_VERSION >= 13040) || \
+    (!TVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API && defined(CUDART_VERSION) && CUDART_VERSION >= 13040)
+#define CAKE_HAS_OVERSIZED_SMEM 1
+#else
+#define CAKE_HAS_OVERSIZED_SMEM 0
+#endif
+
+// Per-device dynamic-SMEM opt-in. Returns true when launches on this device
+// must carry the ALLOW_OVERSIZED shared-memory-mode launch attribute: the
+// request exceeds the device's standard opt-in ceiling
+// (MaxSharedMemoryPerBlockOptin, attribute 97) but fits the oversized ceiling
+// (OversizedSharedMemoryPerBlock, attribute 150). Within the standard ceiling
+// it sets MAX_DYNAMIC_SHARED_SIZE_BYTES for the device, mirroring
+// CubinKernel::SetMaxDynamicSharedMemory. cache: 0 = unresolved,
+// 1 = standard opt-in done, 2 = oversized mode required.
+inline bool CakeConfigureDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_id,
+                                     int smem_bytes, signed char* cache, int cache_len) {
+  namespace cuda_api = tvm::ffi::cuda_api;
+  TVM_FFI_CHECK(device_id >= 0 && device_id < cache_len, RuntimeError)
+      << "dynamic-SMEM opt-in cache does not cover cuda:" << device_id;
+  if (cache[device_id] != 0) {
+    return cache[device_id] == 2;
+  }
+  auto device = cuda_api::GetDeviceHandle(device_id);
+  int optin_max = 0;
+  cuda_api::ResultType err = cuda_api::GetDeviceAttribute(
+      &optin_max,
+      /* CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN /
+         cudaDevAttrMaxSharedMemoryPerBlockOptin */
+      cuda_api::DeviceAttrType(97), device);
+  TVM_FFI_CHECK(err == cuda_api::kSuccess, RuntimeError)
+      << "querying MaxSharedMemoryPerBlockOptin failed for cuda:" << device_id;
+  if (smem_bytes <= optin_max) {
+    err = cuda_api::SetKernelMaxDynamicSharedMem(kernel.GetHandle(), smem_bytes, device);
+    TVM_FFI_CHECK(err == cuda_api::kSuccess, RuntimeError)
+        << "MAX_DYNAMIC_SHARED_SIZE_BYTES=" << smem_bytes << " rejected for cuda:" << device_id;
+    cache[device_id] = 1;
+    return false;
+  }
+#if CAKE_HAS_OVERSIZED_SMEM
+  int oversized_max = 0;
+  err = cuda_api::GetDeviceAttribute(
+      &oversized_max,
+      /* CU_DEVICE_ATTRIBUTE_MAX_OVERSIZED_SHARED_MEMORY_PER_BLOCK /
+         cudaDevAttrOversizedSharedMemoryPerBlock */
+      cuda_api::DeviceAttrType(150), device);
+  TVM_FFI_CHECK(err == cuda_api::kSuccess && oversized_max >= smem_bytes, RuntimeError)
+      << "dynamic smem " << smem_bytes << " B exceeds the standard opt-in ceiling ("
+      << optin_max << " B) on cuda:" << device_id << " and the oversized ceiling is "
+      << oversized_max << " B";
+  cache[device_id] = 2;
+  return true;
+#else
+  TVM_FFI_THROW(RuntimeError)
+      << "dynamic smem " << smem_bytes << " B exceeds the standard opt-in ceiling ("
+      << optin_max << " B) on cuda:" << device_id
+      << " and this CUDA toolkit predates the 13.4 oversized shared-memory mode";
+#endif
 }
 
 // 4D TMA descriptor for buffer 'Q' — compiled from the
@@ -467,10 +531,16 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_T,
   float v_scale = (float)arg_scale;
   void* kargs[] = {&p_Q, &p_K, &p_V, &p_T, &p_O, &p_alpha, &p_cu_seqlens, &p_fixed_state, &p_initial_state_workspace, &p_tensormap_workspace, &v_cp_chunk_len, &v_source_cp_chunk_len, &v_num_q_heads, &v_num_k_heads, &v_num_v_heads, &v_num_sab_heads, &v_scale};
 
-  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_cp_prefill_final_v1_b3bc977174::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1", 224768);
+  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_cp_prefill_final_v1_91e2ec269e::Global()->mod.GetKernel("kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1");
+  static signed char cake_smem_mode_cache[64] = {0};
+  const bool use_oversized_smem = CakeConfigureDynamicSmem(
+      kernel, (int)arg_Q.device().device_id, 224768,
+      cake_smem_mode_cache, 64);
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(384u, 1u, 1u);
 
+  TVM_FFI_CHECK(!use_oversized_smem, RuntimeError)
+      << "oversized dynamic shared memory requires the extended (cluster) launch path";
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.Launch(kargs, grid, block, stream, 224768u));
 }
 
