@@ -242,10 +242,7 @@ def test_cake_vsa_blk64_mixed_rows_use_weight_stationary_profile():
         q2k_num=q2k_num,
     )
     assert wrapper._cake_vsa_plan is not None
-    assert (
-        wrapper._cake_vsa_plan["blk64_profile"]
-        == "blk64_persistent_ws_m64n256"
-    )
+    assert wrapper._cake_vsa_plan["blk64_profile"] == "blk64_persistent_ws_m64n256"
 
     output, lse = wrapper.run(q, k, v, return_lse=True)
     repeated_output, repeated_lse = wrapper.run(q, k, v, return_lse=True)
@@ -260,10 +257,7 @@ def test_cake_vsa_blk64_mixed_rows_use_weight_stationary_profile():
     token_mask = block_mask.repeat_interleave(block_size, 1).repeat_interleave(
         block_size, 2
     )
-    scores = (
-        torch.einsum("mhd,nhd->hmn", q.float(), k.float())
-        / math.sqrt(head_dim)
-    )
+    scores = torch.einsum("mhd,nhd->hmn", q.float(), k.float()) / math.sqrt(head_dim)
     scores.masked_fill_(~token_mask, float("-inf"))
     reference = torch.einsum(
         "hmn,nhd->mhd", torch.softmax(scores, dim=-1), v.float()
@@ -272,5 +266,7 @@ def test_cake_vsa_blk64_mixed_rows_use_weight_stationary_profile():
     torch.testing.assert_close(output, reference, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(lse, reference_lse, atol=1e-2, rtol=1e-2)
 
-    for tensor, original in zip((q, k, v, q2k_indices, q2k_num), inputs):
+    for tensor, original in zip(
+        (q, k, v, q2k_indices, q2k_num), inputs, strict=True
+    ):
         assert torch.equal(tensor, original)
