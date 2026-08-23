@@ -1627,9 +1627,7 @@ def _run_bt16_prepare_chain(
             cu_seqlens,
             cu_chunks,
             seq_order,
-            initial_state,
             out,
-            final_state,
         )
     )
     signatures = {

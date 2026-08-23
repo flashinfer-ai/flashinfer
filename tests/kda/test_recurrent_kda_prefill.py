@@ -1142,7 +1142,7 @@ def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
     ) == ("bt16_prepare", "bt16_chain_m64_s7", False)
 
 
-def test_bt16_two_stage_adapter_forwards_stable_wrapper_abis(monkeypatch):
+def test_bt16_two_stage_adapter_reuses_descriptors_across_state_rotations(monkeypatch):
     prepare_module = _RecorderModule()
     chain_module = _RecorderModule()
     modules = {
@@ -1156,6 +1156,8 @@ def test_bt16_two_stage_adapter_forwards_stable_wrapper_abis(monkeypatch):
     )
     q = torch.empty((1, 1, 1, 1), dtype=torch.bfloat16)
     factor = torch.empty((1, 1, 1, 1), dtype=torch.bfloat16)
+    kd = factor.clone()
+    w = factor.clone()
     qk = torch.empty((1, 1, 1, 1, 1), dtype=torch.bfloat16)
     diag = torch.empty((1, 1, 1, 1), dtype=torch.float32)
     cu_chunks = torch.tensor([0, 256], dtype=torch.int32)
@@ -1167,8 +1169,8 @@ def test_bt16_two_stage_adapter_forwards_stable_wrapper_abis(monkeypatch):
             cu_chunks,
             chunk_to_seq,
             factor,
-            factor.clone(),
-            factor.clone(),
+            kd,
+            w,
             qk,
             diag,
             256,
@@ -1185,6 +1187,9 @@ def test_bt16_two_stage_adapter_forwards_stable_wrapper_abis(monkeypatch):
     seq_order = torch.tensor([0], dtype=torch.int32)
     state = torch.empty((1, 1, 1, 1), dtype=torch.bfloat16)
     output = torch.empty_like(q)
+    beta = torch.empty((1, 1, 1), dtype=torch.bfloat16)
+    a_log = torch.empty(64, dtype=torch.float32)
+    dt_bias = torch.empty((64, 128), dtype=torch.float32)
 
     kda_prefill_api._run_bt16_prepare_chain(
         workspace=workspace,
@@ -1193,9 +1198,9 @@ def test_bt16_two_stage_adapter_forwards_stable_wrapper_abis(monkeypatch):
         k=q,
         v=q,
         g=q,
-        beta=torch.empty((1, 1, 1), dtype=torch.bfloat16),
-        A_log=torch.empty(64, dtype=torch.float32),
-        dt_bias=torch.empty((64, 128), dtype=torch.float32),
+        beta=beta,
+        A_log=a_log,
+        dt_bias=dt_bias,
         cu_seqlens=cu_seqlens,
         seq_order=seq_order,
         initial_state=state,
@@ -1229,6 +1234,43 @@ def test_bt16_two_stage_adapter_forwards_stable_wrapper_abis(monkeypatch):
     assert chain_args[8] is seq_order
     assert chain_args[12].dtype == torch.uint8
     assert chain_args[13:20] == (1, 64, 1, 1, 0.125, 128, 17)
+
+    rotated_state = torch.empty_like(state)
+    kda_prefill_api._run_bt16_prepare_chain(
+        workspace=workspace,
+        target="sm100f",
+        q=q,
+        k=q,
+        v=q,
+        g=q,
+        beta=beta,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        cu_seqlens=cu_seqlens,
+        seq_order=seq_order,
+        initial_state=rotated_state,
+        out=output,
+        final_state=rotated_state,
+        offsets=(0, 4096),
+        num_heads=64,
+        sm_count=152,
+        compute_capability=(10, 3),
+        fixed_layout=True,
+        max_sequence_length=4096,
+        use_initial_state=True,
+        store_final_state=True,
+        scale=0.125,
+        lower_bound=-5.0,
+        stream_ptr=17,
+        capturing=False,
+    )
+
+    second_prepare_args = prepare_module.calls[1]
+    second_chain_args = chain_module.calls[1]
+    assert second_prepare_args[15] == 0
+    assert second_chain_args[9] is rotated_state
+    assert second_chain_args[11] is rotated_state
+    assert second_chain_args[13] == 0
 
 
 def test_h96_uniform_n128_uses_exact_n16_only_on_148_sm():
