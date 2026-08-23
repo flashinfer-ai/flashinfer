@@ -3,7 +3,7 @@
     "sm_100a",
     "sm_103a"
   ],
-  "export_content_sha256": "7d988876e83343d7610250216eaaca4825063cb56091d5b70fadb1c91540d1e6",
+  "export_content_sha256": "c73457986a0070d5099341c64a07aa766af626f62a03951953a1f317a666ec71",
   "profiles": [
     {
       "arg_plan": [
@@ -98,11 +98,11 @@
       "dynamic_smem_bytes": 134784,
       "host": {
         "path": "cake_vsa_blk128_compact_host.cpp",
-        "sha256": "2c53b3f9b321434a8c0deaa56010ba3aef4e2f508edbda305569af205b81b0e5",
-        "size_bytes": 17614
+        "sha256": "8c99ae8221472b3fe8703e0cfc10bcd27eab0a83c37726304cde978d86d60498",
+        "size_bytes": 24454
       },
       "kernel_symbol": "kernel_flashinfer_blackwell_vsa_blk128_seed_sm100",
-      "module_ident": "flashinfer_blackwell_vsa_blk128_seed_sm100_d8d08ef84d",
+      "module_ident": "flashinfer_blackwell_vsa_blk128_seed_sm100_cc0523c28b",
       "profile": "blk128_compact",
       "schedule_symbol": "flashinfer_blackwell_vsa_blk128_seed_sm100",
       "threads": 512
@@ -420,11 +420,11 @@
       "dynamic_smem_bytes": 135424,
       "host": {
         "path": "cake_vsa_ultrasparse_bsr_host.cpp",
-        "sha256": "f5e1d46b0e23c38b2274b61648350f99d09b9a1f2ce7ee4b1be9408daa6eb64c",
-        "size_bytes": 18294
+        "sha256": "32fca8735e6c000d18838e2339e3964e735877dee041a5347f5228b60af2bab0",
+        "size_bytes": 25485
       },
       "kernel_symbol": "kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100",
-      "module_ident": "flashinfer_blackwell_vsa_ultrasparse_bsr_sm100_d29e134a87",
+      "module_ident": "flashinfer_blackwell_vsa_ultrasparse_bsr_sm100_ce27051a00",
       "profile": "ultrasparse_bsr",
       "schedule_symbol": "flashinfer_blackwell_vsa_ultrasparse_bsr_sm100",
       "threads": 512
@@ -522,11 +522,11 @@
       "dynamic_smem_bytes": 134784,
       "host": {
         "path": "cake_vsa_gqa_mask_host.cpp",
-        "sha256": "6c37bf0096b59feae58caf3852efff225ca70d788715ef2186585f93dd42d38b",
-        "size_bytes": 15610
+        "sha256": "5e345b5b84b74f06b8e2b7fa8563e2b641c75c95fc47a440babe062aed52f634",
+        "size_bytes": 22679
       },
       "kernel_symbol": "kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100",
-      "module_ident": "flashinfer_blackwell_vsa_gqa_mask_seed_sm100_e503e490ef",
+      "module_ident": "flashinfer_blackwell_vsa_gqa_mask_seed_sm100_1f27fd4684",
       "profile": "gqa_mask",
       "schedule_symbol": "flashinfer_blackwell_vsa_gqa_mask_seed_sm100",
       "threads": 512
@@ -624,11 +624,11 @@
       "dynamic_smem_bytes": 108928,
       "host": {
         "path": "cake_vsa_head64_native_host.cpp",
-        "sha256": "0944d9e4eeb1d76b65af730cc685303fe591ba4c888422c5d7a2bf299b271d6a",
-        "size_bytes": 17622
+        "sha256": "0925ba953f90d8cc72319d7008fa19f67b1cefdaf7fa5c186514686b97f5b280",
+        "size_bytes": 25237
       },
       "kernel_symbol": "kernel_flashinfer_blackwell_vsa_head64_native_sm100",
-      "module_ident": "flashinfer_blackwell_vsa_head64_native_sm100_4a160c470d",
+      "module_ident": "flashinfer_blackwell_vsa_head64_native_sm100_1b8fbf0974",
       "profile": "head64_native",
       "schedule_symbol": "flashinfer_blackwell_vsa_head64_native_sm100",
       "threads": 384
@@ -726,11 +726,11 @@
       "dynamic_smem_bytes": 182656,
       "host": {
         "path": "cake_vsa_head96_native_host.cpp",
-        "sha256": "4ff70dcf6b98ec5c7d313ede3e8802a4aab0dea9790c080faa546ab8d2296aba",
-        "size_bytes": 18647
+        "sha256": "4b66bfea8e70a8b0d64c02d75ddf66ebb325a4d193c3f2bc5061a928d7779f95",
+        "size_bytes": 24507
       },
       "kernel_symbol": "kernel_flashinfer_blackwell_vsa_head96_native_sm100",
-      "module_ident": "flashinfer_blackwell_vsa_head96_native_sm100_b7e0f1508d",
+      "module_ident": "flashinfer_blackwell_vsa_head96_native_sm100_83db436a27",
       "profile": "head96_native",
       "schedule_symbol": "flashinfer_blackwell_vsa_head96_native_sm100",
       "threads": 384
@@ -828,11 +828,11 @@
       "dynamic_smem_bytes": 134784,
       "host": {
         "path": "cake_vsa_blk128_fp16_compact_host.cpp",
-        "sha256": "eb8d17f87bf430fe107b5a5303bfe59eeed4ad9b8710e25805285d014add9464",
-        "size_bytes": 17643
+        "sha256": "de1dc2ee994f0b99b2f03f797369c3fe3257cbaf9f0ea92b33523d13f25fa4fa",
+        "size_bytes": 24483
       },
       "kernel_symbol": "kernel_flashinfer_blackwell_vsa_blk128_fp16_compact_sm100",
-      "module_ident": "flashinfer_blackwell_vsa_blk128_fp16_compact_sm100_11cb5e34fb",
+      "module_ident": "flashinfer_blackwell_vsa_blk128_fp16_compact_sm100_ce189fed4a",
       "profile": "blk128_fp16_compact",
       "schedule_symbol": "flashinfer_blackwell_vsa_blk128_fp16_compact_sm100",
       "threads": 512

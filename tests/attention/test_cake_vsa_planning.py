@@ -129,6 +129,62 @@ def test_block_mask_takes_precedence_over_bsr(monkeypatch):
     torch.testing.assert_close(plan["indices"], torch.tensor([1, 3], dtype=torch.int32))
 
 
+def test_noncanonical_bsr_rows_are_packed_for_fixed_stride_kernels(monkeypatch):
+    plan = _plan_on_cpu(
+        monkeypatch,
+        indptr=torch.tensor([0, 7, 13], dtype=torch.int32),
+        indices=torch.tensor(
+            [0, 1, 2, 3, 4, 5, 5, 1, 2, 3, 4, 5, 6], dtype=torch.int32
+        ),
+        M=256,
+        N=1024,
+        R=128,
+        C=128,
+    )
+
+    torch.testing.assert_close(
+        plan["indptr"], torch.tensor([0, 6, 12], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        plan["indices"],
+        torch.tensor([0, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 6], dtype=torch.int32),
+    )
+    assert plan["max_selected_blocks"] == 6
+    assert plan["uniform_selected_blocks"]
+
+
+@pytest.mark.parametrize("head_dim", [64, 96])
+def test_native_small_head_routes_reject_more_than_64_blocks(monkeypatch, head_dim):
+    block_mask = torch.ones((2, 1, 65), dtype=torch.bool)
+
+    with pytest.raises(
+        ValueError, match="D64/D96 routes support at most 64 selected blocks"
+    ):
+        _plan_on_cpu(
+            monkeypatch,
+            block_mask=block_mask,
+            M=128,
+            N=65 * 128,
+            R=128,
+            C=128,
+            head_dim=head_dim,
+        )
+
+
+def test_head64_native_rejects_gqa_before_dispatch(monkeypatch):
+    with pytest.raises(ValueError, match="D64/D96 routes support native-head BF16"):
+        _plan_on_cpu(
+            monkeypatch,
+            M=128,
+            N=256,
+            R=128,
+            C=128,
+            num_qo_heads=8,
+            num_kv_heads=2,
+            head_dim=64,
+        )
+
+
 @pytest.mark.parametrize("bad_count", [0, 3])
 def test_direct_q2k_rejects_invalid_counts(monkeypatch, bad_count):
     q2k_indices = torch.zeros((2, 2, 2), dtype=torch.int32)
@@ -171,6 +227,98 @@ def test_direct_q2k_ignores_inactive_padding_indices(monkeypatch):
 
     assert plan["q2k_indices"] is q2k_indices
     assert plan["q2k_num"] is q2k_num
+
+
+@pytest.mark.parametrize("bad_length", [0, 65])
+def test_kv_block_lens_rejects_entries_outside_block(monkeypatch, bad_length):
+    kv_block_lens = torch.full((4,), 64, dtype=torch.int32)
+    kv_block_lens[1] = bad_length
+
+    with pytest.raises(ValueError, match=r"kv_block_lens entries must be in \[1, C\]"):
+        _plan_on_cpu(
+            monkeypatch,
+            q2k_indices=torch.zeros((2, 2, 1), dtype=torch.int32),
+            kv_block_lens=kv_block_lens,
+        )
+
+
+def test_gqa_masks_must_match_within_each_kv_head_group(monkeypatch):
+    block_mask = torch.zeros((4, 2, 4), dtype=torch.bool)
+    block_mask[0, :, 0] = True
+    block_mask[1, :, 1] = True
+    block_mask[2:, :, 2] = True
+
+    with pytest.raises(
+        ValueError, match="masks must be identical within each KV-head group"
+    ):
+        _plan_on_cpu(
+            monkeypatch,
+            block_mask=block_mask,
+            M=256,
+            N=512,
+            R=128,
+            C=128,
+            num_qo_heads=4,
+            num_kv_heads=2,
+            q_data_type=torch.float16,
+        )
+
+
+def test_fp16_gqa_metadata_uses_each_kv_head_group(monkeypatch):
+    block_mask = torch.zeros((4, 2, 4), dtype=torch.bool)
+    block_mask[:2, :, 0] = True
+    block_mask[2:, :, 3] = True
+    plan = _plan_on_cpu(
+        monkeypatch,
+        block_mask=block_mask,
+        M=256,
+        N=512,
+        R=128,
+        C=128,
+        num_qo_heads=4,
+        num_kv_heads=2,
+        q_data_type=torch.float16,
+    )
+
+    q2k, *_ = cake_vsa._fp16_metadata(plan, torch.empty((1,)))
+
+    assert tuple(q2k.shape) == (2, 256, 1)
+    torch.testing.assert_close(q2k[0], torch.zeros_like(q2k[0]))
+    torch.testing.assert_close(q2k[1], torch.full_like(q2k[1], 3))
+
+
+def test_ultrasparse_route_rejects_non_six_topk_before_launch(monkeypatch):
+    q = torch.empty((1,), dtype=torch.bfloat16)
+    plan = {
+        "head_dim": 128,
+        "R": 128,
+        "num_qo_heads": 8,
+        "num_kv_heads": 8,
+        "mb": 625,
+        "N": 16384,
+        "indices": torch.empty((1,), dtype=torch.int32),
+        "max_selected_blocks": 8,
+        "uniform_selected_blocks": True,
+    }
+    monkeypatch.setattr(cake_vsa, "_check_inputs", lambda *_args: None)
+    monkeypatch.setattr(cake_vsa, "_outputs", lambda *_args: (q, q))
+    monkeypatch.setattr(
+        cake_vsa,
+        "_run_standard",
+        lambda *_args, **_kwargs: pytest.fail("launcher should not be reached"),
+    )
+
+    with pytest.raises(ValueError, match="requires exactly six selected blocks"):
+        cake_vsa.run_cake_vsa(
+            plan,
+            q,
+            q,
+            q,
+            out=None,
+            lse=None,
+            return_lse=False,
+            backend="cake",
+        )
 
 
 def test_run_cake_vsa_uses_planned_mask_reductions(monkeypatch):

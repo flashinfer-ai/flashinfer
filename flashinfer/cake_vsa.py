@@ -279,11 +279,6 @@ def _shared_bsr(
         raise ValueError(
             "Cake blk128 routes require one shared BSR pattern across heads"
         )
-    if trust_bsr and indptr is not None and indices is not None:
-        return (
-            indptr.to(device=dense.device, dtype=torch.int32).contiguous(),
-            indices.to(device=dense.device, dtype=torch.int32).contiguous(),
-        )
     shared = dense[0]
     counts = shared.sum(dim=1, dtype=torch.int32)
     ptr = torch.cat(
@@ -292,6 +287,15 @@ def _shared_bsr(
             counts.cumsum(0, dtype=torch.int32),
         ]
     )
+    if trust_bsr and indptr is not None and indices is not None:
+        raw_ptr = indptr.to(device=dense.device, dtype=torch.int32).contiguous()
+        raw_cols = indices.to(device=dense.device, dtype=torch.int32).contiguous()
+        if raw_cols.numel() == int(ptr[-1].item()) and torch.equal(raw_ptr, ptr):
+            return raw_ptr, raw_cols
+
+        # The ultrasparse kernel consumes six columns per row with a fixed
+        # stride rather than consulting indptr. Canonicalize duplicate or
+        # otherwise non-packed BSR rows before making that metadata launchable.
     cols = shared.nonzero(as_tuple=False)[:, 1].to(torch.int32).contiguous()
     return ptr, cols
 
@@ -316,7 +320,57 @@ def plan_cake_vsa(
     sm_scale: Optional[float],
     device: torch.device,
 ) -> dict[str, Any]:
-    """Create stable metadata and workspaces for the source-level backend."""
+    """Create stable metadata and workspaces for the source-level backend.
+
+    Parameters
+    ----------
+    indptr : Optional[torch.Tensor]
+        CSR-style row pointers for a block pattern shared by all heads, with
+        shape ``(M // R + 1,)``. Required with ``indices`` when neither
+        ``block_mask`` nor ``q2k_indices`` is supplied.
+    indices : Optional[torch.Tensor]
+        Column indices corresponding to ``indptr``. Duplicate or non-packed
+        rows are canonicalized before a fixed-stride source kernel can use
+        them.
+    block_mask : Optional[torch.Tensor]
+        Boolean block mask with shape ``(num_qo_heads, M // R, N // C)`` or
+        ``(num_kv_heads, M // R, N // C)``.
+    kv_block_lens : Optional[torch.Tensor]
+        Valid-token count for each KV block, with shape ``(N // C,)``. This is
+        supported only for 64-token blocks.
+    q2k_indices : Optional[torch.Tensor]
+        Direct block-64 selections as contiguous int32 metadata with shape
+        ``(num_qo_heads, M // R, topk)``.
+    q2k_num : Optional[torch.Tensor]
+        Number of active ``q2k_indices`` entries per row, as contiguous int32
+        metadata with shape ``(num_qo_heads, M // R)``.
+    M : int
+        Query sequence length.
+    N : int
+        Key/value sequence length.
+    R : int
+        Query block size. Cake supports 64 and 128.
+    C : int
+        Key/value block size, which must equal ``R``.
+    num_qo_heads : int
+        Number of query/output heads.
+    num_kv_heads : int
+        Number of key/value heads.
+    head_dim : int
+        Per-head dimension. Cake supports 64, 96, and 128.
+    q_data_type : torch.dtype
+        Planned Q/K/V dtype, either ``torch.float16`` or ``torch.bfloat16``.
+    sm_scale : Optional[float]
+        Softmax scale. ``None`` selects ``1 / sqrt(head_dim)``.
+    device : torch.device
+        SM100 or SM103 CUDA device that will execute the plan.
+
+    Returns
+    -------
+    dict[str, Any]
+        Validated metadata and reusable workspaces consumed by
+        :func:`run_cake_vsa`.
+    """
 
     _arch_for_device(device)
     if R != C or R not in (64, 128):
@@ -414,6 +468,13 @@ def plan_cake_vsa(
         )
         if min_selected_blocks <= 0:
             raise ValueError("every Cake VSA block row must select at least one block")
+        if num_qo_heads > num_kv_heads:
+            group_size = num_qo_heads // num_kv_heads
+            grouped = dense.view(num_kv_heads, group_size, mb, nb)
+            if not torch.equal(grouped, grouped[:, :1].expand_as(grouped)):
+                raise ValueError(
+                    "Cake GQA masks must be identical within each KV-head group"
+                )
         if R == 64:
             q2k_num = row_counts.contiguous()
             q2k_indices = (
@@ -427,6 +488,11 @@ def plan_cake_vsa(
                 .contiguous()
             )
 
+    if head_dim in (64, 96) and max_selected_blocks > _MAX_COMPACT_BLOCKS:
+        raise ValueError(
+            "Cake D64/D96 routes support at most 64 selected blocks per row"
+        )
+
     planned_kv_block_lens = None
     if R == 64:
         if kv_block_lens is None:
@@ -439,6 +505,12 @@ def plan_cake_vsa(
             planned_kv_block_lens = kv_block_lens.to(
                 device=device, dtype=torch.int32
             ).contiguous()
+            if bool(
+                torch.any(
+                    (planned_kv_block_lens < 1) | (planned_kv_block_lens > C)
+                ).item()
+            ):
+                raise ValueError("kv_block_lens entries must be in [1, C]")
     shared_indptr = shared_indices = None
     if R != 64 and dense is not None and torch.equal(dense, dense[:1].expand_as(dense)):
         shared_indptr, shared_indices = _shared_bsr(
@@ -651,18 +723,19 @@ def _run_blk64(
 
 def _fp16_metadata(plan: dict[str, Any], q: torch.Tensor):
     cached = plan["workspace"].get("fp16_metadata")
-    if cached is not None:
+    if cached is not None and cached[0].device == q.device:
         return cached
-    counts = plan["row_counts"][0]
+    group_size = plan["num_qo_heads"] // plan["num_kv_heads"]
+    masks = plan["block_mask"][::group_size]
+    counts = plan["row_counts"][::group_size]
     topk = int(counts.max().item())
     if topk > _MAX_DIRECT_TOPK or not torch.all(counts == topk):
         raise ValueError("Cake FP16 direct route requires fixed top-k <= 32")
-    selected = plan["block_mask"][0].nonzero(as_tuple=False)
-    per_block = selected[:, 1].view(plan["mb"], topk).to(torch.int32)
-    per_query = per_block.repeat_interleave(plan["R"], dim=0)
+    selected = masks.nonzero(as_tuple=False)
+    per_block = selected[:, 2].view(plan["num_kv_heads"], plan["mb"], topk)
     q2k = (
-        per_query.unsqueeze(0)
-        .expand(plan["num_kv_heads"], plan["M"], topk)
+        per_block.repeat_interleave(plan["R"], dim=1)
+        .to(device=q.device, dtype=torch.int32)
         .contiguous()
     )
     device = q.device
@@ -737,7 +810,36 @@ def run_cake_vsa(
     return_lse: bool,
     backend: str,
 ):
-    """Run one explicit source-level route; no external fallback is available."""
+    """Run one explicit source-level route; no external fallback is available.
+
+    Parameters
+    ----------
+    plan : dict[str, Any]
+        Metadata returned by :func:`plan_cake_vsa`.
+    q : torch.Tensor
+        Contiguous query tensor with shape
+        ``(M, num_qo_heads, head_dim)``.
+    k : torch.Tensor
+        Contiguous key tensor with shape
+        ``(N, num_kv_heads, head_dim)``.
+    v : torch.Tensor
+        Contiguous value tensor with the same shape and dtype as ``k``.
+    out : Optional[torch.Tensor]
+        Optional output buffer matching ``q``.
+    lse : Optional[torch.Tensor]
+        Optional float32 log-sum-exp buffer with shape
+        ``(M, num_qo_heads)``. It is accepted only when ``return_lse`` is true.
+    return_lse : bool
+        Return log-sum-exp values with the output. D64/D96, BF16 GQA,
+        ultrasparse, and long-sequence routes do not support this option.
+    backend : str
+        Must be ``"cake"``.
+
+    Returns
+    -------
+    torch.Tensor or tuple[torch.Tensor, torch.Tensor]
+        Attention output, or ``(output, lse)`` when ``return_lse`` is true.
+    """
 
     if backend != "cake":
         raise ValueError("run_cake_vsa requires backend='cake'")
@@ -786,8 +888,10 @@ def run_cake_vsa(
         if return_lse:
             raise ValueError("Cake ultrasparse routes do not support return_lse")
         selected = plan["max_selected_blocks"]
-        if selected > _MAX_DIRECT_TOPK or not plan["uniform_selected_blocks"]:
-            raise ValueError("Cake ultrasparse route requires fixed top-k <= 32")
+        if selected != 6 or not plan["uniform_selected_blocks"]:
+            raise ValueError(
+                "Cake ultrasparse route requires exactly six selected blocks"
+            )
         _run_standard(
             "ultrasparse_bsr",
             plan,
