@@ -29,7 +29,7 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_a8325e95cf);
+TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_9de88209a3);
 
 namespace cake_host_shim {
 
@@ -334,7 +334,7 @@ void Run(TensorView arg_K, TensorView arg_beta, TensorView arg_t, TensorView arg
   int32_t v_num_seqs = (int32_t)arg_num_seqs;
   void* kargs[] = {&p_K, &p_beta, &p_t, &p_cu_seqlens, &v_num_k_heads, &v_num_sab_heads, &v_total_t_blocks, &v_num_seqs};
 
-  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_a8325e95cf, "kernel_flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1");
+  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_9de88209a3, "kernel_flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1");
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(128u, 1u, 1u);
 

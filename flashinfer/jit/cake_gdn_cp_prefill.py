@@ -35,7 +35,7 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 CakeGDNCPArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-pr4078-cake-only-standalone-export-v3"
-_MANIFEST_SHA256 = "efc6c511f7faa1cdaf93605d67dace41231be79f86b5c97ef6b3cdde49dcfeb1"
+_MANIFEST_SHA256 = "3e93e509bbae3385ed5cc6c97093ab6ca48f8f64b3ebe85d29e29df6da41eb77"
 _BASELINE_REVISION = "6cb2e70995d92edbc443b1bfc317ecacac907640"
 _FOCUS_CONTRACT = (
     150,
