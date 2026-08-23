@@ -17,9 +17,9 @@
 #include <vector>
 
 TVM_FFI_EMBED_CUBIN(factorized_persistent_segment_preprocess_7ae61d5f32);
-TVM_FFI_EMBED_CUBIN(mamba_ssd_q_tmem_alias_bf16_batched_87ce0c5b25);
+TVM_FFI_EMBED_CUBIN(mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f);
 
-namespace cake_host_shim_703c95277edfbebd {
+namespace cake_host_shim_19ff640e76571047 {
 
 using tvm::ffi::TensorView;
 
@@ -491,7 +491,7 @@ inline CUtensorMap EncodeTma_out_map(const TensorView& t) {
 }
 
 inline auto& Kernel() {
-  static auto kernel = EmbedCubinModule_mamba_ssd_q_tmem_alias_bf16_batched_87ce0c5b25::Global()->mod.GetKernel("kernel_mamba_ssd_q_tmem_alias_bf16_batched");
+  static auto kernel = EmbedCubinModule_mamba_ssd_q_tmem_alias_bf16_batched_152ad01e4f::Global()->mod.GetKernel("kernel_mamba_ssd_q_tmem_alias_bf16_batched");
   return kernel;
 }
 
@@ -836,6 +836,6 @@ void Run(TensorView preprocess_arg_dt, TensorView preprocess_arg_A, TensorView p
   stage_main::Submit(prepared_main, stream);
 }
 
-}  // namespace cake_host_shim_703c95277edfbebd
+}  // namespace cake_host_shim_19ff640e76571047
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_703c95277edfbebd::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_19ff640e76571047::Run);
