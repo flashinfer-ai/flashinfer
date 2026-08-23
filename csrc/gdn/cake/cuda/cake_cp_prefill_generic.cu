@@ -350,6 +350,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     int source_block_end_cg0 = chunk_start - (int)cu_seqlens[blockIdx.y] + block_cg0 * 64 + valid_tokens_cg0;
                     int source_chunk_end_cg0 = (source_block_end_cg0 + source_cp_chunk_len - 1) / source_cp_chunk_len * source_cp_chunk_len;
                     int source_final_block_cg0 = ((source_block_end_cg0 == source_chunk_end_cg0 || source_block_end_cg0 >= (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) ? 1 : 0);
+                    {
+                    }
                     mbarrier_wait(load_gate_full_addr + (gate_stage_cg0) * 8, gate_phase_cg0);
                     mbarrier_wait(load_t_full_addr + (t_stage_cg0) * 8, t_phase_cg0);
                     mbarrier_wait(ainv_empty_addr + (ainv_stage_cg0) * 8, ainv_empty_phase_cg0);
@@ -653,6 +655,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                         if (valid_tokens_cg1 > 0 && valid_tokens_cg1 < 64 && source_block_end_cg1 == (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) {
                             source_final_block_cg1 = 1;
                         }
+                    }
+                    {
                     }
                     mbarrier_wait(load_gate_full_addr + (gate_stage_cg1) * 8, gate_phase_cg1);
                     int gate_base_cg1 = gate_stage_cg1 * 64;
