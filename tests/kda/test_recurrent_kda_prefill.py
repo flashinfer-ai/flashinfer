@@ -1675,17 +1675,19 @@ def test_b200_packed_metadata_is_cached_for_unchanged_offsets(cuda_device):
 
 def test_packed_metadata_is_self_contained_across_threads(cuda_device):
     workspace = kda_prefill_api._FlashKDAStreamWorkspace(cuda_device)
+    device_index = torch.cuda.current_device()
     layouts = {
         "short_first": ((0, 1, 6), (1, 5)),
         "long_first": ((0, 4, 6), (4, 2)),
     }
-    barrier = threading.Barrier(len(layouts))
+    barrier = threading.Barrier(len(layouts), timeout=10)
+    result_lock = threading.Lock()
     results = {}
     failures = []
 
     def build_metadata(name, expected):
         try:
-            torch.cuda.set_device(cuda_device)
+            torch.cuda.set_device(device_index)
             offsets, _ = expected
             cu_seqlens = torch.tensor(
                 offsets, dtype=torch.int64, device=cuda_device
@@ -1698,10 +1700,13 @@ def test_packed_metadata_is_self_contained_across_threads(cuda_device):
                 sm_count=148,
                 build_persistent_plan=False,
             )
-            barrier.wait(timeout=10)
-            results[name] = metadata
+            barrier.wait()
+            with result_lock:
+                results[name] = metadata
         except BaseException as error:
-            failures.append(error)
+            barrier.abort()
+            with result_lock:
+                failures.append(error)
 
     threads = [
         threading.Thread(target=build_metadata, args=(name, expected))
