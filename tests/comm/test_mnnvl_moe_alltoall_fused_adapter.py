@@ -456,6 +456,33 @@ def test_combine_inventory_is_specialized_and_fail_closed():
     assert "int ep_rank, int top_k" not in combine_source
 
 
+def test_bf16_topk8_route_and_stage_grid_keep_exact_boundaries():
+    launcher_source = (
+        Path(__file__).resolve().parents[2]
+        / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllFusedKernels.cu"
+    ).read_text()
+
+    specialized_kernel = (
+        "kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8"
+    )
+    assert launcher_source.count(specialized_kernel) == 3
+    assert (
+        "params.top_k == 8 && params.dtype == nvinfer1::DataType::kBF16 &&"
+        in launcher_source
+    )
+    assert "params.elements_per_token % 8 == 0" in launcher_source
+    assert (
+        'preloadKernel("mnnvl_moe_alltoall_combine_bf16_topk8",'
+        in launcher_source
+    )
+    assert (
+        '"mnnvl_moe_alltoall_combine_bf16_topk8", params.enable_pdl,'
+        in launcher_source
+    )
+    assert "uint64_t{kCombineThreads * 16}" in launcher_source
+    assert "std::min(128, ceilDiv(payload_bytes," in launcher_source
+
+
 def test_workspace_initialization_rendezvous_is_ordered_and_cached(monkeypatch):
     import flashinfer.comm.trtllm_moe_alltoall as api
 
@@ -507,6 +534,18 @@ _ROUTES_BY_RANK = (
     ((0, 3), (4, 4), (2, 1)),
     ((3, 0), (1, 4), (3, 3)),
 )
+_TOPK8_ROUTES_BY_RANK = (
+    (
+        (0, 1, 2, 3, 8, 9, 10, 11),
+        (4, 5, 6, 7, 12, 13, 14, 15),
+        (0, 2, 4, 6, 8, 10, 12, 14),
+    ),
+    (
+        (1, 3, 5, 7, 9, 11, 13, 15),
+        (0, 1, 6, 7, 8, 9, 14, 15),
+        (2, 3, 4, 5, 10, 11, 12, 13),
+    ),
+)
 _QUANTIZATION_CELLS = (
     ("mxfp8", SfLayout.layout_linear),
     ("mxfp8", SfLayout.layout_128x4),
@@ -537,8 +576,9 @@ def _payloads(rank, experts):
     return [hidden, experts, weights, lora_ids, fp8, packed]
 
 
-def _owner(expert_id):
-    return 0 if expert_id < 3 else 1
+def _owner(expert_id, num_experts):
+    experts_per_rank = (num_experts + 1) // 2
+    return min(expert_id // experts_per_rank, 1)
 
 
 def _scale_extent(quantization, rows, columns, layout):
@@ -582,6 +622,8 @@ def _dispatch_public_round(
     active_sources,
     *,
     gather_eplb,
+    routes_by_rank=_ROUTES_BY_RANK,
+    num_experts=5,
 ):
     local_stats = None
     if gather_eplb:
@@ -590,7 +632,7 @@ def _dispatch_public_round(
         routes,
         payloads,
         routes.shape[0],
-        invalid_token_expert_id=5,
+        invalid_token_expert_id=num_experts,
         expert_id_payload_index=1,
         eplb_local_stats=local_stats,
         active_rank_mask=active_mask,
@@ -613,7 +655,7 @@ def _dispatch_public_round(
     expected_payloads = [
         _payloads(
             source,
-            torch.tensor(_ROUTES_BY_RANK[source], dtype=torch.int32, device="cuda"),
+            torch.tensor(routes_by_rank[source], dtype=torch.int32, device="cuda"),
         )
         for source in active_sources
     ]
@@ -623,8 +665,8 @@ def _dispatch_public_round(
     ):
         expected_tokens = [
             token
-            for token, selected in enumerate(_ROUTES_BY_RANK[source])
-            if rank in {_owner(expert) for expert in selected}
+            for token, selected in enumerate(routes_by_rank[source])
+            if rank in {_owner(expert, num_experts) for expert in selected}
         ]
         slots = {
             int(received[3][source, slot, 0].item()): slot
@@ -641,7 +683,9 @@ def _dispatch_public_round(
                     f"dispatch payload {payload_index}",
                 )
         if len(expected_tokens) < routes.shape[0]:
-            assert torch.all(received[1][source, len(expected_tokens) :] == 5)
+            assert torch.all(
+                received[1][source, len(expected_tokens) :] == num_experts
+            )
     return received, valid_slots
 
 
@@ -652,6 +696,9 @@ def _fill_expert_output_and_reference(
     payloads,
     rank,
     active_owners,
+    *,
+    routes_by_rank=_ROUTES_BY_RANK,
+    num_experts=5,
 ):
     expert_output.zero_()
     for source, slots in valid_slots.items():
@@ -663,13 +710,13 @@ def _fill_expert_output_and_reference(
             )
 
     reference = torch.zeros_like(payloads[0])
-    for token, selected in enumerate(_ROUTES_BY_RANK[rank]):
+    for token, selected in enumerate(routes_by_rank[rank]):
         lora_id = int(payloads[3][token, 0].item())
         contributions = [
             (payloads[0][token].float() * (owner + 1 + (lora_id + 1) / 16)).to(
                 torch.bfloat16
             )
-            for owner in {_owner(expert) for expert in selected}
+            for owner in {_owner(expert, num_experts) for expert in selected}
             if owner in active_owners
         ]
         if contributions:
@@ -711,6 +758,8 @@ def _run_public_combine_round(
     gather_eplb=False,
     quantization=None,
     layout=SfLayout.layout_linear,
+    routes_by_rank=_ROUTES_BY_RANK,
+    num_experts=5,
 ):
     received, valid_slots = _dispatch_public_round(
         collective,
@@ -720,6 +769,8 @@ def _run_public_combine_round(
         active_mask,
         active_sources,
         gather_eplb=gather_eplb,
+        routes_by_rank=routes_by_rank,
+        num_experts=num_experts,
     )
     if payload_in_workspace:
         expert_output = collective.get_combine_payload_tensor_in_workspace(
@@ -734,6 +785,8 @@ def _run_public_combine_round(
         payloads,
         rank,
         active_owners,
+        routes_by_rank=routes_by_rank,
+        num_experts=num_experts,
     )
 
     if quantization is None:
@@ -848,6 +901,52 @@ def _run_public_mpi2_cycle():
         (0, 1),
         (0, 1),
         payload_in_workspace=True,
+    )
+
+    topk8_routes = torch.tensor(
+        _TOPK8_ROUTES_BY_RANK[rank], dtype=torch.int32, device="cuda"
+    )
+    topk8_payloads = _payloads(rank, topk8_routes)
+    topk8_workspace_size = MoeAlltoAll.get_moe_workspace_size_per_rank(
+        2,
+        8,
+        max_tokens,
+        _HIDDEN_SIZE,
+        extra_payload_bytes_per_token=extra_payload_bytes,
+    )
+    topk8_collective = MoeAlltoAll(
+        mapping,
+        max_num_tokens=max_tokens,
+        top_k=8,
+        num_experts=16,
+        workspace_size_per_rank=topk8_workspace_size,
+        enable_rank_mask=True,
+    )
+    _run_public_combine_round(
+        topk8_collective,
+        rank,
+        topk8_routes,
+        topk8_payloads,
+        active_mask,
+        (0, 1),
+        (0, 1),
+        payload_in_workspace=False,
+        routes_by_rank=_TOPK8_ROUTES_BY_RANK,
+        num_experts=16,
+    )
+    _run_public_combine_round(
+        topk8_collective,
+        rank,
+        topk8_routes,
+        topk8_payloads,
+        active_mask,
+        (0, 1),
+        (0, 1),
+        payload_in_workspace=False,
+        quantization="nvfp4",
+        layout=SfLayout.layout_128x4,
+        routes_by_rank=_TOPK8_ROUTES_BY_RANK,
+        num_experts=16,
     )
 
     for quantization, layout in _QUANTIZATION_CELLS:
