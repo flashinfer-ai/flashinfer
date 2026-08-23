@@ -1568,6 +1568,12 @@ def test_public_cake_inference_empty_int64_inner_strided_cache_rebind(
         state_indices=reference_indices,
         max_seqlen=max(seq_lens),
     )
+    # The pinned CuTe oracle launches no state writer for a zero-token
+    # sequence.  The public varlen contract publishes its unchanged initial
+    # state instead, which the Cake route implements and this test verifies.
+    for seq_len, state_slot in zip(seq_lens, state_slots, strict=True):
+        if seq_len == 0:
+            reference_state[state_slot].copy_(reference_initial[state_slot])
 
     candidates = []
     for _ in range(2):
