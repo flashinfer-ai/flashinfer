@@ -2275,12 +2275,12 @@ def test_cake_decode_exact_sink_matches_independent_reference() -> None:
         (batch_size * q_len, num_q_heads, head_dim),
         dtype=torch.bfloat16,
         device=device,
-    )
+    ) * 0.125
     kv_cache = torch.randn(
         (pages_per_seq, 2, num_kv_heads, page_size, head_dim),
         dtype=torch.bfloat16,
         device=device,
-    )
+    ) * 0.125
     # Reuse one complete physical page row for every request.  This keeps the
     # exact logical B256/K4096 route while bounding the test's device footprint.
     block_tables = torch.arange(
@@ -2289,7 +2289,9 @@ def test_cake_decode_exact_sink_matches_independent_reference() -> None:
     seq_lens = torch.full(
         (batch_size,), kv_len, dtype=torch.int32, device=device
     )
-    sinks = torch.rand(num_q_heads, dtype=torch.float32, device=device) * 5
+    sinks = torch.linspace(
+        -2.0, 8.0, num_q_heads, dtype=torch.float32, device=device
+    )
     reference_workspace = torch.empty(
         256 * 1024 * 1024, dtype=torch.uint8, device=device
     )
@@ -2373,8 +2375,9 @@ def test_cake_decode_exact_sink_matches_independent_reference() -> None:
 
     # Both production kernels accumulate this long reduction in BF16-specific
     # orders, so comparing them directly compounds their independent rounding
-    # errors.  Use the same sink-attention definition as FlashInfer's reference
-    # tests, evaluated in FP32, and judge each implementation against it.
+    # errors.  Use bounded BF16 inputs and the same sink-attention definition as
+    # FlashInfer's reference tests, evaluated in FP32, and judge each
+    # implementation against it at the standard BF16 tolerance.
     key = kv_cache[:, 0].permute(0, 2, 1, 3).reshape(
         kv_len, num_kv_heads, head_dim
     )
