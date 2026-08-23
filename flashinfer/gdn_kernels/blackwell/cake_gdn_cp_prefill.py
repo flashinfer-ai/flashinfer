@@ -37,7 +37,7 @@ import tvm_ffi
 
 from ...jit.cake_gdn_cp_prefill import (
     CakeGDNCPArch,
-    cake_gdn_cp_nvcc_version as _cake_gdn_cp_nvcc_version,
+    cake_gdn_cp_nvcc_version as _cake_gdn_cp_nvcc_version,  # noqa: F401
     load_cake_gdn_cp_kernel,
 )
 
