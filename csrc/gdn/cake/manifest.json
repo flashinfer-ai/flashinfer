@@ -7152,7 +7152,7 @@
       ]
     }
   ],
-  "generator_commit": "7c740bbbb0285c617bcbfccd4a8b6cf4db5d0733",
+  "generator_commit": "cead7f4fe4f84602032df5c98011d10ad57f5bcd",
   "kernels": [
     {
       "abi": [
@@ -7872,9 +7872,9 @@
           ]
         ],
         "entry": "run_state_fixup_simt_row4",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_fixup_v1_3b30691995",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_fixup_v1_d07cf8dd3b",
         "path": "host/cake_state_fixup_simt_row4.cc",
-        "sha256": "8fd80d9fa796f0bd5c1576ffa6de0a5cb5e55d46407078a8b532deccd9bb5ee2",
+        "sha256": "a3d9c71c8a87ea30fc5097368a687d68972db51c88a3c6bd7c2e915eb082315c",
         "size_bytes": 15462
       },
       "name": "state_fixup_simt_row4",
@@ -7885,8 +7885,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_state_fixup_simt_row4.cu",
-          "sha256": "b077feca997e4b619fae18934eb2ab7b07b20500efba29143075757eb629e803",
-          "size_bytes": 8642
+          "sha256": "2ee0a8a22a87b3ed9a9d7659e98c74283e3d1c3133203eb7563d2744cbb12d33",
+          "size_bytes": 8953
         }
       ],
       "schedule_symbol": "flashinfer_blackwell_gdn_cp_prefill_fixup_v1",
@@ -10010,7 +10010,7 @@
     "stage4_tail_dispatch": "exact-full-block kernel iff every sequence length is divisible by 128; otherwise generic-tail kernel",
     "tensor_map_abi": "grid_constant for every TMA-backed stage; no process-lifetime descriptor arena"
   },
-  "measured_commit": "f38cd2584ced22e28a96cd51af242233d790618a",
+  "measured_commit": "48da33f13b5a42c8451c2e826387cfa65f2c5578",
   "schema": "flashinfer-pr4078-cake-only-standalone-export-v3",
   "selected_seed": "flashinfer_pr4078_exact_tail_qs_vks_cudagraph_v1",
   "selected_stage4_flags": {
