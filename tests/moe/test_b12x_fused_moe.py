@@ -3152,6 +3152,64 @@ def _class_def(path, name):
     raise AssertionError(f"{name} not found in {path}")
 
 
+def _function_def(path, name):
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found in {path}")
+
+
+def test_w4a16_large_weight_banks_cross_compile_boundary_as_pointers():
+    """Weight-bank shapes must not enter CuTe's 32-bit dynamic memref ABI."""
+    path = _FUSED_MOE_DIR / "cute_dsl" / "blackwell_sm12x" / "moe_w4a16_kernel.py"
+    kernel = _class_def(path, "W4A16FusedMoeKernel")
+    call = next(
+        node
+        for node in kernel.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__call__"
+    )
+    annotations = {
+        arg.arg: ast.unparse(arg.annotation) if arg.annotation else None
+        for arg in call.args.args
+    }
+    assert annotations["w13_flat_ptr"] == "cute.Pointer"
+    assert annotations["w2_flat_ptr"] == "cute.Pointer"
+
+    launch = _function_def(path, "_w4a16_fused_moe_launch_flat")
+    compiled_call = next(
+        node
+        for node in ast.walk(launch)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "compiled"
+    )
+    for argument in compiled_call.args[1:3]:
+        assert isinstance(argument, ast.Call)
+        assert isinstance(argument.func, ast.Name)
+        assert argument.func.id == "make_ptr"
+
+    gemm = _class_def(path, "W4A16GemmKernel")
+    stream_offsets = next(
+        node
+        for node in gemm.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_tile_stream_offsets"
+    )
+    stream_source = ast.unparse(stream_offsets)
+    assert "b_expert_off = Int64" in stream_source
+    assert "Int64(expert_idx)" in stream_source
+
+    stage = next(
+        node
+        for node in gemm.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_stage_k_tile_async"
+    )
+    annotations = {
+        arg.arg: ast.unparse(arg.annotation) if arg.annotation else None
+        for arg in stage.args.args
+    }
+    assert annotations["b_gl_rd_base"] == "Int64"
+
+
 def _self_deps(class_def, entry):
     """All ``self.<attr>`` reads reachable from method ``entry``."""
     methods = {n.name: n for n in class_def.body if isinstance(n, ast.FunctionDef)}

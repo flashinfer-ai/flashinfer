@@ -1490,8 +1490,12 @@ class W4A16GemmKernel:
                 scales_expert_stride = Int32((self.size_n * self.size_k) // (32 * 16))
         else:
             scales_expert_stride = Int32((self.size_n * self.size_k) // (16 * 16))
-        b_expert_off = (
-            Int32((self.size_n * self.size_k) // (_PACK_FACTOR * 4)) * expert_idx
+        # A pooled expert cache may make the flat packed bank larger than 2 Gi
+        # int32 elements. Keep weight-bank addressing 64-bit end-to-end; an
+        # Int32 expert offset silently wraps and makes cp.async read an invalid
+        # address even when the bank itself crossed the ABI as a raw pointer.
+        b_expert_off = Int64((self.size_n * self.size_k) // (_PACK_FACTOR * 4)) * Int64(
+            expert_idx
         )
         scales_expert_off = scales_expert_stride * expert_idx
 
@@ -1503,12 +1507,12 @@ class W4A16GemmKernel:
         a_rows_per_iter = Int32(self.cta_threads // self.a_gl_rd_delta_o)
 
         if cutlass.const_expr(self.cta_threads <= self.b_sh_stride):
-            b_gl_rd_base = tid
+            b_gl_rd_base = Int64(tid)
         else:
-            b_gl_rd_base = b_gl_stride * (tid // Int32(self.b_sh_stride)) + (
-                tid % Int32(self.b_sh_stride)
-            )
-        b_gl_rd_base += b_expert_off + Int32(self.b_sh_stride) * output_n_tile
+            b_gl_rd_base = Int64(b_gl_stride) * Int64(
+                tid // Int32(self.b_sh_stride)
+            ) + Int64(tid % Int32(self.b_sh_stride))
+        b_gl_rd_base += b_expert_off + Int64(self.b_sh_stride) * Int64(output_n_tile)
         b_sh_rd = tid
         b_sh_rd += (b_sh_rd // Int32(self.b_sh_stride)) * Int32(
             self.b_sh_stride * (self.b_sh_wr_iters - 1)
@@ -1910,7 +1914,7 @@ class W4A16GemmKernel:
         b_gl_stride: Int32,
         s_gl_stride: Int32,
         scales_expert_off: Int32,
-        b_gl_rd_base: Int32,
+        b_gl_rd_base: Int64,
         a_gl_rd_row: Int32,
         a_gl_rd_col0: Int32,
         a_sh_wr: Int32,
@@ -3010,7 +3014,7 @@ class W4A16GemmKernel:
         b_gl_stride: Int32,
         s_gl_stride: Int32,
         scales_expert_off: Int32,
-        b_gl_rd_base: Int32,
+        b_gl_rd_base: Int64,
         a_gl_rd_row: Int32,
         a_gl_rd_col0: Int32,
         a_sh_wr: Int32,
@@ -3064,9 +3068,9 @@ class W4A16GemmKernel:
             nf3_units_per_expert = (self.size_n * self.size_k) // 32
             nf3_ntile_stride = (self.size_k // 16) * (self.tile_n // 2)
             nf3_span_base_unit = (
-                Int32(nf3_units_per_expert) * expert_idx
-                + Int32(nf3_ntile_stride) * output_n_tile
-                + tile_idx * Int32(self.cta_k_blocks * self.b_sh_stride)
+                Int64(nf3_units_per_expert) * Int64(expert_idx)
+                + Int64(nf3_ntile_stride) * Int64(output_n_tile)
+                + Int64(tile_idx) * Int64(self.cta_k_blocks * self.b_sh_stride)
             )
             for i in cutlass.range_constexpr(self.b_sh_wr_iters_nf3):
                 nf3_chunk = Int32(i * self.cta_threads) + tid
@@ -3078,7 +3082,7 @@ class W4A16GemmKernel:
                 )
                 # int32-element index of the chunk's first word:
                 # (span_base_unit*12 + chunk*16) / 4 = span_base_unit*3 + chunk*4.
-                b_src_i32 = nf3_span_base_unit * Int32(3) + nf3_chunk * Int32(4)
+                b_src_i32 = nf3_span_base_unit * Int64(3) + Int64(nf3_chunk) * Int64(4)
                 cp_async4_shared_global_pred(
                     b_dst,
                     get_ptr_as_int64(b_i32_flat, b_src_i32),
@@ -3090,8 +3094,8 @@ class W4A16GemmKernel:
         ):
             b_src_int4 = (
                 b_gl_rd_base
-                + tile_idx * Int32(self.cta_k_blocks) * b_gl_stride
-                + Int32(i * (self.cta_threads // self.b_sh_stride)) * b_gl_stride
+                + Int64(tile_idx) * Int64(self.cta_k_blocks) * Int64(b_gl_stride)
+                + Int64(i * (self.cta_threads // self.b_sh_stride)) * Int64(b_gl_stride)
             )
             b_dst = self._int4_addr(
                 smem_base,
@@ -3103,7 +3107,7 @@ class W4A16GemmKernel:
             if cutlass.const_expr(self.weight_layout == "packed"):
                 cp_async4_shared_global(
                     b_dst,
-                    get_ptr_as_int64(b_i32_flat, b_src_int4 * Int32(4)),
+                    get_ptr_as_int64(b_i32_flat, b_src_int4 * Int64(4)),
                 )
             else:
                 self._stage_b_tile_modelopt_native(
@@ -3163,7 +3167,7 @@ class W4A16GemmKernel:
         b_gl_stride: Int32,
         s_gl_stride: Int32,
         scales_expert_off: Int32,
-        b_gl_rd_base: Int32,
+        b_gl_rd_base: Int64,
         a_gl_rd_row: Int32,
         a_gl_rd_col0: Int32,
         a_sh_wr: Int32,
@@ -3211,7 +3215,7 @@ class W4A16GemmKernel:
         b_gl_stride: Int32,
         s_gl_stride: Int32,
         scales_expert_off: Int32,
-        b_gl_rd_base: Int32,
+        b_gl_rd_base: Int64,
         a_gl_rd_row: Int32,
         a_gl_rd_col0: Int32,
         a_sh_wr: Int32,
@@ -3264,7 +3268,7 @@ class W4A16GemmKernel:
         b_gl_stride: Int32,
         s_gl_stride: Int32,
         scales_expert_off: Int32,
-        b_gl_rd_base: Int32,
+        b_gl_rd_base: Int64,
         a_gl_rd_row: Int32,
         a_gl_rd_col0: Int32,
         a_sh_wr: Int32,
@@ -4298,8 +4302,8 @@ class W4A16FusedMoeKernel:
     def __call__(
         self,
         a_bf16_ptr: cute.Pointer,
-        w13_i32_flat: cute.Tensor,
-        w2_i32_flat: cute.Tensor,
+        w13_flat_ptr: cute.Pointer,
+        w2_flat_ptr: cute.Pointer,
         fc1_bf16_flat: cute.Tensor,
         activated_bf16_flat: cute.Tensor,
         fc2_bf16_flat: cute.Tensor,
@@ -4323,6 +4327,40 @@ class W4A16FusedMoeKernel:
         a_bf16_flat = cute.make_tensor(
             a_bf16_ptr,
             layout=cute.make_layout((active_m * Int32(self.hidden_size),), stride=(1,)),
+        )
+        if cutlass.const_expr(self.weight_layout == "modelopt"):
+            w13_elements = self.num_experts * self.fc1_cols * (self.hidden_size // 2)
+            w2_elements = (
+                self.num_experts * self.hidden_size * (self.intermediate_size // 2)
+            )
+        elif cutlass.const_expr(self.weight_layout == "nf3_2p1"):
+            w13_elements = (
+                self.num_experts * (self.hidden_size // 16) * (self.fc1_cols // 2) * 3
+            )
+            w2_elements = (
+                self.num_experts
+                * (self.intermediate_size // 16)
+                * (self.hidden_size // 2)
+                * 3
+            )
+        else:
+            w13_elements = (
+                self.num_experts * (self.hidden_size // 16) * (self.fc1_cols // 16 * 32)
+            )
+            w2_elements = (
+                self.num_experts
+                * (self.intermediate_size // 16)
+                * (self.hidden_size // 16 * 32)
+            )
+        # A serving runtime may pool cache slots across layers, producing weight
+        # banks with more than INT32_MAX elements. Passing those banks through a
+        # dynamic DLPack memref overflows CuTe DSL's runtime shape descriptor.
+        # The kernel only needs aligned base addresses and compile-time lengths.
+        w13_i32_flat = cute.make_tensor(
+            w13_flat_ptr, layout=cute.make_layout((w13_elements,), stride=(1,))
+        )
+        w2_i32_flat = cute.make_tensor(
+            w2_flat_ptr, layout=cute.make_layout((w2_elements,), stride=(1,))
         )
         topk_weights_flat = cute.make_tensor(
             topk_weights_ptr,
@@ -5560,39 +5598,15 @@ def compile_w4a16_fused_moe(
     )
     a_fake = make_ptr(cutlass_dtype, 16, cute.AddressSpace.gmem, assumed_align=16)
     if weight_layout == "modelopt":
-        w13_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Uint8,
-            (num_experts * fc1_cols * (hidden_size // 2),),
-            assumed_align=16,
-        )
-        w2_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Uint8,
-            (num_experts * hidden_size * (intermediate_size // 2),),
-            assumed_align=16,
-        )
+        w13_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
+        w2_fake = make_ptr(cutlass.Uint8, 16, cute.AddressSpace.gmem, assumed_align=16)
     elif weight_layout == "nf3_2p1":
         # NF3: int32, 3 words per 32-code unit; (size_n // 2) units per K16 row.
-        w13_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32,
-            (num_experts * (hidden_size // 16) * (fc1_cols // 2) * 3,),
-            assumed_align=16,
-        )
-        w2_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32,
-            (num_experts * (intermediate_size // 16) * (hidden_size // 2) * 3,),
-            assumed_align=16,
-        )
+        w13_fake = make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16)
+        w2_fake = make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16)
     else:
-        w13_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32,
-            (num_experts * (hidden_size // 16) * (fc1_cols // 16 * 32),),
-            assumed_align=16,
-        )
-        w2_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Int32,
-            (num_experts * (intermediate_size // 16) * (hidden_size // 16 * 32),),
-            assumed_align=16,
-        )
+        w13_fake = make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16)
+        w2_fake = make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, assumed_align=16)
     fc1_fake = cute.runtime.make_fake_compact_tensor(
         cutlass_dtype,
         (compile_routed_rows * fc1_cols,),
@@ -5983,8 +5997,18 @@ def _w4a16_fused_moe_launch_flat(
             cute.AddressSpace.gmem,
             assumed_align=16,
         ),
-        w13_arg,
-        w2_arg,
+        make_ptr(
+            cutlass.Uint8 if weight_layout == "modelopt" else cutlass.Int32,
+            w13_arg.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
+        make_ptr(
+            cutlass.Uint8 if weight_layout == "modelopt" else cutlass.Int32,
+            w2_arg.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        ),
         fc1_out,
         activated,
         fc2_out,
