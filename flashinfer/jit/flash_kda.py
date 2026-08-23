@@ -94,8 +94,8 @@ _FLASH_KDA_MODULE_IDENTS = {
 _FLASH_KDA_BINDING_STEMS = {
     "m64": "flashkda_bf16_fused_m64",
     "m128": "flashkda_bf16_fused_m128",
-    "m128_h12_short": "flashkda_bf16_fused_m128_h12",
-    "m128_h12_long": "flashkda_bf16_fused_m128_h12",
+    "m128_h12_short": "cake_flashkda_bf16_fused_m128_h12",
+    "m128_h12_long": "cake_flashkda_bf16_fused_m128_h12",
     "m128_n16": "cake_flashkda_bf16_fused_m128_n16",
     "m128_n16_checkpoint": "flashkda_bf16_fused_m128_n16_checkpoint",
     "persistent_m128": "cake_flashkda_bf16_persistent_m128",

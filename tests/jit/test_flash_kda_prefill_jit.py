@@ -24,14 +24,14 @@ _H12_CASES = (
         "m128_h12_short",
         "fe0a070282",
         "-DFLASHINFER_FLASH_KDA_H12_SHORT=1",
-        "flashkda_bf16_fused_m128_h12_short.cu",
+        "cake_flashkda_bf16_fused_m128_h12_short.cu",
         "d53eb6c03047625fce5c365c0e217bbd511fe64abf20112a1cfff496b27c39ad",
     ),
     (
         "m128_h12_long",
         "9e4219f788",
         "-DFLASHINFER_FLASH_KDA_H12_LONG=1",
-        "flashkda_bf16_fused_m128_h12_long.cu",
+        "cake_flashkda_bf16_fused_m128_h12_long.cu",
         "abbebbc936a6af5a35c7cb5497b1c40136079896904edda6d10ef986556584c3",
     ),
 )
@@ -63,7 +63,7 @@ def test_h12_prefill_jit_spec_and_frozen_source(
     assert spec.name == f"flash_kda_bf16_{variant}_{module_ident}_{target}"
     assert spec.sources == [
         flash_kda._get_flash_kda_csrc_dir()
-        / "flashkda_bf16_fused_m128_h12_binding.cu"
+        / "cake_flashkda_bf16_fused_m128_h12_binding.cu"
     ]
     assert variant_define in spec.extra_cuda_cflags
     assert target_define in spec.extra_cuda_cflags

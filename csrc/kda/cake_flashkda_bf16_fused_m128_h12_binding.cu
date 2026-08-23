@@ -31,9 +31,9 @@
 #define FlashKDATensorMapPack flashkda_generated_FlashKDATensorMapPack
 #define CUtensorMap flashkda_generated_CUtensorMap
 #if defined(FLASHINFER_FLASH_KDA_H12_SHORT)
-#include "flashkda_bf16_fused_m128_h12_short.cu"
+#include "cake_flashkda_bf16_fused_m128_h12_short.cu"
 #else
-#include "flashkda_bf16_fused_m128_h12_long.cu"
+#include "cake_flashkda_bf16_fused_m128_h12_long.cu"
 #endif
 #undef CUtensorMap
 #undef FlashKDATensorMapPack
