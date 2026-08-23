@@ -153,8 +153,9 @@ def _fresh_batched_semantic_oracle(
     beta: torch.Tensor,
     cu_seqlens: torch.Tensor,
     initial_state: torch.Tensor,
-    state_indices: torch.Tensor,
+    state_indices: torch.Tensor | None,
     scale: float,
+    output_state: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     seq_lens = tuple(
         int(value)
@@ -175,7 +176,12 @@ def _fresh_batched_semantic_oracle(
             "scale": scale,
             "cu_seqlens": cu_seqlens.cpu(),
             "initial_state": initial_state.cpu(),
-            "state_indices": state_indices.cpu(),
+            "state_indices": (
+                None if state_indices is None else state_indices.cpu()
+            ),
+            "output_state": (
+                None if output_state is None else output_state.cpu()
+            ),
         },
         device=q.device,
     )
@@ -1326,11 +1332,8 @@ def _allocate_state_pool(
 )
 def test_generic_backend_matches_pr4078_state_and_lifecycle(
     case: dict[str, object],
+    tmp_path: Path,
 ) -> None:
-    from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
-        cp_delta_rule_dsl_sm100,
-    )
-
     torch.manual_seed(int(case["seed"]))
     seq_lens = tuple(int(value) for value in case["seq_lens"])
     total = sum(seq_lens)
@@ -1413,7 +1416,6 @@ def test_generic_backend_matches_pr4078_state_and_lifecycle(
         candidate_state.zero_()
         reference_state.zero_()
     output = torch.empty((total, state_heads, 128), dtype=io_dtype, device="cuda")
-    expected_output = torch.full_like(output, float("nan"))
     read_only = tuple(
         tensor.clone()
         for tensor in (q, k, v, alpha, beta, cu_seqlens)
@@ -1434,21 +1436,22 @@ def test_generic_backend_matches_pr4078_state_and_lifecycle(
         else torch.ones((total, state_heads), dtype=torch.float32, device="cuda")
     )
 
-    cp_delta_rule_dsl_sm100(
-        expected_output,
-        reference_state,
-        q,
-        k,
-        v,
-        baseline_alpha,
-        baseline_beta,
-        cu_seqlens,
-        float(case["scale"]),
+    expected_output, semantic_state = _fresh_batched_semantic_oracle(
+        tmp_path=tmp_path,
+        q=q,
+        k=k,
+        v=v,
+        alpha=baseline_alpha,
+        beta=baseline_beta,
+        cu_seqlens=cu_seqlens,
         initial_state=reference_initial,
         state_indices=state_indices,
-        max_seqlen=total,
+        scale=float(case["scale"]),
+        output_state=reference_state,
     )
     _assert_oracle_output_written(expected_output)
+    if reference_state is not None:
+        reference_state.copy_(semantic_state)
     prepared = cake.prepare_cake_gdn_cp_prefill(
         q,
         k,

@@ -36,14 +36,23 @@ def main(input_path: Path, output_path: Path) -> None:
     if mode == "batched":
         expected_initial = payload["initial_state"].to(device="cuda")
         expected_initial_before = expected_initial.clone()
+        output_state = payload.get("output_state")
+        if output_state is None:
+            output_state = expected_initial
+        else:
+            output_state = output_state.to(device="cuda")
         expected_state = torch.empty_strided(
-            expected_initial.shape,
-            expected_initial.stride(),
-            dtype=expected_initial.dtype,
+            output_state.shape,
+            output_state.stride(),
+            dtype=output_state.dtype,
             device="cuda",
         )
-        expected_state.copy_(expected_initial)
-        state_indices = payload["state_indices"].to(device="cuda", dtype=torch.int64)
+        expected_state.copy_(output_state)
+        state_indices = payload.get("state_indices")
+        if state_indices is None:
+            state_indices = torch.arange(len(seq_lens), device="cuda")
+        else:
+            state_indices = state_indices.to(device="cuda", dtype=torch.int64)
         q_expanded = q.repeat_interleave(state_heads // q.shape[1], dim=1)
         k_expanded = k.repeat_interleave(state_heads // k.shape[1], dim=1)
         v_expanded = v.repeat_interleave(state_heads // v.shape[1], dim=1)
