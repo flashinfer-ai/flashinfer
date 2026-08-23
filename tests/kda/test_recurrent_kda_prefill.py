@@ -1330,9 +1330,9 @@ def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
 @pytest.mark.parametrize(
     ("packed", "num_heads", "expected_variant"),
     [
-        (False, 64, "m128"),
-        (True, 64, "m128"),
-        (True, 2, "m128"),
+        (False, 64, "m128_n16"),
+        (True, 64, "m128_n16"),
+        (True, 2, "m128_n16"),
         (False, 12, "m128_n16"),
     ],
 )
@@ -1399,6 +1399,8 @@ def test_frozen_route_and_ffi_abi(
     )
     assert args[8].dtype == torch.int64
     assert args[9].dtype == torch.int32
+    if packed:
+        assert args[9].data_ptr() == seq_order.data_ptr()
     if expected_variant == "m64":
         assert args[10].data_ptr() == args[12].data_ptr()
         assert args[13].dtype == torch.uint8
@@ -1483,6 +1485,54 @@ def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
     assert args[15].shape == (768,)
     assert args[16] == 1
     assert args[17] == 96
+
+
+def test_explicit_seq_order_keeps_direct_worker_and_reaches_ffi(
+    cuda_device,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: (10, 0),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_is_cuda_version_at_least",
+        lambda version: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_device_sm_count",
+        lambda device: 148,
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(
+        seq_lens=[2, 2],
+        num_heads=96,
+        packed=True,
+        initial_state=True,
+    )
+    seq_order = torch.tensor([1, 0], dtype=torch.int32, device=cuda_device)
+    recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        seq_order=seq_order,
+        backend="cake",
+    )
+
+    assert routes == [("m128", "sm100f")]
+    (args,) = module.calls
+    assert len(args) == 28
+    assert args[9].data_ptr() == seq_order.data_ptr()
 
 
 def test_b200_prefill_without_initial_state_stays_direct(cuda_device, monkeypatch):
@@ -1995,7 +2045,7 @@ def test_explicit_workspace_descriptor_prepare_and_reuse(cuda_device, monkeypatc
     assert (
         module.calls[0][16].data_ptr()
         == module.calls[1][16].data_ptr()
-        == workspace._descriptor_storages["m128"].data_ptr()
+        == workspace._descriptor_storages["m128_n16"].data_ptr()
     )
 
     changed_output = torch.empty_like(output)
@@ -2487,6 +2537,7 @@ def test_frozen_prefill_h6_full_tma_chunk_matches_reference(flash_kda_device):
         **_strict_prefill_kwargs(inputs),
         output=output,
         output_final_state=True,
+        backend="cake",
     )
 
     assert actual_output.data_ptr() == output.data_ptr()
@@ -2525,6 +2576,7 @@ def test_frozen_prefill_h12_tma_chunks_match_reference(flash_kda_device, seq_len
         **_strict_prefill_kwargs(inputs),
         output=output,
         output_final_state=True,
+        backend="cake",
     )
 
     assert actual_output.data_ptr() == output.data_ptr()
@@ -2562,6 +2614,7 @@ def test_frozen_prefill_h12_packed_matches_reference(flash_kda_device):
         **_strict_prefill_kwargs(inputs),
         output=output,
         output_final_state=True,
+        backend="cake",
     )
 
     assert actual_output.data_ptr() == output.data_ptr()
@@ -2634,6 +2687,7 @@ def test_frozen_prefill_h12_strided_beta_indexed_state_and_checkpoints_match_ref
         state_checkpoints=state_checkpoints,
         checkpoint_cu_starts=checkpoint_cu_starts,
         checkpoint_every_n_tokens=checkpoint_interval,
+        backend="cake",
     )
 
     assert actual_state is state_pool
