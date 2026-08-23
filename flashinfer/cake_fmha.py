@@ -97,10 +97,7 @@ _PRODUCT_ROUTE_COMPONENTS: dict[str, tuple[str, ...]] = {
         "context_fp8_hd256",
     ),
     "ctx_fp8_hnd_hd128_hgpack_48b5_v1": ("context_fp8",),
-    "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1": (
-        "context_nvfp4_dequant",
-        "context_fp8",
-    ),
+    "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1": ("context_nvfp4",),
     "decode_native_bf16_v1_bece": ("decode_native_bf16",),
     "decode_native_fp16_hd512_v1_66b1": ("decode_native_fp16_hd512",),
     "decode_native_fp16_nhd_v1_f32d": ("decode_native_fp16_nhd",),
@@ -126,7 +123,7 @@ _AUTHENTICATED_JIT_COMPONENTS = frozenset(
         "context_fp8",
         "context_fp8_hd256",
         "context_hd256_support",
-        "context_nvfp4_dequant",
+        "context_nvfp4",
         "decode_native_bf16",
         "decode_native_fp16_hd512",
         "decode_native_fp16_nhd",
@@ -975,7 +972,7 @@ def _context_nvfp4_workspace_supported(
     num_q_heads: int,
     pack_g: int,
 ) -> bool:
-    """Bound the dequantized K/V and expanded-metadata workspace exactly."""
+    """Bound the fused kernel's expanded-metadata workspace exactly."""
 
     if (
         workspace_buffer is None
@@ -984,11 +981,8 @@ def _context_nvfp4_workspace_supported(
         or workspace_buffer.data_ptr() % 16
     ):
         return False
-    output_page_stride = key_cache.shape[1] * 16 * 128
-    kv_bytes = key_cache.shape[0] * output_page_stride
-    metadata_offset = ((2 * kv_bytes + 15) // 16) * 16
     total_bh = batch_size * (num_q_heads // pack_g)
-    seq_kv_offset = ((metadata_offset + total_bh * 4 + 15) // 16) * 16
+    seq_kv_offset = ((total_bh * 4 + 15) // 16) * 16
     required = ((seq_kv_offset + 2 * total_bh * 4 + 15) // 16) * 16
     return workspace_buffer.numel() * workspace_buffer.element_size() >= required
 

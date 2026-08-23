@@ -810,7 +810,7 @@ def gen_cake_fmha_context_nvfp4_module(
     page_size: int,
     l2_swizzle: int,
 ) -> JitSpec:
-    """Build the authenticated NVFP4-dequant/FP8-context chain."""
+    """Build the authenticated fused NVFP4 context kernel."""
 
     selector = _validate_context_specialization(
         target,
@@ -826,15 +826,12 @@ def gen_cake_fmha_context_nvfp4_module(
     )
     if page_size != 16:
         raise ValueError("Cake NVFP4 context requires page_size=16")
-    dequant_sources = _get_component_launch_sources(
-        "context_nvfp4_dequant", target, {}
+    sources = _get_component_sources(
+        "context_nvfp4",
+        target,
+        {**selector, "STATIC_ONE_TILE": 1},
+        _CONTEXT_FP8_JIT_BINDING,
     )
-    context_sources = _get_component_launch_sources(
-        "context_fp8", target, selector
-    )
-    api_binding = get_cake_fmha_csrc_dir() / _CONTEXT_FP8_JIT_BINDING
-    if not api_binding.is_file():
-        raise FileNotFoundError(f"Cake FMHA JIT source not found: {api_binding}")
     heads_per_group = num_q_heads // num_kv_heads
     tok_per_stage = 128 // pack_g
     spec = gen_jit_spec(
@@ -847,7 +844,7 @@ def gen_cake_fmha_context_nvfp4_module(
             page_size,
             l2_swizzle,
         ),
-        sources=[*dequant_sources, *context_sources, api_binding],
+        sources=list(sources),
         extra_cuda_cflags=[
             *_TARGET_FLAGS[target],
             "-use_fast_math",
@@ -859,7 +856,6 @@ def gen_cake_fmha_context_nvfp4_module(
             f"-DTOK_PER_STAGE={tok_per_stage}",
             f"-DL2_SWIZZLE={l2_swizzle}",
             f"-DPAGE_SIZE={page_size}",
-            "-DVPT=4",
             "-DCAKE_FMHA_CONTEXT_IS_CAUSAL=1",
             "-DCAKE_FMHA_CONTEXT_RETURN_LSE=0",
             "-DCAKE_FMHA_CONTEXT_ENABLE_SINK=0",

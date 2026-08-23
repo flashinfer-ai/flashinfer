@@ -178,23 +178,58 @@ CUtensorMap EncodeTmaPagedKv(TensorView tensor, const char* name) {
   return tm;
 }
 
-CUtensorMap EncodeTmaContiguousPagedKv(void* data, int64_t pages, int64_t page_stride,
-                                       const char* name) {
-  uint64_t global_dim[5] = {128u, PAGE_SIZE, 1u, NUM_Q_HEADS / HEADS_PER_GROUP,
-                            static_cast<uint64_t>(pages)};
-  uint64_t global_strides[4] = {128u, 128u, PAGE_SIZE * 128u,
-                                static_cast<uint64_t>(page_stride)};
-  uint32_t box_dim[5] = {128u, 16u, 1u, 1u, 1u};
+#if CAKE_FMHA_CONTEXT_NVFP4
+CUtensorMap EncodeTmaPackedNvfp4Kv(TensorView tensor, const char* name) {
+  TVM_FFI_ICHECK_EQ(tensor.ndim(), 4) << name << " must be rank-4 packed HND paged KV";
+  TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_uint8);
+  TVM_FFI_ICHECK_EQ(tensor.size(1), NUM_Q_HEADS / HEADS_PER_GROUP);
+  TVM_FFI_ICHECK_EQ(tensor.size(2), PAGE_SIZE);
+  TVM_FFI_ICHECK_EQ(tensor.size(3), 64);
+  TVM_FFI_ICHECK_EQ(tensor.stride(3), 1);
+  uint64_t global_dim[5] = {64u, PAGE_SIZE, 1u, static_cast<uint64_t>(tensor.size(1)),
+                            static_cast<uint64_t>(tensor.size(0))};
+  uint64_t global_strides[4] = {static_cast<uint64_t>(tensor.stride(2)), 64u,
+                                static_cast<uint64_t>(tensor.stride(1)),
+                                static_cast<uint64_t>(tensor.stride(0))};
+  uint32_t box_dim[5] = {64u, 16u, 1u, 1u, 1u};
   uint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
   CUtensorMap tm;
   CUresult result = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5, data, global_dim, global_strides, box_dim,
-      elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
+      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 5, tensor.data_ptr(), global_dim, global_strides, box_dim,
+      elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
       CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS)
-      << "failed to encode Cake FMHA dequantized context " << name << " map";
+      << "failed to encode Cake FMHA packed NVFP4 context " << name << " map";
   return tm;
 }
+
+CUtensorMap EncodeTmaNvfp4Scales(TensorView tensor, const char* name) {
+  TVM_FFI_ICHECK_EQ(tensor.ndim(), 4) << name << " must be rank-4 NVFP4 block scales";
+  TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_float8_e4m3fn);
+  TVM_FFI_ICHECK_EQ(tensor.size(1), NUM_Q_HEADS / HEADS_PER_GROUP);
+  TVM_FFI_ICHECK_EQ(tensor.size(2), PAGE_SIZE);
+  TVM_FFI_ICHECK_EQ(tensor.size(3), 8);
+  TVM_FFI_ICHECK_EQ(tensor.stride(3), 1);
+  TVM_FFI_ICHECK_EQ(tensor.stride(2), 8);
+  TVM_FFI_ICHECK_EQ(tensor.stride(1) % 16, 0);
+  TVM_FFI_ICHECK_EQ(tensor.stride(0) % 16, 0);
+  constexpr uint64_t block_bytes = PAGE_SIZE * 8u;
+  uint64_t global_dim[3] = {block_bytes, static_cast<uint64_t>(tensor.size(1)),
+                            static_cast<uint64_t>(tensor.size(0))};
+  uint64_t global_strides[2] = {static_cast<uint64_t>(tensor.stride(1)),
+                                static_cast<uint64_t>(tensor.stride(0))};
+  uint32_t box_dim[3] = {128u, 1u, 1u};
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
+  CUtensorMap tm;
+  CUresult result = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, tensor.data_ptr(), global_dim, global_strides, box_dim,
+      elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
+      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS)
+      << "failed to encode Cake FMHA NVFP4 context " << name << " map";
+  return tm;
+}
+#endif
 
 __global__ void PrepareContextMetadata(const int* cum_seq_lens_q, const int* seq_lens_kv,
                                        int* expanded_q, int* expanded_kv, int* expanded_cu_q,
@@ -354,38 +389,12 @@ void cake_paged_attention_context(
   cudaStream_t stream = get_stream(query.device());
   auto* workspace = static_cast<uint8_t*>(workspace_buffer.data_ptr());
   int64_t actual_workspace_bytes = workspace_buffer.numel() * get_element_size(workspace_buffer);
-  int64_t workspace_prefix = 0;
   CUtensorMap h_q = EncodeTmaQ(query);
 #if CAKE_FMHA_CONTEXT_NVFP4
-  int64_t pages = key_cache.size(0);
-  TVM_FFI_ICHECK_GT(pages, 0);
-  int64_t output_page_stride =
-      static_cast<int64_t>(NUM_Q_HEADS / HEADS_PER_GROUP) * PAGE_SIZE * 128;
-  TVM_FFI_ICHECK_LE(output_page_stride, static_cast<int64_t>(INT32_MAX));
-  int64_t kv_bytes = pages * output_page_stride;
-  int64_t value_offset = AlignUp(kv_bytes, 16);
-  workspace_prefix = AlignUp(value_offset + kv_bytes, 16);
-  TVM_FFI_ICHECK_GE(actual_workspace_bytes, workspace_prefix)
-      << "Cake FMHA context NVFP4 dequantization requires " << workspace_prefix << " bytes";
-  TVM_FFI_ICHECK_GE(workspace_size, workspace_prefix);
-  auto* dequantized_k = workspace;
-  auto* dequantized_v = workspace + value_offset;
-  int64_t total_groups_64 = pages * (NUM_Q_HEADS / HEADS_PER_GROUP) * PAGE_SIZE * 8;
-  TVM_FFI_ICHECK_LE(total_groups_64, static_cast<int64_t>(INT32_MAX));
-  int total_groups = static_cast<int>(total_groups_64);
-  unsigned int dequant_grid = static_cast<unsigned int>((total_groups_64 + 1023) / 1024);
-  cudaError_t dequant_status = cake_fmha_launch_context_nvfp4_dequant(
-      static_cast<uint8_t*>(key_cache.data_ptr()), static_cast<uint8_t*>(value_cache.data_ptr()),
-      static_cast<uint8_t*>(key_scales.data_ptr()), static_cast<uint8_t*>(value_scales.data_ptr()),
-      dequantized_k, dequantized_v, total_groups, static_cast<int>(output_page_stride),
-      dequant_grid, 1, 1, stream);
-  TVM_FFI_ICHECK_EQ(dequant_status, cudaSuccess)
-      << "Cake FMHA context NVFP4 dequantization failed: "
-      << cudaGetErrorString(dequant_status);
-  CUtensorMap h_k =
-      EncodeTmaContiguousPagedKv(dequantized_k, pages, output_page_stride, "key_cache");
-  CUtensorMap h_v =
-      EncodeTmaContiguousPagedKv(dequantized_v, pages, output_page_stride, "value_cache");
+  CUtensorMap h_k = EncodeTmaPackedNvfp4Kv(key_cache, "key_cache");
+  CUtensorMap h_v = EncodeTmaPackedNvfp4Kv(value_cache, "value_cache");
+  CUtensorMap h_ksf = EncodeTmaNvfp4Scales(key_scales, "key_block_scales");
+  CUtensorMap h_vsf = EncodeTmaNvfp4Scales(value_scales, "value_block_scales");
 #else
   CUtensorMap h_k = EncodeTmaPagedKv(key_cache, "key_cache");
   CUtensorMap h_v = EncodeTmaPagedKv(value_cache, "value_cache");
@@ -393,18 +402,22 @@ void cake_paged_attention_context(
   void* p_q = TmaDeviceSlot(h_q, query.device().device_id, stream);
   void* p_k = TmaDeviceSlot(h_k, query.device().device_id, stream);
   void* p_v = TmaDeviceSlot(h_v, query.device().device_id, stream);
+#if CAKE_FMHA_CONTEXT_NVFP4
+  void* p_ksf = TmaDeviceSlot(h_ksf, query.device().device_id, stream);
+  void* p_vsf = TmaDeviceSlot(h_vsf, query.device().device_id, stream);
+#endif
 
   constexpr int units_per_batch = NUM_Q_HEADS / PACK_G;
   int64_t total_bh_64 = batch_size * units_per_batch;
   TVM_FFI_ICHECK_LE(total_bh_64, static_cast<int64_t>(INT32_MAX));
   int total_bh = static_cast<int>(total_bh_64);
-  int64_t seq_q_offset = workspace_prefix;
+  int64_t seq_q_offset = 0;
   int64_t seq_kv_offset =
       AlignUp(seq_q_offset + total_bh_64 * static_cast<int64_t>(sizeof(int)), 16);
   int64_t cu_q_offset = seq_kv_offset + total_bh_64 * static_cast<int64_t>(sizeof(int));
   int64_t cursor = AlignUp(cu_q_offset + total_bh_64 * static_cast<int64_t>(sizeof(int)), 16);
   TVM_FFI_ICHECK_GE(actual_workspace_bytes, cursor)
-      << "Cake FMHA context FP8 workspace requires " << cursor << " bytes";
+      << "Cake FMHA context metadata workspace requires " << cursor << " bytes";
   TVM_FFI_ICHECK_GE(workspace_size, cursor);
   int64_t counter_bytes =
       multi_ctas_kv_counter_buffer.numel() * get_element_size(multi_ctas_kv_counter_buffer);
@@ -445,15 +458,27 @@ void cake_paged_attention_context(
   float softmax_scale_log2 =
       static_cast<float>(ScalarScale(bmm1_scale, "bmm1_scale") * 1.4426950408889634);
   unsigned int total_tiles = static_cast<unsigned int>(NUM_M_BLOCKS * total_bh);
+#if CAKE_FMHA_CONTEXT_NVFP4
+  unsigned int grid_x = total_tiles;
+#else
   unsigned int grid_x = std::min<unsigned int>(static_cast<unsigned int>(sm_count), total_tiles);
+#endif
   auto* dynamic_counter = static_cast<uint32_t*>(multi_ctas_kv_counter_buffer.data_ptr());
+#if CAKE_FMHA_CONTEXT_NVFP4
+  cudaError_t status = cake_fmha_launch_context_nvfp4(
+      p_q, p_k, p_v, p_ksf, p_vsf, static_cast<uint8_t*>(out.data_ptr()), lse_ptr, sinks_ptr,
+      table_k, table_v, seq_q_expanded, seq_kv_expanded, cu_q_expanded, softmax_scale_log2,
+      output_scale, total_bh, static_cast<int>(page_row_stride), static_cast<int>(grid_x),
+      dynamic_counter, grid_x, 1, 1, stream);
+#else
   cudaError_t status = cake_fmha_launch_context_fp8(
       p_q, p_k, p_v, static_cast<uint8_t*>(out.data_ptr()), lse_ptr, sinks_ptr, table_k, table_v,
       seq_q_expanded, seq_kv_expanded, cu_q_expanded, softmax_scale_log2, output_scale, total_bh,
       static_cast<int>(page_row_stride), static_cast<int>(grid_x), dynamic_counter, grid_x, 1, 1,
       stream);
+#endif
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-      << "Cake FMHA context FP8 launch failed: " << cudaGetErrorString(status);
+      << "Cake FMHA context launch failed: " << cudaGetErrorString(status);
 
   (void)enable_pdl;
 }

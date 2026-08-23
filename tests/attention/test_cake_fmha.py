@@ -637,7 +637,7 @@ def test_cake_fmha_context_fp8_jit_selects_one_manifest_member(monkeypatch) -> N
     assert "-DTOK_PER_STAGE=16" in spec.extra_cuda_cflags
 
 
-def test_cake_fmha_context_nvfp4_jit_selects_dequant_and_fp8_chain(
+def test_cake_fmha_context_nvfp4_jit_selects_fused_member(
     monkeypatch,
 ) -> None:
     import flashinfer.jit.core as jit_core
@@ -650,15 +650,21 @@ def test_cake_fmha_context_nvfp4_jit_selects_dequant_and_fp8_chain(
         "sm100a", 1, 32, 4, 8, 16, 8
     )
     assert {Path(source).name for source in spec.sources} == {
-        "default.cu",
-        "cake_fmha_context_nvfp4_dequant_binding.cu",
-        "enable_sink0_is_causal1_return_lse0.cu",
-        "cake_fmha_context_fp8_binding.cu",
+        "enable_sink0_is_causal1_return_lse0_static_one_tile1.cu",
+        "cake_fmha_context_nvfp4_binding.cu",
         "cake_fmha_context_fp8_jit_binding.cu",
     }
     assert "-DNUM_KV_HEADS=4" in spec.extra_cuda_cflags
     assert "-DPAGE_SIZE=16" in spec.extra_cuda_cflags
     assert "-DCAKE_FMHA_CONTEXT_NVFP4=1" in spec.extra_cuda_cflags
+    adapter = next(
+        Path(source)
+        for source in spec.sources
+        if Path(source).name == "cake_fmha_context_fp8_jit_binding.cu"
+    ).read_text(encoding="utf-8")
+    assert "cake_fmha_launch_context_nvfp4(" in adapter
+    assert "cake_fmha_launch_context_nvfp4_dequant" not in adapter
+    assert "unsigned int grid_x = total_tiles;" in adapter
 
 
 @pytest.mark.parametrize(
@@ -1434,6 +1440,18 @@ def test_cake_fmha_context_candidate_selection_for_adapter_families(monkeypatch)
     )
     assert nvfp4_route is not None
     assert nvfp4_route.component == "context_nvfp4"
+    metadata_only_nvfp4_route = select(
+        fp8_q,
+        torch.empty((4, 2, 16, 64), dtype=torch.uint8),
+        torch.empty_like(fp8_q),
+        kv_layout="HND",
+        shared=True,
+        causal=True,
+        scales=torch.empty((4, 2, 16, 8), dtype=torch.float8_e4m3fn),
+        workspace_bytes=64,
+    )
+    assert metadata_only_nvfp4_route is not None
+    assert metadata_only_nvfp4_route.component == "context_nvfp4"
     assert (
         select(
             fp8_q,
