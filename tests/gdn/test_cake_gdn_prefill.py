@@ -267,7 +267,7 @@ def test_checkpoint_interval_becomes_cp_chunk_and_maps_boundaries(
     )
 
     assert plan.cp_chunk_len == 128
-    assert plan.source_cp_chunk_len == 128
+    assert plan.source_cp_chunk_len == 256
     assert plan.checkpoint_count == 5
     assert cake._checkpoint_fixed_state_indices(plan, device).tolist() == [
         0,

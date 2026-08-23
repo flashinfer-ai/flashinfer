@@ -221,10 +221,12 @@ def _build_plan(
     num_sab_heads = max(hq, hv)
     props = torch.cuda.get_device_properties(q.device)
     num_sms = int(props.multi_processor_count)
-    source_cp_chunk_len = checkpoint_every_n_tokens or _choose_chunk_len(
+    # Checkpoints refine physical chunking without changing the pinned
+    # source-visible block boundaries consumed by Stage 4.
+    source_cp_chunk_len = _choose_chunk_len(
         total_tokens=total_tokens, num_heads=num_sab_heads, num_sms=num_sms
     )
-    cp_chunk_len = source_cp_chunk_len
+    cp_chunk_len = checkpoint_every_n_tokens or source_cp_chunk_len
     if (
         not checkpoint_every_n_tokens
         and arch == "sm_103a"
