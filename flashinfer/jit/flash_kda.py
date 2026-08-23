@@ -31,6 +31,7 @@ FlashKDAVariant = Literal[
     "m64",
     "m128",
     "m128_n16",
+    "m128_n16_checkpoint",
     "persistent_m128",
     "small_bh_m128",
 ]
@@ -40,6 +41,7 @@ FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "m64",
     "m128",
     "m128_n16",
+    "m128_n16_checkpoint",
     "persistent_m128",
     "small_bh_m128",
 )
@@ -58,16 +60,21 @@ _FLASH_KDA_TARGET_DEFINE = {
 # refreshed export or binding specialization after an in-place package upgrade.
 _FLASH_KDA_MODULE_IDENTS = {
     "m64": "9a5566f3be",
-    "m128": "ea022a2f1f",
-    "m128_n16": "ef8b47d690",
-    "persistent_m128": "64bc19d01c",
-    "small_bh_m128": "73369168de",
+    "m128": "564a06c652",
+    "m128_n16": "65709d917f",
+    # Generated body, binding, and shared binding header, separated by NUL
+    # bytes without a trailing separator. Keep this route's cache key tied to
+    # all compiled content.
+    "m128_n16_checkpoint": "3fce0271a4",
+    "persistent_m128": "aae6c933e8",
+    "small_bh_m128": "84472afa2f",
 }
 
 _FLASH_KDA_BINDING_STEMS = {
     "m64": "flashkda_bf16_fused_m64",
     "m128": "flashkda_bf16_fused_m128",
     "m128_n16": "cake_flashkda_bf16_fused_m128_n16",
+    "m128_n16_checkpoint": "flashkda_bf16_fused_m128_n16_checkpoint",
     "persistent_m128": "cake_flashkda_bf16_persistent_m128",
     "small_bh_m128": "cake_flashkda_bf16_small_bh_m128",
 }
@@ -170,6 +177,12 @@ def gen_flash_kda_m128_n16_module(target: FlashKDATarget) -> JitSpec:
     return gen_flash_kda_module("m128_n16", target)
 
 
+def gen_flash_kda_m128_n16_checkpoint_module(target: FlashKDATarget) -> JitSpec:
+    """Generate the N16 M128 module with checkpoint TMA stores."""
+
+    return gen_flash_kda_module("m128_n16_checkpoint", target)
+
+
 def gen_flash_kda_persistent_m128_module(target: FlashKDATarget) -> JitSpec:
     """Generate the SM100-only static-binned persistent M128 module."""
 
@@ -234,6 +247,7 @@ __all__ = [
     "gen_flash_kda_m64_module",
     "gen_flash_kda_m128_module",
     "gen_flash_kda_m128_n16_module",
+    "gen_flash_kda_m128_n16_checkpoint_module",
     "gen_flash_kda_persistent_m128_module",
     "gen_flash_kda_small_bh_m128_module",
     "gen_flash_kda_module",

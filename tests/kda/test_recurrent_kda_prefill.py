@@ -1506,10 +1506,10 @@ def test_strided_beta_indexed_state_and_checkpoints_reach_native_ffi(
     inputs["initial_state"] = state_pool
 
     checkpoint_cu_starts = torch.tensor(
-        [0, 2, 5], dtype=torch.int64, device=cuda_device
+        [0, 5, 14], dtype=torch.int64, device=cuda_device
     )
     state_checkpoints = torch.empty(
-        (5, 12, 128, 128), dtype=torch.bfloat16, device=cuda_device
+        (14, 12, 128, 128), dtype=torch.bfloat16, device=cuda_device
     )
     output, returned_state, returned_checkpoints = recurrent_kda(
         **_strict_prefill_kwargs(inputs),
@@ -1518,12 +1518,12 @@ def test_strided_beta_indexed_state_and_checkpoints_reach_native_ffi(
         ssm_state_indices=state_indices,
         state_checkpoints=state_checkpoints,
         checkpoint_cu_starts=checkpoint_cu_starts,
-        checkpoint_every_n_tokens=64,
+        checkpoint_every_n_tokens=16,
     )
     assert output.shape == inputs["q"].shape
     assert returned_state is state_pool
     assert returned_checkpoints is state_checkpoints
-    assert routes == [("m128_n16", "sm100f")]
+    assert routes == [("m128_n16_checkpoint", "sm100f")]
     (args,) = module.calls
     assert len(args) == 28
     assert args[4].data_ptr() == inputs["beta"].data_ptr()
@@ -1535,7 +1535,7 @@ def test_strided_beta_indexed_state_and_checkpoints_reach_native_ffi(
     assert args[15].data_ptr() == checkpoint_cu_starts.data_ptr()
     assert args[19] == inputs["beta"].stride(-2)
     assert args[20] == state_pool.stride(0)
-    assert args[21:25] == (1, 1, 1, 64)
+    assert args[21:25] == (1, 1, 1, 16)
 
 
 def test_unaligned_strided_beta_uses_internal_tma_workspace(cuda_device, monkeypatch):
@@ -2258,6 +2258,7 @@ def test_frozen_prefill_h12_packed_matches_reference(flash_kda_device):
 def test_frozen_prefill_h12_strided_beta_indexed_state_and_checkpoints_match_reference(
     flash_kda_device,
 ):
+    checkpoint_interval = 16
     inputs = _make_inputs(
         seq_lens=[65, 131],
         num_heads=12,
@@ -2275,7 +2276,7 @@ def test_frozen_prefill_h12_strided_beta_indexed_state_and_checkpoints_match_ref
     inputs["beta"] = beta_carrier[None, :, 8:20]
     expected_output, expected_state, expected_checkpoints = _chunk16_debug_reference(
         {**inputs, "initial_state": compact_initial_state},
-        checkpoint_every_n_tokens=64,
+        checkpoint_every_n_tokens=checkpoint_interval,
     )
 
     state_slot_numel = 12 * 128 * 128
@@ -2294,10 +2295,10 @@ def test_frozen_prefill_h12_strided_beta_indexed_state_and_checkpoints_match_ref
     untouched_before = state_pool[[0, 2, 4]].clone()
     inputs["initial_state"] = state_pool
     checkpoint_cu_starts = torch.tensor(
-        [0, 2, 5], dtype=torch.int64, device=flash_kda_device
+        [0, 5, 14], dtype=torch.int64, device=flash_kda_device
     )
     state_checkpoints = torch.empty(
-        (5, 12, 128, 128), dtype=torch.bfloat16, device=flash_kda_device
+        (14, 12, 128, 128), dtype=torch.bfloat16, device=flash_kda_device
     )
 
     actual_output, actual_state, actual_checkpoints = recurrent_kda(
@@ -2307,7 +2308,7 @@ def test_frozen_prefill_h12_strided_beta_indexed_state_and_checkpoints_match_ref
         ssm_state_indices=state_indices,
         state_checkpoints=state_checkpoints,
         checkpoint_cu_starts=checkpoint_cu_starts,
-        checkpoint_every_n_tokens=64,
+        checkpoint_every_n_tokens=checkpoint_interval,
     )
 
     assert actual_state is state_pool
