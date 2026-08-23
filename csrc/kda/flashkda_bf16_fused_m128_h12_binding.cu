@@ -49,10 +49,11 @@
 namespace flashinfer {
 namespace flash_kda {
 
-constexpr int kThreads = 1024;
 #if defined(FLASHINFER_FLASH_KDA_H12_SHORT)
+constexpr int kThreads = 864;
 constexpr bool kPairPackedBeta = false;
 #else
+constexpr int kThreads = 1024;
 constexpr bool kPairPackedBeta = true;
 #endif
 static_assert(STORE_BACKWARD_TAPE == 0);
