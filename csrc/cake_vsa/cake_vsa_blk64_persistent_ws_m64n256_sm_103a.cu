@@ -644,8 +644,8 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                     for (int group_index = 0; group_index < group_count; group_index++) {
                         mbarrier_wait(s_full_addr, _phase_s_full_0);
                         _phase_s_full_0 ^= 1;
-                        int entry_lo = group_index * 4 + warp_col;
-                        int entry_hi = entry_lo + 2;
+                        int entry_lo = group_index * 4 + 2 * warp_col;
+                        int entry_hi = entry_lo + 1;
                         int valid_lo = 0;
                         int valid_hi = 0;
                         if (entry_lo < selected_count) {
@@ -1536,10 +1536,10 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                         mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 65536);
                         tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536, k, 0, block0 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                         tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 32768, k, 0, block0 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 16384, k, 0, block1 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 49152, k, 0, block1 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 8192, k, 0, block2 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 40960, k, 0, block2 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 16384, k, 0, block2 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 49152, k, 0, block2 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 8192, k, 0, block1 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                        tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 40960, k, 0, block1 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                         tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 24576, k, 0, block3 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                         tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 57344, k, 0, block3 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                     }
@@ -1568,10 +1568,10 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                             mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 65536);
                             tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536, k, 0, block0_4 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                             tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 32768, k, 0, block0_4 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 16384, k, 0, block1_5 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 49152, k, 0, block1_5 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 8192, k, 0, block2_6 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 40960, k, 0, block2_6 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 16384, k, 0, block2_6 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 49152, k, 0, block2_6 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 8192, k, 0, block1_5 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 40960, k, 0, block1_5 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                             tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 24576, k, 0, block3_7 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                             tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 57344, k, 0, block3_7 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                         }
@@ -1601,10 +1601,10 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                                 mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 65536);
                                 tma_4d_gmem2smem(v_smem_addr + load_stage * 65536, v, 0, block0_5 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                                 tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 16384, v, 0, block0_5 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                                tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 32768, v, 0, block1_6 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                                tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 49152, v, 0, block1_6 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                                tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 8192, v, 0, block2_7 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                                tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 24576, v, 0, block2_7 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                                tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 32768, v, 0, block2_7 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                                tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 49152, v, 0, block2_7 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                                tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 8192, v, 0, block1_6 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                                tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 24576, v, 0, block1_6 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                                 tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 40960, v, 0, block3_8 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                                 tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 57344, v, 0, block3_8 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                             }
@@ -1632,10 +1632,10 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                                 mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 65536);
                                 tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536, k, 0, block0_13 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                                 tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 32768, k, 0, block0_13 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                                tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 16384, k, 0, block1_14 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                                tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 49152, k, 0, block1_14 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                                tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 8192, k, 0, block2_15 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                                tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 40960, k, 0, block2_15 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                                tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 16384, k, 0, block2_15 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                                tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 49152, k, 0, block2_15 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                                tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 8192, k, 0, block1_14 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                                tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 40960, k, 0, block1_14 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                                 tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 24576, k, 0, block3_16 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                                 tma_4d_gmem2smem(kv_smem_addr + load_stage * 65536 + 57344, k, 0, block3_16 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                             }
@@ -1664,10 +1664,10 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                             mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 65536);
                             tma_4d_gmem2smem(v_smem_addr + load_stage * 65536, v, 0, block0_12 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                             tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 16384, v, 0, block0_12 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 32768, v, 0, block1_13 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 49152, v, 0, block1_13 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 8192, v, 0, block2_14 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 24576, v, 0, block2_14 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 32768, v, 0, block2_14 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 49152, v, 0, block2_14 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 8192, v, 0, block1_13 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 24576, v, 0, block1_13 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                             tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 40960, v, 0, block3_15 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                             tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 57344, v, 0, block3_15 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                         }
@@ -1695,10 +1695,10 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                             mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 65536);
                             tma_4d_gmem2smem(v_smem_addr + load_stage * 65536, v, 0, block0_20 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                             tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 16384, v, 0, block0_20 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 32768, v, 0, block1_21 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 49152, v, 0, block1_21 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 8192, v, 0, block2_22 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 24576, v, 0, block2_22 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 32768, v, 0, block2_22 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 49152, v, 0, block2_22 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 8192, v, 0, block1_21 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 24576, v, 0, block1_21 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                             tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 40960, v, 0, block3_23 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                             tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 57344, v, 0, block3_23 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                         }
@@ -1727,10 +1727,10 @@ kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100(CakeTensorMap c
                             mbarrier_arrive_expect_tx(kv_full_addr + (load_stage) * 8, 65536);
                             tma_4d_gmem2smem(v_smem_addr + load_stage * 65536, v, 0, block0_4_1 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                             tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 16384, v, 0, block0_4_1 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 32768, v, 0, block1_5_1 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 49152, v, 0, block1_5_1 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 8192, v, 0, block2_6_1 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
-                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 24576, v, 0, block2_6_1 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 32768, v, 0, block2_6_1 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 49152, v, 0, block2_6_1 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 8192, v, 0, block1_5_1 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
+                            tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 24576, v, 0, block1_5_1 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                             tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 40960, v, 0, block3_7_1 * 64, 0, head_3, kv_full_addr + (load_stage) * 8);
                             tma_4d_gmem2smem(v_smem_addr + load_stage * 65536 + 57344, v, 0, block3_7_1 * 64, 1, head_3, kv_full_addr + (load_stage) * 8);
                         }

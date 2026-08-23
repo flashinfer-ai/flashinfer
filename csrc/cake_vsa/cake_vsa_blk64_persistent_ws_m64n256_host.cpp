@@ -16,7 +16,7 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100_3c398b92e9);
+TVM_FFI_EMBED_CUBIN(flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100_9bebd5eecd);
 
 namespace cake_host_shim {
 
@@ -456,7 +456,7 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
   int32_t v_return_lse = (int32_t)arg_return_lse;
   void* kargs[] = {&p_q, &p_k, &p_v, &p_out, &p_lse, &p_q2k_indices, &p_q2k_num, &p_kv_block_lens, &v_max_kv_blocks, &v_sequence_q, &v_query_blocks, &v_total_tiles, &v_tiles_per_cta, &v_num_heads, &v_softmax_scale_log2, &v_return_lse};
 
-  static auto kernel = EmbedCubinModule_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100_3c398b92e9::Global()->mod.GetKernel("kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100");
+  static auto kernel = EmbedCubinModule_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100_9bebd5eecd::Global()->mod.GetKernel("kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100");
   static signed char cake_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = CakeConfigureDynamicSmem(
       kernel, (int)arg_q.device().device_id, 231936,
