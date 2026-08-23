@@ -4495,6 +4495,56 @@ def _block_sparse_attention_run_init(
     }
 
 
+cake_vsa_plan_trace = TraceTemplate(
+    op_type="block_sparse_plan",
+    name_prefix="cake_vsa_plan",
+    description=(
+        "Plan the sparse metadata and fixed execution route consumed by the "
+        "Cake VSA source-level backend."
+    ),
+    axes={
+        "qo_len": Var(description="Query sequence length."),
+        "kv_len": Var(description="Key/value sequence length."),
+        "q_block_size": Const(abbrev="r"),
+        "kv_block_size": Const(abbrev="c"),
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+    },
+    inputs={
+        "indptr": Tensor(["indptr_len"], dtype="int32", optional=True),
+        "indices": Tensor(["nnz"], dtype="int32", optional=True),
+        "block_mask": Tensor(["num_qo_heads", "qo_blocks", "kv_blocks"], optional=True),
+        "kv_block_lens": Tensor(["kv_blocks"], dtype="int32", optional=True),
+        "q2k_indices": Tensor(
+            ["num_qo_heads", "qo_blocks", "topk"],
+            dtype="int32",
+            optional=True,
+        ),
+        "q2k_num": Tensor(["num_qo_heads", "qo_blocks"], dtype="int32", optional=True),
+        "qo_len": Scalar("int32", param="M"),
+        "kv_len": Scalar("int32", param="N"),
+        "q_block_size": Scalar("int32", param="R"),
+        "kv_block_size": Scalar("int32", param="C"),
+        "num_qo_heads": Scalar("int32"),
+        "num_kv_heads": Scalar("int32"),
+        "head_dim": Scalar("int32"),
+        "q_data_type": Scalar("dtype"),
+        "sm_scale": Scalar("float32", optional=True),
+        "device": Scalar("device"),
+    },
+    outputs={},
+    constraints=[
+        "qo_len % q_block_size == 0",
+        "kv_len % kv_block_size == 0",
+        "q_block_size == kv_block_size",
+        "q_block_size in (64, 128)",
+        "num_qo_heads % num_kv_heads == 0",
+    ],
+    tags=["status:verified", "sparse:block", "phase:plan"],
+)
+
+
 block_sparse_attention_run_trace = TraceTemplate(
     op_type="block_sparse",
     name_prefix="block_sparse_run",
