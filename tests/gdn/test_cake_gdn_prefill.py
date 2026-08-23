@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -80,11 +81,24 @@ def _run_fresh_gdn_oracle(
 ) -> dict[str, torch.Tensor]:
     input_path = tmp_path / f"{stem}-input.pt"
     output_path = tmp_path / f"{stem}-output.pt"
+    oracle_home = tmp_path / f"{stem}-home"
+    oracle_workspace = tmp_path / f"{stem}-workspace"
+    oracle_home.mkdir()
+    oracle_workspace.mkdir()
     torch.save(payload, input_path)
     worker = Path(__file__).with_name("_cake_gdn_prefill_checkpoint_oracle.py")
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "FLASHINFER_WORKSPACE_BASE": str(oracle_workspace),
+            "HOME": str(oracle_home),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
     completed = subprocess.run(
         [sys.executable, str(worker), str(input_path), str(output_path)],
         cwd=Path(__file__).resolve().parents[2],
+        env=environment,
         capture_output=True,
         text=True,
         timeout=1800,
