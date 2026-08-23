@@ -1652,6 +1652,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
+        variant_owns_mask: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -1718,11 +1719,31 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         jit_kwargs : Optional[Dict[str, Any]]
             The keyword arguments to create the JIT module, defaults to None.
+
+        variant_owns_mask : bool
+            If ``True``, the attention variant supplied through ``jit_args`` computes the
+            complete attention mask in its ``LogitsMask`` hook, and :attr:`MaskMode.CUSTOM`
+            is selected without a mask tensor: the kernel evaluates ``LogitsMask`` on every
+            KV tile instead of only on the causal/window boundary tiles, and no
+            ``custom_mask``/``packed_custom_mask`` needs to be passed to :meth:`plan`.
+            Requires ``jit_args``, because the default attention variant dereferences the
+            custom mask buffer under :attr:`MaskMode.CUSTOM`. Only supported with
+            ``backend="fa2"`` (the SM90 batch prefill kernels reject
+            :attr:`MaskMode.CUSTOM`), and incompatible with ``prefix_len_ptr``
+            (multi-item scoring), which selects a different mask mode.
+            Defaults to ``False``.
         """
         _check_workspace_buffer_alignment(
             float_workspace_buffer, "float_workspace_buffer"
         )
         _check_kv_layout(kv_layout)
+
+        if variant_owns_mask and backend != "fa2":
+            raise ValueError(
+                "variant_owns_mask is only supported on the fa2 backend: the "
+                "SM90 (fa3) batch prefill kernels return cudaErrorNotSupported "
+                "under MaskMode.CUSTOM."
+            )
 
         self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
@@ -1746,6 +1767,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._jit_module = None
             self._jit_additional_tensor_names = []
             self._jit_additional_scalar_names = []
+
+        if variant_owns_mask and self._jit_module is None:
+            raise ValueError(
+                "variant_owns_mask requires a custom JIT module (jit_args): the "
+                "default attention variant dereferences the custom mask buffer "
+                "under MaskMode.CUSTOM."
+            )
+        self._variant_owns_mask = variant_owns_mask
 
         self._kv_layout = kv_layout
         if backend == "cudnn":
@@ -2319,6 +2348,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 bitorder="little",
             )
 
+        if prefix_len_ptr is not None and self._variant_owns_mask:
+            raise ValueError(
+                "prefix_len_ptr (multi-item scoring) selects "
+                "MaskMode.MULTIITEMSCORING, which overrides the MaskMode.CUSTOM "
+                "required by variant_owns_mask; the two are incompatible."
+            )
         self._prefix_len_ptr = prefix_len_ptr
         self._token_pos_in_items_ptr = token_pos_in_items_ptr
         self._token_pos_in_items_len = token_pos_in_items_len
@@ -2969,7 +3004,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
                 value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
-        if self._custom_mask_buf is not None:
+        if self._custom_mask_buf is not None or self._variant_owns_mask:
             mask_mode = MaskMode.CUSTOM.value
         else:
             if self._causal:
@@ -3294,6 +3329,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
+        variant_owns_mask: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithRaggedKVCacheWrapper`.
 
@@ -3348,8 +3384,27 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         jit_kwargs : Optional[Dict[str, Any]]
             The keyword arguments to create the JIT module, defaults to None.
+
+        variant_owns_mask : bool
+            If ``True``, the attention variant supplied through ``jit_args`` computes the
+            complete attention mask in its ``LogitsMask`` hook, and :attr:`MaskMode.CUSTOM`
+            is selected without a mask tensor: the kernel evaluates ``LogitsMask`` on every
+            KV tile instead of only on the causal/window boundary tiles, and no
+            ``custom_mask``/``packed_custom_mask`` needs to be passed to :meth:`plan`.
+            Requires ``jit_args``, because the default attention variant dereferences the
+            custom mask buffer under :attr:`MaskMode.CUSTOM`. Only supported with
+            ``backend="fa2"`` (the SM90 batch prefill kernels reject
+            :attr:`MaskMode.CUSTOM`), and incompatible with ``prefix_len_ptr``
+            (multi-item scoring), which selects a different mask mode.
+            Defaults to ``False``.
         """
         _check_kv_layout(kv_layout)
+        if variant_owns_mask and backend != "fa2":
+            raise ValueError(
+                "variant_owns_mask is only supported on the fa2 backend: the "
+                "SM90 (fa3) batch prefill kernels return cudaErrorNotSupported "
+                "under MaskMode.CUSTOM."
+            )
         if jit_args is not None and backend != "cute-dsl":
             if jit_kwargs is None:
                 jit_kwargs = {}
@@ -3362,6 +3417,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
+
+        if variant_owns_mask and self._jit_module is None:
+            raise ValueError(
+                "variant_owns_mask requires a custom JIT module (jit_args): the "
+                "default attention variant dereferences the custom mask buffer "
+                "under MaskMode.CUSTOM."
+            )
+        self._variant_owns_mask = variant_owns_mask
 
         self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
@@ -3691,6 +3754,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._cached_o_data_type = o_data_type
         kv_len_arr = kv_indptr_host[1:] - kv_indptr_host[:-1]
 
+        if prefix_len_ptr is not None and self._variant_owns_mask:
+            raise ValueError(
+                "prefix_len_ptr (multi-item scoring) selects "
+                "MaskMode.MULTIITEMSCORING, which overrides the MaskMode.CUSTOM "
+                "required by variant_owns_mask; the two are incompatible."
+            )
         self._prefix_len_ptr = prefix_len_ptr
         self._token_pos_in_items_ptr = token_pos_in_items_ptr
         self._token_pos_in_items_len = token_pos_in_items_len
@@ -4318,7 +4387,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             k = k.to(torch.float16)
             v = v.to(torch.float16)
 
-        if self._custom_mask_buf is not None:
+        if self._custom_mask_buf is not None or self._variant_owns_mask:
             mask_mode = MaskMode.CUSTOM.value
         else:
             if self._causal:

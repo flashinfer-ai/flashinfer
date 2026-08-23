@@ -452,6 +452,252 @@ def test_batch_prefill_flash_sigmoid():
     torch.testing.assert_close(o_paged, o_ref, rtol=2e-2, atol=2e-2)
 
 
+variant_owned_window_decl = r"""
+struct WindowOwnedMask : AttentionVariantBase {
+  static constexpr bool use_softmax = true;
+
+  uint32_t window_left, qo_len, kv_len;
+  float sm_scale_log2;
+
+  // Create closure
+  template <typename Params>
+  __device__ __host__ WindowOwnedMask(const Params& params, uint32_t batch_idx,
+                                      uint8_t* smem_ptr) {
+    qo_len = params.get_qo_len(batch_idx);
+    kv_len = params.get_kv_len(batch_idx);
+    // The mask owns the window: keep KV traversal un-pruned.
+    window_left = kv_len;
+    sm_scale_log2 = params.sm_scale * math::log2e;
+  }
+
+  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+    // Clamp the CTA_TILE_Q padding lanes whose results are discarded.
+    const uint32_t q_local = qo_idx < qo_len ? qo_idx : qo_len - 1;
+    const uint32_t q_abs = kv_len - qo_len + q_local;
+    return (kv_idx <= q_abs) && (q_abs - kv_idx < uint32_t(params.mask_window));
+  })
+};
+"""
+
+
+def _owned_mask_jit_args(uri):
+    return (
+        uri,
+        torch.float16,  # dtype_q
+        torch.float16,  # dtype_kv
+        torch.float16,  # dtype_o
+        torch.int32,  # idtype
+        128,  # hidden_dim_qk
+        128,  # hidden_dim_vo
+        [],  # additional_tensor_names
+        [],  # additional_tensor_dtypes
+        ["mask_window", "sm_scale"],  # additional_scalar_names
+        ["double", "double"],  # additional_scalar_dtypes
+        "WindowOwnedMask",
+        variant_owned_window_decl,
+    )
+
+
+def test_batch_prefill_variant_owns_mask():
+    """A JIT variant that owns the full mask must get MaskMode::CUSTOM.
+
+    Without a mask tensor, ``causal=False`` selects MaskMode::kNone, under
+    which the FA2 kernel only evaluates ``LogitsMask`` on boundary KV tiles.
+    ``variant_owns_mask=True`` selects MaskMode::CUSTOM without a mask tensor
+    so every interior tile is masked as well. The sequences here are long
+    enough to have interior tiles for every CTA_TILE_KV configuration.
+    """
+    torch.manual_seed(42)
+    jit_args = _owned_mask_jit_args("batch_prefill_variant_owns_mask")
+
+    num_qo_heads = 8
+    num_kv_heads = 8
+    head_dim = 128
+    mask_window = 32.0
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    lens = [(128, 2048), (64, 1024)]
+
+    qo_indptr_host = torch.tensor(
+        [0] + list(torch.tensor([q for q, _ in lens]).cumsum(0)), dtype=torch.int32
+    )
+    kv_indptr_host = torch.tensor(
+        [0] + list(torch.tensor([kv for _, kv in lens]).cumsum(0)), dtype=torch.int32
+    )
+    total_q = int(qo_indptr_host[-1])
+    total_kv = int(kv_indptr_host[-1])
+    q = torch.randn(total_q, num_qo_heads, head_dim, dtype=torch.float16, device="cuda")
+    k = torch.randn(
+        total_kv, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+    )
+    v = torch.randn(
+        total_kv, num_kv_heads, head_dim, dtype=torch.float16, device="cuda"
+    )
+
+    def ref_output():
+        outs = []
+        for i, (qo_len, kv_len) in enumerate(lens):
+            qs = q[qo_indptr_host[i] : qo_indptr_host[i + 1]].float()
+            ks = k[kv_indptr_host[i] : kv_indptr_host[i + 1]].float()
+            vs = v[kv_indptr_host[i] : kv_indptr_host[i + 1]].float()
+            q_abs = torch.arange(kv_len - qo_len, kv_len, device="cuda").view(-1, 1)
+            kv_pos = torch.arange(kv_len, device="cuda").view(1, -1)
+            mask = (kv_pos <= q_abs) & (q_abs - kv_pos < mask_window)
+            scores = torch.einsum("qhd,khd->hqk", qs, ks) * sm_scale
+            scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+            outs.append(torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), vs))
+        return torch.cat(outs, dim=0)
+
+    o_ref = ref_output()
+    float_workspace_buffer = torch.empty(
+        128 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+    )
+
+    def plan_ragged(wrapper):
+        wrapper.plan(
+            qo_indptr_host,
+            kv_indptr_host,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            causal=False,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+        )
+
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        float_workspace_buffer,
+        kv_layout="NHD",
+        backend="fa2",
+        jit_args=jit_args,
+        variant_owns_mask=True,
+    )
+    plan_ragged(wrapper)
+    o = wrapper.run(q, k, v, mask_window, sm_scale)
+    torch.testing.assert_close(o.float(), o_ref, rtol=2e-2, atol=2e-2)
+
+    # Same variant without the flag: MaskMode::kNone skips LogitsMask on
+    # interior KV tiles, so the window must NOT be applied there.
+    wrapper_none = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        float_workspace_buffer,
+        kv_layout="NHD",
+        backend="fa2",
+        jit_args=jit_args,
+    )
+    plan_ragged(wrapper_none)
+    o_none = wrapper_none.run(q, k, v, mask_window, sm_scale)
+    assert (o_none.float() - o_ref).abs().max() > 1e-2, (
+        "MaskMode::kNone unexpectedly applied the variant mask on interior "
+        "tiles; variant_owns_mask would be redundant"
+    )
+
+    # Paged wrapper, page_size=1 identity table.
+    wrapper_paged = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        float_workspace_buffer,
+        kv_layout="NHD",
+        backend="fa2",
+        jit_args=jit_args,
+        variant_owns_mask=True,
+    )
+    kv_indices_host = torch.arange(0, total_kv, dtype=torch.int32)
+    paged_kv_last_page_len_host = torch.full((len(lens),), 1, dtype=torch.int32)
+    wrapper_paged.plan(
+        qo_indptr_host,
+        kv_indptr_host,
+        kv_indices_host,
+        paged_kv_last_page_len_host,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        1,
+        causal=False,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+    )
+    o_paged = wrapper_paged.run(q, (k, v), mask_window, sm_scale)
+    torch.testing.assert_close(o_paged.float(), o_ref, rtol=2e-2, atol=2e-2)
+
+
+def test_variant_owns_mask_requires_jit_module():
+    float_workspace_buffer = torch.empty(
+        128 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+    )
+    for cls in (
+        flashinfer.BatchPrefillWithPagedKVCacheWrapper,
+        flashinfer.BatchPrefillWithRaggedKVCacheWrapper,
+    ):
+        with pytest.raises(ValueError, match="variant_owns_mask requires"):
+            cls(
+                float_workspace_buffer,
+                kv_layout="NHD",
+                backend="fa2",
+                variant_owns_mask=True,
+            )
+        # Rejected before any JIT build: the SM90 batch prefill kernels
+        # return cudaErrorNotSupported under MaskMode.CUSTOM.
+        with pytest.raises(ValueError, match="only supported on the fa2 backend"):
+            cls(
+                float_workspace_buffer,
+                kv_layout="NHD",
+                backend="fa3",
+                variant_owns_mask=True,
+            )
+
+
+@pytest.mark.parametrize("paged", [True, False])
+def test_variant_owns_mask_rejects_multi_item_scoring(paged):
+    """prefix_len_ptr selects MULTIITEMSCORING, which would override CUSTOM."""
+    jit_args = _owned_mask_jit_args("batch_prefill_variant_owns_mask")
+    float_workspace_buffer = torch.empty(
+        128 * 1024 * 1024, dtype=torch.uint8, device="cuda"
+    )
+    qo_indptr = torch.tensor([0, 8], dtype=torch.int32)
+    kv_indptr = torch.tensor([0, 8], dtype=torch.int32)
+    prefix_len_ptr = torch.zeros(1, dtype=torch.uint32, device="cuda")
+    if paged:
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            float_workspace_buffer,
+            kv_layout="NHD",
+            backend="fa2",
+            jit_args=jit_args,
+            variant_owns_mask=True,
+        )
+        with pytest.raises(ValueError, match="incompatible"):
+            wrapper.plan(
+                qo_indptr,
+                kv_indptr,
+                torch.arange(0, 8, dtype=torch.int32),
+                torch.full((1,), 1, dtype=torch.int32),
+                8,
+                8,
+                128,
+                1,
+                causal=False,
+                q_data_type=torch.float16,
+                kv_data_type=torch.float16,
+                prefix_len_ptr=prefix_len_ptr,
+            )
+    else:
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            float_workspace_buffer,
+            kv_layout="NHD",
+            backend="fa2",
+            jit_args=jit_args,
+            variant_owns_mask=True,
+        )
+        with pytest.raises(ValueError, match="incompatible"):
+            wrapper.plan(
+                qo_indptr,
+                kv_indptr,
+                8,
+                8,
+                128,
+                causal=False,
+                q_data_type=torch.float16,
+                kv_data_type=torch.float16,
+                prefix_len_ptr=prefix_len_ptr,
+            )
+
+
 def test_batch_prefill_sm90_flash_sigmoid():
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("SM90A is not supported")
