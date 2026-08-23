@@ -224,6 +224,26 @@ def test_generic_plan_selects_head_dtype_and_tail_routes(
     assert plan.num_sab_heads == max(hq, hv)
 
 
+def test_zero_length_plan_uses_simt_state_fixup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cake, "_arch_for", lambda _device: "sm_103a")
+    monkeypatch.setattr(
+        cake.torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=148),
+    )
+    device = SimpleNamespace()
+    q = SimpleNamespace(shape=(129, 4, 128), device=device, dtype=torch.bfloat16)
+    k = SimpleNamespace(shape=(129, 1, 128))
+    v = SimpleNamespace(shape=(129, 1, 128))
+
+    plan = cake._build_plan(q, k, v, (0, 64, 65, 0))
+
+    assert cake._choose_fixup_kind(16, 148) == "state_fixup_utcmma64"
+    assert plan.fixup_kernel == "state_fixup_simt_row4"
+
+
 def test_checkpoint_interval_becomes_cp_chunk_and_maps_boundaries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
