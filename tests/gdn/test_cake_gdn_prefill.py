@@ -52,10 +52,21 @@ def _source_root() -> Path:
 def _assert_oracle_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     """Require exact non-finite masks and the public tolerance elsewhere."""
 
+    _assert_oracle_output_written(expected)
     assert torch.equal(torch.isnan(actual), torch.isnan(expected))
     assert torch.equal(torch.isposinf(actual), torch.isposinf(expected))
     assert torch.equal(torch.isneginf(actual), torch.isneginf(expected))
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2, equal_nan=True)
+
+
+def _assert_oracle_output_written(output: torch.Tensor) -> None:
+    nonfinite = ~torch.isfinite(output)
+    if bool(nonfinite.any().item()):
+        first = torch.nonzero(nonfinite, as_tuple=False)[0].tolist()
+        pytest.fail(
+            "pinned CP oracle left poisoned output storage unwritten: "
+            f"count={int(nonfinite.sum().item())}, first_index={first}"
+        )
 
 
 def test_generated_source_inventory_and_hashes() -> None:
@@ -881,7 +892,9 @@ def test_odd_cp_chunk_uses_generic_kernel_and_matches_cute() -> None:
     alpha = 1.0 - torch.rand((total, hv), dtype=torch.float32, device="cuda") / total
     beta = torch.rand((total, hv), dtype=torch.float32, device="cuda").sigmoid()
     cu_seqlens = torch.tensor([0, total], dtype=torch.int64, device="cuda")
-    expected_output = torch.empty((total, hv, dim), dtype=q.dtype, device="cuda")
+    expected_output = torch.full(
+        (total, hv, dim), float("nan"), dtype=q.dtype, device="cuda"
+    )
     expected_state = torch.empty((1, hv, dim, dim), dtype=torch.float32, device="cuda")
     cp_delta_rule_dsl_sm100(
         expected_output,
@@ -896,6 +909,7 @@ def test_odd_cp_chunk_uses_generic_kernel_and_matches_cute() -> None:
         max_seqlen=total,
         cp_chunk_len=192,
     )
+    _assert_oracle_output_written(expected_output)
 
     output_state = torch.empty_like(expected_state)
     prepared = cake.prepare_cake_gdn_cp_prefill(
@@ -960,7 +974,9 @@ def test_frozen_graph_matches_pr4078_and_preserves_inputs(
         tensor.clone() for tensor in (q, k, v, alpha, beta, cu_seqlens, initial_state)
     )
 
-    expected_output = torch.empty((total, hv, dim), dtype=torch.float16, device=device)
+    expected_output = torch.full(
+        (total, hv, dim), float("nan"), dtype=torch.float16, device=device
+    )
     expected_state = torch.empty_like(initial_state)
     cp_delta_rule_dsl_sm100(
         expected_output,
@@ -975,6 +991,7 @@ def test_frozen_graph_matches_pr4078_and_preserves_inputs(
         initial_state=initial_state,
         max_seqlen=total,
     )
+    _assert_oracle_output_written(expected_output)
     prepared = cake.prepare_cake_gdn_cp_prefill(
         q,
         k,
@@ -1035,7 +1052,7 @@ def test_public_checkpoint_matches_cute_on_caller_stream_and_cuda_graph(
         (3, state_heads, 128, 128), dtype=torch.float32, device="cuda"
     )
 
-    expected_output = torch.empty_like(output)
+    expected_output = torch.full_like(output, float("nan"))
     expected_state = torch.empty_like(output_state)
     # Match the public forced-CP dispatcher, which passes total_seq_len as
     # max_seqlen. Checkpointing refines state publication only; it does not
@@ -1052,6 +1069,7 @@ def test_public_checkpoint_matches_cute_on_caller_stream_and_cuda_graph(
         1.0 / 128**0.5,
         max_seqlen=total,
     )
+    _assert_oracle_output_written(expected_output)
     expected_checkpoints = []
     token_start = 0
     for seq_len in seq_lens:
@@ -1310,7 +1328,7 @@ def test_generic_backend_matches_pr4078_state_and_lifecycle(
         candidate_state.zero_()
         reference_state.zero_()
     output = torch.empty((total, state_heads, 128), dtype=io_dtype, device="cuda")
-    expected_output = torch.empty_like(output)
+    expected_output = torch.full_like(output, float("nan"))
     read_only = tuple(
         tensor.clone()
         for tensor in (q, k, v, alpha, beta, cu_seqlens)
@@ -1345,6 +1363,7 @@ def test_generic_backend_matches_pr4078_state_and_lifecycle(
         state_indices=state_indices,
         max_seqlen=total,
     )
+    _assert_oracle_output_written(expected_output)
     prepared = cake.prepare_cake_gdn_cp_prefill(
         q,
         k,
@@ -1425,8 +1444,11 @@ def test_public_dispatcher_uses_only_cake_for_indexed_inplace_gqa(
         padding=96,
     )
     reference_state.copy_(candidate_state)
-    expected_output = torch.empty(
-        (total, state_heads, 128), dtype=torch.bfloat16, device="cuda"
+    expected_output = torch.full(
+        (total, state_heads, 128),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     ones = torch.ones((total, state_heads), dtype=torch.float32, device="cuda")
     cp_delta_rule_dsl_sm100(
@@ -1443,6 +1465,7 @@ def test_public_dispatcher_uses_only_cake_for_indexed_inplace_gqa(
         state_indices=state_indices,
         max_seqlen=total,
     )
+    _assert_oracle_output_written(expected_output)
 
     immutable = tuple(tensor.clone() for tensor in (q, k, v, cu_seqlens, state_indices))
     state_before = candidate_state.clone()
@@ -1553,8 +1576,11 @@ def test_public_cake_inference_empty_int64_inner_strided_cache_rebind(
     reference_indices = torch.tensor(state_slots, dtype=torch.int32, device="cuda")
     reference_initial = state_values.clone()
     reference_state = torch.full_like(reference_initial, -7.0)
-    expected_output = torch.empty(
-        (total, state_heads, 128), dtype=torch.bfloat16, device="cuda"
+    expected_output = torch.full(
+        (total, state_heads, 128),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device="cuda",
     )
     ones = torch.ones((total, state_heads), dtype=torch.float32, device="cuda")
     cp_delta_rule_dsl_sm100(
@@ -1571,6 +1597,7 @@ def test_public_cake_inference_empty_int64_inner_strided_cache_rebind(
         state_indices=reference_indices,
         max_seqlen=max(seq_lens),
     )
+    _assert_oracle_output_written(expected_output)
     # The pinned CuTe oracle launches no state writer for a zero-token
     # sequence.  The public varlen contract publishes its unchanged initial
     # state instead, which the Cake route implements and this test verifies.
