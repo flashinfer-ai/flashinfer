@@ -20,16 +20,12 @@ import pytest
 import torch
 
 from flashinfer.sparse import BlockSparseAttentionWrapper
-
-
-def _is_sm100_or_sm103() -> bool:
-    if not torch.cuda.is_available():
-        return False
-    return torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+from flashinfer.utils import is_cvt_rs_supported
 
 
 pytestmark = pytest.mark.skipif(
-    not _is_sm100_or_sm103(), reason="Cake VSA requires SM100 or SM103"
+    not torch.cuda.is_available() or not is_cvt_rs_supported(),
+    reason="Cake VSA requires SM100 or SM103",
 )
 
 
