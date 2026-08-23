@@ -1572,9 +1572,7 @@ def test_frozen_h12_n32_specializations_match_reference(
         backend="cake",
     )
 
-    expected_target = kda_prefill_api._select_flash_kda_prefill_target(
-        flash_kda_device
-    )
+    expected_target = kda_prefill_api._select_flash_kda_prefill_target(flash_kda_device)
     assert routes == [(expected_variant, expected_target)]
     assert actual_state is inputs["initial_state"]
     torch.testing.assert_close(

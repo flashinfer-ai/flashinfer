@@ -67,10 +67,13 @@ def test_h12_prefill_jit_spec_and_frozen_source(
     ]
     assert variant_define in spec.extra_cuda_cflags
     assert target_define in spec.extra_cuda_cflags
-    assert sum(
-        flag.startswith("-DFLASHINFER_FLASH_KDA_H12_")
-        for flag in spec.extra_cuda_cflags
-    ) == 1
+    assert (
+        sum(
+            flag.startswith("-DFLASHINFER_FLASH_KDA_H12_")
+            for flag in spec.extra_cuda_cflags
+        )
+        == 1
+    )
     assert sum("-gencode=arch=compute_" in flag for flag in spec.extra_cuda_cflags) == 1
 
     frozen_source = flash_kda._get_flash_kda_csrc_dir() / source_name

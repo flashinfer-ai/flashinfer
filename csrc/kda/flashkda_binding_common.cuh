@@ -286,23 +286,21 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
   const int64_t padded_beta_tma_heads = RoundUpBetaTmaHeads(num_heads);
   const int64_t beta_tma_heads = beta_tma.size(beta_tma.ndim() - 1);
   const bool direct_beta_tma = allow_serving_layouts && beta_tma_heads == num_heads;
-  const bool pair_packed_beta_tma =
-      allow_pair_packed_beta_tma && num_heads == 12 && beta_tma_heads == 24 &&
-      token_count % 2 == 0 && beta_tma.numel() == token_count * num_heads;
-  TVM_FFI_ICHECK(
-      beta_tma.ndim() >= 2 &&
-      (((beta_tma_heads == padded_beta_tma_heads || direct_beta_tma) &&
-        beta_tma.numel() % beta_tma_heads == 0 &&
-        beta_tma.numel() / beta_tma_heads >= token_count) ||
-       pair_packed_beta_tma))
+  const bool pair_packed_beta_tma = allow_pair_packed_beta_tma && num_heads == 12 &&
+                                    beta_tma_heads == 24 && token_count % 2 == 0 &&
+                                    beta_tma.numel() == token_count * num_heads;
+  TVM_FFI_ICHECK(beta_tma.ndim() >= 2 &&
+                 (((beta_tma_heads == padded_beta_tma_heads || direct_beta_tma) &&
+                   beta_tma.numel() % beta_tma_heads == 0 &&
+                   beta_tma.numel() / beta_tma_heads >= token_count) ||
+                  pair_packed_beta_tma))
       << "beta_tma must have at least [tokens, H] direct storage or "
          "[tokens, round_up(H, 8)] padded storage, or the enabled H12 "
          "[tokens / 2, 24] pair-packed alias";
   if (pair_packed_beta_tma) {
     const TensorByteRange beta_range = GetTensorByteRange(beta, "beta");
     const TensorByteRange beta_tma_range = GetTensorByteRange(beta_tma, "beta_tma");
-    TVM_FFI_ICHECK(beta_range.begin == beta_tma_range.begin &&
-                   beta_range.end == beta_tma_range.end)
+    TVM_FFI_ICHECK(beta_range.begin == beta_tma_range.begin && beta_range.end == beta_tma_range.end)
         << "pair-packed beta_tma must exactly alias beta storage";
   } else {
     CheckNoPartialOverlapOrExactAlias(beta, "beta", beta_tma, "beta_tma");
@@ -654,8 +652,7 @@ inline CUtensorMap EncodeBetaTma(const TensorView& tensor) {
   const int64_t outer1 = tensor.numel() / d1;
   uint64_t global_dim[2] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(outer1)};
   TVM_FFI_ICHECK(global_dim[0] >= kBoxHeads && global_dim[1] >= kBoxTokens)
-      << "beta_tma cannot encode the (" << kBoxHeads << ", " << kBoxTokens
-      << ") TMA box";
+      << "beta_tma cannot encode the (" << kBoxHeads << ", " << kBoxTokens << ") TMA box";
   TVM_FFI_ICHECK(tensor.stride(tensor.ndim() - 1) == 1 && tensor.stride(tensor.ndim() - 2) >= d1)
       << "beta_tma must have unit head stride and non-overlapping token rows";
   TVM_FFI_ICHECK(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % 16 == 0)
@@ -742,8 +739,10 @@ inline TmaPointers EncodeTmaPointers(const TensorView& q, const TensorView& k, c
            "this exact workspace and tensor signature before capture";
 
     const std::array<CUtensorMap, kTensorMapCount> host_maps = {
-        EncodeQkTma<ChunkTokens>(q, "q"),          EncodeQkTma<ChunkTokens>(k, "k"),
-        EncodeValueTma<ValueRows, ChunkTokens>(v), EncodeGateTma<ChunkTokens>(g),
+        EncodeQkTma<ChunkTokens>(q, "q"),
+        EncodeQkTma<ChunkTokens>(k, "k"),
+        EncodeValueTma<ValueRows, ChunkTokens>(v),
+        EncodeGateTma<ChunkTokens>(g),
         EncodeBetaTma<ChunkTokens, PairPackedBeta>(beta_tma),
         EncodeOutputTma<ValueRows, ChunkTokens>(out),
     };
