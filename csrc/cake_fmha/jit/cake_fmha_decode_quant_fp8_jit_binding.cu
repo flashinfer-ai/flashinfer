@@ -532,16 +532,21 @@ void cake_paged_attention_decode(
   CUtensorMap h_q = EncodeTmaQuery(query, query_ptr, needs_query_padding);
   CUtensorMap h_k = EncodeTmaPagedKv(key_cache, "key_cache");
   CUtensorMap h_v = EncodeTmaPagedKv(value_cache, "value_cache");
-  void* p_q = TmaDeviceSlot(h_q, query.device().device_id, stream);
-  void* p_k = TmaDeviceSlot(h_k, query.device().device_id, stream);
-  void* p_v = TmaDeviceSlot(h_v, query.device().device_id, stream);
+  auto const* p_q = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_q, query.device().device_id, stream));
+  auto const* p_k = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_k, query.device().device_id, stream));
+  auto const* p_v = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_v, query.device().device_id, stream));
 #if CAKE_FMHA_NVFP4
   CUtensorMap h_ksf =
       EncodeTmaScale(key_block_scales.value(), "key_block_scales");
   CUtensorMap h_vsf =
       EncodeTmaScale(value_block_scales.value(), "value_block_scales");
-  void* p_ksf = TmaDeviceSlot(h_ksf, query.device().device_id, stream);
-  void* p_vsf = TmaDeviceSlot(h_vsf, query.device().device_id, stream);
+  auto const* p_ksf = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_ksf, query.device().device_id, stream));
+  auto const* p_vsf = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_vsf, query.device().device_id, stream));
 #endif
 
   int64_t page_items = needs_page_padding

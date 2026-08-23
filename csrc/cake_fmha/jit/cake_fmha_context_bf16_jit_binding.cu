@@ -299,9 +299,12 @@ void cake_paged_attention_context(
   CUtensorMap h_q = EncodeTmaQ(query);
   CUtensorMap h_k = EncodeTmaPagedKv(key_cache, "key_cache");
   CUtensorMap h_v = EncodeTmaPagedKv(value_cache, "value_cache");
-  void* p_q = TmaDeviceSlot(h_q, query.device().device_id, stream);
-  void* p_k = TmaDeviceSlot(h_k, query.device().device_id, stream);
-  void* p_v = TmaDeviceSlot(h_v, query.device().device_id, stream);
+  auto const* p_q = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_q, query.device().device_id, stream));
+  auto const* p_k = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_k, query.device().device_id, stream));
+  auto const* p_v = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_v, query.device().device_id, stream));
 
   constexpr int units_per_batch = NUM_Q_HEADS / PACK_G;
   int64_t total_bh_64 = batch_size * units_per_batch;

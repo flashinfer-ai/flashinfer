@@ -261,9 +261,12 @@ void cake_paged_attention_decode(
   CUtensorMap h_q = EncodeTmaQt(query);
   CUtensorMap h_k = EncodeTmaPagedKv(key_cache, "key_cache");
   CUtensorMap h_v = EncodeTmaPagedKv(value_cache, "value_cache");
-  void* p_q = TmaDeviceSlot(h_q, query.device().device_id, stream);
-  void* p_k = TmaDeviceSlot(h_k, query.device().device_id, stream);
-  void* p_v = TmaDeviceSlot(h_v, query.device().device_id, stream);
+  auto const* p_q = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_q, query.device().device_id, stream));
+  auto const* p_k = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_k, query.device().device_id, stream));
+  auto const* p_v = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_v, query.device().device_id, stream));
 
   int64_t even_kv_blocks = (max_kv_len + 127) / 128;
   even_kv_blocks += even_kv_blocks % 2;

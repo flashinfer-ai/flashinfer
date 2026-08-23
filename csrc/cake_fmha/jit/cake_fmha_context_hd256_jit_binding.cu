@@ -377,9 +377,12 @@ void cake_paged_attention_context(
   CUtensorMap h_q = EncodeStagedQ(q_packed, total_q_rows);
   CUtensorMap h_k = EncodeStagedKv(k_packed, total_micro_pages);
   CUtensorMap h_v = EncodeStagedKv(v_packed, total_micro_pages);
-  void* p_q = TmaDeviceSlot(h_q, query.device().device_id, stream);
-  void* p_k = TmaDeviceSlot(h_k, query.device().device_id, stream);
-  void* p_v = TmaDeviceSlot(h_v, query.device().device_id, stream);
+  auto const* p_q = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_q, query.device().device_id, stream));
+  auto const* p_k = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_k, query.device().device_id, stream));
+  auto const* p_v = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_v, query.device().device_id, stream));
   float softmax_scale_log2 =
       static_cast<float>(ScalarScale(bmm1_scale, "bmm1_scale") *
                          1.4426950408889634);

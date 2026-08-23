@@ -347,8 +347,10 @@ void cake_paged_attention_decode(
   cudaStream_t stream = get_stream(query.device());
   CUtensorMap h_k = EncodeTmaPagedKv(key_cache, "key_cache");
   CUtensorMap h_v = EncodeTmaPagedKv(value_cache, "value_cache");
-  void* p_k = TmaDeviceSlot(h_k, query.device().device_id, stream);
-  void* p_v = TmaDeviceSlot(h_v, query.device().device_id, stream);
+  auto const* p_k = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_k, query.device().device_id, stream));
+  auto const* p_v = reinterpret_cast<CakeFmhaTensorMap const*>(
+      TmaDeviceSlot(h_v, query.device().device_id, stream));
 
   int64_t page_items =
       needs_page_padding ? BATCH_SIZE * table_rows * padded_pages : 0;

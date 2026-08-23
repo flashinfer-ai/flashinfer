@@ -695,6 +695,29 @@ def test_cake_fmha_context_adapters_match_public_feature_abi(
 
 
 @pytest.mark.parametrize(
+    ("relative_path", "descriptor_count"),
+    [
+        ("jit/cake_fmha_context_bf16_jit_binding.cu", 3),
+        ("jit/cake_fmha_context_fp8_jit_binding.cu", 5),
+        ("jit/cake_fmha_context_hd256_jit_binding.cu", 3),
+        ("jit/cake_fmha_decode_native_bf16_jit_binding.cu", 3),
+        ("jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu", 3),
+        ("jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu", 3),
+        ("jit/cake_fmha_decode_quant_bf16q_jit_binding.cu", 2),
+        ("jit/cake_fmha_decode_quant_fp8_jit_binding.cu", 5),
+    ],
+)
+def test_cake_fmha_typed_launch_adapters_use_typed_tensor_maps(
+    relative_path,
+    descriptor_count,
+) -> None:
+    adapter = (get_cake_fmha_csrc_dir() / relative_path).read_text(encoding="utf-8")
+    assert adapter.count("reinterpret_cast<CakeFmhaTensorMap const*>") == (
+        descriptor_count
+    )
+
+
+@pytest.mark.parametrize(
     ("kind", "generator", "uri", "body", "binding", "fp8_flag"),
     [
         (
