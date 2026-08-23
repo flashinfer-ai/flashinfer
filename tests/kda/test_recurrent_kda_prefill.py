@@ -1046,6 +1046,7 @@ def test_small_bh_owner_helper_policy_matches_residency_contract(
         (True, 8, 12, True, 1024, "direct_m128"),
         (False, 8, 12, False, 3072, "bt16_prepare_chain_m64"),
         (True, 1, 4, True, 65_536, "bt16_prepare_chain_m64"),
+        (True, 1, 1, True, 512, "direct_m128"),
         (True, 1, 1, True, 65_535, "small_bh_owner_helper_m128"),
         (True, 1, 1, True, 65_536, "bt16_prepare_chain_m64"),
         (True, 1, 64, True, 512, "independent_dvsplit_m64"),

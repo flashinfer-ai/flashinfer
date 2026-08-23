@@ -666,6 +666,7 @@ def _select_flash_kda_bf16_route(
     if (
         fixed_layout
         and num_sequences == 1
+        and num_heads == 64
         and max_sequence_length >= 512
         and 2 * num_heads <= sm_count
     ):
