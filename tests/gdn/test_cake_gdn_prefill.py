@@ -994,11 +994,9 @@ def test_read_seq_lens_uses_adjacent_offsets(dtype: torch.dtype) -> None:
     not _CAKE_SM100_AVAILABLE,
     reason="requires an SM100a or SM103a GPU with a supported Cake nvcc toolchain",
 )
-def test_odd_cp_chunk_uses_generic_kernel_and_matches_cute() -> None:
-    from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
-        cp_delta_rule_dsl_sm100,
-    )
-
+def test_odd_cp_chunk_uses_generic_kernel_and_matches_semantic_oracle(
+    tmp_path: Path,
+) -> None:
     torch.manual_seed(4278)
     total, hq, hv, dim = 384, 2, 8, 128
     q = torch.randn((total, hq, dim), dtype=torch.float16, device="cuda")
@@ -1011,22 +1009,20 @@ def test_odd_cp_chunk_uses_generic_kernel_and_matches_cute() -> None:
     alpha = 1.0 - torch.rand((total, hv), dtype=torch.float32, device="cuda") / total
     beta = torch.rand((total, hv), dtype=torch.float32, device="cuda").sigmoid()
     cu_seqlens = torch.tensor([0, total], dtype=torch.int64, device="cuda")
-    expected_output = torch.full(
-        (total, hv, dim), float("nan"), dtype=q.dtype, device="cuda"
+    reference_initial = torch.zeros(
+        (1, hv, dim, dim), dtype=torch.float32, device="cuda"
     )
-    expected_state = torch.empty((1, hv, dim, dim), dtype=torch.float32, device="cuda")
-    cp_delta_rule_dsl_sm100(
-        expected_output,
-        expected_state,
-        q,
-        k,
-        v,
-        alpha,
-        beta,
-        cu_seqlens,
-        dim**-0.5,
-        max_seqlen=total,
-        cp_chunk_len=192,
+    expected_output, expected_state = _fresh_batched_semantic_oracle(
+        tmp_path=tmp_path,
+        q=q,
+        k=k,
+        v=v,
+        alpha=alpha,
+        beta=beta,
+        cu_seqlens=cu_seqlens,
+        initial_state=reference_initial,
+        state_indices=None,
+        scale=dim**-0.5,
     )
     _assert_oracle_output_written(expected_output)
 
@@ -1614,12 +1610,9 @@ def test_public_dispatcher_uses_only_cake_for_indexed_inplace_gqa(
 )
 def test_public_cake_inference_empty_int64_inner_strided_cache_rebind(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Cover public metadata caching and arbitrary positive state strides."""
-
-    from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
-        cp_delta_rule_dsl_sm100,
-    )
 
     torch.manual_seed(504539)
     seq_lens = (0, 64, 65, 0)
@@ -1652,35 +1645,22 @@ def test_public_cake_inference_empty_int64_inner_strided_cache_rebind(
     reference_cu = torch.tensor([0, 0, 64, 129, 129], dtype=torch.int32, device="cuda")
     reference_indices = torch.tensor(state_slots, dtype=torch.int32, device="cuda")
     reference_initial = state_values.clone()
-    reference_state = torch.full_like(reference_initial, -7.0)
-    expected_output = torch.full(
-        (total, state_heads, 128),
-        float("nan"),
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
+    reference_output_state = torch.full_like(reference_initial, -7.0)
     ones = torch.ones((total, state_heads), dtype=torch.float32, device="cuda")
-    cp_delta_rule_dsl_sm100(
-        expected_output,
-        reference_state,
-        q_values,
-        k_values,
-        v_values,
-        ones,
-        ones,
-        reference_cu,
-        0.125,
+    expected_output, reference_state = _fresh_batched_semantic_oracle(
+        tmp_path=tmp_path,
+        q=q_values,
+        k=k_values,
+        v=v_values,
+        alpha=ones,
+        beta=ones,
+        cu_seqlens=reference_cu,
         initial_state=reference_initial,
         state_indices=reference_indices,
-        max_seqlen=max(seq_lens),
+        scale=0.125,
+        output_state=reference_output_state,
     )
     _assert_oracle_output_written(expected_output)
-    # The pinned CuTe oracle launches no state writer for a zero-token
-    # sequence.  The public varlen contract publishes its unchanged initial
-    # state instead, which the Cake route implements and this test verifies.
-    for seq_len, state_slot in zip(seq_lens, state_slots, strict=True):
-        if seq_len == 0:
-            reference_state[state_slot].copy_(reference_initial[state_slot])
 
     candidates = []
     for _ in range(2):
