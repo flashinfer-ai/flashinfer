@@ -1689,9 +1689,7 @@ def test_packed_metadata_is_self_contained_across_threads(cuda_device):
         try:
             torch.cuda.set_device(device_index)
             offsets, _ = expected
-            cu_seqlens = torch.tensor(
-                offsets, dtype=torch.int64, device=cuda_device
-            )
+            cu_seqlens = torch.tensor(offsets, dtype=torch.int64, device=cuda_device)
             metadata = kda_prefill_api._cached_packed_task_metadata(
                 workspace,
                 cu_seqlens,
