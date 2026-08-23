@@ -1680,8 +1680,6 @@ def testMmBf16Fp4(args):
     backend_runners = {}
 
     def make_runner(b_p, sf_p, alpha_p, backend):
-        out = torch.empty((m, n), device=device, dtype=out_dtype)
-
         def run(a):
             # mm_bf16_fp4: bf16 activation a against the prepared FP4
             # weight; b_p/sf_p are prepare_bf16_fp4_weights outputs.
@@ -1692,7 +1690,6 @@ def testMmBf16Fp4(args):
                 alpha_p,
                 backend=backend,
                 out_dtype=out_dtype,
-                out=out,
                 block_size=16,
                 enable_pdl=args.enable_pdl,
             )
@@ -1743,8 +1740,8 @@ def testMmBf16Fp4(args):
 
     ref = None
     if run_refcheck:
-        weight_fp32 = _dequantize_bf16_fp4_ref(b_fp4, b_sf, None, n, k, 16)
-        ref = ((a.float() @ weight_fp32.T) * alpha.float()).to(out_dtype)
+        weight_fp32 = _dequantize_bf16_fp4_ref(b_fp4, b_sf, alpha, n, k, 16)
+        ref = (a.float() @ weight_fp32.T).to(out_dtype)
 
     res = []
     flops = 2 * m * n * k
