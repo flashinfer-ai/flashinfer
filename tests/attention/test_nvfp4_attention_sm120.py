@@ -55,21 +55,25 @@ def _pad_seq_len_to_128(x):
 def _preprocess_qkv_ref(q, k, v):
     k = k - k.mean(dim=-2, keepdim=True)
     q, k, v = map(_pad_seq_len_to_128, (q, k, v))
-    batch, num_heads, seq_len, head_dim = q.shape
-    q_grouped = q.reshape(batch, num_heads, seq_len // 128, 128, head_dim)
+    batch, num_q_heads, seq_len, head_dim = q.shape
+    num_kv_heads = k.shape[1]
+    group_size = num_q_heads // num_kv_heads
+    q_grouped = q.reshape(batch, num_q_heads, seq_len // 128, 128, head_dim)
     qm = q_grouped.mean(dim=3)
     q = (
         (q_grouped - qm.unsqueeze(3))
-        .reshape(batch, num_heads, seq_len, head_dim)
+        .reshape(batch, num_q_heads, seq_len, head_dim)
         .contiguous()
     )
+    k_for_q = k.repeat_interleave(group_size, dim=1)
     qk_correction = (
-        torch.matmul(qm, k.transpose(-2, -1))
+        torch.matmul(qm, k_for_q.transpose(-2, -1))
         .repeat_interleave(128, dim=2)
         .to(torch.float32)
         .contiguous()
     )
-    return q, k, v, qk_correction
+    v_for_q = v.repeat_interleave(group_size, dim=1)
+    return q, k_for_q, v_for_q, qk_correction
 
 
 def _reference_attention(q, k, v, causal):
@@ -181,6 +185,56 @@ def test_nvfp4_attention_sm120_accuracy(
         cos_threshold,
         mean_abs_err_threshold,
     )
+
+
+@torch.inference_mode()
+def test_nvfp4_attention_sm120_gqa_accuracy():
+    _require_sm120()
+
+    torch.manual_seed(42)
+    batch, num_q_heads, num_kv_heads, seq_len, head_dim = 1, 4, 1, 256, 128
+    q = torch.randn(
+        (batch, num_q_heads, seq_len, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        (batch, num_kv_heads, seq_len, head_dim), device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+
+    q_fp4, k_fp4, v_fp4_t, q_scale, k_scale, v_scale_t, qk_correction = (
+        flashinfer.nvfp4_attention_sm120_quantize_qkv(q, k, v)
+    )
+    assert q_fp4.shape == (batch, num_q_heads, seq_len, head_dim // 2)
+    assert k_fp4.shape == (batch, num_kv_heads, seq_len, head_dim // 2)
+    assert v_fp4_t.shape == (batch, num_kv_heads, head_dim, seq_len // 2)
+    assert q_scale.shape == (batch, num_q_heads, seq_len, head_dim // 16)
+    assert k_scale.shape == (batch, num_kv_heads, seq_len, head_dim // 16)
+    assert v_scale_t.shape == (batch, num_kv_heads, head_dim, seq_len // 16)
+    assert qk_correction.shape == (batch, num_q_heads, seq_len // 128, seq_len)
+
+    out, lse = flashinfer.nvfp4_attention_sm120_fwd(
+        q_fp4,
+        k_fp4,
+        v_fp4_t,
+        q_scale,
+        k_scale,
+        v_scale_t,
+        qk_correction,
+        sm_scale=head_dim**-0.5,
+        causal=False,
+    )
+    torch.cuda.synchronize()
+
+    ref = _reference_attention(q, k, v, causal=False)
+    mean_abs_err = (out.float() - ref.float()).abs().mean().item()
+    cos_sim = F.cosine_similarity(
+        out.float().reshape(1, -1), ref.float().reshape(1, -1)
+    ).item()
+
+    assert out.shape == (batch, num_q_heads, seq_len, head_dim)
+    assert lse.shape == (batch, num_q_heads, seq_len)
+    assert mean_abs_err <= 0.08
+    assert cos_sim >= 0.94
 
 
 @pytest.mark.parametrize("per_block_mean", [True, False])
