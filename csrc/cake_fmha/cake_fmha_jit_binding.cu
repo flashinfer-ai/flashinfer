@@ -341,12 +341,14 @@ void cake_paged_attention_context(
     bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> key_block_scales, Optional<TensorView> value_block_scales,
     Optional<float> skip_softmax_threshold_scale_factor, Optional<bool> uses_shared_paged_kv_idx,
-    bool is_causal, Optional<TensorView> lse, int64_t lse_stride_tokens,
-    int64_t lse_stride_heads) {
+    Optional<bool> use_fp16_softmax, Optional<bool> uses_spcompress, bool is_causal,
+    Optional<TensorView> lse, int64_t lse_stride_tokens, int64_t lse_stride_heads) {
   TVM_FFI_ICHECK(o_sf_vec_size == -1 || o_sf_vec_size == 16)
       << "Cake FMHA NVFP4 output requires o_sf_vec_size=16";
   TVM_FFI_ICHECK_EQ(skip_softmax_threshold_scale_factor.value_or(0.0f), 0.0f)
       << "Cake FMHA does not implement skip-softmax approximation";
+  TVM_FFI_ICHECK(!use_fp16_softmax.value_or(false));
+  TVM_FFI_ICHECK(!uses_spcompress.value_or(false));
   (void)max_q_len;
   (void)max_kv_len;
   (void)cum_seq_lens_kv;

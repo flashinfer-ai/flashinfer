@@ -186,8 +186,9 @@ void cake_paged_attention_context(
     Optional<TensorView> key_block_scales,
     Optional<TensorView> value_block_scales,
     Optional<float> skip_softmax_threshold_scale_factor,
-    Optional<bool> uses_shared_paged_kv_idx, bool is_causal,
-    Optional<TensorView> lse, int64_t lse_stride_tokens,
+    Optional<bool> uses_shared_paged_kv_idx,
+    Optional<bool> use_fp16_softmax, Optional<bool> uses_spcompress,
+    bool is_causal, Optional<TensorView> lse, int64_t lse_stride_tokens,
     int64_t lse_stride_heads) {
 #if CAKE_FMHA_HD256_FP8
   TVM_FFI_ICHECK_EQ(query.dtype(), dl_float8_e4m3fn);
@@ -216,6 +217,8 @@ void cake_paged_attention_context(
   TVM_FFI_ICHECK_EQ(lse_stride_heads, 0);
   TVM_FFI_ICHECK_EQ(
       skip_softmax_threshold_scale_factor.value_or(0.0f), 0.0f);
+  TVM_FFI_ICHECK(!use_fp16_softmax.value_or(false));
+  TVM_FFI_ICHECK(!uses_spcompress.value_or(false));
   TVM_FFI_ICHECK_EQ(window_left, -1);
   TVM_FFI_ICHECK_EQ(o_sf_scale, -1.0);
   TVM_FFI_ICHECK_EQ(o_sf_vec_size, -1);

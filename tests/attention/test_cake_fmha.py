@@ -28,6 +28,7 @@ from flashinfer.jit.cake_fmha import (
     gen_cake_fmha_decode_quant_fp8_module,
     gen_cake_fmha_decode_quant_nvfp4_module,
     get_cake_fmha_compat_uri,
+    get_cake_fmha_csrc_dir,
     get_cake_fmha_context_bf16_uri,
     get_cake_fmha_context_fp16_hd256_uri,
     get_cake_fmha_context_fp8_uri,
@@ -666,6 +667,31 @@ def test_cake_fmha_context_nvfp4_jit_selects_fused_member(
     assert "cake_fmha_launch_context_nvfp4_dequant" not in adapter
     assert adapter.count("reinterpret_cast<CakeFmhaTensorMap const*>") >= 5
     assert "unsigned int grid_x = total_tiles;" in adapter
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "cake_fmha_jit_binding.cu",
+        "jit/cake_fmha_context_bf16_jit_binding.cu",
+        "jit/cake_fmha_context_fp8_jit_binding.cu",
+        "jit/cake_fmha_context_hd256_jit_binding.cu",
+    ],
+)
+def test_cake_fmha_context_adapters_match_public_feature_abi(
+    relative_path,
+) -> None:
+    adapter = (get_cake_fmha_csrc_dir() / relative_path).read_text(encoding="utf-8")
+    signature_start = adapter.index("void cake_paged_attention_context(")
+    signature_end = adapter.index(") {", signature_start)
+    signature = adapter[signature_start:signature_end]
+    shared = signature.index("Optional<bool> uses_shared_paged_kv_idx")
+    fp16 = signature.index("Optional<bool> use_fp16_softmax")
+    spcompress = signature.index("Optional<bool> uses_spcompress")
+    causal = signature.index("bool is_causal")
+    assert shared < fp16 < spcompress < causal
+    assert "TVM_FFI_ICHECK(!use_fp16_softmax.value_or(false));" in adapter
+    assert "TVM_FFI_ICHECK(!uses_spcompress.value_or(false));" in adapter
 
 
 @pytest.mark.parametrize(
