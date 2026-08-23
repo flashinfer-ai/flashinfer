@@ -2254,8 +2254,8 @@ def test_cake_decode_bf16_matches_flashinfer_reference() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
-def test_cake_decode_exact_sink_matches_flashinfer_reference() -> None:
-    """Compile and launch the exact sink override through the public Cake API."""
+def test_cake_decode_exact_sink_matches_independent_reference() -> None:
+    """Compile and validate the exact sink override against PyTorch math."""
 
     device = torch.device("cuda")
     if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
@@ -2370,7 +2370,37 @@ def test_cake_decode_exact_sink_matches_flashinfer_reference() -> None:
     )
     assert reference.data_ptr() == reference_out.data_ptr()
     assert actual.data_ptr() == cake_out.data_ptr()
-    torch.testing.assert_close(actual.float(), reference.float(), rtol=1e-2, atol=1e-2)
+
+    # Both production kernels accumulate this long reduction in BF16-specific
+    # orders, so comparing them directly compounds their independent rounding
+    # errors.  Use the same sink-attention definition as FlashInfer's reference
+    # tests, evaluated in FP32, and judge each implementation against it.
+    key = kv_cache[:, 0].permute(0, 2, 1, 3).reshape(
+        kv_len, num_kv_heads, head_dim
+    )
+    value = kv_cache[:, 1].permute(0, 2, 1, 3).reshape(
+        kv_len, num_kv_heads, head_dim
+    )
+    key = torch.repeat_interleave(
+        key, num_q_heads // num_kv_heads, dim=1
+    ).contiguous()
+    value = torch.repeat_interleave(
+        value, num_q_heads // num_kv_heads, dim=1
+    ).contiguous()
+    logits = torch.einsum("bhd,khd->bhk", query.float(), key.float())
+    logits *= common["bmm1_scale"]
+    sink_logits = sinks.view(1, num_q_heads, 1).expand(batch_size, -1, -1)
+    weights = torch.softmax(torch.cat([logits, sink_logits], dim=-1), dim=-1)
+    independent = torch.einsum(
+        "bhk,khd->bhd", weights[..., :-1], value.float()
+    ).to(query)
+
+    torch.testing.assert_close(
+        actual.float(), independent.float(), rtol=1e-2, atol=1e-2
+    )
+    torch.testing.assert_close(
+        reference.float(), independent.float(), rtol=1e-2, atol=1e-2
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
