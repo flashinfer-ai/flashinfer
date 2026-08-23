@@ -58,7 +58,7 @@ def msa_sparse_attention(
     lse_temperature_scale: float = 1.0,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
 ):
-    """Minimax Sparse Attention forward (prefill) for CC10 and SM12x GPUs.
+    """Minimax Sparse Attention forward for SM100/SM103 and SM120/SM121 GPUs.
 
     Each query attends only the top-K KV blocks selected in ``q2k_indices``.
     Query tokens are processed in tiles: each tile runs one online softmax over
@@ -118,16 +118,18 @@ def msa_sparse_attention(
         :func:`flashinfer.nvfp4_quantize` with ``sf_vec_size=16`` and the
         swizzled 128x4 layout (one scale per 16 elements, with rows padded to a
         multiple of 128). Scale rows follow ``(token, head)`` order for flat K
-        and ``(page, head, token)`` order for paged K. SM120/SM121-only.
+        and ``(page, head, token)`` order for paged K. Packed NVFP4, and thus
+        this argument, is supported only on SM120/SM121.
     v_scale : Optional[torch.Tensor], default=None
         NVFP4 block scales for V, with the same dtype, layout, and row-order
         contract as ``k_scale``.
     k_global_scale : Optional[float], default=None
         Global dequant scale for K; folds into the softmax scale (NVFP4 K
-        only). SM120/SM121-only.
+        only). SM100/SM103 prefill does not support global K/V scales.
     v_global_scale : Optional[float], default=None
-        Global dequant scale applied to the output, for any KV dtype (e.g. an
-        fp8 per-tensor V descale). SM120/SM121-only.
+        Global dequant scale applied to the output on SM120/SM121, for any KV
+        dtype (e.g. an fp8 per-tensor V descale). SM100/SM103 prefill does not
+        support global K/V scales.
     q_offset : optional
         Optional per-query offset tensor used by specific MSA workflows.
     return_temperature_lse : bool, default=False

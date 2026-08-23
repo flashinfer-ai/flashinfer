@@ -1,7 +1,7 @@
 """Minimax Sparse Attention operations.
 
-Sparse prefill, sparse decode, and top-k selection support CC10 and SM12x
-Blackwell GPUs. Proxy scoring remains SM120/SM121-only.
+Sparse prefill, sparse decode, and top-k selection support SM100, SM103, SM120,
+and SM121 Blackwell GPUs. Proxy scoring remains SM120/SM121-only.
 """
 
 import torch

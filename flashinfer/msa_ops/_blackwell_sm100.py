@@ -55,7 +55,7 @@ _SPLIT_ADAPTIVE = 0
 
 
 class MSASparseAttentionWorkspace:
-    """Caller-owned storage for CC10 MSA CUDA graph capture.
+    """Caller-owned storage for SM100/SM103 MSA CUDA graph capture.
 
     Construct one workspace per captured sparse-attention invocation. Warm it
     by calling the operation eagerly with the exact tensors, options, and CUDA
@@ -95,7 +95,7 @@ _implicit_reverse_prefill_states_lock = threading.Lock()
 
 
 def is_blackwell_msa_device(device: torch.device | str) -> bool:
-    """Return whether ``device`` is a supported CC10 MSA target."""
+    """Return whether ``device`` is a supported SM100/SM103 MSA target."""
 
     normalized_device = torch.device(device)
     return (
@@ -114,7 +114,7 @@ def _select_target(device: torch.device) -> "BlackwellMSATarget":
     compute_capability = get_compute_capability(device)
     if compute_capability not in _SUPPORTED_COMPUTE_CAPABILITIES:
         raise RuntimeError(
-            "the CC10 MSA backend requires compute capability 10.0 or 10.3; "
+            "the SM100/SM103 MSA backend requires compute capability 10.0 or 10.3; "
             f"got {compute_capability[0]}.{compute_capability[1]}"
         )
     if compute_capability == (10, 3):

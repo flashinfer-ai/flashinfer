@@ -195,7 +195,7 @@ def msa_sparse_decode_attention(
     force_fused: Optional[bool] = None,
     workspace: Optional[MSASparseAttentionWorkspace] = None,
 ):
-    """Sparse decode attention for CC10 and SM12x GPUs.
+    """Sparse decode attention for SM100/SM103 and SM120/SM121 GPUs.
 
     Computes attention for a decode step: each request contributes
     ``seqlen_q`` query tokens (uniform across the batch) attending only the
@@ -243,9 +243,10 @@ def msa_sparse_decode_attention(
         cache layout: ``(token, head)`` order for flat K/V, ``(page, head,
         token)`` for paged. SM120/SM121-only.
     k_global_scale, v_global_scale : float, optional
-        Global dequant scales. ``k_global_scale`` folds into the softmax
-        scale (NVFP4 K only); ``v_global_scale`` scales the output for any
-        KV dtype (e.g. an fp8 per-tensor V descale). SM120/SM121-only.
+        Global dequant scales. On SM120/SM121, ``k_global_scale`` folds into
+        the softmax scale for NVFP4 K and ``v_global_scale`` scales the output
+        for any KV dtype. On SM100/SM103, both are supported only for uniform
+        FP8 Q/K/V decode.
     q_offset : int or torch.Tensor, optional
         Optional query-position offset used by causal alignment.
     partial_dtype : torch.dtype, optional
