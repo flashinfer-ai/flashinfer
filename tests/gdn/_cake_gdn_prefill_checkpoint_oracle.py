@@ -115,6 +115,9 @@ def main(input_path: Path, output_path: Path) -> None:
         )
         checkpoints = []
         token_start = 0
+        recurrent_q = q.float().repeat_interleave(
+            state_heads // q.shape[1], dim=1
+        )
         recurrent_k = k.float().repeat_interleave(state_heads // k.shape[1], dim=1)
         recurrent_v = v.float().repeat_interleave(state_heads // v.shape[1], dim=1)
         for seq_index, seq_len in enumerate(seq_lens):
@@ -133,6 +136,9 @@ def main(input_path: Path, output_path: Path) -> None:
                     -1
                 ) * old_value.unsqueeze(-2)
                 state += recurrent_k[token].unsqueeze(-1) * new_value.unsqueeze(-2)
+                expected_output[token] = scale * torch.einsum(
+                    "hd,hdv->hv", recurrent_q[token], state
+                )
                 if (local_index + 1) % interval == 0:
                     checkpoints.append(state.transpose(-1, -2).clone())
             expected_state[seq_index] = state.transpose(-1, -2)
