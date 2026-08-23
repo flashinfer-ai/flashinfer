@@ -481,6 +481,22 @@ def test_bf16_topk8_route_and_stage_grid_keep_exact_boundaries():
     )
     assert "uint64_t{kCombineThreads * 16}" in launcher_source
     assert "std::min(128, ceilDiv(payload_bytes," in launcher_source
+    assert (
+        "unsigned long long, bool, int, bool);" in launcher_source
+    )
+    assert (
+        "payload_bytes,\n      true, params.ep_rank, params.enable_pdl);"
+        in launcher_source
+    )
+    assert (
+        "unsigned long long, unsigned long long, unsigned long long, bool, int, int, bool,\n"
+        "    bool, unsigned long long);"
+        in launcher_source
+    )
+    assert (
+        "completion_offset, false, params.ep_rank, params.ep_size, params.enable_pdl,"
+        in launcher_source
+    )
 
 
 def test_workspace_initialization_rendezvous_is_ordered_and_cached(monkeypatch):

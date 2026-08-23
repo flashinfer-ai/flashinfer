@@ -37,11 +37,11 @@ extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_dispatch(
 
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_stage_combine(
     uint8_t*, uint8_t*, unsigned long long, unsigned long long, unsigned long long,
-    unsigned long long, int, bool);
+    unsigned long long, bool, int, bool);
 
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_publish_combine(
-    uint8_t*, unsigned long long, unsigned long long, unsigned long long, int, int, bool, bool,
-    unsigned long long);
+    uint8_t*, unsigned long long, unsigned long long, unsigned long long, bool, int, int, bool,
+    bool, unsigned long long);
 
 #define DECLARE_COMBINE_TOP_K(TOP_K)                                                     \
   extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_##TOP_K( \
@@ -273,7 +273,7 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
       static_cast<uint8_t*>(const_cast<void*>(params.prepare_payload)), params.workspace,
       params.workspace_stride_bytes, byteOffset(params.flag_val, rank_workspace),
       byteOffset(params.recv_buffers[params.ep_rank], params.workspace), payload_bytes,
-      params.ep_rank, params.enable_pdl);
+      true, params.ep_rank, params.enable_pdl);
 }
 
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
@@ -293,7 +293,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
       "mnnvl_moe_alltoall_publish_combine", params.enable_pdl,
       kernel_flashinfer_mnnvl_moe_alltoall_publish_combine, 1, kPublicationThreads, 0,
       params.stream, params.workspace, params.workspace_stride_bytes, flag_offset,
-      completion_offset, params.ep_rank, params.ep_size, params.enable_pdl,
+      completion_offset, false, params.ep_rank, params.ep_size, params.enable_pdl,
       params.enable_rank_mask, params.active_rank_mask[0]);
 
   bool const quantized = params.quant_mode != MoeA2ACombineQuantMode::NONE;
