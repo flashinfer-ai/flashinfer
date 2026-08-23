@@ -29,7 +29,7 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_state_scatter_bf16_v1_1f23912ab7);
+TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_state_scatter_bf16_v1_08e7f75aa1);
 
 namespace cake_host_shim {
 
@@ -286,7 +286,7 @@ void Run(TensorView arg_packed, TensorView arg_state_indices, TensorView arg_out
   int32_t v_use_indices = (int32_t)arg_use_indices;
   void* kargs[] = {&p_packed, &p_state_indices, &p_output, &v_pool_stride0, &v_pool_stride1, &v_pool_stride2, &v_pool_stride3, &v_num_heads, &v_total_values, &v_use_indices};
 
-  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(flashinfer_blackwell_gdn_cp_prefill_state_scatter_bf16_v1_1f23912ab7, "kernel_flashinfer_blackwell_gdn_cp_prefill_state_scatter_bf16_v1");
+  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(flashinfer_blackwell_gdn_cp_prefill_state_scatter_bf16_v1_08e7f75aa1, "kernel_flashinfer_blackwell_gdn_cp_prefill_state_scatter_bf16_v1");
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(256u, 1u, 1u);
 

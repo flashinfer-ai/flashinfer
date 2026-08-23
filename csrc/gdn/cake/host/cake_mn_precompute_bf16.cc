@@ -29,7 +29,7 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_mn_precompute_bf16_v1_a46ccc346c);
+TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_mn_precompute_bf16_v1_457cbd51c4);
 
 namespace cake_host_shim {
 
@@ -435,7 +435,7 @@ void Run(TensorView arg_K, TensorView arg_V, TensorView arg_T, TensorView arg_al
   int32_t v_num_seqs = (int32_t)arg_num_seqs;
   void* kargs[] = {&p_K, &p_V, &p_T, &p_alpha, &p_local_transfer, &p_local_state, &p_cu_seqlens, &v_chunk_len, &v_num_k_heads, &v_num_v_heads, &v_num_sab_heads, &v_total_cp_chunks, &v_num_seqs};
 
-  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_bf16_v1_a46ccc346c::Global()->mod.GetKernel("kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_bf16_v1");
+  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_bf16_v1_457cbd51c4::Global()->mod.GetKernel("kernel_flashinfer_blackwell_gdn_cp_prefill_mn_precompute_bf16_v1");
   static signed char cake_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = CakeConfigureDynamicSmem(
       kernel, (int)arg_K.device().device_id, 159744,
