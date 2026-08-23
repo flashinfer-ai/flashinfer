@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -64,9 +66,106 @@ def _assert_oracle_output_written(output: torch.Tensor) -> None:
     if bool(nonfinite.any().item()):
         first = torch.nonzero(nonfinite, as_tuple=False)[0].tolist()
         pytest.fail(
-            "pinned CP oracle left poisoned output storage unwritten: "
+            "reference oracle left poisoned output storage unwritten: "
             f"count={int(nonfinite.sum().item())}, first_index={first}"
         )
+
+
+def _run_fresh_gdn_oracle(
+    *,
+    tmp_path: Path,
+    stem: str,
+    payload: dict[str, object],
+    device: torch.device,
+) -> dict[str, torch.Tensor]:
+    input_path = tmp_path / f"{stem}-input.pt"
+    output_path = tmp_path / f"{stem}-output.pt"
+    torch.save(payload, input_path)
+    worker = Path(__file__).with_name("_cake_gdn_prefill_checkpoint_oracle.py")
+    completed = subprocess.run(
+        [sys.executable, str(worker), str(input_path), str(output_path)],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.fail(
+            f"fresh {stem} oracle failed:\n"
+            f"stdout:\n{completed.stdout}\n"
+            f"stderr:\n{completed.stderr}"
+        )
+    values = torch.load(output_path, map_location="cpu", weights_only=True)
+    return {name: tensor.to(device=device) for name, tensor in values.items()}
+
+
+def _fresh_checkpoint_oracle(
+    *,
+    tmp_path: Path,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    seq_lens: tuple[int, ...],
+    interval: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    values = _run_fresh_gdn_oracle(
+        tmp_path=tmp_path,
+        stem="checkpoint",
+        payload={
+            "mode": "checkpoint_per_sequence",
+            "q": q.cpu(),
+            "k": k.cpu(),
+            "v": v.cpu(),
+            "alpha": alpha.cpu(),
+            "beta": beta.cpu(),
+            "seq_lens": seq_lens,
+            "interval": interval,
+        },
+        device=q.device,
+    )
+    return tuple(values[name] for name in ("output", "final_state", "checkpoints"))
+
+
+def _fresh_batched_semantic_oracle(
+    *,
+    tmp_path: Path,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    alpha: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    initial_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    seq_lens = tuple(
+        int(value)
+        for value in (cu_seqlens[1:] - cu_seqlens[:-1]).detach().cpu().tolist()
+    )
+    values = _run_fresh_gdn_oracle(
+        tmp_path=tmp_path,
+        stem="batched-semantic",
+        payload={
+            "mode": "batched",
+            "q": q.cpu(),
+            "k": k.cpu(),
+            "v": v.cpu(),
+            "alpha": alpha.cpu(),
+            "beta": beta.cpu(),
+            "seq_lens": seq_lens,
+            "interval": 0,
+            "scale": scale,
+            "cu_seqlens": cu_seqlens.cpu(),
+            "initial_state": initial_state.cpu(),
+            "state_indices": state_indices.cpu(),
+        },
+        device=q.device,
+    )
+    return values["output"], values["final_state"]
 
 
 def test_generated_source_inventory_and_hashes() -> None:
@@ -1020,11 +1119,8 @@ def test_frozen_graph_matches_pr4078_and_preserves_inputs(
 )
 def test_public_checkpoint_matches_cute_on_caller_stream_and_cuda_graph(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
-    from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
-        cp_delta_rule_dsl_sm100,
-    )
-
     torch.manual_seed(4436)
     seq_lens = (128, 256)
     interval = 128
@@ -1052,50 +1148,21 @@ def test_public_checkpoint_matches_cute_on_caller_stream_and_cuda_graph(
         (3, state_heads, 128, 128), dtype=torch.float32, device="cuda"
     )
 
-    expected_output = torch.full_like(output, float("nan"))
-    expected_state = torch.empty_like(output_state)
-    # Match the public forced-CP dispatcher, which passes total_seq_len as
-    # max_seqlen. Checkpointing refines state publication only; it does not
-    # change the source-visible output chunking.
-    cp_delta_rule_dsl_sm100(
-        expected_output,
-        expected_state,
-        q,
-        k,
-        v,
-        alpha,
-        beta,
-        cu_seqlens,
-        1.0 / 128**0.5,
-        max_seqlen=total,
+    # The pinned source extension is process-global and can change behavior
+    # after unrelated Loom/Cake compilations in the same pytest session. Keep
+    # the numeric oracle in a fresh process; candidate execution stays here.
+    expected_output, expected_state, expected_checkpoints_tensor = (
+        _fresh_checkpoint_oracle(
+            tmp_path=tmp_path,
+            q=q,
+            k=k,
+            v=v,
+            alpha=alpha,
+            beta=beta,
+            seq_lens=seq_lens,
+            interval=interval,
+        )
     )
-    _assert_oracle_output_written(expected_output)
-    expected_checkpoints = []
-    token_start = 0
-    for seq_len in seq_lens:
-        for prefix_len in range(interval, seq_len + 1, interval):
-            prefix_output = torch.empty(
-                (prefix_len, state_heads, 128), dtype=q.dtype, device="cuda"
-            )
-            prefix_state = torch.empty(
-                (1, state_heads, 128, 128), dtype=torch.float32, device="cuda"
-            )
-            prefix_cu = torch.tensor([0, prefix_len], dtype=torch.int64, device="cuda")
-            cp_delta_rule_dsl_sm100(
-                prefix_output,
-                prefix_state,
-                q[token_start : token_start + prefix_len].contiguous(),
-                k[token_start : token_start + prefix_len].contiguous(),
-                v[token_start : token_start + prefix_len].contiguous(),
-                alpha[token_start : token_start + prefix_len].contiguous(),
-                beta[token_start : token_start + prefix_len].contiguous(),
-                prefix_cu,
-                1.0 / 128**0.5,
-                max_seqlen=prefix_len,
-            )
-            expected_checkpoints.append(prefix_state[0].clone())
-        token_start += seq_len
-    expected_checkpoints_tensor = torch.stack(expected_checkpoints)
 
     def forbidden_external(*_args, **_kwargs):
         raise AssertionError("checkpoint route left the Cake backend")
@@ -1413,12 +1480,9 @@ def test_generic_backend_matches_pr4078_state_and_lifecycle(
 )
 def test_public_dispatcher_uses_only_cake_for_indexed_inplace_gqa(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Exercise the Cake public use_cp=True route with no external arm."""
-
-    from flashinfer.gdn_kernels.blackwell.gdn_cp_prefill import (
-        cp_delta_rule_dsl_sm100,
-    )
 
     torch.manual_seed(504078)
     seq_lens = (64, 129)
@@ -1448,26 +1512,18 @@ def test_public_dispatcher_uses_only_cake_for_indexed_inplace_gqa(
         padding=96,
     )
     reference_state.copy_(candidate_state)
-    expected_output = torch.full(
-        (total, state_heads, 128),
-        float("nan"),
-        dtype=torch.bfloat16,
-        device="cuda",
-    )
     ones = torch.ones((total, state_heads), dtype=torch.float32, device="cuda")
-    cp_delta_rule_dsl_sm100(
-        expected_output,
-        reference_state,
-        q,
-        k,
-        v,
-        ones,
-        ones,
-        cu_seqlens,
-        0.125,
+    expected_output, reference_state = _fresh_batched_semantic_oracle(
+        tmp_path=tmp_path,
+        q=q,
+        k=k,
+        v=v,
+        alpha=ones,
+        beta=ones,
+        cu_seqlens=cu_seqlens,
         initial_state=reference_state,
         state_indices=state_indices,
-        max_seqlen=total,
+        scale=0.125,
     )
     _assert_oracle_output_written(expected_output)
 
