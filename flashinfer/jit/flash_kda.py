@@ -30,6 +30,8 @@ from .core import (
 FlashKDAVariant = Literal[
     "m64",
     "m128",
+    "m128_h12_short",
+    "m128_h12_long",
     "m128_n16",
     "m128_n16_checkpoint",
     "persistent_m128",
@@ -45,6 +47,8 @@ FlashKDATarget = Literal["sm100a", "sm100f"]
 FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "m64",
     "m128",
+    "m128_h12_short",
+    "m128_h12_long",
     "m128_n16",
     "m128_n16_checkpoint",
     "persistent_m128",
@@ -71,6 +75,8 @@ _FLASH_KDA_TARGET_DEFINE = {
 _FLASH_KDA_MODULE_IDENTS = {
     "m64": "9a5566f3be",
     "m128": "ae83f7331a",
+    "m128_h12_short": "fe0a070282",
+    "m128_h12_long": "9e4219f788",
     "m128_n16": "bfc7b64cd3",
     # Generated body, binding, and shared binding header, separated by NUL
     # bytes without a trailing separator. Keep this route's cache key tied to
@@ -88,6 +94,8 @@ _FLASH_KDA_MODULE_IDENTS = {
 _FLASH_KDA_BINDING_STEMS = {
     "m64": "flashkda_bf16_fused_m64",
     "m128": "flashkda_bf16_fused_m128",
+    "m128_h12_short": "flashkda_bf16_fused_m128_h12",
+    "m128_h12_long": "flashkda_bf16_fused_m128_h12",
     "m128_n16": "cake_flashkda_bf16_fused_m128_n16",
     "m128_n16_checkpoint": "flashkda_bf16_fused_m128_n16_checkpoint",
     "persistent_m128": "cake_flashkda_bf16_persistent_m128",
@@ -97,6 +105,11 @@ _FLASH_KDA_BINDING_STEMS = {
     "bt16_chain_m64_s7": "cake_flashkda_bf16_bt16_chain_m64_s7",
     "bt16_chain_m64_s8": "cake_flashkda_bf16_bt16_chain_m64",
     "bt16_chain_m64_s9": "cake_flashkda_bf16_bt16_chain_m64_s9",
+}
+
+_FLASH_KDA_VARIANT_DEFINES = {
+    "m128_h12_short": "-DFLASHINFER_FLASH_KDA_H12_SHORT=1",
+    "m128_h12_long": "-DFLASHINFER_FLASH_KDA_H12_LONG=1",
 }
 
 
@@ -168,6 +181,11 @@ def gen_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget) -> Ji
         extra_cuda_cflags=[
             *_FLASH_KDA_NVCC_FLAGS[target],
             _FLASH_KDA_TARGET_DEFINE[target],
+            *(
+                [_FLASH_KDA_VARIANT_DEFINES[variant]]
+                if variant in _FLASH_KDA_VARIANT_DEFINES
+                else []
+            ),
         ],
         extra_include_paths=[
             csrc_dir,
@@ -189,6 +207,18 @@ def gen_flash_kda_m128_module(target: FlashKDATarget) -> JitSpec:
     """Generate the general packed/fixed M128 module."""
 
     return gen_flash_kda_module("m128", target)
+
+
+def gen_flash_kda_m128_h12_short_module(target: FlashKDATarget) -> JitSpec:
+    """Generate the short-sequence H12 N32 M128 module."""
+
+    return gen_flash_kda_module("m128_h12_short", target)
+
+
+def gen_flash_kda_m128_h12_long_module(target: FlashKDATarget) -> JitSpec:
+    """Generate the pair-packed-beta H12 N32 M128 module."""
+
+    return gen_flash_kda_module("m128_h12_long", target)
 
 
 def gen_flash_kda_m128_n16_module(target: FlashKDATarget) -> JitSpec:
@@ -266,6 +296,18 @@ def load_flash_kda_m128_module(target: FlashKDATarget):
     return load_flash_kda_module("m128", target)
 
 
+def load_flash_kda_m128_h12_short_module(target: FlashKDATarget):
+    """Load the short-sequence H12 N32 M128 module."""
+
+    return load_flash_kda_module("m128_h12_short", target)
+
+
+def load_flash_kda_m128_h12_long_module(target: FlashKDATarget):
+    """Load the pair-packed-beta H12 N32 M128 module."""
+
+    return load_flash_kda_module("m128_h12_long", target)
+
+
 def load_flash_kda_m128_n16_module(target: FlashKDATarget):
     """Load the H12 packed/fixed M128 module with a 16-token chunk."""
 
@@ -321,6 +363,8 @@ __all__ = [
     "gen_flash_kda_bt16_prepare_module",
     "gen_flash_kda_m64_module",
     "gen_flash_kda_m128_module",
+    "gen_flash_kda_m128_h12_short_module",
+    "gen_flash_kda_m128_h12_long_module",
     "gen_flash_kda_m128_n16_module",
     "gen_flash_kda_m128_n16_checkpoint_module",
     "gen_flash_kda_persistent_m128_module",
@@ -330,6 +374,8 @@ __all__ = [
     "get_flash_kda_uri",
     "load_flash_kda_m64_module",
     "load_flash_kda_m128_module",
+    "load_flash_kda_m128_h12_short_module",
+    "load_flash_kda_m128_h12_long_module",
     "load_flash_kda_m128_n16_module",
     "load_flash_kda_persistent_m128_module",
     "load_flash_kda_small_bh_m128_module",

@@ -73,6 +73,7 @@ _FLASH_KDA_BT16_LONG_MIN_SEQUENCE_LENGTH = 65_536
 _FLASH_KDA_BT16_MID_MAX_TASKS = 32
 _FLASH_KDA_H12_DIRECT_N32_MIN_SEQUENCE_LENGTH = 64
 _FLASH_KDA_H12_DIRECT_N32_MAX_SEQUENCE_LENGTH = 256
+_FLASH_KDA_H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQUENCE_LENGTH = 128
 _FLASH_KDA_ROUTE_DIRECT_M128 = "direct_m128"
 _FLASH_KDA_ROUTE_DIRECT_M128_N16 = "direct_m128_n16"
 _FLASH_KDA_ROUTE_PERSISTENT_M128 = "persistent_m128"
@@ -131,6 +132,8 @@ class _RecurrentKDAPrefillWorkspaceBase:
             for variant in (
                 "m64",
                 "m128",
+                "m128_h12_short",
+                "m128_h12_long",
                 "m128_n16",
                 "m128_n16_checkpoint",
                 "persistent_m128",
@@ -1148,6 +1151,32 @@ def _beta_tma_source(
     return padded
 
 
+def _pair_packed_beta_tma_source(beta: torch.Tensor) -> Optional[torch.Tensor]:
+    """Alias dense H12 beta rows as a TensorMap-legal two-token carrier."""
+
+    batch_size, seq_len, num_heads = beta.shape
+    total_tokens = batch_size * seq_len
+    if beta.stride(-1) != 1:
+        raise ValueError("beta must have unit head stride")
+    if batch_size == 1:
+        beta_flat = beta[0]
+    else:
+        if beta.stride(0) != seq_len * beta.stride(1):
+            raise ValueError("beta batch/token dimensions must collapse without a copy")
+        beta_flat = beta.as_strided(
+            (total_tokens, num_heads),
+            (beta.stride(1), beta.stride(2)),
+        )
+    if (
+        num_heads != 12
+        or total_tokens % 2 != 0
+        or not beta_flat.is_contiguous()
+        or beta_flat.data_ptr() % 16 != 0
+    ):
+        return None
+    return beta_flat.view(total_tokens // 2, 24)
+
+
 def _small_bh_workspace(
     *,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
@@ -1865,6 +1894,8 @@ def _run_flash_kda_prefill(
         "bt16",
         "m64",
         "m128",
+        "m128_h12_short",
+        "m128_h12_long",
         "m128_n16",
         "persistent_m128",
         "small_bh_m128",
@@ -1879,6 +1910,13 @@ def _run_flash_kda_prefill(
         variant = "persistent_m128"
     elif route == _FLASH_KDA_ROUTE_DIRECT_M128_N16:
         variant = "m128_n16"
+    elif num_heads == 12:
+        variant = (
+            "m128_h12_short"
+            if max_sequence_length
+            <= _FLASH_KDA_H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQUENCE_LENGTH
+            else "m128_h12_long"
+        )
     else:
         variant = "m128"
     persistent_task_ids = None
@@ -1998,7 +2036,17 @@ def _run_flash_kda_prefill(
             capturing=capturing,
             explicit=explicit_workspace,
         )
-        beta_tma = _beta_tma_source(beta, workspace)
+        if variant == "m128_h12_long":
+            pair_packed_beta_tma = _pair_packed_beta_tma_source(beta)
+            if pair_packed_beta_tma is None:
+                # Preserve the general public route for accepted layouts that
+                # cannot expose the source runtime's zero-copy H12 carrier.
+                variant = "m128"
+                beta_tma = _beta_tma_source(beta, workspace)
+            else:
+                beta_tma = pair_packed_beta_tma
+        else:
+            beta_tma = _beta_tma_source(beta, workspace)
         packet_workspace = None
         packet_ready = None
         packet_consumed = None

@@ -1432,6 +1432,198 @@ def test_frozen_route_and_ffi_abi(
         assert args[5].data_ptr() != inputs["beta"].data_ptr()
 
 
+@pytest.mark.parametrize(
+    ("seq_lens", "expected_variant", "expected_beta_tma_shape", "expect_alias"),
+    [
+        ([128] * 8, "m128_h12_short", (1024, 16), False),
+        ([1024] * 8, "m128_h12_long", (4096, 24), True),
+        ([513] * 7, "m128", (3591, 16), False),
+    ],
+)
+def test_h12_n32_specializations_reach_ffi(
+    cuda_device,
+    monkeypatch,
+    seq_lens,
+    expected_variant,
+    expected_beta_tma_shape,
+    expect_alias,
+):
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 3)
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_is_cuda_version_at_least", lambda version: True
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_flash_kda_device_sm_count", lambda device: 152
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(seq_lens=seq_lens, num_heads=12, packed=True)
+    recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        backend="cake",
+    )
+
+    assert routes == [(expected_variant, "sm100f")]
+    (args,) = module.calls
+    assert len(args) == 28
+    assert tuple(args[5].shape) == expected_beta_tma_shape
+    assert (args[5].data_ptr() == inputs["beta"].data_ptr()) is expect_alias
+
+
+def test_pair_packed_h12_beta_requires_an_even_dense_carrier(cuda_device):
+    dense = torch.empty((1, 128, 12), dtype=torch.bfloat16, device=cuda_device)
+    paired = kda_prefill_api._pair_packed_beta_tma_source(dense)
+    assert paired is not None
+    assert paired.shape == (64, 24)
+    assert paired.data_ptr() == dense.data_ptr()
+    odd = torch.empty((1, 129, 12), dtype=torch.bfloat16, device=cuda_device)
+    assert kda_prefill_api._pair_packed_beta_tma_source(odd) is None
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "expected_variant"),
+    [
+        ([128] * 2, "m128_h12_short"),
+        ([160] * 2, "m128_h12_long"),
+    ],
+)
+def test_frozen_h12_n32_specializations_match_reference(
+    flash_kda_device,
+    monkeypatch,
+    seq_lens,
+    expected_variant,
+):
+    inputs = _make_inputs(
+        seq_lens=seq_lens,
+        num_heads=12,
+        packed=True,
+        initial_state=True,
+        seed=sum(seq_lens),
+    )
+    expected_output, expected_state = _chunk16_debug_reference(inputs)
+    routes = []
+    get_module = kda_prefill_api._get_flash_kda_prefill_module
+
+    def recording_get_module(variant, target):
+        routes.append((variant, target))
+        return get_module(variant, target)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        recording_get_module,
+    )
+    actual_output, actual_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    expected_target = kda_prefill_api._select_flash_kda_prefill_target(
+        flash_kda_device
+    )
+    assert routes == [(expected_variant, expected_target)]
+    assert actual_state is inputs["initial_state"]
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_frozen_h12_long_cuda_graph_replay_matches_reference(flash_kda_device):
+    inputs = _make_inputs(
+        seq_lens=[160] * 2,
+        num_heads=12,
+        packed=True,
+        initial_state=False,
+        seed=321,
+    )
+    expected_output, expected_state = _chunk16_debug_reference(inputs)
+    output = torch.empty_like(inputs["q"])
+    workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+    call_kwargs = {
+        **_strict_prefill_kwargs(inputs),
+        "output": output,
+        "output_final_state": True,
+        "prefill_workspace": workspace,
+        "backend": "cake",
+    }
+
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(**call_kwargs)
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = recurrent_kda(**call_kwargs)
+
+    with torch.cuda.stream(capture_stream):
+        output.fill_(float("nan"))
+        captured_state.fill_(float("nan"))
+    capture_stream.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert workspace._captured
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert captured_state.data_ptr() == workspace._state_scratch.data_ptr()
+    torch.testing.assert_close(
+        captured_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        captured_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_frozen_h12_long_ffi_rejects_disjoint_pair_carrier(
+    flash_kda_device,
+    monkeypatch,
+):
+    inputs = _make_inputs(
+        seq_lens=[160] * 2,
+        num_heads=12,
+        packed=True,
+        initial_state=True,
+        seed=322,
+    )
+    recorder = _RecorderModule()
+    get_module = kda_prefill_api._get_flash_kda_prefill_module
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        lambda variant, target: recorder,
+    )
+    recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        backend="cake",
+    )
+    (args,) = recorder.calls
+    assert args[5].data_ptr() == inputs["beta"].data_ptr()
+
+    target = kda_prefill_api._select_flash_kda_prefill_target(flash_kda_device)
+    module = get_module("m128_h12_long", target)
+    disjoint_args = list(args)
+    disjoint_args[5] = args[5].clone()
+    with pytest.raises(Exception, match="must exactly alias beta storage"):
+        module.run(*disjoint_args)
+
+
 @pytest.mark.parametrize("sm_count", [148, 152])
 def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
     cuda_device,
