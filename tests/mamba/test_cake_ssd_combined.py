@@ -1925,27 +1925,27 @@ def test_source_generated_catalog_is_terminal_and_active():
                 assert hashlib.sha256(path.read_bytes()).hexdigest() == source["sha256"]
 
     expected_inventory_paths = (
-        "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
-        "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296.cu",
-        "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cu",
-        "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_e3f87857c3.cu",
-        "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487.cu",
-        "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85.cu",
-        "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379.cu",
-        "device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cu",
-        "device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cu",
-        "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_a104f24f9d.cu",
-        "device/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cu",
-        "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_0378cc5296.cu",
-        "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cu",
-        "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_e3f87857c3.cu",
-        "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487.cu",
-        "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85.cu",
-        "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379.cu",
-        "device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cu",
-        "device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cu",
-        "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_a104f24f9d.cu",
-        "host/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cpp",
+        "device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
+        "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_8a70d5dbfd.cu",
+        "device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_97897acf8e.cu",
+        "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_4aab9ae5f2.cu",
+        "device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8e8154a2dc.cu",
+        "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_87ce0c5b25.cu",
+        "device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_be73227bd7.cu",
+        "device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_801e676ea3.cu",
+        "device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_eff923f403.cu",
+        "device/sm_100a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
+        "device/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
+        "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_bf16_varlen_8a70d5dbfd.cu",
+        "device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_97897acf8e.cu",
+        "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_bf16_varlen_r10_v1_4aab9ae5f2.cu",
+        "device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8e8154a2dc.cu",
+        "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_batched_87ce0c5b25.cu",
+        "device/sm_103a/mamba_ssd_q_tmem_alias_bf16_varlen_be73227bd7.cu",
+        "device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_801e676ea3.cu",
+        "device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_eff923f403.cu",
+        "device/sm_103a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
+        "host/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cpp",
         "host/sm_100a/mamba_ssd_combined_exact_bf16_batched.cpp",
         "host/sm_100a/mamba_ssd_combined_exact_bf16_varlen.cpp",
         "host/sm_100a/mamba_ssd_combined_exact_f16_batched.cpp",
@@ -1954,7 +1954,7 @@ def test_source_generated_catalog_is_terminal_and_active():
         "host/sm_100a/mamba_ssd_combined_r12_f16_varlen.cpp",
         "host/sm_100a/mamba_ssd_combined_r7_bf16_varlen.cpp",
         "host/sm_100a/mamba_ssd_combined_r7_f16_varlen.cpp",
-        "host/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cpp",
+        "host/sm_103a/factorized_persistent_segment_preprocess_7ae61d5f32.cpp",
         "host/sm_103a/mamba_ssd_combined_exact_bf16_batched.cpp",
         "host/sm_103a/mamba_ssd_combined_exact_bf16_varlen.cpp",
         "host/sm_103a/mamba_ssd_combined_exact_f16_batched.cpp",
@@ -1979,21 +1979,21 @@ def test_active_f16_source_package_declares_cuda_half_types_explicitly():
     source_root = Path(__file__).parents[2] / "csrc" / "cake_mamba_ssd_combined"
     f16_sources = (
         source_root
-        / "generated/device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cu",
+        / "generated/device/sm_100a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_97897acf8e.cu",
         source_root
-        / "generated/device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487.cu",
+        / "generated/device/sm_100a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8e8154a2dc.cu",
         source_root
-        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cu",
+        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_f16_batched_801e676ea3.cu",
         source_root
-        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cu",
+        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_f16_varlen_eff923f403.cu",
         source_root
-        / "generated/device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_990440f9a7.cu",
+        / "generated/device/sm_103a/mamba_ssd_direct_preprocess_warp_sync_1212_f16_varlen_97897acf8e.cu",
         source_root
-        / "generated/device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_53d353f487.cu",
+        / "generated/device/sm_103a/mamba_ssd_prefix_warp_sync_1212_f16_varlen_r10_v1_8e8154a2dc.cu",
         source_root
-        / "generated/device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_811b6649da.cu",
+        / "generated/device/sm_103a/mamba_ssd_q_tmem_alias_f16_batched_801e676ea3.cu",
         source_root
-        / "generated/device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae.cu",
+        / "generated/device/sm_103a/mamba_ssd_q_tmem_alias_f16_varlen_eff923f403.cu",
     )
     for source_path in f16_sources:
         source = source_path.read_text(encoding="utf-8")
@@ -2002,13 +2002,13 @@ def test_active_f16_source_package_declares_cuda_half_types_explicitly():
 
     other_active_sources = (
         source_root
-        / "generated/device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
+        / "generated/device/sm_100a/factorized_persistent_segment_preprocess_7ae61d5f32.cu",
         source_root
-        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_b5016c1b85.cu",
+        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_bf16_batched_87ce0c5b25.cu",
         source_root
-        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_9390bc7379.cu",
+        / "generated/device/sm_100a/mamba_ssd_q_tmem_alias_bf16_varlen_be73227bd7.cu",
         source_root
-        / "generated/device/sm_100a/prefix_factorized_segment_preprocess_onewarp_a104f24f9d.cu",
+        / "generated/device/sm_100a/prefix_factorized_segment_preprocess_onewarp_68ea71ca2f.cu",
     )
     assert all(
         "#include <cuda_fp16.h>" not in source_path.read_text(encoding="utf-8")
