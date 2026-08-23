@@ -266,7 +266,5 @@ def test_cake_vsa_blk64_mixed_rows_use_weight_stationary_profile():
     torch.testing.assert_close(output, reference, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(lse, reference_lse, atol=1e-2, rtol=1e-2)
 
-    for tensor, original in zip(
-        (q, k, v, q2k_indices, q2k_num), inputs, strict=True
-    ):
+    for tensor, original in zip((q, k, v, q2k_indices, q2k_num), inputs, strict=True):
         assert torch.equal(tensor, original)
