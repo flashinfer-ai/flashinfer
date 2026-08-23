@@ -38,7 +38,15 @@ def main(input_path: Path, output_path: Path) -> None:
         )
     cu_seqlens = cu_seqlens.to(device="cuda")
     if mode == "batched":
-        expected_state = payload["initial_state"].to(device="cuda")
+        expected_initial = payload["initial_state"].to(device="cuda")
+        expected_initial_before = expected_initial.clone()
+        expected_state = torch.empty_strided(
+            expected_initial.shape,
+            expected_initial.stride(),
+            dtype=expected_initial.dtype,
+            device="cuda",
+        )
+        expected_state.copy_(expected_initial)
         state_indices = payload["state_indices"].to(device="cuda", dtype=torch.int64)
         cp_delta_rule_dsl_sm100(
             expected_output,
@@ -50,10 +58,12 @@ def main(input_path: Path, output_path: Path) -> None:
             beta,
             cu_seqlens,
             scale,
-            initial_state=expected_state,
+            initial_state=expected_initial,
             state_indices=state_indices,
             max_seqlen=total,
         )
+        if not torch.equal(expected_initial, expected_initial_before):
+            raise RuntimeError("fresh semantic oracle mutated initial state")
         expected_checkpoints = torch.empty(
             (0, state_heads, q.shape[-1], q.shape[-1]),
             dtype=expected_state.dtype,
