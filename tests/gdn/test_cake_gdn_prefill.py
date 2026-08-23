@@ -318,7 +318,13 @@ def test_long_row_dispatch_is_exact(
         ("sm_100a", (128,), torch.float16, (1, 1, 1), "cp_prefill_equal_head"),
         ("sm_100a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head"),
         ("sm_103a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head_h32"),
-        ("sm_100a", (128,), torch.bfloat16, (1, 1, 1), "cp_prefill_bf16"),
+        (
+            "sm_100a",
+            (128,),
+            torch.bfloat16,
+            (1, 1, 1),
+            "cp_prefill_generic_bf16",
+        ),
         ("sm_103a", (384,), torch.float16, (2, 2, 8), "cp_prefill_generic"),
         ("sm_100a", (65,), torch.bfloat16, (1, 1, 2), "cp_prefill_generic_bf16"),
         ("sm_100a", (128, 129), torch.float16, (4, 2, 2), "cp_prefill_generic"),
@@ -352,6 +358,8 @@ def test_generic_plan_selects_head_dtype_and_tail_routes(
     assert plan.mn_kernel == f"mn_precompute{suffix}"
     assert plan.prefill_kernel == expected_prefill
     assert plan.num_sab_heads == max(hq, hv)
+    if dtype == torch.bfloat16:
+        assert plan.cp_chunk_len == cake._BLOCK
 
 
 def test_zero_length_plan_uses_simt_state_fixup(

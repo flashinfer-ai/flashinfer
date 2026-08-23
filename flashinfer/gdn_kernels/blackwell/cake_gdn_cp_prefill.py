@@ -226,9 +226,16 @@ def _build_plan(
     source_cp_chunk_len = _choose_chunk_len(
         total_tokens=total_tokens, num_heads=num_sab_heads, num_sms=num_sms
     )
-    cp_chunk_len = checkpoint_every_n_tokens or source_cp_chunk_len
+    # BF16 block factors are accurate within one 64-token Stage-2 block, but
+    # composing multiple blocks through the BF16 Stage-2 operand boundary can
+    # exceed the public 1e-2 tolerance.  Leave that composition to the FP32
+    # Stage-3 recurrence.  Checkpoint requests retain their exact interval.
+    cp_chunk_len = checkpoint_every_n_tokens or (
+        _BLOCK if q.dtype == torch.bfloat16 else source_cp_chunk_len
+    )
     if (
         not checkpoint_every_n_tokens
+        and q.dtype == torch.float16
         and arch == "sm_103a"
         and seq_lens == (65536,)
         and (hq, hk, hv) == (16, 16, 64)
