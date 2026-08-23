@@ -69,6 +69,7 @@ def test_cake_vsa_manifest_v2_inventory_and_digests():
     source_records = cake_vsa._manifest_source_records(manifest)
 
     assert manifest["schema"] == "cake-vsa-block-sparse-source-export-v2"
+    assert manifest["tensor_map_abi"] == "grid_constant"
     assert len(manifest["profiles"]) == 10
     assert len(source_records) == 30
     assert len({path for path, _ in source_records}) == 30

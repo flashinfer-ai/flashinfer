@@ -9,14 +9,17 @@
 #include <tvm/ffi/extra/cuda/cubin_launcher.h>
 #include <tvm/ffi/function.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <initializer_list>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100_9dccd2326c);
+TVM_FFI_EMBED_CUBIN(flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100_5bc3ff715a);
 
 namespace cake_host_shim {
 
@@ -112,12 +115,23 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
 // CubinKernel::SetMaxDynamicSharedMemory. cache: 0 = unresolved,
 // 1 = standard opt-in done, 2 = oversized mode required.
 inline bool CakeConfigureDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_id,
-                                     int smem_bytes, signed char* cache, int cache_len) {
+                                     int smem_bytes, std::atomic<signed char>* cache,
+                                     int cache_len) {
   namespace cuda_api = tvm::ffi::cuda_api;
   TVM_FFI_CHECK(device_id >= 0 && device_id < cache_len, RuntimeError)
       << "dynamic-SMEM opt-in cache does not cover cuda:" << device_id;
-  if (cache[device_id] != 0) {
-    return cache[device_id] == 2;
+  signed char mode = cache[device_id].load(std::memory_order_acquire);
+  if (mode != 0) {
+    return mode == 2;
+  }
+  // A generated wrapper owns one cache per kernel, but its FFI entrypoint may
+  // be called concurrently.  Serialize the first per-device attribute query,
+  // kernel mutation, and cache publication; cached launches stay lock-free.
+  static std::mutex cake_dynamic_smem_mu;
+  std::lock_guard<std::mutex> lock(cake_dynamic_smem_mu);
+  mode = cache[device_id].load(std::memory_order_acquire);
+  if (mode != 0) {
+    return mode == 2;
   }
   auto device = cuda_api::GetDeviceHandle(device_id);
   int optin_max = 0;
@@ -132,7 +146,7 @@ inline bool CakeConfigureDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_i
     err = cuda_api::SetKernelMaxDynamicSharedMem(kernel.GetHandle(), smem_bytes, device);
     TVM_FFI_CHECK(err == cuda_api::kSuccess, RuntimeError)
         << "MAX_DYNAMIC_SHARED_SIZE_BYTES=" << smem_bytes << " rejected for cuda:" << device_id;
-    cache[device_id] = 1;
+    cache[device_id].store(1, std::memory_order_release);
     return false;
   }
 #if CAKE_HAS_OVERSIZED_SMEM
@@ -146,7 +160,7 @@ inline bool CakeConfigureDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_i
       << "dynamic smem " << smem_bytes << " B exceeds the standard opt-in ceiling ("
       << optin_max << " B) on cuda:" << device_id << " and the oversized ceiling is "
       << oversized_max << " B";
-  cache[device_id] = 2;
+  cache[device_id].store(2, std::memory_order_release);
   return true;
 #else
   TVM_FFI_THROW(RuntimeError)
@@ -156,112 +170,20 @@ inline bool CakeConfigureDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_i
 #endif
 }
 
-struct TmaDeviceArena {
-  static constexpr size_t kSlotsPerChunk = 256;
-  static constexpr size_t kMaxSlots = 4096;
-  std::vector<CUdeviceptr> chunks;
-  size_t used = 0;
-};
-
-// Immutable, process-lifetime device tensor-map slots for the pointer ABI.
-// A slot is never rewritten: different descriptor bytes always get a new
-// address, so concurrent streams cannot observe a partially updated map. The
-// chunked arena caps storage at 512 KiB per CUDA context in this host module.
-static inline void* TmaDeviceSlot(
-    const CUtensorMap& tm,
-    int device_id,
-    cudaStream_t stream) {
-  static std::mutex mu;
-  static auto* slots = new std::unordered_map<std::string, void*>();
-  static auto* arenas = new std::unordered_map<CUcontext, TmaDeviceArena>();
-
-  // Device allocations are context-owned. Resolve and validate the active
-  // context before cache lookup so a warm entry can never bypass the same
-  // checks as a cold entry or leak a pointer across contexts on one device.
-  CUcontext current_context = nullptr;
-  CUresult result = cuCtxGetCurrent(&current_context);
-  TVM_FFI_CHECK(result == CUDA_SUCCESS && current_context != nullptr, RuntimeError)
-      << "pointer TMA ABI requires an active CUDA context: CUresult="
-      << static_cast<int>(result);
-  CUdevice current_device = -1;
-  result = cuCtxGetDevice(&current_device);
-  TVM_FFI_CHECK(result == CUDA_SUCCESS && current_device == device_id, RuntimeError)
-      << "TMA descriptor device mismatch: current=" << current_device
-      << ", tensor=" << device_id;
-
-  std::string key =
-      std::to_string(reinterpret_cast<uintptr_t>(current_context));
-  key.push_back(':');
-  key.append(reinterpret_cast<const char*>(&tm), sizeof(CUtensorMap));
-  std::lock_guard<std::mutex> lock(mu);
-
-  // CUcontext is an opaque, recyclable handle.  Before trusting a warm arena,
-  // prove that its first allocation still belongs to this live context.  A
-  // destroyed context makes the pointer query fail; a subsequently reused
-  // handle must therefore discard the stale pointer and descriptor entries.
-  auto arena_it = arenas->find(current_context);
-  if (arena_it != arenas->end() && !arena_it->second.chunks.empty()) {
-    CUcontext allocation_context = nullptr;
-    result = cuPointerGetAttribute(
-        &allocation_context,
-        CU_POINTER_ATTRIBUTE_CONTEXT,
-        arena_it->second.chunks.front());
-    if (result != CUDA_SUCCESS || allocation_context != current_context) {
-      const std::string prefix =
-          std::to_string(reinterpret_cast<uintptr_t>(current_context)) + ":";
-      for (auto slot_it = slots->begin(); slot_it != slots->end();) {
-        if (slot_it->first.compare(0, prefix.size(), prefix) == 0) {
-          slot_it = slots->erase(slot_it);
-        } else {
-          ++slot_it;
-        }
-      }
-      arenas->erase(arena_it);
+inline int64_t CheckedHostExtent(std::initializer_list<int64_t> factors) {
+  int64_t extent = 1;
+  for (int64_t factor : factors) {
+    TVM_FFI_CHECK(factor >= 0, ValueError)
+        << "host extent factors must be non-negative, got " << factor;
+    if (factor != 0) {
+      TVM_FFI_CHECK(
+          extent <= std::numeric_limits<int64_t>::max() / factor,
+          ValueError)
+          << "host extent overflows int64";
     }
+    extent *= factor;
   }
-
-  auto it = slots->find(key);
-  if (it != slots->end()) return it->second;
-
-  CUstreamCaptureStatus capture_status = CU_STREAM_CAPTURE_STATUS_NONE;
-  result = cuStreamIsCapturing(
-      reinterpret_cast<CUstream>(stream), &capture_status);
-  TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-      << "cuStreamIsCapturing for TMA descriptor slot failed: CUresult="
-      << static_cast<int>(result);
-  TVM_FFI_CHECK(capture_status == CU_STREAM_CAPTURE_STATUS_NONE, RuntimeError)
-      << "pointer TMA ABI cannot create a new device descriptor slot inside "
-         "CUDA Graph capture; prewarm this exact tensor/layout binding or "
-         "compile with tma_abi='grid_constant'";
-
-  TmaDeviceArena& arena = (*arenas)[current_context];
-  TVM_FFI_CHECK(arena.used < TmaDeviceArena::kMaxSlots, RuntimeError)
-      << "pointer TMA ABI exhausted its immutable descriptor arena in CUDA "
-         "context " << current_context << " on device " << device_id
-      << " (capacity=" << TmaDeviceArena::kMaxSlots
-      << "); reuse tensor/layout bindings or compile with tma_abi='grid_constant'";
-  if (arena.used % TmaDeviceArena::kSlotsPerChunk == 0) {
-    CUdeviceptr chunk = 0;
-    result = cuMemAlloc(
-        &chunk,
-        TmaDeviceArena::kSlotsPerChunk * sizeof(CUtensorMap));
-    TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-        << "cuMemAlloc for TMA descriptor arena failed: CUresult="
-        << static_cast<int>(result);
-    arena.chunks.push_back(chunk);
-  }
-  size_t chunk_index = arena.used / TmaDeviceArena::kSlotsPerChunk;
-  size_t slot_index = arena.used % TmaDeviceArena::kSlotsPerChunk;
-  CUdeviceptr dev = arena.chunks[chunk_index] +
-                    slot_index * sizeof(CUtensorMap);
-  result = cuMemcpyHtoD(dev, &tm, sizeof(CUtensorMap));
-  TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-      << "cuMemcpyHtoD for TMA descriptor slot failed: CUresult="
-      << static_cast<int>(result);
-  ++arena.used;
-  void* pointer = reinterpret_cast<void*>(static_cast<uintptr_t>(dev));
-  (*slots)[key] = pointer;
-  return pointer;
+  return extent;
 }
 
 // 4D TMA descriptor for buffer 'q' — compiled from the
@@ -429,18 +351,30 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
   CheckSameCudaDevice(arg_q2k_num, arg_q, "q2k_num", "q");
   CheckSameCudaDevice(arg_kv_block_lens, arg_q, "kv_block_lens", "q");
   CheckCurrentCudaDevice(arg_q, "q");
-  TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
-      << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
+  TVM_FFI_CHECK(
+      grid_x > 0 && grid_x <= std::numeric_limits<uint32_t>::max() &&
+      grid_y > 0 && grid_y <= std::numeric_limits<uint32_t>::max() &&
+      grid_z > 0 && grid_z <= std::numeric_limits<uint32_t>::max(), ValueError)
+      << "launch grid dimensions must fit uint32_t, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
+  TVM_FFI_CHECK(arg_q.ndim() == 3, ValueError)
+      << "q must have rank 3, got " << arg_q.ndim();
+  TVM_FFI_CHECK(arg_q.size(-1) == 128, ValueError)
+      << "q dimension -1 must equal " << (128)      << ", got " << arg_q.size(-1);
+  TVM_FFI_CHECK(arg_k.ndim() == 3, ValueError)
+      << "k must have rank 3, got " << arg_k.ndim();
+  TVM_FFI_CHECK(arg_k.size(-1) == 128, ValueError)
+      << "k dimension -1 must equal " << (128)      << ", got " << arg_k.size(-1);
+  TVM_FFI_CHECK(arg_v.ndim() == 3, ValueError)
+      << "v must have rank 3, got " << arg_v.ndim();
+  TVM_FFI_CHECK(arg_v.size(-1) == 128, ValueError)
+      << "v dimension -1 must equal " << (128)      << ", got " << arg_v.size(-1);
 
   DLDevice dev = arg_q.device();
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);
-  CUtensorMap h_q = EncodeTma_q(arg_q);
-  void* p_q = TmaDeviceSlot(h_q, arg_q.device().device_id, stream);
-  CUtensorMap h_k = EncodeTma_k(arg_k);
-  void* p_k = TmaDeviceSlot(h_k, arg_k.device().device_id, stream);
-  CUtensorMap h_v = EncodeTma_v(arg_v);
-  void* p_v = TmaDeviceSlot(h_v, arg_v.device().device_id, stream);
+  CUtensorMap p_q = EncodeTma_q(arg_q);
+  CUtensorMap p_k = EncodeTma_k(arg_k);
+  CUtensorMap p_v = EncodeTma_v(arg_v);
   void* p_out = arg_out.data_ptr();
   void* p_lse = arg_lse.data_ptr();
   void* p_q2k_indices = arg_q2k_indices.data_ptr();
@@ -456,8 +390,8 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
   int32_t v_return_lse = (int32_t)arg_return_lse;
   void* kargs[] = {&p_q, &p_k, &p_v, &p_out, &p_lse, &p_q2k_indices, &p_q2k_num, &p_kv_block_lens, &v_max_kv_blocks, &v_sequence_q, &v_query_blocks, &v_total_tiles, &v_tiles_per_cta, &v_num_heads, &v_softmax_scale_log2, &v_return_lse};
 
-  static auto kernel = EmbedCubinModule_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100_9dccd2326c::Global()->mod.GetKernel("kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100");
-  static signed char cake_smem_mode_cache[64] = {0};
+  static auto kernel = EmbedCubinModule_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100_5bc3ff715a::Global()->mod.GetKernel("kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100");
+  static std::atomic<signed char> cake_smem_mode_cache[64]{};
   const bool use_oversized_smem = CakeConfigureDynamicSmem(
       kernel, (int)arg_q.device().device_id, 232448,
       cake_smem_mode_cache, 64);
