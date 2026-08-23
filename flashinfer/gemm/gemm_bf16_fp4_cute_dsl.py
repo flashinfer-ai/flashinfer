@@ -606,8 +606,6 @@ _SM100_BF16_FP4_KERNEL_CACHE: Dict[Tuple, object] = {}
 
 _SM100_BF16_FP4_N_TILES = (8, 16, 32, 64, 128, 192)
 _SM100_BF16_FP4_K_TILE = 256
-_SM100_BF16_FP4_RASTER_ALONG_M = True
-_SM100_BF16_FP4_TACTIC_SCHEMA_VERSION = 3
 
 
 def _sm100_bf16_fp4_tactic_configs() -> List[Tuple]:
@@ -628,13 +626,14 @@ def _sm100_bf16_fp4_tactic_configs() -> List[Tuple]:
                 continue
             if route_tile == 192 and gemm_m == 128:
                 continue
-            tactic = (
-                (gemm_m, route_tile, _SM100_BF16_FP4_K_TILE),
-                cluster_shape_mn,
-                _SM100_BF16_FP4_RASTER_ALONG_M,
-            )
-            tactics.append(tactic)
-            tactics.append((tactic[0], tactic[1], False))
+            for raster_along_m in (True, False):
+                tactics.append(
+                    (
+                        (gemm_m, route_tile, _SM100_BF16_FP4_K_TILE),
+                        cluster_shape_mn,
+                        raster_along_m,
+                    )
+                )
     return tactics
 
 
@@ -820,14 +819,7 @@ def _cute_dsl_sm100_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
             _, b, _, _, out_dtype, _, block_size = inputs
             n = int(b.shape[0])
             k = int(b.shape[1]) * 2
-            return (
-                _SM100_BF16_FP4_TACTIC_SCHEMA_VERSION,
-                out_dtype,
-                n,
-                k,
-                int(block_size),
-                bool(enable_pdl),
-            )
+            return (out_dtype, n, k, int(block_size), bool(enable_pdl))
 
         def get_valid_tactics(
             self,
