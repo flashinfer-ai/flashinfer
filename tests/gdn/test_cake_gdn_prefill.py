@@ -1261,6 +1261,10 @@ def test_generic_backend_matches_pr4078_state_and_lifecycle(
     k_fp32 = torch.randn((total, hk, 128), dtype=torch.float32, device="cuda")
     if case["normalize_k"]:
         k_fp32 = torch.nn.functional.normalize(k_fp32, p=2.0, dim=-1)
+    else:
+        # Keep the raw-K path distinct from L2 normalization while bounding
+        # the recurrence so NaN output poison only detects unwritten storage.
+        k_fp32.mul_(1.0 / 128)
     k = k_fp32.to(io_dtype)
     v = torch.randn((total, hv, 128), dtype=io_dtype, device="cuda")
     alpha = (
