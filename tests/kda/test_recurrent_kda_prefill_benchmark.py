@@ -81,8 +81,8 @@ def test_recorded_cake_route_rejects_malformed_bt16_pair(routes):
 def test_timing_iteration_budget_never_exhausts_rotating_state(capacity, expected):
     budget = _timing_iteration_budget(
         state_rotation_capacity=capacity,
-        warmup_ms=20,
-        bench_ms=100,
+        requested_dry_run_iters=20,
+        requested_repeat_iters=100,
     )
     assert budget == expected
     assert 6 + sum(budget) <= capacity
@@ -92,6 +92,6 @@ def test_timing_iteration_budget_requires_one_dry_and_measured_call():
     with pytest.raises(ValueError, match="six CUPTI estimate calls"):
         _timing_iteration_budget(
             state_rotation_capacity=7,
-            warmup_ms=20,
-            bench_ms=100,
+            requested_dry_run_iters=20,
+            requested_repeat_iters=100,
         )

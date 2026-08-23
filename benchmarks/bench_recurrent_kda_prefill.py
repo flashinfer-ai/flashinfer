@@ -253,8 +253,8 @@ def _default_state_rotations(case: Case) -> int:
 def _timing_iteration_budget(
     *,
     state_rotation_capacity: int,
-    warmup_ms: int,
-    bench_ms: int,
+    requested_dry_run_iters: int,
+    requested_repeat_iters: int,
 ) -> tuple[int, int]:
     """Fit explicit CUPTI dry/repeat iterations into one rotating-state block."""
 
@@ -264,8 +264,8 @@ def _timing_iteration_budget(
             "state rotations must cover six CUPTI estimate calls plus at "
             "least one dry run and one measured iteration"
         )
-    desired_dry = max(1, warmup_ms)
-    desired_repeat = max(1, bench_ms)
+    desired_dry = max(1, requested_dry_run_iters)
+    desired_repeat = max(1, requested_repeat_iters)
     desired_total = desired_dry + desired_repeat
     if desired_total <= available:
         return desired_dry, desired_repeat
@@ -698,8 +698,6 @@ def _check_peer(prepared: PreparedCase) -> dict[str, float]:
 def _measure(
     run: Callable[[], object],
     *,
-    warmup_ms: int,
-    bench_ms: int,
     dry_run_iters: int,
     repeat_iters: int,
 ) -> tuple[float, list[float]]:
@@ -710,8 +708,6 @@ def _measure(
         use_cuda_graph=False,
         dry_run_iters=dry_run_iters,
         repeat_iters=repeat_iters,
-        dry_run_time_ms=warmup_ms,
-        repeat_time_ms=bench_ms,
     )
     samples_ms = [float(value) for value in measurements]
     return float(np.median(samples_ms)), samples_ms
@@ -719,8 +715,8 @@ def _measure(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--warmup-ms", type=int, default=20)
-    parser.add_argument("--bench-ms", type=int, default=100)
+    parser.add_argument("--dry-run-iters", type=int, default=20)
+    parser.add_argument("--repeat-iters", type=int, default=100)
     parser.add_argument(
         "--case-set",
         choices=("all", "legacy", "h12", "small_bh", "production"),
@@ -783,8 +779,8 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.warmup_ms <= 0 or args.bench_ms <= 0:
-        parser.error("--warmup-ms and --bench-ms must be positive")
+    if args.dry_run_iters <= 0 or args.repeat_iters <= 0:
+        parser.error("--dry-run-iters and --repeat-iters must be positive")
     if args.state_rotations is not None and args.state_rotations <= 0:
         parser.error("--state-rotations must be positive")
     if args.flash_kda_peer != (args.flash_kda_source_dir is not None):
@@ -842,8 +838,8 @@ def main() -> None:
             state_rotations = _default_state_rotations(case)
         dry_run_iters, repeat_iters = _timing_iteration_budget(
             state_rotation_capacity=state_rotations,
-            warmup_ms=args.warmup_ms,
-            bench_ms=args.bench_ms,
+            requested_dry_run_iters=args.dry_run_iters,
+            requested_repeat_iters=args.repeat_iters,
         )
         timing_iteration_budget = {
             "cupti_estimate_calls": _CUPTI_ESTIMATE_CALLS_PER_BLOCK,
@@ -870,8 +866,6 @@ def main() -> None:
             prepared.reset_state_pools()
             candidate_ms, candidate_samples = _measure(
                 prepared.candidate_run,
-                warmup_ms=args.warmup_ms,
-                bench_ms=args.bench_ms,
                 dry_run_iters=dry_run_iters,
                 repeat_iters=repeat_iters,
             )
@@ -913,8 +907,6 @@ def main() -> None:
                 torch.cuda.synchronize()
                 block_median, block_samples = _measure(
                     run,
-                    warmup_ms=args.warmup_ms,
-                    bench_ms=args.bench_ms,
                     dry_run_iters=dry_run_iters,
                     repeat_iters=repeat_iters,
                 )
@@ -972,8 +964,8 @@ def main() -> None:
                 "cold_l2": True,
                 "cuda_graph": False,
                 "timing_scope": ("public_recurrent_kda_with_inplace_state_update"),
-                "warmup_ms": args.warmup_ms,
-                "bench_ms": args.bench_ms,
+                "requested_dry_run_iters": args.dry_run_iters,
+                "requested_repeat_iters": args.repeat_iters,
                 "timing_iteration_budget": timing_iteration_budget,
             }
         )

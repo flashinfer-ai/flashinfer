@@ -177,9 +177,9 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     On SM100-family devices this includes beta padding, M64/M128-N32/M128-N16
     descriptor storage, small-BH packet-ring storage, and BT16 prepare/chain
     metadata, factors, and independent descriptor storage. Persistent M128 is
-    an eager-only B200/GB200 route; explicit workspaces use direct M128 or M64
-    so graph capture never synchronizes sequence lengths to construct host task
-    bins.
+    an eager-only B200/GB200 route; explicit workspaces use non-persistent
+    direct, M64, small-BH, or eligible BT16 schedules so graph capture never
+    synchronizes sequence lengths to construct host task bins.
 
     A workspace binds to its first stream. Once it participates in capture it
     cannot be passed to Python again, either eagerly or in another capture.

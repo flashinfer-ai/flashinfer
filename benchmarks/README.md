@@ -15,7 +15,8 @@ route, every physical Cake module used (including BT16 prepare plus chain), and
 the explicit per-shape dry/repeat iteration budget. Large state shapes reduce
 the sample count to stay within the rotating-state capacity and set
 `timing_iteration_budget.low_sample_count` when fewer than ten measured
-iterations fit.
+iterations fit. `--dry-run-iters` and `--repeat-iters` request fixed iteration
+counts; they are not duration targets.
 
 ## Overview
 

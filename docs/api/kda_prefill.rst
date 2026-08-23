@@ -111,8 +111,15 @@ For Cake, omitting ``seq_order`` uses its cached eager scheduling metadata. H12
 selects the dedicated M128 schedule with a 16-token recurrence chunk for both
 fixed and packed layouts. Fixed ``B=1,H=64`` selects the two-CTA M64
 value-split kernel; the fixed small-BH region described above selects its
-eight-CTA owner/helper schedule; all remaining eligible inputs select the
-general 32-token M128 schedule.
+eight-CTA owner/helper schedule. Eligible medium and long shapes instead use a
+BT16 prepare/chain route: dense fixed ``B=1,H=60..64`` inputs qualify from
+4,096 tokens when two value-split CTAs per head fit on the device; general
+M128 shapes qualify from 65,536 tokens for one to eight sequence/head tasks,
+or from 4,096 tokens for nine to 32 tasks when two CTAs per task fit. N16
+alternatives additionally depend on SM count, chain waves, and sequence
+length. Supplying ``seq_order`` disables persistent host task-bin planning but
+does not suppress BT16 or otherwise force direct M128. Remaining eligible
+inputs select the shape-appropriate non-persistent or general M128 schedule.
 
 For eager packed CuTe DSL engine calls, omitting ``seq_order`` builds and
 caches a stable decreasing-length order on the host. CuTe DSL decomp retains
@@ -170,8 +177,11 @@ CUDA graph capture requires a caller-owned
 ``RecurrentKDAPrefillWorkspace(device)`` and a preallocated ``output``. The
 workspace owns optional final-state scratch for calls without an initial
 state, beta padding, separate TMA descriptor blocks, and the small-BH compact
-packet ring with its generation counters. It binds to the device and CUDA
-stream of its first ``recurrent_kda`` call.
+packet ring with its generation counters. BT16 schedules additionally own
+``cu_chunks`` and chunk-to-sequence metadata, BF16 Qd/Kd/W/QK factors, FP32
+diagonal factors, and independent prepare/chain descriptor storage. The
+workspace binds to the device and CUDA stream of its first ``recurrent_kda``
+call.
 Warm it eagerly on the intended capture stream with the exact Q, K, V, G,
 beta, and output tensors, then synchronize that stream before capture. Packed
 graphs must also pass preallocated int64 ``cu_seqlens`` and int32

@@ -200,9 +200,10 @@ def recurrent_kda(
             in one wave. CUDA Graph capture of a packed CuTe DSL engine call
             requires an explicit plan prepared with
             :class:`RecurrentKDAPrefillWrapper`. Cake constructs and caches its
-            own eager host metadata. On Cake, supplying an order keeps the direct
-            schedule so caller-owned ordering is not replaced by persistent task
-            bins.
+            own eager host metadata. On Cake, supplying an order disables
+            persistent host task-bin planning but does not force direct M128;
+            the selected non-persistent route may still be BT16 prepare/chain,
+            M64, small-BH, or direct according to the input shape.
             Fixed-layout prefill and decode calls must leave it as ``None``.
         prefill_workspace (Optional[RecurrentKDAPrefillWorkspace]):
             Caller-owned workspace for SM100-family and SM120 prefill backends.
@@ -210,7 +211,8 @@ def recurrent_kda(
             capture. Warm it eagerly with the exact tensors on the capture
             stream before capture. Use one workspace per captured
             ``recurrent_kda`` invocation. Explicit workspaces and CUDA Graph
-            capture use direct/M64 schedules; persistent task planning is an
+            capture use non-persistent schedules, including eligible BT16,
+            M64, small-BH, and direct routes. Persistent task planning is an
             eager-only B200/GB200 route because its bins depend on host-visible
             sequence lengths.
         state_checkpoints (Optional[torch.Tensor]):
