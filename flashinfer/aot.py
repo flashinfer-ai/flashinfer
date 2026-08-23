@@ -90,6 +90,7 @@ from .jit.fused_moe import (
     gen_cutlass_fused_moe_sm103_module,
     gen_cutlass_fused_moe_sm120_module,
     gen_trtllm_gen_fused_moe_sm100_module,
+    gen_trtllm_gen_routing_module,
 )
 from .jit.bgmv_moe import gen_bgmv_moe_module
 from .jit.monomoe import gen_monomoe_module
@@ -622,6 +623,16 @@ def gen_all_modules(
             for variant in CAKE_KDA_PACKED_T1_VARIANTS
         )
 
+    # The experimental fused GDN decode step is deliberately NOT built here.
+    # Its preferred backend is CuTe-DSL, which this AOT pass does not cover at
+    # all, so an AOT entry could only ever pre-build the second-choice CUDA
+    # impl -- which never serves a registered geometry on an install where the
+    # CuTe-DSL one loads.  Paying jit-cache size for a kernel that does not run
+    # is the wrong trade when that budget is shared with kernels that do.  It
+    # JIT-compiles on first eager dispatch instead, which is already how the
+    # CuTe-DSL impl reaches the CUDA-graph capture phase warm.  See
+    # flashinfer/gdn_kernels/experimental/README.md.
+
     if add_act:
         for act_name in act_func_def_str:
             jit_specs.append(gen_act_and_mul_module(act_name))
@@ -661,6 +672,7 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_gen_gemm_module())
             jit_specs.append(gen_trtllm_low_latency_gemm_module())
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module())
+            jit_specs.append(gen_trtllm_gen_routing_module())
         if has_sm100f:
             # Add TGV GEMM modules compiled with SM100f flags for both bf16 and fp16
             jit_specs.append(
