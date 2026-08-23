@@ -84,7 +84,13 @@ _flash_kda_tensor_cache_lock = threading.Lock()
 
 _PackedMetadataSignature = tuple[int, int, int, int, bool]
 _PersistentTaskPlan = tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
-_PackedTaskMetadata = tuple[tuple[int, ...], Optional[_PersistentTaskPlan], bool]
+_PackedTaskMetadata = tuple[
+    tuple[int, ...],
+    Optional[_PersistentTaskPlan],
+    bool,
+    tuple[int, ...],
+    tuple[int, ...],
+]
 
 
 class _RecurrentKDAPrefillWorkspaceBase:
@@ -141,8 +147,6 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._packed_metadata_tensor: Optional[torch.Tensor] = None
         self._packed_metadata_signature: Optional[_PackedMetadataSignature] = None
         self._packed_metadata: Optional[_PackedTaskMetadata] = None
-        self._packed_offsets: Optional[tuple[int, ...]] = None
-        self._packed_sequence_lengths: Optional[tuple[int, ...]] = None
         self._bound_stream_ptr: Optional[int] = None
         self._captured = False
         # The SM120 backend's per-workspace state, created on first use by
@@ -1039,12 +1043,12 @@ def _cached_packed_task_metadata(
             sequence_order,
             persistent_plan,
             len(set(sequence_lengths)) == 1,
+            offsets,
+            sequence_lengths,
         )
         workspace._packed_metadata_tensor = cu_seqlens
         workspace._packed_metadata_signature = signature
         workspace._packed_metadata = metadata
-        workspace._packed_offsets = offsets
-        workspace._packed_sequence_lengths = sequence_lengths
         return metadata
 
 
@@ -1818,6 +1822,8 @@ def _run_flash_kda_prefill(
             automatic_sequence_order,
             persistent_plan,
             uniform_sequences,
+            offsets,
+            sequence_lengths,
         ) = _cached_packed_task_metadata(
             metadata_workspace,
             cu_seqlens_i64,
@@ -1826,10 +1832,6 @@ def _run_flash_kda_prefill(
             sm_count=sm_count,
             build_persistent_plan=persistent_candidate,
         )
-        assert metadata_workspace._packed_offsets is not None
-        assert metadata_workspace._packed_sequence_lengths is not None
-        offsets = metadata_workspace._packed_offsets
-        sequence_lengths = metadata_workspace._packed_sequence_lengths
     if fixed_layout and persistent_candidate:
         persistent_plan = _persistent_task_plan(
             sequence_lengths,

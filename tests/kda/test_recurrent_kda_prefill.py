@@ -14,6 +14,7 @@
 
 import importlib
 import math
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -1667,7 +1668,56 @@ def test_b200_packed_metadata_is_cached_for_unchanged_offsets(cuda_device):
     )
     assert first[0] == (0, 1)
     assert first[1] is not None
+    assert first[3] == (0, 3, 6)
+    assert first[4] == (3, 3)
     assert first is second
+
+
+def test_packed_metadata_is_self_contained_across_threads(cuda_device):
+    workspace = kda_prefill_api._FlashKDAStreamWorkspace(cuda_device)
+    layouts = {
+        "short_first": ((0, 1, 6), (1, 5)),
+        "long_first": ((0, 4, 6), (4, 2)),
+    }
+    barrier = threading.Barrier(len(layouts))
+    results = {}
+    failures = []
+
+    def build_metadata(name, expected):
+        try:
+            torch.cuda.set_device(cuda_device)
+            offsets, _ = expected
+            cu_seqlens = torch.tensor(
+                offsets, dtype=torch.int64, device=cuda_device
+            )
+            metadata = kda_prefill_api._cached_packed_task_metadata(
+                workspace,
+                cu_seqlens,
+                total_tokens=6,
+                num_heads=96,
+                sm_count=148,
+                build_persistent_plan=False,
+            )
+            barrier.wait(timeout=10)
+            results[name] = metadata
+        except BaseException as error:
+            failures.append(error)
+
+    threads = [
+        threading.Thread(target=build_metadata, args=(name, expected))
+        for name, expected in layouts.items()
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert not failures
+    for name, (expected_offsets, expected_lengths) in layouts.items():
+        metadata = results[name]
+        assert metadata[3] == expected_offsets
+        assert metadata[4] == expected_lengths
 
 
 def test_direct_packed_prefill_automatically_sorts_sequences(cuda_device, monkeypatch):
