@@ -174,14 +174,20 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_fixup_v1(float* __restrict__ local_tr
             long long output_index = state_head_base + (long long)((row_base + row_in_cta_7) * 128) + (long long)col;
             output_state[output_index] = shared_state[row_in_cta_7 * 128 + col];
         }
+    } else {
+        #pragma unroll
+        for (int row_in_cta_8 = 0; row_in_cta_8 < 4; row_in_cta_8++) {
+            long long output_index_1 = state_head_base + (long long)((row_base + row_in_cta_8) * 128) + (long long)col;
+            output_state[output_index_1] = initial_state[output_index_1];
+        }
     }
     #pragma unroll 1
     for (int gap_idx = gap_start; gap_idx < gap_end; gap_idx++) {
         int gap_head_linear = gap_idx * num_heads + head_idx;
         long long gap_head_base = (long long)gap_head_linear * 16384;
         #pragma unroll
-        for (int row_in_cta_8 = 0; row_in_cta_8 < 4; row_in_cta_8++) {
-            long long fixed_index_1 = gap_head_base + (long long)((row_base + row_in_cta_8) * 128) + (long long)col;
+        for (int row_in_cta_9 = 0; row_in_cta_9 < 4; row_in_cta_9++) {
+            long long fixed_index_1 = gap_head_base + (long long)((row_base + row_in_cta_9) * 128) + (long long)col;
             fixed_state[fixed_index_1] = 0.0f;
         }
     }
