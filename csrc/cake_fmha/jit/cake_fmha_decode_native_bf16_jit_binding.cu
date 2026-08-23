@@ -335,13 +335,25 @@ void cake_paged_attention_decode(
     sinks_ptr = static_cast<float*>(sinks.data_ptr());
   }
 
+  unsigned int grid_x;
+  unsigned int grid_y = 1;
+  unsigned int grid_z = 1;
+  // The exact sink kernel maps one CTA per (query, KV head, batch) tile.
+  // Other native-BF16 members use their existing persistent 1-D launch.
+#if BATCH_SIZE == 256 && Q_LEN == 1 && NUM_Q_HEADS == 32 && NUM_KV_HEADS == 4 && \
+    CAKE_FMHA_HAS_SINK == 1 && CAKE_FMHA_HAS_WINDOW == 0 && CAKE_FMHA_USE_SCALE_PTR == 0
+  grid_x = Q_LEN;
+  grid_y = NUM_KV_HEADS;
+  grid_z = BATCH_SIZE;
+#else
   unsigned int total_tiles = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;
-  unsigned int grid_x = std::min<unsigned int>(static_cast<unsigned int>(sm_count), total_tiles);
+  grid_x = std::min<unsigned int>(static_cast<unsigned int>(sm_count), total_tiles);
+#endif
   cudaError_t status = cake_fmha_launch_decode_native_bf16(
       p_q, p_k, p_v, static_cast<__nv_bfloat16*>(out.data_ptr()), lse_ptr, page_table,
       causal_prefix, scale_ptr, sinks_ptr, max_pages_per_seq, static_cast<int>(max_kv_len),
       softmax_scale_log2, static_cast<int>(window_left), NUM_Q_HEADS, NUM_KV_HEADS, BATCH_SIZE,
-      grid_x, 1, 1, stream);
+      grid_x, grid_y, grid_z, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
       << "Cake FMHA decode-native BF16 launch failed: " << cudaGetErrorString(status);
 

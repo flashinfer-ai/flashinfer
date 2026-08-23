@@ -58,7 +58,7 @@ def patch_qmul4_cubin(
     *,
     expected_counts: Mapping[int | str, int],
 ) -> bytes:
-    """Replace exact marker instructions and reject incomplete/drifted cubins."""
+    """Patch exact markers and reject non-integral compiler duplication."""
 
     expected = _validated_expected_counts(expected_counts)
     patched = bytearray(cubin)
@@ -103,9 +103,12 @@ def patch_qmul4_cubin(
             actual[marker_id] += 1
 
     mismatched = {
-        marker_id: {"expected": count, "patched": actual[marker_id]}
+        marker_id: {
+            "source_denominator": count,
+            "patched": actual[marker_id],
+        }
         for marker_id, count in expected.items()
-        if actual[marker_id] != count
+        if actual[marker_id] < count or actual[marker_id] % count
     }
     unexpected = {
         marker_id: count

@@ -262,6 +262,98 @@ def test_cake_fmha_decode_native_bf16_jit_selects_all_exact_manifest_members(
     assert selected_batches == {4, 128, 256}
 
 
+def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector() -> None:
+    from flashinfer.jit import cake_fmha as cake_jit
+
+    manifest = get_cake_fmha_manifest()
+    component = manifest["components"]["decode_native_bf16"]
+    sink_members = [
+        member
+        for member in component["source_family"]
+        if "BATCH_SIZE" in member["selector"]
+        and member["selector"].get("HAS_SINK") == 1
+    ]
+    assert len(sink_members) == 1
+    sink_member = sink_members[0]
+    selector = sink_member["selector"]
+    assert {
+        key: selector[key]
+        for key in (
+            "BATCH_SIZE",
+            "Q_LEN",
+            "NUM_Q_HEADS",
+            "NUM_KV_HEADS",
+            "HAS_SINK",
+            "HAS_WINDOW",
+            "USE_SCALE_PTR",
+        )
+    } == {
+        "BATCH_SIZE": 256,
+        "Q_LEN": 1,
+        "NUM_Q_HEADS": 32,
+        "NUM_KV_HEADS": 4,
+        "HAS_SINK": 1,
+        "HAS_WINDOW": 0,
+        "USE_SCALE_PTR": 0,
+    }
+
+    sink_binding = (
+        "bindings/cake_fmha_decode_native_bf16_sink_peer_clc_binding.cu"
+    )
+    launch_override = sink_member["launch_override"]
+    assert launch_override["binding_source"] == sink_binding
+    assert launch_override["binding_sha256"] == manifest["artifacts"][sink_binding][
+        "sha256"
+    ]
+    assert launch_override["grid"] == ["Q_LEN", "NUM_KV_HEADS", "BATCH_SIZE"]
+    assert launch_override["use_pdl"] is True
+    assert len(cake_jit._FLASHINFER_BINDINGS) == 12
+    assert sink_binding not in cake_jit._FLASHINFER_BINDINGS
+    assert cake_jit._sha256(get_cake_fmha_csrc_dir() / sink_binding) == (
+        launch_override["binding_sha256"]
+    )
+    assert cake_jit._flashinfer_bindings_sha256(get_cake_fmha_csrc_dir()) == (
+        CAKE_FMHA_FLASHINFER_BINDINGS_SHA256
+    )
+
+    adapter = (
+        get_cake_fmha_csrc_dir()
+        / "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
+    ).read_text(encoding="utf-8")
+    exact_guard = (
+        "#if BATCH_SIZE == 256 && Q_LEN == 1 && NUM_Q_HEADS == 32 && "
+        "NUM_KV_HEADS == 4 && \\\n"
+        "    CAKE_FMHA_HAS_SINK == 1 && CAKE_FMHA_HAS_WINDOW == 0 && "
+        "CAKE_FMHA_USE_SCALE_PTR == 0"
+    )
+    assert adapter.count(exact_guard) == 1
+    exact_branch = adapter.split(exact_guard, 1)[1].split("#else", 1)[0]
+    assert "grid_x = Q_LEN;" in exact_branch
+    assert "grid_y = NUM_KV_HEADS;" in exact_branch
+    assert "grid_z = BATCH_SIZE;" in exact_branch
+
+
+def test_cake_fmha_decode_native_bf16_other_grids_stay_persistent() -> None:
+    adapter = (
+        get_cake_fmha_csrc_dir()
+        / "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
+    ).read_text(encoding="utf-8")
+    grid_policy = adapter.split("unsigned int grid_z = 1;", 1)[1].split(
+        "cudaError_t status", 1
+    )[0]
+    persistent_branch = grid_policy.split("#else", 1)[1].split("#endif", 1)[0]
+    assert "unsigned int total_tiles = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;" in (
+        persistent_branch
+    )
+    assert (
+        "grid_x = std::min<unsigned int>(static_cast<unsigned int>(sm_count), "
+        "total_tiles);"
+    ) in persistent_branch
+    assert "unsigned int grid_y = 1;" in adapter
+    assert "unsigned int grid_z = 1;" in adapter
+    assert "grid_x, grid_y, grid_z, stream);" in adapter
+
+
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 @pytest.mark.parametrize(
     ("has_sink", "retain_kv_l2"),
@@ -2123,6 +2215,126 @@ def test_cake_decode_bf16_matches_flashinfer_reference() -> None:
         max_in_kv_len=31,
         head_dim=128,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_cake_decode_exact_sink_matches_flashinfer_reference() -> None:
+    """Compile and launch the exact sink override through the public Cake API."""
+
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
+        pytest.skip("Cake FMHA exact sink requires SM100 or SM103")
+
+    torch.manual_seed(0)
+    batch_size = 256
+    q_len = 1
+    num_q_heads = 32
+    num_kv_heads = 4
+    page_size = 16
+    head_dim = 128
+    kv_len = 4096
+    pages_per_seq = kv_len // page_size
+
+    query = torch.randn(
+        (batch_size * q_len, num_q_heads, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    kv_cache = torch.randn(
+        (pages_per_seq, 2, num_kv_heads, page_size, head_dim),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    # Reuse one complete physical page row for every request.  This keeps the
+    # exact logical B256/K4096 route while bounding the test's device footprint.
+    block_tables = torch.arange(
+        pages_per_seq, dtype=torch.int32, device=device
+    ).repeat(batch_size, 1)
+    seq_lens = torch.full(
+        (batch_size,), kv_len, dtype=torch.int32, device=device
+    )
+    sinks = torch.rand(num_q_heads, dtype=torch.float32, device=device) * 5
+    reference_workspace = torch.empty(
+        256 * 1024 * 1024, dtype=torch.uint8, device=device
+    )
+    cake_workspace = torch.empty_like(reference_workspace)
+    reference_out = torch.empty_like(query)
+    cake_out = torch.empty_like(query)
+    common = dict(
+        query=query,
+        kv_cache=kv_cache,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=kv_len,
+        bmm1_scale=float(head_dim**-0.5),
+        bmm2_scale=1.0,
+        window_left=-1,
+        sinks=sinks,
+        kv_layout="HND",
+        enable_pdl=True,
+        q_len_per_req=q_len,
+        uses_shared_paged_kv_idx=True,
+        return_lse=False,
+    )
+
+    route = cake_api.select_cake_fmha_decode_route(
+        device,
+        query=query,
+        key_cache=kv_cache[:, 0],
+        value_cache=kv_cache[:, 1],
+        out=cake_out,
+        workspace_buffer=cake_workspace,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        batch_size=batch_size,
+        q_len=q_len,
+        max_seq_len=kv_len,
+        window_left=-1,
+        bmm1_scale=common["bmm1_scale"],
+        bmm2_scale=common["bmm2_scale"],
+        o_scale=1.0,
+        sinks=sinks,
+        kv_layout="HND",
+        uses_shared_paged_kv_idx=True,
+        cum_seq_lens_q=None,
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=None,
+        enable_block_sparse_attention=False,
+        lse=None,
+    )
+    assert route is not None
+    assert route.component == "decode_native_bf16"
+    assert (
+        route.batch_size,
+        route.q_len,
+        route.num_q_heads,
+        route.num_kv_heads,
+        route.has_sink,
+        route.has_window,
+        route.use_scale_ptr,
+        route.retain_kv_l2,
+        route.page_size,
+    ) == (256, 1, 32, 4, True, False, False, False, 16)
+    assert cake_api.cake_fmha_route_is_optimized(route)
+    # This call forces the member-level body and launch_override binding to JIT
+    # compile before the public API correctness comparison below.
+    assert cake_api.get_cake_fmha_decode_module(device, route) is not None
+
+    reference = decode.trtllm_batch_decode_with_kv_cache(
+        workspace_buffer=reference_workspace,
+        out=reference_out,
+        backend="trtllm-gen",
+        **common,
+    )
+    actual = cake_api.cake_batch_decode_with_kv_cache(
+        workspace_buffer=cake_workspace,
+        out=cake_out,
+        **common,
+    )
+    assert reference.data_ptr() == reference_out.data_ptr()
+    assert actual.data_ptr() == cake_out.data_ptr()
+    torch.testing.assert_close(actual.float(), reference.float(), rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
