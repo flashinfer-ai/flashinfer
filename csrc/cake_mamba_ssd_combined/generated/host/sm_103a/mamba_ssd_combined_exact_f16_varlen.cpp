@@ -19,7 +19,7 @@
 TVM_FFI_EMBED_CUBIN(factorized_persistent_segment_preprocess_77140386cb);
 TVM_FFI_EMBED_CUBIN(mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae);
 
-namespace cake_host_shim {
+namespace cake_host_shim_964fe2aba570dc7d {
 
 using tvm::ffi::TensorView;
 
@@ -256,6 +256,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_dt, TensorView arg_
   prepared.retained.push_back(arg_delta);
   prepared.retained.push_back(arg_cumsum);
   prepared.kernel = &Kernel();
+
   prepared.p_dt = arg_dt.data_ptr();
   prepared.p_A = arg_A.data_ptr();
   prepared.p_dt_bias = arg_dt_bias.data_ptr();
@@ -490,7 +491,7 @@ inline CUtensorMap EncodeTma_out_map(const TensorView& t) {
 }
 
 inline auto& Kernel() {
-  static auto kernel = EmbedCubinModule_mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae::Global()->mod.GetKernelWithMaxDynamicSharedMemory("kernel_mamba_ssd_q_tmem_alias_f16_varlen", 231936);
+  static auto kernel = EmbedCubinModule_mamba_ssd_q_tmem_alias_f16_varlen_ba0c7cdaae::Global()->mod.GetKernel("kernel_mamba_ssd_q_tmem_alias_f16_varlen");
   return kernel;
 }
 
@@ -722,6 +723,12 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_x_map, TensorView a
   prepared.retained.push_back(arg_seq_chunk_cumsum);
   prepared.retained.push_back(arg_out_native);
   prepared.kernel = &Kernel();
+  static signed char cake_smem_mode_cache[64] = {0};
+  const bool use_oversized_smem = CakeConfigureDynamicSmem(
+      Kernel(), (int)arg_x_map.device().device_id, 231936,
+      cake_smem_mode_cache, 64);
+  TVM_FFI_CHECK(!use_oversized_smem, RuntimeError)
+      << "oversized dynamic shared memory requires the extended (cluster) launch path";
   prepared.p_x_map = EncodeTma_x_map(arg_x_map);
   prepared.p_b_map = EncodeTma_b_map(arg_b_map);
   prepared.p_c_map = EncodeTma_c_map(arg_c_map);
@@ -829,6 +836,6 @@ void Run(TensorView preprocess_arg_dt, TensorView preprocess_arg_A, TensorView p
   stage_main::Submit(prepared_main, stream);
 }
 
-}  // namespace cake_host_shim
+}  // namespace cake_host_shim_964fe2aba570dc7d
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_964fe2aba570dc7d::Run);

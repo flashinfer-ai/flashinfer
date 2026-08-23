@@ -300,7 +300,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_exact_bf16_batched.cpp",
-          "sha256": "005ba12d1842c008397ee41b9c7dd259afeb145add0ace249a469a0f71094883"
+          "sha256": "ed60491e77c70dbefa9f3bc1a9803d3e20afd15a9121115798b89edabfe05295"
         },
         "launch_count": 2,
         "stage_order": [
@@ -901,7 +901,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_exact_bf16_batched.cpp",
-          "sha256": "005ba12d1842c008397ee41b9c7dd259afeb145add0ace249a469a0f71094883"
+          "sha256": "8508c84e8c5811db7be506af694d5417a449cdb00f2770c44c6c5afe6f3df8e6"
         },
         "launch_count": 2,
         "stage_order": [
@@ -1504,7 +1504,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_exact_bf16_varlen.cpp",
-          "sha256": "bc81b8d63b0b3419cfe498aad4cf1426edf9def4ca418d9813ef12d1858ac13e"
+          "sha256": "9d5ff48178a52e0064814ea9f78418421c90c492fad3b8453db493c45a35e9f6"
         },
         "launch_count": 2,
         "stage_order": [
@@ -2105,7 +2105,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_exact_bf16_varlen.cpp",
-          "sha256": "bc81b8d63b0b3419cfe498aad4cf1426edf9def4ca418d9813ef12d1858ac13e"
+          "sha256": "839611507b8c62a9b45e2529d79e6950b583b3f4c957a47681e58f079d967606"
         },
         "launch_count": 2,
         "stage_order": [
@@ -2708,7 +2708,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_exact_f16_batched.cpp",
-          "sha256": "9eea13ed027584c983baaaf0228dc0af45d4ea6cc440d83b3c210a5b69283b62"
+          "sha256": "9e5207101e24e444b7ecf1be722e1b6abd61c42f932084e39fa838ebff7b120b"
         },
         "launch_count": 2,
         "stage_order": [
@@ -3309,7 +3309,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_exact_f16_batched.cpp",
-          "sha256": "9eea13ed027584c983baaaf0228dc0af45d4ea6cc440d83b3c210a5b69283b62"
+          "sha256": "2a03b2dda1cc5579ef5e18f06b1226edd1a18124999ac2cd0489f9c814161f37"
         },
         "launch_count": 2,
         "stage_order": [
@@ -3912,7 +3912,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_exact_f16_varlen.cpp",
-          "sha256": "cdddeaa7e5bc08870d079f5e739e1a93135a9ff6019b3c9a620a9439893a19e5"
+          "sha256": "301fd898822d179030ea97f827fe71be51907f126092b458462081190bc1b1e3"
         },
         "launch_count": 2,
         "stage_order": [
@@ -4513,7 +4513,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_exact_f16_varlen.cpp",
-          "sha256": "cdddeaa7e5bc08870d079f5e739e1a93135a9ff6019b3c9a620a9439893a19e5"
+          "sha256": "5b7fa895c0219e3171b2eda4681797cd709fa997dc3d0cc6bd78a6ae1601cacb"
         },
         "launch_count": 2,
         "stage_order": [
@@ -5116,7 +5116,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-          "sha256": "46394fe953da8581146af79f66738140fc130cf88babb76a9b482a753da80f68"
+          "sha256": "01b14fb6c97e8b8ffaec4b7811077f3219cb53787b4de6d5f02d3d9d7e159381"
         },
         "launch_count": 2,
         "stage_order": [
@@ -5717,7 +5717,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-          "sha256": "46394fe953da8581146af79f66738140fc130cf88babb76a9b482a753da80f68"
+          "sha256": "c5fe1de4183eb97f2eff49152a11293f6793db14fac5ff4fdaa8a3ab38a4d348"
         },
         "launch_count": 2,
         "stage_order": [
@@ -6320,7 +6320,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_r12_f16_varlen.cpp",
-          "sha256": "0f2172295d949f06db50903acec27628773f23173a7533a0e4cd2d563c2077cb"
+          "sha256": "9232389b6e3537f8e228ac6dd32d69451b7a8f30b98517eeb171beb7bd30f638"
         },
         "launch_count": 2,
         "stage_order": [
@@ -6921,7 +6921,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_r12_f16_varlen.cpp",
-          "sha256": "0f2172295d949f06db50903acec27628773f23173a7533a0e4cd2d563c2077cb"
+          "sha256": "f80bf6abb8324c02c3f3834252def04fb953d67c91c8075becaf16da43fd52cc"
         },
         "launch_count": 2,
         "stage_order": [
@@ -7524,7 +7524,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_r7_bf16_varlen.cpp",
-          "sha256": "12620c2109a7f0396880863687f3450b5100296bd60519453e9aca656bb5f029"
+          "sha256": "e3274a5c6d14dd35d9659ba7d2538a80666d44b7a8d2b3d76d7d8e7b5f0d2a4d"
         },
         "launch_count": 2,
         "stage_order": [
@@ -8125,7 +8125,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_r7_bf16_varlen.cpp",
-          "sha256": "12620c2109a7f0396880863687f3450b5100296bd60519453e9aca656bb5f029"
+          "sha256": "c63b440b06d3f76d9f24794f5de822fb47181f38bee5d95e4ffc3e32ed869508"
         },
         "launch_count": 2,
         "stage_order": [
@@ -8728,7 +8728,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_100a/mamba_ssd_combined_r7_f16_varlen.cpp",
-          "sha256": "ae99304c1a8e9c1abf5942c95912b1160b327e8c6241d3f8ecfa8e97ead9f829"
+          "sha256": "9b76b96a3581e9df4a76f3cd41d5d932bae2d9319435170c84286642c6cc7845"
         },
         "launch_count": 2,
         "stage_order": [
@@ -9329,7 +9329,7 @@
         "entry": "run",
         "host_source": {
           "path": "host/sm_103a/mamba_ssd_combined_r7_f16_varlen.cpp",
-          "sha256": "ae99304c1a8e9c1abf5942c95912b1160b327e8c6241d3f8ecfa8e97ead9f829"
+          "sha256": "d7c02e6a312c313ba3d5123b5f5557961f34d17a03d25d34e95c4f2a76341171"
         },
         "launch_count": 2,
         "stage_order": [
@@ -9635,7 +9635,7 @@
     }
   },
   "schema_version": 1,
-  "source_archive_sha256": "c04f0c0dcabc83d93252ce9cb0e580984a70bd0a464a37f6f7b0e9b427a6acfb",
+  "source_archive_sha256": "4de9f1a5aae740e9c80ef7815cb1a80137eec304ba7db6c209acf6785f5a680c",
   "source_inventory": [
     {
       "path": "device/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cu",
@@ -9719,75 +9719,75 @@
     },
     {
       "path": "host/sm_100a/factorized_persistent_segment_preprocess_77140386cb.cpp",
-      "sha256": "0d8b386574f75c894ba4a7abde2a94e96a927d8d792dfa969ff219dc26cfecef"
+      "sha256": "766d4c470717256a51fb448f2fe3f67c83d0d9d7ed57b488388b357c856c74ef"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_exact_bf16_batched.cpp",
-      "sha256": "005ba12d1842c008397ee41b9c7dd259afeb145add0ace249a469a0f71094883"
+      "sha256": "ed60491e77c70dbefa9f3bc1a9803d3e20afd15a9121115798b89edabfe05295"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_exact_bf16_varlen.cpp",
-      "sha256": "bc81b8d63b0b3419cfe498aad4cf1426edf9def4ca418d9813ef12d1858ac13e"
+      "sha256": "9d5ff48178a52e0064814ea9f78418421c90c492fad3b8453db493c45a35e9f6"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_exact_f16_batched.cpp",
-      "sha256": "9eea13ed027584c983baaaf0228dc0af45d4ea6cc440d83b3c210a5b69283b62"
+      "sha256": "9e5207101e24e444b7ecf1be722e1b6abd61c42f932084e39fa838ebff7b120b"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_exact_f16_varlen.cpp",
-      "sha256": "cdddeaa7e5bc08870d079f5e739e1a93135a9ff6019b3c9a620a9439893a19e5"
+      "sha256": "301fd898822d179030ea97f827fe71be51907f126092b458462081190bc1b1e3"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-      "sha256": "46394fe953da8581146af79f66738140fc130cf88babb76a9b482a753da80f68"
+      "sha256": "01b14fb6c97e8b8ffaec4b7811077f3219cb53787b4de6d5f02d3d9d7e159381"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_r12_f16_varlen.cpp",
-      "sha256": "0f2172295d949f06db50903acec27628773f23173a7533a0e4cd2d563c2077cb"
+      "sha256": "9232389b6e3537f8e228ac6dd32d69451b7a8f30b98517eeb171beb7bd30f638"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_r7_bf16_varlen.cpp",
-      "sha256": "12620c2109a7f0396880863687f3450b5100296bd60519453e9aca656bb5f029"
+      "sha256": "e3274a5c6d14dd35d9659ba7d2538a80666d44b7a8d2b3d76d7d8e7b5f0d2a4d"
     },
     {
       "path": "host/sm_100a/mamba_ssd_combined_r7_f16_varlen.cpp",
-      "sha256": "ae99304c1a8e9c1abf5942c95912b1160b327e8c6241d3f8ecfa8e97ead9f829"
+      "sha256": "9b76b96a3581e9df4a76f3cd41d5d932bae2d9319435170c84286642c6cc7845"
     },
     {
       "path": "host/sm_103a/factorized_persistent_segment_preprocess_77140386cb.cpp",
-      "sha256": "0d8b386574f75c894ba4a7abde2a94e96a927d8d792dfa969ff219dc26cfecef"
+      "sha256": "797676a7ef7d20f5a6a73c333b7b51e6bb7f0cab4d0e4595c127fbc3c31ccf7a"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_exact_bf16_batched.cpp",
-      "sha256": "005ba12d1842c008397ee41b9c7dd259afeb145add0ace249a469a0f71094883"
+      "sha256": "8508c84e8c5811db7be506af694d5417a449cdb00f2770c44c6c5afe6f3df8e6"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_exact_bf16_varlen.cpp",
-      "sha256": "bc81b8d63b0b3419cfe498aad4cf1426edf9def4ca418d9813ef12d1858ac13e"
+      "sha256": "839611507b8c62a9b45e2529d79e6950b583b3f4c957a47681e58f079d967606"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_exact_f16_batched.cpp",
-      "sha256": "9eea13ed027584c983baaaf0228dc0af45d4ea6cc440d83b3c210a5b69283b62"
+      "sha256": "2a03b2dda1cc5579ef5e18f06b1226edd1a18124999ac2cd0489f9c814161f37"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_exact_f16_varlen.cpp",
-      "sha256": "cdddeaa7e5bc08870d079f5e739e1a93135a9ff6019b3c9a620a9439893a19e5"
+      "sha256": "5b7fa895c0219e3171b2eda4681797cd709fa997dc3d0cc6bd78a6ae1601cacb"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_r12_bf16_varlen.cpp",
-      "sha256": "46394fe953da8581146af79f66738140fc130cf88babb76a9b482a753da80f68"
+      "sha256": "c5fe1de4183eb97f2eff49152a11293f6793db14fac5ff4fdaa8a3ab38a4d348"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_r12_f16_varlen.cpp",
-      "sha256": "0f2172295d949f06db50903acec27628773f23173a7533a0e4cd2d563c2077cb"
+      "sha256": "f80bf6abb8324c02c3f3834252def04fb953d67c91c8075becaf16da43fd52cc"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_r7_bf16_varlen.cpp",
-      "sha256": "12620c2109a7f0396880863687f3450b5100296bd60519453e9aca656bb5f029"
+      "sha256": "c63b440b06d3f76d9f24794f5de822fb47181f38bee5d95e4ffc3e32ed869508"
     },
     {
       "path": "host/sm_103a/mamba_ssd_combined_r7_f16_varlen.cpp",
-      "sha256": "ae99304c1a8e9c1abf5942c95912b1160b327e8c6241d3f8ecfa8e97ead9f829"
+      "sha256": "d7c02e6a312c313ba3d5123b5f5557961f34d17a03d25d34e95c4f2a76341171"
     }
   ],
   "source_status": "terminal"

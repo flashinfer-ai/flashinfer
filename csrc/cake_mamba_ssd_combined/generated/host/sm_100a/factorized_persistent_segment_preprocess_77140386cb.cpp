@@ -18,7 +18,7 @@
 
 TVM_FFI_EMBED_CUBIN(factorized_persistent_segment_preprocess_77140386cb);
 
-namespace cake_host_shim {
+namespace cake_host_shim_de08e41b47bb84d1 {
 
 using tvm::ffi::TensorView;
 
@@ -239,6 +239,6 @@ void Run(TensorView arg_dt, TensorView arg_A, TensorView arg_dt_bias, TensorView
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.Launch(kargs, grid, block, stream, 0u));
 }
 
-}  // namespace cake_host_shim
+}  // namespace cake_host_shim_de08e41b47bb84d1
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_de08e41b47bb84d1::Run);
