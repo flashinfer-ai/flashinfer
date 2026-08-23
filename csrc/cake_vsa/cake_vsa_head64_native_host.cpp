@@ -18,7 +18,7 @@
 #include <initializer_list>
 #include <limits>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_vsa_head64_native_sm100_1b8fbf0974);
+TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_vsa_head64_native_sm100_47359dbcd3);
 
 namespace cake_host_shim {
 
@@ -490,7 +490,7 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
   int32_t v_return_temperature_lse = (int32_t)arg_return_temperature_lse;
   void* kargs[] = {&p_q, &p_k, &p_v, &p_out, &p_lse, &p_temperature_lse, &p_block_mask, &v_mb, &v_nb, &v_num_q_heads, &v_num_kv_heads, &v_softmax_scale_log2, &v_lse_temperature_scale, &v_return_softmax_lse, &v_return_temperature_lse};
 
-  static auto kernel = EmbedCubinModule_flashinfer_blackwell_vsa_head64_native_sm100_1b8fbf0974::Global()->mod.GetKernel("kernel_flashinfer_blackwell_vsa_head64_native_sm100");
+  static auto kernel = EmbedCubinModule_flashinfer_blackwell_vsa_head64_native_sm100_47359dbcd3::Global()->mod.GetKernel("kernel_flashinfer_blackwell_vsa_head64_native_sm100");
   static signed char cake_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = CakeConfigureDynamicSmem(
       kernel, (int)arg_q.device().device_id, 108928,
