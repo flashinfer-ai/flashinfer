@@ -15,8 +15,12 @@ The two trees are **separate backends**:
   either Hopper or Blackwell, never both, so this is not a practical limit.
 - drops are updated independently; never "sync" shared files across the trees.
 
-Current drop: kernel repo commit `1275b8b` ("Merge branch
-'vincent/hopper_megamoe' into 'main'", 2026-07).
+Current drop: kernel repo commit `c3e2c2a` ("Add token-based launch
+heuristics for Hopper FP8 MegaMoE", 2026-08), **minus commit `4f9c042`**
+("Add Green Context execution", reverted by decision — no
+`green_context.py`, no `execution_phase` kwarg, no `split_*` workspace
+regions / token_comm bodies).  Re-exclude that commit's content when
+syncing future drops.
 
 ## Layout
 

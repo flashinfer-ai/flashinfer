@@ -1,15 +1,18 @@
 """SM90 (Hopper) pull-style FP8 mega-MoE token-sweep benchmark.
 
 Reproduces the kernel drop's Hopper P03 multirank token sweep
-(``moe_hopper_fp8/run_token_sweep_benchmark.py`` at kernel commit ``1275b8b``)
-through the FlashInfer ``MoEEpLayer`` mega path, so results are directly
-comparable with the drop's reference CSVs
-(``moe_hopper_fp8/benchmark_data/20260720/
-20260720_multirank_{pertensor|blockwise}_{nonswapab|swapab}_TileM{M}_TileN{N}.csv``
-— same 4xH100 hardware, same vendored kernel).
+(``moe_hopper_fp8/run_token_sweep_benchmark.py``) through the FlashInfer
+``MoEEpLayer`` mega path, so results are directly comparable with the
+drop's reference CSVs.  By default each point uses the drop's token-bucket
+heuristic launch config, the drop's block-permutation balanced routing and
+perf data recipe, and a short pre-series cooldown — see TUNING.md for the
+methodology.  Fixed-layout runs
+(``--both-orders`` / ``--swap-ab`` / ``--no-swap-ab``) map to the drop's
+``20260720_multirank_{pertensor|blockwise}_{nonswapab|swapab}_TileM{M}_TileN{N}.csv``
+reference files.
 
 Geometry defaults (the drop's DSV4 P03 case; all are CLI flags):
-tokens/rank sweep 512..32768 (powers of two), topk=6, 384 total experts
+tokens/rank sweep 8..32768 (powers of two), topk=6, 384 total experts
 (EP4 -> 96 local), hidden=7168, intermediate=3072 (FI post-SwiGLU convention;
 the drop's ``INTERMEDIATE_GATEUP=6144`` is 2x), gate_up_clamp=10.0,
 kind=fp8_e4m3, 1xacc, load_balance_mode=atomic_counter and
@@ -34,7 +37,7 @@ Two timed series per point, CUDA events per rank around each call:
   ``last_timings_ms`` are split-layer only — so the compute series drives the
   documented ``MegaKernelBackend`` API directly; no private internals.)
 
-Launch (one process per GPU, 4xH100; srun+torchrun safe, no interactivity):
+Launch (one process per GPU, 4-rank EP; srun+torchrun safe, no interactivity):
 
     torchrun --nproc_per_node=4 benchmarks/bench_moe_ep_sm90_mega.py
 
@@ -65,7 +68,7 @@ sys.path[:] = [p for p in sys.path if os.path.abspath(p or os.getcwd()) != _here
 os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
 os.environ.setdefault("NVSHMEM_DISABLE_NVLS", "1")
 
-DEFAULT_TOKENS = (512, 1024, 2048, 4096, 8192, 16384, 32768)
+DEFAULT_TOKENS = tuple(1 << p for p in range(3, 16))  # 8 .. 32768
 E4M3_MAX = 448.0
 # Static per-tensor calibration scalars (identical on every EP rank by the
 # kernel's dequant contract) — same derivation as the multirank parity test:
@@ -79,8 +82,8 @@ FC2_ACT_SCALE = 8.0 / (0.95 * E4M3_MAX)
 DEFAULT_TILE = {"non_swap_ab": (64, 128), "swap_ab": (256, 32)}
 REF_DATE = "20260720"  # Vincent's reference run under benchmark_data/<date>/
 
-CSV_HEADER = (
-    "BENCH_CSV,kernel,scale_mode,operand_order,tile_m,tile_n,tile_k,"
+CSV_FIELDS = (
+    "kernel,scale_mode,operand_order,tile_m,tile_n,tile_k,"
     "tokens_per_rank,topk,world_size,total_experts,local_experts,hidden,"
     "intermediate_downproj,intermediate_gateup,warmup,iters,status,"
     "e2e_min_us,e2e_max_us,e2e_mean_us,e2e_median_us,"
@@ -88,6 +91,41 @@ CSV_HEADER = (
     "fc1_flops_per_rank,fc2_flops_per_rank,total_flops_per_rank,"
     "critical_tflops_compute,critical_tflops_e2e,tok_s_e2e,ref_csv"
 )
+CSV_HEADER = "BENCH_CSV," + CSV_FIELDS
+
+# Resolved launch-config columns appended to --output-csv rows (blank for
+# fixed-layout runs; filled from the shim's token-bucket table under
+# --heuristic so the file records what each point actually launched).
+HEUR_CSV_FIELDS = (
+    "heur_swap_ab,heur_pingpong,heur_tile_m,heur_tile_n,heur_tile_k,"
+    "heur_cga_m,heur_cga_n,heur_accum_mode,heur_token_bucket"
+)
+
+
+def _heuristic_cols(scale_mode: str, operand_order: str, tokens: int) -> list[str]:
+    """The launch config the shim resolves for this point (heuristic mode)."""
+    if operand_order != "heuristic":
+        return [""] * 9
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        bootstrap_paths,
+    )
+
+    bootstrap_paths()
+    from moe_hopper_fp8.heuristic_config import select_heuristic_config
+
+    sel = select_heuristic_config(scale_mode, tokens)
+    c = sel.config
+    return [
+        str(int(c.swap_ab)),
+        str(int(c.pingpong)),
+        str(c.mma_tiler_mnk[0]),
+        str(c.mma_tiler_mnk[1]),
+        str(c.mma_tiler_mnk[2]),
+        str(c.cluster_shape_mnk[0]),
+        str(c.cluster_shape_mnk[1]),
+        c.accum_mode,
+        str(sel.token_bucket),
+    ]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -128,9 +166,17 @@ def _parse_args() -> argparse.Namespace:
         const="heuristic",
         help="leave swap_ab/pingpong/mma_tiler/cluster unset so the shim "
         "resolves the drop's token-bucket heuristic table per point "
-        "(moe_hopper_fp8/heuristic_config.py)",
+        "(moe_hopper_fp8/heuristic_config.py).  This is the default.",
     )
-    p.set_defaults(operand_order="both")
+    order.add_argument(
+        "--both-orders",
+        dest="operand_order",
+        action="store_const",
+        const="both",
+        help="sweep both fixed layouts (non-swap then swap-AB) instead of "
+        "the heuristic selection",
+    )
+    p.set_defaults(operand_order="heuristic")
     p.add_argument(
         "--mma-tiler",
         type=str,
@@ -168,6 +214,37 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=20)
+    p.add_argument(
+        "--no-sparse-data",
+        dest="use_sparse_data",
+        action="store_false",
+        help="use dense quantized-randn fp8 payloads (realistic model "
+        "data) instead of the default drop-harness perf recipe (weights: "
+        "positive-only random E4M3 bytes; activations: uniform random "
+        "finite E4M3 bytes).",
+    )
+    p.set_defaults(use_sparse_data=True)
+    p.add_argument(
+        "--output-csv",
+        type=str,
+        default="auto",
+        metavar="PATH",
+        help="also write the BENCH_CSV rows to this file (rank 0 only), "
+        "with the resolved heuristic launch-config columns appended "
+        "(blank in fixed-layout modes).  Default 'auto' writes to "
+        "benchmark_data/<date>/<date>_<time>_mega_sm90_<order>_<scale>.csv "
+        "under the SM90 kernel tree (directories created as needed); "
+        "pass 'none' to disable.",
+    )
+    p.add_argument(
+        "--cooldown-s",
+        type=float,
+        default=5.0,
+        help="idle the GPUs this many seconds before each timed series so "
+        "clocks recover from power capping, mirroring the near-idle "
+        "process-startup window the drop's process-per-case sweep gets "
+        "before each timed burst.  Pass 0 to disable.",
+    )
     return p.parse_args()
 
 
@@ -201,18 +278,37 @@ def _balanced_routing(
     rank: int,
     world_size: int,
     device,
+    seed: int = 1234,
 ):
-    """Deterministic balanced routing (the drop's 'balanced' distribution spirit).
+    """The drop runner's ``_generate_topk_idx_balanced`` (block-permutation).
 
-    Consecutive experts per row (distinct within a row since topk <
-    num_experts), globally even per-expert counts, rotated per rank so every
-    rank exercises cross-rank dispatch to every peer.
+    Each source rank is partitioned into padded blocks of ``num_experts``
+    consecutive tokens; within a block every top-k column walks a random
+    expert permutation at a distinct offset, so a token's K experts are
+    pairwise distinct and scatter uniformly across target ranks.  Same
+    generation for all ranks from one seed, then each rank takes its slice.
+    The routing shape affects kernel time, so the drop algorithm is
+    replicated verbatim for CSV comparability.
     """
+    import numpy as np
     import torch
 
-    flat = torch.arange(num_tokens * topk, device=device, dtype=torch.int64)
-    ids = (flat + rank * (num_experts // world_size)) % num_experts
-    return ids.view(num_tokens, topk)
+    rng = np.random.default_rng(seed)
+    padded = (num_tokens + num_experts - 1) // num_experts * num_experts
+    num_blocks = padded // num_experts
+    expert_permutations = rng.random((world_size, num_blocks, num_experts)).argsort(
+        axis=-1
+    )
+    topk_offsets = rng.random((world_size, num_blocks, num_experts)).argsort(axis=-1)[
+        ..., :topk
+    ]
+    token_offsets = np.arange(num_experts)[None, None, :, None]
+    expert_indices = (token_offsets + topk_offsets[:, :, None, :]) % num_experts
+    topk_blocks = np.take_along_axis(
+        expert_permutations[..., None], expert_indices, axis=2
+    )
+    ids = topk_blocks.reshape(world_size, padded, topk)[rank, :num_tokens, :]
+    return torch.from_numpy(ids.astype("int64")).to(device)
 
 
 def _make_point_inputs(args, tokens: int, rank: int, world_size: int, device):
@@ -327,6 +423,26 @@ def _time_calls(call, *, warmup: int, iters: int) -> list[float]:
     return samples
 
 
+def _cooldown(seconds: float) -> None:
+    """Idle the GPUs so clocks recover before the next timed series.
+
+    Drain all work first, then host-sleep with the device idle; the trailing
+    barrier re-aligns ranks so no rank starts its timed series against peers
+    still sleeping.
+    """
+    import time
+
+    import torch
+    import torch.distributed as dist
+
+    if seconds <= 0:
+        return
+    torch.cuda.synchronize()
+    dist.barrier()
+    time.sleep(seconds)
+    dist.barrier()
+
+
 def _is_oom(exc: BaseException) -> bool:
     import torch
 
@@ -372,6 +488,10 @@ def _run_point(
         transformed = _make_transformed_weights(
             args, scale_mode, local_experts, rank, device
         )
+        if args.use_sparse_data:
+            # Drop perf recipe for weights: positive-only random E4M3 bytes.
+            for tw in (transformed[0][0], transformed[1][0]):
+                tw.view(torch.uint8).random_(0, 127)
         hidden_states, topk_ids, topk_weights = _make_point_inputs(
             args, tokens, rank, world_size, device
         )
@@ -403,6 +523,7 @@ def _run_point(
         )
 
         # --- series 1: FI e2e (validate + stage + kernel + output copy) ---
+        _cooldown(args.cooldown_s)
         e2e = _time_calls(
             lambda: layer.forward(t), warmup=args.warmup, iters=args.iters
         )
@@ -417,6 +538,13 @@ def _run_point(
         bench_backend.bind_ep_bootstrap(bootstrap)
         bench_workspace = bench_backend.prepare_workspace(bootstrap, fleet_params)
         bench_backend.stage_inputs(t, bench_workspace, quantize_input=True)
+        if args.use_sparse_data:
+            # Drop perf recipe for activations: replace the staged fp8
+            # payload with uniform random finite E4M3 bytes (127=nan skipped).
+            xb = bench_workspace.x.view(torch.uint8)
+            idx = torch.randint(0, 254, xb.shape, device=xb.device, dtype=torch.int16)
+            xb.copy_(torch.where(idx < 127, idx, idx + 1).to(torch.uint8))
+        _cooldown(args.cooldown_s)
         compute = _time_calls(
             lambda: bench_backend.compute(bench_workspace, transformed, output=None),
             warmup=args.warmup,
@@ -508,6 +636,7 @@ def _emit_row(
     world_size: int,
     result: PointResult,
     header_done: bool,
+    csv_file=None,
 ) -> None:
     fc1, fc2, total = _flops_per_rank(
         tokens, args.top_k, args.hidden, args.intermediate
@@ -515,48 +644,56 @@ def _emit_row(
     ref_csv = _ref_csv_name(scale_mode, operand_order, tile)
     if not header_done:
         print(CSV_HEADER, flush=True)
-    if result.status != "pass":
-        print(
-            f"BENCH_CSV,sm90_fp8_fp8_bf16_pull_cutedsl,{scale_mode},{operand_order},{tile[0]},{tile[1]},128,"
-            f"{tokens},{args.top_k},{world_size},{args.num_experts},"
-            f"{args.num_experts // world_size},{args.hidden},{args.intermediate},"
-            f"{2 * args.intermediate},{args.warmup},{args.iters},{result.status},"
-            + ",".join(["nan"] * 8)
-            + f",{fc1},{fc2},{total},nan,nan,nan,{ref_csv}",
-            flush=True,
-        )
-        if result.error:
-            print(f"# SKIP detail: {result.error}", flush=True)
-        return
+        if csv_file is not None:
+            csv_file.write(f"{CSV_FIELDS},{HEUR_CSV_FIELDS}\n")
 
-    e2e_min, e2e_max, e2e_mean = (
-        min(result.e2e_us),
-        max(result.e2e_us),
-        fmean(result.e2e_us),
-    )
-    c_min, c_max, c_mean = (
-        min(result.compute_us),
-        max(result.compute_us),
-        fmean(result.compute_us),
-    )
-    e2e_med = fmean(result.e2e_median_us)
-    c_med = fmean(result.compute_median_us)
-    # Critical-path conventions: TFLOPS over the SLOWEST rank (the drop's
-    # critical_tflops_per_rank = total_flops / max_mega_us), tok/s over the
-    # slowest rank's e2e.
-    tflops_c = _tflops(total, c_max)
-    tflops_e2e = _tflops(total, e2e_max)
-    tok_s = tokens * world_size / (e2e_max * 1e-6)
-    print(
-        f"BENCH_CSV,sm90_fp8_fp8_bf16_pull_cutedsl,{scale_mode},{operand_order},{tile[0]},{tile[1]},128,"
+    prefix = (
+        f"sm90_fp8_fp8_bf16_pull_cutedsl,{scale_mode},{operand_order},"
+        f"{tile[0]},{tile[1]},128,"
         f"{tokens},{args.top_k},{world_size},{args.num_experts},"
         f"{args.num_experts // world_size},{args.hidden},{args.intermediate},"
-        f"{2 * args.intermediate},{args.warmup},{args.iters},pass,"
-        f"{e2e_min:.2f},{e2e_max:.2f},{e2e_mean:.2f},{e2e_med:.2f},"
-        f"{c_min:.2f},{c_max:.2f},{c_mean:.2f},{c_med:.2f},"
-        f"{fc1},{fc2},{total},{tflops_c:.2f},{tflops_e2e:.2f},{tok_s:.1f},{ref_csv}",
-        flush=True,
+        f"{2 * args.intermediate},{args.warmup},{args.iters}"
     )
+    if result.status != "pass":
+        row = (
+            f"{prefix},{result.status},"
+            + ",".join(["nan"] * 8)
+            + f",{fc1},{fc2},{total},nan,nan,nan,{ref_csv}"
+        )
+    else:
+        e2e_min, e2e_max, e2e_mean = (
+            min(result.e2e_us),
+            max(result.e2e_us),
+            fmean(result.e2e_us),
+        )
+        c_min, c_max, c_mean = (
+            min(result.compute_us),
+            max(result.compute_us),
+            fmean(result.compute_us),
+        )
+        e2e_med = fmean(result.e2e_median_us)
+        c_med = fmean(result.compute_median_us)
+        # Critical-path conventions: TFLOPS over the SLOWEST rank (the drop's
+        # critical_tflops_per_rank = total_flops / max_mega_us), tok/s over
+        # the slowest rank's e2e.
+        tflops_c = _tflops(total, c_max)
+        tflops_e2e = _tflops(total, e2e_max)
+        tok_s = tokens * world_size / (e2e_max * 1e-6)
+        row = (
+            f"{prefix},pass,"
+            f"{e2e_min:.2f},{e2e_max:.2f},{e2e_mean:.2f},{e2e_med:.2f},"
+            f"{c_min:.2f},{c_max:.2f},{c_mean:.2f},{c_med:.2f},"
+            f"{fc1},{fc2},{total},{tflops_c:.2f},{tflops_e2e:.2f},"
+            f"{tok_s:.1f},{ref_csv}"
+        )
+
+    print(f"BENCH_CSV,{row}", flush=True)
+    if result.status != "pass" and result.error:
+        print(f"# SKIP detail: {result.error}", flush=True)
+    if csv_file is not None:
+        heur = _heuristic_cols(scale_mode, operand_order, tokens)
+        csv_file.write(row + "," + ",".join(heur) + "\n")
+        csv_file.flush()
 
 
 def main() -> int:
@@ -587,7 +724,7 @@ def main() -> int:
     if world_size != 4 and rank == 0:
         print(
             f"# note: world_size={world_size}; the drop reference CSVs are "
-            "EP4 (4xH100) — numbers are only directly comparable at 4 ranks.",
+            "EP4 — numbers are only directly comparable at 4 ranks.",
             flush=True,
         )
 
@@ -614,6 +751,28 @@ def main() -> int:
     )
 
     header_done = False
+    csv_file = None
+    if rank == 0 and args.output_csv and args.output_csv.lower() != "none":
+        csv_path = args.output_csv
+        if csv_path == "auto":
+            import datetime as _dt
+
+            now = _dt.datetime.now()
+            csv_path = os.path.join(
+                os.path.dirname(_here),
+                "flashinfer",
+                "moe_ep",
+                "kernel_src",
+                "sm90",
+                "pull_style_cutedsl_megakernel",
+                "benchmark_data",
+                now.strftime("%Y%m%d"),
+                f"{now.strftime('%Y%m%d_%H%M%S')}_mega_sm90_"
+                f"{args.operand_order}_{args.scale_mode}.csv",
+            )
+        os.makedirs(os.path.dirname(os.path.abspath(csv_path)), exist_ok=True)
+        csv_file = open(csv_path, "w")
+        print(f"# output_csv: {csv_path}", flush=True)
     try:
         for scale_mode in scale_modes:
             for operand_order in orders:
@@ -639,9 +798,12 @@ def main() -> int:
                             world_size=world_size,
                             result=result,
                             header_done=header_done,
+                            csv_file=csv_file,
                         )
                         header_done = True
     finally:
+        if csv_file is not None:
+            csv_file.close()
         finalize_moe_ep_runtime(runtime)
         dist.barrier()
         dist.destroy_process_group()
