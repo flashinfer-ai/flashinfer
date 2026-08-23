@@ -1497,6 +1497,8 @@ def test_paged_decode_extreme_negative_logits(dtype):
     # valid keys whose raw scores (-524288) sit far below the historical -5e4
     # sentinel.
     num_qo_heads, num_kv_heads, head_dim = 32, 4, 128
+    if dtype is torch.bfloat16 and get_compute_capability(torch.device("cuda"))[0] < 8:
+        pytest.skip("BF16 requires SM80+")
     page_size, num_pages = 1, 17
     sm_scale = 1.0 / math.sqrt(head_dim)
     q = torch.full((1, num_qo_heads, head_dim), 64.0, dtype=dtype, device="cuda")
