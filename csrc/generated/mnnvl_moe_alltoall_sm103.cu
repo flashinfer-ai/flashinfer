@@ -176,7 +176,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
         __syncthreads();
         if (num_payloads > 0) {
             unsigned long long source_base = (unsigned long long)local_token_idx * (unsigned long long)payload_0_bytes;
-            if (payload_0_bytes % 16 == 0) {
+            if (payload_0_bytes % 16 == 0 && payload_0_offset % 16 == 0) {
                 int* payload_i32 = reinterpret_cast<int*>(payload_0);
                 int* workspace_i32_0 = reinterpret_cast<int*>(workspace);
                 #pragma unroll 1
@@ -220,7 +220,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
         }
         if (num_payloads > 1) {
             unsigned long long source_base_1 = (unsigned long long)local_token_idx * (unsigned long long)payload_1_bytes;
-            if (payload_1_bytes % 16 == 0) {
+            if (payload_1_bytes % 16 == 0 && payload_1_offset % 16 == 0) {
                 int* payload_i32_1 = reinterpret_cast<int*>(payload_1);
                 int* workspace_i32_0_1 = reinterpret_cast<int*>(workspace);
                 #pragma unroll 1
@@ -264,7 +264,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
         }
         if (num_payloads > 2) {
             unsigned long long source_base_2 = (unsigned long long)local_token_idx * (unsigned long long)payload_2_bytes;
-            if (payload_2_bytes % 16 == 0) {
+            if (payload_2_bytes % 16 == 0 && payload_2_offset % 16 == 0) {
                 int* payload_i32_2 = reinterpret_cast<int*>(payload_2);
                 int* workspace_i32_0_2 = reinterpret_cast<int*>(workspace);
                 #pragma unroll 1
@@ -308,7 +308,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
         }
         if (num_payloads > 3) {
             unsigned long long source_base_3 = (unsigned long long)local_token_idx * (unsigned long long)payload_3_bytes;
-            if (payload_3_bytes % 16 == 0) {
+            if (payload_3_bytes % 16 == 0 && payload_3_offset % 16 == 0) {
                 int* payload_i32_3 = reinterpret_cast<int*>(payload_3);
                 int* workspace_i32_0_3 = reinterpret_cast<int*>(workspace);
                 #pragma unroll 1
@@ -352,7 +352,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
         }
         if (num_payloads > 4) {
             unsigned long long source_base_4 = (unsigned long long)local_token_idx * (unsigned long long)payload_4_bytes;
-            if (payload_4_bytes % 16 == 0) {
+            if (payload_4_bytes % 16 == 0 && payload_4_offset % 16 == 0) {
                 int* payload_i32_4 = reinterpret_cast<int*>(payload_4);
                 int* workspace_i32_0_4 = reinterpret_cast<int*>(workspace);
                 #pragma unroll 1
@@ -396,7 +396,7 @@ kernel_flashinfer_mnnvl_moe_alltoall_dispatch(int* __restrict__ token_selected_e
         }
         if (num_payloads > 5) {
             unsigned long long source_base_5 = (unsigned long long)local_token_idx * (unsigned long long)payload_5_bytes;
-            if (payload_5_bytes % 16 == 0) {
+            if (payload_5_bytes % 16 == 0 && payload_5_offset % 16 == 0) {
                 int* payload_i32_5 = reinterpret_cast<int*>(payload_5);
                 int* workspace_i32_0_5 = reinterpret_cast<int*>(workspace);
                 #pragma unroll 1
