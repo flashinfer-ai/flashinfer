@@ -39,13 +39,17 @@ class TestSm90PullFp8Config:
         assert cfg.kind == "fp8_e4m3"
         assert cfg.fp8_scale_mode == "per_tensor"
         assert cfg.fp8_accum_mode == "1xacc"
-        assert cfg.swap_ab is False
+        # Geometry knobs default to None = drop-driver token heuristics.
+        assert cfg.swap_ab is None
+        assert cfg.pingpong is None
         assert cfg.mma_tiler_mnk is None
+        assert cfg.cluster_shape_mnk is None
         assert cfg.load_balance_mode == "static"
         assert cfg.gate_up_clamp is None
         assert cfg.fast_math is True
         assert cfg.in_kernel_fc2_reduce is False
         assert cfg.token_back_by_dispatch is False
+        assert cfg.token_back_mode is None
         assert cfg.fc1_activation_dequant_scale == 1.0
         assert cfg.fc2_activation_dequant_scale == 1.0
         # PORT NOTE contract: no knobs field until the sm90 tree grows a tuner.

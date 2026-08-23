@@ -18,6 +18,7 @@
 # Usage:
 #   bash moe_hopper_fp8/run_perf_test.sh --scale-mode per-tensor
 #   bash moe_hopper_fp8/run_perf_test.sh --scale-mode blockwise --swapab
+#   bash moe_hopper_fp8/run_perf_test.sh --scale-mode per-tensor --pingpong P03
 #   bash moe_hopper_fp8/run_perf_test.sh --list
 #   bash moe_hopper_fp8/run_perf_test.sh P01
 #   PERF_WARMUP=3 PERF_ITERS=30 bash moe_hopper_fp8/run_perf_test.sh mega
@@ -27,6 +28,7 @@
 #   each invocation runs one scale mode; default is per-tensor.
 #   --swapab selects swap-AB; without it, the test uses non-swap.
 #   FP8_ACCUM_MODE=2xacc bash ... --scale-mode per-tensor    # compare accumulation
+#   FP8_CLUSTER_SHAPE=2,2,1 bash ... --scale-mode per-tensor P01 P02
 #   FP8_NON_SWAP_M=64 FP8_NON_SWAP_N=128 bash .../run_perf_test.sh P01 P02
 #   FP8_SWAP_AB_M=256 FP8_SWAP_AB_N=32 bash .../run_perf_test.sh --swapab P01
 
@@ -59,6 +61,7 @@ fi
 
 SCALE_MODE="${FP8_SCALE_MODE:-per_tensor}"
 SWAP_AB=0
+PINGPONG=0
 LIST_ONLY=0
 declare -a SELECTORS=()
 while [ "$#" -gt 0 ]; do
@@ -73,6 +76,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --swapab)
             SWAP_AB=1
+            shift
+            ;;
+        --pingpong)
+            PINGPONG=1
             shift
             ;;
         --list)
@@ -130,6 +137,16 @@ fi
 # world_size=4 with total_experts=384 without launching 4 ranks.
 DSV4_SINGLE_MEGA_TOTAL_EXPERTS="${DSV4_SINGLE_MEGA_TOTAL_EXPERTS:-$DSV4_LOCAL_EXPERTS}"
 
+FP8_CLUSTER_SHAPE="${FP8_CLUSTER_SHAPE:-1,1,1}"
+case "$FP8_CLUSTER_SHAPE" in
+    1,1,1|2,1,1|1,2,1|2,2,1)
+        ;;
+    *)
+        echo "ERROR: FP8_CLUSTER_SHAPE must be 1,1,1, 2,1,1, 1,2,1, or 2,2,1" >&2
+        exit 2
+        ;;
+esac
+
 if [ "$SWAP_AB" -eq 1 ]; then
     FP8_SWAP_AB_M="${FP8_SWAP_AB_M:-256}"
     case "$FP8_SWAP_AB_M" in
@@ -149,7 +166,11 @@ if [ "$SWAP_AB" -eq 1 ]; then
             exit 2
             ;;
     esac
-    TILE_ARGS="--swap_ab --mma_tiler_mnk ${FP8_SWAP_AB_M},${FP8_SWAP_AB_N},128 --cluster_shape_mnk 1,1,1"
+    TILE_ARGS="--swap_ab --mma_tiler_mnk ${FP8_SWAP_AB_M},${FP8_SWAP_AB_N},128 --cluster_shape_mnk ${FP8_CLUSTER_SHAPE}"
+    if [ "$PINGPONG" -eq 1 ] && [ "$FP8_SWAP_AB_M" -ne 128 ]; then
+        echo "ERROR: swap-AB ping-pong requires FP8_SWAP_AB_M=128" >&2
+        exit 2
+    fi
 else
     FP8_NON_SWAP_M="${FP8_NON_SWAP_M:-64}"
     case "$FP8_NON_SWAP_M" in
@@ -169,7 +190,14 @@ else
             exit 2
             ;;
     esac
-    TILE_ARGS="--mma_tiler_mnk ${FP8_NON_SWAP_M},${FP8_NON_SWAP_N},128 --cluster_shape_mnk 1,1,1"
+    TILE_ARGS="--mma_tiler_mnk ${FP8_NON_SWAP_M},${FP8_NON_SWAP_N},128 --cluster_shape_mnk ${FP8_CLUSTER_SHAPE}"
+    if [ "$PINGPONG" -eq 1 ] && [ "$FP8_NON_SWAP_N" -ne 128 ]; then
+        echo "ERROR: non-swap ping-pong requires FP8_NON_SWAP_N=128" >&2
+        exit 2
+    fi
+fi
+if [ "$PINGPONG" -eq 1 ]; then
+    TILE_ARGS="--pingpong $TILE_ARGS"
 fi
 COMMON_KIND_ARGS="--kind fp8_e4m3"
 COMMON_PERF_ARGS="--perf_run --skip_ref_check"
@@ -179,6 +207,38 @@ case "$FP8_ACCUM_MODE" in
         ;;
     *)
         echo "ERROR: unsupported FP8 accumulation mode '$FP8_ACCUM_MODE'" >&2
+        exit 2
+        ;;
+esac
+
+# MegaMoE combine (fc2 output) surface, mirroring the NVFP4 naming.  P01 is
+# the standalone fc12 runner and has no token communication, so it ignores
+# both knobs and is combine-mode invariant.
+#   FP8_TOKEN_BACK_MODE : who performs the cross-rank fc2 write-back.
+#     epi_warps            - fc2 epilogue STG/REDG straight to the source rank
+#     reuse_dispatch_warps - stage locally, dispatch warps push (default)
+#     standalone_warps     - stage locally, four dedicated warps push
+#   FP8_IN_KERNEL_REDUCE : 1 collapses topk in kernel (epi_warps REDG or the
+#     dispatch modes' cp.reduce bulk push); 0 runs the separate TopkReduce.
+FP8_TOKEN_BACK_MODE="${FP8_TOKEN_BACK_MODE:-reuse_dispatch_warps}"
+case "$FP8_TOKEN_BACK_MODE" in
+    epi_warps|standalone_warps|reuse_dispatch_warps)
+        ;;
+    *)
+        echo "ERROR: unsupported FP8 token-back mode '$FP8_TOKEN_BACK_MODE'" >&2
+        exit 2
+        ;;
+esac
+FP8_IN_KERNEL_REDUCE="${FP8_IN_KERNEL_REDUCE:-0}"
+MEGA_COMBINE_ARGS="--token_back_mode $FP8_TOKEN_BACK_MODE"
+case "$FP8_IN_KERNEL_REDUCE" in
+    1)
+        MEGA_COMBINE_ARGS="$MEGA_COMBINE_ARGS --in_kernel_fc2_reduce"
+        ;;
+    0)
+        ;;
+    *)
+        echo "ERROR: FP8_IN_KERNEL_REDUCE must be 0 or 1" >&2
         exit 2
         ;;
 esac
@@ -278,8 +338,11 @@ print_config() {
     echo "  intermediate_downproj  : $DSV4_INTERMEDIATE_DOWNPROJ"
     echo "  gate_up_clamp          : ${DSV4_GATE_UP_CLAMP:-off}"
     echo "  fp8_scale_mode         : $SCALE_MODE"
+    echo "  token_back_mode        : $FP8_TOKEN_BACK_MODE"
+    echo "  in_kernel_reduce       : $FP8_IN_KERNEL_REDUCE"
     echo "  swap_ab                : $SWAP_AB"
     echo "  fp8_accum_mode         : $FP8_ACCUM_MODE"
+    echo "  cluster_shape_mnk      : $FP8_CLUSTER_SHAPE"
     echo "  route_rows             : $DSV4_ROUTE_ROWS"
     echo "  mega perf warmup/iters : $PERF_WARMUP / $PERF_ITERS"
     echo "  fc12 perf warmup/iters: $FC12_WARMUP / $FC12_ITERS"
@@ -300,9 +363,9 @@ run_fc12_case() {
 run_mega_single_case() {
     local args="$1"
     local scale_mode="$2"
-    echo "[CMD] timeout $TIMEOUT_SECONDS env MEGA_NO_DIST=1 $PYTHON $MEGA_RUNNER $args --fp8_scale_mode $scale_mode --fp8_accum_mode $FP8_ACCUM_MODE"
+    echo "[CMD] timeout $TIMEOUT_SECONDS env MEGA_NO_DIST=1 $PYTHON $MEGA_RUNNER $args --fp8_scale_mode $scale_mode --fp8_accum_mode $FP8_ACCUM_MODE $MEGA_COMBINE_ARGS"
     # shellcheck disable=SC2086
-    timeout "$TIMEOUT_SECONDS" env MEGA_NO_DIST=1 "$PYTHON" "$MEGA_RUNNER" $args --fp8_scale_mode "$scale_mode" --fp8_accum_mode "$FP8_ACCUM_MODE"
+    timeout "$TIMEOUT_SECONDS" env MEGA_NO_DIST=1 "$PYTHON" "$MEGA_RUNNER" $args --fp8_scale_mode "$scale_mode" --fp8_accum_mode "$FP8_ACCUM_MODE" $MEGA_COMBINE_ARGS
 }
 
 run_mega_multi_case() {
@@ -324,9 +387,9 @@ run_mega_multi_case() {
         fi
     fi
 
-    echo "[CMD] timeout $TIMEOUT_SECONDS torchrun --standalone --nproc_per_node=$nproc $MEGA_RUNNER $args --fp8_scale_mode $scale_mode --fp8_accum_mode $FP8_ACCUM_MODE"
+    echo "[CMD] timeout $TIMEOUT_SECONDS torchrun --standalone --nproc_per_node=$nproc $MEGA_RUNNER $args --fp8_scale_mode $scale_mode --fp8_accum_mode $FP8_ACCUM_MODE $MEGA_COMBINE_ARGS"
     # shellcheck disable=SC2086
-    timeout "$TIMEOUT_SECONDS" torchrun --standalone --nproc_per_node="$nproc" "$MEGA_RUNNER" $args --fp8_scale_mode "$scale_mode" --fp8_accum_mode "$FP8_ACCUM_MODE"
+    timeout "$TIMEOUT_SECONDS" torchrun --standalone --nproc_per_node="$nproc" "$MEGA_RUNNER" $args --fp8_scale_mode "$scale_mode" --fp8_accum_mode "$FP8_ACCUM_MODE" $MEGA_COMBINE_ARGS
 }
 
 if [ "$LIST_ONLY" -eq 1 ]; then

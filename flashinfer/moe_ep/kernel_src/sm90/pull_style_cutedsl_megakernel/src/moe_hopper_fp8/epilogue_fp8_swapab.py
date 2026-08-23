@@ -28,6 +28,8 @@ from common.moe_utils import fmax
 from cutlass.cute.typing import Float32
 from moe_hopper_fp8.epilogue_fp8_common import (
     Fc2OutputDest,
+    consume_initial_pingpong_work,
+    consume_next_pingpong_work,
     clamp_and_swiglu_sm90,
     stg_fc1_block_scale_row,
     tma_store_fc1_output,
@@ -78,6 +80,7 @@ class SwapABFp8GluEpilogue:
         apply_topk_in_fc1: bool = False,
         token_back_by_dispatch: bool = False,
         epi_flag_batch: Union[int, Tuple[int, int]] = 1,
+        pingpong: bool = False,
     ) -> None:
         self.fc1_output_dtype = fc1_output_dtype
         self.fc1_output_layout = fc1_output_layout
@@ -95,7 +98,10 @@ class SwapABFp8GluEpilogue:
         self._fc1_store_sync_bar_id = fc1_store_sync_bar_id
         self._fc1_amax_sync_bar_id = fc1_amax_sync_bar_id
         self._epilogue_warp_ids = epilogue_warp_ids
+        self._pingpong = pingpong
+        self._pingpong_order = pingpong
         self._use_2cta_instrs = use_2cta_instrs
+        self._cluster_n = cluster_shape_mn[1]
 
         self._atom_thr_size = 1
         self._raw_cta_tile_m = mma_tiler_mnk[0]
@@ -108,9 +114,17 @@ class SwapABFp8GluEpilogue:
         self._epilogue_warpgroup_count = (
             len(epilogue_warp_ids) // EpiWarpCount
         )
-        self._wg_raw_tile_m = (
-            self._raw_cta_tile_m // self._epilogue_warpgroup_count
+        self._wgmma_fragment_count = self._raw_cta_tile_m // 128
+        expected_warpgroup_count = (
+            2 if self._pingpong else self._wgmma_fragment_count
         )
+        if self._epilogue_warpgroup_count != expected_warpgroup_count:
+            raise ValueError(
+                "Swap-AB epilogue warpgroup count does not match the selected "
+                f"scheduling mode; got {self._epilogue_warpgroup_count}, "
+                f"expected {expected_warpgroup_count}."
+            )
+        self._wg_raw_tile_m = 128
         self._wg_output_tile_m = self._wg_raw_tile_m // 2
         self._mma_tiler_k = mma_tiler_mnk[2]
         self._token_group_count = self._token_tile_n // 8
@@ -133,7 +147,9 @@ class SwapABFp8GluEpilogue:
         self._static_expert_shape = static_expert_shape
         if (
             static_expert_shape is not None
-            and static_expert_shape[2] % self._raw_cta_tile_m == 0
+            and static_expert_shape[2]
+            % (self._raw_cta_tile_m * cluster_shape_mn[0])
+            == 0
         ):
             self._fc2_stg_needs_predicate: bool = False
         else:
@@ -158,6 +174,15 @@ class SwapABFp8GluEpilogue:
             )
         self._epi_tile = (self._token_tile_n, self._wg_output_tile_m)
         self._subtile_cnt = self._epilogue_warpgroup_count
+        self._iket_fc1_epilogue_pt_range = (
+            f"swapab_fc1_epi_m{self._token_tile_n}n64_pt"
+        )
+        self._iket_fc1_epilogue_bw_range = (
+            f"swapab_fc1_epi_m{self._token_tile_n}n64_bw"
+        )
+        self._iket_fc2_epilogue_range = (
+            f"swapab_fc2_epi_m{self._token_tile_n}n128"
+        )
 
         self._fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
         self._apply_topk_in_fc1 = apply_topk_in_fc1
@@ -234,9 +259,11 @@ class SwapABFp8GluEpilogue:
         gmem_topk_scores: cute.Tensor,
         local_warp_idx: int,
         tidx,
+        _iket_active,
         fc1_act_weight_dequant_scale,
         fc2_act_dequant_scale,
         norm_const,
+        storage_group_idx,
     ) -> None:
         """Dispatch the FC1 epilogue for one completed WGMMA task tile."""
         if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
@@ -253,6 +280,8 @@ class SwapABFp8GluEpilogue:
                 gmem_topk_scores=gmem_topk_scores,
                 local_warp_idx=local_warp_idx,
                 tidx=tidx,
+                _iket_active=_iket_active,
+                storage_group_idx=storage_group_idx,
             )
         else:
             self._run_fc1_epilogue_per_tensor(
@@ -267,9 +296,11 @@ class SwapABFp8GluEpilogue:
                 gmem_topk_scores=gmem_topk_scores,
                 local_warp_idx=local_warp_idx,
                 tidx=tidx,
+                _iket_active=_iket_active,
                 fc1_act_weight_dequant_scale=fc1_act_weight_dequant_scale,
                 fc2_act_dequant_scale=fc2_act_dequant_scale,
                 norm_const=norm_const,
+                storage_group_idx=storage_group_idx,
             )
 
 
@@ -372,9 +403,11 @@ class SwapABFp8GluEpilogue:
         gmem_topk_scores: cute.Tensor,
         local_warp_idx: int,
         tidx,
+        _iket_active,
         fc1_act_weight_dequant_scale,
         fc2_act_dequant_scale,
         norm_const,
+        storage_group_idx,
     ) -> None:
         """Fold two M64 fragments into one WG-private Nx64 FP8 tile."""
         # Inner epilogue IKET range for swap-AB, FP8 per-tensor FC1. WGMMA has
@@ -383,12 +416,14 @@ class SwapABFp8GluEpilogue:
         # RMEM-to-SMEM stores. Final TMA store issue remains in the enclosing
         # swapab_fc1_task_pt range; its later async completion
         # wait is outside the task-tile range.
-        iket.range_push("swapab_fc1_epi_pt")
+        if _iket_active:
+            iket.range_push(self._iket_fc1_epilogue_pt_range)
         real_topk_scores, _ = sched_ext.get_gmem_tensor(
             "topk", gmem_topk_scores, work_tile_info,
         )
         sC_stage = cute.slice_(
-            smem_fc1_output_buffer, (None, None, cutlass.Int32(n_half))
+            smem_fc1_output_buffer,
+            (None, None, cutlass.Int32(storage_group_idx)),
         )
         output_rcp = Float32(1.0) / fc2_act_dequant_scale
         token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
@@ -407,7 +442,8 @@ class SwapABFp8GluEpilogue:
                 real_topk_scores=real_topk_scores,
                 token_tile_base=token_tile_base,
             )
-        iket.range_pop()  # swapab_fc1_epi_pt
+        if _iket_active:
+            iket.range_pop()  # swapab_fc1_epi_m{token_tile_n}n64_pt
 
     @cute.jit
     def _fill_fc1_swiglu_chunk_swapab_blockwise(
@@ -695,6 +731,8 @@ class SwapABFp8GluEpilogue:
         gmem_topk_scores: cute.Tensor,
         local_warp_idx: int,
         tidx,
+        _iket_active,
+        storage_group_idx,
     ) -> None:
         """Process blockwise FC1 token groups in register-bounded chunks."""
         # Inner epilogue IKET range for swap-AB, DeepGEMM-style blockwise FC1.
@@ -702,7 +740,8 @@ class SwapABFp8GluEpilogue:
         # spans every register-bounded chunk, including gate/up fold, SwiGLU,
         # warpgroup amax reduction, scale publication, blockwise quantization,
         # and RMEM-to-SMEM stores. Final TMA store belongs to the outer task.
-        iket.range_push("swapab_fc1_epi_bw")
+        if _iket_active:
+            iket.range_push(self._iket_fc1_epilogue_bw_range)
         real_topk_scores, _ = sched_ext.get_gmem_tensor(
             "topk", gmem_topk_scores, work_tile_info,
         )
@@ -711,7 +750,7 @@ class SwapABFp8GluEpilogue:
         value_layout = cute.make_layout(2 * folded_values_per_chunk_m64)
         scale_layout = cute.make_layout(folded_values_per_chunk_m64)
         amax_bar = pipeline.NamedBarrier(
-            barrier_id=self._fc1_amax_sync_bar_id + n_half,
+            barrier_id=self._fc1_amax_sync_bar_id + storage_group_idx,
             num_threads=EpiWarpCount * WarpThreadCount,
         )
         scale_epsilon = Float32(1.0e-30)
@@ -721,11 +760,12 @@ class SwapABFp8GluEpilogue:
         )
         scale_col_idx = (
             work_tile_info.tile_m_idx
-            * cutlass.Int32(self._epilogue_warpgroup_count)
+            * cutlass.Int32(self._wgmma_fragment_count)
             + cutlass.Int32(n_half)
         )
         sC_stage = cute.slice_(
-            smem_fc1_output_buffer, (None, None, cutlass.Int32(n_half))
+            smem_fc1_output_buffer,
+            (None, None, cutlass.Int32(storage_group_idx)),
         )
         token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
             self._token_tile_n
@@ -749,7 +789,7 @@ class SwapABFp8GluEpilogue:
             )
             self._publish_fc1_amax_chunk_swapab_blockwise(
                 chunk_idx=chunk_idx,
-                n_half=n_half,
+                n_half=storage_group_idx,
                 local_warp_idx=local_warp_idx,
                 tidx=tidx,
                 r_swiglu=r_swiglu,
@@ -763,7 +803,7 @@ class SwapABFp8GluEpilogue:
             self._finalize_fc1_scale_chunk_swapab_blockwise(
                 work_tile_info=work_tile_info,
                 chunk_idx=chunk_idx,
-                n_half=n_half,
+                n_half=storage_group_idx,
                 local_warp_idx=local_warp_idx,
                 tidx=tidx,
                 smem_fc1_amax=smem_fc1_amax,
@@ -781,7 +821,8 @@ class SwapABFp8GluEpilogue:
                 r_scale=r_scale,
                 sC_stage=sC_stage,
             )
-        iket.range_pop()  # swapab_fc1_epi_bw
+        if _iket_active:
+            iket.range_pop()  # swapab_fc1_epi_m{token_tile_n}n64_bw
 
     @cute.jit
     def _store_fc1_task_tile(
@@ -793,6 +834,8 @@ class SwapABFp8GluEpilogue:
         gmem_fc1_output: cute.Tensor,
         local_warp_idx: int,
         n_half: cutlass.Constexpr,
+        storage_group_idx,
+        _iket_active,
     ) -> None:
         real_fc1_output, _ = sched_ext.get_gmem_tensor(
             "c", gmem_fc1_output, work_tile_info,
@@ -801,24 +844,30 @@ class SwapABFp8GluEpilogue:
         # Each M=128 WG folds to one contiguous output-channel block of 64.
         output_n_tile = (
             work_tile_info.tile_m_idx
-            * cutlass.Int32(self._epilogue_warpgroup_count)
+            * cutlass.Int32(self._wgmma_fragment_count)
             + cutlass.Int32(n_half)
         )
 
         cute.arch.fence_proxy("async.shared", space="cta")
         fc1_store_bar = pipeline.NamedBarrier(
-            barrier_id=self._fc1_store_sync_bar_id + n_half,
+            barrier_id=self._fc1_store_sync_bar_id + storage_group_idx,
             num_threads=EpiWarpCount * WarpThreadCount,
         )
+        if _iket_active:
+            iket.range_push("swapab_fc1_store_smem_barrier")
         fc1_store_bar.arrive_and_wait()
+        if _iket_active:
+            iket.range_pop()
 
         if local_warp_idx == cutlass.Int32(0):
-            stage_idx = cutlass.Int32(n_half)
+            stage_idx = cutlass.Int32(storage_group_idx)
             g_fc1_output_wg_view = cute.local_tile(
                 real_fc1_output,
                 (self._token_tile_n, Fc1EpilogueStoreTileN, 1),
                 (work_tile_info.tile_n_idx, output_n_tile, 0),
             )
+            if _iket_active:
+                iket.range_push("swapab_fc1_tma_store_issue")
             tma_store_fc1_output(
                 smem_fc1_output_buffer,
                 stage_idx,
@@ -826,6 +875,8 @@ class SwapABFp8GluEpilogue:
                 g_fc1_output_wg_view,
                 work_tile_info.valid_tokens_in_cta_tile,
             )
+            if _iket_active:
+                iket.range_pop()
 
     @cute.jit
     def _run_fc2_token_group_swapab(
@@ -977,6 +1028,7 @@ class SwapABFp8GluEpilogue:
         valid_hidden,
         local_warp_idx: int,
         tidx,
+        _iket_active,
         fc2_act_weight_dequant_scale,
         token_comm_args=None,
     ) -> None:
@@ -987,7 +1039,8 @@ class SwapABFp8GluEpilogue:
         # Inner epilogue IKET range for swap-AB FC2. WGMMA and any blockwise
         # accumulator scaling have already finished. This shared path converts
         # all token-group fragments to BF16 and performs token-major GMEM STG.
-        iket.range_push("swapab_fc2_epi")
+        if _iket_active:
+            iket.range_push(self._iket_fc2_epilogue_range)
 
         token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
             self._token_tile_n
@@ -1012,7 +1065,8 @@ class SwapABFp8GluEpilogue:
                 token_comm_args=token_comm_args,
             )
 
-        iket.range_pop()  # swapab_fc2_epi
+        if _iket_active:
+            iket.range_pop()  # swapab_fc2_epi_m{token_tile_n}n128
 
 
     @cute.jit
@@ -1046,7 +1100,19 @@ class SwapABFp8GluEpilogue:
         fc1_act_weight_dequant_scale,
         fc2_act_dequant_scale,
         norm_const,
+        storage_group_idx,
+        math_wg_order_barrier,
+        math_wg_order_state,
+        epi_wg_order_barrier,
+        epi_wg_order_state,
     ):
+        if cutlass.const_expr(self._pingpong_order):
+            if _iket_active:
+                iket.range_push("pp_swap_fc1_math_wait")
+            math_wg_order_barrier.wait(math_wg_order_state)
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("pp_swap_fc1_wgmma")
         ab_consumer_state = run_wgmma_task_tile(
             work_tile_info=work_tile_info,
             local_warp_idx=local_warp_idx,
@@ -1066,6 +1132,19 @@ class SwapABFp8GluEpilogue:
             _iket_active=_iket_active,
             tidx=tidx,
         )
+        if cutlass.const_expr(self._pingpong_order):
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("pp_swap_fc1_math_handoff")
+            math_wg_order_state = math_wg_order_barrier.arrive(
+                math_wg_order_state
+            )
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("pp_swap_fc1_epi_wait")
+            epi_wg_order_barrier.wait(epi_wg_order_state)
+            if _iket_active:
+                iket.range_pop()
         self._run_fc1_epilogue(
             work_tile_info=work_tile_info,
             accumulators=accumulators,
@@ -1079,11 +1158,13 @@ class SwapABFp8GluEpilogue:
             gmem_topk_scores=gmem_topk_scores,
             local_warp_idx=local_warp_idx,
             tidx=tidx,
+            _iket_active=_iket_active,
             fc1_act_weight_dequant_scale=fc1_act_weight_dequant_scale,
             fc2_act_dequant_scale=fc2_act_dequant_scale,
             norm_const=norm_const,
+            storage_group_idx=storage_group_idx,
         )
-        return ab_consumer_state
+        return ab_consumer_state, math_wg_order_state, epi_wg_order_state
 
     @cute.jit
     def _run_fc2_half_tile(
@@ -1110,8 +1191,19 @@ class SwapABFp8GluEpilogue:
         valid_hidden,
         tidx,
         fc2_act_weight_dequant_scale,
+        math_wg_order_barrier,
+        math_wg_order_state,
+        epi_wg_order_barrier,
+        epi_wg_order_state,
         token_comm_args=None,
     ):
+        if cutlass.const_expr(self._pingpong_order):
+            if _iket_active:
+                iket.range_push("pp_swap_fc2_math_wait")
+            math_wg_order_barrier.wait(math_wg_order_state)
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("pp_swap_fc2_wgmma")
         ab_consumer_state = run_wgmma_task_tile(
             work_tile_info=work_tile_info,
             local_warp_idx=local_warp_idx,
@@ -1131,6 +1223,19 @@ class SwapABFp8GluEpilogue:
             _iket_active=_iket_active,
             tidx=tidx,
         )
+        if cutlass.const_expr(self._pingpong_order):
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("pp_swap_fc2_math_handoff")
+            math_wg_order_state = math_wg_order_barrier.arrive(
+                math_wg_order_state
+            )
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("pp_swap_fc2_epi_wait")
+            epi_wg_order_barrier.wait(epi_wg_order_state)
+            if _iket_active:
+                iket.range_pop()
         self._run_fc2_epilogue(
             work_tile_info=work_tile_info,
             accumulators=accumulators,
@@ -1140,10 +1245,11 @@ class SwapABFp8GluEpilogue:
             valid_hidden=valid_hidden,
             local_warp_idx=local_warp_idx,
             tidx=tidx,
+            _iket_active=_iket_active,
             fc2_act_weight_dequant_scale=fc2_act_weight_dequant_scale,
             token_comm_args=token_comm_args,
         )
-        return ab_consumer_state
+        return ab_consumer_state, math_wg_order_state, epi_wg_order_state
 
     @cute.jit
     def run(
@@ -1180,6 +1286,9 @@ class SwapABFp8GluEpilogue:
         k_tile_cnt_fc2,
         _iket_active,
         n_half,
+        warpgroup_idx,
+        math_wg_order_barrier,
+        epi_wg_order_barrier,
         token_comm_args=None,
     ) -> None:
         """
@@ -1189,37 +1298,74 @@ class SwapABFp8GluEpilogue:
         the fc2 STG is routed to the source rank's combine output.
         """
         task_tile_boundary_bar = pipeline.NamedBarrier(
-            barrier_id=self._epilog_sync_bar_id,
-            num_threads=WarpThreadCount * len(self._epilogue_warp_ids),
+            barrier_id=(
+                self._epilog_sync_bar_id + warpgroup_idx
+                if cutlass.const_expr(self._pingpong)
+                else self._epilog_sync_bar_id
+            ),
+            num_threads=(
+                EpiWarpCount * WarpThreadCount
+                if cutlass.const_expr(self._pingpong)
+                else WarpThreadCount * len(self._epilogue_warp_ids)
+            ),
         )
 
         valid_hidden = cutlass.Int32(gmem_fc2_output.shape[1])
-        work_tile_info = sched_consumer.consume_work()
+        if _iket_active:
+            iket.range_push("swapab_sched_consume_initial")
+        if cutlass.const_expr(self._pingpong):
+            (
+                sched_consumer,
+                work_tile_info,
+                ab_consumer_state,
+            ) = consume_initial_pingpong_work(
+                sched_consumer,
+                warpgroup_idx,
+                ab_consumer_state,
+                k_tile_cnt_fc1,
+                k_tile_cnt_fc2,
+            )
+        else:
+            work_tile_info = sched_consumer.consume_work()
+        if _iket_active:
+            iket.range_pop()
 
         flag_tracker = GpuReleaseFlagBatchTracker(
             flag_addr=Int64(0),
             cumulated_flags=cutlass.Int32(0),
             phase=cutlass.Int32(work_tile_info.phase),
-            tid=tidx % (len(self._epilogue_warp_ids) * WarpThreadCount),
+            tid=tidx % (
+                EpiWarpCount * WarpThreadCount
+                if self._pingpong
+                else len(self._epilogue_warp_ids) * WarpThreadCount
+            ),
         )
+        if cutlass.const_expr(self._pingpong):
+            math_wg_order_state = math_wg_order_barrier.state.clone()
+            epi_wg_order_state = epi_wg_order_barrier.state.clone()
+        else:
+            math_wg_order_state = ab_consumer_state.clone()
+            epi_wg_order_state = ab_consumer_state.clone()
 
         while work_tile_info.is_valid_tile:
-            # Outer task-tile range, emitted by every epilogue warp. It starts
+            # Outer task-tile range, emitted by local warp 0 of each epilogue
+            # warpgroup. It starts
             # before expert-scale setup and contains the representative WGMMA
-            # child range on local warp 0 plus epilogue child ranges on all
-            # four warps. FC1 also includes final TMA STG issue; async drain,
+            # child range plus that warp's representative epilogue child
+            # ranges. FC1 also includes final TMA STG issue; async drain,
             # task-boundary synchronization, and next-tile scheduling follow
             # after the matching pop below.
-            if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
-                if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
-                    iket.range_push("swapab_fc1_task_bw")
+            if _iket_active:
+                if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
+                    if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+                        iket.range_push("swapab_fc1_task_bw")
+                    else:
+                        iket.range_push("swapab_fc1_task_pt")
                 else:
-                    iket.range_push("swapab_fc1_task_pt")
-            else:
-                if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
-                    iket.range_push("swapab_fc2_task_bw")
-                else:
-                    iket.range_push("swapab_fc2_task_pt")
+                    if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+                        iket.range_push("swapab_fc2_task_bw")
+                    else:
+                        iket.range_push("swapab_fc2_task_pt")
 
             expert_idx = work_tile_info.expert_idx
             if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
@@ -1240,8 +1386,12 @@ class SwapABFp8GluEpilogue:
                 )
 
             if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
-                if cutlass.const_expr(self._epilogue_warpgroup_count == 1):
-                    ab_consumer_state = self._run_fc1_half_tile(
+                if cutlass.const_expr(self._wgmma_fragment_count == 1):
+                    (
+                        ab_consumer_state,
+                        math_wg_order_state,
+                        epi_wg_order_state,
+                    ) = self._run_fc1_half_tile(
                         work_tile_info=work_tile_info,
                         local_warp_idx=local_warp_idx,
                         tiled_mma=tiled_mma,
@@ -1270,6 +1420,13 @@ class SwapABFp8GluEpilogue:
                         fc2_act_dequant_scale=fc2_act_dequant_scale,
                         norm_const=norm_const,
                         run_wgmma_task_tile=run_wgmma_task_tile,
+                        storage_group_idx=(
+                            warpgroup_idx if self._pingpong else 0
+                        ),
+                        math_wg_order_barrier=math_wg_order_barrier,
+                        math_wg_order_state=math_wg_order_state,
+                        epi_wg_order_barrier=epi_wg_order_barrier,
+                        epi_wg_order_state=epi_wg_order_state,
                     )
                     self._store_fc1_task_tile(
                         work_tile_info=work_tile_info,
@@ -1279,9 +1436,17 @@ class SwapABFp8GluEpilogue:
                         gmem_fc1_output=gmem_fc1_output,
                         local_warp_idx=local_warp_idx,
                         n_half=0,
+                        storage_group_idx=(
+                            warpgroup_idx if self._pingpong else 0
+                        ),
+                        _iket_active=_iket_active,
                     )
                 elif n_half == cutlass.Int32(0):
-                    ab_consumer_state = self._run_fc1_half_tile(
+                    (
+                        ab_consumer_state,
+                        math_wg_order_state,
+                        epi_wg_order_state,
+                    ) = self._run_fc1_half_tile(
                         work_tile_info=work_tile_info,
                         local_warp_idx=local_warp_idx,
                         tiled_mma=tiled_mma,
@@ -1310,6 +1475,13 @@ class SwapABFp8GluEpilogue:
                         fc2_act_dequant_scale=fc2_act_dequant_scale,
                         norm_const=norm_const,
                         run_wgmma_task_tile=run_wgmma_task_tile,
+                        storage_group_idx=(
+                            warpgroup_idx if self._pingpong else 0
+                        ),
+                        math_wg_order_barrier=math_wg_order_barrier,
+                        math_wg_order_state=math_wg_order_state,
+                        epi_wg_order_barrier=epi_wg_order_barrier,
+                        epi_wg_order_state=epi_wg_order_state,
                     )
                     self._store_fc1_task_tile(
                         work_tile_info=work_tile_info,
@@ -1319,9 +1491,17 @@ class SwapABFp8GluEpilogue:
                         gmem_fc1_output=gmem_fc1_output,
                         local_warp_idx=local_warp_idx,
                         n_half=0,
+                        storage_group_idx=(
+                            warpgroup_idx if self._pingpong else 0
+                        ),
+                        _iket_active=_iket_active,
                     )
                 else:
-                    ab_consumer_state = self._run_fc1_half_tile(
+                    (
+                        ab_consumer_state,
+                        math_wg_order_state,
+                        epi_wg_order_state,
+                    ) = self._run_fc1_half_tile(
                         work_tile_info=work_tile_info,
                         local_warp_idx=local_warp_idx,
                         tiled_mma=tiled_mma,
@@ -1350,6 +1530,13 @@ class SwapABFp8GluEpilogue:
                         fc2_act_dequant_scale=fc2_act_dequant_scale,
                         norm_const=norm_const,
                         run_wgmma_task_tile=run_wgmma_task_tile,
+                        storage_group_idx=(
+                            warpgroup_idx if self._pingpong else 1
+                        ),
+                        math_wg_order_barrier=math_wg_order_barrier,
+                        math_wg_order_state=math_wg_order_state,
+                        epi_wg_order_barrier=epi_wg_order_barrier,
+                        epi_wg_order_state=epi_wg_order_state,
                     )
                     self._store_fc1_task_tile(
                         work_tile_info=work_tile_info,
@@ -1359,10 +1546,18 @@ class SwapABFp8GluEpilogue:
                         gmem_fc1_output=gmem_fc1_output,
                         local_warp_idx=local_warp_idx,
                         n_half=1,
+                        storage_group_idx=(
+                            warpgroup_idx if self._pingpong else 1
+                        ),
+                        _iket_active=_iket_active,
                     )
             else:
-                if cutlass.const_expr(self._epilogue_warpgroup_count == 1):
-                    ab_consumer_state = self._run_fc2_half_tile(
+                if cutlass.const_expr(self._wgmma_fragment_count == 1):
+                    (
+                        ab_consumer_state,
+                        math_wg_order_state,
+                        epi_wg_order_state,
+                    ) = self._run_fc2_half_tile(
                         work_tile_info=work_tile_info,
                         local_warp_idx=local_warp_idx,
                         tiled_mma=tiled_mma,
@@ -1386,9 +1581,17 @@ class SwapABFp8GluEpilogue:
                         fc2_act_weight_dequant_scale=fc2_act_weight_dequant_scale,
                         token_comm_args=token_comm_args,
                         run_wgmma_task_tile=run_wgmma_task_tile,
+                        math_wg_order_barrier=math_wg_order_barrier,
+                        math_wg_order_state=math_wg_order_state,
+                        epi_wg_order_barrier=epi_wg_order_barrier,
+                        epi_wg_order_state=epi_wg_order_state,
                     )
                 elif n_half == cutlass.Int32(0):
-                    ab_consumer_state = self._run_fc2_half_tile(
+                    (
+                        ab_consumer_state,
+                        math_wg_order_state,
+                        epi_wg_order_state,
+                    ) = self._run_fc2_half_tile(
                         work_tile_info=work_tile_info,
                         local_warp_idx=local_warp_idx,
                         tiled_mma=tiled_mma,
@@ -1412,9 +1615,17 @@ class SwapABFp8GluEpilogue:
                         fc2_act_weight_dequant_scale=fc2_act_weight_dequant_scale,
                         token_comm_args=token_comm_args,
                         run_wgmma_task_tile=run_wgmma_task_tile,
+                        math_wg_order_barrier=math_wg_order_barrier,
+                        math_wg_order_state=math_wg_order_state,
+                        epi_wg_order_barrier=epi_wg_order_barrier,
+                        epi_wg_order_state=epi_wg_order_state,
                     )
                 else:
-                    ab_consumer_state = self._run_fc2_half_tile(
+                    (
+                        ab_consumer_state,
+                        math_wg_order_state,
+                        epi_wg_order_state,
+                    ) = self._run_fc2_half_tile(
                         work_tile_info=work_tile_info,
                         local_warp_idx=local_warp_idx,
                         tiled_mma=tiled_mma,
@@ -1438,39 +1649,118 @@ class SwapABFp8GluEpilogue:
                         fc2_act_weight_dequant_scale=fc2_act_weight_dequant_scale,
                         token_comm_args=token_comm_args,
                         run_wgmma_task_tile=run_wgmma_task_tile,
+                        math_wg_order_barrier=math_wg_order_barrier,
+                        math_wg_order_state=math_wg_order_state,
+                        epi_wg_order_barrier=epi_wg_order_barrier,
+                        epi_wg_order_state=epi_wg_order_state,
                     )
             # Matches the selected swapab_fc1/fc2_task_* range above.
-            iket.range_pop()
+            if _iket_active:
+                iket.range_pop()
 
             cur_was_linear1 = work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
-            # Use tile_m_idx // atom_thr_size (= cluster-level token block index)
-            # NOT tile_n_idx (= intermediate N-tile index).  Both fc1 N-tiles
-            # for the same token block share the same tile_m_idx, so all their
-            # increments target the same counter slot.  Using tile_n_idx splits
-            # increments across slots and deadlocks fc2's spin-wait.
+            # The swap-AB token axis is GEMM N. Keep one FC1-done slot per CTA
+            # token tile because cluster peers produce independent workspace
+            # rows and do not form a cooperative two-CTA MMA.
             cur_fc1_counter_slot = (
-                work_tile_info.cumulative_token_block_count
+                cutlass.Int32(self._cluster_n)
+                * work_tile_info.cumulative_token_block_count
                 + work_tile_info.tile_n_idx
             )
             cur_fc2_expert_idx = work_tile_info.expert_idx
 
-            work_tile_info = sched_consumer.consume_work()
+            if cutlass.const_expr(self._pingpong_order):
+                # Match CUTLASS ping-pong ordering: retire the current FC1
+                # bulk-store group and hand epilogue ownership to the peer WG
+                # before waiting for the descriptor two positions ahead.
+                if _iket_active:
+                    if cur_was_linear1:
+                        iket.range_push("pp_swap_fc1_retire_handoff")
+                    else:
+                        iket.range_push("pp_swap_fc2_retire_handoff")
+                if cur_was_linear1:
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    cute.arch.fence_acq_rel_gpu()
+                    flag_tracker = flag_tracker.accumulate(
+                        work_tile_info.phase,
+                        1,
+                        (
+                            gmem_fc1_done_counter.iterator
+                            + cur_fc1_counter_slot
+                        ).toint(),
+                    )
+                else:
+                    if cutlass.const_expr(self._token_back_by_dispatch):
+                        cute.arch.fence_acq_rel_gpu()
+                        fc2_flag_addr = (
+                            token_comm_args.fc2_done_counter.iterator
+                            + cur_fc2_expert_idx
+                        ).toint()
+                    else:
+                        fc2_flag_addr = Int64(0)
+                    flag_tracker = flag_tracker.accumulate(
+                        work_tile_info.phase,
+                        1,
+                        fc2_flag_addr,
+                        not self._token_back_by_dispatch,
+                    )
+                epi_wg_order_state = epi_wg_order_barrier.arrive(
+                    epi_wg_order_state
+                )
+                if _iket_active:
+                    iket.range_pop()
+
+            if _iket_active:
+                iket.range_push("swapab_sched_consume_next")
+            if cutlass.const_expr(self._pingpong):
+                (
+                    sched_consumer,
+                    work_tile_info,
+                    ab_consumer_state,
+                ) = consume_next_pingpong_work(
+                    sched_consumer,
+                    ab_consumer_state,
+                    k_tile_cnt_fc1,
+                    k_tile_cnt_fc2,
+                )
+            else:
+                work_tile_info = sched_consumer.consume_work()
+            if _iket_active:
+                iket.range_pop()
 
             # Drain fc1 TMA/STG stores before publishing the fc1-done counter.
-            if cur_was_linear1:
+            if cur_was_linear1 and cutlass.const_expr(
+                not self._pingpong_order
+            ):
+                if _iket_active:
+                    iket.range_push("swapab_fc1_store_drain")
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=True)
                 cute.arch.fence_acq_rel_gpu()
+                if _iket_active:
+                    iket.range_pop()
 
-            task_tile_boundary_bar.arrive_and_wait()
+            if _iket_active:
+                iket.range_push("swapab_task_boundary_barrier")
+            if cutlass.const_expr(not self._pingpong):
+                task_tile_boundary_bar.arrive_and_wait()
+            if _iket_active:
+                iket.range_pop()
 
-            if cur_was_linear1:
+            if cur_was_linear1 and cutlass.const_expr(
+                not self._pingpong_order
+            ):
+                if _iket_active:
+                    iket.range_push("swapab_fc1_done_flag_accumulate")
                 flag_tracker = flag_tracker.accumulate(
                     work_tile_info.phase,
                     self._epi_fc1_batch,
                     (gmem_fc1_done_counter.iterator + cur_fc1_counter_slot).toint(),
                 )
-            else:
+                if _iket_active:
+                    iket.range_pop()
+            elif cutlass.const_expr(not self._pingpong_order):
                 if cutlass.const_expr(self._token_back_by_dispatch):
                     # Fence before (deferred) counter release: make the fc2
                     # pool-output STG writes device-visible.  The release
@@ -1482,11 +1772,19 @@ class SwapABFp8GluEpilogue:
                 else:
                     fc2_flag_addr = Int64(0)
                 no_fire: cutlass.Constexpr = not self._token_back_by_dispatch
+                if _iket_active:
+                    iket.range_push("swapab_fc2_done_flag_accumulate")
                 flag_tracker = flag_tracker.accumulate(
                     work_tile_info.phase,
                     self._epi_fc2_batch,
                     fc2_flag_addr,
                     no_fire,
                 )
+                if _iket_active:
+                    iket.range_pop()
 
+        if _iket_active:
+            iket.range_push("swapab_done_flag_fire_tail")
         flag_tracker.fire()
+        if _iket_active:
+            iket.range_pop()

@@ -87,6 +87,12 @@ class ImplDesc(_BaseImplDesc):
 
     def __post_init__(self) -> None:
         m, n, k = self.mma_tiler_mnk
+        supported_clusters = ((1, 1, 1), (2, 1, 1), (1, 2, 1), (2, 2, 1))
+        if self.cluster_shape_mnk not in supported_clusters:
+            raise ValueError(
+                "Hopper FP8 cluster_shape_mnk must be one of "
+                f"{supported_clusters}, got {self.cluster_shape_mnk}."
+            )
         non_swap_geometry = (
             m in NonSwapTileMChoices and n in NonSwapTileNChoices
         )
@@ -103,12 +109,17 @@ class ImplDesc(_BaseImplDesc):
         # supported N, then restore this Hopper-only compile-time N. This
         # temporary value never becomes the physical token padding.
         original_tiler = self.mma_tiler_mnk
+        original_cluster = self.cluster_shape_mnk
         if n < 64:
             self.mma_tiler_mnk = (m, 64, k)
+        # The shared v1 descriptor keeps cluster-N fixed at one. Hopper owns
+        # the wider cluster matrix above and validates it independently.
+        self.cluster_shape_mnk = (original_cluster[0], 1, 1)
         try:
             super().__post_init__()
         finally:
             self.mma_tiler_mnk = original_tiler
+            self.cluster_shape_mnk = original_cluster
 
 
 class SwigluFp8Fc12Tester(Fc12TesterBase):
@@ -123,8 +134,10 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
         fp8_scale_mode: str = "per_tensor",
         fp8_accum_mode: str = "1xacc",
         swap_ab: bool = False,
+        pingpong: bool = False,
     ) -> None:
         self.swap_ab = swap_ab
+        self.pingpong = pingpong
         super().__init__(problem, impl, misc)
         if fp8_scale_mode not in FP8_SCALE_MODE_CHOICES:
             raise ValueError(
@@ -663,6 +676,7 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
             ab_dtype=fp8_kind_to_cutlass_dtype(self.problem.kind),
             fp8_scale_mode=self.fp8_scale_mode,
             fp8_accum_mode=self.fp8_accum_mode,
+            pingpong=self.pingpong,
             gate_up_clamp=self.problem.gate_up_clamp,
         )
 
@@ -703,8 +717,13 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
         }
 
     def _partition_workspace(self, counter_token_tile: int):
-        if self.swap_ab:
-            counter_token_tile = self.impl.mma_tiler_mnk[1]
+        # Hopper cluster peers execute independent WGMMA tiles, so FC1-done
+        # counters are indexed at physical CTA token-tile granularity.
+        counter_token_tile = (
+            self.impl.mma_tiler_mnk[1]
+            if self.swap_ab
+            else self.impl.mma_tiler_mnk[0]
+        )
         if self.fp8_scale_mode != "blockwise":
             return super()._partition_workspace(counter_token_tile)
 
@@ -880,6 +899,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--swap_ab", action="store_true",
         help="Use the Hopper weight-as-A M128/M256xN swap-AB kernel.",
     )
+    parser.add_argument(
+        "--pingpong", action="store_true",
+        help="Alternate complete task tiles across two WGMMA+epilogue warpgroups.",
+    )
 
     return parser
 
@@ -902,7 +925,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     mma_tiler_mnk = parse_tuple(args.mma_tiler_mnk)
     if args.swap_ab and mma_tiler_mnk == (64, 128, 128):
-        mma_tiler_mnk = (256, 32, 128)
+        mma_tiler_mnk = (128, 32, 128) if args.pingpong else (256, 32, 128)
 
     impl = ImplDesc(
         mma_tiler_mnk=mma_tiler_mnk,
@@ -937,6 +960,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         fp8_scale_mode=args.fp8_scale_mode,
         fp8_accum_mode=args.fp8_accum_mode,
         swap_ab=args.swap_ab,
+        pingpong=args.pingpong,
     )
     tester.run()
 

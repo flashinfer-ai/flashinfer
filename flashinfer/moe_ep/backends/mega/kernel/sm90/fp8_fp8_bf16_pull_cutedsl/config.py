@@ -34,9 +34,9 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     ``MoEWeightPack`` and enable ``MegaConfig.preprocess_weights`` (default),
     or pass kernel-ready transformed weights with ``preprocess_weights=False``.
 
-    PORT NOTE: no ``knobs`` field yet — the sm90 tree has no tuner/knob-cache
-    module (see the shim's PORT NOTE); geometry knobs (``swap_ab``,
-    ``mma_tiler_mnk``) are explicit fields instead.
+    PORT NOTE: no ``knobs`` field / offline knob-cache yet — geometry knobs
+    are explicit fields, resolved by the drop's token-bucket heuristic table
+    (``moe_hopper_fp8/heuristic_config.py``) when all four are ``None``.
     """
 
     intermediate_size: int
@@ -45,11 +45,17 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     kind: Literal["fp8_e4m3", "fp8_e5m2"] = "fp8_e4m3"
     fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor"
     fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc"
-    # Kernel geometry: swap_ab selects the swap-A/B specialization;
-    # mma_tiler_mnk=None uses the drop driver's default for the geometry
-    # ((64, 128, 128) native, (256, 32, 128) swap-AB).
-    swap_ab: bool = False
+    # Launch geometry / scheduling: leave ALL of swap_ab / pingpong /
+    # mma_tiler_mnk / cluster_shape_mnk as None to use the drop driver's
+    # token-bucket heuristics (keyed on fp8_scale_mode and max tokens per
+    # rank); setting any one switches to manual mode with the drop driver's
+    # defaults for the rest (swap_ab=False, pingpong=False, (64, 128, 128)
+    # native / (256, 32, 128) swap-AB / (128, 32, 128) swap-AB ping-pong,
+    # cluster (1, 1, 1)).
+    swap_ab: bool | None = None
+    pingpong: bool | None = None
     mma_tiler_mnk: tuple[int, int, int] | None = None
+    cluster_shape_mnk: tuple[int, int, int] | None = None
     # Scheduler token-tile assignment; "atomic_counter" is the drop's
     # perf-run setting (run_perf_test.sh), "static" the kernel default.
     load_balance_mode: Literal["static", "atomic_counter"] = "static"
@@ -57,7 +63,12 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     activation_clamp: float | None = None
     fast_math: bool = True
     in_kernel_fc2_reduce: bool = False
+    # Legacy alias: True maps to token_back_mode="reuse_dispatch_warps".
     token_back_by_dispatch: bool = False
+    # Explicit token-back placement; overrides token_back_by_dispatch when set.
+    token_back_mode: (
+        Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"] | None
+    ) = None
     # Per-tensor static calibration scales (see class docstring).
     fc1_activation_dequant_scale: float = 1.0
     fc2_activation_dequant_scale: float = 1.0

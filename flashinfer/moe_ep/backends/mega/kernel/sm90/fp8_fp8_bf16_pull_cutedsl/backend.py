@@ -135,12 +135,15 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             fp8_scale_mode=k.fp8_scale_mode,
             fp8_accum_mode=k.fp8_accum_mode,
             swap_ab=k.swap_ab,
+            pingpong=k.pingpong,
             mma_tiler_mnk=k.mma_tiler_mnk,
+            cluster_shape_mnk=k.cluster_shape_mnk,
             load_balance_mode=k.load_balance_mode,
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
             token_back_by_dispatch=k.token_back_by_dispatch,
+            token_back_mode=k.token_back_mode,
         )
 
     def validate_forward(
@@ -284,9 +287,12 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             k.fp8_scale_mode,
             k.fp8_accum_mode,
             k.swap_ab,
+            k.pingpong,
             k.mma_tiler_mnk,
+            k.cluster_shape_mnk,
             k.load_balance_mode,
             _resolve_gate_up_clamp(k),
             k.in_kernel_fc2_reduce,
             k.token_back_by_dispatch,
+            k.token_back_mode,
         )

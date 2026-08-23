@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize peak Hopper FP8 token-sweep throughput for each mode."""
+"""Consolidate Hopper FP8 token sweeps and derive per-token heuristics."""
 
 from __future__ import annotations
 
@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT_DIR = SCRIPT_DIR / "benchmark_data"
 DATE_DIR_RE = re.compile(r"^\d{8}$")
@@ -21,17 +20,67 @@ RAW_CSV_NAME_RE = re.compile(
     r"(?P<rank>singlerank|multirank)_"
     r"(?P<scale>pertensor|blockwise)_"
     r"(?P<order>swapab|nonswapab)_"
+    r"(?P<schedule>legacy|pingpong)_"
+    r"CGA(?P<cm>\d+)x(?P<cn>\d+)_"
     r"TileM(?P<m>\d+)_TileN(?P<n>\d+)\.csv$"
 )
 
-SUMMARY_FIELDS = (
+HEURISTIC_FIELDS = (
     "run_date",
     "rank_mode",
     "case",
     "scale_mode",
+    "tokens_per_rank",
+    "routed_tokens_per_rank",
     "operand_order",
-    "peak_tflops_per_rank",
+    "pingpong",
     "accum_mode",
+    "cluster_m",
+    "cluster_n",
+    "cluster_k",
+    "tile_m",
+    "tile_n",
+    "tile_k",
+    "min_rank",
+    "max_rank",
+    "min_mega_us",
+    "max_mega_us",
+    "mean_mega_us",
+    "min_rank_tflops_per_rank",
+    "max_rank_tflops_per_rank",
+    "rank_0_mega_us",
+    "rank_1_mega_us",
+    "rank_2_mega_us",
+    "rank_3_mega_us",
+    "world_size",
+    "topk",
+    "total_experts",
+    "local_experts",
+    "hidden",
+    "intermediate_downproj",
+    "intermediate_gateup",
+    "warmup",
+    "iters",
+    "attempt",
+    "timestamp_utc",
+    "git_commit",
+    "gpu_names",
+    "gpu_clocks_mhz",
+    "source_csv",
+    "log_file",
+    "command",
+)
+
+PEAK_SUMMARY_FIELDS = (
+    "rank_mode",
+    "case",
+    "scale_mode",
+    "operand_order",
+    "peak_tflops_per_rank(min_rank)",
+    "peak_tflops_per_rank(max_rank)",
+    "accum_mode",
+    "cga",
+    "ping-pong",
     "tile_m",
     "tile_n",
     "tile_k",
@@ -44,78 +93,93 @@ SUMMARY_FIELDS = (
     "hidden",
     "intermediate_downproj",
     "intermediate_gateup",
-    "critical_latency_us",
-    "min_rank",
-    "min_mega_us",
-    "max_mega_us",
-    "mean_mega_us",
-    "rank_0_mega_us",
-    "rank_1_mega_us",
-    "rank_2_mega_us",
-    "rank_3_mega_us",
-    "warmup",
-    "iters",
-    "attempt",
-    "timestamp_utc",
-    "git_commit",
-    "gpu_names",
-    "source_csv",
-    "log_file",
-    "command",
 )
 
-_RANK_ORDER = {"singlerank": 0, "multirank": 1}
-_SCALE_ORDER = {"per_tensor": 0, "blockwise": 1}
-_OPERAND_ORDER = {"non_swap_ab": 0, "swap_ab": 1}
+TOKEN_VARIANTS = (
+    ("per_tensor", "non_swap_ab"),
+    ("per_tensor", "swap_ab"),
+    ("blockwise", "non_swap_ab"),
+    ("blockwise", "swap_ab"),
+)
+
+TOKEN_VARIANT_TFLOPS_BASE_FIELDS = (
+    "rank_mode",
+    "case",
+    "scale_mode",
+    "operand_order",
+    "rank_metric",
+)
+
+RANK_TFLOPS_METRICS = (
+    ("min_rank", "min_rank_tflops_per_rank"),
+    ("max_rank", "max_rank_tflops_per_rank"),
+)
 
 
 @dataclass(frozen=True)
-class SummaryGroup:
-    run_date: str
-    rank_mode: str
-    scale_mode: str
-    operand_order: str
-
-    def sort_key(self) -> tuple[int, int, int]:
-        return (
-            _RANK_ORDER[self.rank_mode],
-            _SCALE_ORDER[self.scale_mode],
-            _OPERAND_ORDER[self.operand_order],
-        )
-
-
-@dataclass(frozen=True)
-class PeakRecord:
-    group: SummaryGroup
-    tflops: float
+class SourceRow:
     source_csv: Path
     row: dict[str, str]
 
-    def selection_key(self) -> tuple[float, str, int, int, str]:
+    @property
+    def token(self) -> int:
+        return int(self.row["tokens_per_rank"])
+
+    @property
+    def critical_tflops(self) -> float:
+        raw = self.row.get("max_rank_tflops_per_rank", "") or self.row.get(
+            "critical_tflops_per_rank", ""
+        )
+        return float(raw)
+
+    def recency_key(self) -> tuple[str, int]:
         return (
-            self.tflops,
             self.row.get("timestamp_utc", ""),
-            _int_or_zero(self.row.get("attempt", "")),
-            _int_or_zero(self.row.get("tokens_per_rank", "")),
+            int(self.row.get("attempt", "0") or 0),
+        )
+
+    def selection_key(self) -> tuple[float, str, int, str]:
+        return (
+            self.critical_tflops,
+            self.row.get("timestamp_utc", ""),
+            int(self.row.get("attempt", "0") or 0),
             self.source_csv.name,
         )
 
 
-@dataclass(frozen=True)
-class SummaryResult:
-    output_path: Path
-    source_files: int
-    successful_rows: int
-    invalid_rows: int
-    groups: int
-    missing_groups: tuple[SummaryGroup, ...]
+def _raw_csv_files(date_dir: Path) -> Iterable[Path]:
+    for path in sorted(date_dir.glob("*.csv")):
+        match = RAW_CSV_NAME_RE.fullmatch(path.name)
+        if match is not None and match.group("date") == date_dir.name:
+            yield path
 
 
-def _int_or_zero(value: str) -> int:
+def _read_all_rows(date_dir: Path) -> list[SourceRow]:
+    rows: list[SourceRow] = []
+    for path in _raw_csv_files(date_dir):
+        with path.open(newline="", encoding="utf-8") as handle:
+            rows.extend(SourceRow(path, row) for row in csv.DictReader(handle))
+    return rows
+
+
+def _latest_by_config_token(rows: Sequence[SourceRow]) -> list[SourceRow]:
+    latest: dict[tuple[str, int], SourceRow] = {}
+    for source_row in rows:
+        key = (source_row.source_csv.name, source_row.token)
+        current = latest.get(key)
+        if current is None or source_row.recency_key() > current.recency_key():
+            latest[key] = source_row
+    return list(latest.values())
+
+
+def _valid_success(source_row: SourceRow) -> bool:
+    if source_row.row.get("status") != "pass":
+        return False
     try:
-        return int(value)
+        value = source_row.critical_tflops
     except (TypeError, ValueError):
-        return 0
+        return False
+    return math.isfinite(value) and value > 0.0
 
 
 def _accum_mode(row: dict[str, str]) -> str:
@@ -129,123 +193,243 @@ def _accum_mode(row: dict[str, str]) -> str:
     prefix = "FP8_ACCUM_MODE="
     for part in command_parts:
         if part.startswith(prefix):
-            value = part[len(prefix) :]
-            return value or "unknown"
+            return part[len(prefix) :] or "unknown"
     return "unknown"
 
 
-def _group_from_match(match: re.Match[str]) -> SummaryGroup:
-    return SummaryGroup(
-        run_date=match.group("date"),
-        rank_mode=match.group("rank"),
-        scale_mode=(
-            "per_tensor" if match.group("scale") == "pertensor" else "blockwise"
-        ),
-        operand_order=(
-            "swap_ab" if match.group("order") == "swapab" else "non_swap_ab"
-        ),
-    )
-
-
-def _raw_csv_files(date_dir: Path) -> Iterable[tuple[Path, SummaryGroup]]:
-    for path in sorted(date_dir.glob("*.csv")):
-        match = RAW_CSV_NAME_RE.fullmatch(path.name)
-        if match is None or match.group("date") != date_dir.name:
-            continue
-        yield path, _group_from_match(match)
-
-
-def _read_peaks(
-    date_dir: Path,
-) -> tuple[dict[SummaryGroup, PeakRecord], int, int, int]:
-    peaks: dict[SummaryGroup, PeakRecord] = {}
-    source_files = 0
-    successful_rows = 0
-    invalid_rows = 0
-    for path, group in _raw_csv_files(date_dir):
-        source_files += 1
-        with path.open(newline="", encoding="utf-8") as handle:
-            for row in csv.DictReader(handle):
-                if row.get("status") != "pass":
-                    continue
-                try:
-                    tflops = float(row.get("critical_tflops_per_rank", ""))
-                except (TypeError, ValueError):
-                    invalid_rows += 1
-                    continue
-                if not math.isfinite(tflops) or tflops <= 0.0:
-                    invalid_rows += 1
-                    continue
-                successful_rows += 1
-                record = PeakRecord(group, tflops, path, row)
-                current = peaks.get(group)
-                if current is None or record.selection_key() > current.selection_key():
-                    peaks[group] = record
-    return peaks, source_files, successful_rows, invalid_rows
-
-
-def _expected_groups(run_date: str) -> set[SummaryGroup]:
-    return {
-        SummaryGroup(run_date, rank_mode, scale_mode, operand_order)
-        for rank_mode in _RANK_ORDER
-        for scale_mode in _SCALE_ORDER
-        for operand_order in _OPERAND_ORDER
-    }
-
-
-def _summary_row(record: PeakRecord) -> dict[str, str]:
-    source = record.row
-    row = {field: source.get(field, "") for field in SUMMARY_FIELDS}
-    row.update(
-        {
-            "run_date": record.group.run_date,
-            "rank_mode": record.group.rank_mode,
-            "scale_mode": record.group.scale_mode,
-            "operand_order": record.group.operand_order,
-            "peak_tflops_per_rank": f"{record.tflops:.6f}",
-            "accum_mode": _accum_mode(source),
-            "critical_latency_us": source.get("max_mega_us", ""),
-            "source_csv": record.source_csv.name,
-        }
-    )
+def _export_row(source_row: SourceRow) -> dict[str, str]:
+    row = {field: source_row.row.get(field, "") for field in HEURISTIC_FIELDS}
+    row["source_csv"] = source_row.source_csv.name
+    row["accum_mode"] = _accum_mode(source_row.row)
     return row
 
 
-def write_peak_summary(date_dir: Path, output_dir: Path) -> SummaryResult:
-    peaks, source_files, successful_rows, invalid_rows = _read_peaks(date_dir)
-    if not peaks:
-        raise ValueError(f"No valid successful token-sweep rows in {date_dir}")
+def _export_peak_summary_row(source_row: SourceRow) -> dict[str, str]:
+    row = source_row.row
+    return {
+        "rank_mode": row.get("rank_mode", ""),
+        "case": row.get("case", ""),
+        "scale_mode": row.get("scale_mode", ""),
+        "operand_order": row.get("operand_order", ""),
+        "peak_tflops_per_rank(min_rank)": row.get("min_rank_tflops_per_rank", ""),
+        "peak_tflops_per_rank(max_rank)": row.get("max_rank_tflops_per_rank", ""),
+        "accum_mode": _accum_mode(row),
+        "cga": "x".join(
+            (
+                row.get("cluster_m", ""),
+                row.get("cluster_n", ""),
+                row.get("cluster_k", ""),
+            )
+        ),
+        "ping-pong": row.get("pingpong", ""),
+        "tile_m": row.get("tile_m", ""),
+        "tile_n": row.get("tile_n", ""),
+        "tile_k": row.get("tile_k", ""),
+        "tokens_per_rank": row.get("tokens_per_rank", ""),
+        "routed_tokens_per_rank": row.get("routed_tokens_per_rank", ""),
+        "world_size": row.get("world_size", ""),
+        "topk": row.get("topk", ""),
+        "total_experts": row.get("total_experts", ""),
+        "local_experts": row.get("local_experts", ""),
+        "hidden": row.get("hidden", ""),
+        "intermediate_downproj": row.get("intermediate_downproj", ""),
+        "intermediate_gateup": row.get("intermediate_gateup", ""),
+    }
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{date_dir.name}_token_sweep_peak_summary.csv"
-    with output_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDS)
+
+def _write_csv(
+    path: Path, fieldnames: Sequence[str], rows: Iterable[dict[str, str]]
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        for group in sorted(peaks, key=SummaryGroup.sort_key):
-            writer.writerow(_summary_row(peaks[group]))
+        writer.writerows(rows)
+    print(f"[WROTE] {path}")
 
-    missing_groups = tuple(
-        sorted(
-            _expected_groups(date_dir.name) - peaks.keys(),
-            key=SummaryGroup.sort_key,
+
+def _write_all_results(date_dir: Path, rows: Sequence[SourceRow]) -> Path:
+    fieldnames: list[str] = ["source_csv"]
+    for source_row in rows:
+        for field in source_row.row:
+            if field not in fieldnames:
+                fieldnames.append(field)
+    output = date_dir / f"{date_dir.name}_token_sweep_all_results.csv"
+    exported = (
+        {"source_csv": source_row.source_csv.name, **source_row.row}
+        for source_row in rows
+    )
+    _write_csv(output, fieldnames, exported)
+    return output
+
+
+def _write_failures(date_dir: Path, latest: Sequence[SourceRow]) -> Path:
+    output = date_dir / f"{date_dir.name}_token_sweep_failures.csv"
+    failures = sorted(
+        (source_row for source_row in latest if not _valid_success(source_row)),
+        key=lambda item: (item.source_csv.name, item.token),
+    )
+    fieldnames = ("source_csv", "status", "return_code", "tokens_per_rank", "log_file")
+    _write_csv(
+        output,
+        fieldnames,
+        (
+            {
+                "source_csv": item.source_csv.name,
+                "status": item.row.get("status", ""),
+                "return_code": item.row.get("return_code", ""),
+                "tokens_per_rank": item.row.get("tokens_per_rank", ""),
+                "log_file": item.row.get("log_file", ""),
+            }
+            for item in failures
+        ),
+    )
+    return output
+
+
+def _best_per_scale_token(latest: Sequence[SourceRow]) -> list[SourceRow]:
+    best: dict[tuple[str, str, int], SourceRow] = {}
+    for source_row in latest:
+        if not _valid_success(source_row):
+            continue
+        key = (
+            source_row.row["rank_mode"],
+            source_row.row["scale_mode"],
+            source_row.token,
         )
+        current = best.get(key)
+        if current is None or source_row.selection_key() > current.selection_key():
+            best[key] = source_row
+    return sorted(
+        best.values(),
+        key=lambda item: (
+            item.row["rank_mode"],
+            item.row["scale_mode"],
+            item.token,
+        ),
     )
-    return SummaryResult(
-        output_path=output_path,
-        source_files=source_files,
-        successful_rows=successful_rows,
-        invalid_rows=invalid_rows,
-        groups=len(peaks),
-        missing_groups=missing_groups,
+
+
+def _best_per_variant_token(latest: Sequence[SourceRow]) -> list[SourceRow]:
+    best: dict[tuple[str, str, str, int], SourceRow] = {}
+    for source_row in latest:
+        if not _valid_success(source_row):
+            continue
+        key = (
+            source_row.row["rank_mode"],
+            source_row.row["scale_mode"],
+            source_row.row["operand_order"],
+            source_row.token,
+        )
+        current = best.get(key)
+        if current is None or source_row.selection_key() > current.selection_key():
+            best[key] = source_row
+    return sorted(
+        best.values(),
+        key=lambda item: (
+            item.row["rank_mode"],
+            item.token,
+            item.row["scale_mode"],
+            item.row["operand_order"],
+        ),
     )
+
+
+def _write_heuristic(date_dir: Path, best: Sequence[SourceRow]) -> Path:
+    output = date_dir / f"{date_dir.name}_token_sweep_heuristic.csv"
+    _write_csv(output, HEURISTIC_FIELDS, (_export_row(item) for item in best))
+    return output
+
+
+def _write_peak_summary(date_dir: Path, latest: Sequence[SourceRow]) -> Path:
+    best: dict[tuple[str, str, str], SourceRow] = {}
+    for source_row in latest:
+        if not _valid_success(source_row):
+            continue
+        key = (
+            source_row.row["rank_mode"],
+            source_row.row["scale_mode"],
+            source_row.row["operand_order"],
+        )
+        current = best.get(key)
+        if current is None or source_row.selection_key() > current.selection_key():
+            best[key] = source_row
+    output = date_dir / f"{date_dir.name}_token_sweep_peak_summary.csv"
+    records = sorted(best.values(), key=lambda item: item.source_csv.name)
+    _write_csv(
+        output,
+        PEAK_SUMMARY_FIELDS,
+        (_export_peak_summary_row(item) for item in records),
+    )
+    return output
+
+
+def _write_variant_tflops_by_token(date_dir: Path, best: Sequence[SourceRow]) -> Path:
+    lookup: dict[tuple[str, str, str, str, int], SourceRow] = {}
+    for source_row in best:
+        key = (
+            source_row.row["rank_mode"],
+            source_row.row["case"],
+            source_row.row["scale_mode"],
+            source_row.row["operand_order"],
+            source_row.token,
+        )
+        lookup[key] = source_row
+
+    tokens = sorted({source_row.token for source_row in best})
+    contexts = sorted(
+        {(source_row.row["rank_mode"], source_row.row["case"]) for source_row in best}
+    )
+    rows: list[dict[str, str]] = []
+    for rank_mode, case in contexts:
+        for scale_mode, operand_order in TOKEN_VARIANTS:
+            for rank_metric, source_field in RANK_TFLOPS_METRICS:
+                row = {
+                    "rank_mode": rank_mode,
+                    "case": case,
+                    "scale_mode": scale_mode,
+                    "operand_order": operand_order,
+                    "rank_metric": rank_metric,
+                }
+                for token in tokens:
+                    source_row = lookup.get(
+                        (rank_mode, case, scale_mode, operand_order, token)
+                    )
+                    row[str(token)] = (
+                        source_row.row.get(source_field, "")
+                        if source_row is not None
+                        else ""
+                    )
+                rows.append(row)
+
+    output = date_dir / f"{date_dir.name}_token_sweep_optimal_tflops_by_token.csv"
+    fieldnames = (*TOKEN_VARIANT_TFLOPS_BASE_FIELDS, *(str(token) for token in tokens))
+    _write_csv(output, fieldnames, rows)
+    return output
+
+
+def summarize(date_dir: Path) -> tuple[int, int, int]:
+    rows = _read_all_rows(date_dir)
+    if not rows:
+        raise ValueError(f"No raw token-sweep CSV rows in {date_dir}")
+    latest = _latest_by_config_token(rows)
+    best = _best_per_scale_token(latest)
+    best_per_variant = _best_per_variant_token(latest)
+    _write_all_results(date_dir, rows)
+    _write_failures(date_dir, latest)
+    _write_heuristic(date_dir, best)
+    _write_peak_summary(date_dir, latest)
+    _write_variant_tflops_by_token(date_dir, best_per_variant)
+    failures = sum(not _valid_success(item) for item in latest)
+    print(
+        f"[SUMMARY] attempts={len(rows)} latest={len(latest)} "
+        f"heuristic_rows={len(best)} failures={failures}"
+    )
+    return len(rows), len(best), failures
 
 
 def _date_dirs(input_dir: Path, run_date: str | None) -> list[Path]:
     if DATE_DIR_RE.fullmatch(input_dir.name):
-        if run_date is not None and run_date != input_dir.name:
-            raise FileNotFoundError(
-                f"Input directory {input_dir} does not match date {run_date}"
-            )
         candidates = [input_dir]
     elif run_date is not None:
         candidates = [input_dir / run_date]
@@ -255,39 +439,16 @@ def _date_dirs(input_dir: Path, run_date: str | None) -> list[Path]:
             for path in input_dir.iterdir()
             if path.is_dir() and DATE_DIR_RE.fullmatch(path.name)
         )
-    date_dirs = [path for path in candidates if path.is_dir()]
-    if not date_dirs:
-        selected = run_date or "any date"
-        raise FileNotFoundError(f"No token-sweep data for {selected} in {input_dir}")
-    return date_dirs
-
-
-def _date_output_dir(output_dir: Path, run_date: str) -> Path:
-    return output_dir if output_dir.name == run_date else output_dir / run_date
+    result = [path for path in candidates if path.is_dir()]
+    if not result:
+        raise FileNotFoundError(f"No token-sweep data in {input_dir}")
+    return result
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--input-dir",
-        type=Path,
-        default=DEFAULT_INPUT_DIR,
-        help=(
-            "Benchmark-data root or one YYYYMMDD directory "
-            f"(default: {DEFAULT_INPUT_DIR})"
-        ),
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=None,
-        help="Benchmark-data root for summary output; defaults to --input-dir.",
-    )
-    parser.add_argument(
-        "--date",
-        default=None,
-        help="YYYYMMDD to summarize; defaults to all date directories found.",
-    )
+    parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR)
+    parser.add_argument("--date", default=None)
     return parser
 
 
@@ -295,28 +456,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.date is not None and not DATE_DIR_RE.fullmatch(args.date):
         raise ValueError("--date must use YYYYMMDD")
-    input_dir = args.input_dir.resolve()
-    output_dir = (args.output_dir or input_dir).resolve()
-
-    results: list[SummaryResult] = []
-    for date_dir in _date_dirs(input_dir, args.date):
-        result = write_peak_summary(
-            date_dir, _date_output_dir(output_dir, date_dir.name)
-        )
-        results.append(result)
-        print(
-            f"[WROTE] {result.output_path} groups={result.groups} "
-            f"source_files={result.source_files} "
-            f"successful_rows={result.successful_rows} "
-            f"invalid_rows={result.invalid_rows}"
-        )
-        if result.missing_groups:
-            missing = ", ".join(
-                f"{group.rank_mode}/{group.scale_mode}/{group.operand_order}"
-                for group in result.missing_groups
-            )
-            print(f"[WARN] missing groups: {missing}")
-    print(f"SUMMARIES={len(results)}")
+    count = 0
+    for date_dir in _date_dirs(args.input_dir.resolve(), args.date):
+        summarize(date_dir)
+        count += 1
+    print(f"SUMMARIES={count}")
     return 0
 
 

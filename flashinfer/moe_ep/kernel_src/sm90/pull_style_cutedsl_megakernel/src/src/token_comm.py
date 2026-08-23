@@ -538,8 +538,34 @@ class TokenInPullTokenBackPush:
     @cute.jit
     def fc1_tma_b_predispatch_spin(self, token_comm_args, work_tile_info):
         if cutlass.const_expr(self.is_swap_ab):
-            counter_slot = work_tile_info.cumulative_token_block_count + work_tile_info.tile_n_idx
-            peek_threshold = work_tile_info.valid_tokens_in_cta_tile
+            token_cluster_size: cutlass.Constexpr = self.cluster_shape_mn[1]
+            cluster_token_block_idx = (
+                work_tile_info.tile_n_idx // cutlass.Int32(token_cluster_size)
+            )
+            counter_slot = (
+                work_tile_info.cumulative_token_block_count
+                + cluster_token_block_idx
+            )
+            if cutlass.const_expr(token_cluster_size == 1):
+                # Preserve the existing NVFP4/MXFP8 single-token-CTA path.
+                peek_threshold = work_tile_info.valid_tokens_in_cta_tile
+            else:
+                packed_expert_count = token_comm_args.expert_recv_count_sum[
+                    work_tile_info.expert_idx
+                ]
+                expert_token_count = Int32(
+                    Int64(packed_expert_count) & Int64(0xFFFFFFFF)
+                )
+                remaining_cluster_tokens = cutlass.max(
+                    expert_token_count
+                    - cluster_token_block_idx
+                    * cutlass.Int32(self.cluster_tile_tokens),
+                    Int32(0),
+                )
+                peek_threshold = cutlass.min(
+                    remaining_cluster_tokens,
+                    cutlass.Int32(self.cluster_tile_tokens),
+                )
         else:
             counter_slot = (
                 work_tile_info.cumulative_token_block_count
@@ -548,14 +574,18 @@ class TokenInPullTokenBackPush:
             peek_threshold = work_tile_info.valid_tokens_in_cluster_tile
 
         counter_ptr = token_comm_args.fc1_ready_counter.iterator + counter_slot
-        if not work_tile_info.peek_ready:
-            _iket.range_push("tma_token_fc1_wait")
-            spin_wait(
-                counter_ptr,
-                lambda v: v >= peek_threshold,
-                fail_sleep_cycles=1000,
-            )
-            _iket.range_pop()
+        # Dispatch warps may fill rows within a cluster token block out of
+        # order. Every valid CTA therefore waits for the full cluster-block
+        # count; an invalid tail CTA has no rows to consume and skips the wait.
+        if work_tile_info.valid_tokens_in_cta_tile > Int32(0):
+            if not work_tile_info.peek_ready:
+                _iket.range_push("tma_token_fc1_wait")
+                spin_wait(
+                    counter_ptr,
+                    lambda v: v >= peek_threshold,
+                    fail_sleep_cycles=1000,
+                )
+                _iket.range_pop()
 
     @cute.jit
     def dispatch_prep(
@@ -1480,13 +1510,15 @@ class TokenInPullTokenBackPush:
         bidx, bidy, bidz = cute.arch.block_idx()
         cta_linear_id = (
             Int32(bidx)
-            + Int32(self.cluster_shape_mn[1]) * Int32(bidy)
+            + Int32(self.cluster_shape_mn[0]) * Int32(bidy)
             + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
             * Int32(bidz)
         )
         local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
 
-        iket_active = (cta_linear_id == Int32(0)) and (local_warp_idx == Int32(0))
+        # Record all four dispatch warps in CTA 0. Recording every persistent
+        # CTA duplicates the same role and makes PIC-C's trace buffer too large.
+        iket_active = cta_linear_id == Int32(0)
         if iket_active:
             _iket.range_push("Dispatch_Prep")
 
@@ -1597,7 +1629,7 @@ class TokenInPullTokenBackPush:
         bidx, bidy, bidz = cute.arch.block_idx()
         cta_linear_id = (
             Int32(bidx)
-            + Int32(self.cluster_shape_mn[1]) * Int32(bidy)
+            + Int32(self.cluster_shape_mn[0]) * Int32(bidy)
             + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
             * Int32(bidz)
         )
@@ -1631,7 +1663,7 @@ class TokenInPullTokenBackPush:
                 )
         cute.arch.sync_warp()
 
-        iket_active = (cta_linear_id == Int32(0)) and (local_warp_idx == Int32(0))
+        iket_active = cta_linear_id == Int32(0)
         if iket_active:
             _iket.range_push("Token_Back_By_Push_Standalone")
 
@@ -1722,7 +1754,7 @@ class TokenInPullTokenBackPush:
             bidx, bidy, bidz = cute.arch.block_idx()
             cta_linear_id = (
                 Int32(bidx)
-                + Int32(self.cluster_shape_mn[1]) * Int32(bidy)
+                + Int32(self.cluster_shape_mn[0]) * Int32(bidy)
                 + Int32(self.cluster_shape_mn[1] * self.cluster_shape_mn[0])
                 * Int32(bidz)
             )

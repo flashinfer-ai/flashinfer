@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Run the fixed Hopper FP8 P02/P03 tokens-per-rank benchmark sweep.
+"""Run the Hopper FP8 P03 tokens-per-rank tuning sweep.
 
-The default run covers every public non-swap and swap-AB tile, both FP8
-scale modes, and tokens-per-rank from 512 through 32768 in powers of two.
-Each CSV owns one rank/scale/order/tile configuration and contains one row
-per attempt so failed runs and forced reruns remain auditable.
+The full sweep covers every valid scale/order/tile/CGA/ping-pong combination
+and tokens-per-rank from 8 through 32768 in powers of two. Each CSV owns one
+configuration and contains one row per attempt so failed runs and forced
+reruns remain auditable. P02 remains available as an explicit compatibility
+mode, but the default and heuristic target are P03.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ import datetime as dt
 import importlib.util
 import os
 import re
+import selectors
+import signal
 import shlex
 import statistics
 import subprocess
@@ -25,7 +28,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 PERF_SCRIPT = SCRIPT_DIR / "run_perf_test.sh"
 PLOT_SCRIPT = SCRIPT_DIR / "plot_token_sweep.py"
@@ -33,7 +35,7 @@ SUMMARY_SCRIPT = SCRIPT_DIR / "summarize_token_sweep.py"
 DEFAULT_OUTPUT_DIR = SCRIPT_DIR / "benchmark_data"
 BENCHMARK_REQUIREMENTS = SCRIPT_DIR / "benchmark_requirements.txt"
 
-TOKEN_SIZES = (512, 1024, 2048, 4096, 8192, 16384, 32768)
+TOKEN_SIZES = tuple(1 << power for power in range(3, 16))
 TOPK = 6
 TOTAL_EXPERTS = 384
 EP_SIZE = 4
@@ -45,9 +47,12 @@ GATE_UP_CLAMP = "10.0"
 WARMUP = 3
 ITERS = 20
 TIMEOUT_SECONDS = 3600
+SILENCE_TIMEOUT_SECONDS = 300
 TILE_K = 128
 
 SCALE_MODES = ("per_tensor", "blockwise")
+OPERAND_ORDERS = ("non_swap_ab", "swap_ab")
+CLUSTER_SHAPES = ((1, 1, 1), (1, 2, 1), (2, 1, 1), (2, 2, 1))
 RANK_MODES = (
     ("singlerank", "P02", 1),
     ("multirank", "P03", EP_SIZE),
@@ -72,6 +77,7 @@ DISPLAY_ENV_KEYS = (
     "FP8_NON_SWAP_N",
     "FP8_SWAP_AB_M",
     "FP8_SWAP_AB_N",
+    "FP8_CLUSTER_SHAPE",
     "PERF_WARMUP",
     "PERF_ITERS",
     "TIMEOUT_SECONDS",
@@ -88,9 +94,13 @@ CSV_FIELDS = (
     "rank_mode",
     "scale_mode",
     "operand_order",
+    "pingpong",
     "tile_m",
     "tile_n",
     "tile_k",
+    "cluster_m",
+    "cluster_n",
+    "cluster_k",
     "tokens_per_rank",
     "topk",
     "routed_tokens_per_rank",
@@ -106,9 +116,12 @@ CSV_FIELDS = (
     "return_code",
     "wall_time_s",
     "min_rank",
+    "max_rank",
     "min_mega_us",
     "max_mega_us",
     "mean_mega_us",
+    "min_rank_tflops_per_rank",
+    "max_rank_tflops_per_rank",
     "rank_0_mega_us",
     "rank_1_mega_us",
     "rank_2_mega_us",
@@ -123,6 +136,7 @@ CSV_FIELDS = (
     "critical_tflops_per_rank",
     "git_commit",
     "gpu_names",
+    "gpu_clocks_mhz",
     "log_file",
     "command",
 )
@@ -145,8 +159,10 @@ class BenchmarkCase:
     world_size: int
     scale_mode: str
     operand_order: str
+    pingpong: bool
     tile_m: int
     tile_n: int
+    cluster_shape_mnk: tuple[int, int, int]
 
     @property
     def scale_tag(self) -> str:
@@ -156,9 +172,19 @@ class BenchmarkCase:
     def order_tag(self) -> str:
         return "swapab" if self.operand_order == "swap_ab" else "nonswapab"
 
+    @property
+    def schedule_tag(self) -> str:
+        return "pingpong" if self.pingpong else "legacy"
+
+    @property
+    def cluster_tag(self) -> str:
+        m, n, _ = self.cluster_shape_mnk
+        return f"CGA{m}x{n}"
+
     def stem(self, run_date: str) -> str:
         return (
             f"{run_date}_{self.rank_mode}_{self.scale_tag}_{self.order_tag}_"
+            f"{self.schedule_tag}_{self.cluster_tag}_"
             f"TileM{self.tile_m}_TileN{self.tile_n}"
         )
 
@@ -248,36 +274,41 @@ def _read_tuple_constant(path: Path, name: str) -> tuple[int, ...]:
         if not isinstance(node, (ast.Assign, ast.AnnAssign)):
             continue
         targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-        if not any(isinstance(target, ast.Name) and target.id == name for target in targets):
+        if not any(
+            isinstance(target, ast.Name) and target.id == name for target in targets
+        ):
             continue
         value = ast.literal_eval(node.value)
-        if not isinstance(value, tuple) or not all(isinstance(item, int) for item in value):
+        if not isinstance(value, tuple) or not all(
+            isinstance(item, int) for item in value
+        ):
             raise ValueError(f"{path}:{name} must be a literal tuple of integers")
         return value
     raise ValueError(f"Unable to find {name} in {path}")
 
 
-def supported_tiles() -> dict[str, tuple[tuple[int, int], ...]]:
+def supported_tiles(operand_order: str, pingpong: bool) -> tuple[tuple[int, int], ...]:
     non_swap_file = SCRIPT_DIR / "epilogue_fp8.py"
     swap_file = SCRIPT_DIR / "epilogue_fp8_swapab.py"
     non_swap_m = _read_tuple_constant(non_swap_file, "NonSwapTileMChoices")
     non_swap_n = _read_tuple_constant(non_swap_file, "NonSwapTileNChoices")
     swap_m = _read_tuple_constant(swap_file, "SwapABTileMChoices")
     swap_n = _read_tuple_constant(swap_file, "SwapABTokenTileNChoices")
-    return {
+    tiles = {
         "non_swap_ab": tuple((m, n) for m in non_swap_m for n in non_swap_n),
         "swap_ab": tuple((m, n) for m in swap_m for n in swap_n),
     }
+    selected = tiles[operand_order]
+    if not pingpong:
+        return selected
+    if operand_order == "non_swap_ab":
+        return tuple((m, n) for m, n in selected if n == 128)
+    return tuple((m, n) for m, n in selected if m == 128)
 
 
-def build_cases(
-    smoke: bool = False, rank_mode: str = "both"
-) -> tuple[BenchmarkCase, ...]:
+def build_cases(rank_mode: str = "multirank") -> tuple[BenchmarkCase, ...]:
     if rank_mode not in RANK_MODE_CHOICES:
-        raise ValueError(
-            f"rank_mode must be one of {','.join(RANK_MODE_CHOICES)}"
-        )
-    tiles = supported_tiles()
+        raise ValueError(f"rank_mode must be one of {','.join(RANK_MODE_CHOICES)}")
     selected_rank_modes = (
         RANK_MODES
         if rank_mode == "both"
@@ -285,26 +316,30 @@ def build_cases(
     )
     cases = tuple(
         BenchmarkCase(
-            case_rank_mode, perf_case, world_size, scale_mode, order, m, n
+            case_rank_mode,
+            perf_case,
+            world_size,
+            scale_mode,
+            order,
+            pingpong,
+            m,
+            n,
+            cluster_shape,
         )
         for case_rank_mode, perf_case, world_size in selected_rank_modes
         for scale_mode in SCALE_MODES
-        for order in ("non_swap_ab", "swap_ab")
-        for m, n in tiles[order]
+        for order in OPERAND_ORDERS
+        for pingpong in (False, True)
+        for m, n in supported_tiles(order, pingpong)
+        for cluster_shape in CLUSTER_SHAPES
     )
-    if not smoke:
-        return cases
-    return tuple(
-        case
-        for case in cases
-        if case.scale_mode == "per_tensor"
-        and case.operand_order == "non_swap_ab"
-        and (case.tile_m, case.tile_n) == tiles["non_swap_ab"][0]
-    )
+    return cases
 
 
 def _case_environment(case: BenchmarkCase, tokens_per_rank: int) -> dict[str, str]:
     env = os.environ.copy()
+    python_bin = str(Path(sys.executable).resolve().parent)
+    env["PATH"] = os.pathsep.join((python_bin, env.get("PATH", "")))
     env.pop("FP8_SCALE_MODES", None)
     env.pop("FP8_SCALE_MODE", None)
     env.pop("FP8_SWAP_AB", None)
@@ -324,6 +359,9 @@ def _case_environment(case: BenchmarkCase, tokens_per_rank: int) -> dict[str, st
             "DSV4_ROUTE_ROWS": str(tokens_per_rank * TOPK),
             "DSV4_GATE_UP_CLAMP": GATE_UP_CLAMP,
             "FP8_ACCUM_MODE": "1xacc",
+            "FP8_CLUSTER_SHAPE": ",".join(
+                str(value) for value in case.cluster_shape_mnk
+            ),
             "PERF_WARMUP": str(WARMUP),
             "PERF_ITERS": str(ITERS),
             "TIMEOUT_SECONDS": str(TIMEOUT_SECONDS),
@@ -358,6 +396,8 @@ def _case_cli_args(case: BenchmarkCase) -> list[str]:
     args = ["--scale-mode", scale_mode]
     if case.operand_order == "swap_ab":
         args.append("--swapab")
+    if case.pingpong:
+        args.append("--pingpong")
     return args
 
 
@@ -394,6 +434,26 @@ def _next_attempt(path: Path, tokens_per_rank: int) -> int:
 
 def _append_csv_row(path: Path, row: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.stat().st_size:
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.DictReader(handle)
+            existing_fields = tuple(reader.fieldnames or ())
+            existing_rows = list(reader)
+        if existing_fields != CSV_FIELDS:
+            unknown_fields = set(existing_fields) - set(CSV_FIELDS)
+            if unknown_fields:
+                raise ValueError(
+                    f"Cannot migrate {path}; unknown fields: {sorted(unknown_fields)}"
+                )
+            temporary_path = path.with_suffix(".csv.tmp")
+            with temporary_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
+                writer.writeheader()
+                writer.writerows(
+                    {field: existing.get(field, "") for field in CSV_FIELDS}
+                    for existing in existing_rows
+                )
+            os.replace(temporary_path, path)
     write_header = not path.exists() or path.stat().st_size == 0
     with path.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
@@ -403,8 +463,11 @@ def _append_csv_row(path: Path, row: dict[str, object]) -> None:
 
 
 def _run_and_tee(
-    command: Sequence[str], env: dict[str, str], log_path: Path
-) -> tuple[int, list[str]]:
+    command: Sequence[str],
+    env: dict[str, str],
+    log_path: Path,
+    silence_timeout_s: int,
+) -> tuple[int, list[str], bool]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
     with log_path.open("w", encoding="utf-8") as log_handle:
@@ -416,19 +479,60 @@ def _run_and_tee(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
         assert process.stdout is not None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        last_output = time.monotonic()
+        timed_out = False
         try:
+            while process.poll() is None:
+                events = selector.select(timeout=1.0)
+                if events:
+                    line = process.stdout.readline()
+                    if line:
+                        print(line, end="", flush=True)
+                        log_handle.write(line)
+                        log_handle.flush()
+                        lines.append(line)
+                        last_output = time.monotonic()
+                    continue
+                silent_for = time.monotonic() - last_output
+                if silent_for < silence_timeout_s:
+                    continue
+                message = (
+                    f"[TIMEOUT] no output for {silent_for:.1f}s; "
+                    "terminating the process group\n"
+                )
+                print(message, end="", flush=True)
+                log_handle.write(message)
+                log_handle.flush()
+                lines.append(message)
+                timed_out = True
+                os.killpg(process.pid, signal.SIGTERM)
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=10)
+                break
+
             for line in process.stdout:
                 print(line, end="", flush=True)
                 log_handle.write(line)
-                log_handle.flush()
                 lines.append(line)
         except KeyboardInterrupt:
-            process.terminate()
-            process.wait(timeout=30)
+            os.killpg(process.pid, signal.SIGTERM)
+            try:
+                process.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait(timeout=10)
             raise
-        return process.wait(), lines
+        finally:
+            selector.close()
+        return process.wait(), lines, timed_out
 
 
 def _run_case(
@@ -438,6 +542,8 @@ def _run_case(
     run_date: str,
     git_commit: str,
     gpu_names: str,
+    gpu_clocks_mhz: str,
+    silence_timeout_s: int,
 ) -> tuple[str, Path]:
     csv_path = case.csv_path(output_dir, run_date)
     attempt = _next_attempt(csv_path, tokens_per_rank)
@@ -450,19 +556,24 @@ def _run_case(
     print("=" * 79)
     print(
         f"[SWEEP] {case.rank_mode} {case.scale_tag} {case.order_tag} "
+        f"{case.schedule_tag} {case.cluster_tag} "
         f"M{case.tile_m}N{case.tile_n} tokens_per_rank={tokens_per_rank} "
         f"attempt={attempt}"
     )
     print(f"[CMD] {display_command}")
     print(f"[LOG] {log_path}")
     start = time.monotonic()
-    return_code, output_lines = _run_and_tee(command, env, log_path)
+    return_code, output_lines, timed_out = _run_and_tee(
+        command, env, log_path, silence_timeout_s
+    )
     wall_time_s = time.monotonic() - start
     timing = parse_profiler_output(output_lines)
 
     expected_ranks = set(range(case.world_size))
     parsed_ranks = set(timing.rank_times_us)
-    if return_code != 0:
+    if timed_out:
+        status = "timeout"
+    elif return_code != 0:
         status = "failed"
     elif parsed_ranks != expected_ranks:
         status = "parse_error"
@@ -472,23 +583,30 @@ def _run_case(
     rank_values = [timing.rank_times_us[rank] for rank in sorted(parsed_ranks)]
     if rank_values:
         min_rank = min(timing.rank_times_us, key=timing.rank_times_us.__getitem__)
+        max_rank = max(timing.rank_times_us, key=timing.rank_times_us.__getitem__)
         min_mega_us = min(rank_values)
         max_mega_us = max(rank_values)
         mean_mega_us = statistics.fmean(rank_values)
     else:
         min_rank = ""
+        max_rank = ""
         min_mega_us = ""
         max_mega_us = ""
         mean_mega_us = ""
 
-    fc1_flops, fc2_flops, total_flops = compute_gemm_flops_per_rank(
-        tokens_per_rank
-    )
+    fc1_flops, fc2_flops, total_flops = compute_gemm_flops_per_rank(tokens_per_rank)
     critical_tflops = (
         effective_tflops(total_flops, max_mega_us)
         if status == "pass" and isinstance(max_mega_us, float)
         else ""
     )
+    min_rank_tflops = (
+        effective_tflops(total_flops, min_mega_us)
+        if status == "pass" and isinstance(min_mega_us, float)
+        else ""
+    )
+    max_rank_tflops = critical_tflops
+    cluster_m, cluster_n, cluster_k = case.cluster_shape_mnk
 
     row: dict[str, object] = {
         "run_date": run_date,
@@ -498,9 +616,13 @@ def _run_case(
         "rank_mode": case.rank_mode,
         "scale_mode": case.scale_mode,
         "operand_order": case.operand_order,
+        "pingpong": int(case.pingpong),
         "tile_m": case.tile_m,
         "tile_n": case.tile_n,
         "tile_k": TILE_K,
+        "cluster_m": cluster_m,
+        "cluster_n": cluster_n,
+        "cluster_k": cluster_k,
         "tokens_per_rank": tokens_per_rank,
         "topk": TOPK,
         "routed_tokens_per_rank": tokens_per_rank * TOPK,
@@ -516,9 +638,12 @@ def _run_case(
         "return_code": return_code,
         "wall_time_s": f"{wall_time_s:.3f}",
         "min_rank": min_rank,
+        "max_rank": max_rank,
         "min_mega_us": min_mega_us,
         "max_mega_us": max_mega_us,
         "mean_mega_us": mean_mega_us,
+        "min_rank_tflops_per_rank": min_rank_tflops,
+        "max_rank_tflops_per_rank": max_rank_tflops,
         "reported_min_rank": timing.reported_min_rank,
         "reported_min_mega_us": timing.reported_min_mega_us,
         "reported_min_topk_us": timing.reported_min_topk_us,
@@ -529,6 +654,7 @@ def _run_case(
         "critical_tflops_per_rank": critical_tflops,
         "git_commit": git_commit,
         "gpu_names": gpu_names,
+        "gpu_clocks_mhz": gpu_clocks_mhz,
         "log_file": log_path.relative_to(output_dir).as_posix(),
         "command": display_command,
     }
@@ -544,7 +670,9 @@ def _run_case(
 
 def _run_command_text(command: Sequence[str]) -> str:
     try:
-        return subprocess.check_output(command, text=True, stderr=subprocess.DEVNULL).strip()
+        return subprocess.check_output(
+            command, text=True, stderr=subprocess.DEVNULL
+        ).strip()
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
 
@@ -552,6 +680,19 @@ def _run_command_text(command: Sequence[str]) -> str:
 def _gpu_names() -> str:
     output = _run_command_text(
         ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"]
+    )
+    if output == "unknown":
+        return output
+    return ";".join(line.strip() for line in output.splitlines() if line.strip())
+
+
+def _gpu_clocks_mhz() -> str:
+    output = _run_command_text(
+        [
+            "nvidia-smi",
+            "--query-gpu=clocks.mem,clocks.sm",
+            "--format=csv,noheader,nounits",
+        ]
     )
     if output == "unknown":
         return output
@@ -577,6 +718,60 @@ def _validate_run_date(value: str) -> str:
     return value
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def _parse_tokens(value: str) -> tuple[int, ...]:
+    try:
+        tokens = tuple(int(item) for item in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "tokens must be comma-separated integers"
+        ) from error
+    if not tokens or any(token <= 0 for token in tokens):
+        raise argparse.ArgumentTypeError("tokens must all be positive")
+    return tokens
+
+
+def _parse_cluster_shape(value: str) -> tuple[int, int, int]:
+    try:
+        shape = tuple(int(item) for item in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "cluster shape must be M,N or M,N,K"
+        ) from error
+    if len(shape) == 2:
+        shape = (*shape, 1)
+    if shape not in CLUSTER_SHAPES:
+        choices = ", ".join("x".join(map(str, item[:2])) for item in CLUSTER_SHAPES)
+        raise argparse.ArgumentTypeError(f"cluster shape must be one of {choices}")
+    return shape
+
+
+def _select_cases(
+    cases: Sequence[BenchmarkCase],
+    scale_mode: str,
+    operand_order: str,
+    schedule: str,
+    cluster_shapes: Sequence[tuple[int, int, int]] | None,
+) -> tuple[BenchmarkCase, ...]:
+    scale_filter = scale_mode.replace("-", "_")
+    order_filter = operand_order.replace("-", "_")
+    selected = tuple(
+        case
+        for case in cases
+        if (scale_filter == "both" or case.scale_mode == scale_filter)
+        and (order_filter == "both" or case.operand_order == order_filter)
+        and (schedule == "both" or case.pingpong == (schedule == "pingpong"))
+        and (cluster_shapes is None or case.cluster_shape_mnk in cluster_shapes)
+    )
+    return selected
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -597,8 +792,57 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rank-mode",
         choices=RANK_MODE_CHOICES,
+        default="multirank",
+        help="Run singlerank (P02), multirank (P03), or both (default: multirank).",
+    )
+    parser.add_argument(
+        "--tokens",
+        type=_parse_tokens,
+        default=TOKEN_SIZES,
+        help="Comma-separated tokens per rank (default: 8,16,...,32768).",
+    )
+    parser.add_argument(
+        "--scale-mode",
+        choices=("both", "per-tensor", "blockwise"),
         default="both",
-        help="Run singlerank (P02), multirank (P03), or both (default: both).",
+        help="Select one scale mode or both (default: both).",
+    )
+    parser.add_argument(
+        "--operand-order",
+        choices=("both", "non-swap-ab", "swap-ab"),
+        default="both",
+        help="Select non-swapAB, swapAB, or both (default: both).",
+    )
+    parser.add_argument(
+        "--schedule",
+        choices=("both", "legacy", "pingpong"),
+        default="both",
+        help="Select legacy, ping-pong, or both schedules (default: both).",
+    )
+    parser.add_argument(
+        "--cluster-shape",
+        type=_parse_cluster_shape,
+        action="append",
+        default=None,
+        help="Select a CGA as M,N; repeat to select multiple shapes.",
+    )
+    parser.add_argument(
+        "--shard-count",
+        type=_positive_int,
+        default=1,
+        help="Partition configurations into this many deterministic shards.",
+    )
+    parser.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help="Zero-based shard index (default: 0).",
+    )
+    parser.add_argument(
+        "--silence-timeout",
+        type=_positive_int,
+        default=SILENCE_TIMEOUT_SECONDS,
+        help="Kill a run after this many seconds without output (default: 300).",
     )
     parser.add_argument(
         "--force",
@@ -616,6 +860,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Do not invoke plot_token_sweep.py after the benchmark.",
     )
     parser.add_argument(
+        "--no-finalize",
+        action="store_true",
+        help="Do not generate summary or plots after running the selected shard.",
+    )
+    parser.add_argument(
         "--list",
         action="store_true",
         help="List the fixed CSV configurations without running them.",
@@ -628,7 +877,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--smoke",
         action="store_true",
-        help="Validation-only subset for the selected rank mode at token=512.",
+        help="Run only the first selected configuration and token.",
     )
     return parser
 
@@ -644,8 +893,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not SUMMARY_SCRIPT.is_file():
         raise FileNotFoundError(SUMMARY_SCRIPT)
 
-    cases = build_cases(smoke=args.smoke, rank_mode=args.rank_mode)
-    token_sizes = TOKEN_SIZES[:1] if args.smoke else TOKEN_SIZES
+    if args.shard_index < 0 or args.shard_index >= args.shard_count:
+        raise ValueError("--shard-index must be in [0, --shard-count)")
+    cases = _select_cases(
+        build_cases(rank_mode=args.rank_mode),
+        args.scale_mode,
+        args.operand_order,
+        args.schedule,
+        args.cluster_shape,
+    )
+    cases = tuple(
+        case
+        for index, case in enumerate(cases)
+        if index % args.shard_count == args.shard_index
+    )
+    token_sizes = tuple(args.tokens)
+    if args.smoke:
+        cases = cases[:1]
+        token_sizes = token_sizes[:1]
+    if not cases:
+        raise ValueError("No benchmark configurations match the selected filters")
     expected_runs = len(cases) * len(token_sizes)
 
     if args.list:
@@ -662,7 +929,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"RUNS={expected_runs}")
         return 0
 
-    if not args.no_plot:
+    finalize = not args.no_finalize and args.shard_count == 1
+    if finalize and not args.no_plot:
         _require_plot_dependency()
 
     output_dir = args.output_dir.resolve()
@@ -670,20 +938,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     run_dir.mkdir(parents=True, exist_ok=True)
     git_commit = _run_command_text(["git", "rev-parse", "HEAD"])
     gpu_names = _gpu_names()
+    gpu_clocks_mhz = _gpu_clocks_mhz()
 
     print("=" * 79)
-    print("Hopper FP8 fixed P02/P03 token sweep")
+    print("Hopper FP8 P03 tile/CGA/ping-pong token sweep")
     print(f"  output_root      : {output_dir}")
     print(f"  run_dir          : {run_dir}")
     print(f"  run_date         : {args.date}")
     print(f"  rank_mode        : {args.rank_mode}")
     print(f"  token_sizes      : {token_sizes}")
     print(f"  configurations   : {len(cases)}")
+    print(f"  shard             : {args.shard_index}/{args.shard_count}")
     print(f"  planned runs     : {expected_runs}")
     print(f"  topk             : {TOPK}")
     print(f"  warmup / iters   : {WARMUP} / {ITERS}")
     print(f"  git_commit       : {git_commit}")
     print(f"  gpu_names        : {gpu_names}")
+    print(f"  gpu_clocks_mhz   : {gpu_clocks_mhz}")
     print(f"  resume           : {'disabled (--force)' if args.force else 'enabled'}")
     print("=" * 79)
 
@@ -696,7 +967,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         successful = _successful_tokens(csv_path)
         for tokens_per_rank in token_sizes:
             if not args.force and tokens_per_rank in successful:
-                print(f"[SKIP passed] {csv_path.name} tokens_per_rank={tokens_per_rank}")
+                print(
+                    f"[SKIP passed] {csv_path.name} tokens_per_rank={tokens_per_rank}"
+                )
                 skipped += 1
                 continue
             status, _ = _run_case(
@@ -706,6 +979,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.date,
                 git_commit,
                 gpu_names,
+                gpu_clocks_mhz,
+                args.silence_timeout,
             )
             if status == "pass":
                 passed += 1
@@ -717,6 +992,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         if stop:
             break
 
+    summary_rc = 0
+    plot_rc = 0
+    if not finalize:
+        print("[FINALIZE] skipped for this shard")
     summary_command = [
         sys.executable,
         str(SUMMARY_SCRIPT),
@@ -725,13 +1004,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--date",
         args.date,
     ]
-    print(f"[SUMMARY] {shlex.join(summary_command)}")
-    summary_rc = subprocess.run(
-        summary_command, cwd=SCRIPT_DIR.parent, check=False
-    ).returncode
+    if finalize:
+        print(f"[SUMMARY] {shlex.join(summary_command)}")
+        summary_rc = subprocess.run(
+            summary_command, cwd=SCRIPT_DIR.parent, check=False
+        ).returncode
 
-    plot_rc = 0
-    if not args.no_plot:
+    if finalize and not args.no_plot:
         plot_command = [
             sys.executable,
             str(PLOT_SCRIPT),
@@ -743,7 +1022,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.rank_mode,
         ]
         print(f"[PLOT] {shlex.join(plot_command)}")
-        plot_rc = subprocess.run(plot_command, cwd=SCRIPT_DIR.parent, check=False).returncode
+        plot_rc = subprocess.run(
+            plot_command, cwd=SCRIPT_DIR.parent, check=False
+        ).returncode
 
     print("=" * 79)
     print(

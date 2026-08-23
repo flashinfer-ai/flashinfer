@@ -4,7 +4,8 @@
 # through torchrun using MEGA_NPROC/MEGA_NNODES overrides when present.
 #
 # Hopper FP8 tile constraints (apply to ALL tests below):
-#   * Only the 1CTA cluster_shape_mnk 1,1,1 path is validated.
+#   * Cluster 1,1,1 / 2,1,1 / 1,2,1 / 2,2,1 is selected through
+#     FP8_CLUSTER_SHAPE (default 1,1,1).
 #   * Non-swap uses M=64 and N=128/256, selected with
 #     FP8_NON_SWAP_M/N (defaults 64/128).
 #   * Swap-AB uses M=128/256, K=128; FP8_SWAP_AB_M selects M (default 256)
@@ -20,6 +21,7 @@
 # Usage:
 #   bash <abs path>/run_mega_tests.sh --scale-mode per-tensor
 #   bash <abs path>/run_mega_tests.sh --scale-mode blockwise --swapab
+#   bash <abs path>/run_mega_tests.sh --scale-mode per-tensor --pingpong
 #   PYTHON=python3.11 bash .../run_mega_tests.sh
 #   MEGA_NPROC=4 bash .../run_mega_tests.sh
 #   bash .../run_mega_tests.sh --fail-fast
@@ -29,6 +31,7 @@
 # Variant selection:
 #   each invocation runs one scale mode; default is per-tensor.
 #   --swapab selects swap-AB; without it, the test uses non-swap.
+#   --pingpong alternates complete tasks across two WGMMA+epilogue warpgroups.
 #   FP8_ACCUM_MODE=2xacc bash ... --scale-mode per-tensor     # legacy 2xacc
 #   FP8_NON_SWAP_M=64 FP8_NON_SWAP_N=128 bash .../run_mega_tests.sh M01
 #   FP8_SWAP_AB_M=256 FP8_SWAP_AB_N=32 bash .../run_mega_tests.sh --swapab M01
@@ -59,6 +62,7 @@ RUNNER="${SCRIPT_DIR}/mega_runner.py"
 PYTHON="${PYTHON:-python}"
 SCALE_MODE="${FP8_SCALE_MODE:-per_tensor}"
 SWAP_AB=0
+PINGPONG=0
 FAIL_FAST=0
 LIST_ONLY=0
 declare -a SELECTORS=()
@@ -74,6 +78,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --swapab)
             SWAP_AB=1
+            shift
+            ;;
+        --pingpong)
+            PINGPONG=1
             shift
             ;;
         --fail-fast)
@@ -119,8 +127,21 @@ case "$FP8_ACCUM_MODE" in
         ;;
 esac
 TILE_ARGS=()
+FP8_CLUSTER_SHAPE="${FP8_CLUSTER_SHAPE:-1,1,1}"
+case "$FP8_CLUSTER_SHAPE" in
+    1,1,1|2,1,1|1,2,1|2,2,1)
+        ;;
+    *)
+        echo "ERROR: FP8_CLUSTER_SHAPE must be 1,1,1, 2,1,1, 1,2,1, or 2,2,1" >&2
+        exit 2
+        ;;
+esac
 if [ "$SWAP_AB" -eq 1 ]; then
-    FP8_SWAP_AB_M="${FP8_SWAP_AB_M:-256}"
+    if [ "$PINGPONG" -eq 1 ]; then
+        FP8_SWAP_AB_M="${FP8_SWAP_AB_M:-128}"
+    else
+        FP8_SWAP_AB_M="${FP8_SWAP_AB_M:-256}"
+    fi
     case "$FP8_SWAP_AB_M" in
         128|256)
             ;;
@@ -138,7 +159,15 @@ if [ "$SWAP_AB" -eq 1 ]; then
             exit 2
             ;;
     esac
-    TILE_ARGS=(--swap_ab --mma_tiler_mnk "${FP8_SWAP_AB_M},${FP8_SWAP_AB_N},128")
+    TILE_ARGS=(
+        --swap_ab
+        --mma_tiler_mnk "${FP8_SWAP_AB_M},${FP8_SWAP_AB_N},128"
+        --cluster_shape_mnk "$FP8_CLUSTER_SHAPE"
+    )
+    if [ "$PINGPONG" -eq 1 ] && [ "$FP8_SWAP_AB_M" -ne 128 ]; then
+        echo "ERROR: swap-AB ping-pong requires FP8_SWAP_AB_M=128" >&2
+        exit 2
+    fi
 else
     FP8_NON_SWAP_M="${FP8_NON_SWAP_M:-64}"
     case "$FP8_NON_SWAP_M" in
@@ -158,7 +187,17 @@ else
             exit 2
             ;;
     esac
-    TILE_ARGS=(--mma_tiler_mnk "${FP8_NON_SWAP_M},${FP8_NON_SWAP_N},128")
+    TILE_ARGS=(
+        --mma_tiler_mnk "${FP8_NON_SWAP_M},${FP8_NON_SWAP_N},128"
+        --cluster_shape_mnk "$FP8_CLUSTER_SHAPE"
+    )
+    if [ "$PINGPONG" -eq 1 ] && [ "$FP8_NON_SWAP_N" -ne 128 ]; then
+        echo "ERROR: non-swap ping-pong requires FP8_NON_SWAP_N=128" >&2
+        exit 2
+    fi
+fi
+if [ "$PINGPONG" -eq 1 ]; then
+    TILE_ARGS=(--pingpong "${TILE_ARGS[@]}")
 fi
 
 resolve_mode_args() {
@@ -221,9 +260,8 @@ test_matches_selectors() {
     return 1
 }
 
-# Common Hopper FP8 tile args (the only supported config):
-#   --mma_tiler_mnk 64,128,128 --cluster_shape_mnk 1,1,1
-# All entries below include these explicitly for clarity.
+# Entries retain their historical 1,1,1 arguments for readability; TILE_ARGS
+# is appended last and applies FP8_CLUSTER_SHAPE to every launch.
 
 declare -a TESTS=(
     # ── M01: single-rank sanity ──
@@ -268,7 +306,7 @@ echo "  PYTHON : ${PYTHON}"
 echo "  NPROC  : ${NPROC}"
 echo "  NNODES : ${MEGA_NNODES}"
 echo "  WORLD  : ${WORLD_SIZE}"
-echo "  MODE   : ${SCALE_MODE}"
+echo "  MODE   : ${SCALE_MODE} (pingpong=${PINGPONG})"
 if [ "$MEGA_NNODES" -gt 1 ]; then
     echo "  NODE   : rank ${MEGA_NODE_RANK}, master ${MEGA_MASTER_ADDR}:${MEGA_MASTER_PORT}"
 fi

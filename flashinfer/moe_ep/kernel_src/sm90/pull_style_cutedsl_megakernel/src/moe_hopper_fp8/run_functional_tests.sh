@@ -3,8 +3,9 @@
 # It resolves runner_fc12.py (co-located in this moe_hopper_fp8/ folder)
 # relative to this script, so CWD is irrelevant.
 #
-# Hopper FP8 uses the 1CTA --cluster_shape_mnk 1,1,1 path. Non-swap selects
-# M=64 and N=128/256 with FP8_NON_SWAP_M/N (defaults 64/128).
+# Hopper FP8 supports cluster 1,1,1 / 2,1,1 / 1,2,1 / 2,2,1, selected with
+# FP8_CLUSTER_SHAPE (default 1,1,1). Non-swap selects M=64 and N=128/256
+# with FP8_NON_SWAP_M/N (defaults 64/128).
 # Swap-AB uses M=128/256, K=128 and selects M/N with
 # FP8_SWAP_AB_M=128/256 (default 256) and
 # FP8_SWAP_AB_N=16/32/64/128 (default 32).
@@ -12,6 +13,7 @@
 # Usage:
 #   bash <abs path>/run_functional_tests.sh --scale-mode per-tensor
 #   bash <abs path>/run_functional_tests.sh --scale-mode blockwise --swapab
+#   bash <abs path>/run_functional_tests.sh --scale-mode per-tensor --pingpong
 #   PYTHON=python3.11 bash .../run_functional_tests.sh
 #   bash .../run_functional_tests.sh --fail-fast
 #   bash .../run_functional_tests.sh --list
@@ -20,6 +22,7 @@
 # Variant selection:
 #   each invocation runs one scale mode; default is per-tensor.
 #   --swapab selects swap-AB; without it, the test uses non-swap.
+#   --pingpong alternates complete tasks across two WGMMA+epilogue warpgroups.
 #   Each variant runs its six base cases and every legal M/N tile with 1xacc.
 #   Per-tensor variants also run one representative 2xacc case.
 #   Use a Txx or A01 selector to run only the tile or 2xacc matrix cases.
@@ -57,6 +60,7 @@ RUNNER="${SCRIPT_DIR}/runner_fc12.py"
 PYTHON="${PYTHON:-python}"
 SCALE_MODE="${FP8_SCALE_MODE:-per_tensor}"
 SWAP_AB=0
+PINGPONG=0
 FAIL_FAST=0
 LIST_ONLY=0
 declare -a SELECTORS=()
@@ -72,6 +76,10 @@ while [ "$#" -gt 0 ]; do
             ;;
         --swapab)
             SWAP_AB=1
+            shift
+            ;;
+        --pingpong)
+            PINGPONG=1
             shift
             ;;
         --fail-fast)
@@ -117,7 +125,11 @@ case "$FP8_ACCUM_MODE" in
         ;;
 esac
 if [ "$SWAP_AB" -eq 1 ]; then
-    FP8_SWAP_AB_M="${FP8_SWAP_AB_M:-256}"
+    if [ "$PINGPONG" -eq 1 ]; then
+        FP8_SWAP_AB_M="${FP8_SWAP_AB_M:-128}"
+    else
+        FP8_SWAP_AB_M="${FP8_SWAP_AB_M:-256}"
+    fi
     case "$FP8_SWAP_AB_M" in
         128|256)
             ;;
@@ -137,6 +149,10 @@ if [ "$SWAP_AB" -eq 1 ]; then
     esac
     SELECTED_TILE_M=$FP8_SWAP_AB_M
     SELECTED_TILE_N=$FP8_SWAP_AB_N
+    if [ "$PINGPONG" -eq 1 ] && [ "$SELECTED_TILE_M" -ne 128 ]; then
+        echo "ERROR: swap-AB ping-pong requires FP8_SWAP_AB_M=128" >&2
+        exit 2
+    fi
 else
     FP8_NON_SWAP_M="${FP8_NON_SWAP_M:-64}"
     case "$FP8_NON_SWAP_M" in
@@ -158,12 +174,26 @@ else
     esac
     SELECTED_TILE_M=$FP8_NON_SWAP_M
     SELECTED_TILE_N=$FP8_NON_SWAP_N
+    if [ "$PINGPONG" -eq 1 ] && [ "$SELECTED_TILE_N" -ne 128 ]; then
+        echo "ERROR: non-swap ping-pong requires FP8_NON_SWAP_N=128" >&2
+        exit 2
+    fi
 fi
 
 if [ ! -f "$RUNNER" ]; then
     echo "ERROR: runner_fc12.py not found at ${RUNNER}" >&2
     exit 2
 fi
+
+FP8_CLUSTER_SHAPE="${FP8_CLUSTER_SHAPE:-1,1,1}"
+case "$FP8_CLUSTER_SHAPE" in
+    1,1,1|2,1,1|1,2,1|2,2,1)
+        ;;
+    *)
+        echo "ERROR: FP8_CLUSTER_SHAPE must be 1,1,1, 2,1,1, 1,2,1, or 2,2,1" >&2
+        exit 2
+        ;;
+esac
 
 # Returns 0 (true) if the test name matches any selector, OR if the selector
 # list is empty (default = run all).
@@ -259,6 +289,14 @@ for entry in "${TILE_SHAPE_CASES[@]}"; do
     if [ "$case_swap_ab" -ne "$SWAP_AB" ]; then
         continue
     fi
+    if [ "$PINGPONG" -eq 1 ]; then
+        if [ "$case_swap_ab" -eq 0 ] && [ "$tile_n" -ne 128 ]; then
+            continue
+        fi
+        if [ "$case_swap_ab" -eq 1 ] && [ "$tile_m" -ne 128 ]; then
+            continue
+        fi
+    fi
     add_active_test "${tile_name}_1xacc" "$MATRIX_TEST_ARGS" 1xacc \
         "$case_swap_ab" "$tile_m" "$tile_n"
 done
@@ -303,9 +341,15 @@ for index in "${!ACTIVE_NAMES[@]}"; do
         tile_n="${ACTIVE_TILE_N[$index]}"
         full_name="${SCALE_MODE}/${name}"
 
-        case_tile_args=(--mma_tiler_mnk "${tile_m},${tile_n},128")
+        case_tile_args=(
+            --mma_tiler_mnk "${tile_m},${tile_n},128"
+            --cluster_shape_mnk "$FP8_CLUSTER_SHAPE"
+        )
         if [ "$case_swap_ab" -eq 1 ]; then
             case_tile_args=(--swap_ab "${case_tile_args[@]}")
+        fi
+        if [ "$PINGPONG" -eq 1 ]; then
+            case_tile_args=(--pingpong "${case_tile_args[@]}")
         fi
 
         if ! test_matches_selectors "$full_name"; then
@@ -316,13 +360,13 @@ for index in "${!ACTIVE_NAMES[@]}"; do
         echo
         echo "==========================================================================="
         echo "[TEST] $full_name"
-        echo "[MODE] scale=$SCALE_MODE accum=$accum_mode swap_ab=$case_swap_ab tile=${tile_m},${tile_n},128"
+        echo "[MODE] scale=$SCALE_MODE accum=$accum_mode swap_ab=$case_swap_ab pingpong=$PINGPONG tile=${tile_m},${tile_n},128"
         echo "[CMD]  $PYTHON $RUNNER $args --fp8_scale_mode $SCALE_MODE --fp8_accum_mode $accum_mode ${case_tile_args[*]}"
         echo "==========================================================================="
 
         test_start=$SECONDS
         # shellcheck disable=SC2086  # intentional word-splitting on $args
-        "$PYTHON" "$RUNNER" $args --fp8_scale_mode "$SCALE_MODE" \
+        timeout 300 "$PYTHON" "$RUNNER" $args --fp8_scale_mode "$SCALE_MODE" \
             --fp8_accum_mode "$accum_mode" "${case_tile_args[@]}"
         rc=$?
         elapsed=$((SECONDS - test_start))

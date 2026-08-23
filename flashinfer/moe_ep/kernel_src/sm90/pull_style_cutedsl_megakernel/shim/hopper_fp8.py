@@ -66,16 +66,23 @@ _FP8_DISPATCH_SCALE_ATOM_K = 128  # Fp8DispatchScaleAtomK = 4 * Fp8E8M0SfVecSize
 
 # Kernel-geometry choices mirrored from moe_hopper_fp8/epilogue_fp8.py and
 # epilogue_fp8_swapab.py (pre-checks only -- the kernel ctor re-validates and
-# is authoritative).  The Hopper FP8 fork is 1-CTA-only.
+# is authoritative).
 _NONSWAP_TILE_M_CHOICES = (64,)
 _NONSWAP_TILE_N_CHOICES = (128, 256)
 _SWAPAB_TILE_M_CHOICES = (128, 256)
 _SWAPAB_TILE_N_CHOICES = (16, 32, 64, 128)
 
-# Drop-driver defaults (moe_hopper_fp8/mega_runner.py CLI): (64, 128, 128)
-# native, remapped to (256, 32, 128) under --swap_ab.
+# CGA shapes accepted by the drop's _validate_mma_tiler_and_cluster_shape
+# (both geometries).  Cluster K must stay 1; peers only cooperate through
+# scheduler grouping and TMA multicast.
+_SUPPORTED_CLUSTER_SHAPES_MN = ((1, 1), (2, 1), (1, 2), (2, 2))
+
+# Token-back placement enum mirrored from megamoe_kernel_fp8.py.
+_TOKEN_BACK_MODES = ("epi_warps", "standalone_warps", "reuse_dispatch_warps")
+
+# Drop-driver manual-mode default (heuristic_config.DEFAULT_MMA_TILER_MNK);
+# swap-AB manual defaults live in moe_hopper_fp8/heuristic_config.py.
 _DEFAULT_MMA_TILER_NATIVE = (64, 128, 128)
-_DEFAULT_MMA_TILER_SWAPAB = (256, 32, 128)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -117,6 +124,9 @@ class MegaMoEHopperFp8Config:
     fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor"
     fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc"
     swap_ab: bool = False
+    # Ping-pong task-tile scheduling: two WGMMA+epilogue warpgroups alternate
+    # complete task tiles (requires N=128 native / M=128 swap-AB).
+    pingpong: bool = False
     mma_tiler_mnk: Tuple[int, int, int] = _DEFAULT_MMA_TILER_NATIVE
     cluster_shape_mnk: Tuple[int, int, int] = (1, 1, 1)
     use_2cta_instrs: bool = False
@@ -130,7 +140,14 @@ class MegaMoEHopperFp8Config:
     flag_batch: int = 1
     epi_flag_batch: Tuple[int, int] = (2, 4)
     in_kernel_fc2_reduce: bool = False
+    # Legacy alias: True maps to token_back_mode="reuse_dispatch_warps"
+    # (the drop driver's Hopper default push mode), False to "epi_warps".
     token_back_by_dispatch: bool = False
+    # Explicit token-back placement; overrides token_back_by_dispatch when
+    # set.  See megamoe_kernel_fp8.Sm90MegaMoEFp8Kernel token_back_mode.
+    token_back_mode: Optional[
+        Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
+    ] = None
     # deepgemm compute graph: routing weights folded into the SwiGLU output
     # before FC1-output quantization (the driver's ref_compute_graph switch).
     # False leaves the staged FC2 terms unweighted and applies scores in the
@@ -198,9 +215,13 @@ class MegaMoEHopperFp8Config:
                     f"blockwise FP8 requires intermediate ({self.intermediate}) "
                     f"divisible by {_FP8_WEIGHT_SCALE_BLOCK_K}."
                 )
-        if self.in_kernel_fc2_reduce and self.token_back_by_dispatch:
+        if (
+            self.token_back_mode is not None
+            and self.token_back_mode not in _TOKEN_BACK_MODES
+        ):
             raise ValueError(
-                "in_kernel_fc2_reduce and token_back_by_dispatch cannot both be True."
+                f"token_back_mode must be one of {_TOKEN_BACK_MODES}, "
+                f"got {self.token_back_mode!r}."
             )
         if self.in_kernel_fc2_reduce and not self.apply_topk_in_fc1:
             # Kernel invariant: the Form B REDG path collapses topk before a
@@ -212,13 +233,33 @@ class MegaMoEHopperFp8Config:
                 "force_static_sched=True (dynamic CLC is future work)."
             )
         m, n, k = self.mma_tiler_mnk
-        if self.use_2cta_instrs or self.cluster_shape_mnk != (1, 1, 1):
+        if self.use_2cta_instrs:
             raise ValueError(
-                "The Hopper FP8 MegaMoE fork is 1-CTA-only: use_2cta_instrs "
-                "must be False and cluster_shape_mnk must be (1, 1, 1); got "
-                f"use_2cta_instrs={self.use_2cta_instrs}, "
+                "The Hopper FP8 MegaMoE fork has no 2-CTA WGMMA path: "
+                "use_2cta_instrs must be False; got "
+                f"use_2cta_instrs={self.use_2cta_instrs}."
+            )
+        cm, cn, ck = self.cluster_shape_mnk
+        if ck != 1 or (cm, cn) not in _SUPPORTED_CLUSTER_SHAPES_MN:
+            raise ValueError(
+                "Hopper FP8 cluster_shape_mnk (m, n) must be one of "
+                f"{_SUPPORTED_CLUSTER_SHAPES_MN} with k == 1; got "
                 f"cluster_shape_mnk={self.cluster_shape_mnk}."
             )
+        if self.pingpong:
+            # Ping-pong assigns one physical warpgroup per complete task
+            # tile: one N=128 WGMMA fragment native, one M=128 fragment
+            # swap-AB (kernel _setup ValueError otherwise).
+            if self.swap_ab and m != 128:
+                raise ValueError(
+                    "swap-AB Hopper FP8 ping-pong requires mma_tiler M=128; "
+                    f"got mma_tiler_mnk={self.mma_tiler_mnk}."
+                )
+            if not self.swap_ab and n != 128:
+                raise ValueError(
+                    "native Hopper FP8 ping-pong requires mma_tiler N=128; "
+                    f"got mma_tiler_mnk={self.mma_tiler_mnk}."
+                )
         if self.swap_ab:
             if m not in _SWAPAB_TILE_M_CHOICES or n not in _SWAPAB_TILE_N_CHOICES:
                 raise ValueError(
@@ -277,6 +318,13 @@ class MegaMoEHopperFp8Config:
     @property
     def blockwise(self) -> bool:
         return self.fp8_scale_mode == "blockwise"
+
+    @property
+    def resolved_token_back_mode(self) -> str:
+        """Explicit ``token_back_mode`` wins; else map the legacy bool."""
+        if self.token_back_mode is not None:
+            return self.token_back_mode
+        return "reuse_dispatch_warps" if self.token_back_by_dispatch else "epi_warps"
 
 
 @dataclasses.dataclass
@@ -483,6 +531,7 @@ class MegaMoEHopperFp8Frontend:
             c.fp8_scale_mode,
             c.fp8_accum_mode,
             c.swap_ab,
+            c.pingpong,
             c.world_size,
             c.rank,
             c.num_tokens_per_rank,
@@ -501,7 +550,7 @@ class MegaMoEHopperFp8Frontend:
             c.flag_batch,
             c.epi_flag_batch,
             c.in_kernel_fc2_reduce,
-            c.token_back_by_dispatch,
+            c.resolved_token_back_mode,
             c.apply_topk_in_fc1,
             self._gate_up_clamp,
             c.enable_iket,
@@ -595,6 +644,7 @@ class MegaMoEHopperFp8Frontend:
             sf_vec_size=Fp8E8M0SfVecSize,
             fp8_scale_mode=c.fp8_scale_mode,
             fp8_accum_mode=c.fp8_accum_mode,
+            pingpong=c.pingpong,
             world_size=c.world_size,
             local_rank=c.rank,
             num_topk=c.num_topk,
@@ -602,8 +652,7 @@ class MegaMoEHopperFp8Frontend:
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
-            # The SM90 drop keeps the bool (no token_back_mode enum yet).
-            token_back_by_dispatch=c.token_back_by_dispatch,
+            token_back_mode=c.resolved_token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
             gate_up_clamp=self._gate_up_clamp,
@@ -1129,12 +1178,17 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     kind: HopperFp8Kind = "fp8_e4m3",
     fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor",
     fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc",
-    swap_ab: bool = False,
+    swap_ab: Optional[bool] = None,
+    pingpong: Optional[bool] = None,
     mma_tiler_mnk: Optional[Tuple[int, int, int]] = None,
+    cluster_shape_mnk: Optional[Tuple[int, int, int]] = None,
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     in_kernel_fc2_reduce: bool = False,
     token_back_by_dispatch: bool = False,
+    token_back_mode: Optional[
+        Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
+    ] = None,
     apply_topk_in_fc1: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     group_hint: Optional[int] = None,
@@ -1151,9 +1205,16 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     ``kind`` selects the fp8 element format (``fp8_e4m3`` or ``fp8_e5m2``).
     ``fp8_scale_mode`` picks the scale ABI (legacy per-tensor E8M0 wire vs
     blockwise FP32 scales); ``fp8_accum_mode`` picks 1x vs 2x FP8 WGMMA
-    accumulation.  ``swap_ab`` selects the swap-A/B kernel geometry;
-    ``mma_tiler_mnk=None`` uses the drop driver's default for the geometry
-    ((64, 128, 128) native, (256, 32, 128) swap-AB).
+    accumulation.
+
+    Launch geometry (``swap_ab`` / ``pingpong`` / ``mma_tiler_mnk`` /
+    ``cluster_shape_mnk``) follows the drop driver's token heuristics
+    (``moe_hopper_fp8/heuristic_config.py``, keyed on ``fp8_scale_mode`` and
+    ``num_max_tokens``) when ALL four are ``None``.  Setting any one of them
+    switches to manual mode: unset knobs fall back to the drop driver's
+    defaults (``swap_ab=False``, ``pingpong=False``, tiler (64, 128, 128)
+    native / (256, 32, 128) swap-AB / (128, 32, 128) swap-AB ping-pong,
+    cluster (1, 1, 1)).
     ``gate_up_clamp`` sets the kernel gate-up clamp.  ``activation_clamp`` is
     a deprecated alias for ``gate_up_clamp``.
     ``intermediate`` is the post-SwiGLU width, matching the SM100 frontends
@@ -1162,10 +1223,6 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     Expert weights are not allocated here; supply kernel-ready
     ``(weight, weight_sf, activation_dequant_scale, weight_dequant_scale)``
     tuples to :func:`hopper_fp8_mega_moe` instead.
-
-    PORT NOTE: no ``knobs=`` dict / offline knob-cache path yet -- the SM90
-    tree has no tuner module; kernel knobs are the explicit keyword args
-    above.  Wire ``resolve_knobs``-style lookup when an SM90 tuner lands.
     """
     if hidden % 64 != 0 or intermediate % 64 != 0:
         raise ValueError(
@@ -1179,10 +1236,26 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         activation_clamp=activation_clamp,
     )
 
-    if mma_tiler_mnk is None:
-        mma_tiler_mnk = (
-            _DEFAULT_MMA_TILER_SWAPAB if swap_ab else _DEFAULT_MMA_TILER_NATIVE
-        )
+    # Drop-driver recipe (mega_runner.py main()): heuristic table unless any
+    # geometry/scheduling knob is set manually.  heuristic_config imports
+    # without cutlass; bootstrap_paths already ran at package import.
+    from moe_hopper_fp8.heuristic_config import resolve_hopper_fp8_config
+
+    selection = resolve_hopper_fp8_config(
+        fp8_scale_mode,
+        num_max_tokens,
+        swap_ab=swap_ab,
+        pingpong=pingpong,
+        mma_tiler_mnk=mma_tiler_mnk,
+        cluster_shape_mnk=cluster_shape_mnk,
+        accum_mode=fp8_accum_mode,
+    )
+    launch = selection.config
+    swap_ab = launch.swap_ab
+    pingpong = launch.pingpong
+    mma_tiler_mnk = launch.mma_tiler_mnk
+    cluster_shape_mnk = launch.cluster_shape_mnk
+    fp8_accum_mode = launch.accum_mode
 
     cfg = MegaMoEHopperFp8Config(
         rank=rank,
@@ -1196,10 +1269,13 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         fp8_scale_mode=fp8_scale_mode,
         fp8_accum_mode=fp8_accum_mode,
         swap_ab=swap_ab,
+        pingpong=pingpong,
         mma_tiler_mnk=mma_tiler_mnk,
+        cluster_shape_mnk=cluster_shape_mnk,
         gate_up_clamp=clamp,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         token_back_by_dispatch=token_back_by_dispatch,
+        token_back_mode=token_back_mode,
         apply_topk_in_fc1=apply_topk_in_fc1,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,

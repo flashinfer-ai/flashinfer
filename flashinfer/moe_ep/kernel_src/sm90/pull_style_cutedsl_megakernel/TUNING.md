@@ -136,18 +136,28 @@ once per session at workspace allocation:
   activation calibration scalars, identical on all EP ranks by contract) or
   `"blockwise"` (DeepGEMM-style 128-block fp32 scales; requires
   hidden/intermediate %128).
-- `swap_ab` + `mma_tiler_mnk` — layout + tile.  Shim defaults: non-swap
-  (64, 128, 128), swap-AB (256, 32, 128).  Kernel-legal geometry: 1-CTA
-  only; non-swap M∈{64}, N∈{128,256}; swap-AB M∈{128,256},
-  N∈{16,32,64,128}; K=128.
+- `swap_ab` + `pingpong` + `mma_tiler_mnk` + `cluster_shape_mnk` — layout,
+  scheduling, tile, and CGA shape.  Leave ALL four `None` to use the drop's
+  token-bucket heuristic table (`moe_hopper_fp8/heuristic_config.py`, keyed
+  on `fp8_scale_mode` and max tokens/rank, derived from the 2026-08-19
+  four-rank H200 DSV4 sweep); setting any one switches to manual mode with
+  drop-driver defaults for the rest (non-swap (64, 128, 128), swap-AB
+  (256, 32, 128), (128, 32, 128) with ping-pong; cluster (1, 1, 1)).
+  Kernel-legal geometry: non-swap M∈{64}, N∈{128,256}; swap-AB M∈{128,256},
+  N∈{16,32,64,128}; K=128; CGA (m,n)∈{(1,1),(2,1),(1,2),(2,2)}, k=1.
+  Ping-pong needs one physical warpgroup per task tile: N=128 non-swap,
+  M=128 swap-AB.
 - `load_balance_mode` — `"static"` (default, used by the correctness
   tests) or `"atomic_counter"` (the drop's perf-sweep setting; used by the
   benchmark for reference parity).
-- `token_back_by_dispatch` — `reuse_dispatch_warps` combine token-back
-  (the drop's non-ikr perf default, used by the benchmark) vs `epi_warps`
-  (the correctness-validated default).  NOTE: `reuse_dispatch_warps` is
-  currently only perf-exercised — add a `mega_sm90` correctness case
-  before making it a production default.
+- `token_back_mode` — `epi_warps` (the correctness-validated default),
+  `reuse_dispatch_warps` (the drop's non-ikr perf default, used by the
+  benchmark), or `standalone_warps` (four dedicated token-back warps).
+  All six token_back x reduce combinations are kernel-supported since the
+  combine-surface alignment drop.  `token_back_by_dispatch` remains as a
+  legacy bool alias (True -> `reuse_dispatch_warps`).  NOTE: the push modes
+  are currently only perf-exercised — add a `mega_sm90` correctness case
+  before making one a production default.
 - `in_kernel_fc2_reduce` — REDG atomic-add combine (bf16 unordered sum,
   nondeterministic; validated in `mega_sm90` with the roundoff-envelope
   band, not measured in the sweep above).

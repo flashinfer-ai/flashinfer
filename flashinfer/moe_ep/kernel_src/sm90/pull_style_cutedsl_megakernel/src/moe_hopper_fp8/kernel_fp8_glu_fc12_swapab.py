@@ -24,6 +24,7 @@ from moe_hopper_fp8.epilogue_fp8_swapab import (
     SwapABFp8GluEpilogue,
     SwapABTileMChoices,
     SwapABTokenTileNChoices,
+    WarpThreadCount,
 )
 from moe_hopper_fp8.kernel_fp8_glu_fc12 import (
     Sm90SwigluFp8Fc12Kernel as _Sm90Fp8Fc12KernelBase,
@@ -99,6 +100,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         ab_dtype: Type[cutlass.Numeric] = cutlass.Float4E2M1FN,
         fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor",
         fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc",
+        pingpong: bool = False,
         scenario: Literal["2Dx3D"] = "2Dx3D",
         fc2_in_kernel_topk_reduce: bool = False,
         apply_topk_in_fc1: bool = False,
@@ -141,12 +143,12 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 f"got {load_balance_mode!r}."
             )
 
-        # 1CTA-only Hopper FP8 path.
+        # Each cluster member uses an independent 1CTA WGMMA path.
         m, n, _k = mma_tiler_mnk
         if use_2cta_instrs:
             raise ValueError(
                 "Sm90SwapABSwigluFp8Fc12Kernel in moe_hopper_fp8 is "
-                "1CTA-only; "
+                "limited to independent 1CTA WGMMA; "
                 "use_2cta_instrs must be False."
             )
         if m not in SwapABTileMChoices or n not in SwapABTokenTileNChoices:
@@ -172,6 +174,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 f"got {fp8_accum_mode!r}."
             )
         self.fp8_accum_mode = fp8_accum_mode
+        self.pingpong = pingpong
         if ab_dtype == cutlass.Float8E4M3FN:
             self.fp8_output_rcp_limit = Fp8E4M3RcpLimit
         elif ab_dtype == cutlass.Float8E5M2:
@@ -190,16 +193,14 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         )
 
         self.acc_dtype = acc_dtype
-        if cluster_shape_mnk != (1, 1, 1):
-            raise ValueError(
-                "Sm90SwapABSwigluFp8Fc12Kernel in moe_hopper_fp8 is "
-                "1CTA-only; "
-                f"cluster_shape_mnk must be (1, 1, 1), got {cluster_shape_mnk}."
-            )
-
         self.mma_tiler_mnk = mma_tiler_mnk
         self.is_swap_ab = True
         self._set_iket_range_names()
+        if cluster_shape_mnk[2] != 1:
+            raise ValueError(
+                "Hopper FP8 swap-AB only supports cluster K=1, got "
+                f"cluster_shape_mnk={cluster_shape_mnk}."
+            )
         self.cluster_shape_mn = (cluster_shape_mnk[0], cluster_shape_mnk[1])
         self.use_2cta_instrs = False
         self.force_static_sched = force_static_sched
@@ -228,6 +229,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         self.mma_tiler = self.mma_tiler_mnk
         self.token_tile_size = n
         self.wgmma_m_splits = self.mma_tiler[0] // self.wgmma_tile_m
+        if self.pingpong and self.wgmma_m_splits != 1:
+            raise ValueError(
+                "Hopper FP8 swap-AB ping-pong requires one M=128 WGMMA "
+                f"fragment per task, got mma_tiler_mnk={self.mma_tiler}."
+            )
         self.wgmma_tiler = (
             self.wgmma_tile_m,
             self.wgmma_tile_n,
@@ -241,12 +247,17 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # Keep one legacy MMA-only empty warp after the scheduler.
         self.occupancy = 1
         self.epilogue_warps_per_warpgroup = 4
+        self.epilogue_warpgroup_count = (
+            2 if self.pingpong else self.wgmma_m_splits
+        )
         self.epilogue_warp_id = tuple(
             range(
                 self.epilogue_warps_per_warpgroup
-                * self.wgmma_m_splits
+                * self.epilogue_warpgroup_count
             )
         )
+        # Number of WGMMA fragments/scales inside one scheduler task. This is
+        # distinct from the two physical consumer groups used by ping-pong.
         self.wgmma_warpgroup_count = self.wgmma_m_splits
         self.tma_a_warp_id = len(self.epilogue_warp_id)
         self.tma_b_warp_id = self.tma_a_warp_id + 1
@@ -265,7 +276,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # NamedBarrier IDs. FC1 store uses two WG-local barriers at ids 2/3;
         # this kernel forwards the task-boundary and FC1-store base IDs to the
         # epilogue ctor. IDs 8/9/10 are reserved by Mega token-comm hooks.
-        self.epilog_sync_bar_id = 1
+        # Ping-pong groups need distinct 128-thread task-boundary barriers.
+        # IDs 6/7 are free; token communication reserves 8/9/10.
+        self.epilog_sync_bar_id = 6 if self.pingpong else 1
         self.fc1_store_sync_bar_id = 2
 
         # MegaMoE toggle.  False for the lean base; subclasses (e.g.
@@ -315,19 +328,15 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 f"FP8 dispatch scale atom K = {dispatch_scale_atom_k}"
             )
 
-        if (cm, cn) != (1, 1):
+        supported_cluster_shapes = ((1, 1), (2, 1), (1, 2), (2, 2))
+        if (cm, cn) not in supported_cluster_shapes:
             raise ValueError(
-                f"1CTA Hopper FP8 path requires cluster_shape_mn=(1, 1), got {(cm, cn)}."
+                "Hopper FP8 swap-AB cluster_shape_mn must be one of "
+                f"{supported_cluster_shapes}, got {(cm, cn)}."
             )
 
-        is_pow2 = lambda x: x > 0 and (x & (x - 1)) == 0
-        if cm * cn > 16 or not is_pow2(cm) or not is_pow2(cn) or cm > 4 or cn > 4:
-            raise ValueError(
-                f"Invalid cluster_shape ({cm}, {cn}): each dim must be "
-                f"a power of 2 and <= 4, product must be <= 16"
-            )
-
-        # No cluster multicast is wired in this 1CTA-only fork.
+        # Cluster peers share A/B tiles through TMA multicast while issuing
+        # independent WGMMA instructions.
 
     def _setup_attributes(self) -> None:
         """Set up MMA / cluster / tile shapes, SMEM layouts, stage counts.
@@ -377,8 +386,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         self.cluster_layout_mnk = cute.make_layout((*self.cluster_shape_mn, 1))
         self.cluster_layout_vmnk = cute.make_layout((1, *self.cluster_layout_mnk.shape))
 
-        # Multicast CTA counts.  This fork currently validates cluster=(1,1,1),
-        # so both resolve to one; keep the fields for API parity with helpers.
+        # A is shared by CTAs along cluster-N; B is shared along cluster-M.
         self.num_mcast_ctas_a = self.cluster_shape_mn[1]
         self.num_mcast_ctas_b = self.cluster_shape_mn[0]
         self.is_a_mcast = self.num_mcast_ctas_a > 1
@@ -407,6 +415,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             glu_clamp=self.gate_up_clamp,
             fp8_scale_mode=self.fp8_scale_mode,
             fp8_output_rcp_limit=self.fp8_output_rcp_limit,
+            pingpong=self.pingpong,
         )
         self.epilogue = SwapABFp8GluEpilogue(**_epi_common)
 
@@ -416,7 +425,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # sC stages are WG-private FC1 store buffers: each WG folds M=128 to
         # one token-N x output-channel64 stage. M=128/M=256 therefore use
         # one/two stages respectively.
-        self.num_c_stage = self.epilogue.subtile_cnt
+        self.num_c_stage = self.epilogue_warpgroup_count
         c_bytes_total = (
             self.epilogue.bytes_per_stage * self.num_c_stage
             + self.epilogue.fc1_amax_smem_bytes
@@ -807,24 +816,33 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # ── fc1 TMA atoms ──
 
         # TMA load A1 (= fc1 weights).
-        # 1CTA SM90 path uses plain tensor-tile TMA; no cluster multicast.
-        a_op = cpasync.CopyBulkTensorTileG2SOp()
+        a_op = (
+            cpasync.CopyBulkTensorTileG2SMulticastOp()
+            if self.is_a_mcast
+            else cpasync.CopyBulkTensorTileG2SOp()
+        )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, 0))
         tma_atom_fc1_weight, tma_tensor_fc1_weight = cpasync.make_tiled_tma_atom(
             a_op,
             fc1_weight_gemm,
             a_smem_layout,
             cute.slice_(self.mma_tiler, (None, 0, None)),
+            num_multicast=self.num_mcast_ctas_a,
         )
 
         # TMA load B1 (= fc1 activations).
-        b_op = cpasync.CopyBulkTensorTileG2SOp()
+        b_op = (
+            cpasync.CopyBulkTensorTileG2SMulticastOp()
+            if self.is_b_mcast
+            else cpasync.CopyBulkTensorTileG2SOp()
+        )
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, 0))
         tma_atom_fc1_activation, tma_tensor_fc1_activation = cpasync.make_tiled_tma_atom(
             b_op,
             activation_gemm,
             b_smem_layout,
             cute.slice_(self.mma_tiler, (0, None, None)),
+            num_multicast=self.num_mcast_ctas_b,
         )
 
         # TMA store for the FC1 FP8 output.
@@ -915,7 +933,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 (None, None, 0),
             )
             activation_sf_tiler = (self.token_tile_size, 4)
-            activation_sf_op = cpasync.CopyBulkTensorTileG2SOp()
+            activation_sf_op = (
+                cpasync.CopyBulkTensorTileG2SMulticastOp()
+                if self.is_b_mcast
+                else cpasync.CopyBulkTensorTileG2SOp()
+            )
             (
                 tma_atom_fc1_activation_sf,
                 tma_tensor_fc1_activation_sf,
@@ -924,6 +946,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 activation_sf_gemm,
                 activation_sf_smem_layout,
                 activation_sf_tiler,
+                num_multicast=self.num_mcast_ctas_b,
             )
             (
                 tma_atom_fc2_activation_sf,
@@ -933,6 +956,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 fc1_output_sf_gemm,
                 activation_sf_smem_layout,
                 activation_sf_tiler,
+                num_multicast=self.num_mcast_ctas_b,
             )
         else:
             # Compile-time placeholders; the per-tensor kernel removes all SF
@@ -950,6 +974,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 fc2_weight_gemm,
                 a_smem_layout,
                 cute.slice_(self.mma_tiler, (None, 0, None)),
+                num_multicast=self.num_mcast_ctas_a,
             )
         )
         tma_atom_fc2_activation, tma_tensor_fc2_activation = (
@@ -958,6 +983,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 fc1_output_gemm,
                 b_smem_layout,
                 cute.slice_(self.mma_tiler, (0, None, None)),
+                num_multicast=self.num_mcast_ctas_b,
             )
         )
 
@@ -1058,6 +1084,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             # Scheduling
             offs,
             sched_params,
+            self.cluster_layout_mnk,
             self.cluster_layout_vmnk,
             # SMEM layouts
             self.a_smem_layout_staged,
@@ -1114,6 +1141,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # Scheduling
         offs: Optional[cute.Tensor],
         sched_params: MoEFusedFc12SchedulerParams,
+        cluster_layout_mnk: cute.Layout,
         cluster_layout_vmnk: cute.Layout,
         # SMEM layouts
         a_smem_layout_staged: cute.ComposedLayout,
@@ -1137,11 +1165,16 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
 
-        # fc2 waits for all fc1 intermediate N-tiles in the same token block.
-        # 1CTA path: each N-tile contributes exactly one fc1-done increment.
+        # Round the FC1 channel count to whole cluster-M groups because each CTA
+        # publishes one completion for its independent token-N tile.
         ext_fc2_spin_threshold = (
-            fc1_weight_gemm.shape[0] + self.cta_tile_shape_mnk[0] - 1
-        ) // self.cta_tile_shape_mnk[0]
+            (
+                fc1_weight_gemm.shape[0]
+                + self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0]
+                - 1
+            )
+            // (self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0])
+        ) * self.cluster_shape_mn[0]
 
         ext = SwapABSwigluFp4Fc12SchedExtension(
             sf_vec_size=self.sf_vec_size,
@@ -1150,12 +1183,34 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             fc1_ready_counter_ptr=self.token_comm_hook_fc1_ready_counter_ptr(
                 token_comm_args
             ),
+            token_cluster_size=self.cluster_shape_mn[1],
+            fc1_done_per_cta_token=True,
         )
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
         tidx, _, _ = cute.arch.thread_idx()
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(
+            cute.arch.block_idx_in_cluster()
+        )
+        cluster_coord_mnk = cluster_layout_mnk.get_flat_coord(cta_rank_in_cluster)
+        a_mcast_mask = cute.make_layout_image_mask(
+            cluster_layout_mnk, cluster_coord_mnk, mode=1
+        )
+        b_mcast_mask = cute.make_layout_image_mask(
+            cluster_layout_mnk, cluster_coord_mnk, mode=0
+        )
+        a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
+        b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
+        a_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_mnk, (0, None, 0)).shape
+        )
+        b_cta_layout = cute.make_layout(
+            cute.slice_(cluster_layout_mnk, (None, 0, 0)).shape
+        )
+        a_cta_coord = cluster_coord_mnk[1]
+        b_cta_coord = cluster_coord_mnk[0]
         epilogue_group_idx = warp_idx // cutlass.Int32(
             self.epilogue_warps_per_warpgroup
         )
@@ -1169,13 +1224,28 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             sched_params, ext, num_drain_warps=0
         )
 
-        @cute.struct
-        class SharedStorage:
-            ab_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
-            weight_sf_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.num_ab_stage * 2
-            ]
-            sched_storage: SchedStorage
+        if cutlass.const_expr(self.pingpong):
+            @cute.struct
+            class SharedStorage:
+                ab_full_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, self.num_ab_stage * 2
+                ]
+                weight_sf_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, self.num_ab_stage * 2
+                ]
+                math_wg_order_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+                epi_wg_order_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+                sched_storage: SchedStorage
+        else:
+            @cute.struct
+            class SharedStorage:
+                ab_full_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, self.num_ab_stage * 2
+                ]
+                weight_sf_mbar_ptr: cute.struct.MemRange[
+                    cutlass.Int64, self.num_ab_stage * 2
+                ]
+                sched_storage: SchedStorage
 
         smem = utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -1197,7 +1267,12 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # per WGMMA consumer warp (per multicast target), matching the Hopper
         # dense GEMM examples.  Do not use the full 128-thread warpgroup here.
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        num_wgmma_consumer_threads = mcast_size * len(self.epilogue_warp_id)
+        ab_consumer_warps = (
+            self.epilogue_warps_per_warpgroup
+            if self.pingpong
+            else len(self.epilogue_warp_id)
+        )
+        num_wgmma_consumer_threads = mcast_size * ab_consumer_warps
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_wgmma_consumer_threads
         )
@@ -1219,7 +1294,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                     pipeline.Agent.Thread, 32
                 ),
                 consumer_group=pipeline.CooperativeGroup(
-                    pipeline.Agent.Thread, 32 * len(self.epilogue_warp_id)
+                    pipeline.Agent.Thread, 32 * ab_consumer_warps
                 ),
                 defer_sync=True,
             )
@@ -1245,6 +1320,34 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             ext=ext,
         )
         sched_consumer = scheduler.make_consumer()
+
+        if cutlass.const_expr(self.pingpong):
+            math_wg_order_barrier = pipeline.PipelineOrder.create(
+                barrier_storage=storage.math_wg_order_mbar_ptr.data_ptr(),
+                depth=1,
+                length=2,
+                group_id=epilogue_group_idx,
+                producer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
+                    self.epilogue_warps_per_warpgroup * WarpThreadCount,
+                ),
+                defer_sync=True,
+            )
+            epi_wg_order_barrier = pipeline.PipelineOrder.create(
+                barrier_storage=storage.epi_wg_order_mbar_ptr.data_ptr(),
+                depth=1,
+                length=2,
+                group_id=epilogue_group_idx,
+                producer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread,
+                    self.epilogue_warps_per_warpgroup * WarpThreadCount,
+                ),
+                defer_sync=True,
+            )
+        else:
+            # Compile-time placeholder; legacy epilogues never dereference it.
+            math_wg_order_barrier = ab_pipeline
+            epi_wg_order_barrier = ab_pipeline
 
         # Issue the first scheduler claim before cluster init wait so the
         # atomic/offsets latency overlaps with pipeline setup.
@@ -1332,9 +1435,13 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # Each raw gate/up CTA-M tile publishes one completion for the same
         # compile-time token-N block.
         fc2_spin_threshold = (
-            (fc1_weight_gemm.shape[0] + self.cta_tile_shape_mnk[0] - 1)
-            // self.cta_tile_shape_mnk[0]
-        )
+            (
+                fc1_weight_gemm.shape[0]
+                + self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0]
+                - 1
+            )
+            // (self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0])
+        ) * self.cluster_shape_mn[0]
 
         # ════════════════════════════════════════════════════════════════════
         # Scheduler warp (after the two TMA warps)
@@ -1365,9 +1472,14 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
 
         # ── TMA-A warp ──────────────────────────────────────────────────────
         if warp_idx == self.tma_a_warp_id:
-            # ``warp_idx`` is warp-uniform, so all 32 lanes execute every IKET
-            # push/pop in this producer branch.
+            _iket_tma_a_active = tidx == cutlass.Int32(
+                self.tma_a_warp_id * WarpThreadCount
+            )
+            if _iket_tma_a_active:
+                iket.range_push("swapab_tma_a_sched_consume")
             work_tile_info = sched_consumer.consume_work()
+            if _iket_tma_a_active:
+                iket.range_pop()
 
             while work_tile_info.is_valid_tile:
                 is_phase_linear1 = (
@@ -1376,7 +1488,8 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 if is_phase_linear1:
                     # Covers descriptor lookup and weight TMA issue. Blockwise
                     # mode additionally stages weight scales with cp.async.
-                    iket.range_push(self._iket_fc1_weight_load_range)
+                    if _iket_tma_a_active:
+                        iket.range_push(self._iket_fc1_weight_load_range)
                     k_tile_cnt = k_tile_cnt_fc1
                     real_a, desc_ptr_a = ext.get_gmem_tensor(
                         "a", tma_tensor_fc1_weight, work_tile_info,
@@ -1401,6 +1514,10 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                                 output_scale_block_base=output_scale_block_base,
                                 k_tile_cnt=k_tile_cnt_fc1,
                                 tidx=tidx,
+                                tma_cta_coord=a_cta_coord,
+                                tma_cta_layout=a_cta_layout,
+                                mcast_mask=a_mcast_mask,
+                                _iket_active=_iket_tma_a_active,
                             )
                         )
                     else:
@@ -1412,11 +1529,16 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                             ab_producer,
                             work_tile_info.tile_m_idx,
                             k_tile_cnt_fc1,
+                            a_cta_coord,
+                            a_cta_layout,
+                            a_mcast_mask,
+                            _iket_tma_a_active,
                         )
                 else:
                     # Covers descriptor lookup and weight TMA issue. Blockwise
                     # mode additionally stages weight scales with cp.async.
-                    iket.range_push(self._iket_fc2_weight_load_range)
+                    if _iket_tma_a_active:
+                        iket.range_push(self._iket_fc2_weight_load_range)
                     k_tile_cnt = k_tile_cnt_fc2
                     real_a, desc_ptr_a = ext.get_gmem_tensor(
                         "a", tma_tensor_fc2_weight, work_tile_info,
@@ -1441,6 +1563,10 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                                 output_scale_block_base=output_scale_block_base,
                                 k_tile_cnt=k_tile_cnt_fc2,
                                 tidx=tidx,
+                                tma_cta_coord=a_cta_coord,
+                                tma_cta_layout=a_cta_layout,
+                                mcast_mask=a_mcast_mask,
+                                _iket_active=_iket_tma_a_active,
                             )
                         )
                     else:
@@ -1452,10 +1578,18 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                             ab_producer,
                             work_tile_info.tile_m_idx,
                             k_tile_cnt_fc2,
+                            a_cta_coord,
+                            a_cta_layout,
+                            a_mcast_mask,
+                            _iket_tma_a_active,
                         )
 
-                iket.range_pop()
+                if _iket_tma_a_active:
+                    iket.range_pop()
+                    iket.range_push("swapab_tma_a_sched_consume")
                 work_tile_info = sched_consumer.consume_work()
+                if _iket_tma_a_active:
+                    iket.range_pop()
 
             if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
                 weight_sf_producer.tail()
@@ -1463,9 +1597,14 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
 
         # ── TMA-B warp ──────────────────────────────────────────────────────
         if warp_idx == self.tma_b_warp_id:
-            # ``warp_idx`` is warp-uniform, so all 32 lanes execute every IKET
-            # push/pop in this producer branch.
+            _iket_tma_b_active = tidx == cutlass.Int32(
+                self.tma_b_warp_id * WarpThreadCount
+            )
+            if _iket_tma_b_active:
+                iket.range_push("swapab_tma_b_sched_consume")
             work_tile_info = sched_consumer.consume_work()
+            if _iket_tma_b_active:
+                iket.range_pop()
 
             while work_tile_info.is_valid_tile:
                 is_phase_linear1 = (
@@ -1476,7 +1615,8 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                     # Covers optional Mega dispatch readiness, descriptor
                     # lookup, and activation TMA issue. Blockwise mode also
                     # issues activation-scale TMA loads.
-                    iket.range_push(self._iket_fc1_activation_load_range)
+                    if _iket_tma_b_active:
+                        iket.range_push(self._iket_fc1_activation_load_range)
                     self.token_comm_hook_fc1_tma_b_predispatch_spin(
                         token_comm_args, work_tile_info,
                     )
@@ -1511,6 +1651,10 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                                 // cutlass.Int32(self.token_tile_size),
                                 k_tile_cnt_fc1,
                                 k_tiles_per_scale_group=4,
+                                tma_cta_coord=b_cta_coord,
+                                tma_cta_layout=b_cta_layout,
+                                mcast_mask=b_mcast_mask,
+                                _iket_active=_iket_tma_b_active,
                             )
                         )
                     else:
@@ -1522,27 +1666,35 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                             ab_producer,
                             work_tile_info.tile_n_idx,
                             k_tile_cnt_fc1,
+                            b_cta_coord,
+                            b_cta_layout,
+                            b_mcast_mask,
+                            _iket_tma_b_active,
                         )
                 else:
                     # Covers the FC1-done wait/fences, descriptor lookup, and
                     # FC2-activation TMA issue. Blockwise mode also issues
                     # activation-scale TMA loads.
-                    iket.range_push(self._iket_fc2_activation_load_range)
+                    if _iket_tma_b_active:
+                        iket.range_push(self._iket_fc2_activation_load_range)
                     counter_slot = (
-                        work_tile_info.cumulative_token_block_count
+                        cutlass.Int32(self.cluster_shape_mn[1])
+                        * work_tile_info.cumulative_token_block_count
                         + work_tile_info.tile_n_idx
                     )
                     counter_ptr = fc1_done_counter.iterator + counter_slot
                     # Nested inside the swap-AB FC2 activation-load range:
                     # only the FC1 completion-counter spin. The enclosing
                     # range continues through acquire/fence and TMA issue.
-                    iket.range_push("swapab_fc2_fc1_done_spin")
+                    if _iket_tma_b_active:
+                        iket.range_push("swapab_fc2_fc1_done_spin")
                     spin_wait(
                         counter_ptr,
                         lambda v: v >= fc2_spin_threshold,
                         fail_sleep_cycles=20,
                     )
-                    iket.range_pop()
+                    if _iket_tma_b_active:
+                        iket.range_pop()
                     cute.arch.load(
                         counter_ptr, counter_ptr.dtype, sem="acquire", scope="gpu"
                     )
@@ -1572,6 +1724,10 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                                 // cutlass.Int32(self.token_tile_size),
                                 k_tile_cnt_fc2,
                                 k_tiles_per_scale_group=2,
+                                tma_cta_coord=b_cta_coord,
+                                tma_cta_layout=b_cta_layout,
+                                mcast_mask=b_mcast_mask,
+                                _iket_active=_iket_tma_b_active,
                             )
                         )
                     else:
@@ -1583,9 +1739,17 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                             ab_producer,
                             work_tile_info.tile_n_idx,
                             k_tile_cnt_fc2,
+                            b_cta_coord,
+                            b_cta_layout,
+                            b_mcast_mask,
+                            _iket_tma_b_active,
                         )
-                iket.range_pop()
+                if _iket_tma_b_active:
+                    iket.range_pop()
+                    iket.range_push("swapab_tma_b_sched_consume")
                 work_tile_info = sched_consumer.consume_work()
+                if _iket_tma_b_active:
+                    iket.range_pop()
 
             ab_producer.tail()
 
@@ -1675,6 +1839,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 k_tile_cnt_fc2=k_tile_cnt_fc2,
                 _iket_active=_iket_active,
                 n_half=n_half,
+                warpgroup_idx=epilogue_group_idx,
+                math_wg_order_barrier=math_wg_order_barrier,
+                epi_wg_order_barrier=epi_wg_order_barrier,
             )
 
             # MegaMoE: pass token_comm_args only when it is a real bundle (not

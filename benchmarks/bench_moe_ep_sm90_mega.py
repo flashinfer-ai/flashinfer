@@ -121,6 +121,15 @@ def _parse_args() -> argparse.Namespace:
         const="non_swap_ab",
         help="native (non-swap) layout only",
     )
+    order.add_argument(
+        "--heuristic",
+        dest="operand_order",
+        action="store_const",
+        const="heuristic",
+        help="leave swap_ab/pingpong/mma_tiler/cluster unset so the shim "
+        "resolves the drop's token-bucket heuristic table per point "
+        "(moe_hopper_fp8/heuristic_config.py)",
+    )
     p.set_defaults(operand_order="both")
     p.add_argument(
         "--mma-tiler",
@@ -265,7 +274,14 @@ def _make_transformed_weights(args, scale_mode: str, local_experts: int, rank, d
 def _megakernel_config(args, scale_mode: str, operand_order: str, tile):
     from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
-    swap_ab = operand_order == "swap_ab"
+    if operand_order == "heuristic":
+        # All geometry knobs None -> the shim resolves the drop's token-bucket
+        # heuristic per point (keyed on scale mode and max tokens per rank).
+        swap_ab = None
+        mma_tiler_mnk = None
+    else:
+        swap_ab = operand_order == "swap_ab"
+        mma_tiler_mnk = (tile[0], tile[1], 128)
     return Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
         intermediate_size=args.intermediate,
         top_k=args.top_k,
@@ -273,7 +289,7 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile):
         fp8_scale_mode=scale_mode,
         fp8_accum_mode=args.fp8_accum_mode,
         swap_ab=swap_ab,
-        mma_tiler_mnk=(tile[0], tile[1], 128),
+        mma_tiler_mnk=mma_tiler_mnk,
         load_balance_mode=args.load_balance_mode,
         gate_up_clamp=args.gate_up_clamp,
         in_kernel_fc2_reduce=False,
@@ -471,6 +487,9 @@ def _run_point(
 
 
 def _ref_csv_name(scale_mode: str, operand_order: str, tile) -> str:
+    if operand_order == "heuristic":
+        # Per-point geometry follows the token bucket; no single drop CSV.
+        return "heuristic(no-single-ref)"
     scale_tag = "pertensor" if scale_mode == "per_tensor" else "blockwise"
     order_tag = "swapab" if operand_order == "swap_ab" else "nonswapab"
     return (
@@ -598,7 +617,10 @@ def main() -> int:
     try:
         for scale_mode in scale_modes:
             for operand_order in orders:
-                tile = tile_override or DEFAULT_TILE[operand_order]
+                if operand_order == "heuristic":
+                    tile = ("auto", "auto")
+                else:
+                    tile = tile_override or DEFAULT_TILE[operand_order]
                 for tokens in tokens_list:
                     if rank == 0:
                         print(

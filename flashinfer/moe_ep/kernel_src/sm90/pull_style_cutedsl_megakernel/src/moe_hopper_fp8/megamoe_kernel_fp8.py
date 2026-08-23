@@ -19,15 +19,26 @@ data-format-dependent workspace layout differs:
   - ``Fp8GateUpInterleave = 8``                (FC1 gate/up layout)
 
 The caller only provides the final ``output_activation`` with shape
-``(max_tokens_per_rank, hidden)``.  The pre-topk-reduce plane is internal:
+``(max_tokens_per_rank, hidden)``.  The pre-topk-reduce plane is internal.
+Following the NVFP4 mega kernel, the combine surface is two orthogonal knobs:
 
-  * **separate reduce** (default): epilogue or dispatch token-back writes
-    ``combine_quant[src_token, src_topk, :]`` in the shared symmetric
-    workspace, then a BF16 top-k reducer collapses the topk axis into the public
-    output.
-  * **Form B** (``fc2_in_kernel_topk_reduce``): epilogue issues
-    ``red.relaxed.sys.global.add.v2.bf16x2`` directly into a
-    ``(max_tokens_per_rank, 1, hidden)`` view of the public output.
+``token_back_mode`` -- who performs the cross-rank fc2 write-back:
+
+  * ``epi_warps``: the fc2 epilogue STGs straight to the source rank.
+  * ``reuse_dispatch_warps``: the epilogue stages rows in the local
+    ``fc2_output_workspace`` pool; dispatch warps bulk-push them after pull.
+  * ``standalone_warps``: same staging, pushed by four dedicated warps.
+
+``fc2_in_kernel_topk_reduce`` -- where the topk axis collapses:
+
+  * False (**separate reduce**): writes land in the internal
+    ``combine_quant[src_token, src_topk, :]`` shared-symmetric staging, then
+    the shared ``TopkReduce`` kernel collapses topk into the public output.
+  * True (**in-kernel reduce**): writes accumulate directly into a
+    ``(max_tokens_per_rank, 1, hidden)`` view of the public output --
+    ``epi_warps`` issues ``red.relaxed.sys.global.add.noftz.v2.bf16x2``, the
+    dispatch modes push with ``cp.reduce.async.bulk...add.noftz.bf16``
+    (``token_back_reduce_topk``); no reducer kernel runs.
 
 ``static_expert_shape`` is required because dispatch storage and pool sizes are
 codegen-time quantities.
@@ -37,8 +48,7 @@ codegen-time quantities.
 # (PEP 563 string-ifies class-body annotations, which breaks ``@cute.struct``
 # element-type introspection).  See moe_nvfp4_swapab/megamoe_kernel.py.
 
-import os
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -111,6 +121,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         sf_vec_size: int = Fp8E8M0SfVecSize,
         fp8_scale_mode: str = "per_tensor",
         fp8_accum_mode: str = "1xacc",
+        pingpong: bool = False,
         scenario: str = "2Dx3D",
         # MegaMoE-specific independent constants.
         *,
@@ -121,7 +132,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         hidden: int,
         fc2_in_kernel_topk_reduce: bool = False,
         apply_topk_in_fc1: bool = True,
-        token_back_by_dispatch: bool = False,
+        token_back_mode: Literal[
+            "epi_warps", "standalone_warps", "reuse_dispatch_warps"
+        ] = "epi_warps",
         epi_flag_batch: Union[int, Tuple[int, int]] = 1,
         flag_batch: int = 1,
         gate_up_clamp: Optional[float] = None,
@@ -136,16 +149,18 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 f"hidden ({hidden}) must equal "
                 f"static_expert_shape[2] ({static_expert_shape[2]})."
             )
-        if fc2_in_kernel_topk_reduce and token_back_by_dispatch:
-            raise ValueError(
-                "fc2_in_kernel_topk_reduce and token_back_by_dispatch cannot "
-                "both be True."
-            )
+        if token_back_mode not in (
+            "epi_warps", "standalone_warps", "reuse_dispatch_warps",
+        ):
+            raise ValueError(f"unsupported token_back_mode '{token_back_mode}'")
+        # NVFP4 naming: any non-epi mode stages fc2 rows locally and pushes
+        # them back from the dispatch warp area.
+        token_back_by_dispatch = token_back_mode != "epi_warps"
         if fc2_in_kernel_topk_reduce and not apply_topk_in_fc1:
             raise ValueError(
                 "fc2_in_kernel_topk_reduce requires apply_topk_in_fc1=True; "
-                "the REDG path collapses topk before a separate reducer can "
-                "apply routing weights."
+                "the in-kernel reduce can only atomic-add terms whose topk "
+                "score was already absorbed before fc2."
             )
 
         super().__init__(
@@ -165,6 +180,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             sf_vec_size=sf_vec_size,
             fp8_scale_mode=fp8_scale_mode,
             fp8_accum_mode=fp8_accum_mode,
+            pingpong=pingpong,
             scenario=scenario,
             fc2_in_kernel_topk_reduce=fc2_in_kernel_topk_reduce,
             apply_topk_in_fc1=apply_topk_in_fc1,
@@ -178,13 +194,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         self.dispatch_warp_id = tuple(
             range(dispatch_warp_start, dispatch_warp_start + 4)
         )
-        # Token-back mode selected by MEGA_TOKEN_BACK_WARP_MODE:
-        #   1 = four standalone token-back warps after dispatch
-        #   2 = reuse dispatch warps for token-back inline (runner default)
-        self.token_back_standalone = (
-            token_back_by_dispatch
-            and int(os.environ.get("MEGA_TOKEN_BACK_WARP_MODE", "2")) == 1
-        )
+        # ``standalone_warps`` dedicates four token-back warps after dispatch;
+        # ``reuse_dispatch_warps`` runs the push inline on the dispatch warps.
+        self.token_back_standalone = token_back_mode == "standalone_warps"
         token_back_warp_start = dispatch_warp_start + 4
         self.token_back_warp_id = (
             tuple(range(token_back_warp_start, token_back_warp_start + 4))
@@ -198,6 +210,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         if (
             not getattr(self, "is_swap_ab", False)
             and self.wgmma_n_splits == 1
+            and not self.pingpong
         ):
             self.epi_reg_cnt = 256
         self.token_back_reg_cnt = 32
@@ -287,17 +300,25 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # For token_back_by_dispatch, the dispatch warp pushes fc2 results
         # from the local pool workspace back to each source rank's internal
         # combine target.
-        # fc2_publishes_per_token_cluster_tile = ceil(hidden / mma_tiler_m) * cluster_m:
-        # for each cluster token tile, each of cluster_m CTAs publishes once per
-        # hidden N-tile it processes (N-tile width = mma_tiler[1]).
+        # Count every FC2 CTA publish in one token cluster tile. Channel tiles
+        # are rounded to complete channel clusters, and every CTA along the
+        # token-cluster axis independently publishes its output rows.
         if token_back_by_dispatch:
-            channel_tile = (
-                self.mma_tiler_mnk[0]
-                if is_swap_ab
-                else self.mma_tiler_mnk[1]
-            )
+            if is_swap_ab:
+                channel_tile = self.mma_tiler_mnk[0]
+                channel_cluster = cluster_shape_mnk[0]
+                token_cluster = cluster_shape_mnk[1]
+            else:
+                channel_tile = self.mma_tiler_mnk[1]
+                channel_cluster = cluster_shape_mnk[1]
+                token_cluster = cluster_shape_mnk[0]
             fc2_publishes = (
-                (self.hidden + channel_tile - 1) // channel_tile
+                (
+                    self.hidden + channel_tile * channel_cluster - 1
+                )
+                // (channel_tile * channel_cluster)
+                * channel_cluster
+                * token_cluster
             )
         else:
             fc2_publishes = 0
@@ -311,6 +332,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             fc1_token_dtype=self.ab_dtype,
             token_back_by_dispatch=token_back_by_dispatch,
             fc2_publishes_per_token_cluster_tile=fc2_publishes,
+            token_back_reduce_topk=(
+                token_back_by_dispatch and fc2_in_kernel_topk_reduce
+            ),
             token_back_standalone=self.token_back_standalone,
             sf_uint32_per_token=self.sf_uint32_per_token,
             token_padding_block=self.token_padding_block,
@@ -440,8 +464,8 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             ((per_tensor_sf_cols + 3) // 4) * 4
         )
         fc1_done_slots = (
-            (pool_token_capacity + self.cluster_tile_tokens - 1)
-            // self.cluster_tile_tokens
+            (pool_token_capacity + self.token_tile_size - 1)
+            // self.token_tile_size
             + num_experts_per_rank
         )
 
@@ -596,7 +620,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
 
         # The per-topk FC2 plane is an implementation workspace, not public IO.
         # It is the cross-rank STG/TMA target and therefore belongs in the shared
-        # symmetric workspace. Form B reduces directly into output_activation.
+        # symmetric workspace. In-kernel reduce accumulates directly into
+        # output_activation (REDG from epi_warps, or bulk reduce push from the
+        # dispatch token-back modes) and needs no staging.
         if not self.fc2_in_kernel_topk_reduce:
             specs.append(
                 _RegionSpec(
@@ -759,10 +785,12 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
           * ``fc1_weight`` / ``fc1_weight_sf`` / ``fc2_weight`` /
             ``fc2_weight_sf`` are local-only.
 
-          * Under Form B, ``output_activation`` is the cross-rank REDG target
-            and must also be peer reachable. Under separate reduce, peer writes
-            target the internal ``combine_quant`` shared-workspace region and
-            ``output_activation`` may be rank-local memory.
+          * Under in-kernel reduce (``fc2_in_kernel_topk_reduce``),
+            ``output_activation`` is the cross-rank accumulate target (REDG or
+            bulk reduce push) and must also be peer reachable. Under separate
+            reduce, peer writes target the internal ``combine_quant``
+            shared-workspace region and ``output_activation`` may be
+            rank-local memory.
         """
         cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
         sm_count = max_active_clusters * cluster_size
@@ -832,9 +860,10 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 local_workspace, "load_balance_counter",
             )
 
-        # MoE-domain cross-rank combine target. The default path stages one
-        # result per (token, topk) in workspace; Form B aliases the public 2D
-        # output because the epilogue collapses topk on the fly.
+        # MoE-domain cross-rank combine target. Separate reduce stages one
+        # result per (token, topk) in workspace; in-kernel reduce aliases the
+        # public 2D output because writers collapse topk on the fly (epi_warps
+        # REDG, or the dispatch modes' cp.reduce bulk push).
         if cutlass.const_expr(self.fc2_in_kernel_topk_reduce):
             combine_target = cute.make_tensor(
                 output_activation.iterator,
