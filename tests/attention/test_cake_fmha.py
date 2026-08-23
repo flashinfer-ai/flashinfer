@@ -807,6 +807,61 @@ def test_cake_fmha_decode_route_is_optimized_only_on_exact_bf16_domain(
     )
 
 
+def test_cake_fmha_exact_sink_no_lse_member_falls_back_for_caller_lse(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    batch_size = 256
+    num_q_heads = 32
+    query = torch.empty((batch_size, num_q_heads, 128), dtype=torch.bfloat16)
+    key = torch.empty((1, 4, 16, 128), dtype=torch.bfloat16)
+    kwargs = dict(
+        query=query,
+        key_cache=key,
+        value_cache=torch.empty_like(key),
+        out=torch.empty_like(query),
+        workspace_buffer=torch.empty(2 << 20, dtype=torch.uint8),
+        block_tables=torch.zeros((batch_size, 256), dtype=torch.int32),
+        seq_lens=torch.full((batch_size,), 4096, dtype=torch.int32),
+        batch_size=batch_size,
+        q_len=1,
+        max_seq_len=4096,
+        window_left=-1,
+        bmm1_scale=1.0,
+        bmm2_scale=1.0,
+        o_scale=1.0,
+        sinks=torch.zeros(num_q_heads, dtype=torch.float32),
+        kv_layout="HND",
+        uses_shared_paged_kv_idx=True,
+        cum_seq_lens_q=None,
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=None,
+        enable_block_sparse_attention=False,
+    )
+    route = cake_api.select_cake_fmha_decode_route(query.device, **kwargs)
+    assert route == cake_api.CakeFmhaDecodeRoute(
+        target="sm100a",
+        batch_size=batch_size,
+        q_len=1,
+        num_q_heads=num_q_heads,
+        num_kv_heads=4,
+        has_sink=True,
+        has_window=False,
+        use_scale_ptr=False,
+        retain_kv_l2=False,
+    )
+    assert cake_api.cake_fmha_route_is_optimized(route)
+
+    caller_lse = torch.empty((batch_size, num_q_heads), dtype=torch.float32)
+    assert (
+        cake_api.select_cake_fmha_decode_route(
+            query.device, **{**kwargs, "lse": caller_lse}
+        )
+        is None
+    )
+
+
 def test_cake_fmha_decode_candidate_selection_for_adapter_families(monkeypatch) -> None:
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
 

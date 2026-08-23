@@ -633,6 +633,19 @@ def select_cake_fmha_decode_route(
             component=component,
             page_size=selected_page_size,
         )
+        exact_sink_no_lse = (
+            component == "decode_native_bf16"
+            and candidate.batch_size == 256
+            and candidate.q_len == 1
+            and candidate.num_q_heads == 32
+            and candidate.num_kv_heads == 4
+            and candidate.has_sink
+            and not candidate.has_window
+            and not candidate.use_scale_ptr
+            and not candidate.retain_kv_l2
+        )
+        if exact_sink_no_lse and lse is not None:
+            return None
         if component == "decode_native_bf16" and not cake_fmha_route_is_optimized(
             candidate
         ):
