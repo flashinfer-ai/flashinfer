@@ -1513,6 +1513,9 @@ class AutoTuner:
         # path builds no string.  Entries decoded from one store identity are
         # never served under another's.
         self._managed_decoded: dict[tuple[str, str, tuple], tuple[str, Any]] = {}
+        # Store identities already bulk-read into _managed_decoded, so a
+        # re-attach of the same store does not re-scan the entries directory.
+        self._preloaded_stores: set[tuple[str, str]] = set()
         # In-memory winner-cache partitions keyed by store/policy identity;
         # the default (v1) partition is `profiling_cache` itself.  Winners
         # tuned under one measurement identity must not short-circuit
@@ -2368,6 +2371,7 @@ class AutoTuner:
                                     cache_key.file_key,
                                     cache_key.runner_class_name,
                                     _tactic_to_json(tactic),
+                                    key_fields=cache_key.key_fields,
                                 )
                             self.stats.tuned_op_successful_configs[custom_op] = (
                                 self.stats.tuned_op_successful_configs.get(custom_op, 0)

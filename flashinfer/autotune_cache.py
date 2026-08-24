@@ -50,7 +50,15 @@ from .jit.core import logger
 
 # Bump the schema directory (v2 -> v3) on any incompatible change to the
 # directory layout or entry format; do not add per-entry format versions.
-_SCHEMA = "v2"
+# v3: entries additionally carry a structural, round-trippable "key_fields"
+# so a store can be preloaded into memory.  Per this module's rule the schema
+# directory is bumped rather than versioning individual entries; existing v2
+# directories are left untouched and simply re-tuned into v3.
+_SCHEMA = "v3"
+
+# Sentinel for "this value has no round-trippable encoding" (distinct from a
+# legitimately-stored None).
+_UNENCODABLE = object()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -161,6 +169,68 @@ def _canonical_json(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"))
 
 
+def _encode_key_fields(key_fields: Any) -> Optional[Any]:
+    """JSON-safe encoding of a ProfilingCacheKey.key_fields tuple, or None.
+
+    ``file_key`` is ``str(key_fields)`` and is deliberately one-way: ``extras``
+    carries torch dtypes whose ``repr`` ("torch.float8_e4m3fn") is not valid
+    literal syntax, so the on-disk key cannot be parsed back.  This encodes the
+    same fields structurally so a store can be read back into memory.
+
+    Returns None if any component is outside the documented
+    ``get_cache_key_extras`` contract (dtype / is-None flag / scalar value).
+    Callers must treat None as "not preloadable" and fall back to a lazy read --
+    never as an error.
+    """
+    def enc(v):
+        if v is None or isinstance(v, (bool, int, float, str)):
+            return v
+        # Detect a torch dtype WITHOUT importing torch: this module is
+        # deliberately torch-free (stdlib + logger only).
+        if type(v).__module__.split(".")[0] == "torch" and type(v).__name__ == "dtype":
+            return {"__dtype__": str(v).removeprefix("torch.")}
+        if isinstance(v, (tuple, list)):
+            out = []
+            for item in v:
+                e = enc(item)
+                if e is _UNENCODABLE:
+                    return _UNENCODABLE
+                out.append(e)
+            return {"__tuple__": out} if isinstance(v, tuple) else out
+        return _UNENCODABLE
+
+    encoded = enc(key_fields)
+    return None if encoded is _UNENCODABLE else encoded
+
+
+def _decode_key_fields(obj: Any) -> Optional[Any]:
+    """Inverse of _encode_key_fields.  None if the payload is unrecognised."""
+    def dec(v):
+        if v is None or isinstance(v, (bool, int, float, str)):
+            return v
+        if isinstance(v, dict):
+            if "__dtype__" in v:
+                # Lazy import: decoding is the only place this module needs
+                # torch, and it only runs when a store is actually read.
+                try:
+                    import torch
+                except Exception:
+                    return _UNENCODABLE
+                dt = getattr(torch, v["__dtype__"], None)
+                return dt if isinstance(dt, torch.dtype) else _UNENCODABLE
+            if "__tuple__" in v:
+                items = [dec(i) for i in v["__tuple__"]]
+                return _UNENCODABLE if any(i is _UNENCODABLE for i in items) else tuple(items)
+            return _UNENCODABLE
+        if isinstance(v, list):
+            items = [dec(i) for i in v]
+            return _UNENCODABLE if any(i is _UNENCODABLE for i in items) else items
+        return _UNENCODABLE
+
+    decoded = dec(obj)
+    return None if decoded is _UNENCODABLE else decoded
+
+
 def _atomic_write_json(path: pathlib.Path, obj: Any) -> None:
     """Write JSON to *path* via a same-directory temp file + atomic rename."""
     fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=".autotune_", suffix=".tmp")
@@ -247,8 +317,19 @@ class ManagedAutotuneCache:
             self._missing.add(file_key)
             return None
 
-    def publish(self, file_key: str, runner_name: str, json_tactic: Any) -> None:
-        """Atomically persist the tuned winner for *file_key* (best-effort)."""
+    def publish(
+        self,
+        file_key: str,
+        runner_name: str,
+        json_tactic: Any,
+        key_fields: Any = None,
+    ) -> None:
+        """Atomically persist the tuned winner for *file_key* (best-effort).
+
+        *key_fields* is the structural form of the same key; when supplied and
+        encodable it is stored alongside, enabling preload().  Optional so that
+        callers that predate preloading keep working unchanged.
+        """
         try:
             self._ensure_dirs()
             entry = {
@@ -256,6 +337,14 @@ class ManagedAutotuneCache:
                 "runner": runner_name,
                 "tactic": json_tactic,
             }
+            # Structural, round-trippable form of the same key so the store can
+            # be preloaded into memory (see preload()).  Additive: readers that
+            # predate this field ignore it, and an entry without it is simply
+            # not preloadable.
+            if key_fields is not None:
+                encoded = _encode_key_fields(key_fields)
+                if encoded is not None:
+                    entry["key_fields"] = encoded
             _atomic_write_json(self._entry_path(file_key), entry)
             self._hits[file_key] = (runner_name, json_tactic)
             self._missing.discard(file_key)
@@ -265,6 +354,102 @@ class ManagedAutotuneCache:
                 f"{file_key} under {self.entries_dir}: {e}. Tuning result "
                 f"remains available in memory for this process."
             )
+
+    def preload(self) -> Tuple[list, int, int]:
+        """Read every entry once, returning what can be served from memory.
+
+        Returns ``(triples, n_total, n_skipped)`` where each triple is
+        ``(key_fields_tuple, runner_name, json_tactic)``.  Entries written
+        before the ``key_fields`` field existed, or whose extras have no
+        round-trippable encoding, are counted in *n_skipped* and left to the
+        normal lazy path -- preloading is an optimisation, never a
+        prerequisite.
+
+        Every failure mode (missing dir, unreadable or malformed file) yields
+        fewer preloaded entries, never an exception: the cache must not be able
+        to break correctness.
+        """
+        triples: list = []
+        total = skipped = 0
+        try:
+            paths = sorted(self.entries_dir.glob("*.json"))
+        except Exception:
+            return triples, 0, 0
+        for path in paths:
+            total += 1
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    entry = json.load(f)
+                raw = entry.get("key_fields")
+                if raw is None:
+                    skipped += 1
+                    continue
+                fields = _decode_key_fields(raw)
+                if fields is None or not isinstance(fields, tuple):
+                    skipped += 1
+                    continue
+                triples.append((fields, entry["runner"], entry["tactic"]))
+                # Warm the string-keyed memo too, so a lookup that does build a
+                # file_key (cold-miss path, load_from_file) also avoids the read.
+                self._hits[entry["key"]] = (entry["runner"], entry["tactic"])
+            except Exception:
+                skipped += 1
+        return triples, total, skipped
+
+    def preload(self) -> Tuple[list, int, int]:
+        """Read every entry once, returning what can be served from memory.
+
+        Returns ``(triples, n_total, n_skipped)`` where each triple is
+        ``(key_fields_tuple, runner_name, json_tactic)``.  Entries written
+        before the ``key_fields`` field existed, or whose extras have no
+        round-trippable encoding, are counted in *n_skipped* and left to the
+        normal lazy path -- preloading is an optimisation, never a
+        prerequisite.
+
+        Every failure mode (missing dir, unreadable or malformed file) yields
+        fewer preloaded entries, never an exception: the cache must not be able
+        to break correctness.
+        """
+        triples: list = []
+        total = skipped = 0
+        try:
+            paths = sorted(self.entries_dir.glob("*.json"))
+        except Exception:
+            return triples, 0, 0
+        for path in paths:
+            total += 1
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    entry = json.load(f)
+                raw = entry.get("key_fields")
+                if raw is None:
+                    skipped += 1
+                    continue
+                fields = _decode_key_fields(raw)
+                if fields is None or not isinstance(fields, tuple):
+                    skipped += 1
+                    continue
+                # Enforce exactly what lookup() enforces.  Reading entries in
+                # bulk must not become a way to bypass the store's guards:
+                # the entry has to embed the canonical key it was stored
+                # under, that key has to agree with the structural fields,
+                # and the file has to live where that key hashes to.  A
+                # corrupted or relocated entry therefore fails here and is
+                # left to lookup(), which will reject it as a miss.
+                if str(fields) != entry.get("key"):
+                    skipped += 1
+                    continue
+                expect = hashlib.sha256(entry["key"].encode()).hexdigest()[:24]
+                if path.stem != expect:
+                    skipped += 1
+                    continue
+                triples.append((fields, entry["runner"], entry["tactic"]))
+                # Warm the string-keyed memo too, so a lookup that does build a
+                # file_key (cold-miss path, load_from_file) also avoids the read.
+                self._hits[entry["key"]] = (entry["runner"], entry["tactic"])
+            except Exception:
+                skipped += 1
+        return triples, total, skipped
 
     def clear_memo(self) -> None:
         """Forget memoized lookups (e.g. after AutoTuner.clear_cache)."""
@@ -321,7 +506,45 @@ def _resolve_managed_store(tuner, cache_root, manifest: Dict[str, str]):
                 f"[Autotuner]: Managed autotune cache attached for this "
                 f"process: {store!r}"
             )
+        _hydrate_from_store(tuner, store)
         return store
+
+
+def _hydrate_from_store(tuner, store) -> None:
+    """Populate the tuner's decoded-hit memo from *store*, once per identity.
+
+    Without this, every distinct shape pays a file open + JSON decode on its
+    first lookup -- an unpredictable latency spike taken mid-serving.  Reading
+    the store once at attach turns that into a bounded, deterministic startup
+    cost.
+
+    Best-effort by design: any failure leaves the memo as-is and lookups fall
+    back to the existing lazy read.
+    """
+    marker = (str(store.root), store.env_hash)
+    if marker in tuner._preloaded_stores:
+        return
+    try:
+        from .autotuner.autotuner import _json_to_tactic
+
+        triples, total, skipped = store.preload()
+        for key_fields, runner_name, json_tactic in triples:
+            memo_key = (*marker, key_fields)
+            tuner._managed_decoded.setdefault(
+                memo_key, (runner_name, _json_to_tactic(json_tactic))
+            )
+        tuner._preloaded_stores.add(marker)
+        if total:
+            logger.info(
+                f"[Autotuner]: Preloaded {len(triples)}/{total} managed cache "
+                f"entries into memory"
+                + (f" ({skipped} not preloadable, served lazily)" if skipped else "")
+            )
+    except Exception as e:  # never let a cache optimisation break serving
+        logger.warning(
+            f"[Autotuner]: Managed cache preload skipped ({e}); entries will "
+            f"be read lazily."
+        )
 
 
 def autotune_v2_reload() -> None:
