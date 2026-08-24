@@ -168,7 +168,6 @@ void RunReduction(int64_t world_size, int64_t world_rank, int64_t token_num,
   float eps32 = static_cast<float>(rms_eps);
   float weight_bias32 = weight_bias.has_value() ? static_cast<float>(weight_bias.value()) : 0.0f;
   float scale_factor32 = static_cast<float>(scale_factor);
-  int64_t unused_comm_stride = 0;
   int32_t unused_layout = 0;
 
   void* p_active = active_expert_tokens.data_ptr();
@@ -182,14 +181,10 @@ void RunReduction(int64_t world_size, int64_t world_rank, int64_t token_num,
   void* p_quant_out = nullptr;
   void* p_scale_out = nullptr;
   void* p_workspace = workspace_ptrs.data_ptr();
-  void* p_unused_lamport = nullptr;
-  void* p_unused_completion = nullptr;
   void* args[] = {&p_active, &p_scales, &p_token, &p_residual, &p_gamma,
                   &p_moe_out, &p_residual_out, &p_norm_out, &p_quant_out,
-                  &p_scale_out, &p_workspace, &rank32, &p_unused_lamport,
-                  &p_unused_completion, &tokens32, &experts32, &eps32,
-                  &weight_bias32, &scale_factor32, &unused_comm_stride,
-                  &unused_layout};
+                  &p_scale_out, &p_workspace, &rank32, &tokens32, &experts32,
+                  &eps32, &weight_bias32, &scale_factor32, &unused_layout};
   auto config = MakeLaunchConfig(active_expert_tokens, tokens32, launch_with_pdl);
   switch (kernel_index) {
     CAKE_MOE_LAUNCH_CASE(0, kernel_cake_trtllm_moe_reduction_float16_ws2_o0110)
@@ -230,7 +225,6 @@ void RunFinalize(TensorView allreduce_in, TensorView residual_in, TensorView nor
   float eps32 = static_cast<float>(eps);
   float weight_bias32 = weight_bias.has_value() ? static_cast<float>(weight_bias.value()) : 0.0f;
   float unused_scale_factor = 1.0f;
-  int64_t unused_comm_stride = 0;
 
   void* p_allreduce = allreduce_in.data_ptr();
   void* p_indices = inverse_indices.data_ptr();
@@ -243,14 +237,11 @@ void RunFinalize(TensorView allreduce_in, TensorView residual_in, TensorView nor
   void* p_quant_out = nullptr;
   void* p_scale_out = nullptr;
   void* p_workspace = workspace_ptrs.data_ptr();
-  void* p_unused_lamport = nullptr;
-  void* p_unused_completion = nullptr;
   void* args[] = {&p_allreduce, &p_indices, &p_scales, &p_shared, &p_residual,
                   &p_gamma, &p_residual_out, &p_norm_out, &p_quant_out,
-                  &p_scale_out, &p_workspace, &rank32, &p_unused_lamport,
-                  &p_unused_completion, &tokens32, &top_k32, &has_shared32,
-                  &routed32, &eps32, &weight_bias32, &unused_scale_factor,
-                  &unused_comm_stride};
+                  &p_scale_out, &p_workspace, &rank32, &tokens32, &top_k32,
+                  &has_shared32, &routed32, &eps32, &weight_bias32,
+                  &unused_scale_factor};
   auto config = MakeLaunchConfig(allreduce_in, tokens32, launch_with_pdl);
   switch (kernel_index) {
     CAKE_MOE_LAUNCH_CASE(0, kernel_cake_trtllm_moe_finalize_float16_ws2_o110)

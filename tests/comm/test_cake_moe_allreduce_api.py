@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -101,6 +102,59 @@ def _write_cake_source_bundle(tmp_path, *, manifest_text: str | None = None):
         manifest_text = json.dumps(_cake_source_bundle_manifest(source))
     (tmp_path / "manifest.json").write_text(manifest_text, encoding="utf-8")
     return source_path, source
+
+
+def _host_launch_argument_names(function_name: str) -> list[str]:
+    function_start = cake_moe_comm._HOST_SOURCE.index(f"void {function_name}(")
+    args_start = cake_moe_comm._HOST_SOURCE.index("void* args[] = {", function_start)
+    args_end = cake_moe_comm._HOST_SOURCE.index("};", args_start)
+    return re.findall(
+        r"&([A-Za-z_]\w*)", cake_moe_comm._HOST_SOURCE[args_start:args_end]
+    )
+
+
+def test_cake_host_launch_abi_matches_pointer_table_bundle():
+    assert _host_launch_argument_names("RunReduction") == [
+        "p_active",
+        "p_scales",
+        "p_token",
+        "p_residual",
+        "p_gamma",
+        "p_moe_out",
+        "p_residual_out",
+        "p_norm_out",
+        "p_quant_out",
+        "p_scale_out",
+        "p_workspace",
+        "rank32",
+        "tokens32",
+        "experts32",
+        "eps32",
+        "weight_bias32",
+        "scale_factor32",
+        "unused_layout",
+    ]
+    assert _host_launch_argument_names("RunFinalize") == [
+        "p_allreduce",
+        "p_indices",
+        "p_scales",
+        "p_shared",
+        "p_residual",
+        "p_gamma",
+        "p_residual_out",
+        "p_norm_out",
+        "p_quant_out",
+        "p_scale_out",
+        "p_workspace",
+        "rank32",
+        "tokens32",
+        "top_k32",
+        "has_shared32",
+        "routed32",
+        "eps32",
+        "weight_bias32",
+        "unused_scale_factor",
+    ]
 
 
 def test_reduction_default_keeps_trtllm_dispatch(monkeypatch: pytest.MonkeyPatch):
