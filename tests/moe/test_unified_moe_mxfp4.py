@@ -20,19 +20,22 @@ import torch
 from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import fp4_quantize
 from flashinfer.fused_moe import (
-    ActivationConfig,
     BackendOptions,
     ExecutionConfig,
     ExpertConfig,
+    GeGLU,
     MoEActivationPack,
     MoEConfig,
     MoELayer,
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
+    ReLU2,
     RoutingInputMode,
     RoutingConfig,
     RoutingMethodType,
+    SiTU,
+    SwiGLU,
     TrtllmFp4Config,
     TrtllmFp4RoutedRunner,
     trtllm_fp4_block_scale_moe,
@@ -218,7 +221,7 @@ def _make_runtime_case(
             local_expert_offset=expert_offset,
             local_num_experts=local_experts,
         ),
-        activation=ActivationConfig.swiglu,
+        activation=SwiGLU(),
         backend=BackendOptions(candidates=(TrtllmFp4Config(),)),
         execution=ExecutionConfig(tune_max_num_tokens=num_tokens),
     )
@@ -307,7 +310,7 @@ def test_trtllm_mxfp4_unified_matches_reference(variant: QuantVariant):
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
         quant=QuantConfig(variant=variant),
         experts=ExpertConfig(intermediate_size=intermediate_size),
-        activation=ActivationConfig.swiglu,
+        activation=SwiGLU(),
         backend=BackendOptions(candidates=(TrtllmFp4Config(),)),
     )
 
@@ -335,7 +338,7 @@ def test_trtllm_mxfp4_unified_matches_reference(variant: QuantVariant):
     )
 
 
-def _make_fp4_shared_case(variant, num_shared, *, shared_scale=1.0):
+def _make_fp4_shared_case(variant, num_shared, *, activation=None, shared_scale=1.0):
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(42)
     num_tokens, hidden_size, intermediate_size = 8, 1024, 512
@@ -352,10 +355,12 @@ def _make_fp4_shared_case(variant, num_shared, *, shared_scale=1.0):
         )
         * 0.1
     )
+    activation = activation or SwiGLU()
+    gemm1_rows = intermediate_size * (2 if activation.is_gated else 1)
     w1 = (
         torch.randn(
             num_weight_rows,
-            2 * intermediate_size,
+            gemm1_rows,
             hidden_size,
             device=device,
             dtype=torch.bfloat16,
@@ -386,6 +391,7 @@ def _make_fp4_shared_case(variant, num_shared, *, shared_scale=1.0):
         num_local_experts=num_weight_rows,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        activation=activation,
         device=device,
     )
     weights = MoEWeightPack()
@@ -420,7 +426,7 @@ def _make_fp4_shared_case(variant, num_shared, *, shared_scale=1.0):
             intermediate_size=intermediate_size,
             num_fused_shared_experts=num_shared,
         ),
-        activation=ActivationConfig.swiglu,
+        activation=activation,
         backend=BackendOptions(candidates=(TrtllmFp4Config(),)),
         execution=ExecutionConfig(tune_max_num_tokens=num_tokens),
     )
@@ -452,8 +458,8 @@ def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
         gemm1_weights_scale=view["gemm1_weights_scale"],
         gemm1_bias=None,
         gemm1_alpha=view.get("gemm1_alpha"),
-        gemm1_beta=None,
-        gemm1_clamp_limit=None,
+        gemm1_beta=view.get("gemm1_beta"),
+        gemm1_clamp_limit=view.get("gemm1_clamp_limit"),
         gemm2_weights=view["gemm2_weights"],
         gemm2_weights_scale=view["gemm2_weights_scale"],
         gemm2_bias=None,
@@ -469,8 +475,78 @@ def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
         local_num_experts=config.routing.num_experts,
         routed_scaling_factor=2.5,
         routing_method_type=RoutingMethodType.DeepSeekV3,
+        activation_type=int(config.activation.type),
         tune_max_num_tokens=act.num_tokens,
         num_fused_shared_experts=num_shared,
+    )[0]
+    torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.05)
+
+
+@pytest.mark.parametrize(
+    "variant,activation",
+    [
+        *[
+            (variant, activation)
+            for variant in (QuantVariant.NVFP4, QuantVariant.MXFP4)
+            for activation in (SwiGLU(), GeGLU(), SiTU(), ReLU2())
+        ],
+        (QuantVariant.W4A16, SwiGLU()),
+    ],
+)
+def test_trtllm_fp4_preparation_shape_for_declared_activations(variant, activation):
+    _xfail_w4a16_sm103(variant)
+    _, _, config, view, _ = _make_fp4_shared_case(variant, 0, activation=activation)
+    expected_rows = config.experts.intermediate_size * (2 if activation.is_gated else 1)
+    assert view["gemm1_weights"].shape[1] == expected_rows
+    assert view["gemm1_weights_scale"].shape[1] == expected_rows
+
+
+@pytest.mark.parametrize(
+    "activation",
+    (
+        GeGLU(),
+        SiTU(gate_scale=2.0, linear_scale=3.0, clamp_limit=4.0),
+        ReLU2(),
+    ),
+)
+@pytest.mark.parametrize("variant", (QuantVariant.NVFP4, QuantVariant.MXFP4))
+def test_trtllm_fp4_new_activations_match_flat_launcher(variant, activation):
+    _xfail_w4a16_sm103(variant)
+    act, weights, config, view, (routing_logits, routing_bias) = _make_fp4_shared_case(
+        variant,
+        0,
+        activation=activation,
+    )
+    actual = MoELayer(config, device=torch.device("cuda"))(act, weights).clone()
+    expected = trtllm_fp4_block_scale_moe(
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        hidden_states=act.hidden_states_q,
+        hidden_states_scale=act.hidden_states_scale,
+        gemm1_weights=view["gemm1_weights"],
+        gemm1_weights_scale=view["gemm1_weights_scale"],
+        gemm1_bias=None,
+        gemm1_alpha=view.get("gemm1_alpha"),
+        gemm1_beta=view.get("gemm1_beta"),
+        gemm1_clamp_limit=view.get("gemm1_clamp_limit"),
+        gemm2_weights=view["gemm2_weights"],
+        gemm2_weights_scale=view["gemm2_weights_scale"],
+        gemm2_bias=None,
+        output1_scale_scalar=view.get("output1_scale_scalar"),
+        output1_scale_gate_scalar=view.get("output1_scale_gate_scalar"),
+        output2_scale_scalar=view.get("output2_scale_scalar"),
+        num_experts=config.routing.num_experts,
+        top_k=config.routing.top_k,
+        n_group=config.routing.n_group,
+        topk_group=config.routing.topk_group,
+        intermediate_size=config.experts.intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=config.routing.num_experts,
+        routed_scaling_factor=config.routing.routed_scaling_factor,
+        routing_method_type=int(config.routing.method),
+        activation_type=int(activation.type),
+        tune_max_num_tokens=act.num_tokens,
+        num_fused_shared_experts=0,
     )[0]
     torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.05)
 
@@ -528,6 +604,15 @@ def test_trtllm_fp4_validates_optional_physical_expert_rows(name):
     runner._variant = QuantVariant.NVFP4
     runner._num_weight_rows = rows
     runner._intermediate_size = I
+    # _validate_fp4_tensors derives the expected GEMM1 row count from the
+    # activation's gating, so the bare runner needs a config to validate against.
+    runner.config = MoEConfig(
+        routing=RoutingConfig(num_experts=rows, top_k=2),
+        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        experts=ExpertConfig(intermediate_size=I),
+        activation=SwiGLU(),
+        backend=BackendOptions(candidates=(TrtllmFp4Config(),)),
+    )
     act = MoEActivationPack(
         hidden_states_q=torch.zeros(T, H // 2, dtype=torch.uint8, device="cuda"),
         hidden_states_scale=torch.ones(
@@ -696,7 +781,7 @@ def test_trtllm_fp4_variant_architecture_gates(
         routing=RoutingConfig(num_experts=8, top_k=2),
         quant=QuantConfig(variant=variant),
         experts=ExpertConfig(intermediate_size=128),
-        activation=ActivationConfig.swiglu,
+        activation=SwiGLU(),
     )
     runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
     runner.config = config

@@ -17,6 +17,7 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
+    ReLU2,
     RoutingConfig,
     RoutingInputMode,
     TrtllmMxInt4Config,
@@ -257,6 +258,55 @@ def test_mxint4_prepare_rejects_unaligned_geometry():
             hidden_size=256,
             intermediate_size=384,
         )
+
+
+def test_mxint4_prepare_uses_non_gated_permutation_for_non_gated_activation():
+    """GEMM1 permutation must follow activation.is_gated, not just row count.
+
+    get_reorder_rows_for_gated_act_gemm_row_indices only asserts M % 2 == 0, so
+    a non-gated GEMM1 passed through the gated path is silently interleaved as
+    if its rows were [up, gate] halves -- a corrupted weight view rather than an
+    error. The row count already honored the activation; the permutation did
+    not, so pin the emitted view against an explicitly non-gated permutation.
+    """
+    from flashinfer.fused_moe.core import _maybe_get_cached_w3_w1_permute_indices
+    from flashinfer.fused_moe.prepare import _mxint4_quantize
+
+    device = torch.device("cuda")
+    E, H, I = 2, 256, 256
+    generator = torch.Generator(device=device).manual_seed(20260824)
+    w1 = (
+        torch.randn(E, I, H, device=device, dtype=torch.bfloat16, generator=generator)
+        * 0.02
+    )
+    w2 = (
+        torch.randn(E, H, I, device=device, dtype=torch.bfloat16, generator=generator)
+        * 0.02
+    )
+    view = TrtllmMxInt4Config.prepare_weights(
+        w1,
+        w2,
+        num_local_experts=E,
+        hidden_size=H,
+        intermediate_size=I,
+        activation=ReLU2(),
+    )
+
+    w1_q, _ = _mxint4_quantize(w1.reshape(E * I, H))
+    w1_q = w1_q.reshape(E, I, H // 2)
+    expected = torch.stack(
+        [
+            w1_q[e][
+                _maybe_get_cached_w3_w1_permute_indices(
+                    {}, w1_q[e], 128, is_gated_act_gemm=False
+                ).to(device)
+            ]
+            for e in range(E)
+        ]
+    )
+    torch.testing.assert_close(
+        view["gemm1_weights"].reshape(expected.shape), expected, rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize(

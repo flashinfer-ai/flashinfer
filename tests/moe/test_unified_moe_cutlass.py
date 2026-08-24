@@ -8,7 +8,6 @@ import torch.nn.functional as F
 
 from flashinfer.autotuner import AutoTuner, TuningConfig, autotune
 from flashinfer.fused_moe import (
-    ActivationConfig,
     BackendOptions,
     CutlassBf16Config,
     CutlassBf16Runner,
@@ -30,6 +29,8 @@ from flashinfer.fused_moe import (
     CutlassW4A8Runner,
     ExecutionConfig,
     ExpertConfig,
+    GeGLUTanh,
+    Identity,
     MoEActivationPack,
     MoEConfig,
     MoEFinalizeConfig,
@@ -37,14 +38,16 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
+    ReLU2,
     RoutingConfig,
     RoutingInputMode,
+    SwiGLU,
+    SwiGLUStep,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe.runners import MoERunner, _mxfp8_swizzled_act_sf_numel
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
 from flashinfer.fused_moe.utils import map_to_hybrid_bucket
-from flashinfer.tllm_enums import ActivationType
 from flashinfer.utils import (
     get_compute_capability,
     is_sm100a_supported,
@@ -62,7 +65,7 @@ def _config(**overrides) -> MoEConfig:
         routing=RoutingConfig(num_experts=4, top_k=2),
         quant=QuantConfig(variant=QuantVariant.BF16),
         experts=ExpertConfig(intermediate_size=256),
-        activation=ActivationConfig.swiglu,
+        activation=SwiGLU(),
         backend=BackendOptions((CutlassBf16Config(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=64),
     )
@@ -131,6 +134,7 @@ def test_moe_runner_enforces_lifecycle_order():
 
     class Runner(MoERunner):
         supported_quant_variants = (QuantVariant.BF16,)
+        supported_activation_classes = (SwiGLU,)
 
         def _check_support(self):
             events.append("check_support")
@@ -177,7 +181,7 @@ def test_failed_support_check_does_not_authorize_build():
     runner.config = _config()
     runner._support_checked = True
 
-    with pytest.raises(NotImplementedError, match="QuantVariant.BF16"):
+    with pytest.raises(NotImplementedError, match=r"QuantVariant\.BF16"):
         runner.check_support()
     with pytest.raises(RuntimeError, match=r"check_support\(\).*build\(\)"):
         runner.build()
@@ -496,6 +500,140 @@ def test_cutlass_mxfp4_linear_quantizer_clamps_finite_extremes():
 
 
 @pytest.mark.parametrize(
+    "activation,rows",
+    (
+        (SwiGLU(), 512),
+        (SwiGLUStep(), 512),
+        (GeGLUTanh(), 512),
+        (ReLU2(), 256),
+    ),
+)
+def test_cutlass_bf16_preparation_uses_activation_gating(activation, rows):
+    w1 = torch.empty(4, rows, 128, dtype=torch.bfloat16)
+    w2 = torch.empty(4, 128, 256, dtype=torch.bfloat16)
+    view = CutlassBf16Config.prepare_weights(
+        w1,
+        w2,
+        num_local_experts=4,
+        hidden_size=128,
+        intermediate_size=256,
+        activation=activation,
+        device="cpu",
+    )
+    assert view["fc1_expert_weights"].shape == (4, rows, 128)
+    assert view["fc2_expert_weights"].shape == (4, 128, 256)
+
+
+def test_cutlass_integer_scalars_materialize_float32():
+    from flashinfer.fused_moe.runners import _cutlass_activation_params
+
+    params = _cutlass_activation_params(
+        SwiGLU(alpha=2, beta=1, limit=7), 4, torch.device("cpu")
+    )
+    assert all(t is not None and t.dtype is torch.float32 for t in params.values())
+
+
+def test_cutlass_activation_params_derived_when_build_did_not_cache_them():
+    # _build() normally caches the config-derived scalars. A runner that never
+    # built (or whose _build() was overridden) must still resolve the typed
+    # activation rather than raising, or silently dropping non-default scalars.
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config(activation=SwiGLU(alpha=2.0, beta=1.0, limit=7.0))
+    runner.device = torch.device("cpu")
+    assert not hasattr(runner, "_config_activation_params")
+
+    resolved = runner._resolve_activation_params({})
+    for name, value in (
+        ("swiglu_alpha", 2.0),
+        ("swiglu_beta", 1.0),
+        ("swiglu_limit", 7.0),
+    ):
+        assert resolved[name].dtype is torch.float32
+        torch.testing.assert_close(resolved[name], torch.full((4,), value))
+
+    # Per-expert overrides still win over the derived scalars.
+    alpha = torch.arange(4, dtype=torch.float32)
+    assert (
+        runner._resolve_activation_params({"gemm1_alpha": alpha})["swiglu_alpha"]
+        is alpha
+    )
+
+    # SwiGLUStep carries only a limit; the other slots stay unset.
+    step = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    step.config = _config(activation=SwiGLUStep(limit=5.0))
+    step.device = torch.device("cpu")
+    step_resolved = step._resolve_activation_params({})
+    torch.testing.assert_close(step_resolved["swiglu_limit"], torch.full((4,), 5.0))
+    assert step_resolved["swiglu_alpha"] is None
+    assert step_resolved["swiglu_beta"] is None
+
+
+def test_cutlass_derived_activation_params_are_cached():
+    # Repeated packing must reuse the same tensors: reallocating them would
+    # invalidate the raw pointers captured by an existing CUDA graph.
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config(activation=SwiGLU(alpha=2.0))
+    runner.device = torch.device("cpu")
+
+    first = runner._resolve_activation_params({})
+    assert runner._config_activation_params is not None
+    second = runner._resolve_activation_params({})
+    for name in ("swiglu_alpha", "swiglu_beta", "swiglu_limit"):
+        assert first[name] is second[name]
+
+
+def test_cutlass_incomplete_activation_param_cache_is_rederived():
+    # An empty or partial mapping is uninitialized state, not a request for
+    # kernel defaults; resolving it must re-derive rather than drop the scalars.
+    all_none = {"swiglu_alpha": None, "swiglu_beta": None, "swiglu_limit": None}
+    for stale in ({}, {"swiglu_alpha": torch.full((4,), 9.0)}, all_none):
+        runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+        runner.config = _config(activation=SwiGLU(alpha=2.0, beta=1.0, limit=7.0))
+        runner.device = torch.device("cpu")
+        runner._config_activation_params = stale
+
+        resolved = runner._resolve_activation_params({})
+        torch.testing.assert_close(resolved["swiglu_alpha"], torch.full((4,), 2.0))
+        torch.testing.assert_close(resolved["swiglu_beta"], torch.full((4,), 1.0))
+        torch.testing.assert_close(resolved["swiglu_limit"], torch.full((4,), 7.0))
+
+
+def test_cutlass_per_expert_activation_overrides():
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config(activation=SwiGLU(alpha=2.0))
+    runner.device = torch.device("cpu")
+    runner._config_activation_params = {
+        "swiglu_alpha": torch.full((4,), 2.0),
+        "swiglu_beta": torch.zeros(4),
+        "swiglu_limit": torch.full((4,), 7.0),
+    }
+    alpha = torch.arange(4, dtype=torch.float32)
+    resolved = runner._resolve_activation_params({"gemm1_alpha": alpha})
+    assert resolved["swiglu_alpha"] is alpha
+    torch.testing.assert_close(resolved["swiglu_beta"], torch.zeros(4))
+
+    with pytest.raises(TypeError, match=r"torch\.float32"):
+        runner._resolve_activation_params(
+            {"gemm1_alpha": torch.ones(4, dtype=torch.int64)}
+        )
+    with pytest.raises(ValueError, match="shape"):
+        runner._resolve_activation_params({"gemm1_alpha": torch.ones(3)})
+
+    runner.config = _config(activation=SwiGLUStep())
+    runner._config_activation_params = {
+        "swiglu_alpha": None,
+        "swiglu_beta": None,
+        "swiglu_limit": torch.full((4,), 7.0),
+    }
+    step_limit = torch.arange(4, dtype=torch.float32)
+    resolved = runner._resolve_activation_params({"gemm1_clamp_limit": step_limit})
+    assert resolved["swiglu_limit"] is step_limit
+    for invalid in ("gemm1_alpha", "gemm1_beta"):
+        with pytest.raises(ValueError, match="does not consume"):
+            runner._resolve_activation_params({invalid: torch.ones(4)})
+
+
+@pytest.mark.parametrize(
     "config,match",
     (
         (
@@ -503,8 +641,8 @@ def test_cutlass_mxfp4_linear_quantizer_clamps_finite_extremes():
             "QuantVariant.NVFP4",
         ),
         (
-            _config(activation=ActivationConfig(ActivationType.Relu2)),
-            "Swiglu",
+            _config(activation=Identity()),
+            "supported activations",
         ),
         (
             _config(finalize=MoEFinalizeConfig(do_finalize=False)),
@@ -844,7 +982,7 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
     "config",
     (
         _config(quant=QuantConfig(variant=QuantVariant.NVFP4)),
-        _config(activation=ActivationConfig(ActivationType.Relu2)),
+        _config(activation=Identity()),
         _config(finalize=MoEFinalizeConfig(do_finalize=False)),
         _config(
             experts=ExpertConfig(
@@ -1174,16 +1312,18 @@ cutlass_w4a16_required = pytest.mark.skipif(
 )
 
 
-def _make_case(num_tokens: int = 16):
+def _make_case(num_tokens: int = 16, activation=None):
     torch.manual_seed(42)
     device = torch.device("cuda", torch.cuda.current_device())
     num_experts, top_k = 4, 2
     hidden_size, intermediate_size = 128, 256
     x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
+    activation = activation or SwiGLU()
+    gemm1_rows = intermediate_size * (2 if activation.is_gated else 1)
     w1 = (
         torch.randn(
             num_experts,
-            2 * intermediate_size,
+            gemm1_rows,
             hidden_size,
             device=device,
             dtype=torch.bfloat16,
@@ -1207,6 +1347,7 @@ def _make_case(num_tokens: int = 16):
 
     config = _config(
         experts=ExpertConfig(intermediate_size=intermediate_size),
+        activation=activation,
         execution=ExecutionConfig(
             enable_pdl=False,
             tune_max_num_tokens=max(64, num_tokens),
@@ -1222,22 +1363,25 @@ def _make_case(num_tokens: int = 16):
             num_local_experts=num_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         ),
     )
     return config, act, weights, w1, w2
 
 
-def _make_w4a16_case(num_tokens: int = 16):
+def _make_w4a16_case(num_tokens: int = 16, activation=None):
     torch.manual_seed(43)
     device = torch.device("cuda", torch.cuda.current_device())
     num_experts, top_k = 4, 2
     hidden_size, intermediate_size = 128, 256
     x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
+    activation = activation or SwiGLU()
+    gemm1_rows = intermediate_size * (2 if activation.is_gated else 1)
     w1 = (
         torch.randn(
             num_experts,
-            2 * intermediate_size,
+            gemm1_rows,
             hidden_size,
             device=device,
             dtype=torch.bfloat16,
@@ -1262,6 +1406,7 @@ def _make_w4a16_case(num_tokens: int = 16):
         quant=QuantConfig(variant=QuantVariant.W4A16),
         experts=ExpertConfig(intermediate_size=intermediate_size),
         backend=BackendOptions((CutlassW4A16Config(),)),
+        activation=activation,
         execution=ExecutionConfig(
             enable_pdl=False,
             tune_max_num_tokens=max(64, num_tokens),
@@ -1275,11 +1420,12 @@ def _make_w4a16_case(num_tokens: int = 16):
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        activation=activation,
         device=device,
     )
     weights.prepare_for("cutlass_w4a16", view)
     w1_packed, w1_scale = _quantize_mxfp4_linear(
-        w1.view(num_experts * 2 * intermediate_size, hidden_size)
+        w1.view(num_experts * gemm1_rows, hidden_size)
     )
     w2_packed, w2_scale = _quantize_mxfp4_linear(
         w2.view(num_experts * hidden_size, intermediate_size)
@@ -1289,15 +1435,42 @@ def _make_w4a16_case(num_tokens: int = 16):
     return config, act, weights, w1_quantized, w2_quantized, view
 
 
-def _reference(act: MoEActivationPack, w1: torch.Tensor, w2: torch.Tensor):
+def _reference(
+    act: MoEActivationPack,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation=None,
+):
+    activation = activation or SwiGLU()
     x = act.hidden_states_q.float()
     result = torch.zeros_like(x)
     for token in range(x.shape[0]):
         for slot in range(act.topk_ids.shape[1]):
             expert = int(act.topk_ids[token, slot])
-            up_gate = x[token] @ w1[expert].float().T
-            up, gate = up_gate.chunk(2)
-            expert_out = (F.silu(gate) * up) @ w2[expert].float().T
+            fc1 = x[token] @ w1[expert].float().T
+            if isinstance(activation, ReLU2):
+                intermediate = F.relu(fc1) ** 2
+            else:
+                up, gate = fc1.chunk(2)
+                if isinstance(activation, SwiGLU):
+                    gate = gate.clamp(max=activation.limit)
+                    up = up.clamp(min=-activation.limit, max=activation.limit)
+                    intermediate = (
+                        gate
+                        * torch.sigmoid(activation.alpha * gate)
+                        * (up + activation.beta)
+                    )
+                elif isinstance(activation, SwiGLUStep):
+                    intermediate = F.silu(gate).clamp(max=activation.limit) * up.clamp(
+                        min=-activation.limit, max=activation.limit
+                    )
+                elif isinstance(activation, GeGLUTanh):
+                    intermediate = F.gelu(gate, approximate="tanh") * up
+                else:
+                    raise AssertionError(
+                        f"unsupported CUTLASS activation {activation!r}"
+                    )
+            expert_out = intermediate @ w2[expert].float().T
             result[token] += act.topk_weights[token, slot] * expert_out
     return result.to(torch.bfloat16)
 
@@ -1347,13 +1520,23 @@ def _pin_fallback_winner(layer: MoELayer, act: MoEActivationPack):
 
 
 @cutlass_bf16_required
-def test_cutlass_bf16_moe_layer_matches_independent_reference():
-    config, act, weights, w1, w2 = _make_case()
+@pytest.mark.parametrize(
+    "activation",
+    (
+        SwiGLU(),
+        SwiGLU(alpha=1.7, beta=1.0, limit=7.0),
+        SwiGLUStep(),
+        GeGLUTanh(),
+        ReLU2(),
+    ),
+)
+def test_cutlass_bf16_moe_layer_matches_independent_reference(activation):
+    config, act, weights, w1, w2 = _make_case(activation=activation)
     layer = MoELayer(config)
     runner = _pin_fallback_winner(layer, act)
 
     actual = layer(act, weights)
-    expected = _reference(act, w1, w2)
+    expected = _reference(act, w1, w2, activation)
 
     assert layer.winner_backend == "cutlass_bf16"
     assert runner._workspace is not None
@@ -1361,15 +1544,16 @@ def test_cutlass_bf16_moe_layer_matches_independent_reference():
 
 
 @cutlass_w4a16_required
-def test_cutlass_w4a16_moe_layer_matches_quantized_reference():
-    config, act, weights, w1, w2, view = _make_w4a16_case()
+@pytest.mark.parametrize("activation", (SwiGLU(), SwiGLUStep(), GeGLUTanh(), ReLU2()))
+def test_cutlass_w4a16_moe_layer_matches_quantized_reference(activation):
+    config, act, weights, w1, w2, view = _make_w4a16_case(activation=activation)
     assert view["fc1_expert_weights"].dtype is torch.uint8
     assert view["fc1_expert_scales"].ndim == 5
     layer = MoELayer(config)
     runner = _pin_fallback_winner(layer, act)
 
     actual = layer(act, weights)
-    expected = _reference(act, w1, w2)
+    expected = _reference(act, w1, w2, activation)
 
     assert layer.winner_backend == "cutlass_w4a16"
     assert runner._workspace is not None

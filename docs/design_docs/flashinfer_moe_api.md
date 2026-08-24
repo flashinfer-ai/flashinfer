@@ -93,7 +93,7 @@ All configs are frozen dataclasses registered with TVM's object system. The hier
 | RoutingConfig | num_experts, top_k, routing method, grouping params, scaling factor |
 | QuantConfig | dtype (fp4/fp8/bf16), granularity (per-tensor/per-token/block) |
 | ExpertConfig | intermediate_size, local sharding params |
-| ActivationConfig | activation type (swiglu/geglu/relu2/identity) |
+| ActivationConfig | common base for typed activation values and their scalar parameters |
 | BackendOptions | ordered candidate set via \| operator |
 | ExecutionConfig | enable_pdl, tune_max_num_tokens |
 | MoEFinalizeConfig | do_finalize, use_fused_finalize |
@@ -644,7 +644,7 @@ The aspirational API in §2–§4 (eager `moe_layer(...)`, `MoETensors`, `find_b
 import torch
 from flashinfer.fused_moe import (
     MoEConfig, RoutingConfig, QuantConfig, QuantVariant, ExpertConfig,
-    ActivationConfig, ExecutionConfig, MoELayer,
+    SwiGLU, ExecutionConfig, MoELayer,
     MoEActivationPack, MoEWeightPack, CuteDslConfig, TrtllmFp4Config,
 )
 from flashinfer.fused_moe.api import BackendOptions
@@ -655,7 +655,7 @@ config = MoEConfig(
     routing=RoutingConfig(num_experts=32, top_k=2),
     quant=QuantConfig(variant=QuantVariant.NVFP4),       # MVP: NVFP4 only
     experts=ExpertConfig(intermediate_size=512, local_num_experts=32),
-    activation=ActivationConfig(),                       # MVP: Swiglu only
+    activation=SwiGLU(alpha=1.0, beta=0.0),              # typed + hashable
     backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
     execution=ExecutionConfig(tune_max_num_tokens=8192),
 )
@@ -693,8 +693,51 @@ Key mechanisms (and where they live):
 - **Breaking change — `CutlassConfig` removed.** The deprecated, unregistered `CutlassConfig` placeholder is gone. It was never a runnable `MoELayer` backend (`supported()` always returned false; it was not in `_BACKEND_RUNNERS`). Import, annotate, serialize, or feature-detect a quant-specific type instead (`CutlassBf16Config`, `CutlassNvfp4Config`, `CutlassFp8PerTensorConfig`, `CutlassFp8BlockConfig`, `CutlassMxfp8Config`, `CutlassMxfp8Mxfp4Config`, `CutlassW4A16Config`, `CutlassW4A8Config`, `CutlassHummingConfig`). Historical **Anchor:** / CR1 quotes earlier in this document still mention `CutlassConfig` as review history, not current API.
 - **Two-stage cross-backend autotune** (`MoELayer._select_winner`, runners' delegation): for each candidate, the `AutoTuner.choose_one` picks the best *within-backend tactic* (each backend tuned in its own native input schema), then `bench_gpu_time` compares the candidates at their winning tactics and the fastest backend is dispatched. A single `choose_one` over both runners is not possible because their input schemas differ — hence the explicit two stages.
 - **Winner caching is per token-bucket** (`map_to_hybrid_bucket`): reusing one `MoELayer` across token counts re-selects per bucket; `winner_backend` reports the most-recent choice and `reset_winner()` clears the cache.
-- **Fail-fast scope** (`MoELayer._validate_mvp_scope`): non-NVFP4 quant or non-Swiglu activation raises `NotImplementedError` at construction.
+- **Fail-fast scope:** each runner declares quantization and typed-activation
+  capabilities; unsupported pairs are filtered before build and direct-runner
+  calls raise a specific `NotImplementedError`.
 - **Runners delegate** to canonical inner runners (`CuteDslFusedMoENvfp4Runner` / `core.MoERunner`); the unified adapters only translate Packs ⇄ the inner runner's native tensor list.
+
+### Typed activation values and backend parity
+
+The unreleased enum-wrapper/singleton spelling was replaced by frozen values:
+`SwiGLU(alpha, beta, limit)`, `SiTU(gate_scale, linear_scale, clamp_limit)`,
+`GeGLU()`, `ReLU2()`, `GeGLUTanh()`, `SwiGLUStep(limit)`, and `Identity()`.
+Every value exposes `.type` and `.is_gated`; scalar fields participate in
+equality, hashing, repr serialization, and tactic-cache identity. Per-expert
+`gemm1_alpha` / `gemm1_beta` / `gemm1_clamp_limit` tensors remain in
+`MoEWeightPack` backend views and override the scalar-expanded preparation view.
+
+`SiTU.linear_scale` is the linear-branch soft-clamp scale, applied as
+`linear_scale * tanh(linear / linear_scale)`. It accepts `None` for the
+unclamped linear branch, which only the CuTe-DSL scalar ABI can express: the
+TRT-LLM path carries the value in a per-expert `gemm1_beta` float tensor that
+has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
+silently dropping the parameter. The default stays `1.0`, so cross-backend
+parity is unchanged unless `None` is requested explicitly.
+
+The truthful unified support matrix follows the already executable flat path:
+
+| Runner / quantization | Unified activations |
+| --- | --- |
+| TRTLLM BF16 | SwiGLU (typed scalars), ReLU2 |
+| TRTLLM FP8 per-tensor | SwiGLU (default scalars), ReLU2 |
+| TRTLLM DeepSeek block FP8 | SwiGLU (typed scalars) |
+| TRTLLM MXFP8 block FP8 | SwiGLU (typed scalars), GeGLU, ReLU2 |
+| TRTLLM NVFP4 / MXFP4 | SwiGLU (typed scalars), GeGLU, SiTU, ReLU2 |
+| TRTLLM W4A16 | SwiGLU |
+| TRTLLM MxInt4 | SwiGLU (typed scalars) |
+| CUTLASS BF16 / W4A16 | SwiGLU (typed scalars), SwiGLUStep, GeGLUTanh, ReLU2 |
+| CuTe-DSL NVFP4 / W4A16 | SwiGLU (typed scalars), GeGLUTanh, ReLU2, SiTU (typed scalars) |
+| b12x NVFP4 | SwiGLU (default scalars), GeGLUTanh, ReLU2 |
+| b12x W4A16 | SwiGLU (default scalars), ReLU2 |
+
+CuTe-DSL SiTU uses its existing scalar ABI (`situ_beta` and
+`situ_linear_beta`); its flat kernel does not expose a separate SiTU
+`clamp_limit`, so that non-default field is rejected. b12x W4A16 keeps its
+flat-proven SwiGLU/ReLU2 subset. Weight preparation computes GEMM1 rows from
+`activation.is_gated` (`2I` gated, `I` non-gated) and passes that fact into
+TRTLLM row permutations.
 
 ### Today's MVP Cut
 
