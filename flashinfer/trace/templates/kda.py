@@ -229,3 +229,82 @@ fused_kda_decode_trace = TraceTemplate(
     ],
     tags=["stage:decode", "status:verified"],
 )
+
+
+kda_output_only_decode_trace = TraceTemplate(
+    op_type="kda",
+    name_prefix="kda_output_only_decode",
+    description=(
+        "Output-only (frozen-state) KDA decode over 1..16 tokens per "
+        "sequence: computes the attention outputs from a read-only "
+        "committed-state pool without writing state back (the speculative-"
+        "decode verify path)."
+    ),
+    axes={
+        "batch_size": Var(description="Number of sequences."),
+        "seq_len": Var(description="Tokens per sequence (1..16)."),
+        "num_q_heads": Const(description="Number of query and key heads.", abbrev="q"),
+        "num_v_heads": Const(description="Number of value heads.", abbrev="v"),
+        "head_dim": Const(
+            description="Query, key, and value head dimension.", abbrev="d"
+        ),
+        "source_pool_size": Var(description="Number of committed-state slots."),
+    },
+    inputs={
+        "q": Tensor(["batch_size", "seq_len", "num_q_heads", "head_dim"]),
+        "k": Tensor(["batch_size", "seq_len", "num_q_heads", "head_dim"]),
+        "v": Tensor(["batch_size", "seq_len", "num_v_heads", "head_dim"]),
+        "g": Tensor(["batch_size", "seq_len", "num_v_heads", "head_dim"]),
+        "beta": Tensor(["batch_size", "seq_len", "num_v_heads"]),
+        "initial_state_source": Tensor(
+            ["source_pool_size", "num_v_heads", "head_dim", "head_dim"],
+            description="Read-only committed-state pool (never written).",
+        ),
+        "initial_state_indices": Tensor(
+            ["batch_size"],
+            optional=True,
+            description="Committed-state slot selected for each sequence.",
+        ),
+        "A_log": Tensor(
+            ["num_q_heads"],
+            dtype="float32",
+            optional=True,
+            description="Log decay parameter for the in-kernel gate modes.",
+        ),
+        "dt_bias": Tensor(
+            ["num_q_heads", "head_dim"],
+            dtype="float32",
+            optional=True,
+            description="Per-channel decay bias for the in-kernel gate modes.",
+        ),
+        "scale": Scalar("float32", optional=True),
+        "use_gate_in_kernel": Scalar("int32", optional=True),
+        "lower_bound": Scalar("float32", optional=True),
+        "beta_is_logit": Scalar("int32", optional=True),
+        "emit_corrections": Scalar("int32", optional=True),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "seq_len", "num_v_heads", "head_dim"],
+            dtype_from="q",
+        ),
+        "corrections": Tensor(
+            ["batch_size", "seq_len", "num_v_heads", "head_dim"],
+            dtype="bfloat16",
+            optional=True,
+            description="Per-token corrections (emit_corrections=True).",
+        ),
+        "kg_cache": Tensor(
+            ["batch_size", "seq_len", "num_v_heads", "head_dim"],
+            dtype="bfloat16",
+            optional=True,
+            description="Normalized-key | raw-gate cache (emit_corrections).",
+        ),
+    },
+    constraints=[
+        "num_v_heads % num_q_heads == 0",
+        "head_dim == 128",
+        "seq_len <= 16",
+    ],
+    tags=["stage:decode", "status:experimental"],
+)

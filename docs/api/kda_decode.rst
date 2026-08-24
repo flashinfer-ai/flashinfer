@@ -89,11 +89,26 @@ CUDA 12.9 or newer uses one ``sm_100f`` module on CC 10.0 and CC 10.3.
 Unsupported devices or contracts raise an error without falling back to
 another KDA implementation.
 
+Output-only (frozen-state) speculative verify decode
+----------------------------------------------------
+
+``kda_output_only_decode`` computes the KDA outputs for 1..16 tokens per
+sequence from a read-only committed-state pool and never writes state back —
+the speculative-decode verify path, analogous to the GDN WY output-only
+kernel. Two implementations are dispatched by problem size: a WY-parallel
+tensor-core kernel that replaces the serial recurrence with T x T GEMMs, a
+log-depth triangular inverse, and TMA-loaded state GEMMs (per-K-channel decay
+is folded into ``k * exp(±cumsum g)`` / ``q * exp(cumsum g)`` operand tiles),
+and a grouped register-recurrent fork (without the baseline's per-token
+state-checkpoint writes) for small ``B * HV * T``. Requires SM90+ for the WY
+path and ``K = V = 128``.
+
 .. currentmodule:: flashinfer.kda_decode
 
 .. autosummary::
     :toctree: ../generated
 
     fused_kda_decode
+    kda_output_only_decode
     packed_kda_decode
     recurrent_kda

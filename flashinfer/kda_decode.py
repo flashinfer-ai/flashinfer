@@ -30,6 +30,7 @@ import torch
 from .api_logging import flashinfer_api
 from .trace.templates.kda import (
     fused_kda_decode_trace,
+    kda_output_only_decode_trace,
     packed_kda_decode_trace,
     recurrent_kda_trace,
 )
@@ -46,6 +47,31 @@ except (ImportError, RuntimeError):
 
 from .kda_kernels import run_packed_kda_decode as _run_packed_kda_decode
 from .kda_kernels import run_recurrent_kda as _run_recurrent_kda
+
+try:
+    from .kda_kernels.kda_decode_wy_output_only import (
+        kda_wy_output_only as _run_kda_output_only,
+    )
+    from .kda_kernels.kda_decode_wy_output_only import (
+        kda_recoverssm_verify as kda_recoverssm_verify,
+    )
+
+    _KDA_OUTPUT_ONLY_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _run_kda_output_only = None
+    _KDA_OUTPUT_ONLY_AVAILABLE = False
+
+    def _kda_recoverssm_verify_unavailable(*args, **kwargs):
+        """Unavailable stub (CuTe DSL missing); see the real docstring in
+        ``flashinfer.kda_kernels.kda_decode_wy_output_only``."""
+        raise NotImplementedError(
+            "kda_recoverssm_verify is unavailable (missing CuTe DSL deps)"
+        )
+
+    # Keep `import flashinfer` working without the CuTe DSL; calls fail
+    # with a clear NotImplementedError instead of an import-time crash.
+    kda_recoverssm_verify = _kda_recoverssm_verify_unavailable  # type: ignore[assignment]
+
 
 # None when the CuTe DSL is missing or cannot target this device
 # (see flashinfer/kda_kernels/__init__.py).
@@ -362,4 +388,109 @@ def fused_kda_decode(
         lower_bound=lower_bound,
         norm_eps=norm_eps,
         output=output,
+    )
+
+
+@flashinfer_api(trace=kda_output_only_decode_trace)
+def kda_output_only_decode(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state_source: torch.Tensor,
+    initial_state_indices: Optional[torch.Tensor] = None,
+    A_log: Optional[torch.Tensor] = None,
+    dt_bias: Optional[torch.Tensor] = None,
+    scale: Optional[float] = None,
+    use_gate_in_kernel: bool = False,
+    lower_bound: Optional[float] = None,
+    beta_is_logit: bool = False,
+    output: Optional[torch.Tensor] = None,
+    *,
+    backend: Literal["auto", "wy", "recurrent"] = "auto",
+    emit_corrections: bool = False,
+    corrections_out: Optional[torch.Tensor] = None,
+    kg_cache_out: Optional[torch.Tensor] = None,
+):
+    r"""Output-only (frozen-state) KDA decode over 1..16 tokens per sequence.
+
+    Computes the Kimi Delta Attention outputs for ``T`` speculative / MTP
+    tokens per sequence from a read-only committed-state pool, never writing
+    state back — the verify-path counterpart of :func:`recurrent_kda`. Two
+    implementations are dispatched by problem size:
+
+    - ``"wy"``: a chunk-parallel WY-representation kernel that replaces the
+      serial recurrence with tensor-core GEMMs (per-channel decay is folded
+      into pre-scaled ``k * exp(±cumsum g)`` / ``q * exp(cumsum g)`` tiles,
+      followed by a T x T triangular inverse and two state GEMMs against the
+      TMA-loaded initial state).
+    - ``"recurrent"``: a grouped register recurrence for small ``B * HV * T``
+      (an output-only fork of the recurrent decode kernel without its
+      per-token state-checkpoint writes).
+
+    ``"auto"`` picks by a measured crossover. Q/K L2 normalization is always
+    applied in-kernel (eps 1e-6), matching
+    ``recurrent_kda(use_qk_l2norm_in_kernel=True)``.
+
+    Args:
+        q: ``[B, T, H, 128]`` bf16 query, ``1 <= T <= 16``.
+        k: ``[B, T, H, 128]`` bf16 key.
+        v: ``[B, T, HV, 128]`` bf16 value. GQA is applied when ``HV != H``.
+        g: ``[B, T, HV, 128]`` bf16 per-K-channel gate. Log-space when
+            ``use_gate_in_kernel=False``, raw otherwise.
+        beta: ``[B, T, HV]`` bf16 delta-rule learning rate (pre-sigmoided
+            unless ``beta_is_logit=True``).
+        initial_state_source: ``[pool, HV, 128, 128]`` bf16 read-only
+            committed-state pool (``[V, K]`` layout per head). Never written.
+        initial_state_indices: ``[B]`` int32 slot per sequence. Defaults to
+            ``arange(B)``.
+        A_log: ``[H]`` float32 log-decay; required when
+            ``use_gate_in_kernel=True``.
+        dt_bias: ``[H*128]`` float32 per-channel decay bias (optional).
+        scale: Query scale; defaults to ``128**-0.5``.
+        use_gate_in_kernel: Compute the gate in-kernel from raw ``g``.
+        lower_bound: If set (negative, e.g. ``-5.0`` for Kimi K3), uses the
+            ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`` gate;
+            otherwise the ``-exp(A_log) * softplus(g + dt_bias)`` gate. Only
+            meaningful with ``use_gate_in_kernel=True``.
+        beta_is_logit: Apply sigmoid to ``beta`` inside the kernel.
+        output: Optional preallocated contiguous ``[B, T, HV, 128]`` bf16
+            output (required for allocation-free CUDA-graph replay).
+        backend: ``"auto"`` (default), ``"wy"``, or ``"recurrent"``.
+        emit_corrections: Also emit the speculative-verify caches consumed by
+            a RecoverSSM-style commit kernel: per-token corrections
+            ``U_t = beta_t * (v_t - u_t)`` (with ``beta_t`` post-sigmoid when
+            ``beta_is_logit=True``) of shape ``[B, T, HV, 128]`` and a
+            kg cache ``[B, T, HV, 256]`` holding the L2-normalized key in
+            ``[..., :128]`` and the raw gate in ``[..., 128:]``.
+        corrections_out: Optional preallocated contiguous bf16 corrections
+            tensor (CUDA-graph replay).
+        kg_cache_out: Optional preallocated contiguous bf16 kg cache tensor.
+
+    Returns:
+        The bf16 output of shape ``[B, T, HV, 128]``, or the tuple
+        ``(output, corrections, kg_cache)`` when ``emit_corrections=True``.
+    """
+    if _run_kda_output_only is None:
+        raise NotImplementedError("KDA output-only backend is unavailable")
+    return _run_kda_output_only(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        initial_state_source=initial_state_source,
+        initial_state_indices=initial_state_indices,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        use_gate_in_kernel=use_gate_in_kernel,
+        lower_bound=lower_bound,
+        beta_is_logit=beta_is_logit,
+        output=output,
+        backend=backend,
+        emit_corrections=emit_corrections,
+        corrections_out=corrections_out,
+        kg_cache_out=kg_cache_out,
     )
