@@ -112,9 +112,7 @@ def test_cache_dir_workspace_base_takes_priority(monkeypatch, tmp_path):
     xdg_cache = tmp_path / "xdg"
     monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(workspace_base))
     monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_cache))
-    assert (
-        _env._get_cache_dir() == workspace_base / ".cache" / "flashinfer"
-    )
+    assert _env._get_cache_dir() == workspace_base / ".cache" / "flashinfer"
 
 
 def test_cache_dir_uses_xdg_cache_home(monkeypatch, tmp_path):
