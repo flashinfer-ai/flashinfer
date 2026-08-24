@@ -520,13 +520,11 @@ inline void CheckServingAuxiliaryNoOverlap(
 inline void PackBetaForTmaIfNeeded(const TensorView& beta, const TensorView& beta_tma,
                                    int64_t num_heads, int64_t beta_token_stride,
                                    cudaStream_t stream) {
-  // Full chunks TMA-load an eight-head, ChunkTokens-row beta box.  A distinct
-  // beta_tma allocation therefore needs materialization even when only its
-  // token extent, rather than its head extent, is padded.
+  // TMA may require separate storage for either token or head padding. Head
+  // counts can therefore match even though beta_tma is an uninitialized
+  // workspace; only an exact pointer alias is already populated.
   const int64_t padded_num_heads = beta_tma.size(beta_tma.ndim() - 1);
-  const TensorByteRange beta_range = GetTensorByteRange(beta, "beta");
-  const TensorByteRange beta_tma_range = GetTensorByteRange(beta_tma, "beta_tma");
-  if (beta_range.begin == beta_tma_range.begin && beta_range.end == beta_tma_range.end) {
+  if (beta_tma.data_ptr() == beta.data_ptr()) {
     return;
   }
   const int64_t token_count = beta.numel() / num_heads;

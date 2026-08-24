@@ -1861,56 +1861,6 @@ def _run_flash_kda_prefill(
     )
     automatic_sequence_order = None
     persistent_plan = None
-    uniform_sequences = False
-    if (
-        not fixed_layout
-        and seq_order is None
-        and prefill_workspace is None
-        and not capturing
-    ):
-        assert cu_seqlens is not None
-        assert stream_workspace is not None
-        (
-            automatic_sequence_order,
-            persistent_plan,
-            uniform_sequences,
-        ) = _cached_packed_task_metadata(
-            stream_workspace,
-            cu_seqlens,
-            total_tokens=batch_size * seq_len,
-            num_heads=num_heads,
-            sm_count=sm_count,
-            build_persistent_plan=persistent_candidate,
-        )
-    elif persistent_candidate:
-        assert fixed_layout
-        persistent_plan = _persistent_task_plan(
-            (seq_len,) * num_sequences,
-            num_heads=num_heads,
-            sm_count=sm_count,
-        )
-    use_exact_n16 = (
-        checkpoint_every_n_tokens != 0 and checkpoint_every_n_tokens % 32 != 0
-    ) or _requires_exact_n16_recurrence(
-        sm_count=sm_count,
-        fixed_layout=fixed_layout,
-        num_sequences=num_sequences,
-        num_heads=num_heads,
-        uniform_sequences=uniform_sequences,
-    )
-    if use_exact_n16:
-        persistent_plan = None
-    variant = _select_flash_kda_prefill_variant(
-        fixed_layout=fixed_layout,
-        num_sequences=num_sequences,
-        num_heads=num_heads,
-        needs_direct_m128=needs_direct_m128,
-        use_persistent_m128=persistent_plan is not None,
-        use_small_bh_m128=small_bh_candidate,
-        use_exact_n16=use_exact_n16,
-    )
-    if checkpoint_every_n_tokens and variant == "m128_n16":
-        variant = "m128_n16_checkpoint"
     if fixed_layout:
         sequence_lengths = (seq_len,) * num_sequences
         offsets = tuple(index * seq_len for index in range(num_sequences + 1))
@@ -1951,10 +1901,27 @@ def _run_flash_kda_prefill(
             sm_count=sm_count,
         )
     max_sequence_length = max(sequence_lengths)
-    route = (
-        _direct_m128_route(num_heads=num_heads, max_sequence_length=max_sequence_length)
-        if needs_direct_m128
-        else _select_flash_kda_bf16_route(
+    use_exact_n16 = (
+        checkpoint_every_n_tokens != 0 and checkpoint_every_n_tokens % 32 != 0
+    ) or _requires_exact_n16_recurrence(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        uniform_sequences=uniform_sequences,
+    )
+    if needs_direct_m128:
+        route = (
+            _FLASH_KDA_ROUTE_DIRECT_M128_N16
+            if use_exact_n16
+            else _direct_m128_route(
+                num_heads=num_heads,
+                max_sequence_length=max_sequence_length,
+            )
+        )
+    else:
+        route = _select_flash_kda_bf16_route(
             compute_capability=compute_capability,
             sm_count=sm_count,
             fixed_layout=fixed_layout,
@@ -1963,7 +1930,6 @@ def _run_flash_kda_prefill(
             uniform_sequences=uniform_sequences,
             max_sequence_length=max_sequence_length,
         )
-    )
     use_bt16 = route == _FLASH_KDA_ROUTE_BT16_M64
     use_tensor_state_decay = (
         state_indices is None
@@ -1992,6 +1958,7 @@ def _run_flash_kda_prefill(
         "m128_h12_short",
         "m128_h12_long",
         "m128_n16",
+        "m128_n16_checkpoint",
         "m128_n16_short",
         "persistent_m128",
         "small_bh_m128",
@@ -2023,6 +1990,8 @@ def _run_flash_kda_prefill(
         )
     else:
         variant = "m128"
+    if checkpoint_every_n_tokens and variant == "m128_n16":
+        variant = "m128_n16_checkpoint"
     persistent_task_ids = None
     persistent_task_offsets = None
     if persistent_plan is None:
@@ -2153,7 +2122,12 @@ def _run_flash_kda_prefill(
             beta_tma = _beta_tma_source(
                 beta,
                 workspace,
-                chunk_tokens=(16 if variant in ("m128_n16", "m128_n16_short") else 32),
+                chunk_tokens=(
+                    16
+                    if variant
+                    in ("m128_n16", "m128_n16_checkpoint", "m128_n16_short")
+                    else 32
+                ),
             )
         packet_workspace = None
         packet_ready = None
