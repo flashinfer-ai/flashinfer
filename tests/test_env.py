@@ -101,3 +101,33 @@ def test_default_when_nothing_set(monkeypatch):
     monkeypatch.delenv("FLASHINFER_CUBIN_DIR", raising=False)
     monkeypatch.setattr(_env, "has_flashinfer_cubin", lambda: False)
     assert _env._get_cubin_dir() == _env.FLASHINFER_CACHE_DIR / "cubins"
+
+
+# -- cache dir priority tests (issue #4693) ---------------------------------
+
+
+def test_cache_dir_workspace_base_takes_priority(monkeypatch, tmp_path):
+    """FLASHINFER_WORKSPACE_BASE must win over XDG_CACHE_HOME."""
+    workspace_base = tmp_path / "workspace"
+    xdg_cache = tmp_path / "xdg"
+    monkeypatch.setenv("FLASHINFER_WORKSPACE_BASE", str(workspace_base))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_cache))
+    assert (
+        _env._get_cache_dir() == workspace_base / ".cache" / "flashinfer"
+    )
+
+
+def test_cache_dir_uses_xdg_cache_home(monkeypatch, tmp_path):
+    """XDG_CACHE_HOME should be used when FLASHINFER_WORKSPACE_BASE is unset."""
+    xdg_cache = tmp_path / "xdg"
+    monkeypatch.delenv("FLASHINFER_WORKSPACE_BASE", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_cache))
+    assert _env._get_cache_dir() == xdg_cache / "flashinfer"
+
+
+def test_cache_dir_default_home(monkeypatch, tmp_path):
+    """Fall back to $HOME/.cache/flashinfer when nothing is set."""
+    monkeypatch.delenv("FLASHINFER_WORKSPACE_BASE", raising=False)
+    monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+    monkeypatch.setattr(_env.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
+    assert _env._get_cache_dir() == tmp_path / ".cache" / "flashinfer"

@@ -59,7 +59,25 @@ FLASHINFER_BASE_DIR: pathlib.Path = pathlib.Path(
     os.getenv("FLASHINFER_WORKSPACE_BASE", pathlib.Path.home().as_posix())
 )
 
-FLASHINFER_CACHE_DIR: pathlib.Path = FLASHINFER_BASE_DIR / ".cache" / "flashinfer"
+
+def _get_cache_dir() -> pathlib.Path:
+    """Resolve the base cache directory.
+
+    Priority:
+    1. ``FLASHINFER_WORKSPACE_BASE`` -> ``$FLASHINFER_WORKSPACE_BASE/.cache/flashinfer``
+    2. ``XDG_CACHE_HOME`` (per XDG Base Directory Specification) -> ``$XDG_CACHE_HOME/flashinfer``
+    3. Default -> ``$HOME/.cache/flashinfer``
+    """
+    workspace_base = os.getenv("FLASHINFER_WORKSPACE_BASE")
+    if workspace_base:
+        return pathlib.Path(workspace_base) / ".cache" / "flashinfer"
+    xdg_cache_home = os.getenv("XDG_CACHE_HOME")
+    if xdg_cache_home:
+        return pathlib.Path(xdg_cache_home) / "flashinfer"
+    return pathlib.Path.home() / ".cache" / "flashinfer"
+
+
+FLASHINFER_CACHE_DIR: pathlib.Path = _get_cache_dir()
 _package_root: pathlib.Path = pathlib.Path(__file__).resolve().parents[1]
 
 
