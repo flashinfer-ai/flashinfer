@@ -34,6 +34,7 @@ Two variants, differing in how their scale factors enter:
 Both are SM100 (B200-class Blackwell) only.
 """
 
+import contextlib
 import functools
 import importlib.util
 import os
@@ -172,6 +173,24 @@ def _cached_gpu_arch(device_index: int) -> str:
     return f"sm_{major}{minor_str}"
 
 
+def _on_device(device_index: int):
+    """Make ``device_index`` current for a compile+launch, if it is not already.
+
+    The kernels take the TVM-FFI environment stream, which resolves to the
+    current stream of the *current* device.  Launching with tensors that live on
+    another device onto that stream is wrong independently of architecture, so
+    the target has to be current for the duration of the launch.  Compilation is
+    inside the same scope because ``JitSpecCuteDsl`` tags its on-disk cache from
+    the current device too.
+
+    Returns a null context when the target is already current, so the ordinary
+    single-GPU path pays nothing.
+    """
+    if device_index == torch.cuda.current_device():
+        return contextlib.nullcontext()
+    return torch.cuda.device(device_index)
+
+
 def _arch_for_launch(device_index: int, fn_name: str) -> str:
     """Codegen arch for a launch, rejecting a target this process cannot run.
 
@@ -182,11 +201,12 @@ def _arch_for_launch(device_index: int, fn_name: str) -> str:
     architecture check -- so a mismatch has to be caught here, before the
     caller is handed a callable with no execution engine.
 
-    Only the *arch* is checked, and only when the tensors are on a device
-    other than the current one.  A same-arch device mismatch (two identical
-    GPUs) is a separate concern: the launch takes the current device's
-    stream, which is wrong independently of codegen, and is not addressed
-    here.
+    Since the launch paths now run inside :func:`_on_device`, the target is
+    already current by the time this is reached and the mismatch cannot arise
+    there.  It is kept as a backstop for any future caller that compiles for a
+    device without first entering it -- the failure it prevents is silent and
+    deferred, so a cheap check is worth keeping even when it should be
+    unreachable.
 
     ``precompile_paged_mqa_logits`` deliberately does NOT use this: building a
     foreign-arch artifact for another worker to load later is its documented
@@ -822,15 +842,15 @@ def _gpu_schedule(
 
     batch_size = int(context_lens.shape[0])
     aligned_b = max(((batch_size + 31) // 32) * 32, 32)
-    compiled = _compile_schedule_kernel(
-        aligned_b,
-        _SPLIT_KV,
-        num_sms,
-        _arch_for_launch(
-            get_device_index(schedule_meta.device), "compute_paged_mqa_logits_schedule"
-        ),
-    )
-    compiled(context_lens, schedule_meta, batch_size)
+    dev_index = get_device_index(schedule_meta.device)
+    with _on_device(dev_index):
+        compiled = _compile_schedule_kernel(
+            aligned_b,
+            _SPLIT_KV,
+            num_sms,
+            _arch_for_launch(dev_index, "compute_paged_mqa_logits_schedule"),
+        )
+        compiled(context_lens, schedule_meta, batch_size)
 
 
 def padded_context_len(max_context_len: int) -> int:
@@ -1147,36 +1167,37 @@ def fp8_paged_mqa_logits(
             schedule_meta, context_lens, "fp8_paged_mqa_logits"
         )
 
-    compiled = _cached_compile_fp8_kernel(
-        block_size,
-        H,
-        D,
-        next_n,
-        num_sms,
-        cutlass_epi,
-        cutlass_acc,
-        cutlass_out,
-        num_epi_subtiles,
-        _arch_for_launch(get_device_index(q.device), "fp8_paged_mqa_logits"),
-    )
-
     # FP8 tensor passed as uint8 view (DLPack lacks float8 support)
     q_for_ffi = (
         q_3d.view(torch.uint8)
         if q_3d.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
         else q_3d
     )
-    compiled(
-        kv_flat,
-        q_for_ffi,
-        w_2d,
-        logits,
-        block_table,
-        context_lens,
-        schedule_meta,
-        num_blocks,
-        B,
-    )
+    dev_index = get_device_index(q.device)
+    with _on_device(dev_index):
+        compiled = _cached_compile_fp8_kernel(
+            block_size,
+            H,
+            D,
+            next_n,
+            num_sms,
+            cutlass_epi,
+            cutlass_acc,
+            cutlass_out,
+            num_epi_subtiles,
+            _arch_for_launch(dev_index, "fp8_paged_mqa_logits"),
+        )
+        compiled(
+            kv_flat,
+            q_for_ffi,
+            w_2d,
+            logits,
+            block_table,
+            context_lens,
+            schedule_meta,
+            num_blocks,
+            B,
+        )
     return logits
 
 
@@ -1469,30 +1490,32 @@ def fp4_paged_mqa_logits(
             schedule_meta, context_lens, "fp4_paged_mqa_logits"
         )
 
-    compiled = _cached_compile_fp4_kernel(
-        block_size,
-        H,
-        D,
-        next_n,
-        num_sms,
-        cutlass_epi,
-        cutlass_out,
-        num_epi_subtiles,
-        is_kv_sf_interleaved,
-        _arch_for_launch(get_device_index(q.device), "fp4_paged_mqa_logits"),
-    )
-    compiled(
-        kv_flat,
-        q_3d,
-        sf_q_2d,
-        w_2d,
-        logits,
-        block_table,
-        context_lens,
-        schedule_meta,
-        num_blocks,
-        B,
-    )
+    dev_index = get_device_index(q.device)
+    with _on_device(dev_index):
+        compiled = _cached_compile_fp4_kernel(
+            block_size,
+            H,
+            D,
+            next_n,
+            num_sms,
+            cutlass_epi,
+            cutlass_out,
+            num_epi_subtiles,
+            is_kv_sf_interleaved,
+            _arch_for_launch(dev_index, "fp4_paged_mqa_logits"),
+        )
+        compiled(
+            kv_flat,
+            q_3d,
+            sf_q_2d,
+            w_2d,
+            logits,
+            block_table,
+            context_lens,
+            schedule_meta,
+            num_blocks,
+            B,
+        )
     return logits
 
 

@@ -1868,18 +1868,23 @@ def test_gpu_arch_resolves_from_requested_device():
             torch.cuda.set_device(cur)
 
 
-def test_launch_rejects_arch_it_cannot_run(monkeypatch):
-    """A launch target whose arch differs from the current device must raise.
+def test_arch_backstop_rejects_target_it_cannot_run(monkeypatch):
+    """The arch backstop must still reject a target the current device can't run.
 
-    CuTe-DSL does not reject a --gpu-arch the current device cannot execute: it
-    compiles, exports, reloads and then fails only on first invocation (measured
-    on sm_100a for sm_90a, sm_103a and sm_80). Exporting and reloading does not
-    help because load_module performs no architecture check, so the mismatch has
-    to be caught before the caller receives the callable.
+    This is defence in depth, not the primary mechanism. The launch paths run
+    inside ``_on_device``, which makes the target current before compiling and
+    launching, so on those paths the arch matches by construction and this check
+    is unreachable. It stays because the failure it prevents is silent and
+    deferred: CuTe-DSL does not reject a --gpu-arch the current device cannot
+    execute -- it compiles, exports, reloads, and raises only on first
+    invocation (measured on sm_100a for sm_90a, sm_103a and sm_80), and
+    load_module performs no architecture check either. A future caller that
+    compiles for a device without entering it would hit exactly that.
 
-    The arch lookup is stubbed so the check is exercised on a single-GPU host;
-    the real heterogeneous path is covered separately. Regression for PR #4365
-    review r3824968121.
+    The arch lookup is stubbed so this runs on a single-GPU host. Real
+    multi-GPU behaviour -- including that a non-current target now *works*
+    rather than raising -- is covered on a heterogeneous host. Regression for
+    PR #4365 review r3824968121.
     """
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
@@ -1909,6 +1914,46 @@ def test_launch_rejects_arch_it_cannot_run(monkeypatch):
     assert "sm_100a" in msg and "sm_90a" in msg
     assert f"cuda:{other}" in msg and f"cuda:{cur}" in msg
     assert "torch.cuda.device" in msg, "the error should say how to fix it"
+
+
+def test_on_device_enters_target_and_is_free_when_already_current():
+    """The launch paths must make the target device current before launching.
+
+    The kernels take the TVM-FFI environment stream, which resolves to the
+    current stream of the *current* device, so launching with tensors from
+    another device onto that stream is wrong regardless of architecture -- the
+    case raised in PR #4365 review r3824968121. ``_on_device`` fixes it by
+    entering the target, and must cost nothing when the target is already
+    current, which is every single-GPU call.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    import contextlib
+
+    from flashinfer.attn_scores.attn_scores import _on_device
+
+    cur = torch.cuda.current_device()
+
+    # Already current: must be a no-op context, not a device switch.
+    ctx = _on_device(cur)
+    assert isinstance(ctx, contextlib.nullcontext), (
+        "entering the already-current device should cost nothing; "
+        f"got {type(ctx).__name__}"
+    )
+    with ctx:
+        assert torch.cuda.current_device() == cur
+
+    # A different device: must actually switch, and restore afterwards.
+    if torch.cuda.device_count() > 1:
+        other = (cur + 1) % torch.cuda.device_count()
+        with _on_device(other):
+            assert torch.cuda.current_device() == other, (
+                "the target device was not made current for the launch"
+            )
+        assert torch.cuda.current_device() == cur, (
+            "the previous device was not restored"
+        )
 
 
 def test_arch_is_part_of_the_compile_cache_key():
