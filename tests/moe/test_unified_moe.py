@@ -72,6 +72,7 @@ from flashinfer.fused_moe import (
     TrtllmMxInt4RoutedRunner,
 )
 from flashinfer.fused_moe.runners import MoERunner
+from flashinfer.fused_moe.core import _fake_trtllm_moe_output
 from flashinfer.utils import get_compute_capability
 
 
@@ -130,6 +131,67 @@ class TestEnumRepr:
     @pytest.mark.parametrize("member", list(QuantVariant))
     def test_quant_variant_repr(self, member):
         assert eval(repr(member)) == member
+
+
+class TestTrtllmFakeOutputContract:
+    class _FakeContext:
+        def __init__(self):
+            self._next = 16
+
+        def new_dynamic_size(self):
+            self._next += 1
+            return self._next
+
+    def test_unfinalized_generated_weights(self, monkeypatch):
+        monkeypatch.setattr(torch.library, "get_ctx", lambda: self._FakeContext())
+        hidden_states = torch.empty((4, 32), device="meta")
+        result = _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=32,
+            intermediate_size=64,
+            top_k=2,
+            do_finalize=False,
+        )
+
+        assert len(result) == 3
+        assert result[0].shape == (17, 32)
+        assert result[1].shape == (4, 2)
+        assert result[1].dtype == torch.bfloat16
+        assert result[2].shape == (8,)
+        assert result[2].dtype == torch.int32
+
+    def test_unfinalized_preserves_precomputed_weights(self, monkeypatch):
+        monkeypatch.setattr(torch.library, "get_ctx", lambda: self._FakeContext())
+        hidden_states = torch.empty((4, 32), device="meta")
+        weights = torch.empty((4, 2), dtype=torch.float32, device="meta")
+        result = _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=32,
+            intermediate_size=64,
+            top_k=2,
+            do_finalize=False,
+            expert_weights=weights,
+        )
+
+        assert result[1] is weights
+
+    def test_finalized_lora_arity(self, monkeypatch):
+        monkeypatch.setattr(torch.library, "get_ctx", lambda: self._FakeContext())
+        hidden_states = torch.empty((4, 32), device="meta")
+        lora_delta = torch.empty((4, 128), device="meta")
+        result = _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=32,
+            intermediate_size=64,
+            top_k=2,
+            do_finalize=True,
+            gemm1_lora_delta=lora_delta,
+        )
+
+        assert len(result) == 3
+        assert result[0].shape == (4, 32)
+        assert result[1].shape == (8,)
+        assert result[2].shape == (17, 64)
 
 
 # ---------------------------------------------------------------------------
@@ -694,15 +756,18 @@ class TestMoERunnerSupport:
         with pytest.raises(NotImplementedError, match="Swiglu"):
             runner.check_support()
 
-    def test_fp8_block_unfinalized_not_supported(self):
+    def test_fp8_block_unfinalized_supported(self, monkeypatch):
+        import flashinfer.utils as utils
+
         cfg = self._nvfp4_swiglu(
             quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
             finalize=MoEFinalizeConfig(do_finalize=False),
         )
         runner = TrtllmFp8BlockRunner.__new__(TrtllmFp8BlockRunner)
         runner.config = cfg
-        with pytest.raises(NotImplementedError, match="do_finalize=True"):
-            runner.check_support()
+        runner.device = torch.device("cuda")
+        monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 0))
+        runner.check_support()
 
     @pytest.mark.parametrize(
         ("runner_type", "variant"),
@@ -733,7 +798,7 @@ class TestMoERunnerSupport:
             with pytest.raises(NotImplementedError, match="SM100/SM103"):
                 runner.check_support()
 
-    def test_bf16_unfinalized_not_supported(self, monkeypatch):
+    def test_bf16_unfinalized_supported(self, monkeypatch):
         import flashinfer.utils as utils
 
         cfg = self._nvfp4_swiglu(
@@ -744,8 +809,7 @@ class TestMoERunnerSupport:
         runner.config = cfg
         runner.device = torch.device("cuda")
         monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 0))
-        with pytest.raises(NotImplementedError, match="do_finalize=True"):
-            runner.check_support()
+        runner.check_support()
 
     def test_bf16_sm120_rejected_before_launch(self, monkeypatch):
         import flashinfer.utils as utils
