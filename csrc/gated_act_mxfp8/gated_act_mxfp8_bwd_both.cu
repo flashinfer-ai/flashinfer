@@ -297,9 +297,6 @@ kernel_gated_act_mxfp8_bwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
                     : "r"(pad_addr + (unsigned int)((pad_read_word + arr * 1152) * 4)));
             }
         }
-        {
-            __syncthreads();
-        }
         amax_act = amax_act & 2147450879;
         unsigned int _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, amax_act, 1);
         unsigned int peer_act = _shfl_xor_0;
@@ -430,6 +427,9 @@ kernel_gated_act_mxfp8_bwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
                     row_fp8_gate[(q) + 0] = _packed;
                 }
             }
+        }
+        {
+            __syncthreads();
         }
         int word_quad = blk * 2 + half;
         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((row_act_addr + (unsigned int)(stage * 2048) + (unsigned int)(row * 64 + word_quad * 16))), "r"(row_fp8_act[0]), "r"(row_fp8_act[1]), "r"(row_fp8_act[2]), "r"(row_fp8_act[3]) : "memory");
