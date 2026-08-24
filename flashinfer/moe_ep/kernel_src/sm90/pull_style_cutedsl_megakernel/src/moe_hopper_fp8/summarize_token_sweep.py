@@ -95,18 +95,10 @@ PEAK_SUMMARY_FIELDS = (
     "intermediate_gateup",
 )
 
-TOKEN_VARIANTS = (
-    ("per_tensor", "non_swap_ab"),
-    ("per_tensor", "swap_ab"),
-    ("blockwise", "non_swap_ab"),
-    ("blockwise", "swap_ab"),
-)
-
-TOKEN_VARIANT_TFLOPS_BASE_FIELDS = (
+TOKEN_TFLOPS_BASE_FIELDS = (
     "rank_mode",
     "case",
     "scale_mode",
-    "operand_order",
     "rank_metric",
 )
 
@@ -288,37 +280,14 @@ def _write_failures(date_dir: Path, latest: Sequence[SourceRow]) -> Path:
 
 
 def _best_per_scale_token(latest: Sequence[SourceRow]) -> list[SourceRow]:
-    best: dict[tuple[str, str, int], SourceRow] = {}
-    for source_row in latest:
-        if not _valid_success(source_row):
-            continue
-        key = (
-            source_row.row["rank_mode"],
-            source_row.row["scale_mode"],
-            source_row.token,
-        )
-        current = best.get(key)
-        if current is None or source_row.selection_key() > current.selection_key():
-            best[key] = source_row
-    return sorted(
-        best.values(),
-        key=lambda item: (
-            item.row["rank_mode"],
-            item.row["scale_mode"],
-            item.token,
-        ),
-    )
-
-
-def _best_per_variant_token(latest: Sequence[SourceRow]) -> list[SourceRow]:
     best: dict[tuple[str, str, str, int], SourceRow] = {}
     for source_row in latest:
         if not _valid_success(source_row):
             continue
         key = (
             source_row.row["rank_mode"],
+            source_row.row["case"],
             source_row.row["scale_mode"],
-            source_row.row["operand_order"],
             source_row.token,
         )
         current = best.get(key)
@@ -328,9 +297,9 @@ def _best_per_variant_token(latest: Sequence[SourceRow]) -> list[SourceRow]:
         best.values(),
         key=lambda item: (
             item.row["rank_mode"],
-            item.token,
+            item.row["case"],
             item.row["scale_mode"],
-            item.row["operand_order"],
+            item.token,
         ),
     )
 
@@ -364,14 +333,13 @@ def _write_peak_summary(date_dir: Path, latest: Sequence[SourceRow]) -> Path:
     return output
 
 
-def _write_variant_tflops_by_token(date_dir: Path, best: Sequence[SourceRow]) -> Path:
-    lookup: dict[tuple[str, str, str, str, int], SourceRow] = {}
+def _write_optimal_tflops_by_token(date_dir: Path, best: Sequence[SourceRow]) -> Path:
+    lookup: dict[tuple[str, str, str, int], SourceRow] = {}
     for source_row in best:
         key = (
             source_row.row["rank_mode"],
             source_row.row["case"],
             source_row.row["scale_mode"],
-            source_row.row["operand_order"],
             source_row.token,
         )
         lookup[key] = source_row
@@ -382,19 +350,25 @@ def _write_variant_tflops_by_token(date_dir: Path, best: Sequence[SourceRow]) ->
     )
     rows: list[dict[str, str]] = []
     for rank_mode, case in contexts:
-        for scale_mode, operand_order in TOKEN_VARIANTS:
+        scale_modes = sorted(
+            {
+                source_row.row["scale_mode"]
+                for source_row in best
+                if source_row.row["rank_mode"] == rank_mode
+                and source_row.row["case"] == case
+            },
+            key=lambda scale_mode: (scale_mode != "per_tensor", scale_mode),
+        )
+        for scale_mode in scale_modes:
             for rank_metric, source_field in RANK_TFLOPS_METRICS:
                 row = {
                     "rank_mode": rank_mode,
                     "case": case,
                     "scale_mode": scale_mode,
-                    "operand_order": operand_order,
                     "rank_metric": rank_metric,
                 }
                 for token in tokens:
-                    source_row = lookup.get(
-                        (rank_mode, case, scale_mode, operand_order, token)
-                    )
+                    source_row = lookup.get((rank_mode, case, scale_mode, token))
                     row[str(token)] = (
                         source_row.row.get(source_field, "")
                         if source_row is not None
@@ -403,7 +377,7 @@ def _write_variant_tflops_by_token(date_dir: Path, best: Sequence[SourceRow]) ->
                 rows.append(row)
 
     output = date_dir / f"{date_dir.name}_token_sweep_optimal_tflops_by_token.csv"
-    fieldnames = (*TOKEN_VARIANT_TFLOPS_BASE_FIELDS, *(str(token) for token in tokens))
+    fieldnames = (*TOKEN_TFLOPS_BASE_FIELDS, *(str(token) for token in tokens))
     _write_csv(output, fieldnames, rows)
     return output
 
@@ -414,12 +388,11 @@ def summarize(date_dir: Path) -> tuple[int, int, int]:
         raise ValueError(f"No raw token-sweep CSV rows in {date_dir}")
     latest = _latest_by_config_token(rows)
     best = _best_per_scale_token(latest)
-    best_per_variant = _best_per_variant_token(latest)
     _write_all_results(date_dir, rows)
     _write_failures(date_dir, latest)
     _write_heuristic(date_dir, best)
     _write_peak_summary(date_dir, latest)
-    _write_variant_tflops_by_token(date_dir, best_per_variant)
+    _write_optimal_tflops_by_token(date_dir, best)
     failures = sum(not _valid_success(item) for item in latest)
     print(
         f"[SUMMARY] attempts={len(rows)} latest={len(latest)} "

@@ -21,6 +21,22 @@ class HopperFp8HeuristicConfigTest(unittest.TestCase):
                 self.assertEqual(config.accum_mode, "1xacc")
                 self.assertEqual(config.mma_tiler_mnk[2], 128)
                 self.assertEqual(config.cluster_shape_mnk[2], 1)
+                self.assertIn(
+                    config.token_back_mode,
+                    ("epi_warps", "standalone_warps", "reuse_dispatch_warps"),
+                )
+
+    def test_token_back_crossover(self) -> None:
+        # Per-bucket winners of the 2026-08-23 four-rank H200 epi-vs-reuse
+        # sweep: epi_warps small/mid, reuse_dispatch_warps at the GEMM-bound
+        # tail (per_tensor >= 16384, blockwise >= 1024).
+        for scale_mode, boundary in (("per_tensor", 16384), ("blockwise", 1024)):
+            for bucket, config in HEURISTIC_CONFIGS[scale_mode].items():
+                expected = (
+                    "reuse_dispatch_warps" if bucket >= boundary else "epi_warps"
+                )
+                with self.subTest(scale_mode=scale_mode, bucket=bucket):
+                    self.assertEqual(config.token_back_mode, expected)
 
     def test_token_bucket_uses_clamped_ceil_power_of_two(self) -> None:
         expected = {

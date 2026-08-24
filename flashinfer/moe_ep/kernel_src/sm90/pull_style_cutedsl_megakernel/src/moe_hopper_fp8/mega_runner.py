@@ -1108,12 +1108,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--token_back_mode",
         type=str,
-        default="reuse_dispatch_warps",
+        default=None,
         choices=["epi_warps", "standalone_warps", "reuse_dispatch_warps"],
         help="Where the cross-rank fc2 write-back runs: epi_warps (epilogue "
              "STG/REDG straight to the source rank), standalone_warps (four "
              "dedicated token-back warps), or reuse_dispatch_warps (dispatch "
-             "warps push after pull; Hopper default).",
+             "warps push after pull).  Default: the token-bucket heuristic "
+             "table's per-bucket winner (heuristic_config.py).",
     )
     return parser
 
@@ -1166,6 +1167,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         accum_mode=args.fp8_accum_mode,
     )
     launch_config = config_selection.config
+    # Explicit CLI choice wins; else the table's per-bucket winner.
+    token_back_mode = (
+        args.token_back_mode
+        if args.token_back_mode is not None
+        else launch_config.token_back_mode
+    )
     if rank == 0:
         bucket = (
             str(config_selection.token_bucket)
@@ -1180,7 +1187,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"pingpong={launch_config.pingpong} "
             f"mma_tiler_mnk={launch_config.mma_tiler_mnk} "
             f"cluster_shape_mnk={launch_config.cluster_shape_mnk} "
-            f"accum_mode={launch_config.accum_mode}",
+            f"accum_mode={launch_config.accum_mode} "
+            f"token_back_mode={token_back_mode}",
             flush=True,
         )
 
@@ -1196,7 +1204,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         group_hint=args.group_hint,
         non_ubulk_fc2_store=True,
         in_kernel_fc2_reduce=args.in_kernel_fc2_reduce,
-        token_back_mode=args.token_back_mode,
+        token_back_mode=token_back_mode,
         epi_flag_batch=(2, 4),
         flag_batch=1,
     )

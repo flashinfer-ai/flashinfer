@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Run the Hopper FP8 P03 tokens-per-rank tuning sweep.
+"""Run the Hopper FP8 P03 tokens-per-rank performance sweep.
 
-The full sweep covers every valid scale/order/tile/CGA/ping-pong combination
-and tokens-per-rank from 8 through 32768 in powers of two. Each CSV owns one
-configuration and contains one row per attempt so failed runs and forced
-reruns remain auditable. P02 remains available as an explicit compatibility
-mode, but the default and heuristic target are P03.
+By default, each scale/token pair uses the launch configuration selected by
+``heuristic_config.py``. Pass ``--no-heuristic`` to cover every valid
+scale/order/tile/CGA/ping-pong combination. Tokens-per-rank range from 8
+through 32768 in powers of two. Each CSV owns one resolved configuration and
+contains one row per attempt so failed runs and forced reruns remain auditable.
+P02 remains available as an explicit compatibility mode, but the default and
+heuristic target are P03.
 """
 
 from __future__ import annotations
@@ -27,6 +29,11 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
+
+try:
+    from .heuristic_config import select_heuristic_config
+except ImportError:
+    from heuristic_config import select_heuristic_config
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PERF_SCRIPT = SCRIPT_DIR / "run_perf_test.sh"
@@ -193,6 +200,13 @@ class BenchmarkCase:
 
 
 @dataclass(frozen=True)
+class BenchmarkJob:
+    case: BenchmarkCase
+    tokens_per_rank: int
+    use_heuristic: bool
+
+
+@dataclass(frozen=True)
 class ParsedTiming:
     rank_times_us: dict[int, float]
     reported_min_rank: int | None
@@ -229,8 +243,15 @@ def _parse_time_us(value: str) -> float | None:
 
 
 def parse_profiler_output(lines: Iterable[str]) -> ParsedTiming:
-    """Parse the rank-level mega CUDA times printed by mega_runner.py."""
+    """Parse the rank-level mega+topk CUDA times printed by mega_runner.py.
+
+    ``rank_times_us`` is the per-rank TOTAL (mega + standalone topk reduce)
+    so the sweep TFLOPS account for the full compute pipeline, matching the
+    FlashInfer benchmark's compute series; a missing ``topk:`` section (in-
+    kernel reduce) contributes zero.
+    """
     rank_times: dict[int, float] = {}
+    rank_topk_times: dict[int, float] = {}
     section: str | None = None
     reported_min_rank: int | None = None
     reported_min_mega_us: float | None = None
@@ -257,6 +278,14 @@ def parse_profiler_output(lines: Iterable[str]) -> ParsedTiming:
             value = _parse_time_us(rank_match.group("time"))
             if value is not None:
                 rank_times[int(rank_match.group("rank"))] = value
+        elif rank_match and section == "topk":
+            value = _parse_time_us(rank_match.group("time"))
+            if value is not None:
+                rank_topk_times[int(rank_match.group("rank"))] = value
+
+    for rank, topk_us in rank_topk_times.items():
+        if rank in rank_times:
+            rank_times[rank] += topk_us
 
     return ParsedTiming(
         rank_times_us=rank_times,
@@ -336,7 +365,52 @@ def build_cases(rank_mode: str = "multirank") -> tuple[BenchmarkCase, ...]:
     return cases
 
 
-def _case_environment(case: BenchmarkCase, tokens_per_rank: int) -> dict[str, str]:
+def build_heuristic_jobs(
+    rank_mode: str,
+    scale_mode: str,
+    token_sizes: Sequence[int],
+) -> tuple[BenchmarkJob, ...]:
+    selected_rank_modes = (
+        RANK_MODES
+        if rank_mode == "both"
+        else tuple(mode for mode in RANK_MODES if mode[0] == rank_mode)
+    )
+    normalized_scale_mode = scale_mode.replace("-", "_")
+    scale_modes = tuple(
+        mode
+        for mode in SCALE_MODES
+        if normalized_scale_mode == "both" or mode == normalized_scale_mode
+    )
+    jobs = []
+    for case_rank_mode, perf_case, world_size in selected_rank_modes:
+        for selected_scale_mode in scale_modes:
+            for tokens_per_rank in token_sizes:
+                config = select_heuristic_config(
+                    selected_scale_mode, tokens_per_rank
+                ).config
+                tile_m, tile_n, tile_k = config.mma_tiler_mnk
+                if tile_k != TILE_K:
+                    raise ValueError(f"Heuristic tile K must be {TILE_K}, got {tile_k}")
+                case = BenchmarkCase(
+                    case_rank_mode,
+                    perf_case,
+                    world_size,
+                    selected_scale_mode,
+                    "swap_ab" if config.swap_ab else "non_swap_ab",
+                    config.pingpong,
+                    tile_m,
+                    tile_n,
+                    config.cluster_shape_mnk,
+                )
+                jobs.append(BenchmarkJob(case, tokens_per_rank, True))
+    return tuple(jobs)
+
+
+def _case_environment(
+    case: BenchmarkCase,
+    tokens_per_rank: int,
+    use_heuristic: bool = False,
+) -> dict[str, str]:
     env = os.environ.copy()
     python_bin = str(Path(sys.executable).resolve().parent)
     env["PATH"] = os.pathsep.join((python_bin, env.get("PATH", "")))
@@ -359,9 +433,6 @@ def _case_environment(case: BenchmarkCase, tokens_per_rank: int) -> dict[str, st
             "DSV4_ROUTE_ROWS": str(tokens_per_rank * TOPK),
             "DSV4_GATE_UP_CLAMP": GATE_UP_CLAMP,
             "FP8_ACCUM_MODE": "1xacc",
-            "FP8_CLUSTER_SHAPE": ",".join(
-                str(value) for value in case.cluster_shape_mnk
-            ),
             "PERF_WARMUP": str(WARMUP),
             "PERF_ITERS": str(ITERS),
             "TIMEOUT_SECONDS": str(TIMEOUT_SECONDS),
@@ -370,9 +441,21 @@ def _case_environment(case: BenchmarkCase, tokens_per_rank: int) -> dict[str, st
             "NVSHMEM_DISABLE_NVLS": "1",
         }
     )
-    if case.operand_order == "swap_ab":
+    if use_heuristic:
+        for key in (
+            "FP8_CLUSTER_SHAPE",
+            "FP8_NON_SWAP_M",
+            "FP8_NON_SWAP_N",
+            "FP8_SWAP_AB_M",
+            "FP8_SWAP_AB_N",
+        ):
+            env.pop(key, None)
+    elif case.operand_order == "swap_ab":
         env.update(
             {
+                "FP8_CLUSTER_SHAPE": ",".join(
+                    str(value) for value in case.cluster_shape_mnk
+                ),
                 "FP8_SWAP_AB_M": str(case.tile_m),
                 "FP8_SWAP_AB_N": str(case.tile_n),
             }
@@ -382,6 +465,9 @@ def _case_environment(case: BenchmarkCase, tokens_per_rank: int) -> dict[str, st
     else:
         env.update(
             {
+                "FP8_CLUSTER_SHAPE": ",".join(
+                    str(value) for value in case.cluster_shape_mnk
+                ),
                 "FP8_NON_SWAP_M": str(case.tile_m),
                 "FP8_NON_SWAP_N": str(case.tile_n),
             }
@@ -391,20 +477,36 @@ def _case_environment(case: BenchmarkCase, tokens_per_rank: int) -> dict[str, st
     return env
 
 
-def _case_cli_args(case: BenchmarkCase) -> list[str]:
+def _case_cli_args(
+    case: BenchmarkCase,
+    use_heuristic: bool = False,
+) -> list[str]:
     scale_mode = "per-tensor" if case.scale_mode == "per_tensor" else "blockwise"
     args = ["--scale-mode", scale_mode]
-    if case.operand_order == "swap_ab":
-        args.append("--swapab")
-    if case.pingpong:
-        args.append("--pingpong")
+    if use_heuristic:
+        args.append("--heuristic")
+    else:
+        args.append("--no-heuristic")
+        if case.operand_order == "swap_ab":
+            args.append("--swapab")
+        if case.pingpong:
+            args.append("--pingpong")
     return args
 
 
-def _display_command(case: BenchmarkCase, tokens_per_rank: int) -> str:
-    env = _case_environment(case, tokens_per_rank)
+def _display_command(
+    case: BenchmarkCase,
+    tokens_per_rank: int,
+    use_heuristic: bool = False,
+) -> str:
+    env = _case_environment(case, tokens_per_rank, use_heuristic)
     assignments = [f"{key}={env[key]}" for key in DISPLAY_ENV_KEYS if key in env]
-    command = ["bash", str(PERF_SCRIPT), *_case_cli_args(case), case.perf_case]
+    command = [
+        "bash",
+        str(PERF_SCRIPT),
+        *_case_cli_args(case, use_heuristic),
+        case.perf_case,
+    ]
     return shlex.join(["env", *assignments, *command])
 
 
@@ -538,6 +640,7 @@ def _run_and_tee(
 def _run_case(
     case: BenchmarkCase,
     tokens_per_rank: int,
+    use_heuristic: bool,
     output_dir: Path,
     run_date: str,
     git_commit: str,
@@ -549,13 +652,19 @@ def _run_case(
     attempt = _next_attempt(csv_path, tokens_per_rank)
     log_name = f"{case.stem(run_date)}_Tokens{tokens_per_rank}_Attempt{attempt}.log"
     log_path = csv_path.parent / log_name
-    env = _case_environment(case, tokens_per_rank)
-    command = ["bash", str(PERF_SCRIPT), *_case_cli_args(case), case.perf_case]
-    display_command = _display_command(case, tokens_per_rank)
+    env = _case_environment(case, tokens_per_rank, use_heuristic)
+    command = [
+        "bash",
+        str(PERF_SCRIPT),
+        *_case_cli_args(case, use_heuristic),
+        case.perf_case,
+    ]
+    display_command = _display_command(case, tokens_per_rank, use_heuristic)
 
     print("=" * 79)
     print(
-        f"[SWEEP] {case.rank_mode} {case.scale_tag} {case.order_tag} "
+        f"[SWEEP] {'heuristic' if use_heuristic else 'exhaustive'} "
+        f"{case.rank_mode} {case.scale_tag} {case.order_tag} "
         f"{case.schedule_tag} {case.cluster_tag} "
         f"M{case.tile_m}N{case.tile_n} tokens_per_rank={tokens_per_rank} "
         f"attempt={attempt}"
@@ -801,6 +910,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=TOKEN_SIZES,
         help="Comma-separated tokens per rank (default: 8,16,...,32768).",
     )
+    heuristic_group = parser.add_mutually_exclusive_group()
+    heuristic_group.add_argument(
+        "--heuristic",
+        dest="use_heuristic",
+        action="store_true",
+        help="Use token/scale launch heuristics (default).",
+    )
+    heuristic_group.add_argument(
+        "--no-heuristic",
+        dest="use_heuristic",
+        action="store_false",
+        help="Disable heuristics and run the complete launch-configuration sweep.",
+    )
+    parser.set_defaults(use_heuristic=True)
     parser.add_argument(
         "--scale-mode",
         choices=("both", "per-tensor", "blockwise"),
@@ -885,7 +1008,8 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
     if not PERF_SCRIPT.is_file():
         raise FileNotFoundError(PERF_SCRIPT)
     if not PLOT_SCRIPT.is_file():
@@ -895,37 +1019,77 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.shard_index < 0 or args.shard_index >= args.shard_count:
         raise ValueError("--shard-index must be in [0, --shard-count)")
-    cases = _select_cases(
-        build_cases(rank_mode=args.rank_mode),
-        args.scale_mode,
-        args.operand_order,
-        args.schedule,
-        args.cluster_shape,
-    )
-    cases = tuple(
-        case
-        for index, case in enumerate(cases)
-        if index % args.shard_count == args.shard_index
-    )
     token_sizes = tuple(args.tokens)
+    if args.use_heuristic:
+        if (
+            args.operand_order != "both"
+            or args.schedule != "both"
+            or args.cluster_shape is not None
+        ):
+            parser.error(
+                "--operand-order, --schedule, and --cluster-shape require "
+                "--no-heuristic"
+            )
+        all_jobs = build_heuristic_jobs(
+            args.rank_mode,
+            args.scale_mode,
+            token_sizes,
+        )
+        all_cases = tuple(dict.fromkeys(job.case for job in all_jobs))
+        cases = tuple(
+            case
+            for index, case in enumerate(all_cases)
+            if index % args.shard_count == args.shard_index
+        )
+        selected_cases = set(cases)
+        jobs = tuple(job for job in all_jobs if job.case in selected_cases)
+    else:
+        cases = _select_cases(
+            build_cases(rank_mode=args.rank_mode),
+            args.scale_mode,
+            args.operand_order,
+            args.schedule,
+            args.cluster_shape,
+        )
+        cases = tuple(
+            case
+            for index, case in enumerate(cases)
+            if index % args.shard_count == args.shard_index
+        )
+        jobs = tuple(
+            BenchmarkJob(case, tokens_per_rank, False)
+            for case in cases
+            for tokens_per_rank in token_sizes
+        )
     if args.smoke:
-        cases = cases[:1]
-        token_sizes = token_sizes[:1]
-    if not cases:
-        raise ValueError("No benchmark configurations match the selected filters")
-    expected_runs = len(cases) * len(token_sizes)
+        jobs = jobs[:1]
+        cases = tuple(dict.fromkeys(job.case for job in jobs))
+    if not jobs:
+        raise ValueError("No benchmark jobs match the selected filters")
+    expected_runs = len(jobs)
+    selected_token_sizes = tuple(dict.fromkeys(job.tokens_per_rank for job in jobs))
 
     if args.list:
-        for case in cases:
-            csv_path = case.csv_path(Path("."), args.date)
-            print(f"{csv_path} tokens={','.join(map(str, token_sizes))}")
+        if args.use_heuristic:
+            for job in jobs:
+                csv_path = job.case.csv_path(Path("."), args.date)
+                print(f"{csv_path} tokens={job.tokens_per_rank} mode=heuristic")
+        else:
+            for case in cases:
+                csv_path = case.csv_path(Path("."), args.date)
+                print(f"{csv_path} tokens={','.join(map(str, token_sizes))}")
         print(f"CONFIGS={len(cases)} RUNS={expected_runs}")
         return 0
 
     if args.dry_run:
-        for case in cases:
-            for tokens_per_rank in token_sizes:
-                print(_display_command(case, tokens_per_rank))
+        for job in jobs:
+            print(
+                _display_command(
+                    job.case,
+                    job.tokens_per_rank,
+                    job.use_heuristic,
+                )
+            )
         print(f"RUNS={expected_runs}")
         return 0
 
@@ -946,7 +1110,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"  run_dir          : {run_dir}")
     print(f"  run_date         : {args.date}")
     print(f"  rank_mode        : {args.rank_mode}")
-    print(f"  token_sizes      : {token_sizes}")
+    print(f"  config_mode      : {'heuristic' if args.use_heuristic else 'exhaustive'}")
+    print(f"  token_sizes      : {selected_token_sizes}")
     print(f"  configurations   : {len(cases)}")
     print(f"  shard             : {args.shard_index}/{args.shard_count}")
     print(f"  planned runs     : {expected_runs}")
@@ -961,36 +1126,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     passed = 0
     failed = 0
     skipped = 0
-    stop = False
-    for case in cases:
+    successful_by_csv: dict[Path, set[int]] = {}
+    for job in jobs:
+        case = job.case
+        tokens_per_rank = job.tokens_per_rank
         csv_path = case.csv_path(output_dir, args.date)
-        successful = _successful_tokens(csv_path)
-        for tokens_per_rank in token_sizes:
-            if not args.force and tokens_per_rank in successful:
-                print(
-                    f"[SKIP passed] {csv_path.name} tokens_per_rank={tokens_per_rank}"
-                )
-                skipped += 1
-                continue
-            status, _ = _run_case(
-                case,
-                tokens_per_rank,
-                output_dir,
-                args.date,
-                git_commit,
-                gpu_names,
-                gpu_clocks_mhz,
-                args.silence_timeout,
-            )
-            if status == "pass":
-                passed += 1
-            else:
-                failed += 1
-                if args.fail_fast:
-                    stop = True
-                    break
-        if stop:
-            break
+        if csv_path not in successful_by_csv:
+            successful_by_csv[csv_path] = _successful_tokens(csv_path)
+        successful = successful_by_csv[csv_path]
+        if not args.force and tokens_per_rank in successful:
+            print(f"[SKIP passed] {csv_path.name} tokens_per_rank={tokens_per_rank}")
+            skipped += 1
+            continue
+        status, _ = _run_case(
+            case,
+            tokens_per_rank,
+            job.use_heuristic,
+            output_dir,
+            args.date,
+            git_commit,
+            gpu_names,
+            gpu_clocks_mhz,
+            args.silence_timeout,
+        )
+        if status == "pass":
+            passed += 1
+            successful.add(tokens_per_rank)
+        else:
+            failed += 1
+            if args.fail_fast:
+                break
 
     summary_rc = 0
     plot_rc = 0

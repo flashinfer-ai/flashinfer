@@ -17,8 +17,9 @@
 #
 # Usage:
 #   bash moe_hopper_fp8/run_perf_test.sh --scale-mode per-tensor
-#   bash moe_hopper_fp8/run_perf_test.sh --scale-mode blockwise --swapab
-#   bash moe_hopper_fp8/run_perf_test.sh --scale-mode per-tensor --pingpong P03
+#   bash moe_hopper_fp8/run_perf_test.sh --scale-mode blockwise --no-heuristic --swapab
+#   bash moe_hopper_fp8/run_perf_test.sh --scale-mode per-tensor --heuristic P03
+#   bash moe_hopper_fp8/run_perf_test.sh --scale-mode per-tensor --no-heuristic --pingpong P03
 #   bash moe_hopper_fp8/run_perf_test.sh --list
 #   bash moe_hopper_fp8/run_perf_test.sh P01
 #   PERF_WARMUP=3 PERF_ITERS=30 bash moe_hopper_fp8/run_perf_test.sh mega
@@ -26,7 +27,8 @@
 #
 # Variant selection:
 #   each invocation runs one scale mode; default is per-tensor.
-#   --swapab selects swap-AB; without it, the test uses non-swap.
+#   MegaMoE uses token/scale heuristics by default. --no-heuristic restores
+#   manual geometry; --swapab or --pingpong also imply manual geometry.
 #   FP8_ACCUM_MODE=2xacc bash ... --scale-mode per-tensor    # compare accumulation
 #   FP8_CLUSTER_SHAPE=2,2,1 bash ... --scale-mode per-tensor P01 P02
 #   FP8_NON_SWAP_M=64 FP8_NON_SWAP_N=128 bash .../run_perf_test.sh P01 P02
@@ -62,6 +64,20 @@ fi
 SCALE_MODE="${FP8_SCALE_MODE:-per_tensor}"
 SWAP_AB=0
 PINGPONG=0
+USE_HEURISTIC=1
+HEURISTIC_EXPLICIT=0
+MANUAL_CONFIG_REQUESTED=0
+for config_var in \
+    FP8_CLUSTER_SHAPE \
+    FP8_NON_SWAP_M \
+    FP8_NON_SWAP_N \
+    FP8_SWAP_AB_M \
+    FP8_SWAP_AB_N; do
+    if [[ -v "$config_var" ]]; then
+        MANUAL_CONFIG_REQUESTED=1
+        break
+    fi
+done
 LIST_ONLY=0
 declare -a SELECTORS=()
 while [ "$#" -gt 0 ]; do
@@ -76,10 +92,22 @@ while [ "$#" -gt 0 ]; do
             ;;
         --swapab)
             SWAP_AB=1
+            MANUAL_CONFIG_REQUESTED=1
             shift
             ;;
         --pingpong)
             PINGPONG=1
+            MANUAL_CONFIG_REQUESTED=1
+            shift
+            ;;
+        --heuristic)
+            USE_HEURISTIC=1
+            HEURISTIC_EXPLICIT=1
+            shift
+            ;;
+        --no-heuristic)
+            USE_HEURISTIC=0
+            HEURISTIC_EXPLICIT=1
             shift
             ;;
         --list)
@@ -111,6 +139,14 @@ case "$SCALE_MODE" in
         exit 2
         ;;
 esac
+
+if [ "$USE_HEURISTIC" -eq 1 ] && [ "$MANUAL_CONFIG_REQUESTED" -eq 1 ]; then
+    if [ "$HEURISTIC_EXPLICIT" -eq 1 ]; then
+        echo "ERROR: --heuristic cannot be combined with manual launch settings" >&2
+        exit 2
+    fi
+    USE_HEURISTIC=0
+fi
 
 # DSV4 defaults from src/config.py plus the fused-fc12 gate+up convention.
 DSV4_TOKENS_PER_RANK="${DSV4_TOKENS_PER_RANK:-1024}"
@@ -199,6 +235,13 @@ fi
 if [ "$PINGPONG" -eq 1 ]; then
     TILE_ARGS="--pingpong $TILE_ARGS"
 fi
+FC12_TILE_ARGS="$TILE_ARGS"
+MEGA_TILE_ARGS="$TILE_ARGS"
+if [ "$USE_HEURISTIC" -eq 1 ]; then
+    # Leaving MegaMoE geometry unspecified lets mega_runner.py select the
+    # token/scale-dependent launch configuration from heuristic_config.py.
+    MEGA_TILE_ARGS=""
+fi
 COMMON_KIND_ARGS="--kind fp8_e4m3"
 COMMON_PERF_ARGS="--perf_run --skip_ref_check"
 FP8_ACCUM_MODE="${FP8_ACCUM_MODE:-1xacc}"
@@ -216,13 +259,19 @@ esac
 # both knobs and is combine-mode invariant.
 #   FP8_TOKEN_BACK_MODE : who performs the cross-rank fc2 write-back.
 #     epi_warps            - fc2 epilogue STG/REDG straight to the source rank
-#     reuse_dispatch_warps - stage locally, dispatch warps push (default)
+#     reuse_dispatch_warps - stage locally, dispatch warps push
 #     standalone_warps     - stage locally, four dedicated warps push
+#     unset (default)      - the token-bucket heuristic table's per-bucket
+#                            winner (heuristic_config.py)
 #   FP8_IN_KERNEL_REDUCE : 1 collapses topk in kernel (epi_warps REDG or the
 #     dispatch modes' cp.reduce bulk push); 0 runs the separate TopkReduce.
-FP8_TOKEN_BACK_MODE="${FP8_TOKEN_BACK_MODE:-reuse_dispatch_warps}"
+FP8_TOKEN_BACK_MODE="${FP8_TOKEN_BACK_MODE:-heuristic}"
+MEGA_COMBINE_ARGS=""
 case "$FP8_TOKEN_BACK_MODE" in
+    heuristic)
+        ;;
     epi_warps|standalone_warps|reuse_dispatch_warps)
+        MEGA_COMBINE_ARGS="--token_back_mode $FP8_TOKEN_BACK_MODE"
         ;;
     *)
         echo "ERROR: unsupported FP8 token-back mode '$FP8_TOKEN_BACK_MODE'" >&2
@@ -230,7 +279,6 @@ case "$FP8_TOKEN_BACK_MODE" in
         ;;
 esac
 FP8_IN_KERNEL_REDUCE="${FP8_IN_KERNEL_REDUCE:-0}"
-MEGA_COMBINE_ARGS="--token_back_mode $FP8_TOKEN_BACK_MODE"
 case "$FP8_IN_KERNEL_REDUCE" in
     1)
         MEGA_COMBINE_ARGS="$MEGA_COMBINE_ARGS --in_kernel_fc2_reduce"
@@ -259,7 +307,7 @@ FC12_DSV4_ARGS="$COMMON_KIND_ARGS \
   --experts $DSV4_LOCAL_EXPERTS \
   --hidden $DSV4_HIDDEN \
   --intermediate $DSV4_INTERMEDIATE_GATEUP \
-  $TILE_ARGS \
+  $FC12_TILE_ARGS \
   --balance_route \
   --load_balance_mode atomic_counter \
   --enable_static_expert_shape \
@@ -274,7 +322,7 @@ MEGA_DSV4_SINGLE_ARGS="$COMMON_KIND_ARGS \
   --num_total_experts $DSV4_SINGLE_MEGA_TOTAL_EXPERTS \
   --hidden $DSV4_HIDDEN \
   --intermediate $DSV4_INTERMEDIATE_GATEUP \
-  $TILE_ARGS \
+  $MEGA_TILE_ARGS \
   --route_distribution balanced \
   --load_balance_mode atomic_counter \
   --enable_static_expert_shape \
@@ -290,7 +338,7 @@ MEGA_DSV4_MULTI_ARGS="$COMMON_KIND_ARGS \
   --num_total_experts $DSV4_TOTAL_EXPERTS \
   --hidden $DSV4_HIDDEN \
   --intermediate $DSV4_INTERMEDIATE_GATEUP \
-  $TILE_ARGS \
+  $MEGA_TILE_ARGS \
   --route_distribution balanced \
   --load_balance_mode atomic_counter \
   --enable_static_expert_shape \
@@ -338,11 +386,12 @@ print_config() {
     echo "  intermediate_downproj  : $DSV4_INTERMEDIATE_DOWNPROJ"
     echo "  gate_up_clamp          : ${DSV4_GATE_UP_CLAMP:-off}"
     echo "  fp8_scale_mode         : $SCALE_MODE"
+    echo "  mega config source     : $([ "$USE_HEURISTIC" -eq 1 ] && echo heuristic || echo manual)"
     echo "  token_back_mode        : $FP8_TOKEN_BACK_MODE"
     echo "  in_kernel_reduce       : $FP8_IN_KERNEL_REDUCE"
-    echo "  swap_ab                : $SWAP_AB"
+    echo "  swap_ab                : $([ "$USE_HEURISTIC" -eq 1 ] && echo heuristic || echo "$SWAP_AB")"
     echo "  fp8_accum_mode         : $FP8_ACCUM_MODE"
-    echo "  cluster_shape_mnk      : $FP8_CLUSTER_SHAPE"
+    echo "  cluster_shape_mnk      : $([ "$USE_HEURISTIC" -eq 1 ] && echo heuristic || echo "$FP8_CLUSTER_SHAPE")"
     echo "  route_rows             : $DSV4_ROUTE_ROWS"
     echo "  mega perf warmup/iters : $PERF_WARMUP / $PERF_ITERS"
     echo "  fc12 perf warmup/iters: $FC12_WARMUP / $FC12_ITERS"
