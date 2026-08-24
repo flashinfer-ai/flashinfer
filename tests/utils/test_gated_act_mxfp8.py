@@ -197,7 +197,7 @@ def test_gated_act_mxfp8_correctness(m, k, direction, rowwise, colwise):
     assert actual[2].dtype == actual[3].dtype == torch.float8_e8m0fnu
 
     if direction == "forward":
-        for actual_tensor, expected_tensor in zip(actual, expected):
+        for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
             torch.testing.assert_close(
                 actual_tensor.contiguous().view(torch.uint8),
                 expected_tensor.contiguous().view(torch.uint8),

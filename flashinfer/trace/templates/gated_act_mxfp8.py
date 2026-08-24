@@ -151,7 +151,7 @@ def _make_trace(
     init: Callable,
 ) -> TraceTemplate:
     mode = "both" if rowwise and colwise else "row" if rowwise else "col"
-    inputs = {
+    inputs: dict[str, Tensor | Scalar] = {
         "gated_input": Tensor(
             ["M", "K_doubled"],
             description="Contiguous BF16 gate and up values.",
@@ -164,7 +164,7 @@ def _make_trace(
             ["M", "K"], description="Contiguous BF16 output gradient."
         )
 
-    outputs = {
+    outputs: dict[str, Tensor | Scalar] = {
         "row_output": Tensor(
             ["M", "O"] if rowwise else ["zero"], dtype="float8_e4m3fn"
         ),
