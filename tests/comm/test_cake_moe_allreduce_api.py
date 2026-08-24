@@ -300,6 +300,39 @@ def test_cake_finalize_rejects_noncontiguous_allreduce_input(
         )
 
 
+def test_cake_finalize_requires_one_allreduce_row_per_routed_token(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    tokens = 2
+    hidden = 7168
+    top_k = 8
+    dtype = torch.bfloat16
+    monkeypatch.setattr(
+        trtllm_ar,
+        "_check_cake_moe_common",
+        lambda *args, **kwargs: (torch.device("cpu"), dtype, 0),
+    )
+
+    with pytest.raises(ValueError, match=r"token_num \* top_k rows"):
+        trtllm_ar._validate_cake_moe_finalize(
+            allreduce_in=torch.zeros(tokens * top_k - 1, hidden, dtype=dtype),
+            residual_in=torch.zeros(tokens, hidden, dtype=dtype),
+            norm_weight=torch.ones(hidden, dtype=dtype),
+            expanded_idx_to_permuted_idx=torch.zeros(
+                tokens, top_k, dtype=torch.int32
+            ),
+            norm_out=torch.empty(tokens, hidden, dtype=dtype),
+            residual_out=torch.empty(tokens, hidden, dtype=dtype),
+            quant_out=None,
+            scale_out=None,
+            workspace_ptrs=torch.zeros(7, dtype=torch.int64),
+            world_rank=0,
+            world_size=2,
+            shared_expert_output=None,
+            expert_scale_factor=torch.ones(tokens, top_k, dtype=dtype),
+        )
+
+
 def test_missing_cake_source_bundle_is_explicit(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ):

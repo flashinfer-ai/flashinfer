@@ -1360,6 +1360,10 @@ def _validate_cake_moe_finalize(
     top_k = expanded_idx_to_permuted_idx.shape[1]
     if top_k <= 0:
         raise ValueError("expanded_idx_to_permuted_idx must have a positive top_k")
+    if allreduce_in.shape[0] != token_num * top_k:
+        raise ValueError(
+            "allreduce_in must have token_num * top_k rows for Cake MoE finalize"
+        )
     if expert_scale_factor is None:
         raise ValueError("Cake MoE finalize requires expert_scale_factor")
     if residual_out is None or norm_out is None:
