@@ -4,6 +4,8 @@ from flashinfer.artifacts import (
     get_subdir_file_list,
 )
 
+import hashlib
+
 import pytest
 import responses
 
@@ -386,9 +388,15 @@ def test_get_checksums_falls_back_to_cached_manifest(monkeypatch, tmp_path):
     monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
     monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
 
+    manifest_body = "abc123 kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin\n"
     cached = cubin_dir / safe_urljoin(artifact_paths.DEEPGEMM_RUBIN, "checksums.txt")
     cached.parent.mkdir(parents=True)
-    cached.write_text("abc123 kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin\n")
+    cached.write_text(manifest_body)
+    monkeypatch.setitem(
+        artifacts.CheckSumHash.map_checksums,
+        safe_urljoin(artifact_paths.DEEPGEMM_RUBIN, "checksums.txt"),
+        hashlib.sha256(manifest_body.encode()).hexdigest(),
+    )
 
     checksums = artifacts.get_checksums([artifact_paths.DEEPGEMM_RUBIN])
     assert checksums == {
@@ -397,6 +405,60 @@ def test_get_checksums_falls_back_to_cached_manifest(monkeypatch, tmp_path):
             "kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin",
         ): "abc123"
     }
+
+
+def test_get_checksums_rejects_tampered_manifest(monkeypatch, tmp_path):
+    """A manifest that does not match its pinned SHA-256 must not be parsed.
+
+    Its entries become download paths and per-file checksums, so a tampered
+    manifest has to be rejected before parsing, not discovered afterwards.
+    """
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
+
+    cached = cubin_dir / safe_urljoin(artifact_paths.DEEPGEMM_RUBIN, "checksums.txt")
+    cached.parent.mkdir(parents=True)
+    cached.write_text("abc123 kernel.fp8_m_grouped_gemm.007d9ebdca7e.cubin\n")
+    monkeypatch.setitem(
+        artifacts.CheckSumHash.map_checksums,
+        safe_urljoin(artifact_paths.DEEPGEMM_RUBIN, "checksums.txt"),
+        "0" * 64,
+    )
+
+    with pytest.raises(RuntimeError) as excinfo:
+        artifacts.get_checksums([artifact_paths.DEEPGEMM_RUBIN])
+    assert "pinned SHA-256" in str(excinfo.value)
+
+
+def test_get_checksums_rejects_traversal_filenames(monkeypatch, tmp_path):
+    """Manifest entries are joined onto FLASHINFER_CUBIN_DIR; absolute paths
+    and ``..`` segments must be rejected so a manifest can never direct a
+    write outside the cubin cache."""
+    from flashinfer import artifacts
+
+    cubin_dir = tmp_path / "cubins"
+    monkeypatch.setattr(artifacts, "FLASHINFER_CUBIN_DIR", cubin_dir)
+    monkeypatch.setattr(artifacts, "download_file", lambda *args, **kwargs: False)
+
+    for bad_name in ("../../outside.so", "/etc/evil.so", "a\\..\\b.cubin"):
+        manifest_body = f"abc123 {bad_name}\n"
+        cached = cubin_dir / safe_urljoin(
+            artifact_paths.DEEPGEMM_RUBIN, "checksums.txt"
+        )
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        cached.write_text(manifest_body)
+        monkeypatch.setitem(
+            artifacts.CheckSumHash.map_checksums,
+            safe_urljoin(artifact_paths.DEEPGEMM_RUBIN, "checksums.txt"),
+            hashlib.sha256(manifest_body.encode()).hexdigest(),
+        )
+
+        with pytest.raises(RuntimeError) as excinfo:
+            artifacts.get_checksums([artifact_paths.DEEPGEMM_RUBIN])
+        assert "Unsafe filename" in str(excinfo.value)
 
 
 @responses.activate
@@ -540,6 +602,30 @@ bbccddee22334455 cute_dsl_fmha_bf16_h128_causal_nonpersistent_varlen_lse_pdl_tvm
             safe_urljoin(test_cubin_repository, subdir),
             body=empty_dir_index,
             status=200,
+        )
+
+    # get_checksums() refuses to parse a manifest that does not match its
+    # pinned SHA-256, so pin every mocked manifest body for this test.
+    mocked_manifests = {
+        artifact_paths.TRTLLM_GEN_FMHA: checksums_fmha,
+        artifact_paths.TRTLLM_GEN_GEMM: checksums_gemm,
+        artifact_paths.TRTLLM_GEN_BMM: checksums_bmm,
+        artifact_paths.TRTLLM_GEN_BMM_RUBIN: checksums_bmm_rubin,
+        artifact_paths.TRTLLM_GEN_GEMM_RUBIN: checksums_gemm_rubin,
+        artifact_paths.DEEPGEMM: checksums_deepgemm,
+        artifact_paths.DEEPGEMM_RUBIN: checksums_deepgemm_rubin,
+        **{
+            safe_urljoin(
+                artifact_paths.DSL_FMHA, f"x86_64/{sm_arch}/"
+            ): checksums_dsl_fmha
+            for sm_arch in artifact_paths.DSL_FMHA_ARCHS
+        },
+    }
+    for manifest_subdir, manifest_body in mocked_manifests.items():
+        monkeypatch.setitem(
+            artifacts.CheckSumHash.map_checksums,
+            safe_urljoin(manifest_subdir, "checksums.txt"),
+            hashlib.sha256(manifest_body.encode()).hexdigest(),
         )
 
     cubin_files = list(get_subdir_file_list())

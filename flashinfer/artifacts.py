@@ -244,9 +244,35 @@ def get_checksums(subdirs):
                 f"from {uri}. Check that the pin exists in "
                 f"{FLASHINFER_CUBINS_REPOSITORY} and is reachable."
             )
+        # Verify the manifest against its pinned SHA-256 *before* parsing it:
+        # its entries become download paths and per-file checksums, so a
+        # tampered manifest must be rejected up front, not discovered after
+        # files derived from it have already been written.
+        pinned_sha = CheckSumHash.map_checksums.get(
+            safe_urljoin(subdir, "checksums.txt")
+        )
+        if pinned_sha is not None and not verify_cubin(str(checksum_path), pinned_sha):
+            raise RuntimeError(
+                f"Checksum manifest for artifact pin '{subdir}' does not match "
+                f"its pinned SHA-256; refusing to parse it. Delete "
+                f"'{checksum_path}' and retry."
+            )
         with open(checksum_path, "r") as f:
             for line in f:
                 sha256, filename = line.strip().split()
+
+                # Manifest entries are joined onto FLASHINFER_CUBIN_DIR and
+                # downloaded to; never accept a name that could escape it.
+                if (
+                    "\\" in filename
+                    or filename.startswith("/")
+                    or ".." in filename.split("/")
+                ):
+                    raise RuntimeError(
+                        f"Unsafe filename {filename!r} in checksum manifest for "
+                        f"artifact pin '{subdir}'; refusing to use it as a "
+                        f"download path."
+                    )
 
                 # Key every entry by its full path. Bare filenames are not
                 # unique across subdirs: the per-arch pins (e.g. TRTLLM_GEN_BMM
