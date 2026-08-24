@@ -1930,6 +1930,18 @@ class AutoTuner:
                             f"[Autotuner]: Config cache hit for {custom_op} "
                             f"(runner={runner_name}, source=managed cache)"
                         )
+                    # Promote into the in-process winner cache so the next
+                    # lookup for this key exits at source 1 (one dict hit)
+                    # instead of re-traversing source 1 and re-probing the
+                    # store.  Safe: `winners` is the partition for THIS
+                    # store's (root, env_hash) identity, so the entry can
+                    # never be served under a different store or measurement
+                    # policy, and it is never `profiling_cache`, so v1
+                    # save_configs still cannot observe v2 entries.  The
+                    # `None` profile matches what this source already
+                    # returns, and source 1 re-runs `_tactic_still_valid`,
+                    # so revalidation is unchanged.
+                    winners[cache_key] = (tactic, None)
                     return True, r_id, tactic, None
 
             # 3. Bundled package configs (legacy .py files)
