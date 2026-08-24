@@ -24,6 +24,29 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
+#define GATED_MXFP8_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_GATE_SMEM_OFF 1024
+#define SMEM_GATE_SMEM_STAGE_BYTES 4096
+#define SMEM_GATE_SMEM_STRIDE 4096
+#define SMEM_UP_SMEM_OFF 5120
+#define SMEM_UP_SMEM_STAGE_BYTES 4096
+#define SMEM_UP_SMEM_STRIDE 4096
+#define SMEM_GRAD_SMEM_OFF 9216
+#define SMEM_GRAD_SMEM_STAGE_BYTES 4096
+#define SMEM_GRAD_SMEM_STRIDE 4096
+#define SMEM_COL_ACT_OFF 13312
+#define SMEM_COL_ACT_STAGE_BYTES 2048
+#define SMEM_COL_ACT_STRIDE 2048
+#define SMEM_COL_GATE_OFF 15360
+#define SMEM_COL_GATE_STAGE_BYTES 2048
+#define SMEM_COL_GATE_STRIDE 2048
+#define SMEM_SUB_AMAX_OFF 17408
+#define SMEM_SUB_AMAX_STAGE_BYTES 256
+#define SMEM_SUB_AMAX_STRIDE 256
+#define SMEM_TOTAL 17664
+#define THREADS 128
+
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -39,10 +62,12 @@ __device__ __forceinline__ uint32_t elect_sync() {
     return pred;
 }
 
+
 __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
         :: "r"(mbar_addr), "r"(count));
 }
+
 
 __device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
     uint32_t token;
@@ -114,11 +139,13 @@ __device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int p
     }
 }
 
+
 __device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
     asm volatile(
         "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
         :: "r"(mbar_addr) : "memory");
 }
+
 
 __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
     asm volatile(
@@ -126,22 +153,16 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
         :: "r"(mbar_addr), "r"(bytes) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_pred(int mbar_addr, uint32_t count, uint32_t pred) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %2, 0;\n\t"
-        "@p mbarrier.init.shared::cta.b64 [%0], %1;\n\t"
-        "}\n" :: "r"(mbar_addr), "r"(count), "r"(pred));
-}
 
 __device__ __forceinline__ void fence_async_shared() {
     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 }
 
+
 __device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
     return (x & 0x3FFFFULL) >> 4ULL;
 }
+
 
 __device__ __forceinline__ uint64_t make_smem_desc(int addr) {
     const int SBO = 1024;
@@ -150,6 +171,7 @@ __device__ __forceinline__ uint64_t make_smem_desc(int addr) {
          | (1ULL << 46ULL)
          | (2ULL << 61ULL);
 }
+
 
 __device__ __forceinline__ void tma_2d_gmem2smem(
     int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
@@ -161,6 +183,7 @@ __device__ __forceinline__ void tma_2d_gmem2smem(
            "r"(mbar_addr) : "memory");
 }
 
+
 __device__ __forceinline__ void tma_store_2d(
     const void *tmap, int x, int y, unsigned smem_addr) {
     asm volatile(
@@ -169,33 +192,10 @@ __device__ __forceinline__ void tma_store_2d(
         :: "l"(tmap), "r"(x), "r"(y), "r"(smem_addr) : "memory");
 }
 
-#define GATED_MXFP8_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_GATE_SMEM_OFF 1024
-#define SMEM_GATE_SMEM_STAGE_BYTES 4096
-#define SMEM_GATE_SMEM_STRIDE 4096
-#define SMEM_UP_SMEM_OFF 5120
-#define SMEM_UP_SMEM_STAGE_BYTES 4096
-#define SMEM_UP_SMEM_STRIDE 4096
-#define SMEM_GRAD_SMEM_OFF 9216
-#define SMEM_GRAD_SMEM_STAGE_BYTES 4096
-#define SMEM_GRAD_SMEM_STRIDE 4096
-#define SMEM_COL_ACT_OFF 13312
-#define SMEM_COL_ACT_STAGE_BYTES 2048
-#define SMEM_COL_ACT_STRIDE 2048
-#define SMEM_COL_GATE_OFF 15360
-#define SMEM_COL_GATE_STAGE_BYTES 2048
-#define SMEM_COL_GATE_STRIDE 2048
-#define SMEM_SUB_AMAX_OFF 17408
-#define SMEM_SUB_AMAX_STAGE_BYTES 256
-#define SMEM_SUB_AMAX_STRIDE 256
-#define SMEM_TOTAL 17664
-#define THREADS 128
-
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_gated_act_mxfp8_bwd_col_staged_64x64(__grid_constant__ CUtensorMap const gate_tma, __grid_constant__ CUtensorMap const up_tma, __grid_constant__ CUtensorMap const grad_tma, __grid_constant__ CUtensorMap const col_act_tma, __grid_constant__ CUtensorMap const col_gate_tma, uint8_t* __restrict__ col_scales, int M, int K)
+kernel_gated_act_mxfp8_bwd_col_staged_64x64(const __grid_constant__ CUtensorMap gate_tma, const __grid_constant__ CUtensorMap up_tma, const __grid_constant__ CUtensorMap grad_tma, const __grid_constant__ CUtensorMap col_act_tma, const __grid_constant__ CUtensorMap col_gate_tma, uint8_t* __restrict__ col_scales, int M, int K)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -227,12 +227,12 @@ kernel_gated_act_mxfp8_bwd_col_staged_64x64(__grid_constant__ CUtensorMap const 
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
-        // input_full: 1 barriers, init_count=128
-        mbarrier_init_pred(smem + 0, 128, leader);
-        asm volatile("fence.mbarrier_init.release.cluster;");
+        if (leader) {
+            // input_full: 1 barriers, init_count=128
+            mbarrier_init(smem + 0, 128);
+            asm volatile("fence.mbarrier_init.release.cluster;");
+        }
     }
-
-    __syncthreads();
 
     __syncthreads();
 
@@ -268,9 +268,9 @@ kernel_gated_act_mxfp8_bwd_col_staged_64x64(__grid_constant__ CUtensorMap const 
     float value3 = 0.0f;
     if (warp == 0) {
         if (elect_sync()) {
-            tma_2d_gmem2smem(gate_smem_addr, &gate_tma, bx * 64, by * 32, input_full_addr);
-            tma_2d_gmem2smem(up_smem_addr, &up_tma, bx * 64, by * 32, input_full_addr);
-            tma_2d_gmem2smem(grad_smem_addr, &grad_tma, bx * 64, by * 32, input_full_addr);
+            tma_2d_gmem2smem(gate_smem_addr, (&gate_tma), bx * 64, by * 32, input_full_addr);
+            tma_2d_gmem2smem(up_smem_addr, (&up_tma), bx * 64, by * 32, input_full_addr);
+            tma_2d_gmem2smem(grad_smem_addr, (&grad_tma), bx * 64, by * 32, input_full_addr);
         }
     }
     if (tid_0 == 0) {
@@ -283,9 +283,9 @@ kernel_gated_act_mxfp8_bwd_col_staged_64x64(__grid_constant__ CUtensorMap const 
         if (stage + 1 < 1) {
             if (warp == 0) {
                 if (elect_sync()) {
-                    tma_2d_gmem2smem(gate_smem_addr + (unsigned int)((stage + 1) * 4096), &gate_tma, bx * 64, by * 32 + (stage + 1) * 32, input_full_addr + (stage + 1) * 8);
-                    tma_2d_gmem2smem(up_smem_addr + (unsigned int)((stage + 1) * 4096), &up_tma, bx * 64, by * 32 + (stage + 1) * 32, input_full_addr + (stage + 1) * 8);
-                    tma_2d_gmem2smem(grad_smem_addr + (unsigned int)((stage + 1) * 4096), &grad_tma, bx * 64, by * 32 + (stage + 1) * 32, input_full_addr + (stage + 1) * 8);
+                    tma_2d_gmem2smem(gate_smem_addr + (unsigned int)((stage + 1) * 4096), (&gate_tma), bx * 64, by * 32 + (stage + 1) * 32, input_full_addr + (stage + 1) * 8);
+                    tma_2d_gmem2smem(up_smem_addr + (unsigned int)((stage + 1) * 4096), (&up_tma), bx * 64, by * 32 + (stage + 1) * 32, input_full_addr + (stage + 1) * 8);
+                    tma_2d_gmem2smem(grad_smem_addr + (unsigned int)((stage + 1) * 4096), (&grad_tma), bx * 64, by * 32 + (stage + 1) * 32, input_full_addr + (stage + 1) * 8);
                 }
             }
             if (tid_0 == 0) {
@@ -348,7 +348,7 @@ kernel_gated_act_mxfp8_bwd_col_staged_64x64(__grid_constant__ CUtensorMap const 
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pair_values[_lp*2 + 0], pair_values[_lp*2+1 + 0]));
-                packed_act[_lp + (pair)] = *(uint32_t*)&_bf2;
+                packed_act[(pair) + _lp] = *(uint32_t*)&_bf2;
             }
             uint32_t _bf16x2_abs_max_nan_0;
             asm volatile("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_abs_max_nan_0) : "r"(amax_act), "r"(packed_act[pair]));
@@ -358,7 +358,7 @@ kernel_gated_act_mxfp8_bwd_col_staged_64x64(__grid_constant__ CUtensorMap const 
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pair_values[_lp*2 + 0], pair_values[_lp*2+1 + 0]));
-                packed_gate[_lp + (pair)] = *(uint32_t*)&_bf2;
+                packed_gate[(pair) + _lp] = *(uint32_t*)&_bf2;
             }
             uint32_t _bf16x2_abs_max_nan_1;
             asm volatile("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_abs_max_nan_1) : "r"(amax_gate), "r"(packed_gate[pair]));
@@ -429,8 +429,8 @@ kernel_gated_act_mxfp8_bwd_col_staged_64x64(__grid_constant__ CUtensorMap const 
         int gate_out_col = out_col + K;
         int gate_scale_index = ((gate_out_col >> 7) * num_scale_blocks + (row_tile >> 2)) * 512 + (gate_out_col & 31) * 16 + (gate_out_col >> 5 & 3) * 4 + (row_tile & 3);
         if (ty == 0) {
-            *((unsigned char*)(col_scales + act_scale_index)) = (unsigned char)(act_scale);
-            *((unsigned char*)(col_scales + gate_scale_index)) = (unsigned char)(gate_scale);
+            *(reinterpret_cast<unsigned char*>(col_scales + act_scale_index) + (0)) = (unsigned char)(act_scale);
+            *(reinterpret_cast<unsigned char*>(col_scales + gate_scale_index) + (0)) = (unsigned char)(gate_scale);
         }
         unsigned int inv_act = 254 - act_scale << 7;
         unsigned int inv_gate = 254 - gate_scale << 7;
@@ -464,13 +464,15 @@ kernel_gated_act_mxfp8_bwd_col_staged_64x64(__grid_constant__ CUtensorMap const 
             scaled_quad[3] = value3;
             {
                 uint32_t _packed;
-                asm("{\n\t"
-                    ".reg .b16 _lo, _hi;\n\t"
+                asm volatile("{\n\t"
+                    ".reg .b16 _lo;\n\t"
+                    ".reg .b16 _hi;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                     "mov.b32 %0, {_lo, _hi};\n\t"
-                    "}\n"
-                    : "=r"(_packed) : "f"(scaled_quad[0]), "f"(scaled_quad[1]), "f"(scaled_quad[2]), "f"(scaled_quad[3]));
+                    "}"
+                    : "=r"(_packed) : "f"(scaled_quad[0]), "f"(scaled_quad[1]),
+                                       "f"(scaled_quad[2]), "f"(scaled_quad[3]));
                 packed_fp8_act[(q) + 0] = _packed;
             }
             uint32_t _bf16x2_mul_2;
@@ -493,13 +495,15 @@ kernel_gated_act_mxfp8_bwd_col_staged_64x64(__grid_constant__ CUtensorMap const 
             scaled_quad[3] = value3;
             {
                 uint32_t _packed;
-                asm("{\n\t"
-                    ".reg .b16 _lo, _hi;\n\t"
+                asm volatile("{\n\t"
+                    ".reg .b16 _lo;\n\t"
+                    ".reg .b16 _hi;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                     "mov.b32 %0, {_lo, _hi};\n\t"
-                    "}\n"
-                    : "=r"(_packed) : "f"(scaled_quad[0]), "f"(scaled_quad[1]), "f"(scaled_quad[2]), "f"(scaled_quad[3]));
+                    "}"
+                    : "=r"(_packed) : "f"(scaled_quad[0]), "f"(scaled_quad[1]),
+                                       "f"(scaled_quad[2]), "f"(scaled_quad[3]));
                 packed_fp8_gate[(q) + 0] = _packed;
             }
         }
@@ -510,8 +514,8 @@ kernel_gated_act_mxfp8_bwd_col_staged_64x64(__grid_constant__ CUtensorMap const 
         __syncthreads();
         if (warp == 0) {
             if (elect_sync()) {
-                tma_store_2d(&col_act_tma, by * 32 + stage * 32, bx * 64, col_act_addr + (unsigned int)(stage * 2048));
-                tma_store_2d(&col_gate_tma, by * 32 + stage * 32, bx * 64, col_gate_addr + (unsigned int)(stage * 2048));
+                tma_store_2d((&col_act_tma), by * 32 + stage * 32, bx * 64, col_act_addr + (unsigned int)(stage * 2048));
+                tma_store_2d((&col_gate_tma), by * 32 + stage * 32, bx * 64, col_gate_addr + (unsigned int)(stage * 2048));
                 asm volatile("cp.async.bulk.commit_group;");
             }
         }
@@ -538,33 +542,3 @@ kernel_gated_act_mxfp8_bwd_col_staged_64x64(__grid_constant__ CUtensorMap const 
 }
 
 } // extern "C"
-
-#undef GATED_MXFP8_INF
-#undef NUM_MAIN_STAGES
-#undef SMEM_COL_ACT_OFF
-#undef SMEM_COL_ACT_STAGE_BYTES
-#undef SMEM_COL_ACT_STRIDE
-#undef SMEM_COL_GATE_OFF
-#undef SMEM_COL_GATE_STAGE_BYTES
-#undef SMEM_COL_GATE_STRIDE
-#undef SMEM_GATE_SMEM_OFF
-#undef SMEM_GATE_SMEM_STAGE_BYTES
-#undef SMEM_GATE_SMEM_STRIDE
-#undef SMEM_GRAD_SMEM_OFF
-#undef SMEM_GRAD_SMEM_STAGE_BYTES
-#undef SMEM_GRAD_SMEM_STRIDE
-#undef SMEM_SUB_AMAX_OFF
-#undef SMEM_SUB_AMAX_STAGE_BYTES
-#undef SMEM_SUB_AMAX_STRIDE
-#undef SMEM_TOTAL
-#undef SMEM_UP_SMEM_OFF
-#undef SMEM_UP_SMEM_STAGE_BYTES
-#undef SMEM_UP_SMEM_STRIDE
-#undef THREADS
-#undef col_act_addr
-#undef col_gate_addr
-#undef gate_smem_addr
-#undef grad_smem_addr
-#undef input_full_addr
-#undef sub_amax_addr
-#undef up_smem_addr

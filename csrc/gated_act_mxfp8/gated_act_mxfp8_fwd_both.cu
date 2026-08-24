@@ -24,38 +24,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#include <math_constants.h>
-
-__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
-    return (x & 0x3FFFFULL) >> 4ULL;
-}
-
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
-
-__device__ __forceinline__ void tma_2d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
-           "r"(mbar_addr) : "memory");
-}
-
-__device__ __forceinline__ void tma_store_2d(
-    const void *tmap, int x, int y, unsigned smem_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
-        " [%0, {%1, %2}], [%3];"
-        :: "l"(tmap), "r"(x), "r"(y), "r"(smem_addr) : "memory");
-}
-
 #define GATED_MXFP8_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define SMEM_ROW_ACT_OFF 0
@@ -70,10 +38,45 @@ __device__ __forceinline__ void tma_store_2d(
 #define SMEM_TOTAL 8704
 #define THREADS 128
 
+#include <math_constants.h>
+
+__device__ __forceinline__ uint64_t desc_encode(uint64_t x) {
+    return (x & 0x3FFFFULL) >> 4ULL;
+}
+
+
+__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
+    const int SBO = 1024;
+    return desc_encode(addr)
+         | (desc_encode(SBO) << 32ULL)
+         | (1ULL << 46ULL)
+         | (2ULL << 61ULL);
+}
+
+
+__device__ __forceinline__ void tma_2d_gmem2smem(
+    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.shared::cta.global"
+        ".mbarrier::complete_tx::bytes"
+        " [%0], [%1, {%2, %3}], [%4];"
+        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
+           "r"(mbar_addr) : "memory");
+}
+
+
+__device__ __forceinline__ void tma_store_2d(
+    const void *tmap, int x, int y, unsigned smem_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
+        " [%0, {%1, %2}], [%3];"
+        :: "l"(tmap), "r"(x), "r"(y), "r"(smem_addr) : "memory");
+}
+
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_input, __grid_constant__ CUtensorMap const row_act_tma, __grid_constant__ CUtensorMap const col_act_tma, uint8_t* __restrict__ row_scales, uint8_t* __restrict__ col_scales, int M, int K)
+kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_input, const __grid_constant__ CUtensorMap row_act_tma, const __grid_constant__ CUtensorMap col_act_tma, uint8_t* __restrict__ row_scales, uint8_t* __restrict__ col_scales, int M, int K)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -148,9 +151,8 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
     {
         const void* _v8p_0 = (const void*)(gated_input + (gate_index0));
         uint32_t _v8_0_0[8];
-        asm volatile(
-            "ld.global.L2::evict_first.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-            : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]), "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7]) : "l"((const char*)_v8p_0 + 0) : "memory");
+        asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
+            : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]), "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7]) : "l"((const void*)((const char*)_v8p_0 + 0)), "l"(0x12F0000000000000ULL) : "memory");
         *(&gate_words[0 + 0]) = _v8_0_0[0];
         *(&gate_words[0 + 1]) = _v8_0_0[1];
         *(&gate_words[0 + 2]) = _v8_0_0[2];
@@ -163,9 +165,8 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
     {
         const void* _v8p_1 = (const void*)(gated_input + (gate_index0 + K));
         uint32_t _v8_1_0[8];
-        asm volatile(
-            "ld.global.L2::evict_first.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-            : "=r"(_v8_1_0[0]), "=r"(_v8_1_0[1]), "=r"(_v8_1_0[2]), "=r"(_v8_1_0[3]), "=r"(_v8_1_0[4]), "=r"(_v8_1_0[5]), "=r"(_v8_1_0[6]), "=r"(_v8_1_0[7]) : "l"((const char*)_v8p_1 + 0) : "memory");
+        asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
+            : "=r"(_v8_1_0[0]), "=r"(_v8_1_0[1]), "=r"(_v8_1_0[2]), "=r"(_v8_1_0[3]), "=r"(_v8_1_0[4]), "=r"(_v8_1_0[5]), "=r"(_v8_1_0[6]), "=r"(_v8_1_0[7]) : "l"((const void*)((const char*)_v8p_1 + 0)), "l"(0x12F0000000000000ULL) : "memory");
         *(&up_words[0 + 0]) = _v8_1_0[0];
         *(&up_words[0 + 1]) = _v8_1_0[1];
         *(&up_words[0 + 2]) = _v8_1_0[2];
@@ -206,23 +207,25 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
             float2 _f32x2_mul_rn_0;
             asm volatile("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_f32x2_mul_rn_0) : "l"(*(const unsigned long long*)&_f2_3), "l"(*(const unsigned long long*)&sigmoid));
             float2 act = _f32x2_mul_rn_0;
-            float2 _f2_4 = make_float2(up0, up1);
-            float2 _f32x2_mul_rn_1;
-            asm volatile("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_f32x2_mul_rn_1) : "l"(*(const unsigned long long*)&act), "l"(*(const unsigned long long*)&_f2_4));
-            out_act = _f32x2_mul_rn_1;
+            {
+                float2 _f2_7 = make_float2(up0, up1);
+                float2 _f32x2_mul_rn_4;
+                asm volatile("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_f32x2_mul_rn_4) : "l"(*(const unsigned long long*)&act), "l"(*(const unsigned long long*)&_f2_7));
+                out_act = _f32x2_mul_rn_4;
+            }
             pair_values[0] = out_act.x;
             pair_values[1] = out_act.y;
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(pair_values[_lp*2 + 0], pair_values[_lp*2+1 + 0]));
-                packed_act[_lp + (pair)] = *(uint32_t*)&_bf2;
+                packed_act[(pair) + _lp] = *(uint32_t*)&_bf2;
             }
             uint32_t _bf16x2_abs_max_nan_0;
             asm volatile("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_abs_max_nan_0) : "r"(amax_act), "r"(packed_act[pair]));
             amax_act = _bf16x2_abs_max_nan_0;
             int pad_pair = blk * 16 + half * 8 + pair;
             int pad_word = pad_pair * 36 + wchk * 4 + wrow;
-            asm volatile("st.shared.b32 [%0], %1;" :: "r"(pad_addr + (unsigned int)(pad_word * 4)), "r"(packed_act[pair]));
+            asm volatile("st.shared.b32 [%0], %1;" :: "r"(pad_addr + (unsigned int)(pad_word * 4)), "r"((packed_act[pair])));
         }
         __syncthreads();
         #pragma unroll
@@ -230,9 +233,11 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
             int logical_chunk = tq * 2 + chunk;
             int physical_chunk = logical_chunk ^ rsw;
             int pad_read_word = cpr * 36 + physical_chunk * 4;
-            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                : "=r"(*reinterpret_cast<uint32_t*>(&col_values[chunk * 4])), "=r"(*reinterpret_cast<uint32_t*>(&col_values[(chunk * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&col_values[(chunk * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&col_values[(chunk * 4) + 3]))
-                : "r"(pad_addr + (unsigned int)(pad_read_word * 4)));
+            {
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&col_values[chunk * 4])), "=r"(*reinterpret_cast<uint32_t*>(&col_values[(chunk * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&col_values[(chunk * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&col_values[(chunk * 4) + 3]))
+                    : "r"(pad_addr + (unsigned int)(pad_read_word * 4)));
+            }
         }
         amax_act = amax_act & 2147450879;
         unsigned int _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, amax_act, 1);
@@ -257,7 +262,7 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
         int row_num_scale_blocks = K / 128;
         int row_scale_index = ((grow >> 7) * row_num_scale_blocks + (scale_col >> 2)) * 512 + (grow & 31) * 16 + (grow >> 5 & 3) * 4 + (scale_col & 3);
         if (half == 0) {
-            *((unsigned char*)(row_scales + row_scale_index)) = (unsigned char)(act_scale);
+            *(reinterpret_cast<unsigned char*>(row_scales + row_scale_index) + (0)) = (unsigned char)(act_scale);
         }
         unsigned int inv_act = 254 - act_scale << 7;
         if (act_scale == 255) {
@@ -286,13 +291,15 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
             row_scaled_quad[3] = value3;
             {
                 uint32_t _packed;
-                asm("{\n\t"
-                    ".reg .b16 _lo, _hi;\n\t"
+                asm volatile("{\n\t"
+                    ".reg .b16 _lo;\n\t"
+                    ".reg .b16 _hi;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                     "mov.b32 %0, {_lo, _hi};\n\t"
-                    "}\n"
-                    : "=r"(_packed) : "f"(row_scaled_quad[0]), "f"(row_scaled_quad[1]), "f"(row_scaled_quad[2]), "f"(row_scaled_quad[3]));
+                    "}"
+                    : "=r"(_packed) : "f"(row_scaled_quad[0]), "f"(row_scaled_quad[1]),
+                                       "f"(row_scaled_quad[2]), "f"(row_scaled_quad[3]));
                 row_fp8_act[(q) + 0] = _packed;
             }
         }
@@ -305,9 +312,8 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
             {
                 const void* _v8p_2 = (const void*)(gated_input + (next_gate_index));
                 uint32_t _v8_2_0[8];
-                asm volatile(
-                    "ld.global.L2::evict_first.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                    : "=r"(_v8_2_0[0]), "=r"(_v8_2_0[1]), "=r"(_v8_2_0[2]), "=r"(_v8_2_0[3]), "=r"(_v8_2_0[4]), "=r"(_v8_2_0[5]), "=r"(_v8_2_0[6]), "=r"(_v8_2_0[7]) : "l"((const char*)_v8p_2 + 0) : "memory");
+                asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
+                    : "=r"(_v8_2_0[0]), "=r"(_v8_2_0[1]), "=r"(_v8_2_0[2]), "=r"(_v8_2_0[3]), "=r"(_v8_2_0[4]), "=r"(_v8_2_0[5]), "=r"(_v8_2_0[6]), "=r"(_v8_2_0[7]) : "l"((const void*)((const char*)_v8p_2 + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 *(&gate_words[0 + 0]) = _v8_2_0[0];
                 *(&gate_words[0 + 1]) = _v8_2_0[1];
                 *(&gate_words[0 + 2]) = _v8_2_0[2];
@@ -320,9 +326,8 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
             {
                 const void* _v8p_3 = (const void*)(gated_input + (next_gate_index + K));
                 uint32_t _v8_3_0[8];
-                asm volatile(
-                    "ld.global.L2::evict_first.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                    : "=r"(_v8_3_0[0]), "=r"(_v8_3_0[1]), "=r"(_v8_3_0[2]), "=r"(_v8_3_0[3]), "=r"(_v8_3_0[4]), "=r"(_v8_3_0[5]), "=r"(_v8_3_0[6]), "=r"(_v8_3_0[7]) : "l"((const char*)_v8p_3 + 0) : "memory");
+                asm volatile("ld.global.L2::cache_hint.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8], %9;"
+                    : "=r"(_v8_3_0[0]), "=r"(_v8_3_0[1]), "=r"(_v8_3_0[2]), "=r"(_v8_3_0[3]), "=r"(_v8_3_0[4]), "=r"(_v8_3_0[5]), "=r"(_v8_3_0[6]), "=r"(_v8_3_0[7]) : "l"((const void*)((const char*)_v8p_3 + 0)), "l"(0x12F0000000000000ULL) : "memory");
                 *(&up_words[0 + 0]) = _v8_3_0[0];
                 *(&up_words[0 + 1]) = _v8_3_0[1];
                 *(&up_words[0 + 2]) = _v8_3_0[2];
@@ -338,22 +343,22 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
         for (int chunk_1 = 0; chunk_1 < 2; chunk_1++) {
             #pragma unroll
             for (int word = 0; word < 4; word++) {
-                uint32_t _bf16x2_abs_max_nan_1;
-                asm volatile("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_abs_max_nan_1) : "r"(col_amax), "r"(col_values[chunk_1 * 4 + word]));
-                col_amax = _bf16x2_abs_max_nan_1;
+                uint32_t _bf16x2_abs_max_nan_2;
+                asm volatile("max.NaN.xorsign.abs.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_abs_max_nan_2) : "r"(col_amax), "r"(col_values[chunk_1 * 4 + word]));
+                col_amax = _bf16x2_abs_max_nan_2;
             }
         }
         col_amax = col_amax & 2147450879;
-        unsigned int _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, col_amax, 1);
-        unsigned int col_peer = _shfl_xor_1;
-        uint32_t _bf16x2_max_nan_2;
-        asm volatile("max.NaN.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_nan_2) : "r"(col_amax), "r"(col_peer));
-        col_amax = _bf16x2_max_nan_2;
-        unsigned int _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, col_amax, 2);
-        unsigned int col_peer_0 = _shfl_xor_2;
-        uint32_t _bf16x2_max_nan_3;
-        asm volatile("max.NaN.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_nan_3) : "r"(col_amax), "r"(col_peer_0));
-        col_amax = _bf16x2_max_nan_3;
+        unsigned int _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, col_amax, 1);
+        unsigned int col_peer = _shfl_xor_2;
+        uint32_t _bf16x2_max_nan_4;
+        asm volatile("max.NaN.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_nan_4) : "r"(col_amax), "r"(col_peer));
+        col_amax = _bf16x2_max_nan_4;
+        unsigned int _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, col_amax, 2);
+        unsigned int col_peer_0 = _shfl_xor_3;
+        uint32_t _bf16x2_max_nan_5;
+        asm volatile("max.NaN.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_nan_5) : "r"(col_amax), "r"(col_peer_0));
+        col_amax = _bf16x2_max_nan_5;
         unsigned int col_bits0 = (col_amax & 65535) << 16;
         unsigned int col_bits1 = col_amax & 4294901760;
         int col_scale0_i32 = (int)(col_bits0 + 2031616 >> 23) - 8;
@@ -381,8 +386,8 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
         int col_out_col1 = col_out_col + 1;
         int col_scale_index1 = ((col_out_col1 >> 7) * col_num_scale_blocks + (row_tile >> 2)) * 512 + (col_out_col1 & 31) * 16 + (col_out_col1 >> 5 & 3) * 4 + (row_tile & 3);
         if (tq == 0) {
-            *((unsigned char*)(col_scales + col_scale_index0)) = (unsigned char)(col_scale0);
-            *((unsigned char*)(col_scales + col_scale_index1)) = (unsigned char)(col_scale1);
+            *(reinterpret_cast<unsigned char*>(col_scales + col_scale_index0) + (0)) = (unsigned char)(col_scale0);
+            *(reinterpret_cast<unsigned char*>(col_scales + col_scale_index1) + (0)) = (unsigned char)(col_scale1);
         }
         unsigned int col_inv0 = 254 - col_scale0 << 7;
         unsigned int col_inv1 = 254 - col_scale1 << 7;
@@ -395,12 +400,12 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
         unsigned int col_inv_pair = col_inv0 | col_inv1 << 16;
         #pragma unroll
         for (int chunk_2 = 0; chunk_2 < 2; chunk_2++) {
-            uint32_t _bf16x2_mul_2;
-            asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_mul_2) : "r"(col_values[chunk_2 * 4]), "r"(col_inv_pair));
-            unsigned int col_scaled0 = _bf16x2_mul_2;
-            uint32_t _bf16x2_mul_3;
-            asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_mul_3) : "r"(col_values[chunk_2 * 4 + 1]), "r"(col_inv_pair));
-            unsigned int col_scaled1 = _bf16x2_mul_3;
+            uint32_t _bf16x2_mul_4;
+            asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_mul_4) : "r"(col_values[chunk_2 * 4]), "r"(col_inv_pair));
+            unsigned int col_scaled0 = _bf16x2_mul_4;
+            uint32_t _bf16x2_mul_5;
+            asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_mul_5) : "r"(col_values[chunk_2 * 4 + 1]), "r"(col_inv_pair));
+            unsigned int col_scaled1 = _bf16x2_mul_5;
             bits0 = (col_scaled0 & 65535) << 16;
             bits1 = col_scaled0 & 4294901760;
             bits2 = (col_scaled1 & 65535) << 16;
@@ -415,21 +420,23 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
             col_scaled_quad[3] = value3;
             {
                 uint32_t _packed;
-                asm("{\n\t"
-                    ".reg .b16 _lo, _hi;\n\t"
+                asm volatile("{\n\t"
+                    ".reg .b16 _lo;\n\t"
+                    ".reg .b16 _hi;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                     "mov.b32 %0, {_lo, _hi};\n\t"
-                    "}\n"
-                    : "=r"(_packed) : "f"(col_scaled_quad[0]), "f"(col_scaled_quad[1]), "f"(col_scaled_quad[2]), "f"(col_scaled_quad[3]));
+                    "}"
+                    : "=r"(_packed) : "f"(col_scaled_quad[0]), "f"(col_scaled_quad[1]),
+                                       "f"(col_scaled_quad[2]), "f"(col_scaled_quad[3]));
                 col_a01[(chunk_2) + 0] = _packed;
             }
-            uint32_t _bf16x2_mul_4;
-            asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_mul_4) : "r"(col_values[chunk_2 * 4 + 2]), "r"(col_inv_pair));
-            unsigned int col_scaled2 = _bf16x2_mul_4;
-            uint32_t _bf16x2_mul_5;
-            asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_mul_5) : "r"(col_values[chunk_2 * 4 + 3]), "r"(col_inv_pair));
-            unsigned int col_scaled3 = _bf16x2_mul_5;
+            uint32_t _bf16x2_mul_6;
+            asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_mul_6) : "r"(col_values[chunk_2 * 4 + 2]), "r"(col_inv_pair));
+            unsigned int col_scaled2 = _bf16x2_mul_6;
+            uint32_t _bf16x2_mul_7;
+            asm volatile("mul.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_mul_7) : "r"(col_values[chunk_2 * 4 + 3]), "r"(col_inv_pair));
+            unsigned int col_scaled3 = _bf16x2_mul_7;
             bits0 = (col_scaled2 & 65535) << 16;
             bits1 = col_scaled2 & 4294901760;
             bits2 = (col_scaled3 & 65535) << 16;
@@ -444,13 +451,15 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
             col_scaled_quad[3] = value3;
             {
                 uint32_t _packed;
-                asm("{\n\t"
-                    ".reg .b16 _lo, _hi;\n\t"
+                asm volatile("{\n\t"
+                    ".reg .b16 _lo;\n\t"
+                    ".reg .b16 _hi;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
                     "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
                     "mov.b32 %0, {_lo, _hi};\n\t"
-                    "}\n"
-                    : "=r"(_packed) : "f"(col_scaled_quad[0]), "f"(col_scaled_quad[1]), "f"(col_scaled_quad[2]), "f"(col_scaled_quad[3]));
+                    "}"
+                    : "=r"(_packed) : "f"(col_scaled_quad[0]), "f"(col_scaled_quad[1]),
+                                       "f"(col_scaled_quad[2]), "f"(col_scaled_quad[3]));
                 col_a23[(chunk_2) + 0] = _packed;
             }
             col_even[chunk_2] = __byte_perm(col_a01[chunk_2], col_a23[chunk_2], 0x6420);
@@ -458,13 +467,17 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
         }
         int col_local = cpr * 2;
         int col_byte = tq * 2 * 4;
-        asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"((col_act_addr + (unsigned int)(stage * 2048) + (unsigned int)(col_local * 32 + col_byte))), "r"(col_even[0]), "r"(col_even[1]) : "memory");
-        asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"((col_act_addr + (unsigned int)(stage * 2048) + (unsigned int)((col_local + 1) * 32 + col_byte))), "r"(col_odd[0]), "r"(col_odd[1]) : "memory");
+        {
+            asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"((col_act_addr + (unsigned int)(stage * 2048) + (unsigned int)(col_local * 32 + col_byte))), "r"(col_even[0]), "r"(col_even[1]) : "memory");
+            asm volatile("st.shared.v2.b32 [%0], {%1,%2};" :: "r"((col_act_addr + (unsigned int)(stage * 2048) + (unsigned int)((col_local + 1) * 32 + col_byte))), "r"(col_odd[0]), "r"(col_odd[1]) : "memory");
+        }
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         __syncthreads();
         if (warp == 0) {
-            tma_store_2d(&row_act_tma, bx * 64, by * 32 + stage * 32, row_act_addr + (unsigned int)(stage * 2048));
-            tma_store_2d(&col_act_tma, by * 32 + stage * 32, bx * 64, col_act_addr + (unsigned int)(stage * 2048));
+            {
+                tma_store_2d((&row_act_tma), bx * 64, by * 32 + stage * 32, row_act_addr + (unsigned int)(stage * 2048));
+            }
+            tma_store_2d((&col_act_tma), by * 32 + stage * 32, bx * 64, col_act_addr + (unsigned int)(stage * 2048));
             asm volatile("cp.async.bulk.commit_group;");
         }
     }
@@ -474,20 +487,3 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
 }
 
 } // extern "C"
-
-#undef GATED_MXFP8_INF
-#undef NUM_MAIN_STAGES
-#undef SMEM_COL_ACT_OFF
-#undef SMEM_COL_ACT_STAGE_BYTES
-#undef SMEM_COL_ACT_STRIDE
-#undef SMEM_PAD_OFF
-#undef SMEM_PAD_STAGE_BYTES
-#undef SMEM_PAD_STRIDE
-#undef SMEM_ROW_ACT_OFF
-#undef SMEM_ROW_ACT_STAGE_BYTES
-#undef SMEM_ROW_ACT_STRIDE
-#undef SMEM_TOTAL
-#undef THREADS
-#undef col_act_addr
-#undef pad_addr
-#undef row_act_addr
