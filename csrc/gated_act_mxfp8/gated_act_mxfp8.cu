@@ -180,10 +180,10 @@ void Forward(TensorView gated_input, TensorView row_output, TensorView col_outpu
     const bool use_no_allocate =
         (architecture_minor == 3 && elements >= kSm103ForwardNoAllocateElements) ||
         (architecture_minor == 0 && elements >= kSm100ForwardBothNoAllocateElements);
-    status = use_no_allocate
-                 ? LaunchForwardBothNoAllocate(input, row_map, col_map, row_sf, col_sf, m32, k32,
-                                               stream)
-                 : LaunchForwardBoth(input, row_map, col_map, row_sf, col_sf, m32, k32, stream);
+    status =
+        use_no_allocate
+            ? LaunchForwardBothNoAllocate(input, row_map, col_map, row_sf, col_sf, m32, k32, stream)
+            : LaunchForwardBoth(input, row_map, col_map, row_sf, col_sf, m32, k32, stream);
   } else if (rowwise) {
     const CUtensorMap row_map = MakeRowOutputMap(row_q, m, k, k, 128, "row_output");
     status = architecture_minor == 3 && elements >= kSm103ForwardNoAllocateElements

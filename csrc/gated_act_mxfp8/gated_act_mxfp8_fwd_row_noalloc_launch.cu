@@ -24,8 +24,8 @@ namespace flashinfer::gated_act_mxfp8 {
 cudaError_t LaunchForwardRowNoAllocate(__nv_bfloat16* input, CUtensorMap row_output,
                                        uint8_t* row_scales, int m, int k, cudaStream_t stream) {
   kernel_gated_act_mxfp8_fwd_row_direct_128x64_noalloc<<<dim3(k / 128, m / 32), 256, 4096,
-                                                        stream>>>(input, row_output, row_scales, m,
-                                                                  k);
+                                                         stream>>>(input, row_output, row_scales, m,
+                                                                   k);
   return cudaGetLastError();
 }
 

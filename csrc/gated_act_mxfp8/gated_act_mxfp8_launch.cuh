@@ -32,9 +32,9 @@ cudaError_t LaunchBackwardRow(__nv_bfloat16* input, __nv_bfloat16* grad, CUtenso
                               CUtensorMap row_gate, uint8_t* row_scales, int m, int k,
                               cudaStream_t stream);
 
-cudaError_t LaunchBackwardRowSm103(__nv_bfloat16* input, __nv_bfloat16* grad,
-                                   CUtensorMap row_act, CUtensorMap row_gate, uint8_t* row_scales,
-                                   int m, int k, cudaStream_t stream);
+cudaError_t LaunchBackwardRowSm103(__nv_bfloat16* input, __nv_bfloat16* grad, CUtensorMap row_act,
+                                   CUtensorMap row_gate, uint8_t* row_scales, int m, int k,
+                                   cudaStream_t stream);
 
 cudaError_t LaunchForwardCol(CUtensorMap gate, CUtensorMap up, CUtensorMap col_output,
                              uint8_t* col_scales, int m, int k, cudaStream_t stream);
