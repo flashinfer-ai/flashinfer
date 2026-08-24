@@ -37,6 +37,8 @@ struct SageQuantParams {
   Data_type inputType{DATA_TYPE_FP16};
   Data_type quantType{DATA_TYPE_E4M3};
   float* ptrQkScale{nullptr};
+  // Optional source and scratch mean used to perform K-smoothing.
+  void const* ptrKForMean{nullptr};
   float* ptrKMean{nullptr};
   // Optional arguments for SageQuantV.
   // vStage: 0: disabled, 1: collect scales, 2: quantize.
