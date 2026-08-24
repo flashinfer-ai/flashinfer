@@ -167,12 +167,16 @@ def _reduction_worker(
             allreduce_ref = local.to(dtype)
             dist.all_reduce(allreduce_ref, group=group)
             allreduce_ref_f32 = allreduce_ref.float()
-            residual_ref = allreduce_ref_f32 + residual_in.float()
+            residual_ref = (allreduce_ref_f32 + residual_in.float()).to(dtype)
+            residual_ref_f32 = residual_ref.float()
             norm_ref = (
-                residual_ref
-                * torch.rsqrt(residual_ref.square().mean(dim=-1, keepdim=True) + rms_eps)
+                residual_ref_f32
+                * torch.rsqrt(
+                    residual_ref_f32.square().mean(dim=-1, keepdim=True)
+                    + rms_eps
+                )
                 * rms_gamma.float()
-            )
+            ).to(dtype)
 
             emit_allreduce_options = (True, False) if token_num == 64 else (True,)
             for emit_allreduce in emit_allreduce_options:
@@ -337,14 +341,18 @@ def _finalize_worker(
                     local = local + shared_expert_output.float()
                 finalized_ref = local.to(dtype)
                 dist.all_reduce(finalized_ref, group=group)
-                residual_ref = finalized_ref.float() + residual_in.float()
+                residual_ref = (
+                    finalized_ref.float() + residual_in.float()
+                ).to(dtype)
+                residual_ref_f32 = residual_ref.float()
                 norm_ref = (
-                    residual_ref
+                    residual_ref_f32
                     * torch.rsqrt(
-                        residual_ref.square().mean(dim=-1, keepdim=True) + eps
+                        residual_ref_f32.square().mean(dim=-1, keepdim=True)
+                        + eps
                     )
                     * norm_weight.float()
-                )
+                ).to(dtype)
 
                 for launch_with_pdl in (False, True):
                     for mode in ("eager", "graph"):
