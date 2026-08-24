@@ -21,6 +21,7 @@
 #include <math.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <numeric>
 #include <random>
@@ -36,6 +37,7 @@
 #pragma GCC diagnostic ignored "-Wstrict-aliasing"
 #endif
 #include "cute/tensor.hpp"
+#include "cutlass/arch/memory.h"
 #include "cutlass/conv/convolution.h"
 // Order matters here, packed_stride.hpp is missing cute and convolution includes
 #include "cutlass/array.h"
@@ -75,6 +77,7 @@ using namespace tensorrt_llm::common;
 
 namespace tensorrt_llm::kernels::cutlass_kernels {
 
+constexpr int WARP_SIZE = 32;
 constexpr int CVT_ELTS_PER_THREAD = 8;
 
 struct FloatMaxOp {
@@ -1632,6 +1635,8 @@ __global__ void expandInputRowsKernel(
     // Cast first to handle when this is FP4
     auto* dest_row_ptr = reinterpret_cast<OutputElem*>(permuted_output) +
                          permuted_row * hidden_size / ELEM_PER_THREAD;
+    assert(reinterpret_cast<std::uintptr_t>(source_row_ptr) % sizeof(DataElem) == 0);
+    assert(reinterpret_cast<std::uintptr_t>(dest_row_ptr) % sizeof(OutputElem) == 0);
 
     int64_t const start_offset = threadIdx.x;
     int64_t const stride = EXPAND_THREADS_PER_BLOCK;
@@ -1651,7 +1656,9 @@ __global__ void expandInputRowsKernel(
       int64_t num_tokens_before_expert = expert_first_token_offset[expert];
 
       for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
-        auto in_vec = source_row_ptr[elem_index];
+        DataElem in_vec;
+        cutlass::arch::global_load<DataElem, sizeof(DataElem)>(in_vec, source_row_ptr + elem_index,
+                                                               true);
         if constexpr (need_nvfp4_quant || need_mxfp8_quant) {
           auto res =
               quantizePackedFPXValue<InputActivationsType, ExpandedActivationsType, DataElem,
@@ -1662,14 +1669,18 @@ __global__ void expandInputRowsKernel(
                            : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
           static_assert(sizeof(res) == sizeof(*dest_row_ptr),
                         "Quantized value must be the same size as the output");
-          dest_row_ptr[elem_index] = res;
+          auto out_vec = cutlass::platform::bit_cast<OutputElem>(res);
+          cutlass::arch::global_store<OutputElem, sizeof(OutputElem)>(
+              out_vec, dest_row_ptr + elem_index, true);
         } else {
           assert(act_scale_idx == 0 &&
                  "Cannot use per-expert act scale for pre-quantized activations");
           writeSF<VecSize, ELEM_PER_THREAD>(num_tokens_before_expert, expert, source_row,
                                             permuted_row, elem_index, padded_hidden_size,
                                             fc1_act_sf_flat, input_sf, swizzled_input_sf);
-          dest_row_ptr[elem_index] = in_vec;
+          auto out_vec = cutlass::platform::bit_cast<OutputElem>(in_vec);
+          cutlass::arch::global_store<OutputElem, sizeof(OutputElem)>(
+              out_vec, dest_row_ptr + elem_index, true);
         }
       }
 
@@ -1689,14 +1700,18 @@ __global__ void expandInputRowsKernel(
       static_assert(!std::is_same_v<InputActivationsType, ExpandedActivationsType>,
                     "Input and output types must be different for AWQ");
       for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
-        auto frag_elems = source_row_ptr[elem_index];
+        DataElem frag_elems;
+        cutlass::arch::global_load<DataElem, sizeof(DataElem)>(frag_elems,
+                                                               source_row_ptr + elem_index, true);
 
         CUTLASS_PRAGMA_UNROLL
         for (int e = 0; e < ELEM_PER_THREAD; e++) {
           frag_elems[e] = frag_elems[e] * prequant_scales[elem_index * ELEM_PER_THREAD + e];
         }
 
-        dest_row_ptr[elem_index] = arrayConvert<DataElem, OutputElem>(frag_elems);
+        auto out_vec = arrayConvert<DataElem, OutputElem>(frag_elems);
+        cutlass::arch::global_store<OutputElem, sizeof(OutputElem)>(
+            out_vec, dest_row_ptr + elem_index, true);
       }
     } else if constexpr (need_per_token_fp8_quant) {
       using AmaxOp = AbsMaxOp<InputActivationsType>;
@@ -1738,7 +1753,12 @@ __global__ void expandInputRowsKernel(
       }
     } else {
       for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
-        dest_row_ptr[elem_index] = source_row_ptr[elem_index];
+        DataElem in_vec;
+        cutlass::arch::global_load<DataElem, sizeof(DataElem)>(in_vec, source_row_ptr + elem_index,
+                                                               true);
+        auto out_vec = cutlass::platform::bit_cast<OutputElem>(in_vec);
+        cutlass::arch::global_store<OutputElem, sizeof(OutputElem)>(
+            out_vec, dest_row_ptr + elem_index, true);
       }
     }
 
@@ -1778,6 +1798,16 @@ void expandInputRowsKernelLauncher(
                            !use_per_expert_act_scale,
                        "Per-expert act scale for FC1 is only supported for NVFP4 activations");
 #endif
+
+  TLLM_CHECK_WITH_INFO(((hidden_size * std::min(sizeof_bits<InputActivationsType>::value,
+                                                sizeof_bits<ExpandedActivationsType>::value)) %
+                        128) == 0,
+                       "hidden_size %ld rows are not a multiple of 16B; expandInputRowsKernel "
+                       "requires 16B-aligned rows",
+                       hidden_size);
+  TLLM_CHECK_WITH_INFO(reinterpret_cast<uintptr_t>(unpermuted_input) % 16 == 0 &&
+                           reinterpret_cast<uintptr_t>(permuted_output) % 16 == 0,
+                       "expandInputRowsKernel input/output pointers must be 16B-aligned");
 
   static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
   // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
@@ -2215,8 +2245,49 @@ struct SwigluStepAdaptor {
   }
 };
 
+// SiTU-GLU (Kimi-K3 / mistral ffn_activations.situ_glu). A gated activation that transforms both
+// branches, evaluated in fp32 (bf16 rounding is visible at the tanh saturation points):
+//   out = (beta * tanh(gate / beta) * sigmoid(gate)) * (linear_beta * tanh(up / linear_beta))
+// Note the sigmoid reads the *uncapped* gate.
+struct SituAdaptor {
+  constexpr static bool IS_GLU = true;
+  float beta = 4.0f;
+  float linear_beta = 25.0f;
+
+  template <class T>
+  __device__ T operator()(T const& gate, T const& linear) const {
+    cutlass::epilogue::thread::Sigmoid<T> sigmoid{};
+    // tanh(z) == 2*sigmoid(2z) - 1. CUTLASS's Sigmoid uses ::expf, whereas its Tanh lowers to
+    // tanh.approx.f32 whose 2^-11 absolute error linear_beta=25 would amplify to ~1e-2.
+    // The `+ (-1.0f)` is because cutlass::Array has no operator-(Array, scalar).
+    auto tanh = [&](T const& z) { return sigmoid(z * 2.0f) * 2.0f + (-1.0f); };
+    return (tanh(gate * (1.0f / beta)) * sigmoid(gate) * beta) *
+           (tanh(linear * (1.0f / linear_beta)) * linear_beta);
+  }
+};
+
+__device__ inline bool hasPerExpertActivationParams(ActivationParams const& params) {
+  return params.swiglu_alpha || params.swiglu_beta || params.swiglu_limit || params.situ_beta ||
+         params.situ_linear_beta;
+}
+
+// Only assigns what the caller actually supplied, so each adaptor keeps its compile-time default
+// (e.g. SwigluStepAdaptor::limit == 7.0, SituAdaptor::beta == 4.0).
+template <class ActFn>
+__device__ void setPerExpertActivationParams(ActFn& fn, ActivationParams const& params,
+                                             int64_t expert) {
+  if constexpr (std::is_same_v<ActFn, SituAdaptor>) {
+    if (params.situ_beta) fn.beta = params.situ_beta[expert];
+    if (params.situ_linear_beta) fn.linear_beta = params.situ_linear_beta[expert];
+  } else {
+    if (params.swiglu_alpha) fn.alpha = params.swiglu_alpha[expert];
+    if (params.swiglu_beta) fn.beta = params.swiglu_beta[expert];
+    if (params.swiglu_limit) fn.limit = params.swiglu_limit[expert];
+  }
+}
+
 // ============================== Gated Activation =================================
-constexpr static int ACTIVATION_THREADS_PER_BLOCK = 256;
+constexpr static int MAX_ACTIVATION_THREADS_PER_BLOCK = 256;
 
 template <class ActivationOutputType, class GemmOutputType, class ActFn>
 __global__ void doGatedActivationKernel(ActivationOutputType* output,
@@ -2241,31 +2312,17 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output,
   auto gemm_result_vec = reinterpret_cast<GemmResultElem const*>(gemm_result);
   auto output_vec = reinterpret_cast<OutputElem*>(output);
   int64_t const start_offset = tid;
-  int64_t const stride = ACTIVATION_THREADS_PER_BLOCK;
+  int64_t const stride = MAX_ACTIVATION_THREADS_PER_BLOCK;
   assert(inter_size % ACTIVATION_ELEM_PER_THREAD == 0);
   int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
   int64_t const inter_size_vec = inter_size / ACTIVATION_ELEM_PER_THREAD;
 
-  float gate_alpha = 1.0f;
-  float gate_bias = 0.0f;
-  float gate_limit = std::numeric_limits<float>::infinity();
-  if (activation_type.swiglu_alpha || activation_type.swiglu_beta || activation_type.swiglu_limit) {
-    int expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node,
-                                             (int64_t)token + 1) -
-                 1;
-    gate_alpha = activation_type.swiglu_alpha ? activation_type.swiglu_alpha[expert] : 1.0f;
-    gate_bias = activation_type.swiglu_beta ? activation_type.swiglu_beta[expert] : 0.0f;
-    gate_limit = activation_type.swiglu_limit ? activation_type.swiglu_limit[expert]
-                                              : std::numeric_limits<float>::infinity();
-  }
-
   ActFn fn{};
-  fn.alpha = gate_alpha;
-  fn.beta = gate_bias;
-  // Keep the activation's compile-time default limit (e.g. 7.0 for SwigluStep) unless the caller
-  // supplied a per-expert swiglu_limit tensor.
-  if (activation_type.swiglu_limit) {
-    fn.limit = gate_limit;
+  if (hasPerExpertActivationParams(activation_type)) {
+    int64_t const expert = findTotalEltsLessThanTarget(expert_first_token_offset,
+                                                       num_experts_per_node, (int64_t)token + 1) -
+                           1;
+    setPerExpertActivationParams(fn, activation_type, expert);
   }
   for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
     auto linear_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
@@ -2283,7 +2340,7 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
                        int64_t num_tokens, int64_t num_experts_per_node,
                        ActivationParams activation_type, cudaStream_t stream) {
   int64_t const blocks = num_tokens;
-  int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
+  int64_t const threads = MAX_ACTIVATION_THREADS_PER_BLOCK;
 
   auto* fn = (activation_type == ActivationType::Swiglu)
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType,
@@ -2298,6 +2355,8 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluBiasAdaptor>
              : activation_type == ActivationType::SwigluStep
                  ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SwigluStepAdaptor>
+             : activation_type == ActivationType::Situ
+                 ? &doGatedActivationKernel<ActivationOutputType, GemmOutputType, SituAdaptor>
                  : nullptr;
   TLLM_CHECK_WITH_INFO(fn != nullptr, "Invalid activation type");
   fn<<<blocks, threads, 0, stream>>>(output, gemm_result, expert_first_token_offset, inter_size,
@@ -2309,7 +2368,7 @@ void doGatedActivation(ActivationOutputType* output, GemmOutputType const* gemm_
 template <class T, class GemmOutputType, class ScaleBiasType, class ActFn,
           TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType BlockScalingType,
           bool DISABLE_FP4_QUANT_FAST_MATH = false, typename NVFP4_4OVER6_CONFIG = std::false_type>
-__global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKernel(
+__global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivationKernel(
     T* output, GemmOutputType const* gemm_result, float const* fp8_quant,
     ScaleBiasType const* bias_ptr, bool bias_is_broadcast, int64_t const* expert_first_token_offset,
     int const* permuted_token_selected_experts, int num_experts_per_node, int64_t inter_size,
@@ -2361,22 +2420,13 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
     size_t output_offset = token * inter_size;
 
     int64_t expert = 0;
-    float gate_alpha = 1.0f;
-    float gate_beta = 0.0f;
-    float gate_limit = std::numeric_limits<float>::infinity();
     if (bias_ptr || IsNVFP4 || IsMXFP8 || use_per_expert_act_scale ||
-        activation_params.swiglu_alpha || activation_params.swiglu_beta ||
-        activation_params.swiglu_limit) {
+        hasPerExpertActivationParams(activation_params)) {
       expert = permuted_token_selected_experts
                    ? permuted_token_selected_experts[token]
                    : findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node,
                                                  token + 1) -
                          1;
-
-      gate_alpha = activation_params.swiglu_alpha ? activation_params.swiglu_alpha[expert] : 1.0f;
-      gate_beta = activation_params.swiglu_beta ? activation_params.swiglu_beta[expert] : 0.0f;
-      gate_limit = activation_params.swiglu_limit ? activation_params.swiglu_limit[expert]
-                                                  : std::numeric_limits<float>::infinity();
     }
 
     size_t act_scale_idx = use_per_expert_act_scale ? expert : 0;
@@ -2402,36 +2452,42 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
         reinterpret_cast<GemmResultElem const*>(gemm_result + gemm_result_offset);
     auto output_vec = reinterpret_cast<OutputElem*>(safe_inc_ptr(output, output_offset));
     auto bias_ptr_vec = reinterpret_cast<BiasElem const*>(bias_ptr + bias_offset);
+    assert(reinterpret_cast<std::uintptr_t>(gemm_result_vec) % sizeof(GemmResultElem) == 0);
+    assert(reinterpret_cast<std::uintptr_t>(output_vec) % sizeof(OutputElem) == 0);
+    assert(reinterpret_cast<std::uintptr_t>(bias_ptr_vec) % sizeof(BiasElem) == 0);
+
     int64_t const start_offset = tid;
-    int64_t const stride = ACTIVATION_THREADS_PER_BLOCK;
+    int64_t const stride = blockDim.x;
     assert(inter_size % ACTIVATION_ELEM_PER_THREAD == 0);
     int64_t const num_elems_in_col = inter_size / ACTIVATION_ELEM_PER_THREAD;
     assert(gated_off % ACTIVATION_ELEM_PER_THREAD == 0);
     int64_t const gated_off_vec = gated_off / ACTIVATION_ELEM_PER_THREAD;
 
     ActFn fn{};
-    fn.alpha = gate_alpha;
-    fn.beta = gate_beta;
-    // Keep the activation's compile-time default limit (e.g. 7.0 for SwigluStep) unless the caller
-    // supplied a per-expert swiglu_limit tensor.
-    if (activation_params.swiglu_limit) {
-      fn.limit = gate_limit;
-    }
+    setPerExpertActivationParams(fn, activation_params, expert);
     auto compute_activation = [&](int64_t elem_index) {
-      auto fc1_value =
-          arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gated_off_vec]);
+      GemmResultElem fc1_gemm_value;
+      cutlass::arch::global_load<GemmResultElem, sizeof(GemmResultElem)>(
+          fc1_gemm_value, gemm_result_vec + elem_index + gated_off_vec, true);
+      auto fc1_value = arrayConvert<GemmResultElem, ComputeElem>(fc1_gemm_value);
       if (bias_ptr) {
-        fc1_value = fc1_value +
-                    arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index + gated_off_vec]);
+        BiasElem fc1_bias_value;
+        cutlass::arch::global_load<BiasElem, sizeof(BiasElem)>(
+            fc1_bias_value, bias_ptr_vec + elem_index + gated_off_vec, true);
+        fc1_value = fc1_value + arrayConvert<BiasElem, ComputeElem>(fc1_bias_value);
       }
 
       auto gate_act = [&]() {
         if constexpr (IsGated) {
-          auto linear_value =
-              arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
-          if (bias_ptr_vec) {
-            linear_value =
-                linear_value + arrayConvert<BiasElem, ComputeElem>(bias_ptr_vec[elem_index]);
+          GemmResultElem linear_gemm_value;
+          cutlass::arch::global_load<GemmResultElem, sizeof(GemmResultElem)>(
+              linear_gemm_value, gemm_result_vec + elem_index, true);
+          auto linear_value = arrayConvert<GemmResultElem, ComputeElem>(linear_gemm_value);
+          if (bias_ptr) {
+            BiasElem linear_bias_value;
+            cutlass::arch::global_load<BiasElem, sizeof(BiasElem)>(linear_bias_value,
+                                                                   bias_ptr_vec + elem_index, true);
+            linear_value = linear_value + arrayConvert<BiasElem, ComputeElem>(linear_bias_value);
           }
           return fn(fc1_value, linear_value);
         } else {
@@ -2457,7 +2513,7 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
         }
       }
 
-      using BlockReduce = cub::BlockReduce<float, ACTIVATION_THREADS_PER_BLOCK>;
+      using BlockReduce = cub::BlockReduce<float, MAX_ACTIVATION_THREADS_PER_BLOCK>;
       __shared__ typename BlockReduce::TempStorage reduce_storage;
       __shared__ float shared_token_quant_scale;
       float const row_amax = BlockReduce(reduce_storage).Reduce(thread_amax, FloatMaxOp{});
@@ -2490,9 +2546,13 @@ __global__ __launch_bounds__(ACTIVATION_THREADS_PER_BLOCK) void doActivationKern
                     : TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX);
         static_assert(sizeof(res) == sizeof(*output_vec),
                       "Quantized value must be the same size as the output");
-        output_vec[elem_index] = res;
+        auto out_vec = cutlass::platform::bit_cast<OutputElem>(res);
+        cutlass::arch::global_store<OutputElem, sizeof(OutputElem)>(out_vec,
+                                                                    output_vec + elem_index, true);
       } else {
-        output_vec[elem_index] = arrayConvert<ComputeElem, OutputElem>(post_act_val);
+        auto out_vec = arrayConvert<ComputeElem, OutputElem>(post_act_val);
+        cutlass::arch::global_store<OutputElem, sizeof(OutputElem)>(out_vec,
+                                                                    output_vec + elem_index, true);
       }
     }
 
@@ -2534,12 +2594,51 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                   TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_act_sf_flat,
                   float* fp8_token_dequant_scale, float const* fp8_expert_residual_scale,
                   bool enable_pdl, cudaStream_t stream) {
-  static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
-  // Note: Launching 8 blocks per SM can fully leverage the memory bandwidth (tested on B200).
+  TLLM_CHECK_WITH_INFO(
+      (inter_size * std::min(sizeof_bits<T>::value, sizeof_bits<GemmOutputType>::value)) % 128 == 0,
+      "inter_size %ld rows are not a multiple of 16B; doActivationKernel requires 16B-aligned rows",
+      inter_size);
+  TLLM_CHECK_WITH_INFO(reinterpret_cast<uintptr_t>(gemm_result) % 16 == 0 &&
+                           reinterpret_cast<uintptr_t>(output) % 16 == 0 &&
+                           reinterpret_cast<uintptr_t>(bias) % 16 == 0,
+                       "doActivationKernel input/output/bias pointers must be 16B-aligned");
+
   // N-dim SF padding has been removed (CUTLASS grouped GEMM never reads beyond
   // tokens_to_expert), so the grid is driven purely by the expanded token count.
-  int64_t const blocks = std::min(smCount * 8, std::max(expanded_num_tokens, int64_t{1}));
-  int64_t const threads = ACTIVATION_THREADS_PER_BLOCK;
+
+  // Select block size (up to MAX_ACTIVATION_THREADS_PER_BLOCK) per the threads
+  // needed to process each row to avoid inactive warps and improve occupancy.
+#ifdef ENABLE_FP4
+  bool const use_mxfp8_block_scaling = quant_params.mxfp8_mxfp4.fc2.weight_block_scale ||
+                                       quant_params.mxfp8_mxfp8.fc2.weight_block_scale;
+  bool const use_fpx_block_scaling =
+      std::is_same_v<T, Fp4Type> || (std::is_same_v<T, __nv_fp8_e4m3> && use_mxfp8_block_scaling);
+#else
+  constexpr bool use_fpx_block_scaling = false;
+#endif
+  int64_t const elem_per_thread =
+      use_fpx_block_scaling
+          ? CVT_ELTS_PER_THREAD
+          : (128 / std::min(sizeof_bits<T>::value, sizeof_bits<GemmOutputType>::value));
+  int64_t const loads_per_row = std::max<int64_t>(inter_size / elem_per_thread, int64_t{1});
+  // The per-token FP8 quant path reduces the row amax with
+  // cub::BlockReduce<float, MAX_ACTIVATION_THREADS_PER_BLOCK>, which requires
+  // blockDim.x to match the compile-time block size, so force a full block there.
+  int64_t const threads =
+      fp8_token_dequant_scale != nullptr
+          ? MAX_ACTIVATION_THREADS_PER_BLOCK
+          : std::min<int64_t>(MAX_ACTIVATION_THREADS_PER_BLOCK,
+                              tensorrt_llm::common::roundUp(loads_per_row, int64_t{WARP_SIZE}));
+
+  // Limit the grid size to be proportional to the SM count in order to mitigate
+  // the warp scheduling pressure on each SM. The proportion can range from 8 to
+  // 32 blocks per SM and is adaptive to the block size.
+  static int64_t const smCount = tensorrt_llm::common::getMultiProcessorCount();
+  int64_t const blocks_per_sm = std::min<int64_t>(
+      int64_t{32},
+      tensorrt_llm::common::ceilDiv(int64_t{8} * MAX_ACTIVATION_THREADS_PER_BLOCK, threads));
+  int64_t const blocks =
+      std::min(smCount * blocks_per_sm, std::max(expanded_num_tokens, int64_t{1}));
 
   auto fn = [&]() {
     auto fn = [&](auto block_scaling_type, auto disableFP4QuantFastMathTag,
@@ -2585,7 +2684,11 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                               IdentityAdaptor<cutlass::epilogue::thread::Identity>,
                               decltype(block_scaling_type)::value,
                               decltype(disableFP4QuantFastMathTag)::value,
-                              decltype(nvfp4_4over6_config_tag)>  // Identity
+                              decltype(nvfp4_4over6_config_tag)>,  // Identity
+          &doActivationKernel<T, GemmOutputType, ScaleBiasType, SituAdaptor,
+                              decltype(block_scaling_type)::value,
+                              decltype(disableFP4QuantFastMathTag)::value,
+                              decltype(nvfp4_4over6_config_tag)>  // Situ
       };
       return fn_list[static_cast<int>(activation_type.activation_type)];
     };
@@ -2609,10 +2712,8 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
             return fn(NVFP4, disableFP4QuantFastMathTag, nvfp4_4over6_config_tag);
           });
     } else if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
-      return (quant_params.mxfp8_mxfp4.fc2.weight_block_scale ||
-              quant_params.mxfp8_mxfp8.fc2.weight_block_scale)
-                 ? fn(MXFPX, std::false_type{}, std::false_type{})
-                 : fn(NONE, std::false_type{}, std::false_type{});
+      return use_mxfp8_block_scaling ? fn(MXFPX, std::false_type{}, std::false_type{})
+                                     : fn(NONE, std::false_type{}, std::false_type{});
     } else
 #endif
     {

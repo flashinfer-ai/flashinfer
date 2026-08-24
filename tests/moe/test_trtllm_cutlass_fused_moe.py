@@ -20,6 +20,7 @@ import struct
 
 import pytest
 from flashinfer.fused_moe.core import ActivationType
+from flashinfer.tllm_enums import DEFAULT_SITU_BETA, DEFAULT_SITU_LINEAR_BETA
 import torch
 from torch.nn import functional as F
 
@@ -51,6 +52,17 @@ FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 FP8_DTYPE = torch.float8_e4m3fn
 
 set_nvfp4_4over6_env = moe_utils.set_nvfp4_4over6_env
+
+
+def make_situ_scales(num_experts):
+    """Per-expert SiTU-GLU tanh scales, deliberately different from DEFAULT_SITU_BETA /
+    DEFAULT_SITU_LINEAR_BETA so a kernel silently falling back to those would fail."""
+    return {
+        "situ_beta": torch.full((num_experts,), 5.0, dtype=torch.float32).cuda(),
+        "situ_linear_beta": torch.full(
+            (num_experts,), 18.0, dtype=torch.float32
+        ).cuda(),
+    }
 
 
 def dynamic_per_tensor_fp8_quant(x: torch.tensor) -> tuple[torch.tensor, torch.tensor]:
@@ -323,6 +335,8 @@ def compute_with_experts(
     beta=None,
     limit=None,
     activation_type=ActivationType.Swiglu,
+    situ_beta=DEFAULT_SITU_BETA,
+    situ_linear_beta=DEFAULT_SITU_LINEAR_BETA,
 ):
     results = torch.zeros_like(x)
     for expert_id in range(num_experts):
@@ -359,6 +373,22 @@ def compute_with_experts(
             x2 = x2.clamp_(min=-limit, max=limit) + beta
 
             inter = x1_scaled * x2
+        elif activation_type == ActivationType.Situ:
+            # SiTU-GLU, computed in fp32; see SituAdaptor in cutlass_fused_moe_kernels.cuh.
+            # situ_beta / situ_linear_beta are per-expert when given as a tensor/list.
+            sb = float(
+                situ_beta[expert_id] if hasattr(situ_beta, "__getitem__") else situ_beta
+            )
+            slb = float(
+                situ_linear_beta[expert_id]
+                if hasattr(situ_linear_beta, "__getitem__")
+                else situ_linear_beta
+            )
+            gate = (expert_inputs @ w1_expert.t()).float()
+            up = (expert_inputs @ w3_expert.t()).float()
+            out_glu = sb * torch.tanh(gate / sb) * torch.sigmoid(gate)
+            out_linear = slb * torch.tanh(up / slb)
+            inter = (out_glu * out_linear).to(x.dtype)
         else:
             inter = F.silu(expert_inputs @ w1_expert.t()) * (
                 expert_inputs @ w3_expert.t()
@@ -390,12 +420,23 @@ EP_TOP_K = [2]
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize(
-    "activation_type",
-    [ActivationType.Swiglu, ActivationType.SwigluStep],
-    ids=["swiglu", "swiglustep"],
+    "activation_type, situ_per_expert",
+    [
+        (ActivationType.Swiglu, False),
+        (ActivationType.SwigluStep, False),
+        (ActivationType.Situ, False),
+        (ActivationType.Situ, True),
+    ],
+    ids=["swiglu", "swiglustep", "situ_default", "situ_per_expert"],
 )
 def test_moe(
-    batch_size, hidden_size, num_experts, top_k, intermediate_size, activation_type
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+    activation_type,
+    situ_per_expert,
 ):
     # Skip invalid configurations
     if top_k > num_experts:
@@ -425,6 +466,13 @@ def test_moe(
     )
 
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
+
+    # When situ_per_expert is off the kernel must fall back to its compile-time defaults, which is
+    # what compute_with_experts() uses by default. The per-expert scales below are deliberately
+    # non-default so the test fails if the kernel ignores the tensors and falls back anyway.
+    situ_kwargs = make_situ_scales(num_experts) if situ_per_expert else {}
+    ref_situ_kwargs = {k: v.tolist() for k, v in situ_kwargs.items()}
+
     ref_output = compute_with_experts(
         num_experts,
         x,
@@ -433,6 +481,7 @@ def test_moe(
         selected_experts,
         routing_weights,
         activation_type=activation_type,
+        **ref_situ_kwargs,
     )
     flash_output = torch.empty_like(ref_output)
     flash_output = fused_moe.cutlass_fused_moe(
@@ -445,6 +494,7 @@ def test_moe(
         output=flash_output,
         quant_scales=None,
         activation_type=activation_type,
+        **situ_kwargs,
     )
 
     torch.testing.assert_close(ref_output, flash_output[0], rtol=1e-2, atol=1e-2)
@@ -613,8 +663,8 @@ def test_moe_unfused_finalize(
 @pytest.mark.parametrize("otype, wtype", [(torch.float16, torch.float8_e4m3fn)])
 @pytest.mark.parametrize(
     "activation_type",
-    [ActivationType.Swiglu, ActivationType.SwigluStep],
-    ids=["swiglu", "swiglustep"],
+    [ActivationType.Swiglu, ActivationType.SwigluStep, ActivationType.Situ],
+    ids=["swiglu", "swiglustep", "situ"],
 )
 def test_moe_fp8(
     batch_size,
@@ -661,6 +711,11 @@ def test_moe_fp8(
         w31_dequantized.data[expert_id].copy_(torch.mul(w31_quant.to(dtype=otype), s31))
         w2_dequantized.data[expert_id].copy_(torch.mul(w2_quant.to(dtype=otype), s2))
 
+    situ_kwargs = (
+        make_situ_scales(num_experts) if activation_type == ActivationType.Situ else {}
+    )
+    ref_situ_kwargs = {k: v.tolist() for k, v in situ_kwargs.items()}
+
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
     ref_output = compute_with_experts(
         num_experts,
@@ -670,6 +725,7 @@ def test_moe_fp8(
         selected_experts,
         routing_weights,
         activation_type=activation_type,
+        **ref_situ_kwargs,
     )
     flash_output = torch.empty_like(ref_output)
     # For fp8, the hidden_state expects quantized.
@@ -693,6 +749,7 @@ def test_moe_fp8(
         quant_scales=quant_scales,
         output=flash_output,
         activation_type=activation_type,
+        **situ_kwargs,
     )
     torch.testing.assert_close(ref_output, flash_output, rtol=1e-1, atol=1e-1)
 
@@ -3877,6 +3934,41 @@ def test_workspace_cuda_graph_capture_replay():
     out_t = out[0] if isinstance(out, (list, tuple)) else out
     out_e = out_eager[0] if isinstance(out_eager, (list, tuple)) else out_eager
     torch.testing.assert_close(out_t, out_e, rtol=0, atol=0)
+
+
+def _small_moe_inputs(m, hidden, inter, e, top_k, dtype=torch.bfloat16):
+    w31 = torch.randn(e, 2 * inter, hidden, dtype=dtype, device="cuda") / 10
+    w2 = torch.randn(e, hidden, inter, dtype=dtype, device="cuda") / 10
+    logits = torch.randn(m, e, dtype=torch.float32, device="cuda")
+    weights, ids = torch.topk(torch.softmax(logits, -1), top_k)
+    return w31, w2, weights.float().contiguous(), ids.to(torch.int)
+
+
+@_WS_CUTLASS_MOE_SKIP
+def test_vectorized_kernel_rejects_misaligned_input():
+    """The vectorized expand/activation kernels need 16B-aligned rows; a
+    misaligned input base must fail fast on the host with a clear diagnostic
+    instead of an IMA (device asserts are compiled out in release builds)."""
+    torch.manual_seed(42)
+    m, hidden, inter, e, top_k = 4, 128, 128, 8, 2
+    w31, w2, weights, ids = _small_moe_inputs(m, hidden, inter, e, top_k)
+
+    # Contiguous view whose base is 2B- but not 16B-aligned.
+    buf = torch.randn(m * hidden + 8, dtype=torch.bfloat16, device="cuda")
+    x = buf[1 : 1 + m * hidden].view(m, hidden)
+    assert x.is_contiguous() and x.data_ptr() % 16 != 0
+
+    with pytest.raises(Exception, match="16B-aligned"):
+        fused_moe.cutlass_fused_moe(
+            x,
+            ids,
+            weights,
+            w31,
+            w2,
+            torch.bfloat16,
+            quant_scales=None,
+            output=torch.empty_like(x),
+        )
 
 
 if __name__ == "__main__":

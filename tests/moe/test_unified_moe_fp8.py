@@ -34,6 +34,13 @@ from flashinfer.utils import get_compute_capability
 from tests.moe.trtllm_gen_fused_moe_utils import check_accuracy
 
 
+def _build_per_tensor_fp8_runner(config):
+    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    return runner
+
+
 def _is_trtllm_fp8_arch() -> bool:
     return torch.cuda.is_available() and get_compute_capability(
         torch.device("cuda")
@@ -711,7 +718,10 @@ def _make_per_tensor_fp8_case(
             routing_logits=logits,
         )
     else:
-        assert routing_input_mode is RoutingInputMode.PackedPrecomputed
+        assert routing_input_mode in (
+            RoutingInputMode.PackedPrecomputed,
+            RoutingInputMode.UnpackedPrecomputed,
+        )
         act = MoEActivationPack(
             hidden_states_q=x_q,
             hidden_states_scale=x_scale,
@@ -757,8 +767,12 @@ def _assert_per_tensor_fp8_close(out: torch.Tensor, ref: torch.Tensor) -> None:
 
 @pytest.mark.parametrize(
     "routing_input_mode",
-    [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed],
-    ids=["from-logits", "packed"],
+    [
+        RoutingInputMode.FromLogits,
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    ],
+    ids=["from-logits", "packed", "unpacked"],
 )
 def test_fp8_per_tensor_layer_and_direct_runner_match_reference(routing_input_mode):
     act, weights, config, ref, _ = _make_per_tensor_fp8_case(
@@ -767,7 +781,7 @@ def test_fp8_per_tensor_layer_and_direct_runner_match_reference(routing_input_mo
     layer_out = MoELayer(config)(act, weights)
     _assert_per_tensor_fp8_close(layer_out, ref)
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
     direct_out = runner.forward(inputs)
     _assert_per_tensor_fp8_close(direct_out, ref)
@@ -775,8 +789,12 @@ def test_fp8_per_tensor_layer_and_direct_runner_match_reference(routing_input_mo
 
 @pytest.mark.parametrize(
     "routing_input_mode",
-    [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed],
-    ids=["from-logits", "packed"],
+    [
+        RoutingInputMode.FromLogits,
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    ],
+    ids=["from-logits", "packed", "unpacked"],
 )
 def test_fp8_per_tensor_llama4_routes_scale_on_input(routing_input_mode):
     act, weights, config, ref, _ = _make_per_tensor_fp8_case(
@@ -786,7 +804,7 @@ def test_fp8_per_tensor_llama4_routes_scale_on_input(routing_input_mode):
     )
     _assert_per_tensor_fp8_close(MoELayer(config)(act, weights), ref)
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     _assert_per_tensor_fp8_close(runner.forward(runner.pack_inputs(act, weights)), ref)
 
     invalid_config = dataclasses.replace(
@@ -801,8 +819,12 @@ def test_fp8_per_tensor_llama4_routes_scale_on_input(routing_input_mode):
 
 @pytest.mark.parametrize(
     "routing_input_mode",
-    [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed],
-    ids=["from-logits", "packed"],
+    [
+        RoutingInputMode.FromLogits,
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    ],
+    ids=["from-logits", "packed", "unpacked"],
 )
 def test_fp8_per_tensor_nonzero_expert_offset(routing_input_mode):
     act, weights, config, ref, _ = _make_per_tensor_fp8_case(
@@ -814,7 +836,7 @@ def test_fp8_per_tensor_nonzero_expert_offset(routing_input_mode):
     assert torch.count_nonzero(ref)
     _assert_per_tensor_fp8_close(MoELayer(config)(act, weights), ref)
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     _assert_per_tensor_fp8_close(runner.forward(runner.pack_inputs(act, weights)), ref)
 
 
@@ -833,10 +855,11 @@ def test_fp8_per_tensor_packed_ids_keep_global_ids_and_weight_bits():
         act.topk_weights.to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
     )
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     moe_inputs = MoeRunnerInputs.from_list(runner.pack_inputs(act, weights))
     packed = moe_inputs.topk_ids
-    assert moe_inputs.expert_weights is None
+    assert moe_inputs.expert_weights is not None
+    assert moe_inputs.expert_weights.numel() == 0
     assert torch.equal(packed >> 16, expected_ids)
     assert torch.equal(packed & 0xFFFF, expected_bits)
 
@@ -852,7 +875,7 @@ def test_fp8_per_tensor_noncontiguous_packed_routing_matches_reference():
     assert not act.topk_ids.is_contiguous()
     assert not act.topk_weights.is_contiguous()
 
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
     assert MoeRunnerInputs.from_list(inputs).topk_ids.is_contiguous()
     _assert_per_tensor_fp8_close(runner.forward(inputs), ref)
@@ -860,7 +883,7 @@ def test_fp8_per_tensor_noncontiguous_packed_routing_matches_reference():
 
 def test_fp8_per_tensor_routing_replay_matches_reference():
     act, weights, config, _, selected_experts = _make_per_tensor_fp8_case()
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
     replay = torch.full(
         (TOKENS, TOP_K), -1, dtype=torch.int16, device=torch.device("cuda")
@@ -877,14 +900,18 @@ def test_fp8_per_tensor_routing_replay_matches_reference():
 
 @pytest.mark.parametrize(
     "routing_input_mode",
-    [RoutingInputMode.FromLogits, RoutingInputMode.PackedPrecomputed],
-    ids=["from-logits", "packed"],
+    [
+        RoutingInputMode.FromLogits,
+        RoutingInputMode.PackedPrecomputed,
+        RoutingInputMode.UnpackedPrecomputed,
+    ],
+    ids=["from-logits", "packed", "unpacked"],
 )
 def test_fp8_per_tensor_cuda_graph_replay(routing_input_mode):
     act, weights, config, ref, _ = _make_per_tensor_fp8_case(
         routing_input_mode=routing_input_mode
     )
-    runner = TrtllmFp8PerTensorRunner(config, torch.device("cuda"))
+    runner = _build_per_tensor_fp8_runner(config)
     inputs = runner.pack_inputs(act, weights)
     runner.forward(inputs)
     graph = torch.cuda.CUDAGraph()
@@ -893,3 +920,222 @@ def test_fp8_per_tensor_cuda_graph_replay(routing_input_mode):
     graph.replay()
     torch.cuda.synchronize()
     _assert_per_tensor_fp8_close(inputs[0], ref)
+
+
+# ---------------------------------------------------------------------------
+# Fused shared experts (non-EP, DeepSeekV3 + FromLogits only)
+# ---------------------------------------------------------------------------
+#
+# Comparing with the legacy flat API isolates the unified plumbing; legacy
+# kernel correctness is covered elsewhere. A self-fused pre-routed oracle
+# cannot cover checkpoint S=1/S=2 because its declared E+S must be divisible by 4.
+# Replay uses top_k stride while the kernel writes top_k + S, so these tests
+# compare outputs rather than selected expert ids.
+
+SHARED_EXPERTS_E = 64
+SHARED_N_GROUP = 8
+SHARED_TOPK_GROUP = 4
+SHARED_ROUTED_SCALE = 2.5
+
+
+def _make_shared_expert_case(
+    variant, *, num_shared, shared_scale=4.0, num_experts=SHARED_EXPERTS_E
+):
+    """Build a DSv3 case with distinguishable shared rows.
+
+    ``shared_scale=0`` removes only their contribution.
+    """
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(20260801)
+    rows = num_experts + num_shared
+
+    x = torch.randn(TOKENS, HIDDEN, device=device, dtype=torch.bfloat16, generator=gen)
+    w1 = (
+        torch.randn(
+            rows,
+            2 * INTERMEDIATE,
+            HIDDEN,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=gen,
+        )
+        * 0.02
+    )
+    w2 = (
+        torch.randn(
+            rows,
+            HIDDEN,
+            INTERMEDIATE,
+            device=device,
+            dtype=torch.bfloat16,
+            generator=gen,
+        )
+        * 0.02
+    )
+    w1[num_experts:] *= shared_scale
+    w2[num_experts:] *= shared_scale
+
+    x_q, x_scale = TrtllmFp8BlockConfig.prepare_activations(x, variant=variant)
+    # prepare_weights takes the *physical* row count, which includes the shared
+    # experts; the routed-only count lives in RoutingConfig/ExpertConfig.
+    view = TrtllmFp8BlockConfig.prepare_weights(
+        w1,
+        w2,
+        variant=variant,
+        num_local_experts=rows,
+        hidden_size=HIDDEN,
+        intermediate_size=INTERMEDIATE,
+        device=device,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for("trtllm_fp8_block", view)
+
+    logits = torch.randn(
+        TOKENS, num_experts, device=device, dtype=torch.bfloat16, generator=gen
+    )
+    bias = torch.randn(num_experts, device=device, dtype=torch.bfloat16, generator=gen)
+
+    config = MoEConfig(
+        routing=RoutingConfig(
+            num_experts=num_experts,
+            top_k=TOP_K,
+            method=RoutingMethodType.DeepSeekV3,
+            n_group=SHARED_N_GROUP,
+            topk_group=SHARED_TOPK_GROUP,
+            routed_scaling_factor=SHARED_ROUTED_SCALE,
+        ),
+        quant=QuantConfig(variant=variant),
+        experts=ExpertConfig(
+            intermediate_size=INTERMEDIATE,
+            num_fused_shared_experts=num_shared,
+        ),
+        activation=ActivationConfig.swiglu,
+        backend=BackendOptions(candidates=(TrtllmFp8BlockConfig(),)),
+        execution=ExecutionConfig(tune_max_num_tokens=TOKENS),
+    )
+    pack = MoEActivationPack(
+        hidden_states_q=x_q,
+        hidden_states_scale=x_scale,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=logits,
+        routing_bias=bias,
+    )
+    return pack, weights, config, view, (logits, bias)
+
+
+def _legacy_block_fp8_shared(pack, view, logits, bias, config, num_shared):
+    """Same launch through the legacy flat API, for cross-checking the unified path."""
+    from flashinfer.fused_moe import trtllm_fp8_block_scale_moe
+    from flashinfer.tllm_enums import Fp8QuantizationType
+
+    return trtllm_fp8_block_scale_moe(
+        logits,
+        bias,
+        pack.hidden_states_q,
+        pack.hidden_states_scale,
+        view["gemm1_weights"],
+        view["gemm1_weights_scale"],
+        view["gemm2_weights"],
+        view["gemm2_weights_scale"],
+        config.routing.num_experts,
+        config.routing.top_k,
+        config.routing.n_group,
+        config.routing.topk_group,
+        config.experts.intermediate_size,
+        0,
+        config.routing.num_experts,
+        config.routing.routed_scaling_factor,
+        routing_method_type=int(RoutingMethodType.DeepSeekV3),
+        # The flat API defaults to DeepSeekFp8; MXFP8 uses a different
+        # activation-scale layout ([M, H/32] vs [H/128, M]) and the shuffled
+        # weight view, so both must be passed for the cross-check to compare
+        # the same launch the unified runner performs.
+        fp8_quantization_type=(
+            Fp8QuantizationType.MxFp8
+            if config.quant.variant is QuantVariant.MxFp8
+            else Fp8QuantizationType.DeepSeekFp8
+        ),
+        use_shuffled_weight=config.quant.variant is QuantVariant.MxFp8,
+        num_fused_shared_experts=num_shared,
+    )
+
+
+@pytest.mark.parametrize(
+    "variant,num_shared",
+    [
+        pytest.param(QuantVariant.DeepSeekFp8, 1, id="deepseek-s1"),
+        pytest.param(QuantVariant.MxFp8, 2, id="mxfp8-s2"),
+    ],
+)
+def test_block_fp8_fused_shared_experts_match_legacy(variant, num_shared):
+    pack, weights, config, view, (logits, bias) = _make_shared_expert_case(
+        variant, num_shared=num_shared
+    )
+    actual = MoELayer(config)(pack, weights).clone()
+    expected = _legacy_block_fp8_shared(pack, view, logits, bias, config, num_shared)
+    _assert_fp8_close(actual, expected)
+
+
+@pytest.mark.parametrize("key", ["gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"])
+def test_block_fp8_shared_expert_oa_params_use_physical_rows(key):
+    num_shared = 1
+    pack, weights, config, view, _ = _make_shared_expert_case(
+        QuantVariant.DeepSeekFp8, num_shared=num_shared
+    )
+    runner = MoELayer(config).runners[0]
+    device = pack.hidden_states_q.device
+
+    view[key] = torch.ones(
+        SHARED_EXPERTS_E + num_shared, device=device, dtype=torch.float32
+    )
+    runner.pack_inputs(pack, weights)
+
+    view[key] = torch.ones(SHARED_EXPERTS_E, device=device, dtype=torch.float32)
+    with pytest.raises(
+        ValueError, match=rf"{key} shape.*expected \({SHARED_EXPERTS_E + num_shared},\)"
+    ):
+        runner.pack_inputs(pack, weights)
+
+
+def test_block_fp8_fused_shared_experts_contribute():
+    """Verify shared rows contribute independently of the legacy cross-check."""
+    variant = QuantVariant.DeepSeekFp8
+    num_shared = 1
+    pack, weights, config, _, _ = _make_shared_expert_case(
+        variant, num_shared=num_shared
+    )
+    live = MoELayer(config)(pack, weights).clone()
+
+    pack0, weights0, config0, _, _ = _make_shared_expert_case(
+        variant, num_shared=num_shared, shared_scale=0.0
+    )
+    muted = MoELayer(config0)(pack0, weights0).clone()
+
+    rel = (live.float() - muted.float()).abs().max() / (
+        muted.float().abs().max() + 1e-6
+    )
+    assert rel > 0.1, (
+        f"S={num_shared}: zeroing the shared rows moved the output by only "
+        f"{rel:.4f}; the shared experts are not being applied."
+    )
+
+
+def test_block_fp8_fused_shared_experts_cuda_graph_replay():
+    """Verify that static S reaches routing during CUDA graph replay."""
+    pack, weights, config, _, _ = _make_shared_expert_case(
+        QuantVariant.DeepSeekFp8, num_shared=1
+    )
+    from flashinfer.fused_moe.runners import TrtllmFp8BlockRunner
+
+    runner = TrtllmFp8BlockRunner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(pack, weights)
+    eager = runner.forward(inputs).clone()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner.forward(inputs)
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_fp8_close(inputs[0], eager)

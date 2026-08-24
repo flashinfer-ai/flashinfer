@@ -47,6 +47,8 @@ from cutlass.cute.typing import Int32, Int64
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T as mlir_T
 
+from .dtype_compat import as_bf16
+
 
 device = torch.device("cuda:0")
 
@@ -2091,6 +2093,11 @@ def gated_delta_rule_mtp(
     assert initial_state_source.dtype == torch.bfloat16, (
         f"initial_state_source must be bf16 (pool, HV, V, K); got {initial_state_source.dtype}."
     )
+    # bf16-only kernel: any other dtype would be reinterpreted, not converted.
+    q, k, v, a, b = as_bf16(q, k, v, a, b)
+    assert output is None or output.dtype == torch.bfloat16, (
+        f"output must be bf16; got {output.dtype}."
+    )
 
     B, T, H, K_dim = q.shape
     HV = v.shape[2]
@@ -2107,6 +2114,18 @@ def gated_delta_rule_mtp(
         initial_state_indices = torch.arange(B, dtype=torch.int32, device=device)
     else:
         initial_state_indices = initial_state_indices.contiguous()
+        assert initial_state_indices.dtype in (torch.int32, torch.int64), (
+            f"initial_state_indices must be int32 or int64; "
+            f"got {initial_state_indices.dtype}."
+        )
+        # Kernel loads indices as int32; convert rather than reinterpret.
+        if initial_state_indices.dtype != torch.int32:
+            iinfo = torch.iinfo(torch.int32)
+            assert (
+                int(initial_state_indices.min()) >= iinfo.min
+                and int(initial_state_indices.max()) <= iinfo.max
+            ), "initial_state_indices must fit in int32 before narrowing"
+            initial_state_indices = initial_state_indices.to(torch.int32)
     _io_dtype = q.dtype
     HK = k.shape[2]
 

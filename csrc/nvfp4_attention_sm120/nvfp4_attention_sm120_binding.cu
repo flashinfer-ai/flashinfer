@@ -302,6 +302,16 @@ void fwd(TensorView q_fp4, TensorView k_fp4, TensorView v_fp4_t, TensorView q_sc
     return;
   }
 
+  // lse is allocated uninitialized by the caller (torch.empty). The fwd kernel
+  // writes `out` for every query row but does not guarantee writing every
+  // (batch, head, seq) entry of lse, so reading it back can surface whatever
+  // garbage the allocator handed out (observed as flaky NaNs in lse under a
+  // dirty allocator, depending on test/run ordering). Zero it first, mirroring
+  // the seq_len==0 branch above, so unwritten entries are a defined 0.
+  status = cudaMemsetAsync(lse.data_ptr(), 0, numel(lse) * get_element_size(lse), stream);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "cudaMemsetAsync(lse) failed: " << cudaGetErrorString(status);
+
   Flash_fwd_params params;
   set_params_fprop(params, q_fp4, k_fp4, v_fp4_t, q_scale, k_scale, v_scale_t, qk_correction, out,
                    lse, static_cast<float>(sm_scale), causal, per_block_mean);

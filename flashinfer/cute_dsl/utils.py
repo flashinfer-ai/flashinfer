@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import contextlib
 import ctypes
 import functools
 import os
@@ -28,6 +29,10 @@ import torch
 from cutlass._mlir import ir
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
+
+if not hasattr(cute.nvgpu, "OperandMajorMode"):
+    with contextlib.suppress(AttributeError):
+        cute.nvgpu.OperandMajorMode = cute.nvgpu.tcgen05.OperandMajorMode
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -53,6 +58,27 @@ def is_cute_dsl_available() -> bool:
     return (
         importlib.util.find_spec("cutlass") is not None
         and importlib.util.find_spec("cutlass.cute") is not None
+    )
+
+
+@functools.cache
+def is_rubin_cute_dsl_available() -> bool:
+    r"""Return ``True`` when the installed CuTe DSL exposes the Rubin (SM107) API.
+
+    The SM107 kernels are built on ``cutlass.utils.rubin_helpers``, which is only
+    present from CuTe DSL 4.8 onwards. FlashInfer continues to support older DSL
+    releases, so those kernels are imported lazily and this probe decides whether
+    they are offered at all: on an older DSL the rest of the package still works
+    and only the SM107 CuTe DSL paths are unavailable.
+
+    Returns
+    -------
+    bool
+        ``True`` if ``cutlass.utils.rubin_helpers`` is importable.
+    """
+    return (
+        is_cute_dsl_available()
+        and importlib.util.find_spec("cutlass.utils.rubin_helpers") is not None
     )
 
 
@@ -226,6 +252,27 @@ def cutlass_to_torch_dtype(cutlass_dtype):
     if torch_dtype is None:
         raise TypeError(f"{cutlass_dtype} is not supported by torch")
     return torch_dtype
+
+
+def torch_dtype_to_cutlass(dtype: torch.dtype):
+    """Convert torch.dtype to corresponding cutlass dtype.
+
+    :param dtype: PyTorch data type
+    :type dtype: torch.dtype
+    :return: Corresponding CUTLASS data type
+    :rtype: cutlass.dtype
+    :raises TypeError: If the dtype is not supported
+    """
+    torch_to_cutlass_map = {
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+        torch.float8_e5m2: cutlass.Float8E5M2,
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }
+    if dtype not in torch_to_cutlass_map:
+        raise TypeError(f"Unsupported torch dtype: {dtype}")
+    return torch_to_cutlass_map[dtype]
 
 
 @functools.cache
@@ -632,8 +679,10 @@ def sm120_make_smem_layout_sfa(
     k_basic_block_shape = (sf_vec_size, mma_nsf)
     k_basic_block_stride = (0, 1)
 
-    assert tile_shape_mnk[0] % (blk_mn // 2) == 0, (
-        "tile_shape_mnk[0] must be divisible by 64"
+    # Sub-64-row M tiles appear only in the b12x dense GEMM path, whose SF
+    # fragment layouts handle them.
+    assert tile_shape_mnk[0] % (blk_mn // 8) == 0, (
+        "tile_shape_mnk[0] must be divisible by 16"
     )
 
     # Scale-factor tiles are quantized in 128-row blocks, so narrower MMA

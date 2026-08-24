@@ -37,6 +37,14 @@ from typing_extensions import deprecated
 from ..tllm_enums import ActivationType, RoutingInputMode, RoutingMethodType
 
 # ---------------------------------------------------------------------------
+# Kernel ceilings
+# ---------------------------------------------------------------------------
+# Mirrored from MaxSupportedTopExperts and NumNemotronExperts in the
+# trtllm-gen DeepSeek router. These limits apply after adding shared experts.
+MAX_SUPPORTED_TOP_EXPERTS = 32
+MAX_SUPPORTED_TOTAL_EXPERTS = 512
+
+# ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
 # Routing and activation reuse the shared kernel-level enums directly
@@ -176,11 +184,24 @@ class ExpertConfig:
         Start index for expert-parallel sharding.
     local_num_experts : int or None
         Number of experts on this rank.  ``None`` → ``num_experts`` at runtime.
+    num_fused_shared_experts : int
+        Number of shared experts run for every token. Their rows follow the
+        routed experts, so weights have ``E + S`` rows while routing fields
+        remain routed-only. Cross-field constraints are checked by
+        :class:`MoEConfig`.
     """
 
     intermediate_size: int
     local_expert_offset: int = 0
     local_num_experts: Optional[int] = None
+    num_fused_shared_experts: int = 0
+
+    def __post_init__(self) -> None:
+        if self.num_fused_shared_experts < 0:
+            raise ValueError(
+                "num_fused_shared_experts must be >= 0, got "
+                f"{self.num_fused_shared_experts}."
+            )
 
     def __repr__(self) -> str:
         parts = [f"intermediate_size={self.intermediate_size!r}"]
@@ -188,7 +209,50 @@ class ExpertConfig:
             parts.append(f"local_expert_offset={self.local_expert_offset!r}")
         if self.local_num_experts is not None:
             parts.append(f"local_num_experts={self.local_num_experts!r}")
+        if self.num_fused_shared_experts != 0:
+            parts.append(f"num_fused_shared_experts={self.num_fused_shared_experts!r}")
         return f"ExpertConfig({', '.join(parts)})"
+
+
+@dataclass(frozen=True)
+class MoEFinalizeConfig:
+    """How the finalize (combine) step behaves.
+
+    Split out of ``ExecutionConfig`` for the same reason ``RoutingConfig`` is
+    its own config: finalize is a distinct architectural concern (how the
+    per-expert partials are reduced back into one row per token), not a
+    runtime knob like PDL or the autotuner token budget.
+
+    Parameters
+    ----------
+    do_finalize : bool
+        Whether to apply routing-weight scaling and accumulate the per-expert
+        partial results into the output.  ``False`` returns the unreduced
+        TRTLLM intermediates as ``[gemm2_output, expert_weights,
+        expanded_idx_to_permuted_idx]``, leaving the combine to the caller.
+        For FromLogits routing, the routing kernel emits ``expert_weights`` in
+        bfloat16 regardless of the routing-logits dtype. ``PackedPrecomputed``
+        routing also yields bfloat16 weights: the caller's values are narrowed
+        to bfloat16 when packed into the top-k ids. Only
+        ``UnpackedPrecomputed`` routing preserves the caller-provided weights
+        dtype, since it forwards ``topk_weights`` to the kernel unchanged.
+        Only backends that advertise unfinalized output support this mode.
+    use_fused_finalize : bool
+        Whether supported backends reduce routed outputs in the GEMM2 epilogue
+        (atomic accumulation) instead of running a separate reduction kernel.
+        Backends that do not support it ignore the flag.
+    """
+
+    do_finalize: bool = True
+    use_fused_finalize: bool = True
+
+    def __repr__(self) -> str:
+        parts = []
+        if not self.do_finalize:
+            parts.append(f"do_finalize={self.do_finalize!r}")
+        if not self.use_fused_finalize:
+            parts.append(f"use_fused_finalize={self.use_fused_finalize!r}")
+        return f"MoEFinalizeConfig({', '.join(parts)})"
 
 
 @dataclass(frozen=True)
@@ -197,31 +261,21 @@ class ExecutionConfig:
 
     Parameters
     ----------
-    do_finalize : bool
-        Whether to apply routing-weight scaling and accumulate into output.
     enable_pdl : bool or None
         Persistent device launch.  ``None`` → auto (True for sm90+).
     tune_max_num_tokens : int
         Token budget hint for autotuner / CUDA graph capture.
-    use_fused_finalize : bool
-        Whether supported backends reduce routed outputs in the GEMM2 epilogue.
     """
 
-    do_finalize: bool = True
     enable_pdl: Optional[bool] = None
     tune_max_num_tokens: int = 8192
-    use_fused_finalize: bool = True
 
     def __repr__(self) -> str:
         parts = []
-        if not self.do_finalize:
-            parts.append(f"do_finalize={self.do_finalize!r}")
         if self.enable_pdl is not None:
             parts.append(f"enable_pdl={self.enable_pdl!r}")
         if self.tune_max_num_tokens != 8192:
             parts.append(f"tune_max_num_tokens={self.tune_max_num_tokens!r}")
-        if not self.use_fused_finalize:
-            parts.append(f"use_fused_finalize={self.use_fused_finalize!r}")
         return f"ExecutionConfig({', '.join(parts)})"
 
 
@@ -280,6 +334,11 @@ class TrtllmFp4Config:
         ``variant`` selects NVFP4, MXFP4xMXFP8, or ``QuantVariant.W4A16``
         (MXFP4 weights x BF16 activations).
         See :func:`flashinfer.fused_moe.prepare.prepare_trtllm_fp4_weights`.
+
+        .. warning::
+           ``num_local_experts`` is the physical row count: ``E_local + S``
+           when fused shared experts are present. :class:`ExpertConfig` keeps
+           ``local_num_experts`` as the routed-only count ``E_local``.
         """
         from .prepare import prepare_trtllm_fp4_weights
 
@@ -341,6 +400,12 @@ class TrtllmFp8BlockConfig:
         prepared by separate paths. The shuffled MXFP8 view requires both
         ``hidden_size`` and ``intermediate_size`` to be divisible by 128 so its
         scale tensors fit TRTLLM's unpadded 128x4 physical layout.
+
+        .. warning::
+           ``num_local_experts`` here is the **physical row count** of
+           ``w1_bf16`` / ``w2_bf16``: ``E_local + S`` with shared experts.
+           :attr:`ExpertConfig.local_num_experts` remains routed-only
+           (``E_local``).
         """
         from .prepare import prepare_trtllm_fp8_block_weights
 
@@ -614,8 +679,8 @@ class CuteDslConfig:
 
     @classmethod
     def supported(cls, arch: int) -> bool:
-        # SM100, SM103 — tighten when CuteDSL adds more targets
-        return arch in (100, 103)
+        # SM100, SM103 (Blackwell) + SM107 (Rubin) — tighten when CuteDSL adds more targets
+        return arch in (100, 103, 107)
 
     @staticmethod
     def prepare_weights(
@@ -842,6 +907,61 @@ class MoEConfig:
     )
     backend: BackendOptions = field(default_factory=lambda: _DEFAULT_BACKEND)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
+    # Appended last so existing positional construction keeps working.
+    finalize: MoEFinalizeConfig = field(default_factory=MoEFinalizeConfig)
+
+    def __post_init__(self) -> None:
+        # Not in check_support(): MoELayer swallows its exceptions to filter
+        # backends, so errors raised there surface as "no backend available".
+        self._validate_fused_shared_experts()
+
+    def _validate_fused_shared_experts(self) -> None:
+        s = self.experts.num_fused_shared_experts
+        if s == 0:
+            return
+
+        # Only DeepSeekV3 routing emits shared-expert slots.
+        if self.routing.method is not RoutingMethodType.DeepSeekV3:
+            raise ValueError(
+                "num_fused_shared_experts > 0 requires DeepSeekV3 routing, got "
+                f"method={self.routing.method!r}."
+            )
+
+        # Kernel limits apply to the fused totals.
+        total_top_k = self.routing.top_k + s
+        if total_top_k > MAX_SUPPORTED_TOP_EXPERTS:
+            raise ValueError(
+                f"top_k + num_fused_shared_experts must be <= "
+                f"{MAX_SUPPORTED_TOP_EXPERTS}, got {self.routing.top_k} + {s} = "
+                f"{total_top_k}."
+            )
+        total_experts = self.routing.num_experts + s
+        if total_experts > MAX_SUPPORTED_TOTAL_EXPERTS:
+            raise ValueError(
+                f"num_experts + num_fused_shared_experts must be <= "
+                f"{MAX_SUPPORTED_TOTAL_EXPERTS}, got {self.routing.num_experts} "
+                f"+ {s} = {total_experts}."
+            )
+
+        # The kernel maps a shared id to a weight row as
+        # (global_id - local_expert_offset), so all routed experts must be local.
+        local_num_experts = (
+            self.experts.local_num_experts
+            if self.experts.local_num_experts is not None
+            else self.routing.num_experts
+        )
+        if self.experts.local_expert_offset != 0 or (
+            local_num_experts != self.routing.num_experts
+        ):
+            raise ValueError(
+                "num_fused_shared_experts > 0 does not support expert "
+                "parallelism: require local_expert_offset == 0 and "
+                "local_num_experts == num_experts. Got "
+                f"num_fused_shared_experts={s}, "
+                f"local_expert_offset={self.experts.local_expert_offset}, "
+                f"local_num_experts={local_num_experts}, "
+                f"num_experts={self.routing.num_experts}."
+            )
 
     # --- Dict-unpacking protocol: enables ``**config`` at call sites ---
 
@@ -912,10 +1032,10 @@ class MoEActivationPack:
       selection on the host and passes ``topk_ids`` + ``topk_weights``.
       The TRTLLM runners normally combine both fields into one packed ``int32``
       tensor before launch.
-    * ``UnpackedPrecomputed`` — **pre-routed, separate kernel inputs**: currently
-      supported by the TRTLLM FP4 runner. The caller supplies ``int32`` ids and
-      BF16 or FP32 weights directly, avoiding packed-id construction. The
-      launcher consumes the weights in their native dtype.
+    * ``UnpackedPrecomputed`` — **pre-routed, separate kernel inputs**: supported
+      by the TRTLLM runners. The caller supplies ``int32`` ids and BF16 or FP32
+      weights directly, avoiding packed-id construction. The launcher consumes
+      the weights in their native dtype.
     * ``FromLogits`` — **in-kernel**: the caller passes raw ``routing_logits`` (and, for bias-aware
       methods like DeepSeekV3/MiniMax2, ``routing_bias``); the kernel computes the top-k selection
       itself per ``RoutingConfig.method``.  ``topk_ids`` / ``topk_weights`` stay ``None`` — the
@@ -938,7 +1058,7 @@ class MoEActivationPack:
     # Pre-routed top-k selection (Packed/Unpacked modes); None under FromLogits.
     topk_ids: Optional[Tensor] = None  # [M, top_k] int32 (expert indices)
     # [M, top_k] routing weights: float32 for PackedPrecomputed; bfloat16 or
-    # float32 for TRTLLM FP4 UnpackedPrecomputed.
+    # float32 for TRTLLM UnpackedPrecomputed.
     topk_weights: Optional[Tensor] = None
     # Per-token NVFP4 row scale, shape [M].
     per_token_scale: Optional[Tensor] = field(default=None, kw_only=True)

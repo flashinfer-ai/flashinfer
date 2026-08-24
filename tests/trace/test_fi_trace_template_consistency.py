@@ -31,10 +31,11 @@ Two levels of checking
 
 How to add a new template
 --------------------------
-When you add ``@flashinfer_api(trace=my_trace)`` to a function, ensure its
-module is imported by the collector below and optionally add a targeted
-end-to-end test. See the docstring in ``flashinfer/trace/templates/__init__.py``
-for the full how-to guide.
+When you add ``@flashinfer_api(trace=my_trace)`` to the first traced function
+in a module, add that module to ``_TRACE_REGISTRATION_MODULES`` in
+``tests.trace.template_registry``.  Add a targeted end-to-end test when the
+generic checks are insufficient.  See the docstring in
+``flashinfer/trace/templates/__init__.py`` for the full how-to guide.
 """
 
 import ast
@@ -46,6 +47,7 @@ import pytest
 import torch
 
 from flashinfer.trace.template import Const, Scalar, Tensor, TraceTemplate, Var
+from tests.trace.template_registry import collect_registered_trace_templates
 
 # ---------------------------------------------------------------------------
 # Structural checker utilities
@@ -158,6 +160,32 @@ def assert_template_axes_covered(
         f"{pfx}Template '{template.name_prefix or template.op_type}' "
         f"has Const axes with no tensor/scalar source: {uncovered}"
     )
+
+
+_ALLOWED_CONSTRAINT_BUILTINS = {"max"}
+
+
+def assert_template_constraints_valid(
+    template: TraceTemplate,
+    *,
+    label: str = "",
+) -> None:
+    """Assert constraints are expressions over declared axes and inputs."""
+    allowed_names = (
+        set(template.axes) | set(template.inputs) | _ALLOWED_CONSTRAINT_BUILTINS
+    )
+    for constraint in template.constraints:
+        expression = ast.parse(constraint, mode="eval")
+        referenced_names = {
+            node.id for node in ast.walk(expression) if isinstance(node, ast.Name)
+        }
+        unknown_names = referenced_names - allowed_names
+        pfx = f"[{label}] " if label else ""
+        assert not unknown_names, (
+            f"{pfx}Template '{template.name_prefix or template.op_type}' "
+            f"constraint {constraint!r} references undeclared names: "
+            f"{sorted(unknown_names)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -305,44 +333,24 @@ def assert_fi_trace_complete(
 
 
 # ---------------------------------------------------------------------------
-# Auto-discovery via _TRACE_REGISTRY
+# Deterministic auto-discovery via _TRACE_REGISTRY
 #
 # @flashinfer_api(trace=...) automatically registers every (func, template)
-# pair in flashinfer.api_logging._TRACE_REGISTRY at decoration time.
-# We just need to import the modules that contain the decorated functions to
-# trigger those decorators, then read the registry.
+# pair in flashinfer.api_logging._TRACE_REGISTRY at decoration time.  The
+# shared collector imports the complete module inventory and returns a stable
+# snapshot, independent of modules imported by earlier pytest files.
 #
-# To add a new kernel: no changes needed here — simply add
-# @flashinfer_api(trace=my_template) to your function and the tests will
-# pick it up automatically.
+# To add a new kernel, add @flashinfer_api(trace=my_template) to the function.
+# If it lives in a new registration module, add that module to
+# tests.trace.template_registry._TRACE_REGISTRATION_MODULES; the inventory
+# regression test reports omissions.
 # ---------------------------------------------------------------------------
 
 
 def _collect_template_func_pairs() -> List[Tuple[Callable, TraceTemplate, str]]:
-    """
-    Return all (func, template, label) pairs by reading _TRACE_REGISTRY.
+    """Return all available (func, template, label) triples."""
 
-    Imports are done lazily here so that missing GPU drivers don't prevent
-    the structural tests from running.
-    """
-    # Trigger @flashinfer_api decorators by importing all modules that use them.
-    import flashinfer.decode  # BatchDecodeWithPagedKVCacheWrapper
-    import flashinfer.attention.prims_ts.decode  # PrimTS FMHA decode APIs
-    import flashinfer.attention.prims_ts.mla_decode  # PrimTS MLA decode APIs
-    import flashinfer.fused_moe  # trtllm_fp8_block_scale_moe
-    import flashinfer.gdn_decode  # gated_delta_rule_decode, gated_delta_rule_mtp
-    import flashinfer.gdn_prefill  # chunk_gated_delta_rule
-    import flashinfer.gemm  # mm_bf16, mm_fp8, mm_mxfp8, mm_fp4
-    import flashinfer.kda_decode  # recurrent_kda
-    import flashinfer.mla  # BatchMLAPagedAttentionWrapper
-    import flashinfer.msa_ops  # msa_proxy_score, msa_sparse_attention, decode
-    import flashinfer.norm  # rmsnorm, fused_add_rmsnorm
-    import flashinfer.prefill  # BatchPrefillWithPagedKVCacheWrapper, Ragged
-    import flashinfer.sampling  # noqa: F401  # top_k_sampling_from_probs, etc.
-
-    from flashinfer.api_logging import _TRACE_REGISTRY
-
-    return list(_TRACE_REGISTRY)
+    return collect_registered_trace_templates()
 
 
 _ALL_PAIRS = _collect_template_func_pairs()
@@ -350,6 +358,14 @@ _PAIR_IDS = [label for _, _, label in _ALL_PAIRS]
 
 
 _EXPECTED_PRIMTS_TRACE_VARIANTS = {
+    (
+        "flashinfer.attention.prims_ts.block_sparse",
+        "block_sparse_attention",
+    ): 1,
+    (
+        "flashinfer.attention.prims_ts.block_sparse",
+        "block_sparse_attention_with_paged_kv_cache",
+    ): 2,
     (
         "flashinfer.attention.prims_ts.decode",
         "batch_decode_with_paged_kv_cache",
@@ -395,7 +411,7 @@ def test_template_axes_covered(func, template, label):
 
 
 def test_attention_ts_trace_registry_coverage():
-    """All six public decode surfaces register their complete variant sets."""
+    """All public PrimTS attention surfaces register their complete variants."""
 
     discovered = Counter(
         (func.__module__, func.__qualname__)
@@ -403,13 +419,15 @@ def test_attention_ts_trace_registry_coverage():
         if func.__module__.startswith("flashinfer.attention.prims_ts")
     )
     assert discovered == Counter(_EXPECTED_PRIMTS_TRACE_VARIANTS)
-    assert sum(discovered.values()) == 48
+    assert sum(discovered.values()) == 51
 
 
 def test_attention_ts_trace_constraints_match_cache_axes():
-    """PrimTS cache constraints are valid expressions over defined axes."""
+    """PrimTS constraints are valid expressions over defined axes."""
     from flashinfer.trace.templates.attention import (
         attention_ts_decode_trace_dispatch,
+        prims_ts_block_sparse_trace,
+        prims_ts_paged_block_sparse_trace_dispatch,
         prims_ts_decode_mla_one_shot_trace_dispatch,
         prims_ts_decode_mla_trace_dispatch,
         prims_ts_decode_mla_wrapper_trace_dispatch,
@@ -427,18 +445,15 @@ def test_attention_ts_trace_constraints_match_cache_axes():
         prims_ts_decode_mla_one_shot_trace_dispatch,
         prims_ts_decode_mla_wrapper_trace_dispatch,
     )
+    block_sparse_templates = (
+        prims_ts_block_sparse_trace,
+        *prims_ts_paged_block_sparse_trace_dispatch.templates,
+    )
     for dispatch in (*fmha_dispatches, *mla_dispatches):
         for template in dispatch.templates:
-            for constraint in template.constraints:
-                tree = ast.parse(constraint, mode="eval")
-                referenced_names = {
-                    node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
-                }
-                allowed_names = set(template.axes) | set(template.inputs) | {"max"}
-                assert referenced_names <= allowed_names, (
-                    f"{template.name_prefix}: constraint {constraint!r} references "
-                    f"undeclared names {sorted(referenced_names - allowed_names)}"
-                )
+            assert_template_constraints_valid(template, label=dispatch.__name__)
+    for template in block_sparse_templates:
+        assert_template_constraints_valid(template, label="prims_ts_block_sparse")
 
     for dispatch in fmha_dispatches:
         for template in dispatch.templates:
@@ -456,6 +471,71 @@ def test_attention_ts_trace_constraints_match_cache_axes():
             assert ("kv_pad_dim == 1" in template.constraints) == (
                 "kv_pad_dim" in template.axes
             )
+
+
+def test_prims_ts_block_sparse_trace_describes_gqa_contract():
+    from flashinfer.trace.templates.attention import (
+        prims_ts_block_sparse_trace,
+        prims_ts_paged_block_sparse_trace_dispatch,
+    )
+
+    constraints = set(prims_ts_block_sparse_trace.constraints)
+    assert "num_qo_heads % num_kv_heads == 0" in constraints
+    assert "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)" in constraints
+    assert "num_qo_heads == num_kv_heads" not in constraints
+    assert "q_block_size > 0" in constraints
+    assert "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0" in constraints
+    assert "kv_block_size >= 64 or q_block_size in (8, 16, 32)" not in constraints
+    assert "MHA/GQA/MQA" in prims_ts_block_sparse_trace.description
+    assert "per-KV-head BSR" in prims_ts_block_sparse_trace.description
+
+    paged_templates = {
+        template.name_prefix: template
+        for template in prims_ts_paged_block_sparse_trace_dispatch.templates
+    }
+    tuple_trace = paged_templates["prims_ts_paged_block_sparse_tuple"]
+    combined_trace = paged_templates["prims_ts_paged_block_sparse_combined"]
+    common_inputs = {
+        "q",
+        "paged_kv_indptr",
+        "paged_kv_indices",
+        "seq_len_kv",
+        "seq_lens_kv",
+        "block_indptr",
+        "block_indices",
+        "q_block_size",
+        "kv_block_size",
+        "kv_valid_bits",
+        "mask_type",
+        "sm_scale",
+    }
+    for template in (tuple_trace, combined_trace):
+        assert common_inputs <= template.inputs.keys()
+        assert "paged KV" in template.description
+
+    assert tuple_trace.inputs["k_cache"].param == "paged_kv_cache"
+    assert tuple_trace.inputs["k_cache"].tuple_idx == 0
+    assert tuple_trace.inputs["v_cache"].param == "paged_kv_cache"
+    assert tuple_trace.inputs["v_cache"].tuple_idx == 1
+    assert combined_trace.inputs["paged_kv_cache"].dim_names == [
+        "num_pages",
+        "kv_planes",
+        "num_kv_heads",
+        "page_size",
+        "head_dim",
+    ]
+    assert "kv_planes == 2" in combined_trace.constraints
+
+    tuple_cache = (torch.empty(1), torch.empty(1))
+    combined_cache = torch.empty(1)
+    assert (
+        prims_ts_paged_block_sparse_trace_dispatch(paged_kv_cache=tuple_cache)
+        is tuple_trace
+    )
+    assert (
+        prims_ts_paged_block_sparse_trace_dispatch(paged_kv_cache=combined_cache)
+        is combined_trace
+    )
 
 
 def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
@@ -608,6 +688,9 @@ _E2E_SKIP = {
     "moe_fp4_block_scale_llama4_routing",
     "moe_fp4_block_scale_renormalize_naive_routing",
     "moe_fp4_block_scale_topk_routing",
+    # Shared FP4 requires explicit routed/physical expert geometry and scalar
+    # routing args; covered by test_fi_trace_emits_fp4_shared_expert_definition.
+    "moe_fp4_block_scale_ds_shared_experts",
 }
 
 _E2E_PAIRS = [(f, t, l) for f, t, l in _ALL_PAIRS if l not in _E2E_SKIP]
