@@ -21,6 +21,9 @@ DEPENDENCY_PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DEPENDENCY_VERSION_PATTERN = re.compile(
     r"^(?P<release>[0-9]+(?:\.[0-9]+)*)(?:(?P<phase>a|b|rc)(?P<serial>[0-9]+))?$"
 )
+DEPENDENCY_SPECIFIER_PATTERN = re.compile(
+    r"^(?P<operator>==|>=)(?P<version>[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?)$"
+)
 DEPENDENCY_EXTRA_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 CUDA_MAJOR_PATTERN = re.compile(r"^[0-9]+$")
 
@@ -100,15 +103,14 @@ def _toml_string_arrays(path: Path, section: str) -> dict[str, list[str]]:
 def _dependency_requirement(
     package: str,
     dependency: dict[str, Any],
-    version_field: str,
-    operator: str,
+    specifier_field: str,
     cuda_major: str | None = None,
 ) -> str:
     extras = dependency.get("cuda_major_extras", {}).get(cuda_major, [])
     package_spec = package
     if extras:
         package_spec += f"[{','.join(extras)}]"
-    return f"{package_spec}{operator}{dependency[version_field]}"
+    return f"{package_spec}{dependency[specifier_field]}"
 
 
 def _validate_dependency_policy(
@@ -134,9 +136,9 @@ def _validate_dependency_policy(
         context = f"dependency_policy.{package}"
         dependency = _mapping(raw_dependency, context)
         expected_fields = {
-            "provider_build_minimum",
-            "cuda_extra_minimum",
-            "ci_image_version",
+            "provider_build_specifier",
+            "cuda_extra_specifier",
+            "ci_image_specifier",
             "cuda_major_extras",
         }
         if set(dependency) != expected_fields:
@@ -146,26 +148,35 @@ def _validate_dependency_policy(
             )
 
         versions = {}
-        for field in (
-            "provider_build_minimum",
-            "cuda_extra_minimum",
-            "ci_image_version",
-        ):
-            versions[field] = _string(
-                dependency, field, context, DEPENDENCY_VERSION_PATTERN
+        expected_operators = {
+            "provider_build_specifier": ">=",
+            "cuda_extra_specifier": ">=",
+            "ci_image_specifier": "==",
+        }
+        for field, expected_operator in expected_operators.items():
+            specifier = _string(
+                dependency, field, context, DEPENDENCY_SPECIFIER_PATTERN
             )
-        if _version_key(versions["provider_build_minimum"]) > _version_key(
-            versions["cuda_extra_minimum"]
+            match = DEPENDENCY_SPECIFIER_PATTERN.fullmatch(specifier)
+            assert match is not None
+            if match.group("operator") != expected_operator:
+                raise ConfigError(
+                    f"{context}.{field} must use {expected_operator!r}, "
+                    f"got {specifier!r}"
+                )
+            versions[field] = match.group("version")
+        if _version_key(versions["provider_build_specifier"]) > _version_key(
+            versions["cuda_extra_specifier"]
         ):
             raise ConfigError(
-                f"{context}.provider_build_minimum must not exceed "
-                f"{context}.cuda_extra_minimum"
+                f"{context}.provider_build_specifier must not exceed "
+                f"{context}.cuda_extra_specifier"
             )
-        if _version_key(versions["ci_image_version"]) < _version_key(
-            versions["cuda_extra_minimum"]
+        if _version_key(versions["ci_image_specifier"]) < _version_key(
+            versions["cuda_extra_specifier"]
         ):
             raise ConfigError(
-                f"{context}.ci_image_version must satisfy the CUDA-extra minimum"
+                f"{context}.ci_image_specifier must satisfy the CUDA-extra specifier"
             )
 
         extras_by_major = _mapping(
@@ -186,7 +197,7 @@ def _validate_dependency_policy(
                 )
 
         base_requirement = _dependency_requirement(
-            package, dependency, "provider_build_minimum", ">="
+            package, dependency, "provider_build_specifier"
         )
         if base_requirement not in requirements:
             raise ConfigError(
@@ -199,8 +210,7 @@ def _validate_dependency_policy(
             cuda_requirement = _dependency_requirement(
                 package,
                 dependency,
-                "cuda_extra_minimum",
-                ">=",
+                "cuda_extra_specifier",
                 cuda_major,
             )
             if cuda_requirement not in optional_dependencies.get(extra_name, []):

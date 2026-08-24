@@ -25,10 +25,10 @@ from typing import Optional
 
 CI_CONFIG_FILE = Path(__file__).parent / "ci" / "cuda-versions.json"
 
-_DEPENDENCY_SCOPES = {
-    "provider_build": (">=", "provider_build_minimum"),
-    "cuda_extra": (">=", "cuda_extra_minimum"),
-    "ci_image": ("==", "ci_image_version"),
+_DEPENDENCY_SCOPE_FIELDS = {
+    "provider_build": "provider_build_specifier",
+    "cuda_extra": "cuda_extra_specifier",
+    "ci_image": "ci_image_specifier",
 }
 
 
@@ -38,7 +38,7 @@ def get_dependency_requirements(
 ) -> list[str]:
     """Return dependency requirements for a configured installation scope."""
     try:
-        operator, version_field = _DEPENDENCY_SCOPES[scope]
+        specifier_field = _DEPENDENCY_SCOPE_FIELDS[scope]
     except KeyError as error:
         raise ValueError(f"unknown dependency scope: {scope}") from error
 
@@ -54,7 +54,7 @@ def get_dependency_requirements(
         package_spec = package
         if extras:
             package_spec += f"[{','.join(extras)}]"
-        requirements.append(f"{package_spec}{operator}{dependency[version_field]}")
+        requirements.append(f"{package_spec}{dependency[specifier_field]}")
     return requirements
 
 

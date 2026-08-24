@@ -121,7 +121,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (KeyError, OSError, json.JSONDecodeError) as error:
         _fail(f"could not read CI dependency policy: {error}")
     for distribution, policy in dependency_policy.items():
-        expected_version = policy["ci_image_version"]
+        specifier = policy["ci_image_specifier"]
+        if not isinstance(specifier, str) or not specifier.startswith("=="):
+            _fail(f"{distribution} CI image specifier is not exact: {specifier!r}")
+        expected_version = specifier.removeprefix("==")
         actual_version = importlib.metadata.version(distribution)
         if actual_version != expected_version:
             _fail(f"{distribution} is {actual_version}; expected {expected_version}")
