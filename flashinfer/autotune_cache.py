@@ -50,11 +50,13 @@ from .jit.core import logger
 
 # Bump the schema directory (v2 -> v3) on any incompatible change to the
 # directory layout or entry format; do not add per-entry format versions.
-# v3: entries additionally carry a structural, round-trippable "key_fields"
-# so a store can be preloaded into memory.  Per this module's rule the schema
-# directory is bumped rather than versioning individual entries; existing v2
-# directories are left untouched and simply re-tuned into v3.
-_SCHEMA = "v3"
+# Entries additionally carry a structural, round-trippable "key_fields" so a
+# store can be preloaded into memory.  That is additive and compatible in both
+# directions -- an entry without the field is still served by lookup() and is
+# simply skipped by preload(), and a reader that predates the field ignores it
+# -- so by the rule above it does not warrant a bump, and existing stores keep
+# working rather than being silently orphaned.
+_SCHEMA = "v2"
 
 # Sentinel for "this value has no round-trippable encoding" (distinct from a
 # legitimately-stored None).
@@ -354,47 +356,6 @@ class ManagedAutotuneCache:
                 f"{file_key} under {self.entries_dir}: {e}. Tuning result "
                 f"remains available in memory for this process."
             )
-
-    def preload(self) -> Tuple[list, int, int]:
-        """Read every entry once, returning what can be served from memory.
-
-        Returns ``(triples, n_total, n_skipped)`` where each triple is
-        ``(key_fields_tuple, runner_name, json_tactic)``.  Entries written
-        before the ``key_fields`` field existed, or whose extras have no
-        round-trippable encoding, are counted in *n_skipped* and left to the
-        normal lazy path -- preloading is an optimisation, never a
-        prerequisite.
-
-        Every failure mode (missing dir, unreadable or malformed file) yields
-        fewer preloaded entries, never an exception: the cache must not be able
-        to break correctness.
-        """
-        triples: list = []
-        total = skipped = 0
-        try:
-            paths = sorted(self.entries_dir.glob("*.json"))
-        except Exception:
-            return triples, 0, 0
-        for path in paths:
-            total += 1
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    entry = json.load(f)
-                raw = entry.get("key_fields")
-                if raw is None:
-                    skipped += 1
-                    continue
-                fields = _decode_key_fields(raw)
-                if fields is None or not isinstance(fields, tuple):
-                    skipped += 1
-                    continue
-                triples.append((fields, entry["runner"], entry["tactic"]))
-                # Warm the string-keyed memo too, so a lookup that does build a
-                # file_key (cold-miss path, load_from_file) also avoids the read.
-                self._hits[entry["key"]] = (entry["runner"], entry["tactic"])
-            except Exception:
-                skipped += 1
-        return triples, total, skipped
 
     def preload(self) -> Tuple[list, int, int]:
         """Read every entry once, returning what can be served from memory.
