@@ -351,7 +351,11 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1(const __grid_constant__ CUte
                     int source_chunk_end_cg0 = (source_block_end_cg0 + source_cp_chunk_len - 1) / source_cp_chunk_len * source_cp_chunk_len;
                     int source_final_block_cg0 = ((source_block_end_cg0 == source_chunk_end_cg0 || source_block_end_cg0 >= (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) ? 1 : 0);
                     {
-                        source_final_block_cg0 = 0;
+                        {
+                            if (source_cp_chunk_len == 384) {
+                                source_final_block_cg0 = 0;
+                            }
+                        }
                     }
                     mbarrier_wait(load_gate_full_addr + (gate_stage_cg0) * 8, gate_phase_cg0);
                     mbarrier_wait(load_t_full_addr + (t_stage_cg0) * 8, t_phase_cg0);
@@ -642,7 +646,11 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1(const __grid_constant__ CUte
                     int source_chunk_end_cg1 = (source_block_end_cg1 + source_cp_chunk_len - 1) / source_cp_chunk_len * source_cp_chunk_len;
                     int source_final_block_cg1 = ((valid_tokens_cg1 == 64 && (source_block_end_cg1 == source_chunk_end_cg1 || source_block_end_cg1 >= (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y])) ? 1 : 0);
                     {
-                        source_final_block_cg1 = 0;
+                        {
+                            if (source_cp_chunk_len == 384) {
+                                source_final_block_cg1 = 0;
+                            }
+                        }
                     }
                     int source_final_vks_block_cg1 = source_final_block_cg1;
                     int source_final_qs_block_cg1 = source_final_block_cg1;
