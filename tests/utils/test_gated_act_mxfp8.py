@@ -43,14 +43,18 @@ FROZEN_LAUNCHER_SOURCES = (
 )
 
 
-def test_frozen_launcher_sources_use_cuda_tensor_map_definition() -> None:
+def test_frozen_launcher_sources_use_cuda_type_definitions() -> None:
     source_dir = Path(__file__).resolve().parents[2] / "csrc" / "gated_act_mxfp8"
     tensor_map_typedef = re.compile(r"\btypedef\b[^;]*\bCUtensorMap\s*;", re.DOTALL)
+    uint64_typedef = re.compile(r"\btypedef\b[^;]*\buint64_t\s*;", re.DOTALL)
 
     for source_name in FROZEN_LAUNCHER_SOURCES:
         source = (source_dir / source_name).read_text()
         assert tensor_map_typedef.search(source) is None, (
             f"{source_name} must use CUtensorMap from <cuda.h>"
+        )
+        assert uint64_typedef.search(source) is None, (
+            f"{source_name} must use uint64_t from platform headers"
         )
 
 
