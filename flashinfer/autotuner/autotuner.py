@@ -1935,15 +1935,19 @@ class AutoTuner:
                         )
                     # Promote into the in-process winner cache so the next
                     # lookup for this key exits at source 1 (one dict hit)
-                    # instead of re-traversing source 1 and re-probing the
-                    # store.  Safe: `winners` is the partition for THIS
-                    # store's (root, env_hash) identity, so the entry can
-                    # never be served under a different store or measurement
-                    # policy, and it is never `profiling_cache`, so v1
-                    # save_configs still cannot observe v2 entries.  The
-                    # `None` profile matches what this source already
-                    # returns, and source 1 re-runs `_tactic_still_valid`,
-                    # so revalidation is unchanged.
+                    # instead of re-sweeping every runner here and then
+                    # re-consulting the managed-store memo.  This is not about
+                    # I/O: the memo above already keeps the hot path off the
+                    # filesystem, as the design doc states.  What is removed is
+                    # the redundant per-runner key construction.
+                    #
+                    # Safe: `winners` is the partition for THIS store's
+                    # (root, env_hash) identity, so the entry can never be
+                    # served under a different store or measurement policy, and
+                    # it is never `profiling_cache`, so v1 save_configs still
+                    # cannot observe v2 entries.  The `None` profile matches
+                    # what this source already returns, and source 1 re-runs
+                    # `_tactic_still_valid`, so revalidation is unchanged.
                     winners[cache_key] = (tactic, None)
                     return True, r_id, tactic, None
 
