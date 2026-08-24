@@ -748,11 +748,10 @@ def _requires_exact_n16_recurrence(
     num_heads: int,
     uniform_sequences: bool,
 ) -> bool:
-    """Retain the SM100 N16 accuracy fallback for the 148-SM H96/N128 row."""
+    """Retain the N16 accuracy fallback for the 148-SM H96/N128 row."""
 
     return (
-        compute_capability == (10, 0)
-        and sm_count == 148
+        sm_count == 148
         and not fixed_layout
         and num_sequences == 128
         and num_heads == 96

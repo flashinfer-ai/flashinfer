@@ -1413,7 +1413,7 @@ def test_bt16_combined_adapter_reuses_both_descriptor_sets(monkeypatch):
     assert second_args[21:23] == (0, 0)
 
 
-def test_h96_uniform_n128_keeps_n16_only_on_sm100_148_sm():
+def test_h96_uniform_n128_keeps_n16_on_148_sm():
     for compute_capability in ((10, 0), (10, 3)):
         for sm_count in (148, 152):
             assert kda_prefill_api._requires_exact_n16_recurrence(
@@ -1423,7 +1423,7 @@ def test_h96_uniform_n128_keeps_n16_only_on_sm100_148_sm():
                 num_sequences=128,
                 num_heads=96,
                 uniform_sequences=True,
-            ) is (compute_capability == (10, 0) and sm_count == 148)
+            ) is (sm_count == 148)
 
 
 class _RecorderModule:
