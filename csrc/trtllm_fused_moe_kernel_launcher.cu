@@ -1137,6 +1137,15 @@ class FusedMoeLauncher {
       TVM_FFI_ICHECK_EQ(routing_logits.value().size(1), args->num_experts)
           << "routing_logits dim1 must match num_experts.";
 
+      // The routing kernels index score rows with a row stride, so a strided
+      // (e.g. sliced) logits tensor is fine, but each row must be contiguous
+      // and rows must not overlap.
+      TVM_FFI_ICHECK_EQ(routing_logits.value().stride(1), 1)
+          << "routing_logits must be contiguous along the expert dimension.";
+      TVM_FFI_ICHECK(routing_logits.value().size(0) == 1 ||
+                     routing_logits.value().stride(0) >= args->num_experts)
+          << "routing_logits rows must not overlap: stride(0) must be >= num_experts.";
+
       // Check dtype
       TVM_FFI_ICHECK(routing_logits.value().dtype() == dl_float32 ||
                      routing_logits.value().dtype() == dl_bfloat16)
@@ -1516,7 +1525,7 @@ class FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob, replay_ptr, enable_pdl);
+        norm_topk_prob, replay_ptr, enable_pdl, args->routing_logits_stride);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -1557,6 +1566,7 @@ void FusedMoeLauncher::init_common(
   this->device_version = std::make_tuple(major, minor);
 
   args->routing_logits = routing_logits.has_value() ? routing_logits.value().data_ptr() : nullptr;
+  args->routing_logits_stride = routing_logits.has_value() ? routing_logits.value().stride(0) : 0;
   args->routing_bias = routing_bias.has_value() ? routing_bias.value().data_ptr() : nullptr;
   args->hidden_states = hidden_states.data_ptr();
   args->gemm1_weights = gemm1_weights.data_ptr();
@@ -2612,7 +2622,7 @@ class Fp8BlockScaleLauncher : public FusedMoeLauncher {
         static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
         use_routing_scales_on_input, use_deep_seek_fp8,
         static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
-        norm_topk_prob, replay_ptr, enable_pdl);
+        norm_topk_prob, replay_ptr, enable_pdl, args->routing_logits_stride);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -3288,23 +3298,23 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       replay_ptr = reinterpret_cast<int16_t*>(routing_replay_out.value().data_ptr());
     }
 
-    routing_runner.run(args->routing_logits, args->routing_bias, args->num_tokens,
-                       args->num_experts, args->top_k, args->num_fused_shared_experts,
-                       args->n_group, args->topk_group, args->local_expert_offset,
-                       args->local_num_experts, args->routed_scaling_factor,
-                       static_cast<int*>(topk_ids.data_ptr()),
-                       static_cast<int*>(expert_count_histogram.data_ptr()),
-                       static_cast<int*>(total_num_padded_tokens.data_ptr()),
-                       static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
-                       static_cast<int*>(permuted_idx_to_expanded_idx_ptr()),
-                       static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
-                       expert_weights_param, static_cast<int*>(num_tokens_per_expert.data_ptr()),
-                       static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
-                       static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
-                       static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt,
-                       mRoutingBiasDtype, use_routing_scales_on_input, use_deep_seek_fp8,
-                       static_cast<RoutingMethodType>(routing_method_type), routing_stream,
-                       mRoutingLogitsDtype, norm_topk_prob, replay_ptr, enable_pdl);
+    routing_runner.run(
+        args->routing_logits, args->routing_bias, args->num_tokens, args->num_experts, args->top_k,
+        args->num_fused_shared_experts, args->n_group, args->topk_group, args->local_expert_offset,
+        args->local_num_experts, args->routed_scaling_factor,
+        static_cast<int*>(topk_ids.data_ptr()),
+        static_cast<int*>(expert_count_histogram.data_ptr()),
+        static_cast<int*>(total_num_padded_tokens.data_ptr()),
+        static_cast<int*>(expanded_idx_to_permuted_idx.data_ptr()),
+        static_cast<int*>(permuted_idx_to_expanded_idx_ptr()),
+        static_cast<int*>(permuted_idx_to_token_idx.data_ptr()), expert_ids_param,
+        expert_weights_param, static_cast<int*>(num_tokens_per_expert.data_ptr()),
+        static_cast<int*>(cta_idx_xy_to_batch_idx.data_ptr()),
+        static_cast<int*>(cta_idx_xy_to_mn_limit.data_ptr()),
+        static_cast<int*>(num_non_exiting_ctas.data_ptr()), args->mDtypeElt, mRoutingBiasDtype,
+        use_routing_scales_on_input, use_deep_seek_fp8,
+        static_cast<RoutingMethodType>(routing_method_type), routing_stream, mRoutingLogitsDtype,
+        norm_topk_prob, replay_ptr, enable_pdl, args->routing_logits_stride);
 
     check_moe();
     prepare_moe(moe_tactic);
@@ -4364,6 +4374,12 @@ void trtllm_moe_canonicalize_routing(
       << "hidden_states and routing_logits must have the same token count.";
   TVM_FFI_ICHECK(local_num_experts > 0 && local_expert_offset + local_num_experts <= num_experts)
       << "the local expert range must lie within routing_logits.";
+  // Strided (e.g. sliced) logits are supported, but each row must be contiguous
+  // and rows must not overlap.
+  TVM_FFI_ICHECK_EQ(routing_logits.stride(1), 1)
+      << "routing_logits must be contiguous along the expert dimension.";
+  TVM_FFI_ICHECK(num_tokens == 1 || routing_logits.stride(0) >= num_experts)
+      << "routing_logits rows must not overlap: stride(0) must be >= num_experts.";
 
   btg::Dtype dtype_elt;
   if (hidden_states.dtype() == dl_float16) {
@@ -4402,7 +4418,8 @@ void trtllm_moe_canonicalize_routing(
       static_cast<int*>(buffers.num_non_exiting_ctas.data_ptr()), dtype_elt, routing_bias_dtype,
       use_routing_scales_on_input, use_deep_seek_fp8,
       static_cast<RoutingMethodType>(routing_method_type), stream, routing_logits_dtype,
-      norm_topk_prob, static_cast<int16_t*>(buffers.routing_replay_ids.data_ptr()), enable_pdl);
+      norm_topk_prob, static_cast<int16_t*>(buffers.routing_replay_ids.data_ptr()), enable_pdl,
+      routing_logits.stride(0));
 }
 
 /// Allocate graph-stable routing metadata storage for each requested tile without launching work.

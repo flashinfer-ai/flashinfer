@@ -112,7 +112,7 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     // for each token, we load the scores then use `reduceTopK` for this.
     // each thread works on 4 experts, so a local reduction is done before
     for (int tokenIdx = 0; tokenIdx < params.mNumTokens; ++tokenIdx) {
-      auto scoreOffset = tokenIdx * params.mNumExperts;
+      int64_t const scoreOffset = int64_t{tokenIdx} * params.mStrideScores;
       int32_t warpMaxExpertIdx[MaxNumTopExperts];
       InputT warpMaxScore[MaxNumTopExperts];
 
@@ -342,7 +342,7 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
 
   // TODO(mjoux): expand to more tokens (possibly)
   auto warpTokenIdx = clusterBlockRank * NumWarps + warpIdx;
-  auto scoreOffset = warpTokenIdx * params.mNumExperts;
+  int64_t const scoreOffset = int64_t{warpTokenIdx} * params.mStrideScores;
   bool validToken = warpTokenIdx < params.mNumTokens;
   InputT minScore = InputT{-INFINITY};
 
@@ -446,7 +446,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts)
   // in this case, each warp represents a token, and we use a grid-stride loop
   // over all warps/tokens
   for (int tokenIdx = globalWarpIdx; tokenIdx < params.mNumTokens; tokenIdx += globalWarpStride) {
-    auto scoreOffset = tokenIdx * params.mNumExperts;
+    int64_t const scoreOffset = int64_t{tokenIdx} * params.mStrideScores;
     int32_t warpMaxExpertIdx[MaxNumTopExperts];
     InputT warpMaxScore[MaxNumTopExperts];
 

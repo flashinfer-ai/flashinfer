@@ -61,7 +61,8 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
                  int32_t* numNonExitingCtas, btg::Dtype dtypeElt, btg::Dtype dtypeBias,
                  bool useRoutingScalesOnInput, bool useDeepSeekFp8,
                  RoutingMethodType routingMethodType, cudaStream_t stream, btg::Dtype dtypeLogits,
-                 bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl) {
+                 bool normTopkProb, int16_t* routing_replay_out, bool enable_pdl,
+                 int64_t routingLogitsStride) {
   if (routingMethodType == RoutingMethodType::DeepSeekV3 && nGroup <= 1) {
     // Only the grouped DeepSeek kernel below populates the fused shared-expert
     // slots; routingCustom leaves them untouched, so reject rather than return
@@ -89,6 +90,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mSumEpsilon = 1e-20f;
 
     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+    routingData.mStrideScores = routingLogitsStride;
     routingData.mPtrTopKIds = expertIds;
     routingData.mPtrTopKPacked = routingExpertIndexes;
     routingData.mPtrExpertCounts = expertCountHistogram;
@@ -132,6 +134,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mSumEpsilon = 1e-20f;
 
     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+    routingData.mStrideScores = routingLogitsStride;
     routingData.mPtrTopKIds = expertIds;
     routingData.mPtrTopKPacked = routingExpertIndexes;
     routingData.mPtrExpertCounts = expertCountHistogram;
@@ -185,6 +188,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     routingData.mPtrRoutingBias = routingBias;
     // Pre-computed routing support: when expertIds is provided, use it directly
     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+    routingData.mStrideScores = routingLogitsStride;
     routingData.mPtrTopKIds = expertIds;
     routingData.mNumTokens = numTokens;
     routingData.mNumExperts = numExperts;
@@ -245,6 +249,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
     // input:
     // Pre-computed routing support: when expertIds is provided, use it directly
     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+    routingData.mStrideScores = routingLogitsStride;
     routingData.mPtrTopKIds = expertIds;
     routingData.mNumTokens = numTokens;
     routingData.mNumExperts = numExperts;
@@ -314,6 +319,7 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
     // Pre-computed routing support: when expertIds is provided, use it directly
     routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+    routingData.mStrideScores = routingLogitsStride;
     routingData.mPtrTopKIds = expertIds;
 
     //

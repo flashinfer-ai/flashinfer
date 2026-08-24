@@ -150,7 +150,8 @@ class Runner {
            batchedGemm::trtllm::gen::Dtype dtypeBias, bool useRoutingScalesOnInput,
            bool useDeepSeekFp8, RoutingMethodType routingMethodType, cudaStream_t stream,
            batchedGemm::trtllm::gen::Dtype dtypeLogits, bool normTopkProb = true,
-           int16_t* routing_replay_out = nullptr, bool enable_pdl = true);
+           int16_t* routing_replay_out = nullptr, bool enable_pdl = true,
+           int64_t routingLogitsStride = 0);
 
  private:
   friend class MoE::Runner;
@@ -308,8 +309,12 @@ namespace btg = batchedGemm::trtllm::gen;
 struct MoERunnerArgs {
   void* routing_logits = nullptr;  // [num_tokens, num_experts] in float, generated after
                                    // gemm(hidden_state, routing_weights)
-  void* routing_bias = nullptr;    // [num_experts] in bfloat16 for now = mDtypeExpW
-  void* hidden_states = nullptr;   // [num_tokens, hidden_size] in fp8 = mDtypeElt
+  // Row stride of routing_logits in elements; 0 means tightly packed
+  // (== num_experts), otherwise >= num_experts. Rows themselves must be
+  // contiguous. See DataBase::mStrideScores in RoutingKernel.h.
+  int64_t routing_logits_stride = 0;
+  void* routing_bias = nullptr;   // [num_experts] in bfloat16 for now = mDtypeExpW
+  void* hidden_states = nullptr;  // [num_tokens, hidden_size] in fp8 = mDtypeElt
   // [hidden_size/128, num_tokens] in float for e4m3 DS recipe
   // and [num_tokens, hidden_size/16] in float for e2m1
   void* hidden_states_scale = nullptr;

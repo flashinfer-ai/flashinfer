@@ -116,6 +116,20 @@ def _check_trtllm_gen_routing_supported(
             f"routing_logits must be float32 or bfloat16, got {routing_logits.dtype}"
         )
     num_experts = routing_logits.shape[1]
+    # The kernels read score rows with a row stride, so the token dimension may
+    # be strided; each row still has to be contiguous.
+    if routing_logits.stride(1) != 1:
+        raise ValueError(
+            "routing_logits must be contiguous along the expert dimension "
+            f"(stride(1) == 1), got strides {routing_logits.stride()}"
+        )
+    if routing_logits.shape[0] > 1 and routing_logits.stride(0) < num_experts:
+        # A zero row stride is the kernels' "tightly packed" sentinel, so
+        # overlapping rows cannot be expressed unambiguously.
+        raise ValueError(
+            "routing_logits rows must not overlap: stride(0) must be >= "
+            f"num_experts ({num_experts}), got strides {routing_logits.stride()}"
+        )
     if not 1 <= top_k <= num_experts:
         raise ValueError(f"top_k must be in [1, num_experts], got {top_k}")
     if routing_bias is not None and routing_bias.numel() != num_experts:
@@ -232,7 +246,10 @@ def trtllm_gen_routing(
     ----------
     routing_logits : torch.Tensor
         Router logits of shape ``(num_tokens, num_experts)``, ``float32`` or
-        ``bfloat16``.
+        ``bfloat16``. Need not be contiguous: the token dimension may be
+        strided (e.g. a slice of a wider router-output buffer), as long as each
+        row is contiguous (``stride(1) == 1``) and rows do not overlap
+        (``stride(0) >= num_experts``).
     routing_bias : Optional[torch.Tensor]
         Per-expert routing bias of shape ``(num_experts,)``, ``float32`` or
         ``bfloat16`` (used by DeepSeekV3/MiniMax2-style methods).

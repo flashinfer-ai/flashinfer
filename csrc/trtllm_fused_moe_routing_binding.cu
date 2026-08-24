@@ -36,6 +36,10 @@ using tvm::ffi::TensorView;
  * see flashinfer/fused_moe/trtllm_gen_routing.py for the expected shapes.
  *
  *   routing_logits              : [num_tokens, num_experts] float32 or bfloat16
+ *                                 rows must be contiguous and non-overlapping,
+ *                                 but the token dimension may be strided (a
+ *                                 view into a wider router-output buffer is
+ *                                 fine)
  *   routing_bias                : [num_experts] float32 or bfloat16 (optional)
  *   topk_packed                 : [num_tokens, top_k + num_fused_shared_experts] int32 (scratch)
  *                                 PackedScoreIdx pipeline scratch, layout (score << 16) | idx;
@@ -64,13 +68,18 @@ void trtllm_gen_routing(TensorView routing_logits, Optional<TensorView> routing_
                         int64_t topk_group, int64_t local_expert_offset, int64_t local_num_experts,
                         double routed_scaling_factor, int64_t tile_tokens_dim,
                         int64_t routing_method_type, bool norm_topk_prob, bool enable_pdl) {
-  CHECK_INPUT(routing_logits);
+  // The routing kernels index score rows with a row stride, so only the expert
+  // dimension has to be contiguous; the token dimension may be strided.
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(routing_logits);
   CHECK_DIM(2, routing_logits);
   TVM_FFI_ICHECK(routing_logits.dtype() == dl_float32 || routing_logits.dtype() == dl_bfloat16)
       << "routing_logits must be float32 or bfloat16";
 
   int64_t const num_tokens = routing_logits.sizes()[0];
   int64_t const num_experts = routing_logits.sizes()[1];
+  TVM_FFI_ICHECK(num_tokens == 1 || routing_logits.stride(0) >= num_experts)
+      << "routing_logits rows must not overlap: stride(0) must be >= num_experts, got "
+      << routing_logits.stride(0) << " for num_experts=" << num_experts;
   int64_t const total_experts_per_token = top_k + num_fused_shared_experts;
   int64_t const total_num_experts = num_experts + num_fused_shared_experts;
 
@@ -185,7 +194,8 @@ void trtllm_gen_routing(TensorView routing_logits, Optional<TensorView> routing_
       /*dtypeElt=*/btg::Dtype::Bfloat16, dtype_bias,
       /*useRoutingScalesOnInput=*/false, /*useDeepSeekFp8=*/false,
       static_cast<RoutingMethodType>(routing_method_type), stream, dtype_logits, norm_topk_prob,
-      /*routing_replay_out=*/nullptr, enable_pdl);
+      /*routing_replay_out=*/nullptr, enable_pdl,
+      /*routingLogitsStride=*/routing_logits.stride(0));
 }
 
 }  // namespace flashinfer::trtllm_gen_routing

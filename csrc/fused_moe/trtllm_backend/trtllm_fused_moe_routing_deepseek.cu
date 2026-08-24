@@ -155,7 +155,7 @@ __global__ void routingMainKernel(KernelParams params) {
     // to false is enough to keep them from doing any out-of-bounds reads or smem writes.
     expertSelected = (warpIdx < params.mNumExpertGroups) && (laneIdx < params.mNumExpertsPerGroup);
   }
-  auto scoreIdx = int64_t{blockIdx.x} * int64_t{params.mNumExperts} + threadExpert;
+  auto scoreIdx = int64_t{blockIdx.x} * params.mStrideScores + threadExpert;
   auto biasVal = (expertSelected && params.mPtrRoutingBias != nullptr)
                      ? static_cast<OutputT>(
                            loadScalar(params.mPtrRoutingBias, threadExpert, params.mDtypeBias))
