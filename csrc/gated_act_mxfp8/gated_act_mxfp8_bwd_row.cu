@@ -7,8 +7,6 @@ typedef signed int         int32_t;
 typedef short int          int16_t;
 struct __align__(128) LoomTensorMap { uint64_t opaque[16]; };
 
-typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
-
 #include <cuda_bf16.h>
 
 __device__ __forceinline__ int make_warp_uniform(int x) {

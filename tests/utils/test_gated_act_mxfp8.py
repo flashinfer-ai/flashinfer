@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import re
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -31,6 +34,24 @@ MODES = (
     ("backward", False, True),
     ("backward", True, True),
 )
+
+FROZEN_LAUNCHER_SOURCES = (
+    "gated_act_mxfp8_fwd_row_noalloc.cu",
+    "gated_act_mxfp8_fwd_both_noalloc.cu",
+    "gated_act_mxfp8_bwd_row.cu",
+    "gated_act_mxfp8_bwd_row_sm103.cu",
+)
+
+
+def test_frozen_launcher_sources_use_cuda_tensor_map_definition() -> None:
+    source_dir = Path(__file__).resolve().parents[2] / "csrc" / "gated_act_mxfp8"
+    tensor_map_typedef = re.compile(r"\btypedef\b[^;]*\bCUtensorMap\s*;", re.DOTALL)
+
+    for source_name in FROZEN_LAUNCHER_SOURCES:
+        source = (source_dir / source_name).read_text()
+        assert tensor_map_typedef.search(source) is None, (
+            f"{source_name} must use CUtensorMap from <cuda.h>"
+        )
 
 
 def _supported() -> bool:
