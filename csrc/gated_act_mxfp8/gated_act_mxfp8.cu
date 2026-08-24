@@ -26,8 +26,7 @@ namespace flashinfer::gated_act_mxfp8 {
 namespace {
 
 void CheckCuda(cudaError_t status, const char* operation) {
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << operation << " failed: " << cudaGetErrorString(status);
+  TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
 }
 
 void CheckArchitecture(int device_id) {
@@ -55,13 +54,11 @@ void CheckEmpty(const TensorView& tensor, const TensorView& input, const char* n
 void CheckQData(const TensorView& tensor, const TensorView& input, int64_t m, int64_t n,
                 bool row_major, const char* name) {
   CheckDevice(tensor, input, name);
-  TVM_FFI_ICHECK(tensor.dtype() == dl_float8_e4m3fn)
-      << name << " must have float8_e4m3fn dtype";
+  TVM_FFI_ICHECK(tensor.dtype() == dl_float8_e4m3fn) << name << " must have float8_e4m3fn dtype";
   TVM_FFI_ICHECK(tensor.ndim() == 2 && tensor.size(0) == m && tensor.size(1) == n)
       << name << " has an invalid shape";
   if (row_major) {
-    TVM_FFI_ICHECK(tensor.stride(0) == n && tensor.stride(1) == 1)
-        << name << " must be row-major";
+    TVM_FFI_ICHECK(tensor.stride(0) == n && tensor.stride(1) == 1) << name << " must be row-major";
   } else {
     TVM_FFI_ICHECK(tensor.stride(0) == 1 && tensor.stride(1) == m)
         << name << " must be column-major";
@@ -103,9 +100,9 @@ void CheckCommon(const TensorView& gated_input, const TensorView* grad_output, i
   }
 }
 
-CUtensorMap MakeTensorMap(void* base, CUtensorMapDataType data_type, uint64_t inner,
-                          uint64_t outer, uint64_t row_stride_bytes, uint32_t box_inner,
-                          uint32_t box_outer, const char* name) {
+CUtensorMap MakeTensorMap(void* base, CUtensorMapDataType data_type, uint64_t inner, uint64_t outer,
+                          uint64_t row_stride_bytes, uint32_t box_inner, uint32_t box_outer,
+                          const char* name) {
   CUtensorMap descriptor{};
   constexpr uint32_t kRank = 2;
   uint64_t global_dim[kRank] = {inner, outer};
@@ -113,25 +110,23 @@ CUtensorMap MakeTensorMap(void* base, CUtensorMapDataType data_type, uint64_t in
   uint32_t box_dim[kRank] = {box_inner, box_outer};
   uint32_t element_strides[kRank] = {1, 1};
   const CUresult result = cuTensorMapEncodeTiled(
-      &descriptor, data_type, kRank, base, global_dim, global_strides, box_dim,
-      element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE,
-      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      &descriptor, data_type, kRank, base, global_dim, global_strides, box_dim, element_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_ICHECK(result == CUDA_SUCCESS)
-      << "cuTensorMapEncodeTiled failed for " << name << ": CUresult="
-      << static_cast<int>(result);
+      << "cuTensorMapEncodeTiled failed for " << name << ": CUresult=" << static_cast<int>(result);
   return descriptor;
 }
 
-CUtensorMap MakeInputMap(void* base, int64_t m, int64_t k, int64_t row_elements,
-                         const char* name) {
+CUtensorMap MakeInputMap(void* base, int64_t m, int64_t k, int64_t row_elements, const char* name) {
   return MakeTensorMap(base, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, k, m,
                        row_elements * sizeof(__nv_bfloat16), 64, 32, name);
 }
 
 CUtensorMap MakeRowOutputMap(void* base, int64_t m, int64_t width, int64_t row_elements,
                              uint32_t box_width, const char* name) {
-  return MakeTensorMap(base, CU_TENSOR_MAP_DATA_TYPE_UINT8, width, m, row_elements, box_width,
-                       32, name);
+  return MakeTensorMap(base, CU_TENSOR_MAP_DATA_TYPE_UINT8, width, m, row_elements, box_width, 32,
+                       name);
 }
 
 CUtensorMap MakeColOutputMap(void* base, int64_t m, int64_t width, const char* name) {
@@ -191,8 +186,8 @@ void Forward(TensorView gated_input, TensorView row_output, TensorView col_outpu
 }
 
 void Backward(TensorView gated_input, TensorView grad_output, TensorView row_output,
-              TensorView col_output, TensorView row_scales, TensorView col_scales,
-              bool rowwise, bool colwise) {
+              TensorView col_output, TensorView row_scales, TensorView col_scales, bool rowwise,
+              bool colwise) {
   TVM_FFI_ICHECK(rowwise || colwise) << "at least one quantization route must be enabled";
   int64_t m = 0;
   int64_t k = 0;
@@ -233,10 +228,9 @@ void Backward(TensorView gated_input, TensorView grad_output, TensorView row_out
     const CUtensorMap row_gate =
         MakeRowOutputMap(row_q + k, m, k, output_k, 64, "row gate gradient");
     const CUtensorMap col_act = MakeColOutputMap(col_q, m, k, "col activation gradient");
-    const CUtensorMap col_gate =
-        MakeColOutputMap(col_q + k * m, m, k, "col gate gradient");
-    status = LaunchBackwardBoth(input, grad, row_act, row_gate, col_act, col_gate, row_sf,
-                                col_sf, m32, k32, stream);
+    const CUtensorMap col_gate = MakeColOutputMap(col_q + k * m, m, k, "col gate gradient");
+    status = LaunchBackwardBoth(input, grad, row_act, row_gate, col_act, col_gate, row_sf, col_sf,
+                                m32, k32, stream);
   } else if (rowwise) {
     const CUtensorMap row_act =
         MakeRowOutputMap(row_q, m, k, output_k, 64, "row activation gradient");
@@ -248,10 +242,9 @@ void Backward(TensorView gated_input, TensorView grad_output, TensorView row_out
     const CUtensorMap up_map = MakeInputMap(input + k, m, k, output_k, "up input");
     const CUtensorMap grad_map = MakeInputMap(grad, m, k, k, "output gradient");
     const CUtensorMap col_act = MakeColOutputMap(col_q, m, k, "col activation gradient");
-    const CUtensorMap col_gate =
-        MakeColOutputMap(col_q + k * m, m, k, "col gate gradient");
-    status = LaunchBackwardCol(gate_map, up_map, grad_map, col_act, col_gate, col_sf, m32,
-                               k32, stream);
+    const CUtensorMap col_gate = MakeColOutputMap(col_q + k * m, m, k, "col gate gradient");
+    status =
+        LaunchBackwardCol(gate_map, up_map, grad_map, col_act, col_gate, col_sf, m32, k32, stream);
   }
   CheckCuda(status, "launching fused gated MXFP8 backward");
 }

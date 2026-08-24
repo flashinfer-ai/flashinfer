@@ -21,9 +21,9 @@
 
 namespace flashinfer::gated_act_mxfp8 {
 
-cudaError_t LaunchBackwardRow(__nv_bfloat16* input, __nv_bfloat16* grad,
-                              CUtensorMap row_act, CUtensorMap row_gate, uint8_t* row_scales,
-                              int m, int k, cudaStream_t stream) {
+cudaError_t LaunchBackwardRow(__nv_bfloat16* input, __nv_bfloat16* grad, CUtensorMap row_act,
+                              CUtensorMap row_gate, uint8_t* row_scales, int m, int k,
+                              cudaStream_t stream) {
   kernel_gated_act_mxfp8_bwd_row_direct_64x64<<<dim3(k / 64, m / 32), 128, 4096, stream>>>(
       input, grad, row_act, row_gate, row_scales, m, k);
   return cudaGetLastError();

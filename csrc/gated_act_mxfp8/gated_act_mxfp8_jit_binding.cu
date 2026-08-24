@@ -21,8 +21,8 @@ void Forward(TensorView gated_input, TensorView row_output, TensorView col_outpu
              TensorView row_scales, TensorView col_scales, bool rowwise, bool colwise);
 
 void Backward(TensorView gated_input, TensorView grad_output, TensorView row_output,
-              TensorView col_output, TensorView row_scales, TensorView col_scales,
-              bool rowwise, bool colwise);
+              TensorView col_output, TensorView row_scales, TensorView col_scales, bool rowwise,
+              bool colwise);
 
 }  // namespace flashinfer::gated_act_mxfp8
 

@@ -22,8 +22,8 @@
 namespace flashinfer::gated_act_mxfp8 {
 
 cudaError_t LaunchBackwardCol(CUtensorMap gate, CUtensorMap up, CUtensorMap grad,
-                              CUtensorMap col_act, CUtensorMap col_gate, uint8_t* col_scales,
-                              int m, int k, cudaStream_t stream) {
+                              CUtensorMap col_act, CUtensorMap col_gate, uint8_t* col_scales, int m,
+                              int k, cudaStream_t stream) {
   kernel_gated_act_mxfp8_bwd_col_staged_64x64<<<dim3(k / 64, m / 32), 128, 17664, stream>>>(
       gate, up, grad, col_act, col_gate, col_scales, m, k);
   return cudaGetLastError();
