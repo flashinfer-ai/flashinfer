@@ -28,6 +28,7 @@ from flashinfer.gemm import (
     group_gemm_fp8_nt_groupwise,
 )
 from flashinfer.gemm import is_cuda_tile_available
+from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.testing.utils import dequantize_fp8, quantize_fp8
 from flashinfer.utils import get_compute_capability
 
@@ -317,6 +318,55 @@ def test_fp8_groupwise_group_deepgemm(
         m_indptr,
         out_dtype=out_dtype,
     )
+    torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("n,k", [(256, 128), (256, 4096)])
+def test_fp8_groupwise_group_cute_dsl_current_stream(n, k):
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability not in [(10, 0), (10, 3)]:
+        pytest.skip("The contiguous grouped CuTe-DSL kernel requires SM100 or SM103")
+    if not is_cute_dsl_available():
+        pytest.skip("nvidia-cutlass-dsl is not available")
+
+    torch.random.manual_seed(0)
+    group_counts = torch.tensor([128, 256, 128, 256], device="cuda")
+    group_size = group_counts.numel()
+    m = int(group_counts.sum())
+
+    a = torch.randn((m, k), device="cuda", dtype=torch.float32)
+    b = torch.randn((group_size, n, k), device="cuda", dtype=torch.float32)
+    m_indices = torch.repeat_interleave(
+        torch.arange(group_size, device="cuda", dtype=torch.int32), group_counts
+    )
+    a_fp8, a_scale = quantize_fp8(a, (m, k // 128), (1, 128), "K")
+    b_fp8, b_scale = quantize_fp8(
+        b, (group_size, n // 128, k // 128), (1, 128, 128), "K"
+    )
+
+    a_dequant = dequantize_fp8(a_fp8, a_scale, "K")
+    b_dequant = dequantize_fp8(b_fp8, b_scale, "K")
+    ref = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+    row_start = 0
+    for group, group_count in enumerate(group_counts.tolist()):
+        row_end = row_start + group_count
+        ref[row_start:row_end] = (
+            a_dequant[row_start:row_end] @ b_dequant[group].t()
+        ).to(torch.bfloat16)
+        row_start = row_end
+
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        out = group_deepgemm_fp8_nt_groupwise(
+            a_fp8,
+            b_fp8,
+            a_scale,
+            b_scale,
+            m_indices,
+            backend="cute_dsl",
+        )
+    stream.synchronize()
+
     torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
 
 
