@@ -9041,9 +9041,9 @@
           ]
         ],
         "entry": "run_cp_prefill",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_v1_e0902502a7",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_v1_c89e036025",
         "path": "host/cake_cp_prefill.cc",
-        "sha256": "40f751ef5c344ac46290f2566100511dffa7a08acd667a0ce384416b897fc4d0",
+        "sha256": "4acd242b2734c2c541467ea29545ac9f921023bc69ae44cf80abaacfe398f0fa",
         "size_bytes": 26905
       },
       "name": "cp_prefill",
@@ -9054,8 +9054,8 @@
             "sm_103a"
           ],
           "path": "cuda/cake_cp_prefill.cu",
-          "sha256": "47e929a6fceefaafbe167c40e98b2ad78f1d744a1ddc4b6ea9a48444b11892e9",
-          "size_bytes": 147039
+          "sha256": "133bc35b3c59c86036ec38deb618a402ff9646ad32230de27f49d10f4ad65697",
+          "size_bytes": 147143
         }
       ],
       "schedule_symbol": "flashinfer_blackwell_gdn_cp_prefill_final_v1",
