@@ -60,7 +60,7 @@ jobs:
         if: steps.check_changes.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@v7
         with:
-          token: ${{ github.token }}
+          token: ${{ secrets.FLASHINFER_BOT_TOKEN }}
           committer: flashinfer-bot <flashinfer-bot@users.noreply.github.com>
           author: flashinfer-bot <flashinfer-bot@users.noreply.github.com>
           commit-message: |

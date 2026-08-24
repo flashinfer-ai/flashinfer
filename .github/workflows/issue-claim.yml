@@ -13,8 +13,9 @@ on:
   workflow_dispatch:
 
 # Note: The collaborator invitation (PUT /repos/.../collaborators/...)
-# requires admin-level access. Use FLASHINFER_BOT_TOKEN for that capability;
-# regular issue assignment falls back to the default GITHUB_TOKEN.
+# requires admin-level access. This workflow uses FLASHINFER_BOT_TOKEN (a PAT
+# with admin scope) for all API calls; the permissions below only apply to the
+# default GITHUB_TOKEN which is not used.
 permissions:
   contents: read
   issues: write
@@ -71,12 +72,17 @@ jobs:
       - name: Handle !claim
         if: steps.parse.outputs.command == 'claim'
         env:
-          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           REPO: ${{ github.repository }}
           COMMENT_ID: ${{ github.event.comment.id }}
           TARGET_USER: ${{ steps.parse.outputs.target_user }}
         run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::FLASHINFER_BOT_TOKEN secret is not set"
+            exit 1
+          fi
+
           # Check if issue already has assignees
           ASSIGNEE_COUNT=$(gh api \
             -H "Accept: application/vnd.github+json" \
@@ -127,13 +133,18 @@ jobs:
       - name: Handle !assign
         if: steps.parse.outputs.command == 'assign'
         env:
-          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           REPO: ${{ github.repository }}
           COMMENT_ID: ${{ github.event.comment.id }}
           COMMENTER: ${{ github.event.comment.user.login }}
           TARGET_USER: ${{ steps.parse.outputs.target_user }}
         run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::FLASHINFER_BOT_TOKEN secret is not set"
+            exit 1
+          fi
+
           # Check commenter's repository permission (admin/maintain required)
           PERMISSION=$(gh api \
             -H "Accept: application/vnd.github+json" \
@@ -215,11 +226,16 @@ jobs:
       - name: Handle !assign with no username
         if: steps.parse.outputs.command == 'assign-no-user'
         env:
-          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
           COMMENT_ID: ${{ github.event.comment.id }}
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::FLASHINFER_BOT_TOKEN secret is not set"
+            exit 1
+          fi
+
           gh api -X POST \
             "/repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
             -f content='confused'
@@ -237,9 +253,14 @@ jobs:
     steps:
       - name: Check pending invitations
         env:
-          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN || github.token }}
+          GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
           REPO: ${{ github.repository }}
         run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::FLASHINFER_BOT_TOKEN secret is not set"
+            exit 1
+          fi
+
           # Search for open issues with !assign comments updated in the last 30 days
           SINCE=$(date -u -d '30 days ago' '+%Y-%m-%d')
           SEARCH_RESULTS=$(gh api \
