@@ -47,6 +47,14 @@ from ..utils import (
 
 DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
 
+# Feature flag for downstream integrations that must remain compatible with
+# FlashInfer releases whose native SVDQuant epilogue accepts only scalar alpha.
+SVDQUANT_SUPPORTS_PER_OUTPUT_ALPHA = True
+
+# Feature flag for the optional fc1-output -> SwiGLU -> smooth/NVFP4 path.
+# Downstream integrations use this instead of version checks.
+SVDQUANT_SUPPORTS_FUSED_SWIGLU = True
+
 # The fused kernel accumulates the rank-r BF16 LoRA-up into the NVFP4 residual accumulator.
 # The rank is inferred from the d/l1 shapes and must be a positive multiple of the collective's
 # rank granularity (CollectiveMmaLoRA::LoRaK); ranks 32-128 are validated.
@@ -173,6 +181,11 @@ def _check_mm_nvfp4_svdquant_problem(
     k = k_packed * 2
     if n % 32 != 0 or k % 32 != 0:
         raise ValueError(f"n and k must be divisible by 32, got n={n}, k={k}")
+    if alpha.dtype != torch.float32 or alpha.numel() not in (1, n):
+        raise ValueError(
+            f"alpha must be float32 with one element or n={n} elements, "
+            f"got dtype={alpha.dtype} and numel={alpha.numel()}"
+        )
     if d.ndim != 2 or d.shape[0] != m:
         raise ValueError(
             f"d must have shape [m, r] (rank-r LoRA-down output), got {tuple(d.shape)}"
@@ -217,9 +230,10 @@ def mm_nvfp4_svdquant(
     ``d @ l1ᵀ``, computed by a second BF16 tcgen05 MMA into the same accumulator after the
     NVFP4 K-loop, plus an optional fused per-column bias. The LoRA rank ``r`` is inferred
     from the ``d``/``l1`` shapes and must be a positive multiple of 32 (ranks 32-128 are
-    validated). ``1/alpha`` must be folded into ``l1`` by the caller
-    (``l1 = svdquant_lora_b / alpha``) so the epilogue ``out = alpha * acc + bias`` yields
-    the correction unscaled.
+    validated). ``alpha`` may be a scalar or a per-output-channel vector. ``1/alpha``
+    must be folded row-wise into ``l1`` by the caller
+    (``l1 = svdquant_lora_b / alpha.reshape(-1, 1)`` for vector ``alpha``) so the
+    epilogue ``out = alpha * acc + bias`` yields the correction unscaled.
 
     Parameters
     ----------
@@ -236,7 +250,8 @@ def mm_nvfp4_svdquant(
     b_sf: torch.Tensor
         Weight block scales, same layout as ``a_sf`` with ``n`` rows.
     alpha: torch.Tensor
-        Per-tensor residual dequantization scale, float32, device scalar (``numel >= 1``).
+        Residual dequantization scale, float32 device scalar or per-output-channel vector
+        with shape ``(n,)``.
     d: torch.Tensor
         LoRA-down output ``x_hat @ L2ᵀ``, shape ``(m, r)`` bf16, contiguous and 16-byte
         aligned (TMA). Compute it as ``x @ (pre_quant_scale[:, None] * L2ᵀ)`` in bf16.
@@ -348,6 +363,45 @@ def nvfp4_quantize_smooth(
     return xq, sf
 
 
+def _nvfp4_quantize_smooth_swiglu(
+    gate_up: torch.Tensor,
+    pre_quant_scale: torch.Tensor,
+    global_scale: torch.Tensor,
+    enable_pdl: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Internal fused SwiGLU + SVDQuant activation preprocessing.
+
+    Returns the BF16 activated tensor for LoRA-down as well as its smoothed
+    packed-NVFP4 representation and scale factors for the residual GEMM.
+    """
+    if gate_up.ndim != 2:
+        raise ValueError(f"gate_up must be [m, 2*k], got {tuple(gate_up.shape)}")
+    if gate_up.dtype != torch.bfloat16 or pre_quant_scale.dtype != torch.bfloat16:
+        raise ValueError("gate_up and pre_quant_scale must be bf16")
+    if gate_up.shape[1] % 2:
+        raise ValueError("gate_up's last dimension must be even")
+    m, two_k = gate_up.shape
+    k = two_k // 2
+    if k % 16:
+        raise ValueError(f"k must be divisible by 16, got {k}")
+    if pre_quant_scale.numel() != k:
+        raise ValueError(
+            f"pre_quant_scale must have k={k} elements, got {pre_quant_scale.numel()}"
+        )
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(gate_up.device)
+    module = get_nvfp4_svdquant_module()
+    activated = torch.empty(m, k, dtype=torch.bfloat16, device=gate_up.device)
+    xq = torch.empty(m, k // 2, dtype=torch.uint8, device=gate_up.device)
+    sf = torch.empty(
+        _swizzled_sf_size(m, k // 16), dtype=torch.uint8, device=gate_up.device
+    )
+    module.nvfp4_quantize_smooth_swiglu(
+        gate_up, pre_quant_scale, global_scale, activated, xq, sf, enable_pdl
+    )
+    return activated, xq, sf
+
+
 @flashinfer_api(trace=svdquant_linear_trace)
 def svdquant_linear(
     x: torch.Tensor,
@@ -360,6 +414,7 @@ def svdquant_linear(
     global_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
     enable_pdl: Optional[bool] = None,
+    fuse_swiglu: bool = False,
 ) -> torch.Tensor:
     r"""The full SVDQuant linear operator: ``y = x_hat @ (R + L1 @ L2)ᵀ [+ bias]`` where
     ``x_hat = x * pre_quant_scale`` and ``R`` is the NVFP4-quantized residual weight.
@@ -372,19 +427,22 @@ def svdquant_linear(
 
     The invariant per-layer transforms must be prepared offline by the caller:
     ``l2t_smoothed = (pre_quant_scale[:, None] * svdquant_lora_a.T).to(bf16)`` with shape
-    ``(k, r)`` and ``l1_scaled = (svdquant_lora_b / alpha).to(bf16)`` with shape ``(n, r)``,
-    where the LoRA rank ``r`` is a positive multiple of 32.
+    ``(k, r)`` and ``l1_scaled = (svdquant_lora_b / alpha.reshape(-1, 1)).to(bf16)``
+    with shape ``(n, r)`` for vector ``alpha`` (ordinary broadcasting applies for scalar
+    ``alpha``), where the LoRA rank ``r`` is a positive multiple of 32.
 
     Parameters
     ----------
     x: torch.Tensor
-        Input activation, shape ``(m, k)`` bf16.
+        Input activation, shape ``(m, k)`` bf16, or concatenated ``[gate, up]``
+        with shape ``(m, 2*k)`` when ``fuse_swiglu=True``.
     weight_fp4: torch.Tensor
         NVFP4 residual weight, shape ``(n, k // 2)`` uint8 (packed e2m1).
     weight_sf: torch.Tensor
         Weight block scales, uint8 (ue4m3), 128x4 swizzled layout.
     alpha: torch.Tensor
-        Per-tensor residual dequantization scale, float32 device scalar.
+        Residual dequantization scale, float32 device scalar or per-output-channel vector
+        with shape ``(n,)``.
     pre_quant_scale: torch.Tensor
         Per-input-channel smoothing scale, shape ``(k,)`` bf16.
     l2t_smoothed: torch.Tensor
@@ -397,16 +455,32 @@ def svdquant_linear(
         Optional per-column bias, shape ``(n,)`` bf16.
     enable_pdl: Optional[bool]
         Whether to launch with Programmatic Dependent Launch. Defaults to the device default.
+    fuse_swiglu: bool
+        Fuse SwiGLU with smooth NVFP4 quantization while retaining the BF16
+        activated tensor for the low-rank down projection.
 
     Returns
     -------
     out: torch.Tensor
         Output tensor, shape ``(m, n)`` bf16.
     """
-    xq, x_sf = nvfp4_quantize_smooth(
-        x, pre_quant_scale, global_scale, enable_pdl=enable_pdl
-    )
-    down = torch.mm(x, l2t_smoothed)
+    k = weight_fp4.shape[1] * 2
+    expected_input_width = 2 * k if fuse_swiglu else k
+    if x.ndim != 2 or x.shape[1] != expected_input_width:
+        raise ValueError(
+            f"x must have shape [m, {expected_input_width}] when "
+            f"fuse_swiglu={fuse_swiglu}, got {tuple(x.shape)}"
+        )
+    if fuse_swiglu:
+        activated, xq, x_sf = _nvfp4_quantize_smooth_swiglu(
+            x, pre_quant_scale, global_scale, enable_pdl=enable_pdl
+        )
+    else:
+        activated = x
+        xq, x_sf = nvfp4_quantize_smooth(
+            x, pre_quant_scale, global_scale, enable_pdl=enable_pdl
+        )
+    down = torch.mm(activated, l2t_smoothed)
     return mm_nvfp4_svdquant(
         xq,
         weight_fp4,
