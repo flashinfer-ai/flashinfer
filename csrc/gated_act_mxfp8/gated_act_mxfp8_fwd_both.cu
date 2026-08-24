@@ -261,14 +261,18 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
         int scale_col = bx * 2 + blk;
         int row_num_scale_blocks = K / 128;
         int row_scale_index = ((grow >> 7) * row_num_scale_blocks + (scale_col >> 2)) * 512 + (grow & 31) * 16 + (grow >> 5 & 3) * 4 + (scale_col & 3);
-        if (half == 0) {
-            *(reinterpret_cast<unsigned char*>(row_scales + row_scale_index) + (0)) = (unsigned char)(act_scale);
+        {
+            if (half == 0) {
+                *(reinterpret_cast<unsigned char*>(row_scales + row_scale_index) + (0)) = (unsigned char)(act_scale);
+            }
         }
         unsigned int inv_act = 254 - act_scale << 7;
         if (act_scale == 255) {
             inv_act = 32704;
         }
         inv_act = inv_act | inv_act << 16;
+        unsigned int gate_scale_0 = act_scale;
+        int gate_row_scale_index = row_scale_index;
         #pragma unroll
         for (int q = 0; q < 4; q++) {
             uint32_t _bf16x2_mul_0;
@@ -355,9 +359,9 @@ kernel_gated_act_mxfp8_fwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
         asm volatile("max.NaN.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_nan_4) : "r"(col_amax), "r"(col_peer));
         col_amax = _bf16x2_max_nan_4;
         unsigned int _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, col_amax, 2);
-        unsigned int col_peer_0 = _shfl_xor_3;
+        unsigned int col_peer_1 = _shfl_xor_3;
         uint32_t _bf16x2_max_nan_5;
-        asm volatile("max.NaN.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_nan_5) : "r"(col_amax), "r"(col_peer_0));
+        asm volatile("max.NaN.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_nan_5) : "r"(col_amax), "r"(col_peer_1));
         col_amax = _bf16x2_max_nan_5;
         unsigned int col_bits0 = (col_amax & 65535) << 16;
         unsigned int col_bits1 = col_amax & 4294901760;

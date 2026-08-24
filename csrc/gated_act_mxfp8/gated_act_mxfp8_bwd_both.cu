@@ -322,14 +322,13 @@ kernel_gated_act_mxfp8_bwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
             row_num_scale_blocks = K / 64;
         }
         int row_scale_index = ((grow >> 7) * row_num_scale_blocks + (scale_col >> 2)) * 512 + (grow & 31) * 16 + (grow >> 5 & 3) * 4 + (scale_col & 3);
-        if (half == 0) {
-            *(reinterpret_cast<unsigned char*>(row_scales + row_scale_index) + (0)) = (unsigned char)(act_scale);
-        }
         unsigned int inv_act = 254 - act_scale << 7;
         if (act_scale == 255) {
             inv_act = 32704;
         }
         inv_act = inv_act | inv_act << 16;
+        unsigned int gate_scale_0 = act_scale;
+        int gate_row_scale_index = row_scale_index;
         {
             amax_gate = amax_gate & 2147450879;
             unsigned int _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, amax_gate, 1);
@@ -349,14 +348,11 @@ kernel_gated_act_mxfp8_bwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
             if (gate_exponent == 2139095040) {
                 gate_scale_i32 = 255;
             }
-            gate_scale = (unsigned int)gate_scale_i32;
+            gate_scale_0 = (unsigned int)gate_scale_i32;
             int gate_scale_col = scale_col + K / 32;
-            int gate_row_scale_index = ((grow >> 7) * row_num_scale_blocks + (gate_scale_col >> 2)) * 512 + (grow & 31) * 16 + (grow >> 5 & 3) * 4 + (gate_scale_col & 3);
-            if (half == 0) {
-                *(reinterpret_cast<unsigned char*>(row_scales + gate_row_scale_index) + (0)) = (unsigned char)(gate_scale);
-            }
-            inv_gate = 254 - gate_scale << 7;
-            if (gate_scale == 255) {
+            gate_row_scale_index = ((grow >> 7) * row_num_scale_blocks + (gate_scale_col >> 2)) * 512 + (grow & 31) * 16 + (grow >> 5 & 3) * 4 + (gate_scale_col & 3);
+            inv_gate = 254 - gate_scale_0 << 7;
+            if (gate_scale_0 == 255) {
                 inv_gate = 32704;
             }
             inv_gate = inv_gate | inv_gate << 16;
@@ -441,6 +437,10 @@ kernel_gated_act_mxfp8_bwd_both_direct_64x64(__nv_bfloat16* __restrict__ gated_i
                 tma_store_2d((&row_act_tma), bx * 64, by * 32 + stage * 32, row_act_addr + (unsigned int)(stage * 2048));
                 tma_store_2d((&row_gate_tma), bx * 64, by * 32 + stage * 32, row_gate_addr + (unsigned int)(stage * 2048));
                 asm volatile("cp.async.bulk.commit_group;");
+            }
+            if (half == 0) {
+                *(reinterpret_cast<unsigned char*>(row_scales + row_scale_index) + (0)) = (unsigned char)(act_scale);
+                *(reinterpret_cast<unsigned char*>(row_scales + gate_row_scale_index) + (0)) = (unsigned char)(gate_scale_0);
             }
         }
         if (stage + 1 < 1) {
