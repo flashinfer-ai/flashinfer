@@ -18,7 +18,9 @@
 # periodically (sm100/cutedsl_megamoe, sm90/pull_style_cutedsl_megakernel);
 # excluded from all hooks so formatting/lint churn doesn't block syncs.
 # The shim/ layers next to them are ours and stay checked.
-exclude: ^flashinfer/moe_ep/kernel_src/(cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/
+# The Mamba CUDA/host tree is a byte-faithful generated export; its SHA-256
+# digests are checked by JIT manifests and must not be rewritten.
+exclude: ^(?:csrc/cake_mamba_ssd_combined/generated/|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/)
 
 repos:
   # Standard hooks
