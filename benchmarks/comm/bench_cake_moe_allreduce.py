@@ -69,9 +69,9 @@ def _require_choices(
         parser.error(f"{label} contains unsupported values {unknown}; expected {sorted(allowed)}")
 
 
-def _require_cupti() -> str:
+def _require_cupti() -> tuple[str, Any]:
     try:
-        from cupti import cupti as _cupti  # noqa: F401
+        from cupti import cupti as _cupti
 
         version = package_version("cupti-python")
     except Exception as exc:
@@ -82,7 +82,18 @@ def _require_cupti() -> str:
         raise RuntimeError(
             f"cupti-python >=13 is required, found version {version}"
         )
-    return version
+    return version, _cupti
+
+
+def _defer_cupti_finalize(cupti_module: Any) -> Callable[[], Any]:
+    """Keep process-global CUPTI state alive while NCCL's watchdog is active."""
+    finalize = cupti_module.finalize
+
+    def deferred_finalize() -> None:
+        pass
+
+    cupti_module.finalize = deferred_finalize
+    return finalize
 
 
 def _bounded_rand(
@@ -594,11 +605,12 @@ def main() -> int:
         )
 
     started = time.monotonic()
-    cupti_version = _require_cupti()
-    dist.init_process_group(backend="nccl", init_method="env://")
-    group = dist.group.WORLD
+    cupti_version, cupti_module = _require_cupti()
+    cupti_finalize = _defer_cupti_finalize(cupti_module)
     rows: list[dict[str, Any]] = []
     try:
+        dist.init_process_group(backend="nccl", init_method="env://")
+        group = dist.group.WORLD
         if "cake" in args.backends:
             cake_moe_comm.load(local_rank)
         if "trtllm" in args.backends:
@@ -733,8 +745,14 @@ def main() -> int:
             )
             print(json.dumps(report, sort_keys=True))
     finally:
-        if dist.is_initialized():
-            dist.destroy_process_group(group=group)
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group(group=group)
+        finally:
+            cupti_module.finalize = cupti_finalize
+
+    # CUPTI teardown is process-global, so run it only after the NCCL watchdog exits.
+    cupti_finalize()
     return 0
 
 
