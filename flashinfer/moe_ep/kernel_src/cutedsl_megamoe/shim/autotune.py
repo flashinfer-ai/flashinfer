@@ -38,7 +38,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 
-from .tuner import default_knobs, is_valid
+from .tuner import default_knobs, is_valid, is_valid_bf16_mxfp8
 
 # Shared base of the sweep restriction (values that won every profile so far).
 _SWEEP_BASE: Dict[str, Any] = {
@@ -122,9 +122,62 @@ def bf16_candidates() -> List[Dict[str, Any]]:
     return [default_knobs(0, dtype="bf16")]
 
 
-def bf16_mxfp8_candidates() -> List[Dict[str, Any]]:
-    """Return the currently supported BF16×MXFP8 tuning candidate."""
-    return [default_knobs(0, dtype="bf16_mxfp8")]
+def bf16_mxfp8_candidates(
+    *,
+    in_kernel_fc2_reduce: bool = False,
+) -> List[Dict[str, Any]]:
+    """Default BF16×MXFP8 candidate knob dicts (impl tuple × flag_batch × token-back).
+
+    Twelve candidates: three legal implementation tuples (N128/tmem,
+    N256/smem, N256/tmem-overlap) × ``flag_batch`` {1, 4} ×
+    ``token_back_mode`` {``epi_warps``, ``reuse_dispatch_warps``}.
+    ``standalone_warps`` is unsupported.  Pass the session's
+    ``in_kernel_fc2_reduce`` so invalid combos are pruned (the mixed kernel
+    keeps ikr config-owned like MXFP8).
+    """
+    out: List[Dict[str, Any]] = []
+    impl_specs = (
+        {
+            "mma_tiler_mnk": (256, 128, 128),
+            "transform_buffer": "tmem",
+            "accumulator_overlap": False,
+            "transform_k_tile": 128,
+        },
+        {
+            "mma_tiler_mnk": (256, 256, 128),
+            "transform_buffer": "smem",
+            "accumulator_overlap": False,
+            "transform_k_tile": 128,
+        },
+        {
+            "mma_tiler_mnk": (256, 256, 128),
+            "transform_buffer": "tmem",
+            "accumulator_overlap": True,
+            "transform_k_tile": 64,
+        },
+    )
+    base: Dict[str, Any] = {
+        "cluster_shape_mnk": (2, 1, 1),
+        "use_2cta_instrs": True,
+        "group_hint": 512,
+        "epi_flag_batch": (2, 4),
+        "load_balance_mode": "static",
+    }
+    for impl in impl_specs:
+        for flag_batch in (1, 4):
+            for token_back in ("epi_warps", "reuse_dispatch_warps"):
+                if in_kernel_fc2_reduce and token_back != "epi_warps":
+                    continue
+                knobs = dict(
+                    base,
+                    **impl,
+                    flag_batch=flag_batch,
+                    token_back_mode=token_back,
+                    in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                )
+                if is_valid_bf16_mxfp8(knobs):
+                    out.append(knobs)
+    return out
 
 
 def autotune_knobs(
@@ -429,10 +482,16 @@ def autotune_bf16_mxfp8_mega_moe(
             sync=True,
         )
 
+    cfg = symm_buffer._frontend.config
+    if candidates is None:
+        candidates = bf16_mxfp8_candidates(
+            in_kernel_fc2_reduce=cfg.in_kernel_fc2_reduce,
+        )
+
     return autotune_knobs(
         symm_buffer._frontend,
         launch,
-        bf16_mxfp8_candidates() if candidates is None else candidates,
+        candidates,
         label="bf16_mxfp8_mega",
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,

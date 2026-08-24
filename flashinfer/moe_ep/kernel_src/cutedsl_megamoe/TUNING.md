@@ -319,9 +319,18 @@ misses) — both are the right behavior as long as internal drops carry the
   BF16 has ONE profile: `dtype="bf16"` returns the single validated fixed
   MMA/cluster geometry regardless of token count (candidate validity via
   `is_valid_bf16`); per-size bf16 profiles are pending a tuning pass.
-  Mixed BF16×MXFP8 has ONE default profile (`dtype="bf16_mxfp8"`); additional
-  implementation tuples are gated by `is_valid_bf16_mxfp8`.
-- Backend configs (`Nvfp4/Mxfp8/Bf16 ..._Cutedsl_MegaMoeConfig.knobs`): explicit dict
+  Mixed BF16×MXFP8 has per-size measured profiles.  Three legal impl tuples
+  (`is_valid_bf16_mxfp8`; others fail at kernel construction):
+  - N128/tmem/no-overlap/tk128 + `epi_warps` — recommended <1024 tok/rank
+  - N128/tmem/no-overlap/tk128 + `reuse_dispatch_warps` - recommended 1024-2048 tok/rank
+  - N256/tmem/overlap/tk64 + `epi_warps` — recommended 2048-4096 tok/rank;
+  - N256/tmem/overlap/tk64 + `reuse_dispatch_warps` - recommended >4096 tok/rank
+  - N256/smem/no-overlap/tk128
+  The FI shim default (`dtype="bf16_mxfp8"`) is the N128 small-batch profile;
+  `bf16_mxfp8_candidates()` sweeps all three impl tuples × `flag_batch`
+  {1, 4} × token-back {``epi_warps``, ``reuse_dispatch_warps``} (12
+  candidates; per-size winners above are the measured starting point).
+- Backend configs (`Nvfp4/Mxfp8/Bf16/Bf16_Mxfp8 ..._Cutedsl_MegaMoeConfig.knobs`): explicit dict
   overrides the heuristic ENTIRELY (pin every knob you care about);
   `"auto"` runs the online autotuner at the first forward.
 - `autotune.py` — collective online tuner: every EP rank compiles+times the
@@ -645,7 +654,7 @@ srun -A <account> -p batch -N 1 --ntasks-per-node=1 --time=04:00:00 \
   bash -lc '
     export FLASHINFER_DISABLE_VERSION_CHECK=1
     PIP_CONSTRAINT="" BUILD_NIXL_EP=0 python -m pip install --no-build-isolation -e .
-    python -m pip install "nvidia-cutlass-dsl[cu13]"
+    python -m pip install --upgrade "nvidia-cutlass-dsl[cu13]"
     export SECTION=fi_mega GPUS=4 CUDA_VISIBLE_DEVICES=0,1,2,3
     export SEQ_LENS="1024 2048 4096 8192"
     for MODE in kernel e2e_pipelined; do
