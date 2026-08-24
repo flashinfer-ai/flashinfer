@@ -47,7 +47,21 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         description="Offline cutedsl mega-MoE knob tuner (writes the knob cache).",
     )
     parser.add_argument(
-        "--dtype", choices=("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"), default="nvfp4"
+        "--dtype",
+        choices=(
+            "nvfp4",
+            "mxfp8_e4m3",
+            "mxfp8_e5m2",
+            "sm90_fp8_e4m3",
+            "sm90_fp8_e5m2",
+        ),
+        default="nvfp4",
+    )
+    parser.add_argument(
+        "--fp8-scale-mode",
+        choices=("per_tensor", "blockwise"),
+        default="per_tensor",
+        help="FP8 scale ABI (sm90_fp8_* dtypes only)",
     )
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument(
@@ -134,6 +148,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.dtype == "nvfp4":
         from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner import (
+            run_tuning,
+        )
+    elif args.dtype.startswith("sm90_fp8"):
+        from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.tuner import (
             run_tuning,
         )
     else:

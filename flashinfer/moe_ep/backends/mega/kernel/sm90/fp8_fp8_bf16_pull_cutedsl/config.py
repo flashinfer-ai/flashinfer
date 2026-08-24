@@ -34,9 +34,11 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     ``MoEWeightPack`` and enable ``MegaConfig.preprocess_weights`` (default),
     or pass kernel-ready transformed weights with ``preprocess_weights=False``.
 
-    PORT NOTE: no ``knobs`` field / offline knob-cache yet — geometry knobs
-    are explicit fields, resolved by the drop's token-bucket heuristic table
-    (``moe_hopper_fp8/heuristic_config.py``) when all four are ``None``.
+    Launch tuning is resolved through the ``knobs`` field (knob cache /
+    heuristic table / explicit dict / ``"auto"`` autotune — see the field
+    comment below) or, mutually exclusively, through the explicit geometry
+    fields (``swap_ab`` / ``pingpong`` / ``mma_tiler_mnk`` /
+    ``cluster_shape_mnk``).
     """
 
     intermediate_size: int
@@ -45,6 +47,13 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     kind: Literal["fp8_e4m3", "fp8_e5m2"] = "fp8_e4m3"
     fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor"
     fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc"
+    # Kernel tuning knobs (see kernel_src...pull_style_cutedsl_megakernel
+    # shim/tuner.py).  None -> knob-cache lookup, else the drop's
+    # token-bucket heuristic table; a dict applies those knobs; "auto" runs
+    # the collective autotune sweep at the first compute (never inside a
+    # serving engine — tune offline with python -m flashinfer.moe_ep.tune).
+    # Mutually exclusive with the explicit geometry fields below.
+    knobs: dict | str | None = None
     # Launch geometry / scheduling: leave ALL of swap_ab / pingpong /
     # mma_tiler_mnk / cluster_shape_mnk as None to use the drop driver's
     # token-bucket heuristics (keyed on fp8_scale_mode and max tokens per

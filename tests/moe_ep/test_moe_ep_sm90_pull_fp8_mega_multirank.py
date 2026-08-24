@@ -344,7 +344,12 @@ def _assert_ikr_close(y, y_ref, *, topk):
     )
 
 
-def _megakernel_config(problem: dict, *, in_kernel_fc2_reduce: bool = False):
+def _megakernel_config(
+    problem: dict,
+    *,
+    in_kernel_fc2_reduce: bool = False,
+    token_back_mode: str | None = None,
+):
     from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
     return Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
@@ -356,6 +361,7 @@ def _megakernel_config(problem: dict, *, in_kernel_fc2_reduce: bool = False):
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        token_back_mode=token_back_mode,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )
@@ -371,6 +377,7 @@ def _run_mega_layer(
     num_tokens: int = 64,
     max_tokens: int = 64,
     in_kernel_fc2_reduce: bool = False,
+    token_back_mode: str | None = None,
 ):
     import torch
     import torch.distributed as dist
@@ -404,7 +411,11 @@ def _run_mega_layer(
         max_tokens=max_tokens,
     )
     kernel = create_mega_kernel(
-        _megakernel_config(problem, in_kernel_fc2_reduce=in_kernel_fc2_reduce)
+        _megakernel_config(
+            problem,
+            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            token_back_mode=token_back_mode,
+        )
     )
     runtime = bootstrap_moe_ep_runtime(
         bootstrap,
@@ -537,6 +548,42 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_swap_ab_matches_reference():
     )
     print(
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer (swap_ab) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,token_back_mode",
+    [
+        ("per_tensor", "reuse_dispatch_warps"),
+        ("per_tensor", "standalone_warps"),
+        ("blockwise", "reuse_dispatch_warps"),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_token_back_matches_reference(
+    fp8_scale_mode, token_back_mode
+):
+    """Push-style fc2 write-back modes match the epi-warps-validated reference.
+
+    ``reuse_dispatch_warps`` is the heuristic table's pick at the GEMM-bound
+    token buckets and ``standalone_warps`` is a tuner candidate, so both
+    need the same bit-level gate as the ``epi_warps`` default.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=fp8_scale_mode,
+        token_back_mode=token_back_mode,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"({fp8_scale_mode}, token_back={token_back_mode}) matches reference"
     )
 
 

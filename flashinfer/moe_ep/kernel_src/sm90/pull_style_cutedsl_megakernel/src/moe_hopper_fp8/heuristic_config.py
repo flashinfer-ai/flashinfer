@@ -18,6 +18,9 @@ DEFAULT_CLUSTER_SHAPE_MNK = (1, 1, 1)
 DEFAULT_ACCUM_MODE = "1xacc"
 
 
+DEFAULT_TOKEN_BACK_MODE = "epi_warps"
+
+
 @dataclass(frozen=True)
 class HopperFp8Config:
     swap_ab: bool
@@ -25,6 +28,11 @@ class HopperFp8Config:
     mma_tiler_mnk: Tuple[int, int, int]
     cluster_shape_mnk: Tuple[int, int, int]
     accum_mode: str = DEFAULT_ACCUM_MODE
+    # Cross-rank fc2 write-back placement.  Per-bucket winners from the
+    # 2026-08-23 four-rank H200 epi-vs-reuse sweep on the FlashInfer layer
+    # path: epi_warps wins small/mid buckets, reuse_dispatch_warps wins the
+    # GEMM-bound tail (per_tensor >= 16384, blockwise >= 1024).
+    token_back_mode: str = DEFAULT_TOKEN_BACK_MODE
 
 
 @dataclass(frozen=True)
@@ -40,12 +48,14 @@ def _config(
     pingpong: bool,
     tile: Tuple[int, int, int],
     cga: Tuple[int, int, int],
+    token_back: str = DEFAULT_TOKEN_BACK_MODE,
 ) -> HopperFp8Config:
     return HopperFp8Config(
         swap_ab=swap_ab,
         pingpong=pingpong,
         mma_tiler_mnk=tile,
         cluster_shape_mnk=cga,
+        token_back_mode=token_back,
     )
 
 
@@ -63,10 +73,18 @@ HEURISTIC_CONFIGS = {
         4096: _config(swap_ab=False, pingpong=True, tile=(64, 128, 128), cga=(2, 2, 1)),
         8192: _config(swap_ab=True, pingpong=True, tile=(128, 64, 128), cga=(1, 2, 1)),
         16384: _config(
-            swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(2, 1, 1)
+            swap_ab=False,
+            pingpong=False,
+            tile=(64, 256, 128),
+            cga=(2, 1, 1),
+            token_back="reuse_dispatch_warps",
         ),
         32768: _config(
-            swap_ab=False, pingpong=True, tile=(64, 128, 128), cga=(2, 2, 1)
+            swap_ab=False,
+            pingpong=True,
+            tile=(64, 128, 128),
+            cga=(2, 2, 1),
+            token_back="reuse_dispatch_warps",
         ),
     },
     "blockwise": {
@@ -78,22 +96,46 @@ HEURISTIC_CONFIGS = {
         256: _config(swap_ab=True, pingpong=True, tile=(128, 32, 128), cga=(1, 2, 1)),
         512: _config(swap_ab=False, pingpong=False, tile=(64, 128, 128), cga=(1, 1, 1)),
         1024: _config(
-            swap_ab=False, pingpong=False, tile=(64, 128, 128), cga=(2, 2, 1)
+            swap_ab=False,
+            pingpong=False,
+            tile=(64, 128, 128),
+            cga=(2, 2, 1),
+            token_back="reuse_dispatch_warps",
         ),
         2048: _config(
-            swap_ab=False, pingpong=False, tile=(64, 128, 128), cga=(2, 2, 1)
+            swap_ab=False,
+            pingpong=False,
+            tile=(64, 128, 128),
+            cga=(2, 2, 1),
+            token_back="reuse_dispatch_warps",
         ),
         4096: _config(
-            swap_ab=False, pingpong=False, tile=(64, 128, 128), cga=(1, 1, 1)
+            swap_ab=False,
+            pingpong=False,
+            tile=(64, 128, 128),
+            cga=(1, 1, 1),
+            token_back="reuse_dispatch_warps",
         ),
         8192: _config(
-            swap_ab=False, pingpong=False, tile=(64, 128, 128), cga=(2, 1, 1)
+            swap_ab=False,
+            pingpong=False,
+            tile=(64, 128, 128),
+            cga=(2, 1, 1),
+            token_back="reuse_dispatch_warps",
         ),
         16384: _config(
-            swap_ab=False, pingpong=False, tile=(64, 128, 128), cga=(1, 2, 1)
+            swap_ab=False,
+            pingpong=False,
+            tile=(64, 128, 128),
+            cga=(1, 2, 1),
+            token_back="reuse_dispatch_warps",
         ),
         32768: _config(
-            swap_ab=False, pingpong=False, tile=(64, 128, 128), cga=(2, 1, 1)
+            swap_ab=False,
+            pingpong=False,
+            tile=(64, 128, 128),
+            cga=(2, 1, 1),
+            token_back="reuse_dispatch_warps",
         ),
     },
 }

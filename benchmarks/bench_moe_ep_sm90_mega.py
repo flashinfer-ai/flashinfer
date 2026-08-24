@@ -98,14 +98,14 @@ CSV_HEADER = "BENCH_CSV," + CSV_FIELDS
 # --heuristic so the file records what each point actually launched).
 HEUR_CSV_FIELDS = (
     "heur_swap_ab,heur_pingpong,heur_tile_m,heur_tile_n,heur_tile_k,"
-    "heur_cga_m,heur_cga_n,heur_accum_mode,heur_token_bucket"
+    "heur_cga_m,heur_cga_n,heur_accum_mode,heur_token_back,heur_token_bucket"
 )
 
 
 def _heuristic_cols(scale_mode: str, operand_order: str, tokens: int) -> list[str]:
     """The launch config the shim resolves for this point (heuristic mode)."""
     if operand_order != "heuristic":
-        return [""] * 9
+        return [""] * 10
     from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
         bootstrap_paths,
     )
@@ -124,6 +124,7 @@ def _heuristic_cols(scale_mode: str, operand_order: str, tokens: int) -> list[st
         str(c.cluster_shape_mnk[0]),
         str(c.cluster_shape_mnk[1]),
         c.accum_mode,
+        c.token_back_mode,
         str(sel.token_bucket),
     ]
 
@@ -205,12 +206,18 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--token-back",
-        choices=["reuse_dispatch_warps", "epi_warps"],
-        default="reuse_dispatch_warps",
-        help="fc2 token-back path. reuse_dispatch_warps matches the drop's "
-        "P03 perf runs (mega_runner non-ikr default); epi_warps is the "
-        "FI-multirank-validated default — fall back to it if the dispatch-"
-        "warp path misbehaves.",
+        choices=[
+            "heuristic",
+            "epi_warps",
+            "reuse_dispatch_warps",
+            "standalone_warps",
+        ],
+        default="heuristic",
+        help="fc2 token-back path. 'heuristic' (default) follows the "
+        "per-token-bucket table (epi_warps small/mid buckets, "
+        "reuse_dispatch_warps at the GEMM-bound tail); the explicit modes "
+        "pin one path for A/B runs (reuse_dispatch_warps matches the "
+        "drop's P03 perf-run setting).",
     )
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=20)
@@ -389,7 +396,7 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile):
         load_balance_mode=args.load_balance_mode,
         gate_up_clamp=args.gate_up_clamp,
         in_kernel_fc2_reduce=False,
-        token_back_by_dispatch=(args.token_back == "reuse_dispatch_warps"),
+        token_back_mode=(None if args.token_back == "heuristic" else args.token_back),
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )

@@ -52,8 +52,9 @@ class TestSm90PullFp8Config:
         assert cfg.token_back_mode is None
         assert cfg.fc1_activation_dequant_scale == 1.0
         assert cfg.fc2_activation_dequant_scale == 1.0
-        # PORT NOTE contract: no knobs field until the sm90 tree grows a tuner.
-        assert "knobs" not in {f.name for f in dataclasses.fields(cfg)}
+        # Tuner surface: knobs=None resolves the knob cache, then the
+        # heuristic table (see kernel_src sm90 shim/tuner.py).
+        assert cfg.knobs is None
 
     def test_is_mega_kernel_config(self) -> None:
         assert is_mega_kernel_config(_config())

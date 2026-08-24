@@ -22,6 +22,11 @@ heuristics for Hopper FP8 MegaMoE", 2026-08), **minus commit `4f9c042`**
 regions / token_comm bodies).  Re-exclude that commit's content when
 syncing future drops.
 
+Local extension pending upstream: `moe_hopper_fp8/heuristic_config.py`
+carries a `token_back_mode` field per bucket (2026-08-23 FI-layer
+epi-vs-reuse sweep winners); re-apply it when syncing a drop that has not
+picked it up.
+
 ## Layout
 
 ```

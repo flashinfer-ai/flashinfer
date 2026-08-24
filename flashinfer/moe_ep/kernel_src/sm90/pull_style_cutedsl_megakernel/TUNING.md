@@ -13,9 +13,11 @@ geometry: **384 experts, top-6, hidden 7168, intermediate 3072
 8..32768 in powers of two (13 points) — the same geometry and knobs as the
 kernel team's `moe_hopper_fp8/run_token_sweep_benchmark.py`.  The launch
 config per point is the drop's token-bucket heuristic table
-(`moe_hopper_fp8/heuristic_config.py`, derived from the kernel team's
-2026-08-19 four-rank H200 sweep at the same vendored kernel sources).
-Raw rows: `benchmark_data/20260823/20260823_multirank_heuristic_default_config_t8_32768.csv`.
+(`moe_hopper_fp8/heuristic_config.py`, geometry derived from the kernel
+team's 2026-08-19 four-rank H200 sweep at the same vendored kernel
+sources, plus the locally added per-bucket `token_back_mode` column from
+the 2026-08-23 epi-vs-reuse sweep — see the knob list below).
+Raw rows: `benchmark_data/20260823/20260823_090730_mega_sm90_heuristic_both.csv`.
 
 ## Microbenchmark results (2026-08-23, heuristic launch configs, max-rank µs)
 
@@ -39,41 +41,44 @@ the drop's per-rank formula (`routed = tok/rank × topk`,
 `flops = 2·routed·hidden·(gateup + downproj)`) over the max-rank
 (critical-path) time.
 
-**per_tensor** — peak 845 TFLOPS/rank:
+The `token back` column is the per-bucket `token_back_mode` the heuristic
+table now selects (`epi` = `epi_warps`, `reuse` = `reuse_dispatch_warps`).
 
-| tok/rank | heuristic config                   | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
-|---------:|------------------------------------|-----------:|-------:|---------:|-----------:|
-|        8 | swap-AB ping-pong M128N16 CGA2x1   |      845.4 |    7.5 |   1025.1 |        6.2 |
-|       16 | swap-AB ping-pong M128N16 CGA1x2   |     1260.5 |   10.1 |   1420.6 |        8.9 |
-|       32 | non-swap M64N256 CGA1x1            |     1768.4 |   14.3 |   1848.8 |       13.7 |
-|       64 | swap-AB ping-pong M128N64 CGA1x2   |     1998.2 |   25.4 |   2153.4 |       23.6 |
-|      128 | swap-AB ping-pong M128N32 CGA1x2   |     1877.6 |   54.0 |   2038.0 |       49.8 |
-|      256 | swap-AB M256N32 CGA2x1             |     1858.6 |  109.2 |   2045.5 |       99.2 |
-|      512 | swap-AB M256N64 CGA1x1             |     2149.7 |  188.8 |   2312.6 |      175.5 |
-|     1024 | swap-AB ping-pong M128N64 CGA1x2   |     2313.3 |  350.9 |   2471.4 |      328.5 |
-|     2048 | non-swap ping-pong M64N128 CGA2x1  |     3101.0 |  523.5 |   3190.1 |      508.9 |
-|     4096 | non-swap ping-pong M64N128 CGA2x2  |     5260.1 |  617.3 |   5455.5 |      595.2 |
-|     8192 | swap-AB ping-pong M128N64 CGA1x2   |     9124.8 |  711.7 |   9498.4 |      683.7 |
-|    16384 | non-swap M64N256 CGA2x1            |    15900.7 |  816.8 |  16694.8 |      778.0 |
-|    32768 | non-swap ping-pong M64N128 CGA2x2  |    30727.8 |  845.4 |  32444.7 |      800.6 |
+**per_tensor** — peak 841 TFLOPS/rank:
 
-**blockwise** — peak 569 TFLOPS/rank:
+| tok/rank | heuristic config                   | token back | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
+|---------:|------------------------------------|:----------:|-----------:|-------:|---------:|-----------:|
+|        8 | swap-AB ping-pong M128N16 CGA2x1   |    epi     |      830.8 |    7.6 |    954.6 |        6.6 |
+|       16 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1248.4 |   10.2 |   1402.7 |        9.0 |
+|       32 | non-swap M64N256 CGA1x1            |    epi     |     1664.4 |   15.2 |   1784.3 |       14.2 |
+|       64 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     1974.6 |   25.7 |   2136.9 |       23.7 |
+|      128 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |     1824.5 |   55.6 |   1986.0 |       51.1 |
+|      256 | swap-AB M256N32 CGA2x1             |    epi     |     2029.5 |  100.0 |   2019.1 |      100.5 |
+|      512 | swap-AB M256N64 CGA1x1             |    epi     |     2096.0 |  193.6 |   2283.9 |      177.7 |
+|     1024 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     2151.0 |  377.4 |   2323.7 |      349.3 |
+|     2048 | non-swap ping-pong M64N128 CGA2x1  |    epi     |     3043.2 |  533.5 |   3191.9 |      508.6 |
+|     4096 | non-swap ping-pong M64N128 CGA2x2  |    epi     |     5081.8 |  638.9 |   5279.4 |      615.0 |
+|     8192 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     8569.0 |  757.9 |   8862.6 |      732.7 |
+|    16384 | non-swap M64N256 CGA2x1            |   reuse    |    15895.2 |  817.1 |  16718.2 |      776.9 |
+|    32768 | non-swap ping-pong M64N128 CGA2x2  |   reuse    |    30902.9 |  840.6 |  32565.7 |      797.6 |
 
-| tok/rank | heuristic config                   | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
-|---------:|------------------------------------|-----------:|-------:|---------:|-----------:|
-|        8 | swap-AB M256N16 CGA2x1             |      854.4 |    7.4 |   1093.9 |        5.8 |
-|       16 | swap-AB M256N16 CGA1x1             |     1255.6 |   10.1 |   1501.4 |        8.4 |
-|       32 | swap-AB ping-pong M128N16 CGA1x2   |     1702.4 |   14.9 |   1943.4 |       13.1 |
-|       64 | swap-AB M256N32 CGA2x1             |     1861.1 |   27.3 |   2102.7 |       24.1 |
-|      128 | swap-AB M256N16 CGA2x1             |     1833.0 |   55.4 |   2074.3 |       48.9 |
-|      256 | swap-AB ping-pong M128N32 CGA1x2   |     2187.3 |   92.8 |   2441.0 |       83.1 |
-|      512 | non-swap M64N128 CGA1x1            |     2560.3 |  158.5 |   2716.7 |      149.4 |
-|     1024 | non-swap M64N128 CGA2x2            |     3048.5 |  266.3 |   3221.1 |      252.0 |
-|     2048 | non-swap M64N128 CGA2x2            |     4304.1 |  377.2 |   4494.9 |      361.2 |
-|     4096 | non-swap M64N128 CGA1x1            |     6951.8 |  467.1 |   7299.1 |      444.9 |
-|     8192 | non-swap M64N128 CGA2x1            |    11684.0 |  555.8 |  12309.7 |      527.5 |
-|    16384 | non-swap M64N128 CGA1x2            |    22846.8 |  568.5 |  24192.1 |      536.9 |
-|    32768 | non-swap M64N128 CGA2x1            |    45931.5 |  565.5 |  48735.8 |      533.0 |
+**blockwise** — peak 568 TFLOPS/rank:
+
+| tok/rank | heuristic config                   | token back | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
+|---------:|------------------------------------|:----------:|-----------:|-------:|---------:|-----------:|
+|        8 | swap-AB M256N16 CGA2x1             |    epi     |      850.6 |    7.5 |   1077.8 |        5.9 |
+|       16 | swap-AB M256N16 CGA1x1             |    epi     |     1251.2 |   10.1 |   1526.0 |        8.3 |
+|       32 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1673.3 |   15.2 |   1924.9 |       13.2 |
+|       64 | swap-AB M256N32 CGA2x1             |    epi     |     1804.0 |   28.1 |   2069.7 |       24.5 |
+|      128 | swap-AB M256N16 CGA2x1             |    epi     |     1803.6 |   56.3 |   2086.1 |       48.6 |
+|      256 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |     2122.8 |   95.6 |   2372.5 |       85.5 |
+|      512 | non-swap M64N128 CGA1x1            |    epi     |     2507.8 |  161.8 |   2712.4 |      149.6 |
+|     1024 | non-swap M64N128 CGA2x2            |   reuse    |     3055.7 |  265.6 |   3223.7 |      251.8 |
+|     2048 | non-swap M64N128 CGA2x2            |   reuse    |     4337.2 |  374.3 |   4488.9 |      361.7 |
+|     4096 | non-swap M64N128 CGA1x1            |   reuse    |     6932.5 |  468.4 |   7256.4 |      447.5 |
+|     8192 | non-swap M64N128 CGA2x1            |   reuse    |    11824.6 |  549.2 |  12405.7 |      523.5 |
+|    16384 | non-swap M64N128 CGA1x2            |   reuse    |    22854.6 |  568.3 |  24392.3 |      532.5 |
+|    32768 | non-swap M64N128 CGA2x1            |   reuse    |    45875.4 |  566.2 |  48830.3 |      532.0 |
 
 ### e2e overhead (the production path)
 
@@ -84,11 +89,19 @@ fused single-launch quant+repack kernel (`FLASHINFER_MEGA_FUSED_STAGE`);
 the SM90 tree has no counterpart yet — this is the top e2e lever (see
 "Next levers").
 
-## The knob surface (no tuner yet)
+## The knob surface
 
-The SM90 tree has **no `tuner.py` / `autotune.py` / knob-cache** — geometry
-and behavior knobs are explicit `Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig` fields, resolved
-once per session at workspace allocation:
+Geometry and behavior knobs are explicit
+`Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig` fields, resolved once per
+session at workspace allocation.  On top of the explicit fields the tree
+now carries the SM100-style tuning stack (`shim/tuner.py`,
+`shim/autotune.py`, `shim/knob_cache.py`): the config's `knobs=` field
+accepts a knob dict, `"auto"` (collective online autotune on first
+compute, winner persisted to the knob cache), or `None` (cache lookup,
+then the heuristic table).  The autotune candidate set is the heuristic
+winner plus every geometry that wins some bucket of the table (16 today,
+derived programmatically) crossed with both validated token-back modes —
+32 candidates.
 
 - `fp8_scale_mode` — `"per_tensor"` (per-expert weight scalar + static
   activation calibration scalars, identical on all EP ranks by contract) or
@@ -108,22 +121,20 @@ once per session at workspace allocation:
 - `load_balance_mode` — `"static"` (default, used by the correctness
   tests) or `"atomic_counter"` (the drop's perf-sweep setting; used by the
   benchmark for reference parity).
-- `token_back_mode` — `epi_warps` (the correctness-validated default),
-  `reuse_dispatch_warps` (the drop's non-ikr perf default, used by the
-  benchmark), or `standalone_warps` (four dedicated token-back warps).
-  All six token_back x reduce combinations are kernel-supported since the
-  combine-surface alignment drop.  `token_back_by_dispatch` remains as a
-  legacy bool alias (True -> `reuse_dispatch_warps`).  NOTE: the push modes
-  are currently only perf-exercised — add a `mega_sm90` correctness case
-  before making one a production default.
+- `token_back_mode` — `epi_warps`, `reuse_dispatch_warps`, or
+  `standalone_warps` (four dedicated token-back warps).  Left unset it
+  follows the per-token-bucket heuristic table (epi_warps small/mid
+  buckets, reuse_dispatch_warps at the GEMM-bound tail — per_tensor
+  >= 16384, blockwise >= 1024; 2026-08-23 four-rank H200 sweep) and is a
+  tuner candidate axis.  All six token_back x reduce combinations are
+  kernel-supported; `epi_warps` / `reuse_dispatch_warps` /
+  `standalone_warps` are all bit-validated by the `mega_sm90` multirank
+  oracles.  `token_back_by_dispatch` remains as a legacy bool alias
+  (True -> `reuse_dispatch_warps`).
 - `in_kernel_fc2_reduce` — REDG atomic-add combine (bf16 unordered sum,
   nondeterministic; validated in `mega_sm90` with the roundoff-envelope
   band, not measured in the sweep above).
 - `fp8_accum_mode`, `kind` (e4m3/e5m2), clamps.
-
-When an SM90 tuner lands, mirror the SM100 flow (`knobs=` dict / knob
-cache / `"auto"` collective online sweep) — the config-field plumbing is
-already shaped for it.
 
 ## Sweep methodology + environment (reproduce recipe)
 
@@ -186,14 +197,8 @@ drop's `*_mega_us` columns are profiler-extracted kernel time only.
    winners may shift (especially the small-token and blockwise large-token
    CGA choices).  Re-derive and refresh `heuristic_config.py` when the
    kernel team's next sweep lands.
-3. **`reuse_dispatch_warps` correctness case** — add
-   `token_back_mode="reuse_dispatch_warps"` to `mega_sm90` so the
-   perf-default path is bit-validated like the rest.
-4. **DSL runtime A/B** — rerun one column on `nvidia-cutlass-dsl>=4.6.1`
+3. **DSL runtime A/B** — rerun one column on `nvidia-cutlass-dsl>=4.6.1`
    to check whether the SM100 perf-floor finding transfers to SM90.
-5. **Tuner + knob cache** — port the SM100 `tuner.py`/`autotune.py`/knob
-   cache stack once the kernel team's tile/knob sweep space for SM90
-   stabilizes.
-6. **CUDA-graph capture** — the SM100 mega layer's warmup+capture path is
+4. **CUDA-graph capture** — the SM100 mega layer's warmup+capture path is
    kernel-agnostic; validate it on sm90_fp8_fp8_bf16_pull_cutedsl (`test_mega_cuda_graph`
    analog) for decode serving.

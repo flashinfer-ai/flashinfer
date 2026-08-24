@@ -391,6 +391,21 @@ class MegaMoEHopperFp8Frontend:
         self._release_workspace()
         self._gate_up_clamp = clamp
 
+    def apply_knobs(self, knobs: Optional[dict]) -> None:
+        """Apply tuner knobs (see :mod:`.tuner`) to the session config.
+
+        Invalidates the compile cache when the effective config changes; the
+        next ``run()``/``warmup()`` recompiles.  Used by :mod:`.autotune`.
+        """
+        from .tuner import with_knobs
+
+        new_config = with_knobs(self.config, knobs)
+        if new_config == self._config:
+            return
+        ensure_not_capturing("apply_knobs (config change)")
+        self._release_workspace()
+        self._config = new_config
+
     def release(self) -> None:
         self._release_workspace()
 
@@ -1178,6 +1193,12 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     kind: HopperFp8Kind = "fp8_e4m3",
     fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor",
     fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc",
+    # knobs=None resolves the knob cache (offline-tuned winners) and falls
+    # back to the heuristic table; a dict applies those knobs directly;
+    # "auto" starts from the resolved knobs and re-tunes at the first
+    # compute (backend-driven collective sweep).  Mutually exclusive with
+    # the explicit geometry arguments below.
+    knobs: Optional[Any] = None,
     swap_ab: Optional[bool] = None,
     pingpong: Optional[bool] = None,
     mma_tiler_mnk: Optional[Tuple[int, int, int]] = None,
@@ -1236,26 +1257,72 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         activation_clamp=activation_clamp,
     )
 
-    # Drop-driver recipe (mega_runner.py main()): heuristic table unless any
-    # geometry/scheduling knob is set manually.  heuristic_config imports
-    # without cutlass; bootstrap_paths already ran at package import.
-    from moe_hopper_fp8.heuristic_config import resolve_hopper_fp8_config
-
-    selection = resolve_hopper_fp8_config(
-        fp8_scale_mode,
-        num_max_tokens,
-        swap_ab=swap_ab,
-        pingpong=pingpong,
-        mma_tiler_mnk=mma_tiler_mnk,
-        cluster_shape_mnk=cluster_shape_mnk,
-        accum_mode=fp8_accum_mode,
+    manual_geometry = any(
+        value is not None
+        for value in (swap_ab, pingpong, mma_tiler_mnk, cluster_shape_mnk)
     )
-    launch = selection.config
-    swap_ab = launch.swap_ab
-    pingpong = launch.pingpong
-    mma_tiler_mnk = launch.mma_tiler_mnk
-    cluster_shape_mnk = launch.cluster_shape_mnk
-    fp8_accum_mode = launch.accum_mode
+    knob_overrides: Dict[str, Any] = {}
+    if manual_geometry:
+        if isinstance(knobs, dict) and knobs:
+            raise ValueError(
+                "pass either explicit geometry arguments (swap_ab / pingpong "
+                "/ mma_tiler_mnk / cluster_shape_mnk) or knobs=, not both."
+            )
+        # Drop-driver recipe (mega_runner.py main()): manual mode fills the
+        # unset geometry knobs with the driver defaults.  heuristic_config
+        # imports without cutlass; bootstrap_paths already ran at package
+        # import.
+        from moe_hopper_fp8.heuristic_config import resolve_hopper_fp8_config
+
+        selection = resolve_hopper_fp8_config(
+            fp8_scale_mode,
+            num_max_tokens,
+            swap_ab=swap_ab,
+            pingpong=pingpong,
+            mma_tiler_mnk=mma_tiler_mnk,
+            cluster_shape_mnk=cluster_shape_mnk,
+            accum_mode=fp8_accum_mode,
+        )
+        launch = selection.config
+        swap_ab = launch.swap_ab
+        pingpong = launch.pingpong
+        mma_tiler_mnk = launch.mma_tiler_mnk
+        cluster_shape_mnk = launch.cluster_shape_mnk
+        fp8_accum_mode = launch.accum_mode
+    else:
+        # knobs=None (or "auto", which starts from the same resolution and
+        # re-tunes at the first compute): pure lookup — offline-tuned cache
+        # entry for this session key when present, else the kernel drop's
+        # token-bucket heuristic table.  An explicit knobs= dict overrides
+        # both entirely; geometry knobs the dict omits keep the table value.
+        from .knob_cache import resolve_knobs as _resolve_cached_knobs
+        from .tuner import GEOMETRY_KNOBS, default_knobs
+
+        if isinstance(knobs, dict):
+            resolved = dict(knobs)
+        else:
+            resolved, _ = _resolve_cached_knobs(
+                dtype=kind,
+                fp8_scale_mode=fp8_scale_mode,
+                world_size=world_size,
+                hidden=hidden,
+                intermediate=intermediate,
+                num_experts=num_total_experts,
+                topk=num_topk,
+                max_tokens=num_max_tokens,
+            )
+        geometry = default_knobs(num_max_tokens, fp8_scale_mode=fp8_scale_mode)
+        geometry.update({k: resolved[k] for k in GEOMETRY_KNOBS if k in resolved})
+        swap_ab = bool(geometry["swap_ab"])
+        pingpong = bool(geometry["pingpong"])
+        mma_tiler_mnk = tuple(geometry["mma_tiler_mnk"])
+        cluster_shape_mnk = tuple(geometry["cluster_shape_mnk"])
+        fp8_accum_mode = geometry["fp8_accum_mode"]
+        knob_overrides = {k: v for k, v in resolved.items() if k not in GEOMETRY_KNOBS}
+        # An explicit caller token-back choice wins over the heuristic
+        # table's / cache's per-bucket pick.
+        if token_back_mode is not None or token_back_by_dispatch:
+            knob_overrides.pop("token_back_mode", None)
 
     cfg = MegaMoEHopperFp8Config(
         rank=rank,
@@ -1284,6 +1351,12 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         flag_batch=flag_batch,
         epi_flag_batch=epi_flag_batch,
     )
+    if knob_overrides:
+        # Non-geometry knobs from the cache/dict (token_back_mode,
+        # load_balance_mode, flag_batch, epi_flag_batch, group_hint, ...).
+        from .tuner import with_knobs
+
+        cfg = with_knobs(cfg, knob_overrides)
     frontend = MegaMoEHopperFp8Frontend(cfg)
 
     data_dtype = cfg.torch_ab_dtype
