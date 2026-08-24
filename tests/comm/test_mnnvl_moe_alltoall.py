@@ -207,7 +207,8 @@ def make_nvfp4_payloads(
     token_selected_experts: torch.Tensor,
     lora_ids: torch.Tensor | None = None,
 ) -> tuple[list, int]:
-    """Create the production NVFP4 dispatch wire layout.
+    """Create the production NVFP4 dispatch wire layout, with an optional
+    fifth LoRA adapter-ID payload.
 
     Dispatch copies opaque bytes, so uint8 scale patterns avoid requiring FP8
     arithmetic while preserving the production one-byte scale width.
@@ -715,7 +716,10 @@ def test_moe_a2a_dispatch(distribution, top_k, use_lora):
 
 
 def test_moe_a2a_dispatch_phased_h2048_nvfp4():
-    """Exercise the specialized H2048/top-k-22 NVFP4 dispatch layout."""
+    """Exercise the specialized H2048/top-k-22 NVFP4 dispatch kernel."""
+    ep_size = MPI.COMM_WORLD.Get_size()
+    if ep_size not in (4, 8, 16):
+        pytest.skip("phased NVFP4 dispatch requires EP4, EP8, or EP16")
     safe_run(moe_a2a_dispatch_test_impl, "uniform", 22, False, 2048)
 
 
@@ -951,5 +955,5 @@ def test_moe_a2a_dispatch_moe_combine(distribution, top_k, use_lora):
 
 
 if __name__ == "__main__":
-    # Run with: mpirun -n 2 python -m pytest tests/comm/test_mnnvl_a2a.py -v
+    # Run with: mpirun -n 4 python -m pytest tests/comm/test_mnnvl_moe_alltoall.py -v
     pytest.main([__file__, "-v", "-s"])

@@ -77,6 +77,8 @@ static bool isPhasedNvfp4PayloadLayout(DispatchKernelPointers const& ptrs, int n
   int const activation_bytes = ptrs.payload_bytes_per_token[0];
   int const scale_bytes = ptrs.payload_bytes_per_token[1];
   int const metadata_bytes = top_k * static_cast<int>(sizeof(int32_t));
+  // Smaller top-k layouts support runtime activation widths (including H1024).
+  // Top-k 22 is restricted to the measured H2048 configuration.
   bool const validated_top_k_layout = top_k < 22 || activation_bytes == kNvfp4H2048ActivationBytes;
   return validated_top_k_layout && activation_bytes > 0 &&
          activation_bytes <= kCompactDispatchMaxPayloadBytes &&
@@ -354,7 +356,8 @@ __device__ void vectorized_dispatch_impl(uint8_t const* src_ptr, int bytes_per_t
     dst_base_k[k] = dst_data + base_token;
   }
 
-  // TODO: process all payloads. index could be reused.
+  // The caller assigns a worker subset to this payload. Only those workers pay
+  // the per-destination pointer setup and copy cost.
   int const stride = num_workers * VEC_SIZE;
   for (int offset = worker_idx * VEC_SIZE; offset < bytes_per_token; offset += stride) {
     vec_t<uint8_t, VEC_SIZE> v;
