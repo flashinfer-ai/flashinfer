@@ -1,12 +1,14 @@
 """
 Tests for DiT (Diffusion Transformer) oriented ragged attention kernels.
 
-Covers three variants:
-1. Q/K/V all FP8 E4M3 (standard case)
-2. Q/K in BF16, V in FP8 E4M3 (DiT: BMM1 in BF16, BMM2 in FP8)
-3. BF16 Q/K/V quantized on GPU to SageAttention INT8/FP8, then run by attention
+Covers four variants:
+1. Q/K/V all BF16
+2. Q/K/V all FP8 E4M3 (standard case)
+3. Q/K in BF16, V in FP8 E4M3 (DiT: BMM1 in BF16, BMM2 in FP8)
+4. BF16 Q/K/V quantized on GPU to SageAttention INT8/FP8, then run by attention
 
-All tests run on SM100/SM103 only (Blackwell).
+Non-Sage tests run on SM10x targets (SM100/SM103/SM107).
+SageAttention INT8 tests require SM100.
 """
 
 import math
@@ -86,18 +88,93 @@ def _ragged_reference_bf16(
 
 
 # ---------------------------------------------------------------------------
-# Test 1: Q/K/V all FP8
+# Test 1: Q/K/V all BF16 at head_dim=64
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(
-    CC_MAJOR != 10, reason="DiT attention tests require SM100/SM103 (Blackwell)."
+    CC_MAJOR != 10, reason="DiT attention tests require an SM10x target."
+)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("skips_softmax", [False, True])
+def test_trtllm_ragged_dit_qkv_bf16_head_dim_64(
+    causal: bool,
+    skips_softmax: bool,
+):
+    torch.manual_seed(42)
+    device = GPU_DEVICE
+    batch_size = 2
+    num_heads = 8
+    head_dim = 64
+
+    q_lens = torch.tensor([256, 192], dtype=torch.int32, device=device)
+    kv_lens = torch.tensor([512, 384], dtype=torch.int32, device=device)
+    total_q = int(q_lens.sum())
+    total_kv = int(kv_lens.sum())
+
+    q = torch.randn(total_q, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    k = torch.randn(total_kv, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+    v = torch.randn(total_kv, num_heads, head_dim, device=device, dtype=torch.bfloat16)
+
+    scale = 1.0 / math.sqrt(head_dim)
+    qo_indptr = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), q_lens.cumsum(0).int()]
+    )
+    kv_indptr = torch.cat(
+        [torch.zeros(1, dtype=torch.int32, device=device), kv_lens.cumsum(0).int()]
+    )
+
+    out_trtllm = flashinfer.prefill.trtllm_ragged_attention_deepseek(
+        q,
+        k,
+        v,
+        _get_workspace(),
+        kv_lens,
+        int(q_lens.max()),
+        int(kv_lens.max()),
+        scale,
+        1.0,
+        -1,
+        batch_size,
+        -1,
+        qo_indptr,
+        kv_indptr,
+        False,
+        causal,
+        False,
+        skip_softmax_threshold_scale_factor=1e-30 if skips_softmax else None,
+    )
+
+    out_ref = _ragged_reference_bf16(
+        q,
+        k,
+        v,
+        q_lens,
+        kv_lens,
+        scale,
+        causal,
+    )
+    torch.testing.assert_close(
+        out_trtllm.float(),
+        out_ref.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 2: Q/K/V all FP8
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    CC_MAJOR != 10, reason="DiT attention tests require an SM10x target."
 )
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("s_qo,s_kv", [(512, 512), (256, 512)])
 @pytest.mark.parametrize("num_heads", [1, 8])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [64, 128])
 def test_trtllm_ragged_dit_qkv_fp8(
     causal: bool,
     batch_size: int,
@@ -177,18 +254,18 @@ def test_trtllm_ragged_dit_qkv_fp8(
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Q/K in BF16, V in FP8 E4M3 (DiT mixed-dtype)
+# Test 3: Q/K in BF16, V in FP8 E4M3 (DiT mixed-dtype)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(
-    CC_MAJOR != 10, reason="DiT attention tests require SM100/SM103 (Blackwell)."
+    CC_MAJOR != 10, reason="DiT attention tests require an SM10x target."
 )
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("s_qo,s_kv", [(512, 512), (256, 512)])
 @pytest.mark.parametrize("num_heads", [1, 8])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [64, 128])
 def test_trtllm_ragged_dit_qk_bf16_v_fp8(
     causal: bool,
     batch_size: int,
@@ -269,7 +346,7 @@ def test_trtllm_ragged_dit_qk_bf16_v_fp8(
 
 
 # ---------------------------------------------------------------------------
-# Test 3: Q/K quantized to INT8, V to FP8 E4M3, with SageAttention block scaling
+# Test 4: Q/K quantized to INT8, V to FP8 E4M3, with SageAttention block scaling
 # ---------------------------------------------------------------------------
 
 
@@ -281,7 +358,7 @@ def test_trtllm_ragged_dit_qk_bf16_v_fp8(
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("s_qo,s_kv", [(256, 256), (1560, 1560), (512, 2048)])
 @pytest.mark.parametrize("num_heads", [1, 8])
-@pytest.mark.parametrize("head_dim", [128])
+@pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("sage_blk_q", [1])
 @pytest.mark.parametrize("sage_blk_k", [4, 16])
 @pytest.mark.parametrize("smooth_k", [False, True])
