@@ -2256,6 +2256,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         self._dtype_act = dtype_act
         self._dtype_weights = dtype_weights
         self._fp8_quantization_type = Fp8QuantizationType.NoneFp8
+        self._per_token: bool | None = self.config.quant.per_token_scale
 
         # enable_pdl=None means "auto" — resolve once here exactly like the
         # high-level wrapper does before building its MoERunner, because the raw
@@ -2288,7 +2289,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             activation_type=self._activation_type,
             use_shuffled_weight=True,
             weight_layout=int(WeightLayout.MajorK),
-            use_per_token_scaling=False,
+            use_per_token_scaling=self._per_token,
             num_experts=self.config.routing.num_experts,
             num_fused_shared_experts=self._num_fused_shared_experts,
         )
@@ -2503,6 +2504,12 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                 "Dedicated fused shared experts require FromLogits routing; "
                 "pre-routed callers must append shared ids and weights themselves."
             )
+
+        if self._per_token and not act.per_token_scale:
+            raise RuntimeError(
+                "Per-token NVFP4 scale is configured but no activation scale is given."
+            )
+
         if routing_input_mode == RoutingInputMode.FromLogits:
             # In-kernel routing: topk_ids/expert_weights are OUTPUT buffers the kernel fills.
             # Unlike the FP8 launcher, FP4 receives routing_input_mode explicitly;
@@ -2591,7 +2598,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             hidden_states=act.hidden_states_q,
             hidden_states_scale=hidden_states_scale,
             gemm1_lora_delta=None,
-            per_token_scale=None,
+            per_token_scale=act.per_token_scale,
         )
 
         # Static (num_tokens-invariant) launch arguments for the fp4 branch of
@@ -2612,7 +2619,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             output1_scale_scalar=v.get("output1_scale_scalar"),
             output1_scale_gate_scalar=v.get("output1_scale_gate_scalar"),
             output2_scale_scalar=v.get("output2_scale_scalar"),
-            per_token_scale=None,
+            per_token_scale=act.per_token_scale,
             num_experts=routing.num_experts,
             num_fused_shared_experts=self._num_fused_shared_experts,
             n_group=routing.n_group,
