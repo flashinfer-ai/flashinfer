@@ -127,6 +127,21 @@ def _assert_distributed_close(
     return float(max_abs.item())
 
 
+def _rank_order_state_allreduce(
+    local: torch.Tensor,
+    dtype: torch.dtype,
+    group: dist.ProcessGroup,
+) -> torch.Tensor:
+    locals_by_rank = [
+        torch.empty_like(local) for _ in range(dist.get_world_size(group))
+    ]
+    dist.all_gather(locals_by_rank, local, group=group)
+    reduced = locals_by_rank[0]
+    for peer_local in locals_by_rank[1:]:
+        reduced = (reduced.float() + peer_local.float()).to(dtype)
+    return reduced
+
+
 def _seed(operation: str, world_size: int, rank: int, token_num: int) -> int:
     operation_offset = 0 if operation == "reduction" else 1_000_000
     return 0xCA4E0000 + operation_offset + world_size * 10000 + rank * 100 + token_num
@@ -184,18 +199,25 @@ def _make_reduction_case(
     ).contiguous()
     rms_eps = 1e-5
 
-    local = (
-        expert_input.float() * expert_scale.float().unsqueeze(-1)
-    ).sum(dim=0) + token_input.float()
-    allreduce_ref = local.to(dtype)
-    dist.all_reduce(allreduce_ref, group=group)
+    local = torch.zeros_like(token_input)
+    for expert in range(ACTIVE_EXPERTS):
+        contribution = (
+            expert_input[expert].float()
+            * expert_scale[expert].float().unsqueeze(-1)
+        ).to(dtype)
+        local = (local.float() + contribution.float()).to(dtype)
+    local = (local.float() + token_input.float()).to(dtype)
+    allreduce_ref = _rank_order_state_allreduce(local, dtype, group)
     allreduce_ref_f32 = allreduce_ref.float()
-    residual_ref = allreduce_ref_f32 + residual_in.float()
+    residual_ref = (allreduce_ref_f32 + residual_in.float()).to(dtype)
+    residual_ref_f32 = residual_ref.float()
     norm_ref = (
-        residual_ref
-        * torch.rsqrt(residual_ref.square().mean(dim=-1, keepdim=True) + rms_eps)
+        residual_ref_f32
+        * torch.rsqrt(
+            residual_ref_f32.square().mean(dim=-1, keepdim=True) + rms_eps
+        )
         * rms_gamma.float()
-    )
+    ).to(dtype)
 
     moe_allreduce_out = torch.empty_like(residual_in) if emit_allreduce else None
     residual_out = torch.empty_like(residual_in)
@@ -313,21 +335,27 @@ def _make_finalize_case(
     routed = 1.0 if routed_scaling_factor is None else routed_scaling_factor
     eps = 1e-5
 
-    local = (
-        allreduce_in[inverse_indices].float()
-        * expert_scale.float().unsqueeze(-1)
-        * routed
-    ).sum(dim=1)
+    gathered = allreduce_in[inverse_indices]
+    local = torch.zeros_like(residual_in)
+    for route in range(TOP_K):
+        contribution = (
+            gathered[:, route].float()
+            * expert_scale[:, route].float().unsqueeze(-1)
+        ).to(dtype)
+        local = (local.float() + contribution.float()).to(dtype)
+    local = (local.float() * routed).to(dtype)
     if shared_expert_output is not None:
-        local = local + shared_expert_output.float()
-    finalized_ref = local.to(dtype)
-    dist.all_reduce(finalized_ref, group=group)
-    residual_ref = finalized_ref.float() + residual_in.float()
+        local = (local.float() + shared_expert_output.float()).to(dtype)
+    finalized_ref = _rank_order_state_allreduce(local, dtype, group)
+    residual_ref = (finalized_ref.float() + residual_in.float()).to(dtype)
+    residual_ref_f32 = residual_ref.float()
     norm_ref = (
-        residual_ref
-        * torch.rsqrt(residual_ref.square().mean(dim=-1, keepdim=True) + eps)
+        residual_ref_f32
+        * torch.rsqrt(
+            residual_ref_f32.square().mean(dim=-1, keepdim=True) + eps
+        )
         * norm_weight.float()
-    )
+    ).to(dtype)
 
     residual_out = torch.empty_like(residual_in)
     norm_out = torch.empty_like(residual_in)
