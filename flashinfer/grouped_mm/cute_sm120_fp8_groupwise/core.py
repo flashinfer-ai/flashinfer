@@ -35,7 +35,7 @@ from .._sm120_moe_autotune import (
 from ..cute_sm120_mxfp8_groupwise import _check_m_indptr
 
 
-_FP8_MOE_TACTIC_SCHEMA_VERSION = 3
+_FP8_MOE_TACTIC_SCHEMA_VERSION = 4
 _FP8_MOE_PLAIN_TACTICS = (
     (_FP8_MOE_TACTIC_SCHEMA_VERSION, 32, 128),
     (_FP8_MOE_TACTIC_SCHEMA_VERSION, 64, 128),

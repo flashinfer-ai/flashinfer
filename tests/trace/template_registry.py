@@ -72,6 +72,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.kda",
     "flashinfer.kda_decode",
     "flashinfer.mamba.selective_state_update",
+    "flashinfer.mamba.ssd_combined",
     "flashinfer.mhc",
     "flashinfer.mla._core",
     "flashinfer.msa_ops.proxy_score",
