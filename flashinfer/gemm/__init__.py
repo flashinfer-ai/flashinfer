@@ -35,10 +35,14 @@ from .gemm_svdquant import (
 )
 
 from .routergemm import (
-    mm_M1_16 as mm_M1_16,
     mm_M1_16_K6144_N256 as mm_M1_16_K6144_N256,
     mm_M1_16_K7168_N128 as mm_M1_16_K7168_N128,
     mm_M1_16_K7168_N256 as mm_M1_16_K7168_N256,
+    mm_M1_16_K7168_N256_bf16 as mm_M1_16_K7168_N256_bf16,
+    mm_M1_16_K7168_N384 as mm_M1_16_K7168_N384,
+    mm_M1_16_K7168_N384_bf16 as mm_M1_16_K7168_N384_bf16,
+    mm_M1_16_K7168_N896 as mm_M1_16_K7168_N896,
+    mm_M1_16_K7168_N896_bf16 as mm_M1_16_K7168_N896_bf16,
     tinygemm_bf16 as tinygemm_bf16,
 )
 
@@ -115,10 +119,14 @@ __all__ = (
         "fp8_blockscale_gemm_sm90",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
-        "mm_M1_16",
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
         "mm_M1_16_K7168_N256",
+        "mm_M1_16_K7168_N256_bf16",
+        "mm_M1_16_K7168_N384",
+        "mm_M1_16_K7168_N384_bf16",
+        "mm_M1_16_K7168_N896",
+        "mm_M1_16_K7168_N896_bf16",
         "tinygemm_bf16",
     ]
     + _cute_dsl_kernels

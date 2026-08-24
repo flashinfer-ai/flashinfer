@@ -88,21 +88,20 @@ Mixed Precision GEMM (fp8 x fp4)
     group_gemm_mxfp8_mxfp4_nt_groupwise
     group_gemm_nvfp4_nt_groupwise
 
-MoE Router GEMM
----------------
-
-``mm_M1_16`` is the general entry point and covers any expert count with a
-hidden dim that is a multiple of 1024 (DeepSeek-V3, GLM-MoE-DSA, Mistral
-Large 3, Kimi-K2, Kimi-K3, ...).  The remaining names are fixed-shape aliases
-kept for backwards compatibility.
+Router GEMM (DeepSeek-V3 / Mistral / GLM / Kimi-K2 / Kimi-K3)
+-------------------------------------------------------------
 
 .. autosummary::
     :toctree: ../generated
 
-    mm_M1_16
     mm_M1_16_K7168_N128
     mm_M1_16_K7168_N256
     mm_M1_16_K6144_N256
+    mm_M1_16_K7168_N256_bf16
+    mm_M1_16_K7168_N384
+    mm_M1_16_K7168_N384_bf16
+    mm_M1_16_K7168_N896
+    mm_M1_16_K7168_N896_bf16
     tinygemm_bf16
 
 Blackwell SM100 GEMM

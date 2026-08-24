@@ -1940,68 +1940,6 @@ mm_M1_16_K6144_N256_trace = TraceTemplate(
 )
 
 
-# ── mm_M1_16 (generic MoE router GEMM) ───────────────────────────────────────
-
-
-@torch.no_grad()
-def _mm_M1_16_reference(mat_a, mat_b, out, launch_with_pdl: bool = False, **_unused):
-    """Reference for the generic MoE router GEMM (M=1..16, K a multiple of 1024).
-    Mutates ``out`` in-place; returns it.
-    """
-    a = mat_a.to(torch.float32)
-    b = mat_b.to(torch.float32)
-    out.copy_((a @ b).to(out.dtype))
-    return out
-
-
-def _mm_M1_16_init(
-    *,
-    M: int,
-    K: int = 7168,
-    N: int = 256,
-    out_dtype: str = "float32",
-    device: str = "cuda",
-    seed: int = 0,
-):
-    """Build inputs for the generic MoE router GEMM. Mutates ``out``."""
-    torch.manual_seed(seed)
-    M, K, N = int(M), int(K), int(N)
-    if not 1 <= M <= 16:
-        raise ValueError(f"M must be in [1, 16], got {M}")
-    if K % 1024 != 0:
-        raise ValueError(f"K must be a multiple of 1024, got {K}")
-    mat_a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
-    # mat_b is consumed column-major: build it (N, K) row-major and transpose.
-    mat_b = torch.randn(N, K, dtype=torch.bfloat16, device=device).t()
-    out = torch.empty(M, N, dtype=getattr(torch, out_dtype), device=device)
-    return {"mat_a": mat_a, "mat_b": mat_b, "out": out}
-
-
-mm_M1_16_trace = TraceTemplate(
-    op_type="gemm_bf16",
-    name_prefix="mm_M1_16",
-    description=(
-        "MoE router-GEMM: out = mat_a @ mat_b for M in [1, 16], K any multiple "
-        "of 1024, N the expert count. Mutates ``out`` in-place."
-    ),
-    axes={
-        "M": Var(description="Number of tokens (1-16)."),
-        "K": Var(description="Hidden dim (any multiple of 1024)."),
-        "N": Var(description="Number of experts."),
-    },
-    inputs={
-        "mat_a": Tensor(["M", "K"]),
-        "mat_b": Tensor(["K", "N"]),
-        "out": Tensor(["M", "N"], description="In-place output."),
-    },
-    outputs={
-        "out": Tensor(["M", "N"], dtype_from="out"),
-    },
-    tags=["status:verified", "moe"],
-    reference=_mm_M1_16_reference,
-    init=_mm_M1_16_init,
-)
-
 # ── trtllm_ragged_attention_deepseek (DeepSeek ragged prefill) ───────────────
 
 
