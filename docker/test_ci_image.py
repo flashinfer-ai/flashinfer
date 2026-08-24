@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.metadata
+import json
 import os
 import platform
 import re
 import shutil
 import subprocess
 from collections.abc import Sequence
+from pathlib import Path
 from typing import NoReturn
 
 
@@ -19,6 +21,8 @@ DOCKER_ARCH_TO_MACHINE = {
     "amd64": "x86_64",
     "arm64": "aarch64",
 }
+
+DEPENDENCY_POLICY_PATH = Path("/install/ci/cuda-versions.json")
 
 
 def _fail(message: str) -> NoReturn:
@@ -109,6 +113,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     actual_cudnn = importlib.metadata.version(cudnn_package)
     if actual_cudnn != expected_cudnn:
         _fail(f"{cudnn_package} is {actual_cudnn}; expected {expected_cudnn}")
+
+    try:
+        dependency_policy = json.loads(DEPENDENCY_POLICY_PATH.read_text())[
+            "dependency_policy"
+        ]
+    except (KeyError, OSError, json.JSONDecodeError) as error:
+        _fail(f"could not read CI dependency policy: {error}")
+    for distribution, policy in dependency_policy.items():
+        expected_version = policy["ci_image_version"]
+        actual_version = importlib.metadata.version(distribution)
+        if actual_version != expected_version:
+            _fail(f"{distribution} is {actual_version}; expected {expected_version}")
 
     expected_backend = _expected_cudnn_backend(expected_cudnn)
     actual_backend = cudnn.backend_version()
