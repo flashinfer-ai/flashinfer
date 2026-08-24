@@ -4974,8 +4974,8 @@ class MoEDirectMicroKernel:
         # static path passes workspace-sized buffers (dm_slots) -- so launch
         # with length-1 views: same base address, and every device-side
         # access goes through get_ptr_as_int64 (iterator + offset), so the
-        # full buffer stays reachable. Verified on SM120 (RTX 5090); see
-        # flashinfer-ai#4317.
+        # full buffer stays reachable. Verified on SM120 (RTX 5090); and
+        # sm_121a (GB10, aarch64); see flashinfer-ai#4317.
         compiled_fn(
             x.data_ptr(),
             w1_fp4.data_ptr(),
@@ -5228,8 +5228,14 @@ def compile_direct_micro_kernel(
         compiled *without* the flag does expose ``.library``.
 
         Only the host entry ABI differs between the two, so the device code --
-        and therefore its register allocation and max threads per block -- is
-        the same. This costs one extra compile, paid once per artifact on a
+        and therefore its register allocation and max threads per block --
+        should be identical. That equivalence is assumed, not measured: the
+        TVM-FFI side cannot be inspected in-process (above), and the persisted
+        ``.o`` is a host ELF with no ``.nv_fatbin``, so cuobjdump sees no
+        device code in it either -- the comparison needs two live compiles.
+        Measured on the reference side for direct_micro_m1_k256_n512_t2
+        (sm_121a): 74 regs, 768 max threads per block, against a 512-thread
+        CTA. This costs one extra compile, paid once per artifact on a
         cold miss and never again: the answer is persisted next to the ``.o``
         and every later process reads it back.
         """
