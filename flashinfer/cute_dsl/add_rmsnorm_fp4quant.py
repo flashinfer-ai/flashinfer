@@ -199,13 +199,13 @@ class AddRMSNormFP4QuantKernel:
         dtype: cutlass.Numeric,
         H: int,
         block_size: int,
-        launch_config: tuple[int, int, int],
         output_swizzled: bool,
         is_fp16: bool,
         sm_version: int | None = None,
         scale_format: str | None = None,
         output_both_sf_layouts: bool = False,
         output_norm: bool = False,
+        launch_config: tuple[int, int, int] | None = None,
     ):
         self.dtype = dtype
         self.H = H
@@ -225,6 +225,15 @@ class AddRMSNormFP4QuantKernel:
         assert self.scale_format in ("e4m3", "ue8m0"), (
             "scale_format must be 'e4m3' or 'ue8m0'"
         )
+
+        if launch_config is None:
+            cluster_n = self._compute_cluster_n(H, dtype, self.sm_version)
+            H_per_cta = H // cluster_n
+            launch_config = (
+                cluster_n,
+                self._compute_threads_per_row(H_per_cta),
+                self._compute_num_threads(H_per_cta),
+            )
 
         self.cluster_n, self.threads_per_row, self.num_threads = launch_config
         self.H_per_cta = H // self.cluster_n
@@ -320,6 +329,7 @@ class AddRMSNormFP4QuantKernel:
         return threads_per_row, num_threads
 
     @staticmethod
+    @functools.lru_cache(maxsize=1024)
     def _compute_launch_config(
         H: int,
         M: int,
