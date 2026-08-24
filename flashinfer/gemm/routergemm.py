@@ -463,10 +463,10 @@ def get_tinygemm2_module():
     )
 
 
-# tinygemm2_sm100: generated SM100/SM103 variants of the same kernel. Loom
+# tinygemm2_sm100: generated SM100-family variants of the same kernel. Loom
 # schedules exactly porting csrc/tinygemm2.cu with bit-identical outputs;
-# selected automatically for the bias path on B200/B300-class devices. Ring
-# depth (stage 4/8/16) is selected inside the binding, mirroring the
+# selected automatically for the bias path on B200/B300/Rubin-class devices.
+# Ring depth (stage 4/8/16) is selected inside the binding, mirroring the
 # reference launcher convention.
 
 
@@ -556,9 +556,9 @@ def tinygemm_bf16(
     Requires SM90+ (Hopper or newer).  Raises ``ValueError`` if tensor
     dimensions, dtypes, or alignment constraints are violated.
 
-    On SM100/SM103 (B200/B300 class) devices the bias path dispatches to
-    ``tinygemm2_sm100`` — generated variants of the same kernel with
-    bit-identical outputs and lower latency (see
+    On SM100/SM103/SM107 (B200/B300/Rubin class) devices the bias path
+    dispatches to ``tinygemm2_sm100`` — generated variants of the same kernel
+    with bit-identical outputs and lower latency (see
     ``csrc/tinygemm2_sm100.cu``).  Set ``FLASHINFER_DISABLE_TINYGEMM2_SM100=1``
     to force the reference implementation everywhere.
     """
