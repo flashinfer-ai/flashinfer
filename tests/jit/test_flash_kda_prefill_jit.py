@@ -97,6 +97,69 @@ def test_h12_prefill_variants_are_in_the_aot_inventory():
         ("sm100f", "-DFLASHINFER_FLASH_KDA_TARGET_FAMILY=100"),
     ),
 )
+def test_combined_bt16_jit_spec(target, target_define):
+    flash_kda.gen_flash_kda_module.cache_clear()
+    spec = flash_kda.gen_flash_kda_module("bt16_prepare_chain_m64_s8", target)
+
+    csrc_dir = flash_kda._get_flash_kda_csrc_dir()
+    assert spec.name == (
+        f"flash_kda_bf16_bt16_prepare_chain_m64_s8_6c392ef667_{target}"
+    )
+    assert spec.sources == [
+        csrc_dir / "cake_flashkda_bf16_bt16_prepare_binding.cu",
+        csrc_dir / "cake_flashkda_bf16_bt16_chain_m64_binding.cu",
+        csrc_dir / "cake_flashkda_bf16_bt16_prepare_chain_m64_binding.cu",
+    ]
+    assert "-DFLASHINFER_FLASH_KDA_COMBINED_BT16=1" in spec.extra_cuda_cflags
+    assert target_define in spec.extra_cuda_cflags
+    assert "bt16_prepare_chain_m64_s8" in flash_kda.FLASH_KDA_VARIANTS
+
+    flash_kda.gen_flash_kda_module.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("target", "target_define"),
+    (
+        ("sm100a", "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=0"),
+        ("sm100f", "-DFLASHINFER_FLASH_KDA_TARGET_FAMILY=100"),
+    ),
+)
+def test_short_n16_jit_spec_and_frozen_source(target, target_define):
+    flash_kda.gen_flash_kda_module.cache_clear()
+    spec = flash_kda.gen_flash_kda_module("m128_n16_short", target)
+
+    assert spec.name == f"flash_kda_bf16_m128_n16_short_7a9b1c01a0_{target}"
+    assert spec.sources == [
+        flash_kda._get_flash_kda_csrc_dir()
+        / "cake_flashkda_bf16_fused_m128_n16_binding.cu"
+    ]
+    assert "-DFLASHINFER_FLASH_KDA_N16_SHORT=1" in spec.extra_cuda_cflags
+    assert target_define in spec.extra_cuda_cflags
+    assert sum("-gencode=arch=compute_" in flag for flag in spec.extra_cuda_cflags) == 1
+
+    frozen_source = (
+        flash_kda._get_flash_kda_csrc_dir()
+        / "cake_flashkda_bf16_fused_m128_n16_short.cu"
+    )
+    payload = frozen_source.read_bytes()
+    assert hashlib.sha256(payload).hexdigest() == (
+        "7a9b1c01a0abd04c0d2baddbcfc6043b693c80be728691f1fc6d2325db6a238e"
+    )
+    text = payload.decode()
+    assert "#define SMEM_TOTAL 112256" in text
+    assert "__launch_bounds__(512)" in text
+    assert "m128_n16_short" in flash_kda.FLASH_KDA_VARIANTS
+
+    flash_kda.gen_flash_kda_module.cache_clear()
+
+
+@pytest.mark.parametrize(
+    ("target", "target_define"),
+    (
+        ("sm100a", "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=0"),
+        ("sm100f", "-DFLASHINFER_FLASH_KDA_TARGET_FAMILY=100"),
+    ),
+)
 def test_tensor_state_decay_jit_spec_and_frozen_source(target, target_define):
     flash_kda.gen_flash_kda_module.cache_clear()
     spec = flash_kda.gen_flash_kda_module("m128_tensor_state_decay", target)

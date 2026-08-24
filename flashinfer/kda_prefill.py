@@ -137,6 +137,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
                 "m128_h12_long",
                 "m128_n16",
                 "m128_n16_checkpoint",
+                "m128_n16_short",
                 "persistent_m128",
                 "small_bh_m128",
                 "bt16_prepare",
@@ -577,12 +578,9 @@ def _should_use_bt16_prepare_chain(
 
 
 def _direct_m128_route(*, num_heads: int, max_sequence_length: int = 0) -> str:
-    # The exported N16 binding does not meet the BF16 qualification tolerance
-    # for the short H96 production rows; the existing N32 module does.
-    short_n16 = 0 < max_sequence_length <= _FLASH_KDA_BT16_CHUNK and num_heads != 96
     return (
         _FLASH_KDA_ROUTE_DIRECT_M128_N16
-        if num_heads == 12 or short_n16
+        if num_heads == 12 or 0 < max_sequence_length <= _FLASH_KDA_BT16_CHUNK
         else _FLASH_KDA_ROUTE_DIRECT_M128
     )
 
@@ -682,6 +680,7 @@ def _select_flash_kda_bf16_route(
     ):
         return _FLASH_KDA_ROUTE_SMALL_BH_M128
     if _requires_exact_n16_recurrence(
+        compute_capability=compute_capability,
         sm_count=sm_count,
         fixed_layout=fixed_layout,
         num_sequences=num_sequences,
@@ -742,16 +741,18 @@ def _select_bt16_physical_variants(
 
 def _requires_exact_n16_recurrence(
     *,
+    compute_capability: tuple[int, int],
     sm_count: int,
     fixed_layout: bool,
     num_sequences: int,
     num_heads: int,
     uniform_sequences: bool,
 ) -> bool:
-    """Select the measured N16 graph for the 148-SM H96/N128 holdout."""
+    """Retain the SM100 N16 accuracy fallback for the 148-SM H96/N128 row."""
 
     return (
-        sm_count == 148
+        compute_capability == (10, 0)
+        and sm_count == 148
         and not fixed_layout
         and num_sequences == 128
         and num_heads == 96
@@ -1131,6 +1132,8 @@ def _state_scratch(
 def _beta_tma_source(
     beta: torch.Tensor,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
+    *,
+    chunk_tokens: int,
 ) -> torch.Tensor:
     batch_size, seq_len, num_heads = beta.shape
     total_tokens = batch_size * seq_len
@@ -1146,13 +1149,13 @@ def _beta_tma_source(
             (beta.stride(1), beta.stride(2)),
         )
     if (
-        total_tokens >= 32
+        total_tokens >= chunk_tokens
         and num_heads >= _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
         and beta_flat.data_ptr() % 16 == 0
         and beta_flat.stride(0) * beta.element_size() % 16 == 0
     ):
         return beta_flat
-    padded_tokens = max(total_tokens, 32)
+    padded_tokens = max(total_tokens, chunk_tokens)
     padded_heads = (
         (num_heads + _FLASH_KDA_BETA_TMA_HEADS_PER_BOX - 1)
         // _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
@@ -1671,54 +1674,110 @@ def _run_bt16_prepare_chain(
             )
         prepare_flags[variant] = 0 if capturing else int(warmed_signature != signature)
 
-    prepare_module = _get_flash_kda_prefill_module(prepare_variant, target)
-    chain_module = _get_flash_kda_prefill_module(chain_variant, target)
+    combined_variant: Optional["FlashKDAVariant"] = (
+        "bt16_prepare_chain_m64_s8"
+        if prepare_variant == "bt16_prepare" and chain_variant == "bt16_chain_m64_s8"
+        else None
+    )
+    combined_module = (
+        _get_flash_kda_prefill_module(combined_variant, target)
+        if combined_variant is not None
+        else None
+    )
+    prepare_module = (
+        None
+        if combined_module is not None
+        else _get_flash_kda_prefill_module(prepare_variant, target)
+    )
+    chain_module = (
+        None
+        if combined_module is not None
+        else _get_flash_kda_prefill_module(chain_variant, target)
+    )
     try:
-        prepare_module.run(
-            q,
-            k,
-            g,
-            beta,
-            A_log,
-            dt_bias,
-            cu_seqlens,
-            cu_chunks,
-            chunk_to_seq,
-            qd,
-            kd,
-            w,
-            qk,
-            diag,
-            workspace._descriptor_storages[prepare_variant],
-            prepare_flags[prepare_variant],
-            total_chunks,
-            num_heads,
-            lower_bound,
-            prepare_ctas,
-            stream_ptr,
-        )
-        chain_module.run(
-            qd,
-            kd,
-            w,
-            qk,
-            diag,
-            v,
-            cu_seqlens,
-            cu_chunks,
-            seq_order,
-            initial_state,
-            out,
-            final_state,
-            workspace._descriptor_storages[chain_variant],
-            prepare_flags[chain_variant],
-            num_heads,
-            int(use_initial_state),
-            int(store_final_state),
-            scale,
-            _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks,
-            stream_ptr,
-        )
+        if combined_module is not None:
+            combined_module.run(
+                q,
+                k,
+                g,
+                beta,
+                A_log,
+                dt_bias,
+                cu_seqlens,
+                cu_chunks,
+                chunk_to_seq,
+                qd,
+                kd,
+                w,
+                qk,
+                diag,
+                v,
+                seq_order,
+                initial_state,
+                out,
+                final_state,
+                workspace._descriptor_storages[prepare_variant],
+                workspace._descriptor_storages[chain_variant],
+                prepare_flags[prepare_variant],
+                prepare_flags[chain_variant],
+                total_chunks,
+                num_heads,
+                lower_bound,
+                prepare_ctas,
+                int(use_initial_state),
+                int(store_final_state),
+                scale,
+                _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks,
+                stream_ptr,
+            )
+        else:
+            assert prepare_module is not None
+            assert chain_module is not None
+            prepare_module.run(
+                q,
+                k,
+                g,
+                beta,
+                A_log,
+                dt_bias,
+                cu_seqlens,
+                cu_chunks,
+                chunk_to_seq,
+                qd,
+                kd,
+                w,
+                qk,
+                diag,
+                workspace._descriptor_storages[prepare_variant],
+                prepare_flags[prepare_variant],
+                total_chunks,
+                num_heads,
+                lower_bound,
+                prepare_ctas,
+                stream_ptr,
+            )
+            chain_module.run(
+                qd,
+                kd,
+                w,
+                qk,
+                diag,
+                v,
+                cu_seqlens,
+                cu_chunks,
+                seq_order,
+                initial_state,
+                out,
+                final_state,
+                workspace._descriptor_storages[chain_variant],
+                prepare_flags[chain_variant],
+                num_heads,
+                int(use_initial_state),
+                int(store_final_state),
+                scale,
+                _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks,
+                stream_ptr,
+            )
     except Exception:
         for variant, flag in prepare_flags.items():
             if flag:
@@ -1934,6 +1993,7 @@ def _run_flash_kda_prefill(
         "m128_h12_short",
         "m128_h12_long",
         "m128_n16",
+        "m128_n16_short",
         "persistent_m128",
         "small_bh_m128",
     ]
@@ -1948,7 +2008,13 @@ def _run_flash_kda_prefill(
     elif persistent_plan is not None:
         variant = "persistent_m128"
     elif route == _FLASH_KDA_ROUTE_DIRECT_M128_N16:
-        variant = "m128_n16"
+        variant = (
+            "m128_n16_short"
+            if num_heads != 12
+            and 0 < max_sequence_length <= _FLASH_KDA_BT16_CHUNK
+            and checkpoint_every_n_tokens == 0
+            else "m128_n16"
+        )
     elif num_heads == 12:
         variant = (
             "m128_h12_short"
@@ -2081,11 +2147,15 @@ def _run_flash_kda_prefill(
                 # Preserve the general public route for accepted layouts that
                 # cannot expose the source runtime's zero-copy H12 carrier.
                 variant = "m128"
-                beta_tma = _beta_tma_source(beta, workspace)
+                beta_tma = _beta_tma_source(beta, workspace, chunk_tokens=32)
             else:
                 beta_tma = pair_packed_beta_tma
         else:
-            beta_tma = _beta_tma_source(beta, workspace)
+            beta_tma = _beta_tma_source(
+                beta,
+                workspace,
+                chunk_tokens=(16 if variant in ("m128_n16", "m128_n16_short") else 32),
+            )
         packet_workspace = None
         packet_ready = None
         packet_consumed = None

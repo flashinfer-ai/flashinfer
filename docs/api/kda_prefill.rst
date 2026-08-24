@@ -81,8 +81,14 @@ allowlist.
 The dense beta-TMA BT16 one-wave route uses the S9 chain schedule when both
 value-split CTAs for every task fit in one device wave.
 
-At maximum sequence length 16 or below, H96 uses the N32 schedule to retain
-the qualified BF16 error bound; H12 and other qualified head counts retain N16.
+At maximum sequence length 16 or below, generic head counts use a one-stage
+N16 retrace with one four-warp prepare owner. It preserves the variable-shape
+N16 arithmetic while reducing the CTA from 32 to 16 warps. H12 keeps its
+dedicated scalar-beta N16 schedule.
+
+The N16 route describes aligned beta storage directly once it contains a full
+16-token tile. Calls requiring token or head padding refresh the stable beta-TMA
+workspace inside the binding before launching the recurrence kernel.
 
 The frozen H12 N16 schedule's residual recurrence rounds four intermediates
 through BF16: the state/K
@@ -127,6 +133,10 @@ alternatives additionally depend on SM count, chain waves, and sequence
 length. Supplying ``seq_order`` disables persistent host task-bin planning but
 does not suppress BT16 or otherwise force direct M128. Remaining eligible
 inputs select the shape-appropriate non-persistent or general M128 schedule.
+The scalar-prepare/S8 BT16 pair is submitted by one native Cake binding, which
+performs both launch plans before enqueueing either kernel so the dependent
+launches do not expose a Python/FFI inter-kernel gap. CUDA Graph capture still
+records the same two kernels and preserves the workspace contract below.
 
 For eager packed CuTe DSL engine calls, omitting ``seq_order`` builds and
 caches a stable decreasing-length order on the host. CuTe DSL decomp retains

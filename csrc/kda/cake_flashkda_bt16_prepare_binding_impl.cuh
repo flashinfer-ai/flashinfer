@@ -84,7 +84,9 @@ void RunBt16Prepare(TensorView q, TensorView k, TensorView raw_gate, TensorView 
 }  // namespace flash_kda
 }  // namespace flashinfer
 
+#ifndef FLASHINFER_FLASH_KDA_COMBINED_BT16
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::flash_kda::RunBt16Prepare);
+#endif
 
 #undef FLASHINFER_BT16_PREPARE_KERNEL
 #undef FLASHINFER_BT16_PREPARE_USES_BETA_TMA

@@ -347,6 +347,43 @@ struct Bt16ChainTmaPointers {
   void* out;
 };
 
+struct Bt16ChainLaunchPlan {
+  void* ws_qd;
+  void* ws_qd_tma;
+  void* ws_kd;
+  void* ws_kd_tma;
+  void* ws_w;
+  void* ws_w_tma;
+  void* ws_qk;
+  void* ws_qk_tma;
+  void* ws_diag;
+  void* ws_diag_tma;
+  void* v;
+  void* v_tma;
+  void* cu_seqlens;
+  void* cu_chunks;
+  void* seq_order;
+  void* initial_state;
+  void* out;
+  void* out_tma;
+  void* final_state;
+  int32_t num_heads;
+  int32_t use_initial_state;
+  int32_t store_final_state;
+  float scale;
+  uint32_t grid_x;
+  cudaStream_t stream;
+};
+
+Bt16ChainLaunchPlan PrepareBt16ChainLaunch(
+    TensorView ws_qd, TensorView ws_kd, TensorView ws_w, TensorView ws_qk, TensorView ws_diag,
+    TensorView v, TensorView cu_seqlens, TensorView cu_chunks, TensorView seq_order,
+    TensorView initial_state, TensorView out, TensorView final_state, TensorView descriptor_storage,
+    int64_t prepare_descriptors, int64_t num_heads, int64_t use_initial_state,
+    int64_t store_final_state, double scale, int64_t grid_x, int64_t cuda_stream);
+
+void LaunchBt16Chain(const Bt16ChainLaunchPlan& plan);
+
 inline Bt16ChainTmaPointers EncodeBt16ChainTma(const TensorView& ws_qd, const TensorView& ws_kd,
                                                const TensorView& ws_w, const TensorView& ws_qk,
                                                const TensorView& ws_diag, const TensorView& v,

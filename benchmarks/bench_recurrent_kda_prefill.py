@@ -205,6 +205,7 @@ _BT16_CHAIN_VARIANTS = frozenset(
         "bt16_chain_m64_s9",
     )
 )
+_BT16_COMBINED_VARIANTS = frozenset(("bt16_prepare_chain_m64_s8",))
 
 
 def _resolve_recorded_cake_route(
@@ -214,6 +215,8 @@ def _resolve_recorded_cake_route(
 
     if len(routes) == 1:
         variant, target = routes[0]
+        if variant in _BT16_COMBINED_VARIANTS:
+            return "bt16_prepare_chain_m64", target, [variant]
         if (
             variant not in _BT16_PREPARE_VARIANTS
             and variant not in _BT16_CHAIN_VARIANTS

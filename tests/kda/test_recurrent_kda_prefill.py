@@ -1127,7 +1127,7 @@ def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
     )
     assert (
         kda_prefill_api._direct_m128_route(num_heads=96, max_sequence_length=16)
-        == "direct_m128"
+        == "direct_m128_n16"
     )
     assert (
         kda_prefill_api._direct_m128_route(num_heads=12, max_sequence_length=16)
@@ -1315,15 +1315,115 @@ def test_bt16_two_stage_adapter_reuses_descriptors_across_state_rotations(monkey
     assert second_chain_args[13] == 0
 
 
-def test_h96_uniform_n128_uses_exact_n16_only_on_148_sm():
-    for sm_count in (148, 152):
-        assert kda_prefill_api._requires_exact_n16_recurrence(
-            sm_count=sm_count,
-            fixed_layout=False,
-            num_sequences=128,
-            num_heads=96,
-            uniform_sequences=True,
-        ) is (sm_count == 148)
+def test_bt16_combined_adapter_reuses_both_descriptor_sets(monkeypatch):
+    combined_module = _RecorderModule()
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        lambda variant, target: combined_module
+        if variant == "bt16_prepare_chain_m64_s8"
+        else (_ for _ in ()).throw(AssertionError(variant)),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_bt16_physical_variants",
+        lambda **kwargs: ("bt16_prepare", "bt16_chain_m64_s8", False),
+    )
+    q = torch.empty((1, 1, 12, 128), dtype=torch.bfloat16)
+    factor = torch.empty((1, 12, 16, 128), dtype=torch.bfloat16)
+    kd = factor.clone()
+    w = factor.clone()
+    qk = torch.empty((1, 12, 1, 16, 16), dtype=torch.bfloat16)
+    diag = torch.empty((1, 12, 1, 128), dtype=torch.float32)
+    cu_chunks = torch.tensor([0, 1], dtype=torch.int32)
+    chunk_to_seq = torch.zeros(1, dtype=torch.int32)
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_bt16_workspace",
+        lambda **kwargs: (
+            cu_chunks,
+            chunk_to_seq,
+            factor,
+            kd,
+            w,
+            qk,
+            diag,
+            1,
+            12,
+        ),
+    )
+    workspace = SimpleNamespace(
+        _descriptor_signatures={},
+        _descriptor_storages={
+            variant: torch.empty(896, dtype=torch.uint8)
+            for variant in ("bt16_prepare", "bt16_chain_m64_s8")
+        },
+    )
+    cu_seqlens = torch.tensor([0, 512], dtype=torch.int64)
+    seq_order = torch.tensor([0], dtype=torch.int32)
+    state = torch.empty((1, 12, 128, 128), dtype=torch.bfloat16)
+    output = torch.empty_like(q)
+    beta = torch.empty((1, 1, 12), dtype=torch.bfloat16)
+    a_log = torch.empty(12, dtype=torch.float32)
+    dt_bias = torch.empty((12, 128), dtype=torch.float32)
+
+    def run(initial_state):
+        kda_prefill_api._run_bt16_prepare_chain(
+            workspace=workspace,
+            target="sm100f",
+            q=q,
+            k=q,
+            v=q,
+            g=q,
+            beta=beta,
+            A_log=a_log,
+            dt_bias=dt_bias,
+            cu_seqlens=cu_seqlens,
+            seq_order=seq_order,
+            initial_state=initial_state,
+            out=output,
+            final_state=initial_state,
+            offsets=(0, 512),
+            num_heads=12,
+            sm_count=152,
+            compute_capability=(10, 3),
+            fixed_layout=True,
+            max_sequence_length=512,
+            use_initial_state=True,
+            store_final_state=True,
+            scale=0.125,
+            lower_bound=-5.0,
+            stream_ptr=17,
+            capturing=False,
+        )
+
+    run(state)
+    rotated_state = torch.empty_like(state)
+    run(rotated_state)
+
+    first_args, second_args = combined_module.calls
+    assert len(first_args) == 32
+    assert first_args[6] is cu_seqlens
+    assert first_args[7] is cu_chunks
+    assert first_args[8] is chunk_to_seq
+    assert first_args[15] is seq_order
+    assert first_args[21:32] == (1, 1, 1, 12, -5.0, 12, 1, 1, 0.125, 24, 17)
+    assert second_args[16] is rotated_state
+    assert second_args[18] is rotated_state
+    assert second_args[21:23] == (0, 0)
+
+
+def test_h96_uniform_n128_keeps_n16_only_on_sm100_148_sm():
+    for compute_capability in ((10, 0), (10, 3)):
+        for sm_count in (148, 152):
+            assert kda_prefill_api._requires_exact_n16_recurrence(
+                compute_capability=compute_capability,
+                sm_count=sm_count,
+                fixed_layout=False,
+                num_sequences=128,
+                num_heads=96,
+                uniform_sequences=True,
+            ) is (compute_capability == (10, 0) and sm_count == 148)
 
 
 class _RecorderModule:
@@ -1416,9 +1516,9 @@ def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
 @pytest.mark.parametrize(
     ("packed", "num_heads", "expected_variant"),
     [
-        (False, 64, "m128_n16"),
-        (True, 64, "m128_n16"),
-        (True, 2, "m128_n16"),
+        (False, 64, "m128_n16_short"),
+        (True, 64, "m128_n16_short"),
+        (True, 2, "m128_n16_short"),
         (False, 12, "m128_n16"),
     ],
 )
@@ -1480,7 +1580,10 @@ def test_frozen_route_and_ffi_abi(
     assert args[0].data_ptr() == inputs["q"].data_ptr()
     assert args[4].data_ptr() == inputs["beta"].data_ptr()
     assert args[5].shape == (
-        max(inputs["q"].numel() // (num_heads * 128), 32),
+        max(
+            inputs["q"].numel() // (num_heads * 128),
+            16 if expected_variant in ("m128_n16", "m128_n16_short") else 32,
+        ),
         (num_heads + 7) // 8 * 8,
     )
     assert args[8].dtype == torch.int64
@@ -1832,7 +1935,7 @@ def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
 
     monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
     inputs = _make_inputs(
-        seq_lens=[2, 2],
+        seq_lens=[32, 32],
         num_heads=96,
         packed=True,
         initial_state=True,
@@ -1887,7 +1990,7 @@ def test_explicit_seq_order_keeps_direct_worker_and_reaches_ffi(
 
     monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
     inputs = _make_inputs(
-        seq_lens=[2, 2],
+        seq_lens=[32, 32],
         num_heads=96,
         packed=True,
         initial_state=True,
@@ -1942,7 +2045,7 @@ def test_b200_prefill_without_initial_state_stays_direct(cuda_device, monkeypatc
         output=torch.empty_like(inputs["q"]),
         backend="cake",
     )
-    assert routes == [("m128", "sm100f")]
+    assert routes == [("m128_n16_short", "sm100f")]
     (args,) = module.calls
     assert args[9].tolist() == [0, 1]
 
@@ -2378,7 +2481,7 @@ def test_stream_workspace_does_not_allocate_state_scratch_for_inplace_update(
     assert len(kda_prefill_api._flash_kda_stream_workspaces) == 1
     (workspace,) = kda_prefill_api._flash_kda_stream_workspaces.values()
     assert workspace._state_scratch is None
-    assert workspace._beta_padding.numel() == 32 * 8
+    assert workspace._beta_padding.numel() == 16 * 8
 
 
 @pytest.mark.parametrize(
@@ -2468,7 +2571,7 @@ def test_explicit_workspace_descriptor_prepare_and_reuse(cuda_device, monkeypatc
     assert (
         module.calls[0][16].data_ptr()
         == module.calls[1][16].data_ptr()
-        == workspace._descriptor_storages["m128_n16"].data_ptr()
+        == workspace._descriptor_storages["m128_n16_short"].data_ptr()
     )
 
     changed_output = torch.empty_like(output)
@@ -2795,6 +2898,99 @@ def test_frozen_bt16_scalar_prepare_subgroup_heads_matches_direct_control(
     )
 
 
+def test_frozen_bt16_combined_h12_fixed512_matches_cute(flash_kda_device):
+    inputs = _make_inputs(
+        seq_lens=[512],
+        num_heads=12,
+        packed=False,
+        initial_state=True,
+        seed=12002,
+    )
+    initial_state = inputs["initial_state"]
+    assert initial_state is not None
+    initial_state_seed = initial_state.clone()
+
+    cake_output, cake_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+    assert cake_state is initial_state
+    cake_state = cake_state.clone()
+
+    initial_state.copy_(initial_state_seed)
+    cute_output, cute_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cute-dsl",
+    )
+    assert cute_state is initial_state
+    torch.testing.assert_close(
+        cake_output.float(), cute_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        cake_state.float(), cute_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_frozen_bt16_combined_h12_cuda_graph_replay(flash_kda_device):
+    inputs = _make_inputs(
+        seq_lens=[512],
+        num_heads=12,
+        packed=False,
+        initial_state=False,
+        seed=12012,
+    )
+    output = torch.empty_like(inputs["q"])
+    workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    capture_stream = torch.cuda.Stream(device=flash_kda_device)
+    capture_stream.wait_stream(torch.cuda.current_stream(flash_kda_device))
+    call_kwargs = {
+        **_strict_prefill_kwargs(inputs),
+        "output": output,
+        "output_final_state": True,
+        "prefill_workspace": workspace,
+        "backend": "cake",
+    }
+
+    with torch.cuda.stream(capture_stream):
+        recurrent_kda(**call_kwargs)
+    capture_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured_output, captured_state = recurrent_kda(**call_kwargs)
+
+    with torch.cuda.stream(capture_stream):
+        inputs["q"].mul_(0.875)
+        inputs["beta"].add_(0.125)
+        output.fill_(float("nan"))
+    capture_stream.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_output = captured_output.clone()
+    replay_state = captured_state.clone()
+
+    direct_output, direct_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(output),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    assert workspace._captured
+    assert captured_output.data_ptr() == output.data_ptr()
+    assert captured_state.data_ptr() == workspace._state_scratch.data_ptr()
+    torch.testing.assert_close(
+        replay_output.float(), direct_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        replay_state.float(), direct_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
 def test_frozen_bt16_scalar_prepare_subgroup_heads_cuda_graph_replay(
     flash_kda_device,
     monkeypatch,
@@ -2919,6 +3115,40 @@ def test_frozen_prefill_matches_reference(flash_kda_device, packed, non_default_
         expected_state.float(),
         atol=1e-2,
         rtol=1e-2,
+    )
+
+
+def test_frozen_prefill_h96_short_beta_workspace_matches_reference(flash_kda_device):
+    """Cover token-padded beta TMA storage when H is already eight-aligned."""
+
+    inputs = _make_inputs(
+        seq_lens=[16],
+        num_heads=96,
+        packed=False,
+        initial_state=True,
+        seed=11018,
+    )
+    reference_inputs = {
+        **inputs,
+        "initial_state": inputs["initial_state"].clone(),
+    }
+    expected_output, expected_state = _reference(reference_inputs)
+    output = torch.empty_like(inputs["q"])
+
+    actual_output, actual_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=output,
+        output_final_state=True,
+        backend="cake",
+    )
+
+    assert actual_output.data_ptr() == output.data_ptr()
+    assert actual_state is inputs["initial_state"]
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
     )
 
 

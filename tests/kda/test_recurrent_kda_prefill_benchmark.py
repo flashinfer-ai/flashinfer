@@ -37,6 +37,14 @@ def test_recorded_cake_route_serializes_legacy_single_module():
     )
 
 
+def test_recorded_cake_route_serializes_combined_bt16_module():
+    assert _resolve_recorded_cake_route([("bt16_prepare_chain_m64_s8", "sm100f")]) == (
+        "bt16_prepare_chain_m64",
+        "sm100f",
+        ["bt16_prepare_chain_m64_s8"],
+    )
+
+
 def test_recorded_cake_route_serializes_bt16_physical_pair():
     assert _resolve_recorded_cake_route(
         [
