@@ -2188,10 +2188,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             )
         variant = self.config.quant.variant
         if variant in self.supported_quant_variants:
-            if (
-                self.config.quant.per_token_scale
-                and variant is not QuantVariant.NVFP4
-            ):
+            if self.config.quant.per_token_scale and variant is not QuantVariant.NVFP4:
                 raise NotImplementedError(
                     f"{type(self).__name__} does not support per-token scale for {variant.name}."
                 )
@@ -2256,7 +2253,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         self._dtype_act = dtype_act
         self._dtype_weights = dtype_weights
         self._fp8_quantization_type = Fp8QuantizationType.NoneFp8
-        self._per_token: bool | None = self.config.quant.per_token_scale
+        self._per_token = bool(self.config.quant.per_token_scale)
 
         # enable_pdl=None means "auto" — resolve once here exactly like the
         # high-level wrapper does before building its MoERunner, because the raw
@@ -2505,7 +2502,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                 "pre-routed callers must append shared ids and weights themselves."
             )
 
-        if self._per_token and not act.per_token_scale:
+        if self._per_token and act.per_token_scale is None:
             raise RuntimeError(
                 "Per-token NVFP4 scale is configured but no activation scale is given."
             )

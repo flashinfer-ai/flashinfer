@@ -2644,10 +2644,17 @@ class TestTrtllmFp4UnpackedContract:
         )
         assert runner._static_kwargs["local_expert_offset"] == 32
 
+    @pytest.mark.parametrize(
+        "activation",
+        [
+            pytest.param(SwiGLU(), id="swiglu"),
+            pytest.param(ReLU2(), id="relu2"),
+        ],
+    )
     @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
-    def test_cuda_graph_replay_matches_eager(self, weights_dtype):
+    def test_cuda_graph_replay_matches_eager(self, weights_dtype, activation):
         device = torch.device("cuda", torch.cuda.current_device())
-        num_tokens, hidden_size, intermediate_size = 16, 256, 512
+        num_tokens, hidden_size, intermediate_size = 16, 1024, 512
         num_experts, top_k = 8, 2
         tensors = create_moe_tensors(
             num_tokens=num_tokens,
@@ -2656,14 +2663,21 @@ class TestTrtllmFp4UnpackedContract:
             num_experts=num_experts,
             num_local_experts=num_experts,
             top_k=top_k,
+            gated=activation.is_gated,
+            use_per_token_activation=True,
+            use_nontrivial_alphas=False,
         )
         config = MoEConfig(
             routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            quant=QuantConfig(
+                variant=QuantVariant.NVFP4,
+                per_token_scale=True,
+            ),
             experts=ExpertConfig(
                 intermediate_size=intermediate_size,
                 local_num_experts=num_experts,
             ),
+            activation=activation,
         )
         runner = _build_direct_runner(TrtllmFp4RoutedRunner, config, device)
         act_pack = MoEActivationPack(
@@ -2671,25 +2685,69 @@ class TestTrtllmFp4UnpackedContract:
             hidden_states_scale=tensors["x_sf"].squeeze(-1),
             topk_ids=tensors["token_selected_experts"],
             topk_weights=tensors["token_final_scales"].to(weights_dtype),
+            per_token_scale=tensors["x_per_token_scale"],
             routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
         )
         weight_pack = MoEWeightPack()
+        prepared_weights = TrtllmFp4Config.prepare_weights(
+            tensors["w1_weight_bf16"],
+            tensors["w2_weight_bf16"],
+            num_local_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+            device=device,
+        )
+        fc1_size = intermediate_size * (2 if activation.is_gated else 1)
+        assert prepared_weights["gemm1_weights"].shape == (
+            num_experts,
+            fc1_size,
+            hidden_size // 2,
+        )
+        assert prepared_weights["gemm1_weights_scale"].shape == (
+            num_experts,
+            fc1_size,
+            hidden_size // 16,
+        )
         weight_pack.prepare_for(
             runner.backend_key,
-            TrtllmFp4Config.prepare_weights(
-                tensors["w1_weight_bf16"],
-                tensors["w2_weight_bf16"],
-                num_local_experts=num_experts,
-                hidden_size=hidden_size,
-                intermediate_size=intermediate_size,
-                device=device,
-            ),
+            prepared_weights,
         )
         inputs = runner.pack_inputs(act_pack, weight_pack)
+        from flashinfer.fused_moe.core import MoeRunnerInputs
+
+        moe_inputs = MoeRunnerInputs.from_list(inputs)
+        assert moe_inputs.per_token_scale is act_pack.per_token_scale
+        assert runner._static_kwargs["per_token_scale"] is act_pack.per_token_scale
+        assert runner._inner.use_per_token_scaling is True
         for _ in range(3):
             runner.forward(inputs, tactic=-1)
         torch.cuda.synchronize()
         eager = runner.forward(inputs, tactic=-1).clone()
+
+        ones = torch.ones(num_experts, device=device, dtype=torch.float32)
+        reference = compute_reference_moe_fp4(
+            hidden_states=tensors["x_ref"],
+            gemm1_weights=tensors["w1_weight_bf16"],
+            gemm2_weights=tensors["w2_weight_bf16"],
+            gemm1_alpha=ones,
+            gemm2_alpha=ones,
+            token_selected_experts=act_pack.topk_ids,
+            token_final_scales=act_pack.topk_weights,
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+            use_per_token_activation=True,
+            activation_type=activation.type,
+        )
+        passed, pct, atol = check_accuracy(eager, reference)
+        assert passed, (
+            f"{activation.type.name}: only {pct * 100:.2f}% values within "
+            f"tolerance (atol={atol:.4f})"
+        )
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
