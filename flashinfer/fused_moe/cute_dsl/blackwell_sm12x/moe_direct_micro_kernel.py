@@ -4966,9 +4966,16 @@ class MoEDirectMicroKernel:
         # way. The element type is fixed at compile time (``topk_ids_dtype``
         # is part of the kernel's cache key).
         #
-        # TODO: verify on sm12x hardware. This mirrors the argument marshalling
-        # the three MMA kernels already use post-#4331, but the direct micro
-        # signature has not been executed under the TVM-FFI ABI.
+        # The barrier tensors stay DLTensor arguments deliberately: they are
+        # the only device-carrying params in the FFI signature, and the
+        # TVM-FFI env-stream lookup anchors on them (raw pointers carry no
+        # device, and the builder raises at compile time without one). The
+        # compile bakes their fake shape [1] into the signature, while the
+        # static path passes workspace-sized buffers (dm_slots) -- so launch
+        # with length-1 views: same base address, and every device-side
+        # access goes through get_ptr_as_int64 (iterator + offset), so the
+        # full buffer stays reachable. Verified on SM120 (RTX 5090); see
+        # flashinfer-ai#4317.
         compiled_fn(
             x.data_ptr(),
             w1_fp4.data_ptr(),
@@ -4983,8 +4990,8 @@ class MoEDirectMicroKernel:
             topk_ids.data_ptr(),
             topk_weights.data_ptr(),
             out.data_ptr(),
-            barrier_count,
-            barrier_epoch,
+            barrier_count[:1],
+            barrier_epoch[:1],
             m,
             grid_x,
         )
