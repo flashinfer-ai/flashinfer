@@ -105,28 +105,118 @@ def _init_inputs(
     return result
 
 
-def _forward_row_init(**kwargs):
-    return _init_inputs(backward=False, rowwise=True, colwise=False, **kwargs)
+def _forward_row_init(
+    *, M, K, O, O_div_32, SF, zero, K_doubled=4096, device="cuda", seed=0
+):
+    return _init_inputs(
+        M=M,
+        K=K,
+        O=O,
+        O_div_32=O_div_32,
+        SF=SF,
+        zero=zero,
+        K_doubled=K_doubled,
+        device=device,
+        seed=seed,
+        backward=False,
+        rowwise=True,
+        colwise=False,
+    )
 
 
-def _forward_col_init(**kwargs):
-    return _init_inputs(backward=False, rowwise=False, colwise=True, **kwargs)
+def _forward_col_init(
+    *, M, K, O, O_div_32, SF, zero, K_doubled=4096, device="cuda", seed=0
+):
+    return _init_inputs(
+        M=M,
+        K=K,
+        O=O,
+        O_div_32=O_div_32,
+        SF=SF,
+        zero=zero,
+        K_doubled=K_doubled,
+        device=device,
+        seed=seed,
+        backward=False,
+        rowwise=False,
+        colwise=True,
+    )
 
 
-def _forward_both_init(**kwargs):
-    return _init_inputs(backward=False, rowwise=True, colwise=True, **kwargs)
+def _forward_both_init(
+    *, M, K, O, O_div_32, SF, zero, K_doubled=4096, device="cuda", seed=0
+):
+    return _init_inputs(
+        M=M,
+        K=K,
+        O=O,
+        O_div_32=O_div_32,
+        SF=SF,
+        zero=zero,
+        K_doubled=K_doubled,
+        device=device,
+        seed=seed,
+        backward=False,
+        rowwise=True,
+        colwise=True,
+    )
 
 
-def _backward_row_init(**kwargs):
-    return _init_inputs(backward=True, rowwise=True, colwise=False, **kwargs)
+def _backward_row_init(
+    *, M, K, O, O_div_32, SF, zero, K_doubled=4096, device="cuda", seed=0
+):
+    return _init_inputs(
+        M=M,
+        K=K,
+        O=O,
+        O_div_32=O_div_32,
+        SF=SF,
+        zero=zero,
+        K_doubled=K_doubled,
+        device=device,
+        seed=seed,
+        backward=True,
+        rowwise=True,
+        colwise=False,
+    )
 
 
-def _backward_col_init(**kwargs):
-    return _init_inputs(backward=True, rowwise=False, colwise=True, **kwargs)
+def _backward_col_init(
+    *, M, K, O, O_div_32, SF, zero, K_doubled=4096, device="cuda", seed=0
+):
+    return _init_inputs(
+        M=M,
+        K=K,
+        O=O,
+        O_div_32=O_div_32,
+        SF=SF,
+        zero=zero,
+        K_doubled=K_doubled,
+        device=device,
+        seed=seed,
+        backward=True,
+        rowwise=False,
+        colwise=True,
+    )
 
 
-def _backward_both_init(**kwargs):
-    return _init_inputs(backward=True, rowwise=True, colwise=True, **kwargs)
+def _backward_both_init(
+    *, M, K, O, O_div_32, SF, zero, K_doubled=4096, device="cuda", seed=0
+):
+    return _init_inputs(
+        M=M,
+        K=K,
+        O=O,
+        O_div_32=O_div_32,
+        SF=SF,
+        zero=zero,
+        K_doubled=K_doubled,
+        device=device,
+        seed=seed,
+        backward=True,
+        rowwise=True,
+        colwise=True,
+    )
 
 
 for _init in (
