@@ -2124,8 +2124,7 @@ def _run_flash_kda_prefill(
                 workspace,
                 chunk_tokens=(
                     16
-                    if variant
-                    in ("m128_n16", "m128_n16_checkpoint", "m128_n16_short")
+                    if variant in ("m128_n16", "m128_n16_checkpoint", "m128_n16_short")
                     else 32
                 ),
             )

@@ -211,9 +211,7 @@ def test_tensor_state_decay_jit_spec_and_frozen_source(target, target_define):
     flash_kda.gen_flash_kda_module.cache_clear()
     spec = flash_kda.gen_flash_kda_module("m128_tensor_state_decay", target)
 
-    assert spec.name == (
-        f"flash_kda_bf16_m128_tensor_state_decay_b3a1e8779c_{target}"
-    )
+    assert spec.name == (f"flash_kda_bf16_m128_tensor_state_decay_b3a1e8779c_{target}")
     assert spec.sources == [
         flash_kda._get_flash_kda_csrc_dir() / "flashkda_bf16_fused_m128_binding.cu"
     ]
