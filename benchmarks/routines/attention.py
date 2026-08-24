@@ -1320,7 +1320,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         torch.float16,
         torch.bfloat16,
         torch.float8_e4m3fn,
-        torch.float8_e5m2,
     ]:
         print(f"[ERROR] Unsupported q_dtype: {args.q_dtype}")
         return res
@@ -1332,7 +1331,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         torch.float16,
         torch.bfloat16,
         torch.float8_e4m3fn,
-        torch.float8_e5m2,
         torch.uint8,
     ]:
         print(f"[ERROR] Unsupported kv_dtype: {args.kv_dtype}")

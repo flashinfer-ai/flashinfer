@@ -32,7 +32,6 @@ from cutlass.cute.typing import Int32
 
 _CUTLASS_DTYPE = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-    torch.float8_e5m2: cutlass.Float8E5M2,
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
 }

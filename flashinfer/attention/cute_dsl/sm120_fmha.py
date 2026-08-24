@@ -72,7 +72,6 @@ def _cutlass_dtype(torch_dtype: torch.dtype):
 
     return {
         torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-        torch.float8_e5m2: cutlass.Float8E5M2,
         torch.float16: cutlass.Float16,
         torch.bfloat16: cutlass.BFloat16,
     }[torch_dtype]
@@ -129,7 +128,7 @@ def sm120_fmha_fp8_ragged_prefill(
     ----------
     q : torch.Tensor
         Query tensor, shape ``(total_q, Hq, D)``.
-        dtype: ``float8_e4m3fn`` or ``float8_e5m2``.
+        dtype: ``float8_e4m3fn``.
     k : torch.Tensor
         Key tensor, shape ``(total_k, Hkv, D)``. Same dtype as ``q``.
     v : torch.Tensor
@@ -274,7 +273,7 @@ def sm120_fmha_fp8_paged_prefill(
     ----------
     q : torch.Tensor
         Query tensor, shape ``(total_q, Hq, D)``.
-        dtype: ``float8_e4m3fn`` or ``float8_e5m2``.
+        dtype: ``float8_e4m3fn``.
     k_pool : torch.Tensor
         NHD paged K pool, shape ``(num_pages, num_tokens_per_page, Hkv, D)``.
         Same dtype as ``q``. Every slot, including unused page padding, must
@@ -427,7 +426,7 @@ class SM120PrimsBatchPrefillBackend:
     ``run_*`` only validates launch tensors and dispatches a cached kernel.
     """
 
-    _FP8_DTYPES = (torch.float8_e4m3fn, torch.float8_e5m2)
+    _FP8_DTYPES = (torch.float8_e4m3fn,)
     _OUT_DTYPES = (torch.float16, torch.bfloat16)
 
     def __init__(self, device: torch.device) -> None:
@@ -467,7 +466,7 @@ class SM120PrimsBatchPrefillBackend:
         if q_dtype not in self._FP8_DTYPES or kv_dtype != q_dtype:
             raise ValueError(
                 "backend='cute-dsl-prims' requires Q/K/V to have the same "
-                f"FP8 dtype (float8_e4m3fn or float8_e5m2); got q={q_dtype}, "
+                f"FP8 dtype (float8_e4m3fn); got q={q_dtype}, "
                 f"kv={kv_dtype}"
             )
         if o_dtype not in self._OUT_DTYPES:

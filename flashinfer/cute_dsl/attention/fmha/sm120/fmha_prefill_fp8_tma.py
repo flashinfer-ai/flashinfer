@@ -29,7 +29,7 @@ The kernel is compiled and launched through the ``cute-dsl-prims`` backend.
 Use ``benchmarks/flashinfer_benchmark.py`` for correctness and performance runs.
 
 Constraints:
-* Supported input dtypes: Float8E4M3FN and Float8E5M2
+* Supported input dtype: Float8E4M3FN
 * Supported output dtypes: Float16 and BFloat16
 * Head dimension must be exactly 32, 64, 128, or 256
 * Query and K/V sequence tiles must be 64 or 128 rows
@@ -181,14 +181,11 @@ def ptx_mma_m16n8k32_f32(
     c3: cutlass.Float32,
     ab_dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
 ) -> tuple[cutlass.Float32, cutlass.Float32, cutlass.Float32, cutlass.Float32]:
-    """``mma.sync.aligned.m16n8k32.row.col.f32.{e4m3|e5m2}.{e4m3|e5m2}.f32``."""
-    if cutlass.const_expr(
-        ab_dtype != cutlass.Float8E4M3FN and ab_dtype != cutlass.Float8E5M2
-    ):
+    """``mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32``."""
+    if cutlass.const_expr(ab_dtype != cutlass.Float8E4M3FN):
         raise TypeError(f"Invalid A/B dtype: {ab_dtype}")
-    ab_tag = "e4m3" if cutlass.const_expr(ab_dtype == cutlass.Float8E4M3FN) else "e5m2"
     return cute.arch.inline_ptx(
-        f"mma.sync.aligned.m16n8k32.row.col.f32.{ab_tag}.{ab_tag}.f32"
+        "mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32"
         " {$0,$1,$2,$3}, {$4,$5,$6,$7}, {$8,$9}, {$10,$11,$12,$13};",
         write_only_types=[
             cutlass.Float32,
@@ -254,19 +251,15 @@ def cvt_f32x4_to_f8x4(
     dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
 ) -> cutlass.Int32:
     """Convert four FP32 values into one packed FP8 MMA operand."""
-    if cutlass.const_expr(dtype == cutlass.Float8E4M3FN):
-        cvt_type = "e4m3x2"
-    elif cutlass.const_expr(dtype == cutlass.Float8E5M2):
-        cvt_type = "e5m2x2"
-    else:
+    if cutlass.const_expr(dtype != cutlass.Float8E4M3FN):
         raise TypeError(f"Invalid FP8 dtype: {dtype}")
     return cute.arch.inline_ptx(
         (
             "{\n"
             "  .reg .b16 lo;\n"
             "  .reg .b16 hi;\n"
-            f"  cvt.rn.satfinite.{cvt_type}.f32 lo, $2, $1;\n"
-            f"  cvt.rn.satfinite.{cvt_type}.f32 hi, $4, $3;\n"
+            "  cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;\n"
+            "  cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;\n"
             "  mov.b32 $0, {lo, hi};\n"
             "}"
         ),
@@ -306,14 +299,10 @@ def cvt_f32x2_to_f8x2(
     dtype: cutlass.Constexpr[Type[cutlass.Numeric]],
 ) -> cutlass.Uint16:
     """Convert and pack two FP32 values into one FP8x2 register."""
-    if cutlass.const_expr(dtype == cutlass.Float8E4M3FN):
-        cvt_type = "e4m3x2"
-    elif cutlass.const_expr(dtype == cutlass.Float8E5M2):
-        cvt_type = "e5m2x2"
-    else:
+    if cutlass.const_expr(dtype != cutlass.Float8E4M3FN):
         raise TypeError(f"Invalid FP8 dtype: {dtype}")
     return cute.arch.inline_ptx(
-        f"cvt.rn.satfinite.{cvt_type}.f32 $0, $1, $2;",
+        "cvt.rn.satfinite.e4m3x2.f32 $0, $1, $2;",
         write_only_types=[cutlass.Uint16],
         read_only_args=[a, b],
     )
@@ -376,8 +365,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             that causal masking is enabled when this option is true.
         """
         # Data types
-        if in_dtype not in (cutlass.Float8E4M3FN, cutlass.Float8E5M2):
-            raise ValueError("in_dtype must be Float8E4M3FN or Float8E5M2")
+        if in_dtype != cutlass.Float8E4M3FN:
+            raise ValueError("in_dtype must be Float8E4M3FN")
         if out_dtype not in (cutlass.Float16, cutlass.BFloat16):
             raise ValueError("out_dtype must be Float16 or BFloat16")
         self.in_dtype = in_dtype
@@ -547,7 +536,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         """
         if len(q_shape) != 4 or len(k_shape) != 4:
             return False
-        if in_dtype not in (cutlass.Float8E4M3FN, cutlass.Float8E5M2):
+        if in_dtype != cutlass.Float8E4M3FN:
             return False
         if out_dtype not in (cutlass.Float16, cutlass.BFloat16):
             return False

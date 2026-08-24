@@ -424,11 +424,12 @@ def test_sm120_paged_prefill_rejects_hnd_pool():
 # ---------------------------------------------------------------------------
 
 
-def test_sm120_ragged_unsupported_dtype_raises():
-    q = torch.randn(128, 4, 128, device="cuda", dtype=torch.float16)
-    k = torch.randn(128, 4, 128, device="cuda", dtype=torch.float16)
-    v = torch.randn_like(k)
-    o = torch.empty_like(q)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float8_e5m2])
+def test_sm120_ragged_unsupported_dtype_raises(dtype):
+    q = torch.randn(128, 4, 128, device="cuda").to(dtype)
+    k = torch.randn(128, 4, 128, device="cuda").to(dtype)
+    v = torch.randn(k.shape, device="cuda").to(dtype)
+    o = torch.empty(q.shape, device="cuda", dtype=torch.float16)
     cu = torch.tensor([0, 128], device="cuda", dtype=torch.int32)
     with pytest.raises((KeyError, RuntimeError, ValueError)):
         sm120_fmha_fp8_ragged_prefill(q, k, v, o, cu, cu)
