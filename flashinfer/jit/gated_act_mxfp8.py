@@ -10,9 +10,12 @@ _SOURCE_NAMES = (
     "gated_act_mxfp8.cu",
     "gated_act_mxfp8_jit_binding.cu",
     "gated_act_mxfp8_fwd_row_launch.cu",
+    "gated_act_mxfp8_fwd_row_noalloc_launch.cu",
     "gated_act_mxfp8_fwd_col_launch.cu",
     "gated_act_mxfp8_fwd_both_launch.cu",
+    "gated_act_mxfp8_fwd_both_noalloc_launch.cu",
     "gated_act_mxfp8_bwd_row_launch.cu",
+    "gated_act_mxfp8_bwd_row_sm103_launch.cu",
     "gated_act_mxfp8_bwd_col_launch.cu",
     "gated_act_mxfp8_bwd_both_launch.cu",
 )

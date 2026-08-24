@@ -25,11 +25,14 @@ namespace flashinfer::gated_act_mxfp8 {
 
 namespace {
 
+constexpr int64_t kSm100ForwardBothNoAllocateElements = int64_t{16384} * 7168;
+constexpr int64_t kSm103ForwardNoAllocateElements = int64_t{131072} * 8192;
+
 void CheckCuda(cudaError_t status, const char* operation) {
   TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
 }
 
-void CheckArchitecture(int device_id) {
+int CheckArchitecture(int device_id) {
   int major = 0;
   int minor = 0;
   CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
@@ -38,6 +41,7 @@ void CheckArchitecture(int device_id) {
             "reading the CUDA compute-capability minor version");
   TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3))
       << "fused gated MXFP8 quantization requires SM100 or SM103";
+  return minor;
 }
 
 void CheckDevice(const TensorView& tensor, const TensorView& input, const char* name) {
@@ -158,7 +162,7 @@ void Forward(TensorView gated_input, TensorView row_output, TensorView col_outpu
 
   const int device_id = gated_input.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  CheckArchitecture(device_id);
+  const int architecture_minor = CheckArchitecture(device_id);
   auto* input = static_cast<__nv_bfloat16*>(gated_input.data_ptr());
   auto* row_q = static_cast<uint8_t*>(row_output.data_ptr());
   auto* col_q = static_cast<uint8_t*>(col_output.data_ptr());
@@ -167,15 +171,24 @@ void Forward(TensorView gated_input, TensorView row_output, TensorView col_outpu
   const cudaStream_t stream = get_stream(gated_input.device());
   const int m32 = static_cast<int>(m);
   const int k32 = static_cast<int>(k);
+  const int64_t elements = m * k;
   cudaError_t status = cudaSuccess;
 
   if (rowwise && colwise) {
     const CUtensorMap row_map = MakeRowOutputMap(row_q, m, k, k, 64, "row_output");
     const CUtensorMap col_map = MakeColOutputMap(col_q, m, k, "col_output");
-    status = LaunchForwardBoth(input, row_map, col_map, row_sf, col_sf, m32, k32, stream);
+    const bool use_no_allocate =
+        (architecture_minor == 3 && elements >= kSm103ForwardNoAllocateElements) ||
+        (architecture_minor == 0 && elements >= kSm100ForwardBothNoAllocateElements);
+    status = use_no_allocate
+                 ? LaunchForwardBothNoAllocate(input, row_map, col_map, row_sf, col_sf, m32, k32,
+                                               stream)
+                 : LaunchForwardBoth(input, row_map, col_map, row_sf, col_sf, m32, k32, stream);
   } else if (rowwise) {
     const CUtensorMap row_map = MakeRowOutputMap(row_q, m, k, k, 128, "row_output");
-    status = LaunchForwardRow(input, row_map, row_sf, m32, k32, stream);
+    status = architecture_minor == 3 && elements >= kSm103ForwardNoAllocateElements
+                 ? LaunchForwardRowNoAllocate(input, row_map, row_sf, m32, k32, stream)
+                 : LaunchForwardRow(input, row_map, row_sf, m32, k32, stream);
   } else {
     const CUtensorMap gate_map = MakeInputMap(input, m, k, 2 * k, "gate input");
     const CUtensorMap up_map = MakeInputMap(input + k, m, k, 2 * k, "up input");
@@ -210,7 +223,7 @@ void Backward(TensorView gated_input, TensorView grad_output, TensorView row_out
 
   const int device_id = gated_input.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  CheckArchitecture(device_id);
+  const int architecture_minor = CheckArchitecture(device_id);
   auto* input = static_cast<__nv_bfloat16*>(gated_input.data_ptr());
   auto* grad = static_cast<__nv_bfloat16*>(grad_output.data_ptr());
   auto* row_q = static_cast<uint8_t*>(row_output.data_ptr());
@@ -236,7 +249,9 @@ void Backward(TensorView gated_input, TensorView grad_output, TensorView row_out
         MakeRowOutputMap(row_q, m, k, output_k, 64, "row activation gradient");
     const CUtensorMap row_gate =
         MakeRowOutputMap(row_q + k, m, k, output_k, 64, "row gate gradient");
-    status = LaunchBackwardRow(input, grad, row_act, row_gate, row_sf, m32, k32, stream);
+    status = architecture_minor == 3
+                 ? LaunchBackwardRowSm103(input, grad, row_act, row_gate, row_sf, m32, k32, stream)
+                 : LaunchBackwardRow(input, grad, row_act, row_gate, row_sf, m32, k32, stream);
   } else {
     const CUtensorMap gate_map = MakeInputMap(input, m, k, output_k, "gate input");
     const CUtensorMap up_map = MakeInputMap(input + k, m, k, output_k, "up input");

@@ -25,9 +25,16 @@ namespace flashinfer::gated_act_mxfp8 {
 cudaError_t LaunchForwardRow(__nv_bfloat16* input, CUtensorMap row_output, uint8_t* row_scales,
                              int m, int k, cudaStream_t stream);
 
+cudaError_t LaunchForwardRowNoAllocate(__nv_bfloat16* input, CUtensorMap row_output,
+                                       uint8_t* row_scales, int m, int k, cudaStream_t stream);
+
 cudaError_t LaunchBackwardRow(__nv_bfloat16* input, __nv_bfloat16* grad, CUtensorMap row_act,
                               CUtensorMap row_gate, uint8_t* row_scales, int m, int k,
                               cudaStream_t stream);
+
+cudaError_t LaunchBackwardRowSm103(__nv_bfloat16* input, __nv_bfloat16* grad,
+                                   CUtensorMap row_act, CUtensorMap row_gate, uint8_t* row_scales,
+                                   int m, int k, cudaStream_t stream);
 
 cudaError_t LaunchForwardCol(CUtensorMap gate, CUtensorMap up, CUtensorMap col_output,
                              uint8_t* col_scales, int m, int k, cudaStream_t stream);
@@ -39,6 +46,10 @@ cudaError_t LaunchBackwardCol(CUtensorMap gate, CUtensorMap up, CUtensorMap grad
 cudaError_t LaunchForwardBoth(__nv_bfloat16* input, CUtensorMap row_output, CUtensorMap col_output,
                               uint8_t* row_scales, uint8_t* col_scales, int m, int k,
                               cudaStream_t stream);
+
+cudaError_t LaunchForwardBothNoAllocate(__nv_bfloat16* input, CUtensorMap row_output,
+                                        CUtensorMap col_output, uint8_t* row_scales,
+                                        uint8_t* col_scales, int m, int k, cudaStream_t stream);
 
 cudaError_t LaunchBackwardBoth(__nv_bfloat16* input, __nv_bfloat16* grad, CUtensorMap row_act,
                                CUtensorMap row_gate, CUtensorMap col_act, CUtensorMap col_gate,
