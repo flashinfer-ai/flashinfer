@@ -283,6 +283,7 @@ class CUDAGraphMoE:
                 routing_method_type=self.config["routing_method_type"],
                 activation_type=self.config["activation_type"],
                 gemm1_lora_delta=self.gemm1_lora_delta_slot,
+                return_gemm1_output_scale=True,
                 tune_max_num_tokens=TUNE_MAX_NUM_TOKENS,
             )
 
@@ -453,16 +454,41 @@ def _gather_intermediate_by_expanded_idx(raw_kernel_output, reference_args):
     return kernel_routed, ref_routed
 
 
-def _decode_mxfp8_intermediate(kernel_routed, ref_routed):
-    """Decode MxFp8 (e4m3) codes to fp32 using an mx block scale recovered from the
-    reference (the kernel does not return its scale). Compare the result against the
-    CLEAN fp32 ``ref_routed`` — e4m3 is fine-grained enough that clean-fp32 comparison
-    holds (unlike fp4, which needs a round-tripped reference).
-    """
-    _, ref_scale = mxfp8_quantize(ref_routed.to(torch.bfloat16), True)
-    ref_scale_bytes = ref_scale.view(torch.uint8).reshape(-1).cpu()
+def _unswizzle_mxfp8_scale_layout(swizzled_scales, rows, blocks):
+    """Decode graph-safe physical layout metadata carried by tensor rank."""
+    scales = swizzled_scales.view(torch.uint8)
+    if scales.ndim == 4:
+        assert scales.shape[-2:] == (8, 4)
+        padded_rows = scales.shape[0] * 8
+        padded_blocks = scales.shape[1] * 4
+        return (
+            scales.permute(0, 2, 1, 3)
+            .contiguous()
+            .view(padded_rows, padded_blocks)[:rows, :blocks]
+        )
+    assert scales.ndim == 5 and scales.shape[-3:] == (32, 4, 4)
+    padded_rows = scales.shape[0] * 128
+    padded_blocks = scales.shape[1] * 4
     return (
-        mxfp8_dequantize_host(kernel_routed.cpu().view(torch.uint8), ref_scale_bytes)
+        scales.permute(0, 3, 2, 1, 4)
+        .contiguous()
+        .view(padded_rows, padded_blocks)[:rows, :blocks]
+    )
+
+
+def _decode_mxfp8_intermediate(kernel_routed, ref_routed, kernel_scale=None):
+    """Decode MxFp8 codes with returned scales, or reference scales for legacy paths.
+
+    Compare against clean fp32 ``ref_routed`` — e4m3 is fine-grained enough that
+    clean-fp32 comparison holds (unlike fp4, which needs a round-tripped reference).
+    """
+    if kernel_scale is None:
+        _, ref_scale = mxfp8_quantize(ref_routed.to(torch.bfloat16), True)
+        scale_bytes = ref_scale.view(torch.uint8).reshape(-1).cpu()
+    else:
+        scale_bytes = kernel_scale.view(torch.uint8).reshape(-1).cpu()
+    return (
+        mxfp8_dequantize_host(kernel_routed.cpu().view(torch.uint8), scale_bytes)
         .to(ref_routed.device)
         .to(torch.float32)
     )
@@ -943,7 +969,20 @@ class FP4Moe(Moe):
             )
             ref_compare = ref_routed
             if self.quant_mode == QuantMode.FP4_MXFP4_MXFP8:
-                kernel_dequant = _decode_mxfp8_intermediate(kernel_routed, ref_routed)
+                assert len(raw_kernel_output) >= 4, (
+                    "MxFp4xMxFp8 LoRA output must return tactic-layout-aware "
+                    "gemm1_output_scale after gemm1_output"
+                )
+                all_scales = _unswizzle_mxfp8_scale_layout(
+                    raw_kernel_output[3],
+                    raw_kernel_output[2].shape[0],
+                    intermediate_size // 32,
+                )
+                expanded_to_permuted = raw_kernel_output[1].to(torch.int64)
+                kernel_scale = all_scales[expanded_to_permuted]
+                kernel_dequant = _decode_mxfp8_intermediate(
+                    kernel_routed, ref_routed, kernel_scale
+                )
             else:  # FP4_MXFP4_Bf16
                 kernel_dequant = kernel_routed.to(torch.float32)
 
