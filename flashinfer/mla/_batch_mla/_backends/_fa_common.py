@@ -24,8 +24,26 @@ class _GeneratedBatchMLAModule(Protocol):
 
 
 @functools.cache
-def get_batch_mla_module(backend: str, *args: object) -> _GeneratedBatchMLAModule:
-    return gen_batch_mla_module(backend, *args).build_and_load()
+def get_batch_mla_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_ckv: int,
+    head_dim_kpe: int,
+    use_profiler: bool,
+) -> _GeneratedBatchMLAModule:
+    return gen_batch_mla_module(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_ckv,
+        head_dim_kpe,
+        use_profiler,
+    ).build_and_load()
 
 
 def _validate_generated_fa_plan(
