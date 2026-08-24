@@ -141,7 +141,7 @@ contract so the launch path does not synchronize to inspect them.
 
 Native checkpoints use a preallocated BF16
 ``state_checkpoints[C,H,V,K]``, int64 ``checkpoint_cu_starts[N+1]``, and a
-positive ``checkpoint_every_n_tokens`` divisible by 32. KDA checkpoints are
+positive ``checkpoint_every_n_tokens`` divisible by 16. KDA checkpoints are
 states *before* each interval: every non-empty sequence contributes its
 initial state as row zero, followed by states after one, two, ... intervals
 that strictly precede its end. Consequently each sequence contributes
@@ -194,3 +194,132 @@ directly in place by the frozen kernel. Head counts that are not divisible by
 eight capture the beta copy into workspace-owned storage padded to the next
 eight-head boundary before the frozen launch. The public beta and state shapes
 keep the caller's original head count.
+
+SM120a prefill subset
+---------------------
+
+Compute capability 12.0 devices select their own prefill backend,
+``flashinfer.kda_kernels.sm120_prefill``. It is CuTe DSL like the BT=16 backend
+above and shares no code and no device with it, nor with Cake: those two are
+CC 10.0 and 10.3 and this one is CC 12.0, so at most one of the three can be
+eligible for any call, and adding this one cannot change which kernel an SM100
+or SM103 call receives. Nothing about the public API changes — the entry point
+is still :func:`flashinfer.kda.recurrent_kda`, and no argument names the
+architecture.
+
+``backend`` selects an implementation family, not an architecture name. On a
+CC 12.0 device both ``"auto"`` and ``"cute-dsl"`` may reach this backend; the
+dispatcher tries it before the SM100-family CuTe DSL prefill path. An explicit
+``"cake"`` request never probes or runs SM120. If the Cake prefill predicate
+does not support that ordinary multi-token prefill call, the request is
+refused rather than silently executed by another backend.
+
+``recurrent_kda`` uses it only when every condition below holds:
+
+* the device has compute capability 12.0, *and* the installed CuTe DSL and
+  CUDA toolkit can natively target ``sm_120a``. A family-conditional fallback
+  target is refused rather than accepted, because the kernels are written
+  against architecture-specific instructions;
+* input is ordinary multi-token prefill: fixed ``T > 1``, or packed input
+  whose total token count exceeds its number of sequences;
+* Q, K, V and G are contiguous BF16 ``[B,T,H,128]`` tensors sharing one head
+  count, and beta is contiguous BF16 ``[B,T,H]``. GQA and ``V != K`` are not
+  supported;
+* the output fits an INT32 extent: ``T_total * H * 128 <= 2**31 - 1``, which is
+  16383 tokens at H=1024 and no constraint at ordinary head counts. Larger is
+  refused with the backend's own error, because the two things that stop there
+  — a device index built in INT32, and the DSL packing a memref extent as one —
+  otherwise fail as a silent negative offset and as a compile-time overflow
+  naming no tensor;
+* ``A_log`` is contiguous FP32 ``[H]``, and ``dt_bias`` is contiguous FP32
+  ``[H,128]`` or flattened ``[H*128]``;
+* ``use_qk_l2norm_in_kernel=True``, ``use_gate_in_kernel=True``,
+  ``beta_is_logit=True``, and ``lower_bound`` is in ``[-5.0, 0.0)``. The bound
+  exists because the safe gate's worst-case chunk prefix reaches a reciprocal
+  approximation's cliff at about ``-5.4585``;
+* ``initial_state``, if given, is a contiguous BF16 ``[N,H,128,128]`` tensor.
+  A state pool with ``ssm_state_indices`` is not supported;
+* ``output``, if given, is contiguous BF16 with V's shape and does not overlap
+  any input in GMEM;
+* speculative decode, ``seq_order``, prefill checkpoints, committed-state
+  sources and FP32 gate or state are not enabled.
+
+Under ``backend="auto"``, calls outside that subset continue through the
+existing dispatcher. An explicit ``backend="cute-dsl"`` ordinary multi-token
+prefill request is refused when neither CuTe DSL prefill implementation is
+eligible. T=1 decode and speculative decode are not rerouted by this backend.
+
+Two variants, chosen per shape
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The backend has two implementations of the same contract. ``decomp`` runs a
+chunk-parallel prepare and a serial recurrence, issued through one compiled
+host entry; ``fused`` does both in a single kernel. They agree numerically, so
+the choice between them is a performance one and is made from a measured
+table keyed on the device's SM count — not on its name, which is not a stable
+unique selector.
+
+Thresholds exist for the 110-SM, 156-SM and 188-SM parts, measured on each.
+They do not agree: the 110-SM part switches to the fused kernel at CTA 128 and
+the other two at 144, because at CTA 128 with short sequences the larger parts
+still prefer the decomposed kernel and the smallest one does not. Any other
+CC 12.0 device uses the 156-SM thresholds as a labelled fallback. A benchmark
+run reports which case applies, so a number taken on an unprofiled card cannot
+be read as tuned.
+
+State and graph semantics
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+State semantics match the SM100-family path: a supplied ``initial_state`` is
+updated in place whether or not ``output_final_state`` is set, and the second
+return value is ``None`` when it is not set. Without an initial state, a BF16
+final state is allocated only when ``output_final_state=True``.
+
+CUDA graph capture requires a caller-owned ``RecurrentKDAPrefillWorkspace`` and
+a preallocated ``output``, warmed eagerly on the capture stream with the exact
+tensors and then synchronized before capture. The warm call is where every
+compile, descriptor build, metadata table and allocation happens; capture
+performs none of them and a cold capture is refused rather than silently
+degraded. Both offsets dtypes are accepted for packed capture; eager warmup
+populates a workspace-owned canonical int32 buffer. The offset *values* must
+stay fixed for the graph's lifetime. Changing them requires a fresh eager
+warmup and capture. Q, K, V, G, beta and state contents may change freely at
+unchanged addresses.
+
+The offsets contract is not only a capture one. Validating ``cu_seqlens``
+needs a device-to-host read, so what is derived from it — the sequence
+lengths, the canonical int32 copy, and the decomposed variant's chunk tables —
+is cached against the tensor's address and version counter rather than read
+again on every call. Under ``torch.inference_mode`` a tensor has no version
+counter, so refilling an offsets buffer in place with a different segmentation
+is not detectable and the stale tables are reused, silently computing against
+the previous sequence boundaries. Use a different tensor for a different
+segmentation, or call
+``flashinfer.kda_kernels.sm120_prefill.clear_kda_prefill_sm120_caches()``
+after refilling one in place. This applies to eager calls as much as to
+captured ones.
+
+A workspace binds to one variant, one stream and one call signature on first
+use, and once it has participated in a capture it cannot be used again.
+
+What the caches hold
+~~~~~~~~~~~~~~~~~~~~
+
+A warm call is a memo lookup, and the memo addresses the caller's buffers: the
+descriptors carry their base addresses and the flat views wrap them. Those
+buffers therefore stay allocated for as long as the entry lives, which is what
+makes reusing the entry safe — an allocator that had recycled the address would
+otherwise hand the kernel someone else's memory.
+
+The retention scales with the number of *distinct buffer sets* a process
+rotates through, not with the number of calls. On a 110-SM part at
+``[1, 1024, 8, 128]`` one set holds about 14.5 MiB, and eight rotating sets
+about 73 MiB. Reuse one set and it stays at one set's worth forever.
+
+The entry ceilings are not a memory budget and lowering them does not trade
+speed for memory: below the ceiling the retention is the same whatever the
+ceiling is, and above it every call rebuilds its plan — about 7.3 ms against a
+100 microsecond hit on that part. A deployment that needs the memory back
+should rotate fewer buffer sets, or call
+``flashinfer.kda_kernels.sm120_prefill.clear_kda_prefill_sm120_caches()``,
+which releases all of it.

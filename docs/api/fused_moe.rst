@@ -86,6 +86,19 @@ TensorRT-LLM Fused MoE
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
 
+Standalone TRT-LLM Gen Routing
+------------------------------
+
+The routing stage the TRT-LLM Gen fused MoE launchers run before their GEMMs,
+exposed on its own so expert selection and the permutation/padding bookkeeping
+can be used (and tested) independently of quantization and GEMM configuration.
+
+.. autosummary::
+    :toctree: ../generated
+
+    trtllm_gen_routing
+    TrtllmGenRoutingResult
+
 CuteDSL Fused MoE
 -----------------
 
