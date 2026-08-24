@@ -37,14 +37,12 @@ CUDA_TAG="${PYTORCH_INDEX##*/}"  # nightly/cu134 -> cu134
 CUDA_MAJOR="${CUDA_TAG:2:2}"     # cu129 -> 12, cu134 -> 13
 CUDA_MINOR="${CUDA_TAG:4}"       # cu129 -> 9, cu134 -> 4
 PYTORCH_INDEX_URL="https://download.pytorch.org/whl/${PYTORCH_INDEX}"
-BUILD_DEPENDENCY_OUTPUT="$(
-  PYTHONPATH=/install python3 -c \
-    'import sys; from build_utils import get_build_dependency_requirements; print(*get_build_dependency_requirements(sys.argv[1]), sep="\n")' \
-    "${CUDA_MAJOR}"
+CI_IMAGE_DEPENDENCY_OUTPUT="$(
+  python3 /install/image_dependencies.py "${CUDA_MAJOR}"
 )"
-BUILD_DEPENDENCIES=()
-if [[ -n "${BUILD_DEPENDENCY_OUTPUT}" ]]; then
-  mapfile -t BUILD_DEPENDENCIES <<< "${BUILD_DEPENDENCY_OUTPUT}"
+CI_IMAGE_DEPENDENCIES=()
+if [[ -n "${CI_IMAGE_DEPENDENCY_OUTPUT}" ]]; then
+  mapfile -t CI_IMAGE_DEPENDENCIES <<< "${CI_IMAGE_DEPENDENCY_OUTPUT}"
 fi
 
 # Install torch with specific CUDA version first, followed by others in requirements.txt, and then others.
@@ -85,7 +83,7 @@ pip3 install \
   responses pytest scipy build wheel \
   "${CUDA_PYTHON}" \
   "${NVSHMEM4PY}" \
-  "${BUILD_DEPENDENCIES[@]}"
+  "${CI_IMAGE_DEPENDENCIES[@]}"
 
 # Torch 2.13's cu129/cu130 wheels exact-pin cuDNN 9.20, but current FlashInfer
 # uses cuDNN 9.21-9.24 APIs and 9.20 has a known incomplete sublibrary set.

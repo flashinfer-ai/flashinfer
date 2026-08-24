@@ -14,6 +14,8 @@ on:
       - 'build_utils.py'
       - 'ci/cuda-versions.json'
       - 'ci/validate_cuda_versions.py'
+      - 'flashinfer-cubin/build_backend.py'
+      - 'flashinfer-jit-cache/build_backend.py'
       - 'scripts/build_flashinfer_jit_cache_whl.sh'
 
 jobs:

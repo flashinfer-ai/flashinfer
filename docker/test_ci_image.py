@@ -6,12 +6,14 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.metadata
+import json
 import os
 import platform
 import re
 import shutil
 import subprocess
 from collections.abc import Sequence
+from pathlib import Path
 from typing import NoReturn
 
 
@@ -55,6 +57,20 @@ def _expected_cudnn_backend(version: str) -> int:
     except (TypeError, ValueError):
         _fail(f"invalid cuDNN package version: {version}")
     return major * 10000 + minor * 100 + patch
+
+
+def _expected_ci_image_dependencies(
+    config_path: Path = Path("/install/cuda-versions.json"),
+) -> dict[str, str]:
+    try:
+        config = json.loads(config_path.read_text())
+        dependencies = config["ci_image_dependencies"]
+        return {
+            package: dependency["version"]
+            for package, dependency in dependencies.items()
+        }
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
+        _fail(f"could not read CI image dependency policy: {error}")
 
 
 def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -115,15 +131,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     if actual_backend != expected_backend:
         _fail(f"cuDNN backend is {actual_backend}; expected {expected_backend}")
 
+    expected_ci_dependencies = _expected_ci_image_dependencies()
+    for distribution, expected_version in expected_ci_dependencies.items():
+        actual_version = importlib.metadata.version(distribution)
+        if actual_version != expected_version:
+            _fail(
+                f"CI image dependency {distribution} is {actual_version}; "
+                f"expected {expected_version}"
+            )
+
     distributions = (
         "apache-tvm-ffi",
         "cuda-python",
         cudnn_package,
         "nvidia-cudnn-frontend",
-        "nvidia-cutlass-dsl",
+        *expected_ci_dependencies,
         "torch",
     )
-    for distribution in distributions:
+    for distribution in dict.fromkeys(distributions):
         print(f"{distribution}=={importlib.metadata.version(distribution)}")
     print(f"architecture={actual_machine}")
     print(f"cuda={torch.version.cuda}")

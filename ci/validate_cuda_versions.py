@@ -17,6 +17,10 @@ PYTORCH_INDEX_PATTERN = re.compile(r"^(?:nightly/)?cu[0-9]+$")
 IMAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*:[A-Za-z0-9_][A-Za-z0-9._-]*$")
 CUDNN_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9]+){3}$")
 ARCH_LIST_PATTERN = re.compile(r"^[0-9]+\.[0-9]+[a-z]?(?: [0-9]+\.[0-9]+[a-z]?)*$")
+PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+PACKAGE_VERSION_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9]+)+(?:[A-Za-z0-9.+-]*)?$")
+CUDA_MAJOR_PATTERN = re.compile(r"^[0-9]+$")
+EXTRA_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class ConfigError(ValueError):
@@ -45,6 +49,43 @@ def _entries(config: dict[str, Any], section: str) -> list[dict[str, Any]]:
     return [
         _mapping(entry, f"{section}[{index}]") for index, entry in enumerate(entries)
     ]
+
+
+def _validate_ci_image_dependencies(config: dict[str, Any]) -> None:
+    dependencies = _mapping(
+        config.get("ci_image_dependencies"), "ci_image_dependencies"
+    )
+    if not dependencies:
+        raise ConfigError("ci_image_dependencies must not be empty")
+
+    for package, value in dependencies.items():
+        context = f"ci_image_dependencies.{package}"
+        if not isinstance(package, str) or PACKAGE_PATTERN.fullmatch(package) is None:
+            raise ConfigError(f"invalid CI image dependency name: {package!r}")
+        dependency = _mapping(value, context)
+        _string(dependency, "version", context, PACKAGE_VERSION_PATTERN)
+        cuda_extras = _mapping(
+            dependency.get("cuda_major_extras", {}),
+            f"{context}.cuda_major_extras",
+        )
+        for cuda_major, extras in cuda_extras.items():
+            extras_context = f"{context}.cuda_major_extras.{cuda_major}"
+            if (
+                not isinstance(cuda_major, str)
+                or CUDA_MAJOR_PATTERN.fullmatch(cuda_major) is None
+            ):
+                raise ConfigError(f"invalid CUDA major key: {cuda_major!r}")
+            if not isinstance(extras, list) or not extras:
+                raise ConfigError(f"{extras_context} must be a non-empty array")
+            if any(
+                not isinstance(extra, str) or EXTRA_PATTERN.fullmatch(extra) is None
+                for extra in extras
+            ):
+                raise ConfigError(
+                    f"{extras_context} contains invalid extras: {extras!r}"
+                )
+            if len(extras) != len(set(extras)):
+                raise ConfigError(f"{extras_context} contains duplicate extras")
 
 
 def _validate_identity(entry: dict[str, Any], context: str) -> tuple[str, str, str]:
@@ -105,7 +146,7 @@ def _validate_devcontainer(
 def validate_cuda_config(config: Any, repo_root: Path) -> None:
     """Validate matrix syntax, safe values, and cross-file consistency."""
     config = _mapping(config, "CUDA configuration")
-    _mapping(config.get("build_dependencies"), "build_dependencies")
+    _validate_ci_image_dependencies(config)
     runtime_entries = _entries(config, "runtime")
     jit_entries = _entries(config, "jit_cache")
 

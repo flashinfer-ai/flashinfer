@@ -125,18 +125,12 @@ uv pip install --python "${VENV}/bin/python" --no-deps \
 # resolver during the editable `-e .` resolution (nvidia-nvjitlink METADATA
 # mismatch). Installing the leaf deps first + `--no-deps -e .` sidesteps that.
 # nccl4py>=0.3.1 = NCCL-EP (nccl.ep + bundled libnccl_ep.so); cuda-python and
-# nccl4py's cuda.core/cuda-bindings come along here.
-BUILD_DEPENDENCY_OUTPUT="$(
-    PYTHONPATH="${REPO_ROOT}" "${VENV}/bin/python" -c \
-        'from build_utils import get_build_dependency_requirements; print(*get_build_dependency_requirements("13"), sep="\n")'
-)"
-BUILD_DEPENDENCIES=()
-if [[ -n "${BUILD_DEPENDENCY_OUTPUT}" ]]; then
-    mapfile -t BUILD_DEPENDENCIES <<< "${BUILD_DEPENDENCY_OUTPUT}"
-fi
+# nccl4py's cuda.core/cuda-bindings come along here. CuTe DSL is a runtime
+# dependency in this environment, matching the project's cu13 optional extra;
+# it is not a Python build-system dependency.
 uv pip install --python "${VENV}/bin/python" \
     numpy einops ninja nvidia-ml-py click requests tabulate tqdm \
-    "${BUILD_DEPENDENCIES[@]}" "nvidia-cudnn-frontend>=1.13.0" \
+    "nvidia-cutlass-dsl[cu13]>=4.7.0a0" "nvidia-cudnn-frontend>=1.13.0" \
     "cuda-tile>=1.4.0" "cuda-python>=13.0" "nccl4py>=0.3.1" \
     "nvidia-nccl-cu13>=2.30.7"   # B200 NCCL-EP needs >=2.30.7; load this first on LD_LIBRARY_PATH
 

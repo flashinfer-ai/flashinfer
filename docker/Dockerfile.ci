@@ -30,9 +30,10 @@ ENV TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas"
 ENV FLASHINFER_PYTORCH_INDEX="${PYTORCH_INDEX}"
 ENV FLASHINFER_CUDNN_VERSION="${CUDNN_VERSION}"
 
+# Keep exact CI image-only dependency policy separate from package build hooks.
 COPY requirements.txt /install/requirements.txt
-COPY build_utils.py /install/build_utils.py
-COPY ci/cuda-versions.json /install/ci/cuda-versions.json
+COPY ci/cuda-versions.json /install/cuda-versions.json
+COPY ci/image_dependencies.py /install/image_dependencies.py
 COPY docker/install/install_python_packages.sh /install/install_python_packages.sh
 RUN bash /install/install_python_packages.sh "${PYTORCH_INDEX}" "${CUDNN_VERSION}"
 
