@@ -76,8 +76,8 @@ struct KLoader {
   template <typename MainloopParams, typename SharedStorage>
   __device__ __forceinline__ static auto prepare_tma_tensors(const MainloopParams& mainloop_params,
                                                              SharedStorage& shared_storage,
-                                                             int m_block, int query_head, int kv_head,
-                                                             int bidb,
+                                                             int m_block, int query_head,
+                                                             int kv_head, int bidb,
                                                              uint2 cluster_local_block_id) {
     auto sK = make_tensor(make_smem_ptr(shared_storage.smem_k.begin()), SmemLayoutK{});
     auto sSFK = make_tensor(make_smem_ptr(shared_storage.smem_SFK.begin()), SmemLayoutSFK{});
