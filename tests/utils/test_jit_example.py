@@ -507,8 +507,8 @@ def test_batch_prefill_variant_owns_mask():
     so every interior tile is masked as well. The sequences here are long
     enough to have interior tiles for every CTA_TILE_KV configuration.
     """
-    if get_compute_capability(torch.device("cuda")) < (8, 0):
-        pytest.skip("variant_owns_mask FA2 JIT test is validated on SM80+.")
+    if get_compute_capability(torch.device("cuda")) < (7, 5):
+        pytest.skip("FA2 prefill JIT requires SM75 or newer.")
     torch.manual_seed(42)
     jit_args = _owned_mask_jit_args("batch_prefill_variant_owns_mask")
 
@@ -648,8 +648,8 @@ def test_variant_owns_mask_requires_jit_module():
 @pytest.mark.parametrize("paged", [True, False])
 def test_variant_owns_mask_rejects_multi_item_scoring(paged):
     """prefix_len_ptr selects MULTIITEMSCORING, which would override CUSTOM."""
-    if get_compute_capability(torch.device("cuda")) < (8, 0):
-        pytest.skip("variant_owns_mask FA2 JIT test is validated on SM80+.")
+    if get_compute_capability(torch.device("cuda")) < (7, 5):
+        pytest.skip("FA2 prefill JIT requires SM75 or newer.")
     jit_args = _owned_mask_jit_args("batch_prefill_variant_owns_mask")
     float_workspace_buffer = torch.empty(
         128 * 1024 * 1024, dtype=torch.uint8, device="cuda"
