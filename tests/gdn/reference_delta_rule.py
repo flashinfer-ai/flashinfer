@@ -284,9 +284,11 @@ def delta_rule(
     if num_q_heads > num_v_heads:  # GQA
         k = k.repeat_interleave(num_q_heads // num_k_heads, dim=1)
         v = v.repeat_interleave(num_q_heads // num_v_heads, dim=1)
+        num_qkv_heads = num_q_heads
     else:  # GVA
         q = q.repeat_interleave(num_v_heads // num_q_heads, dim=1)
         k = k.repeat_interleave(num_v_heads // num_k_heads, dim=1)
+        num_qkv_heads = num_v_heads
 
     seq_offset = exclusive_cumsum(seq_lens)
     for seq_idx, seq_start in enumerate(seq_offset[:-1]):
@@ -302,7 +304,7 @@ def delta_rule(
         betas = beta[s]
 
         state_HKV = torch.zeros(
-            num_q_heads, head_size, head_size, dtype=state_dtype, device=q.device
+            num_qkv_heads, head_size, head_size, dtype=state_dtype, device=q.device
         )
         for i in range(seq_len):
             # var_DS where var is variable basename and DS is the dimensional semantics.

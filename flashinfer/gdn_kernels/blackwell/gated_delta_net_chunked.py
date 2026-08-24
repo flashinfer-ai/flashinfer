@@ -345,7 +345,7 @@ class GatedDeltaNetChunkedKernel:
 
         self.tmem_state_offset = 0
         self.tmem_q_state_offset = (
-            self.tmem_state_offset + self.tmem_kv_acc_stages * 128
+            self.tmem_state_offset + self.tmem_kv_acc_stages * self.mma_tiler_kv[0]
         )
         self.tmem_state_inp_offset = (
             self.tmem_q_state_offset + self.tmem_q_state_acc_stages * 64
@@ -389,21 +389,26 @@ class GatedDeltaNetChunkedKernel:
             raise testing.CantImplementError(
                 f"inverse_dtype={inverse_dtype} must match io_dtype={io_dtype}"
             )
-        if mma_tiler_qk != (64, 64, 128):
+        head_size = mma_tiler_qk[2]
+        if head_size not in (64, 128):
             raise testing.CantImplementError(
-                f"mma_tiler_qk={mma_tiler_qk} not supported; only (64, 64, 128) is supported"
+                f"head_size={head_size} not supported; only 64 and 128 are supported"
             )
-        if mma_tiler_qs != (128, 64, 128):
+        if mma_tiler_qk != (64, 64, head_size):
             raise testing.CantImplementError(
-                f"mma_tiler_qs={mma_tiler_qs} not supported; only (128, 64, 128) is supported"
+                f"mma_tiler_qk={mma_tiler_qk} not supported"
             )
-        if mma_tiler_qkv != (128, 64, 64):
+        if mma_tiler_qs != (head_size, 64, head_size):
             raise testing.CantImplementError(
-                f"mma_tiler_qkv={mma_tiler_qkv} not supported; only (128, 64, 64) is supported"
+                f"mma_tiler_qs={mma_tiler_qs} not supported"
             )
-        if mma_tiler_kv != (128, 128, 64):
+        if mma_tiler_qkv != (head_size, 64, 64):
             raise testing.CantImplementError(
-                f"mma_tiler_kv={mma_tiler_kv} not supported; only (128, 128, 64) is supported"
+                f"mma_tiler_qkv={mma_tiler_qkv} not supported"
+            )
+        if mma_tiler_kv != (head_size, head_size, 64):
+            raise testing.CantImplementError(
+                f"mma_tiler_kv={mma_tiler_kv} not supported"
             )
 
     # -----------------------------------------------------------------------
@@ -3965,11 +3970,18 @@ class GatedDeltaNetChunkedKernel:
         tCtState_mn_view = utils.gemm.sm100.transform_partitioned_tensor_layout(
             tCtState
         )
-        state_r2t_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
+        if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
+            state_r2t_atom = cute.make_copy_atom(
+                tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
+                self.acc_dtype,
+            )
+            tCtState_for_r2t = tCtState_mn_view[None, None, 0]
+        else:
+            state_r2t_atom = cute.make_copy_atom(
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+            )
+            tCtState_for_r2t = tCtState[(None, None), 0, 0, 0]
         cState = cute.make_identity_tensor((self.mma_tiler_kv[0], self.mma_tiler_kv[1]))
-        tCtState_for_r2t = tCtState[(None, None), 0, 0, 0]
         tiled_state_r2t = tcgen05.make_tmem_copy(state_r2t_atom, tCtState_for_r2t)
         thr_state_r2t = tiled_state_r2t.get_slice(cg1_tidx)
         tRT_tCtState = thr_state_r2t.partition_D(tCtState_mn_view)
@@ -4086,11 +4098,18 @@ class GatedDeltaNetChunkedKernel:
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
         )
 
-        # TMEM -> registers  (Ld32x32b)
-        atom_state_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
+        # TMEM -> registers. D=64 exposes a split (16, 2) value mode.
+        if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
+            atom_state_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
+                self.acc_dtype,
+            )
+            tCtState_for_t2r = tCtState_mn_view[None, None, 0]
+        else:
+            atom_state_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+            )
+            tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
         tiled_state_t2r = tcgen05.make_tmem_copy(atom_state_t2r, tCtState_for_t2r)
         thr_state_t2r = tiled_state_t2r.get_slice(cg1_tidx)
         tTR_tCtState = thr_state_t2r.partition_S(tCtState_mn_view)
@@ -4210,13 +4229,24 @@ class GatedDeltaNetChunkedKernel:
         tCcState = cute.make_identity_tensor(
             (self.mma_tiler_kv[0], self.mma_tiler_kv[1])
         )
-        atom_state_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        atom_state_r2t = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
-        )
-        tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
+        if cutlass.const_expr(self.mma_tiler_kv[0] == 64):
+            atom_state_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
+                self.acc_dtype,
+            )
+            atom_state_r2t = cute.make_copy_atom(
+                tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
+                self.acc_dtype,
+            )
+            tCtState_for_t2r = tCtState_mn_view[None, None, 0]
+        else:
+            atom_state_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+            )
+            atom_state_r2t = cute.make_copy_atom(
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+            )
+            tCtState_for_t2r = tCtState[(None, None), 0, 0, 0]
         tiled_state_t2r = tcgen05.make_tmem_copy(atom_state_t2r, tCtState_for_t2r)
         tiled_state_r2t = tcgen05.make_tmem_copy(atom_state_r2t, tCtState_for_t2r)
         thr_state_t2r = tiled_state_t2r.get_slice(cg1_tidx)
@@ -4243,9 +4273,15 @@ class GatedDeltaNetChunkedKernel:
         tCcState_inp = cute.make_identity_tensor(
             (self.mma_tiler_qs[0], self.mma_tiler_qs[2])
         )
-        atom_state_inp_r2t = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), self.io_dtype
-        )
+        if cutlass.const_expr(self.mma_tiler_qs[0] == 64):
+            atom_state_inp_r2t = cute.make_copy_atom(
+                tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
+                self.io_dtype,
+            )
+        else:
+            atom_state_inp_r2t = cute.make_copy_atom(
+                tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), self.io_dtype
+            )
         tCtState_inp_for_r2t = tCtState_inp_mn_view[None, None, 0]
         tiled_state_inp_r2t = tcgen05.make_tmem_copy(
             atom_state_inp_r2t, tCtState_inp_for_r2t
@@ -4272,20 +4308,33 @@ class GatedDeltaNetChunkedKernel:
         tCcShared = cute.make_identity_tensor(
             (self.mma_tiler_qkv[0], self.mma_tiler_qkv[1])
         )
-        atom_shared_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
-        )
-        tCtShared_for_t2r = tCtShared[(None, None), 0, 0, 0]
+        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64):
+            atom_shared_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
+                self.acc_dtype,
+            )
+            tCtShared_for_t2r = tCtShared_mn_view[None, None, 0]
+        else:
+            atom_shared_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
+            )
+            tCtShared_for_t2r = tCtShared[(None, None), 0, 0, 0]
         tiled_shared_t2r = tcgen05.make_tmem_copy(atom_shared_t2r, tCtShared_for_t2r)
         thr_shared_t2r = tiled_shared_t2r.get_slice(cg1_tidx)
         tTR_tCtShared = thr_shared_t2r.partition_S(tCtShared_mn_view)
         tTR_tCcShared = thr_shared_t2r.partition_D(tCcShared)
 
-        # Dedicated full-tile KS t2r (separate atom so it can be tuned
-        # independently of atom_shared_t2r used by NV/decay_v reads).
-        atom_ks_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
-        )
+        # Keep a dedicated full-tile KS copy so it can be tuned independently
+        # of the copy used by NV/decay_v reads.
+        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64):
+            atom_ks_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
+                self.acc_dtype,
+            )
+        else:
+            atom_ks_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
+            )
         tiled_ks_t2r = tcgen05.make_tmem_copy(atom_ks_t2r, tCtShared_for_t2r)
         thr_ks_t2r = tiled_ks_t2r.get_slice(cg1_tidx)
         tTR_tCtKS = thr_ks_t2r.partition_S(tCtShared_mn_view)
@@ -4309,9 +4358,14 @@ class GatedDeltaNetChunkedKernel:
         tCcShared_inp = cute.make_identity_tensor(
             (self.mma_tiler_qkv[0], self.mma_tiler_qkv[2])
         )
-        atom_shared_inp_r2t = cute.make_copy_atom(
-            tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.io_dtype
-        )
+        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64):
+            atom_shared_inp_r2t = cute.make_copy_atom(
+                tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)), self.io_dtype
+            )
+        else:
+            atom_shared_inp_r2t = cute.make_copy_atom(
+                tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.io_dtype
+            )
         tCtShared_inp_for_r2t = tCtShared_inp_mn_view[None, None, 0]
         tiled_shared_inp_r2t = tcgen05.make_tmem_copy(
             atom_shared_inp_r2t, tCtShared_inp_for_r2t
@@ -4319,11 +4373,17 @@ class GatedDeltaNetChunkedKernel:
         thr_shared_inp_r2t = tiled_shared_inp_r2t.get_slice(cg1_tidx)
         tRT_tCtShared_inp = thr_shared_inp_r2t.partition_D(tCtShared_inp_mn_view)
 
-        # Dedicated full-tile VKS r2t (separate atom so it can be tuned
-        # independently of atom_shared_inp_r2t used by NV/decay_v writes).
-        atom_vks_r2t = cute.make_copy_atom(
-            tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.io_dtype
-        )
+        # Keep a dedicated full-tile VKS copy so it can be tuned independently
+        # of the copy used by NV/decay_v writes.
+        if cutlass.const_expr(self.mma_tiler_qkv[0] == 64):
+            atom_vks_r2t = cute.make_copy_atom(
+                tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
+                self.io_dtype,
+            )
+        else:
+            atom_vks_r2t = cute.make_copy_atom(
+                tcgen05.copy.St16x128bOp(tcgen05.copy.Repetition(8)), self.io_dtype
+            )
         tiled_vks_r2t = tcgen05.make_tmem_copy(atom_vks_r2t, tCtShared_inp_for_r2t)
         thr_vks_r2t = tiled_vks_r2t.get_slice(cg1_tidx)
         tRT_tCtVKS_inp = thr_vks_r2t.partition_D(tCtShared_inp_mn_view)
@@ -4343,15 +4403,27 @@ class GatedDeltaNetChunkedKernel:
         tCcQState = cute.make_identity_tensor(
             (self.mma_tiler_qs[0], self.mma_tiler_qs[1])
         )
-        atom_qs_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
-        )
-        atom_qs_r2t = cute.make_copy_atom(
-            tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
-        )
-        tCtQState_for_t2r = tCtQState[(None, None), 0, 0, 0]
+        if cutlass.const_expr(self.mma_tiler_qs[0] == 64):
+            atom_qs_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
+                self.acc_dtype,
+            )
+            atom_qs_r2t = cute.make_copy_atom(
+                tcgen05.copy.St16x32bx2Op(tcgen05.copy.Repetition(16)),
+                self.acc_dtype,
+            )
+            tCtQState_for_t2r = tCtQState_mn_view[None, None, 0]
+            tCtQState_for_r2t = tCtQState_mn_view[None, None, 0]
+        else:
+            atom_qs_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
+            )
+            atom_qs_r2t = cute.make_copy_atom(
+                tcgen05.copy.St16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
+            )
+            tCtQState_for_t2r = tCtQState[(None, None), 0, 0, 0]
+            tCtQState_for_r2t = tCtQState[(None, None), 0, 0, 0]
         tiled_qs_t2r = tcgen05.make_tmem_copy(atom_qs_t2r, tCtQState_for_t2r)
-        tCtQState_for_r2t = tCtQState[(None, None), 0, 0, 0]
         tiled_qs_r2t = tcgen05.make_tmem_copy(atom_qs_r2t, tCtQState_for_r2t)
         thr_qs_t2r = tiled_qs_t2r.get_slice(cg1_tidx)
         thr_qs_r2t = tiled_qs_r2t.get_slice(cg1_tidx)
@@ -4371,9 +4443,15 @@ class GatedDeltaNetChunkedKernel:
         )
         thr_v_s2r = tiled_v_s2r.get_slice(cg1_tidx)
 
-        atom_o_t2r = cute.make_copy_atom(
-            tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
-        )
+        if cutlass.const_expr(self.mma_tiler_qs[0] == 64):
+            atom_o_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld16x32bx2Op(tcgen05.copy.Repetition(16)),
+                self.acc_dtype,
+            )
+        else:
+            atom_o_t2r = cute.make_copy_atom(
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(8)), self.acc_dtype
+            )
         tiled_o_t2r = tcgen05.make_tmem_copy(atom_o_t2r, tCtQState_for_t2r)
         thr_o_t2r = tiled_o_t2r.get_slice(cg1_tidx)
         tTR_tOtO = thr_o_t2r.partition_S(tCtQState_mn_view)
@@ -4385,10 +4463,14 @@ class GatedDeltaNetChunkedKernel:
         tiled_o_r2s = cute.make_tiled_copy_D(atom_o_r2s, tiled_o_t2r)
         thr_o_r2s = tiled_o_r2s.get_slice(cg1_tidx)
         tCsO = thr_o_r2s.partition_D(sO)
+        # The transformed/partitioned view no longer carries the base SMEM
+        # alignment proof. ldmatrix/stmatrix require 128-bit-aligned pointers.
+        tCsO = cute.make_tensor(tCsO.iterator.align(16), tCsO.layout)
 
         sub_tile_size = 32
         sV_vt_view = utils.gemm.sm100.transform_partitioned_tensor_layout(sV)
         tCsV = thr_v_s2r.partition_S(sV_vt_view)
+        tCsV = cute.make_tensor(tCsV.iterator.align(16), tCsV.layout)
 
         rCumprod = cute.make_rmem_tensor((1, cute.size(tTR_tCcShared)), self.acc_dtype)
         tGrCumprod = thr_shared_t2r.partition_D(rCumprod)

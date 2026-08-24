@@ -782,7 +782,7 @@ def chunk_gated_delta_rule(
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
     - Requires SM90 (Hopper) or SM100 (Blackwell) architecture. The SM100
-      path requires ``head_size == 128``. On SM100/SM103, ``gdn_cp`` supports
+      path requires ``head_size in (64, 128)``. On SM100/SM103, ``gdn_cp`` supports
       structurally legal equal-head, GQA, and GVA shapes on CUDA 12.8,
       CUDA 12.9, and CUDA 13.
       Other SM100 CP DSL routes require CUDA 13 and
@@ -1167,8 +1167,8 @@ def chunk_gated_delta_rule(
             raise NotImplementedError("Blackwell GDN prefill kernel is unavailable")
 
         # Blackwell SM100 and SM103 path (CuTe DSL kernel)
-        assert head_size == 128, (
-            f"Blackwell GDN prefill requires head_size=128, got {head_size}"
+        assert head_size in (64, 128), (
+            f"Blackwell GDN prefill requires head_size=64 or 128, got {head_size}"
         )
 
         # Allocate output_state only when needed
