@@ -212,6 +212,21 @@ def silu_and_mul_mxfp8_quantize(
     up values.  The returned tuple is ordered as ``(row_output, col_output,
     row_scales, col_scales)``.  A disabled orientation is represented by
     zero-sized tensors on the input device.
+
+    Parameters
+    ----------
+    gated_input : torch.Tensor
+        Contiguous BF16 CUDA tensor with shape ``[M, 2K]``.
+    rowwise : bool, optional
+        Whether to emit rowwise MXFP8 values and scales.
+    colwise : bool, optional
+        Whether to emit colwise MXFP8 values and scales.
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        Rowwise values, colwise values, rowwise scales, and colwise scales.
+        Outputs for disabled orientations are zero-sized tensors.
     """
     _validate_inputs(gated_input, None, rowwise=rowwise, colwise=colwise)
     return get_gated_act_mxfp8_module().forward(gated_input, rowwise, colwise)
@@ -230,6 +245,24 @@ def silu_and_mul_mxfp8_quantize_backward(
     The logical result concatenates the gate-input and up-input gradients,
     producing shape ``[M, 2K]`` before quantization.  No intermediate BF16
     result is materialized in global memory.
+
+    Parameters
+    ----------
+    gated_input : torch.Tensor
+        Contiguous BF16 CUDA tensor with shape ``[M, 2K]``.
+    grad_output : torch.Tensor
+        Contiguous BF16 CUDA tensor with shape ``[M, K]``.
+    rowwise : bool, optional
+        Whether to emit rowwise MXFP8 values and scales.
+    colwise : bool, optional
+        Whether to emit colwise MXFP8 values and scales.
+
+    Returns
+    -------
+    tuple of torch.Tensor
+        Rowwise values, colwise values, rowwise scales, and colwise scales for
+        the concatenated gate-input and up-input gradients. Outputs for
+        disabled orientations are zero-sized tensors.
     """
     _validate_inputs(
         gated_input,
