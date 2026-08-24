@@ -1,7 +1,7 @@
-"""Multi-rank fused-launch tests for MoEEpMegaLayer (sm100_bf16_bf16_bf16_cutedsl).
+"""Multi-rank fused-launch tests for MoEEpMegaLayer (sm100_bf16_mxfp8_bf16_cutedsl).
 
 Launched via torchrun:
-    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
+    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_bf16_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
 """
 
 from __future__ import annotations
@@ -19,7 +19,9 @@ def _require_cuda():
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
     if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("BF16 MegaMoE requires sm_100a or sm_103a")
+        pytest.skip("mixed MegaMoE requires sm_100a or sm_103a")
+    if not hasattr(torch, "float8_e8m0fnu"):
+        pytest.skip("PyTorch lacks E8M0 support required by the mixed reference")
 
 
 def _launcher_ranks() -> tuple[int, int]:
@@ -98,6 +100,7 @@ def _mega_problem(
         topk=topk,
         gate_up_clamp=10.0,
         fast_math=True,
+        kind="bf16_mxfp8_e4m3",
         hidden_states=hidden_states,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
@@ -127,13 +130,18 @@ def _all_gather_stack(t):
 
     world_size = dist.get_world_size()
     tc = t.contiguous()
-    gathered = [torch.empty_like(tc) for _ in range(world_size)]
-    dist.all_gather(gathered, tc)
-    return torch.stack(gathered)
+    byte_wire = tc.element_size() == 1 and tc.dtype != torch.uint8
+    wire = tc.view(torch.uint8) if byte_wire else tc
+    gathered = [torch.empty_like(wire) for _ in range(world_size)]
+    dist.all_gather(gathered, wire)
+    stacked = torch.stack(gathered)
+    return stacked.view(tc.dtype) if byte_wire else stacked
 
 
-def _token_back_for_ikr(in_kernel_fc2_reduce: bool) -> str:
-    return "reuse_dispatch_warps" if in_kernel_fc2_reduce else "epi_warps"
+def _public_k_major(t):
+    if t.stride(2) == 1:
+        return t
+    return t.transpose(2, 3).contiguous().transpose(2, 3)
 
 
 def _megakernel_config(
@@ -142,20 +150,21 @@ def _megakernel_config(
     in_kernel_fc2_reduce: bool = False,
     knobs: dict | None = None,
 ):
-    from flashinfer.moe_ep import Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig
+    from flashinfer.moe_ep import Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
 
-    return Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig(
+    return Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=problem["intermediate"],
         top_k=problem["topk"],
+        kind=problem["kind"],
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        token_back_mode=_token_back_for_ikr(in_kernel_fc2_reduce),
+        token_back_mode="epi_warps",
         knobs=knobs,
     )
 
 
-def _reference_bf16_mega_moe(
+def _reference_mixed_mega_moe(
     problem: dict,
     *,
     in_kernel_fc2_reduce: bool = False,
@@ -165,21 +174,20 @@ def _reference_bf16_mega_moe(
     import torch.distributed as dist
 
     from flashinfer.moe_ep import MoEWeightPack
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.bf16_staging import (
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
-        bf16_mega_moe,
-        get_symm_buffer_for_bf16_mega_moe,
+        bf16_mxfp8_mega_moe,
+        get_symm_buffer_for_bf16_mxfp8_mega_moe,
     )
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    token_back = _token_back_for_ikr(in_kernel_fc2_reduce)
-    symm_buffer = get_symm_buffer_for_bf16_mega_moe(
+    symm_buffer = get_symm_buffer_for_bf16_mxfp8_mega_moe(
         problem["num_experts"],
         problem["max_tokens"],
         problem["topk"],
@@ -187,9 +195,10 @@ def _reference_bf16_mega_moe(
         problem["intermediate"],
         rank,
         world_size,
+        kind=problem["kind"],
         gate_up_clamp=problem["gate_up_clamp"],
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        token_back_mode=token_back,
+        token_back_mode="epi_warps",
         knobs=knobs,
     )
     num_tokens = problem["num_tokens"]
@@ -206,11 +215,12 @@ def _reference_bf16_mega_moe(
             MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
             intermediate_size=problem["intermediate"],
             hidden_size=problem["hidden"],
+            kind=problem["kind"],
         )
         y = torch.empty(
             num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
         )
-        bf16_mega_moe(
+        bf16_mxfp8_mega_moe(
             y,
             transformed_l1,
             transformed_l2,
@@ -288,7 +298,7 @@ def _run_mega_layer(
         y_layer2 = mega.forward(t)
         torch.cuda.synchronize()
         dist.barrier()
-        y_ref = _reference_bf16_mega_moe(
+        y_ref = _reference_mixed_mega_moe(
             problem, in_kernel_fc2_reduce=in_kernel_fc2_reduce, knobs=knobs
         )
         dist.barrier()
@@ -318,7 +328,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
         ensure_moe_ep_cuda_device,
         finalize_moe_ep_runtime,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.bf16_staging import (
@@ -326,9 +336,10 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
     from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
-        bf16_mega_moe,
-        compute_megamoe_reference_bf16,
-        get_symm_buffer_for_bf16_mega_moe,
+        Mxfp8ScaleDtype,
+        bf16_mxfp8_mega_moe,
+        compute_megamoe_reference_bf16_mxfp8,
+        get_symm_buffer_for_bf16_mxfp8_mega_moe,
     )
 
     from .test_mxfp8_cutedsl_preprocess_vs_reference import (
@@ -350,10 +361,9 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
     runtime = bootstrap_moe_ep_runtime(
         bootstrap, kernel.runtime_requirements(bootstrap)
     )
-    token_back = _token_back_for_ikr(in_kernel_fc2_reduce)
     try:
         n = problem["num_tokens"]
-        symm_buffer = get_symm_buffer_for_bf16_mega_moe(
+        symm_buffer = get_symm_buffer_for_bf16_mxfp8_mega_moe(
             problem["num_experts"],
             problem["max_tokens"],
             problem["topk"],
@@ -361,9 +371,10 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
             problem["intermediate"],
             rank,
             world_size,
+            kind=problem["kind"],
             gate_up_clamp=problem["gate_up_clamp"],
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-            token_back_mode=token_back,
+            token_back_mode="epi_warps",
         )
         try:
             stage_mega_moe_inputs(
@@ -381,11 +392,12 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
                 MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
                 intermediate_size=problem["intermediate"],
                 hidden_size=problem["hidden"],
+                kind=problem["kind"],
             )
             y_kernel = torch.empty(
                 n, problem["hidden"], dtype=torch.bfloat16, device="cuda"
             )
-            bf16_mega_moe(
+            bf16_mxfp8_mega_moe(
                 y_kernel,
                 transformed_l1,
                 transformed_l2,
@@ -396,12 +408,18 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
             )
             torch.cuda.synchronize()
             dist.barrier()
-            combine_ref = compute_megamoe_reference_bf16(
+            combine_ref = compute_megamoe_reference_bf16_mxfp8(
                 input_activation=_all_gather_stack(x_local),
                 input_topk_idx=_all_gather_stack(idx_local),
                 input_topk_weights=_all_gather_stack(w_local),
-                fc1_weight=_all_gather_stack(transformed_l1[0]),
-                fc2_weight=_all_gather_stack(transformed_l2[0]),
+                fc1_weight=_public_k_major(_all_gather_stack(transformed_l1[0])),
+                fc1_weight_sf=_all_gather_stack(
+                    transformed_l1[1].view(Mxfp8ScaleDtype)
+                ),
+                fc2_weight=_public_k_major(_all_gather_stack(transformed_l2[0])),
+                fc2_weight_sf=_all_gather_stack(
+                    transformed_l2[1].view(Mxfp8ScaleDtype)
+                ),
                 ref_compute_graph="deepgemm",
                 gate_up_clamp=problem["gate_up_clamp"],
                 apply_topk_in_fc1=True,
@@ -410,8 +428,8 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
             y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
             rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
             print(
-                f"[bf16 multirank oracle rank {rank} ikr={in_kernel_fc2_reduce}] "
-                f"rel_l2={rel_l2.item():.4g}"
+                f"[bf16_mxfp8 multirank oracle rank {rank} "
+                f"ikr={in_kernel_fc2_reduce}] rel_l2={rel_l2.item():.4g}"
             )
             _assert_mega_oracle_term_band_close(
                 yk, combine_ref[rank], ikr=in_kernel_fc2_reduce, label=f"rank{rank}"
@@ -426,49 +444,25 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
-@pytest.mark.parametrize("load_balance_mode", ("static", "atomic_counter"))
-@pytest.mark.parametrize(
-    "token_back_mode",
-    ("epi_warps", "standalone_warps", "reuse_dispatch_warps"),
-)
-def test_bf16_multirank_modes_are_constructible(load_balance_mode, token_back_mode):
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16 import MegaMoEBf16Config
-
-    config = MegaMoEBf16Config(
-        rank=0,
-        world_size=4,
-        num_tokens_per_rank=256,
-        num_topk=8,
-        num_total_experts=256,
-        hidden=7168,
-        intermediate=2048,
-        load_balance_mode=load_balance_mode,  # type: ignore[arg-type]
-        token_back_mode=token_back_mode,  # type: ignore[arg-type]
-    )
-    assert config.num_experts_per_rank == 64
-
-
-@pytest.mark.gpu_4
-@pytest.mark.arch_blackwell
-def test_moe_ep_bf16_cutedsl_mega_layer_matches_reference():
+def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_matches_reference():
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size)
-    print(f"rank {rank}: sm100_bf16_bf16_bf16_cutedsl mega layer matches reference")
+    print(f"rank {rank}: sm100_bf16_mxfp8_bf16_cutedsl mega layer matches reference")
 
 
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
-def test_moe_ep_bf16_cutedsl_mega_layer_in_kernel_fc2_reduce():
+def test_moe_ep_bf16_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce():
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
         pytest.skip("needs >=4 ranks")
     rank = _run_mega_layer(rank, world_size, in_kernel_fc2_reduce=True)
     print(
-        f"rank {rank}: sm100_bf16_bf16_bf16_cutedsl mega layer "
+        f"rank {rank}: sm100_bf16_mxfp8_bf16_cutedsl mega layer "
         "(in_kernel_fc2_reduce) matches reference within tolerance"
     )
 
@@ -476,7 +470,7 @@ def test_moe_ep_bf16_cutedsl_mega_layer_in_kernel_fc2_reduce():
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize("in_kernel_fc2_reduce", [False, True])
-def test_moe_ep_bf16_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
+def test_moe_ep_bf16_mxfp8_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
     _require_cuda()
     rank, world_size = _launcher_ranks()
     if world_size < 4:
@@ -485,6 +479,6 @@ def test_moe_ep_bf16_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
         rank, world_size, in_kernel_fc2_reduce=in_kernel_fc2_reduce
     )
     print(
-        f"rank {rank}: sm100_bf16_bf16_bf16_cutedsl mega kernel "
+        f"rank {rank}: sm100_bf16_mxfp8_bf16_cutedsl mega kernel "
         f"(ikr={in_kernel_fc2_reduce}) matches the multi-rank torch oracle"
     )
