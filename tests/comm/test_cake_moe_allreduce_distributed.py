@@ -92,6 +92,21 @@ def _run_mode(call: Callable[[], None], mode: str, group: dist.ProcessGroup) -> 
     torch.cuda.synchronize()
 
 
+def _rank_order_state_allreduce(
+    local: torch.Tensor,
+    dtype: torch.dtype,
+    group: dist.ProcessGroup,
+) -> torch.Tensor:
+    locals_by_rank = [
+        torch.empty_like(local) for _ in range(dist.get_world_size(group))
+    ]
+    dist.all_gather(locals_by_rank, local, group=group)
+    reduced = locals_by_rank[0]
+    for peer_local in locals_by_rank[1:]:
+        reduced = (reduced.float() + peer_local.float()).to(dtype)
+    return reduced
+
+
 def _reduction_worker(
     world_size: int,
     rank: int,
@@ -161,11 +176,15 @@ def _reduction_worker(
             ).contiguous()
             rms_eps = 1e-5
 
-            local = (
-                expert_input.float() * expert_scale.float().unsqueeze(-1)
-            ).sum(dim=0) + token_input.float()
-            allreduce_ref = local.to(dtype)
-            dist.all_reduce(allreduce_ref, group=group)
+            local = torch.zeros_like(token_input)
+            for expert in range(ACTIVE_EXPERTS):
+                contribution = (
+                    expert_input[expert].float()
+                    * expert_scale[expert].float().unsqueeze(-1)
+                ).to(dtype)
+                local = (local.float() + contribution.float()).to(dtype)
+            local = (local.float() + token_input.float()).to(dtype)
+            allreduce_ref = _rank_order_state_allreduce(local, dtype, group)
             allreduce_ref_f32 = allreduce_ref.float()
             residual_ref = (allreduce_ref_f32 + residual_in.float()).to(dtype)
             residual_ref_f32 = residual_ref.float()
@@ -332,15 +351,22 @@ def _finalize_worker(
                     if routed_scaling_factor is None
                     else routed_scaling_factor
                 )
-                local = (
-                    allreduce_in[inverse_indices].float()
-                    * expert_scale.float().unsqueeze(-1)
-                    * routed
-                ).sum(dim=1)
+                gathered = allreduce_in[inverse_indices]
+                local = torch.zeros_like(residual_in)
+                for route in range(TOP_K):
+                    contribution = (
+                        gathered[:, route].float()
+                        * expert_scale[:, route].float().unsqueeze(-1)
+                    ).to(dtype)
+                    local = (local.float() + contribution.float()).to(dtype)
+                local = (local.float() * routed).to(dtype)
                 if shared_expert_output is not None:
-                    local = local + shared_expert_output.float()
-                finalized_ref = local.to(dtype)
-                dist.all_reduce(finalized_ref, group=group)
+                    local = (
+                        local.float() + shared_expert_output.float()
+                    ).to(dtype)
+                finalized_ref = _rank_order_state_allreduce(
+                    local, dtype, group
+                )
                 residual_ref = (
                     finalized_ref.float() + residual_in.float()
                 ).to(dtype)
