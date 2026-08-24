@@ -885,9 +885,7 @@ def test_mla_paged_fi_trace():
         ckv_scale_arr=ckv_scale_arr,
         kpe_scale=1.0,
     )
-    expected_fi_api = (
-        "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run"
-    )
+    expected_fi_api = "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run"
     assert f"fi_api:{expected_fi_api}" in defn["tags"]
     _check_defn(defn, "mla_paged", expected_fi_api)
     axes = defn["axes"]

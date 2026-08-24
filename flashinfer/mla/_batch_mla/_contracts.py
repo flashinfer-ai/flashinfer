@@ -13,6 +13,9 @@ import torch
 
 MLAInputAvailability = Literal["packed", "split", "redundant"]
 MLAChosenRepresentation = Literal["packed", "split"]
+MLALSEMode = Literal["none", "base2", "basee"]
+MLAOutputScaleMode = Literal["none", "per-tensor"]
+MLAScaleMode = Literal["default", "kv-per-tensor"]
 MLAStructuralInputKind = Literal[
     "packed", "adjacent-split", "independent-split", "dual"
 ]
@@ -97,10 +100,10 @@ class MLAPlanMetadata:
 class MLAInputContract:
     """Run options that must remain compatible with a planned wrapper."""
 
-    lse_mode: str
+    lse_mode: MLALSEMode
     output_dtype: torch.dtype
-    output_scale: str
-    scale_mode: str
+    output_scale: MLAOutputScaleMode
+    scale_mode: MLAScaleMode
     query_layout: Literal["packed", "split"] = "packed"
     kv_cache_layout: Literal["packed", "split"] = "packed"
     head_dim_ckv: Optional[int] = None
@@ -200,10 +203,10 @@ def _parse_structural_mla_input(
 
 
 def _adjacent_last_dim_view(
-    left: torch.Tensor, right: torch.Tensor
+    left: torch.Tensor, right: torch.Tensor, *, assume_adjacent: bool = False
 ) -> Optional[torch.Tensor]:
     """Return a single in-bounds contiguous view for adjacent split tensors."""
-    if not _are_adjacent_last_dim_views(left, right):
+    if not assume_adjacent and not _are_adjacent_last_dim_views(left, right):
         return None
     shape = left.shape[:-1] + (left.shape[-1] + right.shape[-1],)
     return left.as_strided(shape, left.stride(), left.storage_offset())
@@ -222,7 +225,7 @@ def _are_adjacent_last_dim_views(left: torch.Tensor, right: torch.Tensor) -> boo
     ):
         return False
     storage = left.untyped_storage()
-    if storage._cdata != right.untyped_storage()._cdata:
+    if storage.data_ptr() != right.untyped_storage().data_ptr():
         return False
     stride = left.stride()
     storage_offset = left.storage_offset()
@@ -315,20 +318,6 @@ def _split_packed_last_dim(
     return packed[..., :left_width], packed[..., left_width:]
 
 
-def _structural_mla_input_kind(value: object) -> MLAStructuralInputKind:
-    if isinstance(value, torch.Tensor):
-        return "packed"
-    packed, split = _parse_structural_mla_input(value, name="MLA input")
-    if packed is not None:
-        return "dual"
-    assert split is not None
-    return (
-        "adjacent-split"
-        if _adjacent_last_dim_view(*split) is not None
-        else "independent-split"
-    )
-
-
 @overload
 def _resolve_structural_mla_input(
     value: object,
@@ -336,6 +325,7 @@ def _resolve_structural_mla_input(
     desired: Literal["packed"],
     widths: Optional[tuple[int, int]],
     name: str,
+    accepted: Optional[MLAChosenRepresentation] = None,
 ) -> torch.Tensor: ...
 
 
@@ -346,6 +336,7 @@ def _resolve_structural_mla_input(
     desired: Literal["split"],
     widths: Optional[tuple[int, int]],
     name: str,
+    accepted: Optional[MLAChosenRepresentation] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -355,10 +346,20 @@ def _resolve_structural_mla_input(
     desired: MLAChosenRepresentation,
     widths: Optional[tuple[int, int]],
     name: str,
+    accepted: Optional[MLAChosenRepresentation] = None,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     if desired not in ("packed", "split"):
         raise ValueError(f"unsupported {name} representation {desired!r}.")
+    if accepted is not None and accepted not in ("packed", "split"):
+        raise ValueError(f"unsupported accepted {name} representation {accepted!r}.")
     packed, split = _parse_structural_mla_input(value, name=name)
+    if accepted == "packed" and packed is None and (widths is None or widths[1] != 0):
+        assert split is not None
+        if not _are_adjacent_last_dim_views(*split):
+            raise ValueError(
+                f"{name} cannot provide the planned packed representation zero-copy; "
+                "re-plan for split input."
+            )
     if widths is None:
         if desired == "packed" and packed is not None:
             return packed
@@ -379,6 +380,8 @@ def _resolve_structural_mla_input(
     left, right = split
     if widths[1] == 0:
         return left
+    if accepted == "packed":
+        return _adjacent_last_dim_view(left, right, assume_adjacent=True)
     adjacent = _adjacent_last_dim_view(left, right)
     if adjacent is not None:
         return adjacent

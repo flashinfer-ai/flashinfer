@@ -256,7 +256,10 @@ The backend then validates constraints such as dtype, shape, softmax scale, and
 hardware support.
 
 After planning succeeds, `MLAInputContract` records the query/KV layouts, split
-widths, LSE mode, output dtype, output scaling mode, and KV scaling mode.
+widths, LSE mode, output dtype, output scaling mode, and KV scaling mode. The
+wrapper also records the selected backend's native query and KV-cache
+representations, so planned `run()` lowers directly to the plan-owned native
+policy without re-reading backend names or probing compatibility paths.
 `run()` must satisfy this contract; changing it normally requires replanning.
 
 ## Runtime tensor contract
@@ -278,7 +281,7 @@ The planned layout determines which representation is validated and consumed:
 | Packed | Independent split pair | Reject; replan for split input. |
 | Split | Split pair | Validate and pass through. |
 | Split | Packed tensor | Slice into zero-copy component views. |
-| Either | Trusted redundant value | Validate and use only the planned member. |
+| Either | Trusted redundant value | Validate and use only the backend-native member selected by the plan. |
 
 Split tensors must agree in rank, leading shape, dtype, device, and planned
 last-dimension widths. A split pair is adjacent only when both tensors are
@@ -287,7 +290,8 @@ wrapper can then create a packed view without allocating or copying.
 
 The redundant form is explicitly trusted: the wrapper does not prove that its
 packed and split members contain equivalent values. The caller owns that
-invariant, and the member not selected by the plan is not inspected.
+invariant, and the member not selected by the plan-owned backend-native policy
+is not inspected.
 
 For a normal planned run, independently allocated split values never satisfy a
 packed layout through concatenation. In particular, the wrapper does not copy a
@@ -367,11 +371,14 @@ new metadata exactly. The reserved `kv_indices` buffer may be larger than its
 active prefix. Generated-FA graph replanning can therefore change the live
 page-index count within capacity, but cannot change the reserved batch shapes.
 
-After a successful generated-FA graph replan, the wrapper retains the previous
-backend object. This keeps its plan-owned workspaces alive for graphs that
-reference their addresses. Retention is a lifetime guarantee, not a
-promise that the Python wrapper can intercept or validate direct external graph
-replay.
+After a successful generated-FA graph replan, the wrapper replaces the backend
+object but reuses the generated-FA plan workspaces captured by the prior backend
+for the same wrapper. The wrapper mirrors those reused workspace objects from
+the new backend, and it retains the previous backend object so other captured
+state remains alive. If the replan fails after touching shared plan workspaces,
+snapshots restore those workspaces before the previous plan remains active.
+Retention is a lifetime guarantee, not a promise that the Python wrapper can
+intercept or validate direct external graph replay.
 
 CUTLASS graph-mode replanning is rejected because its dense metadata pointers
 do not have an equivalent reserved-buffer protocol. An initial CUTLASS plan may
@@ -416,9 +423,10 @@ canonical replacement:
   plan/run LSE agreement.
 - An explicitly requested CUTLASS wrapper may still call `run()` without a
   prior `plan()` when both `kv_len` and `page_table` are present. This adapter
-  builds a dense plan from runtime facts and may concatenate independently split
-  query or KV-cache tensors. It warns and is the only planned-wrapper path that
-  intentionally permits those copies.
+  validates runtime facts and launches CUTLASS directly without synthesizing
+  persistent plan state. It may concatenate independently split query or
+  KV-cache tensors. It warns and is the only wrapper path that intentionally
+  permits those copies.
 
 Trace and Trace Apply integration preserve the public wrapper identity and
 plan-owned metadata capture. The MLA trace template normalizes structural

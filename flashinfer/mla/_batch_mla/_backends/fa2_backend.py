@@ -5,7 +5,7 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 """
 
-from typing import Optional
+from typing import ClassVar, Optional
 
 import torch
 
@@ -18,7 +18,7 @@ from ._fa_common import (
 
 
 class _BatchMLAPagedAttentionFa2Backend(_BatchMLAPagedAttentionFaBackendBase):
-    _plan_capabilities = MLAPlanCapabilities(
+    _plan_capabilities: ClassVar[MLAPlanCapabilities] = MLAPlanCapabilities(
         backend_name="fa2",
         lse_modes=frozenset({"none", "base2", "basee"}),
         kv_layouts=frozenset({"combined", "adjacent-split", "independent-split"}),
@@ -37,6 +37,8 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAPagedAttentionFaBackendBase):
         kv_len_arr_buf: Optional[torch.Tensor],
         query_split_widths: tuple[int, int],
         kv_split_widths: tuple[int, int],
+        int_workspace_buffer: Optional[torch.Tensor] = None,
+        pin_memory_int_workspace_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__(
             backend="fa2",
@@ -48,6 +50,8 @@ class _BatchMLAPagedAttentionFa2Backend(_BatchMLAPagedAttentionFaBackendBase):
             kv_len_arr_buf=kv_len_arr_buf,
             query_split_widths=query_split_widths,
             kv_split_widths=kv_split_widths,
+            int_workspace_buffer=int_workspace_buffer,
+            pin_memory_int_workspace_buffer=pin_memory_int_workspace_buffer,
         )
 
     def plan(

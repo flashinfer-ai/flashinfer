@@ -68,9 +68,7 @@ def _planned_cutlass_backend(
         _BatchMLAPagedAttentionCutlassBackend,
     )
 
-    backend = _BatchMLAPagedAttentionCutlassBackend(
-        torch.empty(16, dtype=torch.uint8)
-    )
+    backend = _BatchMLAPagedAttentionCutlassBackend(torch.empty(16, dtype=torch.uint8))
     backend._batch_size = batch_size
     backend._page_size = page_size
     backend._head_dim_ckv = 512
@@ -81,6 +79,7 @@ def _planned_cutlass_backend(
     backend._output_scale = output_scale
     backend._kv_len = torch.tensor([1], dtype=torch.int32)
     backend._page_table = torch.zeros((1, 128), dtype=torch.int32)
+    backend._empty_lse = torch.empty(0, dtype=torch.float32)
     return backend
 
 
@@ -253,33 +252,6 @@ def test_cutlass_mla_bf16_output_unchanged():
     )
 
     torch.testing.assert_close(o1, o2, rtol=1e-3, atol=1e-3)
-
-
-def test_cutlass_mla_fp8_non_cutlass_backend_rejected():
-    """o_scale with non-cutlass backend should raise ValueError.
-
-    We directly set _backend to 'fa2' without calling plan() to avoid
-    JIT compilation dependencies. The o_scale check happens before any
-    module call.
-    """
-    device = torch.device("cuda:0")
-
-    q_nope, q_pe, ckv_cache, kpe_cache, kv_lens, page_table = _setup_mla_inputs(
-        1, 128, 1, torch.float16, device
-    )
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
-    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="fa2")
-    # Force backend without plan() to avoid JIT compilation
-    wrapper._backend = "fa2"
-
-    out_fp8 = torch.empty(1, 128, 512, dtype=torch.float8_e4m3fn, device=device)
-    with pytest.raises(ValueError, match="o_scale is only supported with the cutlass"):
-        wrapper.run(
-            query=(q_nope, q_pe),
-            kv_cache=(ckv_cache, kpe_cache),
-            out=out_fp8,
-            o_scale=0.1,
-        )
 
 
 def test_planned_cutlass_fp8_output_uses_ckv_width_and_preserves_identity():

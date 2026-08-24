@@ -636,7 +636,7 @@ def test_batch_mla_page_attention(
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
         workspace_buffer,
         backend=backend,
-        use_cuda_graph=True,
+        use_cuda_graph=use_cuda_graph,
         qo_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
         kv_indptr=torch.empty(batch_size + 1, dtype=torch.int32, device=device),
         kv_indices=torch.empty(1048576, dtype=torch.int32, device=device),

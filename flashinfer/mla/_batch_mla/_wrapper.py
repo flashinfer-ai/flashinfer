@@ -10,13 +10,14 @@ import inspect
 import math
 import warnings
 from dataclasses import replace
-from typing import Any, Literal, Optional, Tuple, Union, overload
+from typing import Any, ClassVar, Literal, Optional, Protocol, Tuple, Union, overload
 
 import torch
 
 from ...api_logging import flashinfer_api
 from ...trace.templates.attention import mla_paged_decode_trace
 from ...utils import determine_mla_backend, get_compute_capability
+from ._backends._capabilities import MLAPlanCapabilities
 from ._backends.cutlass_backend import _BatchMLAPagedAttentionCutlassBackend
 from ._backends.fa2_backend import _BatchMLAPagedAttentionFa2Backend
 from ._backends.fa3_backend import _BatchMLAPagedAttentionFa3Backend
@@ -29,15 +30,48 @@ from ._contracts import (
 from ._planning import _MLAPlanArguments
 
 
+class _PlannedBackend(Protocol):
+    def run_from_wrapper(
+        self,
+        *,
+        query: object,
+        kv_cache: object,
+        out: Optional[torch.Tensor],
+        lse: Optional[torch.Tensor],
+        return_lse: bool,
+        profiler_buffer: Optional[torch.Tensor],
+        kv_len: Optional[torch.Tensor],
+        page_table: Optional[torch.Tensor],
+        return_lse_base_on_e: bool,
+        o_scale: Optional[float],
+        ckv_scale: Optional[float],
+        ckv_scale_arr: Optional[torch.Tensor],
+        kpe_scale: Optional[float],
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]: ...
+
+
+class _WrapperBackendType(Protocol):
+    _plan_capabilities: ClassVar[MLAPlanCapabilities]
+
+    @classmethod
+    def plan_from_wrapper(cls, args: _MLAPlanArguments) -> _PlannedBackend: ...
+
+
 def _get_compute_capability(device: torch.device):
     return get_compute_capability(device)
 
 
-_BACKEND_TYPES = {
+_BACKEND_TYPES: dict[str, type[_WrapperBackendType]] = {
     "fa2": _BatchMLAPagedAttentionFa2Backend,
     "fa3": _BatchMLAPagedAttentionFa3Backend,
     "cutlass": _BatchMLAPagedAttentionCutlassBackend,
 }
+
+_MIRRORED_BACKEND_ATTRS = (
+    "_cached_module",
+    "_int_workspace_buffer",
+    "_pin_memory_int_workspace_buffer",
+)
 
 
 def _warn_from_external_caller(message: str, category: type[Warning]) -> None:
@@ -163,6 +197,15 @@ class BatchMLAPagedAttentionWrapper:
         )
         self._warned_legacy_dynamic_lse = True
 
+    def _publish_backend_mirrors(self, backend: object) -> None:
+        """Expose backend fast-replay attrs without retaining stale mirrors."""
+
+        for name in _MIRRORED_BACKEND_ATTRS:
+            if hasattr(backend, name):
+                setattr(self, name, getattr(backend, name))
+            elif hasattr(self, name):
+                delattr(self, name)
+
     @flashinfer_api
     def __init__(
         self,
@@ -219,14 +262,14 @@ class BatchMLAPagedAttentionWrapper:
                 "backend must be one of 'auto', 'fa2', 'fa3', or 'cutlass', "
                 f"got {backend!r}."
             )
-        self._planned_backend = None
+        self._planned_backend: Optional[_PlannedBackend] = None
         self._input_contract: Optional[MLAInputContract] = None
+        self._planned_query_layout: Optional[Literal["packed", "split"]] = None
+        self._planned_kv_cache_layout: Optional[Literal["packed", "split"]] = None
         self._warned_positional_arguments = False
         self._warned_legacy_tensor_arguments = False
         self._legacy_flat_csr_plan = False
         self._warned_legacy_dynamic_lse = False
-        self._legacy_unplanned_cutlass_copy_inputs = False
-        self._legacy_unplanned_cutlass_shape: Optional[tuple[int, int]] = None
         self._retired_cuda_graph_backends: list[object] = []
 
     # Preferred canonical metadata form.
@@ -483,10 +526,26 @@ class BatchMLAPagedAttentionWrapper:
             # Existing FP8 callers always supply CKV/KPE scales at run time.
             scale_mode = "kv-per-tensor"
 
+        previous_backend = getattr(self, "_planned_backend", None)
+        graph_plan_int_workspace_buffer = None
+        graph_plan_pin_memory_int_workspace_buffer = None
+        if (
+            self._use_cuda_graph
+            and previous_backend is not None
+            and self._backend in ("fa2", "fa3")
+            and getattr(previous_backend, "_backend", None) in ("fa2", "fa3")
+        ):
+            graph_plan_int_workspace_buffer = previous_backend._int_workspace_buffer
+            graph_plan_pin_memory_int_workspace_buffer = (
+                previous_backend._pin_memory_int_workspace_buffer
+            )
+
         # ---------------------------------------------------------------------------
         # Lower wrapper inputs to backend plan arguments
         # ---------------------------------------------------------------------------
-        kv_layout = "combined" if kv_cache_layout == "packed" else "independent-split"
+        kv_layout: Literal["combined", "independent-split"] = (
+            "combined" if kv_cache_layout == "packed" else "independent-split"
+        )
         plan_args = _MLAPlanArguments(
             metadata=plan_metadata,
             num_heads=num_heads,
@@ -515,6 +574,10 @@ class BatchMLAPagedAttentionWrapper:
             _kv_indptr_buf=self._kv_indptr_buf,
             _kv_indices_buf=self._kv_indices_buf,
             _kv_len_arr_buf=self._kv_len_arr_buf,
+            _graph_plan_int_workspace_buffer=graph_plan_int_workspace_buffer,
+            _graph_plan_pin_memory_int_workspace_buffer=(
+                graph_plan_pin_memory_int_workspace_buffer
+            ),
         )
 
         # ---------------------------------------------------------------------------
@@ -534,8 +597,35 @@ class BatchMLAPagedAttentionWrapper:
         # Plan with the selected backend
         # ---------------------------------------------------------------------------
         backend_type = _BACKEND_TYPES[self._backend]
-        previous_backend = getattr(self, "_planned_backend", None)
-        planned_backend = backend_type.plan_from_wrapper(plan_args)
+        graph_workspace_snapshots = None
+        if (
+            graph_plan_int_workspace_buffer is not None
+            and graph_plan_pin_memory_int_workspace_buffer is not None
+        ):
+            graph_workspace_snapshots = (
+                (
+                    graph_plan_int_workspace_buffer,
+                    graph_plan_int_workspace_buffer.clone(),
+                ),
+                (
+                    graph_plan_pin_memory_int_workspace_buffer,
+                    graph_plan_pin_memory_int_workspace_buffer.clone(),
+                ),
+            )
+        try:
+            planned_backend = backend_type.plan_from_wrapper(plan_args)
+        except Exception:
+            if graph_workspace_snapshots is not None:
+                for target, snapshot in graph_workspace_snapshots:
+                    target.copy_(snapshot)
+            raise
+        planned_capabilities = backend_type._plan_capabilities
+        planned_query_layout: Literal["packed", "split"] = (
+            "packed" if planned_capabilities.requires_packed_query else "split"
+        )
+        planned_kv_cache_layout: Literal["packed", "split"] = (
+            "packed" if planned_capabilities.requires_packed_kv_cache else "split"
+        )
 
         # ---------------------------------------------------------------------------
         # Publish the successful plan state
@@ -558,9 +648,10 @@ class BatchMLAPagedAttentionWrapper:
             retired_backends.append(previous_backend)
         self._planned_backend = planned_backend
         self._input_contract = input_contract
+        self._planned_query_layout = planned_query_layout
+        self._planned_kv_cache_layout = planned_kv_cache_layout
+        self._publish_backend_mirrors(planned_backend)
         self._legacy_flat_csr_plan = legacy_flat_csr
-        self._legacy_unplanned_cutlass_copy_inputs = False
-        self._legacy_unplanned_cutlass_shape = None
         self._qo_indptr_buf = getattr(
             planned_backend, "_qo_indptr_buf", self._qo_indptr_buf
         )
@@ -768,10 +859,6 @@ class BatchMLAPagedAttentionWrapper:
         # ---------------------------------------------------------------------------
         # Normalize structural and legacy inputs
         # ---------------------------------------------------------------------------
-        if o_scale is not None and self._backend != "cutlass":
-            raise ValueError(
-                "o_scale is only supported with the cutlass backend for now."
-            )
         uses_legacy_query = query is None
         if query is None:
             if (q_nope is None) != (q_pe is None):
@@ -803,10 +890,7 @@ class BatchMLAPagedAttentionWrapper:
                 "BatchMLAPagedAttentionWrapper.run() called before plan()."
             )
 
-        is_legacy_cutlass = is_unplanned_cutlass or getattr(
-            self, "_legacy_unplanned_cutlass_copy_inputs", False
-        )
-        if is_legacy_cutlass:
+        if is_unplanned_cutlass:
             widths = (512, 64)
             _, query_dtype, query_shape = _structural_mla_input_facts(
                 query, widths=widths, name="query"
@@ -814,16 +898,20 @@ class BatchMLAPagedAttentionWrapper:
             _, kv_dtype, kv_shape = _structural_mla_input_facts(
                 kv_cache, widths=widths, name="KV cache"
             )
-            dynamic_shape = (query_shape[0], kv_shape[-2])
-            needs_plan = is_unplanned_cutlass or dynamic_shape != getattr(
-                self, "_legacy_unplanned_cutlass_shape", None
-            )
-            if needs_plan and (kv_len is None or page_table is None):
+            if return_lse:
+                raise ValueError("return_lse is not supported with cutlass backend.")
+            if lse is not None:
+                raise ValueError("lse is not supported with cutlass backend.")
+            if return_lse_base_on_e:
+                raise ValueError(
+                    "return_lse_base_on_e is not supported with cutlass backend."
+                )
+            if kv_len is None or page_table is None:
                 raise ValueError(
                     "unplanned CUTLASS requires both kv_len and page_table metadata "
                     "when its dynamic batch or page size changes."
                 )
-            if needs_plan and o_scale is not None:
+            if o_scale is not None:
                 if out is None:
                     raise ValueError(
                         "out tensor must be provided when o_scale is used for FP8 output."
@@ -838,41 +926,45 @@ class BatchMLAPagedAttentionWrapper:
                     raise ValueError(
                         f"o_scale must be a finite positive value, got {o_scale}"
                     )
-            if needs_plan:
-                if is_unplanned_cutlass:
-                    _warn_from_external_caller(
-                        "Running an explicitly requested CUTLASS backend without first "
-                        "calling plan() is deprecated; call plan() with canonical dense "
-                        "metadata instead.",
-                        DeprecationWarning,
-                    )
-                assert kv_len is not None and page_table is not None
-                self.plan(
-                    metadata=MLAPlanMetadata.dense(
-                        torch.arange(
-                            query_shape[0] + 1,
-                            dtype=torch.int32,
-                            device=self.device,
-                        ),
-                        page_table,
-                        kv_len,
-                        max_q_len=1,
-                    ),
-                    num_heads=query_shape[-2],
-                    head_dim_ckv=widths[0],
-                    head_dim_kpe=widths[1],
-                    page_size=kv_shape[-2],
-                    causal=False,
-                    sm_scale=1.0 / math.sqrt(128 + widths[1]),
-                    q_data_type=query_dtype,
-                    kv_data_type=kv_dtype,
-                    query_layout="packed",
-                    kv_cache_layout="packed",
-                    output_dtype=query_dtype if out is None else out.dtype,
-                    output_scale="per-tensor" if o_scale is not None else "none",
+            _warn_from_external_caller(
+                "Running an explicitly requested CUTLASS backend without first "
+                "calling plan() is deprecated; call plan() with canonical dense "
+                "metadata instead.",
+                DeprecationWarning,
+            )
+            assert kv_len is not None and page_table is not None
+            try:
+                query_for_cutlass = _resolve_structural_mla_input(
+                    query, desired="packed", widths=widths, name="query"
                 )
-                self._legacy_unplanned_cutlass_copy_inputs = True
-                self._legacy_unplanned_cutlass_shape = dynamic_shape
+            except ValueError:
+                if isinstance(query, tuple) and len(query) == 2:
+                    query_for_cutlass = torch.cat(query, dim=-1)
+                else:
+                    raise
+            try:
+                kv_for_cutlass = _resolve_structural_mla_input(
+                    kv_cache, desired="packed", widths=widths, name="KV cache"
+                )
+            except ValueError:
+                if isinstance(kv_cache, tuple) and len(kv_cache) == 2:
+                    kv_for_cutlass = torch.cat(kv_cache, dim=-1)
+                else:
+                    raise
+            return _BatchMLAPagedAttentionCutlassBackend.run_planless(
+                float_workspace_buffer=self._float_workspace_buffer,
+                query=query_for_cutlass,
+                kv_cache=kv_for_cutlass,
+                out=out,
+                profiler_buffer=profiler_buffer,
+                kv_len=kv_len,
+                page_table=page_table,
+                o_scale=o_scale,
+                q_data_type=query_dtype,
+                kv_data_type=kv_dtype,
+                num_heads=query_shape[-2],
+                page_size=kv_shape[-2],
+            )
 
         # ---------------------------------------------------------------------------
         # Validate the declared run contract
@@ -881,7 +973,8 @@ class BatchMLAPagedAttentionWrapper:
         assert contract is not None
         if (
             getattr(self, "_legacy_flat_csr_plan", False)
-            and self._backend in ("fa2", "fa3")
+            and self._planned_query_layout == "split"
+            and self._planned_kv_cache_layout == "split"
             and contract.lse_mode == "none"
             and (return_lse or lse is not None or return_lse_base_on_e)
         ):
@@ -907,41 +1000,24 @@ class BatchMLAPagedAttentionWrapper:
         widths = (contract.head_dim_ckv, contract.head_dim_kpe)
         assert widths[0] is not None and widths[1] is not None
         typed_widths = (widths[0], widths[1])
-        if getattr(self, "_legacy_unplanned_cutlass_copy_inputs", False):
-            query_kind = _structural_mla_input_facts(
-                query, widths=typed_widths, name="query"
-            )[0]
-            kv_kind = _structural_mla_input_facts(
-                kv_cache, widths=typed_widths, name="KV cache"
-            )[0]
-            if query_kind == "independent-split":
-                query_for_backend = torch.cat(query, dim=-1)
-            else:
-                query_for_backend = _resolve_structural_mla_input(
-                    query, desired="packed", widths=typed_widths, name="query"
-                )
-            if kv_kind == "independent-split":
-                kv_for_backend = torch.cat(kv_cache, dim=-1)
-            else:
-                kv_for_backend = _resolve_structural_mla_input(
-                    kv_cache,
-                    desired="packed",
-                    widths=typed_widths,
-                    name="KV cache",
-                )
-        else:
-            query_for_backend = _resolve_structural_mla_input(
-                query,
-                desired=contract.query_layout,
-                widths=typed_widths,
-                name="query",
-            )
-            kv_for_backend = _resolve_structural_mla_input(
-                kv_cache,
-                desired=contract.kv_cache_layout,
-                widths=typed_widths,
-                name="KV cache",
-            )
+        backend_query_layout = self._planned_query_layout
+        backend_kv_cache_layout = self._planned_kv_cache_layout
+        assert backend_query_layout is not None
+        assert backend_kv_cache_layout is not None
+        query_for_backend = _resolve_structural_mla_input(
+            query,
+            desired=backend_query_layout,
+            widths=typed_widths,
+            name="query",
+            accepted=contract.query_layout,
+        )
+        kv_for_backend = _resolve_structural_mla_input(
+            kv_cache,
+            desired=backend_kv_cache_layout,
+            widths=typed_widths,
+            name="KV cache",
+            accepted=contract.kv_cache_layout,
+        )
 
         # ---------------------------------------------------------------------------
         # Dispatch to the planned backend

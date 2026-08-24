@@ -352,7 +352,12 @@ class _MLAPlanMetadataResolver:
         dense_present = tuple(value is not None for value in self._raw_dense[:3])
         max_q_len_present = self._raw_dense[3] is not None
         if any(csr_present) and not all(csr_present):
-            names = ("qo_indptr", "kv_indptr", "kv_indices", "kv_len_arr")
+            names: tuple[str, ...] = (
+                "qo_indptr",
+                "kv_indptr",
+                "kv_indices",
+                "kv_len_arr",
+            )
             missing = [
                 name
                 for name, present in zip(names, csr_present, strict=True)
@@ -576,6 +581,12 @@ class _MLAPlanArguments:
     _kv_indptr_buf: Optional[torch.Tensor] = field(repr=False, compare=False)
     _kv_indices_buf: Optional[torch.Tensor] = field(repr=False, compare=False)
     _kv_len_arr_buf: Optional[torch.Tensor] = field(repr=False, compare=False)
+    _graph_plan_int_workspace_buffer: Optional[torch.Tensor] = field(
+        default=None, repr=False, compare=False
+    )
+    _graph_plan_pin_memory_int_workspace_buffer: Optional[torch.Tensor] = field(
+        default=None, repr=False, compare=False
+    )
     _metadata_resolver: _MLAPlanMetadataResolver = field(
         init=False, repr=False, compare=False
     )

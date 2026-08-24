@@ -7,19 +7,24 @@ you may not use this file except in compliance with the License.
 
 import functools
 import math
-from typing import Callable, Optional, Tuple, Union
+from typing import Callable, ClassVar, Optional, Protocol, Tuple, TypeVar, Union, cast
 
 import torch
 
 from ....jit import gen_batch_mla_module
 from ....utils import MaskMode, check_shape_dtype_device, get_compute_capability
-from ._capabilities import plan_capability_rejection_reason
-from .._contracts import _resolve_structural_mla_input
+from ._capabilities import MLAPlanCapabilities, plan_capability_rejection_reason
 from .._planning import _MLAPlanArguments
 
 
+class _GeneratedBatchMLAModule(Protocol):
+    def plan(self, *args: object) -> object: ...
+
+    def run(self, *args: object) -> object: ...
+
+
 @functools.cache
-def get_batch_mla_module(backend, *args):
+def get_batch_mla_module(backend: str, *args: object) -> _GeneratedBatchMLAModule:
     return gen_batch_mla_module(backend, *args).build_and_load()
 
 
@@ -91,26 +96,32 @@ class _BatchMLAGeneratedFaMechanics:
     def __init__(
         self,
         *,
-        backend: str,
+        backend: Optional[str] = None,
         float_workspace_buffer: torch.Tensor,
         use_cuda_graph: bool,
         qo_indptr_buf: Optional[torch.Tensor],
         kv_indptr_buf: Optional[torch.Tensor],
         kv_indices_buf: Optional[torch.Tensor],
         kv_len_arr_buf: Optional[torch.Tensor],
+        int_workspace_buffer: Optional[torch.Tensor] = None,
+        pin_memory_int_workspace_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         self._backend = backend
         self._float_workspace_buffer = float_workspace_buffer
         self.device = float_workspace_buffer.device
-        self._int_workspace_buffer = torch.empty(
-            (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
-        )
-        self._pin_memory_int_workspace_buffer = torch.empty(
-            self._int_workspace_buffer.shape,
-            dtype=self._int_workspace_buffer.dtype,
-            pin_memory=True,
-            device="cpu",
-        )
+        if int_workspace_buffer is None:
+            int_workspace_buffer = torch.empty(
+                (8 * 1024 * 1024,), dtype=torch.uint8, device=self.device
+            )
+        if pin_memory_int_workspace_buffer is None:
+            pin_memory_int_workspace_buffer = torch.empty(
+                int_workspace_buffer.shape,
+                dtype=int_workspace_buffer.dtype,
+                pin_memory=True,
+                device="cpu",
+            )
+        self._int_workspace_buffer = int_workspace_buffer
+        self._pin_memory_int_workspace_buffer = pin_memory_int_workspace_buffer
         self._use_cuda_graph = use_cuda_graph
         self._qo_indptr_buf = qo_indptr_buf
         self._kv_indptr_buf = kv_indptr_buf
@@ -121,7 +132,7 @@ class _BatchMLAGeneratedFaMechanics:
     def _storage_interval(tensor: torch.Tensor) -> tuple[int, int, int]:
         start = tensor.storage_offset() * tensor.element_size()
         return (
-            tensor.untyped_storage()._cdata,
+            tensor.untyped_storage().data_ptr(),
             start,
             start + tensor.numel() * tensor.element_size(),
         )
@@ -251,7 +262,7 @@ class _BatchMLAGeneratedFaMechanics:
     def _plan_generated_fa(
         self,
         *,
-        module_loader: Callable[[], object],
+        module_loader: Callable[[], _GeneratedBatchMLAModule],
         qo_indptr: torch.Tensor,
         kv_indptr: torch.Tensor,
         kv_indices: torch.Tensor,
@@ -452,13 +463,16 @@ class _BatchMLAGeneratedFaMechanics:
         return (out, lse) if return_lse else out
 
 
+_FaBackendT = TypeVar("_FaBackendT", bound="_BatchMLAPagedAttentionFaBackendBase")
+
+
 class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
-    _plan_capabilities = None
+    _plan_capabilities: ClassVar[Optional[MLAPlanCapabilities]] = None
 
     def __init__(
         self,
         *,
-        backend: str,
+        backend: Optional[str] = None,
         float_workspace_buffer: torch.Tensor,
         use_cuda_graph: bool,
         qo_indptr_buf: Optional[torch.Tensor],
@@ -467,7 +481,13 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
         kv_len_arr_buf: Optional[torch.Tensor],
         query_split_widths: tuple[int, int],
         kv_split_widths: tuple[int, int],
+        int_workspace_buffer: Optional[torch.Tensor] = None,
+        pin_memory_int_workspace_buffer: Optional[torch.Tensor] = None,
     ) -> None:
+        if backend is None:
+            if self._plan_capabilities is None:
+                raise TypeError("generated-FA backend capabilities are required.")
+            backend = self._plan_capabilities.backend_name
         super().__init__(
             backend=backend,
             float_workspace_buffer=float_workspace_buffer,
@@ -476,12 +496,37 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             kv_indptr_buf=kv_indptr_buf,
             kv_indices_buf=kv_indices_buf,
             kv_len_arr_buf=kv_len_arr_buf,
+            int_workspace_buffer=int_workspace_buffer,
+            pin_memory_int_workspace_buffer=pin_memory_int_workspace_buffer,
         )
         self._query_split_widths = query_split_widths
         self._kv_split_widths = kv_split_widths
 
+    def plan(
+        self,
+        *,
+        qo_indptr: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+        kv_len_arr: torch.Tensor,
+        num_heads: int,
+        head_dim_ckv: int,
+        head_dim_kpe: int,
+        page_size: int,
+        causal: bool,
+        sm_scale: float,
+        q_data_type: torch.dtype,
+        kv_data_type: torch.dtype,
+        output_dtype: torch.dtype,
+        scale_mode: str,
+        use_profiler: bool,
+    ) -> None:
+        raise NotImplementedError
+
     @classmethod
-    def plan_from_wrapper(cls, args: _MLAPlanArguments):
+    def plan_from_wrapper(
+        cls: type[_FaBackendT], args: _MLAPlanArguments
+    ) -> _FaBackendT:
         assert cls._plan_capabilities is not None
         if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
             raise ValueError(reason)
@@ -494,6 +539,8 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             kv_len_arr_buf=args._kv_len_arr_buf,
             query_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
             kv_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
+            int_workspace_buffer=args._graph_plan_int_workspace_buffer,
+            pin_memory_int_workspace_buffer=args._graph_plan_pin_memory_int_workspace_buffer,
         )
         csr = args.csr()
         backend.plan(
@@ -540,18 +587,8 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             raise ValueError(
                 "o_scale is only supported with the cutlass backend for now."
             )
-        q_nope, q_pe = _resolve_structural_mla_input(
-            query,
-            desired="split",
-            widths=self._query_split_widths,
-            name="query",
-        )
-        ckv_cache, kpe_cache = _resolve_structural_mla_input(
-            kv_cache,
-            desired="split",
-            widths=self._kv_split_widths,
-            name="KV cache",
-        )
+        q_nope, q_pe = cast(tuple[torch.Tensor, torch.Tensor], query)
+        ckv_cache, kpe_cache = cast(tuple[torch.Tensor, torch.Tensor], kv_cache)
         return self._run_generated_fa(
             q_nope=q_nope,
             q_pe=q_pe,
