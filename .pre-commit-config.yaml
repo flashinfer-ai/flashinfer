@@ -18,9 +18,10 @@
 # periodically (sm100/cutedsl_megamoe, sm90/pull_style_cutedsl_megakernel);
 # excluded from all hooks so formatting/lint churn doesn't block syncs.
 # The shim/ layers next to them are ours and stay checked.
-# The Cake selective-state CUDA/host trees are byte-faithful generated exports;
-# their SHA-256 digests are checked by the JIT manifest and must not be rewritten.
-exclude: ^(?:csrc/cake_selective_state_update/(?:cuda|host)/|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/)
+# The selective-state CUDA/host trees and frozen KDA fallback sources are
+# byte-faithful generated exports; their SHA-256 digests are checked by the JIT
+# manifest and must not be rewritten.
+exclude: ^(?:csrc/cake_selective_state_update/(?:cuda|host)/|csrc/kda/training_fallback_pointer_sm_(?:100a|103a)\.cu|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/)
 
 repos:
   # Standard hooks
@@ -49,8 +50,10 @@ repos:
     hooks:
       - id: clang-format
         types_or: [c++, c, cuda]
+        # Source-export directories are checksum-attested generated artifacts;
+        # formatting them would break parity with their producer manifests.
         exclude: |
-          (?x)^(3rdparty/.* flashinfer/jit/aot_config.py)$
+          (?x)^(3rdparty/.*|flashinfer/jit/aot_config.py|csrc/cake_vsa/.*)$
 
   -   repo: https://github.com/pre-commit/mirrors-mypy
       rev: 'v1.17.1'  # Use the sha / tag you want to point at
