@@ -2103,6 +2103,21 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                     f"TRTLLM {variant.name} is unsupported on "
                     f"SM{compute_capability[0]}{compute_capability[1]}."
                 )
+            # SM107 builds against the pinned Rubin BMM package, whose
+            # gemmGatedAct::ActType is {SwiGlu, GeGlu, None} -- None occupies
+            # the value SiTuGlu has elsewhere. activationTypeToGatedActType
+            # still maps Situ to that value, and the static asserts that would
+            # catch the mismatch are compiled out under TLLM_RUBIN_FEATURES, so
+            # a SiTU request would run with no activation instead of failing.
+            # Drop this once the Rubin pin carries SiTuGlu.
+            if compute_capability == (10, 7) and isinstance(
+                self.config.activation, SiTU
+            ):
+                raise NotImplementedError(
+                    f"{type(self).__name__} cannot run SiTU on SM107: the "
+                    "pinned Rubin BMM package predates SiTuGlu and would "
+                    "silently apply no activation."
+                )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()

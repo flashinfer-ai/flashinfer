@@ -966,6 +966,35 @@ class TestMoERunnerSupport:
         base.update(overrides)
         return MoEConfig(**base)
 
+    @pytest.mark.parametrize(
+        ("compute_capability", "supported"),
+        [((10, 0), True), ((10, 3), True), ((10, 7), False)],
+    )
+    def test_trtllm_fp4_situ_rejected_on_rubin(
+        self, monkeypatch, compute_capability, supported
+    ):
+        """SM107 must reject SiTU while the Rubin BMM pin predates SiTuGlu.
+
+        Rubin's gemmGatedAct::ActType is {SwiGlu, GeGlu, None}, so None holds
+        the value SiTuGlu carries elsewhere. activationTypeToGatedActType still
+        maps Situ to it and the static asserts are compiled out under
+        TLLM_RUBIN_FEATURES, so without this guard SM107 would run SiTU with no
+        activation at all rather than fail.
+        """
+        import flashinfer.utils as utils
+
+        runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
+        runner.config = self._nvfp4_swiglu(activation=SiTU())
+        runner.device = torch.device("cuda")
+        monkeypatch.setattr(
+            utils, "get_compute_capability", lambda _: compute_capability
+        )
+        if supported:
+            assert runner.check_support() is None
+        else:
+            with pytest.raises(NotImplementedError, match="SiTU on SM107"):
+                runner.check_support()
+
     @pytest.mark.parametrize("variant", (QuantVariant.NVFP4, QuantVariant.W4A16))
     def test_cute_dsl_quant_variants_supported(self, variant):
         runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)
@@ -1626,9 +1655,9 @@ sm100_required = pytest.mark.skipif(
 cute_dsl_sm100_required = pytest.mark.skipif(
     not (
         torch.cuda.is_available()
-        and get_compute_capability(torch.device("cuda")) in ((10, 0), (10, 3))
+        and get_compute_capability(torch.device("cuda")) in ((10, 0), (10, 3), (10, 7))
     ),
-    reason="CuTeDSL unified MoE requires SM100 or SM103",
+    reason="CuTeDSL unified MoE requires SM100, SM103, or SM107",
 )
 
 
