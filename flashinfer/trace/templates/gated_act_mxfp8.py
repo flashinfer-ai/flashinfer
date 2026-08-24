@@ -27,9 +27,7 @@ def _quantize_reference(logical, rowwise, colwise):
     empty_q = logical.new_empty(0, dtype=torch.float8_e4m3fn)
     empty_s = logical.new_empty(0, dtype=torch.float8_e8m0fnu)
     if rowwise:
-        row_q, row_s = mxfp8_quantize(
-            logical, sf_swizzle_layout=SfLayout.layout_128x4
-        )
+        row_q, row_s = mxfp8_quantize(logical, sf_swizzle_layout=SfLayout.layout_128x4)
         row_s = row_s.reshape(logical.shape[0], logical.shape[1] // 32).view(
             torch.float8_e8m0fnu
         )
@@ -54,9 +52,7 @@ def _forward_reference(gated_input, rowwise=True, colwise=False):
     return _quantize_reference(logical, rowwise, colwise)
 
 
-def _backward_reference(
-    gated_input, grad_output, rowwise=True, colwise=False
-):
+def _backward_reference(gated_input, grad_output, rowwise=True, colwise=False):
     k = gated_input.shape[1] // 2
     gate = gated_input[:, :k].float()
     up = gated_input[:, k:].float()
@@ -175,9 +171,7 @@ def _make_trace(
             ["M", "O_div_32"] if rowwise else ["zero"],
             dtype="float8_e8m0fnu",
         ),
-        "col_scales": Tensor(
-            ["SF"] if colwise else ["zero"], dtype="float8_e8m0fnu"
-        ),
+        "col_scales": Tensor(["SF"] if colwise else ["zero"], dtype="float8_e8m0fnu"),
     }
     constraints = [
         "K_doubled == 2 * K",

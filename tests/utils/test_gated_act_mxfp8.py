@@ -34,7 +34,9 @@ MODES = (
 
 
 def _supported() -> bool:
-    return torch.cuda.is_available() and get_compute_capability(torch.device("cuda:0")) in (
+    return torch.cuda.is_available() and get_compute_capability(
+        torch.device("cuda:0")
+    ) in (
         (10, 0),
         (10, 3),
     )
@@ -83,9 +85,7 @@ def _quantize_reference(
     empty_q = logical.new_empty(0, dtype=torch.float8_e4m3fn)
     empty_s = logical.new_empty(0, dtype=torch.uint8)
     if rowwise:
-        row_q, row_s = mxfp8_quantize(
-            logical, sf_swizzle_layout=SfLayout.layout_128x4
-        )
+        row_q, row_s = mxfp8_quantize(logical, sf_swizzle_layout=SfLayout.layout_128x4)
         row_s = row_s.reshape(logical.shape[0], logical.shape[1] // 32)
     else:
         row_q, row_s = empty_q, empty_s
@@ -103,9 +103,7 @@ def _unswizzle(sf: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
     padded_rows = (rows + 127) // 128 * 128
     padded_cols = (cols + 3) // 4 * 4
     values = sf.reshape(padded_rows // 128, padded_cols // 4, 32, 4, 4)
-    return values.permute(0, 3, 2, 1, 4).reshape(padded_rows, padded_cols)[
-        :rows, :cols
-    ]
+    return values.permute(0, 3, 2, 1, 4).reshape(padded_rows, padded_cols)[:rows, :cols]
 
 
 def _e4m3_ordinal(bits: torch.Tensor) -> torch.Tensor:
@@ -135,9 +133,9 @@ def _assert_backward_orientation(
     scale_gap = (actual_scale.to(torch.int16) - expected_scale.to(torch.int16)).abs()
     invalid_scale = (actual_scale == 0xFF) | (expected_scale == 0xFF)
     assert not (((scale_gap > 1) & ~invalid_scale).any())
-    assert not (
-        invalid_scale & (actual_scale != expected_scale)
-    ).any(), "invalid scale payloads must match"
+    assert not (invalid_scale & (actual_scale != expected_scale)).any(), (
+        "invalid scale payloads must match"
+    )
     scale_differences = int((actual_scale != expected_scale).sum())
     assert scale_differences <= max(8, int(1.0e-5 * actual_scale.numel()))
 
@@ -156,7 +154,8 @@ def _assert_backward_orientation(
         invalid_elements, actual_bits, reencoded.contiguous().view(torch.uint8)
     )
     invalid_payload = invalid_elements & (
-        (actual_element_scale != expected_element_scale) | (actual_bits != expected_bits)
+        (actual_element_scale != expected_element_scale)
+        | (actual_bits != expected_bits)
     )
     code_gap = (_e4m3_ordinal(common_bits) - _e4m3_ordinal(expected_bits)).abs()
     assert not ((code_gap > 1) | invalid_payload).any()

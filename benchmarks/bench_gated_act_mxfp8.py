@@ -85,9 +85,7 @@ def _decomposed(
         else _backward_activation(gated_input, grad_output)
     )
     if rowwise:
-        flashinfer.mxfp8_quantize(
-            logical, sf_swizzle_layout=SfLayout.layout_128x4
-        )
+        flashinfer.mxfp8_quantize(logical, sf_swizzle_layout=SfLayout.layout_128x4)
     if colwise:
         flashinfer.mxfp8_quantize(
             logical.T.contiguous(), sf_swizzle_layout=SfLayout.layout_128x4
