@@ -113,6 +113,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py \
+    --ignore=tests/moe_ep/test_moe_ep_bf16_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_fault_tolerance_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_cudagraph_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py \
@@ -270,6 +271,7 @@ run_mega() {
     tests/moe_ep/test_moe_ep_deep_gemm_mega_multirank.py \
     tests/moe_ep/test_moe_ep_nvfp4_cutedsl_mega_multirank.py \
     tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py \
+    tests/moe_ep/test_moe_ep_bf16_mxfp8_cutedsl_mega_multirank.py \
     tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v \
     -m "gpu_4 and arch_blackwell" || rc=1
 
