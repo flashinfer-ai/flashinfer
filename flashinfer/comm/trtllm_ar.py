@@ -1343,6 +1343,12 @@ def _validate_cake_moe_finalize(
     )
     if allreduce_in.ndim != 2 or allreduce_in.shape[1] != hidden_dim:
         raise ValueError("allreduce_in must have shape [num_rows, 7168]")
+    _check_cake_moe_tensor(
+        allreduce_in,
+        "allreduce_in",
+        device=device,
+        dtype=dtype,
+    )
     if expanded_idx_to_permuted_idx.ndim != 2:
         raise ValueError(
             "expanded_idx_to_permuted_idx must be a two-dimensional tensor"
@@ -1428,8 +1434,10 @@ def trtllm_moe_allreduce_fusion(
     - rms_eps: the rms epsilon value.
     - scale_factor: the scale factor.
     - moe_reduction_device_num_experts: the number of experts.
-    - moe_reduction_scale_input: the scale input tensor. [token_num, hidden_dim]
-    - moe_reduction_active_experts_token_input: the active experts token input tensor. [token_num, hidden_dim]
+    - moe_reduction_scale_input: the FP32 scale input tensor.
+      [moe_reduction_device_num_experts, token_num]
+    - moe_reduction_active_experts_token_input: the active experts token input
+      tensor. [moe_reduction_device_num_experts, token_num, hidden_dim]
     - moe_reduction_token_input: the token input tensor. [token_num, hidden_dim]
     - layout_code: the layout code.
     - moe_allreduce_out: the moe allreduce output tensor. [token_num, hidden_dim]
@@ -1441,6 +1449,10 @@ def trtllm_moe_allreduce_fusion(
                    None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
                    1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
     - backend: ``"trtllm"`` (default) or the constrained ``"cake"`` SM100 backend.
+      The Cake backend supports contiguous FP16/BF16 tensors, world sizes 2 and
+      4, hidden_dim=7168, 1 to 2048 tokens, and residual plus norm outputs. It
+      does not support quantization. ``weight_bias`` remains a runtime value;
+      ``None`` is passed to the kernel as 0.0.
     """
 
     _check_cake_moe_backend(backend)
@@ -1570,6 +1582,11 @@ def trtllm_moe_finalize_allreduce_fusion(
                    None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
                    1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
     - backend: ``"trtllm"`` (default) or the constrained ``"cake"`` SM100 backend.
+      The Cake backend supports contiguous FP16/BF16 tensors, world sizes 2 and
+      4, hidden_dim=7168, 1 to 2048 tokens, and residual plus norm outputs. It
+      does not support quantization and requires ``expert_scale_factor``. Any
+      positive runtime ``top_k`` is supported; it is not restricted to 8.
+      ``weight_bias`` remains a runtime value, with ``None`` treated as 0.0.
     """
 
     _check_cake_moe_backend(backend)

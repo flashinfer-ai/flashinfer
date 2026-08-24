@@ -1,5 +1,7 @@
 """CPU contract tests for the optional Cake MoE communication backend."""
 
+import hashlib
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -67,6 +69,38 @@ def _finalize_args() -> dict:
         "expert_scale_factor": torch.ones(tokens, top_k, dtype=dtype),
         "routed_scaling_factor": None,
     }
+
+
+def _cake_source_bundle_manifest(source: bytes) -> dict:
+    return {
+        "schema_version": 1,
+        "arch": "sm_100a",
+        "compile_flags": ["--use_fast_math"],
+        "launch": {
+            "block_threads": 224,
+            "cluster_dim": [4, 1, 1],
+            "dynamic_smem_bytes": 256,
+        },
+        "constraints": {
+            "dtypes": ["float16", "bfloat16"],
+            "hidden_dim": 7168,
+            "max_tokens": 2048,
+            "quantization": False,
+            "world_sizes": [2, 4],
+        },
+        "kernel_symbols": list(cake_moe_comm._KERNEL_SYMBOLS),
+        "source_sha256": hashlib.sha256(source).hexdigest(),
+    }
+
+
+def _write_cake_source_bundle(tmp_path, *, manifest_text: str | None = None):
+    source = b'extern "C" __global__ void test_kernel() {}\n'
+    source_path = tmp_path / "cake_moe_allreduce_fusion_kernels.cu"
+    source_path.write_bytes(source)
+    if manifest_text is None:
+        manifest_text = json.dumps(_cake_source_bundle_manifest(source))
+    (tmp_path / "manifest.json").write_text(manifest_text, encoding="utf-8")
+    return source_path, source
 
 
 def test_reduction_default_keeps_trtllm_dispatch(monkeypatch: pytest.MonkeyPatch):
@@ -231,10 +265,89 @@ def test_cake_finalize_rejects_shared_expert_on_another_device(
         )
 
 
+def test_cake_finalize_rejects_noncontiguous_allreduce_input(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    tokens = 1
+    hidden = 7168
+    top_k = 8
+    dtype = torch.float16
+    monkeypatch.setattr(
+        trtllm_ar,
+        "_check_cake_moe_common",
+        lambda *args, **kwargs: (torch.device("cpu"), dtype, 0),
+    )
+    allreduce_in = torch.zeros(hidden, top_k, dtype=dtype).t()
+    assert not allreduce_in.is_contiguous()
+
+    with pytest.raises(ValueError, match="allreduce_in must be contiguous"):
+        trtllm_ar._validate_cake_moe_finalize(
+            allreduce_in=allreduce_in,
+            residual_in=torch.zeros(tokens, hidden, dtype=dtype),
+            norm_weight=torch.ones(hidden, dtype=dtype),
+            expanded_idx_to_permuted_idx=torch.zeros(
+                tokens, top_k, dtype=torch.int32
+            ),
+            norm_out=torch.empty(tokens, hidden, dtype=dtype),
+            residual_out=torch.empty(tokens, hidden, dtype=dtype),
+            quant_out=None,
+            scale_out=None,
+            workspace_ptrs=torch.zeros(7, dtype=torch.int64),
+            world_rank=0,
+            world_size=2,
+            shared_expert_output=None,
+            expert_scale_factor=torch.ones(tokens, top_k, dtype=dtype),
+        )
+
+
 def test_missing_cake_source_bundle_is_explicit(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ):
     monkeypatch.setattr(cake_moe_comm, "_source_dir", lambda: tmp_path)
 
     with pytest.raises(RuntimeError, match="source bundle is not installed"):
+        cake_moe_comm._load_source_bundle()
+
+
+def test_exact_cake_source_bundle_manifest_loads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    source_path, source = _write_cake_source_bundle(tmp_path)
+    monkeypatch.setattr(cake_moe_comm, "_source_dir", lambda: tmp_path)
+
+    loaded_path, loaded_source = cake_moe_comm._load_source_bundle()
+
+    assert loaded_path == source_path
+    assert loaded_source == source
+
+
+def test_cake_source_bundle_rejects_unknown_manifest_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    source_path, source = _write_cake_source_bundle(tmp_path)
+    manifest = _cake_source_bundle_manifest(source)
+    manifest["unexpected"] = True
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(cake_moe_comm, "_source_dir", lambda: tmp_path)
+
+    with pytest.raises(RuntimeError, match="top-level keys mismatch"):
+        cake_moe_comm._load_source_bundle()
+
+    assert source_path.is_file()
+
+
+def test_cake_source_bundle_rejects_duplicate_manifest_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    _, source = _write_cake_source_bundle(tmp_path)
+    manifest_text = json.dumps(_cake_source_bundle_manifest(source))
+    manifest_text = manifest_text.replace(
+        '{"schema_version": 1,',
+        '{"schema_version": 1, "schema_version": 1,',
+        1,
+    )
+    (tmp_path / "manifest.json").write_text(manifest_text, encoding="utf-8")
+    monkeypatch.setattr(cake_moe_comm, "_source_dir", lambda: tmp_path)
+
+    with pytest.raises(RuntimeError, match="contains duplicate key 'schema_version'"):
         cake_moe_comm._load_source_bundle()

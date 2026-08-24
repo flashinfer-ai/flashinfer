@@ -277,6 +277,19 @@ def _source_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "csrc" / "cake_moe_allreduce_fusion"
 
 
+def _reject_duplicate_manifest_keys(
+    pairs: list[tuple[str, Any]],
+) -> dict[str, Any]:
+    decoded: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in decoded:
+            raise RuntimeError(
+                f"Cake MoE communication manifest contains duplicate key {key!r}"
+            )
+        decoded[key] = value
+    return decoded
+
+
 def _load_source_bundle() -> tuple[Path, bytes]:
     source_dir = _source_dir()
     source = source_dir / "cake_moe_allreduce_fusion_kernels.cu"
@@ -287,7 +300,12 @@ def _load_source_bundle() -> tuple[Path, bytes]:
             f"{source} and {manifest_path}"
         )
     source_bytes = source.read_bytes()
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest = json.loads(
+        manifest_path.read_text(encoding="utf-8"),
+        object_pairs_hook=_reject_duplicate_manifest_keys,
+    )
+    if not isinstance(manifest, dict):
+        raise RuntimeError("Cake MoE communication manifest must be a JSON object")
     expected = {
         "schema_version": 1,
         "arch": "sm_100a",
@@ -306,6 +324,14 @@ def _load_source_bundle() -> tuple[Path, bytes]:
         },
         "kernel_symbols": list(_KERNEL_SYMBOLS),
     }
+    expected_keys = set(expected) | {"source_sha256"}
+    if set(manifest) != expected_keys:
+        missing = sorted(expected_keys - set(manifest))
+        unexpected = sorted(set(manifest) - expected_keys)
+        raise RuntimeError(
+            "Cake MoE communication manifest top-level keys mismatch: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
     for key, value in expected.items():
         if manifest.get(key) != value:
             raise RuntimeError(f"Cake MoE communication manifest mismatch for {key}")
