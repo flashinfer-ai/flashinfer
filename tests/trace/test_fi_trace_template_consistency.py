@@ -54,6 +54,19 @@ from tests.trace.template_registry import collect_registered_trace_templates
 # ---------------------------------------------------------------------------
 
 
+def test_svdquant_trace_activation_scale_tracks_variable_m():
+    from flashinfer.trace.templates.gemm import mm_nvfp4_svdquant_trace
+
+    assert isinstance(mm_nvfp4_svdquant_trace.axes["M"], Var)
+    assert isinstance(mm_nvfp4_svdquant_trace.axes["SF_A"], Var)
+    assert any(
+        constraint.startswith("SF_A ==")
+        and "M" in constraint
+        and "K_packed" in constraint
+        for constraint in mm_nvfp4_svdquant_trace.constraints
+    )
+
+
 def _resolved_param(json_key: str, descriptor) -> str:
     """Return the function-parameter name that descriptor maps to."""
     p = getattr(descriptor, "param", None)
