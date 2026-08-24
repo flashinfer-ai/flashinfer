@@ -225,6 +225,9 @@ class MoERunner(TunableRunner):
     supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = ()
     # Set to True only after S is wired through validation and launch.
     supports_fused_shared_experts: ClassVar[bool] = False
+    # Cleared by backends whose kernels cannot map global expert ids onto a
+    # local shard (local_expert_offset / local_num_experts != num_experts).
+    supports_expert_parallelism: ClassVar[bool] = True
 
     config: MoEConfig
 
@@ -245,6 +248,7 @@ class MoERunner(TunableRunner):
                 f"{type(self).__name__} does not support QuantVariant.{variant.name}."
             )
         self._assert_shared_experts_supported()
+        self._assert_expert_parallelism_supported()
 
     def _assert_shared_experts_supported(self) -> None:
         """Reject S > 0 for backends that have not opted in."""
@@ -253,6 +257,22 @@ class MoERunner(TunableRunner):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support fused shared experts "
                 f"(num_fused_shared_experts={s})."
+            )
+
+    def _assert_expert_parallelism_supported(self) -> None:
+        """Reject EP shards for backends that cannot compute a local expert subset."""
+        if self.supports_expert_parallelism:
+            return
+        experts = self.config.experts
+        local_num_experts = experts.local_num_experts or self.config.routing.num_experts
+        if experts.local_expert_offset != 0 or (
+            local_num_experts != self.config.routing.num_experts
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support expert parallelism "
+                f"(local_expert_offset={experts.local_expert_offset}, "
+                f"local_num_experts={local_num_experts} of "
+                f"{self.config.routing.num_experts})."
             )
 
     def build(self) -> None:
@@ -299,7 +319,7 @@ class MoERunner(TunableRunner):
             # S changes tactic enumeration but not profiled tensor shapes.
             int(experts.num_fused_shared_experts),
             int(self.config.activation.type),
-            bool(self.config.execution.do_finalize),
+            bool(self.config.finalize.do_finalize),
             # Routing shape affects expert-token distribution and tactic ranking.
             int(routing.method),
             routing.n_group,
@@ -334,6 +354,7 @@ class _CutlassRunnerBase(MoERunner):
     """
 
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supports_expert_parallelism = False
     _supported_archs: ClassVar[tuple[int, ...]]
     _weight_dtype: ClassVar[torch.dtype]
     _use_w4_group_scaling: ClassVar[bool]
@@ -350,17 +371,9 @@ class _CutlassRunnerBase(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
             )
-        if not self.config.execution.do_finalize:
+        if not self.config.finalize.do_finalize:
             raise NotImplementedError(
                 f"{type(self).__name__} requires do_finalize=True."
-            )
-        experts = self.config.experts
-        local_num_experts = experts.local_num_experts or self.config.routing.num_experts
-        if experts.local_expert_offset != 0 or (
-            local_num_experts != self.config.routing.num_experts
-        ):
-            raise NotImplementedError(
-                f"{type(self).__name__} does not yet support expert parallelism."
             )
         if self._device_arch not in self._supported_archs:
             raise RuntimeError(
@@ -810,6 +823,10 @@ class CuteDslNvfp4Runner(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
             )
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires do_finalize=True."
+            )
         if (
             self.config.quant.variant is QuantVariant.W4A16
             and self.config.quant.per_token_scale
@@ -849,7 +866,7 @@ class CuteDslNvfp4Runner(MoERunner):
                 top_k=routing.top_k,
                 num_local_experts=num_local_experts,
                 local_expert_offset=experts.local_expert_offset,
-                use_fused_finalize=self.config.execution.use_fused_finalize,
+                use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 activation_type=int(self.config.activation.type),
                 use_per_token_activation=bool(self.config.quant.per_token_scale),
@@ -860,7 +877,7 @@ class CuteDslNvfp4Runner(MoERunner):
                 top_k=routing.top_k,
                 num_local_experts=num_local_experts,
                 local_expert_offset=experts.local_expert_offset,
-                use_fused_finalize=self.config.execution.use_fused_finalize,
+                use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 activation_type=int(self.config.activation.type),
             )
@@ -1010,10 +1027,30 @@ class CuteDslNvfp4Runner(MoERunner):
 class _TrtllmRunnerBase(MoERunner):
     """Load the shared TRTLLM-gen module after support validation."""
 
+    _module: Any
+    _inner: Any
+    _static_kwargs: dict[str, Any]
+
     def _build(self) -> None:
         from .core import get_trtllm_moe_sm100_module
 
         self._module = get_trtllm_moe_sm100_module()
+
+    def _forward_inner(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any,
+        do_preparation: bool,
+    ) -> torch.Tensor | List[torch.Tensor]:
+        result = self._inner.forward(
+            inputs,
+            tactic=tactic,
+            do_preparation=do_preparation,
+            **self._static_kwargs,
+        )
+        if self.config.finalize.do_finalize:
+            return inputs[0]
+        return result
 
 
 class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
@@ -1168,18 +1205,12 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         tactic: Any = -1,
         do_preparation: bool = False,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
         # MoELayer's autotuner call passes no kwargs, so the static weight/config
-        # kwargs are injected here.  The inner runner writes the result in-place
-        # into inputs[0] (the output buffer of the MoeRunnerInputs list).
-        self._inner.forward(
-            inputs,
-            tactic=tactic,
-            do_preparation=do_preparation,
-            **self._static_kwargs,
-        )
-        return inputs[0]
+        # kwargs are injected here. Finalized calls write into inputs[0];
+        # unfinalized calls return the flat API's three-tensor result.
+        return self._forward_inner(inputs, tactic, do_preparation)
 
     def _validate_fp4_tensors(
         self,
@@ -1350,7 +1381,11 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         hidden_states_scale = self._validate_fp4_tensors(act, v, hidden_size)
 
         output = act.hidden_states_q.new_empty(
-            (num_tokens, hidden_size), dtype=torch.bfloat16
+            (
+                num_tokens,
+                hidden_size if self.config.finalize.do_finalize else 0,
+            ),
+            dtype=torch.bfloat16,
         )
 
         routing_input_mode = act.routing_input_mode
@@ -1413,12 +1448,11 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             routing_logits = None
             routing_bias = None
             topk_ids = _pack_prerouted_topk_ids(act)
-            # PackedPrecomputed still requires a (kernel-side) topk_weights buffer:
-            # the raw op declares it non-Optional.  The high-level wrapper allocates
-            # an empty bf16 placeholder here; we mirror that since we bypass it.
-            expert_weights = act.topk_weights.new_empty(
-                (num_tokens, routing.top_k), dtype=torch.bfloat16
-            )
+            # FP4 borrows this buffer but leaves its returned FFI slot undefined.
+            # Supply the packed weights so _unpack_trtllm_moe_output() can return
+            # them directly for do_finalize=False. Use BF16 to match the weights
+            # encoded in topk_ids.
+            expert_weights = act.topk_weights.to(torch.bfloat16).contiguous()
         elif routing_input_mode == RoutingInputMode.UnpackedPrecomputed:
             # UnpackedPrecomputed: both routing tensors are caller-owned kernel
             # inputs. Keep global ids intact; the launcher applies
@@ -1480,7 +1514,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             local_expert_offset=self._local_expert_offset,
             routed_scaling_factor=routing.routed_scaling_factor,
             routing_method_type=int(routing.method),
-            do_finalize=self.config.execution.do_finalize,
+            do_finalize=self.config.finalize.do_finalize,
             enable_pdl=self._enable_pdl,
         )
 
@@ -1529,10 +1563,6 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
-            )
-        if not self.config.execution.do_finalize:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only do_finalize=True."
             )
         from ..utils import get_compute_capability
         from .api import TrtllmFp8BlockConfig
@@ -1624,15 +1654,9 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         tactic: Any = -1,
         do_preparation: bool = False,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        self._inner.forward(
-            inputs,
-            tactic=tactic,
-            do_preparation=do_preparation,
-            **self._static_kwargs,
-        )
-        return inputs[0]
+        return self._forward_inner(inputs, tactic, do_preparation)
 
     def _validate_fp8_tensors(
         self,
@@ -1738,7 +1762,11 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         hidden_states_scale = self._validate_fp8_tensors(act, view, hidden_size)
 
         output = act.hidden_states_q.new_empty(
-            (num_tokens, hidden_size), dtype=torch.bfloat16
+            (
+                num_tokens,
+                hidden_size if self.config.finalize.do_finalize else 0,
+            ),
+            dtype=torch.bfloat16,
         )
         routing_input_mode = act.routing_input_mode
         if routing_input_mode == RoutingInputMode.FromLogits:
@@ -1812,7 +1840,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
             routing_method_type=int(routing.method),
             use_shuffled_weight=self._use_shuffled_weight,
             weight_layout=int(WeightLayout.MajorK),
-            do_finalize=True,
+            do_finalize=self.config.finalize.do_finalize,
             enable_pdl=self._enable_pdl,
             # Matches the legacy block-FP8 FromLogits wrapper. Pre-routed
             # execution ignores this flag because weights are already final.
@@ -1862,10 +1890,6 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
-            )
-        if not self.config.execution.do_finalize:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only do_finalize=True."
             )
         if (
             self.config.routing.method is RoutingMethodType.Llama4
@@ -1947,15 +1971,9 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         tactic: Any = -1,
         do_preparation: bool = False,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        self._inner.forward(
-            inputs,
-            tactic=tactic,
-            do_preparation=do_preparation,
-            **self._static_kwargs,
-        )
-        return inputs[0]
+        return self._forward_inner(inputs, tactic, do_preparation)
 
     def _validate_tensors(
         self, act: MoEActivationPack, view: dict, hidden_size: int
@@ -2024,7 +2042,11 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         self._validate_tensors(act, view, hidden_size)
 
         output = act.hidden_states_q.new_empty(
-            (num_tokens, hidden_size), dtype=torch.bfloat16
+            (
+                num_tokens,
+                hidden_size if self.config.finalize.do_finalize else 0,
+            ),
+            dtype=torch.bfloat16,
         )
         routing_input_mode = act.routing_input_mode
         if routing_input_mode == RoutingInputMode.FromLogits:
@@ -2095,7 +2117,7 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
             routed_scaling_factor=routing.routed_scaling_factor,
             use_routing_scales_on_input=(routing.method is RoutingMethodType.Llama4),
             routing_method_type=int(routing.method),
-            do_finalize=True,
+            do_finalize=self.config.finalize.do_finalize,
             enable_pdl=self._enable_pdl,
             norm_topk_prob=True,
             routing_replay_out=None,
@@ -2145,10 +2167,6 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
-            )
-        if not self.config.execution.do_finalize:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only do_finalize=True."
             )
         from ..utils import get_compute_capability
 
@@ -2224,15 +2242,9 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         tactic: Any = -1,
         do_preparation: bool = False,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        self._inner.forward(
-            inputs,
-            tactic=tactic,
-            do_preparation=do_preparation,
-            **self._static_kwargs,
-        )
-        return inputs[0]
+        return self._forward_inner(inputs, tactic, do_preparation)
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -2287,7 +2299,12 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
                 "PackedPrecomputed routing."
             )
 
-        output = hidden_states.new_empty((num_tokens, hidden_size))
+        output = hidden_states.new_empty(
+            (
+                num_tokens,
+                hidden_size if self.config.finalize.do_finalize else 0,
+            )
+        )
         moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
@@ -2317,7 +2334,7 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
             routing_method_type=int(routing.method),
             use_shuffled_weight=True,
             weight_layout=int(WeightLayout.BlockMajorK),
-            do_finalize=self.config.execution.do_finalize,
+            do_finalize=self.config.finalize.do_finalize,
             enable_pdl=self._enable_pdl,
             # Matches the canonical BF16 FromLogits wrapper. Precomputed
             # routing ignores this flag because weights are already final.
@@ -2355,10 +2372,6 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         if self.config.activation.type is not ActivationType.Swiglu:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu activation."
-            )
-        if not self.config.execution.do_finalize:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only do_finalize=True."
             )
         from ..utils import get_compute_capability
         from .api import TrtllmMxInt4Config
@@ -2435,15 +2448,9 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         tactic: Any = -1,
         do_preparation: bool = False,
         **kwargs: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | List[torch.Tensor]:
         self._require_built()
-        self._inner.forward(
-            inputs,
-            tactic=tactic,
-            do_preparation=do_preparation,
-            **self._static_kwargs,
-        )
-        return inputs[0]
+        return self._forward_inner(inputs, tactic, do_preparation)
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -2475,25 +2482,13 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
             _validate_logits_inputs(
                 act, num_tokens, routing.num_experts, type(self).__name__
             )
-            if act.routing_logits.dtype != torch.bfloat16:
-                raise TypeError(
-                    f"{type(self).__name__}: FromLogits currently requires "
-                    f"bfloat16 routing_logits, got {act.routing_logits.dtype}."
-                )
-            if act.routing_bias is not None:
-                if act.routing_bias.dtype != torch.bfloat16:
-                    raise TypeError(
-                        f"{type(self).__name__}: routing_bias must be bfloat16, "
-                        f"got {act.routing_bias.dtype}."
-                    )
             routing_logits = act.routing_logits
             routing_bias = act.routing_bias
-            topk_ids = hidden_states.new_empty(
-                (num_tokens, routing.top_k), dtype=torch.int32
-            )
-            expert_weights = hidden_states.new_empty(
-                (num_tokens, routing.top_k), dtype=torch.bfloat16
-            )
+            # MxInt4 infers routing mode from these placeholders rather than
+            # receiving RoutingInputMode explicitly. Non-empty tensors select
+            # precomputed routing and would suppress routing_logits.
+            topk_ids = hidden_states.new_empty((0,), dtype=torch.int32)
+            expert_weights = hidden_states.new_empty((0,), dtype=torch.bfloat16)
         elif routing_input_mode == RoutingInputMode.PackedPrecomputed:
             _validate_prerouted_inputs(
                 act, num_tokens, routing.top_k, type(self).__name__
@@ -2573,7 +2568,12 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
             type(self).__name__,
         )
 
-        output = hidden_states.new_empty((num_tokens, hidden_size))
+        output = hidden_states.new_empty(
+            (
+                num_tokens,
+                hidden_size if self.config.finalize.do_finalize else 0,
+            )
+        )
         moe_inputs = MoeRunnerInputs(
             output=output,
             routing_logits=routing_logits,
@@ -2600,7 +2600,7 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
             local_expert_offset=self._local_expert_offset,
             routed_scaling_factor=routing.routed_scaling_factor,
             routing_method_type=int(routing.method),
-            do_finalize=self.config.execution.do_finalize,
+            do_finalize=self.config.finalize.do_finalize,
             enable_pdl=self._enable_pdl,
             norm_topk_prob=True,
         )
@@ -2625,6 +2625,7 @@ class _B12xRunner(MoERunner):
     """Shared unified adapter over ``B12xMoEWrapper``."""
 
     backend_key: ClassVar[str] = ""
+    supports_expert_parallelism = False
     required_weight_keys: ClassVar[tuple[str, ...]] = ()
 
     def _check_support(self) -> None:
@@ -2644,15 +2645,7 @@ class _B12xRunner(MoERunner):
                 f"b12x unified MoE requires SM120 or SM121, got SM{major}{minor}."
             )
 
-        experts = self.config.experts
-        local_num_experts = experts.local_num_experts or self.config.routing.num_experts
-        if experts.local_expert_offset != 0 or (
-            local_num_experts != self.config.routing.num_experts
-        ):
-            raise NotImplementedError(
-                "b12x unified MoE does not support expert parallelism."
-            )
-        if not self.config.execution.do_finalize:
+        if not self.config.finalize.do_finalize:
             raise NotImplementedError("b12x unified MoE requires do_finalize=True.")
 
     def __init__(self, config: MoEConfig, device: torch.device):

@@ -28,6 +28,7 @@ from .api import (  # noqa: F401
     ExpertConfig,
     MoEActivationPack,
     MoEConfig,
+    MoEFinalizeConfig,
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
@@ -50,6 +51,7 @@ from .runners import (  # noqa: F401
     CutlassBf16Runner,
     CutlassW4A16Runner,
     CuteDslNvfp4Runner,
+    TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
@@ -103,6 +105,11 @@ from .fused_routing_dsv3 import (  # noqa: F401
 
 from .hash_topk import (  # noqa: F401
     hash_topk as hash_topk,
+)
+
+from .trtllm_gen_routing import (  # noqa: F401
+    TrtllmGenRoutingResult as TrtllmGenRoutingResult,
+    trtllm_gen_routing as trtllm_gen_routing,
 )
 
 from .bgmv_moe import (  # noqa: F401
@@ -166,8 +173,10 @@ __all__ = [
     "trtllm_moe_da_diagnostics",
     "trtllm_moe_release_da_resources",
     "MoEConfig",
+    "MoEFinalizeConfig",
     "MoELayer",
     "MoEWeightPack",
+    "TrtllmBf16RoutedRunner",
     "TrtllmFp4RoutedRunner",
     "TrtllmFp8BlockRunner",
     "TrtllmFp8PerTensorRunner",
@@ -209,6 +218,8 @@ __all__ = [
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
     "hash_topk",
+    "TrtllmGenRoutingResult",
+    "trtllm_gen_routing",
     "bgmv_moe",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",

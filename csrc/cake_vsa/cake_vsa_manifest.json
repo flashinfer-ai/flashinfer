@@ -1,0 +1,985 @@
+{
+  "architectures": [
+    "sm_100a",
+    "sm_103a"
+  ],
+  "export_content_sha256": "c73457986a0070d5099341c64a07aa766af626f62a03951953a1f317a666ec71",
+  "profiles": [
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "v"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "buffer",
+          "lse"
+        ],
+        [
+          "buffer",
+          "temperature_lse"
+        ],
+        [
+          "buffer",
+          "block_mask"
+        ],
+        [
+          "parameter",
+          "mb"
+        ],
+        [
+          "parameter",
+          "nb"
+        ],
+        [
+          "parameter",
+          "num_q_heads"
+        ],
+        [
+          "parameter",
+          "num_kv_heads"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "parameter",
+          "lse_temperature_scale"
+        ],
+        [
+          "parameter",
+          "return_softmax_lse"
+        ],
+        [
+          "parameter",
+          "return_temperature_lse"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": {
+        "sm_100a": {
+          "path": "cake_vsa_blk128_compact_sm_100a.cu",
+          "sha256": "af86b943cb59707ffe26bcece90d6680cbc4553b92e26f20f9424bf900be7ca8",
+          "size_bytes": 101395
+        },
+        "sm_103a": {
+          "path": "cake_vsa_blk128_compact_sm_103a.cu",
+          "sha256": "af86b943cb59707ffe26bcece90d6680cbc4553b92e26f20f9424bf900be7ca8",
+          "size_bytes": 101395
+        }
+      },
+      "dynamic_smem_bytes": 134784,
+      "host": {
+        "path": "cake_vsa_blk128_compact_host.cpp",
+        "sha256": "8c99ae8221472b3fe8703e0cfc10bcd27eab0a83c37726304cde978d86d60498",
+        "size_bytes": 24454
+      },
+      "kernel_symbol": "kernel_flashinfer_blackwell_vsa_blk128_seed_sm100",
+      "module_ident": "flashinfer_blackwell_vsa_blk128_seed_sm100_cc0523c28b",
+      "profile": "blk128_compact",
+      "schedule_symbol": "flashinfer_blackwell_vsa_blk128_seed_sm100",
+      "threads": 512
+    },
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "v"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "buffer",
+          "lse"
+        ],
+        [
+          "buffer",
+          "q2k_indices"
+        ],
+        [
+          "buffer",
+          "q2k_num"
+        ],
+        [
+          "buffer",
+          "kv_block_lens"
+        ],
+        [
+          "parameter",
+          "max_kv_blocks"
+        ],
+        [
+          "parameter",
+          "sequence_q"
+        ],
+        [
+          "parameter",
+          "query_blocks"
+        ],
+        [
+          "parameter",
+          "total_tiles"
+        ],
+        [
+          "parameter",
+          "tiles_per_cta"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "parameter",
+          "return_lse"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": {
+        "sm_100a": {
+          "path": "cake_vsa_blk64_persistent_sm_100a.cu",
+          "sha256": "c842e151ed70ed48674dd825aa68190c4b69824d8b1c37f0de0d0daf939f3a57",
+          "size_bytes": 113653
+        },
+        "sm_103a": {
+          "path": "cake_vsa_blk64_persistent_sm_103a.cu",
+          "sha256": "c842e151ed70ed48674dd825aa68190c4b69824d8b1c37f0de0d0daf939f3a57",
+          "size_bytes": 113653
+        }
+      },
+      "dynamic_smem_bytes": 150016,
+      "host": {
+        "path": "cake_vsa_blk64_persistent_host.cpp",
+        "sha256": "7a00c7eedac9127b048165a128ed8e2ea9138cb74de8955dc91f24daeef72023",
+        "size_bytes": 18076
+      },
+      "kernel_symbol": "kernel_flashinfer_vsa_blk64_persistent_m64_sm100",
+      "module_ident": "flashinfer_vsa_blk64_persistent_m64_sm100_5d38fb2226",
+      "profile": "blk64_persistent",
+      "schedule_symbol": "flashinfer_vsa_blk64_persistent_m64_sm100",
+      "threads": 512
+    },
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "v"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "buffer",
+          "lse"
+        ],
+        [
+          "buffer",
+          "temperature_lse"
+        ],
+        [
+          "buffer",
+          "block_mask"
+        ],
+        [
+          "parameter",
+          "mb"
+        ],
+        [
+          "parameter",
+          "nb"
+        ],
+        [
+          "parameter",
+          "selected_blocks"
+        ],
+        [
+          "parameter",
+          "num_q_heads"
+        ],
+        [
+          "parameter",
+          "num_kv_heads"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "parameter",
+          "lse_temperature_scale"
+        ],
+        [
+          "parameter",
+          "return_softmax_lse"
+        ],
+        [
+          "parameter",
+          "return_temperature_lse"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": {
+        "sm_100a": {
+          "path": "cake_vsa_longseq_sm_100a.cu",
+          "sha256": "9fd479c2bf7a85fbb3470bc8b1cd47b1f572613cfa7816a71c6144cc5723af4b",
+          "size_bytes": 109001
+        },
+        "sm_103a": {
+          "path": "cake_vsa_longseq_sm_103a.cu",
+          "sha256": "9fd479c2bf7a85fbb3470bc8b1cd47b1f572613cfa7816a71c6144cc5723af4b",
+          "size_bytes": 109001
+        }
+      },
+      "dynamic_smem_bytes": 201344,
+      "host": {
+        "path": "cake_vsa_longseq_host.cpp",
+        "sha256": "9d9885f9ac760a283f4520515f1063eef2694b1e117902bfb23f3cb25e53321c",
+        "size_bytes": 18006
+      },
+      "kernel_symbol": "kernel_flashinfer_blackwell_vsa_longseq_warp_specialized_sm100",
+      "module_ident": "flashinfer_blackwell_vsa_longseq_warp_specialized_sm100_15e30f005b",
+      "profile": "longseq",
+      "schedule_symbol": "flashinfer_blackwell_vsa_longseq_warp_specialized_sm100",
+      "threads": 512
+    },
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "v"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "buffer",
+          "lse"
+        ],
+        [
+          "buffer",
+          "temperature_lse"
+        ],
+        [
+          "buffer",
+          "bsr_indices"
+        ],
+        [
+          "parameter",
+          "mb"
+        ],
+        [
+          "parameter",
+          "nb"
+        ],
+        [
+          "parameter",
+          "selected_blocks"
+        ],
+        [
+          "parameter",
+          "total_tiles"
+        ],
+        [
+          "parameter",
+          "num_q_heads"
+        ],
+        [
+          "parameter",
+          "num_kv_heads"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "parameter",
+          "lse_temperature_scale"
+        ],
+        [
+          "parameter",
+          "return_softmax_lse"
+        ],
+        [
+          "parameter",
+          "return_temperature_lse"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": {
+        "sm_100a": {
+          "path": "cake_vsa_ultrasparse_bsr_sm_100a.cu",
+          "sha256": "f13f8a92c8a28ac79c8eb6772a09eb31043aacbced2a952d5e649ef5acdda66e",
+          "size_bytes": 72248
+        },
+        "sm_103a": {
+          "path": "cake_vsa_ultrasparse_bsr_sm_103a.cu",
+          "sha256": "f13f8a92c8a28ac79c8eb6772a09eb31043aacbced2a952d5e649ef5acdda66e",
+          "size_bytes": 72248
+        }
+      },
+      "dynamic_smem_bytes": 135424,
+      "host": {
+        "path": "cake_vsa_ultrasparse_bsr_host.cpp",
+        "sha256": "32fca8735e6c000d18838e2339e3964e735877dee041a5347f5228b60af2bab0",
+        "size_bytes": 25485
+      },
+      "kernel_symbol": "kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100",
+      "module_ident": "flashinfer_blackwell_vsa_ultrasparse_bsr_sm100_ce27051a00",
+      "profile": "ultrasparse_bsr",
+      "schedule_symbol": "flashinfer_blackwell_vsa_ultrasparse_bsr_sm100",
+      "threads": 512
+    },
+    {
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "v"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "buffer",
+          "lse"
+        ],
+        [
+          "buffer",
+          "temperature_lse"
+        ],
+        [
+          "buffer",
+          "block_mask"
+        ],
+        [
+          "parameter",
+          "mb"
+        ],
+        [
+          "parameter",
+          "nb"
+        ],
+        [
+          "parameter",
+          "num_q_heads"
+        ],
+        [
+          "parameter",
+          "num_kv_heads"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "parameter",
+          "lse_temperature_scale"
+        ],
+        [
+          "parameter",
+          "return_softmax_lse"
+        ],
+        [
+          "parameter",
+          "return_temperature_lse"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": {
+        "sm_100a": {
+          "path": "cake_vsa_gqa_mask_sm_100a.cu",
+          "sha256": "d00be98e453e017dfc16e44f695c34118e65bd43f4699dc699ef92cbe1915155",
+          "size_bytes": 112503
+        },
+        "sm_103a": {
+          "path": "cake_vsa_gqa_mask_sm_103a.cu",
+          "sha256": "d00be98e453e017dfc16e44f695c34118e65bd43f4699dc699ef92cbe1915155",
+          "size_bytes": 112503
+        }
+      },
+      "dynamic_smem_bytes": 134784,
+      "host": {
+        "path": "cake_vsa_gqa_mask_host.cpp",
+        "sha256": "5e345b5b84b74f06b8e2b7fa8563e2b641c75c95fc47a440babe062aed52f634",
+        "size_bytes": 22679
+      },
+      "kernel_symbol": "kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100",
+      "module_ident": "flashinfer_blackwell_vsa_gqa_mask_seed_sm100_1f27fd4684",
+      "profile": "gqa_mask",
+      "schedule_symbol": "flashinfer_blackwell_vsa_gqa_mask_seed_sm100",
+      "threads": 512
+    },
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "v"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "buffer",
+          "lse"
+        ],
+        [
+          "buffer",
+          "temperature_lse"
+        ],
+        [
+          "buffer",
+          "block_mask"
+        ],
+        [
+          "parameter",
+          "mb"
+        ],
+        [
+          "parameter",
+          "nb"
+        ],
+        [
+          "parameter",
+          "num_q_heads"
+        ],
+        [
+          "parameter",
+          "num_kv_heads"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "parameter",
+          "lse_temperature_scale"
+        ],
+        [
+          "parameter",
+          "return_softmax_lse"
+        ],
+        [
+          "parameter",
+          "return_temperature_lse"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": {
+        "sm_100a": {
+          "path": "cake_vsa_head64_native_sm_100a.cu",
+          "sha256": "6504ad11a4363e14ddddf56aa9f0c2eb81aaef8f97017cdaf12ac5d342cae94c",
+          "size_bytes": 79484
+        },
+        "sm_103a": {
+          "path": "cake_vsa_head64_native_sm_103a.cu",
+          "sha256": "6504ad11a4363e14ddddf56aa9f0c2eb81aaef8f97017cdaf12ac5d342cae94c",
+          "size_bytes": 79484
+        }
+      },
+      "dynamic_smem_bytes": 108928,
+      "host": {
+        "path": "cake_vsa_head64_native_host.cpp",
+        "sha256": "0925ba953f90d8cc72319d7008fa19f67b1cefdaf7fa5c186514686b97f5b280",
+        "size_bytes": 25237
+      },
+      "kernel_symbol": "kernel_flashinfer_blackwell_vsa_head64_native_sm100",
+      "module_ident": "flashinfer_blackwell_vsa_head64_native_sm100_1b8fbf0974",
+      "profile": "head64_native",
+      "schedule_symbol": "flashinfer_blackwell_vsa_head64_native_sm100",
+      "threads": 384
+    },
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "v"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "buffer",
+          "lse"
+        ],
+        [
+          "buffer",
+          "temperature_lse"
+        ],
+        [
+          "buffer",
+          "block_mask"
+        ],
+        [
+          "parameter",
+          "mb"
+        ],
+        [
+          "parameter",
+          "nb"
+        ],
+        [
+          "parameter",
+          "num_q_heads"
+        ],
+        [
+          "parameter",
+          "num_kv_heads"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "parameter",
+          "lse_temperature_scale"
+        ],
+        [
+          "parameter",
+          "return_softmax_lse"
+        ],
+        [
+          "parameter",
+          "return_temperature_lse"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": {
+        "sm_100a": {
+          "path": "cake_vsa_head96_native_sm_100a.cu",
+          "sha256": "0d0b39a4525bcac94b83dbc3a448d1e90e82090405c2a8d1ccc8c6f6899ab697",
+          "size_bytes": 81430
+        },
+        "sm_103a": {
+          "path": "cake_vsa_head96_native_sm_103a.cu",
+          "sha256": "0d0b39a4525bcac94b83dbc3a448d1e90e82090405c2a8d1ccc8c6f6899ab697",
+          "size_bytes": 81430
+        }
+      },
+      "dynamic_smem_bytes": 182656,
+      "host": {
+        "path": "cake_vsa_head96_native_host.cpp",
+        "sha256": "4b66bfea8e70a8b0d64c02d75ddf66ebb325a4d193c3f2bc5061a928d7779f95",
+        "size_bytes": 24507
+      },
+      "kernel_symbol": "kernel_flashinfer_blackwell_vsa_head96_native_sm100",
+      "module_ident": "flashinfer_blackwell_vsa_head96_native_sm100_83db436a27",
+      "profile": "head96_native",
+      "schedule_symbol": "flashinfer_blackwell_vsa_head96_native_sm100",
+      "threads": 384
+    },
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "v"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "buffer",
+          "lse"
+        ],
+        [
+          "buffer",
+          "temperature_lse"
+        ],
+        [
+          "buffer",
+          "block_mask"
+        ],
+        [
+          "parameter",
+          "mb"
+        ],
+        [
+          "parameter",
+          "nb"
+        ],
+        [
+          "parameter",
+          "num_q_heads"
+        ],
+        [
+          "parameter",
+          "num_kv_heads"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "parameter",
+          "lse_temperature_scale"
+        ],
+        [
+          "parameter",
+          "return_softmax_lse"
+        ],
+        [
+          "parameter",
+          "return_temperature_lse"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": {
+        "sm_100a": {
+          "path": "cake_vsa_blk128_fp16_compact_sm_100a.cu",
+          "sha256": "4666e3367060a0ddca8360421fe732fe3509909658da23ff6905320befaeb1e1",
+          "size_bytes": 101284
+        },
+        "sm_103a": {
+          "path": "cake_vsa_blk128_fp16_compact_sm_103a.cu",
+          "sha256": "4666e3367060a0ddca8360421fe732fe3509909658da23ff6905320befaeb1e1",
+          "size_bytes": 101284
+        }
+      },
+      "dynamic_smem_bytes": 134784,
+      "host": {
+        "path": "cake_vsa_blk128_fp16_compact_host.cpp",
+        "sha256": "de1dc2ee994f0b99b2f03f797369c3fe3257cbaf9f0ea92b33523d13f25fa4fa",
+        "size_bytes": 24483
+      },
+      "kernel_symbol": "kernel_flashinfer_blackwell_vsa_blk128_fp16_compact_sm100",
+      "module_ident": "flashinfer_blackwell_vsa_blk128_fp16_compact_sm100_ce189fed4a",
+      "profile": "blk128_fp16_compact",
+      "schedule_symbol": "flashinfer_blackwell_vsa_blk128_fp16_compact_sm100",
+      "threads": 512
+    },
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "v"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "buffer",
+          "lse"
+        ],
+        [
+          "buffer",
+          "temperature_lse"
+        ],
+        [
+          "buffer",
+          "q2k_indices"
+        ],
+        [
+          "buffer",
+          "cu_seqlens_q"
+        ],
+        [
+          "buffer",
+          "cu_seqlens_k"
+        ],
+        [
+          "buffer",
+          "q_offsets"
+        ],
+        [
+          "buffer",
+          "kv_lens"
+        ],
+        [
+          "buffer",
+          "page_table"
+        ],
+        [
+          "parameter",
+          "total_q"
+        ],
+        [
+          "parameter",
+          "num_q_heads"
+        ],
+        [
+          "parameter",
+          "num_kv_heads"
+        ],
+        [
+          "parameter",
+          "topk"
+        ],
+        [
+          "parameter",
+          "batch_size"
+        ],
+        [
+          "parameter",
+          "max_pages"
+        ],
+        [
+          "parameter",
+          "causal"
+        ],
+        [
+          "parameter",
+          "derive_q_offset"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "parameter",
+          "lse_temperature_scale"
+        ],
+        [
+          "parameter",
+          "return_softmax_lse"
+        ],
+        [
+          "parameter",
+          "return_temperature_lse"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "device": {
+        "sm_100a": {
+          "path": "cake_vsa_fp16_direct_sm_100a.cu",
+          "sha256": "9e9d7199935a95b2d752c171776eb5dd1bd3e21b9263bd8044d6203897e6e1bc",
+          "size_bytes": 114526
+        },
+        "sm_103a": {
+          "path": "cake_vsa_fp16_direct_sm_103a.cu",
+          "sha256": "9e9d7199935a95b2d752c171776eb5dd1bd3e21b9263bd8044d6203897e6e1bc",
+          "size_bytes": 114526
+        }
+      },
+      "dynamic_smem_bytes": 201728,
+      "host": {
+        "path": "cake_vsa_fp16_direct_host.cpp",
+        "sha256": "39de043338bdca6736153459e3abe2aafd025a36fe6e547c92f88a44c2a8a241",
+        "size_bytes": 20371
+      },
+      "kernel_symbol": "kernel_minimax_sparse_prefill_union_sm100",
+      "module_ident": "minimax_sparse_prefill_union_sm100_1df709b305",
+      "profile": "fp16_direct",
+      "schedule_symbol": "minimax_sparse_prefill_union_sm100",
+      "threads": 512
+    }
+  ],
+  "runtime_dependencies": [
+    "CUDA toolkit",
+    "torch",
+    "tvm_ffi"
+  ],
+  "schema": "cake-vsa-block-sparse-source-export-v2"
+}

@@ -14,16 +14,18 @@
 
 """CUPTI benchmark for recurrent-KDA prefill public API shapes.
 
-The default case set combines the original H64/H96 coverage with six H12
-shapes representing Kimi-K3's per-rank head count under TP8.  ``--case-set``
-can select either group independently.
+The default case set combines the original H64/H96 coverage, six H12 shapes
+representing Kimi-K3's per-rank head count under TP8, and four fixed-layout
+small-BH shapes. ``--case-set`` can select each group independently.
 
 The FlashInfer candidate is always invoked through the public
 ``recurrent_kda`` API. ``--candidate-route dispatcher`` measures the natural
 device/shape policy, while ``nonpersistent`` supplies the same explicit
 workspace and packed sequence order used by the historical benchmark to keep
-B200 on the direct schedule family. The resolved module and exact target are
-recorded by observing the real dispatcher during untimed warmup. With
+B200 on the direct schedule family. ``--backend`` selects one public API
+backend per invocation; compare auto, CuTe DSL, and Cake with separate commands
+over the same case set. The resolved backend, schedule variant, and target are
+recorded during untimed warmup. With
 ``--flash-kda-peer``, two commit-verified MoonshotAI/FlashKDA measurements are
 reported:
 
@@ -148,7 +150,13 @@ LEGACY_CASES = (
     Case("h64_uniform", 64, (1024,) * 8, True, 10005),
 )
 H12_CASES = _load_h12_cases()
-CASES = LEGACY_CASES + H12_CASES
+SMALL_BH_CASES = (
+    Case("h8_fixed_65536", 8, (65536,), False, 11000),
+    Case("h4_fixed_65536_holdout", 4, (65536,), False, 11001),
+    Case("h1_fixed_131072", 1, (131072,), False, 11002),
+    Case("h1_fixed_1048576", 1, (1048576,), False, 11003),
+)
+CASES = LEGACY_CASES + H12_CASES + SMALL_BH_CASES
 
 
 def _require_cupti() -> None:
@@ -260,6 +268,7 @@ def _make_case(
     *,
     state_rotations: int,
     candidate_route: str,
+    candidate_backend: str,
     flash_kda=None,
 ) -> PreparedCase:
     total_tokens = sum(case.seq_lens)
@@ -350,6 +359,7 @@ def _make_case(
             beta_is_logit=True,
             seq_order=seq_order,
             prefill_workspace=candidate_workspace,
+            backend=candidate_backend,
         )
 
     peer_raw_run = None
@@ -443,25 +453,48 @@ def _make_case(
     # untimed warmup. This avoids duplicating dispatcher policy in the evidence
     # harness while keeping route logging out of every timed call.
     kda_prefill_module = import_module("flashinfer.kda_prefill")
+    kda_prefill_cute_module = import_module("flashinfer.kda_prefill_cute")
     original_get_module = kda_prefill_module._get_flash_kda_prefill_module
-    resolved_routes = []
+    original_cute_run = kda_prefill_cute_module._run_cute_dsl_kda_prefill
+    resolved_cake_routes = []
+    resolved_backends = []
 
     def recording_get_module(variant, target):
-        resolved_routes.append((variant, target))
+        resolved_cake_routes.append((variant, target))
         return original_get_module(variant, target)
 
+    def recording_cute_run(**kwargs):
+        resolved_backends.append("cute-dsl")
+        return original_cute_run(**kwargs)
+
     kda_prefill_module._get_flash_kda_prefill_module = recording_get_module
+    kda_prefill_cute_module._run_cute_dsl_kda_prefill = recording_cute_run
     try:
         candidate_run()
         torch.cuda.synchronize()
     finally:
         kda_prefill_module._get_flash_kda_prefill_module = original_get_module
+        kda_prefill_cute_module._run_cute_dsl_kda_prefill = original_cute_run
         reset_state_pools()
-    if len(resolved_routes) != 1:
+    if resolved_backends:
+        if resolved_backends != ["cute-dsl"] or resolved_cake_routes:
+            raise RuntimeError(
+                "expected exactly one CuTe DSL route during warmup, got "
+                f"backends={resolved_backends}, cake={resolved_cake_routes}"
+            )
+        resolved_backend = "cute-dsl"
+        decomp_ctas = len(case.seq_lens) * case.num_heads * 2
+        sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+        resolved_variant = "decomp" if decomp_ctas <= sm_count else "engine"
+        resolved_target = "bt16"
+    elif len(resolved_cake_routes) == 1:
+        resolved_backend = "cake"
+        resolved_variant, resolved_target = resolved_cake_routes[0]
+    else:
         raise RuntimeError(
-            f"expected one FlashKDA prefill route during warmup, got {resolved_routes}"
+            "expected one recurrent-KDA prefill route during warmup, got "
+            f"backends={resolved_backends}, cake={resolved_cake_routes}"
         )
-    resolved_variant, resolved_target = resolved_routes[0]
 
     metadata = {
         "name": case.name,
@@ -472,6 +505,8 @@ def _make_case(
         "variant": resolved_variant,
         "target": resolved_target,
         "candidate_route": candidate_route,
+        "requested_backend": candidate_backend,
+        "resolved_backend": resolved_backend,
         "seed": case.seed,
         "state_rotation_capacity": state_rotations,
     }
@@ -560,16 +595,19 @@ def main() -> None:
     parser.add_argument("--bench-ms", type=int, default=100)
     parser.add_argument(
         "--case-set",
-        choices=("all", "legacy", "h12"),
+        choices=("all", "legacy", "h12", "small_bh"),
         default="all",
-        help="Run all cases, the original H64/H96 cases, or the Kimi-K3 TP8 H12 cases.",
+        help=(
+            "Run all cases, the original H64/H96 cases, the Kimi-K3 TP8 H12 "
+            "cases, or the fixed-layout small-BH cases."
+        ),
     )
     parser.add_argument(
         "--state-rotations",
         type=int,
         help=(
             "Override the number of preinitialized same-input state slots per "
-            "mutable path. By default legacy cases use "
+            "mutable path. By default legacy and small-BH cases use "
             f"{DEFAULT_LEGACY_STATE_ROTATIONS} slots and H12 cases use "
             f"{DEFAULT_H12_STATE_ROTATIONS} slots."
         ),
@@ -581,6 +619,15 @@ def main() -> None:
         help=(
             "Measure the natural public dispatcher or force B200 onto its "
             "non-persistent direct/M64 family with an explicit workspace."
+        ),
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("auto", "cute-dsl", "cake"),
+        default="auto",
+        help=(
+            "Select one backend for this invocation of the public recurrent_kda "
+            "API; run separate commands to compare backends."
         ),
     )
     parser.add_argument(
@@ -656,6 +703,7 @@ def main() -> None:
         "all": CASES,
         "legacy": LEGACY_CASES,
         "h12": H12_CASES,
+        "small_bh": SMALL_BH_CASES,
     }[args.case_set]
     results = []
     for case in selected_cases:
@@ -670,6 +718,7 @@ def main() -> None:
             case,
             state_rotations=state_rotations,
             candidate_route=args.candidate_route,
+            candidate_backend=args.backend,
             flash_kda=flash_kda,
         )
         result = {**prepared.metadata, "hardware": hardware}
@@ -765,7 +814,8 @@ def main() -> None:
         results.append(result)
         if prepared.peer_raw_run is None:
             print(
-                f"{result['name']:<18} {result['variant']:<4} "
+                f"{result['name']:<18} {result['resolved_backend']:<8} "
+                f"{result['variant']:<10} "
                 f"{result['median_us']:10.3f} us"
             )
         else:

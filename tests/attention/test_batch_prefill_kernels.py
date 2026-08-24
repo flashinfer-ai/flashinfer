@@ -14,13 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+
 import numpy
 import pytest
 import torch
 from tests.test_helpers.jit_utils import gen_prefill_attention_modules
 
 import flashinfer
-from tests.test_helpers.test_helpers import assert_close_chunked
+from tests.test_helpers.test_helpers import assert_close_chunked, ref_single_prefill
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
@@ -41,6 +43,32 @@ def skip_if_nvfp4_asymmetric_unsupported(head_dim_qk: int):
         pytest.skip(
             "asymmetric NVFP4 KV prefill uses the NVFP4 KV quantization kernel, "
             "which requires SM100 or newer"
+        )
+
+
+def _accumulate_mismatch_count(mismatch_counts, out, ref, rtol, atol):
+    """Record the per-request mismatch count on device without synchronizing.
+
+    The per-request reference loops used to call torch.testing.assert_close per
+    request, which synchronizes the device once per request (up to 128x per
+    test). Accumulating counts and checking once in _assert_no_ref_mismatch
+    keeps a single sync per test, with request-sized (not batch-sized)
+    comparison temporaries.
+    """
+    # Shape check up front: isclose broadcasts, assert_close would not.
+    assert out.shape == ref.shape, f"shape mismatch: {out.shape} vs {ref.shape}"
+    # equal_nan=False matches torch.testing.assert_close's default strictness.
+    close = torch.isclose(out.float(), ref.float(), rtol=rtol, atol=atol)
+    mismatch_counts.append((~close).sum())
+
+
+def _assert_no_ref_mismatch(mismatch_counts):
+    counts = torch.stack(mismatch_counts).cpu()  # single device sync
+    if counts.any():
+        bad = counts.nonzero().flatten().tolist()
+        raise AssertionError(
+            f"output mismatches reference in request(s) {bad}; "
+            f"mismatched elements per request: {[int(counts[i]) for i in bad]}"
         )
 
 
@@ -254,6 +282,7 @@ def test_batch_prefill_with_paged_kv_cache(
 
         g.replay()
 
+    mismatch_counts = []
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
         perm_dims_last = [1, 0, 2] if kv_layout == "HND" else [0, 1, 2]
@@ -305,7 +334,8 @@ def test_batch_prefill_with_paged_kv_cache(
             logits_soft_cap=logits_soft_cap,
         )
         o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
-        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+        _accumulate_mismatch_count(mismatch_counts, o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+    _assert_no_ref_mismatch(mismatch_counts)
 
 
 @pytest.mark.parametrize("causal", [False, True])
@@ -372,6 +402,7 @@ def test_batch_prefill_with_paged_kv_cache_head_dim_512(
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
+    mismatch_counts = []
     for i in range(batch_size):
         qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
         ki = torch.cat(
@@ -405,7 +436,8 @@ def test_batch_prefill_with_paged_kv_cache_head_dim_512(
             backend="fa2",
         )
         o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
-        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+        _accumulate_mismatch_count(mismatch_counts, o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+    _assert_no_ref_mismatch(mismatch_counts)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17, 128])
@@ -593,6 +625,7 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
         g.replay()
 
     k_cache, v_cache = kv_data_fp32
+    mismatch_counts = []
     for i in range(batch_size):
         perm_dims = [0, 2, 1, 3] if kv_layout == "HND" else [0, 1, 2, 3]
         perm_dims_last = [1, 0, 2] if kv_layout == "HND" else [0, 1, 2]
@@ -636,7 +669,8 @@ def test_batch_prefill_with_tuple_paged_kv_cache(
             logits_soft_cap=logits_soft_cap,
         )
         o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
-        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+        _accumulate_mismatch_count(mismatch_counts, o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+    _assert_no_ref_mismatch(mismatch_counts)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17, 128])
@@ -829,6 +863,7 @@ def test_batch_prefill_with_ragged_kv_cache(
     else:
         o = wrapper.run(q, k, v)
 
+    mismatch_counts = []
     for i in range(batch_size):
         o_ref_i = flashinfer.prefill.single_prefill_with_kv_cache(
             q[q_indptr[i] : q_indptr[i + 1]],
@@ -839,7 +874,8 @@ def test_batch_prefill_with_ragged_kv_cache(
             logits_soft_cap=logits_soft_cap,
         )
         o_i = o[q_indptr[i] : q_indptr[i + 1]]
-        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+        _accumulate_mismatch_count(mismatch_counts, o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+    _assert_no_ref_mismatch(mismatch_counts)
 
 
 @pytest.mark.parametrize("causal", [False, True])
@@ -905,6 +941,7 @@ def test_batch_prefill_with_ragged_kv_cache_head_dim_512(
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
+    mismatch_counts = []
     for i in range(batch_size):
         qi = q[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
         ki = k[kv_indptr_cpu[i] : kv_indptr_cpu[i + 1]]
@@ -918,7 +955,8 @@ def test_batch_prefill_with_ragged_kv_cache_head_dim_512(
             backend="fa2",
         )
         o_i = o[q_indptr_cpu[i] : q_indptr_cpu[i + 1]]
-        torch.testing.assert_close(o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+        _accumulate_mismatch_count(mismatch_counts, o_i, o_ref_i, rtol=1e-3, atol=1e-3)
+    _assert_no_ref_mismatch(mismatch_counts)
 
 
 @pytest.mark.parametrize("batch_size", [12, 17, 128])
@@ -2277,3 +2315,145 @@ def test_single_prefill_torch_compile_cuda_graph():
     assert result.returncode == 0 and "PASS" in result.stdout, (
         f"Test failed:\nstdout: {result.stdout[-500:]}\nstderr: {result.stderr[-500:]}"
     )
+
+
+# Regression tests for the finite mask sentinel bugs #4267/#4450/#4451/#4452:
+# masked logits are IEEE -inf, so any finite logit must win over masked positions
+# and fully masked rows must yield zero output with LSE = -inf.
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_ragged_prefill_one_valid_key(dtype):
+    # Deterministic #4451 fixture: one valid causal key with raw score
+    # -524288 (scaled -46341). Softmax over one key is exactly 1, so the
+    # output must equal V regardless of the score magnitude.
+    num_qo_heads, num_kv_heads, head_dim = 32, 8, 128
+    sm_scale = 1.0 / math.sqrt(head_dim)
+    q = torch.full((1, num_qo_heads, head_dim), 64.0, dtype=dtype, device="cuda")
+    k = torch.full((1, num_kv_heads, head_dim), -64.0, dtype=dtype, device="cuda")
+    v = torch.ones(1, num_kv_heads, head_dim, dtype=dtype, device="cuda")
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="fa2"
+    )
+    wrapper.plan(
+        qo_indptr=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        kv_indptr=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        causal=True,
+        sm_scale=sm_scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    o, lse = wrapper.run(q, k, v, return_lse=True)
+
+    k_gqa = k.repeat_interleave(num_qo_heads // num_kv_heads, dim=1)
+    ref_lse = (q.float() * k_gqa.float()).sum(-1) * sm_scale / math.log(2.0)
+    assert not o.isnan().any() and not lse.isnan().any()
+    torch.testing.assert_close(
+        o, v.repeat_interleave(num_qo_heads // num_kv_heads, dim=1), rtol=0, atol=0
+    )
+    torch.testing.assert_close(lse, ref_lse, rtol=1e-5, atol=1e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_paged_prefill_fully_masked_rows(dtype):
+    # Deterministic #4452 fixture: bottom-right causal alignment with
+    # qo_len=34 > kv_len=1 leaves 33 rows with no attendable key. Fully
+    # masked rows must produce zero output and LSE=-inf, while the final
+    # row still attends the single key.
+    qo_len, kv_len = 34, 1
+    num_qo_heads, num_kv_heads, head_dim = 32, 8, 128
+    page_size, num_pages = 1, 2
+    q = torch.zeros(qo_len, num_qo_heads, head_dim, dtype=dtype, device="cuda")
+    k_cache = torch.zeros(
+        num_pages, page_size, num_kv_heads, head_dim, dtype=dtype, device="cuda"
+    )
+    v_cache = torch.ones_like(k_cache)
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="fa2"
+    )
+    wrapper.plan(
+        qo_indptr=torch.tensor([0, qo_len], dtype=torch.int32, device="cuda"),
+        paged_kv_indptr=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+        paged_kv_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+        paged_kv_last_page_len=torch.tensor([1], dtype=torch.int32, device="cuda"),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        page_size=page_size,
+        causal=True,
+        sm_scale=1.0 / math.sqrt(head_dim),
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    o, lse = wrapper.run(q, (k_cache, v_cache), return_lse=True)
+
+    num_masked = qo_len - kv_len
+    assert not o.isnan().any() and not lse.isnan().any()
+    torch.testing.assert_close(
+        o[:num_masked], torch.zeros_like(o[:num_masked]), rtol=0, atol=0
+    )
+    assert torch.isneginf(lse[:num_masked]).all()
+    torch.testing.assert_close(
+        o[num_masked:], torch.ones_like(o[num_masked:]), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        lse[num_masked:], torch.zeros_like(lse[num_masked:]), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_paged_prefill_split_kv_empty_chunk(dtype):
+    # Multi-token causal prefill (qo_len=2, kv_len=129) with split-KV: the
+    # first token's rows have no attendable key in the last kv chunk, so the
+    # merge path must combine a finite partial state with an empty one
+    # (partial lse=-inf, d=0) without producing NaN.
+    bs, qo_len, kv_len = 1, 2, 129
+    num_qo_heads, num_kv_heads, head_dim = 8, 2, 128
+    page_size = 16
+    pages_per = (kv_len + page_size - 1) // page_size
+    q = (
+        torch.randn(bs * qo_len, num_qo_heads, head_dim, dtype=dtype, device="cuda")
+        / 10
+    )
+    kv_data = (
+        torch.randn(
+            pages_per, 2, page_size, num_kv_heads, head_dim, dtype=dtype, device="cuda"
+        )
+        / 10
+    )
+    qo_indptr = torch.tensor([0, bs * qo_len], dtype=torch.int32, device="cuda")
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, kv_layout="NHD", backend="fa2"
+    )
+    wrapper.plan(
+        qo_indptr=qo_indptr,
+        paged_kv_indptr=torch.tensor([0, pages_per], dtype=torch.int32, device="cuda"),
+        paged_kv_indices=torch.arange(pages_per, dtype=torch.int32, device="cuda"),
+        paged_kv_last_page_len=torch.tensor(
+            [(kv_len - 1) % page_size + 1], dtype=torch.int32, device="cuda"
+        ),
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        page_size=page_size,
+        causal=True,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+    )
+    o, lse = wrapper.run(q, kv_data, return_lse=True)
+
+    k = kv_data[:, 0].reshape(-1, num_kv_heads, head_dim)
+    v = kv_data[:, 1].reshape(-1, num_kv_heads, head_dim)
+    o_ref, lse_ref = ref_single_prefill(q, k[:kv_len], v[:kv_len], causal=True)
+    assert not o.isnan().any() and not lse.isnan().any()
+    torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(lse, lse_ref, rtol=1e-2, atol=1e-2)

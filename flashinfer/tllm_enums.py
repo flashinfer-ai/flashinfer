@@ -26,8 +26,10 @@ class RoutingMethodType(IntEnum):
     MiniMax2 = (7,)
     # Sigmoid: Sigmoid -> TopK (no renormalization)
     Sigmoid = (8,)
+    # TopKSigmoid: TopK -> Sigmoid (no renormalization)
+    TopKSigmoid = (9,)
     # Unspecified
-    Unspecified = (9,)
+    Unspecified = (10,)
 
     # Eval-safe repr (``RoutingMethodType.Default`` rather than IntEnum's default
     # ``<RoutingMethodType.Default: 0>``) so configs that embed this member
@@ -100,6 +102,11 @@ _GATED_ACTIVATION_TYPES = (
 DEFAULT_SWIGLU_ALPHA = 1.0
 DEFAULT_SWIGLU_BETA = 0.0
 DEFAULT_SWIGLU_LIMIT = torch.finfo(torch.float32).max
+
+# SiTU-GLU tanh scales. Must match the SituAdaptor defaults in
+# csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh.
+DEFAULT_SITU_BETA = 4.0
+DEFAULT_SITU_LINEAR_BETA = 25.0
 
 
 def normalize_activation_type(

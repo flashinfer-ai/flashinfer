@@ -380,6 +380,7 @@ enum class RoutingPreprocessType {
 enum class RoutingPostprocessType {
   None,                // No postprocessing after topK
   Softmax,             // Apply softmax on top-K scores
+  Sigmoid,             // Apply sigmoid on top-K scores (selection ranks the raw logits)
   SumNormalize,        // Normalize top-K scores by their sum
   ScaledSumNormalize,  // Recover sigmoid scores, normalize by sum and scale (DeepSeek-style)
 };

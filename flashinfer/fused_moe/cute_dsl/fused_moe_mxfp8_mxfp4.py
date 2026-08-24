@@ -519,6 +519,31 @@ class CuteDslMxfp8Mxfp4MoEWrapper:
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     ) -> None:
+        """Initialize a reusable mixed-precision fused-MoE runner.
+
+        Parameters
+        ----------
+        num_experts, top_k : int
+            Global expert count and experts selected per token.
+        hidden_size, intermediate_size : int
+            Model hidden size and per-expert intermediate size.
+        max_num_tokens : int, optional
+            Deprecated compatibility argument; accepted but ignored.
+        num_local_experts : int, optional
+            Experts resident on this rank; defaults to ``num_experts``.
+        local_expert_offset : int
+            Global index of the first local expert.
+        use_cuda_graph : bool
+            Create persistent stream and event resources for graph capture.
+        device : str
+            CUDA device used for persistent resources.
+        enable_pdl : bool
+            Enable programmatic dependent launch in the generated kernels.
+        activation_type : int
+            Fused activation identifier.
+        swiglu_alpha, swiglu_beta, swiglu_limit : float
+            SwiGLU activation parameters.
+        """
         activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
         self.num_experts = num_experts
         self.top_k = top_k
@@ -624,6 +649,21 @@ class CuteDslMxfp8Mxfp4MoEWrapper:
         ``convert_sf_to_mma_layout(..., sf_vec_size=32)``.
 
         The returned tensor is freshly allocated and owned by the caller.
+
+        Parameters
+        ----------
+        x, x_sf : torch.Tensor
+            MXFP8 activations and their linear block-32 E8M0 scales.
+        token_selected_experts, token_final_scales : torch.Tensor
+            Per-token expert indices and routing scales.
+        w1_weight, w2_weight : torch.Tensor
+            Packed MXFP4 expert weights.
+        w1_weight_sf, w2_weight_sf : torch.Tensor
+            Block-32 weight scales in MMA layout.
+        w1_alpha, w2_alpha : torch.Tensor
+            Per-expert dequantization multipliers.
+        tactic : tuple, optional
+            Explicit kernel tactic; the autotuner selects one when omitted.
         """
 
         _validate_mixed_inputs(
@@ -712,6 +752,37 @@ def cute_dsl_fused_moe_mxfp8_mxfp4(
     linear block-32 E8M0 bytes, packed weights must be uint8 E2M1 pairs, and
     weight scales must already use the block-32 MMA E8M0 layout. The output is
     BF16. Unlike the NVFP4 API, this interface has no ``fc2_input_scale``.
+
+    Parameters
+    ----------
+    x, x_sf : torch.Tensor
+        MXFP8 activations and their linear block-32 E8M0 scales.
+    token_selected_experts, token_final_scales : torch.Tensor
+        Per-token expert indices and routing scales.
+    w1_weight, w2_weight : torch.Tensor
+        Packed MXFP4 expert weights.
+    w1_weight_sf, w2_weight_sf : torch.Tensor
+        Block-32 weight scales in MMA layout.
+    w1_alpha, w2_alpha : torch.Tensor
+        Per-expert dequantization multipliers.
+    num_experts, top_k : int
+        Global expert count and experts selected per token.
+    num_local_experts : int, optional
+        Experts resident on this rank; defaults to ``num_experts``.
+    local_expert_offset : int
+        Global index of the first local expert.
+    moe_output : torch.Tensor, optional
+        Caller-owned BF16 output tensor.
+    aux_stream : torch.cuda.Stream, optional
+        Auxiliary CUDA stream used to overlap output clearing with GEMM1.
+    tactic : tuple, optional
+        Explicit kernel tactic; the autotuner selects one when omitted.
+    enable_pdl : bool
+        Enable programmatic dependent launch in the generated kernels.
+    activation_type : int
+        Fused activation identifier.
+    swiglu_alpha, swiglu_beta, swiglu_limit : float
+        SwiGLU activation parameters.
     """
 
     activation, gated = normalize_cute_dsl_moe_activation_type(activation_type)
