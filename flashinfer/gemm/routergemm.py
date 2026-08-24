@@ -22,13 +22,6 @@ from flashinfer.utils import (
     version_at_least,
 )
 
-# SM90 is included because the kernel is plain FMA plus warp shuffles; the only
-# architecture-specific piece is PDL, which the kernel already guards on
-# __CUDA_ARCH__ >= 900. SGLang dispatches its equivalent kernel at SM90+, so
-# matching that range is what lets it drop its in-tree copy. Verified on H100.
-# TODO: other compute capabilities may be supported but are untested
-_ROUTER_GEMM_SUPPORTED_ARCHS = [90, 100, 103, 107]
-
 
 def _router_gemm_shape_checks(
     mat_a,
@@ -89,7 +82,8 @@ def _router_gemm_shape_checks(
     return True
 
 
-@supported_compute_capability(_ROUTER_GEMM_SUPPORTED_ARCHS)
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([90, 100, 103, 107])
 def _mm_M1_16_K7168_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _router_gemm_shape_checks(
         mat_a,
@@ -102,7 +96,8 @@ def _mm_M1_16_K7168_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     )
 
 
-@supported_compute_capability(_ROUTER_GEMM_SUPPORTED_ARCHS)
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([90, 100, 103, 107])
 def _mm_M1_16_K7168_N128_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _router_gemm_shape_checks(
         mat_a,
@@ -115,7 +110,8 @@ def _mm_M1_16_K7168_N128_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     )
 
 
-@supported_compute_capability(_ROUTER_GEMM_SUPPORTED_ARCHS)
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([90, 100, 103, 107])
 def _mm_M1_16_K6144_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _router_gemm_shape_checks(
         mat_a,
@@ -128,7 +124,8 @@ def _mm_M1_16_K6144_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     )
 
 
-@supported_compute_capability(_ROUTER_GEMM_SUPPORTED_ARCHS)
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([90, 100, 103, 107])
 def _mm_M1_16_K7168_N256_bf16_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _router_gemm_shape_checks(
         mat_a,
@@ -141,7 +138,8 @@ def _mm_M1_16_K7168_N256_bf16_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     )
 
 
-@supported_compute_capability(_ROUTER_GEMM_SUPPORTED_ARCHS)
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([90, 100, 103, 107])
 def _mm_M1_16_K7168_N384_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _router_gemm_shape_checks(
         mat_a,
@@ -154,7 +152,8 @@ def _mm_M1_16_K7168_N384_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     )
 
 
-@supported_compute_capability(_ROUTER_GEMM_SUPPORTED_ARCHS)
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([90, 100, 103, 107])
 def _mm_M1_16_K7168_N384_bf16_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _router_gemm_shape_checks(
         mat_a,
@@ -167,7 +166,8 @@ def _mm_M1_16_K7168_N384_bf16_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     )
 
 
-@supported_compute_capability(_ROUTER_GEMM_SUPPORTED_ARCHS)
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([90, 100, 103, 107])
 def _mm_M1_16_K7168_N896_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _router_gemm_shape_checks(
         mat_a,
@@ -180,7 +180,8 @@ def _mm_M1_16_K7168_N896_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     )
 
 
-@supported_compute_capability(_ROUTER_GEMM_SUPPORTED_ARCHS)
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([90, 100, 103, 107])
 def _mm_M1_16_K7168_N896_bf16_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _router_gemm_shape_checks(
         mat_a,
