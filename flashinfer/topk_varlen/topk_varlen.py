@@ -56,6 +56,7 @@ _CUTE_DSL_AVAILABLE = (
 from ..utils import (
     _get_cache_buf,
     backend_requirement,
+    get_compute_capability,
     get_device_sm_count,
     get_shared_bytes_per_block_optin,
     supported_compute_capability,
@@ -66,10 +67,10 @@ from ..utils import (
 # ---------------------------------------------------------------------------
 
 # All SM tiers FlashInfer ships kernels for.
-_ALL_CCS = [75, 80, 86, 89, 90, 100, 103, 110, 120, 121]
+_ALL_CCS = [75, 80, 86, 89, 90, 100, 103, 107, 110, 120, 121]
 
 # CuTe DSL radix backend: all Blackwell-plus tiers.
-_BLACKWELL_PLUS_CCS = [100, 103, 110, 120, 121]
+_BLACKWELL_PLUS_CCS = [100, 103, 107, 110, 120, 121]
 
 # GVR is B200-class only (SM100/103). The non-LB (cluster_size=1) GVR CuTe-DSL
 # kernel fails to build on sm_120a: libNVVM rejects the generated device IR
@@ -871,7 +872,22 @@ def _radix_top_k_varlen_check(
     workspace=None,
 ):
     """CuTe DSL multi-CTA radix: Blackwell only, no pre_idx required."""
-    return _CUTE_DSL_AVAILABLE
+    if not _CUTE_DSL_AVAILABLE:
+        return False
+    # Having the package is not enough: the installed DSL must also be able to
+    # emit for this device. DSL releases before 4.8 have no ``sm_107a`` member
+    # in ``cutlass.base_dsl.arch.Arch``, so compiling this kernel on Rubin dies
+    # with ``KeyError: 'sm_107a'`` deep inside the DSL unless the user exported
+    # ``CUTE_DSL_ARCH=sm_100f`` before ``cutlass`` was first imported. Returning
+    # False here makes backend="auto" fall back to radix_cutlass instead.
+    # Imported lazily: cute_dsl/utils.py has a top-level ``import cutlass``,
+    # which this module deliberately avoids at import time.
+    try:
+        from ..cute_dsl.utils import is_cute_dsl_arch_supported
+    except Exception:
+        return False
+    major, minor = get_compute_capability(logits.device)
+    return is_cute_dsl_arch_supported(major, minor)
 
 
 def _run_radix(
