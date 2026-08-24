@@ -415,15 +415,59 @@ def test_trtllm_ragged_all_empty_kv_rows_with_queries_are_neutral(use_cpu_lens):
 
 
 @pytest.mark.cuda
-def test_trtllm_ragged_requires_cpu_lens_for_cuda_graph_capture(monkeypatch):
+def test_trtllm_ragged_all_active_cuda_graph_capture_without_cpu_lens(monkeypatch):
+    """All-active batches captured without CPU seq-len mirrors must not raise.
+
+    Regression for https://github.com/flashinfer-ai/flashinfer/issues/4609:
+    frameworks like ``BatchPrefillWithRaggedKVCacheWrapper`` do not pass
+    ``q_seq_lens_cpu`` / ``kv_seq_lens_cpu`` and drive an all-active batch
+    inside a captured CUDA graph. The wrapper must skip empty-row detection
+    (which requires a ``.item()`` sync) in that case rather than aborting.
+    """
     device = torch.device("cuda")
     _require_trtllm_ragged(device)
     torch.manual_seed(42)
 
-    q, k, v, _, kv_lens, q_indptr, kv_indptr = _empty_kv_case(device)
+    num_heads = 16
+    head_dim_qk = 128
+    head_dim_vo = 128
+    q_lens = torch.tensor([4, 5, 3, 2, 1], device=device, dtype=torch.int32)
+    kv_lens = torch.tensor([4, 7, 3, 2, 1], device=device, dtype=torch.int32)
+    q_indptr = _indptr(q_lens)
+    kv_indptr = _indptr(kv_lens)
+    q = torch.randn(
+        int(q_indptr[-1].item()),
+        num_heads,
+        head_dim_qk,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        int(kv_indptr[-1].item()),
+        num_heads,
+        head_dim_qk,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn(
+        int(kv_indptr[-1].item()),
+        num_heads,
+        head_dim_vo,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
     monkeypatch.setattr(
         torch.cuda, "is_current_stream_capturing", lambda: True, raising=False
     )
 
-    with pytest.raises(ValueError, match="must be provided during CUDA graph capture"):
-        _run_trtllm_ragged(q, k, v, q_indptr, kv_indptr, kv_lens)
+    output = _run_trtllm_ragged(
+        q,
+        k,
+        v,
+        q_indptr,
+        kv_indptr,
+        kv_lens,
+        return_lse=False,
+    )
+    assert output.shape == (q.shape[0], num_heads, head_dim_vo)
