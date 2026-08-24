@@ -1041,4 +1041,4 @@ class BatchMLAPagedAttentionWrapper:
         )
 
 
-__all__ = ["BatchMLAPagedAttentionWrapper", "MLAPlanMetadata", "MLAInputContract"]
+__all__ = ["BatchMLAPagedAttentionWrapper", "MLAInputContract", "MLAPlanMetadata"]

@@ -901,7 +901,7 @@ def test_fa_backends_share_fp8_plan_validation(monkeypatch, backend_name):
     wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
     wrapper._backend = backend_name
 
-    with pytest.raises(ValueError, match="q_data_type=torch.bfloat16"):
+    with pytest.raises(ValueError, match=r"q_data_type=torch\.bfloat16"):
         wrapper.plan(
             metadata=_dense_metadata(),
             q_data_type=torch.float16,
@@ -927,7 +927,7 @@ def test_fa_backends_reject_non_int32_kv_indices(monkeypatch, backend_name):
         torch.tensor([1], dtype=torch.int32),
     )
 
-    with pytest.raises(ValueError, match="kv_indices.*torch.int32"):
+    with pytest.raises(ValueError, match=r"kv_indices.*torch\.int32"):
         wrapper.plan(metadata=metadata, **COMMON_PLAN_KWARGS)
 
 
@@ -1556,7 +1556,7 @@ def test_cuda_graph_staging_rejects_cross_source_target_alias(monkeypatch):
     wrapper._kv_indices_buf = torch.empty(2, dtype=torch.int32)
     wrapper._kv_len_arr_buf = torch.empty(2, dtype=torch.int32)
 
-    with pytest.raises(ValueError, match="CUDA graph.*source.*reserved"):
+    with pytest.raises(ValueError, match=r"CUDA graph.*source.*reserved"):
         wrapper.plan(
             metadata=_csr_metadata(
                 mla,
@@ -1581,7 +1581,7 @@ def test_cuda_graph_staging_rejects_rank2_kv_indices_reserve(monkeypatch):
     wrapper._kv_indices_buf = torch.empty((2, 2), dtype=torch.int32)
     wrapper._kv_len_arr_buf = torch.empty(2, dtype=torch.int32)
 
-    with pytest.raises(ValueError, match="CUDA graph.*kv_indices.*rank 1"):
+    with pytest.raises(ValueError, match=r"CUDA graph.*kv_indices.*rank 1"):
         wrapper.plan(
             metadata=_csr_metadata(
                 mla,
@@ -1627,5 +1627,5 @@ def test_cuda_graph_cutlass_replan_is_rejected(monkeypatch):
     )
     wrapper.plan(metadata=metadata, **kwargs)
 
-    with pytest.raises(RuntimeError, match="CUDA graph.*replan"):
+    with pytest.raises(RuntimeError, match=r"CUDA graph.*replan"):
         wrapper.plan(metadata=metadata, **kwargs)

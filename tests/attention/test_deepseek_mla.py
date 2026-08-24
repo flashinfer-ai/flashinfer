@@ -749,6 +749,21 @@ def test_batch_mla_page_attention(
     torch.testing.assert_close(lse, lse_buffer, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.parametrize("backend", ["fa2", "fa3"])
+def test_batch_mla_page_attention_cuda_graph_replan(backend):
+    test_batch_mla_page_attention(
+        batch_size=1,
+        kv_len=17,
+        qo_len=1,
+        num_heads=16,
+        causal=False,
+        page_size=1,
+        backend=backend,
+        use_cuda_graph=True,
+        dtype=torch.half,
+    )
+
+
 @pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("max_seq_len", [128, 1024, 4096])
 @pytest.mark.parametrize("page_size", [1, 16, 128])
