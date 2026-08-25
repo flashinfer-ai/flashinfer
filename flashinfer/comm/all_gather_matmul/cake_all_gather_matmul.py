@@ -766,9 +766,13 @@ def all_gather_matmul_cake(
     w: torch.Tensor,
     group: dist.ProcessGroup,
     *,
+    backend: str,
     verbose: bool = False,
 ) -> torch.Tensor:
     """Run the exact Blackwell source-built backend for one NCCL group."""
+
+    if backend != "cake":
+        raise ValueError("backend must be exactly 'cake'")
 
     device_index, rank, world_size, group_name = _validate_inputs(inp, w, group)
     rows = int(inp.shape[0])

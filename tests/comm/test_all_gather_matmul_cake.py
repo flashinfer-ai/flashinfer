@@ -12,8 +12,17 @@ import torch
 
 def _backend():
     return importlib.import_module(
-        "flashinfer.comm.all_gather_matmul.all_gather_matmul_cake"
+        "flashinfer.comm.all_gather_matmul.cake_all_gather_matmul"
     )
+
+
+def test_backend_entrypoint_rejects_non_cake_route():
+    backend = _backend()
+
+    with pytest.raises(ValueError, match="exactly 'cake'"):
+        backend.all_gather_matmul_cake(
+            object(), object(), object(), backend="auto"
+        )
 
 
 def _manifest(backend, source: bytes, arch: str):
@@ -267,8 +276,8 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
     monkeypatch.setattr(backend.torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(backend.torch.cuda, "Event", lambda **kwargs: FakeEvent())
 
-    first = backend.all_gather_matmul_cake(inp, weight, group)
-    second = backend.all_gather_matmul_cake(inp, weight, group)
+    first = backend.all_gather_matmul_cake(inp, weight, group, backend="cake")
+    second = backend.all_gather_matmul_cake(inp, weight, group, backend="cake")
 
     assert first.data_ptr() != second.data_ptr()
     assert first.value == 1

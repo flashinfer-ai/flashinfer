@@ -71,7 +71,7 @@ def test_auto_backend_preserves_pre_blackwell_triton_route(monkeypatch):
 def test_explicit_cake_backend_forwards_exact_subgroup(monkeypatch):
     dispatcher = _dispatcher()
     backend_module = ModuleType(
-        "flashinfer.comm.all_gather_matmul.all_gather_matmul_cake"
+        "flashinfer.comm.all_gather_matmul.cake_all_gather_matmul"
     )
     subgroup = object()
     inp = object()
@@ -79,8 +79,10 @@ def test_explicit_cake_backend_forwards_exact_subgroup(monkeypatch):
     result = object()
     calls = []
 
-    def fake_backend(actual_inp, actual_weight, actual_group, *, verbose):
-        calls.append((actual_inp, actual_weight, actual_group, verbose))
+    def fake_backend(
+        actual_inp, actual_weight, actual_group, *, backend, verbose
+    ):
+        calls.append((actual_inp, actual_weight, actual_group, backend, verbose))
         return result
 
     backend_module.all_gather_matmul_cake = fake_backend
@@ -102,7 +104,7 @@ def test_explicit_cake_backend_forwards_exact_subgroup(monkeypatch):
         )
         is result
     )
-    assert calls == [(inp, weight, subgroup, True)]
+    assert calls == [(inp, weight, subgroup, "cake", True)]
 
 
 def test_unknown_backend_fails_before_dispatch():

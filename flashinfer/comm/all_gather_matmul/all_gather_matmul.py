@@ -75,9 +75,11 @@ def all_gather_matmul(
     source-built Blackwell implementation and rejects unsupported inputs.
     """
     if backend == "cake":
-        from .all_gather_matmul_cake import all_gather_matmul_cake
+        from .cake_all_gather_matmul import all_gather_matmul_cake
 
-        return all_gather_matmul_cake(inp, w, group, verbose=verbose)
+        return all_gather_matmul_cake(
+            inp, w, group, backend="cake", verbose=verbose
+        )
     if backend != "auto":
         raise ValueError("backend must be exactly 'auto' or 'cake'")
     major, _ = torch.cuda.get_device_capability(inp.device)
