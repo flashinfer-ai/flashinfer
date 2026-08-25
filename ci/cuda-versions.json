@@ -1,7 +1,9 @@
 {
-  "build_dependencies": {
+  "dependency_policy": {
     "nvidia-cutlass-dsl": {
-      "version": "4.6.2",
+      "provider_build_specifier": ">=4.6.2a0",
+      "cuda_extra_specifier": ">=4.6.2a0",
+      "ci_image_specifier": "==4.6.2",
       "cuda_major_extras": {
         "13": ["cu13"]
       }
