@@ -137,6 +137,8 @@ moe_layer_cudnn_frost_bf16.json
 moe_layer_cudnn_frost_mxfp8.json
 moe_layer_cudnn_frost_nvfp4.json
 moe_layer_cudnn_frost_mxfp8_mxfp4.json
+ulysses_gather_heads_ws1_d128.json
+ulysses_scatter_heads_ws1_d128.json
 
 Note: top_p_sampling files appear for vocab_size=151936 because
 top_k_top_p_sampling calls top_p_sampling internally.
@@ -164,10 +166,12 @@ os.environ.setdefault("FLASHINFER_TRACE_DUMP", "1")
 SAVE_DIR = Path(os.environ["FLASHINFER_TRACE_DUMP_DIR"])
 
 import torch
+import torch.distributed as dist
 
 import flashinfer
 import flashinfer.activation
 import flashinfer.cascade
+import flashinfer.comm
 import flashinfer.fused_moe
 import flashinfer.gdn_decode
 import flashinfer.gemm
@@ -2952,3 +2956,31 @@ with contextlib.suppress(Exception):
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
         )
+
+# ── Ulysses layout transforms (single-rank trace reference) ──────────────────
+# The trace template intentionally models world_size=1. Multi-rank data movement
+# is covered by tests/comm and cannot be represented by a single-process
+# flashinfer-bench reference function.
+_ulysses_owns_process_group = False
+try:
+    with contextlib.suppress(Exception):
+        if not dist.is_initialized():
+            dist.init_process_group(
+                "nccl", store=dist.HashStore(), rank=0, world_size=1
+            )
+            _ulysses_owns_process_group = True
+        if dist.get_world_size() == 1:
+            _ulysses_x = torch.randn(
+                1, 128, 8, 128, dtype=torch.bfloat16, device=device
+            )
+            with flashinfer.comm.UlyssesCommunicator(
+                max_elems=_ulysses_x.numel(),
+                dtype=_ulysses_x.dtype,
+                backend="nccl",
+                device=_ulysses_x.device,
+            ) as _ulysses_comm:
+                _ulysses_comm.scatter_heads(_ulysses_x)
+                _ulysses_comm.gather_heads(_ulysses_x)
+finally:
+    if _ulysses_owns_process_group:
+        dist.destroy_process_group()
