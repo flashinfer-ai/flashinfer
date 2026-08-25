@@ -33,7 +33,21 @@ from . import kda_decode as _kda_decode
 from . import kda_prefill as _kda_prefill
 from . import kda_prefill_cute as _kda_prefill_cute
 from .api_logging import flashinfer_api
+from .kda_backward import (
+    RecurrentKDABackwardWorkspace as RecurrentKDABackwardWorkspace,
+)
+from .kda_backward import recurrent_kda_backward as recurrent_kda_backward
+from .kda_training import (
+    RecurrentKDATrainingContext as RecurrentKDATrainingContext,
+)
+from .kda_training import (
+    recurrent_kda_training_backward as recurrent_kda_training_backward,
+)
+from .kda_training import (
+    recurrent_kda_training_forward as recurrent_kda_training_forward,
+)
 from .trace.templates.kda import recurrent_kda_trace
+from .utils import get_compute_capability
 
 
 @flashinfer_api(trace=recurrent_kda_trace)
@@ -75,11 +89,16 @@ def recurrent_kda(
     This is the public API layer for the CuTe DSL implementation in
     ``flashinfer.kda_kernels.recurrent_kda``. It supports single-token decode,
     fused speculative decode, GQA, optional cu_seqlens packing, and the same
-    gate modes as the backend implementation. On SM100a (B200/GB200) and
-    SM103a (B300/GB300), the FlashKDA-compatible subset of ordinary multi-token
-    prefill can use either the frozen Cake schedules or the source-level CuTe
-    DSL BT=16 kernel. ``backend="auto"`` prefers CuTe DSL for supported plain
-    prefill contracts and keeps Cake as the feature-complete fallback.
+    gate modes as the backend implementation. On SM120a, eligible ordinary
+    multi-token prefill uses the architecture-specific CuTe DSL backend. On
+    SM100a (B200/GB200) and SM103a (B300/GB300), the FlashKDA-compatible subset
+    can use either the frozen Cake schedules or the source-level CuTe DSL BT=16
+    kernel. The Cake backend includes a generated two-stage BT=16
+    prepare/chain portfolio with device- and shape-specific S7/S8/S9 pipeline
+    selection. ``backend="auto"`` prefers CuTe DSL for supported plain prefill
+    contracts and keeps Cake as the feature-complete fallback; use
+    ``backend="cake"`` to select and benchmark the generated portfolio
+    explicitly.
 
     Args:
         q (torch.Tensor):
@@ -181,17 +200,19 @@ def recurrent_kda(
             in one wave. CUDA Graph capture of a packed CuTe DSL engine call
             requires an explicit plan prepared with
             :class:`RecurrentKDAPrefillWrapper`. Cake constructs and caches its
-            own eager host metadata. On Cake, supplying an order keeps the direct
-            schedule so caller-owned ordering is not replaced by persistent task
-            bins.
+            own eager host metadata. On Cake, supplying an order disables
+            persistent host task-bin planning but does not force direct M128;
+            the selected non-persistent route may still be BT16 prepare/chain,
+            M64, small-BH, or direct according to the input shape.
             Fixed-layout prefill and decode calls must leave it as ``None``.
         prefill_workspace (Optional[RecurrentKDAPrefillWorkspace]):
-            Caller-owned workspace for SM100-family prefill backends.
+            Caller-owned workspace for SM100-family and SM120 prefill backends.
             It is optional for eager execution and required for CUDA graph
             capture. Warm it eagerly with the exact tensors on the capture
             stream before capture. Use one workspace per captured
             ``recurrent_kda`` invocation. Explicit workspaces and CUDA Graph
-            capture use direct/M64 schedules; persistent task planning is an
+            capture use non-persistent schedules, including eligible BT16,
+            M64, small-BH, and direct routes. Persistent task planning is an
             eager-only B200/GB200 route because its bins depend on host-visible
             sequence lengths.
         state_checkpoints (Optional[torch.Tensor]):
@@ -204,16 +225,21 @@ def recurrent_kda(
             Each count must equal ``ceil(seq_len / checkpoint_every_n_tokens)``.
         checkpoint_every_n_tokens (int):
             Checkpoint interval. Zero disables checkpoints; a positive value
-            must be divisible by 32. SGLang normally uses 64 or a larger
-            cache-page-aligned multiple.
+            must be divisible by 32, except that the SM100-family exact-N16
+            frozen route also accepts multiples of 16. SGLang normally uses
+            64 or a larger cache-page-aligned multiple.
         backend (Literal["auto", "cute-dsl", "cake"]):
-            Implementation backend. ``"auto"`` selects the ported BT=16
-            CuTe DSL kernel for supported ordinary multi-token prefill,
-            including state checkpoints, and otherwise falls back to an
-            exported frozen Cake specialization.
-            ``"cake"`` and ``"cute-dsl"`` select those backends strictly.
-            The CuTe DSL kernel needs ``nvidia-cutlass-dsl>=4.7``; below that
-            ``"auto"`` uses Cake and ``"cute-dsl"`` raises :class:`ImportError`.
+            Implementation backend. ``"auto"`` selects the architecture-
+            appropriate CuTe DSL kernel for supported ordinary multi-token
+            prefill, including the SM120 backend and SM100-family state
+            checkpoints, and otherwise falls back to an exported frozen Cake
+            specialization.
+            ``"cake"`` and ``"cute-dsl"`` select those backends strictly. The
+            Cake prefill path chooses among direct, persistent, small-BH, and
+            two-stage BT16 schedules from the input shape and physical device.
+            The SM100-family kernel additionally needs
+            ``nvidia-cutlass-dsl>=4.7``; below that ``"auto"`` uses Cake there
+            and ``"cute-dsl"`` raises :class:`ImportError`.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -230,6 +256,71 @@ def recurrent_kda(
         raise ValueError(
             f"backend must be 'auto', 'cute-dsl', or 'cake', got {backend!r}"
         )
+
+    # SM120 is an architecture-specific CuTe DSL implementation. Try it before
+    # the SM100-family CuTe DSL path, whose eligibility check rejects SM120.
+    sm120_rejection: Optional[str] = None
+    if backend in ("auto", "cute-dsl"):
+        sm120_prefill_kwargs = dict(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            output=output,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            seq_order=seq_order,
+            prefill_workspace=prefill_workspace,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        )
+        if _kda_prefill._sm120_kda_prefill_is_eligible(**sm120_prefill_kwargs):
+            assert A_log is not None
+            assert dt_bias is not None
+            assert lower_bound is not None
+            return _kda_prefill._run_sm120_kda_prefill(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                lower_bound=lower_bound,
+                cu_seqlens=cu_seqlens,
+                output=output,
+                prefill_workspace=prefill_workspace,
+            )
+        if (
+            backend == "cute-dsl"
+            and q.is_cuda
+            and get_compute_capability(q.device) == (12, 0)
+        ):
+            # Recorded, not raised: a decode or any other call this backend does
+            # not take must keep falling through exactly as before.  It is used
+            # only where the CC 10.0/10.3 block already refuses an explicit
+            # request, which on this architecture can only answer with the
+            # contract when the reason is known right here.
+            sm120_rejection = _kda_prefill._sm120_kda_prefill_rejection_reason(
+                **sm120_prefill_kwargs
+            )
 
     is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
         q, cu_seqlens, num_spec_tokens
@@ -270,6 +361,10 @@ def recurrent_kda(
             raise ValueError(
                 "backend='cute-dsl' does not support this recurrent_kda "
                 "prefill contract"
+                if sm120_rejection is None
+                else "backend='cute-dsl' selects the SM120 prefill backend on "
+                "a CC 12.0 device, and it does not support this call: "
+                + sm120_rejection
             )
         if cute_dsl_eligible:
             assert A_log is not None
@@ -369,7 +464,7 @@ def recurrent_kda(
     if prefill_workspace is not None:
         raise ValueError(
             "prefill_workspace is only supported by eligible ordinary "
-            "SM100-family prefill backends"
+            "multi-token prefill backends"
         )
     if seq_order is not None:
         raise ValueError(
@@ -407,6 +502,11 @@ def recurrent_kda(
 
 class RecurrentKDAPrefillWrapper:
     """Plan-and-run wrapper for packed recurrent-KDA prefill.
+
+    Compute capability 10.0 and 10.3 only.  ``run`` forces ``backend="cute-dsl"``
+    and always passes the ``seq_order`` it planned, and the CC 12.0 backend
+    supports neither, so a CC 12.0 caller should use
+    :func:`flashinfer.kda.recurrent_kda` directly.
 
     ``plan`` runs outside CUDA Graph capture.  It reads ``cu_seqlens`` on the
     host, builds a stable descending-length sequence order and cumulative chunk

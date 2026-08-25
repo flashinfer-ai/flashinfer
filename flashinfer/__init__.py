@@ -85,6 +85,13 @@ from .quantization.fp8_quantization import (
     mxfp8_grouped_quantize,
     mxfp8_quantize,
 )
+from .attn_scores import padded_context_len as padded_context_len
+from .attn_scores import (
+    compute_paged_mqa_logits_schedule as compute_paged_mqa_logits_schedule,
+)
+from .attn_scores import fp4_paged_mqa_logits as fp4_paged_mqa_logits
+from .attn_scores import fp8_paged_mqa_logits as fp8_paged_mqa_logits
+from .attn_scores import precompile_paged_mqa_logits as precompile_paged_mqa_logits
 from .fused_moe import (
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
@@ -140,6 +147,19 @@ from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
 from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
 from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
+from .kda_backward import (
+    RecurrentKDABackwardWorkspace as RecurrentKDABackwardWorkspace,
+)
+from .kda_backward import recurrent_kda_backward as recurrent_kda_backward
+from .kda_training import (
+    RecurrentKDATrainingContext as RecurrentKDATrainingContext,
+)
+from .kda_training import (
+    recurrent_kda_training_backward as recurrent_kda_training_backward,
+)
+from .kda_training import (
+    recurrent_kda_training_forward as recurrent_kda_training_forward,
+)
 from .kda_prefill import (
     RecurrentKDAPrefillWorkspace as RecurrentKDAPrefillWorkspace,
 )

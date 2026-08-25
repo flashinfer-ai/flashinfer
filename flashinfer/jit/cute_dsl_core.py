@@ -215,7 +215,27 @@ class JitSpecCuteDsl(JitSpec):
                 )
 
     def load(self) -> Any:
-        """The kernel compiled by build(), or the on-disk artifact."""
+        """The kernel to hand back: the exported artifact whenever one exists.
+
+        The artifact is preferred even immediately after ``build()``.
+        ``cute.compile`` does not reject a ``--gpu-arch`` the current device
+        cannot run: it returns a callable with no execution engine, which
+        compiles cleanly and then raises ``DSLRuntimeError`` on first
+        invocation (measured on sm_100a for sm_90a, sm_103a, sm_120a and
+        sm_80).  Reloading through ``load_module`` instead either yields a
+        properly loaded module or fails here, at build time, rather than
+        deferring the failure to the first call in a user's hot path.
+
+        This also removes a divergence: a cache *hit* already returned the
+        reloaded artifact, so every second run was exercising that form
+        anyway.  Miss and hit now hand back the same thing.
+
+        Falls back to the in-process object when no artifact exists -- export
+        is best-effort (``build()`` logs and continues on failure) and the
+        on-disk cache can be disabled outright.
+        """
+        if self.object_path.exists():
+            return self._load_from_disk()
         if self._compiled_kernel is not None:
             return self._compiled_kernel
         return self._load_from_disk()

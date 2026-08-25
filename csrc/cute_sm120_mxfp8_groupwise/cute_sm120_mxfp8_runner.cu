@@ -317,16 +317,20 @@ void CuteSm120Mxfp8GemmRunner<ElementType, OutElementType, AccumElementType,
                                       int shape_n, int shape_k, cudaStream_t stream,
                                       int32_t const* SFA, int32_t const* SFB, int granK,
                                       int tactic_tile_m, int tactic_tile_n, bool is_gated) {
-  bool valid_tactic = (tactic_tile_m == 32 && tactic_tile_n == 128) ||
-                      (tactic_tile_m == 64 && tactic_tile_n == 64) ||
-                      (tactic_tile_m == 64 && tactic_tile_n == 128) ||
-                      (tactic_tile_m == 128 && tactic_tile_n == 8) ||
-                      (tactic_tile_m == 128 && tactic_tile_n == 64) ||
-                      (tactic_tile_m == 128 && tactic_tile_n == 128);
-  TVM_FFI_ICHECK(valid_tactic) << "unsupported MXFP8 MoE tactic (TileM, TileN)=(" << tactic_tile_m
-                               << ", " << tactic_tile_n << ")";
-  TVM_FFI_ICHECK(tactic_tile_m != 128 || tactic_tile_n != 128 || granK == 128)
-      << "unsupported MXFP8 GranK=32 MoE tactic (TileM, TileN)=(128, 128)";
+  bool valid_plain = (tactic_tile_m == 32 && tactic_tile_n == 128) ||
+                     (tactic_tile_m == 64 && tactic_tile_n == 64) ||
+                     (tactic_tile_m == 64 && tactic_tile_n == 128) ||
+                     (tactic_tile_m == 128 && tactic_tile_n == 128) ||
+                     (tactic_tile_m == 128 && tactic_tile_n == 8);
+  bool valid_gated = (tactic_tile_m == 32 && tactic_tile_n == 128) ||
+                     (tactic_tile_m == 64 && tactic_tile_n == 64) ||
+                     (tactic_tile_m == 64 && tactic_tile_n == 128) ||
+                     (tactic_tile_m == 128 && tactic_tile_n == 64) ||
+                     (tactic_tile_m == 128 && tactic_tile_n == 8) ||
+                     (granK == 128 && tactic_tile_m == 128 && tactic_tile_n == 128);
+  TVM_FFI_ICHECK(is_gated ? valid_gated : valid_plain)
+      << "unsupported MXFP8 MoE tactic (TileM, TileN)=(" << tactic_tile_m << ", " << tactic_tile_n
+      << ")";
   DISPATCH_GRAN_K(granK, GRAN_K, {
     if (is_gated) {
       fused_moe_mxfp8_nt_groupwise_tuned_impl<GRAN_K>(D, A, B, token_offset, num_experts,
@@ -414,17 +418,17 @@ void CuteSm120Mxfp8GemmRunner<ElementType, OutElementType, AccumElementType,
   using KT_M64_N64 = sm120_blockscaled::SM120BlockScaledBuilder<64, 64, kTileK_M64, 4, GranK, kGT>;
   using KT_M64_N128 =
       sm120_blockscaled::SM120BlockScaledBuilder<64, 128, kTileK_M64, 4, GranK, kGT>;
-  using KT_M128_N64 = sm120_blockscaled::SM120BlockScaledBuilder<128, 64, 64, 4, GranK, kGT>;
+  using KT_M128_N128 = sm120_blockscaled::SM120BlockScaledBuilder<128, 128, 64, 4, GranK, kGT>;
   using KT_M32_N128 = sm120_blockscaled::SM120BlockScaledBuilder<32, 128, 128, 4, GranK, kGT>;
   using KT_SWAPAB_N8 = sm120_blockscaled::SM120BlockScaledBuilder<128, 8, 128, 4, GranK, kGT, true>;
 
-  auto ptr_A = reinterpret_cast<typename KT_M128_N64::ElementA*>(const_cast<void*>(A));
-  auto ptr_B = reinterpret_cast<typename KT_M128_N64::ElementB*>(const_cast<void*>(B));
+  auto ptr_A = reinterpret_cast<typename KT_M128_N128::ElementA*>(const_cast<void*>(A));
+  auto ptr_B = reinterpret_cast<typename KT_M128_N128::ElementB*>(const_cast<void*>(B));
   auto ptr_SFA =
-      reinterpret_cast<typename KT_M128_N64::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFA));
+      reinterpret_cast<typename KT_M128_N128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFA));
   auto ptr_SFB =
-      reinterpret_cast<typename KT_M128_N64::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFB));
-  auto ptr_D = reinterpret_cast<typename KT_M128_N64::ElementD*>(D);
+      reinterpret_cast<typename KT_M128_N128::SFConfig::ElementSFLoad*>(const_cast<int32_t*>(SFB));
+  auto ptr_D = reinterpret_cast<typename KT_M128_N128::ElementD*>(D);
   int num_sms = sm120_blockscaled::get_num_sms();
 
   if (tactic_tile_m == 128 && tactic_tile_n == 8) {
@@ -443,12 +447,7 @@ void CuteSm120Mxfp8GemmRunner<ElementType, OutElementType, AccumElementType,
     sm120_blockscaled::launch_moe_gemm<KT_M64_N128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
                                                     total_rows, shape_n, shape_k, num_experts,
                                                     token_offset, num_sms, stream);
-  } else if (tactic_tile_n == 64) {
-    sm120_blockscaled::launch_moe_gemm<KT_M128_N64>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
-                                                    total_rows, shape_n, shape_k, num_experts,
-                                                    token_offset, num_sms, stream);
-  } else if constexpr (GranK == 128) {
-    using KT_M128_N128 = sm120_blockscaled::SM120BlockScaledBuilder<128, 128, 64, 4, GranK, kGT>;
+  } else {
     sm120_blockscaled::launch_moe_gemm<KT_M128_N128>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D,
                                                      total_rows, shape_n, shape_k, num_experts,
                                                      token_offset, num_sms, stream);
