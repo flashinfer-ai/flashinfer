@@ -17,7 +17,6 @@ limitations under the License.
 import functools
 import logging
 import math
-import warnings
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
@@ -2871,7 +2870,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Whether to return the logsumexp of attention output
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
-            Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+            Only effective on backends and devices that support PDL.
         window_left : Optional[int]
             Per-call override for the left (inclusive) sliding-window size.  When
             ``None``, the value supplied to :meth:`plan` is used.  Pass ``-1`` to
@@ -2928,11 +2927,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
         if enable_pdl is None:
-            enable_pdl = (
-                False
-                if self._backend == "cute-dsl-prims"
-                else device_support_pdl(q.device)
-            )
+            enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
@@ -2995,12 +2990,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 lse=lse,
             )
         elif self._backend == "cute-dsl-prims":
-            if enable_pdl:
-                warnings.warn(
-                    "backend='cute-dsl-prims' does not support PDL; falling back "
-                    "to enable_pdl=False",
-                    stacklevel=2,
-                )
             if args:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not accept custom run arguments"
@@ -3042,6 +3031,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 out,
                 return_lse=return_lse,
                 lse=lse,
+                enable_pdl=enable_pdl,
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
@@ -4317,7 +4307,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Whether to return the logsumexp of attention output
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
-            Only supported for >= sm90, and currently only for FA2 and CUDA core decode.
+            Only effective on backends and devices that support PDL.
         kv_cache_sf : Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]]
             Per-block scale factors for NVFP4 KV input.  Accepts either a single
             packed scale tensor or a ``(k_scales, v_scales)`` tuple matching the
@@ -4334,11 +4324,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             * The logsumexp of attention output, shape: ``[qo_indptr[-1], num_qo_heads]``.
         """
         if enable_pdl is None:
-            enable_pdl = (
-                False
-                if self._backend == "cute-dsl-prims"
-                else device_support_pdl(q.device)
-            )
+            enable_pdl = device_support_pdl(q.device)
         _check_cached_qkv_data_type(
             q, k, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -4359,12 +4345,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 )
 
         if self._backend == "cute-dsl-prims":
-            if enable_pdl:
-                warnings.warn(
-                    "backend='cute-dsl-prims' does not support PDL; falling back "
-                    "to enable_pdl=False",
-                    stacklevel=2,
-                )
             if args:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not accept custom run arguments"
@@ -4450,6 +4430,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 v,
                 out,
                 lse=lse if return_lse else None,
+                enable_pdl=enable_pdl,
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,

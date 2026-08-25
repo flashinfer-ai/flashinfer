@@ -54,6 +54,7 @@ def _compile_sm120_fmha_fp8_ragged_kernel(
     device: torch.device,
     with_lse: bool = False,
     balanced_scheduler: bool = False,
+    use_pdl: bool = False,
 ):
     """Compile one sequence-length-independent packed ragged kernel."""
 
@@ -131,6 +132,7 @@ def _compile_sm120_fmha_fp8_ragged_kernel(
         None,  # block_tables (non-paged)
         fake_cu_seqlens_k,
         cutlass.Int32(1),  # runtime max_seqlen_q placeholder
+        use_pdl,
         options="--enable-tvm-ffi",
     )
 
@@ -148,6 +150,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
     device: torch.device,
     with_lse: bool = False,
     balanced_scheduler: bool = False,
+    use_pdl: bool = False,
 ):
     """Compile one sequence-length-independent packed-Q paged kernel."""
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
@@ -253,6 +256,7 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         fake_block_tables,
         None,  # cu_seqlens_k
         cutlass.Int32(1),  # runtime max_seqlen_q placeholder
+        use_pdl,
         options="--enable-tvm-ffi",
     )
 
@@ -282,6 +286,7 @@ def compile_sm120_fmha_fp8_ragged_kernel(
     device: torch.device,
     with_lse: bool = False,
     balanced_scheduler: bool = False,
+    use_pdl: bool = False,
 ):
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
 
@@ -295,6 +300,7 @@ def compile_sm120_fmha_fp8_ragged_kernel(
         f"_hq{num_qo_heads}_hkv{num_kv_heads}_d{head_dim}"
         f"_causal{int(is_causal)}_kt{kv_tile}_qt{q_tile}"
         f"_lse{int(with_lse)}_balanced{int(balanced_scheduler)}"
+        f"_pdl{int(use_pdl)}"
     )
     return build_and_load_cute_dsl_kernel(
         "sm120_prims_fmha_fp8",
@@ -311,6 +317,7 @@ def compile_sm120_fmha_fp8_ragged_kernel(
             device,
             with_lse,
             balanced_scheduler,
+            use_pdl,
         ),
         extra_key_files=_cache_key_files(),
     )
@@ -330,6 +337,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
     device: torch.device,
     with_lse: bool = False,
     balanced_scheduler: bool = False,
+    use_pdl: bool = False,
 ):
     _validate_balanced_scheduler(is_causal, balanced_scheduler)
 
@@ -344,6 +352,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
         f"_causal{int(is_causal)}_kt{kv_tile}_qt{q_tile}"
         f"_page{num_tokens_per_page}_lse{int(with_lse)}"
         f"_balanced{int(balanced_scheduler)}"
+        f"_pdl{int(use_pdl)}"
     )
     return build_and_load_cute_dsl_kernel(
         "sm120_prims_fmha_fp8",
@@ -361,6 +370,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
             device,
             with_lse,
             balanced_scheduler,
+            use_pdl,
         ),
         extra_key_files=_cache_key_files(),
     )

@@ -202,6 +202,7 @@ def sm120_fmha_fp8_ragged_prefill(
     q_tile: Optional[int] = None,
     lse: Optional[torch.Tensor] = None,
     v_scale: Optional[float] = None,
+    enable_pdl: bool = False,
 ) -> None:
     """Run SM120 FP8 FMHA on packed contiguous ragged Q/K/V.
 
@@ -234,6 +235,8 @@ def sm120_fmha_fp8_ragged_prefill(
         Preallocated float32 log2 LSE output, shape ``(total_q, Hq)``.
     v_scale : float, optional
         Scalar multiplier folded into the normalized output. Defaults to 1.
+    enable_pdl : bool
+        Whether to enable Programmatic Dependent Launch.
     Raises
     ------
     RuntimeError
@@ -299,6 +302,7 @@ def sm120_fmha_fp8_ragged_prefill(
         device=q.device,
         with_lse=lse is not None,
         balanced_scheduler=_use_balanced_scheduler(is_causal),
+        use_pdl=enable_pdl,
     )
 
     if sm_scale is None:
@@ -319,6 +323,7 @@ def sm120_fmha_fp8_ragged_prefill(
         None,
         cu_seqlens_k_i32,
         Int32(max_seqlen_q),
+        enable_pdl,
     )
 
 
@@ -342,6 +347,7 @@ def sm120_fmha_fp8_paged_prefill(
     q_tile: Optional[int] = None,
     lse: Optional[torch.Tensor] = None,
     v_scale: Optional[float] = None,
+    enable_pdl: bool = False,
 ) -> None:
     """Run SM120 FP8 FMHA prefill with paged K/V cache.
 
@@ -389,6 +395,8 @@ def sm120_fmha_fp8_paged_prefill(
         Preallocated float32 log2 LSE output, shape ``(total_q, Hq)``.
     v_scale : float, optional
         Scalar multiplier folded into the normalized output. Defaults to 1.
+    enable_pdl : bool
+        Whether to enable Programmatic Dependent Launch.
     Raises
     ------
     RuntimeError
@@ -468,6 +476,7 @@ def sm120_fmha_fp8_paged_prefill(
         device=q.device,
         with_lse=lse is not None,
         balanced_scheduler=_use_balanced_scheduler(is_causal),
+        use_pdl=enable_pdl,
     )
 
     if sm_scale is None:
@@ -495,14 +504,16 @@ def sm120_fmha_fp8_paged_prefill(
         block_tables_i32,
         None,
         Int32(max_seqlen_q),
+        enable_pdl,
     )
 
 
 class SM120PrimsBatchPrefillBackend:
     """Plan/run adapter used by the public batch-prefill wrappers.
 
-    All host-derived metadata and kernel compilation happen in ``plan_*``.
-    ``run_*`` only validates launch tensors and dispatches a cached kernel.
+    Host-derived metadata and the base kernel are prepared in ``plan_*``.
+    Runtime LSE/PDL specializations are compiled lazily and cached before
+    dispatch.
     """
 
     _FP8_DTYPES = (torch.float8_e4m3fn,)
@@ -512,7 +523,7 @@ class SM120PrimsBatchPrefillBackend:
         _check_cutlass_dsl_version()
         self.device = torch.device(device)
         self._mode: Optional[str] = None
-        self._with_lse_compiled = False
+        self._compiled_variants: set[tuple[bool, bool]] = set()
 
     @staticmethod
     def _scalar_scale(name: str, value: Optional[float]) -> float:
@@ -615,19 +626,20 @@ class SM120PrimsBatchPrefillBackend:
         self._sm_scale = sm_scale
         self._page_size: Optional[int] = None
         compile_sm120_fmha_fp8_ragged_kernel(
-            q_dtype,
-            o_dtype,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim_qk,
-            causal,
-            128,
-            128,
-            self.device,
-            False,
-            _use_balanced_scheduler(causal),
+            in_dtype=q_dtype,
+            out_dtype=o_dtype,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim_qk,
+            is_causal=causal,
+            kv_tile=128,
+            q_tile=128,
+            device=self.device,
+            with_lse=False,
+            balanced_scheduler=_use_balanced_scheduler(causal),
+            use_pdl=False,
         )
-        self._with_lse_compiled = False
+        self._compiled_variants = {(False, False)}
 
     def plan_paged(
         self,
@@ -687,20 +699,21 @@ class SM120PrimsBatchPrefillBackend:
         self._sm_scale = sm_scale
         self._page_size = page_size
         compile_sm120_fmha_fp8_paged_kernel(
-            q_dtype,
-            o_dtype,
-            num_qo_heads,
-            num_kv_heads,
-            head_dim_qk,
-            causal,
-            128,
-            128,
-            page_size,
-            self.device,
-            False,
-            _use_balanced_scheduler(causal),
+            in_dtype=q_dtype,
+            out_dtype=o_dtype,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim_qk,
+            is_causal=causal,
+            kv_tile=128,
+            q_tile=128,
+            num_tokens_per_page=page_size,
+            device=self.device,
+            with_lse=False,
+            balanced_scheduler=_use_balanced_scheduler(causal),
+            use_pdl=False,
         )
-        self._with_lse_compiled = False
+        self._compiled_variants = {(False, False)}
 
     def _validate_run(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor
@@ -736,13 +749,16 @@ class SM120PrimsBatchPrefillBackend:
                     f"{tuple(k.shape)} and {tuple(v.shape)}"
                 )
 
-    def _ensure_lse_kernel(self) -> None:
-        if self._with_lse_compiled:
+    def _ensure_kernel(self, *, with_lse: bool, enable_pdl: bool) -> None:
+        variant = (with_lse, enable_pdl)
+        if variant in self._compiled_variants:
             return
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError(
-                "backend='cute-dsl-prims' LSE specialization was not compiled "
-                "before CUDA Graph capture; call run_return_lse() once before capture"
+                "backend='cute-dsl-prims' kernel specialization "
+                f"(return_lse={with_lse}, enable_pdl={enable_pdl}) was not "
+                "compiled before CUDA Graph capture; warm up the same run "
+                "configuration before capture"
             )
         from flashinfer.cute_dsl.attention.fmha.sm120 import (
             compile_sm120_fmha_fp8_paged_kernel,
@@ -763,18 +779,20 @@ class SM120PrimsBatchPrefillBackend:
             compile_sm120_fmha_fp8_ragged_kernel(
                 *common,
                 self.device,
-                True,
+                with_lse,
                 _use_balanced_scheduler(self._causal),
+                enable_pdl,
             )
         else:
             compile_sm120_fmha_fp8_paged_kernel(
                 *common,
                 self._page_size,
                 self.device,
-                True,
+                with_lse,
                 _use_balanced_scheduler(self._causal),
+                enable_pdl,
             )
-        self._with_lse_compiled = True
+        self._compiled_variants.add(variant)
 
     def run_ragged(
         self,
@@ -784,6 +802,7 @@ class SM120PrimsBatchPrefillBackend:
         out: torch.Tensor,
         *,
         lse: Optional[torch.Tensor],
+        enable_pdl: bool,
         q_scale: Optional[float],
         k_scale: Optional[float],
         v_scale: Optional[float],
@@ -791,8 +810,7 @@ class SM120PrimsBatchPrefillBackend:
         self._validate_run(q, k, v, out)
         if self._mode != "ragged":
             raise RuntimeError("SM120 PRIMS backend was not planned for ragged KV")
-        if lse is not None:
-            self._ensure_lse_kernel()
+        self._ensure_kernel(with_lse=lse is not None, enable_pdl=enable_pdl)
         sm_scale = (
             self._sm_scale
             if self._sm_scale is not None
@@ -813,6 +831,7 @@ class SM120PrimsBatchPrefillBackend:
             sm_scale=sm_scale,
             v_scale=scale_v,
             lse=lse,
+            enable_pdl=enable_pdl,
         )
 
     def run_paged(
@@ -824,6 +843,7 @@ class SM120PrimsBatchPrefillBackend:
         *,
         return_lse: bool,
         lse: Optional[torch.Tensor],
+        enable_pdl: bool,
         q_scale: Optional[float],
         k_scale: Optional[float],
         v_scale: Optional[float],
@@ -838,9 +858,9 @@ class SM120PrimsBatchPrefillBackend:
                     dtype=torch.float32,
                     device=q.device,
                 )
-            self._ensure_lse_kernel()
         else:
             lse = None
+        self._ensure_kernel(with_lse=return_lse, enable_pdl=enable_pdl)
         sm_scale = (
             self._sm_scale
             if self._sm_scale is not None
@@ -862,6 +882,7 @@ class SM120PrimsBatchPrefillBackend:
             v_scale=scale_v,
             max_seqlen_q=self._max_seqlen_q,
             lse=lse,
+            enable_pdl=enable_pdl,
         )
         if return_lse:
             return out, lse

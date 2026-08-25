@@ -1980,6 +1980,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         k_token_base = cutlass.Int32(0)
         causal_q_offset = cutlass.Int32(0)
 
+        cute.arch.griddepcontrol_wait()
         q_token_base = cutlass.Int32(cu_seqlens_q[batch_idx])
         seqlen_q = cutlass.Int32(cu_seqlens_q[batch_idx + 1]) - q_token_base
         num_heads_q = q.shape[1]
@@ -2623,6 +2624,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         else:
             prims.setmaxregister(24, prims.SetMaxRegisterAction.DECREASE)
 
+        cute.arch.griddepcontrol_launch_dependents()
+
     @cute.jit
     def __call__(
         self,
@@ -2639,6 +2642,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         block_tables: cute.Tensor | None = None,
         cu_seqlens_k: cute.Tensor | None = None,
         max_seqlen_q: cutlass.Int32 | None = None,
+        use_pdl: bool = False,
     ) -> None:
         """Launch the SM120 PRIM FMHA FP8 kernel.
 
@@ -2659,6 +2663,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             ``(B, max_num_pages_per_seq_kv)``.
         :param cu_seqlens_k: Packed-K/V cumulative Int32 offsets.
         :param max_seqlen_q: Contiguous-varlen launch-grid bound.
+        :param use_pdl: Whether to use Programmatic Dependent Launch.
 
         Direct callers must satisfy the same shape contract enforced by
         :meth:`can_implement_paged`.
@@ -2758,4 +2763,5 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
             block=(self.threads_per_cta, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=use_pdl,
         )
