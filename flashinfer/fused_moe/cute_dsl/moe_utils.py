@@ -577,9 +577,9 @@ def moe_sort(
         enable_pdl: Enable Programmatic Dependent Launch for better kernel overlap.
                     Default is False.
         init_tile_metadata: Zero the tile metadata buffers, giving safe defaults
-                    past num_non_exiting_tiles. Only needed by callers that read
-                    past the true tile count (the Rubin kernels, which round it
-                    up); costs two fill launches. Default: False.
+                    past num_non_exiting_tiles. Only needed by callers that hand
+                    the kernel a rounded-up tile count and so read past the true
+                    one; costs two fill launches. Default: False.
         out_tile_idx_to_expert_idx: Pre-allocated buffer for tile_idx_to_expert_idx.
         out_tile_idx_to_mn_limit: Pre-allocated buffer for tile_idx_to_mn_limit.
         out_expanded_idx_to_permuted_idx: Pre-allocated buffer for expanded_idx_to_permuted_idx.

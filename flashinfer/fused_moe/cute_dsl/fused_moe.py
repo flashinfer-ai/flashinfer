@@ -279,6 +279,18 @@ def _moe_core_impl(
 
     is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
 
+    # Tiles are handed to a cluster in cluster_shape_m-sized groups, so a count
+    # that is not a whole number of groups splits the last one: some CTAs of
+    # that cluster have work and the rest do not, and the ones that do hang at
+    # the cluster barrier waiting for peers that already exited. Rounding the
+    # count the kernel sees up to a multiple of cluster_shape_m keeps every
+    # cluster uniform.
+    #
+    # This is a property of the selected tactic, not of the routing, so it is
+    # known here without inspecting num_non_exiting_tiles (a device tensor).
+    cluster_m = max(gemm1_cluster_shape_mn[0], gemm2_cluster_shape_mn[0])
+    needs_uniform_clusters = is_rubin and cluster_m > 1
+
     # Step 1: Sort tokens by expert
     moe_sort_kwargs = moe_sort_buffers or {}
     (
@@ -296,16 +308,17 @@ def _moe_core_impl(
         local_expert_offset=local_expert_offset,
         num_local_experts=num_local_experts,
         tile_tokens_dim=tile_size,
-        init_tile_metadata=is_rubin,
+        init_tile_metadata=needs_uniform_clusters,
         **moe_sort_kwargs,
     )
 
-    # For Rubin, round num_non_exiting_tiles to the next EVEN number to
-    # prevent a cluster-synchronization deadlock. With cluster_shape_m=2,
-    # two CTAs get consecutive tile indices; if the count is odd, one CTA
-    # enters the cluster barrier while the other skips it.
-    if is_rubin:
-        kernel_num_non_exiting_tiles = ((num_non_exiting_tiles + 1) // 2) * 2
+    # The rounded count is also the kernel's bounds check on the tile metadata,
+    # so rounding it up lets the padding tiles read entries the routing kernel
+    # never wrote -- hence init_tile_metadata above, under the same condition.
+    if needs_uniform_clusters:
+        kernel_num_non_exiting_tiles = (
+            (num_non_exiting_tiles + cluster_m - 1) // cluster_m
+        ) * cluster_m
     else:
         kernel_num_non_exiting_tiles = num_non_exiting_tiles
 
