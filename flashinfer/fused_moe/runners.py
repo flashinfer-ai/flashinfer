@@ -1304,6 +1304,11 @@ class CutlassMxfp8Runner(_CutlassRunnerBase):
         )
         num_experts = self.config.routing.num_experts
         intermediate_size = self.config.experts.intermediate_size
+        if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+            raise ValueError(
+                "Cutlass MXFP8 requires hidden_size and intermediate_size "
+                f"divisible by 128, got H={hidden_size}, I={intermediate_size}."
+            )
         expected_w1 = (num_experts, 2 * intermediate_size, hidden_size)
         expected_w2 = (num_experts, hidden_size, intermediate_size)
         if w1.dtype is not torch.float8_e4m3fn or w2.dtype is not torch.float8_e4m3fn:
@@ -1313,9 +1318,11 @@ class CutlassMxfp8Runner(_CutlassRunnerBase):
                 f"Cutlass MXFP8 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
                 f"!= expected {expected_w1}/{expected_w2}."
             )
+        # Binding uses alignToSfDim(I, 128) * 2 for gated SwiGLU, not
+        # round_up(2*I, 128). Those agree only when I % 128 == 0.
         expected_s1 = (
             num_experts,
-            round_up(2 * intermediate_size, 128),
+            2 * round_up(intermediate_size, 128),
             round_up(hidden_size // 32, 4) // 4,
         )
         expected_s2 = (

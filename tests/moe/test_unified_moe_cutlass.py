@@ -324,6 +324,53 @@ def test_prepare_cutlass_mxfp8_mxfp4_weights_rejects_invalid_source_contract():
         )
 
 
+def test_prepare_cutlass_mxfp8_weights_rejects_invalid_source_contract():
+    w1 = torch.empty(2, 64, 32, dtype=torch.float16)
+    w2 = torch.empty(2, 32, 32, dtype=torch.bfloat16)
+    with pytest.raises(TypeError, match="expects BF16 weights"):
+        CutlassMxfp8Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=2,
+            hidden_size=32,
+            intermediate_size=32,
+        )
+
+    w1 = torch.empty(2, 128, 64, dtype=torch.bfloat16)
+    w2 = torch.empty(2, 64, 64, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="divisible by 128"):
+        CutlassMxfp8Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=2,
+            hidden_size=64,
+            intermediate_size=64,
+        )
+
+    w1 = torch.empty(2, 384, 128, dtype=torch.bfloat16)
+    w2 = torch.empty(2, 128, 192, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="divisible by 128"):
+        CutlassMxfp8Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=2,
+            hidden_size=128,
+            intermediate_size=192,
+        )
+
+    w1 = torch.empty(2, 256, 128, dtype=torch.bfloat16)
+    w2 = torch.empty(2, 128, 128, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="requires CUDA"):
+        CutlassMxfp8Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=2,
+            hidden_size=128,
+            intermediate_size=128,
+            device=torch.device("cpu"),
+        )
+
+
 def test_prepare_cutlass_w4a8_and_humming_weights_reject_invalid_source_contract():
     w1 = torch.empty(2, 256, 128, dtype=torch.float16)
     w2 = torch.empty(2, 128, 128, dtype=torch.bfloat16)
@@ -649,6 +696,27 @@ def test_cutlass_mxfp8_mxfp4_pack_rejects_unaligned_hidden_size():
     view = {key: torch.empty(1) for key in runner._required_weight_keys}
     with pytest.raises(ValueError, match="divisible by 128"):
         runner._pack_weight_inputs(view, hidden_size=64)
+
+
+def test_cutlass_mxfp8_pack_rejects_unaligned_hidden_size():
+    runner = CutlassMxfp8Runner.__new__(CutlassMxfp8Runner)
+    runner.config = _config(
+        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        routing=RoutingConfig(num_experts=2, top_k=2),
+        experts=ExpertConfig(intermediate_size=64),
+    )
+    runner.device = torch.device("cpu")
+    view = {key: torch.empty(1) for key in runner._required_weight_keys}
+    with pytest.raises(ValueError, match="divisible by 128"):
+        runner._pack_weight_inputs(view, hidden_size=64)
+
+    runner.config = _config(
+        quant=QuantConfig(variant=QuantVariant.MxFp8),
+        routing=RoutingConfig(num_experts=2, top_k=2),
+        experts=ExpertConfig(intermediate_size=192),
+    )
+    with pytest.raises(ValueError, match="divisible by 128"):
+        runner._pack_weight_inputs(view, hidden_size=128)
 
 
 def test_cutlass_mxfp8_pack_rejects_malformed_weight_scales():

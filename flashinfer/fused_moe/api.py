@@ -861,8 +861,9 @@ class CutlassMxfp8Config:
     """CUTLASS MXFP8-activation x MXFP8-weight backend (SM100 / SM103 / SM107).
 
     Activations are MXFP8 with a swizzled ``input_sf``. Weights stay E4M3 with
-    packed int32 scale tiles. Packed precomputed routing with SwiGLU and
-    ``do_finalize=True``.
+    packed int32 scale tiles. ``hidden_size`` and ``intermediate_size`` must be
+    divisible by 128 so the gated fc1 scale layout matches the binding.
+    Packed precomputed routing with SwiGLU and ``do_finalize=True``.
     """
 
     @classmethod

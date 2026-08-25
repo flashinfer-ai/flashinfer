@@ -1647,6 +1647,9 @@ def prepare_cutlass_mxfp8_mxfp4_weights(
 def _pack_mxfp8_weight_scales(
     scale_u8: torch.Tensor, rows: int, cols: int
 ) -> torch.Tensor:
+    # CUTLASS MXFP8 SF N-dim is alignToSfDim(N, 128). Callers must pass the
+    # already-gated row count (2 * round_up(I, 128) for SwiGLU fc1); combining
+    # as round_up(2*I, 128) is smaller when I % 128 != 0.
     num_experts = scale_u8.size(0)
     aligned_rows = round_up(rows, 128)
     aligned_k_scales = round_up(cols // 32, 4)
@@ -1683,7 +1686,13 @@ def prepare_cutlass_mxfp8_weights(
     intermediate_size: int,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Build the CUTLASS MXFP8 weight view consumed with MXFP8 activations."""
+    """Build the CUTLASS MXFP8 weight view consumed with MXFP8 activations.
+
+    MXFP8 block scales are 32-wide, but the fused-MoE binding requires
+    ``hidden_size`` and ``intermediate_size`` divisible by 128. The gated fc1
+    SF N-dim is ``2 * round_up(I, 128)``, which only matches
+    ``mxfp8_quantize``'s ``round_up(2*I, 128)`` output when ``I % 128 == 0``.
+    """
     w1_bf16, w2_bf16, device = _require_canonical_cutlass_bf16_weights(
         w1_bf16,
         w2_bf16,
@@ -1691,7 +1700,7 @@ def prepare_cutlass_mxfp8_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_mxfp8_weights",
-        alignment=32,
+        alignment=128,
         require_cuda=True,
         device=device,
     )
@@ -1702,7 +1711,7 @@ def prepare_cutlass_mxfp8_weights(
         "fc1_expert_weights": w1_q.contiguous(),
         "fc2_expert_weights": w2_q.contiguous(),
         "fc1_expert_scales": _pack_mxfp8_weight_scales(
-            w1_scale, 2 * intermediate_size, hidden_size
+            w1_scale, 2 * round_up(intermediate_size, 128), hidden_size
         ),
         "fc2_expert_scales": _pack_mxfp8_weight_scales(
             w2_scale, hidden_size, intermediate_size
