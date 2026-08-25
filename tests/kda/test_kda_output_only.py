@@ -334,7 +334,8 @@ class _RecoverSSMRef:
 
 @pytest.mark.parametrize("lower_bound", [-5.0, None])
 @pytest.mark.parametrize("ragged,with_null", [(False, False), (True, True)])
-def test_recoverssm_dropin(lower_bound, ragged, with_null):
+@pytest.mark.parametrize("padded_checkpoint", [False, True])
+def test_recoverssm_dropin(lower_bound, ragged, with_null, padded_checkpoint):
     """kda_recoverssm_verify matches the vLLM RecoverSSM verify contract."""
     from flashinfer.kda_kernels.kda_decode_wy_output_only import (
         kda_recoverssm_verify,
@@ -357,7 +358,17 @@ def test_recoverssm_dropin(lower_bound, ragged, with_null):
     A_log = torch.randn(H, dtype=torch.float32, device=dev) * 0.3
     dt = torch.randn(H * K, dtype=torch.float32, device=dev) * 0.1
     nblk = B + 2
-    state = torch.randn(nblk, H, V, K, dtype=torch.bfloat16, device=dev) * 0.1
+    if padded_checkpoint:
+        state_storage = torch.randn(
+            nblk,
+            H * V * K + 128,
+            dtype=torch.bfloat16,
+            device=dev,
+        )
+        state_storage.mul_(0.1)
+        state = state_storage[:, : H * V * K].view(nblk, H, V, K)
+    else:
+        state = torch.randn(nblk, H, V, K, dtype=torch.bfloat16, device=dev) * 0.1
     sidx = torch.arange(1, B + 1, dtype=torch.int32, device=dev)
     if with_null:
         sidx = sidx.clone()
@@ -387,3 +398,56 @@ def test_recoverssm_dropin(lower_bound, ragged, with_null):
     # untouched-region immutability (null slots, unused slots, ragged tails)
     assert torch.all(corr[~written] == 7.0), "corrections cache written OOB"
     assert torch.all(kg[~kgw] == 7.0), "kg cache written outside valid tokens"
+
+
+def test_recoverssm_dropin_padding_is_runtime():
+    """One compiled kernel must serve pools with different block paddings.
+
+    The pool block stride is a runtime kernel argument (not baked into the
+    compiled TMA descriptor or the compile-cache key); calling with
+    unpadded, +128- and +256-element-padded pools in one process must give
+    identical results for identical block contents.
+    """
+    from flashinfer.kda_kernels.kda_decode_wy_output_only import (
+        kda_recoverssm_verify,
+    )
+
+    torch.manual_seed(11)
+    dev = "cuda"
+    B, T, H = 3, 8, 4
+    K = V = 128
+    qsl = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=dev)
+    tot = B * T
+    q = torch.randn(1, tot, H, K, dtype=torch.bfloat16, device=dev)
+    k = torch.randn_like(q)
+    v = torch.randn(1, tot, H, V, dtype=torch.bfloat16, device=dev)
+    g = torch.randn(1, tot, H, K, dtype=torch.bfloat16, device=dev)
+    beta = torch.randn(1, tot, H, dtype=torch.bfloat16, device=dev)
+    A_log = torch.randn(H, dtype=torch.float32, device=dev) * 0.3
+    dt = torch.randn(H * K, dtype=torch.float32, device=dev) * 0.1
+    nblk = B + 2
+    dense = torch.randn(nblk, H, V, K, dtype=torch.bfloat16, device=dev) * 0.1
+    sidx = torch.arange(1, B + 1, dtype=torch.int32, device=dev)
+
+    outs = []
+    for pad in [0, 128, 256]:
+        if pad:
+            storage = torch.full(
+                (nblk, H * V * K + pad), 9.0, dtype=torch.bfloat16, device=dev
+            )
+            state = storage[:, : H * V * K].view(nblk, H, V, K)
+            state.copy_(dense)
+        else:
+            state = dense.clone()
+        corr = torch.zeros(nblk, H, T, V, dtype=torch.float32, device=dev)
+        kg = torch.zeros(nblk, H, T, 2 * K, dtype=torch.bfloat16, device=dev)
+        out = kda_recoverssm_verify(
+            q, k, v, g, beta, A_log, dt, -5.0, state, corr, kg, qsl, sidx, T
+        )
+        torch.cuda.synchronize()
+        outs.append((out.clone(), corr.clone(), kg.clone()))
+
+    for pad, (o, c, kgc) in zip([128, 256], outs[1:], strict=True):
+        assert torch.equal(o, outs[0][0]), f"pad={pad}: outputs differ"
+        assert torch.equal(c, outs[0][1]), f"pad={pad}: corrections differ"
+        assert torch.equal(kgc, outs[0][2]), f"pad={pad}: kg differs"

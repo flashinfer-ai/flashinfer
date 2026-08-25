@@ -191,6 +191,7 @@ class KdaDecodeWyOutputOnlyKernel:
         s_kg_blk: cutlass.Int32,
         s_kg_head: cutlass.Int32,
         s_kg_pos: cutlass.Int32,
+        s_h0_blk: cutlass.Int64,
         HV: cutlass.Int32,
         V_DIM: cutlass.Int32,
         H: cutlass.Int32,
@@ -200,12 +201,24 @@ class KdaDecodeWyOutputOnlyKernel:
         op = MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16))
         tiled_mma = cute.make_tiled_mma(op)
         B_val = gH0idx.layout.shape[0]
-        # State TMA: gH0 logical shape (pool, HV, V, K) — reorder to
+        # State TMA: rebuild the pool layout with STATIC inner strides
+        # (blocks are dense [HV, V, K]) and a RUNTIME block stride — real
+        # serving pools (e.g. vLLM's KDA cache) pad between blocks. The TMA
+        # tile modes must be static, so the incoming (possibly fully
+        # dynamic) descriptor layout is not used directly. Reorder to
         # (V, K, HV, pool) so the per-CTA tile is (V_DIM_C, K_HALF); the
         # trailing (HV, pool) modes survive tma_partition as outer coords.
-        gH0_vkhp = cute.make_tensor(
+        _h0_blk = cute.assume(s_h0_blk, divby=8)  # 16 B alignment (bf16)
+        gH0_dense = cute.make_tensor(
             gH0.iterator,
-            cute.select(gH0.layout, mode=[2, 3, 1, 0]),
+            cute.make_layout(
+                (gH0.layout.shape[0], HV, V_DIM_C, K_DIM),
+                stride=(_h0_blk, V_DIM_C * K_DIM, K_DIM, 1),
+            ),
+        )
+        gH0_vkhp = cute.make_tensor(
+            gH0_dense.iterator,
+            cute.select(gH0_dense.layout, mode=[2, 3, 1, 0]),
         )
         sH_tma_layout = _make_sH_sw128_layout_half()
         tma_atom_h, tma_tensor_h = cpasync.make_tiled_tma_atom(
@@ -2237,6 +2250,7 @@ def kda_wy_output_only(
         0,
         0,
         0,
+        HV * V_dim * K_dim,  # compact pool block stride (h0 is contiguous)
         HV,
         V_dim,
         H,
@@ -2316,6 +2330,7 @@ def kda_recoverssm_verify(
     folded into scaled operand tiles; T x T triangular inverse; TMA-loaded
     state GEMMs). Requires SM90+ (validated on SM100a / B200),
     ``K = V = 128``, ``spec_query_len <= 16``, and a bf16 checkpoint pool.
+    The checkpoint rows must be dense, but its block stride may include padding.
     """
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA RecoverSSM q must have shape [1, tokens, heads, dim]")
@@ -2341,8 +2356,10 @@ def kda_recoverssm_verify(
             "this drop-in requires a bf16 checkpoint pool (fp32 pools are "
             "not supported yet)"
         )
-    if not checkpoint_state.is_contiguous():
-        raise ValueError("KDA RecoverSSM checkpoint must be contiguous")
+    if checkpoint_state.stride()[1:] != (value_dim * key_dim, key_dim, 1):
+        raise ValueError("KDA RecoverSSM checkpoint rows must be contiguous")
+    if checkpoint_state.stride(0) % 8 != 0:
+        raise ValueError("KDA RecoverSSM checkpoint block stride must be 16B-aligned")
     if correction_cache.shape != (num_blocks, num_heads, spec_query_len, value_dim):
         raise ValueError("KDA RecoverSSM correction buffer shape is incompatible")
     if kg_cache.shape != (num_blocks, num_heads, spec_query_len, 2 * key_dim):
@@ -2412,7 +2429,7 @@ def kda_recoverssm_verify(
         mk_any(raw_beta),
         mk(A_log_f, 16),
         mk(dt_bias_f, 16),
-        mk_dyn(checkpoint_state),
+        mk_any(checkpoint_state),
         mk_dyn(state_indices),
         mk_any(out),
         mk_any(correction_cache),
@@ -2432,6 +2449,7 @@ def kda_recoverssm_verify(
         int(kg_cache.stride(0)),
         int(kg_cache.stride(1)),
         int(kg_cache.stride(2)),
+        int(checkpoint_state.stride(0)),  # padded block stride supported
         HV,
         value_dim,
         H,
