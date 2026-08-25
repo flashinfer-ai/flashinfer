@@ -196,6 +196,7 @@ def _torch_nvfp4_mega_reference(
     hidden,
     intermediate,
     gate_up_clamp,
+    activation="swiglu",
     term_transform=None,
 ):
     """Pure-torch NVFP4 MegaMoE oracle (apply_topk_in_fc1=True graph).
@@ -241,23 +242,26 @@ def _torch_nvfp4_mega_reference(
         reshaped = fc1_out.view(m, n_pairs, 2, NVFP4_BLOCK)
         gate = reshaped[:, :, 0, :]
         up = reshaped[:, :, 1, :]
-        if gate_up_clamp is not None:
-            limit = abs(float(gate_up_clamp))
-            gate = gate.clamp(max=limit)
-            up = up.clamp(min=-limit, max=limit)
-        swiglu = (gate * torch.sigmoid(gate) * up).reshape(m, intermediate)
+        if activation == "relu2":
+            activated = gate.clamp_min(0).square().reshape(m, intermediate)
+        else:
+            if gate_up_clamp is not None:
+                limit = abs(float(gate_up_clamp))
+                gate = gate.clamp(max=limit)
+                up = up.clamp(min=-limit, max=limit)
+            activated = (gate * torch.sigmoid(gate) * up).reshape(m, intermediate)
 
         # apply_topk_in_fc1=True: weight folded in before the fp4 round-trip
         # (post-hoc weighting would NOT match — quant changes the magnitude).
-        swiglu = swiglu * topk_weights[tokens, slots].unsqueeze(-1)
+        activated = activated * topk_weights[tokens, slots].unsqueeze(-1)
 
-        fc1_q, fc1_q_sf = nvfp4_quantize_per_block_16(swiglu, 1.0)
-        swiglu_rt = _dequant_nvfp4(fc1_q, fc1_q_sf, logical_cols=intermediate)
+        fc1_q, fc1_q_sf = nvfp4_quantize_per_block_16(activated, 1.0)
+        activated_rt = _dequant_nvfp4(fc1_q, fc1_q_sf, logical_cols=intermediate)
 
         fc2_w = _dequant_nvfp4(
             fc2_weight[expert], fc2_sf[expert], logical_cols=intermediate
         )  # (hidden, I)
-        fc2_out = swiglu_rt @ fc2_w.transpose(0, 1)
+        fc2_out = activated_rt @ fc2_w.transpose(0, 1)
         if term_transform is not None:
             fc2_out = term_transform(fc2_out)
         out[tokens, slots] = fc2_out
@@ -458,6 +462,112 @@ def test_nvfp4_kernel_matches_torch_reference(
         # rel_l2≈0.0027 on GB200; kernel is bit-exact vs the CuTeDSL reference
         # launcher on the same operands). atol scales with the output range
         # (random unscaled weights put |y|~1e4 here).
+        atol = 2e-3 * yr.abs().max().item()
+        torch.testing.assert_close(yk, yr, atol=atol, rtol=0.05)
+        assert rel_l2.item() < 0.02
+    finally:
+        symm_buffer.destroy()
+
+
+@pytest.mark.arch_blackwell
+def test_nvfp4_relu2_kernel_matches_torch_reference(monkeypatch):
+    """ReLU2 specialization matches an independent oracle at Nemotron I/H."""
+    _require_cuda()
+
+    import torch
+
+    cap = torch.cuda.get_device_capability()
+    if cap[0] != 10:
+        pytest.skip(
+            f"nvfp4_mega_moe requires sm_100a or sm_103a; got sm_{cap[0]}{cap[1]}"
+        )
+    pytest.importorskip("triton")
+
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.staging import (
+        stage_mega_moe_inputs,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
+        preprocess_mega_weights,
+    )
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+        get_symm_buffer_for_mega_moe,
+        nvfp4_mega_moe,
+    )
+
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    # Exact Nemotron latent expert dimensions and top-k. 32 experts keep this a
+    # practical single-GPU gate while exercising the target K=22 compile path;
+    # the full E=512, DEP4 geometry remains a serving E2E gate.
+    problem = _single_rank_problem(
+        hidden=1024,
+        intermediate=2688,
+        num_experts=32,
+        topk=22,
+    )
+    problem["gate_up_clamp"] = None
+    semantic_w1 = problem["w13"][:, : problem["intermediate"]].contiguous()
+    padded_w1 = torch.cat((semantic_w1, torch.zeros_like(semantic_w1)), dim=1)
+
+    transformed_l1, transformed_l2 = preprocess_mega_weights(
+        MoEWeightPack(w13=semantic_w1, w2=problem["w2"]),
+        intermediate_size=problem["intermediate"],
+        hidden_size=problem["hidden"],
+        activation="relu2",
+    )
+    oracle_problem = {**problem, "w13": padded_w1}
+    fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_nvfp4_from_bf16(oracle_problem)
+
+    num_tokens = problem["num_tokens"]
+    symm_buffer = get_symm_buffer_for_mega_moe(
+        problem["num_experts"],
+        problem["max_tokens"],
+        problem["topk"],
+        problem["hidden"],
+        2 * problem["intermediate"],
+        0,
+        1,
+        activation="relu2",
+    )
+    try:
+        stage_mega_moe_inputs(
+            problem["hidden_states"],
+            problem["topk_weights"],
+            problem["topk_ids"],
+            symm_buffer.x,
+            symm_buffer.x_sf,
+            symm_buffer.topk_idx,
+            symm_buffer.topk_weights,
+        )
+        y_ref = _torch_nvfp4_mega_reference(
+            act_packed=symm_buffer.x[:num_tokens],
+            act_sf=symm_buffer.x_sf[:num_tokens],
+            topk_idx=symm_buffer.topk_idx[:num_tokens],
+            topk_weights=symm_buffer.topk_weights[:num_tokens],
+            fc1_weight=fc1_plain,
+            fc1_sf=fc1_sf,
+            fc2_weight=fc2_plain,
+            fc2_sf=fc2_sf,
+            hidden=problem["hidden"],
+            intermediate=problem["intermediate"],
+            gate_up_clamp=None,
+            activation="relu2",
+        )
+        y_kernel = torch.empty(
+            num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"
+        )
+        nvfp4_mega_moe(
+            y_kernel,
+            transformed_l1,
+            transformed_l2,
+            symm_buffer,
+            num_tokens=num_tokens,
+        )
+        torch.cuda.synchronize()
+
+        assert torch.isfinite(y_kernel).all()
+        yk, yr = y_kernel.float(), y_ref.float()
+        rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
         atol = 2e-3 * yr.abs().max().item()
         torch.testing.assert_close(yk, yr, atol=atol, rtol=0.05)
         assert rel_l2.item() < 0.02

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Literal, Tuple
 
 from ......weights import MoEWeightPack, PrequantizedMoEWeights
 
@@ -99,11 +99,66 @@ def _interleave_gate_up_16(
     return out.contiguous()
 
 
+def _pad_relu2_fc1_plane(
+    tensor: "torch.Tensor",
+    *,
+    intermediate_size: int,
+    name: str,
+) -> "torch.Tensor":
+    """Append the ignored I-wide padding plane required by the 2*I kernel.
+
+    ReLU2 checkpoints expose exactly one semantic W1 plane.  Accepting an
+    already-expanded tensor would make it impossible to prove what occupies
+    the second plane, so the ReLU2 path deliberately requires shape ``I`` and
+    creates its own all-zero padding.
+    """
+    if tensor.ndim != 3 or tensor.shape[1] != intermediate_size:
+        raise ValueError(
+            f"ReLU2 {name} must have semantic intermediate dimension "
+            f"{intermediate_size} (the backend pads it to "
+            f"{2 * intermediate_size} internally), got {tuple(tensor.shape)}"
+        )
+    import torch
+
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is not None and tensor.dtype == fp4_dtype:
+        # torch.cat has no Float4 kernel; each packed Float4 storage element is
+        # one byte, so concatenate through the byte view without changing the
+        # logical packed shape.
+        byte_view = tensor.view(torch.uint8)
+        return (
+            torch.cat((byte_view, torch.zeros_like(byte_view)), dim=1)
+            .contiguous()
+            .view(fp4_dtype)
+        )
+    return torch.cat((tensor, torch.zeros_like(tensor)), dim=1).contiguous()
+
+
+def relu2_reference_from_internal_fc1(
+    internal_fc1: "torch.Tensor",
+    *,
+    alpha: "torch.Tensor | float | None" = None,
+) -> "torch.Tensor":
+    """Torch oracle for the padded FC1 contract used by ReLU2 MegaMoE.
+
+    ``internal_fc1[..., :I]`` is semantic; ``[..., I:]`` is ignored.  This
+    helper intentionally mirrors the device specialization and is used by the
+    focused source tests and hardware oracle.
+    """
+    if internal_fc1.shape[-1] % 2 != 0:
+        raise ValueError("internal FC1 output must have an even trailing dimension")
+    semantic, _padding = internal_fc1.chunk(2, dim=-1)
+    if alpha is not None:
+        semantic = semantic * alpha
+    return semantic.clamp_min(0).square()
+
+
 def preprocess_mega_weights(
     weights: "MoEWeightPack",
     *,
     intermediate_size: int,
     hidden_size: int,
+    activation: Literal["swiglu", "relu2"] = "swiglu",
     gate_up_clamp: float | None = None,
     activation_clamp: float | None = None,
 ) -> TransformedMegaWeights:
@@ -116,12 +171,20 @@ def preprocess_mega_weights(
         _stack_byte_reinterpretable_tensors,
     )
 
+    if activation not in ("swiglu", "relu2"):
+        raise ValueError(f"activation must be 'swiglu' or 'relu2', got {activation!r}.")
     # Reject conflicting clamp aliases; the clamp itself is a kernel-side
     # nonlinearity parameter and must NOT scale the weight quantization.
     _resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp,
         activation_clamp=activation_clamp,
     )
+    if activation == "relu2" and (
+        gate_up_clamp is not None or activation_clamp is not None
+    ):
+        raise ValueError(
+            "ReLU2 MegaMoE does not support gate_up_clamp or activation_clamp."
+        )
     # Kernel contract (see src alpha_swiglu_clamp): the fc1 raw accumulator is
     # dequanted to REAL values by fc1_alpha (default 1.0) before clamp+SwiGLU,
     # so weight SFs must be unscaled (norm_const=1.0). Quantizing with
@@ -132,31 +195,40 @@ def preprocess_mega_weights(
     fc1_out = 2 * intermediate_size
     num_experts = weights.w13.shape[0]
 
+    w13 = weights.w13
+    w13_scale = weights.w13_scale
+    if activation == "relu2":
+        w13 = _pad_relu2_fc1_plane(
+            w13,
+            intermediate_size=intermediate_size,
+            name="w13",
+        )
+        if isinstance(weights, PrequantizedMoEWeights):
+            w13_scale = _pad_relu2_fc1_plane(
+                weights.w13_scale,
+                intermediate_size=intermediate_size,
+                name="w13_scale",
+            )
+
     logical_w13_shape = (num_experts, fc1_out, hidden_size)
     logical_w2_shape = (num_experts, hidden_size, intermediate_size)
     packed_w13_shape = (num_experts, fc1_out, hidden_size // 2)
     packed_w2_shape = (num_experts, hidden_size, intermediate_size // 2)
 
     if isinstance(weights, PrequantizedMoEWeights):
-        if (
-            weights.w13.shape == packed_w13_shape
-            and weights.w2.shape == packed_w2_shape
-        ):
-            if not _is_packed_nvfp4_weight(weights.w13) or not _is_packed_nvfp4_weight(
+        if w13.shape == packed_w13_shape and weights.w2.shape == packed_w2_shape:
+            if not _is_packed_nvfp4_weight(w13) or not _is_packed_nvfp4_weight(
                 weights.w2
             ):
                 raise ValueError(
                     "packed NVFP4 weights must be torch.uint8 or torch.float4_e2m1fn_x2"
                 )
-        elif (
-            weights.w13.shape != logical_w13_shape
-            or weights.w2.shape != logical_w2_shape
-        ):
+        elif w13.shape != logical_w13_shape or weights.w2.shape != logical_w2_shape:
             raise ValueError(
                 "pre-quantized w13/w2 must have packed shapes "
                 f"{packed_w13_shape} / {packed_w2_shape} or legacy logical "
                 f"shapes {logical_w13_shape} / {logical_w2_shape}; got "
-                f"{tuple(weights.w13.shape)} / {tuple(weights.w2.shape)}"
+                f"{tuple(w13.shape)} / {tuple(weights.w2.shape)}"
             )
         expected_w13_scale_shape = (
             num_experts,
@@ -168,19 +240,20 @@ def preprocess_mega_weights(
             hidden_size,
             intermediate_size // 16,
         )
-        if weights.w13_scale.shape != expected_w13_scale_shape:
+        assert w13_scale is not None
+        if w13_scale.shape != expected_w13_scale_shape:
             raise ValueError(
                 f"w13_scale must have shape {expected_w13_scale_shape}, "
-                f"got {tuple(weights.w13_scale.shape)}"
+                f"got {tuple(w13_scale.shape)}"
             )
         if weights.w2_scale.shape != expected_w2_scale_shape:
             raise ValueError(
                 f"w2_scale must have shape {expected_w2_scale_shape}, "
                 f"got {tuple(weights.w2_scale.shape)}"
             )
-        w13 = _interleave_gate_up_16(weights.w13, intermediate_size=intermediate_size)
+        w13 = _interleave_gate_up_16(w13, intermediate_size=intermediate_size)
         w13_scale = _interleave_gate_up_16(
-            weights.w13_scale, intermediate_size=intermediate_size
+            w13_scale, intermediate_size=intermediate_size
         )
         # Keep the transpose as a view so the kernel's K axis remains stride-1.
         # Materializing the logical (E, K, N) view would make N stride-1.
@@ -197,16 +270,15 @@ def preprocess_mega_weights(
         fc1_sf_parts = []
         fc2_q_parts = []
         fc2_sf_parts = []
-        if weights.w13.shape != logical_w13_shape:
+        if w13.shape != logical_w13_shape:
             raise ValueError(
-                f"w13 must have shape {logical_w13_shape}, "
-                f"got {tuple(weights.w13.shape)}"
+                f"w13 must have shape {logical_w13_shape}, got {tuple(w13.shape)}"
             )
         if weights.w2.shape != logical_w2_shape:
             raise ValueError(
                 f"w2 must have shape {logical_w2_shape}, got {tuple(weights.w2.shape)}"
             )
-        w13 = _interleave_gate_up_16(weights.w13, intermediate_size=intermediate_size)
+        w13 = _interleave_gate_up_16(w13, intermediate_size=intermediate_size)
         for expert in range(num_experts):
             fc1_q, fc1_sf = _quantize_expert_weights(
                 w13[expert],
@@ -326,5 +398,6 @@ __all__ = [
     "MoEWeightPack",
     "TransformedMegaWeights",
     "preprocess_mega_weights",
+    "relu2_reference_from_internal_fc1",
     "validate_transformed_mega_weights",
 ]

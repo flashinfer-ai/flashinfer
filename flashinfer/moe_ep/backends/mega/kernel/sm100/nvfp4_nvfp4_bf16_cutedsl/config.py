@@ -15,7 +15,9 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
 
     Expert weights must be NVFP4 at kernel launch; supply bf16 ``MoEWeightPack``
     and enable ``MegaConfig.preprocess_weights`` (default), or pass pre-quantized
-    NVFP4 weights with ``w13_scale`` / ``w2_scale``.
+    NVFP4 weights with ``w13_scale`` / ``w2_scale``. ``activation="relu2"``
+    accepts a semantic I-wide W1 plane and expands it to the kernel's physical
+    2*I FC1 layout with an ignored zero padding plane.
     """
 
     intermediate_size: int
@@ -46,3 +48,18 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # shim.autotune candidate set on the live problem and keep the winner
     # (one cute.compile per candidate, paid once per session).
     knobs: dict | str | None = None
+    # Appended for positional-constructor compatibility with the original
+    # dataclass field order. New integrations should always pass it by name.
+    activation: Literal["swiglu", "relu2"] = "swiglu"
+
+    def __post_init__(self) -> None:
+        if self.activation not in ("swiglu", "relu2"):
+            raise ValueError(
+                f"activation must be 'swiglu' or 'relu2', got {self.activation!r}."
+            )
+        if self.activation == "relu2" and (
+            self.gate_up_clamp is not None or self.activation_clamp is not None
+        ):
+            raise ValueError(
+                "ReLU2 MegaMoE does not support gate_up_clamp or activation_clamp."
+            )

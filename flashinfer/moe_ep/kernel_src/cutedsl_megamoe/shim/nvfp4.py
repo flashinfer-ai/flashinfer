@@ -41,6 +41,7 @@ Single-rank smoke (no NVSHMEM)::
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 import warnings
 from dataclasses import dataclass, field
@@ -76,6 +77,8 @@ COMBINE_FORMAT_NAMES = {
     "nvfp4": "16e2m1xbf16",
 }
 
+_logger = logging.getLogger(__name__)
+
 
 @dataclasses.dataclass(frozen=True)
 class MegaMoENvfp4Config:
@@ -108,6 +111,9 @@ class MegaMoENvfp4Config:
     apply_topk_in_fc1: bool = True
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
+    # Appended for compatibility with positional construction of every
+    # pre-existing config field. New callers should pass this by name.
+    activation: Literal["swiglu", "relu2"] = "swiglu"
 
     def __post_init__(self) -> None:
         if self.world_size < 1:
@@ -128,6 +134,12 @@ class MegaMoENvfp4Config:
                 "num_total_experts must be divisible by world_size "
                 f"({self.num_total_experts} % {self.world_size} != 0)."
             )
+        if self.activation not in ("swiglu", "relu2"):
+            raise ValueError(
+                f"activation must be 'swiglu' or 'relu2', got {self.activation!r}."
+            )
+        if self.activation == "relu2" and self.gate_up_clamp is not None:
+            raise ValueError("ReLU2 MegaMoE does not support gate_up_clamp.")
         # The GEMM tiles are tail-safe (ceil-div K/M loops, TMA OOB zero-fill,
         # predicated epilogue stores); 64 covers the TMA 16B row alignment and
         # SF-word packing. 128-misaligned shapes exist (gpt-oss: 2880).
@@ -244,6 +256,8 @@ class MegaMoENvfp4Frontend:
 
     def set_gate_up_clamp(self, clamp: Optional[float]) -> None:
         """Update ``gate_up_clamp`` and invalidate compile cache when it changes."""
+        if self.config.activation == "relu2" and clamp is not None:
+            raise ValueError("ReLU2 MegaMoE does not support gate_up_clamp.")
         if self._gate_up_clamp == clamp:
             return
         ensure_not_capturing("set_gate_up_clamp (clamp change)")
@@ -425,6 +439,7 @@ class MegaMoENvfp4Frontend:
             c.num_total_experts,
             c.hidden,
             c.intermediate,
+            c.activation,
             c.mma_tiler_mnk,
             c.cluster_shape_mnk,
             c.use_2cta_instrs,
@@ -478,7 +493,17 @@ class MegaMoENvfp4Frontend:
         max_active_clusters = max(1, sm_count // max(cluster_size, 1))
         group_hint = c.group_hint if c.group_hint is not None else max_active_clusters
 
-        kernel = Sm100MegaMoEKernel(
+        _logger.info(
+            "Compiling NVFP4 MegaMoE activation=%s semantic_intermediate=%d "
+            "internal_fc1=%d hidden=%d experts=%d topk=%d",
+            c.activation,
+            c.intermediate // 2,
+            c.intermediate,
+            c.hidden,
+            c.num_total_experts,
+            c.num_topk,
+        )
+        kernel_kwargs = dict(
             mma_tiler_mnk=c.mma_tiler_mnk,
             cluster_shape_mnk=c.cluster_shape_mnk,
             use_2cta_instrs=c.use_2cta_instrs,
@@ -504,6 +529,16 @@ class MegaMoENvfp4Frontend:
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
         )
+        if c.activation == "relu2":
+            from .relu2 import make_sm100_relu2_megamoe_kernel
+
+            # Keep the callable's runtime type exactly Sm100MegaMoEKernel.
+            # CuTeDSL otherwise resolves the vendor __call__'s nested super()
+            # against the shim subclass and recursively re-enters it with the
+            # FC12-only ``fc1_output`` keyword.
+            kernel = make_sm100_relu2_megamoe_kernel(**kernel_kwargs)
+        else:
+            kernel = Sm100MegaMoEKernel(**kernel_kwargs)
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(
@@ -978,6 +1013,8 @@ class MegaMoESymmBuffer:
     _frontend: MegaMoENvfp4Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
+    # Appended so legacy positional construction retains its field order.
+    activation: Literal["swiglu", "relu2"] = "swiglu"
 
     def destroy(self) -> None:
         """Release symmetric-heap allocations and compiled kernel workspaces."""
@@ -1003,6 +1040,7 @@ def get_symm_buffer_for_mega_moe(
     rank: int,
     world_size: int,
     *,
+    activation: Literal["swiglu", "relu2"] = "swiglu",
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     apply_topk_in_fc1: bool = True,
@@ -1019,8 +1057,11 @@ def get_symm_buffer_for_mega_moe(
     sizes first).  Pass ``rank`` / ``world_size`` from :func:`init_dist` instead
     of a ``ProcessGroup`` — NVSHMEM bootstrap is handled internally.
 
-    ``gate_up_clamp`` sets the kernel gate-up clamp.  ``activation_clamp`` is a
-    deprecated alias for ``gate_up_clamp``.
+    ``activation`` selects the FC1 nonlinearity. ``"swiglu"`` preserves the
+    historical two-plane gate/up behavior. ``"relu2"`` treats the first plane
+    as the semantic W1 projection and provably ignores the zero-padded second
+    plane. ``gate_up_clamp`` (and its deprecated ``activation_clamp`` alias)
+    are valid only for SwiGLU.
 
     ``apply_topk_in_fc1`` mirrors ``mega_runner``'s
     ``ref_compute_graph == "deepgemm"`` behaviour when ``True`` (default).
@@ -1054,10 +1095,16 @@ def get_symm_buffer_for_mega_moe(
     if num_total_experts % world_size != 0:
         raise ValueError("num_total_experts must be divisible by world_size.")
 
+    if activation not in ("swiglu", "relu2"):
+        raise ValueError(f"activation must be 'swiglu' or 'relu2', got {activation!r}.")
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp,
         activation_clamp=activation_clamp,
     )
+    if activation == "relu2" and clamp is not None:
+        raise ValueError(
+            "ReLU2 MegaMoE does not support gate_up_clamp or activation_clamp."
+        )
     num_experts_per_rank = num_total_experts // world_size
 
     from .knob_cache import resolve_knobs
@@ -1078,6 +1125,7 @@ def get_symm_buffer_for_mega_moe(
             topk=num_topk,
             max_tokens=num_max_tokens,
             combine_dtype=combine_dtype,
+            activation=activation,
         )
     if knob_source == "heuristic" and combine_dtype != "bf16":
         # The measured profiles pick the token-back mode freely, but a
@@ -1094,6 +1142,7 @@ def get_symm_buffer_for_mega_moe(
         num_total_experts=num_total_experts,
         hidden=hidden,
         intermediate=intermediate,
+        activation=activation,
         gate_up_clamp=clamp,
         apply_topk_in_fc1=apply_topk_in_fc1,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
@@ -1164,6 +1213,7 @@ def get_symm_buffer_for_mega_moe(
         num_topk=num_topk,
         hidden=hidden,
         intermediate=intermediate,
+        activation=activation,
         rank=rank,
         world_size=world_size,
         x=x,
@@ -1448,6 +1498,7 @@ def create_dummy_inputs(
     hidden: int,
     intermediate: int,
     *,
+    activation: Literal["swiglu", "relu2"] = "swiglu",
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
@@ -1497,6 +1548,7 @@ def create_dummy_inputs(
         intermediate,
         rank,
         world_size,
+        activation=activation,
         gate_up_clamp=clamp,
         combine_dtype=combine_dtype,
         fc1_alpha=fc1_alpha,

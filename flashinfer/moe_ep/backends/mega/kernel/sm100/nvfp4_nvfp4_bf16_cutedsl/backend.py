@@ -9,6 +9,7 @@ to skip re-quantization.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -34,6 +35,9 @@ if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
 
 
+_logger = logging.getLogger(__name__)
+
+
 def _resolve_gate_up_clamp(
     config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
 ) -> float | None:
@@ -52,6 +56,13 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         super().__init__(config)
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
         self._thunk_state: tuple | None = None
+        _logger.info(
+            "Configured NVFP4 MegaMoE activation=%s semantic_intermediate=%d "
+            "internal_fc1=%d",
+            config.activation,
+            config.intermediate_size,
+            2 * config.intermediate_size,
+        )
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.
         self._autotune_pending = config.knobs == "auto"
@@ -100,6 +111,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
+            activation=self._kernel_config.activation,
             gate_up_clamp=_resolve_gate_up_clamp(self._kernel_config),
             activation_clamp=self._kernel_config.activation_clamp,
         )
@@ -131,6 +143,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             2 * k.intermediate_size,
             self.ep_rank,
             self.ep_world_size,
+            activation=k.activation,
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             apply_topk_in_fc1=k.apply_topk_in_fc1,
@@ -340,6 +353,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             k.top_k,
             fp.token_hidden_size,
             2 * k.intermediate_size,
+            k.activation,
             _resolve_gate_up_clamp(k),
             k.apply_topk_in_fc1,
             k.in_kernel_fc2_reduce,

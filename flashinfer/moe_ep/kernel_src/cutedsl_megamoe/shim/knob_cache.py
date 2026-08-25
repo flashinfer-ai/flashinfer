@@ -23,6 +23,7 @@ disable the cache entirely), default
      "entries": [{"device": "NVIDIA GB200", "dtype": "nvfp4",
                   "world_size": 4, "hidden": 7168, "intermediate": 2048,
                   "num_experts": 256, "topk": 8, "combine_dtype": "bf16",
+                  "activation": "swiglu",
                   "max_tokens": 2048, "knobs": {...},
                   "p50_us": 585.0, "source": "autotune",
                   "tuned_at": "2026-07-16T12:00:00"}, ...]}
@@ -54,6 +55,7 @@ _KEY_FIELDS = (
     "num_experts",
     "topk",
     "combine_dtype",
+    "activation",
 )
 
 
@@ -111,7 +113,16 @@ def _load_entries(path: str) -> List[Dict[str, Any]]:
         return []
     # Drop non-dict elements too: lookup_knobs/record_knobs call e.get() on
     # every entry, and a corrupted-but-valid-JSON cache must degrade, not raise.
-    return [e for e in entries if isinstance(e, dict)]
+    normalized = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        entry = dict(entry)
+        # Entries written before activation became a kernel specialization are
+        # SwiGLU entries. Preserve them without allowing reuse for ReLU2.
+        entry.setdefault("activation", "swiglu")
+        normalized.append(entry)
+    return normalized
 
 
 def _knobs_to_json(knobs: Dict[str, Any]) -> Dict[str, Any]:
@@ -134,6 +145,7 @@ def lookup_knobs(
     max_tokens: int,
     combine_dtype: str = "bf16",
     device: Optional[str] = None,
+    activation: str = "swiglu",
 ) -> Optional[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss."""
     path = _cache_path()
@@ -148,6 +160,7 @@ def lookup_knobs(
         num_experts=num_experts,
         topk=topk,
         combine_dtype=combine_dtype,
+        activation=activation,
     )
     matches = [
         e
@@ -180,6 +193,7 @@ def record_knobs(
     device: Optional[str] = None,
     p50_us: Optional[float] = None,
     source: str = "autotune",
+    activation: str = "swiglu",
 ) -> Optional[str]:
     """Upsert one tuned entry (exact key incl. ``max_tokens``); atomic write.
 
@@ -199,6 +213,7 @@ def record_knobs(
         num_experts=num_experts,
         topk=topk,
         combine_dtype=combine_dtype,
+        activation=activation,
         max_tokens=max_tokens,
         knobs=_knobs_to_json(knobs),
         p50_us=p50_us,
@@ -248,6 +263,7 @@ def resolve_knobs(
     topk: int,
     max_tokens: int,
     combine_dtype: str = "bf16",
+    activation: str = "swiglu",
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else built-in heuristic.
 
@@ -264,6 +280,7 @@ def resolve_knobs(
         topk=topk,
         max_tokens=max_tokens,
         combine_dtype=combine_dtype,
+        activation=activation,
     )
     if cached is not None:
         return cached, "cache"
