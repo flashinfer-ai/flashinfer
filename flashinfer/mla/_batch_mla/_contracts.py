@@ -253,13 +253,24 @@ def _are_adjacent_last_dim_views(left: torch.Tensor, right: torch.Tensor) -> boo
 
 
 def _validate_packed_structural_input(
-    packed: torch.Tensor, *, widths: tuple[int, int], name: str
+    packed: torch.Tensor,
+    *,
+    widths: tuple[int, int],
+    name: str,
+    expected_dtype: Optional[torch.dtype] = None,
+    planned_dtype_name: Optional[str] = None,
 ) -> tuple[torch.dtype, tuple[int, ...]]:
     if packed.ndim != 3:
         raise ValueError(f"packed {name} must have rank 3.")
     if packed.shape[-1] != sum(widths):
         raise ValueError(
             f"packed {name} last dimension does not match planned split widths."
+        )
+    if expected_dtype is not None and packed.dtype != expected_dtype:
+        assert planned_dtype_name is not None
+        raise ValueError(
+            f"{name}.dtype={packed.dtype} does not match the planned "
+            f"{planned_dtype_name}={expected_dtype}."
         )
     return packed.dtype, tuple(packed.shape)
 
@@ -278,15 +289,15 @@ def _validate_split_structural_input(
         raise ValueError(f"split {name} tensors must have rank 3.")
     if left.shape[:-1] != right.shape[:-1]:
         raise ValueError(f"split {name} tensor shapes must match before the last axis.")
+    if expected_dtype is not None:
+        assert planned_dtype_name is not None and split_leaf_names is not None
+        for leaf, leaf_name in zip((left, right), split_leaf_names, strict=True):
+            if leaf.dtype != expected_dtype:
+                raise ValueError(
+                    f"{leaf_name}.dtype={leaf.dtype} does not match the planned "
+                    f"{planned_dtype_name}={expected_dtype}."
+                )
     if left.dtype != right.dtype:
-        if expected_dtype is not None:
-            assert planned_dtype_name is not None and split_leaf_names is not None
-            for leaf, leaf_name in zip((left, right), split_leaf_names, strict=True):
-                if leaf.dtype != expected_dtype:
-                    raise ValueError(
-                        f"{leaf_name}.dtype={leaf.dtype} does not match the planned "
-                        f"{planned_dtype_name}={expected_dtype}."
-                    )
         raise ValueError(f"split {name} tensor dtypes must match.")
     if left.device != right.device:
         raise ValueError(f"split {name} tensor devices must match.")
@@ -324,11 +335,19 @@ def _split_packed_last_dim(
     widths: tuple[int, int],
     *,
     name: str,
+    expected_dtype: Optional[torch.dtype] = None,
+    planned_dtype_name: Optional[str] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     left_width, right_width = widths
     if left_width <= 0 or right_width < 0:
         raise ValueError("left split width must be positive and right non-negative.")
-    _validate_packed_structural_input(packed, widths=widths, name=name)
+    _validate_packed_structural_input(
+        packed,
+        widths=widths,
+        name=name,
+        expected_dtype=expected_dtype,
+        planned_dtype_name=planned_dtype_name,
+    )
     return packed[..., :left_width], packed[..., left_width:]
 
 
@@ -401,9 +420,21 @@ def _resolve_structural_mla_input(
             )
             return split
         assert packed is not None
-        return _split_packed_last_dim(packed, widths, name=name)
+        return _split_packed_last_dim(
+            packed,
+            widths,
+            name=name,
+            expected_dtype=expected_dtype,
+            planned_dtype_name=planned_dtype_name,
+        )
     if packed is not None:
-        _validate_packed_structural_input(packed, widths=widths, name=name)
+        _validate_packed_structural_input(
+            packed,
+            widths=widths,
+            name=name,
+            expected_dtype=expected_dtype,
+            planned_dtype_name=planned_dtype_name,
+        )
         return packed
     assert split is not None
     _validate_split_structural_input(
