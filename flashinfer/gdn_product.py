@@ -435,23 +435,23 @@ def gated_delta_product_mtp(
     expanded_a.fill_(GATE_NEUTRAL_A_SENTINEL)
     expanded_a[:, ::num_householder] = a
 
+    _o_shape = (
+        expanded_q.size(0),
+        expanded_q.size(1),
+        max(q.size(2), v.size(2)),
+        v.size(3),
+    )
     if expanded_output is None:
         expanded_output = torch.empty(
-            expanded_q.size(0),
-            expanded_q.size(1),
-            max(q.size(2), v.size(2)),
-            q.size(3),
+            *_o_shape,
             # kernel hardcodes bf16...
             dtype=torch.bfloat16,
             device=output.device if output is not None else q.device,
         )
-    elif expanded_output.shape != (
-        expanded_q.size(0),
-        expanded_q.size(1),
-        max(q.size(2), v.size(2)),
-        q.size(3),
-    ):
-        raise ValueError("expanded_output shape must be [B, T*n_h, num_o_heads,  D]")
+    elif expanded_output.shape != _o_shape:
+        raise ValueError(
+            f"expanded_output shape must be {_o_shape} [B, T*n_h, num_o_heads, V]"
+        )
 
     if ssm_state_indices is not None:
         if expanded_ssm_state_indices is None:

@@ -230,24 +230,27 @@ def test_decode_nh1_matches_gdn_mtp(T):
     "num_householder", [1, 2, 3], ids=lambda nh: f"num_householder={nh}"
 )
 @pytest.mark.parametrize("T", [1, 2, 4], ids=lambda t: f"T={t}")
-@pytest.mark.parametrize("head_size", [64, 128], ids=lambda hs: f"head_size={hs}")
+@pytest.mark.parametrize(
+    "head_size",
+    [(64, 64), (128, 128), (128, 64)],
+    ids=lambda kv: f"K={kv[0]}_V={kv[1]}",
+)
 @pytest.mark.parametrize(
     "num_heads",
-    # (q, v). (16, 32) is the ONLY config test_decode_delta_rule.py exercises for
-    # MTP, and the tile heuristics (get_tile_v_mtp) are parameterised on HV --
-    # smaller head counts are outside the kernel's tested envelope.
     [(16, 32)],
     ids=lambda qkv: "num_heads={0}/{1}".format(*qkv),
 )
 def test_decode_matches_reference(num_householder, T, head_size, num_heads):
+    K, V = head_size
     _skip_if_unsupported()
     # n_h=1, T=1 is included deliberately. gated_delta_rule_mtp documents itself
     # as T > 1 in seven places and enforces it nowhere, but T=1 is computed
     # correctly -- verified against the first token of a T=2 run (max|d| = 0).
     # The docs are over-restrictive; the code is not.
-    _skip_if_head_size_unsupported(head_size)
+    _skip_if_head_size_unsupported(K)
+    _skip_if_head_size_unsupported(V)
     num_q_heads, num_v_heads = num_heads
-    B, K, V = 3, head_size, head_size
+    B = 3
     n_h = num_householder
     device, dtype = torch.device("cuda"), torch.bfloat16
 
