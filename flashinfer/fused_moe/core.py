@@ -2217,7 +2217,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                             self.activation_type,
                         )
                     )
-                    moe_op.trtllm_fp8_per_channel_scale_moe(
+                    result = moe_op.trtllm_fp8_per_channel_scale_moe(
                         routing_logits,
                         topk_ids,
                         topk_weights,
