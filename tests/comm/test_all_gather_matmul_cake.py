@@ -20,9 +20,7 @@ def test_backend_entrypoint_rejects_non_cake_route():
     backend = _backend()
 
     with pytest.raises(ValueError, match="exactly 'cake'"):
-        backend.all_gather_matmul_cake(
-            object(), object(), object(), backend="auto"
-        )
+        backend.all_gather_matmul_cake(object(), object(), object(), backend="auto")
 
 
 def _manifest(backend, source: bytes, arch: str):

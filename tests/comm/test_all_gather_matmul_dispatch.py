@@ -79,9 +79,7 @@ def test_explicit_cake_backend_forwards_exact_subgroup(monkeypatch):
     result = object()
     calls = []
 
-    def fake_backend(
-        actual_inp, actual_weight, actual_group, *, backend, verbose
-    ):
+    def fake_backend(actual_inp, actual_weight, actual_group, *, backend, verbose):
         calls.append((actual_inp, actual_weight, actual_group, backend, verbose))
         return result
 

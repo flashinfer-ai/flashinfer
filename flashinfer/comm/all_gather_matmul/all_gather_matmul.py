@@ -77,9 +77,7 @@ def all_gather_matmul(
     if backend == "cake":
         from .cake_all_gather_matmul import all_gather_matmul_cake
 
-        return all_gather_matmul_cake(
-            inp, w, group, backend="cake", verbose=verbose
-        )
+        return all_gather_matmul_cake(inp, w, group, backend="cake", verbose=verbose)
     if backend != "auto":
         raise ValueError("backend must be exactly 'auto' or 'cake'")
     major, _ = torch.cuda.get_device_capability(inp.device)
