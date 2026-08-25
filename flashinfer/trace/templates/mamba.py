@@ -168,3 +168,221 @@ selective_state_update_trace = TraceTemplate(
     reference=_selective_state_update_reference,
     init=_selective_state_update_init,
 )
+
+
+class _SSDCombinedTraceTemplate(TraceTemplate):
+    """SSDCombined schema with the public state-dtype precedence rule."""
+
+    def build_fi_trace_fn(self, fi_api: str):
+        build_definition = super().build_fi_trace_fn(fi_api)
+
+        def fi_trace(save_dir=None, name=None, **kwargs):
+            kwargs = dict(kwargs)
+            state_dtype_source = kwargs.get("initial_states")
+            if state_dtype_source is None:
+                state_dtype_source = kwargs.get("checkpoint_states")
+            kwargs["_ssd_state_dtype_source"] = state_dtype_source
+            return build_definition(save_dir=save_dir, name=name, **kwargs)
+
+        return fi_trace
+
+
+_SSD_COMBINED_COMMON_AXES: dict[str, Var | Const] = {
+    "batch_size": Var(description="Input batch size."),
+    "seqlen": Var(description="Tokens per batch row."),
+    "nheads": Const(abbrev="h", description="Number of SSD heads."),
+    "headdim": Const(abbrev="d", description="Per-head feature dimension."),
+    "ngroups": Const(abbrev="g", description="Number of B/C state groups."),
+    "dstate": Const(abbrev="s", description="Recurrent state dimension."),
+    "nchunks": Var(description="Physical chunks per batch row."),
+    "chunk_size": Const(value=128, abbrev=""),
+    "num_checkpoints": Var(description="Rows in caller-owned checkpoint storage."),
+}
+
+
+def _make_ssd_combined_trace(
+    mode: str,
+    d_layout: str,
+    return_final_states: bool,
+) -> TraceTemplate:
+    axes: dict[str, Var | Const] = dict(_SSD_COMBINED_COMMON_AXES)
+    inputs: dict[str, Tensor | Scalar] = {
+        "x": Tensor(["batch_size", "seqlen", "nheads", "headdim"]),
+        "dt": Tensor(["batch_size", "seqlen", "nheads"]),
+        "A": Tensor(["nheads"], dtype="float32"),
+        "B": Tensor(["batch_size", "seqlen", "ngroups", "dstate"]),
+        "C": Tensor(["batch_size", "seqlen", "ngroups", "dstate"]),
+    }
+    if d_layout == "vector":
+        inputs["D"] = Tensor(["nheads"], dtype="bfloat16")
+    elif d_layout == "matrix":
+        inputs["D"] = Tensor(["nheads", "headdim"], dtype="bfloat16")
+    elif d_layout != "none":
+        raise ValueError(f"unsupported SSDCombined D layout: {d_layout}")
+
+    inputs.update(
+        {
+            "z": Tensor(
+                ["batch_size", "seqlen", "nheads", "headdim"],
+                dtype="bfloat16",
+                optional=True,
+            ),
+            "dt_bias": Tensor(["nheads"], dtype="float32", optional=True),
+            "dt_softplus": Scalar("bool", optional=True),
+        }
+    )
+
+    if mode == "varlen":
+        axes.update(
+            {
+                "num_sequences": Var(description="Packed sequence count."),
+                "num_logical_chunks": Var(
+                    description="Number of logical packed segments."
+                ),
+                "seq_chunk_cumsum_size": Var(
+                    description="Length of the optional prefix-sum buffer."
+                ),
+            }
+        )
+        state_batch_axis = "num_sequences"
+        inputs.update(
+            {
+                "initial_states": Tensor(
+                    ["num_sequences", "nheads", "headdim", "dstate"],
+                    optional=True,
+                ),
+                "seq_idx": Tensor(["batch_size", "seqlen"]),
+                "chunk_indices": Tensor(["num_logical_chunks"], dtype="int32"),
+                "chunk_offsets": Tensor(["num_logical_chunks"], dtype="int32"),
+                "seq_chunk_cumsum": Tensor(
+                    ["seq_chunk_cumsum_size"], dtype="int32", optional=True
+                ),
+                "update_seq_chunk_cumsum": Scalar("bool", optional=True),
+            }
+        )
+    elif mode == "batched":
+        state_batch_axis = "batch_size"
+        inputs["initial_states"] = Tensor(
+            ["batch_size", "nheads", "headdim", "dstate"],
+            optional=True,
+        )
+    else:
+        raise ValueError(f"unsupported SSDCombined trace mode: {mode}")
+
+    inputs.update(
+        {
+            "checkpoint_token_indices": Tensor(
+                [state_batch_axis], dtype="int32", optional=True
+            ),
+            "checkpoint_state_slots": Tensor(
+                [state_batch_axis], dtype="int32", optional=True
+            ),
+            "checkpoint_states": Tensor(
+                ["num_checkpoints", "nheads", "headdim", "dstate"],
+                optional=True,
+            ),
+            "out": Tensor(
+                [
+                    "batch_size",
+                    "nheads",
+                    "headdim",
+                    "nchunks",
+                    "chunk_size",
+                ],
+                dtype="bfloat16",
+                optional=True,
+                description="Optional caller-owned physical output storage.",
+            ),
+            "return_final_states": Scalar("bool", optional=True),
+        }
+    )
+
+    outputs: dict[str, Tensor | Scalar] = {
+        "out": Tensor(
+            ["batch_size", "seqlen", "nheads", "headdim"],
+            dtype_from="x",
+            description=(
+                "Token-major return view. The optional out parameter has a "
+                "distinct physical layout, so this remains a value-returning "
+                "trace output rather than a destination binding."
+            ),
+        ),
+        "checkpoint_states": Tensor(
+            ["num_checkpoints", "nheads", "headdim", "dstate"],
+            param="checkpoint_states",
+            dtype="bfloat16",
+            dtype_from="checkpoint_states",
+            optional=True,
+            description="Caller-owned selective checkpoint state output.",
+        ),
+    }
+    if mode == "varlen":
+        outputs["seq_chunk_cumsum"] = Tensor(
+            ["seq_chunk_cumsum_size"],
+            param="seq_chunk_cumsum",
+            dtype="int32",
+            optional=True,
+            description="Caller-owned prefix-sum buffer when update is requested.",
+        )
+    if return_final_states:
+        outputs["final_states"] = Tensor(
+            [state_batch_axis, "nheads", "headdim", "dstate"],
+            dtype="bfloat16",
+            dtype_from="_ssd_state_dtype_source",
+        )
+
+    final_suffix = "final" if return_final_states else "no_final"
+    return _SSDCombinedTraceTemplate(
+        op_type="mamba_ssd_combined",
+        name_prefix=f"ssd_combined_{mode}_d_{d_layout}_{final_suffix}",
+        description=(
+            f"Mamba2 SSDCombined {mode} forward pass with {d_layout} D layout "
+            f"and return_final_states={return_final_states}."
+        ),
+        axes=axes,
+        inputs=inputs,
+        outputs=outputs,
+        constraints=[
+            "seqlen % chunk_size == 0",
+            "nheads % ngroups == 0",
+            "chunk_size == 128",
+            "headdim == 64",
+            "dstate == 128",
+        ],
+        tags=["status:verified", "mamba", "backend:cake", f"mode:{mode}"],
+    )
+
+
+_SSD_COMBINED_TRACE_BY_CONFIG = {
+    (mode, d_layout, return_final_states): _make_ssd_combined_trace(
+        mode,
+        d_layout,
+        return_final_states,
+    )
+    for mode in ("batched", "varlen")
+    for d_layout in ("none", "vector", "matrix")
+    for return_final_states in (False, True)
+}
+
+
+def ssd_combined_trace_dispatch(**kwargs):
+    """Select the exact SSDCombined schema for mode, D rank, and tuple output."""
+
+    mode = "varlen" if kwargs.get("seq_idx") is not None else "batched"
+    D = kwargs.get("D")
+    if D is None:
+        d_layout = "none"
+    elif D.ndim == 1:
+        d_layout = "vector"
+    elif D.ndim == 2:
+        d_layout = "matrix"
+    else:
+        raise ValueError("SSDCombined trace requires D to be rank 1 or rank 2")
+    return _SSD_COMBINED_TRACE_BY_CONFIG[
+        (mode, d_layout, bool(kwargs.get("return_final_states", True)))
+    ]
+
+
+ssd_combined_trace_dispatch.templates = tuple(  # type: ignore[attr-defined]
+    _SSD_COMBINED_TRACE_BY_CONFIG.values()
+)
