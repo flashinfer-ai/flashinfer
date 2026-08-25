@@ -71,9 +71,11 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t*
   constexpr int SMEM_STRIDE = KV::KV_SMEM_STRIDE;
 
   if (io_tid == 0) mbarrier_arrive_expect_tx(mbar, BI * COPY_BYTES);
-  // Execution barrier the caller's __threadfence_block cannot provide; without it the
-  // CTA deadlocks on sm_121 (#3700).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1210)
+  // sm_121 (GB10) deadlocks the CTA here without an IO-warp rendezvous (#3700); the
+  // mechanism is unresolved, so other archs keep the unmodified path.
   bar_sync_t<4, IO_THREADS>();
+#endif
 
 #pragma unroll 1
   for (int bi = io_tid; bi < BI; bi += IO_THREADS) {
