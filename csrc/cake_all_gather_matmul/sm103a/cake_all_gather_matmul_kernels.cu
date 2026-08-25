@@ -18,6 +18,12 @@
 // Targets: sm_100a and sm_103a; compile flags: --use_fast_math.
 // Generated file; do not edit manually.
 #include <stdint.h>
+
+// Pointer-ABI TMA descriptors are encoded by the CUDA driver and stored in
+// device memory.  Keep the generated kernel pointee self-contained and
+// layout-identical to the compiler's opaque 128-byte descriptor type.
+struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
+#include <stdint.h>
 #include <cuda.h>
 #include <cuda_bf16.h>
 

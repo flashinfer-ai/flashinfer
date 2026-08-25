@@ -55,6 +55,19 @@ def test_program_source_accepts_exact_ordered_manifest(tmp_path, monkeypatch):
     assert manifest["kernel_symbols"] == list(backend._KERNEL_SYMBOLS)
 
 
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_packaged_program_has_self_contained_pointer_abi(arch):
+    backend = _backend()
+
+    source_path, _ = backend._program_source(arch)
+    source = source_path.read_bytes()
+
+    assert source.count(
+        b"struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };"
+    ) == 1
+    assert source.count(b"CakeTensorMap const*") == 12
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
