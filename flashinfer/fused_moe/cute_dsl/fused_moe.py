@@ -277,6 +277,8 @@ def _moe_core_impl(
             main_event = main_event or resources["main_event"]
             memset_event = memset_event or resources["memset_event"]
 
+    is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
+
     # Step 1: Sort tokens by expert
     moe_sort_kwargs = moe_sort_buffers or {}
     (
@@ -294,6 +296,7 @@ def _moe_core_impl(
         local_expert_offset=local_expert_offset,
         num_local_experts=num_local_experts,
         tile_tokens_dim=tile_size,
+        init_tile_metadata=is_rubin,
         **moe_sort_kwargs,
     )
 
@@ -301,7 +304,6 @@ def _moe_core_impl(
     # prevent a cluster-synchronization deadlock. With cluster_shape_m=2,
     # two CTAs get consecutive tile indices; if the count is odd, one CTA
     # enters the cluster barrier while the other skips it.
-    is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
     if is_rubin:
         kernel_num_non_exiting_tiles = ((num_non_exiting_tiles + 1) // 2) * 2
     else:
