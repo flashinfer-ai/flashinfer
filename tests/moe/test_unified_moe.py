@@ -727,10 +727,10 @@ class TestTypedActivationConfig:
             )
         # No override is still fine.
         _validate_prepared_activation_params({}, ReLU2(), "TestRunner")
-        # Deliberately no positive case for a gated non-SwiGLU activation: this
-        # shared helper would let GeGLU(gemm1_alpha=...) through, but the
-        # CUTLASS runner rejects that one layer down, so asserting acceptance
-        # here would pin a permissiveness no backend honors.
+        # Deliberately no positive case for a gated non-SwiGLU activation.
+        # Whether one accepts these overrides is backend-specific, so this
+        # shared helper -- which serves the TRTLLM preparation contract -- must
+        # not be read as asserting generic acceptance.
 
     @pytest.mark.parametrize(
         "activation,expected_rows",
