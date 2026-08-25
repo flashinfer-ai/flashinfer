@@ -2,6 +2,7 @@ import copy
 import hashlib
 import importlib
 import json
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -88,13 +89,11 @@ def test_descriptor_cache_keeps_each_layer_mapping_alive(monkeypatch):
     backend = _backend()
     inp = object()
     scratch = object()
-    output = object()
     weights = [object() for _ in range(80)]
     allocations = []
     preparations = []
     workspace = SimpleNamespace(
         scratch=scratch,
-        output=output,
         descriptor_cache={},
     )
 
@@ -135,6 +134,95 @@ def test_descriptor_cache_keeps_each_layer_mapping_alive(monkeypatch):
     assert reused is descriptors[0]
     assert len(set(descriptors)) == len(allocations) == len(preparations) == 80
     assert len(workspace.descriptor_cache) == 80
+    assert all(len(args) == 6 for args in preparations)
+
+
+def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch):
+    backend = _backend()
+    backend._LAUNCH_STATES.clear()
+    backend._WORKSPACES.clear()
+    inp = SimpleNamespace(
+        device=torch.device("cuda:0"),
+        dtype=torch.bfloat16,
+        shape=(128, 8192),
+    )
+    weight = object()
+    group = object()
+
+    class FakeOutput:
+        def __init__(self, pointer):
+            self.pointer = pointer
+            self.value = None
+
+        def data_ptr(self):
+            return self.pointer
+
+    class FakeEvent:
+        def record(self, stream):
+            pass
+
+    class FakeStream:
+        cuda_stream = 17
+
+        def wait_event(self, event):
+            pass
+
+        def wait_stream(self, stream):
+            pass
+
+    class FakeSignal:
+        def zero_(self):
+            pass
+
+    class FakeScratchHandle:
+        def get_signal_pad(self, *args):
+            return FakeSignal()
+
+    outputs = []
+    launches = []
+
+    def allocate(*shape, **kwargs):
+        output = FakeOutput(1000 + len(outputs))
+        outputs.append(output)
+        return output
+
+    def run_main(*args):
+        output = args[3]
+        output.value = len(launches) + 1
+        launches.append(output)
+
+    module = SimpleNamespace(run_barrier=lambda *args: None, run_main=run_main)
+    workspace = SimpleNamespace(
+        scratch=SimpleNamespace(shape=(1, 128, 8192), dtype=torch.bfloat16),
+        scratch_handle=FakeScratchHandle(),
+        comm_stream=FakeStream(),
+        descriptor_cache={},
+    )
+    monkeypatch.setattr(
+        backend, "_validate_inputs", lambda *args: (0, 0, 1, "tp-group")
+    )
+    monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_100a")
+    monkeypatch.setattr(backend, "_load_program", lambda arch: module)
+    monkeypatch.setattr(backend, "_input_handle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        backend,
+        "_ensure_launch_state",
+        lambda state, **kwargs: setattr(state, "flag_peers", object()),
+    )
+    monkeypatch.setattr(backend, "_workspace", lambda **kwargs: workspace)
+    monkeypatch.setattr(backend, "_descriptor_storage", lambda *args, **kwargs: object())
+    monkeypatch.setattr(backend.torch, "empty", allocate)
+    monkeypatch.setattr(backend.torch.cuda, "current_stream", lambda device: FakeStream())
+    monkeypatch.setattr(backend.torch.cuda, "stream", lambda stream: nullcontext())
+    monkeypatch.setattr(backend.torch.cuda, "Event", lambda **kwargs: FakeEvent())
+
+    first = backend.all_gather_matmul_cake(inp, weight, group)
+    second = backend.all_gather_matmul_cake(inp, weight, group)
+
+    assert first.data_ptr() != second.data_ptr()
+    assert first.value == 1
+    assert second.value == 2
+    assert launches == [first, second]
 
 
 def test_validate_inputs_uses_the_exact_passed_subgroup(monkeypatch):

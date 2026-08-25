@@ -145,20 +145,18 @@ inline CUtensorMapDataType TensorMapDtype(const TensorView& tensor) {
   TVM_FFI_THROW(TypeError) << "inp must have bfloat16 or float16 dtype";
 }
 
-inline void CheckCommonInputs(const TensorView& inp, const TensorView& scratch,
-                              const TensorView& weight, const TensorView& out,
-                              int64_t world_size, int64_t rows) {
+inline void CheckDescriptorInputs(const TensorView& inp,
+                                  const TensorView& scratch,
+                                  const TensorView& weight,
+                                  int64_t world_size, int64_t rows) {
   CheckCudaTensor(inp, "inp");
   CheckCudaTensor(scratch, "scratch");
   CheckCudaTensor(weight, "weight");
-  CheckCudaTensor(out, "out");
   CheckContiguous(inp, "inp");
   CheckContiguous(scratch, "scratch");
   CheckContiguous(weight, "weight");
-  CheckContiguous(out, "out");
   CheckSameDevice(scratch, inp, "scratch");
   CheckSameDevice(weight, inp, "weight");
-  CheckSameDevice(out, inp, "out");
   TVM_FFI_CHECK(world_size == 2 || world_size == 4, ValueError)
       << "world_size must be 2 or 4";
   TVM_FFI_CHECK(rows > 0 && rows % 128 == 0, ValueError)
@@ -174,19 +172,34 @@ inline void CheckCommonInputs(const TensorView& inp, const TensorView& scratch,
                     weight.size(1) == 2048,
                 ValueError)
       << "weight must have shape [8192, 2048]";
+  const DLDataType dtype = inp.dtype();
+  for (const auto* tensor : {&scratch, &weight}) {
+    const DLDataType other = tensor->dtype();
+    TVM_FFI_CHECK(other.code == dtype.code && other.bits == dtype.bits &&
+                      other.lanes == dtype.lanes,
+                  TypeError)
+        << "inp, scratch, and weight must have the same dtype";
+  }
+  (void)TensorMapDtype(inp);
+}
+
+inline void CheckCommonInputs(const TensorView& inp, const TensorView& scratch,
+                              const TensorView& weight, const TensorView& out,
+                              int64_t world_size, int64_t rows) {
+  CheckDescriptorInputs(inp, scratch, weight, world_size, rows);
+  CheckCudaTensor(out, "out");
+  CheckContiguous(out, "out");
+  CheckSameDevice(out, inp, "out");
   TVM_FFI_CHECK(out.ndim() == 2 && out.size(0) == world_size * rows &&
                     out.size(1) == 2048,
                 ValueError)
       << "out must have shape [world_size * rows, 2048]";
   const DLDataType dtype = inp.dtype();
-  for (const auto* tensor : {&scratch, &weight, &out}) {
-    const DLDataType other = tensor->dtype();
-    TVM_FFI_CHECK(other.code == dtype.code && other.bits == dtype.bits &&
-                      other.lanes == dtype.lanes,
-                  TypeError)
-        << "inp, scratch, weight, and out must have the same dtype";
-  }
-  (void)TensorMapDtype(inp);
+  const DLDataType out_dtype = out.dtype();
+  TVM_FFI_CHECK(out_dtype.code == dtype.code && out_dtype.bits == dtype.bits &&
+                    out_dtype.lanes == dtype.lanes,
+                TypeError)
+      << "inp and out must have the same dtype";
 }
 
 inline CUtensorMap EncodeActivationMap(const TensorView& tensor, int64_t rows,
@@ -225,9 +238,9 @@ inline CUtensorMap EncodeWeightMap(const TensorView& weight) {
 }
 
 void PrepareDescriptors(TensorView inp, TensorView scratch, TensorView weight,
-                        TensorView out, TensorView descriptor_storage,
+                        TensorView descriptor_storage,
                         int64_t world_size, int64_t rows) {
-  CheckCommonInputs(inp, scratch, weight, out, world_size, rows);
+  CheckDescriptorInputs(inp, scratch, weight, world_size, rows);
   CheckCudaTensor(descriptor_storage, "descriptor_storage");
   CheckSameDevice(descriptor_storage, inp, "descriptor_storage");
   CheckContiguous(descriptor_storage, "descriptor_storage");
@@ -546,7 +559,6 @@ class _LaunchState:
 class _Workspace:
     scratch: torch.Tensor
     scratch_handle: Any
-    output: torch.Tensor
     comm_stream: torch.cuda.Stream
     descriptor_cache: dict[tuple[Any, ...], torch.Tensor] = field(
         default_factory=dict, repr=False
@@ -672,11 +684,9 @@ def _workspace(
         world_size, rows, _K, dtype=dtype, device=device_index
     )
     scratch_handle = symm_mem.rendezvous(scratch, group=group_name)
-    output = torch.empty(world_size * rows, _N, dtype=dtype, device=device_index)
     workspace = _Workspace(
         scratch=scratch,
         scratch_handle=scratch_handle,
-        output=output,
         comm_stream=torch.cuda.Stream(device=device_index),
     )
     _WORKSPACES[key] = workspace
@@ -697,7 +707,6 @@ def _descriptor_storage(
         _tensor_fingerprint(inp),
         _tensor_fingerprint(workspace.scratch),
         _tensor_fingerprint(w),
-        _tensor_fingerprint(workspace.output),
     )
     descriptors = workspace.descriptor_cache.get(fingerprint)
     if descriptors is not None:
@@ -711,7 +720,6 @@ def _descriptor_storage(
         inp,
         workspace.scratch,
         w,
-        workspace.output,
         descriptors,
         world_size,
         rows,
@@ -776,6 +784,9 @@ def all_gather_matmul_cake(
                 world_size=world_size,
                 rows=rows,
             )
+            output = torch.empty(
+                world_size * rows, _N, dtype=inp.dtype, device=device_index
+            )
 
             chunk_size = min(rows, _CHUNK_ROWS)
             num_chunks = (rows + chunk_size - 1) // chunk_size
@@ -811,7 +822,7 @@ def all_gather_matmul_cake(
                 inp,
                 workspace.scratch,
                 w,
-                workspace.output,
+                output,
                 descriptors,
                 signal_pad,
                 world_size,
@@ -831,7 +842,7 @@ def all_gather_matmul_cake(
                     "Cake all-gather matmul: "
                     f"arch={arch}, world_size={world_size}, M={rows}, K={_K}, N={_N}"
                 )
-            return workspace.output
+            return output
         except Exception:
             state.poisoned = True
             raise
