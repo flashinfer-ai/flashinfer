@@ -538,8 +538,8 @@ Legend:
 | Routine | 7.5 | 8.0 | 8.6 | 8.9 | 9.0 | 10.0 | 10.3 | 12.0 |
 |---------|-----|-----|-----|-----|-----|-------|-------|-------|
 | **BatchDecodeWithPagedKVCacheWrapper** | fa2 | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts | fa2, fa2_tc, cudnn, trtllm-gen, trtllm-native, prims-ts | fa2, fa2_tc, cudnn |
-| **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cute-dsl-prims |
-| **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cute-dsl-prims |
+| **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
+| **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-fmha-v2, cute-dsl-prims |
 | **BatchMLAPagedAttentionWrapper** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-native, cute-dsl, prims-ts | fa2, cutlass, trtllm-native, prims-ts | fa2 |
 | **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
 | **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |

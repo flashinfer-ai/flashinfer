@@ -1713,6 +1713,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             output_scale=prims_ts_output_scale,
             out_dtype=o_data_type,
         )
+
     # Prepare wrappers (after FP8 conversion so we have correct dtypes)
     backend_wrappers = {}
     resolved_backends = {}
@@ -2150,7 +2151,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             )
             resolved_backend = resolved_backends.get(backend, backend)
             display_backend = (
-                f"auto({resolved_backend})" if backend == "auto" else resolved_backend
+                f"auto({resolved_backend})" if backend == "auto" else backend
             )
             print_perf_metrics(
                 display_backend, median_time, std_time, tflops, tb_per_sec
