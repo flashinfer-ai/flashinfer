@@ -239,15 +239,18 @@ def test_descriptor_cache_is_bounded_lru(monkeypatch):
         )
         for weight in weights[:2]
     ]
-    assert backend._descriptor_storage(
-        workspace,
-        module,
-        inp,
-        weights[0],
-        device_index=0,
-        world_size=2,
-        rows=128,
-    ) is descriptors[0]
+    assert (
+        backend._descriptor_storage(
+            workspace,
+            module,
+            inp,
+            weights[0],
+            device_index=0,
+            world_size=2,
+            rows=128,
+        )
+        is descriptors[0]
+    )
     third = backend._descriptor_storage(
         workspace,
         module,
@@ -263,15 +266,18 @@ def test_descriptor_cache_is_bounded_lru(monkeypatch):
     third_key = ("input", "scratch", "weight-2")
     assert list(workspace.descriptor_cache) == [first_key, third_key]
     assert second_key not in workspace.descriptor_cache
-    assert backend._descriptor_storage(
-        workspace,
-        module,
-        inp,
-        weights[0],
-        device_index=0,
-        world_size=2,
-        rows=128,
-    ) is descriptors[0]
+    assert (
+        backend._descriptor_storage(
+            workspace,
+            module,
+            inp,
+            weights[0],
+            device_index=0,
+            world_size=2,
+            rows=128,
+        )
+        is descriptors[0]
+    )
     assert third is not descriptors[0]
     assert len(allocations) == len(preparations) == 3
 
@@ -315,15 +321,18 @@ def test_descriptor_cache_reuses_recycled_fingerprint(monkeypatch):
         rows=128,
     )
 
-    assert backend._descriptor_storage(
-        workspace,
-        module,
-        replacement,
-        weight,
-        device_index=0,
-        world_size=2,
-        rows=128,
-    ) is descriptors
+    assert (
+        backend._descriptor_storage(
+            workspace,
+            module,
+            replacement,
+            weight,
+            device_index=0,
+            world_size=2,
+            rows=128,
+        )
+        is descriptors
+    )
     assert len(allocations) == len(preparations) == 1
 
 

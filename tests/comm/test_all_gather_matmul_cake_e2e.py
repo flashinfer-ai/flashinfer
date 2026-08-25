@@ -141,9 +141,7 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
     torch.cuda.current_stream(device).wait_stream(owner_stream)
     torch.cuda.current_stream(device).wait_stream(eviction_stream)
     torch.testing.assert_close(cached, expected, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(
-        replacement, replacement_expected, atol=1e-2, rtol=1e-2
-    )
+    torch.testing.assert_close(replacement, replacement_expected, atol=1e-2, rtol=1e-2)
     del (
         cached,
         expected,
