@@ -85,6 +85,22 @@ def test_release_jit_propagates_ndebug_to_host_cflags(monkeypatch):
     assert "-DNDEBUG" in spec.extra_cuda_cflags
 
 
+def test_release_jit_can_disable_fast_math(monkeypatch):
+    monkeypatch.delenv("FLASHINFER_JIT_DEBUG", raising=False)
+    monkeypatch.delenv("FLASHINFER_JIT_VERBOSE", raising=False)
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(core, "get_nvcc_parallelism_flags", lambda: ["--threads=1"])
+
+    spec = core.gen_jit_spec(
+        name="test_module_without_fast_math",
+        sources=[],
+        use_fast_math=False,
+    )
+
+    assert "-use_fast_math" not in spec.extra_cuda_cflags
+    assert "-DNDEBUG" in spec.extra_cuda_cflags
+
+
 def test_debug_jit_does_not_propagate_ndebug(monkeypatch):
     monkeypatch.setenv("FLASHINFER_JIT_DEBUG", "1")
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
