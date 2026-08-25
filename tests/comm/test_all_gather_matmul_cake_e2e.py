@@ -1,4 +1,7 @@
+import gc
+import importlib
 import random
+import weakref
 
 import pytest
 import torch
@@ -38,6 +41,51 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
     assert first.data_ptr() != second.data_ptr()
     torch.testing.assert_close(first, first_snapshot, atol=0, rtol=0)
     torch.testing.assert_close(second, expected, atol=1e-2, rtol=1e-2)
+
+    backend = importlib.import_module(
+        "flashinfer.comm.all_gather_matmul.cake_all_gather_matmul"
+    )
+    assert sum(
+        len(workspace.descriptor_cache) for workspace in backend._WORKSPACES.values()
+    ) == 1
+    inp_ref = weakref.ref(inp)
+    weight_ref = weakref.ref(weight)
+    torch.cuda.synchronize(device)
+    del first, first_snapshot, second, expected, gathered, inp, weight
+    gc.collect()
+    assert inp_ref() is None
+    assert weight_ref() is None
+
+    caller_stream = torch.cuda.Stream(device=device)
+    churn_stream = torch.cuda.Stream(device=device)
+    torch.manual_seed(141 + rank)
+    with torch.cuda.stream(caller_stream):
+        inp = torch.randn(rows, 8192, dtype=dtype, device=device)
+        weight = torch.randn(8192, 2048, dtype=dtype, device=device)
+        gathered = torch.empty(world_size * rows, 8192, dtype=dtype, device=device)
+        dist.all_gather_into_tensor(gathered, inp, group=group)
+        expected = gathered @ weight
+        rebuilt = all_gather_matmul(inp, weight, group, backend="cake")
+
+    inp_ref = weakref.ref(inp)
+    weight_ref = weakref.ref(weight)
+    del inp, weight, gathered
+    gc.collect()
+    assert inp_ref() is None
+    assert weight_ref() is None
+
+    with torch.cuda.stream(churn_stream):
+        churn_input = torch.empty(rows, 8192, dtype=dtype, device=device).normal_()
+        churn_weight = torch.empty(8192, 2048, dtype=dtype, device=device).normal_()
+    torch.cuda.current_stream(device).wait_stream(caller_stream)
+    torch.cuda.current_stream(device).wait_stream(churn_stream)
+    torch.testing.assert_close(rebuilt, expected, atol=1e-2, rtol=1e-2)
+    assert all(
+        len(workspace.descriptor_cache)
+        <= backend._DESCRIPTOR_CACHE_MAX_ENTRIES
+        for workspace in backend._WORKSPACES.values()
+    )
+    del churn_input, churn_weight, rebuilt, expected
 
     dist.destroy_process_group(group)
     dist.destroy_process_group()

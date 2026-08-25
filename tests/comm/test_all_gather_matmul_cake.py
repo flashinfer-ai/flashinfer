@@ -2,8 +2,11 @@ import copy
 import hashlib
 import importlib
 import json
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 
 import pytest
@@ -139,19 +142,23 @@ def test_program_source_rejects_manifest_identity_drift(
         backend._program_source("sm_100a")
 
 
-def test_descriptor_cache_keeps_each_layer_mapping_alive(monkeypatch):
+def test_descriptor_cache_reuses_each_layer_mapping(monkeypatch):
     backend = _backend()
-    inp = object()
+
+    class WeakTensor:
+        pass
+
+    inp = WeakTensor()
     scratch = object()
-    weights = [object() for _ in range(80)]
+    weights = [WeakTensor() for _ in range(80)]
     allocations = []
     preparations = []
     workspace = SimpleNamespace(
         scratch=scratch,
-        descriptor_cache={},
+        descriptor_cache=OrderedDict(),
     )
 
-    monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: tensor)
+    monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: id(tensor))
 
     def allocate(*args, **kwargs):
         storage = object()
@@ -191,16 +198,214 @@ def test_descriptor_cache_keeps_each_layer_mapping_alive(monkeypatch):
     assert all(len(args) == 6 for args in preparations)
 
 
+def test_descriptor_cache_is_bounded_lru(monkeypatch):
+    backend = _backend()
+
+    class WeakTensor:
+        def __init__(self, fingerprint):
+            self.fingerprint = fingerprint
+
+    inp = WeakTensor("input")
+    weights = [WeakTensor(f"weight-{index}") for index in range(3)]
+    workspace = SimpleNamespace(
+        scratch=WeakTensor("scratch"),
+        descriptor_cache=OrderedDict(),
+    )
+    monkeypatch.setattr(
+        backend, "_tensor_fingerprint", lambda tensor: tensor.fingerprint
+    )
+    allocations = []
+    preparations = []
+
+    def allocate(*args, **kwargs):
+        descriptor = object()
+        allocations.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(backend.torch, "empty", allocate)
+    monkeypatch.setattr(backend, "_DESCRIPTOR_CACHE_MAX_ENTRIES", 2)
+    module = SimpleNamespace(
+        prepare_descriptors=lambda *args: preparations.append(args)
+    )
+    descriptors = [
+        backend._descriptor_storage(
+            workspace,
+            module,
+            inp,
+            weight,
+            device_index=0,
+            world_size=2,
+            rows=128,
+        )
+        for weight in weights[:2]
+    ]
+    assert backend._descriptor_storage(
+        workspace,
+        module,
+        inp,
+        weights[0],
+        device_index=0,
+        world_size=2,
+        rows=128,
+    ) is descriptors[0]
+    third = backend._descriptor_storage(
+        workspace,
+        module,
+        inp,
+        weights[2],
+        device_index=0,
+        world_size=2,
+        rows=128,
+    )
+
+    first_key = ("input", "scratch", "weight-0")
+    second_key = ("input", "scratch", "weight-1")
+    third_key = ("input", "scratch", "weight-2")
+    assert list(workspace.descriptor_cache) == [first_key, third_key]
+    assert second_key not in workspace.descriptor_cache
+    assert backend._descriptor_storage(
+        workspace,
+        module,
+        inp,
+        weights[0],
+        device_index=0,
+        world_size=2,
+        rows=128,
+    ) is descriptors[0]
+    assert third is not descriptors[0]
+    assert len(allocations) == len(preparations) == 3
+
+
+def test_descriptor_cache_reuses_recycled_fingerprint(monkeypatch):
+    backend = _backend()
+
+    class TensorFingerprint:
+        def __init__(self, fingerprint):
+            self.fingerprint = fingerprint
+
+    first = TensorFingerprint("input")
+    replacement = TensorFingerprint("input")
+    weight = TensorFingerprint("weight")
+    workspace = SimpleNamespace(
+        scratch=TensorFingerprint("scratch"),
+        descriptor_cache=OrderedDict(),
+    )
+    monkeypatch.setattr(
+        backend, "_tensor_fingerprint", lambda tensor: tensor.fingerprint
+    )
+    allocations = []
+    preparations = []
+
+    def allocate(*args, **kwargs):
+        descriptor = object()
+        allocations.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(backend.torch, "empty", allocate)
+    module = SimpleNamespace(
+        prepare_descriptors=lambda *args: preparations.append(args)
+    )
+    descriptors = backend._descriptor_storage(
+        workspace,
+        module,
+        first,
+        weight,
+        device_index=0,
+        world_size=2,
+        rows=128,
+    )
+
+    assert backend._descriptor_storage(
+        workspace,
+        module,
+        replacement,
+        weight,
+        device_index=0,
+        world_size=2,
+        rows=128,
+    ) is descriptors
+    assert len(allocations) == len(preparations) == 1
+
+
+def test_descriptor_prepare_failure_does_not_install_cache_entry(monkeypatch):
+    backend = _backend()
+    workspace = SimpleNamespace(scratch="scratch", descriptor_cache=OrderedDict())
+    monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: tensor)
+    monkeypatch.setattr(backend.torch, "empty", lambda *args, **kwargs: object())
+    def prepare(*args):
+        raise RuntimeError("prepare failed")
+
+    module = SimpleNamespace(prepare_descriptors=prepare)
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        backend._descriptor_storage(
+            workspace,
+            module,
+            "input",
+            "weight",
+            device_index=0,
+            world_size=2,
+            rows=128,
+        )
+
+    assert workspace.descriptor_cache == OrderedDict()
+
+
+def test_concurrent_descriptor_prepare_returns_one_cached_entry(monkeypatch):
+    backend = _backend()
+    workspace = SimpleNamespace(scratch="scratch", descriptor_cache=OrderedDict())
+    monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: tensor)
+    allocations = []
+    preparations = []
+    prepare_barrier = Barrier(2)
+
+    def allocate(*args, **kwargs):
+        descriptor = object()
+        allocations.append(descriptor)
+        return descriptor
+
+    def prepare(*args):
+        preparations.append(args)
+        prepare_barrier.wait()
+
+    monkeypatch.setattr(backend.torch, "empty", allocate)
+    module = SimpleNamespace(prepare_descriptors=prepare)
+
+    def resolve():
+        return backend._descriptor_storage(
+            workspace,
+            module,
+            "input",
+            "weight",
+            device_index=0,
+            world_size=2,
+            rows=128,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: resolve(), range(2)))
+
+    assert results[0] is results[1]
+    assert len(workspace.descriptor_cache) == 1
+    assert len(allocations) == len(preparations) == 2
+
+
 def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch):
     backend = _backend()
     backend._LAUNCH_STATES.clear()
     backend._WORKSPACES.clear()
+    input_streams = []
+    weight_streams = []
+    descriptor_streams = []
     inp = SimpleNamespace(
         device=torch.device("cuda:0"),
         dtype=torch.bfloat16,
         shape=(128, 8192),
+        record_stream=lambda stream: input_streams.append(stream),
     )
-    weight = object()
+    weight = SimpleNamespace(
+        record_stream=lambda stream: weight_streams.append(stream),
+    )
     group = object()
 
     class FakeOutput:
@@ -246,30 +451,41 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
         launches.append(output)
 
     module = SimpleNamespace(run_barrier=lambda *args: None, run_main=run_main)
+    main_stream = FakeStream()
+    comm_stream = FakeStream()
+    descriptors = SimpleNamespace(
+        record_stream=lambda stream: descriptor_streams.append(stream)
+    )
     workspace = SimpleNamespace(
         scratch=SimpleNamespace(shape=(1, 128, 8192), dtype=torch.bfloat16),
         scratch_handle=FakeScratchHandle(),
-        comm_stream=FakeStream(),
-        descriptor_cache={},
+        comm_stream=comm_stream,
+        descriptor_cache=OrderedDict(),
     )
     monkeypatch.setattr(
         backend, "_validate_inputs", lambda *args: (0, 0, 1, "tp-group")
     )
     monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_100a")
     monkeypatch.setattr(backend, "_load_program", lambda arch: module)
-    monkeypatch.setattr(backend, "_input_handle", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         backend,
         "_ensure_launch_state",
         lambda state, **kwargs: setattr(state, "flag_peers", object()),
     )
+    monkeypatch.setattr(
+        backend.symm_mem,
+        "rendezvous",
+        lambda *args, **kwargs: pytest.fail("input must not be rendezvoused"),
+    )
     monkeypatch.setattr(backend, "_workspace", lambda **kwargs: workspace)
     monkeypatch.setattr(
-        backend, "_descriptor_storage", lambda *args, **kwargs: object()
+        backend,
+        "_descriptor_storage",
+        lambda *args, **kwargs: descriptors,
     )
     monkeypatch.setattr(backend.torch, "empty", allocate)
     monkeypatch.setattr(
-        backend.torch.cuda, "current_stream", lambda device: FakeStream()
+        backend.torch.cuda, "current_stream", lambda device: main_stream
     )
     monkeypatch.setattr(backend.torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(backend.torch.cuda, "Event", lambda **kwargs: FakeEvent())
@@ -281,6 +497,9 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
     assert first.value == 1
     assert second.value == 2
     assert launches == [first, second]
+    assert input_streams == [main_stream, comm_stream, main_stream, comm_stream]
+    assert weight_streams == [main_stream, main_stream]
+    assert descriptor_streams == [main_stream, main_stream]
 
 
 def test_validate_inputs_uses_the_exact_passed_subgroup(monkeypatch):

@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import subprocess
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import RLock
@@ -30,6 +31,7 @@ _K = 8192
 _N = 2048
 _TENSOR_MAP_BYTES = 128
 _DESCRIPTOR_COUNT = 3
+_DESCRIPTOR_CACHE_MAX_ENTRIES = 256
 _MAIN_KERNEL_COUNT = 4
 _SUPPORTED_WORLD_SIZES = frozenset((2, 4))
 _SUPPORTED_DTYPES = frozenset((torch.bfloat16, torch.float16))
@@ -582,9 +584,6 @@ class _LaunchState:
     flags: Any = None
     flag_handle: Any = None
     flag_peers: Any = None
-    input_handles: dict[tuple[Any, ...], tuple[Any, Any]] = field(
-        default_factory=dict, repr=False
-    )
     poisoned: bool = False
 
 
@@ -593,8 +592,8 @@ class _Workspace:
     scratch: torch.Tensor
     scratch_handle: Any
     comm_stream: torch.cuda.Stream
-    descriptor_cache: dict[tuple[Any, ...], torch.Tensor] = field(
-        default_factory=dict, repr=False
+    descriptor_cache: OrderedDict[tuple[Any, ...], torch.Tensor] = field(
+        default_factory=OrderedDict, repr=False
     )
 
 
@@ -683,25 +682,6 @@ def _ensure_launch_state(
     state.flag_peers = torch.tensor(peer_ptrs, dtype=torch.int64, device=device_index)
 
 
-def _input_handle(
-    state: _LaunchState,
-    inp: torch.Tensor,
-    *,
-    group_name: str,
-    rank: int,
-    world_size: int,
-):
-    key = (group_name, *_tensor_fingerprint(inp))
-    cached = state.input_handles.get(key)
-    if cached is not None:
-        return cached[1]
-    handle = symm_mem.rendezvous(inp, group=group_name)
-    if int(handle.rank) != rank or int(handle.world_size) != world_size:
-        raise RuntimeError("input symmetric-memory topology does not match group")
-    state.input_handles[key] = (inp, handle)
-    return handle
-
-
 def _workspace(
     *,
     device_index: int,
@@ -741,9 +721,11 @@ def _descriptor_storage(
         _tensor_fingerprint(workspace.scratch),
         _tensor_fingerprint(w),
     )
-    descriptors = workspace.descriptor_cache.get(fingerprint)
-    if descriptors is not None:
-        return descriptors
+    with _CACHE_LOCK:
+        descriptors = workspace.descriptor_cache.get(fingerprint)
+        if descriptors is not None:
+            workspace.descriptor_cache.move_to_end(fingerprint)
+            return descriptors
     descriptors = torch.empty(
         _DESCRIPTOR_COUNT * _TENSOR_MAP_BYTES,
         dtype=torch.uint8,
@@ -757,7 +739,14 @@ def _descriptor_storage(
         world_size,
         rows,
     )
-    workspace.descriptor_cache[fingerprint] = descriptors
+    with _CACHE_LOCK:
+        cached = workspace.descriptor_cache.get(fingerprint)
+        if cached is not None:
+            workspace.descriptor_cache.move_to_end(fingerprint)
+            return cached
+        workspace.descriptor_cache[fingerprint] = descriptors
+        while len(workspace.descriptor_cache) > _DESCRIPTOR_CACHE_MAX_ENTRIES:
+            workspace.descriptor_cache.popitem(last=False)
     return descriptors
 
 
@@ -769,7 +758,11 @@ def all_gather_matmul_cake(
     backend: str,
     verbose: bool = False,
 ) -> torch.Tensor:
-    """Run the exact Blackwell source-built backend for one NCCL group."""
+    """Run the exact Blackwell source-built backend for one NCCL group.
+
+    The input is local-only and need not be remotely addressable. NVSHMEM is
+    still required for the backend's internal symmetric scratch and flags.
+    """
 
     if backend != "cake":
         raise ValueError("backend must be exactly 'cake'")
@@ -788,13 +781,6 @@ def all_gather_matmul_cake(
                 "Cake all-gather matmul state is poisoned by a prior failed collective"
             )
         try:
-            _input_handle(
-                state,
-                inp,
-                group_name=group_name,
-                rank=rank,
-                world_size=world_size,
-            )
             _ensure_launch_state(
                 state,
                 device_index=device_index,
@@ -831,6 +817,10 @@ def all_gather_matmul_cake(
                 rank, (world_size, num_chunks), torch.uint32, 0
             )
             main_stream = torch.cuda.current_stream(device_index)
+            inp.record_stream(main_stream)
+            inp.record_stream(workspace.comm_stream)
+            w.record_stream(main_stream)
+            descriptors.record_stream(main_stream)
             main_stream_id = int(main_stream.cuda_stream)
             if state.tail_event is not None and state.tail_stream != main_stream_id:
                 main_stream.wait_event(state.tail_event)

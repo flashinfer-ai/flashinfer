@@ -40,8 +40,10 @@ All-Gather Matmul
 ``backend="auto"``. On SM100 and SM103, ``backend="cake"`` explicitly selects
 the source-built fused backend for contiguous bfloat16 or float16 inputs with
 ``K=8192``, ``N=2048``, a positive ``M`` divisible by 128, an NVSHMEM symmetric
-input, and a two- or four-rank NCCL process group. Unsupported explicit Cake
-requests raise instead of silently falling back.
+memory backend, and a two- or four-rank NCCL process group. The local input may
+be an ordinary contiguous CUDA tensor because Cake uses internal symmetric
+scratch and flags for remote access and synchronization. Unsupported explicit
+Cake requests raise instead of silently falling back.
 The packaged manifest carries the exact dynamic shared-memory requirement
 resolved for every generated main route; the loader validates that value
 against the packaged CUDA source before compiling the host launcher.
