@@ -59,6 +59,7 @@ from .ulysses import ulysses_a2a as ulysses_a2a
 from .ulysses_topology import ULYSSES_BACKENDS as ULYSSES_BACKENDS
 from .ulysses_topology import UlyssesBackendDecision as UlyssesBackendDecision
 from .ulysses_topology import UlyssesBackendError as UlyssesBackendError
+from .ulysses_topology import UlyssesPciePlan as UlyssesPciePlan
 from .ulysses_topology import UlyssesRankTopology as UlyssesRankTopology
 from .ulysses_topology import decide_ulysses_backend as decide_ulysses_backend
 from .ulysses_topology import (

@@ -840,6 +840,9 @@ def gen_all_modules(
         # and CUDA IPC, and target PCIe machines without NVLink, which is
         # orthogonal to the SM version.
         jit_specs.append(gen_pcie_ipc_comm_module())
+        # gen_ulysses_a2a_module and gen_ulysses_pcie_module are deliberately
+        # absent: Ulysses is JIT-only, and the PCIe module additionally links
+        # -libverbs -lmlx5, which an AOT wheel builder cannot be assumed to have.
 
     if add_misc:
         jit_specs += [
