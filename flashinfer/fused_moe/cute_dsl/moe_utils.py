@@ -525,7 +525,6 @@ def moe_sort(
     num_local_experts: Optional[int] = None,
     tile_tokens_dim: int = 128,
     enable_pdl: bool = False,
-    init_tile_metadata: bool = False,
     # CUDA graph support: pre-allocated output buffers
     out_tile_idx_to_expert_idx: Optional[torch.Tensor] = None,
     out_tile_idx_to_mn_limit: Optional[torch.Tensor] = None,
@@ -576,10 +575,6 @@ def moe_sort(
         tile_tokens_dim: Tile size for scheduling. Default: 128.
         enable_pdl: Enable Programmatic Dependent Launch for better kernel overlap.
                     Default is False.
-        init_tile_metadata: Zero the tile metadata buffers, giving safe defaults
-                    past num_non_exiting_tiles. Only needed by callers that hand
-                    the kernel a rounded-up tile count and so read past the true
-                    one; costs two fill launches. Default: False.
         out_tile_idx_to_expert_idx: Pre-allocated buffer for tile_idx_to_expert_idx.
         out_tile_idx_to_mn_limit: Pre-allocated buffer for tile_idx_to_mn_limit.
         out_expanded_idx_to_permuted_idx: Pre-allocated buffer for expanded_idx_to_permuted_idx.
@@ -668,10 +663,6 @@ def moe_sort(
         tile_idx_to_mn_limit = torch.empty(
             (max_num_tiles,), dtype=torch.int32, device=device
         )
-
-    if init_tile_metadata:
-        tile_idx_to_expert_idx.zero_()
-        tile_idx_to_mn_limit.zero_()
 
     if out_expanded_idx_to_permuted_idx is not None:
         expanded_idx_to_permuted_idx = out_expanded_idx_to_permuted_idx

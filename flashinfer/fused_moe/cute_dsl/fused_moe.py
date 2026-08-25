@@ -279,17 +279,29 @@ def _moe_core_impl(
 
     is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
 
-    # Tiles are handed to a cluster in cluster_shape_m-sized groups, so a count
-    # that is not a whole number of groups splits the last one: some CTAs of
-    # that cluster have work and the rest do not, and the ones that do hang at
-    # the cluster barrier waiting for peers that already exited. Rounding the
-    # count the kernel sees up to a multiple of cluster_shape_m keeps every
-    # cluster uniform.
+    # Tiles are handed to a cluster in cluster_shape_m-sized groups. A count
+    # that is not a whole number of groups splits the last one, and the CTAs
+    # that still have work hang at the cluster barrier waiting for peers that
+    # already exited. Handling that needs two coordinated changes: round the
+    # count the kernel sees up to a multiple of cluster_shape_m, and initialize
+    # the tile-metadata buffers to match, because the kernel's bounds check on
+    # them is that same rounded value.
     #
-    # This is a property of the selected tactic, not of the routing, so it is
-    # known here without inspecting num_non_exiting_tiles (a device tensor).
+    # No reachable Rubin tactic uses a multi-CTA cluster today -- tile_size is
+    # restricted to 128, which forces mma_tiler_m == 128 and hence
+    # cluster_shape_m == 1 -- so rather than carry a pair of coupled code paths
+    # nothing exercises, refuse the case loudly. Whoever re-enables
+    # tile_size=256 gets a clear pointer instead of a silent uninitialized read.
     cluster_m = max(gemm1_cluster_shape_mn[0], gemm2_cluster_shape_mn[0])
-    needs_uniform_clusters = is_rubin and cluster_m > 1
+    if is_rubin and cluster_m > 1:
+        raise NotImplementedError(
+            f"Rubin MoE with cluster_shape_m={cluster_m} is not supported. The "
+            "tile count handed to the kernel must be rounded up to a multiple "
+            "of cluster_shape_m so every cluster reaches the barrier "
+            "uniformly, and tile_idx_to_expert_idx / tile_idx_to_mn_limit must "
+            "be initialized past num_non_exiting_tiles to match, since the "
+            "kernel bounds-checks them against that same rounded count."
+        )
 
     # Step 1: Sort tokens by expert
     moe_sort_kwargs = moe_sort_buffers or {}
@@ -308,19 +320,8 @@ def _moe_core_impl(
         local_expert_offset=local_expert_offset,
         num_local_experts=num_local_experts,
         tile_tokens_dim=tile_size,
-        init_tile_metadata=needs_uniform_clusters,
         **moe_sort_kwargs,
     )
-
-    # The rounded count is also the kernel's bounds check on the tile metadata,
-    # so rounding it up lets the padding tiles read entries the routing kernel
-    # never wrote -- hence init_tile_metadata above, under the same condition.
-    if needs_uniform_clusters:
-        kernel_num_non_exiting_tiles = (
-            (num_non_exiting_tiles + cluster_m - 1) // cluster_m
-        ) * cluster_m
-    else:
-        kernel_num_non_exiting_tiles = num_non_exiting_tiles
 
     # Record event for async memset synchronization
     if use_async_memset and use_fused_finalize:
@@ -354,7 +355,7 @@ def _moe_core_impl(
             tile_idx_to_expert_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             token_id_mapping=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=kernel_num_non_exiting_tiles,
+            num_non_exiting_tiles=num_non_exiting_tiles,
             out=gemm1_out,
             **output_kwargs,
             topk=top_k,
@@ -416,7 +417,7 @@ def _moe_core_impl(
         b_scale=w2_weight_sf,
         alpha=w2_alpha,
         tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-        num_non_exiting_tiles=kernel_num_non_exiting_tiles,
+        num_non_exiting_tiles=num_non_exiting_tiles,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         token_final_scales=token_final_scales,
