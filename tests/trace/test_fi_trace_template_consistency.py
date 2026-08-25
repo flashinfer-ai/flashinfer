@@ -140,9 +140,10 @@ def assert_template_axes_covered(
     """
     Assert that every ``Const`` axis in *template* has at least one source:
 
-    1. A tensor input whose ``dim_names`` contain the axis name, OR
-    2. A scalar input whose key matches the axis name (scalar-kwarg fallback), OR
-    3. A parameter of *func* matching the axis name (scalar-kwarg fallback for
+    1. The ``Const`` declares a fixed ``value``, OR
+    2. A tensor input whose ``dim_names`` contain the axis name, OR
+    3. A scalar input whose key matches the axis name (scalar-kwarg fallback), OR
+    4. A parameter of *func* matching the axis name (scalar-kwarg fallback for
        integer function arguments like ``top_k``, ``n_group``, ``block_size``).
     """
     tensor_dim_names: set = set()
@@ -163,6 +164,7 @@ def assert_template_axes_covered(
         name
         for name, marker in template.axes.items()
         if isinstance(marker, Const)
+        and marker.value is None
         and name not in tensor_dim_names
         and name not in scalar_keys
         and name not in func_param_names
@@ -752,6 +754,11 @@ _E2E_SKIP = {
     # Shared FP4 requires explicit routed/physical expert geometry and scalar
     # routing args; covered by test_fi_trace_emits_fp4_shared_expert_definition.
     "moe_fp4_block_scale_ds_shared_experts",
+    # Method receiver supplies the real process-group size. The generic sample
+    # builder has no communicator; test_ulysses_trace covers both ws=1 schema
+    # generation and the multi-rank trace-apply routing miss.
+    "ulysses_scatter_heads",
+    "ulysses_gather_heads",
 }
 
 _E2E_PAIRS = [(f, t, l) for f, t, l in _ALL_PAIRS if l not in _E2E_SKIP]
