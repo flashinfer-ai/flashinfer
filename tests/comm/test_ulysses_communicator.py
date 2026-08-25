@@ -6,17 +6,22 @@
 # with resource accounting, retryable close, and the device contract — all
 # with timeout + terminate + natural-exit assertions.
 
+import contextlib
+import datetime
 import importlib
 import multiprocessing as std_mp
+import os
 import queue as queue_mod
-import socket
+import tempfile
 import time
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 
 from flashinfer.comm import UlyssesCommunicator
+from flashinfer.comm.ulysses import missing_ulysses_pcie_dependencies
 from flashinfer.comm.ulysses_topology import UlyssesBackendError, UlyssesRankTopology
 
 
@@ -40,7 +45,7 @@ def _patch_probe_mesh_module(world_size, break_nvlink=False, error_rank=None):
     """Patch the probe inside a worker process (no monkeypatch fixture)."""
     topo_mod = importlib.import_module("flashinfer.comm.ulysses_topology")
 
-    def fake_probe(device, r):
+    def fake_probe(device, r, *, probe_pcie=True):
         if error_rank is not None and r == error_rank:
             raise RuntimeError("injected probe failure")
         topos = _full_mesh(world_size)
@@ -74,22 +79,46 @@ def _ref_gather_heads(y_local, world_size, rank, group):
     return torch.cat(blocks, dim=2).contiguous()
 
 
+# ---- rendezvous ---------------------------------------------------------------
+
+
+def _fresh_rendezvous_path():
+    """A unique, unused path for a FileStore rendezvous.
+
+    Not a TCP port: binding and closing a socket to pick one leaves a race,
+    and each test starts eight workers.
+    """
+    handle, path = tempfile.mkstemp(prefix="flashinfer_ulysses_pg_")
+    os.close(handle)
+    # torch's FileStore wants to create the file itself.
+    os.unlink(path)
+    return path
+
+
+@contextlib.contextmanager
+def _rendezvous_path():
+    path = _fresh_rendezvous_path()
+    try:
+        yield path
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+
+
 # ---- single-rank fixtures -----------------------------------------------------
 
 
 @pytest.fixture
 def gloo_pg():
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
-    dist.init_process_group(
-        backend="gloo",
-        init_method=f"tcp://127.0.0.1:{port}",
-        rank=0,
-        world_size=1,
-    )
-    yield dist.group.WORLD
-    dist.destroy_process_group()
+    with _rendezvous_path() as rendezvous:
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"file://{rendezvous}",
+            rank=0,
+            world_size=1,
+        )
+        yield dist.group.WORLD
+        dist.destroy_process_group()
 
 
 def _forbid_ipc_and_jit(monkeypatch):
@@ -112,7 +141,7 @@ def _forbid_ipc_and_jit(monkeypatch):
 def _patch_probe_mesh(monkeypatch, world_size):
     monkeypatch.setattr(
         "flashinfer.comm.ulysses_topology.probe_ulysses_rank_topology",
-        lambda device, rank: _full_mesh(world_size)[rank],
+        lambda device, rank, *, probe_pcie=True: _full_mesh(world_size)[rank],
     )
 
 
@@ -128,7 +157,639 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
+def _fake_operand(shape, *, ptr=None):
+    """Host-only stand-in for what ``_pcie_exchange`` touches: shape, data_ptr."""
+    return SimpleNamespace(shape=shape, data_ptr=lambda: ptr)
+
+
+def _make_mock_pcie_comm():
+    """Minimal host-only communicator for PCIe transaction unit tests."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = object.__new__(UlyssesCommunicator)
+    comm._state = ulysses_mod._OPEN
+    comm._broken_reason = None
+    comm._pcie = 123
+    comm._pcie_armed = True
+    comm._pcie_outputs = {}
+    comm._pcie_stream = None
+    comm._pcie_python_teardown_safe = True
+    comm._nvlink_armed = False
+    comm._fa = None
+    comm.device = torch.device("cpu")
+    comm.dtype = torch.float16
+    comm.max_elems = 1 << 20
+    comm.backend = "pcie"
+    comm.transport = "hybrid"
+    comm.rank = 0
+    comm.world_size = 2
+    comm.group = object()
+    comm._gather = lambda payload: [payload, payload]
+    comm.decision = SimpleNamespace(
+        reason="explicit PCIe backend",
+        pcie_plan=SimpleNamespace(
+            transport="hybrid",
+            numa_nodes=(0, 1),
+            nic_names=("mlx5_0", "mlx5_1"),
+            gid_indices=(2, 3),
+        ),
+    )
+    comm.fallback_reason = None
+    return comm
+
+
+# ---- PCIe host/mock regressions -----------------------------------------------
+
+
+def test_out_storage_overlap_is_rejected_before_backend_launch(monkeypatch):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    comm.backend = "nvlink"
+    comm._fa = 1
+    x = torch.empty((1, 2, 4, 2), dtype=torch.float16)
+    overlapping = x.view(1, 4, 2, 2)
+    monkeypatch.setattr(
+        ulysses_mod,
+        "ulysses_a2a",
+        lambda *args, **kwargs: pytest.fail("backend must not be launched"),
+    )
+    with pytest.raises(ValueError, match="must not overlap input storage"):
+        comm.scatter_heads(x, out=overlapping)
+
+
+def test_pcie_explicit_output_uses_native_owned_allocation(monkeypatch):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    calls = []
+    x = torch.empty((1, 2, 4, 2), dtype=torch.float16)
+    # The native slot is allocated flat at max_elems; the caller gets a view.
+    storage = torch.empty(1 << 20, dtype=torch.float16)
+    module = SimpleNamespace(
+        allocate_output=lambda *_args: (calls.append("allocate"), (storage, [1, 2, 3]))[
+            1
+        ],
+        register_output=lambda *_args: pytest.fail(
+            "native allocation is already registered"
+        ),
+        connect_output=lambda *_args: calls.append("connect"),
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args: None)
+
+    shape = (1, 4, 2, 2)
+    result = comm.allocate_output(x, "scatter_heads")
+    assert tuple(result.shape) == shape
+    assert result.data_ptr() == storage.data_ptr()
+    assert calls == ["allocate", "connect"]
+    assert comm._pcie_outputs[storage.data_ptr()] == 0
+
+
+@pytest.mark.parametrize(
+    ("op", "shape"),
+    [
+        ("scatter_heads", (1, 2, 4, 2)),
+        ("gather_heads", (1, 4, 2, 2)),
+    ],
+)
+def test_multirank_pcie_requires_explicit_output(monkeypatch, op, shape):
+    comm = _make_mock_pcie_comm()
+    x = torch.empty(shape, dtype=torch.float16)
+    outputs_before = dict(comm._pcie_outputs)
+    monkeypatch.setattr(
+        comm,
+        "_pcie_exchange",
+        lambda *_args: pytest.fail("native exchange must not run without out="),
+    )
+
+    with pytest.raises(ValueError, match="requires out= from allocate_output"):
+        getattr(comm, op)(x)
+    assert comm._pcie_outputs == outputs_before
+
+
+def test_pcie_native_allocation_failure_participates_in_rollback(monkeypatch):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    module = SimpleNamespace(
+        allocate_output=lambda *_args: (_ for _ in ()).throw(
+            RuntimeError("injected allocation failure")
+        ),
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+
+    gather_count = {"value": 0}
+
+    def gather(payload):
+        gather_count["value"] += 1
+        # This rank failed before it obtained a Tensor; another rank may
+        # already own a native registration and will roll it back locally.
+        peer_ok = (("ok", ("scatter_heads", (1, 2, 4, 2), "torch.float16")), [1, 2, 3])
+        return [payload, peer_ok if gather_count["value"] == 1 else payload]
+
+    comm._gather = gather
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    x = torch.empty((1, 2, 4, 2), dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="BROKEN state"):
+        comm.allocate_output(x, "scatter_heads")
+    assert comm._pcie_outputs == {}
+    assert comm._state == ulysses_mod._BROKEN
+
+
+@pytest.mark.parametrize("failure_stage", ["connect", "connect_outcome"])
+def test_pcie_registration_failure_poisons_and_defers_cleanup(
+    monkeypatch, failure_stage
+):
+    """A failed registration poisons and leaves the pointer for close().
+
+    Rolling back in place would need a ledger that survives a rollback whose own
+    outcome exchange fails; close() already walks every registered pointer and
+    calls the idempotent native disconnect/dispose, so the pointer only has to
+    be recorded before anything can fail.
+    """
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    calls = []
+    block = torch.empty(comm.max_elems, dtype=torch.float16)
+
+    def boom(name):
+        def fail(*_args):
+            raise RuntimeError(f"injected {name}")
+
+        return fail
+
+    module = SimpleNamespace(
+        allocate_output=lambda *_args: (block, [1, 2, 3]),
+        connect_output=(
+            boom("connect") if failure_stage == "connect" else (lambda *_args: None)
+        ),
+        disconnect_output_ptr=lambda *_args: calls.append("disconnect_ptr"),
+        dispose_output_ptr=lambda *_args: calls.append("dispose_ptr"),
+        dispose=lambda *_args: calls.append("dispose_transport"),
+        teardown_safe=lambda *_args: 1,
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args: None)
+
+    if failure_stage == "connect_outcome":
+        seen = {"count": 0}
+
+        def gather(payload):
+            if payload == ("ok",):
+                seen["count"] += 1
+                if seen["count"] == 1:
+                    raise RuntimeError("injected connect_outcome")
+            return [payload, payload]
+
+        comm._gather = gather
+
+    x = torch.empty((1, 2, 4, 2), dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="BROKEN state"):
+        comm.allocate_output(x, "scatter_heads")
+    assert comm._state == ulysses_mod._BROKEN
+    # The pointer is on the books even though the registration never completed.
+    assert block.data_ptr() in comm._pcie_outputs
+
+    comm._gather = lambda payload: [payload, payload]
+    comm.close()
+    assert calls == ["disconnect_ptr", "dispose_ptr", "dispose_transport"]
+    assert comm._pcie_outputs == {}
+    assert comm._state == ulysses_mod._CLOSED
+
+
+@pytest.mark.parametrize(
+    "failure_stage", ["missing_output", "capture", "current_stream"]
+)
+def test_pcie_p2p_pre_enqueue_failure_poisons_collective_close(
+    monkeypatch, failure_stage
+):
+    """A local pre-enqueue failure may strand a peer's asynchronous barrier."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    comm.transport = "p2p"
+    module = SimpleNamespace(
+        teardown_safe=lambda *_args: pytest.fail(
+            "Python poison must reject close without trusting a native query"
+        ),
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda *_args: pytest.fail("poisoned close must not synchronize"),
+    )
+
+    x = torch.empty((1, 2, 4, 2), dtype=torch.float16)
+    out = torch.empty((1, 4, 2, 2), dtype=torch.float16)
+    comm._pcie_outputs[out.data_ptr()] = 0
+    if failure_stage == "missing_output":
+        out = None
+    elif failure_stage == "capture":
+        monkeypatch.setattr(
+            torch.cuda,
+            "is_current_stream_capturing",
+            lambda: (_ for _ in ()).throw(RuntimeError("injected capture failure")),
+        )
+    else:
+        monkeypatch.setattr(
+            torch.cuda,
+            "current_stream",
+            lambda *_args: (_ for _ in ()).throw(
+                RuntimeError("injected current-stream failure")
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="BROKEN state"):
+        comm.scatter_heads(x, out=out)
+
+    assert comm._state == ulysses_mod._BROKEN
+    assert comm._pcie_python_teardown_safe is False
+
+    with pytest.raises(RuntimeError, match="process termination required"):
+        comm.close()
+    assert comm._state == ulysses_mod._CLOSING
+
+
+def test_pcie_p2p_wrapper_failure_poison_is_sticky(monkeypatch):
+    """Wrapper dispatch can fail after stream bookkeeping but before native enqueue."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    comm.transport = "p2p"
+    calls = []
+
+    def fail_exchange(*_args):
+        calls.append("exchange")
+        raise RuntimeError("injected wrapper failure")
+
+    module = SimpleNamespace(exchange=fail_exchange)
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_args: object())
+
+    x = _fake_operand((1, 2, 4, 2))
+    out = SimpleNamespace(data_ptr=lambda: 456)
+    comm._pcie_outputs[456] = 0
+
+    with pytest.raises(RuntimeError, match="BROKEN state"):
+        comm._pcie_exchange(x, out, 0)
+
+    assert calls == ["exchange"]
+    assert comm._state == ulysses_mod._BROKEN
+    assert comm._pcie_python_teardown_safe is False
+
+
+def test_pcie_unsafe_native_work_blocks_every_teardown_stage(monkeypatch):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    comm._pcie_outputs[456] = object()
+    calls = []
+    module = SimpleNamespace(
+        teardown_safe=lambda *_args: (calls.append("teardown_safe"), 0)[1],
+        disconnect_output_ptr=lambda *_args: pytest.fail("must not disconnect"),
+        dispose_output_ptr=lambda *_args: pytest.fail("must not dispose output"),
+        dispose=lambda *_args: pytest.fail("must not dispose transport"),
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda *_args: pytest.fail("unsafe native work must be checked before sync"),
+    )
+
+    with pytest.raises(RuntimeError, match="process termination required"):
+        comm.close()
+
+    assert calls == ["teardown_safe"] * comm._TEARDOWN_ATTEMPTS
+    assert 456 in comm._pcie_outputs
+    assert comm._pcie == 123
+    assert comm._state == ulysses_mod._CLOSING
+
+
+def test_pcie_close_retry_after_peer_dispose_failure(monkeypatch):
+    """A failed group close must leave ``_pcie_armed`` set: the documented
+    recovery is retrying ``close()`` on all ranks, and a rank that disarmed
+    after its own dispose would skip ``_pcie_close()`` on the retry and leave
+    its peers gathering against a missing rank."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    module = SimpleNamespace(
+        teardown_safe=lambda *_args: True,
+        disconnect_output_ptr=lambda *_args: None,
+        dispose_output_ptr=lambda *_args: None,
+        dispose=lambda *_args: None,
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda *_args: None)
+
+    # A peer's transport dispose keeps failing while every local step
+    # succeeds. Rank-locally the dispose stage is the first gather issued
+    # after this rank's transport handle went away.
+    state = {"gathers": 0, "peer_broken": True}
+
+    def gather(payload):
+        state["gathers"] += 1
+        if state["peer_broken"] and comm._pcie is None:
+            return [payload, (1, "rank 1 PCIe transport teardown: peer failed")]
+        return [payload, (0, None)]
+
+    comm._gather = gather
+
+    with pytest.raises(RuntimeError, match=r"retry close\(\) on all ranks"):
+        comm.close()
+    assert comm._pcie is None  # local dispose succeeded...
+    assert comm._pcie_armed is True  # ...but the rank must stay enrolled
+    assert comm._state == ulysses_mod._CLOSING
+
+    state["peer_broken"] = False
+    gathers_before = state["gathers"]
+    comm.close()
+    assert state["gathers"] > gathers_before  # rejoined the collective stages
+    assert comm._pcie_armed is False
+    assert comm._state == ulysses_mod._CLOSED
+
+
+def test_pcie_rotating_input_has_no_python_control_collective(monkeypatch):
+    """Native pre-registers the landing path; pointer changes stay local."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    calls = []
+
+    module = SimpleNamespace(
+        exchange=lambda *_args: calls.append("exchange"),
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    comm._gather = lambda _payload: pytest.fail(
+        "a rotating input must not add a Python control collective"
+    )
+
+    out = SimpleNamespace(data_ptr=lambda: 456)
+    comm._pcie_outputs[456] = 0
+
+    assert comm._pcie_exchange(_fake_operand((1, 2, 4, 2), ptr=111), out, 0) is out
+    assert comm._pcie_exchange(_fake_operand((1, 2, 4, 2), ptr=222), out, 0) is out
+    assert calls == ["exchange", "exchange"]
+
+
+def test_pcie_collectives_bind_to_the_first_caller_stream(monkeypatch):
+    """A second stream must raise: peers order copies against the bound stream."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    calls = []
+
+    first = object()
+    second = object()
+    streams = iter((first, second))
+    module = SimpleNamespace(
+        exchange=lambda *_args: calls.append("exchange"),
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *_args: next(streams))
+
+    x = torch.empty((1, 2, 4, 2), dtype=torch.float16)
+    out = torch.empty((1, 4, 2, 2), dtype=torch.float16)
+    comm._pcie_outputs[out.data_ptr()] = 0
+
+    assert comm.scatter_heads(x, out=out) is out
+    assert comm._pcie_stream is first
+    with pytest.raises(RuntimeError, match="bound to the stream"):
+        comm.scatter_heads(x, out=out)
+    assert calls == ["exchange"]
+
+
+def test_pcie_batch_validation_precedes_capture_and_native(monkeypatch):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    x = torch.empty((2, 2, 4, 2), dtype=torch.float16)
+    out = torch.empty((2, 4, 2, 2), dtype=torch.float16)
+    gather_x = torch.empty((2, 4, 2, 2), dtype=torch.float16)
+    gather_out = torch.empty((2, 2, 4, 2), dtype=torch.float16)
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        lambda: pytest.fail("capture check must follow operand validation"),
+    )
+    monkeypatch.setattr(
+        ulysses_mod,
+        "get_ulysses_pcie_module",
+        lambda: pytest.fail("native must not be reached"),
+    )
+    for call in (
+        lambda: comm.allocate_output(x, "scatter_heads"),
+        lambda: comm.scatter_heads(x),
+        lambda: comm.scatter_heads(x, out=out),
+        lambda: comm.allocate_output(gather_x, "gather_heads"),
+        lambda: comm.gather_heads(gather_x),
+        lambda: comm.gather_heads(gather_x, out=gather_out),
+    ):
+        with pytest.raises(ValueError, match="batch=1"):
+            call()
+    assert comm._state == ulysses_mod._OPEN
+
+
+def test_pcie_hybrid_mkey_pitch_validation_precedes_native(monkeypatch):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    scatter_x = torch.empty((1, 1, 128, 256), dtype=torch.float16)
+    gather_x = torch.empty((1, 2, 64, 256), dtype=torch.float16)
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_current_stream_capturing",
+        lambda: pytest.fail("capture check must follow mlx5 geometry validation"),
+    )
+    monkeypatch.setattr(
+        ulysses_mod,
+        "get_ulysses_pcie_module",
+        lambda: pytest.fail("native must not be reached"),
+    )
+    for call in (
+        lambda: comm.allocate_output(scatter_x, "scatter_heads"),
+        lambda: comm.scatter_heads(scatter_x),
+        lambda: comm.allocate_output(gather_x, "gather_heads"),
+        lambda: comm.gather_heads(gather_x),
+    ):
+        with pytest.raises(ValueError, match=r"element_size <= 65535.*got 65536"):
+            call()
+    assert comm._state == ulysses_mod._OPEN
+
+    # The limit belongs to mlx5 interleaved MKeys, not the CUDA P2P route.
+    comm.transport = "p2p"
+    comm._validate(scatter_x, "scatter_heads")
+    comm._validate(gather_x, "gather_heads")
+
+    # The largest two-byte row with H=2 below the provider limit remains valid.
+    comm.transport = "hybrid"
+    comm._validate(
+        torch.empty((1, 1, 2, 16_383), dtype=torch.float16),
+        "scatter_heads",
+    )
+
+
+def test_pcie_allocate_output_rejects_capture_before_allocation(monkeypatch):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    x = torch.empty((1, 2, 4, 2), dtype=torch.float16)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        ulysses_mod,
+        "get_ulysses_pcie_module",
+        lambda: pytest.fail("allocation must not run during capture"),
+    )
+    with pytest.raises(RuntimeError, match="CUDA graph capture"):
+        comm.allocate_output(x, "scatter_heads")
+
+
+def test_pcie_init_cleanup_disposes_without_synchronize(monkeypatch):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    calls = []
+    monkeypatch.setattr(
+        ulysses_mod,
+        "get_ulysses_pcie_module",
+        lambda: SimpleNamespace(dispose=lambda *_args: calls.append("dispose")),
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: contextlib.nullcontext())
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda *_args: pytest.fail("init cleanup has no exchange work to synchronize"),
+    )
+    assert comm._pcie_init_cleanup("injected init failure") == "injected init failure"
+    assert calls == ["dispose"]
+    assert comm._pcie is None
+
+
+@pytest.mark.parametrize(
+    ("transport", "gid_indices", "expected_tail"),
+    [
+        ("hybrid", tuple(range(2, 10)), (1, 2)),
+        ("p2p", (), (0, -1)),
+    ],
+)
+def test_pcie_init_passes_exact_local_gid_index(
+    monkeypatch, transport, gid_indices, expected_tail
+):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    comm = _make_mock_pcie_comm()
+    comm.transport = transport
+    comm.decision.pcie_plan.transport = transport
+    if transport == "hybrid":
+        comm.world_size = 8
+        comm.decision.pcie_plan.numa_nodes = (0, 0, 0, 0, 1, 1, 1, 1)
+        comm.decision.pcie_plan.nic_names = tuple(f"mlx5_{rank}" for rank in range(8))
+        comm._gather = lambda payload: [payload] * comm.world_size
+    comm.decision.pcie_plan.gid_indices = gid_indices
+    init_args = []
+    module = SimpleNamespace(
+        init=lambda *args: (init_args.append(args), (456, [1, 2, 3]))[1],
+        connect=lambda *_args: None,
+    )
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", lambda: module)
+
+    assert comm._pcie_init_transaction() is None
+    assert comm._pcie == 456
+    # (use_rdma, gid_index) tail of the native init call
+    assert init_args[0][-2:] == expected_tail
+    assert init_args[0][4] == comm.decision.pcie_plan.nic_names[comm.rank]
+
+
 # ---- constructor: backend selection before IPC/JIT ---------------------------
+
+
+@requires_cuda
+def test_ctor_pcie_world_size_one_is_identity_without_native(gloo_pg, monkeypatch):
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    _patch_probe_mesh(monkeypatch, 1)
+
+    def forbid_native(*_args, **_kwargs):
+        pytest.fail("world-size-one PCIe identity must not JIT or initialize native")
+
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", forbid_native)
+    monkeypatch.setattr(ulysses_mod, "gen_ulysses_pcie_module", forbid_native)
+    comm = UlyssesCommunicator(
+        gloo_pg,
+        max_elems=1 << 16,
+        dtype=torch.float16,
+        backend="pcie",
+        device=torch.device("cuda", torch.cuda.current_device()),
+    )
+    assert comm.backend == "pcie"
+    assert comm.transport == "p2p"
+    assert comm._pcie_armed is False
+    assert comm._pcie is None
+
+    x = torch.randn((1, 2, 4, 2), dtype=torch.float16, device=comm.device)
+    assert comm.scatter_heads(x) is x
+    assert comm.gather_heads(x) is x
+    out = comm.allocate_output(x, "scatter_heads")
+    assert out.data_ptr() != x.data_ptr()
+    assert comm.scatter_heads(x, out=out) is out
+    torch.cuda.synchronize(comm.device)
+    assert torch.equal(out, x)
+    comm.close()
+    assert comm._state == ulysses_mod._CLOSED
+
+
+@requires_cuda
+def test_ctor_pcie_dtype_gate(gloo_pg, monkeypatch):
+    """PCIe accepts the 1/2/4-byte element types; other backends keep the
+    narrow set, and unsupported dtypes raise the joint config error."""
+    ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
+    _patch_probe_mesh(monkeypatch, 1)
+
+    def forbid_native(*_args, **_kwargs):
+        pytest.fail("world-size-one PCIe identity must not JIT or initialize native")
+
+    monkeypatch.setattr(ulysses_mod, "get_ulysses_pcie_module", forbid_native)
+    monkeypatch.setattr(ulysses_mod, "gen_ulysses_pcie_module", forbid_native)
+    device = torch.device("cuda", torch.cuda.current_device())
+    for dtype in (
+        torch.float32,
+        torch.int8,
+        torch.uint8,
+        torch.float8_e4m3fn,
+        torch.float8_e5m2,
+    ):
+        comm = UlyssesCommunicator(
+            gloo_pg, max_elems=1 << 10, dtype=dtype, backend="pcie", device=device
+        )
+        x = torch.zeros((1, 2, 4, 2), dtype=dtype, device=device)
+        assert comm.scatter_heads(x) is x
+        comm.close()
+    with pytest.raises(ValueError, match="dtype must be one of"):
+        UlyssesCommunicator(
+            gloo_pg,
+            max_elems=1 << 10,
+            dtype=torch.float64,
+            backend="pcie",
+            device=device,
+        )
+    with pytest.raises(ValueError, match="dtype must be one of"):
+        UlyssesCommunicator(
+            gloo_pg, max_elems=1 << 10, dtype=torch.int8, backend="nccl", device=device
+        )
+
+
+def test_joint_config_validation_uses_gathered_backends():
+    """The verdict must be a pure function of the gathered configs, so every
+    rank raises (or passes) together whatever backend it requested locally."""
+    encode = UlyssesCommunicator._encode_config
+    pcie_int8 = encode(1 << 10, torch.int8, "cuda:0", "pcie")
+    UlyssesCommunicator._validate_configs_jointly(
+        None, [pcie_int8, encode(1 << 10, torch.int8, "cuda:0", "pcie")]
+    )
+    with pytest.raises(ValueError, match="dtype must be one of"):
+        UlyssesCommunicator._validate_configs_jointly(
+            None, [pcie_int8, encode(1 << 10, torch.int8, "cuda:0", "nccl")]
+        )
 
 
 @requires_cuda
@@ -425,30 +1086,35 @@ DTYPES = [torch.float16, torch.bfloat16, torch.float32]
 _PG_BACKEND_OVERRIDES = {"_none_backend_body": None}
 
 
-def _init_pg(rank, world_size, port, pg_backend="nccl"):
+def _init_pg(rank, world_size, rendezvous, pg_backend="nccl"):
     torch.cuda.set_device(rank)
     dist.init_process_group(
         backend=pg_backend,
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=f"file://{rendezvous}",
         rank=rank,
         world_size=world_size,
+        # Bounded so a rendezvous that never completes fails as this rank's
+        # pg-error instead of stalling on torch's default timeout.
+        timeout=datetime.timedelta(seconds=90),
     )
     return dist.group.WORLD
 
 
-def _worker_main(rank, world_size, port, body_name, arg, allow_skip, q):
+def _worker_main(rank, world_size, rendezvous, body_name, arg, allow_skip, q):
     """Common worker skeleton (top-level: spawn must pickle it by name):
     outcome computed, teardown finished, then a single q.put. The *topology*
     rejection class (UlyssesBackendError) becomes ('skip', ...) only for
     tests that explicitly opted in (real-probe forced-NVLink tests on
     non-NVLink machines); fake-topology and fault-injection tests must FAIL
     on it — a regressed resolver rejecting a fake full mesh is a bug, not a
-    hardware limitation. Runtime init/JIT/IPC failures always FAIL."""
+    hardware limitation. Runtime init/JIT/IPC failures always FAIL, except
+    that PCIe bodies pre-probe the verbs/mlx5 toolchain and re-raise a missing
+    one as UlyssesBackendError so a machine without RDMA headers skips."""
     body = globals()[body_name]
     outcome = None
     try:
         group = _init_pg(
-            rank, world_size, port, _PG_BACKEND_OVERRIDES.get(body_name, "nccl")
+            rank, world_size, rendezvous, _PG_BACKEND_OVERRIDES.get(body_name, "nccl")
         )
         try:
             outcome = body(rank, world_size, group, arg)
@@ -544,6 +1210,332 @@ def _stream_body(rank, world_size, group, backend):
     assert torch.equal(back, x), "round-trip on non-default stream mismatch"
     comm.close()
     return ("ok", comm.backend)
+
+
+# One attention layer's two geometries: a fused-QKV scatter operand carrying
+# 3 * heads, and the attention output carrying heads / world_size. The
+# sequence length is a multiple of 64 so it divides every supported world
+# size.
+_LAYER_HEADS = 56
+_LAYER_HEAD_DIM = 128
+_LAYER_SEQ_LENS = (37888,)
+
+
+def _pcie_layer_shape_body(rank, world_size, group, seq):
+    """Both operands of one attention layer, at production scale.
+
+    The toy shapes elsewhere in this file pin the layout algebra; this pins the
+    two geometries a real layer asks for, where the operand is hundreds of
+    MiB and the hybrid route's head-row pitch starts to matter.
+    """
+    dtype = torch.bfloat16
+    device = torch.device("cuda", rank)
+    missing = missing_ulysses_pcie_dependencies()
+    if missing:
+        raise UlyssesBackendError(
+            f"PCIe transport needs {', '.join(missing)}, missing on this machine"
+        )
+
+    local_seq = seq // world_size
+    packed_heads = 3 * _LAYER_HEADS
+    # Both ops keep numel across the exchange, and the fused-QKV scatter is the
+    # larger of the two, so it alone sizes every registration.
+    capacity = local_seq * packed_heads * _LAYER_HEAD_DIM
+
+    qkv = torch.randn(
+        (1, local_seq, packed_heads, _LAYER_HEAD_DIM), dtype=dtype, device=device
+    )
+    attn_out = torch.randn(
+        (1, local_seq, _LAYER_HEADS, _LAYER_HEAD_DIM), dtype=dtype, device=device
+    )
+    reference_qkv = _ref_scatter_heads(qkv, world_size, rank, group)
+
+    with UlyssesCommunicator(
+        group, max_elems=capacity, dtype=dtype, backend="pcie", device=device
+    ) as comm:
+        assert comm.backend == "pcie"
+        if world_size == 8 and comm.transport != "rdma":
+            raise UlyssesBackendError(
+                f"eight-rank all-RDMA route unavailable: {comm.decision.reason}"
+            )
+
+        qkv_out = comm.allocate_output(qkv, "scatter_heads")
+        exchanged = comm.scatter_heads(qkv, out=qkv_out)
+        torch.cuda.synchronize(device)
+        assert exchanged.shape == (
+            1,
+            seq,
+            packed_heads // world_size,
+            _LAYER_HEAD_DIM,
+        )
+        assert torch.equal(exchanged, reference_qkv), seq
+
+        # The DiT re-views that result as [seq, H/ws, 3, D] and hands attention
+        # three strided head slices. Check the view is the one it expects.
+        merged = exchanged.view(seq, _LAYER_HEADS // world_size, 3, _LAYER_HEAD_DIM)
+        for index in range(3):
+            assert merged[:, :, index].shape == (
+                seq,
+                _LAYER_HEADS // world_size,
+                _LAYER_HEAD_DIM,
+            )
+
+        # The output side is a separate geometry, not the inverse of the fused
+        # scatter: attention returns 56/ws heads of the full sequence.
+        sharded_out = comm.allocate_output(attn_out, "scatter_heads")
+        sharded = comm.scatter_heads(attn_out, out=sharded_out)
+        torch.cuda.synchronize(device)
+        assert sharded.shape == (
+            1,
+            seq,
+            _LAYER_HEADS // world_size,
+            _LAYER_HEAD_DIM,
+        )
+        restored_out = comm.allocate_output(sharded, "gather_heads")
+        restored = comm.gather_heads(sharded, out=restored_out)
+        torch.cuda.synchronize(device)
+        assert torch.equal(restored, attn_out), seq
+
+    return ("ok", f"seq={seq}")
+
+
+def _pcie_correctness_body(rank, world_size, group, test_case):
+    scenario, dtype_name = test_case
+    dtype = getattr(torch, dtype_name)
+    device = torch.device("cuda", rank)
+    # The module links libibverbs/libmlx5 even for an all-P2P route, so report
+    # a missing toolchain as the skip class. A build failure with the
+    # toolchain present stays a hard failure.
+    missing = missing_ulysses_pcie_dependencies()
+    if missing:
+        raise UlyssesBackendError(
+            f"PCIe transport needs {', '.join(missing)}, missing on this machine"
+        )
+    if scenario == "p2p":
+        os.environ["FLASHINFER_ULYSSES_PCIE_ROUTE"] = "p2p"
+    if scenario == "rdma":
+        os.environ["FLASHINFER_ULYSSES_PCIE_ROUTE"] = "rdma"
+    if scenario == "hybrid":
+        os.environ["FLASHINFER_ULYSSES_PCIE_ROUTE"] = "hybrid"
+    if scenario == "wrong-current-device":
+        torch.cuda.set_device((rank + 1) % world_size)
+    caller_device = torch.cuda.current_device()
+
+    shape = (1, 4, world_size * 2, 16)
+    q, k, v = (torch.randn(shape, dtype=dtype, device=device) for _ in range(3))
+    # The varying-shape sweep below goes up to 8x the base sequence length, and
+    # max_elems is the capacity every registration is sized from.
+    varying_steps = 8
+    capacity = varying_steps * 4 * world_size * 2 * 16
+    reference_q = _ref_scatter_heads(q, world_size, rank, group)
+    reference_k = _ref_scatter_heads(k, world_size, rank, group)
+    reference_v = _ref_scatter_heads(v, world_size, rank, group)
+
+    with UlyssesCommunicator(
+        group,
+        max_elems=capacity,
+        dtype=q.dtype,
+        backend="pcie",
+        device=device,
+    ) as comm:
+        assert comm.backend == "pcie"
+        if scenario == "rdma":
+            # A host without a usable per-rank NIC plans all-P2P instead;
+            # that is a hardware property, not a regression, so skip.
+            if comm.transport != "rdma":
+                raise UlyssesBackendError(
+                    f"all-RDMA route unavailable: {comm.decision.reason}"
+                )
+        elif scenario == "hybrid":
+            if comm.transport != "hybrid":
+                raise UlyssesBackendError(
+                    f"hybrid route unavailable: {comm.decision.reason}"
+                )
+        elif world_size < 8 or scenario == "p2p":
+            # These routes are pure CUDA P2P by construction, so the transport
+            # is fully determined by the requested configuration.
+            assert comm.transport == "p2p", (comm.transport, comm.decision.reason)
+        elif comm.transport != "rdma":
+            # auto at eight ranks prefers all-RDMA. The toolchain probe does
+            # not prove a usable NIC or RoCE v2 GID exists; planning all-P2P
+            # there is correct, so skip.
+            raise UlyssesBackendError(
+                f"eight-rank all-RDMA route unavailable: {comm.decision.reason}"
+            )
+        assert torch.cuda.current_device() == caller_device
+
+        explicit_q = comm.allocate_output(q, "scatter_heads")
+        explicit_k = comm.allocate_output(k, "scatter_heads")
+        explicit_v = comm.allocate_output(v, "scatter_heads")
+        explicit_gather = comm.allocate_output(explicit_q, "gather_heads")
+        q_out = comm.scatter_heads(q, out=explicit_q)
+        k_out = comm.scatter_heads(k, out=explicit_k)
+        v_out = comm.scatter_heads(v, out=explicit_v)
+        assert len({q_out.data_ptr(), k_out.data_ptr(), v_out.data_ptr()}) == 3
+        torch.cuda.synchronize(device)
+        assert torch.equal(q_out, reference_q)
+        assert torch.equal(k_out, reference_k)
+        assert torch.equal(v_out, reference_v)
+        assert torch.cuda.current_device() == caller_device
+
+        gather_out = comm.gather_heads(q_out, out=explicit_gather)
+        torch.cuda.synchronize(device)
+        assert torch.equal(gather_out, q)
+
+        if comm.transport == "p2p":
+            # Only the RDMA routes' interleaved MKeys force batch=1; the
+            # peer copy loops over the batch axis, so the P2P route must
+            # accept batch > 1.
+            batched = torch.randn((2,) + tuple(shape[1:]), dtype=dtype, device=device)
+            batched_reference = _ref_scatter_heads(batched, world_size, rank, group)
+            batched_scatter = comm.allocate_output(batched, "scatter_heads")
+            batched_gather = comm.allocate_output(batched_scatter, "gather_heads")
+            batched_out = comm.scatter_heads(batched, out=batched_scatter)
+            torch.cuda.synchronize(device)
+            assert torch.equal(batched_out, batched_reference)
+            assert torch.equal(
+                comm.gather_heads(batched_out, out=batched_gather), batched
+            )
+            torch.cuda.synchronize(device)
+            del batched_out
+        else:
+            # Not pytest.raises: its Failed derives from BaseException and
+            # would skip the worker's outcome queue; keep the bare-assert
+            # shape every other worker body uses.
+            batch_rejected = False
+            try:
+                comm.scatter_heads(
+                    torch.randn((2,) + tuple(shape[1:]), dtype=dtype, device=device)
+                )
+            except ValueError as e:
+                batch_rejected = "batch=1" in str(e)
+            assert batch_rejected, "hybrid route accepted batch > 1"
+
+        assert (
+            len({explicit_q.data_ptr(), explicit_k.data_ptr(), explicit_v.data_ptr()})
+            == 3
+        )
+        assert comm.scatter_heads(q, out=explicit_q) is explicit_q
+        assert comm.scatter_heads(k, out=explicit_k) is explicit_k
+        assert comm.scatter_heads(v, out=explicit_v) is explicit_v
+        assert comm.gather_heads(explicit_q, out=explicit_gather) is explicit_gather
+        torch.cuda.synchronize(device)
+        assert torch.equal(explicit_q, reference_q)
+        assert torch.equal(explicit_k, reference_k)
+        assert torch.equal(explicit_v, reference_v)
+        assert torch.equal(explicit_gather, q)
+
+        # Capture for real: the all-P2P route must replay correctly, the
+        # hybrid one must refuse. Every rank takes the same branch, so the
+        # collective call sequence stays aligned.
+        graph_in = torch.empty_like(q)
+        graph_inputs = [torch.randn_like(q) for _ in range(3)]
+        graph_references = [
+            _ref_scatter_heads(candidate, world_size, rank, group)
+            for candidate in graph_inputs
+        ]
+        capture_stream = torch.cuda.Stream(device=device)
+        capture_stream.wait_stream(torch.cuda.current_stream(device))
+        refused = [
+            ("allocate_output", lambda: comm.allocate_output(q, "scatter_heads"))
+        ]
+        if comm.transport in ("hybrid", "rdma"):
+            refused.append(
+                ("scatter_heads", lambda: comm.scatter_heads(q, out=explicit_q))
+            )
+        with torch.cuda.stream(capture_stream):
+            for name, call in refused:
+                # A fresh graph per attempt: the context manager still ends the
+                # capture when the body raises, so the instance would already
+                # own a graph on a second use.
+                graph = torch.cuda.CUDAGraph()
+                try:
+                    with torch.cuda.graph(graph):
+                        call()
+                except RuntimeError as error:
+                    message = str(error)
+                    assert "cuda graph" in message.lower(), message
+                else:
+                    raise AssertionError(f"PCIe {name} must refuse graph capture")
+                del graph
+
+            if comm.transport == "p2p":
+                # The epoch advances in device memory, so a replay advances it
+                # for real. Replay against changing input: a graph that
+                # re-published a stale epoch would sail through both barriers
+                # and hand back the previous replay's bytes.
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    comm.scatter_heads(graph_in, out=explicit_q)
+                for candidate, expected in zip(
+                    graph_inputs, graph_references, strict=False
+                ):
+                    graph_in.copy_(candidate)
+                    graph.replay()
+                    capture_stream.synchronize()
+                    assert torch.equal(explicit_q, expected), (
+                        "a replayed PCIe graph must exchange the current input"
+                    )
+                del graph
+        torch.cuda.current_stream(device).wait_stream(capture_stream)
+        torch.cuda.synchronize(device)
+
+        # Whatever the capture did -- refused, or captured and replayed -- the
+        # communicator must still work eagerly afterwards.
+        assert torch.equal(comm.scatter_heads(q, out=explicit_q), reference_q), (
+            "a refused capture must not disturb the next exchange"
+        )
+        torch.cuda.synchronize(device)
+
+        # Pre-register each sequence geometry once, then reuse it. A serving
+        # integration applies the same bounded geometry cache policy.
+        varying_cases = []
+        for step in range(1, varying_steps + 1):
+            varying = torch.randn(
+                (1, 4 * step, world_size * 2, 16), dtype=dtype, device=device
+            )
+            varying_out = comm.allocate_output(varying, "scatter_heads")
+            varied = comm.scatter_heads(varying, out=varying_out)
+            reference_varied = _ref_scatter_heads(varying, world_size, rank, group)
+            torch.cuda.synchronize(device)
+            assert torch.equal(varied, reference_varied), step
+            varying_cases.append((varying, varying_out, reference_varied))
+        registrations = len(comm._pcie_outputs)
+        for varying, varying_out, reference_varied in varying_cases:
+            assert torch.equal(
+                comm.scatter_heads(varying, out=varying_out), reference_varied
+            )
+        torch.cuda.synchronize(device)
+        assert len(comm._pcie_outputs) == registrations
+
+        # Reuse one registered output while ranks arrive at deliberately skewed
+        # times. Each clone consumes the previous epoch on the caller stream;
+        # the next opening barrier must prevent a faster rank from overwriting
+        # that output remotely before every peer has consumed it.
+        snapshots = []
+        expected = []
+        skew_input = torch.empty_like(q)
+        for step in range(12):
+            skew_input.fill_(step * 32 + rank)
+            result = comm.scatter_heads(skew_input, out=explicit_q)
+            snapshots.append(result.clone())
+            blocks = [
+                torch.full_like(result[:, : shape[1]], step * 32 + peer)
+                for peer in range(world_size)
+            ]
+            expected.append(torch.cat(blocks, dim=1))
+            if rank == 0 and step % 3 == 0:
+                time.sleep(0.01)
+        torch.cuda.synchronize(device)
+        for actual, wanted in zip(snapshots, expected, strict=True):
+            assert torch.equal(actual, wanted)
+
+        # Collectives are bound to the stream of their first call; the
+        # second-stream refusal is covered by the host-only binding test.
+        assert torch.cuda.current_device() == caller_device
+
+    assert torch.cuda.current_device() == caller_device
+    return ("ok", test_case)
 
 
 def _divisibility_body(rank, world_size, group, _arg):
@@ -1150,13 +2142,11 @@ def _run_multi_rank(body_name, world_size, arg, timeout=300, allow_skip=False):
 
     ctx = std_mp.get_context("spawn")
     q = ctx.Queue()
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
+    rendezvous = _fresh_rendezvous_path()
     procs = [
         ctx.Process(
             target=_worker_main,
-            args=(r, world_size, port, body_name, arg, allow_skip, q),
+            args=(r, world_size, rendezvous, body_name, arg, allow_skip, q),
         )
         for r in range(world_size)
     ]
@@ -1181,6 +2171,8 @@ def _run_multi_rank(body_name, world_size, arg, timeout=300, allow_skip=False):
             if p.is_alive():
                 p.kill()
                 p.join(timeout=10)
+        with contextlib.suppress(OSError):
+            os.unlink(rendezvous)
     assert len(results) == world_size, (
         f"only ranks {sorted(results)} reported within {timeout}s: {results}"
     )
@@ -1189,7 +2181,7 @@ def _run_multi_rank(body_name, world_size, arg, timeout=300, allow_skip=False):
         f"workers must exit naturally with code 0, got {exitcodes} (results: {results})"
     )
     if all(kind == "skip" for kind, _ in results.values()):
-        pytest.skip(f"NVLink path unavailable: {results[0][1]}")
+        pytest.skip(f"backend unavailable on this machine: {results[0][1]}")
     for rank, (kind, payload) in results.items():
         assert kind == "ok", f"rank {rank} failed: {kind}: {payload}"
     return results
@@ -1209,6 +2201,135 @@ def test_correctness_forced_nccl(world_size):
     # W=3 also proves the NCCL backend covers world sizes the fused kernel
     # does not support.
     _run_multi_rank("_correctness_body", world_size, "nccl")
+
+
+@pytest.mark.parametrize(
+    ("world_size", "dtype_name"),
+    [
+        (2, "float16"),
+        (2, "bfloat16"),
+        (4, "bfloat16"),
+        (4, "float32"),
+        (8, "bfloat16"),
+    ],
+)
+def test_correctness_forced_pcie(world_size, dtype_name):
+    _run_multi_rank(
+        "_pcie_correctness_body",
+        world_size,
+        ("explicit-output", dtype_name),
+        timeout=600,
+        allow_skip=True,
+    )
+
+
+def _pcie_dtype_body(rank, world_size, group, dtype_name):
+    """Byte-exact round trip for element types the reference collectives
+    cannot carry: the data is random bytes viewed as the dtype, and both the
+    reference and the comparison run in the uint8 view."""
+    dtype = getattr(torch, dtype_name)
+    device = torch.device("cuda", rank)
+    missing = missing_ulysses_pcie_dependencies()
+    if missing:
+        raise UlyssesBackendError(
+            f"PCIe transport needs {', '.join(missing)}, missing on this machine"
+        )
+    esize = torch.empty((), dtype=dtype).element_size()
+    torch.manual_seed(2000 + rank)
+    raw = torch.randint(
+        0, 256, (1, 16, world_size * 2, 16 * esize), dtype=torch.uint8, device=device
+    )
+    x = raw.view(dtype)
+    with UlyssesCommunicator(
+        max_elems=x.numel(), dtype=dtype, backend="pcie", device=device
+    ) as comm:
+        scatter_out = comm.allocate_output(x, "scatter_heads")
+        gather_out = comm.allocate_output(scatter_out, "gather_heads")
+        comm.scatter_heads(x, out=scatter_out)
+        torch.cuda.synchronize(device)
+        assert torch.equal(
+            scatter_out.view(torch.uint8),
+            _ref_scatter_heads(raw, world_size, rank, group),
+        )
+        comm.gather_heads(scatter_out, out=gather_out)
+        torch.cuda.synchronize(device)
+        assert torch.equal(gather_out.view(torch.uint8), raw)
+    return ("ok", dtype_name)
+
+
+@pytest.mark.parametrize(
+    ("world_size", "dtype_name"),
+    [
+        (2, "uint8"),
+        (4, "int8"),
+        (4, "float8_e4m3fn"),
+        (8, "float8_e5m2"),
+    ],
+)
+def test_correctness_forced_pcie_dtypes(world_size, dtype_name):
+    """1-byte element types ride the byte-exact round trip; float32 runs the
+    full correctness family above."""
+    _run_multi_rank(
+        "_pcie_dtype_body",
+        world_size,
+        dtype_name,
+        timeout=600,
+        allow_skip=True,
+    )
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_correctness_forced_pcie_rdma(world_size):
+    """All-RDMA route forced by FLASHINFER_ULYSSES_PCIE_ROUTE=rdma."""
+    _run_multi_rank(
+        "_pcie_correctness_body",
+        world_size,
+        ("rdma", "bfloat16"),
+        timeout=600,
+        allow_skip=True,
+    )
+
+
+@pytest.mark.parametrize("seq", _LAYER_SEQ_LENS)
+def test_correctness_forced_pcie_layer_shapes(seq):
+    """Layer-scale operands on the eight-rank preferred (all-RDMA) route."""
+    _run_multi_rank(
+        "_pcie_layer_shape_body",
+        8,
+        seq,
+        timeout=900,
+        allow_skip=True,
+    )
+
+
+def test_correctness_forced_pcie_ws8_all_p2p():
+    _run_multi_rank(
+        "_pcie_correctness_body",
+        8,
+        ("p2p", "bfloat16"),
+        timeout=600,
+        allow_skip=True,
+    )
+
+
+def test_correctness_forced_pcie_ws8_hybrid():
+    _run_multi_rank(
+        "_pcie_correctness_body",
+        8,
+        ("hybrid", "bfloat16"),
+        timeout=600,
+        allow_skip=True,
+    )
+
+
+def test_pcie_explicit_device_does_not_depend_on_current_device():
+    _run_multi_rank(
+        "_pcie_correctness_body",
+        2,
+        ("wrong-current-device", "bfloat16"),
+        timeout=600,
+        allow_skip=True,
+    )
 
 
 def test_api_auto_ws3_falls_back_to_nccl():
