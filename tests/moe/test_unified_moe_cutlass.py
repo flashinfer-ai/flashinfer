@@ -109,6 +109,23 @@ def test_cutlass_bf16_config_architectures_and_registration():
     assert _BACKEND_RUNNERS[CutlassHummingConfig] is CutlassHummingRunner
 
 
+def test_cutlass_quant_runner_activation_capabilities():
+    expanded = (SwiGLU, SwiGLUStep, GeGLUTanh, ReLU2, SiTU)
+    assert CutlassBf16Runner.supported_activation_classes == expanded
+    assert CutlassW4A16Runner.supported_activation_classes == expanded
+
+    for runner_cls in (
+        CutlassNvfp4Runner,
+        CutlassFp8PerTensorRunner,
+        CutlassFp8BlockRunner,
+        CutlassMxfp8Mxfp4Runner,
+        CutlassMxfp8Runner,
+        CutlassW4A8Runner,
+        CutlassHummingRunner,
+    ):
+        assert runner_cls.__dict__["supported_activation_classes"] == (SwiGLU,)
+
+
 def test_all_registered_runners_use_enforced_lifecycle():
     for runner_type in _BACKEND_RUNNERS.values():
         assert issubclass(runner_type, MoERunner)
@@ -585,6 +602,18 @@ def test_cutlass_rejects_situ_shapes_its_abi_cannot_express(activation, match):
         runner.check_support()
 
 
+def test_cutlass_situ_unclamped_linear_fails_legibly():
+    """Calling the helper directly bypasses check_support's rejection.
+
+    Without the guard torch.full(None) raises an opaque argument-combination
+    TypeError naming neither the activation nor the backend.
+    """
+    from flashinfer.fused_moe.runners import _cutlass_activation_params
+
+    with pytest.raises(NotImplementedError, match="unclamped linear-branch"):
+        _cutlass_activation_params(SiTU(linear_scale=None), 4, torch.device("cpu"))
+
+
 def test_cutlass_situ_per_expert_overrides_are_read():
     """A supplied situ_* tensor must reach the kernel params.
 
@@ -803,9 +832,9 @@ def test_cutlass_runner_rejects_out_of_scope_configs(config, match):
         (
             _config(
                 quant=QuantConfig(variant=QuantVariant.NVFP4),
-                activation=ActivationConfig(ActivationType.Relu2),
+                activation=ReLU2(),
             ),
-            "Swiglu",
+            "SwiGLU",
         ),
         (
             _config(

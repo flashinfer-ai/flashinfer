@@ -31,6 +31,7 @@ Two sections:
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 from typing import Callable, ClassVar
 
 import pytest
@@ -1047,6 +1048,33 @@ class TestMoERunnerSupport:
         runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)
         runner.config = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
         assert runner.check_support() is None
+
+    def test_cute_dsl_rejects_gated_rows_for_non_gated_activation(self):
+        """A ReLU2 config paired with a default-prepared (SwiGLU) view.
+
+        prepare_weights defaults to SwiGLU, so the view carries 2I rows while
+        the config wants I. The tuner infers intermediate_size from this tensor,
+        so without a boundary check the mismatch surfaces deep in the kernel.
+        """
+        runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)
+        runner.config = self._nvfp4_swiglu(activation=ReLU2())
+        runner._built = True
+        runner._inner = SimpleNamespace(top_k=2)
+
+        intermediate = runner.config.experts.intermediate_size
+        weights = MoEWeightPack()
+        weights.prepare_for(
+            "cute_dsl_nvfp4",
+            {"w1_weight": torch.empty(32, 2 * intermediate, 64, dtype=torch.uint8)},
+        )
+        act = MoEActivationPack(
+            hidden_states_q=torch.empty(4, 64, dtype=torch.uint8),
+            hidden_states_scale=torch.empty(4, 4, dtype=torch.uint8),
+            topk_ids=torch.zeros(4, 2, dtype=torch.int32),
+            topk_weights=torch.ones(4, 2, dtype=torch.bfloat16),
+        )
+        with pytest.raises(ValueError, match="GEMM1 rows"):
+            runner.pack_inputs(act, weights)
 
     def test_cute_dsl_rejects_unrepresentable_situ_clamp(self):
         runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)

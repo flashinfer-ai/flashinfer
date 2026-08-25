@@ -283,7 +283,9 @@ def _validate_prepared_activation_params(
             required += ("gemm1_clamp_limit",)
     elif not activation.is_gated:
         # Non-gated kernels ignore these tensors; reject them rather than
-        # silently accepting ineffective overrides.
+        # silently accepting ineffective overrides. Whether a *gated*
+        # activation accepts them is per-backend (FP4 GeGLU does, FP8 block and
+        # BF16 restrict to Swiglu), so that stays a runner-level decision.
         supplied = [
             name
             for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
@@ -328,6 +330,13 @@ def _cutlass_activation_params(
         "situ_linear_beta": None,
     }
     if isinstance(activation, SiTU):
+        if activation.linear_scale is None:
+            # Normal runner lifecycle rejects this in check_support; keep
+            # direct helper calls explicit as well.
+            raise NotImplementedError(
+                "CUTLASS cannot express SiTU(linear_scale=None); its ABI "
+                "has no unclamped linear-branch encoding."
+            )
         # CUTLASS native defaults match SiTU(), so only custom values need tensors.
         if activation != SiTU():
             params["situ_beta"] = torch.full(
@@ -568,7 +577,9 @@ class _CutlassRunnerBase(MoERunner):
     # Quant-specific CUTLASS runners added after the original BF16/W4A16
     # adapters must opt into broader epilogues only with matching preparation
     # geometry and numerical coverage.
-    supported_activation_classes = (SwiGLU,)
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
+        SwiGLU,
+    )
     supports_expert_parallelism = False
     _supported_archs: ClassVar[tuple[int, ...]]
     _x_dtype: ClassVar[torch.dtype] = torch.bfloat16
@@ -1253,6 +1264,7 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_nvfp4"
     supported_quant_variants = (QuantVariant.NVFP4,)
+    supported_activation_classes = (SwiGLU,)
     _supported_archs = _CUTLASS_NVFP4_ARCHS
     _weight_dtype = torch.int64
     _use_w4_group_scaling = False
@@ -1364,6 +1376,7 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
 
     backend_key = "cutlass_fp8_per_tensor"
     supported_quant_variants = (QuantVariant.FP8PerTensor,)
+    supported_activation_classes = (SwiGLU,)
     _supported_archs = _CUTLASS_FP8_ARCHS
     _x_dtype = torch.float8_e4m3fn
     _weight_dtype = torch.float8_e4m3fn
@@ -1426,6 +1439,7 @@ class CutlassFp8BlockRunner(_CutlassRunnerBase):
 
     backend_key = "cutlass_fp8_block"
     supported_quant_variants = (QuantVariant.DeepSeekFp8,)
+    supported_activation_classes = (SwiGLU,)
     _supported_archs = _CUTLASS_FP8_BLOCK_ARCHS
     _weight_dtype = torch.float8_e4m3fn
     _use_deepseek_fp8_block_scale = True
@@ -1484,6 +1498,7 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_mxfp8_mxfp4"
     supported_quant_variants = (QuantVariant.MXFP4,)
+    supported_activation_classes = (SwiGLU,)
     _supported_archs = _CUTLASS_MXFP8_MXFP4_ARCHS
     _x_dtype = torch.float8_e4m3fn
     _weight_dtype = torch.int64
@@ -1571,6 +1586,7 @@ class CutlassMxfp8Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_mxfp8"
     supported_quant_variants = (QuantVariant.MxFp8,)
+    supported_activation_classes = (SwiGLU,)
     _supported_archs = _CUTLASS_MXFP8_ARCHS
     _x_dtype = torch.float8_e4m3fn
     _weight_dtype = torch.float8_e4m3fn
@@ -1649,6 +1665,7 @@ class CutlassW4A8Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_w4a8"
     supported_quant_variants = (QuantVariant.W4A8,)
+    supported_activation_classes = (SwiGLU,)
     _supported_archs = _CUTLASS_W4A8_ARCHS
     _weight_dtype = torch.uint8
     _use_w4_group_scaling = True
@@ -1744,6 +1761,7 @@ class CutlassHummingRunner(_CutlassRunnerBase):
 
     backend_key = "cutlass_humming"
     supported_quant_variants = (QuantVariant.Humming,)
+    supported_activation_classes = (SwiGLU,)
     _supported_archs = _CUTLASS_HUMMING_ARCHS
     _weight_dtype = torch.uint8
     _use_w4_group_scaling = True
@@ -1957,6 +1975,21 @@ class CuteDslNvfp4Runner(MoERunner):
         _validate_prerouted_inputs(
             act, num_tokens, self._inner.top_k, "CuteDslNvfp4Runner"
         )
+        # prepare_weights defaults to SwiGLU, so a non-gated config paired with a
+        # default-prepared view yields 2I rows. The tuner infers intermediate_size
+        # from this tensor, so the mismatch would surface as a shape error deep in
+        # the kernel rather than here.
+        expected_rows = self.config.experts.intermediate_size * (
+            2 if self.config.activation.is_gated else 1
+        )
+        actual_rows = v["w1_weight"].shape[1]
+        if actual_rows != expected_rows:
+            raise ValueError(
+                f"CuteDslNvfp4Runner: w1_weight has {actual_rows} GEMM1 rows, "
+                f"expected {expected_rows} for "
+                f"{type(self.config.activation).__name__}; prepare the view with "
+                "the same typed activation."
+            )
 
         quant_variant = self.config.quant.variant
         use_per_token_activation = bool(self.config.quant.per_token_scale)
