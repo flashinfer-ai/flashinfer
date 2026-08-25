@@ -9,6 +9,9 @@ import torch.nn.functional as F
 
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
+    # Typed activation values
+    ReLU2,
+    # Unified configs, packs, and runners
     BackendOptions,
     ExpertConfig,
     MoEActivationPack,
@@ -17,7 +20,6 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
-    ReLU2,
     RoutingConfig,
     RoutingInputMode,
     TrtllmMxInt4Config,

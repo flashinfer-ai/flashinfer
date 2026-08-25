@@ -208,18 +208,12 @@ class SwiGLU(ActivationConfig):
 class SiTU(ActivationConfig):
     """SiTU v2 with canonical gate, linear, and optional clamp scales.
 
-    ``linear_scale`` is the linear-branch soft-clamp scale, applied as
-    ``linear_scale * tanh(linear / linear_scale)``. ``None`` selects the
-    unclamped linear branch, which only the CuTe-DSL backend can express; the
-    TRT-LLM ABI has no encoding for it and its runners reject ``None``.
-
-    The defaults are the canonical SiTU (Kimi-K3) scales, which are also the
-    compile-time defaults of the CUTLASS ``SituAdaptor``. They are *not* what
-    every backend falls back to when no per-expert tensor is supplied: the
-    TRT-LLM path reuses the SwiGLU alpha/beta channels, whose null default is
-    ``1.0``/``1.0`` for SiTU. Runners on that path must therefore materialize
-    the scalars even at the default, which is why
-    ``_validate_prepared_activation_params`` requires them unconditionally.
+    ``linear_scale`` applies
+    ``linear_scale * tanh(linear / linear_scale)``; ``None`` selects an
+    unclamped linear branch, currently expressible only by CuTe-DSL. The
+    defaults are the canonical SiTU (Kimi-K3) scales. Backend adapters must
+    lower these exact values or reject unsupported semantics rather than rely
+    on different native defaults.
     """
 
     type: ClassVar[ActivationType] = ActivationType.Situ

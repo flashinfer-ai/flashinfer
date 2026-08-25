@@ -20,22 +20,24 @@ import torch
 from flashinfer.autotuner import autotune
 from flashinfer.fp4_quantization import fp4_quantize
 from flashinfer.fused_moe import (
+    # Typed activation values
+    GeGLU,
+    ReLU2,
+    SiTU,
+    SwiGLU,
+    # Unified configs, packs, and runners
     BackendOptions,
     ExecutionConfig,
     ExpertConfig,
-    GeGLU,
     MoEActivationPack,
     MoEConfig,
     MoELayer,
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
-    ReLU2,
-    RoutingInputMode,
     RoutingConfig,
+    RoutingInputMode,
     RoutingMethodType,
-    SiTU,
-    SwiGLU,
     TrtllmFp4Config,
     TrtllmFp4RoutedRunner,
     trtllm_fp4_block_scale_moe,

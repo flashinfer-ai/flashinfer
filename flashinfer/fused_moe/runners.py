@@ -46,19 +46,21 @@ from .api import (
     _CUTLASS_NVFP4_ARCHS,
     _CUTLASS_W4A16_ARCHS,
     _CUTLASS_W4A8_ARCHS,
+    # Typed activation values
     ActivationConfig,
-    ActivationType,
     GeGLU,
     GeGLUTanh,
+    ReLU2,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
+    # Unified config and pack types
+    ActivationType,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
     QuantVariant,
-    ReLU2,
     RoutingInputMode,
-    SiTU,
-    SwiGLU,
-    SwiGLUStep,
 )
 from .utils import (
     make_hybrid_bucket_mapper,
@@ -244,10 +246,10 @@ def _cute_dsl_activation_kwargs(activation: ActivationConfig) -> dict[str, Any]:
         }
     if isinstance(activation, SiTU):
         return {
-            # The existing ABI selects SiTU as the SwiGLU epilogue plus beta values.
+            # CuTeDSL encodes SiTU as SwiGLU with a non-null situ_beta.
             "activation_type": int(ActivationType.Swiglu),
             "situ_beta": activation.gate_scale,
-            # None reaches the kernel as "no linear-branch tanh clamp".
+            # None means an unclamped linear branch.
             "situ_linear_beta": activation.linear_scale,
         }
     return {"activation_type": int(activation.type)}
@@ -258,18 +260,11 @@ def _validate_prepared_activation_params(
     activation: ActivationConfig,
     runner: str,
 ) -> None:
-    """Reject a weight view prepared without required typed scalar metadata.
-
-    Explicit per-expert tensors in the view remain valid overrides. The check
-    only prevents silently pairing a default-prepared view with a typed
-    activation whose scalar semantics require launcher tensors.
-    """
+    """Validate activation scalars in a backend-prepared weight view."""
     required: tuple[str, ...] = ()
     if isinstance(activation, SwiGLU):
-        # Require a tensor only for the parameters that actually differ from the
-        # kernel's neutral values. Demanding all three would reject a valid
-        # SwiGLU(alpha=1.7) view over beta/limit tensors carrying exactly the
-        # defaults the kernel already applies.
+        # Omitted fields use neutral launcher defaults, so require only values
+        # that differ from the typed default.
         default = SwiGLU()
         if activation.alpha != default.alpha:
             required += ("gemm1_alpha",)
@@ -278,25 +273,17 @@ def _validate_prepared_activation_params(
         if activation.limit != default.limit:
             required += ("gemm1_clamp_limit",)
     elif isinstance(activation, SiTU):
-        # Unconditional, unlike SwiGLU above: this path reuses the SwiGLU
-        # alpha/beta channels, whose null default is 1.0/1.0 for SiTU (see
-        # situ_activation_reference), not the typed default. Omitting the
-        # tensors at the default would silently run 1.0/1.0 instead of the
-        # canonical scales. Note gemm1_beta here is SiTU's multiplicative
-        # linear-branch tanh scale, not SwiGLU's additive beta.
-        #
-        # linear_scale=None is the unclamped linear branch, which has no
-        # per-expert tensor encoding; runners reaching here must have rejected it.
+        # TRTLLM reuses gemm1_alpha/beta, whose null SiTU defaults are 1/1
+        # rather than the typed 4/25. Require explicit tensors even at default.
+        # linear_scale=None is rejected earlier because this ABI cannot encode it.
         required = ("gemm1_alpha",)
         if activation.linear_scale is not None:
             required += ("gemm1_beta",)
         if activation.clamp_limit is not None:
             required += ("gemm1_clamp_limit",)
     elif not activation.is_gated:
-        # The gated-activation epilogue is what reads these per-expert tensors
-        # (see isGatedActivation in trtllm/fused_moe/runner.h). A non-gated
-        # activation ignores them, so accepting one reads as a working override
-        # while the kernel discards it.
+        # Non-gated kernels ignore these tensors; reject them rather than
+        # silently accepting ineffective overrides.
         supplied = [
             name
             for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
@@ -308,9 +295,7 @@ def _validate_prepared_activation_params(
                 f"{supplied}; these per-expert overrides apply to gated "
                 "activations only and would be ignored."
             )
-    # A key carrying None is absent, not supplied: the launcher reads it as
-    # "use the neutral value", which is exactly what the typed activation says
-    # it must not do.
+    # None is equivalent to an absent launcher tensor.
     missing = [name for name in required if view.get(name) is None]
     if missing:
         raise ValueError(
@@ -320,27 +305,11 @@ def _validate_prepared_activation_params(
         )
 
 
-# Canonical keys every _cutlass_activation_params() result carries. A cached
-# mapping missing any of them is treated as uninitialized rather than as a
-# request for kernel defaults.
-_CUTLASS_ACTIVATION_PARAM_KEYS = frozenset(
-    ("swiglu_alpha", "swiglu_beta", "swiglu_limit")
-)
-
-
 @functools.lru_cache(maxsize=None)
 def _cutlass_activation_required_keys(activation: ActivationConfig) -> frozenset[str]:
-    """Keys a cached mapping must supply as tensors for ``activation``.
-
-    Derived from the activation rather than hardcoded, so it cannot drift from
-    what :func:`_cutlass_activation_params` actually materializes. Uses a cheap
-    zero-expert probe: the key set depends only on the activation's type and
-    scalars, never on the expert count or device.
-
-    Cached because this runs once per ``pack_inputs`` while the result depends
-    only on the activation, and typed activations are frozen and hashable. The
-    probe is ~9us, which is small but pure waste on a per-call path.
-    """
+    """Return non-null CUTLASS scalar keys required by ``activation``."""
+    # A zero-expert probe keeps this in sync with the materializer without
+    # depending on expert count or device.
     probe = _cutlass_activation_params(activation, 0, torch.device("cpu"))
     return frozenset(name for name, value in probe.items() if value is not None)
 
@@ -359,9 +328,7 @@ def _cutlass_activation_params(
         "situ_linear_beta": None,
     }
     if isinstance(activation, SiTU):
-        # SituAdaptor's compile-time defaults are the typed defaults, so the
-        # default needs no tensor. This is the opposite of the TRT-LLM path,
-        # whose null default is 1.0/1.0 rather than the canonical scales.
+        # CUTLASS native defaults match SiTU(), so only custom values need tensors.
         if activation != SiTU():
             params["situ_beta"] = torch.full(
                 (num_experts,),
@@ -406,8 +373,7 @@ class MoERunner(TunableRunner):
     backend_key: ClassVar[str] = ""
     supported_routing_modes: tuple[RoutingInputMode, ...] = ()
     supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = ()
-    # Fail closed: every concrete runner must explicitly declare the typed
-    # activations it can execute.
+    # Default to no activations; each concrete runner must declare its support.
     supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = ()
     supported_activation_classes_by_quant: ClassVar[
         dict[QuantVariant, tuple[type[ActivationConfig], ...]]
@@ -730,22 +696,8 @@ class _CutlassRunnerBase(MoERunner):
         self, view: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor | None]:
         """Apply optional per-expert weight-view overrides to typed scalars."""
-        # _build() caches the config-derived scalars. Derive them on demand when
-        # it has not run (or a subclass overrode it without calling super) so
-        # resolution never raises, and never silently drops non-default typed
-        # activation semantics such as SwiGLU(alpha=1.7).
-        #
-        # Treat any mapping missing a canonical key as uninitialized, not just a
-        # missing attribute: an empty or partial cache would otherwise resolve to
-        # kernel defaults just as silently. Cache the result so repeated packing
-        # reuses the same tensors -- reallocating them would invalidate the raw
-        # pointers captured by an existing CUDA graph.
-        # Key presence alone is not enough: an all-None mapping carries every
-        # canonical key yet is exactly what a *default* activation produces, so
-        # a non-default one would silently lose its scalars. A cache is usable
-        # only when it supplies a tensor everywhere the configured activation
-        # needs one -- which is precisely the set of keys the activation itself
-        # declares non-None.
+        # Rebuild an incomplete cache, then retain its tensors so CUDA graphs
+        # keep stable pointers across repeated packing.
         config_params = getattr(self, "_config_activation_params", None)
         required = _cutlass_activation_required_keys(self.config.activation)
         if config_params is None or any(
@@ -2187,13 +2139,10 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             # SM100/SM107 and retains the upstream SM103 xfail in #1754.
             compute_capability = get_compute_capability(self.device)
             if compute_capability == (10, 7) and isinstance(activation, SiTU):
-                # The pinned Rubin BMM artifact predates SiTuGlu: its
-                # gemmGatedAct::ActType is {SwiGlu, GeGlu, None}, so None holds
-                # the value SiTuGlu has elsewhere. activationTypeToGatedActType
-                # still maps Situ to it, and the static asserts that would catch
-                # the mismatch are compiled out under TLLM_RUBIN_FEATURES, so
-                # forwarding SiTU would silently execute no activation. Drop
-                # this once the Rubin pin carries SiTuGlu.
+                # The pinned Rubin BMM lacks SiTuGlu; its enum value collides
+                # with None and would silently disable the activation.
+                # TODO: Update TRTLLM_GEN_BMM_RUBIN to an artifact with
+                # SiTuGlu, then remove this guard and add SM107 parity coverage.
                 raise NotImplementedError(
                     f"{type(self).__name__} does not support SiTU on SM107 with "
                     "the currently pinned Rubin BMM artifact."

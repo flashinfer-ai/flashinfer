@@ -6160,11 +6160,12 @@ def trtllm_fp4_block_scale_moe(
         Block scales for MXFP8 / NVFP4 hidden states of shape
         ``[seq_len, hidden_size // (32 if mxfp8 else 16)]``.  Dtype is float8.
     gemm1_weights : torch.Tensor
-        ``[num_experts, 2 * intermediate_size, hidden_size // 2]`` packed
-        FP4 FC1 weights, dtype ``uint8``.
+        ``[num_experts, M, hidden_size // 2]`` packed FP4 FC1 weights, dtype
+        ``uint8``.  ``M`` is ``2 * intermediate_size`` for gated activations and
+        ``intermediate_size`` for non-gated ones (``6`` Relu2, ``9`` Identity).
     gemm1_weights_scale : torch.Tensor
-        ``[num_experts, 2 * intermediate_size, hidden_size // (32 if mxfp4 else 16)]``
-        FC1 weight block scales, dtype float8.
+        ``[num_experts, M, hidden_size // (32 if mxfp4 else 16)]`` FC1 weight
+        block scales, dtype float8, with the same ``M`` as ``gemm1_weights``.
     gemm1_bias : Optional[torch.Tensor]
         ``[num_experts, 2 * intermediate_size]`` FC1 bias, ``float32``.
     gemm1_alpha : Optional[torch.Tensor]

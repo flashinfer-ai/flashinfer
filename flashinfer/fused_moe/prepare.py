@@ -643,11 +643,8 @@ def prepare_trtllm_fp4_weights(
         "output2_scale_scalar": ones,
     }
     if not is_mxfp4 and activation.is_gated:
-        # ptrGatedActAlpha is only consumed for a gated activation. Emitting it
-        # for ReLU2 would hand the runner a meaningless per-expert tensor and
-        # let _validate_prepared_activation_params accept a view prepared for a
-        # different activation, since the requirement would be satisfied by
-        # this placeholder rather than by real scalars.
+        # NVFP4 gated kernels consume a per-expert gate alpha; non-gated
+        # activations do not, so ReLU2 must not receive this placeholder.
         result["gemm1_alpha"] = ones
     result.update(_activation_param_view(activation, num_local_experts, device))
     return result

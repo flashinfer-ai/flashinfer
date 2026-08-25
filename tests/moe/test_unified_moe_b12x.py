@@ -39,19 +39,21 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
 )
 from flashinfer.fused_moe.api import (
+    # Typed activation values
+    GeGLUTanh,
+    ReLU2,
+    SwiGLU,
+    # Unified config and enum types
     ActivationType,
     BackendOptions,
     ExecutionConfig,
-    MoEFinalizeConfig,
     ExpertConfig,
     MoEConfig,
+    MoEFinalizeConfig,
     QuantConfig,
     QuantVariant,
-    GeGLUTanh,
-    ReLU2,
     RoutingConfig,
     RoutingInputMode,
-    SwiGLU,
 )
 from tests.moe.test_b12x_fused_moe import (  # noqa: E402
     check_accuracy as check_b12x_accuracy,

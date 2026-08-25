@@ -8,6 +8,14 @@ import torch.nn.functional as F
 
 from flashinfer.autotuner import AutoTuner, TuningConfig, autotune
 from flashinfer.fused_moe import (
+    # Typed activation values
+    GeGLUTanh,
+    Identity,
+    ReLU2,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
+    # Unified configs, packs, and runners
     BackendOptions,
     CutlassBf16Config,
     CutlassBf16Runner,
@@ -29,8 +37,6 @@ from flashinfer.fused_moe import (
     CutlassW4A8Runner,
     ExecutionConfig,
     ExpertConfig,
-    GeGLUTanh,
-    Identity,
     MoEActivationPack,
     MoEConfig,
     MoEFinalizeConfig,
@@ -38,12 +44,8 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
-    ReLU2,
     RoutingConfig,
     RoutingInputMode,
-    SiTU,
-    SwiGLU,
-    SwiGLUStep,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe.runners import MoERunner, _mxfp8_swizzled_act_sf_numel
@@ -1591,13 +1593,8 @@ def _reference(
                 elif isinstance(activation, GeGLUTanh):
                     intermediate = F.gelu(gate, approximate="tanh") * up
                 elif isinstance(activation, SiTU):
-                    # SituAdaptor:
-                    #   (beta * tanh(gate/beta) * sigmoid(gate))
-                    #   * (linear_beta * tanh(up/linear_beta))
-                    # The sigmoid reads the uncapped gate. The kernel evaluates
-                    # tanh as 2*sigmoid(2z)-1 to avoid tanh.approx.f32 error at
-                    # linear_beta=25; torch.tanh is exact, and the difference is
-                    # well inside the tolerance below.
+                    # SituAdaptor approximates tanh as 2*sigmoid(2z)-1;
+                    # torch.tanh remains within the test tolerance.
                     beta = activation.gate_scale
                     linear_beta = activation.linear_scale
                     intermediate = (

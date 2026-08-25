@@ -705,8 +705,12 @@ The unreleased enum-wrapper/singleton spelling was replaced by frozen values:
 `GeGLU()`, `ReLU2()`, `GeGLUTanh()`, `SwiGLUStep(limit)`, and `Identity()`.
 Every value exposes `.type` and `.is_gated`; scalar fields participate in
 equality, hashing, repr serialization, and tactic-cache identity. Per-expert
-`gemm1_alpha` / `gemm1_beta` / `gemm1_clamp_limit` tensors remain in
-`MoEWeightPack` backend views and override the scalar-expanded preparation view.
+controls remain in backend-native `MoEWeightPack` views: TRT-LLM uses
+`gemm1_alpha` / `gemm1_beta` / `gemm1_clamp_limit`, while CUTLASS SiTU uses
+`situ_beta` / `situ_linear_beta`. Where supported, these tensors override the
+config-derived values. `Identity()` is modeled as a typed value but is not
+advertised by a unified runner pending end-to-end preparation and launch
+parity.
 
 `SiTU.linear_scale` is the linear-branch soft-clamp scale, applied as
 `linear_scale * tanh(linear / linear_scale)`. It accepts `None` for the
@@ -731,19 +735,22 @@ The truthful unified support matrix follows the already executable flat path:
 | b12x NVFP4 | SwiGLU (default scalars), GeGLUTanh, ReLU2 |
 | b12x W4A16 | SwiGLU (default scalars), ReLU2 |
 
+TRT-LLM FP4 SiTU is supported on SM100/SM103 but rejected on SM107 while the
+pinned Rubin BMM artifact predates `SiTuGlu`.
+
 CuTe-DSL SiTU uses its existing scalar ABI (`situ_beta` and
 `situ_linear_beta`); its flat kernel does not expose a separate SiTU
 `clamp_limit`, so that non-default field is rejected. CUTLASS SiTU uses the
 same two native keys and likewise has no clamp channel or unclamped-linear
 encoding, so `clamp_limit` and `linear_scale=None` are rejected there too.
 `SiTU()` defaults to the canonical Kimi-K3 scales, which are the CUTLASS
-`SituAdaptor` compile-time defaults, so CUTLASS materializes per-expert
-tensors only for a non-default value. The TRT-LLM path cannot do the same: it
-reuses the SwiGLU alpha/beta channels, whose null default is `1.0`/`1.0` for
-SiTU, so its runners require the tensors even at the default. b12x W4A16 keeps its
-flat-proven SwiGLU/ReLU2 subset. Weight preparation computes GEMM1 rows from
-`activation.is_gated` (`2I` gated, `I` non-gated) and passes that fact into
-TRTLLM row permutations.
+`SituAdaptor` compile-time defaults, so CUTLASS materializes config-derived
+per-expert tensors only for a non-default value. The TRT-LLM path cannot do the
+same: it reuses the SwiGLU alpha/beta channels, whose null default is
+`1.0`/`1.0` for SiTU, so its runners require the tensors even at the default.
+b12x runners keep their flat-proven activation subsets. Weight preparation
+derives GEMM1 rows from `activation.is_gated` across backends (`2I` gated, `I`
+non-gated) and forwards the gated mode into TRTLLM row permutations.
 
 ### Today's MVP Cut
 

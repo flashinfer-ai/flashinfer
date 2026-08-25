@@ -354,16 +354,10 @@ def make_random_topk_ids(
 
 
 def get_b12x_activation_name(activation_type: ActivationType) -> str:
-    """Translate an activation type to the b12x kernel name.
+    """Map an activation enum to its b12x kernel name.
 
-    Takes only the enum, so any scalar the typed activation carries is dropped:
-    ``SwiGLU(alpha=1.7)`` and ``SwiGLU()`` both map to ``"silu"``. Callers must
-    reject non-default scalars themselves before converting.
-
-    Raises ``ValueError`` for an activation b12x has no kernel name for. In a
-    backend-selection context translate that to ``NotImplementedError``, which
-    is what ``MoELayer`` filters on; a bare ``ValueError`` there would abort
-    selection instead of skipping the backend.
+    Validate typed scalars before this conversion. Unsupported types raise
+    ``ValueError``; backend selection should expose them as ``NotImplementedError``.
     """
     if activation_type is ActivationType.Swiglu:
         return "silu"
@@ -375,13 +369,7 @@ def get_b12x_activation_name(activation_type: ActivationType) -> str:
 
 
 def resolve_b12x_activation_name(activation) -> str:
-    """Convert a typed activation to its b12x kernel name, rejecting scalars.
-
-    ``prepare_weights`` can be called directly, outside the runner's
-    ``_check_activation_parameters`` guard. Without this check a
-    ``SwiGLU(alpha=1.7)`` request would return a weight view that silently
-    expresses plain ``"silu"`` instead.
-    """
+    """Resolve a typed activation, rejecting scalars b12x cannot represent."""
     from .api import SwiGLU
 
     if activation is None:

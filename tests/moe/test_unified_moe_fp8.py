@@ -9,21 +9,23 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer.fused_moe import (
+    # Typed activation values
+    GeGLU,
+    ReLU2,
+    SwiGLU,
+    # Unified configs, packs, and runners
     BackendOptions,
     ExecutionConfig,
     ExpertConfig,
-    GeGLU,
     MoEActivationPack,
     MoEConfig,
     MoELayer,
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
-    ReLU2,
     RoutingConfig,
     RoutingInputMode,
     RoutingMethodType,
-    SwiGLU,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
     TrtllmFp8PerTensorRunner,
@@ -185,20 +187,12 @@ def _assert_fp8_close(actual, expected):
 
 
 def _assert_closer_to(actual, expected, wrong, *, margin=1.25):
-    """Assert the output tracks `expected` measurably better than `wrong`.
+    """Assert the output is closer to the requested formula than a wrong one.
 
-    _assert_fp8_close cannot do this job for activations. Its atol=0.05 is an
-    order of magnitude above these outputs (mean |out| is ~0.01), so a wrong
-    activation lands inside the bound: GeGLU output matches a SwiGLU reference
-    at 99.99%, and the two references agree with each other at 100%. No
-    tolerance separates them -- tightening only drags the correct reference
-    down with the wrong one.
-
-    Mean absolute error does separate them, because it measures the whole gap
-    instead of counting elements that clear a threshold. Scaling the fixture up
-    to widen the gate distribution does not help: quantization error grows
-    faster than the GELU/SiLU gap, so the margin stays ~1.5x while the correct
-    reference stops passing. Keep the calibrated data and assert on the ratio.
+    The standard FP8 absolute tolerance exceeds this fixture's output scale, so
+    it cannot distinguish GeGLU from SwiGLU. Compare mean errors instead; this
+    fixture gives about 1.5x separation, while scaling it up amplifies
+    quantization error more than the activation difference.
     """
     correct_error = (actual.float() - expected.float()).abs().mean().item()
     wrong_error = (actual.float() - wrong.float()).abs().mean().item()
@@ -333,11 +327,8 @@ def test_mxfp8_new_activation_layer_and_direct_match_reference(activation):
     _assert_fp8_close(layer(pack, weights), reference)
 
     if activation.is_gated:
-        # Discrimination: prove the comparison can tell this activation from
-        # the default one. Only meaningful for a gated activation -- ReLU2's
-        # weights have I GEMM1 rows, so a gated reference cannot be computed
-        # from them at all, which is itself the guarantee for the non-gated
-        # case (a SwiGLU dispatch could not consume these weights).
+        # Compare formulas with matching weight geometry. ReLU2 uses I-row
+        # weights, so a gated dispatch is structurally invalid instead.
         _assert_closer_to(direct, reference, _reference(SwiGLU()))
 
 
@@ -886,14 +877,10 @@ def _assert_per_tensor_fp8_close(out: torch.Tensor, ref: torch.Tensor) -> None:
 def _assert_per_tensor_fp8_discriminates(
     out: torch.Tensor, wrong_ref: torch.Tensor
 ) -> None:
-    """Negative control for the percentage-based tolerance above.
+    """Verify FP8 tolerance rejects a genuinely wrong activation formula.
 
-    ``check_accuracy`` passes when 99% of elements are within atol=0.05 /
-    rtol=0.3, so a pass alone does not prove the comparison could detect a wrong
-    activation formula. ``wrong_ref`` must come from a genuinely different
-    activation rather than a rescaled output: these outputs are small enough
-    that a modest scale factor stays inside atol and would make this control
-    vacuous.
+    A rescaled reference is ineffective because these outputs are smaller than
+    the absolute tolerance.
     """
     try:
         check_accuracy(

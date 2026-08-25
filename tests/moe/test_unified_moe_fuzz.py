@@ -183,23 +183,25 @@ from flashinfer.fused_moe import (
     RoutingInputMode,
 )
 from flashinfer.fused_moe.api import (
+    # Typed activation values
+    GeGLU,
+    GeGLUTanh,
+    ReLU2,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
+    # Unified configs and backend options
     BackendOptions,
     CutlassBf16Config,
     CutlassW4A16Config,
     CuteDslConfig,
     ExecutionConfig,
     ExpertConfig,
-    GeGLU,
-    GeGLUTanh,
     MoEConfig,
     MoEFinalizeConfig,
     QuantConfig,
     QuantVariant,
-    ReLU2,
     RoutingConfig,
-    SiTU,
-    SwiGLU,
-    SwiGLUStep,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -1274,7 +1276,7 @@ def _gen(seed):
         activation = rng.choice(
             ("swiglu", "relu2")
             if fromlogits or offset != 0 or local != ne
-            else ("swiglu", "relu2", "geglutanh", "swiglustep")
+            else ("swiglu", "relu2", "geglutanh", "swiglustep", "situ")
         )
     return Cfg(
         num_tokens=rng.choice(_TOKENS),
@@ -1430,6 +1432,18 @@ _CURATED = [
         "uniform",
         900_022,
         activation="swiglustep",
+        expected_backend="cutlass_bf16",
+    ),
+    Cfg(
+        8,
+        256,
+        256,
+        8,
+        2,
+        "bf16",
+        "uniform",
+        900_023,
+        activation="situ",
         expected_backend="cutlass_bf16",
     ),
     Cfg(
@@ -1907,15 +1921,9 @@ _SKIP_SUBSTR = (
     "only support",
 )
 _CRASH_SUBSTR = ("cuda error", "illegal memory", "misaligned", "device-side assert")
-# _SKIP_SUBSTR keeps the broad shape-capability terms ("must be", "divisible",
-# "requires") because backends legitimately reject shapes that way. These terms
-# override them: an activation-plumbing complaint phrased as a shape or
-# validation error ("gemm1_alpha must have shape (E,)") is the regression this
-# fuzzer exists to catch, never an unsupported shape.
-#
-# Only concrete plumbing identifiers belong here. Activation *names* must not:
-# "backend does not support SiTU" is a legitimate capability rejection, and
-# matching on "situ" would report it as a regression.
+# Broad skip terms also appear in real activation-plumbing errors, so these
+# concrete identifiers force such errors to fail. Do not add activation names:
+# "does not support SiTU" is a legitimate capability skip.
 _NEVER_SKIP_SUBSTR = (
     "activation parameters",
     "gemm1_alpha",

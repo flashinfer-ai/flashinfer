@@ -16,7 +16,16 @@ limitations under the License.
 
 # Unified MoE API
 from .api import (  # noqa: F401
+    # Typed activation values
     ActivationConfig,
+    GeGLU,
+    GeGLUTanh,
+    Identity,
+    ReLU2,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
+    # Unified configs and packs
     B12xNvfp4Config,
     B12xW4A16Config,
     BackendOptions,
@@ -32,20 +41,13 @@ from .api import (  # noqa: F401
     CutlassW4A8Config,
     ExecutionConfig,
     ExpertConfig,
-    GeGLU,
-    GeGLUTanh,
-    Identity,
     MoEActivationPack,
     MoEConfig,
     MoEFinalizeConfig,
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
-    ReLU2,
     RoutingConfig,
-    SiTU,
-    SwiGLU,
-    SwiGLUStep,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -167,7 +169,7 @@ except ImportError:
     _cute_dsl_available = False
 
 __all__ = [
-    # Unified API
+    # Typed activation values
     "ActivationConfig",
     "SwiGLU",
     "SiTU",
@@ -176,6 +178,7 @@ __all__ = [
     "GeGLUTanh",
     "SwiGLUStep",
     "Identity",
+    # Unified configs, packs, and runners
     "B12xNvfp4Config",
     "B12xNvfp4Runner",
     "B12xW4A16Config",

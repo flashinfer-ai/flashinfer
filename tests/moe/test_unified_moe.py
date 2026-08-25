@@ -41,6 +41,15 @@ from flashinfer.autotuner import autotune
 from flashinfer.autotuner.autotuner import ProfilingCacheKey
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe import (
+    # Typed activation values
+    GeGLU,
+    GeGLUTanh,
+    Identity,
+    ReLU2,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
+    # Unified configs, packs, and runners
     ActivationType,
     BackendOptions,
     CuteDslConfig,
@@ -53,24 +62,17 @@ from flashinfer.fused_moe import (
     CutlassNvfp4Config,
     CutlassW4A16Runner,
     ExecutionConfig,
-    MoEFinalizeConfig,
     ExpertConfig,
-    GeGLU,
-    GeGLUTanh,
-    Identity,
     MoEActivationPack,
     MoEConfig,
+    MoEFinalizeConfig,
     MoELayer,
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
-    ReLU2,
     RoutingConfig,
     RoutingInputMode,
     RoutingMethodType,
-    SiTU,
-    SwiGLU,
-    SwiGLUStep,
     TrtllmBf16Config,
     TrtllmBf16RoutedRunner,
     TrtllmFp4Config,
@@ -1887,25 +1889,15 @@ def test_cute_dsl_typed_activation_matches_flat_reference(variant, activation):
         f"(atol={atol:.4f}) vs flat reference"
     )
 
-    # check_accuracy() is deliberately permissive (rtol=0.5 over 97% of
-    # elements) to absorb FP4 quantization noise, which leaves it unable to
-    # distinguish activation formulas: an output computed with
-    # SwiGLU(alpha=1.7, beta=1.0, limit=7.0) still matches a
-    # SwiGLU(alpha=0.25, beta=2.0, limit=0.5) reference at 99.4%. Add a
-    # discriminating check with a much tighter rtol, still percentage-based so
-    # genuine quantization outliers do not fail it, and assert it rejects a
-    # deliberately wrong reference so the bound is known to bite.
+    # Use a tighter percentage bound to distinguish activation formulas while
+    # tolerating FP4 quantization outliers.
     def _agreement(a: torch.Tensor, b: torch.Tensor) -> float:
         a, b = a.float(), b.float()
         atol = 0.05 + 0.5 * b.std().item()
         close = (a - b).abs() < atol + 0.1 * b.abs()
         return close.float().mean().item()
 
-    # A non-finite element compares as "not close", so it is merely counted
-    # against the 3% budget instead of failing. Reject it on both sides: a
-    # handful of NaNs must not be absorbed by the percentage allowance, and a
-    # NaN in the reference would silently weaken the comparison rather than
-    # signal that the reference itself is broken.
+    # Do not let the percentage allowance absorb non-finite values.
     for name, tensor in (("output", actual), ("reference", reference)):
         assert torch.isfinite(tensor).all(), (
             f"{activation!r}: {name} contains non-finite values "
@@ -1917,18 +1909,15 @@ def test_cute_dsl_typed_activation_matches_flat_reference(variant, activation):
         f"flat reference under the discriminating bound."
     )
 
-    # Negative control: the bound above must reject a wrong activation formula,
-    # otherwise the assertion proves nothing. Keep the control's gating, since
-    # _compute_ref reuses weights whose layout depends on it.
+    # Verify that the tighter bound rejects a wrong formula with matching
+    # gated/non-gated geometry.
     control = {
         ActivationType.Swiglu: SwiGLU(alpha=0.25, beta=2.0, limit=0.5),
         ActivationType.Situ: SiTU(gate_scale=0.25, linear_scale=0.5),
         ActivationType.GegluTanh: SwiGLU(alpha=0.25, beta=2.0, limit=0.5),
     }.get(activation.type)
     control_reference = (
-        # Non-gated ReLU2 has no same-gating scalar variant to perturb, so use a
-        # genuinely different non-gated formula (plain ReLU) over the same
-        # weights rather than a rescaled output, which would only test magnitude.
+        # Use plain ReLU as the non-gated control for ReLU2.
         _compute_ref(act_pack, tensors, shape, activation, wrong_formula=True)
         if control is None
         else _compute_ref(act_pack, tensors, shape, control)
@@ -2423,14 +2412,11 @@ _PACKING_SPECS = (
     ids=("dtype", "shape", "device"),
 )
 def test_bf16_runner_rejects_malformed_activation_override(mutation, match):
-    """The BF16 runner must run the override boundary check, not just presence.
+    """Verify BF16 ``pack_inputs`` validates activation override metadata.
 
-    _validate_prepared_activation_params only checks that the required scalars
-    exist; without _validate_optional_gemm1_activation_params a malformed one
-    reaches the FFI boundary and surfaces as a bare TVM-FFI ICHECK naming
-    neither the runner nor the key. Exercising it through pack_inputs (rather
-    than calling the helper directly) is what pins the wiring: passing the
-    wrong expert-count attribute here would leave the helper's own tests green.
+    Presence checks alone let an invalid dtype, shape, or device reach the FFI
+    boundary. Testing through the runner also pins the helper wiring and the
+    expert count used for validation.
     """
     act_pack, weight_pack, config, _ = _make_bf16_packs_and_config(
         8, hidden_size=128, intermediate_size=256, num_experts=4, top_k=2
