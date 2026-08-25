@@ -54,8 +54,6 @@ import torch
 import torch.distributed as dist
 
 from flashinfer.utils import register_custom_op
-from .all_gather_matmul_cutile import all_gather_matmul_cutile
-from .all_gather_matmul_triton import all_gather_matmul_triton
 
 
 @register_custom_op(
@@ -84,5 +82,9 @@ def all_gather_matmul(
         raise ValueError("backend must be exactly 'auto' or 'cake'")
     major, _ = torch.cuda.get_device_capability(inp.device)
     if major >= 10:
+        from .all_gather_matmul_cutile import all_gather_matmul_cutile
+
         return all_gather_matmul_cutile(inp, w, group, verbose=verbose)
+    from .all_gather_matmul_triton import all_gather_matmul_triton
+
     return all_gather_matmul_triton(inp, w, group, verbose=verbose)
