@@ -3464,6 +3464,24 @@ def test_prefill_without_cute_dsl_experimental_falls_back_to_cake(
         recurrent_kda(**run_kwargs, backend="cute-dsl")
 
 
+def test_dsl_version_guard_is_scoped_to_the_sm100_family(cuda_device, monkeypatch):
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_runtime_available",
+        lambda: False,
+    )
+    q = torch.empty(1, 1, 1, 1, device=cuda_device)
+    for capability, blocked in (((10, 0), True), ((10, 3), True), ((12, 0), False)):
+        monkeypatch.setattr(
+            kda_prefill_cute_api,
+            "get_compute_capability",
+            lambda _device, capability=capability: capability,
+        )
+        assert (
+            kda_prefill_cute_api._is_cute_dsl_kda_prefill_dsl_too_old(q) is blocked
+        ), capability
+
+
 @pytest.mark.parametrize(
     ("seq_lens", "num_heads", "packed"),
     [((17,), 96, False), ((17, 33), 12, True)],

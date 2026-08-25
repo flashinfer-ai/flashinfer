@@ -353,7 +353,7 @@ def recurrent_kda(
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         )
         if backend == "cute-dsl" and not cute_dsl_eligible:
-            if not _kda_prefill_cute._is_cute_dsl_kda_runtime_available():
+            if _kda_prefill_cute._is_cute_dsl_kda_prefill_dsl_too_old(q):
                 raise ImportError(
                     "backend='cute-dsl' requires nvidia-cutlass-dsl>=4.7.0 "
                     "(cutlass.experimental); backend='auto' falls back to Cake"

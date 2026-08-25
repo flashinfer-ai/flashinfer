@@ -48,6 +48,20 @@ def _is_cute_dsl_kda_runtime_available() -> bool:
     return is_cute_dsl_experimental_available()
 
 
+def _is_cute_dsl_kda_prefill_dsl_too_old(q: torch.Tensor) -> bool:
+    """Whether this device wants the BT=16 kernel but the installed DSL lacks it.
+
+    Architecture-scoped so that devices served by another CuTe DSL prefill backend,
+    such as SM120, are not told to upgrade a DSL they do not need.
+    """
+    return (
+        isinstance(q, torch.Tensor)
+        and q.is_cuda
+        and get_compute_capability(q.device) in _SUPPORTED_COMPUTE_CAPABILITIES
+        and not _is_cute_dsl_kda_runtime_available()
+    )
+
+
 def _is_cute_dsl_kda_prefill_eligible(
     *,
     q: torch.Tensor,
@@ -476,6 +490,7 @@ def _run_cute_dsl_kda_prefill(
 
 
 __all__ = [
+    "_is_cute_dsl_kda_prefill_dsl_too_old",
     "_is_cute_dsl_kda_prefill_eligible",
     "_is_cute_dsl_kda_runtime_available",
     "_run_cute_dsl_kda_prefill",
