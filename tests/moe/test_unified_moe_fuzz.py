@@ -191,6 +191,7 @@ from flashinfer.fused_moe.api import (
     ExecutionConfig,
     ExpertConfig,
     MoEConfig,
+    MoEFinalizeConfig,
     QuantConfig,
     QuantVariant,
     RoutingConfig,
@@ -201,6 +202,7 @@ from flashinfer.fused_moe.api import (
     TrtllmMxInt4Config,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from flashinfer.fused_moe.runners import _TrtllmRunnerBase
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
 from flashinfer.quantization.fp8_quantization import mxfp8_quantize
@@ -991,6 +993,13 @@ _EP_BACKENDS = {
     for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
     if runner_cls.supports_expert_parallelism
 }
+# Backend config classes whose runner returns unfinalized intermediates. No
+# declared capability flag exists, so key off the TRTLLM runner base.
+_UNFINALIZED_BACKENDS = {
+    cfg_cls
+    for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
+    if issubclass(runner_cls, _TrtllmRunnerBase)
+}
 _UNPACKED_VARIANT_IDS = tuple(
     variant.name.lower()
     for variant, handler in _DTYPE.items()
@@ -1038,6 +1047,7 @@ class Cfg:
     n_group: int = 0  # DeepSeekV3 group count (0 -> None)
     topk_group: int = 0  # DeepSeekV3 groups kept (0 -> None)
     routed_scaling: float = 0.0  # DeepSeekV3 weight scale (0.0 -> None)
+    do_finalize: bool = True
 
     @property
     def n_weight_rows(self):  # physical expert-major rows: routed + shared
@@ -1075,8 +1085,9 @@ class Cfg:
             if self.num_fused_shared_experts
             else ""
         )
+        finalize = "" if self.do_finalize else "unfinalized_"
         return (
-            f"{self.variant}_{sh}{mode}{self.routing_method.name}_{ld}{uwd}{self.route}_"
+            f"{self.variant}_{sh}{mode}{finalize}{self.routing_method.name}_{ld}{uwd}{self.route}_"
             f"e{self.num_experts}_{ep}{grp}k{self.top_k}_"
             f"t{self.num_tokens}_h{self.hidden}_i{self.intermediate}_s{self.seed}"
         )
@@ -1533,6 +1544,63 @@ _CURATED = [
             ("w4a16", 1, 900_044),
         )
     ],
+    # Issue #3926: every unified TRTLLM operator that exposes unfinalized
+    # intermediates must return BF16 expert weights for either logits dtype.
+    *[
+        Cfg(
+            32,
+            512,
+            512,
+            16,
+            4,
+            variant,
+            "uniform",
+            seed,
+            routing_method=RoutingMethodType.Default,
+            routing_input_mode="fromlogits",
+            logits_dtype=logits_dtype,
+            do_finalize=False,
+        )
+        for variant, seed_base in (
+            ("bf16", 900_050),
+            ("fp8pertensor", 900_052),
+            ("deepseekfp8", 900_054),
+            ("mxint4", 900_056),
+            ("nvfp4", 900_058),
+            ("mxfp8", 900_060),
+        )
+        for logits_dtype, seed in (
+            ("bf16", seed_base),
+            ("fp32", seed_base + 1),
+        )
+    ],
+    # PackedPrecomputed + unfinalized coverage. Packed ids encode BF16 routing
+    # weights, but FP4 borrows topk_weights instead of allocating its own buffer.
+    # The value assertion below guards the returned weights across all TRTLLM
+    # variants and catches an invalid FP4 buffer.
+    *[
+        Cfg(
+            32,
+            512,
+            512,
+            16,
+            4,
+            variant,
+            "uniform",
+            seed,
+            routing_method=RoutingMethodType.RenormalizeNaive,
+            routing_input_mode="prerouted",
+            do_finalize=False,
+        )
+        for variant, seed in (
+            ("bf16", 900_070),
+            ("fp8pertensor", 900_071),
+            ("deepseekfp8", 900_072),
+            ("mxint4", 900_073),
+            ("nvfp4", 900_074),
+            ("mxfp8", 900_075),
+        )
+    ],
 ]
 _CURATED_BY_SEED = {}
 for _cfg in _CURATED:
@@ -1865,6 +1933,10 @@ def test_unified_moe_fuzz(cfg):
         # Backends that accept separate tensors through their own ABI are not
         # implementations of RoutingInputMode.UnpackedPrecomputed.
         wired_backends = [B for B in wired_backends if B in _UNPACKED_BACKENDS]
+    if not cfg.do_finalize:
+        # Only TRTLLM returns unfinalized intermediates; like the EP filter
+        # below, this keeps an unsupported arch on the precise skip path.
+        wired_backends = [B for B in wired_backends if B in _UNFINALIZED_BACKENDS]
     if cfg.is_ep:
         # An EP shard needs the runner to map global ids onto a local expert subset;
         # backends without that capability (CUTLASS, b12x) would fail MoELayer's
@@ -1998,6 +2070,7 @@ def test_unified_moe_fuzz(cfg):
                 else max(cfg.num_tokens, 8192)
             )
         ),
+        finalize=MoEFinalizeConfig(do_finalize=cfg.do_finalize),
     )
 
     try:
@@ -2006,6 +2079,53 @@ def test_unified_moe_fuzz(cfg):
         if _is_unsupported(e):
             pytest.skip(f"MoELayer rejected {cfg.label}: {e}")
         raise
+
+    if not cfg.do_finalize:
+        result = layer(act_pack, weight_pack)
+        assert isinstance(result, list) and len(result) == 3, (
+            "do_finalize=False must return "
+            "[gemm2_output, expert_weights, expanded_idx_to_permuted_idx], got "
+            f"{type(result).__name__} of length "
+            f"{len(result) if isinstance(result, list) else 'n/a'}"
+        )
+        gemm2_output, expert_weights, expanded_idx_to_permuted_idx = result
+        assert gemm2_output.shape[-1] == cfg.hidden
+        assert expert_weights.dtype == torch.bfloat16, (
+            "do_finalize=False expert_weights must be bfloat16, got "
+            f"{expert_weights.dtype} for routing_logits dtype {cfg.logits_dtype}"
+        )
+        assert tuple(expert_weights.shape) == (cfg.num_tokens, cfg.top_k)
+        assert expanded_idx_to_permuted_idx.numel() == cfg.num_tokens * cfg.top_k
+        torch.testing.assert_close(
+            expert_weights.float(),
+            final_scales.to(torch.bfloat16).float(),
+            rtol=2e-2,
+            atol=2e-3,
+        )
+
+        permutation = expanded_idx_to_permuted_idx.to(torch.long)
+        assert (permutation >= 0).all()
+        assert permutation.unique().numel() == permutation.numel()
+        assert permutation.max().item() < gemm2_output.shape[0]
+
+        recombined = (
+            gemm2_output[permutation]
+            .view(cfg.num_tokens, cfg.top_k, cfg.hidden)
+            .float()
+            .mul(expert_weights.float().unsqueeze(-1))
+            .sum(dim=1)
+        )
+        abs_diff = (recombined - ref).abs()
+        over_tol = abs_diff > (atol + rtol * ref.abs())
+        if over_tol.any():
+            _fail(
+                cfg,
+                "unfinalized host recombination",
+                f"{int(over_tol.sum())}/{recombined.numel()} elems exceed tol",
+                recombined,
+                ref,
+            )
+        return
 
     out_shape = (cfg.num_tokens, cfg.hidden)
 
