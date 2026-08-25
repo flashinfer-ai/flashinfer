@@ -53,9 +53,6 @@ backends=["trtllm_fp4":TrtllmFp4Config(extra_backend_params...),"cutlass_nvfp4":
 # --- Prepare Inputs Data ---
 weight_pack = MoEWeightPack()
 # the data is possibly obtained through helper functions then added here
-# CUTLASS NVFP4 cannot share TRTLLM's quantized activation pack: keep BF16
-# activations and select CutlassNvfp4Config() explicitly, or compete TRTLLM
-# and CuteDSL on the quantized pack.
 weight_pack.prepare_for("trtllm_fp4", trtllm_weights)
 weight_pack.prepare_for("cutlass_nvfp4", CutlassNvfp4Config.prepare_weights(...))
 act_pack = MoEActivationPack(
@@ -123,13 +120,8 @@ Individual backend configs provided in an ordered list. The autotuner or heurist
 ```
 # Single backend
 backends = [TrtllmFp4Config()]
-# Multiple candidates — autotuner or heuristic picks best among configs that
-# share one activation-pack contract. CUTLASS is *not* a universal fallback:
-# each quant mode is its own config (CutlassBf16Config, CutlassNvfp4Config,
-# CutlassFp8PerTensorConfig, CutlassMxfp8Config, ...).
-backends = [TrtllmFp4Config(), CuteDslConfig()]
-# CUTLASS NVFP4 is selected explicitly; it keeps BF16 activations.
-backends = [CutlassNvfp4Config()]
+# Multiple candidates — autotuner or heuristic picks best
+backends = [TrtllmFp4Config(), CutlassNvfp4Config()]
 # | is associative, returns BackendOptions
 ```
 
@@ -155,7 +147,7 @@ config = MoEConfig(
     routing=RoutingConfig(num_experts=256, top_k=8, method=RoutingMethodType.DeepSeekV3),
     quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    backends=[TrtllmFp4Config(), CuteDslConfig()],
+    backends=[TrtllmFp4Config(), CutlassNvfp4Config()],
 )
 # Unpack into any call accepting these kwargs
 output = moe_layer(tensors, **config)
