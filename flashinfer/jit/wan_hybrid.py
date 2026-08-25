@@ -93,3 +93,28 @@ def gen_wan_hybrid_attention_module(target: str) -> JitSpec:
         ],
         extra_include_paths=[csrc_dir, csrc_dir.parent],
     )
+
+
+@functools.cache
+def gen_wan_hybrid_dispatch_module(target: str) -> JitSpec:
+    if target == "sm100":
+        nvcc_flags = sm100a_nvcc_flags
+        target_minor = "0"
+    elif target == "sm103":
+        nvcc_flags = sm103a_nvcc_flags
+        target_minor = "3"
+    else:
+        raise ValueError(f"Unsupported Wan hybrid dispatch target: {target!r}")
+    csrc_dir = _wan_hybrid_csrc_dir()
+    return gen_jit_spec(
+        f"wan_hybrid_dispatch_{target}",
+        [csrc_dir / "wan_hybrid_dispatch_binding.cu"],
+        extra_cuda_cflags=[
+            *nvcc_flags,
+            "-DFLASHINFER_ENABLE_BF16",
+            f"-DFLASHINFER_WAN_HYBRID_TARGET_MINOR={target_minor}",
+            "--ptxas-options=--opt-level=1",
+        ],
+        extra_include_paths=[csrc_dir, csrc_dir.parent],
+        use_fast_math=target != "sm100",
+    )

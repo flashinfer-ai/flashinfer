@@ -184,7 +184,7 @@ def _fake_wan_hybrid_quantize_value_impl(
     pass
 
 
-_WanHybridAttentionImpl = Callable[
+_WanHybridDispatchImpl = Callable[
     [
         torch.Tensor,
         torch.Tensor,
@@ -198,14 +198,14 @@ _WanHybridAttentionImpl = Callable[
 # The implementation must enqueue asynchronously on the current PyTorch CUDA
 # stream for the input device. The public wrapper does not synchronize.
 
-_wan_hybrid_attention_impl: Optional[_WanHybridAttentionImpl] = None
+_wan_hybrid_dispatch_impl: Optional[_WanHybridDispatchImpl] = None
 try:
-    from ._wan_hybrid import wan_hybrid_attention_impl as _loaded_wan_hybrid_impl
+    from ._wan_hybrid import wan_hybrid_dispatch_impl as _loaded_wan_hybrid_impl
 except ModuleNotFoundError as error:
     if error.name != f"{__package__}._wan_hybrid":
         raise
 else:
-    _wan_hybrid_attention_impl = _loaded_wan_hybrid_impl
+    _wan_hybrid_dispatch_impl = _loaded_wan_hybrid_impl
 
 
 def _normalize_cuda_device(device: torch.device | str | int) -> torch.device:
@@ -235,7 +235,7 @@ def is_wan_hybrid_attention_available(
         Whether ``wan_hybrid_attention`` can be selected explicitly.
     """
 
-    if _wan_hybrid_attention_impl is None:
+    if _wan_hybrid_dispatch_impl is None:
         return False
     if device is None:
         return True
@@ -442,7 +442,7 @@ def wan_hybrid_attention(
         qkv_layout=qkv_layout,
         causal=causal,
     )
-    if _wan_hybrid_attention_impl is None:
+    if _wan_hybrid_dispatch_impl is None:
         raise NotImplementedError(_WAN_HYBRID_UNAVAILABLE_MESSAGE)
     if not is_wan_hybrid_attention_available(q.device):
         major, minor = torch.cuda.get_device_capability(q.device)
@@ -450,6 +450,5 @@ def wan_hybrid_attention(
             f"wan_hybrid attention does not support compute capability {major}.{minor}"
         )
 
-    _quantize_wan_hybrid_value(v, workspace)
-    _wan_hybrid_attention_impl(q, k, v, out, workspace, normalized_sm_scale)
+    _wan_hybrid_dispatch_impl(q, k, v, out, workspace, normalized_sm_scale)
     return out

@@ -96,7 +96,7 @@ def test_wan_hybrid_public_signature_is_explicit() -> None:
 def test_wan_hybrid_unlinked_attention_is_explicitly_unavailable(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(wan_hybrid, "_wan_hybrid_attention_impl", None)
+    monkeypatch.setattr(wan_hybrid, "_wan_hybrid_dispatch_impl", None)
     assert not wan_hybrid.is_wan_hybrid_attention_available()
     assert not wan_hybrid.is_wan_hybrid_attention_available("cpu")
     assert not wan_hybrid.is_wan_hybrid_attention_available("not-a-device")
@@ -106,7 +106,7 @@ def test_wan_hybrid_unlinked_attention_is_explicitly_unavailable(
 def test_wan_hybrid_supported_capabilities_remain_available(
     monkeypatch, capability
 ) -> None:
-    monkeypatch.setattr(wan_hybrid, "_wan_hybrid_attention_impl", object())
+    monkeypatch.setattr(wan_hybrid, "_wan_hybrid_dispatch_impl", object())
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
 
@@ -126,15 +126,17 @@ def test_wan_hybrid_jit_flags_are_target_specific(monkeypatch) -> None:
     )
     wan_hybrid_jit.gen_wan_hybrid_quantization_module.cache_clear()
     wan_hybrid_jit.gen_wan_hybrid_attention_module.cache_clear()
+    wan_hybrid_jit.gen_wan_hybrid_dispatch_module.cache_clear()
 
     try:
         for target in ("sm100", "sm103"):
             wan_hybrid_jit.gen_wan_hybrid_quantization_module(target)
             wan_hybrid_jit.gen_wan_hybrid_attention_module(target)
+            wan_hybrid_jit.gen_wan_hybrid_dispatch_module(target)
 
         for target, arch in (("sm100", "100a"), ("sm103", "103a")):
             target_minor = "0" if target == "sm100" else "3"
-            for component in ("quantization", "attention"):
+            for component in ("quantization", "attention", "dispatch"):
                 call = calls[f"wan_hybrid_{component}_{target}"]
                 flags = call["extra_cuda_cflags"]
                 assert flags.count(f"-gencode=arch=compute_{arch},code=sm_{arch}") == 1
@@ -149,12 +151,16 @@ def test_wan_hybrid_jit_flags_are_target_specific(monkeypatch) -> None:
         assert calls["wan_hybrid_quantization_sm100"]["use_fast_math"] is False
         assert calls["wan_hybrid_quantization_sm103"]["use_fast_math"] is True
         for target in ("sm100", "sm103"):
-            assert "--ptxas-options=--opt-level=1" in calls[
-                f"wan_hybrid_attention_{target}"
-            ]["extra_cuda_cflags"]
+            for component in ("attention", "dispatch"):
+                assert "--ptxas-options=--opt-level=1" in calls[
+                    f"wan_hybrid_{component}_{target}"
+                ]["extra_cuda_cflags"]
+        assert calls["wan_hybrid_dispatch_sm100"]["use_fast_math"] is False
+        assert calls["wan_hybrid_dispatch_sm103"]["use_fast_math"] is True
     finally:
         wan_hybrid_jit.gen_wan_hybrid_quantization_module.cache_clear()
         wan_hybrid_jit.gen_wan_hybrid_attention_module.cache_clear()
+        wan_hybrid_jit.gen_wan_hybrid_dispatch_module.cache_clear()
 
 
 def test_wan_hybrid_quantizer_binding_matches_frozen_device_abi() -> None:
@@ -225,6 +231,31 @@ def test_wan_hybrid_attention_binding_matches_frozen_device_abi() -> None:
         ) == "2b9d37f9cf9fa60d129c4b16edf8e5a2d792bcd2f1fa4a7d724079339fb30e30"
 
 
+def test_wan_hybrid_dispatch_binding_preserves_sources_and_launch_order() -> None:
+    source_root = Path(__file__).resolve().parents[2] / "csrc" / "wan_hybrid"
+    binding = (source_root / "wan_hybrid_dispatch_binding.cu").read_text(
+        encoding="utf-8"
+    )
+    body = binding[binding.index("void Dispatch(") :]
+    assert binding.count('#include "device/wan_hybrid_quantize_value_sm') == 2
+    assert binding.count('#include "device/wan_hybrid_attention_sm') == 2
+    assert "kTensorMapCount = 6" in binding
+    assert "kAttentionDynamicSmemBytes = SMEM_TOTAL" in binding
+    assert "kWanHybridQuantDynamicSmemBytes = SMEM_TOTAL" in binding
+    assert body.index("PrepareTensorMaps(") < body.index(
+        "kernel_wan_hybrid_quantize_value<<<"
+    )
+    assert body.index("cudaDeviceGetAttribute(&multiprocessor_count") < body.index(
+        "kernel_wan_hybrid_quantize_value<<<"
+    )
+    assert body.index("const cudaStream_t stream = get_stream(q.device());") < body.index(
+        "kernel_wan_hybrid_quantize_value<<<"
+    )
+    assert body.index("kernel_wan_hybrid_quantize_value<<<") < body.index(
+        "cudaLaunchKernelEx(&config, kernel_wan_hybrid_attention"
+    )
+
+
 def test_wan_hybrid_attention_requires_prewarm_before_capture(monkeypatch) -> None:
     q = torch.empty((1,), device="cpu")
     k = torch.empty((2,), device="cpu")
@@ -239,6 +270,42 @@ def test_wan_hybrid_attention_requires_prewarm_before_capture(monkeypatch) -> No
         wan_hybrid_impl.wan_hybrid_attention_impl(
             q, k, torch.empty((1,), device="cpu"), out, workspace, 0.125
         )
+
+
+def test_wan_hybrid_native_dispatch_uses_six_map_views_once(monkeypatch) -> None:
+    q = torch.empty((1,), device="cpu")
+    k = torch.empty((2,), device="cpu")
+    v = torch.empty((3,), device="cpu")
+    out = torch.empty((4,), device="cpu")
+    views = wan_hybrid._WanHybridAttentionABIViews(
+        *(torch.empty((index + 5,), device="cpu") for index in range(3))
+    )
+    workspace = object.__new__(wan_hybrid.WanHybridAttentionWorkspace)
+    workspace._attention_views = views
+    workspace._descriptor_storage = torch.empty((6, 128), dtype=torch.uint8)
+    workspace._descriptor_signature = None
+    launches = []
+
+    class Module:
+        def wan_hybrid_dispatch(self, *args) -> None:
+            launches.append(args)
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        wan_hybrid_impl, "_wan_hybrid_attention_target", lambda device: "sm100"
+    )
+    monkeypatch.setattr(
+        wan_hybrid_impl, "_get_wan_hybrid_dispatch_module", lambda target: Module()
+    )
+
+    wan_hybrid_impl.wan_hybrid_dispatch_impl(q, k, v, out, workspace, 0.125)
+    wan_hybrid_impl.wan_hybrid_dispatch_impl(q, k, v, out, workspace, 0.125)
+
+    expected_prefix = (q, k, v, *views, out, workspace._descriptor_storage)
+    assert launches == [
+        (*expected_prefix, True, 0.125),
+        (*expected_prefix, False, 0.125),
+    ]
 
 
 def test_wan_hybrid_quantizer_dispatches_cache_by_value_device(monkeypatch) -> None:
@@ -276,7 +343,7 @@ def test_wan_hybrid_quantizer_dispatches_cache_by_value_device(monkeypatch) -> N
 
 
 def test_wan_hybrid_capability_fails_closed_before_cuda_probe(monkeypatch) -> None:
-    monkeypatch.setattr(wan_hybrid, "_wan_hybrid_attention_impl", None)
+    monkeypatch.setattr(wan_hybrid, "_wan_hybrid_dispatch_impl", None)
 
     def unexpected_cuda_probe() -> bool:
         pytest.fail("an unavailable implementation must not probe CUDA")
@@ -393,14 +460,10 @@ def test_wan_hybrid_returns_the_caller_owned_output(monkeypatch) -> None:
         lambda device: True,
     )
 
-    def quantize(*args) -> None:
-        calls.append(("quantize", *args))
-
     def implementation(*args) -> None:
         calls.append(args)
 
-    monkeypatch.setattr(wan_hybrid, "_quantize_wan_hybrid_value", quantize)
-    monkeypatch.setattr(wan_hybrid, "_wan_hybrid_attention_impl", implementation)
+    monkeypatch.setattr(wan_hybrid, "_wan_hybrid_dispatch_impl", implementation)
     result = wan_hybrid.wan_hybrid_attention(
         q,
         k,
@@ -410,10 +473,7 @@ def test_wan_hybrid_returns_the_caller_owned_output(monkeypatch) -> None:
     )
 
     assert result is out
-    assert calls == [
-        ("quantize", v, workspace),
-        (q, k, v, out, workspace, 0.125),
-    ]
+    assert calls == [(q, k, v, out, workspace, 0.125)]
 
 
 def test_wan_hybrid_out_is_required() -> None:
