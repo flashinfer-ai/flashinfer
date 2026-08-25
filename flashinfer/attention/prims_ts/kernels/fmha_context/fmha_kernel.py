@@ -535,6 +535,25 @@ class VariableWindowDomainTask(Task):
         offset: int = 0,
         **kwargs: Any,
     ) -> None:
+        """Initialize a variable-window task domain.
+
+        Args:
+            variable_window_token_starts: Flattened inclusive K-token start for
+                every Q row, laid out with ``q_stride`` rows per batch.
+            variable_window_token_ends: Flattened inclusive K-token end for
+                every Q row, using the same layout as the start tensor.
+            variable_window_cta_starts: Precomputed minimum K-token start for
+                each Q CTA, used as the common K/V load origin.
+            num_kv_tiles: Planned maximum number of K/V tiles.
+            q_stride: Number of Q rows per batch in the flattened bound tensors.
+            tile_size_q: Number of Q rows covered by one CTA.
+            tile_size_kv: Number of K/V tokens covered by one loop tile.
+            seq_idx: Index of the Q-sequence coordinate in ``tile_coord``.
+            batch_idx: Index of the batch coordinate in ``tile_coord``.
+            offset: Domain-count decrement. Zero selects N; one selects N-1.
+            **kwargs: Remaining ``Task`` arguments, including the required
+                captured ``schedule``.
+        """
         if kwargs.get("schedule") is None:
             raise ValueError("VariableWindow domain tasks require a captured schedule")
         super().__init__(**kwargs)
