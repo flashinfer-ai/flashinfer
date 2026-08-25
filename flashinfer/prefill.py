@@ -4224,7 +4224,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     * (q_scale if q_scale is not None else 1.0)
                     * (k_scale if k_scale is not None else 1.0)
                 )
-                bmm2_scale = (v_scale if v_scale is not None else 1.0) * (
+                bmm2_scale = (v_scale if v_scale is not None else 1.0) / (
                     o_scale if o_scale is not None else 1.0
                 )
                 return trtllm_ragged_attention_deepseek(
