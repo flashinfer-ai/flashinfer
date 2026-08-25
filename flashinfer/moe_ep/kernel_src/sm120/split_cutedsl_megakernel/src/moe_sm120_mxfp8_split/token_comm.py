@@ -830,7 +830,23 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
                             sf_staging_buffer[sf_stage_base + Int64(j)] = sf_value
                             sf_vals[i] = sf_value
                     if lane_idx == Int32(0):
-                        weight = input_topk_weights_buffer[
+                        # The IBGDA receive buffer is a contiguous 2-D
+                        # ``(world * tokens, topk)`` tensor. A scalar CuTe
+                        # coordinate follows the tensor layout and is not a
+                        # raw linear pointer offset for this row-major layout.
+                        # Use an explicit 1-D view before applying the packed
+                        # staged-token/top-k index.
+                        input_weight_f32 = cute.make_tensor(
+                            cute.recast_ptr(
+                                input_topk_weights_buffer.iterator,
+                                dtype=Float32,
+                            ),
+                            cute.make_layout(
+                                input_topk_weights_buffer.shape[0]
+                                * self.num_topk
+                            ),
+                        )
+                        weight = input_weight_f32[
                             Int64(staged_token) * Int64(self.num_topk)
                             + Int64(src_topk)
                         ]

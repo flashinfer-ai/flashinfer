@@ -1,7 +1,7 @@
 # SM120 W4A8 Split Kernel Drop
 
 The raw source under `src/` comes from `bangyus/cutedsl_megamoe`, branch
-`hanyueh/sm120-mxfp4mxfp8-split`, commit `c603357`.
+`hanyueh/sm120-mxfp4mxfp8-split`, commit `ed30d53`.
 
 The historical raw package name remains `moe_sm120_mxfp8_split`; its actual
 weight/activation contract is MXFP4 E2M1 x MXFP8 E4M3 with E8M0 K32 scales.
