@@ -32,7 +32,7 @@ _WAN_HYBRID_PACKED_VALUE_SHAPE = (
     _WAN_HYBRID_PADDED_SEQUENCE // 2,
 )
 _WAN_HYBRID_SCALE_PLANE_SHAPE = (25_600, 32)
-_WAN_HYBRID_TENSOR_MAP_COUNT = 8
+_WAN_HYBRID_TENSOR_MAP_COUNT = 6
 _WAN_HYBRID_TENSOR_MAP_BYTES = 128
 _WAN_HYBRID_UNAVAILABLE_MESSAGE = (
     "wan_hybrid attention is not available in this FlashInfer installation"
@@ -43,11 +43,8 @@ class _WanHybridAttentionABIViews(NamedTuple):
     """Allocation-free views prepared for the optional attention binding."""
 
     vt: torch.Tensor
-    sfq: torch.Tensor
-    sfk: torch.Tensor
     sfvt_lo: torch.Tensor
     sfvt_hi: torch.Tensor
-    qk_correction: torch.Tensor
 
 
 class WanHybridAttentionWorkspace:
@@ -91,9 +88,6 @@ class WanHybridAttentionWorkspace:
             dtype=torch.uint8,
             device=normalized_device,
         )
-        self._qk_correction = torch.zeros(
-            (1,), dtype=torch.float32, device=normalized_device
-        )
         self._descriptor_storage = torch.empty(
             (_WAN_HYBRID_TENSOR_MAP_COUNT, _WAN_HYBRID_TENSOR_MAP_BYTES),
             dtype=torch.uint8,
@@ -113,8 +107,6 @@ class WanHybridAttentionWorkspace:
                 2 * _WAN_HYBRID_VALUE_ROWS,
                 _WAN_HYBRID_PADDED_SEQUENCE // 2,
             ),
-            sfq=self._buffers["v_scale_base_lo"],
-            sfk=self._buffers["v_scale_base_hi"],
             sfvt_lo=self._v_scale_lo_levels.view(
                 2 * _WAN_HYBRID_SCALE_PLANE_SHAPE[0],
                 _WAN_HYBRID_SCALE_PLANE_SHAPE[1],
@@ -123,7 +115,6 @@ class WanHybridAttentionWorkspace:
                 2 * _WAN_HYBRID_SCALE_PLANE_SHAPE[0],
                 _WAN_HYBRID_SCALE_PLANE_SHAPE[1],
             ),
-            qk_correction=self._qk_correction,
         )
 
     @property

@@ -67,6 +67,7 @@ def gen_wan_hybrid_quantization_module(target: str) -> JitSpec:
             f"-DFLASHINFER_WAN_HYBRID_TARGET_MINOR={target_minor}",
         ],
         extra_include_paths=[csrc_dir, csrc_dir.parent],
+        use_fast_math=target != "sm100",
     )
 
 
@@ -88,6 +89,7 @@ def gen_wan_hybrid_attention_module(target: str) -> JitSpec:
             *nvcc_flags,
             "-DFLASHINFER_ENABLE_BF16",
             f"-DFLASHINFER_WAN_HYBRID_TARGET_MINOR={target_minor}",
+            "--ptxas-options=--opt-level=1",
         ],
         extra_include_paths=[csrc_dir, csrc_dir.parent],
     )

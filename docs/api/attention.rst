@@ -230,11 +230,13 @@ output buffer. Query availability before selecting this path; it is not part of
 automatic attention routing.
 
 The workspace allocates its two-level packed value and scale storage once and
-retains stable attention-ready views across calls. Reusing the same workspace
+retains stable attention-ready views across calls. The architecture-specific
+backend uses one compact six-descriptor Q/K/Vt/SFVtLo/SFVtHi/O tensor-map ABI
+on both supported datacenter Blackwell targets. Reusing the same workspace
 therefore avoids per-call storage allocation and supports CUDA Graph replay;
 callers should treat all workspace internals as opaque. Prewarm once with the
-same Q, K, output, and workspace tensors before graph capture. A workspace must
-not be used concurrently by multiple calls.
+same Q, K, output, and workspace tensors before graph capture. A workspace
+must not be used concurrently by multiple calls.
 
 Both value preparation and attention enqueue asynchronously on the caller's
 current PyTorch CUDA stream. The API does not synchronize and reports itself

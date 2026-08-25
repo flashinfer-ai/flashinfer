@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import hashlib
 import inspect
 import json
 from pathlib import Path
@@ -23,6 +24,7 @@ import torch
 
 import flashinfer
 import flashinfer._wan_hybrid as wan_hybrid_impl
+import flashinfer.jit.wan_hybrid as wan_hybrid_jit
 import flashinfer.wan_hybrid as wan_hybrid
 
 
@@ -46,6 +48,10 @@ _NVFP4_QUANT_ENV_VARS = (
 
 def _meta_tensor(*, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
     return torch.empty(_EXACT_SHAPE, dtype=dtype, device="meta")
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _uninitialized_workspace() -> wan_hybrid.WanHybridAttentionWorkspace:
@@ -96,13 +102,66 @@ def test_wan_hybrid_unlinked_attention_is_explicitly_unavailable(
     assert not wan_hybrid.is_wan_hybrid_attention_available("not-a-device")
 
 
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3)])
+def test_wan_hybrid_supported_capabilities_remain_available(
+    monkeypatch, capability
+) -> None:
+    monkeypatch.setattr(wan_hybrid, "_wan_hybrid_attention_impl", object())
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
+
+    assert wan_hybrid.is_wan_hybrid_attention_available("cuda:0")
+
+
+def test_wan_hybrid_jit_flags_are_target_specific(monkeypatch) -> None:
+    calls = {}
+
+    def fake_gen_jit_spec(name, sources, **kwargs):
+        calls[name] = {"sources": sources, **kwargs}
+        return object()
+
+    monkeypatch.setattr(wan_hybrid_jit, "gen_jit_spec", fake_gen_jit_spec)
+    monkeypatch.setattr(
+        wan_hybrid_jit, "_wan_hybrid_csrc_dir", lambda: Path("/wan_hybrid")
+    )
+    wan_hybrid_jit.gen_wan_hybrid_quantization_module.cache_clear()
+    wan_hybrid_jit.gen_wan_hybrid_attention_module.cache_clear()
+
+    try:
+        for target in ("sm100", "sm103"):
+            wan_hybrid_jit.gen_wan_hybrid_quantization_module(target)
+            wan_hybrid_jit.gen_wan_hybrid_attention_module(target)
+
+        for target, arch in (("sm100", "100a"), ("sm103", "103a")):
+            target_minor = "0" if target == "sm100" else "3"
+            for component in ("quantization", "attention"):
+                call = calls[f"wan_hybrid_{component}_{target}"]
+                flags = call["extra_cuda_cflags"]
+                assert flags.count(f"-gencode=arch=compute_{arch},code=sm_{arch}") == 1
+                assert flags.count(
+                    f"-DFLASHINFER_WAN_HYBRID_TARGET_MINOR={target_minor}"
+                ) == 1
+                assert len(call["sources"]) == 1
+                assert call["sources"][0].name == (
+                    f"wan_hybrid_{component}_binding.cu"
+                )
+
+        assert calls["wan_hybrid_quantization_sm100"]["use_fast_math"] is False
+        assert calls["wan_hybrid_quantization_sm103"]["use_fast_math"] is True
+        for target in ("sm100", "sm103"):
+            assert "--ptxas-options=--opt-level=1" in calls[
+                f"wan_hybrid_attention_{target}"
+            ]["extra_cuda_cflags"]
+    finally:
+        wan_hybrid_jit.gen_wan_hybrid_quantization_module.cache_clear()
+        wan_hybrid_jit.gen_wan_hybrid_attention_module.cache_clear()
+
+
 def test_wan_hybrid_quantizer_binding_matches_frozen_device_abi() -> None:
-    binding = (
-        Path(__file__).resolve().parents[2]
-        / "csrc"
-        / "wan_hybrid"
-        / "wan_hybrid_quantization_binding.cu"
-    ).read_text(encoding="utf-8")
+    source_root = Path(__file__).resolve().parents[2] / "csrc" / "wan_hybrid"
+    binding = (source_root / "wan_hybrid_quantization_binding.cu").read_text(
+        encoding="utf-8"
+    )
     for argument in (
         "value",
         "base",
@@ -119,26 +178,29 @@ def test_wan_hybrid_quantizer_binding_matches_frozen_device_abi() -> None:
     assert "kPaddedSequence = 5120" in binding
     assert "kLogicalBlocks = 38" in binding
     assert "kPhysicalBlocks = 40" in binding
+    assert "SMEM_TOTAL == 32896" in binding
+    assert "SMEM_TOTAL == 33280" in binding
     assert "const cudaStream_t stream = get_stream(value.device());" in binding
     assert binding.count('#include "device/wan_hybrid_quantize_value_sm') == 2
+    assert _sha256(source_root / "device/wan_hybrid_quantize_value_sm100.cu") == (
+        "808fa99c273e7b0902cf7938bfb0078e26a8a5ac49f58f2f9432ef17d858fcf5"
+    )
+    assert _sha256(source_root / "device/wan_hybrid_quantize_value_sm103.cu") == (
+        "f2a92e9b3cb774673e5ca1192c793cfd782dc07f2c8c294a12466b3d26be7f3e"
+    )
 
 
 def test_wan_hybrid_attention_binding_matches_frozen_device_abi() -> None:
-    binding = (
-        Path(__file__).resolve().parents[2]
-        / "csrc"
-        / "wan_hybrid"
-        / "wan_hybrid_attention_binding.cu"
-    ).read_text(encoding="utf-8")
+    source_root = Path(__file__).resolve().parents[2] / "csrc" / "wan_hybrid"
+    binding = (source_root / "wan_hybrid_attention_binding.cu").read_text(
+        encoding="utf-8"
+    )
     for argument in (
         "q",
         "k",
         "vt",
-        "sfq",
-        "sfk",
         "sfvt_lo",
         "sfvt_hi",
-        "qk_correction",
         "out",
         "descriptor_storage",
     ):
@@ -147,10 +209,20 @@ def test_wan_hybrid_attention_binding_matches_frozen_device_abi() -> None:
     assert "kSequence = 4800" in binding
     assert "kHeads = 40" in binding
     assert "kHeadDim = 128" in binding
-    assert "kDynamicSmemBytes = 224'256" in binding
-    assert "cudaLaunchAttributeClusterDimension" in binding
-    assert "cudaClusterSchedulingPolicySpread" in binding
+    assert "kTensorMapCount = 6" in binding
+    assert "kMaximumTiles = 147" in binding
+    assert "kDynamicSmemBytes = 231'424" in binding
+    assert 'EncodeNHD(k, 128, "cuTensorMapEncodeTiled(k)")' in binding
+    assert "kPackedValueRows, 64, 128" in binding
+    assert "physical_num_blocks = kPaddedSequence / 128" in binding
+    assert "cudaLaunchAttributeClusterDimension" not in binding
+    for removed in ("TensorView sfq", "TensorView sfk", "TensorView qk_correction"):
+        assert removed not in binding
     assert binding.count('#include "device/wan_hybrid_attention_sm') == 2
+    for target in ("sm100", "sm103"):
+        assert _sha256(
+            source_root / "device" / f"wan_hybrid_attention_{target}.cu"
+        ) == "2b9d37f9cf9fa60d129c4b16edf8e5a2d792bcd2f1fa4a7d724079339fb30e30"
 
 
 def test_wan_hybrid_attention_requires_prewarm_before_capture(monkeypatch) -> None:
@@ -159,7 +231,7 @@ def test_wan_hybrid_attention_requires_prewarm_before_capture(monkeypatch) -> No
     out = torch.empty((3,), device="cpu")
     workspace = object.__new__(wan_hybrid.WanHybridAttentionWorkspace)
     workspace._attention_views = wan_hybrid._WanHybridAttentionABIViews(
-        *(torch.empty((index + 4,), device="cpu") for index in range(6))
+        *(torch.empty((index + 4,), device="cpu") for index in range(3))
     )
     workspace._descriptor_signature = None
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
@@ -498,17 +570,15 @@ def test_wan_hybrid_workspace_uses_exact_reusable_quantizer_storage() -> None:
     assert tuple(views.sfvt_lo.shape) == (51_200, 32)
     assert tuple(views.sfvt_hi.shape) == (51_200, 32)
     assert views.vt.data_ptr() == base.data_ptr()
-    assert views.sfq is workspace._buffers["v_scale_base_lo"]
-    assert views.sfk is workspace._buffers["v_scale_base_hi"]
-    assert views.sfvt_lo.data_ptr() == views.sfq.data_ptr()
-    assert views.sfvt_hi.data_ptr() == views.sfk.data_ptr()
-    assert views.qk_correction.dtype == torch.float32
-    assert views.qk_correction.device == workspace.device
-    assert tuple(views.qk_correction.shape) == (1,)
-    assert torch.equal(views.qk_correction, torch.zeros_like(views.qk_correction))
+    assert views.sfvt_lo.data_ptr() == workspace._buffers[
+        "v_scale_base_lo"
+    ].data_ptr()
+    assert views.sfvt_hi.data_ptr() == workspace._buffers[
+        "v_scale_base_hi"
+    ].data_ptr()
     assert workspace._descriptor_storage.dtype == torch.uint8
     assert workspace._descriptor_storage.device == workspace.device
-    assert tuple(workspace._descriptor_storage.shape) == (8, 128)
+    assert tuple(workspace._descriptor_storage.shape) == (6, 128)
     assert workspace._descriptor_storage.data_ptr() % 128 == 0
     assert workspace._descriptor_signature is None
 

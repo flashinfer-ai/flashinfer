@@ -70,11 +70,11 @@ constexpr int64_t kPackedValueColumns = kPaddedSequence / 2;
 constexpr int64_t kScaleRows = 25'600;
 constexpr int64_t kScaleColumns = 32;
 constexpr int64_t kValueScaleRows = 2 * kScaleRows;
-constexpr int64_t kTensorMapCount = 8;
+constexpr int64_t kTensorMapCount = 6;
 constexpr int64_t kTensorMapBytes = 128;
 constexpr int64_t kThreads = 512;
-constexpr int64_t kMaximumTiles = 400;
-constexpr size_t kDynamicSmemBytes = 224'256;
+constexpr int64_t kMaximumTiles = 147;
+constexpr size_t kDynamicSmemBytes = 231'424;
 
 static_assert(SMEM_TOTAL == kDynamicSmemBytes);
 static_assert(sizeof(CUtensorMap) == kTensorMapBytes);
@@ -156,18 +156,13 @@ CUtensorMap Encode2D(const TensorView& tensor, uint64_t columns, uint64_t rows,
 }
 
 void PrepareTensorMaps(const TensorView& q, const TensorView& k, const TensorView& vt,
-                       const TensorView& sfq, const TensorView& sfk, const TensorView& sfvt_lo,
-                       const TensorView& sfvt_hi, const TensorView& out,
-                       const TensorView& descriptor_storage) {
+                       const TensorView& sfvt_lo, const TensorView& sfvt_hi,
+                       const TensorView& out, const TensorView& descriptor_storage) {
   std::array<CUtensorMap, kTensorMapCount> maps{
       EncodeNHD(q, 128, "cuTensorMapEncodeTiled(q)"),
-      EncodeNHD(k, 64, "cuTensorMapEncodeTiled(k)"),
-      Encode2D(vt, kPackedValueColumns, kPackedValueRows, 64, 64, CU_TENSOR_MAP_SWIZZLE_64B,
+      EncodeNHD(k, 128, "cuTensorMapEncodeTiled(k)"),
+      Encode2D(vt, kPackedValueColumns, kPackedValueRows, 64, 128, CU_TENSOR_MAP_SWIZZLE_64B,
                "cuTensorMapEncodeTiled(vt)"),
-      Encode2D(sfq, kScaleColumns, kScaleRows, 32, 32, CU_TENSOR_MAP_SWIZZLE_NONE,
-               "cuTensorMapEncodeTiled(sfq)"),
-      Encode2D(sfk, kScaleColumns, kScaleRows, 32, 32, CU_TENSOR_MAP_SWIZZLE_NONE,
-               "cuTensorMapEncodeTiled(sfk)"),
       Encode2D(sfvt_lo, kScaleColumns, kValueScaleRows, 32, 16, CU_TENSOR_MAP_SWIZZLE_NONE,
                "cuTensorMapEncodeTiled(sfvt_lo)"),
       Encode2D(sfvt_hi, kScaleColumns, kValueScaleRows, 32, 16, CU_TENSOR_MAP_SWIZZLE_NONE,
@@ -179,19 +174,16 @@ void PrepareTensorMaps(const TensorView& q, const TensorView& k, const TensorVie
       "cudaMemcpy(wan_hybrid tensor maps)");
 }
 
-void Attention(TensorView q, TensorView k, TensorView vt, TensorView sfq, TensorView sfk,
-               TensorView sfvt_lo, TensorView sfvt_hi, TensorView qk_correction, TensorView out,
-               TensorView descriptor_storage, bool prepare_descriptors, double sm_scale) {
+void Attention(TensorView q, TensorView k, TensorView vt, TensorView sfvt_lo,
+               TensorView sfvt_hi, TensorView out, TensorView descriptor_storage,
+               bool prepare_descriptors, double sm_scale) {
   CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
   const int32_t device_id = q.device().device_id;
   CheckExactTensor(q, "q", dl_bfloat16, {kBatch, kSequence, kHeads, kHeadDim}, device_id);
   CheckExactTensor(k, "k", dl_bfloat16, {kBatch, kSequence, kHeads, kHeadDim}, device_id);
   CheckExactTensor(vt, "vt", dl_uint8, {kPackedValueRows, kPackedValueColumns}, device_id);
-  CheckExactTensor(sfq, "sfq", dl_uint8, {kScaleRows, kScaleColumns}, device_id);
-  CheckExactTensor(sfk, "sfk", dl_uint8, {kScaleRows, kScaleColumns}, device_id);
   CheckExactTensor(sfvt_lo, "sfvt_lo", dl_uint8, {kValueScaleRows, kScaleColumns}, device_id);
   CheckExactTensor(sfvt_hi, "sfvt_hi", dl_uint8, {kValueScaleRows, kScaleColumns}, device_id);
-  CheckExactTensor(qk_correction, "qk_correction", dl_float32, {1}, device_id);
   CheckExactTensor(out, "out", dl_bfloat16, {kBatch, kSequence, kHeads, kHeadDim}, device_id);
   CheckExactTensor(descriptor_storage, "descriptor_storage", dl_uint8,
                    {kTensorMapCount, kTensorMapBytes}, device_id);
@@ -202,7 +194,7 @@ void Attention(TensorView q, TensorView k, TensorView vt, TensorView sfq, Tensor
   ffi::CUDADeviceGuard device_guard(device_id);
   CheckTarget(device_id);
   if (prepare_descriptors) {
-    PrepareTensorMaps(q, k, vt, sfq, sfk, sfvt_lo, sfvt_hi, out, descriptor_storage);
+    PrepareTensorMaps(q, k, vt, sfvt_lo, sfvt_hi, out, descriptor_storage);
     CheckCuda(cudaFuncSetAttribute(kernel_wan_hybrid_attention,
                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
                                    static_cast<int>(kDynamicSmemBytes)),
@@ -213,8 +205,10 @@ void Attention(TensorView q, TensorView k, TensorView vt, TensorView sfq, Tensor
   CheckCuda(
       cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device_id),
       "cudaDeviceGetAttribute(multiProcessorCount)");
-  const int grid_x = 2 * std::min(multiprocessor_count / 2, static_cast<int>(kMaximumTiles));
-  TVM_FFI_ICHECK_GT(grid_x, 0) << "wan_hybrid attention requires at least two SMs";
+  constexpr int kTotalTiles = ((kSequence + 255) / 256) * kBatch * kHeads;
+  const int grid_x =
+      std::min({multiprocessor_count, kTotalTiles, static_cast<int>(kMaximumTiles)});
+  TVM_FFI_ICHECK_GT(grid_x, 0) << "wan_hybrid attention requires at least one SM";
 
   auto* descriptor_bytes = static_cast<uint8_t*>(descriptor_storage.data_ptr());
   auto tensor_map = [descriptor_bytes](int index) {
@@ -224,18 +218,14 @@ void Attention(TensorView q, TensorView k, TensorView vt, TensorView sfq, Tensor
   const auto* q_map = tensor_map(0);
   const auto* k_map = tensor_map(1);
   const auto* vt_map = tensor_map(2);
-  const auto* sfq_map = tensor_map(3);
-  const auto* sfk_map = tensor_map(4);
-  const auto* sfvt_lo_map = tensor_map(5);
-  const auto* sfvt_hi_map = tensor_map(6);
-  const auto* out_map = tensor_map(7);
-  auto* correction = static_cast<float*>(qk_correction.data_ptr());
+  const auto* sfvt_lo_map = tensor_map(3);
+  const auto* sfvt_hi_map = tensor_map(4);
+  const auto* out_map = tensor_map(5);
   constexpr int seqlen_q = kSequence;
   constexpr int seqlen_kv = kSequence;
-  constexpr int q_stride = kPaddedSequence;
-  constexpr int kv_stride = kPaddedSequence;
   constexpr int heads = kHeads;
   constexpr int total_bh = kBatch * kHeads;
+  constexpr int physical_num_blocks = kPaddedSequence / 128;
   const float softmax_scale_log2 = static_cast<float>(sm_scale / std::log(2.0));
 
   cudaLaunchConfig_t config{};
@@ -243,19 +233,9 @@ void Attention(TensorView q, TensorView k, TensorView vt, TensorView sfq, Tensor
   config.blockDim = dim3(kThreads, 1, 1);
   config.dynamicSmemBytes = kDynamicSmemBytes;
   config.stream = get_stream(q.device());
-  cudaLaunchAttribute attributes[2]{};
-  attributes[0].id = cudaLaunchAttributeClusterDimension;
-  attributes[0].val.clusterDim.x = 2;
-  attributes[0].val.clusterDim.y = 1;
-  attributes[0].val.clusterDim.z = 1;
-  attributes[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
-  attributes[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
-  config.attrs = attributes;
-  config.numAttrs = 2;
-
-  CheckCuda(cudaLaunchKernelEx(&config, kernel_wan_hybrid_attention, q_map, k_map, vt_map, sfq_map,
-                               sfk_map, sfvt_lo_map, sfvt_hi_map, correction, out_map, seqlen_q,
-                               seqlen_kv, q_stride, kv_stride, softmax_scale_log2, heads, total_bh),
+  CheckCuda(cudaLaunchKernelEx(&config, kernel_wan_hybrid_attention, q_map, k_map, vt_map,
+                               sfvt_lo_map, sfvt_hi_map, out_map, seqlen_q, seqlen_kv,
+                               softmax_scale_log2, heads, total_bh, physical_num_blocks),
             "wan_hybrid_attention launch");
 }
 

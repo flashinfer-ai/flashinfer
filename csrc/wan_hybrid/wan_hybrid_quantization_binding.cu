@@ -68,7 +68,11 @@ constexpr int64_t kScaleColumns = 32;
 constexpr int64_t kGridX = kBatch * kHeads * kLogicalBlocks;
 
 static_assert(THREADS == 256);
+#if FLASHINFER_WAN_HYBRID_TARGET_MINOR == 0
+static_assert(SMEM_TOTAL == 32896);
+#else
 static_assert(SMEM_TOTAL == 33280);
+#endif
 
 void CheckExactTensor(TensorView tensor, const char* name, DLDataType dtype,
                       std::initializer_list<int64_t> shape, int32_t device_id) {
