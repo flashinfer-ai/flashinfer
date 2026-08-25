@@ -28,6 +28,14 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
         raise SystemExit("--live-tokens must be <= --max-tokens")
     symm_buffer: Any = None
     try:
+        layout = (
+            "swiglu" if args.activation == "swiglu" else f"relu2_{args.relu2_kernel}"
+        )
+        physical_fc1 = (
+            args.intermediate
+            if layout == "relu2_single_plane"
+            else 2 * args.intermediate
+        )
         y, l1, l2, symm_buffer = create_dummy_nvfp4_inputs(
             rank,
             world_size,
@@ -36,8 +44,9 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
             live_tokens,
             args.topk,
             args.hidden,
-            2 * args.intermediate,
+            physical_fc1,
             activation=args.activation,
+            relu2_kernel=args.relu2_kernel,
             gate_up_clamp=args.gate_up_clamp,
             combine_dtype=args.combine_dtype,
             seed=args.seed,
@@ -60,12 +69,13 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
                     dtype=args.dtype,
                     world_size=world_size,
                     hidden=args.hidden,
-                    intermediate=2 * args.intermediate,
+                    intermediate=physical_fc1,
                     num_experts=args.num_experts,
                     topk=args.topk,
                     max_tokens=max_tokens,
                     combine_dtype=args.combine_dtype,
                     activation=args.activation,
+                    layout=layout,
                 )
                 if rank == 0:
                     print(f"[moe_ep-tune] schedule sweep base ({src}): {base}")

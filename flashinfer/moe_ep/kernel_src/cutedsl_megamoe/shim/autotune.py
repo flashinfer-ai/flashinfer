@@ -275,6 +275,7 @@ def autotune_nvfp4_mega_moe(
                 max_tokens=cfg.num_tokens_per_rank,
                 combine_dtype=cfg.combine_dtype,
                 activation=cfg.activation,
+                layout=cfg.layout_identity,
                 p50_us=p50_s * 1e6,
                 source="autotune",
             )
@@ -283,7 +284,7 @@ def autotune_nvfp4_mega_moe(
         symm_buffer._frontend,
         launch,
         candidates,
-        label=f"nvfp4_mega_{cfg.activation}",
+        label=f"nvfp4_mega_{cfg.layout_identity}",
         warmup_iters=warmup_iters,
         timed_iters=timed_iters,
         on_winner=_record,

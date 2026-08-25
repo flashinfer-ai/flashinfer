@@ -114,6 +114,8 @@ class MegaMoENvfp4Config:
     # Appended for compatibility with positional construction of every
     # pre-existing config field. New callers should pass this by name.
     activation: Literal["swiglu", "relu2"] = "swiglu"
+    # Appended after activation for the same positional compatibility.
+    relu2_kernel: Literal["padded", "single_plane"] = "padded"
 
     def __post_init__(self) -> None:
         if self.world_size < 1:
@@ -138,6 +140,13 @@ class MegaMoENvfp4Config:
             raise ValueError(
                 f"activation must be 'swiglu' or 'relu2', got {self.activation!r}."
             )
+        if self.relu2_kernel not in ("padded", "single_plane"):
+            raise ValueError(
+                "relu2_kernel must be 'padded' or 'single_plane', got "
+                f"{self.relu2_kernel!r}."
+            )
+        if self.relu2_kernel == "single_plane" and self.activation != "relu2":
+            raise ValueError("relu2_kernel='single_plane' requires activation='relu2'.")
         if self.activation == "relu2" and self.gate_up_clamp is not None:
             raise ValueError("ReLU2 MegaMoE does not support gate_up_clamp.")
         # The GEMM tiles are tail-safe (ceil-div K/M loops, TMA OOB zero-fill,
@@ -201,6 +210,20 @@ class MegaMoENvfp4Config:
     @property
     def num_experts_per_rank(self) -> int:
         return self.num_total_experts // self.world_size
+
+    @property
+    def layout_identity(self) -> str:
+        """Compile/workspace/cache identity for the physical FC1 layout."""
+        if self.activation == "swiglu":
+            return "swiglu"
+        return f"relu2_{self.relu2_kernel}"
+
+    @property
+    def semantic_intermediate(self) -> int:
+        """Post-activation width; ``intermediate`` is the physical FC1 N."""
+        if self.layout_identity == "relu2_single_plane":
+            return self.intermediate
+        return self.intermediate // 2
 
     @property
     def fc2_reduces_topk(self) -> bool:
@@ -439,7 +462,7 @@ class MegaMoENvfp4Frontend:
             c.num_total_experts,
             c.hidden,
             c.intermediate,
-            c.activation,
+            c.layout_identity,
             c.mma_tiler_mnk,
             c.cluster_shape_mnk,
             c.use_2cta_instrs,
@@ -494,10 +517,11 @@ class MegaMoENvfp4Frontend:
         group_hint = c.group_hint if c.group_hint is not None else max_active_clusters
 
         _logger.info(
-            "Compiling NVFP4 MegaMoE activation=%s semantic_intermediate=%d "
-            "internal_fc1=%d hidden=%d experts=%d topk=%d",
+            "Compiling NVFP4 MegaMoE layout=%s activation=%s "
+            "semantic_intermediate=%d physical_fc1=%d hidden=%d experts=%d topk=%d",
+            c.layout_identity,
             c.activation,
-            c.intermediate // 2,
+            c.semantic_intermediate,
             c.intermediate,
             c.hidden,
             c.num_total_experts,
@@ -529,7 +553,7 @@ class MegaMoENvfp4Frontend:
             epi_flag_batch=c.epi_flag_batch,
             combine_format=combine_format,
         )
-        if c.activation == "relu2":
+        if c.layout_identity == "relu2_padded":
             from .relu2 import make_sm100_relu2_megamoe_kernel
 
             # Keep the callable's runtime type exactly Sm100MegaMoEKernel.
@@ -537,6 +561,11 @@ class MegaMoENvfp4Frontend:
             # against the shim subclass and recursively re-enters it with the
             # FC12-only ``fc1_output`` keyword.
             kernel = make_sm100_relu2_megamoe_kernel(**kernel_kwargs)
+        elif c.layout_identity == "relu2_single_plane":
+            # Native upstream specialization: unlike the compatibility
+            # adapter above, this kernel physically computes one I-wide FC1
+            # plane and derives an I-wide FC2 input from activation="relu2".
+            kernel = Sm100MegaMoEKernel(activation="relu2", **kernel_kwargs)
         else:
             kernel = Sm100MegaMoEKernel(**kernel_kwargs)
 
@@ -667,7 +696,7 @@ class MegaMoENvfp4Frontend:
                 f"({c.num_tokens_per_rank})."
             )
 
-        intermediate_down = c.intermediate // 2
+        intermediate_down = c.semantic_intermediate
         e = c.num_experts_per_rank
 
         current_device = torch.cuda.current_device()
@@ -1015,6 +1044,7 @@ class MegaMoESymmBuffer:
     _destroyed: bool = False
     # Appended so legacy positional construction retains its field order.
     activation: Literal["swiglu", "relu2"] = "swiglu"
+    relu2_kernel: Literal["padded", "single_plane"] = "padded"
 
     def destroy(self) -> None:
         """Release symmetric-heap allocations and compiled kernel workspaces."""
@@ -1041,6 +1071,7 @@ def get_symm_buffer_for_mega_moe(
     world_size: int,
     *,
     activation: Literal["swiglu", "relu2"] = "swiglu",
+    relu2_kernel: Literal["padded", "single_plane"] = "padded",
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     apply_topk_in_fc1: bool = True,
@@ -1058,10 +1089,12 @@ def get_symm_buffer_for_mega_moe(
     of a ``ProcessGroup`` — NVSHMEM bootstrap is handled internally.
 
     ``activation`` selects the FC1 nonlinearity. ``"swiglu"`` preserves the
-    historical two-plane gate/up behavior. ``"relu2"`` treats the first plane
-    as the semantic W1 projection and provably ignores the zero-padded second
-    plane. ``gate_up_clamp`` (and its deprecated ``activation_clamp`` alias)
-    are valid only for SwiGLU.
+    historical two-plane gate/up behavior. For ``"relu2"``,
+    ``relu2_kernel="padded"`` retains the two-plane compatibility adapter;
+    ``"single_plane"`` selects the native one-plane kernel. ``intermediate``
+    is always the physical FC1 width: 2*I for SwiGLU/ReLU2-padded, I for
+    ReLU2-single-plane. ``gate_up_clamp`` (and its deprecated
+    ``activation_clamp`` alias) are valid only for SwiGLU.
 
     ``apply_topk_in_fc1`` mirrors ``mega_runner``'s
     ``ref_compute_graph == "deepgemm"`` behaviour when ``True`` (default).
@@ -1097,6 +1130,13 @@ def get_symm_buffer_for_mega_moe(
 
     if activation not in ("swiglu", "relu2"):
         raise ValueError(f"activation must be 'swiglu' or 'relu2', got {activation!r}.")
+    if relu2_kernel not in ("padded", "single_plane"):
+        raise ValueError(
+            f"relu2_kernel must be 'padded' or 'single_plane', got {relu2_kernel!r}."
+        )
+    if relu2_kernel == "single_plane" and activation != "relu2":
+        raise ValueError("relu2_kernel='single_plane' requires activation='relu2'.")
+    layout_identity = "swiglu" if activation == "swiglu" else f"relu2_{relu2_kernel}"
     clamp = resolve_gate_up_clamp(
         gate_up_clamp=gate_up_clamp,
         activation_clamp=activation_clamp,
@@ -1126,6 +1166,7 @@ def get_symm_buffer_for_mega_moe(
             max_tokens=num_max_tokens,
             combine_dtype=combine_dtype,
             activation=activation,
+            layout=layout_identity,
         )
     if knob_source == "heuristic" and combine_dtype != "bf16":
         # The measured profiles pick the token-back mode freely, but a
@@ -1143,6 +1184,7 @@ def get_symm_buffer_for_mega_moe(
         hidden=hidden,
         intermediate=intermediate,
         activation=activation,
+        relu2_kernel=relu2_kernel,
         gate_up_clamp=clamp,
         apply_topk_in_fc1=apply_topk_in_fc1,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
@@ -1214,6 +1256,7 @@ def get_symm_buffer_for_mega_moe(
         hidden=hidden,
         intermediate=intermediate,
         activation=activation,
+        relu2_kernel=relu2_kernel,
         rank=rank,
         world_size=world_size,
         x=x,
@@ -1428,8 +1471,15 @@ def _create_dummy_weights(
     hidden: int,
     intermediate: int,
     generator: torch.Generator,
+    *,
+    relu2_single_plane: bool = False,
 ) -> Tuple[TransformedWeights, TransformedWeights]:
-    """Random NVFP4 weights + swizzled SF for local smoke scripts."""
+    """Random NVFP4 weights + swizzled SF for local smoke scripts.
+
+    ``intermediate`` is the physical FC1 width. The native ReLU2 layout has
+    one projection plane, so its FC2 K is the same width; gated/padded layouts
+    retain FC2 K = physical FC1 / 2.
+    """
     from moe_nvfp4_swapab.mega_runner import (
         _stack_byte_reinterpretable_tensors,
     )
@@ -1439,7 +1489,7 @@ def _create_dummy_weights(
         to_blocked,
     )
 
-    intermediate_down = intermediate // 2
+    intermediate_down = intermediate if relu2_single_plane else intermediate // 2
     hidden_sf_cols = ceil_div(hidden, Nvfp4BlockSize)
     intermediate_down_sf_cols = ceil_div(intermediate_down, Nvfp4BlockSize)
 
@@ -1499,6 +1549,7 @@ def create_dummy_inputs(
     intermediate: int,
     *,
     activation: Literal["swiglu", "relu2"] = "swiglu",
+    relu2_kernel: Literal["padded", "single_plane"] = "padded",
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
@@ -1549,6 +1600,7 @@ def create_dummy_inputs(
         rank,
         world_size,
         activation=activation,
+        relu2_kernel=relu2_kernel,
         gate_up_clamp=clamp,
         combine_dtype=combine_dtype,
         fc1_alpha=fc1_alpha,
@@ -1561,6 +1613,7 @@ def create_dummy_inputs(
         hidden,
         intermediate,
         gen,
+        relu2_single_plane=(activation == "relu2" and relu2_kernel == "single_plane"),
     )
 
     from moe_nvfp4_swapab.runner_common import (

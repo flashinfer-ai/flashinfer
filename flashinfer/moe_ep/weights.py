@@ -35,8 +35,9 @@ class MoEWeightPack:
       ``w13`` ``[local_experts, 2*intermediate, hidden]`` and ``w2``
       ``[local_experts, hidden, intermediate]`` in bf16/fp32. The opt-in
       NVFP4 CuTeDSL MegaMoE ``activation="relu2"`` path instead accepts one
-      semantic W1 plane ``[local_experts, intermediate, hidden]`` and pads its
-      ignored physical plane internally.
+      semantic W1 plane ``[local_experts, intermediate, hidden]``. Its default
+      ``relu2_kernel="padded"`` pads an ignored physical plane internally;
+      ``"single_plane"`` keeps the projection physically I-wide.
     * ``MoEWeightPack(w13, w2, w13_scale, w2_scale)`` ->
       :class:`PrequantizedMoEWeights` — packed quantized data (e.g. fp4
       ``[..., hidden // 2]`` / ``[..., intermediate // 2]``) plus both block
@@ -44,7 +45,8 @@ class MoEWeightPack:
       scales with trailing dims ``hidden // 32`` / ``intermediate // 32``;
       NVFP4 CuTeDSL expects fp8-e4m3 per-16 scales (``hidden // 16`` /
       ``intermediate // 16``). Its ``activation="relu2"`` path likewise takes
-      packed W1 / W1 scales with semantic leading dimension ``intermediate``.
+      packed W1 / W1 scales with semantic leading dimension ``intermediate``;
+      only the compatibility mode expands/interleaves those tensors.
 
     Supplying exactly one scale raises: that state used to silently select
     the re-quantize-from-bf16 path in every backend, ignoring the provided

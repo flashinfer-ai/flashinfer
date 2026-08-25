@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Fused fc1+fc2 swap-AB SwiGLU NVFP4 kernel for SM100."""
+"""Fused fc1+fc2 swap-AB NVFP4 kernel for SM100."""
 
 from typing import Literal, Optional, Tuple, Type
 
@@ -40,6 +40,13 @@ from common.megamoe_constants import (
 from common.host_utils import get_cutedsl_target_arch
 from .moe_utils import spin_wait
 from . import dynamic_mainloop
+from .activation import (
+    Fc1Activation,
+    fc1_projection_planes,
+    post_activation_width,
+    validate_fc1_activation,
+    validate_fc1_fc2_widths,
+)
 from src.token_comm import CombineFormat
 
 
@@ -53,7 +60,7 @@ from src.token_comm import CombineFormat
 
 
 class Sm100SwapABSwigluFp4Fc12Kernel:
-    """Fused fc1+fc2 swap-AB SwiGLU NVFP4 grouped GEMM for MoE on SM100.
+    """Fused fc1+fc2 swap-AB NVFP4 grouped GEMM for MoE on SM100.
 
     This class owns the local fc1/fc2 GEMM pipeline and exposes token-comm
     hooks for the MegaMoE subclass.
@@ -91,6 +98,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         apply_topk_in_fc1: bool = True,
         gate_up_clamp: Optional[float] = None,
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
+        activation: Fc1Activation = "swiglu",
     ) -> None:
         if not force_static_sched:
             raise NotImplementedError(
@@ -139,6 +147,12 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         self.apply_topk_in_fc1 = apply_topk_in_fc1
         self.gate_up_clamp = gate_up_clamp
         self.epi_flag_batch = epi_flag_batch
+        self.activation = validate_fc1_activation(activation)
+        self.fc1_projection_planes = fc1_projection_planes(self.activation)
+        if self.activation == "relu2" and gate_up_clamp is not None:
+            raise ValueError("relu2 does not support gate_up_clamp.")
+        if self.static_expert_shape is not None:
+            post_activation_width(self.static_expert_shape[1], self.activation)
 
         self._validate_mma_tiler_and_cluster_shape()
         self.mma_tiler = mma_tiler_mnk
@@ -219,8 +233,52 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             f"_padding_{self.token_padding_block}x{self.sf_padding_block}"
             f"_{fc2store}_{inkred}_{apply_topk}"
             f"_fc2out{self.fc2_output_dtype.__name__}_sfvec{self.sf_vec_size}"
-            f"_acc{self.acc_dtype.__name__}_clamp{self.gate_up_clamp}_epiflag{epiflag}"
+            f"_acc{self.acc_dtype.__name__}_activation{self.activation}"
+            f"_planes{self.fc1_projection_planes}_clamp{self.gate_up_clamp}"
+            f"_epiflag{epiflag}"
         )
+
+    def validate_problem_shapes(
+        self,
+        activation_shape,
+        fc1_weight_shape,
+        fc2_weight_shape,
+    ) -> int:
+        """Validate the host-visible FC1/FC2 shape contract."""
+        if len(activation_shape) != 2:
+            raise ValueError(
+                f"activation must be rank 2, got shape {tuple(activation_shape)}."
+            )
+        if len(fc1_weight_shape) != 3 or len(fc2_weight_shape) != 3:
+            raise ValueError(
+                "fc1_weight and fc2_weight must be rank 3, got "
+                f"{tuple(fc1_weight_shape)} and {tuple(fc2_weight_shape)}."
+            )
+        experts, hidden, physical_width = map(int, fc1_weight_shape)
+        experts2, fc2_k, hidden2 = map(int, fc2_weight_shape)
+        tokens, activation_hidden = map(int, activation_shape)
+        del tokens
+        if experts != experts2:
+            raise ValueError(
+                f"fc1/fc2 expert counts differ: {experts} vs {experts2}."
+            )
+        if hidden != hidden2 or hidden != activation_hidden:
+            raise ValueError(
+                "hidden dimensions disagree: activation="
+                f"{activation_hidden}, fc1={hidden}, fc2={hidden2}."
+            )
+        semantic_width = validate_fc1_fc2_widths(
+            physical_width, fc2_k, self.activation
+        )
+        if self.static_expert_shape is not None:
+            expected = tuple(map(int, self.static_expert_shape))
+            actual = (experts, physical_width, hidden)
+            if actual != expected:
+                raise ValueError(
+                    f"runtime expert shape {actual} does not match "
+                    f"static_expert_shape {expected}."
+                )
+        return semantic_width
 
     def _validate_mma_tiler_and_cluster_shape(self) -> None:
         """Validate user-provided geometry against v1 fused-fc12 constraints.
@@ -391,6 +449,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
             allow_overlap_acc=True,
             static_expert_shape=self.static_expert_shape,
             gate_up_clamp=self.gate_up_clamp,
+            activation=self.activation,
         )
 
         if self.num_sched_stages is None:
@@ -574,8 +633,10 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         mma_tiler_n = self.mma_tiler_mnk[1]
 
         data_total_rows, _hidden = fc1_activation_tensor.shape
-        experts, _hidden_w, intermediate_gateup = fc1_weight_tensor.shape
-        intermediate_downproj = intermediate_gateup // 2
+        experts, _hidden_w, physical_fc1_width = fc1_weight_tensor.shape
+        intermediate_downproj = post_activation_width(
+            physical_fc1_width, self.activation
+        )
 
         # Conservative upper bound for sf_total_rows.
         sf_total_rows_upper = data_total_rows + experts * sf_padding_block
@@ -771,7 +832,17 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         # Opaque subclass bundle; None for the lean path.
         token_comm_args=None,
     ) -> None:
-        """Launch the fused fc1+fc2 swap-AB SwiGLU NVFP4 kernel."""
+        """Launch the fused fc1+fc2 swap-AB NVFP4 kernel."""
+
+        _shape_values = (
+            *activation.shape,
+            *fc1_weight.shape,
+            *fc2_weight.shape,
+        )
+        if cutlass.const_expr(all(isinstance(v, int) for v in _shape_values)):
+            self.validate_problem_shapes(
+                activation.shape, fc1_weight.shape, fc2_weight.shape
+            )
 
         # Keep the real runtime extent for singleton-expert TMA descriptors.
         # A static extent of one is canonicalized out of the TMA basis before
@@ -788,7 +859,9 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
                 intermediate_gateup_static,
                 hidden_static,
             ) = self.static_expert_shape
-            intermediate_downproj_static = intermediate_gateup_static // 2
+            intermediate_downproj_static = post_activation_width(
+                intermediate_gateup_static, self.activation
+            )
 
             fc1_weight = cute.make_tensor(
                 fc1_weight.iterator,
@@ -1118,7 +1191,7 @@ class Sm100SwapABSwigluFp4Fc12Kernel:
         )
         fc1_output_epi_tile = (
             self.epilogue._EpilogueTokenTileSize,
-            self.epilogue._EpilogueFc1IntermediateDownTileSize,
+            self.epilogue.fc1_output_tile_size,
         )
         tma_atom_fc1_output, tma_tensor_fc1_output = cpasync.make_tiled_tma_atom(
             fc1_output_tma_op,

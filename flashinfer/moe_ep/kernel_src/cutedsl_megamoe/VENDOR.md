@@ -12,9 +12,16 @@ replace, what to audit) lives in `SKILL.md`.
   2026-07-13, before this VENDOR.md existed (it landed in flashinfer via
   PR #3980). The next full re-sync MUST pin the upstream SHA here. Until
   then the only pinned points are the two files synced ahead of the drop
-  (see pending diffs below, `50117315d`).
+  plus the reviewed ReLU2 partial sync (see pending diffs below,
+  `50117315d` and `d8cbe837abf6a528ecd49ca960db846f7b8ba321`). Git
+  archaeology found `8ba9c4efc5b6274b0307c289c876840d18c642ae` and its
+  mainline merge `1995b17d946b7a56e39eb3a9c931b83a906e4b1b` as the
+  nearest historical lineage anchors for this mixed drop; neither is asserted
+  to be an exact full-tree snapshot.
 - **Last synced**: 2026-07-13 (full drop); 2026-08-10 partial re-sync of
-  `inputs_process.py` + `host_utils.py` (see pending diffs).
+  `inputs_process.py` + `host_utils.py`; 2026-08-20 approved partial re-sync
+  of the NVFP4 single-plane ReLU2 production/reference surface (see pending
+  diffs).
 - **Vendored subset**: the four kernel packages only (`common/`, `src/`,
   `moe_mxfp8_glu/`, `moe_nvfp4_swapab/`) under `src/` — no repo scaffolding
   (`ci/`, `tester/`, `tests/`, `scripts/`, `pyproject.toml`, …).
@@ -28,9 +35,26 @@ replace, what to audit) lives in `SKILL.md`.
 - Local bug fixes go upstream first, then re-sync. If an emergency local edit
   is unavoidable, list it here as a pending-upstream diff until the next drop
   absorbs it.
+- The 2026-08-20 ReLU2 update is an explicitly approved partial re-vendor from
+  a pinned upstream commit, not a new full-drop claim. The five-file surface
+  below is therefore the documented exception until the next compatible full
+  re-sync.
 
 ## Pending local diffs vs upstream
 
+- The native single-plane ReLU2 production/reference delta was selectively
+  re-vendored from upstream commit
+  `d8cbe837abf6a528ecd49ca960db846f7b8ba321` (parent
+  `a23de9677cb5af40420bd74430dff5e2cd721003`) on 2026-08-20. The exact
+  vendored surface is:
+  `src/moe_nvfp4_swapab/activation.py` (new),
+  `src/moe_nvfp4_swapab/epilogue_refactor.py`,
+  `src/moe_nvfp4_swapab/kernel_fc12.py`,
+  `src/moe_nvfp4_swapab/mega_reference.py`, and
+  `src/moe_nvfp4_swapab/megamoe_kernel.py`. This was a reviewed semantic
+  backport onto the older mixed tree, not a whole-file copy: it preserves the
+  FlashInfer singleton-expert TMA-mode fix in `kernel_fc12.py` and all other
+  existing drop divergences. No runner or harness file was synced.
 - `src/src/inputs_process.py` is synced **ahead** of the recorded drop, to
   upstream commit `50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab`
   (<https://gitlab-master.nvidia.com/bangyus/cutedsl_megamoe/-/blob/50117315dbcd2ffb1e8c1c4dab4be9b42cad24ab/src/inputs_process.py>),

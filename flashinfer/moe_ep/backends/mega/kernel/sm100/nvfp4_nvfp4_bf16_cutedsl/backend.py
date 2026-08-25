@@ -57,11 +57,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
         self._thunk_state: tuple | None = None
         _logger.info(
-            "Configured NVFP4 MegaMoE activation=%s semantic_intermediate=%d "
-            "internal_fc1=%d",
+            "Configured NVFP4 MegaMoE layout=%s activation=%s "
+            "semantic_intermediate=%d physical_fc1=%d",
+            config.layout_identity,
             config.activation,
             config.intermediate_size,
-            2 * config.intermediate_size,
+            config.physical_fc1_size,
         )
         # knobs="auto": tune at the first compute() (weights + staged inputs
         # exist there), then keep the winner for the session.
@@ -112,6 +113,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
             activation=self._kernel_config.activation,
+            relu2_kernel=self._kernel_config.relu2_kernel,
             gate_up_clamp=_resolve_gate_up_clamp(self._kernel_config),
             activation_clamp=self._kernel_config.activation_clamp,
         )
@@ -128,6 +130,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             hidden_size=fleet_params.token_hidden_size,
             world_size=self.ep_world_size,
             num_experts=fleet_params.num_experts,
+            activation=self._kernel_config.activation,
+            relu2_kernel=self._kernel_config.relu2_kernel,
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
@@ -140,10 +144,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fp.max_tokens_per_rank,
             k.top_k,
             fp.token_hidden_size,
-            2 * k.intermediate_size,
+            k.physical_fc1_size,
             self.ep_rank,
             self.ep_world_size,
             activation=k.activation,
+            relu2_kernel=k.relu2_kernel,
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
             apply_topk_in_fc1=k.apply_topk_in_fc1,
@@ -352,8 +357,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fp.max_tokens_per_rank,
             k.top_k,
             fp.token_hidden_size,
-            2 * k.intermediate_size,
-            k.activation,
+            k.physical_fc1_size,
+            k.layout_identity,
             _resolve_gate_up_clamp(k),
             k.apply_topk_in_fc1,
             k.in_kernel_fc2_reduce,

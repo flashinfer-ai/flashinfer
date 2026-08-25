@@ -26,8 +26,9 @@ Single-rank (no torchrun)::
 
 ``--intermediate`` is the model's post-activation width (the
 ``*MegaMoeConfig.intermediate_size`` convention); the shim-level conversion
-(NVFP4 sessions size fc1 as ``2 * intermediate``) is applied internally, so
-recorded cache keys match engine-time lookups exactly.
+(NVFP4 sessions size FC1 as ``2 * intermediate`` except native single-plane
+ReLU2, which uses ``intermediate``) is applied internally, so recorded cache
+keys match engine-time lookups exactly.
 
 Nondeterministic candidates (``in_kernel_fc2_reduce``) are EXCLUDED by
 default; pass ``--allow-nondeterministic`` to sweep them (a recorded ikr
@@ -62,6 +63,12 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=("swiglu", "relu2"),
         default="swiglu",
         help="NVFP4 FC1 activation (relu2 uses a semantic I-wide W1 plane)",
+    )
+    parser.add_argument(
+        "--relu2-kernel",
+        choices=("padded", "single_plane"),
+        default="padded",
+        help="ReLU2 physical layout: compatibility 2*I padding or native I-wide FC1",
     )
     parser.add_argument("--num-experts", type=int, required=True)
     parser.add_argument("--topk", type=int, required=True)
@@ -142,6 +149,12 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
     if args.activation == "relu2" and args.gate_up_clamp is not None:
         print("--gate-up-clamp is not valid with --activation relu2", file=sys.stderr)
+        return 2
+    if args.relu2_kernel == "single_plane" and args.activation != "relu2":
+        print(
+            "--relu2-kernel single_plane requires --activation relu2",
+            file=sys.stderr,
+        )
         return 2
 
     if args.dtype == "nvfp4":

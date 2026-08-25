@@ -23,7 +23,7 @@ disable the cache entirely), default
      "entries": [{"device": "NVIDIA GB200", "dtype": "nvfp4",
                   "world_size": 4, "hidden": 7168, "intermediate": 2048,
                   "num_experts": 256, "topk": 8, "combine_dtype": "bf16",
-                  "activation": "swiglu",
+                  "activation": "swiglu", "layout": "swiglu",
                   "max_tokens": 2048, "knobs": {...},
                   "p50_us": 585.0, "source": "autotune",
                   "tuned_at": "2026-07-16T12:00:00"}, ...]}
@@ -56,7 +56,38 @@ _KEY_FIELDS = (
     "topk",
     "combine_dtype",
     "activation",
+    "layout",
 )
+
+_LAYOUT_IDENTITIES = ("swiglu", "relu2_padded", "relu2_single_plane")
+
+
+def _effective_layout(activation: str, layout: Optional[str]) -> str:
+    """Resolve and validate the physical-layout cache identity.
+
+    Calls made before ``layout`` existed map ``activation="relu2"`` to the
+    historical padded adapter. This is the cache-migration safety boundary:
+    an old ReLU2 winner can never be selected by the native single-plane path.
+    """
+    if activation not in ("swiglu", "relu2"):
+        raise ValueError(f"activation must be 'swiglu' or 'relu2', got {activation!r}")
+    if layout is None:
+        return "relu2_padded" if activation == "relu2" else "swiglu"
+    if layout not in _LAYOUT_IDENTITIES:
+        raise ValueError(f"layout must be one of {_LAYOUT_IDENTITIES}, got {layout!r}")
+    expected = (
+        ("swiglu",)
+        if activation == "swiglu"
+        else (
+            "relu2_padded",
+            "relu2_single_plane",
+        )
+    )
+    if layout not in expected:
+        raise ValueError(
+            f"layout={layout!r} is incompatible with activation={activation!r}"
+        )
+    return layout
 
 
 def _cache_path() -> Optional[str]:
@@ -121,6 +152,12 @@ def _load_entries(path: str) -> List[Dict[str, Any]]:
         # Entries written before activation became a kernel specialization are
         # SwiGLU entries. Preserve them without allowing reuse for ReLU2.
         entry.setdefault("activation", "swiglu")
+        # Entries written after activation was added but before the physical
+        # layout identity existed used the padded ReLU2 adapter.
+        entry.setdefault(
+            "layout",
+            "relu2_padded" if entry["activation"] == "relu2" else "swiglu",
+        )
         normalized.append(entry)
     return normalized
 
@@ -146,11 +183,13 @@ def lookup_knobs(
     combine_dtype: str = "bf16",
     device: Optional[str] = None,
     activation: str = "swiglu",
+    layout: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss."""
     path = _cache_path()
     if path is None:
         return None
+    effective_layout = _effective_layout(activation, layout)
     key = dict(
         device=device if device is not None else _current_device_name(),
         dtype=dtype,
@@ -161,6 +200,7 @@ def lookup_knobs(
         topk=topk,
         combine_dtype=combine_dtype,
         activation=activation,
+        layout=effective_layout,
     )
     matches = [
         e
@@ -194,6 +234,7 @@ def record_knobs(
     p50_us: Optional[float] = None,
     source: str = "autotune",
     activation: str = "swiglu",
+    layout: Optional[str] = None,
 ) -> Optional[str]:
     """Upsert one tuned entry (exact key incl. ``max_tokens``); atomic write.
 
@@ -204,6 +245,7 @@ def record_knobs(
     path = _cache_path()
     if path is None:
         return None
+    effective_layout = _effective_layout(activation, layout)
     entry = dict(
         device=device if device is not None else _current_device_name(),
         dtype=dtype,
@@ -214,6 +256,7 @@ def record_knobs(
         topk=topk,
         combine_dtype=combine_dtype,
         activation=activation,
+        layout=effective_layout,
         max_tokens=max_tokens,
         knobs=_knobs_to_json(knobs),
         p50_us=p50_us,
@@ -264,6 +307,7 @@ def resolve_knobs(
     max_tokens: int,
     combine_dtype: str = "bf16",
     activation: str = "swiglu",
+    layout: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else built-in heuristic.
 
@@ -281,6 +325,7 @@ def resolve_knobs(
         max_tokens=max_tokens,
         combine_dtype=combine_dtype,
         activation=activation,
+        layout=layout,
     )
     if cached is not None:
         return cached, "cache"

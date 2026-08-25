@@ -348,9 +348,12 @@ Knobs are **compile-time** kernel parameters, resolved **once per session**
 at workspace allocation and keyed on the buffer capacity `num_max_tokens` —
 never on the runtime token count.  `knobs=None` resolves through the
 persistent knob cache (`shim/knob_cache.py`, offline-tuned winners keyed on
-device/dtype/world-size/geometry/wire/token-bucket; path via
+device/dtype/world-size/geometry/wire/physical-layout/token-bucket; path via
 `FLASHINFER_MOE_EP_KNOB_CACHE`) before falling back to the built-in
 `default_knobs` heuristic — a pure dict lookup, no compiles or collectives.
+The layout key is one of `swiglu`, `relu2_padded`, or
+`relu2_single_plane`; legacy ReLU2 entries without that field migrate only to
+`relu2_padded`, so they cannot tune the native I-wide kernel accidentally.
 Populate it with the offline CLI (`python -m flashinfer.moe_ep.tune`) or a
 one-off `knobs="auto"` run outside the engine.  There is no per-shape
 tuning and no shape→kernel dispatch.  Explicitly, what does NOT happen when
