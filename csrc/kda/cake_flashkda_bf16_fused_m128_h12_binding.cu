@@ -16,8 +16,10 @@
 
 #include "flashkda_binding_common.cuh"
 
-// Keep standalone generated typedefs and tensor-map wrappers out of the
-// binding translation unit's CUDA/standard-library namespaces.
+#if defined(FLASHINFER_FLASH_KDA_H12_SHORT) == defined(FLASHINFER_FLASH_KDA_H12_LONG)
+#error "exactly one H12 M128 specialization must be selected"
+#endif
+
 #define int8_t flashkda_generated_int8_t
 #define uint8_t flashkda_generated_uint8_t
 #define uint16_t flashkda_generated_uint16_t
@@ -27,17 +29,13 @@
 #define int16_t flashkda_generated_int16_t
 #define FlashKDATensorMap flashkda_generated_FlashKDATensorMap
 #define FlashKDATensorMapPack flashkda_generated_FlashKDATensorMapPack
-#define CakeTensorMap flashkda_generated_CakeTensorMap
-#define CakeTensorMapPack flashkda_generated_CakeTensorMapPack
 #define CUtensorMap flashkda_generated_CUtensorMap
-#if defined(FLASHINFER_FLASH_KDA_N16_SHORT)
-#include "cake_flashkda_bf16_fused_m128_n16_short.cu"
+#if defined(FLASHINFER_FLASH_KDA_H12_SHORT)
+#include "cake_flashkda_bf16_fused_m128_h12_short.cu"
 #else
-#include "cake_flashkda_bf16_fused_m128_n16.cu"
+#include "cake_flashkda_bf16_fused_m128_h12_long.cu"
 #endif
 #undef CUtensorMap
-#undef CakeTensorMapPack
-#undef CakeTensorMap
 #undef FlashKDATensorMapPack
 #undef FlashKDATensorMap
 #undef int8_t
@@ -51,28 +49,26 @@
 namespace flashinfer {
 namespace flash_kda {
 
-#if defined(FLASHINFER_FLASH_KDA_N16_SHORT)
-using GeneratedTensorMap = flashkda_generated_CakeTensorMap;
+#if defined(FLASHINFER_FLASH_KDA_H12_SHORT)
+constexpr int kThreads = 864;
+constexpr bool kPairPackedBeta = false;
 #else
-using GeneratedTensorMap = flashkda_generated_FlashKDATensorMap;
-#endif
-
-#if defined(FLASHINFER_FLASH_KDA_N16_SHORT)
-constexpr int kThreads = 512;
-#else
-// The frozen source declares __launch_bounds__(1024) but no longer emits a
-// duplicate THREADS macro for its host binding.
 constexpr int kThreads = 1024;
+constexpr bool kPairPackedBeta = true;
 #endif
 static_assert(STORE_BACKWARD_TAPE == 0);
 static_assert(SPLIT_WORK_ITEMS == 0);
-#if defined(FLASHINFER_FLASH_KDA_N16_SHORT)
-static_assert(SMEM_TOTAL == 112256);
+#if defined(FLASHINFER_FLASH_KDA_H12_SHORT)
+static_assert(NUM_CHUNK_PIPE_STAGES == 4);
+static_assert(SMEM_SMEM_BETA_RAW_STAGE_BYTES == 512);
+static_assert(SMEM_TOTAL == 218752);
 #else
-static_assert(SMEM_TOTAL == 117376);
+static_assert(NUM_CHUNK_PIPE_STAGES == 5);
+static_assert(SMEM_SMEM_BETA_RAW_STAGE_BYTES == 816);
+static_assert(SMEM_TOTAL == 227968);
 #endif
 
-void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
+void RunM128H12(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
                 TensorView beta_tma, TensorView A_log, TensorView dt_bias, TensorView cu_seqlens,
                 TensorView seq_order, TensorView state_indices, TensorView initial_state,
                 TensorView out, TensorView final_state, TensorView state_checkpoints,
@@ -86,6 +82,7 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
   const int32_t device_id = q.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
   CheckFlashKDATarget(device_id);
+  TVM_FFI_ICHECK(num_heads == 12) << "specialized M128 H12 requires exactly 12 heads";
 
   const int64_t unchecked_num_seqs = cu_seqlens.numel() - 1;
   const int64_t state_pool_slots = ResolveAndCheckServingStatePool(
@@ -94,7 +91,7 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
   const int64_t num_seqs = CheckCommonInputs(
       q, k, v, g, beta, beta_tma, A_log, dt_bias, cu_seqlens, seq_order, initial_state, out,
       final_state, descriptor_storage, prepare_descriptors, num_heads, use_initial_state,
-      store_final_state, scale, lower_bound, true, state_pool_slots);
+      store_final_state, scale, lower_bound, true, state_pool_slots, kPairPackedBeta);
   TVM_FFI_ICHECK(beta_token_stride == beta.stride(beta.ndim() - 2))
       << "beta_token_stride must match beta's physical token stride";
   CheckServingCheckpointInputs(state_checkpoints, checkpoint_cu_starts, device_id, num_seqs,
@@ -106,38 +103,36 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
 
   constexpr int32_t kSmemBytes = SMEM_TOTAL;
   CheckDynamicSmemCapacity(device_id, kSmemBytes);
-
   CheckCuda(cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m128,
                                  cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes),
-            "cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m128 N16)");
+            "cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m128 H12)");
 
   const int64_t grid_x_i64 = num_seqs * num_heads;
   TVM_FFI_ICHECK(grid_x_i64 > 0 && grid_x_i64 <= std::numeric_limits<uint32_t>::max())
-      << "M128 N16 FlashKDA grid.x is out of range: " << grid_x_i64;
+      << "M128 H12 FlashKDA grid.x is out of range: " << grid_x_i64;
   const dim3 grid(static_cast<uint32_t>(grid_x_i64), 1, 1);
   const dim3 block(kThreads, 1, 1);
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  const TmaPointers tma = EncodeTmaPointers<128, 16>(q, k, v, g, beta_tma, out, descriptor_storage,
-                                                     prepare_descriptors, stream);
-  PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta_token_stride, stream);
+  const TmaPointers tma = EncodeTmaPointers<128, 32, kPairPackedBeta>(
+      q, k, v, g, beta_tma, out, descriptor_storage, prepare_descriptors, stream);
 
   kernel_flashkda_bf16_fused_m128<<<grid, block, kSmemBytes, stream>>>(
       reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
-      reinterpret_cast<GeneratedTensorMap const*>(tma.q),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.q),
       reinterpret_cast<__nv_bfloat16*>(k.data_ptr()),
-      reinterpret_cast<GeneratedTensorMap const*>(tma.k),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.k),
       reinterpret_cast<__nv_bfloat16*>(v.data_ptr()),
-      reinterpret_cast<GeneratedTensorMap const*>(tma.v),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.v),
       reinterpret_cast<__nv_bfloat16*>(g.data_ptr()),
-      reinterpret_cast<GeneratedTensorMap const*>(tma.g),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.g),
       reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()),
-      reinterpret_cast<GeneratedTensorMap const*>(tma.beta),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.beta),
       reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
       reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
       reinterpret_cast<int*>(seq_order.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(initial_state.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-      reinterpret_cast<GeneratedTensorMap const*>(tma.out),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.out),
       reinterpret_cast<__nv_bfloat16*>(final_state.data_ptr()), static_cast<int32_t>(num_heads),
       static_cast<int32_t>(use_initial_state), static_cast<int32_t>(store_final_state),
       static_cast<float>(scale), static_cast<float>(lower_bound),
@@ -146,18 +141,14 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(checkpoint_cu_starts.data_ptr())),
       static_cast<int64_t>(beta_token_stride), static_cast<int64_t>(state_slot_stride),
       static_cast<int32_t>(use_state_indices), static_cast<int32_t>(checkpoint_every_n_tokens),
-      // The frozen forward/training source retains a private training-only ABI tail even though
-      // STORE_BACKWARD_TAPE and SPLIT_WORK_ITEMS are both fixed to zero in this serving export.
-      // Keep those data pointers null so an accidental use fails validation instead of silently
-      // corrupting a public tensor. TensorMap acquire is emitted for every descriptor argument,
-      // so the final disabled slot deliberately aliases the already valid q descriptor.
       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, static_cast<int32_t>(0),
-      static_cast<int32_t>(0), reinterpret_cast<GeneratedTensorMap const*>(tma.q));
-  CheckCuda(cudaGetLastError(), "kernel_flashkda_bf16_fused_m128 N16 launch");
+      static_cast<int32_t>(0),
+      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.q));
+  CheckCuda(cudaGetLastError(), "kernel_flashkda_bf16_fused_m128 H12 launch");
 }
 
 }  // namespace flash_kda
 }  // namespace flashinfer
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::flash_kda::RunM128N16);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::flash_kda::RunM128H12);

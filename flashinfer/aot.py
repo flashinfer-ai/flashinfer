@@ -68,10 +68,20 @@ from .jit.blackwell_msa import (
 )
 from .jit.flash_kda import (
     FlashKDATarget,
+    gen_flash_kda_bt16_chain_m64_s7_module,
+    gen_flash_kda_bt16_chain_m64_s8_module,
+    gen_flash_kda_bt16_chain_m64_s9_module,
+    gen_flash_kda_bt16_prepare_chain_m64_s8_module,
+    gen_flash_kda_bt16_prepare_beta_tma_module,
+    gen_flash_kda_bt16_prepare_module,
     gen_flash_kda_m64_module,
     gen_flash_kda_m128_module,
+    gen_flash_kda_m128_tensor_state_decay_module,
+    gen_flash_kda_m128_h12_long_module,
+    gen_flash_kda_m128_h12_short_module,
     gen_flash_kda_m128_n16_checkpoint_module,
     gen_flash_kda_m128_n16_module,
+    gen_flash_kda_m128_n16_short_module,
     gen_flash_kda_persistent_m128_module,
     gen_flash_kda_small_bh_m128_module,
 )
@@ -603,9 +613,19 @@ def gen_all_modules(
                 [
                     gen_flash_kda_m64_module(flash_kda_target),
                     gen_flash_kda_m128_module(flash_kda_target),
+                    gen_flash_kda_m128_tensor_state_decay_module(flash_kda_target),
+                    gen_flash_kda_m128_h12_short_module(flash_kda_target),
+                    gen_flash_kda_m128_h12_long_module(flash_kda_target),
                     gen_flash_kda_m128_n16_module(flash_kda_target),
                     gen_flash_kda_m128_n16_checkpoint_module(flash_kda_target),
+                    gen_flash_kda_m128_n16_short_module(flash_kda_target),
                     gen_flash_kda_small_bh_m128_module(flash_kda_target),
+                    gen_flash_kda_bt16_prepare_module(flash_kda_target),
+                    gen_flash_kda_bt16_prepare_beta_tma_module(flash_kda_target),
+                    gen_flash_kda_bt16_chain_m64_s7_module(flash_kda_target),
+                    gen_flash_kda_bt16_chain_m64_s8_module(flash_kda_target),
+                    gen_flash_kda_bt16_chain_m64_s9_module(flash_kda_target),
+                    gen_flash_kda_bt16_prepare_chain_m64_s8_module(flash_kda_target),
                 ]
             )
             jit_specs.append(gen_flash_kda_persistent_m128_module(flash_kda_target))
