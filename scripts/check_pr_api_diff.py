@@ -113,8 +113,66 @@ def parameters(
     )
 
 
+def is_none_annotation(node: ast.expr) -> bool:
+    return isinstance(node, ast.Constant) and node.value is None
+
+
+def typing_annotation_name(node: ast.expr) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "typing"
+    ):
+        return node.attr
+    return None
+
+
+def optional_annotation_payload(node: ast.expr) -> ast.expr | None:
+    if isinstance(node, ast.Subscript):
+        annotation_name = typing_annotation_name(node.value)
+        if annotation_name == "Optional":
+            return node.slice
+        if annotation_name == "Union" and isinstance(node.slice, ast.Tuple):
+            elements = node.slice.elts
+            if len(elements) == 2:
+                if is_none_annotation(elements[0]):
+                    return elements[1]
+                if is_none_annotation(elements[1]):
+                    return elements[0]
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        if is_none_annotation(node.left):
+            return node.right
+        if is_none_annotation(node.right):
+            return node.left
+    return None
+
+
+def is_compatible_annotation(before: str | None, after: str | None) -> bool:
+    if before == after:
+        return True
+    if before is None or after is None:
+        return False
+    try:
+        before_node = ast.parse(before, mode="eval").body
+        after_node = ast.parse(after, mode="eval").body
+    except SyntaxError:
+        return False
+    payload = optional_annotation_payload(after_node)
+    return payload is not None and ast.dump(before_node) == ast.dump(payload)
+
+
+def is_compatible_parameter(before: ApiParameter, after: ApiParameter) -> bool:
+    return (
+        before.name == after.name
+        and is_compatible_annotation(before.annotation, after.annotation)
+        and (before.default is None or before.default == after.default)
+    )
+
+
 def is_compatible_signature_extension(before: ApiFunction, after: ApiFunction) -> bool:
-    """Return whether *after* only appends optional parameters.
+    """Return whether *after* is a narrowly compatible input widening.
 
     Existing ``*args``/``**kwargs`` APIs are kept conservative: a new named
     parameter can consume arguments that the old implementation forwarded.
@@ -122,25 +180,50 @@ def is_compatible_signature_extension(before: ApiFunction, after: ApiFunction) -
     if (
         before.is_async != after.is_async
         or before.return_annotation != after.return_annotation
-        or before.positional_only != after.positional_only
         or before.vararg != after.vararg
         or before.kwarg != after.kwarg
         or before.vararg is not None
         or before.kwarg is not None
     ):
         return False
-    if (
-        after.positional_or_keyword[: len(before.positional_or_keyword)]
-        != before.positional_or_keyword
-        or after.keyword_only[: len(before.keyword_only)] != before.keyword_only
+    if len(before.positional_only) != len(after.positional_only) or not all(
+        is_compatible_parameter(old, new)
+        for old, new in zip(
+            before.positional_only,
+            after.positional_only,
+            strict=True,
+        )
     ):
         return False
 
-    added = (
-        after.positional_or_keyword[len(before.positional_or_keyword) :]
-        + after.keyword_only[len(before.keyword_only) :]
+    old_positional = before.positional_or_keyword
+    new_positional = after.positional_or_keyword
+    if len(new_positional) < len(old_positional) or not all(
+        is_compatible_parameter(old, new)
+        for old, new in zip(
+            old_positional,
+            new_positional[: len(old_positional)],
+            strict=True,
+        )
+    ):
+        return False
+    if any(item.default is None for item in new_positional[len(old_positional) :]):
+        return False
+
+    old_keyword_only = {item.name: item for item in before.keyword_only}
+    new_keyword_only = {item.name: item for item in after.keyword_only}
+    if not old_keyword_only.keys() <= new_keyword_only.keys():
+        return False
+    if any(
+        not is_compatible_parameter(item, new_keyword_only[name])
+        for name, item in old_keyword_only.items()
+    ):
+        return False
+    return all(
+        item.default is not None
+        for name, item in new_keyword_only.items()
+        if name not in old_keyword_only
     )
-    return bool(added) and all(item.default is not None for item in added)
 
 
 def is_compatible_api(before: ApiFunction, after: ApiFunction) -> bool:
@@ -263,8 +346,13 @@ def resolve_import_module(node: ast.ImportFrom, path: str) -> str | None:
     return module
 
 
-def module_reexports(path: str, source: str | None) -> dict[str, tuple[str, str]]:
-    """Return public aliases as exported name -> (target module, target name)."""
+ReexportTarget = tuple[str, str]
+
+
+def module_reexports(
+    path: str, source: str | None
+) -> dict[str, tuple[ReexportTarget, ...]]:
+    """Return public aliases and every direct target imported for each name."""
     if source is None:
         return {}
     try:
@@ -272,7 +360,7 @@ def module_reexports(path: str, source: str | None) -> dict[str, tuple[str, str]
     except SyntaxError:
         return {}
 
-    result: dict[str, tuple[str, str]] = {}
+    result: dict[str, set[ReexportTarget]] = {}
     for node in module_scope_imports(tree):
         module = resolve_import_module(node, path)
         if not module:
@@ -280,8 +368,28 @@ def module_reexports(path: str, source: str | None) -> dict[str, tuple[str, str]
         for alias in node.names:
             exported_name = alias.asname or alias.name
             if exported_name != "*":
-                result[exported_name] = (module, alias.name)
-    return result
+                result.setdefault(exported_name, set()).add((module, alias.name))
+    return {
+        exported_name: tuple(sorted(targets))
+        for exported_name, targets in result.items()
+    }
+
+
+def resolve_reexported_api(
+    qualified_name: str,
+    reexports: dict[str, tuple[ReexportTarget, ...]],
+) -> ReexportTarget | None:
+    """Resolve an exact API or one direct ``ExportedClass.member`` alias."""
+    exported_name, separator, member_name = qualified_name.partition(".")
+    if separator and (not member_name or "." in member_name):
+        return None
+    targets = reexports.get(exported_name, ())
+    if len(targets) != 1:
+        return None
+    target_module, target_name = targets[0]
+    if member_name:
+        target_name = f"{target_name}.{member_name}"
+    return target_module, target_name
 
 
 def module_apis(
@@ -411,7 +519,7 @@ def check(base: str, head: str) -> list[PrFinding]:
         )
         for name in sorted(set(old) - set(new)):
             api = old[name]
-            target = reexports.get(name)
+            target = resolve_reexported_api(name, reexports)
             if target:
                 target_module, target_name = target
                 target_api = module_apis(head, target_module, target_cache).get(
