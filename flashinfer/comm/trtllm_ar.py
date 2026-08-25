@@ -686,9 +686,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         raise ValueError("use_symm_dev_mem is only supported when create_metadata=True")
 
     buffer_size = tp_size * max_token_num * hidden_dim * 2
-    legacy_flag_size, cake_tail_size, flag_size = _allreduce_fusion_flag_layout(
-        tp_size
-    )
+    legacy_flag_size, cake_tail_size, flag_size = _allreduce_fusion_flag_layout(tp_size)
     # lamport_comm_size = tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2
     # enable larger workspace for cases > OneShotMaxToken
     lamport_comm_size = (
@@ -759,9 +757,7 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     _symm_workspace_refs[id(ipc_handles)] = symm_refs
 
     if use_symm_dev_mem:
-        cudart.cudaMemset(
-            c_void_p(ipc_handles[1][tp_rank]), 0, legacy_flag_size
-        )
+        cudart.cudaMemset(c_void_p(ipc_handles[1][tp_rank]), 0, legacy_flag_size)
 
     if cake_tail_size:
         trtllm_lamport_initialize(
@@ -1355,9 +1351,7 @@ def _validate_cake_moe_reduction(
         (residual_out, "residual_out", token_elements),
         (norm_out, "norm_out", token_elements),
     ):
-        _check_cake_moe_tensor(
-            tensor, name, device=device, dtype=dtype, numel=numel
-        )
+        _check_cake_moe_tensor(tensor, name, device=device, dtype=dtype, numel=numel)
     if moe_allreduce_out is not None:
         _check_cake_moe_tensor(
             moe_allreduce_out,
@@ -1434,9 +1428,7 @@ def _validate_cake_moe_finalize(
         (norm_out, "norm_out", token_elements),
         (expert_scale_factor, "expert_scale_factor", token_num * top_k),
     ):
-        _check_cake_moe_tensor(
-            tensor, name, device=device, dtype=dtype, numel=numel
-        )
+        _check_cake_moe_tensor(tensor, name, device=device, dtype=dtype, numel=numel)
     _check_cake_moe_tensor(
         expanded_idx_to_permuted_idx,
         "expanded_idx_to_permuted_idx",

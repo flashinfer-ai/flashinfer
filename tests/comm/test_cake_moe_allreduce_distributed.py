@@ -202,8 +202,7 @@ def _reduction_worker(
             norm_ref = (
                 residual_ref_f32
                 * torch.rsqrt(
-                    residual_ref_f32.square().mean(dim=-1, keepdim=True)
-                    + rms_eps
+                    residual_ref_f32.square().mean(dim=-1, keepdim=True) + rms_eps
                 )
                 * rms_gamma.float()
             ).to(dtype)
@@ -357,11 +356,7 @@ def _finalize_worker(
                 else ((shared_expert, 2.5),)
             )
             for shared_expert_output, routed_scaling_factor in optional_cases:
-                routed = (
-                    1.0
-                    if routed_scaling_factor is None
-                    else routed_scaling_factor
-                )
+                routed = 1.0 if routed_scaling_factor is None else routed_scaling_factor
                 gathered = allreduce_in[inverse_indices]
                 local = torch.zeros_like(residual_in)
                 for route in range(TOP_K):
@@ -372,21 +367,14 @@ def _finalize_worker(
                     local = (local.float() + contribution.float()).to(dtype)
                 local = (local.float() * routed).to(dtype)
                 if shared_expert_output is not None:
-                    local = (
-                        local.float() + shared_expert_output.float()
-                    ).to(dtype)
-                finalized_ref = _rank_order_state_allreduce(
-                    local, dtype, group
-                )
-                residual_ref = (
-                    finalized_ref.float() + residual_in.float()
-                ).to(dtype)
+                    local = (local.float() + shared_expert_output.float()).to(dtype)
+                finalized_ref = _rank_order_state_allreduce(local, dtype, group)
+                residual_ref = (finalized_ref.float() + residual_in.float()).to(dtype)
                 residual_ref_f32 = residual_ref.float()
                 norm_ref = (
                     residual_ref_f32
                     * torch.rsqrt(
-                        residual_ref_f32.square().mean(dim=-1, keepdim=True)
-                        + eps
+                        residual_ref_f32.square().mean(dim=-1, keepdim=True) + eps
                     )
                     * norm_weight.float()
                 ).to(dtype)
@@ -524,9 +512,7 @@ _DISTRIBUTED_CASES = (
     _DISTRIBUTED_CASES,
     ids=("tp2-fp16", "tp2-bf16", "tp4-fp16", "tp4-bf16"),
 )
-def test_cake_moe_reduction_correctness(
-    world_size: int, dtype: torch.dtype
-) -> None:
+def test_cake_moe_reduction_correctness(world_size: int, dtype: torch.dtype) -> None:
     _run_distributed(world_size, dtype, _reduction_worker)
 
 
@@ -535,7 +521,5 @@ def test_cake_moe_reduction_correctness(
     _DISTRIBUTED_CASES,
     ids=("tp2-fp16", "tp2-bf16", "tp4-fp16", "tp4-bf16"),
 )
-def test_cake_moe_finalize_correctness(
-    world_size: int, dtype: torch.dtype
-) -> None:
+def test_cake_moe_finalize_correctness(world_size: int, dtype: torch.dtype) -> None:
     _run_distributed(world_size, dtype, _finalize_worker)

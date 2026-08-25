@@ -66,7 +66,9 @@ def _require_choices(
 ) -> None:
     unknown = sorted(set(values) - allowed)
     if unknown:
-        parser.error(f"{label} contains unsupported values {unknown}; expected {sorted(allowed)}")
+        parser.error(
+            f"{label} contains unsupported values {unknown}; expected {sorted(allowed)}"
+        )
 
 
 def _require_cupti() -> tuple[str, Any]:
@@ -79,9 +81,7 @@ def _require_cupti() -> tuple[str, Any]:
             "cupti-python >=13 is required; refusing a fallback timing backend"
         ) from exc
     if int(version.split(".", 1)[0]) < 13:
-        raise RuntimeError(
-            f"cupti-python >=13 is required, found version {version}"
-        )
+        raise RuntimeError(f"cupti-python >=13 is required, found version {version}")
     return version, _cupti
 
 
@@ -213,8 +213,7 @@ def _make_reduction_case(
     local = torch.zeros_like(token_input)
     for expert in range(ACTIVE_EXPERTS):
         contribution = (
-            expert_input[expert].float()
-            * expert_scale[expert].float().unsqueeze(-1)
+            expert_input[expert].float() * expert_scale[expert].float().unsqueeze(-1)
         ).to(dtype)
         local = (local.float() + contribution.float()).to(dtype)
     local = (local.float() + token_input.float()).to(dtype)
@@ -224,9 +223,7 @@ def _make_reduction_case(
     residual_ref_f32 = residual_ref.float()
     norm_ref = (
         residual_ref_f32
-        * torch.rsqrt(
-            residual_ref_f32.square().mean(dim=-1, keepdim=True) + rms_eps
-        )
+        * torch.rsqrt(residual_ref_f32.square().mean(dim=-1, keepdim=True) + rms_eps)
         * rms_gamma.float()
     ).to(dtype)
 
@@ -350,8 +347,7 @@ def _make_finalize_case(
     local = torch.zeros_like(residual_in)
     for route in range(TOP_K):
         contribution = (
-            gathered[:, route].float()
-            * expert_scale[:, route].float().unsqueeze(-1)
+            gathered[:, route].float() * expert_scale[:, route].float().unsqueeze(-1)
         ).to(dtype)
         local = (local.float() + contribution.float()).to(dtype)
     local = (local.float() * routed).to(dtype)
@@ -362,9 +358,7 @@ def _make_finalize_case(
     residual_ref_f32 = residual_ref.float()
     norm_ref = (
         residual_ref_f32
-        * torch.rsqrt(
-            residual_ref_f32.square().mean(dim=-1, keepdim=True) + eps
-        )
+        * torch.rsqrt(residual_ref_f32.square().mean(dim=-1, keepdim=True) + eps)
         * norm_weight.float()
     ).to(dtype)
 
@@ -675,14 +669,16 @@ def main() -> int:
                                             f"tokens{token_num}/pdl{int(launch_with_pdl)}/"
                                             f"{mode}/{variant}/{backend}/leg{leg_index}"
                                         )
-                                        samples, pre_max_abs, post_max_abs = _measure_leg(
-                                            call=call,
-                                            validate=validate,
-                                            label=label,
-                                            mode=mode,
-                                            dry_run_iters=args.dry_run_iters,
-                                            repeat_iters=args.repeat_iters,
-                                            group=group,
+                                        samples, pre_max_abs, post_max_abs = (
+                                            _measure_leg(
+                                                call=call,
+                                                validate=validate,
+                                                label=label,
+                                                mode=mode,
+                                                dry_run_iters=args.dry_run_iters,
+                                                repeat_iters=args.repeat_iters,
+                                                group=group,
+                                            )
                                         )
                                         if rank == 0:
                                             rows.append(

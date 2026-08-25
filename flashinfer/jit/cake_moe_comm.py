@@ -364,7 +364,9 @@ def _nvcc() -> Path:
             if path.is_file():
                 candidate = str(path)
     if candidate is None:
-        raise RuntimeError("nvcc is required to build the Cake MoE communication backend")
+        raise RuntimeError(
+            "nvcc is required to build the Cake MoE communication backend"
+        )
     return Path(candidate).resolve()
 
 
@@ -400,8 +402,7 @@ def load(device_index: int) -> Any:
             if process.returncode != 0:
                 temporary.unlink(missing_ok=True)
                 raise RuntimeError(
-                    "Cake MoE communication nvcc compilation failed:\n"
-                    f"{process.stderr}"
+                    f"Cake MoE communication nvcc compilation failed:\n{process.stderr}"
                 )
             os.replace(temporary, cubin_path)
 

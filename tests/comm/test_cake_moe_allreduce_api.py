@@ -29,9 +29,7 @@ def _reduction_args() -> dict:
         "rms_eps": 1e-6,
         "scale_factor": 1.0,
         "moe_reduction_device_num_experts": experts,
-        "moe_reduction_scale_input": torch.ones(
-            experts * tokens, dtype=torch.float32
-        ),
+        "moe_reduction_scale_input": torch.ones(experts * tokens, dtype=torch.float32),
         "moe_reduction_active_experts_token_input": torch.zeros(
             experts * tokens * hidden, dtype=dtype
         ),
@@ -54,9 +52,7 @@ def _finalize_args() -> dict:
         "allreduce_in": torch.zeros(3, hidden, dtype=dtype),
         "residual_in": torch.zeros(tokens, hidden, dtype=dtype),
         "norm_weight": torch.ones(hidden, dtype=dtype),
-        "expanded_idx_to_permuted_idx": torch.zeros(
-            tokens, top_k, dtype=torch.int32
-        ),
+        "expanded_idx_to_permuted_idx": torch.zeros(tokens, top_k, dtype=torch.int32),
         "norm_out": torch.empty(tokens, hidden, dtype=dtype),
         "residual_out": torch.empty(tokens, hidden, dtype=dtype),
         "quant_out": None,
@@ -192,9 +188,7 @@ def test_reduction_default_keeps_trtllm_dispatch(monkeypatch: pytest.MonkeyPatch
 def test_reduction_cake_dispatch_is_independent(monkeypatch: pytest.MonkeyPatch):
     calls = []
     module = SimpleNamespace(run_reduction=lambda *args: calls.append(args))
-    monkeypatch.setattr(
-        trtllm_ar, "_validate_cake_moe_reduction", lambda **kwargs: 3
-    )
+    monkeypatch.setattr(trtllm_ar, "_validate_cake_moe_reduction", lambda **kwargs: 3)
     monkeypatch.setattr(
         trtllm_ar, "get_cake_moe_comm_module", lambda device_index: module
     )
@@ -216,16 +210,12 @@ def test_finalize_cake_dispatch_defaults_routed_scale(
 ):
     calls = []
     module = SimpleNamespace(run_finalize=lambda *args: calls.append(args))
-    monkeypatch.setattr(
-        trtllm_ar, "_validate_cake_moe_finalize", lambda **kwargs: 1
-    )
+    monkeypatch.setattr(trtllm_ar, "_validate_cake_moe_finalize", lambda **kwargs: 1)
     monkeypatch.setattr(
         trtllm_ar, "get_cake_moe_comm_module", lambda device_index: module
     )
 
-    trtllm_ar.trtllm_moe_finalize_allreduce_fusion(
-        **_finalize_args(), backend="cake"
-    )
+    trtllm_ar.trtllm_moe_finalize_allreduce_fusion(**_finalize_args(), backend="cake")
 
     assert len(calls) == 1
     assert calls[0][-2] == 1.0
@@ -282,9 +272,7 @@ def test_cake_finalize_rejects_wrong_shared_expert_shape(
             allreduce_in=torch.zeros(top_k, hidden, dtype=dtype),
             residual_in=torch.zeros(tokens, hidden, dtype=dtype),
             norm_weight=torch.ones(hidden, dtype=dtype),
-            expanded_idx_to_permuted_idx=torch.zeros(
-                tokens, top_k, dtype=torch.int32
-            ),
+            expanded_idx_to_permuted_idx=torch.zeros(tokens, top_k, dtype=torch.int32),
             norm_out=torch.empty(tokens, hidden, dtype=dtype),
             residual_out=torch.empty(tokens, hidden, dtype=dtype),
             quant_out=None,
@@ -315,9 +303,7 @@ def test_cake_finalize_rejects_shared_expert_on_another_device(
             allreduce_in=torch.zeros(top_k, hidden, dtype=dtype),
             residual_in=torch.zeros(tokens, hidden, dtype=dtype),
             norm_weight=torch.ones(hidden, dtype=dtype),
-            expanded_idx_to_permuted_idx=torch.zeros(
-                tokens, top_k, dtype=torch.int32
-            ),
+            expanded_idx_to_permuted_idx=torch.zeros(tokens, top_k, dtype=torch.int32),
             norm_out=torch.empty(tokens, hidden, dtype=dtype),
             residual_out=torch.empty(tokens, hidden, dtype=dtype),
             quant_out=None,
@@ -352,9 +338,7 @@ def test_cake_finalize_rejects_noncontiguous_allreduce_input(
             allreduce_in=allreduce_in,
             residual_in=torch.zeros(tokens, hidden, dtype=dtype),
             norm_weight=torch.ones(hidden, dtype=dtype),
-            expanded_idx_to_permuted_idx=torch.zeros(
-                tokens, top_k, dtype=torch.int32
-            ),
+            expanded_idx_to_permuted_idx=torch.zeros(tokens, top_k, dtype=torch.int32),
             norm_out=torch.empty(tokens, hidden, dtype=dtype),
             residual_out=torch.empty(tokens, hidden, dtype=dtype),
             quant_out=None,
@@ -385,9 +369,7 @@ def test_cake_finalize_requires_one_allreduce_row_per_routed_token(
             allreduce_in=torch.zeros(tokens * top_k - 1, hidden, dtype=dtype),
             residual_in=torch.zeros(tokens, hidden, dtype=dtype),
             norm_weight=torch.ones(hidden, dtype=dtype),
-            expanded_idx_to_permuted_idx=torch.zeros(
-                tokens, top_k, dtype=torch.int32
-            ),
+            expanded_idx_to_permuted_idx=torch.zeros(tokens, top_k, dtype=torch.int32),
             norm_out=torch.empty(tokens, hidden, dtype=dtype),
             residual_out=torch.empty(tokens, hidden, dtype=dtype),
             quant_out=None,
