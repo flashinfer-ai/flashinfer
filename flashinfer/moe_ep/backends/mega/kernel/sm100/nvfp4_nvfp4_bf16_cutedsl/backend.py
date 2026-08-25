@@ -259,6 +259,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 )
             num_tokens = staged
 
+        capacity = workspace.output_activation.shape[0]
+        if num_tokens > capacity:
+            raise ValueError(
+                f"num_tokens ({num_tokens}) exceeds workspace capacity ({capacity})"
+            )
+
         kcfg = self._kernel_config
         if self._autotune_pending:
             # COLLECTIVE: every EP rank reaches this first compute() together,
@@ -281,22 +287,37 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         # the clamp, and rebuilds the 12-field inputs bundle on every call
         # (~70us of loop-invariant host Python at 43 layers x 4 ranks — the
         # measured arrival-skew generator; see vllm_e2e RUNS.md run 27/28).
-        # Build once per (workspace, weights, compiled-session, STREAM) and
+        # Build once per (workspace, weights, compiled-session, LIVE ROWS,
+        # STREAM) and
         # reuse. The stream is part of the key because the thunk's launch
-        # kwargs bind it at build time — a graph capture runs on a capture
-        # stream and must get its own thunk or the kernel launch escapes the
-        # graph. A knobs/clamp change nulls the frontend's compiled session,
-        # changing the key and forcing a rebuild through the validated path.
+        # kwargs bind the runtime tensor descriptors and stream at build time.
+        # A different live-row extent therefore needs a fresh thunk (but keeps
+        # the same dynamic-shape compiled kernel), while a graph capture runs on
+        # a capture stream and must get its own thunk or the kernel launch
+        # escapes the graph. A knobs/clamp change nulls the frontend's compiled
+        # session, changing the key and forcing a rebuild through the validated
+        # path.
         fe = workspace._frontend
         clamp = _resolve_gate_up_clamp(kcfg)
         if clamp is not None:
             fe.set_gate_up_clamp(clamp)
         mega = fe._mega
         stream = torch.cuda.current_stream().cuda_stream
+        # IKR and zero-row ranks must retain the full padded launch: every EP
+        # rank physically participates in the persistent kernel even when it
+        # has no local rows, or peers can desynchronize. The full standalone
+        # case uses the same descriptor. Only a nonzero partial standalone
+        # batch binds a sliced live-row descriptor for TopkReduce.
+        launch_num_tokens = (
+            num_tokens
+            if not fe.config.fc2_reduces_topk and 0 < num_tokens < capacity
+            else None
+        )
         key = (
             id(workspace),
             id(transformed_weights[0][0]),
             id(mega.compiled) if mega is not None and mega.compiled else None,
+            launch_num_tokens,
             stream,
         )
         state = self._thunk_state
@@ -321,9 +342,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             )
             # Full validation happens inside make_launch_thunk's
             # _prepare_launch_inputs (run()'s slow-path validator).
-            thunk = fe.make_launch_thunk(inputs)
+            thunk = fe.make_launch_thunk(inputs, num_tokens=launch_num_tokens)
             mega = fe._mega
-            key = (key[0], key[1], id(mega.compiled), stream)
+            key = (key[0], key[1], id(mega.compiled), launch_num_tokens, stream)
             state = (key, thunk, workspace.output_activation)
             self._thunk_state = state
 

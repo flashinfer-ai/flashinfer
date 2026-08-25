@@ -67,7 +67,6 @@ from moe_nvfp4_swapab.runner_common import (
     round_up,
 )
 
-
 # Config combine_dtype -> kernel CombineFormat spelling.  The quantized wire
 # formats shrink the cross-rank combine traffic 2x (fp8+e8m0 SF) / 4x
 # (fp4+bf16 SF) at a numerics cost (see MegaMoENvfp4Config.combine_dtype).
@@ -643,12 +642,6 @@ class MegaMoENvfp4Frontend:
             return None
         self._validate_inputs(inputs, num_tokens=resolved)
         buf_tokens = inputs.activation.shape[0]
-        if not self.config.fc2_reduces_topk and resolved < buf_tokens:
-            raise ValueError(
-                "Partial num_tokens is not supported when in_kernel_fc2_reduce=False "
-                f"(top-k reduce compiles for the full buffer of {buf_tokens} tokens). "
-                f"Got num_tokens={resolved}."
-            )
         if resolved == buf_tokens:
             return inputs
         return self._slice_inputs(inputs, resolved)
@@ -881,12 +874,31 @@ class MegaMoENvfp4Frontend:
             num_max_ranks=c.world_size,
         )
         dynamic_weight_modes = (0,) if c.num_experts_per_rank == 1 else ()
+        # The backing workspace is capacity-sized, while each launch passes a
+        # compact prefix view containing only live token rows. Keep mode 0
+        # runtime-dynamic so one compiled MegaMoE specialization accepts every
+        # live extent. In particular, standalone TopkReduce derives its grid
+        # from output_activation.shape[0], so this prevents padded/capacity rows
+        # from entering the reduction without changing its accumulation order.
+        dynamic_token_modes = (0,)
 
         return dict(
-            activation=self._to_cute(inputs.activation),
-            activation_sf=self._to_cute(inputs.activation_sf),
-            topk_idx=self._to_cute(inputs.topk_idx),
-            topk_weights=self._to_cute(inputs.topk_weights),
+            activation=self._to_cute(
+                inputs.activation,
+                dynamic_compact_shape_modes=dynamic_token_modes,
+            ),
+            activation_sf=self._to_cute(
+                inputs.activation_sf,
+                dynamic_compact_shape_modes=dynamic_token_modes,
+            ),
+            topk_idx=self._to_cute(
+                inputs.topk_idx,
+                dynamic_compact_shape_modes=dynamic_token_modes,
+            ),
+            topk_weights=self._to_cute(
+                inputs.topk_weights,
+                dynamic_compact_shape_modes=dynamic_token_modes,
+            ),
             fc1_weight=self._to_cute(
                 inputs.fc1_weight,
                 dynamic_compact_shape_modes=dynamic_weight_modes,
@@ -900,7 +912,10 @@ class MegaMoENvfp4Frontend:
             fc1_alpha=self._to_cute(inputs.fc1_alpha, assumed_align=4),
             fc2_alpha=self._to_cute(inputs.fc2_alpha, assumed_align=4),
             fc1_norm_const=self._to_cute(inputs.fc1_norm_const, assumed_align=4),
-            output_activation=self._to_cute(inputs.output_activation),
+            output_activation=self._to_cute(
+                inputs.output_activation,
+                dynamic_compact_shape_modes=dynamic_token_modes,
+            ),
             # Opaque byte workspaces are passed as raw uint8 gmem base pointers
             # (not cute tensors): the kernel addresses them by base + Int64 byte
             # offset, and a tensor shape would overflow cute's 32-bit memref
