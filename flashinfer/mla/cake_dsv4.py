@@ -314,6 +314,7 @@ def run_cake_dsv4(
         return out
 
     if route in ("bf16_swa128_single_cta", "bf16_h128_swa128"):
+        scalars: tuple[int, ...]
         if route == "bf16_swa128_single_cta":
             scalars = (num_heads, int(has_sinks))
             grid_x = num_query_tokens * 4
