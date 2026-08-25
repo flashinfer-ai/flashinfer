@@ -6,9 +6,13 @@ BF16 output. Both implementations run in one process on one CUDA stream with
 cold-L2 CUPTI activity timing in forward and reverse paired orders.
 """
 
+import argparse
 import json
 import math
+import os
+from pathlib import Path
 import statistics
+import time
 from importlib.metadata import version as distribution_version
 from typing import Callable
 
@@ -75,6 +79,8 @@ def _measure_order(
     pooled = {"C": [], "F": []}
     legs = []
     for leg_index, label in enumerate(order):
+        process_id = os.getpid()
+        stream_id = int(torch.cuda.current_stream().cuda_stream)
         samples = _measure_leg(functions[label])
         pooled[label].extend(samples)
         legs.append(
@@ -83,6 +89,10 @@ def _measure_order(
                 "provider": "candidate" if label == "C" else "production_fa4",
                 "median_ms": statistics.median(samples),
                 "samples_ms": samples,
+                "process_id": process_id,
+                "stream_id": stream_id,
+                "timing_backend": "CUPTI activity span",
+                "cold_l2": True,
             }
         )
     candidate_ms = statistics.median(pooled["C"])
@@ -123,6 +133,14 @@ def _quality(actual: torch.Tensor, expected: torch.Tensor) -> dict:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="also write the qualification report to this JSON path",
+    )
+    args = parser.parse_args()
+    started = time.time()
     cupti_version = _require_cupti()
     device = torch.device("cuda", torch.cuda.current_device())
     if not is_wan_hybrid_attention_available(device):
@@ -210,6 +228,9 @@ def main() -> None:
         and all(order["passed_speedup_ge_1"] for order in orders)
     )
     properties = torch.cuda.get_device_properties(device)
+    gpu_uuid = getattr(properties, "uuid", None)
+    if gpu_uuid is None:
+        raise RuntimeError("PyTorch did not expose the GPU UUID")
     report = {
         "passed": passed,
         "shape": list(_SHAPE),
@@ -220,6 +241,8 @@ def main() -> None:
         "device": properties.name,
         "compute_capability": list(torch.cuda.get_device_capability(device)),
         "multi_processor_count": properties.multi_processor_count,
+        "gpu_uuid": str(gpu_uuid),
+        "process_id": os.getpid(),
         "stream": int(torch.cuda.current_stream(device).cuda_stream),
         "timing": {
             "backend": "CUPTI activity span",
@@ -241,8 +264,13 @@ def main() -> None:
         "memory_allocated_before": allocated_before,
         "memory_allocated_after": allocated_after,
         "orders": orders,
+        "physical_turnaround_seconds": time.time() - started,
     }
-    print(json.dumps(report, indent=2, sort_keys=True))
+    payload = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(payload, encoding="utf-8")
+    print(payload, end="")
     if not passed:
         raise RuntimeError("exact Wan hybrid qualification failed")
 
