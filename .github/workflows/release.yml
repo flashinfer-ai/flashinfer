@@ -15,6 +15,7 @@ on:
       - 'ci/cuda-versions.json'
       - 'ci/validate_cuda_versions.py'
       - 'scripts/build_flashinfer_jit_cache_whl.sh'
+      - 'scripts/jit_cache_build_common.sh'
 
 jobs:
   setup:
