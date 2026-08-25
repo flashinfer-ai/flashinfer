@@ -23,7 +23,7 @@
 
 namespace flashinfer {
 
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+template <bool SAME_KV_STRIDES, uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
 cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
@@ -279,6 +279,10 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
   auto k_cache_strides = paged_k_cache.strides();
   auto v_cache_strides = paged_v_cache.strides();
   TVM_FFI_ICHECK_EQ(paged_k_cache.ndim(), paged_v_cache.ndim());
+  bool kv_strides_are_identical = true;
+  for (int i = 0; i < paged_k_cache.ndim(); ++i) {
+    kv_strides_are_identical &= paged_k_cache.stride(i) == paged_v_cache.stride(i);
+  }
 
   ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
   const cudaStream_t stream = get_stream(float_workspace_buffer.device());
@@ -359,11 +363,14 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
 
         cudaError_t status = cudaSuccess;
 
-        DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-          status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-              CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,
-              /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant,
-              PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
+        DISPATCH_BOOL(kv_strides_are_identical, SAME_KV_STRIDES, [&] {
+          DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
+            status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
+                /*SAME_KV_STRIDES=*/SAME_KV_STRIDES, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,
+                POS_ENCODING_MODE, /*use_fp16_qk_reduction=*/USE_FP16_QK_REDUCTION, MASK_MODE,
+                AttentionVariant, PagedParams>(params, tmp_v, tmp_s, enable_pdl, stream);
+          });
+          return true;
         });
 
         TVM_FFI_ICHECK(status == cudaSuccess)
