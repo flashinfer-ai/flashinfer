@@ -1,4 +1,4 @@
-from .core import JitSpec, gen_jit_spec, current_compilation_context, sm100a_nvcc_flags
+from .core import JitSpec, gen_jit_spec, current_compilation_context
 from . import env as jit_env
 
 
@@ -24,10 +24,13 @@ def gen_tinygemm2_sm100_module() -> JitSpec:
     that exactly port the TensorRT-LLM tinygemm2 kernel with bit-identical
     outputs.
     """
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[10],
+        map_sm107_to_100f=True,
+    )
     return gen_jit_spec(
         "tinygemm2_sm100",
         [jit_env.FLASHINFER_CSRC_DIR / "tinygemm2_sm100.cu"],
-        extra_cuda_cflags=sm100a_nvcc_flags
-        + ["-gencode=arch=compute_103a,code=sm_103a"],
+        extra_cuda_cflags=nvcc_flags,
         extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
     )
