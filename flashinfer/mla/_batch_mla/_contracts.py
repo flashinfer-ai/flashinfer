@@ -140,17 +140,20 @@ class MLAInputContract:
                 "o_scale", self.output_scale, actual_output_scale
             )
 
-        has_ckv_scale = ckv_scale is not None or ckv_scale_arr is not None
-        has_kpe_scale = kpe_scale is not None
-        if has_ckv_scale and has_kpe_scale:
-            actual_scale_mode = "kv-per-tensor"
-        elif has_ckv_scale or has_kpe_scale:
-            actual_scale_mode = "incomplete-kv-per-tensor"
-        else:
-            actual_scale_mode = "default"
-        if actual_scale_mode != self.scale_mode:
-            _raise_planned_run_mismatch(
-                "scale mode", self.scale_mode, actual_scale_mode
+        if self.scale_mode == "kv-per-tensor":
+            if (ckv_scale is None) == (ckv_scale_arr is None):
+                raise ValueError(
+                    "Exactly one of ckv_scale or ckv_scale_arr is required when "
+                    "kv_data_type is FP8."
+                )
+            if kpe_scale is None:
+                raise ValueError("kpe_scale is required when kv_data_type is FP8.")
+        elif (
+            ckv_scale is not None or ckv_scale_arr is not None or kpe_scale is not None
+        ):
+            raise ValueError(
+                "ckv_scale / ckv_scale_arr / kpe_scale are only valid when "
+                "kv_data_type is FP8."
             )
 
 
@@ -266,6 +269,9 @@ def _validate_split_structural_input(
     *,
     widths: tuple[int, int],
     name: str,
+    expected_dtype: Optional[torch.dtype] = None,
+    planned_dtype_name: Optional[str] = None,
+    split_leaf_names: Optional[tuple[str, str]] = None,
 ) -> tuple[torch.dtype, tuple[int, ...]]:
     left, right = split
     if left.ndim != 3 or right.ndim != 3:
@@ -273,6 +279,14 @@ def _validate_split_structural_input(
     if left.shape[:-1] != right.shape[:-1]:
         raise ValueError(f"split {name} tensor shapes must match before the last axis.")
     if left.dtype != right.dtype:
+        if expected_dtype is not None:
+            assert planned_dtype_name is not None and split_leaf_names is not None
+            for leaf, leaf_name in zip((left, right), split_leaf_names, strict=True):
+                if leaf.dtype != expected_dtype:
+                    raise ValueError(
+                        f"{leaf_name}.dtype={leaf.dtype} does not match the planned "
+                        f"{planned_dtype_name}={expected_dtype}."
+                    )
         raise ValueError(f"split {name} tensor dtypes must match.")
     if left.device != right.device:
         raise ValueError(f"split {name} tensor devices must match.")
@@ -326,6 +340,9 @@ def _resolve_structural_mla_input(
     widths: Optional[tuple[int, int]],
     name: str,
     accepted: Optional[MLAChosenRepresentation] = None,
+    expected_dtype: Optional[torch.dtype] = None,
+    planned_dtype_name: Optional[str] = None,
+    split_leaf_names: Optional[tuple[str, str]] = None,
 ) -> torch.Tensor: ...
 
 
@@ -337,6 +354,9 @@ def _resolve_structural_mla_input(
     widths: Optional[tuple[int, int]],
     name: str,
     accepted: Optional[MLAChosenRepresentation] = None,
+    expected_dtype: Optional[torch.dtype] = None,
+    planned_dtype_name: Optional[str] = None,
+    split_leaf_names: Optional[tuple[str, str]] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -347,6 +367,9 @@ def _resolve_structural_mla_input(
     widths: Optional[tuple[int, int]],
     name: str,
     accepted: Optional[MLAChosenRepresentation] = None,
+    expected_dtype: Optional[torch.dtype] = None,
+    planned_dtype_name: Optional[str] = None,
+    split_leaf_names: Optional[tuple[str, str]] = None,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     if desired not in ("packed", "split"):
         raise ValueError(f"unsupported {name} representation {desired!r}.")
@@ -368,7 +391,14 @@ def _resolve_structural_mla_input(
         raise ValueError(f"planned split widths are required for {name} conversion.")
     if desired == "split":
         if split is not None:
-            _validate_split_structural_input(split, widths=widths, name=name)
+            _validate_split_structural_input(
+                split,
+                widths=widths,
+                name=name,
+                expected_dtype=expected_dtype,
+                planned_dtype_name=planned_dtype_name,
+                split_leaf_names=split_leaf_names,
+            )
             return split
         assert packed is not None
         return _split_packed_last_dim(packed, widths, name=name)
@@ -376,7 +406,14 @@ def _resolve_structural_mla_input(
         _validate_packed_structural_input(packed, widths=widths, name=name)
         return packed
     assert split is not None
-    _validate_split_structural_input(split, widths=widths, name=name)
+    _validate_split_structural_input(
+        split,
+        widths=widths,
+        name=name,
+        expected_dtype=expected_dtype,
+        planned_dtype_name=planned_dtype_name,
+        split_leaf_names=split_leaf_names,
+    )
     left, right = split
     if widths[1] == 0:
         return left

@@ -430,18 +430,23 @@ def test_batch_mla_varlen_page_attention(
         )
         * qo_len
     )
+    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device).repeat(batch_size)
+    pages_nums = pages_nums.to(device)
     kv_indptr = torch.cat(
         [
-            torch.arange(0, batch_size + 1).unsqueeze(-1).int() * pages_nums_sum
-            + pages_nums_indptr[i]
-            for i in range(num_different_kv_len)
-        ],
-        dim=-1,
-    ).flatten()
+            torch.zeros(1, dtype=torch.int32, device=device),
+            pages_nums.repeat(batch_size).cumsum(0).to(torch.int32),
+        ]
+    )
     kv_indices = torch.arange(
         0, batch_size * pages_nums_sum, device=device, dtype=torch.int32
     )
-    kv_lens = torch.tensor(kv_lens, dtype=torch.int32, device=device).repeat(batch_size)
+    assert kv_indptr.numel() == q_indptr.numel()
+    assert kv_indptr.numel() == kv_lens.numel() + 1
+    torch.testing.assert_close(
+        kv_indptr[1:] - kv_indptr[:-1], pages_nums.repeat(batch_size)
+    )
+    assert kv_indptr[-1] == kv_indices.numel()
     wrapper.plan(
         metadata=flashinfer.mla.MLAPlanMetadata.csr(
             q_indptr, kv_indptr, kv_indices, kv_lens

@@ -1010,6 +1010,9 @@ class BatchMLAPagedAttentionWrapper:
             widths=typed_widths,
             name="query",
             accepted=contract.query_layout,
+            expected_dtype=self._q_data_type,
+            planned_dtype_name="q_data_type",
+            split_leaf_names=("q_nope", "q_pe"),
         )
         kv_for_backend = _resolve_structural_mla_input(
             kv_cache,
@@ -1017,6 +1020,9 @@ class BatchMLAPagedAttentionWrapper:
             widths=typed_widths,
             name="KV cache",
             accepted=contract.kv_cache_layout,
+            expected_dtype=self._kv_data_type,
+            planned_dtype_name="kv_data_type",
+            split_leaf_names=("ckv_cache", "kpe_cache"),
         )
 
         # ---------------------------------------------------------------------------

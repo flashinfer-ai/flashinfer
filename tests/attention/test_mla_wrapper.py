@@ -1178,7 +1178,26 @@ def test_input_contract_rejects_run_output_dtype_mismatch():
         )
 
 
-def test_input_contract_rejects_incomplete_run_kv_scale_mode():
+@pytest.mark.parametrize(
+    ("scale_kwargs", "message"),
+    [
+        (
+            {},
+            "Exactly one of ckv_scale or ckv_scale_arr is required when "
+            "kv_data_type is FP8.",
+        ),
+        (
+            {"ckv_scale": 1.0},
+            "kpe_scale is required when kv_data_type is FP8.",
+        ),
+        (
+            {"ckv_scale": 1.0, "ckv_scale_arr": torch.ones(1), "kpe_scale": 1.0},
+            "Exactly one of ckv_scale or ckv_scale_arr is required when "
+            "kv_data_type is FP8.",
+        ),
+    ],
+)
+def test_input_contract_preserves_fp8_scale_diagnostics(scale_kwargs, message):
     from flashinfer.mla._batch_mla._contracts import MLAInputContract
 
     contract = MLAInputContract(
@@ -1188,17 +1207,127 @@ def test_input_contract_rejects_incomplete_run_kv_scale_mode():
         scale_mode="kv-per-tensor",
     )
 
-    with pytest.raises(ValueError, match="scale mode"):
+    with pytest.raises(ValueError) as exc_info:
         contract.validate_run_options(
             out=None,
             lse=None,
             return_lse=False,
             return_lse_base_on_e=False,
             o_scale=None,
-            ckv_scale=1.0,
-            ckv_scale_arr=None,
+            ckv_scale=scale_kwargs.get("ckv_scale"),
+            ckv_scale_arr=scale_kwargs.get("ckv_scale_arr"),
+            kpe_scale=scale_kwargs.get("kpe_scale"),
+        )
+
+    assert str(exc_info.value) == message
+
+
+def test_input_contract_rejects_scales_for_default_mode_with_established_message():
+    from flashinfer.mla._batch_mla._contracts import MLAInputContract
+
+    contract = MLAInputContract(
+        lse_mode="none",
+        output_dtype=torch.bfloat16,
+        output_scale="none",
+        scale_mode="default",
+    )
+
+    with pytest.raises(ValueError) as exc_info:
+        contract.validate_run_options(
+            out=None,
+            lse=None,
+            return_lse=False,
+            return_lse_base_on_e=False,
+            o_scale=None,
+            ckv_scale=None,
+            ckv_scale_arr=torch.ones(1),
             kpe_scale=None,
         )
+
+    assert str(exc_info.value) == (
+        "ckv_scale / ckv_scale_arr / kpe_scale are only valid when kv_data_type is FP8."
+    )
+
+
+def _planned_split_wrapper(monkeypatch):
+    import flashinfer.mla as mla
+    import flashinfer.mla._batch_mla._backends._fa_common as fa_common
+
+    _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
+    monkeypatch.setattr(
+        fa_common, "get_compute_capability", lambda device: (9, 0), raising=False
+    )
+    wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
+    wrapper.plan(
+        metadata=_dense_metadata(),
+        query_layout="split",
+        kv_cache_layout="split",
+        **(
+            COMMON_PLAN_KWARGS
+            | {
+                "head_dim_ckv": 512,
+                "head_dim_kpe": 64,
+                "kv_data_type": torch.float8_e4m3fn,
+            }
+        ),
+    )
+    return wrapper
+
+
+@pytest.mark.parametrize(
+    ("query_dtypes", "kv_dtypes", "message"),
+    [
+        (
+            (torch.bfloat16, torch.float16),
+            (torch.float8_e4m3fn, torch.float8_e4m3fn),
+            "q_pe.dtype=torch.float16 does not match the planned "
+            "q_data_type=torch.bfloat16.",
+        ),
+        (
+            (torch.bfloat16, torch.bfloat16),
+            (torch.float8_e4m3fn, torch.bfloat16),
+            "kpe_cache.dtype=torch.bfloat16 does not match the planned "
+            "kv_data_type=torch.float8_e4m3fn.",
+        ),
+    ],
+)
+def test_split_run_preserves_planned_leaf_dtype_diagnostics(
+    monkeypatch, query_dtypes, kv_dtypes, message
+):
+    wrapper = _planned_split_wrapper(monkeypatch)
+    q_nope = torch.empty(2, 16, 512, dtype=query_dtypes[0])
+    q_pe = torch.empty(2, 16, 64, dtype=query_dtypes[1])
+    ckv_cache = torch.empty(2, 1, 512, dtype=kv_dtypes[0])
+    kpe_cache = torch.empty(2, 1, 64, dtype=kv_dtypes[1])
+
+    with pytest.raises(ValueError) as exc_info:
+        wrapper.run(
+            query=(q_nope, q_pe),
+            kv_cache=(ckv_cache, kpe_cache),
+            ckv_scale=1.0,
+            kpe_scale=1.0,
+        )
+
+    assert str(exc_info.value) == message
+
+
+def test_validation_precedes_structural_split_lowering_for_fp8_scales(monkeypatch):
+    wrapper = _planned_split_wrapper(monkeypatch)
+    q_nope = torch.empty(2, 16, 512, dtype=torch.float16)
+    q_pe = torch.empty(2, 16, 64, dtype=torch.bfloat16)
+    ckv_cache = torch.empty(2, 1, 512, dtype=torch.float8_e4m3fn)
+    kpe_cache = torch.empty(2, 1, 64, dtype=torch.float8_e4m3fn)
+
+    with pytest.raises(ValueError) as exc_info:
+        wrapper.run(
+            query=(q_nope, q_pe),
+            kv_cache=(ckv_cache, kpe_cache),
+        )
+
+    assert str(exc_info.value) == (
+        "Exactly one of ckv_scale or ckv_scale_arr is required when "
+        "kv_data_type is FP8."
+    )
 
 
 def test_unplanned_cutlass_compatibility_runs_dynamic_shape_without_plan(monkeypatch):
