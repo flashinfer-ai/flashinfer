@@ -21,7 +21,11 @@ from typing import Any, List, Optional
 import torch
 
 from flashinfer.autotuner import OptimizationProfile, TunableRunner, TuningConfig
-from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs, RoutingInputMode
+from flashinfer.fused_moe.shared.inputs import (
+    MoeRunnerInputs,
+    RoutingInputMode,
+    unpack_trtllm_moe_output,
+)
 from flashinfer.fused_moe.shared.tuning import make_moe_tuning_config, moe_topk_ids_init
 from flashinfer.jit.core import logger
 from flashinfer.tllm_enums import (
@@ -377,6 +381,9 @@ class MoERunner(TunableRunner):
                         routing_logits,
                         *common_args,
                     )
+                    # The FromLogits ABI allocates and returns expert weights
+                    # internally instead of filling the caller's buffer.
+                    expert_weights = None
             if prepare_da_body or da_routing_metadata:
                 return list(result)
         elif (
@@ -418,6 +425,7 @@ class MoERunner(TunableRunner):
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)
+
         else:
             result = self.moe_op.trtllm_fp4_block_scale_moe(
                 kwargs.get("routing_input_mode", RoutingInputMode.FromLogits),
@@ -464,3 +472,11 @@ class MoERunner(TunableRunner):
             )
             if prepare_da_body or da_routing_metadata:
                 return list(result)
+
+        return unpack_trtllm_moe_output(
+            result,
+            output,
+            kwargs["do_finalize"],
+            moe_inputs.gemm1_lora_delta,
+            expert_weights,
+        )

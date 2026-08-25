@@ -31,16 +31,20 @@ gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
 gemm_mxfp8_N4096_K4096.json
+gemm_nvfp4_svdquant_N3072_K_packed1536_rank32.json
 gemma_fused_add_rmsnorm_h4608.json
 gemma_rmsnorm_h4608.json
 gelu_and_mul_h16384.json
 gelu_tanh_and_mul_h16384.json
+fp8_paged_mqa_logits_nn2_H64_D128_bs64.json
+fp4_paged_mqa_logits_nn2_H64_Dp64_bs64.json
 gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
 gqa_ragged_h32_kv8_d128.json
 layernorm_h768.json
 layernorm_quant_h768.json
+linear_nvfp4_svdquant_N3072_K3072_K_packed1536_rank32.json
 merge_state_h32_d128.json
 merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
@@ -79,6 +83,7 @@ nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
 prims_ts_block_sparse_h8_kv8_d128_qb64_kb64.json
 prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64.json
+quantize_nvfp4_smooth_N3072.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
 rmsnorm_quant_h7168.json
@@ -90,6 +95,7 @@ top_k_top_p_sampling_v151936.json
 top_p_sampling_v128256.json
 top_p_sampling_v151936.json
 trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
+trtllm_gen_routing_e256_k8_t8.json
 
 Note: top_p_sampling files appear for vocab_size=151936 because
 top_k_top_p_sampling calls top_p_sampling internally.
@@ -97,6 +103,7 @@ FP4 MoE files are only generated on Blackwell (SM100+) GPUs with fp4_quantize av
 GDN prefill files require SM90+ (Hopper) GPU.
 MSA (msa_*) files require SM120/SM121 (consumer Blackwell) GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
+trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
 """
 
 import contextlib
@@ -469,7 +476,7 @@ try:
 except Exception:
     pass  # Requires Blackwell (SM100+)
 
-# ── SVDQuant fused NVFP4 GEMM (Blackwell SM100: M×3072@3072×3072, rank 32) ──
+# ── SVDQuant fused NVFP4 GEMM (Blackwell: M×3072@3072×3072, rank 32) ─────────
 try:
     M, K, N, RANK = 128, 3072, 3072, 32
     a_svdq = torch.zeros(M, K // 2, dtype=torch.uint8, device=device)
@@ -485,9 +492,9 @@ try:
         a_svdq, b_svdq, a_sf_svdq, b_sf_svdq, alpha_svdq, d_svdq, l1_svdq
     )
 except Exception:
-    pass  # Requires Blackwell (SM100)
+    pass  # Requires SM100/SM103 CUTLASS or SM120/SM121 CuTe DSL support
 
-# ── SVDQuant smooth-quantize + composed linear (Blackwell SM100) ─────────────
+# ── SVDQuant smooth-quantize + composed linear (Blackwell) ──────────────────
 try:
     M, K, N, RANK = 128, 3072, 3072, 32
     x_sq = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
@@ -495,7 +502,7 @@ try:
     gs_sq = torch.ones(1, dtype=torch.float32, device=device)
     flashinfer.gemm.nvfp4_quantize_smooth(x_sq, pqs_sq, gs_sq)
 except Exception:
-    pass  # Requires Blackwell (SM100)
+    pass  # Requires SM100/SM103 CUTLASS or SM120/SM121 CuTe DSL support
 
 try:
     M, K, N, RANK = 128, 3072, 3072, 32
@@ -513,7 +520,7 @@ try:
         x_sl, w_sl, wsf_sl, alpha_sl, pqs_sl, l2t_sl, l1_sl, gs_sl
     )
 except Exception:
-    pass  # Requires Blackwell (SM100)
+    pass  # Requires SM100/SM103 CUTLASS or SM120/SM121 CuTe DSL support
 
 # ── GEMM bf16 x fp4: mm_bf16_fp4 (weight-only) ──────────────────────────────
 # Blackwell SM100+: M×7168@2048×7168, block=16. b/b_descale shapes are the
@@ -1049,6 +1056,20 @@ with contextlib.suppress(Exception):
         topk_group=4,
         routing_method_type=2,
         num_fused_shared_experts=_S_fused,
+    )
+
+
+# ── Standalone trtllm-gen routing stage (SM100/SM103/SM120/SM121) ───────────
+# Same routing kernels the fused MoE launchers run before their GEMMs, exposed
+# on their own. Reuses the DeepSeek-V3-shaped logits from the MoE block above.
+with contextlib.suppress(Exception):
+    flashinfer.fused_moe.trtllm_gen_routing(
+        routing_logits,
+        None,
+        flashinfer.RoutingMethodType.Renormalize,
+        8,
+        tile_tokens_dim=8,
+        local_num_experts=E_tot,
     )
 
 
@@ -2124,4 +2145,50 @@ with contextlib.suppress(Exception):
             cu_seqlens_k=_dec_cu_k,
             seqlen_q=1,
             causal=True,
+        )
+
+# ── Paged MQA logits (attn_scores) — DeepSeek MLA sparse indexer (SM100/SM103) ──
+# FP8 (per-token fp32 KV scale) and FP4 (MXFP4 block-scaled). Traces dump before
+# launch, so the JSONs appear on any GPU; the kernels require SM100/SM103. Inputs
+# are built with each template's own init (H=64, D=128).
+with contextlib.suppress(Exception):
+    import flashinfer.attn_scores  # noqa: F401  (triggers @flashinfer_api registration)
+    from flashinfer.trace.templates.attn_scores import (
+        fp4_paged_mqa_logits_trace as _fp4_pmqa_trace,
+    )
+    from flashinfer.trace.templates.attn_scores import (
+        fp8_paged_mqa_logits_trace as _fp8_pmqa_trace,
+    )
+
+    _pmqa_kw = dict(
+        batch_size=4,
+        next_n=2,
+        num_heads=64,
+        head_dim=128,
+        block_size=64,
+        max_context_len=4096,
+        device=device,
+    )
+
+    with contextlib.suppress(Exception):
+        _fp8_in = _fp8_pmqa_trace.init(**_pmqa_kw)
+        flashinfer.fp8_paged_mqa_logits(
+            _fp8_in["q"],
+            _fp8_in["kv_fused"],
+            _fp8_in["weights"],
+            _fp8_in["context_lens"],
+            _fp8_in["block_table"],
+            _fp8_in["max_context_len"],
+        )
+
+    with contextlib.suppress(Exception):
+        _fp4_in = _fp4_pmqa_trace.init(**_pmqa_kw)
+        flashinfer.fp4_paged_mqa_logits(
+            _fp4_in["q"],
+            _fp4_in["sf_q"],
+            _fp4_in["kv_fused"],
+            _fp4_in["weights"],
+            _fp4_in["context_lens"],
+            _fp4_in["block_table"],
+            _fp4_in["max_context_len"],
         )

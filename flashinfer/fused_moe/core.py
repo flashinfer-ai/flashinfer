@@ -80,6 +80,7 @@ from .shared.inputs import (
     MoEInputs,  # noqa: F401 - compatibility re-export from this module
     MoeRunnerInputs,
     alloc_trtllm_moe_output as _alloc_trtllm_moe_output,
+    fake_trtllm_moe_output as _fake_trtllm_moe_output,
     unpack_trtllm_moe_output as _unpack_trtllm_moe_output,
 )
 from .shared.validation import (
@@ -857,6 +858,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        situ_beta: Optional[torch.Tensor] = None,
+        situ_linear_beta: Optional[torch.Tensor] = None,
         swizzled_input_sf: bool = True,
         tp_size: int = 1,
         tp_rank: int = 0,
@@ -988,6 +991,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
+            situ_beta,
+            situ_linear_beta,
             swizzled_input_sf,
             *min_latency_output,
             tp_size,
@@ -1031,6 +1036,8 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
+        situ_beta: Optional[torch.Tensor] = None,
+        situ_linear_beta: Optional[torch.Tensor] = None,
         swizzled_input_sf: bool = True,
         tp_size: int = 1,
         tp_rank: int = 0,
@@ -1179,6 +1186,9 @@ def cutlass_fused_moe(
     use_fused_finalize: bool = True,
     profile_ids: Optional[List[int]] = None,
     workspace_buffer: Optional[torch.Tensor] = None,
+    *,
+    situ_beta: Optional[torch.Tensor] = None,
+    situ_linear_beta: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Compute a Mixture of Experts (MoE) layer using CUTLASS backend.
 
@@ -1250,6 +1260,14 @@ def cutlass_fused_moe(
 
     swiglu_limit : Optional[torch.Tensor]
         Swiglu limit for swiglu activation.
+
+    situ_beta : Optional[torch.Tensor]
+        Per-expert ``beta`` tanh scale for the ``Situ`` activation (float32,
+        ``[num_experts_on_rank]``). ``None`` uses ``DEFAULT_SITU_BETA``.
+
+    situ_linear_beta : Optional[torch.Tensor]
+        Per-expert ``linear_beta`` tanh scale for the ``Situ`` activation (float32,
+        ``[num_experts_on_rank]``). ``None`` uses ``DEFAULT_SITU_LINEAR_BETA``.
 
     tp_size : int = 1
         Tensor parallelism size. Defaults to 1.
@@ -1417,6 +1435,8 @@ def cutlass_fused_moe(
             swiglu_alpha,
             swiglu_beta,
             swiglu_limit,
+            situ_beta,
+            situ_linear_beta,
             swizzled_input_sf,
             tp_size,
             tp_rank,
@@ -2092,10 +2112,16 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ) -> List[torch.Tensor]:
         # Acknowledge the declared mutation-only argument without reading device data in fake mode.
         _ = routing_replay_out
-        # Propagate the public finalized BF16 output shape for compile-time tracing.
-        seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=hidden_states.shape[1],
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            do_finalize=do_finalize,
+            output=output,
+            expert_weights=expert_weights,
+            gemm1_lora_delta=gemm1_lora_delta,
+        )
 
     @register_custom_op(
         "flashinfer::trtllm_fp8_per_tensor_scale_moe",
@@ -2325,11 +2351,14 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ):
         # Acknowledge the declared mutation-only argument without reading device data in fake mode.
         _ = routing_replay_out
-        # Propagate the public finalized BF16 output shape for compile-time tracing.
-        seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
-
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=hidden_states.shape[1],
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            do_finalize=do_finalize,
+            output=output,
+        )
 
     @register_custom_op(
         "flashinfer::trtllm_fp8_per_tensor_scale_routed_moe",
@@ -2577,16 +2606,15 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ):
         # Acknowledge the declared mutation-only argument without reading device data in fake mode.
         _ = routing_replay_out
-        # Fake mode supports only the finalized public result represented by this wrapper.
-        if not do_finalize:
-            raise NotImplementedError(
-                "The fake trtllm_fp8_per_tensor_scale_routed_moe op does not "
-                "support do_finalize=False"
-            )
-        seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
-
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=hidden_states.shape[1],
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            do_finalize=do_finalize,
+            output=output,
+            expert_weights=expert_weights,
+        )
 
     @register_custom_op(
         "flashinfer::trtllm_fp8_block_scale_moe",
@@ -2908,17 +2936,24 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         enable_pdl: Optional[bool] = None,
         tune_max_num_tokens: int = 8192,
         fp8_quantization_type: Fp8QuantizationType = Fp8QuantizationType.DeepSeekFp8,
+        num_fused_shared_experts: int = 0,
         activation_type: int = ActivationType.Swiglu.value,
         norm_topk_prob: bool = True,
         routing_replay_out: Optional[torch.Tensor] = None,
     ) -> List[torch.Tensor]:
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out
-        # Propagate the finalized public BF16 result shape for compile-time tracing.
-        seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
-        # TODO: This is not correct for gemm1_lora_delta or do_finalize=False
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=hidden_states.shape[1],
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            do_finalize=do_finalize,
+            output=output,
+            expert_weights=expert_weights,
+            gemm1_lora_delta=gemm1_lora_delta,
+            num_fused_shared_experts=num_fused_shared_experts,
+        )
 
     @register_custom_op(
         "flashinfer::trtllm_fp4_block_scale_moe",
@@ -3258,12 +3293,17 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ):
         # Acknowledge mutation-only and fallback-only controls without executing the native op.
         _ = routing_replay_out
-        _ = num_fused_shared_experts
-        # Respect a caller-provided output width when tracing the finalized public result.
-        seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1] if output is None else output.shape[1]
-
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=gemm2_weights.shape[1],
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            do_finalize=do_finalize,
+            output=output,
+            expert_weights=topk_weights,
+            gemm1_lora_delta=gemm1_lora_delta,
+            num_fused_shared_experts=num_fused_shared_experts,
+        )
 
     @register_custom_op(
         "flashinfer::trtllm_mxint4_block_scale_moe",
@@ -3523,11 +3563,16 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
     ):
         # Acknowledge the declared mutation-only argument without reading device data in fake mode.
         _ = routing_replay_out
-        # Propagate the public finalized BF16 output shape for compile-time tracing.
-        seq_len = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1]
-
-        return [hidden_states.new_empty([seq_len, hidden_size], dtype=torch.bfloat16)]
+        return _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=hidden_states.shape[1],
+            intermediate_size=intermediate_size,
+            top_k=top_k,
+            do_finalize=do_finalize,
+            output=output,
+            expert_weights=expert_weights,
+            gemm1_lora_delta=gemm1_lora_delta,
+        )
 
     return SimpleNamespace(
         moe_op=moe_op,

@@ -1,0 +1,49 @@
+{
+  "build_dependencies": {
+    "nvidia-cutlass-dsl": {
+      "version": "4.7.0",
+      "cuda_major_extras": {
+        "13": ["cu13"]
+      }
+    }
+  },
+  "runtime": [
+    {
+      "label": "cu129",
+      "version": "12.9",
+      "image": "nvidia/cuda:12.9.0-devel-ubuntu24.04",
+      "pytorch_index": "cu129",
+      "cudnn_version": "9.24.0.43"
+    },
+    {
+      "label": "cu130",
+      "version": "13.0",
+      "image": "nvidia/cuda:13.0.1-devel-ubuntu24.04",
+      "pytorch_index": "cu130",
+      "cudnn_version": "9.24.0.43"
+    }
+  ],
+  "jit_cache": [
+    {
+      "label": "cu129",
+      "version": "12.9",
+      "pytorch_index": "cu129",
+      "x86_64_arch_list": "7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f",
+      "aarch64_arch_list": "7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f"
+    },
+    {
+      "label": "cu130",
+      "version": "13.0",
+      "pytorch_index": "cu130",
+      "x86_64_arch_list": "7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f",
+      "aarch64_arch_list": "7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f 12.1a"
+    },
+    {
+      "label": "cu134",
+      "version": "13.4",
+      "pytorch_index": "nightly/cu134",
+      "x86_64_arch_list": "7.5 8.0 8.9 9.0a 10.0a 10.3a 10.7a 12.0f",
+      "aarch64_arch_list": "7.5 8.0 8.9 9.0a 10.0a 10.3a 10.7a 11.0a 12.0f 12.1a"
+    }
+  ]
+}

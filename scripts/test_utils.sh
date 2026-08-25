@@ -23,27 +23,40 @@ if [ -z "${MAX_JOBS:-}" ]; then
 fi
 export MAX_JOBS
 
-# Pin the preinstalled CUDA torch for every job-time pip install. Twice now a
-# runtime dep's transitive constraint has made pip re-resolve torch and evict
-# the CUDA build (the nvidia-nccl-cu13 floor, then nvshmem4py-cu12's
-# cuda-python<=12.9 pin downgrading cuda-bindings on cu13 images) — on aarch64
-# pip backtracks to the CPU-only PyPI wheel and tests fail later with "Torch
-# not compiled with CUDA enabled". A constraints file makes any resolution that
-# would replace torch fail loudly at install time instead. The +cuXXX local
-# tag is stripped: PEP 440 lets the installed 2.X.Y+cuNNN satisfy ==2.X.Y, but
-# PEP-517 build envs (flashinfer-jit-cache's build-system.requires includes
-# torch) inherit PIP_CONSTRAINT and must be able to resolve the pin from PyPI,
-# where local-version wheels don't exist.
+# Pin the preinstalled CUDA Python stack for every job-time pip install. Runtime
+# dependencies have previously made pip replace torch, cross cuda-python
+# majors, and restore torch's older cuDNN exact pin. Keep the image's validated
+# stack fixed while syncing the branch's direct requirements. The +cuXXX torch
+# local tag is stripped because PEP-517 build environments must be able to
+# resolve the constraint from PyPI, where local-version wheels do not exist.
 if [ -z "${PIP_CONSTRAINT:-}" ]; then
-    _torch_pin=$(python -c "import torch; print('torch=='+torch.__version__.split('+')[0])" 2>/dev/null || true)
-    if [ -n "${_torch_pin}" ]; then
-        _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt)
-        echo "${_torch_pin}" > "${_constraint_file}"
-        export PIP_CONSTRAINT="${_constraint_file}"
-        echo "Pinning for all pip installs in this job: ${_torch_pin}"
-        unset _constraint_file
+    if ! _cuda_stack_pins=$(python - <<'PY'
+import importlib.metadata as metadata
+import torch
+
+print("torch==" + torch.__version__.split("+")[0])
+for package in ("cuda-python", "nvidia-cudnn-cu12", "nvidia-cudnn-cu13"):
+    try:
+        print(f"{package}=={metadata.version(package)}")
+    except metadata.PackageNotFoundError:
+        pass
+PY
+    ); then
+        echo "ERROR: failed to inspect the image CUDA stack; refusing unpinned pip installs" >&2
+        return 1
     fi
-    unset _torch_pin
+    if [ -n "${_cuda_stack_pins}" ]; then
+        _constraint_file=$(mktemp /tmp/ci-cuda-stack-constraint.XXXXXX.txt)
+        printf '%s\n' "${_cuda_stack_pins}" > "${_constraint_file}"
+        export PIP_CONSTRAINT="${_constraint_file}"
+        echo "Pinning the image CUDA stack for job-time pip installs:"
+        printf '%s\n' "${_cuda_stack_pins}"
+        unset _constraint_file
+    else
+        echo "ERROR: image CUDA stack inspection returned no package constraints" >&2
+        return 1
+    fi
+    unset _cuda_stack_pins
 fi
 
 # CUDA_VISIBLE_DEVICES: Not set by default - let detect_gpus() auto-detect via nvidia-smi
@@ -286,10 +299,9 @@ install_and_verify() {
         # Install precompiled kernels if enabled
         install_precompiled_kernels
 
-        # Sync dependencies from the branch's requirements.txt
-        pip install -r requirements.txt
-        pip install -r requirements-test.txt
-        python -c "import pytest_timeout"
+        # Sync the branch's direct dependencies without re-resolving the CUDA
+        # stack already selected and validated by the image build.
+        _dependency_args=(-r requirements.txt -r requirements-test.txt)
 
         # Install nvidia-cutlass-dsl with the correct CUDA extra to avoid
         # version skew between libs-base and libs-cu13.  requirements.txt
@@ -301,8 +313,11 @@ install_and_verify() {
         # Arch member and so disables every SM107 path for the whole run.
         # The a0 suffix is required for pip to consider pre-releases at all.
         if [[ "${CUDA_VERSION}" == *"cu13"* || "${CUDA_VERSION}" == 13.* ]]; then
-            pip install --upgrade "nvidia-cutlass-dsl[cu13]>=4.7.0a0"
+            _dependency_args+=("nvidia-cutlass-dsl[cu13]>=4.7.0a0")
         fi
+        pip install --no-deps "${_dependency_args[@]}"
+        unset _dependency_args
+        python -c "import pytest_timeout"
 
         # Install local python sources. The env var keeps --no-build-isolation
         # from activating the build hooks' own downloads (see setup_test_env.sh).

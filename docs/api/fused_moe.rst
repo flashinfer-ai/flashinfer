@@ -114,6 +114,19 @@ These symbols are defined in the backend modules and re-exported from
 * :func:`flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_block_scale_routed_moe`
 * :func:`flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_per_tensor_scale_moe`
 
+Standalone TRT-LLM Gen Routing
+------------------------------
+
+The routing stage the TRT-LLM Gen fused MoE launchers run before their GEMMs,
+exposed on its own so expert selection and the permutation/padding bookkeeping
+can be used (and tested) independently of quantization and GEMM configuration.
+
+.. autosummary::
+    :toctree: ../generated
+
+    trtllm_gen_routing
+    TrtllmGenRoutingResult
+
 CuteDSL Fused MoE
 -----------------
 

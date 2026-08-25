@@ -18,6 +18,7 @@ from .inputs import (
     MoEInputs,
     MoeRunnerInputs,
     alloc_trtllm_moe_output,
+    fake_trtllm_moe_output,
     unpack_trtllm_moe_output,
 )
 from .tuning import make_moe_tuning_config, moe_topk_ids_init
@@ -27,6 +28,7 @@ __all__ = [
     "MoEInputs",
     "MoeRunnerInputs",
     "alloc_trtllm_moe_output",
+    "fake_trtllm_moe_output",
     "make_moe_tuning_config",
     "moe_topk_ids_init",
     "unpack_trtllm_moe_output",

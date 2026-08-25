@@ -21,7 +21,7 @@ from flashinfer.fused_moe import (
     cutlass_fused_moe,
     fused_topk_deepseek,
 )
-from flashinfer.tllm_enums import RoutingMethodType
+from flashinfer.tllm_enums import RoutingMethodType, is_gated_activation
 from flashinfer import fp4_quantize, mxfp8_quantize
 from flashinfer.testing.utils import (
     bench_gpu_time,
@@ -74,19 +74,6 @@ def _activation_kwarg(fn, activation_type: ActivationType) -> dict:
             )
         return {"gated_act_type": _ACTIVATION_TO_GATED_ACT[activation_type]}
     return {}
-
-
-def is_gated_activation(activation_type: ActivationType) -> bool:
-    """Whether the activation splits FC1 output into gate/up halves (FC1 weight has 2*intermediate
-    rows). SwigluStep's clamp limit defaults to 7.0 (the Step-3 model value) in the kernel, so no
-    swiglu_limit tensor needs to be passed.
-    """
-    return activation_type in (
-        ActivationType.Swiglu,
-        ActivationType.Geglu,
-        ActivationType.SwigluBias,
-        ActivationType.SwigluStep,
-    )
 
 
 def run_moe_test(args):

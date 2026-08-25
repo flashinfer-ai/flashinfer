@@ -91,10 +91,72 @@ def alloc_trtllm_moe_output(
     device: torch.device,
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Allocate the finalized-output buffer for a trtllm-gen MoE op."""
+    """Allocate the finalized-output buffer for a trtllm-gen MoE op.
+
+    When ``do_finalize`` is false, return a zero-width ``(num_tokens, 0)``
+    placeholder instead. The leading token dimension is preserved for shape
+    checks and autotuner bucketing.
+    """
     return torch.empty(
         num_tokens, hidden_size if do_finalize else 0, dtype=dtype, device=device
     )
+
+
+def fake_trtllm_moe_output(
+    hidden_states: torch.Tensor,
+    *,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    do_finalize: bool,
+    output: Optional[torch.Tensor] = None,
+    expert_weights: Optional[torch.Tensor] = None,
+    gemm1_lora_delta: Optional[torch.Tensor] = None,
+    num_fused_shared_experts: int = 0,
+) -> List[torch.Tensor]:
+    """Model the native TRT-LLM MoE result contract for FakeTensor tracing."""
+    num_tokens = hidden_states.shape[0]
+    if do_finalize:
+        finalized = (
+            output
+            if output is not None and output.shape[1] == hidden_size
+            else hidden_states.new_empty(
+                (num_tokens, hidden_size), dtype=torch.bfloat16
+            )
+        )
+        if gemm1_lora_delta is None:
+            return [finalized]
+    else:
+        # Routing-dependent expert padding makes the first dimension dynamic.
+        gemm2_rows = torch.library.get_ctx().new_dynamic_size()
+        finalized = hidden_states.new_empty(
+            (gemm2_rows, hidden_size), dtype=torch.bfloat16
+        )
+
+    total_top_k = top_k + num_fused_shared_experts
+    expanded_idx_to_permuted_idx = hidden_states.new_empty(
+        (num_tokens * total_top_k,), dtype=torch.int32
+    )
+    if not do_finalize:
+        weights = (
+            expert_weights
+            if expert_weights is not None and expert_weights.numel() > 0
+            else hidden_states.new_empty(
+                (num_tokens, total_top_k), dtype=torch.bfloat16
+            )
+        )
+        result = [finalized, weights, expanded_idx_to_permuted_idx]
+    else:
+        result = [finalized, expanded_idx_to_permuted_idx]
+
+    if gemm1_lora_delta is not None:
+        gemm1_rows = torch.library.get_ctx().new_dynamic_size()
+        result.append(
+            hidden_states.new_empty(
+                (gemm1_rows, intermediate_size), dtype=torch.bfloat16
+            )
+        )
+    return result
 
 
 def unpack_trtllm_moe_output(
