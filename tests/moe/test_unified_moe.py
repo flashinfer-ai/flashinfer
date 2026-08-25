@@ -1198,7 +1198,7 @@ class TestMoERunnerSupport:
             (TrtllmFp8BlockRunner, QuantVariant.DeepSeekFp8),
         ),
     )
-    def test_non_swiglu_activation_not_supported(self, runner_type, variant, act):
+    def test_not_supported_activation(self, runner_type, variant, act):
         cfg = self._nvfp4_swiglu(
             quant=QuantConfig(variant=variant),
             activation=act,
