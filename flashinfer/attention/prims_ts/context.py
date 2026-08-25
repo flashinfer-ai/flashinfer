@@ -65,7 +65,7 @@ _SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
 _INT32_MAX = 2**31 - 1
 _CUDA_GRID_YZ_MAX = 65_535
 _CONTEXT_KV_TILE_N = 128
-_CONTEXT_Q_TILE_M = 128
+_CONTEXT_TILE_SIZE_Q = 128
 # Query-paired D128 represents two 128-row Q tiles in one work tile.  Kernel
 # coordinates include the padded tail of that 256-row span and, for masking,
 # its exclusive right boundary.  Reserve the maximum 255-row tail padding in
@@ -282,13 +282,13 @@ def _build_variable_window_cta_starts(
     starts: torch.Tensor, *, geometry: _ContextGeometry
 ) -> torch.Tensor:
     """Reduce fixed per-row starts into one minimum for each kernel Q CTA."""
-    cta_m = (
+    tile_size_q = (
         _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE
-        if geometry.head_dim == _CONTEXT_Q_TILE_M
-        else _CONTEXT_Q_TILE_M
+        if geometry.head_dim == _CONTEXT_TILE_SIZE_Q
+        else _CONTEXT_TILE_SIZE_Q
     )
-    num_seq_tiles = (geometry.max_seq_len_q + cta_m - 1) // cta_m
-    padded_rows = num_seq_tiles * cta_m
+    num_seq_tiles = (geometry.max_seq_len_q + tile_size_q - 1) // tile_size_q
+    padded_rows = num_seq_tiles * tile_size_q
     starts_2d = starts.view(geometry.batch_size, geometry.max_seq_len_q)
     if padded_rows != geometry.max_seq_len_q:
         padded = torch.full(
@@ -300,7 +300,9 @@ def _build_variable_window_cta_starts(
         padded[:, : geometry.max_seq_len_q] = starts_2d
         starts_2d = padded
     return (
-        starts_2d.view(geometry.batch_size, num_seq_tiles, cta_m).amin(dim=-1).flatten()
+        starts_2d.view(geometry.batch_size, num_seq_tiles, tile_size_q)
+        .amin(dim=-1)
+        .flatten()
     )
 
 
@@ -1268,13 +1270,13 @@ def _get_compiled_context(
     )
     variable_window_starts_fake = fake_compact(cutlass.Int32, variable_window_shape, 4)
     variable_window_ends_fake = fake_compact(cutlass.Int32, variable_window_shape, 4)
-    variable_window_cta_m = (
+    variable_window_tile_size_q = (
         _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE
-        if head_dim == _CONTEXT_Q_TILE_M
-        else _CONTEXT_Q_TILE_M
+        if head_dim == _CONTEXT_TILE_SIZE_Q
+        else _CONTEXT_TILE_SIZE_Q
     )
     variable_window_cta_shape = (
-        (batch_size * cute.ceil_div(max_seq_len_q, variable_window_cta_m),)
+        (batch_size * cute.ceil_div(max_seq_len_q, variable_window_tile_size_q),)
         if has_variable_window
         else (1,)
     )

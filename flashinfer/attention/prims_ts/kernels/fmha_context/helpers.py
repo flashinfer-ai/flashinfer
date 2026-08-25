@@ -27,10 +27,10 @@ def variable_window_cta_min_start(
     batch_coord: Int32,
     seq_coord: Int32,
     q_stride: int | Int32,
-    cta_m: cutlass.Constexpr[int],
+    tile_size_q: cutlass.Constexpr[int],
 ) -> Int32:
     """Load the plan-time minimum variable-window start for one Q CTA."""
-    num_seq_tiles = cute.ceil_div(q_stride, cta_m)
+    num_seq_tiles = cute.ceil_div(q_stride, tile_size_q)
     return Int32(cta_starts[batch_coord * num_seq_tiles + seq_coord])
 
 

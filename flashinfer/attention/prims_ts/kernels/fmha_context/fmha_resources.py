@@ -983,7 +983,7 @@ class GmemQKVResource(MemoryResource):
                 batch_coord=batch_coord,
                 seq_coord=seq_coord,
                 q_stride=self.variable_window_q_stride,
-                cta_m=self.cfg.cta_tiler[0],
+                tile_size_q=self.cfg.cta_tiler[0],
             )
             kv_tile_start = min_window_start // self.cfg.kv_tile_n
         return (
@@ -2451,7 +2451,7 @@ class TmemSPResource(MemoryResource):
             batch_coord=batch_coord,
             seq_coord=seq_coord,
             q_stride=self.variable_window_q_stride,
-            cta_m=self.cfg.cta_tiler[0],
+            tile_size_q=self.cfg.cta_tiler[0],
         )
         kv_base = (min_window_start // self.cfg.kv_tile_n) * self.cfg.kv_tile_n
         return (

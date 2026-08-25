@@ -235,8 +235,8 @@ def _init_causal_domain_state(
     task: Task,
     *,
     num_kv_tiles: int | Int32,
-    cta_m: int | Int32,
-    kv_n: int | Int32,
+    tile_size_q: int | Int32,
+    tile_size_kv: int | Int32,
     q_offset: int | Int32,
     seq_idx: int,
     batch_idx: int | None,
@@ -253,26 +253,28 @@ def _init_causal_domain_state(
     """Initialize causal-domain fields and the static validation domain."""
     static_domain = None
     if isinstance(num_kv_tiles, int):
-        assert isinstance(cta_m, int) and isinstance(kv_n, int)
+        assert isinstance(tile_size_q, int) and isinstance(tile_size_kv, int)
         if packed_window:
             static_domain = min(
                 num_kv_tiles,
                 bottom_right_window_max_tiles(
-                    q_tile_m=cta_m,
-                    kv_tile_n=kv_n,
+                    q_tile_m=tile_size_q,
+                    kv_tile_n=tile_size_kv,
                     window_size_left=window_size_left,
                 ),
             )
         else:
             seq_coord = 0
-            max_q_row = q_offset + seq_coord * cta_m + cta_m - 1
-            causal_n = max_q_row // kv_n + 1
-            static_domain = max(cta_m // kv_n, min(num_kv_tiles, causal_n))
+            max_q_row = q_offset + seq_coord * tile_size_q + tile_size_q - 1
+            causal_n = max_q_row // tile_size_kv + 1
+            static_domain = max(
+                tile_size_q // tile_size_kv, min(num_kv_tiles, causal_n)
+            )
         if window_size_left > 0 and not packed_window:
             static_domain -= bottom_right_window_tile_start(
                 seq_coord=0,
-                q_tile_m=cta_m,
-                kv_tile_n=kv_n,
+                q_tile_m=tile_size_q,
+                kv_tile_n=tile_size_kv,
                 q_offset=q_offset,
                 window_size_left=window_size_left,
             )
@@ -281,10 +283,8 @@ def _init_causal_domain_state(
         static_domain = max(static_domain, 0)
     _init_task_with_domain(task, kwargs, static_domain, task_init=task_init)
     task._num_kv_tiles = num_kv_tiles
-    # M dimension size for Q*K.
-    task._cta_m = cta_m
-    # N dimension size for Q*K.
-    task._kv_n = kv_n
+    task._tile_size_q = tile_size_q
+    task._tile_size_kv = tile_size_kv
     task._q_offset = q_offset
     # Index of the sequence coordinate in tile_coord.
     task._seq_idx = seq_idx
@@ -315,8 +315,8 @@ class CausalDomainTask(Task):
     def __init__(
         self,
         num_kv_tiles: int | Int32,
-        cta_m: int | Int32,
-        kv_n: int | Int32,
+        tile_size_q: int | Int32,
+        tile_size_kv: int | Int32,
         q_offset: int | Int32 = 0,
         seq_idx: int = 0,
         batch_idx: int | None = None,
@@ -333,8 +333,8 @@ class CausalDomainTask(Task):
 
         Args:
             num_kv_tiles: Total number of K/V tiles in the sequence.
-            cta_m: Number of Q rows covered by one CTA tile.
-            kv_n: Number of K/V rows covered by one K-loop iteration.
+            tile_size_q: Number of Q rows covered by one CTA tile.
+            tile_size_kv: Number of K/V rows covered by one K-loop iteration.
             q_offset: Causal row-index shift for S_q < S_kv.
             seq_idx: Index of the sequence coordinate in ``tile_coord``.
             batch_idx: Index of the request coordinate in ``tile_coord`` for
@@ -360,8 +360,8 @@ class CausalDomainTask(Task):
         _init_causal_domain_state(
             self,
             num_kv_tiles=num_kv_tiles,
-            cta_m=cta_m,
-            kv_n=kv_n,
+            tile_size_q=tile_size_q,
+            tile_size_kv=tile_size_kv,
             q_offset=q_offset,
             seq_idx=seq_idx,
             batch_idx=batch_idx,
@@ -395,9 +395,9 @@ class CausalDomainTask(Task):
             k_begin = Int32(self._cum_seqlen_k[batch_coord])
             seqlen_q = Int32(self._cum_seqlen_q[batch_coord + Int32(1)]) - q_begin
             seqlen_k = Int32(self._cum_seqlen_k[batch_coord + Int32(1)]) - k_begin
-            runtime_q_tile_active = Int32(seq_coord * self._cta_m < seqlen_q)
+            runtime_q_tile_active = Int32(seq_coord * self._tile_size_q < seqlen_q)
             q_offset = seqlen_k - seqlen_q
-            num_kv_tiles = cute.ceil_div(seqlen_k, self._kv_n)
+            num_kv_tiles = cute.ceil_div(seqlen_k, self._tile_size_kv)
             if cutlass.const_expr(self._runtime_kv_tile_multiple > 1):
                 num_kv_tiles = (
                     cute.ceil_div(num_kv_tiles, self._runtime_kv_tile_multiple)
@@ -405,24 +405,24 @@ class CausalDomainTask(Task):
                 )
         if self._packed_window:
             max_window_tiles = bottom_right_window_max_tiles(
-                q_tile_m=self._cta_m,
-                kv_tile_n=self._kv_n,
+                q_tile_m=self._tile_size_q,
+                kv_tile_n=self._tile_size_kv,
                 window_size_left=self._window_size_left,
             )
             result = _domain_min(num_kv_tiles, max_window_tiles)
         else:
-            max_q_row = q_offset + seq_coord * self._cta_m + self._cta_m - 1
-            causal_n = max_q_row // self._kv_n + 1
+            max_q_row = q_offset + seq_coord * self._tile_size_q + self._tile_size_q - 1
+            causal_n = max_q_row // self._tile_size_kv + 1
             # Softmax assumes there is at least one Q-tile-width of K work.
             result = _domain_max(
-                self._cta_m // self._kv_n,
+                self._tile_size_q // self._tile_size_kv,
                 _domain_min(num_kv_tiles, causal_n),
             )
         if self._window_size_left > 0 and not self._packed_window:
             result -= bottom_right_window_tile_start(
                 seq_coord=seq_coord,
-                q_tile_m=self._cta_m,
-                kv_tile_n=self._kv_n,
+                q_tile_m=self._tile_size_q,
+                kv_tile_n=self._tile_size_kv,
                 q_offset=q_offset,
                 window_size_left=self._window_size_left,
             )
@@ -435,7 +435,9 @@ class CausalDomainTask(Task):
             # those slots instead of traversing K/V according to a large
             # bottom-right offset. Resource-level ragged extents suppress the
             # dummy Q/O traffic; the minimum domains preserve task handoffs.
-            minimum_domain = max(self._cta_m // self._kv_n - self._offset, 0)
+            minimum_domain = max(
+                self._tile_size_q // self._tile_size_kv - self._offset, 0
+            )
             result = (
                 runtime_q_tile_active * result
                 + (Int32(1) - runtime_q_tile_active) * minimum_domain
@@ -449,8 +451,8 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
     def __init__(
         self,
         num_kv_tiles: int | Int32,
-        cta_m: int | Int32,
-        kv_n: int | Int32,
+        tile_size_q: int | Int32,
+        tile_size_kv: int | Int32,
         q_offset: int | Int32 = 0,
         seq_idx: int = 0,
         batch_idx: int | None = None,
@@ -469,9 +471,9 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
         ----------
         num_kv_tiles : int or Int32
             Total number of K/V tiles in the sequence.
-        cta_m : int or Int32
+        tile_size_q : int or Int32
             Number of Q rows covered by one CTA tile.
-        kv_n : int or Int32
+        tile_size_kv : int or Int32
             Number of K/V rows covered by one K-loop iteration.
         q_offset : int or Int32
             Causal row-index shift for S_q < S_kv.
@@ -500,8 +502,8 @@ class CausalSoftmaxDomainTask(CausalDomainTask):
         _init_causal_domain_state(
             self,
             num_kv_tiles=num_kv_tiles,
-            cta_m=cta_m,
-            kv_n=kv_n,
+            tile_size_q=tile_size_q,
+            tile_size_kv=tile_size_kv,
             q_offset=q_offset,
             seq_idx=seq_idx,
             batch_idx=batch_idx,
@@ -526,8 +528,8 @@ class VariableWindowDomainTask(Task):
         variable_window_cta_starts: cute.Tensor,
         num_kv_tiles: int | Int32,
         q_stride: int | Int32,
-        cta_m: int,
-        kv_n: int,
+        tile_size_q: int,
+        tile_size_kv: int,
         seq_idx: int,
         batch_idx: int,
         offset: int = 0,
@@ -541,8 +543,8 @@ class VariableWindowDomainTask(Task):
         self._variable_window_cta_starts = variable_window_cta_starts
         self._num_kv_tiles = num_kv_tiles
         self._q_stride = q_stride
-        self._cta_m = cta_m
-        self._kv_n = kv_n
+        self._tile_size_q = tile_size_q
+        self._tile_size_kv = tile_size_kv
         self._seq_idx = seq_idx
         self._batch_idx = batch_idx
         self._offset = offset
@@ -551,9 +553,9 @@ class VariableWindowDomainTask(Task):
         """Return the number of K tiles intersecting this Q CTA's bounds."""
         seq_coord = Int32(tile_coord[self._seq_idx])
         batch_coord = Int32(tile_coord[self._batch_idx])
-        first_local_q = seq_coord * self._cta_m
+        first_local_q = seq_coord * self._tile_size_q
         last_local_q = cute.math.min(
-            first_local_q + self._cta_m - Int32(1),
+            first_local_q + self._tile_size_q - Int32(1),
             self._q_stride - Int32(1),
         )
         packed_q_base = batch_coord * self._q_stride
@@ -562,11 +564,11 @@ class VariableWindowDomainTask(Task):
             batch_coord=batch_coord,
             seq_coord=seq_coord,
             q_stride=self._q_stride,
-            cta_m=self._cta_m,
+            tile_size_q=self._tile_size_q,
         )
         last_k = Int32(self._variable_window_token_ends[packed_q_base + last_local_q])
-        first_k_tile = first_k // self._kv_n
-        last_k_tile = (last_k + self._kv_n) // self._kv_n
+        first_k_tile = first_k // self._tile_size_kv
+        last_k_tile = (last_k + self._tile_size_kv) // self._tile_size_kv
         return last_k_tile - first_k_tile - self._offset
 
 
@@ -1935,8 +1937,8 @@ def _configure_common_launch_flags(
 def _causal_domain_kwargs(
     *,
     num_kv_tiles: int | Int32,
-    cta_m: int,
-    kv_n: int,
+    tile_size_q: int,
+    tile_size_kv: int,
     q_offset: int | Int32,
     seq_idx: int,
     batch_idx: int | None = None,
@@ -1958,8 +1960,8 @@ def _causal_domain_kwargs(
     result: DomainKwargs = {
         "task_class": CausalDomainTask,
         "num_kv_tiles": num_kv_tiles,
-        "cta_m": cta_m,
-        "kv_n": kv_n,
+        "tile_size_q": tile_size_q,
+        "tile_size_kv": tile_size_kv,
         "q_offset": q_offset,
         "seq_idx": seq_idx,
         "offset": offset,
@@ -2018,8 +2020,8 @@ def _select_fmha_domain_policy(
             "variable_window_cta_starts": variable_window_cta_starts,
             "num_kv_tiles": num_kv_tiles,
             "q_stride": variable_window_q_stride,
-            "cta_m": cfg.cta_tiler[0],
-            "kv_n": cfg.kv_tile_n,
+            "tile_size_q": cfg.cta_tiler[0],
+            "tile_size_kv": cfg.kv_tile_n,
             "seq_idx": seq_idx,
             "batch_idx": batch_idx,
         }
@@ -2036,8 +2038,8 @@ def _select_fmha_domain_policy(
     if cfg.head_paired and cfg.is_causal:
         causal_n = _causal_domain_kwargs(
             num_kv_tiles=num_kv_tiles,
-            cta_m=cfg.q_tile_m,
-            kv_n=cfg.kv_tile_n,
+            tile_size_q=cfg.q_tile_m,
+            tile_size_kv=cfg.kv_tile_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
             offset=0,
@@ -2047,8 +2049,8 @@ def _select_fmha_domain_policy(
         )
         causal_n_minus_1 = _causal_domain_kwargs(
             num_kv_tiles=num_kv_tiles,
-            cta_m=cfg.q_tile_m,
-            kv_n=cfg.kv_tile_n,
+            tile_size_q=cfg.q_tile_m,
+            tile_size_kv=cfg.kv_tile_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
             offset=1,
@@ -2101,8 +2103,8 @@ def _select_fmha_domain_policy(
         )
         causal_n = _causal_domain_kwargs(
             num_kv_tiles=num_kv_tiles,
-            cta_m=cfg.cta_tiler[0],
-            kv_n=cfg.kv_tile_n,
+            tile_size_q=cfg.cta_tiler[0],
+            tile_size_kv=cfg.kv_tile_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
             batch_idx=batch_idx,
@@ -2114,8 +2116,8 @@ def _select_fmha_domain_policy(
         )
         causal_n_minus_1 = _causal_domain_kwargs(
             num_kv_tiles=num_kv_tiles,
-            cta_m=cfg.cta_tiler[0],
-            kv_n=cfg.kv_tile_n,
+            tile_size_q=cfg.cta_tiler[0],
+            tile_size_kv=cfg.kv_tile_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
             batch_idx=batch_idx,
@@ -2127,8 +2129,8 @@ def _select_fmha_domain_policy(
         )
         causal_n_minus_2 = _causal_domain_kwargs(
             num_kv_tiles=num_kv_tiles,
-            cta_m=cfg.cta_tiler[0],
-            kv_n=cfg.kv_tile_n,
+            tile_size_q=cfg.cta_tiler[0],
+            tile_size_kv=cfg.kv_tile_n,
             q_offset=q_offset,
             seq_idx=seq_idx,
             batch_idx=batch_idx,
