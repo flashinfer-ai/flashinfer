@@ -90,6 +90,66 @@ def _use_balanced_scheduler(is_causal: bool) -> bool:
     return is_causal and os.environ.get("PRIMS_FMHA_DISABLE_BALANCED_SCHEDULING") != "1"
 
 
+def _validate_sm120_prims_plan_options(
+    *,
+    kv_layout: str,
+    required_kv_layout: str,
+    custom_mask: Optional[torch.Tensor],
+    packed_custom_mask: Optional[torch.Tensor],
+    pos_encoding_mode: str,
+    use_fp16_qk_reduction: bool,
+    window_left: int,
+    logits_soft_cap: float,
+    prefix_len_ptr: Optional[torch.Tensor],
+    token_pos_in_items_ptr: Optional[torch.Tensor],
+    max_item_len_ptr: Optional[torch.Tensor],
+    max_sequence_kv: Optional[int],
+    fixed_split_size: int,
+) -> None:
+    """Fail fast for features outside the first PRIMS backend contract."""
+    backend = "backend='cute-dsl-prims'"
+    if kv_layout != required_kv_layout:
+        raise ValueError(
+            f"{backend} requires kv_layout={required_kv_layout!r}; got {kv_layout!r}"
+        )
+    if custom_mask is not None or packed_custom_mask is not None:
+        raise NotImplementedError(f"{backend} does not support custom masks")
+    if pos_encoding_mode != "NONE":
+        raise NotImplementedError(
+            f"{backend} requires pos_encoding_mode='NONE'; got "
+            f"{pos_encoding_mode!r}. Apply RoPE to Q/K before attention."
+        )
+    if use_fp16_qk_reduction:
+        raise NotImplementedError(
+            f"{backend} uses FP32 accumulation and does not support "
+            "use_fp16_qk_reduction=True"
+        )
+    if window_left >= 0:
+        raise NotImplementedError(
+            f"{backend} does not support sliding window; got window_left={window_left}"
+        )
+    if logits_soft_cap > 0:
+        raise NotImplementedError(
+            f"{backend} does not support logits_soft_cap={logits_soft_cap}"
+        )
+    if any(
+        value is not None
+        for value in (prefix_len_ptr, token_pos_in_items_ptr, max_item_len_ptr)
+    ):
+        raise NotImplementedError(
+            f"{backend} does not support multi-item scoring/prefix metadata"
+        )
+    if max_sequence_kv is not None:
+        raise NotImplementedError(
+            f"{backend} does not support max_sequence_kv={max_sequence_kv}; "
+            "this option is only supported by the cuDNN backend"
+        )
+    if fixed_split_size not in (-1, None):
+        raise NotImplementedError(
+            f"{backend} does not support fixed_split_size={fixed_split_size}"
+        )
+
+
 def _validate_lse(q: torch.Tensor, lse: Optional[torch.Tensor]) -> None:
     """Validate the optional packed log2 LSE output tensor."""
     if lse is None:

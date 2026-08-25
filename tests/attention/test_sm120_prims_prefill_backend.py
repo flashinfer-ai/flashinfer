@@ -139,6 +139,49 @@ def test_paged_public_wrapper(page_size):
     torch.testing.assert_close(actual_lse, torch.cat(lses), atol=0.2, rtol=0.2)
 
 
+def test_prims_rejects_cudnn_max_sequence_kv():
+    workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
+    qo = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+
+    paged_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, "HND", backend="cute-dsl-prims"
+    )
+    page_indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    page_indices = torch.tensor([0], dtype=torch.int32, device="cuda")
+    last_page_len = torch.tensor([1], dtype=torch.int32, device="cuda")
+    with pytest.raises(NotImplementedError, match="max_sequence_kv"):
+        paged_wrapper.plan(
+            qo,
+            page_indptr,
+            page_indices,
+            last_page_len,
+            2,
+            1,
+            32,
+            16,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.float16,
+            max_sequence_kv=1,
+        )
+
+    ragged_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        workspace, "NHD", backend="cute-dsl-prims"
+    )
+    with pytest.raises(NotImplementedError, match="max_sequence_kv"):
+        ragged_wrapper.plan(
+            qo,
+            qo,
+            2,
+            1,
+            32,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.float16,
+            max_sequence_kv=1,
+        )
+
+
 def test_prims_accepts_combined_hnd_cache_and_rejects_pdl():
     workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
     qo = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
