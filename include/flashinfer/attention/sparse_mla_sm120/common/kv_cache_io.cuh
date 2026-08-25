@@ -71,6 +71,9 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t*
   constexpr int SMEM_STRIDE = KV::KV_SMEM_STRIDE;
 
   if (io_tid == 0) mbarrier_arrive_expect_tx(mbar, BI * COPY_BYTES);
+  // Execution barrier the caller's __threadfence_block cannot provide; without it the
+  // CTA deadlocks on sm_121 (#3700).
+  bar_sync_t<4, IO_THREADS>();
 
 #pragma unroll 1
   for (int bi = io_tid; bi < BI; bi += IO_THREADS) {
