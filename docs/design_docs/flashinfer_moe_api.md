@@ -641,13 +641,11 @@ The branch can merge to `main` early for team review and may land in a nightly/e
 The aspirational API in §2–§4 (eager `moe_layer(...)`, `MoETensors`, `find_backends`, pipe-operator backends) describes the long-range design. What actually shipped for the PR #3093 MVP is narrower and pack-based; this section is the authoritative end-to-end description of the as-built surface (CR7–CR9).
 
 ```python
-import dataclasses
 import torch
 from flashinfer.fused_moe import (
     MoEConfig, RoutingConfig, QuantConfig, QuantVariant, ExpertConfig,
     ActivationConfig, ExecutionConfig, MoELayer,
     MoEActivationPack, MoEWeightPack, CuteDslConfig, TrtllmFp4Config,
-    CutlassNvfp4Config,
 )
 from flashinfer.fused_moe.api import BackendOptions
 from flashinfer.autotuner import autotune
@@ -686,21 +684,6 @@ with autotune(True):
     out = layer(act, weights)        # tunes + selects winner for this bucket
 print(layer.winner_backend)          # e.g. "cute_dsl_nvfp4"
 out = layer(act, weights)            # subsequent calls: cached winner dispatch
-
-# CUTLASS NVFP4 is a separate candidate set: BF16 activations (kernel-side
-# quant) plus a `cutlass_nvfp4` weight view. It cannot share one
-# MoEActivationPack with TRTLLM/CuteDSL NVFP4.
-cutlass_config = dataclasses.replace(
-    config, backend=BackendOptions(candidates=(CutlassNvfp4Config(),)))
-cutlass_weights = MoEWeightPack()
-cutlass_weights.prepare_for(
-    "cutlass_nvfp4",
-    CutlassNvfp4Config.prepare_weights(
-        w1_bf16, w2_bf16, num_local_experts=32,
-        hidden_size=1024, intermediate_size=512),
-)
-cutlass_act = MoEActivationPack(x_bf16, None, topk_ids, topk_weights)
-cutlass_out = MoELayer(cutlass_config)(cutlass_act, cutlass_weights)
 ```
 
 Key mechanisms (and where they live):
