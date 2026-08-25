@@ -39,6 +39,22 @@
     ],
     "dynamic_smem_bytes": 256
   },
-  "schema_version": 1,
-  "source_sha256": "117388985212ce7853434efce674db3d6c55a51b2a1cb62c25aa3d36675c6b18"
+  "schema_version": 2,
+  "source_sha256": "e23d45731b1bb38a1bd95f53ff6558e0abc7dd636cf11d5aa420d0e026264410",
+  "workspace_protocol": {
+    "flag_region_bytes_by_world_size": {
+      "2": 2048,
+      "4": 4288
+    },
+    "tp4_ack_tail": {
+      "bytes": 192,
+      "consumers": 4,
+      "empty_sentinel_u16": 32768,
+      "generation_stride_bytes": 64,
+      "generations": 3,
+      "offset_bytes": 4096,
+      "ready_u16": 0,
+      "slot_bytes": 16
+    }
+  }
 }

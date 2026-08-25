@@ -74,7 +74,7 @@ def _finalize_args() -> dict:
 
 def _cake_source_bundle_manifest(source: bytes) -> dict:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "arch": "sm_100a",
         "compile_flags": ["--use_fast_math"],
         "launch": {
@@ -90,6 +90,19 @@ def _cake_source_bundle_manifest(source: bytes) -> dict:
             "world_sizes": [2, 4],
         },
         "kernel_symbols": list(cake_moe_comm._KERNEL_SYMBOLS),
+        "workspace_protocol": {
+            "flag_region_bytes_by_world_size": {"2": 2048, "4": 4288},
+            "tp4_ack_tail": {
+                "offset_bytes": 4096,
+                "bytes": 192,
+                "generations": 3,
+                "consumers": 4,
+                "slot_bytes": 16,
+                "generation_stride_bytes": 64,
+                "empty_sentinel_u16": 32768,
+                "ready_u16": 0,
+            },
+        },
         "source_sha256": hashlib.sha256(source).hexdigest(),
     }
 
@@ -406,6 +419,73 @@ def test_exact_cake_source_bundle_manifest_loads(
 
     assert loaded_path == source_path
     assert loaded_source == source
+    assert trtllm_ar._allreduce_fusion_flag_layout(2) == (2048, 0, 2048)
+    assert trtllm_ar._allreduce_fusion_flag_layout(4) == (4096, 192, 4288)
+    slots = {
+        4096 + generation * 64 + consumer * 16
+        for generation in range(3)
+        for consumer in range(4)
+    }
+    assert len(slots) == 12
+    assert min(slots) == 4096
+    assert max(slots) + 16 == 4288
+    assert all(offset % 16 == 0 for offset in slots)
+
+    memsets = []
+    initializers = []
+    monkeypatch.setattr(
+        trtllm_ar.cudart,
+        "cudaMemset",
+        lambda ptr, value, size: memsets.append((ptr.value, value, size)),
+    )
+    monkeypatch.setattr(
+        trtllm_ar.cudart,
+        "cudaMemcpy",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        trtllm_ar,
+        "trtllm_lamport_initialize",
+        lambda ptr, size, dtype: initializers.append((ptr, size, dtype)),
+    )
+    trtllm_ar._initialize_allreduce_fusion_protocol(
+        ipc_handles=[[1000], [2000], [3000]],
+        tp_rank=0,
+        tp_size=4,
+        flag_size=4288,
+        lamport_buffer_size=6144,
+        lamport_comm_size=2048,
+        use_fp32_lamport=False,
+        control_flag_ptr=4000,
+    )
+    assert memsets[0] == (2000, 0, 4096)
+    assert initializers[0] == (2000 + 4096, 96, torch.float16)
+    assert initializers[1] == (3000, 3072, torch.float16)
+    with pytest.raises(ValueError, match="flag layout mismatch"):
+        trtllm_ar._initialize_allreduce_fusion_protocol(
+            ipc_handles=[[1000], [2000], [3000]],
+            tp_rank=0,
+            tp_size=4,
+            flag_size=4096,
+            lamport_buffer_size=6144,
+            lamport_comm_size=2048,
+            use_fp32_lamport=False,
+            control_flag_ptr=4000,
+        )
+    with pytest.raises(ValueError, match=r"flag_size \(4096\).+4288"):
+        trtllm_ar.check_trtllm_allreduce_fusion_workspace_metadata(
+            token_num=1,
+            hidden_dim=7168,
+            world_size=4,
+            dtype=torch.float16,
+            metadata={
+                "max_token_num": 2048,
+                "tp_size": 4,
+                "hidden_dim": 7168,
+                "use_fp32_lamport": False,
+                "flag_size": 4096,
+            },
+        )
 
 
 def test_cake_source_bundle_rejects_unknown_manifest_key(
@@ -429,8 +509,8 @@ def test_cake_source_bundle_rejects_duplicate_manifest_key(
     _, source = _write_cake_source_bundle(tmp_path)
     manifest_text = json.dumps(_cake_source_bundle_manifest(source))
     manifest_text = manifest_text.replace(
-        '{"schema_version": 1,',
-        '{"schema_version": 1, "schema_version": 1,',
+        '{"schema_version": 2,',
+        '{"schema_version": 2, "schema_version": 2,',
         1,
     )
     (tmp_path / "manifest.json").write_text(manifest_text, encoding="utf-8")

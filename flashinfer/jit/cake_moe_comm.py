@@ -298,7 +298,7 @@ def _load_source_bundle() -> tuple[Path, bytes]:
     if not isinstance(manifest, dict):
         raise RuntimeError("Cake MoE communication manifest must be a JSON object")
     expected = {
-        "schema_version": 1,
+        "schema_version": 2,
         "arch": "sm_100a",
         "compile_flags": ["--use_fast_math"],
         "launch": {
@@ -314,6 +314,19 @@ def _load_source_bundle() -> tuple[Path, bytes]:
             "world_sizes": [2, 4],
         },
         "kernel_symbols": list(_KERNEL_SYMBOLS),
+        "workspace_protocol": {
+            "flag_region_bytes_by_world_size": {"2": 2048, "4": 4288},
+            "tp4_ack_tail": {
+                "offset_bytes": 4096,
+                "bytes": 192,
+                "generations": 3,
+                "consumers": 4,
+                "slot_bytes": 16,
+                "generation_stride_bytes": 64,
+                "empty_sentinel_u16": 32768,
+                "ready_u16": 0,
+            },
+        },
     }
     expected_keys = set(expected) | {"source_sha256"}
     if set(manifest) != expected_keys:

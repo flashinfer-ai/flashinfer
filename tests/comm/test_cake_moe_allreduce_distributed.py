@@ -76,17 +76,28 @@ def _assert_distributed_close(
         )
 
 
-def _run_mode(call: Callable[[], None], mode: str, group: dist.ProcessGroup) -> None:
+def _run_mode(
+    call: Callable[[], None],
+    mode: str,
+    group: dist.ProcessGroup,
+    *,
+    replay_count: int = 1,
+    start_delay_seconds: float = 0.0,
+) -> None:
     dist.barrier(group=group)
+    if start_delay_seconds:
+        time.sleep(start_delay_seconds)
     call()
     torch.cuda.synchronize()
     if mode == "eager":
-        call()
+        for _ in range(replay_count):
+            call()
     elif mode == "graph":
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             call()
-        graph.replay()
+        for _ in range(replay_count):
+            graph.replay()
     else:  # pragma: no cover - the test matrix is fixed below.
         raise AssertionError(f"unknown execution mode {mode!r}")
     torch.cuda.synchronize()
@@ -413,7 +424,18 @@ def _finalize_worker(
                             f"finalize/tp{world_size}/{dtype}/tokens{token_num}/"
                             f"pdl{int(launch_with_pdl)}/{mode}/shared_{shared_label}"
                         )
-                        _run_mode(call, mode, group)
+                        stress_tp4_epoch_wrap = world_size == 4 and token_num == 2048
+                        _run_mode(
+                            call,
+                            mode,
+                            group,
+                            replay_count=8 if stress_tp4_epoch_wrap else 1,
+                            start_delay_seconds=(
+                                0.05
+                                if stress_tp4_epoch_wrap and rank == world_size - 1
+                                else 0.0
+                            ),
+                        )
                         _assert_distributed_close(
                             residual_out,
                             residual_ref,

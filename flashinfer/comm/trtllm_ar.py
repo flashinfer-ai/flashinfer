@@ -559,20 +559,46 @@ def trtllm_destroy_ipc_workspace_for_all_reduce(
 
 
 BarrierFlagCount = 256
+CAKE_TP4_ACK_TAIL_BYTES = 192
+CAKE_ACK_SENTINEL_BYTES = 2
 
 MAX_COMM_SIZE = 2147483647 & ~((1 << 21) - 1)  # MAX_INT32 rounded down to 2MB
+
+
+def _allreduce_fusion_flag_layout(tp_size: int) -> tuple[int, int, int]:
+    """Return legacy, Cake-tail, and total flag allocation sizes in bytes."""
+
+    legacy_flag_size = tp_size * BarrierFlagCount * 4
+    cake_tail_size = CAKE_TP4_ACK_TAIL_BYTES if tp_size == 4 else 0
+    return legacy_flag_size, cake_tail_size, legacy_flag_size + cake_tail_size
 
 
 def _initialize_allreduce_fusion_protocol(
     ipc_handles: List[List[int]],
     tp_rank: int,
+    tp_size: int,
     flag_size: int,
     lamport_buffer_size: int,
     lamport_comm_size: int,
     use_fp32_lamport: bool,
     control_flag_ptr: int,
 ) -> None:
-    cudart.cudaMemset(c_void_p(ipc_handles[1][tp_rank]), 0, flag_size)
+    legacy_flag_size, cake_tail_size, expected_flag_size = (
+        _allreduce_fusion_flag_layout(tp_size)
+    )
+    if flag_size != expected_flag_size:
+        raise ValueError(
+            "TRT-LLM all-reduce flag layout mismatch: "
+            f"tp_size={tp_size}, expected={expected_flag_size}, got={flag_size}"
+        )
+    flag_ptr = ipc_handles[1][tp_rank]
+    cudart.cudaMemset(c_void_p(flag_ptr), 0, legacy_flag_size)
+    if cake_tail_size:
+        trtllm_lamport_initialize(
+            flag_ptr + legacy_flag_size,
+            cake_tail_size // CAKE_ACK_SENTINEL_BYTES,
+            torch.float16,
+        )
 
     lamport_dtype = torch.float32 if use_fp32_lamport else torch.float16
     aligned_size = round_up(lamport_buffer_size, 16)
@@ -641,7 +667,8 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     [buffer_size, flag_size, lamport_buffer_size * 3]
     where:
     - buffer_size: tp_size * max_token_num * hidden_dim * sizeof(half)
-    - flag_size: tp_size * BarrierFlagCount * sizeof(int)
+    - flag_size: tp_size * BarrierFlagCount * sizeof(int), plus a 192-byte
+      generation-aware Cake consumer-ack tail when tp_size == 4
     - lamport_buffer_size: tp_size * max_token_num * tp_size * hidden_dim * sizeof(half)
       where sizeof(elem) = 2 (fp16/bf16) or 4 (fp32 when use_fp32_lamport=True)
     The workspace is passed as workspace field in AllReduceFusionParams.
@@ -659,7 +686,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         raise ValueError("use_symm_dev_mem is only supported when create_metadata=True")
 
     buffer_size = tp_size * max_token_num * hidden_dim * 2
-    flag_size = tp_size * BarrierFlagCount * 4
+    legacy_flag_size, cake_tail_size, flag_size = _allreduce_fusion_flag_layout(
+        tp_size
+    )
     # lamport_comm_size = tp_size * max(max_token_num, OneShotMaxToken) * hidden_dim * 2
     # enable larger workspace for cases > OneShotMaxToken
     lamport_comm_size = (
@@ -730,7 +759,16 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     _symm_workspace_refs[id(ipc_handles)] = symm_refs
 
     if use_symm_dev_mem:
-        cudart.cudaMemset(c_void_p(ipc_handles[1][tp_rank]), 0, flag_size)
+        cudart.cudaMemset(
+            c_void_p(ipc_handles[1][tp_rank]), 0, legacy_flag_size
+        )
+
+    if cake_tail_size:
+        trtllm_lamport_initialize(
+            ipc_handles[1][tp_rank] + legacy_flag_size,
+            cake_tail_size // CAKE_ACK_SENTINEL_BYTES,
+            torch.float16,
+        )
 
     # Initialize lamport buffer
     aligned_lamport_buffer_size = round_up(lamport_buffer_size, 16)
@@ -781,8 +819,9 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
         workspace, dtype=torch.int64, device=torch.device("cuda")
     )
 
-    if use_symm_dev_mem:
+    if use_symm_dev_mem or cake_tail_size:
         torch.cuda.synchronize()
+    if use_symm_dev_mem:
         comm_backend.barrier()  # must sync after create_workspace
     else:
         dist.barrier(group=group)
@@ -796,6 +835,8 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
             "use_fp32_lamport": use_fp32_lamport,
             "buffer_size": buffer_size,
             "flag_size": flag_size,
+            "legacy_flag_size": legacy_flag_size,
+            "cake_tail_size": cake_tail_size,
             "lamport_comm_size": lamport_comm_size,
             "lamport_buffer_size": lamport_buffer_size,
         }
@@ -1002,7 +1043,13 @@ def check_trtllm_allreduce_fusion_workspace_metadata(
     metadata: dict,
 ) -> None:
     errors = []
-    required_keys = ["max_token_num", "tp_size", "hidden_dim", "use_fp32_lamport"]
+    required_keys = [
+        "max_token_num",
+        "tp_size",
+        "hidden_dim",
+        "use_fp32_lamport",
+        "flag_size",
+    ]
     for key in required_keys:
         if key not in metadata:
             errors.append(f"Workspace metadata is missing required key: {key}")
@@ -1017,6 +1064,13 @@ def check_trtllm_allreduce_fusion_workspace_metadata(
         errors.append(
             f"world_size ({world_size}) does not match workspace tp_size ({metadata['tp_size']}). "
             f"Workspace was created for tp_size={metadata['tp_size']}."
+        )
+
+    expected_flag_size = _allreduce_fusion_flag_layout(metadata["tp_size"])[2]
+    if metadata["flag_size"] != expected_flag_size:
+        errors.append(
+            f"flag_size ({metadata['flag_size']}) does not match workspace "
+            f"layout size ({expected_flag_size}) for tp_size={metadata['tp_size']}."
         )
 
     # token_num * hidden_dim must not exceed max_token_num * hidden_dim
@@ -1093,7 +1147,8 @@ def trtllm_allreduce_fusion(
     - layout_code: the layout code.
     - metadata: optional workspace metadata dict from create_ipc_workspace_for_all_reduce_fusion.
                 If provided, validates that token_num <= max_token_num, world_size == tp_size,
-                and hidden_dim == workspace hidden_dim. Raises ValueError if validation fails.
+                hidden_dim == workspace hidden_dim, and flag_size matches the exact
+                world-size protocol layout. Raises ValueError if validation fails.
     - block_quant_group_size: group size (in elements along hidden_dim) for per-token-group
                               block-wise FP8 quantization patterns
                               (e.g. ``kPerTokenGroupFP8Packed`` / DeepSeek-style FP8 with
