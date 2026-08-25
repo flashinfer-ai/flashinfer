@@ -156,6 +156,21 @@ def _select_expert_weights(
     return routed_expert_weights
 
 
+def _torch_views_of_ffi_tensors(tensors: Any) -> list[torch.Tensor]:
+    """Return zero-copy Torch views for tensors nested in a TVM-FFI container.
+
+    TVM-FFI 0.1.11+ recursively converts container elements to framework tensors.
+    Preserve those objects instead of exporting DLPack again: a cached raw DLPack
+    capsule is one-shot and cannot safely be consumed by repeated runner calls.
+    """
+    return [
+        tensor
+        if isinstance(tensor, torch.Tensor)
+        else torch.from_dlpack(tensor)
+        for tensor in tensors
+    ]
+
+
 def _gemm1_oa_flags_from_kwargs(kwargs: dict) -> dict[str, bool]:
     return {
         "has_gemm1_alpha": kwargs.get("gemm1_alpha") is not None,
@@ -635,7 +650,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             total_num_padded_tokens,
             gemm1_output,
             gemm2_output,
-        ) = [torch.from_dlpack(t) for t in routing_out]
+        ) = _torch_views_of_ffi_tensors(routing_out)
         expert_weights = _select_expert_weights(moe_inputs, expert_weights)
         routed_token_capacity = _routed_token_capacity(
             self,
@@ -928,7 +943,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             gemm1_output,
             gemm1_output_scale,
             gemm2_output,
-        ) = [torch.from_dlpack(t) for t in routing_out]
+        ) = _torch_views_of_ffi_tensors(routing_out)
         expert_weights = _select_expert_weights(moe_inputs, expert_weights)
         if (
             moe_inputs.routing_logits is not None
@@ -1225,7 +1240,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                     gemm1_output,
                     gemm1_output_scale,
                     gemm2_output,
-                ) = [torch.from_dlpack(t) for t in routing_out]
+                ) = _torch_views_of_ffi_tensors(routing_out)
 
                 fc1_cfg = pair.fc1.cfg.build()
                 fc2_cfg = pair.fc2.cfg.build()
@@ -1378,7 +1393,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             gemm1_output,
             gemm1_output_scale,
             gemm2_output,
-        ) = [torch.from_dlpack(t) for t in routing_out]
+        ) = _torch_views_of_ffi_tensors(routing_out)
         expert_weights = _select_expert_weights(moe_inputs, expert_weights)
         routed_token_capacity = _routed_token_capacity(
             self,
@@ -1628,7 +1643,7 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             total_num_padded_tokens,
             gemm1_output,
             gemm2_output,
-        ) = [torch.from_dlpack(t) for t in routing_out]
+        ) = _torch_views_of_ffi_tensors(routing_out)
         expert_weights = _select_expert_weights(moe_inputs, expert_weights)
         routed_token_capacity = _routed_token_capacity(
             self,
@@ -1938,7 +1953,7 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             total_num_padded_tokens,
             gemm1_output,
             gemm2_output,
-        ) = [torch.from_dlpack(t) for t in routing_out]
+        ) = _torch_views_of_ffi_tensors(routing_out)
         expert_weights = _select_expert_weights(moe_inputs, expert_weights)
         routed_token_capacity = _routed_token_capacity(
             self,
@@ -2232,7 +2247,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             activation_output,
             activation_output_scale,
             gemm2_output,
-        ) = [torch.from_dlpack(t) for t in routing_out]
+        ) = _torch_views_of_ffi_tensors(routing_out)
         expert_weights = _select_expert_weights(moe_inputs, expert_weights)
         routed_token_capacity = _routed_token_capacity(
             self,
