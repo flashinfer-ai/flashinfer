@@ -35,6 +35,8 @@ import torch
 from torch import Tensor
 
 from ..tllm_enums import (
+    DEFAULT_SITU_BETA,
+    DEFAULT_SITU_LINEAR_BETA,
     DEFAULT_SWIGLU_ALPHA,
     DEFAULT_SWIGLU_BETA,
     DEFAULT_SWIGLU_LIMIT,
@@ -209,13 +211,20 @@ class SiTU(ActivationConfig):
     ``linear_scale`` is the linear-branch soft-clamp scale, applied as
     ``linear_scale * tanh(linear / linear_scale)``. ``None`` selects the
     unclamped linear branch, which only the CuTe-DSL backend can express; the
-    TRT-LLM ABI has no encoding for it and its runners reject ``None``. The
-    default stays ``1.0`` so cross-backend parity is unchanged.
+    TRT-LLM ABI has no encoding for it and its runners reject ``None``.
+
+    The defaults are the canonical SiTU (Kimi-K3) scales, which are also the
+    compile-time defaults of the CUTLASS ``SituAdaptor``. They are *not* what
+    every backend falls back to when no per-expert tensor is supplied: the
+    TRT-LLM path reuses the SwiGLU alpha/beta channels, whose null default is
+    ``1.0``/``1.0`` for SiTU. Runners on that path must therefore materialize
+    the scalars even at the default, which is why
+    ``_validate_prepared_activation_params`` requires them unconditionally.
     """
 
     type: ClassVar[ActivationType] = ActivationType.Situ
-    gate_scale: float = 1.0
-    linear_scale: Optional[float] = 1.0
+    gate_scale: float = DEFAULT_SITU_BETA
+    linear_scale: Optional[float] = DEFAULT_SITU_LINEAR_BETA
     clamp_limit: Optional[float] = None
 
     def __post_init__(self) -> None:

@@ -24,7 +24,7 @@ fragile backend-specific kernel-launch code lives in exactly one place.
 from __future__ import annotations
 
 import functools
-from typing import Any, ClassVar, List
+from typing import Any, ClassVar, List, Optional
 
 import torch
 
@@ -254,7 +254,7 @@ def _cute_dsl_activation_kwargs(activation: ActivationConfig) -> dict[str, Any]:
 
 
 def _validate_prepared_activation_params(
-    view: dict[str, torch.Tensor],
+    view: dict[str, Optional[torch.Tensor]],
     activation: ActivationConfig,
     runner: str,
 ) -> None:
@@ -278,6 +278,13 @@ def _validate_prepared_activation_params(
         if activation.limit != default.limit:
             required += ("gemm1_clamp_limit",)
     elif isinstance(activation, SiTU):
+        # Unconditional, unlike SwiGLU above: this path reuses the SwiGLU
+        # alpha/beta channels, whose null default is 1.0/1.0 for SiTU (see
+        # situ_activation_reference), not the typed default. Omitting the
+        # tensors at the default would silently run 1.0/1.0 instead of the
+        # canonical scales. Note gemm1_beta here is SiTU's multiplicative
+        # linear-branch tanh scale, not SwiGLU's additive beta.
+        #
         # linear_scale=None is the unclamped linear branch, which has no
         # per-expert tensor encoding; runners reaching here must have rejected it.
         required = ("gemm1_alpha",)
@@ -348,7 +355,27 @@ def _cutlass_activation_params(
         "swiglu_alpha": None,
         "swiglu_beta": None,
         "swiglu_limit": None,
+        "situ_beta": None,
+        "situ_linear_beta": None,
     }
+    if isinstance(activation, SiTU):
+        # SituAdaptor's compile-time defaults are the typed defaults, so the
+        # default needs no tensor. This is the opposite of the TRT-LLM path,
+        # whose null default is 1.0/1.0 rather than the canonical scales.
+        if activation != SiTU():
+            params["situ_beta"] = torch.full(
+                (num_experts,),
+                activation.gate_scale,
+                dtype=torch.float32,
+                device=device,
+            )
+            params["situ_linear_beta"] = torch.full(
+                (num_experts,),
+                activation.linear_scale,
+                dtype=torch.float32,
+                device=device,
+            )
+        return params
     if isinstance(activation, SwiGLU) and activation != SwiGLU():
         params = {
             "swiglu_alpha": torch.full(
@@ -598,6 +625,21 @@ class _CutlassRunnerBase(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} requires do_finalize=True."
             )
+        activation = self.config.activation
+        if isinstance(activation, SiTU):
+            # The CUTLASS SiTU ABI carries situ_beta and situ_linear_beta only:
+            # there is no unclamped-linear encoding and no clamp channel.
+            if activation.linear_scale is None:
+                raise NotImplementedError(
+                    f"{type(self).__name__} cannot express "
+                    "SiTU(linear_scale=None); the CUTLASS ABI has no unclamped "
+                    "linear-branch encoding."
+                )
+            if activation.clamp_limit is not None:
+                raise NotImplementedError(
+                    f"{type(self).__name__} cannot express a SiTU clamp_limit; "
+                    "the CUTLASS ABI exposes no clamp channel."
+                )
         if self._device_arch not in self._supported_archs:
             raise RuntimeError(
                 f"{type(self).__name__} does not support "
@@ -1127,7 +1169,7 @@ class CutlassBf16Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_bf16"
     supported_quant_variants = (QuantVariant.BF16,)
-    supported_activation_classes = (SwiGLU, SwiGLUStep, GeGLUTanh, ReLU2)
+    supported_activation_classes = (SwiGLU, SwiGLUStep, GeGLUTanh, ReLU2, SiTU)
     _supported_archs = _CUTLASS_BF16_ARCHS
     _weight_dtype = torch.bfloat16
     _use_w4_group_scaling = False
@@ -1159,7 +1201,7 @@ class CutlassW4A16Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_w4a16"
     supported_quant_variants = (QuantVariant.W4A16,)
-    supported_activation_classes = (SwiGLU, SwiGLUStep, GeGLUTanh, ReLU2)
+    supported_activation_classes = (SwiGLU, SwiGLUStep, GeGLUTanh, ReLU2, SiTU)
     _supported_archs = _CUTLASS_W4A16_ARCHS
     _weight_dtype = torch.uint8
     _use_w4_group_scaling = True

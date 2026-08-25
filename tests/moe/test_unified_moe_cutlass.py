@@ -41,6 +41,7 @@ from flashinfer.fused_moe import (
     ReLU2,
     RoutingConfig,
     RoutingInputMode,
+    SiTU,
     SwiGLU,
     SwiGLUStep,
 )
@@ -531,6 +532,51 @@ def test_cutlass_integer_scalars_materialize_float32():
         SwiGLU(alpha=2, beta=1, limit=7), 4, torch.device("cpu")
     )
     assert all(t is not None and t.dtype is torch.float32 for t in params.values())
+
+
+def test_cutlass_situ_materializes_only_non_default_scalars():
+    """SituAdaptor's compile-time defaults are the typed defaults.
+
+    So the default needs no tensor, while any other value must be materialized.
+    This is the opposite of the TRTLLM path, whose null default is 1.0/1.0
+    rather than the canonical scales, and where the tensors are therefore
+    required even at the default.
+    """
+    from flashinfer.fused_moe.runners import (
+        _cutlass_activation_params,
+        _cutlass_activation_required_keys,
+    )
+
+    default = _cutlass_activation_params(SiTU(), 4, torch.device("cpu"))
+    assert default["situ_beta"] is None
+    assert default["situ_linear_beta"] is None
+    assert _cutlass_activation_required_keys(SiTU()) == frozenset()
+
+    tuned = SiTU(gate_scale=2.0, linear_scale=10.0)
+    params = _cutlass_activation_params(tuned, 4, torch.device("cpu"))
+    torch.testing.assert_close(params["situ_beta"], torch.full((4,), 2.0))
+    torch.testing.assert_close(params["situ_linear_beta"], torch.full((4,), 10.0))
+    # Distinct key sets are what keeps the two apart in the autotune cache.
+    assert _cutlass_activation_required_keys(tuned) == frozenset(
+        ("situ_beta", "situ_linear_beta")
+    )
+
+
+@pytest.mark.parametrize(
+    ("activation", "match"),
+    (
+        (SiTU(linear_scale=None), "unclamped"),
+        (SiTU(clamp_limit=4.0), "clamp channel"),
+    ),
+)
+def test_cutlass_rejects_situ_shapes_its_abi_cannot_express(activation, match):
+    """The CUTLASS SiTU ABI carries situ_beta and situ_linear_beta only."""
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config(activation=activation)
+    runner.device = torch.device("cpu")
+    runner._device_arch = 100
+    with pytest.raises(NotImplementedError, match=match):
+        runner.check_support()
 
 
 def test_cutlass_activation_params_derived_when_build_did_not_cache_them():

@@ -84,6 +84,7 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.fused_moe.runners import MoERunner
 from flashinfer.fused_moe.core import _fake_trtllm_moe_output
+from flashinfer.tllm_enums import DEFAULT_SITU_BETA, DEFAULT_SITU_LINEAR_BETA
 from flashinfer.utils import get_compute_capability
 
 
@@ -623,7 +624,7 @@ class TestTypedActivationConfig:
         # linear_scale=None reaches the CuTe-DSL ABI as "no linear-branch clamp".
         assert _cute_dsl_activation_kwargs(SiTU(linear_scale=None)) == {
             "activation_type": int(ActivationType.Swiglu),
-            "situ_beta": 1.0,
+            "situ_beta": DEFAULT_SITU_BETA,
             "situ_linear_beta": None,
         }
 
@@ -634,8 +635,8 @@ class TestTypedActivationConfig:
         assert activation == SiTU(linear_scale=None)
         assert hash(activation) == hash(SiTU(linear_scale=None))
         assert activation != SiTU()
-        # Default remains the clamped 1.0 parity value.
-        assert SiTU().linear_scale == 1.0
+        # The default stays the clamped canonical scale.
+        assert SiTU().linear_scale == DEFAULT_SITU_LINEAR_BETA
 
     def test_situ_unclamped_linear_branch_has_no_per_expert_tensor(self):
         from flashinfer.fused_moe.prepare import _activation_param_view
@@ -755,7 +756,11 @@ class TestTypedActivationConfig:
         assert activation.alpha == 1.0
         assert activation.beta == 0.0
         assert activation.limit == torch.finfo(torch.float32).max
-        assert SiTU() == SiTU(gate_scale=1.0, linear_scale=1.0)
+        # The canonical SiTU (Kimi-K3) scales, matching the CUTLASS
+        # SituAdaptor compile-time defaults.
+        assert SiTU() == SiTU(
+            gate_scale=DEFAULT_SITU_BETA, linear_scale=DEFAULT_SITU_LINEAR_BETA
+        )
         assert SwiGLUStep().limit == 7.0
 
 
@@ -970,7 +975,7 @@ class TestMoERunnerSupport:
                 )
 
     def test_declarative_activation_capabilities(self):
-        cutlass = (SwiGLU, SwiGLUStep, GeGLUTanh, ReLU2)
+        cutlass = (SwiGLU, SwiGLUStep, GeGLUTanh, ReLU2, SiTU)
         assert CutlassBf16Runner.supported_activation_classes == cutlass
         assert CutlassW4A16Runner.supported_activation_classes == cutlass
         assert CuteDslNvfp4Runner.supported_activation_classes == (
@@ -2407,6 +2412,40 @@ _PACKING_SPECS = (
         make_hidden=_bf16_dummy_hidden,
     ),
 )
+
+
+@sm100_required
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    (
+        (lambda t: t.to(torch.float16), "must be float32"),
+        (lambda t: t[:1], "shape"),
+        (lambda t: t.cpu(), "expected"),
+    ),
+    ids=("dtype", "shape", "device"),
+)
+def test_bf16_runner_rejects_malformed_activation_override(mutation, match):
+    """The BF16 runner must run the override boundary check, not just presence.
+
+    _validate_prepared_activation_params only checks that the required scalars
+    exist; without _validate_optional_gemm1_activation_params a malformed one
+    reaches the FFI boundary and surfaces as a bare TVM-FFI ICHECK naming
+    neither the runner nor the key. Exercising it through pack_inputs (rather
+    than calling the helper directly) is what pins the wiring: passing the
+    wrong expert-count attribute here would leave the helper's own tests green.
+    """
+    act_pack, weight_pack, config, _ = _make_bf16_packs_and_config(
+        8, hidden_size=128, intermediate_size=256, num_experts=4, top_k=2
+    )
+    view = weight_pack.get_view("trtllm_bf16_routed")
+    view["gemm1_alpha"] = mutation(
+        torch.ones(4, dtype=torch.float32, device=act_pack.hidden_states_q.device)
+    )
+
+    layer = MoELayer(config)
+    runner = layer.runners[0]
+    with pytest.raises((ValueError, TypeError), match=match):
+        runner.pack_inputs(act_pack, weight_pack)
 
 
 @sm100_required

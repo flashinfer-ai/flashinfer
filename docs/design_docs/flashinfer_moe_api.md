@@ -727,14 +727,21 @@ The truthful unified support matrix follows the already executable flat path:
 | TRTLLM NVFP4 / MXFP4 | SwiGLU (typed scalars), GeGLU, SiTU, ReLU2 |
 | TRTLLM W4A16 | SwiGLU |
 | TRTLLM MxInt4 | SwiGLU (typed scalars) |
-| CUTLASS BF16 / W4A16 | SwiGLU (typed scalars), SwiGLUStep, GeGLUTanh, ReLU2 |
+| CUTLASS BF16 / W4A16 | SwiGLU (typed scalars), SwiGLUStep, GeGLUTanh, ReLU2, SiTU (typed scalars) |
 | CuTe-DSL NVFP4 / W4A16 | SwiGLU (typed scalars), GeGLUTanh, ReLU2, SiTU (typed scalars) |
 | b12x NVFP4 | SwiGLU (default scalars), GeGLUTanh, ReLU2 |
 | b12x W4A16 | SwiGLU (default scalars), ReLU2 |
 
 CuTe-DSL SiTU uses its existing scalar ABI (`situ_beta` and
 `situ_linear_beta`); its flat kernel does not expose a separate SiTU
-`clamp_limit`, so that non-default field is rejected. b12x W4A16 keeps its
+`clamp_limit`, so that non-default field is rejected. CUTLASS SiTU uses the
+same two native keys and likewise has no clamp channel or unclamped-linear
+encoding, so `clamp_limit` and `linear_scale=None` are rejected there too.
+`SiTU()` defaults to the canonical Kimi-K3 scales, which are the CUTLASS
+`SituAdaptor` compile-time defaults, so CUTLASS materializes per-expert
+tensors only for a non-default value. The TRT-LLM path cannot do the same: it
+reuses the SwiGLU alpha/beta channels, whose null default is `1.0`/`1.0` for
+SiTU, so its runners require the tensors even at the default. b12x W4A16 keeps its
 flat-proven SwiGLU/ReLU2 subset. Weight preparation computes GEMM1 rows from
 `activation.is_gated` (`2I` gated, `I` non-gated) and passes that fact into
 TRTLLM row permutations.
