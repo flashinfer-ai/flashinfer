@@ -51,12 +51,47 @@ _FLASH_KDA_SMALL_BH_PACKET_ROWS = 123
 _FLASH_KDA_SMALL_BH_PACKET_ELEMENTS = 128
 _FLASH_KDA_SMALL_BH_MAX_TASKS = 8
 _FLASH_KDA_SMALL_BH_MIN_SEQUENCE_LENGTH = 2048
+_FLASH_KDA_BT16_CHUNK = 16
+_FLASH_KDA_BT16_VALUE_SPLITS = 2
+_FLASH_KDA_BT16_GENERAL_LOW_WORK_CHUNKS_PER_PREP_CTA = 6
+_FLASH_KDA_BT16_GENERAL_HIGH_WORK_CHUNKS_PER_PREP_CTA = 8
+_FLASH_KDA_BT16_GENERAL_HIGH_WORK_MIN_CHUNK_HEADS = 16_384
+_FLASH_KDA_BT16_H12_CHUNKS_PER_PREP_CTA = 4
+_FLASH_KDA_BT16_H12_CPC1_MAX_TOTAL_CHUNKS = 128
+_FLASH_KDA_BT16_PREP_WAVE_QUANT_MIN_WAVES = 8
+_FLASH_KDA_BT16_PREP_WAVE_QUANT_MIN_RETAINED_PERCENT = 98
+_FLASH_KDA_BT16_DENSE_PREP_WAVES = 5
+_FLASH_KDA_BT16_DENSE_MIN_HEADS = 60
+_FLASH_KDA_BT16_DENSE_MAX_HEADS = 64
+_FLASH_KDA_BT16_DENSE_MIN_SEQUENCE_LENGTH = 4096
+_FLASH_KDA_BT16_N16_ONE_CHAIN_WAVE_MIN_SEQUENCE_LENGTH = 512
+_FLASH_KDA_BT16_N16_TWO_CHAIN_WAVE_MIN_SEQUENCE_LENGTH = 3072
+_FLASH_KDA_BT16_N16_MULTI_WAVE_MIN_SEQUENCE_LENGTH = 512
+_FLASH_KDA_BT16_N16_MAX_DIRECT_WAVES = 3
+_FLASH_KDA_BT16_MID_MIN_SEQUENCE_LENGTH = 4096
+_FLASH_KDA_BT16_LONG_MIN_SEQUENCE_LENGTH = 65_536
+_FLASH_KDA_BT16_MID_MAX_TASKS = 32
+_FLASH_KDA_H12_DIRECT_N32_MIN_SEQUENCE_LENGTH = 64
+_FLASH_KDA_H12_DIRECT_N32_MAX_SEQUENCE_LENGTH = 256
+_FLASH_KDA_H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQUENCE_LENGTH = 128
+_FLASH_KDA_ROUTE_DIRECT_M128 = "direct_m128"
+_FLASH_KDA_ROUTE_DIRECT_M128_N16 = "direct_m128_n16"
+_FLASH_KDA_ROUTE_PERSISTENT_M128 = "persistent_m128"
+_FLASH_KDA_ROUTE_M64 = "independent_dvsplit_m64"
+_FLASH_KDA_ROUTE_SMALL_BH_M128 = "small_bh_owner_helper_m128"
+_FLASH_KDA_ROUTE_BT16_M64 = "bt16_prepare_chain_m64"
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
 
 _PackedMetadataSignature = tuple[int, int, int, int, bool]
 _PersistentTaskPlan = tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
-_PackedTaskMetadata = tuple[tuple[int, ...], Optional[_PersistentTaskPlan], bool]
+_PackedTaskMetadata = tuple[
+    tuple[int, ...],
+    Optional[_PersistentTaskPlan],
+    bool,
+    tuple[int, ...],
+    tuple[int, ...],
+]
 
 
 class _RecurrentKDAPrefillWorkspaceBase:
@@ -74,12 +109,21 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._small_bh_packet_ready: Optional[torch.Tensor] = None
         self._small_bh_packet_consumed: Optional[torch.Tensor] = None
         self._small_bh_helper_done: Optional[torch.Tensor] = None
+        self._bt16_cu_chunks: Optional[torch.Tensor] = None
+        self._bt16_chunk_to_seq: Optional[torch.Tensor] = None
+        self._bt16_qd: Optional[torch.Tensor] = None
+        self._bt16_kd: Optional[torch.Tensor] = None
+        self._bt16_w: Optional[torch.Tensor] = None
+        self._bt16_qk: Optional[torch.Tensor] = None
+        self._bt16_diag: Optional[torch.Tensor] = None
+        self._bt16_metadata_signature: Optional[tuple] = None
         self._cute_dsl_workspace: Optional[torch.Tensor] = None
         self._descriptor_storages = {
             variant: torch.empty(
                 (
                     _FLASH_KDA_SEVEN_DESCRIPTOR_STORAGE_BYTES
                     if variant in ("m128_n16_checkpoint", "small_bh_m128")
+                    or variant.startswith("bt16_")
                     else _FLASH_KDA_DESCRIPTOR_STORAGE_BYTES
                 ),
                 dtype=torch.uint8,
@@ -88,10 +132,19 @@ class _RecurrentKDAPrefillWorkspaceBase:
             for variant in (
                 "m64",
                 "m128",
+                "m128_tensor_state_decay",
+                "m128_h12_short",
+                "m128_h12_long",
                 "m128_n16",
                 "m128_n16_checkpoint",
+                "m128_n16_short",
                 "persistent_m128",
                 "small_bh_m128",
+                "bt16_prepare",
+                "bt16_prepare_beta_tma",
+                "bt16_chain_m64_s7",
+                "bt16_chain_m64_s8",
+                "bt16_chain_m64_s9",
             )
         }
         self._descriptor_signatures: dict[str, tuple] = {}
@@ -127,10 +180,11 @@ class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):
     workspace owns optional final-state scratch, backend metadata, TMA
     descriptors, and schedule-specific scratch for the lifetime of the graph.
     On SM100-family devices this includes beta padding, M64/M128-N32/M128-N16
-    descriptor storage and small-BH packet-ring storage. Persistent M128 is an
-    eager-only B200/GB200 route; explicit workspaces use direct M128 or M64 so
-    graph capture never synchronizes sequence lengths to construct host task
-    bins.
+    descriptor storage, small-BH packet-ring storage, and BT16 prepare/chain
+    metadata, factors, and independent descriptor storage. Persistent M128 is
+    an eager-only B200/GB200 route; explicit workspaces use non-persistent
+    direct, M64, small-BH, or eligible BT16 schedules so graph capture never
+    synchronizes sequence lengths to construct host task bins.
 
     A workspace binds to its first stream. Once it participates in capture it
     cannot be passed to Python again, either eagerly or in another capture.
@@ -426,7 +480,6 @@ def _should_use_small_bh_owner_helper(
     *,
     compute_capability: tuple[int, int],
     sm_count: int,
-    fixed_layout: bool,
     num_sequences: int,
     num_heads: int,
     sequence_length: int,
@@ -436,7 +489,6 @@ def _should_use_small_bh_owner_helper(
     total_tasks = num_sequences * num_heads
     return (
         compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
-        and fixed_layout
         and 0 < total_tasks <= _FLASH_KDA_SMALL_BH_MAX_TASKS
         and num_heads <= _FLASH_KDA_SMALL_BH_MAX_TASKS
         and sequence_length >= _FLASH_KDA_SMALL_BH_MIN_SEQUENCE_LENGTH
@@ -444,15 +496,259 @@ def _should_use_small_bh_owner_helper(
     )
 
 
+def _bt16_chunks_per_prepare_cta(*, num_heads: int, total_chunks: int) -> int:
+    if num_heads == 12:
+        if total_chunks <= _FLASH_KDA_BT16_H12_CPC1_MAX_TOTAL_CHUNKS:
+            return 1
+        return _FLASH_KDA_BT16_H12_CHUNKS_PER_PREP_CTA
+    if num_heads * total_chunks >= _FLASH_KDA_BT16_GENERAL_HIGH_WORK_MIN_CHUNK_HEADS:
+        return _FLASH_KDA_BT16_GENERAL_HIGH_WORK_CHUNKS_PER_PREP_CTA
+    return _FLASH_KDA_BT16_GENERAL_LOW_WORK_CHUNKS_PER_PREP_CTA
+
+
+def _wave_quantized_bt16_prepare_ctas(
+    *, rectangular_ctas: int, num_heads: int, sm_count: int
+) -> int:
+    if rectangular_ctas < _FLASH_KDA_BT16_PREP_WAVE_QUANT_MIN_WAVES * sm_count:
+        return rectangular_ctas
+    full_wave_ctas = (rectangular_ctas // sm_count) * sm_count
+    if (
+        full_wave_ctas < num_heads
+        or full_wave_ctas * 100
+        < rectangular_ctas * _FLASH_KDA_BT16_PREP_WAVE_QUANT_MIN_RETAINED_PERCENT
+    ):
+        return rectangular_ctas
+    return full_wave_ctas
+
+
+def _should_use_bt16_dense_wavefront(
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+    fixed_layout: bool,
+    num_sequences: int,
+    num_heads: int,
+    max_sequence_length: int,
+) -> bool:
+    return (
+        compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
+        and fixed_layout
+        and num_sequences == 1
+        and _FLASH_KDA_BT16_DENSE_MIN_HEADS
+        <= num_heads
+        <= _FLASH_KDA_BT16_DENSE_MAX_HEADS
+        and max_sequence_length >= _FLASH_KDA_BT16_DENSE_MIN_SEQUENCE_LENGTH
+        and _FLASH_KDA_BT16_VALUE_SPLITS * num_heads <= sm_count
+    )
+
+
+def _should_use_bt16_prepare_chain(
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+    num_sequences: int,
+    num_heads: int,
+    max_sequence_length: int,
+    n16_alternative: bool = False,
+) -> bool:
+    total_tasks = num_sequences * num_heads
+    if n16_alternative:
+        chain_waves = (
+            _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks + sm_count - 1
+        ) // sm_count
+        if chain_waves <= 1:
+            min_sequence_length = _FLASH_KDA_BT16_N16_ONE_CHAIN_WAVE_MIN_SEQUENCE_LENGTH
+        elif chain_waves == 2:
+            min_sequence_length = _FLASH_KDA_BT16_N16_TWO_CHAIN_WAVE_MIN_SEQUENCE_LENGTH
+        else:
+            min_sequence_length = _FLASH_KDA_BT16_N16_MULTI_WAVE_MIN_SEQUENCE_LENGTH
+        max_tasks = _FLASH_KDA_BT16_N16_MAX_DIRECT_WAVES * sm_count
+    elif total_tasks <= _FLASH_KDA_SMALL_BH_MAX_TASKS:
+        min_sequence_length = _FLASH_KDA_BT16_LONG_MIN_SEQUENCE_LENGTH
+        max_tasks = _FLASH_KDA_SMALL_BH_MAX_TASKS
+    else:
+        min_sequence_length = _FLASH_KDA_BT16_MID_MIN_SEQUENCE_LENGTH
+        max_tasks = _FLASH_KDA_BT16_MID_MAX_TASKS
+    return (
+        compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
+        and 0 < total_tasks <= max_tasks
+        and max_sequence_length >= min_sequence_length
+        and (n16_alternative or _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks <= sm_count)
+    )
+
+
+def _direct_m128_route(*, num_heads: int, max_sequence_length: int = 0) -> str:
+    return (
+        _FLASH_KDA_ROUTE_DIRECT_M128_N16
+        if num_heads == 12 or 0 < max_sequence_length <= _FLASH_KDA_BT16_CHUNK
+        else _FLASH_KDA_ROUTE_DIRECT_M128
+    )
+
+
+def _should_use_n32_tensor_state_decay(
+    *,
+    compute_capability: tuple[int, int],
+    route: str,
+    uniform_sequences: bool,
+    num_heads: int,
+    total_tasks: int,
+    max_sequence_length: int,
+) -> bool:
+    """Select the measured full-tile tensor-core state-decay schedule."""
+
+    return (
+        compute_capability == (10, 3)
+        and route == _FLASH_KDA_ROUTE_DIRECT_M128
+        and uniform_sequences
+        and num_heads >= 64
+        and total_tasks >= 96
+        and max_sequence_length >= 256
+        and max_sequence_length % 32 == 0
+    )
+
+
+def _select_flash_kda_bf16_route(
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+    fixed_layout: bool,
+    num_sequences: int,
+    num_heads: int,
+    uniform_sequences: bool,
+    max_sequence_length: int,
+) -> str:
+    """Mirror the measured Cake route policy for the frozen BF16 portfolio."""
+
+    direct_route = _direct_m128_route(
+        num_heads=num_heads, max_sequence_length=max_sequence_length
+    )
+    if _should_use_bt16_dense_wavefront(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        max_sequence_length=max_sequence_length,
+    ):
+        return _FLASH_KDA_ROUTE_BT16_M64
+    if direct_route == _FLASH_KDA_ROUTE_DIRECT_M128_N16:
+        if (
+            compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
+            and _FLASH_KDA_H12_DIRECT_N32_MIN_SEQUENCE_LENGTH
+            <= max_sequence_length
+            <= _FLASH_KDA_H12_DIRECT_N32_MAX_SEQUENCE_LENGTH
+        ):
+            return _FLASH_KDA_ROUTE_DIRECT_M128
+        total_tasks = num_sequences * num_heads
+        direct_waves = (total_tasks + sm_count - 1) // sm_count
+        chain_waves = (
+            _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks + sm_count - 1
+        ) // sm_count
+        if (
+            compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
+            and uniform_sequences
+            and max_sequence_length > _FLASH_KDA_H12_DIRECT_N32_MAX_SEQUENCE_LENGTH
+            and chain_waves > direct_waves
+        ):
+            return _FLASH_KDA_ROUTE_DIRECT_M128
+        if total_tasks > 2 * sm_count and max_sequence_length >= 512:
+            return _FLASH_KDA_ROUTE_DIRECT_M128
+        if _should_use_bt16_prepare_chain(
+            compute_capability=compute_capability,
+            sm_count=sm_count,
+            num_sequences=num_sequences,
+            num_heads=num_heads,
+            max_sequence_length=max_sequence_length,
+            n16_alternative=True,
+        ):
+            return _FLASH_KDA_ROUTE_BT16_M64
+        return direct_route
+    if _should_use_bt16_prepare_chain(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        max_sequence_length=max_sequence_length,
+    ):
+        return _FLASH_KDA_ROUTE_BT16_M64
+    if _should_use_small_bh_owner_helper(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        sequence_length=max_sequence_length,
+    ):
+        return _FLASH_KDA_ROUTE_SMALL_BH_M128
+    if _requires_exact_n16_recurrence(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        uniform_sequences=uniform_sequences,
+    ):
+        return _FLASH_KDA_ROUTE_DIRECT_M128_N16
+    if (
+        fixed_layout
+        and num_sequences == 1
+        and num_heads == 64
+        and max_sequence_length >= 512
+        and 2 * num_heads <= sm_count
+    ):
+        return _FLASH_KDA_ROUTE_M64
+    return direct_route
+
+
+def _select_bt16_physical_variants(
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+    fixed_layout: bool,
+    num_sequences: int,
+    num_heads: int,
+    max_sequence_length: int,
+) -> tuple["FlashKDAVariant", "FlashKDAVariant", bool]:
+    dense_wavefront = _should_use_bt16_dense_wavefront(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        max_sequence_length=max_sequence_length,
+    )
+    prepare_variant: Literal["bt16_prepare", "bt16_prepare_beta_tma"] = (
+        "bt16_prepare_beta_tma"
+        if dense_wavefront and num_heads % _FLASH_KDA_BETA_TMA_HEADS_PER_BOX == 0
+        else "bt16_prepare"
+    )
+    total_tasks = num_sequences * num_heads
+    chain_variant: Literal[
+        "bt16_chain_m64_s7",
+        "bt16_chain_m64_s8",
+        "bt16_chain_m64_s9",
+    ]
+    if _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks > sm_count:
+        chain_variant = "bt16_chain_m64_s7"
+    elif total_tasks <= 8 or (
+        prepare_variant == "bt16_prepare_beta_tma"
+        and _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks <= sm_count
+    ):
+        chain_variant = "bt16_chain_m64_s9"
+    else:
+        chain_variant = "bt16_chain_m64_s8"
+    return prepare_variant, chain_variant, dense_wavefront
+
+
 def _requires_exact_n16_recurrence(
     *,
+    compute_capability: tuple[int, int],
     sm_count: int,
     fixed_layout: bool,
     num_sequences: int,
     num_heads: int,
     uniform_sequences: bool,
 ) -> bool:
-    """Select the measured N16 graph for the 148-SM H96/N128 holdout."""
+    """Retain the N16 accuracy fallback for the 148-SM H96/N128 row."""
 
     return (
         sm_count == 148
@@ -710,7 +1006,7 @@ def _get_stream_workspace(device: torch.device) -> _FlashKDAStreamWorkspace:
 
 
 def _cached_packed_task_metadata(
-    workspace: _FlashKDAStreamWorkspace,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
     cu_seqlens: torch.Tensor,
     *,
     total_tokens: int,
@@ -735,6 +1031,12 @@ def _cached_packed_task_metadata(
             and cached_metadata is not None
         ):
             return cached_metadata
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "packed recurrent_kda prefill metadata is not warmed for "
+                "CUDA graph capture; eagerly invoke the same offsets once "
+                "with this RecurrentKDAPrefillWorkspace before capture"
+            )
         offsets = tuple(int(value) for value in cu_seqlens.tolist())
         if (
             not offsets
@@ -771,6 +1073,8 @@ def _cached_packed_task_metadata(
             sequence_order,
             persistent_plan,
             len(set(sequence_lengths)) == 1,
+            offsets,
+            sequence_lengths,
         )
         workspace._packed_metadata_tensor = cu_seqlens
         workspace._packed_metadata_signature = signature
@@ -827,6 +1131,8 @@ def _state_scratch(
 def _beta_tma_source(
     beta: torch.Tensor,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
+    *,
+    chunk_tokens: int,
 ) -> torch.Tensor:
     batch_size, seq_len, num_heads = beta.shape
     total_tokens = batch_size * seq_len
@@ -842,13 +1148,13 @@ def _beta_tma_source(
             (beta.stride(1), beta.stride(2)),
         )
     if (
-        total_tokens >= 32
+        total_tokens >= chunk_tokens
         and num_heads >= _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
         and beta_flat.data_ptr() % 16 == 0
         and beta_flat.stride(0) * beta.element_size() % 16 == 0
     ):
         return beta_flat
-    padded_tokens = max(total_tokens, 32)
+    padded_tokens = max(total_tokens, chunk_tokens)
     padded_heads = (
         (num_heads + _FLASH_KDA_BETA_TMA_HEADS_PER_BOX - 1)
         // _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
@@ -871,6 +1177,32 @@ def _beta_tma_source(
     # in one FFI call avoids two Python-dispatched activities and their host gap,
     # while retaining stable storage for the TMA descriptor and CUDA graphs.
     return padded
+
+
+def _pair_packed_beta_tma_source(beta: torch.Tensor) -> Optional[torch.Tensor]:
+    """Alias dense H12 beta rows as a TensorMap-legal two-token carrier."""
+
+    batch_size, seq_len, num_heads = beta.shape
+    total_tokens = batch_size * seq_len
+    if beta.stride(-1) != 1:
+        raise ValueError("beta must have unit head stride")
+    if batch_size == 1:
+        beta_flat = beta[0]
+    else:
+        if beta.stride(0) != seq_len * beta.stride(1):
+            raise ValueError("beta batch/token dimensions must collapse without a copy")
+        beta_flat = beta.as_strided(
+            (total_tokens, num_heads),
+            (beta.stride(1), beta.stride(2)),
+        )
+    if (
+        num_heads != 12
+        or total_tokens % 2 != 0
+        or not beta_flat.is_contiguous()
+        or beta_flat.data_ptr() % 16 != 0
+    ):
+        return None
+    return beta_flat.view(total_tokens // 2, 24)
 
 
 def _small_bh_workspace(
@@ -924,6 +1256,146 @@ def _small_bh_workspace(
         zero_on_allocate=True,
     )
     return packet_workspace, packet_ready, packet_consumed, helper_done
+
+
+def _bt16_workspace(
+    *,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    device: torch.device,
+    offsets: tuple[int, ...],
+    num_heads: int,
+    sm_count: int,
+    dense_wavefront: bool,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+]:
+    """Resolve stable BT16 metadata, factor buffers, and prepare grid size."""
+
+    chunk_counts = tuple(
+        (end - start + _FLASH_KDA_BT16_CHUNK - 1) // _FLASH_KDA_BT16_CHUNK
+        for start, end in zip(offsets, offsets[1:], strict=False)
+    )
+    host_cu_chunks = [0]
+    host_chunk_to_seq: list[int] = []
+    for sequence_index, chunk_count in enumerate(chunk_counts):
+        host_cu_chunks.append(host_cu_chunks[-1] + chunk_count)
+        host_chunk_to_seq.extend([sequence_index] * chunk_count)
+    total_chunks = host_cu_chunks[-1]
+    metadata_signature = (offsets, num_heads)
+    capturing = torch.cuda.is_current_stream_capturing()
+    if workspace._bt16_metadata_signature != metadata_signature:
+        if capturing:
+            raise RuntimeError(
+                "BT16 recurrent_kda metadata is not warmed for CUDA graph "
+                "capture; eagerly invoke the same offsets once with this "
+                "RecurrentKDAPrefillWorkspace before capture"
+            )
+        cu_chunks = _workspace_buffer(
+            workspace=workspace,
+            attribute="_bt16_cu_chunks",
+            device=device,
+            numel=len(host_cu_chunks),
+            capture_error="BT16 cu_chunks workspace is not warmed for capture",
+            dtype=torch.int32,
+        )
+        chunk_to_seq = _workspace_buffer(
+            workspace=workspace,
+            attribute="_bt16_chunk_to_seq",
+            device=device,
+            numel=len(host_chunk_to_seq),
+            capture_error="BT16 chunk_to_seq workspace is not warmed for capture",
+            dtype=torch.int32,
+        )
+        cu_chunks.copy_(torch.tensor(host_cu_chunks, dtype=torch.int32, device=device))
+        chunk_to_seq.copy_(
+            torch.tensor(host_chunk_to_seq, dtype=torch.int32, device=device)
+        )
+        workspace._bt16_metadata_signature = metadata_signature
+    else:
+        assert workspace._bt16_cu_chunks is not None
+        assert workspace._bt16_chunk_to_seq is not None
+        cu_chunks = workspace._bt16_cu_chunks[: len(host_cu_chunks)]
+        chunk_to_seq = workspace._bt16_chunk_to_seq[: len(host_chunk_to_seq)]
+
+    padded_tokens = total_chunks * _FLASH_KDA_BT16_CHUNK
+    factor_numel = num_heads * padded_tokens * _FLASH_KDA_HEAD_DIM
+    qd = _workspace_buffer(
+        workspace=workspace,
+        attribute="_bt16_qd",
+        device=device,
+        numel=factor_numel,
+        capture_error="BT16 qd workspace is not large enough for capture",
+    ).view(1, num_heads, padded_tokens, _FLASH_KDA_HEAD_DIM)
+    kd = _workspace_buffer(
+        workspace=workspace,
+        attribute="_bt16_kd",
+        device=device,
+        numel=factor_numel,
+        capture_error="BT16 kd workspace is not large enough for capture",
+    ).view_as(qd)
+    w = _workspace_buffer(
+        workspace=workspace,
+        attribute="_bt16_w",
+        device=device,
+        numel=factor_numel,
+        capture_error="BT16 w workspace is not large enough for capture",
+    ).view_as(qd)
+    qk_numel = num_heads * total_chunks * _FLASH_KDA_BT16_CHUNK * _FLASH_KDA_BT16_CHUNK
+    qk = _workspace_buffer(
+        workspace=workspace,
+        attribute="_bt16_qk",
+        device=device,
+        numel=qk_numel,
+        capture_error="BT16 qk workspace is not large enough for capture",
+    ).view(
+        1,
+        num_heads,
+        total_chunks,
+        _FLASH_KDA_BT16_CHUNK,
+        _FLASH_KDA_BT16_CHUNK,
+    )
+    diag = _workspace_buffer(
+        workspace=workspace,
+        attribute="_bt16_diag",
+        device=device,
+        numel=num_heads * total_chunks * _FLASH_KDA_HEAD_DIM,
+        capture_error="BT16 diagonal workspace is not large enough for capture",
+        dtype=torch.float32,
+    ).view(1, num_heads, total_chunks, _FLASH_KDA_HEAD_DIM)
+
+    chunks_per_cta = _bt16_chunks_per_prepare_cta(
+        num_heads=num_heads, total_chunks=total_chunks
+    )
+    prepare_ctas = ((total_chunks + chunks_per_cta - 1) // chunks_per_cta) * num_heads
+    prepare_ctas = _wave_quantized_bt16_prepare_ctas(
+        rectangular_ctas=prepare_ctas,
+        num_heads=num_heads,
+        sm_count=sm_count,
+    )
+    if dense_wavefront:
+        prepare_ctas = min(
+            num_heads * total_chunks,
+            _FLASH_KDA_BT16_DENSE_PREP_WAVES * sm_count,
+        )
+    return (
+        cu_chunks,
+        chunk_to_seq,
+        qd,
+        kd,
+        w,
+        qk,
+        diag,
+        total_chunks,
+        prepare_ctas,
+    )
 
 
 def _tensor_descriptor_signature(tensor: torch.Tensor) -> tuple:
@@ -1095,6 +1567,226 @@ def _get_flash_kda_prefill_module(variant: "FlashKDAVariant", target: "FlashKDAT
     return get_flash_kda_prefill_module(variant, target)
 
 
+def _run_bt16_prepare_chain(
+    *,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    target: "FlashKDATarget",
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_order: torch.Tensor,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    final_state: torch.Tensor,
+    offsets: tuple[int, ...],
+    num_heads: int,
+    sm_count: int,
+    compute_capability: tuple[int, int],
+    fixed_layout: bool,
+    max_sequence_length: int,
+    use_initial_state: bool,
+    store_final_state: bool,
+    scale: float,
+    lower_bound: float,
+    stream_ptr: int,
+    capturing: bool,
+) -> None:
+    total_tasks = (len(offsets) - 1) * num_heads
+    prepare_variant, chain_variant, dense_wavefront = _select_bt16_physical_variants(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=len(offsets) - 1,
+        num_heads=num_heads,
+        max_sequence_length=max_sequence_length,
+    )
+    (
+        cu_chunks,
+        chunk_to_seq,
+        qd,
+        kd,
+        w,
+        qk,
+        diag,
+        total_chunks,
+        prepare_ctas,
+    ) = _bt16_workspace(
+        workspace=workspace,
+        device=q.device,
+        offsets=offsets,
+        num_heads=num_heads,
+        sm_count=sm_count,
+        dense_wavefront=dense_wavefront,
+    )
+
+    prepare_tensors = (
+        q,
+        k,
+        g,
+        beta,
+        A_log,
+        dt_bias,
+        cu_seqlens,
+        cu_chunks,
+        chunk_to_seq,
+        qd,
+        kd,
+        w,
+        qk,
+        diag,
+    )
+    prepare_signature = tuple(
+        _tensor_descriptor_signature(tensor) for tensor in prepare_tensors
+    )
+    chain_signature = tuple(
+        _tensor_descriptor_signature(tensor)
+        for tensor in (
+            qd,
+            kd,
+            w,
+            qk,
+            diag,
+            v,
+            cu_seqlens,
+            cu_chunks,
+            seq_order,
+            out,
+        )
+    )
+    signatures = {
+        prepare_variant: prepare_signature,
+        chain_variant: chain_signature,
+    }
+    prepare_flags: dict["FlashKDAVariant", int] = {}
+    for variant, signature in signatures.items():
+        warmed_signature = workspace._descriptor_signatures.get(variant)
+        if capturing and warmed_signature != signature:
+            raise RuntimeError(
+                "RecurrentKDAPrefillWorkspace is not warmed for the exact "
+                f"{variant} descriptor signature; eagerly invoke the same "
+                "call on this stream before capture"
+            )
+        prepare_flags[variant] = 0 if capturing else int(warmed_signature != signature)
+
+    combined_variant: Optional["FlashKDAVariant"] = (
+        "bt16_prepare_chain_m64_s8"
+        if prepare_variant == "bt16_prepare" and chain_variant == "bt16_chain_m64_s8"
+        else None
+    )
+    combined_module = (
+        _get_flash_kda_prefill_module(combined_variant, target)
+        if combined_variant is not None
+        else None
+    )
+    prepare_module = (
+        None
+        if combined_module is not None
+        else _get_flash_kda_prefill_module(prepare_variant, target)
+    )
+    chain_module = (
+        None
+        if combined_module is not None
+        else _get_flash_kda_prefill_module(chain_variant, target)
+    )
+    try:
+        if combined_module is not None:
+            combined_module.run(
+                q,
+                k,
+                g,
+                beta,
+                A_log,
+                dt_bias,
+                cu_seqlens,
+                cu_chunks,
+                chunk_to_seq,
+                qd,
+                kd,
+                w,
+                qk,
+                diag,
+                v,
+                seq_order,
+                initial_state,
+                out,
+                final_state,
+                workspace._descriptor_storages[prepare_variant],
+                workspace._descriptor_storages[chain_variant],
+                prepare_flags[prepare_variant],
+                prepare_flags[chain_variant],
+                total_chunks,
+                num_heads,
+                lower_bound,
+                prepare_ctas,
+                int(use_initial_state),
+                int(store_final_state),
+                scale,
+                _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks,
+                stream_ptr,
+            )
+        else:
+            assert prepare_module is not None
+            assert chain_module is not None
+            prepare_module.run(
+                q,
+                k,
+                g,
+                beta,
+                A_log,
+                dt_bias,
+                cu_seqlens,
+                cu_chunks,
+                chunk_to_seq,
+                qd,
+                kd,
+                w,
+                qk,
+                diag,
+                workspace._descriptor_storages[prepare_variant],
+                prepare_flags[prepare_variant],
+                total_chunks,
+                num_heads,
+                lower_bound,
+                prepare_ctas,
+                stream_ptr,
+            )
+            chain_module.run(
+                qd,
+                kd,
+                w,
+                qk,
+                diag,
+                v,
+                cu_seqlens,
+                cu_chunks,
+                seq_order,
+                initial_state,
+                out,
+                final_state,
+                workspace._descriptor_storages[chain_variant],
+                prepare_flags[chain_variant],
+                num_heads,
+                int(use_initial_state),
+                int(store_final_state),
+                scale,
+                _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks,
+                stream_ptr,
+            )
+    except Exception:
+        for variant, flag in prepare_flags.items():
+            if flag:
+                workspace._descriptor_signatures.pop(variant, None)
+        raise
+    for variant, flag in prepare_flags.items():
+        if flag:
+            workspace._descriptor_signatures[variant] = signatures[variant]
+
+
 def _run_flash_kda_prefill(
     *,
     q: torch.Tensor,
@@ -1139,24 +1831,21 @@ def _run_flash_kda_prefill(
     stream_workspace = (
         _get_stream_workspace(q.device) if prefill_workspace is None else None
     )
+    metadata_workspace: _RecurrentKDAPrefillWorkspaceBase
+    if prefill_workspace is None:
+        assert stream_workspace is not None
+        metadata_workspace = stream_workspace
+    else:
+        metadata_workspace = prefill_workspace
     needs_direct_m128 = (
         state_indices is not None
         or checkpoint_every_n_tokens != 0
         or not beta.is_contiguous()
-        or seq_order is not None
         or (
             initial_state is not None
             and initial_state.stride(0)
             != num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
         )
-    )
-    small_bh_candidate = not needs_direct_m128 and _should_use_small_bh_owner_helper(
-        compute_capability=compute_capability,
-        sm_count=sm_count,
-        fixed_layout=fixed_layout,
-        num_sequences=num_sequences,
-        num_heads=num_heads,
-        sequence_length=seq_len,
     )
     persistent_candidate = (
         _uses_measured_sm100_persistent_policy(
@@ -1165,64 +1854,17 @@ def _run_flash_kda_prefill(
         )
         and not needs_direct_m128
         and prefill_workspace is None
+        and seq_order is None
         and initial_state is not None
         and num_heads != 12
-        and not (fixed_layout and num_sequences == 1 and num_heads == 64)
         and num_sequences * num_heads > sm_count
     )
     automatic_sequence_order = None
     persistent_plan = None
-    uniform_sequences = False
-    if (
-        not fixed_layout
-        and seq_order is None
-        and prefill_workspace is None
-        and not capturing
-    ):
-        assert cu_seqlens is not None
-        assert stream_workspace is not None
-        (
-            automatic_sequence_order,
-            persistent_plan,
-            uniform_sequences,
-        ) = _cached_packed_task_metadata(
-            stream_workspace,
-            cu_seqlens,
-            total_tokens=batch_size * seq_len,
-            num_heads=num_heads,
-            sm_count=sm_count,
-            build_persistent_plan=persistent_candidate,
-        )
-    elif persistent_candidate:
-        assert fixed_layout
-        persistent_plan = _persistent_task_plan(
-            (seq_len,) * num_sequences,
-            num_heads=num_heads,
-            sm_count=sm_count,
-        )
-    use_exact_n16 = (
-        checkpoint_every_n_tokens != 0 and checkpoint_every_n_tokens % 32 != 0
-    ) or _requires_exact_n16_recurrence(
-        sm_count=sm_count,
-        fixed_layout=fixed_layout,
-        num_sequences=num_sequences,
-        num_heads=num_heads,
-        uniform_sequences=uniform_sequences,
-    )
-    if use_exact_n16:
-        persistent_plan = None
-    variant = _select_flash_kda_prefill_variant(
-        fixed_layout=fixed_layout,
-        num_sequences=num_sequences,
-        num_heads=num_heads,
-        needs_direct_m128=needs_direct_m128,
-        use_persistent_m128=persistent_plan is not None,
-        use_small_bh_m128=small_bh_candidate,
-        use_exact_n16=use_exact_n16,
-    )
-    if checkpoint_every_n_tokens and variant == "m128_n16":
-        variant = "m128_n16_checkpoint"
     if fixed_layout:
+        sequence_lengths = (seq_len,) * num_sequences
+        offsets = tuple(index * seq_len for index in range(num_sequences + 1))
+        uniform_sequences = True
         cu_seqlens_i64 = _fixed_cu_seqlens(
             device=q.device, batch_size=batch_size, seq_len=seq_len
         )
@@ -1238,10 +1880,122 @@ def _run_flash_kda_prefill(
             if cu_seqlens.dtype == torch.int64
             else cu_seqlens.to(torch.int64)
         )
+        (
+            automatic_sequence_order,
+            persistent_plan,
+            uniform_sequences,
+            offsets,
+            sequence_lengths,
+        ) = _cached_packed_task_metadata(
+            metadata_workspace,
+            cu_seqlens_i64,
+            total_tokens=batch_size * seq_len,
+            num_heads=num_heads,
+            sm_count=sm_count,
+            build_persistent_plan=persistent_candidate,
+        )
+    if fixed_layout and persistent_candidate:
+        persistent_plan = _persistent_task_plan(
+            sequence_lengths,
+            num_heads=num_heads,
+            sm_count=sm_count,
+        )
+    max_sequence_length = max(sequence_lengths)
+    use_exact_n16 = (
+        checkpoint_every_n_tokens != 0 and checkpoint_every_n_tokens % 32 != 0
+    ) or _requires_exact_n16_recurrence(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        uniform_sequences=uniform_sequences,
+    )
+    if needs_direct_m128:
+        route = (
+            _FLASH_KDA_ROUTE_DIRECT_M128_N16
+            if use_exact_n16
+            else _direct_m128_route(
+                num_heads=num_heads,
+                max_sequence_length=max_sequence_length,
+            )
+        )
+    else:
+        route = _select_flash_kda_bf16_route(
+            compute_capability=compute_capability,
+            sm_count=sm_count,
+            fixed_layout=fixed_layout,
+            num_sequences=num_sequences,
+            num_heads=num_heads,
+            uniform_sequences=uniform_sequences,
+            max_sequence_length=max_sequence_length,
+        )
+    use_bt16 = route == _FLASH_KDA_ROUTE_BT16_M64
+    use_tensor_state_decay = (
+        state_indices is None
+        and checkpoint_every_n_tokens == 0
+        and _should_use_n32_tensor_state_decay(
+            compute_capability=compute_capability,
+            route=route,
+            uniform_sequences=uniform_sequences,
+            num_heads=num_heads,
+            total_tasks=num_sequences * num_heads,
+            max_sequence_length=max_sequence_length,
+        )
+    )
+    if route in (
+        _FLASH_KDA_ROUTE_DIRECT_M128_N16,
+        _FLASH_KDA_ROUTE_BT16_M64,
+        _FLASH_KDA_ROUTE_M64,
+        _FLASH_KDA_ROUTE_SMALL_BH_M128,
+    ):
+        persistent_plan = None
+    variant: Literal[
+        "bt16",
+        "m64",
+        "m128",
+        "m128_tensor_state_decay",
+        "m128_h12_short",
+        "m128_h12_long",
+        "m128_n16",
+        "m128_n16_checkpoint",
+        "m128_n16_short",
+        "persistent_m128",
+        "small_bh_m128",
+    ]
+    if use_bt16:
+        variant = "bt16"
+    elif route == _FLASH_KDA_ROUTE_M64:
+        variant = "m64"
+    elif route == _FLASH_KDA_ROUTE_SMALL_BH_M128:
+        variant = "small_bh_m128"
+    elif use_tensor_state_decay:
+        variant = "m128_tensor_state_decay"
+    elif persistent_plan is not None:
+        variant = "persistent_m128"
+    elif route == _FLASH_KDA_ROUTE_DIRECT_M128_N16:
+        variant = (
+            "m128_n16_short"
+            if num_heads != 12
+            and 0 < max_sequence_length <= _FLASH_KDA_BT16_CHUNK
+            and checkpoint_every_n_tokens == 0
+            else "m128_n16"
+        )
+    elif num_heads == 12:
+        variant = (
+            "m128_h12_short"
+            if max_sequence_length
+            <= _FLASH_KDA_H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQUENCE_LENGTH
+            else "m128_h12_long"
+        )
+    else:
+        variant = "m128"
+    if checkpoint_every_n_tokens and variant == "m128_n16":
+        variant = "m128_n16_checkpoint"
     persistent_task_ids = None
     persistent_task_offsets = None
     if persistent_plan is None:
-        if automatic_sequence_order is None:
+        if seq_order is not None or automatic_sequence_order is None:
             seq_order_i32 = _validate_prefill_seq_order(
                 seq_order,
                 fixed_layout=fixed_layout,
@@ -1355,7 +2109,25 @@ def _run_flash_kda_prefill(
             capturing=capturing,
             explicit=explicit_workspace,
         )
-        beta_tma = _beta_tma_source(beta, workspace)
+        if variant == "m128_h12_long":
+            pair_packed_beta_tma = _pair_packed_beta_tma_source(beta)
+            if pair_packed_beta_tma is None:
+                # Preserve the general public route for accepted layouts that
+                # cannot expose the source runtime's zero-copy H12 carrier.
+                variant = "m128"
+                beta_tma = _beta_tma_source(beta, workspace, chunk_tokens=32)
+            else:
+                beta_tma = pair_packed_beta_tma
+        else:
+            beta_tma = _beta_tma_source(
+                beta,
+                workspace,
+                chunk_tokens=(
+                    16
+                    if variant in ("m128_n16", "m128_n16_checkpoint", "m128_n16_short")
+                    else 32
+                ),
+            )
         packet_workspace = None
         packet_ready = None
         packet_consumed = None
@@ -1379,6 +2151,38 @@ def _run_flash_kda_prefill(
             )
             if initial_state is None:
                 returned_state = final_state_arg
+        if variant == "bt16":
+            _run_bt16_prepare_chain(
+                workspace=workspace,
+                target=target,
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                cu_seqlens=cu_seqlens_i64,
+                seq_order=seq_order_i32,
+                initial_state=initial_state_arg,
+                out=out_buf,
+                final_state=final_state_arg,
+                offsets=offsets,
+                num_heads=num_heads,
+                sm_count=sm_count,
+                compute_capability=compute_capability,
+                fixed_layout=fixed_layout,
+                max_sequence_length=max_sequence_length,
+                use_initial_state=use_initial_state,
+                store_final_state=store_final_state,
+                scale=scale_value,
+                lower_bound=float(lower_bound),
+                stream_ptr=stream_ptr,
+                capturing=capturing,
+            )
+            if capturing and explicit_workspace:
+                workspace._captured = True
+            return (out_buf, returned_state if output_final_state else None)
         signature = _descriptor_signature(
             q=q,
             k=k,

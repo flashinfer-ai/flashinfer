@@ -81,6 +81,67 @@ def test_trace_default_check():
     assert standard_check([ref], [actual])
 
 
+def test_nvfp4_attention_sm120_trace_output_dtype_precedence():
+    batch, num_qo_heads, num_kv_heads = 1, 8, 2
+    seq_len_q, seq_len_k, head_dim = 256, 384, 128
+    kwargs = {
+        "q_fp4": torch.empty(
+            batch, num_qo_heads, seq_len_q, head_dim // 2, dtype=torch.uint8
+        ),
+        "k_fp4": torch.empty(
+            batch, num_kv_heads, seq_len_k, head_dim // 2, dtype=torch.uint8
+        ),
+        "v_fp4_t": torch.empty(
+            batch, num_kv_heads, head_dim, seq_len_k // 2, dtype=torch.uint8
+        ),
+        "q_scale": torch.empty(
+            batch,
+            num_qo_heads,
+            seq_len_q,
+            head_dim // 16,
+            dtype=torch.float8_e4m3fn,
+        ),
+        "k_scale": torch.empty(
+            batch,
+            num_kv_heads,
+            seq_len_k,
+            head_dim // 16,
+            dtype=torch.float8_e4m3fn,
+        ),
+        "v_scale_t": torch.empty(
+            batch,
+            num_kv_heads,
+            head_dim,
+            seq_len_k // 16,
+            dtype=torch.float8_e4m3fn,
+        ),
+        "qk_correction": torch.empty(
+            batch,
+            num_qo_heads,
+            seq_len_q // 128,
+            seq_len_k,
+            dtype=torch.float32,
+        ),
+        "sm_scale": head_dim**-0.5,
+        "causal": False,
+        "per_block_mean": True,
+    }
+
+    default_defn = flashinfer.nvfp4_attention_sm120_fwd.fi_trace(**kwargs)
+    assert default_defn["outputs"]["out"]["dtype"] == "bfloat16"
+
+    dtype_defn = flashinfer.nvfp4_attention_sm120_fwd.fi_trace(
+        **kwargs, out_dtype=torch.float16
+    )
+    assert dtype_defn["outputs"]["out"]["dtype"] == "float16"
+
+    out = torch.empty(batch, num_qo_heads, seq_len_q, head_dim, dtype=torch.bfloat16)
+    out_defn = flashinfer.nvfp4_attention_sm120_fwd.fi_trace(
+        **kwargs, out=out, out_dtype=torch.float16
+    )
+    assert out_defn["outputs"]["out"]["dtype"] == "bfloat16"
+
+
 def test_all_registered_trace_templates_have_check():
     from flashinfer.api_logging import _TRACE_REGISTRY
 

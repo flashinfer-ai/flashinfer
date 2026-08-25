@@ -93,8 +93,12 @@ def recurrent_kda(
     multi-token prefill uses the architecture-specific CuTe DSL backend. On
     SM100a (B200/GB200) and SM103a (B300/GB300), the FlashKDA-compatible subset
     can use either the frozen Cake schedules or the source-level CuTe DSL BT=16
-    kernel. ``backend="auto"`` prefers CuTe DSL for supported plain prefill
-    contracts and keeps Cake as the feature-complete fallback.
+    kernel. The Cake backend includes a generated two-stage BT=16
+    prepare/chain portfolio with device- and shape-specific S7/S8/S9 pipeline
+    selection. ``backend="auto"`` prefers CuTe DSL for supported plain prefill
+    contracts and keeps Cake as the feature-complete fallback; use
+    ``backend="cake"`` to select and benchmark the generated portfolio
+    explicitly.
 
     Args:
         q (torch.Tensor):
@@ -196,9 +200,10 @@ def recurrent_kda(
             in one wave. CUDA Graph capture of a packed CuTe DSL engine call
             requires an explicit plan prepared with
             :class:`RecurrentKDAPrefillWrapper`. Cake constructs and caches its
-            own eager host metadata. On Cake, supplying an order keeps the direct
-            schedule so caller-owned ordering is not replaced by persistent task
-            bins.
+            own eager host metadata. On Cake, supplying an order disables
+            persistent host task-bin planning but does not force direct M128;
+            the selected non-persistent route may still be BT16 prepare/chain,
+            M64, small-BH, or direct according to the input shape.
             Fixed-layout prefill and decode calls must leave it as ``None``.
         prefill_workspace (Optional[RecurrentKDAPrefillWorkspace]):
             Caller-owned workspace for SM100-family and SM120 prefill backends.
@@ -206,7 +211,8 @@ def recurrent_kda(
             capture. Warm it eagerly with the exact tensors on the capture
             stream before capture. Use one workspace per captured
             ``recurrent_kda`` invocation. Explicit workspaces and CUDA Graph
-            capture use direct/M64 schedules; persistent task planning is an
+            capture use non-persistent schedules, including eligible BT16,
+            M64, small-BH, and direct routes. Persistent task planning is an
             eager-only B200/GB200 route because its bins depend on host-visible
             sequence lengths.
         state_checkpoints (Optional[torch.Tensor]):
@@ -228,7 +234,9 @@ def recurrent_kda(
             prefill, including the SM120 backend and SM100-family state
             checkpoints, and otherwise falls back to an exported frozen Cake
             specialization.
-            ``"cake"`` and ``"cute-dsl"`` select those backends strictly.
+            ``"cake"`` and ``"cute-dsl"`` select those backends strictly. The
+            Cake prefill path chooses among direct, persistent, small-BH, and
+            two-stage BT16 schedules from the input shape and physical device.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
