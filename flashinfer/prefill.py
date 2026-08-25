@@ -4620,13 +4620,27 @@ def trtllm_sage_attention_quantize(
     q_block_size: int = 1,
     k_block_size: int = 16,
     qk_quant_dtype: torch.dtype = torch.int8,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    cum_seq_lens_kv: Optional[torch.Tensor] = None,
+    smooth_k: bool = False,
+) -> Union[
+    Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
 ]:
     """Quantize Q/K/V into the layout consumed by TRTLLM SageAttention.
 
@@ -4645,15 +4659,23 @@ def trtllm_sage_attention_quantize(
     qk_quant_dtype : torch.dtype
         ``torch.int8`` (the SageAttention INT8 path) or
         ``torch.float8_e4m3fn``.
+    cum_seq_lens_q, cum_seq_lens_kv : Optional[torch.Tensor]
+        Contiguous INT32 CUDA tensors of shape ``[batch_size + 1]`` containing
+        cumulative Q and KV sequence lengths. Assumes single-batch input if
+        `cum_seq_lens_q` is missing.
+    smooth_k : bool
+        Whether to perform K-smoothing before quantization for better accuracy.
+        NOTE: K-smoothing shifts LSE by ``-sm_scale * (query * k_mean).sum(-1)``
+        FlashInfer does not consume `k_mean`, thus it's up to users to shift
+        back the LSE if performing ring attention with this option enabled.
 
     Returns
     -------
-    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale)
-        Quantized Q/K/V followed by their FP32 dequantization scales. Q and K
-        scales have shapes ``[q_heads, ceil(q_tokens / q_block_size)]`` and
-        ``[kv_heads, ceil(kv_tokens / k_block_size)]``. V scales have shape
-        ``[kv_heads, head_dim]``. These outputs can be passed directly to
-        :func:`trtllm_ragged_attention_deepseek`.
+    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale) or
+    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, k_mean)
+        Quantized Q/K/V followed by their FP32 dequantization scales.
+        When ``smooth_k=True``, the FP32 K mean is appended. The first six
+        outputs can be passed directly to `trtllm_ragged_attention_deepseek`.
     """
     if query.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"query must be float16 or bfloat16, got {query.dtype}")
@@ -4675,6 +4697,17 @@ def trtllm_sage_attention_quantize(
         raise ValueError("q_block_size and k_block_size must be 1, 4, or 16")
     if qk_quant_dtype not in (torch.int8, torch.float8_e4m3fn):
         raise ValueError("qk_quant_dtype must be torch.int8 or torch.float8_e4m3fn")
+    if cum_seq_lens_q is None:
+        cum_seq_lens_q = torch.tensor(
+            [0, query.shape[0]], dtype=torch.int32, device=query.device
+        )
+        cum_seq_lens_kv = torch.tensor(
+            [0, key.shape[0]], dtype=torch.int32, device=query.device
+        )
+    elif cum_seq_lens_kv is None:
+        cum_seq_lens_kv = cum_seq_lens_q
+
+    batch_size = cum_seq_lens_q.numel() - 1
 
     query = query.contiguous()
     key = key.contiguous()
@@ -4683,12 +4716,12 @@ def trtllm_sage_attention_quantize(
     k_quant = torch.empty_like(key, dtype=qk_quant_dtype)
     v_quant = torch.empty_like(value, dtype=torch.float8_e4m3fn)
     q_scale = torch.empty(
-        (query.shape[1], ceil_div(query.shape[0], q_block_size)),
+        (query.shape[1], ceil_div(query.shape[0], q_block_size) + batch_size - 1),
         dtype=torch.float32,
         device=query.device,
     )
     k_scale = torch.empty(
-        (key.shape[1], ceil_div(key.shape[0], k_block_size)),
+        (key.shape[1], ceil_div(key.shape[0], k_block_size) + batch_size - 1),
         dtype=torch.float32,
         device=query.device,
     )
@@ -4696,6 +4729,15 @@ def trtllm_sage_attention_quantize(
         (value.shape[1], value.shape[2]),
         dtype=torch.float32,
         device=query.device,
+    )
+    k_mean = (
+        torch.empty(
+            (key.shape[1], key.shape[2]),
+            dtype=torch.float32,
+            device=query.device,
+        )
+        if smooth_k
+        else None
     )
 
     get_trtllm_gen_fmha_module().trtllm_sage_attention_quantize(
@@ -4708,10 +4750,16 @@ def trtllm_sage_attention_quantize(
         query,
         key,
         value,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
         q_block_size,
         k_block_size,
         get_device_sm_count(query.device),
+        k_mean,
+        smooth_k,
     )
+    if smooth_k:
+        return q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, k_mean
     return q_quant, k_quant, v_quant, q_scale, k_scale, v_scale
 
 
