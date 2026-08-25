@@ -24,6 +24,7 @@ Algorithm (push-wait):
 Routing:
     - SM >= 100 (Blackwell+): cuTile implementation (all_gather_matmul_cutile)
     - SM <  100             : Triton implementation  (all_gather_matmul_triton)
+    - ``backend="cake"``    : exact source-built SM100/SM103 implementation
 
 Example (run with torchrun or mp.spawn across all GPU ranks)::
 
@@ -66,9 +67,21 @@ def all_gather_matmul(
     w: torch.Tensor,
     group: dist.ProcessGroup,
     *,
+    backend: str = "auto",
     verbose: bool = False,
 ):
-    """Push-wait all-gather matmul; dispatches to cuTile (SM>=100) or Triton."""
+    """Run push-wait all-gather matmul.
+
+    ``backend="auto"`` preserves the existing cuTile-on-Blackwell and
+    Triton-otherwise routing. ``backend="cake"`` selects the exact
+    source-built Blackwell implementation and rejects unsupported inputs.
+    """
+    if backend == "cake":
+        from .all_gather_matmul_cake import all_gather_matmul_cake
+
+        return all_gather_matmul_cake(inp, w, group, verbose=verbose)
+    if backend != "auto":
+        raise ValueError("backend must be exactly 'auto' or 'cake'")
     major, _ = torch.cuda.get_device_capability(inp.device)
     if major >= 10:
         return all_gather_matmul_cutile(inp, w, group, verbose=verbose)

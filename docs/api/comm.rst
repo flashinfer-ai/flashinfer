@@ -33,6 +33,21 @@ Mapping Utilities
 
     Mapping
 
+All-Gather Matmul
+-----------------
+
+``all_gather_matmul`` keeps its architecture-based default routing when
+``backend="auto"``. On SM100 and SM103, ``backend="cake"`` explicitly selects
+the source-built fused backend for contiguous bfloat16 or float16 inputs with
+``K=8192``, ``N=2048``, a positive ``M`` divisible by 128, an NVSHMEM symmetric
+input, and a two- or four-rank NCCL process group. Unsupported explicit Cake
+requests raise instead of silently falling back.
+
+.. autosummary::
+    :toctree: ../generated
+
+    all_gather_matmul
+
 TensorRT-LLM AllReduce
 ----------------------
 
