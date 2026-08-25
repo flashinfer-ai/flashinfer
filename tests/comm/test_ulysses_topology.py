@@ -17,6 +17,8 @@ import flashinfer.comm as comm
 from flashinfer.comm.ulysses_topology import (
     UlyssesBackendError,
     UlyssesRankTopology,
+    _parse_pcie_gid_indices_override,
+    _probe_rocev2_ipv4_gid,
     decide_ulysses_backend,
     probe_ulysses_rank_topology,
     resolve_ulysses_backend,
@@ -37,6 +39,117 @@ def _full_mesh(world_size, hostname="hostA"):
         )
         for r in range(world_size)
     ]
+
+
+def _pcie_mesh(rank_order=None):
+    rank_order = list(range(8)) if rank_order is None else rank_order
+    uuids = [f"GPU-fake-{physical}" for physical in rank_order]
+    numa = [physical // 4 for physical in rank_order]
+    return [
+        UlyssesRankTopology(
+            rank=rank,
+            hostname="hostA",
+            device_index=rank,
+            device_uuid=uuids[rank],
+            pci_bus_id=f"0000:{rank_order[rank]:02x}:00.0",
+            numa_node=numa[rank],
+            nic_name=f"mlx5_{rank_order[rank]}",
+            gid_index=rank_order[rank] + 2,
+            peer_p2p={uuids[peer]: True for peer in range(8) if peer != rank},
+            peer_nvlink={uuids[peer]: False for peer in range(8) if peer != rank},
+        )
+        for rank in range(8)
+    ]
+
+
+def _write_gid_entry(
+    sysfs_root, nic_name, index, *, gid="::ffff:10.0.0.1", gid_type="RoCE v2"
+):
+    port_root = sysfs_root / "class/infiniband" / nic_name / "ports/1"
+    (port_root / "gids").mkdir(parents=True, exist_ok=True)
+    (port_root / "gid_attrs/types").mkdir(parents=True, exist_ok=True)
+    (port_root / "gids" / str(index)).write_text(gid)
+    (port_root / "gid_attrs/types" / str(index)).write_text(gid_type)
+
+
+# ---- PCIe RoCE GID policy --------------------------------------------------
+
+
+def test_gid_indices_override_unset_or_empty(monkeypatch):
+    monkeypatch.delenv("FLASHINFER_ULYSSES_PCIE_GID_INDICES", raising=False)
+    assert _parse_pcie_gid_indices_override() is None
+    monkeypatch.setenv("FLASHINFER_ULYSSES_PCIE_GID_INDICES", "")
+    assert _parse_pcie_gid_indices_override() is None
+
+
+def test_gid_indices_override_is_rank_ordered(monkeypatch):
+    monkeypatch.setenv("FLASHINFER_ULYSSES_PCIE_GID_INDICES", " 2, 3,4,5, 6,7,8, 9 ")
+    assert _parse_pcie_gid_indices_override() == (2, 3, 4, 5, 6, 7, 8, 9)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0,1,2,3,4,5,6,",
+        "0,1,2,3,4,5,6,-1",
+        "0,1,2,3,4,5,6,+7",
+        "0,1,2,3,4,5,6,0x7",
+        "0,1,2,3,4,5,6,2147483648",
+        "   ",
+    ],
+)
+def test_gid_indices_override_rejects_malformed_values(monkeypatch, value):
+    monkeypatch.setenv("FLASHINFER_ULYSSES_PCIE_GID_INDICES", value)
+    with pytest.raises(ValueError, match="FLASHINFER_ULYSSES_PCIE_GID_INDICES"):
+        _parse_pcie_gid_indices_override()
+
+
+@pytest.mark.parametrize("value", ["7", "3,3,5,7", "0,1,2,3,4,5,6,7"])
+def test_gid_indices_override_accepts_per_rank_counts(monkeypatch, value):
+    """One entry per rank, however many ranks the group has."""
+    monkeypatch.setenv("FLASHINFER_ULYSSES_PCIE_GID_INDICES", value)
+    expected = tuple(int(v) for v in value.split(","))
+    assert _parse_pcie_gid_indices_override() == expected
+
+
+def test_gid_probe_selects_lowest_usable_entry(tmp_path):
+    _write_gid_entry(tmp_path, "mlx5_0", 0, gid="2001:db8::1")  # not IPv4-mapped
+    _write_gid_entry(tmp_path, "mlx5_0", 1, gid_type="IB/RoCE v1")
+    _write_gid_entry(tmp_path, "mlx5_0", 5, gid="::ffff:0.0.0.0")  # unspecified
+    _write_gid_entry(
+        tmp_path, "mlx5_0", 3, gid="0000:0000:0000:0000:0000:ffff:0a00:0008"
+    )
+    _write_gid_entry(tmp_path, "mlx5_0", 10, gid="::ffff:10.0.0.10")
+
+    assert _probe_rocev2_ipv4_gid("mlx5_0", sysfs_root=tmp_path) == 3
+
+
+def test_gid_probe_raises_when_no_entry_is_usable(tmp_path):
+    _write_gid_entry(tmp_path, "mlx5_0", 0, gid="2001:db8::1")
+    _write_gid_entry(tmp_path, "mlx5_0", 1, gid_type="IB/RoCE v1")
+
+    with pytest.raises(RuntimeError, match="no usable IPv4 RoCE v2 GID"):
+        _probe_rocev2_ipv4_gid("mlx5_0", sysfs_root=tmp_path)
+
+
+def test_gid_probe_override_selects_one_of_multiple_candidates(tmp_path):
+    _write_gid_entry(tmp_path, "mlx5_0", 2, gid="::ffff:10.0.0.2")
+    _write_gid_entry(tmp_path, "mlx5_0", 10, gid="::ffff:10.0.0.10")
+
+    assert (
+        _probe_rocev2_ipv4_gid("mlx5_0", requested_index=10, sysfs_root=tmp_path) == 10
+    )
+
+
+@pytest.mark.parametrize("requested_index", [1, 11])
+def test_gid_probe_override_cannot_force_invalid_entry(tmp_path, requested_index):
+    _write_gid_entry(tmp_path, "mlx5_0", 2, gid="::ffff:10.0.0.2")
+    _write_gid_entry(tmp_path, "mlx5_0", 1, gid_type="IB/RoCE v1")
+
+    with pytest.raises(RuntimeError, match=f"selects index {requested_index}"):
+        _probe_rocev2_ipv4_gid(
+            "mlx5_0", requested_index=requested_index, sysfs_root=tmp_path
+        )
 
 
 # ---- pure decision layer ---------------------------------------------------
@@ -166,6 +279,272 @@ def test_invalid_backend_value():
         decide_ulysses_backend("magic", _full_mesh(2))
 
 
+def test_explicit_pcie_builds_rank_order_independent_plan():
+    topos = _pcie_mesh([4, 1, 6, 3, 0, 5, 2, 7])
+    decision = decide_ulysses_backend("pcie", topos)
+    assert decision.backend == "pcie"
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "rdma"
+    assert decision.pcie_plan.numa_nodes == tuple(t.numa_node for t in topos)
+    assert decision.pcie_plan.nic_names == tuple(t.nic_name for t in topos)
+    assert decision.pcie_plan.gid_indices == tuple(t.gid_index for t in topos)
+
+
+@pytest.mark.parametrize("world_size", [1, 2, 4])
+def test_explicit_pcie_selects_p2p_for_small_world_sizes(world_size):
+    decision = decide_ulysses_backend("pcie", _full_mesh(world_size))
+    assert decision.backend == "pcie"
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "p2p"
+    assert decision.pcie_plan.gid_indices == ()
+    assert "CUDA P2P route planned" in decision.reason
+
+
+@pytest.mark.parametrize("world_size", [2, 4])
+def test_explicit_pcie_small_world_rejects_missing_p2p_pair(world_size):
+    topos = _full_mesh(world_size)
+    topos[-1].peer_p2p[topos[0].device_uuid] = False
+    with pytest.raises(UlyssesBackendError, match="no CUDA P2P access"):
+        decide_ulysses_backend("pcie", topos)
+
+
+def test_explicit_pcie_falls_back_to_all_p2p_when_rdma_is_unavailable():
+    decision = decide_ulysses_backend("pcie", _full_mesh(8))
+    assert decision.backend == "pcie"
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "p2p"
+    assert "all-RDMA unavailable" in decision.reason
+
+
+def test_explicit_pcie_falls_back_when_two_ranks_share_one_nic():
+    # Each rank picks its NIC from local sysfs distance, so a BIOS whose PCI
+    # enumeration defeats the tie break can hand two GPUs behind one switch the
+    # same device. Nothing downstream would notice: both ranks open it with
+    # distinct QPNs and silently halve their cross-NUMA bandwidth. The decision
+    # layer sees the whole rank-ordered plan and must reject it.
+    topos = _pcie_mesh()
+    topos[1].nic_name = topos[0].nic_name
+    decision = decide_ulysses_backend("pcie", topos)
+    assert decision.backend == "pcie"
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "p2p"
+    assert "more than one rank" in decision.reason
+    assert "FLASHINFER_ULYSSES_PCIE_NICS" in decision.reason
+
+
+def test_explicit_pcie_auto_eight_ranks_prefers_rdma():
+    decision = decide_ulysses_backend("pcie", _pcie_mesh())
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "rdma"
+    assert "all-RDMA route planned" in decision.reason
+    assert len(set(decision.pcie_plan.nic_names)) == 8
+    assert decision.pcie_plan.gid_indices == tuple(range(2, 10))
+
+
+def test_explicit_pcie_falls_back_when_gid_probe_fails():
+    topos = _pcie_mesh()
+    topos[3].gid_error = "multiple usable IPv4 RoCE v2 GIDs"
+
+    decision = decide_ulysses_backend("pcie", topos)
+
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "p2p"
+    assert decision.pcie_plan.gid_indices == ()
+    assert "RoCE GID probe failed on rank 3" in decision.reason
+
+
+def test_explicit_pcie_falls_back_on_inconsistent_gid_overrides():
+    topos = _pcie_mesh()
+    selected = tuple(t.gid_index for t in topos)
+    for topo in topos:
+        topo.gid_indices_override = selected
+    topos[7].gid_indices_override = selected[:-1] + (99,)
+
+    decision = decide_ulysses_backend("pcie", topos)
+
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "p2p"
+    assert "FLASHINFER_ULYSSES_PCIE_GID_INDICES is inconsistent" in decision.reason
+
+
+def test_explicit_pcie_falls_back_when_selected_gids_do_not_match_override():
+    topos = _pcie_mesh()
+    selected = tuple(t.gid_index for t in topos)
+    override = selected[:-1] + (99,)
+    for topo in topos:
+        topo.gid_indices_override = override
+
+    decision = decide_ulysses_backend("pcie", topos)
+
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "p2p"
+    assert "selected GID indices" in decision.reason
+    assert "FLASHINFER_ULYSSES_PCIE_GID_INDICES" in decision.reason
+
+
+@pytest.mark.parametrize(
+    ("mutate", "reason"),
+    [
+        (lambda t: setattr(t[0], "pcie_error", "no mlx5"), "probe failed"),
+    ],
+)
+def test_explicit_pcie_falls_back_to_all_p2p_on_rdma_probe_error(mutate, reason):
+    topos = _pcie_mesh()
+    mutate(topos)
+    decision = decide_ulysses_backend("pcie", topos)
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "p2p"
+    assert reason in decision.reason
+
+
+def test_explicit_pcie_route_hybrid_forces_hybrid():
+    topos = _pcie_mesh()
+    for topo in topos:
+        topo.route = "hybrid"
+    decision = decide_ulysses_backend("pcie", topos)
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "hybrid"
+    assert decision.pcie_plan.requested_route == "hybrid"
+    assert "FLASHINFER_ULYSSES_PCIE_ROUTE=hybrid" in decision.reason
+
+
+def test_explicit_pcie_route_hybrid_requires_numa_split():
+    topos = _pcie_mesh()
+    topos[7].numa_node = 0
+    for topo in topos:
+        topo.route = "hybrid"
+    decision = decide_ulysses_backend("pcie", topos)
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "p2p"
+    assert "4+4" in decision.reason
+
+
+def test_explicit_pcie_route_p2p_selects_all_p2p():
+    topos = _full_mesh(8)
+    for topo in topos:
+        topo.route = "p2p"
+    decision = decide_ulysses_backend("pcie", topos)
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "p2p"
+    assert decision.pcie_plan.requested_route == "p2p"
+    assert "FLASHINFER_ULYSSES_PCIE_ROUTE=p2p" in decision.reason
+
+
+def _rdma_mesh(world_size):
+    """A same-NUMA mesh with a distinct NIC and GID per rank."""
+    topos = _full_mesh(world_size)
+    for r, topo in enumerate(topos):
+        topo.numa_node = 0
+        topo.nic_name = f"mlx5_{r}"
+        topo.gid_index = r + 2
+        topo.route = "rdma"
+    return topos
+
+
+@pytest.mark.parametrize("world_size", [2, 4, 8])
+def test_explicit_pcie_route_rdma_plans_all_rdma(world_size):
+    """Pure RDMA needs no NUMA split and works at every supported multi-rank
+    world size."""
+    topos = _rdma_mesh(world_size)
+    decision = decide_ulysses_backend("pcie", topos)
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "rdma"
+    assert decision.pcie_plan.requested_route == "rdma"
+    assert decision.pcie_plan.gid_indices == tuple(t.gid_index for t in topos)
+    assert "all-RDMA" in decision.reason
+
+
+def test_explicit_pcie_route_rdma_world_size_one_stays_identity():
+    """One rank transports nothing; route=rdma must not arm RDMA semantics
+    (batch=1, pitch limit) on the identity path."""
+    topos = _rdma_mesh(1)
+    decision = decide_ulysses_backend("pcie", topos)
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "p2p"
+
+
+def test_explicit_pcie_route_rdma_falls_back_without_nics():
+    topos = _full_mesh(4)
+    for topo in topos:
+        topo.route = "rdma"
+    decision = decide_ulysses_backend("pcie", topos)
+    assert decision.pcie_plan is not None
+    assert decision.pcie_plan.transport == "p2p"
+    assert decision.pcie_plan.requested_route == "rdma"
+    assert "all-RDMA unavailable" in decision.reason
+
+
+def test_explicit_pcie_route_rdma_rejects_duplicate_nics():
+    topos = _rdma_mesh(4)
+    topos[1].nic_name = topos[0].nic_name
+    decision = decide_ulysses_backend("pcie", topos)
+    assert decision.pcie_plan.transport == "p2p"
+    assert "distinct NIC per rank" in decision.reason
+
+
+def test_explicit_pcie_route_invalid_raises():
+    topos = _pcie_mesh()
+    for topo in topos:
+        topo.route = "RDMA"
+    with pytest.raises(
+        UlyssesBackendError, match="invalid FLASHINFER_ULYSSES_PCIE_ROUTE"
+    ):
+        decide_ulysses_backend("pcie", topos)
+
+
+@pytest.mark.parametrize("value", ["auto", "p2p", "rdma", "hybrid", "bogus"])
+def test_route_env_is_recorded_verbatim(monkeypatch, value):
+    """The probe records the raw value; validation is joint, in the decision,
+    so every rank raises the same error on a bad setting."""
+    monkeypatch.setenv("FLASHINFER_ULYSSES_PCIE_ROUTE", value)
+    assert probe_ulysses_rank_topology(None, rank=0).route == value
+
+
+def test_route_defaults_to_auto(monkeypatch):
+    monkeypatch.delenv("FLASHINFER_ULYSSES_PCIE_ROUTE", raising=False)
+    assert probe_ulysses_rank_topology(None, rank=0).route == "auto"
+
+
+def test_explicit_pcie_route_disagreement_raises():
+    topos = _pcie_mesh()
+    topos[0].route = "p2p"
+    with pytest.raises(
+        UlyssesBackendError, match="disagree on FLASHINFER_ULYSSES_PCIE_ROUTE"
+    ):
+        decide_ulysses_backend("pcie", topos)
+
+
+def test_explicit_pcie_rejects_unsupported_world_size():
+    with pytest.raises(UlyssesBackendError, match="supports world sizes"):
+        decide_ulysses_backend("pcie", _full_mesh(6))
+
+
+def test_auto_does_not_select_experimental_pcie():
+    decision = decide_ulysses_backend("auto", _pcie_mesh())
+    assert decision.backend == "nccl"
+    assert "no NVLink" in decision.reason
+
+
+@pytest.mark.parametrize(
+    "mutate,match",
+    [
+        (
+            lambda t: t[1].peer_p2p.update({t[0].device_uuid: False}),
+            "full-group CUDA P2P",
+        ),
+        (
+            lambda t: t[4].peer_p2p.update({t[0].device_uuid: False}),
+            "full-group CUDA P2P",
+        ),
+    ],
+)
+def test_forced_pcie_rejects_incomplete_route(mutate, match):
+    topos = _pcie_mesh()
+    mutate(topos)
+    with pytest.raises(UlyssesBackendError, match=match):
+        decide_ulysses_backend("pcie", topos)
+
+
 # ---- resolve (collective wrapper) -------------------------------------------
 # Single-process gloo group: no GPU or NCCL needed, proves the forced-NVLink
 # failure fires before any IPC allocation or JIT compilation.
@@ -206,7 +585,7 @@ def test_resolve_auto_world_size_1_no_ipc_jit(gloo_pg, monkeypatch):
     _forbid_ipc_and_jit(monkeypatch)
     monkeypatch.setattr(
         "flashinfer.comm.ulysses_topology.probe_ulysses_rank_topology",
-        lambda device, rank: _full_mesh(1)[0],
+        lambda device, rank, *, probe_pcie=True: _full_mesh(1)[0],
     )
     d = resolve_ulysses_backend("auto", group=gloo_pg, device=torch.device("cpu"))
     assert d.backend == "nccl"
@@ -217,7 +596,7 @@ def test_resolve_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
     _forbid_ipc_and_jit(monkeypatch)
     monkeypatch.setattr(
         "flashinfer.comm.ulysses_topology.probe_ulysses_rank_topology",
-        lambda device, rank: _full_mesh(1)[0],
+        lambda device, rank, *, probe_pcie=True: _full_mesh(1)[0],
     )
     with pytest.raises(UlyssesBackendError, match="world size 1"):
         resolve_ulysses_backend("nvlink", group=gloo_pg, device=torch.device("cpu"))
@@ -249,12 +628,12 @@ class _EvilBackend:
 def _resolve_case_worker(rank, world_size, port, backends, patch, marker_path, q):
     mod = importlib.import_module("flashinfer.comm.ulysses_topology")
 
-    def mesh_probe(device, r):
+    def mesh_probe(device, r, *, probe_pcie=True):
         return _full_mesh(world_size)[r]
 
     if patch == "nvlink_pair_missing":
 
-        def broken_probe(device, r):
+        def broken_probe(device, r, *, probe_pcie=True):
             topos = _full_mesh(world_size)
             topos[1].peer_nvlink[topos[0].device_uuid] = False
             return topos[r]
@@ -263,7 +642,7 @@ def _resolve_case_worker(rank, world_size, port, backends, patch, marker_path, q
     elif patch == "probe_raises_rank0":
         if rank == 0:
 
-            def raising_probe(device, r):
+            def raising_probe(device, r, *, probe_pcie=True):
                 raise RuntimeError("probe exploded")
 
             mod.probe_ulysses_rank_topology = raising_probe
@@ -293,7 +672,7 @@ def _resolve_case_worker(rank, world_size, port, backends, patch, marker_path, q
         )
     elif patch == "probe_marker":
 
-        def marker_probe(device, r):
+        def marker_probe(device, r, *, probe_pcie=True):
             with open(marker_path, "w") as f:
                 f.write(f"probe touched by rank {r}")
             return mesh_probe(device, r)
