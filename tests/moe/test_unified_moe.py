@@ -727,12 +727,10 @@ class TestTypedActivationConfig:
             )
         # No override is still fine.
         _validate_prepared_activation_params({}, ReLU2(), "TestRunner")
-        # A gated activation keeps accepting them.
-        for gated in (GeGLU(), GeGLUTanh()):
-            assert gated.is_gated
-            _validate_prepared_activation_params(
-                {"gemm1_alpha": torch.ones(2)}, gated, "TestRunner"
-            )
+        # Deliberately no positive case for a gated non-SwiGLU activation: this
+        # shared helper would let GeGLU(gemm1_alpha=...) through, but the
+        # CUTLASS runner rejects that one layer down, so asserting acceptance
+        # here would pin a permissiveness no backend honors.
 
     @pytest.mark.parametrize(
         "activation,expected_rows",

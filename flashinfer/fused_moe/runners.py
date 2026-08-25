@@ -758,23 +758,54 @@ class _CutlassRunnerBase(MoERunner):
             )
             self._config_activation_params = config_params
         params = dict(config_params)
-        aliases = {
-            "gemm1_alpha": "swiglu_alpha",
-            "gemm1_beta": "swiglu_beta",
-            "gemm1_clamp_limit": "swiglu_limit",
-        }
+        activation = self.config.activation
+        # SiTU carries its own native CUTLASS keys rather than the gemm1_*
+        # spelling, so the accepted override names depend on the activation.
+        # Reading only the gemm1_* set would drop a supplied situ_beta on the
+        # floor while rejecting the gemm1_* names the caller does not have.
+        if isinstance(activation, SiTU):
+            aliases = {
+                "situ_beta": "situ_beta",
+                "situ_linear_beta": "situ_linear_beta",
+            }
+        else:
+            aliases = {
+                "gemm1_alpha": "swiglu_alpha",
+                "gemm1_beta": "swiglu_beta",
+                "gemm1_clamp_limit": "swiglu_limit",
+            }
         present = [name for name in aliases if name in view]
-        if isinstance(self.config.activation, SwiGLUStep):
+        if isinstance(activation, SwiGLUStep):
             ignored = [name for name in ("gemm1_alpha", "gemm1_beta") if name in view]
             if ignored:
                 raise ValueError(
                     f"{type(self).__name__}: SwiGLUStep does not consume "
                     f"per-expert overrides {ignored}; only gemm1_clamp_limit is valid."
                 )
-        if present and not isinstance(self.config.activation, (SwiGLU, SwiGLUStep)):
+        if present and not isinstance(activation, (SwiGLU, SwiGLUStep, SiTU)):
             raise ValueError(
                 f"{type(self).__name__}: per-expert activation overrides {present} "
-                f"are invalid for {type(self.config.activation).__name__}."
+                f"are invalid for {type(activation).__name__}."
+            )
+        # An override spelled for a different activation is a mistake worth
+        # naming, not something to ignore -- in either direction.
+        foreign: tuple[str, ...]
+        correct: str
+        if isinstance(activation, SiTU):
+            foreign, correct = (
+                ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
+                "situ_beta / situ_linear_beta",
+            )
+        else:
+            foreign, correct = (
+                ("situ_beta", "situ_linear_beta"),
+                "gemm1_alpha / gemm1_beta / gemm1_clamp_limit",
+            )
+        supplied = [name for name in foreign if name in view]
+        if supplied:
+            raise ValueError(
+                f"{type(self).__name__}: {type(activation).__name__} takes "
+                f"per-expert overrides as {correct}, not {supplied}."
             )
         expected_shape = (self.config.routing.num_experts,)
         for source, destination in aliases.items():
@@ -2156,10 +2187,13 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             # SM100/SM107 and retains the upstream SM103 xfail in #1754.
             compute_capability = get_compute_capability(self.device)
             if compute_capability == (10, 7) and isinstance(activation, SiTU):
-                # The pinned Rubin BMM artifact predates SiTuGlu. Its native
-                # gated-activation enum uses value 2 for None, while the host
-                # enum uses 2 for SiTuGlu, so forwarding SiTU would silently
-                # execute no activation.
+                # The pinned Rubin BMM artifact predates SiTuGlu: its
+                # gemmGatedAct::ActType is {SwiGlu, GeGlu, None}, so None holds
+                # the value SiTuGlu has elsewhere. activationTypeToGatedActType
+                # still maps Situ to it, and the static asserts that would catch
+                # the mismatch are compiled out under TLLM_RUBIN_FEATURES, so
+                # forwarding SiTU would silently execute no activation. Drop
+                # this once the Rubin pin carries SiTuGlu.
                 raise NotImplementedError(
                     f"{type(self).__name__} does not support SiTU on SM107 with "
                     "the currently pinned Rubin BMM artifact."
@@ -2172,21 +2206,6 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                 raise NotImplementedError(
                     f"TRTLLM {variant.name} is unsupported on "
                     f"SM{compute_capability[0]}{compute_capability[1]}."
-                )
-            # SM107 builds against the pinned Rubin BMM package, whose
-            # gemmGatedAct::ActType is {SwiGlu, GeGlu, None} -- None occupies
-            # the value SiTuGlu has elsewhere. activationTypeToGatedActType
-            # still maps Situ to that value, and the static asserts that would
-            # catch the mismatch are compiled out under TLLM_RUBIN_FEATURES, so
-            # a SiTU request would run with no activation instead of failing.
-            # Drop this once the Rubin pin carries SiTuGlu.
-            if compute_capability == (10, 7) and isinstance(
-                self.config.activation, SiTU
-            ):
-                raise NotImplementedError(
-                    f"{type(self).__name__} cannot run SiTU on SM107: the "
-                    "pinned Rubin BMM package predates SiTuGlu and would "
-                    "silently apply no activation."
                 )
 
     def __init__(self, config: MoEConfig, device: torch.device):

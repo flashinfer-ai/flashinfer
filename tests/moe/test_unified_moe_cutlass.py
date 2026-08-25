@@ -506,6 +506,7 @@ def test_cutlass_mxfp4_linear_quantizer_clamps_finite_extremes():
         (SwiGLU(), 512),
         (SwiGLUStep(), 512),
         (GeGLUTanh(), 512),
+        (SiTU(), 512),
         (ReLU2(), 256),
     ),
 )
@@ -556,7 +557,10 @@ def test_cutlass_situ_materializes_only_non_default_scalars():
     params = _cutlass_activation_params(tuned, 4, torch.device("cpu"))
     torch.testing.assert_close(params["situ_beta"], torch.full((4,), 2.0))
     torch.testing.assert_close(params["situ_linear_beta"], torch.full((4,), 10.0))
-    # Distinct key sets are what keeps the two apart in the autotune cache.
+    # The key set drives cache *validity* -- a cached mapping missing one of
+    # these is treated as uninitialized. Cache *identity* comes from
+    # repr(config.activation), which already separates a tuned SiTU from a
+    # default one.
     assert _cutlass_activation_required_keys(tuned) == frozenset(
         ("situ_beta", "situ_linear_beta")
     )
@@ -577,6 +581,80 @@ def test_cutlass_rejects_situ_shapes_its_abi_cannot_express(activation, match):
     runner._device_arch = 100
     with pytest.raises(NotImplementedError, match=match):
         runner.check_support()
+
+
+def test_cutlass_situ_per_expert_overrides_are_read():
+    """A supplied situ_* tensor must reach the kernel params.
+
+    SiTU carries CUTLASS's native keys rather than the gemm1_* spelling, so an
+    override map keyed only on gemm1_* would drop situ_beta silently while
+    rejecting names the caller never used.
+    """
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config(activation=SiTU(gate_scale=2.0, linear_scale=10.0))
+    runner.device = torch.device("cpu")
+
+    resolved = runner._resolve_activation_params(
+        {
+            "situ_beta": torch.full((4,), 9.0),
+            "situ_linear_beta": torch.full((4,), 99.0),
+        }
+    )
+    torch.testing.assert_close(resolved["situ_beta"], torch.full((4,), 9.0))
+    torch.testing.assert_close(resolved["situ_linear_beta"], torch.full((4,), 99.0))
+
+    # Without an override the configured scalars stand.
+    resolved = runner._resolve_activation_params({})
+    torch.testing.assert_close(resolved["situ_beta"], torch.full((4,), 2.0))
+    torch.testing.assert_close(resolved["situ_linear_beta"], torch.full((4,), 10.0))
+
+
+@pytest.mark.parametrize(
+    "key", ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"), ids=lambda k: k
+)
+def test_cutlass_situ_rejects_gemm1_spelled_overrides(key):
+    """The gemm1_* names belong to the TRTLLM path and are not SiTU's."""
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config(activation=SiTU())
+    runner.device = torch.device("cpu")
+    with pytest.raises(ValueError, match="situ_beta / situ_linear_beta"):
+        runner._resolve_activation_params({key: torch.full((4,), 1.0)})
+
+
+@pytest.mark.parametrize(
+    "activation", (SwiGLU(alpha=1.7), SwiGLUStep(), GeGLUTanh(), ReLU2())
+)
+@pytest.mark.parametrize("key", ("situ_beta", "situ_linear_beta"), ids=lambda k: k)
+def test_cutlass_non_situ_rejects_situ_spelled_overrides(activation, key):
+    """The mirror of the SiTU case: a situ_* key is foreign to every other one.
+
+    Reading only the alias map that matches the configured activation would let
+    the other spelling through untouched, which looks like a working override
+    while the kernel never sees it.
+    """
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config(activation=activation)
+    runner.device = torch.device("cpu")
+    with pytest.raises(ValueError, match="gemm1_alpha / gemm1_beta"):
+        runner._resolve_activation_params({key: torch.full((4,), 9.0)})
+
+
+@pytest.mark.parametrize(
+    ("mutation", "match"),
+    (
+        (lambda t: t.to(torch.float16), "float32"),
+        (lambda t: t[:1], "shape"),
+    ),
+    ids=("dtype", "shape"),
+)
+def test_cutlass_situ_override_boundary_is_validated(mutation, match):
+    runner = CutlassBf16Runner.__new__(CutlassBf16Runner)
+    runner.config = _config(activation=SiTU())
+    runner.device = torch.device("cpu")
+    with pytest.raises((ValueError, TypeError), match=match):
+        runner._resolve_activation_params(
+            {"situ_beta": mutation(torch.full((4,), 9.0))}
+        )
 
 
 def test_cutlass_activation_params_derived_when_build_did_not_cache_them():
@@ -1512,6 +1590,19 @@ def _reference(
                     )
                 elif isinstance(activation, GeGLUTanh):
                     intermediate = F.gelu(gate, approximate="tanh") * up
+                elif isinstance(activation, SiTU):
+                    # SituAdaptor:
+                    #   (beta * tanh(gate/beta) * sigmoid(gate))
+                    #   * (linear_beta * tanh(up/linear_beta))
+                    # The sigmoid reads the uncapped gate. The kernel evaluates
+                    # tanh as 2*sigmoid(2z)-1 to avoid tanh.approx.f32 error at
+                    # linear_beta=25; torch.tanh is exact, and the difference is
+                    # well inside the tolerance below.
+                    beta = activation.gate_scale
+                    linear_beta = activation.linear_scale
+                    intermediate = (
+                        beta * torch.tanh(gate / beta) * torch.sigmoid(gate)
+                    ) * (linear_beta * torch.tanh(up / linear_beta))
                 else:
                     raise AssertionError(
                         f"unsupported CUTLASS activation {activation!r}"
@@ -1574,6 +1665,11 @@ def _pin_fallback_winner(layer: MoELayer, act: MoEActivationPack):
         SwiGLUStep(),
         GeGLUTanh(),
         ReLU2(),
+        # The default exercises SituAdaptor's compile-time scalars, for which
+        # no per-expert tensor is materialized; the tuned one exercises the
+        # tensors.
+        SiTU(),
+        SiTU(gate_scale=2.0, linear_scale=10.0),
     ),
 )
 def test_cutlass_bf16_moe_layer_matches_independent_reference(activation):
@@ -1590,7 +1686,9 @@ def test_cutlass_bf16_moe_layer_matches_independent_reference(activation):
 
 
 @cutlass_w4a16_required
-@pytest.mark.parametrize("activation", (SwiGLU(), SwiGLUStep(), GeGLUTanh(), ReLU2()))
+@pytest.mark.parametrize(
+    "activation", (SwiGLU(), SwiGLUStep(), GeGLUTanh(), ReLU2(), SiTU())
+)
 def test_cutlass_w4a16_moe_layer_matches_quantized_reference(activation):
     config, act, weights, w1, w2, view = _make_w4a16_case(activation=activation)
     assert view["fc1_expert_weights"].dtype is torch.uint8

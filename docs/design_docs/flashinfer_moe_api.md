@@ -713,8 +713,7 @@ equality, hashing, repr serialization, and tactic-cache identity. Per-expert
 unclamped linear branch, which only the CuTe-DSL scalar ABI can express: the
 TRT-LLM path carries the value in a per-expert `gemm1_beta` float tensor that
 has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
-silently dropping the parameter. The default stays `1.0`, so cross-backend
-parity is unchanged unless `None` is requested explicitly.
+silently dropping the parameter.
 
 The truthful unified support matrix follows the already executable flat path:
 
