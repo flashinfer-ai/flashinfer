@@ -129,3 +129,11 @@ def test_cache_dir_default_home(monkeypatch, tmp_path):
     monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
     monkeypatch.setattr(_env.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
     assert _env._get_cache_dir() == tmp_path / ".cache" / "flashinfer"
+
+
+def test_cache_dir_ignores_relative_xdg_cache_home(monkeypatch, tmp_path):
+    """A relative XDG_CACHE_HOME is invalid per XDG spec and must be ignored."""
+    monkeypatch.delenv("FLASHINFER_WORKSPACE_BASE", raising=False)
+    monkeypatch.setenv("XDG_CACHE_HOME", "relative/cache")
+    monkeypatch.setattr(_env.pathlib.Path, "home", classmethod(lambda cls: tmp_path))
+    assert _env._get_cache_dir() == tmp_path / ".cache" / "flashinfer"

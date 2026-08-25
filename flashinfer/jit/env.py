@@ -72,7 +72,8 @@ def _get_cache_dir() -> pathlib.Path:
     if workspace_base:
         return pathlib.Path(workspace_base) / ".cache" / "flashinfer"
     xdg_cache_home = os.getenv("XDG_CACHE_HOME")
-    if xdg_cache_home:
+    # The XDG spec requires an absolute path; relative values must be ignored.
+    if xdg_cache_home and pathlib.Path(xdg_cache_home).is_absolute():
         return pathlib.Path(xdg_cache_home) / "flashinfer"
     return pathlib.Path.home() / ".cache" / "flashinfer"
 
