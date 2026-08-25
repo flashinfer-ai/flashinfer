@@ -678,9 +678,10 @@ def is_cub_topk_beneficial(
     for the benchmark results.
 
     ``clusters_eligible`` states whether the clusters backend could serve this
-    call (``can_use_clusters_topk``); it selects between the clusters-calibrated
-    and radix-calibrated thresholds. Returning False falls through to the
-    clusters / radix dispatch below the CUB branch.
+    call (``can_use_clusters_topk``); the eager calls it can serve always defer
+    to it, so only the graphed and radix-calibrated thresholds below apply.
+    Returning False falls through to the clusters / radix dispatch below the CUB
+    branch.
     """
     if algo == "cub":
         return True
@@ -695,17 +696,11 @@ def is_cub_topk_beneficial(
         return d >= (32768 if dtype == torch.float32 else 65536)
 
     # When the clusters backend is available (SM100, eager, non-deterministic,
-    # no tie-break), it beats CUB nearly everywhere; CUB only keeps the fp32
-    # d ~ 8192 band (below batch 256), fp32 small-batch mid-d, and single-row
-    # long-d calls.
+    # no tie-break), always fall through to it. CUB's kernel is faster on some
+    # shapes, but its eager per-call host cost occasionally outweighs that end
+    # to end.
     if clusters_eligible:
-        if dtype == torch.float32:
-            return (
-                (4096 < d <= 8192 and num_rows < 256)
-                or (num_rows == 1 and d > 4096)
-                or (num_rows <= 32 and 16384 <= d <= 65536)
-            )
-        return num_rows == 1 and d >= 262144
+        return False
 
     # Eager with no clusters backend available: CUB vs the radix backend.
     # CUB always wins under these conditions
