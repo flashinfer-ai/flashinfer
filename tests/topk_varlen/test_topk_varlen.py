@@ -96,6 +96,23 @@ requires_blackwell = pytest.mark.skipif(
 )
 
 
+# The radix_cutlass backend is the portable fallback the auto heuristic lands on
+# when GVR is unavailable, but it is not offered on every compute capability
+# (e.g. SM107/Rubin).  Tests that force it, or that rely on auto resolving to it,
+# must gate on the backend actually being supported rather than on "has a GPU".
+def _backend_hw_supported(name: str) -> bool:
+    if not torch.cuda.is_available() or not _FLASHINFER_AVAILABLE:
+        return False
+    major, minor = get_compute_capability(torch.device("cuda"))
+    return flashinfer.top_k_varlen.is_backend_supported(name, major * 10 + minor)
+
+
+requires_radix_cutlass = pytest.mark.skipif(
+    not _backend_hw_supported("radix_cutlass"),
+    reason="top_k_varlen radix_cutlass backend is unsupported on this compute capability",
+)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -211,6 +228,7 @@ def _radix_ctas(N, dtype, batch_size):
 )
 @pytest.mark.parametrize("N", [4096, 32768])
 @pytest.mark.parametrize("batch_size", [1, 32])
+@requires_radix_cutlass
 def test_basic_decode(dtype, top_k, N, batch_size):
     """top_k_varlen with pre_idx: works on Blackwell (GVR) and any GPU (radix)."""
     if not torch.cuda.is_available():
@@ -361,6 +379,7 @@ def test_large_batch():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@requires_radix_cutlass
 def test_repeated_calls():
     """Repeated identical calls each return a valid top-K (no state corruption).
 
@@ -388,6 +407,7 @@ def test_repeated_calls():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@requires_radix_cutlass
 def test_no_pre_idx_selects_radix():
     """pre_idx=None resolves auto to a radix backend (never GVR) and is correct.
 
@@ -412,6 +432,7 @@ def test_no_pre_idx_selects_radix():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@requires_radix_cutlass
 def test_skip_check_auto_backend():
     """skip_check=True with backend="auto" must not raise TypeError.
 
@@ -439,6 +460,7 @@ def test_skip_check_auto_backend():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("top_k", [512, 1024])
+@requires_radix_cutlass
 def test_radix_cutlass_return_values(dtype, top_k):
     """radix_cutlass backend: returned values must equal logits[row, indices]."""
     N, batch_size = 8192, 4
@@ -468,6 +490,7 @@ def test_radix_cutlass_return_values(dtype, top_k):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("top_k", [512, 1024])
 @pytest.mark.parametrize("batch_size", [2, 16])
+@requires_radix_cutlass
 def test_radix_cutlass_next_n(dtype, top_k, batch_size):
     """radix_cutlass backend: next_n=2 — two rows share one seq_len entry."""
     next_n, N = 2, 8192
@@ -487,6 +510,7 @@ def test_radix_cutlass_next_n(dtype, top_k, batch_size):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("top_k", [512, 1024])
+@requires_radix_cutlass
 def test_radix_cutlass_compress_ratio(dtype, top_k):
     """radix_cutlass backend: compress_ratio=4 — seq_lens in uncompressed-token space."""
     compress_ratio, N, batch_size = 4, 4096, 8
@@ -508,6 +532,7 @@ def test_radix_cutlass_compress_ratio(dtype, top_k):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@requires_radix_cutlass
 def test_radix_cutlass_preallocated_outputs():
     """radix_cutlass backend: out_indices and out_values are written in-place."""
     dtype, top_k, N, batch_size = torch.bfloat16, 512, 4096, 4
@@ -712,6 +737,7 @@ def test_gvr_row_width_alignment(dtype, align):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@requires_radix_cutlass
 def test_radix_cutlass_row_width_no_alignment_constraint():
     """radix_cutlass backend accepts any N (no vectorized-load alignment requirement)."""
     top_k, batch_size, N_bad = 512, 4, 4097
@@ -1044,6 +1070,7 @@ def test_out_values_ignored_when_return_values_false(backend, load_balance):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 @pytest.mark.parametrize("backend", ["radix", "radix_cutlass"])
+@requires_radix_cutlass
 def test_varlen_ragged(backend):
     """Distinct per-row seq_lens: every row is masked to its own length.
 
@@ -1063,6 +1090,7 @@ def test_varlen_ragged(backend):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 @pytest.mark.parametrize("backend", ["radix", "radix_cutlass"])
+@requires_radix_cutlass
 def test_seq_len_equals_top_k(backend):
     """Degenerate seq_len == top_k: the top-K is exactly all valid indices [0, top_k)."""
     if backend == "radix" and not _IS_BLACKWELL:
@@ -1262,6 +1290,7 @@ def test_unknown_backend_rejected():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+@requires_radix_cutlass
 def test_input_validation():
     """1-D logits and non-int32 seq_lens are rejected by the up-front asserts."""
     top_k = 512
@@ -1311,6 +1340,7 @@ def test_radix_multi_cta_return_values(dtype, top_k, N, batch_size):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 @pytest.mark.parametrize("backend", ["radix", "radix_cutlass"])
+@requires_radix_cutlass
 def test_seq_len_less_than_top_k(backend):
     """Rows with seq_len < top_k: every valid index [0, seq_len) is selected.
 
@@ -1359,6 +1389,7 @@ def test_seq_len_less_than_top_k(backend):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
 @pytest.mark.parametrize("next_n", [1, 2])
+@requires_radix_cutlass
 def test_cuda_graph_radix_cutlass(next_n):
     """radix_cutlass (the non-Blackwell auto default) under CUDA graph replay.
 

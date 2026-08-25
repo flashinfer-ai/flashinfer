@@ -20,6 +20,8 @@ import torch
 import torch.nn.functional as F
 import pytest
 
+from tests.test_helpers.test_helpers import skip_if_cute_dsl_arch_unsupported
+
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
@@ -32,6 +34,10 @@ INTEGER_DTYPES = (
 
 def _skip_if_not_supported():
     device = torch.device("cuda")
+    # Every GDN backend is a CuTe-DSL kernel compiled for the device's own
+    # arch; an older DSL raises a bare KeyError (e.g. 'sm_107a' on CuTe DSL
+    # 4.7 / Rubin).  Treat that as an environment gap and skip.
+    skip_if_cute_dsl_arch_unsupported(device)
     major, _ = get_compute_capability(device)
     if major not in (9, 10, 12):
         pytest.skip("state_indices GDN prefill path requires SM90, SM100, or SM120")

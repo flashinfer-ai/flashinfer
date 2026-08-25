@@ -641,6 +641,25 @@ def is_sm100a_supported(device: torch.device) -> bool:
     return major == 10 and version_at_least(torch.version.cuda, "12.8")
 
 
+def is_datacenter_blackwell(device: torch.device = None) -> bool:
+    """Check if the device is B200 (cc 10.0) or B300 (cc 10.3), and nothing else.
+
+    ``is_sm100a_supported`` is a *family* predicate (``major == 10``), so it is
+    also True on Rubin/SM107 (cc 10.7).  That is the right answer for kernels
+    that only need the shared 10.x feature set, but wrong for anything that
+    genuinely requires the B200/B300 instruction set: those paths pass the
+    family gate on SM107 and then die deeper in with a ``Check failed`` or a
+    ``KeyError`` from kernel compilation.  Use this predicate there instead so
+    SM107 is rejected (or skipped, in tests) at the front door.
+
+    Kept in the same shape as :func:`is_cvt_rs_supported`: an explicit
+    compute-capability allow-list, never a major-version check.
+    """
+    if device is None:
+        device = torch.device("cuda")
+    return get_compute_capability(device) in ((10, 0), (10, 3))
+
+
 def is_sm100f_supported(device: torch.device) -> bool:
     major, _ = get_compute_capability(device)
     return major == 10 and version_at_least(torch.version.cuda, "12.9")
@@ -1450,7 +1469,18 @@ def backend_requirement(
                 if kwargs.get("backend") == "auto":
                     # This needs to be called for heuristic function
                     capability = _get_capability(*args, **kwargs)
-                    suitable_auto_backends(capability, *args, **kwargs)
+                    # `suitable_auto_backends` only publishes
+                    # `wrapper.suitable_auto_backends` when it finds at least one
+                    # backend.  `skip_check` skips *validation*, but it cannot
+                    # skip auto-resolution: ignoring a False here lets the body
+                    # read the attribute that was never set and fail with a bare
+                    # `AttributeError: 'function' object has no attribute
+                    # 'suitable_auto_backends'`.  Report the same error the
+                    # checked path would.
+                    if not suitable_auto_backends(capability, *args, **kwargs):
+                        raise BackendSupportedError(
+                            f"No suitable auto backends found for {func.__name__}"
+                        )
 
             return func(*args, **kwargs)
 

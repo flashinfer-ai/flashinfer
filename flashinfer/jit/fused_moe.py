@@ -247,16 +247,10 @@ def gen_trtllm_gen_fused_moe_sm100_module(enable_rubin: bool = False) -> JitSpec
     # Fetch "flashinferMetaInfo.h" from the online kernel cache. This file
     # contains the `tllmGenBatchedGemmList` as the list of available kernels
     # online. It is included when compiling `trtllm_fused_moe_runner.cu`, etc.
-    bmm_path = (
-        ArtifactPath.TRTLLM_GEN_BMM_RUBIN
-        if enable_rubin
-        else ArtifactPath.TRTLLM_GEN_BMM
-    )
-    bmm_checksum = (
-        CheckSumHash.TRTLLM_GEN_BMM_RUBIN
-        if enable_rubin
-        else CheckSumHash.TRTLLM_GEN_BMM
-    )
+    # One BMM package serves both Blackwell and Rubin; only the compile flags
+    # and the module name still differ between the two variants.
+    bmm_path = ArtifactPath.TRTLLM_GEN_BMM
+    bmm_checksum = CheckSumHash.TRTLLM_GEN_BMM
     module_name = "fused_moe_trtllm_sm107" if enable_rubin else "fused_moe_trtllm_sm100"
     rubin_flags = ["-DTLLM_RUBIN_FEATURES"] if enable_rubin else []
     include_path = f"{bmm_path}/include"
