@@ -23,7 +23,7 @@ def _manifest(backend, source: bytes, arch: str):
         "compile_flags": ["--use_fast_math"],
         "tma_abi": "pointer",
         "kernel_count": 8,
-        "launch": copy.deepcopy(backend._LAUNCH_CONTRACT),
+        "launch": backend._launch_contract(source),
         "constraints": copy.deepcopy(backend._CONSTRAINTS),
         "kernel_symbols": list(backend._KERNEL_SYMBOLS),
         "route_coverage": copy.deepcopy(backend._ROUTE_COVERAGE),
@@ -32,7 +32,10 @@ def _manifest(backend, source: bytes, arch: str):
 
 
 def _write_bundle(tmp_path: Path, backend, arch: str = "sm_100a"):
-    source = b'extern "C" __global__ void generated() {}\n'
+    source = (
+        b"#define SMEM_TOTAL 197632\n" * 4
+        + b'extern "C" __global__ void generated() {}\n'
+    )
     directory = tmp_path / arch.replace("sm_", "sm")
     directory.mkdir(parents=True)
     source_path = directory / "cake_all_gather_matmul_kernels.cu"
@@ -53,6 +56,35 @@ def test_program_source_accepts_exact_ordered_manifest(tmp_path, monkeypatch):
 
     assert actual_source == source_path
     assert manifest["kernel_symbols"] == list(backend._KERNEL_SYMBOLS)
+    assert manifest["launch"]["main"]["dynamic_smem_bytes"] == 197632
+
+
+def test_host_launch_consumes_manifest_smem(tmp_path, monkeypatch):
+    backend = _backend()
+    source_path, _ = _write_bundle(tmp_path, backend)
+    monkeypatch.setattr(backend, "_source_dir", lambda: tmp_path)
+    _, manifest = backend._program_source("sm_100a")
+
+    rendered = backend._render_host_source("test_module", manifest)
+
+    assert "constexpr int32_t kMainSmemBytes = 197632;" in rendered
+    assert "CAKE_MAIN_SMEM_BYTES" not in rendered
+    assert source_path.read_bytes().count(b"#define SMEM_TOTAL 197632") == 4
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        b"#define SMEM_TOTAL 197632\n" * 3,
+        b"#define SMEM_TOTAL 197632\n" * 3
+        + b"#define SMEM_TOTAL 196608\n",
+    ],
+)
+def test_source_launch_contract_rejects_missing_or_divergent_main_smem(source):
+    backend = _backend()
+
+    with pytest.raises(RuntimeError, match="one uniform SMEM_TOTAL"):
+        backend._launch_contract(source)
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
@@ -66,6 +98,7 @@ def test_packaged_program_has_self_contained_pointer_abi(arch):
         b"struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };"
     ) == 1
     assert source.count(b"CakeTensorMap const*") == 12
+    assert backend._resolved_main_smem_bytes(source) == 197632
 
 
 @pytest.mark.parametrize(
@@ -77,6 +110,9 @@ def test_packaged_program_has_self_contained_pointer_abi(arch):
         lambda manifest: manifest["kernel_symbols"].reverse(),
         lambda manifest: manifest["constraints"].update(world_sizes=[2]),
         lambda manifest: manifest["launch"]["main"].update(block_threads=128),
+        lambda manifest: manifest["launch"]["main"].update(
+            dynamic_smem_bytes=196608
+        ),
         lambda manifest: manifest["route_coverage"]["ws4"]["main"].update(
             bfloat16=manifest["kernel_symbols"][5]
         ),

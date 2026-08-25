@@ -42,6 +42,9 @@ the source-built fused backend for contiguous bfloat16 or float16 inputs with
 ``K=8192``, ``N=2048``, a positive ``M`` divisible by 128, an NVSHMEM symmetric
 input, and a two- or four-rank NCCL process group. Unsupported explicit Cake
 requests raise instead of silently falling back.
+The packaged manifest carries the exact dynamic shared-memory requirement
+resolved for every generated main route; the loader validates that value
+against the packaged CUDA source before compiling the host launcher.
 
 .. autosummary::
     :toctree: ../generated

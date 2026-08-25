@@ -8,6 +8,7 @@ import functools
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -27,10 +28,9 @@ _BLOCK_M = 128
 _CHUNK_ROWS = 19 * _BLOCK_M
 _K = 8192
 _N = 2048
-_MAIN_THREADS = 192
-_MAIN_SMEM_BYTES = 196608
 _TENSOR_MAP_BYTES = 128
 _DESCRIPTOR_COUNT = 3
+_MAIN_KERNEL_COUNT = 4
 _SUPPORTED_WORLD_SIZES = frozenset((2, 4))
 _SUPPORTED_DTYPES = frozenset((torch.bfloat16, torch.float16))
 _KERNEL_SYMBOLS = (
@@ -57,18 +57,7 @@ _MANIFEST_KEYS = frozenset(
         "source_sha256",
     }
 )
-_LAUNCH_CONTRACT = {
-    "barrier": {
-        "block_threads": 32,
-        "dynamic_smem_bytes": 0,
-        "grid": [1, 1, 1],
-    },
-    "main": {
-        "block_threads": 192,
-        "dynamic_smem_bytes": 196608,
-        "grid_x": "(min(M, 2432) / 128) * 8",
-    },
-}
+_SMEM_TOTAL_PATTERN = re.compile(rb"^#define SMEM_TOTAL ([1-9][0-9]*)$", re.MULTILINE)
 _CONSTRAINTS = {
     "dtypes": ["float16", "bfloat16"],
     "k": 8192,
@@ -114,7 +103,7 @@ using tvm::ffi::TensorView;
 constexpr int64_t kTensorMapBytes = sizeof(CUtensorMap);
 constexpr int64_t kDescriptorCount = 3;
 constexpr int32_t kMainThreads = 192;
-constexpr int32_t kMainSmemBytes = 196608;
+constexpr int32_t kMainSmemBytes = CAKE_MAIN_SMEM_BYTES;
 
 static_assert(sizeof(CUtensorMap) == 128);
 
@@ -457,6 +446,43 @@ def _reject_duplicate_manifest_keys(pairs):
     return document
 
 
+def _resolved_main_smem_bytes(source: bytes) -> int:
+    values = [int(match) for match in _SMEM_TOTAL_PATTERN.findall(source)]
+    if len(values) != _MAIN_KERNEL_COUNT or len(set(values)) != 1:
+        raise RuntimeError(
+            "Cake all-gather matmul source must expose one uniform SMEM_TOTAL "
+            "for each main kernel"
+        )
+    return values[0]
+
+
+def _launch_contract(source: bytes) -> dict[str, Any]:
+    return {
+        "barrier": {
+            "block_threads": 32,
+            "dynamic_smem_bytes": 0,
+            "grid": [1, 1, 1],
+        },
+        "main": {
+            "block_threads": 192,
+            "dynamic_smem_bytes": _resolved_main_smem_bytes(source),
+            "grid_x": "(min(M, 2432) / 128) * 8",
+        },
+    }
+
+
+def _render_host_source(module_ident: str, manifest: dict[str, Any]) -> str:
+    main_smem_bytes = int(manifest["launch"]["main"]["dynamic_smem_bytes"])
+    if main_smem_bytes <= 0:
+        raise RuntimeError("Cake all-gather matmul main dynamic shared memory is invalid")
+    rendered = _HOST_SOURCE.replace("CAKE_MODULE_IDENT", module_ident).replace(
+        "CAKE_MAIN_SMEM_BYTES", str(main_smem_bytes)
+    )
+    if "CAKE_MODULE_IDENT" in rendered or "CAKE_MAIN_SMEM_BYTES" in rendered:
+        raise RuntimeError("Cake all-gather matmul host launch template is incomplete")
+    return rendered
+
+
 def _program_source(arch: str) -> tuple[Path, dict[str, Any]]:
     directory = _source_dir() / arch.replace("sm_", "sm")
     source = directory / "cake_all_gather_matmul_kernels.cu"
@@ -467,14 +493,15 @@ def _program_source(arch: str) -> tuple[Path, dict[str, Any]]:
         manifest_path.read_text(encoding="utf-8"),
         object_pairs_hook=_reject_duplicate_manifest_keys,
     )
-    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    source_bytes = source.read_bytes()
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
     expected = {
         "schema_version": 1,
         "arch": arch,
         "compile_flags": ["--use_fast_math"],
         "tma_abi": "pointer",
         "kernel_count": 8,
-        "launch": _LAUNCH_CONTRACT,
+        "launch": _launch_contract(source_bytes),
         "constraints": _CONSTRAINTS,
         "kernel_symbols": list(_KERNEL_SYMBOLS),
         "route_coverage": _ROUTE_COVERAGE,
@@ -503,7 +530,7 @@ def _load_program(arch: str):
     digest.update(str(nvcc).encode())
     key = digest.hexdigest()[:16]
     module_ident = f"cake_all_gather_matmul_{arch}_{key}"
-    host_source = _HOST_SOURCE.replace("CAKE_MODULE_IDENT", module_ident)
+    host_source = _render_host_source(module_ident, manifest)
     build_dir = jit_env.FLASHINFER_JIT_DIR / module_ident
     build_dir.mkdir(parents=True, exist_ok=True)
     cubin = build_dir / f"{module_ident}.cubin"

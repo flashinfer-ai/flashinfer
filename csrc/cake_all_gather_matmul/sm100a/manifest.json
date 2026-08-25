@@ -39,7 +39,7 @@
     },
     "main": {
       "block_threads": 192,
-      "dynamic_smem_bytes": 196608,
+      "dynamic_smem_bytes": 197632,
       "grid_x": "(min(M, 2432) / 128) * 8"
     }
   },
