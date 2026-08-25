@@ -27,8 +27,8 @@ namespace activation {
 
 template <typename T, float (*Activation)(const float&)>
 __global__ __launch_bounds__(256) void act_and_mul_kernel(T* __restrict__ out,
-                                                            const T* __restrict__ input,
-                                                            const int d) {
+                                                          const T* __restrict__ input,
+                                                          const int d) {
   constexpr uint32_t vec_size = 16 / sizeof(T);
   const int64_t token_idx = blockIdx.x;
   const int64_t thread_idx = threadIdx.x;
