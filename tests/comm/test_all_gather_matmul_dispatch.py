@@ -1,4 +1,5 @@
 import importlib
+import inspect
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -8,6 +9,24 @@ import pytest
 def _dispatcher():
     return importlib.import_module(
         "flashinfer.comm.all_gather_matmul.all_gather_matmul"
+    )
+
+
+def test_public_package_exports_exact_callable_api():
+    import flashinfer.comm as comm
+    from flashinfer.comm import all_gather_matmul
+
+    assert callable(all_gather_matmul)
+    assert comm.all_gather_matmul is all_gather_matmul
+    assert (
+        all_gather_matmul.__module__
+        == "flashinfer.comm.all_gather_matmul.all_gather_matmul"
+    )
+    signature = inspect.signature(all_gather_matmul)
+    assert str(signature.parameters["backend"].default) == "auto"
+    source = inspect.getsourcefile(all_gather_matmul)
+    assert source is not None and source.endswith(
+        "flashinfer/comm/all_gather_matmul/all_gather_matmul.py"
     )
 
 
