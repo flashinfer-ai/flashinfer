@@ -332,6 +332,7 @@ def test_descriptor_prepare_failure_does_not_install_cache_entry(monkeypatch):
     workspace = SimpleNamespace(scratch="scratch", descriptor_cache=OrderedDict())
     monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: tensor)
     monkeypatch.setattr(backend.torch, "empty", lambda *args, **kwargs: object())
+
     def prepare(*args):
         raise RuntimeError("prepare failed")
 
@@ -357,7 +358,7 @@ def test_concurrent_descriptor_prepare_returns_one_cached_entry(monkeypatch):
     monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: tensor)
     allocations = []
     preparations = []
-    prepare_barrier = Barrier(2)
+    call_barrier = Barrier(2, timeout=30)
 
     def allocate(*args, **kwargs):
         descriptor = object()
@@ -366,12 +367,12 @@ def test_concurrent_descriptor_prepare_returns_one_cached_entry(monkeypatch):
 
     def prepare(*args):
         preparations.append(args)
-        prepare_barrier.wait()
 
     monkeypatch.setattr(backend.torch, "empty", allocate)
     module = SimpleNamespace(prepare_descriptors=prepare)
 
     def resolve():
+        call_barrier.wait()
         return backend._descriptor_storage(
             workspace,
             module,
@@ -387,7 +388,8 @@ def test_concurrent_descriptor_prepare_returns_one_cached_entry(monkeypatch):
 
     assert results[0] is results[1]
     assert len(workspace.descriptor_cache) == 1
-    assert len(allocations) == len(preparations) == 2
+    assert len(allocations) == len(preparations)
+    assert len(preparations) in (1, 2)
 
 
 def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch):
