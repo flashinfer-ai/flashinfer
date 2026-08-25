@@ -64,6 +64,7 @@ moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_ng8_kg4.json
 moe_fp4_block_scale_ds_shared_experts_s1_e33_topk8_h256_i128_act3_ng8_kg4.json
 moe_fp4_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
 moe_fp4_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048.json
+moe_fp4_block_scale_renormalize_routing_topk2_e8_h1024_i512_act3.json
 moe_fp4_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
 moe_fp4_block_scale_topk_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_default_routing_topk8_e32_h7168_i2048.json
@@ -71,6 +72,7 @@ moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.json
 moe_fp8_block_scale_ds_shared_experts_s1_e33_topk8_ng8_kg4_h7168_i2048.json
 moe_fp8_block_scale_llama4_routing_topk1_e32_h7168_i2048.json
 moe_fp8_block_scale_renormalize_naive_routing_topk8_e32_h7168_i2048.json
+moe_fp8_block_scale_renormalize_routing_topk2_e8_h1024_i512.json
 moe_fp8_block_scale_renormalize_routing_topk8_e32_h7168_i2048.json
 moe_fp8_block_scale_topk_routing_topk8_e32_h7168_i2048.json
 msa_proxy_score_fp4_h4_kv1.json
@@ -94,6 +96,11 @@ top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
 top_p_sampling_v128256.json
 top_p_sampling_v151936.json
+trtllm_bf16_moe_topk2_e8_h1024_i512.json
+trtllm_bf16_routed_moe_topk2_e8_h1024.json
+trtllm_fp4_block_scale_routed_moe_topk2_e8_h1024_act3.json
+trtllm_fp8_block_scale_routed_moe_topk2_e8_h1024.json
+trtllm_fp8_per_tensor_scale_moe_topk2_e8_h1024_i512.json
 trtllm_fp8_per_tensor_scale_routed_moe_topk8_e32_h7168.json
 trtllm_gen_routing_e256_k8_t8.json
 
@@ -1315,6 +1322,212 @@ if _fp4_moe_args is not None:
             routing_method_type=5,
             **_fp4_moe_common,
         )
+
+# ── PrimsTS MoE public APIs ──────────────────────────────────────────────────
+# Use the H=1024, I=512, E=8, top-k=2 shape covered by the routed PrimsTS MoE
+# tests. Explicit fi_trace calls exercise all seven decorators without loading
+# the backend kernels; their distinct shape vector avoids colliding with the
+# H=7168 TRT-LLM definitions above even though both backends share templates.
+_pts_moe_T, _pts_moe_H, _pts_moe_I = 32, 1024, 512
+_pts_moe_E, _pts_moe_K = 8, 2
+_pts_moe_logits = torch.empty(
+    _pts_moe_T, _pts_moe_E, dtype=torch.bfloat16, device=device
+)
+_pts_moe_bias = torch.empty(_pts_moe_E, dtype=torch.bfloat16, device=device)
+_pts_moe_hidden_bf16 = torch.empty(
+    _pts_moe_T, _pts_moe_H, dtype=torch.bfloat16, device=device
+)
+_pts_moe_w1_bf16 = torch.empty(
+    _pts_moe_E,
+    2 * _pts_moe_I,
+    _pts_moe_H,
+    dtype=torch.bfloat16,
+    device=device,
+)
+_pts_moe_w2_bf16 = torch.empty(
+    _pts_moe_E,
+    _pts_moe_H,
+    _pts_moe_I,
+    dtype=torch.bfloat16,
+    device=device,
+)
+_pts_moe_topk_ids = (
+    torch.arange(
+        _pts_moe_T * _pts_moe_K, dtype=torch.int32, device=device
+    ).reshape(_pts_moe_T, _pts_moe_K)
+    % _pts_moe_E
+)
+_pts_moe_topk_weights = torch.full(
+    (_pts_moe_T, _pts_moe_K),
+    1.0 / _pts_moe_K,
+    dtype=torch.bfloat16,
+    device=device,
+)
+_pts_moe_packed_topk = (_pts_moe_topk_ids << 16) | _pts_moe_topk_weights.view(
+    torch.int16
+).to(torch.int32)
+_pts_moe_common = dict(
+    num_experts=_pts_moe_E,
+    top_k=_pts_moe_K,
+    n_group=None,
+    topk_group=None,
+    intermediate_size=_pts_moe_I,
+    local_expert_offset=0,
+    local_num_experts=_pts_moe_E,
+    routed_scaling_factor=None,
+    routing_method_type=1,
+)
+
+flashinfer.prims_ts_bf16_moe.fi_trace(
+    routing_logits=_pts_moe_logits,
+    routing_bias=_pts_moe_bias,
+    hidden_states=_pts_moe_hidden_bf16,
+    gemm1_weights=_pts_moe_w1_bf16,
+    gemm2_weights=_pts_moe_w2_bf16,
+    **_pts_moe_common,
+)
+flashinfer.prims_ts_bf16_routed_moe.fi_trace(
+    topk_ids=_pts_moe_packed_topk,
+    hidden_states=_pts_moe_hidden_bf16,
+    gemm1_weights=_pts_moe_w1_bf16,
+    gemm2_weights=_pts_moe_w2_bf16,
+    **_pts_moe_common,
+)
+
+_pts_moe_hidden_fp8 = torch.empty(
+    _pts_moe_T, _pts_moe_H, dtype=torch.float8_e4m3fn, device=device
+)
+_pts_moe_w1_fp8 = torch.empty_like(
+    _pts_moe_w1_bf16, dtype=torch.float8_e4m3fn
+)
+_pts_moe_w2_fp8 = torch.empty_like(
+    _pts_moe_w2_bf16, dtype=torch.float8_e4m3fn
+)
+_pts_moe_tensor_scales = torch.ones(
+    _pts_moe_E, dtype=torch.float32, device=device
+)
+flashinfer.prims_ts_fp8_per_tensor_scale_moe.fi_trace(
+    routing_logits=_pts_moe_logits,
+    routing_bias=_pts_moe_bias,
+    hidden_states=_pts_moe_hidden_fp8,
+    gemm1_weights=_pts_moe_w1_fp8,
+    output1_scales_scalar=_pts_moe_tensor_scales,
+    output1_scales_gate_scalar=_pts_moe_tensor_scales,
+    gemm2_weights=_pts_moe_w2_fp8,
+    output2_scales_scalar=_pts_moe_tensor_scales,
+    use_routing_scales_on_input=False,
+    **_pts_moe_common,
+)
+
+_pts_moe_hidden_fp8_scale = torch.ones(
+    _pts_moe_H // 128, _pts_moe_T, dtype=torch.float32, device=device
+)
+_pts_moe_w1_fp8_scale = torch.ones(
+    _pts_moe_E,
+    (2 * _pts_moe_I) // 128,
+    _pts_moe_H // 128,
+    dtype=torch.float32,
+    device=device,
+)
+_pts_moe_w2_fp8_scale = torch.ones(
+    _pts_moe_E,
+    _pts_moe_H // 128,
+    _pts_moe_I // 128,
+    dtype=torch.float32,
+    device=device,
+)
+_pts_moe_fp8_block_common = dict(
+    routing_bias=_pts_moe_bias,
+    hidden_states=_pts_moe_hidden_fp8,
+    hidden_states_scale=_pts_moe_hidden_fp8_scale,
+    gemm1_weights=_pts_moe_w1_fp8,
+    gemm1_weights_scale=_pts_moe_w1_fp8_scale,
+    gemm2_weights=_pts_moe_w2_fp8,
+    gemm2_weights_scale=_pts_moe_w2_fp8_scale,
+    **_pts_moe_common,
+)
+flashinfer.prims_ts_fp8_block_scale_moe.fi_trace(
+    routing_logits=_pts_moe_logits,
+    **_pts_moe_fp8_block_common,
+)
+flashinfer.prims_ts_fp8_block_scale_routed_moe.fi_trace(
+    topk_ids=_pts_moe_packed_topk,
+    **_pts_moe_fp8_block_common,
+)
+
+_pts_moe_hidden_fp4 = torch.empty(
+    _pts_moe_T, _pts_moe_H // 2, dtype=torch.uint8, device=device
+)
+_pts_moe_hidden_fp4_scale = torch.empty(
+    _pts_moe_T,
+    _pts_moe_H // 16,
+    dtype=torch.float8_e4m3fn,
+    device=device,
+)
+_pts_moe_w1_fp4 = torch.empty(
+    _pts_moe_E,
+    2 * _pts_moe_I,
+    _pts_moe_H // 2,
+    dtype=torch.uint8,
+    device=device,
+)
+_pts_moe_w1_fp4_scale = torch.empty(
+    _pts_moe_E,
+    2 * _pts_moe_I,
+    _pts_moe_H // 16,
+    dtype=torch.float8_e4m3fn,
+    device=device,
+)
+_pts_moe_w2_fp4 = torch.empty(
+    _pts_moe_E,
+    _pts_moe_H,
+    _pts_moe_I // 2,
+    dtype=torch.uint8,
+    device=device,
+)
+_pts_moe_w2_fp4_scale = torch.empty(
+    _pts_moe_E,
+    _pts_moe_H,
+    _pts_moe_I // 16,
+    dtype=torch.float8_e4m3fn,
+    device=device,
+)
+_pts_moe_gemm1_bias = torch.empty(
+    _pts_moe_E, 2 * _pts_moe_I, dtype=torch.float32, device=device
+)
+_pts_moe_gemm2_bias = torch.empty(
+    _pts_moe_E, _pts_moe_H, dtype=torch.float32, device=device
+)
+_pts_moe_activation_params = torch.ones(
+    _pts_moe_E, dtype=torch.float32, device=device
+)
+_pts_moe_fp4_common = dict(
+    routing_bias=_pts_moe_bias,
+    hidden_states=_pts_moe_hidden_fp4,
+    hidden_states_scale=_pts_moe_hidden_fp4_scale,
+    gemm1_weights=_pts_moe_w1_fp4,
+    gemm1_weights_scale=_pts_moe_w1_fp4_scale,
+    gemm1_bias=_pts_moe_gemm1_bias,
+    gemm1_alpha=_pts_moe_activation_params,
+    gemm1_beta=_pts_moe_activation_params,
+    gemm1_clamp_limit=_pts_moe_activation_params,
+    gemm2_weights=_pts_moe_w2_fp4,
+    gemm2_weights_scale=_pts_moe_w2_fp4_scale,
+    gemm2_bias=_pts_moe_gemm2_bias,
+    output1_scale_scalar=_pts_moe_tensor_scales,
+    output1_scale_gate_scalar=_pts_moe_tensor_scales,
+    output2_scale_scalar=_pts_moe_tensor_scales,
+    activation_type=3,
+    **_pts_moe_common,
+)
+flashinfer.prims_ts_fp4_block_scale_moe.fi_trace(
+    routing_logits=_pts_moe_logits,
+    **_pts_moe_fp4_common,
+)
+flashinfer.prims_ts_fp4_block_scale_routed_moe.fi_trace(
+    topk_ids=_pts_moe_packed_topk,
+    **_pts_moe_fp4_common,
+)
 
 # ── Summary ───────────────────────────────────────────────────────────────────
 files = sorted(SAVE_DIR.glob("*.json"))

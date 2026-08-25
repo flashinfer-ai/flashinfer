@@ -1,0 +1,155 @@
+{
+  "name": "trtllm_fp8_per_tensor_scale_moe_topk2_e8_h1024_i512",
+  "description": "TRT-LLM FP8 MoE with per-tensor activation/weight scales.",
+  "op_type": "moe",
+  "tags": [
+    "fi_api:flashinfer.fused_moe.backends.prims_ts.fp8_op.prims_ts_fp8_per_tensor_scale_moe",
+    "status:verified",
+    "backend:trtllm",
+    "quantization:float8_e4m3fn"
+  ],
+  "axes": {
+    "seq_len": {
+      "type": "var",
+      "description": "Number of input tokens."
+    },
+    "num_experts": {
+      "type": "const",
+      "value": 8,
+      "description": "Total number of experts."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 2
+    },
+    "num_local_experts": {
+      "type": "const",
+      "value": 8,
+      "description": "Number of local experts."
+    },
+    "hidden_size": {
+      "type": "const",
+      "value": 1024
+    },
+    "intermediate_size": {
+      "type": "const",
+      "value": 512
+    },
+    "gemm1_out_size": {
+      "type": "const",
+      "value": 1024,
+      "description": "2 * intermediate_size."
+    }
+  },
+  "inputs": {
+    "routing_logits": {
+      "shape": [
+        "seq_len",
+        "num_experts"
+      ],
+      "dtype": "bfloat16",
+      "description": "Routing logits for expert selection."
+    },
+    "routing_bias": {
+      "shape": [
+        "num_experts"
+      ],
+      "dtype": "bfloat16",
+      "optional": true,
+      "description": "Optional routing bias."
+    },
+    "hidden_states": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Input hidden states (dtype depends on variant)."
+    },
+    "gemm1_weights": {
+      "shape": [
+        "num_local_experts",
+        "gemm1_out_size",
+        "hidden_size"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "FC1 weights (gate+up)."
+    },
+    "gemm2_weights": {
+      "shape": [
+        "num_local_experts",
+        "hidden_size",
+        "intermediate_size"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "FC2 weights (down)."
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Number of experts to route per token."
+    },
+    "n_group": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Expert groups (DeepSeek-V3)."
+    },
+    "topk_group": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Groups to keep (DeepSeek-V3)."
+    },
+    "local_expert_offset": {
+      "shape": null,
+      "dtype": "int32",
+      "description": "Offset of local experts in global expert space."
+    },
+    "routed_scaling_factor": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true,
+      "description": "Scaling factor for routing weights."
+    },
+    "routing_method_type": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "0=Default, 1=Renormalize, 2=DeepSeekV3, 3=Llama4, 4=RenormalizeNaive, 5=TopK."
+    },
+    "output1_scales_scalar": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "description": "Per-expert FC1 output scale."
+    },
+    "output1_scales_gate_scalar": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "description": "Per-expert FC1 gate scale."
+    },
+    "output2_scales_scalar": {
+      "shape": [
+        "num_local_experts"
+      ],
+      "dtype": "float32",
+      "description": "Per-expert FC2 output scale."
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "seq_len",
+        "hidden_size"
+      ],
+      "dtype": "bfloat16",
+      "description": "MoE output."
+    }
+  },
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n@torch.no_grad()\ndef _trtllm_fp8_per_tensor_scale_moe_reference(\n    routing_logits,\n    routing_bias,\n    hidden_states,\n    gemm1_weights,\n    output1_scales_scalar,\n    output1_scales_gate_scalar,\n    gemm2_weights,\n    output2_scales_scalar,\n    num_experts,\n    top_k,\n    local_expert_offset,\n    routed_scaling_factor=None,\n    **_unused,\n):\n    \"\"\"Reference for TRT-LLM FP8 per-tensor scale MoE. Dequantizes per-expert.\"\"\"\n    E_local = gemm1_weights.shape[0]\n    w_topk, topk_idx = _default_routing_weights(\n        routing_logits, routing_bias, top_k, routed_scaling_factor\n    )\n    # Per-expert dequant: each expert has its own scalar scale for FC1 gate,\n    # FC1 up, and FC2. Scale broadcasts over the non-expert dims.\n    W1 = gemm1_weights.to(torch.float32)\n    W2 = gemm2_weights.to(torch.float32)\n    s1 = output1_scales_scalar.to(torch.float32).view(E_local, 1, 1)\n    s1g = output1_scales_gate_scalar.to(torch.float32).view(E_local, 1, 1)\n    s2 = output2_scales_scalar.to(torch.float32).view(E_local, 1, 1)\n    I = W1.shape[1] // 2\n    # W1 is [E, 2I, H]: first half is gate, second half is up \u2014 apply scales.\n    W1 = torch.cat([W1[:, :I] * s1g, W1[:, I:] * s1], dim=1)\n    W2 = W2 * s2\n    return _moe_bf16_run_experts(\n        hidden_states.to(torch.float32),\n        W1,\n        W2,\n        w_topk,\n        topk_idx,\n        local_expert_offset,\n        int(num_experts),\n    )\n",
+  "check": "def standard_check(\n    reference_outputs: Any,\n    actual_outputs: Any,\n    *,\n    rtol: Optional[float] = None,\n    atol: Optional[float] = None,\n    max_mismatch_pct: float = 0.0,\n    min_cos_sim: Optional[float] = 1.0 - 1e-3,\n) -> bool:\n    \"\"\"Default trace correctness check used when a template does not override it.\"\"\"\n    from flashinfer.trace import default_check\n\n    return default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    )\n"
+}
