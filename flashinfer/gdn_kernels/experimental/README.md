@@ -285,38 +285,36 @@ served by the composable path (and reported unsupported by the probe).
 
 Keep the registry trimmed to the measured-win surface, and let the
 **end-to-end** measurement decide it — a row is a promise about serving
-behaviour, not about the kernel in isolation.  The shipped surface, per
-impl, all in the `SD` layout on SM120:
+behaviour, not about the kernel in isolation.  The shipped surface, all in
+the `SD` layout on SM120:
 
-| geometry | `hidden` | `n_ba` | `qkv_dim` | `h_q` | `hv` | `d` | batches |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| Qwen3.6-27B | 5120 | 96 | 10240 | 16 | 48 | 128 | 1/2/4/8 |
-| Qwen3.6-35B-A3B | 2048 | 64 | 8192 | 16 | 32 | 128 | 1/2/4 |
+| validation provenance | `hidden` | `n_ba` | `qkv_dim` | `h_q` | `hv` | `d` | CuTe-DSL batches | persistent CUDA batches |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Qwen3.6-27B | 5120 | 96 | 10240 | 16 | 48 | 128 | 1/2/4/8 | 1/2/4/8 |
+| Qwen3.6-35B-A3B | 2048 | 64 | 8192 | 16 | 32 | 128 | 1/2/4 | 1/2/4 |
+| Qwen3.5-27B TP2 | 5120 | 48 | 5120 | 8 | 24 | 128 | — | 1/2/4/8/16 |
+| Qwen3.5-35B-A3B TP2 | 2048 | 32 | 4096 | 8 | 16 | 128 | — | 1/2/4/8/16/24/32 |
 
-Both geometries have `conv_width=4`, `conv_state_len=3`, and are served by
-the same kernels — only the compile-time sizes differ.  A geometry must
-satisfy the relations the kernels tile on — `n_ba == 2*hv`, `hv % h_q == 0`,
-`qkv_dim == (2*h_q + hv)*d`, `d == 128`, and `hidden`/`qkv_dim` divisible by
-the CuTe-DSL K-split and conv tile — which the CUDA kernel `static_assert`s
-and the CuTe-DSL impl checks at dispatch.
+All geometries have `conv_width=4` and `conv_state_len=3`.  The persistent CUDA
+kernel requires `n_ba == 2*hv`, `hv % h_q == 0`,
+`qkv_dim == (2*h_q + hv)*d`, and `d == 128`, enforced by named
+`static_assert`s.  Geometries registered for CuTe-DSL must additionally satisfy
+its K-split and convolution-tile divisibility checks.
 
-**Which checkpoints those rows are valid for.** The first geometry was
-captured from `nvidia/Qwen3.6-27B-NVFP4` and the second from
-`nvidia/Qwen3.6-35B-A3B-NVFP4`, and the end-to-end serving sweep that
-chose each batch window ran on that checkpoint.  Matching is on the numbers
-and the device `cc` alone — no row names a model, and nothing in the
-dispatch path reads a model name — so *any* checkpoint whose GDN layer has
-exactly these sizes dispatches here, and a checkpoint from a neighbouring
-release (Qwen3.5-class GDN layers, other 27B variants) does so if and only
-if its layer sizes are identical, which is a property of that checkpoint
-rather than of the family name.  Anything else falls through to the
-composable path.  For the 27B, batches 16/24/32 are deliberately absent even
-though the kernel is faster than the stock chain there in a kernel A/B
-(1.49x at 16, 1.16x at 32 under CUDA-graph replay): the serving sweep that
-covered them did not reproduce a win at the engine level, so those batches
-keep the stock path and the registry claims only what was measured.  Adding
-them back is a registry-only change once an end-to-end win is measured; no
-dispatch, kernel or consumer code has to move.
+**Which checkpoints those rows are valid for.** The first two geometries were
+captured from `nvidia/Qwen3.6-27B-NVFP4` and
+`nvidia/Qwen3.6-35B-A3B-NVFP4`.  The rank-local TP2 geometries were validated
+on Qwen3.5-27B and Qwen3.5-35B-A3B.  Matching uses the complete numerical
+signature and device `cc`; model and TP names are validation provenance, not
+dispatch keys.  Anything else falls through to the composable path.
+
+For Qwen3.6-27B, batches 16/24/32 remain absent even though the kernel is faster
+than the stock chain there in a kernel A/B (1.49x at 16, 1.16x at 32 under
+CUDA-graph replay), because the serving sweep did not reproduce a win.  For
+Qwen3.5-27B TP2, batches 24/32 are absent because correctness passed but the
+fixed full-model-graph serving screen did not show an end-to-end win.  The TP2
+CuTe-DSL rows are absent because that implementation has not been validated for
+either rank-local geometry.
 
 ## Adding a new layer geometry (a new model)
 
