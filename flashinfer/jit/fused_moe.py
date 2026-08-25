@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import functools
 from typing import List
 
 from . import env as jit_env
@@ -25,7 +26,11 @@ from .core import (
     sm90a_nvcc_flags,
     sm89_nvcc_flags,
 )
-from .cpp_ext import is_cuda_version_at_least
+from .cpp_ext import (
+    has_prebuilt_aot_module,
+    is_cuda_version_at_least,
+    version_gated_nvcc_flag,
+)
 from .cubin_loader import (
     get_artifact,
     get_meta_hash,
@@ -110,13 +115,30 @@ def gen_cutlass_fused_moe_sm100_module(use_fast_build: bool = False) -> JitSpec:
     return gen_cutlass_fused_moe_module(nvcc_flags, "100", use_fast_build)
 
 
+@functools.cache
+def cutlass_fused_moe_fp8_block_scale_supported(device_arch: str = "90") -> bool:
+    """Whether the cutlass fused_moe module for ``device_arch`` contains the
+    deepseek fp8 block-scale kernels.
+
+    They are compiled only when ``-DENABLE_FP8_BLOCK_SCALE`` survives flag
+    generation, i.e. when a CUDA 12.8+ toolkit is used for JIT compilation or
+    when a prebuilt AOT module (built with a 12.8+ toolkit, e.g. from
+    flashinfer-jit-cache) is available.
+    """
+    if has_prebuilt_aot_module(f"fused_moe_{device_arch}"):
+        return True
+    return is_cuda_version_at_least("12.8")
+
+
 def gen_cutlass_fused_moe_sm90_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = sm90a_nvcc_flags + [
         "-DCOMPILE_HOPPER_TMA_GEMMS",
         "-DCOMPILE_HOPPER_TMA_GROUPED_GEMMS",
         "-DENABLE_BF16",
         "-DENABLE_FP8",
-        "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
+        version_gated_nvcc_flag("-DENABLE_FP8_BLOCK_SCALE", "12.8", "fused_moe_90"),
+        # ENABLE_FP4 needs no toolkit gate on SM90: the Hopper CUTLASS path
+        # uses cutlass::float_e2m1_t (see fp4_compat.h), not <cuda_fp4.h>.
         "-DENABLE_FP4",
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
         "-DCUTLASS_ENABLE_GDC_FOR_SM90=1",
@@ -129,7 +151,7 @@ def gen_cutlass_fused_moe_sm89_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = sm89_nvcc_flags + [
         "-DENABLE_BF16",
         "-DENABLE_FP8",
-        "-DENABLE_FP8_BLOCK_SCALE" if is_cuda_version_at_least("12.8") else "",
+        version_gated_nvcc_flag("-DENABLE_FP8_BLOCK_SCALE", "12.8", "fused_moe_89"),
         "-DUSING_OSS_CUTLASS_MOE_GEMM",
     ]
     return gen_cutlass_fused_moe_module(nvcc_flags, "89", use_fast_build)
