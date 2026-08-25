@@ -9,7 +9,10 @@ import flashinfer.fused_moe.core as core_mod
 from flashinfer import autotune
 from flashinfer.autotuner.initializers import autotuner_initializer_randn
 from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
-from flashinfer.fused_moe.shared.tuning import moe_topk_ids_init
+from flashinfer.fused_moe.shared.tuning import (
+    make_moe_tuning_config,
+    moe_topk_ids_init,
+)
 from flashinfer.fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
@@ -1881,6 +1884,52 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
             assert torch.all((initialized >= 0) & (initialized < 128))
     finally:
         fn.cache_clear()
+
+
+def test_moe_empty_routing_placeholders_preserve_file_cache_key():
+    """Logits-routed placeholders remain bucketed in persisted tactic keys."""
+    num_tokens, hidden_size, num_experts = 17, 64, 8
+    moe_inputs = MoeRunnerInputs(
+        output=torch.empty((num_tokens, hidden_size)),
+        routing_logits=torch.empty((num_tokens, num_experts)),
+        topk_ids=torch.empty((0,), dtype=torch.int32),
+        expert_weights=torch.empty((0,), dtype=torch.bfloat16),
+        hidden_states=torch.empty((num_tokens, hidden_size)),
+        hidden_states_scale=None,
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    )
+    tuning_config = make_moe_tuning_config(
+        moe_inputs,
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        init_packed_topk_ids=moe_topk_ids_init(num_experts),
+    )
+    input_shapes = AutoTuner.get()._get_input_sizes(moe_inputs.to_list())
+
+    cache_key = AutoTuner._get_cache_key(
+        "test::routed_moe",
+        DummyRunner(),
+        input_shapes,
+        tuning_config,
+    )
+    legacy_profile = (
+        (32, hidden_size),
+        (32, num_experts),
+        (32,),
+        (32,),
+        (32, hidden_size),
+        (0,),
+        (0,),
+        (0,),
+    )
+
+    assert tuning_config.dynamic_tensor_specs[0].input_idx == (0, 1, 2, 3, 4)
+    assert cache_key.nearest_profile == legacy_profile
+    assert cache_key.file_key == str(
+        ("test::routed_moe", "DummyRunner", legacy_profile, ())
+    )
 
 
 def test_find_nearest_profile_cache_ignores_fresh_closure_initializer(monkeypatch):

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 import torch
 
@@ -37,10 +37,6 @@ from ..utils import (
     make_random_topk_ids,
 )
 from .inputs import MoeRunnerInputs
-
-
-def _has_payload(tensor: Optional[torch.Tensor]) -> bool:
-    return tensor is not None and tensor.numel() > 0
 
 
 @functools.cache
@@ -91,9 +87,9 @@ def make_moe_tuning_config(
     }
     if moe_inputs.routing_logits is not None:
         spec["routing_logits"] = autotuner_initializer_rand
-    if _has_payload(moe_inputs.topk_ids):
+    if moe_inputs.topk_ids is not None:
         spec["topk_ids"] = init_packed_topk_ids
-    if _has_payload(moe_inputs.expert_weights):
+    if moe_inputs.expert_weights is not None:
         spec["expert_weights"] = autotuner_initializer_ones
     if moe_inputs.hidden_states_scale is not None:
         spec["hidden_states_scale"] = autotuner_initializer_ones
