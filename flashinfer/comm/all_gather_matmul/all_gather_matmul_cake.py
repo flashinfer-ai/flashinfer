@@ -431,7 +431,9 @@ def _nvcc() -> Path:
             if path.is_file():
                 candidate = str(path)
     if candidate is None:
-        raise RuntimeError("nvcc is required to build the Cake all-gather matmul backend")
+        raise RuntimeError(
+            "nvcc is required to build the Cake all-gather matmul backend"
+        )
     return Path(candidate).resolve()
 
 
@@ -474,7 +476,9 @@ def _launch_contract(source: bytes) -> dict[str, Any]:
 def _render_host_source(module_ident: str, manifest: dict[str, Any]) -> str:
     main_smem_bytes = int(manifest["launch"]["main"]["dynamic_smem_bytes"])
     if main_smem_bytes <= 0:
-        raise RuntimeError("Cake all-gather matmul main dynamic shared memory is invalid")
+        raise RuntimeError(
+            "Cake all-gather matmul main dynamic shared memory is invalid"
+        )
     rendered = _HOST_SOURCE.replace("CAKE_MODULE_IDENT", module_ident).replace(
         "CAKE_MAIN_SMEM_BYTES", str(main_smem_bytes)
     )
@@ -488,7 +492,9 @@ def _program_source(arch: str) -> tuple[Path, dict[str, Any]]:
     source = directory / "cake_all_gather_matmul_kernels.cu"
     manifest_path = directory / "manifest.json"
     if not source.is_file() or not manifest_path.is_file():
-        raise RuntimeError(f"Cake all-gather matmul source package is incomplete for {arch}")
+        raise RuntimeError(
+            f"Cake all-gather matmul source package is incomplete for {arch}"
+        )
     manifest = json.loads(
         manifest_path.read_text(encoding="utf-8"),
         object_pairs_hook=_reject_duplicate_manifest_keys,
@@ -646,7 +652,9 @@ def _validate_inputs(
     if not 0 <= rank < world_size:
         raise RuntimeError("process-group rank is outside its world size")
     if str(symm_mem.get_backend(inp.device)).upper() != "NVSHMEM":
-        raise ValueError("the Cake backend requires the NVSHMEM symmetric-memory backend")
+        raise ValueError(
+            "the Cake backend requires the NVSHMEM symmetric-memory backend"
+        )
     _target_arch(inp.device)
     return device_index, rank, world_size, _group_name(group)
 
@@ -707,9 +715,7 @@ def _workspace(
     workspace = _WORKSPACES.get(key)
     if workspace is not None:
         return workspace
-    scratch = symm_mem.empty(
-        world_size, rows, _K, dtype=dtype, device=device_index
-    )
+    scratch = symm_mem.empty(world_size, rows, _K, dtype=dtype, device=device_index)
     scratch_handle = symm_mem.rendezvous(scratch, group=group_name)
     workspace = _Workspace(
         scratch=scratch,

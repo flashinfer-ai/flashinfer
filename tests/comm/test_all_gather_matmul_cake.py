@@ -76,8 +76,7 @@ def test_host_launch_consumes_manifest_smem(tmp_path, monkeypatch):
     "source",
     [
         b"#define SMEM_TOTAL 197632\n" * 3,
-        b"#define SMEM_TOTAL 197632\n" * 3
-        + b"#define SMEM_TOTAL 196608\n",
+        b"#define SMEM_TOTAL 197632\n" * 3 + b"#define SMEM_TOTAL 196608\n",
     ],
 )
 def test_source_launch_contract_rejects_missing_or_divergent_main_smem(source):
@@ -94,9 +93,10 @@ def test_packaged_program_has_self_contained_pointer_abi(arch):
     source_path, _ = backend._program_source(arch)
     source = source_path.read_bytes()
 
-    assert source.count(
-        b"struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };"
-    ) == 1
+    assert (
+        source.count(b"struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };")
+        == 1
+    )
     assert source.count(b"CakeTensorMap const*") == 12
     assert backend._resolved_main_smem_bytes(source) == 197632
 
@@ -110,9 +110,7 @@ def test_packaged_program_has_self_contained_pointer_abi(arch):
         lambda manifest: manifest["kernel_symbols"].reverse(),
         lambda manifest: manifest["constraints"].update(world_sizes=[2]),
         lambda manifest: manifest["launch"]["main"].update(block_threads=128),
-        lambda manifest: manifest["launch"]["main"].update(
-            dynamic_smem_bytes=196608
-        ),
+        lambda manifest: manifest["launch"]["main"].update(dynamic_smem_bytes=196608),
         lambda manifest: manifest["route_coverage"]["ws4"]["main"].update(
             bfloat16=manifest["kernel_symbols"][5]
         ),
@@ -259,9 +257,13 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
         lambda state, **kwargs: setattr(state, "flag_peers", object()),
     )
     monkeypatch.setattr(backend, "_workspace", lambda **kwargs: workspace)
-    monkeypatch.setattr(backend, "_descriptor_storage", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        backend, "_descriptor_storage", lambda *args, **kwargs: object()
+    )
     monkeypatch.setattr(backend.torch, "empty", allocate)
-    monkeypatch.setattr(backend.torch.cuda, "current_stream", lambda device: FakeStream())
+    monkeypatch.setattr(
+        backend.torch.cuda, "current_stream", lambda device: FakeStream()
+    )
     monkeypatch.setattr(backend.torch.cuda, "stream", lambda stream: nullcontext())
     monkeypatch.setattr(backend.torch.cuda, "Event", lambda **kwargs: FakeEvent())
 
