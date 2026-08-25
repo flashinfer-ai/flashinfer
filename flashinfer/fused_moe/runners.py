@@ -285,7 +285,26 @@ def _validate_prepared_activation_params(
             required += ("gemm1_beta",)
         if activation.clamp_limit is not None:
             required += ("gemm1_clamp_limit",)
-    missing = [name for name in required if name not in view]
+    elif not activation.is_gated:
+        # The gated-activation epilogue is what reads these per-expert tensors
+        # (see isGatedActivation in trtllm/fused_moe/runner.h). A non-gated
+        # activation ignores them, so accepting one reads as a working override
+        # while the kernel discards it.
+        supplied = [
+            name
+            for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+            if view.get(name) is not None
+        ]
+        if supplied:
+            raise ValueError(
+                f"{runner}: {type(activation).__name__} does not consume "
+                f"{supplied}; these per-expert overrides apply to gated "
+                "activations only and would be ignored."
+            )
+    # A key carrying None is absent, not supplied: the launcher reads it as
+    # "use the neutral value", which is exactly what the typed activation says
+    # it must not do.
+    missing = [name for name in required if view.get(name) is None]
     if missing:
         raise ValueError(
             f"{runner}: prepared weights are missing activation parameters {missing}; "
@@ -2094,6 +2113,15 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             # #4171. NVFP4/MXFP4 support SM100/SM103/SM107; W4A16 supports
             # SM100/SM107 and retains the upstream SM103 xfail in #1754.
             compute_capability = get_compute_capability(self.device)
+            if compute_capability == (10, 7) and isinstance(activation, SiTU):
+                # The pinned Rubin BMM artifact predates SiTuGlu. Its native
+                # gated-activation enum uses value 2 for None, while the host
+                # enum uses 2 for SiTuGlu, so forwarding SiTU would silently
+                # execute no activation.
+                raise NotImplementedError(
+                    f"{type(self).__name__} does not support SiTU on SM107 with "
+                    "the currently pinned Rubin BMM artifact."
+                )
             if variant in (QuantVariant.NVFP4, QuantVariant.MXFP4):
                 supported = compute_capability in ((10, 0), (10, 3), (10, 7))
             else:
@@ -3281,6 +3309,12 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         v = weights.get_view(self.backend_key)
         _validate_prepared_activation_params(
             v, self.config.activation, type(self).__name__
+        )
+        _validate_optional_gemm1_activation_params(
+            v,
+            self._num_local_experts,
+            act.hidden_states_q.device,
+            type(self).__name__,
         )
         routing = self.config.routing
 

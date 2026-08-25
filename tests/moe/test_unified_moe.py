@@ -691,6 +691,48 @@ class TestTypedActivationConfig:
                 {}, SiTU(linear_scale=None), "TestRunner"
             )
 
+    def test_none_valued_scalar_key_counts_as_missing(self):
+        """A key present with value None is absent, not supplied.
+
+        The launcher reads a null pointer as "use the neutral value", which is
+        exactly what a non-default typed scalar says it must not do, so keying
+        on presence alone would let it through.
+        """
+        from flashinfer.fused_moe.runners import (
+            _validate_prepared_activation_params,
+        )
+
+        with pytest.raises(ValueError, match="missing activation parameters"):
+            _validate_prepared_activation_params(
+                {"gemm1_alpha": None}, SwiGLU(alpha=1.5), "TestRunner"
+            )
+
+    def test_scalar_overrides_rejected_for_non_gated_activation(self):
+        """The gated epilogue is what reads the per-expert scalar tensors.
+
+        GeGLU is gated and does consume alpha/beta -- its formula is
+        (x0 + beta) * (x1 * phi(alpha * x1)) -- so only a non-gated activation
+        should reject them. Accepting one there reads as a working override
+        while the kernel discards it.
+        """
+        from flashinfer.fused_moe.runners import (
+            _validate_prepared_activation_params,
+        )
+
+        assert not ReLU2().is_gated
+        with pytest.raises(ValueError, match="does not consume"):
+            _validate_prepared_activation_params(
+                {"gemm1_alpha": torch.ones(2)}, ReLU2(), "TestRunner"
+            )
+        # No override is still fine.
+        _validate_prepared_activation_params({}, ReLU2(), "TestRunner")
+        # A gated activation keeps accepting them.
+        for gated in (GeGLU(), GeGLUTanh()):
+            assert gated.is_gated
+            _validate_prepared_activation_params(
+                {"gemm1_alpha": torch.ones(2)}, gated, "TestRunner"
+            )
+
     @pytest.mark.parametrize(
         "activation,expected_rows",
         (
