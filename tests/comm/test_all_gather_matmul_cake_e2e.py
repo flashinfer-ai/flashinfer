@@ -28,14 +28,16 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
     inp = symm_mem.empty(rows, 8192, dtype=dtype, device=device).normal_()
     weight = torch.randn(8192, 2048, dtype=dtype, device=device)
 
-    for _ in range(2):
-        actual = all_gather_matmul(inp, weight, group, backend="cake")
-        gathered = torch.empty(
-            world_size * rows, 8192, dtype=dtype, device=device
-        )
-        dist.all_gather_into_tensor(gathered, inp, group=group)
-        expected = gathered @ weight
-        torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+    gathered = torch.empty(world_size * rows, 8192, dtype=dtype, device=device)
+    dist.all_gather_into_tensor(gathered, inp, group=group)
+    expected = gathered @ weight
+    first = all_gather_matmul(inp, weight, group, backend="cake")
+    torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
+    first_snapshot = first.clone()
+    second = all_gather_matmul(inp, weight, group, backend="cake")
+    assert first.data_ptr() != second.data_ptr()
+    torch.testing.assert_close(first, first_snapshot, atol=0, rtol=0)
+    torch.testing.assert_close(second, expected, atol=1e-2, rtol=1e-2)
 
     dist.destroy_process_group(group)
     dist.destroy_process_group()
