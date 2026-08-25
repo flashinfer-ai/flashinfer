@@ -381,6 +381,7 @@ class MegaMoEBf16Mxfp8SymmBuffer:
             self._frontend.release()
             for root in self._sym_roots:
                 free_sym_tensor(root)
+            self._sym_roots.clear()
             self._destroyed = True
 
 
