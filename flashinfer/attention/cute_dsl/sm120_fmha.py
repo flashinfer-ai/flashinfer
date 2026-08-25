@@ -107,6 +107,27 @@ def _validate_lse(q: torch.Tensor, lse: Optional[torch.Tensor]) -> None:
         raise ValueError("lse must be contiguous")
 
 
+def _validate_hnd_paged_pool(name: str, pool: torch.Tensor) -> None:
+    """Validate the HND inner layout while allowing combined-cache views."""
+    if pool.ndim != 4:
+        raise ValueError(
+            f"{name} must have HND shape "
+            f"(num_pages, Hkv, page_size, D), got {tuple(pool.shape)}"
+        )
+    _, num_heads, page_size, head_dim = pool.shape
+    expected_inner_strides = (page_size * head_dim, head_dim, 1)
+    min_page_stride = num_heads * page_size * head_dim
+    if (
+        tuple(pool.stride()[1:]) != expected_inner_strides
+        or pool.stride(0) < min_page_stride
+    ):
+        raise ValueError(
+            f"{name} must use HND storage with compact [Hkv, page_size, D] "
+            "planes; a standalone pool or a K/V plane view from a combined "
+            f"cache is supported, got strides {pool.stride()}"
+        )
+
+
 def sm120_fmha_fp8_ragged_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -275,11 +296,12 @@ def sm120_fmha_fp8_paged_prefill(
         Query tensor, shape ``(total_q, Hq, D)``.
         dtype: ``float8_e4m3fn``.
     k_pool : torch.Tensor
-        NHD paged K pool, shape ``(num_pages, num_tokens_per_page, Hkv, D)``.
+        HND paged K pool, shape ``(num_pages, Hkv, num_tokens_per_page, D)``.
         Same dtype as ``q``. Every slot, including unused page padding, must
-        contain a finite value.
+        contain a finite value. A plane view from a combined
+        ``(num_pages, 2, Hkv, num_tokens_per_page, D)`` cache is accepted.
     v_pool : torch.Tensor
-        NHD paged V pool, shape ``(num_pages, num_tokens_per_page, Hkv, D)``.
+        HND paged V pool, shape ``(num_pages, Hkv, num_tokens_per_page, D)``.
         Same dtype and finite-value contract as ``k_pool``.
     o : torch.Tensor
         Output tensor, same shape as ``q``, written in-place.
@@ -327,21 +349,18 @@ def sm120_fmha_fp8_paged_prefill(
     assert q.ndim == 3, f"q must be packed (total_q, Hq, D), got {q.shape}"
     _, Hq, D = q.shape
 
-    assert k_pool.ndim == 4, (
-        f"k_pool must be (num_pages, page_size, Hkv, D), got {k_pool.shape}"
-    )
+    _validate_hnd_paged_pool("k_pool", k_pool)
+    _validate_hnd_paged_pool("v_pool", v_pool)
     if tuple(v_pool.shape) != tuple(k_pool.shape):
         raise ValueError(
-            f"v_pool must have the same NHD shape as k_pool, got "
+            f"v_pool must have the same HND shape as k_pool, got "
             f"{v_pool.shape} and {k_pool.shape}"
         )
     if k_pool.dtype != q.dtype or v_pool.dtype != q.dtype:
         raise ValueError("q, k_pool, and v_pool must have the same FP8 dtype")
     if k_pool.device != q.device or v_pool.device != q.device:
         raise ValueError("q, k_pool, and v_pool must be on the same device")
-    if not k_pool.is_contiguous() or not v_pool.is_contiguous():
-        raise ValueError("NHD k_pool and v_pool must be contiguous")
-    _, page_size, Hkv, D_k = k_pool.shape
+    _, Hkv, page_size, D_k = k_pool.shape
     assert D_k == D, f"head_dim mismatch: q={D}, k_pool={D_k}"
 
     assert block_tables.ndim == 2, (
@@ -639,8 +658,23 @@ class SM120PrimsBatchPrefillBackend:
                     f"backend='cute-dsl-prims' expected {name} on {self.device} "
                     f"with dtype {dtype}; got {tensor.device}/{tensor.dtype}"
                 )
-            if not tensor.is_contiguous():
+            if self._mode == "paged" and name in ("k", "v"):
+                _validate_hnd_paged_pool(name, tensor)
+            elif not tensor.is_contiguous():
                 raise ValueError(f"backend='cute-dsl-prims' requires contiguous {name}")
+        if self._mode == "paged":
+            expected_pool_shape = (
+                self._num_kv_heads,
+                self._page_size,
+                self._head_dim,
+            )
+            if tuple(k.shape[1:]) != expected_pool_shape or v.shape != k.shape:
+                raise ValueError(
+                    "backend='cute-dsl-prims' expected HND K/V pools with "
+                    f"shape [num_pages, {self._num_kv_heads}, "
+                    f"{self._page_size}, {self._head_dim}]; got "
+                    f"{tuple(k.shape)} and {tuple(v.shape)}"
+                )
 
     def _ensure_lse_kernel(self) -> None:
         if self._with_lse_compiled:

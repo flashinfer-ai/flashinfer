@@ -45,27 +45,35 @@ def _make_paged_kv(k_dense, v_dense, page_size):
 
     Returns
     -------
-    k_pool : (total_k_pages, page_size, Hkv, D)
-    v_pool : (total_v_pages, page_size, Hkv, D)
+    k_pool : (total_k_pages, Hkv, page_size, D)
+    v_pool : (total_v_pages, Hkv, page_size, D)
     block_tables : (B, pages_per_seq)  int32
     """
     B, Skv, Hkv, D = k_dense.shape
     assert Skv % page_size == 0, f"Skv={Skv} must be divisible by page_size={page_size}"
     pages_per_seq = Skv // page_size
 
-    # K pool: B * pages_per_seq pages, sequential layout
-    # Each page is NHD (page_size, Hkv, D).
-    k_pool = (
-        k_dense.reshape(B, pages_per_seq, page_size, Hkv, D)  # (B, Skv, Hkv, D)
-        .reshape(B * pages_per_seq, page_size, Hkv, D)
-        .contiguous()
+    # Populate one standard combined HND cache and return its K/V plane views.
+    # Their page stride includes both planes, exercising the zero-copy runtime
+    # contract used by BatchPrefillWithPagedKVCacheWrapper.
+    kv_pool = torch.empty(
+        B * pages_per_seq,
+        2,
+        Hkv,
+        page_size,
+        D,
+        dtype=k_dense.dtype,
+        device=k_dense.device,
     )
-    # V pool: same layout (separate physical pool for V)
-    v_pool = (
-        v_dense.reshape(B, pages_per_seq, page_size, Hkv, D)
-        .reshape(B * pages_per_seq, page_size, Hkv, D)
-        .contiguous()
+    k_pages = k_dense.reshape(B, pages_per_seq, page_size, Hkv, D).permute(
+        0, 1, 3, 2, 4
     )
+    v_pages = v_dense.reshape(B, pages_per_seq, page_size, Hkv, D).permute(
+        0, 1, 3, 2, 4
+    )
+    kv_pool[:, 0].copy_(k_pages.reshape_as(kv_pool[:, 0]))
+    kv_pool[:, 1].copy_(v_pages.reshape_as(kv_pool[:, 1]))
+    k_pool, v_pool = kv_pool.unbind(dim=1)
 
     # Separate K/V pools share one physical page-ID table.
     block_tables = torch.arange(

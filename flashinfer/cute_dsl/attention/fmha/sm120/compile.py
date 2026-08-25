@@ -198,11 +198,30 @@ def _compile_sm120_fmha_fp8_paged_kernel(
         else None
     )
 
-    # NHD paged KV pool: (num_pages, num_tokens_per_page, Hkv, D)
-    fake_kv = make_fake_compact_tensor(
+    # HND paged KV pool: (num_pages, Hkv, num_tokens_per_page, D). Keep the
+    # outer page stride symbolic so a plane view from a combined
+    # [num_pages, 2, Hkv, page_size, D] allocation has the same compiled ABI
+    # as a standalone compact HND pool.
+    fake_k = cute.runtime.make_fake_tensor(
         in_ct,
-        (sym_num_pages, num_tokens_per_page, num_kv_heads, head_dim),
-        stride_order=(3, 2, 1, 0),
+        (sym_num_pages, num_kv_heads, num_tokens_per_page, head_dim),
+        stride=(
+            cute.sym_int(),
+            num_tokens_per_page * head_dim,
+            head_dim,
+            1,
+        ),
+        assumed_align=16,
+    )
+    fake_v = cute.runtime.make_fake_tensor(
+        in_ct,
+        (sym_num_pages, num_kv_heads, num_tokens_per_page, head_dim),
+        stride=(
+            cute.sym_int(),
+            num_tokens_per_page * head_dim,
+            head_dim,
+            1,
+        ),
         assumed_align=16,
     )
 
@@ -222,8 +241,8 @@ def _compile_sm120_fmha_fp8_paged_kernel(
     return cute.compile(
         fmha,
         fake_q,
-        fake_kv,  # k
-        fake_kv,  # v (same paged pool layout)
+        fake_k,
+        fake_v,
         fake_o,
         fake_lse,
         cutlass.Float32(1.0),  # softmax_scale_log2 placeholder
@@ -320,7 +339,7 @@ def compile_sm120_fmha_fp8_paged_kernel(
     if torch.cuda.get_device_capability(device) != (12, 0):
         raise RuntimeError("SM120 PRIMS FMHA compilation requires SM120")
     kernel_name = (
-        f"paged_{_dtype_name(in_dtype)}_{_dtype_name(out_dtype)}"
+        f"paged_hnd_{_dtype_name(in_dtype)}_{_dtype_name(out_dtype)}"
         f"_hq{num_qo_heads}_hkv{num_kv_heads}_d{head_dim}"
         f"_causal{int(is_causal)}_kt{kv_tile}_qt{q_tile}"
         f"_page{num_tokens_per_page}_lse{int(with_lse)}"

@@ -1316,11 +1316,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     res = []
 
     q_dtype = dtype_str_to_torch_dtype(args.q_dtype)
-    if q_dtype not in [
-        torch.float16,
-        torch.bfloat16,
-        torch.float8_e4m3fn,
-    ]:
+    if q_dtype not in [torch.float16, torch.bfloat16, torch.float8_e4m3fn]:
         print(f"[ERROR] Unsupported q_dtype: {args.q_dtype}")
         return res
     q_init_dtype = torch.float16 if q_dtype == torch.float16 else torch.bfloat16
@@ -1343,16 +1339,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     if o_data_type not in [torch.bfloat16, torch.float16, torch.float8_e4m3fn]:
         print(f"[ERROR] Unsupported out_dtype: {args.out_dtype}")
         return res
-    if "cute-dsl-prims" in args.backends:
-        if args.out_dtype is None:
-            print(
-                "[ERROR] --out_dtype must be set to bfloat16 or float16 for cute-dsl-prims."
-            )
-            return res
-        prims_out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
-        if prims_out_dtype not in (torch.bfloat16, torch.float16):
-            print(f"[ERROR] Unsupported cute-dsl-prims out_dtype: {args.out_dtype}")
-            return res
 
     # Increase tolerances for FP8 due to lower precision
     if q_dtype in [torch.float8_e4m3fn, torch.float8_e5m2] or kv_dtype in [
@@ -1667,6 +1653,8 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         q, q_scale_t = to_float8(q, q_dtype)
         q_scale = q_scale_t.item()
         q_scale_tensor = q_scale_t.reshape(1, 1, 1, 1)
+        # o_data_type stays as q_dtype (FP8 output)
+
     if is_nvfp4_kv:
         kv_cache_nvfp4, kv_cache_sf, k_scale, v_scale = nvfp4_quantize_paged_kv_cache(
             kv_cache[:, 0], kv_cache[:, 1]
@@ -1725,9 +1713,6 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             output_scale=prims_ts_output_scale,
             out_dtype=o_data_type,
         )
-    prims_k_cache = k_cache_cudnn.transpose(1, 2).contiguous()
-    prims_v_cache = v_cache_cudnn.transpose(1, 2).contiguous()
-
     # Prepare wrappers (after FP8 conversion so we have correct dtypes)
     backend_wrappers = {}
     resolved_backends = {}
@@ -1740,7 +1725,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
                     workspace_buffer,
-                    "NHD" if backend == "cute-dsl-prims" else "HND",
+                    "HND",
                     use_cuda_graph=is_cuda_graph_compatible
                     if backend != "fa2"
                     else False,
@@ -1844,7 +1829,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         elif backend == "cute-dsl-prims":
             return backend_wrappers[backend].run(
                 q,
-                (prims_k_cache, prims_v_cache),
+                kv_cache,
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,

@@ -1566,6 +1566,7 @@ def _build_block_tables_from_paged_kv_indices(
 def _validate_sm120_prims_plan_options(
     *,
     kv_layout: str,
+    required_kv_layout: str,
     custom_mask: Optional[torch.Tensor],
     packed_custom_mask: Optional[torch.Tensor],
     pos_encoding_mode: str,
@@ -1579,8 +1580,10 @@ def _validate_sm120_prims_plan_options(
 ) -> None:
     """Fail fast for features outside the first PRIMS backend contract."""
     backend = "backend='cute-dsl-prims'"
-    if kv_layout != "NHD":
-        raise ValueError(f"{backend} requires kv_layout='NHD'; got {kv_layout!r}")
+    if kv_layout != required_kv_layout:
+        raise ValueError(
+            f"{backend} requires kv_layout={required_kv_layout!r}; got {kv_layout!r}"
+        )
     if custom_mask is not None or packed_custom_mask is not None:
         raise NotImplementedError(f"{backend} does not support custom masks")
     if pos_encoding_mode != "NONE":
@@ -1792,10 +1795,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             device architecture and kernel availability.
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-prims`` is an explicit SM120-only FP8 prefill backend. It requires
-            ``NHD`` layout, a contiguous ``(k_cache, v_cache)`` tuple, equal QK/VO head
-            dimensions, and page size 16, 32, 64, or 128. It does not use the wrapper's
-            split-K workspace and rejects custom masks, positional encoding, sliding
-            windows, logits soft cap, fixed split, and tensor-valued scales.
+            ``HND`` paged K/V layout, equal QK/VO head dimensions, and page size 16,
+            32, 64, or 128. Combined ``[num_pages, 2, Hkv, page_size, D]`` caches
+            and separate K/V pools are accepted without copying. It does not use the
+            wrapper's split-K workspace and rejects custom masks, positional encoding,
+            sliding windows, logits soft cap, fixed split, and tensor-valued scales.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -2661,6 +2665,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         elif self._backend == "cute-dsl-prims":
             _validate_sm120_prims_plan_options(
                 kv_layout=self._kv_layout,
+                required_kv_layout="HND",
                 custom_mask=custom_mask,
                 packed_custom_mask=packed_custom_mask,
                 pos_encoding_mode=pos_encoding_mode,
@@ -3023,25 +3028,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     "backend='cute-dsl-prims' does not support a run-time "
                     "window_left override"
                 )
-            if not isinstance(paged_kv_cache, tuple) or len(paged_kv_cache) != 2:
-                raise ValueError(
-                    "backend='cute-dsl-prims' paged prefill requires a contiguous "
-                    "NHD (k_cache, v_cache) tuple; a combined 5-D cache produces "
-                    "non-contiguous plane views"
-                )
-            k_cache, v_cache = paged_kv_cache
+            k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
             _check_cached_qkv_data_type(
                 q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
             )
-            if (
-                k_cache.ndim != 4
-                or v_cache.shape != k_cache.shape
-                or not k_cache.is_contiguous()
-                or not v_cache.is_contiguous()
-            ):
+            if k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
                 raise ValueError(
-                    "backend='cute-dsl-prims' requires contiguous NHD K/V pools "
-                    "with shape [num_pages, page_size, num_kv_heads, head_dim]"
+                    "backend='cute-dsl-prims' requires HND K/V pools with shape "
+                    "[num_pages, num_kv_heads, page_size, head_dim]"
                 )
             if q.size(0) != self._qo_indptr_last:
                 raise ValueError(
@@ -4060,6 +4054,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         if self._backend == "cute-dsl-prims":
             _validate_sm120_prims_plan_options(
                 kv_layout=self._kv_layout,
+                required_kv_layout="NHD",
                 custom_mask=custom_mask,
                 packed_custom_mask=packed_custom_mask,
                 pos_encoding_mode=pos_encoding_mode,

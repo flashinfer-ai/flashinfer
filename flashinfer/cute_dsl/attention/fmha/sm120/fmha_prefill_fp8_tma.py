@@ -34,7 +34,7 @@ Constraints:
 * Head dimension must be exactly 32, 64, 128, or 256
 * Query and K/V sequence tiles must be 64 or 128 rows
 * Q/O and ragged K/V use packed contiguous tensors plus cumulative sequence
-  offsets; paged K/V uses NHD ``[num_pages, num_tokens_per_page, Hkv, D]`` pools
+  offsets; paged K/V uses HND ``[num_pages, Hkv, num_tokens_per_page, D]`` pools
   and a shared K/V block table in ``block_tables[B, max_pages]``
 * Q head count must be divisible by K/V head count
 * ``max(2 * kv_tile * head_dim * input_dtype_size,
@@ -691,8 +691,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
     ) -> None:
         """Launch TMA loads for one logical K/V tile from pre-resolved pages.
 
-        The paged pool is compact NHD
-        ``(num_pages, num_tokens_per_page, Hkv, D)``. The
+        The paged pool uses HND storage
+        ``(num_pages, Hkv, num_tokens_per_page, D)``. The
         destination SMEM layout matches the contiguous path:
         ``[D chunk][KV row][D within chunk]``.
         """
@@ -717,8 +717,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                         tma_desc_ptr,
                         (
                             head_offset,
-                            kv_head_idx,
                             token_in_page,
+                            kv_head_idx,
                             page_id,
                         ),
                         mbar_arrived,
@@ -1987,7 +1987,7 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
 
         if cutlass.const_expr(self.use_paged_kv):
             seqlen_k = cutlass.Int32(seqlens_kv[batch_idx])
-            num_heads_kv = k.shape[2]
+            num_heads_kv = k.shape[1]
         else:
             k_token_base = cutlass.Int32(cu_seqlens_k[batch_idx])
             seqlen_k = cutlass.Int32(cu_seqlens_k[batch_idx + 1]) - k_token_base
@@ -2643,8 +2643,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
         """Launch the SM120 PRIM FMHA FP8 kernel.
 
         :param q: Packed query ``(total_q, Hq, D)``.
-        :param k: Packed key ``(total_k, Hkv, D)`` or NHD paged K pool
-            ``(num_pages, num_tokens_per_page, Hkv, D)``. Paged pools must
+        :param k: Packed key ``(total_k, Hkv, D)`` or HND paged K pool
+            ``(num_pages, Hkv, num_tokens_per_page, D)``. Paged pools must
             contain finite values in every slot, including unused padding.
         :param v: Packed or paged value with the same shape and finite-value
             contract as K.
@@ -2673,8 +2673,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 or head_dim != v.shape[3]
                 or head_dim != output_head_dim
                 or head_dim != self.head_tile
-                or k.shape[1] != self.num_tokens_per_page
-                or v.shape[1] != self.num_tokens_per_page
+                or k.shape[2] != self.num_tokens_per_page
+                or v.shape[2] != self.num_tokens_per_page
             ):
                 raise ValueError(
                     "runtime paged tensors must match the compiled structural config"
@@ -2683,8 +2683,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 k,
                 box_dims=(
                     1,
-                    self.num_tokens_per_page,
                     1,
+                    self.num_tokens_per_page,
                     self.tma_copy_head_per_iter,
                 ),
                 stride_order=(3, 2, 1, 0),
@@ -2694,8 +2694,8 @@ class SM120FusedMultiHeadAttentionFP8ForwardTMA:
                 v,
                 box_dims=(
                     1,
-                    self.num_tokens_per_page,
                     1,
+                    self.num_tokens_per_page,
                     self.tma_copy_head_per_iter,
                 ),
                 stride_order=(3, 2, 1, 0),

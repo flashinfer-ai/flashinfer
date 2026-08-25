@@ -91,11 +91,11 @@ def test_paged_public_wrapper(page_size):
     page_indices = torch.tensor([3, 1, 4], dtype=torch.int32, device="cuda")
     last_page_len = torch.tensor([5, 4], dtype=torch.int32, device="cuda")
     q = _fp8((5, hq, d))
-    k_pool = _fp8((5, page_size, hkv, d))
-    v_pool = _fp8((5, page_size, hkv, d))
+    combined_cache = _fp8((5, 2, hkv, page_size, d))
+    k_pool, v_pool = combined_cache.unbind(dim=1)
     workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace, "NHD", backend="cute-dsl-prims"
+        workspace, "HND", backend="cute-dsl-prims"
     )
     assert wrapper.workspace_size(
         qo,
@@ -124,14 +124,14 @@ def test_paged_public_wrapper(page_size):
         kv_data_type=k_pool.dtype,
         o_data_type=torch.bfloat16,
     )
-    actual, actual_lse = wrapper.run_return_lse(q, (k_pool, v_pool))
+    actual, actual_lse = wrapper.run_return_lse(q, combined_cache)
     refs, lses = [], []
     for batch, (q_start, q_end) in enumerate(zip(qo[:-1], qo[1:], strict=False)):
         pages = page_indices[page_indptr[batch] : page_indptr[batch + 1]]
-        k = torch.cat([k_pool[p] for p in pages])[
+        k = torch.cat([k_pool[p].transpose(0, 1) for p in pages])[
             : ((len(pages) - 1) * page_size + last_page_len[batch])
         ]
-        v = torch.cat([v_pool[p] for p in pages])[: k.shape[0]]
+        v = torch.cat([v_pool[p].transpose(0, 1) for p in pages])[: k.shape[0]]
         ref, ref_lse = _reference(q[q_start:q_end], k, v, True, 1 / math.sqrt(d))
         refs.append(ref)
         lses.append(ref_lse)
@@ -139,14 +139,14 @@ def test_paged_public_wrapper(page_size):
     torch.testing.assert_close(actual_lse, torch.cat(lses), atol=0.2, rtol=0.2)
 
 
-def test_prims_rejects_non_contiguous_combined_cache_and_pdl():
+def test_prims_accepts_combined_hnd_cache_and_rejects_pdl():
     workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
     qo = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
     indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
     indices = torch.tensor([0], dtype=torch.int32, device="cuda")
     last = torch.tensor([1], dtype=torch.int32, device="cuda")
     wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace, "NHD", backend="cute-dsl-prims"
+        workspace, "HND", backend="cute-dsl-prims"
     )
     wrapper.plan(
         qo,
@@ -162,12 +162,7 @@ def test_prims_rejects_non_contiguous_combined_cache_and_pdl():
         o_data_type=torch.float16,
     )
     q = _fp8((1, 2, 32))
-    combined = _fp8((1, 2, 16, 1, 32))
-    with pytest.raises(ValueError, match="tuple"):
-        wrapper.run(q, combined)
+    combined = _fp8((1, 2, 1, 16, 32))
+    assert wrapper.run(q, combined).shape == q.shape
     with pytest.raises(NotImplementedError, match="enable_pdl"):
-        wrapper.run(
-            q,
-            (combined[:, 0].contiguous(), combined[:, 1].contiguous()),
-            enable_pdl=True,
-        )
+        wrapper.run(q, combined, enable_pdl=True)

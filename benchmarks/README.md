@@ -611,9 +611,10 @@ Backend Legend:
 - prims-ts: Experimental task-scheduled attention kernels (Blackwell SM100/SM103)
 - cuda: FlashInfer CUDA kernels
 - cute-dsl: FlashInfer CuTe-DSL kernels (Blackwell SM10.0+)
-- cute-dsl-prims: SM120 PRIMS FP8 batch-prefill kernels. Ragged and paged
-  inputs use NHD storage; paged K/V must be a contiguous tuple. The backend
-  supports FP32 log2 LSE and requires `cutlass.experimental`.
+- cute-dsl-prims: SM120 PRIMS FP8 batch-prefill kernels. Ragged inputs use
+  packed NHD storage, while paged K/V uses HND storage. Paged attention accepts
+  the standard combined cache or separate K/V pools without copying. The
+  backend supports FP32 log2 LSE and requires `cutlass.experimental`.
 
 SM120 PRIMS examples:
 

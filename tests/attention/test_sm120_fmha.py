@@ -297,9 +297,8 @@ def _run_paged_case(
     num_pages = sum(page_counts)
     physical_ids = list(reversed(range(num_pages)))
     block_tables = torch.zeros(B, block_table_width, device="cuda", dtype=torch.int32)
-    k_pool = torch.zeros(num_pages, page_size, Hkv, D, device="cuda", dtype=q.dtype)
-    v_pool = torch.empty_like(k_pool)
-    v_pool.zero_()
+    kv_pool = torch.zeros(num_pages, 2, Hkv, page_size, D, device="cuda", dtype=q.dtype)
+    k_pool, v_pool = kv_pool.unbind(dim=1)
     physical_cursor = 0
     for batch_idx, (k_part, v_part, page_count) in enumerate(
         zip(k_parts, v_parts, page_counts, strict=False)
@@ -310,8 +309,12 @@ def _run_paged_case(
             block_tables[batch_idx, logical_page] = physical_page
             start = logical_page * page_size
             end = min(start + page_size, k_part.shape[0])
-            k_pool[physical_page, : end - start].copy_(k_part[start:end])
-            v_pool[physical_page, : end - start].copy_(v_part[start:end])
+            k_pool[physical_page, :, : end - start].copy_(
+                k_part[start:end].transpose(0, 1)
+            )
+            v_pool[physical_page, :, : end - start].copy_(
+                v_part[start:end].transpose(0, 1)
+            )
 
     cu_seqlens_q = torch.tensor(
         [0, *torch.tensor(q_lens).cumsum(0).tolist()],
@@ -378,8 +381,8 @@ def test_sm120_paged_return_lse(is_causal):
 
 def test_sm120_paged_prefill_rejects_dual_plane_page_indices():
     q = _make_fp8((64, 4, 64))
-    k_pool = _make_fp8((4, 32, 2, 64))
-    v_pool = _make_fp8((4, 32, 2, 64))
+    k_pool = _make_fp8((4, 2, 32, 64))
+    v_pool = _make_fp8((4, 2, 32, 64))
     o = torch.empty(64, 4, 64, device="cuda", dtype=torch.float16)
     dual_plane_indices = torch.zeros(1, 2, 4, device="cuda", dtype=torch.int32)
     seqlens_kv = torch.tensor([128], device="cuda", dtype=torch.int32)
@@ -397,11 +400,11 @@ def test_sm120_paged_prefill_rejects_dual_plane_page_indices():
         )
 
 
-def test_sm120_paged_prefill_rejects_hnd_pool():
+def test_sm120_paged_prefill_rejects_nhd_pool():
     q = _make_fp8((64, 4, 64))
-    # HND [P, Hkv, page, D] is intentionally unsupported.
-    k_pool = _make_fp8((4, 2, 32, 64))
-    v_pool = _make_fp8((4, 2, 32, 64))
+    # NHD [P, page, Hkv, D] is intentionally unsupported.
+    k_pool = _make_fp8((4, 32, 2, 64))
+    v_pool = _make_fp8((4, 32, 2, 64))
     o = torch.empty(64, 4, 64, device="cuda", dtype=torch.float16)
     block_tables = torch.arange(4, device="cuda", dtype=torch.int32).unsqueeze(0)
     seqlens_kv = torch.tensor([128], device="cuda", dtype=torch.int32)
