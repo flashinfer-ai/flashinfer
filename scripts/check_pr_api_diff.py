@@ -284,13 +284,20 @@ def extract_public_apis(path: str, source: str | None) -> dict[str, ApiFunction]
 
 
 class ModuleScopeImportFromVisitor(ast.NodeVisitor):
-    """Collect imports visible at module scope, including guarded imports."""
+    """Collect module-scope imports that can be visible at runtime."""
 
     def __init__(self) -> None:
         self.imports: list[ast.ImportFrom] = []
 
     def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
         self.imports.append(node)
+
+    def visit_If(self, node: ast.If) -> None:
+        if isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING":
+            for child in node.orelse:
+                self.visit(child)
+            return
+        self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         return

@@ -268,6 +268,29 @@ class ClassReexportIntegrationTest(unittest.TestCase):
                 (),
             ),
             (
+                "runtime-guarded re-export",
+                {
+                    "flashinfer/public.py": (
+                        "if runtime_condition:\n"
+                        "    from flashinfer.impl import Target as Exported\n"
+                    ),
+                    "flashinfer/impl.py": compatible_target,
+                },
+                (),
+            ),
+            (
+                "TYPE_CHECKING-only re-export",
+                {
+                    "flashinfer/public.py": (
+                        "from typing import TYPE_CHECKING\n\n"
+                        "if TYPE_CHECKING:\n"
+                        "    from flashinfer.impl import Target as Exported\n"
+                    ),
+                    "flashinfer/impl.py": compatible_target,
+                },
+                ("public_api_removed",),
+            ),
+            (
                 "conflicting re-export",
                 {
                     "flashinfer/public.py": (
