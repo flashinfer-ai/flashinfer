@@ -822,16 +822,25 @@ class SM120PrimsBatchPrefillBackend:
         v: torch.Tensor,
         out: torch.Tensor,
         *,
+        return_lse: bool,
         lse: Optional[torch.Tensor],
         q_scale: Optional[float],
         k_scale: Optional[float],
         v_scale: Optional[float],
-    ) -> None:
+    ):
         self._validate_run(q, k, v, out)
         if self._mode != "paged":
             raise RuntimeError("SM120 PRIMS backend was not planned for paged KV")
-        if lse is not None:
+        if return_lse:
+            if lse is None:
+                lse = torch.empty(
+                    (q.size(0), q.size(1)),
+                    dtype=torch.float32,
+                    device=q.device,
+                )
             self._ensure_lse_kernel()
+        else:
+            lse = None
         sm_scale = (
             self._sm_scale
             if self._sm_scale is not None
@@ -854,3 +863,6 @@ class SM120PrimsBatchPrefillBackend:
             max_seqlen_q=self._max_seqlen_q,
             lse=lse,
         )
+        if return_lse:
+            return out, lse
+        return out

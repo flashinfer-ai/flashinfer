@@ -58,15 +58,17 @@ def test_ragged_public_wrapper(causal, out_dtype):
     )
     out = torch.empty_like(q, dtype=out_dtype)
     q_scale, k_scale, v_scale = 0.75, 1.25, 0.5
-    actual, actual_lse = wrapper.run_return_lse(
-        q,
-        k,
-        v,
-        out=out,
-        q_scale=q_scale,
-        k_scale=k_scale,
-        v_scale=v_scale,
-    )
+    with pytest.warns(UserWarning, match="falling back to enable_pdl=False"):
+        actual, actual_lse = wrapper.run_return_lse(
+            q,
+            k,
+            v,
+            out=out,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            enable_pdl=True,
+        )
     assert actual is out
     refs, lses = [], []
     for i, (ql, kl) in enumerate(zip(q_lens, kv_lens, strict=False)):
@@ -182,7 +184,7 @@ def test_prims_rejects_cudnn_max_sequence_kv():
         )
 
 
-def test_prims_accepts_combined_hnd_cache_and_rejects_pdl():
+def test_prims_accepts_combined_hnd_cache_and_falls_back_without_pdl():
     workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
     qo = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
     indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
@@ -207,5 +209,5 @@ def test_prims_accepts_combined_hnd_cache_and_rejects_pdl():
     q = _fp8((1, 2, 32))
     combined = _fp8((1, 2, 1, 16, 32))
     assert wrapper.run(q, combined).shape == q.shape
-    with pytest.raises(NotImplementedError, match="enable_pdl"):
-        wrapper.run(q, combined, enable_pdl=True)
+    with pytest.warns(UserWarning, match="falling back to enable_pdl=False"):
+        assert wrapper.run(q, combined, enable_pdl=True).shape == q.shape
