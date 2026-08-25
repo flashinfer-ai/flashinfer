@@ -23,6 +23,8 @@ from .api_logging import flashinfer_api
 from .trace.templates.gdn import gdn_prefill_trace
 from .utils import get_compute_capability, get_device_name, get_device_sm_count
 from .gdn_kernels import (
+    _gdn_cp_nvcc_version,
+    _chunk_gated_delta_rule_source_sm100,
     chunk_gated_delta_rule_sm90,
     chunk_gated_delta_rule_sm100,
     chunk_gated_delta_rule_sm120,
@@ -44,14 +46,54 @@ _STATE_DTYPES: tuple[torch.dtype, ...] = (
     torch.float8_e5m2,
 )
 
+_SOURCE_CP_STATE_DTYPES: tuple[torch.dtype, ...] = (
+    torch.float32,
+    torch.bfloat16,
+    torch.float16,
+)
+
 
 def _format_dtype_list(dtypes: tuple[torch.dtype, ...]) -> str:
     return ", ".join(str(dtype).removeprefix("torch.") for dtype in dtypes)
 
 
+def _use_source_cp_sm100(
+    *,
+    initial_state: Optional[torch.Tensor],
+    output_state: Optional[torch.Tensor],
+    checkpoint_every_n_tokens: int,
+    state_checkpoints: Optional[torch.Tensor],
+    checkpoint_cu_starts: Optional[torch.Tensor],
+    cp_chunk_len: Optional[int],
+) -> bool:
+    """Select the source-only backend for the ratified public domain."""
+
+    checkpoint_enabled = checkpoint_every_n_tokens > 0
+    if checkpoint_enabled:
+        if (
+            state_checkpoints is None
+            or state_checkpoints.dtype != torch.float32
+            or checkpoint_cu_starts is None
+            or checkpoint_cu_starts.dtype not in (torch.int32, torch.int64)
+            or cp_chunk_len not in (None, checkpoint_every_n_tokens)
+        ):
+            return False
+    elif (
+        state_checkpoints is not None
+        or checkpoint_cu_starts is not None
+        or cp_chunk_len is not None
+    ):
+        return False
+    return all(
+        tensor is None or tensor.dtype in _SOURCE_CP_STATE_DTYPES
+        for tensor in (initial_state, output_state)
+    )
+
+
 def _cp_delta_rule_rejection_reason(
     *,
     arch_major: int,
+    arch_minor: int,
     cuda_major: int,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -60,30 +102,59 @@ def _cp_delta_rule_rejection_reason(
     beta: Optional[torch.Tensor],
     output: torch.Tensor,
     initial_state: Optional[torch.Tensor],
+    output_state: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
     state_indices: Optional[torch.Tensor],
+    cp_chunk_len: Optional[int],
 ) -> Optional[str]:
     if arch_major == 9:
         if cp_delta_rule_dsl_sm90 is None:
             return "CP delta rule SM90 DSL kernel is unavailable"
     elif arch_major == 10:
-        if cuda_major < 13:
-            return "CP delta rule SM100 requires CUDA 13 or newer"
-        if cp_delta_rule_dsl_sm100 is None:
-            return "CP delta rule SM100 DSL kernel is unavailable"
+        use_source_cp = _use_source_cp_sm100(
+            initial_state=initial_state,
+            output_state=output_state,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            cp_chunk_len=cp_chunk_len,
+        )
+        if use_source_cp:
+            capability = (arch_major, arch_minor)
+            minimum_nvcc = {(10, 0): (12, 8), (10, 3): (12, 9)}.get(capability)
+            if minimum_nvcc is None:
+                return (
+                    "Blackwell-only CP delta rule supports only compute capabilities "
+                    "10.0 and 10.3"
+                )
+            if _chunk_gated_delta_rule_source_sm100 is None:
+                return "Blackwell-only CP delta rule SM100 kernel is unavailable"
+            if _gdn_cp_nvcc_version is None:
+                return "Blackwell-only CP delta rule SM100 nvcc toolchain is unavailable"
+            try:
+                nvcc_version = _gdn_cp_nvcc_version()
+            except RuntimeError as error:
+                return f"Blackwell-only CP delta rule SM100 nvcc toolchain is unavailable: {error}"
+            if nvcc_version < minimum_nvcc:
+                required = ".".join(map(str, minimum_nvcc))
+                observed = ".".join(map(str, nvcc_version))
+                return (
+                    f"Blackwell-only CP delta rule for compute capability "
+                    f"{arch_major}.{arch_minor} requires nvcc {required} or newer, "
+                    f"got {observed}"
+                )
+        else:
+            if cuda_major < 13:
+                return "CP delta rule SM100 DSL kernel requires CUDA 13 or newer"
+            if cp_delta_rule_dsl_sm100 is None:
+                return "CP delta rule SM100 DSL kernel is unavailable"
     elif arch_major == 12:
         if cp_delta_rule_dsl_sm120 is None:
             return "CP delta rule SM120 DSL kernel is unavailable"
     else:
         return "CP delta rule is currently implemented only for SM90, SM100, and SM120"
-    if (
-        checkpoint_every_n_tokens > 0
-        or state_checkpoints is not None
-        or checkpoint_cu_starts is not None
-    ) and arch_major not in (9, 10, 12):
-        return "CP delta rule does not support state checkpointing yet"
     if q.shape[-1] != 128:
         return f"CP delta rule only supports head_size=128, got {q.shape[-1]}"
     if q.dtype not in (torch.float16, torch.bfloat16):
@@ -167,8 +238,8 @@ def chunk_gated_delta_rule(
         when ``None``.  When ``state_indices`` is given (SM90/SM100/SM103/SM120),
         this is instead the state **pool** ``[N_pool, num_sab_heads,
         head_size, head_size]`` and sequence ``i`` reads its initial state
-        from row ``state_indices[i]``; the pool may be non-compact (padded
-        first-dimension stride, inner ``[H, V, K]`` block contiguous).
+        from row ``state_indices[i]``; the pool may use arbitrary positive
+        strides, with distinct first-dimension rows occupying disjoint storage.
     output_final_state : bool
         Whether to output the final state.  Default: ``False``.
     cu_seqlens : torch.Tensor
@@ -212,27 +283,32 @@ def chunk_gated_delta_rule(
         Store intermediate state every N tokens.  Must be a multiple of the
         chunk size (64).  ``0`` disables checkpointing (default).
     use_cp : Literal["auto"] | bool, optional:
-        Whether to use the SM90/SM120 context-parallel DSL implementation when
-        low-parallelism heuristics match. ``"auto"`` enables conservative
-        routing, ``True`` requires CP support, and ``False`` disables CP.
-        Default: ``"auto"``.
+        Whether to use context parallelism when low-parallelism heuristics
+        match. SM100/SM103 uses the Blackwell-only four-stage implementation for
+        the original CP feature domain and FP32 boundary checkpoints. FP8
+        state/checkpoints and an unrelated explicit private CP chunk length
+        retain the CuTe-DSL implementation.
+        ``"auto"`` enables conservative routing, ``True`` requires CP support,
+        and ``False`` disables CP. Default: ``"auto"``.
     state_indices : torch.Tensor, optional
-        Int32 tensor of shape ``[num_seqs]`` (SM90/SM100/SM103/SM120). When provided,
+        Int32 or int64 tensor of shape ``[num_seqs]``
+        (SM90/SM100/SM103/SM120). When provided,
         ``initial_state`` and ``output_state`` are treated as a state pool whose
         first dimension is indexed by these slot ids rather than laid out in
         sequence order: sequence ``i`` reads its initial state from row
         ``state_indices[i]`` and writes its final state back to the same row
         (in place when ``output_state is initial_state``). This lets callers
         that keep a paged/indexed state pool avoid gathering the active rows
-        into a packed buffer and scattering the result back. The pool may be
-        non-compact (padded first-dimension stride). ``None`` (default) keeps
-        the packed, sequence-ordered layout.
+        into a packed buffer and scattering the result back. The pool may use
+        arbitrary positive strides as long as distinct first-dimension rows do
+        not overlap. ``None`` (default) keeps the packed, sequence-ordered layout.
 
         The ids **must be unique**: as with any indexed scatter, two sequences
         sharing a slot id would concurrently write the same pool row across
         work tiles, leaving that row's final state nondeterministic. Uniqueness
-        is a caller precondition (not checked at launch, to avoid a per-call
-        host sync); the caller's slot allocator is expected to guarantee it.
+        is validated while the Blackwell SM100/SM103 path prepares its launch plan.
+        Other backends may treat uniqueness as a caller precondition, so the
+        caller's slot allocator must still guarantee it.
 
 
     Returns
@@ -251,10 +327,11 @@ def chunk_gated_delta_rule(
     - Supports GQA (``num_q_heads > num_k_heads = num_v_heads``) and GVA
       (``num_v_heads > num_q_heads = num_k_heads``).
     - The final state layout is ``[N, H, V, K]``.
-    - Requires SM90 (Hopper) or SM100 (Blackwell) architecture.  The SM100
-      path requires ``head_size == 128`` and
-      ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip install
-      flashinfer-python[cu13]``).
+    - Requires SM90 (Hopper) or SM100/SM103 (Blackwell) architecture. The
+      Blackwell SM100/SM103 CP path requires ``head_size == 128`` and an installed
+      CUDA toolkit with nvcc 12.8/12.9 or newer, respectively. CuTe-DSL
+      fallback routes require ``nvidia-cutlass-dsl[cu13]>=4.4.2`` (``pip
+      install flashinfer-python[cu13]``).
     """
     if use_cp not in ("auto", True, False):
         raise ValueError(f'use_cp must be "auto", True, or False, got {use_cp!r}')
@@ -391,6 +468,7 @@ def chunk_gated_delta_rule(
     if will_use_cp:
         cp_rejection_reason = _cp_delta_rule_rejection_reason(
             arch_major=_arch_major,
+            arch_minor=_device_capability[1],
             cuda_major=_cuda_major,
             q=q,
             k=k,
@@ -399,10 +477,12 @@ def chunk_gated_delta_rule(
             beta=beta,
             output=output,
             initial_state=initial_state,
+            output_state=output_state,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
             state_indices=state_indices,
+            cp_chunk_len=_cp_chunk_len,
         )
         if cp_rejection_reason is not None:
             if use_cp is True:
@@ -414,12 +494,44 @@ def chunk_gated_delta_rule(
                 stacklevel=2,
             )
         else:
+            use_source_cp = _arch_major == 10 and _use_source_cp_sm100(
+                initial_state=initial_state,
+                output_state=output_state,
+                checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                state_checkpoints=state_checkpoints,
+                checkpoint_cu_starts=checkpoint_cu_starts,
+                cp_chunk_len=_cp_chunk_len,
+            )
             if output_final_state and output_state is None:
                 output_state = torch.empty(
                     (num_seqs, num_sab_heads, head_size, head_size),
                     dtype=torch.float32,
                     device=device,
                 )
+            if use_source_cp:
+                source_cp = cast(
+                    Callable[..., None], _chunk_gated_delta_rule_source_sm100
+                )
+                source_cp(
+                    output,
+                    output_state,
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    cu_seqlens,
+                    _scale,
+                    initial_state=initial_state,
+                    state_indices=state_indices,
+                    state_checkpoints=state_checkpoints,
+                    checkpoint_cu_starts=checkpoint_cu_starts,
+                    checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                    output_final_state=output_final_state,
+                )
+                if output_final_state:
+                    return output, output_state
+                return output
             _g = (
                 g
                 if g is not None
