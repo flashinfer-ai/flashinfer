@@ -1364,6 +1364,11 @@ _E2E_SKIP = {
     # Shared FP4 requires explicit routed/physical expert geometry and scalar
     # routing args; covered by test_fi_trace_emits_fp4_shared_expert_definition.
     "moe_fp4_block_scale_ds_shared_experts",
+    # Method receiver supplies the real process-group size. The generic sample
+    # builder has no communicator; test_ulysses_trace covers both ws=1 schema
+    # generation and the multi-rank trace-apply routing miss.
+    "ulysses_scatter_heads",
+    "ulysses_gather_heads",
 }
 
 _E2E_PAIRS = [(f, t, l) for f, t, l in _ALL_PAIRS if l not in _E2E_SKIP]
