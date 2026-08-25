@@ -193,6 +193,77 @@ def test_batch_decode_tensor_cores(
     torch.testing.assert_close(lse, lse_tensor_cores, rtol=1e-3, atol=1e-3)
 
 
+@pytest.mark.cuda
+def test_batch_decode_tensor_cores_equal_kv_strides_bf16_group_size_5():
+    """Exercise the equal-stride FA2 paged path for the Llama-4 head ratio."""
+    torch.manual_seed(42)
+    batch_size, kv_len, page_size = 2, 97, 16
+    num_qo_heads, num_kv_heads, head_dim = 40, 8, 128
+    pages_per_request = (kv_len + page_size - 1) // page_size
+    total_pages = batch_size * pages_per_request
+
+    q = torch.randn(
+        batch_size,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        total_pages,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    assert k.stride() == v.stride()
+
+    kv_indptr = (
+        torch.arange(batch_size + 1, device="cuda", dtype=torch.int32)
+        * pages_per_request
+    )
+    kv_indices = torch.arange(total_pages, device="cuda", dtype=torch.int32)
+    last_page_len = torch.full(
+        (batch_size,),
+        (kv_len - 1) % page_size + 1,
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    workspace = torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace, "NHD", use_tensor_cores=True, backend="fa2"
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    actual = wrapper.run(q, (k, v))
+
+    k_dense = k.view(batch_size, pages_per_request * page_size, num_kv_heads, head_dim)[
+        :, :kv_len
+    ]
+    v_dense = v.view(batch_size, pages_per_request * page_size, num_kv_heads, head_dim)[
+        :, :kv_len
+    ]
+    group_size = num_qo_heads // num_kv_heads
+    k_dense = k_dense.repeat_interleave(group_size, dim=2).float()
+    v_dense = v_dense.repeat_interleave(group_size, dim=2).float()
+    logits = torch.einsum("bhd,bkhd->bhk", q.float(), k_dense) * head_dim**-0.5
+    expected = torch.einsum("bhk,bkhd->bhd", torch.softmax(logits, dim=-1), v_dense)
+
+    torch.testing.assert_close(actual.float(), expected, rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("batch_size", [12, 17])
 @pytest.mark.parametrize("kv_len", [54, 97, 512])
 @pytest.mark.parametrize("page_size", [1, 8, 16])

@@ -338,6 +338,69 @@ def test_batch_prefill_with_paged_kv_cache(
     _assert_no_ref_mismatch(mismatch_counts)
 
 
+@pytest.mark.cuda
+def test_batch_prefill_equal_kv_strides_bf16():
+    """Exercise the equal-stride FA2 paged path for the GPT-OSS head shape."""
+    torch.manual_seed(42)
+    qo_len = kv_len = 65
+    page_size = 16
+    num_qo_heads, num_kv_heads, head_dim = 64, 8, 64
+    pages_per_request = (kv_len + page_size - 1) // page_size
+
+    q = torch.randn(
+        qo_len,
+        num_qo_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        pages_per_request,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    assert k.stride() == v.stride()
+
+    qo_indptr = torch.tensor([0, qo_len], device="cuda", dtype=torch.int32)
+    kv_indptr = torch.tensor([0, pages_per_request], device="cuda", dtype=torch.int32)
+    kv_indices = torch.arange(pages_per_request, device="cuda", dtype=torch.int32)
+    last_page_len = torch.tensor(
+        [(kv_len - 1) % page_size + 1], device="cuda", dtype=torch.int32
+    )
+
+    workspace = torch.empty(128 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, "NHD", backend="fa2"
+    )
+    wrapper.plan(
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        last_page_len,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        causal=True,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+    )
+    actual = wrapper.run(q, (k, v))
+    expected = flashinfer.prefill.single_prefill_with_kv_cache(
+        q,
+        k.view(-1, num_kv_heads, head_dim)[:kv_len],
+        v.view(-1, num_kv_heads, head_dim)[:kv_len],
+        causal=True,
+        backend="fa2",
+    )
+
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=1e-2)
+
+
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
 def test_batch_prefill_with_paged_kv_cache_head_dim_512(
