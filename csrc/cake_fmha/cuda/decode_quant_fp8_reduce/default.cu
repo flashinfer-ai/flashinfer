@@ -24,7 +24,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_FMHA_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
 #define THREADS 32
 #define HEAD_DIM 128
@@ -71,7 +71,7 @@ kernel_cake_fmha_decode_quant_fp8_reduce(float* __restrict__ partial_O, float* _
     int bh = blockIdx.x;
     int split_stride = ((FIXED_NUM_SPLITS != 0) ? FIXED_NUM_SPLITS : num_split);
     int stat_base = bh * split_stride;
-    float max_m = -LOOM_INF;
+    float max_m = -CAKE_FMHA_INF;
     float fixed_max[8];
     {
         #pragma unroll 8
@@ -92,7 +92,7 @@ kernel_cake_fmha_decode_quant_fp8_reduce(float* __restrict__ partial_O, float* _
         #pragma unroll 8
         for (int s1 = 0; s1 < num_split; s1++) {
             float m_s1 = partial_max[stat_base + s1];
-            if (m_s1 != -LOOM_INF) {
+            if (m_s1 != -CAKE_FMHA_INF) {
                 float _exp2_1 = approx_exp2(m_s1 - max_m);
                 float w_s = _exp2_1 * partial_sum[stat_base + s1];
                 sum_w = sum_w + w_s;

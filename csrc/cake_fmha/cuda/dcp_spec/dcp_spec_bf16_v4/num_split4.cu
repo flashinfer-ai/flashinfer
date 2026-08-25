@@ -28,7 +28,7 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 
 #include <cuda_bf16.h>
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_FMHA_INF CUDART_INF_F
 #define TMEM_NCOLS 128
 #define TMEM_TMEM_S0_OFFSET 0
 #define TMEM_TMEM_S1_OFFSET 8
@@ -607,8 +607,8 @@ kernel_cake_fmha_dcp_spec_bf16_v4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                 }
                 float row_max_pair[2];
                 float row_sum_pair[2];
-                row_max_pair[0] = -LOOM_INF;
-                row_max_pair[1] = -LOOM_INF;
+                row_max_pair[0] = -CAKE_FMHA_INF;
+                row_max_pair[1] = -CAKE_FMHA_INF;
                 row_sum_pair[0] = 0.0f;
                 row_sum_pair[1] = 0.0f;
                 uint32_t _amf_u_0 = __float_as_uint(-3.4028235e+38f);
@@ -724,7 +724,7 @@ kernel_cake_fmha_dcp_spec_bf16_v4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                     for (int c_3 = 0; c_3 < 2; c_3++) {
                         float delta = softmax_scale_log2 * (row_max_pair[c_3] - new_max_pair[c_3]);
                         float _exp2_0 = approx_exp2(delta);
-                        acc_scale_pair[c_3] = ((row_max_pair[c_3] > -LOOM_INF) ? _exp2_0 : 1.0f);
+                        acc_scale_pair[c_3] = ((row_max_pair[c_3] > -CAKE_FMHA_INF) ? _exp2_0 : 1.0f);
                     }
                     float stats_pair[4];
                     stats_pair[0] = old_max_pair[0];
@@ -742,7 +742,7 @@ kernel_cake_fmha_dcp_spec_bf16_v4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                     float exp_vals[8];
                     #pragma unroll
                     for (int c_4 = 0; c_4 < 8; c_4++) {
-                        float safe_max = ((new_max_pair[c_4 % 2] == -LOOM_INF) ? 0.0f : new_max_pair[c_4 % 2]);
+                        float safe_max = ((new_max_pair[c_4 % 2] == -CAKE_FMHA_INF) ? 0.0f : new_max_pair[c_4 % 2]);
                         float max_scaled = safe_max * softmax_scale_log2;
                         float _exp2_1 = approx_exp2(sv[c_4] * softmax_scale_log2 - max_scaled);
                         exp_vals[c_4] = _exp2_1;
@@ -1068,7 +1068,7 @@ kernel_cake_fmha_dcp_spec_bf16_v4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                 float owner_scale0 = 0.0f;
                 float owner_scale1 = 0.0f;
                 float owner_inv_sum = 0.0f;
-                float owner_lse = -LOOM_INF;
+                float owner_lse = -CAKE_FMHA_INF;
                 int owner_valid = 0;
                 if (group_ratio_rt > lane) {
                     float owner_m0 = smem_exch0[lane];
@@ -1080,9 +1080,9 @@ kernel_cake_fmha_dcp_spec_bf16_v4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                     float owner_d0 = softmax_scale_log2 * (owner_m0 - owner_max);
                     float owner_d1 = softmax_scale_log2 * (owner_m1 - owner_max);
                     float _exp2_4 = approx_exp2(owner_d0);
-                    owner_scale0 = ((owner_m0 == -LOOM_INF) ? 0.0f : _exp2_4);
+                    owner_scale0 = ((owner_m0 == -CAKE_FMHA_INF) ? 0.0f : _exp2_4);
                     float _exp2_5 = approx_exp2(owner_d1);
-                    owner_scale1 = ((owner_m1 == -LOOM_INF) ? 0.0f : _exp2_5);
+                    owner_scale1 = ((owner_m1 == -CAKE_FMHA_INF) ? 0.0f : _exp2_5);
                     float owner_sum = owner_s0 * owner_scale0 + owner_s1 * owner_scale1;
                     if (owner_sum > 0.0f && owner_sum == owner_sum) {
                         float _rcp_0 = approx_rcp(owner_sum);
@@ -1152,7 +1152,7 @@ kernel_cake_fmha_dcp_spec_bf16_v4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                         int reduce_q_head = kv_head_idx_1 * group_ratio_rt + d_idx;
                         int reduce_stat_base = ((batch_idx_1 * Q_LEN + q_row_idx_1) * NUM_Q_HEADS + reduce_q_head) * NUM_SPLIT;
                         {
-                            float merged_max = -LOOM_INF;
+                            float merged_max = -CAKE_FMHA_INF;
                             #pragma unroll 2
                             for (int reduce_split = 0; reduce_split < NUM_SPLIT; reduce_split++) {
                                 float split_lse = partial_LSE_ptr[reduce_stat_base + reduce_split];
@@ -1164,7 +1164,7 @@ kernel_cake_fmha_dcp_spec_bf16_v4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                             for (int reduce_split_1 = 0; reduce_split_1 < NUM_SPLIT; reduce_split_1++) {
                                 float split_lse_1 = partial_LSE_ptr[reduce_stat_base + reduce_split_1];
                                 float split_weight = 0.0f;
-                                if (split_lse_1 != -LOOM_INF) {
+                                if (split_lse_1 != -CAKE_FMHA_INF) {
                                     float _exp2_8 = approx_exp2(split_lse_1 - merged_max);
                                     split_weight = _exp2_8;
                                 }
@@ -1178,7 +1178,7 @@ kernel_cake_fmha_dcp_spec_bf16_v4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorMap
                                 int weight_idx = reduce_split_2 * TILE_Q + d_idx;
                                 split_weights[weight_idx] = split_weights[weight_idx] * inv_weight_sum;
                             }
-                            float merged_lse = -LOOM_INF;
+                            float merged_lse = -CAKE_FMHA_INF;
                             if (weight_sum > 0.0f) {
                                 float _log2_2;
                                 asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_2) : "f"(weight_sum));

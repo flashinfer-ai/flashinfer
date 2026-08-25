@@ -75,7 +75,7 @@ __device__ __forceinline__ uint32_t cake_fmha_qmul4_portable(
   return output;
 }
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_FMHA_INF CUDART_INF_F
 #define TMEM_NCOLS 224
 #define TMEM_TMEM_S0_OFFSET 0
 #define TMEM_TMEM_S1_OFFSET 8
@@ -703,12 +703,12 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                 float row_sum_pair0[2];
                 float row_max_pair1[2];
                 float row_sum_pair1[2];
-                row_max_pair0[0] = -LOOM_INF;
-                row_max_pair0[1] = -LOOM_INF;
+                row_max_pair0[0] = -CAKE_FMHA_INF;
+                row_max_pair0[1] = -CAKE_FMHA_INF;
                 row_sum_pair0[0] = 0.0f;
                 row_sum_pair0[1] = 0.0f;
-                row_max_pair1[0] = -LOOM_INF;
-                row_max_pair1[1] = -LOOM_INF;
+                row_max_pair1[0] = -CAKE_FMHA_INF;
+                row_max_pair1[1] = -CAKE_FMHA_INF;
                 row_sum_pair1[0] = 0.0f;
                 row_sum_pair1[1] = 0.0f;
                 uint32_t _amf_u_0 = __float_as_uint(-3.4028235e+38f);
@@ -884,8 +884,8 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                                 row_max_pair0[c_3] = new_max_pair_s[c_3];
                             }
                         }
-                        float safe_max0_s = ((new_max_pair_s[0] == -LOOM_INF) ? 0.0f : new_max_pair_s[0]);
-                        float safe_max1_s = ((new_max_pair_s[1] == -LOOM_INF) ? 0.0f : new_max_pair_s[1]);
+                        float safe_max0_s = ((new_max_pair_s[0] == -CAKE_FMHA_INF) ? 0.0f : new_max_pair_s[0]);
+                        float safe_max1_s = ((new_max_pair_s[1] == -CAKE_FMHA_INF) ? 0.0f : new_max_pair_s[1]);
                         float2 _f2_3 = make_float2(softmax_scale_log2, softmax_scale_log2);
                         float2 _f2_4 = make_float2(-softmax_scale_log2, -softmax_scale_log2);
                         float2 _f2_5 = make_float2(8.8073549f, 8.8073549f);
@@ -1246,13 +1246,13 @@ kernel_cake_fmha_decode_quant_nvfp4(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                 float2 d0_pair_f2 = mul_f32x2(_f2_38, max_diff_i0_f2);
                 float2 d1_pair_f2 = mul_f32x2(_f2_38, max_diff_i1_f2);
                 float _exp2_14 = approx_exp2(d0_pair_f2.x);
-                scale0_pair[0] = ((m0_0 == -LOOM_INF) ? 0.0f : _exp2_14);
+                scale0_pair[0] = ((m0_0 == -CAKE_FMHA_INF) ? 0.0f : _exp2_14);
                 float _exp2_15 = approx_exp2(d0_pair_f2.y);
-                scale0_pair[1] = ((m0_1 == -LOOM_INF) ? 0.0f : _exp2_15);
+                scale0_pair[1] = ((m0_1 == -CAKE_FMHA_INF) ? 0.0f : _exp2_15);
                 float _exp2_16 = approx_exp2(d1_pair_f2.x);
-                scale1_pair[0] = ((m1_0 == -LOOM_INF) ? 0.0f : _exp2_16);
+                scale1_pair[0] = ((m1_0 == -CAKE_FMHA_INF) ? 0.0f : _exp2_16);
                 float _exp2_17 = approx_exp2(d1_pair_f2.y);
-                scale1_pair[1] = ((m1_1 == -LOOM_INF) ? 0.0f : _exp2_17);
+                scale1_pair[1] = ((m1_1 == -CAKE_FMHA_INF) ? 0.0f : _exp2_17);
                 float2 _f2_39 = make_float2(scale0_pair[0], scale0_pair[1]);
                 float2 _f2_40 = make_float2(scale1_pair[0], scale1_pair[1]);
                 float2 s1_scaled_pair_f2 = mul_f32x2(_f2_34, _f2_40);

@@ -17,7 +17,7 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 
 #include <cuda_bf16.h>
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_FMHA_INF CUDART_INF_F
 #define TMEM_NCOLS 128
 #define TMEM_TMEM_S0_OFFSET 0
 #define TMEM_TMEM_S1_OFFSET 8
@@ -578,8 +578,8 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                 int split_start_block = 0;
                 float row_max_pair[2];
                 float row_sum_pair[2];
-                row_max_pair[0] = -LOOM_INF;
-                row_max_pair[1] = -LOOM_INF;
+                row_max_pair[0] = -CAKE_FMHA_INF;
+                row_max_pair[1] = -CAKE_FMHA_INF;
                 row_sum_pair[0] = 0.0f;
                 row_sum_pair[1] = 0.0f;
                 uint32_t _amf_u_0 = __float_as_uint(-3.4028235e+38f);
@@ -713,7 +713,7 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                     for (int c_3 = 0; c_3 < 2; c_3++) {
                         float delta = smx_scale * (row_max_pair[c_3] - new_max_pair[c_3]);
                         float _exp2_0 = approx_exp2(delta);
-                        acc_scale_pair[c_3] = ((row_max_pair[c_3] > -LOOM_INF) ? _exp2_0 : 1.0f);
+                        acc_scale_pair[c_3] = ((row_max_pair[c_3] > -CAKE_FMHA_INF) ? _exp2_0 : 1.0f);
                     }
                     float stats_pair[4];
                     stats_pair[0] = old_max_pair[0];
@@ -731,7 +731,7 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                     float exp_vals[8];
                     #pragma unroll
                     for (int c_4 = 0; c_4 < 8; c_4++) {
-                        float safe_max = ((new_max_pair[c_4 % 2] == -LOOM_INF) ? 0.0f : new_max_pair[c_4 % 2]);
+                        float safe_max = ((new_max_pair[c_4 % 2] == -CAKE_FMHA_INF) ? 0.0f : new_max_pair[c_4 % 2]);
                         float max_scaled = safe_max * smx_scale;
                         float _exp2_1 = approx_exp2(sv[c_4] * smx_scale - max_scaled);
                         exp_vals[c_4] = _exp2_1;
@@ -1301,9 +1301,9 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                     float d0 = smx_scale_c * (m0 - fm);
                     float d1 = smx_scale_c * (m1 - fm);
                     float _exp2_4 = approx_exp2(d0);
-                    scale0[c_11] = ((m0 == -LOOM_INF) ? 0.0f : _exp2_4);
+                    scale0[c_11] = ((m0 == -CAKE_FMHA_INF) ? 0.0f : _exp2_4);
                     float _exp2_5 = approx_exp2(d1);
-                    scale1[c_11] = ((m1 == -LOOM_INF) ? 0.0f : _exp2_5);
+                    scale1[c_11] = ((m1 == -CAKE_FMHA_INF) ? 0.0f : _exp2_5);
                     local_sum[c_11] = s0 * scale0[c_11] + s1 * scale1[c_11];
                 }
                 mbarrier_arrive(corr_empty_0_addr);
@@ -1322,7 +1322,7 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                 #pragma unroll
                 for (int h_24 = 0; h_24 < 8; h_24++) {
                     float final_o = 0.0f;
-                    float local_lse = -LOOM_INF;
+                    float local_lse = -CAKE_FMHA_INF;
                     if (local_sum[h_24] > 0.0f && local_sum[h_24] == local_sum[h_24]) {
                         float merged = _tmem_load_2[h_24] * scale0[h_24] + _tmem_load_3[h_24] * scale1[h_24];
                         float _rcp_0 = approx_rcp(local_sum[h_24]);
@@ -1352,7 +1352,7 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                 #pragma unroll
                 for (int h_25 = 0; h_25 < 8; h_25++) {
                     float final_o_1 = 0.0f;
-                    float local_lse_1 = -LOOM_INF;
+                    float local_lse_1 = -CAKE_FMHA_INF;
                     if (local_sum[h_25] > 0.0f && local_sum[h_25] == local_sum[h_25]) {
                         float merged_1 = _tmem_load_4[h_25] * scale0[h_25] + _tmem_load_5[h_25] * scale1[h_25];
                         float _rcp_1 = approx_rcp(local_sum[h_25]);
@@ -1376,7 +1376,7 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                 #pragma unroll
                 for (int h_26 = 0; h_26 < 8; h_26++) {
                     float final_o_2 = 0.0f;
-                    float local_lse_2 = -LOOM_INF;
+                    float local_lse_2 = -CAKE_FMHA_INF;
                     if (local_sum[h_26] > 0.0f && local_sum[h_26] == local_sum[h_26]) {
                         float merged_2 = _tmem_load_6[h_26] * scale0[h_26] + _tmem_load_7[h_26] * scale1[h_26];
                         float _rcp_2 = approx_rcp(local_sum[h_26]);
@@ -1400,7 +1400,7 @@ kernel_cake_fmha_decode_native_fp16_hd512(CakeFmhaTensorMap const* Qt, CakeFmhaT
                 #pragma unroll
                 for (int h_27 = 0; h_27 < 8; h_27++) {
                     float final_o_3 = 0.0f;
-                    float local_lse_3 = -LOOM_INF;
+                    float local_lse_3 = -CAKE_FMHA_INF;
                     if (local_sum[h_27] > 0.0f && local_sum[h_27] == local_sum[h_27]) {
                         float merged_3 = _tmem_load_8[h_27] * scale0[h_27] + _tmem_load_9[h_27] * scale1[h_27];
                         float _rcp_3 = approx_rcp(local_sum[h_27]);

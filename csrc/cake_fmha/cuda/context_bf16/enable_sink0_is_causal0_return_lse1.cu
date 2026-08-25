@@ -17,7 +17,7 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 
 #include <cuda_bf16.h>
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_FMHA_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_SCORES_0_OFFSET 0
 #define TMEM_SOFTMAX_0_OFFSET 64
@@ -788,7 +788,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                 {
                     num_masked_iters = 0;
                 }
-                float row_max_val = -LOOM_INF;
+                float row_max_val = -CAKE_FMHA_INF;
                 float row_sum_val = 0.0f;
                 unsigned int masked_loop_end = num_masked_iters;
                 unsigned int unmasked_loop_start = num_masked_iters;
@@ -820,7 +820,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                         }
                         #pragma unroll
                         for (int _i_1 = 0; _i_1 < 32; _i_1++) {
-                            if (!(_slice_lo_mask_0 & (1u << _i_1))) _tmem_load_0[0 + _i_1] = -LOOM_INF;
+                            if (!(_slice_lo_mask_0 & (1u << _i_1))) _tmem_load_0[0 + _i_1] = -CAKE_FMHA_INF;
                         }
                         uint32_t _slice_lo_mask_1;
                         {
@@ -837,7 +837,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                         }
                         #pragma unroll
                         for (int _i_3 = 0; _i_3 < 32; _i_3++) {
-                            if (!(_slice_lo_mask_1 & (1u << _i_3))) _tmem_load_0[32 + _i_3] = -LOOM_INF;
+                            if (!(_slice_lo_mask_1 & (1u << _i_3))) _tmem_load_0[32 + _i_3] = -CAKE_FMHA_INF;
                         }
                         uint32_t _slice_lo_mask_2;
                         {
@@ -854,7 +854,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                         }
                         #pragma unroll
                         for (int _i_5 = 0; _i_5 < 32; _i_5++) {
-                            if (!(_slice_lo_mask_2 & (1u << _i_5))) _tmem_load_0[64 + _i_5] = -LOOM_INF;
+                            if (!(_slice_lo_mask_2 & (1u << _i_5))) _tmem_load_0[64 + _i_5] = -CAKE_FMHA_INF;
                         }
                         uint32_t _slice_lo_mask_3;
                         {
@@ -871,7 +871,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                         }
                         #pragma unroll
                         for (int _i_7 = 0; _i_7 < 32; _i_7++) {
-                            if (!(_slice_lo_mask_3 & (1u << _i_7))) _tmem_load_0[96 + _i_7] = -LOOM_INF;
+                            if (!(_slice_lo_mask_3 & (1u << _i_7))) _tmem_load_0[96 + _i_7] = -CAKE_FMHA_INF;
                         }
                     }
                     int valid_count = causal_row - n_block * BLOCK_N + 1;
@@ -890,7 +890,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     }
                     #pragma unroll
                     for (int _i_9 = 0; _i_9 < 32; _i_9++) {
-                        if (!(_slice_lo_mask_4 & (1u << _i_9))) _tmem_load_0[0 + _i_9] = -LOOM_INF;
+                        if (!(_slice_lo_mask_4 & (1u << _i_9))) _tmem_load_0[0 + _i_9] = -CAKE_FMHA_INF;
                     }
                     uint32_t _slice_lo_mask_5;
                     {
@@ -907,7 +907,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     }
                     #pragma unroll
                     for (int _i_11 = 0; _i_11 < 32; _i_11++) {
-                        if (!(_slice_lo_mask_5 & (1u << _i_11))) _tmem_load_0[32 + _i_11] = -LOOM_INF;
+                        if (!(_slice_lo_mask_5 & (1u << _i_11))) _tmem_load_0[32 + _i_11] = -CAKE_FMHA_INF;
                     }
                     uint32_t _slice_lo_mask_6;
                     {
@@ -924,7 +924,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     }
                     #pragma unroll
                     for (int _i_13 = 0; _i_13 < 32; _i_13++) {
-                        if (!(_slice_lo_mask_6 & (1u << _i_13))) _tmem_load_0[64 + _i_13] = -LOOM_INF;
+                        if (!(_slice_lo_mask_6 & (1u << _i_13))) _tmem_load_0[64 + _i_13] = -CAKE_FMHA_INF;
                     }
                     uint32_t _slice_lo_mask_7;
                     {
@@ -941,9 +941,9 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     }
                     #pragma unroll
                     for (int _i_15 = 0; _i_15 < 32; _i_15++) {
-                        if (!(_slice_lo_mask_7 & (1u << _i_15))) _tmem_load_0[96 + _i_15] = -LOOM_INF;
+                        if (!(_slice_lo_mask_7 & (1u << _i_15))) _tmem_load_0[96 + _i_15] = -CAKE_FMHA_INF;
                     }
-                    float2 _reg_reduce_max2_16 = {-LOOM_INF, -LOOM_INF};
+                    float2 _reg_reduce_max2_16 = {-CAKE_FMHA_INF, -CAKE_FMHA_INF};
                     row_max_x32_accum(&_tmem_load_0[0], _reg_reduce_max2_16);
                     row_max_x32_accum(&_tmem_load_0[32], _reg_reduce_max2_16);
                     row_max_x32_accum(&_tmem_load_0[64], _reg_reduce_max2_16);
@@ -952,17 +952,17 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     float new_max = _tmem_load_0_max;
                     float _max_0 = max_noftz(new_max, row_max_val);
                     new_max = _max_0;
-                    float new_max_scaled = ((new_max == -LOOM_INF) ? 0.0f : new_max) * softmax_scale_log2;
+                    float new_max_scaled = ((new_max == -CAKE_FMHA_INF) ? 0.0f : new_max) * softmax_scale_log2;
                     float acc_scale;
                     float selected_max;
                     float _fma_0 = __fmaf_rn(row_max_val, softmax_scale_log2, -new_max_scaled);
                     if (_fma_0 >= -8.0f) {
                         selected_max = row_max_val;
                         acc_scale = 1.0f;
-                        new_max_scaled = ((row_max_val == -LOOM_INF) ? 0.0f : row_max_val) * softmax_scale_log2;
+                        new_max_scaled = ((row_max_val == -CAKE_FMHA_INF) ? 0.0f : row_max_val) * softmax_scale_log2;
                     } else {
                         selected_max = new_max;
-                        if (row_max_val > -LOOM_INF) {
+                        if (row_max_val > -CAKE_FMHA_INF) {
                             float _exp2_0 = approx_exp2(_fma_0);
                             acc_scale = _exp2_0;
                         } else {
@@ -1055,7 +1055,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                             }
                             #pragma unroll
                             for (int _i_21 = 0; _i_21 < 32; _i_21++) {
-                                if (!(_slice_lo_mask_12 & (1u << _i_21))) _tmem_load_1[0 + _i_21] = -LOOM_INF;
+                                if (!(_slice_lo_mask_12 & (1u << _i_21))) _tmem_load_1[0 + _i_21] = -CAKE_FMHA_INF;
                             }
                             uint32_t _slice_lo_mask_13;
                             {
@@ -1072,7 +1072,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                             }
                             #pragma unroll
                             for (int _i_23 = 0; _i_23 < 32; _i_23++) {
-                                if (!(_slice_lo_mask_13 & (1u << _i_23))) _tmem_load_1[32 + _i_23] = -LOOM_INF;
+                                if (!(_slice_lo_mask_13 & (1u << _i_23))) _tmem_load_1[32 + _i_23] = -CAKE_FMHA_INF;
                             }
                             uint32_t _slice_lo_mask_14;
                             {
@@ -1089,7 +1089,7 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                             }
                             #pragma unroll
                             for (int _i_25 = 0; _i_25 < 32; _i_25++) {
-                                if (!(_slice_lo_mask_14 & (1u << _i_25))) _tmem_load_1[64 + _i_25] = -LOOM_INF;
+                                if (!(_slice_lo_mask_14 & (1u << _i_25))) _tmem_load_1[64 + _i_25] = -CAKE_FMHA_INF;
                             }
                             uint32_t _slice_lo_mask_15;
                             {
@@ -1106,11 +1106,11 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                             }
                             #pragma unroll
                             for (int _i_27 = 0; _i_27 < 32; _i_27++) {
-                                if (!(_slice_lo_mask_15 & (1u << _i_27))) _tmem_load_1[96 + _i_27] = -LOOM_INF;
+                                if (!(_slice_lo_mask_15 & (1u << _i_27))) _tmem_load_1[96 + _i_27] = -CAKE_FMHA_INF;
                             }
                         }
                     }
-                    float2 _reg_reduce_max2_28 = {-LOOM_INF, -LOOM_INF};
+                    float2 _reg_reduce_max2_28 = {-CAKE_FMHA_INF, -CAKE_FMHA_INF};
                     row_max_x32_accum(&_tmem_load_1[0], _reg_reduce_max2_28);
                     row_max_x32_accum(&_tmem_load_1[32], _reg_reduce_max2_28);
                     row_max_x32_accum(&_tmem_load_1[64], _reg_reduce_max2_28);
@@ -1119,17 +1119,17 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     float new_max_1 = _tmem_load_1_max;
                     float _max_1 = max_noftz(new_max_1, row_max_val);
                     new_max_1 = _max_1;
-                    float new_max_scaled_1 = ((new_max_1 == -LOOM_INF) ? 0.0f : new_max_1) * softmax_scale_log2;
+                    float new_max_scaled_1 = ((new_max_1 == -CAKE_FMHA_INF) ? 0.0f : new_max_1) * softmax_scale_log2;
                     float acc_scale_1;
                     float selected_max_1;
                     float _fma_1 = __fmaf_rn(row_max_val, softmax_scale_log2, -new_max_scaled_1);
                     if (_fma_1 >= -8.0f) {
                         selected_max_1 = row_max_val;
                         acc_scale_1 = 1.0f;
-                        new_max_scaled_1 = ((row_max_val == -LOOM_INF) ? 0.0f : row_max_val) * softmax_scale_log2;
+                        new_max_scaled_1 = ((row_max_val == -CAKE_FMHA_INF) ? 0.0f : row_max_val) * softmax_scale_log2;
                     } else {
                         selected_max_1 = new_max_1;
-                        if (row_max_val > -LOOM_INF) {
+                        if (row_max_val > -CAKE_FMHA_INF) {
                             float _exp2_1 = approx_exp2(_fma_1);
                             acc_scale_1 = _exp2_1;
                         } else {

@@ -17,7 +17,7 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 
 #include <cuda_bf16.h>
 
-#define LOOM_INF CUDART_INF_F
+#define CAKE_FMHA_INF CUDART_INF_F
 #define TMEM_NCOLS 128
 #define TMEM_TMEM_S0_OFFSET 0
 #define TMEM_TMEM_S1_OFFSET 8
@@ -815,9 +815,9 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                     float2 _f2_2 = make_float2(smx_scale, smx_scale);
                     float2 acc_scaled_delta_pair_f2 = mul_f32x2(_f2_2, acc_delta_pair_f2);
                     float _exp2_0 = approx_exp2(acc_scaled_delta_pair_f2.x);
-                    acc_scale_pair[0] = ((row_max_pair[0] > -LOOM_INF) ? _exp2_0 : 1.0f);
+                    acc_scale_pair[0] = ((row_max_pair[0] > -CAKE_FMHA_INF) ? _exp2_0 : 1.0f);
                     float _exp2_1 = approx_exp2(acc_scaled_delta_pair_f2.y);
-                    acc_scale_pair[1] = ((row_max_pair[1] > -LOOM_INF) ? _exp2_1 : 1.0f);
+                    acc_scale_pair[1] = ((row_max_pair[1] > -CAKE_FMHA_INF) ? _exp2_1 : 1.0f);
                     float stats_pair[4];
                     stats_pair[0] = old_max_pair[0];
                     stats_pair[1] = old_max_pair[1];
@@ -1229,9 +1229,9 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                     float d0 = smx_scale_c * (m0 - fm);
                     float d1 = smx_scale_c * (m1 - fm);
                     float _exp2_14 = approx_exp2(d0);
-                    scale0[c_5] = ((m0 == -LOOM_INF) ? 0.0f : _exp2_14);
+                    scale0[c_5] = ((m0 == -CAKE_FMHA_INF) ? 0.0f : _exp2_14);
                     float _exp2_15 = approx_exp2(d1);
-                    scale1[c_5] = ((m1 == -LOOM_INF) ? 0.0f : _exp2_15);
+                    scale1[c_5] = ((m1 == -CAKE_FMHA_INF) ? 0.0f : _exp2_15);
                     local_sum[c_5] = s0 * scale0[c_5] + s1 * scale1[c_5];
                 }
                 mbarrier_arrive(corr_empty_0_addr);
@@ -1264,7 +1264,7 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                 #pragma unroll
                 for (int h = 0; h < 8; h++) {
                     float final_o = 0.0f;
-                    float local_lse = -LOOM_INF;
+                    float local_lse = -CAKE_FMHA_INF;
                     {
                         float merged_n = 0.0f;
                         if (local_sum[h] > 0.0f && local_sum[h] == local_sum[h]) {
