@@ -14,6 +14,7 @@ from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
     bootstrap_dist,
+    ensure_not_capturing,
     free_sym_tensor,
     resolve_gate_up_clamp,
     sym_zeros,
@@ -112,6 +113,7 @@ class MegaMoEBf16Frontend:
 
     def set_gate_up_clamp(self, clamp: Optional[float]) -> None:
         if self._gate_up_clamp != clamp:
+            ensure_not_capturing("set_gate_up_clamp (clamp change)")
             self._release_workspace()
             self._gate_up_clamp = clamp
             self._mega_key = None
@@ -125,6 +127,7 @@ class MegaMoEBf16Frontend:
             raise ValueError(f"unsupported BF16 MegaMoE knobs: {knobs}.")
         new_config = with_knobs(self.config, knobs)
         if new_config != self._config:
+            ensure_not_capturing("apply_knobs (config change)")
             self._release_workspace()
             self._config = new_config
             self._mega_key = None
@@ -177,6 +180,7 @@ class MegaMoEBf16Frontend:
         if self._mega is not None and self._mega_key == key:
             return self._mega
 
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
         self._release_workspace()
         import cutlass
         import cutlass.cute as cute
@@ -290,7 +294,7 @@ class MegaMoEBf16Frontend:
         if self.config.in_kernel_fc2_reduce:
             inputs.combine_output.zero_()
         mega.compiled(**mega.launch_kwargs)
-        if sync:
+        if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
         return inputs.combine_output[:n]
 
@@ -359,6 +363,7 @@ class MegaMoEBf16Frontend:
 
     def _release_workspace(self) -> None:
         if self._mega is not None:
+            ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
 
 
@@ -431,11 +436,35 @@ def get_symm_buffer_for_bf16_mega_moe(
     if knobs:
         from .tuner import is_valid_bf16, with_knobs
 
+        # IKR is caller-owned. Drop it from knobs so with_knobs cannot flip
+        # it, and rewrite epi token-back before replace: BF16 rejects
+        # in_kernel_fc2_reduce + epi_warps in __post_init__.
+        knobs = dict(knobs)
+        knobs.pop("in_kernel_fc2_reduce", None)
+        if in_kernel_fc2_reduce:
+            mode = knobs.get("token_back_mode", token_back_mode)
+            if mode == "epi_warps":
+                knobs["token_back_mode"] = (
+                    token_back_mode
+                    if token_back_mode != "epi_warps"
+                    else "reuse_dispatch_warps"
+                )
         if not is_valid_bf16(knobs):
             raise ValueError(f"unsupported BF16 MegaMoE knobs: {knobs}.")
         cfg = with_knobs(cfg, knobs)
         if cfg.in_kernel_fc2_reduce != in_kernel_fc2_reduce:
-            cfg = dataclasses.replace(cfg, in_kernel_fc2_reduce=in_kernel_fc2_reduce)
+            token_back = cfg.token_back_mode
+            if in_kernel_fc2_reduce and token_back == "epi_warps":
+                token_back = (
+                    token_back_mode
+                    if token_back_mode != "epi_warps"
+                    else "reuse_dispatch_warps"
+                )
+            cfg = dataclasses.replace(
+                cfg,
+                in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                token_back_mode=token_back,
+            )
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)
