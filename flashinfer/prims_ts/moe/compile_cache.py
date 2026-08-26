@@ -23,6 +23,7 @@ import json
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
+from flashinfer.jit.cute_dsl_core import _get_compile_arch
 from flashinfer.prims_ts.utils import get_prims_ts_compile_options
 
 
@@ -49,7 +50,22 @@ def get_compile_options() -> str:
     return get_prims_ts_compile_options()
 
 
-_COMPILED_GEMM_CACHE: dict[tuple[str, str, str], Any] = {}
+_COMPILED_GEMM_CACHE: dict[tuple[str, str, str, int, str], Any] = {}
+
+
+def _compile_target_key(io: dict) -> tuple[int, str]:
+    """Return the CUDA device and CuTe-DSL architecture for this compilation."""
+    import torch
+
+    device_index = None
+    for value in io.get("_keepalive", ()):
+        if isinstance(value, torch.Tensor) and value.device.type == "cuda":
+            device_index = value.device.index
+            break
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+
+    return int(device_index), _get_compile_arch()
 
 
 def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> Any:
@@ -61,7 +77,14 @@ def get_compiled_gemm(cfg_hash: str, fc1_or_fc2: str, io: dict, stream: Any) -> 
     does not depend on their values and they must not be part of the cache key.
     """
 
-    key = (cfg_hash, fc1_or_fc2, get_compile_options())
+    device_index, compile_arch = _compile_target_key(io)
+    key = (
+        cfg_hash,
+        fc1_or_fc2,
+        get_compile_options(),
+        device_index,
+        compile_arch,
+    )
     if key in _COMPILED_GEMM_CACHE:
         return _COMPILED_GEMM_CACHE[key]
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import _compile_for_launch

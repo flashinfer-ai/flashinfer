@@ -22,8 +22,8 @@ import json
 from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache
+from importlib import resources
 import math
-from pathlib import Path
 from typing import Sequence
 
 from flashinfer.tllm_enums import ActivationType, WeightLayout
@@ -473,13 +473,13 @@ def _activation_json_eltwise_act(activation_type: int) -> str:
     return "none"
 
 
-def _prims_ts_config_path() -> Path:
-    path = Path(__file__).with_name("prims_ts_moe_configs.json")
-    if not path.is_file():
+def _prims_ts_config_resource():
+    config = resources.files(__package__).joinpath("prims_ts_moe_configs.json")
+    if not config.is_file():
         raise FileNotFoundError(
-            f"Local Prims-TS MoE config JSON is required but was not found: {path}"
+            f"Packaged Prims-TS MoE config JSON is required but was not found: {config}"
         )
-    return path
+    return config
 
 
 def _resolve_json_template(
@@ -518,9 +518,8 @@ def _validate_json_options(
 
 @lru_cache(maxsize=1)
 def _expanded_prims_ts_json_configs() -> tuple[_JsonBatchedGemmConfig, ...]:
-    path = _prims_ts_config_path()
-    with path.open() as handle:
-        data = json.load(handle)
+    config = _prims_ts_config_resource()
+    data = json.loads(config.read_text(encoding="utf-8"))
     templates = data["templates"]
     expanded: list[_JsonBatchedGemmConfig] = []
 

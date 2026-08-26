@@ -29,7 +29,7 @@ from flashinfer.autotuner import (
     TunableRunner,
     TuningConfig,
 )
-from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
+from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs, RoutingInputMode
 from flashinfer.fused_moe.shared.tuning import (
     make_moe_tuning_config,
     moe_topk_ids_init,
@@ -78,6 +78,15 @@ from .tensor_adapter import (
     build_mxfp4_mxfp8_launch_io,
     build_nvfp4_launch_io,
 )
+
+
+def _moe_topk_ids_init_for_routing(
+    num_experts: int, routing_input_mode: RoutingInputMode
+):
+    return moe_topk_ids_init(
+        num_experts,
+        packed=(routing_input_mode != RoutingInputMode.UnpackedPrecomputed),
+    )
 
 
 def _per_token_sf_dtype_value(tensor: torch.Tensor) -> int:
@@ -149,14 +158,16 @@ def _fp8_per_tensor_scale_dtype(
 
 def _select_expert_weights(
     moe_inputs: MoeRunnerInputs,
-    routed_expert_weights: torch.Tensor,
+    routed_expert_weights: torch.Tensor | None,
 ) -> torch.Tensor:
     if moe_inputs.expert_weights is not None and moe_inputs.expert_weights.numel() > 0:
         return moe_inputs.expert_weights
+    if routed_expert_weights is None:
+        raise RuntimeError("routing did not return expert weights")
     return routed_expert_weights
 
 
-def _torch_views_of_ffi_tensors(tensors: Any) -> list[torch.Tensor]:
+def _torch_views_of_ffi_tensors(tensors: Any) -> list[Any]:
     """Return zero-copy Torch views for tensors nested in a TVM-FFI container.
 
     TVM-FFI 0.1.11+ recursively converts container elements to framework tensors.
@@ -164,7 +175,15 @@ def _torch_views_of_ffi_tensors(tensors: Any) -> list[torch.Tensor]:
     capsule is one-shot and cannot safely be consumed by repeated runner calls.
     """
     return [
-        tensor if isinstance(tensor, torch.Tensor) else torch.from_dlpack(tensor)
+        (
+            None
+            if tensor is None
+            else (
+                tensor
+                if isinstance(tensor, torch.Tensor)
+                else torch.from_dlpack(tensor)
+            )
+        )
         for tensor in tensors
     ]
 
@@ -241,7 +260,7 @@ def _routed_token_capacity(
         raise ValueError(f"Prims-TS MoE tile_N must be positive, got {tile_n}")
     num_tokens = int(moe_inputs.hidden_states.shape[0])
     num_experts = int(
-        kwargs.get("num_experts", getattr(runner, "num_local_experts", 0))
+        kwargs.get("local_num_experts", getattr(runner, "num_local_experts", 0))
     )
     top_k = int(getattr(runner, "top_k", 0))
 
@@ -514,6 +533,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self,
         moe_inputs: MoeRunnerInputs,
         tune_max_num_tokens: int = 8192,
+        routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
         **kwargs,
     ) -> TuningConfig:
         return make_moe_tuning_config(
@@ -521,7 +541,9 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=moe_topk_ids_init(self.num_experts),
+            init_packed_topk_ids=_moe_topk_ids_init_for_routing(
+                self.num_experts, routing_input_mode
+            ),
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )
@@ -679,7 +701,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             total_num_padded_tokens=total_num_padded_tokens,
             routed_token_capacity=routed_token_capacity,
             activation_type=int(self.activation_type),
-            num_experts=kwargs["num_experts"],
+            num_experts=self.num_local_experts,
             num_tokens=num_tokens,
             top_k=self.top_k,
             intermediate_size=self.intermediate_size,
@@ -707,7 +729,7 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             total_num_padded_tokens=total_num_padded_tokens,
             routed_token_capacity=routed_token_capacity,
             activation_type=int(self.activation_type),
-            num_experts=kwargs["num_experts"],
+            num_experts=self.num_local_experts,
             num_tokens=num_tokens,
             top_k=self.top_k,
             intermediate_size=self.intermediate_size,
@@ -778,6 +800,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self,
         moe_inputs: MoeRunnerInputs,
         tune_max_num_tokens: int = 8192,
+        routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
         **kwargs,
     ) -> TuningConfig:
         return make_moe_tuning_config(
@@ -785,7 +808,9 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=moe_topk_ids_init(self.num_experts),
+            init_packed_topk_ids=_moe_topk_ids_init_for_routing(
+                self.num_experts, routing_input_mode
+            ),
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )
@@ -995,7 +1020,7 @@ class PrimsTsNvfp4MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             total_num_padded_tokens=total_num_padded_tokens,
             routed_token_capacity=routed_token_capacity,
             activation_type=int(self.activation_type),
-            num_experts=kwargs["num_experts"],
+            num_experts=self.num_local_experts,
             num_tokens=num_tokens,
             top_k=self.top_k,
             intermediate_size=self.intermediate_size,
@@ -1095,6 +1120,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self,
         moe_inputs: MoeRunnerInputs,
         tune_max_num_tokens: int = 8192,
+        routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
         **kwargs,
     ) -> TuningConfig:
         return make_moe_tuning_config(
@@ -1102,7 +1128,9 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=moe_topk_ids_init(self.num_experts),
+            init_packed_topk_ids=_moe_topk_ids_init_for_routing(
+                self.num_experts, routing_input_mode
+            ),
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )
@@ -1265,7 +1293,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
                     num_non_exiting_ctas=num_non_exiting_ctas,
                     total_num_padded_tokens=total_num_padded_tokens,
                     activation_type=int(self.activation_type),
-                    num_experts=kwargs["num_experts"],
+                    num_experts=self.num_local_experts,
                     num_tokens=num_tokens,
                     top_k=self.top_k,
                     intermediate_size=self.intermediate_size,
@@ -1427,7 +1455,7 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             total_num_padded_tokens=total_num_padded_tokens,
             routed_token_capacity=routed_token_capacity,
             activation_type=int(self.activation_type),
-            num_experts=kwargs["num_experts"],
+            num_experts=self.num_local_experts,
             num_tokens=num_tokens,
             top_k=self.top_k,
             intermediate_size=self.intermediate_size,
@@ -1504,6 +1532,7 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self,
         moe_inputs: MoeRunnerInputs,
         tune_max_num_tokens: int = 8192,
+        routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
         **kwargs,
     ) -> TuningConfig:
         return make_moe_tuning_config(
@@ -1511,7 +1540,9 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=moe_topk_ids_init(self.num_experts),
+            init_packed_topk_ids=_moe_topk_ids_init_for_routing(
+                self.num_experts, routing_input_mode
+            ),
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )
@@ -1675,7 +1706,7 @@ class PrimsTsMxfp4Bf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             total_num_padded_tokens=total_num_padded_tokens,
             routed_token_capacity=routed_token_capacity,
             activation_type=int(self.activation_type),
-            num_experts=kwargs["num_experts"],
+            num_experts=self.num_local_experts,
             num_tokens=num_tokens,
             top_k=self.top_k,
             intermediate_size=self.intermediate_size,
@@ -1751,6 +1782,7 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self,
         moe_inputs: MoeRunnerInputs,
         tune_max_num_tokens: int = 8192,
+        routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
         **kwargs,
     ) -> TuningConfig:
         return make_moe_tuning_config(
@@ -1758,7 +1790,9 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=moe_topk_ids_init(self.num_experts),
+            init_packed_topk_ids=_moe_topk_ids_init_for_routing(
+                self.num_experts, routing_input_mode
+            ),
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )
@@ -1984,7 +2018,7 @@ class PrimsTsFp8PerTensorMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             total_num_padded_tokens=total_num_padded_tokens,
             routed_token_capacity=routed_token_capacity,
             activation_type=int(self.activation_type),
-            num_experts=kwargs["num_experts"],
+            num_experts=self.num_local_experts,
             num_tokens=num_tokens,
             top_k=self.top_k,
             intermediate_size=self.intermediate_size,
@@ -2080,6 +2114,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self,
         moe_inputs: MoeRunnerInputs,
         tune_max_num_tokens: int = 8192,
+        routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
         **kwargs,
     ) -> TuningConfig:
         return make_moe_tuning_config(
@@ -2087,7 +2122,9 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             num_experts=self.num_experts,
             hidden_size=self.hidden_size,
             fp8_quantization_type=self.fp8_quantization_type,
-            init_packed_topk_ids=moe_topk_ids_init(self.num_experts),
+            init_packed_topk_ids=_moe_topk_ids_init_for_routing(
+                self.num_experts, routing_input_mode
+            ),
             tune_max_num_tokens=tune_max_num_tokens,
             **kwargs,
         )
@@ -2290,7 +2327,7 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             total_num_padded_tokens=total_num_padded_tokens,
             routed_token_capacity=routed_token_capacity,
             activation_type=int(self.activation_type),
-            num_experts=kwargs["num_experts"],
+            num_experts=self.num_local_experts,
             num_tokens=num_tokens,
             top_k=self.top_k,
             intermediate_size=self.intermediate_size,

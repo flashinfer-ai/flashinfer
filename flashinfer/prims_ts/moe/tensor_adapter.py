@@ -37,12 +37,21 @@ def _fc1_out_hidden(intermediate_size: int, activation_type: int) -> int:
     )
 
 
-def _check_fp8_scale_storage(name: str, tensor: torch.Tensor) -> None:
+def _check_fp8_scale_storage(
+    name: str, tensor: torch.Tensor, *, min_numel: int | None = None
+) -> None:
     valid_dtypes = [torch.float8_e4m3fn, torch.uint8]
     if hasattr(torch, "float8_e8m0fnu"):
         valid_dtypes.append(torch.float8_e8m0fnu)
     if tensor.dtype not in valid_dtypes:
         raise ValueError(f"{name} must be byte-sized FP8 scale storage")
+    if not tensor.is_contiguous():
+        raise ValueError(f"{name} must be contiguous")
+    if min_numel is not None and tensor.numel() < int(min_numel):
+        raise ValueError(
+            f"{name} scale storage is too small: "
+            f"need at least {min_numel} elements, got {tensor.numel()}"
+        )
 
 
 def _validate_weight_storage(
@@ -55,6 +64,24 @@ def _validate_weight_storage(
     in_hidden: int,
 ) -> None:
     if int(cfg.weight_layout) == int(WeightLayout.MajorK):
+        weight_bits = int(in_hidden) * int(cfg.weight_dtype_tma_bits)
+        element_bits = tensor.element_size() * 8
+        if weight_bits % element_bits != 0:
+            raise ValueError(
+                f"{name} logical K storage is not integral for dtype "
+                f"{tensor.dtype}: in_hidden={in_hidden}, "
+                f"weight_bits={cfg.weight_dtype_tma_bits}"
+            )
+        expected = (
+            int(num_experts),
+            int(out_hidden),
+            weight_bits // element_bits,
+        )
+        if tensor.ndim != 3 or tuple(int(dim) for dim in tensor.shape) != expected:
+            raise ValueError(
+                f"{name} has invalid MajorK shape {tuple(tensor.shape)}, "
+                f"expected {expected}"
+            )
         return
     if int(cfg.weight_layout) != int(WeightLayout.BlockMajorK):
         raise ValueError(f"Unsupported weight_layout={cfg.weight_layout}")
@@ -1049,10 +1076,29 @@ def build_mxfp4_mxfp8_launch_io(
         raise ValueError("MXFP4xMXFP8 hidden_states must be float8_e4m3fn")
     if gemm1_weights.dtype != torch.uint8 or gemm2_weights.dtype != torch.uint8:
         raise ValueError("MXFP4 weights must be packed uint8")
-    _check_fp8_scale_storage("hidden_states_scale", hidden_states_scale)
-    _check_fp8_scale_storage("gemm1_weights_scale", gemm1_weights_scale)
-    _check_fp8_scale_storage("gemm2_weights_scale", gemm2_weights_scale)
-    _check_fp8_scale_storage("gemm1_output_scale", gemm1_output_scale)
+    sf_k_fc1 = (int(hidden_size) + 31) // 32
+    sf_k_fc2 = (int(intermediate_size) + 31) // 32
+    fc1_out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
+    _check_fp8_scale_storage(
+        "hidden_states_scale",
+        hidden_states_scale,
+        min_numel=int(num_tokens) * sf_k_fc1,
+    )
+    _check_fp8_scale_storage(
+        "gemm1_weights_scale",
+        gemm1_weights_scale,
+        min_numel=int(num_experts) * fc1_out_hidden * sf_k_fc1,
+    )
+    _check_fp8_scale_storage(
+        "gemm2_weights_scale",
+        gemm2_weights_scale,
+        min_numel=int(num_experts) * int(hidden_size) * sf_k_fc2,
+    )
+    _check_fp8_scale_storage(
+        "gemm1_output_scale",
+        gemm1_output_scale,
+        min_numel=logical_token_capacity * sf_k_fc2,
+    )
 
     launch_early_exit_max_token_ctas = _launch_early_exit_max_token_ctas(
         cfg=cfg,
@@ -1405,14 +1451,37 @@ def build_fp8_block_scale_launch_io(
             if tensor.dtype != torch.float32:
                 raise ValueError(f"DeepSeek FP8 {name} must be float32")
     else:
-        for name, tensor in (
-            ("hidden_states_scale", hidden_states_scale),
-            ("gemm1_weights_scale", gemm1_weights_scale),
-            ("gemm2_weights_scale", gemm2_weights_scale),
-            ("gemm1_output_scale", gemm1_output_scale),
-            ("activation_output_scale", activation_output_scale),
+        sf_k_fc1 = (int(hidden_size) + 31) // 32
+        sf_k_fc2 = (int(intermediate_size) + 31) // 32
+        fc1_out_hidden = _fc1_out_hidden(intermediate_size, activation_type)
+        for name, tensor, min_numel in (
+            (
+                "hidden_states_scale",
+                hidden_states_scale,
+                int(num_tokens) * sf_k_fc1,
+            ),
+            (
+                "gemm1_weights_scale",
+                gemm1_weights_scale,
+                int(num_experts) * fc1_out_hidden * sf_k_fc1,
+            ),
+            (
+                "gemm2_weights_scale",
+                gemm2_weights_scale,
+                int(num_experts) * int(hidden_size) * sf_k_fc2,
+            ),
+            (
+                "gemm1_output_scale",
+                gemm1_output_scale,
+                logical_token_capacity * sf_k_fc2,
+            ),
+            (
+                "activation_output_scale",
+                activation_output_scale,
+                logical_token_capacity * sf_k_fc2,
+            ),
         ):
-            _check_fp8_scale_storage(name, tensor)
+            _check_fp8_scale_storage(name, tensor, min_numel=min_numel)
 
     launch_early_exit_max_token_ctas = _launch_early_exit_max_token_ctas(
         cfg=cfg,
@@ -1730,8 +1799,22 @@ def build_mxfp4_bf16_launch_io(
         raise ValueError("MXFP4xBF16 GEMM outputs must be bfloat16")
     if gemm1_weights.dtype != torch.uint8 or gemm2_weights.dtype != torch.uint8:
         raise ValueError("MXFP4 weights must be packed uint8")
-    _check_fp8_scale_storage("gemm1_weights_scale", gemm1_weights_scale)
-    _check_fp8_scale_storage("gemm2_weights_scale", gemm2_weights_scale)
+    sf_k_fc1 = (int(hidden_size) + 31) // 32
+    sf_k_fc2 = (int(intermediate_size) + 31) // 32
+    _check_fp8_scale_storage(
+        "gemm1_weights_scale",
+        gemm1_weights_scale,
+        min_numel=(
+            int(num_experts)
+            * _fc1_out_hidden(intermediate_size, activation_type)
+            * sf_k_fc1
+        ),
+    )
+    _check_fp8_scale_storage(
+        "gemm2_weights_scale",
+        gemm2_weights_scale,
+        min_numel=int(num_experts) * int(hidden_size) * sf_k_fc2,
+    )
 
     launch_early_exit_max_token_ctas = _launch_early_exit_max_token_ctas(
         cfg=cfg,

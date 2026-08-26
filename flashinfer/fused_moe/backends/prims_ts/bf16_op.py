@@ -24,6 +24,7 @@ from flashinfer.api_logging import flashinfer_api
 from flashinfer.autotuner import AutoTuner
 from flashinfer.fused_moe.shared.inputs import (
     MoeRunnerInputs,
+    RoutingInputMode,
     alloc_trtllm_moe_output,
     unpack_trtllm_moe_output,
 )
@@ -134,6 +135,15 @@ def prims_ts_bf16_moe_op(
             if expert_weights is not None
             else torch.empty(0, dtype=torch.bfloat16, device=hidden_states.device)
         )
+    routing_input_mode = (
+        RoutingInputMode.FromLogits
+        if routing_logits is not None
+        else (
+            RoutingInputMode.UnpackedPrecomputed
+            if expert_weights.numel() > 0
+            else RoutingInputMode.PackedPrecomputed
+        )
+    )
 
     moe_op = _get_moe_op()
     moe_runner = PrimsTsBf16MoERunner(
@@ -160,6 +170,7 @@ def prims_ts_bf16_moe_op(
     tuning_config = moe_runner._make_tuning_config(
         moe_inputs,
         tune_max_num_tokens=tune_max_num_tokens,
+        routing_input_mode=routing_input_mode,
         use_cuda_graph=True,
         use_cold_l2_cache=True,
     )

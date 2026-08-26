@@ -332,6 +332,7 @@ def prims_ts_fp4_block_scale_moe(
     tuning_config = moe_runner._make_tuning_config(
         moe_inputs,
         tune_max_num_tokens=tune_max_num_tokens,
+        routing_input_mode=RoutingInputMode(routing_input_mode),
         use_cuda_graph=True,
         use_cold_l2_cache=True,
     )

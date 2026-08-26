@@ -150,16 +150,17 @@ def prims_ts_fp8_per_tensor_scale_moe(
     routed_scaling_factor: Optional[float],
     use_routing_scales_on_input: bool,
     routing_method_type: int = 0,
-    weight_layout: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
-    fc1_per_channel_weight_scale: Optional[torch.Tensor] = None,
-    fc2_per_channel_weight_scale: Optional[torch.Tensor] = None,
     routing_replay_out: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    *,
+    weight_layout: int = 0,
+    fc1_per_channel_weight_scale: Optional[torch.Tensor] = None,
+    fc2_per_channel_weight_scale: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     r"""FP8 per-tensor-scaled MoE using the Prims-TS backend on SM100.
 
@@ -204,8 +205,6 @@ def prims_ts_fp8_per_tensor_scale_moe(
         Apply routing scales on the input path when ``True``.
     routing_method_type : int
         Routing method selector (default ``0``).
-    weight_layout : int
-        Weight layout enum value (default ``MajorK``).
     do_finalize : bool
         If ``True``, return the finalized MoE output.
     enable_pdl : Optional[bool]
@@ -216,14 +215,16 @@ def prims_ts_fp8_per_tensor_scale_moe(
         Activation enum value (default Swiglu).
     norm_topk_prob : bool
         Normalize top-k routing probabilities.
-    fc1_per_channel_weight_scale : Optional[torch.Tensor]
-        Optional per-channel FC1 weight scales.
-    fc2_per_channel_weight_scale : Optional[torch.Tensor]
-        Optional per-channel FC2 weight scales.
     routing_replay_out : Optional[torch.Tensor]
         Optional buffer that captures selected expert IDs.
     output : Optional[torch.Tensor]
         Optional in-place output tensor.
+    weight_layout : int
+        Prims-TS weight layout enum value (default ``MajorK``). Keyword-only.
+    fc1_per_channel_weight_scale : Optional[torch.Tensor]
+        Optional per-channel FC1 weight scales. Keyword-only.
+    fc2_per_channel_weight_scale : Optional[torch.Tensor]
+        Optional per-channel FC2 weight scales. Keyword-only.
 
     Returns
     -------
@@ -321,6 +322,7 @@ def prims_ts_fp8_per_tensor_scale_moe(
     tuning_config = moe_runner._make_tuning_config(
         moe_inputs,
         tune_max_num_tokens=tune_max_num_tokens,
+        routing_input_mode=RoutingInputMode.FromLogits,
         use_cuda_graph=True,
         use_cold_l2_cache=True,
     )
@@ -412,16 +414,17 @@ def _fake_prims_ts_fp8_per_tensor_scale_moe(
     routed_scaling_factor: Optional[float],
     use_routing_scales_on_input: bool,
     routing_method_type: int = 0,
-    weight_layout: int = 0,
     do_finalize: bool = True,
     enable_pdl: Optional[bool] = None,
     tune_max_num_tokens: int = 8192,
     activation_type: int = ActivationType.Swiglu.value,
     norm_topk_prob: bool = True,
-    fc1_per_channel_weight_scale: Optional[torch.Tensor] = None,
-    fc2_per_channel_weight_scale: Optional[torch.Tensor] = None,
     routing_replay_out: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    *,
+    weight_layout: int = 0,
+    fc1_per_channel_weight_scale: Optional[torch.Tensor] = None,
+    fc2_per_channel_weight_scale: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     del (
         routing_logits,
@@ -897,6 +900,7 @@ def _prims_ts_fp8_block_scale_moe_impl(
     tuning_config = moe_runner._make_tuning_config(
         moe_inputs,
         tune_max_num_tokens=tune_max_num_tokens,
+        routing_input_mode=RoutingInputMode(routing_input_mode),
         use_cuda_graph=True,
         use_cold_l2_cache=True,
     )

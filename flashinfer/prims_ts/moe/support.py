@@ -223,7 +223,7 @@ def _validate_gemm1_oa_params(
         return False, "gemm1_alpha/beta/clamp_limit require Swiglu activation"
     device = moe_inputs.hidden_states.device
     num_experts = int(
-        kwargs.get("num_experts", getattr(runner, "num_local_experts", 0))
+        kwargs.get("local_num_experts", getattr(runner, "num_local_experts", 0))
     )
     if num_experts <= 0:
         return False, "num_experts must be available for OA parameter validation"
