@@ -482,11 +482,21 @@ class FP4MQALogitsKernel:
         # - use_two_level_task_loop (two-level task loop): the late release
         #   triggers at nn_atom=2, where the flat loop wins; all other nn
         #   keep the two-level loop. Auto: on except Rubin nn_atom=2.
+        #
+        # atom=3 divergence from upstream: with THIS file's epilogue (packed
+        # f16x2/bf16x2 helpers rather than upstream's reworked epilogue), both
+        # levers regress at nn_atom=3 on B200 -- the fp32 w-cache cap of 56
+        # makes atom=3 the register-pressure maximum, and an ablation at
+        # b=64/ctx=16K graph-timed both-on at -5.0%, either alone at -3..-5%,
+        # both-off at baseline. On Rubin the same ablation is neutral either
+        # way, so gating atom=3 off everywhere costs nothing there.
         is_rubin = _target_is_rubin()
         if use_flat_logits_view is None:
-            use_flat_logits_view = not is_rubin
+            use_flat_logits_view = not is_rubin and _next_n_atom != 3
         if use_two_level_task_loop is None:
-            use_two_level_task_loop = not (is_rubin and _next_n_atom == 2)
+            use_two_level_task_loop = (
+                not (is_rubin and _next_n_atom == 2) and _next_n_atom != 3
+            )
         self.use_flat_logits_view = use_flat_logits_view
         self.use_two_level_task_loop = use_two_level_task_loop
         # epi_bytes covers fp16 and bf16 (FP8 only handled fp16).
