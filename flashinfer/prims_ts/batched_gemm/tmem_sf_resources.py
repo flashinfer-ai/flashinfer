@@ -730,9 +730,7 @@ class TmemCastAResource(MemoryResource):
         # conversion below.
         if cutlass.target_version(max_version="12.9"):
             packed_byte = (packed_word >> Int32(byte_lane * 8)) & Int32(0xFF)
-            scale_byte = (packed_scale_word >> Int32(scale_lane * 8)) & Int32(
-                0xFF
-            )
+            scale_byte = (packed_scale_word >> Int32(scale_lane * 8)) & Int32(0xFF)
             value = self._decode_cast_pair(packed_byte)
             scale_pair = scale_byte | (scale_byte << Int32(8))
             scale = self._cvt_ue8m0x2_to_bf16x2(scale_pair)
