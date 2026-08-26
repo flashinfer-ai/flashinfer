@@ -245,11 +245,11 @@ def test_generated_source_inventory_and_hashes() -> None:
     assert manifest["support_contract"]["external_fallbacks_allowed"] == 0
     assert manifest["support_contract"]["focus_contract"] == {
         "row_count": 150,
-        "canonical_stream_sha256": "d4f3fad233af91b8afac35271d6848df8f0f090b08f17807b9e2830139dd37ab",
+        "canonical_stream_sha256": "f64bc1f07c03379ed002ecf9d624809d6ecc46dfbda38df806475d40e3a4f539",
     }
     assert manifest["support_contract"]["full_regression_contract"] == {
         "row_count": 822,
-        "canonical_stream_sha256": "0dff83c89b9a17f67e0a2db9bb9c20ed77506fa3b38cc55d7772864021553592",
+        "canonical_stream_sha256": "aea1d3199a1add1035ca172688a82ae49e93260b79af564399b99db4a486843b",
     }
     assert manifest["support_contract"]["checkpoint"] == {
         "cu_starts_dtypes": ["int32", "int64"],
