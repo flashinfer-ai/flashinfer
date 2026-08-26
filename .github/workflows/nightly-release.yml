@@ -189,8 +189,8 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
           CUDA_VERSION: ${{ matrix.cuda.version }}
           DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda.version) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda.version) }}
-          # Keep 12.1a on CUDA 13.x aarch64 only: including it in cu129 made
-          # that wheel exceed GitHub's 2 GiB release-asset limit (#4519).
+          # Keep size-constrained architecture coverage centralized in
+          # ci/cuda-versions.json so release and nightly wheels stay aligned.
           FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.arch == 'aarch64' && matrix.cuda.aarch64_arch_list || matrix.cuda.x86_64_arch_list }}
           FLASHINFER_DEV_RELEASE_SUFFIX: ${{ needs.setup.outputs.dev_suffix }}
           FLASHINFER_LOCAL_VERSION: ${{ matrix.cuda.label }}
