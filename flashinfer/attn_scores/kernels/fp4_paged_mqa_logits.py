@@ -72,8 +72,9 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass import BFloat16, Float4E2M1FN, Float8E8M0FNU, Float16, Int32
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, vector
+from cutlass.cute.arch import get_max_tmem_alloc_cols
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import BaseDSL, dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
@@ -360,8 +361,31 @@ def utccp_required_smem_warp_transpose(smem_ptr) -> None:
         st_shared_b32(smem_ptr + offset, values[i])
 
 
+def _target_is_rubin() -> bool:
+    """Whether the JIT target is a Rubin arch (sm_107 / sm_109), which natively
+    supports a per-atom FP4 next_n of 4.
+
+    next_n=4 needs 544 raw TMEM columns. Blackwell (sm_100/sm_103) caps at 512,
+    so there next_n=4 must run as a 2-atom split; Rubin's 576 columns fit it
+    directly via exclusive (non-power-of-two) allocation.
+
+    There is no canonical "is Rubin" Arch API: ``Arch.BlackwellArchs()`` lumps
+    sm_107/sm_109 in with Blackwell, and ``Arch.is_family_of()`` compares only
+    the major version and is suffix-sensitive. Within major==10 the archs are
+    sm_100/sm_103 (Blackwell) and sm_107/sm_109 (Rubin), so ``minor >= 7`` is
+    the robust discriminator; sm_110 is major 11 and therefore excluded.
+    """
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return arch.major == 10 and arch.minor >= 7
+
+
+def max_next_n_for_target() -> int:
+    """Largest per-atom FP4 next_n the JIT target's TMEM can hold."""
+    return 4 if _target_is_rubin() else 3
+
+
 class FP4MQALogitsKernel:
-    """FP4 (MXFP4) paged MQA logits kernel for Blackwell (SM100).
+    """FP4 (MXFP4) paged MQA logits kernel for Blackwell (SM100) and Rubin.
 
     Each CTA processes a range of (q_idx, kv_split) pairs.
     A split = 2 consecutive KV blocks within a sequence (one per warp group).
@@ -381,6 +405,7 @@ class FP4MQALogitsKernel:
         num_heads: int = 64,
         head_dim: int = 128,
         next_n: int = 1,
+        num_next_n_atoms: int = 1,
         num_sms: int = 148,
         num_epi_subtiles: int = 1,
         epi_dtype=cutlass.Float32,
@@ -391,8 +416,19 @@ class FP4MQALogitsKernel:
         # Static FP4 invariants — see plan Sanity checklist.
         assert num_heads == 64, "FP4 kernel hardcodes num_heads=64 for TMEM/SMEM budget"
         assert head_dim == 128, "FP4 kernel hardcodes head_dim=128"
-        assert next_n in (1, 2, 3), (
-            f"FP4 supports next_n in {{1,2,3}}; got {next_n}. next_n=4 is out-of-scope (TMEM cap)."
+        # In-kernel atom split: the MMA/TMEM tile is sized by the *atom*
+        # (next_n // num_next_n_atoms), not by the logical next_n, so the atom
+        # is what the arch TMEM cap gates. next_n itself may exceed that cap via
+        # the split -- e.g. Blackwell runs next_n=4 as two atoms of 2.
+        assert next_n % num_next_n_atoms == 0, (
+            f"num_next_n_atoms={num_next_n_atoms} must divide next_n={next_n}"
+        )
+        _next_n_atom = next_n // num_next_n_atoms
+        _max_atom = max_next_n_for_target()
+        assert 1 <= _next_n_atom <= _max_atom, (
+            f"FP4 next_n_atom={_next_n_atom} (next_n={next_n} / "
+            f"num_next_n_atoms={num_next_n_atoms}) must be in 1..{_max_atom} "
+            f"(atom=4 requires Rubin sm_107+; Blackwell max is 3)."
         )
         assert epi_dtype in (
             cutlass.Float32,
@@ -416,8 +452,12 @@ class FP4MQALogitsKernel:
         )
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.next_n = next_n
-        self.N = next_n * num_heads
+        self.next_n = next_n  # logical next-token count; drives output row layout
+        self.num_next_n_atoms = num_next_n_atoms
+        self.next_n_atom = _next_n_atom
+        # MMA/TMEM N tile spans one atom; the logical next_n only appears in the
+        # output row stride (see _atom_out_row_base).
+        self.N = self.next_n_atom * num_heads
         self.num_sms = num_sms
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
@@ -474,6 +514,39 @@ class FP4MQALogitsKernel:
         self.cta_group = tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (1, 1)
         self.mma_tiler_mn = (block_kv, self.N)
+
+    # ── in-kernel atom split ───────────────────────────────────────────────
+    # A q_atom_idx enumerates batch*num_next_n_atoms tasks. These three map it
+    # back onto the NATIVE [batch]-indexed inputs, so block_table / context_lens
+    # are consumed unexpanded. All three are the identity when
+    # num_next_n_atoms == 1, so the unsplit path is unchanged.
+
+    def _atom_seq(self, qa):
+        """Native sequence (block_table / context_lens row) of a q_atom_idx."""
+        return qa // self.num_next_n_atoms
+
+    def _atom_ctx_len(self, qa, context_lens):
+        """Per-atom context length.
+
+        Atom i (= qa % num_atoms, 0 = oldest) sees ctx shortened by
+        (num_atoms-1-i)*next_n_atom so the split's staggered causal limits
+        reproduce the unsplit next_n.
+
+        May go <= 0 when a sequence is shorter than an atom's offset (e.g. a
+        brand-new short sequence under MTP). That needs no clamp *here* -- the
+        offset is < next_n <= 4, so ceil_div(ctx, block_kv) floors such an atom
+        to zero work in both the scheduler and the kernel, and they agree. It
+        does mean every consumer must treat "no work" as ``<= 0`` rather than
+        ``== 0``.
+        """
+        na = self.num_next_n_atoms
+        return context_lens[qa // na] - (na - 1 - qa % na) * self.next_n_atom
+
+    def _atom_out_row_base(self, qa):
+        """Output row base for a q_atom_idx: seq*next_n + atom*next_n_atom.
+        The +t within the atom is added by the caller."""
+        na = self.num_next_n_atoms
+        return (qa // na) * self.next_n + (qa % na) * self.next_n_atom
 
     def _setup_mma(self, a_dtype, b_dtype, a_major, b_major):
         self.a_dtype = a_dtype
@@ -613,18 +686,33 @@ class FP4MQALogitsKernel:
             + self.num_sfa_tmem_cols * self.num_groups
             + self.num_sfb_tmem_cols
         )
-        # TMEM allocator requires num_columns to be a power of two AND a
-        # multiple of 32, between 32 and 512. Round up to next valid value.
-        # Equivalent to utils.get_num_tmem_alloc_cols(..., rounding=True) but
-        # without needing a tmem tensor handle (we already have raw_total).
-        self.num_tmem_alloc_cols_total = max(1 << math.ceil(math.log2(raw_total)), 32)
-        assert self.num_tmem_alloc_cols_total <= 512, (
-            f"FP4 TMEM exceeds 512 cols: raw={raw_total}, "
+        # Arch-aware TMEM sizing. SM100 caps at 512 columns and requires a
+        # power-of-two, multiple-of-32 allocation. sm_107+ (Rubin, 576 columns)
+        # additionally allows allocations above 512 that are merely
+        # multiple-of-32, via *exclusive* TMEM allocation; the DSL sets the
+        # exclusive flag itself in alloc_tmem when arch + num_columns warrant it
+        # (cf. cute.arch.is_tmem_allocation_exclusive). This is what lets
+        # next_n=4 (544 raw columns) run directly on Rubin.
+        arch = BaseDSL._get_dsl().get_arch_enum()
+        self.arch_str = f"sm_{arch.major}{arch.minor}"  # family key, e.g. "sm_107"
+        max_tmem_cols = get_max_tmem_alloc_cols(self.arch_str)
+        if raw_total <= 512:
+            # SM100 rule, also valid everywhere: round up to pow2, min 32.
+            self.num_tmem_alloc_cols_total = max(
+                1 << math.ceil(math.log2(raw_total)), 32
+            )
+        else:
+            # >512: exclusive allocation, 32-column aligned, no pow2 rounding.
+            self.num_tmem_alloc_cols_total = ((raw_total + 31) // 32) * 32
+        assert self.num_tmem_alloc_cols_total <= max_tmem_cols, (
+            f"FP4 TMEM {self.num_tmem_alloc_cols_total} cols (raw={raw_total}) "
+            f"exceeds {self.arch_str} capacity {max_tmem_cols} for "
+            f"next_n={self.next_n} (atom={self.next_n_atom}): "
             f"acc={self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages}, "
             f"sfa_per_wg={self.num_sfa_tmem_cols} x{self.num_groups}, "
             f"sfb={self.num_sfb_tmem_cols}, "
-            f"total={self.num_tmem_alloc_cols_total}. next_n={self.next_n}, "
-            f"num_umma_stages={self.num_umma_stages} — see plan TMEM table."
+            f"num_umma_stages={self.num_umma_stages}. An atom of 4 needs 544 "
+            f"cols and therefore sm_107+; sm_100 supports an atom of <=3."
         )
 
         # Stash the chunk SMEM layouts; UMMA warp uses them as a reference
@@ -968,7 +1056,7 @@ class FP4MQALogitsKernel:
         # element), but it is never used because has_work will be False.
         start_q_clamped = min(start_q, batch_size - 1)
         current_num_kv = (
-            mContextLens[start_q_clamped] + self.block_kv - 1
+            self._atom_ctx_len(start_q_clamped, mContextLens) + self.block_kv - 1
         ) // self.block_kv
 
         if is_tma_warp:
@@ -983,7 +1071,9 @@ class FP4MQALogitsKernel:
 
         block_kv_val = self.block_kv
         num_heads = self.num_heads
-        next_n = self.next_n
+        # Positions processed per kernel task = one atom. The logical next_n
+        # appears only in the output row stride (_atom_out_row_base).
+        next_n = self.next_n_atom
         num_epi_subtiles = self.num_epi_subtiles
 
         # === Pipelines ===
@@ -1122,6 +1212,10 @@ class FP4MQALogitsKernel:
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=0,  # math warp 0 does alloc+free (last TMEM consumer)
             is_two_cta=False,
+            # Arch-aware: sm_107 exposes 576 cols and needs an exclusive
+            # allocation above 512 (next_n atom of 4 -> 544). Defaults to
+            # sm_100 (512) otherwise.
+            arch=self.arch_str,
         )
 
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
@@ -1391,13 +1485,21 @@ class FP4MQALogitsKernel:
                     # does not hang, which is why only an interspersed-zero
                     # case exposes it (a trailing zero is masked by the
                     # prefetch_next < end_q_idx guard below).
-                    peek_ctx = cutlass.Int32(1)  # nonzero => do not skip
+                    # Must use the per-atom context length, and must test <= 0,
+                    # not == 0. Under an atom split a row's per-atom ctx is
+                    # ctx[seq] - (num_atoms-1-i)*next_n_atom, which can be zero
+                    # OR NEGATIVE while the native ctx is still positive. The
+                    # task iterators below floor such an atom to zero work, so a
+                    # lookahead reading the native ctx (or testing only == 0)
+                    # would fail to skip a row the consumers do skip -- exactly
+                    # the desync this block exists to prevent.
+                    peek_ctx = cutlass.Int32(1)  # positive => do not skip
                     if prefetch_next < end_q_idx:
-                        peek_ctx = mContextLens[prefetch_next]
-                    while (peek_ctx == 0) & (prefetch_next < end_q_idx):
+                        peek_ctx = self._atom_ctx_len(prefetch_next, mContextLens)
+                    while (peek_ctx <= 0) & (prefetch_next < end_q_idx):
                         prefetch_next = prefetch_next + 1
                         if prefetch_next < end_q_idx:
-                            peek_ctx = mContextLens[prefetch_next]
+                            peek_ctx = self._atom_ctx_len(prefetch_next, mContextLens)
                         else:
                             peek_ctx = cutlass.Int32(1)
                     if prefetch_next < end_q_idx:
@@ -1459,7 +1561,9 @@ class FP4MQALogitsKernel:
                     if prefetch_kv < num_kv:
                         base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
+                            cached_blks[i] = mBlockTable[
+                                (self._atom_seq(q_idx), base_phys + i)
+                            ]
                     else:
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                             cached_blks[i] = cutlass.Int32(0)
@@ -1497,7 +1601,9 @@ class FP4MQALogitsKernel:
                     next_kv_idx = 0
                     if next_q_idx < batch_size:
                         next_num_kv = (
-                            mContextLens[next_q_idx] + block_kv_val - 1
+                            self._atom_ctx_len(next_q_idx, mContextLens)
+                            + block_kv_val
+                            - 1
                         ) // block_kv_val
                     # Zero-length rows get no scheduled work, but the exact-
                     # coordinate termination below would still step onto them and
@@ -1513,7 +1619,9 @@ class FP4MQALogitsKernel:
                         next_q_idx = next_q_idx + 1
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens)
+                                + block_kv_val
+                                - 1
                             ) // block_kv_val
                 # Update while-loop condition
                 has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -1545,7 +1653,9 @@ class FP4MQALogitsKernel:
                     if prefetch_kv < num_kv:
                         base_phys = prefetch_kv * NUM_BLOCKS_PER_MMA
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                            cached_blks[i] = mBlockTable[(q_idx, base_phys + i)]
+                            cached_blks[i] = mBlockTable[
+                                (self._atom_seq(q_idx), base_phys + i)
+                            ]
                     else:
                         for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
                             cached_blks[i] = cutlass.Int32(0)
@@ -1583,7 +1693,9 @@ class FP4MQALogitsKernel:
                     next_kv_idx = 0
                     if next_q_idx < batch_size:
                         next_num_kv = (
-                            mContextLens[next_q_idx] + block_kv_val - 1
+                            self._atom_ctx_len(next_q_idx, mContextLens)
+                            + block_kv_val
+                            - 1
                         ) // block_kv_val
                     # Zero-length rows get no scheduled work, but the exact-
                     # coordinate termination below would still step onto them and
@@ -1599,7 +1711,9 @@ class FP4MQALogitsKernel:
                         next_q_idx = next_q_idx + 1
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens)
+                                + block_kv_val
+                                - 1
                             ) // block_kv_val
                 # Update while-loop condition
                 has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -1787,7 +1901,9 @@ class FP4MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens)
+                                + block_kv_val
+                                - 1
                             ) // block_kv_val
                         # Zero-length rows get no scheduled work, but the exact-
                         # coordinate termination below would still step onto them and
@@ -1803,7 +1919,9 @@ class FP4MQALogitsKernel:
                             next_q_idx = next_q_idx + 1
                             if next_q_idx < batch_size:
                                 next_num_kv = (
-                                    mContextLens[next_q_idx] + block_kv_val - 1
+                                    self._atom_ctx_len(next_q_idx, mContextLens)
+                                    + block_kv_val
+                                    - 1
                                 ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -1948,7 +2066,9 @@ class FP4MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens)
+                                + block_kv_val
+                                - 1
                             ) // block_kv_val
                         # Zero-length rows get no scheduled work, but the exact-
                         # coordinate termination below would still step onto them and
@@ -1964,7 +2084,9 @@ class FP4MQALogitsKernel:
                             next_q_idx = next_q_idx + 1
                             if next_q_idx < batch_size:
                                 next_num_kv = (
-                                    mContextLens[next_q_idx] + block_kv_val - 1
+                                    self._atom_ctx_len(next_q_idx, mContextLens)
+                                    + block_kv_val
+                                    - 1
                                 ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -2013,7 +2135,10 @@ class FP4MQALogitsKernel:
                     # 2-byte weights (fp16 or bf16): next_n in {1,2,3} all fit
                     MAX_NUM_W_IN_REG = 64
                 else:  # fp32, 4-byte weights
-                    MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
+                    # An atom of 4 (Rubin only): 40 is the largest multiple-of-4
+                    # that is spill-free on the direct kernel (ncu: 40 -> 0 local
+                    # ld/st; 44 -> ~8.5K spill STL in the hot loop).
+                    MAX_NUM_W_IN_REG = 40 if next_n == 4 else 56 if next_n == 3 else 64
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
@@ -2287,13 +2412,13 @@ class FP4MQALogitsKernel:
                         if cutlass.const_expr(self.use_batched_store):
                             result_arr[t] = self.output_dtype(result_t)
                         else:
-                            out_row = q_idx * next_n + t
+                            out_row = self._atom_out_row_base(q_idx) + t
                             mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
 
                     if cutlass.const_expr(self.use_batched_store):
                         # Batched STG: all result_arr[t] → mLogits in one pass.
                         for t in cutlass.range_constexpr(next_n):
-                            out_row = q_idx * next_n + t
+                            out_row = self._atom_out_row_base(q_idx) + t
                             mLogits[(out_row, kv_pos)] = result_arr[t]
 
                     # Advance: inline fetch_next_task
@@ -2303,7 +2428,9 @@ class FP4MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens)
+                                + block_kv_val
+                                - 1
                             ) // block_kv_val
                         # Zero-length rows get no scheduled work, but the exact-
                         # coordinate termination below would still step onto them and
@@ -2319,7 +2446,9 @@ class FP4MQALogitsKernel:
                             next_q_idx = next_q_idx + 1
                             if next_q_idx < batch_size:
                                 next_num_kv = (
-                                    mContextLens[next_q_idx] + block_kv_val - 1
+                                    self._atom_ctx_len(next_q_idx, mContextLens)
+                                    + block_kv_val
+                                    - 1
                                 ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
@@ -2346,7 +2475,10 @@ class FP4MQALogitsKernel:
                 if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
                     MAX_NUM_W_IN_REG = 64
                 else:
-                    MAX_NUM_W_IN_REG = 56 if next_n == 3 else 64
+                    # An atom of 4 (Rubin only): 40 is the largest multiple-of-4
+                    # that is spill-free on the direct kernel (ncu: 40 -> 0 local
+                    # ld/st; 44 -> ~8.5K spill STL in the hot loop).
+                    MAX_NUM_W_IN_REG = 40 if next_n == 4 else 56 if next_n == 3 else 64
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
@@ -2610,13 +2742,13 @@ class FP4MQALogitsKernel:
                         if cutlass.const_expr(self.use_batched_store):
                             result_arr[t] = self.output_dtype(result_t)
                         else:
-                            out_row = q_idx * next_n + t
+                            out_row = self._atom_out_row_base(q_idx) + t
                             mLogits[(out_row, kv_pos)] = self.output_dtype(result_t)
 
                     if cutlass.const_expr(self.use_batched_store):
                         # Batched STG: all result_arr[t] → mLogits in one pass.
                         for t in cutlass.range_constexpr(next_n):
-                            out_row = q_idx * next_n + t
+                            out_row = self._atom_out_row_base(q_idx) + t
                             mLogits[(out_row, kv_pos)] = result_arr[t]
 
                     # Advance: inline fetch_next_task
@@ -2626,7 +2758,9 @@ class FP4MQALogitsKernel:
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
                             next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
+                                self._atom_ctx_len(next_q_idx, mContextLens)
+                                + block_kv_val
+                                - 1
                             ) // block_kv_val
                         # Zero-length rows get no scheduled work, but the exact-
                         # coordinate termination below would still step onto them and
@@ -2642,7 +2776,9 @@ class FP4MQALogitsKernel:
                             next_q_idx = next_q_idx + 1
                             if next_q_idx < batch_size:
                                 next_num_kv = (
-                                    mContextLens[next_q_idx] + block_kv_val - 1
+                                    self._atom_ctx_len(next_q_idx, mContextLens)
+                                    + block_kv_val
+                                    - 1
                                 ) // block_kv_val
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)

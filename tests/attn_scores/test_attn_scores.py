@@ -846,14 +846,122 @@ def test_fp4_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dt
     assert diff < 0.02, f"cosine diff {diff:.3e} too large"
 
 
-def test_fp4_next_n4_rejected():
-    """FP4 supports next_n up to 3; 4 is rejected rather than emulated.
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("avg_ctx", [256, 4096])
+@pytest.mark.parametrize("next_n_atom", [None, "direct", 2, 1])
+def test_fp4_paged_mqa_logits_next_n4(batch_size, avg_ctx, next_n_atom):
+    """Numerical check of next_n=4 against the torch reference.
 
-    An earlier version decomposed next_n=4 into two next_n=2 atoms, which cost
-    a per-call page-table duplication and context-length rebuild, and made a
-    caller-supplied schedule_meta silently wrong (the split changes the batch
-    the scheduler must describe).  The kernel asserts next_n in {1,2,3}; the
-    API now reports that directly.
+    next_n=4 raw TMEM footprint is 544 columns.  Rubin (SM107+, 576) runs it as
+    one atom; Blackwell (512) must decompose it.  Every decomposition of 4 that
+    the arch permits has to give the same logits as the reference, so this
+    sweeps them: ``None`` (direct where it fits, else the widest legal split),
+    ``"direct"`` (skipped where the arch cannot), and explicit 2- and 4-way
+    splits.  The staggered per-atom causal limits are the easy thing to get
+    wrong, so both a short context (one KV block) and a multi-block one are
+    covered.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import fp4_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import _fp4_max_atom_for_device
+
+    device = "cuda"
+    next_n = 4
+    max_atom = _fp4_max_atom_for_device(torch.device(device))
+    if next_n_atom == "direct" and max_atom < next_n:
+        pytest.skip(f"atom of {next_n} needs Rubin; this device caps at {max_atom}")
+
+    torch.manual_seed(42)
+    num_heads, head_dim, block_size = 64, 128, 64
+    output_dtype = torch.float32
+    max_model_len = max(avg_ctx * 2, 2048)
+
+    lo = max(block_size, int(0.7 * avg_ctx))
+    hi = int(1.3 * avg_ctx) + 1
+    context_lens = torch.randint(
+        lo, hi, (batch_size,), dtype=torch.int32, device=device
+    ).clamp(max=max_model_len)
+    block_table, num_total_blocks = _make_paged_kv(
+        batch_size, block_size, context_lens, device
+    )
+
+    q_f32 = torch.randn(
+        batch_size, next_n, num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    kv_cache = torch.randn(
+        num_total_blocks, block_size, 1, head_dim, device=device, dtype=torch.bfloat16
+    )
+    weights = torch.randn(
+        batch_size * next_n, num_heads, device=device, dtype=torch.float32
+    )
+
+    q_packed, sf_q_packed = _per_token_cast_to_fp4(q_f32.view(-1, head_dim), gran_k=32)
+    q_fp4 = q_packed.view(torch.uint8).view(
+        batch_size, next_n, num_heads, head_dim // 2
+    )
+    sf_q = sf_q_packed.view(torch.int32).view(batch_size, next_n, num_heads)
+    q_sim = (
+        _cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32)
+        .view(batch_size, next_n, num_heads, head_dim)
+        .to(torch.bfloat16)
+    )
+    kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
+
+    ref = _ref_fp4_paged_mqa_logits(
+        q_sim.float(), kv_sim.float(), weights, context_lens, block_table, max_model_len
+    )
+    out = fp4_paged_mqa_logits(
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        context_lens,
+        block_table,
+        max_model_len,
+        output_dtype=output_dtype,
+        next_n_atom=next_n_atom,
+    )
+
+    positions = (
+        torch.arange(max_model_len, device=device)
+        .unsqueeze(0)
+        .expand(batch_size * next_n, -1)
+    )
+    offsets = torch.arange(batch_size * next_n, device=device)
+    limits = (context_lens[offsets // next_n] - next_n + offsets % next_n).unsqueeze(1)
+    neginf_mask = ~(positions <= limits)
+
+    out_m = out.float().masked_fill(neginf_mask, 0)
+    ref_m = ref.float().masked_fill(neginf_mask, 0)
+    finite = torch.isfinite(out_m) & torch.isfinite(ref_m)
+    valid = (~neginf_mask) & finite
+    assert valid.any(), "test shape produced no comparable positions"
+    torch.testing.assert_close(
+        out_m.masked_fill(~finite, 0)[valid],
+        ref_m.masked_fill(~finite, 0)[valid],
+        atol=5e-5,
+        rtol=1e-5,
+    )
+
+
+def test_fp4_next_n_limits():
+    """FP4 accepts next_n up to 4; 5 is still rejected.
+
+    next_n=4 needs 544 TMEM columns, over SM100's 512-column cap, so Rubin
+    (SM107+, 576 columns) runs it directly while Blackwell reaches it as two
+    atoms of 2.  The decomposition is now done *inside* the kernel, which is
+    what makes it acceptable: an earlier caller-side version duplicated the
+    page table and rebuilt the context lengths per call, and this test
+    previously asserted next_n=4 was refused outright for that reason.
+
+    The one hazard that remains is a caller-supplied schedule_meta: a split
+    makes the scheduler describe batch*num_atoms rows while the schedule's
+    shape is unchanged, so a schedule built from the native context_lens would
+    pass every always-on check and still be wrong.  That combination is
+    rejected rather than silently accepted; see
+    test_fp4_next_n4_split_rejects_caller_schedule.
     """
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
@@ -865,7 +973,7 @@ def test_fp4_next_n4_rejected():
     context_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
     block_table, ntb = _make_paged_kv(B, block_size, context_lens, device)
 
-    for next_n, should_pass in ((3, True), (4, False), (5, False)):
+    for next_n, should_pass in ((3, True), (4, True), (5, False)):
         q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
         sf_q = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
         kv = torch.zeros(
@@ -876,8 +984,50 @@ def test_fp4_next_n4_rejected():
         if should_pass:
             fp4_paged_mqa_logits(*args, output_dtype=torch.bfloat16)
         else:
-            with pytest.raises(ValueError, match=r"next_n in 1\.\.3"):
+            with pytest.raises(ValueError, match=r"next_n in 1\.\.4"):
                 fp4_paged_mqa_logits(*args, output_dtype=torch.bfloat16)
+
+
+def test_fp4_next_n4_split_rejects_caller_schedule():
+    """A caller-supplied schedule_meta is refused when next_n=4 must split.
+
+    On a device whose TMEM caps the atom at 3 (Blackwell), next_n=4 runs as two
+    atoms, so the schedule must describe 2*batch rows.  A schedule built from
+    the native context_lens has the right shape and the wrong contents, and the
+    freshness check that would notice is opt-in and skipped under CUDA-graph
+    capture -- so this must be an error, not a silent miscompute.
+    """
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("FP4 paged MQA logits requires SM100a (B200)")
+
+    from flashinfer import compute_paged_mqa_logits_schedule, fp4_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import _fp4_max_atom_for_device
+
+    device = "cuda"
+    if _fp4_max_atom_for_device(torch.device(device)) >= 4:
+        pytest.skip("device runs next_n=4 directly; no split to reject")
+
+    B, H, D, block_size, ctx, next_n = 2, 64, 128, 64, 256, 4
+    context_lens = torch.full((B,), ctx, dtype=torch.int32, device=device)
+    block_table, ntb = _make_paged_kv(B, block_size, context_lens, device)
+    q = torch.zeros(B, next_n, H, D // 2, dtype=torch.uint8, device=device)
+    sf_q = torch.zeros(B, next_n, H, dtype=torch.int32, device=device)
+    kv = torch.zeros(ntb, block_size, 1, D // 2 + 4, dtype=torch.uint8, device=device)
+    w = torch.randn(B * next_n, H, device=device, dtype=torch.float32)
+
+    sched = compute_paged_mqa_logits_schedule(context_lens)
+    with pytest.raises(ValueError, match=r"silently wrong"):
+        fp4_paged_mqa_logits(
+            q,
+            sf_q,
+            kv,
+            w,
+            context_lens,
+            block_table,
+            ctx,
+            output_dtype=torch.bfloat16,
+            schedule_meta=sched,
+        )
 
 
 @pytest.mark.parametrize("block_size", [64, 128])
