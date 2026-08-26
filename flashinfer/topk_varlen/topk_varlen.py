@@ -35,7 +35,6 @@ Backend choices
 """
 
 import functools
-import importlib.util
 import math
 from typing import Literal, Optional, Tuple
 
@@ -45,13 +44,9 @@ from ..api_logging import flashinfer_api
 from ..trace.templates.topk import top_k_varlen_trace
 from ..topk import get_topk_module
 
-# Check for the Python CuTe DSL package without importing it (and without
-# importing cute_dsl/utils.py, which has top-level `import cutlass`).
-# This mirrors what is_cute_dsl_available() does internally.
-_CUTE_DSL_AVAILABLE = (
-    importlib.util.find_spec("cutlass") is not None
-    and importlib.util.find_spec("cutlass.cute") is not None
-)
+from ..cute_dsl.availability import is_cute_dsl_available
+
+_CUTE_DSL_AVAILABLE = is_cute_dsl_available()
 
 from ..utils import (
     _get_cache_buf,

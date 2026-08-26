@@ -18,7 +18,7 @@ CuTe DSL Attention Kernels (Cubin Distribution)
 Pre-compiled FMHA kernels loaded via ExternalBinaryModule.
 """
 
-from flashinfer.cute_dsl.utils import is_cute_dsl_available
+from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
 if is_cute_dsl_available():
     from .fmha import (

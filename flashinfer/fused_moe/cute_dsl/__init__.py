@@ -15,7 +15,7 @@
 CuteDSL-based Fused MoE Kernels for NVFP4 and MXFP8 x MXFP4.
 """
 
-from ...cute_dsl.utils import is_cute_dsl_available
+from ...cute_dsl.availability import is_cute_dsl_available
 
 # Conditionally import CuTe-DSL kernels
 if is_cute_dsl_available():
