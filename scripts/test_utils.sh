@@ -295,14 +295,18 @@ install_and_verify() {
         # version skew between libs-base and libs-cu13.  requirements.txt
         # cannot add the extra conditionally, hence the separate install.
         #
-        # Keep this a floor, not an exact pin: an exact ==4.7.0 downgrades a
-        # newer CuTe DSL that the test image may ship (the Rubin image ships
-        # 4.8.0a0), which removes cutlass.utils.rubin_helpers and the sm_107a
-        # Arch member and so disables every SM107 path for the whole run.
-        # The a0 suffix is required for pip to consider pre-releases at all.
+        # Exact 4.6.2: existing CI images bake 4.7.0, and a >= floor would
+        # still resolve to 4.7.x. This also downgrades Rubin images that
+        # ship 4.8.0a0 (SM107 cute-dsl stays gated off for the job).
+        pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
+            nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 \
+            nvidia-cutlass-dsl-libs-core -y 2>/dev/null || true
         if [[ "${CUDA_VERSION}" == *"cu13"* || "${CUDA_VERSION}" == 13.* ]]; then
-            pip install --upgrade "nvidia-cutlass-dsl[cu13]>=4.7.0a0"
+            pip install "nvidia-cutlass-dsl[cu13]==4.6.2"
+        else
+            pip install "nvidia-cutlass-dsl==4.6.2"
         fi
+        python -c "import importlib.metadata as m; print('nvidia-cutlass-dsl', m.version('nvidia-cutlass-dsl'))"
 
         # Install local python sources. The env var keeps --no-build-isolation
         # from activating the build hooks' own downloads (see setup_test_env.sh).
