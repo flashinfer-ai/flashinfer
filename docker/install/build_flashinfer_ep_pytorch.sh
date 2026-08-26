@@ -31,6 +31,11 @@ CUTLASS_DSL_SPEC="nvidia-cutlass-dsl==4.6.2"
 if [[ "${CUDA_MAJOR}" == "13" ]]; then
     CUTLASS_DSL_SPEC="nvidia-cutlass-dsl[cu13]==4.6.2"
 fi
+# Rubin jobs keep the image / public-stack DSL (see test_utils.sh).
+if [ "${PREPARE_RUBIN_TEST_IMAGE:-0}" = "1" ] || \
+   [ "${PREPARE_PUBLIC_RUBIN_STACK:-0}" = "1" ]; then
+    CUTLASS_DSL_SPEC=""
+fi
 
 FI_SRC="${FI_SRC:-/host/flashinfer}"
 NCCL_VERSION="${FI_NCCL_VERSION:-2.30.7}"
@@ -60,12 +65,19 @@ PIP_CONSTRAINT="" pip install --no-cache-dir \
 python -c "import nccl.ep; from nccl.core import Communicator; print('nccl.ep + nccl4py import OK')"
 
 echo "== install DeepGEMM + NVSHMEM / CUTLASS DSL deps =="
-PIP_CONSTRAINT="" python -m pip install --no-cache-dir \
-    "nvshmem4py-${CU}" \
-    pytest \
-    "nvidia-nvshmem-${CU}" \
-    filelock \
-    "${CUTLASS_DSL_SPEC}"
+_ep_pip_args=(
+    "nvshmem4py-${CU}"
+    pytest
+    "nvidia-nvshmem-${CU}"
+    filelock
+)
+if [ -n "${CUTLASS_DSL_SPEC}" ]; then
+    _ep_pip_args+=("${CUTLASS_DSL_SPEC}")
+else
+    echo "Keeping installed nvidia-cutlass-dsl for Rubin job"
+fi
+PIP_CONSTRAINT="" python -m pip install --no-cache-dir "${_ep_pip_args[@]}"
+unset _ep_pip_args
 (
     if [ ! -d "${DEEPGEMM_SRC}/.git" ]; then
         git clone --recursive https://github.com/deepseek-ai/DeepGEMM.git "${DEEPGEMM_SRC}"
