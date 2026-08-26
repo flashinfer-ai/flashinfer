@@ -65,6 +65,22 @@ class _TrainingRecorder:
         self.c32_backward_calls.append(args)
 
 
+def _training_call_counts(training_module):
+    return tuple(
+        len(calls)
+        for calls in (
+            training_module.forward_calls,
+            training_module.backward_calls,
+            training_module.row_forward_calls,
+            training_module.row_backward_calls,
+            training_module.grouped_row_forward_calls,
+            training_module.grouped_row_backward_calls,
+            training_module.c32_forward_calls,
+            training_module.c32_backward_calls,
+        )
+    )
+
+
 def test_training_api_signatures_and_no_forward_recompute():
     forward_parameters = tuple(
         inspect.signature(recurrent_kda_training_forward).parameters
@@ -689,7 +705,7 @@ def test_fallback_ffi_consumes_route_context_without_recompute(
         assert forward_args[13] is context._metadata["seq_order"]
         assert forward_args[32].data_ptr() == forward_args[16].data_ptr()
         assert forward_args[32].data_ptr() != context._final_output_scratch.data_ptr()
-        assert forward_args[43] == 0
+        assert forward_args[43] == int(context._metadata["use_split_work_items"])
         assert forward_args[44] == 1
     assert not training_module.forward_calls
     assert not training_module.backward_calls
@@ -760,8 +776,9 @@ def test_training_rejects_cuda_graph_capture_before_ffi(monkeypatch):
         inputs["initial_state"],
         inputs["cu_seqlens"],
     )
-    assert len(training_module.forward_calls) == 1
-    assert len(training_module.backward_calls) == 0
+    call_counts = _training_call_counts(training_module)
+    assert sum(call_counts[::2]) > 0
+    assert sum(call_counts[1::2]) == 0
 
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     with pytest.raises(RuntimeError, match="does not support CUDA graph capture"):
@@ -779,8 +796,7 @@ def test_training_rejects_cuda_graph_capture_before_ffi(monkeypatch):
     with pytest.raises(RuntimeError, match="does not support CUDA graph capture"):
         recurrent_kda_training_backward(context, inputs["do"], inputs["dfinal_state"])
 
-    assert len(training_module.forward_calls) == 1
-    assert len(training_module.backward_calls) == 0
+    assert _training_call_counts(training_module) == call_counts
 
 
 def test_saved_context_mutation_rejected_before_ffi(monkeypatch):
@@ -806,6 +822,9 @@ def test_saved_context_mutation_rejected_before_ffi(monkeypatch):
         inputs["initial_state"],
         inputs["cu_seqlens"],
     )
+    call_counts = _training_call_counts(training_module)
+    assert sum(call_counts[::2]) > 0
+    assert sum(call_counts[1::2]) == 0
     context.state_checkpoints.zero_()
 
     with pytest.raises(RuntimeError, match="context was modified after forward"):
@@ -826,5 +845,4 @@ def test_saved_context_mutation_rejected_before_ffi(monkeypatch):
             context_out=context,
         )
 
-    assert len(training_module.forward_calls) == 1
-    assert len(training_module.backward_calls) == 0
+    assert _training_call_counts(training_module) == call_counts
