@@ -61,10 +61,15 @@ pip3 install --upgrade "$CUDA_PYTHON"
 # Install cudnn package based on CUDA version
 if [[ "$CUDA_VERSION" == *"cu13"* ]]; then
   pip3 install --upgrade nvidia-cudnn-cu13
-  pip3 install --upgrade "nvidia-cutlass-dsl[cu13]==4.6.2"
+  CUTLASS_DSL_PKG="nvidia-cutlass-dsl[cu13]==4.6.2"
 else
   pip3 install --upgrade nvidia-cudnn-cu12
+  CUTLASS_DSL_PKG="nvidia-cutlass-dsl==4.6.2"
 fi
+pip3 uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
+  nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 \
+  nvidia-cutlass-dsl-libs-core -y 2>/dev/null || true
+pip3 install --upgrade "$CUTLASS_DSL_PKG"
 
 # Fail the build if torch or cuda-python drifted off this image's CUDA major.
 python3 -c "

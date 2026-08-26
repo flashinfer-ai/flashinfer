@@ -306,6 +306,7 @@ install_and_verify() {
         else
             pip install "nvidia-cutlass-dsl==4.6.2"
         fi
+        python -c "import importlib.metadata as m; print('nvidia-cutlass-dsl', m.version('nvidia-cutlass-dsl'))"
 
         # Install local python sources. The env var keeps --no-build-isolation
         # from activating the build hooks' own downloads (see setup_test_env.sh).

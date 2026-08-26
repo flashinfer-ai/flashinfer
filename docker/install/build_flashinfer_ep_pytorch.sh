@@ -27,9 +27,9 @@ set -euo pipefail
 CUDA_MAJOR="${CUDA_MAJOR:-$(python -c 'import torch; v = torch.version.cuda or ""; print(v.split(".")[0])' 2>/dev/null || true)}"
 : "${CUDA_MAJOR:?could not detect CUDA major from torch.version.cuda; set CUDA_MAJOR explicitly}"
 CU="cu${CUDA_MAJOR}"
-CUTLASS_DSL_SPEC="nvidia-cutlass-dsl>=4.6.0"
+CUTLASS_DSL_SPEC="nvidia-cutlass-dsl==4.6.2"
 if [[ "${CUDA_MAJOR}" == "13" ]]; then
-    CUTLASS_DSL_SPEC="nvidia-cutlass-dsl[cu13]>=4.6.0"
+    CUTLASS_DSL_SPEC="nvidia-cutlass-dsl[cu13]==4.6.2"
 fi
 
 FI_SRC="${FI_SRC:-/host/flashinfer}"

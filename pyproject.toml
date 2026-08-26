@@ -25,6 +25,8 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 license-files = ["LICENSE", "LICENSE*.txt"]
 
 [project.optional-dependencies]
+# Same floor as requirements.txt (looser than main's >=4.7.0a0) so [cu12]/[cu13]
+# can resolve next to quack-kernels 0.6.4, which hard-pins ==4.6.2.
 cu12 = ["nvidia-cutlass-dsl>=4.6.2a0"]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.6.2a0"]
 # DEPRECATED alias, kept so existing `pip install ".[nvep]"` commands keep
