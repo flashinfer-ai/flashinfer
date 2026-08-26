@@ -257,6 +257,75 @@ mm_bf16_trace = TraceTemplate(
 )
 
 
+def _mm_bf16_dual_weight_reference(
+    A, weight_high, weight_low, out=None, out_dtype=None, **_unused
+):
+    """Reference for BF16 activations and dual-BF16 residual weights."""
+    if A.is_cuda:
+        high = torch.mm(A, weight_high.T, out_dtype=torch.float32)
+        low = torch.mm(A, weight_low.T, out_dtype=torch.float32)
+    else:
+        high = torch.mm(A.float(), weight_high.float().T)
+        low = torch.mm(A.float(), weight_low.float().T)
+    resolved_dtype = out.dtype if out is not None else (out_dtype or torch.bfloat16)
+    return (high + low / 256.0).to(resolved_dtype)
+
+
+def _mm_bf16_dual_weight_init(
+    *,
+    M: int,
+    N: int = 4096,
+    K: int = 4096,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``flashinfer.mm_bf16_dual_weight``."""
+    torch.manual_seed(seed)
+    a = torch.randn(M, K, dtype=torch.bfloat16, device=device)
+    weight = torch.randn(N, K, dtype=torch.float32, device=device)
+    weight_high = weight.to(torch.bfloat16)
+    weight_low = ((weight - weight_high.float()) * 256.0).to(torch.bfloat16)
+    return {
+        "a": a,
+        "weight_high": weight_high,
+        "weight_low": weight_low,
+    }
+
+
+mm_bf16_dual_weight_trace = TraceTemplate(
+    op_type="gemm_bf16_dual_weight",
+    description=(
+        "GEMM C = A @ (weight_high + weight_low / 256).T. "
+        "Activation and both weight components are BF16."
+    ),
+    axes={
+        "M": Var(),
+        "N": Const(),
+        "K": Const(),
+    },
+    inputs={
+        "A": Tensor(["M", "K"], param="a"),
+        "weight_high": Tensor(["N", "K"]),
+        "weight_low": Tensor(["N", "K"]),
+        "out": Tensor(["M", "N"], optional=True),
+        "out_dtype": Scalar("dtype", optional=True),
+    },
+    outputs={
+        "C": Tensor(
+            ["M", "N"],
+            param="out",
+            dtype="bfloat16",
+            dtype_from="out",
+            dtype_from_scalar="out_dtype",
+        ),
+    },
+    tags=["status:verified", "architecture:sm100", "weight:dual-bf16"],
+    reference=_mm_bf16_dual_weight_reference,
+    check=_gemm_check,
+    init=_mm_bf16_dual_weight_init,
+)
+
+
 def _mm_fp8_init(
     *,
     M: int,

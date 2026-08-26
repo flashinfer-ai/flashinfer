@@ -142,6 +142,29 @@ def test_nvfp4_attention_sm120_trace_output_dtype_precedence():
     assert out_defn["outputs"]["out"]["dtype"] == "bfloat16"
 
 
+def test_mm_bf16_dual_weight_trace_output_dtype():
+    a = torch.empty(8, 256, dtype=torch.bfloat16)
+    weight_high = torch.empty(64, 256, dtype=torch.bfloat16)
+    weight_low = torch.empty(64, 256, dtype=torch.bfloat16)
+
+    kwargs = {
+        "a": a,
+        "weight_high": weight_high,
+        "weight_low": weight_low,
+    }
+    default_defn = flashinfer.mm_bf16_dual_weight.fi_trace(**kwargs)
+    assert default_defn["outputs"]["C"]["dtype"] == "bfloat16"
+
+    dtype_defn = flashinfer.mm_bf16_dual_weight.fi_trace(
+        **kwargs, out_dtype=torch.float32
+    )
+    assert dtype_defn["outputs"]["C"]["dtype"] == "float32"
+
+    out = torch.empty(8, 64, dtype=torch.float32)
+    out_defn = flashinfer.mm_bf16_dual_weight.fi_trace(**kwargs, out=out)
+    assert out_defn["outputs"]["C"]["dtype"] == "float32"
+
+
 def test_all_registered_trace_templates_have_check():
     from flashinfer.api_logging import _TRACE_REGISTRY
 

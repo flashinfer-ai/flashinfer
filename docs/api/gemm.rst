@@ -43,6 +43,34 @@ BF16 x FP4 GEMM (W4A16)
     prepare_bf16_fp4_weights
     mm_bf16_fp4
 
+BF16 x Dual-BF16 Weight GEMM (SM100)
+------------------------------------
+
+The dual-BF16 representation stores an FP32 weight as two contiguous BF16
+matrices and reconstructs it as ``weight_high + weight_low / 256`` inside the
+GEMM. Prepare weights once at model load time. The compute API supports BF16 or
+FP32 output and accepts an optional caller-owned workspace for CUDA Graph and
+multi-stream use.
+
+.. autosummary::
+    :toctree: ../generated
+
+    prepare_dual_bf16_weights
+    dual_bf16_weight_gemm_workspace_size
+    mm_bf16_dual_weight
+
+Benchmark the kernel against the strict FP32 PyTorch/cuBLAS baseline (weight
+preparation and the BF16-to-FP32 activation conversion are excluded from both
+timings):
+
+.. code-block:: bash
+
+    python benchmarks/flashinfer_benchmark.py \
+        --routine mm_bf16_dual_weight \
+        --backends dual-bf16 cublas \
+        --m 512 --n 192 --k 4096 \
+        --out_dtype float32 --refcheck
+
 MXFP8 GEMM
 ----------
 

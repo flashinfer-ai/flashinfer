@@ -129,6 +129,7 @@ from .jit.blackwell_bgmv_moe import (
 from .jit.monomoe import gen_monomoe_module
 from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
 from .jit.gemm import (
+    gen_dual_bf16_weight_gemm_sm100_module,
     gen_fp8_blockscale_gemm_sm90_module,
     gen_gemm_module,
     gen_gemm_sm90_module,
@@ -750,6 +751,7 @@ def gen_all_modules(
             # the fixed E=256/N=512/K=2048 shape (BS8).
             jit_specs.append(gen_monomoe_module())
         if has_sm100:
+            jit_specs.append(gen_dual_bf16_weight_gemm_sm100_module())
             jit_specs.append(gen_fp4_quantization_sm100_module())
             jit_specs.append(gen_cutlass_fused_moe_sm100_module())
             jit_specs.append(gen_gemm_sm100_module())
