@@ -71,7 +71,7 @@ def compare_export(
 
 def _run_two_gpu_public_api(repo_root: Path) -> tuple[bool, int]:
     visible_gpu_count = torch.cuda.device_count()
-    if visible_gpu_count != 2:
+    if visible_gpu_count < 2:
         return False, visible_gpu_count
     completed = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", _TWO_GPU_API_TEST],

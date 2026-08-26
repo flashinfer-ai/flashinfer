@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.attention import cake_dcp_public_validation
 from tests.attention.cake_dcp_public_validation import compare_export
 
 from flashinfer.cake_dcp import (
@@ -68,6 +69,40 @@ def test_public_promotion_hook_requires_exact_export_parity(tmp_path: Path) -> N
     assert drift["export_parity_passed"] is False
     assert drift["matched_artifact_count"] == 1
     assert [row["name"] for row in drift["mismatched_artifacts"]] == ["a.cu"]
+
+
+@pytest.mark.parametrize(
+    ("visible_gpu_count", "expected_passed", "expected_subprocess_calls"),
+    [(1, False, 0), (2, True, 1), (4, True, 1)],
+)
+def test_public_promotion_hook_accepts_hosts_with_at_least_two_gpus(
+    monkeypatch,
+    tmp_path: Path,
+    visible_gpu_count: int,
+    expected_passed: bool,
+    expected_subprocess_calls: int,
+) -> None:
+    subprocess_calls = []
+    monkeypatch.setattr(
+        cake_dcp_public_validation.torch.cuda,
+        "device_count",
+        lambda: visible_gpu_count,
+    )
+    monkeypatch.setattr(
+        cake_dcp_public_validation.subprocess,
+        "run",
+        lambda *args, **kwargs: (
+            subprocess_calls.append((args, kwargs)) or SimpleNamespace(returncode=0)
+        ),
+    )
+
+    passed, reported_gpu_count = cake_dcp_public_validation._run_two_gpu_public_api(
+        tmp_path
+    )
+
+    assert passed is expected_passed
+    assert reported_gpu_count == visible_gpu_count
+    assert len(subprocess_calls) == expected_subprocess_calls
 
 
 def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> None:
