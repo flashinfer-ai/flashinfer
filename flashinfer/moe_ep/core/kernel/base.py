@@ -56,12 +56,28 @@ class SplitKernelBackend(ABC):
         self._transformed_weights = weights
         return weights
 
+    def pack_dispatch_payload(self, x: "torch.Tensor") -> "torch.Tensor":
+        """Optionally transform the token payload before EP dispatch.
+
+        Default: identity (BF16 tokens on the wire). A backend that quantizes
+        activations may override this to send a packed quantized payload and
+        unpack it in :meth:`compute`. ``FleetParams`` keeps describing the
+        LOGICAL bf16 token; the packed row's byte width must not exceed
+        ``token_hidden_size * dtype_bytes`` (the transport's per-token byte
+        budget)."""
+        return x
+
     @abstractmethod
     def compute(self, ctx: SplitKernelContext) -> "torch.Tensor": ...
 
 
 class MegaKernelBackend(ABC):
     """Fused kernel backend that owns comm + local MoE on the mega EP path."""
+
+    # Backends opt in to returning a workspace-backed output view by setting
+    # this capability during backend registration.  Keep the default false so
+    # existing backends retain the materializing output path.
+    supports_output_view: bool = False
 
     def __init__(self, config: object) -> None:
         self._config = config

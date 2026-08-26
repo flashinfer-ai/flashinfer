@@ -84,6 +84,7 @@ from .utils import (
     register_custom_op,
     register_fake_op,
     round_up,
+    check_trtllm_gen_sm107_only_feature,
 )
 
 
@@ -247,6 +248,8 @@ def get_trtllm_gen_prefill_module():
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        use_fp16_softmax: Optional[bool] = None,
+        uses_spcompress: Optional[bool] = None,
         is_causal: bool = True,
         lse: Optional[torch.Tensor] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
@@ -304,6 +307,8 @@ def get_trtllm_gen_prefill_module():
             value_block_scales,
             skip_softmax_threshold_scale_factor,
             uses_shared_paged_kv_idx,
+            use_fp16_softmax,
+            uses_spcompress,
             is_causal,
             lse,
             lse_stride_tokens,
@@ -694,6 +699,8 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        use_fp16_softmax: Optional[bool] = None,
+        uses_spcompress: Optional[bool] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         if backend == "trtllm-gen":
@@ -732,6 +739,8 @@ def get_batch_prefill_module(backend, *args):
                 value_block_scales=value_block_scales,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
+                use_fp16_softmax=use_fp16_softmax,
+                uses_spcompress=uses_spcompress,
                 is_causal=mask_mode != MaskMode.NON_CAUSAL.value,
                 lse=maybe_lse,
                 multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
@@ -876,6 +885,8 @@ def get_batch_prefill_module(backend, *args):
         value_block_scales: Optional[torch.Tensor] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
         uses_shared_paged_kv_idx: bool = True,
+        use_fp16_softmax: Optional[bool] = None,
+        uses_spcompress: Optional[bool] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> None:
         pass
@@ -2655,6 +2666,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        use_fp16_softmax: Optional[bool] = None,
+        uses_spcompress: Optional[bool] = None,
     ) -> torch.Tensor: ...
 
     @overload
@@ -2675,6 +2688,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        use_fp16_softmax: Optional[bool] = None,
+        uses_spcompress: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]: ...
 
     @flashinfer_api(trace=gqa_paged_prefill_trace)
@@ -2696,6 +2711,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
         ] = None,
         skip_softmax_threshold_scale_factor: Optional[float] = None,
+        use_fp16_softmax: Optional[bool] = None,
+        uses_spcompress: Optional[bool] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         r"""Compute batch prefill/append attention between query and paged kv-cache.
 
@@ -2763,8 +2780,16 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
             For the trtllm-gen backend with ``NHD`` layout, scale tensors are transposed
             to HND internally (incurring a copy). Use ``HND`` for better performance.
-
             Currently, NVFP4 KV supports `fa2` and `trtllm-gen` backend.
+        use_fp16_softmax : Optional[bool]
+            trtllm-gen backend only. Select the ``…Fp16Softmax…`` cubin variant
+            (FP16 softmax accumulator). Currently only shipped for BF16 Q/KV/O context
+            kernels. Ignored by other backends.
+        uses_spcompress : Optional[bool]
+            trtllm-gen backend only. Select the ``…Spcomp…`` cubin variant
+            (sparse compression). Currently only shipped for FP8 Q context kernels.
+            Ignored by other backends.
+
         skip_softmax_threshold_scale_factor : Optional[float]
             Threshold scale factor for skipping softmax operations.  Providing a
             value enables skip-softmax sparsity as described in
@@ -2844,6 +2869,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 return_lse=return_lse,
                 lse=lse,
             )
+
+        check_trtllm_gen_sm107_only_feature(
+            use_fp16_softmax, "use_fp16_softmax", q.device
+        )
+        check_trtllm_gen_sm107_only_feature(
+            uses_spcompress, "uses_spcompress", q.device
+        )
 
         if (
             k_cache.dtype == torch.uint8 or v_cache.dtype == torch.uint8
@@ -3091,6 +3123,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     value_block_scales,
                     skip_softmax_threshold_scale_factor,
                     True,  # uses_shared_paged_kv_idx
+                    use_fp16_softmax,
+                    uses_spcompress,
                     self._trtllm_gen_multi_ctas_kv_counter_buffer,
                 ]
 
@@ -4092,9 +4126,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if kv_cache_sf is not None and v.dtype == torch.uint8
             else v.shape[-1]
         )
-        if out is None:
-            # when input dtype is fp8, we need to use bf16 output
+        # Effective output dtype for allocation and validation; an 8-bit cached
+        # dtype is just plan()'s q_data_type default, so fall back to bf16.
+        out_dtype = getattr(self, "_cached_o_data_type", None)
+        if out_dtype is None or out_dtype.itemsize == 1:
             out_dtype = torch.bfloat16 if q.dtype.itemsize == 1 else q.dtype
+        if out is None:
             out = torch.empty(
                 q.shape[:-1] + (out_head_dim,),
                 dtype=out_dtype,
@@ -4104,7 +4141,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             check_shape_dtype_device(
                 out,
                 q.shape[:-1] + (out_head_dim,),
-                self._cached_o_data_type,
+                out_dtype,
                 q.device,
                 "out",
             )
@@ -4586,13 +4623,27 @@ def trtllm_sage_attention_quantize(
     q_block_size: int = 1,
     k_block_size: int = 16,
     qk_quant_dtype: torch.dtype = torch.int8,
-) -> Tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
+    cum_seq_lens_q: Optional[torch.Tensor] = None,
+    cum_seq_lens_kv: Optional[torch.Tensor] = None,
+    smooth_k: bool = False,
+) -> Union[
+    Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
+    Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
 ]:
     """Quantize Q/K/V into the layout consumed by TRTLLM SageAttention.
 
@@ -4611,15 +4662,23 @@ def trtllm_sage_attention_quantize(
     qk_quant_dtype : torch.dtype
         ``torch.int8`` (the SageAttention INT8 path) or
         ``torch.float8_e4m3fn``.
+    cum_seq_lens_q, cum_seq_lens_kv : Optional[torch.Tensor]
+        Contiguous INT32 CUDA tensors of shape ``[batch_size + 1]`` containing
+        cumulative Q and KV sequence lengths. Assumes single-batch input if
+        `cum_seq_lens_q` is missing.
+    smooth_k : bool
+        Whether to perform K-smoothing before quantization for better accuracy.
+        NOTE: K-smoothing shifts LSE by ``-sm_scale * (query * k_mean).sum(-1)``
+        FlashInfer does not consume `k_mean`, thus it's up to users to shift
+        back the LSE if performing ring attention with this option enabled.
 
     Returns
     -------
-    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale)
-        Quantized Q/K/V followed by their FP32 dequantization scales. Q and K
-        scales have shapes ``[q_heads, ceil(q_tokens / q_block_size)]`` and
-        ``[kv_heads, ceil(kv_tokens / k_block_size)]``. V scales have shape
-        ``[kv_heads, head_dim]``. These outputs can be passed directly to
-        :func:`trtllm_ragged_attention_deepseek`.
+    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale) or
+    (q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, k_mean)
+        Quantized Q/K/V followed by their FP32 dequantization scales.
+        When ``smooth_k=True``, the FP32 K mean is appended. The first six
+        outputs can be passed directly to `trtllm_ragged_attention_deepseek`.
     """
     if query.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError(f"query must be float16 or bfloat16, got {query.dtype}")
@@ -4641,6 +4700,17 @@ def trtllm_sage_attention_quantize(
         raise ValueError("q_block_size and k_block_size must be 1, 4, or 16")
     if qk_quant_dtype not in (torch.int8, torch.float8_e4m3fn):
         raise ValueError("qk_quant_dtype must be torch.int8 or torch.float8_e4m3fn")
+    if cum_seq_lens_q is None:
+        cum_seq_lens_q = torch.tensor(
+            [0, query.shape[0]], dtype=torch.int32, device=query.device
+        )
+        cum_seq_lens_kv = torch.tensor(
+            [0, key.shape[0]], dtype=torch.int32, device=query.device
+        )
+    elif cum_seq_lens_kv is None:
+        cum_seq_lens_kv = cum_seq_lens_q
+
+    batch_size = cum_seq_lens_q.numel() - 1
 
     query = query.contiguous()
     key = key.contiguous()
@@ -4649,12 +4719,12 @@ def trtllm_sage_attention_quantize(
     k_quant = torch.empty_like(key, dtype=qk_quant_dtype)
     v_quant = torch.empty_like(value, dtype=torch.float8_e4m3fn)
     q_scale = torch.empty(
-        (query.shape[1], ceil_div(query.shape[0], q_block_size)),
+        (query.shape[1], ceil_div(query.shape[0], q_block_size) + batch_size - 1),
         dtype=torch.float32,
         device=query.device,
     )
     k_scale = torch.empty(
-        (key.shape[1], ceil_div(key.shape[0], k_block_size)),
+        (key.shape[1], ceil_div(key.shape[0], k_block_size) + batch_size - 1),
         dtype=torch.float32,
         device=query.device,
     )
@@ -4662,6 +4732,15 @@ def trtllm_sage_attention_quantize(
         (value.shape[1], value.shape[2]),
         dtype=torch.float32,
         device=query.device,
+    )
+    k_mean = (
+        torch.empty(
+            (key.shape[1], key.shape[2]),
+            dtype=torch.float32,
+            device=query.device,
+        )
+        if smooth_k
+        else None
     )
 
     get_trtllm_gen_fmha_module().trtllm_sage_attention_quantize(
@@ -4674,10 +4753,16 @@ def trtllm_sage_attention_quantize(
         query,
         key,
         value,
+        cum_seq_lens_q,
+        cum_seq_lens_kv,
         q_block_size,
         k_block_size,
         get_device_sm_count(query.device),
+        k_mean,
+        smooth_k,
     )
+    if smooth_k:
+        return q_quant, k_quant, v_quant, q_scale, k_scale, v_scale, k_mean
     return q_quant, k_quant, v_quant, q_scale, k_scale, v_scale
 
 
@@ -4714,6 +4799,8 @@ def trtllm_ragged_attention_deepseek(
     backend: str = "trtllm-gen",
     q_seq_lens_cpu: Optional[torch.Tensor] = None,
     kv_seq_lens_cpu: Optional[torch.Tensor] = None,
+    use_fp16_softmax: Optional[bool] = None,
+    uses_spcompress: Optional[bool] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """
     Parameters
@@ -4768,6 +4855,14 @@ def trtllm_ragged_attention_deepseek(
         output tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1], value.shape[2]]
     lse : Optional[torch.Tensor]
         lse tensor, if not provided, will be allocated with shape [query.shape[0], query.shape[1]]
+    use_fp16_softmax : Optional[bool]
+        Select the trtllm-gen ``Fp16Softmax`` cubin variant (BF16 Q/KV/O only).
+        When ``None`` (default) or ``False`` the standard FP32-accumulator softmax cubin is used.
+        Setting ``True`` for non-BF16 inputs will fail kernel selection.
+    uses_spcompress : Optional[bool]
+        Select the trtllm-gen ``Spcomp`` cubin variant (FP8 Q, with FP8 or BF16 output).
+        When ``None`` (default) or ``False`` the standard cubin is used.
+        Setting ``True`` for non-FP8 Q will fail kernel selection.
     sage_attn_sfs : Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]
         SageAttention scale-factor tensors for the four sub-blocks ``(q_sf, k_sf, p_sf, v_sf)``.
         The outputs from :func:`trtllm_sage_attention_quantize` can be supplied as Q, K, and V scales (with ``p_sf=None``).
@@ -4798,6 +4893,12 @@ def trtllm_ragged_attention_deepseek(
         If return_lse is True, the output will be a tuple of two tensors, the first is the output tensor, the second is the lse tensor.
         If return_lse is False, the output will be a single tensor.
     """
+    check_trtllm_gen_sm107_only_feature(
+        use_fp16_softmax, "use_fp16_softmax", query.device
+    )
+    check_trtllm_gen_sm107_only_feature(
+        uses_spcompress, "uses_spcompress", query.device
+    )
     is_dsr1 = query.shape[2] == 192 and key.shape[2] == 192 and value.shape[2] == 128
     is_smaller_dimensions = (
         query.shape[2] == 128 and key.shape[2] == 128 and value.shape[2] == 128
@@ -5206,6 +5307,8 @@ def trtllm_ragged_attention_deepseek(
                 attention_sinks,
                 skip_softmax_threshold_scale_factor,
                 run_lse,
+                use_fp16_softmax,
+                uses_spcompress,
                 sage_attn_sfs_q,
                 sage_attn_sfs_k,
                 sage_attn_sfs_p,
@@ -5261,6 +5364,8 @@ def trtllm_batch_context_with_kv_cache(
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+    use_fp16_softmax: Optional[bool] = None,
+    uses_spcompress: Optional[bool] = None,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -5363,6 +5468,12 @@ def trtllm_batch_context_with_kv_cache(
         Whether the K and V page indices are shared as a unified index.
         True (default) uses vLLM/FlashInfer layout with a 2D page table.
         False uses TRT-LLM layout with a 3D page table ``[batch_size, 2, max_num_pages_per_seq]``.
+    use_fp16_softmax : Optional[bool] = None
+        Select the ``…Fp16Softmax…`` cubin variant (FP16 softmax accumulator).
+        Currently only shipped for BF16 Q/KV/O kernels.
+    uses_spcompress : Optional[bool] = None
+        Select the ``…Spcomp…`` cubin variant (sparse compression).
+        Currently only shipped for FP8 Q kernels.
     causal : bool = True
         Whether to apply a causal mask. Set to ``False`` to request dense / bidirectional
         attention. For the TRTLLM-gen paged context path, non-causal currently requires
@@ -5389,6 +5500,12 @@ def trtllm_batch_context_with_kv_cache(
         ``[num_tokens, num_qo_heads]`` with dtype ``torch.float32``.
     """
 
+    check_trtllm_gen_sm107_only_feature(
+        use_fp16_softmax, "use_fp16_softmax", query.device
+    )
+    check_trtllm_gen_sm107_only_feature(
+        uses_spcompress, "uses_spcompress", query.device
+    )
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
     if not causal and window_left >= 0:
@@ -5569,6 +5686,8 @@ def trtllm_batch_context_with_kv_cache(
         value_block_scales,
         skip_softmax_threshold_scale_factor,
         uses_shared_paged_kv_idx,
+        use_fp16_softmax,
+        uses_spcompress,
         causal,
         lse,
         lse_stride_tokens,

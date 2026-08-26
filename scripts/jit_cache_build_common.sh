@@ -129,8 +129,20 @@ setup_sccache() {
   export SCCACHE_BASEDIRS="${source_root}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
   export SCCACHE_S3_KEY_PREFIX="${key_prefix}"
   export SCCACHE_IDLE_TIMEOUT=0
-  export FLASHINFER_NVCC_LAUNCHER="sccache"
   export FLASHINFER_CXX_LAUNCHER="sccache"
+
+  # sccache v0.17 cannot parse CUDA 13.3+ nvcc dry-run output, which can leave
+  # fatbinary without its input cubins. Keep host C++ caching enabled, but run
+  # cu134 nvcc directly until a release includes the upstream fix:
+  # https://github.com/mozilla/sccache/pull/2722
+  case "${CUDA_VERSION:-}" in
+    13.4|134)
+      unset FLASHINFER_NVCC_LAUNCHER
+      ;;
+    *)
+      export FLASHINFER_NVCC_LAUNCHER="sccache"
+      ;;
+  esac
 
   # Avoid leaking AWS credentials under set -x.
   local _sccache_xtrace=0
@@ -155,6 +167,8 @@ setup_sccache() {
   echo "sccache region: ${SCCACHE_REGION}"
   echo "sccache prefix: ${SCCACHE_S3_KEY_PREFIX}"
   echo "sccache basedirs: ${SCCACHE_BASEDIRS}"
+  echo "sccache cxx launcher: ${FLASHINFER_CXX_LAUNCHER}"
+  echo "sccache nvcc launcher: ${FLASHINFER_NVCC_LAUNCHER:-disabled}"
 
   if [ -n "${SCCACHE_STATS_DIR:-}" ]; then
     mkdir -p "${SCCACHE_STATS_DIR}"

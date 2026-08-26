@@ -24,9 +24,11 @@ def gen_dsv3_router_gemm_module() -> JitSpec:
     )
 
 
-def gen_dsv3_fused_routing_module() -> JitSpec:
+def gen_dsv3_fused_routing_module(backend: str = "default") -> JitSpec:
+    if backend not in ("default", "cake"):
+        raise ValueError(f"Unsupported fused routing backend: {backend}")
     return gen_jit_spec(
-        "dsv3_fused_routing",
+        "dsv3_fused_routing" if backend == "default" else "dsv3_fused_routing_cake",
         [
             jit_env.FLASHINFER_CSRC_DIR / "fused_moe/noAuxTcKernels.cu",
             jit_env.FLASHINFER_CSRC_DIR / "nv_internal/cpp/common/envUtils.cpp",
@@ -55,4 +57,7 @@ def gen_dsv3_fused_routing_module() -> JitSpec:
             / "kernels"
             / "cutlass_kernels",
         ],
+        extra_cuda_cflags=["-DFLASHINFER_CAKE_BACKEND", "--use_fast_math"]
+        if backend == "cake"
+        else None,
     )

@@ -2906,6 +2906,7 @@ class TrtllmGenDecodeModule:
             False,  # enable_block_sparse_attention
             None,  # sparse_mla_top_k_lens
             bf16q_fp8kv_transform_mode,
+            None,  # use_fp16_softmax
         )
         return out
 
@@ -3746,6 +3747,7 @@ def trtllm_batch_decode_with_kv_cache(
             enable_block_sparse_attention,
             None,  # sparse_mla_top_k_lens
             bf16q_fp8kv_transform_mode_value,
+            None,  # use_fp16_softmax
         )
 
         result_out = (

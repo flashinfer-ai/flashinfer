@@ -31,7 +31,14 @@ from .api import (
     B12xNvfp4Config,
     B12xW4A16Config,
     CutlassBf16Config,
+    CutlassFp8BlockConfig,
+    CutlassFp8PerTensorConfig,
+    CutlassHummingConfig,
+    CutlassMxfp8Config,
+    CutlassMxfp8Mxfp4Config,
+    CutlassNvfp4Config,
     CutlassW4A16Config,
+    CutlassW4A8Config,
     CuteDslConfig,
     MoEActivationPack,
     MoEConfig,
@@ -46,7 +53,14 @@ from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
     CutlassBf16Runner,
+    CutlassFp8BlockRunner,
+    CutlassFp8PerTensorRunner,
+    CutlassHummingRunner,
+    CutlassMxfp8Mxfp4Runner,
+    CutlassMxfp8Runner,
+    CutlassNvfp4Runner,
     CutlassW4A16Runner,
+    CutlassW4A8Runner,
     CuteDslNvfp4Runner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
@@ -62,7 +76,14 @@ from .utils import map_to_hybrid_bucket
 # typing the list with this Union gives mypy the visibility it needs.
 _RunnerT = Union[
     CutlassBf16Runner,
+    CutlassFp8BlockRunner,
+    CutlassFp8PerTensorRunner,
+    CutlassHummingRunner,
+    CutlassMxfp8Mxfp4Runner,
+    CutlassMxfp8Runner,
+    CutlassNvfp4Runner,
     CutlassW4A16Runner,
+    CutlassW4A8Runner,
     CuteDslNvfp4Runner,
     TrtllmFp4RoutedRunner,
     TrtllmBf16RoutedRunner,
@@ -76,7 +97,14 @@ _RunnerT = Union[
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CutlassBf16Config: CutlassBf16Runner,
+    CutlassFp8BlockConfig: CutlassFp8BlockRunner,
+    CutlassFp8PerTensorConfig: CutlassFp8PerTensorRunner,
+    CutlassHummingConfig: CutlassHummingRunner,
+    CutlassMxfp8Config: CutlassMxfp8Runner,
+    CutlassMxfp8Mxfp4Config: CutlassMxfp8Mxfp4Runner,
+    CutlassNvfp4Config: CutlassNvfp4Runner,
     CutlassW4A16Config: CutlassW4A16Runner,
+    CutlassW4A8Config: CutlassW4A8Runner,
     CuteDslConfig: CuteDslNvfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
     TrtllmBf16Config: TrtllmBf16RoutedRunner,
@@ -147,6 +175,25 @@ class MoELayer:
                     f"experts are implemented only by [{supporting}], which must "
                     f"also be configured and supported on this arch."
                 )
+            local_num_experts = (
+                config.experts.local_num_experts or config.routing.num_experts
+            )
+            if config.experts.local_expert_offset != 0 or (
+                local_num_experts != config.routing.num_experts
+            ):
+                supporting = ", ".join(
+                    r.__name__
+                    for r in _BACKEND_RUNNERS.values()
+                    if r.supports_expert_parallelism
+                )
+                hint += (
+                    f" Note the config is an expert-parallel shard "
+                    f"(local_expert_offset={config.experts.local_expert_offset}, "
+                    f"local_num_experts={local_num_experts} of "
+                    f"{config.routing.num_experts}): expert parallelism is "
+                    f"implemented only by [{supporting}], which must also be "
+                    f"configured and supported on this arch."
+                )
             raise RuntimeError(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
@@ -168,7 +215,7 @@ class MoELayer:
         self,
         act_pack: MoEActivationPack,
         weight_pack: MoEWeightPack,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         ceiling = self.config.execution.tune_max_num_tokens
         if act_pack.num_tokens > ceiling:
             raise ValueError(

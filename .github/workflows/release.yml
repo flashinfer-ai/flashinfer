@@ -11,6 +11,11 @@ on:
     paths:
       - '.python-version'
       - '.github/workflows/release.yml'
+      - 'build_utils.py'
+      - 'ci/cuda-versions.json'
+      - 'ci/validate_cuda_versions.py'
+      - 'scripts/build_flashinfer_jit_cache_whl.sh'
+      - 'scripts/jit_cache_build_common.sh'
 
 jobs:
   setup:
@@ -19,27 +24,32 @@ jobs:
       version: ${{ steps.set-version.outputs.version }}
       release_tag: ${{ steps.set-version.outputs.release_tag }}
       is_pr: ${{ steps.set-version.outputs.is_pr }}
+      jit_cache_cuda_matrix: ${{ steps.cuda-versions.outputs.jit_cache }}
       python_version: ${{ steps.set-version.outputs.python_version }}
     steps:
       - name: Determine if running in PR mode
         id: check-mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            echo "is_pr=true" >> $GITHUB_OUTPUT
+          if [ "${EVENT_NAME}" == "pull_request" ]; then
+            echo "is_pr=true" >> "$GITHUB_OUTPUT"
             echo "Running in PR mode (dry-run)"
           else
-            echo "is_pr=false" >> $GITHUB_OUTPUT
+            echo "is_pr=false" >> "$GITHUB_OUTPUT"
             echo "Running in release mode"
           fi
 
       - name: Validate tag format
         if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [[ ! "${{ inputs.tag }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.?[a-z][a-z0-9]*)?$ ]]; then
-            echo "Error: Tag '${{ inputs.tag }}' does not match the expected format (e.g., v1.2.3 or v1.2.3.post1 or v1.2.3rc1)"
+          if [[ ! "${RELEASE_INPUT_TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.?[a-z][a-z0-9]*)?$ ]]; then
+            echo "Error: Tag '${RELEASE_INPUT_TAG}' does not match the expected format (e.g., v1.2.3 or v1.2.3.post1 or v1.2.3rc1)"
             exit 1
           fi
-          echo "✓ Tag format is valid: ${{ inputs.tag }}"
+          echo "✓ Tag format is valid: ${RELEASE_INPUT_TAG}"
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -50,8 +60,15 @@ jobs:
           repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
           submodules: true
 
+      - name: Validate CUDA configuration
+        run: python3 ci/validate_cuda_versions.py
+
       - name: Verify tag matches version.txt
         id: set-version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RELEASE_INPUT_TAG: ${{ inputs.tag }}
         run: |
           # Check version.txt - this is the source of truth
           if [ ! -f "version.txt" ]; then
@@ -61,17 +78,19 @@ jobs:
 
           VERSION_TXT=$(cat version.txt | tr -d '[:space:]')
           PYTHON_VERSION=$(tr -d '[:space:]' < .python-version)
-          echo "python_version=${PYTHON_VERSION}" >> $GITHUB_OUTPUT
+          if [[ ! "${VERSION_TXT}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.?[a-z][a-z0-9]*)?$ ]]; then
+            echo "Error: version.txt contains an invalid version: ${VERSION_TXT}"
+            exit 1
+          fi
 
           # In PR mode, use version from version.txt with a test suffix
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            echo "is_pr=true" >> $GITHUB_OUTPUT
-            echo "version=${VERSION_TXT}" >> $GITHUB_OUTPUT
-            echo "release_tag=test-v${VERSION_TXT}-pr${{ github.event.pull_request.number }}" >> $GITHUB_OUTPUT
-            echo "✓ PR mode: using test tag test-v${VERSION_TXT}-pr${{ github.event.pull_request.number }}"
+          if [ "${EVENT_NAME}" == "pull_request" ]; then
+            IS_PR=true
+            RELEASE_TAG="test-v${VERSION_TXT}-pr${PR_NUMBER}"
+            echo "✓ PR mode: using test tag ${RELEASE_TAG}"
           else
             # Extract version from tag (remove 'v' prefix)
-            TAG_VERSION="${{ inputs.tag }}"
+            TAG_VERSION="${RELEASE_INPUT_TAG}"
             TAG_VERSION="${TAG_VERSION#v}"
 
             if [ "$TAG_VERSION" != "$VERSION_TXT" ]; then
@@ -84,11 +103,21 @@ jobs:
               exit 1
             fi
 
-            echo "is_pr=false" >> $GITHUB_OUTPUT
+            IS_PR=false
+            RELEASE_TAG="${RELEASE_INPUT_TAG}"
             echo "✓ version.txt matches tag version: $VERSION_TXT"
-            echo "version=${VERSION_TXT}" >> $GITHUB_OUTPUT
-            echo "release_tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
           fi
+
+          {
+            echo "python_version=${PYTHON_VERSION}"
+            echo "is_pr=${IS_PR}"
+            echo "version=${VERSION_TXT}"
+            echo "release_tag=${RELEASE_TAG}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Load CUDA wheel matrix
+        id: cuda-versions
+        run: echo "jit_cache=$(jq -c '.jit_cache' ci/cuda-versions.json)" >> "$GITHUB_OUTPUT"
 
   build-flashinfer-python:
     needs: setup
@@ -165,11 +194,12 @@ jobs:
           retention-days: 7
 
   build-flashinfer-jit-cache:
+    name: JIT cache (${{ matrix.cuda.label }}, ${{ matrix.arch }})
     needs: setup
     strategy:
       fail-fast: false
       matrix:
-        cuda: ["12.8", "12.9", "13.0"]
+        cuda: ${{ fromJSON(needs.setup.outputs.jit_cache_cuda_matrix) }}
         arch: ['x86_64', 'aarch64']
 
     runs-on: [self-hosted, linux, "${{ matrix.arch == 'aarch64' && 'arm64' || 'x64' }}", cpu, on-demand]
@@ -191,38 +221,45 @@ jobs:
 
       - name: Build wheel in container
         env:
-          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
-          # 12.1a is CUDA 13.0 aarch64 only: adding it to cu129 aarch64 too (#3684) pushed that
-          # wheel to 2.14 GiB, past GitHub's 2 GiB release-asset limit (#4519).
-          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.cuda < '12.9' && '7.5 8.0 8.9 9.0a 10.0a 12.0a' || (matrix.cuda < '13.0' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f' || (matrix.arch == 'aarch64' && '7.5 8.0 8.9 9.0a 10.0a 10.3a 11.0a 12.0f 12.1a' || '7.5 8.0 8.9 9.0a 10.0a 10.3a 12.0f')) }}
+          ARCH: ${{ matrix.arch }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}
+          CUDA_VERSION: ${{ matrix.cuda.version }}
+          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda.version) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda.version) }}
+          # Keep 12.1a on CUDA 13.x aarch64 only: including it in cu129 made
+          # that wheel exceed GitHub's 2 GiB release-asset limit (#4519).
+          FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.arch == 'aarch64' && matrix.cuda.aarch64_arch_list || matrix.cuda.x86_64_arch_list }}
+          FLASHINFER_LOCAL_VERSION: ${{ matrix.cuda.label }}
+          PYTORCH_INDEX: ${{ matrix.cuda.pytorch_index }}
+          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
+          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
         run: |
           # Extract CUDA major and minor versions
-          CUDA_MAJOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f1)
-          CUDA_MINOR=$(echo "${{ matrix.cuda }}" | cut -d'.' -f2)
+          IFS=. read -r CUDA_MAJOR CUDA_MINOR <<< "${CUDA_VERSION}"
           export CUDA_MAJOR
           export CUDA_MINOR
-          export FLASHINFER_LOCAL_VERSION="cu${CUDA_MAJOR}${CUDA_MINOR}"
 
-          mkdir -p ${{ github.workspace }}/ci-cache ${{ github.workspace }}/sccache-stats
+          mkdir -p "${GITHUB_WORKSPACE}/ci-cache" "${GITHUB_WORKSPACE}/sccache-stats"
 
           docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            -v ${{ github.workspace }}/ci-cache:/ci-cache \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -v "${GITHUB_WORKSPACE}/ci-cache:/ci-cache" \
             -e FLASHINFER_CI_CACHE=/ci-cache \
-            -e CUDA_VERSION="${{ matrix.cuda }}" \
+            -e CUDA_VERSION \
             -e CUDA_MAJOR="$CUDA_MAJOR" \
             -e CUDA_MINOR="$CUDA_MINOR" \
-            -e FLASHINFER_LOCAL_VERSION="$FLASHINFER_LOCAL_VERSION" \
-            -e ARCH="${{ matrix.arch }}" \
-            -e FLASHINFER_CUDA_ARCH_LIST="${FLASHINFER_CUDA_ARCH_LIST}" \
+            -e PYTORCH_INDEX \
+            -e FLASHINFER_LOCAL_VERSION \
+            -e ARCH \
+            -e FLASHINFER_CUDA_ARCH_LIST \
             -e FLASHINFER_NVCC_THREADS="${FLASHINFER_NVCC_THREADS:-}" \
-            -e SCCACHE_BUCKET="${{ vars.SCCACHE_BUCKET }}" \
-            -e AWS_ACCESS_KEY_ID="${{ secrets.SCCACHE_AWS_ACCESS_KEY_ID }}" \
-            -e AWS_SECRET_ACCESS_KEY="${{ secrets.SCCACHE_AWS_SECRET_ACCESS_KEY }}" \
-            -e SCCACHE_REGION="${{ vars.SCCACHE_REGION }}" \
+            -e SCCACHE_BUCKET \
+            -e AWS_ACCESS_KEY_ID \
+            -e AWS_SECRET_ACCESS_KEY \
+            -e SCCACHE_REGION \
             -e SCCACHE_STATS_DIR=/workspace/sccache-stats \
             -w /workspace \
-            ${{ env.DOCKER_IMAGE }} \
+            "${DOCKER_IMAGE}" \
             bash /workspace/scripts/build_flashinfer_jit_cache_whl.sh
         timeout-minutes: 360
 
@@ -239,7 +276,10 @@ jobs:
       - name: Record sccache job metadata
         if: always()
         env:
-          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda) }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+          MATRIX_CUDA_LABEL: ${{ matrix.cuda.label }}
+          MATRIX_CUDA_VERSION: ${{ matrix.cuda.version }}
+          DOCKER_IMAGE: ${{ matrix.arch == 'aarch64' && format('pytorch/manylinuxaarch64-builder:cuda{0}', matrix.cuda.version) || format('pytorch/manylinux2_28-builder:cuda{0}', matrix.cuda.version) }}
         run: |
           mkdir -p "${GITHUB_WORKSPACE}/sccache-stats"
           IMAGE_DIGESTS=$(docker image inspect --format '{{json .RepoDigests}}' "${DOCKER_IMAGE}" 2>/dev/null || printf 'unavailable')
@@ -247,15 +287,16 @@ jobs:
             printf 'git_commit=%s\n' "$(git rev-parse HEAD)"
             printf 'docker_image=%s\n' "${DOCKER_IMAGE}"
             printf 'docker_image_repo_digests=%s\n' "${IMAGE_DIGESTS}"
-            printf 'matrix_cuda=%s\n' "${{ matrix.cuda }}"
-            printf 'matrix_arch=%s\n' "${{ matrix.arch }}"
+            printf 'matrix_cuda=%s\n' "${MATRIX_CUDA_VERSION}"
+            printf 'matrix_cuda_label=%s\n' "${MATRIX_CUDA_LABEL}"
+            printf 'matrix_arch=%s\n' "${MATRIX_ARCH}"
           } > "${GITHUB_WORKSPACE}/sccache-stats/job-metadata.txt"
 
       - name: Upload sccache stats
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sccache-stats-cuda${{ matrix.cuda }}-${{ matrix.arch }}
+          name: sccache-stats-${{ matrix.cuda.label }}-${{ matrix.arch }}
           path: sccache-stats/
           if-no-files-found: warn
           retention-days: 14
@@ -265,9 +306,11 @@ jobs:
 
       - name: Create artifact name
         id: artifact-name
+        env:
+          MATRIX_ARCH: ${{ matrix.arch }}
+          MATRIX_CUDA_LABEL: ${{ matrix.cuda.label }}
         run: |
-          CUDA_NO_DOT=$(echo "${{ matrix.cuda }}" | tr -d '.')
-          echo "name=jit-cache-cu${CUDA_NO_DOT}-${{ matrix.arch }}" >> $GITHUB_OUTPUT
+          echo "name=jit-cache-${MATRIX_CUDA_LABEL}-${MATRIX_ARCH}" >> "$GITHUB_OUTPUT"
 
       - name: Upload flashinfer-jit-cache artifact
         uses: actions/upload-artifact@v4
@@ -293,49 +336,51 @@ jobs:
         id: release-notes
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+          REPOSITORY: ${{ github.repository }}
+          TARGET_SHA: ${{ github.sha }}
         run: |
-          TAG="${{ needs.setup.outputs.release_tag }}"
-
           # Get the previous release tag
-          PREV_TAG=$(git tag --sort=-version:refname | grep -A1 "^${TAG}$" | tail -n1 || echo "")
+          PREV_TAG=$(git tag --sort=-version:refname | grep -A1 "^${RELEASE_TAG}$" | tail -n1 || echo "")
 
           if [ -z "$PREV_TAG" ]; then
             echo "No previous tag found, generating notes from all commits"
-            NOTES=$(gh api /repos/${{ github.repository }}/releases/generate-notes \
-              -f tag_name="$TAG" \
-              -f target_commitish="${{ github.sha }}" \
+            NOTES=$(gh api "/repos/${REPOSITORY}/releases/generate-notes" \
+              -f tag_name="${RELEASE_TAG}" \
+              -f target_commitish="${TARGET_SHA}" \
               --jq '.body')
           else
-            echo "Generating notes from ${PREV_TAG} to ${TAG}"
-            NOTES=$(gh api /repos/${{ github.repository }}/releases/generate-notes \
-              -f tag_name="$TAG" \
+            echo "Generating notes from ${PREV_TAG} to ${RELEASE_TAG}"
+            NOTES=$(gh api "/repos/${REPOSITORY}/releases/generate-notes" \
+              -f tag_name="${RELEASE_TAG}" \
               -f previous_tag_name="$PREV_TAG" \
-              -f target_commitish="${{ github.sha }}" \
+              -f target_commitish="${TARGET_SHA}" \
               --jq '.body')
           fi
 
           # Save to file for multi-line output
           echo "$NOTES" > /tmp/release_notes.md
-          echo "notes_file=/tmp/release_notes.md" >> $GITHUB_OUTPUT
+          echo "notes_file=/tmp/release_notes.md" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release (empty first)
         env:
           GH_TOKEN: ${{ github.token }}
+          NOTES_FILE: ${{ steps.release-notes.outputs.notes_file }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
+          RELEASE_VERSION: ${{ needs.setup.outputs.version }}
         run: |
-          TAG="${{ needs.setup.outputs.release_tag }}"
-
           # Delete existing release and tag if they exist
-          if gh release view "$TAG" &>/dev/null; then
-            echo "Deleting existing release: $TAG"
-            gh release delete "$TAG" --yes
+          if gh release view "${RELEASE_TAG}" &>/dev/null; then
+            echo "Deleting existing release: ${RELEASE_TAG}"
+            gh release delete "${RELEASE_TAG}" --yes
           fi
 
           # Read release notes from file
-          NOTES=$(cat ${{ steps.release-notes.outputs.notes_file }})
+          NOTES=$(cat "${NOTES_FILE}")
 
           # Create new release without assets first
-          gh release create "$TAG" \
-            --title "Release v${{ needs.setup.outputs.version }}" \
+          gh release create "${RELEASE_TAG}" \
+            --title "Release v${RELEASE_VERSION}" \
             --notes "$NOTES"
 
       - name: Download flashinfer-python artifact
@@ -347,8 +392,9 @@ jobs:
       - name: Upload flashinfer-python to release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
         run: |
-          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-python/* --clobber
+          gh release upload "${RELEASE_TAG}" dist-python/* --clobber
 
       - name: Download flashinfer-cubin artifact
         uses: actions/download-artifact@v4
@@ -359,36 +405,44 @@ jobs:
       - name: Upload flashinfer-cubin to release
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
         run: |
-          gh release upload "${{ needs.setup.outputs.release_tag }}" dist-cubin/* --clobber
+          gh release upload "${RELEASE_TAG}" dist-cubin/* --clobber
 
       - name: Upload flashinfer-jit-cache wheels to release (one at a time to avoid OOM)
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
         run: |
           # Upload jit-cache wheels one at a time to avoid OOM
           # Each wheel can be several GB, so we download, upload, delete, repeat
           mkdir -p dist-jit-cache
 
-          for cuda in 128 129 130; do
+          mapfile -t CUDA_LABELS < <(jq -r '.jit_cache[].label' ci/cuda-versions.json)
+          for cuda_label in "${CUDA_LABELS[@]}"; do
             for arch in x86_64 aarch64; do
-              ARTIFACT_NAME="jit-cache-cu${cuda}-${arch}"
+              ARTIFACT_NAME="jit-cache-${cuda_label}-${arch}"
               echo "Processing ${ARTIFACT_NAME}..."
 
               # Download this specific artifact
-              gh run download ${{ github.run_id }} -n "${ARTIFACT_NAME}" -D dist-jit-cache/ || {
-                echo "Warning: Failed to download ${ARTIFACT_NAME}, skipping..."
-                continue
-              }
-
-              # Upload to release
-              if [ -n "$(ls -A dist-jit-cache/)" ]; then
-                gh release upload "${{ needs.setup.outputs.release_tag }}" dist-jit-cache/* --clobber
-                echo "✅ Uploaded ${ARTIFACT_NAME}"
+              if ! gh run download "${GITHUB_RUN_ID}" -n "${ARTIFACT_NAME}" -D dist-jit-cache/; then
+                echo "::error::Failed to download required artifact ${ARTIFACT_NAME}"
+                exit 1
               fi
 
+              shopt -s nullglob
+              WHEELS=(dist-jit-cache/*.whl)
+              shopt -u nullglob
+              if [ "${#WHEELS[@]}" -eq 0 ]; then
+                echo "::error::Required artifact ${ARTIFACT_NAME} contained no wheel"
+                exit 1
+              fi
+
+              gh release upload "${RELEASE_TAG}" "${WHEELS[@]}" --clobber
+              echo "✅ Uploaded ${ARTIFACT_NAME}"
+
               # Clean up to save disk space before next iteration
-              rm -rf dist-jit-cache/*
+              rm -f -- "${WHEELS[@]}"
             done
           done
 
@@ -461,17 +515,21 @@ jobs:
           python-version-file: '.python-version'
 
       - name: Update wheel index
+        env:
+          RELEASE_TAG: ${{ needs.setup.outputs.release_tag }}
         run: |
           python3 scripts/update_whl_index.py \
             --dist-dir dist \
             --output-dir flashinfer-whl \
-            --release-tag "${{ needs.setup.outputs.release_tag }}"
+            --release-tag "${RELEASE_TAG}"
 
       - name: Push wheel index
+        env:
+          RELEASE_VERSION: ${{ needs.setup.outputs.version }}
         run: |
           cd flashinfer-whl
           git config --local user.name "github-actions[bot]"
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "update whl for release ${{ needs.setup.outputs.version }}"
+          git commit -m "update whl for release ${RELEASE_VERSION}"
           git push

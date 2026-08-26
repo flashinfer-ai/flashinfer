@@ -32,6 +32,9 @@ Tests include:
 - ReLU2 (non-gated) activation for Nemotron-Super
 """
 
+import ast
+from pathlib import Path
+
 import pytest
 import torch
 from torch.nn import functional as F
@@ -3116,6 +3119,286 @@ class TestRelu2Activation:
         torch.cuda.synchronize()
         assert not torch.isnan(output).any(), "NaN after ReLU2 CUDA graph replay"
         assert not (output == 0).all(), "All zeros after ReLU2 CUDA graph replay"
+
+
+def _make_cpu_wrapper(monkeypatch, use_cuda_graph=True, **shared):
+    """Build a B12xMoEWrapper without a GPU: fake CUDA 13, CPU buffers."""
+    from flashinfer.fused_moe.cute_dsl import b12x_moe as b12x_moe_mod
+    from flashinfer.jit import cpp_ext
+
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", _fake_cuda_13_version)
+    return b12x_moe_mod.B12xMoEWrapper(
+        num_experts=8,
+        top_k=1,
+        hidden_size=256,
+        intermediate_size=128,
+        use_cuda_graph=use_cuda_graph,
+        max_num_tokens=1024,  # crosses the static/dynamic cutover
+        device="cpu",
+        **shared,
+    )
+
+
+def test_wrapper_defaults_allocate_own_buffers(monkeypatch):
+    """Without sharing, each wrapper allocates its own workspaces and output."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    allocs = []
+    monkeypatch.setattr(
+        moe_dispatch,
+        "allocate_sm120_moe_workspace",
+        lambda **kw: allocs.append(kw) or object(),
+    )
+
+    first = _make_cpu_wrapper(monkeypatch)
+    second = _make_cpu_wrapper(monkeypatch)
+
+    assert len(allocs) == 4  # static + dynamic per wrapper
+    assert second._static_workspace is not first._static_workspace
+    assert second._dynamic_workspace is not first._dynamic_workspace
+    assert second._moe_output is not first._moe_output
+
+
+def test_wrapper_shared_buffers_are_reused(monkeypatch):
+    """Injected shared buffers are reused instead of fresh allocations."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    allocs = []
+    monkeypatch.setattr(
+        moe_dispatch,
+        "allocate_sm120_moe_workspace",
+        lambda **kw: allocs.append(kw) or object(),
+    )
+
+    first = _make_cpu_wrapper(monkeypatch)
+    assert len(allocs) == 2  # static + dynamic
+
+    # Spy on the output factory: sharing must skip the output allocation too.
+    real_empty = torch.empty
+    output_allocs = []
+    monkeypatch.setattr(
+        torch,
+        "empty",
+        lambda *a, **kw: output_allocs.append((a, kw)) or real_empty(*a, **kw),
+    )
+
+    second = _make_cpu_wrapper(
+        monkeypatch,
+        shared_static_workspace=first._static_workspace,
+        shared_dynamic_workspace=first._dynamic_workspace,
+        shared_output=first._moe_output,
+    )
+
+    assert len(allocs) == 2  # nothing new allocated
+    assert not output_allocs
+    assert second._static_workspace is first._static_workspace
+    assert second._dynamic_workspace is first._dynamic_workspace
+    assert second._moe_output is first._moe_output
+
+
+def test_wrapper_shared_output_is_validated(monkeypatch):
+    """Incompatible shared_output buffers are rejected at construction."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    monkeypatch.setattr(
+        moe_dispatch, "allocate_sm120_moe_workspace", lambda **kw: object()
+    )
+    bad = torch.zeros((4, 64), dtype=torch.float32)  # too small, wrong dtype
+    with pytest.raises(ValueError, match="shared_output"):
+        _make_cpu_wrapper(monkeypatch, shared_output=bad)
+
+
+def test_wrapper_shared_buffers_require_cuda_graph(monkeypatch):
+    """Shared buffers are rejected when CUDA graph mode is disabled."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    monkeypatch.setattr(
+        moe_dispatch, "allocate_sm120_moe_workspace", lambda **kw: object()
+    )
+    output = torch.zeros((1024, 256), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="use_cuda_graph"):
+        _make_cpu_wrapper(monkeypatch, use_cuda_graph=False, shared_output=output)
+
+
+@sm120_required
+@cuda_13_required
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+def test_wrapper_shared_output_rejects_other_gpu():
+    """A shared_output on a different CUDA device is rejected.
+
+    Regression test: the device check must compare the full device, including
+    the index — with index-less ``device="cuda"`` resolved to the current
+    device — instead of only the device type.
+    """
+    from flashinfer.fused_moe.cute_dsl import b12x_moe as b12x_moe_mod
+
+    other_gpu = torch.zeros((16, 256), dtype=torch.bfloat16, device="cuda:1")
+    with torch.cuda.device(0), pytest.raises(ValueError, match="shared_output"):
+        b12x_moe_mod.B12xMoEWrapper(
+            num_experts=8,
+            top_k=1,
+            hidden_size=256,
+            intermediate_size=128,
+            use_cuda_graph=True,
+            max_num_tokens=16,
+            device="cuda",  # index-less: resolves to cuda:0
+            shared_output=other_gpu,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dense-kernel borrow contract (CPU-only, pure source scan).
+#
+# SM12x MoE kernel classes invoke DenseGemmKernel helpers unbound, e.g.
+# ``self._dense_cls._partition_fragment_SFA(self, ...)`` with ``self`` being
+# the MoE kernel. Every ``self.<attr>`` read inside such a borrowed method
+# (including transitive intra-class calls) must be provided by the borrower.
+# Everything below works on parsed sources only — it imports no kernel
+# module, so it runs even where the CuTe DSL stack is unavailable. Borrowers
+# are discovered by scanning the fused_moe sources for the borrow pattern,
+# so new kernels are covered without editing this test.
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_FUSED_MOE_DIR = _REPO_ROOT / "flashinfer" / "fused_moe"
+_DENSE_KERNEL_FILE = (
+    _REPO_ROOT
+    / "flashinfer"
+    / "gemm"
+    / "kernels"
+    / "dense_blockscaled_gemm_sm120_b12x.py"
+)
+
+
+def _class_def(path, name):
+    for node in ast.walk(ast.parse(path.read_text())):
+        if isinstance(node, ast.ClassDef) and node.name == name:
+            return node
+    raise AssertionError(f"{name} not found in {path}")
+
+
+def _self_deps(class_def, entry):
+    """All ``self.<attr>`` reads reachable from method ``entry``."""
+    methods = {n.name: n for n in class_def.body if isinstance(n, ast.FunctionDef)}
+    deps, seen, stack = set(), set(), [entry]
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in methods:
+            continue
+        seen.add(name)
+        for node in ast.walk(methods[name]):
+            if (
+                isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "self"
+            ):
+                deps.add(node.attr)
+                stack.append(node.attr)
+    deps.discard(entry)  # the borrowed method itself stays on DenseGemmKernel
+    return deps
+
+
+def _provided(class_def):
+    """Attributes a class offers: its methods and ``self.<attr>`` assignments."""
+    out = set()
+    for node in ast.walk(class_def):
+        if isinstance(node, ast.FunctionDef):
+            out.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            out.update(
+                t.attr
+                for t in targets
+                if isinstance(t, ast.Attribute)
+                and isinstance(t.value, ast.Name)
+                and t.value.id == "self"
+            )
+    return out
+
+
+def _borrowed_method_name(node):
+    """Match ``self._dense_cls.<name>(self, ...)``; return the method name."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "_dense_cls"
+        and node.args
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id == "self"
+    ):
+        return node.func.attr
+    return None
+
+
+def _dense_cls_target(class_def):
+    """Class referred to by ``_dense_cls``, in any common assignment form."""
+    for node in ast.walk(class_def):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        if not any(
+            (isinstance(t, ast.Attribute) and t.attr == "_dense_cls")
+            or (isinstance(t, ast.Name) and t.id == "_dense_cls")
+            for t in targets
+        ):
+            continue
+        if isinstance(node.value, ast.Name):
+            return node.value.id
+        if isinstance(node.value, ast.Attribute):
+            return node.value.attr  # e.g. kernels.DenseGemmKernel
+    return None
+
+
+def _find_borrowers():
+    """All (file, class, borrowed methods, _dense_cls target) in fused_moe."""
+    out = []
+    for path in sorted(_FUSED_MOE_DIR.rglob("*.py")):
+        classes = (
+            n
+            for n in ast.walk(ast.parse(path.read_text()))
+            if isinstance(n, ast.ClassDef)
+        )
+        for cls in classes:
+            borrowed = {
+                name for node in ast.walk(cls) if (name := _borrowed_method_name(node))
+            }
+            if borrowed:
+                out.append((path.name, cls, borrowed, _dense_cls_target(cls)))
+    return out
+
+
+_DENSE_KERNEL_CLASS = _class_def(_DENSE_KERNEL_FILE, "DenseGemmKernel")
+_BORROW_CONTRACT_CASES = _find_borrowers()
+
+
+def test_borrower_discovery_is_non_empty():
+    # An empty discovery would silently skip the parametrized contract test.
+    assert _BORROW_CONTRACT_CASES, (
+        "no `_dense_cls` borrow sites found; if a refactor renamed `_dense_cls` "
+        "or changed the borrow idiom, update discovery here — if the pattern was "
+        "intentionally removed, delete this test section."
+    )
+
+
+@pytest.mark.parametrize(
+    "path_name,cls,borrowed,target",
+    _BORROW_CONTRACT_CASES,
+    ids=[f"{p}:{c.name}" for p, c, _, _ in _BORROW_CONTRACT_CASES],
+)
+def test_borrowed_dense_method_self_deps(path_name, cls, borrowed, target):
+    assert target == "DenseGemmKernel", (
+        f"{cls.name} borrows via _dense_cls={target!r}; if it references a "
+        f"different kernel class, extend this test to resolve it."
+    )
+    provided = _provided(cls)
+    for name in borrowed:
+        missing = _self_deps(_DENSE_KERNEL_CLASS, name) - provided
+        assert not missing, (
+            f"{cls.name} borrows DenseGemmKernel.{name}() but does not provide "
+            f"{sorted(missing)}; make the helper a module-level function or add "
+            f"it to {cls.name}."
+        )
 
 
 if __name__ == "__main__":

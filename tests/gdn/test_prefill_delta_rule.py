@@ -719,6 +719,7 @@ def _test_checkpoint(
     scale: float,
     checkpoint_every_n_tokens: int,
     seed: int | None = None,
+    use_cp: bool = False,
 ):
     """Test state checkpointing by comparing against prefix-based reference runs."""
     _skip_if_unsupported()
@@ -787,7 +788,8 @@ def _test_checkpoint(
         state_checkpoints=state_checkpoints,
         checkpoint_cu_starts=checkpoint_cu_starts,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-        use_cp=False,
+        use_cp=use_cp,
+        _cp_chunk_len=checkpoint_every_n_tokens if use_cp else None,
     )
     torch.cuda.synchronize()
 
@@ -831,7 +833,8 @@ def _test_checkpoint(
                 True,
                 output=prefix_o,
                 output_state=prefix_state,
-                use_cp=False,
+                use_cp=use_cp,
+                _cp_chunk_len=checkpoint_every_n_tokens if use_cp else None,
             )
             torch.cuda.synchronize()
 
@@ -839,12 +842,8 @@ def _test_checkpoint(
             actual_ckpt = state_checkpoints[ckpt_global_idx]
             expected_ckpt = prefix_state[0]
 
-            torch.testing.assert_close(
-                actual_ckpt,
-                expected_ckpt,
-                atol=1e-3,
-                rtol=1e-4,
-                msg=f"Checkpoint mismatch: seq={seq_idx}, ckpt={ckpt_idx}",
+            assert torch.equal(actual_ckpt, expected_ckpt), (
+                f"Checkpoint mismatch: seq={seq_idx}, ckpt={ckpt_idx}"
             )
 
 
@@ -856,6 +855,7 @@ def _test_checkpoint(
 )
 @pytest.mark.parametrize("seq_lens", [[256], [128, 256, 512]])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("use_cp", [False, True])
 def test_checkpoint_correctness(
     qkv_factory,
     dtype: str,
@@ -865,8 +865,15 @@ def test_checkpoint_correctness(
     head_size: int,
     seq_lens: list[int],
     checkpoint_every_n_tokens: int,
+    use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
+    if use_cp and not (
+        is_sm90a_supported(torch.device("cuda"))
+        or is_sm100a_supported(torch.device("cuda"))
+        or is_sm12x_supported(torch.device("cuda"))
+    ):
+        pytest.skip("CP state checkpointing requires SM90, SM100, or SM120")
     scale = 1.0 / math.sqrt(head_size)
     _test_checkpoint(
         qkv_factory,
@@ -879,6 +886,7 @@ def test_checkpoint_correctness(
         scale,
         checkpoint_every_n_tokens,
         seed,
+        use_cp=use_cp,
     )
 
 
@@ -1049,7 +1057,7 @@ def test_checkpoint_wrong_cu_starts_size(qkv_factory):
 
 
 # ---------------------------------------------------------------------------
-# State dtype tests (SM100 only)
+# State dtype tests
 # ---------------------------------------------------------------------------
 
 
@@ -1063,9 +1071,12 @@ def _test_prefill_kernel_state_dtype(
     head_size: int,
     seq_lens: list[int],
     scale: float,
+    use_cp: bool,
     seed: int | None = None,
 ):
-    _skip_if_not_sm100()
+    _skip_if_unsupported()
+    if use_cp:
+        _skip_if_cp_unsupported()
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -1122,7 +1133,7 @@ def _test_prefill_kernel_state_dtype(
         True,
         output=our_o,
         output_state=our_state,
-        use_cp=False,
+        use_cp=use_cp,
     )
 
     torch.cuda.synchronize()
@@ -1170,6 +1181,7 @@ def _test_prefill_kernel_state_dtype(
     "state_dtype",
     [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2],
 )
+@pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_kernel_state_dtype(
     qkv_factory,
     dtype: str,
@@ -1180,6 +1192,7 @@ def test_prefill_kernel_state_dtype(
     seq_lens: list[int],
     scale: float | str,
     state_dtype: torch.dtype,
+    use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
@@ -1193,5 +1206,6 @@ def test_prefill_kernel_state_dtype(
         head_size,
         seq_lens,
         scale,
+        use_cp,
         seed=seed,
     )

@@ -42,18 +42,19 @@ config = MoEConfig(
     ),
     quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    backends=[TrtllmFp4Config(extra_backend_params...), CutlassConfig(extra_backend_params...)],
+    backends=[TrtllmFp4Config(extra_backend_params...), CutlassNvfp4Config()],
 )
 # --- Find possible backends ---
 backends = MoELayer.find_backends(**config)
-# this contains {"trtllm_fp4":TrtllmFp4Config(), "cutlass_fp4":CutlassConfig()}
-# or {"trtllm_fp4":"unsupported reason...", "cutlass_fp4":CutlassConfig()}
+# this contains {"trtllm_fp4":TrtllmFp4Config(), "cutlass_nvfp4":CutlassNvfp4Config()}
+# or {"trtllm_fp4":"unsupported reason...", "cutlass_nvfp4":CutlassNvfp4Config()}
 # more modification to the backends' parameters could be done here
-backends=["trtllm_fp4":TrtllmFp4Config(extra_backend_params...),"cutlass_fp4":CutlassConfig(extra_backend_params...)]
+backends=["trtllm_fp4":TrtllmFp4Config(extra_backend_params...),"cutlass_nvfp4":CutlassNvfp4Config()]
 # --- Prepare Inputs Data ---
 weight_pack = MoEWeightPack()
 # the data is possibly obtained through helper functions then added here
-weight_pack.prepare_for("trtllm_fp4", trtllm_weights) weight_pack.prepare_for("cutlass_fp4", cutlass_weights)
+weight_pack.prepare_for("trtllm_fp4", trtllm_weights)
+weight_pack.prepare_for("cutlass_nvfp4", CutlassNvfp4Config.prepare_weights(...))
 act_pack = MoEActivationPack(
     hidden_states_q=cute_dsl_data["x"],
     hidden_states_scale=x_sf,
@@ -94,7 +95,8 @@ All configs are frozen dataclasses registered with TVM's object system. The hier
 | ExpertConfig | intermediate_size, local sharding params |
 | ActivationConfig | activation type (swiglu/geglu/relu2/identity) |
 | BackendOptions | ordered candidate set via \| operator |
-| ExecutionConfig | do_finalize, enable_pdl, tune_max_num_tokens, output tensor |
+| ExecutionConfig | enable_pdl, tune_max_num_tokens |
+| MoEFinalizeConfig | do_finalize, use_fused_finalize |
 | MoEConfig | assembles all above; supports \*\*unpacking protocol |
 
 ### 3.1 RoutingConfig
@@ -119,9 +121,8 @@ Individual backend configs provided in an ordered list. The autotuner or heurist
 # Single backend
 backends = [TrtllmFp4Config()]
 # Multiple candidates — autotuner or heuristic picks best
-backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]
+backends = [TrtllmFp4Config(), CutlassNvfp4Config()]
 # | is associative, returns BackendOptions
-# CutlassConfig is always the universal fallback
 ```
 
 Each backend config declares its own preconditions:
@@ -130,11 +131,11 @@ Each backend config declares its own preconditions:
 class TrtllmFp4Config:
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 90  # Hopper+
-class CutlassConfig:
+        return arch in (100, 103, 107)
+class CutlassNvfp4Config:
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return True  # universal fallback
+        return arch in (100, 103, 107, 110, 120, 121)
 ```
 
 ### 3.3 MoEConfig — \*\*unpack protocol
@@ -146,7 +147,7 @@ config = MoEConfig(
     routing=RoutingConfig(num_experts=256, top_k=8, method=RoutingMethodType.DeepSeekV3),
     quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    backends=[TrtllmFp4Config(), CutlassConfig()],
+    backends=[TrtllmFp4Config(), CutlassNvfp4Config()],
 )
 # Unpack into any call accepting these kwargs
 output = moe_layer(tensors, **config)
@@ -257,7 +258,7 @@ repro.benchmark_all()
 # FinalizeConfig    0.11ms
 # Total             3.13ms
 # Isolate backend to narrow regression
-repro.isolate_backend(CutlassConfig())
+repro.isolate_backend(CutlassNvfp4Config())
 repro.isolate_backend(TrtllmFp4Config())
 ```
 
@@ -296,7 +297,7 @@ flashinfer/
       __init__.py     # BACKEND_REGISTRY, DEFAULT_PRIORITY
       trtllm_fp4.py   # TrtllmFp4Config + adapter
       trtllm_fp8.py   # Fp8Block + Fp8PerTensor + adapters
-      cutlass.py      # CutlassConfig + adapter
+      cutlass.py      # CutlassBf16 / W4A16 / Nvfp4 / Fp8 / Mxfp8 / W4A8 / Humming + adapters
     repro.py          # MoERepro
     tensors.py        # MoETensors, Gemm1Tensors, Gemm2Tensors
 ```
@@ -688,7 +689,8 @@ out = layer(act, weights)            # subsequent calls: cached winner dispatch
 Key mechanisms (and where they live):
 
 - **Two packs, two lifetimes.** `MoEWeightPack` holds long-lived, backend-native weight materializations keyed by `backend_key` (`prepare_for` / `get_view`); `MoEActivationPack` carries per-call pre-routed activations. This is the concrete answer to reviewers' "backends need different weight preprocessing" concern (C29–C32): each backend stores its own view, none is hidden from the caller.
-- **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` (backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7).
+- **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` / `CutlassNvfp4Config.prepare_weights(...)` (and the other quant-specific `Cutlass*Config.prepare_weights` helpers, backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7). CUTLASS NVFP4 uses swizzled `fp4_quantize` scales, not the TRTLLM shuffle / BlockMajorK path. CUTLASS FP8 / MXFP8 / W4A8 / Humming likewise keep unshuffled or mixed-input layouts distinct from TRTLLM. Each quant mode uses its matching `Cutlass*Config` / `Cutlass*Runner`; there is no quant-neutral CUTLASS fallback.
+- **Breaking change — `CutlassConfig` removed.** The deprecated, unregistered `CutlassConfig` placeholder is gone. It was never a runnable `MoELayer` backend (`supported()` always returned false; it was not in `_BACKEND_RUNNERS`). Import, annotate, serialize, or feature-detect a quant-specific type instead (`CutlassBf16Config`, `CutlassNvfp4Config`, `CutlassFp8PerTensorConfig`, `CutlassFp8BlockConfig`, `CutlassMxfp8Config`, `CutlassMxfp8Mxfp4Config`, `CutlassW4A16Config`, `CutlassW4A8Config`, `CutlassHummingConfig`). Historical **Anchor:** / CR1 quotes earlier in this document still mention `CutlassConfig` as review history, not current API.
 - **Two-stage cross-backend autotune** (`MoELayer._select_winner`, runners' delegation): for each candidate, the `AutoTuner.choose_one` picks the best *within-backend tactic* (each backend tuned in its own native input schema), then `bench_gpu_time` compares the candidates at their winning tactics and the fastest backend is dispatched. A single `choose_one` over both runners is not possible because their input schemas differ — hence the explicit two stages.
 - **Winner caching is per token-bucket** (`map_to_hybrid_bucket`): reusing one `MoELayer` across token counts re-selects per bucket; `winner_backend` reports the most-recent choice and `reset_winner()` clears the cache.
 - **Fail-fast scope** (`MoELayer._validate_mvp_scope`): non-NVFP4 quant or non-Swiglu activation raises `NotImplementedError` at construction.
@@ -824,8 +826,9 @@ Repro: `benchmarks/flashinfer_benchmark.py --routine {trtllm_fp4_block_scale_moe
 > `MoETensors` cluster drop ("Two packs, two lifetimes" + the pack rationale in
 > `api.py`). The Reviewer 14 `_select_winner` thread remains tracked under Post-MVP
 > Carryover (a deferred design decision, not part of this pass). The *open* MoE
-> work is now the two fuzzer-filed bugs — gh #3547 / #3548 — described under
-> "Test Harness" above.
+> work includes the remaining fuzzer-filed global-scale gap, gh #3548,
+> described under "Test Harness" above. The earlier gh #3547 EP-offset bug is
+> fixed and retained as regression coverage.
 
 
 ### Test Harness — Forward-Compatible Fuzzer (PR #6, merged 2026-06-09)
@@ -869,32 +872,22 @@ local + `local_expert_offset` — the real deployment shape, in scope for the
 single-GPU harness; the EP *collective* is not), all under a weight-memory
 budget so one config never hogs the GPU.
 
-**Known-failure ledger** (`_KNOWN_FAILURES`): a filed-and-tracked bug is `xfail`ed
-by `(backend_key, predicate)` — the case is **still run**, so the suite stays
-green yet flags loudly (`xpass` → "remove this entry") the day the bug is fixed.
-A crash is never tolerated, only a wrong answer.
+**Known-failure ledger** (shared `tests/test_helpers/fuzz_ledger.py`):
+wrong-answer findings still run and report `xfail` after healthy backends;
+crash-class findings are quarantined before launch. Unexpected passes fail
+strictly so stale waivers are removed.
 
-**CI-safety gate (waived, opt-in).** The ledger tolerates a *wrong answer* but
-cannot absorb a *process abort*, and a single-process run of this suite on SM100
-hit `CUDA error: device-side assert triggered` → `Fatal Python error: Aborted`
-(triage 2026-06-09) — which would block B200 CI. Per-config isolation passes
-68/86 incl. EP `offset>0`, so the abort is **not** cleanly attributable to one
-config (the #3547 EP case returns tolerated zeros under `synchronize`, no
-assert); it surfaces only in the accumulated single-process run CI uses, and
-`--forked` can't isolate it (CUDA inits at collection). So the suite is gated
-behind `FLASHINFER_UMOE_FUZZ` (`pytestmark` skip): **unset (CI default) →
-collected-and-skipped, launches no kernel, cannot abort the job**; set → runs
-(developer / nightly). The follow-up PR fixes #3547, root-causes the abort, and
-removes the gate.
+**CI gate (default-on).** The accumulated fuzzer runs by default and uses a
+`shard_group` marker to keep all configurations in one pytest process.
+`FLASHINFER_UMOE_FUZZ=0` remains an emergency waiver.
 
 **Bugs this fuzzer found + filed** (the EP/scale regimes the prior suite never
 exercised end-to-end):
-- **gh #3547** — `trtllm_fp4_routed` returns all-zeros for EP shards
-  (`local_expert_offset > 0`): the offset is applied twice (pre-subtracted in
-  `pack_inputs` *and* forwarded to the kernel). `cute_dsl_nvfp4` is correct
-  (passes global ids + offset, kernel localizes once). Encoded as the current
-  `_KNOWN_FAILURES` entry. Fix = stop pre-subtracting (pass global ids), then
-  delete the ledger entry so the case flips to passing.
+- **gh #3547 (fixed)** — `trtllm_fp4_routed` returned all-zeros for EP shards
+  (`local_expert_offset > 0`) because the offset was applied twice
+  (pre-subtracted in `pack_inputs` and forwarded to the kernel). The fix passes
+  global IDs and lets the kernel localize once. Its ledger entry has been
+  removed; the EP-offset cases remain as regression coverage.
 - **gh #3548** — activation **global-scale** gap: `prepare_*_weights` hardcodes
   `gs=1.0`/`fc2_input_scale=1.0`/`alpha=ones` and `MoEActivationPack` has no
   global-scale field, so calibrated-checkpoint scales are silently dropped

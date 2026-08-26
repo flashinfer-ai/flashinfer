@@ -15,6 +15,11 @@ from types import SimpleNamespace
 import pytest
 
 
+_PACKAGE_NAME = "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe"
+_BACKEND_PACKAGE_NAME = (
+    "flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_push_cuda"
+)
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PACKAGE_PATH = "flashinfer/moe_ep/kernel_src/sm90/push_style_megamoe"
 _CUDA_RESOURCES = (
     "src/a2a/sm90_push_a2a_ops.cu",
@@ -44,9 +49,37 @@ def _resource_at(package_root, relative_path: str):
     return resource
 
 
+def _python_resources(resource_root):
+    for resource in resource_root.iterdir():
+        if resource.is_dir():
+            yield from _python_resources(resource)
+        elif resource.name.endswith(".py") and resource.is_file():
+            yield resource
+
+
+def _backend_sources():
+    source_tree = (
+        _PROJECT_ROOT
+        / "flashinfer"
+        / "moe_ep"
+        / "backends"
+        / "mega"
+        / "kernel"
+        / "sm90"
+        / "fp8_fp8_bf16_push_cuda"
+    )
+    if source_tree.is_dir():
+        return sorted(source_tree.rglob("*.py"))
+
+    package_root = resources.files(_BACKEND_PACKAGE_NAME)
+    return sorted(_python_resources(package_root), key=str)
+
+
 def test_sm90_push_package_data_contains_cuda_sources():
-    project_root = Path(__file__).resolve().parents[2]
-    pyproject = (project_root / "pyproject.toml").read_text(encoding="utf-8")
+    pyproject_path = _PROJECT_ROOT / "pyproject.toml"
+    if not pyproject_path.is_file():
+        pytest.skip("pyproject.toml is only available in source-tree test runs")
+    pyproject = pyproject_path.read_text(encoding="utf-8")
     key = '"flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = ['
     package_block = pyproject.split(key, maxsplit=1)[1].split("]", maxsplit=1)[0]
     assert '"*.md"' in package_block
@@ -57,9 +90,7 @@ def test_sm90_push_package_data_contains_cuda_sources():
 
 
 def test_sm90_push_runtime_resources_expose_packaged_cuda_sources():
-    package_root = resources.files(
-        "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe"
-    )
+    package_root = resources.files(_PACKAGE_NAME)
     for relative_path in (
         *_CUDA_RESOURCES,
         *_PYTHON_RESOURCES,
@@ -96,22 +127,10 @@ def test_sm90_push_prebuilt_wheel_contains_runtime_package():
 
 
 def test_sm90_push_backend_imports_kernel_package_through_public_boundaries():
-    project_root = Path(__file__).resolve().parents[2]
-    backend_root = (
-        project_root
-        / "flashinfer"
-        / "moe_ep"
-        / "backends"
-        / "mega"
-        / "kernel"
-        / "sm90"
-        / "fp8_fp8_bf16_push_cuda"
-    )
     package_marker = "kernel_src.sm90.push_style_megamoe"
 
-    assert backend_root.is_dir(), f"backend package not found: {backend_root}"
-    sources = sorted(backend_root.rglob("*.py"))
-    assert sources, f"no Python modules under {backend_root}"
+    sources = _backend_sources()
+    assert sources, f"no Python modules found for {_BACKEND_PACKAGE_NAME}"
     for path in sources:
         source = path.read_text(encoding="utf-8")
         assert f"{package_marker}.src" not in source
