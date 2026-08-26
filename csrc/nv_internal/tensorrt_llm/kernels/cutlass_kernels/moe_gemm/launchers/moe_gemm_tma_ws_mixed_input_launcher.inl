@@ -221,17 +221,18 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
   constexpr bool use_rolling_refill =
       KernelType == tkc::MainloopScheduleType::SINGLE_WARPGROUP_ROLLING;
   constexpr int SmallKTileN = cute::size<1>(TileShape{});
-  constexpr int SmallKCtasPerSm = SmallKTileN <= 16 ? 5 : (SmallKTileN == 32 ? 4 : 3);
+  constexpr int SmallKCtasPerSm =
+      SmallKTileN <= 16 ? 5 : (SmallKTileN == 32 ? 4 : (SmallKTileN == 40 ? 3 : 2));
 
   static_assert(!use_single_warpgroup || use_fused_e8m0_scale,
                 "The single-warpgroup kernel is only valid for pre-MMA E8M0 scaling.");
   static_assert(!use_single_warpgroup || cute::size(ClusterShape{}) == 1,
                 "The single-warpgroup kernel requires a 1x1x1 cluster.");
-  static_assert(
-      !use_single_warpgroup ||
-          (cute::size<0>(TileShape{}) == 128 && cute::size<2>(TileShape{}) == 128 &&
-           (SmallKTileN == 8 || SmallKTileN == 16 || SmallKTileN == 32 || SmallKTileN == 40)),
-      "Unsupported single-warpgroup tile shape.");
+  static_assert(!use_single_warpgroup ||
+                    (cute::size<0>(TileShape{}) == 128 && cute::size<2>(TileShape{}) == 128 &&
+                     (SmallKTileN == 8 || SmallKTileN == 16 || SmallKTileN == 32 ||
+                      SmallKTileN == 40 || SmallKTileN == 64)),
+                "Unsupported single-warpgroup tile shape.");
 
   using FusionOperation =
       std::conditional_t<use_fused_e8m0_scale,
