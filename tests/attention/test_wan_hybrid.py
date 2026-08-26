@@ -184,8 +184,10 @@ def test_wan_hybrid_quantizer_binding_matches_frozen_device_abi() -> None:
     assert "kPaddedSequence = 5120" in binding
     assert "kLogicalBlocks = 38" in binding
     assert "kPhysicalBlocks = 40" in binding
-    assert "SMEM_TOTAL == 32896" in binding
-    assert "SMEM_TOTAL == 33280" not in binding
+    assert "kWanHybridQuantDynamicSmemBytes = 32896" in binding
+    assert "static_assert(kWanHybridQuantDynamicSmemBytes == 32896)" in binding
+    assert "kWanHybridQuantDynamicSmemBytes, stream" in binding
+    assert "SMEM_TOTAL == 32896" not in binding
     assert "const cudaStream_t stream = get_stream(value.device());" in binding
     assert binding.count('#include "device/wan_hybrid_quantize_value_sm') == 2
     assert _sha256(source_root / "device/wan_hybrid_quantize_value_sm100.cu") == (
@@ -244,7 +246,8 @@ def test_wan_hybrid_dispatch_binding_preserves_sources_and_launch_order() -> Non
     assert binding.count('#include "device/wan_hybrid_attention_sm') == 2
     assert "kTensorMapCount = 6" in binding
     assert "kAttentionDynamicSmemBytes = SMEM_TOTAL" in binding
-    assert "kWanHybridQuantDynamicSmemBytes = SMEM_TOTAL" in binding
+    assert "kWanHybridQuantDynamicSmemBytes = 32896" in binding
+    assert "kWanHybridQuantDynamicSmemBytes = SMEM_TOTAL" not in binding
     assert "kMaximumTiles148Sm = 147" in binding
     assert "kMaximumTiles152Sm = 152" in binding
     assert "multiprocessor_count == 152" in binding

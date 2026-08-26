@@ -48,7 +48,7 @@
 #error "Wan hybrid dispatch requires target minor 0 or 3"
 #endif
 constexpr int kWanHybridQuantThreads = THREADS;
-constexpr size_t kWanHybridQuantDynamicSmemBytes = SMEM_TOTAL;
+constexpr size_t kWanHybridQuantDynamicSmemBytes = 32896;
 #undef THREADS
 #undef SMEM_TOTAL
 #undef SMEM_V_SMEM_STRIDE

@@ -66,9 +66,10 @@ constexpr int64_t kPackedColumns = kPaddedSequence / 2;
 constexpr int64_t kScaleRows = kBatch * kHeads * kPhysicalBlocks * 16;
 constexpr int64_t kScaleColumns = 32;
 constexpr int64_t kGridX = kBatch * kHeads * kLogicalBlocks;
+constexpr size_t kWanHybridQuantDynamicSmemBytes = 32896;
 
 static_assert(THREADS == 256);
-static_assert(SMEM_TOTAL == 32896);
+static_assert(kWanHybridQuantDynamicSmemBytes == 32896);
 
 void CheckExactTensor(TensorView tensor, const char* name, DLDataType dtype,
                       std::initializer_list<int64_t> shape, int32_t device_id) {
@@ -106,7 +107,8 @@ void QuantizeValue(TensorView value, TensorView base, TensorView residual, Tenso
 
   ffi::CUDADeviceGuard device_guard(device_id);
   const cudaStream_t stream = get_stream(value.device());
-  kernel_wan_hybrid_quantize_value<<<dim3(kGridX, 1, 1), dim3(THREADS, 1, 1), SMEM_TOTAL, stream>>>(
+  kernel_wan_hybrid_quantize_value<<<dim3(kGridX, 1, 1), dim3(THREADS, 1, 1),
+                                     kWanHybridQuantDynamicSmemBytes, stream>>>(
       static_cast<__nv_bfloat16*>(value.data_ptr()),
       static_cast<wan_hybrid_generated_uint8_t*>(base.data_ptr()),
       static_cast<wan_hybrid_generated_uint8_t*>(residual.data_ptr()),
