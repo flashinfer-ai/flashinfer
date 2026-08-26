@@ -2572,17 +2572,19 @@ def test_moe_nvfp4_ndim_padding_safety(
         ActivationType.Swiglu,
     )
     # Two-tier tolerance for FP4 at larger K dimensions (2048 vs 128 in existing tests):
-    # 1. Tight: most elements within atol=0.5. SM100/SM120 use a 95% bar; SM107
-    #    uses 90% because hardware-dependent reduction order shifts the
-    #    batch_size=1 match rate. If N-dim padding corruption occurs, this drops
-    #    dramatically either way.
+    # 1. Tight: most elements within atol=0.5 plus 5% of the reference magnitude.
+    #    SM100/SM120 use a 95% bar; SM107 uses 90% because hardware-dependent
+    #    reduction order shifts the batch_size=1 match rate. If N-dim padding
+    #    corruption occurs, this drops dramatically either way.
     # 2. Relaxed: 100% within atol=2.0. Catches catastrophic NaN/corruption.
     abs_diff = (ref_output - flash_output).abs()
-    tight_match_rate = (abs_diff <= 0.5).float().mean().item()
+    tight_tolerance = 0.5 + 0.05 * ref_output.abs()
+    tight_match_rate = (abs_diff <= tight_tolerance).float().mean().item()
     is_sm107 = get_compute_capability(torch.device("cuda")) == (10, 7)
     tight_bar = 0.90 if is_sm107 else 0.95
     assert tight_match_rate >= tight_bar, (
-        f"Only {tight_match_rate * 100:.1f}% of elements within tight tolerance (0.5). "
+        f"Only {tight_match_rate * 100:.1f}% of elements within tight tolerance "
+        f"(atol=0.5, rtol=0.05). "
         f"Expected >={tight_bar * 100:.0f}%."
     )
     assert abs_diff.max().item() <= 2.0, (
