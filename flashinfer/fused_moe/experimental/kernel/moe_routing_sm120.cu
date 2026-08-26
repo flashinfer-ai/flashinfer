@@ -88,17 +88,17 @@ namespace {
 #define BLOCK_M 8
 #define MAXM 32 /* descriptor: M*TOPK assignments must fit one CTA */
 
-#define PT_R 256                /* router GEMV threads per CTA          */
-#define RWARPS (PT_R / 32)      /* = 8, warps that split one HID row     */
-#define RCHUNK 8                /* tokens whose GEMV is kept in flight  */
+#define PT_R 256           /* router GEMV threads per CTA          */
+#define RWARPS (PT_R / 32) /* = 8, warps that split one HID row     */
+#define RCHUNK 8           /* tokens whose GEMV is kept in flight  */
 
-#define PT_D 256                /* descriptor threads (>= MAXM * TOPK)  */
+#define PT_D 256 /* descriptor threads (>= MAXM * TOPK)  */
 #define DWARPS (PT_D / 32)
 
-#define PT_F 64                            /* finalize threads per CTA  */
-#define FVEC 8                             /* bf16 per thread (uint4)   */
-#define FSPLIT (HID / (PT_F * FVEC))       /* = 4 CTAs per token        */
-#define FVW (FVEC / 2)                     /* 32-bit words per thread   */
+#define PT_F 64                      /* finalize threads per CTA  */
+#define FVEC 8                       /* bf16 per thread (uint4)   */
+#define FSPLIT (HID / (PT_F * FVEC)) /* = 4 CTAs per token        */
+#define FVW (FVEC / 2)               /* 32-bit words per thread   */
 
 // --------------------------- bit / memory helpers --------------------------
 static __device__ __forceinline__ float bflo(unsigned int w) {
@@ -246,11 +246,26 @@ static __device__ __noinline__ void topk8(const __nv_bfloat16* __restrict__ row,
   }
   CE(k0, k1)
   CE(k2, k3)
-  CE(k4, k5) CE(k6, k7) CE(k0, k2) CE(k1, k3) CE(k4, k6) CE(k5, k7) CE(k1, k2) CE(k5, k6) CE(k0, k4)
-      CE(k1, k5) CE(k2, k6) CE(k3, k7) CE(k2, k4) CE(k3, k5) CE(k1, k2) CE(k3, k4) CE(k5, k6)
+  CE(k4, k5)
+  CE(k6, k7)
+  CE(k0, k2)
+  CE(k1, k3)
+  CE(k4, k6)
+  CE(k5, k7)
+  CE(k1, k2)
+  CE(k5, k6)
+  CE(k0, k4)
+  CE(k1, k5)
+  CE(k2, k6)
+  CE(k3, k7)
+  CE(k2, k4)
+  CE(k3, k5)
+  CE(k1, k2)
+  CE(k3, k4)
+  CE(k5, k6)
 #undef CE
 
-          unsigned int mysel = 0u;
+  unsigned int mysel = 0u;
   for (int r = 0; r < 8; ++r) {
     const unsigned int best = __reduce_max_sync(0xffffffffu, k0);
     if (lane == r) mysel = best;
@@ -320,8 +335,7 @@ __global__ __launch_bounds__(PT_D) void moe_routing_descriptor(
     __syncthreads();
     if (warp == 0) {
       const int id = (lane < numel) ? s_id[lane] : (0x10000 + lane);
-      const unsigned int act =
-          (numel >= 32) ? 0xffffffffu : (unsigned int)((1u << numel) - 1u);
+      const unsigned int act = (numel >= 32) ? 0xffffffffu : (unsigned int)((1u << numel) - 1u);
       const unsigned int mk = __match_any_sync(0xffffffffu, id) & act;
       const int pos = __popc(mk & ((1u << lane) - 1u));
       const bool first = (lane < numel) && (pos == 0);
@@ -591,8 +605,7 @@ void moe_routing_align_sm120(TensorView topk_ids, TensorView sorted_token_ids,
 
   moe_routing_descriptor<<<1, PT_D, 0, stream>>>(
       nullptr, static_cast<const int*>(topk_ids.data_ptr()), nullptr, nullptr,
-      static_cast<int*>(sorted_token_ids.data_ptr()),
-      static_cast<int*>(expert_ids.data_ptr()),
+      static_cast<int*>(sorted_token_ids.data_ptr()), static_cast<int*>(expert_ids.data_ptr()),
       static_cast<int*>(num_tokens_post_pad.data_ptr()), M);
 
   const cudaError_t status = cudaGetLastError();
@@ -604,11 +617,9 @@ void moe_routing_align_sm120(TensorView topk_ids, TensorView sorted_token_ids,
 // `TensorView` into the global namespace but NOT `Optional`; the csrc files that
 // use it bare get it transitively from a flashinfer header they also include.
 // Relying on that is how this signature failed to compile.
-void moe_routing_finalize_sm120(TensorView expert_out,
-                                ffi::Optional<TensorView> maybe_shared_out,
+void moe_routing_finalize_sm120(TensorView expert_out, ffi::Optional<TensorView> maybe_shared_out,
                                 TensorView topk_weights,
-                                ffi::Optional<TensorView> maybe_shared_gate,
-                                TensorView output) {
+                                ffi::Optional<TensorView> maybe_shared_gate, TensorView output) {
   CHECK_INPUT_AND_TYPE(expert_out, dl_bfloat16);
   CHECK_INPUT_AND_TYPE(topk_weights, dl_float32);
   CHECK_INPUT_AND_TYPE(output, dl_bfloat16);
