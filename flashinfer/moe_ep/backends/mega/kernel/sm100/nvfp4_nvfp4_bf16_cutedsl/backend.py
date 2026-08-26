@@ -303,16 +303,16 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             fe.set_gate_up_clamp(clamp)
         mega = fe._mega
         stream = torch.cuda.current_stream().cuda_stream
-        # IKR and zero-row ranks must retain the full padded launch: every EP
-        # rank physically participates in the persistent kernel even when it
-        # has no local rows, or peers can desynchronize. The full standalone
-        # case uses the same descriptor. Only a nonzero partial standalone
-        # batch binds a sliced live-row descriptor for TopkReduce.
-        launch_num_tokens = (
-            num_tokens
-            if not fe.config.fc2_reduces_topk and 0 < num_tokens < capacity
-            else None
-        )
+        # The persistent EP kernel's shared routing metadata uses a fixed
+        # ``capacity * topk`` rank/expert stride.  Slicing every token-row
+        # descriptor to ``num_tokens`` also changes dispatch_prep's stride,
+        # while receivers still index the capacity-sized workspace.  That
+        # corrupts remote token metadata for any partial batch.  Keep the
+        # capacity descriptor on every rank; stage_inputs masks all tail rows
+        # with topk_idx=-1, so they remain inert.  A future live-row reduction
+        # must narrow only the standalone TopkReduce tail, not the persistent
+        # kernel's communication descriptors.
+        launch_num_tokens = None
         key = (
             id(workspace),
             id(transformed_weights[0][0]),

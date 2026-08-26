@@ -401,6 +401,7 @@ def _run_mega_layer(
     in_kernel_fc2_reduce: bool = False,
     combine_dtype: str = "bf16",
     check_output_view: bool = False,
+    routing=None,
 ):
     import torch
     import torch.distributed as dist
@@ -428,6 +429,14 @@ def _run_mega_layer(
     problem = _mega_problem(
         rank, world_size, num_tokens=num_tokens, max_tokens=max_tokens
     )
+    if routing is not None:
+        topk_ids, topk_weights = routing
+        problem["topk_ids"] = torch.tensor(
+            topk_ids, dtype=torch.int64, device="cuda"
+        )
+        problem["topk_weights"] = torch.tensor(
+            topk_weights, dtype=torch.float32, device="cuda"
+        )
     config_extra = dict(
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         combine_dtype=combine_dtype,
@@ -597,6 +606,35 @@ def test_moe_ep_nvfp4_cutedsl_mega_layer_matches_reference():
     print(
         f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega layer (staged inputs) matches reference"
     )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_blackwell
+def test_moe_ep_nvfp4_cutedsl_mega_layer_partial_batch_routing_stride():
+    """EP4 partial batch keeps capacity-strided routing metadata bit-exact."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size != 4:
+        pytest.skip("needs exactly 4 ranks")
+    routing = (
+        ((0, 2, 4, 6), (3, 5, 7, 1), (4, 6, 0, 2), (7, 1, 3, 5)),
+        (
+            (0.1, 0.2, 0.3, 0.4),
+            (0.4, 0.1, 0.2, 0.3),
+            (0.3, 0.4, 0.1, 0.2),
+            (0.2, 0.3, 0.4, 0.1),
+        ),
+    )
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        num_tokens=4,
+        max_tokens=64,
+        check_output_view=True,
+        routing=routing,
+    )
+    print(f"rank {rank}: partial-batch capacity-strided routing matches reference")
 
 
 @pytest.mark.gpu_4

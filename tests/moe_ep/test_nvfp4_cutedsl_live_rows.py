@@ -174,7 +174,7 @@ def test_live_token_extents_share_one_dynamic_cutedsl_signature():
     )
 
 
-def test_backend_thunk_cache_separates_live_extents(monkeypatch):
+def test_backend_thunk_cache_preserves_capacity_extent(monkeypatch):
     from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.backend import (
         Nvfp4CutedslMegaKernelBackend,
     )
@@ -253,8 +253,12 @@ def test_backend_thunk_cache_separates_live_extents(monkeypatch):
     )
     assert backend.compute(workspace, transformed_weights, output=full_c) is full_c
 
-    assert frontend.builds == [None, 3, None]
-    assert frontend.launches == [None, None, None, 3, 3, None]
+    # The EP communication workspace is indexed with capacity*topk strides.
+    # Partial output rows are copied back to the caller, but the persistent
+    # kernel must retain capacity-sized descriptors so sender and receiver use
+    # the same metadata addresses on every rank.
+    assert frontend.builds == [None]
+    assert frontend.launches == [None, None, None, None, None, None]
     torch.testing.assert_close(partial_a, out_buf[:3])
     torch.testing.assert_close(full_c, out_buf)
 
