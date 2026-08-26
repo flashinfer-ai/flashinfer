@@ -114,9 +114,7 @@ def test_callable_provenance_fails_without_source(monkeypatch) -> None:
         benchmark._callable_provenance("provider-dist", provider)
 
 
-def test_production_fa4_provenance_records_sglang_route(
-    tmp_path, monkeypatch
-) -> None:
+def test_production_fa4_provenance_records_sglang_route(tmp_path, monkeypatch) -> None:
     source = tmp_path / "interface.py"
     source.write_text("def provider():\n    return None\n", encoding="utf-8")
     module = types.ModuleType("flash_attn.cute.interface")
