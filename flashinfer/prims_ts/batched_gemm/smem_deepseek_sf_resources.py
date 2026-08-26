@@ -87,6 +87,9 @@ class SmemDeepSeekSfAbResource(MemoryResource):
     t2r_output_call_idx: Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
+    t2r_dequant_scale: Constexpr[TaskLocalVariable] = (
+        TaskLocalVariable.uninitialized()
+    )
     _alloc_dsfp8_sf: Constexpr[Optional[SmemAllocation]] = None
 
     def __post_init__(self):
@@ -111,6 +114,11 @@ class SmemDeepSeekSfAbResource(MemoryResource):
             dtype=Int32,
             default=Int32(0),
             docs="Logical epilogue output subtile index.",
+        )
+        self.t2r_dequant_scale = TaskLocalVariable(
+            dtype=cutlass.Float32,
+            default_factory=self._t2r_rmem_default,
+            docs="Per-register DeepSeek FP8 dequantization scale.",
         )
         if self.total_num_padded_tokens_tensor is not None:
             self.gTotalNumPaddedTokens = cutlass.make_array_view(
@@ -354,7 +362,9 @@ class SmemDeepSeekSfAbResource(MemoryResource):
         self.dsfp8_last_act_stage_ptr = act_ptr
         self.dsfp8_last_wt_stage_ptr = wt_ptr
 
-    @consumer_work(returns=(t2r_rmem, t2r_rmem_1, t2r_output_call_idx))
+    @consumer_work(
+        returns=(t2r_rmem, t2r_rmem_1, t2r_output_call_idx, t2r_dequant_scale)
+    )
     @cute.jit
     def apply_dequant_to_t2r(
         self,
@@ -364,11 +374,12 @@ class SmemDeepSeekSfAbResource(MemoryResource):
         t2r_rmem_1,
         t2r_output_call_idx,
     ):
-        """Apply the cached DS-FP8 scale stage to a T2R fragment.
+        """Attach the cached DS-FP8 scales to a T2R fragment.
 
-        DeepSeek FP8 drains one TMEM partial per K tile, applies the matching
-        activation and weight scale-factor block, accumulates the scaled result
-        in RMEM, and stores only on the last K iteration.
+        The separate accumulation work hook consumes the returned fragment and
+        scale vector. Keeping the loop-carried accumulator update in that hook
+        preserves the task scheduler's SSA boundary while still lowering the
+        arithmetic to packed FFMA2 instructions.
         """
         act_smem = cutlass.Array(
             self.dsfp8_last_act_stage_ptr,
@@ -400,23 +411,26 @@ class SmemDeepSeekSfAbResource(MemoryResource):
                 n_subtile_offset = t2r_output_call_idx * Int32(self.cfg.epi_tile_n)
             base_tmem_col = (lane_id % Int32(4)) * Int32(2)
 
-            vals0 = [Float32(0.0)] * (max(1, self.cfg.epi_tile_n // 8) * 4)
-            vals1 = [Float32(0.0)] * (max(1, self.cfg.epi_tile_n // 8) * 4)
+            dequant_scales = [Float32(0.0)] * (
+                max(1, self.cfg.epi_tile_n // 8) * 4
+            )
             for group in cutlass.range_constexpr(max(1, self.cfg.epi_tile_n // 8)):
+                reg_base = group * 4
                 col_off = Int32(group * 8)
-                for col_sub in cutlass.range_constexpr(2):
-                    reg0 = group * 4 + col_sub
-                    reg1 = group * 4 + 2 + col_sub
-                    sf_col = n_subtile_offset + base_tmem_col + col_off + Int32(col_sub)
-                    dq_ab = act_smem.load(idx=sf_col, vector_size=1)[0] * dq_w
-                    vals0[reg0] = t2r_rmem[reg0] * dq_ab
-                    vals0[reg1] = t2r_rmem[reg1] * dq_ab
-                    vals1[reg0] = t2r_rmem_1[reg0] * dq_ab
-                    vals1[reg1] = t2r_rmem_1[reg1] * dq_ab
+                sf_col = n_subtile_offset + base_tmem_col + col_off
+                dq_ab0 = act_smem.load(idx=sf_col, vector_size=1)[0] * dq_w
+                dq_ab1 = act_smem.load(idx=sf_col + Int32(1), vector_size=1)[0] * dq_w
+                dequant_scales[reg_base] = dq_ab0
+                dequant_scales[reg_base + 1] = dq_ab1
+                dequant_scales[reg_base + 2] = dq_ab0
+                dequant_scales[reg_base + 3] = dq_ab1
             return (
-                cutlass.Vector.from_elements(tuple(vals0), dtype=cutlass.Float32),
-                cutlass.Vector.from_elements(tuple(vals1), dtype=cutlass.Float32),
+                t2r_rmem,
+                t2r_rmem_1,
                 t2r_output_call_idx,
+                cutlass.Vector.from_elements(
+                    tuple(dequant_scales), dtype=cutlass.Float32
+                ),
             )
 
         warp_idx = cute.arch.warp_idx()
@@ -426,9 +440,10 @@ class SmemDeepSeekSfAbResource(MemoryResource):
         row_in_tile = warp_in_epi * Int32(32) + lane_id
         dq_ab = act_smem.load(idx=row_in_tile, vector_size=1)[0] * dq_w
         return (
-            t2r_rmem * cutlass.vector.full_like(t2r_rmem, dq_ab.ir_value()),
+            t2r_rmem,
             t2r_rmem_1,
             t2r_output_call_idx,
+            cutlass.vector.full_like(t2r_rmem, dq_ab.ir_value()),
         )
 
     @consumer_work(returns=(t2r_rmem, t2r_rmem_1, t2r_output_call_idx))
@@ -440,10 +455,58 @@ class SmemDeepSeekSfAbResource(MemoryResource):
         t2r_rmem,
         t2r_rmem_1,
         t2r_output_call_idx,
+        t2r_dequant_scale,
     ):
-        """Add one already-dequantized T2R partial into the tile accumulator."""
-        self.dsfp8_acc_rmem_state = self.dsfp8_acc_rmem_state + t2r_rmem
-        self.dsfp8_acc_rmem_1_state = self.dsfp8_acc_rmem_1_state + t2r_rmem_1
+        """FFMA2 one DS-FP8 T2R partial into the tile accumulator."""
+        if cutlass.const_expr(self.cfg.is_swap_ab):
+            t2r_repx = max(1, self.cfg.epi_tile_n // 8) * 4
+        else:
+            t2r_repx = max(1, self.cfg.epi_tile_n // 4)
+        acc0 = self.dsfp8_acc_rmem_state
+        vals0 = [Float32(0.0)] * t2r_repx
+        for pair in cutlass.range_constexpr(t2r_repx // 2):
+            reg_base = pair * 2
+            vals0[reg_base], vals0[reg_base + 1] = prims.fma_packed_f32x2(
+                (t2r_rmem[reg_base], t2r_rmem[reg_base + 1]),
+                (t2r_dequant_scale[reg_base], t2r_dequant_scale[reg_base + 1]),
+                (acc0[reg_base], acc0[reg_base + 1]),
+                ftz=True,
+                rnd="rn",
+            )
+        if cutlass.const_expr(t2r_repx % 2 != 0):
+            vals0[-1] = (
+                t2r_rmem[-1] * t2r_dequant_scale[-1] + acc0[-1]
+            )
+        self.dsfp8_acc_rmem_state = cutlass.Vector.from_elements(
+            tuple(vals0), dtype=cutlass.Float32
+        )
+
+        if cutlass.const_expr(self.cfg.is_swap_ab):
+            acc1 = self.dsfp8_acc_rmem_1_state
+            vals1 = [Float32(0.0)] * t2r_repx
+            for pair in cutlass.range_constexpr(t2r_repx // 2):
+                reg_base = pair * 2
+                vals1[reg_base], vals1[reg_base + 1] = prims.fma_packed_f32x2(
+                    (t2r_rmem_1[reg_base], t2r_rmem_1[reg_base + 1]),
+                    (
+                        t2r_dequant_scale[reg_base],
+                        t2r_dequant_scale[reg_base + 1],
+                    ),
+                    (acc1[reg_base], acc1[reg_base + 1]),
+                    ftz=True,
+                    rnd="rn",
+                )
+            if cutlass.const_expr(t2r_repx % 2 != 0):
+                vals1[-1] = (
+                    t2r_rmem_1[-1] * t2r_dequant_scale[-1] + acc1[-1]
+                )
+            self.dsfp8_acc_rmem_1_state = cutlass.Vector.from_elements(
+                tuple(vals1), dtype=cutlass.Float32
+            )
+        else:
+            self.dsfp8_acc_rmem_1_state = (
+                self.dsfp8_acc_rmem_1_state + t2r_rmem_1
+            )
         return (
             self.dsfp8_acc_rmem_state,
             self.dsfp8_acc_rmem_1_state,

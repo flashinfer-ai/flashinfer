@@ -1439,6 +1439,7 @@ def create_epilogue_task_dsfp8(
                     t2r_rmem=scaled_tok[0],
                     t2r_rmem_1=scaled_tok[1],
                     t2r_output_call_idx=scaled_tok[2],
+                    t2r_dequant_scale=scaled_tok[3],
                 )
                 sf.release()
                 with d.last_iter():
