@@ -149,6 +149,44 @@ def test_rejects_jit_args():
         _make_wrapper("prims-ts", jit_args=[1])
 
 
+def test_plan_trace_captures_explicit_causal_mode():
+    """The plan trace includes kwargs passed through compatibility API."""
+
+    plan_trace = flashinfer.BatchDecodeWithPagedKVCacheWrapper.plan.fi_trace
+    indptr, indices, last_page_len, *_ = _plan_args([2, 3], "cpu")
+    definition = plan_trace(
+        indptr=indptr,
+        indices=indices,
+        last_page_len=last_page_len,
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        page_size=PAGE_SIZE,
+        kwargs={"q_len_per_req": 4, "is_causal": False},
+    )
+
+    assert definition["op_type"] == "gqa_paged_plan"
+    assert definition["inputs"]["q_len_per_req"]["optional"] is True
+    assert definition["inputs"]["is_causal"] == {
+        "shape": None,
+        "dtype": "bool",
+        "optional": True,
+        "description": "Whether the planned attention mask is causal.",
+    }
+
+
+@requires_cuda
+def test_workspace_size_rejects_prims_ts():
+    wrapper = _make_wrapper("prims-ts")
+    with pytest.raises(NotImplementedError, match="prims-ts"):
+        wrapper.workspace_size(
+            *_plan_args([2, 3], "cuda"),
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            q_len_per_req=4,
+        )
+
+
 @requires_cuda
 def test_rejects_logits_soft_cap():
     wrapper = _make_wrapper("prims-ts")

@@ -25,6 +25,7 @@ import torch
 from .api_logging import flashinfer_api
 from .trace.templates.attention import (
     gqa_paged_decode_trace,
+    gqa_paged_decode_plan_trace,
     single_decode_with_kv_cache_trace,
     trtllm_batch_decode_trace_dispatch,
     xqa_batch_decode_trace,
@@ -1131,6 +1132,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._float_workspace_buffer, "float_workspace_buffer"
         )
         del block_tables, rope_scale, rope_theta, sm_scale
+        backend = self._backend
+        if backend == "prims-ts":
+            raise NotImplementedError(
+                f"workspace_size is not available for decode backend {backend!r}"
+            )
         batch_size = len(last_page_len)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -1183,7 +1189,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     "would attend to an empty KV range."
                 )
 
-        backend = self._backend
         if backend in ("cute-dsl", "trtllm-gen"):
             raise NotImplementedError(
                 f"workspace_size is not available for decode backend {backend!r}"
@@ -1290,7 +1295,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         float_workspace_size, int_workspace_size = module.workspace_size(*args)
         return int(float_workspace_size), int(int_workspace_size)
 
-    @flashinfer_api
+    @flashinfer_api(trace=gqa_paged_decode_plan_trace)
     def plan(
         self,
         indptr: torch.Tensor,
