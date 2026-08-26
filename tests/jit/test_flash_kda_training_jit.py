@@ -124,7 +124,7 @@ def test_training_forward_frozen_specialization_contract():
     paired_binding = (csrc_dir / "flashkda_training_paired_binding.cu").read_text()
     assert "STORE_BETA_ACTIVE 1" in c16
     assert "G_INPUT_BF16 1" in c16
-    assert "STORE_FINAL_STATE 0" in c16
+    assert "STORE_FINAL_STATE 1" in c16
     assert "#define validate_outputs 0" in c16
     assert "USE_INITIAL_STATE 1" in final_state
     assert "STORE_FINAL_STATE 1" in final_state
