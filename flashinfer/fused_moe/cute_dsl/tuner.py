@@ -694,6 +694,20 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
                 if not gated:
                     return False
 
+                # Those kernels are also built on ``cutlass.utils.rubin_helpers``,
+                # which only exists from CuTe DSL 4.8. The ``.rubin`` package
+                # imports them eagerly, so on an older DSL the import below raises
+                # ModuleNotFoundError instead of merely declining the tactic.
+                #
+                # Imported inside the function because ``cute_dsl/utils`` pulls in
+                # cutlass at module scope and this module deliberately does not.
+                # Once the probes live in a cutlass-free module this can move to
+                # module scope and import from there instead.
+                from ...cute_dsl.utils import is_rubin_cute_dsl_available
+
+                if not is_rubin_cute_dsl_available():
+                    return False
+
                 from .rubin import (
                     Sm107BlockScaledContiguousGatherGroupedGemmSwigluFusionKernel,
                     Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
