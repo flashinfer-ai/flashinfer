@@ -24,8 +24,10 @@ support for recurrent KDA prefill.  The stable public dispatcher remains in
 """
 
 import functools
+import heapq
 import math
 import threading
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Optional
 
 import torch
@@ -77,9 +79,32 @@ _FLASH_KDA_H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQUENCE_LENGTH = 128
 _FLASH_KDA_ROUTE_DIRECT_M128 = "direct_m128"
 _FLASH_KDA_ROUTE_DIRECT_M128_N16 = "direct_m128_n16"
 _FLASH_KDA_ROUTE_PERSISTENT_M128 = "persistent_m128"
+_FLASH_KDA_ROUTE_PIECE_PERSISTENT_M128 = "piece_persistent_m128"
 _FLASH_KDA_ROUTE_M64 = "independent_dvsplit_m64"
 _FLASH_KDA_ROUTE_SMALL_BH_M128 = "small_bh_owner_helper_m128"
 _FLASH_KDA_ROUTE_BT16_M64 = "bt16_prepare_chain_m64"
+
+# Physical contract for the frozen persistent-M128 schedule. The generated
+# launch reserves an additional aligned control prefix; the roofline uses the
+# schedule's data-pool footprint when resolving resident CTA count.
+_FLASH_KDA_M128_CHUNK = 32
+_FLASH_KDA_PERSISTENT_THREADS_PER_CTA = 1024
+_FLASH_KDA_PERSISTENT_SMEM_POOL_BYTES_PER_CTA = 220_672
+_FLASH_KDA_PERSISTENT_TMEM_COLS_PER_CTA = 256
+_FLASH_KDA_BLACKWELL_MAX_THREADS_PER_SM = 2048
+_FLASH_KDA_BLACKWELL_SMEM_BYTES_PER_SM = 228 * 1024
+_FLASH_KDA_BLACKWELL_TMEM_COLS_PER_SM = 512
+_FLASH_KDA_BLACKWELL_BF16_TFLOPS = 2250.0
+_FLASH_KDA_BLACKWELL_HBM_GBPS = 8000.0
+_FLASH_KDA_PERSISTENT_TENSOR_FLOPS_PER_CHUNK = (
+    3 * 2 * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_M128_CHUNK * _FLASH_KDA_HEAD_DIM
+    + 2 * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_M128_CHUNK * _FLASH_KDA_M128_CHUNK
+)
+_FLASH_KDA_PERSISTENT_STREAM_BYTES_PER_CHUNK = (
+    5 * _FLASH_KDA_M128_CHUNK * _FLASH_KDA_HEAD_DIM * 2 + _FLASH_KDA_M128_CHUNK * 2
+)
+_FLASH_KDA_PERSISTENT_STATE_BYTES = _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM * 2
+_FLASH_KDA_PERSISTENT_TASK_REFILL_CHUNKS = 2
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
 
@@ -92,6 +117,20 @@ _PackedTaskMetadata = tuple[
     tuple[int, ...],
     tuple[int, ...],
 ]
+
+
+@dataclass(frozen=True)
+class _PersistentM128Roofline:
+    """Resolved occupancy and critical-path lower bounds in nanoseconds."""
+
+    resident_ctas_per_sm: int
+    worker_count: int
+    handoff_count: int
+    chunk_ns: float
+    state_transfer_ns: float
+    task_refill_ns: float
+    direct_ns: float
+    piece_ns: float
 
 
 class _RecurrentKDAPrefillWorkspaceBase:
@@ -109,6 +148,8 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._small_bh_packet_ready: Optional[torch.Tensor] = None
         self._small_bh_packet_consumed: Optional[torch.Tensor] = None
         self._small_bh_helper_done: Optional[torch.Tensor] = None
+        self._piece_mid_state: Optional[torch.Tensor] = None
+        self._piece_mid_state_ready: Optional[torch.Tensor] = None
         self._bt16_cu_chunks: Optional[torch.Tensor] = None
         self._bt16_chunk_to_seq: Optional[torch.Tensor] = None
         self._bt16_qd: Optional[torch.Tensor] = None
@@ -139,6 +180,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
                 "m128_n16_checkpoint",
                 "m128_n16_short",
                 "persistent_m128",
+                "piece_persistent_m128",
                 "small_bh_m128",
                 "bt16_prepare",
                 "bt16_prepare_beta_tma",
@@ -616,6 +658,8 @@ def _select_flash_kda_bf16_route(
     num_heads: int,
     uniform_sequences: bool,
     max_sequence_length: int,
+    use_initial_state: bool = True,
+    store_final_state: bool = True,
 ) -> str:
     """Mirror the measured Cake route policy for the frozen BF16 portfolio."""
 
@@ -696,6 +740,17 @@ def _select_flash_kda_bf16_route(
         and 2 * num_heads <= sm_count
     ):
         return _FLASH_KDA_ROUTE_M64
+    if _should_use_uniform_piece_persistent(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        uniform_sequences=uniform_sequences,
+        max_sequence_length=max_sequence_length,
+        use_initial_state=use_initial_state,
+        store_final_state=store_final_state,
+    ):
+        return _FLASH_KDA_ROUTE_PIECE_PERSISTENT_M128
     return direct_route
 
 
@@ -827,6 +882,301 @@ def _lpt_bins_are_balanced(loads: tuple[int, ...]) -> bool:
         max(loads) * _FLASH_KDA_LPT_MAX_IMBALANCE_DENOMINATOR * len(loads)
         <= sum(loads) * _FLASH_KDA_LPT_MAX_IMBALANCE_NUMERATOR
     )
+
+
+@functools.lru_cache(maxsize=64)
+def _make_uniform_piece_task_bins(
+    *,
+    num_sequences: int,
+    num_heads: int,
+    sequence_length: int,
+    worker_count: int,
+) -> tuple[
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[int, ...],
+    int,
+    tuple[int, ...],
+]:
+    """Split quantization-bound uniform chains across persistent CTA bins."""
+
+    total_tasks = num_sequences * num_heads
+    if (
+        num_sequences <= 0
+        or num_heads <= 0
+        or sequence_length <= 0
+        or worker_count <= 0
+        or worker_count > total_tasks
+    ):
+        raise ValueError("uniform piece bins require positive resolved work")
+
+    chunk_count = (sequence_length + _FLASH_KDA_M128_CHUNK - 1) // _FLASH_KDA_M128_CHUNK
+    bins: list[list[tuple[int, int, int, int, int]]] = [[] for _ in range(worker_count)]
+    loads = [0] * worker_count
+    for task_idx in range(total_tasks):
+        worker_idx = min(
+            range(worker_count),
+            key=lambda index: (loads[index], index),
+        )
+        bins[worker_idx].append((task_idx, 0, sequence_length, -1, -1))
+        loads[worker_idx] += chunk_count
+
+    base_tasks, extra_tasks = divmod(total_tasks, worker_count)
+    piece_count = (
+        min(base_tasks, worker_count // extra_tasks, chunk_count) if extra_tasks else 1
+    )
+    if piece_count >= 2:
+        peak_load = (base_tasks + 1) * chunk_count
+        peak_slots = [
+            worker_idx for worker_idx, load in enumerate(loads) if load == peak_load
+        ]
+        if len(peak_slots) != extra_tasks:
+            raise RuntimeError("uniform LPT peak count did not match task remainder")
+        overflow_tasks = []
+        for worker_idx in peak_slots:
+            task = bins[worker_idx].pop()
+            loads[worker_idx] -= chunk_count
+            overflow_tasks.append(task[0])
+
+        handoff_count = 0
+        chunk_base = chunk_count // piece_count
+        chunk_remainder = chunk_count % piece_count
+        chunk_cuts = [0]
+        for piece_idx in range(piece_count):
+            # Put longer pieces last so every dependency gets at least the
+            # preceding whole-chain interval of scheduling slack.
+            piece_chunks = chunk_base + int(piece_idx >= piece_count - chunk_remainder)
+            chunk_cuts.append(chunk_cuts[-1] + piece_chunks)
+
+        for overflow_idx, task_idx in enumerate(overflow_tasks):
+            handoffs = tuple(range(handoff_count, handoff_count + piece_count - 1))
+            handoff_count += piece_count - 1
+            for piece_idx in range(piece_count):
+                chunk_start = chunk_cuts[piece_idx]
+                chunk_end = chunk_cuts[piece_idx + 1]
+                token_start = chunk_start * _FLASH_KDA_M128_CHUNK
+                token_end = min(sequence_length, chunk_end * _FLASH_KDA_M128_CHUNK)
+                source = -1 if piece_idx == 0 else handoffs[piece_idx - 1]
+                destination = (
+                    -1 if piece_idx + 1 == piece_count else handoffs[piece_idx]
+                )
+                worker_idx = piece_idx * extra_tasks + overflow_idx
+                insert_at = min(1 + piece_idx, len(bins[worker_idx]))
+                bins[worker_idx].insert(
+                    insert_at,
+                    (
+                        task_idx,
+                        token_start,
+                        token_end - token_start,
+                        source,
+                        destination,
+                    ),
+                )
+                loads[worker_idx] += chunk_end - chunk_start
+    else:
+        handoff_count = 0
+
+    task_ids: list[int] = []
+    task_token_starts: list[int] = []
+    task_token_counts: list[int] = []
+    task_state_sources: list[int] = []
+    task_state_destinations: list[int] = []
+    task_offsets = [0]
+    for worker_tasks in bins:
+        for task_idx, token_start, token_count, source, destination in worker_tasks:
+            task_ids.append(task_idx)
+            task_token_starts.append(token_start)
+            task_token_counts.append(token_count)
+            task_state_sources.append(source)
+            task_state_destinations.append(destination)
+        task_offsets.append(len(task_ids))
+    return (
+        tuple(task_ids),
+        tuple(task_offsets),
+        tuple(task_token_starts),
+        tuple(task_token_counts),
+        tuple(task_state_sources),
+        tuple(task_state_destinations),
+        handoff_count,
+        tuple(loads),
+    )
+
+
+@functools.lru_cache(maxsize=64)
+def _persistent_m128_roofline(
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+    num_sequences: int,
+    num_heads: int,
+    sequence_length: int,
+    use_initial_state: bool,
+    store_final_state: bool,
+) -> Optional[_PersistentM128Roofline]:
+    """Compare direct and recurrence-piece persistent critical paths."""
+
+    if compute_capability not in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES:
+        return None
+    if sm_count not in (148, 152):
+        return None
+    if num_sequences <= 0 or num_heads <= 0 or sequence_length <= 0:
+        raise ValueError("persistent-M128 roofline requires resolved positive extents")
+
+    resident_ctas_per_sm = min(
+        _FLASH_KDA_BLACKWELL_MAX_THREADS_PER_SM
+        // _FLASH_KDA_PERSISTENT_THREADS_PER_CTA,
+        _FLASH_KDA_BLACKWELL_SMEM_BYTES_PER_SM
+        // _FLASH_KDA_PERSISTENT_SMEM_POOL_BYTES_PER_CTA,
+        _FLASH_KDA_BLACKWELL_TMEM_COLS_PER_SM
+        // _FLASH_KDA_PERSISTENT_TMEM_COLS_PER_CTA,
+    )
+    if resident_ctas_per_sm <= 0:
+        raise RuntimeError(
+            "persistent-M128 schedule is not resident on the selected device"
+        )
+    worker_count = sm_count * resident_ctas_per_sm
+    total_tasks = num_sequences * num_heads
+    if total_tasks <= worker_count:
+        return None
+
+    (
+        _task_ids,
+        task_offsets,
+        _token_starts,
+        token_counts,
+        state_sources,
+        state_destinations,
+        handoff_count,
+        _loads,
+    ) = _make_uniform_piece_task_bins(
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        sequence_length=sequence_length,
+        worker_count=worker_count,
+    )
+    if handoff_count == 0:
+        return None
+
+    worker_flops_per_ns = _FLASH_KDA_BLACKWELL_BF16_TFLOPS * 1_000.0 / worker_count
+    worker_bytes_per_ns = _FLASH_KDA_BLACKWELL_HBM_GBPS / worker_count
+    chunk_ns = max(
+        _FLASH_KDA_PERSISTENT_TENSOR_FLOPS_PER_CHUNK / worker_flops_per_ns,
+        _FLASH_KDA_PERSISTENT_STREAM_BYTES_PER_CHUNK / worker_bytes_per_ns,
+    )
+    state_transfer_ns = _FLASH_KDA_PERSISTENT_STATE_BYTES / worker_bytes_per_ns
+    task_refill_ns = _FLASH_KDA_PERSISTENT_TASK_REFILL_CHUNKS * chunk_ns
+    chunks_per_task = (
+        sequence_length + _FLASH_KDA_M128_CHUNK - 1
+    ) // _FLASH_KDA_M128_CHUNK
+    direct_task_ns = chunks_per_task * chunk_ns
+    if use_initial_state:
+        direct_task_ns += state_transfer_ns
+    if store_final_state:
+        direct_task_ns += state_transfer_ns
+    direct_ns = ((total_tasks + worker_count - 1) // worker_count) * direct_task_ns
+
+    entry_count = len(token_counts)
+    edges: list[set[int]] = [set() for _ in range(entry_count)]
+    indegree = [0] * entry_count
+
+    def add_edge(source: int, destination: int) -> None:
+        if destination not in edges[source]:
+            edges[source].add(destination)
+            indegree[destination] += 1
+
+    for worker_idx in range(worker_count):
+        begin = task_offsets[worker_idx]
+        end = task_offsets[worker_idx + 1]
+        for entry_idx in range(begin + 1, end):
+            add_edge(entry_idx - 1, entry_idx)
+    handoff_producers = {
+        destination: entry_idx
+        for entry_idx, destination in enumerate(state_destinations)
+        if destination >= 0
+    }
+    if len(handoff_producers) != handoff_count:
+        raise RuntimeError("piece roofline did not resolve every handoff producer")
+    for entry_idx, source in enumerate(state_sources):
+        if source >= 0:
+            try:
+                producer = handoff_producers[source]
+            except KeyError as exc:
+                raise RuntimeError(
+                    f"piece roofline did not resolve handoff source {source}"
+                ) from exc
+            add_edge(producer, entry_idx)
+
+    ready = [entry_idx for entry_idx, degree in enumerate(indegree) if degree == 0]
+    heapq.heapify(ready)
+    worker_first_entries = frozenset(task_offsets[:-1])
+    earliest_start = [0.0] * entry_count
+    finish = [0.0] * entry_count
+    visited = 0
+    while ready:
+        entry_idx = heapq.heappop(ready)
+        duration = (
+            (token_counts[entry_idx] + _FLASH_KDA_M128_CHUNK - 1)
+            // _FLASH_KDA_M128_CHUNK
+            * chunk_ns
+        )
+        if entry_idx not in worker_first_entries:
+            duration += task_refill_ns
+        if state_sources[entry_idx] >= 0 or use_initial_state:
+            duration += state_transfer_ns
+        if state_destinations[entry_idx] >= 0 or store_final_state:
+            duration += state_transfer_ns
+        finish[entry_idx] = earliest_start[entry_idx] + duration
+        visited += 1
+        for successor in edges[entry_idx]:
+            earliest_start[successor] = max(
+                earliest_start[successor], finish[entry_idx]
+            )
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
+                heapq.heappush(ready, successor)
+    if visited != entry_count:
+        raise RuntimeError("piece roofline dependency graph contains a cycle")
+
+    return _PersistentM128Roofline(
+        resident_ctas_per_sm=resident_ctas_per_sm,
+        worker_count=worker_count,
+        handoff_count=handoff_count,
+        chunk_ns=chunk_ns,
+        state_transfer_ns=state_transfer_ns,
+        task_refill_ns=task_refill_ns,
+        direct_ns=direct_ns,
+        piece_ns=max(finish),
+    )
+
+
+def _should_use_uniform_piece_persistent(
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+    num_sequences: int,
+    num_heads: int,
+    uniform_sequences: bool,
+    max_sequence_length: int,
+    use_initial_state: bool = True,
+    store_final_state: bool = True,
+) -> bool:
+    """Select recurrence pieces when their occupancy-aware roofline wins."""
+
+    if not uniform_sequences or max_sequence_length <= 0:
+        return False
+    estimate = _persistent_m128_roofline(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        sequence_length=max_sequence_length,
+        use_initial_state=use_initial_state,
+        store_final_state=store_final_state,
+    )
+    return estimate is not None and estimate.piece_ns < estimate.direct_ns
 
 
 def _persistent_task_plan(
@@ -1256,6 +1606,37 @@ def _small_bh_workspace(
         zero_on_allocate=True,
     )
     return packet_workspace, packet_ready, packet_consumed, helper_done
+
+
+def _piece_persistent_workspace(
+    *,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    device: torch.device,
+    handoff_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if handoff_count <= 0:
+        raise ValueError("piece-persistent workspace requires a positive handoff count")
+    capture_error = (
+        "recurrent_kda piece-persistent workspace is not large enough for "
+        "CUDA graph capture; warm the largest shape on this stream before capture"
+    )
+    mid_state = _workspace_buffer(
+        workspace=workspace,
+        attribute="_piece_mid_state",
+        device=device,
+        numel=handoff_count * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM,
+        capture_error=capture_error,
+    ).view(handoff_count, _FLASH_KDA_HEAD_DIM, _FLASH_KDA_HEAD_DIM)
+    mid_state_ready = _workspace_buffer(
+        workspace=workspace,
+        attribute="_piece_mid_state_ready",
+        device=device,
+        numel=handoff_count,
+        capture_error=capture_error,
+        dtype=torch.uint32,
+        zero_on_allocate=True,
+    )
+    return mid_state, mid_state_ready
 
 
 def _bt16_workspace(
@@ -1847,11 +2228,20 @@ def _run_flash_kda_prefill(
             != num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
         )
     )
-    persistent_candidate = (
+    legacy_persistent_candidate = (
         _uses_measured_sm100_persistent_policy(
             compute_capability=compute_capability,
             sm_count=sm_count,
         )
+        and not needs_direct_m128
+        and prefill_workspace is None
+        and seq_order is None
+        and initial_state is not None
+        and num_heads != 12
+        and num_sequences * num_heads > sm_count
+    )
+    piece_persistent_candidate = (
+        compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
         and not needs_direct_m128
         and prefill_workspace is None
         and seq_order is None
@@ -1892,9 +2282,9 @@ def _run_flash_kda_prefill(
             total_tokens=batch_size * seq_len,
             num_heads=num_heads,
             sm_count=sm_count,
-            build_persistent_plan=persistent_candidate,
+            build_persistent_plan=legacy_persistent_candidate,
         )
-    if fixed_layout and persistent_candidate:
+    if fixed_layout and legacy_persistent_candidate:
         persistent_plan = _persistent_task_plan(
             sequence_lengths,
             num_heads=num_heads,
@@ -1929,7 +2319,17 @@ def _run_flash_kda_prefill(
             num_heads=num_heads,
             uniform_sequences=uniform_sequences,
             max_sequence_length=max_sequence_length,
+            use_initial_state=initial_state is not None,
+            store_final_state=initial_state is not None or output_final_state,
         )
+        if (
+            route == _FLASH_KDA_ROUTE_PIECE_PERSISTENT_M128
+            and not piece_persistent_candidate
+        ):
+            route = _direct_m128_route(
+                num_heads=num_heads,
+                max_sequence_length=max_sequence_length,
+            )
     use_bt16 = route == _FLASH_KDA_ROUTE_BT16_M64
     use_tensor_state_decay = (
         state_indices is None
@@ -1961,6 +2361,7 @@ def _run_flash_kda_prefill(
         "m128_n16_checkpoint",
         "m128_n16_short",
         "persistent_m128",
+        "piece_persistent_m128",
         "small_bh_m128",
     ]
     if use_bt16:
@@ -1971,6 +2372,8 @@ def _run_flash_kda_prefill(
         variant = "small_bh_m128"
     elif use_tensor_state_decay:
         variant = "m128_tensor_state_decay"
+    elif route == _FLASH_KDA_ROUTE_PIECE_PERSISTENT_M128:
+        variant = "piece_persistent_m128"
     elif persistent_plan is not None:
         variant = "persistent_m128"
     elif route == _FLASH_KDA_ROUTE_DIRECT_M128_N16:
@@ -1992,6 +2395,31 @@ def _run_flash_kda_prefill(
         variant = "m128"
     if checkpoint_every_n_tokens and variant == "m128_n16":
         variant = "m128_n16_checkpoint"
+    piece_plan = None
+    if variant == "piece_persistent_m128":
+        piece_roofline = _persistent_m128_roofline(
+            compute_capability=compute_capability,
+            sm_count=sm_count,
+            num_sequences=num_sequences,
+            num_heads=num_heads,
+            sequence_length=max_sequence_length,
+            use_initial_state=initial_state is not None,
+            store_final_state=initial_state is not None or output_final_state,
+        )
+        if (
+            piece_roofline is None
+            or piece_roofline.piece_ns >= piece_roofline.direct_ns
+        ):
+            raise RuntimeError(
+                "piece-persistent route selected without a resolved roofline advantage"
+            )
+        piece_plan = _make_uniform_piece_task_bins(
+            num_sequences=num_sequences,
+            num_heads=num_heads,
+            sequence_length=max_sequence_length,
+            worker_count=piece_roofline.worker_count,
+        )
+        persistent_plan = None
     persistent_task_ids = None
     persistent_task_offsets = None
     if persistent_plan is None:
@@ -2024,6 +2452,52 @@ def _run_flash_kda_prefill(
             device=q.device,
             kind="persistent_task_offsets",
             values=task_offsets,
+        )
+    piece_task_token_starts = None
+    piece_task_token_counts = None
+    piece_task_state_sources = None
+    piece_task_state_destinations = None
+    piece_handoff_count = 0
+    if piece_plan is not None:
+        (
+            task_ids,
+            task_offsets,
+            token_starts,
+            token_counts,
+            state_sources,
+            state_destinations,
+            piece_handoff_count,
+            _piece_loads,
+        ) = piece_plan
+        persistent_task_ids = _cached_int32_metadata(
+            device=q.device,
+            kind="piece_persistent_task_ids",
+            values=task_ids,
+        )
+        persistent_task_offsets = _cached_int32_metadata(
+            device=q.device,
+            kind="piece_persistent_task_offsets",
+            values=task_offsets,
+        )
+        piece_task_token_starts = _cached_int32_metadata(
+            device=q.device,
+            kind="piece_persistent_task_token_starts",
+            values=token_starts,
+        )
+        piece_task_token_counts = _cached_int32_metadata(
+            device=q.device,
+            kind="piece_persistent_task_token_counts",
+            values=token_counts,
+        )
+        piece_task_state_sources = _cached_int32_metadata(
+            device=q.device,
+            kind="piece_persistent_task_state_sources",
+            values=state_sources,
+        )
+        piece_task_state_destinations = _cached_int32_metadata(
+            device=q.device,
+            kind="piece_persistent_task_state_destinations",
+            values=state_destinations,
         )
     dummy_state = _dummy_bf16(q.device)
     dummy_i32 = _dummy_i32(q.device) if variant != "m64" else None
@@ -2132,6 +2606,8 @@ def _run_flash_kda_prefill(
         packet_ready = None
         packet_consumed = None
         helper_done = None
+        piece_mid_state = None
+        piece_mid_state_ready = None
         if variant == "small_bh_m128":
             (
                 packet_workspace,
@@ -2142,6 +2618,12 @@ def _run_flash_kda_prefill(
                 workspace=workspace,
                 device=q.device,
                 total_tasks=num_sequences * num_heads,
+            )
+        elif variant == "piece_persistent_m128":
+            piece_mid_state, piece_mid_state_ready = _piece_persistent_workspace(
+                workspace=workspace,
+                device=q.device,
+                handoff_count=piece_handoff_count,
             )
         if initial_state is None and output_final_state and explicit_workspace:
             final_state_arg = _state_scratch(
@@ -2281,6 +2763,46 @@ def _run_flash_kda_prefill(
                     seq_order_i32,
                     persistent_task_ids,
                     persistent_task_offsets,
+                    initial_state_arg,
+                    out_buf,
+                    final_state_arg,
+                    descriptor_storage,
+                    prepare_descriptors,
+                    num_heads,
+                    int(use_initial_state),
+                    int(store_final_state),
+                    scale_value,
+                    float(lower_bound),
+                    stream_ptr,
+                )
+            elif variant == "piece_persistent_m128":
+                assert persistent_task_ids is not None
+                assert persistent_task_offsets is not None
+                assert piece_task_token_starts is not None
+                assert piece_task_token_counts is not None
+                assert piece_task_state_sources is not None
+                assert piece_task_state_destinations is not None
+                assert piece_mid_state is not None
+                assert piece_mid_state_ready is not None
+                module.run(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    beta_tma,
+                    A_log,
+                    dt_bias,
+                    cu_seqlens_i64,
+                    seq_order_i32,
+                    persistent_task_ids,
+                    persistent_task_offsets,
+                    piece_task_token_starts,
+                    piece_task_token_counts,
+                    piece_task_state_sources,
+                    piece_task_state_destinations,
+                    piece_mid_state,
+                    piece_mid_state_ready,
                     initial_state_arg,
                     out_buf,
                     final_state_arg,
