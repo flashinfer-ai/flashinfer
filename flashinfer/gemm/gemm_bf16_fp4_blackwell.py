@@ -69,6 +69,11 @@ def _prepare_blackwell_bf16_fp4(
     backend: BlackwellBf16Fp4Backend,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Prepare one of the two explicit source-kernel tensor layouts."""
+    if block_size != 16:
+        raise ValueError(
+            f"source-built BF16 x FP4 preparation requires block_size=16; "
+            f"got {block_size}"
+        )
     _require_blackwell_source_arch(b.device)
     if b.device != b_descale.device:
         raise ValueError(

@@ -153,9 +153,21 @@ SMOKE_MNK = (16, 1024, 1024)
 # Source-dispatch boundaries: short-K routes, M16/M32/M64 buckets, native N
 # tails, and the K=240/256 cp.async/TMA transition.
 BLACKWELL_BOUNDARY_PROBLEM_SIZES = [
+    ("blackwell-native", 1, 63, 128),
+    ("blackwell-native", 1, 64, 128),
+    ("blackwell-native", 1, 65, 128),
     ("blackwell-native", 1, 64, 16),
+    ("blackwell-native", 1, 64, 32),
+    ("blackwell-native", 1, 64, 48),
     ("blackwell-native", 16, 65, 32),
     ("blackwell-native", 17, 127, 48),
+    ("blackwell-native", 17, 64, 64),
+    ("blackwell-native", 16, 64, 128),
+    ("blackwell-native", 17, 64, 128),
+    ("blackwell-native", 32, 64, 128),
+    ("blackwell-native", 33, 64, 128),
+    ("blackwell-native", 64, 64, 128),
+    ("blackwell-native", 65, 64, 128),
     ("blackwell-native", 32, 129, 240),
     ("blackwell-native", 33, 191, 256),
     ("blackwell-native", 64, 192, 240),
@@ -163,6 +175,13 @@ BLACKWELL_BOUNDARY_PROBLEM_SIZES = [
     ("blackwell-tiled", 1, 64, 16),
     ("blackwell-tiled", 1, 64, 32),
     ("blackwell-tiled", 1, 64, 48),
+    ("blackwell-tiled", 17, 64, 64),
+    ("blackwell-tiled", 16, 64, 128),
+    ("blackwell-tiled", 17, 64, 128),
+    ("blackwell-tiled", 32, 64, 128),
+    ("blackwell-tiled", 33, 64, 128),
+    ("blackwell-tiled", 64, 64, 128),
+    ("blackwell-tiled", 65, 64, 128),
     ("blackwell-tiled", 16, 64, 256),
     ("blackwell-tiled", 17, 64, 256),
     ("blackwell-tiled", 32, 64, 240),
@@ -783,6 +802,21 @@ def test_blackwell_prepare_rejects_k_not_multiple_of_16(backend):
             b_descale,
             None,
             backend=backend,
+        )
+
+
+@pytest.mark.parametrize("backend", BLACKWELL_BACKENDS)
+def test_blackwell_prepare_rejects_non_16_block_size(backend):
+    _skip_if_backend_unavailable(backend)
+    device = torch.device("cuda")
+    b, b_descale, alpha = _make_random_fp4_weights(64, 32, device)
+    with pytest.raises(ValueError, match="requires block_size=16"):
+        prepare_bf16_fp4_weights(
+            b,
+            b_descale,
+            alpha,
+            backend=backend,
+            block_size=8,
         )
 
 
