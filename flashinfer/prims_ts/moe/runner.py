@@ -164,9 +164,7 @@ def _torch_views_of_ffi_tensors(tensors: Any) -> list[torch.Tensor]:
     capsule is one-shot and cannot safely be consumed by repeated runner calls.
     """
     return [
-        tensor
-        if isinstance(tensor, torch.Tensor)
-        else torch.from_dlpack(tensor)
+        tensor if isinstance(tensor, torch.Tensor) else torch.from_dlpack(tensor)
         for tensor in tensors
     ]
 

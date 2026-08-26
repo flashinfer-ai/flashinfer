@@ -1352,9 +1352,9 @@ _pts_moe_w2_bf16 = torch.empty(
     device=device,
 )
 _pts_moe_topk_ids = (
-    torch.arange(
-        _pts_moe_T * _pts_moe_K, dtype=torch.int32, device=device
-    ).reshape(_pts_moe_T, _pts_moe_K)
+    torch.arange(_pts_moe_T * _pts_moe_K, dtype=torch.int32, device=device).reshape(
+        _pts_moe_T, _pts_moe_K
+    )
     % _pts_moe_E
 )
 _pts_moe_topk_weights = torch.full(
@@ -1397,15 +1397,9 @@ flashinfer.prims_ts_bf16_routed_moe.fi_trace(
 _pts_moe_hidden_fp8 = torch.empty(
     _pts_moe_T, _pts_moe_H, dtype=torch.float8_e4m3fn, device=device
 )
-_pts_moe_w1_fp8 = torch.empty_like(
-    _pts_moe_w1_bf16, dtype=torch.float8_e4m3fn
-)
-_pts_moe_w2_fp8 = torch.empty_like(
-    _pts_moe_w2_bf16, dtype=torch.float8_e4m3fn
-)
-_pts_moe_tensor_scales = torch.ones(
-    _pts_moe_E, dtype=torch.float32, device=device
-)
+_pts_moe_w1_fp8 = torch.empty_like(_pts_moe_w1_bf16, dtype=torch.float8_e4m3fn)
+_pts_moe_w2_fp8 = torch.empty_like(_pts_moe_w2_bf16, dtype=torch.float8_e4m3fn)
+_pts_moe_tensor_scales = torch.ones(_pts_moe_E, dtype=torch.float32, device=device)
 flashinfer.prims_ts_fp8_per_tensor_scale_moe.fi_trace(
     routing_logits=_pts_moe_logits,
     routing_bias=_pts_moe_bias,
@@ -1498,9 +1492,7 @@ _pts_moe_gemm1_bias = torch.empty(
 _pts_moe_gemm2_bias = torch.empty(
     _pts_moe_E, _pts_moe_H, dtype=torch.float32, device=device
 )
-_pts_moe_activation_params = torch.ones(
-    _pts_moe_E, dtype=torch.float32, device=device
-)
+_pts_moe_activation_params = torch.ones(_pts_moe_E, dtype=torch.float32, device=device)
 _pts_moe_fp4_common = dict(
     routing_bias=_pts_moe_bias,
     hidden_states=_pts_moe_hidden_fp4,
