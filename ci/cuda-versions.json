@@ -44,8 +44,8 @@
       "label": "cu134",
       "version": "13.4",
       "pytorch_index": "nightly/cu134",
-      "x86_64_arch_list": "7.5 8.0 8.9 9.0a 10.0a 10.3a 10.7a 12.0f",
-      "aarch64_arch_list": "7.5 8.0 8.9 9.0a 10.0a 10.3a 10.7a 11.0a 12.0f 12.1a"
+      "x86_64_arch_list": "8.0 8.9 9.0a 10.0a 10.3a 10.7a 12.0f",
+      "aarch64_arch_list": "8.0 8.9 9.0a 10.0a 10.3a 10.7a 11.0a 12.0f 12.1a"
     }
   ]
 }
