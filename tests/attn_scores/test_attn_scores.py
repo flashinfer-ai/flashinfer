@@ -995,7 +995,12 @@ def test_fp4_next_n4_split_rejects_caller_schedule():
     atoms, so the schedule must describe 2*batch rows.  A schedule built from
     the native context_lens has the right shape and the wrong contents, and the
     freshness check that would notice is opt-in and skipped under CUDA-graph
-    capture -- so this must be an error, not a silent miscompute.
+    capture -- so this must be an error.  Not merely to avoid wrong results:
+    the persistent kernel terminates on exact equality with the schedule's end
+    boundary, and a B-row boundary is unreachable when the kernel iterates
+    2*B rows, so the mismatch HANGS.  Commit 29ca0629 removed the previous
+    caller-side next_n=4 split after hitting exactly this hang, and noted no
+    test covered the combination; this test is that coverage.
     """
     if not is_sm100a_supported(torch.device("cuda")):
         pytest.skip("FP4 paged MQA logits requires SM100a (B200)")

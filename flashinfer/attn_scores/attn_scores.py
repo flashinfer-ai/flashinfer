@@ -626,7 +626,9 @@ def _choose_atom_split(
     return cands[0][2]
 
 
-@functools.cache
+_ATOM_OFFSETS_CACHE: dict = {}
+
+
 def _atom_offsets(num_atoms: int, atom: int, device: torch.device) -> torch.Tensor:
     """Per-atom context-length offsets ``[(num_atoms-1)*atom, ..., 0]``.
 
@@ -635,8 +637,22 @@ def _atom_offsets(num_atoms: int, atom: int, device: torch.device) -> torch.Tens
     microseconds each, so the whole API call is host-launch-bound -- building
     this tensor per call cost more in dispatch overhead than the paged-MQA
     kernel itself takes to run.
+
+    A manual dict rather than ``functools.cache`` so that a CUDA-graph capture
+    can never populate it: a tensor allocated during capture comes from the
+    graph's private memory pool and would dangle once that graph is freed. On a
+    cache miss during capture the offsets are computed (and captured) but not
+    retained; a warmed-up caller hits the cache and the question never arises.
     """
-    return torch.arange(num_atoms - 1, -1, -1, device=device, dtype=torch.int32) * atom
+    key = (num_atoms, atom, device)
+    off = _ATOM_OFFSETS_CACHE.get(key)
+    if off is None:
+        off = (
+            torch.arange(num_atoms - 1, -1, -1, device=device, dtype=torch.int32) * atom
+        )
+        if not torch.cuda.is_current_stream_capturing():
+            _ATOM_OFFSETS_CACHE[key] = off
+    return off
 
 
 def _expand_context_lens(
@@ -1688,17 +1704,22 @@ def fp4_paged_mqa_logits(
             # A split makes the scheduler describe batch*num_atoms rows, but the
             # schedule's shape ([num_sms+1, 2]) is unchanged, so a schedule built
             # from the native context_lens passes every always-on check and is
-            # still wrong. The freshness check that would catch it is opt-in and
-            # skipped under CUDA-graph capture, so it cannot be relied on. Reject
-            # instead: silent wrongness here is exactly why next_n=4 was
-            # previously refused outright.
+            # still wrong. Worse than wrong results: the persistent kernel
+            # terminates on exact equality with the schedule's stored end
+            # boundary, and a boundary describing B rows is unreachable when the
+            # kernel iterates exp_B, so the mismatch HANGS the kernel (this is
+            # what commit 29ca0629 measured when it removed the old caller-side
+            # split). The freshness check that would catch it is opt-in and
+            # skipped under CUDA-graph capture, so it cannot be relied on.
+            # Reject instead.
             raise ValueError(
                 f"fp4_paged_mqa_logits: next_n={next_n} runs as {num_atoms} "
                 f"atoms of {atom} on this device (an atom of 4 needs Rubin "
                 f"SM107+), so the schedule must describe {exp_B} rows rather "
                 f"than {B}. A schedule_meta built from context_lens is silently "
-                f"wrong here. Omit schedule_meta so it is computed correctly, or "
-                f"pass next_n_atom={next_n} on a device that supports it."
+                f"wrong here and can hang the persistent kernel. Omit "
+                f"schedule_meta so it is computed correctly, or pass "
+                f"next_n_atom={next_n} on a device that supports it."
             )
         _validate_schedule_meta(schedule_meta, num_sms, q.device)
         _validate_schedule_meta_fresh(schedule_meta, sched_ctx, "fp4_paged_mqa_logits")
