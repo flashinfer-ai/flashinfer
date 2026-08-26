@@ -696,11 +696,11 @@ def test_fp8_page64_d256_ratio16_all_ranks_and_graph_replay() -> None:
     torch.testing.assert_close(merged_lse, dense_lse, atol=0.1, rtol=0.1)
 
 
-@pytest.mark.parametrize("q_len", (3, 4, 5, 6))
+@pytest.mark.parametrize("q_len", (1, 2, 3, 4, 5, 6, 8))
 def test_fp8_page64_d256_b128_reviewer_all_ranks_and_graph_replay(
     q_len: int,
 ) -> None:
-    """Validate every reviewed B128/q3-q6 CP4 split1 CUDA Graph route."""
+    """Validate every admitted B128 D256 CP4 split1 CUDA Graph route."""
 
     _require_blackwell_dcp()
     batch_size = 128
