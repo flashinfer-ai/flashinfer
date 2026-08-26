@@ -56,7 +56,7 @@ def get_current_arch() -> str:
     sm_100f), return the family base ('sm_100') so capacity lookups and
     kernel configuration use family-portable values."""
     major, minor = get_compute_capability(torch.device("cuda"))
-    from ..utils import is_cute_dsl_arch_supported
+    from ..availability import is_cute_dsl_arch_supported
 
     if not is_cute_dsl_arch_supported(
         major, minor, native_only=True

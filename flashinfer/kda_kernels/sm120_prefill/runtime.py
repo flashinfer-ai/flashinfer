@@ -163,7 +163,7 @@ def sm120a_available(device: torch.device | None = None) -> bool:
     try:
         if _capability(device) != SM120_CAPABILITY:
             return False
-        from ...cute_dsl.utils import is_cute_dsl_arch_supported
+        from ...cute_dsl.availability import is_cute_dsl_arch_supported
         from ...utils import is_sm120a_supported
 
         if not is_sm120a_supported(

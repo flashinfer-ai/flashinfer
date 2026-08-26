@@ -444,7 +444,7 @@ def _tgv_gemm_requirement(
     # nvidia-cutlass-dsl. Surface a clear error here when cute_ext is the
     # active path and the dependency is missing.
     if not _TGV_DEBUG_USE_CPP:
-        from flashinfer.cute_dsl.utils import is_cute_dsl_available
+        from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
         if not is_cute_dsl_available():
             raise LibraryError(
@@ -503,7 +503,7 @@ def _cute_dsl_mm_bf16_requirement(
             a, b, out, out_dtype, bias, False, "cublaslt"
         )
 
-    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
     if not is_cute_dsl_available():
         raise LibraryError("The CuTeDSL low-M backend requires nvidia-cutlass-dsl.")
@@ -883,7 +883,7 @@ def _tgv_bmm_bf16_requirement(
         raise ValueError("The TGV backend for bmm_bf16 only supports bfloat16 output.")
     # The C++ TGV kernel is 2D-only, so bmm_bf16 always dispatches to the
     # cute_ext implementation regardless of ``_TGV_DEBUG_USE_CPP``.
-    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
     if not is_cute_dsl_available():
         raise LibraryError(
@@ -5279,7 +5279,7 @@ def _check_cute_dsl_arch(device: torch.device) -> None:
 
 def _check_cute_dsl_availability():
     try:
-        from flashinfer.cute_dsl.utils import is_cute_dsl_available
+        from flashinfer.cute_dsl.availability import is_cute_dsl_available
     except ImportError as err:
         raise RuntimeError("CuTe DSL is not available.") from err
 
