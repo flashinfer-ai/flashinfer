@@ -41,8 +41,6 @@ from .jit.attention import (
     gen_batch_prefill_module,
     gen_cudnn_fmha_module,
     gen_fmha_cutlass_sm100a_module,
-    gen_single_decode_module,
-    gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
     gen_trtllm_fmha_v2_sm120_module,
 )
@@ -152,19 +150,6 @@ def gen_fa2(
     if dtype_qo.itemsize == 1:
         return  # fp8 tensor cores not supported in fa2
 
-    yield gen_single_prefill_module(
-        backend="fa2",
-        dtype_q=dtype_qo,
-        dtype_kv=dtype_kv,
-        dtype_o=dtype_qo,
-        head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        pos_encoding_mode=0,
-        use_sliding_window=use_sliding_window,
-        use_logits_soft_cap=use_logits_soft_cap,
-        use_fp16_qk_reduction=False,
-    )
-
     yield gen_batch_prefill_module(
         backend="fa2",
         dtype_q=dtype_qo,
@@ -180,17 +165,6 @@ def gen_fa2(
     )
 
     if not prefill_only:
-        yield gen_single_decode_module(
-            dtype_q=dtype_qo,
-            dtype_kv=dtype_kv,
-            dtype_o=dtype_qo,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            pos_encoding_mode=0,
-            use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-        )
-
         yield gen_batch_decode_module(
             dtype_q=dtype_qo,
             dtype_kv=dtype_kv,
