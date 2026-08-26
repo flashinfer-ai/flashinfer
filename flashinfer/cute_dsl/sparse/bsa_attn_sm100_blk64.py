@@ -13,7 +13,6 @@
 # CuTe-DSL integration is JIT-only too, and this keeps both backends
 # consistent (see dispatch_helpers.py module docstring).
 
-import math
 from typing import Optional, Tuple
 
 import torch
@@ -128,7 +127,9 @@ def bsa_attn_sm100_blk64_fwd(
             v_scale,
         )
     else:
-        assert k_scale is None and v_scale is None, "Q/K/V scales must be provided together"
+        assert k_scale is None and v_scale is None, (
+            "Q/K/V scales must be provided together"
+        )
         assert q.dtype == k.dtype == v.dtype == torch.bfloat16, (
             "blk64 CuTeDSL requires Q/K/V to all use bf16"
         )
@@ -171,6 +172,10 @@ def bsa_attn_sm100_blk64_fwd(
         assert requested_lse.shape == (batch_size, num_head, seqlen_q)
         assert requested_lse.dtype == torch.float32
         assert requested_lse.device == q_bhsd.device
+        assert requested_lse.is_contiguous(), (
+            "pre-allocated lse must be contiguous; got strides "
+            f"{requested_lse.stride()}"
+        )
 
     num_q_blocks = (seqlen_q + 63) // 64
     num_kv_blocks = (seqlen_k + 63) // 64
@@ -222,12 +227,18 @@ def bsa_attn_sm100_blk64_fwd(
         has_block_sizes = True
 
     validate_sm100_blk64_int32_bounds(
-        q_bhsd, k_bhsd, v_bhsd, q2k_block_index, uniform_block_sparse_num, block_sizes, q2k_block_nums
+        q_bhsd,
+        k_bhsd,
+        v_bhsd,
+        q2k_block_index,
+        uniform_block_sparse_num,
+        block_sizes,
+        q2k_block_nums,
     )
     use_int64_kv_strides = sm100_blk64_requires_int64_kv_strides(k_bhsd, v_bhsd)
 
     if softmax_scale is None:
-        softmax_scale = head_dim ** -0.5
+        softmax_scale = head_dim**-0.5
 
     dtype = torch2cute_dtype_map[q_bhsd.dtype]
     sparse_block_size = 64
@@ -236,7 +247,9 @@ def bsa_attn_sm100_blk64_fwd(
     tile_n = 256
 
     if auto_kv_splits:
-        kv_splits_i = sm100_blk64_auto_kv_splits(q_bhsd, q2k_block_index, uniform_block_sparse_num)
+        kv_splits_i = sm100_blk64_auto_kv_splits(
+            q_bhsd, q2k_block_index, uniform_block_sparse_num
+        )
     kv_splits_i = resolve_sm100_blk64_split_workspace(
         q_bhsd, head_dim_v, kv_splits_i, allow_fallback=auto_kv_splits
     )
@@ -292,7 +305,9 @@ def bsa_attn_sm100_blk64_fwd(
             requested_lse
             if requested_lse is not None
             else torch.empty(
-                (batch_size, num_head, seqlen_q), dtype=torch.float32, device=q_bhsd.device
+                (batch_size, num_head, seqlen_q),
+                dtype=torch.float32,
+                device=q_bhsd.device,
             )
         )
 

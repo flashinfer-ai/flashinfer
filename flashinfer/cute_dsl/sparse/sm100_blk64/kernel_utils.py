@@ -12,15 +12,22 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 
 
-from .copy_utils import predicate_k
+from .copy_utils import predicate_k  # noqa: F401  re-exported for utils.predicate_k callers
 from .cute_dsl_utils import sub_packed_f32x2
 
-_NVVM_FMAX_REQUIRES_RESULT_TYPE = sum(1 for p in inspect.signature(nvvm.fmax).parameters.values() if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)) > 2
+_NVVM_FMAX_REQUIRES_RESULT_TYPE = (
+    sum(
+        1
+        for p in inspect.signature(nvvm.fmax).parameters.values()
+        if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+    )
+    > 2
+)
 
 # Obtained from sollya:
 # fpminimax(exp(x * log(2.0)), 1, [|1,24...|],[0;1],relative);
 POLY_EX2 = {
-    0: (1.0),
+    0: (1.0,),
     1: (
         1.0,
         0.922497093677520751953125,
@@ -127,7 +134,14 @@ def warp_reduce(
 
 
 @dsl_user_op
-def fmax(a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None) -> Float32:
+def fmax(
+    a: float | Float32,
+    b: float | Float32,
+    c: float | Float32 | None = None,
+    *,
+    loc=None,
+    ip=None,
+) -> Float32:
     if const_expr(_NVVM_FMAX_REQUIRES_RESULT_TYPE):
         return Float32(
             nvvm.fmax(
@@ -152,7 +166,11 @@ def fmax(a: float | Float32, b: float | Float32, c: float | Float32 | None = Non
 
 
 @cute.jit
-def fmax_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80) -> Float32:
+def fmax_reduce(
+    x: cute.TensorSSA,
+    init_val: float | Float32 | None = None,
+    arch: cutlass.Constexpr[int] = 80,
+) -> Float32:
     if const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
         res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
@@ -165,13 +183,21 @@ def fmax_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch
         local_max[0] = fmax(local_max[0], local_max[1])
         local_max[2] = fmax(local_max[2], local_max[3])
         local_max[0] = fmax(local_max[0], local_max[2])
-        return local_max[0] if const_expr(init_val is None) else fmax(local_max[0], init_val)
+        return (
+            local_max[0]
+            if const_expr(init_val is None)
+            else fmax(local_max[0], init_val)
+        )
     else:
         # [2025-06-15] x.reduce only seems to use 50% 3-input max and 50% 2-input max
         # We instead force the 3-input max.
         res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
-        local_max_0 = fmax(init_val, res[0], res[1]) if const_expr(init_val is not None) else fmax(res[0], res[1])
+        local_max_0 = (
+            fmax(init_val, res[0], res[1])
+            if const_expr(init_val is not None)
+            else fmax(res[0], res[1])
+        )
         local_max = [
             local_max_0,
             fmax(res[2], res[3]),
@@ -188,7 +214,11 @@ def fmax_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch
 
 
 @cute.jit
-def fadd_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80) -> Float32:
+def fadd_reduce(
+    x: cute.TensorSSA,
+    init_val: float | Float32 | None = None,
+    arch: cutlass.Constexpr[int] = 80,
+) -> Float32:
     if const_expr(arch < 100 or cute.size(x.shape) % 8 != 0):
         if const_expr(init_val is None):
             init_val = Float32.zero
@@ -196,13 +226,25 @@ def fadd_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch
     else:
         res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
-        local_sum_0 = cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1])) if const_expr(init_val is not None) else (res[0], res[1])
+        local_sum_0 = (
+            cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
+            if const_expr(init_val is not None)
+            else (res[0], res[1])
+        )
         local_sum = [local_sum_0, (res[2], res[3]), (res[4], res[5]), (res[6], res[7])]
         for i in cutlass.range_constexpr(8, cute.size(x.shape), 8):
-            local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], (res[i + 0], res[i + 1]))
-            local_sum[1] = cute.arch.add_packed_f32x2(local_sum[1], (res[i + 2], res[i + 3]))
-            local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], (res[i + 4], res[i + 5]))
-            local_sum[3] = cute.arch.add_packed_f32x2(local_sum[3], (res[i + 6], res[i + 7]))
+            local_sum[0] = cute.arch.add_packed_f32x2(
+                local_sum[0], (res[i + 0], res[i + 1])
+            )
+            local_sum[1] = cute.arch.add_packed_f32x2(
+                local_sum[1], (res[i + 2], res[i + 3])
+            )
+            local_sum[2] = cute.arch.add_packed_f32x2(
+                local_sum[2], (res[i + 4], res[i + 5])
+            )
+            local_sum[3] = cute.arch.add_packed_f32x2(
+                local_sum[3], (res[i + 6], res[i + 7])
+            )
         local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[1])
         local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], local_sum[3])
         local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[2])
@@ -210,7 +252,9 @@ def fadd_reduce(x: cute.TensorSSA, init_val: float | Float32 | None = None, arch
 
 
 @dsl_user_op
-def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
+def elem_pointer(
+    x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None
+) -> cute.Pointer:
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
@@ -230,7 +274,9 @@ def shuffle_sync(
     val[0] = value
     val_i32 = cute.recast_tensor(val, cutlass.Int32)
     for i in cutlass.range_constexpr(cute.size(val_i32)):
-        val_i32[i] = cute.arch.shuffle_sync(val_i32[i], offset, mask_and_clamp=mask_and_clamp)
+        val_i32[i] = cute.arch.shuffle_sync(
+            val_i32[i], offset, mask_and_clamp=mask_and_clamp
+        )
     return val[0]
 
 
@@ -260,7 +306,9 @@ def shr_u32(
 
 
 @cute.jit
-def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:
+def warp_prefix_sum(
+    val: cutlass.Int32, lane: Optional[cutlass.Int32] = None
+) -> cutlass.Int32:
     if const_expr(lane is None):
         lane = cute.arch.lane_idx()
     for i in cutlass.range_constexpr(int(math.log2(cute.arch.WARP_SIZE))):
@@ -273,8 +321,12 @@ def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) ->
 
 
 @dsl_user_op
-def cvt_f16x2_f32(a: float | Float32, b: float | Float32, to_dtype: Type, *, loc=None, ip=None) -> cutlass.Int32:
-    assert to_dtype in [cutlass.BFloat16, cutlass.Float16], "to_dtype must be BFloat16 or Float16"
+def cvt_f16x2_f32(
+    a: float | Float32, b: float | Float32, to_dtype: Type, *, loc=None, ip=None
+) -> cutlass.Int32:
+    assert to_dtype in [cutlass.BFloat16, cutlass.Float16], (
+        "to_dtype must be BFloat16 or Float16"
+    )
     return cutlass.Int32(
         llvm.inline_asm(
             T.i32(),
@@ -316,9 +368,13 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
     else:
         # tensor variant: write to dst
         dst = dst_or_dtype
-        assert cute.size(dst.shape) == cute.size(src.shape), "dst and src must have the same size"
+        assert cute.size(dst.shape) == cute.size(src.shape), (
+            "dst and src must have the same size"
+        )
         assert cute.size(src.shape) % 2 == 0, "src must have an even number of elements"
-        assert dst.element_type in [cutlass.BFloat16, cutlass.Float16], "dst must be BFloat16 or Float16"
+        assert dst.element_type in [cutlass.BFloat16, cutlass.Float16], (
+            "dst must be BFloat16 or Float16"
+        )
         assert src.element_type is Float32, "src must be Float32"
         dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
         assert cute.size(dst_i32.shape) * 2 == cute.size(src.shape)
@@ -328,7 +384,9 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
 
 @dsl_user_op
 @cute.jit
-def evaluate_polynomial_2(x: Float32, y: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+def evaluate_polynomial_2(
+    x: Float32, y: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
     deg = len(poly) - 1
     out = (poly[deg], poly[deg])
     for i in cutlass.range_constexpr(deg - 1, -1, -1):
@@ -337,7 +395,9 @@ def evaluate_polynomial_2(x: Float32, y: Float32, poly: Tuple[Float32, ...], *, 
 
 
 @dsl_user_op
-def combine_int_frac_ex2(x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=None) -> Float32:
+def combine_int_frac_ex2(
+    x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=None
+) -> Float32:
     return cutlass.Float32(
         llvm.inline_asm(
             T.f32(),
@@ -352,7 +412,9 @@ def combine_int_frac_ex2(x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=
             "shl.b32 x_rounded_e, x_rounded_i, 23;\n\t"
             # add.u32 generates IMAD instruction and add.s32 generates LEA instruction
             # IMAD uses the FMA pipeline and LEA uses the ALU pipeline, afaik
-            "add.s32 out_i, x_rounded_e, frac_ex_i;\n\t" "mov.b32 $0, out_i;\n\t" "}\n",
+            "add.s32 out_i, x_rounded_e, frac_ex_i;\n\t"
+            "mov.b32 $0, out_i;\n\t"
+            "}\n",
             "=f,f,f",
             has_side_effects=False,
             is_align_stack=False,
@@ -362,12 +424,16 @@ def combine_int_frac_ex2(x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=
 
 
 @dsl_user_op
-def ex2_emulation_2(x: Float32, y: Float32, *, poly_degree: int = 3, loc=None, ip=None) -> Tuple[Float32, Float32]:
+def ex2_emulation_2(
+    x: Float32, y: Float32, *, poly_degree: int = 3, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
     # We assume x <= 127.0 and y <= 127.0
     fp32_round_int = float(2**23 + 2**22)
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     # We want to round down here, so that the fractional part is in [0, 1)
-    xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm"
+    )
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
     xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
@@ -379,7 +445,9 @@ def ex2_emulation_2(x: Float32, y: Float32, *, poly_degree: int = 3, loc=None, i
 
 
 @dsl_user_op
-def domain_offset_aligned(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+def domain_offset_aligned(
+    coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None
+) -> cute.Tensor:
     assert isinstance(tensor.iterator, cute.Pointer)
     # We assume that applying the offset does not change the pointer alignment
     new_ptr = cute.make_ptr(
