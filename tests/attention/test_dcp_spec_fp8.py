@@ -720,12 +720,10 @@ def test_fp8_page64_d256_b128_reviewer_all_ranks_and_graph_replay(
         device="cuda",
     )
     v_cache = torch.zeros_like(k_cache)
-    block_tables = torch.arange(
-        pages_per_seq, dtype=torch.int32, device="cuda"
-    ).repeat(batch_size, 1)
-    seq_lens = torch.full(
-        (batch_size,), local_len, dtype=torch.int32, device="cuda"
+    block_tables = torch.arange(pages_per_seq, dtype=torch.int32, device="cuda").repeat(
+        batch_size, 1
     )
+    seq_lens = torch.full((batch_size,), local_len, dtype=torch.int32, device="cuda")
     prefix_lens = torch.full(
         (batch_size,), prefix_len, dtype=torch.int32, device="cuda"
     )

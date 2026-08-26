@@ -36,9 +36,7 @@ def compare_export(
 ) -> dict[str, object]:
     """Compare the generated flat source bundle with ``csrc/dcp``."""
 
-    generated = {
-        path.name: path for path in generated_root.iterdir() if path.is_file()
-    }
+    generated = {path.name: path for path in generated_root.iterdir() if path.is_file()}
     public = {path.name: path for path in public_root.iterdir() if path.is_file()}
     generated_names = set(generated)
     public_names = set(public)

@@ -44,9 +44,7 @@ def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
         "cake_fmha_dcp_spec_bf16_fp8_sm100a_b256_q3_hq64_hkv8_cp4_split3_retain1"
     )
     for q_len in (3, 4, 5, 6):
-        assert get_dcp_spec_fp8_d256_uri(
-            "sm100f", 8, q_len, 16, 1, 4, 4
-        ) == (
+        assert get_dcp_spec_fp8_d256_uri("sm100f", 8, q_len, 16, 1, 4, 4) == (
             "cake_fmha_dcp_spec_bf16_fp8_d256_sm100f_"
             f"b8_q{q_len}_hq16_hkv1_cp4_split4_retain0"
         )
@@ -61,16 +59,12 @@ def test_public_promotion_hook_requires_exact_export_parity(tmp_path: Path) -> N
         (generated / name).write_bytes(payload)
         (public / name).write_bytes(payload)
 
-    exact = compare_export(
-        generated, public, expected_artifact_count=2
-    )
+    exact = compare_export(generated, public, expected_artifact_count=2)
     assert exact["export_parity_passed"] is True
     assert exact["matched_artifact_count"] == 2
 
     (public / "a.cu").write_bytes(b"drift\n")
-    drift = compare_export(
-        generated, public, expected_artifact_count=2
-    )
+    drift = compare_export(generated, public, expected_artifact_count=2)
     assert drift["export_parity_passed"] is False
     assert drift["matched_artifact_count"] == 1
     assert [row["name"] for row in drift["mismatched_artifacts"]] == ["a.cu"]
