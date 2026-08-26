@@ -63,6 +63,13 @@ def get_act_and_mul_module(act_func_name: str):
     return SimpleNamespace(**{fname: _act_and_mul})
 
 
+def _check_act_and_mul_input(input: torch.Tensor) -> None:
+    if input.shape[-1] % 2 != 0:
+        raise ValueError(
+            "The last dimension of the input must be even (2 * hidden_size)."
+        )
+
+
 def _check_shape(input: torch.Tensor, output: torch.Tensor) -> None:
     assert input.ndim == output.ndim, f"{input.ndim} != {output.ndim}"
     assert input.shape[:-1] == output.shape[:-1], (
@@ -100,8 +107,7 @@ def silu_and_mul(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
+    _check_act_and_mul_input(input)
     if out is not None:
         _check_shape(input, out)
     else:
@@ -145,8 +151,7 @@ def gelu_tanh_and_mul(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
+    _check_act_and_mul_input(input)
     if out is not None:
         _check_shape(input, out)
     else:
@@ -186,8 +191,7 @@ def gelu_and_mul(
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(input.device)
-    if input.shape[-1] * input.dtype.itemsize % 16 != 0:
-        raise ValueError("The pointers must be multiple of 16 bytes.")
+    _check_act_and_mul_input(input)
     if out is not None:
         _check_shape(input, out)
     else:
