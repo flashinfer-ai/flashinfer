@@ -150,6 +150,28 @@ def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
     assert writes == [True]
 
 
+@pytest.mark.parametrize("is_aot", [False, True])
+def test_jit_spec_post_load_adapter_applies_to_jit_and_aot_load_paths(
+    monkeypatch, tmp_path, is_aot
+):
+    raw_module = object()
+    seen = []
+    spec = core.JitSpecNvcc(
+        name="test_module",
+        sources=[],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+        post_load_adapter=lambda module: seen.append(module) or ("wrapped", module),
+    )
+    monkeypatch.setattr(core.tvm_ffi, "load_module", lambda _path: raw_module)
+    path = tmp_path / ("aot.so" if is_aot else "jit.so")
+
+    assert spec.load(path if is_aot else None) == ("wrapped", raw_module)
+    assert seen == [raw_module]
+
+
 def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
     monkeypatch, tmp_path
 ):

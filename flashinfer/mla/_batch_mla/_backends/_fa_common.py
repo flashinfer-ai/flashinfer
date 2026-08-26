@@ -20,6 +20,8 @@ from .._planning import _MLAPlanArguments
 class _GeneratedBatchMLAModule(Protocol):
     def plan(self, *args: object) -> object: ...
 
+    def plan_with_staged_workspace_bytes(self, *args: object) -> tuple[object, int]: ...
+
     def run(self, *args: object) -> object: ...
 
 
@@ -301,7 +303,7 @@ class _BatchMLAGeneratedFaMechanics:
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
         kv_len_arr_host = kv_len_arr.to("cpu")
-        plan_info = cached_module.plan(
+        plan_args = (
             self._float_workspace_buffer,
             self._int_workspace_buffer,
             self._pin_memory_int_workspace_buffer,
@@ -312,6 +314,15 @@ class _BatchMLAGeneratedFaMechanics:
             head_dim_ckv,
             causal,
         )
+        if hasattr(cached_module, "plan_with_staged_workspace_bytes"):
+            plan_info, staged_int_workspace_bytes = (
+                cached_module.plan_with_staged_workspace_bytes(*plan_args)
+            )
+        else:
+            # Compatibility for externally cached legacy modules; generated modules
+            # are always adapted at load time.
+            plan_info = cached_module.plan(*plan_args)
+            staged_int_workspace_bytes = 0
 
         # ---------------------------------------------------------------------------
         # Stage metadata and publish backend state
@@ -331,6 +342,7 @@ class _BatchMLAGeneratedFaMechanics:
         self._kv_data_type = kv_data_type
         self._use_profiler = use_profiler
         self._plan_info = plan_info
+        self._staged_int_workspace_bytes = staged_int_workspace_bytes
 
     def _validate_run_input_dtypes(
         self,
@@ -548,6 +560,7 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
         assert cls._plan_capabilities is not None
         if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
             raise ValueError(reason)
+        csr = args.csr()
         backend = cls(
             float_workspace_buffer=args._float_workspace_buffer,
             use_cuda_graph=args._use_cuda_graph,
@@ -558,9 +571,14 @@ class _BatchMLAPagedAttentionFaBackendBase(_BatchMLAGeneratedFaMechanics):
             query_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
             kv_split_widths=(args.head_dim_ckv, args.head_dim_kpe),
             int_workspace_buffer=args._graph_plan_int_workspace_buffer,
-            pin_memory_int_workspace_buffer=args._graph_plan_pin_memory_int_workspace_buffer,
         )
-        csr = args.csr()
+        if args._use_cuda_graph:
+            backend._preflight_graph_metadata_buffers(
+                qo_indptr=csr.qo_indptr,
+                kv_indptr=csr.kv_indptr,
+                kv_indices=csr.kv_indices,
+                kv_len_arr=csr.kv_len_arr,
+            )
         backend.plan(
             qo_indptr=csr.qo_indptr,
             kv_indptr=csr.kv_indptr,

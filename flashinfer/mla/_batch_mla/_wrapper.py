@@ -270,7 +270,6 @@ class BatchMLAPagedAttentionWrapper:
         self._warned_legacy_tensor_arguments = False
         self._legacy_flat_csr_plan = False
         self._warned_legacy_dynamic_lse = False
-        self._retired_cuda_graph_backends: list[object] = []
 
     # Preferred canonical metadata form.
     @overload
@@ -528,7 +527,6 @@ class BatchMLAPagedAttentionWrapper:
 
         previous_backend = getattr(self, "_planned_backend", None)
         graph_plan_int_workspace_buffer = None
-        graph_plan_pin_memory_int_workspace_buffer = None
         if (
             self._use_cuda_graph
             and previous_backend is not None
@@ -536,9 +534,25 @@ class BatchMLAPagedAttentionWrapper:
             and getattr(previous_backend, "_backend", None) in ("fa2", "fa3")
         ):
             graph_plan_int_workspace_buffer = previous_backend._int_workspace_buffer
-            graph_plan_pin_memory_int_workspace_buffer = (
-                previous_backend._pin_memory_int_workspace_buffer
-            )
+
+        backend_type = _BACKEND_TYPES[self._backend]
+        planned_capabilities = backend_type._plan_capabilities
+        planned_query_layout: Literal["packed", "split"] = (
+            "packed" if planned_capabilities.requires_packed_query else "split"
+        )
+        planned_kv_cache_layout: Literal["packed", "split"] = (
+            "packed" if planned_capabilities.requires_packed_kv_cache else "split"
+        )
+        input_contract = MLAInputContract(
+            lse_mode=lse_mode,
+            output_dtype=output_dtype,
+            output_scale=output_scale,
+            scale_mode=scale_mode,
+            query_layout=query_layout,
+            kv_cache_layout=kv_cache_layout,
+            head_dim_ckv=head_dim_ckv,
+            head_dim_kpe=head_dim_kpe,
+        )
 
         # ---------------------------------------------------------------------------
         # Lower wrapper inputs to backend plan arguments
@@ -575,9 +589,6 @@ class BatchMLAPagedAttentionWrapper:
             _kv_indices_buf=self._kv_indices_buf,
             _kv_len_arr_buf=self._kv_len_arr_buf,
             _graph_plan_int_workspace_buffer=graph_plan_int_workspace_buffer,
-            _graph_plan_pin_memory_int_workspace_buffer=(
-                graph_plan_pin_memory_int_workspace_buffer
-            ),
         )
 
         # ---------------------------------------------------------------------------
@@ -596,56 +607,35 @@ class BatchMLAPagedAttentionWrapper:
         # ---------------------------------------------------------------------------
         # Plan with the selected backend
         # ---------------------------------------------------------------------------
-        backend_type = _BACKEND_TYPES[self._backend]
-        graph_workspace_snapshots = None
-        if (
-            graph_plan_int_workspace_buffer is not None
-            and graph_plan_pin_memory_int_workspace_buffer is not None
-        ):
-            graph_workspace_snapshots = (
-                (
-                    graph_plan_int_workspace_buffer,
-                    graph_plan_int_workspace_buffer.clone(),
-                ),
-                (
-                    graph_plan_pin_memory_int_workspace_buffer,
-                    graph_plan_pin_memory_int_workspace_buffer.clone(),
-                ),
+        graph_workspace_snapshot = None
+        if graph_plan_int_workspace_buffer is not None:
+            prior_plan_workspace_bytes = int(
+                getattr(previous_backend, "_staged_int_workspace_bytes", 0)
             )
+            if not (
+                0
+                <= prior_plan_workspace_bytes
+                <= graph_plan_int_workspace_buffer.numel()
+            ):
+                raise RuntimeError(
+                    "previous CUDA graph plan has an invalid device int workspace "
+                    "usage size."
+                )
+            graph_workspace_snapshot = graph_plan_int_workspace_buffer[
+                :prior_plan_workspace_bytes
+            ].clone()
         try:
             planned_backend = backend_type.plan_from_wrapper(plan_args)
         except Exception:
-            if graph_workspace_snapshots is not None:
-                for target, snapshot in graph_workspace_snapshots:
-                    target.copy_(snapshot)
+            if graph_workspace_snapshot is not None:
+                graph_plan_int_workspace_buffer[
+                    : graph_workspace_snapshot.numel()
+                ].copy_(graph_workspace_snapshot)
             raise
-        planned_capabilities = backend_type._plan_capabilities
-        planned_query_layout: Literal["packed", "split"] = (
-            "packed" if planned_capabilities.requires_packed_query else "split"
-        )
-        planned_kv_cache_layout: Literal["packed", "split"] = (
-            "packed" if planned_capabilities.requires_packed_kv_cache else "split"
-        )
 
         # ---------------------------------------------------------------------------
         # Publish the successful plan state
         # ---------------------------------------------------------------------------
-        input_contract = MLAInputContract(
-            lse_mode=lse_mode,
-            output_dtype=output_dtype,
-            output_scale=output_scale,
-            scale_mode=scale_mode,
-            query_layout=query_layout,
-            kv_cache_layout=kv_cache_layout,
-            head_dim_ckv=head_dim_ckv,
-            head_dim_kpe=head_dim_kpe,
-        )
-        if self._use_cuda_graph and previous_backend is not None:
-            retired_backends = getattr(self, "_retired_cuda_graph_backends", None)
-            if retired_backends is None:
-                retired_backends = []
-                self._retired_cuda_graph_backends = retired_backends
-            retired_backends.append(previous_backend)
         self._planned_backend = planned_backend
         self._input_contract = input_contract
         self._planned_query_layout = planned_query_layout

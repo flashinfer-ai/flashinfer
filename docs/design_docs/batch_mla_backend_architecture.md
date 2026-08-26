@@ -82,6 +82,174 @@ define:
 Planning does not require live query or KV-cache tensors, and a normal planned
 run does not implicitly copy an independently split paged KV cache.
 
+## Public usage
+
+Use only the public facade for planned Batch MLA. Backend selection and
+concrete backend classes remain implementation details rather than an
+application extension interface; a caller should express the metadata and
+input contract it needs and let the wrapper own the implementation choice.
+
+The following portable CSR example constructs a wrapper, declares the planned
+contract with canonical metadata, and runs it with packed structural inputs.
+The metadata tensors may remain on CPU; the workspace, query, and paged
+KV-cache are on the same CUDA device.
+
+```python
+import math
+
+import torch
+
+from flashinfer.mla import BatchMLAPagedAttentionWrapper, MLAPlanMetadata
+
+device = torch.device("cuda")
+dtype = torch.bfloat16
+page_size = 16
+num_heads = 128
+head_dim_ckv = 512
+head_dim_kpe = 64
+
+workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+wrapper = BatchMLAPagedAttentionWrapper(workspace)
+
+metadata = MLAPlanMetadata.csr(
+    qo_indptr=torch.tensor([0, 1, 2], dtype=torch.int32),
+    kv_indptr=torch.tensor([0, 1, 3], dtype=torch.int32),
+    kv_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+    kv_len_arr=torch.tensor([16, 24], dtype=torch.int32),
+)
+wrapper.plan(
+    metadata=metadata,
+    num_heads=num_heads,
+    head_dim_ckv=head_dim_ckv,
+    head_dim_kpe=head_dim_kpe,
+    page_size=page_size,
+    causal=False,
+    sm_scale=1.0 / math.sqrt(head_dim_ckv + head_dim_kpe),
+    q_data_type=dtype,
+    kv_data_type=dtype,
+    query_layout="packed",
+    kv_cache_layout="packed",
+)
+
+query = torch.randn(
+    2, num_heads, head_dim_ckv + head_dim_kpe, device=device, dtype=dtype
+)
+kv_cache = torch.randn(
+    3, page_size, head_dim_ckv + head_dim_kpe, device=device, dtype=dtype
+)
+output = wrapper.run(query=query, kv_cache=kv_cache)
+```
+
+The same packed plan can also accept split structural inputs when each pair is
+formed from adjacent, row-major views of a shared packed parent. This variation
+reuses the `query` and `kv_cache` tensors from the preceding example, so no
+replanning or copy is required:
+
+```python
+q_nope = query[..., :head_dim_ckv]
+q_pe = query[..., head_dim_ckv:]
+ckv_cache = kv_cache[..., :head_dim_ckv]
+kpe_cache = kv_cache[..., head_dim_ckv:]
+
+output = wrapper.run(
+    query=(q_nope, q_pe),
+    kv_cache=(ckv_cache, kpe_cache),
+)
+```
+
+The wrapper can reinterpret these adjacent views as packed tensors without an
+allocation. Independently allocated tensors, non-dense views, and arbitrary
+strided slices do not have that guarantee: a packed plan rejects them, and a
+caller that needs such inputs should plan for the split layout instead. This is
+an input-representation contract rather than a promise about a specific
+backend.
+
+When an application already owns both representations, supply them together
+with `MLAPlanMetadata.dual(...)`. The planner checks that they describe the
+same requests and page mapping; do not maintain separate, unchecked metadata
+paths for different implementations. This continues the preceding example:
+replace its metadata construction with the following block before replanning
+and running the same wrapper and structural inputs.
+
+```python
+metadata = MLAPlanMetadata.dual(
+    qo_indptr=torch.tensor([0, 1, 2], dtype=torch.int32),
+    kv_indptr=torch.tensor([0, 1, 3], dtype=torch.int32),
+    kv_indices=torch.tensor([0, 1, 2], dtype=torch.int32),
+    kv_len_arr=torch.tensor([16, 24], dtype=torch.int32),
+    cum_seq_lens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+    block_tables=torch.tensor(
+        [[0, 0, 0, 0, 0, 0, 0, 0], [1, 2, 0, 0, 0, 0, 0, 0]],
+        dtype=torch.int32,
+    ),
+    seq_lens=torch.tensor([16, 24], dtype=torch.int32),
+    max_q_len=1,
+)
+wrapper.plan(
+    metadata=metadata,
+    num_heads=num_heads,
+    head_dim_ckv=head_dim_ckv,
+    head_dim_kpe=head_dim_kpe,
+    page_size=page_size,
+    causal=False,
+    sm_scale=1.0 / math.sqrt(head_dim_ckv + head_dim_kpe),
+    q_data_type=dtype,
+    kv_data_type=dtype,
+    query_layout="packed",
+    kv_cache_layout="packed",
+)
+output = wrapper.run(query=query, kv_cache=kv_cache)
+```
+
+For the current dense packed-input form, construct the same public wrapper
+with `backend="cutlass"`, use dense metadata, and pass packed tensors through
+the same structural runtime keywords. This example uses the current CUTLASS
+shape and scale contract; it is an example of today's supported form, not a
+permanent support matrix.
+
+```python
+import math
+
+import torch
+
+from flashinfer.mla import BatchMLAPagedAttentionWrapper, MLAPlanMetadata
+
+device = torch.device("cuda")
+dtype = torch.bfloat16
+page_size = 16
+qk_nope_head_dim = 128
+workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+wrapper = BatchMLAPagedAttentionWrapper(workspace, backend="cutlass")
+
+metadata = MLAPlanMetadata.dense(
+    cum_seq_lens_q=torch.tensor([0, 1, 2], dtype=torch.int32, device=device),
+    block_tables=torch.tensor(
+        [[0, 0, 0, 0, 0, 0, 0, 0], [1, 2, 0, 0, 0, 0, 0, 0]],
+        dtype=torch.int32,
+        device=device,
+    ),
+    seq_lens=torch.tensor([16, 24], dtype=torch.int32, device=device),
+    max_q_len=1,
+)
+wrapper.plan(
+    metadata=metadata,
+    num_heads=128,
+    head_dim_ckv=512,
+    head_dim_kpe=64,
+    page_size=page_size,
+    causal=False,
+    sm_scale=1.0 / math.sqrt(qk_nope_head_dim + 64),
+    q_data_type=dtype,
+    kv_data_type=dtype,
+    query_layout="packed",
+    kv_cache_layout="packed",
+)
+
+query = torch.randn(2, 128, 512 + 64, device=device, dtype=dtype)
+kv_cache = torch.randn(3, page_size, 512 + 64, device=device, dtype=dtype)
+output = wrapper.run(query=query, kv_cache=kv_cache)
+```
+
 ## Layering and ownership
 
 ### Public facade
@@ -371,14 +539,18 @@ new metadata exactly. The reserved `kv_indices` buffer may be larger than its
 active prefix. Generated-FA graph replanning can therefore change the live
 page-index count within capacity, but cannot change the reserved batch shapes.
 
-After a successful generated-FA graph replan, the wrapper replaces the backend
-object but reuses the generated-FA plan workspaces captured by the prior backend
-for the same wrapper. The wrapper mirrors those reused workspace objects from
-the new backend, and it retains the previous backend object so other captured
-state remains alive. If the replan fails after touching shared plan workspaces,
-snapshots restore those workspaces before the previous plan remains active.
-Retention is a lifetime guarantee, not a promise that the Python wrapper can
-intercept or validate direct external graph replay.
+The wrapper owns the stable pointer-bearing device workspaces and reserved
+metadata storage required for graph capture. A replan builds a transient
+candidate backend generation around that stable storage. Generated planning
+uses a private, allocator-aware pinned staging allocation for exactly the
+reported workspace prefix; that staging allocation is not public state and is
+not retained as a growing history of plans. If candidate planning or staging
+fails, the wrapper restores the affected device-workspace prefix and keeps the
+published plan and metadata pointers intact. Only after the candidate succeeds
+does the wrapper publish its backend and input-contract state, so ownership is
+bounded to the active plan plus temporary rollback state rather than an
+unbounded list of retired backends. These lifetime guarantees do not imply that
+the Python wrapper can intercept or validate direct external graph replay.
 
 CUTLASS graph-mode replanning is rejected because its dense metadata pointers
 do not have an equivalent reserved-buffer protocol. An initial CUTLASS plan may

@@ -5,7 +5,9 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 """
 
+import gc
 import warnings
+import weakref
 
 import torch
 import pytest
@@ -51,6 +53,71 @@ class _FakeBatchMLAModule:
         self.cutlass_calls.append(args)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_batch_mla_module_proxy_copies_only_planned_workspace_prefix():
+    from flashinfer.jit.attention.modules import _BatchMLAModuleProxy
+
+    class _RawModule:
+        def plan(self, _float_workspace, _int_workspace, scratch, *_args):
+            scratch.view(torch.uint8).fill_(0xAB)
+            return [0] * 18, 37
+
+        def run(self, *args):
+            return args
+
+    raw = _RawModule()
+    proxy = _BatchMLAModuleProxy(raw)
+    int_workspace = torch.full((64,), 0xCD, dtype=torch.uint8, device="cuda")
+    scratch = torch.empty(64, dtype=torch.uint8, pin_memory=True)
+
+    plan_info, staged_int_workspace_bytes = proxy.plan_with_staged_workspace_bytes(
+        torch.empty(1, dtype=torch.uint8, device="cuda"),
+        int_workspace,
+        scratch,
+        *([None] * 6),
+    )
+    torch.cuda.synchronize()
+
+    assert plan_info == [0] * 18
+    assert staged_int_workspace_bytes == 37
+    assert (
+        proxy.plan(
+            torch.empty(1, dtype=torch.uint8, device="cuda"),
+            int_workspace,
+            scratch,
+            *([None] * 6),
+        )
+        == [0] * 18
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(
+        int_workspace.cpu(),
+        torch.tensor([0xAB] * 37 + [0xCD] * 27, dtype=torch.uint8),
+    )
+    assert proxy.run("forwarded") == ("forwarded",)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("staged_int_workspace_bytes", [-1, 65])
+def test_batch_mla_module_proxy_rejects_invalid_workspace_prefix(
+    staged_int_workspace_bytes,
+):
+    from flashinfer.jit.attention.modules import _BatchMLAModuleProxy
+
+    class _RawModule:
+        def plan(self, *_args):
+            return [0] * 18, staged_int_workspace_bytes
+
+    proxy = _BatchMLAModuleProxy(_RawModule())
+    with pytest.raises(ValueError, match="staged_int_workspace_bytes"):
+        proxy.plan_with_staged_workspace_bytes(
+            torch.empty(1, dtype=torch.uint8, device="cuda"),
+            torch.empty(64, dtype=torch.uint8, device="cuda"),
+            torch.empty(64, dtype=torch.uint8, pin_memory=True),
+            *([None] * 6),
+        )
+
+
 def _minimal_uninitialized_wrapper(wrapper_cls, *, use_cuda_graph=False):
     wrapper = wrapper_cls.__new__(wrapper_cls)
     wrapper._float_workspace_buffer = torch.empty(16, dtype=torch.uint8)
@@ -72,7 +139,6 @@ def _minimal_uninitialized_wrapper(wrapper_cls, *, use_cuda_graph=False):
     wrapper._warned_positional_arguments = False
     wrapper._warned_legacy_tensor_arguments = False
     wrapper._warned_legacy_dynamic_lse = False
-    wrapper._retired_cuda_graph_backends = []
     return wrapper
 
 
@@ -830,6 +896,67 @@ def test_planned_cutlass_reuses_plan_owned_empty_lse(monkeypatch):
     assert first_empty_lse is second_empty_lse
 
 
+@pytest.mark.parametrize("tensor_name", ["query", "kv_cache", "out"])
+def test_planned_cutlass_rejects_non_contiguous_launch_tensors_before_dispatch(
+    monkeypatch, tensor_name
+):
+    import flashinfer.mla as mla
+
+    fake_module = _FakeBatchMLAModule()
+    _patch_fake_cutlass_module(monkeypatch, fake_module)
+    wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
+    wrapper._backend = "cutlass"
+    wrapper.plan(**_cutlass_plan_kwargs())
+    query = torch.empty(2, 128, 576, dtype=torch.bfloat16)
+    kv_cache = torch.empty(2, 64, 576, dtype=torch.bfloat16)
+    out = torch.empty(2, 128, 512, dtype=torch.bfloat16)
+    if tensor_name == "query":
+        query = torch.empty(2, 128, 1152, dtype=torch.bfloat16)[..., :576]
+    elif tensor_name == "kv_cache":
+        kv_cache = torch.empty(2, 64, 1152, dtype=torch.bfloat16)[..., :576]
+    else:
+        out = torch.empty(2, 128, 1024, dtype=torch.bfloat16)[..., :512]
+
+    assert not {
+        "query": query,
+        "kv_cache": kv_cache,
+        "out": out,
+    }[tensor_name].is_contiguous()
+    with pytest.raises(ValueError, match="contiguous"):
+        wrapper.run(query=query, kv_cache=kv_cache, out=out)
+
+    assert fake_module.cutlass_calls == []
+
+
+@pytest.mark.parametrize("tensor_name", ["query", "kv_cache", "out"])
+def test_planned_cutlass_rejects_workspace_device_mismatch_before_dispatch(
+    monkeypatch, tensor_name
+):
+    import flashinfer.mla as mla
+
+    fake_module = _FakeBatchMLAModule()
+    _patch_fake_cutlass_module(monkeypatch, fake_module)
+    wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
+    wrapper._backend = "cutlass"
+    wrapper.plan(**_cutlass_plan_kwargs())
+    query = torch.empty(2, 128, 576, dtype=torch.bfloat16)
+    kv_cache = torch.empty(2, 64, 576, dtype=torch.bfloat16)
+    out = torch.empty(2, 128, 512, dtype=torch.bfloat16)
+    if tensor_name == "query":
+        query = torch.empty(2, 128, 576, dtype=torch.bfloat16, device="meta")
+        out = None
+    elif tensor_name == "kv_cache":
+        kv_cache = torch.empty(2, 64, 576, dtype=torch.bfloat16, device="meta")
+        out = None
+    else:
+        out = torch.empty(2, 128, 512, dtype=torch.bfloat16, device="meta")
+
+    with pytest.raises(ValueError, match="workspace device"):
+        wrapper.run(query=query, kv_cache=kv_cache, out=out)
+
+    assert fake_module.cutlass_calls == []
+
+
 @pytest.mark.parametrize("page_size", [0, 127, 256])
 def test_planned_cutlass_rejects_invalid_page_size_before_launch(
     monkeypatch, page_size
@@ -1397,6 +1524,87 @@ def test_unplanned_cutlass_compatibility_runs_dynamic_shape_without_plan(monkeyp
     assert getattr(wrapper, "_planned_backend", None) is None
 
 
+@pytest.mark.parametrize("tensor_name", ["query", "kv_cache", "out"])
+def test_planless_cutlass_rejects_non_contiguous_launch_tensors_before_dispatch(
+    monkeypatch, tensor_name
+):
+    import flashinfer.mla as mla
+
+    fake_module = _FakeBatchMLAModule()
+    _patch_fake_cutlass_module(monkeypatch, fake_module)
+    wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
+    wrapper._backend = "cutlass"
+    query = torch.empty(2, 128, 576, dtype=torch.bfloat16)
+    kv_cache = torch.empty(2, 64, 576, dtype=torch.bfloat16)
+    out = torch.empty(2, 128, 512, dtype=torch.bfloat16)
+    if tensor_name == "query":
+        query = torch.empty(2, 128, 1152, dtype=torch.bfloat16)[..., :576]
+    elif tensor_name == "kv_cache":
+        kv_cache = torch.empty(2, 64, 1152, dtype=torch.bfloat16)[..., :576]
+    else:
+        out = torch.empty(2, 128, 1024, dtype=torch.bfloat16)[..., :512]
+    kv_len = torch.full((2,), 64, dtype=torch.int32)
+    page_table = torch.zeros((2, 2), dtype=torch.int32)
+
+    assert not {
+        "query": query,
+        "kv_cache": kv_cache,
+        "out": out,
+    }[tensor_name].is_contiguous()
+    with (
+        pytest.warns(DeprecationWarning, match="CUTLASS"),
+        pytest.raises(ValueError, match="contiguous"),
+    ):
+        wrapper.run(
+            query=query,
+            kv_cache=kv_cache,
+            kv_len=kv_len,
+            page_table=page_table,
+            out=out,
+        )
+
+    assert fake_module.cutlass_calls == []
+
+
+@pytest.mark.parametrize("tensor_name", ["query", "kv_cache", "out"])
+def test_planless_cutlass_rejects_workspace_device_mismatch_before_dispatch(
+    monkeypatch, tensor_name
+):
+    import flashinfer.mla as mla
+
+    fake_module = _FakeBatchMLAModule()
+    _patch_fake_cutlass_module(monkeypatch, fake_module)
+    wrapper = _minimal_uninitialized_wrapper(mla.BatchMLAPagedAttentionWrapper)
+    wrapper._backend = "cutlass"
+    query = torch.empty(2, 128, 576, dtype=torch.bfloat16)
+    kv_cache = torch.empty(2, 64, 576, dtype=torch.bfloat16)
+    out = torch.empty(2, 128, 512, dtype=torch.bfloat16)
+    if tensor_name == "query":
+        query = torch.empty(2, 128, 576, dtype=torch.bfloat16, device="meta")
+        out = None
+    elif tensor_name == "kv_cache":
+        kv_cache = torch.empty(2, 64, 576, dtype=torch.bfloat16, device="meta")
+        out = None
+    else:
+        out = torch.empty(2, 128, 512, dtype=torch.bfloat16, device="meta")
+    kv_len = torch.full((2,), 64, dtype=torch.int32)
+    page_table = torch.zeros((2, 2), dtype=torch.int32)
+
+    with (
+        pytest.warns(DeprecationWarning, match="CUTLASS"),
+        pytest.raises(ValueError, match="workspace device"),
+    ):
+        wrapper.run(
+            query=query,
+            kv_cache=kv_cache,
+            kv_len=kv_len,
+            page_table=page_table,
+            out=out,
+        )
+
+    assert fake_module.cutlass_calls == []
+
+
 # CUDA graph planning
 
 
@@ -1515,10 +1723,10 @@ def test_cuda_graph_replan_failure_rolls_back_reserved_metadata(monkeypatch):
     previous_plan_info = wrapper._plan_info
     int_workspace = wrapper._int_workspace_buffer
     pin_workspace = wrapper._pin_memory_int_workspace_buffer
+    previous_backend._staged_int_workspace_bytes = 8
     int_workspace.fill_(17)
     pin_workspace.fill_(23)
     int_workspace_snapshot = int_workspace.clone()
-    pin_workspace_snapshot = pin_workspace.clone()
     snapshots = tuple(
         tensor.clone()
         for tensor in (
@@ -1535,7 +1743,7 @@ def test_cuda_graph_replan_failure_rolls_back_reserved_metadata(monkeypatch):
         def plan(self, *args):
             self.int_workspace_arg = args[1]
             self.pin_workspace_arg = args[2]
-            args[1].fill_(99)
+            args[1][:8].fill_(99)
             args[2].fill_(88)
             raise RuntimeError("candidate plan failure")
 
@@ -1563,13 +1771,15 @@ def test_cuda_graph_replan_failure_rolls_back_reserved_metadata(monkeypatch):
 
     assert failing_module is not None
     assert failing_module.int_workspace_arg is int_workspace
-    assert failing_module.pin_workspace_arg is pin_workspace
+    assert failing_module.pin_workspace_arg is not pin_workspace
     assert wrapper._planned_backend is previous_backend
     assert wrapper._plan_info is previous_plan_info
     assert torch.equal(int_workspace, int_workspace_snapshot)
-    assert torch.equal(pin_workspace, pin_workspace_snapshot)
+    assert torch.equal(pin_workspace, torch.full_like(pin_workspace, 23))
     assert wrapper._int_workspace_buffer is int_workspace
     assert wrapper._pin_memory_int_workspace_buffer is pin_workspace
+    previous_backend._cached_module.run("old-plan")
+    assert previous_backend._cached_module.run_args == ("old-plan",)
     for actual, expected in zip(
         (
             wrapper._qo_indptr_buf,
@@ -1583,7 +1793,9 @@ def test_cuda_graph_replan_failure_rolls_back_reserved_metadata(monkeypatch):
         assert torch.equal(actual, expected)
 
 
-def test_cuda_graph_fa_replan_retains_captured_backend_storage(monkeypatch):
+def test_cuda_graph_replan_keeps_only_current_backend_and_stable_graph_storage(
+    monkeypatch,
+):
     import flashinfer.mla as mla
 
     _patch_fake_fa_module(monkeypatch, _FakeBatchMLAModule())
@@ -1605,28 +1817,52 @@ def test_cuda_graph_fa_replan_retains_captured_backend_storage(monkeypatch):
         ),
         **common,
     )
-    captured_backend = wrapper._planned_backend
-    captured_int_workspace = wrapper._int_workspace_buffer
-    captured_pin_workspace = wrapper._pin_memory_int_workspace_buffer
-
-    wrapper.plan(
-        metadata=_csr_metadata(
-            mla,
-            torch.tensor([0, 1, 2], dtype=torch.int32),
-            torch.tensor([0, 1, 2], dtype=torch.int32),
-            torch.tensor([3, 4], dtype=torch.int32),
-            torch.tensor([1, 1], dtype=torch.int32),
-        ),
-        **common,
+    stable_tensors = (
+        wrapper._int_workspace_buffer,
+        wrapper._qo_indptr_buf,
+        wrapper._kv_indptr_buf,
+        wrapper._kv_indices_buf,
+        wrapper._kv_len_arr_buf,
     )
+    old_backend_refs = []
+    for index in range(32):
+        old_backend_refs.append(weakref.ref(wrapper._planned_backend))
+        previous_pin_workspace = (
+            wrapper._planned_backend._pin_memory_int_workspace_buffer
+        )
+        wrapper.plan(
+            metadata=_csr_metadata(
+                mla,
+                torch.tensor([0, 1, 2], dtype=torch.int32),
+                torch.tensor([0, 1, 2], dtype=torch.int32),
+                torch.tensor([index, index + 1], dtype=torch.int32),
+                torch.tensor([1, 1], dtype=torch.int32),
+            ),
+            **common,
+        )
+        assert (
+            wrapper._planned_backend._pin_memory_int_workspace_buffer
+            is not previous_pin_workspace
+        )
 
-    replanned_backend = wrapper._planned_backend
-    assert replanned_backend is not captured_backend
-    assert replanned_backend._int_workspace_buffer is captured_int_workspace
-    assert replanned_backend._pin_memory_int_workspace_buffer is captured_pin_workspace
-    assert wrapper._int_workspace_buffer is captured_int_workspace
-    assert wrapper._pin_memory_int_workspace_buffer is captured_pin_workspace
-    assert captured_backend in wrapper._retired_cuda_graph_backends
+    gc.collect()
+
+    assert all(
+        actual is expected
+        for actual, expected in zip(
+            (
+                wrapper._int_workspace_buffer,
+                wrapper._qo_indptr_buf,
+                wrapper._kv_indptr_buf,
+                wrapper._kv_indices_buf,
+                wrapper._kv_len_arr_buf,
+            ),
+            stable_tensors,
+            strict=True,
+        )
+    )
+    assert all(old_backend_ref() is None for old_backend_ref in old_backend_refs)
+    assert not hasattr(wrapper, "_retired_cuda_graph_backends")
 
 
 @pytest.mark.parametrize(

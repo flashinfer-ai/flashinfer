@@ -74,6 +74,35 @@ def _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table):
         )
 
 
+def _validate_cutlass_launch_tensors(
+    device: torch.device,
+    *,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    out: torch.Tensor,
+    kv_len: torch.Tensor,
+    page_table: torch.Tensor,
+) -> None:
+    for name, tensor in (
+        ("query", query),
+        ("KV cache", kv_cache),
+        ("out", out),
+        ("kv_len", kv_len),
+        ("page_table", page_table),
+    ):
+        if tensor.device != device:
+            raise ValueError(
+                f"CUTLASS launch tensor {name} must be on workspace device "
+                f"{device}, got {tensor.device}."
+            )
+    for name, tensor in (("query", query), ("KV cache", kv_cache), ("out", out)):
+        if not tensor.is_contiguous():
+            raise ValueError(
+                f"CUTLASS launch tensor {name} must be contiguous because "
+                "the native kernel uses fixed compact strides."
+            )
+
+
 @functools.cache
 def get_mla_module():
     return gen_mla_module().build_and_load()
@@ -267,8 +296,6 @@ class _BatchMLAPagedAttentionCutlassBackend:
         for name, tensor in (("kv_len", kv_len), ("page_table", page_table)):
             if tensor.dtype != torch.int32:
                 raise ValueError(f"{name} must have dtype torch.int32.")
-            if tensor.device != self.device:
-                raise ValueError(f"{name} must be on {self.device}.")
         _check_cutlass_shape(q_nope_pe, ckv_kpe_cache, kv_len, page_table)
         if q_nope_pe.shape[0] != self._batch_size:
             raise ValueError(
@@ -304,7 +331,7 @@ class _BatchMLAPagedAttentionCutlassBackend:
                 out,
                 (*q_nope_pe.shape[:-1], self._head_dim_ckv),
                 self._output_dtype,
-                q_nope_pe.device,
+                None,
                 "out",
             )
         elif out is None:
@@ -318,13 +345,21 @@ class _BatchMLAPagedAttentionCutlassBackend:
                 out,
                 (*q_nope_pe.shape[:-1], self._head_dim_ckv),
                 self._output_dtype,
-                q_nope_pe.device,
+                None,
                 "out",
             )
 
         # ---------------------------------------------------------------------------
         # Launch the CUTLASS backend
         # ---------------------------------------------------------------------------
+        _validate_cutlass_launch_tensors(
+            self.device,
+            query=q_nope_pe,
+            kv_cache=ckv_kpe_cache,
+            out=out,
+            kv_len=kv_len,
+            page_table=page_table,
+        )
         self._cached_module.cutlass_mla_paged_attention(
             self._float_workspace_buffer,
             out,
@@ -389,8 +424,6 @@ class _BatchMLAPagedAttentionCutlassBackend:
         for name, tensor in (("kv_len", kv_len), ("page_table", page_table)):
             if tensor.dtype != torch.int32:
                 raise ValueError(f"{name} must have dtype torch.int32.")
-            if tensor.device != float_workspace_buffer.device:
-                raise ValueError(f"{name} must be on {float_workspace_buffer.device}.")
         _check_cutlass_shape(query, kv_cache, kv_len, page_table)
         if kv_cache.shape[1] != page_size:
             raise ValueError(
@@ -428,10 +461,16 @@ class _BatchMLAPagedAttentionCutlassBackend:
         if out is None:
             out = torch.empty(output_shape, dtype=output_dtype, device=query.device)
         else:
-            check_shape_dtype_device(
-                out, output_shape, output_dtype, query.device, "out"
-            )
+            check_shape_dtype_device(out, output_shape, output_dtype, None, "out")
 
+        _validate_cutlass_launch_tensors(
+            float_workspace_buffer.device,
+            query=query,
+            kv_cache=kv_cache,
+            out=out,
+            kv_len=kv_len,
+            page_table=page_table,
+        )
         empty_lse = torch.empty(
             0, dtype=torch.float32, device=float_workspace_buffer.device
         )
@@ -451,6 +490,7 @@ class _BatchMLAPagedAttentionCutlassBackend:
 __all__ = [
     "_BatchMLAPagedAttentionCutlassBackend",
     "_check_cutlass_shape",
+    "_validate_cutlass_launch_tensors",
     "_validate_cutlass_page_size",
     "get_mla_module",
 ]

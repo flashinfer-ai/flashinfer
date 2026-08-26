@@ -584,9 +584,6 @@ class _MLAPlanArguments:
     _graph_plan_int_workspace_buffer: Optional[torch.Tensor] = field(
         default=None, repr=False, compare=False
     )
-    _graph_plan_pin_memory_int_workspace_buffer: Optional[torch.Tensor] = field(
-        default=None, repr=False, compare=False
-    )
     _metadata_resolver: _MLAPlanMetadataResolver = field(
         init=False, repr=False, compare=False
     )
