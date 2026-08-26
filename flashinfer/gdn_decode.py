@@ -130,22 +130,23 @@ def gated_delta_rule_decode_pretranspose(
     initial_state: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     output_state_indices: Optional[torch.Tensor] = None,
+    *,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
     disable_state_update: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    r"""Gated Delta Rule Decode kernel for single-token generation.
+    r"""Gated Delta Rule Decode kernel for pretransposed state.
 
     Implements the decode phase of gated delta rule linear attention,
-    processing one token at a time and updating the recurrent state.
+    processing one or more tokens and updating the recurrent state by default.
 
     Parameters
     ----------
     q : torch.Tensor
-        Current query of shape ``[B, 1, H, K]``.  Must be float16/bfloat16.
+        Current query of shape ``[B, T, H, K]``.  Must be float16/bfloat16.
     k : torch.Tensor
-        Current key of shape ``[B, 1, H, K]``.  Must be float16/bfloat16.
+        Current key of shape ``[B, T, H, K]``.  Must be float16/bfloat16.
     v : torch.Tensor
-        Current value of shape ``[B, 1, HV, V]``.  Must be float16/bfloat16.
+        Current value of shape ``[B, T, HV, V]``.  Must be float16/bfloat16.
     state : torch.Tensor, optional
         Current state of shape ``[B, HV, V, K]`` (v-major / K-last layout).
         Float32: legacy kernel (T=1 only).  Bfloat16: BF16 state backend
@@ -154,18 +155,18 @@ def gated_delta_rule_decode_pretranspose(
     A_log : torch.Tensor
         Log decay parameter of shape ``[HV]``.  Must be float32.
     a : torch.Tensor
-        Input-dependent decay of shape ``[B, 1, HV]``.  Must be
+        Input-dependent decay of shape ``[B, T, HV]``.  Must be
         float16/bfloat16.
     dt_bias : torch.Tensor
         Decay bias of shape ``[HV]``.  Must be bfloat16 or float32.
     b : torch.Tensor
-        Update gate (beta) input of shape ``[B, 1, HV]``.  Must be
+        Update gate (beta) input of shape ``[B, T, HV]``.  Must be
         float16/bfloat16.
     scale : float, optional
         Scale factor for queries.  If ``None``, defaults to
         ``1 / sqrt(K)``.
     output : torch.Tensor, optional
-        Pre-allocated output tensor of shape ``[B, 1, HV, V]``.  Allocated
+        Pre-allocated output tensor of shape ``[B, T, HV, V]``.  Allocated
         automatically when ``None``.
     use_qk_l2norm : bool
         Whether to apply L2 normalization to q and k.  Default: ``True``.
@@ -201,26 +202,27 @@ def gated_delta_rule_decode_pretranspose(
           entirely; neither the state pool nor the output are touched for
           that batch entry; the output slot is written as **zero**.
     intermediate_states_buffer : torch.Tensor, optional
-        Caller-owned buffer of shape ``[B, cache_steps, HV, V, K]`` for
-        caching intermediate states on MTP paths (``T > 1``).  Its dtype
-        must match the selected state backend and ``cache_steps`` must be at
-        least ``T``.
+        Caller-owned BF16 intermediate-state cache of shape
+        ``[B, cache_steps, HV, V, K]``. Supported only by the BF16 ``T>1``
+        path; ``cache_steps`` must be at least ``T``. Defaults to ``None``.
     disable_state_update : bool
-        Whether to leave the state pool unchanged on MTP paths (``T > 1``).
-        Default: ``False``.
+        If ``True``, the BF16 ``T>1`` path leaves the state pool unchanged.
+        This is used by speculative verification while intermediate states
+        are retained in ``intermediate_states_buffer``. Defaults to ``False``
+        to preserve the existing update behavior.
 
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor]
         ``(output, state_or_initial_state)`` where ``output`` has shape
-        ``[B, 1, HV, V]`` and the second element is the updated state
-        (mutated in place).
+        ``[B, T, HV, V]`` and the second element is the caller-owned state.
+        The state is mutated in place unless state updates are disabled.
 
     Notes
     -----
     - Requires SM90+ (Hopper, Blackwell, etc.).
-    - State is updated in-place by default; the pool path writes directly
-      into ``initial_state`` memory (no separate scatter step needed).
+    - State is updated in-place by default; BF16 MTP verification can preserve
+      it with ``disable_state_update=True``.
     - State layout is v-major (K-last): ``[B, HV, V, K]``.  When state is
       bfloat16 and ``K = V = 128``, the BF16 state kernel is used (T=1 or
       MTP for T>1); the pool+indices path routes through the MTP kernel.
@@ -235,6 +237,12 @@ def gated_delta_rule_decode_pretranspose(
     # Validate input shapes
     B, T, H, K = q.shape
     _, _, HV, V = v.shape
+
+    if (intermediate_states_buffer is not None or disable_state_update) and T == 1:
+        raise ValueError(
+            "intermediate_states_buffer and disable_state_update are supported "
+            "only by BF16 pretranspose decode with T > 1"
+        )
 
     use_pool = initial_state is not None
     assert use_pool == (initial_state_indices is not None), (
@@ -278,6 +286,13 @@ def gated_delta_rule_decode_pretranspose(
         and K == 128
         and V == 128
     )
+    if (
+        intermediate_states_buffer is not None or disable_state_update
+    ) and not use_bf16_state:
+        raise ValueError(
+            "intermediate_states_buffer and disable_state_update are supported "
+            "only by BF16 pretranspose decode with T > 1"
+        )
     if use_bf16_state:
         assert q.dtype in (torch.float16, torch.bfloat16), (
             f"q must be float16/bfloat16, got {q.dtype}"
@@ -322,8 +337,6 @@ def gated_delta_rule_decode_pretranspose(
                 initial_state_source=bf16_pool,
                 initial_state_indices=bf16_indices,
                 output_state_indices=output_state_indices,
-                intermediate_states_buffer=intermediate_states_buffer,
-                disable_state_update=disable_state_update,
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
                 output=forward_output,
@@ -343,6 +356,8 @@ def gated_delta_rule_decode_pretranspose(
                 initial_state_source=bf16_pool,
                 initial_state_indices=bf16_indices,
                 output_state_indices=output_state_indices,
+                intermediate_states_buffer=intermediate_states_buffer,
+                disable_state_update=disable_state_update,
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
                 output=forward_output,
@@ -393,8 +408,8 @@ def gated_delta_rule_decode_pretranspose(
             b=b,
             scale=scale,
             output=output,
-            intermediate_states_buffer=intermediate_states_buffer,
-            disable_state_update=disable_state_update,
+            intermediate_states_buffer=None,
+            disable_state_update=False,
             use_qk_l2norm=use_qk_l2norm,
             output_state_indices=output_state_indices,
         )
