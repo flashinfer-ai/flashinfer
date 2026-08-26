@@ -3371,6 +3371,28 @@ class _B12xRunner(MoERunner):
                 f"b12x unified MoE requires SM120 or SM121, got SM{major}{minor}."
             )
 
+        experts = self.config.experts
+        num_experts = self.config.routing.num_experts
+        local_num_experts = (
+            experts.local_num_experts
+            if experts.local_num_experts is not None
+            else num_experts
+        )
+        if experts.local_expert_offset != 0 or local_num_experts != num_experts:
+            if not 0 < local_num_experts <= num_experts:
+                raise ValueError(
+                    f"local_num_experts={local_num_experts} must be in "
+                    f"[1, num_experts={num_experts}]."
+                )
+            if (
+                experts.local_expert_offset < 0
+                or experts.local_expert_offset + local_num_experts > num_experts
+            ):
+                raise ValueError(
+                    f"local expert block [{experts.local_expert_offset}, "
+                    f"{experts.local_expert_offset + local_num_experts}) exceeds "
+                    f"num_experts={num_experts}."
+                )
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("b12x unified MoE requires do_finalize=True.")
 
@@ -3384,6 +3406,12 @@ class _B12xRunner(MoERunner):
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.activation = get_b12x_activation_name(config.activation.type)
         self.tuning_config = TuningConfig()
+        self._local_num_experts = (
+            config.experts.local_num_experts
+            if config.experts.local_num_experts is not None
+            else config.routing.num_experts
+        )
+        self._local_expert_offset = config.experts.local_expert_offset
         self._prepared_weights: dict[str, torch.Tensor] | None = None
         self._inner: Any = None
         self._wrapper_cls: Any = None
@@ -3434,13 +3462,29 @@ class _B12xRunner(MoERunner):
             and num_tokens <= self._inner.max_num_tokens
         ):
             return
+        num_experts = self.config.routing.num_experts
+        expert_map = None
+        if self._local_num_experts != num_experts or self._local_expert_offset != 0:
+            # ExpertConfig describes a contiguous shard, so expand it into
+            # the wrapper's global-to-local map.
+            expert_map = torch.full(
+                (num_experts,), -1, dtype=torch.int32, device=self.device
+            )
+            expert_map[
+                self._local_expert_offset : self._local_expert_offset
+                + self._local_num_experts
+            ] = torch.arange(
+                self._local_num_experts, dtype=torch.int32, device=self.device
+            )
         self._inner = self._wrapper_cls(
-            num_experts=self.config.routing.num_experts,
+            num_experts=num_experts,
             top_k=self.config.routing.top_k,
             hidden_size=hidden_size,
             intermediate_size=self.config.experts.intermediate_size,
             use_cuda_graph=True,
             max_num_tokens=max(1, num_tokens),
+            num_local_experts=self._local_num_experts,
+            expert_map=expert_map,
             device=self.device,
             activation=self.activation,
             quant_mode=self._get_quant_mode_name(),
@@ -3453,12 +3497,14 @@ class _B12xRunner(MoERunner):
         self._require_built()
         v = weights.get_view(self.backend_key)
         self._validate_prepared_weights(v)
-        first_weight = v[self.required_weight_keys[0]]
-        if first_weight.shape[0] != self.config.routing.num_experts:
-            raise ValueError(
-                f"{self.backend_key} prepared {first_weight.shape[0]} "
-                f"experts, expected {self.config.routing.num_experts}."
-            )
+        # Only the packed weights are expert-major; SFs are swizzled, alphas may broadcast.
+        for key in ("w1_weight", "w2_weight"):
+            prepared_experts = v[key].shape[0]
+            if prepared_experts != self._local_num_experts:
+                raise ValueError(
+                    f"{self.backend_key} {key} prepared {prepared_experts} "
+                    f"experts, expected {self._local_num_experts} rank-local ones."
+                )
 
         hidden_states = act.hidden_states_q
         if hidden_states.dtype != torch.bfloat16:
@@ -3555,11 +3601,17 @@ class B12xNvfp4Runner(_B12xRunner):
 
 
 class B12xW4A16Runner(_B12xRunner):
-    """Unified SM120/SM121 adapter for b12x W4A16 MoE."""
+    """Unified SM120/SM121 adapter for b12x W4A16 MoE.
+
+    Supports expert parallelism over a contiguous expert shard
+    (``ExpertConfig.local_expert_offset`` / ``local_num_experts``): each rank
+    computes a zero-filled partial that the caller sums across the EP group.
+    """
 
     backend_key = "b12x_w4a16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.W4A16,)
+    supports_expert_parallelism = True
     required_weight_keys = (
         "w1_weight",
         "w1_weight_sf",
