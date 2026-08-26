@@ -1228,11 +1228,25 @@ __device__ __forceinline__ void compute_qk(
           using packed2_ = std::conditional_t<std::is_same_v<DTypeQ_, half>, half2, __nv_bfloat162>;
           constexpr uint32_t SF_COLS_K = KTraits::NUM_MMA_D_QK;  // HEAD_DIM_QK / 16
           uint32_t sf_base = (mma_kv * 16 + lane_idx / 4) * SF_COLS_K + mma_d;
+          packed2_ scale_a, scale_b;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
+          // Pre-SM100 has no hardware e4m3->f16 convert, so `static_cast` below expands to a
+          // software conversion *per scale byte, per fragment*. Pack both bytes duplicated into one
+          // word and reuse the prmt/lop3 converter already used on the V side, which handles four
+          // at once: {a,a,b,b} -> {half2(a,a), half2(b,b)} == {scale_a, scale_b}.
+          uint32_t sf_pack = __byte_perm(uint32_t(k_sf_smem[sf_base]),
+                                        uint32_t(k_sf_smem[sf_base + 8 * SF_COLS_K]), 0x4400u);
+          uint2 sf_pair;
+          fast_dequant_f8f16x4<__nv_fp8_e4m3, DTypeQ_>(&sf_pack, &sf_pair);
+          scale_a = *(packed2_*)&sf_pair.x;
+          scale_b = *(packed2_*)&sf_pair.y;
+#else
           __nv_fp8_e4m3 sf_a_fp8, sf_b_fp8;
           sf_a_fp8.__x = k_sf_smem[sf_base];
           sf_b_fp8.__x = k_sf_smem[sf_base + 8 * SF_COLS_K];
-          packed2_ scale_a{static_cast<DTypeQ_>(sf_a_fp8), static_cast<DTypeQ_>(sf_a_fp8)};
-          packed2_ scale_b{static_cast<DTypeQ_>(sf_b_fp8), static_cast<DTypeQ_>(sf_b_fp8)};
+          scale_a = packed2_{static_cast<DTypeQ_>(sf_a_fp8), static_cast<DTypeQ_>(sf_a_fp8)};
+          scale_b = packed2_{static_cast<DTypeQ_>(sf_b_fp8), static_cast<DTypeQ_>(sf_b_fp8)};
+#endif
           *(packed2_*)&b_frag[0] = __hmul2(*(packed2_*)&b_frag[0], scale_a);
           *(packed2_*)&b_frag[1] = __hmul2(*(packed2_*)&b_frag[1], scale_a);
           *(packed2_*)&b_frag[2] = __hmul2(*(packed2_*)&b_frag[2], scale_b);
