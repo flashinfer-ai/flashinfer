@@ -23,7 +23,7 @@
 # The Cake selective-state and Mamba CUDA/host trees, along with frozen KDA
 # fallback sources, are byte-faithful generated exports; their SHA-256 digests
 # are checked by JIT manifests and must not be rewritten.
-exclude: ^(?:csrc/(?:blackwell_msa/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|kda/training_fallback_pointer_sm_(?:100a|103a)\.cu)|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/)
+exclude: ^(?:csrc/(?:blackwell_msa/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|kda/training_(?:fallback|grouped_row_wg8)_pointer_sm_(?:100a|103a)\.cu)|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/)
 
 repos:
   # Standard hooks

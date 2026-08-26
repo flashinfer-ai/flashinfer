@@ -27,6 +27,8 @@ class _TrainingRecorder:
         self.backward_calls = []
         self.row_forward_calls = []
         self.row_backward_calls = []
+        self.grouped_row_forward_calls = []
+        self.grouped_row_backward_calls = []
         self.c32_forward_calls = []
         self.c32_backward_calls = []
 
@@ -46,8 +48,16 @@ class _TrainingRecorder:
         assert len(args) == 33
         self.row_backward_calls.append(args)
 
+    def run_training_grouped_row_forward(self, *args):
+        assert len(args) == 31
+        self.grouped_row_forward_calls.append(args)
+
+    def run_training_grouped_row_backward(self, *args):
+        assert len(args) == 38
+        self.grouped_row_backward_calls.append(args)
+
     def run_training_c32_forward(self, *args):
-        assert len(args) == 51
+        assert len(args) == 52
         self.c32_forward_calls.append(args)
 
     def run_training_c32_backward(self, *args):
@@ -90,8 +100,8 @@ def test_training_api_signatures_and_no_forward_recompute():
 @pytest.mark.parametrize(
     ("seq_lens", "num_qk_heads", "num_v_heads", "tag", "family"),
     [
-        ((1024,) * 8, 4, 8, "grouped_c16", "c16"),
-        ((17, 33, 65), 4, 8, "grouped_c32", "c32"),
+        ((1024,) * 8, 4, 8, "grouped_hybrid_c16_c32", "c16"),
+        ((17, 33, 65), 4, 8, "grouped_row_split", "row_split"),
         ((17,), 1, 1, "row_split", "row_split"),
         ((1024,) * 8, 96, 96, "c16", "c16"),
         ((1300, 547, 2048, 963, 271, 3063), 96, 96, "c32", "c32"),
@@ -100,7 +110,7 @@ def test_training_api_signatures_and_no_forward_recompute():
 def test_full_training_dispatcher_route_selector(
     seq_lens, num_qk_heads, num_v_heads, tag, family
 ):
-    """Fast-path predicates select a route; they do not restrict the API."""
+    """The analytical selector chooses a strict route without shape guards."""
 
     spec = kda_training_api._select_training_route(seq_lens, num_qk_heads, num_v_heads)
     assert spec.tag == tag
@@ -111,7 +121,7 @@ def test_full_training_dispatcher_route_selector(
     ("batch_size", "seq_len", "num_heads", "tag"),
     [
         (2, 17, 1, "row_split"),
-        (4, 33, 16, "c32"),
+        (4, 33, 16, "row_split"),
         (8, 64, 32, "c16"),
     ],
 )
@@ -131,6 +141,71 @@ def test_public_contract_does_not_promote_fast_path_predicates_to_guards():
     assert "grouped Q/K heads only" not in source
     assert "torch.bfloat16" in source
     assert "torch.float32" in source
+
+
+def test_analytical_selector_preserves_template_choice_and_strict_adapter():
+    grouped = kda_training_api._select_training_route((3200,) * 9 + (3968,), 4, 8)
+    equal = kda_training_api._select_training_route((2656,) * 11 + (3552,), 4, 4)
+    assert grouped.selected_template == "checkpoint_recurrent_c16"
+    assert grouped.tag == "grouped_hybrid_c16_c32"
+    assert grouped.uses_parameter_context
+    assert equal.selected_template == "checkpoint_recurrent_c16"
+    assert equal.tag == "c32"
+    assert not equal.uses_parameter_context
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "heads", "template"),
+    [
+        ((1024,) * 2, 96, "tensor_tape_c32"),
+        ((1024,) * 4, 96, "checkpoint_recurrent_c16"),
+        ((2048,) * 4, 96, "tensor_tape_c32"),
+        ((2048,) * 5, 96, "checkpoint_recurrent_c16"),
+        ((512,), 8, "row_warp_checkpoint"),
+        ((17,), 1, "row_warp_checkpoint"),
+    ],
+)
+def test_analytical_template_crossovers(seq_lens, heads, template):
+    spec = kda_training_api._select_training_route(
+        seq_lens, heads, heads, resident_sms=152
+    )
+    assert spec.selected_template == template
+
+
+@pytest.mark.parametrize("resident_sms", [148, 152, 160])
+def test_all_customer_layouts_select_c16_template(resident_sms):
+    layouts = {
+        "a": (3200,) * 9 + (3968,),
+        "b": (2000,) * 8 + (2432,),
+        "c": (2656,) * 11 + (3552,),
+        "d": (1648,) * 10 + (1952,),
+    }
+    rows = (
+        (4, 8, "a"),
+        (2, 8, "b"),
+        (4, 4, "c"),
+        (2, 4, "d"),
+        (4, 8, "b"),
+        (2, 8, "a"),
+        (2, 4, "b"),
+        (4, 4, "d"),
+        (2, 8, "c"),
+        (4, 8, "d"),
+        (4, 4, "a"),
+        (2, 4, "c"),
+        (4, 4, "b"),
+        (2, 4, "a"),
+        (4, 8, "c"),
+        (2, 8, "d"),
+    )
+    for qk_heads, value_heads, layout in rows:
+        spec = kda_training_api._select_training_route(
+            layouts[layout],
+            qk_heads,
+            value_heads,
+            resident_sms=resident_sms,
+        )
+        assert spec.selected_template == "checkpoint_recurrent_c16"
 
 
 def test_context_has_an_explicit_route_tag():
@@ -305,8 +380,8 @@ def test_training_forward_context_backward_matches_fla():
 
 
 @pytest.mark.arch_blackwell
-def test_grouped_c32_forward_context_backward_matches_fla():
-    """The grouped C32 fallback is part of the API, not a rejected shape."""
+def test_grouped_row_forward_context_backward_matches_fla():
+    """The grouped WG8 row fallback is part of the public API."""
 
     _require_blackwell()
     inputs = _make_inputs(
@@ -315,12 +390,26 @@ def test_grouped_c32_forward_context_backward_matches_fla():
         num_qk_heads=4,
         num_v_heads=8,
     )
+    _assert_training_matches_fla(inputs, "grouped_row_split")
+
+
+@pytest.mark.arch_blackwell
+def test_grouped_c32_forward_context_backward_matches_fla():
+    """The grouped C32 template handles deeper unaligned recurrence."""
+
+    _require_blackwell()
+    inputs = _make_inputs(
+        seed=24105,
+        seq_lens=(4097,),
+        num_qk_heads=1,
+        num_v_heads=8,
+    )
     _assert_training_matches_fla(inputs, "grouped_c32")
 
 
 @pytest.mark.arch_blackwell
-def test_grouped_c16_forward_context_backward_matches_fla():
-    """The fast grouped route preserves paired forward/backward semantics."""
+def test_grouped_hybrid_forward_context_backward_matches_fla():
+    """The strict grouped route saves both contexts before backward."""
 
     _require_blackwell()
     inputs = _make_inputs(
@@ -329,12 +418,12 @@ def test_grouped_c16_forward_context_backward_matches_fla():
         num_qk_heads=4,
         num_v_heads=8,
     )
-    _assert_training_matches_fla(inputs, "grouped_c16")
+    _assert_training_matches_fla(inputs, "grouped_hybrid_c16_c32")
 
 
 @pytest.mark.arch_blackwell
-def test_high_head_mixed_c32_forward_context_backward_matches_fla():
-    """Mixed packed lengths use the equal-head C32 fallback without rejection."""
+def test_high_head_mixed_row_forward_context_backward_matches_fla():
+    """Mixed short packed lengths use the analytical row template."""
 
     _require_blackwell()
     inputs = _make_inputs(
@@ -343,12 +432,12 @@ def test_high_head_mixed_c32_forward_context_backward_matches_fla():
         num_qk_heads=16,
         num_v_heads=16,
     )
-    _assert_training_matches_fla(inputs, "c32")
+    _assert_training_matches_fla(inputs, "row_split")
 
 
 @pytest.mark.arch_blackwell
-def test_short_high_head_c32_forward_context_backward_matches_fla():
-    """A token-padded beta TMA scratch is materialized before C32 tape use."""
+def test_short_high_head_row_forward_context_backward_matches_fla():
+    """A short high-head row remains in the public legal domain."""
 
     _require_blackwell()
     inputs = _make_inputs(
@@ -357,7 +446,7 @@ def test_short_high_head_c32_forward_context_backward_matches_fla():
         num_qk_heads=16,
         num_v_heads=16,
     )
-    _assert_training_matches_fla(inputs, "c32")
+    _assert_training_matches_fla(inputs, "row_split")
 
 
 @pytest.mark.arch_blackwell
@@ -393,7 +482,7 @@ def test_packed_row_split_forward_context_backward_matches_fla():
     ("batch_size", "seq_len", "num_heads", "route"),
     [
         (2, 17, 1, "row_split"),
-        (4, 33, 16, "c32"),
+        (4, 33, 16, "row_split"),
         (8, 64, 32, "c16"),
     ],
 )
@@ -540,11 +629,20 @@ def test_paired_backward_ffi_does_not_rerun_forward(monkeypatch):
             ),
         ),
         (
-            "grouped_c32",
+            "grouped_row_split",
             lambda: _make_inputs(
                 seed=24005,
                 seq_lens=(17, 33, 65),
                 num_qk_heads=4,
+                num_v_heads=8,
+            ),
+        ),
+        (
+            "grouped_c32",
+            lambda: _make_inputs(
+                seed=24105,
+                seq_lens=(4097,),
+                num_qk_heads=1,
                 num_v_heads=8,
             ),
         ),
@@ -575,6 +673,14 @@ def test_fallback_ffi_consumes_route_context_without_recompute(
     if route == "row_split":
         assert len(training_module.row_forward_calls) == 1
         assert len(training_module.row_backward_calls) == 1
+    elif route == "grouped_row_split":
+        assert len(training_module.grouped_row_forward_calls) == 1
+        assert len(training_module.grouped_row_backward_calls) == 1
+        forward_args = training_module.grouped_row_forward_calls[0]
+        assert forward_args[2] is context._route_tensors["q_value_heads"]
+        assert forward_args[3] is context._route_tensors["k_value_heads"]
+        assert forward_args[24] == context._shape.num_qk_heads
+        assert forward_args[25] == context._shape.num_v_heads
     else:
         assert len(training_module.c32_forward_calls) == 1
         assert len(training_module.c32_backward_calls) == 1
@@ -587,6 +693,48 @@ def test_fallback_ffi_consumes_route_context_without_recompute(
         assert forward_args[44] == 1
     assert not training_module.forward_calls
     assert not training_module.backward_calls
+
+
+def test_grouped_hybrid_materializes_both_contexts_during_forward(monkeypatch):
+    _require_blackwell()
+    training_module = _TrainingRecorder()
+    monkeypatch.setattr(
+        kda_training_api, "_get_training_module", lambda _: training_module
+    )
+    values = _make_inputs(
+        seed=24001,
+        seq_lens=(1024,),
+        num_qk_heads=4,
+        num_v_heads=8,
+    )
+    _, _, context = recurrent_kda_training_forward(
+        values["q"],
+        values["k"],
+        values["v"],
+        values["g"],
+        values["beta"],
+        values["A_log"],
+        values["dt_bias"],
+        values["initial_state"],
+        values["cu_seqlens"],
+    )
+    assert context._route.tag == "grouped_hybrid_c16_c32"
+    assert context._parameter_context is not None
+    assert context._parameter_context._route.tag == "grouped_c32"
+    assert len(training_module.forward_calls) == 1
+    assert len(training_module.c32_forward_calls) == 1
+    assert training_module.c32_forward_calls[0][47] == 0
+
+    gradients = recurrent_kda_training_backward(
+        context, values["do"], values["dfinal_state"]
+    )
+    assert len(training_module.backward_calls) == 1
+    assert len(training_module.c32_backward_calls) == 1
+    c32_outputs = training_module.c32_backward_calls[0]
+    assert c32_outputs[43] is gradients[5]
+    assert c32_outputs[44] is gradients[6]
+    assert len(training_module.forward_calls) == 1
+    assert len(training_module.c32_forward_calls) == 1
 
 
 def test_training_rejects_cuda_graph_capture_before_ffi(monkeypatch):
