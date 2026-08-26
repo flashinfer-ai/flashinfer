@@ -427,7 +427,7 @@ def get_trtllm_comm_module():
 
 @functools.cache
 def get_cake_moe_comm_module(device_index: int):
-    """Load the independent SM100 Cake MoE communication module."""
+    """Load the independent SM100/SM103 Cake MoE communication module."""
     from ..jit.cake_moe_comm import load
 
     return load(device_index)
@@ -1246,6 +1246,15 @@ def _check_cake_moe_tensor(
         raise ValueError(f"{name} must be contiguous")
 
 
+def _check_cake_moe_arch(device_index: int) -> None:
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability not in ((10, 0), (10, 3)):
+        raise ValueError(
+            "Cake MoE communication requires SM100 or SM103, got "
+            f"SM{capability[0]}{capability[1]}"
+        )
+
+
 def _check_cake_moe_common(
     reference: torch.Tensor,
     workspace_ptrs: torch.Tensor,
@@ -1275,12 +1284,7 @@ def _check_cake_moe_common(
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    capability = torch.cuda.get_device_capability(device_index)
-    if capability != (10, 0):
-        raise ValueError(
-            "Cake MoE communication requires SM100, got "
-            f"SM{capability[0]}{capability[1]}"
-        )
+    _check_cake_moe_arch(device_index)
     _check_cake_moe_tensor(
         workspace_ptrs,
         "workspace_ptrs",
@@ -1499,7 +1503,8 @@ def trtllm_moe_allreduce_fusion(
     - weight_bias: bias added to rms_gamma before scaling.
                    None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
                    1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
-    - backend: ``"trtllm"`` (default) or the constrained ``"cake"`` SM100 backend.
+    - backend: ``"trtllm"`` (default) or the constrained ``"cake"``
+      SM100/SM103 backend.
       The Cake backend supports contiguous FP16/BF16 tensors, world sizes 2 and
       4, hidden_dim=7168, 1 to 2048 tokens, and residual plus norm outputs. It
       does not support quantization. ``weight_bias`` remains a runtime value;
@@ -1632,7 +1637,8 @@ def trtllm_moe_finalize_allreduce_fusion(
     - weight_bias: bias added to rms_gamma before scaling.
                    None or 0.0 -> standard RMSNorm (out = gamma * x * rsqrt(...)).
                    1.0          -> Gemma / Qwen3.5 RMSNorm (out = (1 + gamma) * x * rsqrt(...)).
-    - backend: ``"trtllm"`` (default) or the constrained ``"cake"`` SM100 backend.
+    - backend: ``"trtllm"`` (default) or the constrained ``"cake"``
+      SM100/SM103 backend.
       The Cake backend supports contiguous FP16/BF16 tensors, world sizes 2 and
       4, hidden_dim=7168, 1 to 2048 tokens, and residual plus norm outputs. It
       does not support quantization and requires ``expert_scale_factor``. Any

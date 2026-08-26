@@ -1,4 +1,4 @@
-"""Source-built Cake MoE communication kernels for SM100."""
+"""Source-built Cake MoE communication kernels for SM100 and SM103."""
 
 from __future__ import annotations
 
@@ -32,6 +32,11 @@ _KERNEL_SYMBOLS = (
     "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110",
     "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110",
 )
+
+_TARGET_ARCH_BY_CAPABILITY = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+}
 
 
 _HOST_SOURCE = r"""
@@ -297,9 +302,7 @@ def _load_source_bundle() -> tuple[Path, bytes]:
     )
     if not isinstance(manifest, dict):
         raise RuntimeError("Cake MoE communication manifest must be a JSON object")
-    expected = {
-        "schema_version": 2,
-        "arch": "sm_100a",
+    expected_common = {
         "compile_flags": ["--use_fast_math"],
         "launch": {
             "block_threads": 224,
@@ -328,6 +331,27 @@ def _load_source_bundle() -> tuple[Path, bytes]:
             },
         },
     }
+    schema_version = manifest.get("schema_version")
+    if schema_version == 2:
+        # The frozen source bundle predates SM103 qualification and records its
+        # original generation target. Keep validating that receipt exactly.
+        expected = {
+            "schema_version": 2,
+            "arch": "sm_100a",
+            **expected_common,
+        }
+    elif schema_version == 3:
+        # Future bundles declare every native JIT target explicitly. Exact list
+        # matching keeps architecture additions fail-closed.
+        expected = {
+            "schema_version": 3,
+            "architectures": list(_TARGET_ARCH_BY_CAPABILITY.values()),
+            **expected_common,
+        }
+    else:
+        raise RuntimeError(
+            "Cake MoE communication manifest mismatch for schema_version"
+        )
     expected_keys = set(expected) | {"source_sha256"}
     if set(manifest) != expected_keys:
         missing = sorted(expected_keys - set(manifest))
@@ -347,12 +371,13 @@ def _load_source_bundle() -> tuple[Path, bytes]:
 
 def _target_arch(device_index: int) -> str:
     capability = torch.cuda.get_device_capability(device_index)
-    if capability != (10, 0):
+    arch = _TARGET_ARCH_BY_CAPABILITY.get(capability)
+    if arch is None:
         raise ValueError(
-            "Cake MoE communication requires SM100, got "
+            "Cake MoE communication requires SM100 or SM103, got "
             f"SM{capability[0]}{capability[1]}"
         )
-    return "sm_100a"
+    return arch
 
 
 def _nvcc() -> Path:

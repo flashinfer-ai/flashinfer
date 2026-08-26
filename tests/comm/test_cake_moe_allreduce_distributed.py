@@ -1,4 +1,4 @@
-"""Distributed correctness coverage for the SM100 Cake MoE backend."""
+"""Distributed correctness coverage for the SM100/SM103 Cake MoE backend."""
 
 from __future__ import annotations
 
@@ -457,10 +457,12 @@ def _run_distributed(
     unsupported = [
         index
         for index in range(world_size)
-        if torch.cuda.get_device_capability(index) != (10, 0)
+        if torch.cuda.get_device_capability(index) not in ((10, 0), (10, 3))
     ]
     if unsupported:
-        pytest.skip(f"Cake MoE communication requires SM100 devices: {unsupported=}")
+        pytest.skip(
+            f"Cake MoE communication requires SM100/SM103 devices: {unsupported=}"
+        )
 
     context = mp.get_context("spawn")
     distributed_init_port = _get_open_port()

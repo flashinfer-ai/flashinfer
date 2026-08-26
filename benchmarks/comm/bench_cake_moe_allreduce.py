@@ -1,6 +1,6 @@
-"""Benchmark the SM100 Cake MoE backend against the TRT-LLM backend.
+"""Benchmark the SM100/SM103 Cake MoE backend against the TRT-LLM backend.
 
-Launch this file with ``torchrun`` on either two or four B200 GPUs.  Every
+Launch this file with ``torchrun`` on either two or four B200/B300 GPUs.  Every
 timed leg is bracketed by distributed correctness checks and uses a fresh IPC
 workspace so protocol state cannot leak between backends or shapes.
 """
@@ -593,10 +593,13 @@ def main() -> int:
 
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
-    if torch.cuda.get_device_capability(device) != (10, 0):
+    compute_capability = torch.cuda.get_device_capability(device)
+    if compute_capability not in ((10, 0), (10, 3)):
         parser.error(
-            f"Cake MoE communication requires SM100, got {torch.cuda.get_device_capability(device)}"
+            "Cake MoE communication requires SM100 or SM103, "
+            f"got {compute_capability}"
         )
+    cake_target_arch = cake_moe_comm._target_arch(local_rank)
 
     started = time.monotonic()
     cupti_version, cupti_module = _require_cupti()
@@ -715,6 +718,8 @@ def main() -> int:
                 "schema_version": 1,
                 "world_size": world_size,
                 "gpu": torch.cuda.get_device_name(device),
+                "compute_capability": list(compute_capability),
+                "cake_target_arch": cake_target_arch,
                 "cupti_python_version": cupti_version,
                 "timing": {
                     "method": "bench_gpu_time",

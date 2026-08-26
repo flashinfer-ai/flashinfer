@@ -68,39 +68,49 @@ def _finalize_args() -> dict:
     }
 
 
-def _cake_source_bundle_manifest(source: bytes) -> dict:
-    return {
-        "schema_version": 2,
-        "arch": "sm_100a",
-        "compile_flags": ["--use_fast_math"],
-        "launch": {
-            "block_threads": 224,
-            "cluster_dim": [4, 1, 1],
-            "dynamic_smem_bytes": 256,
-        },
-        "constraints": {
-            "dtypes": ["float16", "bfloat16"],
-            "hidden_dim": 7168,
-            "max_tokens": 2048,
-            "quantization": False,
-            "world_sizes": [2, 4],
-        },
-        "kernel_symbols": list(cake_moe_comm._KERNEL_SYMBOLS),
-        "workspace_protocol": {
-            "flag_region_bytes_by_world_size": {"2": 2048, "4": 4288},
-            "tp4_ack_tail": {
-                "offset_bytes": 4096,
-                "bytes": 192,
-                "generations": 3,
-                "consumers": 4,
-                "slot_bytes": 16,
-                "generation_stride_bytes": 64,
-                "empty_sentinel_u16": 32768,
-                "ready_u16": 0,
+def _cake_source_bundle_manifest(source: bytes, *, schema_version: int = 2) -> dict:
+    if schema_version == 2:
+        manifest = {"schema_version": 2, "arch": "sm_100a"}
+    elif schema_version == 3:
+        manifest = {
+            "schema_version": 3,
+            "architectures": ["sm_100a", "sm_103a"],
+        }
+    else:  # pragma: no cover - test helper callers use the schemas above.
+        raise ValueError(f"unsupported test manifest schema {schema_version}")
+    manifest.update(
+        {
+            "compile_flags": ["--use_fast_math"],
+            "launch": {
+                "block_threads": 224,
+                "cluster_dim": [4, 1, 1],
+                "dynamic_smem_bytes": 256,
             },
-        },
-        "source_sha256": hashlib.sha256(source).hexdigest(),
-    }
+            "constraints": {
+                "dtypes": ["float16", "bfloat16"],
+                "hidden_dim": 7168,
+                "max_tokens": 2048,
+                "quantization": False,
+                "world_sizes": [2, 4],
+            },
+            "kernel_symbols": list(cake_moe_comm._KERNEL_SYMBOLS),
+            "workspace_protocol": {
+                "flag_region_bytes_by_world_size": {"2": 2048, "4": 4288},
+                "tp4_ack_tail": {
+                    "offset_bytes": 4096,
+                    "bytes": 192,
+                    "generations": 3,
+                    "consumers": 4,
+                    "slot_bytes": 16,
+                    "generation_stride_bytes": 64,
+                    "empty_sentinel_u16": 32768,
+                    "ready_u16": 0,
+                },
+            },
+            "source_sha256": hashlib.sha256(source).hexdigest(),
+        }
+    )
+    return manifest
 
 
 def _write_cake_source_bundle(tmp_path, *, manifest_text: str | None = None):
@@ -468,6 +478,89 @@ def test_exact_cake_source_bundle_manifest_loads(
                 "flag_size": 4096,
             },
         )
+
+
+def test_exact_dual_arch_cake_source_bundle_manifest_loads(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    source_path, source = _write_cake_source_bundle(tmp_path)
+    manifest = _cake_source_bundle_manifest(source, schema_version=3)
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(cake_moe_comm, "_source_dir", lambda: tmp_path)
+
+    assert cake_moe_comm._load_source_bundle() == (source_path, source)
+
+
+@pytest.mark.parametrize(
+    "capability,expected",
+    (((10, 0), "sm_100a"), ((10, 3), "sm_103a")),
+)
+def test_cake_target_arch_maps_supported_blackwell_devices(
+    monkeypatch: pytest.MonkeyPatch,
+    capability: tuple[int, int],
+    expected: str,
+):
+    monkeypatch.setattr(
+        cake_moe_comm.torch.cuda,
+        "get_device_capability",
+        lambda device_index: capability,
+    )
+
+    assert cake_moe_comm._target_arch(0) == expected
+
+
+@pytest.mark.parametrize("capability", ((9, 0), (12, 0)))
+def test_cake_target_arch_rejects_other_devices(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+):
+    monkeypatch.setattr(
+        cake_moe_comm.torch.cuda,
+        "get_device_capability",
+        lambda device_index: capability,
+    )
+
+    with pytest.raises(ValueError, match="requires SM100 or SM103"):
+        cake_moe_comm._target_arch(0)
+
+
+@pytest.mark.parametrize("capability", ((10, 0), (10, 3)))
+def test_public_cake_arch_guard_accepts_supported_blackwell_devices(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+):
+    monkeypatch.setattr(
+        trtllm_ar.torch.cuda,
+        "get_device_capability",
+        lambda device_index: capability,
+    )
+
+    trtllm_ar._check_cake_moe_arch(0)
+
+
+@pytest.mark.parametrize("capability", ((9, 0), (12, 0)))
+def test_public_cake_arch_guard_rejects_other_devices(
+    monkeypatch: pytest.MonkeyPatch, capability: tuple[int, int]
+):
+    monkeypatch.setattr(
+        trtllm_ar.torch.cuda,
+        "get_device_capability",
+        lambda device_index: capability,
+    )
+
+    with pytest.raises(ValueError, match="requires SM100 or SM103"):
+        trtllm_ar._check_cake_moe_arch(0)
+
+
+def test_dual_arch_cake_source_bundle_rejects_architecture_drift(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    _, source = _write_cake_source_bundle(tmp_path)
+    manifest = _cake_source_bundle_manifest(source, schema_version=3)
+    manifest["architectures"] = ["sm_103a", "sm_100a"]
+    (tmp_path / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    monkeypatch.setattr(cake_moe_comm, "_source_dir", lambda: tmp_path)
+
+    with pytest.raises(RuntimeError, match="mismatch for architectures"):
+        cake_moe_comm._load_source_bundle()
 
 
 def test_cake_source_bundle_rejects_unknown_manifest_key(
