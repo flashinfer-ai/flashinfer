@@ -46,8 +46,11 @@ from flashinfer.fused_moe import (
     BackendOptions,
     CuteDslConfig,
     CuteDslNvfp4Runner,
-    CutlassConfig,
     CutlassBf16Config,
+    CutlassFp8BlockConfig,
+    CutlassFp8PerTensorConfig,
+    CutlassMxfp8Config,
+    CutlassNvfp4Config,
     ExecutionConfig,
     MoEFinalizeConfig,
     ExpertConfig,
@@ -72,6 +75,7 @@ from flashinfer.fused_moe import (
     TrtllmMxInt4RoutedRunner,
 )
 from flashinfer.fused_moe.runners import MoERunner
+from flashinfer.fused_moe.core import _fake_trtllm_moe_output
 from flashinfer.utils import get_compute_capability
 
 
@@ -89,6 +93,30 @@ from tests.moe.test_cute_dsl_fused_moe import (  # noqa: E402
     compute_reference_moe_fp4,
     create_moe_tensors,
 )
+
+
+def test_noaux_tc_ref_excludes_unselected_groups_with_negative_scores():
+    from tests.moe.trtllm_gen_fused_moe_utils import noaux_tc_ref
+
+    logits = torch.zeros((1, 8), dtype=torch.float32)
+    bias = torch.tensor(
+        [[2.5, 1.5, 0.5, -1.5, 0.0, -0.1, -0.2, -0.3]],
+        dtype=torch.float32,
+    )
+
+    scores = noaux_tc_ref(
+        logits,
+        bias,
+        n_group=2,
+        topk_group=1,
+        top_k=4,
+        routed_scaling_factor=1.0,
+    )
+
+    selected = torch.where(scores[0] != 0)[0]
+    assert set(selected.tolist()) == {0, 1, 2, 3}
+
+
 # ---------------------------------------------------------------------------
 # Enum repr round-trip
 # ---------------------------------------------------------------------------
@@ -106,6 +134,67 @@ class TestEnumRepr:
     @pytest.mark.parametrize("member", list(QuantVariant))
     def test_quant_variant_repr(self, member):
         assert eval(repr(member)) == member
+
+
+class TestTrtllmFakeOutputContract:
+    class _FakeContext:
+        def __init__(self):
+            self._next = 16
+
+        def new_dynamic_size(self):
+            self._next += 1
+            return self._next
+
+    def test_unfinalized_generated_weights(self, monkeypatch):
+        monkeypatch.setattr(torch.library, "get_ctx", lambda: self._FakeContext())
+        hidden_states = torch.empty((4, 32), device="meta")
+        result = _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=32,
+            intermediate_size=64,
+            top_k=2,
+            do_finalize=False,
+        )
+
+        assert len(result) == 3
+        assert result[0].shape == (17, 32)
+        assert result[1].shape == (4, 2)
+        assert result[1].dtype == torch.bfloat16
+        assert result[2].shape == (8,)
+        assert result[2].dtype == torch.int32
+
+    def test_unfinalized_preserves_precomputed_weights(self, monkeypatch):
+        monkeypatch.setattr(torch.library, "get_ctx", lambda: self._FakeContext())
+        hidden_states = torch.empty((4, 32), device="meta")
+        weights = torch.empty((4, 2), dtype=torch.float32, device="meta")
+        result = _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=32,
+            intermediate_size=64,
+            top_k=2,
+            do_finalize=False,
+            expert_weights=weights,
+        )
+
+        assert result[1] is weights
+
+    def test_finalized_lora_arity(self, monkeypatch):
+        monkeypatch.setattr(torch.library, "get_ctx", lambda: self._FakeContext())
+        hidden_states = torch.empty((4, 32), device="meta")
+        lora_delta = torch.empty((4, 128), device="meta")
+        result = _fake_trtllm_moe_output(
+            hidden_states,
+            hidden_size=32,
+            intermediate_size=64,
+            top_k=2,
+            do_finalize=True,
+            gemm1_lora_delta=lora_delta,
+        )
+
+        assert len(result) == 3
+        assert result[0].shape == (4, 32)
+        assert result[1].shape == (8,)
+        assert result[2].shape == (17, 64)
 
 
 # ---------------------------------------------------------------------------
@@ -216,11 +305,11 @@ class TestReprRoundTrip:
         assert _eval_repr(cfg) == cfg
 
     def test_backend_options_multi(self):
-        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig()))
+        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassNvfp4Config()))
         reconstructed = _eval_repr(opts)
         assert len(reconstructed) == 2
         assert isinstance(reconstructed.candidates[0], TrtllmFp4Config)
-        assert isinstance(reconstructed.candidates[1], CutlassConfig)
+        assert isinstance(reconstructed.candidates[1], CutlassNvfp4Config)
 
     def test_backend_options_single(self):
         opts = BackendOptions(candidates=(TrtllmFp8PerTensorConfig(),))
@@ -250,7 +339,7 @@ class TestReprRoundTrip:
             experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
             activation=ActivationConfig(type=ActivationType.Geglu),
             backend=BackendOptions(
-                candidates=(TrtllmFp8BlockConfig(), CutlassConfig())
+                candidates=(TrtllmFp8BlockConfig(), CutlassMxfp8Config())
             ),
             execution=ExecutionConfig(enable_pdl=True, tune_max_num_tokens=4096),
         )
@@ -264,13 +353,13 @@ class TestReprRoundTrip:
 
 class TestBackendOptions:
     def test_explicit_candidates(self):
-        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig()))
+        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassNvfp4Config()))
         assert isinstance(opts, BackendOptions)
         assert len(opts) == 2
 
     def test_multiple_candidates(self):
         opts = BackendOptions(
-            candidates=(TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig())
+            candidates=(TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassNvfp4Config())
         )
         assert len(opts) == 3
 
@@ -289,7 +378,6 @@ class TestBackendOptions:
         )
         valid = opts.valid_for(100)
         assert len(valid) == 3
-        assert not CutlassConfig.supported(100)
         assert CutlassBf16Config.supported(100)
         assert TrtllmBf16Config.supported(100)
         assert TrtllmBf16Config.supported(103)
@@ -308,11 +396,11 @@ class TestBackendOptions:
         assert not TrtllmFp8PerTensorConfig.supported(120)
 
     def test_iteration(self):
-        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig()))
+        opts = BackendOptions(candidates=(TrtllmFp4Config(), CutlassNvfp4Config()))
         items = list(opts)
         assert len(items) == 2
         assert any(isinstance(c, TrtllmFp4Config) for c in items)
-        assert any(isinstance(c, CutlassConfig) for c in items)
+        assert any(isinstance(c, CutlassNvfp4Config) for c in items)
 
     def test_empty(self):
         opts = BackendOptions()
@@ -402,7 +490,9 @@ class TestImmutableReplace:
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=512),
         )
-        narrow = dataclasses.replace(cfg, backend=BackendOptions((CutlassConfig(),)))
+        narrow = dataclasses.replace(
+            cfg, backend=BackendOptions((CutlassNvfp4Config(),))
+        )
         assert len(narrow.backend) == 1
 
 
@@ -484,7 +574,9 @@ class TestExpressiveness:
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=1024),
             activation=ActivationConfig(type=ActivationType.Swiglu),
-            backend=BackendOptions(candidates=(TrtllmFp4Config(), CutlassConfig())),
+            backend=BackendOptions(
+                candidates=(TrtllmFp4Config(), CutlassNvfp4Config())
+            ),
         )
         assert cfg.routing.method == RoutingMethodType.DeepSeekV3
         assert cfg.quant.variant == QuantVariant.NVFP4
@@ -502,7 +594,7 @@ class TestExpressiveness:
             experts=ExpertConfig(intermediate_size=512),
             activation=ActivationConfig(type=ActivationType.Swiglu),
             backend=BackendOptions(
-                candidates=(TrtllmFp8BlockConfig(), CutlassConfig())
+                candidates=(TrtllmFp8BlockConfig(), CutlassMxfp8Config())
             ),
         )
         assert cfg.quant.variant == QuantVariant.MxFp8
@@ -513,7 +605,9 @@ class TestExpressiveness:
             routing=RoutingConfig(num_experts=8, top_k=2),
             quant=QuantConfig(variant=QuantVariant.FP8PerTensor),
             experts=ExpertConfig(intermediate_size=512),
-            backend=BackendOptions((TrtllmFp8PerTensorConfig(),)),
+            backend=BackendOptions(
+                candidates=(TrtllmFp8PerTensorConfig(), CutlassFp8PerTensorConfig())
+            ),
         )
         assert cfg.quant.variant == QuantVariant.FP8PerTensor
 
@@ -544,17 +638,15 @@ class TestExpressiveness:
         assert cfg.quant.variant == QuantVariant.MxInt4
 
     def test_cutlass_modular_fp8(self):
-        """Legacy declarative CUTLASS modular FP8 config."""
+        """CUTLASS DeepSeek block-scale FP8 config."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=64, top_k=8),
             quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
             experts=ExpertConfig(intermediate_size=2048),
             activation=ActivationConfig(type=ActivationType.Swiglu),
-            backend=BackendOptions((CutlassConfig(),)),
+            backend=BackendOptions((CutlassFp8BlockConfig(),)),
         )
-        # CutlassConfig preserves the historical quant-neutral declarative form for
-        # compatibility; it is not a registered runnable backend.
-        assert any(isinstance(c, CutlassConfig) for c in cfg.backend)
+        assert any(isinstance(c, CutlassFp8BlockConfig) for c in cfg.backend)
 
     def test_cutedsl_nvfp4(self):
         """CuteDSL NVFP4 config."""
@@ -563,7 +655,7 @@ class TestExpressiveness:
             quant=QuantConfig(variant=QuantVariant.NVFP4),
             experts=ExpertConfig(intermediate_size=1024),
             activation=ActivationConfig(type=ActivationType.Swiglu),
-            backend=BackendOptions(candidates=(CuteDslConfig(), CutlassConfig())),
+            backend=BackendOptions(candidates=(CuteDslConfig(), CutlassNvfp4Config())),
         )
         assert any(isinstance(c, CuteDslConfig) for c in cfg.backend)
 
@@ -670,15 +762,18 @@ class TestMoERunnerSupport:
         with pytest.raises(NotImplementedError, match="Swiglu"):
             runner.check_support()
 
-    def test_fp8_block_unfinalized_not_supported(self):
+    def test_fp8_block_unfinalized_supported(self, monkeypatch):
+        import flashinfer.utils as utils
+
         cfg = self._nvfp4_swiglu(
             quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
             finalize=MoEFinalizeConfig(do_finalize=False),
         )
         runner = TrtllmFp8BlockRunner.__new__(TrtllmFp8BlockRunner)
         runner.config = cfg
-        with pytest.raises(NotImplementedError, match="do_finalize=True"):
-            runner.check_support()
+        runner.device = torch.device("cuda")
+        monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 0))
+        runner.check_support()
 
     @pytest.mark.parametrize(
         ("runner_type", "variant"),
@@ -709,7 +804,7 @@ class TestMoERunnerSupport:
             with pytest.raises(NotImplementedError, match="SM100/SM103"):
                 runner.check_support()
 
-    def test_bf16_unfinalized_not_supported(self, monkeypatch):
+    def test_bf16_unfinalized_supported(self, monkeypatch):
         import flashinfer.utils as utils
 
         cfg = self._nvfp4_swiglu(
@@ -720,8 +815,7 @@ class TestMoERunnerSupport:
         runner.config = cfg
         runner.device = torch.device("cuda")
         monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 0))
-        with pytest.raises(NotImplementedError, match="do_finalize=True"):
-            runner.check_support()
+        runner.check_support()
 
     def test_bf16_sm120_rejected_before_launch(self, monkeypatch):
         import flashinfer.utils as utils

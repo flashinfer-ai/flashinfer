@@ -23,8 +23,10 @@ from enum import Enum
 from types import SimpleNamespace
 from typing import Callable, List, Literal, Optional, Tuple
 
-from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
+from packaging.version import Version
 import torch
+
+from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.gemm import (
@@ -101,6 +103,8 @@ from ..jit.gemm import gen_fp8_blockscale_gemm_sm90_module
 from ..tllm_enums import DtypeTrtllmGen, SfLayout
 from .routergemm import get_tinygemm2_module
 
+
+_MIN_B12X_CUDA_VERSION = Version("12.9")
 
 logger = logging.getLogger(__name__)
 
@@ -6194,11 +6198,13 @@ def _b12x_gemm_fp4_requirement(
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
-    # b12x backend requires CUDA 13+ and 128x4 scale factor layout.
-    if get_cuda_version().major < 13:
+    cuda_version = get_cuda_version()
+    min_cuda_version = _MIN_B12X_CUDA_VERSION if use_nvfp4 else Version("13.0")
+    if cuda_version < min_cuda_version:
         raise ValueError(
-            "b12x FP4 GEMM requires CUDA 13 or later. "
-            f"Current CUDA version: {get_cuda_version()}."
+            f"b12x {'NVFP4' if use_nvfp4 else 'MXFP4'} GEMM requires "
+            f"CUDA {min_cuda_version} or later. "
+            f"Current CUDA version: {cuda_version}."
         )
     if use_8x4_sf_layout:
         raise ValueError("b12x FP4 GEMM only supports 128x4 scale factor layout.")
@@ -6887,24 +6893,33 @@ def _heuristic_func_mm_fp4(
       - On SM100 (B200) - use cudnn (faster based on benchmarks).
 
     """
-    cuda_major = get_cuda_version().major
+    cuda_version = get_cuda_version()
     # Get compute capability to distinguish between SM100 (10.0) and SM103 (10.3)
     major, minor = get_compute_capability(a.device)
     is_sm107 = major == 10 and minor == 7
     is_sm103 = major == 10 and minor == 3
     is_sm120 = major == 12 and minor == 0
 
-    # SM120 + CUDA 13: prefer b12x for both NVFP4 and MXFP4. SM121 (GB10) is
-    # intentionally excluded -- b12x is supported there as an explicit backend,
-    # but cutlass/cudnn are faster in most cases, so `auto` keeps using them.
-    if is_sm120 and cuda_major >= 13:
+    # SM120 prefers b12x from CUDA 12.9 for NVFP4 and CUDA 13 for MXFP4.
+    # SM121 (GB10) is intentionally excluded from automatic selection because
+    # cutlass/cudnn are faster in most cases; b12x remains explicitly selectable.
+    b12x_cuda_supported = (
+        cuda_version >= _MIN_B12X_CUDA_VERSION
+        if use_nvfp4
+        else cuda_version.major >= 13
+    )
+    if is_sm120 and b12x_cuda_supported:
         return [c for c in ("b12x", "cutlass", "cudnn") if c in suitable_backends]
 
     candidate_backends: Tuple[str, ...]
     # If cuda version is 13 or greater and cudnn version is 9.15 or greater:
     # On SM103 (B300), cutlass is more performant than cudnn.
     # On SM100 (B200), cudnn is more performant than cutlass.
-    if CUDNN_AVAILABLE and cuda_major >= 13 and cudnn.backend_version() >= 91500:
+    if (
+        CUDNN_AVAILABLE
+        and cuda_version.major >= 13
+        and cudnn.backend_version() >= 91500
+    ):
         if is_sm103:
             candidate_backends = ("cutlass", "cudnn")
         elif is_sm107:
