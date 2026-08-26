@@ -33,11 +33,11 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define TMEM_SCORES_0_OFFSET 0
 #define TMEM_SCORES_1_OFFSET 128
 #define TMEM_TMEM_SFA_PV0_LO_OFFSET 80
-#define TMEM_TMEM_SFA_PV0_HI_OFFSET 84
+#define TMEM_TMEM_SFA_PV0_HI_OFFSET 240
 #define TMEM_TMEM_SFB_PV0_LO_OFFSET 88
-#define TMEM_TMEM_SFB_PV0_HI_OFFSET 92
+#define TMEM_TMEM_SFB_PV0_HI_OFFSET 244
 #define TMEM_TMEM_SFB_PV0_RES_LO_OFFSET 96
-#define TMEM_TMEM_SFB_PV0_RES_HI_OFFSET 100
+#define TMEM_TMEM_SFB_PV0_RES_HI_OFFSET 248
 #define TMEM_TMEM_SFA_PV1_LO_OFFSET 208
 #define TMEM_TMEM_SFA_PV1_HI_OFFSET 212
 #define TMEM_TMEM_SFB_PV1_LO_OFFSET 216
@@ -49,6 +49,8 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define NUM_Q_STAGES 2
 #define NUM_KV_STAGES 3
 #define NUM_ACC_STAGES 1
+#define NUM_PV_READS_STAGES 2
+#define NUM_P0_HIGH_STAGES 2
 #define SMEM_SSCALE_OFF 1024
 #define SMEM_SSCALE_STAGE_BYTES 1024
 #define SMEM_SSCALE_STRIDE 1024
@@ -598,8 +600,8 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(SFVtHi)) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(O)) : "memory"); }
 
-    // Mbarrier init (11 groups, 24 barriers)
-    // Mbarriers at smem_raw[0..192)
+    // Mbarrier init (15 groups, 31 barriers)
+    // Mbarriers at smem_raw[0..248)
 
     {
         const int warp = make_warp_uniform(tid / 32);
@@ -642,6 +644,19 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                 // epi_empty: 2 barriers, init_count=32
                 mbarrier_init(smem + 176, 32);
                 mbarrier_init(smem + 184, 32);
+                // --- pipeline 'pv_reads' ---
+                // pv_stage0_reads_done: 2 barriers, init_count=1
+                mbarrier_init(smem + 192, 1);
+                mbarrier_init(smem + 200, 1);
+                // pv_stage1_reads_done: 2 barriers, init_count=1
+                mbarrier_init(smem + 208, 1);
+                mbarrier_init(smem + 216, 1);
+                // --- pipeline 'p0_high' ---
+                // p0_high_done: 2 barriers, init_count=1
+                mbarrier_init(smem + 224, 1);
+                mbarrier_init(smem + 232, 1);
+                // stage1_score_tail_free: 1 barriers, init_count=128
+                mbarrier_init(smem + 240, 128);
                 asm volatile("fence.mbarrier_init.release.cluster;");
             }
         }
@@ -650,11 +665,11 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
     __syncwarp();
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 192);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 248);
     {
         const int warp = make_warp_uniform(tid / 32);
         if (warp == 12) {
-            int _tmem_hold = smem + 192;
+            int _tmem_hold = smem + 248;
             asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
             asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
         }
@@ -675,17 +690,21 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
     #define p_full_2_addr (mbar_base + 144)
     #define epi_full_addr (mbar_base + 160)
     #define epi_empty_addr (mbar_base + 176)
+    #define pv_stage0_reads_done_addr (mbar_base + 192)
+    #define pv_stage1_reads_done_addr (mbar_base + 208)
+    #define p0_high_done_addr (mbar_base + 224)
+    #define stage1_score_tail_free_addr (mbar_base + 240)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
     const int tmem_scores_0 = taddr;
     const int tmem_scores_1 = taddr + 128;
     const int tmem_tmem_sfa_pv0_lo = taddr + 80;
-    const int tmem_tmem_sfa_pv0_hi = taddr + 84;
+    const int tmem_tmem_sfa_pv0_hi = taddr + 240;
     const int tmem_tmem_sfb_pv0_lo = taddr + 88;
-    const int tmem_tmem_sfb_pv0_hi = taddr + 92;
+    const int tmem_tmem_sfb_pv0_hi = taddr + 244;
     const int tmem_tmem_sfb_pv0_res_lo = taddr + 96;
-    const int tmem_tmem_sfb_pv0_res_hi = taddr + 100;
+    const int tmem_tmem_sfb_pv0_res_hi = taddr + 248;
     const int tmem_tmem_sfa_pv1_lo = taddr + 208;
     const int tmem_tmem_sfa_pv1_hi = taddr + 212;
     const int tmem_tmem_sfb_pv1_lo = taddr + 216;
@@ -714,6 +733,7 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
             int scale_off = make_warp_uniform(stage * (unsigned int)BLOCK_M);
             unsigned int total_tiles = NUM_M_BLOCKS * total_bh;
             unsigned int _phase_s_full = 0;
+            unsigned int _phase_stage1_score_tail_free_0 = 0;
             unsigned int _phase_o_full = 0;
             #pragma unroll 1
             for (unsigned int tile_idx = bid; tile_idx < total_tiles; tile_idx += num_bids) {
@@ -740,6 +760,9 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                 tmem_ld_x32(&_tmem_load_0[32], s_base + 32);
                 tmem_ld_x32(&_tmem_load_0[64], s_base + 64);
                 tmem_ld_x32(&_tmem_load_0[96], s_base + 96);
+                if (stage == 1) {
+                    mbarrier_arrive(stage1_score_tail_free_addr);
+                }
                 {
                     int tail_valid = seqlen_kv - n_block * BLOCK_N;
                     if (tail_valid < BLOCK_N) {
@@ -1366,6 +1389,12 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                     : "memory");
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 mbarrier_arrive(p_full_addr + (stage) * 8);
+                if (stage == 0) {
+                    mbarrier_wait(stage1_score_tail_free_addr, _phase_stage1_score_tail_free_0);
+                    _phase_stage1_score_tail_free_0 ^= 1;
+                }
+                int p_hi_off = ((stage == 0) ? TMEM_SCORES_1_OFFSET + 104 : TMEM_SCORES_1_OFFSET + 72);
+                int sfa_hi_off = ((stage == 0) ? TMEM_TMEM_SFA_PV0_HI_OFFSET : TMEM_TMEM_SFA_PV1_HI_OFFSET);
                 float _exp2_4 = approx_exp2(((group_max4 > -WAN_HYBRID_INF) ? group_max4 * softmax_scale_log2 : 0.0f) - new_max_scaled - 2.584962500721156f);
                 sf_values[0] = ((group_max4 > -WAN_HYBRID_INF) ? _exp2_4 : 0.0f);
                 const float2 _fma_b2_16 = {softmax_scale_log2, softmax_scale_log2};
@@ -1395,7 +1424,7 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                 asm volatile(
                     "tcgen05.st.sync.aligned.32x32b.x2.b32"
                     " [%0], {%1, %2};"
-                    :: "r"(taddr + (unsigned int)p_stage_off + 72 + (unsigned int)(warp % 4 * 32 << 16)), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_4[1]))
+                    :: "r"(taddr + (unsigned int)p_hi_off + (unsigned int)(warp % 4 * 32 << 16)), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_4[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_4[1]))
                     : "memory");
                 float _exp2_5 = approx_exp2(((group_max5 > -WAN_HYBRID_INF) ? group_max5 * softmax_scale_log2 : 0.0f) - new_max_scaled - 2.584962500721156f);
                 sf_values[1] = ((group_max5 > -WAN_HYBRID_INF) ? _exp2_5 : 0.0f);
@@ -1426,7 +1455,7 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                 asm volatile(
                     "tcgen05.st.sync.aligned.32x32b.x2.b32"
                     " [%0], {%1, %2};"
-                    :: "r"(taddr + (unsigned int)p_stage_off + 72 + (unsigned int)(warp % 4 * 32 << 16) + 2), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_5[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_5[1]))
+                    :: "r"(taddr + (unsigned int)p_hi_off + (unsigned int)(warp % 4 * 32 << 16) + 2), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_5[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_5[1]))
                     : "memory");
                 float _exp2_6 = approx_exp2(((group_max6 > -WAN_HYBRID_INF) ? group_max6 * softmax_scale_log2 : 0.0f) - new_max_scaled - 2.584962500721156f);
                 sf_values[2] = ((group_max6 > -WAN_HYBRID_INF) ? _exp2_6 : 0.0f);
@@ -1457,7 +1486,7 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                 asm volatile(
                     "tcgen05.st.sync.aligned.32x32b.x2.b32"
                     " [%0], {%1, %2};"
-                    :: "r"(taddr + (unsigned int)p_stage_off + 72 + (unsigned int)(warp % 4 * 32 << 16) + 4), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_6[1]))
+                    :: "r"(taddr + (unsigned int)p_hi_off + (unsigned int)(warp % 4 * 32 << 16) + 4), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_6[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_6[1]))
                     : "memory");
                 float _exp2_7 = approx_exp2(((group_max7 > -WAN_HYBRID_INF) ? group_max7 * softmax_scale_log2 : 0.0f) - new_max_scaled - 2.584962500721156f);
                 sf_values[3] = ((group_max7 > -WAN_HYBRID_INF) ? _exp2_7 : 0.0f);
@@ -1488,7 +1517,7 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                 asm volatile(
                     "tcgen05.st.sync.aligned.32x32b.x2.b32"
                     " [%0], {%1, %2};"
-                    :: "r"(taddr + (unsigned int)p_stage_off + 72 + (unsigned int)(warp % 4 * 32 << 16) + 6), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_7[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_7[1]))
+                    :: "r"(taddr + (unsigned int)p_hi_off + (unsigned int)(warp % 4 * 32 << 16) + 6), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_7[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_7[1]))
                     : "memory");
                 uint32_t _fp8_1[1];
                 {
@@ -1507,7 +1536,7 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                 asm volatile(
                     "tcgen05.st.sync.aligned.32x32b.x1.b32"
                     " [%0], {%1};"
-                    :: "r"(taddr + (unsigned int)p_stage_off + 84 + (unsigned int)(warp % 4)), "r"(*reinterpret_cast<const uint32_t*>(&_fp8_1[0]))
+                    :: "r"(taddr + (unsigned int)sfa_hi_off + (unsigned int)(warp % 4)), "r"(*reinterpret_cast<const uint32_t*>(&_fp8_1[0]))
                     : "memory");
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 mbarrier_arrive(p_full_2_addr + (stage) * 8);
@@ -1523,6 +1552,9 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                     tmem_ld_x32(&_tmem_load_1[32], s_base_1 + 32);
                     tmem_ld_x32(&_tmem_load_1[64], s_base_1 + 64);
                     tmem_ld_x32(&_tmem_load_1[96], s_base_1 + 96);
+                    if (stage == 1) {
+                        mbarrier_arrive(stage1_score_tail_free_addr);
+                    }
                     int valid_count = causal_row - n_block_0 * BLOCK_N + 1;
                     uint32_t _slice_lo_mask_8;
                     {
@@ -2154,6 +2186,12 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                         : "memory");
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(p_full_addr + (stage) * 8);
+                    if (stage == 0) {
+                        mbarrier_wait(stage1_score_tail_free_addr, _phase_stage1_score_tail_free_0);
+                        _phase_stage1_score_tail_free_0 ^= 1;
+                    }
+                    int p_hi_off_104 = ((stage == 0) ? TMEM_SCORES_1_OFFSET + 104 : TMEM_SCORES_1_OFFSET + 72);
+                    int sfa_hi_off_105 = ((stage == 0) ? TMEM_TMEM_SFA_PV0_HI_OFFSET : TMEM_TMEM_SFA_PV1_HI_OFFSET);
                     float _exp2_13 = approx_exp2(((group_max4 > -WAN_HYBRID_INF) ? group_max4 * softmax_scale_log2 : 0.0f) - new_max_scaled_69 - 2.584962500721156f);
                     sf_values_71[0] = ((group_max4 > -WAN_HYBRID_INF) ? _exp2_13 : 0.0f);
                     const float2 _fma_b2_40 = {softmax_scale_log2, softmax_scale_log2};
@@ -2166,24 +2204,24 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                         _tmem_load_1[_le + 64] = approx_exp2(_tmem_load_1[_le + 64]);
                     }
                     float2 _f2_38 = make_float2(_tmem_load_1[64], _tmem_load_1[65]);
-                    float2 partial_104 = _f2_38;
+                    float2 partial_106 = _f2_38;
                     #pragma unroll
                     for (int pair_12 = 2; pair_12 < 16; pair_12 += 2) {
                         float2 _f2_39 = make_float2((_tmem_load_1 + 64)[pair_12], (_tmem_load_1 + 64)[pair_12 + 1]);
-                        partial_104 = add_f32x2(partial_104, _f2_39);
+                        partial_106 = add_f32x2(partial_106, _f2_39);
                     }
-                    float2 frag_sum2_105 = partial_104;
+                    float2 frag_sum2_107 = partial_106;
                     float2 _f2_40 = make_float2(((group_max4 > -WAN_HYBRID_INF) ? _exp2_13 : 0.0f), ((group_max4 > -WAN_HYBRID_INF) ? _exp2_13 : 0.0f));
-                    float2 raw_scale2_106 = _f2_40;
-                    float2 raw_sum2_107 = mul_f32x2(frag_sum2_105, raw_scale2_106);
+                    float2 raw_scale2_108 = _f2_40;
+                    float2 raw_sum2_109 = mul_f32x2(frag_sum2_107, raw_scale2_108);
                     uint32_t _fp4_12[2];
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_12[0]) : "f"(_tmem_load_1[64]), "f"(_tmem_load_1[65]), "f"(_tmem_load_1[66]), "f"(_tmem_load_1[67]), "f"(_tmem_load_1[68]), "f"(_tmem_load_1[69]), "f"(_tmem_load_1[70]), "f"(_tmem_load_1[71]));
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_12[1]) : "f"(_tmem_load_1[72]), "f"(_tmem_load_1[73]), "f"(_tmem_load_1[74]), "f"(_tmem_load_1[75]), "f"(_tmem_load_1[76]), "f"(_tmem_load_1[77]), "f"(_tmem_load_1[78]), "f"(_tmem_load_1[79]));
-                    block_sum2_70 = add_f32x2(block_sum2_70, raw_sum2_107);
+                    block_sum2_70 = add_f32x2(block_sum2_70, raw_sum2_109);
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x2.b32"
                         " [%0], {%1, %2};"
-                        :: "r"(taddr + (unsigned int)p_stage_off_72 + 72 + (unsigned int)(warp % 4 * 32 << 16)), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_12[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_12[1]))
+                        :: "r"(taddr + (unsigned int)p_hi_off_104 + (unsigned int)(warp % 4 * 32 << 16)), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_12[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_12[1]))
                         : "memory");
                     float _exp2_14 = approx_exp2(((group_max5 > -WAN_HYBRID_INF) ? group_max5 * softmax_scale_log2 : 0.0f) - new_max_scaled_69 - 2.584962500721156f);
                     sf_values_71[1] = ((group_max5 > -WAN_HYBRID_INF) ? _exp2_14 : 0.0f);
@@ -2197,24 +2235,24 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                         _tmem_load_1[_le + 80] = approx_exp2(_tmem_load_1[_le + 80]);
                     }
                     float2 _f2_41 = make_float2(_tmem_load_1[80], _tmem_load_1[81]);
-                    float2 partial_108 = _f2_41;
+                    float2 partial_110 = _f2_41;
                     #pragma unroll
                     for (int pair_13 = 2; pair_13 < 16; pair_13 += 2) {
                         float2 _f2_42 = make_float2((_tmem_load_1 + 80)[pair_13], (_tmem_load_1 + 80)[pair_13 + 1]);
-                        partial_108 = add_f32x2(partial_108, _f2_42);
+                        partial_110 = add_f32x2(partial_110, _f2_42);
                     }
-                    float2 frag_sum2_109 = partial_108;
+                    float2 frag_sum2_111 = partial_110;
                     float2 _f2_43 = make_float2(((group_max5 > -WAN_HYBRID_INF) ? _exp2_14 : 0.0f), ((group_max5 > -WAN_HYBRID_INF) ? _exp2_14 : 0.0f));
-                    float2 raw_scale2_110 = _f2_43;
-                    float2 raw_sum2_111 = mul_f32x2(frag_sum2_109, raw_scale2_110);
+                    float2 raw_scale2_112 = _f2_43;
+                    float2 raw_sum2_113 = mul_f32x2(frag_sum2_111, raw_scale2_112);
                     uint32_t _fp4_13[2];
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_13[0]) : "f"(_tmem_load_1[80]), "f"(_tmem_load_1[81]), "f"(_tmem_load_1[82]), "f"(_tmem_load_1[83]), "f"(_tmem_load_1[84]), "f"(_tmem_load_1[85]), "f"(_tmem_load_1[86]), "f"(_tmem_load_1[87]));
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_13[1]) : "f"(_tmem_load_1[88]), "f"(_tmem_load_1[89]), "f"(_tmem_load_1[90]), "f"(_tmem_load_1[91]), "f"(_tmem_load_1[92]), "f"(_tmem_load_1[93]), "f"(_tmem_load_1[94]), "f"(_tmem_load_1[95]));
-                    block_sum2_70 = add_f32x2(block_sum2_70, raw_sum2_111);
+                    block_sum2_70 = add_f32x2(block_sum2_70, raw_sum2_113);
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x2.b32"
                         " [%0], {%1, %2};"
-                        :: "r"(taddr + (unsigned int)p_stage_off_72 + 72 + (unsigned int)(warp % 4 * 32 << 16) + 2), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_13[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_13[1]))
+                        :: "r"(taddr + (unsigned int)p_hi_off_104 + (unsigned int)(warp % 4 * 32 << 16) + 2), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_13[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_13[1]))
                         : "memory");
                     float _exp2_15 = approx_exp2(((group_max6 > -WAN_HYBRID_INF) ? group_max6 * softmax_scale_log2 : 0.0f) - new_max_scaled_69 - 2.584962500721156f);
                     sf_values_71[2] = ((group_max6 > -WAN_HYBRID_INF) ? _exp2_15 : 0.0f);
@@ -2228,24 +2266,24 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                         _tmem_load_1[_le + 96] = approx_exp2(_tmem_load_1[_le + 96]);
                     }
                     float2 _f2_44 = make_float2(_tmem_load_1[96], _tmem_load_1[97]);
-                    float2 partial_112 = _f2_44;
+                    float2 partial_114 = _f2_44;
                     #pragma unroll
                     for (int pair_14 = 2; pair_14 < 16; pair_14 += 2) {
                         float2 _f2_45 = make_float2((_tmem_load_1 + 96)[pair_14], (_tmem_load_1 + 96)[pair_14 + 1]);
-                        partial_112 = add_f32x2(partial_112, _f2_45);
+                        partial_114 = add_f32x2(partial_114, _f2_45);
                     }
-                    float2 frag_sum2_113 = partial_112;
+                    float2 frag_sum2_115 = partial_114;
                     float2 _f2_46 = make_float2(((group_max6 > -WAN_HYBRID_INF) ? _exp2_15 : 0.0f), ((group_max6 > -WAN_HYBRID_INF) ? _exp2_15 : 0.0f));
-                    float2 raw_scale2_114 = _f2_46;
-                    float2 raw_sum2_115 = mul_f32x2(frag_sum2_113, raw_scale2_114);
+                    float2 raw_scale2_116 = _f2_46;
+                    float2 raw_sum2_117 = mul_f32x2(frag_sum2_115, raw_scale2_116);
                     uint32_t _fp4_14[2];
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_14[0]) : "f"(_tmem_load_1[96]), "f"(_tmem_load_1[97]), "f"(_tmem_load_1[98]), "f"(_tmem_load_1[99]), "f"(_tmem_load_1[100]), "f"(_tmem_load_1[101]), "f"(_tmem_load_1[102]), "f"(_tmem_load_1[103]));
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_14[1]) : "f"(_tmem_load_1[104]), "f"(_tmem_load_1[105]), "f"(_tmem_load_1[106]), "f"(_tmem_load_1[107]), "f"(_tmem_load_1[108]), "f"(_tmem_load_1[109]), "f"(_tmem_load_1[110]), "f"(_tmem_load_1[111]));
-                    block_sum2_70 = add_f32x2(block_sum2_70, raw_sum2_115);
+                    block_sum2_70 = add_f32x2(block_sum2_70, raw_sum2_117);
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x2.b32"
                         " [%0], {%1, %2};"
-                        :: "r"(taddr + (unsigned int)p_stage_off_72 + 72 + (unsigned int)(warp % 4 * 32 << 16) + 4), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_14[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_14[1]))
+                        :: "r"(taddr + (unsigned int)p_hi_off_104 + (unsigned int)(warp % 4 * 32 << 16) + 4), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_14[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_14[1]))
                         : "memory");
                     float _exp2_16 = approx_exp2(((group_max7 > -WAN_HYBRID_INF) ? group_max7 * softmax_scale_log2 : 0.0f) - new_max_scaled_69 - 2.584962500721156f);
                     sf_values_71[3] = ((group_max7 > -WAN_HYBRID_INF) ? _exp2_16 : 0.0f);
@@ -2259,24 +2297,24 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                         _tmem_load_1[_le + 112] = approx_exp2(_tmem_load_1[_le + 112]);
                     }
                     float2 _f2_47 = make_float2(_tmem_load_1[112], _tmem_load_1[113]);
-                    float2 partial_116 = _f2_47;
+                    float2 partial_118 = _f2_47;
                     #pragma unroll
                     for (int pair_15 = 2; pair_15 < 16; pair_15 += 2) {
                         float2 _f2_48 = make_float2((_tmem_load_1 + 112)[pair_15], (_tmem_load_1 + 112)[pair_15 + 1]);
-                        partial_116 = add_f32x2(partial_116, _f2_48);
+                        partial_118 = add_f32x2(partial_118, _f2_48);
                     }
-                    float2 frag_sum2_117 = partial_116;
+                    float2 frag_sum2_119 = partial_118;
                     float2 _f2_49 = make_float2(((group_max7 > -WAN_HYBRID_INF) ? _exp2_16 : 0.0f), ((group_max7 > -WAN_HYBRID_INF) ? _exp2_16 : 0.0f));
-                    float2 raw_scale2_118 = _f2_49;
-                    float2 raw_sum2_119 = mul_f32x2(frag_sum2_117, raw_scale2_118);
+                    float2 raw_scale2_120 = _f2_49;
+                    float2 raw_sum2_121 = mul_f32x2(frag_sum2_119, raw_scale2_120);
                     uint32_t _fp4_15[2];
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_15[0]) : "f"(_tmem_load_1[112]), "f"(_tmem_load_1[113]), "f"(_tmem_load_1[114]), "f"(_tmem_load_1[115]), "f"(_tmem_load_1[116]), "f"(_tmem_load_1[117]), "f"(_tmem_load_1[118]), "f"(_tmem_load_1[119]));
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_15[1]) : "f"(_tmem_load_1[120]), "f"(_tmem_load_1[121]), "f"(_tmem_load_1[122]), "f"(_tmem_load_1[123]), "f"(_tmem_load_1[124]), "f"(_tmem_load_1[125]), "f"(_tmem_load_1[126]), "f"(_tmem_load_1[127]));
-                    block_sum2_70 = add_f32x2(block_sum2_70, raw_sum2_119);
+                    block_sum2_70 = add_f32x2(block_sum2_70, raw_sum2_121);
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x2.b32"
                         " [%0], {%1, %2};"
-                        :: "r"(taddr + (unsigned int)p_stage_off_72 + 72 + (unsigned int)(warp % 4 * 32 << 16) + 6), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_15[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_15[1]))
+                        :: "r"(taddr + (unsigned int)p_hi_off_104 + (unsigned int)(warp % 4 * 32 << 16) + 6), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_15[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_15[1]))
                         : "memory");
                     uint32_t _fp8_3[1];
                     {
@@ -2295,7 +2333,7 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
-                        :: "r"(taddr + (unsigned int)p_stage_off_72 + 84 + (unsigned int)(warp % 4)), "r"(*reinterpret_cast<const uint32_t*>(&_fp8_3[0]))
+                        :: "r"(taddr + (unsigned int)sfa_hi_off_105 + (unsigned int)(warp % 4)), "r"(*reinterpret_cast<const uint32_t*>(&_fp8_3[0]))
                         : "memory");
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(p_full_2_addr + (stage) * 8);
@@ -2315,6 +2353,9 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                     tmem_ld_x32(&_tmem_load_2[32], s_base_0 + 32);
                     tmem_ld_x32(&_tmem_load_2[64], s_base_0 + 64);
                     tmem_ld_x32(&_tmem_load_2[96], s_base_0 + 96);
+                    if (stage == 1) {
+                        mbarrier_arrive(stage1_score_tail_free_addr);
+                    }
                     float _max3_118;
                     #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                     #error "Max3 requires PTX three-input max.f32 support on sm_100+"
@@ -2868,6 +2909,12 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                         : "memory");
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(p_full_addr + (stage) * 8);
+                    if (stage == 0) {
+                        mbarrier_wait(stage1_score_tail_free_addr, _phase_stage1_score_tail_free_0);
+                        _phase_stage1_score_tail_free_0 ^= 1;
+                    }
+                    int p_hi_off_104_1 = ((stage == 0) ? TMEM_SCORES_1_OFFSET + 104 : TMEM_SCORES_1_OFFSET + 72);
+                    int sfa_hi_off_105_1 = ((stage == 0) ? TMEM_TMEM_SFA_PV0_HI_OFFSET : TMEM_TMEM_SFA_PV1_HI_OFFSET);
                     float _exp2_22 = approx_exp2(((group_max4 > -WAN_HYBRID_INF) ? group_max4 * softmax_scale_log2 : 0.0f) - new_max_scaled_69_1 - 2.584962500721156f);
                     sf_values_71_1[0] = ((group_max4 > -WAN_HYBRID_INF) ? _exp2_22 : 0.0f);
                     const float2 _fma_b2_56 = {softmax_scale_log2, softmax_scale_log2};
@@ -2880,24 +2927,24 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                         _tmem_load_2[_le + 64] = approx_exp2(_tmem_load_2[_le + 64]);
                     }
                     float2 _f2_63 = make_float2(_tmem_load_2[64], _tmem_load_2[65]);
-                    float2 partial_104_1 = _f2_63;
+                    float2 partial_106_1 = _f2_63;
                     #pragma unroll
                     for (int pair_20 = 2; pair_20 < 16; pair_20 += 2) {
                         float2 _f2_64 = make_float2((_tmem_load_2 + 64)[pair_20], (_tmem_load_2 + 64)[pair_20 + 1]);
-                        partial_104_1 = add_f32x2(partial_104_1, _f2_64);
+                        partial_106_1 = add_f32x2(partial_106_1, _f2_64);
                     }
-                    float2 frag_sum2_105_1 = partial_104_1;
+                    float2 frag_sum2_107_1 = partial_106_1;
                     float2 _f2_65 = make_float2(((group_max4 > -WAN_HYBRID_INF) ? _exp2_22 : 0.0f), ((group_max4 > -WAN_HYBRID_INF) ? _exp2_22 : 0.0f));
-                    float2 raw_scale2_106_1 = _f2_65;
-                    float2 raw_sum2_107_1 = mul_f32x2(frag_sum2_105_1, raw_scale2_106_1);
+                    float2 raw_scale2_108_1 = _f2_65;
+                    float2 raw_sum2_109_1 = mul_f32x2(frag_sum2_107_1, raw_scale2_108_1);
                     uint32_t _fp4_20[2];
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_20[0]) : "f"(_tmem_load_2[64]), "f"(_tmem_load_2[65]), "f"(_tmem_load_2[66]), "f"(_tmem_load_2[67]), "f"(_tmem_load_2[68]), "f"(_tmem_load_2[69]), "f"(_tmem_load_2[70]), "f"(_tmem_load_2[71]));
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_20[1]) : "f"(_tmem_load_2[72]), "f"(_tmem_load_2[73]), "f"(_tmem_load_2[74]), "f"(_tmem_load_2[75]), "f"(_tmem_load_2[76]), "f"(_tmem_load_2[77]), "f"(_tmem_load_2[78]), "f"(_tmem_load_2[79]));
-                    block_sum2_70_1 = add_f32x2(block_sum2_70_1, raw_sum2_107_1);
+                    block_sum2_70_1 = add_f32x2(block_sum2_70_1, raw_sum2_109_1);
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x2.b32"
                         " [%0], {%1, %2};"
-                        :: "r"(taddr + (unsigned int)p_stage_off_72_1 + 72 + (unsigned int)(warp % 4 * 32 << 16)), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_20[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_20[1]))
+                        :: "r"(taddr + (unsigned int)p_hi_off_104_1 + (unsigned int)(warp % 4 * 32 << 16)), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_20[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_20[1]))
                         : "memory");
                     float _exp2_23 = approx_exp2(((group_max5 > -WAN_HYBRID_INF) ? group_max5 * softmax_scale_log2 : 0.0f) - new_max_scaled_69_1 - 2.584962500721156f);
                     sf_values_71_1[1] = ((group_max5 > -WAN_HYBRID_INF) ? _exp2_23 : 0.0f);
@@ -2911,24 +2958,24 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                         _tmem_load_2[_le + 80] = approx_exp2(_tmem_load_2[_le + 80]);
                     }
                     float2 _f2_66 = make_float2(_tmem_load_2[80], _tmem_load_2[81]);
-                    float2 partial_108_1 = _f2_66;
+                    float2 partial_110_1 = _f2_66;
                     #pragma unroll
                     for (int pair_21 = 2; pair_21 < 16; pair_21 += 2) {
                         float2 _f2_67 = make_float2((_tmem_load_2 + 80)[pair_21], (_tmem_load_2 + 80)[pair_21 + 1]);
-                        partial_108_1 = add_f32x2(partial_108_1, _f2_67);
+                        partial_110_1 = add_f32x2(partial_110_1, _f2_67);
                     }
-                    float2 frag_sum2_109_1 = partial_108_1;
+                    float2 frag_sum2_111_1 = partial_110_1;
                     float2 _f2_68 = make_float2(((group_max5 > -WAN_HYBRID_INF) ? _exp2_23 : 0.0f), ((group_max5 > -WAN_HYBRID_INF) ? _exp2_23 : 0.0f));
-                    float2 raw_scale2_110_1 = _f2_68;
-                    float2 raw_sum2_111_1 = mul_f32x2(frag_sum2_109_1, raw_scale2_110_1);
+                    float2 raw_scale2_112_1 = _f2_68;
+                    float2 raw_sum2_113_1 = mul_f32x2(frag_sum2_111_1, raw_scale2_112_1);
                     uint32_t _fp4_21[2];
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_21[0]) : "f"(_tmem_load_2[80]), "f"(_tmem_load_2[81]), "f"(_tmem_load_2[82]), "f"(_tmem_load_2[83]), "f"(_tmem_load_2[84]), "f"(_tmem_load_2[85]), "f"(_tmem_load_2[86]), "f"(_tmem_load_2[87]));
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_21[1]) : "f"(_tmem_load_2[88]), "f"(_tmem_load_2[89]), "f"(_tmem_load_2[90]), "f"(_tmem_load_2[91]), "f"(_tmem_load_2[92]), "f"(_tmem_load_2[93]), "f"(_tmem_load_2[94]), "f"(_tmem_load_2[95]));
-                    block_sum2_70_1 = add_f32x2(block_sum2_70_1, raw_sum2_111_1);
+                    block_sum2_70_1 = add_f32x2(block_sum2_70_1, raw_sum2_113_1);
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x2.b32"
                         " [%0], {%1, %2};"
-                        :: "r"(taddr + (unsigned int)p_stage_off_72_1 + 72 + (unsigned int)(warp % 4 * 32 << 16) + 2), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_21[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_21[1]))
+                        :: "r"(taddr + (unsigned int)p_hi_off_104_1 + (unsigned int)(warp % 4 * 32 << 16) + 2), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_21[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_21[1]))
                         : "memory");
                     float _exp2_24 = approx_exp2(((group_max6 > -WAN_HYBRID_INF) ? group_max6 * softmax_scale_log2 : 0.0f) - new_max_scaled_69_1 - 2.584962500721156f);
                     sf_values_71_1[2] = ((group_max6 > -WAN_HYBRID_INF) ? _exp2_24 : 0.0f);
@@ -2942,24 +2989,24 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                         _tmem_load_2[_le + 96] = approx_exp2(_tmem_load_2[_le + 96]);
                     }
                     float2 _f2_69 = make_float2(_tmem_load_2[96], _tmem_load_2[97]);
-                    float2 partial_112_1 = _f2_69;
+                    float2 partial_114_1 = _f2_69;
                     #pragma unroll
                     for (int pair_22 = 2; pair_22 < 16; pair_22 += 2) {
                         float2 _f2_70 = make_float2((_tmem_load_2 + 96)[pair_22], (_tmem_load_2 + 96)[pair_22 + 1]);
-                        partial_112_1 = add_f32x2(partial_112_1, _f2_70);
+                        partial_114_1 = add_f32x2(partial_114_1, _f2_70);
                     }
-                    float2 frag_sum2_113_1 = partial_112_1;
+                    float2 frag_sum2_115_1 = partial_114_1;
                     float2 _f2_71 = make_float2(((group_max6 > -WAN_HYBRID_INF) ? _exp2_24 : 0.0f), ((group_max6 > -WAN_HYBRID_INF) ? _exp2_24 : 0.0f));
-                    float2 raw_scale2_114_1 = _f2_71;
-                    float2 raw_sum2_115_1 = mul_f32x2(frag_sum2_113_1, raw_scale2_114_1);
+                    float2 raw_scale2_116_1 = _f2_71;
+                    float2 raw_sum2_117_1 = mul_f32x2(frag_sum2_115_1, raw_scale2_116_1);
                     uint32_t _fp4_22[2];
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_22[0]) : "f"(_tmem_load_2[96]), "f"(_tmem_load_2[97]), "f"(_tmem_load_2[98]), "f"(_tmem_load_2[99]), "f"(_tmem_load_2[100]), "f"(_tmem_load_2[101]), "f"(_tmem_load_2[102]), "f"(_tmem_load_2[103]));
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_22[1]) : "f"(_tmem_load_2[104]), "f"(_tmem_load_2[105]), "f"(_tmem_load_2[106]), "f"(_tmem_load_2[107]), "f"(_tmem_load_2[108]), "f"(_tmem_load_2[109]), "f"(_tmem_load_2[110]), "f"(_tmem_load_2[111]));
-                    block_sum2_70_1 = add_f32x2(block_sum2_70_1, raw_sum2_115_1);
+                    block_sum2_70_1 = add_f32x2(block_sum2_70_1, raw_sum2_117_1);
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x2.b32"
                         " [%0], {%1, %2};"
-                        :: "r"(taddr + (unsigned int)p_stage_off_72_1 + 72 + (unsigned int)(warp % 4 * 32 << 16) + 4), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_22[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_22[1]))
+                        :: "r"(taddr + (unsigned int)p_hi_off_104_1 + (unsigned int)(warp % 4 * 32 << 16) + 4), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_22[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_22[1]))
                         : "memory");
                     float _exp2_25 = approx_exp2(((group_max7 > -WAN_HYBRID_INF) ? group_max7 * softmax_scale_log2 : 0.0f) - new_max_scaled_69_1 - 2.584962500721156f);
                     sf_values_71_1[3] = ((group_max7 > -WAN_HYBRID_INF) ? _exp2_25 : 0.0f);
@@ -2973,24 +3020,24 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                         _tmem_load_2[_le + 112] = approx_exp2(_tmem_load_2[_le + 112]);
                     }
                     float2 _f2_72 = make_float2(_tmem_load_2[112], _tmem_load_2[113]);
-                    float2 partial_116_1 = _f2_72;
+                    float2 partial_118_1 = _f2_72;
                     #pragma unroll
                     for (int pair_23 = 2; pair_23 < 16; pair_23 += 2) {
                         float2 _f2_73 = make_float2((_tmem_load_2 + 112)[pair_23], (_tmem_load_2 + 112)[pair_23 + 1]);
-                        partial_116_1 = add_f32x2(partial_116_1, _f2_73);
+                        partial_118_1 = add_f32x2(partial_118_1, _f2_73);
                     }
-                    float2 frag_sum2_117_1 = partial_116_1;
+                    float2 frag_sum2_119_1 = partial_118_1;
                     float2 _f2_74 = make_float2(((group_max7 > -WAN_HYBRID_INF) ? _exp2_25 : 0.0f), ((group_max7 > -WAN_HYBRID_INF) ? _exp2_25 : 0.0f));
-                    float2 raw_scale2_118_1 = _f2_74;
-                    float2 raw_sum2_119_1 = mul_f32x2(frag_sum2_117_1, raw_scale2_118_1);
+                    float2 raw_scale2_120_1 = _f2_74;
+                    float2 raw_sum2_121_1 = mul_f32x2(frag_sum2_119_1, raw_scale2_120_1);
                     uint32_t _fp4_23[2];
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_23[0]) : "f"(_tmem_load_2[112]), "f"(_tmem_load_2[113]), "f"(_tmem_load_2[114]), "f"(_tmem_load_2[115]), "f"(_tmem_load_2[116]), "f"(_tmem_load_2[117]), "f"(_tmem_load_2[118]), "f"(_tmem_load_2[119]));
                     asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_23[1]) : "f"(_tmem_load_2[120]), "f"(_tmem_load_2[121]), "f"(_tmem_load_2[122]), "f"(_tmem_load_2[123]), "f"(_tmem_load_2[124]), "f"(_tmem_load_2[125]), "f"(_tmem_load_2[126]), "f"(_tmem_load_2[127]));
-                    block_sum2_70_1 = add_f32x2(block_sum2_70_1, raw_sum2_119_1);
+                    block_sum2_70_1 = add_f32x2(block_sum2_70_1, raw_sum2_121_1);
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x2.b32"
                         " [%0], {%1, %2};"
-                        :: "r"(taddr + (unsigned int)p_stage_off_72_1 + 72 + (unsigned int)(warp % 4 * 32 << 16) + 6), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_23[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_23[1]))
+                        :: "r"(taddr + (unsigned int)p_hi_off_104_1 + (unsigned int)(warp % 4 * 32 << 16) + 6), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_23[0])), "r"(*reinterpret_cast<const uint32_t*>(&_fp4_23[1]))
                         : "memory");
                     uint32_t _fp8_5[1];
                     {
@@ -3009,7 +3056,7 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                     asm volatile(
                         "tcgen05.st.sync.aligned.32x32b.x1.b32"
                         " [%0], {%1};"
-                        :: "r"(taddr + (unsigned int)p_stage_off_72_1 + 84 + (unsigned int)(warp % 4)), "r"(*reinterpret_cast<const uint32_t*>(&_fp8_5[0]))
+                        :: "r"(taddr + (unsigned int)sfa_hi_off_105_1 + (unsigned int)(warp % 4)), "r"(*reinterpret_cast<const uint32_t*>(&_fp8_5[0]))
                         : "memory");
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(p_full_2_addr + (stage) * 8);
@@ -3027,6 +3074,8 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
         { // correction_main
             unsigned int total_tiles_1 = NUM_M_BLOCKS * total_bh;
             unsigned int corr_epi_producer_phase = 1;
+            unsigned int corr_p0_high_stage = 0;
+            unsigned int corr_p0_high_phase = 0;
             unsigned int _phase_corr_sig_0 = 0;
             unsigned int _phase_corr_sig_1 = 0;
             unsigned int _phase_o_full_0 = 0;
@@ -3052,6 +3101,9 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                 for (unsigned int n_iter_2 = 1; n_iter_2 < num_n_blocks_1; n_iter_2++) {
                     mbarrier_wait(corr_sig_addr, _phase_corr_sig_0);
                     _phase_corr_sig_0 ^= 1;
+                    mbarrier_wait(p0_high_done_addr + (corr_p0_high_stage) * 8, corr_p0_high_phase);
+                    corr_p0_high_stage += 1;
+                    if (corr_p0_high_stage == 2) { corr_p0_high_stage = 0; corr_p0_high_phase ^= 1; }
                     float scale = sScale[warp % 4 * 32 + lane];
                     int _vote_0 = __any_sync(0xFFFFFFFF, scale < 1.0f);
                     if (_vote_0 != 0) {
@@ -3179,12 +3231,17 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
             unsigned int total_tiles_2 = NUM_M_BLOCKS * total_bh;
             unsigned int mma_kv_stage = 0;
             unsigned int mma_kv_phase = 0;
+            unsigned int pv_reads_stage = 0;
+            unsigned int p0_high_stage = 0;
             unsigned int _phase_q_full_0 = 0;
             unsigned int _phase_q_full_1 = 0;
             unsigned int _phase_p_full_0 = 0;
+            unsigned int _phase_pv_stage0_reads_done = 0;
+            unsigned int _phase_stage1_score_tail_free_0_1 = 0;
             unsigned int _phase_p_full_2_0 = 0;
             unsigned int _phase_p_full_1 = 0;
             unsigned int _phase_p_full_2_1 = 0;
+            unsigned int _phase_pv_stage1_reads_done = 0;
             #pragma unroll 1
             for (unsigned int tile_idx_2 = bid; tile_idx_2 < total_tiles_2; tile_idx_2 += num_bids) {
                 unsigned int m_block_2;
@@ -3333,12 +3390,6 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                     if (elect_sync()) {
                         tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv0_res_lo, make_sf_cp_desc_sbo128(smem_sfvt_residual_lo_addr + v_stage * 32768));
                     }
-                    if (elect_sync()) {
-                        tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv0_hi, make_sf_cp_desc_sbo128(smem_sfvt_hi_addr + v_stage * 32768));
-                    }
-                    if (elect_sync()) {
-                        tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv0_res_hi, make_sf_cp_desc_sbo128(smem_sfvt_residual_hi_addr + v_stage * 32768));
-                    }
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_b_lo_2 = make_warp_uniform((((smem_vt_addr) >> 4) & 0x3FFF) + (v_stage) * 2048);
                     if (elect_sync()) {
@@ -3354,30 +3405,16 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                             tcgen05_mma_mxf4nvf4_bs_ts(tmem_output_0, tmem_scores_0 + 64 + 0, b_desc + 0, 0x8200480U, tmem_tmem_sfa_pv0_lo + 0, tmem_tmem_sfb_pv0_res_lo + 0, 1);
                         }
                     }
-                    mbarrier_wait(p_full_2_addr, _phase_p_full_2_0);
-                    _phase_p_full_2_0 ^= 1;
+                    elect_commit(pv_stage0_reads_done_addr + (pv_reads_stage) * 8);
+                    mbarrier_wait(pv_stage0_reads_done_addr + (pv_reads_stage) * 8, _phase_pv_stage0_reads_done);
                     asm volatile("tcgen05.fence::after_thread_sync;");
-                    int _mma_b_lo_4 = make_warp_uniform((((smem_vt_addr + 32) >> 4) & 0x3FFF) + (v_stage) * 2048);
-                    if (elect_sync()) {
-                        {
-                            uint64_t b_desc = ((uint64_t)_mma_b_lo_4) | ((uint64_t)0x80004020 << 32);
-                            tcgen05_mma_mxf4nvf4_bs_ts(tmem_output_0, tmem_scores_0 + 72 + 0, b_desc + 0, 0x8200480U, tmem_tmem_sfa_pv0_hi + 0, tmem_tmem_sfb_pv0_hi + 0, 1);
-                        }
-                    }
-                    int _mma_b_lo_5 = make_warp_uniform((((smem_vt_residual_addr + 32) >> 4) & 0x3FFF) + (v_stage) * 2048);
-                    if (elect_sync()) {
-                        {
-                            uint64_t b_desc = ((uint64_t)_mma_b_lo_5) | ((uint64_t)0x80004020 << 32);
-                            tcgen05_mma_mxf4nvf4_bs_ts(tmem_output_0, tmem_scores_0 + 72 + 0, b_desc + 0, 0x8200480U, tmem_tmem_sfa_pv0_hi + 0, tmem_tmem_sfb_pv0_res_hi + 0, 1);
-                        }
-                    }
                     unsigned int k_stage = mma_kv_stage;
                     unsigned int k_phase = mma_kv_phase;
                     mma_kv_stage += 1;
                     if (mma_kv_stage == 3) { mma_kv_stage = 0; mma_kv_phase ^= 1; }
                     mbarrier_wait(kv_full_addr + (k_stage) * 8, k_phase);
-                    int _mma_a_lo_6 = make_warp_uniform(((smem_q0_addr) >> 4) & 0x3FFF);
-                    int _mma_b_lo_6 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 2048);
+                    int _mma_a_lo_4 = make_warp_uniform(((smem_q0_addr) >> 4) & 0x3FFF);
+                    int _mma_b_lo_4 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 2048);
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -3431,8 +3468,38 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(_mma_a_lo_6), "r"(_mma_b_lo_6), "r"(tmem_scores_0), "r"(0));
+                    :: "r"(_mma_a_lo_4), "r"(_mma_b_lo_4), "r"(tmem_scores_0), "r"(0));
                     elect_commit(s_full_addr);
+                    {
+                        mbarrier_wait(stage1_score_tail_free_addr, _phase_stage1_score_tail_free_0_1);
+                        _phase_stage1_score_tail_free_0_1 ^= 1;
+                    }
+                    if (elect_sync()) {
+                        tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv0_hi, make_sf_cp_desc_sbo128(smem_sfvt_hi_addr + v_stage * 32768));
+                    }
+                    if (elect_sync()) {
+                        tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv0_res_hi, make_sf_cp_desc_sbo128(smem_sfvt_residual_hi_addr + v_stage * 32768));
+                    }
+                    mbarrier_wait(p_full_2_addr, _phase_p_full_2_0);
+                    _phase_p_full_2_0 ^= 1;
+                    asm volatile("tcgen05.fence::after_thread_sync;");
+                    int _mma_b_lo_5 = make_warp_uniform((((smem_vt_addr + 32) >> 4) & 0x3FFF) + (v_stage) * 2048);
+                    if (elect_sync()) {
+                        {
+                            uint64_t b_desc = ((uint64_t)_mma_b_lo_5) | ((uint64_t)0x80004020 << 32);
+                            tcgen05_mma_mxf4nvf4_bs_ts(tmem_output_0, tmem_scores_1 + 104 + 0, b_desc + 0, 0x8200480U, tmem_tmem_sfa_pv0_hi + 0, tmem_tmem_sfb_pv0_hi + 0, 1);
+                        }
+                    }
+                    int _mma_b_lo_6 = make_warp_uniform((((smem_vt_residual_addr + 32) >> 4) & 0x3FFF) + (v_stage) * 2048);
+                    if (elect_sync()) {
+                        {
+                            uint64_t b_desc = ((uint64_t)_mma_b_lo_6) | ((uint64_t)0x80004020 << 32);
+                            tcgen05_mma_mxf4nvf4_bs_ts(tmem_output_0, tmem_scores_1 + 104 + 0, b_desc + 0, 0x8200480U, tmem_tmem_sfa_pv0_hi + 0, tmem_tmem_sfb_pv0_res_hi + 0, 1);
+                        }
+                    }
+                    elect_commit(p0_high_done_addr + (p0_high_stage) * 8);
+                    p0_high_stage += 1;
+                    if (p0_high_stage == 2) { p0_high_stage = 0; }
                     mbarrier_wait(p_full_addr + 8, _phase_p_full_1);
                     _phase_p_full_1 ^= 1;
                     if (elect_sync()) {
@@ -3440,12 +3507,6 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                     }
                     if (elect_sync()) {
                         tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv1_res_lo, make_sf_cp_desc_sbo128(smem_sfvt_residual_lo_addr + v_stage * 32768));
-                    }
-                    if (elect_sync()) {
-                        tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv1_hi, make_sf_cp_desc_sbo128(smem_sfvt_hi_addr + v_stage * 32768));
-                    }
-                    if (elect_sync()) {
-                        tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv1_res_hi, make_sf_cp_desc_sbo128(smem_sfvt_residual_hi_addr + v_stage * 32768));
                     }
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     int _mma_b_lo_7 = make_warp_uniform((((smem_vt_addr) >> 4) & 0x3FFF) + (v_stage) * 2048);
@@ -3461,6 +3522,12 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                             uint64_t b_desc = ((uint64_t)_mma_b_lo_8) | ((uint64_t)0x80004020 << 32);
                             tcgen05_mma_mxf4nvf4_bs_ts(tmem_output_1, tmem_scores_1 + 64 + 0, b_desc + 0, 0x8200480U, tmem_tmem_sfa_pv1_lo + 0, tmem_tmem_sfb_pv1_res_lo + 0, 1);
                         }
+                    }
+                    if (elect_sync()) {
+                        tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv1_hi, make_sf_cp_desc_sbo128(smem_sfvt_hi_addr + v_stage * 32768));
+                    }
+                    if (elect_sync()) {
+                        tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv1_res_hi, make_sf_cp_desc_sbo128(smem_sfvt_residual_hi_addr + v_stage * 32768));
                     }
                     mbarrier_wait(p_full_2_addr + 8, _phase_p_full_2_1);
                     _phase_p_full_2_1 ^= 1;
@@ -3479,6 +3546,11 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                             tcgen05_mma_mxf4nvf4_bs_ts(tmem_output_1, tmem_scores_1 + 72 + 0, b_desc + 0, 0x8200480U, tmem_tmem_sfa_pv1_hi + 0, tmem_tmem_sfb_pv1_res_hi + 0, 1);
                         }
                     }
+                    elect_commit(pv_stage1_reads_done_addr + (pv_reads_stage) * 8);
+                    mbarrier_wait(pv_stage1_reads_done_addr + (pv_reads_stage) * 8, _phase_pv_stage1_reads_done);
+                    pv_reads_stage += 1;
+                    if (pv_reads_stage == 2) { pv_reads_stage = 0; _phase_pv_stage0_reads_done ^= 1; _phase_pv_stage1_reads_done ^= 1; }
+                    asm volatile("tcgen05.fence::after_thread_sync;");
                     elect_commit(kv_empty_addr + (v_stage) * 8);
                     int _mma_a_lo_11 = make_warp_uniform(((smem_q1_addr) >> 4) & 0x3FFF);
                     int _mma_b_lo_11 = make_warp_uniform((((smem_kv_addr) >> 4) & 0x3FFF) + (k_stage) * 2048);
@@ -3552,12 +3624,6 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                 if (elect_sync()) {
                     tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv0_res_lo, make_sf_cp_desc_sbo128(smem_sfvt_residual_lo_addr + mma_kv_stage * 32768));
                 }
-                if (elect_sync()) {
-                    tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv0_hi, make_sf_cp_desc_sbo128(smem_sfvt_hi_addr + mma_kv_stage * 32768));
-                }
-                if (elect_sync()) {
-                    tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv0_res_hi, make_sf_cp_desc_sbo128(smem_sfvt_residual_hi_addr + mma_kv_stage * 32768));
-                }
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_b_lo_12 = make_warp_uniform((((smem_vt_addr) >> 4) & 0x3FFF) + (mma_kv_stage) * 2048);
                 if (elect_sync()) {
@@ -3573,6 +3639,16 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                         tcgen05_mma_mxf4nvf4_bs_ts(tmem_output_0, tmem_scores_0 + 64 + 0, b_desc + 0, 0x8200480U, tmem_tmem_sfa_pv0_lo + 0, tmem_tmem_sfb_pv0_res_lo + 0, 1);
                     }
                 }
+                {
+                    mbarrier_wait(stage1_score_tail_free_addr, _phase_stage1_score_tail_free_0_1);
+                    _phase_stage1_score_tail_free_0_1 ^= 1;
+                }
+                if (elect_sync()) {
+                    tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv0_hi, make_sf_cp_desc_sbo128(smem_sfvt_hi_addr + mma_kv_stage * 32768));
+                }
+                if (elect_sync()) {
+                    tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv0_res_hi, make_sf_cp_desc_sbo128(smem_sfvt_residual_hi_addr + mma_kv_stage * 32768));
+                }
                 mbarrier_wait(p_full_2_addr, _phase_p_full_2_0);
                 _phase_p_full_2_0 ^= 1;
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -3580,14 +3656,14 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                 if (elect_sync()) {
                     {
                         uint64_t b_desc = ((uint64_t)_mma_b_lo_14) | ((uint64_t)0x80004020 << 32);
-                        tcgen05_mma_mxf4nvf4_bs_ts(tmem_output_0, tmem_scores_0 + 72 + 0, b_desc + 0, 0x8200480U, tmem_tmem_sfa_pv0_hi + 0, tmem_tmem_sfb_pv0_hi + 0, 1);
+                        tcgen05_mma_mxf4nvf4_bs_ts(tmem_output_0, tmem_scores_1 + 104 + 0, b_desc + 0, 0x8200480U, tmem_tmem_sfa_pv0_hi + 0, tmem_tmem_sfb_pv0_hi + 0, 1);
                     }
                 }
                 int _mma_b_lo_15 = make_warp_uniform((((smem_vt_residual_addr + 32) >> 4) & 0x3FFF) + (mma_kv_stage) * 2048);
                 if (elect_sync()) {
                     {
                         uint64_t b_desc = ((uint64_t)_mma_b_lo_15) | ((uint64_t)0x80004020 << 32);
-                        tcgen05_mma_mxf4nvf4_bs_ts(tmem_output_0, tmem_scores_0 + 72 + 0, b_desc + 0, 0x8200480U, tmem_tmem_sfa_pv0_hi + 0, tmem_tmem_sfb_pv0_res_hi + 0, 1);
+                        tcgen05_mma_mxf4nvf4_bs_ts(tmem_output_0, tmem_scores_1 + 104 + 0, b_desc + 0, 0x8200480U, tmem_tmem_sfa_pv0_hi + 0, tmem_tmem_sfb_pv0_res_hi + 0, 1);
                     }
                 }
                 mbarrier_wait(p_full_addr + 8, _phase_p_full_1);
@@ -3597,12 +3673,6 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                 }
                 if (elect_sync()) {
                     tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv1_res_lo, make_sf_cp_desc_sbo128(smem_sfvt_residual_lo_addr + mma_kv_stage * 32768));
-                }
-                if (elect_sync()) {
-                    tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv1_hi, make_sf_cp_desc_sbo128(smem_sfvt_hi_addr + mma_kv_stage * 32768));
-                }
-                if (elect_sync()) {
-                    tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv1_res_hi, make_sf_cp_desc_sbo128(smem_sfvt_residual_hi_addr + mma_kv_stage * 32768));
                 }
                 asm volatile("tcgen05.fence::after_thread_sync;");
                 int _mma_b_lo_16 = make_warp_uniform((((smem_vt_addr) >> 4) & 0x3FFF) + (mma_kv_stage) * 2048);
@@ -3618,6 +3688,12 @@ kernel_wan_hybrid_attention(WanHybridTensorMap const* Q, WanHybridTensorMap cons
                         uint64_t b_desc = ((uint64_t)_mma_b_lo_17) | ((uint64_t)0x80004020 << 32);
                         tcgen05_mma_mxf4nvf4_bs_ts(tmem_output_1, tmem_scores_1 + 64 + 0, b_desc + 0, 0x8200480U, tmem_tmem_sfa_pv1_lo + 0, tmem_tmem_sfb_pv1_res_lo + 0, 1);
                     }
+                }
+                if (elect_sync()) {
+                    tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv1_hi, make_sf_cp_desc_sbo128(smem_sfvt_hi_addr + mma_kv_stage * 32768));
+                }
+                if (elect_sync()) {
+                    tcgen05_cp_32x128b_warpx4(tmem_tmem_sfb_pv1_res_hi, make_sf_cp_desc_sbo128(smem_sfvt_residual_hi_addr + mma_kv_stage * 32768));
                 }
                 mbarrier_wait(p_full_2_addr + 8, _phase_p_full_2_1);
                 _phase_p_full_2_1 ^= 1;

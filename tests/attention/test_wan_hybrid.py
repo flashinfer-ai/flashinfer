@@ -149,14 +149,14 @@ def test_wan_hybrid_jit_flags_are_target_specific(monkeypatch) -> None:
                 )
 
         assert calls["wan_hybrid_quantization_sm100"]["use_fast_math"] is False
-        assert calls["wan_hybrid_quantization_sm103"]["use_fast_math"] is True
+        assert calls["wan_hybrid_quantization_sm103"]["use_fast_math"] is False
         for target in ("sm100", "sm103"):
             for component in ("attention", "dispatch"):
                 assert "--ptxas-options=--opt-level=1" in calls[
                     f"wan_hybrid_{component}_{target}"
                 ]["extra_cuda_cflags"]
         assert calls["wan_hybrid_dispatch_sm100"]["use_fast_math"] is False
-        assert calls["wan_hybrid_dispatch_sm103"]["use_fast_math"] is True
+        assert calls["wan_hybrid_dispatch_sm103"]["use_fast_math"] is False
     finally:
         wan_hybrid_jit.gen_wan_hybrid_quantization_module.cache_clear()
         wan_hybrid_jit.gen_wan_hybrid_attention_module.cache_clear()
@@ -185,14 +185,14 @@ def test_wan_hybrid_quantizer_binding_matches_frozen_device_abi() -> None:
     assert "kLogicalBlocks = 38" in binding
     assert "kPhysicalBlocks = 40" in binding
     assert "SMEM_TOTAL == 32896" in binding
-    assert "SMEM_TOTAL == 33280" in binding
+    assert "SMEM_TOTAL == 33280" not in binding
     assert "const cudaStream_t stream = get_stream(value.device());" in binding
     assert binding.count('#include "device/wan_hybrid_quantize_value_sm') == 2
     assert _sha256(source_root / "device/wan_hybrid_quantize_value_sm100.cu") == (
         "808fa99c273e7b0902cf7938bfb0078e26a8a5ac49f58f2f9432ef17d858fcf5"
     )
     assert _sha256(source_root / "device/wan_hybrid_quantize_value_sm103.cu") == (
-        "f2a92e9b3cb774673e5ca1192c793cfd782dc07f2c8c294a12466b3d26be7f3e"
+        "808fa99c273e7b0902cf7938bfb0078e26a8a5ac49f58f2f9432ef17d858fcf5"
     )
 
 
@@ -228,7 +228,7 @@ def test_wan_hybrid_attention_binding_matches_frozen_device_abi() -> None:
     for target in ("sm100", "sm103"):
         assert _sha256(
             source_root / "device" / f"wan_hybrid_attention_{target}.cu"
-        ) == "2b9d37f9cf9fa60d129c4b16edf8e5a2d792bcd2f1fa4a7d724079339fb30e30"
+        ) == "b47b42c250a7696aea46f35937f9681019e997568c8e871c30a45d65d8b8527c"
 
 
 def test_wan_hybrid_dispatch_binding_preserves_sources_and_launch_order() -> None:

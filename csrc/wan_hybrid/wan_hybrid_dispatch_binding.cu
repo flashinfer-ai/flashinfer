@@ -117,11 +117,7 @@ constexpr int64_t kMaximumTiles = 147;
 constexpr size_t kAttentionDynamicSmemBytes = SMEM_TOTAL;
 
 static_assert(kWanHybridQuantThreads == 256);
-#if FLASHINFER_WAN_HYBRID_TARGET_MINOR == 0
 static_assert(kWanHybridQuantDynamicSmemBytes == 32896);
-#else
-static_assert(kWanHybridQuantDynamicSmemBytes == 33280);
-#endif
 static_assert(kAttentionDynamicSmemBytes == 231'424);
 static_assert(sizeof(CUtensorMap) == kTensorMapBytes);
 static_assert(sizeof(wan_hybrid_attention_generated_TensorMap) == kTensorMapBytes);

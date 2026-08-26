@@ -67,7 +67,7 @@ def gen_wan_hybrid_quantization_module(target: str) -> JitSpec:
             f"-DFLASHINFER_WAN_HYBRID_TARGET_MINOR={target_minor}",
         ],
         extra_include_paths=[csrc_dir, csrc_dir.parent],
-        use_fast_math=target != "sm100",
+        use_fast_math=False,
     )
 
 
@@ -116,5 +116,5 @@ def gen_wan_hybrid_dispatch_module(target: str) -> JitSpec:
             "--ptxas-options=--opt-level=1",
         ],
         extra_include_paths=[csrc_dir, csrc_dir.parent],
-        use_fast_math=target != "sm100",
+        use_fast_math=False,
     )
