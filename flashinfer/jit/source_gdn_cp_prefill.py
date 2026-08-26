@@ -51,7 +51,9 @@ def _source_dir() -> Path:
     installed = jit_env.FLASHINFER_CSRC_DIR / "gdn" / "blackwell_cp_prefill"
     if installed.exists():
         return installed
-    checkout = Path(__file__).resolve().parents[2] / "csrc" / "gdn" / "blackwell_cp_prefill"
+    checkout = (
+        Path(__file__).resolve().parents[2] / "csrc" / "gdn" / "blackwell_cp_prefill"
+    )
     if checkout.exists():
         return checkout
     raise FileNotFoundError(

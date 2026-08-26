@@ -238,7 +238,9 @@ def _delegate_frozen_graph_case_to_fresh_pytest(
 def test_generated_source_inventory_and_hashes() -> None:
     root = _source_root()
     manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema"] == "flashinfer-pr4078-sm100-cp-prefill-standalone-export-v3"
+    assert (
+        manifest["schema"] == "flashinfer-pr4078-sm100-cp-prefill-standalone-export-v3"
+    )
     assert "generator_commit" not in manifest
     assert "measured_commit" not in manifest
     assert manifest["baseline_revision"] == ("6cb2e70995d92edbc443b1bfc317ecacac907640")
@@ -534,7 +536,9 @@ def test_all_contract_plans_match_frozen_dispatch(
         k = SimpleNamespace(shape=(total, shape["Hk"], shape["D"]))
         v = SimpleNamespace(shape=(total, shape["Hv"], shape["D"]))
         for arch, expected in shape["dispatch"].items():
-            monkeypatch.setattr(source_backend, "_arch_for", lambda _device, value=arch: value)
+            monkeypatch.setattr(
+                source_backend, "_arch_for", lambda _device, value=arch: value
+            )
             plan = source_backend._build_plan(q, k, v, tuple(shape["seq_lens"]))
             assert {
                 "cp_chunk_len": plan.cp_chunk_len,
@@ -690,7 +694,9 @@ def test_public_gdn_cp_cache_reuses_equal_metadata_and_rebinds_tensor_addresses(
         "current_stream",
         lambda _device: SimpleNamespace(cuda_stream=7),
     )
-    monkeypatch.setattr(source_backend.torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        source_backend.torch.cuda, "is_current_stream_capturing", lambda: False
+    )
     source_backend._public_key = None
     source_backend._public_metadata_binding = None
     source_backend._public_prepared = None
@@ -802,7 +808,9 @@ def test_public_gdn_cp_cache_detects_metadata_writes_without_version_bump(
         "current_stream",
         lambda _device: SimpleNamespace(cuda_stream=7),
     )
-    monkeypatch.setattr(source_backend.torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        source_backend.torch.cuda, "is_current_stream_capturing", lambda: False
+    )
     source_backend._reset_gdn_cp_prefill_cache()
 
     q = torch.zeros((4, 1, 128), dtype=torch.float16)
@@ -1129,7 +1137,9 @@ def test_public_dispatch_fails_closed_when_gdn_cp_is_unavailable(
 def test_read_seq_lens_uses_adjacent_offsets(dtype: torch.dtype) -> None:
     cu_seqlens = torch.tensor([0, 2, 5], dtype=dtype)
 
-    assert source_backend._read_seq_lens(cu_seqlens, total_tokens=5, expected=(2, 3)) == (2, 3)
+    assert source_backend._read_seq_lens(
+        cu_seqlens, total_tokens=5, expected=(2, 3)
+    ) == (2, 3)
 
 
 @pytest.mark.skipif(

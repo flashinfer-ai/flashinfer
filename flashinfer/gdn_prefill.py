@@ -132,7 +132,9 @@ def _cp_delta_rule_rejection_reason(
             if _chunk_gated_delta_rule_source_sm100 is None:
                 return "Blackwell-only CP delta rule SM100 kernel is unavailable"
             if _gdn_cp_nvcc_version is None:
-                return "Blackwell-only CP delta rule SM100 nvcc toolchain is unavailable"
+                return (
+                    "Blackwell-only CP delta rule SM100 nvcc toolchain is unavailable"
+                )
             try:
                 nvcc_version = _gdn_cp_nvcc_version()
             except RuntimeError as error:
