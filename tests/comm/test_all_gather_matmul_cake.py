@@ -514,11 +514,13 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
     )
     monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_100a")
     monkeypatch.setattr(backend, "_load_program", lambda arch: module)
-    monkeypatch.setattr(
-        backend,
-        "_ensure_launch_state",
-        lambda state, **kwargs: setattr(state, "flag_peers", object()),
-    )
+    def ensure_launch_state(state, **kwargs):
+        if state.flags is None:
+            lifecycle.append("launch-state")
+            state.flags = object()
+            state.flag_peers = object()
+
+    monkeypatch.setattr(backend, "_ensure_launch_state", ensure_launch_state)
     monkeypatch.setattr(
         backend.symm_mem,
         "rendezvous",
@@ -527,6 +529,15 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
 
     def create_workspace(**kwargs):
         lifecycle.append("workspace")
+        key = (
+            kwargs["device_index"],
+            id(kwargs["group"]),
+            kwargs["group_name"],
+            kwargs["dtype"],
+            kwargs["world_size"],
+            kwargs["rows"],
+        )
+        backend._WORKSPACES[key] = workspace
         return workspace
 
     monkeypatch.setattr(backend, "_workspace", create_workspace)
@@ -555,11 +566,9 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
     assert descriptor_streams == [main_stream, main_stream]
     assert lifecycle == [
         "current-sync",
+        "launch-state",
         "workspace",
         "tail-record",
-        "current-sync",
-        "tail-sync",
-        "workspace",
         "tail-record",
     ]
 

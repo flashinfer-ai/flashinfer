@@ -819,13 +819,6 @@ def _run_cake_validated(
                 "Cake all-gather matmul state is poisoned by a prior failed collective"
             )
         try:
-            _ensure_launch_state(
-                state,
-                device_index=device_index,
-                rank=rank,
-                world_size=world_size,
-                group_name=group_name,
-            )
             workspace_key = (
                 device_index,
                 id(group),
@@ -836,13 +829,23 @@ def _run_cake_validated(
             )
             with _CACHE_LOCK:
                 workspace = _WORKSPACES.get(workspace_key)
-            if workspace is None:
+            main_stream = torch.cuda.current_stream(device_index)
+            if state.flags is None or workspace is None:
                 # Symmetric allocation and rendezvous are host operations, so
                 # a stream dependency cannot order them after queued caller work.
                 # Wait only on a cache miss; steady-state launches stay async.
-                torch.cuda.current_stream(device_index).synchronize()
+                main_stream.synchronize()
                 if state.tail_event is not None:
                     state.tail_event.synchronize()
+
+            _ensure_launch_state(
+                state,
+                device_index=device_index,
+                rank=rank,
+                world_size=world_size,
+                group_name=group_name,
+            )
+            if workspace is None:
                 with _CACHE_LOCK:
                     workspace = _workspace(
                         device_index=device_index,
@@ -871,7 +874,6 @@ def _run_cake_validated(
             signal_pad = workspace.scratch_handle.get_signal_pad(
                 rank, (world_size, num_chunks), torch.uint32, 0
             )
-            main_stream = torch.cuda.current_stream(device_index)
             inp.record_stream(main_stream)
             inp.record_stream(workspace.comm_stream)
             w.record_stream(main_stream)
