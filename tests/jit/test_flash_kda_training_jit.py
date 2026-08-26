@@ -14,6 +14,10 @@ import pytest
 from flashinfer.jit import flash_kda, flash_kda_training
 
 
+def _kernel_symbols(source: str) -> set[str]:
+    return set(re.findall(r"kernel_flashkda_[A-Za-z0-9_]+", source))
+
+
 @pytest.mark.parametrize(
     ("target", "arch_flag"),
     [
@@ -61,16 +65,39 @@ def test_flash_kda_training_jit_spec(target, arch_flag):
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_training_backward" in paired_binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_training_c32_forward" in fallback_binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_training_c32_backward" in fallback_binding
-    assert "kernel_flashkda_forward_checkpoint_c16" in c16
-    assert "kernel_flashkda_backward_persistent_c16" in c16
-    assert "kernel_flashkda_refine_forgetting_horizons" in auxiliary
-    assert "kernel_flashkda_backward_param_reduce_c16_partial" in auxiliary
-    assert "kernel_flashkda_grouped_qk_reduce" in auxiliary
-    assert "kernel_flashkda_blackwell_prefill_fp32_state_initial" in final_state
-    assert "kernel_flashkda_backward_state_checkpoint_fallback_c32" in fallback
-    assert "kernel_flashkda_bf16_fused_m128_unsplit" in fallback
-    assert "kernel_flashkda_backward_reverse_wg8" in grouped_row
-    assert "kernel_flashkda_backward_checkpoint_wg4" in grouped_row
+    assert _kernel_symbols(c16) == {
+        "kernel_flashkda_forward_checkpoint_c16",
+        "kernel_flashkda_backward_persistent_c16",
+    }
+    assert _kernel_symbols(auxiliary) == {
+        "kernel_flashkda_refine_forgetting_horizons",
+        "kernel_flashkda_backward_param_reduce_c16_partial",
+        "kernel_flashkda_grouped_qk_expand",
+        "kernel_flashkda_grouped_qk_reduce",
+    }
+    assert _kernel_symbols(final_state) == {
+        "kernel_flashkda_blackwell_prefill_fp32_state_initial"
+    }
+    assert _kernel_symbols(fallback) == {
+        "kernel_flashkda_backward_preprocess",
+        "kernel_flashkda_forward_checkpoint_rows_f32",
+        "kernel_flashkda_backward_reverse_rows",
+        "kernel_flashkda_backward_finalize_tokens",
+        "kernel_flashkda_backward_gate_reduce_split",
+        "kernel_flashkda_bf16_fused_m128_unsplit",
+        "kernel_flashkda_bf16_fused_m128",
+        "kernel_flashkda_backward_state_checkpoint_fallback_c32",
+        "kernel_flashkda_backward_boundary_c32_tcgen_m64",
+        "kernel_flashkda_backward_boundary_c32_tcgen",
+        "kernel_flashkda_backward_local_c32_tcgen",
+        "kernel_flashkda_backward_map_finalize_c32",
+    }
+    assert _kernel_symbols(grouped_row) == {
+        "kernel_flashkda_backward_preprocess_bf16_norm",
+        "kernel_flashkda_forward_checkpoint_rows_bf16_wg4",
+        "kernel_flashkda_backward_reverse_wg8",
+        "kernel_flashkda_backward_finalize_tokens_bf16_norm",
+    }
     assert "kernel_flashkda_bf16_fused_m128_unsplit" in fallback_binding
     assert "run_training_grouped_row_forward" in fallback_binding
     assert "run_training_grouped_row_backward" in fallback_binding

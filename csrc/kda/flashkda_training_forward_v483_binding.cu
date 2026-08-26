@@ -14,7 +14,7 @@ extern "C" __global__ void kernel_flashkda_forward_checkpoint_c16(
     unsigned int*, const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, __nv_bfloat16*,
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, __nv_bfloat16*,
-    __nv_bfloat16*, float*, float*, long long*, long long*, int*, float*, __nv_bfloat16*, int, int,
+    __nv_bfloat16*, float*, float*, long long*, long long*, int*, float*, float*, int, int,
     int, int, int, int, float, float);
 
 namespace flashinfer {
@@ -86,14 +86,6 @@ struct TensorMapWords {
 static __global__ void PublishTensorMaps(uint64_t* destination, TensorMapWords source) {
   if (threadIdx.x < kDescriptorBytes / sizeof(uint64_t)) {
     destination[threadIdx.x] = source.words[threadIdx.x];
-  }
-}
-
-static __global__ void CastFinalState(const __nv_bfloat16* source, float* destination,
-                                      int64_t count) {
-  const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index < count) {
-    destination[index] = static_cast<float>(source[index]);
   }
 }
 
@@ -194,18 +186,9 @@ void RunForward(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
       reinterpret_cast<long long*>(checkpoint_cu_starts.data_ptr()),
       reinterpret_cast<int*>(work_items.data_ptr()),
       reinterpret_cast<float*>(initial_state.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(final_state_bf16.data_ptr()), kWorkItems, 1, kHeads, kHeads,
-      kHeads, 16, static_cast<float>(scale), static_cast<float>(lower_bound));
+      reinterpret_cast<float*>(final_state.data_ptr()), kWorkItems, 1, kHeads, kHeads, kHeads, 16,
+      static_cast<float>(scale), static_cast<float>(lower_bound));
   CheckCuda(cudaGetLastError(), "training forward launch");
-
-  constexpr int32_t kCastThreads = 256;
-  const int64_t final_count = final_state.numel();
-  const uint32_t cast_blocks =
-      static_cast<uint32_t>((final_count + kCastThreads - 1) / kCastThreads);
-  CastFinalState<<<cast_blocks, kCastThreads, 0, stream>>>(
-      reinterpret_cast<__nv_bfloat16*>(final_state_bf16.data_ptr()),
-      reinterpret_cast<float*>(final_state.data_ptr()), final_count);
-  CheckCuda(cudaGetLastError(), "training final-state cast launch");
 }
 
 }  // namespace flash_kda_training

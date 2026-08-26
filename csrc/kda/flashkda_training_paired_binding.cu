@@ -20,7 +20,7 @@ __global__ void kernel_flashkda_forward_checkpoint_c16(
     unsigned int*, const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, __nv_bfloat16*,
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, __nv_bfloat16*,
-    __nv_bfloat16*, float*, float*, long long*, long long*, int*, float*, __nv_bfloat16*, int, int,
+    __nv_bfloat16*, float*, float*, long long*, long long*, int*, float*, float*, int, int,
     int, int, int, int, float, float);
 
 __global__ void kernel_flashkda_backward_persistent_c16(
@@ -282,13 +282,13 @@ void RunTrainingForward(
   TVM_FFI_ICHECK(final_tensormap_workspace.numel() >= final_grid_ctas * kFinalWorkspaceBytesPerCta);
 
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  CheckCuda(
-      cudaMemcpyAsync(work_items.data_ptr(), base_work_items.data_ptr(),
-                      total_work_items * 8 * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream),
-      "copy training work items");
-  CheckCuda(cudaMemsetAsync(counters.data_ptr(), 0, counters.numel() * sizeof(uint32_t), stream),
-            "reset training counters");
   if (boundary_count != 0) {
+    CheckCuda(
+        cudaMemcpyAsync(work_items.data_ptr(), base_work_items.data_ptr(),
+                        total_work_items * 8 * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream),
+        "copy training work items");
+    CheckCuda(cudaMemsetAsync(counters.data_ptr(), 0, counters.numel() * sizeof(uint32_t), stream),
+              "reset training counters");
     ConfigureDynamicSmem(kernel_flashkda_refine_forgetting_horizons, kRefineSmemBytes, device_id,
                          "cudaFuncSetAttribute(forgetting-horizon refinement)");
     kernel_flashkda_refine_forgetting_horizons<<<dim3(boundary_count, 1, 1), 128, kRefineSmemBytes,
@@ -299,6 +299,9 @@ void RunTrainingForward(
         reinterpret_cast<unsigned int*>(counters.data_ptr()), static_cast<int>(num_v_heads),
         static_cast<float>(lower_bound), kDefaultLog2Threshold);
     CheckCuda(cudaGetLastError(), "forgetting-horizon refinement launch");
+  } else if (uniform_work_items == 0) {
+    CheckCuda(cudaMemsetAsync(counters.data_ptr(), 0, sizeof(uint32_t), stream),
+              "reset training forward counter");
   }
 
   const CUtensorMap q_map = EncodeTokenMap(q, "q", total_tokens, num_qk_heads);
@@ -321,32 +324,11 @@ void RunTrainingForward(
       reinterpret_cast<long long*>(checkpoint_cu_starts.data_ptr()),
       reinterpret_cast<int*>(work_items.data_ptr()),
       reinterpret_cast<float*>(initial_state.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(beta_active.data_ptr()), static_cast<int>(total_work_items),
+      reinterpret_cast<float*>(final_state.data_ptr()), static_cast<int>(total_work_items),
       static_cast<int>(uniform_work_items), static_cast<int>(num_qk_heads),
       static_cast<int>(num_v_heads), static_cast<int>(beta_active_stride), kChunk,
       static_cast<float>(scale), static_cast<float>(lower_bound));
   CheckCuda(cudaGetLastError(), "training forward launch");
-
-  PrepareFinalTensorMaps(q, k, v, g, final_output_scratch, final_descriptor_storage, total_tokens,
-                         num_qk_heads, num_v_heads, prepare_final_descriptors, stream);
-  ConfigureDynamicSmem(kernel_flashkda_blackwell_prefill_fp32_state_initial, kFinalSmemBytes,
-                       device_id, "cudaFuncSetAttribute(training final state)");
-  auto* final_maps =
-      reinterpret_cast<const FlashKDATrainingTensorMap*>(final_descriptor_storage.data_ptr());
-  kernel_flashkda_blackwell_prefill_fp32_state_initial<<<dim3(final_grid_ctas, 1, 1), 384,
-                                                         kFinalSmemBytes, stream>>>(
-      final_maps + 0, final_maps + 1, final_maps + 2, final_maps + 3, final_maps + 4,
-      reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()), reinterpret_cast<float*>(A_log.data_ptr()),
-      reinterpret_cast<float*>(dt_bias.data_ptr()),
-      reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
-      reinterpret_cast<float*>(initial_state.data_ptr()),
-      reinterpret_cast<float*>(final_state.data_ptr()),
-      reinterpret_cast<float*>(dummy_f32.data_ptr()), reinterpret_cast<int*>(dummy_i32.data_ptr()),
-      reinterpret_cast<uint8_t*>(final_tensormap_workspace.data_ptr()), 0,
-      static_cast<float>(scale), static_cast<int>(num_sequences), static_cast<int>(num_qk_heads),
-      static_cast<int>(num_v_heads), static_cast<int>(num_sequences * num_v_heads),
-      static_cast<float>(lower_bound));
-  CheckCuda(cudaGetLastError(), "training final-state launch");
 }
 
 void RunTrainingBackward(TensorView q, TensorView k, TensorView v, TensorView g, TensorView A_log,

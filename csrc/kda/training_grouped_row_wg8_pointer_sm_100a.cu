@@ -270,7 +270,7 @@ kernel_flashkda_backward_preprocess_bf16_norm(__nv_bfloat16* __restrict__ q, __n
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_flashkda_backward_checkpoint_wg4(__nv_bfloat16* __restrict__ k_norm, __nv_bfloat16* __restrict__ decay, float* __restrict__ beta_active, __nv_bfloat16* __restrict__ v, float* __restrict__ initial_state, long long* __restrict__ cu_seqlens, __nv_bfloat16* __restrict__ checkpoint, int num_sequences, int num_heads)
+kernel_flashkda_forward_checkpoint_rows_bf16_wg4(__nv_bfloat16* __restrict__ q_norm, __nv_bfloat16* __restrict__ k_norm, __nv_bfloat16* __restrict__ decay, float* __restrict__ beta_active, __nv_bfloat16* __restrict__ v, float* __restrict__ initial_state, long long* __restrict__ cu_seqlens, __nv_bfloat16* __restrict__ checkpoint, __nv_bfloat16* __restrict__ out, float* __restrict__ final_state, int num_sequences, int num_heads, float scale)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -304,11 +304,12 @@ kernel_flashkda_backward_checkpoint_wg4(__nv_bfloat16* __restrict__ k_norm, __nv
     #pragma unroll 1
     for (long long token = bos; token < eos; token++) {
         long long token_base = (token * (long long)num_heads + (long long)head) * (long long)D;
+        float q_frag[4];
         float k_frag[4];
         float d_frag[4];
         {
             uint2 _vld_1;
-            _vld_1 = *reinterpret_cast<const uint2*>(k_norm + token_base + (long long)elem);
+            _vld_1 = *reinterpret_cast<const uint2*>(q_norm + token_base + (long long)elem);
             uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
@@ -317,13 +318,13 @@ kernel_flashkda_backward_checkpoint_wg4(__nv_bfloat16* __restrict__ k_norm, __nv
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&k_frag[0 + _pair * 2])[0]), "=f"((&k_frag[0 + _pair * 2])[1])
+                    : "=f"((&q_frag[0 + _pair * 2])[0]), "=f"((&q_frag[0 + _pair * 2])[1])
                     : "r"(_vpairs_1[_pair]));
             }
         }
         {
             uint2 _vld_2;
-            _vld_2 = *reinterpret_cast<const uint2*>(decay + token_base + (long long)elem);
+            _vld_2 = *reinterpret_cast<const uint2*>(k_norm + token_base + (long long)elem);
             uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
             #pragma unroll
             for (int _pair = 0; _pair < 2; _pair++) {
@@ -332,8 +333,23 @@ kernel_flashkda_backward_checkpoint_wg4(__nv_bfloat16* __restrict__ k_norm, __nv
                     "shl.b32 %0, %2, 16;\n\t"
                     "and.b32 %1, %2, 0xffff0000;\n\t"
                     "}\n"
-                    : "=f"((&d_frag[0 + _pair * 2])[0]), "=f"((&d_frag[0 + _pair * 2])[1])
+                    : "=f"((&k_frag[0 + _pair * 2])[0]), "=f"((&k_frag[0 + _pair * 2])[1])
                     : "r"(_vpairs_2[_pair]));
+            }
+        }
+        {
+            uint2 _vld_3;
+            _vld_3 = *reinterpret_cast<const uint2*>(decay + token_base + (long long)elem);
+            uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3);
+            #pragma unroll
+            for (int _pair = 0; _pair < 2; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&d_frag[0 + _pair * 2])[0]), "=f"((&d_frag[0 + _pair * 2])[1])
+                    : "r"(_vpairs_3[_pair]));
             }
         }
         float pred = 0.0f;
@@ -353,10 +369,13 @@ kernel_flashkda_backward_checkpoint_wg4(__nv_bfloat16* __restrict__ k_norm, __nv
         long long value_index = token_base + (long long)value_row;
         float residual = beta_active[beta_index] * ((float)v[value_index] - pred);
         long long checkpoint_base = ((token * (long long)num_heads + (long long)head) * (long long)V + (long long)value_row) * (long long)D;
+        float output_value = 0.0f;
         #pragma unroll
         for (int i2 = 0; i2 < 4; i2++) {
             float _fma_1 = __fmaf_rn(residual, k_frag[i2], decayed[i2]);
             state[i2] = _fma_1;
+            float _fma_2 = __fmaf_rn(q_frag[i2], state[i2], output_value);
+            output_value = _fma_2;
         }
         {
             uint2 _pk2;
@@ -365,6 +384,19 @@ kernel_flashkda_backward_checkpoint_wg4(__nv_bfloat16* __restrict__ k_norm, __nv
             _pk[1] = __floats2bfloat162_rn(state[0 + 2], state[0 + 3]);
             *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(checkpoint + (checkpoint_base + (long long)elem)))[0]) = _pk2;
         }
+        float _warp_reduce_1 = output_value;
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            _warp_reduce_1 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_1, offset);
+        output_value = _warp_reduce_1;
+        if (lane == 0) {
+            __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(scale * output_value);
+            out[value_index] = _cvt_bf16_0;
+        }
+    }
+    {
+        float4 _v4 = make_float4(state[0 + 0], state[0 + 1], state[0 + 2], state[0 + 3]);
+        *reinterpret_cast<float4*>(final_state + (state_base + (long long)elem) + 0) = _v4;
     }
 }
 

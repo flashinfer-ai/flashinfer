@@ -88,7 +88,7 @@ def test_training_api_signatures_and_no_forward_recompute():
     backward_parameters = tuple(
         inspect.signature(recurrent_kda_training_backward).parameters
     )
-    assert forward_parameters[:9] == (
+    assert forward_parameters == (
         "q",
         "k",
         "v",
@@ -98,6 +98,11 @@ def test_training_api_signatures_and_no_forward_recompute():
         "dt_bias",
         "initial_state",
         "cu_seqlens",
+        "scale",
+        "lower_bound",
+        "out",
+        "final_state_out",
+        "context_out",
     )
     assert (
         inspect.signature(recurrent_kda_training_forward)
@@ -382,6 +387,16 @@ def _assert_training_matches_fla(inputs, expected_route):
     gradients = recurrent_kda_training_backward(
         context, inputs["do"], inputs["dfinal_state"]
     )
+    assert tuple(gradient.dtype for gradient in gradients) == (
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float32,
+        torch.float32,
+    )
     assert torch.equal(inputs["initial_state"], initial_state_before)
     torch.testing.assert_close(output, expected_output, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(final_state, expected_final, atol=1e-2, rtol=1e-2)
@@ -662,6 +677,15 @@ def test_paired_backward_ffi_does_not_rerun_forward(monkeypatch):
                 num_v_heads=8,
             ),
         ),
+        (
+            "c32",
+            lambda: _make_inputs(
+                seed=24019,
+                seq_lens=(2049,),
+                num_qk_heads=16,
+                num_v_heads=16,
+            ),
+        ),
     ],
 )
 def test_fallback_ffi_consumes_route_context_without_recompute(
@@ -706,7 +730,8 @@ def test_fallback_ffi_consumes_route_context_without_recompute(
         assert forward_args[32].data_ptr() == forward_args[16].data_ptr()
         assert forward_args[32].data_ptr() != context._final_output_scratch.data_ptr()
         assert forward_args[43] == int(context._metadata["use_split_work_items"])
-        assert forward_args[44] == 1
+        assert forward_args[44] == int(context._route.grouped)
+        assert forward_args[47] == 1
     assert not training_module.forward_calls
     assert not training_module.backward_calls
 
@@ -739,7 +764,10 @@ def test_grouped_hybrid_materializes_both_contexts_during_forward(monkeypatch):
     assert context._parameter_context._route.tag == "grouped_c32"
     assert len(training_module.forward_calls) == 1
     assert len(training_module.c32_forward_calls) == 1
-    assert training_module.c32_forward_calls[0][47] == 0
+    parameter_forward = training_module.c32_forward_calls[0]
+    assert parameter_forward[16] is context._parameter_context._final_output_scratch
+    assert parameter_forward[32] is context._parameter_context._final_output_scratch
+    assert parameter_forward[47] == 0
 
     gradients = recurrent_kda_training_backward(
         context, values["do"], values["dfinal_state"]
@@ -751,6 +779,53 @@ def test_grouped_hybrid_materializes_both_contexts_during_forward(monkeypatch):
     assert c32_outputs[44] is gradients[6]
     assert len(training_module.forward_calls) == 1
     assert len(training_module.c32_forward_calls) == 1
+
+
+def test_strict_public_dtypes_are_rejected_before_ffi(monkeypatch):
+    _require_blackwell()
+    training_module = _TrainingRecorder()
+    monkeypatch.setattr(
+        kda_training_api, "_get_training_module", lambda _: training_module
+    )
+    inputs = _make_inputs(seed=1027)
+
+    with pytest.raises(ValueError, match="q must have dtype torch.bfloat16"):
+        recurrent_kda_training_forward(
+            inputs["q"].float(),
+            inputs["k"],
+            inputs["v"],
+            inputs["g"],
+            inputs["beta"],
+            inputs["A_log"],
+            inputs["dt_bias"],
+            inputs["initial_state"],
+            inputs["cu_seqlens"],
+        )
+    assert sum(_training_call_counts(training_module)) == 0
+
+    _, _, context = recurrent_kda_training_forward(
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["g"],
+        inputs["beta"],
+        inputs["A_log"],
+        inputs["dt_bias"],
+        inputs["initial_state"],
+        inputs["cu_seqlens"],
+    )
+    forward_counts = _training_call_counts(training_module)
+    with pytest.raises(ValueError, match="do must have dtype torch.bfloat16"):
+        recurrent_kda_training_backward(
+            context, inputs["do"].float(), inputs["dfinal_state"]
+        )
+    with pytest.raises(
+        ValueError, match="dfinal_state must have dtype torch.float32"
+    ):
+        recurrent_kda_training_backward(
+            context, inputs["do"], inputs["dfinal_state"].to(torch.bfloat16)
+        )
+    assert _training_call_counts(training_module) == forward_counts
 
 
 def test_training_rejects_cuda_graph_capture_before_ffi(monkeypatch):

@@ -16,8 +16,9 @@ extern "C" {
 __global__ void kernel_flashkda_backward_preprocess(__nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
                                                     __nv_bfloat16*, float*, float*, float*, float*,
                                                     float*, float*, int, int, float);
-__global__ void kernel_flashkda_backward_checkpoint(float*, float*, float*, __nv_bfloat16*, float*,
-                                                    long long*, float*, int, int);
+__global__ void kernel_flashkda_forward_checkpoint_rows_f32(
+    float*, float*, float*, float*, __nv_bfloat16*, float*, long long*, float*, __nv_bfloat16*,
+    float*, int, int, float);
 __global__ void kernel_flashkda_backward_reverse_rows(float*, float*, float*, float*,
                                                       __nv_bfloat16*, __nv_bfloat16*, float*,
                                                       float*, long long*, float*, float*, float*,
@@ -36,9 +37,9 @@ __global__ void kernel_flashkda_backward_preprocess_bf16_norm(__nv_bfloat16*, __
                                                               float*, float*, __nv_bfloat16*,
                                                               __nv_bfloat16*, __nv_bfloat16*,
                                                               float*, int, int, float);
-__global__ void kernel_flashkda_backward_checkpoint_wg4(__nv_bfloat16*, __nv_bfloat16*, float*,
-                                                        __nv_bfloat16*, float*, long long*,
-                                                        __nv_bfloat16*, int, int);
+__global__ void kernel_flashkda_forward_checkpoint_rows_bf16_wg4(
+    __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float*, __nv_bfloat16*, float*, long long*,
+    __nv_bfloat16*, __nv_bfloat16*, float*, int, int, float);
 __global__ void kernel_flashkda_backward_reverse_wg8(__nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
                                                      float*, __nv_bfloat16*, __nv_bfloat16*, float*,
                                                      float*, long long*, __nv_bfloat16*, float*,
@@ -64,7 +65,7 @@ __global__ void kernel_flashkda_bf16_fused_m128(
     float, unsigned long long, unsigned long long, unsigned long long, long long, long long, int,
     int, long long*, __nv_bfloat16*, unsigned int*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
     __nv_bfloat16*, float*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float*, __nv_bfloat16*,
-    float*, float*, unsigned int*, int, int, const FlashKDATrainingFallbackTensorMap*);
+    float*, float*, unsigned int*, int, int, const FlashKDATrainingFallbackTensorMap*, float*, int);
 __global__ void kernel_flashkda_bf16_fused_m128_unsplit(
     __nv_bfloat16*, const FlashKDATrainingFallbackTensorMap*, __nv_bfloat16*,
     const FlashKDATrainingFallbackTensorMap*, __nv_bfloat16*,
@@ -75,7 +76,7 @@ __global__ void kernel_flashkda_bf16_fused_m128_unsplit(
     float, unsigned long long, unsigned long long, unsigned long long, long long, long long, int,
     int, long long*, __nv_bfloat16*, unsigned int*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*,
     __nv_bfloat16*, float*, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float*, __nv_bfloat16*,
-    float*, float*, unsigned int*, int, int, const FlashKDATrainingFallbackTensorMap*);
+    float*, float*, unsigned int*, int, int, const FlashKDATrainingFallbackTensorMap*, float*, int);
 __global__ void kernel_flashkda_backward_state_checkpoint_fallback_c32(
     long long*, long long*, unsigned int*, float*, __nv_bfloat16*, float*, __nv_bfloat16*,
     __nv_bfloat16*, int, int, int, float, int);
@@ -322,20 +323,17 @@ void RunTrainingRowForward(
       static_cast<int>(num_heads), static_cast<float>(lower_bound));
   CheckCuda(cudaGetLastError(), "row training preprocess launch");
   const int64_t row_grid = num_sequences * num_heads * kHeadDim;
-  kernel_flashkda_backward_checkpoint<<<static_cast<uint32_t>(row_grid), 32, 0, stream>>>(
-      reinterpret_cast<float*>(k_norm.data_ptr()), reinterpret_cast<float*>(decay.data_ptr()),
-      reinterpret_cast<float*>(beta_active.data_ptr()),
+  kernel_flashkda_forward_checkpoint_rows_f32<<<static_cast<uint32_t>(row_grid), 32, 0, stream>>>(
+      reinterpret_cast<float*>(q_norm.data_ptr()), reinterpret_cast<float*>(k_norm.data_ptr()),
+      reinterpret_cast<float*>(decay.data_ptr()), reinterpret_cast<float*>(beta_active.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(v.data_ptr()),
       reinterpret_cast<float*>(initial_state.data_ptr()),
       reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
-      reinterpret_cast<float*>(checkpoint.data_ptr()), static_cast<int>(num_sequences),
-      static_cast<int>(num_heads));
-  CheckCuda(cudaGetLastError(), "row training checkpoint launch");
-  LaunchAccurateForward(q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens, out,
-                        final_state, final_descriptor_storage, final_tensormap_workspace, dummy_f32,
-                        dummy_i32, total_tokens, num_sequences, num_heads, num_heads,
-                        final_grid_ctas, prepare_final_descriptors, scale, lower_bound, device_id,
-                        stream);
+      reinterpret_cast<float*>(checkpoint.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      reinterpret_cast<float*>(final_state.data_ptr()), static_cast<int>(num_sequences),
+      static_cast<int>(num_heads), static_cast<float>(scale));
+  CheckCuda(cudaGetLastError(), "row training forward launch");
 }
 
 void RunTrainingRowBackward(TensorView q, TensorView k, TensorView v, TensorView g,
@@ -456,23 +454,20 @@ void RunTrainingGroupedRowForward(
   CheckCuda(cudaGetLastError(), "grouped row preprocess launch");
 
   const int64_t checkpoint_grid = num_sequences * num_heads * (kHeadDim / 4);
-  kernel_flashkda_backward_checkpoint_wg4<<<CheckedGridX(checkpoint_grid, "grouped row checkpoint"),
-                                            kGroupedRowCheckpointThreads, 0, stream>>>(
-      reinterpret_cast<__nv_bfloat16*>(k_norm.data_ptr()),
+  kernel_flashkda_forward_checkpoint_rows_bf16_wg4<<<
+      CheckedGridX(checkpoint_grid, "grouped row forward"), kGroupedRowCheckpointThreads, 0,
+      stream>>>(reinterpret_cast<__nv_bfloat16*>(q_norm.data_ptr()),
+                reinterpret_cast<__nv_bfloat16*>(k_norm.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(decay.data_ptr()),
       reinterpret_cast<float*>(beta_active.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(v.data_ptr()),
       reinterpret_cast<float*>(initial_state.data_ptr()),
       reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(checkpoint.data_ptr()), static_cast<int>(num_sequences),
-      static_cast<int>(num_heads));
-  CheckCuda(cudaGetLastError(), "grouped row checkpoint launch");
-
-  LaunchAccurateForward(q_native, k_native, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens,
-                        out, final_state, final_descriptor_storage, final_tensormap_workspace,
-                        dummy_f32, dummy_i32, total_tokens, num_sequences, num_qk_heads, num_heads,
-                        final_grid_ctas, prepare_final_descriptors, scale, lower_bound, device_id,
-                        stream);
+      reinterpret_cast<__nv_bfloat16*>(checkpoint.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      reinterpret_cast<float*>(final_state.data_ptr()), static_cast<int>(num_sequences),
+      static_cast<int>(num_heads), static_cast<float>(scale));
+  CheckCuda(cudaGetLastError(), "grouped row forward launch");
 }
 
 void RunTrainingGroupedRowBackward(
@@ -656,7 +651,9 @@ void RunTrainingC32Forward(
       reinterpret_cast<float*>(beta_active.data_ptr()),                                          \
       reinterpret_cast<float*>(initial_state.data_ptr()),                                        \
       reinterpret_cast<unsigned int*>(zero_workspace.data_ptr()),                                \
-      static_cast<int>(zero_workspace.numel()), static_cast<int>(num_sequences), checkpoint_map)
+      static_cast<int>(zero_workspace.numel()), static_cast<int>(num_sequences), checkpoint_map, \
+      reinterpret_cast<float*>(final_state.data_ptr()),                                           \
+      static_cast<int>(materialize_public_forward))
 
   if (use_split_work_items != 0) {
     ConfigureDynamicSmem(kernel_flashkda_bf16_fused_m128, kTapeSmemBytes, device_id,
@@ -688,13 +685,6 @@ void RunTrainingC32Forward(
       static_cast<float>(lower_bound), static_cast<int>(use_split_work_items));
   CheckCuda(cudaGetLastError(), "training C32 state fallback launch");
 
-  if (materialize_public_forward != 0) {
-    LaunchAccurateForward(q_native, k_native, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens,
-                          final_output_scratch, final_state, final_descriptor_storage,
-                          final_tensormap_workspace, dummy_f32, dummy_i32, total_tokens,
-                          num_sequences, num_qk_heads, num_heads, final_grid_ctas,
-                          prepare_final_descriptors, scale, lower_bound, device_id, stream);
-  }
 }
 
 void RunTrainingC32Backward(
