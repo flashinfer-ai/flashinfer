@@ -28,10 +28,6 @@ from cutlass._mlir import ir
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 
-# Availability probes live in ``.availability``, which imports nothing from
-# ``cutlass`` -- a guard must not depend on the thing it guards. Re-exported
-# here for backwards compatibility; new call sites that run before the DSL is
-# known present should import from ``.availability`` directly.
 from .availability import (  # noqa: F401
     cute_dsl_compile_arch,
     is_cute_dsl_arch_supported,

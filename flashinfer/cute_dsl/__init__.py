@@ -25,9 +25,6 @@ This module provides high-performance GPU kernels implemented using NVIDIA CuTe-
     removed in a future release.
 """
 
-# ``.availability`` imports nothing from ``cutlass``, so this package stays
-# importable when the optional DSL is absent. Everything below the guard --
-# including ``.utils`` -- does require it.
 from .availability import (
     is_cute_dsl_available,
     is_rubin_cute_dsl_available,
