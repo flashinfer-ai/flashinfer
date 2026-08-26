@@ -1992,10 +1992,7 @@ def test_pretranspose_api_mtp_verify_controls_are_keyword_only():
         "intermediate_states_buffer",
         "disable_state_update",
     )
-    assert (
-        parameters["intermediate_states_buffer"].kind
-        is inspect.Parameter.KEYWORD_ONLY
-    )
+    assert parameters["intermediate_states_buffer"].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["disable_state_update"].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["intermediate_states_buffer"].default is None
     assert parameters["disable_state_update"].default is False
@@ -2027,15 +2024,8 @@ def test_pretranspose_api_forwards_bf16_mtp_verify_controls():
     v = torch.randn(
         batch_size, seq_len, num_v_heads, head_size, dtype=dtype, device=device
     )
-    a = (
-        torch.randn(
-            batch_size, seq_len, num_v_heads, dtype=dtype, device=device
-        )
-        * 0.1
-    )
-    b_tensor = torch.randn(
-        batch_size, seq_len, num_v_heads, dtype=dtype, device=device
-    )
+    a = torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device) * 0.1
+    b_tensor = torch.randn(batch_size, seq_len, num_v_heads, dtype=dtype, device=device)
     A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
     dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
     initial_state_indices = torch.tensor([1, 4], dtype=torch.int32, device=device)
