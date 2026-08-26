@@ -48,9 +48,13 @@ from .api import (
     _CUTLASS_W4A8_ARCHS,
     # Typed activation values
     ActivationConfig,
+    GELU,
     GeGLU,
     GeGLUTanh,
+    Identity,
+    ReLU,
     ReLU2,
+    SiLU,
     SiTU,
     SwiGLU,
     SwiGLUStep,
@@ -65,6 +69,20 @@ from .api import (
 from .utils import (
     make_hybrid_bucket_mapper,
     map_to_hybrid_bucket,
+)
+
+
+_CUTLASS_SEMANTIC_ACTIVATIONS: tuple[type[ActivationConfig], ...] = (
+    SwiGLU,
+    SwiGLUStep,
+    GeGLU,
+    GeGLUTanh,
+    ReLU2,
+    SiTU,
+    Identity,
+    GELU,
+    ReLU,
+    SiLU,
 )
 
 
@@ -574,12 +592,11 @@ class _CutlassRunnerBase(MoERunner):
     """
 
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
-    # Quant-specific CUTLASS runners added after the original BF16/W4A16
-    # adapters must opt into broader epilogues only with matching preparation
-    # geometry and numerical coverage.
-    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = (
-        SwiGLU,
-    )
+    # Fail closed like MoERunner: every concrete CUTLASS runner declares its own
+    # activations after proving the matching preparation geometry and numerical
+    # coverage. A SwiGLU default would let a runner added later inherit support
+    # it never validated instead of failing at check_support().
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = ()
     supports_expert_parallelism = False
     _supported_archs: ClassVar[tuple[int, ...]]
     _x_dtype: ClassVar[torch.dtype] = torch.bfloat16
@@ -1163,7 +1180,7 @@ class CutlassBf16Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_bf16"
     supported_quant_variants = (QuantVariant.BF16,)
-    supported_activation_classes = (SwiGLU, SwiGLUStep, GeGLUTanh, ReLU2, SiTU)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_BF16_ARCHS
     _weight_dtype = torch.bfloat16
     _use_w4_group_scaling = False
@@ -1195,7 +1212,7 @@ class CutlassW4A16Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_w4a16"
     supported_quant_variants = (QuantVariant.W4A16,)
-    supported_activation_classes = (SwiGLU, SwiGLUStep, GeGLUTanh, ReLU2, SiTU)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_W4A16_ARCHS
     _weight_dtype = torch.uint8
     _use_w4_group_scaling = True
@@ -1264,7 +1281,7 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_nvfp4"
     supported_quant_variants = (QuantVariant.NVFP4,)
-    supported_activation_classes = (SwiGLU,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_NVFP4_ARCHS
     _weight_dtype = torch.int64
     _use_w4_group_scaling = False
@@ -1300,11 +1317,12 @@ class CutlassNvfp4Runner(_CutlassRunnerBase):
                 "Cutlass NVFP4 requires hidden_size and intermediate_size "
                 f"divisible by 16, got H={hidden_size}, I={intermediate_size}."
             )
-        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size // 2)
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size // 2)
         expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
         expected_s1 = (
             num_experts,
-            round_up(2 * intermediate_size, 128),
+            round_up(gemm1_rows, 128),
             round_up(hidden_size // 16, 4),
         )
         expected_s2 = (
@@ -1376,7 +1394,7 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
 
     backend_key = "cutlass_fp8_per_tensor"
     supported_quant_variants = (QuantVariant.FP8PerTensor,)
-    supported_activation_classes = (SwiGLU,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_FP8_ARCHS
     _x_dtype = torch.float8_e4m3fn
     _weight_dtype = torch.float8_e4m3fn
@@ -1396,7 +1414,8 @@ class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
         )
         num_experts = self.config.routing.num_experts
         intermediate_size = self.config.experts.intermediate_size
-        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size)
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size)
         expected_w2 = (num_experts, hidden_size, intermediate_size)
         if w1.dtype is not torch.float8_e4m3fn or w2.dtype is not torch.float8_e4m3fn:
             raise TypeError("Cutlass FP8 prepared weights must be float8_e4m3fn.")
@@ -1439,7 +1458,7 @@ class CutlassFp8BlockRunner(_CutlassRunnerBase):
 
     backend_key = "cutlass_fp8_block"
     supported_quant_variants = (QuantVariant.DeepSeekFp8,)
-    supported_activation_classes = (SwiGLU,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_FP8_BLOCK_ARCHS
     _weight_dtype = torch.float8_e4m3fn
     _use_deepseek_fp8_block_scale = True
@@ -1459,11 +1478,12 @@ class CutlassFp8BlockRunner(_CutlassRunnerBase):
         w1, w2, w1_scale, w2_scale = (view[key] for key in self._required_weight_keys)
         num_experts = self.config.routing.num_experts
         intermediate_size = self.config.experts.intermediate_size
-        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size)
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size)
         expected_w2 = (num_experts, hidden_size, intermediate_size)
         expected_s1 = (
             num_experts,
-            ceil(2 * intermediate_size / 128),
+            ceil(gemm1_rows / 128),
             ceil(hidden_size / 128),
         )
         expected_s2 = (
@@ -1498,7 +1518,7 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_mxfp8_mxfp4"
     supported_quant_variants = (QuantVariant.MXFP4,)
-    supported_activation_classes = (SwiGLU,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_MXFP8_MXFP4_ARCHS
     _x_dtype = torch.float8_e4m3fn
     _weight_dtype = torch.int64
@@ -1526,7 +1546,8 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
                 "Cutlass MXFP8xMXFP4 requires hidden_size and intermediate_size "
                 f"divisible by 128, got H={hidden_size}, I={intermediate_size}."
             )
-        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size // 2)
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size // 2)
         expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
         if w1.dtype is not torch.uint8 or w2.dtype is not torch.uint8:
             raise TypeError("Cutlass MXFP8xMXFP4 packed weights must be uint8.")
@@ -1538,7 +1559,7 @@ class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
             )
         self._validate_weight_storage((w1, w2, w1_scale, w2_scale, a1_scale, a2_scale))
         expected_s1 = num_experts * _mxfp8_swizzled_act_sf_numel(
-            2 * intermediate_size, hidden_size
+            gemm1_rows, hidden_size
         )
         expected_s2 = num_experts * _mxfp8_swizzled_act_sf_numel(
             hidden_size, intermediate_size
@@ -1586,7 +1607,7 @@ class CutlassMxfp8Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_mxfp8"
     supported_quant_variants = (QuantVariant.MxFp8,)
-    supported_activation_classes = (SwiGLU,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_MXFP8_ARCHS
     _x_dtype = torch.float8_e4m3fn
     _weight_dtype = torch.float8_e4m3fn
@@ -1614,7 +1635,8 @@ class CutlassMxfp8Runner(_CutlassRunnerBase):
                 "Cutlass MXFP8 requires hidden_size and intermediate_size "
                 f"divisible by 128, got H={hidden_size}, I={intermediate_size}."
             )
-        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size)
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size)
         expected_w2 = (num_experts, hidden_size, intermediate_size)
         if w1.dtype is not torch.float8_e4m3fn or w2.dtype is not torch.float8_e4m3fn:
             raise TypeError("Cutlass MXFP8 prepared weights must be float8_e4m3fn.")
@@ -1623,11 +1645,10 @@ class CutlassMxfp8Runner(_CutlassRunnerBase):
                 f"Cutlass MXFP8 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
                 f"!= expected {expected_w1}/{expected_w2}."
             )
-        # Binding uses alignToSfDim(I, 128) * 2 for gated SwiGLU, not
-        # round_up(2*I, 128). Those agree only when I % 128 == 0.
+        # Binding aligns the semantic GEMM1 row count to the scale-factor tile.
         expected_s1 = (
             num_experts,
-            2 * round_up(intermediate_size, 128),
+            round_up(gemm1_rows, 128),
             round_up(hidden_size // 32, 4) // 4,
         )
         expected_s2 = (
@@ -1665,7 +1686,7 @@ class CutlassW4A8Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_w4a8"
     supported_quant_variants = (QuantVariant.W4A8,)
-    supported_activation_classes = (SwiGLU,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_W4A8_ARCHS
     _weight_dtype = torch.uint8
     _use_w4_group_scaling = True
@@ -1691,7 +1712,8 @@ class CutlassW4A8Runner(_CutlassRunnerBase):
         w1, w2 = tensors[0], tensors[1]
         num_experts = self.config.routing.num_experts
         intermediate_size = self.config.experts.intermediate_size
-        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size // 2)
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size // 2)
         expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
         if w1.dtype is not torch.uint8 or w2.dtype is not torch.uint8:
             raise TypeError("Cutlass W4A8 packed weights must be uint8.")
@@ -1702,7 +1724,7 @@ class CutlassW4A8Runner(_CutlassRunnerBase):
             )
         expected_s1 = (
             num_experts,
-            2 * intermediate_size // 64,
+            gemm1_rows // 64,
             hidden_size // 128,
             8,
             8,
@@ -1761,7 +1783,7 @@ class CutlassHummingRunner(_CutlassRunnerBase):
 
     backend_key = "cutlass_humming"
     supported_quant_variants = (QuantVariant.Humming,)
-    supported_activation_classes = (SwiGLU,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_HUMMING_ARCHS
     _weight_dtype = torch.uint8
     _use_w4_group_scaling = True
@@ -1785,7 +1807,8 @@ class CutlassHummingRunner(_CutlassRunnerBase):
         )
         num_experts = self.config.routing.num_experts
         intermediate_size = self.config.experts.intermediate_size
-        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size // 2)
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size // 2)
         expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
         if w1.dtype is not torch.uint8 or w2.dtype is not torch.uint8:
             raise TypeError("Cutlass Humming packed weights must be uint8.")
@@ -1797,7 +1820,7 @@ class CutlassHummingRunner(_CutlassRunnerBase):
             )
         expected_s1 = (
             num_experts,
-            2 * intermediate_size // 64,
+            gemm1_rows // 64,
             hidden_size // 128,
             16,
             16,

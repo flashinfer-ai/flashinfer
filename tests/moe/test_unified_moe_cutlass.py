@@ -9,9 +9,13 @@ import torch.nn.functional as F
 from flashinfer.autotuner import AutoTuner, TuningConfig, autotune
 from flashinfer.fused_moe import (
     # Typed activation values
+    GELU,
+    GeGLU,
     GeGLUTanh,
     Identity,
+    ReLU,
     ReLU2,
+    SiLU,
     SiTU,
     SwiGLU,
     SwiGLUStep,
@@ -35,6 +39,7 @@ from flashinfer.fused_moe import (
     CutlassW4A16Runner,
     CutlassW4A8Config,
     CutlassW4A8Runner,
+    cutlass_fused_moe,
     ExecutionConfig,
     ExpertConfig,
     MoEActivationPack,
@@ -60,6 +65,20 @@ from flashinfer.utils import (
     is_sm121a_supported,
     is_sm12x_supported,
     is_sm90a_supported,
+)
+
+
+_CUTLASS_ACTIVATIONS = (
+    SwiGLU(),
+    SwiGLUStep(),
+    GeGLU(),
+    GeGLUTanh(),
+    ReLU2(),
+    SiTU(),
+    Identity(),
+    GELU(),
+    ReLU(),
+    SiLU(),
 )
 
 
@@ -110,11 +129,10 @@ def test_cutlass_bf16_config_architectures_and_registration():
 
 
 def test_cutlass_quant_runner_activation_capabilities():
-    expanded = (SwiGLU, SwiGLUStep, GeGLUTanh, ReLU2, SiTU)
-    assert CutlassBf16Runner.supported_activation_classes == expanded
-    assert CutlassW4A16Runner.supported_activation_classes == expanded
-
+    expanded = tuple(type(activation) for activation in _CUTLASS_ACTIVATIONS)
     for runner_cls in (
+        CutlassBf16Runner,
+        CutlassW4A16Runner,
         CutlassNvfp4Runner,
         CutlassFp8PerTensorRunner,
         CutlassFp8BlockRunner,
@@ -123,7 +141,7 @@ def test_cutlass_quant_runner_activation_capabilities():
         CutlassW4A8Runner,
         CutlassHummingRunner,
     ):
-        assert runner_cls.__dict__["supported_activation_classes"] == (SwiGLU,)
+        assert runner_cls.__dict__["supported_activation_classes"] == expanded
 
 
 def test_all_registered_runners_use_enforced_lifecycle():
@@ -527,6 +545,10 @@ def test_cutlass_mxfp4_linear_quantizer_clamps_finite_extremes():
         (GeGLUTanh(), 512),
         (SiTU(), 512),
         (ReLU2(), 256),
+        (Identity(), 256),
+        (GELU(), 256),
+        (ReLU(), 256),
+        (SiLU(), 256),
     ),
 )
 def test_cutlass_bf16_preparation_uses_activation_gating(activation, rows):
@@ -543,6 +565,43 @@ def test_cutlass_bf16_preparation_uses_activation_gating(activation, rows):
     )
     assert view["fc1_expert_weights"].shape == (4, rows, 128)
     assert view["fc2_expert_weights"].shape == (4, 128, 256)
+
+
+@pytest.mark.parametrize(
+    "config_cls",
+    (
+        CutlassBf16Config,
+        CutlassW4A16Config,
+        CutlassNvfp4Config,
+        CutlassFp8PerTensorConfig,
+        CutlassFp8BlockConfig,
+        CutlassMxfp8Mxfp4Config,
+        CutlassMxfp8Config,
+        CutlassW4A8Config,
+        CutlassHummingConfig,
+    ),
+)
+@pytest.mark.parametrize("activation", (SwiGLU(), Identity()))
+def test_all_cutlass_preparers_reject_opposite_activation_geometry(
+    config_cls, activation
+):
+    """Every quant path validates I versus 2I before device-specific work."""
+    experts = 2
+    hidden = intermediate = 128
+    wrong_rows = intermediate if activation.is_gated else 2 * intermediate
+    w1 = torch.empty(experts, wrong_rows, hidden, dtype=torch.bfloat16)
+    w2 = torch.empty(experts, hidden, intermediate, dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="weight shapes"):
+        config_cls.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=experts,
+            hidden_size=hidden,
+            intermediate_size=intermediate,
+            activation=activation,
+            device="cpu",
+        )
 
 
 def test_cutlass_integer_scalars_materialize_float32():
@@ -796,10 +855,6 @@ def test_cutlass_per_expert_activation_overrides():
             "QuantVariant.NVFP4",
         ),
         (
-            _config(activation=Identity()),
-            "supported activations",
-        ),
-        (
             _config(finalize=MoEFinalizeConfig(do_finalize=False)),
             "do_finalize=True",
         ),
@@ -828,13 +883,6 @@ def test_cutlass_runner_rejects_out_of_scope_configs(config, match):
         (
             _config(quant=QuantConfig(variant=QuantVariant.BF16)),
             "QuantVariant.BF16",
-        ),
-        (
-            _config(
-                quant=QuantConfig(variant=QuantVariant.NVFP4),
-                activation=ReLU2(),
-            ),
-            "SwiGLU",
         ),
         (
             _config(
@@ -1137,7 +1185,6 @@ def test_moe_layer_checks_support_before_build_and_execution(monkeypatch):
     "config",
     (
         _config(quant=QuantConfig(variant=QuantVariant.NVFP4)),
-        _config(activation=Identity()),
         _config(finalize=MoEFinalizeConfig(do_finalize=False)),
         _config(
             experts=ExpertConfig(
@@ -1605,6 +1652,14 @@ def _reference(
             fc1 = x[token] @ w1[expert].float().T
             if isinstance(activation, ReLU2):
                 intermediate = F.relu(fc1) ** 2
+            elif isinstance(activation, Identity):
+                intermediate = fc1
+            elif isinstance(activation, GELU):
+                intermediate = F.gelu(fc1, approximate="none")
+            elif isinstance(activation, ReLU):
+                intermediate = F.relu(fc1)
+            elif isinstance(activation, SiLU):
+                intermediate = F.silu(fc1)
             else:
                 up, gate = fc1.chunk(2)
                 if isinstance(activation, SwiGLU):
@@ -1621,6 +1676,8 @@ def _reference(
                     )
                 elif isinstance(activation, GeGLUTanh):
                     intermediate = F.gelu(gate, approximate="tanh") * up
+                elif isinstance(activation, GeGLU):
+                    intermediate = F.gelu(gate, approximate="none") * up
                 elif isinstance(activation, SiTU):
                     # SituAdaptor approximates tanh as 2*sigmoid(2z)-1;
                     # torch.tanh remains within the test tolerance.
@@ -1682,19 +1739,45 @@ def _pin_fallback_winner(layer: MoELayer, act: MoEActivationPack):
     return runner
 
 
+def _run_flat_cutlass_from_unified_inputs(
+    runner, act: MoEActivationPack, weights: MoEWeightPack
+) -> torch.Tensor:
+    """Launch the public flat API from the same backend-native prepared view."""
+    inputs = runner.pack_inputs(act, weights)
+    output = torch.empty_like(inputs[0])
+    cutlass_fused_moe(
+        inputs[1],
+        inputs[2],
+        inputs[3],
+        inputs[4],
+        inputs[5],
+        output_dtype=torch.bfloat16,
+        quant_scales=runner._quant_scales(inputs),
+        input_sf=runner._input_sf(inputs),
+        output=output,
+        tune_max_num_tokens=runner.config.execution.tune_max_num_tokens,
+        enable_pdl=runner._enable_pdl,
+        activation_type=runner.config.activation.type,
+        use_deepseek_fp8_block_scale=runner._use_deepseek_fp8_block_scale,
+        use_w4_group_scaling=runner._use_w4_group_scaling,
+        use_mxfp8_act_scaling=runner._use_mxfp8_act_scaling,
+        use_packed_weights=runner._use_packed_weights,
+        use_wfp4afp8_humming=runner._use_wfp4afp8_humming,
+        use_fused_finalize=runner._use_fused_finalize,
+        swizzled_input_sf=True,
+        profile_ids=[-1, -1],
+        workspace_buffer=runner._workspace,
+        **runner._activation_params,
+    )
+    return output
+
+
 @cutlass_bf16_required
 @pytest.mark.parametrize(
     "activation",
-    (
-        SwiGLU(),
+    _CUTLASS_ACTIVATIONS
+    + (
         SwiGLU(alpha=1.7, beta=1.0, limit=7.0),
-        SwiGLUStep(),
-        GeGLUTanh(),
-        ReLU2(),
-        # The default exercises SituAdaptor's compile-time scalars, for which
-        # no per-expert tensor is materialized; the tuned one exercises the
-        # tensors.
-        SiTU(),
         SiTU(gate_scale=2.0, linear_scale=10.0),
     ),
 )
@@ -1704,17 +1787,17 @@ def test_cutlass_bf16_moe_layer_matches_independent_reference(activation):
     runner = _pin_fallback_winner(layer, act)
 
     actual = layer(act, weights)
+    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
     expected = _reference(act, w1, w2, activation)
 
     assert layer.winner_backend == "cutlass_bf16"
     assert runner._workspace is not None
+    torch.testing.assert_close(actual, flat, rtol=0, atol=0)
     _assert_numerically_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
 @cutlass_w4a16_required
-@pytest.mark.parametrize(
-    "activation", (SwiGLU(), SwiGLUStep(), GeGLUTanh(), ReLU2(), SiTU())
-)
+@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
 def test_cutlass_w4a16_moe_layer_matches_quantized_reference(activation):
     config, act, weights, w1, w2, view = _make_w4a16_case(activation=activation)
     assert view["fc1_expert_weights"].dtype is torch.uint8
@@ -1723,10 +1806,12 @@ def test_cutlass_w4a16_moe_layer_matches_quantized_reference(activation):
     runner = _pin_fallback_winner(layer, act)
 
     actual = layer(act, weights)
+    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
     expected = _reference(act, w1, w2, activation)
 
     assert layer.winner_backend == "cutlass_w4a16"
     assert runner._workspace is not None
+    torch.testing.assert_close(actual, flat, rtol=0, atol=0)
     assert torch.isfinite(actual).all(), "CUTLASS W4A16 produced non-finite output"
     _assert_numerically_close(actual, expected, rtol=5e-2, atol=2e-2)
 
@@ -1908,16 +1993,18 @@ cutlass_nvfp4_required = pytest.mark.skipif(
 )
 
 
-def _make_nvfp4_case(num_tokens: int = 16):
+def _make_nvfp4_case(num_tokens: int = 16, activation=None):
     torch.manual_seed(44)
     device = torch.device("cuda", torch.cuda.current_device())
     num_experts, top_k = 4, 2
     hidden_size, intermediate_size = 128, 256
+    activation = activation or SwiGLU()
+    gemm1_rows = intermediate_size * (2 if activation.is_gated else 1)
     x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
     w1 = (
         torch.randn(
             num_experts,
-            2 * intermediate_size,
+            gemm1_rows,
             hidden_size,
             device=device,
             dtype=torch.bfloat16,
@@ -1941,6 +2028,7 @@ def _make_nvfp4_case(num_tokens: int = 16):
     config = _config(
         quant=QuantConfig(variant=QuantVariant.NVFP4),
         experts=ExpertConfig(intermediate_size=intermediate_size),
+        activation=activation,
         backend=BackendOptions((CutlassNvfp4Config(),)),
         execution=ExecutionConfig(
             enable_pdl=False,
@@ -1954,6 +2042,7 @@ def _make_nvfp4_case(num_tokens: int = 16):
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        activation=activation,
         device=device,
     )
     weights = MoEWeightPack()
@@ -1978,7 +2067,11 @@ def _dequantize_cutlass_nvfp4_matrix(
     ).view(rows, packed_cols * 2)
 
 
-def _nvfp4_quantized_reference(act: MoEActivationPack, view: dict[str, torch.Tensor]):
+def _nvfp4_quantized_reference(
+    act: MoEActivationPack,
+    view: dict[str, torch.Tensor],
+    activation=None,
+):
     from flashinfer.fp4_quantization import fp4_quantize
 
     x = act.hidden_states_q
@@ -2013,24 +2106,35 @@ def _nvfp4_quantized_reference(act: MoEActivationPack, view: dict[str, torch.Ten
         ]
     )
     ref_act = MoEActivationPack(x_dq, None, act.topk_ids, act.topk_weights)
-    return _reference(ref_act, w1, w2)
+    return _reference(ref_act, w1, w2, activation)
 
 
 @cutlass_nvfp4_required
-def test_cutlass_nvfp4_moe_layer_matches_quantized_reference():
-    config, act, weights, view = _make_nvfp4_case()
+@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+def test_cutlass_nvfp4_moe_layer_matches_quantized_reference(activation):
+    config, act, weights, view = _make_nvfp4_case(activation=activation)
     assert view["fc1_expert_weights"].dtype is torch.uint8
     assert view["fc1_weight_block_scale"].ndim == 3
     layer = MoELayer(config)
     runner = _pin_fallback_winner(layer, act)
 
     actual = layer(act, weights)
-    expected = _nvfp4_quantized_reference(act, view)
+    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
+    expected = _nvfp4_quantized_reference(act, view, activation)
 
     assert layer.winner_backend == "cutlass_nvfp4"
     assert runner._workspace is not None
+    torch.testing.assert_close(actual, flat, rtol=0, atol=0)
     assert torch.isfinite(actual).all(), "CUTLASS NVFP4 produced non-finite output"
-    _assert_numerically_close(actual, expected, rtol=2e-1, atol=2e-1)
+    # Identity is the only pure pass-through here, so GEMM1 output reaches the
+    # NVFP4 requantization with its full dynamic range instead of being
+    # compressed by a nonlinearity first. The dequantized reference tracks that
+    # noise less well: one element of 2048 lands ~11% past the shared bound,
+    # while ReLU/GELU/SiLU -- non-gated but still compressive -- stay inside it.
+    # The exact flat comparison above is what pins the plumbing; this bound only
+    # needs to catch a wrong magnitude.
+    ref_rtol = ref_atol = 3e-1 if isinstance(activation, Identity) else 2e-1
+    _assert_numerically_close(actual, expected, rtol=ref_rtol, atol=ref_atol)
 
 
 @cutlass_nvfp4_required
@@ -2130,11 +2234,15 @@ def _make_routing(num_tokens, num_experts, top_k, device):
     return topk_ids, topk_weights
 
 
-def _make_bf16_experts(num_experts, hidden_size, intermediate_size, device):
+def _make_bf16_experts(
+    num_experts, hidden_size, intermediate_size, device, activation=None
+):
+    activation = activation or SwiGLU()
+    gemm1_rows = intermediate_size * (2 if activation.is_gated else 1)
     w1 = (
         torch.randn(
             num_experts,
-            2 * intermediate_size,
+            gemm1_rows,
             hidden_size,
             device=device,
             dtype=torch.bfloat16,
@@ -2179,13 +2287,16 @@ def _autotune_and_graph(runner, act, weights, expected, *, rtol, atol, cache_nam
 
 
 @cutlass_fp8_required
-def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference():
+@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation):
     torch.manual_seed(45)
     device = torch.device("cuda", torch.cuda.current_device())
     num_tokens, num_experts, top_k = 16, 4, 2
     hidden_size, intermediate_size = 128, 256
     x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
-    w1, w2 = _make_bf16_experts(num_experts, hidden_size, intermediate_size, device)
+    w1, w2 = _make_bf16_experts(
+        num_experts, hidden_size, intermediate_size, device, activation
+    )
     topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
     x_q, x_scale = CutlassFp8PerTensorConfig.prepare_activations(x)
     view = CutlassFp8PerTensorConfig.prepare_weights(
@@ -2194,6 +2305,7 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference():
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        activation=activation,
         device=device,
     )
     x_dq = x_q.float() * x_scale
@@ -2202,6 +2314,7 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference():
     config = _config(
         quant=QuantConfig(variant=QuantVariant.FP8PerTensor),
         experts=ExpertConfig(intermediate_size=intermediate_size),
+        activation=activation,
         backend=BackendOptions((CutlassFp8PerTensorConfig(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=64),
     )
@@ -2209,14 +2322,17 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference():
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_fp8_per_tensor", view)
     layer = MoELayer(config)
-    _pin_fallback_winner(layer, act)
+    runner = _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
+    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
     expected = _reference(
         MoEActivationPack(x_dq.to(torch.bfloat16), None, topk_ids, topk_weights),
         w1_dq.to(torch.bfloat16),
         w2_dq.to(torch.bfloat16),
+        activation,
     )
     assert layer.winner_backend == "cutlass_fp8_per_tensor"
+    torch.testing.assert_close(actual, flat, rtol=0, atol=0)
     _assert_numerically_close(actual, expected, rtol=1e-1, atol=1e-1)
     _autotune_and_graph(
         layer.runners[0],
@@ -2230,13 +2346,16 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference():
 
 
 @cutlass_fp8_block_required
-def test_cutlass_fp8_block_moe_layer_matches_quantized_reference():
+@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+def test_cutlass_fp8_block_moe_layer_matches_quantized_reference(activation):
     torch.manual_seed(46)
     device = torch.device("cuda", torch.cuda.current_device())
     num_tokens, num_experts, top_k = 16, 4, 2
     hidden_size, intermediate_size = 128, 256
     x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
-    w1, w2 = _make_bf16_experts(num_experts, hidden_size, intermediate_size, device)
+    w1, w2 = _make_bf16_experts(
+        num_experts, hidden_size, intermediate_size, device, activation
+    )
     topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
     view = CutlassFp8BlockConfig.prepare_weights(
         w1,
@@ -2244,6 +2363,7 @@ def test_cutlass_fp8_block_moe_layer_matches_quantized_reference():
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        activation=activation,
         device=device,
     )
     w1_dq = view["fc1_expert_weights"].float() * view[
@@ -2255,6 +2375,7 @@ def test_cutlass_fp8_block_moe_layer_matches_quantized_reference():
     config = _config(
         quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
         experts=ExpertConfig(intermediate_size=intermediate_size),
+        activation=activation,
         backend=BackendOptions((CutlassFp8BlockConfig(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=64),
     )
@@ -2262,10 +2383,14 @@ def test_cutlass_fp8_block_moe_layer_matches_quantized_reference():
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_fp8_block", view)
     layer = MoELayer(config)
-    _pin_fallback_winner(layer, act)
+    runner = _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
-    expected = _reference(act, w1_dq.to(torch.bfloat16), w2_dq.to(torch.bfloat16))
+    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
+    expected = _reference(
+        act, w1_dq.to(torch.bfloat16), w2_dq.to(torch.bfloat16), activation
+    )
     assert layer.winner_backend == "cutlass_fp8_block"
+    torch.testing.assert_close(actual, flat, rtol=0, atol=0)
     _assert_numerically_close(actual, expected, rtol=1e-1, atol=1e-1)
     _autotune_and_graph(
         layer.runners[0],
@@ -2279,7 +2404,8 @@ def test_cutlass_fp8_block_moe_layer_matches_quantized_reference():
 
 
 @cutlass_mxfp8_mxfp4_required
-def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference():
+@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference(activation):
     from flashinfer import mxfp4_dequantize, mxfp8_dequantize_host
 
     torch.manual_seed(47)
@@ -2287,7 +2413,9 @@ def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference():
     num_tokens, num_experts, top_k = 16, 4, 2
     hidden_size, intermediate_size = 128, 256
     x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
-    w1, w2 = _make_bf16_experts(num_experts, hidden_size, intermediate_size, device)
+    w1, w2 = _make_bf16_experts(
+        num_experts, hidden_size, intermediate_size, device, activation
+    )
     topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
     x_q, x_sf = CutlassMxfp8Mxfp4Config.prepare_activations(x)
     view = CutlassMxfp8Mxfp4Config.prepare_weights(
@@ -2296,6 +2424,7 @@ def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference():
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        activation=activation,
         device=device,
     )
     x_dq = mxfp8_dequantize_host(
@@ -2324,6 +2453,7 @@ def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference():
     config = _config(
         quant=QuantConfig(variant=QuantVariant.MXFP4),
         experts=ExpertConfig(intermediate_size=intermediate_size),
+        activation=activation,
         backend=BackendOptions((CutlassMxfp8Mxfp4Config(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=16),
     )
@@ -2331,12 +2461,17 @@ def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference():
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_mxfp8_mxfp4", view)
     layer = MoELayer(config)
-    _pin_fallback_winner(layer, act)
+    runner = _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
+    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
     expected = _reference(
-        MoEActivationPack(x_dq, None, topk_ids, topk_weights), w1_dq, w2_dq
+        MoEActivationPack(x_dq, None, topk_ids, topk_weights),
+        w1_dq,
+        w2_dq,
+        activation,
     )
     assert layer.winner_backend == "cutlass_mxfp8_mxfp4"
+    torch.testing.assert_close(actual, flat, rtol=0, atol=0)
     _assert_numerically_close(actual, expected, rtol=1e-1, atol=1e-1)
     _autotune_and_graph(
         layer.runners[0],
@@ -2350,7 +2485,8 @@ def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference():
 
 
 @cutlass_mxfp8_required
-def test_cutlass_mxfp8_moe_layer_matches_quantized_reference():
+@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+def test_cutlass_mxfp8_moe_layer_matches_quantized_reference(activation):
     from flashinfer import mxfp8_dequantize_host
 
     torch.manual_seed(48)
@@ -2358,7 +2494,9 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference():
     num_tokens, num_experts, top_k = 16, 4, 2
     hidden_size, intermediate_size = 128, 256
     x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
-    w1, w2 = _make_bf16_experts(num_experts, hidden_size, intermediate_size, device)
+    w1, w2 = _make_bf16_experts(
+        num_experts, hidden_size, intermediate_size, device, activation
+    )
     topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
     x_q, x_sf = CutlassMxfp8Config.prepare_activations(x)
     view = CutlassMxfp8Config.prepare_weights(
@@ -2367,6 +2505,7 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference():
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        activation=activation,
         device=device,
     )
     x_dq = mxfp8_dequantize_host(
@@ -2377,6 +2516,7 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference():
     config = _config(
         quant=QuantConfig(variant=QuantVariant.MxFp8),
         experts=ExpertConfig(intermediate_size=intermediate_size),
+        activation=activation,
         backend=BackendOptions((CutlassMxfp8Config(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=16),
     )
@@ -2384,10 +2524,17 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference():
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_mxfp8", view)
     layer = MoELayer(config)
-    _pin_fallback_winner(layer, act)
+    runner = _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
-    expected = _reference(MoEActivationPack(x_dq, None, topk_ids, topk_weights), w1, w2)
+    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
+    expected = _reference(
+        MoEActivationPack(x_dq, None, topk_ids, topk_weights),
+        w1,
+        w2,
+        activation,
+    )
     assert layer.winner_backend == "cutlass_mxfp8"
+    torch.testing.assert_close(actual, flat, rtol=0, atol=0)
     assert torch.isfinite(actual).all()
     _assert_numerically_close(actual, expected, rtol=2e-1, atol=2e-1)
     _autotune_and_graph(
@@ -2479,13 +2626,16 @@ def _dequant_int4(packed, scale, group_size=128):
 
 
 @cutlass_w4a8_required
-def test_cutlass_w4a8_moe_layer_matches_quantized_reference():
+@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+def test_cutlass_w4a8_moe_layer_matches_quantized_reference(activation):
     torch.manual_seed(49)
     device = torch.device("cuda", torch.cuda.current_device())
     num_tokens, num_experts, top_k = 16, 4, 2
     hidden_size, intermediate_size = 128, 256
     x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
-    w1, w2 = _make_bf16_experts(num_experts, hidden_size, intermediate_size, device)
+    w1, w2 = _make_bf16_experts(
+        num_experts, hidden_size, intermediate_size, device, activation
+    )
     topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
     from flashinfer.fused_moe.prepare import _quantize_int4_grouped
 
@@ -2497,11 +2647,13 @@ def test_cutlass_w4a8_moe_layer_matches_quantized_reference():
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        activation=activation,
         device=device,
     )
     config = _config(
         quant=QuantConfig(variant=QuantVariant.W4A8),
         experts=ExpertConfig(intermediate_size=intermediate_size),
+        activation=activation,
         backend=BackendOptions((CutlassW4A8Config(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=64),
     )
@@ -2509,14 +2661,17 @@ def test_cutlass_w4a8_moe_layer_matches_quantized_reference():
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_w4a8", view)
     layer = MoELayer(config)
-    _pin_fallback_winner(layer, act)
+    runner = _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
+    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
     expected = _reference(
         act,
         _dequant_int4(packed_w1, scale_w1).to(torch.bfloat16),
         _dequant_int4(packed_w2, scale_w2).to(torch.bfloat16),
+        activation,
     )
     assert layer.winner_backend == "cutlass_w4a8"
+    torch.testing.assert_close(actual, flat, rtol=0, atol=0)
     _assert_numerically_close(actual, expected, rtol=1e-1, atol=1e-1)
     _autotune_and_graph(
         layer.runners[0],
@@ -2530,13 +2685,16 @@ def test_cutlass_w4a8_moe_layer_matches_quantized_reference():
 
 
 @cutlass_humming_required
-def test_cutlass_humming_moe_layer_matches_quantized_reference():
+@pytest.mark.parametrize("activation", _CUTLASS_ACTIVATIONS)
+def test_cutlass_humming_moe_layer_matches_quantized_reference(activation):
     torch.manual_seed(50)
     device = torch.device("cuda", torch.cuda.current_device())
     num_tokens, num_experts, top_k = 16, 4, 2
     hidden_size, intermediate_size = 128, 256
     x = torch.randn(num_tokens, hidden_size, device=device, dtype=torch.bfloat16) / 2
-    w1, w2 = _make_bf16_experts(num_experts, hidden_size, intermediate_size, device)
+    w1, w2 = _make_bf16_experts(
+        num_experts, hidden_size, intermediate_size, device, activation
+    )
     topk_ids, topk_weights = _make_routing(num_tokens, num_experts, top_k, device)
     view = CutlassHummingConfig.prepare_weights(
         w1,
@@ -2544,10 +2702,11 @@ def test_cutlass_humming_moe_layer_matches_quantized_reference():
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        activation=activation,
         device=device,
     )
     w1_lin, w1_sf = _quantize_mxfp4_linear(
-        w1.view(num_experts * 2 * intermediate_size, hidden_size)
+        w1.view(num_experts * w1.shape[1], hidden_size)
     )
     w2_lin, w2_sf = _quantize_mxfp4_linear(
         w2.view(num_experts * hidden_size, intermediate_size)
@@ -2555,6 +2714,7 @@ def test_cutlass_humming_moe_layer_matches_quantized_reference():
     config = _config(
         quant=QuantConfig(variant=QuantVariant.Humming),
         experts=ExpertConfig(intermediate_size=intermediate_size),
+        activation=activation,
         backend=BackendOptions((CutlassHummingConfig(),)),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=64),
     )
@@ -2562,20 +2722,23 @@ def test_cutlass_humming_moe_layer_matches_quantized_reference():
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_humming", view)
     layer = MoELayer(config)
-    _pin_fallback_winner(layer, act)
+    runner = _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
+    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
     expected = _reference(
         act,
         _dequant_linear_mxfp4(
-            w1_lin.view(num_experts, 2 * intermediate_size, hidden_size // 2),
-            w1_sf.view(num_experts, 2 * intermediate_size, hidden_size // 32),
+            w1_lin.view(num_experts, w1.shape[1], hidden_size // 2),
+            w1_sf.view(num_experts, w1.shape[1], hidden_size // 32),
         ).to(torch.bfloat16),
         _dequant_linear_mxfp4(
             w2_lin.view(num_experts, hidden_size, intermediate_size // 2),
             w2_sf.view(num_experts, hidden_size, intermediate_size // 32),
         ).to(torch.bfloat16),
+        activation,
     )
     assert layer.winner_backend == "cutlass_humming"
+    torch.testing.assert_close(actual, flat, rtol=0, atol=0)
     _assert_numerically_close(actual, expected, rtol=2e-1, atol=2e-1)
     _autotune_and_graph(
         layer.runners[0],
