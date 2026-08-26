@@ -650,16 +650,14 @@ def testTrtllmFp4BlockScaleMoe(args):
     gemm1_weights_fp4 = gemm1_weights_fp4_bytes.view(torch.uint8).reshape(
         num_experts, 2 * intermediate_size, hidden_size // 2
     )
-    gemm1_weights_scale = gemm1_scales_fp4_bytes.view(torch.float8_e4m3fn).reshape(
-        num_experts, 2 * intermediate_size, hidden_size // sf_vec_size
-    )
+    # Keep the shape returned by quantize_fp4_batched: swizzled scale storage
+    # pads rows to 128 and scale columns to 4 independently for each expert.
+    gemm1_weights_scale = gemm1_scales_fp4_bytes.view(torch.float8_e4m3fn)
 
     gemm2_weights_fp4 = gemm2_weights_fp4_bytes.view(torch.uint8).reshape(
         num_experts, hidden_size, intermediate_size // 2
     )
-    gemm2_weights_scale = gemm2_scales_fp4_bytes.view(torch.float8_e4m3fn).reshape(
-        num_experts, hidden_size, intermediate_size // sf_vec_size
-    )
+    gemm2_weights_scale = gemm2_scales_fp4_bytes.view(torch.float8_e4m3fn)
 
     gemm1_bias = None
     gemm1_alpha = None
