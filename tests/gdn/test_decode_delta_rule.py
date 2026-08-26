@@ -16,6 +16,7 @@ limitations under the License.
 
 from __future__ import annotations
 
+import inspect
 import math
 import os
 import sys
@@ -1982,6 +1983,22 @@ def test_pretranspose_api_uses_gdn_decode_bf16_state(
     print(
         f"✓ API gdn_decode_bf16_state backend verified (batch={batch_size}, T={seq_len})"
     )
+
+
+def test_pretranspose_api_mtp_verify_controls_are_keyword_only():
+    parameters = inspect.signature(gated_delta_rule_decode_pretranspose).parameters
+
+    assert tuple(parameters)[-2:] == (
+        "intermediate_states_buffer",
+        "disable_state_update",
+    )
+    assert (
+        parameters["intermediate_states_buffer"].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
+    assert parameters["disable_state_update"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameters["intermediate_states_buffer"].default is None
+    assert parameters["disable_state_update"].default is False
 
 
 def test_pretranspose_api_forwards_bf16_mtp_verify_controls():

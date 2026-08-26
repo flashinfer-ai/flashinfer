@@ -187,6 +187,7 @@ def gated_delta_rule_decode_pretranspose(
         Requires ``initial_state`` to be provided.  If ``None``, the kernel
         writes the updated state back to the same slot it read from (i.e.
         ``initial_state_indices``).
+
         **Padding / inactive sequences**: set the index to ``-1`` for any
         batch entry that should be treated as padding.  The two backends
         handle ``-1`` differently:
