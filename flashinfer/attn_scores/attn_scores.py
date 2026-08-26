@@ -890,7 +890,11 @@ def _cached_compile_fp4_kernel(
     num_epi_subtiles: int,
     is_kv_sf_interleaved: bool,
     arch: str,
-    num_next_n_atoms: int = 1,
+    # Deliberately NO default: functools.cache keys on the literal call shape,
+    # so f(..., arch) and f(..., arch, 1) would be distinct entries for the
+    # same kernel -- a warm from one call site would silently miss from the
+    # other. Forcing every caller to pass it keeps the key canonical.
+    num_next_n_atoms: int,
 ):
     from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from .kernels import FP4MQALogitsKernel

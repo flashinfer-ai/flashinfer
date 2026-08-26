@@ -2232,7 +2232,7 @@ def test_precompile_warms_fp4_float32_output():
     for out_dtype in (torch.bfloat16, torch.float32):
         hits = _cached_compile_fp4_kernel.cache_info().hits
         _cached_compile_fp4_kernel(
-            64, 64, 128, 1, sms, f32, _to_cutlass(out_dtype), 1, False, arch
+            64, 64, 128, 1, sms, f32, _to_cutlass(out_dtype), 1, False, arch, 1
         )
         assert _cached_compile_fp4_kernel.cache_info().hits == hits + 1, (
             f"precompile did not warm fp4 output_dtype={out_dtype}"
@@ -2241,7 +2241,7 @@ def test_precompile_warms_fp4_float32_output():
     # a dtype outside the warmed set must miss, or the assertions above are vacuous
     misses = _cached_compile_fp4_kernel.cache_info().misses
     _cached_compile_fp4_kernel(
-        64, 64, 128, 1, sms, f32, _to_cutlass(torch.float16), 1, False, arch
+        64, 64, 128, 1, sms, f32, _to_cutlass(torch.float16), 1, False, arch, 1
     )
     assert _cached_compile_fp4_kernel.cache_info().misses > misses, (
         "float16 was not warmed but did not miss -- the cache key ignores "
