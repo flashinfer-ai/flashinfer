@@ -506,8 +506,50 @@ def _cached_max_smem_per_block(device_index: int) -> int:
 
 _CUTE_DSL_AVAILABLE = is_cute_dsl_available()
 
-# SM100 / SM103 only (B200-class Blackwell)
-_SM100_CCS = [100, 103]
+
+def _require_cute_dsl(device: torch.device, fn_name: str) -> None:
+    """Raise unless the installed CuTe DSL can generate code for ``device``.
+
+    Two distinct failures get one entry point.  ``_CUTE_DSL_AVAILABLE`` only
+    says the package imports; it does not say the DSL knows the *device's*
+    architecture.  A DSL release predating a part resolves e.g. ``sm_107a`` to
+    a ``KeyError`` raised deep inside ``cute.compile``, long after the caller
+    has passed validation -- so the capability lists above (which say what
+    FlashInfer has kernels for) are checked against what the toolchain can
+    actually emit.
+
+    ``native_only=True`` because these kernels use block-scaled ``tcgen05``
+    MMA.  The probe's family-conditional fallback (compiling an sm_107 device
+    for ``sm_100f``) is only sound for family-portable feature sets, which
+    this is not.
+    """
+    if not _CUTE_DSL_AVAILABLE:
+        raise RuntimeError(f"{fn_name} requires nvidia-cutlass-dsl")
+
+    from ..cute_dsl.utils import is_cute_dsl_arch_supported
+
+    major, minor = torch.cuda.get_device_capability(device)
+    if not is_cute_dsl_arch_supported(major, minor, native_only=True):
+        raise RuntimeError(
+            f"{fn_name}: the installed nvidia-cutlass-dsl cannot target "
+            f"sm_{major}{minor}a. FlashInfer ships kernels for this device, but "
+            f"the DSL release in use predates it and would fail inside "
+            f"cute.compile. Upgrade nvidia-cutlass-dsl."
+        )
+
+
+# Datacentre Blackwell (SM100/SM103) and Rubin (SM107).
+#
+# The kernels are written against the family-portable tcgen05 surface, so the
+# CuTe DSL compiles them for ``sm_107a`` unchanged -- no Rubin-specific kernel
+# code is needed for the next_n <= 3 path. What the DSL will *not* do is warn
+# when it lacks the device's architecture altogether, so ``_require_cute_dsl``
+# above gates on that separately.
+#
+# Consumer Blackwell (SM120/121) is deliberately absent: these kernels use
+# block-scaled tcgen05 MMA and a 2-CTA-free TMEM budget sized for the
+# datacentre parts.
+_PAGED_MQA_CCS = [100, 103, 107]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Schedule-metadata computation (pure Python, mirrors DeepGEMM scheduler)
@@ -914,7 +956,7 @@ def compute_paged_mqa_logits_schedule(
     return result
 
 
-@supported_compute_capability(_SM100_CCS)
+@supported_compute_capability(_PAGED_MQA_CCS)
 def _check_fp8_paged_mqa_logits_supported(
     q: torch.Tensor,
     kv_fused: torch.Tensor,
@@ -1118,8 +1160,7 @@ def fp8_paged_mqa_logits(
         head_dim, num_heads and next_n together must fit the shared memory
                          available per block on the device.
     """
-    if not _CUTE_DSL_AVAILABLE:
-        raise RuntimeError("fp8_paged_mqa_logits requires nvidia-cutlass-dsl")
+    _require_cute_dsl(q.device, "fp8_paged_mqa_logits")
 
     B, next_n, H, D = q.shape
     block_size = kv_fused.shape[1]
@@ -1198,7 +1239,7 @@ def fp8_paged_mqa_logits(
     return logits
 
 
-@supported_compute_capability(_SM100_CCS)
+@supported_compute_capability(_PAGED_MQA_CCS)
 def _check_fp4_paged_mqa_logits_supported(
     q: torch.Tensor,
     sf_q: torch.Tensor,
@@ -1436,8 +1477,7 @@ def fp4_paged_mqa_logits(
         is_kv_sf_interleaved may be True only when
                          block_size == _FP4_SF_INTERLEAVE_BLOCK_SIZE.
     """
-    if not _CUTE_DSL_AVAILABLE:
-        raise RuntimeError("fp4_paged_mqa_logits requires nvidia-cutlass-dsl")
+    _require_cute_dsl(q.device, "fp4_paged_mqa_logits")
 
     B, next_n, H, half_D = q.shape
     D = half_D * 2
