@@ -7,11 +7,14 @@ cold-L2 CUPTI activity timing in forward and reverse paired orders.
 """
 
 import argparse
+import hashlib
+import importlib
 import json
 import math
 import os
 from pathlib import Path
 import statistics
+import sys
 import time
 from importlib.metadata import version as distribution_version
 from typing import Callable
@@ -103,6 +106,9 @@ def _measure_order(
         "legs": legs,
         "candidate_median_ms": candidate_ms,
         "production_fa4_median_ms": production_fa4_ms,
+        "candidate_minus_production_fa4_ms": candidate_ms - production_fa4_ms,
+        "production_fa4_minus_candidate_ms": production_fa4_ms - candidate_ms,
+        "absolute_delta_ms": abs(candidate_ms - production_fa4_ms),
         "speedup": speedup,
         "passed_speedup_ge_1": speedup >= 1.0,
     }
@@ -132,6 +138,47 @@ def _quality(actual: torch.Tensor, expected: torch.Tensor) -> dict:
     }
 
 
+def _qualification_passed(
+    quality: dict,
+    production_fa4_quality: dict,
+    repeat_bitwise: bool,
+    allocation_stable: bool,
+    orders: list[dict],
+) -> bool:
+    return bool(
+        quality["passed"]
+        and production_fa4_quality["passed"]
+        and repeat_bitwise
+        and allocation_stable
+        and all(order["passed_speedup_ge_1"] for order in orders)
+    )
+
+
+def _callable_provenance(distribution: str, fn: Callable[..., object]) -> dict:
+    module_name = getattr(fn, "__module__", None)
+    if not module_name:
+        raise RuntimeError(f"{distribution} callable has no module")
+    module = sys.modules.get(module_name)
+    if module is None:
+        module = importlib.import_module(module_name)
+    module_file = getattr(module, "__file__", None)
+    if not module_file:
+        raise RuntimeError(f"{distribution} callable module has no source file")
+    source = Path(module_file).resolve(strict=True)
+    if not source.is_file():
+        raise RuntimeError(f"{distribution} callable source is not a file: {source}")
+    return {
+        "distribution": distribution,
+        "distribution_version": distribution_version(distribution),
+        "callable_module": module_name,
+        "callable_qualified_name": getattr(
+            fn, "__qualname__", getattr(fn, "__name__", type(fn).__name__)
+        ),
+        "module_source_path": str(source),
+        "module_source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -140,7 +187,7 @@ def main() -> None:
         help="also write the qualification report to this JSON path",
     )
     args = parser.parse_args()
-    started = time.time()
+    started = time.monotonic()
     cupti_version = _require_cupti()
     device = torch.device("cuda", torch.cuda.current_device())
     if not is_wan_hybrid_attention_available(device):
@@ -221,11 +268,18 @@ def main() -> None:
     allocation_stable = allocated_after == allocated_before
 
     orders = [_measure_order(order, candidate_fn, fa4_fn) for order in _PAIRED_ORDERS]
-    passed = bool(
-        quality["passed"]
-        and repeat_bitwise
-        and allocation_stable
-        and all(order["passed_speedup_ge_1"] for order in orders)
+    passed = _qualification_passed(
+        quality,
+        fa4_quality,
+        repeat_bitwise,
+        allocation_stable,
+        orders,
+    )
+    candidate_median_ms = statistics.median(
+        order["candidate_median_ms"] for order in orders
+    )
+    production_fa4_median_ms = statistics.median(
+        order["production_fa4_median_ms"] for order in orders
     )
     properties = torch.cuda.get_device_properties(device)
     gpu_uuid = getattr(properties, "uuid", None)
@@ -259,12 +313,28 @@ def main() -> None:
         "cupti_python_version": cupti_version,
         "quality_vs_bf16_reference": quality,
         "production_fa4_quality_vs_bf16_reference": fa4_quality,
+        "candidate_median_ms": candidate_median_ms,
+        "production_fa4_median_ms": production_fa4_median_ms,
+        "candidate_minus_production_fa4_ms": (
+            candidate_median_ms - production_fa4_median_ms
+        ),
+        "production_fa4_minus_candidate_ms": (
+            production_fa4_median_ms - candidate_median_ms
+        ),
+        "absolute_delta_ms": abs(candidate_median_ms - production_fa4_median_ms),
+        "overall_speedup": production_fa4_median_ms / candidate_median_ms,
         "repeatability_bitwise": repeat_bitwise,
         "allocation_stable": allocation_stable,
         "memory_allocated_before": allocated_before,
         "memory_allocated_after": allocated_after,
         "orders": orders,
-        "physical_turnaround_seconds": time.time() - started,
+        "provenance": {
+            "candidate": _callable_provenance(
+                "flashinfer-python", wan_hybrid_attention
+            ),
+            "production_fa4": _callable_provenance("sglang", production_fa4),
+        },
+        "benchmark_process_runtime_seconds": time.monotonic() - started,
     }
     payload = json.dumps(report, indent=2, sort_keys=True) + "\n"
     if args.output is not None:
