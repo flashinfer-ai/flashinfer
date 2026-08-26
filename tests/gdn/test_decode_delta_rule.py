@@ -1992,7 +1992,9 @@ def test_pretranspose_api_mtp_verify_controls_are_keyword_only():
         "intermediate_states_buffer",
         "disable_state_update",
     )
-    assert parameters["intermediate_states_buffer"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert (
+        parameters["intermediate_states_buffer"].kind is inspect.Parameter.KEYWORD_ONLY
+    )
     assert parameters["disable_state_update"].kind is inspect.Parameter.KEYWORD_ONLY
     assert parameters["intermediate_states_buffer"].default is None
     assert parameters["disable_state_update"].default is False
