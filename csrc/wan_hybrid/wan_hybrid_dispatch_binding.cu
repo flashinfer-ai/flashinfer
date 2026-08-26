@@ -113,7 +113,8 @@ constexpr int64_t kValueScaleRows = 2 * kScaleRows;
 constexpr int64_t kTensorMapCount = 6;
 constexpr int64_t kTensorMapBytes = 128;
 constexpr int64_t kAttentionThreads = 512;
-constexpr int64_t kMaximumTiles = 147;
+constexpr int64_t kMaximumTiles148Sm = 147;
+constexpr int64_t kMaximumTiles152Sm = 152;
 constexpr size_t kAttentionDynamicSmemBytes = SMEM_TOTAL;
 
 static_assert(kWanHybridQuantThreads == 256);
@@ -249,7 +250,9 @@ void Dispatch(TensorView q, TensorView k, TensorView value, TensorView vt, Tenso
       cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device_id),
       "cudaDeviceGetAttribute(multiProcessorCount)");
   constexpr int kTotalTiles = ((kSequence + 255) / 256) * kBatch * kHeads;
-  const int grid_x = std::min({multiprocessor_count, kTotalTiles, static_cast<int>(kMaximumTiles)});
+  const int maximum_tiles =
+      multiprocessor_count == 152 ? kMaximumTiles152Sm : kMaximumTiles148Sm;
+  const int grid_x = std::min({multiprocessor_count, kTotalTiles, maximum_tiles});
   TVM_FFI_ICHECK_GT(grid_x, 0) << "wan_hybrid attention requires at least one SM";
 
   auto* descriptor_bytes = static_cast<uint8_t*>(descriptor_storage.data_ptr());

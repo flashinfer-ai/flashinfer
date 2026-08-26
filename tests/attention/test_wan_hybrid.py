@@ -216,7 +216,9 @@ def test_wan_hybrid_attention_binding_matches_frozen_device_abi() -> None:
     assert "kHeads = 40" in binding
     assert "kHeadDim = 128" in binding
     assert "kTensorMapCount = 6" in binding
-    assert "kMaximumTiles = 147" in binding
+    assert "kMaximumTiles148Sm = 147" in binding
+    assert "kMaximumTiles152Sm = 152" in binding
+    assert "multiprocessor_count == 152" in binding
     assert "kDynamicSmemBytes = 231'424" in binding
     assert 'EncodeNHD(k, 128, "cuTensorMapEncodeTiled(k)")' in binding
     assert "kPackedValueRows, 64, 128" in binding
@@ -243,6 +245,9 @@ def test_wan_hybrid_dispatch_binding_preserves_sources_and_launch_order() -> Non
     assert "kTensorMapCount = 6" in binding
     assert "kAttentionDynamicSmemBytes = SMEM_TOTAL" in binding
     assert "kWanHybridQuantDynamicSmemBytes = SMEM_TOTAL" in binding
+    assert "kMaximumTiles148Sm = 147" in binding
+    assert "kMaximumTiles152Sm = 152" in binding
+    assert "multiprocessor_count == 152" in binding
     assert body.index("PrepareTensorMaps(") < body.index(
         "kernel_wan_hybrid_quantize_value<<<"
     )
