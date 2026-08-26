@@ -1364,6 +1364,9 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+    const int first_chunk_tiles_m = ((M < 2432) ? M : 2432) / 128;
+    const int n_tiles = num_bids / first_chunk_tiles_m;
+    const int output_n = n_tiles * 256;
     if (tid == 0) {
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_local)) : "memory");
         asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A_scratch)) : "memory");
@@ -1445,7 +1448,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
                     int rows_left = M - chunk_idx * ((M < 2432) ? M : 2432);
                     int chunk_m = ((rows_left > ((M < 2432) ? M : 2432)) ? ((M < 2432) ? M : 2432) : rows_left);
                     int chunk_tiles_m = chunk_m / 128;
-                    int active_tiles = chunk_tiles_m * 8;
+                    int active_tiles = chunk_tiles_m * n_tiles;
                     if (active_tiles > bid) {
                         int bid_m = bid % chunk_tiles_m;
                         int bid_n = bid / chunk_tiles_m;
@@ -1505,7 +1508,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
                     int rows_left_1 = M - chunk_idx_1 * ((M < 2432) ? M : 2432);
                     int chunk_m_1 = ((rows_left_1 > ((M < 2432) ? M : 2432)) ? ((M < 2432) ? M : 2432) : rows_left_1);
                     int chunk_tiles_m_1 = chunk_m_1 / 128;
-                    int active_tiles_1 = chunk_tiles_m_1 * 8;
+                    int active_tiles_1 = chunk_tiles_m_1 * n_tiles;
                     if (active_tiles_1 > bid) {
                         mbarrier_wait(epilogue_done_addr + (mma_epi_stage) * 8, _phase_epilogue_done);
                         #pragma unroll 1
@@ -1576,7 +1579,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
                     int rows_left_2 = M - chunk_idx_2 * ((M < 2432) ? M : 2432);
                     int chunk_m_2 = ((rows_left_2 > ((M < 2432) ? M : 2432)) ? ((M < 2432) ? M : 2432) : rows_left_2);
                     int chunk_tiles_m_2 = chunk_m_2 / 128;
-                    int active_tiles_2 = chunk_tiles_m_2 * 8;
+                    int active_tiles_2 = chunk_tiles_m_2 * n_tiles;
                     if (active_tiles_2 > bid) {
                         int bid_m_1 = bid % chunk_tiles_m_2;
                         int bid_n_1 = bid / chunk_tiles_m_2;
@@ -1599,7 +1602,7 @@ kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4(CakeTensorMap const* A_loca
                                 __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
                                 _tmem_load_0_bf16[_lp] = *(uint32_t*)&_bf2;
                             }
-                            reinterpret_cast<int4*>(C + ((out_m + epi_tid) * 2048 + (off_n_1 + n_chunk * 8)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16)[0];
+                            reinterpret_cast<int4*>(C + ((out_m + epi_tid) * output_n + (off_n_1 + n_chunk * 8)))[0] = reinterpret_cast<int4*>(_tmem_load_0_bf16)[0];
                         }
                         if (elect_sync()) {
                             mbarrier_arrive(epilogue_done_addr + (epi_stage) * 8);

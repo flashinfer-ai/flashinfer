@@ -78,7 +78,9 @@ def test_host_launch_consumes_manifest_smem(tmp_path, monkeypatch):
     rendered = backend._render_host_source("test_module", manifest)
 
     assert "constexpr int32_t kMainSmemBytes = 197632;" in rendered
+    assert "kPackedQkvExperimentSupported =\n    false;" in rendered
     assert "CAKE_MAIN_SMEM_BYTES" not in rendered
+    assert "CAKE_PACKED_QKV_EXPERIMENT_SUPPORTED" not in rendered
     assert source_path.read_bytes().count(b"#define SMEM_TOTAL 197632") == 4
 
 
@@ -109,6 +111,30 @@ def test_packaged_program_has_self_contained_pointer_abi(arch):
     )
     assert source.count(b"CakeTensorMap const*") == 12
     assert backend._resolved_main_smem_bytes(source) == 197632
+
+
+def test_sm103_bf16_ws4_derives_private_packed_width_from_grid():
+    backend = _backend()
+
+    source_path, manifest = backend._program_source("sm_103a")
+    source = source_path.read_text(encoding="utf-8")
+    function = source.split("kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4", 1)[
+        1
+    ].split("} // extern", 1)[0]
+
+    assert "active_tiles = chunk_tiles_m * n_tiles" in function
+    assert "active_tiles_1 = chunk_tiles_m_1 * n_tiles" in function
+    assert "active_tiles_2 = chunk_tiles_m_2 * n_tiles" in function
+    assert "const int n_tiles = num_bids / first_chunk_tiles_m;" in function
+    assert "const int output_n = n_tiles * 256;" in function
+    assert "(out_m + epi_tid) * output_n" in function
+    assert manifest["constraints"]["n"] == 2048
+    assert manifest["launch"]["main"]["grid_x"].endswith("* 8")
+    rendered = backend._render_host_source("test_module", manifest)
+    assert "kPackedQkvExperimentSupported =\n    true;" in rendered
+
+    sm100_source, _ = backend._program_source("sm_100a")
+    assert b"n_tiles" not in sm100_source.read_bytes()
 
 
 @pytest.mark.parametrize(
@@ -418,6 +444,7 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
         record_stream=lambda stream: weight_streams.append(stream),
     )
     group = object()
+    lifecycle = []
 
     class FakeOutput:
         def __init__(self, pointer):
@@ -429,7 +456,10 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
 
     class FakeEvent:
         def record(self, stream):
-            pass
+            lifecycle.append("tail-record")
+
+        def synchronize(self):
+            lifecycle.append("tail-sync")
 
     class FakeStream:
         cuda_stream = 17
@@ -450,6 +480,7 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
 
     outputs = []
     launches = []
+    barriers = []
 
     def allocate(*shape, **kwargs):
         output = FakeOutput(1000 + len(outputs))
@@ -459,9 +490,11 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
     def run_main(*args):
         output = args[3]
         output.value = len(launches) + 1
-        launches.append(output)
+        launches.append((output, args[-1]))
 
-    module = SimpleNamespace(run_barrier=lambda *args: None, run_main=run_main)
+    module = SimpleNamespace(
+        run_barrier=lambda *args: barriers.append(args[-1]), run_main=run_main
+    )
     main_stream = FakeStream()
     comm_stream = FakeStream()
     descriptors = SimpleNamespace(
@@ -488,7 +521,12 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
         "rendezvous",
         lambda *args, **kwargs: pytest.fail("input must not be rendezvoused"),
     )
-    monkeypatch.setattr(backend, "_workspace", lambda **kwargs: workspace)
+
+    def create_workspace(**kwargs):
+        lifecycle.append("workspace")
+        return workspace
+
+    monkeypatch.setattr(backend, "_workspace", create_workspace)
     monkeypatch.setattr(
         backend,
         "_descriptor_storage",
@@ -507,10 +545,18 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
     assert first.data_ptr() != second.data_ptr()
     assert first.value == 1
     assert second.value == 2
-    assert launches == [first, second]
+    assert launches == [(first, 17), (second, 17)]
+    assert barriers == [17, 17]
     assert input_streams == [main_stream, comm_stream, main_stream, comm_stream]
     assert weight_streams == [main_stream, main_stream]
     assert descriptor_streams == [main_stream, main_stream]
+    assert lifecycle == [
+        "workspace",
+        "tail-record",
+        "tail-sync",
+        "workspace",
+        "tail-record",
+    ]
 
 
 def test_validate_inputs_uses_the_exact_passed_subgroup(monkeypatch):
@@ -556,6 +602,80 @@ def test_validate_inputs_uses_the_exact_passed_subgroup(monkeypatch):
         "tp-group",
     )
     assert seen_groups == [subgroup, subgroup]
+
+
+def test_validate_inputs_keeps_packed_qkv_route_private(monkeypatch):
+    backend = _backend()
+    subgroup = SimpleNamespace(group_name="tp-group")
+    device = torch.device("cuda:3")
+    inp = SimpleNamespace(
+        device=device,
+        dtype=torch.bfloat16,
+        ndim=2,
+        shape=(128, 8192),
+        is_contiguous=lambda: True,
+    )
+    weight = SimpleNamespace(
+        device=device,
+        dtype=torch.bfloat16,
+        ndim=2,
+        shape=(8192, 2560),
+        is_contiguous=lambda: True,
+    )
+    monkeypatch.setattr(backend.dist, "is_available", lambda: True)
+    monkeypatch.setattr(backend.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(backend.dist, "get_backend", lambda group: "nccl")
+    monkeypatch.setattr(backend.dist, "get_world_size", lambda group: 4)
+    monkeypatch.setattr(backend.dist, "get_rank", lambda group: 2)
+    monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: "NVSHMEM")
+    monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_103a")
+
+    with pytest.raises(ValueError, match="exact K=8192 and N=2048"):
+        backend._validate_inputs(inp, weight, subgroup)
+    assert backend._validate_inputs(
+        inp, weight, subgroup, packed_qkv_experiment=True
+    ) == (3, 2, 4, "tp-group")
+    assert "_all_gather_matmul_cake_packed_qkv_sm103_tp4" not in backend.__all__
+
+
+@pytest.mark.parametrize(
+    ("arch", "dtype", "world_size"),
+    [
+        ("sm_100a", torch.bfloat16, 4),
+        ("sm_103a", torch.float16, 4),
+        ("sm_103a", torch.bfloat16, 2),
+    ],
+)
+def test_validate_inputs_rejects_other_packed_qkv_routes(
+    monkeypatch, arch, dtype, world_size
+):
+    backend = _backend()
+    subgroup = SimpleNamespace(group_name="tp-group")
+    device = torch.device("cuda:0")
+    inp = SimpleNamespace(
+        device=device,
+        dtype=dtype,
+        ndim=2,
+        shape=(128, 8192),
+        is_contiguous=lambda: True,
+    )
+    weight = SimpleNamespace(
+        device=device,
+        dtype=dtype,
+        ndim=2,
+        shape=(8192, 2560),
+        is_contiguous=lambda: True,
+    )
+    monkeypatch.setattr(backend.dist, "is_available", lambda: True)
+    monkeypatch.setattr(backend.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(backend.dist, "get_backend", lambda group: "nccl")
+    monkeypatch.setattr(backend.dist, "get_world_size", lambda group: world_size)
+    monkeypatch.setattr(backend.dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: "NVSHMEM")
+    monkeypatch.setattr(backend, "_target_arch", lambda device: arch)
+
+    with pytest.raises(ValueError, match="requires SM103, bfloat16"):
+        backend._validate_inputs(inp, weight, subgroup, packed_qkv_experiment=True)
 
 
 def test_validate_inputs_rejects_unsupported_subgroup_size(monkeypatch):

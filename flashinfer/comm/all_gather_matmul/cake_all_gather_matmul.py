@@ -29,6 +29,7 @@ _BLOCK_M = 128
 _CHUNK_ROWS = 19 * _BLOCK_M
 _K = 8192
 _N = 2048
+_PACKED_QKV_N = 2560
 _TENSOR_MAP_BYTES = 128
 _DESCRIPTOR_COUNT = 3
 _DESCRIPTOR_CACHE_MAX_ENTRIES = 256
@@ -89,7 +90,6 @@ _HOST_SOURCE = r"""
 #include <cuda.h>
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/error.h>
-#include <tvm/ffi/extra/c_env_api.h>
 #include <tvm/ffi/extra/cuda/cubin_launcher.h>
 #include <tvm/ffi/function.h>
 
@@ -106,6 +106,8 @@ constexpr int64_t kTensorMapBytes = sizeof(CUtensorMap);
 constexpr int64_t kDescriptorCount = 3;
 constexpr int32_t kMainThreads = 192;
 constexpr int32_t kMainSmemBytes = CAKE_MAIN_SMEM_BYTES;
+constexpr bool kPackedQkvExperimentSupported =
+    CAKE_PACKED_QKV_EXPERIMENT_SUPPORTED;
 
 static_assert(sizeof(CUtensorMap) == 128);
 
@@ -160,9 +162,9 @@ inline void CheckDescriptorInputs(const TensorView& inp,
                 ValueError)
       << "scratch must have shape [world_size, rows, 8192]";
   TVM_FFI_CHECK(weight.ndim() == 2 && weight.size(0) == 8192 &&
-                    weight.size(1) == 2048,
+                    (weight.size(1) == 2048 || weight.size(1) == 2560),
                 ValueError)
-      << "weight must have shape [8192, 2048]";
+      << "weight must have shape [8192, 2048] or [8192, 2560]";
   const DLDataType dtype = inp.dtype();
   for (const auto* tensor : {&scratch, &weight}) {
     const DLDataType other = tensor->dtype();
@@ -182,9 +184,9 @@ inline void CheckCommonInputs(const TensorView& inp, const TensorView& scratch,
   CheckContiguous(out, "out");
   CheckSameDevice(out, inp, "out");
   TVM_FFI_CHECK(out.ndim() == 2 && out.size(0) == world_size * rows &&
-                    out.size(1) == 2048,
+                    out.size(1) == weight.size(1),
                 ValueError)
-      << "out must have shape [world_size * rows, 2048]";
+      << "out must have shape [world_size * rows, weight.size(1)]";
   const DLDataType dtype = inp.dtype();
   const DLDataType out_dtype = out.dtype();
   TVM_FFI_CHECK(out_dtype.code == dtype.code && out_dtype.bits == dtype.bits &&
@@ -212,8 +214,9 @@ inline CUtensorMap EncodeActivationMap(const TensorView& tensor, int64_t rows,
 }
 
 inline CUtensorMap EncodeWeightMap(const TensorView& weight) {
-  uint64_t global_dim[3] = {2048, 8192, 1};
-  uint64_t global_strides[2] = {2048 * 2, 8192ULL * 2048ULL * 2ULL};
+  const uint64_t n = static_cast<uint64_t>(weight.size(1));
+  uint64_t global_dim[3] = {n, 8192, 1};
+  uint64_t global_strides[2] = {n * 2, 8192ULL * n * 2ULL};
   uint32_t box_dim[3] = {64, 64, 1};
   uint32_t element_strides[3] = {1, 1, 1};
   CUtensorMap map{};
@@ -283,11 +286,20 @@ inline tvm::ffi::CubinKernel& BarrierKernel(int64_t world_size, int64_t phase) {
   return phase == 0 ? ws4_p0 : ws4_p1;
 }
 
-inline tvm::ffi::CubinKernel& MainKernel(int64_t world_size, int64_t dtype_code) {
+inline tvm::ffi::CubinKernel& MainKernel(int64_t world_size, int64_t dtype_code,
+                                         int64_t n) {
   TVM_FFI_CHECK(world_size == 2 || world_size == 4, ValueError)
       << "world_size must be 2 or 4";
   TVM_FFI_CHECK(dtype_code == 0 || dtype_code == 1, ValueError)
       << "dtype_code must be 0 (bfloat16) or 1 (float16)";
+  TVM_FFI_CHECK(n == 2048 || n == 2560, ValueError)
+      << "n must be 2048 or 2560";
+  if (n == 2560) {
+    TVM_FFI_CHECK(kPackedQkvExperimentSupported && world_size == 4 &&
+                      dtype_code == 0,
+                  ValueError)
+        << "the packed-QKV experiment requires SM103, world_size=4, and bfloat16";
+  }
   static auto bf16_ws2 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
       CAKE_MODULE_IDENT,
       "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2");
@@ -307,7 +319,7 @@ inline tvm::ffi::CubinKernel& MainKernel(int64_t world_size, int64_t dtype_code)
 }
 
 void RunBarrier(TensorView flag_peers, int64_t world_size, int64_t rank,
-                int64_t phase) {
+                int64_t phase, int64_t cuda_stream) {
   CheckCudaTensor(flag_peers, "flag_peers");
   CheckContiguous(flag_peers, "flag_peers");
   const DLDataType dtype = flag_peers.dtype();
@@ -320,9 +332,8 @@ void RunBarrier(TensorView flag_peers, int64_t world_size, int64_t rank,
   TVM_FFI_CHECK(rank >= 0 && rank < world_size, ValueError)
       << "rank is outside the process group";
 
-  const DLDevice device = flag_peers.device();
   CUstream stream = reinterpret_cast<CUstream>(
-      TVMFFIEnvGetStream(device.device_type, device.device_id));
+      static_cast<uintptr_t>(cuda_stream));
   int32_t world = static_cast<int32_t>(world_size);
   int32_t local_rank = static_cast<int32_t>(rank);
   void* flags = flag_peers.data_ptr();
@@ -335,7 +346,8 @@ void RunBarrier(TensorView flag_peers, int64_t world_size, int64_t rank,
 
 void RunMain(TensorView inp, TensorView scratch, TensorView weight,
              TensorView out, TensorView descriptor_storage, TensorView ready,
-             int64_t world_size, int64_t rank, int64_t rows, int64_t dtype_code) {
+             int64_t world_size, int64_t rank, int64_t rows, int64_t dtype_code,
+             int64_t cuda_stream) {
   CheckCommonInputs(inp, scratch, weight, out, world_size, rows);
   CheckCudaTensor(descriptor_storage, "descriptor_storage");
   CheckCudaTensor(ready, "ready");
@@ -366,7 +378,8 @@ void RunMain(TensorView inp, TensorView scratch, TensorView weight,
   void* args[] = {&inp_map, &scratch_map, &weight_map, &output_ptr,
                   &scratch_ptr, &ready_ptr, &local_rank, &local_rows};
 
-  auto& kernel = MainKernel(world_size, dtype_code);
+  const int64_t n = weight.size(1);
+  auto& kernel = MainKernel(world_size, dtype_code, n);
   namespace cuda_api = tvm::ffi::cuda_api;
   static signed char smem_configured[4][64] = {};
   TVM_FFI_CHECK(inp.device().device_id >= 0 && inp.device().device_id < 64,
@@ -383,10 +396,10 @@ void RunMain(TensorView inp, TensorView scratch, TensorView weight,
   }
 
   const int64_t chunk_rows = rows < 2432 ? rows : 2432;
-  const uint32_t grid_x = static_cast<uint32_t>((chunk_rows / 128) * 8);
-  const DLDevice device = inp.device();
+  const uint32_t grid_x =
+      static_cast<uint32_t>((chunk_rows / 128) * (n / 256));
   CUstream stream = reinterpret_cast<CUstream>(
-      TVMFFIEnvGetStream(device.device_type, device.device_id));
+      static_cast<uintptr_t>(cuda_stream));
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
       kernel.Launch(args, tvm::ffi::dim3(grid_x, 1, 1),
                     tvm::ffi::dim3(kMainThreads, 1, 1), stream,
@@ -481,10 +494,22 @@ def _render_host_source(module_ident: str, manifest: dict[str, Any]) -> str:
         raise RuntimeError(
             "Cake all-gather matmul main dynamic shared memory is invalid"
         )
-    rendered = _HOST_SOURCE.replace("CAKE_MODULE_IDENT", module_ident).replace(
-        "CAKE_MAIN_SMEM_BYTES", str(main_smem_bytes)
+    rendered = (
+        _HOST_SOURCE.replace("CAKE_MODULE_IDENT", module_ident)
+        .replace("CAKE_MAIN_SMEM_BYTES", str(main_smem_bytes))
+        .replace(
+            "CAKE_PACKED_QKV_EXPERIMENT_SUPPORTED",
+            "true" if manifest["arch"] == "sm_103a" else "false",
+        )
     )
-    if "CAKE_MODULE_IDENT" in rendered or "CAKE_MAIN_SMEM_BYTES" in rendered:
+    if any(
+        placeholder in rendered
+        for placeholder in (
+            "CAKE_MODULE_IDENT",
+            "CAKE_MAIN_SMEM_BYTES",
+            "CAKE_PACKED_QKV_EXPERIMENT_SUPPORTED",
+        )
+    ):
         raise RuntimeError("Cake all-gather matmul host launch template is incomplete")
     return rendered
 
@@ -620,7 +645,11 @@ def _group_name(group: dist.ProcessGroup) -> str:
 
 
 def _validate_inputs(
-    inp: torch.Tensor, w: torch.Tensor, group: dist.ProcessGroup
+    inp: torch.Tensor,
+    w: torch.Tensor,
+    group: dist.ProcessGroup,
+    *,
+    packed_qkv_experiment: bool = False,
 ) -> tuple[int, int, int, str]:
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("an initialized NCCL process group is required")
@@ -642,7 +671,12 @@ def _validate_inputs(
     rows, k = (int(dim) for dim in inp.shape)
     if rows <= 0 or rows % _BLOCK_M:
         raise ValueError("inp.shape[0] must be a positive multiple of 128")
-    if k != _K or tuple(w.shape) != (_K, _N):
+    if packed_qkv_experiment:
+        if k != _K or tuple(w.shape) != (_K, _PACKED_QKV_N):
+            raise ValueError(
+                "the packed-QKV experiment requires exact K=8192 and N=2560"
+            )
+    elif k != _K or tuple(w.shape) != (_K, _N):
         raise ValueError("the Cake backend requires exact K=8192 and N=2048")
     world_size = int(dist.get_world_size(group))
     rank = int(dist.get_rank(group))
@@ -654,7 +688,13 @@ def _validate_inputs(
         raise ValueError(
             "the Cake backend requires the NVSHMEM symmetric-memory backend"
         )
-    _target_arch(inp.device)
+    arch = _target_arch(inp.device)
+    if packed_qkv_experiment and (
+        arch != "sm_103a" or inp.dtype != torch.bfloat16 or world_size != 4
+    ):
+        raise ValueError(
+            "the packed-QKV experiment requires SM103, bfloat16, and world size 4"
+        )
     return device_index, rank, world_size, _group_name(group)
 
 
@@ -750,24 +790,22 @@ def _descriptor_storage(
     return descriptors
 
 
-def all_gather_matmul_cake(
+def _run_cake_validated(
     inp: torch.Tensor,
     w: torch.Tensor,
     group: dist.ProcessGroup,
     *,
-    backend: str,
-    verbose: bool = False,
+    verbose: bool,
+    packed_qkv_experiment: bool,
 ) -> torch.Tensor:
-    """Run the exact Blackwell source-built backend for one NCCL group.
-
-    The input is local-only and need not be remotely addressable. NVSHMEM is
-    still required for the backend's internal symmetric scratch and flags.
-    """
-
-    if backend != "cake":
-        raise ValueError("backend must be exactly 'cake'")
-
-    device_index, rank, world_size, group_name = _validate_inputs(inp, w, group)
+    if packed_qkv_experiment:
+        device_index, rank, world_size, group_name = _validate_inputs(
+            inp, w, group, packed_qkv_experiment=True
+        )
+        output_n = _PACKED_QKV_N
+    else:
+        device_index, rank, world_size, group_name = _validate_inputs(inp, w, group)
+        output_n = _N
     rows = int(inp.shape[0])
     arch = _target_arch(inp.device)
     module = _load_program(arch)
@@ -788,15 +826,31 @@ def all_gather_matmul_cake(
                 world_size=world_size,
                 group_name=group_name,
             )
+            workspace_key = (
+                device_index,
+                id(group),
+                group_name,
+                inp.dtype,
+                world_size,
+                rows,
+            )
             with _CACHE_LOCK:
-                workspace = _workspace(
-                    device_index=device_index,
-                    group=group,
-                    group_name=group_name,
-                    dtype=inp.dtype,
-                    world_size=world_size,
-                    rows=rows,
-                )
+                workspace = _WORKSPACES.get(workspace_key)
+            if workspace is None:
+                # Symmetric allocation and rendezvous are host operations, so
+                # a stream dependency cannot order them after the prior launch.
+                # Wait only on a cache miss; steady-state launches stay async.
+                if state.tail_event is not None:
+                    state.tail_event.synchronize()
+                with _CACHE_LOCK:
+                    workspace = _workspace(
+                        device_index=device_index,
+                        group=group,
+                        group_name=group_name,
+                        dtype=inp.dtype,
+                        world_size=world_size,
+                        rows=rows,
+                    )
 
             descriptors = _descriptor_storage(
                 workspace,
@@ -808,7 +862,7 @@ def all_gather_matmul_cake(
                 rows=rows,
             )
             output = torch.empty(
-                world_size * rows, _N, dtype=inp.dtype, device=device_index
+                world_size * rows, output_n, dtype=inp.dtype, device=device_index
             )
 
             chunk_size = min(rows, _CHUNK_ROWS)
@@ -826,7 +880,9 @@ def all_gather_matmul_cake(
                 main_stream.wait_event(state.tail_event)
 
             phase = state.next_phase
-            module.run_barrier(state.flag_peers, world_size, rank, phase)
+            module.run_barrier(
+                state.flag_peers, world_size, rank, phase, main_stream_id
+            )
             workspace.comm_stream.wait_stream(main_stream)
             with torch.cuda.stream(workspace.comm_stream):
                 for shift in range(1, world_size):
@@ -856,6 +912,7 @@ def all_gather_matmul_cake(
                 rank,
                 rows,
                 int(inp.dtype == torch.float16),
+                main_stream_id,
             )
             signal_pad.zero_()
             main_stream.wait_stream(workspace.comm_stream)
@@ -867,12 +924,56 @@ def all_gather_matmul_cake(
             if verbose and rank == 0:
                 print(
                     "Cake all-gather matmul: "
-                    f"arch={arch}, world_size={world_size}, M={rows}, K={_K}, N={_N}"
+                    f"arch={arch}, world_size={world_size}, M={rows}, "
+                    f"K={_K}, N={output_n}"
                 )
             return output
         except Exception:
             state.poisoned = True
             raise
+
+
+def all_gather_matmul_cake(
+    inp: torch.Tensor,
+    w: torch.Tensor,
+    group: dist.ProcessGroup,
+    *,
+    backend: str,
+    verbose: bool = False,
+) -> torch.Tensor:
+    """Run the exact Blackwell source-built backend for one NCCL group.
+
+    The input is local-only and need not be remotely addressable. NVSHMEM is
+    still required for the backend's internal symmetric scratch and flags.
+    """
+
+    if backend != "cake":
+        raise ValueError("backend must be exactly 'cake'")
+    return _run_cake_validated(
+        inp,
+        w,
+        group,
+        verbose=verbose,
+        packed_qkv_experiment=False,
+    )
+
+
+def _all_gather_matmul_cake_packed_qkv_sm103_tp4(
+    inp: torch.Tensor,
+    w: torch.Tensor,
+    group: dist.ProcessGroup,
+    *,
+    verbose: bool = False,
+) -> torch.Tensor:
+    """Run the private SM103/BF16/TP4 packed-QKV arithmetic experiment."""
+
+    return _run_cake_validated(
+        inp,
+        w,
+        group,
+        verbose=verbose,
+        packed_qkv_experiment=True,
+    )
 
 
 __all__ = ["all_gather_matmul_cake"]
