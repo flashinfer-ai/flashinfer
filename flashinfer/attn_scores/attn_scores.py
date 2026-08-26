@@ -74,8 +74,13 @@ _MAX_BLOCKS_PER_MMA = 4
 # "expects the N-mode to satisfy 8 <= N <= 256 and N % 8 == 0".
 # N here is next_n * num_heads.
 _MMA_N_MIN, _MMA_N_MAX, _MMA_N_MULTIPLE = 8, 256, 8
-# FP4 supports next_n in {1,2,3}; the kernel asserts this directly.
-_FP4_MAX_NEXT_N = 3
+# Largest logical next_n the FP4 path accepts. This is NOT the per-atom cap:
+# the kernel's TMEM budget limits one *atom* to 3 on Blackwell and 4 on Rubin
+# (see _fp4_max_atom_for_device), and the in-kernel atom split decomposes next_n
+# into atoms, so next_n=4 is reachable everywhere -- directly on Rubin, as two
+# atoms of 2 on Blackwell. 4 is where upstream's validation stops, so the API
+# stops there too rather than at the arbitrary limit an atom of 1 would allow.
+_FP4_MAX_NEXT_N = 4
 # is_kv_sf_interleaved is only implemented for this page size (1 physical
 # block == 1 UTCCP atom); the kernel silently ignores the flag otherwise.
 _FP4_SF_INTERLEAVE_BLOCK_SIZE = 128
@@ -551,12 +556,101 @@ def _require_cute_dsl(device: torch.device, fn_name: str) -> None:
 # datacentre parts.
 _PAGED_MQA_CCS = [100, 103, 107]
 
+
+def _fp4_max_atom_for_device(device: torch.device) -> int:
+    """Largest per-atom FP4 next_n this device's TMEM can hold.
+
+    An atom of 4 needs 544 raw TMEM columns. Blackwell (SM100/SM103) caps at
+    512, so 3 is its maximum; Rubin (SM107+) exposes 576 and fits 4 via an
+    exclusive, non-power-of-two allocation. Mirrors the kernel-side
+    ``max_next_n_for_target``, but keyed on the torch device so the API can
+    report the limit without entering the DSL.
+    """
+    major, minor = torch.cuda.get_device_capability(device)
+    return 4 if (major, minor) >= (10, 7) else 3
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Schedule-metadata computation (pure Python, mirrors DeepGEMM scheduler)
 # ──────────────────────────────────────────────────────────────────────────────
 
 _COMPUTE_BLOCK_KV = 128  # kernel's fixed compute tile (immutable)
 _NUM_MATH_WG = 2  # warp groups per CTA; kernel multiplies col-1 by this
+
+# One "atom" runs `atom` next-token positions per launched q-row. Splitting
+# next_n into next_n/atom pieces expands the effective batch, and each piece
+# re-reads the same KV -- so a split costs num_atoms x KV HBM traffic but
+# exposes more parallelism. _SPLIT_KV_TOKENS is the KV span of one scheduler
+# task (see _COMPUTE_BLOCK_KV * _NUM_MATH_WG).
+_SPLIT_KV_TOKENS = _COMPUTE_BLOCK_KV * _NUM_MATH_WG
+
+
+def _choose_atom_split(
+    batch: int,
+    ctx: int,
+    next_n: int,
+    num_sms: int,
+    kernel_atoms: Tuple[int, ...],
+    tie: str = "max_num_atoms",
+) -> int:
+    """Pick the atom size decomposing ``next_n`` to minimise the persistent
+    scheduler's wave count for a (batch, ctx) shape.
+
+    Wave count is estimated as ``ceil(tasks / num_sms)``, where a task is one
+    (expanded-batch-row, KV-chunk) tile and a ``ctx``-token sequence spans
+    ``ceil(ctx / _SPLIT_KV_TOKENS)`` chunks. Fewer waves means better SM
+    occupancy.
+
+    Ties -- the small-batch regime, where splitting fills otherwise idle SMs
+    within the same wave -- break toward the largest ``num_atoms`` (smallest
+    atom), i.e. most SMs busy per wave, accepting the extra KV re-reads because
+    SMs rather than HBM are the limiter there.
+
+    Purely analytical, no timing. Scored against the measured direct-vs-split
+    sweep in DKG MR !25506: it matches the empirical winner in 81% of cells,
+    and in 100% of the decisive large- and small-batch regions; every mismatch
+    sits in a narrow near-crossover band where the loss is <=7%.
+    """
+    cands = []
+    for atom in kernel_atoms:
+        if next_n % atom == 0:
+            num_atoms = next_n // atom
+            tasks = batch * num_atoms * -(-ctx // _SPLIT_KV_TOKENS)
+            cands.append((-(-tasks // num_sms), num_atoms, atom))
+    if not cands:
+        raise ValueError(f"no atom in {kernel_atoms} divides next_n={next_n}")
+    if tie == "max_num_atoms":
+        cands.sort(key=lambda c: (c[0], -c[1]))
+    else:
+        cands.sort(key=lambda c: (c[0], c[1]))
+    return cands[0][2]
+
+
+def _expand_context_lens(
+    context_lens: torch.Tensor, num_atoms: int, atom: int
+) -> torch.Tensor:
+    """Expand ``[batch]`` context lengths to ``[batch*num_atoms]`` for the split.
+
+    Atom ``i`` (0 = oldest) of a sequence sees ``ctx - (num_atoms-1-i)*atom``,
+    which reproduces the unsplit next_n's staggered causal limits. Identity when
+    ``num_atoms == 1``.
+
+    A per-atom length may come out zero or negative when a sequence is shorter
+    than the atom's offset. That is deliberately left unclamped: the offset is
+    below next_n (<= 4), so ``ceil_div(ctx, block_kv)`` floors such an atom to
+    zero work in both the scheduler and the kernel, keeping the two in
+    agreement. Clamping to 0 here would be equivalent, but leaving the raw value
+    keeps this function a pure inverse of the kernel's ``_atom_ctx_len``.
+    """
+    if num_atoms == 1:
+        return context_lens
+    off = (
+        torch.arange(
+            num_atoms - 1, -1, -1, device=context_lens.device, dtype=torch.int32
+        )
+        * atom
+    )
+    return (context_lens.unsqueeze(1) - off.unsqueeze(0)).reshape(-1).contiguous()
 
 
 def _compute_schedule_metadata(
@@ -770,16 +864,22 @@ def _cached_compile_fp4_kernel(
     num_epi_subtiles: int,
     is_kv_sf_interleaved: bool,
     arch: str,
+    num_next_n_atoms: int = 1,
 ):
     from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from .kernels import FP4MQALogitsKernel
 
-    N = next_n * num_heads
+    # next_n is the LOGICAL next-token count. The fake Q/SF/W carry one atom of
+    # N = next_n_atom * num_heads, and the kernel tiles the split over
+    # q_atom_idx; block_table / context_lens stay [batch]-shaped.
+    next_n_atom = next_n // num_next_n_atoms
+    N = next_n_atom * num_heads
     half_D = head_dim // 2
     block_bytes = block_size * (half_D + 4)
 
     sym_npb = cute.sym_int()
-    sym_B = cute.sym_int()
+    sym_B = cute.sym_int()  # Q / SF / weights L dim = batch * num_next_n_atoms
+    sym_batch = cute.sym_int()  # native block_table / context_lens rows
     max_ctx = cute.sym_int()
     max_blocks = cute.sym_int()
     num_ctas_sym = cute.sym_int()
@@ -806,10 +906,10 @@ def _cached_compile_fp4_kernel(
         stride=(cute.sym_int64(), 1),
     )
     bt_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (sym_B, max_blocks), stride_order=(1, 0)
+        cutlass.Int32, (sym_batch, max_blocks), stride_order=(1, 0)
     )
     cl_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Int32, (sym_B,), stride_order=(0,)
+        cutlass.Int32, (sym_batch,), stride_order=(0,)
     )
     sm_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32, (num_ctas_sym, 2), stride_order=(1, 0)
@@ -822,6 +922,7 @@ def _cached_compile_fp4_kernel(
         num_heads=num_heads,
         head_dim=head_dim,
         next_n=next_n,
+        num_next_n_atoms=num_next_n_atoms,
         num_sms=num_sms,
         num_epi_subtiles=num_epi_subtiles,
         epi_dtype=epi_dtype,
@@ -849,6 +950,7 @@ def _cached_compile_fp4_kernel(
 
     tag = (
         f"fp4_bs{block_size}_H{num_heads}_D{head_dim}_nn{next_n}"
+        f"_at{num_next_n_atoms}"
         f"_sms{num_sms}_epi{epi_dtype}_out{output_dtype}"
         f"_sub{num_epi_subtiles}_sfI{int(is_kv_sf_interleaved)}_{arch}"
     )
@@ -1253,6 +1355,7 @@ def _check_fp4_paged_mqa_logits_supported(
     epi_dtype: torch.dtype = torch.float32,
     num_epi_subtiles: int = 1,
     is_kv_sf_interleaved: bool = False,
+    next_n_atom: "int | str | None" = None,
     schedule_meta: torch.Tensor = None,
     out: torch.Tensor = None,
 ) -> bool:
@@ -1375,6 +1478,7 @@ def fp4_paged_mqa_logits(
     epi_dtype: torch.dtype = torch.float32,
     num_epi_subtiles: int = 1,
     is_kv_sf_interleaved: bool = False,
+    next_n_atom: "int | str | None" = None,
     schedule_meta: torch.Tensor = None,
     out: torch.Tensor = None,
 ) -> torch.Tensor:
@@ -1488,16 +1592,60 @@ def fp4_paged_mqa_logits(
     cutlass_epi = _to_cutlass(epi_dtype)
     cutlass_out = _to_cutlass(output_dtype)
 
-    # Reshape to kernel convention
-    q_3d = q.reshape(B, next_n * H, half_D).permute(1, 2, 0)  # [next_n*H, D//2, B]
-    sf_q_2d = sf_q.reshape(B, next_n * H).t()  # [next_n*H, B]
-    # weights [B*next_n, H] → [B, next_n*H] → [next_n*H, B]
-    if epi_dtype == torch.float16:
-        w_2d = weights.reshape(B, next_n * H).half().t()
-    elif epi_dtype == torch.bfloat16:
-        w_2d = weights.reshape(B, next_n * H).bfloat16().t()
+    # Resolve the atom (kernel-side next_n). atom == next_n runs direct, one
+    # launch; atom < next_n splits next_n into next_n/atom pieces that each
+    # re-read the KV. The arch cap is what makes this necessary: an atom of 4
+    # needs 544 TMEM columns and therefore Rubin, so Blackwell reaches next_n=4
+    # only via a split.
+    max_atom = _fp4_max_atom_for_device(q.device)
+    if next_n_atom is None:
+        # Default: direct whenever the arch can hold the whole next_n in one
+        # atom, splitting only when it cannot (next_n=4 on Blackwell). This is
+        # deliberately NOT the wave-count heuristic. Splitting is a change of
+        # execution strategy -- it multiplies KV traffic and, more importantly,
+        # changes the schedule the kernel expects, so a caller-supplied
+        # schedule_meta built from the native context_lens would no longer
+        # match. Making that the default would silently alter configurations
+        # that already work. Pass "auto" to opt into the heuristic.
+        atom = (
+            next_n
+            if next_n <= max_atom
+            else max(a for a in range(1, max_atom + 1) if next_n % a == 0)
+        )
+    elif next_n_atom == "auto":
+        atom = _choose_atom_split(
+            B, max_context_len, next_n, num_sms, tuple(range(1, max_atom + 1))
+        )
+    elif next_n_atom == "direct":
+        atom = next_n
     else:
-        w_2d = weights.reshape(B, next_n * H).t()
+        atom = int(next_n_atom)
+    if not (1 <= atom <= next_n and next_n % atom == 0):
+        raise ValueError(
+            f"fp4_paged_mqa_logits: next_n_atom={atom} must divide next_n="
+            f"{next_n} and lie in [1, {next_n}]."
+        )
+    if atom > max_atom:
+        raise ValueError(
+            f"fp4_paged_mqa_logits: next_n_atom={atom} exceeds the maximum "
+            f"kernel next_n for this device ({max_atom}); an atom of 4 requires "
+            f"Rubin (SM107+). Pick a smaller atom that divides next_n={next_n}."
+        )
+    num_atoms = next_n // atom
+    exp_B = B * num_atoms
+    N_atom = atom * H
+
+    # Reshape to kernel convention. The atom reshape (exp_B rows of one atom
+    # each) is free for contiguous q / sf_q, and weights [B*next_n, H] is
+    # already layout-equivalent to [exp_B*atom, H].
+    q_3d = q.reshape(exp_B, N_atom, half_D).permute(1, 2, 0)  # [atom*H, D//2, exp_B]
+    sf_q_2d = sf_q.reshape(exp_B, N_atom).t()  # [atom*H, exp_B]
+    if epi_dtype == torch.float16:
+        w_2d = weights.reshape(exp_B, N_atom).half().t()
+    elif epi_dtype == torch.bfloat16:
+        w_2d = weights.reshape(exp_B, N_atom).bfloat16().t()
+    else:
+        w_2d = weights.reshape(exp_B, N_atom).t()
     kv_flat = kv_fused.flatten(1)
 
     _validate_paged_bounds(
@@ -1519,13 +1667,31 @@ def fp4_paged_mqa_logits(
     if B == 0:
         return logits
 
+    # The scheduler enumerates batch*num_atoms q_atom tasks, so it must be built
+    # from the per-atom context lengths. Identity when num_atoms == 1, which
+    # keeps the unsplit path (and any caller-supplied schedule) unchanged.
+    sched_ctx = _expand_context_lens(context_lens, num_atoms, atom)
     if schedule_meta is None:
-        schedule_meta = compute_paged_mqa_logits_schedule(context_lens, device=q.device)
+        schedule_meta = compute_paged_mqa_logits_schedule(sched_ctx, device=q.device)
     else:
+        if num_atoms > 1:
+            # A split makes the scheduler describe batch*num_atoms rows, but the
+            # schedule's shape ([num_sms+1, 2]) is unchanged, so a schedule built
+            # from the native context_lens passes every always-on check and is
+            # still wrong. The freshness check that would catch it is opt-in and
+            # skipped under CUDA-graph capture, so it cannot be relied on. Reject
+            # instead: silent wrongness here is exactly why next_n=4 was
+            # previously refused outright.
+            raise ValueError(
+                f"fp4_paged_mqa_logits: next_n={next_n} runs as {num_atoms} "
+                f"atoms of {atom} on this device (an atom of 4 needs Rubin "
+                f"SM107+), so the schedule must describe {exp_B} rows rather "
+                f"than {B}. A schedule_meta built from context_lens is silently "
+                f"wrong here. Omit schedule_meta so it is computed correctly, or "
+                f"pass next_n_atom={next_n} on a device that supports it."
+            )
         _validate_schedule_meta(schedule_meta, num_sms, q.device)
-        _validate_schedule_meta_fresh(
-            schedule_meta, context_lens, "fp4_paged_mqa_logits"
-        )
+        _validate_schedule_meta_fresh(schedule_meta, sched_ctx, "fp4_paged_mqa_logits")
 
     dev_index = get_device_index(q.device)
     with _on_device(dev_index):
@@ -1540,6 +1706,7 @@ def fp4_paged_mqa_logits(
             num_epi_subtiles,
             is_kv_sf_interleaved,
             _arch_for_launch(dev_index, "fp4_paged_mqa_logits"),
+            num_atoms,
         )
         compiled(
             kv_flat,
@@ -1547,11 +1714,13 @@ def fp4_paged_mqa_logits(
             sf_q_2d,
             w_2d,
             logits,
+            # block_table / context_lens stay NATIVE [batch]; the kernel maps
+            # q_atom_idx back onto them via _atom_seq / _atom_ctx_len.
             block_table,
             context_lens,
             schedule_meta,
             num_blocks,
-            B,
+            exp_B,  # kernel batch_size = q's L dim = batch * num_atoms
         )
     return logits
 
