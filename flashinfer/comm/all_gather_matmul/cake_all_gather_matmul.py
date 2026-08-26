@@ -838,8 +838,9 @@ def _run_cake_validated(
                 workspace = _WORKSPACES.get(workspace_key)
             if workspace is None:
                 # Symmetric allocation and rendezvous are host operations, so
-                # a stream dependency cannot order them after the prior launch.
+                # a stream dependency cannot order them after queued caller work.
                 # Wait only on a cache miss; steady-state launches stay async.
+                torch.cuda.current_stream(device_index).synchronize()
                 if state.tail_event is not None:
                     state.tail_event.synchronize()
                 with _CACHE_LOCK:

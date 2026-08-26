@@ -464,6 +464,9 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
     class FakeStream:
         cuda_stream = 17
 
+        def synchronize(self):
+            lifecycle.append("current-sync")
+
         def wait_event(self, event):
             pass
 
@@ -551,8 +554,10 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
     assert weight_streams == [main_stream, main_stream]
     assert descriptor_streams == [main_stream, main_stream]
     assert lifecycle == [
+        "current-sync",
         "workspace",
         "tail-record",
+        "current-sync",
         "tail-sync",
         "workspace",
         "tail-record",
