@@ -1116,6 +1116,117 @@ def test_bt16_route_policy_matches_measured_crossovers(
     )
 
 
+def test_uniform_piece_bins_cover_tasks_and_match_h96_h64_bounds():
+    for num_heads, expected_handoffs, expected_max in (
+        (96, 32, 167),
+        (64, 56, 112),
+    ):
+        (
+            tasks,
+            offsets,
+            token_starts,
+            token_counts,
+            sources,
+            destinations,
+            handoff_count,
+            loads,
+        ) = kda_prefill_api._make_uniform_piece_task_bins(
+            num_sequences=8,
+            num_heads=num_heads,
+            sequence_length=1024,
+            worker_count=152,
+        )
+        assert len(offsets) == 153
+        assert len(tasks) == len(token_starts) == len(token_counts)
+        assert len(tasks) == len(sources) == len(destinations)
+        assert handoff_count == expected_handoffs
+        assert max(loads) == expected_max
+        assert sum(loads) == 8 * num_heads * 32
+
+        produced = sorted(value for value in destinations if value >= 0)
+        consumed = sorted(value for value in sources if value >= 0)
+        assert produced == consumed == list(range(handoff_count))
+        coverage = {}
+        for task, start, count in zip(tasks, token_starts, token_counts, strict=True):
+            coverage.setdefault(task, []).append((start, start + count))
+        assert set(coverage) == set(range(8 * num_heads))
+        for intervals in coverage.values():
+            ordered = sorted(intervals)
+            assert ordered[0][0] == 0
+            assert ordered[-1][1] == 1024
+            assert all(
+                left[1] == right[0]
+                for left, right in zip(ordered, ordered[1:], strict=False)
+            )
+
+
+def test_uniform_piece_policy_uses_occupancy_and_dependency_dag():
+    common = {
+        "compute_capability": (10, 3),
+        "sm_count": 152,
+        "num_sequences": 8,
+        "uniform_sequences": True,
+        "max_sequence_length": 1024,
+    }
+    for num_heads in (60, 64, 96, 104):
+        estimate = kda_prefill_api._persistent_m128_roofline(
+            compute_capability=common["compute_capability"],
+            sm_count=common["sm_count"],
+            num_sequences=common["num_sequences"],
+            num_heads=num_heads,
+            sequence_length=common["max_sequence_length"],
+            use_initial_state=True,
+            store_final_state=True,
+        )
+        assert estimate is not None
+        assert estimate.resident_ctas_per_sm == 1
+        assert estimate.worker_count == common["sm_count"]
+        assert estimate.handoff_count > 0
+        assert estimate.piece_ns < estimate.direct_ns
+        assert kda_prefill_api._should_use_uniform_piece_persistent(
+            num_heads=num_heads,
+            **common,
+        )
+        assert (
+            kda_prefill_api._select_flash_kda_bf16_route(
+                fixed_layout=False,
+                num_heads=num_heads,
+                **common,
+            )
+            == "piece_persistent_m128"
+        )
+
+    assert kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96,
+        **(common | {"compute_capability": (10, 0), "sm_count": 148}),
+    )
+    assert not kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96, **(common | {"num_sequences": 4})
+    )
+    assert not kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96, **(common | {"sm_count": 149})
+    )
+    assert kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96, **(common | {"max_sequence_length": 992})
+    )
+    assert not kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96, **(common | {"max_sequence_length": 32})
+    )
+    assert not kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=48, **common
+    )
+    assert not kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96, **(common | {"uniform_sequences": False})
+    )
+    assert kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96, **(common | {"num_sequences": 16})
+    )
+    for num_sequences in (32, 64):
+        assert not kda_prefill_api._should_use_uniform_piece_persistent(
+            num_heads=96, **(common | {"num_sequences": num_sequences})
+        )
+
+
 def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
     assert (
         kda_prefill_api._direct_m128_route(num_heads=64, max_sequence_length=16)
@@ -1959,6 +2070,207 @@ def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
     assert args[15].shape == (768,)
     assert args[16] == 1
     assert args[17] == 96
+
+
+def test_uniform_piece_prefill_reaches_extended_worker_abi(
+    cuda_device,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: (10, 3),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_is_cuda_version_at_least",
+        lambda version: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_device_sm_count",
+        lambda device: 152,
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_uniform_piece_persistent",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_persistent_m128_roofline",
+        lambda **kwargs: SimpleNamespace(
+            worker_count=152,
+            piece_ns=1.0,
+            direct_ns=2.0,
+        ),
+    )
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(
+        seq_lens=[64] * 8,
+        num_heads=96,
+        packed=True,
+        initial_state=True,
+    )
+    output, state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        backend="cake",
+    )
+
+    assert output.shape == inputs["q"].shape
+    assert state is None
+    assert routes == [("piece_persistent_m128", "sm100f")]
+    (args,) = module.calls
+    assert len(args) == 29
+    assert args[9].tolist() == list(range(8))
+    assert args[10].numel() > 8 * 96
+    assert args[11].numel() == 153
+    assert args[10].numel() == args[12].numel() == args[13].numel()
+    assert args[10].numel() == args[14].numel() == args[15].numel()
+    assert args[16].shape[1:] == (128, 128)
+    assert args[17].dtype == torch.uint32
+    assert args[16].shape[0] == args[17].numel()
+    assert args[21].dtype == torch.uint8
+    assert args[21].shape == (768,)
+    assert args[22] == 1
+    assert args[23] == 96
+
+
+def test_explicit_workspace_keeps_uniform_piece_candidate_on_direct_abi(
+    cuda_device,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: (10, 3),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_is_cuda_version_at_least",
+        lambda version: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_device_sm_count",
+        lambda device: 152,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_uniform_piece_persistent",
+        lambda **kwargs: True,
+    )
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(
+        seq_lens=[64] * 8,
+        num_heads=96,
+        packed=True,
+        initial_state=True,
+    )
+    workspace = RecurrentKDAPrefillWorkspace(cuda_device)
+    recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        prefill_workspace=workspace,
+        backend="cake",
+    )
+
+    assert routes == [("m128", "sm100f")]
+    assert len(module.calls[0]) == 28
+
+
+@pytest.mark.parametrize("num_heads", [40, 64, 96])
+def test_frozen_uniform_piece_prefill_repeats_and_matches_direct_control(
+    flash_kda_device,
+    monkeypatch,
+    num_heads,
+):
+    inputs = _make_inputs(
+        seq_lens=[1024] * 8,
+        num_heads=num_heads,
+        packed=True,
+        initial_state=True,
+        seed=102400 + num_heads,
+    )
+    initial_state_seed = inputs["initial_state"].clone()
+    routes = []
+    get_module = kda_prefill_api._get_flash_kda_prefill_module
+
+    def recording_get_module(variant, target):
+        routes.append((variant, target))
+        return get_module(variant, target)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        recording_get_module,
+    )
+
+    piece_results = []
+    for _ in range(2):
+        inputs["initial_state"].copy_(initial_state_seed)
+        piece_output, piece_state = recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=torch.empty_like(inputs["q"]),
+            output_final_state=True,
+            backend="cake",
+        )
+        piece_results.append((piece_output.clone(), piece_state.clone()))
+
+    stream_workspace = kda_prefill_api._get_stream_workspace(flash_kda_device)
+    assert stream_workspace._piece_mid_state_ready is not None
+    assert not torch.count_nonzero(stream_workspace._piece_mid_state_ready).item()
+
+    inputs["initial_state"].copy_(initial_state_seed)
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_uniform_piece_persistent",
+        lambda **kwargs: False,
+    )
+    direct_output, direct_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        seq_order=torch.arange(8, dtype=torch.int32, device=flash_kda_device),
+        backend="cake",
+    )
+
+    expected_target = kda_prefill_api._select_flash_kda_prefill_target(flash_kda_device)
+    direct_variant = (
+        "m128_tensor_state_decay"
+        if get_compute_capability(flash_kda_device) == (10, 3) and num_heads >= 64
+        else "m128"
+    )
+    assert routes == [
+        ("piece_persistent_m128", expected_target),
+        ("piece_persistent_m128", expected_target),
+        (direct_variant, expected_target),
+    ]
+    for piece_output, piece_state in piece_results:
+        torch.testing.assert_close(
+            piece_output.float(), direct_output.float(), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            piece_state.float(), direct_state.float(), atol=1e-2, rtol=1e-2
+        )
+    assert torch.equal(piece_results[0][0], piece_results[1][0])
+    assert torch.equal(piece_results[0][1], piece_results[1][1])
 
 
 def test_explicit_seq_order_keeps_direct_worker_and_reaches_ffi(
