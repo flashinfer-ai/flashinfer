@@ -25,6 +25,22 @@ import torch
 from flashinfer.tllm_enums import ActivationType, Fp8QuantizationType, WeightLayout
 
 
+_expert_scale_ones: dict[tuple[torch.device, int], torch.Tensor] = {}
+
+
+def _get_expert_scale_ones(
+    num_experts: int, device: torch.device
+) -> torch.Tensor:
+    """Return the immutable per-expert unit scales shared by MoE launches."""
+
+    key = (torch.device(device), int(num_experts))
+    scales = _expert_scale_ones.get(key)
+    if scales is None:
+        scales = torch.ones(key[1], dtype=torch.float32, device=key[0])
+        _expert_scale_ones[key] = scales
+    return scales
+
+
 def _is_gated_activation(activation_type: int) -> bool:
     return ActivationType(int(activation_type)).is_gated
 
@@ -1506,9 +1522,7 @@ def build_fp8_block_scale_launch_io(
     data_dtype = cutlass.Float8E4M3FN
     sf_dtype = cutlass.Float32 if is_deepseek else cutlass.Float8E8M0FNU
     dummy_data_ptr = output_buf.data_ptr()
-    global_scale = torch.ones(
-        int(num_experts), dtype=torch.float32, device=hidden_states.device
-    )
+    global_scale = _get_expert_scale_ones(num_experts, hidden_states.device)
     selected_bias = _select_bias(
         fc=fc,
         cfg=cfg,

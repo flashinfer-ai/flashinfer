@@ -1899,8 +1899,11 @@ class StagedMoeLauncher : public FusedMoeLauncher {
       // mode; Python substitutes the caller tensor for downstream use.
       workspace.expert_weights = const_cast<void*>(expert_weights.data_ptr());
     } else {
-      auto ew_dtype =
-          mRoutingLogitsDtype == btg::Dtype::Fp32 ? dl_float32 : expert_weight_storage_dtype();
+      // Routing output weights have their own fixed ABI and do not inherit the
+      // logits dtype. In particular, DeepSeekV3 accepts FP32 logits but emits
+      // BF16 weights; allocating this buffer as FP32 mislabels packed BF16 data
+      // and makes the staged finalize path consume the wrong values.
+      auto ew_dtype = expert_weight_storage_dtype();
       FusedMoeLauncher::expert_weights =
           alloc_tensor({args->num_tokens, args->top_k}, ew_dtype, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();

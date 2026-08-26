@@ -2230,16 +2230,8 @@ class PrimsTsFp8BlockScaleMoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
 
         torch_stream = torch.cuda.current_stream(device=hidden_states.device)
         stream = cuda_drv.CUstream(torch_stream.cuda_stream)
-        routing_logits_for_routing = moe_inputs.routing_logits
-        if (
-            routing_logits_for_routing is not None
-            and routing_logits_for_routing.dtype == torch.float32
-            and int(kwargs["routing_method_type"]) == int(RoutingMethodType.DeepSeekV3)
-        ):
-            routing_logits_for_routing = routing_logits_for_routing.to(torch.bfloat16)
-
         routing_out = self.moe_op.trtllm_moe_run_routing_fp8_block_scale(
-            routing_logits_for_routing,
+            moe_inputs.routing_logits,
             kwargs["routing_bias"],
             moe_inputs.topk_ids,
             moe_inputs.expert_weights,

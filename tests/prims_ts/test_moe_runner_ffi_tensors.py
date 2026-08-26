@@ -22,6 +22,7 @@ from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs, RoutingInputMode
 from flashinfer.fused_moe.shared.tuning import moe_topk_ids_init
 from flashinfer.fused_moe.backends.prims_ts import bf16_op, fp4_op, fp8_op
 from flashinfer.prims_ts.moe import runner as runner_module
+from flashinfer.prims_ts.moe.tensor_adapter import _get_expert_scale_ones
 from flashinfer.prims_ts.moe.runner import (
     PrimsTsBf16MoERunner,
     _moe_topk_ids_init_for_routing,
@@ -75,6 +76,14 @@ def test_torch_tensor_is_preserved():
 
 def test_optional_ffi_tensor_is_preserved():
     assert _torch_views_of_ffi_tensors([None]) == [None]
+
+
+def test_expert_unit_scales_are_reused():
+    first = _get_expert_scale_ones(7, torch.device("cpu"))
+    second = _get_expert_scale_ones(7, torch.device("cpu"))
+
+    assert first is second
+    torch.testing.assert_close(first, torch.ones(7))
 
 
 def test_ffi_tensor_can_be_converted_repeatedly():
