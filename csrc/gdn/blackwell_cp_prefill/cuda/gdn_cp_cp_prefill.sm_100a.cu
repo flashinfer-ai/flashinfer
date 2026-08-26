@@ -90,7 +90,7 @@ __device__ __forceinline__ void mma_ts_step(
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) void
-kernel_flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap T, const __grid_constant__ CUtensorMap O, float* __restrict__ alpha, long long* __restrict__ cu_seqlens, float* __restrict__ fixed_state, float* __restrict__ initial_state_workspace, uint8_t* __restrict__ tensormap_workspace, int cp_chunk_len, int source_cp_chunk_len, int num_q_heads, int num_k_heads, int num_v_heads, int num_sab_heads, float scale)
+kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap T, const __grid_constant__ CUtensorMap O, float* __restrict__ alpha, long long* __restrict__ cu_seqlens, float* __restrict__ fixed_state, float* __restrict__ initial_state_workspace, uint8_t* __restrict__ tensormap_workspace, int cp_chunk_len, int source_cp_chunk_len, int num_q_heads, int num_k_heads, int num_v_heads, int num_sab_heads, float scale)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -343,9 +343,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1(const __grid_cons
                     }
                     int source_block_end_cg0 = chunk_start - (int)cu_seqlens[blockIdx.y] + block_cg0 * 64 + valid_tokens_cg0;
                     int source_chunk_end_cg0 = (source_block_end_cg0 + source_cp_chunk_len - 1) / source_cp_chunk_len * source_cp_chunk_len;
-                    int source_final_block_cg0 = ((source_block_end_cg0 == source_chunk_end_cg0 || source_block_end_cg0 >= (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) ? 1 : 0);
+                    int source_final_block_cg0 = ((valid_tokens_cg0 == 64 && source_block_end_cg0 == (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) ? 1 : 0);
                     {
-                        source_final_block_cg0 = 0;
                     }
                     mbarrier_wait(load_gate_full_addr + (gate_stage_cg0) * 8, gate_phase_cg0);
                     mbarrier_wait(load_t_full_addr + (t_stage_cg0) * 8, t_phase_cg0);
@@ -637,9 +636,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1(const __grid_cons
                     }
                     int source_block_end_cg1 = chunk_start_1 - (int)cu_seqlens[blockIdx.y] + block_cg1 * 64 + valid_tokens_cg1;
                     int source_chunk_end_cg1 = (source_block_end_cg1 + source_cp_chunk_len - 1) / source_cp_chunk_len * source_cp_chunk_len;
-                    int source_final_block_cg1 = ((valid_tokens_cg1 == 64 && (source_block_end_cg1 == source_chunk_end_cg1 || source_block_end_cg1 >= (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y])) ? 1 : 0);
+                    int source_final_block_cg1 = ((valid_tokens_cg1 == 64 && source_block_end_cg1 == (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) ? 1 : 0);
                     {
-                        source_final_block_cg1 = 0;
                     }
                     mbarrier_wait(load_gate_full_addr + (gate_stage_cg1) * 8, gate_phase_cg1);
                     int gate_base_cg1 = gate_stage_cg1 * 64;
@@ -1274,9 +1272,9 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_equal_head_v1(const __grid_cons
             unsigned int _phase_load_t_empty = 1;
             unsigned int _phase_load_v_empty = 1;
             if (blockIdx.x / num_sab_heads < ((int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y] + cp_chunk_len - 1) / cp_chunk_len) {
-                int q_head = sab_head_3;
-                int k_head = sab_head_3;
-                int v_head = sab_head_3;
+                int q_head = sab_head_3 * num_q_heads / num_sab_heads;
+                int k_head = sab_head_3 * num_k_heads / num_sab_heads;
+                int v_head = sab_head_3 * num_v_heads / num_sab_heads;
                 unsigned int q_stage = 0;
                 unsigned int k_stage = 0;
                 unsigned int v_stage = 0;

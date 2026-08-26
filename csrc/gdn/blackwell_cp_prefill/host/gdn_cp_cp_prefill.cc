@@ -29,9 +29,9 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_final_v1_bad9d3995c);
+TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_final_v1_8e5d7c65b5);
 
-namespace gdn_cp_host_shim_6e18802e2713e32e {
+namespace gdn_cp_host_shim_08cab7c176abc813 {
 
 using tvm::ffi::TensorView;
 
@@ -261,9 +261,6 @@ inline CUtensorMap EncodeTma_Q(const TensorView& t) {
   int64_t d3 = t.size(t.ndim() - 3);
   TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
       << "TMA source 'Q' trailing dims must be positive";
-  int64_t s2 = TmaCheckedMul(t.stride(t.ndim() - 2), 1);
-  TVM_FFI_CHECK(s2 > 0, ValueError)
-      << "TMA source 'Q' physical strides must be positive";
   int64_t s3 = TmaCheckedMul(t.stride(t.ndim() - 3), 1);
   TVM_FFI_CHECK(s3 > 0, ValueError)
       << "TMA source 'Q' physical strides must be positive";
@@ -276,7 +273,7 @@ inline CUtensorMap EncodeTma_Q(const TensorView& t) {
   uint64_t global_strides[3] = {
       TmaGlobalStrideBytes(s3, 16),
       TmaGlobalStrideBytes(64, 16),
-      TmaGlobalStrideBytes(s2, 16),
+      TmaGlobalStrideBytes(d1, 16),
   };
   uint32_t box_dim[4] = {64u, 64u, 2u, 1u};
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
@@ -302,9 +299,6 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
   int64_t d3 = t.size(t.ndim() - 3);
   TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
       << "TMA source 'K' trailing dims must be positive";
-  int64_t s2 = TmaCheckedMul(t.stride(t.ndim() - 2), 1);
-  TVM_FFI_CHECK(s2 > 0, ValueError)
-      << "TMA source 'K' physical strides must be positive";
   int64_t s3 = TmaCheckedMul(t.stride(t.ndim() - 3), 1);
   TVM_FFI_CHECK(s3 > 0, ValueError)
       << "TMA source 'K' physical strides must be positive";
@@ -317,7 +311,7 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
   uint64_t global_strides[3] = {
       TmaGlobalStrideBytes(s3, 16),
       TmaGlobalStrideBytes(64, 16),
-      TmaGlobalStrideBytes(s2, 16),
+      TmaGlobalStrideBytes(d1, 16),
   };
   uint32_t box_dim[4] = {64u, 64u, 2u, 1u};
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
@@ -343,9 +337,6 @@ inline CUtensorMap EncodeTma_V(const TensorView& t) {
   int64_t d3 = t.size(t.ndim() - 3);
   TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
       << "TMA source 'V' trailing dims must be positive";
-  int64_t s2 = TmaCheckedMul(t.stride(t.ndim() - 2), 1);
-  TVM_FFI_CHECK(s2 > 0, ValueError)
-      << "TMA source 'V' physical strides must be positive";
   int64_t s3 = TmaCheckedMul(t.stride(t.ndim() - 3), 1);
   TVM_FFI_CHECK(s3 > 0, ValueError)
       << "TMA source 'V' physical strides must be positive";
@@ -358,7 +349,7 @@ inline CUtensorMap EncodeTma_V(const TensorView& t) {
   uint64_t global_strides[3] = {
       TmaGlobalStrideBytes(s3, 16),
       TmaGlobalStrideBytes(64, 16),
-      TmaGlobalStrideBytes(s2, 16),
+      TmaGlobalStrideBytes(d1, 16),
   };
   uint32_t box_dim[4] = {64u, 64u, 2u, 1u};
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
@@ -423,9 +414,6 @@ inline CUtensorMap EncodeTma_O(const TensorView& t) {
   int64_t d3 = t.size(t.ndim() - 3);
   TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
       << "TMA source 'O' trailing dims must be positive";
-  int64_t s2 = TmaCheckedMul(t.stride(t.ndim() - 2), 1);
-  TVM_FFI_CHECK(s2 > 0, ValueError)
-      << "TMA source 'O' physical strides must be positive";
   int64_t s3 = TmaCheckedMul(t.stride(t.ndim() - 3), 1);
   TVM_FFI_CHECK(s3 > 0, ValueError)
       << "TMA source 'O' physical strides must be positive";
@@ -438,7 +426,7 @@ inline CUtensorMap EncodeTma_O(const TensorView& t) {
   uint64_t global_strides[3] = {
       TmaGlobalStrideBytes(s3, 16),
       TmaGlobalStrideBytes(64, 16),
-      TmaGlobalStrideBytes(s2, 16),
+      TmaGlobalStrideBytes(d1, 16),
   };
   uint32_t box_dim[4] = {64u, 64u, 2u, 1u};
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
@@ -455,14 +443,18 @@ inline CUtensorMap EncodeTma_O(const TensorView& t) {
 void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_T, TensorView arg_O, TensorView arg_alpha, TensorView arg_cu_seqlens, TensorView arg_fixed_state, TensorView arg_initial_state_workspace, TensorView arg_tensormap_workspace, int64_t arg_cp_chunk_len, int64_t arg_source_cp_chunk_len, int64_t arg_num_q_heads, int64_t arg_num_k_heads, int64_t arg_num_v_heads, int64_t arg_num_sab_heads, double arg_scale, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   CheckCudaTensor(arg_Q, "Q");
   CheckDtype(arg_Q, "Q", 2, 16, 1);
+  CheckContiguous(arg_Q, "Q");
   CheckCudaTensor(arg_K, "K");
   CheckDtype(arg_K, "K", 2, 16, 1);
+  CheckContiguous(arg_K, "K");
   CheckCudaTensor(arg_V, "V");
   CheckDtype(arg_V, "V", 2, 16, 1);
+  CheckContiguous(arg_V, "V");
   CheckCudaTensor(arg_T, "T");
   CheckDtype(arg_T, "T", 2, 16, 1);
   CheckCudaTensor(arg_O, "O");
   CheckDtype(arg_O, "O", 2, 16, 1);
+  CheckContiguous(arg_O, "O");
   CheckCudaTensor(arg_alpha, "alpha");
   CheckDtype(arg_alpha, "alpha", 2, 32, 1);
   CheckContiguous(arg_alpha, "alpha");
@@ -531,7 +523,7 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_T,
   float v_scale = (float)arg_scale;
   void* kargs[] = {&p_Q, &p_K, &p_V, &p_T, &p_O, &p_alpha, &p_cu_seqlens, &p_fixed_state, &p_initial_state_workspace, &p_tensormap_workspace, &v_cp_chunk_len, &v_source_cp_chunk_len, &v_num_q_heads, &v_num_k_heads, &v_num_v_heads, &v_num_sab_heads, &v_scale};
 
-  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_cp_prefill_final_v1_bad9d3995c::Global()->mod.GetKernel("kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1");
+  static auto kernel = EmbedCubinModule_flashinfer_blackwell_gdn_cp_prefill_final_v1_8e5d7c65b5::Global()->mod.GetKernel("kernel_flashinfer_blackwell_gdn_cp_prefill_final_v1");
   static signed char gdn_cp_smem_mode_cache[64] = {0};
   const bool use_oversized_smem = GDNCPConfigureDynamicSmem(
       kernel, (int)arg_Q.device().device_id, 224768,
@@ -544,7 +536,7 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_V, TensorView arg_T,
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.Launch(kargs, grid, block, stream, 224768u));
 }
 
-}  // namespace gdn_cp_host_shim_6e18802e2713e32e
+}  // namespace gdn_cp_host_shim_08cab7c176abc813
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_cp_prefill, gdn_cp_host_shim_6e18802e2713e32e::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_cp_prefill, gdn_cp_host_shim_08cab7c176abc813::Run);
 // clang-format on

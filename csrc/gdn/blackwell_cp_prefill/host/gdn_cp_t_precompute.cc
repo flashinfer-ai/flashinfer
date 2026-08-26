@@ -29,9 +29,9 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_9de88209a3);
+TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_bc2b9a20a9);
 
-namespace gdn_cp_host_shim_72a0999bedf75589 {
+namespace gdn_cp_host_shim_01e4392856bfb201 {
 
 using tvm::ffi::TensorView;
 
@@ -261,9 +261,6 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
   int64_t d3 = t.size(t.ndim() - 3);
   TVM_FFI_CHECK(d1 > 0 && d2 > 0 && d3 > 0, ValueError)
       << "TMA source 'K' trailing dims must be positive";
-  int64_t s2 = TmaCheckedMul(t.stride(t.ndim() - 2), 1);
-  TVM_FFI_CHECK(s2 > 0, ValueError)
-      << "TMA source 'K' physical strides must be positive";
   int64_t s3 = TmaCheckedMul(t.stride(t.ndim() - 3), 1);
   TVM_FFI_CHECK(s3 > 0, ValueError)
       << "TMA source 'K' physical strides must be positive";
@@ -276,7 +273,7 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
   uint64_t global_strides[3] = {
       TmaGlobalStrideBytes(s3, 16),
       TmaGlobalStrideBytes(64, 16),
-      TmaGlobalStrideBytes(s2, 16),
+      TmaGlobalStrideBytes(d1, 16),
   };
   uint32_t box_dim[4] = {64u, 64u, 2u, 1u};
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
@@ -293,6 +290,7 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
 void Run(TensorView arg_K, TensorView arg_beta, TensorView arg_t, TensorView arg_cu_seqlens, int64_t arg_num_k_heads, int64_t arg_num_sab_heads, int64_t arg_total_t_blocks, int64_t arg_num_seqs, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   CheckCudaTensor(arg_K, "K");
   CheckDtype(arg_K, "K", 2, 16, 1);
+  CheckContiguous(arg_K, "K");
   CheckCudaTensor(arg_beta, "beta");
   CheckDtype(arg_beta, "beta", 2, 32, 1);
   CheckContiguous(arg_beta, "beta");
@@ -334,14 +332,14 @@ void Run(TensorView arg_K, TensorView arg_beta, TensorView arg_t, TensorView arg
   int32_t v_num_seqs = (int32_t)arg_num_seqs;
   void* kargs[] = {&p_K, &p_beta, &p_t, &p_cu_seqlens, &v_num_k_heads, &v_num_sab_heads, &v_total_t_blocks, &v_num_seqs};
 
-  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_9de88209a3, "kernel_flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1");
+  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1_bc2b9a20a9, "kernel_flashinfer_blackwell_gdn_cp_prefill_t_precompute_v1");
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(128u, 1u, 1u);
 
   TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(kernel.Launch(kargs, grid, block, stream, 25856u));
 }
 
-}  // namespace gdn_cp_host_shim_72a0999bedf75589
+}  // namespace gdn_cp_host_shim_01e4392856bfb201
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_t_precompute, gdn_cp_host_shim_72a0999bedf75589::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_t_precompute, gdn_cp_host_shim_01e4392856bfb201::Run);
 // clang-format on

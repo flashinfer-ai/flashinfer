@@ -350,10 +350,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                     }
                     int source_block_end_cg0 = chunk_start - (int)cu_seqlens[blockIdx.y] + block_cg0 * 64 + valid_tokens_cg0;
                     int source_chunk_end_cg0 = (source_block_end_cg0 + source_cp_chunk_len - 1) / source_cp_chunk_len * source_cp_chunk_len;
-                    int source_final_block_cg0 = ((source_block_end_cg0 == source_chunk_end_cg0 || source_block_end_cg0 >= (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) ? 1 : 0);
-                    {
-                        source_final_block_cg0 = ((((int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) % source_cp_chunk_len == 0 && source_block_end_cg0 == source_chunk_end_cg0) ? 1 : 0);
-                    }
+                    int source_final_block_cg0 = ((valid_tokens_cg0 == 64 && source_block_end_cg0 == (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) ? 1 : 0);
                     {
                         source_final_block_cg0 = 0;
                     }
@@ -690,10 +687,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_bf16_v1(const __grid_co
                     }
                     int source_block_end_cg1 = chunk_start_1 - (int)cu_seqlens[blockIdx.y] + block_cg1 * 64 + valid_tokens_cg1;
                     int source_chunk_end_cg1 = (source_block_end_cg1 + source_cp_chunk_len - 1) / source_cp_chunk_len * source_cp_chunk_len;
-                    int source_final_block_cg1 = ((valid_tokens_cg1 == 64 && (source_block_end_cg1 == source_chunk_end_cg1 || source_block_end_cg1 >= (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y])) ? 1 : 0);
-                    {
-                        source_final_block_cg1 = ((valid_tokens_cg1 == 64 && ((int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) % source_cp_chunk_len == 0 && source_block_end_cg1 == source_chunk_end_cg1) ? 1 : 0);
-                    }
+                    int source_final_block_cg1 = ((valid_tokens_cg1 == 64 && source_block_end_cg1 == (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) ? 1 : 0);
                     {
                         source_final_block_cg1 = 0;
                     }

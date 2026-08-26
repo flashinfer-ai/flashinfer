@@ -90,7 +90,7 @@ __device__ __forceinline__ void mma_ts_step(
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) void
-kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap T, const __grid_constant__ CUtensorMap O, float* __restrict__ alpha, long long* __restrict__ cu_seqlens, float* __restrict__ fixed_state, float* __restrict__ initial_state_workspace, uint8_t* __restrict__ tensormap_workspace, int cp_chunk_len, int source_cp_chunk_len, int num_q_heads, int num_k_heads, int num_v_heads, int num_sab_heads, float scale)
+kernel_flashinfer_blackwell_gdn_cp_prefill_final_bf16_v1(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap T, const __grid_constant__ CUtensorMap O, float* __restrict__ alpha, long long* __restrict__ cu_seqlens, float* __restrict__ fixed_state, float* __restrict__ initial_state_workspace, uint8_t* __restrict__ tensormap_workspace, int cp_chunk_len, int source_cp_chunk_len, int num_q_heads, int num_k_heads, int num_v_heads, int num_sab_heads, float scale)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -104,27 +104,27 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
     const int num_bids = gridDim.x;
 
     // Kernel setup ops
-    __half* smem_q = reinterpret_cast<__half*>(smem_raw + 1024);
+    __nv_bfloat16* smem_q = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
-    __half* smem_k = reinterpret_cast<__half*>(smem_raw + 33792);
+    __nv_bfloat16* smem_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
     const int smem_k_addr = smem + 33792;
-    __half* smem_v = reinterpret_cast<__half*>(smem_raw + 82944);
+    __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + 82944);
     const int smem_v_addr = smem + 82944;
-    __half* smem_t = reinterpret_cast<__half*>(smem_raw + 132096);
+    __nv_bfloat16* smem_t = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
     const int smem_t_addr = smem + 132096;
-    __half* smem_ainv = reinterpret_cast<__half*>(smem_raw + 148480);
+    __nv_bfloat16* smem_ainv = reinterpret_cast<__nv_bfloat16*>(smem_raw + 148480);
     const int smem_ainv_addr = smem + 148480;
-    __half* smem_qk = reinterpret_cast<__half*>(smem_raw + 173056);
+    __nv_bfloat16* smem_qk = reinterpret_cast<__nv_bfloat16*>(smem_raw + 173056);
     const int smem_qk_addr = smem + 173056;
-    __half* smem_o = reinterpret_cast<__half*>(smem_raw + 189440);
+    __nv_bfloat16* smem_o = reinterpret_cast<__nv_bfloat16*>(smem_raw + 189440);
     const int smem_o_addr = smem + 189440;
-    __half* smem_qk_residual = reinterpret_cast<__half*>(smem_raw + 189440);
+    __nv_bfloat16* smem_qk_residual = reinterpret_cast<__nv_bfloat16*>(smem_raw + 189440);
     const int smem_qk_residual_addr = smem + 189440;
     float* smem_cumsumlog = reinterpret_cast<float*>(smem_raw + 222208);
     const int smem_cumsumlog_addr = smem + 222208;
     float* smem_cumprod = reinterpret_cast<float*>(smem_raw + 223488);
     const int smem_cumprod_addr = smem + 223488;
-    __half* smem_k_trans = reinterpret_cast<__half*>(smem_raw + 33792);
+    __nv_bfloat16* smem_k_trans = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
     const int smem_k_trans_addr = smem + 33792;
 
     // Mbarrier init (29 groups, 59 barriers)
@@ -340,17 +340,10 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                 for (int block_cg0 = 0; block_cg0 < num_padded_blocks; block_cg0++) {
                     int valid_tokens_cg0 = 64;
                     {
-                        valid_tokens_cg0 = chunk_end - (chunk_start + block_cg0 * 64);
-                        if (valid_tokens_cg0 > 64) {
-                            valid_tokens_cg0 = 64;
-                        }
-                        if (valid_tokens_cg0 < 0) {
-                            valid_tokens_cg0 = 0;
-                        }
                     }
                     int source_block_end_cg0 = chunk_start - (int)cu_seqlens[blockIdx.y] + block_cg0 * 64 + valid_tokens_cg0;
                     int source_chunk_end_cg0 = (source_block_end_cg0 + source_cp_chunk_len - 1) / source_cp_chunk_len * source_cp_chunk_len;
-                    int source_final_block_cg0 = ((source_block_end_cg0 == source_chunk_end_cg0 || source_block_end_cg0 >= (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) ? 1 : 0);
+                    int source_final_block_cg0 = ((valid_tokens_cg0 == 64 && source_block_end_cg0 == (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) ? 1 : 0);
                     {
                         source_final_block_cg0 = 0;
                     }
@@ -384,14 +377,10 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                         for (int _pair = 0; _pair < 4; _pair++) {
                             asm volatile(
                                 "{\n\t"
-                                ".reg .b16 h_lo, h_hi;\n\t"
-                                ".reg .b32 f_lo, f_hi;\n\t"
-                                "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
                                 "}\n"
-                                : "=l"(*reinterpret_cast<unsigned long long*>(&t_bits_cg0_f32[_pair * 2]))
+                                : "=f"((&t_bits_cg0_f32[_pair * 2])[0]), "=f"((&t_bits_cg0_f32[_pair * 2])[1])
                                 : "r"(t_bits_cg0[_pair]));
                         }
                         {
@@ -420,12 +409,6 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                                                 float gamma_cg0 = 0.0f;
                                                 float symmetric_scale_cg0 = 0.0f;
                                                 t_valid_cg0 = ((t_col_cg0 >= t_row_cg0) ? 1 : 0);
-                                                if (block_cg0 >= num_valid_blocks - 1) {
-                                                    if (t_row_cg0 >= valid_tokens_cg0 || t_col_cg0 >= valid_tokens_cg0) {
-                                                        t_valid_cg0 = 0;
-                                                        gamma_cg0 = 0.0f;
-                                                    }
-                                                }
                                                 if (source_final_block_cg0 != 0) {
                                                     int final_t_threshold_cg0 = valid_tokens_cg0 - 33;
                                                     if (final_t_threshold_cg0 < 0) {
@@ -444,12 +427,6 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                                                 int qk_valid_cg0 = 0;
                                                 float qk_scale_cg0 = 0.0f;
                                                 qk_valid_cg0 = ((t_row_cg0 >= t_col_cg0) ? 1 : 0);
-                                                if (block_cg0 >= num_valid_blocks - 1) {
-                                                    if (t_row_cg0 >= valid_tokens_cg0 || t_col_cg0 >= valid_tokens_cg0) {
-                                                        qk_valid_cg0 = 0;
-                                                        qk_scale_cg0 = 0.0f;
-                                                    }
-                                                }
                                                 if (source_final_block_cg0 != 0) {
                                                     int final_qk_threshold_cg0 = valid_tokens_cg0 - 33;
                                                     if (final_qk_threshold_cg0 < 0) {
@@ -475,8 +452,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                         unsigned int t_signed_bits_cg0[4];
                         #pragma unroll
                         for (int _lp = 0; _lp < 4; _lp++) {
-                            __half2 _h2 = __float22half2_rn(make_float2(t_bits_cg0_f32[_lp*2 + 0], t_bits_cg0_f32[_lp*2+1 + 0]));
-                            t_signed_bits_cg0[_lp] = *(uint32_t*)&_h2;
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(t_bits_cg0_f32[_lp*2 + 0], t_bits_cg0_f32[_lp*2+1 + 0]));
+                            t_signed_bits_cg0[_lp] = *(uint32_t*)&_bf2;
                         }
                         int t_store_row_cg0 = t_col_tile_cg0 * 16 + (lane & 7) + (lane & 16) / 2;
                         int t_store_col_lane_cg0 = warp_cg0 * 16 + (lane & 8);
@@ -515,8 +492,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     unsigned int qk_bits_cg0[16];
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
-                        qk_bits_cg0[_lp] = *(uint32_t*)&_h2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_0[_lp*2 + 0], _tmem_load_0[_lp*2+1 + 0]));
+                        qk_bits_cg0[_lp] = *(uint32_t*)&_bf2;
                     }
                     unsigned int qk_residual_bits_cg0[16];
                     int qk_store_row_cg0 = qk_logical_row_base_cg0 + (lane & 7) + (lane & 8);
@@ -656,7 +633,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     }
                     int source_block_end_cg1 = chunk_start_1 - (int)cu_seqlens[blockIdx.y] + block_cg1 * 64 + valid_tokens_cg1;
                     int source_chunk_end_cg1 = (source_block_end_cg1 + source_cp_chunk_len - 1) / source_cp_chunk_len * source_cp_chunk_len;
-                    int source_final_block_cg1 = ((valid_tokens_cg1 == 64 && (source_block_end_cg1 == source_chunk_end_cg1 || source_block_end_cg1 >= (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y])) ? 1 : 0);
+                    int source_final_block_cg1 = ((valid_tokens_cg1 == 64 && source_block_end_cg1 == (int)cu_seqlens[blockIdx.y + 1] - (int)cu_seqlens[blockIdx.y]) ? 1 : 0);
                     {
                         source_final_block_cg1 = 0;
                     }
@@ -680,8 +657,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                         unsigned int state_input_bits_cg1[64];
                         #pragma unroll
                         for (int _lp = 0; _lp < 64; _lp++) {
-                            __half2 _h2 = __float22half2_rn(make_float2(state_values_cg1[_lp*2 + 0], state_values_cg1[_lp*2+1 + 0]));
-                            state_input_bits_cg1[_lp] = *(uint32_t*)&_h2;
+                            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_values_cg1[_lp*2 + 0], state_values_cg1[_lp*2+1 + 0]));
+                            state_input_bits_cg1[_lp] = *(uint32_t*)&_bf2;
                         }
                         #pragma unroll
                         for (int state_col_block_cg1_1 = 0; state_col_block_cg1_1 < 4; state_col_block_cg1_1++) {
@@ -783,13 +760,13 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     unsigned int ks_frag_hi_cg1_f16[16];
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __half2 _h2 = __float22half2_rn(make_float2(ks_frag_lo_cg1[_lp*2 + 0], ks_frag_lo_cg1[_lp*2+1 + 0]));
-                        ks_frag_lo_cg1_f16[_lp] = *(uint32_t*)&_h2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ks_frag_lo_cg1[_lp*2 + 0], ks_frag_lo_cg1[_lp*2+1 + 0]));
+                        ks_frag_lo_cg1_f16[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __half2 _h2 = __float22half2_rn(make_float2(ks_frag_hi_cg1[_lp*2 + 0], ks_frag_hi_cg1[_lp*2+1 + 0]));
-                        ks_frag_hi_cg1_f16[_lp] = *(uint32_t*)&_h2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(ks_frag_hi_cg1[_lp*2 + 0], ks_frag_hi_cg1[_lp*2+1 + 0]));
+                        ks_frag_hi_cg1_f16[_lp] = *(uint32_t*)&_bf2;
                     }
                     float qs_frag_early_cg1[32];
                     int qs_addr_early_cg1 = taddr + 128 + (unsigned int)tmem_row_base_cg1;
@@ -815,12 +792,12 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                                     vks_bits_lo_cg1[vks_pair_cg1] = v_frag_lo_cg1[vks_pair_cg1];
                                     vks_bits_hi_cg1[vks_pair_cg1] = v_frag_hi_cg1[vks_pair_cg1];
                                 } else {
-                                    uint32_t _f16x2_sub_0;
-                                    asm volatile("sub.rn.f16x2 %0, %1, %2;" : "=r"(_f16x2_sub_0) : "r"(v_frag_lo_cg1[vks_pair_cg1]), "r"(ks_frag_lo_cg1_f16[vks_pair_cg1]));
-                                    vks_bits_lo_cg1[vks_pair_cg1] = _f16x2_sub_0;
-                                    uint32_t _f16x2_sub_1;
-                                    asm volatile("sub.rn.f16x2 %0, %1, %2;" : "=r"(_f16x2_sub_1) : "r"(v_frag_hi_cg1[vks_pair_cg1]), "r"(ks_frag_hi_cg1_f16[vks_pair_cg1]));
-                                    vks_bits_hi_cg1[vks_pair_cg1] = _f16x2_sub_1;
+                                    uint32_t _bf16x2_sub_0;
+                                    asm volatile("sub.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_sub_0) : "r"(v_frag_lo_cg1[vks_pair_cg1]), "r"(ks_frag_lo_cg1_f16[vks_pair_cg1]));
+                                    vks_bits_lo_cg1[vks_pair_cg1] = _bf16x2_sub_0;
+                                    uint32_t _bf16x2_sub_1;
+                                    asm volatile("sub.rn.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_sub_1) : "r"(v_frag_hi_cg1[vks_pair_cg1]), "r"(ks_frag_hi_cg1_f16[vks_pair_cg1]));
+                                    vks_bits_hi_cg1[vks_pair_cg1] = _bf16x2_sub_1;
                                 }
                             }
                         }
@@ -973,13 +950,13 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     unsigned int nv_bits_hi_cg1[16];
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __half2 _h2 = __float22half2_rn(make_float2(nv_frag_lo_cg1[_lp*2 + 0], nv_frag_lo_cg1[_lp*2+1 + 0]));
-                        nv_bits_lo_cg1[_lp] = *(uint32_t*)&_h2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv_frag_lo_cg1[_lp*2 + 0], nv_frag_lo_cg1[_lp*2+1 + 0]));
+                        nv_bits_lo_cg1[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __half2 _h2 = __float22half2_rn(make_float2(nv_frag_hi_cg1[_lp*2 + 0], nv_frag_hi_cg1[_lp*2+1 + 0]));
-                        nv_bits_hi_cg1[_lp] = *(uint32_t*)&_h2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv_frag_hi_cg1[_lp*2 + 0], nv_frag_hi_cg1[_lp*2+1 + 0]));
+                        nv_bits_hi_cg1[_lp] = *(uint32_t*)&_bf2;
                     }
                     asm volatile(
                         "tcgen05.st.sync.aligned.16x128b.x8.b32"
@@ -1001,13 +978,13 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     unsigned int decay_bits_hi_cg1[16];
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __half2 _h2 = __float22half2_rn(make_float2(nv_frag_lo_cg1[_lp*2 + 0], nv_frag_lo_cg1[_lp*2+1 + 0]));
-                        decay_bits_lo_cg1[_lp] = *(uint32_t*)&_h2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv_frag_lo_cg1[_lp*2 + 0], nv_frag_lo_cg1[_lp*2+1 + 0]));
+                        decay_bits_lo_cg1[_lp] = *(uint32_t*)&_bf2;
                     }
                     #pragma unroll
                     for (int _lp = 0; _lp < 16; _lp++) {
-                        __half2 _h2 = __float22half2_rn(make_float2(nv_frag_hi_cg1[_lp*2 + 0], nv_frag_hi_cg1[_lp*2+1 + 0]));
-                        decay_bits_hi_cg1[_lp] = *(uint32_t*)&_h2;
+                        __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(nv_frag_hi_cg1[_lp*2 + 0], nv_frag_hi_cg1[_lp*2+1 + 0]));
+                        decay_bits_hi_cg1[_lp] = *(uint32_t*)&_bf2;
                     }
                     {
                         asm volatile(
@@ -1046,8 +1023,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                             unsigned int o_bits_cg1[16];
                             #pragma unroll
                             for (int _lp = 0; _lp < 16; _lp++) {
-                                __half2 _h2 = __float22half2_rn(make_float2(_tmem_load_3[_lp*2 + 0], _tmem_load_3[_lp*2+1 + 0]));
-                                o_bits_cg1[_lp] = *(uint32_t*)&_h2;
+                                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_tmem_load_3[_lp*2 + 0], _tmem_load_3[_lp*2+1 + 0]));
+                                o_bits_cg1[_lp] = *(uint32_t*)&_bf2;
                             }
                             #pragma unroll
                             for (int o_group_cg1 = 0; o_group_cg1 < 4; o_group_cg1++) {
@@ -1171,7 +1148,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     ""
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 68157456;\n\t"
+                    "mov.b32 id, 68158608;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
@@ -1322,9 +1299,6 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                         if (q_stage == 2) { q_stage = 0; _phase_load_q_empty ^= 1; }
                         int t_block = block_idx;
                         {
-                            if (num_valid_blocks_3 <= block_idx) {
-                                t_block = num_valid_blocks_3 - 1;
-                            }
                         }
                         mbarrier_wait(load_t_empty_addr + (t_stage) * 8, _phase_load_t_empty);
                         mbarrier_arrive_expect_tx(load_t_full_addr + (t_stage) * 8, 8192);
@@ -1439,7 +1413,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135266320;\n\t"
+                    "mov.b32 id, 135267472;\n\t"
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
@@ -1490,7 +1464,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135266320;\n\t"
+                    "mov.b32 id, 135267472;\n\t"
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
@@ -1547,7 +1521,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135266320;\n\t"
+                    "mov.b32 id, 135267472;\n\t"
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
@@ -1587,7 +1561,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 135266320;\n\t"
+                    "mov.b32 id, 135267472;\n\t"
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
@@ -1623,7 +1597,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 136380432;\n\t"
+                    "mov.b32 id, 136381584;\n\t"
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
@@ -1728,12 +1702,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                     float gate0 = 1.0f;
                     float gate1 = 1.0f;
                     {
-                        if (token0 < chunk_end_5) {
-                            gate0 = alpha[token0 * num_sab_heads + sab_head_5];
-                        }
-                        if (token1 < chunk_end_5) {
-                            gate1 = alpha[token1 * num_sab_heads + sab_head_5];
-                        }
+                        gate0 = alpha[token0 * num_sab_heads + sab_head_5];
+                        gate1 = alpha[token1 * num_sab_heads + sab_head_5];
                     }
                     float _log2_0;
                     asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(gate0 + 1e-10f));
@@ -1806,12 +1776,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                         float gate0_1 = 1.0f;
                         float gate1_1 = 1.0f;
                         {
-                            if (token0_1 < chunk_end_5) {
-                                gate0_1 = alpha[token0_1 * num_sab_heads + sab_head_5];
-                            }
-                            if (token1_1 < chunk_end_5) {
-                                gate1_1 = alpha[token1_1 * num_sab_heads + sab_head_5];
-                            }
+                            gate0_1 = alpha[token0_1 * num_sab_heads + sab_head_5];
+                            gate1_1 = alpha[token1_1 * num_sab_heads + sab_head_5];
                         }
                         float _log2_2;
                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_2) : "f"(gate0_1 + 1e-10f));
@@ -1886,12 +1852,8 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_generic_v1(const __grid_constan
                         float gate0_2 = 1.0f;
                         float gate1_2 = 1.0f;
                         {
-                            if (token0_2 < chunk_end_5) {
-                                gate0_2 = alpha[token0_2 * num_sab_heads + sab_head_5];
-                            }
-                            if (token1_2 < chunk_end_5) {
-                                gate1_2 = alpha[token1_2 * num_sab_heads + sab_head_5];
-                            }
+                            gate0_2 = alpha[token0_2 * num_sab_heads + sab_head_5];
+                            gate1_2 = alpha[token1_2 * num_sab_heads + sab_head_5];
                         }
                         float _log2_4;
                         asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_4) : "f"(gate0_2 + 1e-10f));
