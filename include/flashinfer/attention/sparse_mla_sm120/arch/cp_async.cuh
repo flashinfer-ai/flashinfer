@@ -90,6 +90,13 @@ __device__ __forceinline__ uint64_t create_l2_evict_first_policy() {
   return policy;
 }
 
+// Create L2 evict-last cache policy, for data reused across query tokens.
+__device__ __forceinline__ uint64_t create_l2_evict_last_policy() {
+  uint64_t policy;
+  asm volatile("createpolicy.fractional.L2::evict_last.b64 %0, 1.0;" : "=l"(policy));
+  return policy;
+}
+
 // Store 8 floats (256-bit) with L2::evict_last hint.
 // L2::evict_last requires .v8.b32 or .v4.b64 — 128-bit stores are not supported.
 __device__ __forceinline__ void store_8f_evict_last(float* addr, float4 v0, float4 v1) {

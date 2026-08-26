@@ -29,6 +29,7 @@
 #pragma once
 
 #include "../model/kv_cache_traits.cuh"
+#include "scale_mma.cuh"
 
 // Smem layout: constexpr offset computation for each buffer.
 // Parameterized by ModelType and ComputeMode.
@@ -207,6 +208,88 @@ struct SmemPtrsMG {
   }
   __device__ __forceinline__ uint64_t* mbar_kv(int i) const {
     return reinterpret_cast<uint64_t*>(base + LMG::OFF_MBAR_KV) + i;
+  }
+};
+
+// swapAB (warp specialized) tiling and layout: candidates on the MMA M axis and
+// heads on N, so one warp owns HEADS_PER_WARP heads and Q stays in registers.
+
+template <ModelType MT>
+struct ComputeTraitsSwapAB {
+  using KV = KVCacheTraits<MT>;
+
+  static constexpr int HEADS_PER_WARP = 8;
+  static constexpr int HEADS_PER_CTA = N_MATH_WARPS * HEADS_PER_WARP;  // 64
+  static constexpr int MTILES = BI / 16;                               // 4
+  static constexpr int NOPE_KSTEPS = KV::D_NOPE / 32;                  // 16
+  static constexpr int STEPS_PER_GRP = KV::QUANT_TILE / 32;            // 4
+  // Candidate M-tiles per QK pass: two independent MMA chains, bounded A live set.
+  static constexpr int MPASS = 2;
+  static constexpr int MPASSES = MTILES / MPASS;  // 2
+  // V dims per XV pass; sizes the V fragment, not the total MMA count.
+  static constexpr int V_CHUNK = 64;
+  static constexpr int N_V_CHUNKS = D_V / V_CHUNK;                 // 8
+  static constexpr int CHUNKS_PER_GRP = KV::QUANT_TILE / V_CHUNK;  // 2
+  static constexpr int XV_MTILES = V_CHUNK / 16;                   // 4
+  static constexpr int XV_KSTEPS = BI / 32;                        // 2
+  static constexpr int P_PASSES = WeightFp8PassTraits<KV::SCALE_FORMAT>::PASSES;
+
+  static_assert(KV::QUANT_TILE % V_CHUNK == 0, "a dequant group must cover whole V chunks");
+};
+
+template <ModelType MT>
+struct SmemLayoutSwapAB {
+  using KV = KVCacheTraits<MT>;
+  using CT = ComputeTraitsSwapAB<MT>;
+
+  static constexpr int KV_STRIDE = KV::KV_GMEM_STRIDE;          // 656
+  static constexpr int P_TILE_BYTES = CT::HEADS_PER_WARP * BI;  // 512
+
+  // nope + inline scales + rope, one linear tile per candidate.
+  static constexpr size_t SMEM_KV_BUF = BI * KV_STRIDE;  // 41984
+
+  // The epilogue's [dim, head] to [head, dim] transpose stays inside a warp, one
+  // V chunk at a time. Padding keeps each head row aligned for the uint4 readback.
+  static constexpr int O_STAGE_STRIDE = CT::V_CHUNK + OUT_VEC;  // 72 bf16
+  static constexpr size_t SMEM_O_WARP = CT::HEADS_PER_WARP * O_STAGE_STRIDE * sizeof(bf16);
+
+  // P and O staging are both warp private and never live at once: one slot each.
+  static constexpr size_t SMEM_SCRATCH_WARP = (size_t)CT::P_PASSES * P_TILE_BYTES > SMEM_O_WARP
+                                                  ? (size_t)CT::P_PASSES* P_TILE_BYTES
+                                                  : SMEM_O_WARP;
+  static constexpr size_t SMEM_SCRATCH = N_MATH_WARPS * SMEM_SCRATCH_WARP;
+  static constexpr size_t SMEM_MBAR = 2 * sizeof(uint64_t);
+
+  static constexpr size_t OFF_KV0 = 0;
+  static constexpr size_t OFF_KV1 = OFF_KV0 + SMEM_KV_BUF;
+  static constexpr size_t OFF_SCRATCH = OFF_KV1 + SMEM_KV_BUF;
+  static constexpr size_t OFF_MBAR_KV = (OFF_SCRATCH + SMEM_SCRATCH + 7) / 8 * 8;
+  static constexpr size_t OFF_MBAR_WR = OFF_MBAR_KV + SMEM_MBAR;
+  static constexpr size_t TOTAL = OFF_MBAR_WR + SMEM_MBAR;
+
+  static_assert(TOTAL <= 101376, "swapAB smem exceeds 99KB per-block limit");
+};
+
+template <ModelType MT>
+struct SmemPtrsSwapAB {
+  using L = SmemLayoutSwapAB<MT>;
+
+  uint8_t* kv_bufs[2];
+  uint8_t* p_buf;  // this warp's stmatrix tile (P_PASSES × P_TILE_BYTES)
+  bf16* o_buf;     // same slot, reused by the epilogue for one V chunk
+  uint64_t* mbar_kv;
+  uint64_t* mbar_wr;
+
+  __device__ static SmemPtrsSwapAB init(char* base, int mwarp) {
+    SmemPtrsSwapAB s;
+    s.kv_bufs[0] = (uint8_t*)(base + L::OFF_KV0);
+    s.kv_bufs[1] = (uint8_t*)(base + L::OFF_KV1);
+    uint8_t* scratch = (uint8_t*)(base + L::OFF_SCRATCH) + mwarp * L::SMEM_SCRATCH_WARP;
+    s.p_buf = scratch;
+    s.o_buf = (bf16*)scratch;
+    s.mbar_kv = (uint64_t*)(base + L::OFF_MBAR_KV);
+    s.mbar_wr = (uint64_t*)(base + L::OFF_MBAR_WR);
+    return s;
   }
 };
 

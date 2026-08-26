@@ -28,6 +28,8 @@
 
 // Sparse-MLA SM120 prefill. Single raw-pointer entry point that dispatches:
 //   - DSV3_2 / DSV4 model split
+//   - swapAB (warp specialized, 64 heads/CTA) for the DSV3_2 family at
+//     num_heads 64 / 128
 //   - SG (single-group, 16 heads/CTA) for num_heads <= 16
 //   - MG (multi-group, 32 heads/CTA) for num_heads > 16
 //   - Dual-cache MG variants (DSV4 only)
@@ -83,6 +85,39 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
   configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
 
   // SG is single-cache only.
+  PrefillColdParams cold{sm_scale,
+                         num_tokens,
+                         stride_kv_block,
+                         /*stride_kv_block_extra=*/(size_t)0,
+                         /*topk_extra=*/0,
+                         attn_sink,
+                         topk_length_ptr,
+                         /*topk_length_extra=*/(const int*)nullptr};
+  cudaLaunchConfig_t config{grid, block, smem_bytes, stream, nullptr, 0};
+  void* args[] = {(void*)&Q,      (void*)&KV_cache, (void*)&indices, (void*)&attn_sink,
+                  (void*)&output, (void*)&out_lse,  (void*)&cold};
+  CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
+}
+
+// Warp-specialized swapAB dispatcher (DSV3_2 family, 64 heads/CTA, single cache).
+template <ModelType MT, int NUM_HEADS, int TOPK>
+void launch_prefill_swapab(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
+                           const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
+                           int num_tokens, size_t stride_kv_block, const int* topk_length_ptr,
+                           cudaStream_t stream) {
+  using CT = ComputeTraitsSwapAB<MT>;
+  using L = SmemLayoutSwapAB<MT>;
+  static_assert(KVCacheTraits<MT>::SCALE_IN_KV_SMEM && KVCacheTraits<MT>::D_NOPE == D_V,
+                "swapAB prefill is DSV3_2 family only: inline scales, V spans the nope half");
+  constexpr size_t smem_bytes = L::TOTAL;
+  constexpr int REPLICATE_H = NUM_HEADS / CT::HEADS_PER_CTA;
+  dim3 grid(num_tokens * REPLICATE_H);
+  dim3 block(BLOCK_THREADS);
+
+  auto kernel = sparse_mla_prefill_swapab_kernel<MT, NUM_HEADS, TOPK>;
+  static bool configured[kMaxCachedCudaDevices] = {};
+  configure_dynamic_smem_per_device(kernel, smem_bytes, configured);
+
   PrefillColdParams cold{sm_scale,
                          num_tokens,
                          stride_kv_block,
@@ -211,13 +246,43 @@ void launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cache, const int32_
   CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
+// swapAB covers the head counts that fill whole 64-head CTAs; the rest fall
+// through to SG/MG below.
+template <ModelType MT>
+inline bool dispatch_v32_swapab(int num_heads, const bf16* Q, const uint8_t* KV,
+                                const int32_t* indices, const float* attn_sink, bf16* output,
+                                float* out_lse, float sm_scale, int num_tokens,
+                                size_t stride_kv_block, const int* topk_length_ptr,
+                                cudaStream_t stream) {
+#define DISPATCH_DSV3_2_SWAPAB(NH)                                                          \
+  launch_prefill_swapab<MT, NH, 2048>(Q, KV, indices, attn_sink, output, out_lse, sm_scale, \
+                                      num_tokens, stride_kv_block, topk_length_ptr, stream)
+
+  switch (num_heads) {
+    case 64:
+      DISPATCH_DSV3_2_SWAPAB(64);
+      return true;
+    case 128:
+      DISPATCH_DSV3_2_SWAPAB(128);
+      return true;
+    default:
+      return false;
+  }
+#undef DISPATCH_DSV3_2_SWAPAB
+}
+
 template <ModelType MT>
 inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* KV,
                          const int32_t* indices, const float* attn_sink, bf16* output,
                          float* out_lse, float sm_scale, int num_tokens, size_t stride_kv_block,
                          const int* topk_length_ptr, cudaStream_t stream) {
   static_assert(KVCacheTraits<MT>::D_QK == 576);
+
   if (topk != 2048) return false;
+
+  if (dispatch_v32_swapab<MT>(num_heads, Q, KV, indices, attn_sink, output, out_lse, sm_scale,
+                              num_tokens, stride_kv_block, topk_length_ptr, stream))
+    return true;
 
   // PBS=64 matches the V32 decode (`decode_dsv3_2_kernel.cuh`). NH=8 covers
   // small-TP shards; the SG kernel zero-pads invalid head slots up to HPB=16

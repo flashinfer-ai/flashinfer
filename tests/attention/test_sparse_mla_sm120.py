@@ -911,7 +911,7 @@ def test_sparse_mla_sm120_decode_glm_nsa_arbitrary_fp32() -> None:
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-@pytest.mark.parametrize("num_heads", [8, 32])
+@pytest.mark.parametrize("num_heads", [8, 32, 64, 128])
 def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None:
     torch.manual_seed(2)
     device = torch.device("cuda")
