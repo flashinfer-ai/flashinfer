@@ -244,25 +244,17 @@ static __device__ __noinline__ void topk8(const __nv_bfloat16* __restrict__ row,
     y = min(x, y);                     \
     x = t_;                            \
   }
-  CE(k0, k1)
-  CE(k2, k3)
-  CE(k4, k5)
-  CE(k6, k7)
-  CE(k0, k2)
-  CE(k1, k3)
-  CE(k4, k6)
-  CE(k5, k7)
-  CE(k1, k2)
-  CE(k5, k6)
-  CE(k0, k4)
-  CE(k1, k5)
-  CE(k2, k6)
-  CE(k3, k7)
-  CE(k2, k4)
-  CE(k3, k5)
-  CE(k1, k2)
-  CE(k3, k4)
-  CE(k5, k6)
+  // clang-format off
+  // One line per stage of the network; clang-format cannot lay out a run of
+  // semicolon-less macro invocations idempotently (it rewraps it differently
+  // on every pass), and the stage structure is the point of the sequence.
+  CE(k0, k1) CE(k2, k3) CE(k4, k5) CE(k6, k7)
+  CE(k0, k2) CE(k1, k3) CE(k4, k6) CE(k5, k7)
+  CE(k1, k2) CE(k5, k6)
+  CE(k0, k4) CE(k1, k5) CE(k2, k6) CE(k3, k7)
+  CE(k2, k4) CE(k3, k5)
+  CE(k1, k2) CE(k3, k4) CE(k5, k6)
+  // clang-format on
 #undef CE
 
   unsigned int mysel = 0u;
@@ -290,6 +282,11 @@ static __device__ __noinline__ void topk8(const __nv_bfloat16* __restrict__ row,
     w_out[lane] = x * __frcp_rn(sum);
     id_out[lane] = 255 - (int)(mysel & 0xFFu);
   }
+}
+
+// An expert id is only safe to use as an index once it is known to be one.
+static __device__ __forceinline__ bool expert_in_range(int e) {
+  return static_cast<unsigned int>(e) < static_cast<unsigned int>(NUM_EXPERTS);
 }
 
 // ---------------------------------------------------------------------------
@@ -370,11 +367,23 @@ __global__ __launch_bounds__(PT_D) void moe_routing_descriptor(
 
   if (tid < numel) {
     const int e = s_id[tid];
-    if (o_tw != nullptr) {
-      o_tw[tid] = s_w[tid];
-      o_tid[tid] = e;
+    // Everything below indexes s_cnt / s_cur / s_start, which are NUM_EXPERTS
+    // wide, with an id that on the align entry point came straight out of the
+    // caller's `in_tid`.  An id outside [0, NUM_EXPERTS) would be an
+    // out-of-bounds shared-memory access, so DROP the assignment: its slot in
+    // `o_sti` keeps the `numel` sentinel prefilled at the top of this kernel,
+    // which is the same "no token here" value the padding uses, so the
+    // descriptor stays consistent instead of half-written.
+    // (The prologue cannot produce one -- topk8 emits 255 - e for e in
+    // [0, NUM_EXPERTS) -- and it is the only caller that passes o_tw/o_tid,
+    // so this guard costs the shipped path nothing.)
+    if (expert_in_range(e)) {
+      if (o_tw != nullptr) {
+        o_tw[tid] = s_w[tid];
+        o_tid[tid] = e;
+      }
+      atomicAdd(&s_cnt[e], 1);
     }
-    atomicAdd(&s_cnt[e], 1);
   }
   __syncthreads();
 
@@ -407,8 +416,14 @@ __global__ __launch_bounds__(PT_D) void moe_routing_descriptor(
   __syncthreads();
   if (tid < numel) {
     const int e = s_id[tid];
-    const int r = atomicAdd(&s_cur[e], 1);
-    o_sti[s_start[e] * BLOCK_M + r] = tid;
+    // Same drop as the counting pass above, and it has to be the same
+    // predicate: an id counted there is an id scattered here, and one without
+    // the other would either lose a token or scatter into a block no expert
+    // owns.
+    if (expert_in_range(e)) {
+      const int r = atomicAdd(&s_cur[e], 1);
+      o_sti[s_start[e] * BLOCK_M + r] = tid;
+    }
   }
 }
 
@@ -539,10 +554,20 @@ void moe_routing_prologue_sm120(TensorView hidden_states, TensorView gate_weight
       << "expert_ids must hold max_num_m_blocks = 8 * M entries";
   TVM_FFI_ICHECK_EQ(num_tokens_post_pad.numel(), 1);
 
+  // Every operand, input and output alike, on the device this launch guards
+  // to.  CHECK_INPUT_AND_TYPE above only says "some CUDA tensor"; an output
+  // allocated on a different device would be written through a pointer that
+  // does not belong to the current context -- an illegal access at best.  The
+  // align and finalize entry points check all of theirs, so these do too.
   CHECK_DEVICE(gate_weight, hidden_states);
   CHECK_DEVICE(shared_gate_weight, hidden_states);
   CHECK_DEVICE(router_logits, hidden_states);
   CHECK_DEVICE(shared_gate, hidden_states);
+  CHECK_DEVICE(topk_weights, hidden_states);
+  CHECK_DEVICE(topk_ids, hidden_states);
+  CHECK_DEVICE(sorted_token_ids, hidden_states);
+  CHECK_DEVICE(expert_ids, hidden_states);
+  CHECK_DEVICE(num_tokens_post_pad, hidden_states);
 
   ffi::CUDADeviceGuard device_guard(hidden_states.device().device_id);
   const cudaStream_t stream = get_stream(hidden_states.device());

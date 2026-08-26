@@ -69,7 +69,9 @@ Dispatch contract for the specialized path:
 * **nothing is prebuilt.**  This op is not in the AOT pass, so the single
   translation unit under ``kernel/`` JIT-compiles on the first *non-capturing*
   dispatch, or on an explicit :func:`moe_routing_precompile` -- which is what a
-  serving engine's eager profile pass amounts to;
+  serving engine's eager profile pass amounts to.  A build that fails is
+  remembered, so the attempt is made once per process and every later dispatch
+  goes straight to the composable path instead of re-entering the compiler;
 * during CUDA-graph capture an entry point dispatches only if that module is
   already compiled and loaded; it never compiles, queries devices or
   synchronizes under capture.  A capture that arrives cold therefore records
@@ -145,6 +147,15 @@ _INACTIVE_EXPERT_ID = -1
 _MAX_TOKENS = 32
 
 _MODULE = None
+# Latched by the first failed build.  Nothing is prebuilt for this op, so the
+# JIT is the only way the specialized kernels ever exist; a build that fails
+# once in a given process fails for a reason that does not go away by itself
+# (no nvcc, a compile error, FLASHINFER_DISABLE_JIT with a cold cache).  Without
+# this latch every later non-capturing dispatch would re-enter
+# ``build_and_load`` -- a file lock and a ninja invocation -- per MoE layer per
+# decode step, which is a serving hazard rather than a slow first call.  Tests
+# that want a real re-evaluation clear it.
+_MODULE_BUILD_FAILED = False
 _PROLOGUE_LAUNCH_COUNT = 0
 _ALIGN_LAUNCH_COUNT = 0
 _FINALIZE_LAUNCH_COUNT = 0
@@ -209,8 +220,14 @@ def moe_routing_precompile() -> bool:
     capture graphs and warm it implicitly; callers that would rather be explicit
     (or that capture without a profile pass) invoke this directly.  Returns True
     when the module is loaded afterwards.
+
+    A failed build is remembered: this returns False immediately from then on
+    rather than paying for the attempt again on every dispatch.
     """
+    global _MODULE_BUILD_FAILED
     if not _sm120_available():
+        return False
+    if _MODULE_BUILD_FAILED:
         return False
     try:
         _get_module()
@@ -219,6 +236,7 @@ def moe_routing_precompile() -> bool:
         # design -- every call then takes the composable path and only a launch
         # counter notices -- so the compiler's own error is the single most
         # useful thing this line can carry.
+        _MODULE_BUILD_FAILED = True
         _jit_logger().warning_once(
             "Unable to build the specialized MoE routing kernels: %s: %s",
             type(exc).__name__,

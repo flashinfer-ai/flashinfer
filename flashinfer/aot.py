@@ -748,24 +748,6 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
-        # The experimental fused MoE routing op has no entry here either -- but
-        # NOT for the reason the fused GDN decode step above has none, and the
-        # difference is worth stating so nobody "restores consistency" by
-        # copying that rationale.  The GDN entry was redundant: its preferred
-        # impl is CuTe-DSL, which this pass does not cover at all, so an AOT
-        # entry could only pre-build a second-choice kernel that never runs.
-        # Here the kernel behind the op is the ONLY compiled implementation --
-        # the fallback is a Python-level torch composition -- so this entry did
-        # pre-build the thing that actually runs, and dropping it is a real
-        # trade: one fewer sm120a translation unit in every jit-cache wheel,
-        # from a shared and size-limited budget, for an op whose allowlist is
-        # three decode shapes on one architecture, paid for by a compile on the
-        # first eager call.  What it does NOT trade away is CUDA-graph safety:
-        # a dispatch made under capture never compiles *or* loads (it only
-        # consults whether the module is already resident) and falls back to
-        # the capture-safe composable path, so with or without an AOT artifact
-        # a cold capture behaves identically.  See
-        # flashinfer/fused_moe/experimental/README.md.
         if has_sm120:
             jit_specs.append(gen_fp4_quantization_sm120_module())
         if has_sm121:

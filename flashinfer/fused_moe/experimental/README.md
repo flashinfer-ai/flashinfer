@@ -162,7 +162,11 @@ wheel already carries — and with no AOT entry, no wheel carries this one. So
 unless the on-disk JIT cache was populated by an earlier unrestricted run, the
 module cannot be obtained at all: `moe_routing_precompile()` returns `False`
 after logging the loader's own message, and all three entry points serve the
-composable path. That is **correct**, just not accelerated — and
+composable path. The failure is **latched**: the JIT is now the op's only build
+path, and a build that fails once in a process fails for a reason that does not
+resolve itself, so the attempt is made once and later dispatches take the
+fallback directly rather than re-entering the file lock and `ninja` on every
+call. That is **correct**, just not accelerated — and
 `moe_routing_supported()` keeps answering `True` there, because it reports what
 this build's *allowlist and device* support, not whether a toolchain happens to
 be available. A consumer that needs the stronger statement should call

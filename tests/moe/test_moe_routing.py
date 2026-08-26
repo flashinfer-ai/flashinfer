@@ -12,6 +12,12 @@ The tests are grouped by what they protect:
 * the token-count ceiling -- the descriptor pass keeps every assignment in one
   CTA, so there is a hard ceiling, and it must be REPORTED rather than silently
   producing nothing;
+* what the entry points refuse to trust -- an expert id the caller supplied is
+  not a shared-memory index until it has been checked, and an operand on
+  another device is not this launch's memory.  Both go to the module directly,
+  since the dispatch guards are what keeps them away from it in normal use;
+* the build latch -- the JIT is this op's only build path, so a build that
+  fails is attempted once per process rather than by every later dispatch;
 * CUDA graphs -- capture after precompile records the specialized kernels, cold
   capture falls back cleanly;
 * launch independence -- the split has no persistent device state and no
@@ -627,6 +633,130 @@ def test_align_reports_a_token_count_it_cannot_serve():
             NUM_EXPERTS,
             BLOCK_M,
         )
+
+
+@requires_sm120
+def test_descriptor_drops_out_of_range_expert_ids():
+    """A caller-supplied expert id is not trusted as a shared-memory index.
+
+    ``moe_routing_align`` takes ``topk_ids`` from the caller's own router, and
+    above 4 tokens the descriptor pass indexes per-expert shared arrays
+    (``s_cnt`` / ``s_cur`` / ``s_start``, ``NUM_EXPERTS`` wide) with them.  An
+    id outside ``[0, NUM_EXPERTS)`` is dropped -- its slot keeps the padding
+    sentinel -- rather than scribbling on shared memory.
+
+    The shipped allowlist is m in {1, 2, 4}, so the guards never send a size
+    this large to the kernel and this goes to the module directly.  That is
+    also why the check costs the shipped path nothing: at those sizes the
+    warp-local branch runs instead, and it indexes nothing by expert id.
+    """
+    assert mr.moe_routing_precompile()
+    m = 8
+    assert m > SHIPPED_MAX_M
+    ins = _inputs(m, seed=101)
+    topk_ids = _composable_prologue(ins, m)["topk_ids"].clone()
+    for (row, col), value in {
+        (0, 0): -1,
+        (1, 3): NUM_EXPERTS,
+        (4, 7): NUM_EXPERTS + 11,
+        (6, 5): -(1 << 20),
+        (7, 2): 1 << 20,
+    }.items():
+        topk_ids[row, col] = value
+
+    outs = _align_outputs(m)
+    mr._MODULE.moe_routing_align_sm120(
+        topk_ids,
+        outs["sorted_token_ids"],
+        outs["expert_ids"],
+        outs["num_tokens_post_pad"],
+        NUM_EXPERTS,
+        BLOCK_M,
+    )
+    torch.cuda.synchronize()
+
+    flat = topk_ids.reshape(-1).tolist()
+    kept = {}
+    for index, expert in enumerate(flat):
+        if 0 <= expert < NUM_EXPERTS:
+            kept.setdefault(expert, []).append(index)
+    kept = {expert: sorted(v) for expert, v in kept.items()}
+
+    # The valid assignments are described exactly as if the invalid ones had
+    # never been passed...
+    assert _per_expert_assignments(outs, m) == kept
+    blocks = sum((len(v) + BLOCK_M - 1) // BLOCK_M for v in kept.values())
+    assert int(outs["num_tokens_post_pad"][0].item()) == blocks * BLOCK_M
+    # ... and the dropped ones appear nowhere in the descriptor.
+    dropped = {i for i, e in enumerate(flat) if not (0 <= e < NUM_EXPERTS)}
+    assert len(dropped) == 5
+    assert dropped.isdisjoint(set(outs["sorted_token_ids"].tolist()))
+
+
+@requires_sm120
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="an operand on another device needs two"
+)
+def test_prologue_rejects_an_operand_on_another_device():
+    """Outputs are checked against the launch's device too, not just inputs.
+
+    ``CHECK_INPUT_AND_TYPE`` only says "some CUDA tensor".  An output allocated
+    on a different device would be written through a pointer that does not
+    belong to the context this launch guards to.
+    """
+    assert mr.moe_routing_precompile()
+    m = 1
+    ins = _inputs(m, seed=103)
+    outs = _prologue_outputs(m)
+    outs["topk_ids"] = outs["topk_ids"].to("cuda:1")
+    # B017: blind on purpose, as above -- tvm_ffi's error class is not a stable
+    # public type to import here.
+    with pytest.raises(Exception):  # noqa: B017
+        mr._MODULE.moe_routing_prologue_sm120(
+            ins["hidden_states"],
+            ins["gate_weight"],
+            ins["shared_gate_weight"],
+            outs["router_logits"],
+            outs["shared_gate"],
+            outs["topk_weights"],
+            outs["topk_ids"],
+            outs["sorted_token_ids"],
+            outs["expert_ids"],
+            outs["num_tokens_post_pad"],
+        )
+
+
+def test_a_failed_build_is_attempted_once_per_process(monkeypatch):
+    """A build that fails must not be retried by every later dispatch.
+
+    The JIT is this op's only build path, so a failure here is the difference
+    between a slow first call and a file lock plus a ``ninja`` invocation per
+    MoE layer per decode step.  The reason a build fails does not resolve
+    itself mid-process, so the answer is latched and later dispatches take the
+    composable path directly.
+    """
+    attempts = []
+
+    class _FailingSpec:
+        def build_and_load(self):
+            attempts.append(1)
+            raise RuntimeError("nvcc will not be there on the next call either")
+
+    monkeypatch.setattr(mr, "_sm120_module_generator", lambda: _FailingSpec)
+    monkeypatch.setattr(mr, "_MODULE", None)
+    monkeypatch.setattr(mr, "_MODULE_BUILD_FAILED", False)
+
+    for _ in range(5):
+        assert mr.moe_routing_precompile() is False
+    assert len(attempts) == 1
+    assert mr.moe_routing_ready_for_graph_capture() is False
+
+    if torch.cuda.is_available():
+        # ... and the dispatch path, which is what a serving engine actually
+        # calls, goes through the same latch.
+        for _ in range(5):
+            assert mr._dispatch_ready() is False
+        assert len(attempts) == 1
 
 
 # ------------------------------------------------------------- CUDA graphs
