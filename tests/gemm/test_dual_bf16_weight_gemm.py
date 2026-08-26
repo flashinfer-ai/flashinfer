@@ -39,8 +39,8 @@ def _make_inputs(m: int, n: int, k: int, seed: int = 0):
 
 
 def _reference(a, weight_high, weight_low, out_dtype):
-    high = torch.mm(a, weight_high.T, out_dtype=torch.float32)
-    low = torch.mm(a, weight_low.T, out_dtype=torch.float32)
+    high = torch.mm(a.float(), weight_high.float().T)
+    low = torch.mm(a.float(), weight_low.float().T)
     return (high + low / 256.0).to(out_dtype)
 
 
@@ -178,13 +178,12 @@ def test_multistream_all_dispatch_paths():
         for m, n, k, _ in cases
     ]
     outputs = [
-        torch.empty(m, n, device="cuda", dtype=torch.float32)
-        for m, n, _, _ in cases
+        torch.empty(m, n, device="cuda", dtype=torch.float32) for m, n, _, _ in cases
     ]
     streams = [torch.cuda.Stream() for _ in cases]
 
     for stream, case, case_inputs, workspace, output in zip(
-        streams, cases, inputs, workspaces, outputs
+        streams, cases, inputs, workspaces, outputs, strict=True
     ):
         m, n, k, expected_kind = case
         assert _dual_bf16_weight_gemm_kernel_kind(m, n, k, "cuda") == expected_kind
@@ -199,7 +198,7 @@ def test_multistream_all_dispatch_paths():
     for stream in streams:
         torch.cuda.current_stream().wait_stream(stream)
 
-    for case_inputs, output in zip(inputs, outputs):
+    for case_inputs, output in zip(inputs, outputs, strict=True):
         reference = _reference(*case_inputs, torch.float32)
         torch.testing.assert_close(output, reference, rtol=2e-2, atol=2e-2)
 

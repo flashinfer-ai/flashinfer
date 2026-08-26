@@ -425,6 +425,7 @@ __global__ __launch_bounds__(kThreadCount, 1) void kernel(
       if (has_previous_store) {
         if (epilogue_thread == 0) {
           tma_store_wait<0>();
+          __threadfence();
           atomicAdd(tile_counters + previous_base_tile, 1);
         }
         cutlass::arch::NamedBarrier::sync(kEpilogueThreads,

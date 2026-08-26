@@ -21,7 +21,10 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..jit.gemm import gen_dual_bf16_weight_gemm_sm100_module
-from ..trace.templates.gemm import mm_bf16_dual_weight_trace
+from ..trace.templates.gemm import (
+    mm_bf16_dual_weight_trace,
+    prepare_dual_bf16_weights_trace,
+)
 from ..utils import (
     _get_cache_buf,
     backend_requirement,
@@ -65,6 +68,7 @@ def _workspace_size_cached(device_index: int, m: int, n: int, k: int) -> int:
     return int(module.workspace_size(m, n, k, device_index))
 
 
+@flashinfer_api
 def dual_bf16_weight_gemm_workspace_size(
     m: int,
     n: int,
@@ -75,6 +79,20 @@ def dual_bf16_weight_gemm_workspace_size(
 
     The split-K path uses this memory for FP32 partial outputs and int32 tile
     counters. Persistent 1SM and cluster 2SM paths return zero.
+
+    Args:
+        m: Number of activation rows.
+        n: Number of output channels.
+        k: Reduction dimension. Must be a positive multiple of 128.
+        device: CUDA device on which the GEMM will run. Defaults to the current
+            CUDA device.
+
+    Returns:
+        Required workspace size in bytes.
+
+    Raises:
+        ValueError: If a dimension is non-positive, ``k`` is not a multiple of
+            128, or the selected device is not exact SM100.
     """
 
     if m <= 0 or n <= 0 or k <= 0:
@@ -100,7 +118,7 @@ def _dual_bf16_weight_gemm_kernel_kind(
     return int(module.kernel_kind(m, n, k, get_device_index(normalized)))
 
 
-@flashinfer_api
+@flashinfer_api(trace=prepare_dual_bf16_weights_trace)
 @torch.no_grad()
 def prepare_dual_bf16_weights(
     weight: torch.Tensor,
@@ -110,6 +128,20 @@ def prepare_dual_bf16_weights(
     The compute kernel reconstructs the runtime weight as
     weight_high.float() + weight_low.float() / 256. Call this helper once
     when loading weights, then reuse both returned contiguous tensors.
+
+    Args:
+        weight: Contiguous or strided FP32 weight with shape ``[N, K]``. The
+            reduction dimension ``K`` must be a positive multiple of 128.
+
+    Returns:
+        A tuple ``(weight_high, weight_low)`` containing two contiguous BF16
+        tensors with shape ``[N, K]``. The runtime approximation is
+        ``weight_high.float() + weight_low.float() / 256``.
+
+    Raises:
+        ValueError: If ``weight`` is not two-dimensional, has an empty
+            dimension, or its reduction dimension is not a multiple of 128.
+        TypeError: If ``weight`` is not FP32.
     """
 
     if weight.dim() != 2:

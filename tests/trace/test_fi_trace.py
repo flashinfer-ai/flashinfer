@@ -165,6 +165,17 @@ def test_mm_bf16_dual_weight_trace_output_dtype():
     assert out_defn["outputs"]["C"]["dtype"] == "float32"
 
 
+def test_prepare_dual_bf16_weights_trace():
+    weight = torch.empty(64, 256, dtype=torch.float32)
+    definition = flashinfer.prepare_dual_bf16_weights.fi_trace(weight=weight)
+
+    assert definition["axes"]["N"]["value"] == 64
+    assert definition["axes"]["K"]["value"] == 256
+    assert definition["inputs"]["weight"]["dtype"] == "float32"
+    assert definition["outputs"]["weight_high"]["dtype"] == "bfloat16"
+    assert definition["outputs"]["weight_low"]["dtype"] == "bfloat16"
+
+
 def test_all_registered_trace_templates_have_check():
     from flashinfer.api_logging import _TRACE_REGISTRY
 

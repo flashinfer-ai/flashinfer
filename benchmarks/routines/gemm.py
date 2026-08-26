@@ -218,6 +218,8 @@ def parse_gemm_args(line, parser):
             args.backends = ["dual-bf16"]
         if not has_input_dtype_arg:
             args.input_dtype = "bfloat16"
+        if not has_mat2_dtype_arg:
+            args.mat2_dtype = "float32"
     if args.routine == "mm_fp8":
         if not has_backends_arg:
             args.backends = ["trtllm_low_latency"]
@@ -2317,6 +2319,16 @@ def testMmBf16DualWeight(args):
     m, n, k = args.m, args.n, args.k
     if k % 128 != 0:
         raise ValueError(f"mm_bf16_dual_weight requires k % 128 == 0; got {k}")
+    input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
+    if input_dtype != torch.bfloat16:
+        raise ValueError(
+            f"mm_bf16_dual_weight requires input_dtype=bfloat16; got {args.input_dtype}"
+        )
+    mat2_dtype = dtype_str_to_torch_dtype(args.mat2_dtype)
+    if mat2_dtype != torch.float32:
+        raise ValueError(
+            f"mm_bf16_dual_weight requires mat2_dtype=float32; got {args.mat2_dtype}"
+        )
     out_dtype = dtype_str_to_torch_dtype(args.out_dtype)
     if out_dtype not in (torch.bfloat16, torch.float32):
         raise ValueError(
@@ -2376,8 +2388,8 @@ def testMmBf16DualWeight(args):
             run(backend, outputs[backend])
 
         if args.refcheck:
-            high = torch.mm(a, weight_high.T, out_dtype=torch.float32)
-            low = torch.mm(a, weight_low.T, out_dtype=torch.float32)
+            high = torch.mm(a.float(), weight_high.float().T)
+            low = torch.mm(a.float(), weight_low.float().T)
             dual_reference = (high + low / 256.0).to(out_dtype)
             dual_output = outputs["dual-bf16"]
             if "dual-bf16" in backends:

@@ -29,6 +29,7 @@ fused_kda_decode_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_bf16_dual_weight_N256_K256.json
+prepare_dual_bf16_weights_N256_K256.json
 gemm_fp4_N2048_K7168_block_size16.json
 gemm_fp8_N1536_K7168.json
 gemm_fp8_nt_groupwise_n1536_k7168.json
