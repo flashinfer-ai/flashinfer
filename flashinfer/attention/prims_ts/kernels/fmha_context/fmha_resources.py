@@ -125,11 +125,7 @@ def _mask_score_quad(
     score2: Float32,
     score3: Float32,
 ) -> tuple[Float32, Float32, Float32, Float32]:
-    """Expand four bitmap bits with setp and replace invalid scores.
-
-    Use and/setp because CUDA 13.3 libNVVM fails to compile the equivalent
-    `r2p.b32 {valid0, valid1, valid2, valid3}.reverse, {$r0}.b0, 0x0f;`.
-    """
+    """Expand four bitmap bits with setp and replace invalid scores."""
     return cute.arch.inline_ptx(
         """
         {
@@ -3084,8 +3080,6 @@ class TmemSPResource(MemoryResource):
             masked_scores = []
             for quad_idx in cutlass.range_constexpr(tmem_x // 4):
                 quad_base = quad_idx * 4
-                # CUDA 13.3 NVVM rejects r2p in this kernel, so expand each
-                # four-bit group with ordinary setp instructions.
                 masked_scores.extend(
                     _mask_score_quad(
                         valid_bits >> Int32(quad_base),
