@@ -348,6 +348,38 @@ def _state_carrier(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.as_strided((span,), (1,), storage_offset=int(tensor.storage_offset()))
 
 
+def _validate_binding_aliases(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    alpha: torch.Tensor | None,
+    beta: torch.Tensor | None,
+    initial_state: torch.Tensor | None,
+    output: torch.Tensor,
+    output_state: torch.Tensor | None,
+) -> None:
+    """Enforce the public writable/read-only alias contract for each binding."""
+
+    if initial_state is not None and output_state is not None:
+        aliases = (
+            initial_state.untyped_storage().data_ptr()
+            == output_state.untyped_storage().data_ptr()
+        )
+        if aliases and output_state is not initial_state:
+            raise ValueError("state storage aliasing must use the same tensor object")
+    output_storage = output.untyped_storage().data_ptr()
+    for name, tensor in (
+        ("q", q),
+        ("k", k),
+        ("v", v),
+        ("alpha", alpha),
+        ("beta", beta),
+    ):
+        if tensor is not None and tensor.untyped_storage().data_ptr() == output_storage:
+            raise ValueError(f"output must not alias read-only input {name}")
+
+
 def _checkpoint_fixed_state_indices(
     plan: GDNCPPrefillPlan, device: torch.device
 ) -> torch.Tensor:
@@ -615,6 +647,16 @@ class GDNCPPrefill:
 
         if self._graph is not None:
             raise RuntimeError("dynamic Blackwell bindings require a direct composite")
+        _validate_binding_aliases(
+            q=q,
+            k=k,
+            v=v,
+            alpha=alpha,
+            beta=beta,
+            initial_state=initial_state,
+            output=output,
+            output_state=output_state,
+        )
         current = torch.cuda.current_stream(q.device)
         if current.cuda_stream != self._stream.cuda_stream:
             raise RuntimeError("GDNCPPrefill must launch on its preparation stream")
@@ -965,23 +1007,16 @@ def prepare_gdn_cp_prefill(
             raise ValueError("state_indices values must be unique")
         if any(index < 0 or index >= pool_size for index in indices):
             raise ValueError("state_indices values must address the state pool")
-    if initial_state is not None and output_state is not None:
-        aliases = (
-            initial_state.untyped_storage().data_ptr()
-            == output_state.untyped_storage().data_ptr()
-        )
-        if aliases and output_state is not initial_state:
-            raise ValueError("state storage aliasing must use the same tensor object")
-    output_storage = output.untyped_storage().data_ptr()
-    for name, tensor in (
-        ("q", q),
-        ("k", k),
-        ("v", v),
-        ("alpha", alpha),
-        ("beta", beta),
-    ):
-        if tensor.untyped_storage().data_ptr() == output_storage:
-            raise ValueError(f"output must not alias read-only input {name}")
+    _validate_binding_aliases(
+        q=q,
+        k=k,
+        v=v,
+        alpha=alpha,
+        beta=beta,
+        initial_state=initial_state,
+        output=output,
+        output_state=output_state,
+    )
     resolved_scale = (
         1.0 / math.sqrt(_HEAD_DIM) if scale is None or scale == 0.0 else float(scale)
     )

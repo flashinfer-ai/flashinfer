@@ -628,6 +628,44 @@ def test_metadata_version_accepts_inference_tensors() -> None:
         assert source_backend._metadata_version(metadata) is None
 
 
+def test_prepared_cache_rebind_revalidates_alias_contract() -> None:
+    prepared = object.__new__(source_backend.GDNCPPrefill)
+    prepared._graph = None
+    q = torch.zeros((2, 1, 128), dtype=torch.float16)
+    alpha = torch.ones((2, 1), dtype=torch.float32)
+    beta = torch.ones((2, 1), dtype=torch.float32)
+    initial_state = torch.zeros((1, 1, 128, 128), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match="output must not alias read-only input q"):
+        prepared.launch_with_bindings(
+            q=q,
+            k=q,
+            v=q,
+            alpha=alpha,
+            beta=beta,
+            initial_state=initial_state,
+            output=q,
+            output_state=torch.empty_like(initial_state),
+            state_checkpoints=None,
+        )
+
+    output_state = initial_state.view_as(initial_state)
+    with pytest.raises(
+        ValueError, match="state storage aliasing must use the same tensor object"
+    ):
+        prepared.launch_with_bindings(
+            q=q,
+            k=q,
+            v=q,
+            alpha=alpha,
+            beta=beta,
+            initial_state=initial_state,
+            output=torch.empty_like(q),
+            output_state=output_state,
+            state_checkpoints=None,
+        )
+
+
 def test_public_gdn_cp_cache_reuses_equal_metadata_and_rebinds_tensor_addresses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
