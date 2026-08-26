@@ -25,9 +25,7 @@ def test_compiled_gemm_cache_is_partitioned_by_device_and_arch(monkeypatch, requ
         compiled.append((io, stream, result))
         return result
 
-    monkeypatch.setattr(
-        compile_cache, "_compile_target_key", lambda _io: target[0]
-    )
+    monkeypatch.setattr(compile_cache, "_compile_target_key", lambda _io: target[0])
     monkeypatch.setattr(batched_gemm_run, "_compile_for_launch", fake_compile)
     compile_cache._COMPILED_GEMM_CACHE.clear()
     request.addfinalizer(compile_cache._COMPILED_GEMM_CACHE.clear)

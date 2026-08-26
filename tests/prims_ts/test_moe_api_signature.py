@@ -34,7 +34,7 @@ def test_prims_ts_fp8_positional_contract_matches_trtllm():
     ]
     assert all(
         parameter.kind == expected.kind
-        for parameter, expected in zip(prims_ts_params, trtllm_params)
+        for parameter, expected in zip(prims_ts_params, trtllm_params, strict=False)
     )
 
     backend_params = prims_ts_params[len(trtllm_params) :]
@@ -44,8 +44,7 @@ def test_prims_ts_fp8_positional_contract_matches_trtllm():
         "fc2_per_channel_weight_scale",
     ]
     assert all(
-        parameter.kind == inspect.Parameter.KEYWORD_ONLY
-        for parameter in backend_params
+        parameter.kind == inspect.Parameter.KEYWORD_ONLY for parameter in backend_params
     )
     assert inspect.signature(
         _fake_prims_ts_fp8_per_tensor_scale_moe
