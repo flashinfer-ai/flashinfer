@@ -1984,6 +1984,120 @@ def test_pretranspose_api_uses_gdn_decode_bf16_state(
     )
 
 
+def test_pretranspose_api_forwards_bf16_mtp_verify_controls():
+    """The public pretranspose API must preserve MTP verify state and cache controls."""
+    _skip_if_not_sm90_or_later()
+    if not GDN_DECODE_BF16_STATE_AVAILABLE:
+        pytest.skip("BF16 state kernel not available")
+
+    torch.random.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    batch_size, seq_len = 2, 2
+    num_q_heads = num_k_heads = 16
+    num_v_heads = 32
+    head_size = 128
+    pool_size = 5
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+
+    q = torch.randn(
+        batch_size, seq_len, num_q_heads, head_size, dtype=dtype, device=device
+    )
+    k = torch.randn(
+        batch_size, seq_len, num_k_heads, head_size, dtype=dtype, device=device
+    )
+    v = torch.randn(
+        batch_size, seq_len, num_v_heads, head_size, dtype=dtype, device=device
+    )
+    a = (
+        torch.randn(
+            batch_size, seq_len, num_v_heads, dtype=dtype, device=device
+        )
+        * 0.1
+    )
+    b_tensor = torch.randn(
+        batch_size, seq_len, num_v_heads, dtype=dtype, device=device
+    )
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    initial_state_indices = torch.tensor([1, 4], dtype=torch.int32, device=device)
+    initial_pool = torch.randn(
+        pool_size,
+        num_v_heads,
+        head_size,
+        head_size,
+        dtype=dtype,
+        device=device,
+    )
+    output = torch.empty(
+        batch_size, seq_len, num_v_heads, head_size, dtype=dtype, device=device
+    )
+    sentinel = 3.25
+    cache_shape = (
+        batch_size,
+        seq_len + 1,
+        num_v_heads,
+        head_size,
+        head_size,
+    )
+    public_cache = torch.full(cache_shape, sentinel, dtype=dtype, device=device)
+    direct_cache = torch.full(cache_shape, sentinel, dtype=dtype, device=device)
+    public_pool = initial_pool.clone()
+    direct_pool = initial_pool.clone()
+    scale = 1.0 / math.sqrt(head_size)
+
+    public_output, returned_pool = gated_delta_rule_decode_pretranspose(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b_tensor,
+        scale=scale,
+        output=output,
+        use_qk_l2norm=True,
+        initial_state=public_pool,
+        initial_state_indices=initial_state_indices,
+        intermediate_states_buffer=public_cache,
+        disable_state_update=True,
+    )
+    direct_output = gdn_decode_bf16_state_mtp(
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        q=q,
+        k=k,
+        v=v,
+        b=b_tensor,
+        initial_state_source=direct_pool,
+        initial_state_indices=initial_state_indices,
+        intermediate_states_buffer=direct_cache,
+        disable_state_update=True,
+        use_qk_l2norm_in_kernel=True,
+        scale=scale,
+    )
+
+    assert public_output is output
+    assert returned_pool is public_pool
+    torch.testing.assert_close(public_output, direct_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(public_pool, initial_pool, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(direct_pool, initial_pool, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(
+        public_cache[:, :seq_len], direct_cache[:, :seq_len], atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        public_cache[:, seq_len:],
+        torch.full_like(public_cache[:, seq_len:], sentinel),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+
 # ============================================================================
 # Test BF16 state kernel (T=1)
 # ============================================================================

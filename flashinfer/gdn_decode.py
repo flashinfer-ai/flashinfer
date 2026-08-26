@@ -130,6 +130,8 @@ def gated_delta_rule_decode_pretranspose(
     initial_state: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     output_state_indices: Optional[torch.Tensor] = None,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    disable_state_update: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel for single-token generation.
 
@@ -184,7 +186,6 @@ def gated_delta_rule_decode_pretranspose(
         Requires ``initial_state`` to be provided.  If ``None``, the kernel
         writes the updated state back to the same slot it read from (i.e.
         ``initial_state_indices``).
-
         **Padding / inactive sequences**: set the index to ``-1`` for any
         batch entry that should be treated as padding.  The two backends
         handle ``-1`` differently:
@@ -199,6 +200,14 @@ def gated_delta_rule_decode_pretranspose(
         - **float32 legacy path** (T=1): ``-1`` entries are skipped
           entirely; neither the state pool nor the output are touched for
           that batch entry; the output slot is written as **zero**.
+    intermediate_states_buffer : torch.Tensor, optional
+        Caller-owned buffer of shape ``[B, cache_steps, HV, V, K]`` for
+        caching intermediate states on MTP paths (``T > 1``).  Its dtype
+        must match the selected state backend and ``cache_steps`` must be at
+        least ``T``.
+    disable_state_update : bool
+        Whether to leave the state pool unchanged on MTP paths (``T > 1``).
+        Default: ``False``.
 
     Returns
     -------
@@ -210,8 +219,8 @@ def gated_delta_rule_decode_pretranspose(
     Notes
     -----
     - Requires SM90+ (Hopper, Blackwell, etc.).
-    - State is always updated in-place; the pool path writes directly into
-      ``initial_state`` memory (no separate scatter step needed).
+    - State is updated in-place by default; the pool path writes directly
+      into ``initial_state`` memory (no separate scatter step needed).
     - State layout is v-major (K-last): ``[B, HV, V, K]``.  When state is
       bfloat16 and ``K = V = 128``, the BF16 state kernel is used (T=1 or
       MTP for T>1); the pool+indices path routes through the MTP kernel.
@@ -313,6 +322,8 @@ def gated_delta_rule_decode_pretranspose(
                 initial_state_source=bf16_pool,
                 initial_state_indices=bf16_indices,
                 output_state_indices=output_state_indices,
+                intermediate_states_buffer=intermediate_states_buffer,
+                disable_state_update=disable_state_update,
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
                 output=forward_output,
@@ -382,8 +393,8 @@ def gated_delta_rule_decode_pretranspose(
             b=b,
             scale=scale,
             output=output,
-            intermediate_states_buffer=None,
-            disable_state_update=False,
+            intermediate_states_buffer=intermediate_states_buffer,
+            disable_state_update=disable_state_update,
             use_qk_l2norm=use_qk_l2norm,
             output_state_indices=output_state_indices,
         )
