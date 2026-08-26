@@ -514,6 +514,7 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
     )
     monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_100a")
     monkeypatch.setattr(backend, "_load_program", lambda arch: module)
+
     def ensure_launch_state(state, **kwargs):
         if state.flags is None:
             lifecycle.append("launch-state")
