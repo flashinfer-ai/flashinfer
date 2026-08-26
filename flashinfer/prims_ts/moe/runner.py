@@ -443,13 +443,11 @@ class _PrimsTsMoERunnerMixin:
             ("gemm1_lora_delta", moe_inputs.gemm1_lora_delta is not None),
             (
                 "routing_logits",
-                moe_inputs.routing_logits is not None
-                and moe_inputs.routing_logits.numel() > 0,
+                moe_inputs.routing_logits is not None,
             ),
             (
                 "expert_weights",
-                moe_inputs.expert_weights is not None
-                and moe_inputs.expert_weights.numel() > 0,
+                moe_inputs.expert_weights is not None,
             ),
             *getattr(self, "_cache_key_static_extras", ()),
         )

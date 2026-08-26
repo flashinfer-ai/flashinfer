@@ -18,15 +18,51 @@ import inspect
 import torch
 import tvm_ffi
 
-from flashinfer.fused_moe.shared.inputs import RoutingInputMode
+from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs, RoutingInputMode
 from flashinfer.fused_moe.shared.tuning import moe_topk_ids_init
 from flashinfer.fused_moe.backends.prims_ts import bf16_op, fp4_op, fp8_op
 from flashinfer.prims_ts.moe import runner as runner_module
 from flashinfer.prims_ts.moe.runner import (
+    PrimsTsBf16MoERunner,
     _moe_topk_ids_init_for_routing,
     _routed_token_capacity,
     _torch_views_of_ffi_tensors,
 )
+
+
+def test_cache_key_extras_are_invariant_to_synthesized_placeholders():
+    runner = PrimsTsBf16MoERunner(
+        None,
+        top_k=2,
+        num_local_experts=8,
+        hidden_size=1024,
+        intermediate_size=512,
+        num_experts=8,
+    )
+    runtime_inputs = MoeRunnerInputs(
+        output=torch.empty(32, 1024),
+        routing_logits=torch.empty(0),
+        topk_ids=torch.empty(32, dtype=torch.int32),
+        expert_weights=torch.empty(0, dtype=torch.bfloat16),
+        hidden_states=torch.empty(32, 1024),
+        hidden_states_scale=None,
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    )
+    synthesized_inputs = MoeRunnerInputs(
+        output=runtime_inputs.output,
+        routing_logits=torch.empty(32),
+        topk_ids=runtime_inputs.topk_ids,
+        expert_weights=torch.empty(32, dtype=torch.bfloat16),
+        hidden_states=runtime_inputs.hidden_states,
+        hidden_states_scale=None,
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    )
+
+    assert runner.get_cache_key_extras(
+        runtime_inputs.to_list()
+    ) == runner.get_cache_key_extras(synthesized_inputs.to_list())
 
 
 def test_torch_tensor_is_preserved():
