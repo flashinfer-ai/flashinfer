@@ -210,6 +210,20 @@ def add_f16x2(
     )
 
 
+def _target_is_rubin() -> bool:
+    """Whether the JIT target is a Rubin arch (sm_107 / sm_109).
+
+    NOTE: there is no canonical "is Rubin" Arch API -- Arch.BlackwellArchs()
+    lumps sm_107/sm_109 in with Blackwell, and Arch.is_family_of() only compares
+    the major version (can't split Rubin from Blackwell) and is suffix-sensitive
+    (False for a base sm_107). Within major==10 the archs are sm_100/103
+    (Blackwell, minor 0/3) and sm_107/109 (Rubin, minor 7/9), so `minor >= 7` is
+    the robust discriminator (sm_110/sm_101 are major 11, excluded).
+    """
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return arch.major == 10 and arch.minor >= 7
+
+
 class FP8MQALogitsKernel:
     """FP8 paged MQA logits kernel for Blackwell (SM100).
 
@@ -235,6 +249,9 @@ class FP8MQALogitsKernel:
         epi_dtype=cutlass.Float32,
         acc_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
+        use_flat_logits_view=None,
+        use_two_level_task_loop=None,
+        use_paired_pipeline_polls=None,
     ):
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
@@ -248,6 +265,28 @@ class FP8MQALogitsKernel:
         self.remove_kv_wait_in_epilogue = remove_kv_wait_in_epilogue
         self.early_tmem_copy = early_tmem_copy
         self.smem_subpartition_opt = smem_subpartition_opt
+        # Per-arch optimization gates (None = auto). All consumed via
+        # cutlass.const_expr in-kernel.
+        # - use_flat_logits_view (flat logits view + carried row offset):
+        #   regresses on Rubin (sm_107) — the backend schedules the UMMA
+        #   consumer-release late in the math loop, throttling the MMA
+        #   pipe per KV tile, growing with ctx. Pure win on Blackwell.
+        #   Auto: off on Rubin.
+        # - use_two_level_task_loop / use_paired_pipeline_polls: with the
+        #   flat view off, both on wins on Rubin at nn<4; at nn=4 the
+        #   baseline loop is the best achievable there. Auto: on except
+        #   Rubin nn=4 (both fall back together so nn=4 compiles to the
+        #   baseline task-loop form).
+        is_rubin = _target_is_rubin()
+        if use_flat_logits_view is None:
+            use_flat_logits_view = not is_rubin
+        if use_two_level_task_loop is None:
+            use_two_level_task_loop = not (is_rubin and next_n >= 4)
+        if use_paired_pipeline_polls is None:
+            use_paired_pipeline_polls = not (is_rubin and next_n >= 4)
+        self.use_flat_logits_view = use_flat_logits_view
+        self.use_two_level_task_loop = use_two_level_task_loop
+        self.use_paired_pipeline_polls = use_paired_pipeline_polls
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.next_n = next_n
@@ -633,15 +672,6 @@ class FP8MQALogitsKernel:
         start_kv_half = mScheduleMeta[(sm_idx, 1)]
         end_q_idx = mScheduleMeta[(sm_idx + 1, 0)]
         end_kv_half = mScheduleMeta[(sm_idx + 1, 1)]
-        # Early mContextLens load: overlap ~200-cycle L2 latency with the
-        # entire prologue setup (pipelines, SMEM alloc, TMA partition, etc.)
-        # Clamp to avoid OOB when start_q == batch_size (zero-work CTA sentinel).
-        # Note: zero-work CTAs get a stale current_num_kv (from the last batch
-        # element), but it is never used because has_work will be False.
-        start_q_clamped = min(start_q, batch_size - 1)
-        current_num_kv = (
-            mContextLens[start_q_clamped] + self.block_kv - 1
-        ) // self.block_kv
 
         if is_tma_warp:
             cpasync.prefetch_descriptor(tma_atom_a)
@@ -954,24 +984,35 @@ class FP8MQALogitsKernel:
         )
 
         # ===== SCHEDULER: derive values from early-loaded schedule metadata =====
-        end_kv_idx = end_kv_half * NUM_MATH_WG
+        # Consumers of the early schedule-metadata loads, placed at their
+        # real use site. Known codegen limitation (not worked around):
+        # the compiler does not keep these global loads and their
+        # consumers apart — regardless of source
+        # placement, the clamp+add+shift chain is hoisted right after its
+        # load, exposing the two L2 round-trips instead of hiding them
+        # under the independent mbarrier-init work. ptxas trades exposed
+        # load latency for shorter register lifetimes and re-solves to that
+        # optimum no matter the IR order; getting the sink from source needs
+        # a scheduling barrier (cfence) or a latency-aware cost model fix.
+        # Clamp to avoid OOB when start_q == batch_size (zero-work CTA
+        # sentinel). Zero-work CTAs get a stale current_num_kv, never used
+        # because has_work will be False.
+        start_q_clamped = min(start_q, batch_size - 1)
+        current_num_kv = (
+            mContextLens[start_q_clamped] + self.block_kv - 1
+        ) // self.block_kv
 
-        # Convert start to KV block units (matching DeepGEMM)
-        current_q_idx = start_q
-        current_kv_idx = start_kv_half * NUM_MATH_WG
-
-        # ===== COMMON SCHEDULER STATE (before warp branches) =====
-        # Each warp role independently maintains its own copy of these
-        # variables (like DeepGEMM where each role creates its own scheduler).
-        # Pre-fetch first task (current_num_kv loaded early above for latency hiding)
-        next_q_idx = current_q_idx
-        next_kv_idx = current_kv_idx
-        next_num_kv = current_num_kv
-        # Sentinel: no previous batch (matches DeepGEMM's q_idx = batch_size)
-        q_idx = batch_size
-        # While-loop termination flag (matches DeepGEMM's fetch_next_task pattern).
-        # True if this CTA has work assigned (start != end in schedule_meta).
-        has_work = (current_q_idx != end_q_idx) | (current_kv_idx != end_kv_idx)
+        # ===== SCHEDULER STATE: sunk into each warp-role branch =====
+        # Each warp role derives its own scheduler-state copy (end_kv_idx,
+        # next_q_idx/next_kv_idx/next_num_kv, q_idx sentinel, has_work) from
+        # the early-loaded schedule metadata AFTER its warpgroup_reg_alloc/
+        # dealloc call. Deriving it here (before the branches) placed the
+        # loop-carried values under the shared prologue register budget,
+        # where the register pressure before the setmaxnreg
+        # reallocation forced ptxas to spill the kv cursor + bound pair
+        # to local memory; deriving per role eliminates
+        # the spill. The block is pure arithmetic on already-loaded values,
+        # so per-branch duplication is semantics-preserving.
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
@@ -981,6 +1022,15 @@ class FP8MQALogitsKernel:
             # TMA warp 0: loads Q (prefetch) + KV for group 0
             # Matches DeepGEMM's TMA warp with kv_group_idx == 0
             cute.arch.warpgroup_reg_dealloc(24)
+
+            # Per-role scheduler state (see comment above the branch chain)
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
             lane_idx = tidx % 32
 
             # Block table prefetch: 32 lanes cache block indices,
@@ -1144,6 +1194,15 @@ class FP8MQALogitsKernel:
             # TMA warp 1: loads KV + Scale for group 1 only
             # Matches DeepGEMM's TMA warp with kv_group_idx == 1
             cute.arch.warpgroup_reg_dealloc(24)
+
+            # Per-role scheduler state (see comment above the branch chain)
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
             lane_idx = tidx % 32
 
             # Block table prefetch for group 1
@@ -1235,6 +1294,14 @@ class FP8MQALogitsKernel:
             # writes are visible.
             cute.arch.warpgroup_reg_dealloc(24)
 
+            # Per-role scheduler state (see comment above the branch chain)
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
             # TMEM: wait for math warp 0's allocation, retrieve pointer
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
@@ -1323,6 +1390,14 @@ class FP8MQALogitsKernel:
             # start GEMM before TMA warp 0 finishes loading Q into SMEM.
             cute.arch.warpgroup_reg_dealloc(24)
 
+            # Per-role scheduler state (see comment above the branch chain)
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
             # TMEM: wait for umma_warp_0's allocation, retrieve pointer
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
@@ -1405,6 +1480,16 @@ class FP8MQALogitsKernel:
         elif is_math_warp:
             cute.arch.warpgroup_reg_alloc(240)
 
+            # Per-role scheduler state (see comment above the branch chain).
+            # Derived AFTER warpgroup_reg_alloc(240) so the loop-carried
+            # scheduler words live under the 240-register math budget.
+            end_kv_idx = end_kv_half * NUM_MATH_WG
+            next_q_idx = start_q
+            next_kv_idx = start_kv_half * NUM_MATH_WG
+            next_num_kv = current_num_kv
+            q_idx = batch_size  # sentinel: no previous batch
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
             # TMEM: math warp 0 is the allocator; all math warps wait + retrieve
             tmem.allocate(num_tmem_alloc_cols_total)
             tmem.wait_for_alloc()
@@ -1464,6 +1549,32 @@ class FP8MQALogitsKernel:
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
+                # Flat logits view + carried row offset: the store address
+                # is base + out_row*stride0 + kv_pos, but out_row only
+                # changes on q-change. Recomputing the row term there (cold
+                # path) leaves the hot path a single add — the wide-multiply
+                # address chain otherwise re-materializes every task because
+                # the while-loop control flow hides the invariance.
+                # Gated off on Rubin (sm_107): there the backend schedules the
+                # UMMA consumer-release late in the math loop, throttling the
+                # MMA pipe per KV tile — regresses, growing with ctx.
+                # The 2D alias below keeps `mLogits` itself out of the gated
+                # store code: referencing a defined tensor from the untraced
+                # arm changes the loop-region captures (and the SASS schedule
+                # with it), while an undefined name is dropped harmlessly.
+                if cutlass.const_expr(self.use_flat_logits_view):
+                    logits_stride0 = cutlass.Int32(mLogits.layout.stride[0])
+                    # Sized by the pitched span (rows * stride0), not the
+                    # visible width: stores also cover the aligned padding
+                    # past max_context_len (host allocates the full pitch).
+                    mLogits_flat = cute.make_tensor(
+                        mLogits.iterator,
+                        cute.make_layout(cute.size(mLogits, mode=[0]) * logits_stride0),
+                    )
+                    out_row_off = cutlass.Int32(0)
+                else:
+                    mLogits_2d = mLogits
+
                 while has_work:
                     # fetch_next_task: commit next → current
                     q_idx_old = q_idx
@@ -1478,218 +1589,319 @@ class FP8MQALogitsKernel:
                             q_cons_state.advance()
                         q_pipeline.consumer_wait(q_cons_state)
                         q_stage_local = q_cons_state.index
+                        if cutlass.const_expr(self.use_flat_logits_view):
+                            out_row_off = (q_idx * next_n) * logits_stride0
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
                                 w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
                                     (t_i * num_heads + w_j, q_stage_local)
                                 ]
+                    # ---- inner: hot kv loop within this q ----
+                    # Two-level restructure: the two cold blocks (q-change
+                    # weight preload above, q-rollover ctx reload below) execute
+                    # rarely but sat inline in the single flat loop, costing
+                    # taken-branch fetch bubbles on every hot iteration. The
+                    # inner loop below replays exactly the original task sequence:
+                    #   original: process (q, kv); next_kv = kv + W;
+                    #             roll over to (q+1, 0) if next_kv >= num_kv;
+                    #             stop when (next_q, next_kv) == (end_q, end_kv).
+                    # Truth table for kv_go after processing (q, kv) and advancing
+                    # kv += W (W = NUM_MATH_WG):
+                    #   kv <  num_kv, (q, kv) != end -> True  (more kv in this q)
+                    #   kv <  num_kv, (q, kv) == end -> False (global end mid-q)
+                    #   kv >= num_kv, any            -> False (q exhausted; outer
+                    #                                          rollover runs next)
+                    # First iteration is unconditional, matching the original: the
+                    # outer while is only entered when the committed (q, kv) != end.
+                    # Gate (use_two_level_task_loop=False, Rubin nn>=4 auto):
+                    # forcing kv_go False after the body degenerates the inner
+                    # loop to a single trip, restoring the original flat loop
+                    # (per-task q-change check) without duplicating the skeleton.
+                    kv_go = cutlass.Boolean(True)
+                    while kv_go:
+                        # Process KV block for group 0 (kv_idx + 0)
+                        # Unconditional Math (like DeepGEMM): OOB results
+                        # written to aligned padding region in logits buffer.
+                        kv_pos = kv_idx * block_kv_val + m_coord
 
-                    # Process KV block for group 0 (kv_idx + 0)
-                    # Unconditional Math (like DeepGEMM): OOB results
-                    # written to aligned padding region in logits buffer.
-                    kv_pos = kv_idx * block_kv_val + m_coord
-
-                    if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
-                        # Skip KV wait, rely on UMMA barrier's
-                        # transitive visibility.
-                        umma_pipeline_0.consumer_wait(umma_cons_state_0)
-                    else:
-                        # Default: wait KV first to overlap lds with
-                        # UMMA computation.
-                        kv_pipeline_0.consumer_wait(kv_cons_state_math_0)
-                        sc_stage_0 = kv_cons_state_math_0.index
-                        scale_val = sScales_0[(m_coord, sc_stage_0)]
-                        umma_pipeline_0.consumer_wait(umma_cons_state_0)
-
-                    # --- TMEM sub-tile setup ---
-                    # flat_divide accumulator by sub-tile shape;
-                    # partition once, then loop over sub-tiles.
-                    tCtAcc_c0 = tCtAcc_base_0[
-                        (None, None, None, umma_cons_state_0.index)
-                    ]
-                    tAcc_c0 = tCtAcc_c0[((None, None), 0, 0)]
-                    tAcc_c0_epi = cute.flat_divide(tAcc_c0, epi_sub_mn)
-                    tc_0 = tcgen05.make_tmem_copy(
-                        copy_atom_t2r, tAcc_c0_epi[(None, None, 0, 0)]
-                    )
-                    tr_0 = tc_0.get_slice(local_tidx)
-                    tTR_0 = tr_0.partition_S(tAcc_c0_epi)
-
-                    # --- First sub-tile LDTM + KV release ---
-                    if cutlass.const_expr(self.early_tmem_copy):
-                        # Issue first sub-tile LDTM early
-                        cute.copy(tc_0, tTR_0[(None, None, None, 0, 0)], tTR_rAcc)
-                        # Scale LDS + KV release fill latency
                         if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
+                            # Skip KV wait, rely on UMMA barrier's
+                            # transitive visibility.
+                            umma_pipeline_0.consumer_wait(umma_cons_state_0)
+                        elif cutlass.const_expr(self.use_paired_pipeline_polls):
+                            # Issue both barrier polls back-to-back so their
+                            # mbarrier round-trips overlap instead of running
+                            # serially; each blocking wait below short-circuits
+                            # when its poll already saw the barrier flipped.
+                            kv_ready_0 = kv_pipeline_0.consumer_try_wait(
+                                kv_cons_state_math_0
+                            )
+                            umma_ready_0 = umma_pipeline_0.consumer_try_wait(
+                                umma_cons_state_0
+                            )
+                            kv_pipeline_0.consumer_wait(
+                                kv_cons_state_math_0, kv_ready_0
+                            )
                             sc_stage_0 = kv_cons_state_math_0.index
                             scale_val = sScales_0[(m_coord, sc_stage_0)]
-                        kv_pipeline_0.consumer_release(kv_cons_state_math_0)
-                        kv_cons_state_math_0.advance()
-                        cute.arch.fence_view_async_tmem_load()
-                    else:
-                        # Default: scale LDS + KV release first
-                        if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
-                            sc_stage_0 = kv_cons_state_math_0.index
-                            scale_val = sScales_0[(m_coord, sc_stage_0)]
-                        kv_pipeline_0.consumer_release(kv_cons_state_math_0)
-                        kv_cons_state_math_0.advance()
-                        cute.copy(tc_0, tTR_0[(None, None, None, 0, 0)], tTR_rAcc)
-                        cute.arch.fence_view_async_tmem_load()
-
-                    # --- Sub-tile compute loop ---
-                    # Each sub-tile: LDTM.xN → fence → load →
-                    # ReLU+FMA. Breaks FMA chain (16→4 per chunk)
-                    # and interleaves LDTM with FP32 compute to
-                    # reduce ShadowPipeThrottle.
-                    # Sub-tiles are within each t-slot (num_heads
-                    # // num_epi_subtiles wide). flat_divide yields
-                    # next_n * num_epi_subtiles sub-tiles total;
-                    # global index = t * num_epi_subtiles + i.
-                    subtile_n = num_heads // num_epi_subtiles
-                    if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                        packed_zero = pack_f16x2(Float16(0.0), Float16(0.0))
-                    for t in cutlass.range_constexpr(next_n):
-                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            ps0 = packed_zero
-                            ps1 = packed_zero
+                            umma_pipeline_0.consumer_wait(
+                                umma_cons_state_0, umma_ready_0
+                            )
                         else:
-                            s0x = cutlass.Float32(0.0)
-                            s0y = cutlass.Float32(0.0)
-                            s1x = cutlass.Float32(0.0)
-                            s1y = cutlass.Float32(0.0)
-                        for i in cutlass.range_constexpr(num_epi_subtiles):
-                            # LDTM for sub-tiles 1..N-1
-                            # (sub-tile 0 handled above)
-                            if t > 0 or i > 0:
-                                cute.copy(
-                                    tc_0,
-                                    tTR_0[
-                                        (None, None, None, 0, t * num_epi_subtiles + i)
-                                    ],
-                                    tTR_rAcc,
+                            # Gated (Rubin nn>=4 auto): plain waits, KV first to
+                            # overlap the scale SMEM load with UMMA computation.
+                            kv_pipeline_0.consumer_wait(kv_cons_state_math_0)
+                            sc_stage_0 = kv_cons_state_math_0.index
+                            scale_val = sScales_0[(m_coord, sc_stage_0)]
+                            umma_pipeline_0.consumer_wait(umma_cons_state_0)
+
+                        # --- TMEM sub-tile setup ---
+                        # flat_divide accumulator by sub-tile shape;
+                        # partition once, then loop over sub-tiles.
+                        tCtAcc_c0 = tCtAcc_base_0[
+                            (None, None, None, umma_cons_state_0.index)
+                        ]
+                        tAcc_c0 = tCtAcc_c0[((None, None), 0, 0)]
+                        tAcc_c0_epi = cute.flat_divide(tAcc_c0, epi_sub_mn)
+                        # Every UMMA stage shares the staged-fragment layout and
+                        # differs only in TMEM base address, so the pre-loop
+                        # tiled copy / thread slice partition every stage;
+                        # rebuilding them per task re-derives loop-invariant
+                        # copy descriptors inside the hot loop.
+                        tTR_0 = thr_copy_ref_0.partition_S(tAcc_c0_epi)
+
+                        # --- First sub-tile LDTM + KV release ---
+                        if cutlass.const_expr(self.early_tmem_copy):
+                            # Issue first sub-tile LDTM early
+                            cute.copy(
+                                tiled_copy_ref_0,
+                                tTR_0[(None, None, None, 0, 0)],
+                                tTR_rAcc,
+                            )
+                            # Scale LDS + KV release fill latency
+                            if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
+                                sc_stage_0 = kv_cons_state_math_0.index
+                                scale_val = sScales_0[(m_coord, sc_stage_0)]
+                            kv_pipeline_0.consumer_release(kv_cons_state_math_0)
+                            kv_cons_state_math_0.advance()
+                            cute.arch.fence_view_async_tmem_load()
+                        else:
+                            # Default: scale LDS + KV release first
+                            if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
+                                sc_stage_0 = kv_cons_state_math_0.index
+                                scale_val = sScales_0[(m_coord, sc_stage_0)]
+                            kv_pipeline_0.consumer_release(kv_cons_state_math_0)
+                            kv_cons_state_math_0.advance()
+                            cute.copy(
+                                tiled_copy_ref_0,
+                                tTR_0[(None, None, None, 0, 0)],
+                                tTR_rAcc,
+                            )
+                            cute.arch.fence_view_async_tmem_load()
+
+                        # --- Sub-tile compute loop ---
+                        # Each sub-tile: LDTM.xN → fence → load →
+                        # ReLU+FMA. Breaks FMA chain (16→4 per chunk)
+                        # and interleaves LDTM with FP32 compute to
+                        # reduce ShadowPipeThrottle.
+                        # Sub-tiles are within each t-slot (num_heads
+                        # // num_epi_subtiles wide). flat_divide yields
+                        # next_n * num_epi_subtiles sub-tiles total;
+                        # global index = t * num_epi_subtiles + i.
+                        subtile_n = num_heads // num_epi_subtiles
+                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                            packed_zero = pack_f16x2(Float16(0.0), Float16(0.0))
+                        for t in cutlass.range_constexpr(next_n):
+                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                                ps0 = packed_zero
+                                ps1 = packed_zero
+                            else:
+                                s0x = cutlass.Float32(0.0)
+                                s0y = cutlass.Float32(0.0)
+                                s1x = cutlass.Float32(0.0)
+                                s1y = cutlass.Float32(0.0)
+                            for i in cutlass.range_constexpr(num_epi_subtiles):
+                                # LDTM for sub-tiles 1..N-1
+                                # (sub-tile 0 handled above)
+                                if t > 0 or i > 0:
+                                    cute.copy(
+                                        tiled_copy_ref_0,
+                                        tTR_0[
+                                            (
+                                                None,
+                                                None,
+                                                None,
+                                                0,
+                                                t * num_epi_subtiles + i,
+                                            )
+                                        ],
+                                        tTR_rAcc,
+                                    )
+                                    cute.arch.fence_view_async_tmem_load()
+                                # Release UMMA after last LDTM+fence
+                                if t == next_n - 1 and i == num_epi_subtiles - 1:
+                                    umma_pipeline_0.consumer_release(umma_cons_state_0)
+                                    umma_cons_state_0.advance()
+                                acc_vec = tTR_rAcc.load()
+                                # Reg-path: weights from registers
+                                reg_h_end = min(
+                                    subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
                                 )
-                                cute.arch.fence_view_async_tmem_load()
-                            # Release UMMA after last LDTM+fence
-                            if t == next_n - 1 and i == num_epi_subtiles - 1:
-                                umma_pipeline_0.consumer_release(umma_cons_state_0)
-                                umma_cons_state_0.advance()
-                            acc_vec = tTR_rAcc.load()
-                            # Reg-path: weights from registers
-                            reg_h_end = min(
-                                subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
-                            )
-                            for h in cutlass.range_constexpr(0, reg_h_end, 4):
-                                n0 = h
-                                h_g = i * subtile_n + h
+                                for h in cutlass.range_constexpr(0, reg_h_end, 4):
+                                    n0 = h
+                                    h_g = i * subtile_n + h
+                                    if cutlass.const_expr(
+                                        self.epi_dtype == cutlass.Float16
+                                    ):
+                                        pa01 = pack_f16x2(
+                                            Float16(acc_vec[n0]),
+                                            Float16(acc_vec[n0 + 1]),
+                                        )
+                                        pa23 = pack_f16x2(
+                                            Float16(acc_vec[n0 + 2]),
+                                            Float16(acc_vec[n0 + 3]),
+                                        )
+                                        pa01 = max_f16x2(pa01, packed_zero)
+                                        pa23 = max_f16x2(pa23, packed_zero)
+                                        r0 = t * NUM_W_IN_REG + h_g
+                                        pw01 = pack_f16x2(w_cache[r0], w_cache[r0 + 1])
+                                        pw23 = pack_f16x2(
+                                            w_cache[r0 + 2], w_cache[r0 + 3]
+                                        )
+                                        ps0 = fma_f16x2(pa01, pw01, ps0)
+                                        ps1 = fma_f16x2(pa23, pw23, ps1)
+                                    else:
+                                        a0 = cutlass.max(
+                                            acc_vec[n0], cutlass.Float32(0.0)
+                                        )
+                                        a1 = cutlass.max(
+                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
+                                        )
+                                        a2 = cutlass.max(
+                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
+                                        )
+                                        a3 = cutlass.max(
+                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
+                                        )
+                                        r0 = t * NUM_W_IN_REG + h_g
+                                        w0 = w_cache[r0]
+                                        w1 = w_cache[r0 + 1]
+                                        w2 = w_cache[r0 + 2]
+                                        w3 = w_cache[r0 + 3]
+                                        s0x, s0y = cute.arch.fma_packed_f32x2(
+                                            (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
+                                        )
+                                        s1x, s1y = cute.arch.fma_packed_f32x2(
+                                            (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
+                                        )
+                                # SMEM-path: weights from shared mem
+                                smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
+                                for h in cutlass.range_constexpr(
+                                    smem_h_start, subtile_n, 4
+                                ):
+                                    n0 = h
+                                    h_g = i * subtile_n + h
+                                    if cutlass.const_expr(
+                                        self.epi_dtype == cutlass.Float16
+                                    ):
+                                        pa01 = pack_f16x2(
+                                            Float16(acc_vec[n0]),
+                                            Float16(acc_vec[n0 + 1]),
+                                        )
+                                        pa23 = pack_f16x2(
+                                            Float16(acc_vec[n0 + 2]),
+                                            Float16(acc_vec[n0 + 3]),
+                                        )
+                                        pa01 = max_f16x2(pa01, packed_zero)
+                                        pa23 = max_f16x2(pa23, packed_zero)
+                                        pw01 = pack_f16x2(
+                                            sW[(t * num_heads + h_g, q_stage_local)],
+                                            sW[
+                                                (t * num_heads + h_g + 1, q_stage_local)
+                                            ],
+                                        )
+                                        pw23 = pack_f16x2(
+                                            sW[
+                                                (t * num_heads + h_g + 2, q_stage_local)
+                                            ],
+                                            sW[
+                                                (t * num_heads + h_g + 3, q_stage_local)
+                                            ],
+                                        )
+                                        ps0 = fma_f16x2(pa01, pw01, ps0)
+                                        ps1 = fma_f16x2(pa23, pw23, ps1)
+                                    else:
+                                        a0 = cutlass.max(
+                                            acc_vec[n0], cutlass.Float32(0.0)
+                                        )
+                                        a1 = cutlass.max(
+                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
+                                        )
+                                        a2 = cutlass.max(
+                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
+                                        )
+                                        a3 = cutlass.max(
+                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
+                                        )
+                                        w0 = sW[(t * num_heads + h_g, q_stage_local)]
+                                        w1 = sW[
+                                            (t * num_heads + h_g + 1, q_stage_local)
+                                        ]
+                                        w2 = sW[
+                                            (t * num_heads + h_g + 2, q_stage_local)
+                                        ]
+                                        w3 = sW[
+                                            (t * num_heads + h_g + 3, q_stage_local)
+                                        ]
+                                        s0x, s0y = cute.arch.fma_packed_f32x2(
+                                            (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
+                                        )
+                                        s1x, s1y = cute.arch.fma_packed_f32x2(
+                                            (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
+                                        )
+                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                                ps_sum = add_f16x2(ps0, ps1)
+                                sum_lo, sum_hi = unpack_f16x2(ps_sum)
+                                result_t = sum_lo + sum_hi
+                            else:
+                                result_t = s0x + s0y + s1x + s1y
+                            if cutlass.const_expr(self.use_flat_logits_view):
+                                out_off_t = out_row_off + t * logits_stride0 + kv_pos
                                 if cutlass.const_expr(
                                     self.epi_dtype == cutlass.Float16
                                 ):
-                                    pa01 = pack_f16x2(
-                                        Float16(acc_vec[n0]), Float16(acc_vec[n0 + 1])
+                                    mLogits_flat[out_off_t] = self.output_dtype(
+                                        result_t * Float16(scale_val)
                                     )
-                                    pa23 = pack_f16x2(
-                                        Float16(acc_vec[n0 + 2]),
-                                        Float16(acc_vec[n0 + 3]),
-                                    )
-                                    pa01 = max_f16x2(pa01, packed_zero)
-                                    pa23 = max_f16x2(pa23, packed_zero)
-                                    r0 = t * NUM_W_IN_REG + h_g
-                                    pw01 = pack_f16x2(w_cache[r0], w_cache[r0 + 1])
-                                    pw23 = pack_f16x2(w_cache[r0 + 2], w_cache[r0 + 3])
-                                    ps0 = fma_f16x2(pa01, pw01, ps0)
-                                    ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(
-                                        acc_vec[n0 + 1], cutlass.Float32(0.0)
+                                    mLogits_flat[out_off_t] = self.output_dtype(
+                                        result_t * scale_val
                                     )
-                                    a2 = cutlass.max(
-                                        acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                    )
-                                    a3 = cutlass.max(
-                                        acc_vec[n0 + 3], cutlass.Float32(0.0)
-                                    )
-                                    r0 = t * NUM_W_IN_REG + h_g
-                                    w0 = w_cache[r0]
-                                    w1 = w_cache[r0 + 1]
-                                    w2 = w_cache[r0 + 2]
-                                    w3 = w_cache[r0 + 3]
-                                    s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
-                                    )
-                                    s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
-                                    )
-                            # SMEM-path: weights from shared mem
-                            smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
-                            for h in cutlass.range_constexpr(
-                                smem_h_start, subtile_n, 4
-                            ):
-                                n0 = h
-                                h_g = i * subtile_n + h
+                            else:
+                                out_row = q_idx * next_n + t
                                 if cutlass.const_expr(
                                     self.epi_dtype == cutlass.Float16
                                 ):
-                                    pa01 = pack_f16x2(
-                                        Float16(acc_vec[n0]), Float16(acc_vec[n0 + 1])
+                                    mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
+                                        result_t * Float16(scale_val)
                                     )
-                                    pa23 = pack_f16x2(
-                                        Float16(acc_vec[n0 + 2]),
-                                        Float16(acc_vec[n0 + 3]),
-                                    )
-                                    pa01 = max_f16x2(pa01, packed_zero)
-                                    pa23 = max_f16x2(pa23, packed_zero)
-                                    pw01 = pack_f16x2(
-                                        sW[(t * num_heads + h_g, q_stage_local)],
-                                        sW[(t * num_heads + h_g + 1, q_stage_local)],
-                                    )
-                                    pw23 = pack_f16x2(
-                                        sW[(t * num_heads + h_g + 2, q_stage_local)],
-                                        sW[(t * num_heads + h_g + 3, q_stage_local)],
-                                    )
-                                    ps0 = fma_f16x2(pa01, pw01, ps0)
-                                    ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(
-                                        acc_vec[n0 + 1], cutlass.Float32(0.0)
+                                    mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
+                                        result_t * scale_val
                                     )
-                                    a2 = cutlass.max(
-                                        acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                    )
-                                    a3 = cutlass.max(
-                                        acc_vec[n0 + 3], cutlass.Float32(0.0)
-                                    )
-                                    w0 = sW[(t * num_heads + h_g, q_stage_local)]
-                                    w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
-                                    w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
-                                    w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
-                                    s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
-                                    )
-                                    s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
-                                    )
-                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            ps_sum = add_f16x2(ps0, ps1)
-                            sum_lo, sum_hi = unpack_f16x2(ps_sum)
-                            result_t = sum_lo + sum_hi
-                        else:
-                            result_t = s0x + s0y + s1x + s1y
-                        out_row = q_idx * next_n + t
-                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * Float16(scale_val)
-                            )
-                        else:
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * scale_val
-                            )
+                        # Advance within this q
+                        kv_idx = kv_idx + NUM_MATH_WG
+                        kv_go = (kv_idx < num_kv) & (
+                            (q_idx != end_q_idx) | (kv_idx != end_kv_idx)
+                        )
+                        if cutlass.const_expr(not self.use_two_level_task_loop):
+                            kv_go = cutlass.Boolean(False)
 
-                    # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
-                    if next_kv_idx >= num_kv:
+                    # ---- outer: rollover ----
+                    if kv_idx >= num_kv:
+                        # Inner loop exhausted this q's kv range: advance to the
+                        # next q (same as the original rollover path).
                         next_q_idx = q_idx + 1
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
@@ -1712,6 +1924,13 @@ class FP8MQALogitsKernel:
                                 next_num_kv = (
                                     mContextLens[next_q_idx] + block_kv_val - 1
                                 ) // block_kv_val
+                    else:
+                        # Global end hit mid-q: next == (q_idx, kv_idx) == end,
+                        # so has_work goes False below. kv_idx was already
+                        # advanced past the last processed task in the inner
+                        # loop, so this matches the original's next_kv_idx.
+                        next_q_idx = q_idx
+                        next_kv_idx = kv_idx
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
@@ -1764,6 +1983,27 @@ class FP8MQALogitsKernel:
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 q_stage_local = cutlass.Int32(0)
 
+                # Flat logits view + carried row offset (see Math WG 0).
+                # Gated off on Rubin (sm_107): there the backend schedules the
+                # UMMA consumer-release late in the math loop, throttling the
+                # MMA pipe per KV tile — regresses, growing with ctx.
+                # The 2D alias below keeps `mLogits` itself out of the gated
+                # store code: referencing a defined tensor from the untraced
+                # arm changes the loop-region captures (and the SASS schedule
+                # with it), while an undefined name is dropped harmlessly.
+                if cutlass.const_expr(self.use_flat_logits_view):
+                    logits_stride0 = cutlass.Int32(mLogits.layout.stride[0])
+                    # Sized by the pitched span (rows * stride0), not the
+                    # visible width: stores also cover the aligned padding
+                    # past max_context_len (host allocates the full pitch).
+                    mLogits_flat = cute.make_tensor(
+                        mLogits.iterator,
+                        cute.make_layout(cute.size(mLogits, mode=[0]) * logits_stride0),
+                    )
+                    out_row_off = cutlass.Int32(0)
+                else:
+                    mLogits_2d = mLogits
+
                 while has_work:
                     # fetch_next_task: commit next → current
                     q_idx_old = q_idx
@@ -1778,199 +2018,304 @@ class FP8MQALogitsKernel:
                             q_cons_state.advance()
                         q_pipeline.consumer_wait(q_cons_state)
                         q_stage_local = q_cons_state.index
+                        if cutlass.const_expr(self.use_flat_logits_view):
+                            out_row_off = (q_idx * next_n) * logits_stride0
                         # Preload first NUM_W_IN_REG weights per slot
                         for t_i in cutlass.range_constexpr(next_n):
                             for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
                                 w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
                                     (t_i * num_heads + w_j, q_stage_local)
                                 ]
+                    # ---- inner: hot kv loop within this q ----
+                    # Two-level restructure: the two cold blocks (q-change
+                    # weight preload above, q-rollover ctx reload below) execute
+                    # rarely but sat inline in the single flat loop, costing
+                    # taken-branch fetch bubbles on every hot iteration. The
+                    # inner loop below replays exactly the original task sequence:
+                    #   original: process (q, kv); next_kv = kv + W;
+                    #             roll over to (q+1, 0) if next_kv >= num_kv;
+                    #             stop when (next_q, next_kv) == (end_q, end_kv).
+                    # Truth table for kv_go after processing (q, kv) and advancing
+                    # kv += W (W = NUM_MATH_WG):
+                    #   kv <  num_kv, (q, kv) != end -> True  (more kv in this q)
+                    #   kv <  num_kv, (q, kv) == end -> False (global end mid-q)
+                    #   kv >= num_kv, any            -> False (q exhausted; outer
+                    #                                          rollover runs next)
+                    # First iteration is unconditional, matching the original: the
+                    # outer while is only entered when the committed (q, kv) != end.
+                    # Gate (use_two_level_task_loop=False, Rubin nn>=4 auto):
+                    # forcing kv_go False after the body degenerates the inner
+                    # loop to a single trip, restoring the original flat loop
+                    # (per-task q-change check) without duplicating the skeleton.
+                    kv_go = cutlass.Boolean(True)
+                    while kv_go:
+                        # Process KV block for group 1 (kv_idx + 1)
+                        # Unconditional Math (like DeepGEMM)
+                        kv_idx_1 = kv_idx + 1
 
-                    # Process KV block for group 1 (kv_idx + 1)
-                    # Unconditional Math (like DeepGEMM)
-                    kv_idx_1 = kv_idx + 1
+                        kv_pos = kv_idx_1 * block_kv_val + m_coord
 
-                    kv_pos = kv_idx_1 * block_kv_val + m_coord
-
-                    if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
-                        umma_pipeline_1.consumer_wait(umma_cons_state_1)
-                    else:
-                        kv_pipeline_1.consumer_wait(kv_cons_state_math_1)
-                        sc_stage_1 = kv_cons_state_math_1.index
-                        scale_val = sScales_1[(m_coord, sc_stage_1)]
-                        umma_pipeline_1.consumer_wait(umma_cons_state_1)
-
-                    # --- TMEM sub-tile setup (WG1) ---
-                    tCtAcc_c1 = tCtAcc_base_1[
-                        (None, None, None, umma_cons_state_1.index)
-                    ]
-                    tAcc_c1 = tCtAcc_c1[((None, None), 0, 0)]
-                    tAcc_c1_epi = cute.flat_divide(tAcc_c1, epi_sub_mn)
-                    tc_1 = tcgen05.make_tmem_copy(
-                        copy_atom_t2r, tAcc_c1_epi[(None, None, 0, 0)]
-                    )
-                    tr_1 = tc_1.get_slice(local_tidx)
-                    tTR_1 = tr_1.partition_S(tAcc_c1_epi)
-
-                    # --- First sub-tile LDTM + KV release (WG1) ---
-                    if cutlass.const_expr(self.early_tmem_copy):
-                        cute.copy(tc_1, tTR_1[(None, None, None, 0, 0)], tTR_rAcc)
                         if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
+                            # Skip KV wait, rely on UMMA barrier's
+                            # transitive visibility.
+                            umma_pipeline_1.consumer_wait(umma_cons_state_1)
+                        elif cutlass.const_expr(self.use_paired_pipeline_polls):
+                            # Issue both barrier polls back-to-back so their
+                            # mbarrier round-trips overlap instead of running
+                            # serially; each blocking wait below short-circuits
+                            # when its poll already saw the barrier flipped.
+                            kv_ready_1 = kv_pipeline_1.consumer_try_wait(
+                                kv_cons_state_math_1
+                            )
+                            umma_ready_1 = umma_pipeline_1.consumer_try_wait(
+                                umma_cons_state_1
+                            )
+                            kv_pipeline_1.consumer_wait(
+                                kv_cons_state_math_1, kv_ready_1
+                            )
                             sc_stage_1 = kv_cons_state_math_1.index
                             scale_val = sScales_1[(m_coord, sc_stage_1)]
-                        kv_pipeline_1.consumer_release(kv_cons_state_math_1)
-                        kv_cons_state_math_1.advance()
-                        cute.arch.fence_view_async_tmem_load()
-                    else:
-                        if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
-                            sc_stage_1 = kv_cons_state_math_1.index
-                            scale_val = sScales_1[(m_coord, sc_stage_1)]
-                        kv_pipeline_1.consumer_release(kv_cons_state_math_1)
-                        kv_cons_state_math_1.advance()
-                        cute.copy(tc_1, tTR_1[(None, None, None, 0, 0)], tTR_rAcc)
-                        cute.arch.fence_view_async_tmem_load()
-
-                    # --- Sub-tile compute loop (WG1) ---
-                    subtile_n = num_heads // num_epi_subtiles
-                    if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                        packed_zero = pack_f16x2(Float16(0.0), Float16(0.0))
-                    for t in cutlass.range_constexpr(next_n):
-                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            ps0 = packed_zero
-                            ps1 = packed_zero
+                            umma_pipeline_1.consumer_wait(
+                                umma_cons_state_1, umma_ready_1
+                            )
                         else:
-                            s0x = cutlass.Float32(0.0)
-                            s0y = cutlass.Float32(0.0)
-                            s1x = cutlass.Float32(0.0)
-                            s1y = cutlass.Float32(0.0)
-                        for i in cutlass.range_constexpr(num_epi_subtiles):
-                            if t > 0 or i > 0:
-                                cute.copy(
-                                    tc_1,
-                                    tTR_1[
-                                        (None, None, None, 0, t * num_epi_subtiles + i)
-                                    ],
-                                    tTR_rAcc,
+                            # Gated (Rubin nn>=4 auto): plain waits, KV first to
+                            # overlap the scale SMEM load with UMMA computation.
+                            kv_pipeline_1.consumer_wait(kv_cons_state_math_1)
+                            sc_stage_1 = kv_cons_state_math_1.index
+                            scale_val = sScales_1[(m_coord, sc_stage_1)]
+                            umma_pipeline_1.consumer_wait(umma_cons_state_1)
+
+                        # --- TMEM sub-tile setup (WG1) ---
+                        tCtAcc_c1 = tCtAcc_base_1[
+                            (None, None, None, umma_cons_state_1.index)
+                        ]
+                        tAcc_c1 = tCtAcc_c1[((None, None), 0, 0)]
+                        tAcc_c1_epi = cute.flat_divide(tAcc_c1, epi_sub_mn)
+                        # Every UMMA stage shares the staged-fragment layout and
+                        # differs only in TMEM base address, so the pre-loop
+                        # tiled copy / thread slice partition every stage;
+                        # rebuilding them per task re-derives loop-invariant
+                        # copy descriptors inside the hot loop.
+                        tTR_1 = thr_copy_ref_1.partition_S(tAcc_c1_epi)
+
+                        # --- First sub-tile LDTM + KV release (WG1) ---
+                        if cutlass.const_expr(self.early_tmem_copy):
+                            cute.copy(
+                                tiled_copy_ref_1,
+                                tTR_1[(None, None, None, 0, 0)],
+                                tTR_rAcc,
+                            )
+                            if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
+                                sc_stage_1 = kv_cons_state_math_1.index
+                                scale_val = sScales_1[(m_coord, sc_stage_1)]
+                            kv_pipeline_1.consumer_release(kv_cons_state_math_1)
+                            kv_cons_state_math_1.advance()
+                            cute.arch.fence_view_async_tmem_load()
+                        else:
+                            if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
+                                sc_stage_1 = kv_cons_state_math_1.index
+                                scale_val = sScales_1[(m_coord, sc_stage_1)]
+                            kv_pipeline_1.consumer_release(kv_cons_state_math_1)
+                            kv_cons_state_math_1.advance()
+                            cute.copy(
+                                tiled_copy_ref_1,
+                                tTR_1[(None, None, None, 0, 0)],
+                                tTR_rAcc,
+                            )
+                            cute.arch.fence_view_async_tmem_load()
+
+                        # --- Sub-tile compute loop (WG1) ---
+                        subtile_n = num_heads // num_epi_subtiles
+                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                            packed_zero = pack_f16x2(Float16(0.0), Float16(0.0))
+                        for t in cutlass.range_constexpr(next_n):
+                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                                ps0 = packed_zero
+                                ps1 = packed_zero
+                            else:
+                                s0x = cutlass.Float32(0.0)
+                                s0y = cutlass.Float32(0.0)
+                                s1x = cutlass.Float32(0.0)
+                                s1y = cutlass.Float32(0.0)
+                            for i in cutlass.range_constexpr(num_epi_subtiles):
+                                if t > 0 or i > 0:
+                                    cute.copy(
+                                        tiled_copy_ref_1,
+                                        tTR_1[
+                                            (
+                                                None,
+                                                None,
+                                                None,
+                                                0,
+                                                t * num_epi_subtiles + i,
+                                            )
+                                        ],
+                                        tTR_rAcc,
+                                    )
+                                    cute.arch.fence_view_async_tmem_load()
+                                if t == next_n - 1 and i == num_epi_subtiles - 1:
+                                    umma_pipeline_1.consumer_release(umma_cons_state_1)
+                                    umma_cons_state_1.advance()
+                                acc_vec = tTR_rAcc.load()
+                                # Reg-path
+                                reg_h_end = min(
+                                    subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
                                 )
-                                cute.arch.fence_view_async_tmem_load()
-                            if t == next_n - 1 and i == num_epi_subtiles - 1:
-                                umma_pipeline_1.consumer_release(umma_cons_state_1)
-                                umma_cons_state_1.advance()
-                            acc_vec = tTR_rAcc.load()
-                            # Reg-path
-                            reg_h_end = min(
-                                subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
-                            )
-                            for h in cutlass.range_constexpr(0, reg_h_end, 4):
-                                n0 = h
-                                h_g = i * subtile_n + h
+                                for h in cutlass.range_constexpr(0, reg_h_end, 4):
+                                    n0 = h
+                                    h_g = i * subtile_n + h
+                                    if cutlass.const_expr(
+                                        self.epi_dtype == cutlass.Float16
+                                    ):
+                                        pa01 = pack_f16x2(
+                                            Float16(acc_vec[n0]),
+                                            Float16(acc_vec[n0 + 1]),
+                                        )
+                                        pa23 = pack_f16x2(
+                                            Float16(acc_vec[n0 + 2]),
+                                            Float16(acc_vec[n0 + 3]),
+                                        )
+                                        pa01 = max_f16x2(pa01, packed_zero)
+                                        pa23 = max_f16x2(pa23, packed_zero)
+                                        r0 = t * NUM_W_IN_REG + h_g
+                                        pw01 = pack_f16x2(w_cache[r0], w_cache[r0 + 1])
+                                        pw23 = pack_f16x2(
+                                            w_cache[r0 + 2], w_cache[r0 + 3]
+                                        )
+                                        ps0 = fma_f16x2(pa01, pw01, ps0)
+                                        ps1 = fma_f16x2(pa23, pw23, ps1)
+                                    else:
+                                        a0 = cutlass.max(
+                                            acc_vec[n0], cutlass.Float32(0.0)
+                                        )
+                                        a1 = cutlass.max(
+                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
+                                        )
+                                        a2 = cutlass.max(
+                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
+                                        )
+                                        a3 = cutlass.max(
+                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
+                                        )
+                                        r0 = t * NUM_W_IN_REG + h_g
+                                        w0 = w_cache[r0]
+                                        w1 = w_cache[r0 + 1]
+                                        w2 = w_cache[r0 + 2]
+                                        w3 = w_cache[r0 + 3]
+                                        s0x, s0y = cute.arch.fma_packed_f32x2(
+                                            (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
+                                        )
+                                        s1x, s1y = cute.arch.fma_packed_f32x2(
+                                            (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
+                                        )
+                                # SMEM-path
+                                smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
+                                for h in cutlass.range_constexpr(
+                                    smem_h_start, subtile_n, 4
+                                ):
+                                    n0 = h
+                                    h_g = i * subtile_n + h
+                                    if cutlass.const_expr(
+                                        self.epi_dtype == cutlass.Float16
+                                    ):
+                                        pa01 = pack_f16x2(
+                                            Float16(acc_vec[n0]),
+                                            Float16(acc_vec[n0 + 1]),
+                                        )
+                                        pa23 = pack_f16x2(
+                                            Float16(acc_vec[n0 + 2]),
+                                            Float16(acc_vec[n0 + 3]),
+                                        )
+                                        pa01 = max_f16x2(pa01, packed_zero)
+                                        pa23 = max_f16x2(pa23, packed_zero)
+                                        pw01 = pack_f16x2(
+                                            sW[(t * num_heads + h_g, q_stage_local)],
+                                            sW[
+                                                (t * num_heads + h_g + 1, q_stage_local)
+                                            ],
+                                        )
+                                        pw23 = pack_f16x2(
+                                            sW[
+                                                (t * num_heads + h_g + 2, q_stage_local)
+                                            ],
+                                            sW[
+                                                (t * num_heads + h_g + 3, q_stage_local)
+                                            ],
+                                        )
+                                        ps0 = fma_f16x2(pa01, pw01, ps0)
+                                        ps1 = fma_f16x2(pa23, pw23, ps1)
+                                    else:
+                                        a0 = cutlass.max(
+                                            acc_vec[n0], cutlass.Float32(0.0)
+                                        )
+                                        a1 = cutlass.max(
+                                            acc_vec[n0 + 1], cutlass.Float32(0.0)
+                                        )
+                                        a2 = cutlass.max(
+                                            acc_vec[n0 + 2], cutlass.Float32(0.0)
+                                        )
+                                        a3 = cutlass.max(
+                                            acc_vec[n0 + 3], cutlass.Float32(0.0)
+                                        )
+                                        w0 = sW[(t * num_heads + h_g, q_stage_local)]
+                                        w1 = sW[
+                                            (t * num_heads + h_g + 1, q_stage_local)
+                                        ]
+                                        w2 = sW[
+                                            (t * num_heads + h_g + 2, q_stage_local)
+                                        ]
+                                        w3 = sW[
+                                            (t * num_heads + h_g + 3, q_stage_local)
+                                        ]
+                                        s0x, s0y = cute.arch.fma_packed_f32x2(
+                                            (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
+                                        )
+                                        s1x, s1y = cute.arch.fma_packed_f32x2(
+                                            (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
+                                        )
+                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                                ps_sum = add_f16x2(ps0, ps1)
+                                sum_lo, sum_hi = unpack_f16x2(ps_sum)
+                                result_t = sum_lo + sum_hi
+                            else:
+                                result_t = s0x + s0y + s1x + s1y
+                            if cutlass.const_expr(self.use_flat_logits_view):
+                                out_off_t = out_row_off + t * logits_stride0 + kv_pos
                                 if cutlass.const_expr(
                                     self.epi_dtype == cutlass.Float16
                                 ):
-                                    pa01 = pack_f16x2(
-                                        Float16(acc_vec[n0]), Float16(acc_vec[n0 + 1])
+                                    mLogits_flat[out_off_t] = self.output_dtype(
+                                        result_t * Float16(scale_val)
                                     )
-                                    pa23 = pack_f16x2(
-                                        Float16(acc_vec[n0 + 2]),
-                                        Float16(acc_vec[n0 + 3]),
-                                    )
-                                    pa01 = max_f16x2(pa01, packed_zero)
-                                    pa23 = max_f16x2(pa23, packed_zero)
-                                    r0 = t * NUM_W_IN_REG + h_g
-                                    pw01 = pack_f16x2(w_cache[r0], w_cache[r0 + 1])
-                                    pw23 = pack_f16x2(w_cache[r0 + 2], w_cache[r0 + 3])
-                                    ps0 = fma_f16x2(pa01, pw01, ps0)
-                                    ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(
-                                        acc_vec[n0 + 1], cutlass.Float32(0.0)
+                                    mLogits_flat[out_off_t] = self.output_dtype(
+                                        result_t * scale_val
                                     )
-                                    a2 = cutlass.max(
-                                        acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                    )
-                                    a3 = cutlass.max(
-                                        acc_vec[n0 + 3], cutlass.Float32(0.0)
-                                    )
-                                    r0 = t * NUM_W_IN_REG + h_g
-                                    w0 = w_cache[r0]
-                                    w1 = w_cache[r0 + 1]
-                                    w2 = w_cache[r0 + 2]
-                                    w3 = w_cache[r0 + 3]
-                                    s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
-                                    )
-                                    s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
-                                    )
-                            # SMEM-path
-                            smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
-                            for h in cutlass.range_constexpr(
-                                smem_h_start, subtile_n, 4
-                            ):
-                                n0 = h
-                                h_g = i * subtile_n + h
+                            else:
+                                out_row = q_idx * next_n + t
                                 if cutlass.const_expr(
                                     self.epi_dtype == cutlass.Float16
                                 ):
-                                    pa01 = pack_f16x2(
-                                        Float16(acc_vec[n0]), Float16(acc_vec[n0 + 1])
+                                    mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
+                                        result_t * Float16(scale_val)
                                     )
-                                    pa23 = pack_f16x2(
-                                        Float16(acc_vec[n0 + 2]),
-                                        Float16(acc_vec[n0 + 3]),
-                                    )
-                                    pa01 = max_f16x2(pa01, packed_zero)
-                                    pa23 = max_f16x2(pa23, packed_zero)
-                                    pw01 = pack_f16x2(
-                                        sW[(t * num_heads + h_g, q_stage_local)],
-                                        sW[(t * num_heads + h_g + 1, q_stage_local)],
-                                    )
-                                    pw23 = pack_f16x2(
-                                        sW[(t * num_heads + h_g + 2, q_stage_local)],
-                                        sW[(t * num_heads + h_g + 3, q_stage_local)],
-                                    )
-                                    ps0 = fma_f16x2(pa01, pw01, ps0)
-                                    ps1 = fma_f16x2(pa23, pw23, ps1)
                                 else:
-                                    a0 = cutlass.max(acc_vec[n0], cutlass.Float32(0.0))
-                                    a1 = cutlass.max(
-                                        acc_vec[n0 + 1], cutlass.Float32(0.0)
+                                    mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
+                                        result_t * scale_val
                                     )
-                                    a2 = cutlass.max(
-                                        acc_vec[n0 + 2], cutlass.Float32(0.0)
-                                    )
-                                    a3 = cutlass.max(
-                                        acc_vec[n0 + 3], cutlass.Float32(0.0)
-                                    )
-                                    w0 = sW[(t * num_heads + h_g, q_stage_local)]
-                                    w1 = sW[(t * num_heads + h_g + 1, q_stage_local)]
-                                    w2 = sW[(t * num_heads + h_g + 2, q_stage_local)]
-                                    w3 = sW[(t * num_heads + h_g + 3, q_stage_local)]
-                                    s0x, s0y = cute.arch.fma_packed_f32x2(
-                                        (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
-                                    )
-                                    s1x, s1y = cute.arch.fma_packed_f32x2(
-                                        (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
-                                    )
-                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            ps_sum = add_f16x2(ps0, ps1)
-                            sum_lo, sum_hi = unpack_f16x2(ps_sum)
-                            result_t = sum_lo + sum_hi
-                        else:
-                            result_t = s0x + s0y + s1x + s1y
-                        out_row = q_idx * next_n + t
-                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * Float16(scale_val)
-                            )
-                        else:
-                            mLogits[(out_row, kv_pos)] = self.output_dtype(
-                                result_t * scale_val
-                            )
+                        # Advance within this q
+                        kv_idx = kv_idx + NUM_MATH_WG
+                        kv_go = (kv_idx < num_kv) & (
+                            (q_idx != end_q_idx) | (kv_idx != end_kv_idx)
+                        )
+                        if cutlass.const_expr(not self.use_two_level_task_loop):
+                            kv_go = cutlass.Boolean(False)
 
-                    # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
-                    if next_kv_idx >= num_kv:
+                    # ---- outer: rollover ----
+                    if kv_idx >= num_kv:
+                        # Inner loop exhausted this q's kv range: advance to the
+                        # next q (same as the original rollover path).
                         next_q_idx = q_idx + 1
                         next_kv_idx = 0
                         if next_q_idx < batch_size:
@@ -1993,6 +2338,13 @@ class FP8MQALogitsKernel:
                                 next_num_kv = (
                                     mContextLens[next_q_idx] + block_kv_val - 1
                                 ) // block_kv_val
+                    else:
+                        # Global end hit mid-q: next == (q_idx, kv_idx) == end,
+                        # so has_work goes False below. kv_idx was already
+                        # advanced past the last processed task in the inner
+                        # loop, so this matches the original's next_kv_idx.
+                        next_q_idx = q_idx
+                        next_kv_idx = kv_idx
                     # Update while-loop condition
                     has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
