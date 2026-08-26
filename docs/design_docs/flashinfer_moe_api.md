@@ -709,9 +709,7 @@ equality, hashing, repr serialization, and tactic-cache identity. Per-expert
 controls remain in backend-native `MoEWeightPack` views: TRT-LLM uses
 `gemm1_alpha` / `gemm1_beta` / `gemm1_clamp_limit`, while CUTLASS SiTU uses
 `situ_beta` / `situ_linear_beta`. Where supported, these tensors override the
-config-derived values. `Identity()` is modeled as a typed value but is not
-advertised by a unified runner pending end-to-end preparation and launch
-parity.
+config-derived values.
 
 `SiTU.linear_scale` is the linear-branch soft-clamp scale, applied as
 `linear_scale * tanh(linear / linear_scale)`. It accepts `None` for the

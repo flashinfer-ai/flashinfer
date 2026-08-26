@@ -1739,35 +1739,148 @@ def _pin_fallback_winner(layer: MoELayer, act: MoEActivationPack):
     return runner
 
 
-def _run_flat_cutlass_from_unified_inputs(
-    runner, act: MoEActivationPack, weights: MoEWeightPack
+def _independent_activation_params(activation, num_experts, device):
+    """Lower a typed activation to CUTLASS scalar tensors, from the value alone.
+
+    Deliberately does not call runners._cutlass_activation_params: that is the
+    lowering under test, so reusing it would let a wrong mapping agree with
+    itself. CUTLASS compile-time defaults cover SwiGLU() and SiTU(), which is
+    why only non-default values materialize tensors.
+    """
+    full = lambda v: torch.full((num_experts,), v, dtype=torch.float32, device=device)
+    if isinstance(activation, SiTU):
+        if activation == SiTU():
+            return {}
+        return {
+            "situ_beta": full(activation.gate_scale),
+            "situ_linear_beta": full(activation.linear_scale),
+        }
+    if isinstance(activation, SwiGLU) and activation != SwiGLU():
+        return {
+            "swiglu_alpha": full(activation.alpha),
+            "swiglu_beta": full(activation.beta),
+            "swiglu_limit": full(activation.limit),
+        }
+    if isinstance(activation, SwiGLUStep):
+        return {"swiglu_limit": full(activation.limit)}
+    return {}
+
+
+# Per-backend flat contract, written out from the prepared view's named keys
+# rather than read off the runner. quant_scales is ordered as the flat binding
+# consumes it; a runner that reorders or mis-selects a scale disagrees here.
+def _independent_quant_scales(backend_key, view, act):
+    v = view
+    if backend_key == "cutlass_bf16":
+        return []
+    if backend_key == "cutlass_w4a16":
+        return [
+            v["fc1_expert_scales"].view(torch.int32),
+            v["fc2_expert_scales"].view(torch.int32),
+        ]
+    if backend_key == "cutlass_nvfp4":
+        return [
+            v["fc1_act_global_scale"],
+            v["fc1_weight_block_scale"].view(torch.int32),
+            v["fc1_dequant_scale"],
+            v["fc2_act_global_scale"],
+            v["fc2_weight_block_scale"].view(torch.int32),
+            v["fc2_dequant_scale"],
+        ]
+    if backend_key == "cutlass_fp8_per_tensor":
+        act_scale = act.hidden_states_scale
+        return [
+            (v["fc1_dequant"] * act_scale).float(),
+            torch.ones((), device=act_scale.device, dtype=torch.float32),
+            v["fc2_dequant"].float(),
+            act_scale,
+        ]
+    if backend_key == "cutlass_fp8_block":
+        return [v["fc1_block_scale"], v["fc2_block_scale"]]
+    if backend_key in ("cutlass_mxfp8_mxfp4", "cutlass_mxfp8"):
+        return [
+            v["fc1_expert_scales"].view(torch.int32),
+            v["fc1_input_scale"],
+            v["fc2_expert_scales"].view(torch.int32),
+            v["fc2_input_scale"],
+        ]
+    if backend_key == "cutlass_w4a8":
+        return [
+            v["fc1_expert_scales"],
+            v["fc1_act_scale"],
+            v["fc1_zero"],
+            v["fc1_alpha"],
+            v["fc2_expert_scales"],
+            v["fc2_act_scale"],
+            v["fc2_zero"],
+            v["fc2_alpha"],
+        ]
+    if backend_key == "cutlass_humming":
+        return [
+            v["fc1_expert_scales"].view(torch.int32),
+            v["fc1_residual_scale"],
+            v["fc2_expert_scales"].view(torch.int32),
+            v["fc2_residual_scale"],
+            v["fc2_act_global"],
+        ]
+    raise AssertionError(f"no independent flat contract for {backend_key}")
+
+
+def _run_flat_cutlass_independently(
+    config_cls, backend_key, act: MoEActivationPack, weights: MoEWeightPack, config
 ) -> torch.Tensor:
-    """Launch the public flat API from the same backend-native prepared view."""
-    inputs = runner.pack_inputs(act, weights)
-    output = torch.empty_like(inputs[0])
+    """Launch the flat API with arguments built from the view, not the runner.
+
+    Routing every argument through runner.pack_inputs()/_quant_scales() would
+    make this comparison circular: _CutlassRunnerBase.forward() calls
+    cutlass_fused_moe with those same expressions, so a mis-ordered scale or a
+    dropped activation scalar would reach both sides identically and still
+    compare bit-exact. Rebuilding from the prepared view's named keys is what
+    gives the assertion its teeth.
+    """
+    view = weights.get_view(backend_key)
+    x = act.hidden_states_q
+    num_experts = config.routing.num_experts
+    output = torch.empty(
+        (x.shape[0], x.shape[1]), dtype=torch.bfloat16, device=x.device
+    )
+    input_sf = None
+    if config_cls in (CutlassMxfp8Mxfp4Config, CutlassMxfp8Config):
+        input_sf = act.hidden_states_scale.reshape(-1)
+    # The flat NVFP4/MXFP4 ABI takes packed weights viewed as int64 -- that is
+    # how the binding selects the FP4 kernel, and it rejects raw uint8.
+    packed_fp4 = config_cls in (CutlassNvfp4Config, CutlassMxfp8Mxfp4Config)
+    fc1 = view["fc1_expert_weights"]
+    fc2 = view["fc2_expert_weights"]
+    if packed_fp4:
+        fc1, fc2 = fc1.view(torch.int64), fc2.view(torch.int64)
     cutlass_fused_moe(
-        inputs[1],
-        inputs[2],
-        inputs[3],
-        inputs[4],
-        inputs[5],
+        x,
+        act.topk_ids,
+        act.topk_weights,
+        fc1,
+        fc2,
         output_dtype=torch.bfloat16,
-        quant_scales=runner._quant_scales(inputs),
-        input_sf=runner._input_sf(inputs),
+        quant_scales=_independent_quant_scales(backend_key, view, act),
+        input_sf=input_sf,
         output=output,
-        tune_max_num_tokens=runner.config.execution.tune_max_num_tokens,
-        enable_pdl=runner._enable_pdl,
-        activation_type=runner.config.activation.type,
-        use_deepseek_fp8_block_scale=runner._use_deepseek_fp8_block_scale,
-        use_w4_group_scaling=runner._use_w4_group_scaling,
-        use_mxfp8_act_scaling=runner._use_mxfp8_act_scaling,
-        use_packed_weights=runner._use_packed_weights,
-        use_wfp4afp8_humming=runner._use_wfp4afp8_humming,
-        use_fused_finalize=runner._use_fused_finalize,
+        tune_max_num_tokens=config.execution.tune_max_num_tokens,
+        enable_pdl=config.execution.enable_pdl,
+        activation_type=config.activation.type,
+        use_deepseek_fp8_block_scale=(config_cls is CutlassFp8BlockConfig),
+        use_w4_group_scaling=config_cls
+        in (CutlassW4A16Config, CutlassW4A8Config, CutlassHummingConfig),
+        use_mxfp8_act_scaling=config_cls
+        in (CutlassMxfp8Mxfp4Config, CutlassMxfp8Config),
+        use_packed_weights=(config_cls is CutlassW4A8Config),
+        use_wfp4afp8_humming=(config_cls is CutlassHummingConfig),
         swizzled_input_sf=True,
+        # Written out rather than read off the runner: if a runner stops using
+        # the fused finalize, this comparison should surface that as a
+        # difference instead of silently following it.
+        use_fused_finalize=True,
         profile_ids=[-1, -1],
-        workspace_buffer=runner._workspace,
-        **runner._activation_params,
+        **_independent_activation_params(config.activation, num_experts, x.device),
     )
     return output
 
@@ -1787,7 +1900,9 @@ def test_cutlass_bf16_moe_layer_matches_independent_reference(activation):
     runner = _pin_fallback_winner(layer, act)
 
     actual = layer(act, weights)
-    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
+    flat = _run_flat_cutlass_independently(
+        CutlassBf16Config, "cutlass_bf16", act, weights, config
+    )
     expected = _reference(act, w1, w2, activation)
 
     assert layer.winner_backend == "cutlass_bf16"
@@ -1806,7 +1921,9 @@ def test_cutlass_w4a16_moe_layer_matches_quantized_reference(activation):
     runner = _pin_fallback_winner(layer, act)
 
     actual = layer(act, weights)
-    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
+    flat = _run_flat_cutlass_independently(
+        CutlassW4A16Config, "cutlass_w4a16", act, weights, config
+    )
     expected = _reference(act, w1, w2, activation)
 
     assert layer.winner_backend == "cutlass_w4a16"
@@ -2119,7 +2236,9 @@ def test_cutlass_nvfp4_moe_layer_matches_quantized_reference(activation):
     runner = _pin_fallback_winner(layer, act)
 
     actual = layer(act, weights)
-    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
+    flat = _run_flat_cutlass_independently(
+        CutlassNvfp4Config, "cutlass_nvfp4", act, weights, config
+    )
     expected = _nvfp4_quantized_reference(act, view, activation)
 
     assert layer.winner_backend == "cutlass_nvfp4"
@@ -2322,9 +2441,11 @@ def test_cutlass_fp8_per_tensor_moe_layer_matches_quantized_reference(activation
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_fp8_per_tensor", view)
     layer = MoELayer(config)
-    runner = _pin_fallback_winner(layer, act)
+    _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
-    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
+    flat = _run_flat_cutlass_independently(
+        CutlassFp8PerTensorConfig, "cutlass_fp8_per_tensor", act, weights, config
+    )
     expected = _reference(
         MoEActivationPack(x_dq.to(torch.bfloat16), None, topk_ids, topk_weights),
         w1_dq.to(torch.bfloat16),
@@ -2383,9 +2504,11 @@ def test_cutlass_fp8_block_moe_layer_matches_quantized_reference(activation):
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_fp8_block", view)
     layer = MoELayer(config)
-    runner = _pin_fallback_winner(layer, act)
+    _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
-    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
+    flat = _run_flat_cutlass_independently(
+        CutlassFp8BlockConfig, "cutlass_fp8_block", act, weights, config
+    )
     expected = _reference(
         act, w1_dq.to(torch.bfloat16), w2_dq.to(torch.bfloat16), activation
     )
@@ -2461,9 +2584,11 @@ def test_cutlass_mxfp8_mxfp4_moe_layer_matches_quantized_reference(activation):
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_mxfp8_mxfp4", view)
     layer = MoELayer(config)
-    runner = _pin_fallback_winner(layer, act)
+    _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
-    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
+    flat = _run_flat_cutlass_independently(
+        CutlassMxfp8Mxfp4Config, "cutlass_mxfp8_mxfp4", act, weights, config
+    )
     expected = _reference(
         MoEActivationPack(x_dq, None, topk_ids, topk_weights),
         w1_dq,
@@ -2524,9 +2649,11 @@ def test_cutlass_mxfp8_moe_layer_matches_quantized_reference(activation):
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_mxfp8", view)
     layer = MoELayer(config)
-    runner = _pin_fallback_winner(layer, act)
+    _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
-    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
+    flat = _run_flat_cutlass_independently(
+        CutlassMxfp8Config, "cutlass_mxfp8", act, weights, config
+    )
     expected = _reference(
         MoEActivationPack(x_dq, None, topk_ids, topk_weights),
         w1,
@@ -2661,9 +2788,11 @@ def test_cutlass_w4a8_moe_layer_matches_quantized_reference(activation):
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_w4a8", view)
     layer = MoELayer(config)
-    runner = _pin_fallback_winner(layer, act)
+    _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
-    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
+    flat = _run_flat_cutlass_independently(
+        CutlassW4A8Config, "cutlass_w4a8", act, weights, config
+    )
     expected = _reference(
         act,
         _dequant_int4(packed_w1, scale_w1).to(torch.bfloat16),
@@ -2722,9 +2851,11 @@ def test_cutlass_humming_moe_layer_matches_quantized_reference(activation):
     weights = MoEWeightPack()
     weights.prepare_for("cutlass_humming", view)
     layer = MoELayer(config)
-    runner = _pin_fallback_winner(layer, act)
+    _pin_fallback_winner(layer, act)
     actual = layer(act, weights)
-    flat = _run_flat_cutlass_from_unified_inputs(runner, act, weights)
+    flat = _run_flat_cutlass_independently(
+        CutlassHummingConfig, "cutlass_humming", act, weights, config
+    )
     expected = _reference(
         act,
         _dequant_linear_mxfp4(
