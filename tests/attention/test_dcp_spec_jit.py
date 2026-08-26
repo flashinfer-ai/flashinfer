@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.attention.cake_dcp_public_validation import compare_export
+
 from flashinfer.cake_dcp import (
     _select_fp8_num_split,
     _select_num_split,
@@ -48,6 +50,30 @@ def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
             "cake_fmha_dcp_spec_bf16_fp8_d256_sm100f_"
             f"b8_q{q_len}_hq16_hkv1_cp4_split4_retain0"
         )
+
+
+def test_public_promotion_hook_requires_exact_export_parity(tmp_path: Path) -> None:
+    generated = tmp_path / "generated"
+    public = tmp_path / "public"
+    generated.mkdir()
+    public.mkdir()
+    for name, payload in (("a.cu", b"a\n"), ("manifest.json", b"{}\n")):
+        (generated / name).write_bytes(payload)
+        (public / name).write_bytes(payload)
+
+    exact = compare_export(
+        generated, public, expected_artifact_count=2
+    )
+    assert exact["export_parity_passed"] is True
+    assert exact["matched_artifact_count"] == 2
+
+    (public / "a.cu").write_bytes(b"drift\n")
+    drift = compare_export(
+        generated, public, expected_artifact_count=2
+    )
+    assert drift["export_parity_passed"] is False
+    assert drift["matched_artifact_count"] == 1
+    assert [row["name"] for row in drift["mismatched_artifacts"]] == ["a.cu"]
 
 
 def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> None:
