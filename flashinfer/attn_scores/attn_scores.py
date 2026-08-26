@@ -1449,10 +1449,13 @@ def _check_fp4_paged_mqa_logits_supported(
     # a bare assertion from inside JIT compilation.
     #
     # This bound also subsumes the UMMA N-mode check that fp8 needs: with
-    # num_heads pinned to 64, N = next_n * 64 is in {64, 128, 192}, all within
-    # [_MMA_N_MIN, _MMA_N_MAX] and a multiple of _MMA_N_MULTIPLE. For the same
-    # reason there is no SMEM-budget check here -- head_dim and num_heads are
-    # fixed, so the config space cannot reach the per-CTA limit.
+    # num_heads pinned to 64, the kernel's N tile is atom * 64 for atom <= 4,
+    # i.e. in {64, 128, 192, 256} -- 256 sits exactly at _MMA_N_MAX and is a
+    # multiple of _MMA_N_MULTIPLE, so every reachable tile is legal. Likewise
+    # no SMEM-budget check is needed: head_dim and num_heads are fixed, and the
+    # largest tile (atom=4, Rubin-only) adds only the wider Q stage (256x64B vs
+    # 192x64B) over next_n=3, far from the per-CTA limit on the parts that can
+    # run it.
     if next_n < 1 or next_n > _FP4_MAX_NEXT_N:
         raise ValueError(
             f"fp4_paged_mqa_logits supports next_n in 1..{_FP4_MAX_NEXT_N}; "
@@ -1777,7 +1780,9 @@ def precompile_paged_mqa_logits(
     Only the configs listed below are covered; anything else (fp16 epilogue,
     other head_dim / num_heads, num_epi_subtiles != 1) still compiles on first
     use.  Measured on sm_100a: ~9s for the 8 fp8 kernels, ~3s per output dtype
-    for the 9 fp4.
+    for the 12 fp4.  The fp4 next_n=4 entry compiles the decomposition the
+    default policy picks on the target device (direct on Rubin, two atoms of 2
+    on Blackwell).
 
     Args:
         device:        CUDA device to target.  Defaults to the current CUDA
@@ -1862,8 +1867,15 @@ def precompile_paged_mqa_logits(
             # default; float32 is what a consumer binding logits as C float
             # needs, and without it that deployment still JITs on first request.
             fp4_outs = output_dtypes or (torch.bfloat16, torch.float32)
+            # next_n=4 compiles the decomposition the default policy would pick
+            # on this device: direct (one atom) where the TMEM holds it (Rubin),
+            # otherwise two atoms of 2 (Blackwell). Forced non-default splits
+            # (next_n_atom=...) are not warmed here; they are a benchmarking
+            # surface, not a deployment one.
+            _max_atom = _fp4_max_atom_for_device(device)
             for block_size in (32, 64, 128):
-                for nn in (1, 2, 3):
+                for nn in (1, 2, 3, 4):
+                    num_atoms = 1 if nn <= _max_atom else 2
                     for out_dtype in fp4_outs:
                         _cached_compile_fp4_kernel(
                             block_size,
@@ -1876,6 +1888,7 @@ def precompile_paged_mqa_logits(
                             1,
                             False,
                             arch,
+                            num_atoms,
                         )
 
         # The schedule kernel is keyed on the aligned batch size, not on the
