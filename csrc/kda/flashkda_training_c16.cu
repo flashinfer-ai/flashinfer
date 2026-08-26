@@ -390,6 +390,33 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     return result;
 }
 
+
+__device__ __forceinline__ void tmem_ld_x32(float* dst, int tmem_addr) {
+  asm volatile(
+      "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+      " {%0, %1, %2, %3, %4, %5, %6, %7,"
+      "  %8, %9, %10, %11, %12, %13, %14, %15,"
+      "  %16, %17, %18, %19, %20, %21, %22, %23,"
+      "  %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+      : "=f"(dst[0]), "=f"(dst[1]), "=f"(dst[2]), "=f"(dst[3]), "=f"(dst[4]), "=f"(dst[5]),
+        "=f"(dst[6]), "=f"(dst[7]), "=f"(dst[8]), "=f"(dst[9]), "=f"(dst[10]), "=f"(dst[11]),
+        "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15]), "=f"(dst[16]), "=f"(dst[17]),
+        "=f"(dst[18]), "=f"(dst[19]), "=f"(dst[20]), "=f"(dst[21]), "=f"(dst[22]), "=f"(dst[23]),
+        "=f"(dst[24]), "=f"(dst[25]), "=f"(dst[26]), "=f"(dst[27]), "=f"(dst[28]), "=f"(dst[29]),
+        "=f"(dst[30]), "=f"(dst[31])
+      : "r"(tmem_addr));
+}
+
+__device__ __forceinline__ void tma_2d_gmem2smem(int dst, const void* tmap_ptr, int x, int y,
+                                                 int mbar_addr) {
+  asm volatile(
+      "cp.async.bulk.tensor.2d.shared::cta.global"
+      ".mbarrier::complete_tx::bytes"
+      " [%0], [%1, {%2, %3}], [%4];" ::"r"(dst),
+      "l"(tmap_ptr), "r"(x), "r"(y), "r"(mbar_addr)
+      : "memory");
+}
+
 #define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 272
 #define TMEM_TMEM_STATE_OFFSET 0
