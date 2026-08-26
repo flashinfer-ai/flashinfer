@@ -1,0 +1,9 @@
+{
+  "comment": "Problem sizes the specialized SM120 MoE routing prologue/finalize kernels may serve. Matched exactly; nothing is inferred. This is the MEASURED win surface, not the kernels' support surface: the prologue serves any token count up to 32 and the finalize any token count at all, but only the decode sizes below have a measured graph-replay win, so the larger capture sizes deliberately keep the composable path until they are measured.",
+  "fields": ["m", "hidden_size", "num_experts", "top_k"],
+  "workloads": [
+    [1, 2048, 256, 8],
+    [2, 2048, 256, 8],
+    [4, 2048, 256, 8]
+  ]
+}

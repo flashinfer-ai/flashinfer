@@ -105,6 +105,25 @@ from .fused_moe import (
     trtllm_fp8_per_tensor_scale_routed_moe,
 )
 
+# The fused MoE routing glue is surfaced here like the other fused-MoE APIs;
+# the code lives under flashinfer/fused_moe/experimental/ (see its README),
+# but "experimental" describes the file location, not the import path.
+# Unconditional on purpose: the module imports torch and nothing else, and a
+# consumer's capability check is `getattr(flashinfer, "moe_routing_finalize",
+# None)` — it must be present whenever the library is new enough, and absent
+# on an older one, with no third "present but broken" state.  Everything
+# heavy (the dispatch allowlist, the JIT toolchain and the SM120 kernel) is
+# reached lazily on the first probe or call.
+from .fused_moe.experimental import (
+    moe_routing_align as moe_routing_align,
+    moe_routing_finalize as moe_routing_finalize,
+    moe_routing_precompile as moe_routing_precompile,
+    moe_routing_prologue as moe_routing_prologue,
+    moe_routing_ready_for_graph_capture as moe_routing_ready_for_graph_capture,
+    moe_routing_stats as moe_routing_stats,
+    moe_routing_supported as moe_routing_supported,
+)
+
 # CuteDSL high-level APIs (conditionally if cute_dsl available)
 with contextlib.suppress(ImportError):
     from .fused_moe import (

@@ -97,6 +97,12 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
   "src/fp8_gemm/*.cu",
   "src/fp8_gemm/*.cuh",
 ]
+# Dispatch allowlist of the experimental fused MoE routing op, loaded at
+# runtime via importlib.resources.
+"flashinfer.fused_moe.experimental" = ["*.json"]
+# Its in-package JIT kernel source, compiled on demand by
+# flashinfer/jit/moe_routing.py, like the GDN sources above.
+"flashinfer.fused_moe.experimental.kernel" = ["*.cu"]
 "flashinfer.data" = ["csrc/**", "include/**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.spdlog" = ["include/**"]
