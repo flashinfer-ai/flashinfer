@@ -18,10 +18,13 @@ limitations under the License.
 from .api import (  # noqa: F401
     # Typed activation values
     ActivationConfig,
+    GELU,
     GeGLU,
     GeGLUTanh,
     Identity,
+    ReLU,
     ReLU2,
+    SiLU,
     SiTU,
     SwiGLU,
     SwiGLUStep,
@@ -171,10 +174,13 @@ except ImportError:
 __all__ = [
     # Typed activation values
     "ActivationConfig",
+    "GELU",
     "SwiGLU",
     "SiTU",
     "GeGLU",
+    "ReLU",
     "ReLU2",
+    "SiLU",
     "GeGLUTanh",
     "SwiGLUStep",
     "Identity",

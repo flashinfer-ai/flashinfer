@@ -702,7 +702,8 @@ Key mechanisms (and where they live):
 
 The unreleased enum-wrapper/singleton spelling was replaced by frozen values:
 `SwiGLU(alpha, beta, limit)`, `SiTU(gate_scale, linear_scale, clamp_limit)`,
-`GeGLU()`, `ReLU2()`, `GeGLUTanh()`, `SwiGLUStep(limit)`, and `Identity()`.
+`GeGLU()`, `ReLU2()`, `GeGLUTanh()`, `SwiGLUStep(limit)`, `Identity()`,
+`GELU()`, `ReLU()`, and `SiLU()`.
 Every value exposes `.type` and `.is_gated`; scalar fields participate in
 equality, hashing, repr serialization, and tactic-cache identity. Per-expert
 controls remain in backend-native `MoEWeightPack` views: TRT-LLM uses
@@ -730,7 +731,7 @@ The truthful unified support matrix follows the already executable flat path:
 | TRTLLM NVFP4 / MXFP4 | SwiGLU (typed scalars), GeGLU, SiTU, ReLU2 |
 | TRTLLM W4A16 | SwiGLU |
 | TRTLLM MxInt4 | SwiGLU (typed scalars) |
-| CUTLASS BF16 / W4A16 | SwiGLU (typed scalars), SwiGLUStep, GeGLUTanh, ReLU2, SiTU (typed scalars) |
+| CUTLASS BF16 / NVFP4 / FP8 per-tensor / FP8 block / MXFP8×MXFP4 / MXFP8 / W4A16 / W4A8 / Humming | SwiGLU (typed scalars), SwiGLUStep, GeGLU, GeGLUTanh, ReLU2, SiTU (typed scalars), Identity, GELU, ReLU, SiLU |
 | CuTe-DSL NVFP4 / W4A16 | SwiGLU (typed scalars), GeGLUTanh, ReLU2, SiTU (typed scalars) |
 | b12x NVFP4 | SwiGLU (default scalars), GeGLUTanh, ReLU2 |
 | b12x W4A16 | SwiGLU (default scalars), ReLU2 |

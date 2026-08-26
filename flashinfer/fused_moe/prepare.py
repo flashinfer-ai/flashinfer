@@ -1482,13 +1482,14 @@ def prepare_cutlass_nvfp4_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the CUTLASS NVFP4 view consumed by ``CutlassNvfp4Runner``.
 
-    Canonical source is BF16 ``w1_bf16 [E, 2*I, H]`` in semantic ``[up, gate]``
-    order (same as the flat CUTLASS SwiGLU split that tests name ``(w3, w1)``:
-    up first, gate second) and ``w2_bf16 [E, H, I]``. Each expert is quantized
+    Canonical source is BF16 ``w1_bf16 [E, rows, H]``, where ``rows`` is
+    ``2*I`` in semantic ``[up, gate]`` order for gated activations and ``I``
+    for non-gated activations, plus ``w2_bf16 [E, H, I]``. Each expert is quantized
     independently with ``fp4_quantize`` (``sf_vec_size=16``, swizzled scales)
     so 128-row swizzle tiles never cross expert boundaries. Global scales are
     fixed at 1.0 to match the other unified NVFP4 prepares; the kernel still
@@ -1512,7 +1513,9 @@ def prepare_cutlass_nvfp4_weights(
             "Cutlass NVFP4 requires hidden_size and intermediate_size "
             f"divisible by {_NVFP4_SF_VEC_SIZE}."
         )
-    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    activation = _normalize_activation(activation)
+    gemm1_rows = _gemm1_rows(intermediate_size, activation)
+    expected_w1 = (num_local_experts, gemm1_rows, hidden_size)
     expected_w2 = (num_local_experts, hidden_size, intermediate_size)
     if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
         raise ValueError(
@@ -1571,6 +1574,7 @@ def _require_canonical_cutlass_bf16_weights(
     hidden_size: int,
     intermediate_size: int,
     name: str,
+    activation=None,
     alignment: Optional[int] = None,
     require_cuda: bool = False,
     device: Optional[torch.device] = None,
@@ -1587,7 +1591,12 @@ def _require_canonical_cutlass_bf16_weights(
             f"{name} requires hidden_size and intermediate_size divisible by "
             f"{alignment}."
         )
-    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    activation = _normalize_activation(activation)
+    expected_w1 = (
+        num_local_experts,
+        _gemm1_rows(intermediate_size, activation),
+        hidden_size,
+    )
     expected_w2 = (num_local_experts, hidden_size, intermediate_size)
     if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
         raise ValueError(
@@ -1628,6 +1637,7 @@ def prepare_cutlass_fp8_per_tensor_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the unshuffled per-tensor FP8 view for ``CutlassFp8PerTensorRunner``.
@@ -1643,6 +1653,7 @@ def prepare_cutlass_fp8_per_tensor_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_fp8_per_tensor_weights",
+        activation=activation,
         device=device,
     )
     w1_q, w1_mult = _quantize_fp8_per_expert(w1_bf16)
@@ -1662,6 +1673,7 @@ def prepare_cutlass_fp8_block_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the DeepSeek 128x128 FP8 block-scale view for CUTLASS.
@@ -1676,6 +1688,7 @@ def prepare_cutlass_fp8_block_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_fp8_block_weights",
+        activation=activation,
         alignment=128,
         device=device,
     )
@@ -1730,6 +1743,7 @@ def prepare_cutlass_mxfp8_mxfp4_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the CUTLASS MXFP4 weight view consumed with MXFP8 activations.
@@ -1744,6 +1758,7 @@ def prepare_cutlass_mxfp8_mxfp4_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_mxfp8_mxfp4_weights",
+        activation=activation,
         alignment=128,
         require_cuda=True,
         device=device,
@@ -1801,6 +1816,7 @@ def prepare_cutlass_mxfp8_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the CUTLASS MXFP8 weight view consumed with MXFP8 activations.
@@ -1817,10 +1833,13 @@ def prepare_cutlass_mxfp8_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_mxfp8_weights",
+        activation=activation,
         alignment=128,
         require_cuda=True,
         device=device,
     )
+    activation = _normalize_activation(activation)
+    gemm1_rows = _gemm1_rows(intermediate_size, activation)
     w1_q, w1_scale = _quantize_mxfp8_experts(w1_bf16, num_local_experts)
     w2_q, w2_scale = _quantize_mxfp8_experts(w2_bf16, num_local_experts)
     fake_input_scale = torch.ones(num_local_experts, device=device, dtype=torch.float32)
@@ -1828,7 +1847,7 @@ def prepare_cutlass_mxfp8_weights(
         "fc1_expert_weights": w1_q.contiguous(),
         "fc2_expert_weights": w2_q.contiguous(),
         "fc1_expert_scales": _pack_mxfp8_weight_scales(
-            w1_scale, 2 * round_up(intermediate_size, 128), hidden_size
+            w1_scale, gemm1_rows, hidden_size
         ),
         "fc2_expert_scales": _pack_mxfp8_weight_scales(
             w2_scale, hidden_size, intermediate_size
@@ -1868,6 +1887,7 @@ def prepare_cutlass_w4a8_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the SM90 packed INT4 view for ``CutlassW4A8Runner``.
@@ -1884,6 +1904,7 @@ def prepare_cutlass_w4a8_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_w4a8_weights",
+        activation=activation,
         alignment=group_size,
         require_cuda=True,
         device=device,
@@ -1919,6 +1940,7 @@ def prepare_cutlass_humming_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the Humming MXFP4 x FP8 mixed-input view for SM90 CUTLASS.
@@ -1935,6 +1957,7 @@ def prepare_cutlass_humming_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_humming_weights",
+        activation=activation,
         alignment=128,
         require_cuda=True,
         device=device,
@@ -1949,7 +1972,9 @@ def prepare_cutlass_humming_weights(
             scales.view(num_local_experts, rows, cols // 32),
         )
 
-    w1_packed, w1_scale = quantize(w1_bf16, 2 * intermediate_size, hidden_size)
+    activation = _normalize_activation(activation)
+    gemm1_rows = _gemm1_rows(intermediate_size, activation)
+    w1_packed, w1_scale = quantize(w1_bf16, gemm1_rows, hidden_size)
     w2_packed, w2_scale = quantize(w2_bf16, hidden_size, intermediate_size)
     w1_il, w1_scale_il, w1_residual = (
         preprocess_moe_weights_for_sm90_mixed_gemm_humming(w1_packed, w1_scale)

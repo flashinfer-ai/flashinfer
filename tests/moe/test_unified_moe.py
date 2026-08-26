@@ -43,10 +43,13 @@ from flashinfer.autotuner.autotuner import ProfilingCacheKey
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe import (
     # Typed activation values
+    GELU,
     GeGLU,
     GeGLUTanh,
     Identity,
+    ReLU,
     ReLU2,
+    SiLU,
     SiTU,
     SwiGLU,
     SwiGLUStep,
@@ -297,6 +300,9 @@ class TestReprRoundTrip:
             GeGLUTanh(),
             SwiGLUStep(),
             Identity(),
+            GELU(),
+            ReLU(),
+            SiLU(),
         ):
             assert _eval_repr(cfg) == cfg
             assert hash(_eval_repr(cfg)) == hash(cfg)
@@ -559,13 +565,35 @@ class TestHashability:
 
 
 class TestTypedActivationConfig:
+    def test_parameter_free_activations_are_public(self):
+        import flashinfer.fused_moe as fused_moe
+
+        for name, activation_type in (
+            ("GELU", ActivationType.Gelu),
+            ("ReLU", ActivationType.Relu),
+            ("SiLU", ActivationType.Silu),
+        ):
+            activation_cls = getattr(fused_moe, name)
+            activation = activation_cls()
+            assert name in fused_moe.__all__
+            assert activation.type is activation_type
+            assert not activation.is_gated
+            assert eval(repr(activation), vars(fused_moe)) == activation
+            assert hash(activation) == hash(activation_cls())
+
     def test_type_and_gating(self):
         assert SwiGLU().type is ActivationType.Swiglu
         assert GeGLU().type is ActivationType.Geglu
         assert ReLU2().type is ActivationType.Relu2
         assert Identity().type is ActivationType.Identity
+        assert GELU().type is ActivationType.Gelu
+        assert ReLU().type is ActivationType.Relu
+        assert SiLU().type is ActivationType.Silu
         assert SwiGLU().is_gated
         assert not Identity().is_gated
+        assert not GELU().is_gated
+        assert not ReLU().is_gated
+        assert not SiLU().is_gated
 
     def test_common_base_is_not_a_concrete_activation(self):
         from flashinfer.fused_moe import ActivationConfig
@@ -745,6 +773,9 @@ class TestTypedActivationConfig:
             (SwiGLUStep(), 256),
             (ReLU2(), 128),
             (Identity(), 128),
+            (GELU(), 128),
+            (ReLU(), 128),
+            (SiLU(), 128),
         ),
     )
     def test_typed_activation_controls_gemm1_rows(self, activation, expected_rows):
@@ -976,7 +1007,18 @@ class TestMoERunnerSupport:
                 )
 
     def test_declarative_activation_capabilities(self):
-        cutlass = (SwiGLU, SwiGLUStep, GeGLUTanh, ReLU2, SiTU)
+        cutlass = (
+            SwiGLU,
+            SwiGLUStep,
+            GeGLU,
+            GeGLUTanh,
+            ReLU2,
+            SiTU,
+            Identity,
+            GELU,
+            ReLU,
+            SiLU,
+        )
         assert CutlassBf16Runner.supported_activation_classes == cutlass
         assert CutlassW4A16Runner.supported_activation_classes == cutlass
         assert CuteDslNvfp4Runner.supported_activation_classes == (

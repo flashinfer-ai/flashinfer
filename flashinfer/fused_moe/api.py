@@ -261,6 +261,21 @@ class Identity(ActivationConfig):
 
 
 @dataclass(frozen=True)
+class GELU(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Gelu
+
+
+@dataclass(frozen=True)
+class ReLU(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Relu
+
+
+@dataclass(frozen=True)
+class SiLU(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Silu
+
+
+@dataclass(frozen=True)
 class ExpertConfig:
     """Expert geometry.
 
@@ -684,8 +699,8 @@ class CutlassBf16Config:
     Architecture coverage follows the dense-BF16 legacy flat API. The unified
     GPU tests currently exercise SM90.
 
-    This backend supports packed precomputed routing with SwiGLU,
-    SwiGLU-step, GeGLU-tanh, and ReLU², and requires ``do_finalize=True``.
+    This backend supports packed precomputed routing with all flat CUTLASS
+    activation semantics and requires ``do_finalize=True``.
     Expert parallelism and shared experts are not supported.
     """
 
@@ -730,8 +745,8 @@ class CutlassBf16Config:
 class CutlassW4A16Config:
     """CUTLASS MXFP4-weight x BF16-activation backend for SM90.
 
-    This backend supports packed precomputed routing with SwiGLU,
-    SwiGLU-step, GeGLU-tanh, and ReLU², and requires ``do_finalize=True``.
+    This backend supports packed precomputed routing with all flat CUTLASS
+    activation semantics and requires ``do_finalize=True``.
     Expert parallelism and shared experts are not supported. Both
     ``hidden_size`` and ``intermediate_size`` must be divisible by 128.
     """
@@ -772,7 +787,8 @@ class CutlassW4A16Config:
 class CutlassNvfp4Config:
     """CUTLASS NVFP4 backend for SM100 / SM110 / SM12x.
 
-    Packed precomputed routing with SwiGLU and ``do_finalize=True``. Expert
+    Packed precomputed routing with all flat CUTLASS activation semantics and
+    ``do_finalize=True``. Expert
     parallelism and shared experts are not supported. Both ``hidden_size``
     and ``intermediate_size`` must be divisible by 16 (the NVFP4 scale-vector
     size). Activations stay BF16; the kernel quantizes them internally.
@@ -795,6 +811,7 @@ class CutlassNvfp4Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into CUTLASS-swizzled NVFP4.
@@ -810,6 +827,7 @@ class CutlassNvfp4Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -823,7 +841,8 @@ class CutlassFp8PerTensorConfig:
 
     Activations are prequantized E4M3 with a scalar dequant scale on
     ``MoEActivationPack.hidden_states_scale``. Weights stay unshuffled; this is
-    not the TRTLLM MajorK view. Packed precomputed routing with SwiGLU and
+    not the TRTLLM MajorK view. Packed precomputed routing with all flat
+    CUTLASS activation semantics and
     ``do_finalize=True``. Not in the default backend search list: TRTLLM
     per-tensor FP8 folds the activation scale into the weight view, so the two
     contracts cannot share one pack without a conversion.
@@ -841,6 +860,7 @@ class CutlassFp8PerTensorConfig:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into unshuffled per-tensor FP8."""
@@ -852,6 +872,7 @@ class CutlassFp8PerTensorConfig:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -872,7 +893,7 @@ class CutlassFp8BlockConfig:
 
     Activations stay BF16; the kernel quantizes them internally. This is not
     the TRTLLM block-FP8 activation pack. Packed precomputed routing with
-    SwiGLU and ``do_finalize=True``.
+    all flat CUTLASS activation semantics and ``do_finalize=True``.
     """
 
     @classmethod
@@ -887,6 +908,7 @@ class CutlassFp8BlockConfig:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into 128x128 FP8 block scales."""
@@ -898,6 +920,7 @@ class CutlassFp8BlockConfig:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -910,8 +933,8 @@ class CutlassMxfp8Mxfp4Config:
     """CUTLASS MXFP8-activation x MXFP4-weight backend for SM100 / SM110 / SM12x.
 
     Activations are MXFP8 with a swizzled ``input_sf``. Weights are packed
-    MXFP4 viewed as int64 at launch. Packed precomputed routing with SwiGLU
-    and ``do_finalize=True``. Both ``hidden_size`` and ``intermediate_size``
+    MXFP4 viewed as int64 at launch. Packed precomputed routing with all flat
+    CUTLASS activation semantics and ``do_finalize=True``. Both ``hidden_size`` and ``intermediate_size``
     must be divisible by 128.
     """
 
@@ -927,6 +950,7 @@ class CutlassMxfp8Mxfp4Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into CUTLASS MXFP4."""
@@ -938,6 +962,7 @@ class CutlassMxfp8Mxfp4Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -959,7 +984,8 @@ class CutlassMxfp8Config:
     Activations are MXFP8 with a swizzled ``input_sf``. Weights stay E4M3 with
     packed int32 scale tiles. ``hidden_size`` and ``intermediate_size`` must be
     divisible by 128 so the gated fc1 scale layout matches the binding.
-    Packed precomputed routing with SwiGLU and ``do_finalize=True``.
+    Packed precomputed routing with all flat CUTLASS activation semantics and
+    ``do_finalize=True``.
     """
 
     @classmethod
@@ -974,6 +1000,7 @@ class CutlassMxfp8Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into CUTLASS MXFP8."""
@@ -985,6 +1012,7 @@ class CutlassMxfp8Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -1004,7 +1032,8 @@ class CutlassW4A8Config:
     """CUTLASS INT4-weight x FP8-activation backend for SM90.
 
     Activations stay BF16; the kernel quantizes them internally with the packed
-    mixed-input INT4 layout. Packed precomputed routing with SwiGLU and
+    mixed-input INT4 layout. Packed precomputed routing with all flat CUTLASS
+    activation semantics and
     ``do_finalize=True``.
     """
 
@@ -1020,6 +1049,7 @@ class CutlassW4A8Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into SM90 interleaved INT4."""
@@ -1031,6 +1061,7 @@ class CutlassW4A8Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -1043,7 +1074,8 @@ class CutlassHummingConfig:
     """CUTLASS Humming MXFP4-weight x FP8-activation backend for SM90.
 
     Activations stay BF16; weights use Humming pre-MMA E8M0 fusion plus the
-    SM90 mixed-input interleave. Packed precomputed routing with SwiGLU and
+    SM90 mixed-input interleave. Packed precomputed routing with all flat
+    CUTLASS activation semantics and
     ``do_finalize=True``.
     """
 
@@ -1059,6 +1091,7 @@ class CutlassHummingConfig:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into the Humming mixed-input layout."""
@@ -1070,6 +1103,7 @@ class CutlassHummingConfig:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
