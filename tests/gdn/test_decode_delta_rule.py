@@ -2154,9 +2154,7 @@ def test_pretranspose_api_forwards_fp32_mtp_verify_controls_with_noncompact_pool
         batch_size, seq_len, num_v_heads, head_size, dtype=io_dtype, device=device
     )
     a = (
-        torch.randn(
-            batch_size, seq_len, num_v_heads, dtype=io_dtype, device=device
-        )
+        torch.randn(batch_size, seq_len, num_v_heads, dtype=io_dtype, device=device)
         * 0.1
     )
     b_tensor = torch.randn(
