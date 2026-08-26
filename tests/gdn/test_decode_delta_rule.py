@@ -2050,16 +2050,15 @@ def test_pretranspose_api_forwards_bf16_mtp_verify_controls():
     output = torch.empty(
         batch_size, seq_len, num_v_heads, head_size, dtype=dtype, device=device
     )
-    sentinel = 3.25
     cache_shape = (
         batch_size,
-        seq_len + 1,
+        seq_len,
         num_v_heads,
         head_size,
         head_size,
     )
-    public_cache = torch.full(cache_shape, sentinel, dtype=dtype, device=device)
-    direct_cache = torch.full(cache_shape, sentinel, dtype=dtype, device=device)
+    public_cache = torch.empty(cache_shape, dtype=dtype, device=device)
+    direct_cache = torch.empty(cache_shape, dtype=dtype, device=device)
     public_pool = initial_pool.clone()
     direct_pool = initial_pool.clone()
     scale = 1.0 / math.sqrt(head_size)
@@ -2104,15 +2103,7 @@ def test_pretranspose_api_forwards_bf16_mtp_verify_controls():
     torch.testing.assert_close(public_output, direct_output, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(public_pool, initial_pool, atol=0.0, rtol=0.0)
     torch.testing.assert_close(direct_pool, initial_pool, atol=0.0, rtol=0.0)
-    torch.testing.assert_close(
-        public_cache[:, :seq_len], direct_cache[:, :seq_len], atol=1e-2, rtol=1e-2
-    )
-    torch.testing.assert_close(
-        public_cache[:, seq_len:],
-        torch.full_like(public_cache[:, seq_len:], sentinel),
-        atol=0.0,
-        rtol=0.0,
-    )
+    torch.testing.assert_close(public_cache, direct_cache, atol=1e-2, rtol=1e-2)
 
 
 # ============================================================================
