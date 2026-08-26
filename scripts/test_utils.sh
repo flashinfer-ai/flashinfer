@@ -295,18 +295,25 @@ install_and_verify() {
         # version skew between libs-base and libs-cu13.  requirements.txt
         # cannot add the extra conditionally, hence the separate install.
         #
-        # Exact 4.6.2: existing CI images bake 4.7.0, and a >= floor would
-        # still resolve to 4.7.x. This also downgrades Rubin images that
-        # ship 4.8.0a0 (SM107 cute-dsl stays gated off for the job).
-        pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
-            nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 \
-            nvidia-cutlass-dsl-libs-core -y 2>/dev/null || true
-        if [[ "${CUDA_VERSION}" == *"cu13"* || "${CUDA_VERSION}" == 13.* ]]; then
-            pip install "nvidia-cutlass-dsl[cu13]==4.6.2"
+        # Exact 4.6.2 on default CI images (they bake 4.7.0; a >= floor still
+        # resolves to 4.7.x). Rubin jobs keep the image/prep DSL: gr100/vr200
+        # on adshen/rubin-unit-test-pdx use rubin-latest (4.8.0a0) with
+        # PREPARE_RUBIN_TEST_IMAGE=1; public-stack Rubin jobs set
+        # PREPARE_PUBLIC_RUBIN_STACK=1 after installing 4.7.0.
+        if [ "${PREPARE_RUBIN_TEST_IMAGE:-0}" = "1" ] || \
+           [ "${PREPARE_PUBLIC_RUBIN_STACK:-0}" = "1" ]; then
+            python -c "import importlib.metadata as m; print('nvidia-cutlass-dsl', m.version('nvidia-cutlass-dsl'), '(left in place for Rubin job)')"
         else
-            pip install "nvidia-cutlass-dsl==4.6.2"
+            pip uninstall nvidia-cutlass-dsl nvidia-cutlass-dsl-libs-base \
+                nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 \
+                nvidia-cutlass-dsl-libs-core -y 2>/dev/null || true
+            if [[ "${CUDA_VERSION}" == *"cu13"* || "${CUDA_VERSION}" == 13.* ]]; then
+                pip install "nvidia-cutlass-dsl[cu13]==4.6.2"
+            else
+                pip install "nvidia-cutlass-dsl==4.6.2"
+            fi
+            python -c "import importlib.metadata as m; print('nvidia-cutlass-dsl', m.version('nvidia-cutlass-dsl'))"
         fi
-        python -c "import importlib.metadata as m; print('nvidia-cutlass-dsl', m.version('nvidia-cutlass-dsl'))"
 
         # Install local python sources. The env var keeps --no-build-isolation
         # from activating the build hooks' own downloads (see setup_test_env.sh).
