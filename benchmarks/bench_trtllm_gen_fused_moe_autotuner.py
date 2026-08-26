@@ -1,5 +1,11 @@
 import argparse
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+import hashlib
+from importlib.metadata import PackageNotFoundError, version
+import json
+from pathlib import Path
+import platform
+import subprocess
 from typing import Callable, Literal, Optional
 import torch
 import numpy as np
@@ -13,11 +19,15 @@ from flashinfer import (
 from flashinfer.fp4_quantization import block_scale_interleave
 from flashinfer.fused_moe import (
     Fp8QuantizationType,
+    prims_ts_bf16_moe,
+    prims_ts_bf16_routed_moe,
     prims_ts_fp4_block_scale_moe,
     prims_ts_fp4_block_scale_routed_moe,
     prims_ts_fp8_block_scale_moe,
     prims_ts_fp8_block_scale_routed_moe,
     prims_ts_fp8_per_tensor_scale_moe,
+    trtllm_bf16_moe,
+    trtllm_bf16_routed_moe,
     trtllm_fp4_block_scale_moe,
     trtllm_fp4_block_scale_routed_moe,
     trtllm_mxint4_block_scale_moe,
@@ -28,6 +38,7 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.fused_moe.core import (
     _maybe_get_cached_w3_w1_permute_indices,
+    convert_to_block_layout,
     get_w2_permute_indices_with_cache,
 )
 from flashinfer.autotuner import autotune, AutoTuner
@@ -121,8 +132,8 @@ def _print_table(results: list[BenchmarkResult], config_str: str):
         )
         print(
             f"  {result.batch_size:>{col0}}  {result.backend:>{col1}}"
-            f"  {result.no_autotune_ms:>{col2}.3f}"
-            f"  {result.tuned_ms:>{col3}.3f}  {speedup:>{col4}.2f}x"
+            f"  {result.no_autotune_ms:>{col2}.6f}"
+            f"  {result.tuned_ms:>{col3}.6f}  {speedup:>{col4}.2f}x"
             f"  {backend_ratio_str:>{col5}}"
         )
 
@@ -165,18 +176,22 @@ def _run_benchmark(
             setup.fn(**setup.input_kwargs)
         tuned_backends.add(setup.backend)
 
-    # measure tuned
-    results = [
-        BenchmarkResult(
-            setup.batch_size,
-            setup.backend,
-            ms,
-            measure(setup.fn, setup.input_kwargs),
-        )
-        for setup, ms in zip(setups, ms_no_autotune, strict=True)
-    ]
+    # The same override must remain active for lookup as for profiling.  Without
+    # it, explicit buckets are cached under one profile mapping and measured
+    # under the API's default mapping, which can silently fall back to tactic -1.
+    with autotune(False, tuning_buckets=tuning_buckets_tuple):
+        results = [
+            BenchmarkResult(
+                setup.batch_size,
+                setup.backend,
+                ms,
+                measure(setup.fn, setup.input_kwargs),
+            )
+            for setup, ms in zip(setups, ms_no_autotune, strict=True)
+        ]
 
     _print_table(results, config_str)
+    return results
 
 
 def _normalize_backends(backends: list[str], quant_mode: str) -> list[str]:
@@ -209,6 +224,14 @@ def _fp4_ops(backend: str, routed: bool) -> Callable:
             if routed
             else prims_ts_fp4_block_scale_moe
         )
+    raise ValueError(f"Unknown backend: {backend}")
+
+
+def _bf16_ops(backend: str, routed: bool) -> Callable:
+    if backend == "trtllm":
+        return trtllm_bf16_routed_moe if routed else trtllm_bf16_moe
+    if backend == "prims_ts":
+        return prims_ts_bf16_routed_moe if routed else prims_ts_bf16_moe
     raise ValueError(f"Unknown backend: {backend}")
 
 
@@ -373,6 +396,205 @@ def _shuffle_fp4_major_k(
     return result
 
 
+def _shuffle_bf16_block_major_k(
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    *,
+    activation_type: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create the common shuffled BlockMajorK layout required by BF16 MoE."""
+    epilogue_tile_m = 128
+    is_gated = activation_type in (
+        ActivationType.Swiglu.value,
+        ActivationType.Geglu.value,
+    )
+    permute_cache = {}
+    gemm1_weights_shuffled = []
+    gemm2_weights_shuffled = []
+    for expert_idx in range(gemm1_weights.shape[0]):
+        gemm1_bytes = gemm1_weights[expert_idx].view(torch.uint8)
+        permute_indices = _maybe_get_cached_w3_w1_permute_indices(
+            permute_cache,
+            gemm1_bytes,
+            epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
+        )
+        gemm1_weights_shuffled.append(
+            convert_to_block_layout(
+                gemm1_bytes[permute_indices.to(gemm1_bytes.device)].contiguous(), 128
+            ).view(torch.bfloat16)
+        )
+
+        gemm2_bytes = gemm2_weights[expert_idx].view(torch.uint8)
+        permute_indices = get_w2_permute_indices_with_cache(
+            permute_cache, gemm2_bytes, epilogue_tile_m
+        )
+        gemm2_weights_shuffled.append(
+            convert_to_block_layout(
+                gemm2_bytes[permute_indices.to(gemm2_bytes.device)].contiguous(), 128
+            ).view(torch.bfloat16)
+        )
+
+    return (
+        torch.stack(gemm1_weights_shuffled).contiguous(),
+        torch.stack(gemm2_weights_shuffled).contiguous(),
+    )
+
+
+def _shuffle_fp8_major_k(
+    gemm1_weights: torch.Tensor,
+    gemm2_weights: torch.Tensor,
+    *,
+    activation_type: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Create the common shuffled MajorK weight layout for FP8 block scale."""
+    epilogue_tile_m = 128
+    is_gated = activation_type in (
+        ActivationType.Swiglu.value,
+        ActivationType.Geglu.value,
+    )
+    permute_cache = {}
+    gemm1_weights_shuffled = []
+    gemm2_weights_shuffled = []
+    for expert_idx in range(gemm1_weights.shape[0]):
+        gemm1_bytes = gemm1_weights[expert_idx].view(torch.uint8)
+        gemm1_permute = _maybe_get_cached_w3_w1_permute_indices(
+            permute_cache,
+            gemm1_bytes,
+            epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
+        )
+        gemm1_weights_shuffled.append(
+            gemm1_bytes[gemm1_permute.to(gemm1_bytes.device)].contiguous()
+        )
+
+        gemm2_bytes = gemm2_weights[expert_idx].view(torch.uint8)
+        gemm2_permute = get_w2_permute_indices_with_cache(
+            permute_cache, gemm2_bytes, epilogue_tile_m
+        )
+        gemm2_weights_shuffled.append(
+            gemm2_bytes[gemm2_permute.to(gemm2_bytes.device)].contiguous()
+        )
+
+    return (
+        torch.stack(gemm1_weights_shuffled).view(gemm1_weights.dtype),
+        torch.stack(gemm2_weights_shuffled).view(gemm2_weights.dtype),
+    )
+
+
+def bench_trtllm_gen_fused_moe_autotuner_bf16(
+    tune_max_num_tokens: Optional[int],
+    num_tokens_list: list[int],
+    num_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+    warmups: int,
+    iterations: int,
+    activation_type: int,
+    backends: list[str],
+    tuning_buckets: Optional[list[int]] = None,
+    routed: bool = False,
+):
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+    tune_max = (
+        max(num_tokens_list) if tune_max_num_tokens is None else tune_max_num_tokens
+    )
+    is_gated = activation_type in (
+        ActivationType.Swiglu.value,
+        ActivationType.Geglu.value,
+    )
+    gemm1_rows = 2 * intermediate_size if is_gated else intermediate_size
+    gemm1_weights = torch.randn(
+        num_experts,
+        gemm1_rows,
+        hidden_size,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gemm2_weights = torch.randn(
+        num_experts,
+        hidden_size,
+        intermediate_size,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    gemm1_weights, gemm2_weights = _shuffle_bf16_block_major_k(
+        gemm1_weights,
+        gemm2_weights,
+        activation_type=activation_type,
+    )
+
+    static_kwargs = dict(
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate_size,
+        local_expert_offset=0,
+        local_num_experts=num_experts,
+        routed_scaling_factor=None,
+        routing_method_type=(
+            RoutingMethodType.Renormalize.value
+            if routed
+            else RoutingMethodType.TopK.value
+        ),
+        use_shuffled_weight=True,
+        weight_layout=WeightLayout.BlockMajorK.value,
+        do_finalize=True,
+        enable_pdl=enable_pdl,
+        tune_max_num_tokens=tune_max,
+        activation_type=activation_type,
+    )
+
+    setups = []
+    for batch_size in num_tokens_list:
+        hidden_states = torch.randn(
+            batch_size, hidden_size, device=device, dtype=torch.bfloat16
+        )
+        common_fn_kwargs = dict(static_kwargs)
+        if routed:
+            common_fn_kwargs["topk_ids"] = _pack_topk(
+                batch_size, top_k, num_experts, device
+            )
+        else:
+            common_fn_kwargs.update(
+                routing_logits=torch.rand(
+                    batch_size,
+                    num_experts,
+                    device=device,
+                    dtype=torch.bfloat16,
+                ),
+                routing_bias=None,
+                norm_topk_prob=True,
+            )
+        input_kwargs = {
+            "hidden_states": hidden_states,
+            "gemm1_weights": gemm1_weights,
+            "gemm2_weights": gemm2_weights,
+        }
+        for backend in backends:
+            setups.append(
+                BenchmarkSetup(
+                    batch_size,
+                    backend,
+                    partial(_bf16_ops(backend, routed), **common_fn_kwargs),
+                    input_kwargs,
+                )
+            )
+
+    mode_str = "routed" if routed else "non_routed"
+    return _run_benchmark(
+        setups,
+        warmups,
+        iterations,
+        f"quant_mode=BF16  routing={mode_str}  experts={num_experts}"
+        f"  hidden={hidden_size}  intermediate={intermediate_size}  top_k={top_k}",
+        tuning_buckets=tuning_buckets,
+    )
+
+
 def bench_trtllm_gen_fused_moe_autotuner_fp8(
     tune_max_num_tokens: Optional[int],
     quant_mode: Literal["Fp8-Per-Tensor", "Fp8-Block", "MxFP8xMxFP8"],
@@ -441,6 +663,9 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
             ),
             w2_scalar.item(),
             device=device,
+        )
+        w13, w2 = _shuffle_fp8_major_k(
+            w13, w2, activation_type=activation_type
         )
     else:  # MxFP8xMxFP8
         w13, w13_scale = mxfp8_quantize(w13, True)
@@ -521,7 +746,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                 local_expert_offset=0,
                 local_num_experts=num_experts,
                 routed_scaling_factor=2.5,
-                use_shuffled_weight=quant_mode == "MxFP8xMxFP8",
+                use_shuffled_weight=True,
                 weight_layout=WeightLayout.MajorK.value,
                 enable_pdl=enable_pdl,
                 tune_max_num_tokens=tune_max,
@@ -562,7 +787,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
                 )
 
     mode_str = "routed" if routed else "non_routed"
-    _run_benchmark(
+    return _run_benchmark(
         setups,
         warmups,
         iterations,
@@ -783,7 +1008,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp4(
             )
 
     mode_str = "routed" if routed else "non_routed"
-    _run_benchmark(
+    return _run_benchmark(
         setups,
         warmups,
         iterations,
@@ -868,7 +1093,7 @@ def bench_trtllm_gen_fused_moe_autotuner_mxint4(
         }
         setups.append(BenchmarkSetup(batch_size, "trtllm", fn, input_kwargs))
 
-    _run_benchmark(
+    return _run_benchmark(
         setups,
         warmups,
         iterations,
@@ -884,6 +1109,7 @@ if __name__ == "__main__":
         type=str,
         default="MxFP4xMxFP8",
         choices=[
+            "BF16",
             "NvFP4xNvFP4",
             "MxFP4xMxFP8",
             "MxFP4xBf16",
@@ -980,7 +1206,18 @@ if __name__ == "__main__":
         help="Use pre-computed topk_ids (routed) path instead of routing_logits. "
         "Not supported for Fp8-Per-Tensor or MxInt4xBf16.",
     )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed used to create inputs"
+    )
+    parser.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Write configuration, environment, and raw median results as JSON.",
+    )
     args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
 
     if args.num_tokens is None:
         args.num_tokens = [512]
@@ -1009,8 +1246,23 @@ if __name__ == "__main__":
     if args.routed and is_mxint4:
         raise ValueError("--routed is not supported for MxInt4xBf16.")
 
-    if is_fp8:
-        bench_trtllm_gen_fused_moe_autotuner_fp8(
+    if args.quant_mode == "BF16":
+        results = bench_trtllm_gen_fused_moe_autotuner_bf16(
+            args.tune_max_num_tokens,
+            args.num_tokens,
+            args.num_experts,
+            args.hidden_size,
+            args.intermediate_size,
+            args.top_k,
+            args.warmups,
+            args.iterations,
+            args.activation_type,
+            backends,
+            tuning_buckets=args.tuning_buckets,
+            routed=args.routed,
+        )
+    elif is_fp8:
+        results = bench_trtllm_gen_fused_moe_autotuner_fp8(
             args.tune_max_num_tokens,
             args.quant_mode,
             args.num_tokens,
@@ -1026,7 +1278,7 @@ if __name__ == "__main__":
             routed=args.routed,
         )
     elif is_mxint4:
-        bench_trtllm_gen_fused_moe_autotuner_mxint4(
+        results = bench_trtllm_gen_fused_moe_autotuner_mxint4(
             args.tune_max_num_tokens,
             args.quant_mode,
             args.num_tokens,
@@ -1039,7 +1291,7 @@ if __name__ == "__main__":
             args.activation_type,
         )
     else:
-        bench_trtllm_gen_fused_moe_autotuner_fp4(
+        results = bench_trtllm_gen_fused_moe_autotuner_fp4(
             args.tune_max_num_tokens,
             args.quant_mode,
             args.num_tokens,
@@ -1057,3 +1309,95 @@ if __name__ == "__main__":
             use_bias=args.use_bias,
             routed=args.routed,
         )
+
+    if args.output_json is not None:
+        def package_version(name: str) -> Optional[str]:
+            try:
+                return version(name)
+            except PackageNotFoundError:
+                return None
+
+        def command_output(command: list[str]) -> Optional[str]:
+            try:
+                return subprocess.check_output(command, text=True).strip()
+            except (OSError, subprocess.CalledProcessError):
+                return None
+
+        device_properties = torch.cuda.get_device_properties(0)
+        cupti_version = package_version("cupti-python")
+        driver_output = command_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=driver_version",
+                "--format=csv,noheader",
+            ]
+        )
+        source_path = Path(__file__).resolve()
+        timing_method = (
+            "CUPTI activity tracing of one CUDA-graph replay"
+            if cupti_version is not None and int(cupti_version.split(".")[0]) >= 13
+            else "CUDA events around 10-call CUDA-graph replays, divided by 10"
+        )
+        payload = {
+            "schema_version": 1,
+            "environment": {
+                "gpu": device_properties.name,
+                "compute_capability": list(torch.cuda.get_device_capability(0)),
+                "nvidia_driver": (
+                    driver_output.splitlines()[0] if driver_output else None
+                ),
+                "python": platform.python_version(),
+                "flashinfer": package_version("flashinfer-python"),
+                "flashinfer_cubin": package_version("flashinfer-cubin"),
+                "torch": torch.__version__,
+                "torch_cuda": torch.version.cuda,
+                "cudnn": torch.backends.cudnn.version(),
+                "numpy": np.__version__,
+                "nvidia_cutlass_dsl": package_version("nvidia-cutlass-dsl"),
+                "apache_tvm_ffi": package_version("apache-tvm-ffi"),
+                "cupti_python": cupti_version,
+                "git_commit": command_output(["git", "rev-parse", "HEAD"]),
+                "git_dirty": bool(command_output(["git", "status", "--porcelain"])),
+                "benchmark_script_sha256": hashlib.sha256(
+                    source_path.read_bytes()
+                ).hexdigest(),
+            },
+            "configuration": {
+                "quant_mode": args.quant_mode,
+                "routing_input_mode": "precomputed" if args.routed else "logits",
+                "routing_method": (
+                    "Renormalize"
+                    if args.routed
+                    else (
+                        "DeepSeekV3"
+                        if args.quant_mode in ("Fp8-Block", "MxFP8xMxFP8")
+                        else "TopK"
+                    )
+                ),
+                "num_tokens": args.num_tokens,
+                "num_experts": args.num_experts,
+                "local_num_experts": args.local_num_experts,
+                "local_expert_offset": args.local_expert_offset,
+                "top_k": args.top_k,
+                "hidden_size": args.hidden_size,
+                "intermediate_size": args.intermediate_size,
+                "tp": args.tp,
+                "activation_type": int(args.activation_type),
+                "use_bias": args.use_bias if args.quant_mode != "BF16" else False,
+                "tune_max_num_tokens": args.tune_max_num_tokens,
+                "tuning_buckets": args.tuning_buckets,
+                "seed": args.seed,
+            },
+            "timing": {
+                "method": timing_method,
+                "cold_l2_cache": True,
+                "cuda_graph": True,
+                "warmup_replays": args.warmups,
+                "measured_replays": args.iterations,
+                "calls_per_replay": 1 if cupti_version is not None else 10,
+                "jit_compilation_in_steady_state_timing": False,
+            },
+            "results": [asdict(result) for result in results],
+        }
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.write_text(json.dumps(payload, indent=2) + "\n")
