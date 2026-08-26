@@ -2140,6 +2140,10 @@ class FP4MQALogitsKernel:
                     # ld/st; 44 -> ~8.5K spill STL in the hot loop).
                     MAX_NUM_W_IN_REG = 40 if next_n == 4 else 56 if next_n == 3 else 64
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
+                # Both the register and SMEM weight paths unroll 4-wide; an
+                # off-multiple split point silently corrupts the epilogue
+                # (mirrors the FP8 kernel's _EPI_UNROLL guard).
+                assert NUM_W_IN_REG % 4 == 0
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
                 # actual STG happens once after the for-t loop to land all
@@ -2480,6 +2484,10 @@ class FP4MQALogitsKernel:
                     # ld/st; 44 -> ~8.5K spill STL in the hot loop).
                     MAX_NUM_W_IN_REG = 40 if next_n == 4 else 56 if next_n == 3 else 64
                 NUM_W_IN_REG = min(MAX_NUM_W_IN_REG, num_heads)
+                # Both the register and SMEM weight paths unroll 4-wide; an
+                # off-multiple split point silently corrupts the epilogue
+                # (mirrors the FP8 kernel's _EPI_UNROLL guard).
+                assert NUM_W_IN_REG % 4 == 0
                 w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
                 # Batched STG: hold reduced result per t in register; the
                 # actual STG happens once after the for-t loop to land all

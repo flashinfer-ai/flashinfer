@@ -718,3 +718,103 @@ def test_adv_interspersed_zero_row_uses_correct_q(variant):
             f"{rel:.2e} relative: the row after a skipped zero-length row is "
             "consuming the skipped row's Q/weights"
         )
+
+
+@pytest.mark.parametrize("next_n_atom", [None, 2, 1])
+def test_adv_fp4_next_n4_split_zero_and_short_rows(next_n_atom):
+    """Interspersed zero-work ATOMS must not desync the FP4 split's prefetch.
+
+    Under an atom split a "row" the task iterators traverse is a q_atom, and
+    its context is ctx - (num_atoms-1-i)*atom -- which is zero or NEGATIVE for
+    a short-but-nonzero native row (here ctx=2 at next_n=4: the leading atom of
+    a 2-split sees 0, the 4-split sees -1..2). The producer lookahead must skip
+    exactly the atoms the consumers skip, on the per-atom length with a <= 0
+    test; a lookahead reading the native ctx (or testing == 0) stages the
+    skipped atom's Q/SF_Q/W and the atom after the gap consumes them -- wrong
+    logits, no hang, the same failure mode
+    test_adv_interspersed_zero_row_uses_correct_q pins for num_atoms == 1.
+
+    The shape combines every skip trigger: a native zero row (all atoms
+    skipped), a ctx=2 row (leading atoms skipped, trailing atom live), and a
+    num_sms*256 row so one CTA's range spans the gaps. Trailing zeros cannot
+    expose the bug. Weights are distinct per (b, t) so any row mixup is
+    unmissable. Runs every legal decomposition: None (direct on Rubin, 2-atom
+    split on Blackwell), 2-atom, and 4-atom.
+    """
+    _skip_if_not_sm100()
+    from flashinfer import fp4_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import _cached_num_sms
+    from flashinfer.utils import get_device_index
+
+    from tests.attn_scores.test_attn_scores import (
+        _cast_back_from_fp4,
+        _kv_cache_cast_to_fp4,
+        _per_token_cast_to_fp4,
+        _ref_fp4_paged_mqa_logits,
+    )
+
+    torch.manual_seed(11)
+    S = _cached_num_sms(get_device_index(torch.device(DEVICE)))
+    H, D, block_size, next_n = 64, 128, 64, 4
+    ctx = [128, 0, 2, S * 256]
+    B = len(ctx)
+    max_ml = max(ctx)
+
+    cl = torch.tensor(ctx, dtype=torch.int32, device=DEVICE)
+    nblk = [-(-c // block_size) for c in ctx]
+    bt = torch.zeros((B, max(nblk)), dtype=torch.int32, device=DEVICE)
+    run = 0
+    for b, n in enumerate(nblk):
+        for j in range(n):
+            bt[b, j] = run
+            run += 1
+    ntb = max(run, 1)
+
+    # distinct per (b, t): consuming a neighbouring atom's W is unmissable
+    weights = torch.empty(B * next_n, H, device=DEVICE, dtype=torch.float32)
+    for i in range(B * next_n):
+        weights[i] = float(i + 1)
+
+    q_f32 = torch.randn(B, next_n, H, D, device=DEVICE)
+    q_packed, sf_q_packed = _per_token_cast_to_fp4(q_f32.view(-1, D), gran_k=32)
+    q_fp4 = q_packed.view(torch.uint8).view(B, next_n, H, D // 2)
+    sf_q = sf_q_packed.view(torch.int32).view(B, next_n, H)
+    q_sim = _cast_back_from_fp4(q_packed, sf_q_packed, gran_k=32).view(B, next_n, H, D)
+    kv_cache = torch.randn(ntb, block_size, 1, D, device=DEVICE, dtype=torch.bfloat16)
+    kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
+
+    ref = _ref_fp4_paged_mqa_logits(
+        q_sim.float(), kv_sim.float(), weights, cl, bt, max_ml
+    )
+    out = fp4_paged_mqa_logits(
+        q_fp4,
+        sf_q,
+        kv_fused,
+        weights,
+        cl,
+        bt,
+        max_ml,
+        output_dtype=torch.float32,
+        next_n_atom=next_n_atom,
+    )
+    torch.cuda.synchronize()
+
+    # Per (b, t) output row: valid positions are pos <= ctx[b] - next_n + t,
+    # so ctx=2 has none for t in {0, 1} and 1-2 positions for t in {2, 3}.
+    for b, n in enumerate(ctx):
+        for t in range(next_n):
+            limit = n - next_n + t + 1  # count of valid positions
+            if limit <= 0:
+                continue
+            row = b * next_n + t
+            a = out[row, :limit].float()
+            r = ref[row, :limit].float()
+            finite = torch.isfinite(a) & torch.isfinite(r)
+            assert finite.any(), f"row {row} produced no finite logits"
+            scale = float(r[finite].abs().max()) or 1.0
+            rel = float((a[finite] - r[finite]).abs().max()) / scale
+            assert rel < 1e-3, (
+                f"next_n_atom={next_n_atom} row (b={b}, t={t}, ctx={n}) differs "
+                f"from the reference by {rel:.2e} relative: an atom after a "
+                "zero-work atom is consuming the skipped atom's Q/weights"
+            )
