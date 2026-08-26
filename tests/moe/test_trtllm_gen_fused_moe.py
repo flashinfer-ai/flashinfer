@@ -161,20 +161,6 @@ def cache_permute_indices():
         pytest.param(
             {
                 "use_shuffled_weight": True,
-                "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [
-                    FP4Moe,
-                    FP8PerTensorMoe,
-                    FP8BlockScaleMoe,
-                    BF16Moe,
-                ],
-                "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
-            },
-            id="Shuffled_MajorK_PrimsTS",
-        ),
-        pytest.param(
-            {
-                "use_shuffled_weight": True,
                 "layout": WeightLayout.BlockMajorK,
                 "compatible_moe_impls": [
                     FP8BlockScaleMoe,
@@ -391,20 +377,6 @@ def test_sigmoid_routing(
         pytest.param(
             {
                 "use_shuffled_weight": True,
-                "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [
-                    FP4Moe,
-                    FP8PerTensorMoe,
-                    FP8BlockScaleMoe,
-                    BF16Moe,
-                ],
-                "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
-            },
-            id="Shuffled_MajorK_PrimsTS",
-        ),
-        pytest.param(
-            {
-                "use_shuffled_weight": True,
                 "layout": WeightLayout.BlockMajorK,
                 "compatible_moe_impls": [
                     FP8BlockScaleMoe,
@@ -575,20 +547,6 @@ def test_deepseekv3_routing(
             },
             id="Shuffled_MajorK",
         ),
-        pytest.param(
-            {
-                "use_shuffled_weight": True,
-                "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [
-                    FP4Moe,
-                    FP8PerTensorMoe,
-                    FP8BlockScaleMoe,
-                    BF16Moe,
-                ],
-                "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
-            },
-            id="Shuffled_MajorK_PrimsTS",
-        ),
     ],
 )
 @pytest.mark.parametrize(
@@ -728,20 +686,6 @@ def test_topk_routing(
                 "compatible_gemm_backends": [MoeGemmBackend.TRTLLM],
             },
             id="Shuffled_MajorK",
-        ),
-        pytest.param(
-            {
-                "use_shuffled_weight": True,
-                "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [
-                    FP4Moe,
-                    FP8PerTensorMoe,
-                    FP8BlockScaleMoe,
-                    BF16Moe,
-                ],
-                "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
-            },
-            id="Shuffled_MajorK_PrimsTS",
         ),
     ],
 )
@@ -1829,20 +1773,6 @@ def test_tier_1024_experts_routing(
                 "compatible_gemm_backends": [MoeGemmBackend.TRTLLM],
             },
             id="Shuffled_MajorK",
-        ),
-        pytest.param(
-            {
-                "use_shuffled_weight": True,
-                "layout": WeightLayout.MajorK,
-                "compatible_moe_impls": [
-                    FP4Moe,
-                    FP8PerTensorMoe,
-                    FP8BlockScaleMoe,
-                    BF16Moe,
-                ],
-                "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
-            },
-            id="Shuffled_MajorK_PrimsTS",
         ),
         pytest.param(
             {

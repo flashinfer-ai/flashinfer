@@ -137,6 +137,13 @@ def test_prims_ts_deepseek_fp8_block_scale_tile16_smoke(
 
 
 @pytest.mark.parametrize("bias", ["gemm2", "gemm1", "gemm1_and_gemm2"])
+@pytest.mark.parametrize(
+    "moe_gemm_backend",
+    [
+        pytest.param(MoeGemmBackend.TRTLLM, id="TRTLLM"),
+        pytest.param(MoeGemmBackend.PRIMS_TS, id="PrimsTS"),
+    ],
+)
 def test_prims_ts_mxfp8_block_scale_bias(
     bias,
     moe_gemm_backend,

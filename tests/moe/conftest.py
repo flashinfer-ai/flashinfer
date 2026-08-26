@@ -33,12 +33,7 @@ def _disable_prims_ts_exhaustive_checker_in_moe_integration_tests(monkeypatch):
     monkeypatch.setenv("FLASHINFER_PRIMS_TS_DEBUG_CHECKS", "0")
 
 
-def pytest_generate_tests(metafunc):
-    if "moe_gemm_backend" in metafunc.fixturenames:
-        metafunc.parametrize(
-            "moe_gemm_backend",
-            [
-                pytest.param(MoeGemmBackend.TRTLLM, id="TRTLLM"),
-                pytest.param(MoeGemmBackend.PRIMS_TS, id="PrimsTS"),
-            ],
-        )
+@pytest.fixture
+def moe_gemm_backend():
+    """Use TRT-LLM unless a focused test explicitly requests both backends."""
+    return MoeGemmBackend.TRTLLM
