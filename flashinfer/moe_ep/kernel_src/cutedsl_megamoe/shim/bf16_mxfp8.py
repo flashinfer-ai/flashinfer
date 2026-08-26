@@ -12,6 +12,7 @@ from .comm import (
     _CompiledMega,
     _compute_peer_offsets,
     bootstrap_dist,
+    ensure_not_capturing,
     free_sym_tensor,
     resolve_gate_up_clamp,
     sym_zeros,
@@ -73,8 +74,8 @@ class MegaMoEBf16Mxfp8Config:
             raise ValueError(
                 "hidden must be divisible by 32 and intermediate positive."
             )
-        if (self.intermediate // 2) % 32:
-            raise ValueError("intermediate/2 must be divisible by 32.")
+        if self.intermediate % 64:
+            raise ValueError("intermediate must be divisible by 64.")
         if self.cluster_shape_mnk != (2, 1, 1) or not self.use_2cta_instrs:
             raise ValueError("mixed MegaMoE requires two-CTA cluster (2, 1, 1).")
         if (
@@ -122,9 +123,13 @@ class MegaMoEBf16Mxfp8Frontend:
     def config(self) -> MegaMoEBf16Mxfp8Config:
         return self._config
 
-    def release(self) -> None:
+    def _release_workspace(self) -> None:
         if self._mega is not None:
+            ensure_not_capturing("workspace release (symmetric-heap free)")
             free_sym_tensor(self._mega.shared_workspace)
+
+    def release(self) -> None:
+        self._release_workspace()
         self._mega = None
         self._mega_key = None
 
@@ -136,6 +141,7 @@ class MegaMoEBf16Mxfp8Frontend:
             raise ValueError(f"unsupported mixed MegaMoE knobs: {knobs}.")
         new_config = with_knobs(self._config, knobs)
         if new_config != self._config:
+            ensure_not_capturing("apply_knobs (config change)")
             self.release()
             self._config = new_config
 
@@ -251,6 +257,8 @@ class MegaMoEBf16Mxfp8Frontend:
         key = self._compile_key()
         if self._mega is not None and self._mega_key == key:
             return self._mega
+
+        ensure_not_capturing("cute.compile + symmetric-heap allocation")
         self.release()
         import cutlass
         import cutlass.cute as cute
