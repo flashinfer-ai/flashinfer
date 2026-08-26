@@ -173,6 +173,28 @@ def test_config_mapper_supports_nvfp4_per_token_sfb_e2m1_fc1():
     assert fc2.use_per_token_sf_b == 0
 
 
+def test_nvfp4_tile32_packed_gather_uses_two_warps():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        compute_warp_layout,
+    )
+
+    pair = map_trtllm_nvfp4_moe_tactic(
+        [32, 9],
+        activation_type=int(ActivationType.Swiglu),
+        num_tokens=512,
+        top_k=4,
+        num_local_experts=128,
+        fc1_has_bias=True,
+        fc2_has_bias=True,
+    )
+    fc1 = pair.fc1.cfg.build()
+    compute_warp_layout(fc1)
+
+    assert fc1.tile_n == 32
+    assert fc1.num_gather_warps == 2
+    assert fc1.threads_per_cta == 512
+
+
 def test_config_mapper_mxfp4_mxfp8_uses_local_json_config_pair():
     num_configs = len(_expanded_prims_ts_json_configs())
     pair = _first_buildable_pair(
