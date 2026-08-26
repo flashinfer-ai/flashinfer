@@ -49,12 +49,10 @@ def _require_cupti() -> str:
 
 def _load_production_fa4():
     try:
-        from sglang.kernels.ops.attention.flash_attn.cute.interface import (
-            _flash_attn_fwd,
-        )
+        from flash_attn.cute.interface import _flash_attn_fwd
     except ImportError as error:
         raise RuntimeError(
-            "an SGLang installation with production FA4 is required"
+            "the flash-attn-4 package used by production SGLang FA4 is required"
         ) from error
     return _flash_attn_fwd
 
@@ -176,6 +174,14 @@ def _callable_provenance(distribution: str, fn: Callable[..., object]) -> dict:
         ),
         "module_source_path": str(source),
         "module_source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+    }
+
+
+def _production_fa4_provenance(fn: Callable[..., object]) -> dict:
+    return {
+        **_callable_provenance("flash-attn-4", fn),
+        "sglang_distribution_version": distribution_version("sglang"),
+        "sglang_backend": "FA4",
     }
 
 
@@ -332,7 +338,7 @@ def main() -> None:
             "candidate": _callable_provenance(
                 "flashinfer-python", wan_hybrid_attention
             ),
-            "production_fa4": _callable_provenance("sglang", production_fa4),
+            "production_fa4": _production_fa4_provenance(production_fa4),
         },
         "benchmark_process_runtime_seconds": time.monotonic() - started,
     }

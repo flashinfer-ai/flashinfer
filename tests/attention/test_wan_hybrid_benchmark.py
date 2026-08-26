@@ -52,6 +52,26 @@ def test_baseline_quality_is_required_for_promotion() -> None:
     )
 
 
+def test_load_production_fa4_uses_sglang_runtime_package(monkeypatch) -> None:
+    flash_attn = types.ModuleType("flash_attn")
+    flash_attn.__path__ = []
+    cute = types.ModuleType("flash_attn.cute")
+    cute.__path__ = []
+    interface = types.ModuleType("flash_attn.cute.interface")
+
+    def provider() -> None:
+        return None
+
+    interface._flash_attn_fwd = provider
+    monkeypatch.setitem(sys.modules, "flash_attn", flash_attn)
+    monkeypatch.setitem(sys.modules, "flash_attn.cute", cute)
+    monkeypatch.setitem(sys.modules, "flash_attn.cute.interface", interface)
+    monkeypatch.delitem(sys.modules, "sglang", raising=False)
+
+    assert benchmark._load_production_fa4() is provider
+    assert "sglang" not in sys.modules
+
+
 def test_callable_provenance_records_source_identity(tmp_path, monkeypatch) -> None:
     source = tmp_path / "provider.py"
     source.write_text("def provider():\n    return None\n", encoding="utf-8")
@@ -92,3 +112,27 @@ def test_callable_provenance_fails_without_source(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, module.__name__, module)
     with pytest.raises(RuntimeError, match="no source file"):
         benchmark._callable_provenance("provider-dist", provider)
+
+
+def test_production_fa4_provenance_records_sglang_route(
+    tmp_path, monkeypatch
+) -> None:
+    source = tmp_path / "interface.py"
+    source.write_text("def provider():\n    return None\n", encoding="utf-8")
+    module = types.ModuleType("flash_attn.cute.interface")
+    module.__file__ = str(source)
+
+    def provider() -> None:
+        return None
+
+    provider.__module__ = module.__name__
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    versions = {"flash-attn-4": "4.0.0b15", "sglang": "0.5.14"}
+    monkeypatch.setattr(benchmark, "distribution_version", versions.__getitem__)
+
+    result = benchmark._production_fa4_provenance(provider)
+    assert result["distribution"] == "flash-attn-4"
+    assert result["distribution_version"] == "4.0.0b15"
+    assert result["sglang_distribution_version"] == "0.5.14"
+    assert result["sglang_backend"] == "FA4"
+    assert result["callable_module"] == module.__name__
