@@ -30,6 +30,12 @@ output_column_dict = {
         "is_var_seq",
         "cute_dsl_impl",
     ],
+    "dsv4_sparse_mla": [
+        "swa_topk",
+        "compressed_topk",
+        "compressed_kv_len",
+        "compressed_page_size",
+    ],
     "gemm": [
         "n",
         "group_size",
@@ -197,6 +203,7 @@ output_column_dict = {
 full_output_columns = (
     output_column_dict["perf"]
     + output_column_dict["attention"]
+    + output_column_dict["dsv4_sparse_mla"]
     + output_column_dict["gemm"]
     + output_column_dict["moe"]
     + output_column_dict["moe_comm"]
@@ -220,6 +227,7 @@ benchmark_apis = {
         "BatchPrefillWithPagedKVCacheWrapper",
         "BatchPrefillWithRaggedKVCacheWrapper",
         "BatchMLAPagedAttentionWrapper",
+        "trtllm_batch_decode_sparse_mla_dsv4",
     ],
     "gemm": [
         "gemm_fp8_nt_groupwise",
@@ -493,6 +501,18 @@ routine_cc_to_supported_backends = {
         "10.7": ["fa2", "cutlass", "trtllm-native"],
         "12.0": ["fa2"],
         "12.1": ["fa2"],
+    },
+    "trtllm_batch_decode_sparse_mla_dsv4": {
+        "7.5": [],
+        "8.0": [],
+        "8.6": [],
+        "8.9": [],
+        "9.0": [],
+        "10.0": ["trtllm-gen"],
+        "10.3": ["trtllm-gen"],
+        "10.7": [],
+        "12.0": [],
+        "12.1": [],
     },
     # GEMM
     "gemm_fp8_nt_groupwise": {

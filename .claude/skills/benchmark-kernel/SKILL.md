@@ -63,7 +63,7 @@ If you don't install CUPTI, the framework will:
 ### Step 1: Choose Your Test Routine
 
 Available routines:
-- **Attention**: `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, `BatchPrefillWithRaggedKVCacheWrapper`, `BatchMLAPagedAttentionWrapper`
+- **Attention**: `BatchDecodeWithPagedKVCacheWrapper`, `BatchPrefillWithPagedKVCacheWrapper`, `BatchPrefillWithRaggedKVCacheWrapper`, `BatchMLAPagedAttentionWrapper`, `trtllm_batch_decode_sparse_mla_dsv4`
 - **GEMM**: `bmm_fp8`, `gemm_fp8_nt_groupwise`, `group_gemm_fp8_nt_groupwise`, `mm_fp4`
 - **MOE**: `trtllm_fp4_block_scale_moe`, `trtllm_fp8_block_scale_moe`, `trtllm_fp8_per_tensor_scale_moe`, `cutlass_fused_moe`
 

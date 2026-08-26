@@ -36,6 +36,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
         - Also supports computationally similar `cudnn_batch_prefill_with_kv_cache` (cudnn-native) and  `trtllm_ragged_attention_deepseek`.
     - `BatchMLAPagedAttentionWrapper` - MLA attention proposed in DeepSeek series of models.
         - Also supports computationally similar `trtllm_batch_decode_with_kv_cache_mla` (trtllm-native) and CuTe DSL MLA decode kernel (cute-dsl, SM100+).
+    - `trtllm_batch_decode_sparse_mla_dsv4` - DeepSeek-V4 sparse MLA using the public TRTLLM-GEN API on SM100/SM103. Supports varlen prefill-style query lengths, causal SWA and compressed-cache sparse tables, FP8/BF16 inputs, sampled FP32 reference checking, and hot-path Q-tile selector benchmarks.
     - All four attention routines accept `--backends prims-ts` on SM100/SM103 to benchmark the experimental task-scheduled attention implementation. `prims_ts` is accepted as an alias.
 - GEMM:
     - `gemm_fp8_nt_groupwise` - GEMM with FP8 data types using groupwise scaling.
@@ -239,6 +240,11 @@ The output CSV will contain detailed metrics including:
 | `--out_dtype`            | Data type for the output tensor. Default: same as q_dtype. Backend-dependent; PrimTS context accepts bfloat16, float16, or fp8_e4m3, while PrimTS FP8 decode accepts float16 or fp8_e4m3. FP8 ragged comparisons with non-PrimTS backends require bfloat16 or float16. |
 | `--causal`               | Use causal attention masking for context/prefill. Multi-query FMHA and MLA decode use bottom-right causal masking automatically. |
 | `--random_actual_seq_len`| Use random sequence lengths up to max length. If False, use max length.                                    |
+| `--swa_topk`             | DSV4 sparse MLA only: sliding-window segment width. Must be 128.                                           |
+| `--compressed_topk`      | DSV4 sparse MLA only: maximum compressed-cache rows selected per query. Default: 1920.                    |
+| `--compressed_kv_len`    | DSV4 sparse MLA only: compressed-cache rows per request. Default: `ceil(s_kv / 4)`.                       |
+| `--compressed_page_size` | DSV4 sparse MLA only: compressed-cache page size. Default: 64.                                             |
+| `--kv_layout`            | DSV4 sparse MLA only: `HND` (default) or `NHD` for both KV-cache pools.                                    |
 
 ### GEMM Flags
 | Flag                     | Description                                                                                                 |
@@ -526,6 +532,7 @@ Legend:
 | **BatchPrefillWithPagedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, trtllm-gen, trtllm-native, prims-ts | fa2, cudnn, cudnn-native |
 | **BatchPrefillWithRaggedKVCacheWrapper** |  | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, cudnn, cudnn-native | fa2, fa3, cudnn, cudnn-native | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native, cutlass, trtllm-native, prims-ts | fa2, cudnn, cudnn-native |
 | **BatchMLAPagedAttentionWrapper** |  | fa2 | fa2 | fa2 | fa2, fa3 | fa2, cutlass, trtllm-native, cute-dsl, prims-ts | fa2, cutlass, trtllm-native, prims-ts | fa2 |
+| **trtllm_batch_decode_sparse_mla_dsv4** |  |  |  |  |  | trtllm-gen | trtllm-gen |  |
 | **gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
 | **group_gemm_fp8_nt_groupwise** |  |  |  |  |  | cutlass | cutlass |  |
 | **bmm_fp8** |  |  |  | cudnn, cublas | cudnn, cublas | cudnn, cublas, cutlass | cudnn, cublas, cutlass | cudnn, cublas |
