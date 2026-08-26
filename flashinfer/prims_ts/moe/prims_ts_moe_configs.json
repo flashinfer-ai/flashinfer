@@ -160,7 +160,8 @@
         {
             "_comment": "FP4_FC1_LowLatency",
             "_template": "BatchedGemmFp4LowLatency",
-            "route_act": "tma",
+            "route_act": "ldgsts",
+            "route_sfs_act": "ldgsts",
             "fused_act,act,eltwise_act_type": [
                 [true, "swiglu", "none"],
                 [true, "geglu", "none"],

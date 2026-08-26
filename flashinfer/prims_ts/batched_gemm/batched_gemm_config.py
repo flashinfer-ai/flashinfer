@@ -2927,14 +2927,18 @@ def validate_config(
     if cfg.has_gather:
         activation_operand = "b" if cfg.is_swap_ab else "a"
         activation_dtype_bits = cfg.dtype_b_bits if cfg.is_swap_ab else cfg.dtype_a_bits
-        if activation_dtype_bits % 8 != 0:
-            # [FIXME] Support LDGSTS gather for packed sub-byte activations once
-            # the gather path handles bit-packed element addressing and SMEM sizing.
+        if activation_dtype_bits not in (4, 8, 16):
             raise ValueError(
-                "LDGSTS activation gather requires byte-addressable activation "
+                "LDGSTS activation gather requires a supported packed or "
+                "byte-addressable activation "
                 f"elements, got dtype_{activation_operand} with "
-                f"{activation_dtype_bits} bits. Use route_act=TMA for packed "
-                "sub-byte activations."
+                f"{activation_dtype_bits} bits."
+            )
+        if (cfg.tile_k * activation_dtype_bits) % 128 != 0:
+            raise ValueError(
+                "LDGSTS activation gather requires each row tile to contain an "
+                f"integer number of 16-byte copies, got tile_k={cfg.tile_k} "
+                f"and dtype_{activation_operand}={activation_dtype_bits} bits."
             )
 
     if cfg.act_kind not in (

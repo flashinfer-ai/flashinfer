@@ -1361,7 +1361,7 @@ def _batched_gemm_kernel_bf16_body(
         route_map_view = cutlass.make_array_view(route_map_tensor)
         mn_limit_view = cutlass.make_array_view(mn_limit_tensor)
         act_byte_ptr = cutlass.make_array_view(act_tensor).data_ptr()
-        act_stride = problem_k * Int32(cfg.dtype_b_bits // 8)
+        act_stride = problem_k * Int32(cfg.dtype_b_bits) // Int32(8)
         smem_a = SmemAResource(
             cfg=cfg,
             tma_a_desc=tma_a_ptr,
@@ -1382,7 +1382,7 @@ def _batched_gemm_kernel_bf16_body(
         route_map_view = cutlass.make_array_view(route_map_tensor)
         mn_limit_view = cutlass.make_array_view(mn_limit_tensor)
         act_byte_ptr = cutlass.make_array_view(act_tensor).data_ptr()
-        act_stride = problem_k * Int32(cfg.dtype_a_bits // 8)
+        act_stride = problem_k * Int32(cfg.dtype_a_bits) // Int32(8)
         smem_a = SmemGatherResource(
             cfg=cfg,
             act_gmem_ptr=act_byte_ptr,

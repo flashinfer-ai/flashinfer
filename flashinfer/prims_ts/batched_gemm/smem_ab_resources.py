@@ -503,7 +503,8 @@ class SmemGatherResource(MemoryResource):
     In non-swapAB mode: this is the A operand (activations, tokens × in_hidden).
 
     The route map (`ptrRouteMap`) maps logical token indices to physical GMEM
-    positions. Each cp.async loads 16 bytes (8 bf16 elements) with s128b swizzle.
+    positions. Each cp.async loads 16 bytes with s128b swizzle. Packed FP4 rows
+    are addressed in bytes, so one 128-byte K box contains 256 logical elements.
     """
 
     cfg: Constexpr[BatchedGemmConfig]
@@ -622,9 +623,9 @@ class SmemGatherResource(MemoryResource):
         """LDGSTS: gather activations from GMEM to SMEM via cp.async 16B.
 
         Uses cp.async.ca.shared.global for true LDGSTS (async copy from
-        global to shared memory). Each thread copies 16 bytes (8 bf16 elements).
-        Route map provides the physical GMEM row for each logical token.
-        s128b swizzle applied to SMEM destination.
+        global to shared memory). Each thread copies 16 bytes. Route map
+        provides the physical GMEM row for each logical token. s128b swizzle
+        is applied to the SMEM destination for BF16, FP8, and packed FP4.
         """
         is_operand_b = cutlass.const_expr(self._operand == "b")
         bytes_per_stage = (
@@ -650,9 +651,9 @@ class SmemGatherResource(MemoryResource):
         dtype_bits = (
             self.cfg.dtype_b_smem_bits if is_operand_b else self.cfg.dtype_a_smem_bits
         )
-        dtype_bytes = dtype_bits // 8
-        box_k = 64 if dtype_bits == 16 else 128
-        copies_per_row_box = box_k * dtype_bytes // copy_bytes
+        box_k = 64 if dtype_bits == 16 else 128 if dtype_bits == 8 else 256
+        bytes_per_row_box = box_k * dtype_bits // 8
+        copies_per_row_box = bytes_per_row_box // copy_bytes
         num_k_boxes = self.cfg.tile_k // box_k
         total_copies = tile_rows_per_cta * copies_per_row_box * num_k_boxes
         num_threads = self.cfg.num_gather_warps * 32
@@ -676,8 +677,8 @@ class SmemGatherResource(MemoryResource):
             )
 
             # SMEM destination with s128b swizzle
-            smem_kbox_bytes = k_box * Int32(tile_rows_per_cta * box_k * dtype_bytes)
-            smem_row_bytes = row_in_tile * Int32(box_k * dtype_bytes)
+            smem_kbox_bytes = k_box * Int32(tile_rows_per_cta * bytes_per_row_box)
+            smem_row_bytes = row_in_tile * Int32(bytes_per_row_box)
             smem_col_bytes = col_chunk * Int32(copy_bytes)
             smem_off_bytes = smem_kbox_bytes + smem_row_bytes + smem_col_bytes
             swizzle_mask = (row_in_tile % Int32(8)) * Int32(copy_bytes)
@@ -690,9 +691,9 @@ class SmemGatherResource(MemoryResource):
                 if in_bounds:
                     phys_row = self.route_map.load(idx=logical_row, vector_size=1)[0]
                     # GMEM source: byte offset from activation base
-                    gmem_col_bytes = (coord_k + k_box * Int32(box_k)) * Int32(
-                        dtype_bytes
-                    ) + col_chunk * Int32(copy_bytes)
+                    gmem_col_bytes = (
+                        (coord_k + k_box * Int32(box_k)) * Int32(dtype_bits)
+                    ) // Int32(8) + col_chunk * Int32(copy_bytes)
                     gmem_byte_off = phys_row * self.act_stride_bytes + gmem_col_bytes
                     gmem_ptr = self.act_gmem_ptr + gmem_byte_off
                     prims.cp_async_shared_global(

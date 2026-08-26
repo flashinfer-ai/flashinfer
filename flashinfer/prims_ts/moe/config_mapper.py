@@ -906,15 +906,6 @@ def _json_config_kwargs(
         kwargs["use_deepseek_fp8"] = 1
         kwargs["num_load_sfab_warps"] = 1
         kwargs["load_sfab_regs"] = int(options.get("load_sfab_regs", load_sf_regs))
-    if (
-        fc == "fc1"
-        and kwargs["dtype_b"] == int(_DType.E2M1)
-        and kwargs["route_act"] != int(_RouteImpl.TMA)
-    ):
-        raise ValueError(
-            "Prims-TS NVFP4 FC1 requires routeAct=TMA for packed sub-byte "
-            f"activations in batched GEMM config {cfg.global_index}"
-        )
     if use_per_token_sf_a:
         kwargs["use_per_token_sf_a"] = 1
     if use_per_token_sf_b:

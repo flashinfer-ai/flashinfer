@@ -151,7 +151,7 @@ def test_config_mapper_keeps_mxfp4_bf16_tile256_disabled():
 
 
 def test_config_mapper_supports_nvfp4_per_token_sfb_e2m1_fc1():
-    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType, RouteImpl
 
     pair = map_trtllm_nvfp4_moe_tactic(
         [-1, -1],
@@ -166,6 +166,8 @@ def test_config_mapper_supports_nvfp4_per_token_sfb_e2m1_fc1():
     fc2 = pair.fc2.cfg.build()
     assert fc1.dtype_c_kind == int(DType.E2M1)
     assert fc1.has_epilogue_quant
+    assert fc1.route_act == int(RouteImpl.LDGSTS)
+    assert fc1.route_sfs_act == int(RouteImpl.LDGSTS)
     assert fc1.use_per_token_sf_b == 1
     assert fc1.per_token_sf_dtype == int(DType.FP32)
     assert fc2.use_per_token_sf_b == 0
