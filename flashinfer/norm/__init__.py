@@ -419,7 +419,8 @@ def fused_add_rmsnorm_fp8_block_quant(
     Parameters
     ----------
     out : torch.Tensor
-        fp8 output, shape ``(batch_size, hidden_size)``, dtype float8_e4m3fn / float8_e5m2.
+        fp8 output, shape ``(batch_size, hidden_size)``, dtype float8_e4m3fn (the activation
+        dtype the fp8 block-scaled GEMMs consume).
     block_scale : torch.Tensor
         fp32 block scales, shape ``(hidden_size // 128, round_up(batch_size, 4))``, contiguous.
         This is the column-major (MN-major, TMA-aligned) buffer deep_gemm expects: the logical

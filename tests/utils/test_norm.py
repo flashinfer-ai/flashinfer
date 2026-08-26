@@ -368,6 +368,52 @@ def test_fused_add_rmsnorm_fp8_block_quant_rejects_unsupported_hidden(hidden_siz
         )
 
 
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "out_dtype",
+        "out_shape",
+        "block_scale_dtype",
+        "block_scale_stride",
+        "normed_out_dtype",
+    ],
+)
+def test_fused_add_rmsnorm_fp8_block_quant_rejects_bad_outputs(bad):
+    # The kernel reinterprets the output buffers with fixed types (e4m3 out, fp32 block_scale,
+    # input-dtype normed_out) and indexes block_scale unit-stride along m, so each of these would
+    # silently corrupt memory without a host-side check.
+    batch_size, hidden_size = 64, 1024
+    dtype = torch.bfloat16
+    x = torch.randn(batch_size, hidden_size, dtype=dtype, device="cuda")
+    residual = torch.randn_like(x)
+    weight = torch.randn(hidden_size, dtype=dtype, device="cuda")
+    m_pad = (batch_size + 3) & ~3
+    out = torch.empty(batch_size, hidden_size, dtype=torch.float8_e4m3fn, device="cuda")
+    block_scale = torch.empty(
+        hidden_size // 128, m_pad, dtype=torch.float32, device="cuda"
+    )
+    normed_out = torch.empty_like(x)
+
+    if bad == "out_dtype":
+        out = out.to(torch.float8_e5m2)
+    elif bad == "out_shape":
+        out = out[:, : hidden_size // 2]
+    elif bad == "block_scale_dtype":
+        block_scale = block_scale.to(torch.float16)
+    elif bad == "block_scale_stride":
+        # transposed (m-major) view: last dim is no longer unit-stride
+        block_scale = torch.empty(
+            m_pad, hidden_size // 128, dtype=torch.float32, device="cuda"
+        ).t()
+    elif bad == "normed_out_dtype":
+        normed_out = normed_out.to(torch.float32)
+
+    with pytest.raises(RuntimeError):
+        flashinfer.norm.fused_add_rmsnorm_fp8_block_quant(
+            out, block_scale, normed_out, x, residual, weight, 1e-6, enable_pdl=False
+        )
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 3584, 4096, 8192, 16384])
 @pytest.mark.parametrize("dtype", [torch.float16])

@@ -197,6 +197,8 @@ void fused_add_rmsnorm_fp8_block_quant(TensorView output, TensorView block_scale
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(normed_out);
+  // The kernel indexes block_scale as [(d/128) * stride(0) + m], i.e. unit-stride along m.
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(block_scale);
   CHECK_DEVICE(input, residual);
   CHECK_DEVICE(input, weight);
   CHECK_DEVICE(input, output);
@@ -208,12 +210,21 @@ void fused_add_rmsnorm_fp8_block_quant(TensorView output, TensorView block_scale
   CHECK_DIM(2, output);    // fp8 (batch_size, hidden_size)
   CHECK_DIM(2, normed_out);
   CHECK_DIM(2, block_scale);  // (hidden_size/128, round_up(batch_size, 4))
+  // residual/weight/normed_out share the kernel's compute type with input; output is e4m3 and
+  // block_scale is fp32 (the dtypes the fp8 block-scaled GEMMs consume).
+  CHECK_SAME_DTYPE(residual, input);
+  CHECK_SAME_DTYPE(weight, input);
+  CHECK_SAME_DTYPE(normed_out, input);
+  CHECK_INPUT_TYPE(output, dl_float8_e4m3fn);
+  CHECK_INPUT_TYPE(block_scale, dl_float32);
   unsigned int batch_size = input.size(0);
   unsigned int hidden_size = input.size(1);
   unsigned int m_pad = (batch_size + 3) & ~3u;
   TVM_FFI_ICHECK_EQ(residual.size(0), batch_size);
   TVM_FFI_ICHECK_EQ(residual.size(1), hidden_size);
   TVM_FFI_ICHECK_EQ(weight.size(0), hidden_size);
+  TVM_FFI_ICHECK_EQ(output.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(output.size(1), hidden_size);
   TVM_FFI_ICHECK_EQ(normed_out.size(0), batch_size);
   TVM_FFI_ICHECK_EQ(normed_out.size(1), hidden_size);
   TVM_FFI_ICHECK_EQ(block_scale.size(0), hidden_size / 128);
