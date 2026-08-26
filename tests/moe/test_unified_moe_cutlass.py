@@ -1807,23 +1807,91 @@ def _independent_quant_scales(backend_key, view, act):
     if backend_key == "cutlass_w4a8":
         return [
             v["fc1_expert_scales"],
-            v["fc1_act_scale"],
-            v["fc1_zero"],
-            v["fc1_alpha"],
             v["fc2_expert_scales"],
+            v["fc1_act_scale"],
             v["fc2_act_scale"],
+            v["fc1_zero"],
             v["fc2_zero"],
+            v["fc1_alpha"],
             v["fc2_alpha"],
         ]
     if backend_key == "cutlass_humming":
+        # The gemm2 activation scale sits between the two gemm groups here,
+        # not after them -- see the Humming quant_scales list in the
+        # cutlass_fused_moe docstring.
         return [
             v["fc1_expert_scales"].view(torch.int32),
             v["fc1_residual_scale"],
+            v["fc2_act_global"],
             v["fc2_expert_scales"].view(torch.int32),
             v["fc2_residual_scale"],
-            v["fc2_act_global"],
         ]
     raise AssertionError(f"no independent flat contract for {backend_key}")
+
+
+# Expected quant_scales ordering per backend, by view key. Pinned here because
+# four CUTLASS backends are SM90-only and skip on SM100, so a wrong order in
+# _independent_quant_scales would reach H100 CI unchecked -- which is how the
+# W4A8 and Humming orderings were originally wrong. This locks the contract in
+# one reviewable place; the orderings themselves are ground-truthed by the
+# cutlass_fused_moe docstring and by running the suite on a supported arch.
+_EXPECTED_SCALE_ORDER = {
+    "cutlass_bf16": (),
+    "cutlass_w4a16": ("fc1_expert_scales", "fc2_expert_scales"),
+    "cutlass_fp8_block": ("fc1_block_scale", "fc2_block_scale"),
+    "cutlass_nvfp4": (
+        "fc1_act_global_scale",
+        "fc1_weight_block_scale",
+        "fc1_dequant_scale",
+        "fc2_act_global_scale",
+        "fc2_weight_block_scale",
+        "fc2_dequant_scale",
+    ),
+    "cutlass_mxfp8_mxfp4": (
+        "fc1_expert_scales",
+        "fc1_input_scale",
+        "fc2_expert_scales",
+        "fc2_input_scale",
+    ),
+    "cutlass_mxfp8": (
+        "fc1_expert_scales",
+        "fc1_input_scale",
+        "fc2_expert_scales",
+        "fc2_input_scale",
+    ),
+    "cutlass_w4a8": (
+        "fc1_expert_scales",
+        "fc2_expert_scales",
+        "fc1_act_scale",
+        "fc2_act_scale",
+        "fc1_zero",
+        "fc2_zero",
+        "fc1_alpha",
+        "fc2_alpha",
+    ),
+    "cutlass_humming": (
+        "fc1_expert_scales",
+        "fc1_residual_scale",
+        "fc2_act_global",
+        "fc2_expert_scales",
+        "fc2_residual_scale",
+    ),
+}
+
+
+@pytest.mark.parametrize("backend_key", sorted(_EXPECTED_SCALE_ORDER))
+def test_independent_scale_order_matches_flat_abi(backend_key):
+    """CPU-only, so the SM90 backends are covered on any arch.
+
+    cutlass_fp8_per_tensor is absent: it folds the activation scale into the
+    gemm1 dequant and inserts a literal, so there is no key-to-slot mapping to
+    pin. Sentinels are int32 so the .view(torch.int32) calls stay no-ops.
+    """
+    expected = _EXPECTED_SCALE_ORDER[backend_key]
+    keys = sorted(set(expected))
+    view = {key: torch.tensor(i + 1, dtype=torch.int32) for i, key in enumerate(keys)}
+    actual = _independent_quant_scales(backend_key, view, None)
+    assert [t.item() for t in actual] == [view[key].item() for key in expected]
 
 
 def _run_flat_cutlass_independently(
