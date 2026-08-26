@@ -35,6 +35,7 @@ def test_flash_kda_training_jit_spec(target, arch_flag):
         "flashkda_training_aux.cu",
         "flashkda_training_final_state.cu",
         f"training_fallback_pointer_{target.replace('sm', 'sm_', 1)}.cu",
+        f"training_grouped_row_wg8_pointer_{target.replace('sm', 'sm_', 1)}.cu",
     ]
     assert all(source.is_file() for source in spec.sources)
     common = flash_kda_training._get_csrc_dir() / "flashkda_binding_common.cuh"
@@ -52,6 +53,7 @@ def test_flash_kda_training_jit_spec(target, arch_flag):
         auxiliary,
         final_state,
         fallback,
+        grouped_row,
     ) = (source.read_text() for source in spec.sources)
     assert '#include "flashkda_training_forward_v483.cu"' not in legacy_binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_forward" in legacy_binding
@@ -67,7 +69,13 @@ def test_flash_kda_training_jit_spec(target, arch_flag):
     assert "kernel_flashkda_blackwell_prefill_fp32_state_initial" in final_state
     assert "kernel_flashkda_backward_state_checkpoint_fallback_c32" in fallback
     assert "kernel_flashkda_bf16_fused_m128_unsplit" in fallback
+    assert "kernel_flashkda_backward_reverse_wg8" in grouped_row
+    assert "kernel_flashkda_backward_checkpoint_wg4" in grouped_row
     assert "kernel_flashkda_bf16_fused_m128_unsplit" in fallback_binding
+    assert "run_training_grouped_row_forward" in fallback_binding
+    assert "run_training_grouped_row_backward" in fallback_binding
+    assert "materialize_public_forward" in fallback_binding
+    assert "kGroupedRowReverseSmemBytes = 12416" in fallback_binding
     assert "use_split_work_items" in fallback_binding
     assert "seq_order" in fallback_binding
     assert "#define SPLIT_WORK_ITEMS 0" in fallback
@@ -116,12 +124,18 @@ def test_paired_backward_binding_has_no_forward_recompute_symbols():
         flash_kda_training._get_csrc_dir() / "flashkda_training_fallback_binding.cu"
     ).read_text()
     row_backward = fallback_binding.split("void RunTrainingRowBackward(", 1)[1]
-    row_backward = row_backward.split("void RunTrainingC32Forward(", 1)[0]
+    row_backward = row_backward.split("void RunTrainingGroupedRowForward(", 1)[0]
+    grouped_row_backward = fallback_binding.split(
+        "void RunTrainingGroupedRowBackward(", 1
+    )[1]
+    grouped_row_backward = grouped_row_backward.split("void RunTrainingC32Forward(", 1)[
+        0
+    ]
     c32_backward = fallback_binding.split("void RunTrainingC32Backward(", 1)[1]
     c32_backward = c32_backward.split("}  // namespace flash_kda_training_fallback", 1)[
         0
     ]
-    for fallback_backward in (row_backward, c32_backward):
+    for fallback_backward in (row_backward, grouped_row_backward, c32_backward):
         assert "LaunchAccurateForward" not in fallback_backward
         assert "run_training_forward" not in fallback_backward
 

@@ -31,7 +31,7 @@ FlashKDATrainingTarget = Literal["sm100a", "sm103a"]
 
 # First ten hex digits of SHA256 over the target's complete source list and the
 # shared binding header, separated by NUL bytes without a trailing separator.
-_FLASH_KDA_TRAINING_MODULE_IDENT = "668d5e5f0d"
+_FLASH_KDA_TRAINING_MODULE_IDENT = "e5e3219941"
 _TARGET_FLAGS: dict[FlashKDATrainingTarget, list[str]] = {
     "sm100a": sm100a_nvcc_flags,
     "sm103a": sm103a_nvcc_flags,
@@ -75,6 +75,10 @@ def gen_flash_kda_training_module(target: FlashKDATrainingTarget) -> JitSpec:
     fallback = (
         csrc_dir / f"training_fallback_pointer_{target.replace('sm', 'sm_', 1)}.cu"
     )
+    grouped_row = (
+        csrc_dir
+        / f"training_grouped_row_wg8_pointer_{target.replace('sm', 'sm_', 1)}.cu"
+    )
     common = csrc_dir / "flashkda_binding_common.cuh"
     sources = [
         legacy_binding,
@@ -84,6 +88,7 @@ def gen_flash_kda_training_module(target: FlashKDATrainingTarget) -> JitSpec:
         auxiliary,
         final_state,
         fallback,
+        grouped_row,
     ]
     for source in (*sources, common):
         if not source.exists():

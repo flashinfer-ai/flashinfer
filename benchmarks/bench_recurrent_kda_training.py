@@ -9,10 +9,10 @@
 """Cold-L2 CUPTI benchmark for the paired recurrent-KDA training API.
 
 The forward timing includes the exact checkpoint-producing route plus the
-full-FP32-state recurrence that produces the public final state. Its token
-output is private on C16 and public on C32; row-split directly produces both
-public outputs. The backward timing consumes the already-saved context and
-therefore excludes forward recomputation.
+full-FP32-state recurrence that produces the public final state. A strict
+grouped low-head route materializes both C16 and C32 contexts in that one
+forward call. The backward timing consumes the saved context and therefore
+excludes forward recomputation.
 """
 
 import argparse
@@ -43,10 +43,14 @@ class _Shape:
     num_qk_heads: int
     num_v_heads: int
     seed: int
+    layout: str = "packed"
 
+
+_EXACT_PACKED_SHAPES = {
+    "packed_1024x8_h96": _Shape((1024,) * 8, 96, 96, 819208),
+}
 
 _PRIMARY_SHAPES = {
-    "packed_1024x8_h96": _Shape((1024,) * 8, 96, 96, 819208),
     "portfolio_01_hq4_hv8_t32768": _Shape((3200,) * 9 + (3968,), 4, 8, 24001),
     "portfolio_02_hq2_hv8_t18432": _Shape((2000,) * 8 + (2432,), 2, 8, 24002),
     "portfolio_03_hq4_hv4_t32768": _Shape((2656,) * 11 + (3552,), 4, 4, 24003),
@@ -63,15 +67,21 @@ _PRIMARY_SHAPES = {
     "portfolio_14_hq2_hv4_t32768": _Shape((3200,) * 9 + (3968,), 2, 4, 24014),
     "portfolio_15_hq4_hv8_t32768": _Shape((2656,) * 11 + (3552,), 4, 8, 24015),
     "portfolio_16_hq2_hv8_t18432": _Shape((1648,) * 10 + (1952,), 2, 8, 24016),
+    "fixed_b8_t1024_h96": _Shape((1024,) * 8, 96, 96, 36072, "fixed"),
+    "fixed_b8_t2048_h96": _Shape((2048,) * 8, 96, 96, 37096, "fixed"),
+    "fixed_b8_t4096_h96": _Shape((4096,) * 8, 96, 96, 39144, "fixed"),
+    "fixed_b8_t8192_h96": _Shape((8192,) * 8, 96, 96, 43240, "fixed"),
+    "fixed_b8_t16384_h96": _Shape((16384,) * 8, 96, 96, 51432, "fixed"),
 }
 
 _FALLBACK_SHAPES = {
-    "fallback_grouped_c32_mixed": _Shape((17, 33, 65), 4, 8, 24005),
+    "fallback_grouped_row_mixed": _Shape((17, 33, 65), 4, 8, 24005),
+    "fallback_grouped_c32_deep_tail": _Shape((4097,), 1, 8, 24105),
     "fallback_row_split_mixed": _Shape((17, 33), 1, 1, 24018),
-    "fallback_high_head_c32_mixed": _Shape((17, 33), 16, 16, 24017),
+    "fallback_high_head_row_mixed": _Shape((17, 33), 16, 16, 24017),
 }
 
-_SHAPES = _PRIMARY_SHAPES | _FALLBACK_SHAPES
+_SHAPES = _EXACT_PACKED_SHAPES | _PRIMARY_SHAPES | _FALLBACK_SHAPES
 _PRIMARY_SHAPE_NAMES = tuple(_PRIMARY_SHAPES)
 
 _FLA_BASELINE_COMMIT = "97bcb883dafd3fa5b859917184e4abfb1c4e8a71"
@@ -96,11 +106,27 @@ def _require_timing_dependencies() -> tuple[str, str]:
     return cupti_version, pyelftools_version
 
 
-def _make_inputs(shape: _Shape, seed: int) -> dict[str, torch.Tensor]:
+def _make_inputs(shape: _Shape, seed: int) -> dict[str, torch.Tensor | None]:
     generator = torch.Generator(device="cuda").manual_seed(seed)
-    total_tokens = sum(shape.seq_lens)
-    qk_shape = (1, total_tokens, shape.num_qk_heads, 128)
-    value_shape = (1, total_tokens, shape.num_v_heads, 128)
+    if shape.layout == "fixed":
+        if len(set(shape.seq_lens)) != 1:
+            raise ValueError("fixed layout requires uniform sequence lengths")
+        batch_size = len(shape.seq_lens)
+        sequence_length = shape.seq_lens[0]
+        qk_shape = (batch_size, sequence_length, shape.num_qk_heads, 128)
+        value_shape = (batch_size, sequence_length, shape.num_v_heads, 128)
+        cu_seqlens = None
+    elif shape.layout == "packed":
+        total_tokens = sum(shape.seq_lens)
+        qk_shape = (1, total_tokens, shape.num_qk_heads, 128)
+        value_shape = (1, total_tokens, shape.num_v_heads, 128)
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(shape.seq_lens).cumsum(0).tolist()],
+            dtype=torch.int64,
+            device="cuda",
+        )
+    else:
+        raise ValueError(f"unsupported layout: {shape.layout}")
     state_shape = (len(shape.seq_lens), shape.num_v_heads, 128, 128)
 
     def bf16(shape, multiplier=1.0):
@@ -123,11 +149,7 @@ def _make_inputs(shape: _Shape, seed: int) -> dict[str, torch.Tensor]:
         * 0.1,
         "initial_state": torch.randn(state_shape, generator=generator, device="cuda")
         * 0.02,
-        "cu_seqlens": torch.tensor(
-            [0, *torch.tensor(shape.seq_lens).cumsum(0).tolist()],
-            dtype=torch.int64,
-            device="cuda",
-        ),
+        "cu_seqlens": cu_seqlens,
         "do": bf16(value_shape, 0.1),
         "dfinal_state": torch.randn(state_shape, generator=generator, device="cuda")
         * 0.1,
@@ -184,7 +206,9 @@ def _prepare_fla_full_dag(inputs):
     leaves["dt_bias"] = (
         inputs["dt_bias"].detach().reshape(-1).clone().requires_grad_(True)
     )
-    cu_seqlens_cpu = inputs["cu_seqlens"].detach().cpu()
+    cu_seqlens_cpu = (
+        None if inputs["cu_seqlens"] is None else inputs["cu_seqlens"].detach().cpu()
+    )
 
     def run_fla_full_dag():
         output, final_state = chunk_kda(
@@ -304,8 +328,16 @@ def _benchmark_shape(
     full_dag_ms, full_dag_samples = _median_ms(run_full_dag, warmup_ms, bench_ms)
     result = {
         "shape": name,
-        "suite": "primary" if name in _PRIMARY_SHAPES else "fallback",
+        "suite": (
+            "primary"
+            if name in _PRIMARY_SHAPES
+            else "exact_packed"
+            if name in _EXACT_PACKED_SHAPES
+            else "fallback"
+        ),
         "seed": seed,
+        "layout": shape.layout,
+        "physical_batch_size": int(inputs["q"].shape[0]),
         "seq_lens": list(shape.seq_lens),
         "total_tokens": sum(shape.seq_lens),
         "num_sequences": len(shape.seq_lens),
@@ -373,7 +405,7 @@ def main() -> None:
     parser.add_argument(
         "--all-shapes",
         action="store_true",
-        help="benchmark the required H96 row and all 16 production portfolio rows",
+        help="benchmark the 16 portfolio rows and five fixed B8/H96 rows",
     )
     parser.add_argument("--json", type=Path)
     parser.add_argument(

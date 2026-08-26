@@ -38,17 +38,29 @@ Packed layout accepts a physical batch dimension of one plus CUDA int64
 ``cu_seqlens``. Packed sequence lengths may be mixed, and neither layout
 requires a 16-token-aligned length.
 
-The dispatcher selects grouped or equal-head C16 for shapes that satisfy its
-fast-route predicates. Other grouped or high-head shapes use the C32 fallback;
-other low-head equal-head shapes use the row-split fallback. These predicates
-select an implementation and are not public shape guards. The paired backward
-consumes the exact context saved by the selected route, including C32 tails and
-mixed sequence lengths, without rerunning a forward kernel.
+The dispatcher filters three physical templates by their legal domains, then
+selects the lowest analytical cost. Its model includes fixed DAG fill and drain,
+per-chunk compute and memory service, resident CTA capacity, persistent-grid
+tail utilization, recurrence handoffs, and grouped-QK adapter traffic. C16 is
+legal only when every sequence length is 16-token aligned. C32 and the row-warp
+template cover positive tails and mixed lengths. Runtime batch, length, and head
+counts are model inputs rather than API guards.
+
+For low-head shapes where the model selects C16, the strict public route avoids
+publishing its sparse gate-parameter residuals. Equal-head shapes save a C32
+context. Grouped shapes save both the C16 and grouped-C32 contexts during the
+single public forward call; backward takes the six token/state gradients from
+C16 and the two gate-parameter gradients from C32. This is still a paired API:
+all recurrence and checkpoint work happens before forward returns, and backward
+only consumes saved context. Other selected templates save one route context.
+Grouped row-warp execution expands Q/K to the value-head work domain and folds
+dQ/dK back to their native heads.
 
 The exact packed training shape with eight 1024-token sequences and 96 equal
 heads is validated against FLA for output, final state, and all eight gradients
-at ``atol=rtol=1e-2``. Regression coverage also exercises grouped C32 mixed
-tails and fixed B2/B4/B8 layouts through the same public paired API.
+at ``atol=rtol=1e-2``. Regression coverage also exercises grouped C16/C32/row
+selection, mixed tails, analytical crossovers, and fixed B2/B4/B8 layouts
+through the same public paired API.
 
 .. currentmodule:: flashinfer.kda_training
 

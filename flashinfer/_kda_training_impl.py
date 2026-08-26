@@ -10,6 +10,7 @@ from typing import Literal, Optional, Sequence, cast
 import torch
 
 from .api_logging import flashinfer_api
+from ._kda_training_dispatch import _TrainingRouteSpec, _select_training_route
 from .kda_backward import KDA_BACKWARD_GRADIENT_NAMES
 from .utils import get_compute_capability
 
@@ -24,8 +25,6 @@ _FINAL_TMAP_BYTES_PER_SLOT = 128
 _FINAL_SHORT_GRID_CTAS = 128
 _FINAL_LONG_GRID_CTAS = 148
 _TrainingTarget = Literal["sm100a", "sm103a"]
-_RouteTag = Literal["grouped_c16", "grouped_c32", "c16", "c32", "row_split"]
-_RouteFamily = Literal["c16", "c32", "row_split"]
 
 
 def _tensor_signature(tensor: torch.Tensor) -> tuple:
@@ -100,67 +99,6 @@ def _validate_scale_and_bound(
             f"recurrent KDA training fixes lower_bound=-5.0, got {lower_bound_value}"
         )
     return scale_value, lower_bound_value
-
-
-@dataclass(frozen=True)
-class _TrainingRouteSpec:
-    tag: _RouteTag
-
-    @property
-    def family(self) -> _RouteFamily:
-        if self.tag.endswith("c16"):
-            return "c16"
-        if self.tag.endswith("c32"):
-            return "c32"
-        return "row_split"
-
-    @property
-    def grouped(self) -> bool:
-        return self.tag.startswith("grouped_")
-
-
-def _select_training_route(
-    seq_lens: tuple[int, ...], num_qk_heads: int, num_v_heads: int
-) -> _TrainingRouteSpec:
-    """Mirror the source dispatcher without promoting fast-route predicates to guards."""
-
-    long_underfilled_c16 = (
-        num_v_heads <= 8
-        and max(seq_lens) >= 1024
-        and all(length > 0 and length % _C16_CHUNK == 0 for length in seq_lens)
-    )
-    grouped = num_qk_heads != num_v_heads
-    if grouped:
-        return _TrainingRouteSpec(
-            "grouped_c16" if long_underfilled_c16 else "grouped_c32"
-        )
-    if long_underfilled_c16:
-        return _TrainingRouteSpec("c16")
-    uniform_c16 = (
-        num_v_heads >= 16
-        and len(set(seq_lens)) == 1
-        and seq_lens[0] > 0
-        and seq_lens[0] % _C16_CHUNK == 0
-    )
-    if uniform_c16:
-        chunks_per_item = seq_lens[0] // _C16_CHUNK
-        work_items = len(seq_lens) * num_v_heads
-        use_c16 = (
-            num_v_heads <= 64
-            and (
-                (chunks_per_item <= 32 and work_items >= 128)
-                or (chunks_per_item <= 64 and work_items >= 192)
-            )
-        ) or (
-            num_v_heads > 64
-            and (
-                (chunks_per_item <= 64 and work_items >= 384)
-                or (chunks_per_item <= 96 and work_items >= 768)
-            )
-        )
-        if use_c16:
-            return _TrainingRouteSpec("c16")
-    return _TrainingRouteSpec("c32" if num_v_heads >= 16 else "row_split")
 
 
 @dataclass(frozen=True)
@@ -278,7 +216,14 @@ def _validate_forward_inputs(
         num_v_heads=num_v_heads,
         seq_lens=seq_lens,
         offsets=offsets,
-        route=_select_training_route(seq_lens, num_qk_heads, num_v_heads),
+        route=_select_training_route(
+            seq_lens,
+            num_qk_heads,
+            num_v_heads,
+            resident_sms=int(
+                torch.cuda.get_device_properties(device).multi_processor_count
+            ),
+        ),
     )
 
 
@@ -342,7 +287,7 @@ def _build_c16_metadata(
     for length, count in zip(shape.seq_lens, chunk_counts, strict=True):
         token_starts.append(token_starts[-1] + length)
         checkpoint_starts.append(checkpoint_starts[-1] + count)
-    split = shape.num_v_heads <= 8 and max(shape.seq_lens) >= 1024
+    split = shape.route.split_work_items
     rows: list[tuple[int, int, int, int, int, int, int, int, int]] = []
     n_tiles = shape.num_sequences * shape.num_v_heads
     ideal_tokens = (
@@ -566,6 +511,12 @@ class RecurrentKDATrainingContext:
     _dummy_i32: torch.Tensor = field(repr=False)
     _final_grid_ctas: int = field(repr=False)
     _stream_ptr: int = field(repr=False)
+    _parameter_context: Optional[RecurrentKDATrainingContext] = field(
+        default=None, repr=False
+    )
+    _parameter_final_state_scratch: Optional[torch.Tensor] = field(
+        default=None, repr=False
+    )
     _input_tensors: tuple[torch.Tensor, ...] = field(default=(), repr=False)
     _input_signatures: tuple[tuple, ...] = field(default=(), repr=False)
     _saved_context_signatures: tuple[tuple, ...] = field(default=(), repr=False)
@@ -581,13 +532,16 @@ def _saved_context_tensors(
     metadata_tensors = tuple(
         value for value in context._metadata.values() if isinstance(value, torch.Tensor)
     )
-    return (
+    saved = (
         context.state_checkpoints,
         context.beta_active,
         context._cu_seqlens,
         *context._route_tensors.values(),
         *metadata_tensors,
     )
+    if context._parameter_context is not None:
+        saved += _saved_context_tensors(context._parameter_context)
+    return saved
 
 
 def _new_context(
@@ -631,7 +585,7 @@ def _new_context(
         metadata = {"total_chunks": shape.total_tokens}
         state_checkpoints = torch.empty(
             (shape.total_tokens, shape.num_v_heads, _HEAD_DIM, _HEAD_DIM),
-            dtype=torch.float32,
+            dtype=torch.bfloat16 if shape.route.grouped else torch.float32,
             device=device,
         )
         beta_active = torch.empty(
@@ -639,10 +593,31 @@ def _new_context(
         )
         vector_shape = (shape.total_tokens, shape.num_v_heads, _HEAD_DIM)
         route_tensors.update(
-            q_norm=torch.empty(vector_shape, dtype=torch.float32, device=device),
-            k_norm=torch.empty(vector_shape, dtype=torch.float32, device=device),
-            decay=torch.empty(vector_shape, dtype=torch.float32, device=device),
+            q_norm=torch.empty(
+                vector_shape,
+                dtype=torch.bfloat16 if shape.route.grouped else torch.float32,
+                device=device,
+            ),
+            k_norm=torch.empty(
+                vector_shape,
+                dtype=torch.bfloat16 if shape.route.grouped else torch.float32,
+                device=device,
+            ),
+            decay=torch.empty(
+                vector_shape,
+                dtype=torch.bfloat16 if shape.route.grouped else torch.float32,
+                device=device,
+            ),
         )
+        if shape.route.grouped:
+            route_tensors["q_value_heads"] = torch.empty(
+                (1, shape.total_tokens, shape.num_v_heads, _HEAD_DIM),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            route_tensors["k_value_heads"] = torch.empty_like(
+                route_tensors["q_value_heads"]
+            )
     else:
         metadata = _build_c32_metadata(shape, device)
         total_chunks = cast(int, metadata["total_chunks"])
@@ -717,7 +692,7 @@ def _new_context(
         )
         route_tensors["tape_e"] = route_tensors["tape_x"]
     final_grid = _final_grid_ctas(shape)
-    return RecurrentKDATrainingContext(
+    context = RecurrentKDATrainingContext(
         state_checkpoints=state_checkpoints,
         beta_active=beta_active,
         _route=shape.route,
@@ -745,6 +720,36 @@ def _new_context(
         _final_grid_ctas=final_grid,
         _stream_ptr=stream_ptr,
     )
+    if shape.route.uses_parameter_context:
+        parameter_shape = _TrainingShape(
+            layout=shape.layout,
+            public_batch=shape.public_batch,
+            public_tokens=shape.public_tokens,
+            total_tokens=shape.total_tokens,
+            num_sequences=shape.num_sequences,
+            num_qk_heads=shape.num_qk_heads,
+            num_v_heads=shape.num_v_heads,
+            seq_lens=shape.seq_lens,
+            offsets=shape.offsets,
+            route=_TrainingRouteSpec(
+                "grouped_c32", "tensor_tape_c32", split_work_items=False
+            ),
+        )
+        context._parameter_context = _new_context(
+            parameter_shape,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            initial_state,
+            cu_seqlens,
+            stream_ptr,
+        )
+        context._parameter_final_state_scratch = torch.empty_like(initial_state)
+    return context
 
 
 def _validate_context_storage(
@@ -775,6 +780,19 @@ def _validate_context_storage(
             raise ValueError("C32 descriptor storage must be 64-byte aligned")
     if context._final_descriptor_storage.data_ptr() % 64:
         raise ValueError("final descriptor storage must be 64-byte aligned")
+    if context._parameter_context is not None:
+        if context._parameter_final_state_scratch is None:
+            raise ValueError(
+                "hybrid route is missing its parameter final-state scratch"
+            )
+        _validate_tensor(
+            context._parameter_final_state_scratch,
+            "context._parameter_final_state_scratch",
+            shape=tuple(context._initial_state.shape),
+            dtype=torch.float32,
+            device=device,
+        )
+        _validate_context_storage(context._parameter_context, device)
 
 
 def _descriptor_signature(*tensors: torch.Tensor) -> tuple:
@@ -787,6 +805,8 @@ def _run_forward_route(
     final_state: torch.Tensor,
     scale: float,
     lower_bound: float,
+    *,
+    materialize_public_forward: bool = True,
 ) -> None:
     shape = context._shape
     qf, kf, vf, gf, betaf = _canonical_views(
@@ -798,7 +818,10 @@ def _run_forward_route(
     final_signature = _descriptor_signature(
         qf, kf, vf, gf, final_target, context._final_descriptor_storage
     )
-    prepare_final = int(final_signature != context._final_descriptor_signature)
+    prepare_final = int(
+        materialize_public_forward
+        and final_signature != context._final_descriptor_signature
+    )
     if route == "c16":
         m = context._metadata
         t = context._route_tensors
@@ -843,36 +866,71 @@ def _run_forward_route(
         )
     elif route == "row_split":
         t = context._route_tensors
-        module.run_training_row_forward(
-            qf,
-            kf,
-            vf,
-            gf,
-            betaf,
-            context._A_log,
-            context._dt_bias,
-            context._initial_state,
-            context._cu_seqlens,
-            output_flat,
-            final_state,
-            t["q_norm"],
-            t["k_norm"],
-            t["decay"],
-            context.beta_active,
-            context.state_checkpoints,
-            context._final_descriptor_storage,
-            context._final_tensormap_workspace,
-            context._dummy_f32,
-            context._dummy_i32,
-            shape.total_tokens,
-            shape.num_sequences,
-            shape.num_v_heads,
-            context._final_grid_ctas,
-            prepare_final,
-            scale,
-            lower_bound,
-            context._stream_ptr,
-        )
+        if context._route.grouped:
+            module.run_training_grouped_row_forward(
+                qf,
+                kf,
+                t["q_value_heads"],
+                t["k_value_heads"],
+                vf,
+                gf,
+                betaf,
+                context._A_log,
+                context._dt_bias,
+                context._initial_state,
+                context._cu_seqlens,
+                output_flat,
+                final_state,
+                t["q_norm"],
+                t["k_norm"],
+                t["decay"],
+                context.beta_active,
+                context.state_checkpoints,
+                context._final_descriptor_storage,
+                context._final_tensormap_workspace,
+                context._dummy_f32,
+                context._dummy_i32,
+                shape.total_tokens,
+                shape.num_sequences,
+                shape.num_qk_heads,
+                shape.num_v_heads,
+                context._final_grid_ctas,
+                prepare_final,
+                scale,
+                lower_bound,
+                context._stream_ptr,
+            )
+        else:
+            module.run_training_row_forward(
+                qf,
+                kf,
+                vf,
+                gf,
+                betaf,
+                context._A_log,
+                context._dt_bias,
+                context._initial_state,
+                context._cu_seqlens,
+                output_flat,
+                final_state,
+                t["q_norm"],
+                t["k_norm"],
+                t["decay"],
+                context.beta_active,
+                context.state_checkpoints,
+                context._final_descriptor_storage,
+                context._final_tensormap_workspace,
+                context._dummy_f32,
+                context._dummy_i32,
+                shape.total_tokens,
+                shape.num_sequences,
+                shape.num_v_heads,
+                context._final_grid_ctas,
+                prepare_final,
+                scale,
+                lower_bound,
+                context._stream_ptr,
+            )
     else:
         t = context._route_tensors
         m = context._metadata
@@ -935,13 +993,118 @@ def _run_forward_route(
             int(context._route.grouped),
             prepare_route,
             prepare_final,
+            int(materialize_public_forward),
             context._final_grid_ctas,
             scale,
             lower_bound,
             context._stream_ptr,
         )
         context._route_descriptor_signature = route_signature
-    context._final_descriptor_signature = final_signature
+    if materialize_public_forward:
+        context._final_descriptor_signature = final_signature
+
+
+def _bind_context_inputs(
+    context: RecurrentKDATrainingContext,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+) -> None:
+    context._q, context._k, context._v, context._g = q, k, v, g
+    context._beta, context._A_log, context._dt_bias = beta, A_log, dt_bias
+    context._initial_state = initial_state
+    context._cu_seqlens = cu_seqlens
+    if context._parameter_context is not None:
+        _bind_context_inputs(
+            context._parameter_context,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            initial_state,
+            cu_seqlens,
+        )
+
+
+def _forward_context_writes(
+    context: RecurrentKDATrainingContext, prefix: str = "context"
+) -> list[tuple[str, torch.Tensor]]:
+    writes = [
+        (f"{prefix}.state_checkpoints", context.state_checkpoints),
+        (f"{prefix}.beta_active", context.beta_active),
+        (f"{prefix}._final_output_scratch", context._final_output_scratch),
+        (f"{prefix}._final_descriptor_storage", context._final_descriptor_storage),
+        (f"{prefix}._final_tensormap_workspace", context._final_tensormap_workspace),
+    ]
+    if context._route.family == "c16":
+        writes.extend(
+            (
+                (
+                    f"{prefix}._work_items",
+                    cast(torch.Tensor, context._metadata["work_items"]),
+                ),
+                (f"{prefix}._counters", context._route_tensors["counters"]),
+            )
+        )
+    elif context._route.family == "row_split":
+        writes.extend(
+            (f"{prefix}.{name}", context._route_tensors[name])
+            for name in ("q_norm", "k_norm", "decay")
+        )
+        if context._route.grouped:
+            writes.extend(
+                (f"{prefix}.{name}", context._route_tensors[name])
+                for name in ("q_value_heads", "k_value_heads")
+            )
+    else:
+        names = [
+            "state_checkpoint_needed",
+            "tape_qd",
+            "tape_kd",
+            "tape_kr",
+            "tape_j",
+            "tape_restore_factor",
+            "tape_x",
+            "tape_r",
+            "norm_inv",
+            "decay",
+            "zero_workspace",
+            "descriptor_storage",
+        ]
+        if context._route.grouped:
+            names.extend(("q_value_heads", "k_value_heads"))
+        beta_tma = context._route_tensors["beta_tma"]
+        if not _storage_ranges_overlap(beta_tma, context._beta):
+            names.append("beta_tma")
+        writes.extend(
+            (f"{prefix}.{name}", context._route_tensors[name]) for name in names
+        )
+    if context._parameter_context is not None:
+        if context._parameter_final_state_scratch is None:
+            raise ValueError(
+                "hybrid route is missing its parameter final-state scratch"
+            )
+        writes.append(
+            (
+                f"{prefix}._parameter_final_state_scratch",
+                context._parameter_final_state_scratch,
+            )
+        )
+        writes.extend(
+            _forward_context_writes(
+                context._parameter_context, f"{prefix}._parameter_context"
+            )
+        )
+    return writes
 
 
 def _recurrent_kda_training_forward_impl(
@@ -1050,52 +1213,19 @@ def _recurrent_kda_training_forward_impl(
         if cu_seqlens is not None:
             context._cu_seqlens = cu_seqlens
     _qf, _kf, vf, _gf, _betaf = _canonical_views(shape, q, k, v, g, beta)
-    context._q, context._k, context._v, context._g = q, k, v, g
-    context._beta, context._A_log, context._dt_bias = beta, A_log, dt_bias
-    context._initial_state = initial_state
-    internal_writes: list[tuple[str, torch.Tensor]] = [
-        ("context.state_checkpoints", context.state_checkpoints),
-        ("context.beta_active", context.beta_active),
-        ("context._final_output_scratch", context._final_output_scratch),
-        ("context._final_descriptor_storage", context._final_descriptor_storage),
-        ("context._final_tensormap_workspace", context._final_tensormap_workspace),
-    ]
-    if context._route.family == "c16":
-        internal_writes.extend(
-            (
-                ("context._work_items", context._metadata["work_items"]),
-                ("context._counters", context._route_tensors["counters"]),
-            )
-        )
-    elif context._route.family == "row_split":
-        internal_writes.extend(
-            (f"context.{name}", context._route_tensors[name])
-            for name in ("q_norm", "k_norm", "decay")
-        )
-    else:
-        c32_write_names = [
-            "state_checkpoint_needed",
-            "tape_qd",
-            "tape_kd",
-            "tape_kr",
-            "tape_j",
-            "tape_restore_factor",
-            "tape_x",
-            "tape_r",
-            "norm_inv",
-            "decay",
-            "zero_workspace",
-            "descriptor_storage",
-        ]
-        if context._route.grouped:
-            c32_write_names.extend(("q_value_heads", "k_value_heads"))
-        beta_tma = context._route_tensors["beta_tma"]
-        if not _storage_ranges_overlap(beta_tma, beta):
-            c32_write_names.append("beta_tma")
-        internal_writes.extend(
-            (f"context.{name}", context._route_tensors[name])
-            for name in c32_write_names
-        )
+    _bind_context_inputs(
+        context,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log,
+        dt_bias,
+        initial_state,
+        context._cu_seqlens,
+    )
+    internal_writes = _forward_context_writes(context)
     _check_writes_do_not_overlap(
         (("out", output), ("final_state_out", final_state), *internal_writes),
         tuple(zip(input_names, public_inputs, strict=True)),
@@ -1103,6 +1233,19 @@ def _recurrent_kda_training_forward_impl(
     _run_forward_route(
         context, output.view_as(vf), final_state, scale_value, lower_bound_value
     )
+    if context._parameter_context is not None:
+        if context._parameter_final_state_scratch is None:
+            raise ValueError(
+                "hybrid route is missing its parameter final-state scratch"
+            )
+        _run_forward_route(
+            context._parameter_context,
+            context._parameter_context._final_output_scratch,
+            context._parameter_final_state_scratch,
+            scale_value,
+            lower_bound_value,
+            materialize_public_forward=False,
+        )
     context._input_tensors = public_inputs
     context._input_signatures = tuple(
         _tensor_signature(tensor) for tensor in public_inputs
@@ -1324,41 +1467,90 @@ def _run_row_backward(
         (shape.total_tokens, shape.num_v_heads),
         torch.float32,
     )
-    _get_training_module(context._q.device).run_training_row_backward(
-        qf,
-        kf,
-        vf,
-        gf,
-        context._A_log,
-        context._dt_bias,
-        context._initial_state,
-        do_flat,
-        dfinal_state,
-        context._cu_seqlens,
-        t["q_norm"],
-        t["k_norm"],
-        t["decay"],
-        context.beta_active,
-        context.state_checkpoints,
-        dq_norm,
-        dk_norm,
-        dlog,
-        dbeta_active,
-        dq.view_as(qf),
-        dk.view_as(kf),
-        dv.view_as(vf),
-        dg.view_as(gf),
-        dbeta.view(1, shape.total_tokens, shape.num_v_heads),
-        dA,
-        ddt,
-        dinit,
-        shape.total_tokens,
-        shape.num_sequences,
-        shape.num_v_heads,
-        _SCALE,
-        _LOWER_BOUND,
-        context._stream_ptr,
-    )
+    module = _get_training_module(context._q.device)
+    if context._route.grouped:
+        dq_value = _backward_buffer(
+            context, "row_dq_value", tuple(vf.shape), torch.bfloat16
+        )
+        dk_value = _backward_buffer(
+            context, "row_dk_value", tuple(vf.shape), torch.bfloat16
+        )
+        module.run_training_grouped_row_backward(
+            qf,
+            kf,
+            t["q_value_heads"],
+            t["k_value_heads"],
+            vf,
+            gf,
+            context._A_log,
+            context._dt_bias,
+            context._initial_state,
+            do_flat,
+            dfinal_state,
+            context._cu_seqlens,
+            t["q_norm"],
+            t["k_norm"],
+            t["decay"],
+            context.beta_active,
+            context.state_checkpoints,
+            dq_norm,
+            dk_norm,
+            dlog,
+            dbeta_active,
+            dq_value,
+            dk_value,
+            dv.view_as(vf),
+            dg.view_as(gf),
+            dbeta.view(1, shape.total_tokens, shape.num_v_heads),
+            dA,
+            ddt,
+            dinit,
+            dq.view_as(qf),
+            dk.view_as(kf),
+            shape.total_tokens,
+            shape.num_sequences,
+            shape.num_qk_heads,
+            shape.num_v_heads,
+            _SCALE,
+            _LOWER_BOUND,
+            context._stream_ptr,
+        )
+    else:
+        module.run_training_row_backward(
+            qf,
+            kf,
+            vf,
+            gf,
+            context._A_log,
+            context._dt_bias,
+            context._initial_state,
+            do_flat,
+            dfinal_state,
+            context._cu_seqlens,
+            t["q_norm"],
+            t["k_norm"],
+            t["decay"],
+            context.beta_active,
+            context.state_checkpoints,
+            dq_norm,
+            dk_norm,
+            dlog,
+            dbeta_active,
+            dq.view_as(qf),
+            dk.view_as(kf),
+            dv.view_as(vf),
+            dg.view_as(gf),
+            dbeta.view(1, shape.total_tokens, shape.num_v_heads),
+            dA,
+            ddt,
+            dinit,
+            shape.total_tokens,
+            shape.num_sequences,
+            shape.num_v_heads,
+            _SCALE,
+            _LOWER_BOUND,
+            context._stream_ptr,
+        )
 
 
 def _run_c32_backward(
@@ -1551,6 +1743,24 @@ def recurrent_kda_training_backward(
         )
         if context._route.family == "c16":
             _run_c16_backward(context, do_flat, dfinal_state, outputs)
+            if context._parameter_context is not None:
+                parameter_outputs = tuple(
+                    outputs[index]
+                    if index in (5, 6)
+                    else _backward_buffer(
+                        context._parameter_context,
+                        f"hybrid_discard_{name}",
+                        tuple(outputs[index].shape),
+                        outputs[index].dtype,
+                    )
+                    for index, name in enumerate(KDA_BACKWARD_GRADIENT_NAMES)
+                )
+                _run_c32_backward(
+                    context._parameter_context,
+                    do_flat,
+                    dfinal_state,
+                    parameter_outputs,
+                )
         elif context._route.family == "row_split":
             _run_row_backward(context, do_flat, dfinal_state, outputs)
         else:
