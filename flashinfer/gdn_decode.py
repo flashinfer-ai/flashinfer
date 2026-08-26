@@ -204,8 +204,8 @@ def gated_delta_rule_decode_pretranspose(
           that batch entry; the output slot is written as **zero**.
     intermediate_states_buffer : torch.Tensor, optional
         Caller-owned BF16 intermediate-state cache of shape
-        ``[B, cache_steps, HV, V, K]``. Supported only by the BF16 ``T>1``
-        path; ``cache_steps`` must be at least ``T``. Defaults to ``None``.
+        ``[B, T, HV, V, K]``. Supported only by the BF16 ``T>1`` path.
+        Defaults to ``None``.
     disable_state_update : bool
         If ``True``, the BF16 ``T>1`` path leaves the state pool unchanged.
         This is used by speculative verification while intermediate states
