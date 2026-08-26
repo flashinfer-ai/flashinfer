@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for the BF16 x FP4 GEMM API ``mm_bf16_fp4``."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -46,7 +48,8 @@ def _dequantize_bf16_fp4_torch(b, b_descale, alpha, n, k, block_size):
 
 # Backends covered by the cross-backend contract tests.  New backends get
 # appended here as they land.
-ALL_BACKENDS = ["cudnn", "cute-dsl"]
+BLACKWELL_BACKENDS = ["blackwell-native", "blackwell-tiled"]
+ALL_BACKENDS = ["cudnn", "cute-dsl", *BLACKWELL_BACKENDS]
 
 
 def _skip_if_backend_unavailable(backend: str) -> None:
@@ -147,6 +150,27 @@ PROBLEM_SIZES = [
 # (alpha=None, out_dtype override, preallocated out, K-mismatch).
 SMOKE_MNK = (16, 1024, 1024)
 
+# Source-dispatch boundaries: short-K routes, M16/M32/M64 buckets, native N
+# tails, and the K=240/256 cp.async/TMA transition.
+BLACKWELL_BOUNDARY_PROBLEM_SIZES = [
+    ("blackwell-native", 1, 64, 16),
+    ("blackwell-native", 16, 65, 32),
+    ("blackwell-native", 17, 127, 48),
+    ("blackwell-native", 32, 129, 240),
+    ("blackwell-native", 33, 191, 256),
+    ("blackwell-native", 64, 192, 240),
+    ("blackwell-native", 65, 193, 256),
+    ("blackwell-tiled", 1, 64, 16),
+    ("blackwell-tiled", 1, 64, 32),
+    ("blackwell-tiled", 1, 64, 48),
+    ("blackwell-tiled", 16, 64, 256),
+    ("blackwell-tiled", 17, 64, 256),
+    ("blackwell-tiled", 32, 64, 240),
+    ("blackwell-tiled", 33, 64, 256),
+    ("blackwell-tiled", 64, 64, 240),
+    ("blackwell-tiled", 65, 64, 256),
+]
+
 ATOL = 1.5e-2
 RTOL = 1.5e-2
 
@@ -223,6 +247,35 @@ def test_backend_matches_handwritten_dequant_matmul(auto_tuning, backend, m, n, 
     assert out.dtype == torch.bfloat16
 
 
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("backend,m,n,k", BLACKWELL_BOUNDARY_PROBLEM_SIZES)
+def test_blackwell_boundary_shapes_match_reference(backend, m, n, k, enable_pdl):
+    """Exercise every source-dispatch boundary with both PDL modes."""
+    _skip_if_backend_unavailable(backend)
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4,
+        b_sf,
+        alpha,
+        backend=backend,
+    )
+    out = mm_bf16_fp4(
+        a,
+        b_p,
+        sf_p,
+        alpha_p,
+        backend=backend,
+        enable_pdl=enable_pdl,
+    )
+
+    weight_fp32 = _dequantize_bf16_fp4_torch(b_fp4, b_sf, alpha, n, k, 16)
+    ref = (a.float() @ weight_fp32.T).to(torch.bfloat16)
+    _assert_close_to_reference(out, ref, backend)
+
+
 @pytest.mark.parametrize("backend", ALL_BACKENDS)
 @pytest.mark.parametrize("auto_tuning", [False, True])
 def test_backend_alpha_none_equals_alpha_one(auto_tuning, backend):
@@ -251,10 +304,8 @@ def test_backend_alpha_none_equals_alpha_one(auto_tuning, backend):
 def test_backend_out_dtype_override(backend):
     """out_dtype kwarg controls return dtype independently of a.dtype."""
     _skip_if_backend_unavailable(backend)
-    if backend == "cute-dsl":
-        # The cute-dsl kernel's MMA path requires out_dtype == a.dtype, so
-        # it cannot emit fp16 from a bf16 activation (see _compute_cute_dsl).
-        pytest.skip("cute-dsl requires out_dtype == a.dtype")
+    if backend in ("cute-dsl", "blackwell-tiled"):
+        pytest.skip(f"{backend} requires bfloat16 output")
     device = torch.device("cuda")
     m, n, k = SMOKE_MNK
     a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
@@ -521,6 +572,241 @@ def test_cute_dsl_prepare_uses_architecture_specific_layout():
     else:
         assert b_p.dtype == torch.int32
         assert sf_p.shape == (k // 16, n)
+
+
+@pytest.mark.parametrize(
+    "backend,n,k",
+    [
+        ("blackwell-native", 65, 16),
+        ("blackwell-native", 127, 32),
+        ("blackwell-native", 129, 48),
+        ("blackwell-native", 191, 240),
+        ("blackwell-native", 193, 256),
+        ("blackwell-tiled", 64, 16),
+        ("blackwell-tiled", 64, 32),
+        ("blackwell-tiled", 64, 48),
+        ("blackwell-tiled", 128, 240),
+        ("blackwell-tiled", 128, 256),
+    ],
+)
+def test_blackwell_prepare_layout_is_exact(backend, n, k):
+    """Pin native/tiled tensor dtypes, shapes, and pure-Torch transforms."""
+    _skip_if_backend_unavailable(backend)
+    from flashinfer.gemm.gemm_bf16_fp4_cute_dsl import (
+        _cute_dsl_pack_fp4_weight,
+        _e4m3_to_s0e5m3,
+    )
+
+    device = torch.device("cuda")
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4,
+        b_sf,
+        alpha,
+        backend=backend,
+    )
+    linear_sf = _unswizzle_sf_128x4(b_sf, n, k // 16).contiguous()
+    assert alpha_p is alpha
+
+    if backend == "blackwell-native":
+        assert b_p.dtype == torch.uint8
+        assert tuple(b_p.shape) == (n, k // 2)
+        assert sf_p.dtype == torch.float8_e4m3fn
+        assert tuple(sf_p.shape) == (n, k // 16)
+        assert torch.equal(sf_p.view(torch.uint8), linear_sf)
+    else:
+        expected_b = _cute_dsl_pack_fp4_weight(b_fp4.t().contiguous())
+        expected_sf = _e4m3_to_s0e5m3(linear_sf.t().contiguous())
+        assert b_p.dtype == torch.int32
+        assert tuple(b_p.shape) == (k // 16, n * 2)
+        assert sf_p.dtype == torch.uint8
+        assert tuple(sf_p.shape) == (k // 16, n)
+        assert torch.equal(b_p, expected_b)
+        assert torch.equal(sf_p, expected_sf)
+
+
+@pytest.mark.parametrize(
+    "backend,layout_code,out_dtype",
+    [
+        ("blackwell-native", 0, torch.float16),
+        ("blackwell-tiled", 1, torch.bfloat16),
+    ],
+)
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("explicit_alpha", [False, True])
+def test_blackwell_launch_abi_materializes_alpha_and_preserves_out(
+    monkeypatch,
+    backend,
+    layout_code,
+    out_dtype,
+    enable_pdl,
+    explicit_alpha,
+):
+    """Pin the exact seven-argument FFI carrier ABI."""
+    _skip_if_backend_unavailable(backend)
+    import flashinfer.gemm.gemm_bf16_fp4_blackwell as blackwell
+
+    device = torch.device("cuda")
+    m, n, k = 17, 64, 256
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, _ = _make_random_fp4_weights(n, k, device)
+    alpha = (
+        torch.tensor([0.5], device=device, dtype=torch.float32)
+        if explicit_alpha
+        else None
+    )
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4,
+        b_sf,
+        alpha,
+        backend=backend,
+    )
+    assert alpha_p is alpha
+
+    calls = []
+    monkeypatch.setattr(
+        blackwell,
+        "_get_blackwell_bf16_fp4_module",
+        lambda: SimpleNamespace(run=lambda *args: calls.append(args)),
+    )
+    out = torch.empty((m, n), device=device, dtype=out_dtype)
+    returned = mm_bf16_fp4(
+        a,
+        b_p,
+        sf_p,
+        alpha_p,
+        backend=backend,
+        out_dtype=out_dtype,
+        out=out,
+        enable_pdl=enable_pdl,
+    )
+
+    assert returned is out
+    assert len(calls) == 1
+    call = calls[0]
+    assert len(call) == 7
+    assert call[0] is a
+    assert call[1] is b_p
+    assert call[2].dtype == torch.uint8
+    assert call[2].data_ptr() == sf_p.data_ptr()
+    if backend == "blackwell-native":
+        assert call[2] is not sf_p
+    else:
+        assert call[2] is sf_p
+    alpha_for_launch = call[3]
+    assert alpha_for_launch.dtype == torch.float32
+    assert tuple(alpha_for_launch.shape) == (1,)
+    assert alpha_for_launch.device == device
+    assert alpha_for_launch.is_contiguous()
+    if explicit_alpha:
+        assert alpha_for_launch is alpha
+        assert alpha_for_launch.data_ptr() != a.data_ptr()
+    else:
+        assert alpha_for_launch.data_ptr() == a.data_ptr()
+    assert call[4] is out
+    assert call[5] == layout_code
+    assert call[6] is enable_pdl
+
+
+@pytest.mark.parametrize("backend", BLACKWELL_BACKENDS)
+def test_blackwell_rejects_explicit_alpha_aliasing_a(backend):
+    _skip_if_backend_unavailable(backend)
+    device = torch.device("cuda")
+    m, n, k = 17, 64, 256
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, _ = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, _ = prepare_bf16_fp4_weights(
+        b_fp4,
+        b_sf,
+        None,
+        backend=backend,
+    )
+    alpha_alias = a.view(torch.float32).reshape(-1)[:1]
+    with pytest.raises(ValueError, match="explicit alpha must not alias a"):
+        mm_bf16_fp4(
+            a,
+            b_p,
+            sf_p,
+            alpha_alias,
+            backend=backend,
+        )
+
+
+def test_blackwell_backend_capability_metadata_is_sm100_sm103_only():
+    for backend in BLACKWELL_BACKENDS:
+        assert mm_bf16_fp4.is_backend_supported(backend, 100)
+        assert mm_bf16_fp4.is_backend_supported(backend, 103)
+        assert not mm_bf16_fp4.is_backend_supported(backend, 120)
+
+
+def test_blackwell_tiled_rejects_n_tail_and_float16_output():
+    _skip_if_backend_unavailable("blackwell-tiled")
+    device = torch.device("cuda")
+    b_tail, sf_tail, alpha_tail = _make_random_fp4_weights(65, 48, device)
+    with pytest.raises(ValueError, match="multiple of 64"):
+        prepare_bf16_fp4_weights(
+            b_tail,
+            sf_tail,
+            alpha_tail,
+            backend="blackwell-tiled",
+        )
+
+    m, n, k = 17, 64, 256
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4,
+        b_sf,
+        alpha,
+        backend="blackwell-tiled",
+    )
+    with pytest.raises(ValueError, match="requires bfloat16 output"):
+        mm_bf16_fp4(
+            a,
+            b_p,
+            sf_p,
+            alpha_p,
+            backend="blackwell-tiled",
+            out_dtype=torch.float16,
+        )
+
+
+@pytest.mark.parametrize("backend", BLACKWELL_BACKENDS)
+def test_blackwell_prepare_rejects_k_not_multiple_of_16(backend):
+    _skip_if_backend_unavailable(backend)
+    device = torch.device("cuda")
+    b = torch.zeros((64, 7), device=device, dtype=torch.uint8)
+    b_descale = torch.zeros((512,), device=device, dtype=torch.uint8)
+    with pytest.raises(ValueError, match="K=14 must be a multiple"):
+        prepare_bf16_fp4_weights(
+            b,
+            b_descale,
+            None,
+            backend=backend,
+        )
+
+
+@pytest.mark.parametrize("backend", BLACKWELL_BACKENDS)
+def test_blackwell_rejects_prepared_scale_shape_drift(backend):
+    _skip_if_backend_unavailable(backend)
+    device = torch.device("cuda")
+    m, n, k = 17, 64, 256
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(
+        b_fp4,
+        b_sf,
+        alpha,
+        backend=backend,
+    )
+    with pytest.raises(ValueError, match="scales with shape"):
+        mm_bf16_fp4(
+            a,
+            b_p,
+            sf_p[..., :-1],
+            alpha_p,
+            backend=backend,
+        )
 
 
 # =============================================================================
