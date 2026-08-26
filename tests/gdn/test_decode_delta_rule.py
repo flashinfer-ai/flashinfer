@@ -2000,7 +2000,33 @@ def test_pretranspose_api_mtp_verify_controls_are_keyword_only():
     assert parameters["disable_state_update"].default is False
 
 
-def test_pretranspose_api_forwards_bf16_mtp_verify_controls():
+@pytest.mark.parametrize("control", ["cache", "disable_state_update"])
+def test_pretranspose_api_rejects_mtp_controls_at_t1(control: str):
+    tensor = torch.empty(1, 1, 1, 1)
+    kwargs = (
+        {"intermediate_states_buffer": torch.empty(0)}
+        if control == "cache"
+        else {"disable_state_update": True}
+    )
+
+    with pytest.raises(ValueError, match="T > 1"):
+        gated_delta_rule_decode_pretranspose(
+            q=tensor,
+            k=tensor,
+            v=tensor,
+            state=tensor,
+            A_log=torch.empty(1),
+            a=torch.empty(1, 1, 1),
+            dt_bias=torch.empty(1),
+            b=torch.empty(1, 1, 1),
+            **kwargs,
+        )
+
+
+@pytest.mark.parametrize("noncompact_pool", [False, True])
+def test_pretranspose_api_forwards_bf16_mtp_verify_controls(
+    noncompact_pool: bool,
+):
     """The public pretranspose API must preserve MTP verify state and cache controls."""
     _skip_if_not_sm90_or_later()
     if not GDN_DECODE_BF16_STATE_AVAILABLE:
@@ -2031,9 +2057,10 @@ def test_pretranspose_api_forwards_bf16_mtp_verify_controls():
     A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
     dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
     initial_state_indices = torch.tensor([1, 4], dtype=torch.int32, device=device)
-    initial_pool = torch.randn(
+    padded_heads = 1 if noncompact_pool else 0
+    initial_backing = torch.randn(
         pool_size,
-        num_v_heads,
+        num_v_heads + padded_heads,
         head_size,
         head_size,
         dtype=dtype,
@@ -2051,8 +2078,12 @@ def test_pretranspose_api_forwards_bf16_mtp_verify_controls():
     )
     public_cache = torch.empty(cache_shape, dtype=dtype, device=device)
     direct_cache = torch.empty(cache_shape, dtype=dtype, device=device)
-    public_pool = initial_pool.clone()
-    direct_pool = initial_pool.clone()
+    public_backing = initial_backing.clone()
+    direct_backing = initial_backing.clone()
+    public_pool = public_backing[:, :num_v_heads]
+    direct_pool = direct_backing[:, :num_v_heads]
+    assert public_pool.is_contiguous() == (not noncompact_pool)
+    assert direct_pool.is_contiguous() == (not noncompact_pool)
     scale = 1.0 / math.sqrt(head_size)
 
     public_output, returned_pool = gated_delta_rule_decode_pretranspose(
@@ -2093,9 +2124,119 @@ def test_pretranspose_api_forwards_bf16_mtp_verify_controls():
     assert public_output is output
     assert returned_pool is public_pool
     torch.testing.assert_close(public_output, direct_output, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(public_pool, initial_pool, atol=0.0, rtol=0.0)
-    torch.testing.assert_close(direct_pool, initial_pool, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(public_backing, initial_backing, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(direct_backing, initial_backing, atol=0.0, rtol=0.0)
     torch.testing.assert_close(public_cache, direct_cache, atol=1e-2, rtol=1e-2)
+
+
+def test_pretranspose_api_forwards_fp32_mtp_verify_controls_with_noncompact_pool():
+    """FP32 MTP controls must survive public dtype dispatch for a padded pool."""
+    _skip_if_not_sm90_or_later()
+
+    torch.random.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    batch_size, seq_len = 2, 2
+    num_q_heads = num_k_heads = 16
+    num_v_heads = 32
+    head_size = 128
+    pool_size = 5
+    device = torch.device("cuda")
+    io_dtype = torch.bfloat16
+
+    q = torch.randn(
+        batch_size, seq_len, num_q_heads, head_size, dtype=io_dtype, device=device
+    )
+    k = torch.randn(
+        batch_size, seq_len, num_k_heads, head_size, dtype=io_dtype, device=device
+    )
+    v = torch.randn(
+        batch_size, seq_len, num_v_heads, head_size, dtype=io_dtype, device=device
+    )
+    a = (
+        torch.randn(
+            batch_size, seq_len, num_v_heads, dtype=io_dtype, device=device
+        )
+        * 0.1
+    )
+    b_tensor = torch.randn(
+        batch_size, seq_len, num_v_heads, dtype=io_dtype, device=device
+    )
+    A_log = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    dt_bias = torch.randn(num_v_heads, dtype=torch.float32, device=device) * 0.1
+    initial_state_indices = torch.tensor([1, 4], dtype=torch.int32, device=device)
+    initial_backing = torch.randn(
+        pool_size,
+        num_v_heads + 1,
+        head_size,
+        head_size,
+        dtype=torch.float32,
+        device=device,
+    )
+    public_backing = initial_backing.clone()
+    direct_backing = initial_backing.clone()
+    public_pool = public_backing[:, :num_v_heads]
+    direct_pool = direct_backing[:, :num_v_heads]
+    assert not public_pool.is_contiguous()
+    assert not direct_pool.is_contiguous()
+
+    output = torch.empty(
+        batch_size, seq_len, num_v_heads, head_size, dtype=io_dtype, device=device
+    )
+    direct_output_buffer = torch.empty_like(output)
+    cache_shape = (
+        batch_size,
+        seq_len,
+        num_v_heads,
+        head_size,
+        head_size,
+    )
+    public_cache = torch.empty(cache_shape, dtype=torch.float32, device=device)
+    direct_cache = torch.empty(cache_shape, dtype=torch.float32, device=device)
+    scale = 1.0 / math.sqrt(head_size)
+
+    public_output, returned_pool = gated_delta_rule_decode_pretranspose(
+        q=q,
+        k=k,
+        v=v,
+        state=None,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b_tensor,
+        scale=scale,
+        output=output,
+        use_qk_l2norm=True,
+        initial_state=public_pool,
+        initial_state_indices=initial_state_indices,
+        intermediate_states_buffer=public_cache,
+        disable_state_update=True,
+    )
+    direct_output, direct_returned_pool = gated_delta_rule_mtp(
+        q=q,
+        k=k,
+        v=v,
+        initial_state=direct_pool,
+        initial_state_indices=initial_state_indices,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b_tensor,
+        scale=scale,
+        output=direct_output_buffer,
+        intermediate_states_buffer=direct_cache,
+        disable_state_update=True,
+        use_qk_l2norm=True,
+    )
+
+    assert public_output is output
+    assert returned_pool is public_pool
+    assert direct_output is direct_output_buffer
+    assert direct_returned_pool is direct_pool
+    torch.testing.assert_close(public_output, direct_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(public_backing, initial_backing, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(direct_backing, initial_backing, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(public_cache, direct_cache, atol=1e-3, rtol=1e-3)
 
 
 # ============================================================================

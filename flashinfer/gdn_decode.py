@@ -175,8 +175,8 @@ def gated_delta_rule_decode_pretranspose(
         K-contiguous, same layout as the per-batch ``state`` argument).
         When provided, the kernel gathers directly from the pool using
         ``initial_state_indices`` and writes updates back in-place,
-        eliminating the caller-side gather/scatter overhead.  Requires
-        bfloat16 state with K=V=128 (bf16 fast path).
+        eliminating the caller-side gather/scatter overhead. Bfloat16 state
+        uses the K=V=128 fast path; float32 state supports both T=1 and MTP.
     initial_state_indices : torch.Tensor, optional
         Per-batch indices of shape ``[B]`` (int32 or int64) mapping each
         batch entry to its slot in ``initial_state``.  Required when
@@ -199,18 +199,20 @@ def gated_delta_rule_decode_pretranspose(
           should not use it).  The caller must therefore allocate the pool
           with an extra leading slot (``pool_size = num_real_slots + 1``)
           and keep real slots at indices ``1..pool_size-1``.
-        - **float32 legacy path** (T=1): ``-1`` entries are skipped
-          entirely; neither the state pool nor the output are touched for
-          that batch entry; the output slot is written as **zero**.
+        - **float32 path**: ``-1`` entries are skipped entirely; neither the
+          state pool nor the output are touched for that batch entry. The
+          output slot remains caller-provided, or is **zero** when ``output``
+          is ``None``.
     intermediate_states_buffer : torch.Tensor, optional
-        Caller-owned BF16 intermediate-state cache of shape
-        ``[B, T, HV, V, K]``. Supported only by the BF16 ``T>1`` path.
-        Defaults to ``None``.
+        Caller-owned intermediate-state cache of shape
+        ``[B, T, HV, V, K]``. The cache must be bfloat16 for the BF16-state
+        backend and float32 for the FP32-state backend. Supported only when
+        ``T > 1``. Defaults to ``None``.
     disable_state_update : bool
-        If ``True``, the BF16 ``T>1`` path leaves the state pool unchanged.
-        This is used by speculative verification while intermediate states
-        are retained in ``intermediate_states_buffer``. Defaults to ``False``
-        to preserve the existing update behavior.
+        If ``True``, the ``T>1`` path leaves the state pool unchanged. This is
+        used by speculative verification while intermediate states are retained
+        in ``intermediate_states_buffer``. Defaults to ``False`` to preserve the
+        existing update behavior.
 
     Returns
     -------
@@ -222,14 +224,14 @@ def gated_delta_rule_decode_pretranspose(
     Notes
     -----
     - Requires SM90+ (Hopper, Blackwell, etc.).
-    - State is updated in-place by default; BF16 MTP verification can preserve
-      it with ``disable_state_update=True``.
+    - State is updated in-place by default; MTP verification can preserve it
+      with ``disable_state_update=True``.
     - State layout is v-major (K-last): ``[B, HV, V, K]``.  When state is
       bfloat16 and ``K = V = 128``, the BF16 state kernel is used (T=1 or
       MTP for T>1); the pool+indices path routes through the MTP kernel.
     - Pool+indices (``initial_state`` / ``initial_state_indices``) are
       supported on both the bf16 fast path (K=V=128) and the float32 legacy
-      path (T=1).  Both paths support ``-1`` padding indices (see
+      path (T=1 or MTP). Both paths support ``-1`` padding indices (see
       ``initial_state_indices`` above for per-backend semantics).
     - Legacy path (float32 state, T=1): ``K`` and ``V`` must each be
       ``>= 128``, and ``V`` must be a multiple of 8 (the pretranspose tile
@@ -242,7 +244,7 @@ def gated_delta_rule_decode_pretranspose(
     if (intermediate_states_buffer is not None or disable_state_update) and T == 1:
         raise ValueError(
             "intermediate_states_buffer and disable_state_update are supported "
-            "only by BF16 pretranspose decode with T > 1"
+            "only by pretranspose decode with T > 1"
         )
 
     use_pool = initial_state is not None
@@ -287,12 +289,15 @@ def gated_delta_rule_decode_pretranspose(
         and K == 128
         and V == 128
     )
+    supports_mtp_controls = use_bf16_state or (
+        state_dtype == torch.float32 and T > 1 and use_pool
+    )
     if (
         intermediate_states_buffer is not None or disable_state_update
-    ) and not use_bf16_state:
+    ) and not supports_mtp_controls:
         raise ValueError(
             "intermediate_states_buffer and disable_state_update are supported "
-            "only by BF16 pretranspose decode with T > 1"
+            "only by BF16 or pool-backed FP32 pretranspose decode with T > 1"
         )
     if use_bf16_state:
         assert q.dtype in (torch.float16, torch.bfloat16), (
@@ -409,8 +414,8 @@ def gated_delta_rule_decode_pretranspose(
             b=b,
             scale=scale,
             output=output,
-            intermediate_states_buffer=None,
-            disable_state_update=False,
+            intermediate_states_buffer=intermediate_states_buffer,
+            disable_state_update=disable_state_update,
             use_qk_l2norm=use_qk_l2norm,
             output_state_indices=output_state_indices,
         )
