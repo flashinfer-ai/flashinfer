@@ -140,21 +140,21 @@ def test_wan_hybrid_jit_flags_are_target_specific(monkeypatch) -> None:
                 call = calls[f"wan_hybrid_{component}_{target}"]
                 flags = call["extra_cuda_cflags"]
                 assert flags.count(f"-gencode=arch=compute_{arch},code=sm_{arch}") == 1
-                assert flags.count(
-                    f"-DFLASHINFER_WAN_HYBRID_TARGET_MINOR={target_minor}"
-                ) == 1
-                assert len(call["sources"]) == 1
-                assert call["sources"][0].name == (
-                    f"wan_hybrid_{component}_binding.cu"
+                assert (
+                    flags.count(f"-DFLASHINFER_WAN_HYBRID_TARGET_MINOR={target_minor}")
+                    == 1
                 )
+                assert len(call["sources"]) == 1
+                assert call["sources"][0].name == (f"wan_hybrid_{component}_binding.cu")
 
         assert calls["wan_hybrid_quantization_sm100"]["use_fast_math"] is False
         assert calls["wan_hybrid_quantization_sm103"]["use_fast_math"] is False
         for target in ("sm100", "sm103"):
             for component in ("attention", "dispatch"):
-                assert "--ptxas-options=--opt-level=1" in calls[
-                    f"wan_hybrid_{component}_{target}"
-                ]["extra_cuda_cflags"]
+                assert (
+                    "--ptxas-options=--opt-level=1"
+                    in calls[f"wan_hybrid_{component}_{target}"]["extra_cuda_cflags"]
+                )
         assert calls["wan_hybrid_dispatch_sm100"]["use_fast_math"] is False
         assert calls["wan_hybrid_dispatch_sm103"]["use_fast_math"] is False
     finally:
@@ -189,10 +189,10 @@ def test_wan_hybrid_quantizer_binding_matches_frozen_device_abi() -> None:
     assert "const cudaStream_t stream = get_stream(value.device());" in binding
     assert binding.count('#include "device/wan_hybrid_quantize_value_sm') == 2
     assert _sha256(source_root / "device/wan_hybrid_quantize_value_sm100.cu") == (
-        "808fa99c273e7b0902cf7938bfb0078e26a8a5ac49f58f2f9432ef17d858fcf5"
+        "45fd994837483df419ad8b1d30c29cdb84e88572fcab54acdbcaefba9ad48ea3"
     )
     assert _sha256(source_root / "device/wan_hybrid_quantize_value_sm103.cu") == (
-        "808fa99c273e7b0902cf7938bfb0078e26a8a5ac49f58f2f9432ef17d858fcf5"
+        "45fd994837483df419ad8b1d30c29cdb84e88572fcab54acdbcaefba9ad48ea3"
     )
 
 
@@ -226,9 +226,10 @@ def test_wan_hybrid_attention_binding_matches_frozen_device_abi() -> None:
         assert removed not in binding
     assert binding.count('#include "device/wan_hybrid_attention_sm') == 2
     for target in ("sm100", "sm103"):
-        assert _sha256(
-            source_root / "device" / f"wan_hybrid_attention_{target}.cu"
-        ) == "b47b42c250a7696aea46f35937f9681019e997568c8e871c30a45d65d8b8527c"
+        assert (
+            _sha256(source_root / "device" / f"wan_hybrid_attention_{target}.cu")
+            == "705bbbfd640b34d4775535d379bfc6305b28ea4df21eb073278c6c7d4177e45a"
+        )
 
 
 def test_wan_hybrid_dispatch_binding_preserves_sources_and_launch_order() -> None:
@@ -248,9 +249,9 @@ def test_wan_hybrid_dispatch_binding_preserves_sources_and_launch_order() -> Non
     assert body.index("cudaDeviceGetAttribute(&multiprocessor_count") < body.index(
         "kernel_wan_hybrid_quantize_value<<<"
     )
-    assert body.index("const cudaStream_t stream = get_stream(q.device());") < body.index(
-        "kernel_wan_hybrid_quantize_value<<<"
-    )
+    assert body.index(
+        "const cudaStream_t stream = get_stream(q.device());"
+    ) < body.index("kernel_wan_hybrid_quantize_value<<<")
     assert body.index("kernel_wan_hybrid_quantize_value<<<") < body.index(
         "cudaLaunchKernelEx(&config, kernel_wan_hybrid_attention"
     )
@@ -630,12 +631,8 @@ def test_wan_hybrid_workspace_uses_exact_reusable_quantizer_storage() -> None:
     assert tuple(views.sfvt_lo.shape) == (51_200, 32)
     assert tuple(views.sfvt_hi.shape) == (51_200, 32)
     assert views.vt.data_ptr() == base.data_ptr()
-    assert views.sfvt_lo.data_ptr() == workspace._buffers[
-        "v_scale_base_lo"
-    ].data_ptr()
-    assert views.sfvt_hi.data_ptr() == workspace._buffers[
-        "v_scale_base_hi"
-    ].data_ptr()
+    assert views.sfvt_lo.data_ptr() == workspace._buffers["v_scale_base_lo"].data_ptr()
+    assert views.sfvt_hi.data_ptr() == workspace._buffers["v_scale_base_hi"].data_ptr()
     assert workspace._descriptor_storage.dtype == torch.uint8
     assert workspace._descriptor_storage.device == workspace.device
     assert tuple(workspace._descriptor_storage.shape) == (6, 128)

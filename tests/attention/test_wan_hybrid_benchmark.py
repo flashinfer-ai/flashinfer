@@ -11,9 +11,7 @@ import pytest
 
 
 _BENCHMARK_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "benchmarks"
-    / "bench_wan_hybrid_attention.py"
+    Path(__file__).resolve().parents[2] / "benchmarks" / "bench_wan_hybrid_attention.py"
 )
 _SPEC = importlib.util.spec_from_file_location(
     "flashinfer_wan_hybrid_benchmark_test_target", _BENCHMARK_PATH
@@ -32,9 +30,7 @@ def test_measure_order_reports_signed_and_absolute_deltas(monkeypatch) -> None:
         lambda: types.SimpleNamespace(cuda_stream=7),
     )
 
-    result = benchmark._measure_order(
-        ("C", "F", "F", "C"), lambda: None, lambda: None
-    )
+    result = benchmark._measure_order(("C", "F", "F", "C"), lambda: None, lambda: None)
 
     assert result["order"] == "C/F/F/C"
     assert result["candidate_median_ms"] == 2.0

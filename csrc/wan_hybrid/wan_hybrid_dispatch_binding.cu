@@ -123,8 +123,7 @@ static_assert(sizeof(CUtensorMap) == kTensorMapBytes);
 static_assert(sizeof(wan_hybrid_attention_generated_TensorMap) == kTensorMapBytes);
 
 void CheckCuda(cudaError_t status, const char* operation) {
-  TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-      << operation << " failed: " << cudaGetErrorString(status);
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
 }
 
 void CheckDriver(CUresult status, const char* operation) {
@@ -135,8 +134,7 @@ void CheckDriver(CUresult status, const char* operation) {
 void CheckExactTensor(TensorView tensor, const char* name, DLDataType dtype,
                       std::initializer_list<int64_t> shape, int32_t device_id) {
   CHECK_INPUT(tensor);
-  TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(tensor.dtype()),
-                    encode_dlpack_dtype(dtype))
+  TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(tensor.dtype()), encode_dlpack_dtype(dtype))
       << name << " has the wrong dtype";
   TVM_FFI_ICHECK_EQ(tensor.ndim(), static_cast<int32_t>(shape.size()))
       << name << " has the wrong rank";
@@ -153,36 +151,30 @@ void CheckExactTensor(TensorView tensor, const char* name, DLDataType dtype,
 void CheckTarget(int32_t device_id) {
   int major = 0;
   int minor = 0;
-  CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                                   device_id),
+  CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
             "cudaDeviceGetAttribute(major)");
-  CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
-                                   device_id),
+  CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
-  TVM_FFI_ICHECK_EQ(major, 10)
-      << "wan_hybrid dispatch requires compute capability 10.x";
+  TVM_FFI_ICHECK_EQ(major, 10) << "wan_hybrid dispatch requires compute capability 10.x";
   TVM_FFI_ICHECK_EQ(minor, FLASHINFER_WAN_HYBRID_TARGET_MINOR)
       << "wan_hybrid dispatch module target does not match the CUDA device";
 }
 
-CUtensorMap EncodeTensorMap(const void* address, CUtensorMapDataType data_type,
-                            uint32_t rank, const uint64_t* global_dims,
-                            const uint64_t* global_strides,
+CUtensorMap EncodeTensorMap(const void* address, CUtensorMapDataType data_type, uint32_t rank,
+                            const uint64_t* global_dims, const uint64_t* global_strides,
                             const uint32_t* box_dims, CUtensorMapSwizzle swizzle,
                             const char* name) {
   std::array<uint32_t, 5> element_strides{1, 1, 1, 1, 1};
   CUtensorMap tensor_map{};
   const CUresult result = cuTensorMapEncodeTiled(
-      &tensor_map, data_type, rank, const_cast<void*>(address), global_dims,
-      global_strides, box_dims, element_strides.data(),
-      CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+      &tensor_map, data_type, rank, const_cast<void*>(address), global_dims, global_strides,
+      box_dims, element_strides.data(), CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+      CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   CheckDriver(result, name);
   return tensor_map;
 }
 
-CUtensorMap EncodeNHD(const TensorView& tensor, uint32_t rows_per_box,
-                      const char* name) {
+CUtensorMap EncodeNHD(const TensorView& tensor, uint32_t rows_per_box, const char* name) {
   constexpr uint64_t global_dims[5] = {64, kSequence, kHeads, kBatch, 2};
   constexpr uint64_t global_strides[4] = {
       kHeads * kHeadDim * sizeof(__nv_bfloat16),
@@ -191,98 +183,78 @@ CUtensorMap EncodeNHD(const TensorView& tensor, uint32_t rows_per_box,
       64 * sizeof(__nv_bfloat16),
   };
   const uint32_t box_dims[5] = {64, rows_per_box, 1, 1, 2};
-  return EncodeTensorMap(tensor.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-                         5, global_dims, global_strides, box_dims,
-                         CU_TENSOR_MAP_SWIZZLE_128B, name);
+  return EncodeTensorMap(tensor.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, global_dims,
+                         global_strides, box_dims, CU_TENSOR_MAP_SWIZZLE_128B, name);
 }
 
 CUtensorMap Encode2D(const TensorView& tensor, uint64_t columns, uint64_t rows,
-                     uint32_t box_columns, uint32_t box_rows,
-                     CUtensorMapSwizzle swizzle, const char* name) {
+                     uint32_t box_columns, uint32_t box_rows, CUtensorMapSwizzle swizzle,
+                     const char* name) {
   const uint64_t global_dims[2] = {columns, rows};
   const uint64_t global_strides[1] = {columns};
   const uint32_t box_dims[2] = {box_columns, box_rows};
-  return EncodeTensorMap(tensor.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 2,
-                         global_dims, global_strides, box_dims, swizzle, name);
+  return EncodeTensorMap(tensor.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, global_dims,
+                         global_strides, box_dims, swizzle, name);
 }
 
-void PrepareTensorMaps(const TensorView& q, const TensorView& k,
-                       const TensorView& vt, const TensorView& sfvt_lo,
-                       const TensorView& sfvt_hi, const TensorView& out,
+void PrepareTensorMaps(const TensorView& q, const TensorView& k, const TensorView& vt,
+                       const TensorView& sfvt_lo, const TensorView& sfvt_hi, const TensorView& out,
                        const TensorView& descriptor_storage) {
   std::array<CUtensorMap, kTensorMapCount> maps{
       EncodeNHD(q, 128, "cuTensorMapEncodeTiled(q)"),
       EncodeNHD(k, 128, "cuTensorMapEncodeTiled(k)"),
-      Encode2D(vt, kPackedValueColumns, kPackedValueRows, 64, 128,
-               CU_TENSOR_MAP_SWIZZLE_64B, "cuTensorMapEncodeTiled(vt)"),
-      Encode2D(sfvt_lo, kScaleColumns, kValueScaleRows, 32, 16,
-               CU_TENSOR_MAP_SWIZZLE_NONE,
+      Encode2D(vt, kPackedValueColumns, kPackedValueRows, 64, 128, CU_TENSOR_MAP_SWIZZLE_64B,
+               "cuTensorMapEncodeTiled(vt)"),
+      Encode2D(sfvt_lo, kScaleColumns, kValueScaleRows, 32, 16, CU_TENSOR_MAP_SWIZZLE_NONE,
                "cuTensorMapEncodeTiled(sfvt_lo)"),
-      Encode2D(sfvt_hi, kScaleColumns, kValueScaleRows, 32, 16,
-               CU_TENSOR_MAP_SWIZZLE_NONE,
+      Encode2D(sfvt_hi, kScaleColumns, kValueScaleRows, 32, 16, CU_TENSOR_MAP_SWIZZLE_NONE,
                "cuTensorMapEncodeTiled(sfvt_hi)"),
       EncodeNHD(out, 128, "cuTensorMapEncodeTiled(out)"),
   };
-  CheckCuda(cudaMemcpy(descriptor_storage.data_ptr(), maps.data(), sizeof(maps),
-                       cudaMemcpyHostToDevice),
-            "cudaMemcpy(wan_hybrid tensor maps)");
+  CheckCuda(
+      cudaMemcpy(descriptor_storage.data_ptr(), maps.data(), sizeof(maps), cudaMemcpyHostToDevice),
+      "cudaMemcpy(wan_hybrid tensor maps)");
 }
 
-void Dispatch(TensorView q, TensorView k, TensorView value, TensorView vt,
-              TensorView sfvt_lo, TensorView sfvt_hi, TensorView out,
-              TensorView descriptor_storage, bool prepare_descriptors,
-              double sm_scale) {
+void Dispatch(TensorView q, TensorView k, TensorView value, TensorView vt, TensorView sfvt_lo,
+              TensorView sfvt_hi, TensorView out, TensorView descriptor_storage,
+              bool prepare_descriptors, double sm_scale) {
   CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
   const int32_t device_id = q.device().device_id;
-  CheckExactTensor(q, "q", dl_bfloat16,
-                   {kBatch, kSequence, kHeads, kHeadDim}, device_id);
-  CheckExactTensor(k, "k", dl_bfloat16,
-                   {kBatch, kSequence, kHeads, kHeadDim}, device_id);
-  CheckExactTensor(value, "value", dl_bfloat16,
-                   {kBatch, kSequence, kHeads, kHeadDim}, device_id);
-  CheckExactTensor(vt, "vt", dl_uint8,
-                   {kPackedValueRows, kPackedValueColumns}, device_id);
-  CheckExactTensor(sfvt_lo, "sfvt_lo", dl_uint8,
-                   {kValueScaleRows, kScaleColumns}, device_id);
-  CheckExactTensor(sfvt_hi, "sfvt_hi", dl_uint8,
-                   {kValueScaleRows, kScaleColumns}, device_id);
-  CheckExactTensor(out, "out", dl_bfloat16,
-                   {kBatch, kSequence, kHeads, kHeadDim}, device_id);
+  CheckExactTensor(q, "q", dl_bfloat16, {kBatch, kSequence, kHeads, kHeadDim}, device_id);
+  CheckExactTensor(k, "k", dl_bfloat16, {kBatch, kSequence, kHeads, kHeadDim}, device_id);
+  CheckExactTensor(value, "value", dl_bfloat16, {kBatch, kSequence, kHeads, kHeadDim}, device_id);
+  CheckExactTensor(vt, "vt", dl_uint8, {kPackedValueRows, kPackedValueColumns}, device_id);
+  CheckExactTensor(sfvt_lo, "sfvt_lo", dl_uint8, {kValueScaleRows, kScaleColumns}, device_id);
+  CheckExactTensor(sfvt_hi, "sfvt_hi", dl_uint8, {kValueScaleRows, kScaleColumns}, device_id);
+  CheckExactTensor(out, "out", dl_bfloat16, {kBatch, kSequence, kHeads, kHeadDim}, device_id);
   CheckExactTensor(descriptor_storage, "descriptor_storage", dl_uint8,
                    {kTensorMapCount, kTensorMapBytes}, device_id);
-  TVM_FFI_ICHECK_EQ(
-      reinterpret_cast<uintptr_t>(descriptor_storage.data_ptr()) % 128, 0)
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(descriptor_storage.data_ptr()) % 128, 0)
       << "descriptor_storage must be 128-byte aligned";
   TVM_FFI_ICHECK(std::isfinite(sm_scale)) << "sm_scale must be finite";
 
   ffi::CUDADeviceGuard device_guard(device_id);
   CheckTarget(device_id);
   if (prepare_descriptors) {
-    PrepareTensorMaps(q, k, vt, sfvt_lo, sfvt_hi, out,
-                      descriptor_storage);
-    CheckCuda(cudaFuncSetAttribute(
-                  kernel_wan_hybrid_attention,
-                  cudaFuncAttributeMaxDynamicSharedMemorySize,
-                  static_cast<int>(kAttentionDynamicSmemBytes)),
+    PrepareTensorMaps(q, k, vt, sfvt_lo, sfvt_hi, out, descriptor_storage);
+    CheckCuda(cudaFuncSetAttribute(kernel_wan_hybrid_attention,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   static_cast<int>(kAttentionDynamicSmemBytes)),
               "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
   }
 
   int multiprocessor_count = 0;
-  CheckCuda(cudaDeviceGetAttribute(&multiprocessor_count,
-                                   cudaDevAttrMultiProcessorCount, device_id),
-            "cudaDeviceGetAttribute(multiProcessorCount)");
-  constexpr int kTotalTiles =
-      ((kSequence + 255) / 256) * kBatch * kHeads;
-  const int grid_x = std::min(
-      {multiprocessor_count, kTotalTiles, static_cast<int>(kMaximumTiles)});
-  TVM_FFI_ICHECK_GT(grid_x, 0)
-      << "wan_hybrid attention requires at least one SM";
+  CheckCuda(
+      cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device_id),
+      "cudaDeviceGetAttribute(multiProcessorCount)");
+  constexpr int kTotalTiles = ((kSequence + 255) / 256) * kBatch * kHeads;
+  const int grid_x = std::min({multiprocessor_count, kTotalTiles, static_cast<int>(kMaximumTiles)});
+  TVM_FFI_ICHECK_GT(grid_x, 0) << "wan_hybrid attention requires at least one SM";
 
-  auto* descriptor_bytes =
-      static_cast<uint8_t*>(descriptor_storage.data_ptr());
+  auto* descriptor_bytes = static_cast<uint8_t*>(descriptor_storage.data_ptr());
   auto tensor_map = [descriptor_bytes](int index) {
-    return reinterpret_cast<
-        const wan_hybrid_attention_generated_TensorMap*>(
+    return reinterpret_cast<const wan_hybrid_attention_generated_TensorMap*>(
         descriptor_bytes + index * kTensorMapBytes);
   };
   const auto* q_map = tensor_map(0);
@@ -296,24 +268,18 @@ void Dispatch(TensorView q, TensorView k, TensorView value, TensorView vt,
   constexpr int heads = kHeads;
   constexpr int total_bh = kBatch * kHeads;
   constexpr int physical_num_blocks = kPaddedSequence / 128;
-  const float softmax_scale_log2 =
-      static_cast<float>(sm_scale / std::log(2.0));
+  const float softmax_scale_log2 = static_cast<float>(sm_scale / std::log(2.0));
   const cudaStream_t stream = get_stream(q.device());
 
-  auto* value_bytes = static_cast<wan_hybrid_quant_generated_uint8_t*>(
-      vt.data_ptr());
-  auto* scale_lo_bytes = static_cast<wan_hybrid_quant_generated_uint8_t*>(
-      sfvt_lo.data_ptr());
-  auto* scale_hi_bytes = static_cast<wan_hybrid_quant_generated_uint8_t*>(
-      sfvt_hi.data_ptr());
-  kernel_wan_hybrid_quantize_value<<<
-      dim3(kHeads * kLogicalBlocks, 1, 1),
-      dim3(kWanHybridQuantThreads, 1, 1),
-      kWanHybridQuantDynamicSmemBytes, stream>>>(
+  auto* value_bytes = static_cast<wan_hybrid_quant_generated_uint8_t*>(vt.data_ptr());
+  auto* scale_lo_bytes = static_cast<wan_hybrid_quant_generated_uint8_t*>(sfvt_lo.data_ptr());
+  auto* scale_hi_bytes = static_cast<wan_hybrid_quant_generated_uint8_t*>(sfvt_hi.data_ptr());
+  kernel_wan_hybrid_quantize_value<<<dim3(kHeads * kLogicalBlocks, 1, 1),
+                                     dim3(kWanHybridQuantThreads, 1, 1),
+                                     kWanHybridQuantDynamicSmemBytes, stream>>>(
       static_cast<__nv_bfloat16*>(value.data_ptr()), value_bytes,
-      value_bytes + kValueRows * kPackedValueColumns, scale_lo_bytes,
-      scale_hi_bytes, scale_lo_bytes + kScaleRows * kScaleColumns,
-      scale_hi_bytes + kScaleRows * kScaleColumns,
+      value_bytes + kValueRows * kPackedValueColumns, scale_lo_bytes, scale_hi_bytes,
+      scale_lo_bytes + kScaleRows * kScaleColumns, scale_hi_bytes + kScaleRows * kScaleColumns,
       static_cast<wan_hybrid_quant_generated_int32_t>(kHeads),
       static_cast<wan_hybrid_quant_generated_int32_t>(kSequence),
       static_cast<wan_hybrid_quant_generated_int32_t>(kPaddedSequence),
@@ -326,15 +292,13 @@ void Dispatch(TensorView q, TensorView k, TensorView value, TensorView vt,
   config.blockDim = dim3(kAttentionThreads, 1, 1);
   config.dynamicSmemBytes = kAttentionDynamicSmemBytes;
   config.stream = stream;
-  CheckCuda(cudaLaunchKernelEx(&config, kernel_wan_hybrid_attention, q_map,
-                               k_map, vt_map, sfvt_lo_map, sfvt_hi_map, out_map,
-                               seqlen_q, seqlen_kv, softmax_scale_log2, heads,
-                               total_bh, physical_num_blocks),
+  CheckCuda(cudaLaunchKernelEx(&config, kernel_wan_hybrid_attention, q_map, k_map, vt_map,
+                               sfvt_lo_map, sfvt_hi_map, out_map, seqlen_q, seqlen_kv,
+                               softmax_scale_log2, heads, total_bh, physical_num_blocks),
             "wan_hybrid_attention launch");
 }
 
 }  // namespace wan_hybrid
 }  // namespace flashinfer
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(wan_hybrid_dispatch,
-                              flashinfer::wan_hybrid::Dispatch);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(wan_hybrid_dispatch, flashinfer::wan_hybrid::Dispatch);

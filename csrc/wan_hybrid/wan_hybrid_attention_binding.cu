@@ -156,8 +156,8 @@ CUtensorMap Encode2D(const TensorView& tensor, uint64_t columns, uint64_t rows,
 }
 
 void PrepareTensorMaps(const TensorView& q, const TensorView& k, const TensorView& vt,
-                       const TensorView& sfvt_lo, const TensorView& sfvt_hi,
-                       const TensorView& out, const TensorView& descriptor_storage) {
+                       const TensorView& sfvt_lo, const TensorView& sfvt_hi, const TensorView& out,
+                       const TensorView& descriptor_storage) {
   std::array<CUtensorMap, kTensorMapCount> maps{
       EncodeNHD(q, 128, "cuTensorMapEncodeTiled(q)"),
       EncodeNHD(k, 128, "cuTensorMapEncodeTiled(k)"),
@@ -174,9 +174,9 @@ void PrepareTensorMaps(const TensorView& q, const TensorView& k, const TensorVie
       "cudaMemcpy(wan_hybrid tensor maps)");
 }
 
-void Attention(TensorView q, TensorView k, TensorView vt, TensorView sfvt_lo,
-               TensorView sfvt_hi, TensorView out, TensorView descriptor_storage,
-               bool prepare_descriptors, double sm_scale) {
+void Attention(TensorView q, TensorView k, TensorView vt, TensorView sfvt_lo, TensorView sfvt_hi,
+               TensorView out, TensorView descriptor_storage, bool prepare_descriptors,
+               double sm_scale) {
   CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
   const int32_t device_id = q.device().device_id;
   CheckExactTensor(q, "q", dl_bfloat16, {kBatch, kSequence, kHeads, kHeadDim}, device_id);
@@ -206,8 +206,7 @@ void Attention(TensorView q, TensorView k, TensorView vt, TensorView sfvt_lo,
       cudaDeviceGetAttribute(&multiprocessor_count, cudaDevAttrMultiProcessorCount, device_id),
       "cudaDeviceGetAttribute(multiProcessorCount)");
   constexpr int kTotalTiles = ((kSequence + 255) / 256) * kBatch * kHeads;
-  const int grid_x =
-      std::min({multiprocessor_count, kTotalTiles, static_cast<int>(kMaximumTiles)});
+  const int grid_x = std::min({multiprocessor_count, kTotalTiles, static_cast<int>(kMaximumTiles)});
   TVM_FFI_ICHECK_GT(grid_x, 0) << "wan_hybrid attention requires at least one SM";
 
   auto* descriptor_bytes = static_cast<uint8_t*>(descriptor_storage.data_ptr());
