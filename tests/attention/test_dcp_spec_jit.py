@@ -41,9 +41,13 @@ def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
     assert fp8_uri == (
         "cake_fmha_dcp_spec_bf16_fp8_sm100a_b256_q3_hq64_hkv8_cp4_split3_retain1"
     )
-    assert get_dcp_spec_fp8_d256_uri("sm100f", 8, 4, 16, 1, 4, 4) == (
-        "cake_fmha_dcp_spec_bf16_fp8_d256_sm100f_b8_q4_hq16_hkv1_cp4_split4_retain0"
-    )
+    for q_len in (3, 4, 5, 6):
+        assert get_dcp_spec_fp8_d256_uri(
+            "sm100f", 8, q_len, 16, 1, 4, 4
+        ) == (
+            "cake_fmha_dcp_spec_bf16_fp8_d256_sm100f_"
+            f"b8_q{q_len}_hq16_hkv1_cp4_split4_retain0"
+        )
 
 
 def test_dcp_jit_selects_the_route_specialized_source_family(monkeypatch) -> None:
@@ -138,7 +142,9 @@ def test_fp8_dcp_spec_uri_supports_q3_but_rejects_other_gaps() -> None:
 
 def test_fp8_d256_uri_rejects_nonproduction_shapes() -> None:
     with pytest.raises(ValueError, match="q_len"):
-        get_dcp_spec_fp8_d256_uri("sm100f", 8, 3, 16, 1, 4, 4)
+        get_dcp_spec_fp8_d256_uri("sm100f", 8, 2, 16, 1, 4, 4)
+    with pytest.raises(ValueError, match="q_len"):
+        get_dcp_spec_fp8_d256_uri("sm100f", 8, 8, 16, 1, 4, 4)
     with pytest.raises(ValueError, match="num_q_heads"):
         get_dcp_spec_fp8_d256_uri("sm100f", 8, 4, 32, 2, 4, 4)
     with pytest.raises(ValueError, match="cp_world"):
@@ -235,6 +241,18 @@ def test_dcp_split_selector_matches_promoted_policy() -> None:
         )
         == 4
     )
+    for sm_count in (148, 152):
+        for q_len in (3, 4, 5, 6):
+            assert (
+                _select_fp8_num_split(
+                    logical_tiles=128 * q_len,
+                    sm_count=sm_count,
+                    local_blocks=64,
+                    cp_world=4,
+                    head_dim=256,
+                )
+                == 1
+            )
     assert (
         _select_fp8_num_split(
             logical_tiles=4,
@@ -397,7 +415,9 @@ def test_fp8_page64_underfill_uses_split3_and_caller_owned_scratch(
     assert args[7].data_ptr() == inputs["completion_buffer"].data_ptr()
 
 
+@pytest.mark.parametrize("q_len", (3, 4, 5, 6))
 def test_fp8_d256_production_route_uses_split8_and_d256_workspace(
+    q_len: int,
     monkeypatch,
 ) -> None:
     dcp = importlib.import_module("flashinfer.cake_dcp")
@@ -415,7 +435,7 @@ def test_fp8_d256_production_route_uses_split8_and_d256_workspace(
 
     inputs = _empty_rank_inputs(
         kv_dtype=torch.float8_e4m3fn,
-        q_len_per_req=4,
+        q_len_per_req=q_len,
         bmm2_scale=0.25,
         head_dim=256,
         num_q_heads=16,
@@ -427,15 +447,15 @@ def test_fp8_d256_production_route_uses_split8_and_d256_workspace(
     inputs["seq_lens"] = torch.full((1,), 8192, dtype=torch.int32)
     inputs["max_local_seq_len"] = 8192
     inputs["workspace_buffer"] = torch.empty(
-        get_dcp_spec_workspace_size_bytes(1, 4, 16, 8, head_dim=256),
+        get_dcp_spec_workspace_size_bytes(1, q_len, 16, 8, head_dim=256),
         dtype=torch.uint8,
     )
     inputs["completion_buffer"] = torch.zeros(
-        get_dcp_spec_counter_bytes(1, 4, 1), dtype=torch.uint8
+        get_dcp_spec_counter_bytes(1, q_len, 1), dtype=torch.uint8
     )
     run_dcp_spec_decode(**inputs)
 
-    assert loader_calls == [("sm100f", 1, 4, 16, 1, 4, 8)]
+    assert loader_calls == [("sm100f", 1, q_len, 16, 1, 4, 8)]
     assert len(launches) == 1
     args = launches[0]
     assert args[3].data_ptr() == inputs["workspace_buffer"].data_ptr()

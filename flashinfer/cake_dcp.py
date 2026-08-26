@@ -47,6 +47,7 @@ _FP8_D256_CP4_MIN_LOCAL_BLOCKS = 64
 _FP8_RETAIN_KV_L2_MAX_BLOCKS = 18
 _BF16_SUPPORTED_Q_LENS = (1, 2, 4, 5, 6, 8)
 _FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
+_FP8_D256_SUPPORTED_Q_LENS = (3, 4, 5, 6)
 _SUPPORTED_CP_WORLDS = (1, 2, 4, 8)
 
 
@@ -344,7 +345,7 @@ def _validate_core_inputs(
         raise ValueError("the FP8/page64 DCP profile requires head_dim=128 or 256")
     if head_dim == _D256_HEAD_DIM:
         profile = "fp8_p64_d256"
-        supported_q_lens = (4,)
+        supported_q_lens = _FP8_D256_SUPPORTED_Q_LENS
     if q_len_per_req not in supported_q_lens:
         raise ValueError(
             f"q_len_per_req must be one of {supported_q_lens} for the {profile} profile"

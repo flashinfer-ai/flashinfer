@@ -3296,7 +3296,7 @@ def trtllm_batch_decode_with_kv_cache(
         head group ratio in ``[1,8]``. BF16 KV uses page size 16 and
         ``q_len_per_req`` in ``{1,2,4,5,6,8}``; FP8 e4m3 KV uses page size 64
         and also supports ``q_len_per_req=3``. The D256 production profile is
-        FP8/page64 with ``q_len_per_req=4``, ``num_qo_heads=16``,
+        FP8/page64 with ``q_len_per_req`` in ``{3,4,5,6}``, ``num_qo_heads=16``,
         ``num_kv_heads=1``, and ``cp_world`` 1 or 4. ``bmm1_scale`` is the
         fused QK scale and ``bmm2_scale`` is the FP8 V/output scale (BF16 KV
         requires ``bmm2_scale=1``). LSE is FP32 base-2, matching the existing

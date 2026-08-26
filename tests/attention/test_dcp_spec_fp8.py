@@ -696,6 +696,114 @@ def test_fp8_page64_d256_ratio16_all_ranks_and_graph_replay() -> None:
     torch.testing.assert_close(merged_lse, dense_lse, atol=0.1, rtol=0.1)
 
 
+@pytest.mark.parametrize("q_len", (3, 4, 5, 6))
+def test_fp8_page64_d256_b128_reviewer_all_ranks_and_graph_replay(
+    q_len: int,
+) -> None:
+    """Validate every reviewed B128/q3-q6 CP4 split1 CUDA Graph route."""
+
+    _require_blackwell_dcp()
+    batch_size = 128
+    num_q_heads, num_kv_heads, head_dim = 16, 1, 256
+    cp_world = 4
+    prefix_len = 32768 - q_len
+    local_len = 8192
+    pages_per_seq = local_len // _PAGE_SIZE
+    query = torch.zeros(
+        (batch_size, q_len, num_q_heads, head_dim),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    k_cache = torch.zeros(
+        (pages_per_seq, num_kv_heads, _PAGE_SIZE, head_dim),
+        dtype=torch.float8_e4m3fn,
+        device="cuda",
+    )
+    v_cache = torch.zeros_like(k_cache)
+    block_tables = torch.arange(
+        pages_per_seq, dtype=torch.int32, device="cuda"
+    ).repeat(batch_size, 1)
+    seq_lens = torch.full(
+        (batch_size,), local_len, dtype=torch.int32, device="cuda"
+    )
+    prefix_lens = torch.full(
+        (batch_size,), prefix_len, dtype=torch.int32, device="cuda"
+    )
+    workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
+
+    partials = []
+    for rank in range(cp_world):
+        out = torch.empty_like(query)
+        lse = torch.empty(
+            (batch_size, q_len, num_q_heads),
+            dtype=torch.float32,
+            device="cuda",
+        )
+        out_ptr = out.data_ptr()
+        lse_ptr = lse.data_ptr()
+
+        def run(
+            rank=rank,
+            out=out,
+            lse=lse,
+        ):
+            return _run_public_rank(
+                query,
+                k_cache,
+                v_cache,
+                block_tables,
+                seq_lens,
+                prefix_lens,
+                workspace,
+                max_local_seq_len=local_len,
+                q_len=q_len,
+                cp_world=cp_world,
+                cp_rank=rank,
+                bmm1_scale=head_dim**-0.5,
+                bmm2_scale=1.0,
+                out=out,
+                lse=lse,
+            )
+
+        expected_rows = torch.tensor(
+            [
+                math.log2(_local_visible_count(prefix_len, row, rank, cp_world))
+                for row in range(q_len)
+            ],
+            dtype=torch.float32,
+            device="cuda",
+        )
+        expected_lse = expected_rows.view(1, q_len, 1).expand_as(lse)
+
+        run()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
+        torch.testing.assert_close(lse, expected_lse, atol=0.1, rtol=0.1)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        out.fill_(float("nan"))
+        lse.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out, torch.zeros_like(out), atol=0, rtol=0)
+        torch.testing.assert_close(lse, expected_lse, atol=0.1, rtol=0.1)
+        assert out.data_ptr() == out_ptr
+        assert lse.data_ptr() == lse_ptr
+        partials.append((out.clone(), lse.clone()))
+
+    merged_o, merged_lse = _merge_partials(partials)
+    dense_rows = torch.tensor(
+        [math.log2(prefix_len + row + 1) for row in range(q_len)],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    expected_dense_lse = dense_rows.view(1, q_len, 1).expand_as(merged_lse)
+    torch.testing.assert_close(merged_o, torch.zeros_like(merged_o), atol=0, rtol=0)
+    torch.testing.assert_close(merged_lse, expected_dense_lse, atol=0.1, rtol=0.1)
+
+
 def test_fp8_page64_d256_initializes_dynamic_smem_on_each_device() -> None:
     _require_blackwell_dcp()
     if torch.cuda.device_count() < 2:

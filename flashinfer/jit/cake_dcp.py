@@ -38,6 +38,7 @@ _DCP_SPEC_NVCC_FLAGS = {
 }
 _SUPPORTED_Q_LENS = (1, 2, 4, 5, 6, 8)
 _FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
+_FP8_D256_SUPPORTED_Q_LENS = (3, 4, 5, 6)
 _FP8_D256_SUPPORTED_SPLITS = (1, 2, 3, 4, 8, 16)
 _SUPPORTED_CP_WORLDS = (1, 2, 4, 8)
 
@@ -200,8 +201,10 @@ def _validate_fp8_d256_specialization(
         raise ValueError(f"unsupported DCP speculative FMHA target: {target}")
     if batch_size <= 0:
         raise ValueError(f"batch_size must be positive, got {batch_size}")
-    if q_len != 4:
-        raise ValueError(f"D256 q_len must be 4, got {q_len}")
+    if q_len not in _FP8_D256_SUPPORTED_Q_LENS:
+        raise ValueError(
+            f"D256 q_len must be one of {_FP8_D256_SUPPORTED_Q_LENS}, got {q_len}"
+        )
     if (num_q_heads, num_kv_heads) != (16, 1):
         raise ValueError(
             "D256 production specialization requires num_q_heads=16 and "
