@@ -626,6 +626,19 @@ def _choose_atom_split(
     return cands[0][2]
 
 
+@functools.cache
+def _atom_offsets(num_atoms: int, atom: int, device: torch.device) -> torch.Tensor:
+    """Per-atom context-length offsets ``[(num_atoms-1)*atom, ..., 0]``.
+
+    Cached because it depends only on the decomposition and the device, while
+    ``_expand_context_lens`` runs on every call. These kernels are only a few
+    microseconds each, so the whole API call is host-launch-bound -- building
+    this tensor per call cost more in dispatch overhead than the paged-MQA
+    kernel itself takes to run.
+    """
+    return torch.arange(num_atoms - 1, -1, -1, device=device, dtype=torch.int32) * atom
+
+
 def _expand_context_lens(
     context_lens: torch.Tensor, num_atoms: int, atom: int
 ) -> torch.Tensor:
@@ -644,13 +657,10 @@ def _expand_context_lens(
     """
     if num_atoms == 1:
         return context_lens
-    off = (
-        torch.arange(
-            num_atoms - 1, -1, -1, device=context_lens.device, dtype=torch.int32
-        )
-        * atom
-    )
-    return (context_lens.unsqueeze(1) - off.unsqueeze(0)).reshape(-1).contiguous()
+    off = _atom_offsets(num_atoms, atom, context_lens.device)
+    # One kernel: the broadcast subtract already produces a contiguous
+    # [batch, num_atoms] result, so reshape is a view and no copy is needed.
+    return (context_lens.unsqueeze(1) - off.unsqueeze(0)).reshape(-1)
 
 
 def _compute_schedule_metadata(
