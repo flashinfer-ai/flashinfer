@@ -81,7 +81,10 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
     int device = 0;
     DSV3_2_CUDA_CHECK(cudaGetDevice(&device));
     DSV3_2_CUDA_CHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
-    if (sm_count <= 0) sm_count = 188;
+    if (sm_count <= 0) {
+      printf("CUDA %s:%d invalid SM count %d\n", __FILE__, __LINE__, sm_count);
+      return false;
+    }
     constexpr int CEIL_WAVES_MAX = 3;
     const int per_token_head = num_tokens * H_BLOCKS;
     chunks_per_block = 1;

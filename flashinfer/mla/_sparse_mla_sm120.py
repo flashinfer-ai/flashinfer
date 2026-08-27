@@ -38,17 +38,23 @@ The user-facing sparse MLA entry points are
 for the DSv3.2 / GLM sparse top-k path. This module keeps only the SM120
 implementation hooks used by those dispatchers and focused kernel
 tests/benchmarks.
+
+Decode kernels are instantiated for a fixed set of ``(num_heads, topk)``
+pairs; ``flashinfer.mla.supported_sparse_mla_sm120_configs`` enumerates them
+so callers can validate a configuration at init time.
 """
 
 from __future__ import annotations
 
 import functools
 import os
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional
 
 import torch
 
+from ..api_logging import flashinfer_api
 from ..autotuner import (
     AutoTuner,
     ConstraintSpec,
@@ -139,6 +145,175 @@ _MODEL_TYPE_GLM_NSA = 2
 _KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32"})
 _BPT_DSV3_2 = 656
 _BPT_DSV4 = 584
+
+# Kernel-family names used in the public config query and error messages.
+_MODEL_TYPE_TO_FAMILY = {
+    _MODEL_TYPE_DSV3_2: "dsv3_2",
+    _MODEL_TYPE_DSV4: "dsv4",
+    _MODEL_TYPE_GLM_NSA: "glm_nsa",
+}
+
+
+@dataclass(frozen=True)
+class SparseMLASm120DecodeConfig:
+    """Instantiated decode-kernel set for one SM120 sparse-MLA kernel family.
+
+    Decode-form calls (``num_tokens <= max_num_tokens``) dispatch to a
+    standalone decode kernel only when their shape matches one of the
+    instantiations described here; there is no prefill fallback for such
+    calls. Larger calls go through the prefill orchestrator, which has its
+    own separately instantiated shape envelope; this config describes
+    decode only.
+
+    Attributes
+    ----------
+    d_qk : int
+        Query/key head dim served by this family (``512`` for DSv4, ``576``
+        for DSv3.2 / GLM-NSA).
+    page_block_size : int
+        The only KV page block size the decode kernels are instantiated for.
+    max_num_tokens : int
+        Largest ``num_tokens`` routed to the decode kernels (inclusive).
+    head_topk_pairs : frozenset[tuple[int, int]]
+        The instantiated ``(num_heads, topk)`` pairs.
+    """
+
+    d_qk: int
+    page_block_size: int
+    max_num_tokens: int
+    head_topk_pairs: frozenset[tuple[int, int]]
+
+    def supported_num_heads(self) -> tuple[int, ...]:
+        """Sorted head counts with at least one instantiated top-k."""
+        return tuple(sorted({h for h, _ in self.head_topk_pairs}))
+
+    def supported_topk(self, num_heads: Optional[int] = None) -> tuple[int, ...]:
+        """Sorted top-k values instantiated for ``num_heads`` (or any head count)."""
+        return tuple(
+            sorted(
+                {
+                    t
+                    for h, t in self.head_topk_pairs
+                    if num_heads is None or h == num_heads
+                }
+            )
+        )
+
+    def supports_decode(
+        self,
+        num_heads: int,
+        topk: int,
+        *,
+        num_tokens: int = 1,
+        page_block_size: Optional[int] = None,
+    ) -> bool:
+        """True iff a decode-form call with this shape reaches a decode kernel."""
+        if page_block_size is None:
+            page_block_size = self.page_block_size
+        return (
+            num_tokens <= self.max_num_tokens
+            and page_block_size == self.page_block_size
+            and (num_heads, topk) in self.head_topk_pairs
+        )
+
+
+@flashinfer_api
+def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig]:
+    """Enumerate the instantiated SM120 sparse-MLA decode kernel configurations.
+
+    Lets callers validate a serving configuration at initialization time
+    instead of discovering an uninstantiated ``(num_heads, topk)`` pair on the
+    first decode-form request.
+
+    Returns
+    -------
+    dict[str, SparseMLASm120DecodeConfig]
+        Mapping from kernel family to its instantiated decode set, keyed by
+        ``"dsv4"`` (``d_qk=512``), ``"dsv3_2"`` (``d_qk=576``, power-of-2
+        FP32 scales), and ``"glm_nsa"`` (``d_qk=576``, arbitrary FP32 scales;
+        shares the DSv3.2 decode instantiations).
+
+    Examples
+    --------
+    >>> import flashinfer
+    >>> configs = flashinfer.mla.supported_sparse_mla_sm120_configs()
+    >>> configs["dsv4"].supports_decode(num_heads=64, topk=256)
+    True
+    """
+    dsv3_2 = SparseMLASm120DecodeConfig(
+        d_qk=576,
+        page_block_size=_DECODE_DSV3_2_PAGE_BLOCK_SIZE,
+        max_num_tokens=_DECODE_MAX_TOKENS,
+        head_topk_pairs=_DECODE_DSV3_2_DISPATCH,
+    )
+    return {
+        "dsv4": SparseMLASm120DecodeConfig(
+            d_qk=512,
+            page_block_size=_DECODE_DSV4_PAGE_BLOCK_SIZE,
+            max_num_tokens=_DECODE_MAX_TOKENS,
+            head_topk_pairs=_DECODE_DSV4_DISPATCH,
+        ),
+        "dsv3_2": dsv3_2,
+        "glm_nsa": dsv3_2,
+    }
+
+
+def _decode_dispatch_error_message(
+    *,
+    num_tokens: int,
+    num_heads: int,
+    topk: int,
+    d_qk: int,
+    page_block_size: int,
+    model_type: int,
+    extra_topk: int,
+) -> str:
+    """Build the decode dispatch-miss error, naming the mismatched parameter."""
+    family = _MODEL_TYPE_TO_FAMILY[model_type]
+    config = supported_sparse_mla_sm120_configs()[family]
+    reasons = []
+    if d_qk != config.d_qk:
+        reasons.append(
+            f"d_qk={d_qk} does not match the {family} decode family "
+            f"(requires d_qk={config.d_qk})"
+        )
+    if page_block_size != config.page_block_size:
+        reasons.append(
+            f"page_block_size={page_block_size} is unsupported; decode kernels "
+            f"are instantiated only for page_block_size={config.page_block_size}"
+        )
+    if (num_heads, topk) not in config.head_topk_pairs:
+        heads = config.supported_num_heads()
+        if num_heads in heads:
+            reasons.append(
+                f"topk={topk} is not instantiated for num_heads={num_heads}; "
+                f"available topk: {list(config.supported_topk(num_heads))}"
+            )
+        elif topk in config.supported_topk():
+            reasons.append(
+                f"num_heads={num_heads} is not instantiated for topk={topk}; "
+                f"available num_heads: {list(heads)}"
+            )
+        else:
+            reasons.append(
+                f"neither num_heads={num_heads} nor topk={topk} is instantiated; "
+                f"available num_heads: {list(heads)}; "
+                f"available topk: {list(config.supported_topk())}"
+            )
+    # The dispatch branches guarantee at least one reason; the fallback only
+    # guards future drift between them and this diagnosis.
+    detail = "; ".join(reasons) or "no matching decode instantiation"
+    return (
+        "SM120 sparse-MLA has no decode kernel for this shape: "
+        f"num_tokens={num_tokens}, num_heads={num_heads}, topk={topk}, "
+        f"d_qk={d_qk}, page_block_size={page_block_size}, "
+        f"model_type={family}, extra_topk={extra_topk}. "
+        f"Mismatch: {detail}. "
+        f"The prefill orchestrator only serves num_tokens > {_DECODE_MAX_TOKENS}, "
+        "so a decode-form call must match a decode instantiation exactly. "
+        "Query supported shapes at init time with "
+        "flashinfer.mla.supported_sparse_mla_sm120_configs()."
+    )
 
 
 def _require_d_v_512(d_v: int) -> None:
@@ -396,11 +571,15 @@ def get_sparse_mla_sm120_module():
         # the process in the kernel.
         if num_tokens <= _DECODE_MAX_TOKENS:
             raise ValueError(
-                "SM120 sparse-MLA has no decode kernel for this shape: "
-                f"num_tokens={num_tokens}, num_heads={num_heads}, topk={topk}, "
-                f"d_qk={d_qk}, page_block_size={kv_pbs}, model_type={model_type}, "
-                f"extra_topk={extra_topk}. Supported decode shapes are enumerated "
-                "in _DECODE_DSV4_DISPATCH and _DECODE_DSV3_2_DISPATCH."
+                _decode_dispatch_error_message(
+                    num_tokens=num_tokens,
+                    num_heads=num_heads,
+                    topk=topk,
+                    d_qk=d_qk,
+                    page_block_size=kv_pbs,
+                    model_type=model_type,
+                    extra_topk=extra_topk,
+                )
             )
 
         module.sparse_mla_sm120_paged_attention(

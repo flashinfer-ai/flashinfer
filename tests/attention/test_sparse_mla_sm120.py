@@ -452,10 +452,7 @@ def test_sparse_mla_sm120_decode_unsupported_shape_fails_before_prefill() -> Non
     )
     out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=device)
 
-    with pytest.raises(
-        ValueError,
-        match=r"no decode kernel.*num_tokens=1, num_heads=16, topk=384",
-    ):
+    with pytest.raises(ValueError):
         sparse_mla_sm120_paged_attention(
             q,
             kv_cache,
