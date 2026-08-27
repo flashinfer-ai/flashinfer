@@ -758,6 +758,7 @@ class _FakePreparedTensor:
         self.device = device
         self.ndim = len(shape)
         self.contiguous = contiguous
+        self.recorded_streams = []
 
     def data_ptr(self):
         return self.pointer
@@ -772,6 +773,9 @@ class _FakePreparedTensor:
 
     def is_contiguous(self):
         return self.contiguous
+
+    def record_stream(self, stream):
+        self.recorded_streams.append(stream)
 
     def __getitem__(self, index):
         if isinstance(index, int):
@@ -803,6 +807,18 @@ def _fake_prepared_packed_qkv(
     module = SimpleNamespace(name="bound-module")
     state = backend._LaunchState(flags=object(), flag_peers=object())
 
+    class FakeEvent:
+        cuda_event = 29
+
+        def __init__(self):
+            self.recorded_streams = []
+
+        def record(self, stream):
+            self.recorded_streams.append(stream)
+
+    class FakeStream:
+        cuda_stream = 23
+
     class FakeScratchHandle:
         rank = 2
         world_size = handle_world_size
@@ -825,7 +841,8 @@ def _fake_prepared_packed_qkv(
     workspace = backend._Workspace(
         scratch=scratch,
         scratch_handle=scratch_handle,
-        comm_stream=object(),
+        comm_stream=FakeStream(),
+        bridge_event=FakeEvent(),
     )
     state_key = (3, id(group), "tp-group")
     workspace_key = (
@@ -863,7 +880,12 @@ def _fake_prepared_packed_qkv(
         "current_stream",
         lambda device_index: SimpleNamespace(cuda_stream=17),
     )
-    descriptor = object()
+    descriptor = _FakePreparedTensor(
+        6001,
+        (backend._DESCRIPTOR_COUNT * backend._TENSOR_MAP_BYTES,),
+        torch.uint8,
+        device,
+    )
     monkeypatch.setattr(
         backend,
         "_prepared_descriptor_storage",
@@ -913,6 +935,8 @@ def test_prepare_packed_qkv_binds_host_identity_once(monkeypatch):
     assert launcher.chunk_plan == ((0, 128),)
     assert launcher.signal_pad.shape == (4, 1)
     assert len(launcher.peer_routes) == 3
+    assert launcher.peer_scratch_ptrs.tolist() == [5004, 5001, 5002]
+    assert launcher.peer_signal_ptrs.tolist() == [4004, 4001, 4002]
     assert [call[:2] for call in workspace.scratch_handle.calls] == [
         ("signal", 2),
         ("remote", 3),
@@ -931,6 +955,55 @@ def test_prepare_packed_qkv_binds_host_identity_once(monkeypatch):
     assert "_prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4" not in backend.__all__
     with pytest.raises(AttributeError):
         launcher.peer_routes = ()
+
+
+def test_prepared_packed_qkv_hot_path_uses_one_native_submission(monkeypatch):
+    backend = _backend()
+    launcher, inp, weight, _, state, workspace, module, _ = (
+        _fake_prepared_packed_qkv(monkeypatch, backend)
+    )
+    output = _FakePreparedTensor(
+        7001,
+        (launcher.world_size * launcher.rows, 2560),
+        torch.bfloat16,
+        launcher.device,
+    )
+    monkeypatch.setattr(backend.torch, "empty", lambda *args, **kwargs: output)
+    submissions = []
+    module.run_prepared_packed_qkv = lambda *args: submissions.append(args)
+
+    class TailEvent:
+        def __init__(self, **kwargs):
+            self.recorded_streams = []
+
+        def record(self, stream):
+            self.recorded_streams.append(stream)
+
+    monkeypatch.setattr(backend.torch.cuda, "Event", TailEvent)
+
+    result = launcher(inp)
+
+    assert result is output
+    assert len(submissions) == 1
+    submission = submissions[0]
+    assert submission[0] is inp
+    assert submission[1] is workspace.scratch
+    assert submission[2] is weight
+    assert submission[3] is output
+    descriptor = submission[4]
+    assert descriptor.data_ptr() == 6001
+    assert submission[5] is launcher.signal_pad
+    assert submission[6] is state.flag_peers
+    assert submission[7] is launcher.peer_scratch_ptrs
+    assert submission[8] is launcher.peer_signal_ptrs
+    assert submission[9:] == (4, 2, 128, 0, 17, 23, 29)
+    assert state.next_phase == 1
+    assert state.tail_stream == 17
+    assert state.tail_event.recorded_streams
+    main_stream = descriptor.recorded_streams[0]
+    assert inp.recorded_streams == [main_stream, workspace.comm_stream]
+    assert weight.recorded_streams == [main_stream]
+    assert descriptor.recorded_streams == [main_stream]
 
 
 @pytest.mark.parametrize(

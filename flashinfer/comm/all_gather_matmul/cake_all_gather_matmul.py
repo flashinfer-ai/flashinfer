@@ -404,6 +404,126 @@ void RunMain(TensorView inp, TensorView scratch, TensorView weight,
                     kMainSmemBytes));
 }
 
+void RunPreparedPackedQkv(
+    TensorView inp, TensorView scratch, TensorView weight, TensorView out,
+    TensorView descriptor_storage, TensorView ready, TensorView flag_peers,
+    TensorView peer_scratch_ptrs, TensorView peer_signal_ptrs,
+    int64_t world_size, int64_t rank, int64_t rows, int64_t phase,
+    int64_t main_cuda_stream, int64_t comm_cuda_stream,
+    int64_t bridge_cuda_event) {
+  CheckCommonInputs(inp, scratch, weight, out, world_size, rows);
+  CheckCudaTensor(descriptor_storage, "descriptor_storage");
+  CheckCudaTensor(ready, "ready");
+  CheckSameDevice(descriptor_storage, inp, "descriptor_storage");
+  CheckSameDevice(ready, inp, "ready");
+  CheckContiguous(descriptor_storage, "descriptor_storage");
+  CheckContiguous(ready, "ready");
+  TVM_FFI_CHECK(descriptor_storage.numel() >=
+                    kDescriptorCount * kTensorMapBytes,
+                ValueError)
+      << "descriptor_storage is too small";
+  const DLDataType ready_dtype = ready.dtype();
+  TVM_FFI_CHECK(ready_dtype.code == kDLUInt && ready_dtype.bits == 32 &&
+                    ready_dtype.lanes == 1,
+                TypeError)
+      << "ready must have uint32 dtype";
+  TVM_FFI_CHECK(world_size == 4, ValueError)
+      << "prepared packed-QKV launch requires world_size=4";
+  TVM_FFI_CHECK(weight.size(1) == 2560, ValueError)
+      << "prepared packed-QKV launch requires N=2560";
+  const DLDataType dtype = inp.dtype();
+  TVM_FFI_CHECK(dtype.code == kDLBfloat && dtype.bits == 16 &&
+                    dtype.lanes == 1,
+                TypeError)
+      << "prepared packed-QKV launch requires bfloat16";
+  for (const auto* tensor : {&peer_scratch_ptrs, &peer_signal_ptrs}) {
+    CheckCpuTensor(*tensor, "prepared peer pointer array");
+    CheckContiguous(*tensor, "prepared peer pointer array");
+    const DLDataType pointer_dtype = tensor->dtype();
+    TVM_FFI_CHECK(pointer_dtype.code == kDLInt && pointer_dtype.bits == 64 &&
+                      pointer_dtype.lanes == 1,
+                  TypeError)
+        << "prepared peer pointer arrays must have int64 dtype";
+    TVM_FFI_CHECK(tensor->ndim() == 1 &&
+                      tensor->numel() == world_size - 1,
+                  ValueError)
+        << "prepared peer pointer arrays must contain world_size-1 pointers";
+  }
+  TVM_FFI_CHECK(main_cuda_stream != 0 && comm_cuda_stream != 0 &&
+                    bridge_cuda_event != 0,
+                ValueError)
+      << "prepared packed-QKV CUDA handles must be nonzero";
+
+  CUstream main_stream = reinterpret_cast<CUstream>(
+      static_cast<uintptr_t>(main_cuda_stream));
+  CUstream comm_stream = reinterpret_cast<CUstream>(
+      static_cast<uintptr_t>(comm_cuda_stream));
+  CUevent bridge_event = reinterpret_cast<CUevent>(
+      static_cast<uintptr_t>(bridge_cuda_event));
+
+  RunBarrier(flag_peers, world_size, rank, phase, main_cuda_stream);
+  TVM_FFI_CHECK(cuEventRecord(bridge_event, main_stream) == CUDA_SUCCESS,
+                RuntimeError)
+      << "recording the prepared main-to-comm event failed";
+  TVM_FFI_CHECK(cuStreamWaitEvent(comm_stream, bridge_event, 0) == CUDA_SUCCESS,
+                RuntimeError)
+      << "waiting for the prepared barrier on the comm stream failed";
+
+  const auto* scratch_ptrs =
+      static_cast<const int64_t*>(peer_scratch_ptrs.data_ptr());
+  const auto* signal_ptrs =
+      static_cast<const int64_t*>(peer_signal_ptrs.data_ptr());
+  const int64_t chunk_rows = rows < 2432 ? rows : 2432;
+  const int64_t num_chunks = (rows + chunk_rows - 1) / chunk_rows;
+  const size_t row_bytes = 8192 * sizeof(uint16_t);
+  const CUdeviceptr input_base = static_cast<CUdeviceptr>(
+      reinterpret_cast<uintptr_t>(inp.data_ptr()));
+  for (int64_t peer_index = 0; peer_index < world_size - 1; ++peer_index) {
+    const CUdeviceptr peer_scratch_base =
+        static_cast<CUdeviceptr>(scratch_ptrs[peer_index]);
+    const CUdeviceptr peer_signal_base =
+        static_cast<CUdeviceptr>(signal_ptrs[peer_index]);
+    TVM_FFI_CHECK(peer_scratch_base != 0 && peer_signal_base != 0, ValueError)
+        << "prepared peer pointers must be nonzero";
+    for (int64_t chunk = 0; chunk < num_chunks; ++chunk) {
+      const int64_t begin = chunk * chunk_rows;
+      const int64_t end = (begin + chunk_rows) < rows
+                              ? (begin + chunk_rows)
+                              : rows;
+      const size_t offset = static_cast<size_t>(begin) * row_bytes;
+      const size_t bytes = static_cast<size_t>(end - begin) * row_bytes;
+      TVM_FFI_CHECK(cuMemcpyDtoDAsync(peer_scratch_base + offset,
+                                     input_base + offset, bytes,
+                                     comm_stream) == CUDA_SUCCESS,
+                    RuntimeError)
+          << "prepared peer copy submission failed";
+      TVM_FFI_CHECK(
+          cuStreamWriteValue32(
+              comm_stream,
+              peer_signal_base + static_cast<size_t>(chunk) * sizeof(uint32_t),
+              1, CU_STREAM_WRITE_VALUE_DEFAULT) == CUDA_SUCCESS,
+          RuntimeError)
+          << "prepared peer signal submission failed";
+    }
+  }
+
+  RunMain(inp, scratch, weight, out, descriptor_storage, ready, world_size,
+          rank, rows, 0, main_cuda_stream);
+  TVM_FFI_CHECK(
+      cuMemsetD32Async(
+          static_cast<CUdeviceptr>(
+              reinterpret_cast<uintptr_t>(ready.data_ptr())),
+          0, ready.numel(), main_stream) == CUDA_SUCCESS,
+      RuntimeError)
+      << "prepared signal reset submission failed";
+  TVM_FFI_CHECK(cuEventRecord(bridge_event, comm_stream) == CUDA_SUCCESS,
+                RuntimeError)
+      << "recording the prepared comm-to-main event failed";
+  TVM_FFI_CHECK(cuStreamWaitEvent(main_stream, bridge_event, 0) == CUDA_SUCCESS,
+                RuntimeError)
+      << "waiting for prepared peer copies on the main stream failed";
+}
+
 }  // namespace flashinfer_cake_all_gather_matmul
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
@@ -413,6 +533,9 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     run_barrier, flashinfer_cake_all_gather_matmul::RunBarrier);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(
     run_main, flashinfer_cake_all_gather_matmul::RunMain);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(
+    run_prepared_packed_qkv,
+    flashinfer_cake_all_gather_matmul::RunPreparedPackedQkv);
 """
 
 
@@ -615,6 +738,7 @@ class _Workspace:
     scratch: torch.Tensor
     scratch_handle: Any
     comm_stream: torch.cuda.Stream
+    bridge_event: torch.cuda.Event
     descriptor_cache: OrderedDict[tuple[Any, ...], torch.Tensor] = field(
         default_factory=OrderedDict, repr=False
     )
@@ -735,10 +859,14 @@ def _workspace(
         return workspace
     scratch = symm_mem.empty(world_size, rows, _K, dtype=dtype, device=device_index)
     scratch_handle = symm_mem.rendezvous(scratch, group=group_name)
+    comm_stream = torch.cuda.Stream(device=device_index)
+    bridge_event = torch.cuda.Event(enable_timing=False)
+    bridge_event.record(torch.cuda.current_stream(device_index))
     workspace = _Workspace(
         scratch=scratch,
         scratch_handle=scratch_handle,
-        comm_stream=torch.cuda.Stream(device=device_index),
+        comm_stream=comm_stream,
+        bridge_event=bridge_event,
     )
     _WORKSPACES[key] = workspace
     return workspace
@@ -895,6 +1023,8 @@ class _PreparedPackedQkvSm103Tp4Launcher:
     chunk_plan: tuple[tuple[int, int], ...]
     signal_pad: torch.Tensor = field(repr=False)
     peer_routes: tuple[tuple[torch.Tensor, torch.Tensor], ...] = field(repr=False)
+    peer_scratch_ptrs: torch.Tensor = field(repr=False)
+    peer_signal_ptrs: torch.Tensor = field(repr=False)
     verbose: bool = False
 
     def _validate_hot_input(self, inp: torch.Tensor) -> None:
@@ -953,39 +1083,24 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                     main_stream.wait_event(state.tail_event)
 
                 phase = state.next_phase
-                self.module.run_barrier(
-                    state.flag_peers,
-                    self.world_size,
-                    self.rank,
-                    phase,
-                    main_stream_id,
-                )
-                workspace.comm_stream.wait_stream(main_stream)
-                with torch.cuda.stream(workspace.comm_stream):
-                    for peer_scratch, peer_signal_row in self.peer_routes:
-                        for chunk_idx, (begin, end) in enumerate(self.chunk_plan):
-                            peer_scratch[begin:end].copy_(
-                                inp[begin:end], non_blocking=True
-                            )
-                            torch.ops.symm_mem.stream_write_value32_(
-                                peer_signal_row, chunk_idx, 1
-                            )
-
-                self.module.run_main(
+                self.module.run_prepared_packed_qkv(
                     inp,
                     workspace.scratch,
                     w,
                     output,
                     descriptors,
                     self.signal_pad,
+                    state.flag_peers,
+                    self.peer_scratch_ptrs,
+                    self.peer_signal_ptrs,
                     self.world_size,
                     self.rank,
                     self.rows,
-                    0,
+                    phase,
                     main_stream_id,
+                    int(workspace.comm_stream.cuda_stream),
+                    int(workspace.bridge_event.cuda_event),
                 )
-                self.signal_pad.zero_()
-                main_stream.wait_stream(workspace.comm_stream)
                 if state.tail_event is None:
                     state.tail_event = torch.cuda.Event(enable_timing=False)
                 state.tail_event.record(main_stream)
@@ -1128,6 +1243,16 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
                     device=device,
                 )
                 peer_routes.append((peer_scratch, peer_signal_row))
+            peer_scratch_ptrs = torch.tensor(
+                [int(peer_scratch.data_ptr()) for peer_scratch, _ in peer_routes],
+                dtype=torch.int64,
+                device="cpu",
+            )
+            peer_signal_ptrs = torch.tensor(
+                [int(peer_signal.data_ptr()) for _, peer_signal in peer_routes],
+                dtype=torch.int64,
+                device="cpu",
+            )
             launcher = _PreparedPackedQkvSm103Tp4Launcher(
                 group=group,
                 group_id=id(group),
@@ -1150,6 +1275,8 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
                 chunk_plan=chunk_plan,
                 signal_pad=signal_pad,
                 peer_routes=tuple(peer_routes),
+                peer_scratch_ptrs=peer_scratch_ptrs,
+                peer_signal_ptrs=peer_signal_ptrs,
                 verbose=verbose,
             )
             _prepared_descriptor_storage(
