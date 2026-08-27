@@ -236,8 +236,7 @@ void RunTrainingForward(
     TensorView dummy_i32, int64_t boundary_count, int64_t total_work_items, int64_t total_tokens,
     int64_t num_sequences, int64_t num_qk_heads, int64_t num_v_heads, int64_t total_chunks,
     int64_t beta_active_stride, int64_t uniform_work_items, int64_t final_grid_ctas,
-    int64_t prepare_final_descriptors, double scale, double lower_bound, int64_t aligned_c16,
-    int64_t cuda_stream) {
+    int64_t prepare_final_descriptors, double scale, double lower_bound, int64_t cuda_stream) {
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
@@ -248,7 +247,10 @@ void RunTrainingForward(
   TVM_FFI_ICHECK(boundary_count >= 0 && beta_active_stride >= num_v_heads);
   TVM_FFI_ICHECK(uniform_work_items == 0 || uniform_work_items == 1);
   TVM_FFI_ICHECK(prepare_final_descriptors == 0 || prepare_final_descriptors == 1);
-  TVM_FFI_ICHECK(aligned_c16 == 0 || aligned_c16 == 1);
+  TVM_FFI_ICHECK(total_chunks <= std::numeric_limits<int64_t>::max() / kChunk);
+  const int64_t tiled_tokens = total_chunks * kChunk;
+  TVM_FFI_ICHECK(tiled_tokens >= total_tokens);
+  const bool has_partial_tail = tiled_tokens != total_tokens;
 
   for (const auto& named : std::initializer_list<std::pair<TensorView*, const char*>>{
            {&q, "q"},
@@ -335,7 +337,7 @@ void RunTrainingForward(
   const CUtensorMap checkpoint_map =
       EncodeCheckpointMap(state_checkpoints, total_chunks, num_v_heads);
   const dim3 grid(std::min<int64_t>(total_work_items, ResidentCtas(device_id)), 1, 1);
-  if (aligned_c16 != 0) {
+  if (!has_partial_tail) {
     ConfigureDynamicSmem(kernel_cake_flashkda_forward_checkpoint_c16_aligned,
                          kForwardSmemBytes, device_id,
                          "cudaFuncSetAttribute(aligned training forward)");
@@ -388,18 +390,21 @@ void RunTrainingBackward(TensorView q, TensorView k, TensorView v, TensorView g,
                          TensorView dq, TensorView dk, int64_t total_work_items,
                          int64_t total_tokens, int64_t num_sequences, int64_t num_qk_heads,
                          int64_t num_v_heads, int64_t total_chunks, int64_t beta_active_stride,
-                         int64_t uniform_work_items, int64_t aligned_c16, int64_t grouped, double scale,
+                         int64_t uniform_work_items, int64_t grouped, double scale,
                          double lower_bound, int64_t cuda_stream) {
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
   CheckFlashKDATarget(device_id);
   TVM_FFI_ICHECK(grouped == 0 || grouped == 1);
-  TVM_FFI_ICHECK(aligned_c16 == 0 || aligned_c16 == 1);
   TVM_FFI_ICHECK(grouped == int64_t(num_qk_heads != num_v_heads));
   TVM_FFI_ICHECK(total_work_items > 0 && total_tokens > 0 && num_sequences > 0 &&
                  num_qk_heads > 0 && num_v_heads >= num_qk_heads &&
                  num_v_heads % num_qk_heads == 0 && total_chunks > 0);
+  TVM_FFI_ICHECK(total_chunks <= std::numeric_limits<int64_t>::max() / kChunk);
+  const int64_t tiled_tokens = total_chunks * kChunk;
+  TVM_FFI_ICHECK(tiled_tokens >= total_tokens);
+  const bool has_partial_tail = tiled_tokens != total_tokens;
 
   for (const auto& named : std::initializer_list<std::pair<TensorView*, const char*>>{
            {&q, "q"},
@@ -554,7 +559,7 @@ void RunTrainingBackward(TensorView q, TensorView k, TensorView v, TensorView g,
       &scale_arg,
       &lower_bound_arg,
   };
-  if (aligned_c16 != 0) {
+  if (!has_partial_tail) {
     void* aligned_kernel_args[] = {
         &dynamic_counter,
         &q_map,
@@ -619,7 +624,7 @@ void RunTrainingBackward(TensorView q, TensorView k, TensorView v, TensorView g,
               "partial training backward launch");
   }
 
-  if (aligned_c16 != 0) {
+  if (!has_partial_tail) {
     ConfigureDynamicSmem(kernel_cake_flashkda_backward_param_reduce_c16_aligned,
                          kReduceSmemBytes, device_id,
                          "cudaFuncSetAttribute(aligned training parameter reduction)");
