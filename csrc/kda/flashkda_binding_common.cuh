@@ -717,9 +717,10 @@ struct TensorMapWords {
 };
 
 static __global__ void PublishTensorMaps(uint64_t* destination, TensorMapWords source) {
-  const uint32_t index = threadIdx.x;
-  if (index < TensorMapWords::kWordCount) {
-    destination[index] = source.words[index];
+  if (threadIdx.x == 0) {
+    for (uint32_t index = 0; index < TensorMapWords::kWordCount; ++index) {
+      destination[index] = source.words[index];
+    }
     asm volatile("fence.proxy.tensormap::generic.release.gpu;" ::: "memory");
   }
 }
@@ -749,7 +750,7 @@ inline TmaPointers EncodeTmaPointers(const TensorView& q, const TensorView& k, c
     static_assert(sizeof(host_maps) == kDescriptorStorageBytes);
     TensorMapWords words{};
     std::memcpy(words.words, host_maps.data(), sizeof(host_maps));
-    PublishTensorMaps<<<1, 128, 0, stream>>>(
+    PublishTensorMaps<<<1, 1, 0, stream>>>(
         reinterpret_cast<uint64_t*>(descriptor_storage.data_ptr()), words);
     CheckCuda(cudaGetLastError(), "PublishTensorMaps launch");
   }
