@@ -85,6 +85,13 @@ from .quantization.fp8_quantization import (
     mxfp8_grouped_quantize,
     mxfp8_quantize,
 )
+from .attn_scores import padded_context_len as padded_context_len
+from .attn_scores import (
+    compute_paged_mqa_logits_schedule as compute_paged_mqa_logits_schedule,
+)
+from .attn_scores import fp4_paged_mqa_logits as fp4_paged_mqa_logits
+from .attn_scores import fp8_paged_mqa_logits as fp8_paged_mqa_logits
+from .attn_scores import precompile_paged_mqa_logits as precompile_paged_mqa_logits
 from .fused_moe import (
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
@@ -103,10 +110,25 @@ with contextlib.suppress(ImportError):
     from .fused_moe import (
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper as CuteDslMoEWrapper,
+        cute_dsl_fused_moe_mxfp8_mxfp4 as cute_dsl_fused_moe_mxfp8_mxfp4,
+        CuteDslMxfp8Mxfp4MoEWrapper as CuteDslMxfp8Mxfp4MoEWrapper,
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+# The fused GDN decode step is surfaced here like the other GDN APIs; the
+# code lives under flashinfer/gdn_kernels/experimental/ (see its README),
+# but "experimental" describes the file location, not the import path.
+# Unconditional on purpose: the module imports torch and nothing else, and a
+# consumer's capability check is `getattr(flashinfer, "gdn_fused_decode_step",
+# None)` — it must be present whenever the library is new enough, and absent
+# on an older one, with no third "present but broken" state.  Everything
+# heavy (the registry, the kernels, the JIT and CuTe-DSL dependencies) is
+# imported lazily on the first probe or call.
+from .gdn_kernels.experimental import (
+    gdn_fused_decode_step as gdn_fused_decode_step,
+    gdn_fused_decode_step_supported as gdn_fused_decode_step_supported,
+)
 from .gemm import SegmentGEMMWrapper as SegmentGEMMWrapper
 from .gemm import bmm_bf16 as bmm_bf16
 from .gemm import bmm_fp8 as bmm_fp8
@@ -125,16 +147,34 @@ from .grouped_mm import grouped_mm_bf16 as grouped_mm_bf16
 from .grouped_mm import grouped_mm_fp8 as grouped_mm_fp8
 from .grouped_mm import grouped_mm_mxfp8 as grouped_mm_mxfp8
 from .grouped_mm import grouped_mm_fp4 as grouped_mm_fp4
+from .kda_backward import (
+    RecurrentKDABackwardWorkspace as RecurrentKDABackwardWorkspace,
+)
+from .kda_backward import recurrent_kda_backward as recurrent_kda_backward
+from .kda_training import (
+    RecurrentKDATrainingContext as RecurrentKDATrainingContext,
+)
+from .kda_training import (
+    recurrent_kda_training_backward as recurrent_kda_training_backward,
+)
+from .kda_training import (
+    recurrent_kda_training_forward as recurrent_kda_training_forward,
+)
 from .kda_prefill import (
     RecurrentKDAPrefillWorkspace as RecurrentKDAPrefillWorkspace,
 )
+from .kda import RecurrentKDAPrefillWrapper as RecurrentKDAPrefillWrapper
 from .kda import recurrent_kda as recurrent_kda
 from .kda_decode import fused_kda_decode as fused_kda_decode
+from .kda_decode import packed_kda_decode as packed_kda_decode
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
 from . import msa_ops as msa_ops
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
+from .norm import (
+    fused_add_rmsnorm_fp8_block_quant as fused_add_rmsnorm_fp8_block_quant,
+)
 from .norm import layernorm as layernorm
 from .norm import layernorm_quant as layernorm_quant
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm

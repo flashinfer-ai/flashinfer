@@ -81,6 +81,67 @@ def test_trace_default_check():
     assert standard_check([ref], [actual])
 
 
+def test_nvfp4_attention_sm120_trace_output_dtype_precedence():
+    batch, num_qo_heads, num_kv_heads = 1, 8, 2
+    seq_len_q, seq_len_k, head_dim = 256, 384, 128
+    kwargs = {
+        "q_fp4": torch.empty(
+            batch, num_qo_heads, seq_len_q, head_dim // 2, dtype=torch.uint8
+        ),
+        "k_fp4": torch.empty(
+            batch, num_kv_heads, seq_len_k, head_dim // 2, dtype=torch.uint8
+        ),
+        "v_fp4_t": torch.empty(
+            batch, num_kv_heads, head_dim, seq_len_k // 2, dtype=torch.uint8
+        ),
+        "q_scale": torch.empty(
+            batch,
+            num_qo_heads,
+            seq_len_q,
+            head_dim // 16,
+            dtype=torch.float8_e4m3fn,
+        ),
+        "k_scale": torch.empty(
+            batch,
+            num_kv_heads,
+            seq_len_k,
+            head_dim // 16,
+            dtype=torch.float8_e4m3fn,
+        ),
+        "v_scale_t": torch.empty(
+            batch,
+            num_kv_heads,
+            head_dim,
+            seq_len_k // 16,
+            dtype=torch.float8_e4m3fn,
+        ),
+        "qk_correction": torch.empty(
+            batch,
+            num_qo_heads,
+            seq_len_q // 128,
+            seq_len_k,
+            dtype=torch.float32,
+        ),
+        "sm_scale": head_dim**-0.5,
+        "causal": False,
+        "per_block_mean": True,
+    }
+
+    default_defn = flashinfer.nvfp4_attention_sm120_fwd.fi_trace(**kwargs)
+    assert default_defn["outputs"]["out"]["dtype"] == "bfloat16"
+
+    dtype_defn = flashinfer.nvfp4_attention_sm120_fwd.fi_trace(
+        **kwargs, out_dtype=torch.float16
+    )
+    assert dtype_defn["outputs"]["out"]["dtype"] == "float16"
+
+    out = torch.empty(batch, num_qo_heads, seq_len_q, head_dim, dtype=torch.bfloat16)
+    out_defn = flashinfer.nvfp4_attention_sm120_fwd.fi_trace(
+        **kwargs, out=out, out_dtype=torch.float16
+    )
+    assert out_defn["outputs"]["out"]["dtype"] == "bfloat16"
+
+
 def test_all_registered_trace_templates_have_check():
     from flashinfer.api_logging import _TRACE_REGISTRY
 
@@ -212,6 +273,134 @@ def test_recurrent_kda_fi_trace():
     ]
     assert defn["inputs"]["initial_state_indices"]["shape"] == ["num_sequences"]
     assert defn["axes"]["head_dim"]["value"] == head_dim
+
+
+def test_ssd_combined_trace_dispatch_exposes_exact_finite_matrix():
+    from flashinfer.trace.templates.mamba import ssd_combined_trace_dispatch
+
+    templates = ssd_combined_trace_dispatch.templates
+    assert len(templates) == 12
+    assert len({id(template) for template in templates}) == 12
+    assert {template.name_prefix for template in templates} == {
+        f"ssd_combined_{mode}_d_{d_layout}_{final_suffix}"
+        for mode in ("batched", "varlen")
+        for d_layout in ("none", "vector", "matrix")
+        for final_suffix in ("no_final", "final")
+    }
+
+
+@pytest.mark.parametrize(
+    ("mode", "d_layout", "return_final_states"),
+    [
+        (mode, d_layout, return_final_states)
+        for mode in ("batched", "varlen")
+        for d_layout in ("none", "vector", "matrix")
+        for return_final_states in (False, True)
+    ],
+)
+def test_ssd_combined_fi_trace_exact_variants_are_json_finite(
+    mode,
+    d_layout,
+    return_final_states,
+):
+    module = __import__(
+        "flashinfer.mamba.ssd_combined",
+        fromlist=["ssd_combined_fwd"],
+    )
+    batch_size, seqlen, nheads, headdim, ngroups, dstate = 2, 128, 8, 64, 8, 128
+    kwargs = {
+        "x": torch.empty(batch_size, seqlen, nheads, headdim, dtype=torch.bfloat16),
+        "dt": torch.empty(batch_size, seqlen, nheads, dtype=torch.float32),
+        "A": torch.empty(nheads, dtype=torch.float32),
+        "B": torch.empty(batch_size, seqlen, ngroups, dstate, dtype=torch.bfloat16),
+        "C": torch.empty(batch_size, seqlen, ngroups, dstate, dtype=torch.bfloat16),
+        "dt_limit": (0.0, float("inf")),
+        "return_final_states": return_final_states,
+    }
+    if d_layout == "vector":
+        kwargs["D"] = torch.empty(nheads, dtype=torch.bfloat16)
+    elif d_layout == "matrix":
+        kwargs["D"] = torch.empty(nheads, headdim, dtype=torch.bfloat16)
+
+    expected_state_dtype = "bfloat16"
+    if mode == "varlen":
+        num_sequences, num_logical_chunks = 3, 4
+        kwargs.update(
+            initial_states=torch.empty(
+                num_sequences,
+                nheads,
+                headdim,
+                dstate,
+                dtype=torch.float16,
+            ),
+            seq_idx=torch.empty(batch_size, seqlen, dtype=torch.int32),
+            chunk_indices=torch.empty(num_logical_chunks, dtype=torch.int32),
+            chunk_offsets=torch.empty(num_logical_chunks, dtype=torch.int32),
+            seq_chunk_cumsum=torch.empty(num_sequences + 1, dtype=torch.int32),
+        )
+        expected_state_dtype = "float16"
+    elif d_layout == "matrix" and return_final_states:
+        kwargs.update(
+            checkpoint_token_indices=torch.empty(batch_size, dtype=torch.int32),
+            checkpoint_state_slots=torch.empty(batch_size, dtype=torch.int32),
+            checkpoint_states=torch.empty(
+                2, nheads, headdim, dstate, dtype=torch.float16
+            ),
+        )
+        expected_state_dtype = "float16"
+
+    definition = module.ssd_combined_fwd.fi_trace(**kwargs)
+
+    final_suffix = "final" if return_final_states else "no_final"
+    assert definition["name"].startswith(
+        f"ssd_combined_{mode}_d_{d_layout}_{final_suffix}_"
+    )
+    assert ("D" in definition["inputs"]) == (d_layout != "none")
+    assert ("seq_idx" in definition["inputs"]) == (mode == "varlen")
+    assert definition["inputs"]["out"]["optional"] is True
+    assert "param" not in definition["outputs"]["out"]
+    assert definition["outputs"]["checkpoint_states"]["optional"] is True
+    assert definition["outputs"]["checkpoint_states"]["param"] == "checkpoint_states"
+    assert ("seq_chunk_cumsum" in definition["outputs"]) == (mode == "varlen")
+    if mode == "varlen":
+        assert definition["outputs"]["seq_chunk_cumsum"]["optional"] is True
+        assert definition["outputs"]["seq_chunk_cumsum"]["param"] == "seq_chunk_cumsum"
+    assert ("final_states" in definition["outputs"]) == return_final_states
+    if return_final_states:
+        assert definition["outputs"]["final_states"]["dtype"] == expected_state_dtype
+    json.dumps(definition, allow_nan=False)
+
+
+def test_packed_kda_decode_fi_trace_resolves_singleton_without_output():
+    import flashinfer.kda_decode
+
+    batch_size, num_heads, head_dim = 4, 12, 128
+    hidden_size = num_heads * head_dim
+    defn = flashinfer.kda_decode.packed_kda_decode.fi_trace(
+        mixed_qkv=torch.empty(batch_size, 3 * hidden_size, dtype=torch.bfloat16),
+        raw_gate=torch.empty(batch_size, hidden_size, dtype=torch.bfloat16),
+        raw_beta=torch.empty(batch_size, num_heads, dtype=torch.bfloat16),
+        A_log=torch.empty(num_heads, dtype=torch.float32),
+        dt_bias=torch.empty(hidden_size, dtype=torch.float32),
+        state=torch.empty(
+            batch_size, num_heads, head_dim, head_dim, dtype=torch.bfloat16
+        ),
+        state_indices=torch.arange(batch_size, dtype=torch.int32),
+    )
+
+    _check_defn(defn, "kda", "flashinfer.kda_decode.packed_kda_decode")
+    assert defn["name"] == "packed_kda_decode_h12_d128"
+    assert defn["axes"]["singleton"] == {
+        "type": "const",
+        "value": 1,
+        "description": "Fixed single-token output dimension.",
+    }
+    assert defn["outputs"]["output"]["shape"] == [
+        "batch_size",
+        "singleton",
+        "num_heads",
+        "head_dim",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -678,11 +867,23 @@ def test_mla_paged_fi_trace():
 
     q_nope = torch.randn(batch_size, num_qo_heads, head_dim_ckv, dtype=torch.bfloat16)
     q_pe = torch.randn(batch_size, num_qo_heads, head_dim_kpe, dtype=torch.bfloat16)
-    ckv_cache = torch.randn(num_pages, page_size, head_dim_ckv, dtype=torch.bfloat16)
-    kpe_cache = torch.randn(num_pages, page_size, head_dim_kpe, dtype=torch.bfloat16)
+    ckv_cache = torch.zeros(
+        num_pages, page_size, head_dim_ckv, dtype=torch.float8_e4m3fn
+    )
+    kpe_cache = torch.zeros(
+        num_pages, page_size, head_dim_kpe, dtype=torch.float8_e4m3fn
+    )
+    ckv_scale_arr = torch.ones(
+        num_pages, page_size, head_dim_ckv // 128, dtype=torch.float32
+    )
 
     defn = BatchMLAPagedAttentionWrapper.run.fi_trace(
-        q_nope=q_nope, q_pe=q_pe, ckv_cache=ckv_cache, kpe_cache=kpe_cache
+        q_nope=q_nope,
+        q_pe=q_pe,
+        ckv_cache=ckv_cache,
+        kpe_cache=kpe_cache,
+        ckv_scale_arr=ckv_scale_arr,
+        kpe_scale=1.0,
     )
     _check_defn(defn, "mla_paged", "BatchMLAPagedAttentionWrapper")
     axes = defn["axes"]
@@ -690,6 +891,15 @@ def test_mla_paged_fi_trace():
     assert axes["head_dim_ckv"]["value"] == head_dim_ckv
     assert axes["head_dim_kpe"]["value"] == head_dim_kpe
     assert axes["page_size"]["value"] == page_size
+    assert axes["ckv_scale_groups"]["type"] == "var"
+    ckv_scale_arr_defn = defn["inputs"]["ckv_scale_arr"]
+    assert ckv_scale_arr_defn["shape"] == [
+        "num_pages",
+        "page_size",
+        "ckv_scale_groups",
+    ]
+    assert ckv_scale_arr_defn["dtype"] == "float32"
+    assert ckv_scale_arr_defn["optional"] is True
 
 
 # ---------------------------------------------------------------------------

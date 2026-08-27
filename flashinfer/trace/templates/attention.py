@@ -18,24 +18,26 @@ Pick the template whose input schema matches your call site. Rows that share
 KV layout / indexing / stage are interchangeable from a consumer's viewpoint;
 the backend column indicates which kernel the API wraps.
 
-+---------------------------+-------------------+---------------------------+-------------------------+---------+-----------------+
-| Template                  | Batching          | KV layout                 | Indexing                | Stage   | Backend         |
-+===========================+===================+===========================+=========================+=========+=================+
-| ``single_decode``         | single request    | contiguous                | none                    | decode  | any (no plan)   |
-| ``single_prefill``        | single request    | contiguous                | none                    | prefill | any (no plan)   |
-| ``gqa_paged_decode``      | batched, ragged   | paged tuple (k, v)        | kv_indptr + kv_indices  | decode  | FA2/FA3/cuDNN   |
-| ``prims_ts_batch_decode`` | batched, ragged   | paged HND tuple/combined  | kv_indptr + optional qo | decode  | PrimTS SM100/SM103 |
-| ``gqa_paged_prefill``     | batched, ragged   | paged tuple (k, v)        | +qo_indptr              | prefill | FA2/FA3/cuDNN   |
-| ``gqa_ragged``            | batched, ragged   | contiguous                | qo_indptr + kv_indptr   | prefill | FA2/FA3         |
-| ``mla_paged_decode``      | batched, ragged   | paged MLA (ckv + kpe)     | kv_indptr + kv_indices  | decode  | DeepSeek MLA    |
-| ``prims_ts_decode_mla``   | batched, ragged Q | paged MLA (ckv + kpe)     | block tables + qo/seq   | decode  | PrimTS SM100/SM103 |
-| ``mla_paged_prefill``     | batched, ragged   | paged MLA (ckv + kpe)     | +qo_indptr              | prefill | DeepSeek MLA    |
-| ``dsa_paged``             | batched           | paged MLA                 | sparse_indices (top-K)  | both    | sparse DSA      |
-| ``trtllm_batch_decode``   | batched           | paged, interleaved single | block_tables + seq_lens | decode  | TRT-LLM SM100+  |
-| ``trtllm_batch_context``  | batched           | paged, interleaved single | block_tables + cum_*    | prefill | TRT-LLM SM100+  |
-| ``cudnn_batch_decode``    | batched           | paged, separate k/v       | block_tables            | decode  | cuDNN (no plan) |
-| ``cudnn_batch_prefill``   | batched, var-len  | paged or contiguous       | actual_seq_lens_*       | prefill | cuDNN (no plan) |
-+---------------------------+-------------------+---------------------------+-------------------------+---------+-----------------+
++---------------------------------+-------------------+---------------------------+-------------------------+---------+-----------------+
+| Template                        | Batching          | KV layout                 | Indexing                | Stage   | Backend         |
++=================================+===================+===========================+=========================+=========+=================+
+| ``single_decode``               | single request    | contiguous                | none                    | decode  | any (no plan)   |
+| ``single_prefill``              | single request    | contiguous                | none                    | prefill | any (no plan)   |
+| ``gqa_paged_decode``            | batched, ragged   | paged tuple (k, v)        | kv_indptr + kv_indices  | decode  | FA2/FA3/cuDNN   |
+| ``prims_ts_batch_decode``       | batched, ragged   | paged HND tuple/combined  | kv_indptr + optional qo | decode  | PrimTS SM100/SM103 |
+| ``gqa_paged_prefill``           | batched, ragged   | paged tuple (k, v)        | +qo_indptr              | prefill | FA2/FA3/cuDNN   |
+| ``gqa_ragged``                  | batched, ragged   | contiguous                | qo_indptr + kv_indptr   | prefill | FA2/FA3         |
+| ``prims_ts_block_sparse``       | batched, fixed    | contiguous BSHD           | per-KV-head BSR + bits  | both    | PrimTS SM100a   |
+| ``prims_ts_paged_block_sparse`` | batched, fixed    | paged HND tuple/combined  | page table + BSR + bits | both    | PrimTS SM100a   |
+| ``mla_paged_decode``            | batched, ragged   | paged MLA (ckv + kpe)     | kv_indptr + kv_indices  | decode  | DeepSeek MLA    |
+| ``prims_ts_decode_mla``         | batched, ragged Q | paged MLA (ckv + kpe)     | block tables + qo/seq   | decode  | PrimTS SM100/SM103 |
+| ``mla_paged_prefill``           | batched, ragged   | paged MLA (ckv + kpe)     | +qo_indptr              | prefill | DeepSeek MLA    |
+| ``dsa_paged``                   | batched           | paged MLA                 | sparse_indices (top-K)  | both    | sparse DSA      |
+| ``trtllm_batch_decode``         | batched           | paged, interleaved single | block_tables + seq_lens | decode  | TRT-LLM SM100+  |
+| ``trtllm_batch_context``        | batched           | paged, interleaved single | block_tables + cum_*    | prefill | TRT-LLM SM100+  |
+| ``cudnn_batch_decode``          | batched           | paged, separate k/v       | block_tables            | decode  | cuDNN (no plan) |
+| ``cudnn_batch_prefill``         | batched, var-len  | paged or contiguous       | actual_seq_lens_*       | prefill | cuDNN (no plan) |
++---------------------------------+-------------------+---------------------------+-------------------------+---------+-----------------+
 """
 
 import math
@@ -240,6 +242,222 @@ gqa_paged_decode_trace = TraceTemplate(
     tags=["stage:decode", "status:verified"],
     reference=_gqa_paged_decode_reference,
     init=_gqa_paged_decode_init,
+)
+
+
+# PrimTS block-sparse schema. Only the one-shot API can fully express its BSR
+# metadata and block geometry in a trace definition.
+
+
+def _make_prims_ts_block_sparse_trace() -> TraceTemplate:
+    axes: dict[str, Var | Const] = {
+        "batch_size": Var(description="Number of requests."),
+        "seq_len_q": Var(description="Fixed query length per request."),
+        "seq_len_kv": Var(description="Fixed key/value length per request."),
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "num_q_block_offsets": Var(
+            description="Number of BSR row offsets per batch and KV head."
+        ),
+        "num_block_indices": Var(description="Number of selected KV blocks."),
+        "num_kv_valid_words": Var(
+            description="Number of optional token-validity words per batch."
+        ),
+        "q_block_size": Const(abbrev="qb"),
+        "kv_block_size": Const(abbrev="kb"),
+    }
+    inputs: dict[str, Tensor | Scalar] = {
+        "q": Tensor(["batch_size", "seq_len_q", "num_qo_heads", "head_dim"]),
+        "k": Tensor(["batch_size", "seq_len_kv", "num_kv_heads", "head_dim"]),
+        "v": Tensor(["batch_size", "seq_len_kv", "num_kv_heads", "head_dim"]),
+        "block_indptr": Tensor(
+            ["batch_size", "num_kv_heads", "num_q_block_offsets"],
+            dtype="int32",
+            description=(
+                "Absolute offsets into block_indices, consumed by the one-shot call."
+            ),
+        ),
+        "block_indices": Tensor(
+            ["num_block_indices"],
+            dtype="int32",
+            description="Selected KV block IDs, consumed by the one-shot call.",
+        ),
+        "kv_valid_bits": Tensor(
+            ["batch_size", "num_kv_valid_words"],
+            dtype="uint32",
+            optional=True,
+            description=(
+                "Batch-only token validity bits: token t uses bit t % 32 of "
+                "word t // 32 (LSB-first); one means valid. Padding bits "
+                "beyond Skv are ignored; consumed by the one-shot call."
+            ),
+        ),
+        "q_block_size": Scalar("int32"),
+        "kv_block_size": Scalar("int32"),
+        "mask_type": Scalar("string", optional=True),
+        "sm_scale": Scalar("float32", optional=True),
+    }
+    return TraceTemplate(
+        op_type="block_sparse",
+        name_prefix="prims_ts_block_sparse",
+        description=(
+            "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
+            "BSHD Q/K/V and per-KV-head BSR metadata."
+        ),
+        axes=axes,
+        inputs=inputs,
+        outputs={
+            "output": Tensor(
+                ["batch_size", "seq_len_q", "num_qo_heads", "head_dim"],
+                dtype_from="q",
+                param="out",
+            )
+        },
+        constraints=[
+            "num_qo_heads % num_kv_heads == 0",
+            "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)",
+            "head_dim == 128",
+            "q_block_size > 0",
+            "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0",
+            (
+                "kv_block_size in (8, 16, 32) or "
+                "(kv_block_size > 0 and kv_block_size % 64 == 0)"
+            ),
+            "num_q_block_offsets == (seq_len_q + q_block_size - 1) // q_block_size + 1",
+            "kv_valid_bits is None or num_kv_valid_words == (seq_len_kv + 31) // 32",
+            "mask_type is None or mask_type in ('dense', 'causal')",
+        ],
+        tags=[
+            "backend:prims-ts",
+            "sparse:block",
+            "status:experimental",
+        ],
+    )
+
+
+prims_ts_block_sparse_trace = _make_prims_ts_block_sparse_trace()
+
+
+def _make_prims_ts_paged_block_sparse_trace(*, combined: bool) -> TraceTemplate:
+    """Extend the one-shot block-sparse schema with paged-KV inputs."""
+
+    contiguous = _make_prims_ts_block_sparse_trace()
+    cache_form = "combined" if combined else "tuple"
+    axes = dict(contiguous.axes)
+    axes["seq_len_kv"] = Var(description="Static maximum logical K/V length.")
+    axes.update(
+        {
+            "num_pages": Var(
+                description="Total number of allocated physical KV pages."
+            ),
+            "page_size": Const(abbrev="ps"),
+            "num_page_offsets": Var(
+                description="Length of the request-to-page indptr array."
+            ),
+            "num_page_indices": Var(description="Number of runtime physical page IDs."),
+        }
+    )
+    if combined:
+        axes["kv_planes"] = Const(
+            abbrev="", description="K/V plane count; required to be 2."
+        )
+
+    inputs = dict(contiguous.inputs)
+    del inputs["k"], inputs["v"]
+    if combined:
+        inputs["paged_kv_cache"] = Tensor(
+            [
+                "num_pages",
+                "kv_planes",
+                "num_kv_heads",
+                "page_size",
+                "head_dim",
+            ],
+            description="Combined K/V pages in HND layout.",
+        )
+    else:
+        inputs.update(
+            {
+                "k_cache": Tensor(
+                    ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+                    param="paged_kv_cache",
+                    tuple_idx=0,
+                    description="K pages in the separate HND paged-cache form.",
+                ),
+                "v_cache": Tensor(
+                    ["num_pages", "num_kv_heads", "page_size", "head_dim"],
+                    param="paged_kv_cache",
+                    tuple_idx=1,
+                    description="V pages in the separate HND paged-cache form.",
+                ),
+            }
+        )
+    inputs.update(
+        {
+            "paged_kv_indptr": Tensor(
+                ["num_page_offsets"],
+                dtype="int32",
+                description="Request offsets into paged_kv_indices.",
+            ),
+            "paged_kv_indices": Tensor(
+                ["num_page_indices"],
+                dtype="int32",
+                description="Runtime physical page IDs.",
+            ),
+            "seq_len_kv": Scalar(
+                "int32",
+                description="Static maximum logical K/V length.",
+            ),
+            "seq_lens_kv": Tensor(
+                ["batch_size"],
+                dtype="int32",
+                optional=True,
+                description="Optional per-request logical K/V lengths.",
+            ),
+        }
+    )
+
+    return TraceTemplate(
+        op_type=contiguous.op_type,
+        name_prefix=f"prims_ts_paged_block_sparse_{cache_form}",
+        description=(
+            "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact "
+            f"BSHD Q, the {cache_form} HND paged KV cache form, request page "
+            "tables, and per-KV-head BSR metadata."
+        ),
+        axes=axes,
+        inputs=inputs,
+        outputs=dict(contiguous.outputs),
+        constraints=[
+            *contiguous.constraints,
+            "num_page_offsets == batch_size + 1",
+            "num_page_indices == paged_kv_indptr[-1].item()",
+            "seq_lens_kv is None or max(seq_lens_kv) <= seq_len_kv",
+            "page_size in (16, 32, 64, 128)",
+            "page_size >= (kv_block_size if kv_block_size < 64 else 64)",
+            "page_size % (kv_block_size if kv_block_size < 64 else 64) == 0",
+            *(["kv_planes == 2"] if combined else []),
+        ],
+        tags=[*contiguous.tags, "kv-cache:paged"],
+    )
+
+
+_PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES = {
+    combined: _make_prims_ts_paged_block_sparse_trace(combined=combined)
+    for combined in (False, True)
+}
+
+
+def prims_ts_paged_block_sparse_trace_dispatch(**kwargs):
+    """Select the tuple or combined paged-KV block-sparse schema."""
+
+    combined = isinstance(kwargs.get("paged_kv_cache"), torch.Tensor)
+    return _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES[combined]
+
+
+prims_ts_paged_block_sparse_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_PAGED_BLOCK_SPARSE_TRACES.values()
 )
 
 
@@ -1374,14 +1592,40 @@ gqa_ragged_prefill_trace = TraceTemplate(
 
 @torch.no_grad()
 def _mla_paged_decode_reference(
-    q_nope, q_pe, ckv_cache, kpe_cache, kv_indptr, kv_indices, sm_scale
+    q_nope,
+    q_pe,
+    ckv_cache,
+    kpe_cache,
+    kv_indptr,
+    kv_indices,
+    sm_scale,
+    ckv_scale=None,
+    ckv_scale_arr=None,
+    kpe_scale=None,
+    return_lse=False,
 ):
+    del return_lse
     batch_size, num_qo_heads, head_dim_ckv = q_nope.shape
     _, _, head_dim_kpe = q_pe.shape
 
     # [num_pages, page_size, head_dim_*] — keep the page dim; flatten after gather.
     Kc_all = ckv_cache.to(torch.float32)
     Kp_all = kpe_cache.to(torch.float32)
+    if ckv_cache.dtype == torch.float8_e4m3fn:
+        if (ckv_scale is None) == (ckv_scale_arr is None):
+            raise ValueError(
+                "Exactly one of ckv_scale or ckv_scale_arr is required for FP8 KV cache"
+            )
+        if kpe_scale is None:
+            raise ValueError("kpe_scale is required for FP8 KV cache")
+        if ckv_scale_arr is not None:
+            Kc_all = (
+                Kc_all.reshape(*Kc_all.shape[:-1], head_dim_ckv // 128, 128)
+                * ckv_scale_arr.unsqueeze(-1)
+            ).reshape_as(Kc_all)
+        else:
+            Kc_all *= float(ckv_scale)
+        Kp_all *= float(kpe_scale)
 
     output = torch.zeros(
         (batch_size, num_qo_heads, head_dim_ckv),
@@ -1425,6 +1669,7 @@ def _mla_paged_decode_init(
     num_pages_per_seq: int = 4,
     len_indptr: int = 0,
     num_kv_indices: int = 0,
+    ckv_scale_groups: int = 0,
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -1433,7 +1678,7 @@ def _mla_paged_decode_init(
     Sourced from ``tests/trace/example.py`` MLA section. Default
     ``num_qo_heads=16`` matches DeepSeek-V3 TP=8.
     """
-    del num_pages, len_indptr, num_kv_indices
+    del num_pages, len_indptr, num_kv_indices, ckv_scale_groups
     torch.manual_seed(seed)
     total_pages = batch_size * num_pages_per_seq
     qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
@@ -1504,6 +1749,7 @@ mla_paged_decode_trace = TraceTemplate(
         "head_dim_ckv": Const(abbrev="ckv"),
         "head_dim_kpe": Const(abbrev="kpe"),
         "page_size": Const(abbrev="ps"),
+        "ckv_scale_groups": Var(description="Number of 128-channel CKV scale groups."),
         "num_pages": Var(
             description="Total number of allocated pages in the KV cache."
         ),
@@ -1550,9 +1796,18 @@ mla_paged_decode_trace = TraceTemplate(
             optional=True,
             description=(
                 "Per-tensor dequantization scale for the compressed-KV cache when "
-                "kv_data_type is FP8 (real = quantized * ckv_scale). Required "
-                "together with kpe_scale for the FP8 KV cache path on the fa3 "
-                "backend. Set during run(), not plan()."
+                "kv_data_type is FP8 (real = quantized * ckv_scale). Exactly one "
+                "of ckv_scale or ckv_scale_arr is required for the FP8 KV cache "
+                "path. Set during run(), not plan()."
+            ),
+        ),
+        "ckv_scale_arr": Tensor(
+            ["num_pages", "page_size", "ckv_scale_groups"],
+            dtype="float32",
+            optional=True,
+            description=(
+                "Per-token, per-128-channel CKV dequantization scales for the FP8 "
+                "KV cache path. Exactly one of ckv_scale or ckv_scale_arr is required."
             ),
         ),
         "kpe_scale": Scalar(
@@ -1561,8 +1816,7 @@ mla_paged_decode_trace = TraceTemplate(
             description=(
                 "Per-tensor dequantization scale for the rope-K cache when "
                 "kv_data_type is FP8 (real = quantized * kpe_scale). Required "
-                "together with ckv_scale for the FP8 KV cache path on the fa3 "
-                "backend. Set during run(), not plan()."
+                "with either CKV scale representation. Set during run(), not plan()."
             ),
         ),
         "return_lse": Scalar(
@@ -4239,6 +4493,56 @@ def _block_sparse_attention_run_init(
             kv_len, num_kv_heads, head_dim, dtype=torch.float16, device=device
         ),
     }
+
+
+cake_vsa_plan_trace = TraceTemplate(
+    op_type="block_sparse_plan",
+    name_prefix="cake_vsa_plan",
+    description=(
+        "Plan the sparse metadata and fixed execution route consumed by the "
+        "Cake VSA source-level backend."
+    ),
+    axes={
+        "qo_len": Var(description="Query sequence length."),
+        "kv_len": Var(description="Key/value sequence length."),
+        "q_block_size": Const(abbrev="r"),
+        "kv_block_size": Const(abbrev="c"),
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+    },
+    inputs={
+        "indptr": Tensor(["indptr_len"], dtype="int32", optional=True),
+        "indices": Tensor(["nnz"], dtype="int32", optional=True),
+        "block_mask": Tensor(["num_qo_heads", "qo_blocks", "kv_blocks"], optional=True),
+        "kv_block_lens": Tensor(["kv_blocks"], dtype="int32", optional=True),
+        "q2k_indices": Tensor(
+            ["num_qo_heads", "qo_blocks", "topk"],
+            dtype="int32",
+            optional=True,
+        ),
+        "q2k_num": Tensor(["num_qo_heads", "qo_blocks"], dtype="int32", optional=True),
+        "qo_len": Scalar("int32", param="M"),
+        "kv_len": Scalar("int32", param="N"),
+        "q_block_size": Scalar("int32", param="R"),
+        "kv_block_size": Scalar("int32", param="C"),
+        "num_qo_heads": Scalar("int32"),
+        "num_kv_heads": Scalar("int32"),
+        "head_dim": Scalar("int32"),
+        "q_data_type": Scalar("dtype"),
+        "sm_scale": Scalar("float32", optional=True),
+        "device": Scalar("device"),
+    },
+    outputs={},
+    constraints=[
+        "qo_len % q_block_size == 0",
+        "kv_len % kv_block_size == 0",
+        "q_block_size == kv_block_size",
+        "q_block_size in (64, 128)",
+        "num_qo_heads % num_kv_heads == 0",
+    ],
+    tags=["status:verified", "sparse:block", "phase:plan"],
+)
 
 
 block_sparse_attention_run_trace = TraceTemplate(

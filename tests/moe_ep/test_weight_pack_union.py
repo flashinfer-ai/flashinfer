@@ -130,7 +130,7 @@ def test_nvfp4_preprocess_dispatches_prequantized_shapes():
     # The prequantized branch validates scale shapes before any GPU work:
     # a wrong scale shape must raise from the prequantized path (proving the
     # isinstance dispatch selected it), not fall through to re-quantization.
-    from flashinfer.moe_ep.backends.mega.kernel.nvfp4_cutedsl.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.weights import (
         preprocess_mega_weights,
     )
 

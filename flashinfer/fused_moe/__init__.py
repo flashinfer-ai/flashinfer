@@ -16,18 +16,37 @@ limitations under the License.
 
 # Unified MoE API
 from .api import (  # noqa: F401
+    # Typed activation values
     ActivationConfig,
+    GELU,
+    GeGLU,
+    GeGLUTanh,
+    Identity,
+    ReLU,
+    ReLU2,
+    SiLU,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
+    # Unified configs and packs
     B12xNvfp4Config,
     B12xW4A16Config,
     BackendOptions,
     CuteDslConfig,
-    CutlassConfig,
     CutlassBf16Config,
+    CutlassFp8BlockConfig,
+    CutlassFp8PerTensorConfig,
+    CutlassHummingConfig,
+    CutlassMxfp8Config,
+    CutlassMxfp8Mxfp4Config,
+    CutlassNvfp4Config,
     CutlassW4A16Config,
+    CutlassW4A8Config,
     ExecutionConfig,
     ExpertConfig,
     MoEActivationPack,
     MoEConfig,
+    MoEFinalizeConfig,
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
@@ -39,12 +58,25 @@ from .api import (  # noqa: F401
     TrtllmMxInt4Config,
 )
 from .layer import MoELayer  # noqa: F401
+from .da_runtime import (  # noqa: F401
+    trtllm_moe_acquire_da_graph_leases,
+    trtllm_moe_da_diagnostics,
+    trtllm_moe_release_da_resources,
+)
 from .runners import (  # noqa: F401
     B12xNvfp4Runner,
     B12xW4A16Runner,
     CutlassBf16Runner,
+    CutlassFp8BlockRunner,
+    CutlassFp8PerTensorRunner,
+    CutlassHummingRunner,
+    CutlassMxfp8Mxfp4Runner,
+    CutlassMxfp8Runner,
+    CutlassNvfp4Runner,
     CutlassW4A16Runner,
+    CutlassW4A8Runner,
     CuteDslNvfp4Runner,
+    TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
@@ -54,6 +86,8 @@ from .runners import (  # noqa: F401
 # Legacy flat-argument APIs (unchanged, not deprecated)
 from .core import (
     RoutingInputMode,
+    TrtllmMoERoutingMetadata,
+    TrtllmMoERoutingMetadataSlot,
     convert_to_block_layout,
     cutlass_fused_moe,
     cutlass_fused_moe_workspace_size,
@@ -69,6 +103,8 @@ from .core import (
     trtllm_fp8_block_scale_routed_moe,
     trtllm_fp8_per_tensor_scale_moe,
     trtllm_fp8_per_tensor_scale_routed_moe,
+    trtllm_moe_allocate_routing_metadata,
+    trtllm_moe_allocate_routing_metadata_multi_tile,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
     trtllm_mxint4_block_scale_moe,
@@ -96,6 +132,11 @@ from .hash_topk import (  # noqa: F401
     hash_topk as hash_topk,
 )
 
+from .trtllm_gen_routing import (  # noqa: F401
+    TrtllmGenRoutingResult as TrtllmGenRoutingResult,
+    trtllm_gen_routing as trtllm_gen_routing,
+)
+
 from .bgmv_moe import (  # noqa: F401
     bgmv_moe as bgmv_moe,
     bgmv_moe_shrink as bgmv_moe_shrink,
@@ -120,6 +161,8 @@ try:
     from .cute_dsl import (
         cute_dsl_fused_moe_nvfp4,
         CuteDslMoEWrapper,
+        cute_dsl_fused_moe_mxfp8_mxfp4,
+        CuteDslMxfp8Mxfp4MoEWrapper,
         b12x_fused_moe,
         B12xMoEWrapper,
     )
@@ -129,27 +172,60 @@ except ImportError:
     _cute_dsl_available = False
 
 __all__ = [
-    # Unified API
+    # Typed activation values
     "ActivationConfig",
+    "GELU",
+    "SwiGLU",
+    "SiTU",
+    "GeGLU",
+    "ReLU",
+    "ReLU2",
+    "SiLU",
+    "GeGLUTanh",
+    "SwiGLUStep",
+    "Identity",
+    # Unified configs, packs, and runners
     "B12xNvfp4Config",
     "B12xNvfp4Runner",
-    "CutlassBf16Runner",
-    "CutlassW4A16Runner",
     "B12xW4A16Config",
     "B12xW4A16Runner",
     "BackendOptions",
     "CuteDslConfig",
-    "CutlassConfig",
     "CutlassBf16Config",
+    "CutlassBf16Runner",
+    "CutlassFp8BlockConfig",
+    "CutlassFp8BlockRunner",
+    "CutlassFp8PerTensorConfig",
+    "CutlassFp8PerTensorRunner",
+    "CutlassHummingConfig",
+    "CutlassHummingRunner",
+    "CutlassMxfp8Config",
+    "CutlassMxfp8Mxfp4Config",
+    "CutlassMxfp8Mxfp4Runner",
+    "CutlassMxfp8Runner",
+    "CutlassNvfp4Config",
+    "CutlassNvfp4Runner",
     "CutlassW4A16Config",
+    "CutlassW4A16Runner",
+    "CutlassW4A8Config",
+    "CutlassW4A8Runner",
     "ExecutionConfig",
     "ExpertConfig",
     "CuteDslNvfp4Runner",
     "MoEActivationPack",
     "RoutingInputMode",
+    "TrtllmMoERoutingMetadata",
+    "TrtllmMoERoutingMetadataSlot",
+    "trtllm_moe_allocate_routing_metadata",
+    "trtllm_moe_allocate_routing_metadata_multi_tile",
+    "trtllm_moe_acquire_da_graph_leases",
+    "trtllm_moe_da_diagnostics",
+    "trtllm_moe_release_da_resources",
     "MoEConfig",
+    "MoEFinalizeConfig",
     "MoELayer",
     "MoEWeightPack",
+    "TrtllmBf16RoutedRunner",
     "TrtllmFp4RoutedRunner",
     "TrtllmFp8BlockRunner",
     "TrtllmFp8PerTensorRunner",
@@ -191,6 +267,8 @@ __all__ = [
     "trtllm_mxint4_block_scale_routed_moe",
     "fused_topk_deepseek",
     "hash_topk",
+    "TrtllmGenRoutingResult",
+    "trtllm_gen_routing",
     "bgmv_moe",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",
@@ -210,6 +288,8 @@ if _cute_dsl_available:
     __all__ += [
         "cute_dsl_fused_moe_nvfp4",
         "CuteDslMoEWrapper",
+        "cute_dsl_fused_moe_mxfp8_mxfp4",
+        "CuteDslMxfp8Mxfp4MoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",
     ]
