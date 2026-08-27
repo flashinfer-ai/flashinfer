@@ -37,6 +37,28 @@ namespace flashinfer {
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
+namespace {
+
+bool isArchCompatible(int smVersion, gemm::trtllm::gen::CudaArch cubinArch) {
+  using CudaArch = gemm::trtllm::gen::CudaArch;
+  switch (cubinArch) {
+    case CudaArch::Sm100a:
+      return smVersion == 100;
+    case CudaArch::Sm100f:
+      return smVersion == 100 || smVersion == 103;
+    case CudaArch::Sm103a:
+      return smVersion == 103;
+#ifdef TLLM_RUBIN_FEATURES
+    case CudaArch::Sm107a:
+      return smVersion == 107;
+#endif
+    default:
+      return false;
+  }
+}
+
+}  // namespace
+
 struct TrtllmLowLatencyGemmRunnerOptions {
   gemm::trtllm::gen::Dtype eltType;
   gemm::trtllm::gen::Dtype outputType;
@@ -137,6 +159,7 @@ class TrtllmLowLatencyGemmRunner {
     auto const configs = gemm.getGemmConfigs();
 
     mPassingConfigIndices.clear();
+    int const sv = getSMVersion();
 
     for (size_t i = 0; i < gemm.getNumGemmConfigs(); ++i) {
       auto const configOptions = configs[i].mOptions;
@@ -146,6 +169,7 @@ class TrtllmLowLatencyGemmRunner {
           configOptions.mTransposeMmaOutput == true &&
           configOptions.mLayoutA == gemm::gemm::MatrixLayout::BlockMajorK &&
           configOptions.mUseShuffledMatrix) {
+        if (!isArchCompatible(sv, configs[i].mSm)) continue;
         mPassingConfigIndices.push_back(i);
       }
     }
