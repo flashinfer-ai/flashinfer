@@ -239,7 +239,7 @@ struct VOSplitSmem<NUM_WARPS_KV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_VO, DTypeQ, k
 
 template <uint32_t NUM_WARPS_KV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV, uint32_t HEAD_DIM_QK,
           uint32_t HEAD_DIM_VO, typename DTypeQ, typename DTypeKV, typename DTypeO,
-          bool ENABLE_FP4_REPACK = true, bool kEnableVOSplitOpt = false>
+          bool ENABLE_FP4_REPACK = false, bool kEnableVOSplitOpt = false>
 struct SharedStorageQKVO
     : KVScaleFactorSmem<DTypeKV, CTA_TILE_KV, HEAD_DIM_QK, HEAD_DIM_VO>,
       KVRepackSmem<DTypeQ, DTypeKV, CTA_TILE_Q, CTA_TILE_KV, HEAD_DIM_QK, HEAD_DIM_VO,
@@ -336,7 +336,12 @@ template <MaskMode MASK_MODE_, uint32_t CTA_TILE_Q_, uint32_t NUM_MMA_Q_, uint32
           uint32_t NUM_MMA_D_QK_, uint32_t NUM_MMA_D_VO_, uint32_t NUM_WARPS_Q_,
           uint32_t NUM_WARPS_KV_, PosEncodingMode POS_ENCODING_MODE_, typename DTypeQ_,
           typename DTypeKV_, typename DTypeO_, typename DTypeQKAccum_, typename IdType_,
-          typename AttentionVariant_, bool ENABLE_FP4_REPACK_ = true>
+          typename AttentionVariant_,
+          // Defaults to the variant that allocates no staging buffer. The FA2 prefill launchers
+          // pass this explicitly; every other instantiation of KernelTraits (pod, batch_pod,
+          // persistent) has neither a repack call site nor the staging term in its shared-memory
+          // budget, so a default of true would make those paths reserve a buffer they never read.
+          bool ENABLE_FP4_REPACK_ = false>
 struct KernelTraits {
   static constexpr uint32_t NUM_STAGES = 1;  // used for BatchAttention Template
   static constexpr MaskMode MASK_MODE = MASK_MODE_;
