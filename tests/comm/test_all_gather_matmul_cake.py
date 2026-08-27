@@ -1015,8 +1015,8 @@ def test_prepare_packed_qkv_binds_host_identity_once(monkeypatch):
 
 def test_prepared_packed_qkv_hot_path_uses_one_native_submission(monkeypatch):
     backend = _backend()
-    launcher, inp, weight, _, state, workspace, module, _ = (
-        _fake_prepared_packed_qkv(monkeypatch, backend)
+    launcher, inp, weight, _, state, workspace, module, _ = _fake_prepared_packed_qkv(
+        monkeypatch, backend
     )
     output = _FakePreparedTensor(
         7001,

@@ -1084,10 +1084,7 @@ def _prepared_descriptor_storage(
             workspace.prepared_descriptor_cache.move_to_end(fingerprint)
             return cached
         workspace.prepared_descriptor_cache[fingerprint] = entry
-        while (
-            len(workspace.prepared_descriptor_cache)
-            > _DESCRIPTOR_CACHE_MAX_ENTRIES
-        ):
+        while len(workspace.prepared_descriptor_cache) > _DESCRIPTOR_CACHE_MAX_ENTRIES:
             workspace.prepared_descriptor_cache.popitem(last=False)
     return entry
 
@@ -1193,10 +1190,7 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                 main_stream_id = int(main_stream.cuda_stream)
                 if descriptor_entry.ready_stream != main_stream_id:
                     main_stream.wait_event(descriptor_entry.ready_event)
-                if (
-                    state.tail_event is not None
-                    and state.tail_stream != main_stream_id
-                ):
+                if state.tail_event is not None and state.tail_stream != main_stream_id:
                     main_stream.wait_event(state.tail_event)
 
                 phase = state.next_phase
