@@ -115,14 +115,14 @@ def test_host_descriptor_encoder_writes_cpu_staging_only(tmp_path, monkeypatch):
 
     rendered = backend._render_host_source("test_module", manifest)
 
-    assert '#include <cstring>' in rendered
-    assert 'host_descriptor_storage must be a CPU tensor' in rendered
-    assert 'host_descriptor_storage must have uint8 dtype' in rendered
+    assert "#include <cstring>" in rendered
+    assert "host_descriptor_storage must be a CPU tensor" in rendered
+    assert "host_descriptor_storage must have uint8 dtype" in rendered
     assert (
         "std::memcpy(host_descriptor_storage.data_ptr(), maps.data(), sizeof(maps));"
         in rendered
     )
-    assert 'cuMemcpyHtoD' not in rendered
+    assert "cuMemcpyHtoD" not in rendered
 
 
 @pytest.mark.parametrize(
