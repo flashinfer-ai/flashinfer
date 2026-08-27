@@ -289,12 +289,11 @@ install_and_verify() {
 
         # Sync the branch's direct dependencies without re-resolving the CUDA
         # stack already selected and validated by the image build.
-        _dependency_args=(-r requirements.txt -r requirements-test.txt)
+        pip install --no-deps -r requirements.txt -r requirements-test.txt
+        python -c "import pytest_timeout"
 
-        # Install nvidia-cutlass-dsl with the correct CUDA extra to avoid
-        # version skew between libs-base and libs-cu13.  requirements.txt
-        # cannot add the extra conditionally, hence the separate install.
-        #
+        # Metapackage only; libs-* provide `import cutlass`. Use deps, and
+        # [cu13] on CUDA 13 so libs-cu13 is pulled.
         if [ "${PREPARE_RUBIN_TEST_IMAGE:-0}" = "1" ] || \
            [ "${PREPARE_PUBLIC_RUBIN_STACK:-0}" = "1" ]; then
             python -c "import importlib.metadata as m; print('nvidia-cutlass-dsl', m.version('nvidia-cutlass-dsl'), '(left in place for Rubin job)')"
@@ -303,15 +302,13 @@ install_and_verify() {
                 nvidia-cutlass-dsl-libs-cu12 nvidia-cutlass-dsl-libs-cu13 \
                 nvidia-cutlass-dsl-libs-core -y 2>/dev/null || true
             if [[ "${CUDA_VERSION}" == *"cu13"* || "${CUDA_VERSION}" == 13.* ]]; then
-                _dependency_args+=("nvidia-cutlass-dsl[cu13]==4.6.2")
+                pip install "nvidia-cutlass-dsl[cu13]==4.6.2"
             else
-                _dependency_args+=("nvidia-cutlass-dsl==4.6.2")
+                pip install "nvidia-cutlass-dsl==4.6.2"
             fi
+            python -c "import importlib.metadata as m; print('nvidia-cutlass-dsl', m.version('nvidia-cutlass-dsl'))"
+            python -c "import cutlass; print('cutlass import OK')"
         fi
-        pip install --no-deps "${_dependency_args[@]}"
-        unset _dependency_args
-        python -c "import pytest_timeout"
-        python -c "import importlib.metadata as m; print('nvidia-cutlass-dsl', m.version('nvidia-cutlass-dsl'))"
 
         # Install local python sources. The env var keeps --no-build-isolation
         # from activating the build hooks' own downloads (see setup_test_env.sh).
