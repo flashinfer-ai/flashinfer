@@ -478,7 +478,7 @@ def test_bf16_topk8_route_and_stage_grid_keep_exact_boundaries():
     assert "std::min(128, ceilDiv(payload_bytes," in launcher_source
     assert "unsigned long long, bool, int, bool);" in launcher_source
     assert (
-        "payload_bytes,\n      true, params.ep_rank, params.enable_pdl);"
+        "payload_bytes, true,\n      params.ep_rank, params.enable_pdl);"
         in launcher_source
     )
     assert (
