@@ -72,17 +72,20 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
   // (ceil(waves) - waves). On ties, prefer the largest cpb so fewer
   // launched blocks contend on L2. The ceil_w cap rules out cpb values
   // whose fractional gap looks small but require many integer waves.
-  // AutoTuner can override per-shape via chunks_per_block_override.
+  // chunks_per_block_override: calibrated-model or explicit caller choice;
+  // the heuristic is the fallback when no override is given.
   int chunks_per_block;
   if (chunks_per_block_override >= 1 && chunks_per_block_override <= num_splits) {
-    // AutoTuner / caller override path — used by SparseMlaDecodeRunner to
-    // sweep cpb tactics and pick per-shape best.
     chunks_per_block = chunks_per_block_override;
   } else {
     int sm_count = 0;
     int device = 0;
     CUDA_CHECK_BOOL(cudaGetDevice(&device));
     CUDA_CHECK_BOOL(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
+    if (sm_count <= 0) {
+      printf("CUDA %s:%d invalid SM count %d\n", __FILE__, __LINE__, sm_count);
+      return false;
+    }
     constexpr int CEIL_WAVES_MAX = 3;
     const int per_token_head = num_tokens * H_BLOCKS;
     chunks_per_block = 1;
@@ -100,13 +103,10 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
       }
     }
   }
-  int num_splits_eff = (num_splits + chunks_per_block - 1) / chunks_per_block;
-
   // Launch the FULL Python-allocated num_splits grid blocks; inactive splits
-  // (chunk_lo >= num_chunks_total) return early after marking LSE = -inf,
+  // (chunk_lo >= num_chunks_total) return early after marking LSE = -1e30f,
   // which is cheap. This keeps the mid_out/mid_lse stride matching Python's
   // allocation without extra coordination.
-  (void)num_splits_eff;
   dim3 grid1(num_tokens, H_BLOCKS, num_splits);
   dim3 block1(DSV4_BLOCK_THREADS);
   kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(

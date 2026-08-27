@@ -74,6 +74,8 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
   // chunks_per_block heuristic identical to decode-dsv4: among cpb candidates
   // with at most CEIL_WAVES_MAX integer waves, minimize the last-wave tail
   // gap; ties broken by largest cpb (fewer launched blocks contending on L2).
+  // chunks_per_block_override: calibrated-model or explicit caller choice;
+  // the heuristic is the fallback when no override is given.
   int chunks_per_block;
   if (chunks_per_block_override >= 1 && chunks_per_block_override <= num_splits) {
     chunks_per_block = chunks_per_block_override;
@@ -105,8 +107,8 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
   }
 
   // Launch the full Python-allocated num_splits grid. Inactive splits return
-  // early after marking LSE = -inf — keeps mid_out/mid_lse stride aligned with
-  // wrapper allocation.
+  // early after marking LSE = -1e30f — keeps mid_out/mid_lse stride aligned
+  // with wrapper allocation.
   dim3 grid1(num_tokens, H_BLOCKS, num_splits);
   dim3 block1(DSV3_2_BLOCK_THREADS);
   kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(

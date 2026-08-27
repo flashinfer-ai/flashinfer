@@ -18,10 +18,6 @@ from flashinfer.mla._core import (
     _build_mla_decode_tuning_config,
     _mla_decode_tuning_config,
 )
-from flashinfer.mla._sparse_mla_sm120 import (
-    _decode_dsv3_2_tuning_config,
-    _decode_dsv4_tuning_config,
-)
 from flashinfer.tllm_enums import (
     DtypeTrtllmGen,
     Fp8QuantizationType,
@@ -2002,19 +1998,6 @@ def test_mla_decode_tuning_config_is_memoized(
             )
     finally:
         _mla_decode_tuning_config.cache_clear()
-
-
-def test_sparse_mla_tuning_config_initializer_indices():
-    """Sparse MLA configs retain each initializer's original input index."""
-
-    assert set(dict(_decode_dsv4_tuning_config().tensor_initializers)) == {
-        0,
-        1,
-        6,
-        8,
-        9,
-    }
-    assert set(dict(_decode_dsv3_2_tuning_config().tensor_initializers)) == {0, 1, 6}
 
 
 def test_find_nearest_profile_cache_dedups_mla_decode_config():

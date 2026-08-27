@@ -40,7 +40,7 @@ from flashinfer.mla._sparse_mla_sm120 import (
 from flashinfer.utils import is_sm12x_supported
 
 pytestmark = pytest.mark.skipif(
-    not is_sm12x_supported(torch.device("cuda")),
+    not torch.cuda.is_available() or not is_sm12x_supported(torch.device("cuda")),
     reason="Sparse-MLA SM120 requires SM12x.",
 )
 
@@ -512,6 +512,26 @@ def test_sparse_mla_sm120_decode_empty_query() -> None:
     )
     assert lse3.shape == (0, num_heads)
     assert lse3.dtype == torch.float32
+
+
+def test_sparse_mla_sm120_decode_zero_tokens_direct() -> None:
+    """Direct decode-wrapper call with T=0 returns empty outputs (no launch)."""
+    from flashinfer.mla._sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
+
+    device = torch.device("cuda")
+    num_heads, topk, d_qk, d_v = 8, 128, 512, 512
+    q = torch.empty((0, num_heads, d_qk), dtype=torch.bfloat16, device=device)
+    kv_cache = torch.empty(4, 64 * 584, dtype=torch.uint8, device=device)
+    indices = torch.empty((0, topk), dtype=torch.int32, device=device)
+    mid_out = torch.empty((0, num_heads, 2, d_v), dtype=torch.bfloat16, device=device)
+    mid_lse = torch.empty((0, num_heads, 2), dtype=torch.float32, device=device)
+    output = torch.empty((0, num_heads, d_v), dtype=torch.bfloat16, device=device)
+    out_lse = torch.empty((0, num_heads), dtype=torch.float32, device=device)
+
+    returned = sparse_mla_sm120_decode_dsv4(
+        q, kv_cache, indices, mid_out, mid_lse, output, out_lse, d_qk**-0.5
+    )
+    assert returned is output
 
 
 @pytest.mark.parametrize("family", ["dsv4", "dsv3_2"])
