@@ -285,6 +285,9 @@ jobs:
 
   create-release:
     needs: [setup, build-flashinfer-python, build-flashinfer-cubin, build-flashinfer-jit-cache]
+    # Publish only from main: a workflow_dispatch on any other branch runs the
+    # builds and tests as a dry run without touching the nightly release/index.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -501,6 +504,7 @@ jobs:
 
   update-wheel-index:
     needs: [setup, create-release, test-nightly-build]
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout flashinfer repo
