@@ -19,6 +19,7 @@
 #include <tvm/ffi/error.h>
 #include <tvm_ffi_utils.h>
 
+#include <algorithm>
 #include <vector>
 
 #include "flashinfer/exception.h"
@@ -179,11 +180,24 @@ class TrtllmLowLatencyGemmRunner {
         "No valid low latency TRTLLM-GEN GEMM kernel was found for the given data types.");
   }
 
+  // Tactic ids are indices into the cubin manifest, which spans several
+  // architectures. A tactic that never came from getValidTactics() (a config
+  // file saved on other hardware, an explicit FFI argument) would otherwise
+  // reach cuModuleLoadData and fault instead of erroring.
+  void checkPassingConfigIndex(int64_t tactic) const {
+    auto it = std::find(mPassingConfigIndices.begin(), mPassingConfigIndices.end(), tactic);
+    TVM_FFI_ICHECK(it != mPassingConfigIndices.end())
+        << "Tactic " << tactic
+        << " is not in this runner's compatible config set (device architecture or GEMM options "
+           "mismatch)";
+  }
+
   void run(int64_t m, int64_t n, int64_t k, void const* a, void const* b, void* c, void* cScale,
            void* workspace, CUstream stream, int32_t device_index, int64_t tactic) {
     auto gemm = gemm::gemm::GemmInterface();
     auto const configs = gemm.getGemmConfigs();
     TVM_FFI_ICHECK(tactic >= 0 && tactic < gemm.getNumGemmConfigs()) << "Invalid tactic id in run";
+    checkPassingConfigIndex(tactic);
     auto const& config = configs[tactic];
 
     gemm::gemm::GemmData gemmData = createGemmData(m, n, k);
