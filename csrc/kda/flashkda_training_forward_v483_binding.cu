@@ -195,3 +195,9 @@ void RunForward(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
 }  // namespace flashinfer
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_forward, flashinfer::flash_kda_training::RunForward);
+
+// The content digest is part of the filename so this included device program
+// participates in the JIT module identity through this translation unit.
+namespace cake_kda_aligned_forward_program {
+#include "cake_aligned_training_export/cake_flashkda_training_c16_aligned_forward_36075669f2.cu"
+}
