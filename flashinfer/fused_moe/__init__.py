@@ -137,6 +137,12 @@ from .trtllm_gen_routing import (  # noqa: F401
     trtllm_gen_routing as trtllm_gen_routing,
 )
 
+from .alphamoe_router import (  # noqa: F401
+    AlphaMoeRoutePlan as AlphaMoeRoutePlan,
+    allocate_alphamoe_route_plan as allocate_alphamoe_route_plan,
+    alphamoe_fused_router as alphamoe_fused_router,
+)
+
 from .bgmv_moe import (  # noqa: F401
     bgmv_moe as bgmv_moe,
     bgmv_moe_shrink as bgmv_moe_shrink,
@@ -269,6 +275,9 @@ __all__ = [
     "hash_topk",
     "TrtllmGenRoutingResult",
     "trtllm_gen_routing",
+    "AlphaMoeRoutePlan",
+    "allocate_alphamoe_route_plan",
+    "alphamoe_fused_router",
     "bgmv_moe",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",

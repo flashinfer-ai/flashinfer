@@ -1,0 +1,31 @@
+/*
+ * Copyright (c) 2026 by FlashInfer team.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include "tvm_ffi_utils.h"
+
+namespace flashinfer::alphamoe_router {
+using tvm::ffi::TensorView;
+void AlphaMoeFusedRouter(TensorView router_logits, TensorView topk_weights,
+                         TensorView topk_ids, TensorView sorted_token_ids,
+                         TensorView expert_ids,
+                         TensorView num_tokens_post_padded,
+                         TensorView expert_counts, TensorView expert_offsets,
+                         TensorView expert_scatter_offsets, TensorView scratch,
+                         int64_t top_k, int64_t block_m,
+                         bool has_shared_expert);
+}  // namespace flashinfer::alphamoe_router
+
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(alphamoe_fused_router,
+                              flashinfer::alphamoe_router::AlphaMoeFusedRouter);

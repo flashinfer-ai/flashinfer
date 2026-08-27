@@ -105,6 +105,13 @@ from .fused_moe import (
     trtllm_fp8_per_tensor_scale_routed_moe,
 )
 
+# AlphaMoE fused gating router ("vibecuda" backend); plain CUDA, always available.
+from .fused_moe import (  # noqa: F401
+    AlphaMoeRoutePlan as AlphaMoeRoutePlan,
+    allocate_alphamoe_route_plan as allocate_alphamoe_route_plan,
+    alphamoe_fused_router as alphamoe_fused_router,
+)
+
 # CuteDSL high-level APIs (conditionally if cute_dsl available)
 with contextlib.suppress(ImportError):
     from .fused_moe import (

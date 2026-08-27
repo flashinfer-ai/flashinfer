@@ -14,6 +14,8 @@ Requires a CUDA-capable GPU.
 
 Results:
 - We would get these example json files under fi_trace_out directory:
+alphamoe_fused_router_e256_k8_b16.json
+alphamoe_fused_router_e257_k9_b8.json
 bmm_mxfp8_N128_K128.json
 fused_add_rmsnorm_h5120.json
 fused_add_rmsnorm_quant_h7168.json
@@ -1071,6 +1073,24 @@ with contextlib.suppress(Exception):
         8,
         tile_tokens_dim=8,
         local_num_experts=E_tot,
+    )
+
+
+# ── Fused AlphaMoE gating router ("vibecuda" backend, SM100+) ────────────────
+# Stable descending top-k + softmax + block-sparse routing metadata bundle in
+# one fused call. Two geometries: plain top-k-8 and shared-expert top-k-9.
+with contextlib.suppress(Exception):
+    flashinfer.fused_moe.alphamoe_fused_router(
+        torch.randn(128, 256, dtype=torch.float32, device=device),
+        top_k=8,
+        block_m=16,
+    )
+with contextlib.suppress(Exception):
+    flashinfer.fused_moe.alphamoe_fused_router(
+        torch.randn(8, 257, dtype=torch.float32, device=device),
+        top_k=9,
+        block_m=8,
+        has_shared_expert=True,
     )
 
 

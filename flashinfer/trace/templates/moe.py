@@ -4617,3 +4617,158 @@ trtllm_gen_routing_trace = TraceTemplate(
     tags=["status:verified", "moe", "moe:routing"],
     init=_trtllm_gen_routing_init,
 )
+
+
+# ---------------------------------------------------------------------------
+# Fused AlphaMoE gating router ("vibecuda" backend)
+# ---------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def _alphamoe_fused_router_reference(
+    router_logits: torch.Tensor,
+    top_k: int,
+    block_m: int,
+    has_shared_expert: bool = False,
+    **_unused,
+):
+    """Exact torch reference for the fused AlphaMoE gating router.
+
+    Stable descending top-k over the routed experts (ties keep the lower
+    expert index), optional shared-expert column, fp32 max-subtracted
+    softmax over the selected logits, then the block-sparse routing
+    metadata: expert histogram, block_m-aligned padded offsets and extent,
+    per-expert scatter offsets (identical to the expert histogram, mirroring
+    the upstream ``counts.clone()`` routing-plan output), expert-grouped
+    flat route ids, and per-block expert ids.
+    """
+    num_tokens, num_experts = router_logits.shape
+    routed_experts = num_experts - int(has_shared_expert)
+    routed_top_k = top_k - int(has_shared_expert)
+    order = torch.argsort(
+        router_logits[:, :routed_experts], dim=-1, descending=True, stable=True
+    )[:, :routed_top_k]
+    selected = torch.gather(router_logits, 1, order)
+    if has_shared_expert:
+        shared = torch.full(
+            (num_tokens, 1),
+            num_experts - 1,
+            dtype=torch.int64,
+            device=router_logits.device,
+        )
+        order = torch.cat((order, shared), dim=-1)
+        selected = torch.cat((selected, router_logits[:, -1:]), dim=-1)
+    topk_ids = order.to(torch.int32)
+    topk_weights = torch.softmax(selected, dim=-1)
+    flat = topk_ids.flatten().to(torch.int64)
+    counts = torch.bincount(flat, minlength=num_experts).to(torch.int32)
+    padded = (counts + block_m - 1) // block_m * block_m
+    offsets = torch.zeros(num_experts + 1, dtype=torch.int32, device=router_logits.device)
+    offsets[1:] = torch.cumsum(padded, dim=0)
+    scatter_offsets = counts.clone()
+    pairs = num_tokens * top_k
+    nonempty = min(num_experts, pairs)
+    max_blocks = nonempty + (pairs - nonempty) // block_m
+    sorted_ids = torch.zeros(
+        max_blocks * block_m, dtype=torch.int32, device=router_logits.device
+    )
+    expert_ids = torch.zeros(max_blocks, dtype=torch.int32, device=router_logits.device)
+    sentinel = pairs
+    for expert in range(num_experts):
+        start = int(offsets[expert].item())
+        count = int(counts[expert].item())
+        end = int(offsets[expert + 1].item())
+        if count:
+            routes = torch.nonzero(flat == expert).flatten().to(torch.int32)
+            sorted_ids[start : start + count] = routes
+            sorted_ids[start + count : end] = sentinel
+            expert_ids[start // block_m : end // block_m] = expert
+    extent = offsets[-1:].clone()
+    return (
+        topk_weights,
+        topk_ids,
+        sorted_ids,
+        expert_ids,
+        extent,
+        counts,
+        offsets,
+        scatter_offsets,
+    )
+
+
+def _alphamoe_fused_router_init(
+    *,
+    num_tokens: int,
+    num_experts: int = 256,
+    top_k: int = 8,
+    block_m: int = 16,
+    has_shared_expert: bool = False,
+    # Derived by the exact output geometry; accepted only so the signature
+    # carries every Var axis, and recomputed rather than used.
+    max_blocks: int = 0,
+    slots: int = 0,
+    one: int = 1,
+    num_experts_plus_one: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for the fused AlphaMoE gating router."""
+    torch.manual_seed(seed)
+    router_logits = torch.randn(
+        num_tokens, num_experts, dtype=torch.float32, device=device
+    )
+    return {
+        "router_logits": router_logits,
+        "top_k": int(top_k),
+        "block_m": int(block_m),
+        "has_shared_expert": bool(has_shared_expert),
+    }
+
+
+alphamoe_fused_router_trace = TraceTemplate(
+    op_type="moe_routing",
+    name_prefix="alphamoe_fused_router",
+    description=(
+        "Fused AlphaMoE gating router: stable descending top-k with an "
+        "optional shared-expert column -> fp32 max-subtracted softmax -> "
+        "block_m-aligned routing metadata bundle (expert histogram, padded "
+        "expert offsets + extent, scatter offsets equal to the expert "
+        "counts, expert-grouped flat route ids with sentinel padding, "
+        "per-block expert ids). Route ids are flat token*top_k+slot indices; "
+        "in-segment padding slots carry the sentinel num_tokens*top_k."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "num_experts": Const(abbrev="e"),
+        "top_k": Const(abbrev="k"),
+        "block_m": Const(abbrev="b"),
+        "max_blocks": Var(
+            description="Block-bound from the output geometry "
+            "(min(num_experts, pairs) + (pairs - nonempty) // block_m)."
+        ),
+        "slots": Var(description="max_blocks * block_m."),
+        "one": Var(description="Placeholder for shape [1] output tensors."),
+        "num_experts_plus_one": Var(
+            description="num_experts + 1 for the inclusive padded offsets."
+        ),
+    },
+    inputs={
+        "router_logits": Tensor(["num_tokens", "num_experts"]),
+        "top_k": Scalar("int32"),
+        "block_m": Scalar("int32"),
+        "has_shared_expert": Scalar("bool"),
+    },
+    outputs={
+        "topk_weights": Tensor(["num_tokens", "top_k"], dtype="float32"),
+        "topk_ids": Tensor(["num_tokens", "top_k"], dtype="int32"),
+        "sorted_token_ids": Tensor(["slots"], dtype="int32"),
+        "expert_ids": Tensor(["max_blocks"], dtype="int32"),
+        "num_tokens_post_padded": Tensor(["one"], dtype="int32"),
+        "expert_counts": Tensor(["num_experts"], dtype="int32"),
+        "expert_offsets": Tensor(["num_experts_plus_one"], dtype="int32"),
+        "expert_scatter_offsets": Tensor(["num_experts"], dtype="int32"),
+    },
+    tags=["status:verified", "moe", "moe:routing"],
+    reference=_alphamoe_fused_router_reference,
+    init=_alphamoe_fused_router_init,
+)

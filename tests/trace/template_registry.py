@@ -53,6 +53,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.cute_dsl.attention.wrappers.batch_prefill",
     "flashinfer.cute_dsl.rmsnorm_fp4quant",
     "flashinfer.decode",
+    "flashinfer.fused_moe.alphamoe_router",
     "flashinfer.fused_moe.core",
     "flashinfer.fused_moe.cute_dsl.b12x_moe",
     "flashinfer.fused_moe.cute_dsl.fused_moe",
