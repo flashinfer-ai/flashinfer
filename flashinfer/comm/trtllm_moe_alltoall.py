@@ -7,7 +7,7 @@ supporting multiple payloads per collective operation.
 
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional, Sequence
+from typing import Literal, Optional, Sequence
 
 import torch
 import functools
@@ -24,6 +24,7 @@ from ..tllm_enums import SfLayout
 # csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h, which is
 # derived from kMaxRanks there). A single word covers up to 64 ranks.
 MOE_A2A_RANK_MASK_WORDS = 1
+MoeAlltoAllTarget = Literal["sm100a", "sm103a"]
 
 
 def moe_a2a_active_rank_mask(active_ranks: Sequence[int], ep_size: int) -> torch.Tensor:
@@ -67,7 +68,7 @@ class _A2AState:
     eplb_gathered_stats: Optional[torch.Tensor] = None
 
 
-def _moe_alltoall_target(device_index: int) -> str:
+def _moe_alltoall_target(device_index: int) -> MoeAlltoAllTarget:
     capability = torch.cuda.get_device_capability(device_index)
     if capability == (10, 0):
         return "sm100a"
@@ -80,7 +81,7 @@ def _moe_alltoall_target(device_index: int) -> str:
 
 
 @functools.cache
-def _get_moe_alltoall_module_for_target(target: str):
+def _get_moe_alltoall_module_for_target(target: MoeAlltoAllTarget):
     """Build or load one exact-architecture MNNVL MoE all-to-all module."""
     module = gen_moe_alltoall_module(target).build_and_load()
 
@@ -369,7 +370,9 @@ def get_moe_alltoall_module():
     return _get_moe_alltoall_module_for_target(_moe_alltoall_target(device_index))
 
 
-get_moe_alltoall_module.cache_clear = _get_moe_alltoall_module_for_target.cache_clear
+get_moe_alltoall_module.cache_clear = (  # type: ignore[attr-defined]
+    _get_moe_alltoall_module_for_target.cache_clear
+)
 
 
 @flashinfer_api

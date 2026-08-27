@@ -503,9 +503,8 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
       TVM_FFI_ICHECK(scales.dtype() == dl_uint8 || scales.dtype() == dl_float8_e4m3fn)
           << "packed fp4 output_scales must have uint8 (MXFP4) or float8_e4m3fn (NVFP4) "
              "dtype";
-      params.quant_mode =
-          scales.dtype() == dl_uint8 ? MoeA2ACombineQuantMode::MXFP4
-                                     : MoeA2ACombineQuantMode::NVFP4;
+      params.quant_mode = scales.dtype() == dl_uint8 ? MoeA2ACombineQuantMode::MXFP4
+                                                     : MoeA2ACombineQuantMode::NVFP4;
     } else {
       TVM_FFI_LOG_AND_THROW(NotImplementedError)
           << "Quantization not supported for output dtype: " << output.dtype();

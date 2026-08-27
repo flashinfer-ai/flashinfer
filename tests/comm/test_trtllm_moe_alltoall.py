@@ -204,9 +204,9 @@ def test_moe_combine_rejects_invalid_output_scales(invalid_kind, error_match):
     if invalid_kind == "cpu":
         output_scales = output_scales.cpu()
     elif invalid_kind == "noncontiguous":
-        output_scales = torch.empty(
-            scale_extent * 2, dtype=torch.uint8, device="cuda"
-        )[::2]
+        output_scales = torch.empty(scale_extent * 2, dtype=torch.uint8, device="cuda")[
+            ::2
+        ]
     elif invalid_kind == "dtype":
         output_scales = output_scales.to(torch.float32)
     elif invalid_kind == "packed_dtype":
@@ -214,12 +214,8 @@ def test_moe_combine_rejects_invalid_output_scales(invalid_kind, error_match):
         output_dtype = torch.uint8
         output_width //= 2
     elif invalid_kind == "extent":
-        output_scales = torch.empty(
-            scale_extent + 1, dtype=torch.uint8, device="cuda"
-        )
-    output = torch.empty(
-        (num_tokens, output_width), dtype=output_dtype, device="cuda"
-    )
+        output_scales = torch.empty(scale_extent + 1, dtype=torch.uint8, device="cuda")
+    output = torch.empty((num_tokens, output_width), dtype=output_dtype, device="cuda")
     with pytest.raises(Exception, match=error_match):
         trtllm_moe_alltoall.moe_a2a_combine(
             combine_payload,
@@ -566,9 +562,7 @@ def combine_from_single_rank(
                 payload_in_workspace=payload_in_workspace,
                 output_dtype=output_dtype,
                 output_scales=(
-                    output_scales_list[rank]
-                    if output_scales_list is not None
-                    else None
+                    output_scales_list[rank] if output_scales_list is not None else None
                 ),
                 output_scalar_scale=output_scalar_scale,
                 sf_layout=sf_layout,
@@ -641,10 +635,7 @@ def test_moe_combine_k4_matches_source_reduction_tree(dtype, scalar_values):
         + (physical[2].float() + physical[3].float())
     ).to(dtype)
     sequential = (
-        (
-            (physical[0].float() + physical[1].float())
-            + physical[2].float()
-        )
+        ((physical[0].float() + physical[1].float()) + physical[2].float())
         + physical[3].float()
     ).to(dtype)
     assert not torch.equal(expected, sequential)

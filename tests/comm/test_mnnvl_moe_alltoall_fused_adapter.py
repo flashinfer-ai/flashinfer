@@ -232,7 +232,9 @@ def test_fused_module_keeps_the_public_python_contract():
         } == expected_class_defaults[name]
 
     combine = inspect.signature(api.moe_a2a_combine)
-    assert combine.parameters["use_low_precision"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert (
+        combine.parameters["use_low_precision"].kind is inspect.Parameter.KEYWORD_ONLY
+    )
     class_combine = inspect.signature(api.MoeAlltoAll.combine)
     assert (
         class_combine.parameters["use_low_precision"].kind
@@ -295,7 +297,9 @@ def test_fused_module_registers_the_existing_custom_ops(monkeypatch):
             "flashinfer::moe_a2a_get_metainfo_index_pairs",
             "flashinfer::moe_a2a_get_aux_data_size",
         }
-        combine_into = next(row for row in registrations if row[0].endswith("combine_into"))
+        combine_into = next(
+            row for row in registrations if row[0].endswith("combine_into")
+        )
         assert combine_into[1] == ("workspace", "output")
     finally:
         api.get_moe_alltoall_module.cache_clear()
@@ -338,16 +342,19 @@ def test_fused_jit_inventory_is_exact_arch_and_self_contained(
         "trtllm_moe_alltoall.cu",
         "moeAlltoAllFusedKernels.cu",
     } <= names
-    assert not {
-        "moeAlltoAllKernels.cu",
-        "moeAlltoAllPrepareDispatch.cu",
-        "moeAlltoAllDispatch.cu",
-        "moeAlltoAllStageCombine.cu",
-        "moeAlltoAllPublishCombine.cu",
-        "moeAlltoAllCombine.cu",
-        "moeAlltoAllQuantizeCombine.cu",
-        "moeAlltoAllSanitize.cu",
-    } & names
+    assert (
+        not {
+            "moeAlltoAllKernels.cu",
+            "moeAlltoAllPrepareDispatch.cu",
+            "moeAlltoAllDispatch.cu",
+            "moeAlltoAllStageCombine.cu",
+            "moeAlltoAllPublishCombine.cu",
+            "moeAlltoAllCombine.cu",
+            "moeAlltoAllQuantizeCombine.cu",
+            "moeAlltoAllSanitize.cu",
+        }
+        & names
+    )
     assert {
         path.name for path in captured["sources"] if path.parent.name == "generated"
     } == {generated_name}
@@ -365,19 +372,13 @@ def test_runtime_module_selection_uses_exact_current_device_capability(monkeypat
         lambda target: selected.append(target) or target,
     )
 
-    monkeypatch.setattr(
-        api.torch.cuda, "get_device_capability", lambda device: (10, 0)
-    )
+    monkeypatch.setattr(api.torch.cuda, "get_device_capability", lambda device: (10, 0))
     assert api.get_moe_alltoall_module() == "sm100a"
-    monkeypatch.setattr(
-        api.torch.cuda, "get_device_capability", lambda device: (10, 3)
-    )
+    monkeypatch.setattr(api.torch.cuda, "get_device_capability", lambda device: (10, 3))
     assert api.get_moe_alltoall_module() == "sm103a"
     assert selected == ["sm100a", "sm103a"]
 
-    monkeypatch.setattr(
-        api.torch.cuda, "get_device_capability", lambda device: (12, 0)
-    )
+    monkeypatch.setattr(api.torch.cuda, "get_device_capability", lambda device: (12, 0))
     with pytest.raises(RuntimeError, match="exact compute capability 10.0 or 10.3"):
         api.get_moe_alltoall_module()
 
@@ -462,36 +463,27 @@ def test_bf16_topk8_route_and_stage_grid_keep_exact_boundaries():
         / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllFusedKernels.cu"
     ).read_text()
 
-    specialized_kernel = (
-        "kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8"
-    )
+    specialized_kernel = "kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8"
     assert launcher_source.count(specialized_kernel) == 3
     assert (
         "params.top_k == 8 && params.dtype == nvinfer1::DataType::kBF16 &&"
         in launcher_source
     )
     assert "params.elements_per_token % 8 == 0" in launcher_source
+    assert 'preloadKernel("mnnvl_moe_alltoall_combine_bf16_topk8",' in launcher_source
     assert (
-        'preloadKernel("mnnvl_moe_alltoall_combine_bf16_topk8",'
-        in launcher_source
-    )
-    assert (
-        '"mnnvl_moe_alltoall_combine_bf16_topk8", params.enable_pdl,'
-        in launcher_source
+        '"mnnvl_moe_alltoall_combine_bf16_topk8", params.enable_pdl,' in launcher_source
     )
     assert "uint64_t{kCombineThreads * 16}" in launcher_source
     assert "std::min(128, ceilDiv(payload_bytes," in launcher_source
-    assert (
-        "unsigned long long, bool, int, bool);" in launcher_source
-    )
+    assert "unsigned long long, bool, int, bool);" in launcher_source
     assert (
         "payload_bytes,\n      true, params.ep_rank, params.enable_pdl);"
         in launcher_source
     )
     assert (
         "unsigned long long, unsigned long long, unsigned long long, bool, int, int, bool,\n"
-        "    bool, unsigned long long);"
-        in launcher_source
+        "    bool, unsigned long long);" in launcher_source
     )
     assert (
         "completion_offset, false, params.ep_rank, params.ep_size, params.enable_pdl,"
@@ -577,13 +569,13 @@ def _payloads(rank, experts):
     rows = torch.arange(tokens, dtype=torch.float32, device="cuda")[:, None]
     hidden = (rank * 100 + rows * 10 + columns).to(torch.bfloat16)
     top_k = experts.shape[1]
-    weights = torch.arange(
-        tokens * top_k, dtype=torch.float32, device="cuda"
-    ).reshape(tokens, top_k)
+    weights = torch.arange(tokens * top_k, dtype=torch.float32, device="cuda").reshape(
+        tokens, top_k
+    )
     weights.add_(rank * 10)
-    lora_ids = (
-        rank * 10 + torch.arange(tokens, dtype=torch.int32, device="cuda")
-    )[:, None]
+    lora_ids = (rank * 10 + torch.arange(tokens, dtype=torch.int32, device="cuda"))[
+        :, None
+    ]
     fp8 = (hidden.float() * 0.125).to(torch.float8_e4m3fn)
     packed = torch.arange(
         tokens * (_HIDDEN_SIZE // 2), dtype=torch.uint8, device="cuda"
@@ -616,8 +608,7 @@ def _assert_exact_physical_bytes(actual, expected, label):
     actual_bytes = actual.contiguous().view(torch.uint8).reshape(-1)
     expected_bytes = expected.contiguous().view(torch.uint8).reshape(-1)
     assert actual_bytes.shape == expected_bytes.shape, (
-        f"{label} byte extent mismatch: "
-        f"{actual_bytes.shape} != {expected_bytes.shape}"
+        f"{label} byte extent mismatch: {actual_bytes.shape} != {expected_bytes.shape}"
     )
     if not torch.equal(actual_bytes, expected_bytes):
         mismatches = torch.nonzero(actual_bytes != expected_bytes, as_tuple=False)
@@ -657,8 +648,7 @@ def _dispatch_public_round(
     if gather_eplb:
         expected_stats = torch.stack(
             [
-                source * 100
-                + torch.arange(5, dtype=torch.int32, device="cuda")
+                source * 100 + torch.arange(5, dtype=torch.int32, device="cuda")
                 for source in active_sources
             ]
         )
@@ -676,9 +666,7 @@ def _dispatch_public_round(
         for source in active_sources
     ]
     valid_slots = {}
-    for source, source_payloads in zip(
-        active_sources, expected_payloads, strict=True
-    ):
+    for source, source_payloads in zip(active_sources, expected_payloads, strict=True):
         expected_tokens = [
             token
             for token, selected in enumerate(routes_by_rank[source])
@@ -699,9 +687,7 @@ def _dispatch_public_round(
                     f"dispatch payload {payload_index}",
                 )
         if len(expected_tokens) < routes.shape[0]:
-            assert torch.all(
-                received[1][source, len(expected_tokens) :] == num_experts
-            )
+            assert torch.all(received[1][source, len(expected_tokens) :] == num_experts)
     return received, valid_slots
 
 
@@ -824,9 +810,7 @@ def _run_public_combine_round(
         output_columns = _HIDDEN_SIZE
     else:
         output_dtype = torch.uint8
-        scale_dtype = (
-            torch.float8_e4m3fn if quantization == "nvfp4" else torch.uint8
-        )
+        scale_dtype = torch.float8_e4m3fn if quantization == "nvfp4" else torch.uint8
         output_columns = _HIDDEN_SIZE // 2
     output_scales = torch.zeros(
         _scale_extent(quantization, routes.shape[0], _HIDDEN_SIZE, layout),
