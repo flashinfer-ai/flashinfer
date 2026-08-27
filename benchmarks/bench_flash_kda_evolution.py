@@ -71,9 +71,7 @@ def _make_inputs(case):
     for length in case.seq_lens:
         offsets.append(offsets[-1] + length)
     cu_seqlens = (
-        torch.tensor(offsets, dtype=torch.int64, device="cuda")
-        if case.packed
-        else None
+        torch.tensor(offsets, dtype=torch.int64, device="cuda") if case.packed else None
     )
     return q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens
 

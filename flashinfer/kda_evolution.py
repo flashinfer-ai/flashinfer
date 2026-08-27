@@ -85,9 +85,7 @@ def _route(
     num_sequences = len(sequence_lengths)
     full_chunks = all(length % 32 == 0 for length in sequence_lengths)
     use_m64 = fixed_layout and num_sequences == 1 and num_heads == 64
-    use_vtile = not use_m64 and (
-        fixed_layout or len(set(sequence_lengths)) == 1
-    )
+    use_vtile = not use_m64 and (fixed_layout or len(set(sequence_lengths)) == 1)
     dummy = torch.empty((1,), dtype=torch.int32, device="cuda")
 
     if use_m64:
@@ -177,9 +175,7 @@ class PreparedFlashKDAEvolution:
         fixed_layout = cu_seqlens is None
         if fixed_layout:
             offsets = tuple(range(0, total_tokens + 1, tokens_per_batch))
-            cu_seqlens = torch.tensor(
-                offsets, dtype=torch.int64, device=q.device
-            )
+            cu_seqlens = torch.tensor(offsets, dtype=torch.int64, device=q.device)
         else:
             offsets = tuple(int(value) for value in cu_seqlens.tolist())
         sequence_lengths = tuple(
