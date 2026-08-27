@@ -488,6 +488,170 @@ prims_ts_paged_block_sparse_trace_dispatch.templates = list(  # type: ignore[att
 )
 
 
+def _copy_scalar_as_optional(inputs: dict[str, Tensor | Scalar], name: str) -> None:
+    """Mark one plan-owned scalar as optional without mutating another template."""
+
+    descriptor = inputs[name]
+    assert isinstance(descriptor, Scalar)
+    inputs[name] = Scalar(
+        descriptor.dtype,
+        param=descriptor.param,
+        optional=True,
+        description=descriptor.description,
+    )
+
+
+def _copy_tensor_with_description(
+    inputs: dict[str, Tensor | Scalar], name: str, description: str
+) -> None:
+    """Replace one inherited tensor descriptor without mutating its template."""
+
+    descriptor = inputs[name]
+    assert isinstance(descriptor, Tensor)
+    inputs[name] = Tensor(
+        list(descriptor.dim_names),
+        param=descriptor.param,
+        tuple_idx=descriptor.tuple_idx,
+        dtype=descriptor.dtype,
+        dtype_from=descriptor.dtype_from,
+        optional=descriptor.optional,
+        description=description,
+    )
+
+
+def _make_block_sparse_wrapper_inputs(
+    one_shot: TraceTemplate, plan_scalars: tuple[str, ...]
+) -> dict[str, Tensor | Scalar]:
+    """Adapt one-shot inputs to the reusable wrapper lifecycle."""
+
+    inputs = dict(one_shot.inputs)
+    for name in plan_scalars:
+        _copy_scalar_as_optional(inputs, name)
+    _copy_tensor_with_description(
+        inputs,
+        "block_indptr",
+        "Absolute offsets into live block_indices for this wrapper run.",
+    )
+    _copy_tensor_with_description(
+        inputs,
+        "kv_valid_bits",
+        (
+            "Batch-only token validity bits: token t uses bit t % 32 of word "
+            "t // 32 (LSB-first); one means valid. Padding bits beyond the "
+            "planned K/V capacity are ignored."
+        ),
+    )
+    return inputs
+
+
+def _make_prims_ts_block_sparse_wrapper_trace() -> TraceTemplate:
+    """Describe ``BlockSparseTSWrapper.run`` and its plan-owned geometry."""
+
+    one_shot = _make_prims_ts_block_sparse_trace()
+    axes = dict(one_shot.axes)
+    # Unlike the one-shot API, run() does not receive these plan-owned values.
+    # Keep them as optional schema context, matching the dense PrimTS wrapper
+    # traces, rather than emitting unresolved Const axes.
+    del axes["q_block_size"], axes["kv_block_size"]
+    inputs = _make_block_sparse_wrapper_inputs(
+        one_shot, ("q_block_size", "kv_block_size", "mask_type")
+    )
+    return TraceTemplate(
+        op_type=one_shot.op_type,
+        name_prefix="prims_ts_block_sparse_wrapper",
+        description=(
+            "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact "
+            "BSHD Q/K/V and live per-KV-head BSR metadata. Block geometry and "
+            "mask type are retained by plan() and represented as optional "
+            "trace context."
+        ),
+        axes=axes,
+        inputs=inputs,
+        outputs=dict(one_shot.outputs),
+        constraints=list(one_shot.constraints),
+        tags=list(one_shot.tags),
+    )
+
+
+_PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACE = _make_prims_ts_block_sparse_wrapper_trace()
+
+
+def _require_prims_ts_block_sparse_wrapper_state(
+    kwargs: dict[str, object], wrapper_name: str
+) -> None:
+    """Require bound-method tracing after the reusable wrapper is planned."""
+
+    wrapper = kwargs.get("self")
+    if wrapper is None:
+        raise ValueError(
+            f"Tracing {wrapper_name}.run requires the live wrapper's plan state. "
+            "Use flashinfer.fi_trace(wrapper.run, ...) instead of "
+            "wrapper.run.fi_trace(...)."
+        )
+    if getattr(wrapper, "_plan_state", None) is None:
+        raise RuntimeError("plan() must be called before run()")
+
+
+def prims_ts_block_sparse_wrapper_trace_dispatch(**kwargs):
+    """Trace a planned contiguous block-sparse wrapper run."""
+
+    _require_prims_ts_block_sparse_wrapper_state(kwargs, "BlockSparseTSWrapper")
+    return _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACE
+
+
+prims_ts_block_sparse_wrapper_trace_dispatch.templates = [  # type: ignore[attr-defined]
+    _PRIMS_TS_BLOCK_SPARSE_WRAPPER_TRACE
+]
+
+
+def _make_prims_ts_paged_block_sparse_wrapper_trace(*, combined: bool) -> TraceTemplate:
+    """Describe ``BlockSparsePagedTSWrapper.run`` for one cache form."""
+
+    one_shot = _make_prims_ts_paged_block_sparse_trace(combined=combined)
+    cache_form = "combined" if combined else "tuple"
+    axes = dict(one_shot.axes)
+    del axes["q_block_size"], axes["kv_block_size"]
+    inputs = _make_block_sparse_wrapper_inputs(
+        one_shot,
+        ("q_block_size", "kv_block_size", "max_seq_len_kv", "mask_type"),
+    )
+    return TraceTemplate(
+        op_type=one_shot.op_type,
+        name_prefix=f"prims_ts_paged_block_sparse_wrapper_{cache_form}",
+        description=(
+            "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact "
+            f"fixed-length BSHD Q, the {cache_form} HND paged KV cache form, "
+            "and live page tables, K/V lengths, and per-KV-head BSR metadata. "
+            "Static K/V capacity, block geometry, and mask type are retained "
+            "by plan() and represented as optional trace context."
+        ),
+        axes=axes,
+        inputs=inputs,
+        outputs=dict(one_shot.outputs),
+        constraints=list(one_shot.constraints),
+        tags=list(one_shot.tags),
+    )
+
+
+_PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES = {
+    combined: _make_prims_ts_paged_block_sparse_wrapper_trace(combined=combined)
+    for combined in (False, True)
+}
+
+
+def prims_ts_paged_block_sparse_wrapper_trace_dispatch(**kwargs):
+    """Trace a planned paged block-sparse wrapper for either cache form."""
+
+    _require_prims_ts_block_sparse_wrapper_state(kwargs, "BlockSparsePagedTSWrapper")
+    combined = isinstance(kwargs.get("paged_kv_cache"), torch.Tensor)
+    return _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES[combined]
+
+
+prims_ts_paged_block_sparse_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-defined]
+    _PRIMS_TS_PAGED_BLOCK_SPARSE_WRAPPER_TRACES.values()
+)
+
+
 # PrimTS decode schemas. Query storage is part of the public ABI, so fixed SQ1,
 # fixed multi-Q, and packed Q use distinct templates. In particular, a rank-3
 # query is not sufficient to identify packed mode: ``qo_indptr is not None`` is

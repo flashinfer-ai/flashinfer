@@ -818,6 +818,114 @@ def test_block_sparse_wrapper_routes_are_run_inputs() -> None:
     assert "num_heads" not in state_fields
 
 
+def test_block_sparse_contiguous_wrapper_trace_uses_bound_plan_state() -> None:
+    """Trace a reusable contiguous run while keeping plan geometry optional."""
+
+    from flashinfer.fi_trace import fi_trace
+
+    wrapper = block_sparse_module.BlockSparseTSWrapper()
+    q = torch.empty((2, 64, 8, 128), dtype=torch.float16)
+    k = torch.empty((2, 256, 4, 128), dtype=torch.float16)
+    v = torch.empty_like(k)
+    kwargs = {
+        "q": q,
+        "k": k,
+        "v": v,
+        "block_indptr": torch.empty((2, 4, 2), dtype=torch.int32),
+        "block_indices": torch.empty((16,), dtype=torch.int32),
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"requires the live wrapper's plan state.*flashinfer\.fi_trace",
+    ):
+        wrapper.run.fi_trace(**kwargs)
+    with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
+        fi_trace(wrapper.run, **kwargs)
+
+    # A successful plan atomically publishes this state. Its contents are not
+    # needed to select the single contiguous schema, so avoid a CUDA plan here.
+    wrapper._plan_state = SimpleNamespace()
+    defn = fi_trace(wrapper.run, **kwargs)
+    assert defn["name"].startswith("prims_ts_block_sparse_wrapper")
+    assert defn["inputs"]["q"]["shape"] == [
+        "batch_size",
+        "seq_len_q",
+        "num_qo_heads",
+        "head_dim",
+    ]
+    assert defn["inputs"]["k"]["shape"] == [
+        "batch_size",
+        "seq_len_kv",
+        "num_kv_heads",
+        "head_dim",
+    ]
+    for name in ("q_block_size", "kv_block_size", "mask_type"):
+        assert defn["inputs"][name]["optional"] is True
+    assert defn["inputs"]["block_indptr"].get("optional") is not True
+
+
+def test_block_sparse_paged_wrapper_trace_uses_bound_plan_state() -> None:
+    """Trace both public paged-cache forms with live run metadata."""
+
+    from flashinfer.fi_trace import fi_trace
+
+    wrapper = block_sparse_module.BlockSparsePagedTSWrapper()
+    q = torch.empty((2, 4, 8, 128), dtype=torch.bfloat16)
+    k_cache = torch.empty((8, 4, 64, 128), dtype=torch.bfloat16)
+    v_cache = torch.empty_like(k_cache)
+    common_kwargs = {
+        "q": q,
+        "paged_kv_indptr": torch.empty((3,), dtype=torch.int32),
+        "paged_kv_indices": torch.empty((8,), dtype=torch.int32),
+        "seq_lens_kv": torch.empty((2,), dtype=torch.int32),
+        "block_indptr": torch.empty((2, 4, 2), dtype=torch.int32),
+        "block_indices": torch.empty((16,), dtype=torch.int32),
+    }
+
+    with pytest.raises(
+        ValueError,
+        match=r"requires the live wrapper's plan state.*flashinfer\.fi_trace",
+    ):
+        wrapper.run.fi_trace(paged_kv_cache=(k_cache, v_cache), **common_kwargs)
+    with pytest.raises(RuntimeError, match=r"plan\(\) must be called before run\(\)"):
+        fi_trace(
+            wrapper.run,
+            paged_kv_cache=(k_cache, v_cache),
+            **common_kwargs,
+        )
+
+    wrapper._plan_state = SimpleNamespace()
+    cache_forms = (
+        ((k_cache, v_cache), "tuple"),
+        (torch.stack((k_cache, v_cache), dim=1), "combined"),
+    )
+    for paged_kv_cache, cache_form in cache_forms:
+        defn = fi_trace(
+            wrapper.run,
+            paged_kv_cache=paged_kv_cache,
+            **common_kwargs,
+        )
+        assert defn["name"].startswith(
+            f"prims_ts_paged_block_sparse_wrapper_{cache_form}"
+        )
+        for name in (
+            "q_block_size",
+            "kv_block_size",
+            "max_seq_len_kv",
+            "mask_type",
+        ):
+            assert defn["inputs"][name]["optional"] is True
+        for name in (
+            "paged_kv_indptr",
+            "paged_kv_indices",
+            "seq_lens_kv",
+            "block_indptr",
+            "block_indices",
+        ):
+            assert defn["inputs"][name].get("optional") is not True
+
+
 def test_public_paged_wrapper_uses_only_live_run_metadata() -> None:
     """Paged plans own capacity, while attention consumes caller live lengths."""
 
