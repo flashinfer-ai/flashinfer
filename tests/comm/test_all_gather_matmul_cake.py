@@ -484,6 +484,52 @@ def test_concurrent_descriptor_prepare_returns_one_cached_entry(monkeypatch):
     assert len(preparations) in (1, 2)
 
 
+def test_prepared_descriptor_cache_preserves_ready_stream(monkeypatch):
+    backend = _backend()
+    workspace = SimpleNamespace(
+        scratch="scratch", prepared_descriptor_cache=OrderedDict()
+    )
+    monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: tensor)
+    allocations = _mock_descriptor_allocations(monkeypatch, backend)
+    preparations = []
+    events = []
+
+    class ReadyEvent:
+        def __init__(self, **kwargs):
+            self.recorded_streams = []
+            events.append(self)
+
+        def record(self, stream):
+            self.recorded_streams.append(stream)
+
+    monkeypatch.setattr(backend.torch.cuda, "Event", ReadyEvent)
+    module = SimpleNamespace(
+        prepare_descriptors=lambda *args: preparations.append(args)
+    )
+    first_stream = SimpleNamespace(cuda_stream=17)
+    second_stream = SimpleNamespace(cuda_stream=19)
+    kwargs = {
+        "device_index": 0,
+        "world_size": 4,
+        "rows": 128,
+        "scratch_fingerprint": "scratch",
+        "weight_fingerprint": "weight",
+    }
+
+    first = backend._prepared_descriptor_storage(
+        workspace, module, "input", "weight", main_stream=first_stream, **kwargs
+    )
+    second = backend._prepared_descriptor_storage(
+        workspace, module, "input", "weight", main_stream=second_stream, **kwargs
+    )
+
+    assert second is first
+    assert first.ready_stream == 17
+    assert first.ready_event.recorded_streams == [first_stream]
+    assert len(events) == len(preparations) == 1
+    assert len(allocations) == 2
+
+
 def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch):
     backend = _backend()
     backend._LAUNCH_STATES.clear()
@@ -887,12 +933,17 @@ def _fake_prepared_packed_qkv(
         torch.uint8,
         device,
     )
+    descriptor_entry = SimpleNamespace(
+        descriptors=descriptor,
+        ready_event=FakeEvent(),
+        ready_stream=17,
+    )
     monkeypatch.setattr(
         backend,
         "_prepared_descriptor_storage",
         lambda *args, **kwargs: (
             descriptor_calls.append((args, kwargs)),
-            descriptor,
+            descriptor_entry,
         )[1],
     )
     launcher = backend._prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
@@ -903,6 +954,7 @@ def _fake_prepared_packed_qkv(
         arch=arch_calls,
         module=module_calls,
         descriptor=descriptor_calls,
+        descriptor_entry=descriptor_entry,
     )
     return launcher, inp, weight, group, state, workspace, module, calls
 
@@ -936,8 +988,6 @@ def test_prepare_packed_qkv_binds_host_identity_once(monkeypatch):
     assert launcher.chunk_plan == ((0, 128),)
     assert launcher.signal_pad.shape == (4, 1)
     assert launcher.signal_pad_ptr == 4002
-    assert launcher.descriptor_ready_stream == 17
-    assert launcher.descriptor_ready_event.recorded_streams
     assert len(launcher.peer_routes) == 3
     assert launcher.peer_scratch_ptrs == (5004, 5001, 5002)
     assert launcher.peer_signal_ptrs == (4004, 4001, 4002)
@@ -1034,7 +1084,7 @@ def test_prepared_packed_qkv_hot_path_uses_one_native_submission(monkeypatch):
 
 def test_prepared_packed_qkv_first_other_stream_waits_for_descriptor(monkeypatch):
     backend = _backend()
-    launcher, inp, _, _, state, _, module, _ = _fake_prepared_packed_qkv(
+    launcher, inp, _, _, state, _, module, calls = _fake_prepared_packed_qkv(
         monkeypatch, backend
     )
     output = _FakePreparedTensor(
@@ -1070,7 +1120,51 @@ def test_prepared_packed_qkv_first_other_stream_waits_for_descriptor(monkeypatch
 
     launcher(inp)
 
-    assert first_call_stream.waited_events == [launcher.descriptor_ready_event]
+    assert first_call_stream.waited_events == [calls.descriptor_entry.ready_event]
+    assert state.tail_stream == 19
+
+
+def test_prepared_packed_qkv_first_call_waits_for_descriptor_and_tail(monkeypatch):
+    backend = _backend()
+    launcher, inp, _, _, state, _, module, calls = _fake_prepared_packed_qkv(
+        monkeypatch, backend
+    )
+    output = _FakePreparedTensor(
+        7001,
+        (launcher.world_size * launcher.rows, 2560),
+        torch.bfloat16,
+        launcher.device,
+    )
+    monkeypatch.setattr(backend.torch, "empty", lambda *args, **kwargs: output)
+    module.run_prepared_packed_qkv = lambda *args: None
+
+    class FirstCallStream:
+        cuda_stream = 19
+
+        def __init__(self):
+            self.waited_events = []
+
+        def wait_event(self, event):
+            self.waited_events.append(event)
+
+    class PriorTail:
+        def record(self, stream):
+            pass
+
+    first_call_stream = FirstCallStream()
+    prior_tail = PriorTail()
+    state.tail_event = prior_tail
+    state.tail_stream = 23
+    monkeypatch.setattr(
+        backend.torch.cuda, "current_stream", lambda device_index: first_call_stream
+    )
+
+    launcher(inp)
+
+    assert first_call_stream.waited_events == [
+        calls.descriptor_entry.ready_event,
+        prior_tail,
+    ]
     assert state.tail_stream == 19
 
 

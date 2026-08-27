@@ -825,6 +825,13 @@ class _LaunchState:
 
 
 @dataclass
+class _PreparedDescriptorEntry:
+    descriptors: torch.Tensor
+    ready_event: torch.cuda.Event
+    ready_stream: int
+
+
+@dataclass
 class _Workspace:
     scratch: torch.Tensor
     scratch_handle: Any
@@ -833,6 +840,9 @@ class _Workspace:
     descriptor_cache: OrderedDict[tuple[Any, ...], torch.Tensor] = field(
         default_factory=OrderedDict, repr=False
     )
+    prepared_descriptor_cache: OrderedDict[
+        tuple[Any, ...], _PreparedDescriptorEntry
+    ] = field(default_factory=OrderedDict, repr=False)
 
 
 _CACHE_LOCK = RLock()
@@ -1028,7 +1038,7 @@ def _prepared_descriptor_storage(
     rows: int,
     scratch_fingerprint: tuple[Any, ...],
     weight_fingerprint: tuple[Any, ...],
-) -> torch.Tensor:
+) -> _PreparedDescriptorEntry:
     """Resolve only the current input descriptor for a prepared launcher."""
 
     fingerprint = (
@@ -1037,10 +1047,10 @@ def _prepared_descriptor_storage(
         weight_fingerprint,
     )
     with _CACHE_LOCK:
-        descriptors = workspace.descriptor_cache.get(fingerprint)
-        if descriptors is not None:
-            workspace.descriptor_cache.move_to_end(fingerprint)
-            return descriptors
+        entry = workspace.prepared_descriptor_cache.get(fingerprint)
+        if entry is not None:
+            workspace.prepared_descriptor_cache.move_to_end(fingerprint)
+            return entry
     host_descriptors = torch.empty(
         _DESCRIPTOR_COUNT * _TENSOR_MAP_BYTES,
         dtype=torch.uint8,
@@ -1062,15 +1072,25 @@ def _prepared_descriptor_storage(
     )
     with torch.cuda.stream(main_stream):
         descriptors.copy_(host_descriptors, non_blocking=True)
+    ready_event = torch.cuda.Event(enable_timing=False)
+    ready_event.record(main_stream)
+    entry = _PreparedDescriptorEntry(
+        descriptors=descriptors,
+        ready_event=ready_event,
+        ready_stream=int(main_stream.cuda_stream),
+    )
     with _CACHE_LOCK:
-        cached = workspace.descriptor_cache.get(fingerprint)
+        cached = workspace.prepared_descriptor_cache.get(fingerprint)
         if cached is not None:
-            workspace.descriptor_cache.move_to_end(fingerprint)
+            workspace.prepared_descriptor_cache.move_to_end(fingerprint)
             return cached
-        workspace.descriptor_cache[fingerprint] = descriptors
-        while len(workspace.descriptor_cache) > _DESCRIPTOR_CACHE_MAX_ENTRIES:
-            workspace.descriptor_cache.popitem(last=False)
-    return descriptors
+        workspace.prepared_descriptor_cache[fingerprint] = entry
+        while (
+            len(workspace.prepared_descriptor_cache)
+            > _DESCRIPTOR_CACHE_MAX_ENTRIES
+        ):
+            workspace.prepared_descriptor_cache.popitem(last=False)
+    return entry
 
 
 def _validate_prepared_view(
@@ -1114,8 +1134,6 @@ class _PreparedPackedQkvSm103Tp4Launcher:
     chunk_plan: tuple[tuple[int, int], ...]
     signal_pad: torch.Tensor = field(repr=False)
     signal_pad_ptr: int
-    descriptor_ready_event: torch.cuda.Event = field(repr=False)
-    descriptor_ready_stream: int
     peer_routes: tuple[tuple[torch.Tensor, torch.Tensor], ...] = field(repr=False)
     peer_scratch_ptrs: tuple[int, ...]
     peer_signal_ptrs: tuple[int, ...]
@@ -1149,7 +1167,7 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                 )
             try:
                 main_stream = torch.cuda.current_stream(self.device_index)
-                descriptors = _prepared_descriptor_storage(
+                descriptor_entry = _prepared_descriptor_storage(
                     workspace,
                     self.module,
                     inp,
@@ -1161,6 +1179,7 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                     scratch_fingerprint=self.scratch_fingerprint,
                     weight_fingerprint=self.weight_fingerprint,
                 )
+                descriptors = descriptor_entry.descriptors
                 output = torch.empty(
                     self.world_size * self.rows,
                     _PACKED_QKV_N,
@@ -1173,10 +1192,12 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                 w.record_stream(main_stream)
                 descriptors.record_stream(main_stream)
                 main_stream_id = int(main_stream.cuda_stream)
-                if state.tail_event is None:
-                    if self.descriptor_ready_stream != main_stream_id:
-                        main_stream.wait_event(self.descriptor_ready_event)
-                elif state.tail_stream != main_stream_id:
+                if descriptor_entry.ready_stream != main_stream_id:
+                    main_stream.wait_event(descriptor_entry.ready_event)
+                if (
+                    state.tail_event is not None
+                    and state.tail_stream != main_stream_id
+                ):
                     main_stream.wait_event(state.tail_event)
 
                 phase = state.next_phase
@@ -1370,8 +1391,6 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
                 scratch_fingerprint=scratch_fingerprint,
                 weight_fingerprint=weight_fingerprint,
             )
-            descriptor_ready_event = torch.cuda.Event(enable_timing=False)
-            descriptor_ready_event.record(main_stream)
             launcher = _PreparedPackedQkvSm103Tp4Launcher(
                 group=group,
                 group_id=id(group),
@@ -1394,8 +1413,6 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
                 chunk_plan=chunk_plan,
                 signal_pad=signal_pad,
                 signal_pad_ptr=int(signal_pad.data_ptr()),
-                descriptor_ready_event=descriptor_ready_event,
-                descriptor_ready_stream=int(main_stream.cuda_stream),
                 peer_routes=tuple(peer_routes),
                 peer_scratch_ptrs=peer_scratch_ptrs,
                 peer_signal_ptrs=peer_signal_ptrs,
