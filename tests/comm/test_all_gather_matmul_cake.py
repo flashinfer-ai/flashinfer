@@ -280,7 +280,7 @@ def test_descriptor_cache_reuses_each_layer_mapping(monkeypatch):
     assert all(kwargs["device"] == 3 for _, _, kwargs in allocations[1::2])
     assert all(
         descriptor.copies == [(preparation[3], True)]
-        for descriptor, preparation in zip(descriptors, preparations)
+        for descriptor, preparation in zip(descriptors, preparations, strict=True)
     )
 
 
