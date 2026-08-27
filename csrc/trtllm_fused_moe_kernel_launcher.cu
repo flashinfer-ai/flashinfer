@@ -2227,13 +2227,14 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
           static_cast<int*>(const_cast<void*>(expert_indices_.data_ptr()));
     }
 
+    if (is_unpacked_routing()) {
+      args->mDtypeExpW = expert_weights_dtype(expert_weights_);
+    }
     if (has_precomputed(expert_weights_)) {
       workspace.expert_weights = const_cast<void*>(expert_weights_.data_ptr());
     } else {
-      auto expert_weights_dtype =
-          mRoutingLogitsDtype == btg::Dtype::Fp32 ? dl_float32 : dl_bfloat16;
-      FusedMoeLauncher::expert_weights = alloc_tensor({args->num_tokens, args->top_k},
-                                                      expert_weights_dtype, hidden_states.device());
+      FusedMoeLauncher::expert_weights =
+          alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());
       workspace.expert_weights = FusedMoeLauncher::expert_weights.data_ptr();
     }
 

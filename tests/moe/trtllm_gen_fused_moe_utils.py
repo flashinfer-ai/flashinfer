@@ -1975,21 +1975,26 @@ class FP8PerChannelMoe(Moe):
             gemm2_per_channel_scales.unsqueeze(-1)
         ).squeeze(-1)
 
-        if gated:
-            scale_c_fc1 = args_dequant.c_global_sf / gemm1_per_channel_scales
-        else:
-            scale_c_fc1 = torch.full_like(
-                gemm1_per_channel_scales, args_dequant.c_global_sf
-            )
-        scale_gate_fc1 = 1.0 / gemm1_per_channel_scales
-        scale_c_fc2 = 1.0 / (args_dequant.c_global_sf * gemm2_per_channel_scales)
+        gemm1_per_channel_weight_scale = 1.0 / gemm1_per_channel_scales
+        gemm2_per_channel_weight_scale = 1.0 / (
+            args_dequant.c_global_sf * gemm2_per_channel_scales
+        )
+        output1_scale_scalar = torch.full(
+            (num_experts,),
+            args_dequant.c_global_sf,
+            dtype=torch.float32,
+            device=gemm1_per_channel_scales.device,
+        )
+        unit_scale = torch.ones_like(output1_scale_scalar)
 
         return {
             "gemm1_weights": gemm1_weights_shuffled,
             "gemm2_weights": gemm2_weights_shuffled,
-            "scale_c_fc1": scale_c_fc1,
-            "scale_gate_fc1": scale_gate_fc1,
-            "scale_c_fc2": scale_c_fc2,
+            "gemm1_per_channel_weight_scale": gemm1_per_channel_weight_scale,
+            "output1_scale_scalar": output1_scale_scalar,
+            "output1_scale_gate_scalar": unit_scale,
+            "gemm2_per_channel_weight_scale": gemm2_per_channel_weight_scale,
+            "output2_scale_scalar": unit_scale,
         }
 
     def call_moe(
@@ -2012,10 +2017,12 @@ class FP8PerChannelMoe(Moe):
                 input_quantized["hidden_states"],
                 input_quantized["hidden_states_scale"],
                 static_data["gemm1_weights"],
-                static_data["scale_c_fc1"],
-                static_data["scale_gate_fc1"],
+                static_data["gemm1_per_channel_weight_scale"],
+                static_data["output1_scale_scalar"],
+                static_data["output1_scale_gate_scalar"],
                 static_data["gemm2_weights"],
-                static_data["scale_c_fc2"],
+                static_data["gemm2_per_channel_weight_scale"],
+                static_data["output2_scale_scalar"],
                 kwargs["num_experts"],
                 kwargs["top_k"],
                 kwargs["n_groups"],

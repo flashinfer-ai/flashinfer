@@ -83,7 +83,6 @@ from ..tllm_enums import (
     RoutingMethodType,
     WeightLayout,
     deduce_trtllm_gen_tensor_dtype,
-    is_gated_activation,
     trtllm_gen_dtype_has_scale,
 )
 from ..utils import (
@@ -413,21 +412,6 @@ def is_trtllm_moe_supported(
     ]:
         return False
     return True
-
-
-def _prepare_gemm1_per_channel_scales(
-    weight_scale: torch.Tensor,
-    gate_weight_scale: torch.Tensor,
-    activation_type: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Separate row-wise dequantization from the expert-level output scale."""
-    if is_gated_activation(activation_type):
-        output_scale = weight_scale[:, 0] / gate_weight_scale[:, 0]
-    else:
-        output_scale = weight_scale[:, 0]
-    output_scale = output_scale.contiguous()
-    unit_scale = torch.ones_like(output_scale)
-    return gate_weight_scale, output_scale, unit_scale
 
 
 def _maybe_get_cached_w3_w1_permute_indices(
@@ -2210,13 +2194,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                     )
                 elif self.fp8_quantization_type == Fp8QuantizationType.PerChannelFp8:
                     # FP8 per-token activation and per-channel weight scales.
-                    gemm1_scale, output1_scale, unit_scale = (
-                        _prepare_gemm1_per_channel_scales(
-                            kwargs["gemm1_per_channel_weight_scale"],
-                            kwargs["gemm1_per_channel_gate_weight_scale"],
-                            self.activation_type,
-                        )
-                    )
                     result = moe_op.trtllm_fp8_per_channel_scale_moe(
                         routing_logits,
                         topk_ids,
@@ -2225,12 +2202,12 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                         hidden_states,
                         hidden_states_scale,
                         kwargs["gemm1_weights"],
-                        gemm1_scale,
-                        output1_scale,
-                        unit_scale,
+                        kwargs["gemm1_per_channel_weight_scale"],
+                        kwargs["output1_scale_scalar"],
+                        kwargs["output1_scale_gate_scalar"],
                         kwargs["gemm2_weights"],
                         kwargs["gemm2_per_channel_weight_scale"],
-                        unit_scale,
+                        kwargs["output2_scale_scalar"],
                         output,
                         kwargs["num_experts"],
                         self.top_k,
@@ -3440,9 +3417,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm1_per_channel_weight_scale: torch.Tensor,
-        gemm1_per_channel_gate_weight_scale: torch.Tensor,
+        output1_scale_scalar: torch.Tensor,
+        output1_scale_gate_scalar: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_per_channel_weight_scale: torch.Tensor,
+        output2_scale_scalar: torch.Tensor,
         num_experts: int,
         top_k: int,
         n_group: Optional[int],
@@ -3490,10 +3469,23 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
                 else torch.empty(0, dtype=routing_dtype, device=hidden_states.device)
             )
 
+        if hidden_states.dtype == torch.bfloat16:
+            dtype_act = DtypeTrtllmGen.Bfloat16
+        elif hidden_states.dtype == torch.float16:
+            dtype_act = DtypeTrtllmGen.Fp16
+        elif hidden_states.dtype == torch.float8_e4m3fn:
+            dtype_act = DtypeTrtllmGen.E4m3
+        else:
+            raise ValueError(
+                "FP8 per-channel MoE hidden_states must have dtype "
+                "torch.bfloat16, torch.float16, or torch.float8_e4m3fn, got "
+                f"{hidden_states.dtype}."
+            )
+
         moe_runner = MoERunner(
             top_k=top_k,
             num_local_experts=local_num_experts,
-            dtype_act=DtypeTrtllmGen.E4m3,
+            dtype_act=dtype_act,
             dtype_weights=DtypeTrtllmGen.E4m3,
             fp8_quantization_type=Fp8QuantizationType.PerChannelFp8,
             hidden_size=hidden_size,
@@ -3529,9 +3521,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_bias=routing_bias,
             gemm1_weights=gemm1_weights,
             gemm1_per_channel_weight_scale=gemm1_per_channel_weight_scale,
-            gemm1_per_channel_gate_weight_scale=gemm1_per_channel_gate_weight_scale,
+            output1_scale_scalar=output1_scale_scalar,
+            output1_scale_gate_scalar=output1_scale_gate_scalar,
             gemm2_weights=gemm2_weights,
             gemm2_per_channel_weight_scale=gemm2_per_channel_weight_scale,
+            output2_scale_scalar=output2_scale_scalar,
             num_experts=num_experts,
             n_group=n_group,
             topk_group=topk_group,
@@ -3544,11 +3538,6 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             enable_pdl=enable_pdl,
             activation_type=activation_type,
         )
-        gemm1_scale, output1_scale, unit_scale = _prepare_gemm1_per_channel_scales(
-            gemm1_per_channel_weight_scale,
-            gemm1_per_channel_gate_weight_scale,
-            activation_type,
-        )
         intermediate_output = moe_op.trtllm_fp8_per_channel_scale_moe(
             routing_logits,
             topk_ids,
@@ -3557,12 +3546,12 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             hidden_states,
             hidden_states_scale,
             gemm1_weights,
-            gemm1_scale,
-            output1_scale,
-            unit_scale,
+            gemm1_per_channel_weight_scale,
+            output1_scale_scalar,
+            output1_scale_gate_scalar,
             gemm2_weights,
             gemm2_per_channel_weight_scale,
-            unit_scale,
+            output2_scale_scalar,
             output,
             num_experts,
             top_k,
@@ -3594,9 +3583,11 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor,
         gemm1_per_channel_weight_scale: torch.Tensor,
-        gemm1_per_channel_gate_weight_scale: torch.Tensor,
+        output1_scale_scalar: torch.Tensor,
+        output1_scale_gate_scalar: torch.Tensor,
         gemm2_weights: torch.Tensor,
         gemm2_per_channel_weight_scale: torch.Tensor,
+        output2_scale_scalar: torch.Tensor,
         num_experts: int,
         top_k: int,
         n_group: Optional[int],
@@ -5904,9 +5895,11 @@ def trtllm_fp8_per_channel_scale_moe(
     hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
     gemm1_per_channel_weight_scale: torch.Tensor,
-    gemm1_per_channel_gate_weight_scale: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
     gemm2_weights: torch.Tensor,
     gemm2_per_channel_weight_scale: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
     num_experts: int,
     top_k: int,
     n_group: Optional[int],
@@ -5934,14 +5927,15 @@ def trtllm_fp8_per_channel_scale_moe(
             where M is 2*intermediate_size for gated activations and
             intermediate_size otherwise
         gemm1_per_channel_weight_scale: [local_num_experts, M] per-channel
-            output scales for gemm1, in the same shuffled row order as gemm1_weights
-        gemm1_per_channel_gate_weight_scale: [local_num_experts, M] per-channel
             weight dequantization multipliers for gemm1, in the same shuffled row
             order as gemm1_weights
+        output1_scale_scalar: [local_num_experts] per-expert output scales for gemm1
+        output1_scale_gate_scalar: [local_num_experts] per-expert gate scales for gemm1
         gemm2_weights: [num_experts, hidden_size, intermediate_size] FP8 second layer weights
         gemm2_per_channel_weight_scale: [local_num_experts, hidden_size]
             per-channel dequantization multipliers for gemm2, in the same shuffled
             row order as gemm2_weights
+        output2_scale_scalar: [local_num_experts] per-expert output scales for gemm2
         num_experts: Total number of experts
         top_k: Number of experts to route to per token
         n_group: Number of expert groups
@@ -5971,9 +5965,11 @@ def trtllm_fp8_per_channel_scale_moe(
         hidden_states_scale,
         gemm1_weights,
         gemm1_per_channel_weight_scale,
-        gemm1_per_channel_gate_weight_scale,
+        output1_scale_scalar,
+        output1_scale_gate_scalar,
         gemm2_weights,
         gemm2_per_channel_weight_scale,
+        output2_scale_scalar,
         num_experts,
         top_k,
         n_group,
@@ -6008,9 +6004,11 @@ def trtllm_fp8_per_channel_scale_routed_moe(
     hidden_states_scale: torch.Tensor,
     gemm1_weights: torch.Tensor,
     gemm1_per_channel_weight_scale: torch.Tensor,
-    gemm1_per_channel_gate_weight_scale: torch.Tensor,
+    output1_scale_scalar: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
     gemm2_weights: torch.Tensor,
     gemm2_per_channel_weight_scale: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
     num_experts: int,
     top_k: int,
     n_group: Optional[int],
@@ -6044,16 +6042,19 @@ def trtllm_fp8_per_channel_scale_routed_moe(
         ``2 * intermediate_size`` for gated activations and ``intermediate_size``
         otherwise.
     gemm1_per_channel_weight_scale : torch.Tensor
-        ``[local_num_experts, M]`` per-channel output scales for GEMM1, in the
-        same shuffled row order as ``gemm1_weights``.
-    gemm1_per_channel_gate_weight_scale : torch.Tensor
         ``[local_num_experts, M]`` per-channel weight dequantization multipliers
         for GEMM1, in the same shuffled row order as ``gemm1_weights``.
+    output1_scale_scalar : torch.Tensor
+        ``[local_num_experts]`` per-expert output scales for GEMM1.
+    output1_scale_gate_scalar : torch.Tensor
+        ``[local_num_experts]`` per-expert gate scales for GEMM1.
     gemm2_weights : torch.Tensor
         ``[num_experts, hidden_size, intermediate_size]`` FP8 second-layer weights.
     gemm2_per_channel_weight_scale : torch.Tensor
         ``[local_num_experts, hidden_size]`` per-channel dequantization
         multipliers for GEMM2, in the same shuffled row order as ``gemm2_weights``.
+    output2_scale_scalar : torch.Tensor
+        ``[local_num_experts]`` per-expert output scales for GEMM2.
     num_experts : int
         Total number of experts.
     top_k : int
@@ -6100,9 +6101,11 @@ def trtllm_fp8_per_channel_scale_routed_moe(
         hidden_states_scale,
         gemm1_weights,
         gemm1_per_channel_weight_scale,
-        gemm1_per_channel_gate_weight_scale,
+        output1_scale_scalar,
+        output1_scale_gate_scalar,
         gemm2_weights,
         gemm2_per_channel_weight_scale,
+        output2_scale_scalar,
         num_experts,
         top_k,
         n_group,
