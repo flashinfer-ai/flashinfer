@@ -305,6 +305,139 @@ def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
 
 
 @cute_dsl_available
+def test_static_workspace_uses_disjoint_route_output_scratch():
+    """Route partials must never alias live packed activations."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    workspace = moe_dispatch.allocate_sm120_static_workspace(
+        state_E=8,
+        weight_E=8,
+        max_rows=256,
+        k=1536,
+        n=768,
+        num_topk=2,
+        device=torch.device("cpu"),
+        quant_mode="nvfp4",
+    )
+
+    assert workspace.route_output_scratch.shape == (256, 3, 1536)
+    packed_begin = workspace.packed_input.data_ptr()
+    packed_end = packed_begin + workspace.packed_input.nbytes
+    route_begin = workspace.route_output_scratch.data_ptr()
+    route_end = route_begin + workspace.route_output_scratch.nbytes
+    assert max(packed_begin, route_begin) >= min(packed_end, route_end)
+
+
+@cute_dsl_available
+def test_static_workspace_pads_odd_retained_group_geometry():
+    """Five N128 slices are padded to six before retained2 scheduling."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    workspace = moe_dispatch.allocate_sm120_static_workspace(
+        state_E=2,
+        weight_E=2,
+        max_rows=8,
+        k=256,
+        n=640,
+        num_topk=2,
+        device=torch.device("cpu"),
+        quant_mode="nvfp4",
+    )
+
+    assert workspace.n == 768
+    assert workspace.route_output_scratch.shape == (8, 3, 256)
+
+
+@cute_dsl_available
+def test_dynamic_workspace_keeps_native_n128_geometry():
+    """Static retained-group padding must not leak into dynamic geometry."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    workspace = moe_dispatch.allocate_sm120_dynamic_workspace(
+        state_E=2,
+        weight_E=2,
+        routed_rows=2048,
+        k=256,
+        n=640,
+        num_topk=2,
+        device=torch.device("cpu"),
+        quant_mode="nvfp4",
+    )
+
+    assert workspace.n == 640
+
+
+@cute_dsl_available
+def test_static_workspace_rejects_undersized_shared_capacity():
+    """A legacy 640-row workspace cannot serve the widened 1024-row band."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    workspace = moe_dispatch.allocate_sm120_static_workspace(
+        state_E=8,
+        weight_E=8,
+        max_rows=640,
+        k=256,
+        n=256,
+        num_topk=8,
+        device=torch.device("cpu"),
+        quant_mode="nvfp4",
+    )
+
+    with pytest.raises(ValueError, match="capacity is too small"):
+        moe_dispatch._validate_static_workspace_for_launch(
+            workspace,
+            state_E=8,
+            weight_E=8,
+            routed_rows=1024,
+            k=256,
+            n=256,
+            num_topk=8,
+            device=torch.device("cpu"),
+            activation_precision="fp4",
+            quant_mode="nvfp4",
+        )
+
+
+@cute_dsl_available
+def test_static_workspace_rejects_wrong_type_and_geometry():
+    """Injected workspaces must match the selected static ABI exactly."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    validation_args = dict(
+        state_E=8,
+        weight_E=8,
+        routed_rows=256,
+        k=256,
+        n=256,
+        num_topk=8,
+        device=torch.device("cpu"),
+        activation_precision="fp4",
+        quant_mode="nvfp4",
+    )
+    with pytest.raises(ValueError, match="must be Sm120StaticMoEWorkspace"):
+        moe_dispatch._validate_static_workspace_for_launch(object(), **validation_args)
+
+    workspace = moe_dispatch.allocate_sm120_static_workspace(
+        state_E=8,
+        weight_E=8,
+        max_rows=256,
+        k=256,
+        n=256,
+        num_topk=8,
+        device=torch.device("cpu"),
+        quant_mode="nvfp4",
+    )
+    with pytest.raises(ValueError, match="workspace n mismatch"):
+        moe_dispatch._validate_static_workspace_for_launch(
+            workspace, **{**validation_args, "n": 512}
+        )
+
+    workspace.token_map = workspace.token_map[:, :-1]
+    with pytest.raises(ValueError, match="workspace token_map mismatch"):
+        moe_dispatch._validate_static_workspace_for_launch(workspace, **validation_args)
+
+
+@cute_dsl_available
 def test_w4a16_static_cutover_env_override_is_precision_scoped(monkeypatch):
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
@@ -1202,6 +1335,10 @@ class TestB12xFunctional:
             num_local_experts=num_experts,
             top_k=top_k,
         )
+        if num_tokens == 128:
+            # Reproduce the route distribution that used to overlap packed-A.
+            tensors["token_selected_experts"][:, 0].fill_(0)
+            tensors["token_selected_experts"][:, 1].fill_(1)
         result = b12x_fused_moe(
             x=tensors["x_bf16"],
             w1_weight=tensors["w1_weight"],
@@ -1241,13 +1378,15 @@ class TestB12xFunctional:
     @pytest.mark.parametrize(
         "activation", ["silu", "gelu_tanh", "swigluoai_uninterleave"]
     )
-    @pytest.mark.parametrize("num_tokens", [8, 128])
-    def test_intermediate_not_128_aligned(self, activation: str, num_tokens: int):
-        """NVFP4 transparently pads non-128-aligned intermediate sizes (e.g.
-        Gemma-4's 704) up to a tile multiple; result matches the unpadded ref."""
+    @pytest.mark.parametrize("intermediate_size", [640, 704])
+    @pytest.mark.parametrize("num_tokens", [8, 128, 2048])
+    def test_intermediate_padding_matches_selected_backend(
+        self, activation: str, intermediate_size: int, num_tokens: int
+    ):
+        """Odd N128 counts stay correct across static and dynamic dispatch."""
         from flashinfer import b12x_fused_moe
 
-        hidden_size, intermediate_size = 512, 704  # 704 = 128 * 5.5
+        hidden_size = 512
         num_experts, top_k = 8, 2
         swiglu_limit = 7.0 if activation == "swigluoai_uninterleave" else None
         tensors = create_moe_tensors(

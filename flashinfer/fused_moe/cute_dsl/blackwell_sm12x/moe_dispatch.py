@@ -62,6 +62,7 @@ _NVFP4_BLOCK_SIZE = 16
 _MXFP4_BLOCK_SIZE = 32
 _LEVEL_TILE_M = 128
 _LEVEL_TILE_N = 128
+_STATIC_RETAINED_GROUP_N = 2 * _LEVEL_TILE_N
 # Must equal the kernel's task materialization granularity or the task
 # queue is mis-sized.
 _DYNAMIC_SLICE_CHUNK = _TASK_SLICE_CHUNK
@@ -392,6 +393,7 @@ class Sm120StaticMoEWorkspace:
     # followed by [weight_E, max_chunks] chunk -> local expert id map. The
     # static route kernel re-initializes it every launch (graph-replay safe).
     virt_route_scratch: torch.Tensor  # [weight_E*(1+max_chunks)] int32
+    route_output_scratch: torch.Tensor  # [max_rows, ceil(n/256), k] bf16
 
     # Views (set after allocation)
     packed_a_view: torch.Tensor | None = None
@@ -428,6 +430,7 @@ def allocate_sm120_static_workspace(
     quant_mode: str = "nvfp4",
 ) -> Sm120StaticMoEWorkspace:
     """Allocate workspace buffers for the SM120 static MoE kernel."""
+    n = _align_up(n, _STATIC_RETAINED_GROUP_N)
     activation_precision = _normalize_activation_precision(activation_precision)
     if activation_precision == "bf16":
         raise ValueError(
@@ -444,8 +447,10 @@ def allocate_sm120_static_workspace(
     # total_rows/32, so ceil(max_rows/32) extra slots always suffice.
     max_chunks = (max_rows + 31) // 32
     virt_E = state_E + max_chunks
+    retained_groups = max(1, n // _STATIC_RETAINED_GROUP_N)
     _check_memref_limit("static packed_input", virt_E * max_rows * (k // 2))
     _check_memref_limit("static packed_input_scale", virt_E * rows_pad_k * cols_pad_k)
+    _check_memref_limit("static route_output_scratch", max_rows * retained_groups * k)
     packed_input = torch.empty(
         virt_E, max_rows, k // 2, dtype=torch.uint8, device=device
     )
@@ -480,6 +485,13 @@ def allocate_sm120_static_workspace(
             # shared by the retained NVFP4 and MXFP4 implementation.
             weight_E * (1 + max_chunks) + 8,
             dtype=torch.int32,
+            device=device,
+        ),
+        route_output_scratch=torch.empty(
+            max_rows,
+            retained_groups,
+            k,
+            dtype=torch.bfloat16,
             device=device,
         ),
     )
@@ -996,6 +1008,11 @@ def _get_static_kernel(
         (state_E * max_rows * (k // 2),),
         assumed_align=16,
     )
+    route_output_scratch_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.BFloat16,
+        (max_rows * max(1, n // _STATIC_RETAINED_GROUP_N) * k,),
+        assumed_align=16,
+    )
     scale_storage_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8,
         (state_E * rows_pad_k * cols_pad_k,),
@@ -1100,6 +1117,7 @@ def _get_static_kernel(
             packed_a_fake,
             sfa_fake,
             packed_a_storage_fake,
+            route_output_scratch_fake,
             scale_storage_fake,
             barrier_count_fake,
             barrier_epoch_fake,
@@ -1743,6 +1761,7 @@ def launch_sm120_static_moe(
             swiglu_limit=swiglu_limit,
             quant_mode=quant_mode,
         )
+        route_output_scratch_args: Tuple[Any, ...] = ()
         virt_scratch_args: Tuple[Any, ...] = ()
     else:
         compiled, mac = _get_static_kernel(
@@ -1765,6 +1784,7 @@ def launch_sm120_static_moe(
             quant_mode=quant_mode,
         )
         launch_ids = flat_ids
+        route_output_scratch_args = (workspace.route_output_scratch.view(-1),)
         virt_scratch_args = (workspace.virt_route_scratch,)
 
     # Pointer arguments must be passed as raw ints (data_ptr()) at runtime.
@@ -1779,6 +1799,7 @@ def launch_sm120_static_moe(
         workspace.packed_a_view,
         workspace.packed_input_scale.data_ptr(),
         workspace.packed_a_flat,
+        *route_output_scratch_args,
         workspace.scale_flat,
         workspace.barrier_count,
         workspace.barrier_epoch,
@@ -3199,6 +3220,98 @@ def _pad_intermediate_to_tile(
     return result
 
 
+def _validate_static_workspace_for_launch(
+    workspace,
+    *,
+    state_E: int,
+    weight_E: int,
+    routed_rows: int,
+    k: int,
+    n: int,
+    num_topk: int,
+    device: torch.device,
+    activation_precision: str,
+    quant_mode: str,
+) -> None:
+    """Reject stale or undersized shared static workspaces before launch."""
+    if type(workspace) is not Sm120StaticMoEWorkspace:
+        raise ValueError(
+            "pre-allocated static workspace must be Sm120StaticMoEWorkspace"
+        )
+    expected_metadata = {
+        "state_E": state_E,
+        "weight_E": weight_E,
+        "k": k,
+        "n": n,
+        "num_topk": num_topk,
+        "device": torch.device(device),
+        "activation_precision": activation_precision,
+        "quant_mode": quant_mode,
+    }
+    for name, expected in expected_metadata.items():
+        if getattr(workspace, name, None) != expected:
+            raise ValueError(
+                f"pre-allocated static workspace {name} mismatch: "
+                f"expected {expected!r}, got {getattr(workspace, name, None)!r}."
+            )
+    if not isinstance(workspace.max_rows, int) or workspace.max_rows < routed_rows:
+        raise ValueError(
+            "pre-allocated static workspace capacity is too small: "
+            f"max_rows={getattr(workspace, 'max_rows', None)!r}, "
+            f"routed_rows={routed_rows}."
+        )
+
+    max_rows = workspace.max_rows
+    max_chunks = (max_rows + 31) // 32
+    virt_E = state_E + max_chunks
+    sf_vec_size, _ = _sf_params_for_quant_mode(quant_mode)
+    rows_pad_k = _align_up(max_rows, 128)
+    cols_pad_k = _align_up(k // sf_vec_size, 4)
+    retained_groups = max(1, n // _STATIC_RETAINED_GROUP_N)
+    tensors = {
+        "row_counts": ((virt_E,), torch.int32),
+        "token_map": ((virt_E, max_rows), torch.int32),
+        "token_weights": ((virt_E, max_rows), torch.float32),
+        "packed_input": ((virt_E, max_rows, k // 2), torch.uint8),
+        "packed_input_scale": (
+            (virt_E, rows_pad_k, cols_pad_k),
+            torch.uint8,
+        ),
+        "route_output_scratch": (
+            (max_rows, retained_groups, k),
+            torch.bfloat16,
+        ),
+    }
+    for name, (shape, dtype) in tensors.items():
+        value = getattr(workspace, name, None)
+        if (
+            not isinstance(value, torch.Tensor)
+            or tuple(value.shape) != shape
+            or value.dtype != dtype
+            or value.device != torch.device(device)
+        ):
+            raise ValueError(
+                f"pre-allocated static workspace {name} mismatch: expected "
+                f"shape={shape}, dtype={dtype}, device={torch.device(device)}."
+            )
+
+    packed = workspace.packed_input
+    route = workspace.route_output_scratch
+    packed_range = (
+        packed.data_ptr(),
+        packed.data_ptr() + packed.numel() * packed.element_size(),
+    )
+    route_range = (
+        route.data_ptr(),
+        route.data_ptr() + route.numel() * route.element_size(),
+    )
+    if max(packed_range[0], route_range[0]) < min(packed_range[1], route_range[1]):
+        raise ValueError(
+            "pre-allocated static workspace packed_input and "
+            "route_output_scratch storage overlap"
+        )
+
+
 def launch_sm120_moe(
     *,
     a: torch.Tensor,
@@ -3300,15 +3413,6 @@ def launch_sm120_moe(
             _prepared_weights=_prepared_weights,
         )
 
-    if fc2_input_scale is None:
-        if quant_mode == "nvfp4":
-            raise ValueError("fc2_input_scale is required when quant_mode='nvfp4'.")
-        # MXFP4 has no tensor-wide FC2 input scale. Reuse an existing
-        # per-expert tensor because the shared kernel signature still carries
-        # the argument; the MXFP4 quantizer ignores it.
-        down_input_scale = w2_alpha
-    else:
-        down_input_scale = fc2_input_scale
     if quant_mode == "nvfp4" and input_global_scale is not None:
         input_gs = input_global_scale
         if _weight_views is None:
@@ -3320,27 +3424,7 @@ def launch_sm120_moe(
     else:
         input_gs = w1_alpha
 
-    weights = (
-        _weight_views
-        if _weight_views is not None
-        else _get_weight_views(
-            w1_fp4=w1_weight,
-            w1_blockscale=w1_weight_sf,
-            w2_fp4=w2_weight,
-            w2_blockscale=w2_weight_sf,
-            w1_alphas=w1_alpha,
-            w2_alphas=w2_alpha,
-            n=n,
-            k=k,
-            activation_precision=activation_precision,
-            quant_mode=quant_mode,
-        )
-    )
-
-    # Resolve workspace and backend selection.
-    # When a pre-allocated workspace is provided (CUDA graph wrapper path),
-    # infer the backend from the workspace type so they stay in sync —
-    # the caller already committed to a backend at allocation time.
+    # Resolve the backend before applying its private physical geometry.
     if _workspace is not None:
         workspace = _workspace
         workspace_activation_precision = getattr(
@@ -3370,6 +3454,7 @@ def launch_sm120_moe(
         else:
             backend = "static"
     else:
+        workspace = None
         backend = select_sm120_moe_backend(
             num_tokens=num_tokens,
             num_topk=top_k,
@@ -3382,6 +3467,61 @@ def launch_sm120_moe(
         # has global-to-local expert remapping.
         if backend == "dynamic" and num_local_experts != num_experts:
             backend = "static"
+
+    # retained2 always consumes two adjacent N128 slices. Keep that physical
+    # padding inside the static dispatch path; the wrapper remains unaware of
+    # the schedule and dynamic keeps its native N128 geometry.
+    weight_views = _weight_views
+    if backend == "static" and n % _STATIC_RETAINED_GROUP_N != 0:
+        (
+            w1_weight,
+            w1_weight_sf,
+            w2_weight,
+            w2_weight_sf,
+            fc2_input_scale,
+            n,
+        ) = _pad_intermediate_to_tile(
+            w1_weight,
+            w1_weight_sf,
+            w2_weight,
+            w2_weight_sf,
+            fc2_input_scale,
+            n,
+            _STATIC_RETAINED_GROUP_N,
+            k,
+            w1_weight.size(0),
+            is_gated,
+            quant_mode,
+        )
+        weight_views = None
+
+    if fc2_input_scale is None:
+        if quant_mode == "nvfp4":
+            raise ValueError("fc2_input_scale is required when quant_mode='nvfp4'.")
+        # MXFP4 has no tensor-wide FC2 input scale. Reuse an existing
+        # per-expert tensor because the shared kernel signature still carries
+        # the argument; the MXFP4 quantizer ignores it.
+        down_input_scale = w2_alpha
+    else:
+        down_input_scale = fc2_input_scale
+    weights = (
+        weight_views
+        if weight_views is not None
+        else _get_weight_views(
+            w1_fp4=w1_weight,
+            w1_blockscale=w1_weight_sf,
+            w2_fp4=w2_weight,
+            w2_blockscale=w2_weight_sf,
+            w1_alphas=w1_alpha,
+            w2_alphas=w2_alpha,
+            n=n,
+            k=k,
+            activation_precision=activation_precision,
+            quant_mode=quant_mode,
+        )
+    )
+
+    if workspace is None:
         workspace = _get_cached_workspace(
             backend=backend,
             state_E=num_local_experts,
@@ -3394,6 +3534,20 @@ def launch_sm120_moe(
             activation_precision=activation_precision,
             quant_mode=quant_mode,
             activation=activation,
+        )
+
+    if backend == "static":
+        _validate_static_workspace_for_launch(
+            workspace,
+            state_E=num_local_experts,
+            weight_E=num_experts,
+            routed_rows=routed_rows,
+            k=k,
+            n=n,
+            num_topk=top_k,
+            device=a.device,
+            activation_precision=activation_precision,
+            quant_mode=quant_mode,
         )
 
     if backend == "dynamic":

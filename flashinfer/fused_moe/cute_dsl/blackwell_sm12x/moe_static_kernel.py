@@ -963,6 +963,7 @@ class MoEStaticKernel:
         packed_a: cute.Tensor,  # [max_rows, K, E] fp4x2 view for compute
         sfa_ptr: cute.Pointer,
         packed_a_storage: cute.Tensor,  # flat uint8 backing packed_a
+        route_output_scratch: cute.Tensor,  # flat bf16 [route, retained_group, K]
         scale_storage: cute.Tensor,  # flat uint8 backing sfa_ptr
         barrier_count: cute.Tensor,  # [1] int32 (host-zeroed)
         barrier_epoch: cute.Tensor,  # [1] int32 (host-zeroed)
@@ -1062,6 +1063,7 @@ class MoEStaticKernel:
             topk_ids,
             topk_weights,
             packed_a_storage,
+            route_output_scratch,
             scale_storage,
             barrier_count,
             barrier_epoch,
@@ -1120,7 +1122,7 @@ class MoEStaticKernel:
         final_grid_z = (final_vec_count + 255) // 256
         final_grid = (1, 1, final_grid_z)
         self.finalize_kernel(
-            packed_a_storage,
+            route_output_scratch,
             scatter_output,
             topk_ids,
             retained_group_count,
@@ -1139,6 +1141,7 @@ class MoEStaticKernel:
         topk_ids: cute.Tensor,
         topk_weights: cute.Tensor,
         packed_a_storage: cute.Tensor,
+        route_output_scratch: cute.Tensor,
         scale_storage: cute.Tensor,
         barrier_count: cute.Tensor,
         barrier_epoch: cute.Tensor,
@@ -1685,13 +1688,6 @@ class MoEStaticKernel:
         )
         output_tile_cnt = cute.size(gB_down, mode=[2])
         retained_group_count = (gate_tile_cnt + Int32(1)) // Int32(2)
-        # The wrapper reserves packed-A capacity for max_num_tokens, while the
-        # compact static path consumes only the contiguous active-expert
-        # prefix.  Use the high end as a private
-        # [route, retained_group, K] BF16 contribution buffer.
-        route_scratch_bytes = total_pairs * retained_group_count * cols * Int32(2)
-        route_scratch_base = Int32(packed_a_storage.shape[0]) - route_scratch_bytes
-
         prod_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.ab_stage
         )
@@ -2481,17 +2477,15 @@ class MoEStaticKernel:
                                 route_partial = intermediate_slice // Int32(2)
                                 store_weighted_bf16x8_route(
                                     get_ptr_as_int64(
-                                        packed_a_storage,
-                                        route_scratch_base
-                                        + (
+                                        route_output_scratch,
+                                        (
                                             (
                                                 route_idx * retained_group_count
                                                 + route_partial
                                             )
                                             * scatter_N
                                             + global_col
-                                        )
-                                        * Int32(2),
+                                        ),
                                     ),
                                     sc_smem_addr,
                                     wv,
@@ -2735,7 +2729,7 @@ class MoEStaticKernel:
     @cute.kernel
     def finalize_kernel(
         self,
-        packed_a_storage: cute.Tensor,
+        route_output_scratch: cute.Tensor,
         scatter_output: cute.Tensor,
         topk_ids: cute.Tensor,
         retained_group_count: cutlass.Constexpr,
@@ -2750,11 +2744,6 @@ class MoEStaticKernel:
         cols = Int32(scatter_output.shape[1])
         total_pairs = Int32(topk_ids.shape[0])
         num_topk = total_pairs // num_tokens
-        route_scratch_bytes = (
-            total_pairs * Int32(retained_group_count) * cols * Int32(2)
-        )
-        route_scratch_base = Int32(packed_a_storage.shape[0]) - route_scratch_bytes
-
         vecs_per_token = cols // Int32(8)
         final_vec_count = num_tokens * vecs_per_token
         final_vec_idx = flat_tid
@@ -2770,17 +2759,15 @@ class MoEStaticKernel:
                 while final_partial < Int32(retained_group_count):
                     route_values = load_global_bf16x8_to_f32x8(
                         get_ptr_as_int64(
-                            packed_a_storage,
-                            route_scratch_base
-                            + (
+                            route_output_scratch,
+                            (
                                 (
                                     final_route * Int32(retained_group_count)
                                     + final_partial
                                 )
                                 * cols
                                 + final_col
-                            )
-                            * Int32(2),
+                            ),
                         )
                     )
                     for final_elem in cutlass.range_constexpr(8):
