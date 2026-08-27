@@ -316,6 +316,25 @@ inline tvm::ffi::CubinKernel& MainKernel(int64_t world_size, int64_t dtype_code,
   return dtype_code == 0 ? bf16_ws4 : f16_ws4;
 }
 
+inline tvm::ffi::CubinKernel& ConfiguredMainKernel(
+    int64_t world_size, int64_t dtype_code, int64_t n, int64_t device_id) {
+  auto& kernel = MainKernel(world_size, dtype_code, n);
+  namespace cuda_api = tvm::ffi::cuda_api;
+  static signed char smem_configured[4][64] = {};
+  TVM_FFI_CHECK(device_id >= 0 && device_id < 64, RuntimeError)
+      << "CUDA device id exceeds the dynamic-smem cache";
+  const int route = (world_size == 4 ? 2 : 0) + (dtype_code == 1 ? 1 : 0);
+  if (smem_configured[route][device_id] == 0) {
+    auto device = cuda_api::GetDeviceHandle(device_id);
+    const auto result = cuda_api::SetKernelMaxDynamicSharedMem(
+        kernel.GetHandle(), kMainSmemBytes, device);
+    TVM_FFI_CHECK(result == cuda_api::kSuccess, RuntimeError)
+        << "setting max dynamic shared memory failed";
+    smem_configured[route][device_id] = 1;
+  }
+  return kernel;
+}
+
 void RunBarrier(TensorView flag_peers, int64_t world_size, int64_t rank,
                 int64_t phase, int64_t cuda_stream) {
   CheckCudaTensor(flag_peers, "flag_peers");
@@ -358,11 +377,23 @@ void RunMain(TensorView inp, TensorView scratch, TensorView weight,
   TVM_FFI_CHECK(descriptor_storage.numel() >= kDescriptorCount * kTensorMapBytes,
                 ValueError)
       << "descriptor_storage is too small";
+  const DLDataType descriptor_dtype = descriptor_storage.dtype();
+  TVM_FFI_CHECK(descriptor_dtype.code == kDLUInt &&
+                    descriptor_dtype.bits == 8 &&
+                    descriptor_dtype.lanes == 1,
+                TypeError)
+      << "descriptor_storage must have uint8 dtype";
   const DLDataType ready_dtype = ready.dtype();
   TVM_FFI_CHECK(ready_dtype.code == kDLUInt && ready_dtype.bits == 32 &&
                     ready_dtype.lanes == 1,
                 TypeError)
       << "ready must have uint32 dtype";
+  const int64_t chunk_rows = rows < 2432 ? rows : 2432;
+  const int64_t num_chunks = (rows + chunk_rows - 1) / chunk_rows;
+  TVM_FFI_CHECK(ready.ndim() == 2 && ready.size(0) == world_size &&
+                    ready.size(1) == num_chunks,
+                ValueError)
+      << "ready must have shape [world_size, num_chunks]";
 
   auto* descriptors = static_cast<unsigned char*>(descriptor_storage.data_ptr());
   void* inp_map = descriptors + 0 * kTensorMapBytes;
@@ -377,23 +408,9 @@ void RunMain(TensorView inp, TensorView scratch, TensorView weight,
                   &scratch_ptr, &ready_ptr, &local_rank, &local_rows};
 
   const int64_t n = weight.size(1);
-  auto& kernel = MainKernel(world_size, dtype_code, n);
-  namespace cuda_api = tvm::ffi::cuda_api;
-  static signed char smem_configured[4][64] = {};
-  TVM_FFI_CHECK(inp.device().device_id >= 0 && inp.device().device_id < 64,
-                RuntimeError)
-      << "CUDA device id exceeds the dynamic-smem cache";
-  const int route = (world_size == 4 ? 2 : 0) + (dtype_code == 1 ? 1 : 0);
-  if (smem_configured[route][inp.device().device_id] == 0) {
-    auto device = cuda_api::GetDeviceHandle(inp.device().device_id);
-    const auto result = cuda_api::SetKernelMaxDynamicSharedMem(
-        kernel.GetHandle(), kMainSmemBytes, device);
-    TVM_FFI_CHECK(result == cuda_api::kSuccess, RuntimeError)
-        << "setting max dynamic shared memory failed";
-    smem_configured[route][inp.device().device_id] = 1;
-  }
+  auto& kernel = ConfiguredMainKernel(world_size, dtype_code, n,
+                                      inp.device().device_id);
 
-  const int64_t chunk_rows = rows < 2432 ? rows : 2432;
   const uint32_t grid_x =
       static_cast<uint32_t>((chunk_rows / 128) * (n / 256));
   CUstream stream = reinterpret_cast<CUstream>(
@@ -407,28 +424,54 @@ void RunMain(TensorView inp, TensorView scratch, TensorView weight,
 void RunPreparedPackedQkv(
     TensorView inp, TensorView scratch, TensorView weight, TensorView out,
     TensorView descriptor_storage, TensorView ready, TensorView flag_peers,
-    TensorView peer_scratch_ptrs, TensorView peer_signal_ptrs,
+    TensorView peer_scratch_0, TensorView peer_signal_0,
+    TensorView peer_scratch_1, TensorView peer_signal_1,
+    TensorView peer_scratch_2, TensorView peer_signal_2,
     int64_t world_size, int64_t rank, int64_t rows, int64_t phase,
     int64_t main_cuda_stream, int64_t comm_cuda_stream,
-    int64_t bridge_cuda_event) {
+    int64_t bridge_cuda_event, int64_t expected_scratch_ptr,
+    int64_t expected_ready_ptr, int64_t expected_peer_scratch_0,
+    int64_t expected_peer_signal_0, int64_t expected_peer_scratch_1,
+    int64_t expected_peer_signal_1, int64_t expected_peer_scratch_2,
+    int64_t expected_peer_signal_2) {
   CheckCommonInputs(inp, scratch, weight, out, world_size, rows);
   CheckCudaTensor(descriptor_storage, "descriptor_storage");
   CheckCudaTensor(ready, "ready");
+  CheckCudaTensor(flag_peers, "flag_peers");
   CheckSameDevice(descriptor_storage, inp, "descriptor_storage");
   CheckSameDevice(ready, inp, "ready");
+  CheckSameDevice(flag_peers, inp, "flag_peers");
   CheckContiguous(descriptor_storage, "descriptor_storage");
   CheckContiguous(ready, "ready");
+  CheckContiguous(flag_peers, "flag_peers");
   TVM_FFI_CHECK(descriptor_storage.numel() >=
                     kDescriptorCount * kTensorMapBytes,
                 ValueError)
       << "descriptor_storage is too small";
+  const DLDataType descriptor_dtype = descriptor_storage.dtype();
+  TVM_FFI_CHECK(descriptor_dtype.code == kDLUInt &&
+                    descriptor_dtype.bits == 8 &&
+                    descriptor_dtype.lanes == 1,
+                TypeError)
+      << "descriptor_storage must have uint8 dtype";
   const DLDataType ready_dtype = ready.dtype();
   TVM_FFI_CHECK(ready_dtype.code == kDLUInt && ready_dtype.bits == 32 &&
                     ready_dtype.lanes == 1,
                 TypeError)
       << "ready must have uint32 dtype";
+  const DLDataType flag_dtype = flag_peers.dtype();
+  TVM_FFI_CHECK(flag_dtype.code == kDLInt && flag_dtype.bits == 64 &&
+                    flag_dtype.lanes == 1,
+                TypeError)
+      << "flag_peers must have int64 dtype";
   TVM_FFI_CHECK(world_size == 4, ValueError)
       << "prepared packed-QKV launch requires world_size=4";
+  TVM_FFI_CHECK(rank >= 0 && rank < world_size, ValueError)
+      << "rank is outside the process group";
+  TVM_FFI_CHECK(flag_peers.ndim() == 1 &&
+                    flag_peers.numel() == world_size,
+                ValueError)
+      << "flag_peers must contain one pointer per rank";
   TVM_FFI_CHECK(weight.size(1) == 2560, ValueError)
       << "prepared packed-QKV launch requires N=2560";
   const DLDataType dtype = inp.dtype();
@@ -436,23 +479,77 @@ void RunPreparedPackedQkv(
                     dtype.lanes == 1,
                 TypeError)
       << "prepared packed-QKV launch requires bfloat16";
-  for (const auto* tensor : {&peer_scratch_ptrs, &peer_signal_ptrs}) {
-    CheckCpuTensor(*tensor, "prepared peer pointer array");
-    CheckContiguous(*tensor, "prepared peer pointer array");
-    const DLDataType pointer_dtype = tensor->dtype();
-    TVM_FFI_CHECK(pointer_dtype.code == kDLInt && pointer_dtype.bits == 64 &&
-                      pointer_dtype.lanes == 1,
-                  TypeError)
-        << "prepared peer pointer arrays must have int64 dtype";
-    TVM_FFI_CHECK(tensor->ndim() == 1 &&
-                      tensor->numel() == world_size - 1,
-                  ValueError)
-        << "prepared peer pointer arrays must contain world_size-1 pointers";
-  }
+  const int64_t chunk_rows = rows < 2432 ? rows : 2432;
+  const int64_t num_chunks = (rows + chunk_rows - 1) / chunk_rows;
+  TVM_FFI_CHECK(ready.ndim() == 2 && ready.size(0) == world_size &&
+                    ready.size(1) == num_chunks,
+                ValueError)
+      << "ready must have shape [world_size, num_chunks]";
   TVM_FFI_CHECK(main_cuda_stream != 0 && comm_cuda_stream != 0 &&
                     bridge_cuda_event != 0,
                 ValueError)
       << "prepared packed-QKV CUDA handles must be nonzero";
+
+  const std::array<const TensorView*, 3> peer_scratch = {
+      &peer_scratch_0, &peer_scratch_1, &peer_scratch_2};
+  const std::array<const TensorView*, 3> peer_signal = {
+      &peer_signal_0, &peer_signal_1, &peer_signal_2};
+  const std::array<int64_t, 3> expected_peer_scratch = {
+      expected_peer_scratch_0, expected_peer_scratch_1,
+      expected_peer_scratch_2};
+  const std::array<int64_t, 3> expected_peer_signal = {
+      expected_peer_signal_0, expected_peer_signal_1, expected_peer_signal_2};
+  TVM_FFI_CHECK(expected_scratch_ptr != 0 && expected_ready_ptr != 0 &&
+                    reinterpret_cast<uintptr_t>(scratch.data_ptr()) ==
+                        static_cast<uintptr_t>(expected_scratch_ptr) &&
+                    reinterpret_cast<uintptr_t>(ready.data_ptr()) ==
+                        static_cast<uintptr_t>(expected_ready_ptr),
+                ValueError)
+      << "prepared workspace storage changed after binding";
+  for (int64_t peer_index = 0; peer_index < world_size - 1; ++peer_index) {
+    const auto& peer_scratch_tensor = *peer_scratch[peer_index];
+    const auto& peer_signal_tensor = *peer_signal[peer_index];
+    CheckCudaTensor(peer_scratch_tensor, "prepared peer scratch");
+    CheckCudaTensor(peer_signal_tensor, "prepared peer signal");
+    CheckSameDevice(peer_scratch_tensor, inp, "prepared peer scratch");
+    CheckSameDevice(peer_signal_tensor, inp, "prepared peer signal");
+    CheckContiguous(peer_scratch_tensor, "prepared peer scratch");
+    CheckContiguous(peer_signal_tensor, "prepared peer signal");
+    const DLDataType peer_scratch_dtype = peer_scratch_tensor.dtype();
+    const DLDataType peer_signal_dtype = peer_signal_tensor.dtype();
+    TVM_FFI_CHECK(peer_scratch_dtype.code == dtype.code &&
+                      peer_scratch_dtype.bits == dtype.bits &&
+                      peer_scratch_dtype.lanes == dtype.lanes &&
+                      peer_scratch_tensor.ndim() == 2 &&
+                      peer_scratch_tensor.size(0) == rows &&
+                      peer_scratch_tensor.size(1) == 8192,
+                  ValueError)
+        << "prepared peer scratch binding changed";
+    TVM_FFI_CHECK(peer_signal_dtype.code == kDLUInt &&
+                      peer_signal_dtype.bits == 32 &&
+                      peer_signal_dtype.lanes == 1 &&
+                      peer_signal_tensor.ndim() == 1 &&
+                      peer_signal_tensor.size(0) == num_chunks,
+                  ValueError)
+        << "prepared peer signal binding changed";
+    TVM_FFI_CHECK(expected_peer_scratch[peer_index] != 0 &&
+                      expected_peer_signal[peer_index] != 0 &&
+                      reinterpret_cast<uintptr_t>(
+                          peer_scratch_tensor.data_ptr()) ==
+                          static_cast<uintptr_t>(
+                              expected_peer_scratch[peer_index]) &&
+                      reinterpret_cast<uintptr_t>(
+                          peer_signal_tensor.data_ptr()) ==
+                          static_cast<uintptr_t>(
+                              expected_peer_signal[peer_index]),
+                  ValueError)
+        << "prepared peer storage changed after binding";
+  }
+
+  // Resolve every kernel/capability check before this rank enters the collective.
+  (void)BarrierKernel(world_size, phase);
+  (void)ConfiguredMainKernel(world_size, 0, weight.size(1),
+                             inp.device().device_id);
 
   CUstream main_stream = reinterpret_cast<CUstream>(
       static_cast<uintptr_t>(main_cuda_stream));
@@ -469,22 +566,16 @@ void RunPreparedPackedQkv(
                 RuntimeError)
       << "waiting for the prepared barrier on the comm stream failed";
 
-  const auto* scratch_ptrs =
-      static_cast<const int64_t*>(peer_scratch_ptrs.data_ptr());
-  const auto* signal_ptrs =
-      static_cast<const int64_t*>(peer_signal_ptrs.data_ptr());
-  const int64_t chunk_rows = rows < 2432 ? rows : 2432;
-  const int64_t num_chunks = (rows + chunk_rows - 1) / chunk_rows;
   const size_t row_bytes = 8192 * sizeof(uint16_t);
   const CUdeviceptr input_base = static_cast<CUdeviceptr>(
       reinterpret_cast<uintptr_t>(inp.data_ptr()));
   for (int64_t peer_index = 0; peer_index < world_size - 1; ++peer_index) {
     const CUdeviceptr peer_scratch_base =
-        static_cast<CUdeviceptr>(scratch_ptrs[peer_index]);
+        static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(
+            peer_scratch[peer_index]->data_ptr()));
     const CUdeviceptr peer_signal_base =
-        static_cast<CUdeviceptr>(signal_ptrs[peer_index]);
-    TVM_FFI_CHECK(peer_scratch_base != 0 && peer_signal_base != 0, ValueError)
-        << "prepared peer pointers must be nonzero";
+        static_cast<CUdeviceptr>(reinterpret_cast<uintptr_t>(
+            peer_signal[peer_index]->data_ptr()));
     for (int64_t chunk = 0; chunk < num_chunks; ++chunk) {
       const int64_t begin = chunk * chunk_rows;
       const int64_t end = (begin + chunk_rows) < rows
@@ -1022,9 +1113,10 @@ class _PreparedPackedQkvSm103Tp4Launcher:
     num_chunks: int
     chunk_plan: tuple[tuple[int, int], ...]
     signal_pad: torch.Tensor = field(repr=False)
+    signal_pad_ptr: int
     peer_routes: tuple[tuple[torch.Tensor, torch.Tensor], ...] = field(repr=False)
-    peer_scratch_ptrs: torch.Tensor = field(repr=False)
-    peer_signal_ptrs: torch.Tensor = field(repr=False)
+    peer_scratch_ptrs: tuple[int, ...]
+    peer_signal_ptrs: tuple[int, ...]
     verbose: bool = False
 
     def _validate_hot_input(self, inp: torch.Tensor) -> None:
@@ -1091,8 +1183,12 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                     descriptors,
                     self.signal_pad,
                     state.flag_peers,
-                    self.peer_scratch_ptrs,
-                    self.peer_signal_ptrs,
+                    self.peer_routes[0][0],
+                    self.peer_routes[0][1],
+                    self.peer_routes[1][0],
+                    self.peer_routes[1][1],
+                    self.peer_routes[2][0],
+                    self.peer_routes[2][1],
                     self.world_size,
                     self.rank,
                     self.rows,
@@ -1100,6 +1196,14 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                     main_stream_id,
                     int(workspace.comm_stream.cuda_stream),
                     int(workspace.bridge_event.cuda_event),
+                    int(self.scratch_fingerprint[0]),
+                    self.signal_pad_ptr,
+                    self.peer_scratch_ptrs[0],
+                    self.peer_signal_ptrs[0],
+                    self.peer_scratch_ptrs[1],
+                    self.peer_signal_ptrs[1],
+                    self.peer_scratch_ptrs[2],
+                    self.peer_signal_ptrs[2],
                 )
                 if state.tail_event is None:
                     state.tail_event = torch.cuda.Event(enable_timing=False)
@@ -1243,15 +1347,11 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
                     device=device,
                 )
                 peer_routes.append((peer_scratch, peer_signal_row))
-            peer_scratch_ptrs = torch.tensor(
-                [int(peer_scratch.data_ptr()) for peer_scratch, _ in peer_routes],
-                dtype=torch.int64,
-                device="cpu",
+            peer_scratch_ptrs = tuple(
+                int(peer_scratch.data_ptr()) for peer_scratch, _ in peer_routes
             )
-            peer_signal_ptrs = torch.tensor(
-                [int(peer_signal.data_ptr()) for _, peer_signal in peer_routes],
-                dtype=torch.int64,
-                device="cpu",
+            peer_signal_ptrs = tuple(
+                int(peer_signal.data_ptr()) for _, peer_signal in peer_routes
             )
             launcher = _PreparedPackedQkvSm103Tp4Launcher(
                 group=group,
@@ -1274,6 +1374,7 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
                 num_chunks=num_chunks,
                 chunk_plan=chunk_plan,
                 signal_pad=signal_pad,
+                signal_pad_ptr=int(signal_pad.data_ptr()),
                 peer_routes=tuple(peer_routes),
                 peer_scratch_ptrs=peer_scratch_ptrs,
                 peer_signal_ptrs=peer_signal_ptrs,

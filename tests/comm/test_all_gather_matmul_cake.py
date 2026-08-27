@@ -934,9 +934,10 @@ def test_prepare_packed_qkv_binds_host_identity_once(monkeypatch):
     assert launcher.num_chunks == 1
     assert launcher.chunk_plan == ((0, 128),)
     assert launcher.signal_pad.shape == (4, 1)
+    assert launcher.signal_pad_ptr == 4002
     assert len(launcher.peer_routes) == 3
-    assert launcher.peer_scratch_ptrs.tolist() == [5004, 5001, 5002]
-    assert launcher.peer_signal_ptrs.tolist() == [4004, 4001, 4002]
+    assert launcher.peer_scratch_ptrs == (5004, 5001, 5002)
+    assert launcher.peer_signal_ptrs == (4004, 4001, 4002)
     assert [call[:2] for call in workspace.scratch_handle.calls] == [
         ("signal", 2),
         ("remote", 3),
@@ -994,9 +995,31 @@ def test_prepared_packed_qkv_hot_path_uses_one_native_submission(monkeypatch):
     assert descriptor.data_ptr() == 6001
     assert submission[5] is launcher.signal_pad
     assert submission[6] is state.flag_peers
-    assert submission[7] is launcher.peer_scratch_ptrs
-    assert submission[8] is launcher.peer_signal_ptrs
-    assert submission[9:] == (4, 2, 128, 0, 17, 23, 29)
+    assert submission[7:13] == (
+        launcher.peer_routes[0][0],
+        launcher.peer_routes[0][1],
+        launcher.peer_routes[1][0],
+        launcher.peer_routes[1][1],
+        launcher.peer_routes[2][0],
+        launcher.peer_routes[2][1],
+    )
+    assert submission[13:] == (
+        4,
+        2,
+        128,
+        0,
+        17,
+        23,
+        29,
+        3001,
+        4002,
+        5004,
+        4004,
+        5001,
+        4001,
+        5002,
+        4002,
+    )
     assert state.next_phase == 1
     assert state.tail_stream == 17
     assert state.tail_event.recorded_streams
