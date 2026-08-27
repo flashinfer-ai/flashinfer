@@ -1062,14 +1062,36 @@ class GmemQKVResource(MemoryResource):
         return batch_coord, kv_tile_start, cached_seqlen_kv
 
 
-def _qkv_inner_dim_size_bytes(cfg: FmhaConfig) -> int:
+def _qk_inner_dim_size_bytes(cfg: FmhaConfig) -> int:
     """Return the byte width of one Q/K/V tile inner dimension."""
     return cfg.qk_mma_tiler[2] * cfg.q_dtype.width // 8
 
 
-def _qkv_smem_layout(cfg: FmhaConfig) -> int:
-    """Return the tcgen05 descriptor layout selector for Q/K/V SMEM tiles."""
-    inner_dim_size = _qkv_inner_dim_size_bytes(cfg)
+def _pv_inner_dim_size_bytes(cfg: FmhaConfig) -> int:
+    """Return the byte width of one P/V tile inner dimension."""
+    return cfg.pv_mma_tiler[1] * cfg.v_dtype.width // 8
+
+
+def _o_inner_dim_size_bytes(cfg: FmhaConfig) -> int:
+    """Return the byte width of one O tile inner dimension."""
+    return cfg.qk_mma_tiler[2] * cfg.o_dtype.width // 8
+
+
+def _qk_smem_layout(cfg: FmhaConfig) -> int:
+    """Return the tcgen05 descriptor layout selector for Q/K SMEM tiles."""
+    inner_dim_size = _qk_inner_dim_size_bytes(cfg)
+    if inner_dim_size % 128 == 0:
+        return 2
+    if inner_dim_size == 64:
+        return 4
+    if inner_dim_size == 32:
+        return 6
+    raise RuntimeError(f"Unsupported inner dimension size: {inner_dim_size}")
+
+
+def _pv_smem_layout(cfg: FmhaConfig) -> int:
+    """Return the tcgen05 descriptor layout selector for V SMEM tiles."""
+    inner_dim_size = _pv_inner_dim_size_bytes(cfg)
     if inner_dim_size % 128 == 0:
         return 2
     if inner_dim_size == 64:
@@ -1106,7 +1128,7 @@ def _pv_smem_desc_offsets(cfg: FmhaConfig) -> SmemDescOffsets:
 
 def _smem_o_swizzle(cfg: FmhaConfig) -> cutlass.Swizzle:
     """Return the shared-memory swizzle used when staging O for TMA store."""
-    inner_dim_size = _qkv_inner_dim_size_bytes(cfg)
+    inner_dim_size = _o_inner_dim_size_bytes(cfg)
     if inner_dim_size % 128 == 0:
         return cutlass.Swizzle(3, 4, 3)
     if inner_dim_size == 64:
@@ -1254,7 +1276,7 @@ class SmemQResource(MemoryResource):
             sQ_curr,
             leading_byte_offset=leading_byte_offset,
             stride_byte_offset=stride_byte_offset,
-            layout=_qkv_smem_layout(self.cfg),
+            layout=_qk_smem_layout(self.cfg),
         )
 
     @consumer_work(returns=desc_q0_base)
@@ -1889,7 +1911,7 @@ class SmemKVResource(MemoryResource):
             sK_curr,
             leading_byte_offset=leading_byte_offset,
             stride_byte_offset=stride_byte_offset,
-            layout=_qkv_smem_layout(self.cfg),
+            layout=_qk_smem_layout(self.cfg),
         )
         return desc_k_base
 
@@ -1904,7 +1926,7 @@ class SmemKVResource(MemoryResource):
             sK_curr,
             leading_byte_offset=leading_byte_offset,
             stride_byte_offset=stride_byte_offset,
-            layout=_qkv_smem_layout(self.cfg),
+            layout=_pv_smem_layout(self.cfg),
         )
         return desc_v_base
 

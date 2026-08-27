@@ -2341,8 +2341,10 @@ class FmhaTs:
         Accumulator dtype for QK GEMM (default: Float32).
     pv_acc_dtype : type, optional
         Accumulator dtype for PV GEMM (default: Float32).
-    in_dtype : type, optional
-        Input tensor dtype for Q, K, V (default: Float16).
+    in_qk_dtype : type, optional
+        Input tensor dtype for Q and K (default: Float16).
+    in_pv_dtype : type, optional
+        Input tensor dtype for V (default: Float16).
     out_dtype : type, optional
         Output tensor dtype for O (default: Float16).
     mma_tiler_mn : Tuple[int, int], optional
@@ -2376,7 +2378,8 @@ class FmhaTs:
         self,
         qk_acc_dtype: type | None = None,
         pv_acc_dtype: type | None = None,
-        in_dtype: type | None = None,
+        in_qk_dtype: type | None = None,
+        in_pv_dtype: type | None = None,
         out_dtype: type | None = None,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         d: int = 128,
@@ -2439,9 +2442,10 @@ class FmhaTs:
         self.is_clc_dynamic = is_clc_dynamic
         self.exhaustive_deadlock_race_check = exhaustive_deadlock_race_check
 
-        q_dtype = in_dtype or cutlass.Float16
-        k_dtype = in_dtype or cutlass.Float16
-        v_dtype = in_dtype or cutlass.Float16
+        q_dtype = in_qk_dtype or cutlass.Float16
+        k_dtype = in_qk_dtype or cutlass.Float16
+        v_dtype = in_pv_dtype or cutlass.Float16
+
         o_dtype = out_dtype or cutlass.Float16
 
         cfg = FmhaConfig()
