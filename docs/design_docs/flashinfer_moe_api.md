@@ -718,21 +718,37 @@ TRT-LLM path carries the value in a per-expert `gemm1_beta` float tensor that
 has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
 silently dropping the parameter.
 
-The truthful unified support matrix follows the already executable flat path:
+The class-level matrix below is generated from the registered runner classes.
 
-| Runner / quantization | Unified activations |
-| --- | --- |
-| TRTLLM BF16 | SwiGLU (typed scalars), ReLU2 |
-| TRTLLM FP8 per-tensor | SwiGLU (default scalars), ReLU2 |
-| TRTLLM DeepSeek block FP8 | SwiGLU (typed scalars) |
-| TRTLLM MXFP8 block FP8 | SwiGLU (typed scalars), GeGLU, ReLU2 |
-| TRTLLM NVFP4 / MXFP4 | SwiGLU (typed scalars), GeGLU, SiTU, ReLU2 |
-| TRTLLM W4A16 | SwiGLU |
-| TRTLLM MxInt4 | SwiGLU (typed scalars) |
-| CUTLASS BF16 / NVFP4 / FP8 per-tensor / FP8 block / MXFP8×MXFP4 / MXFP8 / W4A16 / W4A8 / Humming | SwiGLU (typed scalars), SwiGLUStep, GeGLU, GeGLUTanh, ReLU2, SiTU (typed scalars), Identity, GELU, ReLU, SiLU |
-| CuTe-DSL NVFP4 / W4A16 | SwiGLU (typed scalars), GeGLUTanh, ReLU2, SiTU (typed scalars) |
-| b12x NVFP4 | SwiGLU (default scalars), GeGLUTanh, ReLU2 |
-| b12x W4A16 | SwiGLU (default scalars), ReLU2 |
+<!-- BEGIN GENERATED MOE ACTIVATION MATRIX -->
+| Backend | Config | Quantization | Typed activations |
+| --- | --- | --- | --- |
+| `b12x_nvfp4` | `B12xNvfp4Config` | `NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2` |
+| `b12x_w4a16` | `B12xW4A16Config` | `W4A16` | `SwiGLU`, `ReLU2` |
+| `cute_dsl_nvfp4` | `CuteDslConfig` | `NVFP4` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
+| `cute_dsl_nvfp4` | `CuteDslConfig` | `W4A16` | `SwiGLU`, `GeGLUTanh`, `ReLU2`, `SiTU` |
+| `cutlass_bf16` | `CutlassBf16Config` | `BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_fp8_block` | `CutlassFp8BlockConfig` | `DeepSeekFp8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_fp8_per_tensor` | `CutlassFp8PerTensorConfig` | `FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_humming` | `CutlassHummingConfig` | `Humming` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_mxfp8` | `CutlassMxfp8Config` | `MxFp8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_mxfp8_mxfp4` | `CutlassMxfp8Mxfp4Config` | `MXFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_w4a16` | `CutlassW4A16Config` | `W4A16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_w4a8` | `CutlassW4A8Config` | `W4A8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `trtllm_bf16_routed` | `TrtllmBf16Config` | `BF16` | `SwiGLU`, `ReLU2` |
+| `trtllm_fp4_routed` | `TrtllmFp4Config` | `MXFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+| `trtllm_fp4_routed` | `TrtllmFp4Config` | `NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
+| `trtllm_fp4_routed` | `TrtllmFp4Config` | `W4A16` | `SwiGLU` |
+| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `DeepSeekFp8` | `SwiGLU` |
+| `trtllm_fp8_block` | `TrtllmFp8BlockConfig` | `MxFp8` | `SwiGLU`, `GeGLU`, `ReLU2` |
+| `trtllm_fp8_per_tensor` | `TrtllmFp8PerTensorConfig` | `FP8PerTensor` | `SwiGLU`, `ReLU2` |
+| `trtllm_mxint4_routed` | `TrtllmMxInt4Config` | `MxInt4` | `SwiGLU` |
+<!-- END GENERATED MOE ACTIVATION MATRIX -->
+
+This table records activation classes, not every accepted scalar value. For
+example, TRT-LLM FP8 per-tensor and b12x accept only default-scalar `SwiGLU`,
+while other runner-specific restrictions remain in `check_support()`.
 
 TRT-LLM FP4 SiTU is supported on SM100/SM103 but rejected on SM107 while the
 pinned Rubin BMM artifact predates `SiTuGlu`.
