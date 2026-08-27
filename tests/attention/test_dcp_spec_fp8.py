@@ -696,7 +696,7 @@ def test_fp8_page64_d256_ratio16_all_ranks_and_graph_replay() -> None:
     torch.testing.assert_close(merged_lse, dense_lse, atol=0.1, rtol=0.1)
 
 
-@pytest.mark.parametrize("q_len", (1, 2, 3, 4, 5, 6, 8))
+@pytest.mark.parametrize("q_len", (1, 2, 3, 4, 5, 6, 7, 8))
 def test_fp8_page64_d256_b128_reviewer_all_ranks_and_graph_replay(
     q_len: int,
 ) -> None:

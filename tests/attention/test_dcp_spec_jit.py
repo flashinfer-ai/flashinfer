@@ -44,7 +44,7 @@ def test_dcp_spec_uri_covers_full_parameterized_domain() -> None:
     assert fp8_uri == (
         "cake_fmha_dcp_spec_bf16_fp8_sm100a_b256_q3_hq64_hkv8_cp4_split3_retain1"
     )
-    for q_len in (1, 2, 3, 4, 5, 6, 8):
+    for q_len in (1, 2, 3, 4, 5, 6, 7, 8):
         assert get_dcp_spec_fp8_d256_uri("sm100f", 8, q_len, 16, 1, 4, 4) == (
             "cake_fmha_dcp_spec_bf16_fp8_d256_sm100f_"
             f"b8_q{q_len}_hq16_hkv1_cp4_split4_retain0"
@@ -185,19 +185,18 @@ def test_dcp_spec_uri_rejects_unsupported_specialization(args, message) -> None:
         get_dcp_spec_uri(*args)
 
 
-def test_fp8_dcp_spec_uri_supports_q3_but_rejects_other_gaps() -> None:
+def test_fp8_dcp_spec_uri_supports_full_query_length_range() -> None:
     assert "_q3_" in get_dcp_spec_fp8_uri("sm100f", 64, 3, 64, 8, 4, 3, 1)
-    with pytest.raises(ValueError, match="q_len"):
-        get_dcp_spec_fp8_uri("sm100f", 64, 7, 64, 8, 4, 3, 1)
+    assert "_q7_" in get_dcp_spec_fp8_uri("sm100f", 64, 7, 64, 8, 4, 3, 1)
     with pytest.raises(ValueError, match="num_split"):
         get_dcp_spec_fp8_uri("sm100f", 64, 4, 64, 8, 4, 5, 1)
     with pytest.raises(ValueError, match="retain_kv_l2"):
         get_dcp_spec_fp8_uri("sm100f", 64, 4, 64, 8, 4, 3, 2)
 
 
-def test_fp8_d256_uri_rejects_q7_and_nonproduction_shapes() -> None:
+def test_fp8_d256_uri_rejects_nonproduction_shapes() -> None:
     with pytest.raises(ValueError, match="q_len"):
-        get_dcp_spec_fp8_d256_uri("sm100f", 8, 7, 16, 1, 4, 4)
+        get_dcp_spec_fp8_d256_uri("sm100f", 8, 9, 16, 1, 4, 4)
     with pytest.raises(ValueError, match="num_q_heads"):
         get_dcp_spec_fp8_d256_uri("sm100f", 8, 4, 32, 2, 4, 4)
     with pytest.raises(ValueError, match="cp_world"):
@@ -295,7 +294,7 @@ def test_dcp_split_selector_matches_promoted_policy() -> None:
         == 4
     )
     for sm_count in (148, 152):
-        for q_len in (1, 2, 3, 4, 5, 6, 8):
+        for q_len in (1, 2, 3, 4, 5, 6, 7, 8):
             assert (
                 _select_fp8_num_split(
                     logical_tiles=128 * q_len,
@@ -468,7 +467,7 @@ def test_fp8_page64_underfill_uses_split3_and_caller_owned_scratch(
     assert args[7].data_ptr() == inputs["completion_buffer"].data_ptr()
 
 
-@pytest.mark.parametrize("q_len", (1, 2, 3, 4, 5, 6, 8))
+@pytest.mark.parametrize("q_len", (1, 2, 3, 4, 5, 6, 7, 8))
 def test_fp8_d256_production_route_uses_split8_and_d256_workspace(
     q_len: int,
     monkeypatch,
@@ -528,12 +527,12 @@ def test_q3_is_restricted_to_fp8_page64() -> None:
         run_dcp_spec_decode(**_empty_rank_inputs(q_len_per_req=3))
 
 
-def test_fp8_d256_q7_is_rejected_by_public_dispatch() -> None:
+def test_fp8_d256_q9_is_rejected_by_public_dispatch() -> None:
     with pytest.raises(ValueError, match="q_len_per_req"):
         run_dcp_spec_decode(
             **_empty_rank_inputs(
                 kv_dtype=torch.float8_e4m3fn,
-                q_len_per_req=7,
+                q_len_per_req=9,
                 head_dim=256,
                 num_q_heads=16,
                 num_kv_heads=1,

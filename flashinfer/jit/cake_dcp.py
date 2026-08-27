@@ -37,8 +37,8 @@ _DCP_SPEC_NVCC_FLAGS = {
     "sm100f": sm100f_nvcc_flags,
 }
 _SUPPORTED_Q_LENS = (1, 2, 4, 5, 6, 8)
-_FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
-_FP8_D256_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
+_FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 7, 8)
+_FP8_D256_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 7, 8)
 _FP8_D256_SUPPORTED_SPLITS = (1, 2, 3, 4, 8, 16)
 _SUPPORTED_CP_WORLDS = (1, 2, 4, 8)
 
