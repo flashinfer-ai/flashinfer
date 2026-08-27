@@ -257,7 +257,7 @@ static __device__ __noinline__ void topk8(const __nv_bfloat16* __restrict__ row,
   // clang-format on
 #undef CE
 
-  unsigned int mysel = 0u;
+          unsigned int mysel = 0u;
   for (int r = 0; r < 8; ++r) {
     const unsigned int best = __reduce_max_sync(0xffffffffu, k0);
     if (lane == r) mysel = best;
