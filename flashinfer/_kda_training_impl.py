@@ -297,7 +297,9 @@ def _final_grid_ctas(shape: _TrainingShape) -> int:
 def _build_c16_metadata(
     shape: _TrainingShape, device: torch.device
 ) -> dict[str, object]:
-    chunk_counts = tuple(length // _C16_CHUNK for length in shape.seq_lens)
+    chunk_counts = tuple(
+        (length + _C16_CHUNK - 1) // _C16_CHUNK for length in shape.seq_lens
+    )
     resident_ctas = int(torch.cuda.get_device_properties(device).multi_processor_count)
     token_starts = [0]
     checkpoint_starts = [0]

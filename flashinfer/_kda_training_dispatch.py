@@ -121,7 +121,9 @@ def _unsplit_groups(problem: _Problem, *, chunk_tokens: int) -> tuple[_WorkGroup
 
 
 def _c16_split_groups(problem: _Problem) -> tuple[tuple[_WorkGroup, ...], int]:
-    chunk_counts = tuple(length // _C16_CHUNK for length in problem.seq_lens)
+    chunk_counts = tuple(
+        (length + _C16_CHUNK - 1) // _C16_CHUNK for length in problem.seq_lens
+    )
     total_chunk_heads = sum(chunk_counts) * problem.num_v_heads
     target_chunks = max(1, math.ceil(total_chunk_heads / problem.resident_sms))
     groups: list[_WorkGroup] = []
@@ -166,7 +168,9 @@ def _estimate_c16(problem: _Problem) -> tuple[float, bool]:
     )
     split += boundaries * 8.0 / problem.resident_sms
     use_split = split < unsplit
-    max_chunks = max(length // _C16_CHUNK for length in problem.seq_lens)
+    max_chunks = max(
+        (length + _C16_CHUNK - 1) // _C16_CHUNK for length in problem.seq_lens
+    )
     dag_fill = 17.0 + min(12.0, 3.0 * max_chunks / 32.0)
     return (
         (split if use_split else unsplit)
@@ -232,9 +236,8 @@ def _estimate_row(problem: _Problem) -> float:
 @lru_cache(maxsize=256)
 def _select_training_route_cached(problem: _Problem) -> _TrainingRouteSpec:
     candidates: list[tuple[float, _TemplateName, bool]] = []
-    if all(length % _C16_CHUNK == 0 for length in problem.seq_lens):
-        c16_cost, split = _estimate_c16(problem)
-        candidates.append((c16_cost, "checkpoint_recurrent_c16", split))
+    c16_cost, split = _estimate_c16(problem)
+    candidates.append((c16_cost, "checkpoint_recurrent_c16", split))
     candidates.append((_estimate_c32(problem), "tensor_tape_c32", False))
     candidates.append((_estimate_row(problem), "row_warp_checkpoint", False))
     _, template, split = min(candidates, key=lambda candidate: candidate[0])

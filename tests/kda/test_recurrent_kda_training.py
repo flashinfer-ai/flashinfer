@@ -131,7 +131,9 @@ def test_training_api_signatures_and_no_forward_recompute():
         ((1024,) * 8, 4, 8, "grouped_c16", "c16"),
         ((17, 33, 65), 4, 8, "grouped_row_split", "row_split"),
         ((17,), 1, 1, "row_split", "row_split"),
+        ((17, 33, 65, 513), 16, 16, "c16", "c16"),
         ((1024,) * 8, 96, 96, "c16", "c16"),
+        ((1025,) * 4, 96, 96, "c16", "c16"),
         ((1300, 547, 2048, 963, 271, 3063), 96, 96, "c32", "c32"),
     ],
 )
@@ -500,6 +502,32 @@ def test_grouped_row_forward_context_backward_matches_fla():
         num_v_heads=8,
     )
     _assert_training_matches_fla(inputs, "grouped_row_split")
+
+
+@pytest.mark.arch_blackwell
+@pytest.mark.parametrize(
+    ("seq_lens", "split_work_items"),
+    [
+        ((17, 33, 65, 513), False),
+        ((513,), True),
+    ],
+)
+def test_unaligned_c16_forward_context_backward_matches_fla(
+    seq_lens, split_work_items
+):
+    """C16 masks the final chunk instead of rejecting unaligned lengths."""
+
+    _require_blackwell()
+    inputs = _make_inputs(
+        seed=24513,
+        seq_lens=seq_lens,
+        num_qk_heads=16,
+        num_v_heads=16,
+    )
+    expected = kda_training_api._select_training_route(seq_lens, 16, 16)
+    assert expected.tag == "c16"
+    assert expected.split_work_items is split_work_items
+    _assert_training_matches_fla(inputs, "c16")
 
 
 @pytest.mark.arch_blackwell

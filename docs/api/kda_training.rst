@@ -39,9 +39,10 @@ semantic sequence must be non-empty. The safe gate lower bound is fixed to
 
 Backward requires BF16 ``do`` and FP32 ``dfinal_state``. It returns gradients
 for Q, K, V, raw gate, and raw beta in BF16, and gradients for ``A_log``,
-``dt_bias``, and ``initial_state`` in FP32. Correctness coverage compares the
-BF16 output, FP32 final state, and all eight gradients with
-``atol=rtol=1e-2``.
+``dt_bias``, and ``initial_state`` in FP32. Correctness coverage records the
+BF16 output, FP32 final state, and all eight gradients against FLA. Routes
+other than production C16 are gated at ``atol=rtol=1e-2`` for every value;
+the production C16 contract is stated separately below.
 
 Fixed layout accepts contiguous ``[B, T, H, 128]`` tensors with ``B >= 1`` and
 omitted ``cu_seqlens``; each physical batch row is one semantic sequence.
@@ -55,17 +56,17 @@ be mixed, and neither layout requires a 16-token-aligned length.
 The dispatcher filters three physical templates by their legal domains, then
 selects the lowest analytical cost. Its model includes fixed DAG fill and drain,
 per-chunk compute and memory service, resident CTA capacity, persistent-grid
-tail utilization, recurrence handoffs, and grouped-QK adapter traffic. C16 is
-legal only when every sequence length is 16-token aligned. C32 and the row-warp
-template cover positive tails and mixed lengths. Runtime batch, length, and head
-counts are model inputs rather than API guards.
+tail utilization, recurrence handoffs, and grouped-QK adapter traffic. C16,
+C32, and the row-warp template all cover positive tails and mixed lengths; C16
+masks loads and stores in its final partial chunk. Runtime batch, length, and
+head counts are model inputs rather than API guards.
 
-Every selected template saves one route context. In particular, aligned
-low-head shapes run the production C16 schedule selected by the analytical
-model instead of materializing a second C32 tape. Grouped C16 consumes Q/K in
-their native head domain and folds dQ/dK after the backward. Grouped C32 and
-row-warp execution expand Q/K to the value-head work domain and fold dQ/dK
-back to their native heads.
+Every selected template saves one route context. Shapes assigned to C16 run
+one production C16 schedule selected by the analytical model instead of
+materializing a second C32 tape. Grouped C16 consumes Q/K in their native head
+domain and folds dQ/dK after the backward. Grouped C32 and row-warp execution
+expand Q/K to the value-head work domain and fold dQ/dK back to their native
+heads.
 
 The production C16 schedule is validated under the same competitive-precision
 contract used by its FROST baseline: its token/state gradients satisfy BF16
@@ -73,16 +74,20 @@ contract used by its FROST baseline: its token/state gradients satisfy BF16
 have sparse values outside that FLA-relative threshold. The public API does not
 currently provide a strict-FLA override for a problem selected onto C16.
 
-The public benchmark contains 35 deterministic shapes: 16 deployment-portfolio
-rows, five fixed B8/H96 rows, twelve fixed-or-packed selector-boundary rows,
-and two grouped route-coverage rows. Together they exercise C16, row, grouped
-row, grouped C32, and grouped hybrid dispatch. Before reporting a timing, the
-script validates output, final state, and all eight gradients against a pinned
-FLA chunk-32 peer at ``atol=rtol=1e-2``. Its only reportable latency boundary is
-one callback that calls public forward and then public backward with the saved
-context. It does not add separately measured forward and backward medians.
-Timing uses CUPTI activity records with cold L2, CUDA graphs disabled, and a
-hard error on CUDA-event fallback.
+The public strict-audit benchmark contains 35 deterministic shapes: 16
+deployment-portfolio rows, five fixed B8/H96 rows, twelve fixed-or-packed
+selector-boundary rows, and two grouped route-coverage rows. Together they
+exercise C16, row, grouped row, grouped C32, and grouped C16 dispatch. Before
+reporting a strict-audit timing, the script validates output, final state, and
+all eight gradients against a pinned FLA chunk-32 peer at
+``atol=rtol=1e-2``; a C16 row with a documented parameter-gradient residual
+therefore stops instead of being relabeled strict. Production C16 performance
+uses a separate paired Frost comparison that keeps the six token/state
+gradients strict and records both parameter-gradient error surfaces for the
+competitive check. Its latency boundary is one callback that calls public
+forward and then public backward with the saved context, not a sum of separate
+medians. Timing uses CUPTI activity records with cold L2, CUDA graphs disabled,
+and a hard error on CUDA-event fallback.
 
 .. currentmodule:: flashinfer.kda_training
 

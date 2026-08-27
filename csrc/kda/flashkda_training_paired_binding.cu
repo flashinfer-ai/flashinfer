@@ -19,18 +19,19 @@ extern "C" {
 __global__ void kernel_flashkda_forward_checkpoint_c16(
     unsigned int*, const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, __nv_bfloat16*,
-    const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, __nv_bfloat16*,
-    __nv_bfloat16*, float*, float*, long long*, long long*, int*, float*, float*, int, int,
-    int, int, int, int, float, float);
+    const __grid_constant__ CUtensorMap, __nv_bfloat16*,
+    const __grid_constant__ CUtensorMap, __nv_bfloat16*, __nv_bfloat16*, float*, float*,
+    long long*, long long*, int*, float*, float*, int, int, int, int, int, int, float, float);
 
 __global__ void kernel_flashkda_backward_persistent_c16(
     unsigned int*, const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, float*,
-    const __grid_constant__ CUtensorMap, __nv_bfloat16*, __nv_bfloat16*, float*, float*, float*,
-    float*, float*, const __grid_constant__ CUtensorMap, float*, long long*, long long*, int*,
-    unsigned int*, float*, float*, float*, float*, float*, float*, float*, float*, float*, float*,
-    float*, float*, float*, float*, int, int, int, int, int, int, int, float, float);
+    const __grid_constant__ CUtensorMap, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float*,
+    float*, float*, float*, float*, const __grid_constant__ CUtensorMap, float*, long long*,
+    long long*, int*, unsigned int*, float*, float*, float*, float*, float*, float*, float*,
+    float*, float*, float*, float*, float*, float*, float*, int, int, int, int, int, int, int,
+    float, float);
 
 __global__ void kernel_flashkda_refine_forgetting_horizons(__nv_bfloat16*, float*, float*, int*,
                                                            int*, unsigned int*, int, float, float);
@@ -316,7 +317,8 @@ void RunTrainingForward(
                        "cudaFuncSetAttribute(training forward)");
   kernel_flashkda_forward_checkpoint_c16<<<grid, 512, kForwardSmemBytes, stream>>>(
       reinterpret_cast<unsigned int*>(counters.data_ptr()), q_map, k_map, v_map, g_map,
-      reinterpret_cast<__nv_bfloat16*>(g.data_ptr()), out_map, checkpoint_map,
+      reinterpret_cast<__nv_bfloat16*>(g.data_ptr()), out_map,
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), checkpoint_map,
       reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(beta_active.data_ptr()),
       reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
@@ -439,6 +441,7 @@ void RunTrainingBackward(TensorView q, TensorView k, TensorView v, TensorView g,
                        "cudaFuncSetAttribute(training backward)");
   auto* dynamic_counter = reinterpret_cast<unsigned int*>(counters.data_ptr()) + 1;
   auto* dfinal_state_ptr = reinterpret_cast<float*>(dfinal_state.data_ptr());
+  auto* dv_ptr = reinterpret_cast<__nv_bfloat16*>(dv.data_ptr());
   auto* dq_value_heads_ptr = reinterpret_cast<__nv_bfloat16*>(dq_value_heads.data_ptr());
   auto* dk_value_heads_ptr = reinterpret_cast<__nv_bfloat16*>(dk_value_heads.data_ptr());
   auto* dlog_decay_ptr = reinterpret_cast<float*>(dlog_decay.data_ptr());
@@ -471,6 +474,7 @@ void RunTrainingBackward(TensorView q, TensorView k, TensorView v, TensorView g,
       &state_map,
       &dfinal_state_ptr,
       &dv_map,
+      &dv_ptr,
       &dq_value_heads_ptr,
       &dk_value_heads_ptr,
       &dlog_decay_ptr,
