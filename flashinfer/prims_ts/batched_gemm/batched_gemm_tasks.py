@@ -93,14 +93,18 @@ def _persistent_skippable(cfg, wtwl):
 
 
 @contextmanager
-def _work_tile_schedule_loop(cfg, work_queue):
+def _work_tile_schedule_loop(cfg, work_queue, work_tile_preheader=None):
     """Wrap setup once per persistent work tile, or once for static schedules."""
     if _is_persistent(cfg):
         with _persistent_work_tile_loop(cfg, work_queue) as wtwl:
+            if work_tile_preheader is not None:
+                work_tile_preheader()
             with _persistent_skippable(cfg, wtwl):
                 yield
             _persistent_tail(work_queue)
     else:
+        if work_tile_preheader is not None:
+            work_tile_preheader()
         yield
 
 
@@ -1418,9 +1422,12 @@ def create_epilogue_task_dsfp8(
         _ = tmem.init_epilogue_state()
         _ = sf.init_epilogue_state()
         gmem.init_store_state()
-        with _work_tile_schedule_loop(cfg, wq):
+        with _work_tile_schedule_loop(
+            cfg,
+            wq,
+            work_tile_preheader=sf.reset_dequant_accumulator,
+        ):
             gmem.init_epilogue_tile_state()
-            sf.reset_dequant_accumulator()
             with domain_loop(0, num_k_tiles, 1) as d:
                 tmem.try_wait()
                 sf.try_wait()
