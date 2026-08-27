@@ -82,6 +82,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.msa_ops.proxy_score",
     "flashinfer.msa_ops.sparse_decode",
     "flashinfer.msa_ops.sparse_prefill",
+    "flashinfer.msa_ops.sparse_topk_select",
     "flashinfer.norm",
     "flashinfer.nvfp4_attention_sm120",
     "flashinfer.page",
