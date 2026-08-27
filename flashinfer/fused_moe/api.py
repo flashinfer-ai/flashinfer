@@ -71,6 +71,7 @@ class QuantVariant(Enum):
     MXFP4 = 5  # MXFP4 weights x MXFP8 activations (TRTLLM W4A8)
     MxInt4 = 6
     W4A16 = 7  # backend-specific 4-bit weights x BF16 activations
+    Glm5LowLatencyFp8 = 8  # BF16 activations, block-FP8 weights, in-kernel quant
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}.{self.name}"
@@ -789,6 +790,48 @@ class B12xW4A16Config:
         return "B12xW4A16Config()"
 
 
+@dataclass(frozen=True)
+class Glm5LowLatencyConfig:
+    """Shape-specialized GLM5 block-FP8 decode backend for SM100/SM103.
+
+    This backend is intentionally opt-in. It supports one to four BF16 decode
+    tokens, 256 routed experts plus one shared expert, top-8 sigmoid routing,
+    hidden size 6144, and TP-local intermediate size 256 or 512.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in (100, 103)
+
+    @staticmethod
+    def prepare_weights(
+        shared_gate_up_weight,
+        shared_gate_up_scale,
+        routed_up_gate_weight,
+        routed_up_gate_scale,
+        routed_down_weight,
+        routed_down_scale,
+        shared_down_weight,
+        shared_down_scale,
+    ):
+        """Pack raw GLM5 TP4/TP8 block-FP8 weights for ``MoEWeightPack``."""
+        from .glm5 import prepare_glm5_low_latency_moe_weights
+
+        return prepare_glm5_low_latency_moe_weights(
+            shared_gate_up_weight,
+            shared_gate_up_scale,
+            routed_up_gate_weight,
+            routed_up_gate_scale,
+            routed_down_weight,
+            routed_down_scale,
+            shared_down_weight,
+            shared_down_scale,
+        )
+
+    def __repr__(self) -> str:
+        return "Glm5LowLatencyConfig()"
+
+
 # Union type for backend config
 BackendConfigType = Union[
     TrtllmFp4Config,
@@ -802,6 +845,7 @@ BackendConfigType = Union[
     CuteDslConfig,
     B12xNvfp4Config,
     B12xW4A16Config,
+    Glm5LowLatencyConfig,
 ]
 
 ALL_BACKEND_CONFIGS = (
@@ -816,6 +860,7 @@ ALL_BACKEND_CONFIGS = (
     CuteDslConfig,
     B12xNvfp4Config,
     B12xW4A16Config,
+    Glm5LowLatencyConfig,
 )
 
 
@@ -913,10 +958,23 @@ class MoEConfig:
         if s == 0:
             return
 
-        # Only DeepSeekV3 routing emits shared-expert slots.
-        if self.routing.method is not RoutingMethodType.DeepSeekV3:
+        # The general unified path fuses shared experts with DeepSeekV3
+        # routing. The opt-in GLM5 backend uses the ungrouped sigmoid+bias
+        # variant represented by MiniMax2; do not relax other backend configs.
+        is_glm5_low_latency = (
+            self.quant.variant is QuantVariant.Glm5LowLatencyFp8
+            and any(
+                isinstance(candidate, Glm5LowLatencyConfig)
+                for candidate in self.backend
+            )
+        )
+        routing_supported = self.routing.method is RoutingMethodType.DeepSeekV3 or (
+            is_glm5_low_latency and self.routing.method is RoutingMethodType.MiniMax2
+        )
+        if not routing_supported:
             raise ValueError(
-                "num_fused_shared_experts > 0 requires DeepSeekV3 routing, got "
+                "num_fused_shared_experts > 0 requires DeepSeekV3 routing, or "
+                "MiniMax2 routing with the GLM5 low-latency backend; got "
                 f"method={self.routing.method!r}."
             )
 
@@ -1014,6 +1072,8 @@ class MoEActivationPack:
       packed signed INT4 with BF16 block scales.
     * DeepSeek FP8: ``float8_e4m3fn [M, H]`` values with transposed
       ``float32 [H/128, M]`` block scales.
+    * GLM5 low-latency FP8: raw ``bfloat16 [M, 6144]`` values with no scale;
+      the specialized backend quantizes activations in-kernel.
     * MXFP8: ``float8_e4m3fn [M, H]`` values with token-major
       ``uint8 [M, H/32]`` UE8M0 scales.
     * FP8 per-tensor: ``float8_e4m3fn [M, H]`` values with no scale tensor;

@@ -23,6 +23,7 @@ fragile backend-specific kernel-launch code lives in exactly one place.
 
 from __future__ import annotations
 
+import math
 from typing import Any, ClassVar, List
 
 import torch
@@ -38,6 +39,7 @@ from .api import (
     MoEWeightPack,
     QuantVariant,
     RoutingInputMode,
+    RoutingMethodType,
 )
 from .utils import (
     make_hybrid_bucket_mapper,
@@ -2614,6 +2616,223 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
             use_cold_l2_cache=True,
         )
         return moe_inputs.to_list()
+
+
+# ---------------------------------------------------------------------------
+# GLM5 low-latency block-FP8 runner
+# ---------------------------------------------------------------------------
+
+
+class Glm5LowLatencyRunner(MoERunner):
+    """Unified adapter for the shape-specialized GLM5 decode kernels."""
+
+    backend_key = "glm5_low_latency"
+    supported_routing_modes = (RoutingInputMode.FromLogits,)
+    supported_quant_variants = (QuantVariant.Glm5LowLatencyFp8,)
+    supports_fused_shared_experts = True
+
+    _required_weight_keys = (
+        "expert_gate_up_weight",
+        "expert_gate_up_scale",
+        "routed_down_weight",
+        "routed_down_scale",
+        "shared_down_weight",
+        "shared_down_scale",
+    )
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
+        from ..utils import get_compute_capability
+
+        self.config = config
+        self.device = torch.device(device)
+        if self.device.type != "cuda":
+            raise ValueError(f"Glm5LowLatencyRunner requires CUDA, got {device}.")
+        if self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        major, minor = get_compute_capability(self.device)
+        self._device_arch = major * 10 + minor
+        self._module: Any = None
+        self._workspace_cache: dict[tuple[int, int], Any] = {}
+        self._output_cache: dict[int, torch.Tensor] = {}
+        self.tuning_config = TuningConfig(use_cuda_graph=True)
+
+    def _check_support(self) -> None:
+        super()._check_support()
+        routing = self.config.routing
+        experts = self.config.experts
+        local_num_experts = experts.local_num_experts or routing.num_experts
+        if self._device_arch not in (100, 103):
+            raise RuntimeError(
+                "Glm5LowLatencyRunner supports only SM100 and SM103, got "
+                f"SM{self._device_arch}."
+            )
+        if self.config.activation.type is not ActivationType.Swiglu:
+            raise NotImplementedError("Glm5LowLatencyRunner requires SwiGLU.")
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError("Glm5LowLatencyRunner requires do_finalize=True.")
+        if routing.method is not RoutingMethodType.MiniMax2:
+            raise NotImplementedError(
+                "Glm5LowLatencyRunner requires MiniMax2 routing "
+                "(sigmoid + bias + top-k + scaled sum normalization)."
+            )
+        if routing.n_group is not None or routing.topk_group is not None:
+            raise NotImplementedError(
+                "Glm5LowLatencyRunner uses ungrouped routing; n_group and "
+                "topk_group must be None."
+            )
+        if routing.num_experts != 256 or routing.top_k != 8:
+            raise NotImplementedError(
+                "Glm5LowLatencyRunner requires num_experts=256 and top_k=8."
+            )
+        if routing.routed_scaling_factor is None or not math.isfinite(
+            routing.routed_scaling_factor
+        ):
+            raise ValueError(
+                "Glm5LowLatencyRunner requires a finite routed_scaling_factor."
+            )
+        if routing.routed_scaling_factor <= 0:
+            raise ValueError("Glm5LowLatencyRunner requires routed_scaling_factor > 0.")
+        if (
+            experts.local_expert_offset != 0
+            or local_num_experts != 256
+            or experts.num_fused_shared_experts != 1
+            or experts.intermediate_size not in (256, 512)
+        ):
+            raise NotImplementedError(
+                "Glm5LowLatencyRunner requires all 256 routed experts locally, "
+                "one fused shared expert, and intermediate_size 256 or 512."
+            )
+
+    def _build(self) -> None:
+        from ..jit.glm5_moe import load_glm5_low_latency_moe_module
+
+        self._module = load_glm5_low_latency_moe_module()
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
+        self._require_built()
+        return [-1]
+
+    def _get_buffers(self, num_tokens: int, intermediate_size: int):
+        from .glm5 import alloc_glm5_low_latency_moe_workspace
+
+        key = (num_tokens, intermediate_size)
+        workspace = self._workspace_cache.get(key)
+        if workspace is None:
+            workspace = alloc_glm5_low_latency_moe_workspace(
+                num_tokens, intermediate_size, self.device
+            )
+            self._workspace_cache[key] = workspace
+        output = self._output_cache.get(num_tokens)
+        if output is None:
+            output = torch.empty(
+                (num_tokens, 6144), dtype=torch.bfloat16, device=self.device
+            )
+            self._output_cache[num_tokens] = output
+        return output, workspace
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        if act.routing_input_mode is not RoutingInputMode.FromLogits:
+            raise NotImplementedError(
+                "Glm5LowLatencyRunner supports only FromLogits routing."
+            )
+        if act.hidden_states_scale is not None or act.per_token_scale is not None:
+            raise ValueError(
+                "Glm5LowLatencyRunner consumes raw BF16 activations without "
+                "activation scale tensors."
+            )
+        if act.routing_logits is None or act.routing_bias is None:
+            raise ValueError(
+                "Glm5LowLatencyRunner requires routing_logits and routing_bias."
+            )
+
+        view = weights.get_view(self.backend_key)
+        missing = [key for key in self._required_weight_keys if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        tensors = [view[key] for key in self._required_weight_keys]
+
+        from .glm5 import (
+            _check_glm5_low_latency_moe_shapes,
+            _check_glm5_low_latency_moe_supported,
+        )
+
+        num_tokens, intermediate_size = _check_glm5_low_latency_moe_shapes(
+            act.hidden_states_q,
+            act.routing_logits,
+            act.routing_bias,
+            *tensors,
+        )
+        output, workspace = self._get_buffers(num_tokens, intermediate_size)
+        _check_glm5_low_latency_moe_supported(
+            act.hidden_states_q,
+            act.routing_logits,
+            act.routing_bias,
+            *tensors,
+            routed_scaling_factor=self.config.routing.routed_scaling_factor,
+            out=output,
+            workspace=workspace,
+        )
+        return [
+            output,
+            act.hidden_states_q,
+            act.routing_logits,
+            act.routing_bias,
+            *tensors,
+            workspace.topk_weights,
+            workspace.topk_indices,
+            workspace.expert_slots,
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if len(inputs) != 13:
+            raise ValueError(
+                f"Glm5LowLatencyRunner expects 13 inputs, got {len(inputs)}."
+            )
+        if tactic != -1:
+            raise ValueError("Glm5LowLatencyRunner supports only tactic -1.")
+        if do_preparation:
+            return inputs[0]
+        self._module.glm5_fused_expert_up(
+            inputs[2],
+            inputs[1],
+            inputs[3],
+            inputs[4],
+            inputs[5],
+            inputs[10],
+            inputs[11],
+            inputs[12],
+            float(self.config.routing.routed_scaling_factor),
+        )
+        self._module.glm5_fused_expert_down(
+            inputs[12],
+            inputs[11],
+            inputs[10],
+            inputs[6],
+            inputs[7],
+            inputs[8],
+            inputs[9],
+            inputs[0],
+        )
+        return inputs[0]
+
+    def _cache_key_extras(self) -> tuple:
+        return super()._cache_key_extras() + (
+            self._device_arch,
+            float(self.config.routing.routed_scaling_factor),
+        )
 
 
 # ---------------------------------------------------------------------------

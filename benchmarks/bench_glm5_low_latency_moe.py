@@ -46,10 +46,20 @@ if "--baseline-only" in sys.argv:
     from flashinfer.fused_moe import cutlass_fused_moe
 else:
     from flashinfer.fused_moe import (
-        alloc_glm5_low_latency_moe_workspace,
+        BackendOptions,
+        ExecutionConfig,
+        ExpertConfig,
+        Glm5LowLatencyConfig,
+        MoEActivationPack,
+        MoEConfig,
+        MoELayer,
+        MoEWeightPack,
+        QuantConfig,
+        QuantVariant,
+        RoutingConfig,
+        RoutingInputMode,
+        RoutingMethodType,
         cutlass_fused_moe,
-        glm5_low_latency_moe,
-        prepare_glm5_low_latency_moe_weights,
     )
 
 
@@ -235,7 +245,32 @@ def main() -> None:
         ),
     }
     if not args.baseline_only:
-        glm5_weights = prepare_glm5_low_latency_moe_weights(**raw_weights)
+        glm5_view = Glm5LowLatencyConfig.prepare_weights(**raw_weights)
+        glm5_weight_pack = MoEWeightPack()
+        glm5_weight_pack.prepare_for("glm5_low_latency", glm5_view)
+        glm5_act_pack = MoEActivationPack(
+            hidden_states_q=hidden_states,
+            hidden_states_scale=None,
+            routing_input_mode=RoutingInputMode.FromLogits,
+            routing_logits=router_logits,
+            routing_bias=routing_bias,
+        )
+        glm5_config = MoEConfig(
+            routing=RoutingConfig(
+                num_experts=_NUM_EXPERTS,
+                top_k=_TOP_K,
+                method=RoutingMethodType.MiniMax2,
+                routed_scaling_factor=_ROUTED_SCALING_FACTOR,
+            ),
+            quant=QuantConfig(variant=QuantVariant.Glm5LowLatencyFp8),
+            experts=ExpertConfig(
+                intermediate_size=raw_weights["shared_down_weight"].shape[1],
+                num_fused_shared_experts=1,
+            ),
+            backend=BackendOptions(candidates=(Glm5LowLatencyConfig(),)),
+            execution=ExecutionConfig(tune_max_num_tokens=4),
+        )
+        glm5_layer = MoELayer(glm5_config, device=device)
     if not args.glm5_only:
         cutlass_weights = _prepare_cutlass_weights(**raw_weights)
         selected_experts, routing_weights = _deepseek_routing(
@@ -245,24 +280,11 @@ def main() -> None:
         : args.tokens
     ]
 
-    local_intermediate_size = raw_weights["shared_down_weight"].shape[1]
-    if not args.baseline_only:
-        glm5_workspace = alloc_glm5_low_latency_moe_workspace(
-            args.tokens, local_intermediate_size, device
-        )
-        glm5_output = torch.empty_like(hidden_states)
     if not args.glm5_only:
         cutlass_output = torch.empty_like(hidden_states)
 
     def run_glm5() -> torch.Tensor:
-        return glm5_low_latency_moe(
-            hidden_states,
-            router_logits,
-            routing_bias,
-            **glm5_weights.as_kwargs(),
-            out=glm5_output,
-            workspace=glm5_workspace,
-        )
+        return glm5_layer(glm5_act_pack, glm5_weight_pack)
 
     def run_cutlass_kernel(
         routed_experts: torch.Tensor | None = None,

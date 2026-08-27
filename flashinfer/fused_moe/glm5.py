@@ -18,16 +18,13 @@ Low-latency block-FP8 MoE specialized for the GLM5 decode shape.
 
 from __future__ import annotations
 
-import functools
 import math
 from dataclasses import dataclass
 from typing import Optional
 
 import torch
 
-from ..api_logging import flashinfer_api
-from ..trace.templates.moe import glm5_low_latency_moe_trace
-from ..utils import backend_requirement, supported_compute_capability
+from ..utils import supported_compute_capability
 
 
 _NUM_EXPERTS = 256
@@ -51,28 +48,6 @@ _UP_BYTES_PER_COL_QUAD = 4
 
 
 @dataclass(frozen=True)
-class Glm5LowLatencyMoeWeights:
-    """Prepared tensors accepted by :func:`glm5_low_latency_moe`."""
-
-    expert_gate_up_weight: torch.Tensor
-    expert_gate_up_scale: torch.Tensor
-    routed_down_weight: torch.Tensor
-    routed_down_scale: torch.Tensor
-    shared_down_weight: torch.Tensor
-    shared_down_scale: torch.Tensor
-
-    def as_kwargs(self) -> dict[str, torch.Tensor]:
-        return {
-            "expert_gate_up_weight": self.expert_gate_up_weight,
-            "expert_gate_up_scale": self.expert_gate_up_scale,
-            "routed_down_weight": self.routed_down_weight,
-            "routed_down_scale": self.routed_down_scale,
-            "shared_down_weight": self.shared_down_weight,
-            "shared_down_scale": self.shared_down_scale,
-        }
-
-
-@dataclass(frozen=True)
 class Glm5LowLatencyMoeWorkspace:
     """Reusable output buffers for allocation-free decode calls."""
 
@@ -86,7 +61,7 @@ def alloc_glm5_low_latency_moe_workspace(
     local_intermediate_size: int,
     device: torch.device | str,
 ) -> Glm5LowLatencyMoeWorkspace:
-    """Allocate the temporary buffers used by :func:`glm5_low_latency_moe`."""
+    """Allocate temporary buffers owned by ``Glm5LowLatencyRunner``."""
     if not 1 <= num_tokens <= _MAX_TOKENS:
         raise ValueError(
             f"GLM5 low-latency MoE supports 1 <= M <= {_MAX_TOKENS}, got {num_tokens}."
@@ -310,27 +285,20 @@ def prepare_glm5_low_latency_moe_weights(
     routed_down_scale: torch.Tensor,
     shared_down_weight: torch.Tensor,
     shared_down_scale: torch.Tensor,
-) -> Glm5LowLatencyMoeWeights:
+) -> dict[str, torch.Tensor]:
     """Prepare raw GLM5 TP4/TP8 block-FP8 weights for repeated decode calls."""
-    return Glm5LowLatencyMoeWeights(
-        expert_gate_up_weight=pack_glm5_low_latency_moe_gate_up_weight(
+    return {
+        "expert_gate_up_weight": pack_glm5_low_latency_moe_gate_up_weight(
             shared_gate_up_weight, routed_up_gate_weight
         ),
-        expert_gate_up_scale=pack_glm5_low_latency_moe_gate_up_scale(
+        "expert_gate_up_scale": pack_glm5_low_latency_moe_gate_up_scale(
             shared_gate_up_scale, routed_up_gate_scale
         ),
-        routed_down_weight=routed_down_weight.contiguous(),
-        routed_down_scale=routed_down_scale.contiguous(),
-        shared_down_weight=shared_down_weight.contiguous(),
-        shared_down_scale=shared_down_scale.contiguous(),
-    )
-
-
-@functools.cache
-def _get_glm5_low_latency_moe_module():
-    from ..jit.glm5_moe import load_glm5_low_latency_moe_module
-
-    return load_glm5_low_latency_moe_module()
+        "routed_down_weight": routed_down_weight.contiguous(),
+        "routed_down_scale": routed_down_scale.contiguous(),
+        "shared_down_weight": shared_down_weight.contiguous(),
+        "shared_down_scale": shared_down_scale.contiguous(),
+    }
 
 
 def _check_glm5_low_latency_moe_shapes(
@@ -486,108 +454,3 @@ def _check_glm5_low_latency_moe_supported(
     if not math.isfinite(routed_scaling_factor) or routed_scaling_factor <= 0:
         raise ValueError("routed_scaling_factor must be positive and finite.")
     return True
-
-
-@backend_requirement({}, common_check=_check_glm5_low_latency_moe_supported)
-@flashinfer_api(trace=glm5_low_latency_moe_trace)
-def glm5_low_latency_moe(
-    hidden_states: torch.Tensor,
-    router_logits: torch.Tensor,
-    routing_bias: torch.Tensor,
-    expert_gate_up_weight: torch.Tensor,
-    expert_gate_up_scale: torch.Tensor,
-    routed_down_weight: torch.Tensor,
-    routed_down_scale: torch.Tensor,
-    shared_down_weight: torch.Tensor,
-    shared_down_scale: torch.Tensor,
-    routed_scaling_factor: float = 2.5,
-    out: Optional[torch.Tensor] = None,
-    workspace: Optional[Glm5LowLatencyMoeWorkspace] = None,
-) -> torch.Tensor:
-    """Run the GLM5 low-latency block-FP8 MoE path on SM100/SM103.
-
-    This specialized decode kernel supports 256 routed experts, one shared
-    expert, top-8 sigmoid routing, hidden size 6144, ``M <= 4``, and local
-    intermediate size 256 (TP8) or 512 (TP4). Call
-    :func:`prepare_glm5_low_latency_moe_weights` once when loading model weights.
-
-    The returned tensor is this TP rank's local contribution. Distributed
-    callers must all-reduce it across TP ranks before the residual connection.
-
-    Parameters
-    ----------
-    hidden_states : torch.Tensor
-        BF16 input with shape ``[M, 6144]``, where ``1 <= M <= 4``.
-    router_logits : torch.Tensor
-        FP32 routed-expert logits with shape ``[M, 256]``.
-    routing_bias : torch.Tensor
-        BF16 no-aux routing bias with shape ``[256]``. The bias affects expert
-        selection; normalized expert weights use the unbiased sigmoid scores.
-    expert_gate_up_weight : torch.Tensor
-        Packed FP8 gate/up weights from
-        :func:`pack_glm5_low_latency_moe_gate_up_weight`.
-    expert_gate_up_scale : torch.Tensor
-        Packed FP32 block scales from
-        :func:`pack_glm5_low_latency_moe_gate_up_scale`.
-    routed_down_weight, shared_down_weight : torch.Tensor
-        Raw row-major FP8 down-projection weights.
-    routed_down_scale, shared_down_scale : torch.Tensor
-        FP32 128x128 down-projection block scales.
-    routed_scaling_factor : float
-        Scale applied after normalizing the selected sigmoid scores.
-    out : Optional[torch.Tensor]
-        Optional BF16 output buffer with shape ``[M, 6144]``.
-    workspace : Optional[Glm5LowLatencyMoeWorkspace]
-        Reusable temporaries allocated by
-        :func:`alloc_glm5_low_latency_moe_workspace`. Supplying this and ``out``
-        makes repeated decode calls allocation-free.
-    Returns
-    -------
-    torch.Tensor
-        BF16 TP-local MoE contribution with shape ``[M, 6144]``.
-    """
-    num_tokens, inter_per_tp = _check_glm5_low_latency_moe_shapes(
-        hidden_states,
-        router_logits,
-        routing_bias,
-        expert_gate_up_weight,
-        expert_gate_up_scale,
-        routed_down_weight,
-        routed_down_scale,
-        shared_down_weight,
-        shared_down_scale,
-    )
-    if out is None:
-        out = torch.empty(
-            (num_tokens, _HIDDEN_SIZE),
-            dtype=torch.bfloat16,
-            device=hidden_states.device,
-        )
-    if workspace is None:
-        workspace = alloc_glm5_low_latency_moe_workspace(
-            num_tokens, inter_per_tp, hidden_states.device
-        )
-
-    module = _get_glm5_low_latency_moe_module()
-    module.glm5_fused_expert_up(
-        router_logits,
-        hidden_states,
-        routing_bias,
-        expert_gate_up_weight,
-        expert_gate_up_scale,
-        workspace.topk_weights,
-        workspace.topk_indices,
-        workspace.expert_slots,
-        float(routed_scaling_factor),
-    )
-    module.glm5_fused_expert_down(
-        workspace.expert_slots,
-        workspace.topk_indices,
-        workspace.topk_weights,
-        routed_down_weight,
-        routed_down_scale,
-        shared_down_weight,
-        shared_down_scale,
-        out,
-    )
-    return out

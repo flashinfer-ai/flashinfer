@@ -33,6 +33,7 @@ from .api import (
     CutlassBf16Config,
     CutlassW4A16Config,
     CuteDslConfig,
+    Glm5LowLatencyConfig,
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
@@ -48,6 +49,7 @@ from .runners import (
     CutlassBf16Runner,
     CutlassW4A16Runner,
     CuteDslNvfp4Runner,
+    Glm5LowLatencyRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -71,6 +73,7 @@ _RunnerT = Union[
     TrtllmMxInt4RoutedRunner,
     B12xNvfp4Runner,
     B12xW4A16Runner,
+    Glm5LowLatencyRunner,
 ]
 
 # Map backend-config class -> runner class
@@ -85,6 +88,7 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     TrtllmMxInt4Config: TrtllmMxInt4RoutedRunner,
     B12xNvfp4Config: B12xNvfp4Runner,
     B12xW4A16Config: B12xW4A16Runner,
+    Glm5LowLatencyConfig: Glm5LowLatencyRunner,
 }
 
 

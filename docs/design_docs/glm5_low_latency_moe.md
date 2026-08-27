@@ -11,9 +11,10 @@ These low-latency kernels are inspired by the design of
 ultra-low-latency LLM inference with fused kernels.
 
 The ported files retain their NVIDIA copyright and Apache-2.0 license notices.
-The port replaces the Torch custom-op boundary with TVM FFI, uses caller-owned
-outputs and reusable workspaces, and integrates with FlashInfer's JIT, AOT,
-trace, test, and benchmark infrastructure.
+The port replaces the Torch custom-op boundary with TVM FFI and integrates the
+kernels as a shape-specialized backend of FlashInfer's unified `MoELayer` API.
+`Glm5LowLatencyRunner` owns reusable outputs and workspaces for stable decode
+addresses and CUDA graph capture.
 
 ## Supported contract
 
@@ -29,14 +30,54 @@ trace, test, and benchmark infrastructure.
 | Activations/output | BF16 input, FP16 expert handoff, BF16 output |
 | Weights/scales | FP8 E4M3 with FP32 128x128 block scales |
 
-`glm5_low_latency_moe` returns the local TP contribution. The serving framework must
+`MoELayer` returns the local TP contribution. The serving framework must
 all-reduce that tensor across TP ranks before applying the residual connection.
-The router GEMM that produces `router_logits` is also outside this operator.
+The router GEMM that produces `routing_logits` is also outside this backend.
+
+## Unified API integration
+
+Select the backend explicitly with `Glm5LowLatencyConfig`. The specialized
+quantization variant makes the BF16-activation/in-kernel-quantization contract
+unambiguous and prevents unrelated FP8 runners from competing for the same
+weight view.
+
+```python
+config = MoEConfig(
+    routing=RoutingConfig(
+        num_experts=256,
+        top_k=8,
+        method=RoutingMethodType.MiniMax2,
+        routed_scaling_factor=2.5,
+    ),
+    quant=QuantConfig(variant=QuantVariant.Glm5LowLatencyFp8),
+    experts=ExpertConfig(
+        intermediate_size=256,  # TP8; use 512 for TP4
+        num_fused_shared_experts=1,
+    ),
+    backend=BackendOptions(candidates=(Glm5LowLatencyConfig(),)),
+    execution=ExecutionConfig(tune_max_num_tokens=4),
+)
+
+weights = MoEWeightPack()
+weights.prepare_for(
+    "glm5_low_latency",
+    Glm5LowLatencyConfig.prepare_weights(...),
+)
+activations = MoEActivationPack(
+    hidden_states_q=hidden_states,
+    hidden_states_scale=None,
+    routing_input_mode=RoutingInputMode.FromLogits,
+    routing_logits=router_logits,
+    routing_bias=routing_bias,
+)
+output = MoELayer(config)(activations, weights)
+```
 
 ## Weight preparation
 
-Call `prepare_glm5_low_latency_moe_weights` once during model loading. The raw GLM5
-checkpoint conventions are:
+Call `Glm5LowLatencyConfig.prepare_weights` once during model loading and
+register its returned native view with `MoEWeightPack`. The raw GLM5 checkpoint
+conventions are:
 
 - shared gate/up: `[gate, up]`, shape `[2 * I, 6144]`;
 - routed gate/up: `[up, gate]`, shape `[256, 2 * I, 6144]`;
@@ -48,9 +89,9 @@ The up-projection helper normalizes the half ordering and packs the weight into
 weights remain row-major and are staged with TMA at runtime. Preparation is not
 part of decode latency.
 
-For repeated calls, allocate `Glm5LowLatencyMoeWorkspace` once and pass both it and
-an `out` tensor. This avoids allocator work in the serving loop and keeps tensor
-addresses stable for CUDA graph capture.
+For repeated calls, reuse the same `MoELayer` instance. Its
+`Glm5LowLatencyRunner` caches the output and temporary buffers by token count,
+avoiding allocator work in the serving loop.
 
 ## Kernel pipeline
 

@@ -29,14 +29,26 @@ from pathlib import Path
 import pytest
 import torch
 
+from flashinfer.fused_moe import (
+    BackendOptions,
+    ExecutionConfig,
+    ExpertConfig,
+    Glm5LowLatencyConfig,
+    MoEActivationPack,
+    MoEConfig,
+    MoELayer,
+    MoEWeightPack,
+    QuantConfig,
+    QuantVariant,
+    RoutingConfig,
+    RoutingInputMode,
+    RoutingMethodType,
+)
 from flashinfer.fused_moe.glm5 import (
     _check_glm5_low_latency_moe_shapes,
     _interleave_packed_gate_up,
     _pack_up_weight_side,
-    alloc_glm5_low_latency_moe_workspace,
-    glm5_low_latency_moe,
     pack_glm5_low_latency_moe_gate_up_scale,
-    prepare_glm5_low_latency_moe_weights,
 )
 
 _NUM_EXPERTS = 256
@@ -51,6 +63,32 @@ _ERROR_THRESHOLDS_BY_RANK = (
     8.90e-5,
     5.50e-4,
 )
+
+
+def _glm5_config(intermediate_size: int) -> MoEConfig:
+    return MoEConfig(
+        routing=RoutingConfig(
+            num_experts=_NUM_EXPERTS,
+            top_k=8,
+            method=RoutingMethodType.MiniMax2,
+            routed_scaling_factor=2.5,
+        ),
+        quant=QuantConfig(variant=QuantVariant.Glm5LowLatencyFp8),
+        experts=ExpertConfig(
+            intermediate_size=intermediate_size,
+            num_fused_shared_experts=1,
+        ),
+        backend=BackendOptions(candidates=(Glm5LowLatencyConfig(),)),
+        execution=ExecutionConfig(tune_max_num_tokens=4),
+    )
+
+
+def test_glm5_unified_config_contract() -> None:
+    config = _glm5_config(256)
+    assert config.backend.valid_for(100) == [Glm5LowLatencyConfig()]
+    assert config.backend.valid_for(103) == [Glm5LowLatencyConfig()]
+    assert config.backend.valid_for(90) == []
+    assert eval(repr(config.backend.candidates[0])) == Glm5LowLatencyConfig()
 
 
 def test_glm5_up_weight_side_pack_layout() -> None:
@@ -189,7 +227,7 @@ def test_glm5_low_latency_moe_tp8_dump_replay() -> None:
         hidden_states.float(), router_weight.float().transpose(0, 1)
     ).contiguous()
 
-    prepared = prepare_glm5_low_latency_moe_weights(
+    prepared = Glm5LowLatencyConfig.prepare_weights(
         _load_dump(dump_dir, rank, weight_layer, "shared_gate_up_weight_org", device),
         _load_dump(
             dump_dir,
@@ -228,21 +266,23 @@ def test_glm5_low_latency_moe_tp8_dump_replay() -> None:
     ]
 
     threshold = _ERROR_THRESHOLDS_BY_RANK[rank]
-    workspace = alloc_glm5_low_latency_moe_workspace(
-        hidden_states.shape[0], prepared.shared_down_weight.shape[1], device
+    weight_pack = MoEWeightPack()
+    weight_pack.prepare_for("glm5_low_latency", prepared)
+    act_pack = MoEActivationPack(
+        hidden_states_q=hidden_states,
+        hidden_states_scale=None,
+        routing_input_mode=RoutingInputMode.FromLogits,
+        routing_logits=router_logits,
+        routing_bias=routing_bias,
     )
-    output = torch.empty_like(hidden_states)
+    local_intermediate_size = prepared["shared_down_weight"].shape[1]
+    layer = MoELayer(_glm5_config(local_intermediate_size), device=device)
     with torch.inference_mode():
-        actual = glm5_low_latency_moe(
-            hidden_states,
-            router_logits,
-            routing_bias,
-            **prepared.as_kwargs(),
-            out=output,
-            workspace=workspace,
-        )
+        actual = layer(act_pack, weight_pack)
         torch.cuda.synchronize(device)
 
+    assert local_intermediate_size in (256, 512)
+    assert layer.winner_backend == "glm5_low_latency"
     max_abs_error = (actual.float() - expected.float()).abs().max().item()
     print(f"rank={rank} max_abs_error={max_abs_error:.6e} threshold={threshold:.6e}")
     assert max_abs_error <= threshold

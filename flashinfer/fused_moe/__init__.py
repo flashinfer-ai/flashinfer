@@ -26,6 +26,7 @@ from .api import (  # noqa: F401
     CutlassW4A16Config,
     ExecutionConfig,
     ExpertConfig,
+    Glm5LowLatencyConfig,
     MoEActivationPack,
     MoEConfig,
     MoEFinalizeConfig,
@@ -51,6 +52,7 @@ from .runners import (  # noqa: F401
     CutlassBf16Runner,
     CutlassW4A16Runner,
     CuteDslNvfp4Runner,
+    Glm5LowLatencyRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
     TrtllmFp8PerTensorRunner,
@@ -124,15 +126,6 @@ from .monomoe import (  # noqa: F401
     get_scratchpad_size_bytes as get_scratchpad_size_bytes,
     interleave_for_tma_wgmma_up as interleave_for_tma_wgmma_up,
 )
-from .glm5 import (  # noqa: F401
-    Glm5LowLatencyMoeWeights,
-    Glm5LowLatencyMoeWorkspace,
-    alloc_glm5_low_latency_moe_workspace,
-    glm5_low_latency_moe,
-    pack_glm5_low_latency_moe_gate_up_scale,
-    pack_glm5_low_latency_moe_gate_up_weight,
-    prepare_glm5_low_latency_moe_weights,
-)
 
 # CuteDSL MoE APIs (conditionally imported if cute_dsl available)
 try:
@@ -165,6 +158,8 @@ __all__ = [
     "CutlassW4A16Config",
     "ExecutionConfig",
     "ExpertConfig",
+    "Glm5LowLatencyConfig",
+    "Glm5LowLatencyRunner",
     "CuteDslNvfp4Runner",
     "MoEActivationPack",
     "RoutingInputMode",
@@ -232,13 +227,6 @@ __all__ = [
     "alloc_scratchpad",
     "get_scratchpad_size_bytes",
     "interleave_for_tma_wgmma_up",
-    "Glm5LowLatencyMoeWeights",
-    "Glm5LowLatencyMoeWorkspace",
-    "alloc_glm5_low_latency_moe_workspace",
-    "glm5_low_latency_moe",
-    "pack_glm5_low_latency_moe_gate_up_scale",
-    "pack_glm5_low_latency_moe_gate_up_weight",
-    "prepare_glm5_low_latency_moe_weights",
 ]
 
 # Add CuteDSL exports if available

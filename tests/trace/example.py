@@ -34,7 +34,6 @@ gemma_fused_add_rmsnorm_h4608.json
 gemma_rmsnorm_h4608.json
 gelu_and_mul_h16384.json
 gelu_tanh_and_mul_h16384.json
-glm5_low_latency_moe_topk8_h6144_i256.json
 gqa_paged_decode_h32_kv8_d128_ps16.json
 gqa_paged_decode_h32_kv8_d128_ps64.json
 gqa_paged_prefill_h32_kv8_d128_ps16.json
@@ -770,54 +769,6 @@ flashinfer.kda_decode.fused_kda_decode(
     fk_state,
     fk_output_gate,
     fk_norm_weight,
-)
-
-# ── GLM5 low-latency MoE (Blackwell, TP8 local shape) ───────────────
-# Generate the definition directly from metadata tensors so this example does
-# not allocate the multi-gigabyte expert weights or compile an SM100 kernel.
-_glm5_E, _glm5_H, _glm5_I, _glm5_M = 256, 6144, 256, 4
-_glm5_E_SHARED, _glm5_H_BLOCKS = _glm5_E + 1, _glm5_H // 128
-flashinfer.fused_moe.glm5_low_latency_moe.fi_trace(
-    save_dir=SAVE_DIR,
-    hidden_states=torch.empty(_glm5_M, _glm5_H, dtype=torch.bfloat16, device="meta"),
-    router_logits=torch.empty(_glm5_M, _glm5_E, dtype=torch.float32, device="meta"),
-    routing_bias=torch.empty(_glm5_E, dtype=torch.bfloat16, device="meta"),
-    expert_gate_up_weight=torch.empty(
-        _glm5_E_SHARED,
-        _glm5_I // 64,
-        8,
-        98304,
-        dtype=torch.float8_e4m3fn,
-        device="meta",
-    ),
-    expert_gate_up_scale=torch.empty(
-        _glm5_E_SHARED,
-        _glm5_I // 64,
-        _glm5_H_BLOCKS,
-        dtype=torch.float32,
-        device="meta",
-    ),
-    routed_down_weight=torch.empty(
-        _glm5_E,
-        _glm5_H,
-        _glm5_I,
-        dtype=torch.float8_e4m3fn,
-        device="meta",
-    ),
-    routed_down_scale=torch.empty(
-        _glm5_E,
-        _glm5_H_BLOCKS,
-        _glm5_I // 128,
-        dtype=torch.float32,
-        device="meta",
-    ),
-    shared_down_weight=torch.empty(
-        _glm5_H, _glm5_I, dtype=torch.float8_e4m3fn, device="meta"
-    ),
-    shared_down_scale=torch.empty(
-        _glm5_H_BLOCKS, _glm5_I // 128, dtype=torch.float32, device="meta"
-    ),
-    routed_scaling_factor=2.5,
 )
 
 # ── mono_moe / monomoe (Qwen3.5-35B block-FP8 MonoMoe kernel, SM90a) ────────────
