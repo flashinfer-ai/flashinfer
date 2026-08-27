@@ -37,6 +37,7 @@ FlashKDAVariant = Literal[
     "m128_n16_checkpoint",
     "m128_n16_short",
     "persistent_m128",
+    "piece_persistent_m128",
     "small_bh_m128",
     "bt16_prepare",
     "bt16_prepare_beta_tma",
@@ -57,6 +58,7 @@ FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "m128_n16_checkpoint",
     "m128_n16_short",
     "persistent_m128",
+    "piece_persistent_m128",
     "small_bh_m128",
     "bt16_prepare",
     "bt16_prepare_beta_tma",
@@ -91,6 +93,7 @@ _FLASH_KDA_MODULE_IDENTS = {
     "m128_n16_checkpoint": "2c3342ae17",
     "m128_n16_short": "71bc4450bf",
     "persistent_m128": "e57cec87a0",
+    "piece_persistent_m128": "3ac5764753",
     "small_bh_m128": "87ee851220",
     "bt16_prepare": "2c6cc4c1f6",
     "bt16_prepare_beta_tma": "d9394ce430",
@@ -110,6 +113,7 @@ _FLASH_KDA_BINDING_STEMS = {
     "m128_n16_checkpoint": "flashkda_bf16_fused_m128_n16_checkpoint",
     "m128_n16_short": "cake_flashkda_bf16_fused_m128_n16",
     "persistent_m128": "cake_flashkda_bf16_persistent_m128",
+    "piece_persistent_m128": "cake_flashkda_bf16_piece_persistent_m128",
     "small_bh_m128": "cake_flashkda_bf16_small_bh_m128",
     "bt16_prepare": "cake_flashkda_bf16_bt16_prepare",
     "bt16_prepare_beta_tma": "cake_flashkda_bf16_bt16_prepare_beta_tma",
@@ -281,6 +285,12 @@ def gen_flash_kda_persistent_m128_module(target: FlashKDATarget) -> JitSpec:
     return gen_flash_kda_module("persistent_m128", target)
 
 
+def gen_flash_kda_piece_persistent_m128_module(target: FlashKDATarget) -> JitSpec:
+    """Generate the recurrence-piece persistent M128 module."""
+
+    return gen_flash_kda_module("piece_persistent_m128", target)
+
+
 def gen_flash_kda_small_bh_m128_module(target: FlashKDATarget) -> JitSpec:
     """Generate the fixed-layout small-BH owner/helper M128 module."""
 
@@ -382,6 +392,12 @@ def load_flash_kda_persistent_m128_module(target: FlashKDATarget):
     return load_flash_kda_module("persistent_m128", target)
 
 
+def load_flash_kda_piece_persistent_m128_module(target: FlashKDATarget):
+    """Load the recurrence-piece persistent M128 module."""
+
+    return load_flash_kda_module("piece_persistent_m128", target)
+
+
 def load_flash_kda_small_bh_m128_module(target: FlashKDATarget):
     """Load the fixed-layout small-BH owner/helper M128 module."""
 
@@ -436,6 +452,7 @@ __all__ = [
     "gen_flash_kda_m128_n16_module",
     "gen_flash_kda_m128_n16_checkpoint_module",
     "gen_flash_kda_m128_n16_short_module",
+    "gen_flash_kda_piece_persistent_m128_module",
     "gen_flash_kda_persistent_m128_module",
     "gen_flash_kda_small_bh_m128_module",
     "gen_flash_kda_module",
@@ -448,6 +465,7 @@ __all__ = [
     "load_flash_kda_m128_h12_long_module",
     "load_flash_kda_m128_n16_module",
     "load_flash_kda_m128_n16_short_module",
+    "load_flash_kda_piece_persistent_m128_module",
     "load_flash_kda_persistent_m128_module",
     "load_flash_kda_small_bh_m128_module",
     "load_flash_kda_bt16_chain_m64_s7_module",

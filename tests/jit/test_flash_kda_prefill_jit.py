@@ -54,6 +54,10 @@ _COMMON_HEADER_VARIANT_BODIES = (
     ),
     ("m128_n16_short", "cake_flashkda_bf16_fused_m128_n16_short.cu"),
     ("persistent_m128", "cake_flashkda_bf16_persistent_m128.cu"),
+    (
+        "piece_persistent_m128",
+        "cake_flashkda_bf16_piece_persistent_m128.cu",
+    ),
     ("small_bh_m128", "cake_flashkda_bf16_small_bh_m128.cu"),
 )
 
@@ -135,6 +139,10 @@ def test_h12_prefill_jit_spec_and_frozen_source(
 def test_h12_prefill_variants_are_in_the_aot_inventory():
     assert "m128_h12_short" in flash_kda.FLASH_KDA_VARIANTS
     assert "m128_h12_long" in flash_kda.FLASH_KDA_VARIANTS
+
+
+def test_piece_persistent_prefill_variant_is_in_the_aot_inventory():
+    assert "piece_persistent_m128" in flash_kda.FLASH_KDA_VARIANTS
 
 
 @pytest.mark.parametrize(

@@ -135,8 +135,10 @@ def test_deepseek_cute_dsl(dtype_qk, dtype_vo, Dqk, Dvo):
         (torch.float8_e4m3fn, torch.float8_e4m3fn),
     ],
 )
+@pytest.mark.parametrize("scale_bmm1", [1.0, 0.8])
+@pytest.mark.parametrize("scale_bmm2", [1.0, 0.6])
 @pytest.mark.parametrize("causal", [False, True])
-def test_batch_prefill_cute_dsl(dtype_qk, dtype_vo, causal):
+def test_batch_prefill_cute_dsl(dtype_qk, dtype_vo, scale_bmm1, scale_bmm2, causal):
     torch.manual_seed(0)
     b, s, Hq, Hk, D = 2, 1024, 8, 8, 128
     qo = _indptr([s] * b)
@@ -150,19 +152,19 @@ def test_batch_prefill_cute_dsl(dtype_qk, dtype_vo, causal):
         ws, kv_layout="NHD", backend="cute-dsl"
     )
     w.plan(qo, kv, Hq, Hk, D, causal=causal, q_data_type=dtype_qk)
-    o = w.run(q, k, v)
-    ref = _ragged_ref(qr, kr, vr, qo, kv, sm, causal=causal)
-    atol = 4e-2 if min(dtype_qk.itemsize, dtype_vo.itemsize) == 1 else 6e-3
+    o = w.run(q, k, v, q_scale=scale_bmm1, v_scale=scale_bmm2)
+    ref = _ragged_ref(qr, kr, vr, qo, kv, sm * scale_bmm1, causal=causal) * scale_bmm2
+    atol = 4.5e-2 if min(dtype_qk.itemsize, dtype_vo.itemsize) == 1 else 6e-3
     torch.testing.assert_close(o.float(), ref.float(), atol=atol, rtol=atol)
 
     # Check whether the caller provided out and returned out match
     out_buf = torch.empty_like(o)
-    o_explicit = w.run(q, k, v, out=out_buf)
+    o_explicit = w.run(q, k, v, q_scale=scale_bmm1, v_scale=scale_bmm2, out=out_buf)
     assert o_explicit.dtype == o.dtype
     torch.testing.assert_close(o_explicit, o, rtol=0, atol=0)
 
     # LSE is now supported for standard attention.
-    o2, lse = w.run(q, k, v, return_lse=True)
+    o2, lse = w.run(q, k, v, q_scale=scale_bmm1, v_scale=scale_bmm2, return_lse=True)
     torch.testing.assert_close(o2.float(), o.float(), atol=1e-2, rtol=1e-2)
     assert lse.shape == (total, Hq)
 
