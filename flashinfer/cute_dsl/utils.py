@@ -29,6 +29,7 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 
 from .availability import (  # noqa: F401
+    cute_dsl_compile_arch,
     is_cute_dsl_arch_supported,
     is_cute_dsl_available,
     is_cute_dsl_experimental_available,
