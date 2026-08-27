@@ -22,6 +22,7 @@ from flashinfer.prims_ts.moe.config_mapper import (
     _expanded_prims_ts_json_configs,
     _expanded_trtllm_gen_json_configs,
     map_trtllm_bf16_moe_tactic,
+    map_trtllm_deepseek_fp8_moe_tactic,
     map_trtllm_mxfp4_mxfp8_moe_tactic,
     map_trtllm_mxfp4_bf16_moe_tactic,
     map_trtllm_nvfp4_moe_tactic,
@@ -254,6 +255,25 @@ def test_config_mapper_matches_default_tile_selection():
         num_local_experts=128,
     )
     assert pair.tile_n == 8
+
+
+def test_deepseek_scheduler_variants_preserve_persisted_pair_indices():
+    legacy_pairs = [
+        (0, 0),
+        (0, 1),
+        (1, 0),
+        (1, 1),
+    ]
+    for tactic_index, expected_schedulers in enumerate(legacy_pairs):
+        pair = map_trtllm_deepseek_fp8_moe_tactic([32, tactic_index])
+        fc1 = pair.fc1.cfg.build()
+        fc2 = pair.fc2.cfg.build()
+        assert (fc1.tile_scheduler, fc2.tile_scheduler) == expected_schedulers
+        assert (fc1.use_work_throttle, fc2.use_work_throttle) == (0, 0)
+
+    throttled_pair = map_trtllm_deepseek_fp8_moe_tactic([32, 8])
+    assert throttled_pair.fc1.cfg.build().use_work_throttle == 1
+    assert throttled_pair.fc2.cfg.build().use_work_throttle == 1
 
 
 def test_config_mapper_rejects_unknown_tile():

@@ -763,14 +763,36 @@ def _resolve_moe_json_config_pair(
             f"{dtype_label} tile_N={tile_n}, activation_type={activation_type}, "
             f"fc1_matches={len(fc1_indices)}, fc2_matches={len(fc2_indices)}"
         )
-    total = len(fc1_indices) * len(fc2_indices)
+    config_pairs = [
+        (fc1_index, fc2_index)
+        for fc1_index in fc1_indices
+        for fc2_index in fc2_indices
+    ]
+    if use_deepseek_fp8:
+        # Keep the original unthrottled 2x2 Cartesian product at indices 0..3.
+        # Persisted autotuner caches store this pair index, so appending the
+        # work-throttled scheduler variants must not reinterpret old tactics.
+        config_pairs.sort(
+            key=lambda pair: int(
+                _bool_value(
+                    _json_config_by_global_index(pair[0]).options.get(
+                        "use_work_throttle", False
+                    )
+                )
+                or _bool_value(
+                    _json_config_by_global_index(pair[1]).options.get(
+                        "use_work_throttle", False
+                    )
+                )
+            )
+        )
+    total = len(config_pairs)
     if moe_config_index >= total:
         raise ValueError(
             f"Unsupported MoE config index={moe_config_index}; valid range is "
             f"[0, {total - 1}] for {dtype_label} tile_N={tile_n}"
         )
-    fc1_index = fc1_indices[moe_config_index // len(fc2_indices)]
-    fc2_index = fc2_indices[moe_config_index % len(fc2_indices)]
+    fc1_index, fc2_index = config_pairs[moe_config_index]
     return _json_config_by_global_index(fc1_index), _json_config_by_global_index(
         fc2_index
     )
