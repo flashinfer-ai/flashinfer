@@ -75,8 +75,12 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
         dist.all_gather_into_tensor(gathered, inp, group=group)
         expected = gathered @ weight
     owner_stream.wait_stream(producer_stream)
+    cold_miss_gate = torch.cuda.Event(enable_timing=False)
     with torch.cuda.stream(owner_stream):
+        torch.cuda._sleep(2_000_000_000)
+        cold_miss_gate.record()
         ordinary = all_gather_matmul(inp, weight, group, backend="cake")
+    assert not cold_miss_gate.query()
     pinned_descriptor_churn = [
         torch.empty(384, dtype=torch.uint8, device="cpu", pin_memory=True).fill_(index)
         for index in range(32)
