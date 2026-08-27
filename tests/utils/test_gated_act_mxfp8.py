@@ -40,6 +40,7 @@ FROZEN_LAUNCHER_SOURCES = (
     "gated_act_mxfp8_fwd_both_noalloc.cu",
     "gated_act_mxfp8_bwd_row.cu",
     "gated_act_mxfp8_bwd_row_sm103.cu",
+    "gated_act_mxfp8_bwd_both_sm103.cu",
 )
 
 
@@ -260,3 +261,52 @@ def test_gated_act_mxfp8_mode_consistency(direction):
             rtol=0,
             atol=0,
         )
+
+
+@torch.inference_mode()
+def test_gated_act_mxfp8_sm103_backward_both_special_values():
+    if not torch.cuda.is_available() or get_compute_capability(
+        torch.device("cuda:0")
+    ) != (10, 3):
+        pytest.skip("SM103-specific backward-both kernel requires SM103")
+
+    m = k = 128
+    gated_input = torch.empty((m, 2 * k), device="cuda", dtype=torch.bfloat16)
+    grad_output = torch.empty((m, k), device="cuda", dtype=torch.bfloat16)
+    values = torch.tensor(
+        [
+            -16.0,
+            -8.0,
+            -1.0,
+            -0.125,
+            -(2**-12),
+            -0.0,
+            0.0,
+            2**-12,
+            0.125,
+            1.0,
+            8.0,
+            16.0,
+        ],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    gated_input.copy_(
+        values.repeat((gated_input.numel() + values.numel() - 1) // values.numel())[
+            : gated_input.numel()
+        ].reshape_as(gated_input)
+    )
+    grad_output.copy_(
+        values.flip(0)
+        .repeat((grad_output.numel() + values.numel() - 1) // values.numel())[
+            : grad_output.numel()
+        ]
+        .reshape_as(grad_output)
+    )
+
+    actual = _run("backward", gated_input, grad_output, True, True)
+    expected = _quantize_reference(
+        _logical("backward", gated_input, grad_output), True, True
+    )
+    _assert_backward_orientation(actual[0], actual[2], expected[0], expected[2], True)
+    _assert_backward_orientation(actual[1], actual[3], expected[1], expected[3], False)

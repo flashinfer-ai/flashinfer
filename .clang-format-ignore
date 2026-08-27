@@ -8,3 +8,4 @@ csrc/gated_act_mxfp8/gated_act_mxfp8_bwd_row.cu
 csrc/gated_act_mxfp8/gated_act_mxfp8_bwd_row_sm103.cu
 csrc/gated_act_mxfp8/gated_act_mxfp8_bwd_col.cu
 csrc/gated_act_mxfp8/gated_act_mxfp8_bwd_both.cu
+csrc/gated_act_mxfp8/gated_act_mxfp8_bwd_both_sm103.cu

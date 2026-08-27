@@ -56,4 +56,9 @@ cudaError_t LaunchBackwardBoth(__nv_bfloat16* input, __nv_bfloat16* grad, CUtens
                                uint8_t* row_scales, uint8_t* col_scales, int m, int k,
                                cudaStream_t stream);
 
+cudaError_t LaunchBackwardBothSm103(__nv_bfloat16* input, __nv_bfloat16* grad, CUtensorMap row_act,
+                                    CUtensorMap row_gate, CUtensorMap col_act, CUtensorMap col_gate,
+                                    uint8_t* row_scales, uint8_t* col_scales, int m, int k,
+                                    cudaStream_t stream);
+
 }  // namespace flashinfer::gated_act_mxfp8

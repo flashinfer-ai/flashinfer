@@ -242,8 +242,11 @@ void Backward(TensorView gated_input, TensorView grad_output, TensorView row_out
         MakeRowOutputMap(row_q + k, m, k, output_k, 64, "row gate gradient");
     const CUtensorMap col_act = MakeColOutputMap(col_q, m, k, "col activation gradient");
     const CUtensorMap col_gate = MakeColOutputMap(col_q + k * m, m, k, "col gate gradient");
-    status = LaunchBackwardBoth(input, grad, row_act, row_gate, col_act, col_gate, row_sf, col_sf,
-                                m32, k32, stream);
+    status = architecture_minor == 3
+                 ? LaunchBackwardBothSm103(input, grad, row_act, row_gate, col_act, col_gate,
+                                           row_sf, col_sf, m32, k32, stream)
+                 : LaunchBackwardBoth(input, grad, row_act, row_gate, col_act, col_gate, row_sf,
+                                      col_sf, m32, k32, stream);
   } else if (rowwise) {
     const CUtensorMap row_act =
         MakeRowOutputMap(row_q, m, k, output_k, 64, "row activation gradient");
