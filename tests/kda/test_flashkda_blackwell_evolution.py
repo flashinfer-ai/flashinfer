@@ -60,7 +60,17 @@ def test_flashkda_evolution_jit_spec_has_one_generated_binding(variant, target):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_flashkda_evolution_h96_fixed_8192_matches_public_backend():
+@pytest.mark.parametrize(
+    ("seq_lens", "seed", "expected_variant"),
+    (
+        ((8192,), 20260826, "vtile_f1_t8192_h96_p1_s96"),
+        ((1300, 547, 2048, 963, 271, 3063), 10001, "m128_h96_p0_s1"),
+    ),
+    ids=("fixed-8192", "mixed"),
+)
+def test_flashkda_evolution_h96_matches_public_backend(
+    seq_lens, seed, expected_variant
+):
     from flashinfer.kda import recurrent_kda
     from flashinfer.kda_prefill import _select_flash_kda_prefill_target
 
@@ -68,8 +78,8 @@ def test_flashkda_evolution_h96_fixed_8192_matches_public_backend():
         pytest.skip("requires SM100 or SM103")
 
     device = torch.device("cuda")
-    generator = torch.Generator(device=device).manual_seed(20260826)
-    shape = (1, 8192, 96, 128)
+    generator = torch.Generator(device=device).manual_seed(seed)
+    shape = (1, sum(seq_lens), 96, 128)
     q = (
         torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
         * 0.1
@@ -99,9 +109,20 @@ def test_flashkda_evolution_h96_fixed_8192_matches_public_backend():
     )
     initial = (
         torch.randn(
-            (1, 96, 128, 128), dtype=torch.bfloat16, device=device, generator=generator
+            (len(seq_lens), 96, 128, 128),
+            dtype=torch.bfloat16,
+            device=device,
+            generator=generator,
         )
         * 0.01
+    )
+    offsets = [0]
+    for seq_len in seq_lens:
+        offsets.append(offsets[-1] + seq_len)
+    cu_seqlens = (
+        torch.tensor(offsets, dtype=torch.int64, device=device)
+        if len(seq_lens) > 1
+        else None
     )
 
     expected_initial = initial.clone()
@@ -120,6 +141,7 @@ def test_flashkda_evolution_h96_fixed_8192_matches_public_backend():
         lower_bound=-5.0,
         beta_is_logit=True,
         backend="cake",
+        cu_seqlens=cu_seqlens,
     )
 
     actual_out = torch.empty_like(q)
@@ -137,8 +159,9 @@ def test_flashkda_evolution_h96_fixed_8192_matches_public_backend():
         actual_state,
         scale=1.0 / math.sqrt(128),
         lower_bound=-5.0,
+        cu_seqlens=cu_seqlens,
     )
-    assert prepared.variant == "vtile_f1_t8192_h96_p1_s96"
+    assert prepared.variant == expected_variant
     assert prepared.target == _select_flash_kda_prefill_target(device)
     prepared.launch()
     torch.cuda.synchronize(device)
