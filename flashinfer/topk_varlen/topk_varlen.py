@@ -32,6 +32,10 @@ Backend choices
                        ``pre_idx`` hint from the previous decode step.
 ``"radix_cutlass"``  — masked-radix fallback; masks logits to ``seq_lens`` then
                        calls the FlashInfer CUTLASS radix top-K.  Runs on any GPU.
+``"radix_filter"``   — filtered-radix (coarse histogram → filter → on-chip
+                       refine); hint-free like ``"radix"``, large-N specialist.
+                       Datacentre Blackwell-class (sm_100/103/107) only;
+                       opt-in — never chosen by ``"auto"``.
 ``"auto"``           — GVR (if pre_idx provided) > radix (Blackwell) >
                        radix_cutlass (default).
 """
@@ -88,6 +92,13 @@ _BLACKWELL_PLUS_CCS = [100, 103, 107, 110, 120, 121]
 # lacks. Rubin keeps both (datacentre cluster shape, same PTX surface). radix
 # serves SM110+.
 _GVR_CCS = [100, 103, 107]
+
+# DKG filtered-radix backend (vendored CuTe-DSL kernel, see
+# kernels/filtered_topk_util.py). Upstream's own arch table
+# ``_LARGE_OCCUPANCY_MIN_BLOCKS_PER_MP`` covers sm_100/103/107/109. 109 is left
+# out here because the shipped CuTe DSL has no ``sm_109`` entry in
+# ``SMEM_CAPACITY_MAP``, so sizing raises before the kernel ever compiles.
+_RADIX_FILTER_CCS = [100, 103, 107]
 
 # ---------------------------------------------------------------------------
 # Backend requirement checkers
@@ -204,7 +215,11 @@ def _top_k_varlen_heuristic(
     call this function with positional args on the skip_check=True path without
     raising TypeError.  Mirrors the pattern used by _heuristic_func_mm_fp4.
     """
-    return [b for b in ("gvr", "radix", "radix_cutlass") if b in suitable_backends]
+    return [
+        b
+        for b in ("gvr", "radix", "radix_filter", "radix_cutlass")
+        if b in suitable_backends
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -996,6 +1011,108 @@ def _run_radix(
 
 
 # ---------------------------------------------------------------------------
+# Internal: DKG filtered-radix (`radix_filter`) backend implementation
+# ---------------------------------------------------------------------------
+
+_RADIX_FILTER_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+@functools.cache
+def _radix_filter_kernel_dsl_ok() -> bool:
+    """Whether the installed CuTe DSL has the APIs the vendored kernel uses.
+
+    The vendored files target the ``cutlass.memory`` namespace (``SmemAllocator``,
+    ``get_smem_capacity_in_bytes``), which exists only in DSL releases newer than
+    this repo's minimum pin -- on the pinned floor the kernel raises
+    ``AttributeError`` from inside ``cute.compile``. Unlike the arch probe above,
+    this one fails CLOSED: without the module the kernel definitely cannot run,
+    so reporting unsupported (clean fallback / clean dispatch error) is strictly
+    better than the deferred crash.
+    """
+    try:
+        import cutlass.memory  # noqa: F401, PLC0415
+
+        return hasattr(cutlass.memory, "SmemAllocator") and hasattr(
+            cutlass.memory, "get_smem_capacity_in_bytes"
+        )
+    except Exception:
+        return False
+
+
+@supported_compute_capability(_RADIX_FILTER_CCS)
+def _radix_filter_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+):
+    """Return True only when the vendored DKG kernel covers this configuration.
+
+    Upstream's decode wrapper has no ``compress_ratio`` and no ``pre_idx``
+    parameter at all, so those are hard exclusions rather than tuning knobs --
+    returning False here makes ``backend="auto"`` fall through to a backend that
+    does implement them instead of silently ignoring the argument.
+    """
+    if not _cute_dsl_ready(logits.device):
+        return False
+    if not _radix_filter_kernel_dsl_ok():
+        return False
+    if compress_ratio != 1:
+        return False
+    if logits.dtype not in _RADIX_FILTER_DTYPES:
+        return False
+    return True
+
+
+def _run_radix_filter(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    return_output_values: bool,
+    out_indices: torch.Tensor,
+    out_values: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """DKG filtered-radix (coarse histogram -> filter -> refine) decode top-k.
+
+    The upstream wrapper's contract already matches this API: it takes the
+    ``(batch * next_n, N)`` logits and the ``(batch,)`` int32 ``seq_lens``, and
+    returns row-relative indices padded with ``-1``. It allocates its own
+    outputs, so ``out_indices``/``out_values`` are filled by copy when the
+    caller supplied them.
+    """
+    from .kernels.filtered_topk_decode import (  # noqa: PLC0415
+        cute_dsl_radix_filter_topk_wrapper,
+    )
+
+    idx, val = cute_dsl_radix_filter_topk_wrapper(
+        logits,
+        seq_lens,
+        top_k,
+        next_n,
+        return_val=return_output_values,
+    )
+
+    if out_indices is not None and out_indices.data_ptr() != idx.data_ptr():
+        out_indices.copy_(idx)
+        idx = out_indices
+    if return_output_values and out_values is not None and val is not None:
+        if out_values.data_ptr() != val.data_ptr():
+            out_values.copy_(val)
+            val = out_values
+    return idx, (val if return_output_values else None)
+
+
+# ---------------------------------------------------------------------------
 # Public API: top_k_varlen
 # ---------------------------------------------------------------------------
 
@@ -1005,6 +1122,7 @@ def _run_radix(
         "radix": _radix_top_k_varlen_check,
         "gvr": _gvr_top_k_varlen_check,
         "radix_cutlass": _radix_cutlass_top_k_varlen_check,
+        "radix_filter": _radix_filter_top_k_varlen_check,
     },
     heuristic_func=_top_k_varlen_heuristic,
 )
@@ -1019,7 +1137,7 @@ def top_k_varlen(
     return_values: bool = False,
     out_indices: Optional[torch.Tensor] = None,
     out_values: Optional[torch.Tensor] = None,
-    backend: Literal["radix", "gvr", "radix_cutlass", "auto"] = "auto",
+    backend: Literal["radix", "gvr", "radix_cutlass", "radix_filter", "auto"] = "auto",
     load_balance: bool = True,
     workspace: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -1231,10 +1349,21 @@ def top_k_varlen(
             out_indices,
             out_values,
         )
+    elif backend == "radix_filter":
+        out_i, out_v = _run_radix_filter(
+            logits,
+            seq_lens,
+            top_k,
+            next_n,
+            compress_ratio,
+            return_values,
+            out_indices,
+            out_values,
+        )
     else:
         raise ValueError(
             f"Unknown backend: {backend!r}. "
-            f"Expected 'radix', 'gvr', or 'radix_cutlass'."
+            f"Expected 'radix', 'gvr', 'radix_cutlass', or 'radix_filter'."
         )
 
     return out_i, out_v
