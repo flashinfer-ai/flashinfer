@@ -862,3 +862,9 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_training_c32_forward,
                               flashinfer::flash_kda_training_fallback::RunTrainingC32Forward);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_training_c32_backward,
                               flashinfer::flash_kda_training_fallback::RunTrainingC32Backward);
+
+// The content digest is part of the filename so this included device program
+// participates in the JIT module identity through this translation unit.
+namespace cake_kda_aligned_param_reduce_program {
+#include "cake_aligned_training_export/cake_flashkda_training_c16_aligned_param_reduce_be120a1e72.cu"
+}
