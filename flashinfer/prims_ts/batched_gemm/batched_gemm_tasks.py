@@ -1422,10 +1422,18 @@ def create_epilogue_task_dsfp8(
         _ = tmem.init_epilogue_state()
         _ = sf.init_epilogue_state()
         gmem.init_store_state()
+
+        def reset_work_tile_state():
+            sf.reset_dequant_accumulator()
+            if cutlass.const_expr(
+                cfg.has_deepseek_fp8_c_scale and cfg.epi_tile_n == 64
+            ):
+                gmem.reset_dsfp8_absmax()
+
         with _work_tile_schedule_loop(
             cfg,
             wq,
-            work_tile_preheader=sf.reset_dequant_accumulator,
+            work_tile_preheader=reset_work_tile_state,
         ):
             gmem.init_epilogue_tile_state()
             with domain_loop(0, num_k_tiles, 1) as d:

@@ -112,6 +112,7 @@ class GmemCResource(MemoryResource):
     sC: Any = None
     sCInt16: Any = None
     sCFloat: Any = None
+    sDsFp8Absmax: Any = None
     sBias: Any = None
     sPerTokenSfA: Any = None
     sPerTokenSfB: Any = None
@@ -124,6 +125,7 @@ class GmemCResource(MemoryResource):
     tile_token_limit: Any = None
     dsfp8_c_scale_stride: Any = None
     _alloc_sc: Constexpr[Optional[SmemAllocation]] = None
+    _alloc_dsfp8_absmax: Constexpr[Optional[SmemAllocation]] = None
     _alloc_bias: Constexpr[Optional[SmemAllocation]] = None
     _alloc_per_token_sf_a: Constexpr[Optional[SmemAllocation]] = None
     _alloc_per_token_sf_b: Constexpr[Optional[SmemAllocation]] = None
@@ -134,6 +136,16 @@ class GmemCResource(MemoryResource):
                 f"{self.name}_sc",
                 size_bytes=self.cfg.num_bytes_c_smem_scratch,
                 alignment=1024,
+            )
+        if (
+            self._alloc_dsfp8_absmax is None
+            and self.cfg.has_deepseek_fp8_c_scale
+            and self.cfg.epi_tile_n == 64
+        ):
+            self._alloc_dsfp8_absmax = SmemAllocation(
+                f"{self.name}_dsfp8_absmax",
+                size_bytes=self.cfg.epi_tile_n * 4,
+                alignment=16,
             )
         if self._alloc_bias is None and self.cfg.has_bias_m:
             self._alloc_bias = SmemAllocation(
@@ -194,6 +206,8 @@ class GmemCResource(MemoryResource):
 
     def get_smem_requirements(self):
         requirements = [self._alloc_sc]
+        if self._alloc_dsfp8_absmax is not None:
+            requirements.append(self._alloc_dsfp8_absmax)
         if self._alloc_bias is not None:
             requirements.append(self._alloc_bias)
         if self._alloc_per_token_sf_a is not None:
@@ -241,6 +255,13 @@ class GmemCResource(MemoryResource):
             shape=(self._alloc_sc.size_bytes // 2,),
             addrspace=3,
         )
+        if cutlass.const_expr(self._alloc_dsfp8_absmax is not None):
+            self.sDsFp8Absmax = cutlass.Array(
+                context.smem_base.data_ptr() + self._alloc_dsfp8_absmax.offset,
+                dtype=cutlass.Float32,
+                shape=(self.cfg.epi_tile_n,),
+                addrspace=3,
+            )
         if cutlass.const_expr(self._alloc_bias is not None):
             self.sBias = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc_bias.offset,
@@ -276,6 +297,19 @@ class GmemCResource(MemoryResource):
             self.dsfp8_c_scale_stride = self.gTotalNumPaddedTokens.load(
                 idx=Int32(0), vector_size=1
             )[0]
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def reset_dsfp8_absmax(self, stage_info: StageInfo) -> None:
+        """Clear the dedicated DeepSeek output-scale reduction scratch."""
+        if cutlass.const_expr(self._alloc_dsfp8_absmax is not None):
+            tidx, _, _ = cute.arch.thread_idx()
+            if tidx < Int32(self.cfg.epi_tile_n):
+                self.sDsFp8Absmax.subview(tidx).store(Float32(0.0))
+            prims.barrier_cta_sync(
+                barrier_id=9,
+                thread_count=self.cfg.num_epilogue_warps * 32,
+            )
 
     def _use_swap_ab_quant_tma_store(self) -> bool:
         """Whether the swapAB quantized epilogue should stage C through TMA."""
@@ -1374,6 +1408,28 @@ class GmemCResource(MemoryResource):
             )
 
     @cute.jit
+    def _atomic_dsfp8_absmax_scratch_pair(self, val0, val1, lane_id, scale_pair):
+        warp_absmax0 = self._reduce_fp4_absmax_m16(val0)
+        warp_absmax1 = self._reduce_fp4_absmax_m16(val1)
+        lane_col = (lane_id % Int32(4)) * Int32(2)
+        scratch_idx = scale_pair * Int32(8) + lane_col
+        if (lane_id // Int32(4)) == Int32(0):
+            cute.arch.atomic_fmax(
+                ptr=self.sDsFp8Absmax.data_ptr(scratch_idx),
+                val=warp_absmax0,
+                sign_bit=False,
+                sem="relaxed",
+                scope="cta",
+            )
+            cute.arch.atomic_fmax(
+                ptr=self.sDsFp8Absmax.data_ptr(scratch_idx + Int32(1)),
+                val=warp_absmax1,
+                sign_bit=False,
+                sem="relaxed",
+                scope="cta",
+            )
+
+    @cute.jit
     def _read_absmax_scratch(self, warpgroup_idx, warp_in_epi4, lane_id, scale_slot):
         """Phase 2: read own + partner warp's scratch and combine.
 
@@ -1461,14 +1517,23 @@ class GmemCResource(MemoryResource):
 
     @cute.jit
     def _dsfp8_c_scale_pair_two_epilogues(self, lane_id, scale_pair):
-        group0_abs0, group0_abs1 = self._read_absmax_scratch_pair_all_warps(
-            Int32(0), lane_id, scale_pair
-        )
-        group1_abs0, group1_abs1 = self._read_absmax_scratch_pair_all_warps(
-            Int32(1), lane_id, scale_pair
-        )
-        block_abs0 = cute.arch.fmax(group0_abs0, group1_abs0)
-        block_abs1 = cute.arch.fmax(group0_abs1, group1_abs1)
+        if cutlass.const_expr(self.cfg.epi_tile_n == 64):
+            lane_col = (lane_id % Int32(4)) * Int32(2)
+            scratch_idx = scale_pair * Int32(8) + lane_col
+            block_abs0, block_abs1 = self.sDsFp8Absmax.load(
+                scratch_idx,
+                vector_size=2,
+                alignment=8,
+            )
+        else:
+            group0_abs0, group0_abs1 = self._read_absmax_scratch_pair_all_warps(
+                Int32(0), lane_id, scale_pair
+            )
+            group1_abs0, group1_abs1 = self._read_absmax_scratch_pair_all_warps(
+                Int32(1), lane_id, scale_pair
+            )
+            block_abs0 = cute.arch.fmax(group0_abs0, group1_abs0)
+            block_abs1 = cute.arch.fmax(group0_abs1, group1_abs1)
         safe_abs0, safe_abs1 = self._fmul2(
             cute.arch.fmax(block_abs0, Float32(1.0e-12)),
             cute.arch.fmax(block_abs1, Float32(1.0e-12)),
@@ -2876,14 +2941,22 @@ class GmemCResource(MemoryResource):
                             local_abs0 = local_abs
                         else:
                             local_abs1 = local_abs
-                    self._write_absmax_scratch_pair(
-                        local_abs0,
-                        local_abs1,
-                        warpgroup_idx,
-                        warp_in_epi4,
-                        lane_id,
-                        Int32(group),
-                    )
+                    if cutlass.const_expr(self.cfg.epi_tile_n == 64):
+                        self._atomic_dsfp8_absmax_scratch_pair(
+                            local_abs0,
+                            local_abs1,
+                            lane_id,
+                            Int32(group),
+                        )
+                    else:
+                        self._write_absmax_scratch_pair(
+                            local_abs0,
+                            local_abs1,
+                            warpgroup_idx,
+                            warp_in_epi4,
+                            lane_id,
+                            Int32(group),
+                        )
 
                 prims.barrier_cta_sync(barrier_id=9, thread_count=256)
                 for group in cutlass.range_constexpr(self.cfg.epi_tile_n // 8):
