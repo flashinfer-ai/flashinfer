@@ -25,9 +25,10 @@ A caller-owned context may be reused only with matching shape metadata and CUDA
 device, on the CUDA stream that originally created it. Reuse overwrites its
 saved checkpoints and metadata. Pass it as ``context_out`` together with the
 same-shape ``out`` and ``final_state_out`` buffers to avoid reallocating the
-paired forward storage. Calls sharing one context are serialized. The context
-returned by that forward is the context consumed by backward; backward never
-creates a replacement tape by rerunning forward.
+paired forward storage. Packed reuse still requires the same trusted CPU
+planning metadata described below. Calls sharing one context are serialized.
+The context returned by that forward is the context consumed by backward;
+backward never creates a replacement tape by rerunning forward.
 
 The frozen production dispatcher requires Blackwell compute capability 10.0
 or 10.3, key/value dimensions 128, BF16 Q/K/V/raw-gate/raw-beta, and FP32
@@ -45,8 +46,11 @@ BF16 output, FP32 final state, and all eight gradients with
 Fixed layout accepts contiguous ``[B, T, H, 128]`` tensors with ``B >= 1`` and
 omitted ``cu_seqlens``; each physical batch row is one semantic sequence.
 Packed layout accepts a physical batch dimension of one plus CUDA int64
-``cu_seqlens``. Packed sequence lengths may be mixed, and neither layout
-requires a 16-token-aligned length.
+``cu_seqlens`` and requires ``cu_seqlens_cpu``, an int64 CPU tensor containing
+the same cumulative offsets. The CPU tensor is trusted planning metadata: the
+wrapper validates and traverses it without copying or reading the CUDA tensor,
+so callers must keep both tensors' contents equal. Packed sequence lengths may
+be mixed, and neither layout requires a 16-token-aligned length.
 
 The dispatcher filters three physical templates by their legal domains, then
 selects the lowest analytical cost. Its model includes fixed DAG fill and drain,

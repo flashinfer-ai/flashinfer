@@ -127,15 +127,16 @@ def _make_inputs(shape: _Shape, seed: int) -> dict[str, torch.Tensor | None]:
         qk_shape = (batch_size, sequence_length, shape.num_qk_heads, 128)
         value_shape = (batch_size, sequence_length, shape.num_v_heads, 128)
         cu_seqlens = None
+        cu_seqlens_cpu = None
     elif shape.layout == "packed":
         total_tokens = sum(shape.seq_lens)
         qk_shape = (1, total_tokens, shape.num_qk_heads, 128)
         value_shape = (1, total_tokens, shape.num_v_heads, 128)
-        cu_seqlens = torch.tensor(
+        cu_seqlens_cpu = torch.tensor(
             [0, *torch.tensor(shape.seq_lens).cumsum(0).tolist()],
             dtype=torch.int64,
-            device="cuda",
         )
+        cu_seqlens = cu_seqlens_cpu.to(device="cuda")
     else:
         raise ValueError(f"unsupported layout: {shape.layout}")
     state_shape = (len(shape.seq_lens), shape.num_v_heads, 128, 128)
@@ -161,6 +162,7 @@ def _make_inputs(shape: _Shape, seed: int) -> dict[str, torch.Tensor | None]:
         "initial_state": torch.randn(state_shape, generator=generator, device="cuda")
         * 0.02,
         "cu_seqlens": cu_seqlens,
+        "cu_seqlens_cpu": cu_seqlens_cpu,
         "do": bf16(value_shape, 0.1),
         "dfinal_state": torch.randn(state_shape, generator=generator, device="cuda")
         * 0.1,
@@ -217,9 +219,7 @@ def _prepare_fla_paired(inputs):
     leaves["dt_bias"] = (
         inputs["dt_bias"].detach().reshape(-1).clone().requires_grad_(True)
     )
-    cu_seqlens_cpu = (
-        None if inputs["cu_seqlens"] is None else inputs["cu_seqlens"].detach().cpu()
-    )
+    cu_seqlens_cpu = inputs["cu_seqlens_cpu"]
 
     def run_fla_paired():
         output, final_state = chunk_kda(
@@ -299,6 +299,7 @@ def _benchmark_shape(
         inputs["cu_seqlens"],
         out=output,
         final_state_out=final_state,
+        cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
     )
     gradients = (
         torch.empty_like(inputs["q"]),
@@ -329,6 +330,7 @@ def _benchmark_shape(
             out=output,
             final_state_out=final_state,
             context_out=context,
+            cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
         )
         paired_gradients = recurrent_kda_training_backward(
             paired_context,

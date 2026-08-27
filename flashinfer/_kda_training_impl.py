@@ -125,6 +125,7 @@ def _validate_forward_inputs(
     dt_bias: torch.Tensor,
     initial_state: torch.Tensor,
     cu_seqlens: Optional[torch.Tensor],
+    cu_seqlens_cpu: Optional[torch.Tensor],
 ) -> _TrainingShape:
     if not isinstance(q, torch.Tensor) or not q.is_cuda:
         raise ValueError("recurrent_kda_training_forward requires CUDA tensors")
@@ -139,6 +140,8 @@ def _validate_forward_inputs(
     if batch <= 0 or tokens <= 0 or num_qk_heads <= 0:
         raise ValueError("batch, sequence length, and head count must be positive")
     if cu_seqlens is None:
+        if cu_seqlens_cpu is not None:
+            raise ValueError("cu_seqlens_cpu requires packed cu_seqlens")
         layout: Literal["fixed", "packed"] = "fixed"
         seq_lens = (tokens,) * batch
         offsets = tuple(index * tokens for index in range(batch + 1))
@@ -157,9 +160,23 @@ def _validate_forward_inputs(
         )
         if cu_seqlens.numel() < 2:
             raise ValueError("cu_seqlens must contain at least one sequence")
-        offsets = tuple(int(value) for value in cu_seqlens.detach().cpu().tolist())
+        if cu_seqlens_cpu is None:
+            raise ValueError("cu_seqlens_cpu must be provided for packed tensors")
+        if not isinstance(cu_seqlens_cpu, torch.Tensor) or cu_seqlens_cpu.ndim != 1:
+            raise ValueError("cu_seqlens_cpu must be a one-dimensional CPU tensor")
+        if cu_seqlens_cpu.device.type != "cpu":
+            raise ValueError("cu_seqlens_cpu must be a CPU tensor")
+        if cu_seqlens_cpu.dtype != torch.int64:
+            raise ValueError("cu_seqlens_cpu must have dtype torch.int64")
+        if not cu_seqlens_cpu.is_contiguous():
+            raise ValueError("cu_seqlens_cpu must be contiguous")
+        if cu_seqlens_cpu.numel() != cu_seqlens.numel():
+            raise ValueError("cu_seqlens_cpu must have the same shape as cu_seqlens")
+        offsets = tuple(int(value) for value in cu_seqlens_cpu.detach().tolist())
         if offsets[0] != 0 or offsets[-1] != tokens:
-            raise ValueError("cu_seqlens must start at zero and end at total_tokens")
+            raise ValueError(
+                "cu_seqlens_cpu must start at zero and end at total_tokens"
+            )
         seq_lens = tuple(
             right - left for left, right in zip(offsets, offsets[1:], strict=False)
         )
@@ -1122,9 +1139,19 @@ def _recurrent_kda_training_forward_impl(
     out: Optional[torch.Tensor] = None,
     final_state_out: Optional[torch.Tensor] = None,
     context_out: Optional[RecurrentKDATrainingContext] = None,
+    cu_seqlens_cpu: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, RecurrentKDATrainingContext]:
     shape = _validate_forward_inputs(
-        q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens
+        q,
+        k,
+        v,
+        g,
+        beta,
+        A_log,
+        dt_bias,
+        initial_state,
+        cu_seqlens,
+        cu_seqlens_cpu,
     )
     scale_value, lower_bound_value = _validate_scale_and_bound(scale, lower_bound)
     device = q.device
@@ -1272,8 +1299,14 @@ def recurrent_kda_training_forward(
     out: Optional[torch.Tensor] = None,
     final_state_out: Optional[torch.Tensor] = None,
     context_out: Optional[RecurrentKDATrainingContext] = None,
+    *,
+    cu_seqlens_cpu: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, RecurrentKDATrainingContext]:
-    r"""Run fixed or packed KDA forward and save the selected route's tapes."""
+    r"""Run fixed or packed KDA forward and save the selected route's tapes.
+
+    Packed calls require ``cu_seqlens_cpu``, a trusted CPU mirror of the CUDA
+    ``cu_seqlens`` tensor used for host-side route and metadata planning.
+    """
 
     args = (
         q,
@@ -1291,11 +1324,13 @@ def recurrent_kda_training_forward(
         final_state_out,
     )
     if context_out is None:
-        return _recurrent_kda_training_forward_impl(*args, None)
+        return _recurrent_kda_training_forward_impl(*args, None, cu_seqlens_cpu)
     if not isinstance(context_out, RecurrentKDATrainingContext):
         raise TypeError("context_out must be a RecurrentKDATrainingContext")
     with context_out._lock:
-        return _recurrent_kda_training_forward_impl(*args, context_out)
+        return _recurrent_kda_training_forward_impl(
+            *args, context_out, cu_seqlens_cpu
+        )
 
 
 def _gradient_outputs(

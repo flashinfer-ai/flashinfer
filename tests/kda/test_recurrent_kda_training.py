@@ -103,12 +103,19 @@ def test_training_api_signatures_and_no_forward_recompute():
         "out",
         "final_state_out",
         "context_out",
+        "cu_seqlens_cpu",
     )
     assert (
         inspect.signature(recurrent_kda_training_forward)
         .parameters["cu_seqlens"]
         .default
         is None
+    )
+    assert (
+        inspect.signature(recurrent_kda_training_forward)
+        .parameters["cu_seqlens_cpu"]
+        .kind
+        is inspect.Parameter.KEYWORD_ONLY
     )
     assert backward_parameters == ("context", "do", "dfinal_state", "out")
     source = inspect.getsource(recurrent_kda_training_backward)
@@ -162,6 +169,16 @@ def test_public_contract_does_not_promote_fast_path_predicates_to_guards():
     assert "grouped Q/K heads only" not in source
     assert "torch.bfloat16" in source
     assert "torch.float32" in source
+
+
+def test_packed_planning_does_not_read_cuda_cu_seqlens_on_the_host():
+    source = inspect.getsource(kda_training_api._validate_forward_inputs)
+    assert "cu_seqlens.detach().cpu()" not in source
+    assert "cu_seqlens.cpu()" not in source
+    assert "cu_seqlens.item()" not in source
+    assert "cu_seqlens.tolist()" not in source
+    assert "cu_seqlens.detach().tolist()" not in source
+    assert "cu_seqlens_cpu.detach().tolist()" in source
 
 
 def test_analytical_selector_preserves_template_choice_and_strict_adapter():
@@ -253,6 +270,9 @@ def _make_inputs(
     qk_shape = (1, total_tokens, num_qk_heads, 128)
     value_shape = (1, total_tokens, num_v_heads, 128)
     state_shape = (len(seq_lens), num_v_heads, 128, 128)
+    cu_seqlens_cpu = torch.tensor(
+        [0, *torch.tensor(seq_lens).cumsum(0).tolist()], dtype=torch.int64
+    )
 
     def bf16(shape, multiplier=1.0):
         return (torch.randn(shape, generator=generator, device="cuda") * multiplier).to(
@@ -272,11 +292,8 @@ def _make_inputs(
         * 0.1,
         "initial_state": torch.randn(state_shape, generator=generator, device="cuda")
         * 0.02,
-        "cu_seqlens": torch.tensor(
-            [0, *torch.tensor(seq_lens).cumsum(0).tolist()],
-            dtype=torch.int64,
-            device="cuda",
-        ),
+        "cu_seqlens": cu_seqlens_cpu.to(device="cuda"),
+        "cu_seqlens_cpu": cu_seqlens_cpu,
         "do": bf16(value_shape, 0.1),
         "dfinal_state": torch.randn(state_shape, generator=generator, device="cuda")
         * 0.1,
@@ -313,10 +330,71 @@ def _make_fixed_inputs(
         "initial_state": torch.randn(state_shape, generator=generator, device="cuda")
         * 0.02,
         "cu_seqlens": None,
+        "cu_seqlens_cpu": None,
         "do": bf16(token_shape, 0.1),
         "dfinal_state": torch.randn(state_shape, generator=generator, device="cuda")
         * 0.1,
     }
+
+
+@pytest.mark.arch_blackwell
+def test_packed_forward_validates_trusted_cpu_cu_seqlens():
+    _require_blackwell()
+    inputs = _make_inputs(seed=24027, seq_lens=(17, 33))
+    names = ("q", "k", "v", "g", "beta", "A_log", "dt_bias", "initial_state")
+    args = tuple(inputs[name] for name in names)
+
+    with pytest.raises(ValueError, match="must be provided for packed tensors"):
+        recurrent_kda_training_forward(*args, inputs["cu_seqlens"])
+    with pytest.raises(ValueError, match="must be provided for packed tensors"):
+        kda_training_api._validate_forward_inputs(
+            *args, inputs["cu_seqlens"], None
+        )
+    with pytest.raises(ValueError, match="must be a CPU tensor"):
+        kda_training_api._validate_forward_inputs(
+            *args, inputs["cu_seqlens"], inputs["cu_seqlens"]
+        )
+    with pytest.raises(ValueError, match="dtype torch.int64"):
+        kda_training_api._validate_forward_inputs(
+            *args, inputs["cu_seqlens"], inputs["cu_seqlens_cpu"].to(torch.int32)
+        )
+    noncontiguous = torch.stack(
+        (inputs["cu_seqlens_cpu"], inputs["cu_seqlens_cpu"]), dim=1
+    )[:, 0]
+    assert not noncontiguous.is_contiguous()
+    with pytest.raises(ValueError, match="must be contiguous"):
+        kda_training_api._validate_forward_inputs(
+            *args, inputs["cu_seqlens"], noncontiguous
+        )
+    with pytest.raises(ValueError, match="same shape"):
+        kda_training_api._validate_forward_inputs(
+            *args, inputs["cu_seqlens"], inputs["cu_seqlens_cpu"][:-1]
+        )
+    invalid_end = inputs["cu_seqlens_cpu"].clone()
+    invalid_end[-1] -= 1
+    with pytest.raises(ValueError, match="end at total_tokens"):
+        kda_training_api._validate_forward_inputs(
+            *args, inputs["cu_seqlens"], invalid_end
+        )
+    non_increasing = inputs["cu_seqlens_cpu"].clone()
+    non_increasing[1] = non_increasing[0]
+    with pytest.raises(ValueError, match="sequence lengths must be positive"):
+        kda_training_api._validate_forward_inputs(
+            *args, inputs["cu_seqlens"], non_increasing
+        )
+
+    shape = kda_training_api._validate_forward_inputs(
+        *args, inputs["cu_seqlens"], inputs["cu_seqlens_cpu"]
+    )
+    assert shape.offsets == (0, 17, 50)
+    assert shape.seq_lens == (17, 33)
+
+    fixed = _make_fixed_inputs(2, 17, 1, seed=24028)
+    fixed_args = tuple(fixed[name] for name in names)
+    with pytest.raises(ValueError, match="requires packed cu_seqlens"):
+        kda_training_api._validate_forward_inputs(
+            *fixed_args, None, inputs["cu_seqlens_cpu"]
+        )
 
 
 def _fla_reference(inputs):
@@ -346,7 +424,7 @@ def _fla_reference(inputs):
         lower_bound=-5.0,
         state_v_first=True,
         cu_seqlens=cu_seqlens,
-        cu_seqlens_cpu=(None if cu_seqlens is None else cu_seqlens.detach().cpu()),
+        cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
         A_log=leaves["A_log"],
         dt_bias=leaves["dt_bias"],
         chunk_size=32,
@@ -377,6 +455,7 @@ def _assert_training_matches_fla(inputs, expected_route):
         inputs["dt_bias"],
         inputs["initial_state"],
         inputs["cu_seqlens"],
+        cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
     )
     assert isinstance(context, RecurrentKDATrainingContext)
     assert context._route.tag == expected_route
@@ -542,6 +621,7 @@ def test_paired_backward_ffi_does_not_rerun_forward(monkeypatch):
         inputs["dt_bias"],
         inputs["initial_state"],
         inputs["cu_seqlens"],
+        cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
     )
     final_state_output_ptr = context._final_output_scratch.data_ptr()
     assert final_state_output_ptr != output.data_ptr()
@@ -560,6 +640,7 @@ def test_paired_backward_ffi_does_not_rerun_forward(monkeypatch):
             out=rejected_q,
             final_state_out=final_state,
             context_out=context,
+            cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
         )
     assert context._q is inputs["q"]
     with pytest.raises(
@@ -578,6 +659,7 @@ def test_paired_backward_ffi_does_not_rerun_forward(monkeypatch):
             out=context._final_output_scratch,
             final_state_out=final_state,
             context_out=context,
+            cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
         )
     _, _, reused_context = recurrent_kda_training_forward(
         inputs["q"],
@@ -592,6 +674,7 @@ def test_paired_backward_ffi_does_not_rerun_forward(monkeypatch):
         out=output,
         final_state_out=final_state,
         context_out=context,
+        cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
     )
     assert reused_context is context
     assert context._final_output_scratch.data_ptr() == final_state_output_ptr
@@ -610,6 +693,7 @@ def test_paired_backward_ffi_does_not_rerun_forward(monkeypatch):
         out=output,
         final_state_out=final_state,
         context_out=context,
+        cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
     )
     assert training_module.forward_calls[-1][33] == 1
     recurrent_kda_training_backward(context, inputs["do"], inputs["dfinal_state"])
@@ -636,6 +720,7 @@ def test_paired_backward_ffi_does_not_rerun_forward(monkeypatch):
                 out=output,
                 final_state_out=final_state,
                 context_out=context,
+                cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
             )
     assert len(training_module.forward_calls) == 3
     assert len(training_module.backward_calls) == 1
@@ -707,6 +792,7 @@ def test_fallback_ffi_consumes_route_context_without_recompute(
         values["dt_bias"],
         values["initial_state"],
         values["cu_seqlens"],
+        cu_seqlens_cpu=values["cu_seqlens_cpu"],
     )
     assert context._route.tag == route
     recurrent_kda_training_backward(context, values["do"], values["dfinal_state"])
@@ -758,6 +844,7 @@ def test_grouped_hybrid_materializes_both_contexts_during_forward(monkeypatch):
         values["dt_bias"],
         values["initial_state"],
         values["cu_seqlens"],
+        cu_seqlens_cpu=values["cu_seqlens_cpu"],
     )
     assert context._route.tag == "grouped_hybrid_c16_c32"
     assert context._parameter_context is not None
@@ -800,6 +887,7 @@ def test_strict_public_dtypes_are_rejected_before_ffi(monkeypatch):
             inputs["dt_bias"],
             inputs["initial_state"],
             inputs["cu_seqlens"],
+            cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
         )
     assert sum(_training_call_counts(training_module)) == 0
 
@@ -813,6 +901,7 @@ def test_strict_public_dtypes_are_rejected_before_ffi(monkeypatch):
         inputs["dt_bias"],
         inputs["initial_state"],
         inputs["cu_seqlens"],
+        cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
     )
     forward_counts = _training_call_counts(training_module)
     with pytest.raises(ValueError, match="do must have dtype torch.bfloat16"):
@@ -850,6 +939,7 @@ def test_training_rejects_cuda_graph_capture_before_ffi(monkeypatch):
         inputs["dt_bias"],
         inputs["initial_state"],
         inputs["cu_seqlens"],
+        cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
     )
     call_counts = _training_call_counts(training_module)
     assert sum(call_counts[::2]) > 0
@@ -867,6 +957,7 @@ def test_training_rejects_cuda_graph_capture_before_ffi(monkeypatch):
             inputs["dt_bias"],
             inputs["initial_state"],
             inputs["cu_seqlens"],
+            cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
         )
     with pytest.raises(RuntimeError, match="does not support CUDA graph capture"):
         recurrent_kda_training_backward(context, inputs["do"], inputs["dfinal_state"])
@@ -896,6 +987,7 @@ def test_saved_context_mutation_rejected_before_ffi(monkeypatch):
         inputs["dt_bias"],
         inputs["initial_state"],
         inputs["cu_seqlens"],
+        cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
     )
     call_counts = _training_call_counts(training_module)
     assert sum(call_counts[::2]) > 0
@@ -918,6 +1010,7 @@ def test_saved_context_mutation_rejected_before_ffi(monkeypatch):
             out=output,
             final_state_out=final_state,
             context_out=context,
+            cu_seqlens_cpu=inputs["cu_seqlens_cpu"],
         )
 
     assert _training_call_counts(training_module) == call_counts
