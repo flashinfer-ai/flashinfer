@@ -158,7 +158,9 @@ def gen_flash_kda_evolution_module(
         extra_cuda_cflags=[*_NVCC_FLAGS[target], _TARGET_DEFINE[target]],
         extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
     )
-    logger.info("Generated FlashKDA evolution %s %s JIT spec: %s", variant, target, spec.name)
+    logger.info(
+        "Generated FlashKDA evolution %s %s JIT spec: %s", variant, target, spec.name
+    )
     return spec
 
 

@@ -54,20 +54,41 @@ def test_flashkda_evolution_h96_fixed_8192_matches_public_backend():
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(20260826)
     shape = (1, 8192, 96, 128)
-    q = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator) * 0.1
-    k = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator) * 0.1
-    v = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator) * 0.1
-    g = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator) * 0.1
-    beta = torch.sigmoid(
-        torch.randn(shape[:-1], dtype=torch.bfloat16, device=device, generator=generator)
+    q = (
+        torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
+        * 0.1
     )
-    A_log = torch.randn((96,), dtype=torch.float32, device=device, generator=generator) * 0.1
-    dt_bias = torch.randn(
-        (96, 128), dtype=torch.float32, device=device, generator=generator
-    ) * 0.1
-    initial = torch.randn(
-        (1, 96, 128, 128), dtype=torch.bfloat16, device=device, generator=generator
-    ) * 0.01
+    k = (
+        torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
+        * 0.1
+    )
+    v = (
+        torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
+        * 0.1
+    )
+    g = (
+        torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
+        * 0.1
+    )
+    beta = torch.sigmoid(
+        torch.randn(
+            shape[:-1], dtype=torch.bfloat16, device=device, generator=generator
+        )
+    )
+    A_log = (
+        torch.randn((96,), dtype=torch.float32, device=device, generator=generator)
+        * 0.1
+    )
+    dt_bias = (
+        torch.randn((96, 128), dtype=torch.float32, device=device, generator=generator)
+        * 0.1
+    )
+    initial = (
+        torch.randn(
+            (1, 96, 128, 128), dtype=torch.bfloat16, device=device, generator=generator
+        )
+        * 0.01
+    )
 
     expected_initial = initial.clone()
     expected_out, expected_state = recurrent_kda(
