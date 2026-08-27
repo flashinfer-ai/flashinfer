@@ -29,7 +29,34 @@ from .core import (
 )
 from .utils import write_if_different
 
-FlashKDAEvolutionVariant = Literal["vtile_f1_t8192_h96_p1_s96"]
+FlashKDAEvolutionVariant = Literal[
+    "m128_h32_p0_s1",
+    "m128_h4_p0_s1",
+    "m128_h64_p1_s114",
+    "m128_h96_p0_s1",
+    "m64_f1_t8192_h64",
+    "vtile_f0_t16_h96_p1_s192",
+    "vtile_f0_t16_h96_p1_s96",
+    "vtile_f0_t37_h96_p1_s96",
+    "vtile_f0_t97_h96_p1_s96",
+    "vtile_f1_t1024_h64_p4_s128",
+    "vtile_f1_t1024_h96_p1_s12288",
+    "vtile_f1_t1024_h96_p1_s1536",
+    "vtile_f1_t1024_h96_p1_s24576",
+    "vtile_f1_t1024_h96_p1_s3072",
+    "vtile_f1_t1024_h96_p1_s6144",
+    "vtile_f1_t1024_h96_p6_s128",
+    "vtile_f1_t1048576_h1_p1_s1",
+    "vtile_f1_t131072_h1_p1_s1",
+    "vtile_f1_t16384_h16_p1_s16",
+    "vtile_f1_t32768_h16_p1_s16",
+    "vtile_f1_t524288_h1_p1_s2",
+    "vtile_f1_t65536_h16_p1_s16",
+    "vtile_f1_t65536_h4_p1_s4",
+    "vtile_f1_t65536_h8_p1_s8",
+    "vtile_f1_t8192_h32_p1_s32",
+    "vtile_f1_t8192_h96_p1_s96",
+]
 FlashKDAEvolutionTarget = Literal["sm100a", "sm100f"]
 
 
@@ -38,19 +65,57 @@ class FlashKDAEvolutionMetadata(NamedTuple):
     kernel_symbol: str
     value_rows: int
     has_tile_schedule: bool
-    grid_x: int
+
+
+_FLASH_KDA_EVOLUTION_VARIANT_NAMES: tuple[FlashKDAEvolutionVariant, ...] = (
+    "m128_h32_p0_s1",
+    "m128_h4_p0_s1",
+    "m128_h64_p1_s114",
+    "m128_h96_p0_s1",
+    "m64_f1_t8192_h64",
+    "vtile_f0_t16_h96_p1_s192",
+    "vtile_f0_t16_h96_p1_s96",
+    "vtile_f0_t37_h96_p1_s96",
+    "vtile_f0_t97_h96_p1_s96",
+    "vtile_f1_t1024_h64_p4_s128",
+    "vtile_f1_t1024_h96_p1_s12288",
+    "vtile_f1_t1024_h96_p1_s1536",
+    "vtile_f1_t1024_h96_p1_s24576",
+    "vtile_f1_t1024_h96_p1_s3072",
+    "vtile_f1_t1024_h96_p1_s6144",
+    "vtile_f1_t1024_h96_p6_s128",
+    "vtile_f1_t1048576_h1_p1_s1",
+    "vtile_f1_t131072_h1_p1_s1",
+    "vtile_f1_t16384_h16_p1_s16",
+    "vtile_f1_t32768_h16_p1_s16",
+    "vtile_f1_t524288_h1_p1_s2",
+    "vtile_f1_t65536_h16_p1_s16",
+    "vtile_f1_t65536_h4_p1_s4",
+    "vtile_f1_t65536_h8_p1_s8",
+    "vtile_f1_t8192_h32_p1_s32",
+    "vtile_f1_t8192_h96_p1_s96",
+)
+_TILE_SCHEDULE_VARIANTS = frozenset(
+    {
+        "m128_h32_p0_s1",
+        "m128_h4_p0_s1",
+        "m128_h64_p1_s114",
+        "m128_h96_p0_s1",
+    }
+)
+_VALUE_ROWS_64_VARIANTS = frozenset({"m64_f1_t8192_h64"})
 
 
 FLASH_KDA_EVOLUTION_VARIANTS: dict[
     FlashKDAEvolutionVariant, FlashKDAEvolutionMetadata
 ] = {
-    "vtile_f1_t8192_h96_p1_s96": FlashKDAEvolutionMetadata(
-        source_stem="cake_flashkda_blackwell_evolution_vtile_f1_t8192_h96_p1_s96",
-        kernel_symbol="kernel_flashkda_blackwell_evolution_vtile_f1_t8192_h96_p1_s96",
-        value_rows=128,
-        has_tile_schedule=False,
-        grid_x=96,
-    ),
+    variant: FlashKDAEvolutionMetadata(
+        source_stem=f"cake_flashkda_blackwell_evolution_{variant}",
+        kernel_symbol=f"kernel_flashkda_blackwell_evolution_{variant}",
+        value_rows=64 if variant in _VALUE_ROWS_64_VARIANTS else 128,
+        has_tile_schedule=variant in _TILE_SCHEDULE_VARIANTS,
+    )
+    for variant in _FLASH_KDA_EVOLUTION_VARIANT_NAMES
 }
 
 _NVCC_FLAGS = {

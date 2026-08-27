@@ -27,16 +27,31 @@ from flashinfer.jit.flash_kda_evolution import (
 
 
 def test_flashkda_evolution_profile_is_frozen():
+    assert len(FLASH_KDA_EVOLUTION_VARIANTS) == 26
+    assert (
+        sum(
+            metadata.has_tile_schedule
+            for metadata in FLASH_KDA_EVOLUTION_VARIANTS.values()
+        )
+        == 4
+    )
+    assert (
+        sum(
+            metadata.value_rows == 64
+            for metadata in FLASH_KDA_EVOLUTION_VARIANTS.values()
+        )
+        == 1
+    )
     metadata = FLASH_KDA_EVOLUTION_VARIANTS["vtile_f1_t8192_h96_p1_s96"]
     assert metadata.value_rows == 128
     assert not metadata.has_tile_schedule
-    assert metadata.grid_x == 96
     assert metadata.kernel_symbol.endswith("vtile_f1_t8192_h96_p1_s96")
 
 
 @pytest.mark.parametrize("target", ["sm100a", "sm100f"])
-def test_flashkda_evolution_jit_spec_has_one_generated_binding(target):
-    spec = gen_flash_kda_evolution_module("vtile_f1_t8192_h96_p1_s96", target)
+@pytest.mark.parametrize("variant", FLASH_KDA_EVOLUTION_VARIANTS)
+def test_flashkda_evolution_jit_spec_has_one_generated_binding(variant, target):
+    spec = gen_flash_kda_evolution_module(variant, target)
     assert spec.name.endswith(target)
     assert len(spec.sources) == 1
     assert spec.sources[0].name == "binding.cu"
