@@ -165,6 +165,29 @@ def test_rejects_cuda_graph():
         _make_wrapper("prims-ts", use_cuda_graph=True, **buffers)
 
 
+@requires_cuda
+def test_rejects_fast_decode_plan():
+    wrapper = _make_wrapper("prims-ts")
+    with pytest.raises(NotImplementedError, match="fast_decode_plan"):
+        flashinfer.decode.fast_decode_plan(
+            wrapper,
+            *_plan_args([32, 48], "cuda"),
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+        )
+
+
+@requires_cuda
+def test_rejects_mismatched_seq_lens():
+    wrapper = _make_wrapper("prims-ts")
+    with pytest.raises(ValueError, match="seq_lens must match"):
+        wrapper.plan(
+            *_plan_args([32, 48], "cuda"),
+            q_data_type=torch.bfloat16,
+            seq_lens=torch.tensor([32, 40], dtype=torch.int32, device="cuda"),
+        )
+
+
 def test_plan_trace_captures_explicit_causal_mode():
     """The plan trace includes kwargs passed through compatibility API."""
 
@@ -402,6 +425,50 @@ def test_run_rejects_unsupported_options(run_kwargs, match):
     wrapper.plan(*_plan_args(kv_lens, "cuda"), q_data_type=torch.bfloat16)
     with pytest.raises(NotImplementedError, match=match):
         wrapper.run(q, (k_cache, v_cache), **run_kwargs)
+
+
+@requires_prims_ts_gpu
+def test_matching_seq_lens_accepted():
+    kv_lens = [32, 48]
+    wrapper = _make_wrapper("prims-ts")
+    wrapper.plan(
+        *_plan_args(kv_lens, "cuda"),
+        q_data_type=torch.bfloat16,
+        seq_lens=torch.tensor(kv_lens, dtype=torch.int32, device="cuda"),
+    )
+    q = torch.randn(
+        len(kv_lens), NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    k_cache, v_cache = _make_cache(kv_lens, torch.bfloat16, "cuda")
+    out = wrapper.run(q, (k_cache, v_cache))
+    assert out.shape == q.shape
+
+
+@requires_prims_ts_gpu
+def test_rejects_noncontiguous_multi_q_tensors():
+    kv_lens = [64, 96]
+    q_len_per_req = 4
+    wrapper = _make_wrapper("prims-ts")
+    wrapper.plan(
+        *_plan_args(kv_lens, "cuda"),
+        q_data_type=torch.bfloat16,
+        q_len_per_req=q_len_per_req,
+        is_causal=False,
+    )
+    k_cache, v_cache = _make_cache(kv_lens, torch.bfloat16, "cuda")
+    num_tokens = len(kv_lens) * q_len_per_req
+    q = torch.randn(
+        num_tokens, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    q_strided = torch.randn(
+        num_tokens, HEAD_DIM, NUM_QO_HEADS, dtype=torch.bfloat16, device="cuda"
+    ).transpose(1, 2)
+    assert not q_strided.is_contiguous()
+    with pytest.raises(ValueError, match="contiguous"):
+        wrapper.run(q_strided, (k_cache, v_cache))
+    out_strided = torch.empty_like(q_strided)
+    with pytest.raises(ValueError, match="contiguous"):
+        wrapper.run(q, (k_cache, v_cache), out=out_strided)
 
 
 @requires_prims_ts_gpu

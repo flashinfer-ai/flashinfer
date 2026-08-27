@@ -1667,6 +1667,17 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     "prims-ts decode backend requires q_data_type == kv_data_type, "
                     f"got {q_data_type} and {kv_data_type}"
                 )
+            # The delegate derives kv lengths from the page table and has no
+            # seq_lens input, so a divergent seq_lens would be silently ignored.
+            if seq_lens is not None:
+                derived_kv_lens = get_seq_lens(
+                    indptr_host, last_page_len_host, page_size
+                ).to(torch.int64)
+                if not torch.equal(kv_lens_arr_host.to(torch.int64), derived_kv_lens):
+                    raise ValueError(
+                        "prims-ts decode backend derives kv lengths from "
+                        "(indptr, last_page_len, page_size); seq_lens must match them"
+                    )
             self._max_kv_len = int(max(kv_lens_arr_host).item())
             self._prims_ts_wrapper.plan(
                 self._paged_kv_indptr_buf,
@@ -2210,6 +2221,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 )
             # The kernel takes token-major [B, SQ, Hq, D], or [B, Hq, D] at SQ=1.
             if q_len_per_req > 1:
+                if not q.is_contiguous() or not out.is_contiguous():
+                    raise ValueError(
+                        "prims-ts decode backend requires contiguous q and out "
+                        "when q_len_per_req > 1"
+                    )
                 packed_shape = (actual_batch_size, q_len_per_req, q.size(1), q.size(2))
                 q = q.view(packed_shape)
                 out = out.view(packed_shape[:-1] + (out.size(-1),))
@@ -3959,6 +3975,10 @@ def fast_decode_plan(
     - Remove unnecessary host-to-device copy for the metadata buffers.
     """
     batch_size = len(last_page_len)
+    if getattr(self, "_backend", None) == "prims-ts":
+        raise NotImplementedError(
+            "fast_decode_plan is not supported by the prims-ts decode backend"
+        )
     if q_len_per_req < 1:
         raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
     if q_len_per_req > 1 and not self.use_tensor_cores:
