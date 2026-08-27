@@ -734,15 +734,32 @@ def test_a_failed_build_is_attempted_once_per_process(monkeypatch):
     MoE layer per decode step.  The reason a build fails does not resolve
     itself mid-process, so the answer is latched and later dispatches take the
     composable path directly.
+
+    The injected failure is captured rather than allowed to reach the real JIT
+    logger: that logger writes to the shared ``flashinfer_jit.log`` an operator
+    reads to tell a genuine build failure from a shape that was never
+    allowlisted, and a synthetic one planted there is indistinguishable from
+    the real thing.  Capturing it also lets the test assert what the warning
+    actually carries, which is the part that matters -- the compiler's own
+    message, not just the exception class.
     """
     attempts = []
+    warned = []
 
     class _FailingSpec:
         def build_and_load(self):
             attempts.append(1)
-            raise RuntimeError("nvcc will not be there on the next call either")
+            raise RuntimeError(
+                "synthetic build failure injected by "
+                "test_a_failed_build_is_attempted_once_per_process"
+            )
+
+    class _CapturingLogger:
+        def warning_once(self, fmt, *args):
+            warned.append(fmt % args)
 
     monkeypatch.setattr(mr, "_sm120_module_generator", lambda: _FailingSpec)
+    monkeypatch.setattr(mr, "_jit_logger", _CapturingLogger)
     monkeypatch.setattr(mr, "_MODULE", None)
     monkeypatch.setattr(mr, "_MODULE_BUILD_FAILED", False)
 
@@ -751,12 +768,19 @@ def test_a_failed_build_is_attempted_once_per_process(monkeypatch):
     assert len(attempts) == 1
     assert mr.moe_routing_ready_for_graph_capture() is False
 
+    # One attempt means one diagnostic, and it carries the message and not only
+    # the class -- a build failure is silent apart from this line.
+    assert len(warned) == 1, warned
+    assert "RuntimeError" in warned[0]
+    assert "synthetic build failure injected by" in warned[0]
+
     if torch.cuda.is_available():
         # ... and the dispatch path, which is what a serving engine actually
         # calls, goes through the same latch.
         for _ in range(5):
             assert mr._dispatch_ready() is False
         assert len(attempts) == 1
+        assert len(warned) == 1
 
 
 # ------------------------------------------------------------- CUDA graphs
