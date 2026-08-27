@@ -149,20 +149,32 @@ def test_rejects_jit_args():
         _make_wrapper("prims-ts", jit_args=[1])
 
 
-@requires_cuda
-def test_rejects_cuda_graph():
-    batch_size = 2
-    buffers = dict(
+def _graph_buffers(batch_size, max_pages, device="cuda"):
+    return dict(
         paged_kv_indptr_buffer=torch.zeros(
-            batch_size + 1, dtype=torch.int32, device="cuda"
+            batch_size + 1, dtype=torch.int32, device=device
         ),
-        paged_kv_indices_buffer=torch.zeros(16, dtype=torch.int32, device="cuda"),
+        paged_kv_indices_buffer=torch.zeros(
+            max_pages, dtype=torch.int32, device=device
+        ),
         paged_kv_last_page_len_buffer=torch.zeros(
-            batch_size, dtype=torch.int32, device="cuda"
+            batch_size, dtype=torch.int32, device=device
         ),
     )
-    with pytest.raises(NotImplementedError, match="use_cuda_graph"):
-        _make_wrapper("prims-ts", use_cuda_graph=True, **buffers)
+
+
+@requires_prims_ts_gpu
+def test_graph_plan_rejects_small_workspace():
+    workspace = torch.zeros(64, dtype=torch.uint8, device="cuda")
+    wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace,
+        "HND",
+        backend="prims-ts",
+        use_cuda_graph=True,
+        **_graph_buffers(2, max_pages=64),
+    )
+    with pytest.raises(ValueError, match="workspace bytes"):
+        wrapper.plan(*_plan_args([32, 48], "cuda"), q_data_type=torch.bfloat16)
 
 
 @requires_cuda
@@ -472,12 +484,75 @@ def test_rejects_noncontiguous_multi_q_tensors():
 
 
 @requires_prims_ts_gpu
-def test_graph_capture_of_fixed_plan_replays():
-    """Capturing run() after a plan replays that plan; re-planning is not covered.
+@pytest.mark.parametrize("q_len_per_req,is_causal", [(1, False), (4, False), (4, True)])
+def test_cuda_graph_replan_then_replay(q_len_per_req, is_causal):
+    kv_lens_sets = [[64, 96], [40, 200], [128, 128]]
+    max_pages = 64
+    torch.manual_seed(0)
+    k_cache, v_cache = _make_cache(
+        [max_pages * PAGE_SIZE // 2] * 2, torch.bfloat16, "cuda"
+    )
+    q = torch.randn(
+        2 * q_len_per_req, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+    )
+    wrapper = _make_wrapper(
+        "prims-ts", use_cuda_graph=True, **_graph_buffers(2, max_pages=max_pages)
+    )
 
-    The wrapper-level ``use_cuda_graph=True`` flow (re-plan then replay) is
-    rejected for this backend, see ``test_rejects_cuda_graph``.
-    """
+    def plan(kv_lens):
+        wrapper.plan(
+            *_plan_args(kv_lens, "cuda"),
+            q_data_type=torch.bfloat16,
+            q_len_per_req=q_len_per_req,
+            is_causal=is_causal,
+        )
+
+    def reference(kv_lens):
+        return _reference_decode(
+            q, k_cache, v_cache, kv_lens, q_len_per_req, is_causal, PAGE_SIZE
+        )
+
+    plan(kv_lens_sets[0])
+    out = torch.empty_like(q)
+    wrapper.run(q, (k_cache, v_cache), out=out)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, (k_cache, v_cache), out=out)
+
+    for kv_lens in kv_lens_sets:
+        plan(kv_lens)
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            out.float(), reference(kv_lens), rtol=2e-2, atol=2e-2
+        )
+
+
+@requires_prims_ts_gpu
+def test_cuda_graph_matches_eager_path():
+    kv_lens = [64, 96]
+    torch.manual_seed(0)
+    k_cache, v_cache = _make_cache(kv_lens, torch.bfloat16, "cuda")
+    q = torch.randn(2, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    plan_args = _plan_args(kv_lens, "cuda")
+
+    eager = _make_wrapper("prims-ts")
+    eager.plan(*plan_args, q_data_type=torch.bfloat16)
+    expected = eager.run(q, (k_cache, v_cache))
+
+    graph_wrapper = _make_wrapper(
+        "prims-ts", use_cuda_graph=True, **_graph_buffers(2, max_pages=32)
+    )
+    graph_wrapper.plan(*plan_args, q_data_type=torch.bfloat16)
+    got = graph_wrapper.run(q, (k_cache, v_cache))
+    torch.testing.assert_close(got, expected, rtol=1e-2, atol=1e-2)
+
+
+@requires_prims_ts_gpu
+def test_graph_capture_of_fixed_plan_replays():
+    """Eager-mode wrapper: capturing run() after a plan replays that plan."""
 
     kv_lens = [64, 96]
     q_len_per_req = 4

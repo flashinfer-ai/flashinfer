@@ -1674,6 +1674,69 @@ def get_prims_ts_batch_decode_workspace_size(
     ).total_bytes
 
 
+def warm_prims_ts_batch_decode(
+    batch_size: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    page_size: int,
+    max_seq_len: int,
+    *,
+    seq_len_q: int = 1,
+    q_dtype: torch.dtype = torch.float16,
+    kv_dtype: Optional[torch.dtype] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    mask_type: Literal["dense", "causal"] = "dense",
+    window_left: int = -1,
+    kv_layout: Literal["HND"] = "HND",
+    device: Optional[Union[int, str, torch.device]] = None,
+) -> None:
+    """Compile the fixed-Q kernels that :func:`prims_ts_batch_decode_with_kv_cache`
+    would launch for this semantic key, so a later launch can be captured into a
+    CUDA graph without JIT work. Arguments mirror
+    :func:`get_prims_ts_batch_decode_workspace_size`."""
+
+    batch_size = _validate_positive_int(batch_size, "batch_size")
+    seq_len_q = _validate_seq_len_q(seq_len_q)
+    _validate_head_geometry(num_qo_heads, num_kv_heads)
+    _validate_decode_query_head_extent(
+        batch_size=batch_size,
+        num_qo_heads=num_qo_heads,
+        max_seq_len_q=seq_len_q,
+    )
+    head_dim = _validate_head_dim(head_dim)
+    page_size = _validate_page_size(page_size)
+    max_seq_len = _validate_max_kv_len(max_seq_len, "max_seq_len")
+    _validate_layout(kv_layout)
+    _validate_mask(mask_type)
+    window_left = _validate_window_left(window_left, mask_type)
+    if kv_dtype is None:
+        kv_dtype = q_dtype
+    if out_dtype is None:
+        out_dtype = q_dtype
+    _validate_dtype_pair(q_dtype, kv_dtype, out_dtype)
+    _, device_index = _resolve_cuda_device(device)
+    _get_compiled_decode(
+        device_index,
+        batch_size,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        max_seq_len,
+        seq_len_q,
+        _dtype_key(q_dtype),
+        _dtype_key(kv_dtype),
+        _dtype_key(out_dtype),
+        kv_layout,
+        mask_type,
+        False,
+        window_left,
+        "dynamic",
+        "dynamic",
+    )
+
+
 def _prepare_decode_runtime(
     q: torch.Tensor,
     paged_kv_cache: PagedKVCache,
