@@ -293,7 +293,20 @@ class ModuleScopeImportFromVisitor(ast.NodeVisitor):
         self.imports.append(node)
 
     def visit_If(self, node: ast.If) -> None:
-        if isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING":
+        is_type_checking = (
+            isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING"
+        )
+        is_main_guard = (
+            isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "__name__"
+            and len(node.test.ops) == 1
+            and isinstance(node.test.ops[0], ast.Eq)
+            and len(node.test.comparators) == 1
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value == "__main__"
+        )
+        if is_type_checking or is_main_guard:
             for child in node.orelse:
                 self.visit(child)
             return

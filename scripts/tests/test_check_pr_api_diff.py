@@ -291,6 +291,17 @@ class ClassReexportIntegrationTest(unittest.TestCase):
                 ("public_api_removed",),
             ),
             (
+                "__main__-guarded re-export",
+                {
+                    "flashinfer/public.py": (
+                        'if __name__ == "__main__":\n'
+                        "    from flashinfer.impl import Target as Exported\n"
+                    ),
+                    "flashinfer/impl.py": compatible_target,
+                },
+                ("public_api_removed",),
+            ),
+            (
                 "conflicting re-export",
                 {
                     "flashinfer/public.py": (
