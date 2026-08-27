@@ -86,7 +86,8 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta
   TVM_FFI_ICHECK(num_seqs > 0);
   TVM_FFI_ICHECK(grid_x > 0 && grid_x <= std::numeric_limits<uint32_t>::max())
       << "evolution grid.x is out of range: " << grid_x;
-  if constexpr (kHasTileSchedule) {
+#if FLASHKDA_BLACKWELL_EVOLUTION_HAS_TILE_SCHEDULE
+  {
     flash_kda::CheckCudaTensor(tile_schedule, "tile_schedule", device_id);
     flash_kda::CheckCudaTensor(tile_schedule_counts, "tile_schedule_counts", device_id);
     flash_kda::CheckDtype(tile_schedule, "tile_schedule", dl_int32);
@@ -131,7 +132,9 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta
         reinterpret_cast<__nv_bfloat16*>(final_state.data_ptr()), static_cast<int32_t>(num_heads),
         static_cast<int32_t>(use_initial_state), static_cast<int32_t>(store_final_state),
         static_cast<float>(scale), static_cast<float>(lower_bound));
-  } else {
+  }
+#else
+  {
     FLASHKDA_BLACKWELL_EVOLUTION_KERNEL<<<grid, block, kSmemBytes, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
         reinterpret_cast<flashkda_evolution_generated_CakeTensorMap const*>(tma.q),
@@ -153,6 +156,7 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta
         static_cast<int32_t>(use_initial_state), static_cast<int32_t>(store_final_state),
         static_cast<float>(scale), static_cast<float>(lower_bound));
   }
+#endif
   flash_kda::CheckCuda(cudaGetLastError(), "FlashKDA Blackwell evolution launch");
 }
 
