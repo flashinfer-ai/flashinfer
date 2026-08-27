@@ -40,10 +40,7 @@ def test_public_package_exports_exact_prepare_api():
 
     assert callable(prepare)
     assert subpackage.prepare_all_gather_matmul is prepare
-    assert (
-        prepare.__module__
-        == "flashinfer.comm.all_gather_matmul.all_gather_matmul"
-    )
+    assert prepare.__module__ == "flashinfer.comm.all_gather_matmul.all_gather_matmul"
     signature = inspect.signature(prepare)
     assert tuple(signature.parameters) == (
         "inp",
@@ -80,9 +77,7 @@ def test_prepare_backend_forwards_exact_binding(monkeypatch, backend):
         calls.append((actual_inp, actual_weight, actual_group, verbose))
         return launcher
 
-    backend_module._prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4 = (
-        fake_prepare
-    )
+    backend_module._prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4 = fake_prepare
     monkeypatch.setitem(sys.modules, backend_module.__name__, backend_module)
 
     assert (

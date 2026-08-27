@@ -798,9 +798,7 @@ def _fake_prepared_packed_qkv(
     device = torch.device("cuda:3")
     inp = _FakePreparedTensor(1001, (128, 8192), torch.bfloat16, device)
     weight = _FakePreparedTensor(2001, (8192, 2560), torch.bfloat16, device)
-    scratch = _FakePreparedTensor(
-        3001, (4, 128, 8192), torch.bfloat16, device
-    )
+    scratch = _FakePreparedTensor(3001, (4, 128, 8192), torch.bfloat16, device)
     group = SimpleNamespace(group_name="tp-group")
     module = SimpleNamespace(name="bound-module")
     state = backend._LaunchState(flags=object(), flag_peers=object())
@@ -814,18 +812,14 @@ def _fake_prepared_packed_qkv(
 
         def get_signal_pad(self, peer, shape, dtype, offset):
             self.calls.append(("signal", peer, tuple(shape), dtype, offset))
-            return _FakePreparedTensor(
-                4000 + peer, tuple(shape), dtype, device
-            )
+            return _FakePreparedTensor(4000 + peer, tuple(shape), dtype, device)
 
         def get_remote_tensor(self, peer, shape, dtype):
             self.calls.append(("remote", peer, tuple(shape), dtype))
             remote_shape = tuple(shape)
             if bad_peer_scratch:
                 remote_shape = (remote_shape[0], 127, remote_shape[2])
-            return _FakePreparedTensor(
-                5000 + peer, remote_shape, dtype, device
-            )
+            return _FakePreparedTensor(5000 + peer, remote_shape, dtype, device)
 
     scratch_handle = FakeScratchHandle()
     workspace = backend._Workspace(
@@ -934,10 +928,7 @@ def test_prepare_packed_qkv_binds_host_identity_once(monkeypatch):
     assert calls.arch == [torch.device("cuda:3")]
     assert calls.module == ["sm_103a"]
     assert len(calls.descriptor) == 1
-    assert (
-        "_prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4"
-        not in backend.__all__
-    )
+    assert "_prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4" not in backend.__all__
     with pytest.raises(AttributeError):
         launcher.peer_routes = ()
 
@@ -994,9 +985,7 @@ def test_prepared_packed_qkv_bound_group_drift_fails_closed(monkeypatch):
 
 def test_prepared_packed_qkv_poisoned_state_fails_before_hot_submission(monkeypatch):
     backend = _backend()
-    launcher, inp, _, _, state, *_ = _fake_prepared_packed_qkv(
-        monkeypatch, backend
-    )
+    launcher, inp, _, _, state, *_ = _fake_prepared_packed_qkv(monkeypatch, backend)
     state.poisoned = True
 
     with pytest.raises(RuntimeError, match="state is poisoned"):

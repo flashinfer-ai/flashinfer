@@ -949,10 +949,7 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                 w.record_stream(main_stream)
                 descriptors.record_stream(main_stream)
                 main_stream_id = int(main_stream.cuda_stream)
-                if (
-                    state.tail_event is not None
-                    and state.tail_stream != main_stream_id
-                ):
+                if state.tail_event is not None and state.tail_stream != main_stream_id:
                     main_stream.wait_event(state.tail_event)
 
                 phase = state.next_phase
