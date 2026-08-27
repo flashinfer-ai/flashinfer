@@ -797,6 +797,382 @@ def _descriptor_storage(
     return descriptors
 
 
+def _prepared_descriptor_storage(
+    workspace: _Workspace,
+    module: Any,
+    inp: torch.Tensor,
+    w: torch.Tensor,
+    *,
+    device_index: int,
+    main_stream: torch.cuda.Stream,
+    world_size: int,
+    rows: int,
+    scratch_fingerprint: tuple[Any, ...],
+    weight_fingerprint: tuple[Any, ...],
+) -> torch.Tensor:
+    """Resolve only the current input descriptor for a prepared launcher."""
+
+    fingerprint = (
+        _tensor_fingerprint(inp),
+        scratch_fingerprint,
+        weight_fingerprint,
+    )
+    with _CACHE_LOCK:
+        descriptors = workspace.descriptor_cache.get(fingerprint)
+        if descriptors is not None:
+            workspace.descriptor_cache.move_to_end(fingerprint)
+            return descriptors
+    host_descriptors = torch.empty(
+        _DESCRIPTOR_COUNT * _TENSOR_MAP_BYTES,
+        dtype=torch.uint8,
+        device="cpu",
+        pin_memory=True,
+    )
+    descriptors = torch.empty(
+        _DESCRIPTOR_COUNT * _TENSOR_MAP_BYTES,
+        dtype=torch.uint8,
+        device=device_index,
+    )
+    module.prepare_descriptors(
+        inp,
+        workspace.scratch,
+        w,
+        host_descriptors,
+        world_size,
+        rows,
+    )
+    with torch.cuda.stream(main_stream):
+        descriptors.copy_(host_descriptors, non_blocking=True)
+    with _CACHE_LOCK:
+        cached = workspace.descriptor_cache.get(fingerprint)
+        if cached is not None:
+            workspace.descriptor_cache.move_to_end(fingerprint)
+            return cached
+        workspace.descriptor_cache[fingerprint] = descriptors
+        while len(workspace.descriptor_cache) > _DESCRIPTOR_CACHE_MAX_ENTRIES:
+            workspace.descriptor_cache.popitem(last=False)
+    return descriptors
+
+
+def _validate_prepared_view(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    if tuple(tensor.shape) != shape:
+        raise RuntimeError(f"prepared packed-QKV {name} shape does not match binding")
+    if tensor.dtype != dtype:
+        raise RuntimeError(f"prepared packed-QKV {name} dtype does not match binding")
+    if tensor.device != device:
+        raise RuntimeError(f"prepared packed-QKV {name} device does not match binding")
+    if not tensor.is_contiguous():
+        raise RuntimeError(f"prepared packed-QKV {name} must be contiguous")
+
+
+@dataclass(frozen=True)
+class _PreparedPackedQkvSm103Tp4Launcher:
+    group: dist.ProcessGroup = field(repr=False)
+    group_id: int
+    group_name: str
+    rank: int
+    world_size: int
+    device_index: int
+    device: torch.device
+    arch: str
+    dtype: torch.dtype
+    rows: int
+    module: Any = field(repr=False)
+    state: _LaunchState = field(repr=False)
+    workspace: _Workspace = field(repr=False)
+    weight: torch.Tensor = field(repr=False)
+    weight_fingerprint: tuple[Any, ...] = field(repr=False)
+    scratch_fingerprint: tuple[Any, ...] = field(repr=False)
+    chunk_size: int
+    num_chunks: int
+    chunk_plan: tuple[tuple[int, int], ...]
+    signal_pad: torch.Tensor = field(repr=False)
+    peer_routes: tuple[tuple[torch.Tensor, torch.Tensor], ...] = field(repr=False)
+    verbose: bool = False
+
+    def _validate_hot_input(self, inp: torch.Tensor) -> None:
+        if id(self.group) != self.group_id:
+            raise RuntimeError("prepared packed-QKV group identity changed")
+        if inp.device != self.device:
+            raise ValueError("prepared packed-QKV inp device changed")
+        if inp.dtype != self.dtype:
+            raise ValueError("prepared packed-QKV inp dtype changed")
+        if inp.ndim != 2 or tuple(inp.shape) != (self.rows, _K):
+            raise ValueError(
+                f"prepared packed-QKV inp must have shape [{self.rows}, {_K}]"
+            )
+        if not inp.is_contiguous():
+            raise ValueError("prepared packed-QKV inp must be contiguous")
+        if _tensor_fingerprint(self.weight) != self.weight_fingerprint:
+            raise RuntimeError("prepared packed-QKV bound weight contract changed")
+
+    def __call__(self, inp: torch.Tensor) -> torch.Tensor:
+        self._validate_hot_input(inp)
+        state = self.state
+        workspace = self.workspace
+        w = self.weight
+        with state.lock:
+            if state.poisoned:
+                raise RuntimeError(
+                    "Cake all-gather matmul state is poisoned by a prior failed collective"
+                )
+            try:
+                main_stream = torch.cuda.current_stream(self.device_index)
+                descriptors = _prepared_descriptor_storage(
+                    workspace,
+                    self.module,
+                    inp,
+                    w,
+                    device_index=self.device_index,
+                    main_stream=main_stream,
+                    world_size=self.world_size,
+                    rows=self.rows,
+                    scratch_fingerprint=self.scratch_fingerprint,
+                    weight_fingerprint=self.weight_fingerprint,
+                )
+                output = torch.empty(
+                    self.world_size * self.rows,
+                    _PACKED_QKV_N,
+                    dtype=self.dtype,
+                    device=self.device_index,
+                )
+
+                inp.record_stream(main_stream)
+                inp.record_stream(workspace.comm_stream)
+                w.record_stream(main_stream)
+                descriptors.record_stream(main_stream)
+                main_stream_id = int(main_stream.cuda_stream)
+                if (
+                    state.tail_event is not None
+                    and state.tail_stream != main_stream_id
+                ):
+                    main_stream.wait_event(state.tail_event)
+
+                phase = state.next_phase
+                self.module.run_barrier(
+                    state.flag_peers,
+                    self.world_size,
+                    self.rank,
+                    phase,
+                    main_stream_id,
+                )
+                workspace.comm_stream.wait_stream(main_stream)
+                with torch.cuda.stream(workspace.comm_stream):
+                    for peer_scratch, peer_signal_row in self.peer_routes:
+                        for chunk_idx, (begin, end) in enumerate(self.chunk_plan):
+                            peer_scratch[begin:end].copy_(
+                                inp[begin:end], non_blocking=True
+                            )
+                            torch.ops.symm_mem.stream_write_value32_(
+                                peer_signal_row, chunk_idx, 1
+                            )
+
+                self.module.run_main(
+                    inp,
+                    workspace.scratch,
+                    w,
+                    output,
+                    descriptors,
+                    self.signal_pad,
+                    self.world_size,
+                    self.rank,
+                    self.rows,
+                    0,
+                    main_stream_id,
+                )
+                self.signal_pad.zero_()
+                main_stream.wait_stream(workspace.comm_stream)
+                if state.tail_event is None:
+                    state.tail_event = torch.cuda.Event(enable_timing=False)
+                state.tail_event.record(main_stream)
+                state.next_phase = 1 - phase
+                state.tail_stream = main_stream_id
+                if self.verbose and self.rank == 0:
+                    print(
+                        "Cake all-gather matmul prepared packed-QKV: "
+                        f"arch={self.arch}, world_size={self.world_size}, "
+                        f"M={self.rows}, K={_K}, N={_PACKED_QKV_N}"
+                    )
+                return output
+            except Exception:
+                state.poisoned = True
+                raise
+
+
+def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
+    inp: torch.Tensor,
+    w: torch.Tensor,
+    group: dist.ProcessGroup,
+    *,
+    verbose: bool = False,
+) -> _PreparedPackedQkvSm103Tp4Launcher:
+    """Bind immutable host state for the private SM103/BF16/TP4 route."""
+
+    device_index, rank, world_size, group_name = _validate_inputs(
+        inp, w, group, packed_qkv_experiment=True
+    )
+    rows = int(inp.shape[0])
+    device = torch.device("cuda", device_index)
+    arch = _target_arch(device)
+    module = _load_program(arch)
+    state_key = (device_index, id(group), group_name)
+    with _CACHE_LOCK:
+        state = _LAUNCH_STATES.setdefault(state_key, _LaunchState())
+
+    with state.lock:
+        if state.poisoned:
+            raise RuntimeError(
+                "Cake all-gather matmul state is poisoned by a prior failed collective"
+            )
+        try:
+            workspace_key = (
+                device_index,
+                id(group),
+                group_name,
+                inp.dtype,
+                world_size,
+                rows,
+            )
+            with _CACHE_LOCK:
+                workspace = _WORKSPACES.get(workspace_key)
+            main_stream = torch.cuda.current_stream(device_index)
+            if state.flags is None or workspace is None:
+                main_stream.synchronize()
+                if state.tail_event is not None:
+                    state.tail_event.synchronize()
+            _ensure_launch_state(
+                state,
+                device_index=device_index,
+                rank=rank,
+                world_size=world_size,
+                group_name=group_name,
+            )
+            if workspace is None:
+                with _CACHE_LOCK:
+                    workspace = _workspace(
+                        device_index=device_index,
+                        group=group,
+                        group_name=group_name,
+                        dtype=inp.dtype,
+                        world_size=world_size,
+                        rows=rows,
+                    )
+
+            expected_scratch_shape = (world_size, rows, _K)
+            if tuple(workspace.scratch.shape) != expected_scratch_shape:
+                raise RuntimeError(
+                    "prepared packed-QKV workspace scratch shape does not match binding"
+                )
+            if workspace.scratch.dtype != inp.dtype:
+                raise RuntimeError(
+                    "prepared packed-QKV workspace scratch dtype does not match binding"
+                )
+            if workspace.scratch.device != device:
+                raise RuntimeError(
+                    "prepared packed-QKV workspace scratch device does not match binding"
+                )
+            if (
+                int(workspace.scratch_handle.rank) != rank
+                or int(workspace.scratch_handle.world_size) != world_size
+            ):
+                raise RuntimeError(
+                    "prepared packed-QKV workspace topology does not match group"
+                )
+
+            weight_fingerprint = _tensor_fingerprint(w)
+            scratch_fingerprint = _tensor_fingerprint(workspace.scratch)
+            chunk_size = min(rows, _CHUNK_ROWS)
+            num_chunks = (rows + chunk_size - 1) // chunk_size
+            chunk_plan = tuple(
+                (
+                    chunk_idx * chunk_size,
+                    min((chunk_idx + 1) * chunk_size, rows),
+                )
+                for chunk_idx in range(num_chunks)
+            )
+            signal_pad = workspace.scratch_handle.get_signal_pad(
+                rank, (world_size, num_chunks), torch.uint32, 0
+            )
+            _validate_prepared_view(
+                signal_pad,
+                name="local signal_pad",
+                shape=(world_size, num_chunks),
+                dtype=torch.uint32,
+                device=device,
+            )
+            peer_routes = []
+            for shift in range(1, world_size):
+                peer = (rank + shift) % world_size
+                peer_scratch = workspace.scratch_handle.get_remote_tensor(
+                    peer, workspace.scratch.shape, workspace.scratch.dtype
+                )[rank]
+                _validate_prepared_view(
+                    peer_scratch,
+                    name=f"peer {peer} scratch rank slice",
+                    shape=(rows, _K),
+                    dtype=inp.dtype,
+                    device=device,
+                )
+                peer_signal_row = workspace.scratch_handle.get_signal_pad(
+                    peer, (world_size, num_chunks), torch.uint32, 0
+                )[rank]
+                _validate_prepared_view(
+                    peer_signal_row,
+                    name=f"peer {peer} signal rank row",
+                    shape=(num_chunks,),
+                    dtype=torch.uint32,
+                    device=device,
+                )
+                peer_routes.append((peer_scratch, peer_signal_row))
+            launcher = _PreparedPackedQkvSm103Tp4Launcher(
+                group=group,
+                group_id=id(group),
+                group_name=group_name,
+                rank=rank,
+                world_size=world_size,
+                device_index=device_index,
+                device=device,
+                arch=arch,
+                dtype=inp.dtype,
+                rows=rows,
+                module=module,
+                state=state,
+                workspace=workspace,
+                weight=w,
+                weight_fingerprint=weight_fingerprint,
+                scratch_fingerprint=scratch_fingerprint,
+                chunk_size=chunk_size,
+                num_chunks=num_chunks,
+                chunk_plan=chunk_plan,
+                signal_pad=signal_pad,
+                peer_routes=tuple(peer_routes),
+                verbose=verbose,
+            )
+            _prepared_descriptor_storage(
+                workspace,
+                module,
+                inp,
+                w,
+                device_index=device_index,
+                main_stream=main_stream,
+                world_size=world_size,
+                rows=rows,
+                scratch_fingerprint=scratch_fingerprint,
+                weight_fingerprint=weight_fingerprint,
+            )
+            return launcher
+        except Exception:
+            state.poisoned = True
+            raise
+
+
 def _run_cake_validated(
     inp: torch.Tensor,
     w: torch.Tensor,
