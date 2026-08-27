@@ -769,21 +769,36 @@ def _resolve_moe_json_config_pair(
         for fc2_index in fc2_indices
     ]
     if use_deepseek_fp8:
-        # Keep the original unthrottled 2x2 Cartesian product at indices 0..3.
-        # Persisted autotuner caches store this pair index, so appending the
-        # work-throttled scheduler variants must not reinterpret old tactics.
+        # Persisted autotuner caches store this pair index. Keep all original
+        # no-fast-drain pairs first, with the legacy unthrottled 2x2 Cartesian
+        # product at indices 0..3 and the work-throttled pairs at 4..8. Append
+        # fast-drain pairs without reinterpreting any existing tactic.
         config_pairs.sort(
-            key=lambda pair: int(
-                _bool_value(
-                    _json_config_by_global_index(pair[0]).options.get(
-                        "use_work_throttle", False
+            key=lambda pair: (
+                int(
+                    _bool_value(
+                        _json_config_by_global_index(pair[0]).options.get(
+                            "use_clc_fast_drain", False
+                        )
                     )
-                )
-                or _bool_value(
-                    _json_config_by_global_index(pair[1]).options.get(
-                        "use_work_throttle", False
+                    or _bool_value(
+                        _json_config_by_global_index(pair[1]).options.get(
+                            "use_clc_fast_drain", False
+                        )
                     )
-                )
+                ),
+                int(
+                    _bool_value(
+                        _json_config_by_global_index(pair[0]).options.get(
+                            "use_work_throttle", False
+                        )
+                    )
+                    or _bool_value(
+                        _json_config_by_global_index(pair[1]).options.get(
+                            "use_work_throttle", False
+                        )
+                    )
+                ),
             )
         )
     total = len(config_pairs)

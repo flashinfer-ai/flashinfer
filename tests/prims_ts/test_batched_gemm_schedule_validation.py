@@ -852,7 +852,35 @@ def test_deepseek_fp8_tma_route_uses_generated_load_b_warp_count(
     assert cfg.threads_per_cta == 512
 
 
-def test_validation_rejects_clc_fast_drain():
+def test_validation_accepts_persistent_clc_fast_drain():
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        DType,
+        TileScheduler,
+        make_config,
+        validate_config,
+    )
+
+    cfg = make_config(
+        dtype_a=int(DType.BF16),
+        dtype_b=int(DType.BF16),
+        dtype_c=int(DType.BF16),
+        tile_k=64,
+        mma_k=16,
+        tile_n=16,
+        tile_scheduler=int(TileScheduler.PERSISTENT),
+        use_early_exit=1,
+        use_clc_fast_drain=1,
+    )
+    validate_config(cfg)
+
+
+@pytest.mark.parametrize(
+    ("tile_scheduler", "use_early_exit"),
+    ((0, 1), (1, 0)),
+)
+def test_validation_rejects_clc_fast_drain_without_persistent_early_exit(
+    tile_scheduler, use_early_exit
+):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
         DType,
         make_config,
@@ -866,9 +894,11 @@ def test_validation_rejects_clc_fast_drain():
         tile_k=64,
         mma_k=16,
         tile_n=16,
+        tile_scheduler=tile_scheduler,
+        use_early_exit=use_early_exit,
         use_clc_fast_drain=1,
     )
-    with pytest.raises(ValueError, match="use_clc_fast_drain is not supported"):
+    with pytest.raises(ValueError, match="requires persistent scheduling"):
         validate_config(cfg)
 
 

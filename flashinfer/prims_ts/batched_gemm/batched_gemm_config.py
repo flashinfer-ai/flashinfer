@@ -632,11 +632,7 @@ class BatchedGemmConfig:
     """
 
     use_clc_fast_drain: int = 0
-    """Reserved.
-
-    .. warning::
-        Not implemented -- must be ``0`` (:func:`validate_config` rejects ``1``).
-    """
+    """Cancel queued persistent CTAs after entering an early-exit suffix."""
 
     use_early_exit: int = 0
     """Let over-launched token CTAs skip work past the active batch. ``0``/``1``.
@@ -2662,9 +2658,13 @@ def validate_config(
     if cfg.use_early_exit not in (0, 1):
         raise ValueError(f"use_early_exit must be 0 or 1, got {cfg.use_early_exit}")
 
-    if cfg.use_clc_fast_drain != 0:
+    if cfg.use_clc_fast_drain not in (0, 1):
         raise ValueError(
-            "use_clc_fast_drain is not supported yet; set use_clc_fast_drain=0"
+            f"use_clc_fast_drain must be 0 or 1, got {cfg.use_clc_fast_drain}"
+        )
+    if cfg.use_clc_fast_drain and (not cfg.is_persistent or not cfg.use_early_exit):
+        raise ValueError(
+            "use_clc_fast_drain requires persistent scheduling and use_early_exit=1"
         )
 
     if cfg.use_work_throttle not in (0, 1):

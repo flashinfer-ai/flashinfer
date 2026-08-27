@@ -340,10 +340,12 @@
                 [64, 64, 64, 6, 6, 6, 6, 6, 6, 4, 160, 48, 48, 48, 48, 48, 48, 48],
                 [128, 128, 128, 5, 5, 5, 5, 5, 5, 4, 152, 80, 80, 80, 80, 80, 80, 80]
             ],
-            "tile_scheduler,num_stages_tmem_acc,use_work_throttle": [
-                ["static", 2, false],
-                ["persistent", 4, false],
-                ["persistent", 4, true]
+            "tile_scheduler,num_stages_tmem_acc,use_work_throttle,use_clc_fast_drain": [
+                ["static", 2, false, false],
+                ["persistent", 4, false, false],
+                ["persistent", 4, true, false],
+                ["persistent", 4, false, true],
+                ["persistent", 4, true, true]
             ]
         },
         {
@@ -360,10 +362,12 @@
                 [64, 64, 64, 6, 6, 6, 6, 6, 6, 160, 48, 48, 48, 48, 48, 48, 48],
                 [128, 128, 128, 5, 5, 5, 5, 5, 5, 160, 64, 64, 64, 64, 64, 64, 64]
             ],
-            "tile_scheduler,num_stages_tmem_acc,use_work_throttle": [
-                ["static", 2, false],
-                ["persistent", 4, false],
-                ["persistent", 4, true]
+            "tile_scheduler,num_stages_tmem_acc,use_work_throttle,use_clc_fast_drain": [
+                ["static", 2, false, false],
+                ["persistent", 4, false, false],
+                ["persistent", 4, true, false],
+                ["persistent", 4, false, true],
+                ["persistent", 4, true, true]
             ]
         },
         {

@@ -1750,6 +1750,11 @@ def _batched_gemm_kernel_bf16_body(
             )[0]
         # CLC response buffer in SMEM
         clc_response_ptr = cute.arch.alloc_smem(cutlass.Int128, cfg.num_stages_workid)
+        fast_drain_response_ptr = None
+        fast_drain_mbar_ptr = None
+        if cutlass.const_expr(cfg.use_clc_fast_drain):
+            fast_drain_response_ptr = cute.arch.alloc_smem(cutlass.Int128, 4)
+            fast_drain_mbar_ptr = cute.arch.alloc_smem(cutlass.Int64, 1)
         tile_sched_cfg = (
             TileSchedulerConfig.create_clc_dynamic_persistent_tile_scheduler_params(
                 tile_scheduler_params=tile_sched_params,
@@ -1761,6 +1766,8 @@ def _batched_gemm_kernel_bf16_body(
             cfg=cfg,
             num_non_exiting_ctas_tensor=num_non_exiting_ctas_tensor,
             num_non_exiting_ctas_value=num_non_exiting_ctas_value,
+            fast_drain_response_ptr=fast_drain_response_ptr,
+            fast_drain_mbar_ptr=fast_drain_mbar_ptr,
             pipeline_config=pcfgs["workid"],
             name="WorkQueue",
         )

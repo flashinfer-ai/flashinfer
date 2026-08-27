@@ -270,10 +270,19 @@ def test_deepseek_scheduler_variants_preserve_persisted_pair_indices():
         fc2 = pair.fc2.cfg.build()
         assert (fc1.tile_scheduler, fc2.tile_scheduler) == expected_schedulers
         assert (fc1.use_work_throttle, fc2.use_work_throttle) == (0, 0)
+        assert (fc1.use_clc_fast_drain, fc2.use_clc_fast_drain) == (0, 0)
 
     throttled_pair = map_trtllm_deepseek_fp8_moe_tactic([32, 8])
     assert throttled_pair.fc1.cfg.build().use_work_throttle == 1
     assert throttled_pair.fc2.cfg.build().use_work_throttle == 1
+    assert throttled_pair.fc1.cfg.build().use_clc_fast_drain == 0
+    assert throttled_pair.fc2.cfg.build().use_clc_fast_drain == 0
+
+    fast_drain_pair = map_trtllm_deepseek_fp8_moe_tactic([32, 24])
+    assert fast_drain_pair.fc1.cfg.build().use_work_throttle == 1
+    assert fast_drain_pair.fc2.cfg.build().use_work_throttle == 1
+    assert fast_drain_pair.fc1.cfg.build().use_clc_fast_drain == 1
+    assert fast_drain_pair.fc2.cfg.build().use_clc_fast_drain == 1
 
 
 def test_config_mapper_rejects_unknown_tile():
