@@ -1268,7 +1268,10 @@ class GmemCResource(MemoryResource):
         Output-SF reduction uses fmax so NaNs are filtered (fmax(NaN, x) = x):
         and all-NaN local contributions reduce as zero.
         """
-        val = cute.math.max(cute.math.abs(val), Float32(0.0))
+        if cutlass.const_expr(self.cfg.has_deepseek_fp8_c_scale):
+            val = cute.arch.fmax(cute.arch.fmax(val, -val), Float32(0.0))
+        else:
+            val = cute.math.max(cute.math.abs(val), Float32(0.0))
         for lane_mask in (4, 8, 16):
             other = prims.shfl_sync(
                 thread_mask=0xFFFFFFFF,
@@ -1278,7 +1281,10 @@ class GmemCResource(MemoryResource):
                 kind=prims.Shfl.BFLY,
                 return_value_and_is_valid=False,
             ).bitcast(cutlass.Float32)
-            val = cute.math.max(val, other)
+            if cutlass.const_expr(self.cfg.has_deepseek_fp8_c_scale):
+                val = cute.arch.fmax(val, other)
+            else:
+                val = cute.math.max(val, other)
         return val
 
     @cute.jit
@@ -1375,10 +1381,11 @@ class GmemCResource(MemoryResource):
         partner_idx = self._absmax_scratch_idx(
             warpgroup_idx, partner_warp, lane_id, scale_slot
         )
-        return cute.math.max(
-            self.sCFloat.subview(own_idx).load(),
-            self.sCFloat.subview(partner_idx).load(),
-        )
+        own_val = self.sCFloat.subview(own_idx).load()
+        partner_val = self.sCFloat.subview(partner_idx).load()
+        if cutlass.const_expr(self.cfg.has_deepseek_fp8_c_scale):
+            return cute.arch.fmax(own_val, partner_val)
+        return cute.math.max(own_val, partner_val)
 
     @cute.jit
     def _read_absmax_scratch_pair(
@@ -1393,6 +1400,11 @@ class GmemCResource(MemoryResource):
         )
         own_vec = self.sCFloat.load(own_idx, vector_size=2, alignment=8)
         partner_vec = self.sCFloat.load(partner_idx, vector_size=2, alignment=8)
+        if cutlass.const_expr(self.cfg.has_deepseek_fp8_c_scale):
+            return (
+                cute.arch.fmax(own_vec[0], partner_vec[0]),
+                cute.arch.fmax(own_vec[1], partner_vec[1]),
+            )
         return (
             cute.math.max(own_vec[0], partner_vec[0]),
             cute.math.max(own_vec[1], partner_vec[1]),
@@ -1417,8 +1429,12 @@ class GmemCResource(MemoryResource):
         v2 = self.sCFloat.load(idx2, vector_size=2, alignment=8)
         v3 = self.sCFloat.load(idx3, vector_size=2, alignment=8)
         return (
-            cute.math.max(cute.math.max(v0[0], v1[0]), cute.math.max(v2[0], v3[0])),
-            cute.math.max(cute.math.max(v0[1], v1[1]), cute.math.max(v2[1], v3[1])),
+            cute.arch.fmax(
+                cute.arch.fmax(v0[0], v1[0]), cute.arch.fmax(v2[0], v3[0])
+            ),
+            cute.arch.fmax(
+                cute.arch.fmax(v0[1], v1[1]), cute.arch.fmax(v2[1], v3[1])
+            ),
         )
 
     @cute.jit
@@ -1427,8 +1443,8 @@ class GmemCResource(MemoryResource):
             warpgroup_idx, lane_id, scale_pair
         )
         safe_abs0, safe_abs1 = self._fmul2(
-            cute.math.max(block_abs0, Float32(1.0e-12)),
-            cute.math.max(block_abs1, Float32(1.0e-12)),
+            cute.arch.fmax(block_abs0, Float32(1.0e-12)),
+            cute.arch.fmax(block_abs1, Float32(1.0e-12)),
             Float32(1.0),
             Float32(1.0),
         )
@@ -1446,11 +1462,11 @@ class GmemCResource(MemoryResource):
         group1_abs0, group1_abs1 = self._read_absmax_scratch_pair_all_warps(
             Int32(1), lane_id, scale_pair
         )
-        block_abs0 = cute.math.max(group0_abs0, group1_abs0)
-        block_abs1 = cute.math.max(group0_abs1, group1_abs1)
+        block_abs0 = cute.arch.fmax(group0_abs0, group1_abs0)
+        block_abs1 = cute.arch.fmax(group0_abs1, group1_abs1)
         safe_abs0, safe_abs1 = self._fmul2(
-            cute.math.max(block_abs0, Float32(1.0e-12)),
-            cute.math.max(block_abs1, Float32(1.0e-12)),
+            cute.arch.fmax(block_abs0, Float32(1.0e-12)),
+            cute.arch.fmax(block_abs1, Float32(1.0e-12)),
             Float32(1.0),
             Float32(1.0),
         )
@@ -2847,8 +2863,9 @@ class GmemCResource(MemoryResource):
                         val1_f32 = self._maybe_apply_scale_c(val1_f32, scale_c)
                         val0_vals.append(val0_f32)
                         val1_vals.append(val1_f32)
-                        local_abs = cute.math.max(
-                            cute.math.abs(val0_f32), cute.math.abs(val1_f32)
+                        local_abs = cute.arch.fmax(
+                            cute.arch.fmax(val0_f32, -val0_f32),
+                            cute.arch.fmax(val1_f32, -val1_f32),
                         )
                         if col_sub == 0:
                             local_abs0 = local_abs
@@ -2997,13 +3014,15 @@ class GmemCResource(MemoryResource):
                         val2_vals.append(val2_f32)
                         val3_vals.append(val3_f32)
 
-                        local_abs = cute.math.max(
-                            cute.math.abs(val0_f32), cute.math.abs(val1_f32)
+                        local_abs = cute.arch.fmax(
+                            cute.arch.fmax(val0_f32, -val0_f32),
+                            cute.arch.fmax(val1_f32, -val1_f32),
                         )
-                        local_abs = cute.math.max(
+                        local_abs = cute.arch.fmax(
                             local_abs,
-                            cute.math.max(
-                                cute.math.abs(val2_f32), cute.math.abs(val3_f32)
+                            cute.arch.fmax(
+                                cute.arch.fmax(val2_f32, -val2_f32),
+                                cute.arch.fmax(val3_f32, -val3_f32),
                             ),
                         )
                         if col_sub == 0:
