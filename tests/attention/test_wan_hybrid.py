@@ -106,11 +106,59 @@ def test_wan_hybrid_unlinked_attention_is_explicitly_unavailable(
 def test_wan_hybrid_supported_capabilities_remain_available(
     monkeypatch, capability
 ) -> None:
+    loaded_targets = []
     monkeypatch.setattr(wan_hybrid, "_wan_hybrid_dispatch_impl", object())
+    monkeypatch.setattr(
+        wan_hybrid,
+        "_wan_hybrid_dispatch_module_resolver",
+        lambda target: loaded_targets.append(target) or object(),
+    )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
 
     assert wan_hybrid.is_wan_hybrid_attention_available("cuda:0")
+    assert loaded_targets == ["sm100" if capability == (10, 0) else "sm103"]
+
+
+def test_wan_hybrid_native_module_load_failure_is_unavailable(monkeypatch) -> None:
+    monkeypatch.setattr(wan_hybrid, "_wan_hybrid_dispatch_impl", object())
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda _device: (10, 0)
+    )
+
+    def fail_to_load(_target: str):
+        raise RuntimeError("native module failed to load")
+
+    monkeypatch.setattr(
+        wan_hybrid, "_wan_hybrid_dispatch_module_resolver", fail_to_load
+    )
+    assert not wan_hybrid.is_wan_hybrid_attention_available("cuda:0")
+
+
+def test_wan_hybrid_trace_captures_the_exact_public_contract() -> None:
+    tensor = _meta_tensor()
+    definition = wan_hybrid.wan_hybrid_attention.fi_trace(
+        q=tensor,
+        k=tensor,
+        v=tensor,
+        out=tensor,
+        workspace=object(),
+        qkv_layout="NHD",
+        causal=False,
+    )
+
+    assert definition["name"] == "wan_hybrid_attention_b1_s4800_h40_d128"
+    assert definition["op_type"] == "wan_hybrid_attention"
+    assert definition["inputs"]["q"]["shape"] == [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim",
+    ]
+    assert definition["inputs"]["workspace"]["dtype"] == "int64"
+    assert definition["outputs"]["output"]["param"] == "out"
+    assert definition["outputs"]["output"]["dtype"] == "bfloat16"
 
 
 def test_wan_hybrid_jit_flags_are_target_specific(monkeypatch) -> None:
@@ -149,6 +197,8 @@ def test_wan_hybrid_jit_flags_are_target_specific(monkeypatch) -> None:
 
         assert calls["wan_hybrid_quantization_sm100"]["use_fast_math"] is False
         assert calls["wan_hybrid_quantization_sm103"]["use_fast_math"] is False
+        assert calls["wan_hybrid_attention_sm100"]["use_fast_math"] is False
+        assert calls["wan_hybrid_attention_sm103"]["use_fast_math"] is False
         for target in ("sm100", "sm103"):
             for component in ("attention", "dispatch"):
                 assert (
@@ -186,6 +236,9 @@ def test_wan_hybrid_quantizer_binding_matches_frozen_device_abi() -> None:
     assert "kPhysicalBlocks = 40" in binding
     assert "SMEM_TOTAL == 32896" in binding
     assert "SMEM_TOTAL == 33280" not in binding
+    assert "void CheckTarget(int32_t device_id)" in binding
+    assert "CheckTarget(device_id);" in binding
+    assert "FLASHINFER_WAN_HYBRID_TARGET_MINOR" in binding
     assert "const cudaStream_t stream = get_stream(value.device());" in binding
     assert binding.count('#include "device/wan_hybrid_quantize_value_sm') == 2
     assert _sha256(source_root / "device/wan_hybrid_quantize_value_sm100.cu") == (

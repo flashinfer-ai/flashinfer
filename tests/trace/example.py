@@ -25,6 +25,7 @@ gdn_prefill_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
+wan_hybrid_attention_b1_s4800_h40_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
@@ -140,6 +141,21 @@ device = "cuda"
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
 
 print(f"\nAuto-dumping fi_trace JSON files to {SAVE_DIR}/\n")
+
+# ── Wan hybrid attention fixed serving contract ─────────────────────────────
+# Metadata-only trace generation avoids requiring an SM100/SM103 device or
+# loading the optional native module while preserving the exact public schema.
+_wan_shape = (1, 4800, 40, 128)
+_wan_tensor = torch.empty(_wan_shape, dtype=torch.bfloat16, device="meta")
+flashinfer.wan_hybrid_attention.fi_trace(
+    q=_wan_tensor,
+    k=_wan_tensor,
+    v=_wan_tensor,
+    out=_wan_tensor,
+    workspace=object(),
+    qkv_layout="NHD",
+    causal=False,
+)
 
 # ── rmsnorm ───────────────────────────────────────────────────────────────────
 # Llama-3.1-8B (hidden=4096) and DeepSeek-V3 (hidden=7168)

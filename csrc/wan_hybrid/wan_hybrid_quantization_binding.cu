@@ -70,6 +70,10 @@ constexpr int64_t kGridX = kBatch * kHeads * kLogicalBlocks;
 static_assert(THREADS == 256);
 static_assert(SMEM_TOTAL == 32896);
 
+void CheckCuda(cudaError_t status, const char* operation) {
+  TVM_FFI_ICHECK_EQ(status, cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
+}
+
 void CheckExactTensor(TensorView tensor, const char* name, DLDataType dtype,
                       std::initializer_list<int64_t> shape, int32_t device_id) {
   CHECK_INPUT(tensor);
@@ -85,6 +89,18 @@ void CheckExactTensor(TensorView tensor, const char* name, DLDataType dtype,
   }
   TVM_FFI_ICHECK_EQ(tensor.device().device_id, device_id)
       << name << " must be on the same CUDA device as value";
+}
+
+void CheckTarget(int32_t device_id) {
+  int major = 0;
+  int minor = 0;
+  CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
+            "cudaDeviceGetAttribute(major)");
+  CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
+            "cudaDeviceGetAttribute(minor)");
+  TVM_FFI_ICHECK_EQ(major, 10) << "wan_hybrid quantization requires compute capability 10.x";
+  TVM_FFI_ICHECK_EQ(minor, FLASHINFER_WAN_HYBRID_TARGET_MINOR)
+      << "wan_hybrid quantization module target does not match the CUDA device";
 }
 
 void QuantizeValue(TensorView value, TensorView base, TensorView residual, TensorView base_scale_lo,
@@ -105,6 +121,7 @@ void QuantizeValue(TensorView value, TensorView base, TensorView residual, Tenso
                    device_id);
 
   ffi::CUDADeviceGuard device_guard(device_id);
+  CheckTarget(device_id);
   const cudaStream_t stream = get_stream(value.device());
   kernel_wan_hybrid_quantize_value<<<dim3(kGridX, 1, 1), dim3(THREADS, 1, 1), SMEM_TOTAL, stream>>>(
       static_cast<__nv_bfloat16*>(value.data_ptr()),

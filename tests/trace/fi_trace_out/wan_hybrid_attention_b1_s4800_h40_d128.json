@@ -1,0 +1,100 @@
+{
+  "name": "wan_hybrid_attention_b1_s4800_h40_d128",
+  "description": "Explicit Wan VideoGen BF16 Q/K with internally quantized NVFP4 P/V attention for the fixed B1/S4800/H40/D128 noncausal NHD contract.",
+  "op_type": "wan_hybrid_attention",
+  "tags": [
+    "fi_api:flashinfer.wan_hybrid.wan_hybrid_attention",
+    "stage:prefill",
+    "backend:wan-hybrid",
+    "status:experimental"
+  ],
+  "axes": {
+    "batch_size": {
+      "type": "const",
+      "value": 1
+    },
+    "seq_len": {
+      "type": "const",
+      "value": 4800
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 40
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128
+    }
+  },
+  "constraints": [
+    "batch_size == 1",
+    "seq_len == 4800",
+    "num_heads == 40",
+    "head_dim == 128",
+    "qkv_layout is None or qkv_layout == 'NHD'",
+    "causal is None or causal == False"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "k": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "v": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16"
+    },
+    "workspace": {
+      "shape": null,
+      "dtype": "int64",
+      "description": "Opaque caller-owned WanHybridAttentionWorkspace handle; its storage is implementation-specific."
+    },
+    "sm_scale": {
+      "shape": null,
+      "dtype": "float32",
+      "optional": true
+    },
+    "qkv_layout": {
+      "shape": null,
+      "dtype": "string",
+      "optional": true
+    },
+    "causal": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true
+    }
+  },
+  "outputs": {
+    "output": {
+      "shape": [
+        "batch_size",
+        "seq_len",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "bfloat16",
+      "param": "out",
+      "description": "Caller-owned contiguous BF16 output."
+    }
+  },
+  "check": "def _wan_hybrid_attention_check(\n    reference_outputs,\n    actual_outputs,\n    *,\n    rtol=None,\n    atol=None,\n    max_mismatch_pct=0.0,\n    min_cos_sim=None,\n):\n    import torch\n\n    from flashinfer.trace import default_check\n\n    rtol = 0.1 if rtol is None else rtol\n    atol = 1.0 if atol is None else atol\n    min_cos_sim = 0.995 if min_cos_sim is None else min_cos_sim\n    if not default_check(\n        reference_outputs,\n        actual_outputs,\n        rtol=rtol,\n        atol=atol,\n        max_mismatch_pct=max_mismatch_pct,\n        min_cos_sim=min_cos_sim,\n    ):\n        return False\n    reference = (\n        reference_outputs[0]\n        if isinstance(reference_outputs, (list, tuple))\n        else reference_outputs\n    )\n    actual = (\n        actual_outputs[0]\n        if isinstance(actual_outputs, (list, tuple))\n        else actual_outputs\n    )\n    if not isinstance(reference, torch.Tensor) or not isinstance(actual, torch.Tensor):\n        return False\n    return bool(\n        torch.isfinite(actual).all().item()\n        and (actual.float() - reference.float()).abs().mean().item() <= 0.025\n    )\n"
+}

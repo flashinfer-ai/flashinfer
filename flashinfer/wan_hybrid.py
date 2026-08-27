@@ -20,11 +20,14 @@ from typing import Callable, NamedTuple, Optional
 
 import torch
 
+from .api_logging import flashinfer_api
+from .trace.templates.attention import wan_hybrid_attention_trace
 from .utils import register_custom_op, register_fake_op
 
 
 _WAN_HYBRID_SHAPE = (1, 4800, 40, 128)
 _WAN_HYBRID_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
+_WAN_HYBRID_TARGETS = {(10, 0): "sm100", (10, 3): "sm103"}
 _WAN_HYBRID_PADDED_SEQUENCE = 5120
 _WAN_HYBRID_VALUE_ROWS = 40 * 128
 _WAN_HYBRID_PACKED_VALUE_SHAPE = (
@@ -199,13 +202,18 @@ _WanHybridDispatchImpl = Callable[
 # stream for the input device. The public wrapper does not synchronize.
 
 _wan_hybrid_dispatch_impl: Optional[_WanHybridDispatchImpl] = None
+_wan_hybrid_dispatch_module_resolver: Optional[Callable[[str], object]] = None
 try:
+    from ._wan_hybrid import (
+        _get_wan_hybrid_dispatch_module as _loaded_wan_hybrid_module_resolver,
+    )
     from ._wan_hybrid import wan_hybrid_dispatch_impl as _loaded_wan_hybrid_impl
 except ModuleNotFoundError as error:
     if error.name != f"{__package__}._wan_hybrid":
         raise
 else:
     _wan_hybrid_dispatch_impl = _loaded_wan_hybrid_impl
+    _wan_hybrid_dispatch_module_resolver = _loaded_wan_hybrid_module_resolver
 
 
 def _normalize_cuda_device(device: torch.device | str | int) -> torch.device:
@@ -221,8 +229,9 @@ def is_wan_hybrid_attention_available(
 
     This probe fails closed. It returns ``False`` when the implementation is
     not present, CUDA is unavailable, ``device`` is not a CUDA device, or the
-    device is not one of the implementation's supported architectures. When
-    ``device`` is omitted, the result only reports implementation availability.
+    device is not one of the implementation's supported architectures, or the
+    architecture-specific native module cannot be loaded. When ``device`` is
+    omitted, the current CUDA device is queried.
 
     Parameters
     ----------
@@ -235,21 +244,33 @@ def is_wan_hybrid_attention_available(
         Whether ``wan_hybrid_attention`` can be selected explicitly.
     """
 
-    if _wan_hybrid_dispatch_impl is None:
+    if (
+        _wan_hybrid_dispatch_impl is None
+        or _wan_hybrid_dispatch_module_resolver is None
+    ):
         return False
-    if device is None:
-        return True
+    if not torch.cuda.is_available():
+        return False
     try:
-        normalized_device = _normalize_cuda_device(device)
+        normalized_device = _normalize_cuda_device(
+            torch.cuda.current_device() if device is None else device
+        )
     except (TypeError, ValueError, RuntimeError):
         return False
-    if normalized_device.type != "cuda" or not torch.cuda.is_available():
+    if normalized_device.type != "cuda":
         return False
     try:
         capability = torch.cuda.get_device_capability(normalized_device)
     except (ValueError, RuntimeError):
         return False
-    return capability in _WAN_HYBRID_SUPPORTED_COMPUTE_CAPABILITIES
+    target = _WAN_HYBRID_TARGETS.get(capability)
+    if target is None:
+        return False
+    try:
+        _wan_hybrid_dispatch_module_resolver(target)
+    except Exception:
+        return False
+    return True
 
 
 def _validate_tensor_metadata(name: str, tensor: torch.Tensor) -> None:
@@ -380,6 +401,7 @@ def _quantize_wan_hybrid_value(
     )
 
 
+@flashinfer_api(trace=wan_hybrid_attention_trace)
 def wan_hybrid_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -446,9 +468,12 @@ def wan_hybrid_attention(
         raise NotImplementedError(_WAN_HYBRID_UNAVAILABLE_MESSAGE)
     if not is_wan_hybrid_attention_available(q.device):
         major, minor = torch.cuda.get_device_capability(q.device)
-        raise NotImplementedError(
-            f"wan_hybrid attention does not support compute capability {major}.{minor}"
-        )
+        if (major, minor) not in _WAN_HYBRID_SUPPORTED_COMPUTE_CAPABILITIES:
+            raise NotImplementedError(
+                "wan_hybrid attention does not support compute capability "
+                f"{major}.{minor}"
+            )
+        raise NotImplementedError(_WAN_HYBRID_UNAVAILABLE_MESSAGE)
 
     _wan_hybrid_dispatch_impl(q, k, v, out, workspace, normalized_sm_scale)
     return out

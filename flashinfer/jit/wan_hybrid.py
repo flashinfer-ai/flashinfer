@@ -92,6 +92,7 @@ def gen_wan_hybrid_attention_module(target: str) -> JitSpec:
             "--ptxas-options=--opt-level=1",
         ],
         extra_include_paths=[csrc_dir, csrc_dir.parent],
+        use_fast_math=False,
     )
 
 

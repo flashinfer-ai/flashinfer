@@ -50,6 +50,16 @@ def test_baseline_quality_is_required_for_promotion() -> None:
     assert not benchmark._qualification_passed(
         {"passed": True}, {"passed": False}, True, True, orders
     )
+    assert not benchmark._qualification_passed(
+        {"passed": True}, {"passed": True}, True, False, orders
+    )
+
+
+def test_benchmark_records_peak_temporary_allocations() -> None:
+    source = _BENCHMARK_PATH.read_text(encoding="utf-8")
+    assert "torch.cuda.reset_peak_memory_stats(device)" in source
+    assert "torch.cuda.max_memory_allocated(device)" in source
+    assert '"peak_temporary_allocation_bytes"' in source
 
 
 def test_load_production_fa4_uses_sglang_runtime_package(monkeypatch) -> None:

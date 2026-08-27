@@ -267,11 +267,16 @@ def main() -> None:
     fa4_quality = _quality(out_fa4, reference)
 
     allocated_before = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
     for _ in range(10):
         candidate_fn()
     torch.cuda.synchronize(device)
     allocated_after = torch.cuda.memory_allocated(device)
-    allocation_stable = allocated_after == allocated_before
+    allocated_peak = torch.cuda.max_memory_allocated(device)
+    peak_temporary_allocation_bytes = max(0, allocated_peak - allocated_before)
+    allocation_stable = (
+        allocated_after == allocated_before and peak_temporary_allocation_bytes == 0
+    )
 
     orders = [_measure_order(order, candidate_fn, fa4_fn) for order in _PAIRED_ORDERS]
     passed = _qualification_passed(
@@ -333,6 +338,8 @@ def main() -> None:
         "allocation_stable": allocation_stable,
         "memory_allocated_before": allocated_before,
         "memory_allocated_after": allocated_after,
+        "memory_allocated_peak": allocated_peak,
+        "peak_temporary_allocation_bytes": peak_temporary_allocation_bytes,
         "orders": orders,
         "provenance": {
             "candidate": _callable_provenance(

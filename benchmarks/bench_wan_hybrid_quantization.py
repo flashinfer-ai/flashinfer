@@ -44,10 +44,16 @@ def main() -> None:
     quantize()
     torch.cuda.synchronize(device)
     allocated_before = torch.cuda.memory_allocated(device)
+    torch.cuda.reset_peak_memory_stats(device)
     for _ in range(10):
         quantize()
     torch.cuda.synchronize(device)
     allocated_after = torch.cuda.memory_allocated(device)
+    allocated_peak = torch.cuda.max_memory_allocated(device)
+    peak_temporary_allocation_bytes = max(0, allocated_peak - allocated_before)
+    allocation_stable = (
+        allocated_after == allocated_before and peak_temporary_allocation_bytes == 0
+    )
 
     samples = [
         float(sample)
@@ -75,9 +81,11 @@ def main() -> None:
         "min_ms": min(samples),
         "max_ms": max(samples),
         "samples_ms": samples,
-        "allocation_stable": allocated_after == allocated_before,
+        "allocation_stable": allocation_stable,
         "memory_allocated_before": allocated_before,
         "memory_allocated_after": allocated_after,
+        "memory_allocated_peak": allocated_peak,
+        "peak_temporary_allocation_bytes": peak_temporary_allocation_bytes,
         "packed_storage_bytes_per_level": 13_107_200,
         "scale_plane_bytes": 819_200,
         "scale_plane_count": 4,
