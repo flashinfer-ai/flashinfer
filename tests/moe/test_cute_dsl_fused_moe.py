@@ -107,6 +107,12 @@ def _skip_sm107_unimplemented_moe_features(request):
     if request.node.function.__name__ == "test_geglu_tanh_accuracy":
         pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
 
+    if (
+        request.node.function.__name__
+        == "test_deterministic_finalize_numerical_accuracy"
+    ):
+        pytest.skip("SM107 finalize kernel implements only the fused path")
+
 
 def is_sm100_family():
     """Check for the SM100 family: Blackwell SM100/SM103 and Rubin SM107.
@@ -1182,11 +1188,6 @@ class TestAutotunerBucketConfig:
 @cute_dsl_available
 @sm100_required
 class TestCuteDslMoeW4A16:
-    # The W4A16 entry point calls ``require_cute_dsl_arch(..., native_only=True)``,
-    # so a DSL release that predates this device's arch (e.g. 4.7.0 on sm_107)
-    # raises NotImplementedError before any kernel runs. That is the guard doing
-    # its job, not a failure -- skip, exactly as the other GPU-executing classes
-    # in this file do.
     pytestmark = _requires_dsl_arch
 
     @pytest.mark.parametrize("use_wrapper", [False, True])
