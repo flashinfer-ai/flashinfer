@@ -190,6 +190,27 @@ def _dsl_captured_arch() -> Optional[str]:
         return None
 
 
+def cute_dsl_compile_arch(major: int, minor: int) -> str:
+    r"""Return the arch name to pass to ``cute.GPUArch`` for a device."""
+    from cutlass.base_dsl.arch import Arch
+
+    for name in (f"sm_{major}{minor}a", f"sm_{major}{minor}"):
+        try:
+            Arch[name]
+            return name
+        except KeyError:
+            continue
+    if is_cute_dsl_arch_supported(major, minor):
+        family = _family_fallback_arch(major, minor)
+        if family is not None:
+            return family
+    raise NotImplementedError(
+        f"the installed CuTe DSL cannot target sm_{major}{minor}; export "
+        f"CUTE_DSL_ARCH=sm_{major}0f before starting the process to build "
+        f"family-portable kernels on this device"
+    )
+
+
 def require_cute_dsl_arch(device, native_only: bool = False) -> None:
     r"""Raise :class:`NotImplementedError` when the installed CuTe DSL cannot
     target ``device``'s architecture (see :func:`is_cute_dsl_arch_supported`)."""
