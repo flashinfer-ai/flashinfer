@@ -1894,6 +1894,59 @@ class CuteDslNvfp4Runner(MoERunner):
                 f"{type(self).__name__} does not support per-token W4A16 activation "
                 "scales."
             )
+        self._assert_rubin_cute_dsl_available()
+
+    def _assert_rubin_cute_dsl_available(self) -> None:
+        """Reject SM107 when the installed CuTe DSL cannot provide its kernels.
+
+        The SM107 gather/activation-fusion and finalize-fusion kernels are built
+        on ``cutlass.utils.rubin_helpers``, which only exists from CuTe DSL 4.8.
+        Without it the kernel factories raise ``NotImplementedError`` when they
+        are first called -- that is, in the middle of ``forward()``, long after
+        this backend has been accepted as a candidate.
+
+        Declining here instead lets ``MoELayer`` drop the backend at build time,
+        so ``auto`` routes elsewhere and callers that enumerate backends see it
+        absent rather than failing mid-call.
+
+        The probe is arch-conditional on purpose: only the SM107 kernels need
+        ``rubin_helpers``, so an older DSL is perfectly usable on SM100/SM103.
+        """
+        from ..utils import get_compute_capability
+
+        # check_support() is also exercised on runners built with __new__ and only
+        # a config attached (see TestMoERunnerSupport), so there may be no bound
+        # device. Nothing arch-specific can be decided in that case; the real
+        # dispatch path always sets device in __init__ before check_support().
+        device = getattr(self, "device", None)
+        if device is None:
+            return
+        if get_compute_capability(device) != (10, 7):
+            return
+
+        # ``cute_dsl.utils`` imports cutlass at module scope, so on a stack with no
+        # CuTe DSL installed the probe cannot be reached at all. Failing to import
+        # it is itself proof the SM107 kernels are unavailable, so decline rather
+        # than propagating an ImportError out of a support check.
+        #
+        # #4753 adds a cutlass-free ``cute_dsl.availability`` module and reroutes
+        # the package off ``utils``; once that lands this collapses to a plain
+        # ``from ..cute_dsl.availability import is_rubin_cute_dsl_available``,
+        # matching what release-v0.6.18 already does. The try/except is kept so
+        # this commit is correct whichever of the two merges first.
+        try:
+            from ..cute_dsl.utils import is_rubin_cute_dsl_available
+
+            rubin_dsl_available = is_rubin_cute_dsl_available()
+        except ImportError:
+            rubin_dsl_available = False
+
+        if not rubin_dsl_available:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires CuTe DSL >= 4.8 on SM107 "
+                "(Rubin), which provides cutlass.utils.rubin_helpers; the "
+                "installed CuTe DSL does not have it."
+            )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
