@@ -93,6 +93,41 @@ struct KVCacheTraits<ModelType::GLM_NSA> : KVCacheTraits<ModelType::DSV3_2> {
 };
 
 template <>
+struct KVCacheTraits<ModelType::GLM53_NOPE> {
+  // GLM-5.3-Flash is a native NoPE model. The absorbed query and latent KV
+  // dimensions are both 512; no positional-key lane exists.
+  static constexpr int D_NOPE = 512;
+  static constexpr int D_ROPE = 0;
+  static constexpr int D_QK = D_NOPE;
+  static constexpr int D_V = 512;
+
+  static constexpr int QUANT_TILE = 128;
+  static constexpr int NUM_SCALES = D_NOPE / QUANT_TILE;
+  static constexpr ScaleFormat SCALE_FORMAT = ScaleFormat::ARBITRARY_FP32;
+
+  // vLLM's fp8_ds_mla cache ABI remains 656 bytes/token. The first 528
+  // bytes contain the 512 FP8 latent values plus four inline FP32 scales;
+  // the trailing 128 bytes are reserved padding and must never be treated as
+  // RoPE data by this specialization.
+  static constexpr bool SCALE_INLINE = true;
+  static constexpr int SCALE_BYTES_PER_TOKEN = NUM_SCALES * sizeof(float);
+  static constexpr int KV_GMEM_STRIDE = 656;
+  static constexpr int KV_SCALE_GMEM_OFFSET = D_NOPE;
+  static constexpr int KV_ROPE_GMEM_OFFSET = D_NOPE + SCALE_BYTES_PER_TOKEN;
+  static constexpr int KV_SMEM_STRIDE = D_NOPE + SCALE_BYTES_PER_TOKEN;
+  static constexpr int KV_SMEM_COPY_BYTES = KV_SMEM_STRIDE;
+  static constexpr bool SCALE_IN_KV_SMEM = true;
+
+  static constexpr int Q_NOPE_STRIDE = D_NOPE + 16;
+  static constexpr int Q_NOPE_BF16_STRIDE = D_NOPE + 8;
+  static constexpr bool V_HAS_ROPE = false;
+
+  __device__ static __forceinline__ uint8_t scale_to_ue8m0(float scale) {
+    return static_cast<uint8_t>((__float_as_uint(scale) >> 23) & 0xFF);
+  }
+};
+
+template <>
 struct KVCacheTraits<ModelType::DSV4> {
   // Dimensions
   static constexpr int D_NOPE = 448;
@@ -158,6 +193,8 @@ static_assert(KVCacheTraits<ModelType::DSV4>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::DSV4>::D_V == D_V);
 static_assert(KVCacheTraits<ModelType::GLM_NSA>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::GLM_NSA>::D_V == D_V);
+static_assert(KVCacheTraits<ModelType::GLM53_NOPE>::D_ROPE == 0);
+static_assert(KVCacheTraits<ModelType::GLM53_NOPE>::D_V == D_V);
 
 // Warp configuration
 static constexpr int N_MATH_WARPS = 8;

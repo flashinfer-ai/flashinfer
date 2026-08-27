@@ -131,11 +131,13 @@ _DECODE_DSV3_2_DISPATCH = frozenset(
         (128, 2048),
     }
 )
+_DECODE_GLM53_NOPE_DISPATCH = frozenset({(32, 2176)})
 _DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
 
 _MODEL_TYPE_DSV3_2 = 0
 _MODEL_TYPE_DSV4 = 1
 _MODEL_TYPE_GLM_NSA = 2
+_MODEL_TYPE_GLM53_NOPE = 3
 _KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32"})
 _BPT_DSV3_2 = 656
 _BPT_DSV4 = 584
@@ -170,17 +172,18 @@ def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
             return _MODEL_TYPE_GLM_NSA
         return _MODEL_TYPE_DSV3_2
     if d_qk == 512:
+        if fmt == "arbitrary_fp32":
+            return _MODEL_TYPE_GLM53_NOPE
         if fmt != "auto":
             raise ValueError(
-                "kv_scale_format is only configurable for d_qk=576; "
-                f"got d_qk=512 with kv_scale_format={kv_scale_format!r}"
+                f"unsupported d_qk=512 kv_scale_format={kv_scale_format!r}"
             )
         return _MODEL_TYPE_DSV4
     raise ValueError(f"SM120 sparse-MLA supports d_qk=576 or d_qk=512, got d_qk={d_qk}")
 
 
 def _bytes_per_token_for_model_type(model_type: int) -> int:
-    if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
+    if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE):
         return _BPT_DSV3_2
     if model_type == _MODEL_TYPE_DSV4:
         return _BPT_DSV4
@@ -227,14 +230,25 @@ def _packed_kv_page_block_size(
 
 
 def _decode_dsv3_2_dispatchable(
-    num_tokens: int, num_heads: int, topk: int, d_qk: int, page_block_size: int
+    num_tokens: int,
+    num_heads: int,
+    topk: int,
+    d_qk: int,
+    page_block_size: int,
+    model_type: int,
 ) -> bool:
     """True iff decode-dsv3_2 supports this shape configuration."""
     return (
         num_tokens <= _DECODE_MAX_TOKENS
-        and d_qk == 576
+        and d_qk in (512, 576)
         and page_block_size == _DECODE_DSV3_2_PAGE_BLOCK_SIZE
-        and (num_heads, topk) in _DECODE_DSV3_2_DISPATCH
+        and (
+            (num_heads, topk) in _DECODE_DSV3_2_DISPATCH
+            or (
+                model_type == _MODEL_TYPE_GLM53_NOPE
+                and (num_heads, topk) in _DECODE_GLM53_NOPE_DISPATCH
+            )
+        )
     )
 
 
@@ -366,7 +380,10 @@ def get_sparse_mla_sm120_module():
         if model_type in (
             _MODEL_TYPE_DSV3_2,
             _MODEL_TYPE_GLM_NSA,
-        ) and _decode_dsv3_2_dispatchable(num_tokens, num_heads, topk, d_qk, kv_pbs):
+            _MODEL_TYPE_GLM53_NOPE,
+        ) and _decode_dsv3_2_dispatchable(
+            num_tokens, num_heads, topk, d_qk, kv_pbs, model_type
+        ):
             num_splits = (topk + _BI - 1) // _BI
             mid_out_view, mid_lse_view = _decode_scratch_views(
                 mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
