@@ -93,6 +93,7 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta
     flash_kda::CheckDtype(tile_schedule, "tile_schedule", dl_int32);
     flash_kda::CheckDtype(tile_schedule_counts, "tile_schedule_counts", dl_int32);
   }
+#endif
 
   constexpr int32_t kSmemBytes = SMEM_TOTAL;
   flash_kda::CheckDynamicSmemCapacity(device_id, kSmemBytes);
@@ -109,7 +110,8 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta
   const dim3 grid(static_cast<uint32_t>(grid_x), 1, 1);
   const dim3 block(kThreads, 1, 1);
 
-  if constexpr (kHasTileSchedule) {
+#if FLASHKDA_BLACKWELL_EVOLUTION_HAS_TILE_SCHEDULE
+  {
     FLASHKDA_BLACKWELL_EVOLUTION_KERNEL<<<grid, block, kSmemBytes, stream>>>(
         reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
         reinterpret_cast<flashkda_evolution_generated_CakeTensorMap const*>(tma.q),
