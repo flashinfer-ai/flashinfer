@@ -78,8 +78,8 @@ def _moe_profile_shapes(
     def _bucket(t: torch.Tensor | None, dim: int = 0) -> tuple:
         if t is None:
             return (0,)
-        if t.numel() == 0:
-            return tuple(t.shape)
+        # Non-None routing placeholders remain dynamic autotuner inputs even
+        # when empty, so their persisted key uses the token bucket as well.
         s = list(t.shape)
         s[dim] = bucket_m
         return tuple(s)
