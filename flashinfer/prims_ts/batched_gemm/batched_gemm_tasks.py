@@ -1420,6 +1420,7 @@ def create_epilogue_task_dsfp8(
         gmem.init_store_state()
         with _work_tile_schedule_loop(cfg, wq):
             gmem.init_epilogue_tile_state()
+            sf.reset_dequant_accumulator()
             with domain_loop(0, num_k_tiles, 1) as d:
                 tmem.try_wait()
                 sf.try_wait()
@@ -1427,8 +1428,6 @@ def create_epilogue_task_dsfp8(
                 tok = tmem.consumer_work(subtile_idx=0)
                 tmem.release()
                 sf.wait()
-                with d.first_iter():
-                    sf.reset_dequant_accumulator()
                 sf.consume_sfab_tile()
                 scaled_tok = sf.apply_dequant_to_t2r(
                     t2r_rmem=tok[0],
