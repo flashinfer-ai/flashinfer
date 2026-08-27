@@ -467,6 +467,56 @@ def test_sparse_mla_sm120_decode_unsupported_shape_fails_before_prefill() -> Non
         )
 
 
+def test_sparse_mla_sm120_decode_empty_query() -> None:
+    """Zero-token decode (EP rank with no tokens) returns empty outputs."""
+    device = torch.device("cuda")
+    num_heads, topk = 8, 128
+    d_qk = 576
+
+    kv_bf16 = (
+        torch.randn(4, 64, 1, d_qk, device=device, dtype=torch.bfloat16) / 10.0
+    ).clamp(-1, 1)
+    kv_hnd = quantize_kv_dsv3_2(kv_bf16).transpose(1, 2)
+
+    query = torch.empty((0, 1, num_heads, d_qk), dtype=torch.bfloat16, device=device)
+    block_tables = torch.empty((0, 1, topk), dtype=torch.int32, device=device)
+    workspace = torch.empty(8 << 20, dtype=torch.uint8, device=device)
+    kwargs = dict(
+        query=query,
+        kv_cache=kv_hnd,
+        workspace_buffer=workspace,
+        qk_nope_head_dim=512,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        block_tables=block_tables,
+        seq_lens=None,
+        max_seq_len=64,
+        sparse_mla_top_k=topk,
+        bmm1_scale=d_qk**-0.5,
+        bmm2_scale=1.0,
+        backend="sparse",
+    )
+
+    out = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(**kwargs)
+    assert out.shape == (0, 1, num_heads, 512)
+
+    # Caller-supplied buffers must pass through untouched (identity, not copy).
+    user_out = torch.empty((0, 1, num_heads, 512), dtype=torch.bfloat16, device=device)
+    user_lse = torch.empty((0, num_heads), dtype=torch.float32, device=device)
+    out2, lse2 = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+        **kwargs, out=user_out, lse=user_lse, return_lse=True
+    )
+    assert out2 is user_out
+    assert lse2 is user_lse
+
+    # return_lse without a caller buffer: fresh flat-shaped empty lse.
+    _, lse3 = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+        **kwargs, return_lse=True
+    )
+    assert lse3.shape == (0, num_heads)
+    assert lse3.dtype == torch.float32
+
+
 @pytest.mark.parametrize(
     "num_heads,topk,num_tokens,kv_layout",
     [

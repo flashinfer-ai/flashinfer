@@ -325,6 +325,10 @@ def get_sparse_mla_sm120_module():
         topk = indices.shape[-1]
         _require_d_v_512(d_v)
         _check_last_dim_512(output, "output")
+        if num_tokens == 0:
+            # Empty request: outputs are already-sized empty tensors; a kernel
+            # launch would hit a grid.x=0 CUDA error.
+            return
 
         kv_pbs = _packed_kv_page_block_size(
             kv_cache, model_type=model_type, name="kv_cache"

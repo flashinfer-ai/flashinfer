@@ -210,7 +210,7 @@ def _normalize_sparse_mla_indices_and_lens(
             raise ValueError(
                 f"Expected {name}.shape == {expected_shape}, got {tuple(indices.shape)}"
             )
-        indices = indices.reshape(batch_size * q_len_per_request, -1)
+        indices = indices.reshape(batch_size * q_len_per_request, sparse_topk)
     elif indices.ndim == 2:
         sparse_topk = int(indices.shape[-1])
         expected_shape = (batch_size * q_len_per_request, sparse_topk)
@@ -445,6 +445,20 @@ def _trtllm_batch_decode_sparse_mla_sm120(
                 f"got {tuple(lse.shape)}"
             )
         out_lse_arg = lse
+
+    if query_flat.shape[0] == 0:
+        # Empty batch (e.g. an EP rank that received no tokens under
+        # speculative decoding): the runner rejects max_num_tokens == 0, so
+        # return the normalized buffers without touching it.
+        if return_lse:
+            return out, (
+                user_lse
+                if user_lse is not None
+                else torch.empty(
+                    flat_lse_shape, dtype=torch.float32, device=query.device
+                )
+            )
+        return out
 
     runner = _SparseMLAPagedAttentionRunner(
         max_num_tokens=query_flat.shape[0],
