@@ -134,7 +134,7 @@ def test_training_api_signatures_and_no_forward_recompute():
         ((17, 33, 65, 513), 16, 16, "c16", "c16"),
         ((1024,) * 8, 96, 96, "c16", "c16"),
         ((1025,) * 4, 96, 96, "c16", "c16"),
-        ((1300, 547, 2048, 963, 271, 3063), 96, 96, "c32", "c32"),
+        ((1300, 547, 2048, 963, 271, 3063), 96, 96, "c16", "c16"),
     ],
 )
 def test_full_training_dispatcher_route_selector(
