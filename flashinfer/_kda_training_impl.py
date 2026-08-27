@@ -528,12 +528,6 @@ class RecurrentKDATrainingContext:
     _dummy_i32: torch.Tensor = field(repr=False)
     _final_grid_ctas: int = field(repr=False)
     _stream_ptr: int = field(repr=False)
-    _parameter_context: Optional[RecurrentKDATrainingContext] = field(
-        default=None, repr=False
-    )
-    _parameter_final_state_scratch: Optional[torch.Tensor] = field(
-        default=None, repr=False
-    )
     _input_tensors: tuple[torch.Tensor, ...] = field(default=(), repr=False)
     _input_signatures: tuple[tuple, ...] = field(default=(), repr=False)
     _saved_context_signatures: tuple[tuple, ...] = field(default=(), repr=False)
@@ -556,8 +550,6 @@ def _saved_context_tensors(
         *context._route_tensors.values(),
         *metadata_tensors,
     )
-    if context._parameter_context is not None:
-        saved += _saved_context_tensors(context._parameter_context)
     return saved
 
 
@@ -737,35 +729,6 @@ def _new_context(
         _final_grid_ctas=final_grid,
         _stream_ptr=stream_ptr,
     )
-    if shape.route.uses_parameter_context:
-        parameter_shape = _TrainingShape(
-            layout=shape.layout,
-            public_batch=shape.public_batch,
-            public_tokens=shape.public_tokens,
-            total_tokens=shape.total_tokens,
-            num_sequences=shape.num_sequences,
-            num_qk_heads=shape.num_qk_heads,
-            num_v_heads=shape.num_v_heads,
-            seq_lens=shape.seq_lens,
-            offsets=shape.offsets,
-            route=_TrainingRouteSpec(
-                "grouped_c32", "tensor_tape_c32", split_work_items=False
-            ),
-        )
-        context._parameter_context = _new_context(
-            parameter_shape,
-            q,
-            k,
-            v,
-            g,
-            beta,
-            A_log,
-            dt_bias,
-            initial_state,
-            cu_seqlens,
-            stream_ptr,
-        )
-        context._parameter_final_state_scratch = torch.empty_like(initial_state)
     return context
 
 
@@ -797,19 +760,6 @@ def _validate_context_storage(
             raise ValueError("C32 descriptor storage must be 64-byte aligned")
     if context._final_descriptor_storage.data_ptr() % 64:
         raise ValueError("final descriptor storage must be 64-byte aligned")
-    if context._parameter_context is not None:
-        if context._parameter_final_state_scratch is None:
-            raise ValueError(
-                "hybrid route is missing its parameter final-state scratch"
-            )
-        _validate_tensor(
-            context._parameter_final_state_scratch,
-            "context._parameter_final_state_scratch",
-            shape=tuple(context._initial_state.shape),
-            dtype=torch.float32,
-            device=device,
-        )
-        _validate_context_storage(context._parameter_context, device)
 
 
 def _descriptor_signature(*tensors: torch.Tensor) -> tuple:
@@ -1037,19 +987,6 @@ def _bind_context_inputs(
     context._beta, context._A_log, context._dt_bias = beta, A_log, dt_bias
     context._initial_state = initial_state
     context._cu_seqlens = cu_seqlens
-    if context._parameter_context is not None:
-        _bind_context_inputs(
-            context._parameter_context,
-            q,
-            k,
-            v,
-            g,
-            beta,
-            A_log,
-            dt_bias,
-            initial_state,
-            cu_seqlens,
-        )
 
 
 def _forward_context_writes(
@@ -1104,22 +1041,6 @@ def _forward_context_writes(
             names.append("beta_tma")
         writes.extend(
             (f"{prefix}.{name}", context._route_tensors[name]) for name in names
-        )
-    if context._parameter_context is not None:
-        if context._parameter_final_state_scratch is None:
-            raise ValueError(
-                "hybrid route is missing its parameter final-state scratch"
-            )
-        writes.append(
-            (
-                f"{prefix}._parameter_final_state_scratch",
-                context._parameter_final_state_scratch,
-            )
-        )
-        writes.extend(
-            _forward_context_writes(
-                context._parameter_context, f"{prefix}._parameter_context"
-            )
         )
     return writes
 
@@ -1260,19 +1181,6 @@ def _recurrent_kda_training_forward_impl(
     _run_forward_route(
         context, output.view_as(vf), final_state, scale_value, lower_bound_value
     )
-    if context._parameter_context is not None:
-        if context._parameter_final_state_scratch is None:
-            raise ValueError(
-                "hybrid route is missing its parameter final-state scratch"
-            )
-        _run_forward_route(
-            context._parameter_context,
-            context._parameter_context._final_output_scratch,
-            context._parameter_final_state_scratch,
-            scale_value,
-            lower_bound_value,
-            materialize_public_forward=False,
-        )
     context._input_tensors = public_inputs
     context._input_signatures = tuple(
         _tensor_signature(tensor) for tensor in public_inputs
@@ -1778,24 +1686,6 @@ def recurrent_kda_training_backward(
         )
         if context._route.family == "c16":
             _run_c16_backward(context, do_flat, dfinal_state, outputs)
-            if context._parameter_context is not None:
-                parameter_outputs = tuple(
-                    outputs[index]
-                    if index in (5, 6)
-                    else _backward_buffer(
-                        context._parameter_context,
-                        f"hybrid_discard_{name}",
-                        tuple(outputs[index].shape),
-                        outputs[index].dtype,
-                    )
-                    for index, name in enumerate(KDA_BACKWARD_GRADIENT_NAMES)
-                )
-                _run_c32_backward(
-                    context._parameter_context,
-                    do_flat,
-                    dfinal_state,
-                    parameter_outputs,
-                )
         elif context._route.family == "row_split":
             _run_row_backward(context, do_flat, dfinal_state, outputs)
         else:

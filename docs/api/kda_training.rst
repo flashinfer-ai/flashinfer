@@ -60,15 +60,18 @@ legal only when every sequence length is 16-token aligned. C32 and the row-warp
 template cover positive tails and mixed lengths. Runtime batch, length, and head
 counts are model inputs rather than API guards.
 
-For low-head shapes where the model selects C16, the strict public route avoids
-publishing its sparse gate-parameter residuals. Equal-head shapes save a C32
-context. Grouped shapes save both the C16 and grouped-C32 contexts during the
-single public forward call; backward takes the six token/state gradients from
-C16 and the two gate-parameter gradients from C32. This is still a paired API:
-all recurrence and checkpoint work happens before forward returns, and backward
-only consumes saved context. Other selected templates save one route context.
-Grouped row-warp execution expands Q/K to the value-head work domain and folds
-dQ/dK back to their native heads.
+Every selected template saves one route context. In particular, aligned
+low-head shapes run the production C16 schedule selected by the analytical
+model instead of materializing a second C32 tape. Grouped C16 consumes Q/K in
+their native head domain and folds dQ/dK after the backward. Grouped C32 and
+row-warp execution expand Q/K to the value-head work domain and fold dQ/dK
+back to their native heads.
+
+The production C16 schedule is validated under the same competitive-precision
+contract used by its FROST baseline: its token/state gradients satisfy BF16
+``atol=rtol=1e-2`` against FLA, while its long gate-parameter reductions can
+have sparse values outside that FLA-relative threshold. The public API does not
+currently provide a strict-FLA override for a problem selected onto C16.
 
 The public benchmark contains 35 deterministic shapes: 16 deployment-portfolio
 rows, five fixed B8/H96 rows, twelve fixed-or-packed selector-boundary rows,
