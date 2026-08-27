@@ -876,7 +876,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             no RoPE/ALiBi/soft-cap).
             The ``prims-ts`` backend uses the task-scheduled decode kernel on SM100a/SM103a.
             It is the only backend that accepts ``is_causal=False`` with
-            ``q_len_per_req > 1``, and it requires ``kv_layout="HND"``.
+            ``q_len_per_req > 1``. It requires ``kv_layout="HND"`` and does not
+            support ``use_cuda_graph=True``.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -984,6 +985,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if kv_layout != "HND":
                 raise NotImplementedError(
                     "prims-ts decode backend requires kv_layout='HND'"
+                )
+            # The delegate snapshots seq_lens, scratch, and the compiled kernel
+            # at plan time, so a captured run() does not follow a later plan().
+            if use_cuda_graph:
+                raise NotImplementedError(
+                    "prims-ts decode backend does not support use_cuda_graph=True"
                 )
             from .attention.prims_ts import BatchDecodePagedTSWrapper
 

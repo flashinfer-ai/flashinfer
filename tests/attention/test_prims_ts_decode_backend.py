@@ -149,6 +149,22 @@ def test_rejects_jit_args():
         _make_wrapper("prims-ts", jit_args=[1])
 
 
+@requires_cuda
+def test_rejects_cuda_graph():
+    batch_size = 2
+    buffers = dict(
+        paged_kv_indptr_buffer=torch.zeros(
+            batch_size + 1, dtype=torch.int32, device="cuda"
+        ),
+        paged_kv_indices_buffer=torch.zeros(16, dtype=torch.int32, device="cuda"),
+        paged_kv_last_page_len_buffer=torch.zeros(
+            batch_size, dtype=torch.int32, device="cuda"
+        ),
+    )
+    with pytest.raises(NotImplementedError, match="use_cuda_graph"):
+        _make_wrapper("prims-ts", use_cuda_graph=True, **buffers)
+
+
 def test_plan_trace_captures_explicit_causal_mode():
     """The plan trace includes kwargs passed through compatibility API."""
 
@@ -389,7 +405,13 @@ def test_run_rejects_unsupported_options(run_kwargs, match):
 
 
 @requires_prims_ts_gpu
-def test_cuda_graph_replay():
+def test_graph_capture_of_fixed_plan_replays():
+    """Capturing run() after a plan replays that plan; re-planning is not covered.
+
+    The wrapper-level ``use_cuda_graph=True`` flow (re-plan then replay) is
+    rejected for this backend, see ``test_rejects_cuda_graph``.
+    """
+
     kv_lens = [64, 96]
     q_len_per_req = 4
     torch.manual_seed(0)
