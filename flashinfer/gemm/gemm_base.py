@@ -143,36 +143,40 @@ from ..utils import (
     get_compute_capability,
 )
 
-# cuDNN's cuBLASLt-backed matmul engine -- the plan candidate that
-# BuildPlanPolicy HEURISTICS_CHOICE picks first -- asks for a flat 32 MiB plus a
-# 256 byte pointer-alignment slack on SM90 and newer, for every shape. At the old
-# 32 MiB the very first cuDNN GEMM of a process therefore always grew this buffer;
-# see _gemm_workspace_at_least() for why growing it is unsafe.
+# cuDNN's cuBLASLt matmul engine (plan candidate 0) asks for a flat 32 MiB + 256 B
+# on SM90+ for every shape, so 32 MiB grew this buffer on the very first GEMM.
 DEFAULT_WORKSPACE_SIZE = 40 * 1024 * 1024
+
+
+class CudnnCaptureUnsafeError(RuntimeError):
+    """A cuDNN GEMM step that is unsafe under CUDA graph capture was reached.
+
+    The runners re-raise this base type instead of retrying with tactic=-1.
+    """
+
+
+class CudnnWorkspaceTooSmallInCaptureError(CudnnCaptureUnsafeError):
+    """The shared GEMM workspace was too small during CUDA graph capture."""
 
 
 def _gemm_workspace_at_least(workspace: torch.Tensor, size: int) -> torch.Tensor:
     """Return a workspace of at least ``size`` bytes, never moving ``workspace``.
 
-    ``workspace`` is a process-wide cached buffer shared by every call on this lane,
-    including calls already captured into CUDA graphs. ``Tensor.resize_()`` to a
-    larger size frees the old storage and returns a new address, which leaves those
-    graphs replaying against a pointer the caching allocator has since handed to
-    something else (flashinfer-ai/flashinfer#4549). Hand back a call-local buffer
-    instead -- the same thing the CUTLASS runners in ``csrc/`` do when the provided
-    workspace is too small.
+    ``workspace`` is shared process-wide, including with already-captured graphs.
+    ``resize_()`` would free its storage and leave those graphs replaying against a
+    recycled pointer (#4549), so hand back a call-local buffer instead.
     """
     if workspace.numel() >= size:
         return workspace
 
-    # A call-local buffer would come from (and be freed back into) the capturing
-    # graph's private pool, which a later capture in that pool could then reuse.
+    # A call-local buffer would come from the capturing graph's private pool.
     if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            f"cuDNN asked for a {size} byte GEMM workspace but the shared buffer is "
-            f"only {workspace.numel()} bytes, and the current stream is capturing a "
-            "CUDA graph, where neither growing the shared buffer nor allocating a "
-            "new one is safe. Run this shape once outside the capture region first."
+        raise CudnnWorkspaceTooSmallInCaptureError(
+            f"cuDNN needs a {size} byte GEMM workspace but the shared buffer is "
+            f"only {workspace.numel()} bytes, and growing or replacing it under "
+            f"CUDA graph capture is unsafe. Raise DEFAULT_WORKSPACE_SIZE above "
+            f"{size} and call this shape once eagerly before capturing, or use "
+            "another GEMM backend."
         )
 
     warnings.warn(
@@ -2864,42 +2868,13 @@ def _get_cudnn_plan_index_for_tactic(graph, tactic) -> int:
     return plan_index
 
 
-# Building a cuDNN execution plan is the step that does cuDNN's one-time,
-# host-side initialisation work: it loads kernel modules, may invoke NVRTC for the
-# runtime-compiled engines, and -- for the cuBLASLt-backed matmul engine that
-# BuildPlanPolicy HEURISTICS_CHOICE picks as plan candidate 0 -- makes the
-# process's first ``cublasLtCreate()`` call.  None of that belongs inside a CUDA
-# graph capture:
-#
-#   * cuDNN's own sources state that the first ``cublasLtCreate()`` "cannot be
-#     executed when the graph capture is enabled", and its legacy RNN and
-#     multi-head-attention paths each do an explicit warm-up call to get that
-#     first create out of the way.  The backend matmul path FlashInfer uses has
-#     no such protection.
-#   * cuDNN carries a separate work-around for lazy kernel-module loading under
-#     capture in its convolution path, again not present on the matmul path.
-#   * cudnn-frontend's own ``Graph::warmup()`` gives up immediately when it finds
-#     a capture already active, rather than doing this work under capture.
-#
-# FlashInfer's graph builders are ``functools.lru_cache``'d on shape, so a shape
-# first seen inside a capture region would build its plan right there.  Refuse,
-# and tell the caller to warm the shape up outside the capture instead.  There is
-# no cudnn-frontend Python binding for ``Graph::warmup()``, so "warm up" here
-# means running the same op once eagerly.
 _ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE = (
     os.environ.get("FLASHINFER_ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE", "0") == "1"
 )
 
 
-class CudnnPlanBuildInCaptureError(RuntimeError):
-    """A cuDNN execution plan was about to be built during CUDA graph capture.
-
-    Raised by :func:`_check_cudnn_plan_build_not_capturing`.  It has its own type
-    so that the ``except Exception -> retry with tactic=-1`` fallbacks in the
-    cuDNN runners can let it through: retrying would just build a *different*
-    plan under the same capture, and would silently succeed whenever the
-    ``tactic=-1`` plan for that shape happened to be cached already.
-    """
+class CudnnPlanBuildInCaptureError(CudnnCaptureUnsafeError):
+    """A cuDNN execution plan was about to be built during CUDA graph capture."""
 
 
 def _check_cudnn_plan_build_not_capturing(what: str) -> None:
@@ -4148,9 +4123,7 @@ def _cudnn_gemm_fp8_runner():
                         out.dtype,
                         tactic=tactic,
                     )
-            except CudnnPlanBuildInCaptureError:
-                # Retrying with tactic=-1 would build a plan under the same
-                # capture; let the caller see the real problem.
+            except CudnnCaptureUnsafeError:
                 raise
             except Exception as exc:
                 warnings.warn(
@@ -4666,9 +4639,7 @@ def _cudnn_gemm_bf16_runner(
                     )
                 else:
                     _cudnn_gemm_bf16(workspace_buffer, a, b, bias, out, tactic=tactic)
-            except CudnnPlanBuildInCaptureError:
-                # Retrying with tactic=-1 would build a plan under the same
-                # capture; let the caller see the real problem.
+            except CudnnCaptureUnsafeError:
                 raise
             except Exception as exc:
                 warnings.warn(
@@ -5595,9 +5566,7 @@ def _cudnn_mm_mxfp8_runner():
                         workspace_buffer=workspace_buffer,
                         tactic=tactic,
                     )
-            except CudnnPlanBuildInCaptureError:
-                # Retrying with tactic=-1 would build a plan under the same
-                # capture; let the caller see the real problem.
+            except CudnnCaptureUnsafeError:
                 raise
             except Exception as exc:
                 warnings.warn(
@@ -6073,9 +6042,7 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                         workspace_buffer,
                         tactic=tactic,
                     )
-            except CudnnPlanBuildInCaptureError:
-                # Retrying with tactic=-1 would build a plan under the same
-                # capture; let the caller see the real problem.
+            except CudnnCaptureUnsafeError:
                 raise
             except Exception as exc:
                 warnings.warn(
@@ -9695,9 +9662,7 @@ def _cudnn_gemm_mxfp8_runner():
                         workspace_buffer=workspace_buffer,
                         tactic=tactic,
                     )
-            except CudnnPlanBuildInCaptureError:
-                # Retrying with tactic=-1 would build a plan under the same
-                # capture; let the caller see the real problem.
+            except CudnnCaptureUnsafeError:
                 raise
             except Exception as exc:
                 warnings.warn(

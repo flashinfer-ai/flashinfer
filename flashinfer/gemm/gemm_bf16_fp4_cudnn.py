@@ -24,6 +24,7 @@ from ..utils import _get_cache_buf, get_native_fp4_dtype
 
 from .gemm_base import (
     CUDNN_AVAILABLE,
+    CudnnCaptureUnsafeError,
     DEFAULT_WORKSPACE_SIZE,
     UIDs,
     _gemm_workspace_at_least,
@@ -503,6 +504,8 @@ def _cudnn_bf16_fp4_runner(tuning_config):
                         workspace_buffer,
                         tactic=tactic,
                     )
+            except CudnnCaptureUnsafeError:
+                raise
             except Exception as exc:
                 warnings.warn(
                     "cuDNN bf16-fp4 GEMM tactic failed; falling back to default "
