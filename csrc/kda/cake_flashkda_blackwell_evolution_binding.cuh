@@ -103,7 +103,7 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta
       "cudaFuncSetAttribute(FlashKDA Blackwell evolution)");
 
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  const flash_kda::TmaPointers tma = flash_kda::EncodeTmaPointers<kValueRows, 32>(
+  const flash_kda::TmaPointers tma = flash_kda::EncodeTmaPointers<kValueRows, 32, false, 64>(
       q, k, v, g, beta_tma, out, descriptor_storage, prepare_descriptors, stream);
   flash_kda::PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta.stride(beta.ndim() - 2),
                                     stream);

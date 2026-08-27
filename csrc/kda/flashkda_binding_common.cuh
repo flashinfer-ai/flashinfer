@@ -723,7 +723,8 @@ static __global__ void PublishTensorMaps(uint64_t* destination, TensorMapWords s
   }
 }
 
-template <int ValueRows, int ChunkTokens = 32, bool PairPackedBeta = false>
+template <int ValueRows, int ChunkTokens = 32, bool PairPackedBeta = false,
+          int ValueTmaRows = ValueRows>
 inline TmaPointers EncodeTmaPointers(const TensorView& q, const TensorView& k, const TensorView& v,
                                      const TensorView& g, const TensorView& beta_tma,
                                      const TensorView& out, const TensorView& descriptor_storage,
@@ -739,7 +740,7 @@ inline TmaPointers EncodeTmaPointers(const TensorView& q, const TensorView& k, c
     const std::array<CUtensorMap, kTensorMapCount> host_maps = {
         EncodeQkTma<ChunkTokens>(q, "q"),
         EncodeQkTma<ChunkTokens>(k, "k"),
-        EncodeValueTma<ValueRows, ChunkTokens>(v),
+        EncodeValueTma<ValueTmaRows, ChunkTokens>(v),
         EncodeGateTma<ChunkTokens>(g),
         EncodeBetaTma<ChunkTokens, PairPackedBeta>(beta_tma),
         EncodeOutputTma<ValueRows, ChunkTokens>(out),
