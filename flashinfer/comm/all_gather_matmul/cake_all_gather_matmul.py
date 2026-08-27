@@ -485,10 +485,9 @@ void RunPreparedPackedQkv(
                     ready.size(1) == num_chunks,
                 ValueError)
       << "ready must have shape [world_size, num_chunks]";
-  TVM_FFI_CHECK(main_cuda_stream != 0 && comm_cuda_stream != 0 &&
-                    bridge_cuda_event != 0,
+  TVM_FFI_CHECK(comm_cuda_stream != 0 && bridge_cuda_event != 0,
                 ValueError)
-      << "prepared packed-QKV CUDA handles must be nonzero";
+      << "prepared packed-QKV communication CUDA handles must be nonzero";
 
   const std::array<const TensorView*, 3> peer_scratch = {
       &peer_scratch_0, &peer_scratch_1, &peer_scratch_2};

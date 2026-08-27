@@ -104,6 +104,8 @@ def test_host_launch_consumes_manifest_smem(tmp_path, monkeypatch):
     assert "kPackedQkvExperimentSupported =\n    false;" in rendered
     assert "CAKE_MAIN_SMEM_BYTES" not in rendered
     assert "CAKE_PACKED_QKV_EXPERIMENT_SUPPORTED" not in rendered
+    assert "main_cuda_stream != 0" not in rendered
+    assert "comm_cuda_stream != 0 && bridge_cuda_event != 0" in rendered
     assert source_path.read_bytes().count(b"#define SMEM_TOTAL 197632") == 4
 
 
