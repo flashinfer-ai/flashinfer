@@ -116,7 +116,7 @@ def test_training_api_signatures_and_no_forward_recompute():
 @pytest.mark.parametrize(
     ("seq_lens", "num_qk_heads", "num_v_heads", "tag", "family"),
     [
-        ((1024,) * 8, 4, 8, "grouped_hybrid_c16_c32", "c16"),
+        ((1024,) * 8, 4, 8, "grouped_c16", "c16"),
         ((17, 33, 65), 4, 8, "grouped_row_split", "row_split"),
         ((17,), 1, 1, "row_split", "row_split"),
         ((1024,) * 8, 96, 96, "c16", "c16"),
@@ -126,7 +126,7 @@ def test_training_api_signatures_and_no_forward_recompute():
 def test_full_training_dispatcher_route_selector(
     seq_lens, num_qk_heads, num_v_heads, tag, family
 ):
-    """The analytical selector chooses a strict route without shape guards."""
+    """The analytical selector chooses a production route without shape guards."""
 
     spec = kda_training_api._select_training_route(seq_lens, num_qk_heads, num_v_heads)
     assert spec.tag == tag
@@ -159,15 +159,13 @@ def test_public_contract_does_not_promote_fast_path_predicates_to_guards():
     assert "torch.float32" in source
 
 
-def test_analytical_selector_preserves_template_choice_and_strict_adapter():
+def test_analytical_selector_preserves_template_choice():
     grouped = kda_training_api._select_training_route((3200,) * 9 + (3968,), 4, 8)
     equal = kda_training_api._select_training_route((2656,) * 11 + (3552,), 4, 4)
     assert grouped.selected_template == "checkpoint_recurrent_c16"
-    assert grouped.tag == "grouped_hybrid_c16_c32"
-    assert grouped.uses_parameter_context
+    assert grouped.tag == "grouped_c16"
     assert equal.selected_template == "checkpoint_recurrent_c16"
-    assert equal.tag == "c32"
-    assert not equal.uses_parameter_context
+    assert equal.tag == "c16"
 
 
 @pytest.mark.parametrize(
@@ -222,6 +220,7 @@ def test_all_customer_layouts_select_c16_template(resident_sms):
             resident_sms=resident_sms,
         )
         assert spec.selected_template == "checkpoint_recurrent_c16"
+        assert spec.tag == ("grouped_c16" if qk_heads != value_heads else "c16")
 
 
 def test_context_has_an_explicit_route_tag():
@@ -424,8 +423,8 @@ def test_grouped_c32_forward_context_backward_matches_fla():
 
 
 @pytest.mark.arch_blackwell
-def test_grouped_hybrid_forward_context_backward_matches_fla():
-    """The strict grouped route saves both contexts before backward."""
+def test_grouped_c16_forward_context_backward_matches_fla():
+    """The production grouped route saves one C16 context before backward."""
 
     _require_blackwell()
     inputs = _make_inputs(
@@ -434,7 +433,7 @@ def test_grouped_hybrid_forward_context_backward_matches_fla():
         num_qk_heads=4,
         num_v_heads=8,
     )
-    _assert_training_matches_fla(inputs, "grouped_hybrid_c16_c32")
+    _assert_training_matches_fla(inputs, "grouped_c16")
 
 
 @pytest.mark.arch_blackwell
@@ -711,7 +710,7 @@ def test_fallback_ffi_consumes_route_context_without_recompute(
     assert not training_module.backward_calls
 
 
-def test_grouped_hybrid_materializes_both_contexts_during_forward(monkeypatch):
+def test_grouped_c16_materializes_one_context_during_forward(monkeypatch):
     _require_blackwell()
     training_module = _TrainingRecorder()
     monkeypatch.setattr(
@@ -734,23 +733,15 @@ def test_grouped_hybrid_materializes_both_contexts_during_forward(monkeypatch):
         values["initial_state"],
         values["cu_seqlens"],
     )
-    assert context._route.tag == "grouped_hybrid_c16_c32"
-    assert context._parameter_context is not None
-    assert context._parameter_context._route.tag == "grouped_c32"
+    assert context._route.tag == "grouped_c16"
     assert len(training_module.forward_calls) == 1
-    assert len(training_module.c32_forward_calls) == 1
-    assert training_module.c32_forward_calls[0][47] == 0
+    assert not training_module.c32_forward_calls
 
-    gradients = recurrent_kda_training_backward(
-        context, values["do"], values["dfinal_state"]
-    )
+    recurrent_kda_training_backward(context, values["do"], values["dfinal_state"])
     assert len(training_module.backward_calls) == 1
-    assert len(training_module.c32_backward_calls) == 1
-    c32_outputs = training_module.c32_backward_calls[0]
-    assert c32_outputs[43] is gradients[5]
-    assert c32_outputs[44] is gradients[6]
+    assert not training_module.c32_backward_calls
     assert len(training_module.forward_calls) == 1
-    assert len(training_module.c32_forward_calls) == 1
+    assert not training_module.c32_forward_calls
 
 
 def test_training_rejects_cuda_graph_capture_before_ffi(monkeypatch):

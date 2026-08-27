@@ -9,10 +9,8 @@
 """Cold-L2 CUPTI benchmark for the paired recurrent-KDA training API.
 
 The forward timing includes the exact checkpoint-producing route plus the
-full-FP32-state recurrence that produces the public final state. A strict
-grouped low-head route materializes both C16 and C32 contexts in that one
-forward call. The backward timing consumes the saved context and therefore
-excludes forward recomputation.
+full-FP32-state recurrence that produces the public final state. The backward
+timing consumes the saved context and therefore excludes forward recomputation.
 """
 
 import argparse
