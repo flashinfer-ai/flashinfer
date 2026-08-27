@@ -438,6 +438,124 @@ def test_static_workspace_rejects_wrong_type_and_geometry():
 
 
 @cute_dsl_available
+@pytest.mark.parametrize(
+    "field",
+    [
+        "barrier_count",
+        "barrier_epoch",
+        "active_expert_count",
+        "weight_expert_ids",
+        "global_to_local_expert",
+        "compact_topk_ids",
+        "virt_route_scratch",
+        "packed_a_view",
+        "packed_a_flat",
+        "scale_flat",
+        "dm_barrier_count",
+        "dm_barrier_epoch",
+        "dm_intermediate",
+        "dm_input_gs",
+        "dm_down_input_scale",
+    ],
+)
+def test_static_workspace_rejects_incomplete_kernel_tensor_contract(field):
+    """Every fixed-shape tensor consumed by a reachable static path is checked."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    validation_args = dict(
+        state_E=8,
+        weight_E=8,
+        routed_rows=256,
+        k=1536,
+        n=768,
+        num_topk=2,
+        device=torch.device("cpu"),
+        activation_precision="fp4",
+        quant_mode="nvfp4",
+    )
+    workspace = moe_dispatch.allocate_sm120_static_workspace(
+        state_E=8,
+        weight_E=8,
+        max_rows=256,
+        k=1536,
+        n=768,
+        num_topk=2,
+        device=torch.device("cpu"),
+        quant_mode="nvfp4",
+    )
+    value = getattr(workspace, field)
+    assert isinstance(value, torch.Tensor)
+    setattr(workspace, field, value.reshape(-1)[:-1])
+    with pytest.raises(ValueError, match=rf"workspace {field} mismatch"):
+        moe_dispatch._validate_static_workspace_for_launch(workspace, **validation_args)
+
+
+@cute_dsl_available
+def test_static_workspace_rejects_broken_derived_view_aliases():
+    """Shape-compatible replacement views may not point at unrelated storage."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    validation_args = dict(
+        state_E=8,
+        weight_E=8,
+        routed_rows=256,
+        k=256,
+        n=256,
+        num_topk=8,
+        device=torch.device("cpu"),
+        activation_precision="fp4",
+        quant_mode="nvfp4",
+    )
+    for field in ("packed_a_view", "packed_a_flat", "scale_flat"):
+        workspace = moe_dispatch.allocate_sm120_static_workspace(
+            state_E=8,
+            weight_E=8,
+            max_rows=256,
+            k=256,
+            n=256,
+            num_topk=8,
+            device=torch.device("cpu"),
+            quant_mode="nvfp4",
+        )
+        setattr(workspace, field, torch.empty_like(getattr(workspace, field)))
+        with pytest.raises(ValueError, match=rf"{field} must alias"):
+            moe_dispatch._validate_static_workspace_for_launch(
+                workspace, **validation_args
+            )
+
+
+@cute_dsl_available
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_static_workspace_accepts_equivalent_cuda_device_forms():
+    """An index-less CUDA allocation matches its resolved current device."""
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+    current_device = torch.cuda.current_device()
+    workspace = moe_dispatch.allocate_sm120_static_workspace(
+        state_E=8,
+        weight_E=8,
+        max_rows=256,
+        k=256,
+        n=256,
+        num_topk=8,
+        device=torch.device("cuda"),
+        quant_mode="nvfp4",
+    )
+    moe_dispatch._validate_static_workspace_for_launch(
+        workspace,
+        state_E=8,
+        weight_E=8,
+        routed_rows=256,
+        k=256,
+        n=256,
+        num_topk=8,
+        device=torch.device("cuda", current_device),
+        activation_precision="fp4",
+        quant_mode="nvfp4",
+    )
+
+
+@cute_dsl_available
 def test_w4a16_static_cutover_env_override_is_precision_scoped(monkeypatch):
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 

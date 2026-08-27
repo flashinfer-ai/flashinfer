@@ -3238,13 +3238,19 @@ def _validate_static_workspace_for_launch(
         raise ValueError(
             "pre-allocated static workspace must be Sm120StaticMoEWorkspace"
         )
+    expected_device = _canonical_cuda_device(device)
+    try:
+        workspace_device = _canonical_cuda_device(workspace.device)
+    except (RuntimeError, TypeError, ValueError) as error:
+        raise ValueError(
+            f"pre-allocated static workspace device is invalid: {workspace.device!r}."
+        ) from error
     expected_metadata = {
         "state_E": state_E,
         "weight_E": weight_E,
         "k": k,
         "n": n,
         "num_topk": num_topk,
-        "device": torch.device(device),
         "activation_precision": activation_precision,
         "quant_mode": quant_mode,
     }
@@ -3254,6 +3260,11 @@ def _validate_static_workspace_for_launch(
                 f"pre-allocated static workspace {name} mismatch: "
                 f"expected {expected!r}, got {getattr(workspace, name, None)!r}."
             )
+    if workspace_device != expected_device:
+        raise ValueError(
+            f"pre-allocated static workspace device mismatch: expected "
+            f"{expected_device}, got {workspace_device}."
+        )
     if not isinstance(workspace.max_rows, int) or workspace.max_rows < routed_rows:
         raise ValueError(
             "pre-allocated static workspace capacity is too small: "
@@ -3277,22 +3288,74 @@ def _validate_static_workspace_for_launch(
             (virt_E, rows_pad_k, cols_pad_k),
             torch.uint8,
         ),
+        "barrier_count": ((1,), torch.int32),
+        "barrier_epoch": ((1,), torch.int32),
+        "active_expert_count": ((1,), torch.int32),
+        "weight_expert_ids": ((virt_E,), torch.int32),
+        "global_to_local_expert": ((weight_E,), torch.int32),
+        "compact_topk_ids": ((max(state_E, max_rows),), torch.int32),
+        "virt_route_scratch": (
+            (weight_E * (1 + max_chunks) + 8,),
+            torch.int32,
+        ),
         "route_output_scratch": (
             (max_rows, retained_groups, k),
             torch.bfloat16,
         ),
+        "packed_a_view": (
+            (max_rows, k // 2, virt_E),
+            torch.float4_e2m1fn_x2,
+        ),
+        "packed_a_flat": ((virt_E * max_rows * (k // 2),), torch.uint8),
+        "scale_flat": (
+            (virt_E * rows_pad_k * cols_pad_k,),
+            torch.uint8,
+        ),
     }
+    if (
+        quant_mode == "nvfp4"
+        and state_E == weight_E
+        and _direct_micro_candidate(k, n, num_topk, weight_E)
+    ):
+        dm_rows = min(max_rows, _MICRO_MAX_TOKENS * num_topk)
+        dm_slots = dm_rows + _MICRO_MAX_TOKENS * 16
+        fc2_n_chunks = (n // 2 + 127) // 128
+        dm_intermediate = _MICRO_MAX_TOKENS * num_topk * fc2_n_chunks * 128
+        tensors.update(
+            {
+                "dm_barrier_count": ((dm_slots,), torch.int32),
+                "dm_barrier_epoch": ((dm_slots,), torch.int32),
+                "dm_intermediate": ((dm_intermediate,), torch.float32),
+                "dm_input_gs": ((weight_E,), torch.float32),
+                "dm_down_input_scale": ((weight_E,), torch.float32),
+            }
+        )
     for name, (shape, dtype) in tensors.items():
         value = getattr(workspace, name, None)
         if (
             not isinstance(value, torch.Tensor)
             or tuple(value.shape) != shape
             or value.dtype != dtype
-            or value.device != torch.device(device)
+            or _canonical_cuda_device(value.device) != expected_device
+            or value.data_ptr() % 16 != 0
         ):
             raise ValueError(
                 f"pre-allocated static workspace {name} mismatch: expected "
-                f"shape={shape}, dtype={dtype}, device={torch.device(device)}."
+                f"shape={shape}, dtype={dtype}, device={expected_device}, "
+                "and 16-byte alignment."
+            )
+
+    for view_name, storage_name in (
+        ("packed_a_view", "packed_input"),
+        ("packed_a_flat", "packed_input"),
+        ("scale_flat", "packed_input_scale"),
+    ):
+        if (
+            getattr(workspace, view_name).data_ptr()
+            != getattr(workspace, storage_name).data_ptr()
+        ):
+            raise ValueError(
+                f"pre-allocated static workspace {view_name} must alias {storage_name}"
             )
 
     packed = workspace.packed_input
