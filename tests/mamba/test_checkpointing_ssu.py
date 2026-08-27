@@ -16,6 +16,7 @@ from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.mamba.checkpointing_ssu import (
     CheckpointingSSURunner,
     _checkpointing_ssu_tuning_config,
+    _device_tuning_signature,
     _get_checkpointing_ssu_runner,
     _make_tactics,
     allocate_checkpointing_ssu_scratch,
@@ -695,6 +696,7 @@ def test_autotune_runner_key_is_synthesis_invariant():
     runner = _make_autotune_runner(inputs)
     padded_runner = _make_autotune_runner(padded_inputs)
     assert hash(runner) == hash(padded_runner)
+    assert runner.get_cache_key_extras(inputs)[-1] == ("cpu",)
     assert runner.get_cache_key_extras(inputs) == padded_runner.get_cache_key_extras(
         padded_inputs
     )
@@ -708,6 +710,16 @@ def test_autotune_runner_key_is_synthesis_invariant():
         strided_runner.get_cache_key_extras(inputs)
     )
     assert hash(strided_runner) == hash(runner)
+
+
+def test_autotune_device_tuning_signature(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    monkeypatch.setattr(
+        "flashinfer.mamba.checkpointing_ssu._sm_count", lambda device: 132
+    )
+
+    assert _device_tuning_signature(torch.device("cpu")) == ("cpu",)
+    assert _device_tuning_signature(torch.device("cuda", 0)) == ("cuda", 9, 0, 132)
 
 
 def test_autotune_max_batch_populates_dynamic_buckets():

@@ -163,7 +163,7 @@ def allocate_checkpointing_ssu_scratch(
 
 
 def _prepare_checkpointing_ssu_profile_inputs(inputs: list[Any]) -> list[Any]:
-    """Install valid cache indices and a mixed replay history."""
+    """Install valid cache indices and a deterministic mixed replay history."""
     state = inputs[0]  # state
     x = inputs[1]  # x
     x_cache = inputs[7]  # x_cache
@@ -177,6 +177,8 @@ def _prepare_checkpointing_ssu_profile_inputs(inputs: list[Any]) -> list[Any]:
                 state_batch_indices.dtype
             )
         )
+    # Cover several valid ring positions and accepted-token counts without
+    # modelling a workload-specific PNAT distribution.
     slots = torch.arange(state.size(0), device=state.device)
     ring_start.copy_((slots % x_cache.size(2)).to(ring_start.dtype))
     max_window = x_cache.size(2) - x.size(1)
@@ -184,6 +186,13 @@ def _prepare_checkpointing_ssu_profile_inputs(inputs: list[Any]) -> list[Any]:
         ((slots * max_window) % (max_window + 1)).to(prev_num_accepted_tokens.dtype)
     )
     return inputs
+
+
+def _device_tuning_signature(device: torch.device) -> tuple[Any, ...]:
+    """Return hardware properties that affect ReplaySSM tactic performance."""
+    if device.type != "cuda":
+        return (device.type,)
+    return ("cuda", *torch.cuda.get_device_capability(device), _sm_count(device))
 
 
 def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
@@ -379,13 +388,14 @@ class CheckpointingSSURunner(TunableRunner):
         )
 
     def get_cache_key_extras(self, inputs: list[torch.Tensor]) -> tuple[Any, ...]:
-        del inputs
+        device = inputs[1].device  # x
         return (
             self._module_base_args,
             self._dt_softplus,
             self._pad_slot_id,
             self._requested_d_split,
             self._optional_tensor_presence,
+            _device_tuning_signature(device),
         )
 
     def get_tuning_config(self, inputs: list[Any]) -> TuningConfig:
@@ -802,8 +812,9 @@ def checkpointing_ssu(
     algorithm : str
         Kernel selection: ``"auto"`` (default), ``"monolith"``, or ``"two-kernel"``.
         With the scratch trio and no explicit tuning knobs, ``"auto"`` uses
-        FlashInfer's cached autotuner tactic.  Inside an ``autotune(True)``
-        context, it profiles monolithic against every supported combination of
+        FlashInfer's cached autotuner tactic, which may be monolithic or
+        two-kernel. Inside an ``autotune(True)`` context, it profiles monolithic
+        against every supported combination of
         precompute heads/CTA, main pipeline stages, and main CTAs/SM.  Without a
         cached tactic it retains the production fallback: use the split when
         ``batch * nheads >= sm_count`` and otherwise use monolithic.
