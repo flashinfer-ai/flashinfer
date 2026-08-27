@@ -19,6 +19,29 @@ def _backend():
     )
 
 
+class _FakeDescriptorStorage:
+    def __init__(self, device):
+        self.device = device
+        self.copies = []
+
+    def copy_(self, source, *, non_blocking):
+        self.copies.append((source, non_blocking))
+        return self
+
+
+def _mock_descriptor_allocations(monkeypatch, backend):
+    allocations = []
+
+    def allocate(*args, **kwargs):
+        storage = _FakeDescriptorStorage(kwargs["device"])
+        allocations.append((storage, args, kwargs))
+        return storage
+
+    monkeypatch.setattr(backend.torch, "empty", allocate)
+    monkeypatch.setattr(backend.torch.cuda, "stream", lambda stream: nullcontext())
+    return allocations
+
+
 def test_backend_entrypoint_rejects_non_cake_route():
     backend = _backend()
 
@@ -82,6 +105,24 @@ def test_host_launch_consumes_manifest_smem(tmp_path, monkeypatch):
     assert "CAKE_MAIN_SMEM_BYTES" not in rendered
     assert "CAKE_PACKED_QKV_EXPERIMENT_SUPPORTED" not in rendered
     assert source_path.read_bytes().count(b"#define SMEM_TOTAL 197632") == 4
+
+
+def test_host_descriptor_encoder_writes_cpu_staging_only(tmp_path, monkeypatch):
+    backend = _backend()
+    _write_bundle(tmp_path, backend)
+    monkeypatch.setattr(backend, "_source_dir", lambda: tmp_path)
+    _, manifest = backend._program_source("sm_100a")
+
+    rendered = backend._render_host_source("test_module", manifest)
+
+    assert '#include <cstring>' in rendered
+    assert 'host_descriptor_storage must be a CPU tensor' in rendered
+    assert 'host_descriptor_storage must have uint8 dtype' in rendered
+    assert (
+        "std::memcpy(host_descriptor_storage.data_ptr(), maps.data(), sizeof(maps));"
+        in rendered
+    )
+    assert 'cuMemcpyHtoD' not in rendered
 
 
 @pytest.mark.parametrize(
@@ -177,8 +218,9 @@ def test_descriptor_cache_reuses_each_layer_mapping(monkeypatch):
     inp = WeakTensor()
     scratch = object()
     weights = [WeakTensor() for _ in range(80)]
-    allocations = []
     preparations = []
+    main_stream = object()
+    publication_streams = []
     workspace = SimpleNamespace(
         scratch=scratch,
         descriptor_cache=OrderedDict(),
@@ -186,15 +228,18 @@ def test_descriptor_cache_reuses_each_layer_mapping(monkeypatch):
 
     monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: id(tensor))
 
-    def allocate(*args, **kwargs):
-        storage = object()
-        allocations.append((storage, args, kwargs))
-        return storage
-
     def prepare(*args):
         preparations.append(args)
 
-    monkeypatch.setattr(backend.torch, "empty", allocate)
+    allocations = _mock_descriptor_allocations(monkeypatch, backend)
+    monkeypatch.setattr(
+        backend.torch.cuda,
+        "stream",
+        lambda stream: (
+            publication_streams.append(stream),
+            nullcontext(),
+        )[1],
+    )
     module = SimpleNamespace(prepare_descriptors=prepare)
     descriptors = [
         backend._descriptor_storage(
@@ -203,6 +248,7 @@ def test_descriptor_cache_reuses_each_layer_mapping(monkeypatch):
             inp,
             weight,
             device_index=3,
+            main_stream=main_stream,
             world_size=4,
             rows=128,
         )
@@ -215,13 +261,27 @@ def test_descriptor_cache_reuses_each_layer_mapping(monkeypatch):
         inp,
         weights[0],
         device_index=3,
+        main_stream=main_stream,
         world_size=4,
         rows=128,
     )
     assert reused is descriptors[0]
-    assert len(set(descriptors)) == len(allocations) == len(preparations) == 80
+    assert len(set(descriptors)) == len(preparations) == 80
+    assert len(allocations) == 160
     assert len(workspace.descriptor_cache) == 80
     assert all(len(args) == 6 for args in preparations)
+    assert all(args[3].device == "cpu" for args in preparations)
+    assert all(args[3].copies == [] for args in preparations)
+    assert publication_streams == [main_stream] * 80
+    assert all(
+        kwargs["device"] == "cpu" and kwargs["pin_memory"] is True
+        for _, _, kwargs in allocations[::2]
+    )
+    assert all(kwargs["device"] == 3 for _, _, kwargs in allocations[1::2])
+    assert all(
+        descriptor.copies == [(preparation[3], True)]
+        for descriptor, preparation in zip(descriptors, preparations)
+    )
 
 
 def test_descriptor_cache_is_bounded_lru(monkeypatch):
@@ -240,15 +300,9 @@ def test_descriptor_cache_is_bounded_lru(monkeypatch):
     monkeypatch.setattr(
         backend, "_tensor_fingerprint", lambda tensor: tensor.fingerprint
     )
-    allocations = []
     preparations = []
-
-    def allocate(*args, **kwargs):
-        descriptor = object()
-        allocations.append(descriptor)
-        return descriptor
-
-    monkeypatch.setattr(backend.torch, "empty", allocate)
+    main_stream = object()
+    allocations = _mock_descriptor_allocations(monkeypatch, backend)
     monkeypatch.setattr(backend, "_DESCRIPTOR_CACHE_MAX_ENTRIES", 2)
     module = SimpleNamespace(
         prepare_descriptors=lambda *args: preparations.append(args)
@@ -260,6 +314,7 @@ def test_descriptor_cache_is_bounded_lru(monkeypatch):
             inp,
             weight,
             device_index=0,
+            main_stream=main_stream,
             world_size=2,
             rows=128,
         )
@@ -272,6 +327,7 @@ def test_descriptor_cache_is_bounded_lru(monkeypatch):
             inp,
             weights[0],
             device_index=0,
+            main_stream=main_stream,
             world_size=2,
             rows=128,
         )
@@ -283,6 +339,7 @@ def test_descriptor_cache_is_bounded_lru(monkeypatch):
         inp,
         weights[2],
         device_index=0,
+        main_stream=main_stream,
         world_size=2,
         rows=128,
     )
@@ -299,13 +356,15 @@ def test_descriptor_cache_is_bounded_lru(monkeypatch):
             inp,
             weights[0],
             device_index=0,
+            main_stream=main_stream,
             world_size=2,
             rows=128,
         )
         is descriptors[0]
     )
     assert third is not descriptors[0]
-    assert len(allocations) == len(preparations) == 3
+    assert len(allocations) == 6
+    assert len(preparations) == 3
 
 
 def test_descriptor_cache_reuses_recycled_fingerprint(monkeypatch):
@@ -325,15 +384,9 @@ def test_descriptor_cache_reuses_recycled_fingerprint(monkeypatch):
     monkeypatch.setattr(
         backend, "_tensor_fingerprint", lambda tensor: tensor.fingerprint
     )
-    allocations = []
     preparations = []
-
-    def allocate(*args, **kwargs):
-        descriptor = object()
-        allocations.append(descriptor)
-        return descriptor
-
-    monkeypatch.setattr(backend.torch, "empty", allocate)
+    main_stream = object()
+    allocations = _mock_descriptor_allocations(monkeypatch, backend)
     module = SimpleNamespace(
         prepare_descriptors=lambda *args: preparations.append(args)
     )
@@ -343,6 +396,7 @@ def test_descriptor_cache_reuses_recycled_fingerprint(monkeypatch):
         first,
         weight,
         device_index=0,
+        main_stream=main_stream,
         world_size=2,
         rows=128,
     )
@@ -354,19 +408,21 @@ def test_descriptor_cache_reuses_recycled_fingerprint(monkeypatch):
             replacement,
             weight,
             device_index=0,
+            main_stream=main_stream,
             world_size=2,
             rows=128,
         )
         is descriptors
     )
-    assert len(allocations) == len(preparations) == 1
+    assert len(allocations) == 2
+    assert len(preparations) == 1
 
 
 def test_descriptor_prepare_failure_does_not_install_cache_entry(monkeypatch):
     backend = _backend()
     workspace = SimpleNamespace(scratch="scratch", descriptor_cache=OrderedDict())
     monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: tensor)
-    monkeypatch.setattr(backend.torch, "empty", lambda *args, **kwargs: object())
+    _mock_descriptor_allocations(monkeypatch, backend)
 
     def prepare(*args):
         raise RuntimeError("prepare failed")
@@ -380,6 +436,7 @@ def test_descriptor_prepare_failure_does_not_install_cache_entry(monkeypatch):
             "input",
             "weight",
             device_index=0,
+            main_stream=object(),
             world_size=2,
             rows=128,
         )
@@ -391,19 +448,14 @@ def test_concurrent_descriptor_prepare_returns_one_cached_entry(monkeypatch):
     backend = _backend()
     workspace = SimpleNamespace(scratch="scratch", descriptor_cache=OrderedDict())
     monkeypatch.setattr(backend, "_tensor_fingerprint", lambda tensor: tensor)
-    allocations = []
     preparations = []
     call_barrier = Barrier(2, timeout=30)
-
-    def allocate(*args, **kwargs):
-        descriptor = object()
-        allocations.append(descriptor)
-        return descriptor
+    main_stream = object()
 
     def prepare(*args):
         preparations.append(args)
 
-    monkeypatch.setattr(backend.torch, "empty", allocate)
+    allocations = _mock_descriptor_allocations(monkeypatch, backend)
     module = SimpleNamespace(prepare_descriptors=prepare)
 
     def resolve():
@@ -414,6 +466,7 @@ def test_concurrent_descriptor_prepare_returns_one_cached_entry(monkeypatch):
             "input",
             "weight",
             device_index=0,
+            main_stream=main_stream,
             world_size=2,
             rows=128,
         )
@@ -423,7 +476,7 @@ def test_concurrent_descriptor_prepare_returns_one_cached_entry(monkeypatch):
 
     assert results[0] is results[1]
     assert len(workspace.descriptor_cache) == 1
-    assert len(allocations) == len(preparations)
+    assert len(allocations) == 2 * len(preparations)
     assert len(preparations) in (1, 2)
 
 

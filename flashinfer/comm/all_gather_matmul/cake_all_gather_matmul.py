@@ -95,6 +95,7 @@ _HOST_SOURCE = r"""
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 
 TVM_FFI_EMBED_CUBIN(CAKE_MODULE_IDENT);
 
@@ -114,6 +115,11 @@ static_assert(sizeof(CUtensorMap) == 128);
 inline void CheckCudaTensor(const TensorView& tensor, const char* name) {
   TVM_FFI_CHECK(tensor.device().device_type == kDLCUDA, ValueError)
       << name << " must be a CUDA tensor";
+}
+
+inline void CheckCpuTensor(const TensorView& tensor, const char* name) {
+  TVM_FFI_CHECK(tensor.device().device_type == kDLCPU, ValueError)
+      << name << " must be a CPU tensor";
 }
 
 inline void CheckContiguous(const TensorView& tensor, const char* name) {
@@ -232,35 +238,27 @@ inline CUtensorMap EncodeWeightMap(const TensorView& weight) {
 }
 
 void PrepareDescriptors(TensorView inp, TensorView scratch, TensorView weight,
-                        TensorView descriptor_storage,
+                        TensorView host_descriptor_storage,
                         int64_t world_size, int64_t rows) {
   CheckDescriptorInputs(inp, scratch, weight, world_size, rows);
-  CheckCudaTensor(descriptor_storage, "descriptor_storage");
-  CheckSameDevice(descriptor_storage, inp, "descriptor_storage");
-  CheckContiguous(descriptor_storage, "descriptor_storage");
-  const DLDataType storage_dtype = descriptor_storage.dtype();
+  CheckCpuTensor(host_descriptor_storage, "host_descriptor_storage");
+  CheckContiguous(host_descriptor_storage, "host_descriptor_storage");
+  const DLDataType storage_dtype = host_descriptor_storage.dtype();
   TVM_FFI_CHECK(storage_dtype.code == kDLUInt && storage_dtype.bits == 8 &&
                     storage_dtype.lanes == 1,
                 TypeError)
-      << "descriptor_storage must have uint8 dtype";
-  TVM_FFI_CHECK(descriptor_storage.numel() >= kDescriptorCount * kTensorMapBytes,
+      << "host_descriptor_storage must have uint8 dtype";
+  TVM_FFI_CHECK(host_descriptor_storage.numel() >=
+                    kDescriptorCount * kTensorMapBytes,
                 ValueError)
-      << "descriptor_storage is too small";
-  TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(descriptor_storage.data_ptr()) % 128 == 0,
-                ValueError)
-      << "descriptor_storage must be 128-byte aligned";
+      << "host_descriptor_storage is too small";
 
   const std::array<CUtensorMap, kDescriptorCount> maps = {
       EncodeActivationMap(inp, rows, "inp"),
       EncodeActivationMap(scratch, world_size * rows, "scratch"),
       EncodeWeightMap(weight),
   };
-  const CUresult result = cuMemcpyHtoD(
-      reinterpret_cast<CUdeviceptr>(descriptor_storage.data_ptr()), maps.data(),
-      sizeof(maps));
-  TVM_FFI_CHECK(result == CUDA_SUCCESS, RuntimeError)
-      << "cuMemcpyHtoD failed while publishing tensor maps with CUresult="
-      << static_cast<int>(result);
+  std::memcpy(host_descriptor_storage.data_ptr(), maps.data(), sizeof(maps));
 }
 
 inline tvm::ffi::CubinKernel& BarrierKernel(int64_t world_size, int64_t phase) {
@@ -753,6 +751,7 @@ def _descriptor_storage(
     w: torch.Tensor,
     *,
     device_index: int,
+    main_stream: torch.cuda.Stream,
     world_size: int,
     rows: int,
 ) -> torch.Tensor:
@@ -766,6 +765,12 @@ def _descriptor_storage(
         if descriptors is not None:
             workspace.descriptor_cache.move_to_end(fingerprint)
             return descriptors
+    host_descriptors = torch.empty(
+        _DESCRIPTOR_COUNT * _TENSOR_MAP_BYTES,
+        dtype=torch.uint8,
+        device="cpu",
+        pin_memory=True,
+    )
     descriptors = torch.empty(
         _DESCRIPTOR_COUNT * _TENSOR_MAP_BYTES,
         dtype=torch.uint8,
@@ -775,10 +780,12 @@ def _descriptor_storage(
         inp,
         workspace.scratch,
         w,
-        descriptors,
+        host_descriptors,
         world_size,
         rows,
     )
+    with torch.cuda.stream(main_stream):
+        descriptors.copy_(host_descriptors, non_blocking=True)
     with _CACHE_LOCK:
         cached = workspace.descriptor_cache.get(fingerprint)
         if cached is not None:
@@ -862,6 +869,7 @@ def _run_cake_validated(
                 inp,
                 w,
                 device_index=device_index,
+                main_stream=main_stream,
                 world_size=world_size,
                 rows=rows,
             )

@@ -77,6 +77,10 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
     owner_stream.wait_stream(producer_stream)
     with torch.cuda.stream(owner_stream):
         ordinary = all_gather_matmul(inp, weight, group, backend="cake")
+    pinned_descriptor_churn = [
+        torch.empty(384, dtype=torch.uint8, device="cpu", pin_memory=True).fill_(index)
+        for index in range(32)
+    ]
     torch.cuda.current_stream(device).wait_stream(owner_stream)
     torch.testing.assert_close(ordinary, expected, atol=1e-2, rtol=1e-2)
 
@@ -151,6 +155,7 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
         replacement_inp,
         replacement_weight,
         descriptor_churn,
+        pinned_descriptor_churn,
     )
     gc.collect()
 
