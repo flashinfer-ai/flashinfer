@@ -210,6 +210,11 @@ class _RecurrentKDAPrefillWorkspaceBase:
         #: so nothing serializes the launch sequence, device memory doubles,
         #: and a capture is recorded where no one will look for it.
         self._sm120_state_lock = threading.Lock()
+        # The VibeCUDA backend's per-workspace state, created on first use by
+        # ``flashinfer.kda_vibecuda`` with the same composition pattern as the
+        # ``_sm120_state`` above.
+        self._vibecuda_state: Optional[object] = None
+        self._vibecuda_state_lock = threading.Lock()
 
 
 class RecurrentKDAPrefillWorkspace(_RecurrentKDAPrefillWorkspaceBase):

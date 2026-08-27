@@ -25,8 +25,11 @@ The FlashInfer candidate is always invoked through the public
 device/shape policy, while ``nonpersistent`` supplies the same explicit
 workspace and packed sequence order used by the historical benchmark to keep
 B200 on the direct schedule family. ``--backend`` selects one public API
-backend per invocation; compare auto, CuTe DSL, and Cake with separate commands
-over the same case set. The resolved backend, logical schedule, physical module
+backend per invocation; compare auto, CuTe DSL, Cake, and VibeCUDA with
+separate commands over the same case set. The compare-to-SOTA mode measures
+VibeCUDA and Cake in one process with identical inputs and timing policy,
+checks output and in-place final-state equality, and reports per-shape and
+aggregate speedups. The resolved backend, logical schedule, physical module
 variants, and target are recorded during untimed warmup. With
 ``--flash-kda-peer``, two commit-verified MoonshotAI/FlashKDA measurements are
 reported:
@@ -616,6 +619,11 @@ def _make_case(
             resolved_target,
             resolved_physical_variants,
         ) = _resolve_recorded_cake_route(resolved_cake_routes)
+    elif candidate_backend == "vibecuda":
+        resolved_backend = "vibecuda"
+        resolved_variant = "vibecuda_dispatch"
+        resolved_target = SUPPORTED_FLASH_KDA_ARCHS[get_compute_capability(q.device)]
+        resolved_physical_variants = [resolved_variant]
     else:
         raise RuntimeError(
             "expected one recurrent-KDA prefill route during warmup, got "
@@ -716,6 +724,15 @@ def _measure(
     return float(np.median(samples_ms)), samples_ms
 
 
+def _aggregate_speedups(values: list[float]) -> dict[str, float | int]:
+    return {
+        "workloads": len(values),
+        "arithmetic_mean_speedup": float(np.mean(values)),
+        "geometric_mean_speedup": float(np.exp(np.mean(np.log(np.asarray(values))))),
+        "minimum_speedup": float(min(values)),
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run-iters", type=int, default=20)
@@ -751,11 +768,19 @@ def main() -> None:
     )
     parser.add_argument(
         "--backend",
-        choices=("auto", "cute-dsl", "cake"),
+        choices=("auto", "cute-dsl", "cake", "vibecuda"),
         default="auto",
         help=(
             "Select one backend for this invocation of the public recurrent_kda "
             "API; run separate commands to compare backends."
+        ),
+    )
+    parser.add_argument(
+        "--compare-to-sota",
+        action="store_true",
+        help=(
+            "Compare backend='vibecuda' with backend='cake' using identical "
+            "inputs, rotating state pools, and CUPTI iteration counts."
         ),
     )
     parser.add_argument(
@@ -790,6 +815,8 @@ def main() -> None:
         parser.error(
             "--flash-kda-peer and --flash-kda-source-dir must be provided together"
         )
+    if args.compare_to_sota and args.flash_kda_peer:
+        parser.error("--compare-to-sota is incompatible with --flash-kda-peer")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     device = torch.device("cuda")
@@ -858,11 +885,72 @@ def main() -> None:
             case,
             state_rotations=state_rotations,
             candidate_route=args.candidate_route,
-            candidate_backend=args.backend,
+            candidate_backend="vibecuda" if args.compare_to_sota else args.backend,
             flash_kda=flash_kda,
         )
+        sota_prepared = None
+        if args.compare_to_sota:
+            sota_prepared = _make_case(
+                case,
+                state_rotations=state_rotations,
+                candidate_route=args.candidate_route,
+                candidate_backend="cake",
+            )
         result = {**prepared.metadata, "hardware": hardware}
-        if prepared.peer_raw_run is None:
+        if sota_prepared is not None:
+            for item in (sota_prepared, prepared):
+                item.reset_state_pools()
+                item.candidate_run()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                prepared.candidate_output,
+                sota_prepared.candidate_output,
+                atol=1e-2,
+                rtol=1e-2,
+            )
+            torch.testing.assert_close(
+                prepared.candidate_state_pool[0],
+                sota_prepared.candidate_state_pool[0],
+                atol=1e-2,
+                rtol=1e-2,
+            )
+            block_medians = {"cake": [], "vibecuda": []}
+            block_samples = {"cake": [], "vibecuda": []}
+            for backend, item in (
+                ("cake", sota_prepared),
+                ("vibecuda", prepared),
+                ("vibecuda", prepared),
+                ("cake", sota_prepared),
+            ):
+                item.reset_state_pools()
+                torch.cuda.synchronize()
+                median_ms, samples_ms = _measure(
+                    item.candidate_run,
+                    dry_run_iters=dry_run_iters,
+                    repeat_iters=repeat_iters,
+                )
+                block_medians[backend].append(median_ms)
+                block_samples[backend].extend(samples_ms)
+            candidate_block_medians = block_medians["vibecuda"]
+            candidate_samples = block_samples["vibecuda"]
+            candidate_ms = float(np.median(candidate_block_medians))
+            sota_ms = float(np.median(block_medians["cake"]))
+            result.update(
+                {
+                    "correctness_sota": "passed",
+                    "sota_backend": "cake",
+                    "sota_variant": sota_prepared.metadata["variant"],
+                    "sota_physical_variants": sota_prepared.metadata[
+                        "physical_variants"
+                    ],
+                    "sota_median_ms": sota_ms,
+                    "sota_samples_ms": block_samples["cake"],
+                    "sota_block_medians_ms": block_medians["cake"],
+                    "speedup_vs_sota": sota_ms / candidate_ms,
+                    "pair_order": "cake/vibecuda/vibecuda/cake",
+                }
+            )
+        elif prepared.peer_raw_run is None:
             prepared.reset_state_pools()
             prepared.candidate_run()
             torch.cuda.synchronize()
@@ -973,7 +1061,14 @@ def main() -> None:
             }
         )
         results.append(result)
-        if prepared.peer_raw_run is None:
+        if sota_prepared is not None:
+            print(
+                f"{result['name']:<28} CAKE "
+                f"{result['sota_median_ms'] * 1000.0:10.3f} us  "
+                f"VibeCUDA {result['median_us']:10.3f} us  "
+                f"{result['speedup_vs_sota']:.4f}x"
+            )
+        elif prepared.peer_raw_run is None:
             print(
                 f"{result['name']:<18} {result['resolved_backend']:<8} "
                 f"{result['variant']:<10} "
@@ -990,7 +1085,19 @@ def main() -> None:
                 f"{result['speedup_vs_flash_kda_peer_adapted']:.4f}x"
             )
         del prepared
+        del sota_prepared
         torch.cuda.empty_cache()
+
+    if args.compare_to_sota:
+        speedups = [result["speedup_vs_sota"] for result in results]
+        aggregate = _aggregate_speedups(speedups)
+        results.append({"aggregate_speedups_vs_sota": aggregate})
+        print(
+            f"all cases ({aggregate['workloads']} workloads): arithmetic mean "
+            f"{aggregate['arithmetic_mean_speedup']:.4f}x, geometric mean "
+            f"{aggregate['geometric_mean_speedup']:.4f}x, minimum "
+            f"{aggregate['minimum_speedup']:.4f}x"
+        )
 
     if args.json is not None:
         args.json.write_text(json.dumps(results, indent=2) + "\n")

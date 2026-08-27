@@ -32,6 +32,7 @@ import torch
 from . import kda_decode as _kda_decode
 from . import kda_prefill as _kda_prefill
 from . import kda_prefill_cute as _kda_prefill_cute
+from . import kda_vibecuda as _kda_vibecuda
 from .api_logging import flashinfer_api
 from .kda_backward import (
     RecurrentKDABackwardWorkspace as RecurrentKDABackwardWorkspace,
@@ -79,7 +80,7 @@ def recurrent_kda(
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
     *,
-    backend: Literal["auto", "cute-dsl", "cake"] = "auto",
+    backend: Literal["auto", "cute-dsl", "cake", "vibecuda"] = "auto",
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -252,9 +253,9 @@ def recurrent_kda(
         prefill_workspace, _kda_prefill.RecurrentKDAPrefillWorkspace
     ):
         raise TypeError("prefill_workspace must be a RecurrentKDAPrefillWorkspace")
-    if backend not in ("auto", "cute-dsl", "cake"):
+    if backend not in ("auto", "cute-dsl", "cake", "vibecuda"):
         raise ValueError(
-            f"backend must be 'auto', 'cute-dsl', or 'cake', got {backend!r}"
+            f"backend must be 'auto', 'cute-dsl', 'cake', or 'vibecuda', got {backend!r}"
         )
 
     # SM120 is an architecture-specific CuTe DSL implementation. Try it before
@@ -325,6 +326,70 @@ def recurrent_kda(
     is_plain_prefill = _kda_prefill._is_plain_multi_token_prefill(
         q, cu_seqlens, num_spec_tokens
     )
+    if backend == "vibecuda":
+        if not is_plain_prefill:
+            raise ValueError(
+                "backend='vibecuda' does not support this recurrent_kda "
+                "prefill contract"
+            )
+        if q.is_cuda and get_compute_capability(q.device) not in (
+            (10, 0),
+            (10, 3),
+        ):
+            raise RuntimeError(
+                "backend='vibecuda' recurrent-KDA prefill requires compute "
+                "capability 10.0 (SM100; B200/GB200) or 10.3 (SM103a; "
+                f"B300/GB300); got {get_compute_capability(q.device)[0]}."
+                f"{get_compute_capability(q.device)[1]}"
+            )
+        if not _kda_vibecuda._vibecuda_kda_prefill_is_eligible(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            initial_state=initial_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            num_accepted_tokens=num_accepted_tokens,
+            output=output,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        ):
+            raise ValueError(
+                "backend='vibecuda' does not support this recurrent_kda "
+                "prefill contract"
+            )
+        assert A_log is not None
+        assert dt_bias is not None
+        assert lower_bound is not None
+        return _kda_vibecuda._run_vibecuda_kda_prefill(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            seq_order=seq_order,
+            prefill_workspace=prefill_workspace,
+        )
     try_cute_dsl_prefill = backend in ("auto", "cute-dsl")
     if try_cute_dsl_prefill and is_plain_prefill:
         cute_dsl_eligible = _kda_prefill_cute._is_cute_dsl_kda_prefill_eligible(

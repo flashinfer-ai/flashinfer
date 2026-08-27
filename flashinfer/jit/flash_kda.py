@@ -344,6 +344,82 @@ def load_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget):
     return module
 
 
+# VibeCUDA FlashKDA prefill module: one .so holding the whole VibeCUDA
+# prefill kernel family (union M128, slab M128, M64, persistent M128, plus
+# the TVM-FFI export TU exposing run_m128 / run_m128_split / run_m64 /
+# run_persistent_m128 / sort_seqs_into). The four binding TUs define
+# distinct raw-pointer launchers in the kda_flash / kda_flash_slab
+# namespaces, so they link together in a single module.
+_VIBECUDA_FLASH_KDA_MODULE_IDENT = "51f6c68ed0"
+
+
+def get_vibecuda_flash_kda_uri(target: FlashKDATarget) -> str:
+    """Return the target-specific JIT/AOT key for the VibeCUDA module."""
+
+    if target not in _FLASH_KDA_NVCC_FLAGS:
+        raise ValueError(f"unsupported FlashKDA target: {target}")
+    return f"vibecuda_flash_kda_bf16_{_VIBECUDA_FLASH_KDA_MODULE_IDENT}_{target}"
+
+
+@functools.cache
+def gen_vibecuda_flash_kda_module(target: FlashKDATarget) -> JitSpec:
+    """Generate the VibeCUDA FlashKDA prefill JIT module.
+
+    The kernel sources keep the generated standalone structure of the frozen
+    schedules, so the module builds with the same SM100-family NVCC flags.
+    The defines reproduce the measured default build: ``KDA_DTB_HOIST``
+    (dt_bias register hoist) and ``KDA_F32X2`` (packed f32x2 prep math) are
+    the two measured-on generated-code switches; the half/bfloat conversion
+    undefs match the generated kernels' arithmetic expectations.
+    """
+
+    csrc_dir = _get_flash_kda_csrc_dir()
+    include_dir = _get_flash_kda_include_dir()
+    uri = get_vibecuda_flash_kda_uri(target)
+    sources = [
+        csrc_dir / "vibecuda_flashkda_binding.cu",
+        csrc_dir / "vibecuda_flashkda_bf16_fused_m128_binding.cu",
+        csrc_dir / "vibecuda_flashkda_bf16_fused_m128_slab_binding.cu",
+        csrc_dir / "vibecuda_flashkda_bf16_fused_m64_binding.cu",
+        csrc_dir / "vibecuda_flashkda_bf16_persistent_m128_binding.cu",
+    ]
+    for source in sources:
+        if not source.exists():
+            raise FileNotFoundError(f"VibeCUDA FlashKDA source not found: {source}")
+
+    spec = gen_jit_spec(
+        name=uri,
+        sources=sources,
+        extra_cuda_cflags=[
+            *_FLASH_KDA_NVCC_FLAGS[target],
+            _FLASH_KDA_TARGET_DEFINE[target],
+            "--extra-device-vectorization",
+            "-DKDA_DTB_HOIST",
+            "-DKDA_F32X2",
+            "-U__CUDA_NO_HALF_OPERATORS__",
+            "-U__CUDA_NO_HALF_CONVERSIONS__",
+            "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
+            "-U__CUDA_NO_HALF2_OPERATORS__",
+        ],
+        extra_include_paths=[
+            csrc_dir,
+            csrc_dir.parent,
+            include_dir,
+        ],
+    )
+    logger.info(f"Generated VibeCUDA FlashKDA {target} JIT spec: {spec.name}")
+    return spec
+
+
+@functools.cache
+def load_vibecuda_flash_kda_module(target: FlashKDATarget):
+    """Build or load the VibeCUDA FlashKDA prefill module."""
+
+    module = gen_vibecuda_flash_kda_module(target).build_and_load()
+    logger.info(f"Loaded VibeCUDA FlashKDA {target} module")
+    return module
+
+
 def load_flash_kda_m64_module(target: FlashKDATarget):
     """Load the fixed N=1, H=64 two-CTA M64 module."""
 
@@ -456,8 +532,10 @@ __all__ = [
     "gen_flash_kda_persistent_m128_module",
     "gen_flash_kda_small_bh_m128_module",
     "gen_flash_kda_module",
+    "gen_vibecuda_flash_kda_module",
     "get_flash_kda_prefill_module",
     "get_flash_kda_uri",
+    "get_vibecuda_flash_kda_uri",
     "load_flash_kda_m64_module",
     "load_flash_kda_m128_module",
     "load_flash_kda_m128_tensor_state_decay_module",
@@ -475,4 +553,5 @@ __all__ = [
     "load_flash_kda_bt16_prepare_beta_tma_module",
     "load_flash_kda_bt16_prepare_module",
     "load_flash_kda_module",
+    "load_vibecuda_flash_kda_module",
 ]
