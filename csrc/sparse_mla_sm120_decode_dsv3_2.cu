@@ -38,7 +38,7 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
                                       int chunks_per_block_override, float sm_scale,
                                       size_t stride_kv_block, cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
-  static_assert(KV::D_QK == 576);
+  static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   constexpr int H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
 
   // Dynamic smem layout (must match decode_dsv3_2_kernel.cuh exactly).
@@ -139,13 +139,15 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
         Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink,       \
         num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, stream); \
   }
-#define DSV3_2_DISPATCH(H, K)                      \
-  do {                                             \
-    if (mt == ModelType::DSV3_2) {                 \
-      DSV3_2_DISPATCH_MT(ModelType::DSV3_2, H, K)  \
-    } else if (mt == ModelType::GLM_NSA) {         \
-      DSV3_2_DISPATCH_MT(ModelType::GLM_NSA, H, K) \
-    }                                              \
+#define DSV3_2_DISPATCH(H, K)                         \
+  do {                                                \
+    if (mt == ModelType::DSV3_2) {                    \
+      DSV3_2_DISPATCH_MT(ModelType::DSV3_2, H, K)     \
+    } else if (mt == ModelType::GLM_NSA) {            \
+      DSV3_2_DISPATCH_MT(ModelType::GLM_NSA, H, K)    \
+    } else if (mt == ModelType::GLM53_NOPE) {         \
+      DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, H, K) \
+    }                                                 \
   } while (0);
   DSV3_2_DISPATCH(8, 128)
   DSV3_2_DISPATCH(8, 512)
@@ -167,6 +169,11 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
   DSV3_2_DISPATCH(128, 512)
   DSV3_2_DISPATCH(128, 1024)
   DSV3_2_DISPATCH(128, 2048)
+  // GLM-5.3 combines its 2048 sparse selection with the 128-token
+  // indexer window. Keep this instantiation model-specific.
+  if (mt == ModelType::GLM53_NOPE) {
+    DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, 32, 2176)
+  }
 #undef DSV3_2_DISPATCH
 #undef DSV3_2_DISPATCH_MT
   return false;

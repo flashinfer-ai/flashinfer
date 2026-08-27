@@ -50,8 +50,9 @@ constexpr int DSV3_2_KV_BUF_COUNT = 2;
 constexpr int DSV3_2_ENTRIES_PER_WARP = DSV3_2_BI / DSV3_2_N_WARPS;  // 8
 constexpr int DSV3_2_QK_N_TILES = DSV3_2_ENTRIES_PER_WARP / 8;       // 1
 
+template <ModelType MT>
 struct DecodeDsv3_2Smem {
-  using KV = KVCacheTraits<ModelType::DSV3_2>;
+  using KV = KVCacheTraits<MT>;
 
   static constexpr int N_V_CHUNKS = KV::D_NOPE / KV::QUANT_TILE;
   static constexpr size_t SMEM_Q_ROPE = HPB * KV::D_ROPE * sizeof(bf16);
@@ -126,7 +127,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     const int* __restrict__ topk_length_ptr,  // [num_tokens] or null
     int num_tokens, int num_splits, int chunks_per_block, float sm_scale, size_t stride_kv_block) {
   using KV = KVCacheTraits<MT>;
-  static_assert(KV::D_QK == 576);
+  static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   constexpr int D_NOPE = KV::D_NOPE;                                // 512
   constexpr int D_ROPE_C = KV::D_ROPE;                              // 64
   constexpr int D_QK = KV::D_QK;                                    // 576
@@ -200,7 +201,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   // D_NOPE 512 + SCALE_BYTES_PER_TOKEN 16), so the QK / XV stages read
   // scales directly out of sm_kv_fp8.
   extern __shared__ __align__(16) char smem_raw[];
-  auto sm = DecodeDsv3_2Smem::init(smem_raw);
+  auto sm = DecodeDsv3_2Smem<MT>::init(smem_raw);
 
   __shared__ bf16 sm_p_full[HPB][DSV3_2_BI];  // 2 KB static
   const int32_t* idx_base = indices + (size_t)t_idx * TOPK;
@@ -249,8 +250,10 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
       cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
                         V2_BULK_NOPESC_BYTES, sm.mbar_full(buf));
       // Bulk 2: RoPE (128 B) → sm_kv_rope slot.
-      cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C, data_base + KV_ROPE_OFFSET,
-                        V2_BULK_ROPE_BYTES, sm.mbar_full(buf));
+      if constexpr (D_ROPE_C > 0) {
+        cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C, data_base + KV_ROPE_OFFSET,
+                          V2_BULK_ROPE_BYTES, sm.mbar_full(buf));
+      }
     }
   };
 
