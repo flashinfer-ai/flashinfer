@@ -31,7 +31,7 @@ FlashKDATrainingTarget = Literal["sm100a", "sm103a"]
 
 # First ten hex digits of SHA256 over the target's complete source list and the
 # shared binding header, separated by NUL bytes without a trailing separator.
-_FLASH_KDA_TRAINING_MODULE_IDENT = "668d5e5f0d"
+_FLASH_KDA_TRAINING_MODULE_IDENT = "6d85119ef7"
 _TARGET_FLAGS: dict[FlashKDATrainingTarget, list[str]] = {
     "sm100a": sm100a_nvcc_flags,
     "sm103a": sm103a_nvcc_flags,
@@ -66,14 +66,29 @@ def get_flash_kda_training_uri(target: FlashKDATrainingTarget) -> str:
 @functools.cache
 def gen_flash_kda_training_module(target: FlashKDATrainingTarget) -> JitSpec:
     csrc_dir = _get_csrc_dir()
+    export_dir = csrc_dir / "cake_training_export"
     legacy_binding = csrc_dir / "flashkda_training_forward_v483_binding.cu"
     paired_binding = csrc_dir / "flashkda_training_paired_binding.cu"
     fallback_binding = csrc_dir / "flashkda_training_fallback_binding.cu"
-    c16 = csrc_dir / "flashkda_training_c16.cu"
-    auxiliary = csrc_dir / "flashkda_training_aux.cu"
-    final_state = csrc_dir / "flashkda_training_final_state.cu"
+    c16 = export_dir / "cake_flashkda_training_c16.cu"
+    aligned_c16_forward = (
+        export_dir / "cake_flashkda_training_c16_aligned_forward.cu"
+    )
+    aligned_c16_backward = (
+        export_dir / "cake_flashkda_training_c16_aligned_backward.cu"
+    )
+    aligned_c16_param_reduce = (
+        export_dir / "cake_flashkda_training_c16_aligned_param_reduce.cu"
+    )
+    auxiliary = export_dir / "cake_flashkda_training_aux.cu"
+    final_state = export_dir / "cake_flashkda_training_final_state.cu"
     fallback = (
-        csrc_dir / f"training_fallback_pointer_{target.replace('sm', 'sm_', 1)}.cu"
+        export_dir
+        / f"cake_training_fallback_pointer_{target.replace('sm', 'sm_', 1)}.cu"
+    )
+    grouped_row = (
+        export_dir
+        / f"cake_training_grouped_row_wg8_pointer_{target.replace('sm', 'sm_', 1)}.cu"
     )
     common = csrc_dir / "flashkda_binding_common.cuh"
     sources = [
@@ -81,9 +96,13 @@ def gen_flash_kda_training_module(target: FlashKDATrainingTarget) -> JitSpec:
         paired_binding,
         fallback_binding,
         c16,
+        aligned_c16_forward,
+        aligned_c16_backward,
+        aligned_c16_param_reduce,
         auxiliary,
         final_state,
         fallback,
+        grouped_row,
     ]
     for source in (*sources, common):
         if not source.exists():
@@ -95,7 +114,7 @@ def gen_flash_kda_training_module(target: FlashKDATrainingTarget) -> JitSpec:
             *_TARGET_FLAGS[target],
             f"-DFLASHINFER_FLASH_KDA_TARGET_MINOR={0 if target == 'sm100a' else 3}",
         ],
-        extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
+        extra_include_paths=[export_dir, csrc_dir, csrc_dir.parent, _get_include_dir()],
     )
     logger.info(f"Generated FlashKDA training {target} JIT spec: {spec.name}")
     return spec
