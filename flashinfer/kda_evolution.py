@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import heapq
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 
@@ -137,7 +138,7 @@ def _route(
             f"fixed_layout={fixed_layout}"
         )
     return _Route(
-        variant=variant,
+        variant=cast(FlashKDAEvolutionVariant, variant),
         grid_x=grid_x,
         tile_schedule=tile_schedule,
         tile_schedule_counts=tile_schedule_counts,
@@ -179,7 +180,7 @@ class PreparedFlashKDAEvolution:
         else:
             offsets = tuple(int(value) for value in cu_seqlens.tolist())
         sequence_lengths = tuple(
-            end - start for start, end in zip(offsets, offsets[1:])
+            end - start for start, end in zip(offsets, offsets[1:], strict=False)
         )
         route = _route(sequence_lengths, num_heads, fixed_layout)
         seq_order = torch.tensor(
