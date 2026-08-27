@@ -543,6 +543,7 @@ def gen_jit_spec(
         *get_nvcc_parallelism_flags(),
         "-use_fast_math",
         "-Xfatbin=-compress-all",  # Ensure all device binaries are compressed
+        "--compress-mode=size",
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
         "-DFLASHINFER_ENABLE_FP8_E4M3",

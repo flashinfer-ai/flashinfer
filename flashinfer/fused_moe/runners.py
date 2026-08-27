@@ -23,15 +23,42 @@ fragile backend-specific kernel-launch code lives in exactly one place.
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, List
+import functools
+from typing import Any, ClassVar, List, Optional
 
 import torch
 
-from ..autotuner import AutoTuner, DynamicTensorSpec, TunableRunner, TuningConfig
-from ..utils import next_positive_power_of_2
+from ..autotuner import (
+    AutoTuner,
+    ConstraintSpec,
+    DynamicTensorSpec,
+    TunableRunner,
+    TuningConfig,
+)
+from ..utils import next_positive_power_of_2, round_up
 from .api import (
     _CUTLASS_BF16_ARCHS,
+    _CUTLASS_FP8_ARCHS,
+    _CUTLASS_FP8_BLOCK_ARCHS,
+    _CUTLASS_HUMMING_ARCHS,
+    _CUTLASS_MXFP8_ARCHS,
+    _CUTLASS_MXFP8_MXFP4_ARCHS,
+    _CUTLASS_NVFP4_ARCHS,
     _CUTLASS_W4A16_ARCHS,
+    _CUTLASS_W4A8_ARCHS,
+    # Typed activation values
+    ActivationConfig,
+    GELU,
+    GeGLU,
+    GeGLUTanh,
+    Identity,
+    ReLU,
+    ReLU2,
+    SiLU,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
+    # Unified config and pack types
     ActivationType,
     MoEActivationPack,
     MoEConfig,
@@ -42,6 +69,20 @@ from .api import (
 from .utils import (
     make_hybrid_bucket_mapper,
     map_to_hybrid_bucket,
+)
+
+
+_CUTLASS_SEMANTIC_ACTIVATIONS: tuple[type[ActivationConfig], ...] = (
+    SwiGLU,
+    SwiGLUStep,
+    GeGLU,
+    GeGLUTanh,
+    ReLU2,
+    SiTU,
+    Identity,
+    GELU,
+    ReLU,
+    SiLU,
 )
 
 
@@ -212,6 +253,142 @@ def _validate_optional_gemm1_activation_params(
             raise ValueError(f"{runner}: {key} must be contiguous.")
 
 
+def _cute_dsl_activation_kwargs(activation: ActivationConfig) -> dict[str, Any]:
+    """Translate typed activation values to the existing CuTe-DSL scalar ABI."""
+    if isinstance(activation, SwiGLU):
+        return {
+            "activation_type": int(activation.type),
+            "swiglu_alpha": activation.alpha,
+            "swiglu_beta": activation.beta,
+            "swiglu_limit": activation.limit,
+        }
+    if isinstance(activation, SiTU):
+        return {
+            # CuTeDSL encodes SiTU as SwiGLU with a non-null situ_beta.
+            "activation_type": int(ActivationType.Swiglu),
+            "situ_beta": activation.gate_scale,
+            # None means an unclamped linear branch.
+            "situ_linear_beta": activation.linear_scale,
+        }
+    return {"activation_type": int(activation.type)}
+
+
+def _validate_prepared_activation_params(
+    view: dict[str, Optional[torch.Tensor]],
+    activation: ActivationConfig,
+    runner: str,
+) -> None:
+    """Validate activation scalars in a backend-prepared weight view."""
+    required: tuple[str, ...] = ()
+    if isinstance(activation, SwiGLU):
+        # Omitted fields use neutral launcher defaults, so require only values
+        # that differ from the typed default.
+        default = SwiGLU()
+        if activation.alpha != default.alpha:
+            required += ("gemm1_alpha",)
+        if activation.beta != default.beta:
+            required += ("gemm1_beta",)
+        if activation.limit != default.limit:
+            required += ("gemm1_clamp_limit",)
+    elif isinstance(activation, SiTU):
+        # TRTLLM reuses gemm1_alpha/beta, whose null SiTU defaults are 1/1
+        # rather than the typed 4/25. Require explicit tensors even at default.
+        # linear_scale=None is rejected earlier because this ABI cannot encode it.
+        required = ("gemm1_alpha",)
+        if activation.linear_scale is not None:
+            required += ("gemm1_beta",)
+        if activation.clamp_limit is not None:
+            required += ("gemm1_clamp_limit",)
+    elif not activation.is_gated:
+        # Non-gated kernels ignore these tensors; reject them rather than
+        # silently accepting ineffective overrides. Whether a *gated*
+        # activation accepts them is per-backend (FP4 GeGLU does, FP8 block and
+        # BF16 restrict to Swiglu), so that stays a runner-level decision.
+        supplied = [
+            name
+            for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
+            if view.get(name) is not None
+        ]
+        if supplied:
+            raise ValueError(
+                f"{runner}: {type(activation).__name__} does not consume "
+                f"{supplied}; these per-expert overrides apply to gated "
+                "activations only and would be ignored."
+            )
+    # None is equivalent to an absent launcher tensor.
+    missing = [name for name in required if view.get(name) is None]
+    if missing:
+        raise ValueError(
+            f"{runner}: prepared weights are missing activation parameters {missing}; "
+            "prepare the backend view with the same typed activation or provide "
+            "explicit per-expert overrides."
+        )
+
+
+@functools.lru_cache(maxsize=None)
+def _cutlass_activation_required_keys(activation: ActivationConfig) -> frozenset[str]:
+    """Return non-null CUTLASS scalar keys required by ``activation``."""
+    # A zero-expert probe keeps this in sync with the materializer without
+    # depending on expert count or device.
+    probe = _cutlass_activation_params(activation, 0, torch.device("cpu"))
+    return frozenset(name for name, value in probe.items() if value is not None)
+
+
+def _cutlass_activation_params(
+    activation: ActivationConfig,
+    num_experts: int,
+    device: torch.device,
+) -> dict[str, torch.Tensor | None]:
+    """Materialize CUTLASS's optional per-expert activation tensors."""
+    params: dict[str, torch.Tensor | None] = {
+        "swiglu_alpha": None,
+        "swiglu_beta": None,
+        "swiglu_limit": None,
+        "situ_beta": None,
+        "situ_linear_beta": None,
+    }
+    if isinstance(activation, SiTU):
+        if activation.linear_scale is None:
+            # Normal runner lifecycle rejects this in check_support; keep
+            # direct helper calls explicit as well.
+            raise NotImplementedError(
+                "CUTLASS cannot express SiTU(linear_scale=None); its ABI "
+                "has no unclamped linear-branch encoding."
+            )
+        # CUTLASS native defaults match SiTU(), so only custom values need tensors.
+        if activation != SiTU():
+            params["situ_beta"] = torch.full(
+                (num_experts,),
+                activation.gate_scale,
+                dtype=torch.float32,
+                device=device,
+            )
+            params["situ_linear_beta"] = torch.full(
+                (num_experts,),
+                activation.linear_scale,
+                dtype=torch.float32,
+                device=device,
+            )
+        return params
+    if isinstance(activation, SwiGLU) and activation != SwiGLU():
+        params = {
+            "swiglu_alpha": torch.full(
+                (num_experts,), activation.alpha, dtype=torch.float32, device=device
+            ),
+            "swiglu_beta": torch.full(
+                (num_experts,), activation.beta, dtype=torch.float32, device=device
+            ),
+            "swiglu_limit": torch.full(
+                (num_experts,), activation.limit, dtype=torch.float32, device=device
+            ),
+        }
+    elif isinstance(activation, SwiGLUStep):
+        params["swiglu_limit"] = torch.full(
+            (num_experts,), activation.limit, dtype=torch.float32, device=device
+        )
+    return params
+
+
 class MoERunner(TunableRunner):
     """Unified MoE runner lifecycle: validate, build once, then execute.
 
@@ -223,6 +400,11 @@ class MoERunner(TunableRunner):
     backend_key: ClassVar[str] = ""
     supported_routing_modes: tuple[RoutingInputMode, ...] = ()
     supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = ()
+    # Default to no activations; each concrete runner must declare its support.
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = ()
+    supported_activation_classes_by_quant: ClassVar[
+        dict[QuantVariant, tuple[type[ActivationConfig], ...]]
+    ] = {}
     # Set to True only after S is wired through validation and launch.
     supports_fused_shared_experts: ClassVar[bool] = False
     # Cleared by backends whose kernels cannot map global expert ids onto a
@@ -247,8 +429,40 @@ class MoERunner(TunableRunner):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support QuantVariant.{variant.name}."
             )
+        if self.supported_activation_classes_by_quant:
+            # Strict lookup: a runner that declares per-quant capabilities must
+            # declare them for every variant it accepts. Falling back to the
+            # permissive class default would silently admit every activation on
+            # a newly added variant.
+            try:
+                supported_activations = self.supported_activation_classes_by_quant[
+                    variant
+                ]
+            except KeyError:
+                raise NotImplementedError(
+                    f"{type(self).__name__} declares per-quantization activation "
+                    f"support but has no entry for QuantVariant.{variant.name}; "
+                    "add one to supported_activation_classes_by_quant."
+                ) from None
+        else:
+            supported_activations = self.supported_activation_classes
+        if not supported_activations:
+            raise NotImplementedError(
+                f"{type(self).__name__} declares no supported activation classes."
+            )
+        if not isinstance(self.config.activation, supported_activations):
+            names = ", ".join(cls.__name__ for cls in supported_activations)
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support "
+                f"{type(self.config.activation).__name__} for QuantVariant."
+                f"{variant.name}; supported activations are {names}."
+            )
         self._assert_shared_experts_supported()
         self._assert_expert_parallelism_supported()
+        self._check_activation_parameters()
+
+    def _check_activation_parameters(self) -> None:
+        """Reject typed scalar values a backend would otherwise silently drop."""
 
     def _assert_shared_experts_supported(self) -> None:
         """Reject S > 0 for backends that have not opted in."""
@@ -319,6 +533,7 @@ class MoERunner(TunableRunner):
             # S changes tactic enumeration but not profiled tensor shapes.
             int(experts.num_fused_shared_experts),
             int(self.config.activation.type),
+            repr(self.config.activation),
             bool(self.config.finalize.do_finalize),
             # Routing shape affects expert-token distribution and tactic ranking.
             int(routing.method),
@@ -335,6 +550,29 @@ class MoERunner(TunableRunner):
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         # Configuration-only, so synthesized profiling inputs use the same key.
         return self._cache_key_extras()
+
+
+def _mxfp8_swizzled_act_sf_numel(num_tokens: int, hidden_size: int) -> int:
+    """Byte count of a 128x4-swizzled MXFP8 activation scale buffer."""
+    return round_up(num_tokens, 128) * round_up(hidden_size // 32, 4)
+
+
+def _infer_mxfp8_swizzled_act_sf_numel(shapes: list) -> int:
+    """ConstraintSpec callback: ``input_sf`` numel from hidden_states ``[M, H]``."""
+    return _mxfp8_swizzled_act_sf_numel(shapes[1][0], shapes[1][1])
+
+
+def _require_cutlass_tensor(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    dtype: torch.dtype,
+    shape: tuple[int, ...],
+) -> None:
+    if tensor.dtype is not dtype:
+        raise TypeError(f"{name} must be {dtype}, got {tensor.dtype}.")
+    if tuple(tensor.shape) != shape:
+        raise ValueError(f"{name} shape {tuple(tensor.shape)} != expected {shape}.")
 
 
 # ---------------------------------------------------------------------------
@@ -354,10 +592,20 @@ class _CutlassRunnerBase(MoERunner):
     """
 
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    # Fail closed like MoERunner: every concrete CUTLASS runner declares its own
+    # activations after proving the matching preparation geometry and numerical
+    # coverage. A SwiGLU default would let a runner added later inherit support
+    # it never validated instead of failing at check_support().
+    supported_activation_classes: ClassVar[tuple[type[ActivationConfig], ...]] = ()
     supports_expert_parallelism = False
     _supported_archs: ClassVar[tuple[int, ...]]
+    _x_dtype: ClassVar[torch.dtype] = torch.bfloat16
     _weight_dtype: ClassVar[torch.dtype]
-    _use_w4_group_scaling: ClassVar[bool]
+    _use_w4_group_scaling: ClassVar[bool] = False
+    _use_deepseek_fp8_block_scale: ClassVar[bool] = False
+    _use_mxfp8_act_scaling: ClassVar[bool] = False
+    _use_packed_weights: ClassVar[bool] = False
+    _use_wfp4afp8_humming: ClassVar[bool] = False
     _required_weight_keys: ClassVar[tuple[str, ...]]
     _expected_num_inputs: ClassVar[int]
     # Keep the best N tactics per GEMM stage, then return their Cartesian
@@ -367,20 +615,45 @@ class _CutlassRunnerBase(MoERunner):
 
     def _check_support(self) -> None:
         super()._check_support()
-        if self.config.activation.type is not ActivationType.Swiglu:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only the Swiglu activation."
-            )
         if not self.config.finalize.do_finalize:
             raise NotImplementedError(
                 f"{type(self).__name__} requires do_finalize=True."
             )
+        activation = self.config.activation
+        if isinstance(activation, SiTU):
+            # The CUTLASS SiTU ABI carries situ_beta and situ_linear_beta only:
+            # there is no unclamped-linear encoding and no clamp channel.
+            if activation.linear_scale is None:
+                raise NotImplementedError(
+                    f"{type(self).__name__} cannot express "
+                    "SiTU(linear_scale=None); the CUTLASS ABI has no unclamped "
+                    "linear-branch encoding."
+                )
+            if activation.clamp_limit is not None:
+                raise NotImplementedError(
+                    f"{type(self).__name__} cannot express a SiTU clamp_limit; "
+                    "the CUTLASS ABI exposes no clamp channel."
+                )
         if self._device_arch not in self._supported_archs:
             raise RuntimeError(
                 f"{type(self).__name__} does not support "
                 f"SM{self._device_arch}; supported architectures are "
                 f"{self._supported_archs}."
             )
+        if self._use_mxfp8_act_scaling and (
+            self.config.quant.swizzled_scale_factors is False
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} requires swizzled MXFP8 input_sf; "
+                "linear scales (swizzled_scale_factors=False) are not supported."
+            )
+        if self._use_deepseek_fp8_block_scale:
+            from ..jit.cpp_ext import is_cuda_version_at_least
+
+            if not is_cuda_version_at_least("12.8"):
+                raise NotImplementedError(
+                    "FP8 block scaling requires CUDA 12.8 or newer."
+                )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -419,7 +692,7 @@ class _CutlassRunnerBase(MoERunner):
         with torch.cuda.device(self.device):
             module = get_cutlass_fused_moe_module(str(self._device_arch))
             self._inner = module.MoERunner(
-                x_dtype=torch.bfloat16,
+                x_dtype=self._x_dtype,
                 weight_dtype=self._weight_dtype,
                 output_dtype=torch.bfloat16,
                 top_k=self.config.routing.top_k,
@@ -430,16 +703,109 @@ class _CutlassRunnerBase(MoERunner):
                 cluster_size=1,
                 cluster_rank=0,
                 enable_alltoall=False,
-                use_deepseek_fp8_block_scale=False,
+                use_deepseek_fp8_block_scale=self._use_deepseek_fp8_block_scale,
                 use_w4_group_scaling=self._use_w4_group_scaling,
-                use_mxfp8_act_scaling=False,
+                use_mxfp8_act_scaling=self._use_mxfp8_act_scaling,
                 min_latency_mode=False,
                 enable_pdl=self._enable_pdl,
                 activation_type=self.config.activation.type,
-                use_packed_weights=False,
+                use_packed_weights=self._use_packed_weights,
                 use_fused_finalize=self._use_fused_finalize,
-                use_wfp4afp8_humming=False,
+                use_wfp4afp8_humming=self._use_wfp4afp8_humming,
             )
+            activation = self.config.activation
+            num_experts = self.config.routing.num_experts
+            self._activation_params = _cutlass_activation_params(
+                activation, num_experts, self.device
+            )
+            self._config_activation_params = dict(self._activation_params)
+
+    def _resolve_activation_params(
+        self, view: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor | None]:
+        """Apply optional per-expert weight-view overrides to typed scalars."""
+        # Rebuild an incomplete cache, then retain its tensors so CUDA graphs
+        # keep stable pointers across repeated packing.
+        config_params = getattr(self, "_config_activation_params", None)
+        required = _cutlass_activation_required_keys(self.config.activation)
+        if config_params is None or any(
+            config_params.get(name) is None for name in required
+        ):
+            config_params = _cutlass_activation_params(
+                self.config.activation,
+                self.config.routing.num_experts,
+                self.device,
+            )
+            self._config_activation_params = config_params
+        params = dict(config_params)
+        activation = self.config.activation
+        # SiTU carries its own native CUTLASS keys rather than the gemm1_*
+        # spelling, so the accepted override names depend on the activation.
+        # Reading only the gemm1_* set would drop a supplied situ_beta on the
+        # floor while rejecting the gemm1_* names the caller does not have.
+        if isinstance(activation, SiTU):
+            aliases = {
+                "situ_beta": "situ_beta",
+                "situ_linear_beta": "situ_linear_beta",
+            }
+        else:
+            aliases = {
+                "gemm1_alpha": "swiglu_alpha",
+                "gemm1_beta": "swiglu_beta",
+                "gemm1_clamp_limit": "swiglu_limit",
+            }
+        present = [name for name in aliases if name in view]
+        if isinstance(activation, SwiGLUStep):
+            ignored = [name for name in ("gemm1_alpha", "gemm1_beta") if name in view]
+            if ignored:
+                raise ValueError(
+                    f"{type(self).__name__}: SwiGLUStep does not consume "
+                    f"per-expert overrides {ignored}; only gemm1_clamp_limit is valid."
+                )
+        if present and not isinstance(activation, (SwiGLU, SwiGLUStep, SiTU)):
+            raise ValueError(
+                f"{type(self).__name__}: per-expert activation overrides {present} "
+                f"are invalid for {type(activation).__name__}."
+            )
+        # An override spelled for a different activation is a mistake worth
+        # naming, not something to ignore -- in either direction.
+        foreign: tuple[str, ...]
+        correct: str
+        if isinstance(activation, SiTU):
+            foreign, correct = (
+                ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"),
+                "situ_beta / situ_linear_beta",
+            )
+        else:
+            foreign, correct = (
+                ("situ_beta", "situ_linear_beta"),
+                "gemm1_alpha / gemm1_beta / gemm1_clamp_limit",
+            )
+        supplied = [name for name in foreign if name in view]
+        if supplied:
+            raise ValueError(
+                f"{type(self).__name__}: {type(activation).__name__} takes "
+                f"per-expert overrides as {correct}, not {supplied}."
+            )
+        expected_shape = (self.config.routing.num_experts,)
+        for source, destination in aliases.items():
+            if source not in view:
+                continue
+            tensor = view[source]
+            if tensor.dtype is not torch.float32:
+                raise TypeError(f"{source} must use torch.float32, got {tensor.dtype}.")
+            if tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f"{source} must have shape {expected_shape}, got {tuple(tensor.shape)}."
+                )
+            if tensor.device != self.device:
+                raise ValueError(
+                    f"{source} is on {tensor.device}, expected {self.device}."
+                )
+            if not tensor.is_contiguous():
+                raise ValueError(f"{source} must be contiguous.")
+            params[destination] = tensor
+        return params
 
     def _prepare_tuning_inputs(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """Populate synthesized routing inputs with a valid balanced pattern."""
@@ -455,6 +821,18 @@ class _CutlassRunnerBase(MoERunner):
         ).unsqueeze(0)
         inputs[2].copy_((token_offsets * top_k + slots) % num_experts)
         inputs[3].fill_(1.0 / top_k)
+        if self._use_mxfp8_act_scaling:
+            hidden_states = inputs[1]
+            inputs[-1] = torch.full(
+                (
+                    _mxfp8_swizzled_act_sf_numel(
+                        hidden_states.shape[0], hidden_states.shape[1]
+                    ),
+                ),
+                127,
+                dtype=torch.uint8,
+                device=hidden_states.device,
+            )
         return inputs
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
@@ -528,12 +906,16 @@ class _CutlassRunnerBase(MoERunner):
             self.config.experts.intermediate_size,
             self.config.routing.num_experts,
             self.config.routing.top_k,
-            x_dtype=torch.bfloat16,
+            x_dtype=self._x_dtype,
             weight_dtype=self._weight_dtype,
             output_dtype=torch.bfloat16,
             activation_type=self.config.activation.type,
+            use_deepseek_fp8_block_scale=self._use_deepseek_fp8_block_scale,
             use_w4_group_scaling=self._use_w4_group_scaling,
+            use_mxfp8_act_scaling=self._use_mxfp8_act_scaling,
             use_fused_finalize=self._use_fused_finalize,
+            use_packed_weights=self._use_packed_weights,
+            use_wfp4afp8_humming=self._use_wfp4afp8_humming,
             device=self.device,
         )
         workspace = torch.empty(size, dtype=torch.uint8, device=self.device)
@@ -551,19 +933,16 @@ class _CutlassRunnerBase(MoERunner):
                 f"{type(self).__name__} supports only PackedPrecomputed routing."
             )
         hidden_states = act.hidden_states_q
-        if hidden_states.ndim != 2 or hidden_states.dtype is not torch.bfloat16:
+        if hidden_states.ndim != 2 or hidden_states.dtype is not self._x_dtype:
             raise TypeError(
-                f"{type(self).__name__} requires 2D BF16 hidden_states_q, got "
-                f"shape={tuple(hidden_states.shape)}, dtype={hidden_states.dtype}."
+                f"{type(self).__name__} requires 2D {self._x_dtype} hidden_states_q, "
+                f"got shape={tuple(hidden_states.shape)}, dtype={hidden_states.dtype}."
             )
         if hidden_states.device != self.device:
             raise ValueError(
                 f"hidden_states_q is on {hidden_states.device}, expected {self.device}."
             )
-        if act.hidden_states_scale is not None:
-            raise ValueError(
-                f"{type(self).__name__} activations do not use hidden_states_scale."
-            )
+        self._validate_activation_scale(act)
 
         num_tokens, hidden_size = hidden_states.shape
         ceiling = self.config.execution.tune_max_num_tokens
@@ -588,33 +967,104 @@ class _CutlassRunnerBase(MoERunner):
                 f"{self.backend_key} prepared weights are missing {missing}."
             )
         weight_inputs = self._pack_weight_inputs(view, hidden_size)
+        scale_inputs = self._pack_activation_scale_inputs(act)
+        self._activation_params = self._resolve_activation_params(view)
+
+        # Token-dynamic dims are only the packed prerouted buffers (output,
+        # hidden, topk_ids, topk_weights). Per-tensor FP8 dequant is 0-dim;
+        # MXFP8 input_sf is a swizzled 1-D buffer resized by ConstraintSpec.
+        # Sniffing shape[0] == num_tokens treated a (1,) scale at M=1 as
+        # token-dynamic and let autotune replace it with a bucket-sized tensor.
+        input_idxs: tuple[int, ...] = (0, 1, 2, 3)
+        dim_idxs: tuple[int, ...] = (0, 0, 0, 0)
 
         bucket = map_to_hybrid_bucket(
             num_tokens, self.config.execution.tune_max_num_tokens
         )
+        constraint_specs: tuple[ConstraintSpec, ...] = ()
+        if self._use_mxfp8_act_scaling:
+            constraint_specs = (
+                ConstraintSpec(
+                    4 + len(weight_inputs),
+                    0,
+                    _infer_mxfp8_swizzled_act_sf_numel,
+                ),
+            )
         self.tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
-                    input_idx=(0, 1, 2, 3),
-                    dim_idx=(0, 0, 0, 0),
+                    input_idx=input_idxs,
+                    dim_idx=dim_idxs,
                     gen_tuning_buckets=(bucket,),
                     map_to_tuning_buckets=make_hybrid_bucket_mapper(
                         self.config.execution.tune_max_num_tokens
                     ),
                 ),
             ),
+            constraint_specs=constraint_specs,
             use_cuda_graph=True,
             inputs_pre_hook=self._prepare_tuning_inputs,
         )
         self._ensure_workspace(bucket, hidden_size)
-        output = hidden_states.new_empty((num_tokens, hidden_size))
+        output = torch.empty(
+            (num_tokens, hidden_size),
+            dtype=torch.bfloat16,
+            device=hidden_states.device,
+        )
         return [
             output,
             hidden_states,
             act.topk_ids,
             act.topk_weights,
             *weight_inputs,
+            *scale_inputs,
         ]
+
+    def _validate_activation_scale(self, act: MoEActivationPack) -> None:
+        if self._use_mxfp8_act_scaling:
+            scale = act.hidden_states_scale
+            num_tokens, hidden_size = act.hidden_states_q.shape
+            expected = _mxfp8_swizzled_act_sf_numel(num_tokens, hidden_size)
+            if (
+                scale is None
+                or scale.dtype is not torch.uint8
+                or scale.numel() != expected
+                or not scale.is_contiguous()
+            ):
+                got = (
+                    None
+                    if scale is None
+                    else (scale.dtype, tuple(scale.shape), scale.is_contiguous())
+                )
+                raise ValueError(
+                    f"{type(self).__name__} requires a contiguous uint8 swizzled "
+                    f"input_sf with {expected} elements for M={num_tokens}, "
+                    f"H={hidden_size}; got {got}."
+                )
+            return
+        if self._x_dtype is torch.float8_e4m3fn:
+            scale = act.hidden_states_scale
+            if scale is None or scale.dim() != 0 or scale.dtype is not torch.float32:
+                raise ValueError(
+                    f"{type(self).__name__} requires a 0-dim float32 "
+                    "hidden_states_scale dequant factor."
+                )
+            return
+        if act.hidden_states_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} activations do not use hidden_states_scale."
+            )
+
+    def _pack_activation_scale_inputs(
+        self, act: MoEActivationPack
+    ) -> List[torch.Tensor]:
+        if self._use_mxfp8_act_scaling or self._x_dtype is torch.float8_e4m3fn:
+            assert act.hidden_states_scale is not None
+            scale = act.hidden_states_scale
+            if self._use_mxfp8_act_scaling:
+                scale = scale.reshape(-1)
+            return [scale]
+        return []
 
     def _pack_weight_inputs(
         self, view: dict[str, torch.Tensor], hidden_size: int
@@ -623,6 +1073,11 @@ class _CutlassRunnerBase(MoERunner):
 
     def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
         return []
+
+    def _input_sf(self, inputs: List[torch.Tensor]) -> torch.Tensor | None:
+        if self._use_mxfp8_act_scaling:
+            return inputs[-1]
+        return None
 
     def _validate_weight_storage(self, tensors: tuple[torch.Tensor, ...]) -> None:
         if any(t.device != self.device for t in tensors):
@@ -695,14 +1150,21 @@ class _CutlassRunnerBase(MoERunner):
             inputs[5],
             output_dtype=torch.bfloat16,
             quant_scales=self._quant_scales(inputs),
+            input_sf=self._input_sf(inputs),
             output=inputs[0],
             tune_max_num_tokens=self.config.execution.tune_max_num_tokens,
             enable_pdl=self._enable_pdl,
             activation_type=self.config.activation.type,
+            use_deepseek_fp8_block_scale=self._use_deepseek_fp8_block_scale,
             use_w4_group_scaling=self._use_w4_group_scaling,
+            use_mxfp8_act_scaling=self._use_mxfp8_act_scaling,
+            use_packed_weights=self._use_packed_weights,
+            use_wfp4afp8_humming=self._use_wfp4afp8_humming,
             use_fused_finalize=self._use_fused_finalize,
+            swizzled_input_sf=True,
             profile_ids=profile_ids,
             workspace_buffer=self._workspace,
+            **self._activation_params,
         )
         return inputs[0]
 
@@ -718,6 +1180,7 @@ class CutlassBf16Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_bf16"
     supported_quant_variants = (QuantVariant.BF16,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_BF16_ARCHS
     _weight_dtype = torch.bfloat16
     _use_w4_group_scaling = False
@@ -730,7 +1193,8 @@ class CutlassBf16Runner(_CutlassRunnerBase):
         w1, w2 = (view[key] for key in self._required_weight_keys)
         num_experts = self.config.routing.num_experts
         intermediate_size = self.config.experts.intermediate_size
-        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size)
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size)
         expected_w2 = (num_experts, hidden_size, intermediate_size)
         if w1.dtype is not torch.bfloat16 or w2.dtype is not torch.bfloat16:
             raise TypeError("Cutlass BF16 prepared weights must use torch.bfloat16.")
@@ -748,6 +1212,7 @@ class CutlassW4A16Runner(_CutlassRunnerBase):
 
     backend_key = "cutlass_w4a16"
     supported_quant_variants = (QuantVariant.W4A16,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_W4A16_ARCHS
     _weight_dtype = torch.uint8
     _use_w4_group_scaling = True
@@ -765,11 +1230,12 @@ class CutlassW4A16Runner(_CutlassRunnerBase):
         w1, w2, w1_scale, w2_scale = (view[key] for key in self._required_weight_keys)
         num_experts = self.config.routing.num_experts
         intermediate_size = self.config.experts.intermediate_size
-        expected_w1 = (num_experts, 2 * intermediate_size, hidden_size // 2)
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size // 2)
         expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
         expected_s1 = (
             num_experts,
-            2 * intermediate_size // 64,
+            gemm1_rows // 64,
             hidden_size // 128,
             16,
             16,
@@ -804,6 +1270,596 @@ class CutlassW4A16Runner(_CutlassRunnerBase):
         return [inputs[6].view(torch.int32), inputs[7].view(torch.int32)]
 
 
+class CutlassNvfp4Runner(_CutlassRunnerBase):
+    """Unified adapter for CUTLASS NVFP4 fused MoE.
+
+    Weights stay packed uint8 in the ``MoEWeightPack`` view. At launch they are
+    viewed as ``int64``, matching the flat ``cutlass_fused_moe`` NVFP4 ABI; the
+    inner ``MoERunner`` selects the NVFP4 kernel from that dtype. Activations
+    remain BF16 and are quantized inside the kernel with unit global scale.
+    """
+
+    backend_key = "cutlass_nvfp4"
+    supported_quant_variants = (QuantVariant.NVFP4,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
+    _supported_archs = _CUTLASS_NVFP4_ARCHS
+    _weight_dtype = torch.int64
+    _use_w4_group_scaling = False
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_act_global_scale",
+        "fc1_weight_block_scale",
+        "fc1_dequant_scale",
+        "fc2_act_global_scale",
+        "fc2_weight_block_scale",
+        "fc2_dequant_scale",
+    )
+    _expected_num_inputs = 12
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        (
+            w1,
+            w2,
+            a1_gs,
+            w1_scale,
+            fc1_dequant,
+            a2_gs,
+            w2_scale,
+            fc2_dequant,
+        ) = (view[key] for key in self._required_weight_keys)
+        num_experts = self.config.routing.num_experts
+        intermediate_size = self.config.experts.intermediate_size
+        if hidden_size % 16 != 0 or intermediate_size % 16 != 0:
+            raise ValueError(
+                "Cutlass NVFP4 requires hidden_size and intermediate_size "
+                f"divisible by 16, got H={hidden_size}, I={intermediate_size}."
+            )
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size // 2)
+        expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
+        expected_s1 = (
+            num_experts,
+            round_up(gemm1_rows, 128),
+            round_up(hidden_size // 16, 4),
+        )
+        expected_s2 = (
+            num_experts,
+            round_up(hidden_size, 128),
+            round_up(intermediate_size // 16, 4),
+        )
+        if w1.dtype is not torch.uint8 or w2.dtype is not torch.uint8:
+            raise TypeError("Cutlass NVFP4 packed weights must be uint8.")
+        if w1_scale.dtype is not torch.uint8 or w2_scale.dtype is not torch.uint8:
+            raise TypeError("Cutlass NVFP4 block scales must be uint8.")
+        if any(
+            t.dtype is not torch.float32
+            for t in (a1_gs, a2_gs, fc1_dequant, fc2_dequant)
+        ):
+            raise TypeError("Cutlass NVFP4 global and dequant scales must be float32.")
+        if (tuple(w1.shape), tuple(w2.shape)) != (expected_w1, expected_w2):
+            raise ValueError(
+                f"Cutlass NVFP4 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"!= expected {expected_w1}/{expected_w2}."
+            )
+        if (tuple(w1_scale.shape), tuple(w2_scale.shape)) != (
+            expected_s1,
+            expected_s2,
+        ):
+            raise ValueError(
+                "Cutlass NVFP4 scale shapes "
+                f"{tuple(w1_scale.shape)}/{tuple(w2_scale.shape)} != expected "
+                f"{expected_s1}/{expected_s2}."
+            )
+        expected_dequant = (num_experts,)
+        if (
+            tuple(fc1_dequant.shape) != expected_dequant
+            or tuple(fc2_dequant.shape) != expected_dequant
+        ):
+            raise ValueError(
+                "Cutlass NVFP4 dequant scale shapes "
+                f"{tuple(fc1_dequant.shape)}/{tuple(fc2_dequant.shape)} != "
+                f"expected {expected_dequant}."
+            )
+        self._validate_weight_storage(
+            (w1, w2, a1_gs, w1_scale, fc1_dequant, a2_gs, w2_scale, fc2_dequant)
+        )
+        # Flat NVFP4 CUTLASS selects the kernel from weight dtype int64.
+        return [
+            w1.view(torch.int64),
+            w2.view(torch.int64),
+            a1_gs,
+            w1_scale,
+            fc1_dequant,
+            a2_gs,
+            w2_scale,
+            fc2_dequant,
+        ]
+
+    def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        return [
+            inputs[6],
+            inputs[7].view(torch.int32),
+            inputs[8],
+            inputs[9],
+            inputs[10].view(torch.int32),
+            inputs[11],
+        ]
+
+
+class CutlassFp8PerTensorRunner(_CutlassRunnerBase):
+    """Unified adapter for CUTLASS per-tensor FP8 fused MoE."""
+
+    backend_key = "cutlass_fp8_per_tensor"
+    supported_quant_variants = (QuantVariant.FP8PerTensor,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
+    _supported_archs = _CUTLASS_FP8_ARCHS
+    _x_dtype = torch.float8_e4m3fn
+    _weight_dtype = torch.float8_e4m3fn
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_dequant",
+        "fc2_dequant",
+    )
+    _expected_num_inputs = 9
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        w1, w2, w1_dequant, w2_dequant = (
+            view[key] for key in self._required_weight_keys
+        )
+        num_experts = self.config.routing.num_experts
+        intermediate_size = self.config.experts.intermediate_size
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size)
+        expected_w2 = (num_experts, hidden_size, intermediate_size)
+        if w1.dtype is not torch.float8_e4m3fn or w2.dtype is not torch.float8_e4m3fn:
+            raise TypeError("Cutlass FP8 prepared weights must be float8_e4m3fn.")
+        if tuple(w1.shape) != expected_w1 or tuple(w2.shape) != expected_w2:
+            raise ValueError(
+                f"Cutlass FP8 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"!= expected {expected_w1}/{expected_w2}."
+            )
+        if (
+            w1_dequant.dtype is not torch.float32
+            or w2_dequant.dtype is not torch.float32
+        ):
+            raise TypeError("Cutlass FP8 dequant scales must be float32.")
+        expected_scale = (num_experts,)
+        if (
+            tuple(w1_dequant.shape) != expected_scale
+            or tuple(w2_dequant.shape) != expected_scale
+        ):
+            raise ValueError(
+                "Cutlass FP8 dequant scale shapes "
+                f"{tuple(w1_dequant.shape)}/{tuple(w2_dequant.shape)} != "
+                f"expected {expected_scale}."
+            )
+        self._validate_weight_storage((w1, w2, w1_dequant, w2_dequant))
+        return [w1, w2, w1_dequant, w2_dequant]
+
+    def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        act_scale = inputs[8]
+        gemm2_act_quant = torch.ones((), device=act_scale.device, dtype=torch.float32)
+        return [
+            (inputs[6] * act_scale).float(),
+            gemm2_act_quant,
+            inputs[7].float(),
+            act_scale,
+        ]
+
+
+class CutlassFp8BlockRunner(_CutlassRunnerBase):
+    """Unified adapter for CUTLASS DeepSeek 128x128 FP8 block-scale MoE."""
+
+    backend_key = "cutlass_fp8_block"
+    supported_quant_variants = (QuantVariant.DeepSeekFp8,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
+    _supported_archs = _CUTLASS_FP8_BLOCK_ARCHS
+    _weight_dtype = torch.float8_e4m3fn
+    _use_deepseek_fp8_block_scale = True
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_block_scale",
+        "fc2_block_scale",
+    )
+    _expected_num_inputs = 8
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        from math import ceil
+
+        w1, w2, w1_scale, w2_scale = (view[key] for key in self._required_weight_keys)
+        num_experts = self.config.routing.num_experts
+        intermediate_size = self.config.experts.intermediate_size
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size)
+        expected_w2 = (num_experts, hidden_size, intermediate_size)
+        expected_s1 = (
+            num_experts,
+            ceil(gemm1_rows / 128),
+            ceil(hidden_size / 128),
+        )
+        expected_s2 = (
+            num_experts,
+            ceil(hidden_size / 128),
+            ceil(intermediate_size / 128),
+        )
+        if w1.dtype is not torch.float8_e4m3fn or w2.dtype is not torch.float8_e4m3fn:
+            raise TypeError("Cutlass FP8-block prepared weights must be float8_e4m3fn.")
+        if w1_scale.dtype is not torch.float32 or w2_scale.dtype is not torch.float32:
+            raise TypeError("Cutlass FP8-block scales must be float32.")
+        if (tuple(w1.shape), tuple(w2.shape)) != (expected_w1, expected_w2):
+            raise ValueError(
+                f"Cutlass FP8-block weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"!= expected {expected_w1}/{expected_w2}."
+            )
+        if (tuple(w1_scale.shape), tuple(w2_scale.shape)) != (expected_s1, expected_s2):
+            raise ValueError(
+                "Cutlass FP8-block scale shapes "
+                f"{tuple(w1_scale.shape)}/{tuple(w2_scale.shape)} != expected "
+                f"{expected_s1}/{expected_s2}."
+            )
+        self._validate_weight_storage((w1, w2, w1_scale, w2_scale))
+        return [w1, w2, w1_scale, w2_scale]
+
+    def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        return [inputs[6], inputs[7]]
+
+
+class CutlassMxfp8Mxfp4Runner(_CutlassRunnerBase):
+    """Unified adapter for CUTLASS MXFP8 x MXFP4 fused MoE."""
+
+    backend_key = "cutlass_mxfp8_mxfp4"
+    supported_quant_variants = (QuantVariant.MXFP4,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
+    _supported_archs = _CUTLASS_MXFP8_MXFP4_ARCHS
+    _x_dtype = torch.float8_e4m3fn
+    _weight_dtype = torch.int64
+    _use_mxfp8_act_scaling = True
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_expert_scales",
+        "fc2_expert_scales",
+        "fc1_input_scale",
+        "fc2_input_scale",
+    )
+    _expected_num_inputs = 11
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        w1, w2, w1_scale, w2_scale, a1_scale, a2_scale = (
+            view[key] for key in self._required_weight_keys
+        )
+        num_experts = self.config.routing.num_experts
+        intermediate_size = self.config.experts.intermediate_size
+        if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+            raise ValueError(
+                "Cutlass MXFP8xMXFP4 requires hidden_size and intermediate_size "
+                f"divisible by 128, got H={hidden_size}, I={intermediate_size}."
+            )
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size // 2)
+        expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
+        if w1.dtype is not torch.uint8 or w2.dtype is not torch.uint8:
+            raise TypeError("Cutlass MXFP8xMXFP4 packed weights must be uint8.")
+        if (tuple(w1.shape), tuple(w2.shape)) != (expected_w1, expected_w2):
+            raise ValueError(
+                "Cutlass MXFP8xMXFP4 weight shapes "
+                f"{tuple(w1.shape)}/{tuple(w2.shape)} != expected "
+                f"{expected_w1}/{expected_w2}."
+            )
+        self._validate_weight_storage((w1, w2, w1_scale, w2_scale, a1_scale, a2_scale))
+        expected_s1 = num_experts * _mxfp8_swizzled_act_sf_numel(
+            gemm1_rows, hidden_size
+        )
+        expected_s2 = num_experts * _mxfp8_swizzled_act_sf_numel(
+            hidden_size, intermediate_size
+        )
+        if w1_scale.dtype is not torch.uint8 or w2_scale.dtype is not torch.uint8:
+            raise TypeError("Cutlass MXFP8xMXFP4 weight scales must be uint8.")
+        if w1_scale.numel() != expected_s1 or w2_scale.numel() != expected_s2:
+            raise ValueError(
+                "Cutlass MXFP8xMXFP4 weight scale sizes "
+                f"{w1_scale.numel()}/{w2_scale.numel()} != expected "
+                f"{expected_s1}/{expected_s2}."
+            )
+        _require_cutlass_tensor(
+            a1_scale,
+            name="fc1_input_scale",
+            dtype=torch.float32,
+            shape=(num_experts,),
+        )
+        _require_cutlass_tensor(
+            a2_scale,
+            name="fc2_input_scale",
+            dtype=torch.float32,
+            shape=(num_experts,),
+        )
+        return [
+            w1.view(torch.int64),
+            w2.view(torch.int64),
+            w1_scale,
+            w2_scale,
+            a1_scale,
+            a2_scale,
+        ]
+
+    def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        return [
+            inputs[6].view(torch.int32),
+            inputs[8],
+            inputs[7].view(torch.int32),
+            inputs[9],
+        ]
+
+
+class CutlassMxfp8Runner(_CutlassRunnerBase):
+    """Unified adapter for CUTLASS MXFP8 x MXFP8 fused MoE."""
+
+    backend_key = "cutlass_mxfp8"
+    supported_quant_variants = (QuantVariant.MxFp8,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
+    _supported_archs = _CUTLASS_MXFP8_ARCHS
+    _x_dtype = torch.float8_e4m3fn
+    _weight_dtype = torch.float8_e4m3fn
+    _use_mxfp8_act_scaling = True
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_expert_scales",
+        "fc2_expert_scales",
+        "fc1_input_scale",
+        "fc2_input_scale",
+    )
+    _expected_num_inputs = 11
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        w1, w2, w1_scale, w2_scale, a1_scale, a2_scale = (
+            view[key] for key in self._required_weight_keys
+        )
+        num_experts = self.config.routing.num_experts
+        intermediate_size = self.config.experts.intermediate_size
+        if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+            raise ValueError(
+                "Cutlass MXFP8 requires hidden_size and intermediate_size "
+                f"divisible by 128, got H={hidden_size}, I={intermediate_size}."
+            )
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size)
+        expected_w2 = (num_experts, hidden_size, intermediate_size)
+        if w1.dtype is not torch.float8_e4m3fn or w2.dtype is not torch.float8_e4m3fn:
+            raise TypeError("Cutlass MXFP8 prepared weights must be float8_e4m3fn.")
+        if (tuple(w1.shape), tuple(w2.shape)) != (expected_w1, expected_w2):
+            raise ValueError(
+                f"Cutlass MXFP8 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"!= expected {expected_w1}/{expected_w2}."
+            )
+        # Binding aligns the semantic GEMM1 row count to the scale-factor tile.
+        expected_s1 = (
+            num_experts,
+            round_up(gemm1_rows, 128),
+            round_up(hidden_size // 32, 4) // 4,
+        )
+        expected_s2 = (
+            num_experts,
+            round_up(hidden_size, 128),
+            round_up(intermediate_size // 32, 4) // 4,
+        )
+        _require_cutlass_tensor(
+            w1_scale, name="fc1_expert_scales", dtype=torch.int32, shape=expected_s1
+        )
+        _require_cutlass_tensor(
+            w2_scale, name="fc2_expert_scales", dtype=torch.int32, shape=expected_s2
+        )
+        _require_cutlass_tensor(
+            a1_scale,
+            name="fc1_input_scale",
+            dtype=torch.float32,
+            shape=(num_experts,),
+        )
+        _require_cutlass_tensor(
+            a2_scale,
+            name="fc2_input_scale",
+            dtype=torch.float32,
+            shape=(num_experts,),
+        )
+        self._validate_weight_storage((w1, w2, w1_scale, w2_scale, a1_scale, a2_scale))
+        return [w1, w2, w1_scale, w2_scale, a1_scale, a2_scale]
+
+    def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        return [inputs[6], inputs[8], inputs[7], inputs[9]]
+
+
+class CutlassW4A8Runner(_CutlassRunnerBase):
+    """Unified adapter for CUTLASS INT4-weight x FP8-activation fused MoE."""
+
+    backend_key = "cutlass_w4a8"
+    supported_quant_variants = (QuantVariant.W4A8,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
+    _supported_archs = _CUTLASS_W4A8_ARCHS
+    _weight_dtype = torch.uint8
+    _use_w4_group_scaling = True
+    _use_packed_weights = True
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_expert_scales",
+        "fc2_expert_scales",
+        "fc1_act_scale",
+        "fc2_act_scale",
+        "fc1_zero",
+        "fc2_zero",
+        "fc1_alpha",
+        "fc2_alpha",
+    )
+    _expected_num_inputs = 14
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        tensors = tuple(view[key] for key in self._required_weight_keys)
+        w1, w2 = tensors[0], tensors[1]
+        num_experts = self.config.routing.num_experts
+        intermediate_size = self.config.experts.intermediate_size
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size // 2)
+        expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
+        if w1.dtype is not torch.uint8 or w2.dtype is not torch.uint8:
+            raise TypeError("Cutlass W4A8 packed weights must be uint8.")
+        if (tuple(w1.shape), tuple(w2.shape)) != (expected_w1, expected_w2):
+            raise ValueError(
+                f"Cutlass W4A8 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"!= expected {expected_w1}/{expected_w2}."
+            )
+        expected_s1 = (
+            num_experts,
+            gemm1_rows // 64,
+            hidden_size // 128,
+            8,
+            8,
+        )
+        expected_s2 = (
+            num_experts,
+            hidden_size // 64,
+            intermediate_size // 128,
+            8,
+            8,
+        )
+        w1_scale, w2_scale = tensors[2], tensors[3]
+        act1, act2, zero1, zero2, alpha1, alpha2 = tensors[4:]
+        _require_cutlass_tensor(
+            w1_scale,
+            name="fc1_expert_scales",
+            dtype=torch.bfloat16,
+            shape=expected_s1,
+        )
+        _require_cutlass_tensor(
+            w2_scale,
+            name="fc2_expert_scales",
+            dtype=torch.bfloat16,
+            shape=expected_s2,
+        )
+        _require_cutlass_tensor(
+            act1, name="fc1_act_scale", dtype=torch.bfloat16, shape=(hidden_size,)
+        )
+        _require_cutlass_tensor(
+            act2,
+            name="fc2_act_scale",
+            dtype=torch.bfloat16,
+            shape=(intermediate_size,),
+        )
+        _require_cutlass_tensor(
+            zero1, name="fc1_zero", dtype=torch.bfloat16, shape=(0,)
+        )
+        _require_cutlass_tensor(
+            zero2, name="fc2_zero", dtype=torch.bfloat16, shape=(0,)
+        )
+        _require_cutlass_tensor(
+            alpha1, name="fc1_alpha", dtype=torch.float32, shape=(num_experts,)
+        )
+        _require_cutlass_tensor(
+            alpha2, name="fc2_alpha", dtype=torch.float32, shape=(num_experts,)
+        )
+        self._validate_weight_storage(tensors)
+        return list(tensors)
+
+    def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        return list(inputs[6:14])
+
+
+class CutlassHummingRunner(_CutlassRunnerBase):
+    """Unified adapter for CUTLASS Humming MXFP4 x FP8 fused MoE."""
+
+    backend_key = "cutlass_humming"
+    supported_quant_variants = (QuantVariant.Humming,)
+    supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
+    _supported_archs = _CUTLASS_HUMMING_ARCHS
+    _weight_dtype = torch.uint8
+    _use_w4_group_scaling = True
+    _use_wfp4afp8_humming = True
+    _required_weight_keys = (
+        "fc1_expert_weights",
+        "fc2_expert_weights",
+        "fc1_expert_scales",
+        "fc2_expert_scales",
+        "fc1_residual_scale",
+        "fc2_residual_scale",
+        "fc2_act_global",
+    )
+    _expected_num_inputs = 11
+
+    def _pack_weight_inputs(
+        self, view: dict[str, torch.Tensor], hidden_size: int
+    ) -> List[torch.Tensor]:
+        w1, w2, w1_scale, w2_scale, r1, r2, a2 = (
+            view[key] for key in self._required_weight_keys
+        )
+        num_experts = self.config.routing.num_experts
+        intermediate_size = self.config.experts.intermediate_size
+        gemm1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, gemm1_rows, hidden_size // 2)
+        expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
+        if w1.dtype is not torch.uint8 or w2.dtype is not torch.uint8:
+            raise TypeError("Cutlass Humming packed weights must be uint8.")
+        if (tuple(w1.shape), tuple(w2.shape)) != (expected_w1, expected_w2):
+            raise ValueError(
+                "Cutlass Humming weight shapes "
+                f"{tuple(w1.shape)}/{tuple(w2.shape)} != expected "
+                f"{expected_w1}/{expected_w2}."
+            )
+        expected_s1 = (
+            num_experts,
+            gemm1_rows // 64,
+            hidden_size // 128,
+            16,
+            16,
+        )
+        expected_s2 = (
+            num_experts,
+            hidden_size // 64,
+            intermediate_size // 128,
+            16,
+            16,
+        )
+        _require_cutlass_tensor(
+            w1_scale, name="fc1_expert_scales", dtype=torch.uint8, shape=expected_s1
+        )
+        _require_cutlass_tensor(
+            w2_scale, name="fc2_expert_scales", dtype=torch.uint8, shape=expected_s2
+        )
+        _require_cutlass_tensor(
+            r1, name="fc1_residual_scale", dtype=torch.float32, shape=(num_experts,)
+        )
+        _require_cutlass_tensor(
+            r2, name="fc2_residual_scale", dtype=torch.float32, shape=(num_experts,)
+        )
+        _require_cutlass_tensor(
+            a2, name="fc2_act_global", dtype=torch.float32, shape=()
+        )
+        self._validate_weight_storage((w1, w2, w1_scale, w2_scale, r1, r2, a2))
+        return [w1, w2, w1_scale, w2_scale, r1, r2, a2]
+
+    def _quant_scales(self, inputs: List[torch.Tensor]) -> List[torch.Tensor]:
+        return [
+            inputs[6].view(torch.int32),
+            inputs[8],
+            inputs[10],
+            inputs[7].view(torch.int32),
+            inputs[9],
+        ]
+
+
 # ---------------------------------------------------------------------------
 # CuteDSL NVFP4 runner — delegates to the matching W4A4 or W4A16 runner
 # ---------------------------------------------------------------------------
@@ -816,12 +1872,15 @@ class CuteDslNvfp4Runner(MoERunner):
     # CuteDSL has no in-kernel router; it only consumes pre-routed packs.
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.NVFP4, QuantVariant.W4A16)
+    supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
 
     def _check_support(self) -> None:
         super()._check_support()
-        if self.config.activation.type is not ActivationType.Swiglu:
+        if isinstance(self.config.activation, SiTU) and (
+            self.config.activation.clamp_limit is not None
+        ):
             raise NotImplementedError(
-                f"{type(self).__name__} supports only the Swiglu activation."
+                f"{type(self).__name__} SiTU does not expose a separate clamp_limit."
             )
         if not self.config.finalize.do_finalize:
             raise NotImplementedError(
@@ -868,8 +1927,8 @@ class CuteDslNvfp4Runner(MoERunner):
                 local_expert_offset=experts.local_expert_offset,
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
-                activation_type=int(self.config.activation.type),
                 use_per_token_activation=bool(self.config.quant.per_token_scale),
+                **_cute_dsl_activation_kwargs(self.config.activation),
             )
         elif self.config.quant.variant is QuantVariant.W4A16:
             self._inner = CuteDslFusedMoEW4A16Runner(
@@ -879,7 +1938,7 @@ class CuteDslNvfp4Runner(MoERunner):
                 local_expert_offset=experts.local_expert_offset,
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
-                activation_type=int(self.config.activation.type),
+                **_cute_dsl_activation_kwargs(self.config.activation),
             )
         else:
             raise NotImplementedError(
@@ -939,6 +1998,21 @@ class CuteDslNvfp4Runner(MoERunner):
         _validate_prerouted_inputs(
             act, num_tokens, self._inner.top_k, "CuteDslNvfp4Runner"
         )
+        # prepare_weights defaults to SwiGLU, so a non-gated config paired with a
+        # default-prepared view yields 2I rows. The tuner infers intermediate_size
+        # from this tensor, so the mismatch would surface as a shape error deep in
+        # the kernel rather than here.
+        expected_rows = self.config.experts.intermediate_size * (
+            2 if self.config.activation.is_gated else 1
+        )
+        actual_rows = v["w1_weight"].shape[1]
+        if actual_rows != expected_rows:
+            raise ValueError(
+                f"CuteDslNvfp4Runner: w1_weight has {actual_rows} GEMM1 rows, "
+                f"expected {expected_rows} for "
+                f"{type(self.config.activation).__name__}; prepare the view with "
+                "the same typed activation."
+            )
 
         quant_variant = self.config.quant.variant
         use_per_token_activation = bool(self.config.quant.per_token_scale)
@@ -1094,12 +2168,23 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         QuantVariant.W4A16,
     )
     supports_fused_shared_experts = True
+    supported_activation_classes_by_quant: ClassVar[
+        dict[QuantVariant, tuple[type[ActivationConfig], ...]]
+    ] = {
+        QuantVariant.NVFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
+        QuantVariant.MXFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
+        QuantVariant.W4A16: (SwiGLU,),
+    }
 
     def _check_support(self) -> None:
         super()._check_support()
-        if self.config.activation.type is not ActivationType.Swiglu:
+        activation = self.config.activation
+        if isinstance(activation, SiTU) and activation.linear_scale is None:
+            # gemm1_beta is a per-expert float tensor with no encoding for
+            # "unclamped"; only the CuTe-DSL scalar ABI can express it.
             raise NotImplementedError(
-                f"{type(self).__name__} supports only the Swiglu activation."
+                f"{type(self).__name__} cannot express SiTU(linear_scale=None); "
+                "the TRT-LLM ABI has no unclamped linear-branch encoding."
             )
         variant = self.config.quant.variant
         if variant in self.supported_quant_variants:
@@ -1109,6 +2194,15 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             # #4171. NVFP4/MXFP4 support SM100/SM103/SM107; W4A16 supports
             # SM100/SM107 and retains the upstream SM103 xfail in #1754.
             compute_capability = get_compute_capability(self.device)
+            if compute_capability == (10, 7) and isinstance(activation, SiTU):
+                # The pinned Rubin BMM lacks SiTuGlu; its enum value collides
+                # with None and would silently disable the activation.
+                # TODO: Update TRTLLM_GEN_BMM_RUBIN to an artifact with
+                # SiTuGlu, then remove this guard and add SM107 parity coverage.
+                raise NotImplementedError(
+                    f"{type(self).__name__} does not support SiTU on SM107 with "
+                    "the currently pinned Rubin BMM artifact."
+                )
             if variant in (QuantVariant.NVFP4, QuantVariant.MXFP4):
                 supported = compute_capability in ((10, 0), (10, 3), (10, 7))
             else:
@@ -1276,7 +2370,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         expected_weights = {
             "gemm1_weights": (
                 self._num_weight_rows,
-                2 * self._intermediate_size,
+                self._intermediate_size * (2 if self.config.activation.is_gated else 1),
                 hidden_size // 2,
             ),
             "gemm2_weights": (
@@ -1298,7 +2392,8 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
                 "gemm1_weights_scale",
                 (
                     self._num_weight_rows,
-                    2 * self._intermediate_size,
+                    self._intermediate_size
+                    * (2 if self.config.activation.is_gated else 1),
                     hidden_size // sf_vec_size,
                 ),
             ),
@@ -1370,6 +2465,9 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
         from .core import MoeRunnerInputs, RoutingInputMode
 
         v = weights.get_view(self.backend_key)
+        _validate_prepared_activation_params(
+            v, self.config.activation, type(self).__name__
+        )
         routing = self.config.routing
 
         num_tokens = act.hidden_states_q.shape[0]
@@ -1498,8 +2596,8 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
             gemm1_weights_scale=v["gemm1_weights_scale"],
             gemm1_bias=None,
             gemm1_alpha=v.get("gemm1_alpha"),
-            gemm1_beta=None,
-            gemm1_clamp_limit=None,
+            gemm1_beta=v.get("gemm1_beta"),
+            gemm1_clamp_limit=v.get("gemm1_clamp_limit"),
             gemm2_weights=v["gemm2_weights"],
             gemm2_weights_scale=v["gemm2_weights_scale"],
             gemm2_bias=None,
@@ -1557,13 +2655,15 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         QuantVariant.MxFp8,
     )
     supports_fused_shared_experts = True
+    supported_activation_classes_by_quant: ClassVar[
+        dict[QuantVariant, tuple[type[ActivationConfig], ...]]
+    ] = {
+        QuantVariant.DeepSeekFp8: (SwiGLU,),
+        QuantVariant.MxFp8: (SwiGLU, GeGLU, ReLU2),
+    }
 
     def _check_support(self) -> None:
         super()._check_support()
-        if self.config.activation.type is not ActivationType.Swiglu:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only the Swiglu activation."
-            )
         from ..utils import get_compute_capability
         from .api import TrtllmFp8BlockConfig
 
@@ -1684,7 +2784,9 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
                 )
             expected_w1_scale = (
                 self._num_weight_rows,
-                2 * self._intermediate_size // 128,
+                self._intermediate_size
+                * (2 if self.config.activation.is_gated else 1)
+                // 128,
                 hidden_size // 128,
             )
             expected_w2_scale = (
@@ -1702,7 +2804,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
                 )
             expected_w1_scale = (
                 self._num_weight_rows,
-                2 * self._intermediate_size,
+                self._intermediate_size * (2 if self.config.activation.is_gated else 1),
                 hidden_size // 32,
             )
             expected_w2_scale = (
@@ -1715,7 +2817,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         expected_weights = {
             "gemm1_weights": (
                 self._num_weight_rows,
-                2 * self._intermediate_size,
+                self._intermediate_size * (2 if self.config.activation.is_gated else 1),
                 hidden_size,
             ),
             "gemm2_weights": (
@@ -1757,6 +2859,9 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         from .core import MoeRunnerInputs, RoutingInputMode
 
         view = weights.get_view(self.backend_key)
+        _validate_prepared_activation_params(
+            view, self.config.activation, type(self).__name__
+        )
         routing = self.config.routing
         num_tokens, hidden_size = act.hidden_states_q.shape
         hidden_states_scale = self._validate_fp8_tensors(act, view, hidden_size)
@@ -1880,6 +2985,18 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = (QuantVariant.FP8PerTensor,)
+    # The per-tensor cubin manifest has SwiGLU and ReLU2 epilogues. GeGLU is
+    # representable by the enum but has no matching generated kernel.
+    supported_activation_classes = (SwiGLU, ReLU2)
+
+    def _check_activation_parameters(self) -> None:
+        if (
+            isinstance(self.config.activation, SwiGLU)
+            and self.config.activation != SwiGLU()
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot represent non-default SwiGLU scalars."
+            )
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -1887,10 +3004,6 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
         from ..utils import get_compute_capability
         from .api import TrtllmFp8PerTensorConfig
 
-        if self.config.activation.type is not ActivationType.Swiglu:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only the Swiglu activation."
-            )
         if (
             self.config.routing.method is RoutingMethodType.Llama4
             and self.config.routing.top_k != 1
@@ -1994,7 +3107,8 @@ class TrtllmFp8PerTensorRunner(_TrtllmRunnerBase):
                 "gemm1_weights",
                 (
                     self._num_local_experts,
-                    2 * self._intermediate_size,
+                    self._intermediate_size
+                    * (2 if self.config.activation.is_gated else 1),
                     hidden_size,
                 ),
             ),
@@ -2161,13 +3275,12 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = (QuantVariant.BF16,)
+    # The BF16 cubin manifest currently contains SwiGLU and ReLU2. GeGLU and
+    # SiTU are represented by the launcher enum but have no matching kernels.
+    supported_activation_classes = (SwiGLU, ReLU2)
 
     def _check_support(self) -> None:
         super()._check_support()
-        if self.config.activation.type is not ActivationType.Swiglu:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only the Swiglu activation."
-            )
         from ..utils import get_compute_capability
 
         major, minor = get_compute_capability(self.device)
@@ -2260,6 +3373,15 @@ class TrtllmBf16RoutedRunner(_TrtllmRunnerBase):
         from .core import MoeRunnerInputs, RoutingInputMode
 
         v = weights.get_view(self.backend_key)
+        _validate_prepared_activation_params(
+            v, self.config.activation, type(self).__name__
+        )
+        _validate_optional_gemm1_activation_params(
+            v,
+            self._num_local_experts,
+            act.hidden_states_q.device,
+            type(self).__name__,
+        )
         routing = self.config.routing
 
         hidden_states = act.hidden_states_q  # raw bf16 on this path
@@ -2366,13 +3488,10 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         RoutingInputMode.FromLogits,
     )
     supported_quant_variants = (QuantVariant.MxInt4,)
+    supported_activation_classes = (SwiGLU,)
 
     def _check_support(self) -> None:
         super()._check_support()
-        if self.config.activation.type is not ActivationType.Swiglu:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only the Swiglu activation."
-            )
         from ..utils import get_compute_capability
         from .api import TrtllmMxInt4Config
 
@@ -2459,6 +3578,9 @@ class TrtllmMxInt4RoutedRunner(_TrtllmRunnerBase):
         from .core import MoeRunnerInputs
 
         view = weights.get_view(self.backend_key)
+        _validate_prepared_activation_params(
+            view, self.config.activation, type(self).__name__
+        )
         routing = self.config.routing
         hidden_states = act.hidden_states_q
         if hidden_states.dtype != torch.bfloat16 or hidden_states.dim() != 2:
@@ -2628,6 +3750,20 @@ class _B12xRunner(MoERunner):
     supports_expert_parallelism = False
     required_weight_keys: ClassVar[tuple[str, ...]] = ()
 
+    # Kernel activation name, resolved in _check_support() rather than
+    # __init__() so an unsupported activation is a filterable
+    # NotImplementedError instead of a constructor failure.
+    activation: str | None
+
+    def _check_activation_parameters(self) -> None:
+        if (
+            isinstance(self.config.activation, SwiGLU)
+            and self.config.activation != SwiGLU()
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} cannot represent non-default SwiGLU scalars."
+            )
+
     def _check_support(self) -> None:
         super()._check_support()
 
@@ -2648,15 +3784,23 @@ class _B12xRunner(MoERunner):
         if not self.config.finalize.do_finalize:
             raise NotImplementedError("b12x unified MoE requires do_finalize=True.")
 
-    def __init__(self, config: MoEConfig, device: torch.device):
-        super().__init__()
+        # super()._check_support() already rejected activations outside the
+        # declared capability set; translate any residual gap in the name table
+        # into the NotImplementedError that backend selection filters on.
         from .utils import get_b12x_activation_name
 
+        try:
+            self.activation = get_b12x_activation_name(self.config.activation.type)
+        except ValueError as exc:
+            raise NotImplementedError(str(exc)) from exc
+
+    def __init__(self, config: MoEConfig, device: torch.device):
+        super().__init__()
         self.config = config
         self.device = torch.device(device)
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
-        self.activation = get_b12x_activation_name(config.activation.type)
+        self.activation = None
         self.tuning_config = TuningConfig()
         self._prepared_weights: dict[str, torch.Tensor] | None = None
         self._inner: Any = None
@@ -2817,6 +3961,7 @@ class B12xNvfp4Runner(_B12xRunner):
     backend_key = "b12x_nvfp4"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.NVFP4,)
+    supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2)
     required_weight_keys = (
         "w1_weight",
         "w1_weight_sf",
@@ -2834,6 +3979,7 @@ class B12xW4A16Runner(_B12xRunner):
     backend_key = "b12x_w4a16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.W4A16,)
+    supported_activation_classes = (SwiGLU, ReLU2)
     required_weight_keys = (
         "w1_weight",
         "w1_weight_sf",
@@ -2842,13 +3988,3 @@ class B12xW4A16Runner(_B12xRunner):
         "w2_weight_sf",
         "w2_alpha",
     )
-
-    def _check_support(self) -> None:
-        super()._check_support()
-        if self.config.activation.type not in (
-            ActivationType.Swiglu,
-            ActivationType.Relu2,
-        ):
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only the Swiglu or Relu2 activation."
-            )
