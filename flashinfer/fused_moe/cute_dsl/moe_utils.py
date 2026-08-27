@@ -76,6 +76,25 @@ def validate_cute_dsl_moe_situ_config(
         raise ValueError("situ_linear_beta must be positive and finite when set")
 
 
+def normalize_cute_dsl_moe_weight_interleave(
+    weight_interleave: Optional[int], swap_ab: bool
+) -> int:
+    """Validate and resolve the physical up/gate weight interleave."""
+    if weight_interleave is None:
+        weight_interleave = 16 if swap_ab else 64
+    valid_values = (16,) if swap_ab else (16, 64)
+    if (
+        isinstance(weight_interleave, bool)
+        or not isinstance(weight_interleave, int)
+        or weight_interleave not in valid_values
+    ):
+        raise ValueError(
+            f"weight_interleave must be one of {valid_values} "
+            f"when swap_ab={swap_ab}, got {weight_interleave!r}"
+        )
+    return weight_interleave
+
+
 def get_max_num_tiles(
     num_tokens: int,
     top_k: int,

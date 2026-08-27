@@ -363,7 +363,7 @@ class TestReprRoundTrip:
                 topk_group=4,
                 routed_scaling_factor=1.0,
             ),
-            quant=QuantConfig(variant=QuantVariant.MxFp8),
+            quant=QuantConfig(variant=QuantVariant.MXFP8),
             experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
             activation=GeGLU(),
             backend=BackendOptions(
@@ -877,14 +877,14 @@ class TestExpressiveness:
                 top_k=8,
                 method=RoutingMethodType.Renormalize,
             ),
-            quant=QuantConfig(variant=QuantVariant.MxFp8),
+            quant=QuantConfig(variant=QuantVariant.MXFP8),
             experts=ExpertConfig(intermediate_size=512),
             activation=SwiGLU(),
             backend=BackendOptions(
                 candidates=(TrtllmFp8BlockConfig(), CutlassMxfp8Config())
             ),
         )
-        assert cfg.quant.variant == QuantVariant.MxFp8
+        assert cfg.quant.variant == QuantVariant.MXFP8
 
     def test_trtllm_fp8_per_tensor(self):
         """Per-tensor FP8 config."""
@@ -1042,7 +1042,7 @@ class TestMoERunnerSupport:
         )
         assert TrtllmFp8BlockRunner.supported_activation_classes_by_quant == {
             QuantVariant.DeepSeekFp8: (SwiGLU,),
-            QuantVariant.MxFp8: (SwiGLU, GeGLU, ReLU2),
+            QuantVariant.MXFP8: (SwiGLU, GeGLU, ReLU2),
         }
         assert TrtllmMxInt4RoutedRunner.supported_activation_classes == (SwiGLU,)
 
@@ -3365,7 +3365,7 @@ _RUNNERS = [
         TrtllmFp8BlockRunner,
         TrtllmFp8BlockConfig(),
         QuantVariant.DeepSeekFp8,
-        QuantVariant.MxFp8,
+        QuantVariant.MXFP8,
         id="fp8_block",
     ),
     pytest.param(

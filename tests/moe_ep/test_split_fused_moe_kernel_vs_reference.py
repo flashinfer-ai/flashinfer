@@ -300,6 +300,7 @@ def test_split_w4a8_kernel_matches_direct_runner():
     from flashinfer.moe_ep.backends.split.kernel.fused_moe.backend import (
         FusedMoeSplitKernelBackend,
     )
+    from flashinfer.fused_moe.cute_dsl.tuner import DEFAULT_BLACKWELL_MOE_TACTIC
     from flashinfer.quantization.fp8_quantization import mxfp8_quantize
 
     x, w13, w2, _, _ = _make_problem()
@@ -309,7 +310,9 @@ def test_split_w4a8_kernel_matches_direct_runner():
         max_tokens_per_rank=NUM_TOKENS // NUM_EXPERTS,
         token_hidden_size=HIDDEN,
     )
-    backend = FusedMoeSplitKernelBackend(ep.FusedMoeKernelConfig(moe_config=cfg))
+    backend = FusedMoeSplitKernelBackend(
+        ep.FusedMoeKernelConfig(moe_config=cfg, tactic=DEFAULT_BLACKWELL_MOE_TACTIC)
+    )
     assert backend._transformed_weights is None
     assert backend.pack_dispatch_payload(x) is x
     backend.validate_init(ep.BootstrapConfig(world_size=1, rank=0), fleet)

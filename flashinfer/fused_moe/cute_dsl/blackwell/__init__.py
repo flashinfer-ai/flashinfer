@@ -20,14 +20,15 @@ This module contains CuteDSL kernels optimized for NVIDIA Blackwell architecture
 These kernels are adapted from TensorRT-LLM.
 """
 
+from cutlass.cute.arch import (
+    griddepcontrol_launch_dependents,
+    griddepcontrol_wait,
+)
+
 from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
 )
 from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
     BlockScaledContiguousGatherGroupedGemmKernel,
 )
-from .utils import (
-    griddepcontrol_launch_dependents,
-    griddepcontrol_wait,
-    is_power_of_2,
-)
+from .utils import is_power_of_2

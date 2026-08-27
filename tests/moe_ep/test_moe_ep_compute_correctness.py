@@ -302,6 +302,8 @@ def _run_w4a8_dispatch(layout_str, *, mxfp8_dispatch):
     import flashinfer.fused_moe as fm
     import flashinfer.moe_ep as ep
 
+    from flashinfer.fused_moe.cute_dsl.tuner import DEFAULT_BLACKWELL_MOE_TACTIC
+
     rank, world_size = dist.get_rank(), dist.get_world_size()
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
     torch.cuda.set_device(local_rank)
@@ -389,6 +391,7 @@ def _run_w4a8_dispatch(layout_str, *, mxfp8_dispatch):
             kernel=ep.FusedMoeKernelConfig(
                 moe_config=moe,
                 mxfp8_dispatch=mxfp8_dispatch,
+                tactic=DEFAULT_BLACKWELL_MOE_TACTIC,
             ),
         ),
     )

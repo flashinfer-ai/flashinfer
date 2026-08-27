@@ -31,7 +31,7 @@ grouped GEMM kernel with fused gather and activation designed for MoE GEMM1 laye
 
 Key features:
 - NVFP4 x NVFP4 and MXFP8 x MXFP4 grouped GEMM paths
-- Fused gather operation using LDGSTS instructions with token_id_mapping
+- Fused gather operation using asynchronous copies with token_id_mapping
 - Eliminates the need for a separate moe_permute kernel
 - Fused FC1 activation in the epilogue
 - Optional FP4 quantization of output with scale factor generation
@@ -70,6 +70,7 @@ from flashinfer.cute_dsl.utils import (
 )
 from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
+    normalize_cute_dsl_moe_weight_interleave,
     validate_cute_dsl_moe_situ_config,
 )
 
@@ -238,6 +239,8 @@ def _get_compiled_gather_kernel(
     token_id_ptr,
     num_tiles_ptr,
     norm_const_ptr,
+    bias_up_ptr,
+    bias_gate_ptr,
     a_per_token_scale_ptr,
     max_active_clusters: int,
     stream,
@@ -260,7 +263,11 @@ def _get_compiled_gather_kernel(
     # Rubin-specific
     mma_tiler: Optional[Tuple[int, int, int]] = None,
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
-    # PDL control
+    pdl_count: Optional[int] = -1,
+    split_k: int = 1,
+    swap_ab: bool = False,
+    use_compact_sf: bool = True,
+    weight_interleave: Optional[int] = None,
     enable_pdl: bool = True,
     activation_type: Union[int, ActivationType] = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
@@ -270,6 +277,8 @@ def _get_compiled_gather_kernel(
     situ_linear_beta: Optional[float] = None,
     gated: bool = True,
     use_a_per_token_scale: bool = False,
+    apply_expert_alpha: bool = True,
+    bias_expert_stride_factor: int = 1,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -309,7 +318,11 @@ def _get_compiled_gather_kernel(
         cluster_shape_mn,
         vectorized_f32,
         raster_along_m,
-        enable_pdl,
+        pdl_count,
+        split_k,
+        swap_ab,
+        use_compact_sf,
+        weight_interleave,
         normalized_activation_type.value,
         swiglu_alpha,
         swiglu_beta,
@@ -318,6 +331,8 @@ def _get_compiled_gather_kernel(
         situ_linear_beta,
         gated,
         use_a_per_token_scale,
+        apply_expert_alpha,
+        bias_expert_stride_factor,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -366,7 +381,11 @@ def _get_compiled_gather_kernel(
                 vectorized_f32=vectorized_f32,
                 topk=topk,
                 raster_along_m=raster_along_m,
-                enable_pdl=enable_pdl,
+                pdl_count=pdl_count,
+                split_k=split_k,
+                swap_ab=swap_ab,
+                use_compact_sfc=use_compact_sf,
+                weight_interleave=weight_interleave,
                 activation_type=normalized_activation_type.value,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
@@ -375,18 +394,21 @@ def _get_compiled_gather_kernel(
                 situ_linear_beta=situ_linear_beta,
                 gated=gated,
                 use_a_per_token_scale=use_a_per_token_scale,
+                apply_expert_alpha=apply_expert_alpha,
+                bias_expert_stride_factor=bias_expert_stride_factor,
             )
         wrapper_fn = gemm.wrapper
 
         # Compile with runtime parameters - they can vary across calls.
         # Order must match the wrapper signature, and the two wrappers have
-        # DIFFERENT arities: the Blackwell wrapper takes a_per_token_scale_ptr
-        # (13 pointers), the Rubin SM107 wrapper does not (12 pointers).
-        # Passing 13 pointers to the SM107 wrapper shifts every argument one
-        # slot and dies with "multiple values for argument 'tile_size'".
+        # DIFFERENT arities: the Blackwell wrapper takes bias_up_ptr,
+        # bias_gate_ptr, and a_per_token_scale_ptr (15 pointers), while the
+        # Rubin SM107 wrapper takes 12 pointers. Passing 15 pointers to the
+        # SM107 wrapper shifts every following argument one slot.
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
-        #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr, token_id_mapping_ptr,
-        #  num_non_exiting_tiles_ptr, global_sf_ptr, [a_per_token_scale_ptr],
+        #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr,
+        #  token_id_mapping_ptr, num_non_exiting_tiles_ptr, global_sf_ptr,
+        #  [bias_up_ptr, bias_gate_ptr, a_per_token_scale_ptr],
         #  orig_m, m, n, k, l, tile_size, scaling_vector_size,
         #  max_active_clusters, stream)
         compiled_gemm = cute.compile(
@@ -403,7 +425,7 @@ def _get_compiled_gather_kernel(
             token_id_ptr,
             num_tiles_ptr,
             norm_const_ptr,
-            *([] if is_rubin else [a_per_token_scale_ptr]),
+            *([] if is_rubin else [bias_up_ptr, bias_gate_ptr, a_per_token_scale_ptr]),
             orig_m,
             permuted_m,
             n,
@@ -425,7 +447,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     b: torch.Tensor,
     a_scale: torch.Tensor,
     b_scale: torch.Tensor,
-    alpha: torch.Tensor,
+    alpha: Optional[torch.Tensor],
     tile_idx_to_expert_idx: torch.Tensor,
     tile_idx_to_mn_limit: torch.Tensor,
     token_id_mapping: torch.Tensor,
@@ -435,6 +457,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     global_scale: Optional[torch.Tensor] = None,
     *,
     a_per_token_scale: Optional[torch.Tensor] = None,
+    bias_up: Optional[torch.Tensor] = None,
+    bias_gate: Optional[torch.Tensor] = None,
     topk: int = 8,
     a_dtype: str = "float4_e2m1fn",
     b_dtype: str = "float4_e2m1fn",
@@ -450,7 +474,12 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     # Rubin-specific parameters (optional; when set, use SM107 kernel)
     mma_tiler: Optional[Tuple[int, int, int]] = None,
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
-    enable_pdl: bool = True,
+    pdl_count: Optional[int] = -1,
+    split_k: int = 1,
+    swap_ab: bool = False,
+    use_compact_sf: bool = True,
+    weight_interleave: Optional[int] = None,
+    enable_pdl: Optional[bool] = None,
     activation_type: Union[int, ActivationType] = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
@@ -489,12 +518,15 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         out: Optional output tensor, shape (permuted_m, intermediate_size). Created if None.
              For FP4 output, shape is (permuted_m, intermediate_size//2) uint8.
         out_scale: Optional output scale factor tensor for block-scaled
-            quantized output.
+            quantized output. Unswapped FP4 scales use the native SM100 MMA
+            layout; other scaled outputs use compact row-major storage.
         global_scale: Global scale factor for FP4 output quantization, shape
             (1,), float32.
         a_per_token_scale: Optional per-token row scale for operand A,
             shape (seq_len,), float32. Indexed by the original token ID and
             applied before the fused activation.
+        bias_up: Optional per-expert bias for the up-projection branch.
+        bias_gate: Optional per-expert bias for the gate-projection branch.
         topk: Number of experts per token. Default: 8
         a_dtype: Data type for the A matrix.
         b_dtype: Data type for the B matrix.
@@ -510,7 +542,15 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         vectorized_f32: Use vectorized f32x2 operations. Default: True
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
-        enable_pdl: Enable Programmatic Dependent Launch. Default: True.
+        pdl_count: Persistent K-tile index at which to launch dependent grids.
+            None disables Programmatic Dependent Launch, -1 releases dependent
+            grids when the kernel completes, and a non-negative value releases
+            them at that persistent K-tile. Default: -1.
+        split_k: Number of cluster-local FC1 K partitions. Values greater
+            than one require swap_ab. Default: 1.
+        swap_ab: Swap the device A/B operands and M/N roles. Default: False.
+        weight_interleave: Physical up/gate weight interleave: 16 or 64 for
+            unswapped, and 16 for swapped weights. Defaults by swap mode.
         activation_type: Activation type for the epilogue. Use
             ActivationType.Swiglu for gated SwiGLU/OAI/SiTU,
             ActivationType.GegluTanh for tanh-approximate GeGLU, and
@@ -583,6 +623,11 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     validate_cute_dsl_moe_situ_config(
         normalized_activation_type, situ_beta, situ_linear_beta
     )
+    if enable_pdl is not None:
+        pdl_count = -1 if enable_pdl else None
+    weight_interleave = normalize_cute_dsl_moe_weight_interleave(
+        weight_interleave, swap_ab
+    )
 
     # Get dimensions
     seq_len = a.shape[0]
@@ -596,6 +641,11 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         raise ValueError(f"A and B logical K dimensions must match, got {k} and {b_k}")
 
     intermediate_size = n // (2 if gated else 1)
+    if gated and intermediate_size % weight_interleave != 0:
+        raise ValueError(
+            f"gated intermediate_size={intermediate_size} must be divisible by "
+            f"weight_interleave={weight_interleave}"
+        )
     permuted_m = token_id_mapping.shape[0]
 
     use_a_per_token_scale = a_per_token_scale is not None
@@ -625,12 +675,6 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             )
         if c_dtype == "float4_e2m1fn" and global_scale is None:
             raise ValueError("global_scale is required when c_dtype is 'float4_e2m1fn'")
-        # The output scale-factor tensor is laid out in whole 128-row MMA atoms.
-        if permuted_m % 128 != 0:
-            raise ValueError(
-                f"permuted_m={permuted_m} must be padded to a multiple of 128 "
-                "when generating output scale factors"
-            )
     elif out_scale is not None or global_scale is not None:
         raise ValueError(
             "out_scale and global_scale are only supported when quantize_output is True"
@@ -684,20 +728,25 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         )
     else:
         can_impl = BlockScaledContiguousGatherGroupedGemmKernel.can_implement(
-            a_dtype_cutlass,
-            b_dtype_cutlass,
-            sf_dtype_cutlass,
-            sf_vec_size,
-            c_dtype_cutlass,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            permuted_m,
-            n,
-            k,
-            num_experts,
+            a_dtype=a_dtype_cutlass,
+            b_dtype=b_dtype_cutlass,
+            sf_dtype=sf_dtype_cutlass,
+            sf_vec_size=sf_vec_size,
+            c_dtype=c_dtype_cutlass,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            m=permuted_m,
+            n=n,
+            k=k,
+            l=num_experts,
             a_major="k",
             b_major="k",
             c_major="n",
+            swap_ab=swap_ab,
+            gated=gated,
+            split_k=split_k,
+            use_compact_sfc=use_compact_sf,
+            weight_interleave=weight_interleave,
         )
     if not can_impl:
         raise ValueError(
@@ -725,16 +774,40 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             )
 
     # Create output scale tensor if needed and not provided
-    if generate_sfc and out_scale is None:
+    if generate_sfc:
         # Scale factor layout for output
-        scale_atom_n = sf_vec_size * 4
-        scale_rest_n = (intermediate_size + scale_atom_n - 1) // scale_atom_n
-        # MMA-compatible scale factor shape
-        out_scale = torch.empty(
-            (32, 4, permuted_m // 128, 4, scale_rest_n, 1),
-            dtype=torch.uint8,
-            device=a.device,
-        )
+        scale_intermediate_size = intermediate_size // sf_vec_size
+        expected_scale_shape: Tuple[int, ...]
+        if swap_ab and use_compact_sf:
+            expected_scale_shape = (
+                permuted_m,
+                ((scale_intermediate_size + 15) // 16) * 16,
+            )
+        elif swap_ab or c_dtype == "float4_e2m1fn":
+            expected_scale_shape = (
+                32,
+                4,
+                (permuted_m + 127) // 128,
+                4,
+                scale_intermediate_size // 4,
+                1,
+            )
+        else:
+            expected_scale_shape = (
+                permuted_m,
+                ((scale_intermediate_size + 15) // 16) * 16,
+            )
+        if out_scale is None:
+            out_scale = torch.empty(
+                expected_scale_shape,
+                dtype=torch.uint8,
+                device=a.device,
+            )
+        elif tuple(out_scale.shape) != expected_scale_shape:
+            raise ValueError(
+                f"out_scale must use shape {expected_scale_shape}, "
+                f"got {tuple(out_scale.shape)}"
+            )
 
     # Get SM count
     if sm_count is None:
@@ -742,7 +815,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
 
     # Compute max active clusters (cached to avoid expensive HardwareInfo queries)
     max_active_clusters = get_max_active_clusters(
-        cluster_shape_mn[0] * cluster_shape_mn[1]
+        cluster_shape_mn[0] * cluster_shape_mn[1] * split_k
     )
 
     tile_size = mma_tiler[0] if is_rubin else mma_tiler_mn[0]
@@ -765,18 +838,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     )
 
     if generate_sfc:
-        # CuTeDSL supports FP32 -> E8M0 conversion, but the MXFP8 epilogue
-        # deliberately emits the exact UE8M0 codes used by mxfp8_quantize and
-        # scalar-stores them as bytes. This also avoids the unsupported
-        # vector<2xE8M0> conversion/store lowering; GEMM2 reinterprets the same
-        # bytes as Float8E8M0FNU scale factors.
-        c_sf_storage_dtype = (
-            cutlass.Uint8
-            if c_dtype == "float8_e4m3fn" and sf_dtype == "float8_e8m0fnu"
-            else sf_dtype_cutlass
-        )
         c_sf_ptr = make_ptr(
-            c_sf_storage_dtype,
+            sf_dtype_cutlass,
             out_scale.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=16,
@@ -794,7 +857,29 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         c_sf_ptr = None
         norm_const_ptr = None
 
-    alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
+    apply_expert_alpha = alpha is not None
+    alpha_ptr = (
+        make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
+        if apply_expert_alpha
+        else None
+    )
+    if bias_up is None:
+        bias_up = torch.zeros(
+            (num_experts, intermediate_size), dtype=torch.float32, device=a.device
+        )
+    if bias_gate is None:
+        bias_gate = torch.zeros(
+            (num_experts, intermediate_size), dtype=torch.float32, device=a.device
+        )
+    if bias_up.stride() != bias_gate.stride() or bias_up.stride(1) != 1:
+        raise ValueError("bias_up and bias_gate must use matching row-major strides")
+    bias_expert_stride_factor, remainder = divmod(bias_up.stride(0), intermediate_size)
+    if remainder or bias_expert_stride_factor not in (1, 2):
+        raise ValueError("bias expert stride must be intermediate_size or twice it")
+    bias_up_ptr = make_ptr(cutlass.Float32, bias_up.data_ptr(), cute.AddressSpace.gmem)
+    bias_gate_ptr = make_ptr(
+        cutlass.Float32, bias_gate.data_ptr(), cute.AddressSpace.gmem
+    )
     if use_a_per_token_scale:
         a_per_token_scale_ptr = make_ptr(
             cutlass.Float32,
@@ -838,6 +923,8 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         token_id_ptr=token_id_ptr,
         num_tiles_ptr=num_tiles_ptr,
         norm_const_ptr=norm_const_ptr,
+        bias_up_ptr=bias_up_ptr,
+        bias_gate_ptr=bias_gate_ptr,
         a_per_token_scale_ptr=a_per_token_scale_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
@@ -857,7 +944,13 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         mma_tiler_mn=mma_tiler_mn if not is_rubin else None,
         mma_tiler=mma_tiler if is_rubin else None,
         mma_inst_shape=mma_inst_shape if is_rubin else None,
-        enable_pdl=enable_pdl,
+        pdl_count=pdl_count,
+        split_k=split_k,
+        swap_ab=swap_ab,
+        use_compact_sf=use_compact_sf,
+        weight_interleave=weight_interleave,
+        bias_expert_stride_factor=bias_expert_stride_factor,
+        enable_pdl=pdl_count is not None,
         activation_type=normalized_activation_type.value,
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
@@ -866,16 +959,17 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         situ_linear_beta=situ_linear_beta,
         gated=gated,
         use_a_per_token_scale=use_a_per_token_scale,
+        apply_expert_alpha=apply_expert_alpha,
     )
 
     # Execute kernel with runtime parameters.
     # Order must match the wrapper signature; the Rubin SM107 wrapper has no
-    # a_per_token_scale_ptr parameter (see the arity note at the compile site),
-    # so on Rubin the extra pointer must be omitted here too or every argument
-    # shifts one slot ("multiple values for argument 'stream'").
+    # bias or a_per_token_scale_ptr parameters, so on Rubin those pointers must
+    # be omitted or every following argument shifts one slot.
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
     #  tile_idx_ptr, mn_limit_ptr, token_id_ptr, num_tiles_ptr, global_sf_ptr,
-    #  [a_per_token_scale_ptr], orig_m, m, n, k, l, stream)
+    #  [bias_up_ptr, bias_gate_ptr, a_per_token_scale_ptr],
+    #  orig_m, m, n, k, l, stream)
     compiled_gemm(
         a_ptr,
         b_ptr,
@@ -889,7 +983,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         token_id_ptr,
         num_tiles_ptr,
         norm_const_ptr,
-        *([] if is_rubin else [a_per_token_scale_ptr]),
+        *([] if is_rubin else [bias_up_ptr, bias_gate_ptr, a_per_token_scale_ptr]),
         seq_len,  # orig_m
         permuted_m,
         n,

@@ -53,11 +53,13 @@ blk_reduce_bf16, blk_reduce_fp32, blk_reduce_fp16.
 
 import ctypes
 import functools
-from typing import Union
+from typing import Tuple, Union
 
 import cutlass
+from cutlass import cute, utils
 from cutlass._mlir.dialects import llvm, nvvm
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects.nvvm import cp_async_bulk_global_shared_cta
+from cutlass.cutlass_dsl import Int32, Integer, T, dsl_user_op
 
 # Re-export all shared utilities so existing imports continue to work
 from ..common.kernel_utils import (  # noqa: F401
@@ -77,6 +79,79 @@ from ..common.kernel_utils import (  # noqa: F401
 # ============================================================================
 # Blackwell-specific functions
 # ============================================================================
+
+
+class DeviceBoundPersistentTileScheduler(utils.StaticPersistentTileScheduler):
+    """Persistent scheduler with a device-provided logical N tile count.
+
+    The launch grid and backing tensors can retain their graph-safe maximum
+    extent while the persistent loop operates only on routed tiles produced by
+    the preceding routing kernel.
+    """
+
+    @staticmethod
+    @dsl_user_op
+    def create_static_n(
+        params: utils.PersistentTileSchedulerParams,
+        block_idx: Tuple[Integer, Integer, Integer],
+        grid_dim: Tuple[Integer, Integer, Integer],
+        unused_actual_tiles_n: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        del unused_actual_tiles_n
+        return utils.StaticPersistentTileScheduler.create(
+            params, block_idx, grid_dim, loc=loc, ip=ip
+        )
+
+    @staticmethod
+    @dsl_user_op
+    def create_n(
+        params: utils.PersistentTileSchedulerParams,
+        block_idx: Tuple[Integer, Integer, Integer],
+        grid_dim: Tuple[Integer, Integer, Integer],
+        actual_tiles_n: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        sched = utils.StaticPersistentTileScheduler.create(
+            params, block_idx, grid_dim, loc=loc, ip=ip
+        )
+        runtime_params = sched.params
+        m_tiles = runtime_params.problem_shape_ntile_mnl[0]
+        runtime_params.problem_shape_ntile_mnl = (m_tiles, actual_tiles_n, Int32(1))
+
+        cluster_n = runtime_params.cluster_shape_mn[1]
+        m_clusters = runtime_params.problem_layout_ncluster_mnl.shape[0]
+        actual_clusters_n = (actual_tiles_n + Int32(cluster_n) - Int32(1)) // Int32(
+            cluster_n
+        )
+        runtime_params.problem_layout_ncluster_mnl = cute.make_layout(
+            (m_clusters, actual_clusters_n, Int32(1)), loc=loc, ip=ip
+        )
+
+        actual_clusters_n_fdd = cute.fast_divmod_create_divisor(
+            cutlass.max(actual_clusters_n, Int32(1)), loc=loc, ip=ip
+        )
+        if hasattr(runtime_params, "raster_along_m"):
+            if runtime_params.raster_along_m:
+                runtime_params.cluster_shape_minor_fdd = actual_clusters_n_fdd
+            else:
+                runtime_params.cluster_shape_major_fdd = actual_clusters_n_fdd
+        else:
+            runtime_params.cluster_shape_n_fdd = actual_clusters_n_fdd
+
+        return sched
+
+
+def compact_sf_layout(shape, sf_vec_size: int) -> cute.Layout:
+    """Scale layout: (M, padded K // sf_vec_size, L)."""
+    m, k, l = shape
+    scale_k = cute.ceil_div(k, sf_vec_size)
+    padded_scale_k = cute.round_up(scale_k, 16)
+    return cute.make_ordered_layout((m, padded_scale_k, l), order=(1, 0, 2))
 
 
 @functools.lru_cache(maxsize=None)
@@ -103,6 +178,24 @@ def fmin(
     else:
         # CUDA 13: nvvm.fmin(a, b, ...)
         result = nvvm.fmin(a_val, b_val, nan=nan, loc=loc, ip=ip)
+    return cutlass.Float32(result)
+
+
+@dsl_user_op
+def fmax(
+    a: Union[float, cutlass.Float32],
+    b: Union[float, cutlass.Float32],
+    *,
+    nan=False,
+    loc=None,
+    ip=None,
+) -> cutlass.Float32:
+    a_val = cutlass.Float32(a).ir_value(loc=loc, ip=ip)
+    b_val = cutlass.Float32(b).ir_value(loc=loc, ip=ip)
+    if _nvvm_fmin_needs_res():
+        result = nvvm.fmax(T.f32(), a_val, b_val, nan=nan, loc=loc, ip=ip)
+    else:
+        result = nvvm.fmax(a_val, b_val, nan=nan, loc=loc, ip=ip)
     return cutlass.Float32(result)
 
 
@@ -139,6 +232,8 @@ def situ_f32(
     # cannot strength-reduce (1/25.0 is inexact) nor hoist (varying numerator).
     if isinstance(beta, (float, int)):
         inv_beta = cutlass.Float32(f32_reciprocal(beta))
+    elif fastmath:
+        inv_beta = cute.arch.rcp_approx(beta_f32)
     else:
         inv_beta = cutlass.Float32(1.0) / beta_f32
     return (
@@ -165,18 +260,10 @@ def gelu_tanh_f32(
 
 @dsl_user_op
 def blk_copy(dst_gemm, src_smem, size, loc=None, ip=None):
-    llvm.inline_asm(
-        None,
-        [
-            dst_gemm.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            src_smem.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
-            size.ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
-        "l,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
+    cp_async_bulk_global_shared_cta(
+        dst_gemm.iterator.llvm_ptr,
+        src_smem.iterator.llvm_ptr,
+        size.ir_value(),
         loc=loc,
         ip=ip,
     )
@@ -225,7 +312,7 @@ def blk_reduce_fp16(dst_gemm, src_smem, size, loc=None, ip=None):
             src_smem.iterator.llvm_ptr,
             size.ir_value(),
         ],
-        "cp.reduce.async.bulk.global.shared::cta.bulk_group.noftz.f16 [$0], [$1], $2;",
+        "cp.reduce.async.bulk.global.shared::cta.bulk_group.add.noftz.f16 [$0], [$1], $2;",
         "l,l,r",
         has_side_effects=True,
         loc=loc,

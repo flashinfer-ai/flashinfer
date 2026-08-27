@@ -71,7 +71,7 @@ class QuantVariant(Enum):
     BF16 = 0
     FP8PerTensor = 1
     DeepSeekFp8 = 2
-    MxFp8 = 3
+    MXFP8 = 3
     NVFP4 = 4  # day-1 MVP target
     MXFP4 = 5  # MXFP4 weights x MXFP8 activations (TRTLLM W4A8)
     MxInt4 = 6
@@ -525,7 +525,7 @@ class TrtllmFp8BlockConfig:
         """Build the ``trtllm_fp8_block`` weight view from canonical BF16.
 
         ``variant`` must be :attr:`QuantVariant.DeepSeekFp8` or
-        :attr:`QuantVariant.MxFp8`; their scale formats are intentionally
+        :attr:`QuantVariant.MXFP8`; their scale formats are intentionally
         prepared by separate paths. The shuffled MXFP8 view requires both
         ``hidden_size`` and ``intermediate_size`` to be divisible by 128 so its
         scale tensors fit TRTLLM's unpadded 128x4 physical layout.
@@ -1134,6 +1134,8 @@ class CuteDslConfig:
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
         device=None,
+        gemm1_bias=None,
+        gemm2_bias=None,
     ):
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
@@ -1150,6 +1152,8 @@ class CuteDslConfig:
             intermediate_size=intermediate_size,
             activation=activation,
             device=device,
+            gemm1_bias=gemm1_bias,
+            gemm2_bias=gemm2_bias,
         )
 
     def __repr__(self) -> str:

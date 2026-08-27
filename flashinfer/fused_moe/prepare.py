@@ -787,9 +787,9 @@ def prepare_trtllm_fp8_block_weights(
     """
     from .api import QuantVariant
 
-    if variant not in (QuantVariant.DeepSeekFp8, QuantVariant.MxFp8):
+    if variant not in (QuantVariant.DeepSeekFp8, QuantVariant.MXFP8):
         raise ValueError(
-            "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MxFp8, "
+            "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MXFP8, "
             f"got {variant!r}."
         )
     activation = _normalize_activation(activation)
@@ -903,13 +903,13 @@ def prepare_trtllm_fp8_block_activations(
         if hidden_states_bf16.shape[1] % 128 != 0:
             raise ValueError("DeepSeek FP8 hidden_size must be divisible by 128.")
         return _deepseek_fp8_quantize_activations(hidden_states_bf16)
-    if variant is QuantVariant.MxFp8:
+    if variant is QuantVariant.MXFP8:
         from ..quantization.fp8_quantization import mxfp8_quantize
 
         q, sf = mxfp8_quantize(hidden_states_bf16, is_sf_swizzled_layout=False)
         return q, sf.view(torch.uint8).reshape(hidden_states_bf16.shape[0], -1)
     raise ValueError(
-        "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MxFp8, "
+        "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MXFP8, "
         f"got {variant!r}."
     )
 
@@ -2023,6 +2023,8 @@ def prepare_cute_dsl_weights(
     intermediate_size: int,
     activation=None,
     device: Optional[torch.device] = None,
+    gemm1_bias: Optional[torch.Tensor] = None,
+    gemm2_bias: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the CuteDSL FP4 ``cute_dsl`` weight view.
 
@@ -2038,7 +2040,7 @@ def prepare_cute_dsl_weights(
     dict
         Keys expected by ``CuteDslRunner.pack_inputs``: ``w1_weight``,
         ``w1_weight_sf``, ``w1_alpha``, ``fc2_input_scale``, ``w2_weight``,
-        ``w2_weight_sf``, ``w2_alpha``.
+        ``w2_weight_sf``, ``w2_alpha``, and optional expert biases.
     """
     from ..cute_dsl.utils import convert_sf_to_mma_layout
     from ..fp4_quantization import fp4_quantize
@@ -2050,6 +2052,10 @@ def prepare_cute_dsl_weights(
         raise ValueError(
             f"CuTe-DSL FP4 weight preparation does not support {variant!r}"
         )
+    if variant is QuantVariant.W4A16 and (
+        gemm1_bias is not None or gemm2_bias is not None
+    ):
+        raise ValueError("CuTe-DSL W4A16 does not support fused expert bias")
 
     if device is None:
         device = w1_bf16.device
@@ -2118,6 +2124,14 @@ def prepare_cute_dsl_weights(
     }
     if not is_mxfp4:
         view["fc2_input_scale"] = gs
+    for name, bias, shape in (
+        ("gemm1_bias", gemm1_bias, (num_local_experts, gemm1_rows)),
+        ("gemm2_bias", gemm2_bias, (num_local_experts, hidden_size)),
+    ):
+        if bias is not None:
+            if tuple(bias.shape) != shape:
+                raise ValueError(f"{name} must have shape {shape}")
+            view[name] = bias.to(device=device, dtype=torch.float32).contiguous()
     return view
 
 

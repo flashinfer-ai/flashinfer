@@ -1607,7 +1607,7 @@ class CutlassMxfp8Runner(_CutlassRunnerBase):
     """Unified adapter for CUTLASS MXFP8 x MXFP8 fused MoE."""
 
     backend_key = "cutlass_mxfp8"
-    supported_quant_variants = (QuantVariant.MxFp8,)
+    supported_quant_variants = (QuantVariant.MXFP8,)
     supported_activation_classes = _CUTLASS_SEMANTIC_ACTIVATIONS
     _supported_archs = _CUTLASS_MXFP8_ARCHS
     _x_dtype = torch.float8_e4m3fn
@@ -1947,10 +1947,15 @@ class CuteDslRunner(MoERunner):
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 use_per_token_activation=bool(self.config.quant.per_token_scale),
-                quant_mode=(
-                    "w4a8"
+                activation_format=(
+                    QuantVariant.MXFP8
                     if self.config.quant.variant is QuantVariant.MXFP4
-                    else "w4a4"
+                    else QuantVariant.NVFP4
+                ),
+                weight_format=(
+                    QuantVariant.MXFP4
+                    if self.config.quant.variant is QuantVariant.MXFP4
+                    else QuantVariant.NVFP4
                 ),
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
@@ -2001,7 +2006,8 @@ class CuteDslRunner(MoERunner):
         """Translate packs into the selected CuTe DSL runner's input list.
 
         Expected weight view keys: w1_weight, w1_weight_sf, w1_alpha,
-        fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha.
+        fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha, with optional
+        gemm1_bias and gemm2_bias.
         The W4A4 per-token path inserts ``per_token_scale`` before the trailing
         ``moe_output`` buffer. W4A16 uses its own compact input layout. Both
         tuning configurations include the output buffer so profiling can replace
@@ -2065,6 +2071,8 @@ class CuteDslRunner(MoERunner):
                 v["w2_weight"],
                 v["w2_weight_sf"],
                 v["w2_alpha"],
+                v.get("gemm1_bias"),
+                v.get("gemm2_bias"),
                 moe_output,
             ]
         elif (
@@ -2089,6 +2097,8 @@ class CuteDslRunner(MoERunner):
                 v["w2_weight"],
                 v["w2_weight_sf"],
                 v["w2_alpha"],
+                v.get("gemm1_bias"),
+                v.get("gemm2_bias"),
                 act.per_token_scale,
                 moe_output,
             ]
@@ -2691,14 +2701,14 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
     )
     supported_quant_variants = (
         QuantVariant.DeepSeekFp8,
-        QuantVariant.MxFp8,
+        QuantVariant.MXFP8,
     )
     supports_fused_shared_experts = True
     supported_activation_classes_by_quant: ClassVar[
         dict[QuantVariant, tuple[type[ActivationConfig], ...]]
     ] = {
         QuantVariant.DeepSeekFp8: (SwiGLU,),
-        QuantVariant.MxFp8: (SwiGLU, GeGLU, ReLU2),
+        QuantVariant.MXFP8: (SwiGLU, GeGLU, ReLU2),
     }
 
     def _check_support(self) -> None:
@@ -2720,7 +2730,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         from ..utils import device_support_pdl
         from .api import QuantVariant
 
-        if config.quant.variant is QuantVariant.MxFp8:
+        if config.quant.variant is QuantVariant.MXFP8:
             dtype = DtypeTrtllmGen.MxE4m3
             fp8_type = Fp8QuantizationType.MxFp8
         else:
@@ -2736,7 +2746,7 @@ class TrtllmFp8BlockRunner(_TrtllmRunnerBase):
         self._dtype_act = dtype
         self._dtype_weights = dtype
         self._fp8_quantization_type = fp8_type
-        self._use_shuffled_weight = config.quant.variant is QuantVariant.MxFp8
+        self._use_shuffled_weight = config.quant.variant is QuantVariant.MXFP8
 
         routing = config.routing
         experts = config.experts

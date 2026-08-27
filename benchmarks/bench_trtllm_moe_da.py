@@ -305,7 +305,7 @@ def _prepare_precision(name: str, shape: BenchmarkShape) -> PreparedPrecision:
 
     elif name in ("fp8_block", "mxfp8"):
         variant = (
-            QuantVariant.DeepSeekFp8 if name == "fp8_block" else QuantVariant.MxFp8
+            QuantVariant.DeepSeekFp8 if name == "fp8_block" else QuantVariant.MXFP8
         )
         hidden_q, hidden_scale = TrtllmFp8BlockConfig.prepare_activations(
             hidden, variant=variant
