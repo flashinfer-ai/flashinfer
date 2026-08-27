@@ -279,19 +279,9 @@ def _moe_core_impl(
 
     is_rubin = gemm1_mma_tiler is not None and gemm1_mma_inst_shape is not None
 
-    # Tiles are handed to a cluster in cluster_shape_m-sized groups. A count
-    # that is not a whole number of groups splits the last one, and the CTAs
-    # that still have work hang at the cluster barrier waiting for peers that
-    # already exited. Handling that needs two coordinated changes: round the
-    # count the kernel sees up to a multiple of cluster_shape_m, and initialize
-    # the tile-metadata buffers to match, because the kernel's bounds check on
-    # them is that same rounded value.
-    #
-    # No reachable Rubin tactic uses a multi-CTA cluster today -- tile_size is
-    # restricted to 128, which forces mma_tiler_m == 128 and hence
-    # cluster_shape_m == 1 -- so rather than carry a pair of coupled code paths
-    # nothing exercises, refuse the case loudly. Whoever re-enables
-    # tile_size=256 gets a clear pointer instead of a silent uninitialized read.
+    # No reachable Rubin tactic uses a multi-CTA cluster (tile_size is capped at
+    # 128, which forces cluster_shape_m == 1), so refuse rather than carry a
+    # workaround nothing exercises.
     cluster_m = max(gemm1_cluster_shape_mn[0], gemm2_cluster_shape_mn[0])
     if is_rubin and cluster_m > 1:
         raise NotImplementedError(
