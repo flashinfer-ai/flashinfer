@@ -141,7 +141,7 @@ __device__ __forceinline__ uint32_t elect_sync() {
 
 __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-        :: "r"(mbar_addr), "r"(count));
+        :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
 
@@ -173,19 +173,21 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
     return token;
 }
 
+// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
+// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
+// explicit loop still makes this helper blocking until acquire succeeds.
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    uint32_t ticks = 0x989680;
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
         "LAB_WAIT:\n\t"
         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
+        " P1, [%0], %1;\n\t"
         "@P1 bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
         "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
+        :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
 __device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
@@ -543,7 +545,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8(CakeTensorMap const* Qt, CakeTensorMap const*
             mbarrier_init(smem + 216, 128);
             // tmem_dealloc: 1 barriers, init_count=128
             mbarrier_init(smem + 224, 128);
-            asm volatile("fence.mbarrier_init.release.cluster;");
+            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
@@ -591,7 +593,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8(CakeTensorMap const* Qt, CakeTensorMap const*
     const int tmem_tmem_o0 = taddr + 80;
     const int tmem_tmem_o1 = taddr + 88;
 
-    // ---- Register redistribution for WGs split across roles ----
+    // ---- Ordered hardware-WG register redistribution ----
     // Dec phase frees registers before any WG attempts inc.
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
