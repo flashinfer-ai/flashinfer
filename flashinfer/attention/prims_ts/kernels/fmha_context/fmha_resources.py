@@ -58,6 +58,7 @@ GMEM resources (no pipeline)
 - GmemOResource   : TMA descriptor for O stores.
 """
 
+import enum
 import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional, TypeAlias
@@ -149,6 +150,23 @@ def _placeholder_softmax_chunks(cfg: Any) -> SoftmaxChunks:
 
 
 # ---------------------------------------------------------------------------
+# MMA schedule variants for the paired MMA task
+# ---------------------------------------------------------------------------
+
+
+class MmaOrder(enum.Enum):
+    """Per-iter QK/PV order for the paired MMA task.
+
+    ``Pv0Qk0Pv1Qk1``: historical — ``Qk0 → Pv1 → Qk1 → Pv0``, V locked twice/iter.
+    ``Qk0Pv0Qk1Pv1``: interleaved — one V lock/iter; QK(i+1) between Pv0/Pv1.
+    Causal reuses the latter (TAIL dual-PV off ``V_{N-1}``; peer0 empty ``sp0`` + Softmax0 drain).
+    """
+
+    Pv0Qk0Pv1Qk1 = 0
+    Qk0Pv0Qk1Pv1 = 1
+
+
+# ---------------------------------------------------------------------------
 # FmhaConfig -- kernel-wide configuration
 # ---------------------------------------------------------------------------
 
@@ -179,6 +197,8 @@ class FmhaConfig:
     # Number of interleaved Q/KV/O instances per CTA: two selects the paired
     # schedule, while one selects the single-instance schedule used for D>128.
     num_qkv_instances: int = 2
+    # Paired MMA QK/PV order; ignored when single_qkv_instance. Default historical.
+    mma_order: MmaOrder = MmaOrder.Pv0Qk0Pv1Qk1
 
     # Pipeline stages
     q_stage: int = 2
@@ -223,13 +243,17 @@ class FmhaConfig:
     num_regs_correction: int = 96
     num_regs_other: int = 32
 
-    # TMEM layout
+    # TMEM layout (paired defaults; single-instance overrides in
+    # _configure_single_instance_tmem_layout). Same-instance S↔P by default
+    # (P0@S0, P1@S1); Qk0Pv0Qk1Pv1 overrides to cross-alias in
+    # _configure_pipeline_stages.
     tmem_alloc_cols: int = 512
     tmem_stats_cols: int = 4
     tmem_s0_offset: int = 0
     tmem_s1_offset: int = 128
     tmem_o0_offset: int = 256
     tmem_o1_offset: int = 384
+    # Same-instance: P0 inside S0, P1 inside S1.
     tmem_p0_offset: int = 32
     tmem_p1_offset: int = 160
     tmem_vec0_offset: int = 0
@@ -328,6 +352,22 @@ class FmhaConfig:
     def single_qkv_instance(self) -> bool:
         """Return whether one work tile carries a single Q/KV/O instance."""
         return self.num_qkv_instances == 1
+
+    @property
+    def uses_qk_pv_interleaved_paired_schedule(self) -> bool:
+        """True when paired MMA uses ``Qk0 → Pv0 → Qk1 → Pv1`` (else historical).
+
+        Causal TAIL specialisation also gates on ``self.is_causal``.
+        """
+        return not self.single_qkv_instance and self.mma_order == MmaOrder.Qk0Pv0Qk1Pv1
+
+    @property
+    def uses_qk_pv_interleaved_causal_paired_schedule(self) -> bool:
+        """True when interleaved paired MMA runs causal TAIL (off ``V_{N-1}``).
+
+        Peer0 empty ``sp0`` + Softmax0 drain for correction; gated on ``is_causal``.
+        """
+        return self.uses_qk_pv_interleaved_paired_schedule and self.is_causal
 
     @property
     def uses_early_tile_sum(self) -> bool:
@@ -1878,6 +1918,9 @@ class TmemSPResource(MemoryResource):
     # Softmax warp per-warp P address.
     tmem_p_addr_cached: TmemAddr | None = field(init=False, default=None)
     _alloc: Constexpr[Optional[TmemAllocation]] = field(init=False, default=None)
+    # Softmax → its TmemPResource (_tp_ref); OS helpers no-op if unset.
+    # Wired by build_resources after both resources exist.
+    _tp_ref: Optional[MemoryResource] = field(init=False, default=None)
     old_row_max: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     row_max: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     row_sum: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -1909,6 +1952,7 @@ class TmemSPResource(MemoryResource):
         self.cum_seqlen_q = cum_seqlen_q
         self.cum_seqlen_k = cum_seqlen_k
         self.scale_softmax_log2 = scale_softmax_log2
+        self._tp_ref = None
         self._alloc = TmemAllocation(
             f"tmem_sp_q{q_half}",
             cfg.qk_mma_tiler[1] * cfg.mma_softmax_stage,
@@ -2823,6 +2867,25 @@ class TmemSPResource(MemoryResource):
         cute.arch.fence_view_async_tmem_store()
         return local_sum_pair_0[0] + local_sum_pair_0[1]
 
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def ordered_sequence_arrive_if_paired(self, stage_info: StageInfo) -> None:
+        """Arrive OS peer after LDTM(S); no-op if ``_tp_ref`` is unset."""
+        _ = stage_info
+        if cutlass.const_expr(self._tp_ref is not None):
+            self._tp_ref._ordered_sequence_arrive()
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def ordered_sequence_wait_if_paired(self, stage_info: StageInfo) -> None:
+        """Wait until OS peer finishes LDTM(S); no-op if ``_tp_ref`` is unset.
+
+        Pre-loop wait burns the init credit; in-loop wait gates each STTM(P).
+        """
+        _ = stage_info
+        if cutlass.const_expr(self._tp_ref is not None):
+            self._tp_ref._ordered_sequence_wait()
+
     @consumer_work(returns=(old_row_max, row_max))
     @cute.jit
     def compute_row_max(
@@ -3333,27 +3396,42 @@ class TmemSPResource(MemoryResource):
 class TmemPResource(MemoryResource):
     """Pipeline-only P handoff for split S/P scheduling.
 
-    Softmax stores P into the TMEM columns owned by ``TmemSPResource`` and
-    commits this AsyncUmma resource. The MMA task waits on it before issuing
-    PV, so the next QK can use the other S/P stage without using the S acquire
-    as an implicit P-ready wait.
+    Softmax stores P into ``TmemSPResource`` TMEM and commits this resource;
+    MMA waits before PV so next QK need not treat S-acquire as P-ready.
+
+    OrderedSequence (interleaved only): S0↔P1 / S1↔P0 alias means STTM(P)
+    can race with the peer still LDTM(S). One mbarrier per peer: arrive after
+    own LDTM(S), wait before own STTM(P) (SMEM via ``ordered_sequence_alloc``).
     """
 
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
     tmem_p_offset: Constexpr[int] = field(init=False, default=None)
+    inst_id: Constexpr[int] = field(init=False, default=0)
+    ordered_sequence_alloc: Constexpr[Optional[SmemAllocation]] = field(
+        init=False, default=None
+    )
+    owns_ordered_sequence_alloc: Constexpr[bool] = field(init=False, default=False)
     tmem_p_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+    _ordered_sequence_barrier_ptr: object = field(init=False, default=None)
+    _ordered_sequence_phase: object = field(init=False, default=None)
 
     def __init__(
         self,
         pipeline_config: PipelineConfig,
         cfg: FmhaConfig,
         tmem_p_offset: int,
+        inst_id: int = 0,
+        ordered_sequence_alloc: Optional[SmemAllocation] = None,
+        owns_ordered_sequence_alloc: bool = False,
         **kwargs: Any,
     ) -> None:
         """Bind the base P TMEM offset used by the split S/P pipeline."""
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
         self.tmem_p_offset = tmem_p_offset
+        self.inst_id = inst_id
+        self.ordered_sequence_alloc = ordered_sequence_alloc
+        self.owns_ordered_sequence_alloc = owns_ordered_sequence_alloc
         self.tmem_p_base = TaskLocalVariable(
             dtype=Int32,
             default=Int32(tmem_p_offset),
@@ -3363,6 +3441,87 @@ class TmemPResource(MemoryResource):
     def get_tmem_requirements(self) -> list[TmemAllocation]:
         """Return no allocation because P aliases the TmemSP allocation."""
         return []
+
+    def get_smem_requirements(self) -> list[SmemAllocation]:
+        """Return the OrderedSequence mbarrier allocation for the owning instance."""
+        if self.owns_ordered_sequence_alloc and self.ordered_sequence_alloc is not None:
+            return [self.ordered_sequence_alloc]
+        return []
+
+    @cute.jit
+    def initialize_runtime_state_internal(
+        self,
+        context=None,
+        captured_schedule: Constexpr[bool] = False,
+    ) -> None:
+        """Initialize the tmem_p pipeline and the OrderedSequence mbarriers."""
+        super().initialize_runtime_state_internal(context, captured_schedule)
+        if cutlass.const_expr(
+            context is not None
+            and context.smem_base is not None
+            and self.ordered_sequence_alloc is not None
+        ):
+            self._ordered_sequence_barrier_ptr = cute.make_ptr(
+                cutlass.Int64,
+                context.smem_base.data_ptr() + self.ordered_sequence_alloc.offset,
+                mem_space=cute.AddressSpace.smem,
+            )
+        # Phase 0: wait until peer's first arrive flips our barrier (before STTM(P)).
+        self._ordered_sequence_phase = Int32(0)
+        if cutlass.const_expr(self._ordered_sequence_barrier_ptr is not None):
+            self._init_ordered_sequence_barriers()
+
+    @cute.jit
+    def _init_ordered_sequence_barriers(self) -> None:
+        """Init OS mbarriers (count=128); plant one credit on ``barrier[0]`` only.
+
+        Peer0 pre-loop wait returns immediately; peer1 waits until peer0 arrives.
+        """
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        # softmax0 warp 2 initializes barrier 0 (waited on by softmax0);
+        # softmax1 warp 2 initializes barrier 1 (waited on by softmax1).
+        bar_init_warp = Int32(
+            self.cfg.softmax0_warp_ids[2]
+            if self.inst_id == 0
+            else self.cfg.softmax1_warp_ids[2]
+        )
+        if warp_idx == bar_init_warp:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_init(
+                    self._ordered_sequence_barrier_ptr + self.inst_id,
+                    Int32(128),
+                )
+                if cutlass.const_expr(self.inst_id == 0):
+                    # Pre-plant a full-warpgroup credit on barrier[0] only,
+                    # so peer 0's pre-loop wait unblocks immediately and
+                    # peer 1's pre-loop wait blocks on peer 0's first arrive
+                    # — establishing the peer0 -> peer1 ordering for iter 0.
+                    cute.arch.mbarrier_arrive(
+                        self._ordered_sequence_barrier_ptr + self.inst_id,
+                        arrive_count=128,
+                    )
+        cute.arch.mbarrier_init_fence()
+        prims.barrier_cta_sync(
+            self.cfg.tmem_bar_id,
+            thread_count=self.cfg.block_warps * cute.arch.WARP_SIZE,
+        )
+
+    @cute.jit
+    def _ordered_sequence_wait(self) -> None:
+        """Wait on ``barrier[inst_id]`` until peer LDTM(S) is done; then XOR phase."""
+        if cutlass.const_expr(self._ordered_sequence_barrier_ptr is not None):
+            cute.arch.mbarrier_wait(
+                self._ordered_sequence_barrier_ptr + self.inst_id,
+                self._ordered_sequence_phase,
+            )
+            self._ordered_sequence_phase = self._ordered_sequence_phase ^ Int32(1)
+
+    @cute.jit
+    def _ordered_sequence_arrive(self) -> None:
+        """Arrive on peer's barrier after LDTM(S); does not touch local phase."""
+        if cutlass.const_expr(self._ordered_sequence_barrier_ptr is not None):
+            peer_id = 1 - self.inst_id
+            cute.arch.mbarrier_arrive(self._ordered_sequence_barrier_ptr + peer_id)
 
     @cute.jit
     def create_function_variables(self, context: Optional[Any] = None) -> Int32:
@@ -3870,7 +4029,9 @@ class TmemOResource(MemoryResource):
         The task domain pads partial final CTAs so this slot is always outside
         peer0's causal reach.
         """
-        if cutlass.const_expr(section == FmhaStage.Head):
+        if cutlass.const_expr(self.cfg.uses_qk_pv_interleaved_paired_schedule):
+            writes_o0 = inst_idx == 0
+        elif cutlass.const_expr(section == FmhaStage.Head):
             writes_o0 = True
             first_o0_write = True
             first_o1_write_maybe = False
@@ -3883,15 +4044,22 @@ class TmemOResource(MemoryResource):
             first_o0_write = False
             first_o1_write_maybe = True
 
-        # In causal mode, check if O0 MMA should skip the last LOOP iteration.
+        # Elide peer0's PV0 over its trailing fully-masked tile. Location differs
+        # by schedule: legacy folds the last PV into the LOOP (skip last LOOP
+        # iter); interleaved pipelines PV one tile behind QK so peer0's only
+        # invalid PV0(V_{N-1}) lands in the TAIL (skip there, not the LOOP, which
+        # still holds valid tiles).
         skip_o0_invalid = False
-        if cutlass.const_expr(
-            self.cfg.skip_causal_invalid_peer0
-            and writes_o0
-            and section == FmhaStage.Loop
-        ):
-            if not is_tail:
-                skip_o0_invalid = stage_info.loop_offset == (stage_info.loop_end - 1)
+        if cutlass.const_expr(self.cfg.skip_causal_invalid_peer0 and writes_o0):
+            if cutlass.const_expr(self.cfg.uses_qk_pv_interleaved_paired_schedule):
+                skip_o0_invalid = cutlass.const_expr(
+                    section == FmhaStage.Tail and is_tail
+                )
+            elif cutlass.const_expr(section == FmhaStage.Loop):
+                if not is_tail:
+                    skip_o0_invalid = stage_info.loop_offset == (
+                        stage_info.loop_end - 1
+                    )
 
         if not skip_o0_invalid:
             tmem_ptr_raw = self.tmem_ptr_raw_cached
@@ -3987,6 +4155,16 @@ class TmemOResource(MemoryResource):
                     scale_d = stage_info.loop_end > 0
                 elif cutlass.const_expr(section == FmhaStage.Loop):
                     scale_d = stage_info.loop_offset > 0
+                else:
+                    scale_d = False
+            elif cutlass.const_expr(self.cfg.uses_qk_pv_interleaved_paired_schedule):
+                # Interleaved paired schedule: HEAD has no PV, so LOOP iter 0
+                # or TAIL (when the LOOP domain is empty) is the first write
+                # for both O0 and O1.
+                if cutlass.const_expr(section == FmhaStage.Loop):
+                    scale_d = stage_info.loop_offset > 0
+                elif cutlass.const_expr(section == FmhaStage.Tail):
+                    scale_d = stage_info.loop_end > 0
                 else:
                     scale_d = False
             elif cutlass.const_expr(first_o0_write):
@@ -4107,13 +4285,15 @@ class TmemOResource(MemoryResource):
         else:
             tmem_o_offset = self.tmem_o1_offset
 
-        # In causal mode with no Q right offset, skip the invalid O0 correction
-        # in the last LOOP iteration. The task domain pads partial final CTAs so
-        # this slot is always outside peer0's causal reach.
+        # Skip peer0's invalid O0 correction on the last LOOP iter (domain pads
+        # partial CTAs so it is outside peer0's causal reach). Interleaved is
+        # exempt: it pipelines PV behind QK so every LOOP O0 rescale is valid and
+        # the invalid tile carries no PV0 -- nothing to skip here.
         skip_o0_invalid = False
         if cutlass.const_expr(
             self.cfg.skip_causal_invalid_peer0
             and not self.cfg.single_qkv_instance
+            and not self.cfg.uses_qk_pv_interleaved_paired_schedule
             and inst_idx == 0
         ):
             # This is O0 correction; check if this is the last LOOP iteration.
