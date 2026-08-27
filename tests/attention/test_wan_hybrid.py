@@ -123,9 +123,7 @@ def test_wan_hybrid_supported_capabilities_remain_available(
 def test_wan_hybrid_native_module_load_failure_is_unavailable(monkeypatch) -> None:
     monkeypatch.setattr(wan_hybrid, "_wan_hybrid_dispatch_impl", object())
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(
-        torch.cuda, "get_device_capability", lambda _device: (10, 0)
-    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
 
     def fail_to_load(_target: str):
         raise RuntimeError("native module failed to load")
