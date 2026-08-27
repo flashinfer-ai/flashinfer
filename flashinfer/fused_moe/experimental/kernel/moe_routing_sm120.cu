@@ -284,7 +284,9 @@ static __device__ __noinline__ void topk8(const __nv_bfloat16* __restrict__ row,
   }
 }
 
-// An expert id is only safe to use as an index once it is known to be one.
+// An expert id is only safe to USE once it is known to be one -- as a
+// shared-memory index in the M > 4 branch, and as the owner of a live block
+// that the expert GEMM will dereference, in either branch.
 static __device__ __forceinline__ bool expert_in_range(int e) {
   return static_cast<unsigned int>(e) < static_cast<unsigned int>(NUM_EXPERTS);
 }
@@ -331,20 +333,41 @@ __global__ __launch_bounds__(PT_D) void moe_routing_descriptor(
     // gives the per-expert multiplicity and the intra-expert rank at once.
     __syncthreads();
     if (warp == 0) {
-      const int id = (lane < numel) ? s_id[lane] : (0x10000 + lane);
-      const unsigned int act = (numel >= 32) ? 0xffffffffu : (unsigned int)((1u << numel) - 1u);
+      // Nothing in this branch INDEXES by the expert id -- `pos` is a popc of a
+      // lane mask, `before` is a comparison count, and every store is addressed
+      // by lane or by rank -- so an out-of-range id is not a hazard here the way
+      // it was for the M > 4 branch's s_cnt / s_cur / s_start.  It is still
+      // dropped, because the id is written as a VALUE into `o_eid` as the owner
+      // of a block `o_ntp` declares live, and the expert GEMM dereferences that:
+      // it selects its weight matrix with `expert_ids[block]`.  An out-of-range
+      // id is therefore an out-of-bounds weight row in the CONSUMER, and -1 is
+      // worse still -- it is the very "no expert here" sentinel `o_eid` is
+      // prefilled with, so a live block carrying it silently drops BLOCK_M real
+      // assignments.  Dropping keeps this branch's semantics identical to the
+      // M > 4 branch's, which the same public entry point reaches with the same
+      // argument at a different token count.
+      // (The prologue cannot produce one: topk8 emits 255 - (mysel & 0xFF),
+      // which is in [0, NUM_EXPERTS) for every bit pattern.  So on the shipped
+      // path `keep` equals the old `lane < numel` and `act` equals the old
+      // contiguous mask, and the descriptors are bit-identical.)
+      const bool keep = (lane < numel) && expert_in_range(s_id[lane]);
+      const int id = keep ? s_id[lane] : (0x10000 + lane);
+      // Ballot rather than a computed mask: it is the set of lanes that count,
+      // which is now the guard's own predicate, and it also retires the
+      // `numel >= 32` special case that only existed because 1u << 32 is UB.
+      const unsigned int act = __ballot_sync(0xffffffffu, keep);
       const unsigned int mk = __match_any_sync(0xffffffffu, id) & act;
       const int pos = __popc(mk & ((1u << lane) - 1u));
-      const bool first = (lane < numel) && (pos == 0);
-      // Inactive lanes carry a key no active id can be below, so the count of
-      // distinct experts ordered before `id` can scan the full warp.
+      const bool first = keep && (pos == 0);
+      // Dropped and inactive lanes carry a key no kept id can be below, so the
+      // count of distinct experts ordered before `id` can scan the full warp.
       const int key = first ? id : 0x7FFFFFFF;
       int before = 0;
 #pragma unroll
       for (int j = 0; j < 32; ++j) before += (__shfl_sync(0xffffffffu, key, j) < id);
       const int total = __popc(__ballot_sync(0xffffffffu, first));
       if (lane == 0) *o_ntp = total * BLOCK_M;
-      if (lane < numel) {
+      if (keep) {
         if (o_tw != nullptr) {
           o_tw[lane] = s_w[lane];
           o_tid[lane] = id;

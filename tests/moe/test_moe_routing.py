@@ -635,33 +635,74 @@ def test_align_reports_a_token_count_it_cannot_serve():
         )
 
 
-@requires_sm120
-def test_descriptor_drops_out_of_range_expert_ids():
-    """A caller-supplied expert id is not trusted as a shared-memory index.
-
-    ``moe_routing_align`` takes ``topk_ids`` from the caller's own router, and
-    above 4 tokens the descriptor pass indexes per-expert shared arrays
-    (``s_cnt`` / ``s_cur`` / ``s_start``, ``NUM_EXPERTS`` wide) with them.  An
-    id outside ``[0, NUM_EXPERTS)`` is dropped -- its slot keeps the padding
-    sentinel -- rather than scribbling on shared memory.
-
-    The shipped allowlist is m in {1, 2, 4}, so the guards never send a size
-    this large to the kernel and this goes to the module directly.  That is
-    also why the check costs the shipped path nothing: at those sizes the
-    warp-local branch runs instead, and it indexes nothing by expert id.
-    """
-    assert mr.moe_routing_precompile()
-    m = 8
-    assert m > SHIPPED_MAX_M
-    ins = _inputs(m, seed=101)
-    topk_ids = _composable_prologue(ins, m)["topk_ids"].clone()
-    for (row, col), value in {
+# (row, col) -> poisoned id, per token count.  Every case carries at least one
+# negative and one oversized id; m in {1, 2, 4} is the shipped allowlist and is
+# exactly the set of sizes that take the descriptor's warp-local branch, m = 8
+# takes the block-wide one.
+_OUT_OF_RANGE_INJECTIONS = {
+    1: {(0, 0): -1, (0, 3): NUM_EXPERTS, (0, 7): 1 << 20},
+    2: {(0, 0): -1, (0, 5): NUM_EXPERTS, (1, 2): -(1 << 20), (1, 7): NUM_EXPERTS + 11},
+    4: {
+        (0, 0): -1,
+        (1, 3): NUM_EXPERTS,
+        (2, 7): NUM_EXPERTS + 11,
+        (3, 2): 1 << 20,
+        (3, 5): -(1 << 20),
+    },
+    8: {
         (0, 0): -1,
         (1, 3): NUM_EXPERTS,
         (4, 7): NUM_EXPERTS + 11,
         (6, 5): -(1 << 20),
         (7, 2): 1 << 20,
-    }.items():
+    },
+}
+
+
+@requires_sm120
+@pytest.mark.parametrize("m", sorted(_OUT_OF_RANGE_INJECTIONS))
+def test_descriptor_drops_out_of_range_expert_ids(m):
+    """A caller-supplied expert id is never described, at either branch.
+
+    ``moe_routing_align`` takes ``topk_ids`` from the caller's own router and
+    checks its shape, dtype, contiguity and device -- but not its VALUES.  A
+    value check would need a device-to-host sync and would cost the op its
+    CUDA-graph capturability, so it deliberately cannot exist on the host side.
+    The kernel is therefore the only thing that can distrust an id, and it has
+    two branches that must agree:
+
+    * above 4 tokens it indexes per-expert shared arrays (``s_cnt`` /
+      ``s_cur`` / ``s_start``, ``NUM_EXPERTS`` wide) with the id, so an
+      out-of-range one is a shared-memory overrun;
+    * at 4 tokens and below -- the shipped allowlist -- the warp-local branch
+      indexes *nothing* by the id (``pos`` is a popc of a lane mask, every
+      store is addressed by lane or by rank), so there is no local hazard.  It
+      drops the id anyway, because ``expert_ids`` is a value the expert GEMM
+      dereferences (``b_ptr + expert_ids[block] * stride_be``): propagating an
+      out-of-range one just moves the out-of-bounds access into the consumer,
+      and -1 in particular is the very "no expert here" sentinel that
+      ``expert_ids`` is prefilled with and that the contract reserves for
+      blocks past ``num_tokens_post_pad``.
+
+    So what this pins is DROPPING rather than propagation, at both branches,
+    with the same observable descriptor either side of the size split.
+
+    It drives the module directly rather than ``moe_routing_align`` at every
+    size, including the allowlisted ones: the composable fallback counts with
+    ``scatter_add_`` on the raw ids, which device-asserts on an out-of-range
+    one and would poison the CUDA context for the rest of the session.  The
+    kernel is strictly more tolerant than the reference here, which is exactly
+    why the reference must not be reached.
+    """
+    # The parametrization spans both branches, which is the point of it.
+    assert (
+        min(_OUT_OF_RANGE_INJECTIONS) <= SHIPPED_MAX_M < max(_OUT_OF_RANGE_INJECTIONS)
+    )
+    assert mr.moe_routing_precompile()
+    ins = _inputs(m, seed=101)
+    topk_ids = _composable_prologue(ins, m)["topk_ids"].clone()
+    injections = _OUT_OF_RANGE_INJECTIONS[m]
+    for (row, col), value in injections.items():
         topk_ids[row, col] = value
 
     outs = _align_outputs(m)
@@ -689,8 +730,14 @@ def test_descriptor_drops_out_of_range_expert_ids():
     assert int(outs["num_tokens_post_pad"][0].item()) == blocks * BLOCK_M
     # ... and the dropped ones appear nowhere in the descriptor.
     dropped = {i for i, e in enumerate(flat) if not (0 <= e < NUM_EXPERTS)}
-    assert len(dropped) == 5
+    assert len(dropped) == len(injections)
     assert dropped.isdisjoint(set(outs["sorted_token_ids"].tolist()))
+    # No live block may name an expert the GEMM cannot index, and -1 -- which
+    # a consumer reads as "not my rank, write zeros" -- must stay strictly
+    # outside the live region.
+    expert_ids = outs["expert_ids"].tolist()
+    assert all(0 <= e < NUM_EXPERTS for e in expert_ids[:blocks])
+    assert all(e == mr._INACTIVE_EXPERT_ID for e in expert_ids[blocks:])
 
 
 @requires_sm120
