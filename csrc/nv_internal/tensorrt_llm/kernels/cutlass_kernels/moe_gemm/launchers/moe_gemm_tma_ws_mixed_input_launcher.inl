@@ -98,7 +98,7 @@ struct EpilogueSelector<false, TileShape, ClusterShape, ElementAccumulator, Elem
           cutlass::epilogue::collective::EpilogueTileAuto, ElementAccumulator, ElementAccumulator,
           ElementC, typename cutlass::layout::LayoutTranspose<LayoutC>::type*, AlignmentC, ElementD,
           typename cutlass::layout::LayoutTranspose<LayoutD>::type*, AlignmentD, EpilogueSchedule,
-          FusionOperation>::CollectiveOp;
+          FusionOperation, true>::CollectiveOp;
 };
 
 template <class TileShape, class ClusterShape, class ElementAccumulator, class ElementC,
@@ -321,7 +321,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
         {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c),
          reinterpret_cast<StrideC*>(hopper_inputs.stride_c),
          reinterpret_cast<ElementD**>(hopper_inputs.ptr_d),
-         reinterpret_cast<StrideD*>(hopper_inputs.stride_d)},
+         reinterpret_cast<StrideD*>(hopper_inputs.stride_d), nullptr},
         hw_info};
   }
 
@@ -375,6 +375,9 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
   }
   arguments.mainloop.ptr_A_prebuilt_tma_desc = precomputed_workspace.prebuilt_tma_desc_A;
   arguments.mainloop.ptr_B_prebuilt_tma_descs = precomputed_workspace.prebuilt_tma_desc_B;
+  if constexpr (!use_single_warpgroup) {
+    arguments.epilogue.ptr_D_prebuilt_tma_descs = precomputed_workspace.prebuilt_tma_desc_D;
+  }
 
   if (gemm.get_workspace_size(arguments) > hopper_inputs.gemm_workspace_size) {
     TLLM_LOG_ERROR("[Mixed dtype WS grouped GEMM] given workspace size insufficient, %d < %d.",
@@ -404,7 +407,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
                                           CurrentClusterShapeM, CurrentClusterShapeN,
                                           use_single_warpgroup>(
       precomputed_workspace, hopper_inputs.int4_groupwise_params.shape.problem_shapes,
-      inputs.num_experts, total_routed_tokens, inputs.n, gemm.params().mainloop, inputs.stream);
+      inputs.num_experts, total_routed_tokens, inputs.n, gemm.params().mainloop,
+      gemm.params().epilogue, inputs.stream);
 
   auto run_status = gemm.run(inputs.stream);
   if (run_status != cutlass::Status::kSuccess) {
