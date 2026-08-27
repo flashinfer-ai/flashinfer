@@ -5444,7 +5444,7 @@ def trtllm_fp8_per_tensor_scale_moe(
         Maximum number of tokens for autotuning (default ``8192``).
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``0`` Gelu; ``3`` Swiglu;
-        ``4`` Geglu; ``6`` Relu2 (non-gated); ``7`` Identity.
+        ``4`` Geglu; ``6`` Relu2; ``9`` Identity.
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
@@ -5763,7 +5763,7 @@ def trtllm_fp8_block_scale_moe(
         otherwise a ``ValueError`` is raised.
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
-        ``6`` Relu2 (non-gated); ``7`` Identity.
+        ``6`` Relu2; ``9`` Identity.
     norm_topk_prob : bool
         Whether to normalize the top-k probabilities (default ``True``).
     routing_replay_out : Optional[torch.Tensor]
@@ -6018,7 +6018,7 @@ def trtllm_fp8_block_scale_routed_moe(
         FP8 quantization scheme (default ``Fp8QuantizationType.DeepSeekFp8``).
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
-        ``6`` Relu2; ``7`` Identity.
+        ``6`` Relu2; ``9`` Identity.
     gemm1_alpha : Optional[torch.Tensor]
         Optional ``[local_num_experts]`` float32 per-expert SwiGLU OA alpha
         parameter.  Supported for ``Fp8QuantizationType.MxFp8`` and
@@ -6160,13 +6160,15 @@ def trtllm_fp4_block_scale_moe(
         Block scales for MXFP8 / NVFP4 hidden states of shape
         ``[seq_len, hidden_size // (32 if mxfp8 else 16)]``.  Dtype is float8.
     gemm1_weights : torch.Tensor
-        ``[num_experts, 2 * intermediate_size, hidden_size // 2]`` packed
-        FP4 FC1 weights, dtype ``uint8``.
+        ``[num_experts, M, hidden_size // 2]`` packed FP4 FC1 weights, dtype
+        ``uint8``.  ``M`` is ``2 * intermediate_size`` for gated activations and
+        ``intermediate_size`` for non-gated ones (``6`` Relu2, ``9`` Identity).
     gemm1_weights_scale : torch.Tensor
-        ``[num_experts, 2 * intermediate_size, hidden_size // (32 if mxfp4 else 16)]``
-        FC1 weight block scales, dtype float8.
+        ``[num_experts, M, hidden_size // (32 if mxfp4 else 16)]`` FC1 weight
+        block scales, dtype float8, with the same ``M`` as ``gemm1_weights``.
     gemm1_bias : Optional[torch.Tensor]
-        ``[num_experts, 2 * intermediate_size]`` FC1 bias, ``float32``.
+        ``[num_experts, M]`` FC1 bias, ``float32``, with the same ``M`` as
+        ``gemm1_weights``.
     gemm1_alpha : Optional[torch.Tensor]
         ``[num_experts]`` swiglu alpha, ``float32``.
         For SiTU this is ``[local_num_experts]``, finite and positive;
@@ -6238,7 +6240,7 @@ def trtllm_fp4_block_scale_moe(
         Whether to enable Programmatic Dependent Launch.
     activation_type : int
         Activation type (default ``3`` — Swiglu).  ``3`` Swiglu; ``4`` Geglu;
-        ``6`` Relu2; ``7`` Identity.
+        ``6`` Relu2; ``9`` Identity.
         ``10`` SiTU uses ``beta*tanh(x0/beta) * alpha*tanh(x1/alpha)*sigmoid(x1)``.
     per_token_scale : Optional[torch.Tensor]
         ``[seq_len]`` per-token scaling factors, ``float32``.
