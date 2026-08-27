@@ -33,6 +33,7 @@ from .api import (
     _CUTLASS_BF16_ARCHS,
     _CUTLASS_W4A16_ARCHS,
     _CUTILE_BF16_ARCHS,
+    _CUTILE_NVFP4_ARCHS,
     ActivationType,
     MoEActivationPack,
     MoEConfig,
@@ -951,7 +952,7 @@ class CuTileBf16Runner(MoERunner):
             )
         return configs
 
-    def _candidate_block_sizes(self, num_assignments: int) -> tuple[int, int]:
+    def _candidate_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
         # Padding dominates while each expert receives few rows. The measured
         # M32 -> M64 crossover differs by architecture; retain the adjacent M
         # sizes around it so the end-to-end tuner still makes the final choice.
@@ -1194,6 +1195,428 @@ class CuTileBf16Runner(MoERunner):
 
     def _cache_key_extras(self) -> tuple:
         return super()._cache_key_extras() + (self._device_arch, self._block_sizes)
+
+
+# ---------------------------------------------------------------------------
+# cuTile NVFP4 runners
+# ---------------------------------------------------------------------------
+
+
+class _CuTileFp4Runner(CuTileBf16Runner):
+    """Shared adapter for fixed A16/A16 and A4/A4 NVFP4 pipelines."""
+
+    supports_expert_parallelism = False
+    _activation_fp4: ClassVar[bool]
+    _supported_archs: ClassVar[tuple[int, ...]]
+
+    def _check_support(self) -> None:
+        MoERunner._check_support(self)
+        if self.config.activation.type not in (
+            ActivationType.Swiglu,
+            ActivationType.Relu2,
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only the Swiglu or Relu2 activation."
+            )
+        if not self.config.finalize.do_finalize:
+            raise NotImplementedError(
+                f"{type(self).__name__} requires do_finalize=True."
+            )
+        if self.config.execution.enable_pdl is True:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support PDL launches."
+            )
+        if self._device_arch not in self._supported_archs:
+            raise RuntimeError(
+                f"{type(self).__name__} does not support SM{self._device_arch}; "
+                f"supported architectures are {self._supported_archs}."
+            )
+        from ..cutile import is_cuda_tile_available
+
+        with torch.cuda.device(self.device):
+            available = is_cuda_tile_available()
+        if not available:
+            raise RuntimeError(
+                "cuTile NVFP4 requires cuda-tile and a tileiras/NVRTC toolchain "
+                f"that supports SM{self._device_arch}."
+            )
+
+    def _build(self) -> None:
+        from .cutile import fp4
+
+        self._kernel_module = fp4
+
+    def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
+        self._require_built()
+        ceiling = self.config.execution.tune_max_num_tokens
+        if num_tokens > ceiling:
+            raise ValueError(
+                f"num_tokens={num_tokens} exceeds tune_max_num_tokens={ceiling}."
+            )
+        capacity = map_to_hybrid_bucket(num_tokens, ceiling)
+        key = (capacity, hidden_size)
+        workspace = self._workspace_cache.get(key)
+        if workspace is None:
+            workspace = self._kernel_module.allocate_workspace(
+                num_tokens=capacity,
+                hidden_size=hidden_size,
+                intermediate_size=self.config.experts.intermediate_size,
+                num_experts=self.config.routing.num_experts,
+                top_k=self.config.routing.top_k,
+                is_gated=self.config.activation.is_gated,
+                block_sizes=self._block_sizes,
+                quantize_activations=self._activation_fp4,
+                device=self.device,
+            )
+            self._workspace_cache[key] = workspace
+        self._workspace = workspace
+
+    def _gemm_configs(self, k_in: int, n: int) -> list[tuple[int, int, int]]:
+        if self._activation_fp4:
+            candidates = [
+                (128, 128, 2),
+                (128, 256, 2),
+                (128, 64, 2),
+                (256, 128, 1),
+                (128, 64, 4),
+                (256, 64, 1),
+                (256, 64, 2),
+                (256, 128, 2),
+                (256, 256, 1),
+            ]
+        else:
+            candidates = [
+                (64, 256, 2),
+                (64, 128, 2),
+                (128, 128, 1),
+                (128, 64, 1),
+                (32, 64, 2),
+                (16, 32, 2),
+            ]
+        configs = [
+            config
+            for config in candidates
+            if config[0] <= 2 * n and config[1] <= 2 * k_in
+        ]
+        if not configs:
+            raise ValueError(
+                f"{type(self).__name__}: no cuTile NVFP4 GEMM tile fits "
+                f"n={n}, k={k_in}."
+            )
+        return configs
+
+    def _candidate_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
+        if self._activation_fp4:
+            num_experts = self.config.routing.num_experts
+            rows_per_expert = (num_assignments + num_experts - 1) // num_experts
+            if rows_per_expert <= 8:
+                return (16, 32)
+            intermediate_size = self.config.experts.intermediate_size
+            if num_assignments >= 4096 and (
+                intermediate_size >= 1024 or num_assignments >= 65536
+            ):
+                return (32, 64)
+            return (32, 64, 128)
+        return super()._candidate_block_sizes(num_assignments)
+
+    def _candidate_gemm_pairs(
+        self, inputs: List[torch.Tensor]
+    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+        hidden_size = inputs[1].shape[1]
+        intermediate_size = self.config.experts.intermediate_size
+        gemm1_output_size = intermediate_size * (
+            2 if self.config.activation.is_gated else 1
+        )
+        gemm1 = self._gemm_configs(hidden_size, gemm1_output_size)
+        gemm2 = self._gemm_configs(intermediate_size, hidden_size)
+
+        if self._activation_fp4:
+            base = (128, 128, 2)
+            base_k256 = (128, 256, 2)
+            base_k64 = (128, 64, 2)
+            wide = (256, 128, 1)
+            base_k64_occ4 = (128, 64, 4)
+            wide_k64 = (256, 64, 1)
+            wide_k64_occ2 = (256, 64, 2)
+            wide_occ2 = (256, 128, 2)
+            wide_k256 = (256, 256, 1)
+            candidates = (
+                (base, base),
+                (base_k256, base),
+                (base, base_k256),
+                (base_k64, base),
+                (base, base_k64),
+                (wide, base),
+                (wide_k256, wide_k256),
+                (wide_k64_occ2, base),
+                (wide_k64, wide_k64_occ2),
+                (base_k64_occ4, base_k64_occ4),
+                (base_k64_occ4, base),
+                (wide_occ2, wide_occ2),
+            )
+            available1, available2 = set(gemm1), set(gemm2)
+            return [
+                pair
+                for pair in candidates
+                if pair[0] in available1 and pair[1] in available2
+            ]
+
+        pairs = [(gemm1[0], gemm2[0])]
+        for index in range(1, max(len(gemm1), len(gemm2))):
+            pairs.append((gemm1[min(index, len(gemm1) - 1)], gemm2[0]))
+            pairs.append((gemm1[0], gemm2[min(index, len(gemm2) - 1)]))
+        return list(dict.fromkeys(pairs))[:6]
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        self._require_built()
+        if len(inputs) != 10:
+            raise ValueError(
+                f"{type(self).__name__} expects 10 inputs, got {len(inputs)}."
+            )
+        if self._activation_fp4:
+            intermediate_size = self.config.experts.intermediate_size
+            num_assignments = inputs[2].numel()
+            tactics = []
+            for block_size in self._candidate_block_sizes(num_assignments):
+                for gemm1, gemm2 in self._candidate_gemm_pairs(inputs):
+                    tile_i = (
+                        gemm1[0] // 2 if self.config.activation.is_gated else gemm1[0]
+                    )
+                    fused_store_supported = (
+                        tile_i >= 128
+                        and intermediate_size % 64 == 0
+                        and (
+                            not self.config.activation.is_gated
+                            or intermediate_size % tile_i == 0
+                        )
+                        and (
+                            not self.config.activation.is_gated or num_assignments >= 64
+                        )
+                    )
+                    tactics.append((block_size, 0, *gemm1, *gemm2))
+                    if fused_store_supported:
+                        tactics.append((block_size, 1, *gemm1, *gemm2))
+            return tactics
+        return [
+            (block_size, *gemm1, *gemm2)
+            for block_size in self._candidate_block_sizes(inputs[2].numel())
+            for gemm1, gemm2 in self._candidate_gemm_pairs(inputs)
+        ]
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        self._require_built()
+        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only PackedPrecomputed routing."
+            )
+        hidden_states = act.hidden_states_q
+        if hidden_states.ndim != 2 or hidden_states.dtype is not torch.bfloat16:
+            raise TypeError(
+                f"{type(self).__name__} requires 2D BF16 hidden_states_q, got "
+                f"shape={tuple(hidden_states.shape)}, dtype={hidden_states.dtype}."
+            )
+        if hidden_states.device != self.device or not hidden_states.is_contiguous():
+            raise ValueError(
+                f"{type(self).__name__} requires contiguous hidden states on {self.device}."
+            )
+        if act.hidden_states_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} quantizes activations internally; "
+                "hidden_states_scale must be None."
+            )
+        num_tokens, hidden_size = hidden_states.shape
+        if num_tokens == 0:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support zero tokens."
+            )
+        _validate_prerouted_inputs(
+            act,
+            num_tokens,
+            self.config.routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32,),
+            require_contiguous=True,
+        )
+
+        view = weights.get_view(self.backend_key)
+        required = (
+            "w1",
+            "w1_scale",
+            "w1_global_scale",
+            "w2",
+            "w2_scale",
+            "w2_global_scale",
+        )
+        missing = [key for key in required if key not in view]
+        if missing:
+            raise KeyError(
+                f"{self.backend_key} prepared weights are missing {missing}."
+            )
+        w1, w1_scale, w1_global, w2, w2_scale, w2_global = (
+            view[key] for key in required
+        )
+        num_experts = self.config.routing.num_experts
+        intermediate_size = self.config.experts.intermediate_size
+        w1_rows = intermediate_size * (2 if self.config.activation.is_gated else 1)
+        expected_w1 = (num_experts, w1_rows, hidden_size // 2)
+        expected_w2 = (num_experts, hidden_size, intermediate_size // 2)
+        if tuple(w1.shape) != expected_w1 or tuple(w2.shape) != expected_w2:
+            raise ValueError(
+                f"cuTile NVFP4 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
+                f"!= expected {expected_w1}/{expected_w2}."
+            )
+        if self._activation_fp4:
+            expected_s1: tuple[int, ...] = (
+                num_experts,
+                (w1_rows + 127) // 128,
+                hidden_size // 64,
+                32,
+                16,
+            )
+            expected_s2: tuple[int, ...] = (
+                num_experts,
+                (hidden_size + 127) // 128,
+                intermediate_size // 64,
+                32,
+                16,
+            )
+        else:
+            expected_s1 = (num_experts, w1_rows, hidden_size // 16)
+            expected_s2 = (num_experts, hidden_size, intermediate_size // 16)
+        if tuple(w1_scale.shape) != expected_s1 or tuple(w2_scale.shape) != expected_s2:
+            raise ValueError(
+                "cuTile NVFP4 block-scale shapes "
+                f"{tuple(w1_scale.shape)}/{tuple(w2_scale.shape)} != "
+                f"expected {expected_s1}/{expected_s2}."
+            )
+        if w1.dtype is not torch.uint8 or w2.dtype is not torch.uint8:
+            raise TypeError("cuTile NVFP4 prepared weights must use torch.uint8.")
+        if (
+            w1_scale.dtype is not torch.float8_e4m3fn
+            or w2_scale.dtype is not torch.float8_e4m3fn
+        ):
+            raise TypeError("cuTile NVFP4 block scales must use float8_e4m3fn.")
+        if w1_global.dtype is not torch.float32 or w2_global.dtype is not torch.float32:
+            raise TypeError("cuTile NVFP4 global scales must use torch.float32.")
+        if any(
+            t.device != self.device
+            for t in (w1, w1_scale, w1_global, w2, w2_scale, w2_global)
+        ):
+            raise ValueError(
+                "cuTile NVFP4 prepared weights must match the runner device."
+            )
+        if any(
+            not t.is_contiguous()
+            for t in (w1, w1_scale, w1_global, w2, w2_scale, w2_global)
+        ):
+            raise ValueError("cuTile NVFP4 prepared weights must be contiguous.")
+
+        bucket = map_to_hybrid_bucket(
+            num_tokens, self.config.execution.tune_max_num_tokens
+        )
+        self.tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0, 1, 2, 3),
+                    dim_idx=(0, 0, 0, 0),
+                    gen_tuning_buckets=(bucket,),
+                    map_to_tuning_buckets=make_hybrid_bucket_mapper(
+                        self.config.execution.tune_max_num_tokens
+                    ),
+                ),
+            ),
+            use_cuda_graph=True,
+            inputs_pre_hook=self._prepare_tuning_inputs,
+        )
+        self._ensure_workspace(num_tokens, hidden_size)
+        return [
+            hidden_states.new_empty((num_tokens, hidden_size)),
+            hidden_states,
+            act.topk_ids,
+            act.topk_weights,
+            w1,
+            w1_scale,
+            w1_global,
+            w2,
+            w2_scale,
+            w2_global,
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        self._require_built()
+        if len(inputs) != 10:
+            raise ValueError(
+                f"{type(self).__name__} expects 10 inputs, got {len(inputs)}."
+            )
+        if tactic == -1:
+            gemm1, gemm2 = self._candidate_gemm_pairs(inputs)[0]
+            tactic = (self._default_block_size, *gemm1, *gemm2)
+        if not isinstance(tactic, (tuple, list)) or len(tactic) not in (7, 8):
+            raise ValueError(
+                f"{type(self).__name__} tactic must be -1 or a seven- or "
+                "eight-integer tuple."
+            )
+        fuse_gemm1 = None
+        if len(tactic) == 8:
+            (
+                block_size,
+                fuse_gemm1,
+                g1_n,
+                g1_k,
+                g1_occ,
+                g2_n,
+                g2_k,
+                g2_occ,
+            ) = map(int, tactic)
+            if fuse_gemm1 not in (0, 1):
+                raise ValueError("cuTile NVFP4 GEMM1 fusion flag must be 0 or 1.")
+        else:
+            block_size, g1_n, g1_k, g1_occ, g2_n, g2_k, g2_occ = map(int, tactic)
+        if block_size not in self._block_sizes:
+            raise ValueError(
+                f"cuTile NVFP4 block size must be one of {self._block_sizes}, "
+                f"got {block_size}."
+            )
+        hidden_size = inputs[1].shape[1]
+        self._ensure_workspace(inputs[1].shape[0], hidden_size)
+        return self._kernel_module.run_moe(
+            inputs[1],
+            inputs[2],
+            inputs[3],
+            inputs[4],
+            inputs[5],
+            inputs[6],
+            inputs[7],
+            inputs[8],
+            inputs[9],
+            inputs[0],
+            self._workspace,
+            activation_type=self.config.activation.type,
+            activation_fp4=self._activation_fp4,
+            fuse_gemm1=None if fuse_gemm1 is None else bool(fuse_gemm1),
+            block_size=block_size,
+            gemm1_config=self._kernel_module.GemmConfig(g1_n, g1_k, g1_occ),
+            gemm2_config=self._kernel_module.GemmConfig(g2_n, g2_k, g2_occ),
+        )
+
+
+class CuTileNvfp4Runner(_CuTileFp4Runner):
+    """cuTile NVFP4 weights and inputs for both grouped GEMMs."""
+
+    backend_key = "cutile_nvfp4"
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = (QuantVariant.NVFP4,)
+    _block_sizes = (16, 32, 64, 128)
+    _activation_fp4 = True
+    _supported_archs = _CUTILE_NVFP4_ARCHS
 
 
 # ---------------------------------------------------------------------------

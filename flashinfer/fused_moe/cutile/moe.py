@@ -36,11 +36,12 @@ import torch
 from ...cutile.cutile_common import cached_replace_hints
 from ...tllm_enums import ActivationType
 from ...utils import next_positive_power_of_2
-from .activation import launch_activation
+from .activation import _apply_activation, launch_activation
 
 ConstInt: TypeAlias = ct.Constant[int]
 
 _PERMUTE_TILE_CAP = 16384
+_NO_ACTIVATION = -1
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,7 @@ def allocate_workspace(
     is_gated: bool,
     block_sizes: Sequence[int],
     device: torch.device,
+    allocate_activation_output: bool = True,
 ) -> Workspace:
     """Allocate graph-stable buffers for one exact token shape and tactic set."""
     if not block_sizes or any(block_size <= 0 for block_size in block_sizes):
@@ -124,7 +126,9 @@ def allocate_workspace(
             device=device,
         ),
         activation_out=torch.empty(
-            num_assignments, intermediate_size, dtype=bf16, device=device
+            ((num_assignments, intermediate_size) if allocate_activation_output else 0),
+            dtype=bf16,
+            device=device,
         ),
         gemm2_out=torch.empty(num_assignments, hidden_size, dtype=bf16, device=device),
     )
@@ -433,6 +437,7 @@ def _grouped_gemm_bf16(
     TILE_M: ConstInt,
     TILE_N: ConstInt,
     TILE_K: ConstInt,
+    ACTIVATION_TYPE: ConstInt,
 ):
     initial_m_block = ct.bid(0)
     n_block = ct.bid(1)
@@ -474,13 +479,18 @@ def _grouped_gemm_bf16(
                     (TILE_K, TILE_N),
                 )
                 accumulator = ct.mma(a, b, accumulator)
+            values = ct.astype(accumulator, OUT.dtype)
+            if ACTIVATION_TYPE != _NO_ACTIVATION:
+                values = _apply_activation(
+                    ct.astype(values, ct.float32), ACTIVATION_TYPE
+                )
             ct.scatter(
                 OUT,
                 (
                     ct.reshape(slots, (TILE_M, 1)),
                     ct.reshape(n_offsets, (1, TILE_N)),
                 ),
-                ct.astype(accumulator, OUT.dtype),
+                ct.astype(values, OUT.dtype),
                 check_bounds=True,
             )
 
@@ -661,6 +671,7 @@ def _grouped_gemm(
     top_k: int,
     block_size: int,
     config: GemmConfig,
+    activation_type: ActivationType | None = None,
 ) -> None:
     num_assignment_rows = output.shape[0]
     n = output.shape[1]
@@ -684,6 +695,11 @@ def _grouped_gemm(
             block_size,
             config.tile_n,
             config.tile_k,
+            (
+                _NO_ACTIVATION
+                if activation_type is None
+                else int(ActivationType(activation_type))
+            ),
         ),
     )
 
@@ -711,20 +727,34 @@ def run_moe(
     sorted_slots, block_expert, num_post_pad = _permute(
         topk_ids, w1.shape[0], block_size, workspace
     )
-    gemm1_out = workspace.gemm1_out[:num_assignments]
-    _grouped_gemm(
-        hidden_states,
-        w1,
-        sorted_slots,
-        block_expert,
-        num_post_pad,
-        gemm1_out,
-        top_k=top_k,
-        block_size=block_size,
-        config=gemm1_config,
-    )
     activation_out = workspace.activation_out[:num_assignments]
-    launch_activation(gemm1_out, activation_out, activation_type)
+    if activation_type.is_gated:
+        gemm1_out = workspace.gemm1_out[:num_assignments]
+        _grouped_gemm(
+            hidden_states,
+            w1,
+            sorted_slots,
+            block_expert,
+            num_post_pad,
+            gemm1_out,
+            top_k=top_k,
+            block_size=block_size,
+            config=gemm1_config,
+        )
+        launch_activation(gemm1_out, activation_out, activation_type)
+    else:
+        _grouped_gemm(
+            hidden_states,
+            w1,
+            sorted_slots,
+            block_expert,
+            num_post_pad,
+            activation_out,
+            top_k=top_k,
+            block_size=block_size,
+            config=gemm1_config,
+            activation_type=activation_type,
+        )
     gemm2_out = workspace.gemm2_out[:num_assignments]
     _grouped_gemm(
         activation_out,

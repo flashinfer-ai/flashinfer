@@ -295,6 +295,7 @@ _CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
 _CUTLASS_W4A16_ARCHS = (90,)
 
 _CUTILE_BF16_ARCHS = (89, 90, 120, 121)
+_CUTILE_NVFP4_ARCHS = (120, 121)
 
 
 @dataclass(frozen=True)
@@ -665,6 +666,53 @@ class CuTileBf16Config:
 
 
 @dataclass(frozen=True)
+class CuTileNvfp4Config:
+    """cuTile NVFP4-weight x NVFP4-activation backend."""
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_NVFP4_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w1_global_scale,
+        w2_fp4,
+        w2_block_scale,
+        w2_global_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: ActivationConfig = ActivationConfig.swiglu,
+        source_format: str = "modelopt",
+        device=None,
+    ):
+        """Build the ``cutile_nvfp4`` view from checkpoint NVFP4 weights."""
+        from .prepare import prepare_cutile_nvfp4_weights
+
+        return prepare_cutile_nvfp4_weights(
+            w1_fp4,
+            w1_block_scale,
+            w1_global_scale,
+            w2_fp4,
+            w2_block_scale,
+            w2_global_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=activation.type,
+            source_format=source_format,
+            activation_fp4=True,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CuTileNvfp4Config()"
+
+
+@dataclass(frozen=True)
 class CutlassW4A16Config:
     """CUTLASS MXFP4-weight x BF16-activation backend for SM90.
 
@@ -840,6 +888,7 @@ BackendConfigType = Union[
     CutlassConfig,
     CutlassBf16Config,
     CuTileBf16Config,
+    CuTileNvfp4Config,
     CutlassW4A16Config,
     CuteDslConfig,
     B12xNvfp4Config,
@@ -855,6 +904,7 @@ ALL_BACKEND_CONFIGS = (
     CutlassConfig,
     CutlassBf16Config,
     CuTileBf16Config,
+    CuTileNvfp4Config,
     CutlassW4A16Config,
     CuteDslConfig,
     B12xNvfp4Config,

@@ -77,6 +77,8 @@ cuTile Fused MoE
 
     CuTileBf16Config
     CuTileBf16Runner
+    CuTileNvfp4Config
+    CuTileNvfp4Runner
 
 TensorRT-LLM Fused MoE
 ----------------------

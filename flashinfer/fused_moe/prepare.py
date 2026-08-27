@@ -1238,6 +1238,153 @@ def prepare_cutlass_bf16_weights(
     }
 
 
+def _swizzle_cutile_nvfp4_scales(scale: torch.Tensor) -> torch.Tensor:
+    """Convert ``[E, N, K/16]`` scales to the layout used by scaled MMA."""
+    num_experts, n, k_groups = scale.shape
+    if n % 64 != 0 or k_groups % 4 != 0:
+        raise ValueError("cuTile W4A4 scales require N and K divisible by 64.")
+    padded_n = (n + 127) // 128 * 128
+    if padded_n != n:
+        padded = scale.new_zeros((num_experts, padded_n, k_groups))
+        padded[:, :n] = scale
+        scale = padded
+    reshaped = scale.reshape(num_experts * padded_n, k_groups)
+    reshaped = reshaped.reshape(num_experts * padded_n // 128, 4, 32, k_groups // 4, 4)
+    return (
+        reshaped.permute(0, 3, 2, 1, 4)
+        .contiguous()
+        .reshape(num_experts, padded_n // 128, k_groups // 4, 32, 16)
+    )
+
+
+def prepare_cutile_nvfp4_weights(
+    w1_fp4: torch.Tensor,
+    w1_block_scale: torch.Tensor,
+    w1_global_scale: torch.Tensor,
+    w2_fp4: torch.Tensor,
+    w2_block_scale: torch.Tensor,
+    w2_global_scale: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    source_format: str = "modelopt",
+    activation_fp4: bool,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Build checkpoint-native NVFP4 views for the cuTile MoE runners.
+
+    Packed values use two E2M1 elements per byte along K. Block scales are
+    E4M3 with a 16-element K group, and global scales are per expert or, for a
+    gated GEMM1, optionally per ``[up, gate]`` shard. W4A4 weights retain their
+    logical dimensions while their scaled-MMA layout pads outer scale rows to
+    a multiple of 128.
+    """
+    activation_type = ActivationType(activation_type)
+    if activation_type not in (ActivationType.Swiglu, ActivationType.Relu2):
+        raise ValueError(
+            f"unsupported cuTile NVFP4 activation {activation_type!r}; expected "
+            "Swiglu or Relu2."
+        )
+    if hidden_size % 16 != 0 or intermediate_size % 16 != 0:
+        raise ValueError(
+            "cuTile NVFP4 requires hidden_size and intermediate_size divisible by 16."
+        )
+    if activation_fp4 and (hidden_size % 64 != 0 or intermediate_size % 64 != 0):
+        raise ValueError(
+            "cuTile W4A4 requires hidden_size and intermediate_size divisible by 64."
+        )
+    if device is None:
+        device = w1_fp4.device
+    device = torch.device(device)
+    tensors = (
+        w1_fp4,
+        w1_block_scale,
+        w1_global_scale,
+        w2_fp4,
+        w2_block_scale,
+        w2_global_scale,
+    )
+    if any(t.device != tensors[0].device for t in tensors):
+        raise ValueError("cuTile NVFP4 checkpoint tensors must share one device.")
+    if w1_fp4.dtype != torch.uint8 or w2_fp4.dtype != torch.uint8:
+        raise TypeError("cuTile NVFP4 packed weights must use torch.uint8.")
+    if (
+        w1_block_scale.dtype != torch.float8_e4m3fn
+        or w2_block_scale.dtype != torch.float8_e4m3fn
+    ):
+        raise TypeError("cuTile NVFP4 block scales must use torch.float8_e4m3fn.")
+    if w1_global_scale.dtype != torch.float32 or w2_global_scale.dtype != torch.float32:
+        raise TypeError("cuTile NVFP4 global scales must use torch.float32.")
+
+    w1_rows = intermediate_size * (2 if activation_type.is_gated else 1)
+    expected_w1 = (num_local_experts, w1_rows, hidden_size // 2)
+    expected_w1_scale = (num_local_experts, w1_rows, hidden_size // 16)
+    expected_w2 = (num_local_experts, hidden_size, intermediate_size // 2)
+    expected_w2_scale = (num_local_experts, hidden_size, intermediate_size // 16)
+    if tuple(w1_fp4.shape) != expected_w1 or tuple(w2_fp4.shape) != expected_w2:
+        raise ValueError(
+            f"cuTile NVFP4 weight shapes {tuple(w1_fp4.shape)}/{tuple(w2_fp4.shape)} "
+            f"!= expected {expected_w1}/{expected_w2}."
+        )
+    if (
+        tuple(w1_block_scale.shape) != expected_w1_scale
+        or tuple(w2_block_scale.shape) != expected_w2_scale
+    ):
+        raise ValueError(
+            "cuTile NVFP4 block-scale shapes "
+            f"{tuple(w1_block_scale.shape)}/{tuple(w2_block_scale.shape)} != "
+            f"expected {expected_w1_scale}/{expected_w2_scale}."
+        )
+    allowed_w1_global_shapes: set[tuple[int, ...]] = {(num_local_experts,)}
+    if activation_type.is_gated:
+        allowed_w1_global_shapes.add((num_local_experts, 2))
+    if tuple(w1_global_scale.shape) not in allowed_w1_global_shapes:
+        raise ValueError(
+            "cuTile NVFP4 GEMM1 global scale must be [E] or [E, 2] for a gated activation."
+        )
+    if tuple(w2_global_scale.shape) != (num_local_experts,):
+        raise ValueError("cuTile NVFP4 GEMM2 global scale must have shape [E].")
+
+    source = source_format.lower().replace("-", "_")
+    if source not in ("modelopt", "modelopt_nvfp4", "compressed_tensors"):
+        raise ValueError(
+            "source_format must be 'modelopt' or 'compressed_tensors', "
+            f"got {source_format!r}."
+        )
+    if source == "compressed_tensors":
+        w1_global_scale = 1.0 / w1_global_scale
+        w2_global_scale = 1.0 / w2_global_scale
+
+    w1_fp4 = w1_fp4.to(device)
+    w1_block_scale = w1_block_scale.to(device)
+    w1_global_scale = w1_global_scale.to(device)
+    w2_fp4 = w2_fp4.to(device)
+    w2_block_scale = w2_block_scale.to(device)
+    w2_global_scale = w2_global_scale.to(device)
+    if activation_type.is_gated:
+        up, gate = w1_fp4.chunk(2, dim=1)
+        w1_fp4 = torch.cat((gate, up), dim=1)
+        up_scale, gate_scale = w1_block_scale.chunk(2, dim=1)
+        w1_block_scale = torch.cat((gate_scale, up_scale), dim=1)
+        if w1_global_scale.ndim == 2:
+            w1_global_scale = w1_global_scale[:, [1, 0]]
+
+    result = {
+        "w1": w1_fp4.contiguous(),
+        "w1_scale": w1_block_scale.contiguous(),
+        "w1_global_scale": w1_global_scale.contiguous(),
+        "w2": w2_fp4.contiguous(),
+        "w2_scale": w2_block_scale.contiguous(),
+        "w2_global_scale": w2_global_scale.contiguous(),
+    }
+    if activation_fp4:
+        result["w1_scale"] = _swizzle_cutile_nvfp4_scales(result["w1_scale"])
+        result["w2_scale"] = _swizzle_cutile_nvfp4_scales(result["w2_scale"])
+    return result
+
+
 def prepare_cutile_bf16_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
