@@ -48,10 +48,19 @@ The packaged manifest carries the exact dynamic shared-memory requirement
 resolved for every generated main route; the loader validates that value
 against the packaged CUDA source before compiling the host launcher.
 
+``prepare_all_gather_matmul`` prepares the source-built packed-QKV route for
+SM103, bfloat16, four-rank NCCL groups, contiguous ``[M, 8192]`` inputs, and a
+contiguous ``[8192, 2560]`` weight, where ``M`` is a positive multiple of 128.
+It binds the weight and process group once and returns a callable that accepts
+a contiguous input with the same shape, dtype, and device. Both
+``backend="auto"`` and ``backend="cake"`` select this prepared route.
+Unsupported configurations raise during preparation instead of falling back.
+
 .. autosummary::
     :toctree: ../generated
 
     all_gather_matmul
+    prepare_all_gather_matmul
 
 TensorRT-LLM AllReduce
 ----------------------
