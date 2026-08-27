@@ -1114,6 +1114,8 @@ class _PreparedPackedQkvSm103Tp4Launcher:
     chunk_plan: tuple[tuple[int, int], ...]
     signal_pad: torch.Tensor = field(repr=False)
     signal_pad_ptr: int
+    descriptor_ready_event: torch.cuda.Event = field(repr=False)
+    descriptor_ready_stream: int
     peer_routes: tuple[tuple[torch.Tensor, torch.Tensor], ...] = field(repr=False)
     peer_scratch_ptrs: tuple[int, ...]
     peer_signal_ptrs: tuple[int, ...]
@@ -1171,7 +1173,10 @@ class _PreparedPackedQkvSm103Tp4Launcher:
                 w.record_stream(main_stream)
                 descriptors.record_stream(main_stream)
                 main_stream_id = int(main_stream.cuda_stream)
-                if state.tail_event is not None and state.tail_stream != main_stream_id:
+                if state.tail_event is None:
+                    if self.descriptor_ready_stream != main_stream_id:
+                        main_stream.wait_event(self.descriptor_ready_event)
+                elif state.tail_stream != main_stream_id:
                     main_stream.wait_event(state.tail_event)
 
                 phase = state.next_phase
@@ -1353,6 +1358,20 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
             peer_signal_ptrs = tuple(
                 int(peer_signal.data_ptr()) for _, peer_signal in peer_routes
             )
+            _prepared_descriptor_storage(
+                workspace,
+                module,
+                inp,
+                w,
+                device_index=device_index,
+                main_stream=main_stream,
+                world_size=world_size,
+                rows=rows,
+                scratch_fingerprint=scratch_fingerprint,
+                weight_fingerprint=weight_fingerprint,
+            )
+            descriptor_ready_event = torch.cuda.Event(enable_timing=False)
+            descriptor_ready_event.record(main_stream)
             launcher = _PreparedPackedQkvSm103Tp4Launcher(
                 group=group,
                 group_id=id(group),
@@ -1375,22 +1394,12 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
                 chunk_plan=chunk_plan,
                 signal_pad=signal_pad,
                 signal_pad_ptr=int(signal_pad.data_ptr()),
+                descriptor_ready_event=descriptor_ready_event,
+                descriptor_ready_stream=int(main_stream.cuda_stream),
                 peer_routes=tuple(peer_routes),
                 peer_scratch_ptrs=peer_scratch_ptrs,
                 peer_signal_ptrs=peer_signal_ptrs,
                 verbose=verbose,
-            )
-            _prepared_descriptor_storage(
-                workspace,
-                module,
-                inp,
-                w,
-                device_index=device_index,
-                main_stream=main_stream,
-                world_size=world_size,
-                rows=rows,
-                scratch_fingerprint=scratch_fingerprint,
-                weight_fingerprint=weight_fingerprint,
             )
             return launcher
         except Exception:

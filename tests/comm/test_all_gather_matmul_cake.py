@@ -810,7 +810,7 @@ def _fake_prepared_packed_qkv(
     class FakeEvent:
         cuda_event = 29
 
-        def __init__(self):
+        def __init__(self, **kwargs):
             self.recorded_streams = []
 
         def record(self, stream):
@@ -880,6 +880,7 @@ def _fake_prepared_packed_qkv(
         "current_stream",
         lambda device_index: SimpleNamespace(cuda_stream=17),
     )
+    monkeypatch.setattr(backend.torch.cuda, "Event", FakeEvent)
     descriptor = _FakePreparedTensor(
         6001,
         (backend._DESCRIPTOR_COUNT * backend._TENSOR_MAP_BYTES,),
@@ -935,6 +936,8 @@ def test_prepare_packed_qkv_binds_host_identity_once(monkeypatch):
     assert launcher.chunk_plan == ((0, 128),)
     assert launcher.signal_pad.shape == (4, 1)
     assert launcher.signal_pad_ptr == 4002
+    assert launcher.descriptor_ready_stream == 17
+    assert launcher.descriptor_ready_event.recorded_streams
     assert len(launcher.peer_routes) == 3
     assert launcher.peer_scratch_ptrs == (5004, 5001, 5002)
     assert launcher.peer_signal_ptrs == (4004, 4001, 4002)
@@ -1027,6 +1030,48 @@ def test_prepared_packed_qkv_hot_path_uses_one_native_submission(monkeypatch):
     assert inp.recorded_streams == [main_stream, workspace.comm_stream]
     assert weight.recorded_streams == [main_stream]
     assert descriptor.recorded_streams == [main_stream]
+
+
+def test_prepared_packed_qkv_first_other_stream_waits_for_descriptor(monkeypatch):
+    backend = _backend()
+    launcher, inp, _, _, state, _, module, _ = _fake_prepared_packed_qkv(
+        monkeypatch, backend
+    )
+    output = _FakePreparedTensor(
+        7001,
+        (launcher.world_size * launcher.rows, 2560),
+        torch.bfloat16,
+        launcher.device,
+    )
+    monkeypatch.setattr(backend.torch, "empty", lambda *args, **kwargs: output)
+    module.run_prepared_packed_qkv = lambda *args: None
+
+    class FirstCallStream:
+        cuda_stream = 19
+
+        def __init__(self):
+            self.waited_events = []
+
+        def wait_event(self, event):
+            self.waited_events.append(event)
+
+    class TailEvent:
+        def __init__(self, **kwargs):
+            pass
+
+        def record(self, stream):
+            pass
+
+    first_call_stream = FirstCallStream()
+    monkeypatch.setattr(
+        backend.torch.cuda, "current_stream", lambda device_index: first_call_stream
+    )
+    monkeypatch.setattr(backend.torch.cuda, "Event", TailEvent)
+
+    launcher(inp)
+
+    assert first_call_stream.waited_events == [launcher.descriptor_ready_event]
+    assert state.tail_stream == 19
 
 
 @pytest.mark.parametrize(
