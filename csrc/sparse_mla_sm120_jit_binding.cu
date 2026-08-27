@@ -23,22 +23,22 @@ void SparseMlaSm120PagedAttention(TensorView q, TensorView kv_cache, TensorView 
                                   Optional<TensorView> extra_indices,
                                   Optional<TensorView> extra_topk_length);
 
-bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int page_block_size,
-                                   int num_tokens, int num_splits, const bf16* Q,
-                                   const uint8_t* KV_cache, const int32_t* indices, bf16* mid_out,
-                                   float* mid_lse, bf16* output, float* out_lse,
-                                   const int* topk_length, const float* attn_sink,
-                                   const uint8_t* extra_KV_cache, const int32_t* extra_indices,
-                                   const int* extra_topk_length, int extra_topk, int pbs_extra,
-                                   size_t stride_extra_kv_block, int chunks_per_block_override,
-                                   float sm_scale, size_t stride_kv_block, cudaStream_t stream);
+bool launch_sparse_mla_decode_dsv4(
+    ModelType mt, int num_heads, int topk, int page_block_size, int num_tokens, int num_splits,
+    const bf16* Q, const uint8_t* KV_cache, const int32_t* indices, bf16* mid_out, float* mid_lse,
+    bf16* output, float* out_lse, const int* topk_length, const float* attn_sink,
+    const uint8_t* extra_KV_cache, const int32_t* extra_indices, const int* extra_topk_length,
+    int extra_topk, int pbs_extra, size_t stride_extra_kv_block, int chunks_per_block_override,
+    float sm_scale, size_t stride_kv_block, size_t stride_indices_token,
+    size_t stride_extra_indices_token, cudaStream_t stream);
 
 bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int num_tokens,
                                      int num_splits, const bf16* Q, const uint8_t* KV_cache,
                                      const int32_t* indices, bf16* mid_out, float* mid_lse,
                                      bf16* output, float* out_lse, const int* topk_length,
                                      const float* attn_sink, int chunks_per_block_override,
-                                     float sm_scale, size_t stride_kv_block, cudaStream_t stream);
+                                     float sm_scale, size_t stride_kv_block,
+                                     size_t stride_indices_token, cudaStream_t stream);
 
 namespace {
 
@@ -95,15 +95,18 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   TVM_FFI_ICHECK_EQ(q.ndim(), 3) << "q must be [T, H, D_QK]";
   TVM_FFI_ICHECK_GE(kv_cache.ndim(), 2);
   // indices may be 2D [T, topk] or 3D [T, s_q=1, topk] (some callers keep
-  // the s_q singleton dim through the call stack). The kernel walks
-  // `indices + t_idx * stride_per_t`, where stride is captured below from
-  // .stride(0).
+  // the s_q singleton dim through the call stack). Rows may be strided views
+  // into a wider persistent buffer; the kernel walks each row with
+  // stride(0). The last dim must stay contiguous.
   TVM_FFI_ICHECK_GE(indices.ndim(), 2)
       << "indices must have at least 2 dims; got ndim=" << indices.ndim();
   if (indices.ndim() == 3) {
     TVM_FFI_ICHECK_EQ(indices.size(1), 1)
         << "indices 3D form requires size(1) == 1; got " << indices.size(1);
   }
+  CHECK_INPUT_TYPE(indices, dl_int32);
+  TVM_FFI_ICHECK_EQ(indices.stride(-1), 1) << "indices last dimension must be contiguous";
+  const size_t stride_indices_token = static_cast<size_t>(indices.stride(0));
 
   const int num_tokens = static_cast<int>(q.size(0));
   const int num_heads = static_cast<int>(q.size(1));
@@ -135,10 +138,15 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   int extra_topk_arg = 0;
   int pbs_extra_arg = 0;
   size_t stride_extra_kv_block = 0;
+  size_t stride_extra_indices_token = 0;
   if (extra_kv_cache.has_value()) {
     TVM_FFI_ICHECK(extra_indices.has_value()) << "extra_kv_cache requires extra_indices";
     const auto& ekv = extra_kv_cache.value();
-    extra_topk_arg = static_cast<int>(extra_indices.value().size(-1));
+    const auto& eidx = extra_indices.value();
+    CHECK_INPUT_TYPE(eidx, dl_int32);
+    TVM_FFI_ICHECK_EQ(eidx.stride(-1), 1) << "extra_indices last dimension must be contiguous";
+    extra_topk_arg = static_cast<int>(eidx.size(-1));
+    stride_extra_indices_token = static_cast<size_t>(eidx.stride(0));
     const PagedKVLayout extra_layout = parse_paged_kv_layout(ekv, BPT_DSV4, "extra_kv_cache");
     pbs_extra_arg = extra_layout.page_block_size;
     stride_extra_kv_block = extra_layout.stride_kv_block;
@@ -153,7 +161,7 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
       static_cast<float*>(out_lse.data_ptr()), topk_len_ptr, attn_sink_ptr, extra_kv_ptr,
       extra_indices_ptr, extra_topk_len_ptr, extra_topk_arg, pbs_extra_arg, stride_extra_kv_block,
       static_cast<int>(chunks_per_block_override), static_cast<float>(sm_scale),
-      kv_layout.stride_kv_block, stream);
+      kv_layout.stride_kv_block, stride_indices_token, stride_extra_indices_token, stream);
   TVM_FFI_ICHECK(ok) << "decode-dsv4 launch failed (unsupported shape or kernel error)";
 }
 
@@ -173,6 +181,9 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
     TVM_FFI_ICHECK_EQ(indices.size(1), 1)
         << "indices 3D form requires size(1) == 1; got " << indices.size(1);
   }
+  CHECK_INPUT_TYPE(indices, dl_int32);
+  TVM_FFI_ICHECK_EQ(indices.stride(-1), 1) << "indices last dimension must be contiguous";
+  const size_t stride_indices_token = static_cast<size_t>(indices.stride(0));
 
   const int num_tokens = static_cast<int>(q.size(0));
   const int num_heads = static_cast<int>(q.size(1));
@@ -199,7 +210,7 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
       static_cast<float*>(mid_lse.data_ptr()), static_cast<bf16*>(output.data_ptr()),
       static_cast<float*>(out_lse.data_ptr()), topk_len_ptr, attn_sink_ptr,
       static_cast<int>(chunks_per_block_override), static_cast<float>(sm_scale),
-      kv_layout.stride_kv_block, stream);
+      kv_layout.stride_kv_block, stride_indices_token, stream);
   TVM_FFI_ICHECK(ok) << "decode-dsv3_2 launch failed (unsupported shape or kernel error)";
 }
 

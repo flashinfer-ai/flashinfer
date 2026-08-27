@@ -124,7 +124,10 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     bf16* __restrict__ mid_out,               // [num_tokens, num_heads, num_splits, d_v=512] bf16
     float* __restrict__ mid_lse,              // [num_tokens, num_heads, num_splits] f32
     const int* __restrict__ topk_length_ptr,  // [num_tokens] or null
-    int num_tokens, int num_splits, int chunks_per_block, float sm_scale, size_t stride_kv_block) {
+    int num_tokens, int num_splits, int chunks_per_block, float sm_scale, size_t stride_kv_block,
+    // Row stride of indices; may exceed topk when the caller views a wider
+    // persistent buffer (last dim must stay contiguous).
+    size_t stride_indices_token) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576);
   constexpr int D_NOPE = KV::D_NOPE;                                // 512
@@ -203,7 +206,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   auto sm = DecodeDsv3_2Smem::init(smem_raw);
 
   __shared__ bf16 sm_p_full[HPB][DSV3_2_BI];  // 2 KB static
-  const int32_t* idx_base = indices + (size_t)t_idx * TOPK;
+  const int32_t* idx_base = indices + (size_t)t_idx * stride_indices_token;
 
   // ── Per-stage mbarrier init.
   if (threadIdx.x == 0) {

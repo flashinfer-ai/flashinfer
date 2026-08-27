@@ -1434,7 +1434,9 @@ def sparse_mla_sm120_decode_dsv4(
         Paged FP8 cache, shape ``[num_blocks, page_bytes]`` uint8.
     indices : torch.Tensor
         ``[T, topk]`` int32. ``topk`` must be one of
-        {128, 192, 256, 512, 1024}; ``-1`` marks invalid slots.
+        {128, 192, 256, 512, 1024}; ``-1`` marks invalid slots. Row-strided
+        views into a wider persistent buffer are accepted (the last dim must
+        stay contiguous).
     mid_out : torch.Tensor
         Scratch, ``[T, num_heads, num_splits, d_v]`` bf16. ``num_splits =
         ceil(topk / 64) + ceil(extra_topk / 64)``.

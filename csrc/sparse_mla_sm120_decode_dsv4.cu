@@ -26,7 +26,8 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
                                     const int* extra_topk_length, int extra_topk, int pbs_extra,
                                     size_t stride_extra_kv_block, int num_tokens, int num_splits,
                                     int chunks_per_block_override, float sm_scale,
-                                    size_t stride_kv_block, cudaStream_t stream) {
+                                    size_t stride_kv_block, size_t stride_indices_token,
+                                    size_t stride_extra_indices_token, cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
   // Ceiling div so NUM_HEADS < HPB (small-TP configs, e.g. h=8) still get a
   // tile. The kernel internally clamps Q load + mid_out writes to
@@ -111,7 +112,8 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
   kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
       Q, KV_cache, indices, mid_out, mid_lse, topk_length, extra_KV_cache, extra_indices,
       extra_topk_length, extra_topk, pbs_extra, stride_extra_kv_block, num_tokens, num_splits,
-      chunks_per_block, sm_scale, stride_kv_block);
+      chunks_per_block, sm_scale, stride_kv_block, stride_indices_token,
+      stride_extra_indices_token);
   CUDA_CHECK_BOOL(cudaGetLastError());
 
   // Stage 2: merge splits → final output + LSE.
@@ -136,15 +138,14 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
 // TOPK ∈ {128, 192, 256, 512, 1024}. TOPK=192 covers the padded
 // DeepSeek-V4-Flash-0731 DSpark K=5 shape (128 SWA + 5 active draft entries),
 // while TOPK=256 covers wider DSpark configurations.
-bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int page_block_size,
-                                   int num_tokens, int num_splits, const bf16* Q,
-                                   const uint8_t* KV_cache, const int32_t* indices, bf16* mid_out,
-                                   float* mid_lse, bf16* output, float* out_lse,
-                                   const int* topk_length, const float* attn_sink,
-                                   const uint8_t* extra_KV_cache, const int32_t* extra_indices,
-                                   const int* extra_topk_length, int extra_topk, int pbs_extra,
-                                   size_t stride_extra_kv_block, int chunks_per_block_override,
-                                   float sm_scale, size_t stride_kv_block, cudaStream_t stream) {
+bool launch_sparse_mla_decode_dsv4(
+    ModelType mt, int num_heads, int topk, int page_block_size, int num_tokens, int num_splits,
+    const bf16* Q, const uint8_t* KV_cache, const int32_t* indices, bf16* mid_out, float* mid_lse,
+    bf16* output, float* out_lse, const int* topk_length, const float* attn_sink,
+    const uint8_t* extra_KV_cache, const int32_t* extra_indices, const int* extra_topk_length,
+    int extra_topk, int pbs_extra, size_t stride_extra_kv_block, int chunks_per_block_override,
+    float sm_scale, size_t stride_kv_block, size_t stride_indices_token,
+    size_t stride_extra_indices_token, cudaStream_t stream) {
   if (mt != ModelType::DSV4 || page_block_size != 64) return false;
   if (num_splits <= 0) return false;
 #define DSV4_DISPATCH(H, K)                                                                 \
@@ -153,7 +154,7 @@ bool launch_sparse_mla_decode_dsv4(ModelType mt, int num_heads, int topk, int pa
         Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink,    \
         extra_KV_cache, extra_indices, extra_topk_length, extra_topk, pbs_extra,            \
         stride_extra_kv_block, num_tokens, num_splits, chunks_per_block_override, sm_scale, \
-        stride_kv_block, stream);                                                           \
+        stride_kv_block, stride_indices_token, stride_extra_indices_token, stream);         \
   }
   DSV4_DISPATCH(8, 128)
   DSV4_DISPATCH(8, 192)

@@ -36,7 +36,8 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
                                       const int* topk_length, bf16* output, float* out_lse,
                                       const float* attn_sink, int num_tokens, int num_splits,
                                       int chunks_per_block_override, float sm_scale,
-                                      size_t stride_kv_block, cudaStream_t stream) {
+                                      size_t stride_kv_block, size_t stride_indices_token,
+                                      cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576);
   constexpr int H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
@@ -108,9 +109,9 @@ static bool launch_decode_dsv3_2_impl(const bf16* Q, const uint8_t* KV_cache,
   // wrapper allocation.
   dim3 grid1(num_tokens, H_BLOCKS, num_splits);
   dim3 block1(DSV3_2_BLOCK_THREADS);
-  kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(Q, KV_cache, indices, mid_out, mid_lse,
-                                                    topk_length, num_tokens, num_splits,
-                                                    chunks_per_block, sm_scale, stride_kv_block);
+  kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
+      Q, KV_cache, indices, mid_out, mid_lse, topk_length, num_tokens, num_splits, chunks_per_block,
+      sm_scale, stride_kv_block, stride_indices_token);
   DSV3_2_CUDA_CHECK(cudaGetLastError());
 
   // Stage 2: reuse decode-dsv4 merge kernel (D_V=512 identical for both).
@@ -134,13 +135,15 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
                                      const int32_t* indices, bf16* mid_out, float* mid_lse,
                                      bf16* output, float* out_lse, const int* topk_length,
                                      const float* attn_sink, int chunks_per_block_override,
-                                     float sm_scale, size_t stride_kv_block, cudaStream_t stream) {
+                                     float sm_scale, size_t stride_kv_block,
+                                     size_t stride_indices_token, cudaStream_t stream) {
   if (num_splits <= 0) return false;
-#define DSV3_2_DISPATCH_MT(MT_VALUE, H, K)                                                     \
-  if (num_heads == (H) && topk == (K)) {                                                       \
-    return launch_decode_dsv3_2_impl<MT_VALUE, (H), (K)>(                                      \
-        Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink,       \
-        num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, stream); \
+#define DSV3_2_DISPATCH_MT(MT_VALUE, H, K)                                               \
+  if (num_heads == (H) && topk == (K)) {                                                 \
+    return launch_decode_dsv3_2_impl<MT_VALUE, (H), (K)>(                                \
+        Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink, \
+        num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block,    \
+        stride_indices_token, stream);                                                   \
   }
 #define DSV3_2_DISPATCH(H, K)                      \
   do {                                             \

@@ -133,7 +133,10 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     int extra_topk,                                 // 0 = no extra cache
     int pbs_extra,  // page_block_size for extra cache (e.g. 2 for DSv4 C128A)
     size_t stride_extra_kv_block, int num_tokens, int num_splits, int chunks_per_block,
-    float sm_scale, size_t stride_kv_block) {
+    float sm_scale, size_t stride_kv_block,
+    // Row strides of (extra_)indices; either may exceed the row width when the
+    // caller views a wider persistent buffer (last dim must stay contiguous).
+    size_t stride_indices_token, size_t stride_extra_indices_token) {
   using KV = KVCacheTraits<MT>;
   static_assert(MT == ModelType::DSV4, "decode-dsv4 currently DSV4-only");
   constexpr int D_NOPE = KV::D_NOPE;                                // 448
@@ -218,7 +221,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
   auto sm = DecodeDsv4Smem<MT>::init(smem_raw);
 
   __shared__ bf16 sm_p_full[HPB][DSV4_BI];  // 2 KB static
-  const int32_t* idx_base = indices + (size_t)t_idx * TOPK;
+  const int32_t* idx_base = indices + (size_t)t_idx * stride_indices_token;
 
   // mbar_full: leader arrives + expect_tx, bulk completion drives tx.
   // mbar_empty: math signaling thread arrives. mbar.try_wait.parity has no
@@ -250,7 +253,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     const int g_start = chunk_in_section * DSV4_CAND_WINDOW;
     const int g_end = min(g_start + DSV4_CAND_WINDOW, section_len);
     const int32_t* section_idx_base =
-        is_extra ? (extra_indices + (size_t)t_idx * extra_topk) : idx_base;
+        is_extra ? (extra_indices + (size_t)t_idx * stride_extra_indices_token) : idx_base;
     const uint8_t* section_kv = is_extra ? extra_KV_cache : KV_cache;
     const size_t section_stride = is_extra ? stride_extra_kv_block : stride_kv_block;
     // Page block size of THIS section. Main is compile-time constexpr (typ.
@@ -432,7 +435,7 @@ __global__ void __launch_bounds__(DSV4_BLOCK_THREADS) sparse_mla_decode_dsv4_ker
     // section_len OR slot id = -1 (indexer-padded; IO already gathered slot 0
     // into smem with idx clamped — masking to -inf kills it in softmax).
     const int32_t* section_idx_base =
-        is_extra_chunk ? (extra_indices + (size_t)t_idx * extra_topk) : idx_base;
+        is_extra_chunk ? (extra_indices + (size_t)t_idx * stride_extra_indices_token) : idx_base;
     const int warp_first_cand = warp_id * DSV4_ENTRIES_PER_WARP;
 #pragma unroll
     for (int nt = 0; nt < DSV4_QK_N_TILES; nt++) {
