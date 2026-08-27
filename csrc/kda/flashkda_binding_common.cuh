@@ -720,6 +720,7 @@ static __global__ void PublishTensorMaps(uint64_t* destination, TensorMapWords s
   const uint32_t index = threadIdx.x;
   if (index < TensorMapWords::kWordCount) {
     destination[index] = source.words[index];
+    asm volatile("fence.proxy.tensormap::generic.release.gpu;" ::: "memory");
   }
 }
 
