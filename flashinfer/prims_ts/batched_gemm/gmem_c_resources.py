@@ -97,6 +97,7 @@ class GmemCResource(MemoryResource):
     problem_n: Any = None
     gC: Any = None  # make_array_view of c_tensor
     gCBytes: Any = None
+    gCInt16: Any = None
     gSfC: Any = None
     gSfCBytes: Any = None
     gBias: Any = None
@@ -160,6 +161,10 @@ class GmemCResource(MemoryResource):
                 or self.cfg.uses_fp8_output
             ):
                 self.gCBytes = cutlass.Array(self.gC.data_ptr(), dtype=cutlass.Int8)
+            if self.cfg.uses_fp8_output:
+                self.gCInt16 = cutlass.Array(
+                    self.gC.data_ptr(), dtype=cutlass.Int16
+                )
         if self.sf_c_tensor is not None:
             self.gSfC = cutlass.make_array_view(self.sf_c_tensor)
             if self.cfg.has_epilogue_quant:
@@ -2910,33 +2915,25 @@ class GmemCResource(MemoryResource):
                             warp_in_epi4,
                             warpgroup_idx,
                         )
-                        for row_sub in cutlass.range_constexpr(2):
-                            m_local_row = base_row_idx + Int32(row_sub)
-                            m_row = m_tile_base + m_local_row
-                            val_f32 = val0_vals[pair_idx]
-                            if row_sub == 1:
-                                val_f32 = val1_vals[pair_idx]
-                            val_out = self._to_output_value(val_f32 * q_scale)
-                            flat_idx = n_col * output_m + m_row
-                            output_in_bounds = (m_row < output_m) & (
-                                n_col < self.problem_n
-                            )
-                            if cutlass.const_expr(self.cfg.use_tma_oob_opt):
-                                if token_in_bounds & output_in_bounds:
-                                    self.gC.store(
-                                        val_out,
-                                        idx=flat_idx,
-                                        vector_size=1,
-                                        alignment=1,
-                                    )
-                            else:
-                                if output_in_bounds:
-                                    self.gC.store(
-                                        val_out,
-                                        idx=flat_idx,
-                                        vector_size=1,
-                                        alignment=1,
-                                    )
+                        m_row1 = m_row0 + Int32(1)
+                        flat_idx0 = n_col * output_m + m_row0
+                        output_pair_in_bounds = (m_row1 < output_m) & (
+                            n_col < self.problem_n
+                        )
+                        packed = self._pack_swap_ab_fp8_gated_tma_pair(
+                            val0_vals[pair_idx] * q_scale,
+                            val1_vals[pair_idx] * q_scale,
+                        )
+                        if cutlass.const_expr(self.cfg.use_tma_oob_opt):
+                            if token_in_bounds & output_pair_in_bounds:
+                                self.gCInt16.subview(flat_idx0 // Int32(2)).store(
+                                    packed
+                                )
+                        else:
+                            if output_pair_in_bounds:
+                                self.gCInt16.subview(flat_idx0 // Int32(2)).store(
+                                    packed
+                                )
                 prims.barrier_cta_sync(barrier_id=9, thread_count=256)
             else:
                 val0_vals = []
