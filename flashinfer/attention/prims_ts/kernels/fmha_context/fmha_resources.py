@@ -2441,6 +2441,10 @@ class TmemSPResource(MemoryResource):
             + self.q_half * self.cfg.peer_q_seq_tile_stride * self.cfg.q_tile_m
             + row_in_tile
         )
+        local_q = cute.math.min(
+            local_q,
+            self.variable_window_q_stride - Int32(1),
+        )
         packed_q = batch_coord * self.variable_window_q_stride + local_q
         min_window_start = variable_window_cta_min_start(
             self.variable_window_cta_starts,

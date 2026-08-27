@@ -1944,6 +1944,49 @@ def test_attention_ts_context_variable_window_uses_cta_minimum_start(head_dim: i
     _assert_context_correct(actual, case, expected=expected)
 
 
+@pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_variable_window_clamps_padded_q_rows(head_dim: int):
+    """Padded Q rows must not read past flattened per-row window bounds."""
+
+    seq_len = 33
+    case = _make_context_case(
+        q_lengths=(seq_len, seq_len),
+        k_lengths=(seq_len, seq_len),
+        num_qo_heads=2,
+        num_kv_heads=2,
+        qkv_dtype=torch.float16,
+        packed=False,
+        mask_type="variable_window",
+        head_dim=head_dim,
+        output_dtype=torch.float16,
+        output_scale=1.0,
+        device="cuda",
+        seed=2026082701 + head_dim,
+    )
+
+    query_positions = torch.arange(seq_len, dtype=torch.int32, device="cuda")
+    ends = query_positions.unsqueeze(0).expand(2, -1).contiguous()
+    starts = torch.clamp(ends - 7, min=0)
+
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        case.q,
+        case.k,
+        case.v,
+        mask_type="variable_window",
+        variable_window_token_starts=starts,
+        variable_window_token_ends=ends,
+        sm_scale=case.sm_scale,
+        output_scale=case.output_scale,
+        out_dtype=case.output_dtype,
+    )
+    actual = wrapper.run(case.q, case.k, case.v)
+    expected = _variable_window_reference(case, starts, ends)
+    _assert_context_correct(actual, case, expected=expected)
+
+
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_fixed_dense_k_tail_excludes_tma_padding():
