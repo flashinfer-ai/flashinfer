@@ -113,6 +113,26 @@ Batch Decoding
     trtllm_batch_decode_with_kv_cache
     xqa_batch_decode_with_kv_cache
 
+DCP Speculative Decode Workspace
+--------------------------------
+
+The native Cake FMHA DCP speculative route of
+:func:`flashinfer.decode.trtllm_batch_decode_with_kv_cache` uses caller-owned
+scratch buffers so a prewarmed invocation can be captured in a CUDA Graph.
+The production D256 FP8/page64 ratio-16 profile supports speculative query
+lengths 1 through 8 and passes ``head_dim=256`` to the workspace-size helper;
+D128 remains the default.
+
+.. currentmodule:: flashinfer
+
+.. autosummary::
+    :toctree: ../generated
+
+    get_dcp_spec_workspace_size_bytes
+    get_dcp_spec_counter_bytes
+
+.. currentmodule:: flashinfer.decode
+
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
     :members:
     :exclude-members: begin_forward, end_forward, forward, forward_return_lse
