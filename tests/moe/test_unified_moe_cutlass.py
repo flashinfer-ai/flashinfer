@@ -1880,7 +1880,7 @@ _EXPECTED_SCALE_ORDER = {
 
 
 @pytest.mark.parametrize("backend_key", sorted(_EXPECTED_SCALE_ORDER))
-def test_independent_scale_order_matches_flat_abi(backend_key):
+def test_scale_orders_match_flat_abi(backend_key):
     """CPU-only, so the SM90 backends are covered on any arch.
 
     cutlass_fp8_per_tensor is absent: it folds the activation scale into the
@@ -1890,8 +1890,20 @@ def test_independent_scale_order_matches_flat_abi(backend_key):
     expected = _EXPECTED_SCALE_ORDER[backend_key]
     keys = sorted(set(expected))
     view = {key: torch.tensor(i + 1, dtype=torch.int32) for i, key in enumerate(keys)}
-    actual = _independent_quant_scales(backend_key, view, None)
-    assert [t.item() for t in actual] == [view[key].item() for key in expected]
+    expected_values = [view[key].item() for key in expected]
+
+    independent = _independent_quant_scales(backend_key, view, None)
+    assert [tensor.item() for tensor in independent] == expected_values
+
+    runner_cls = next(
+        cls for cls in _BACKEND_RUNNERS.values() if cls.backend_key == backend_key
+    )
+    weight_inputs = [view[key] for key in runner_cls._required_weight_keys[2:]]
+    runner_inputs = [
+        torch.empty(0, dtype=torch.int32) for _ in range(6)
+    ] + weight_inputs
+    production = runner_cls.__new__(runner_cls)._quant_scales(runner_inputs)
+    assert [tensor.item() for tensor in production] == expected_values
 
 
 def _run_flat_cutlass_independently(
