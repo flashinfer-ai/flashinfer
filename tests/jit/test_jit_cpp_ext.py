@@ -28,6 +28,16 @@ def test_nvcc_parallelism_flags_ignore_sccache_launcher(monkeypatch):
     assert cpp_ext.get_nvcc_parallelism_flags() == ["--threads=4"]
 
 
+def test_jit_uses_size_optimized_fatbin_compression(monkeypatch):
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(core, "get_nvcc_parallelism_flags", lambda: ["--threads=1"])
+
+    spec = core.gen_jit_spec(name="test_module", sources=[])
+
+    assert "-Xfatbin=-compress-all" in spec.extra_cuda_cflags
+    assert "--compress-mode=size" in spec.extra_cuda_cflags
+
+
 def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
     monkeypatch, tmp_path
 ):
