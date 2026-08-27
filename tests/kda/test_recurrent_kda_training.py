@@ -33,11 +33,11 @@ class _TrainingRecorder:
         self.c32_backward_calls = []
 
     def run_training_forward(self, *args):
-        assert len(args) == 38
+        assert len(args) == 37
         self.forward_calls.append(args)
 
     def run_training_backward(self, *args):
-        assert len(args) == 44
+        assert len(args) == 43
         self.backward_calls.append(args)
 
     def run_training_row_forward(self, *args):
@@ -875,12 +875,10 @@ def test_grouped_c16_materializes_one_context_during_forward(monkeypatch):
     )
     assert context._route.tag == "grouped_c16"
     assert len(training_module.forward_calls) == 1
-    assert training_module.forward_calls[0][36] == 1
     assert not training_module.c32_forward_calls
 
     recurrent_kda_training_backward(context, values["do"], values["dfinal_state"])
     assert len(training_module.backward_calls) == 1
-    assert training_module.backward_calls[0][39] == 1
     assert not training_module.c32_backward_calls
     assert len(training_module.forward_calls) == 1
     assert not training_module.c32_forward_calls

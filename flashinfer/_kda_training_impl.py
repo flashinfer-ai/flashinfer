@@ -374,7 +374,6 @@ def _build_c16_metadata(
     base_work_items = torch.tensor(work_rows, dtype=torch.int32, device=device)
     return {
         "chunk_counts": chunk_counts,
-        "aligned_c16": all(length % _C16_CHUNK == 0 for length in shape.seq_lens),
         "total_chunks": sum(chunk_counts),
         "base_work_items": base_work_items,
         "work_items": base_work_items.clone(),
@@ -832,7 +831,6 @@ def _run_forward_route(
             prepare_final,
             scale,
             lower_bound,
-            int(cast(bool, m["aligned_c16"])),
             context._stream_ptr,
         )
     elif route == "row_split":
@@ -1386,7 +1384,6 @@ def _run_c16_backward(
         m["total_chunks"],
         max(shape.num_v_heads, 8),
         m["uniform_work_items"],
-        int(cast(bool, m["aligned_c16"])),
         int(grouped),
         _SCALE,
         _LOWER_BOUND,
