@@ -926,7 +926,7 @@ def _fake_prepared_packed_qkv(
     monkeypatch.setattr(
         backend.torch.cuda,
         "current_stream",
-        lambda device_index: SimpleNamespace(cuda_stream=17),
+        lambda device_index: SimpleNamespace(cuda_stream=0),
     )
     monkeypatch.setattr(backend.torch.cuda, "Event", FakeEvent)
     descriptor = _FakePreparedTensor(
@@ -938,7 +938,7 @@ def _fake_prepared_packed_qkv(
     descriptor_entry = SimpleNamespace(
         descriptors=descriptor,
         ready_event=FakeEvent(),
-        ready_stream=17,
+        ready_stream=0,
     )
     monkeypatch.setattr(
         backend,
@@ -1063,7 +1063,7 @@ def test_prepared_packed_qkv_hot_path_uses_one_native_submission(monkeypatch):
         2,
         128,
         0,
-        17,
+        0,
         23,
         29,
         3001,
@@ -1076,7 +1076,7 @@ def test_prepared_packed_qkv_hot_path_uses_one_native_submission(monkeypatch):
         4002,
     )
     assert state.next_phase == 1
-    assert state.tail_stream == 17
+    assert state.tail_stream == 0
     assert state.tail_event.recorded_streams
     main_stream = descriptor.recorded_streams[0]
     assert inp.recorded_streams == [main_stream, workspace.comm_stream]
