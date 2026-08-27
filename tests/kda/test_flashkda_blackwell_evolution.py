@@ -22,8 +22,8 @@ import torch
 from flashinfer.jit.flash_kda_evolution import (
     FLASH_KDA_EVOLUTION_VARIANTS,
     gen_flash_kda_evolution_module,
-    load_flash_kda_evolution_module,
 )
+from flashinfer.kda_evolution import prepare_flash_kda_evolution
 
 
 def test_flashkda_evolution_profile_is_frozen():
@@ -124,39 +124,23 @@ def test_flashkda_evolution_h96_fixed_8192_matches_public_backend():
 
     actual_out = torch.empty_like(q)
     actual_state = torch.empty_like(initial)
-    cu_seqlens = torch.tensor([0, 8192], dtype=torch.int64, device=device)
-    seq_order = torch.tensor([0], dtype=torch.int32, device=device)
-    dummy_i32 = torch.empty((1,), dtype=torch.int32, device=device)
-    descriptor_storage = torch.empty((6 * 128,), dtype=torch.uint8, device=device)
-    target = _select_flash_kda_prefill_target(device)
-    module = load_flash_kda_evolution_module("vtile_f1_t8192_h96_p1_s96", target)
-    stream_ptr = int(torch.cuda.current_stream(device).cuda_stream)
-    module.run(
+    prepared = prepare_flash_kda_evolution(
         q,
         k,
         v,
         g,
         beta,
-        beta,
         A_log,
         dt_bias,
-        cu_seqlens,
-        seq_order,
-        dummy_i32,
-        dummy_i32,
         initial,
         actual_out,
         actual_state,
-        descriptor_storage,
-        1,
-        96,
-        96,
-        1,
-        1,
-        1.0 / math.sqrt(128),
-        -5.0,
-        stream_ptr,
+        scale=1.0 / math.sqrt(128),
+        lower_bound=-5.0,
     )
+    assert prepared.variant == "vtile_f1_t8192_h96_p1_s96"
+    assert prepared.target == _select_flash_kda_prefill_target(device)
+    prepared.launch()
     torch.cuda.synchronize(device)
 
     torch.testing.assert_close(actual_out, expected_out, atol=1e-2, rtol=1e-2)
