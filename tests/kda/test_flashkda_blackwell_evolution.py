@@ -70,10 +70,8 @@ def test_flashkda_evolution_h96_fixed_8192_matches_public_backend():
         torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
         * 0.1
     )
-    beta = torch.sigmoid(
-        torch.randn(
-            shape[:-1], dtype=torch.bfloat16, device=device, generator=generator
-        )
+    beta = torch.randn(
+        shape[:-1], dtype=torch.bfloat16, device=device, generator=generator
     )
     A_log = (
         torch.randn((96,), dtype=torch.float32, device=device, generator=generator)
@@ -101,8 +99,10 @@ def test_flashkda_evolution_h96_fixed_8192_matches_public_backend():
         dt_bias,
         initial_state=expected_initial,
         output_final_state=True,
+        use_gate_in_kernel=True,
         scale=1.0 / math.sqrt(128),
         lower_bound=-5.0,
+        beta_is_logit=True,
         backend="cake",
     )
 
