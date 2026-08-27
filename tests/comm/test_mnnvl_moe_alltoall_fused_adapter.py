@@ -486,7 +486,8 @@ def test_bf16_topk8_route_and_stage_grid_keep_exact_boundaries():
         "    bool, unsigned long long);" in launcher_source
     )
     assert (
-        "completion_offset, false, params.ep_rank, params.ep_size, params.enable_pdl,"
+        "completion_offset, false,\n"
+        "                           params.ep_rank, params.ep_size, params.enable_pdl,"
         in launcher_source
     )
 
