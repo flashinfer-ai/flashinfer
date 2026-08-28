@@ -189,10 +189,11 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
   const int num_heads = static_cast<int>(q.size(1));
   const int topk = static_cast<int>(indices.size(-1));
   const int d_qk = static_cast<int>(q.size(2));
-  TVM_FFI_ICHECK_EQ(d_qk, 576) << "decode-dsv3_2 expects DSV3_2 layout (d_qk=576); got " << d_qk;
   const auto mt = static_cast<ModelType>(model_type);
-  TVM_FFI_ICHECK(mt == ModelType::DSV3_2 || mt == ModelType::GLM_NSA)
-      << "decode-dsv3_2 expects model_type DSV3_2 or GLM_NSA; got " << model_type;
+  TVM_FFI_ICHECK((d_qk == 576 && (mt == ModelType::DSV3_2 || mt == ModelType::GLM_NSA)) ||
+                 (d_qk == 512 && mt == ModelType::GLM53_NOPE))
+      << "decode-v32 expects DSV3_2/GLM_NSA d_qk=576 or GLM53_NOPE d_qk=512; got d_qk=" << d_qk
+      << " model_type=" << model_type;
 
   constexpr int BPT_DSV3_2 = 656;
   const PagedKVLayout kv_layout = parse_paged_kv_layout(kv_cache, BPT_DSV3_2, "kv_cache");

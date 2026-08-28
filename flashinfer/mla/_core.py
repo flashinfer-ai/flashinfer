@@ -595,12 +595,20 @@ def _trtllm_batch_decode_sparse_mla_v32_sm120(
         raise ValueError(
             f"SM120 sparse MLA v32/GLM expects BF16 query, got {query.dtype}"
         )
-    if kv_lora_rank != 512 or qk_rope_head_dim != 64 or query.size(-1) != 576:
+    rope_v32 = kv_lora_rank == 512 and qk_rope_head_dim == 64 and query.size(-1) == 576
+    glm53_nope = (
+        kv_lora_rank == 512
+        and qk_rope_head_dim == 0
+        and query.size(-1) == 512
+        and str(kv_scale_format).lower().replace("-", "_") == "arbitrary_fp32"
+    )
+    if not (rope_v32 or glm53_nope):
         raise ValueError(
-            "SM120 sparse MLA v32/GLM expects kv_lora_rank=512, "
-            f"qk_rope_head_dim=64, and query head dim 576; got "
+            "SM120 sparse MLA expects either the v32/GLM_NSA 512+64 layout "
+            "or GLM-5.3 native NoPE 512+0 with arbitrary_fp32 scales; got "
             f"kv_lora_rank={kv_lora_rank}, "
-            f"qk_rope_head_dim={qk_rope_head_dim}, query dim={query.size(-1)}"
+            f"qk_rope_head_dim={qk_rope_head_dim}, query dim={query.size(-1)}, "
+            f"kv_scale_format={kv_scale_format!r}"
         )
     if workspace_buffer.device != query.device:
         raise ValueError(
@@ -3561,8 +3569,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         ``head_dim_qk = kv_lora_rank + qk_rope_head_dim``. When
         ``cum_seq_lens_q`` is provided, TRTLLM-GEN and monolithic CuTeDSL
         instead accept compact ``[total_q, num_heads, head_dim_qk]`` input.
-        For the SM120/SM121 v32/GLM sparse backend, this must be BF16 with
-        ``head_dim_qk == 576``.
+        For the SM120/SM121 sparse backend, this must be BF16 with
+        ``head_dim_qk == 576`` for v32/GLM_NSA or ``512`` for GLM-5.3 NoPE.
     kv_cache : torch.Tensor
         For TRTLLM-GEN, CuteDSL, and XQA, the paged KV cache is
         ``[num_pages, page_size, kv_lora_rank + qk_rope_head_dim]`` or
@@ -3576,7 +3584,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     qk_nope_head_dim : int
         Non-RoPE query dimension. Dense MLA paths commonly use ``128`` or
         ``64`` depending on model. The SM120/SM121 sparse v32/GLM backend
-        ignores this value and validates ``query.shape[-1] == 576`` instead.
+        validates it together with ``query.shape[-1]``. GLM-5.3 uses the
+        native ``qk_rope_head_dim=0`` / ``query.shape[-1]=512`` geometry.
     kv_lora_rank : int
         Latent KV rank. TRTLLM-GEN and SM120/SM121 sparse v32/GLM use ``512``.
     qk_rope_head_dim : int

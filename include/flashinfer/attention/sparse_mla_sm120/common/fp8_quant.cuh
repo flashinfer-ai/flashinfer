@@ -49,6 +49,7 @@ __device__ __forceinline__ void load_q_bf16_to_smem(bf16* q_nope_bf16, bf16* q_r
                                                     const bf16* q_base, int valid_hpb = HPB) {
   using KV = KVCacheTraits<MT>;
   constexpr int D_NOPE = KV::D_NOPE;
+  constexpr int D_ROPE = KV::D_ROPE;
   constexpr int DIM = KV::D_QK;
   constexpr int BF16_STRIDE = KV::Q_NOPE_BF16_STRIDE;
 
@@ -57,9 +58,12 @@ __device__ __forceinline__ void load_q_bf16_to_smem(bf16* q_nope_bf16, bf16* q_r
     q_nope_bf16[h * BF16_STRIDE + d] =
         (h < valid_hpb) ? q_base[h * DIM + d] : __float2bfloat16(0.f);
   }
-  for (int i = threadIdx.x; i < HPB * D_ROPE; i += _MATH_THREADS) {
-    int h = i / D_ROPE, d = i % D_ROPE;
-    q_rope[h * D_ROPE + d] = (h < valid_hpb) ? q_base[h * DIM + D_NOPE + d] : __float2bfloat16(0.f);
+  if constexpr (D_ROPE > 0) {
+    for (int i = threadIdx.x; i < HPB * D_ROPE; i += _MATH_THREADS) {
+      int h = i / D_ROPE, d = i % D_ROPE;
+      q_rope[h * D_ROPE + d] =
+          (h < valid_hpb) ? q_base[h * DIM + D_NOPE + d] : __float2bfloat16(0.f);
+    }
   }
   bar_sync_t<2, _MATH_THREADS>();
 }
@@ -135,6 +139,7 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
                                                    float* reduce_buf, int valid_hpb = HPB) {
   using KV = KVCacheTraits<MT>;
   constexpr int D_NOPE = KV::D_NOPE;
+  constexpr int D_ROPE = KV::D_ROPE;
   constexpr int Q_NOPE_STRIDE = KV::Q_NOPE_STRIDE;
   constexpr int QUANT_TILE = KV::QUANT_TILE;
   constexpr int NUM_SCALES = KV::NUM_SCALES;
@@ -143,9 +148,12 @@ __device__ __forceinline__ void quantize_q_to_smem(uint8_t* q_nope_fp8, float* q
   float* amax = reduce_buf;
 
   // Step 1: copy Q rope to smem (only valid heads from gmem; zero-fill rest)
-  for (int i = threadIdx.x; i < HPB * D_ROPE; i += _MATH_THREADS) {
-    int h = i / D_ROPE, d = i % D_ROPE;
-    q_rope[h * D_ROPE + d] = (h < valid_hpb) ? q_base[h * DIM + D_NOPE + d] : __float2bfloat16(0.f);
+  if constexpr (D_ROPE > 0) {
+    for (int i = threadIdx.x; i < HPB * D_ROPE; i += _MATH_THREADS) {
+      int h = i / D_ROPE, d = i % D_ROPE;
+      q_rope[h * D_ROPE + d] =
+          (h < valid_hpb) ? q_base[h * DIM + D_NOPE + d] : __float2bfloat16(0.f);
+    }
   }
   // Step 2: init amax
   for (int i = threadIdx.x; i < HPB * NUM_SCALES; i += _MATH_THREADS) amax[i] = 0.f;

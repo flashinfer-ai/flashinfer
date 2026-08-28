@@ -28,6 +28,7 @@ namespace flashinfer::sparse_mla_sm120 {
 //   [512   : 528)  4 × FP32 scale (one per 128-elem tile)
 //   [528   : 656)  BF16 rope, 64 elements × 2B
 // DSv3.2 stores power-of-2 FP32 scales; GLM_NSA stores arbitrary FP32 scales.
+// GLM53_NOPE reuses the 656 B row with [528:656) as reserved padding — never read as rope.
 // The IO warp does a single bulk per token that covers both nope and inline
 // scales in one go (528 B), then a second bulk for rope (128 B). No scalar
 // scale gather phase.
@@ -50,8 +51,9 @@ constexpr int DSV3_2_KV_BUF_COUNT = 2;
 constexpr int DSV3_2_ENTRIES_PER_WARP = DSV3_2_BI / DSV3_2_N_WARPS;  // 8
 constexpr int DSV3_2_QK_N_TILES = DSV3_2_ENTRIES_PER_WARP / 8;       // 1
 
+template <ModelType MT>
 struct DecodeDsv3_2Smem {
-  using KV = KVCacheTraits<ModelType::DSV3_2>;
+  using KV = KVCacheTraits<MT>;
 
   static constexpr int N_V_CHUNKS = KV::D_NOPE / KV::QUANT_TILE;
   static constexpr size_t SMEM_Q_ROPE = HPB * KV::D_ROPE * sizeof(bf16);
@@ -129,7 +131,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     // persistent buffer (last dim must stay contiguous).
     size_t stride_indices_token) {
   using KV = KVCacheTraits<MT>;
-  static_assert(KV::D_QK == 576);
+  static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   constexpr int D_NOPE = KV::D_NOPE;                                // 512
   constexpr int D_ROPE_C = KV::D_ROPE;                              // 64
   constexpr int D_QK = KV::D_QK;                                    // 576
@@ -203,7 +205,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   // D_NOPE 512 + SCALE_BYTES_PER_TOKEN 16), so the QK / XV stages read
   // scales directly out of sm_kv_fp8.
   extern __shared__ __align__(16) char smem_raw[];
-  auto sm = DecodeDsv3_2Smem::init(smem_raw);
+  auto sm = DecodeDsv3_2Smem<MT>::init(smem_raw);
 
   __shared__ bf16 sm_p_full[HPB][DSV3_2_BI];  // 2 KB static
   const int32_t* idx_base = indices + (size_t)t_idx * stride_indices_token;
@@ -251,9 +253,12 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
       // Bulk 1: NoPE + INLINE scales (528 B) → sm_kv_fp8 slot.
       cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
                         V2_BULK_NOPESC_BYTES, sm.mbar_full(buf));
-      // Bulk 2: RoPE (128 B) → sm_kv_rope slot.
-      cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C, data_base + KV_ROPE_OFFSET,
-                        V2_BULK_ROPE_BYTES, sm.mbar_full(buf));
+      // Bulk 2: RoPE (128 B) → sm_kv_rope slot. NoPE models issue no rope bulk;
+      // the expect-tx accounting shrinks with V2_BULK_ROPE_BYTES automatically.
+      if constexpr (D_ROPE_C > 0) {
+        cp_async_bulk_g2s(kv_rope_dst + (size_t)entry_idx * D_ROPE_C, data_base + KV_ROPE_OFFSET,
+                          V2_BULK_ROPE_BYTES, sm.mbar_full(buf));
+      }
     }
   };
 

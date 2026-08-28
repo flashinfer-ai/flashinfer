@@ -41,28 +41,37 @@
 // KV rope B operands are prefetched from global into registers BEFORE QK nope
 // MMA, so the ~300 cycle load latency overlaps with nope MMA compute.
 
+template <ModelType MT>
 struct QRopeRegs {
-  uint32_t a[N_ROPE_CHUNKS][4];
+  static constexpr int N_CHUNKS = KVCacheTraits<MT>::D_ROPE / 16;
+  uint32_t a[N_CHUNKS > 0 ? N_CHUNKS : 1][4];
 };
 
+template <ModelType MT>
 struct KVRopePrefetch {
-  uint32_t b[N_ROPE_CHUNKS][2];
+  static constexpr int N_CHUNKS = KVCacheTraits<MT>::D_ROPE / 16;
+  uint32_t b[N_CHUNKS > 0 ? N_CHUNKS : 1][2];
 };
 
-__device__ __forceinline__ QRopeRegs preload_q_rope_regs(const bf16* q_rope_smem, int lane) {
-  QRopeRegs regs;
+template <ModelType MT>
+__device__ __forceinline__ QRopeRegs<MT> preload_q_rope_regs(const bf16* q_rope_smem, int lane) {
+  using KV = KVCacheTraits<MT>;
+  constexpr int N_CHUNKS = KV::D_ROPE / 16;
+  QRopeRegs<MT> regs{};
 #pragma unroll
-  for (int ks = 0; ks < N_ROPE_CHUNKS; ks++)
+  for (int ks = 0; ks < N_CHUNKS; ks++)
     ldmatrix_load_A_bf16(regs.a[ks][0], regs.a[ks][1], regs.a[ks][2], regs.a[ks][3],
-                         q_rope_smem + ks * 16, D_ROPE, lane);
+                         q_rope_smem + ks * 16, KV::D_ROPE, lane);
   return regs;
 }
 
-__device__ __forceinline__ KVRopePrefetch prefetch_kv_rope(const bf16* kv_rope_ptr, int lane) {
+template <ModelType MT>
+__device__ __forceinline__ KVRopePrefetch<MT> prefetch_kv_rope(const bf16* kv_rope_ptr, int lane) {
+  constexpr int N_CHUNKS = KVCacheTraits<MT>::D_ROPE / 16;
   const int tid = lane & 3;
-  KVRopePrefetch pf;
+  KVRopePrefetch<MT> pf{};
 #pragma unroll
-  for (int ks = 0; ks < N_ROPE_CHUNKS; ks++) {
+  for (int ks = 0; ks < N_CHUNKS; ks++) {
     int ko = ks * 16;
     pf.b[ks][0] = *reinterpret_cast<const uint32_t*>(kv_rope_ptr + ko + tid * 2);
     pf.b[ks][1] = *reinterpret_cast<const uint32_t*>(kv_rope_ptr + ko + 8 + tid * 2);
@@ -70,11 +79,13 @@ __device__ __forceinline__ KVRopePrefetch prefetch_kv_rope(const bf16* kv_rope_p
   return pf;
 }
 
-__device__ __forceinline__ void compute_qk_rope(float qk[4], const QRopeRegs& qr,
-                                                const KVRopePrefetch& pf) {
+template <ModelType MT>
+__device__ __forceinline__ void compute_qk_rope(float qk[4], const QRopeRegs<MT>& qr,
+                                                const KVRopePrefetch<MT>& pf) {
+  constexpr int N_CHUNKS = KVCacheTraits<MT>::D_ROPE / 16;
   float ra[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-  for (int ks = 0; ks < N_ROPE_CHUNKS; ks++) {
+  for (int ks = 0; ks < N_CHUNKS; ks++) {
     MmaBf16Result r = mma_bf16_m16n8k16(qr.a[ks][0], qr.a[ks][1], qr.a[ks][2], qr.a[ks][3],
                                         pf.b[ks][0], pf.b[ks][1], ra[0], ra[1], ra[2], ra[3]);
     ra[0] = r.d0;
@@ -88,12 +99,15 @@ __device__ __forceinline__ void compute_qk_rope(float qk[4], const QRopeRegs& qr
   qk[3] += ra[3];
 }
 
-template <int KV_STRIDE>
+// swapAB variant: KV rope A operands come from smem (ldmatrix), Q rope B
+// operands were prefetched from gmem. 0-trip for NoPE models (D_ROPE=0).
+template <int KV_STRIDE, ModelType MT>
 __device__ __forceinline__ void compute_qk_rope_swapab(float qk[4], const bf16* kv_rope_smem,
-                                                       const KVRopePrefetch& qr, int lane) {
+                                                       const KVRopePrefetch<MT>& qr, int lane) {
+  constexpr int N_CHUNKS = KVCacheTraits<MT>::D_ROPE / 16;
   float ra[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
-  for (int ks = 0; ks < N_ROPE_CHUNKS; ks++) {
+  for (int ks = 0; ks < N_CHUNKS; ks++) {
     uint32_t a0, a1, a2, a3;
     ldmatrix_load_A_bf16(a0, a1, a2, a3, kv_rope_smem + ks * 16, KV_STRIDE / 2, lane);
     MmaBf16Result r =

@@ -66,7 +66,14 @@ _DECODE_MAX_TOKENS = 64
 _MODEL_TYPE_DSV3_2 = 0
 _MODEL_TYPE_DSV4 = 1
 _MODEL_TYPE_GLM_NSA = 2
-_V32_MODEL_TYPES = frozenset({_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA})
+_MODEL_TYPE_GLM53_NOPE = 3
+# The V32 kernel family: the 656B/token inline-scale cache ABI. GLM53_NOPE is
+# the rope-free member (d_qk=512; bytes [528:656) are reserved padding).
+_V32_MODEL_TYPES = frozenset(
+    {_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE}
+)
+# swapAB is instantiated at topk=2048 only; GLM53_NOPE (topk=2176) is excluded.
+_SWAPAB_MODEL_TYPES = frozenset({_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA})
 _BPT_DSV3_2 = 656
 _BPT_DSV4 = 584
 
@@ -75,6 +82,7 @@ _MODEL_TYPE_TO_FAMILY = {
     _MODEL_TYPE_DSV3_2: "dsv3_2",
     _MODEL_TYPE_DSV4: "dsv4",
     _MODEL_TYPE_GLM_NSA: "glm_nsa",
+    _MODEL_TYPE_GLM53_NOPE: "glm53_nope",
 }
 
 # Every instantiated kernel (decode and prefill, both families) is compiled
@@ -139,8 +147,18 @@ _DECODE_DSV3_2_DISPATCH = frozenset(
     }
 )
 
+# GLM-5.3 native NoPE decode: topk=2176 folds the 128-token indexer tail
+# into the 2048 sparse selection. (32, 2176) is the TP2 shape of the
+# 64-head model.
+_DECODE_GLM53_NOPE_DISPATCH = frozenset({(32, 2176)})
+
 # Prefill instantiation envelope (single cache unless noted).
-_V32_TOPK = 2048  # DSV3_2-family prefill topk (SG, MG, and swapAB)
+# DSV3_2-family prefill topk (SG, MG, and swapAB); GLM53_NOPE serves 2176.
+_V32_TOPK = {
+    _MODEL_TYPE_DSV3_2: 2048,
+    _MODEL_TYPE_GLM_NSA: 2048,
+    _MODEL_TYPE_GLM53_NOPE: 2176,
+}
 _SG_HEADS = frozenset({8, 16})  # SG: 16-head CTA, NH=8 zero-padded
 _MG_V32_HEADS = frozenset({32, 64, 128})  # MG: 32-head CTA
 _PREFILL_DSV4_TOPKS = frozenset({128, 192, 256, 512, 1024, 2048})
@@ -184,6 +202,9 @@ def decode_splitk_eligible(
     if model_type == _MODEL_TYPE_DSV4:
         # The decode-dsv4 kernel takes the secondary cache as runtime args.
         return (num_heads, topk) in _DECODE_DSV4_DISPATCH
+    if model_type == _MODEL_TYPE_GLM53_NOPE:
+        # decode-v32 has no dual-cache form.
+        return not has_extra and (num_heads, topk) in _DECODE_GLM53_NOPE_DISPATCH
     if model_type in _V32_MODEL_TYPES:
         # decode-dsv3_2 has no dual-cache form.
         return not has_extra and (num_heads, topk) in _DECODE_DSV3_2_DISPATCH
@@ -193,11 +214,13 @@ def decode_splitk_eligible(
 def prefill_swapab_eligible(
     model_type: int, num_heads: int, topk: int, page_block_size: int, has_extra: bool
 ) -> bool:
+    # GLM53_NOPE stays out of the swapAB envelope while swapAB is
+    # instantiated at topk=2048 only.
     return (
-        model_type in _V32_MODEL_TYPES
+        model_type in _SWAPAB_MODEL_TYPES
         and not has_extra
         and page_block_size == _PAGE_BLOCK_SIZE
-        and topk == _V32_TOPK
+        and topk == _V32_TOPK[model_type]
         and num_heads in _SWAPAB_HEADS
     )
 
@@ -209,7 +232,7 @@ def prefill_sg_eligible(
         model_type in _V32_MODEL_TYPES
         and not has_extra
         and page_block_size == _PAGE_BLOCK_SIZE
-        and topk == _V32_TOPK
+        and topk == _V32_TOPK[model_type]
         and num_heads in _SG_HEADS
     )
 
@@ -220,7 +243,7 @@ def prefill_mg_eligible(
     if has_extra or page_block_size != _PAGE_BLOCK_SIZE:
         return False
     if model_type in _V32_MODEL_TYPES:
-        return topk == _V32_TOPK and num_heads in _MG_V32_HEADS
+        return topk == _V32_TOPK[model_type] and num_heads in _MG_V32_HEADS
     if model_type == _MODEL_TYPE_DSV4:
         return topk in _PREFILL_DSV4_TOPKS and num_heads in _PREFILL_DSV4_HEADS
     return False
@@ -271,14 +294,14 @@ def _check_swapab_eligible(
     """Raise ValueError when prefill_impl='swapab' meets an ineligible shape."""
     if has_extra:
         raise ValueError("prefill_impl='swapab' does not support dual-cache")
-    if model_type not in _V32_MODEL_TYPES:
+    if model_type not in _SWAPAB_MODEL_TYPES:
         raise ValueError(
             "prefill_impl='swapab' requires the DSV3_2 family "
             f"(d_qk=576); got family={_MODEL_TYPE_TO_FAMILY[model_type]!r}"
         )
-    if topk != _V32_TOPK:
+    if topk != _V32_TOPK[model_type]:
         raise ValueError(
-            f"prefill_impl='swapab' requires topk={_V32_TOPK}; got topk={topk}"
+            f"prefill_impl='swapab' requires topk={_V32_TOPK[model_type]}; got topk={topk}"
         )
     if num_heads not in _SWAPAB_HEADS:
         raise ValueError(

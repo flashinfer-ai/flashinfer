@@ -31,8 +31,9 @@
 Decode-form calls (``num_tokens <= 64``) route to dedicated warp-spec
 standalone decode kernels when the shape is decode-instantiated, and to the
 shared prefill orchestrator otherwise (prefill serves any ``num_tokens >=
-1``). ``num_tokens > 64`` always routes to prefill. Both DSv3.2 (d_qk=576)
-and DSv4 (d_qk=512) are supported; prefill dispatches through the
+1``). ``num_tokens > 64`` always routes to prefill. DSv3.2 / GLM-NSA
+(d_qk=576), DSv4 (d_qk=512), and GLM-5.3 native NoPE (d_qk=512,
+arbitrary FP32 scales) are supported; prefill dispatches through the
 orchestrator.
 
 When crossover constants are calibrated (same ``autotune()`` tuning-mode
@@ -86,7 +87,9 @@ from ._sparse_mla_sm120_plan import (
     _DECODE_MAX_TOKENS,
     _MODEL_TYPE_DSV3_2,
     _MODEL_TYPE_DSV4,
+    _MODEL_TYPE_GLM53_NOPE,
     _MODEL_TYPE_GLM_NSA,
+    _DECODE_GLM53_NOPE_DISPATCH,
     _MODEL_TYPE_TO_FAMILY,
     _D_V,
     KernelVariant,
@@ -189,8 +192,9 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
     dict[str, SparseMLASm120DecodeConfig]
         Mapping from kernel family to its instantiated decode set, keyed by
         ``"dsv4"`` (``d_qk=512``), ``"dsv3_2"`` (``d_qk=576``, power-of-2
-        FP32 scales), and ``"glm_nsa"`` (``d_qk=576``, arbitrary FP32 scales;
-        shares the DSv3.2 decode instantiations).
+        FP32 scales), ``"glm_nsa"`` (``d_qk=576``, arbitrary FP32 scales;
+        shares the DSv3.2 decode instantiations), and ``"glm53_nope"``
+        (GLM-5.3 native NoPE, ``d_qk=512``, arbitrary FP32 scales).
 
     Examples
     --------
@@ -214,6 +218,12 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
         ),
         "dsv3_2": dsv3_2,
         "glm_nsa": dsv3_2,
+        "glm53_nope": SparseMLASm120DecodeConfig(
+            d_qk=512,
+            page_block_size=_DECODE_DSV3_2_PAGE_BLOCK_SIZE,
+            max_num_tokens=_DECODE_MAX_TOKENS,
+            head_topk_pairs=_DECODE_GLM53_NOPE_DISPATCH,
+        ),
     }
 
 
@@ -304,17 +314,21 @@ def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
             return _MODEL_TYPE_GLM_NSA
         return _MODEL_TYPE_DSV3_2
     if d_qk == 512:
+        # GLM-5.3 native NoPE (512+0) shares the DSv4 query width; the scale
+        # format disambiguates.
+        if fmt == "arbitrary_fp32":
+            return _MODEL_TYPE_GLM53_NOPE
         if fmt != "auto":
             raise ValueError(
-                "kv_scale_format is only configurable for d_qk=576; "
-                f"got d_qk=512 with kv_scale_format={kv_scale_format!r}"
+                "kv_scale_format for d_qk=512 must be 'auto' (DSV4) or "
+                f"'arbitrary_fp32' (GLM53_NOPE); got {kv_scale_format!r}"
             )
         return _MODEL_TYPE_DSV4
     raise ValueError(f"SM120 sparse-MLA supports d_qk=576 or d_qk=512, got d_qk={d_qk}")
 
 
 def _bytes_per_token_for_model_type(model_type: int) -> int:
-    if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
+    if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE):
         return _BPT_DSV3_2
     if model_type == _MODEL_TYPE_DSV4:
         return _BPT_DSV4
@@ -946,7 +960,8 @@ def sparse_mla_sm120_decode_dsv3_2(
     an explicit value is used directly; otherwise the calibrated analytical
     model picks one when its constants are available (calibrated once per
     device during ``autotune()`` tuning mode), falling back to the C++
-    heuristic. DSv3.2 and GLM-NSA share the same calibrated constants.
+    heuristic. DSv3.2 and GLM-NSA share the same calibrated constants;
+    GLM53_NOPE has its own constants entry.
     """
     _check_last_dim_512(output, "output")
     _check_last_dim_512(mid_out, "mid_out")
@@ -961,7 +976,12 @@ def sparse_mla_sm120_decode_dsv3_2(
         cpb_override = int(chunks_per_block)
     else:
         cpb_override = _resolve_cpb(
-            q.device, "dsv3_2", q.shape[0], q.shape[1], indices.shape[-1], 0
+            q.device,
+            _MODEL_TYPE_TO_FAMILY[int(model_type)],
+            q.shape[0],
+            q.shape[1],
+            indices.shape[-1],
+            0,
         )
 
     module.sparse_mla_sm120_decode_dsv3_2(

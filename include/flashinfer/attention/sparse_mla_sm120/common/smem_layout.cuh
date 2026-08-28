@@ -51,7 +51,7 @@ struct SmemLayout {
   static constexpr size_t SMEM_Q_NOPE =
       BF16_Q ? HPB * KV::Q_NOPE_BF16_STRIDE * sizeof(bf16) : HPB * KV::Q_NOPE_STRIDE;
   static constexpr size_t SMEM_Q_SC = BF16_Q ? 0 : HPB * KV::NUM_SCALES * sizeof(float);
-  static constexpr size_t SMEM_Q_ROPE = HPB * D_ROPE * sizeof(bf16);
+  static constexpr size_t SMEM_Q_ROPE = HPB * KV::D_ROPE * sizeof(bf16);
 
   // KV double buffer
   static constexpr size_t SMEM_KV_BUF = BI * KV::KV_SMEM_STRIDE;
@@ -124,7 +124,7 @@ struct SmemLayoutMG {
   static constexpr int W_FP8_PARITIES = 2;
   static constexpr size_t SMEM_W_FP8_MG = W_FP8_PARITIES * N_HG * HPB * (BI + 16);
   // q_rope is only needed before the main loop; reuse the W_FP8 region.
-  static_assert(N_HG * HPB * D_ROPE * sizeof(bf16) <= SMEM_W_FP8_MG);
+  static_assert(N_HG * HPB * KV::D_ROPE * sizeof(bf16) <= SMEM_W_FP8_MG);
   static constexpr size_t SMEM_SCRATCH = 0;
   static constexpr size_t SMEM_MBAR_KV = 2 * sizeof(uint64_t);
 

@@ -135,7 +135,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     const bf16* q_base = Q + ((size_t)s_i * NUM_HEADS + h_base + gid) * KV::D_QK;
 
     QSwapABRegs<MT> q = quantize_q_to_regs_swapab<MT>(q_base, lane);
-    KVRopePrefetch q_rope = prefetch_kv_rope(q_base + KV::D_NOPE, lane);
+    KVRopePrefetch<MT> q_rope = prefetch_kv_rope<MT>(q_base + KV::D_NOPE, lane);
 
     uint8_t sfb[KV::NUM_SCALES];
     float q_sc[2][KV::NUM_SCALES];
@@ -263,7 +263,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       // ── QK rope: stored raw, so it lands in the real domain ──
 #pragma unroll
       for (int m = 0; m < CT::MTILES; m++)
-        compute_qk_rope_swapab<L::KV_STRIDE>(
+        compute_qk_rope_swapab<L::KV_STRIDE, MT>(
             qk[m],
             reinterpret_cast<const bf16*>(kv_smem + (size_t)(m * 16) * L::KV_STRIDE +
                                           KV::KV_ROPE_GMEM_OFFSET),

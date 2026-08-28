@@ -33,8 +33,10 @@
 // ModelType determines KV cache layout, dimensions, and scale format.
 //   DSV3_2:  d_nope=512, power-of-2 FP32 scale inline, 656B/token
 //   DSV4:    d_nope=448, UE8M0 scale footer, 584B/token
-//   GLM_NSA: d_nope=512, arbitrary FP32 scale inline, 656B/token
-enum class ModelType { DSV3_2, DSV4, GLM_NSA };
+//   GLM_NSA: d_nope=512, d_rope=64, arbitrary FP32 scale inline, 656B/token
+//   GLM53_NOPE: d_nope=512, d_rope=0, arbitrary FP32 scale inline,
+//               656B/token (the final 128 bytes are reserved cache padding)
+enum class ModelType { DSV3_2, DSV4, GLM_NSA, GLM53_NOPE };
 
 // Prefill kernel variants selected by the Python dispatch planner
 // (flashinfer/mla/_sparse_mla_sm120_plan.py, KernelVariant; the values must

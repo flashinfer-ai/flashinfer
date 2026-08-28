@@ -49,10 +49,12 @@ from flashinfer.mla import (
 from flashinfer.mla._sparse_mla_sm120 import (
     _DECODE_DSV3_2_DISPATCH,
     _DECODE_DSV4_DISPATCH,
+    _DECODE_GLM53_NOPE_DISPATCH,
     _DECODE_MAX_TOKENS,
     _MODEL_TYPE_DSV3_2,
     _MODEL_TYPE_DSV4,
     _MODEL_TYPE_GLM_NSA,
+    _MODEL_TYPE_GLM53_NOPE,
     _decode_dispatch_error_message,
     _decode_dsv3_2_dispatchable,
     _decode_dsv4_dispatchable,
@@ -62,7 +64,7 @@ from flashinfer.mla._sparse_mla_sm120 import (
 def test_supported_configs_families() -> None:
     """The query API mirrors the private dispatch tables exactly."""
     configs = supported_sparse_mla_sm120_configs()
-    assert set(configs) == {"dsv4", "dsv3_2", "glm_nsa"}
+    assert set(configs) == {"dsv4", "dsv3_2", "glm_nsa", "glm53_nope"}
     assert all(
         isinstance(config, SparseMLASm120DecodeConfig) for config in configs.values()
     )
@@ -80,6 +82,11 @@ def test_supported_configs_families() -> None:
 
     # GLM-NSA shares the DSv3.2 decode instantiations (same config object).
     assert configs["glm_nsa"] is dsv3_2
+
+    glm53 = configs["glm53_nope"]
+    assert glm53.d_qk == 512
+    assert glm53.page_block_size == 64
+    assert glm53.head_topk_pairs == _DECODE_GLM53_NOPE_DISPATCH
 
     # The lazy export resolves through the public flashinfer.mla namespace.
     assert (
@@ -465,3 +472,105 @@ def test_plan_memo_buckets_large_t(known_crossover) -> None:
         torch.device("cpu"),
     )
     assert len(plan_mod._plan_memo) == size_after_first
+
+
+def test_plan_glm53_nope_decode_and_prefill(known_crossover) -> None:
+    """GLM53_NOPE: decode at (32, 2176) for T<=64; prefill MG above."""
+    plan_mod, _ = known_crossover
+    planned = plan_mod.plan(
+        4,
+        32,
+        2176,
+        _MODEL_TYPE_GLM53_NOPE,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    assert planned is not None
+    assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
+    planned = plan_mod.plan(
+        65,
+        32,
+        2176,
+        _MODEL_TYPE_GLM53_NOPE,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_MG
+    # (64, 2048) is neither a NOPE decode instantiation nor a NOPE prefill
+    # shape (NOPE prefill serves topk=2176 only).
+    assert (
+        plan_mod.plan(
+            4,
+            64,
+            2048,
+            _MODEL_TYPE_GLM53_NOPE,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+        )
+        is None
+    )
+
+
+def test_plan_glm53_nope_crossover(known_crossover) -> None:
+    """Injected crossover applies to the glm53_nope key space."""
+    plan_mod, table = known_crossover
+    table["glm53_nope|32|2176"] = 8
+    plan_mod._plan_memo.clear()
+    planned = plan_mod.plan(
+        8,
+        32,
+        2176,
+        _MODEL_TYPE_GLM53_NOPE,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    assert (
+        planned is not None and planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
+    )
+    planned = plan_mod.plan(
+        16,
+        32,
+        2176,
+        _MODEL_TYPE_GLM53_NOPE,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_MG
+
+
+def test_plan_glm53_nope_swapab_excluded(known_crossover) -> None:
+    """swapAB is instantiated at topk=2048 only: auto never routes NOPE to
+    it, and forcing it raises."""
+    plan_mod, _ = known_crossover
+    planned = plan_mod.plan(
+        128,
+        64,
+        2176,
+        _MODEL_TYPE_GLM53_NOPE,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_MG
+    with pytest.raises(ValueError, match="DSV3_2 family"):
+        plan_mod.plan(
+            128,
+            64,
+            2176,
+            _MODEL_TYPE_GLM53_NOPE,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_SWAPAB,
+            torch.device("cpu"),
+        )

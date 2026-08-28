@@ -144,7 +144,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base,
                                            sm.reduce_buf, VALID_HPB);
     }
-    QRopeRegs q_rope_regs = preload_q_rope_regs(sm.q_rope, lane);
+    QRopeRegs<MT> q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
 
     for (int h = threadIdx.x; h < HPB; h += MATH_THREADS) sm.m_smem[h] = -1e30f;
 
@@ -186,7 +186,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
         sm.w_head_sc_all[i] = 0.f;
 
-      KVRopePrefetch rope_pf = prefetch_kv_rope(
+      KVRopePrefetch<MT> rope_pf = prefetch_kv_rope<MT>(
           reinterpret_cast<const bf16*>(entry_base[gid] + KV::KV_ROPE_GMEM_OFFSET), lane);
 
       // ── QK nope MMA ─────────────────────
@@ -262,7 +262,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       }
 
       // ── QK rope (BF16 MMA, uses prefetched B operands) ──────
-      compute_qk_rope(qk, q_rope_regs, rope_pf);
+      compute_qk_rope<MT>(qk, q_rope_regs, rope_pf);
 
       // ── Invalid index masking + topk_length overflow ─────
       {
@@ -817,20 +817,20 @@ __device__ __forceinline__ void prefill_mg_impl(
       const bf16* q_base_g =
           Q + (size_t)s_i * NUM_HEADS * KV::D_QK + (size_t)(h_start + g * HPB) * KV::D_QK;
       if constexpr (CM == ComputeMode::BF16) {
-        load_q_bf16_to_smem<MT, MATH_THREADS>(sm.q_nope_bf16(g), sm.q_rope() + g * HPB * D_ROPE,
+        load_q_bf16_to_smem<MT, MATH_THREADS>(sm.q_nope_bf16(g), sm.q_rope() + g * HPB * KV::D_ROPE,
                                               q_base_g, VALID_HPB);
       } else {
         quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8(g), sm.q_nope_sc(g),
-                                             sm.q_rope() + g * HPB * D_ROPE, q_base_g,
+                                             sm.q_rope() + g * HPB * KV::D_ROPE, q_base_g,
                                              sm.reduce_buf(), VALID_HPB);
       }
     }
 
     // Preload Q rope to registers for both groups
-    QRopeRegs q_rope_regs[MG_N_HG];
+    QRopeRegs<MT> q_rope_regs[MG_N_HG];
 #pragma unroll
     for (int g = 0; g < MG_N_HG; g++)
-      q_rope_regs[g] = preload_q_rope_regs(sm.q_rope() + g * HPB * D_ROPE, lane);
+      q_rope_regs[g] = preload_q_rope_regs<MT>(sm.q_rope() + g * HPB * KV::D_ROPE, lane);
 
     for (int i = threadIdx.x; i < MG_N_HG * HPB; i += MATH_THREADS) sm.m_smem()[i] = -1e30f;
 
@@ -898,7 +898,7 @@ __device__ __forceinline__ void prefill_mg_impl(
         }
       }
 
-      KVRopePrefetch rope_pf = prefetch_kv_rope(
+      KVRopePrefetch<MT> rope_pf = prefetch_kv_rope<MT>(
           reinterpret_cast<const bf16*>(entry_base_gid + KV::KV_ROPE_GMEM_OFFSET), lane);
 
       // Init per-group w_head_sc_all
@@ -965,7 +965,7 @@ __device__ __forceinline__ void prefill_mg_impl(
 #pragma unroll
         for (int g = 0; g < 2; g++) {
           float* qk = qk_grp[g];
-          compute_qk_rope(qk, q_rope_regs[g], rope_pf);
+          compute_qk_rope<MT>(qk, q_rope_regs[g], rope_pf);
 
           {
             int e0 = qk_nb + tid * 2, e1 = e0 + 1;
@@ -1108,7 +1108,7 @@ __device__ __forceinline__ void prefill_mg_impl(
           }
 
           // QK rope (reuses prefetched B operands)
-          compute_qk_rope(qk, q_rope_regs[g], rope_pf);
+          compute_qk_rope<MT>(qk, q_rope_regs[g], rope_pf);
 
           // Invalid index masking + topk_length overflow. Dual splits per phase
           // (main: absolute ti*BI+e vs topk_len; extra: relative
