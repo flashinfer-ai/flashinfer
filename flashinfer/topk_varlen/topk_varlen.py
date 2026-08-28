@@ -1310,6 +1310,23 @@ def top_k_varlen(
     """
     assert logits.is_cuda and logits.dim() == 2, "logits must be a 2-D CUDA tensor"
     assert seq_lens.is_cuda and seq_lens.dim() == 1 and seq_lens.dtype == torch.int32
+    # Grouped-row ABI, shared by every backend: row r belongs to sequence
+    # r // next_n, so seq_lens must hold exactly one entry per group. Validated
+    # here (not in the per-backend checkers) because a violation is a silent
+    # device-side OOB read of seq_lens or a wrong grouping in every backend,
+    # and the API body still runs under skip_check=True. Real exceptions, not
+    # asserts: this must hold under `python -O` too.
+    if next_n < 1:
+        raise ValueError(f"next_n must be >= 1, got {next_n}")
+    if logits.shape[0] != seq_lens.shape[0] * next_n:
+        raise ValueError(
+            f"logits has {logits.shape[0]} rows but seq_lens has "
+            f"{seq_lens.shape[0]} entries with next_n={next_n}: expected "
+            f"seq_lens.shape[0] * next_n == logits.shape[0] "
+            f"(= {seq_lens.shape[0] * next_n}). Rows are grouped as "
+            f"row // next_n -> sequence; for per-row lengths pass next_n=1 "
+            f"with one seq_lens entry per row."
+        )
 
     if backend == "auto":
         backend = top_k_varlen.suitable_auto_backends[0]

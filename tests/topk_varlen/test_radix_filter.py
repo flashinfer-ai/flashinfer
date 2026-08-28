@@ -267,3 +267,31 @@ def test_bounded_spill_policy_correctness():
         assert sel.numel() == k and sel.unique().numel() == k
         kth = torch.topk(logits[b], k).values.min()
         assert bool((logits[b][sel.long()] >= kth - 1e-4).all()), f"row {b}"
+
+
+@pytest.mark.parametrize("backend", ["radix_filter", "radix", "radix_cutlass"])
+def test_next_n_group_abi_validated(backend):
+    """next_n < 1 and row/group mismatches must fail fast at the API.
+
+    Every backend maps row r to sequence r // next_n, so next_n == 0 divides
+    by zero and logits.shape[0] != seq_lens.numel() * next_n silently reads
+    seq_lens out of bounds on device (or applies the wrong grouping) -- easy
+    to hit for an adapter that supplies expanded per-row lengths. Message-
+    matched so the pre-fix behavior (a deeper, different error or silent
+    corruption) cannot satisfy the test.
+
+    Regression for PR #4621 review (grouped next_n ABI validation).
+    """
+    device = torch.device("cuda")
+    if backend == "radix_filter":
+        _skip_unless_radix_filter(device)
+
+    logits = torch.randn(5, 4096, dtype=torch.float32, device=device)
+    seq_lens = torch.full((2,), 4096, dtype=torch.int32, device=device)
+
+    with pytest.raises(ValueError, match=r"next_n must be >= 1"):
+        flashinfer.top_k_varlen(logits, seq_lens, 512, next_n=0, backend=backend)
+
+    # 5 rows cannot be 2 groups of next_n=2.
+    with pytest.raises(ValueError, match=r"row // next_n"):
+        flashinfer.top_k_varlen(logits, seq_lens, 512, next_n=2, backend=backend)
