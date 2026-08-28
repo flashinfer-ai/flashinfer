@@ -35,10 +35,13 @@ _DESCRIPTOR_STORAGE_BYTES = 6 * 128
 
 
 def _build_persistent_scalar_schedule(
-    sequence_lengths: tuple[int, ...], num_heads: int
+    sequence_lengths: tuple[int, ...],
+    num_heads: int,
+    num_ctas: int,
+    device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
     bins: list[tuple[int, int, list[tuple[int, int]]]] = [
-        (0, cta, []) for cta in range(_PERSISTENT_SCALAR_CTAS)
+        (0, cta, []) for cta in range(num_ctas)
     ]
     heapq.heapify(bins)
     ordered_sequences = sorted(
@@ -53,10 +56,117 @@ def _build_persistent_scalar_schedule(
             tasks.append((sequence * num_heads + head, chunks))
             heapq.heappush(bins, (load + chunks, cta, tasks))
 
+    while True:
+        light_index = min(
+            range(num_ctas), key=lambda index: (bins[index][0], bins[index][1])
+        )
+        heavy_index = max(
+            range(num_ctas), key=lambda index: (bins[index][0], -bins[index][1])
+        )
+        light_load, light_cta, light_tasks = bins[light_index]
+        heavy_load, heavy_cta, heavy_tasks = bins[heavy_index]
+        pair_tasks = light_tasks + heavy_tasks
+        pair_load = light_load + heavy_load
+        reachable = {0: 0}
+        for task_index, (_task, chunks) in enumerate(pair_tasks):
+            for load, mask in list(reachable.items()):
+                reachable.setdefault(load + chunks, mask | (1 << task_index))
+        split_load = min(
+            reachable,
+            key=lambda load: (
+                max(load, pair_load - load),
+                abs(pair_load - 2 * load),
+            ),
+        )
+        if max(split_load, pair_load - split_load) >= heavy_load:
+            break
+        split_mask = reachable[split_load]
+        light_tasks = [
+            task
+            for index, task in enumerate(pair_tasks)
+            if split_mask & (1 << index)
+        ]
+        heavy_tasks = [
+            task
+            for index, task in enumerate(pair_tasks)
+            if not split_mask & (1 << index)
+        ]
+        bins[light_index] = (split_load, light_cta, light_tasks)
+        bins[heavy_index] = (pair_load - split_load, heavy_cta, heavy_tasks)
+
+    while num_ctas >= 3:
+        ordered_bins = sorted(
+            range(num_ctas), key=lambda index: (bins[index][0], bins[index][1])
+        )
+        light_index = ordered_bins[0]
+        heavy_index = ordered_bins[-1]
+        average_load = sum(load for load, _cta, _tasks in bins) / num_ctas
+        middle_index = min(
+            ordered_bins[1:-1],
+            key=lambda index: (
+                abs(bins[index][0] - average_load),
+                -max(chunks for _task, chunks in bins[index][2]),
+                bins[index][1],
+            ),
+        )
+        selected_indices = (light_index, middle_index, heavy_index)
+        selected_tasks = [
+            task for index in selected_indices for task in bins[index][2]
+        ]
+        selected_load = sum(chunks for _task, chunks in selected_tasks)
+        heavy_load = bins[heavy_index][0]
+        if selected_load > 1024:
+            break
+        reachable_pairs = {(0, 0): 0}
+        processed_load = 0
+        for task_index, (_task, chunks) in enumerate(selected_tasks):
+            next_pairs = dict(reachable_pairs)
+            for (first_load, second_load), assignment in reachable_pairs.items():
+                third_load = processed_load - first_load - second_load
+                if first_load + chunks < heavy_load:
+                    next_pairs.setdefault(
+                        (first_load + chunks, second_load),
+                        assignment | (1 << (2 * task_index)),
+                    )
+                if second_load + chunks < heavy_load:
+                    next_pairs.setdefault(
+                        (first_load, second_load + chunks),
+                        assignment | (2 << (2 * task_index)),
+                    )
+                if third_load + chunks >= heavy_load:
+                    next_pairs.pop((first_load, second_load), None)
+            reachable_pairs = next_pairs
+            processed_load += chunks
+        if not reachable_pairs:
+            break
+        (first_load, second_load), assignment = min(
+            reachable_pairs.items(),
+            key=lambda item: max(
+                item[0][0], item[0][1], selected_load - sum(item[0])
+            ),
+        )
+        split_loads = (
+            first_load,
+            second_load,
+            selected_load - first_load - second_load,
+        )
+        if max(split_loads) >= heavy_load:
+            break
+        split_tasks: list[list[tuple[int, int]]] = [[], [], []]
+        for task_index, task in enumerate(selected_tasks):
+            encoded_group = (assignment >> (2 * task_index)) & 3
+            group = 0 if encoded_group == 1 else 1 if encoded_group == 2 else 2
+            split_tasks[group].append(task)
+        for index, load, tasks in zip(
+            selected_indices, split_loads, split_tasks, strict=True
+        ):
+            _old_load, cta, _old_tasks = bins[index]
+            bins[index] = (load, cta, tasks)
+
     bins.sort(key=lambda item: item[1])
     counts = [load for load, _cta, _tasks in bins]
     stride = max(counts)
-    schedule = [0] * (_PERSISTENT_SCALAR_CTAS * stride)
+    schedule = [0] * (num_ctas * stride)
     for _load, cta, tasks in bins:
         slot = 0
         for task, chunks in tasks:
@@ -66,8 +176,8 @@ def _build_persistent_scalar_schedule(
                 )
                 slot += 1
     return (
-        torch.tensor(schedule, dtype=torch.int32, device="cuda"),
-        torch.tensor(counts, dtype=torch.int32, device="cuda"),
+        torch.tensor(schedule, dtype=torch.int32, device=device),
+        torch.tensor(counts, dtype=torch.int32, device=device),
         stride,
     )
 
@@ -81,13 +191,16 @@ class _Route:
 
 
 def _route(
-    sequence_lengths: tuple[int, ...], num_heads: int, fixed_layout: bool
+    sequence_lengths: tuple[int, ...],
+    num_heads: int,
+    fixed_layout: bool,
+    device: torch.device,
 ) -> _Route:
     num_sequences = len(sequence_lengths)
     full_chunks = all(length % 32 == 0 for length in sequence_lengths)
     use_m64 = fixed_layout and num_sequences == 1 and num_heads == 64
     use_vtile = not use_m64 and (fixed_layout or len(set(sequence_lengths)) == 1)
-    dummy = torch.empty((1,), dtype=torch.int32, device="cuda")
+    dummy = torch.empty((1,), dtype=torch.int32, device=device)
 
     if use_m64:
         variant = f"m64_f{int(full_chunks)}_t{sequence_lengths[0]}_h{num_heads}"
@@ -113,17 +226,26 @@ def _route(
         tile_schedule = dummy
         tile_schedule_counts = dummy
     else:
+        persistent_scalar_ctas = min(
+            _PERSISTENT_SCALAR_CTAS,
+            torch.cuda.get_device_properties(device).multi_processor_count,
+        )
         use_persistent_scalar = (
-            num_heads == 64
-            and num_sequences * num_heads >= 2 * _PERSISTENT_SCALAR_CTAS
+            num_heads in (64, 96)
+            and num_sequences * num_heads >= 2 * persistent_scalar_ctas
             and num_sequences * num_heads < 1024
             and max((length + 31) // 32 for length in sequence_lengths) < 256
         )
         if use_persistent_scalar:
             tile_schedule, tile_schedule_counts, stride = (
-                _build_persistent_scalar_schedule(sequence_lengths, num_heads)
+                _build_persistent_scalar_schedule(
+                    sequence_lengths,
+                    num_heads,
+                    persistent_scalar_ctas,
+                    device,
+                )
             )
-            grid_x = _PERSISTENT_SCALAR_CTAS
+            grid_x = persistent_scalar_ctas
         else:
             stride = 1
             grid_x = num_sequences * num_heads
@@ -182,7 +304,7 @@ class PreparedFlashKDAEvolution:
         sequence_lengths = tuple(
             end - start for start, end in zip(offsets, offsets[1:], strict=False)
         )
-        route = _route(sequence_lengths, num_heads, fixed_layout)
+        route = _route(sequence_lengths, num_heads, fixed_layout, q.device)
         seq_order = torch.tensor(
             sorted(
                 range(len(sequence_lengths)),

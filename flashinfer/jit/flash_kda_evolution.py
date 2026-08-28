@@ -33,7 +33,10 @@ FlashKDAEvolutionVariant = Literal[
     "m128_h32_p0_s1",
     "m128_h4_p0_s1",
     "m128_h64_p1_s114",
+    "m128_h64_p1_s126",
     "m128_h96_p0_s1",
+    "m128_h96_p1_s166",
+    "m128_h96_p1_s173",
     "m64_f1_t8192_h64",
     "vtile_f0_t16_h96_p1_s192",
     "vtile_f0_t16_h96_p1_s96",
@@ -71,7 +74,10 @@ _FLASH_KDA_EVOLUTION_VARIANT_NAMES: tuple[FlashKDAEvolutionVariant, ...] = (
     "m128_h32_p0_s1",
     "m128_h4_p0_s1",
     "m128_h64_p1_s114",
+    "m128_h64_p1_s126",
     "m128_h96_p0_s1",
+    "m128_h96_p1_s166",
+    "m128_h96_p1_s173",
     "m64_f1_t8192_h64",
     "vtile_f0_t16_h96_p1_s192",
     "vtile_f0_t16_h96_p1_s96",
@@ -100,7 +106,10 @@ _TILE_SCHEDULE_VARIANTS = frozenset(
         "m128_h32_p0_s1",
         "m128_h4_p0_s1",
         "m128_h64_p1_s114",
+        "m128_h64_p1_s126",
         "m128_h96_p0_s1",
+        "m128_h96_p1_s166",
+        "m128_h96_p1_s173",
     }
 )
 _VALUE_ROWS_64_VARIANTS = frozenset({"m64_f1_t8192_h64"})
@@ -180,6 +189,7 @@ def _module_ident(csrc_dir: Path, metadata: FlashKDAEvolutionMetadata) -> str:
     paths = (
         csrc_dir / f"{metadata.source_stem}.cu",
         csrc_dir / "cake_flashkda_blackwell_evolution_binding.cuh",
+        csrc_dir / "flashkda_binding_common.cuh",
     )
     for index, path in enumerate(paths):
         if index:
@@ -212,7 +222,8 @@ def gen_flash_kda_evolution_module(
     metadata = FLASH_KDA_EVOLUTION_VARIANTS[variant]
     body = csrc_dir / f"{metadata.source_stem}.cu"
     binding_header = csrc_dir / "cake_flashkda_blackwell_evolution_binding.cuh"
-    for path in (body, binding_header):
+    common_header = csrc_dir / "flashkda_binding_common.cuh"
+    for path in (body, binding_header, common_header):
         if not path.exists():
             raise FileNotFoundError(f"FlashKDA evolution source not found: {path}")
     uri = get_flash_kda_evolution_uri(variant, target)

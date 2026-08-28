@@ -15,25 +15,27 @@ limitations under the License.
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from flashinfer.jit.flash_kda_evolution import (
     FLASH_KDA_EVOLUTION_VARIANTS,
+    _module_ident,
     gen_flash_kda_evolution_module,
 )
-from flashinfer.kda_evolution import prepare_flash_kda_evolution
+from flashinfer.kda_evolution import _route, prepare_flash_kda_evolution
 
 
 def test_flashkda_evolution_profile_is_frozen():
-    assert len(FLASH_KDA_EVOLUTION_VARIANTS) == 26
+    assert len(FLASH_KDA_EVOLUTION_VARIANTS) == 29
     assert (
         sum(
             metadata.has_tile_schedule
             for metadata in FLASH_KDA_EVOLUTION_VARIANTS.values()
         )
-        == 4
+        == 7
     )
     assert (
         sum(
@@ -46,6 +48,53 @@ def test_flashkda_evolution_profile_is_frozen():
     assert metadata.value_rows == 128
     assert not metadata.has_tile_schedule
     assert metadata.kernel_symbol.endswith("vtile_f1_t8192_h96_p1_s96")
+
+
+def test_flashkda_evolution_module_ident_covers_all_included_sources(tmp_path):
+    metadata = FLASH_KDA_EVOLUTION_VARIANTS["m128_h96_p1_s166"]
+    (tmp_path / f"{metadata.source_stem}.cu").write_bytes(b"body")
+    (tmp_path / "cake_flashkda_blackwell_evolution_binding.cuh").write_bytes(
+        b"binding"
+    )
+    common = tmp_path / "flashkda_binding_common.cuh"
+    common.write_bytes(b"common-v1")
+    first = _module_ident(tmp_path, metadata)
+    common.write_bytes(b"common-v2")
+    assert _module_ident(tmp_path, metadata) != first
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "multiprocessor_count", "expected_variant", "expected_stride"),
+    (
+        (64, 148, "m128_h64_p1_s126", 126),
+        (96, 148, "m128_h96_p1_s173", 173),
+        (64, 152, "m128_h64_p1_s114", 114),
+        (96, 152, "m128_h96_p1_s166", 166),
+    ),
+)
+def test_flashkda_evolution_routes_persistent_scalar_by_sm_count(
+    monkeypatch,
+    num_heads,
+    multiprocessor_count,
+    expected_variant,
+    expected_stride,
+):
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda _device: SimpleNamespace(multi_processor_count=multiprocessor_count),
+    )
+    route = _route(
+        (1300, 547, 2048, 963, 271, 3063),
+        num_heads,
+        False,
+        torch.device("cpu"),
+    )
+
+    assert route.variant == expected_variant
+    assert route.grid_x == multiprocessor_count
+    assert route.tile_schedule.numel() == multiprocessor_count * expected_stride
+    assert int(route.tile_schedule_counts.max()) == expected_stride
 
 
 @pytest.mark.parametrize("target", ["sm100a", "sm100f"])
@@ -64,7 +113,7 @@ def test_flashkda_evolution_jit_spec_has_one_generated_binding(variant, target):
     ("seq_lens", "seed", "expected_variant"),
     (
         ((8192,), 20260826, "vtile_f1_t8192_h96_p1_s96"),
-        ((1300, 547, 2048, 963, 271, 3063), 10001, "m128_h96_p0_s1"),
+        ((1300, 547, 2048, 963, 271, 3063), 10001, "persistent-h96-mixed"),
     ),
     ids=("fixed-8192", "mixed"),
 )
@@ -161,6 +210,14 @@ def test_flashkda_evolution_h96_matches_public_backend(
         lower_bound=-5.0,
         cu_seqlens=cu_seqlens,
     )
+    if expected_variant == "persistent-h96-mixed":
+        multiprocessor_count = torch.cuda.get_device_properties(
+            device
+        ).multi_processor_count
+        expected_variant = {
+            148: "m128_h96_p1_s173",
+            152: "m128_h96_p1_s166",
+        }[multiprocessor_count]
     assert prepared.variant == expected_variant
     assert prepared.target == _select_flash_kda_prefill_target(device)
     prepared.launch()
