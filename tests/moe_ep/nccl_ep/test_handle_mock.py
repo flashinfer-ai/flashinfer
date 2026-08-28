@@ -549,3 +549,29 @@ def test_ll_rejects_unsupported_hidden_size(fake_nccl_ep, bypass_build_checks, h
 def test_ll_accepts_supported_hidden_size(fake_nccl_ep, bypass_build_checks, hidden):
     """The SWITCH_HIDDEN set itself must keep working."""
     assert _make_fleet(fake_nccl_ep, hidden=hidden) is not None
+
+
+def test_ll_dispatch_rejects_more_tokens_than_the_fleet_was_sized_for(
+    fake_nccl_ep, bypass_build_checks
+):
+    """Over-dispatching must raise, not overrun the LL staging buffer.
+
+    LL sizes staging to max_tokens_per_rank. Sending more silently corrupted
+    memory and the kernel died with a bare SIGSEGV; HT already refused this.
+    Measured on 2xB200 at hidden=2048: (M=256, T=222) and (M=222, T=222) round
+    trip cleanly, (M=128, T=222) kills the worker.
+    """
+    import torch
+
+    from flashinfer.moe_ep.config import DispatchInputParams
+    from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    fleet = _make_fleet(fake_nccl_ep, max_tokens=128)
+    h = _make_handle(fleet, num_tokens=128, top_k=2)
+    too_many = torch.zeros(222, 2048, dtype=torch.bfloat16, device="cuda")
+
+    with pytest.raises(MoEEpConfigError, match="exceeding max_tokens_per_rank"):
+        h.dispatch(DispatchInputParams(x=[too_many]))

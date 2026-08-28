@@ -303,6 +303,19 @@ class NcclEpHandle(Handle):
         # token_hidden_size * dtype_bytes byte budget.
         hidden = x.shape[1]
 
+        # LL sizes its staging to max_tokens_per_rank; dispatching more than
+        # that overruns the buffer and the kernel dies with a SIGSEGV carrying
+        # no Python traceback. HT already refuses this (see _dispatch_ht);
+        # LL did not, so the same mistake was silent memory corruption.
+        n_tokens = x.shape[0]
+        if n_tokens > max_per_rank:
+            raise MoEEpConfigError(
+                f"nccl_ep LL dispatch received {n_tokens} tokens on this rank, "
+                f"exceeding max_tokens_per_rank ({max_per_rank}). Size the "
+                "Fleet for the largest per-rank token count you will dispatch "
+                "(FleetParams.max_tokens_per_rank), or dispatch in chunks."
+            )
+
         # Fleet-cached recv buffer (a fresh Handle is created every forward, so
         # per-handle caching never hits; the fleet persists).
         shape = (self._num_local_experts, max_per_rank * world_size, hidden)
@@ -381,6 +394,19 @@ class NcclEpHandle(Handle):
         max_per_rank = self._fleet.params.max_tokens_per_rank
         # Recv row mirrors the sent row; see _dispatch_ll.
         hidden = x.shape[1]
+        # LL sizes its staging to max_tokens_per_rank; dispatching more than
+        # that overruns the buffer and the kernel dies with a SIGSEGV carrying
+        # no Python traceback. HT already refuses this (see _dispatch_ht);
+        # LL did not, so the same mistake was silent memory corruption.
+        n_tokens = x.shape[0]
+        if n_tokens > max_per_rank:
+            raise MoEEpConfigError(
+                f"nccl_ep LL dispatch received {n_tokens} tokens on this rank, "
+                f"exceeding max_tokens_per_rank ({max_per_rank}). Size the "
+                "Fleet for the largest per-rank token count you will dispatch "
+                "(FleetParams.max_tokens_per_rank), or dispatch in chunks."
+            )
+
         m = max_per_rank * world_size
 
         tw = self._handle_knobs.get(HandleAlgoKnobTopKWeights)
