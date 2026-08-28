@@ -151,8 +151,10 @@ _DECODE_DOTS3_SWA_DISPATCH = frozenset(
 
 # Crossover-calibration grids: the (num_heads, topk) pairs the tuning-mode
 # sweep times on both paths. Deliberately NOT the full eligibility product —
-# calibrating 128 head counts would explode the sweep. Shapes outside the
-# grid keep the decode-first default until a measured entry exists.
+# calibrating 128 head counts would explode the sweep. Every grid head count
+# hits a dedicated instantiation, so the sweep times exactly the kernels
+# production decode calls launch; runtime-H-only shapes off the grid keep the
+# decode-first default until a measured entry exists.
 _CALIBRATION_HEADS = (8, 16, 32, 64, 128)
 _DECODE_DSV4_CALIBRATION_GRID = frozenset(
     (h, k) for h in _CALIBRATION_HEADS for k in _DECODE_DSV4_TOPKS

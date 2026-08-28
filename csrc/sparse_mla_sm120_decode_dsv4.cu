@@ -151,11 +151,11 @@ static bool launch_decode_dsv4_impl(
 // TOPK=192 covers the padded DeepSeek-V4-Flash-0731 DSpark K=5 shape (128 SWA
 // + 5 active draft entries), while TOPK=256 covers wider DSpark
 // configurations.
-// Head counts: NUM_HEADS=8 keeps a dedicated instantiation (its true-H mid
-// scratch lets the kernel skip the second-half writeback at compile time,
-// worth 4-6% at small T); every other num_heads <= 128 is served by one
-// runtime-H instantiation per topk (NUM_HEADS == 0), which pads the head tile
-// with zero-Q rows and HPB-aligns the mid scratch.
+// Head counts: the production grid {8, 16, 32, 64, 128} keeps dedicated
+// instantiations — measured 0.9-2.5% faster than the runtime-H kernel on hot
+// shapes (compile-time head strides); every other num_heads in [1, 128] falls
+// back to one runtime-H instantiation per topk (NUM_HEADS == 0), which pads
+// the head tile with zero-Q rows and HPB-aligns the mid scratch.
 bool launch_sparse_mla_decode_dsv4(
     ModelType mt, int num_heads, int topk, int page_block_size, int num_tokens, int num_splits,
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices, bf16* mid_out, float* mid_lse,
@@ -176,8 +176,8 @@ bool launch_sparse_mla_decode_dsv4(
         stride_extra_kv_block, num_tokens, num_splits, chunks_per_block_override, sm_scale, \
         stride_kv_block, stride_indices_token, stride_extra_indices_token, stream);         \
   }
-// Runtime-H dispatch: any num_heads in [1, 128] other than the dedicated
-// counts above (which return first).
+// Runtime-H fallback: any num_heads in [1, 128] whose exact count no
+// dedicated instantiation above claimed (they return first).
 #define DECODE_DISPATCH_RT(MT_, K)                                                          \
   if (mt == (MT_) && topk == (K)) {                                                         \
     return launch_decode_dsv4_impl<(MT_), 0, (K), 64>(                                      \
@@ -188,11 +188,18 @@ bool launch_sparse_mla_decode_dsv4(
   }
 #define DSV4_DISPATCH(H, K) DECODE_DISPATCH(ModelType::DSV4, (H), (K))
 #define DSV4_DISPATCH_RT(K) DECODE_DISPATCH_RT(ModelType::DSV4, (K))
-  DSV4_DISPATCH(8, 128)
-  DSV4_DISPATCH(8, 192)
-  DSV4_DISPATCH(8, 256)
-  DSV4_DISPATCH(8, 512)
-  DSV4_DISPATCH(8, 1024)
+#define DSV4_DISPATCH_ROW(H) \
+  DSV4_DISPATCH(H, 128)      \
+  DSV4_DISPATCH(H, 192)      \
+  DSV4_DISPATCH(H, 256)      \
+  DSV4_DISPATCH(H, 512)      \
+  DSV4_DISPATCH(H, 1024)
+  DSV4_DISPATCH_ROW(8)
+  DSV4_DISPATCH_ROW(16)
+  DSV4_DISPATCH_ROW(32)
+  DSV4_DISPATCH_ROW(64)
+  DSV4_DISPATCH_ROW(128)
+#undef DSV4_DISPATCH_ROW
   DSV4_DISPATCH_RT(128)
   DSV4_DISPATCH_RT(192)
   DSV4_DISPATCH_RT(256)
@@ -207,9 +214,13 @@ bool launch_sparse_mla_decode_dsv4(
   // the per-token candidate count inside the kernel, so omitting it costs
   // nothing beyond the window itself. Unused slots must still carry -1, which
   // the QK mask turns into -inf.
-  // Head counts cover TP shards of a 64-head layer (TP4 -> 16); H=8 stays
-  // dedicated, the rest ride the runtime-H instantiation.
+  // Head counts cover the TP shards of a 64-head layer (TP4 -> 16) with
+  // dedicated instantiations; any other count up to 128 rides the runtime-H
+  // fallback.
   DECODE_DISPATCH(ModelType::DOTS3_SWA, 8, 576)
+  DECODE_DISPATCH(ModelType::DOTS3_SWA, 16, 576)
+  DECODE_DISPATCH(ModelType::DOTS3_SWA, 32, 576)
+  DECODE_DISPATCH(ModelType::DOTS3_SWA, 64, 576)
   DECODE_DISPATCH_RT(ModelType::DOTS3_SWA, 576)
 #undef DSV4_DISPATCH_RT
 #undef DSV4_DISPATCH

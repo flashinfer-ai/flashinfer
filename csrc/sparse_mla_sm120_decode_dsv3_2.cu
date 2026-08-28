@@ -6,11 +6,10 @@
 // buffered with per-buffer mbarrier pairs, static grid (num_tokens × HBLOCKS
 // × num_splits). Reuses decode-dsv4's merge kernel for split combine.
 //
-// Supports the full V32-family dispatch grid:
-//   num_heads ∈ {8, 16, 32, 64, 128}
-//   topk      ∈ {128, 512, 1024, 2048}
-//   pbs       = 64
-// = 20 instantiations.
+// Supports the V32-family dispatch grid: dedicated instantiations at
+//   num_heads ∈ {8, 16, 32, 64, 128} × topk ∈ {128, 512, 1024, 2048}
+// plus one runtime-H instantiation per topk (any num_heads <= 128 off the
+// grid), and GLM53_NOPE at topk=2176 (dedicated 32/64 + runtime-H).
 
 #include <cuda_runtime.h>
 
@@ -135,9 +134,9 @@ static bool launch_decode_dsv3_2_impl(int num_heads, const bf16* Q, const uint8_
 }
 
 // Public surface: V32-family (DSv3.2 / GLM_NSA) decode.
-// num_heads=8 keeps a dedicated instantiation per topk (true-H scratch lets
-// the kernel skip the second-half writeback at compile time); every other
-// num_heads <= 128 rides one runtime-H instantiation per topk.
+// The production grid {8, 16, 32, 64, 128} keeps dedicated instantiations
+// (measured 0.9-2.5% faster than runtime-H on hot shapes); every other
+// num_heads <= 128 falls back to one runtime-H instantiation per topk.
 // Returns false if (num_heads, topk) is outside the dispatch envelope.
 bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int num_tokens,
                                      int num_splits, const bf16* Q, const uint8_t* KV_cache,
@@ -179,18 +178,27 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
       DSV3_2_DISPATCH_RT_MT(ModelType::GLM_NSA, K) \
     }                                              \
   } while (0);
-  DSV3_2_DISPATCH(8, 128)
-  DSV3_2_DISPATCH(8, 512)
-  DSV3_2_DISPATCH(8, 1024)
-  DSV3_2_DISPATCH(8, 2048)
+#define DSV3_2_DISPATCH_ROW(H) \
+  DSV3_2_DISPATCH(H, 128)      \
+  DSV3_2_DISPATCH(H, 512)      \
+  DSV3_2_DISPATCH(H, 1024)     \
+  DSV3_2_DISPATCH(H, 2048)
+  DSV3_2_DISPATCH_ROW(8)
+  DSV3_2_DISPATCH_ROW(16)
+  DSV3_2_DISPATCH_ROW(32)
+  DSV3_2_DISPATCH_ROW(64)
+  DSV3_2_DISPATCH_ROW(128)
+#undef DSV3_2_DISPATCH_ROW
   DSV3_2_DISPATCH_RT(128)
   DSV3_2_DISPATCH_RT(512)
   DSV3_2_DISPATCH_RT(1024)
   DSV3_2_DISPATCH_RT(2048)
   // GLM-5.3 combines its 2048 sparse selection with the 128-token
-  // indexer window. One runtime-H instantiation at topk=2176 covers the
-  // TP1 (64-head) and TP2 (32-head) shapes and any other shard.
+  // indexer window. The TP1 (64-head) and TP2 (32-head) shapes keep
+  // dedicated instantiations; any other shard rides the runtime-H fallback.
   if (mt == ModelType::GLM53_NOPE) {
+    DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, 32, 2176)
+    DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, 64, 2176)
     DSV3_2_DISPATCH_RT_MT(ModelType::GLM53_NOPE, 2176)
   }
 #undef DSV3_2_DISPATCH_RT
