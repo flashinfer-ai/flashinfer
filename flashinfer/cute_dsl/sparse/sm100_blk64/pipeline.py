@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from dataclasses import dataclass
 
 import cutlass.cute as cute
@@ -118,6 +118,16 @@ def _call_with_elect_one(parent_method, self, state, elect_one, syncwarp, loc, i
 
 class _PipelineIndexPhaseMixin:
     """Mixin providing _w_index_phase / _w_index methods that delegate to PipelineState-based parents."""
+
+    if TYPE_CHECKING:
+        # Declared for type-checking only: provided at runtime by the PipelineAsyncOg-derived
+        # sibling base class in each concrete subclass's MRO (e.g. PipelineAsync, PipelineTmaAsync).
+        def producer_acquire(
+            self, state, try_acquire_token=None, *, loc=None, ip=None
+        ): ...
+        def producer_commit(self, state, *, loc=None, ip=None): ...
+        def consumer_wait(self, state, try_wait_token=None, *, loc=None, ip=None): ...
+        def consumer_release(self, state, *, loc=None, ip=None): ...
 
     @dsl_user_op
     def producer_acquire_w_index_phase(

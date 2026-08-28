@@ -388,7 +388,7 @@ def tma_get_copy_fn(
     loc=None,
     ip=None,
     **kwargs,
-) -> Callable:
+) -> Tuple[Callable, cute.Tensor, cute.Tensor]:
     src_is_smem = const_expr(
         isinstance(src_tensor.iterator, cute.Pointer)
         and src_tensor.memspace == cute.AddressSpace.smem

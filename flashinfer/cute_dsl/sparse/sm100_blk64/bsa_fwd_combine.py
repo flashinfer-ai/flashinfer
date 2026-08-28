@@ -268,7 +268,7 @@ class BlockSparseAttnForwardCombine:
                 128,
             ]
 
-        smem_size = SharedStorage.size_in_bytes()
+        smem_size = SharedStorage.size_in_bytes()  # type: ignore[attr-defined]
 
         # Grid dimensions: (ceil_div(seqlen, m_block), ceil_div(head_dim, k_block), num_head * batch)
         seqlen = mO_partial.shape[0]

@@ -119,7 +119,7 @@ class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
 
     @staticmethod
-    def create(
+    def create(  # type: ignore[override]
         scale_log2: Float32,
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,

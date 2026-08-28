@@ -741,7 +741,7 @@ class BlockSparseAttnForwardSm100Blk64:
         if const_expr(self.use_clc_scheduler):
             TileScheduler = BlockSparsePersistentTileScheduler
         elif const_expr(not self.is_persistent):
-            TileScheduler = SingleTileScheduler
+            TileScheduler = SingleTileScheduler  # type: ignore[assignment]
         else:
             TileScheduler = BlockSparsePersistentTileScheduler
         tile_sched_args = TileSchedulerArguments(
