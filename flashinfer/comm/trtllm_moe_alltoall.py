@@ -24,7 +24,7 @@ from ..tllm_enums import SfLayout
 # csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h, which is
 # derived from kMaxRanks there). A single word covers up to 64 ranks.
 MOE_A2A_RANK_MASK_WORDS = 1
-MoeAlltoAllTarget = Literal["sm100a", "sm103a"]
+MoeAlltoAllTarget = Literal["legacy", "sm100a", "sm103a"]
 
 
 def moe_a2a_active_rank_mask(active_ranks: Sequence[int], ep_size: int) -> torch.Tensor:
@@ -74,15 +74,12 @@ def _moe_alltoall_target(device_index: int) -> MoeAlltoAllTarget:
         return "sm100a"
     if capability == (10, 3):
         return "sm103a"
-    raise RuntimeError(
-        "MNNVL MoE all-to-all requires exact compute capability 10.0 or 10.3, "
-        f"got {capability[0]}.{capability[1]}"
-    )
+    return "legacy"
 
 
 @functools.cache
 def _get_moe_alltoall_module_for_target(target: MoeAlltoAllTarget):
-    """Build or load one exact-architecture MNNVL MoE all-to-all module."""
+    """Build or load the legacy or exact-architecture all-to-all module."""
     module = gen_moe_alltoall_module(target).build_and_load()
 
     @register_custom_op(
@@ -365,7 +362,7 @@ def _get_moe_alltoall_module_for_target(target: MoeAlltoAllTarget):
 
 
 def get_moe_alltoall_module():
-    """Return the module for the current device's exact compute capability."""
+    """Return the legacy or exact-architecture module for the current device."""
     device_index = torch.cuda.current_device()
     return _get_moe_alltoall_module_for_target(_moe_alltoall_target(device_index))
 

@@ -286,7 +286,7 @@ def gen_ulysses_a2a_module() -> JitSpec:
     )
 
 
-MoeAlltoAllTarget = Literal["sm100a", "sm103a"]
+MoeAlltoAllTarget = Literal["legacy", "sm100a", "sm103a"]
 
 _MOE_ALLTOALL_GENERATED_SOURCE = {
     "sm100a": "mnnvl_moe_alltoall_sm100.cu",
@@ -298,9 +298,7 @@ _MOE_ALLTOALL_NVCC_FLAGS = {
 }
 
 
-def gen_moe_alltoall_module(target: MoeAlltoAllTarget) -> JitSpec:
-    if target not in _MOE_ALLTOALL_GENERATED_SOURCE:
-        raise ValueError(f"unsupported MNNVL MoE all-to-all target: {target}")
+def gen_moe_alltoall_module(target: MoeAlltoAllTarget = "legacy") -> JitSpec:
     communication_kernels = (
         jit_env.FLASHINFER_CSRC_DIR
         / "nv_internal"
@@ -308,17 +306,26 @@ def gen_moe_alltoall_module(target: MoeAlltoAllTarget) -> JitSpec:
         / "kernels"
         / "communicationKernels"
     )
-    generated_source = (
-        jit_env.FLASHINFER_CSRC_DIR
-        / "generated"
-        / _MOE_ALLTOALL_GENERATED_SOURCE[target]
-    )
+    if target == "legacy":
+        module_name = "mnnvl_moe_alltoall"
+        kernel_sources = [communication_kernels / "moeAlltoAllKernels.cu"]
+        arch_flags = []
+    elif target in _MOE_ALLTOALL_GENERATED_SOURCE:
+        module_name = f"mnnvl_moe_alltoall_{target}"
+        kernel_sources = [
+            communication_kernels / "moeAlltoAllFusedKernels.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "generated"
+            / _MOE_ALLTOALL_GENERATED_SOURCE[target],
+        ]
+        arch_flags = _MOE_ALLTOALL_NVCC_FLAGS[target]
+    else:
+        raise ValueError(f"unsupported MNNVL MoE all-to-all target: {target}")
     return gen_jit_spec(
-        f"mnnvl_moe_alltoall_{target}",
+        module_name,
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_alltoall.cu",
-            communication_kernels / "moeAlltoAllFusedKernels.cu",
-            generated_source,
+            *kernel_sources,
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal"
             / "cpp"
@@ -345,7 +352,7 @@ def gen_moe_alltoall_module(target: MoeAlltoAllTarget) -> JitSpec:
             str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include"),
         ],
         extra_cuda_cflags=[
-            *_MOE_ALLTOALL_NVCC_FLAGS[target],
+            *arch_flags,
             "-DENABLE_BF16",
         ],
     )

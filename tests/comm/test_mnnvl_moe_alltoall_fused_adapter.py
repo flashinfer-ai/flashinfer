@@ -361,6 +361,25 @@ def test_fused_jit_inventory_is_exact_arch_and_self_contained(
     assert any(arch_flag in flag for flag in captured["kwargs"]["extra_cuda_cflags"])
 
 
+def test_legacy_jit_inventory_remains_available(monkeypatch):
+    import flashinfer.jit.comm as jit_comm
+
+    captured = {}
+
+    def capture(name, sources, **kwargs):
+        captured.update(name=name, sources=tuple(sources), kwargs=kwargs)
+        return object()
+
+    monkeypatch.setattr(jit_comm, "gen_jit_spec", capture)
+    jit_comm.gen_moe_alltoall_module()
+    names = {path.name for path in captured["sources"]}
+    assert captured["name"] == "mnnvl_moe_alltoall"
+    assert "moeAlltoAllKernels.cu" in names
+    assert "moeAlltoAllFusedKernels.cu" not in names
+    assert not {name for name in names if name.startswith("mnnvl_moe_alltoall_sm")}
+    assert captured["kwargs"]["extra_cuda_cflags"] == ["-DENABLE_BF16"]
+
+
 def test_runtime_module_selection_uses_exact_current_device_capability(monkeypatch):
     import flashinfer.comm.trtllm_moe_alltoall as api
 
@@ -376,11 +395,9 @@ def test_runtime_module_selection_uses_exact_current_device_capability(monkeypat
     assert api.get_moe_alltoall_module() == "sm100a"
     monkeypatch.setattr(api.torch.cuda, "get_device_capability", lambda device: (10, 3))
     assert api.get_moe_alltoall_module() == "sm103a"
-    assert selected == ["sm100a", "sm103a"]
-
-    monkeypatch.setattr(api.torch.cuda, "get_device_capability", lambda device: (12, 0))
-    with pytest.raises(RuntimeError, match="exact compute capability 10.0 or 10.3"):
-        api.get_moe_alltoall_module()
+    monkeypatch.setattr(api.torch.cuda, "get_device_capability", lambda device: (9, 0))
+    assert api.get_moe_alltoall_module() == "legacy"
+    assert selected == ["sm100a", "sm103a", "legacy"]
 
 
 def test_aot_registers_each_exact_mnnvl_moe_target(monkeypatch):
