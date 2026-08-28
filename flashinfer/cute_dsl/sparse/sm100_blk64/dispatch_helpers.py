@@ -200,16 +200,24 @@ def ceil_log2_int(x: int) -> int:
 
 
 def sm100_blk64_kv_splits_from_count(kv_blocks: int, max_kv_splits: int = 16) -> int:
-    """Choose the long-Q split count from a uniform sparse-block count."""
+    """Choose the long-Q split count from a uniform sparse-block count.
+
+    Retuned from the original 256/450/900 tiers (carried over from
+    Block-Sparse-Attention/bsa_attn_interface.py) after measuring on B200
+    (SM100): those tiers regressed 1.1x-2.8x versus kv_splits=1 across the
+    batch/head/M-block shapes tested (total_q_tiles in {4, 32, 512},
+    num_heads=4, bf16, densities 0.5/0.9) -- splitting only paid off once
+    active blocks reached roughly 3500+, where it measured a consistent
+    4-6x speedup. A single ~3500 threshold (rather than the finer-grained
+    2/4/8 schedule) is a deliberately conservative choice: the ~2000-3200
+    transition region showed high run-to-run variance in this sweep, so
+    this sits solidly inside the consistently-faster regime instead of
+    chasing the exact crossover. Measured on one GPU/config -- may need
+    revisiting for other archs (SM103) or untested shapes (different head
+    counts, dtypes, densities).
+    """
     kv_blocks = int(kv_blocks)
-    if kv_blocks >= 900:
-        splits = 8
-    elif kv_blocks >= 450:
-        splits = 4
-    elif kv_blocks >= 256:
-        splits = 2
-    else:
-        splits = 1
+    splits = 8 if kv_blocks >= 3500 else 1
     return max(1, min(int(splits), int(max_kv_splits), kv_blocks))
 
 
@@ -219,7 +227,19 @@ def sm100_blk64_auto_kv_splits(
     fixed_block_sparse_num: int,
     max_kv_splits: int = 16,
 ) -> int:
-    """Choose KV splits for the SM100 blk64 KV-bucketed target cases."""
+    """Choose KV splits for the SM100 blk64 KV-bucketed target cases.
+
+    Restores a ``total_q_tiles`` gate present in the upstream
+    Block-Sparse-Attention/bsa_attn_interface.py source this module was
+    adapted from but dropped in the port: large-Q workloads already expose
+    enough independent Q tiles to fill the GPU, so splitting KV only adds
+    FP32 partial-output traffic and a combine launch without useful extra
+    parallelism. This alone does not cover every regression measured on
+    B200 -- small-Q shapes (``total_q_tiles`` well under 512) still fall
+    through to ``sm100_blk64_kv_splits_from_count``, whose thresholds were
+    separately retuned (see its docstring) because they regressed even at
+    low ``total_q_tiles``.
+    """
     if is_fake_mode() or not q.is_cuda:
         return 1
 
@@ -227,6 +247,14 @@ def sm100_blk64_auto_kv_splits(
     if kv_blocks <= 0:
         kv_blocks = int(q2k_block_index.shape[-1])
     if kv_blocks <= 1:
+        return 1
+
+    # Large-Q workloads already expose enough independent Q tiles to fill
+    # the GPU; splitting KV adds FP32 partial-output traffic and a combine
+    # launch without providing useful extra parallelism.
+    batch, heads, seqlen_q, _ = q.shape
+    total_q_tiles = batch * heads * ceil_div_int(seqlen_q, 64)
+    if total_q_tiles >= 512:
         return 1
 
     return sm100_blk64_kv_splits_from_count(kv_blocks, max_kv_splits)
@@ -273,20 +301,29 @@ def build_sm100_blk64_kv_split_offsets(
 
 
 def _blk64_split_workspace_bytes(
-    q: torch.Tensor, value_dim: int, kv_splits: int
+    q: torch.Tensor, value_dim: int, kv_splits: int, output_dtype: torch.dtype
 ) -> int:
-    """Estimate live split-KV partial, combine-output, and offset storage."""
+    """Estimate live split-KV partial, combine-output, and offset storage.
+
+    ``output_dtype`` sizes the final combined-output buffer -- it is the
+    combine kernel's actual write dtype (see ``combine_blk64_kv_bucketed_
+    partials``' ``output_dtype``), which is not always ``q.dtype``: Sage-FP8
+    inputs (``q`` in float8_e4m3fn) still combine down to a bf16 output.
+    Using ``q.element_size()`` here would undercount that buffer whenever
+    the output is wider than the input.
+    """
     batch, num_heads, seqlen_q, _ = q.shape
     num_q_blocks = ceil_div_int(seqlen_q, 64)
     rows = batch * num_heads * seqlen_q
     partial_bytes = kv_splits * rows * (value_dim + 1) * 4
-    final_bytes = rows * (value_dim * q.element_size() + 4)
+    final_bytes = rows * (value_dim * output_dtype.itemsize + 4)
     offset_bytes = batch * num_heads * num_q_blocks * (kv_splits + 1) * 4
     return int(partial_bytes + final_bytes + offset_bytes)
 
 
-#: (device_index, q.shape, q.dtype, value_dim, kv_splits, allow_fallback) -> resolved
-#: kv_splits_i. Populated by resolve_sm100_blk64_split_workspace; see its docstring.
+#: (device_index, q.shape, q.dtype, value_dim, kv_splits, allow_fallback,
+#: output_dtype) -> resolved kv_splits_i. Populated by
+#: resolve_sm100_blk64_split_workspace; see its docstring.
 _split_workspace_resolution_cache: dict = {}
 
 
@@ -295,16 +332,39 @@ def resolve_sm100_blk64_split_workspace(
     value_dim: int,
     kv_splits: int,
     allow_fallback: bool,
+    output_dtype: torch.dtype,
 ) -> int:
     """Fit split-KV workspace to currently available CUDA allocator capacity.
 
-    Resolved once per (device, q shape/dtype, requested kv_splits) and cached
-    thereafter, so otherwise-identical calls don't have their split count --
-    and therefore peak memory, first-compile latency, and even bitwise
-    results, since kv_splits_i feeds the compile key -- drift with transient
-    allocator state. Only successful resolutions are cached: a raised
-    RuntimeError (below, when allow_fallback is False) is not cached, so a
-    later call can still retry once more memory is free.
+    Resolved once per (device, q shape/dtype, requested kv_splits) and
+    cached, but re-validated against the *current* allocator budget on every
+    call before being trusted: under stable memory conditions this still
+    returns the identical, deterministic split count straight from the
+    cache -- no full re-search, no kv_splits_i/compile-key drift across
+    otherwise-identical calls, matching the point of caching this in the
+    first place -- but if the cached split count no longer fits the current
+    budget, this falls through to a full re-resolution exactly as a cold
+    call would, and the cache is updated with the fresh result. Only
+    successful resolutions are cached: a raised RuntimeError (below, when
+    allow_fallback is False) is never cached, so a later call can still
+    retry once more memory is free.
+
+    The re-validation is two-tier: it first checks the cached split count
+    against ``free_bytes`` alone (``torch.cuda.mem_get_info()``, ~5us).
+    ``reclaimable_bytes`` (below) can only raise the true budget, never
+    lower it, so a fit against ``free_bytes`` alone is always a safe fit
+    against the true budget too -- this lets the common case (cache hit,
+    memory roughly unchanged) skip ``torch.cuda.memory_reserved()`` /
+    ``memory_allocated()``, which measured ~20x costlier than
+    ``mem_get_info()`` alone (~100us vs ~5us) despite being pure host-side
+    allocator-stats reads. Only a cache miss, or a cached value that fails
+    the cheap check, pays for the full ``reclaimable_bytes``-inclusive
+    budget.
+
+    ``output_dtype`` must be the combine kernel's actual output dtype (see
+    ``_blk64_split_workspace_bytes``), not assumed to be ``q.dtype`` --
+    Sage-FP8 combines an fp8 ``q`` down to a bf16 output, and using the
+    narrower input dtype would undercount that buffer.
     """
     kv_splits = int(kv_splits)
     if kv_splits <= 1 or is_fake_mode() or not q.is_cuda:
@@ -317,22 +377,37 @@ def resolve_sm100_blk64_split_workspace(
         value_dim,
         kv_splits,
         allow_fallback,
+        output_dtype,
     )
-    cached = _split_workspace_resolution_cache.get(cache_key)
-    if cached is not None:
-        return cached
 
     free_bytes, total_bytes = torch.cuda.mem_get_info(q.device)
+    reserve_bytes = max(512 << 20, int(total_bytes * 0.05))
+
+    cached = _split_workspace_resolution_cache.get(cache_key)
+    cached_required_bytes = (
+        _blk64_split_workspace_bytes(q, value_dim, cached, output_dtype)
+        if cached is not None
+        else None
+    )
+    if cached_required_bytes is not None:
+        conservative_budget_bytes = max(0, free_bytes - reserve_bytes)
+        if cached_required_bytes <= conservative_budget_bytes:
+            return cached
+
     reclaimable_bytes = max(
         0,
         torch.cuda.memory_reserved(q.device) - torch.cuda.memory_allocated(q.device),
     )
-    reserve_bytes = max(512 << 20, int(total_bytes * 0.05))
     budget_bytes = max(0, free_bytes + reclaimable_bytes - reserve_bytes)
+
+    if cached_required_bytes is not None and cached_required_bytes <= budget_bytes:
+        return cached
 
     candidate = kv_splits
     while candidate > 1:
-        required_bytes = _blk64_split_workspace_bytes(q, value_dim, candidate)
+        required_bytes = _blk64_split_workspace_bytes(
+            q, value_dim, candidate, output_dtype
+        )
         if required_bytes <= budget_bytes:
             _split_workspace_resolution_cache[cache_key] = candidate
             return candidate

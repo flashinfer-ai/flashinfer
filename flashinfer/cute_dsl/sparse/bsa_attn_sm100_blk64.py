@@ -263,7 +263,11 @@ def bsa_attn_sm100_blk64_fwd(
             q_bhsd, q2k_block_index, uniform_block_sparse_num
         )
     kv_splits_i = resolve_sm100_blk64_split_workspace(
-        q_bhsd, head_dim_v, kv_splits_i, allow_fallback=auto_kv_splits
+        q_bhsd,
+        head_dim_v,
+        kv_splits_i,
+        allow_fallback=auto_kv_splits,
+        output_dtype=output_dtype,
     )
     allow_empty_block_nums = kv_splits_i > 1
     if use_clc is None:

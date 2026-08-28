@@ -8,6 +8,7 @@
 import contextlib
 import importlib.metadata
 import inspect
+import threading
 import warnings
 from dataclasses import dataclass, fields
 from functools import partial
@@ -29,6 +30,14 @@ _STATIC_TYPES = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(Non
 
 _EXPECTED_CUTLASS_DSL_VERSION = "4.7.0"  # keep in sync with requirements.txt
 
+# Serializes the save/patch/restore sequence below so overlapping
+# cute.compile(..., "--enable-tvm-ffi") calls from different threads can't
+# interleave their reads/writes of the process-global
+# converter._convert_single_arg slot. Reentrant so a thread that is already
+# inside this context manager can safely enter it again (e.g. a nested
+# compile call on the same thread) without deadlocking itself.
+_converter_patch_lock = threading.RLock()
+
 
 @contextlib.contextmanager
 def constexpr_tvm_ffi_converter_patched():
@@ -46,10 +55,15 @@ def constexpr_tvm_ffi_converter_patched():
     its own recursive calls, so a permanent rebind would also intercept
     every other backend's ``--enable-tvm-ffi`` compiles for the rest of the
     process. Restoring the original on exit keeps that blast radius limited
-    to this call. This assumes ``cute.compile()`` calls are not issued
-    concurrently from multiple threads while this context manager is active
-    -- true today (no threaded/concurrent compilation path in the JIT
-    layer), but would need revisiting if that changes.
+    to this call. ``_converter_patch_lock`` (held for the full body, across
+    the ``yield``) serializes overlapping calls from different threads so
+    the save/restore of the global slot can't interleave -- without it, one
+    thread's restore-on-exit could strip another thread's still-active
+    patch, or a later restore could clobber the true original with an
+    already-patched wrapper, leaking it for the rest of the process. This
+    only protects this function's own save/restore of the global slot: it
+    does not make the surrounding compile caches (see callers) thread-safe
+    against redundant concurrent compiles of the same key.
     """
     installed_version = importlib.metadata.version("nvidia-cutlass-dsl")
     if installed_version != _EXPECTED_CUTLASS_DSL_VERSION:
@@ -64,40 +78,41 @@ def constexpr_tvm_ffi_converter_patched():
 
     import cutlass.cute._tvm_ffi_args_spec_converter as converter
 
-    original = converter._convert_single_arg
-    supports_is_constexpr = "is_constexpr" in inspect.signature(original).parameters
+    with _converter_patch_lock:
+        original = converter._convert_single_arg
+        supports_is_constexpr = "is_constexpr" in inspect.signature(original).parameters
 
-    def convert_single_arg(
-        arg,
-        arg_name,
-        arg_type,
-        ctx,
-        *,
-        is_constexpr=False,
-    ):
-        if arg_type is not None and get_origin(arg_type) is cutlass.Constexpr:
-            return spec.ConstNone(arg_name)
-        if (
-            isinstance(arg, tuple)
-            and hasattr(type(arg), "_fields")
-            and (arg_type is None or not hasattr(arg_type, "_fields"))
+        def convert_single_arg(
+            arg,
+            arg_name,
+            arg_type,
+            ctx,
+            *,
+            is_constexpr=False,
         ):
-            arg_type = type(arg)
-        if supports_is_constexpr:
-            return original(
-                arg,
-                arg_name,
-                arg_type,
-                ctx,
-                is_constexpr=is_constexpr,
-            )
-        return original(arg, arg_name, arg_type, ctx)
+            if arg_type is not None and get_origin(arg_type) is cutlass.Constexpr:
+                return spec.ConstNone(arg_name)
+            if (
+                isinstance(arg, tuple)
+                and hasattr(type(arg), "_fields")
+                and (arg_type is None or not hasattr(arg_type, "_fields"))
+            ):
+                arg_type = type(arg)
+            if supports_is_constexpr:
+                return original(
+                    arg,
+                    arg_name,
+                    arg_type,
+                    ctx,
+                    is_constexpr=is_constexpr,
+                )
+            return original(arg, arg_name, arg_type, ctx)
 
-    converter._convert_single_arg = convert_single_arg
-    try:
-        yield
-    finally:
-        converter._convert_single_arg = original
+        converter._convert_single_arg = convert_single_arg
+        try:
+            yield
+        finally:
+            converter._convert_single_arg = original
 
 
 torch2cute_dtype_map = {

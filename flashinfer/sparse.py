@@ -625,9 +625,9 @@ class BlockSparseAttentionWrapper:
             Number of KV splits for the split-KV combine path, or ``"auto"`` to pick a
             split count from the sparsity heuristics. Only supported for the
             ``vsa_sm100_blk64`` backend; must be ``None`` for all other backends.
-            ``None`` (default) is equivalent to ``"auto"``, which selects the split
-            count automatically via a sparsity heuristic. Pass ``1`` explicitly to
-            disable splitting.
+            ``None`` (default) disables splitting, equivalent to passing ``1``
+            explicitly. Pass ``"auto"`` to select the split count automatically via
+            a sparsity heuristic.
         use_clc : Optional[bool]
             Override the SM100 blk64 scheduler: ``True`` forces the CLC persistent
             scheduler, ``False`` forces the static scheduler, ``None`` (default) uses

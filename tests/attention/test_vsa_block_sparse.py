@@ -865,29 +865,38 @@ def test_vsa_blk64_kv_splits(kv_splits, workspace):
 
 
 def test_sm100_blk64_kv_splits_from_count_thresholds():
-    """Lock the auto-kv_splits heuristic's active-KV-block thresholds (256/450/900).
+    """Lock the auto-kv_splits heuristic's active-KV-block threshold (3500).
 
-    Pure Python logic, no GPU/quack dependency -- documents the boundaries
-    that test_vsa_blk64_auto_kv_splits_large_topk below exercises end-to-end.
+    Retuned from the original 256/450/900 tiers after measuring on B200
+    that those tiers regressed vs. kv_splits=1 (see
+    sm100_blk64_kv_splits_from_count's docstring). Pure Python logic, no
+    GPU/quack dependency -- documents the boundary that
+    test_vsa_blk64_auto_kv_splits_large_topk below exercises end-to-end.
     """
     from flashinfer.cute_dsl.sparse.sm100_blk64.dispatch_helpers import (
         sm100_blk64_kv_splits_from_count,
     )
 
-    assert sm100_blk64_kv_splits_from_count(255) == 1
-    assert sm100_blk64_kv_splits_from_count(256) == 2
-    assert sm100_blk64_kv_splits_from_count(449) == 2
-    assert sm100_blk64_kv_splits_from_count(450) == 4
-    assert sm100_blk64_kv_splits_from_count(899) == 4
-    assert sm100_blk64_kv_splits_from_count(900) == 8
+    assert sm100_blk64_kv_splits_from_count(3499) == 1
+    assert sm100_blk64_kv_splits_from_count(3500) == 8
 
 
 @_requires_sm100_or_sm103
 def test_vsa_blk64_auto_kv_splits_large_topk(workspace):
     """kv_splits="auto" must actually resolve to >1 once top-k reaches the
-    sm100_blk64_kv_splits_from_count threshold (256), not just accuracy-pass
+    sm100_blk64_kv_splits_from_count threshold (3500), not just accuracy-pass
     at the small top-k used by test_vsa_blk64_kv_splits (where "auto"
     trivially resolves to 1 and never exercises the split-KV/combine path).
+
+    The threshold was retuned from 256 to 3500 after B200 measurements
+    showed splitting at 256 active blocks regressed ~2.2x vs. kv_splits=1
+    for this exact (MB=1, num_heads=4) shape -- see
+    sm100_blk64_kv_splits_from_count's docstring. This test's shape (NB=4096,
+    density=0.9 -> 3686 active blocks) sits solidly inside the range
+    measured to give a consistent 4-6x speedup, and total_q_tiles=4 stays
+    well under the separate total_q_tiles>=512 gate in
+    sm100_blk64_auto_kv_splits, so it still exercises the
+    sm100_blk64_kv_splits_from_count path (not the large-Q gate).
     """
     from unittest.mock import patch
 
@@ -897,11 +906,11 @@ def test_vsa_blk64_auto_kv_splits_large_topk(workspace):
     torch.manual_seed(15)
     dtype = torch.bfloat16
     num_heads = 4
-    # MB=1, NB=512 (N=32768) at density=0.5 -> exactly 256 active KV blocks
-    # for the single Q-block row, matching the >= 256 auto-split threshold.
-    MB64, NB64 = 1, 512
+    # MB=1, NB=4096 at density=0.9 -> exactly 3686 active KV blocks for the
+    # single Q-block row, comfortably past the >= 3500 auto-split threshold.
+    MB64, NB64 = 1, 4096
     M, N = MB64 * R64, NB64 * R64
-    density = 0.5
+    density = 0.9
 
     q = torch.randn(M, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
     k = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
@@ -909,8 +918,8 @@ def test_vsa_blk64_auto_kv_splits_large_topk(workspace):
 
     indptr, indices = _build_random_bsr(MB64, NB64, density, device)
     active_blocks = int(indptr[1].item())
-    assert active_blocks == 256, (
-        f"expected exactly 256 active KV blocks for the single Q row, got {active_blocks}"
+    assert active_blocks == 3686, (
+        f"expected exactly 3686 active KV blocks for the single Q row, got {active_blocks}"
     )
     o_ref = _pytorch_ref(q, k, v, indptr, indices, R64, C64)
 
@@ -932,8 +941,10 @@ def test_vsa_blk64_auto_kv_splits_large_topk(workspace):
     original_resolve = _blk64_mod.resolve_sm100_blk64_split_workspace
     resolved = {}
 
-    def _spy(q_bhsd, value_dim, kv_splits_i, allow_fallback):
-        result = original_resolve(q_bhsd, value_dim, kv_splits_i, allow_fallback)
+    def _spy(q_bhsd, value_dim, kv_splits_i, allow_fallback, output_dtype):
+        result = original_resolve(
+            q_bhsd, value_dim, kv_splits_i, allow_fallback, output_dtype
+        )
         resolved["kv_splits_i"] = result
         return result
 
@@ -943,7 +954,7 @@ def test_vsa_blk64_auto_kv_splits_large_topk(workspace):
         o = wrapper.run(q, k, v)
 
     assert resolved.get("kv_splits_i", 1) > 1, (
-        "expected kv_splits='auto' to resolve to >1 at top-k=256 "
+        "expected kv_splits='auto' to resolve to >1 at top-k=3686 "
         f"(sm100_blk64_kv_splits_from_count threshold), got {resolved}"
     )
     torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
