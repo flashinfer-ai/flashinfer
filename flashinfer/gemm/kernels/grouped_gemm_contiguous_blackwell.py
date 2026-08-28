@@ -108,7 +108,7 @@ Matrix A/C Memory Layout Diagrams:
     |<-        ValidM           ->|
    ```
    Note: the Group(L) dimension will be flatted into M dimension, and the rest Group(L) size is 1.
-         each ValidM will be aligned to 128.
+         Internal group boundaries are aligned to 128 rows; the final group may end in a partial tile.
 
 This GEMM kernel supports the following features:
     - Utilizes Tensor Memory Access (TMA) for efficient memory operations

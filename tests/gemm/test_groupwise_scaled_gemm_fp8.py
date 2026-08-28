@@ -321,8 +321,9 @@ def test_fp8_groupwise_group_deepgemm(
     torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
 
 
-@pytest.mark.parametrize("n,k", [(256, 128), (256, 4096)])
-def test_fp8_groupwise_group_cute_dsl_current_stream(n, k):
+def _assert_fp8_groupwise_group_cute_dsl(
+    group_counts, n, k, use_non_default_stream=False
+):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability not in [(10, 0), (10, 3)]:
         pytest.skip("The contiguous grouped CuTe-DSL kernel requires SM100 or SM103")
@@ -330,7 +331,7 @@ def test_fp8_groupwise_group_cute_dsl_current_stream(n, k):
         pytest.skip("nvidia-cutlass-dsl is not available")
 
     torch.random.manual_seed(0)
-    group_counts = torch.tensor([128, 256, 128, 256], device="cuda")
+    group_counts = torch.tensor(group_counts, device="cuda")
     group_size = group_counts.numel()
     m = int(group_counts.sum())
 
@@ -355,8 +356,13 @@ def test_fp8_groupwise_group_cute_dsl_current_stream(n, k):
         ).to(torch.bfloat16)
         row_start = row_end
 
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream):
+    if use_non_default_stream:
+        stream = torch.cuda.Stream()
+        stream_context = torch.cuda.stream(stream)
+    else:
+        stream = torch.cuda.current_stream()
+        stream_context = torch.cuda.stream(stream)
+    with stream_context:
         out = group_deepgemm_fp8_nt_groupwise(
             a_fp8,
             b_fp8,
@@ -368,6 +374,28 @@ def test_fp8_groupwise_group_cute_dsl_current_stream(n, k):
     stream.synchronize()
 
     torch.testing.assert_close(out, ref, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("n,k", [(256, 128), (256, 4096)])
+def test_fp8_groupwise_group_cute_dsl_current_stream(n, k):
+    _assert_fp8_groupwise_group_cute_dsl(
+        [128, 256, 128, 256], n, k, use_non_default_stream=True
+    )
+
+
+@pytest.mark.parametrize(
+    "group_counts,n,k",
+    [
+        ([1], 128, 128),
+        ([64], 256, 384),
+        ([128, 1], 384, 1024),
+        ([128, 64], 128, 128),
+        ([0, 128, 1], 256, 384),
+        ([128, 128, 1, 0], 256, 1024),
+    ],
+)
+def test_fp8_groupwise_group_cute_dsl_partial_final_m(group_counts, n, k):
+    _assert_fp8_groupwise_group_cute_dsl(group_counts, n, k)
 
 
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])

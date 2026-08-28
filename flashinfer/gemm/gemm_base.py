@@ -8945,7 +8945,7 @@ def _check_group_deepgemm_fp8_nt_groupwise_cute_dsl(
     num_groups, n, _ = b.shape
     if min(m, n, k, num_groups) <= 0:
         raise ValueError("m, n, k, and the number of groups must be positive")
-    for dim_name, dim_value in (("m", m), ("n", n), ("k", k)):
+    for dim_name, dim_value in (("n", n), ("k", k)):
         if dim_value % 128 != 0:
             raise ValueError(
                 f"The cute_dsl backend requires {dim_name} to be a multiple "
@@ -9100,8 +9100,11 @@ def group_deepgemm_fp8_nt_groupwise(
     - This function requires NVIDIA Blackwell (SM100) architecture
     - The scaling factors should be generated using appropriate quantization functions
       like ``per_token_cast_to_fp8`` for `a` and ``per_block_cast_to_fp8`` for `b`
-    - The ``cute_dsl`` backend requires M, N, and K to be multiples of 128
-    - For ``cute_dsl``, expert rows must be sorted and each expert boundary padded to 128 rows
+    - The ``cute_dsl`` backend requires N and K to be multiples of 128; M may end
+      with a partial 128-row tile
+    - For ``cute_dsl``, expert rows must be sorted and every internal expert
+      boundary must be aligned to 128 rows. The final non-empty expert may have
+      an unpadded row count
     - All input tensors must be on the same CUDA device
     - The block size for scaling is determined by the ``scale_granularity_mnk`` parameter
     """
