@@ -50,6 +50,55 @@ class QuantMode(IntEnum):
     MXINT4_BF16_BF16 = 8
 
 
+class RecordingTuner:
+    """Minimal stage tuner used by unified-MoE factorization tests."""
+
+    def __init__(self):
+        self.calls = []
+
+    def rank_tactics(self, custom_op, runners, tuning_config, inputs, k=1, **kwargs):
+        del tuning_config, kwargs
+        self.calls.append((custom_op, k))
+        return runners[0].get_valid_tactics(inputs, None)[:k]
+
+
+def compute_reference_moe(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation_type: ActivationType,
+) -> torch.Tensor:
+    """Torch reference for pre-routed BF16-activation MoE execution."""
+    num_tokens, hidden_size = hidden_states.shape
+    intermediate_size = w2.shape[2]
+    result = torch.zeros(
+        num_tokens, hidden_size, dtype=torch.float32, device=hidden_states.device
+    )
+    for expert_id in range(w1.shape[0]):
+        token_ids, slots = torch.where(topk_ids == expert_id)
+        if token_ids.numel() == 0:
+            continue
+        gemm1 = (hidden_states[token_ids].float() @ w1[expert_id].float().T).to(
+            torch.bfloat16
+        )
+        if activation_type is ActivationType.Swiglu:
+            up, gate = gemm1.split(intermediate_size, dim=-1)
+            intermediate = (F.silu(gate.float()) * up.float()).to(torch.bfloat16)
+        elif activation_type is ActivationType.Relu2:
+            intermediate = F.relu(gemm1.float()).square().to(torch.bfloat16)
+        else:
+            raise ValueError(f"unsupported reference activation {activation_type!r}")
+        expert_output = (intermediate @ w2[expert_id].T).float()
+        result.index_add_(
+            0,
+            token_ids,
+            expert_output * topk_weights[token_ids, slots, None],
+        )
+    return result.to(torch.bfloat16)
+
+
 @contextmanager
 def nvfp4_4over6_env(use_4over6: bool):
     original_value = os.environ.get("FLASHINFER_NVFP4_4OVER6", None)

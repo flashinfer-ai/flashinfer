@@ -130,8 +130,11 @@ class MoELayer:
                 continue  # MVP scope — skip non-MVP backends silently
             if config.quant.variant not in runner_cls.supported_quant_variants:
                 continue
-            runner = runner_cls(config, device=self.device)
             try:
+                # Construction is inside the guard because a runner may reject an
+                # unsupported config while binding backend resources; letting that
+                # escape would abort selection instead of skipping the backend.
+                runner = runner_cls(config, device=self.device)
                 runner.check_support()
             except (NotImplementedError, ValueError, RuntimeError):
                 continue

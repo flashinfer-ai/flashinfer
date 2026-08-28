@@ -25,7 +25,7 @@ import torch
 from ...cutile.cutile_common import cached_replace_hints
 from ...tllm_enums import ActivationType
 from ...utils import next_positive_power_of_2
-from .activation import _apply_activation, launch_activation
+from .activation import _apply_activation, _validate_activation, launch_activation
 from .moe import (
     GemmConfig,
     Workspace as Bf16Workspace,
@@ -46,6 +46,7 @@ _SORT_INPUT_SMALL_I_MIN_ASSIGNMENTS = 65536
 _PERSISTENT_CTAS_PER_SM = 2
 _PERSISTENT_MIN_ASSIGNMENTS = 65536
 _PERSISTENT_MAX_K = 1024
+_SEPARATE_ACTIVATION_MAX_ASSIGNMENTS = 64
 
 
 def _use_row_major_scale_layout(num_assignments: int, intermediate_size: int) -> bool:
@@ -100,7 +101,12 @@ def allocate_workspace(
         top_k=top_k,
         is_gated=is_gated,
         block_sizes=block_sizes,
-        allocate_activation_output=is_gated and num_tokens * top_k <= 64,
+        # Hybrid buckets can be almost 2x the runtime token count. Keep the
+        # small gated-activation buffer whenever this bucket can contain a
+        # launch with fewer than 64 assignments.
+        allocate_activation_output=(
+            is_gated and num_tokens * top_k < 2 * _SEPARATE_ACTIVATION_MAX_ASSIGNMENTS
+        ),
         device=device,
     )
     input_rows = ((num_tokens + 127) // 128) * 128
@@ -178,14 +184,13 @@ def allocate_workspace(
 
 def _encode_nvfp4_groups(
     groups,
-    global_scale: float,
     tile_m: ConstInt,
     tile_k: ConstInt,
 ):
     amax = ct.max(ct.abs(groups), axis=2)
-    scale = ct.astype(amax * (global_scale / 6.0), ct.float8_e4m3fn)
+    scale = ct.astype(amax / 6.0, ct.float8_e4m3fn)
     dequant_scale = ct.maximum(ct.astype(scale, ct.float32), _E4M3_TINY)
-    values = groups * global_scale / ct.expand_dims(dequant_scale, axis=2)
+    values = groups / ct.expand_dims(dequant_scale, axis=2)
     magnitude = ct.abs(values)
     u8 = ct.uint8
     codes = (
@@ -209,7 +214,6 @@ def _quantize_nvfp4(
     X,
     Q,
     SCALE,
-    global_scale: float,
     K: ConstInt,
     TILE_M: ConstInt,
     TILE_K: ConstInt,
@@ -228,7 +232,7 @@ def _quantize_nvfp4(
         ct.astype(x, ct.float32),
         (TILE_M, groups_per_tile, _NVFP4_BLOCK_SIZE),
     )
-    packed, scale = _encode_nvfp4_groups(groups, global_scale, TILE_M, TILE_K)
+    packed, scale = _encode_nvfp4_groups(groups, TILE_M, TILE_K)
     ct.store(Q, index=(row_block, k_block), tile=packed)
     if SCALE_ROW_MAJOR:
         ct.store(SCALE, index=(row_block, k_block), tile=scale)
@@ -283,7 +287,7 @@ def _activation_quantize_nvfp4(
         ct.astype(ct.astype(values, X.dtype), ct.float32),
         (TILE_M, groups_per_tile, _NVFP4_BLOCK_SIZE),
     )
-    packed, scale = _encode_nvfp4_groups(groups, 1.0, TILE_M, TILE_I)
+    packed, scale = _encode_nvfp4_groups(groups, TILE_M, TILE_I)
     ct.store(Q, index=(row_block, i_block), tile=packed)
     if SCALE_ROW_MAJOR:
         ct.store(SCALE, index=(row_block, i_block), tile=scale)
@@ -343,7 +347,6 @@ def _quantize(
     q: torch.Tensor,
     scale: torch.Tensor,
     *,
-    global_scale: float = 1.0,
     scale_row_major: bool = False,
 ) -> None:
     rows, k = x.shape
@@ -376,7 +379,7 @@ def _quantize(
         torch.cuda.current_stream(x.device),
         (((rows + tile_m - 1) // tile_m), k // tile_k),
         kernel,
-        (x, q, scale, global_scale, k, tile_m, tile_k, scale_row_major),
+        (x, q, scale, k, tile_m, tile_k, scale_row_major),
     )
 
 
@@ -477,6 +480,7 @@ def _launch_activation_quantize(
     occupancy: int = 2,
     scale_row_major: bool = False,
 ) -> None:
+    activation_type = _validate_activation(activation_type)
     intermediate_size = q.shape[1] * 2
     expected_input_size = intermediate_size * (2 if activation_type.is_gated else 1)
     if x.ndim != 2 or x.shape[1] != expected_input_size:
@@ -544,8 +548,11 @@ def _launch_unfused_activation_quantize(
     num_assignments: int,
     num_sms: int,
 ) -> None:
-    if activation_type.is_gated and num_assignments < 64:
-        if workspace.activation_out is None:
+    if (
+        activation_type.is_gated
+        and num_assignments < _SEPARATE_ACTIVATION_MAX_ASSIGNMENTS
+    ):
+        if workspace.activation_out.numel() == 0:
             raise RuntimeError("W4A4 workspace is missing the activation buffer.")
         activation_out = workspace.activation_out[:num_assignments]
         launch_activation(gemm1_out, activation_out, activation_type)
@@ -1002,7 +1009,7 @@ def _grouped_gemm1_w4a4_fused(
                 ct.astype(ct.astype(values, ct.bfloat16), ct.float32),
                 (TILE_M, groups_per_output_tile, _NVFP4_BLOCK_SIZE),
             )
-            packed, scale = _encode_nvfp4_groups(groups, 1.0, TILE_M, TILE_I)
+            packed, scale = _encode_nvfp4_groups(groups, TILE_M, TILE_I)
             output_rows = m_offsets if OUTPUT_SORTED else slots
             ct.scatter(
                 OUT_Q,
@@ -1122,6 +1129,7 @@ def _can_fuse_gemm1(
     activation_type: ActivationType,
     config: GemmConfig,
 ) -> bool:
+    activation_type = _validate_activation(activation_type)
     tile_i = config.tile_n // 2 if activation_type.is_gated else config.tile_n
     return (
         tile_i >= 128

@@ -296,6 +296,7 @@ _CUTLASS_W4A16_ARCHS = (90,)
 
 _CUTILE_BF16_ARCHS = (89, 90, 120, 121)
 _CUTILE_NVFP4_ARCHS = (120, 121)
+_CUTILE_SUPPORTED_ACTIVATIONS = (ActivationType.Swiglu, ActivationType.Relu2)
 
 
 @dataclass(frozen=True)

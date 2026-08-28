@@ -35,6 +35,7 @@ from .api import (
     _CUTLASS_W4A16_ARCHS,
     _CUTILE_BF16_ARCHS,
     _CUTILE_NVFP4_ARCHS,
+    _CUTILE_SUPPORTED_ACTIVATIONS,
     ActivationType,
     MoEActivationPack,
     MoEConfig,
@@ -1098,9 +1099,13 @@ class CuTileBf16Runner(MoERunner):
     backend_key = "cutile_bf16"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.BF16,)
+    supports_expert_parallelism = False
     _block_sizes: ClassVar[tuple[int, ...]] = (32, 64, 128)
     _default_block_size: ClassVar[int] = 32
     _num_top_tactics_per_stage: ClassVar[int] = 2
+    _supported_archs: ClassVar[tuple[int, ...]] = _CUTILE_BF16_ARCHS
+    _precision_name: ClassVar[str] = "BF16"
+    _gemm_heuristic_version: ClassVar[int] = _CUTILE_BF16_GEMM_HEURISTIC_VERSION
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -1124,10 +1129,7 @@ class CuTileBf16Runner(MoERunner):
 
     def _check_support(self) -> None:
         super()._check_support()
-        if self.config.activation.type not in (
-            ActivationType.Swiglu,
-            ActivationType.Relu2,
-        ):
+        if self.config.activation.type not in _CUTILE_SUPPORTED_ACTIVATIONS:
             raise NotImplementedError(
                 f"{type(self).__name__} supports only the Swiglu or Relu2 activation."
             )
@@ -1139,18 +1141,10 @@ class CuTileBf16Runner(MoERunner):
             raise NotImplementedError(
                 f"{type(self).__name__} does not support PDL launches."
             )
-        experts = self.config.experts
-        local_num_experts = experts.local_num_experts or self.config.routing.num_experts
-        if experts.local_expert_offset != 0 or (
-            local_num_experts != self.config.routing.num_experts
-        ):
-            raise NotImplementedError(
-                f"{type(self).__name__} does not yet support expert parallelism."
-            )
-        if self._device_arch not in _CUTILE_BF16_ARCHS:
+        if self._device_arch not in self._supported_archs:
             raise RuntimeError(
                 f"{type(self).__name__} does not support SM{self._device_arch}; "
-                f"supported architectures are {_CUTILE_BF16_ARCHS}."
+                f"supported architectures are {self._supported_archs}."
             )
         from ..cutile import is_cuda_tile_available
 
@@ -1158,7 +1152,8 @@ class CuTileBf16Runner(MoERunner):
             available = is_cuda_tile_available()
         if not available:
             raise RuntimeError(
-                "cuTile BF16 requires cuda-tile and a tileiras/NVRTC toolchain "
+                f"cuTile {self._precision_name} requires cuda-tile and a "
+                "tileiras/NVRTC toolchain "
                 f"that supports SM{self._device_arch}."
             )
 
@@ -1204,38 +1199,61 @@ class CuTileBf16Runner(MoERunner):
             self._workspace_cache[key] = workspace
         self._workspace = workspace
 
-    def _gemm_configs(self, k_in: int, n: int) -> list[tuple[int, int, int]]:
-        # Compact search space ordered to preserve measured decode winners
-        # while still admitting shape fallbacks.
-        candidates = [
-            (128, 32, 4),
-            (128, 128, 1),
-            (128, 64, 1),
-            (64, 64, 4),
-        ]
-        if self._device_arch == 89:
-            candidates.extend(((256, 32, 2), (256, 32, 1)))
-        elif self._device_arch == 90:
-            candidates.extend(
-                (
-                    (256, 64, 2),
-                    (256, 32, 2),
-                    (256, 32, 1),
-                )
+    def _validate_inputs(self, act: MoEActivationPack) -> tuple[torch.Tensor, int, int]:
+        self._require_built()
+        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
+            raise NotImplementedError(
+                f"{type(self).__name__} supports only PackedPrecomputed routing."
             )
-        elif self._device_arch in (120, 121):
-            candidates.append((256, 32, 2))
-        configs = [
-            config
-            for config in candidates
-            if config[0] <= 2 * n and config[1] <= 2 * k_in
-        ]
-        if not configs:
+        hidden_states = act.hidden_states_q
+        if hidden_states.ndim != 2 or hidden_states.dtype is not torch.bfloat16:
+            raise TypeError(
+                f"{type(self).__name__} requires 2D BF16 hidden_states_q, got "
+                f"shape={tuple(hidden_states.shape)}, dtype={hidden_states.dtype}."
+            )
+        if hidden_states.device != self.device or not hidden_states.is_contiguous():
             raise ValueError(
-                f"{type(self).__name__}: no cuTile GEMM tile fits n={n}, "
-                f"k={k_in}; hidden_size and intermediate_size are too small."
+                f"{type(self).__name__} requires contiguous hidden states on "
+                f"{self.device}."
             )
-        return configs
+        if act.hidden_states_scale is not None:
+            raise ValueError(
+                f"{type(self).__name__} requires hidden_states_scale=None."
+            )
+        num_tokens, hidden_size = hidden_states.shape
+        if num_tokens == 0:
+            raise NotImplementedError(
+                f"{type(self).__name__} does not support zero tokens."
+            )
+        _validate_prerouted_inputs(
+            act,
+            num_tokens,
+            self.config.routing.top_k,
+            type(self).__name__,
+            allowed_weights_dtypes=(torch.float32,),
+            require_contiguous=True,
+        )
+        return hidden_states, num_tokens, hidden_size
+
+    def _configure_tuning(self, num_tokens: int, hidden_size: int) -> None:
+        bucket = map_to_hybrid_bucket(
+            num_tokens, self.config.execution.tune_max_num_tokens
+        )
+        self.tuning_config = TuningConfig(
+            dynamic_tensor_specs=(
+                DynamicTensorSpec(
+                    input_idx=(0, 1, 2, 3),
+                    dim_idx=(0, 0, 0, 0),
+                    gen_tuning_buckets=(bucket,),
+                    map_to_tuning_buckets=make_hybrid_bucket_mapper(
+                        self.config.execution.tune_max_num_tokens
+                    ),
+                ),
+            ),
+            use_cuda_graph=True,
+            inputs_pre_hook=self._prepare_tuning_inputs,
+        )
+        self._ensure_workspace(num_tokens, hidden_size)
 
     def _gemm_problem(
         self,
@@ -1344,15 +1362,6 @@ class CuTileBf16Runner(MoERunner):
         )
         return list(dict.fromkeys(tactics))
 
-    def _candidate_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
-        # Padding dominates while each expert receives few rows. The measured
-        # M32 -> M64 crossover differs by architecture; retain the adjacent M
-        # sizes around it so the end-to-end tuner still makes the final choice.
-        num_experts = self.config.routing.num_experts
-        rows_per_expert = (num_assignments + num_experts - 1) // num_experts
-        prefill_threshold = {89: 64, 90: 128, 120: 512, 121: 512}[self._device_arch]
-        return (32, 64) if rows_per_expert < prefill_threshold else (64, 128)
-
     def _candidate_non_gated_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
         num_experts = self.config.routing.num_experts
         rows_per_expert = (num_assignments + num_experts - 1) // num_experts
@@ -1371,70 +1380,6 @@ class CuTileBf16Runner(MoERunner):
             return (self._gated_block_size(num_assignments),)
         return self._candidate_non_gated_block_sizes(num_assignments)
 
-    def _candidate_gemm_pairs(
-        self, inputs: List[torch.Tensor]
-    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
-        hidden_size = inputs[1].shape[1]
-        intermediate_size = self.config.experts.intermediate_size
-        gemm1_output_size = intermediate_size * (
-            2 if self.config.activation.is_gated else 1
-        )
-        gemm1 = self._gemm_configs(hidden_size, gemm1_output_size)
-        gemm2 = self._gemm_configs(intermediate_size, hidden_size)
-
-        def choose(
-            config: tuple[int, int, int],
-            available: list[tuple[int, int, int]],
-            fallback: int,
-        ) -> tuple[int, int, int]:
-            return config if config in available else available[fallback]
-
-        g1_b0, g2_b0 = gemm1[0], gemm2[0]
-        g2_b1 = choose((128, 128, 1), gemm2, 0)
-        g1_b2 = choose((128, 64, 1), gemm1, 0)
-        g2_b2 = choose((128, 64, 1), gemm2, 0)
-        g1_b3 = choose((64, 64, 4), gemm1, 0)
-        g2_b3 = choose((64, 64, 4), gemm2, 0)
-
-        if self._device_arch == 89:
-            g1_w1 = choose((256, 32, 2), gemm1, 0)
-            g2_w1 = choose((256, 32, 2), gemm2, 0)
-            g1_w2 = choose((256, 32, 1), gemm1, 0)
-            g2_w2 = choose((256, 32, 1), gemm2, 0)
-            pairs = (
-                (g1_b0, g2_b2),
-                (g1_b0, g2_w2),
-                (g1_w1, g2_w2),
-                (g1_w2, g2_w1),
-                (g1_w2, g2_b2),
-                (g1_w1, g2_w1),
-            )
-        elif self._device_arch == 90:
-            g1_w64 = choose((256, 64, 2), gemm1, 0)
-            g2_w64 = choose((256, 64, 2), gemm2, 0)
-            g1_w32 = choose((256, 32, 1), gemm1, 0)
-            pairs = (
-                (g1_b0, g2_w64),
-                (g1_w32, g2_b0),
-                (g1_w32, g2_w64),
-                (g1_w64, g2_w64),
-                (g1_w64, g2_b1),
-                (g1_b0, g2_b0),
-            )
-        else:
-            g1_wide = choose((256, 32, 2), gemm1, 0)
-            g2_wide = choose((256, 32, 2), gemm2, 0)
-            pairs = (
-                (g1_b3, g2_b3),
-                (g1_wide, g2_b3),
-                (g1_b2, g2_wide),
-                (g1_b2, g2_b0),
-                (g1_b0, g2_b0),
-                (g1_wide, g2_wide),
-            )
-        # Shape filtering can collapse nominally different representatives.
-        return list(dict.fromkeys(pairs))
-
     def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
         self._require_built()
         if len(inputs) != 6:
@@ -1446,43 +1391,7 @@ class CuTileBf16Runner(MoERunner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
-        self._require_built()
-        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only PackedPrecomputed routing."
-            )
-        hidden_states = act.hidden_states_q
-        if hidden_states.ndim != 2 or hidden_states.dtype is not torch.bfloat16:
-            raise TypeError(
-                f"{type(self).__name__} requires 2D BF16 hidden_states_q, got "
-                f"shape={tuple(hidden_states.shape)}, dtype={hidden_states.dtype}."
-            )
-        if hidden_states.device != self.device:
-            raise ValueError(
-                f"hidden_states_q is on {hidden_states.device}, expected {self.device}."
-            )
-        if not hidden_states.is_contiguous():
-            raise ValueError(
-                f"{type(self).__name__} requires contiguous hidden states."
-            )
-        if act.hidden_states_scale is not None:
-            raise ValueError(
-                f"{type(self).__name__} activations do not use hidden_states_scale."
-            )
-
-        num_tokens, hidden_size = hidden_states.shape
-        if num_tokens == 0:
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support zero tokens."
-            )
-        _validate_prerouted_inputs(
-            act,
-            num_tokens,
-            self.config.routing.top_k,
-            type(self).__name__,
-            allowed_weights_dtypes=(torch.float32,),
-            require_contiguous=True,
-        )
+        hidden_states, num_tokens, hidden_size = self._validate_inputs(act)
         view = weights.get_view(self.backend_key)
         missing = [key for key in ("w1", "w2") if key not in view]
         if missing:
@@ -1512,24 +1421,7 @@ class CuTileBf16Runner(MoERunner):
         if not w1.is_contiguous() or not w2.is_contiguous():
             raise ValueError("cuTile BF16 prepared weights must be contiguous.")
 
-        bucket = map_to_hybrid_bucket(
-            num_tokens, self.config.execution.tune_max_num_tokens
-        )
-        self.tuning_config = TuningConfig(
-            dynamic_tensor_specs=(
-                DynamicTensorSpec(
-                    input_idx=(0, 1, 2, 3),
-                    dim_idx=(0, 0, 0, 0),
-                    gen_tuning_buckets=(bucket,),
-                    map_to_tuning_buckets=make_hybrid_bucket_mapper(
-                        self.config.execution.tune_max_num_tokens
-                    ),
-                ),
-            ),
-            use_cuda_graph=True,
-            inputs_pre_hook=self._prepare_tuning_inputs,
-        )
-        self._ensure_workspace(num_tokens, hidden_size)
+        self._configure_tuning(num_tokens, hidden_size)
         return [
             hidden_states.new_empty((num_tokens, hidden_size)),
             hidden_states,
@@ -1598,7 +1490,7 @@ class CuTileBf16Runner(MoERunner):
             self._device_arch,
             self._num_sms,
             self._block_sizes,
-            _CUTILE_BF16_GEMM_HEURISTIC_VERSION,
+            self._gemm_heuristic_version,
         )
 
 
@@ -1608,8 +1500,6 @@ class CuTileBf16Runner(MoERunner):
 
 
 _CUTILE_W4A4_GEMM_HEURISTIC_VERSION = 4
-_CUTILE_W4A4_SORT_INPUT_MIN_ASSIGNMENTS = 4096
-_CUTILE_W4A4_SORT_INPUT_SMALL_I_MIN_ASSIGNMENTS = 65536
 _CUTILE_W4A4_GATED_FUSION_MIN_ASSIGNMENTS = 64
 _CUTILE_W4A4_STAGE_MAX_CONFIGS = 9
 _CUTILE_W4A4_DEFAULT_GEMM_CONFIGS = (
@@ -1789,7 +1679,7 @@ def _rank_cutile_w4a4_gemm_configs(
 
 
 class _CuTileW4A4StageRunner(TunableRunner):
-    def __init__(self, parent: _CuTileNvfp4RunnerBase, stage: int, block_size: int):
+    def __init__(self, parent: CuTileNvfp4Runner, stage: int, block_size: int):
         self.parent = parent
         self.stage = stage
         self.block_size = block_size
@@ -2062,72 +1952,21 @@ class _CuTileW4A4StageRunner(TunableRunner):
         )
 
 
-class _CuTileNvfp4RunnerBase(CuTileBf16Runner):
-    """Shared implementation for the cuTile W4A4 NVFP4 runner."""
+class CuTileNvfp4Runner(CuTileBf16Runner):
+    """cuTile NVFP4 weights and inputs for both grouped GEMMs."""
 
-    supports_expert_parallelism = False
-    _supported_archs: ClassVar[tuple[int, ...]]
-
-    def _check_support(self) -> None:
-        MoERunner._check_support(self)
-        if self.config.activation.type not in (
-            ActivationType.Swiglu,
-            ActivationType.Relu2,
-        ):
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only the Swiglu or Relu2 activation."
-            )
-        if not self.config.finalize.do_finalize:
-            raise NotImplementedError(
-                f"{type(self).__name__} requires do_finalize=True."
-            )
-        if self.config.execution.enable_pdl is True:
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support PDL launches."
-            )
-        if self._device_arch not in self._supported_archs:
-            raise RuntimeError(
-                f"{type(self).__name__} does not support SM{self._device_arch}; "
-                f"supported architectures are {self._supported_archs}."
-            )
-        from ..cutile import is_cuda_tile_available
-
-        with torch.cuda.device(self.device):
-            available = is_cuda_tile_available()
-        if not available:
-            raise RuntimeError(
-                "cuTile NVFP4 requires cuda-tile and a tileiras/NVRTC toolchain "
-                f"that supports SM{self._device_arch}."
-            )
+    backend_key = "cutile_nvfp4"
+    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+    supported_quant_variants = (QuantVariant.NVFP4,)
+    _block_sizes = (16, 32, 64, 128)
+    _supported_archs = _CUTILE_NVFP4_ARCHS
+    _precision_name = "NVFP4"
+    _gemm_heuristic_version = _CUTILE_W4A4_GEMM_HEURISTIC_VERSION
 
     def _build(self) -> None:
         from .cutile import fp4
 
         self._kernel_module = fp4
-
-    def _ensure_workspace(self, num_tokens: int, hidden_size: int) -> None:
-        self._require_built()
-        ceiling = self.config.execution.tune_max_num_tokens
-        if num_tokens > ceiling:
-            raise ValueError(
-                f"num_tokens={num_tokens} exceeds tune_max_num_tokens={ceiling}."
-            )
-        capacity = map_to_hybrid_bucket(num_tokens, ceiling)
-        key = (capacity, hidden_size)
-        workspace = self._workspace_cache.get(key)
-        if workspace is None:
-            workspace = self._kernel_module.allocate_workspace(
-                num_tokens=capacity,
-                hidden_size=hidden_size,
-                intermediate_size=self.config.experts.intermediate_size,
-                num_experts=self.config.routing.num_experts,
-                top_k=self.config.routing.top_k,
-                is_gated=self.config.activation.is_gated,
-                block_sizes=self._block_sizes,
-                device=self.device,
-            )
-            self._workspace_cache[key] = workspace
-        self._workspace = workspace
 
     def _candidate_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
         num_experts = self.config.routing.num_experts
@@ -2164,10 +2003,9 @@ class _CuTileNvfp4RunnerBase(CuTileBf16Runner):
         else:
             raise ValueError(f"stage must be 1 or 2, got {stage}")
         num_assignments = inputs[2].numel()
-        input_sorted = num_assignments >= _CUTILE_W4A4_SORT_INPUT_MIN_ASSIGNMENTS and (
-            intermediate_size >= 1024
-            or num_assignments >= _CUTILE_W4A4_SORT_INPUT_SMALL_I_MIN_ASSIGNMENTS
-        )
+        from .cutile.fp4 import _use_row_major_scale_layout
+
+        input_sorted = _use_row_major_scale_layout(num_assignments, intermediate_size)
         return _CuTileW4A4GemmProblem(
             stage=stage,
             arch=self._device_arch,
@@ -2408,39 +2246,7 @@ class _CuTileNvfp4RunnerBase(CuTileBf16Runner):
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
-        self._require_built()
-        if act.routing_input_mode is not RoutingInputMode.PackedPrecomputed:
-            raise NotImplementedError(
-                f"{type(self).__name__} supports only PackedPrecomputed routing."
-            )
-        hidden_states = act.hidden_states_q
-        if hidden_states.ndim != 2 or hidden_states.dtype is not torch.bfloat16:
-            raise TypeError(
-                f"{type(self).__name__} requires 2D BF16 hidden_states_q, got "
-                f"shape={tuple(hidden_states.shape)}, dtype={hidden_states.dtype}."
-            )
-        if hidden_states.device != self.device or not hidden_states.is_contiguous():
-            raise ValueError(
-                f"{type(self).__name__} requires contiguous hidden states on {self.device}."
-            )
-        if act.hidden_states_scale is not None:
-            raise ValueError(
-                f"{type(self).__name__} quantizes activations internally; "
-                "hidden_states_scale must be None."
-            )
-        num_tokens, hidden_size = hidden_states.shape
-        if num_tokens == 0:
-            raise NotImplementedError(
-                f"{type(self).__name__} does not support zero tokens."
-            )
-        _validate_prerouted_inputs(
-            act,
-            num_tokens,
-            self.config.routing.top_k,
-            type(self).__name__,
-            allowed_weights_dtypes=(torch.float32,),
-            require_contiguous=True,
-        )
+        hidden_states, num_tokens, hidden_size = self._validate_inputs(act)
 
         view = weights.get_view(self.backend_key)
         required = (
@@ -2511,24 +2317,7 @@ class _CuTileNvfp4RunnerBase(CuTileBf16Runner):
         ):
             raise ValueError("cuTile NVFP4 prepared weights must be contiguous.")
 
-        bucket = map_to_hybrid_bucket(
-            num_tokens, self.config.execution.tune_max_num_tokens
-        )
-        self.tuning_config = TuningConfig(
-            dynamic_tensor_specs=(
-                DynamicTensorSpec(
-                    input_idx=(0, 1, 2, 3),
-                    dim_idx=(0, 0, 0, 0),
-                    gen_tuning_buckets=(bucket,),
-                    map_to_tuning_buckets=make_hybrid_bucket_mapper(
-                        self.config.execution.tune_max_num_tokens
-                    ),
-                ),
-            ),
-            use_cuda_graph=True,
-            inputs_pre_hook=self._prepare_tuning_inputs,
-        )
-        self._ensure_workspace(num_tokens, hidden_size)
+        self._configure_tuning(num_tokens, hidden_size)
         return [
             hidden_states.new_empty((num_tokens, hidden_size)),
             hidden_states,
@@ -2556,27 +2345,22 @@ class _CuTileNvfp4RunnerBase(CuTileBf16Runner):
             )
         if tactic == -1:
             tactic = self._w4a4_fallback_tactic(inputs)
-        if not isinstance(tactic, (tuple, list)) or len(tactic) not in (7, 8):
+        if not isinstance(tactic, (tuple, list)) or len(tactic) != 8:
             raise ValueError(
-                f"{type(self).__name__} tactic must be -1 or a seven- or "
-                "eight-integer tuple."
+                f"{type(self).__name__} tactic must be -1 or an eight-integer tuple."
             )
-        fuse_gemm1 = None
-        if len(tactic) == 8:
-            (
-                block_size,
-                fuse_gemm1,
-                g1_n,
-                g1_k,
-                g1_occ,
-                g2_n,
-                g2_k,
-                g2_occ,
-            ) = map(int, tactic)
-            if fuse_gemm1 not in (0, 1):
-                raise ValueError("cuTile NVFP4 GEMM1 fusion flag must be 0 or 1.")
-        else:
-            block_size, g1_n, g1_k, g1_occ, g2_n, g2_k, g2_occ = map(int, tactic)
+        (
+            block_size,
+            fuse_gemm1,
+            g1_n,
+            g1_k,
+            g1_occ,
+            g2_n,
+            g2_k,
+            g2_occ,
+        ) = map(int, tactic)
+        if fuse_gemm1 not in (0, 1):
+            raise ValueError("cuTile NVFP4 GEMM1 fusion flag must be 0 or 1.")
         if block_size not in self._block_sizes:
             raise ValueError(
                 f"cuTile NVFP4 block size must be one of {self._block_sizes}, "
@@ -2597,22 +2381,12 @@ class _CuTileNvfp4RunnerBase(CuTileBf16Runner):
             inputs[0],
             self._workspace,
             activation_type=self.config.activation.type,
-            fuse_gemm1=None if fuse_gemm1 is None else bool(fuse_gemm1),
+            fuse_gemm1=bool(fuse_gemm1),
             num_sms=self._num_sms,
             block_size=block_size,
             gemm1_config=self._kernel_module.GemmConfig(g1_n, g1_k, g1_occ),
             gemm2_config=self._kernel_module.GemmConfig(g2_n, g2_k, g2_occ),
         )
-
-
-class CuTileNvfp4Runner(_CuTileNvfp4RunnerBase):
-    """cuTile NVFP4 weights and inputs for both grouped GEMMs."""
-
-    backend_key = "cutile_nvfp4"
-    supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
-    supported_quant_variants = (QuantVariant.NVFP4,)
-    _block_sizes = (16, 32, 64, 128)
-    _supported_archs = _CUTILE_NVFP4_ARCHS
 
 
 # ---------------------------------------------------------------------------

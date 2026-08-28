@@ -23,24 +23,29 @@ import torch
 
 from ...tllm_enums import ActivationType
 from ...utils import next_positive_power_of_2
+from ..api import _CUTILE_SUPPORTED_ACTIVATIONS
 
 ConstInt: TypeAlias = ct.Constant[int]
 
 _SWIGLU = int(ActivationType.Swiglu)
 _RELU2 = int(ActivationType.Relu2)
-SUPPORTED_ACTIVATIONS = (ActivationType.Swiglu, ActivationType.Relu2)
 
 
 def _apply_activation(x, activation_type: ConstInt):
     """Apply activation math in FP32; ``activation_type`` is compile-time."""
     if activation_type == _SWIGLU:
         return x / (1.0 + ct.exp(-x))
-    elif activation_type == _RELU2:
-        relu = ct.maximum(x, 0.0)
-        return relu * relu
-    else:
-        # Unsupported codes are rejected by launch_activation before tracing.
-        return x
+    relu = ct.maximum(x, 0.0)
+    return relu * relu
+
+
+def _validate_activation(activation_type: ActivationType) -> ActivationType:
+    activation_type = ActivationType(activation_type)
+    if activation_type not in _CUTILE_SUPPORTED_ACTIVATIONS:
+        raise NotImplementedError(
+            f"cuTile MoE does not support activation {activation_type!r}."
+        )
+    return activation_type
 
 
 @ct.kernel
@@ -105,11 +110,7 @@ def launch_activation(
     activation_type: ActivationType,
 ) -> None:
     """Launch a gated or plain MoE activation into caller-owned storage."""
-    activation_type = ActivationType(activation_type)
-    if activation_type not in SUPPORTED_ACTIVATIONS:
-        raise NotImplementedError(
-            f"cuTile MoE does not support activation {activation_type!r}."
-        )
+    activation_type = _validate_activation(activation_type)
     if x.ndim != 2 or output.ndim != 2 or x.shape[0] != output.shape[0]:
         raise ValueError(
             "cuTile MoE activation expects 2D input/output with matching rows."
@@ -141,4 +142,4 @@ def launch_activation(
     )
 
 
-__all__ = ["SUPPORTED_ACTIVATIONS", "launch_activation"]
+__all__ = ["launch_activation"]

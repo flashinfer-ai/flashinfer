@@ -36,7 +36,7 @@ import torch
 from ...cutile.cutile_common import cached_replace_hints
 from ...tllm_enums import ActivationType
 from ...utils import next_positive_power_of_2
-from .activation import _apply_activation, launch_activation
+from .activation import _apply_activation, _validate_activation, launch_activation
 
 ConstInt: TypeAlias = ct.Constant[int]
 
@@ -690,6 +690,8 @@ def _grouped_gemm(
     config: GemmConfig,
     activation_type: ActivationType | None = None,
 ) -> None:
+    if activation_type is not None:
+        activation_type = _validate_activation(activation_type)
     num_assignment_rows = output.shape[0]
     n = output.shape[1]
     m_blocks = (sorted_slots.shape[0] + block_size - 1) // block_size
