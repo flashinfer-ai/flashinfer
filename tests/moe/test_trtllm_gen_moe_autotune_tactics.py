@@ -321,6 +321,7 @@ def _enumerate_valid_tactics(
     num_experts: int,
     num_tokens: int,
     use_per_token_scaling: bool = False,
+    gemm2_use_per_token_scaling: bool | None = None,
     activation_type: ActivationType = ActivationType.Swiglu,
 ) -> list[list[int]]:
     """Enumerate every (tile_N, config) tactic the autotuner may select for
@@ -328,6 +329,10 @@ def _enumerate_valid_tactics(
     from flashinfer.tllm_enums import Fp8QuantizationType
 
     cfg = _quant_mode_config(quant_mode)
+    if gemm2_use_per_token_scaling is None:
+        gemm2_use_per_token_scaling = (
+            quant_mode == "NvFP4xNvFP4" and use_per_token_scaling
+        )
     return list(
         moe_op.trtllm_get_valid_moe_configs(
             cfg["dtype_act"],
@@ -341,6 +346,7 @@ def _enumerate_valid_tactics(
             True,  # use_shuffled_weight
             WeightLayout.MajorK.value,
             use_per_token_scaling,
+            gemm2_use_per_token_scaling,
             num_tokens,
             False,  # has_gemm1_lora_delta
         )
@@ -405,6 +411,7 @@ def test_nvfp4_per_token_all_tactics_are_correct(
                     use_4over6=True,
                     weights_use_4over6=True,
                     activation_type=activation_type,
+                    gemm2_use_per_token_scaling=True,
                 )
         except Exception as err:
             raise AssertionError(
@@ -412,6 +419,27 @@ def test_nvfp4_per_token_all_tactics_are_correct(
                 f"for {activation_type.name}"
             ) from err
         torch.cuda.empty_cache()
+
+
+def test_nvfp4_static_gemm2_has_valid_tactics():
+    """Per-token FC1 with static-scale FC2 must select the BF16 staging path."""
+    if get_compute_capability(torch.device(device="cuda"))[0] not in [10]:
+        pytest.skip("Only work on SM100 / SM103.")
+
+    moe_op = gen_trtllm_gen_fused_moe_sm100_module().build_and_load()
+    valid_tactics = _enumerate_valid_tactics(
+        moe_op,
+        "NvFP4xNvFP4",
+        top_k=8,
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=128,
+        num_tokens=4096,
+        use_per_token_scaling=True,
+        gemm2_use_per_token_scaling=False,
+        activation_type=ActivationType.Relu2,
+    )
+    assert valid_tactics
 
 
 def test_nvfp4_per_tensor_small_shape_all_tactics_are_correct():
@@ -858,6 +886,7 @@ def _enumerate_fp8_valid_tactics(
             cfg["use_shuffled_weight"],
             cfg["weight_layout"],
             False,  # use_per_token_scaling
+            False,  # gemm2_use_per_token_scaling
             num_tokens,
             False,  # has_gemm1_lora_delta
         )

@@ -352,7 +352,8 @@ Runner::Runner(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, bool useDeepSeekFp8
       mUsePerChannelScalingGemm1(usePerChannelScalingGemm1),
       mUsePerChannelScalingGemm2(usePerChannelScalingGemm2),
       mPermuteGemm1(PermuteGemm1::Runner(
-          dtypeAct, dtypeWeights, usePerTokenScalingGemm2 ? btg::Dtype::Bfloat16 : dtypeAct,
+          dtypeAct, dtypeWeights,
+          dtypeAct == btg::Dtype::E2m1 && usePerTokenScalingGemm1 ? btg::Dtype::Bfloat16 : dtypeAct,
           useDeepSeekFp8, tileTokensDim, activationType, useShuffledMatrix, weightLayout,
           gemm1BiasType, usePerTokenScalingGemm1, usePerChannelScalingGemm1)),
       mGemm2(Gemm2::Runner(dtypeAct, dtypeWeights, btg::Dtype::Bfloat16, useDeepSeekFp8,
@@ -613,6 +614,28 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
         reinterpret_cast<uint8_t*>(workspace.activation_output),
         reinterpret_cast<uint8_t*>(workspace.activation_output_scale),
         reinterpret_cast<float*>(workspace.token_scales_fc2), sfLayout, stream);
+
+    gemm2_input = workspace.activation_output;
+    gemm2_input_scale = workspace.activation_output_scale;
+  } else if (mUsePerTokenScalingGemm1 && mGemm2.mDtypeAct == btg::Dtype::E2m1) {
+    FLASHINFER_CHECK(mPermuteGemm1.mDtypeOutput == btg::Dtype::Bfloat16,
+                     "Static-scale NVFP4 GEMM2 requires PermuteGemm1 to output Bfloat16.");
+    FLASHINFER_CHECK(workspace.activation_output != nullptr,
+                     "Static-scale NVFP4 GEMM2 requires an activation output buffer.");
+    FLASHINFER_CHECK(workspace.activation_output_scale != nullptr,
+                     "Static-scale NVFP4 GEMM2 requires an activation scale buffer.");
+
+    // The static GEMM2 input quantization scale is supplied through the GEMM1 output scalar.
+    // Generate only the per-block E4M3 factors here; no row-wise outer scale is calculated or
+    // passed to GEMM2.
+    auto sfLayout = mGemm2.mTileTokensDim >= 128 ? QuantizationSFLayout::SWIZZLED_128x4
+                                                 : QuantizationSFLayout::SWIZZLED_8x4;
+    invokeNvfp4QuantWithStaticScale<__nv_bfloat16>(
+        args.num_tokens * totalExpertsPerToken, args.intermediate_size,
+        reinterpret_cast<__nv_bfloat16 const*>(workspace.gemm1_output), 1.0f,
+        workspace.expanded_idx_to_permuted_idx,
+        reinterpret_cast<uint8_t*>(workspace.activation_output),
+        reinterpret_cast<uint8_t*>(workspace.activation_output_scale), sfLayout, stream);
 
     gemm2_input = workspace.activation_output;
     gemm2_input_scale = workspace.activation_output_scale;

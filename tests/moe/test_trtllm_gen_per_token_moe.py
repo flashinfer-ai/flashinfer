@@ -67,10 +67,11 @@ cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 @pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.parametrize("weights_use_4over6", [False, True])
 @pytest.mark.parametrize(
-    "activation_type",
+    "activation_type,gemm2_use_per_token_scaling",
     [
-        pytest.param(ActivationType.Swiglu, id="Swiglu"),
-        pytest.param(ActivationType.Relu2, id="Relu2"),
+        pytest.param(ActivationType.Swiglu, True, id="Swiglu-dynamic-fc2"),
+        pytest.param(ActivationType.Relu2, True, id="Relu2-dynamic-fc2"),
+        pytest.param(ActivationType.Relu2, False, id="Relu2-static-fc2"),
     ],
 )
 def test_routed_fused_moe(
@@ -82,6 +83,7 @@ def test_routed_fused_moe(
     use_4over6: bool,
     weights_use_4over6: bool,
     activation_type: ActivationType,
+    gemm2_use_per_token_scaling: bool,
 ):
     device = torch.device("cuda:0")
     compute_capability = get_compute_capability(torch.device(device="cuda"))
@@ -131,6 +133,9 @@ def test_routed_fused_moe(
     expert_weights = expert_weights.view(num_tokens, num_experts)[
         torch.arange(num_tokens).unsqueeze(1), topk_ids
     ].to(torch.bfloat16)
+    if not gemm2_use_per_token_scaling:
+        # Expert-choice routing marks inactive token/expert assignments with -1.
+        topk_ids[0, 0] = -1
 
     # ======== Quantize =======
     nvfp4_4over6_config = NVFP44Over6Config() if use_4over6 else None
@@ -302,16 +307,26 @@ def test_routed_fused_moe(
 
     # For a non-linear elementwise activation (Relu2) the kernel applies the gate scalar
     # *before* the activation and the c scalar *after*, so the dequantization factor must
-    # ride on the gate scalar only -- s * relu(x)^2 != relu(s * x)^2.  The c scalar then
-    # carries just the output quantization factor, which is 1 here because FC1 emits bf16
-    # under per-token scaling.  Gated activations take the dequant on both.
+    # ride on the gate scalar only -- s * relu(x)^2 != relu(s * x)^2. Static FC2 scales
+    # the BF16 activation before block quantization and compensates in the FC2 epilogue.
     # Mirrors scale_c_fc1 / scale_gate_fc1 in tests/moe/trtllm_gen_fused_moe_utils.py.
+    fc2_input_quant_scale = torch.tensor(
+        1.0 if gemm2_use_per_token_scaling else 1.0 / 16.0,
+        device=device,
+        dtype=torch.float32,
+    )
     output1_scale_scalar = torch.stack(
-        [w13_global_scale_inv if is_gated else torch.ones_like(w13_global_scale_inv)]
+        [
+            w13_global_scale_inv * fc2_input_quant_scale
+            if is_gated
+            else fc2_input_quant_scale
+        ]
         * num_experts
     )
     output1_scale_gate_scalar = torch.stack([w13_global_scale_inv] * num_experts)
-    output2_scale_scalar = torch.stack([w2_global_scale_inv] * num_experts)
+    output2_scale_scalar = torch.stack(
+        [w2_global_scale_inv / fc2_input_quant_scale] * num_experts
+    )
 
     packed_tensor = (topk_ids.to(torch.int32) << 16) | expert_weights.to(
         torch.bfloat16
@@ -352,6 +367,7 @@ def test_routed_fused_moe(
         activation_type.value,  # act_type
         per_token_scale_inv,
         None,
+        gemm2_use_per_token_scaling=gemm2_use_per_token_scaling,
     )
 
     from flashinfer.autotuner import autotune
