@@ -699,9 +699,9 @@ bs_paged_kv_indices = torch.cat(
         torch.zeros(1, dtype=torch.int32, device=device),
     )
 )
-bs_seq_lens_kv = torch.tensor(
-    [bs_Skv - bs_page_size // 2, bs_Skv], dtype=torch.int32, device=device
-)
+bs_seq_lens_kv = torch.full((bs_B,), bs_Skv, dtype=torch.int32, device=device)
+# Exercise a live length that does not fill its last page.
+bs_seq_lens_kv[0] = bs_Skv - bs_page_size // 2
 bs_k_cache = torch.randn(
     bs_num_pages,
     bs_H,
