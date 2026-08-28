@@ -295,6 +295,11 @@ class ModuleScopeImportFromVisitor(ast.NodeVisitor):
     def visit_If(self, node: ast.If) -> None:
         is_type_checking = (
             isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING"
+        ) or (
+            isinstance(node.test, ast.Attribute)
+            and isinstance(node.test.value, ast.Name)
+            and node.test.value.id == "typing"
+            and node.test.attr == "TYPE_CHECKING"
         )
         is_main_guard = (
             isinstance(node.test, ast.Compare)

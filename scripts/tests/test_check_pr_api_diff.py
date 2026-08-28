@@ -291,6 +291,18 @@ class ClassReexportIntegrationTest(unittest.TestCase):
                 ("public_api_removed",),
             ),
             (
+                "typing.TYPE_CHECKING-only re-export",
+                {
+                    "flashinfer/public.py": (
+                        "import typing\n\n"
+                        "if typing.TYPE_CHECKING:\n"
+                        "    from flashinfer.impl import Target as Exported\n"
+                    ),
+                    "flashinfer/impl.py": compatible_target,
+                },
+                ("public_api_removed",),
+            ),
+            (
                 "__main__-guarded re-export",
                 {
                     "flashinfer/public.py": (
