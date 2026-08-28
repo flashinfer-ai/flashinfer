@@ -1,0 +1,93 @@
+# Copyright (c) 2025 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Focused regression tests for the `radix_filter` top-k backend."""
+
+import pytest
+import torch
+
+import flashinfer
+from flashinfer.utils import get_compute_capability
+
+
+def _skip_unless_radix_filter(device: torch.device) -> None:
+    cc = get_compute_capability(device)
+    if cc[0] * 10 + cc[1] not in (100, 103, 107):
+        pytest.skip("radix_filter requires SM100/SM103/SM107")
+    if not flashinfer.top_k_varlen.is_backend_supported(
+        "radix_filter", cc[0] * 10 + cc[1]
+    ):
+        pytest.skip("radix_filter not supported in this environment")
+
+
+@pytest.mark.parametrize(
+    "dtype,N",
+    [
+        # Row stride (N * element_size) deliberately NOT a multiple of the
+        # kernel's 32-byte copy alignment, so successive rows start at varying
+        # misalignments and the scalar prologue spans up to 7 (fp32) or 15
+        # (fp16/bf16) elements.
+        (torch.float32, 101),
+        (torch.float16, 105),
+        (torch.bfloat16, 105),
+    ],
+)
+def test_short_misaligned_rows(dtype, N):
+    """Short misaligned rows must not scan past their valid length.
+
+    ``prologue_elems`` is derived from address alignment alone; on a row with
+    ``top_k < seq_len < prologue span`` an unclamped prologue reads elements
+    beyond ``seq_len`` into the coarse histogram, so indices past the row's
+    valid length can be emitted as top-k results (and the final row can read
+    past the allocation). Elements beyond each row's length are planted with a
+    large sentinel so any over-read is guaranteed to surface in the output
+    rather than depending on random values.
+
+    Regression for PR #4621 review (prologue clamp in every mode).
+    """
+    device = torch.device("cuda")
+    _skip_unless_radix_filter(device)
+
+    torch.manual_seed(7)
+    top_k = 4
+    # Lengths straddle the maximum possible prologue span, all > top_k so the
+    # trivial-case shortcut cannot mask the scan path. Kept at 5/6 so that for
+    # every tested (dtype, N) at least one row has prologue span > length
+    # (e.g. fp32/N=101: row 5 starts 4 bytes past a 32-byte boundary, giving a
+    # 7-element prologue against a 6-element row).
+    lens = [5, 6, 5, 6, 5, 6, 5, 6]
+    B = len(lens)
+    logits = torch.randn(B, N, dtype=dtype, device=device)
+    seq_lens = torch.tensor(lens, dtype=torch.int32, device=device)
+    # Sentinel: anything the kernel reads beyond a row's valid length would
+    # dominate the top-k and show up as an out-of-range index.
+    for b, n in enumerate(lens):
+        logits[b, n:] = 100.0
+
+    idx, vals = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, return_values=True, backend="radix_filter"
+    )
+    idx = idx.view(B, top_k)
+    vals = vals.view(B, top_k)
+
+    for b, n in enumerate(lens):
+        sel = idx[b][idx[b] >= 0]
+        assert sel.numel() == top_k, f"row {b}: expected {top_k} indices"
+        assert int(sel.max()) < n, (
+            f"row {b} (len={n}): index {int(sel.max())} beyond the valid "
+            f"length -- the prologue scanned past the row"
+        )
+        assert sel.unique().numel() == sel.numel()
+        ref = torch.topk(logits[b, :n].float(), top_k).values
+        got = torch.sort(vals[b].float(), descending=True).values
+        torch.testing.assert_close(got, ref, atol=1e-2, rtol=1e-2)

@@ -2582,21 +2582,26 @@ class FilteredTopKKernelVarlen:
 
         prologue_elems = cutlass.Int32(fix_bytes // elem_bytes)
 
-        # SP multi-CTA cluster mode: an empty chunk (chunk_start >= eff_len ->
-        # length <= 0) must scan NOTHING. Otherwise the prologue/left loops
-        # (bounded by alignment, not length) would read -inf padding past the
-        # row end and corrupt the DSMEM-merged histogram. Clamp so the total
-        # scanned == max(length, 0). Guarded under const_expr so single-CTA /
-        # 2-pass codegen is unchanged (there length > top_k in this branch).
-        if cutlass.const_expr(self.single_pass_multi_cta):
-            _len_nonneg = length
-            if _len_nonneg < 0:
-                _len_nonneg = cutlass.Int32(0)
-            if prologue_elems > _len_nonneg:
-                prologue_elems = _len_nonneg
-            remaining = _len_nonneg - prologue_elems
-        else:
-            remaining = length - prologue_elems
+        # Clamp so the total scanned == max(length, 0), in EVERY mode.
+        # prologue_elems is derived from address alignment alone, so on a short
+        # misaligned row (top_k < length < prologue span) the scalar prologue
+        # would otherwise scan past the row's valid length: out-of-range
+        # elements enter the coarse histogram (indices beyond `length` can be
+        # emitted as top-k results) and the final row can read past the
+        # allocation. The earlier `length > top_k` argument for the unclamped
+        # modes only bounds length below by top_k, not by the prologue span.
+        # SP multi-CTA additionally needs this for empty chunks (chunk_start >=
+        # eff_len -> length <= 0 must scan NOTHING, or the prologue/left loops
+        # read -inf padding and corrupt the DSMEM-merged histogram).
+        # DIVERGENCE FROM UPSTREAM: upstream gates this clamp under
+        # const_expr(single_pass_multi_cta); generalized here after review
+        # (flashinfer PR #4621). Two predicated ops in per-row setup code.
+        _len_nonneg = length
+        if _len_nonneg < 0:
+            _len_nonneg = cutlass.Int32(0)
+        if prologue_elems > _len_nonneg:
+            prologue_elems = _len_nonneg
+        remaining = _len_nonneg - prologue_elems
         aligned_size = (remaining // self.vec_size) * self.vec_size
         left_size = remaining - aligned_size
 
