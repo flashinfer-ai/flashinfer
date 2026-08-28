@@ -72,8 +72,9 @@ _MODEL_TYPE_GLM53_NOPE = 3
 _V32_MODEL_TYPES = frozenset(
     {_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE}
 )
-# swapAB is instantiated at topk=2048 only; GLM53_NOPE (topk=2176) is excluded.
-_SWAPAB_MODEL_TYPES = frozenset({_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA})
+# swapAB is instantiated for all V32 model types; GLM53_NOPE serves
+# topk=2176, the others topk=2048.
+_SWAPAB_MODEL_TYPES = _V32_MODEL_TYPES
 _BPT_DSV3_2 = 656
 _BPT_DSV4 = 584
 
@@ -148,9 +149,9 @@ _DECODE_DSV3_2_DISPATCH = frozenset(
 )
 
 # GLM-5.3 native NoPE decode: topk=2176 folds the 128-token indexer tail
-# into the 2048 sparse selection. (32, 2176) is the TP2 shape of the
-# 64-head model.
-_DECODE_GLM53_NOPE_DISPATCH = frozenset({(32, 2176)})
+# into the 2048 sparse selection. 64 heads is the TP1 shape; (32, 2176) is
+# the TP2 shape of the same model.
+_DECODE_GLM53_NOPE_DISPATCH = frozenset({(32, 2176), (64, 2176)})
 
 # Prefill instantiation envelope (single cache unless noted).
 # DSV3_2-family prefill topk (SG, MG, and swapAB); GLM53_NOPE serves 2176.
@@ -214,8 +215,7 @@ def decode_splitk_eligible(
 def prefill_swapab_eligible(
     model_type: int, num_heads: int, topk: int, page_block_size: int, has_extra: bool
 ) -> bool:
-    # GLM53_NOPE stays out of the swapAB envelope while swapAB is
-    # instantiated at topk=2048 only.
+    # Single-cache only; GLM53_NOPE is included at topk=2176.
     return (
         model_type in _SWAPAB_MODEL_TYPES
         and not has_extra
@@ -296,8 +296,8 @@ def _check_swapab_eligible(
         raise ValueError("prefill_impl='swapab' does not support dual-cache")
     if model_type not in _SWAPAB_MODEL_TYPES:
         raise ValueError(
-            "prefill_impl='swapab' requires the DSV3_2 family "
-            f"(d_qk=576); got family={_MODEL_TYPE_TO_FAMILY[model_type]!r}"
+            "prefill_impl='swapab' requires a V32-family model type "
+            f"(dsv3_2, glm_nsa, or glm53_nope); got family={_MODEL_TYPE_TO_FAMILY[model_type]!r}"
         )
     if topk != _V32_TOPK[model_type]:
         raise ValueError(

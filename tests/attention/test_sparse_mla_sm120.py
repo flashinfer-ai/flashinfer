@@ -1120,11 +1120,12 @@ def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_decode_glm53_nope() -> None:
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_sparse_mla_sm120_decode_glm53_nope(num_heads: int) -> None:
     torch.manual_seed(3)
     device = torch.device("cuda")
     d_qk = d_v = 512
-    num_tokens, num_heads, topk = 4, 32, 2176
+    num_tokens, topk = 4, 2176
     page_block_size = 64
     num_blocks = 64
     s_kv = num_blocks * page_block_size
@@ -1221,6 +1222,66 @@ def test_sparse_mla_sm120_prefill_glm53_nope() -> None:
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("num_heads", [64, 128])
+def test_sparse_mla_sm120_prefill_glm53_nope_swapab(num_heads: int) -> None:
+    """swapAB serves GLM53_NOPE at topk=2176; auto routes to it (bitwise)."""
+    torch.manual_seed(11)
+    device = torch.device("cuda")
+    d_qk = d_v = 512
+    num_tokens, topk = 128, 2176
+    page_block_size = 64
+    num_blocks = 128
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_glm53_nope(kv_bf16)
+    _assert_has_non_pow2_inline_scales(kv_packed)
+    kv_dequant = dequantize_kv_dsv3_2(kv_packed)[..., :d_qk]
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    results = {}
+    for impl in ("swapab", None):
+        output = torch.zeros(
+            (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+        )
+        out_lse = torch.zeros(
+            (num_tokens, num_heads), dtype=torch.float32, device=device
+        )
+        sparse_mla_sm120_paged_attention(
+            q,
+            kv_packed,
+            indices,
+            output,
+            out_lse,
+            sm_scale,
+            d_v=d_v,
+            kv_scale_format="arbitrary_fp32",
+            prefill_impl=impl,
+        )
+        torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+        results[impl] = (output, out_lse)
+
+    # The auto policy prefers swapAB at this eligible shape.
+    assert torch.equal(results["swapab"][0], results[None][0])
+    assert torch.equal(results["swapab"][1], results[None][1])
 
 
 _DSV4_PREFILL_CONFIGS = [
@@ -1950,7 +2011,7 @@ def test_sparse_mla_sm120_prefill_impl_swapab_rejects_dsv4() -> None:
     )
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
 
-    with pytest.raises(ValueError, match="DSV3_2 family"):
+    with pytest.raises(ValueError, match="V32-family"):
         sparse_mla_sm120_paged_attention(
             q,
             kv_packed,
@@ -2317,13 +2378,16 @@ _ENVELOPE_PROBES = [
     ("mg_dual", 0, 32, 128, 64, True),  # dual is DSV4-only
     ("mg_dual", 1, 32, 256, 64, True),  # dual topk must be 128
     ("mg_dual", 1, 32, 128, 64, False),  # requires the extra cache
-    # GLM53_NOPE: V32 family at topk=2176; swapAB-excluded.
+    # GLM53_NOPE: V32 family at topk=2176 (swapAB included).
     ("sg", 3, 8, 2176, 64, False),
     ("sg", 3, 16, 2048, 64, False),  # NOPE serves topk=2176 only
     ("mg", 3, 32, 2176, 64, False),
     ("mg", 3, 128, 2176, 64, False),
     ("mg", 3, 64, 2048, 64, False),
-    ("swapab", 3, 64, 2176, 64, False),  # swapAB is topk=2048-only
+    ("swapab", 3, 64, 2176, 64, False),
+    ("swapab", 3, 128, 2176, 64, False),
+    ("swapab", 3, 32, 2176, 64, False),  # H below swapAB
+    ("swapab", 3, 64, 2048, 64, False),  # NOPE serves topk=2176 only
     ("mg_dual", 3, 32, 128, 64, True),  # dual is DSV4-only
 ]
 

@@ -251,7 +251,8 @@ void launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cache, const int32_
   CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-// swapAB (warp specialized, 64 heads/CTA), DSV3_2 family, topk=2048 only.
+// swapAB (warp specialized, 64 heads/CTA), DSV3_2 family. GLM53_NOPE is
+// instantiated at its model topk=2176 as well.
 // swapAB takes no PBS template parameter (the KV stride is runtime), but the
 // envelope is pbs=64 like every other instantiation.
 template <ModelType MT>
@@ -260,9 +261,10 @@ inline bool dispatch_v32_swapab(int num_heads, int topk, int page_block_size, co
                                 bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                 size_t stride_kv_block, const int* topk_length_ptr,
                                 cudaStream_t stream) {
-  if (topk != 2048 || page_block_size != 64) return false;
+  constexpr int TOPK = MT == ModelType::GLM53_NOPE ? 2176 : 2048;
+  if (topk != TOPK || page_block_size != 64) return false;
 #define DISPATCH_DSV3_2_SWAPAB(NH)                                                          \
-  launch_prefill_swapab<MT, NH, 2048>(Q, KV, indices, attn_sink, output, out_lse, sm_scale, \
+  launch_prefill_swapab<MT, NH, TOPK>(Q, KV, indices, attn_sink, output, out_lse, sm_scale, \
                                       num_tokens, stride_kv_block, topk_length_ptr, stream)
 
   switch (num_heads) {
@@ -499,8 +501,7 @@ bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_h
                                  const float* attn_sink, const int* topk_length,
                                  const int* extra_topk_length, cudaStream_t stream) {
   // V32-family variants (swapAB/SG/MG) dispatch over the three V32 model
-  // types. GLM53_NOPE is swapAB-excluded for now: swapAB is instantiated at
-  // topk=2048 only, and GLM53_NOPE serves topk=2176.
+  // types. GLM53_NOPE is included at topk=2176; the other two serve topk=2048.
 #define DISPATCH_V32(fn)                                                                         \
   do {                                                                                           \
     switch (mt) {                                                                                \
@@ -523,19 +524,8 @@ bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_h
 
   switch (variant) {
     case PrefillVariant::SWAPAB: {
-      if (mt == ModelType::GLM53_NOPE || extra_KV_cache != nullptr) return false;
-      switch (mt) {
-        case ModelType::DSV3_2:
-          return dispatch_v32_swapab<ModelType::DSV3_2>(
-              num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink, output, out_lse,
-              sm_scale, num_tokens, stride_kv_block, topk_length, stream);
-        case ModelType::GLM_NSA:
-          return dispatch_v32_swapab<ModelType::GLM_NSA>(
-              num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink, output, out_lse,
-              sm_scale, num_tokens, stride_kv_block, topk_length, stream);
-        default:
-          return false;
-      }
+      if (extra_KV_cache != nullptr) return false;
+      DISPATCH_V32(dispatch_v32_swapab);
     }
     case PrefillVariant::SG: {
       if (extra_KV_cache != nullptr) return false;

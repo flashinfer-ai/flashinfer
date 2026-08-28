@@ -66,8 +66,8 @@ _SCHEMA_VERSION = 2
 # v1 files predate the crossover table: constants load, crossover counts as
 # absent and the runtime falls back to the default decode-first policy.
 _LOADABLE_SCHEMA_VERSIONS = (1, 2)
-_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656}
-_D_QK = {"dsv4": 512, "dsv3_2": 576}
+_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 656}
+_D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512}
 
 # Device-level key in the JSON payload holding the crossover table.
 _DECODE_MAX_TOKENS_KEY = "decode_max_tokens"
@@ -85,6 +85,20 @@ _MEASUREMENTS = (
     # Same split count as M4 at half the waves: breaks the (waves, s)
     # collinearity that makes the c0/beta split unidentifiable over M1..M4.
     (32, 128, 512, 1),
+)
+# glm53_nope decode is instantiated at topk=2176 only (N=34 chunks, fixed),
+# so M1/M2 isolate the bandwidth term by varying cpb (17 vs 33) at identical
+# waves and split count s=2 instead of varying N. The wide cpb gap keeps the
+# signal well above min-of-iters timing noise. M5 is the latency point.
+_MEASUREMENTS_GLM53_NOPE = (
+    (64, 64, 2176, 17),
+    (64, 64, 2176, 33),
+    (64, 64, 2176, 1),
+    (64, 32, 2176, 1),
+    (1, 32, 2176, 34),
+    # Half the waves of M3 at half the split count, keeping the (waves, s)
+    # rows non-proportional for the c0/beta lstsq.
+    (32, 64, 2176, 2),
 )
 
 _POOL_BYTES_TARGET = 2 << 30  # >> L2, so calibration traffic is HBM-faithful
@@ -287,7 +301,7 @@ def calibrate(
     """
     if family not in _BYTES_PER_TOKEN:
         raise ValueError(f"unknown sparse-MLA family {family!r}")
-    from ._sparse_mla_sm120 import _MODEL_TYPE_DSV3_2
+    from ._sparse_mla_sm120 import _MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM53_NOPE
 
     device = torch.device(device)
     props = torch.cuda.get_device_properties(device)
@@ -295,6 +309,12 @@ def calibrate(
     l2_cache_bytes = int(getattr(props, "L2_cache_size", 0) or 0)
     w = _BI * _BYTES_PER_TOKEN[family]
     d_qk = _D_QK[family]
+    if family == "glm53_nope":
+        measurements = _MEASUREMENTS_GLM53_NOPE
+        model_type = _MODEL_TYPE_GLM53_NOPE
+    else:
+        measurements = _MEASUREMENTS
+        model_type = _MODEL_TYPE_DSV3_2
 
     kv_cache, num_slots = _allocate_kv_pool(family, device)
 
@@ -359,7 +379,7 @@ def calibrate(
                     sm_scale,
                     None,
                     None,
-                    _MODEL_TYPE_DSV3_2,
+                    model_type,
                     cpb,
                 )
 
@@ -368,7 +388,7 @@ def calibrate(
         # (the crossover calibration's protocol).
         return _time_call_fresh_indices(call, num_tokens, topk, num_slots, device)
 
-    t = [measure(*m) for m in _MEASUREMENTS]
+    t = [measure(*m) for m in measurements]
 
     def shape_terms(num_tokens: int, num_heads: int, topk: int, cpb: int):
         h_b = _ceil_div(num_heads, _HPB)
@@ -382,18 +402,29 @@ def calibrate(
     # The bytes_i * inv_bw residuals below carry a wave-quantization bias
     # (measured grid size g vs ceil-quantized waves) that partially cancels in
     # predict_time_s, which applies the same ceil.
-    h_b1, n1, _, _ = shape_terms(*_MEASUREMENTS[0])
-    _, n2, _, _ = shape_terms(*_MEASUREMENTS[1])
-    inv_bw = (t[1] - t[0]) / ((n2 - n1) * _MEASUREMENTS[0][0] * h_b1 * w)
+    if family == "glm53_nope":
+        # N is fixed (topk=2176-only instantiation); M1/M2 differ in cpb
+        # (17 vs 33) at identical waves and splits:
+        # t2 - t1 = waves * (cpb2 - cpb1) * min(g, S) * W * inv_bw.
+        tokens1, _, _, cpb1 = measurements[0]
+        cpb2 = measurements[1][3]
+        h_b1, _, splits1, waves1 = shape_terms(*measurements[0])
+        g1 = tokens1 * h_b1 * splits1
+        inv_bw = (t[1] - t[0]) / (waves1 * (cpb2 - cpb1) * min(g1, sm_count) * w)
+    else:
+        h_b1, n1, _, _ = shape_terms(*measurements[0])
+        _, n2, _, _ = shape_terms(*measurements[1])
+        inv_bw = (t[1] - t[0]) / ((n2 - n1) * measurements[0][0] * h_b1 * w)
 
     # Overheads over the saturated-regime points M1..M4 + M6 (M5 is the
     # latency point): t_i - bytes_i * inv_bw = c0 * waves_i + beta * s_i.
-    # M6 shares M4's split count at half its waves, so the (waves, s) rows
-    # are not proportional and the c0/beta split is identifiable by design.
+    # Each grid keeps the (waves, s) rows non-proportional (default grid: M6
+    # shares M4's split count at half its waves), so the c0/beta split is
+    # identifiable by design.
     sat = list(range(4)) + [5]
     a_rows, b_rows = [], []
     for i in sat:
-        num_tokens, num_heads, topk, cpb = _MEASUREMENTS[i]
+        num_tokens, num_heads, topk, cpb = measurements[i]
         h_b, n, splits, waves = shape_terms(num_tokens, num_heads, topk, cpb)
         a_rows.append((waves, splits))
         b_rows.append(t[i] - num_tokens * h_b * n * w * inv_bw)
@@ -407,7 +438,7 @@ def calibrate(
 
     # M5 launches a single block (latency-bound): t5 = waves * (cpb * W *
     # inv_rsm + c0) + beta * splits.
-    num_tokens, num_heads, topk, cpb = _MEASUREMENTS[4]
+    num_tokens, num_heads, topk, cpb = measurements[4]
     _, _, splits5, waves5 = shape_terms(num_tokens, num_heads, topk, cpb)
     inv_rsm = (t[4] - waves5 * c0 - beta * splits5) / (waves5 * cpb * w)
 
@@ -441,8 +472,10 @@ def calibrate_crossover(
     instantiated). Family
     ``"dsv3_2"`` covers both the ``dsv3_2`` and ``glm_nsa`` key spaces because
     the scale format changes prefill speed; the decode kernel is timed with
-    the matching ``model_type`` too. A config the prefill envelope does not
-    serve (e.g. DSV3_2-family topk != 2048) records ``decode_max_tokens=64``.
+    the matching ``model_type`` too. ``"glm53_nope"`` covers its own key
+    space at the topk=2176 instantiations. A config the prefill envelope does
+    not serve (e.g. DSV3_2-family topk != 2048) records
+    ``decode_max_tokens=64``.
 
     Returns a flat ``{"<family>|<num_heads>|<topk>": decode_max_tokens}``
     table: the largest probed T with ``decode_time <= 0.95 * prefill_time``,
@@ -451,9 +484,11 @@ def calibrate_crossover(
     from ._sparse_mla_sm120 import (
         _DECODE_DSV3_2_DISPATCH,
         _DECODE_DSV4_DISPATCH,
+        _DECODE_GLM53_NOPE_DISPATCH,
         _MODEL_TYPE_DSV3_2,
         _MODEL_TYPE_DSV4,
         _MODEL_TYPE_GLM_NSA,
+        _MODEL_TYPE_GLM53_NOPE,
     )
     from ._sparse_mla_sm120_plan import (
         _PREFILL_IMPL_AUTO,
@@ -468,6 +503,10 @@ def calibrate_crossover(
         spaces = [
             ("dsv3_2", sorted(_DECODE_DSV3_2_DISPATCH), _MODEL_TYPE_DSV3_2),
             ("glm_nsa", sorted(_DECODE_DSV3_2_DISPATCH), _MODEL_TYPE_GLM_NSA),
+        ]
+    elif family == "glm53_nope":
+        spaces = [
+            ("glm53_nope", sorted(_DECODE_GLM53_NOPE_DISPATCH), _MODEL_TYPE_GLM53_NOPE)
         ]
     else:
         raise ValueError(f"unknown sparse-MLA family {family!r}")

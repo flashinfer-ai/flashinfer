@@ -475,20 +475,21 @@ def test_plan_memo_buckets_large_t(known_crossover) -> None:
 
 
 def test_plan_glm53_nope_decode_and_prefill(known_crossover) -> None:
-    """GLM53_NOPE: decode at (32, 2176) for T<=64; prefill MG above."""
+    """GLM53_NOPE: decode at (32|64, 2176) for T<=64; prefill MG above."""
     plan_mod, _ = known_crossover
-    planned = plan_mod.plan(
-        4,
-        32,
-        2176,
-        _MODEL_TYPE_GLM53_NOPE,
-        64,
-        False,
-        plan_mod._PREFILL_IMPL_AUTO,
-        torch.device("cpu"),
-    )
-    assert planned is not None
-    assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
+    for num_heads in (32, 64):
+        planned = plan_mod.plan(
+            4,
+            num_heads,
+            2176,
+            _MODEL_TYPE_GLM53_NOPE,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+        )
+        assert planned is not None
+        assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
     planned = plan_mod.plan(
         65,
         32,
@@ -548,25 +549,29 @@ def test_plan_glm53_nope_crossover(known_crossover) -> None:
     assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_MG
 
 
-def test_plan_glm53_nope_swapab_excluded(known_crossover) -> None:
-    """swapAB is instantiated at topk=2048 only: auto never routes NOPE to
-    it, and forcing it raises."""
+def test_plan_glm53_nope_swapab(known_crossover) -> None:
+    """swapAB serves GLM53_NOPE at topk=2176: auto prefers it at H>=64, and
+    forcing it works; an ineligible head count still raises."""
     plan_mod, _ = known_crossover
-    planned = plan_mod.plan(
-        128,
-        64,
-        2176,
-        _MODEL_TYPE_GLM53_NOPE,
-        64,
-        False,
-        plan_mod._PREFILL_IMPL_AUTO,
-        torch.device("cpu"),
-    )
-    assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_MG
-    with pytest.raises(ValueError, match="DSV3_2 family"):
-        plan_mod.plan(
+    for impl in (plan_mod._PREFILL_IMPL_AUTO, plan_mod._PREFILL_IMPL_SWAPAB):
+        planned = plan_mod.plan(
             128,
             64,
+            2176,
+            _MODEL_TYPE_GLM53_NOPE,
+            64,
+            False,
+            impl,
+            torch.device("cpu"),
+        )
+        assert (
+            planned is not None
+            and planned.variant is plan_mod.KernelVariant.PREFILL_SWAPAB
+        )
+    with pytest.raises(ValueError, match="num_heads"):
+        plan_mod.plan(
+            128,
+            32,
             2176,
             _MODEL_TYPE_GLM53_NOPE,
             64,

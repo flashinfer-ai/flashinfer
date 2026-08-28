@@ -179,6 +179,7 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
   // indexer window. Keep this instantiation model-specific.
   if (mt == ModelType::GLM53_NOPE) {
     DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, 32, 2176)
+    DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, 64, 2176)
   }
 #undef DSV3_2_DISPATCH
 #undef DSV3_2_DISPATCH_MT

@@ -246,9 +246,21 @@ def dsv4_constants() -> CpbConstants:
     )
 
 
+@pytest.fixture(scope="module", params=["dsv4", "glm53_nope"])
+def family_constants(request: pytest.FixtureRequest) -> tuple[str, CpbConstants]:
+    from flashinfer.mla._sparse_mla_sm120 import (
+        _get_sparse_mla_sm120_decode_module,
+    )
+
+    _skip_if_low_vram(3)  # 2 GiB calibration pool plus headroom
+    return request.param, cpb_mod.calibrate(
+        _get_sparse_mla_sm120_decode_module, request.param, torch.device("cuda")
+    )
+
+
 @requires_sm12x
-def test_calibration_smoke(dsv4_constants: CpbConstants) -> None:
-    c = dsv4_constants
+def test_calibration_smoke(family_constants: tuple[str, CpbConstants]) -> None:
+    family, c = family_constants
     assert c.inv_bw > 0 and c.inv_rsm > 0 and c.c0 > 0 and c.beta >= 0
     assert (
         c.sm_count
@@ -258,7 +270,7 @@ def test_calibration_smoke(dsv4_constants: CpbConstants) -> None:
     if getattr(props, "L2_cache_size", None):
         assert c.l2_cache_bytes == props.L2_cache_size
     bw_gbps = 1.0 / c.inv_bw / 1e9
-    print(f"\ncalibrated dsv4 constants: {c}")
+    print(f"\ncalibrated {family} constants: {c}")
     print(f"implied aggregate HBM bandwidth: {bw_gbps:.0f} GB/s")
     # Loose physical-plausibility band around modern datacenter GPUs.
     assert 100 < bw_gbps < 20000
