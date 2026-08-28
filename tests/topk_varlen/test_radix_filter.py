@@ -225,3 +225,45 @@ def test_truncate_policy_rejects_topk_equal_to_smem_capacity():
     FilteredTopKKernelVarlen(
         cutlass.Float32, 1 << 20, S - 256, overflow_policy="TRUNCATE"
     )
+
+
+def test_bounded_spill_policy_correctness():
+    """BOUNDED_SPILL must clear the overflow flag it consumes.
+
+    The overflow flag was initialized only for REREAD while BOUNDED_SPILL both
+    increments and reads it; stale shared memory could select the
+    non-overflow refinement with more candidates than the bounded buffer.
+    Exercises the kernel-level wrapper (the public API pins REREAD) with a
+    spill capacity small enough that rows overflow into the reread fallback,
+    checked against a torch reference. Note: the unfixed behavior depends on
+    residual SMEM contents, so this is functional coverage of the fixed path
+    rather than a deterministic reproduction of the stale read.
+
+    Regression for PR #4621 review (overflow-flag initialization).
+    """
+    device = torch.device("cuda")
+    _skip_unless_radix_filter(device)
+
+    from flashinfer.topk_varlen.kernels.filtered_topk_decode import (
+        cute_dsl_radix_filter_topk_wrapper,
+    )
+
+    torch.manual_seed(5)
+    B, N, k = 8, 65536, 2048
+    logits = torch.randn(B, N, dtype=torch.float32, device=device)
+    seq_lens = torch.full((B,), N, dtype=torch.int32, device=device)
+    idx, _ = cute_dsl_radix_filter_topk_wrapper(
+        logits,
+        seq_lens,
+        k,
+        1,
+        return_val=False,
+        overflow_policy="BOUNDED_SPILL",
+        spill_capacity=k + 256,  # small: forces overflow -> reread fallback
+    )
+    idx = idx.view(B, k)
+    for b in range(B):
+        sel = idx[b][idx[b] >= 0]
+        assert sel.numel() == k and sel.unique().numel() == k
+        kth = torch.topk(logits[b], k).values.min()
+        assert bool((logits[b][sel.long()] >= kth - 1e-4).all()), f"row {b}"

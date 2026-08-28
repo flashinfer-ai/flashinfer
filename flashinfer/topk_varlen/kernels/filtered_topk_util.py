@@ -2673,7 +2673,14 @@ class FilteredTopKKernelVarlen:
             # num_threads_per_cta < radix (e.g. 128 < 256).
             for _hi in range(tidx, self.radix + 1, self.num_threads_per_cta):
                 s_histogram[_hi] = 0
-            if cutlass.const_expr(self.enable_reread):
+            # Initialize for EVERY policy that consumes the flag: the reader
+            # below gates on (enable_reread or enable_bounded_spill), and the
+            # spill path atomically increments it on overflow -- clearing it
+            # only for REREAD left BOUNDED_SPILL reading stale shared memory,
+            # which can select the non-overflow refinement with a candidate
+            # count larger than the bounded buffer. DIVERGENCE FROM UPSTREAM
+            # (REREAD-only clear), after review (flashinfer PR #4621).
+            if cutlass.const_expr(self.enable_reread or self.enable_bounded_spill):
                 if tidx == 0:
                     s_overflow_flag[0] = 0
             cute.arch.barrier()
