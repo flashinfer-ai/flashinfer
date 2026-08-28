@@ -16,7 +16,7 @@ from __future__ import annotations
 import pytest
 
 
-def _make_fleet(fake_nccl_ep, *, algorithm=None, world=4, max_tokens=128, hidden=64):
+def _make_fleet(fake_nccl_ep, *, algorithm=None, world=4, max_tokens=128, hidden=2048):
     from flashinfer.moe_ep.config import BootstrapConfig, EpAlgorithm, FleetParams
     from flashinfer.moe_ep.backends.split.comm.nccl_ep.fleet import NcclEpFleet
 
@@ -526,3 +526,26 @@ def test_ops_move_to_the_capture_stream_under_capture(
     native = fake_nccl_ep._log["handles"][-1]
     stream = [c for c in native.calls if c[0] == "update"][-1][2]["stream"]
     assert stream == captured_stream != pinned.cuda_stream
+
+
+@pytest.mark.parametrize("hidden", [256, 512, 1024, 3072])
+def test_ll_rejects_unsupported_hidden_size(fake_nccl_ep, bypass_build_checks, hidden):
+    """Unsupported hidden must raise, not abort the process.
+
+    nccl_ep instantiates LL kernels only for the SWITCH_HIDDEN set; anything
+    else hits EP_HOST_ASSERT(false and "Unsupported hidden") in
+    device/low_latency.cu, which kills the worker with no Python traceback.
+    Measured on 2xB200: hidden 256/512/1024 abort, 2048/4096 round-trip
+    cleanly. 3072 is included here because DeepEP-LL supports it and nccl_ep
+    does not -- copying DeepEP's list would silently reintroduce the abort.
+    """
+    from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+    with pytest.raises(MoEEpConfigError, match="does not support token_hidden_size"):
+        _make_fleet(fake_nccl_ep, hidden=hidden)
+
+
+@pytest.mark.parametrize("hidden", [2048, 2560, 4096, 8192])
+def test_ll_accepts_supported_hidden_size(fake_nccl_ep, bypass_build_checks, hidden):
+    """The SWITCH_HIDDEN set itself must keep working."""
+    assert _make_fleet(fake_nccl_ep, hidden=hidden) is not None
