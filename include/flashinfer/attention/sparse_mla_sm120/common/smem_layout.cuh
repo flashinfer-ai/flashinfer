@@ -34,7 +34,7 @@
 // Parameterized by ModelType and ComputeMode.
 //
 // Buffers (decode / prefill SG):
-//   q_nope_fp8, q_nope_sc, q_rope, kv_buf×2, [kv_scale_buf×2 for DSV4],
+//   q_nope_fp8, q_nope_sc, q_rope, kv_buf×2, [kv_scale_buf×2 for footer layouts],
 //   reduce_buf, sum_reduce_buf (or union), m_smem, l_smem,
 //   w_head_sc_all, w_fp8 (FP8 mode), v_trans, mbar_kv
 //
@@ -56,7 +56,7 @@ struct SmemLayout {
   static constexpr size_t SMEM_KV_BUF = BI * KV::KV_SMEM_STRIDE;
 
   // KV scale buffer: needed when bulk copy doesn't include scales.
-  // DSV3_2: copies 528B (nope+scale), scales in kv_smem → no extra buffer.
+  // Inline layouts copy nope+scale together, so scales already reside in kv_smem.
   // DSV4: copies 448B (nope only), scales at offset 576 → need separate buffer.
   static constexpr bool NEED_SCALE_BUF =
       (KV::KV_SMEM_COPY_BYTES < KV::KV_SCALE_GMEM_OFFSET + KV::SCALE_BYTES_PER_TOKEN);

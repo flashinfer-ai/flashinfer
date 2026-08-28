@@ -182,9 +182,8 @@ struct KVCacheTraits<ModelType::DSV4> {
 
 static constexpr int HPB = 16;
 static constexpr int BI = 64;
-// D_ROPE and D_V are shared across all supported models; the asserts below
-// pin them to KVCacheTraits<...> so a new model with diverging values has
-// to opt out explicitly.
+// D_V is shared across all supported models. D_ROPE is the shared width for
+// RoPE-bearing models; GLM53_NOPE explicitly specializes it to zero.
 static constexpr int D_ROPE = 64;
 static constexpr int D_V = 512;
 static_assert(KVCacheTraits<ModelType::DSV3_2>::D_ROPE == D_ROPE);

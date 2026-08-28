@@ -28,10 +28,10 @@
 
 // Sparse-MLA SM120 paged attention orchestrator (prefill-only).
 //
-// Decode for both DSV3_2 and DSV4 routes through the standalone
+// Decode for DSV3_2, DSV4, GLM_NSA, and GLM53_NOPE routes through the standalone
 // SparseMlaSm120DecodeDsv3_2 / SparseMlaSm120DecodeDsv4 entry points from
-// Python (see flashinfer/sparse_mla_sm120.py). This entry point handles
-// prefill dispatch for both model types (with optional dual cache for DSV4).
+// Python (see flashinfer/mla/_sparse_mla_sm120.py). This entry point handles
+// prefill dispatch for every model type (with optional dual cache for DSV4).
 
 #include <cuda_runtime.h>
 #include <flashinfer/attention/sparse_mla_sm120/model/model_type.h>
@@ -73,7 +73,7 @@ inline ModelType resolve_model_type(int d_qk, int64_t model_type) {
     return mt;
   }
   TVM_FFI_ICHECK(false) << "Unsupported d_qk=" << d_qk
-                        << "; expected 576 (DSV3_2/GLM_NSA) or 512 (DSV4)";
+                        << "; expected 576 (DSV3_2/GLM_NSA) or 512 (DSV4/GLM53_NOPE)";
   return ModelType::DSV4;
 }
 

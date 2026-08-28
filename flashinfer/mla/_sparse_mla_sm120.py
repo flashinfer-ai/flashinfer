@@ -29,8 +29,9 @@
 """Internal Sparse-MLA paged attention implementation for SM120.
 
 Auto-dispatches between decode (num_tokens <= 64) and prefill (larger). Both
-DSv3.2 (d_qk=576) and DSv4 (d_qk=512) decode go through dedicated warp-spec
-standalone kernels; prefill is dispatched through the shared orchestrator.
+the RoPE-bearing v32 family (d_qk=576), DSv4 (d_qk=512), and GLM-5.3 NoPE
+(d_qk=512) decode through dedicated warp-spec standalone kernels; prefill is
+dispatched through the shared orchestrator.
 
 The user-facing sparse MLA entry points are
 ``flashinfer.mla.trtllm_batch_decode_sparse_mla_dsv4`` for DeepSeek V4 and
@@ -66,7 +67,7 @@ from ..utils import (
 
 # Kernel-side constants. Mirrored from
 # include/flashinfer/attention/sparse_mla_sm120/{arch,model}/*.cuh.
-_D_V = 512  # value head dim (universal across DSV3_2 and DSV4)
+_D_V = 512  # value head dim (shared by every supported model type)
 _BI = 64  # KV partition tile size in candidates (BLOCK_SIZE_N)
 
 # Decode/prefill cutoff: num_tokens > _DECODE_MAX_TOKENS routes to the
@@ -466,8 +467,9 @@ def _sparse_mla_sm120_paged_attention(
     ----------
     q : torch.Tensor
         Query tensor, shape ``[num_tokens, num_heads, d_qk]``, dtype bf16.
-        ``d_qk=576`` uses the V32-family inline-scale cache and
-        ``d_qk=512`` uses the DSv4 footer-scale cache.
+        ``d_qk=576`` uses a V32-family inline-scale cache. With ``d_qk=512``,
+        ``kv_scale_format="auto"`` selects the DSv4 footer-scale cache and
+        ``"arbitrary_fp32"`` selects the GLM-5.3 inline-scale cache.
     kv_cache : torch.Tensor
         Byte-packed paged main KV cache. Accepted forms are 3D
         ``[num_blocks, page_block_size, bytes]``, HND
@@ -486,11 +488,12 @@ def _sparse_mla_sm120_paged_attention(
     sm_scale : float
         Softmax scale (typically ``1 / sqrt(d_qk)``).
     d_v : int
-        Value head dim. ``512`` for both DSV3_2 and DSV4 today.
+        Value head dim. ``512`` for every supported model type.
     kv_scale_format : str
-        Scale semantics for ``d_qk=576``. ``"auto"`` and ``"pow2_fp32"``
-        select DSv3.2 power-of-2 FP32 inline scales; ``"arbitrary_fp32"``
-        selects GLM-style arbitrary FP32 inline scales.
+        Model/cache selector. For ``d_qk=576``, ``"auto"`` and
+        ``"pow2_fp32"`` select DSv3.2 while ``"arbitrary_fp32"`` selects
+        GLM-NSA. For ``d_qk=512``, ``"auto"`` selects DSv4 and
+        ``"arbitrary_fp32"`` selects GLM-5.3 NoPE.
     topk_length : Optional[torch.Tensor]
         Effective top-k length per query token, shape ``[num_tokens]``, dtype
         int32. Required for sliding-window MLA near sequence start; ``None``
@@ -565,11 +568,12 @@ class _SparseMLAPagedAttentionRunner:
     max_num_heads : Optional[int]
         Optional worst-case ``num_heads``.
     d_v : int
-        Value head dim. ``512`` for DSV3_2 / DSV4.
+        Value head dim. ``512`` for every supported model type.
     kv_scale_format : str
-        Scale semantics for ``d_qk=576``. ``"auto"`` and ``"pow2_fp32"``
-        select DSv3.2 power-of-2 FP32 inline scales; ``"arbitrary_fp32"``
-        selects GLM-style arbitrary FP32 inline scales.
+        Model/cache selector. For ``d_qk=576``, ``"auto"`` and
+        ``"pow2_fp32"`` select DSv3.2 while ``"arbitrary_fp32"`` selects
+        GLM-NSA. For ``d_qk=512``, ``"auto"`` selects DSv4 and
+        ``"arbitrary_fp32"`` selects GLM-5.3 NoPE.
     device : Optional[torch.device]
         Allocation target. Defaults to the current CUDA device.
 
