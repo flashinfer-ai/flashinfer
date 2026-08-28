@@ -249,7 +249,7 @@ def parse_moe_args(line, parser):
         default=False,
         help=(
             "Use the functional MoE API instead of the wrapper class: "
-            "cute_dsl_fused_moe_nvfp4 vs CuteDslMoEWrapper for "
+            "cute_dsl_fused_moe vs CuteDslMoEWrapper for "
             "cute_dsl_fp4_block_scale_moe, and b12x_fused_moe vs B12xMoEWrapper for "
             "b12x_fused_moe. Useful for verifying that the wrapper's workspace cache "
             "eliminates per-call allocation overhead."
@@ -1380,7 +1380,7 @@ def testCuteDslFp4BlockScaleMoe(args):
 
     This test:
     1. Creates NVFP4-quantized weights and fp4-quantized inputs for CuTe DSL kernels
-    2. Runs MoE via CuteDslMoEWrapper (or cute_dsl_fused_moe_nvfp4 when
+    2. Runs MoE via CuteDslMoEWrapper (or cute_dsl_fused_moe when
        ``--use_functional_api`` is set). SwiGLU only.
     3. Measures performance metrics (TFLOPS, TB/sec)
 
@@ -1460,7 +1460,7 @@ def testCuteDslFp4BlockScaleMoe(args):
 
     if use_functional:
         from functools import partial
-        from flashinfer import cute_dsl_fused_moe_nvfp4
+        from flashinfer import cute_dsl_fused_moe
 
         # Pre-allocate output buffer to avoid per-call allocation
         moe_output = torch.empty(
@@ -1468,9 +1468,9 @@ def testCuteDslFp4BlockScaleMoe(args):
         )
 
         if args.verbose >= 1:
-            print("[INFO] Using CuTe DSL functional API (cute_dsl_fused_moe_nvfp4)")
+            print("[INFO] Using CuTe DSL functional API (cute_dsl_fused_moe)")
         runner = partial(
-            cute_dsl_fused_moe_nvfp4,
+            cute_dsl_fused_moe,
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=local_num_experts,
@@ -2591,7 +2591,7 @@ def testUnifiedNvfp4Moe(args):
     num_active_experts = int(local_topk_ids.unique().numel())
 
     weight_pack = MoEWeightPack()
-    weight_pack.prepare_for("cute_dsl_nvfp4", cute_dsl_view)
+    weight_pack.prepare_for("cute_dsl", cute_dsl_view)
     weight_pack.prepare_for("trtllm_fp4_routed", trtllm_view)
 
     # ---- MoELayer config --------------------------------------------------

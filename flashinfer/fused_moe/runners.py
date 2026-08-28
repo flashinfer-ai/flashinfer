@@ -17,13 +17,14 @@ limitations under the License.
 Each runner wraps one backend and translates (MoEActivationPack, MoEWeightPack)
 into the backend's native calling convention. The adapters reuse existing
 canonical inner runners (CuteDSL's
-``CuteDslFusedMoENvfp4Runner`` and trtllm-gen's ``core.MoERunner``) so the
+``CuteDslFusedMoERunner`` and trtllm-gen's ``core.MoERunner``) so the
 fragile backend-specific kernel-launch code lives in exactly one place.
 """
 
 from __future__ import annotations
 
 import functools
+import warnings
 from typing import Any, ClassVar, List, Optional
 
 import torch
@@ -1861,17 +1862,21 @@ class CutlassHummingRunner(_CutlassRunnerBase):
 
 
 # ---------------------------------------------------------------------------
-# CuteDSL NVFP4 runner — delegates to the matching W4A4 or W4A16 runner
+# CuteDSL runner — delegates to the matching W4A4, W4A8, or W4A16 runner
 # ---------------------------------------------------------------------------
 
 
-class CuteDslNvfp4Runner(MoERunner):
+class CuteDslRunner(MoERunner):
     """Translate activation and weight packs into a CuTe DSL runner input list."""
 
-    backend_key = "cute_dsl_nvfp4"
+    backend_key = "cute_dsl"
     # CuteDSL has no in-kernel router; it only consumes pre-routed packs.
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
-    supported_quant_variants = (QuantVariant.NVFP4, QuantVariant.W4A16)
+    supported_quant_variants = (
+        QuantVariant.NVFP4,
+        QuantVariant.MXFP4,
+        QuantVariant.W4A16,
+    )
     supported_activation_classes = (SwiGLU, GeGLUTanh, ReLU2, SiTU)
 
     def _check_support(self) -> None:
@@ -1887,13 +1892,27 @@ class CuteDslNvfp4Runner(MoERunner):
                 f"{type(self).__name__} requires do_finalize=True."
             )
         if (
-            self.config.quant.variant is QuantVariant.W4A16
+            self.config.quant.variant is not QuantVariant.NVFP4
             and self.config.quant.per_token_scale
         ):
             raise NotImplementedError(
-                f"{type(self).__name__} does not support per-token W4A16 activation "
-                "scales."
+                f"{type(self).__name__} does not support per-token "
+                f"{self.config.quant.variant.name} activation scales."
             )
+        if self.config.quant.variant is QuantVariant.MXFP4 and isinstance(
+            self.config.activation, SiTU
+        ):
+            raise NotImplementedError("CuTe-DSL W4A8 does not support SiTU.")
+        if (
+            self.config.quant.variant is QuantVariant.MXFP4
+            and not self.config.finalize.use_fused_finalize
+        ):
+            raise NotImplementedError("CuTe-DSL W4A8 requires fused finalize.")
+        if self.config.quant.variant is QuantVariant.MXFP4 and hasattr(self, "device"):
+            from ..utils import get_compute_capability
+
+            if get_compute_capability(self.device) == (10, 7):
+                raise NotImplementedError("CuTe-DSL W4A8 does not support SM107.")
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -1904,9 +1923,9 @@ class CuteDslNvfp4Runner(MoERunner):
 
     def _build(self) -> None:
         """Create the shape-independent CuTe DSL tuning runner."""
-        from .cute_dsl.fused_moe import _cute_dsl_fused_moe_nvfp4_impl
+        from .cute_dsl.fused_moe import _cute_dsl_fused_moe_impl
         from .cute_dsl.tuner import (
-            CuteDslFusedMoENvfp4Runner,
+            CuteDslFusedMoERunner,
             CuteDslFusedMoEW4A16Runner,
         )
 
@@ -1918,9 +1937,9 @@ class CuteDslNvfp4Runner(MoERunner):
             if self.config.execution.enable_pdl is None
             else self.config.execution.enable_pdl
         )
-        if self.config.quant.variant is QuantVariant.NVFP4:
-            self._inner = CuteDslFusedMoENvfp4Runner(
-                forward_impl=_cute_dsl_fused_moe_nvfp4_impl,
+        if self.config.quant.variant in (QuantVariant.NVFP4, QuantVariant.MXFP4):
+            self._inner = CuteDslFusedMoERunner(
+                forward_impl=_cute_dsl_fused_moe_impl,
                 num_experts=routing.num_experts,
                 top_k=routing.top_k,
                 num_local_experts=num_local_experts,
@@ -1928,6 +1947,11 @@ class CuteDslNvfp4Runner(MoERunner):
                 use_fused_finalize=self.config.finalize.use_fused_finalize,
                 enable_pdl=enable_pdl,
                 use_per_token_activation=bool(self.config.quant.per_token_scale),
+                quant_mode=(
+                    "w4a8"
+                    if self.config.quant.variant is QuantVariant.MXFP4
+                    else "w4a4"
+                ),
                 **_cute_dsl_activation_kwargs(self.config.activation),
             )
         elif self.config.quant.variant is QuantVariant.W4A16:
@@ -1942,7 +1966,7 @@ class CuteDslNvfp4Runner(MoERunner):
             )
         else:
             raise NotImplementedError(
-                f"CuteDslNvfp4Runner does not support {self.config.quant.variant}."
+                f"CuteDslRunner does not support {self.config.quant.variant}."
             )
         # tuning_config is an instance attribute on the inner runner (its
         # dummy expert-id span depends on num_experts/offset), so read it from
@@ -1989,15 +2013,13 @@ class CuteDslNvfp4Runner(MoERunner):
         # logits pack's None topk tensors into the kernel launch.
         if act.routing_input_mode not in self.supported_routing_modes:
             raise NotImplementedError(
-                f"CuteDslNvfp4Runner does not support "
+                f"CuteDslRunner does not support "
                 f"routing_input_mode={act.routing_input_mode!r} "
                 "(only PackedPrecomputed is wired; CuteDSL has no in-kernel router)."
             )
         v = weights.get_view(self.backend_key)
         num_tokens = act.hidden_states_q.shape[0]
-        _validate_prerouted_inputs(
-            act, num_tokens, self._inner.top_k, "CuteDslNvfp4Runner"
-        )
+        _validate_prerouted_inputs(act, num_tokens, self._inner.top_k, "CuteDslRunner")
         # prepare_weights defaults to SwiGLU, so a non-gated config paired with a
         # default-prepared view yields 2I rows. The tuner infers intermediate_size
         # from this tensor, so the mismatch would surface as a shape error deep in
@@ -2008,7 +2030,7 @@ class CuteDslNvfp4Runner(MoERunner):
         actual_rows = v["w1_weight"].shape[1]
         if actual_rows != expected_rows:
             raise ValueError(
-                f"CuteDslNvfp4Runner: w1_weight has {actual_rows} GEMM1 rows, "
+                f"CuteDslRunner: w1_weight has {actual_rows} GEMM1 rows, "
                 f"expected {expected_rows} for "
                 f"{type(self.config.activation).__name__}; prepare the view with "
                 "the same typed activation."
@@ -2017,24 +2039,29 @@ class CuteDslNvfp4Runner(MoERunner):
         quant_variant = self.config.quant.variant
         use_per_token_activation = bool(self.config.quant.per_token_scale)
         if (
-            quant_variant is QuantVariant.NVFP4
+            quant_variant in (QuantVariant.NVFP4, QuantVariant.MXFP4)
             and not use_per_token_activation
             and act.hidden_states_scale is not None
             and act.per_token_scale is None
         ):
-            hidden_size = act.hidden_states_q.shape[1] * 2  # FP4 packed
+            is_mxfp4 = quant_variant is QuantVariant.MXFP4
+            hidden_size = act.hidden_states_q.shape[1] * (1 if is_mxfp4 else 2)
             moe_output = act.hidden_states_q.new_empty(
                 (num_tokens, hidden_size), dtype=torch.bfloat16
             )
             return [
                 act.hidden_states_q,
-                act.hidden_states_scale.unsqueeze(-1),  # CuteDSL expects [M, H//16, 1]
+                (
+                    act.hidden_states_scale
+                    if is_mxfp4
+                    else act.hidden_states_scale.unsqueeze(-1)
+                ).view(torch.uint8 if is_mxfp4 else act.hidden_states_scale.dtype),
                 act.topk_ids,
                 act.topk_weights,
                 v["w1_weight"],
                 v["w1_weight_sf"],
                 v["w1_alpha"],
-                v["fc2_input_scale"],
+                None if is_mxfp4 else v["fc2_input_scale"],
                 v["w2_weight"],
                 v["w2_weight_sf"],
                 v["w2_alpha"],
@@ -2088,8 +2115,8 @@ class CuteDslNvfp4Runner(MoERunner):
             ]
         else:
             raise ValueError(
-                "CuteDslNvfp4Runner activation inputs must match W4A4, "
-                "W4A4 per-token, or W4A16"
+                "CuteDslRunner activation inputs must match W4A4, W4A4 "
+                "per-token, W4A8, or W4A16"
             )
 
 
@@ -2134,7 +2161,7 @@ class TrtllmFp4RoutedRunner(_TrtllmRunnerBase):
     plus the static weight/config kwargs that ``core.MoERunner.forward``
     consumes, then delegates tactic enumeration, tuning-config construction, and
     the tactic'd forward to that inner runner.  This mirrors
-    ``CuteDslNvfp4Runner`` (which wraps ``CuteDslFusedMoENvfp4Runner``) and keeps
+    ``CuteDslRunner`` (which wraps ``CuteDslFusedMoERunner``) and keeps
     the fragile raw-op positional launch in exactly one place —
     ``core.MoERunner.forward``.
 
@@ -4000,3 +4027,14 @@ class B12xW4A16Runner(_B12xRunner):
         "w2_weight_sf",
         "w2_alpha",
     )
+
+
+def __getattr__(name: str):
+    if name == "CuteDslNvfp4Runner":
+        warnings.warn(
+            "CuteDslNvfp4Runner is deprecated; use CuteDslRunner instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return CuteDslRunner
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

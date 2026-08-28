@@ -881,10 +881,11 @@ def _create_distributed_moe_layer(
     )
     weight_pack = MoEWeightPack()
     weight_pack.prepare_for(
-        "cute_dsl_nvfp4",
+        "cute_dsl",
         CuteDslConfig.prepare_weights(
             w13,
             w2,
+            variant=moe_config.quant.variant,
             num_local_experts=num_local_experts,
             hidden_size=CFG.hidden_size,
             intermediate_size=intermediate_size,

@@ -108,8 +108,7 @@ The CuteDSL backends are conditionally available when the
 .. autosummary::
     :toctree: ../generated
 
-    cute_dsl_fused_moe_nvfp4
-    cute_dsl_fused_moe_mxfp8_mxfp4
+    cute_dsl_fused_moe
     b12x_fused_moe
 
 .. autoclass:: CuteDslMoEWrapper
@@ -119,12 +118,10 @@ The CuteDSL backends are conditionally available when the
 
     .. automethod:: __init__
 
-.. autoclass:: CuteDslMxfp8Mxfp4MoEWrapper
-    :members:
-    :inherited-members:
-    :show-inheritance:
-
-    .. automethod:: __init__
+The dtype-specific ``cute_dsl_fused_moe_nvfp4``,
+``cute_dsl_fused_moe_mxfp8_mxfp4``, and ``CuteDslMxfp8Mxfp4MoEWrapper``
+names are deprecated compatibility aliases. Use ``cute_dsl_fused_moe`` or
+``CuteDslMoEWrapper`` with the corresponding ``quant_mode`` instead.
 
 .. autoclass:: B12xMoEWrapper
     :members:

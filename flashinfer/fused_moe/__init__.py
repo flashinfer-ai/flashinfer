@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import warnings
+
 # Unified MoE API
 from .api import (  # noqa: F401
     # Typed activation values
@@ -75,7 +77,7 @@ from .runners import (  # noqa: F401
     CutlassNvfp4Runner,
     CutlassW4A16Runner,
     CutlassW4A8Runner,
-    CuteDslNvfp4Runner,
+    CuteDslRunner,
     TrtllmBf16RoutedRunner,
     TrtllmFp4RoutedRunner,
     TrtllmFp8BlockRunner,
@@ -159,10 +161,8 @@ from .monomoe import (  # noqa: F401
 # CuteDSL MoE APIs (conditionally imported if cute_dsl available)
 try:
     from .cute_dsl import (
-        cute_dsl_fused_moe_nvfp4,
+        cute_dsl_fused_moe,
         CuteDslMoEWrapper,
-        cute_dsl_fused_moe_mxfp8_mxfp4,
-        CuteDslMxfp8Mxfp4MoEWrapper,
         b12x_fused_moe,
         B12xMoEWrapper,
     )
@@ -170,6 +170,26 @@ try:
     _cute_dsl_available = True
 except ImportError:
     _cute_dsl_available = False
+
+
+def __getattr__(name: str):
+    if name == "CuteDslNvfp4Runner":
+        warnings.warn(
+            "CuteDslNvfp4Runner is deprecated; use CuteDslRunner instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return CuteDslRunner
+    if _cute_dsl_available and name in {
+        "cute_dsl_fused_moe_nvfp4",
+        "cute_dsl_fused_moe_mxfp8_mxfp4",
+        "CuteDslMxfp8Mxfp4MoEWrapper",
+    }:
+        from .cute_dsl import fused_moe as _cute_dsl_fused_moe
+
+        return getattr(_cute_dsl_fused_moe, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # Typed activation values
@@ -211,6 +231,7 @@ __all__ = [
     "CutlassW4A8Runner",
     "ExecutionConfig",
     "ExpertConfig",
+    "CuteDslRunner",
     "CuteDslNvfp4Runner",
     "MoEActivationPack",
     "RoutingInputMode",
@@ -286,9 +307,10 @@ __all__ = [
 # Add CuteDSL exports if available
 if _cute_dsl_available:
     __all__ += [
+        "cute_dsl_fused_moe",
         "cute_dsl_fused_moe_nvfp4",
-        "CuteDslMoEWrapper",
         "cute_dsl_fused_moe_mxfp8_mxfp4",
+        "CuteDslMoEWrapper",
         "CuteDslMxfp8Mxfp4MoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",

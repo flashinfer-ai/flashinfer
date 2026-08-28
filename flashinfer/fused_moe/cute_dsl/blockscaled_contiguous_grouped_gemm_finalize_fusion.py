@@ -41,6 +41,7 @@ Key features:
 """
 
 import functools
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import cutlass
@@ -352,7 +353,7 @@ def _get_compiled_finalize_kernel(
     return _finalize_kernel_cache[cache_key]
 
 
-def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
+def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scale: torch.Tensor,
@@ -404,12 +405,12 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
              a provided buffer must already be zero-initialized.
         a_per_token_scale: Optional per-row operand-A scale, shape (permuted_m,).
              Used when GEMM1 output is quantized by a standalone per-token
-             NVFP4 quantizer instead of the fused GEMM1 epilogue.
+             W4A4 quantizer instead of the fused GEMM1 epilogue.
         a_dtype: Data type for the A matrix.
         b_dtype: Data type for the B matrix.
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
         out_dtype: Data type for output matrix. Default: "bfloat16"
-        sf_vec_size: Scale factor vector size. Default: 16 (for NVFP4)
+        sf_vec_size: Scale factor vector size. Use 16 for W4A4 or 32 for W4A8.
         mma_tiler_mn: MMA tile shape (M, N). Default: (256, 128)
         cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Default: (2, 1)
         raster_along_m: If True, raster tiles along M dimension. Default: False
@@ -424,7 +425,7 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
     Notes:
         - A caller-provided fused output must be zero-initialized.
         - Call create_finalize_fusion_tensors() to create permuted_idx_to_expanded_idx and token_final_scales.
-        - Requires SM100 (Blackwell) GPU architecture
+        - Supports SM100/SM103, plus W4A4 on SM107 with Rubin tactic parameters.
         - Deterministic mode requires a separate ``moe_unpermute`` call.
 
     Example:
@@ -445,7 +446,7 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
         ... )
         >>>
         >>> # Run grouped GEMM with finalize fusion
-        >>> out = blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
+        >>> out = blockscaled_contiguous_grouped_gemm_finalize_fusion(
         ...     a=gemm1_output_fp4,              # (valid_m, intermediate_dim//2)
         ...     b=expert_down_weights_fp4,       # (num_experts, hidden_dim, intermediate_dim//2)
         ...     a_scale=gemm1_output_scale,
@@ -456,6 +457,8 @@ def _blockscaled_contiguous_grouped_gemm_finalize_fusion(
         ...     tile_idx_to_mn_limit=mn_limit,
         ...     permuted_idx_to_expanded_idx=permuted_idx,
         ...     token_final_scales=final_scales,
+        ...     a_dtype="float4_e2m1fn",
+        ...     b_dtype="float4_e2m1fn",
         ... )  # out shape: (seq_len, hidden_dim)
     """
     # Validate inputs
@@ -758,7 +761,14 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4(
     use_fused_finalize: bool = True,
 ) -> torch.Tensor:
     """Run the existing homogeneous NVFP4 GEMM2 finalize kernel."""
-    return _blockscaled_contiguous_grouped_gemm_finalize_fusion(
+    warnings.warn(
+        "blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4 is "
+        "deprecated; use blockscaled_contiguous_grouped_gemm_finalize_fusion "
+        "instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return blockscaled_contiguous_grouped_gemm_finalize_fusion(
         a,
         b,
         a_scale,
@@ -814,6 +824,13 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_mxfp8_mxfp4(
     be divisible by 128 and by ``mma_tiler_mn[1]`` because the current finalize
     epilogue does not predicate a partial N tile.
     """
+    warnings.warn(
+        "blockscaled_contiguous_grouped_gemm_finalize_fusion_mxfp8_mxfp4 is "
+        "deprecated; use blockscaled_contiguous_grouped_gemm_finalize_fusion "
+        "instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if a.ndim != 2 or b.ndim != 3:
         raise ValueError(f"Expected A rank 2 and B rank 3, got {a.ndim} and {b.ndim}")
     if a.dtype is not torch.float8_e4m3fn:
@@ -862,7 +879,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_mxfp8_mxfp4(
         if not out.is_contiguous():
             raise ValueError("out must be contiguous")
 
-    return _blockscaled_contiguous_grouped_gemm_finalize_fusion(
+    return blockscaled_contiguous_grouped_gemm_finalize_fusion(
         a,
         b,
         a_scale,

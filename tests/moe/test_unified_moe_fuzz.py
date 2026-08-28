@@ -219,7 +219,7 @@ from flashinfer.utils import get_compute_capability
 from tests.test_helpers.fuzz_ledger import FuzzLedger
 
 NUM_TESTS = int(os.environ.get("FLASHINFER_UMOE_FUZZ_NUM_TESTS", "160"))
-# Debug knob: comma-separated backend_key allowlist (e.g. "cute_dsl_nvfp4") to run a
+# Debug knob: comma-separated backend_key allowlist (e.g. "cute_dsl") to run a
 # backend-scoped sequence -- used to bisect cross-call state corruption by backend (gh #3957).
 _BACKEND_FILTER = {
     b for b in os.environ.get("FLASHINFER_UMOE_FUZZ_BACKENDS", "").split(",") if b
@@ -261,7 +261,7 @@ _DETERMINISTIC = {
     "cutlass_bf16": True,
     "cutlass_w4a16": True,
     "trtllm_fp4_routed": True,  # bitwise-stable across reruns in calibration
-    "cute_dsl_nvfp4": False,  # atomic scatter-add finalize -> non-bit-exact by design
+    "cute_dsl": False,  # atomic scatter-add finalize -> non-bit-exact by design
     "trtllm_bf16_routed": True,  # same trtllm-gen finalize path as fp4_routed; bitwise-stable in calibration
     "trtllm_fp8_block": True,
     "trtllm_fp8_per_tensor": True,

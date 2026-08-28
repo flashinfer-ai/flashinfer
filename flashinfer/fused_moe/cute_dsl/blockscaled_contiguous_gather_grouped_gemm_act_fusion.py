@@ -45,6 +45,7 @@ Comparison with non-gather activation fusion:
 """
 
 import functools
+import warnings
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cutlass
@@ -419,7 +420,7 @@ def _get_compiled_gather_kernel(
     return _gather_kernel_cache[cache_key]
 
 
-def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     a: torch.Tensor,
     b: torch.Tensor,
     a_scale: torch.Tensor,
@@ -499,7 +500,7 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         b_dtype: Data type for the B matrix.
         sf_dtype: Data type for scale factors. Default: "float8_e4m3fn"
         c_dtype: Data type for output matrix. Default: "bfloat16"
-        sf_vec_size: Scale factor vector size. Default: 16 (for NVFP4)
+        sf_vec_size: Scale factor vector size. Use 16 for W4A4 or 32 for W4A8.
         quantize_output: If True, quantize the epilogue output to a
             block-scaled format and generate out_scale. This is separate from
             c_dtype because float8_e4m3fn may also be used as a plain output
@@ -536,7 +537,7 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         - The A tensor is the original unpermuted input
         - The output is in permuted order (can be fed directly to GEMM2)
         - Use create_gather_gemm_tensors() to create required mapping tensors
-        - Requires SM100 (Blackwell) GPU architecture
+        - Supports SM100/SM103, plus W4A4 on SM107 with Rubin tactic parameters.
 
     Example:
         >>> # Setup for MoE GEMM1 with 8 experts, no moe_permute needed!
@@ -550,7 +551,7 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         ... )
         >>>
         >>> # Run gathered GEMM with SwiGLU fusion - NO moe_permute needed!
-        >>> out, _ = blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
+        >>> out, _ = blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         ...     a=original_input_fp4,            # (seq_len, hidden_dim//2) - UNPERMUTED!
         ...     b=expert_gate_up_weights_fp4,    # (num_experts, 2*intermediate_dim, hidden_dim//2)
         ...     a_scale=input_scale,
@@ -560,6 +561,11 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         ...     tile_idx_to_mn_limit=mn_limit,
         ...     token_id_mapping=token_map,
         ...     num_non_exiting_tiles=num_tiles,
+        ...     global_scale=fc2_input_scale,
+        ...     a_dtype="float4_e2m1fn",
+        ...     b_dtype="float4_e2m1fn",
+        ...     c_dtype="float4_e2m1fn",
+        ...     quantize_output=True,
         ...     topk=topk,
         ... )  # out shape: (valid_m, intermediate_dim)
     """
@@ -939,7 +945,14 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     operands.  FP4 output scale generation keeps the existing global-scale
     behavior.
     """
-    return _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+    warnings.warn(
+        "blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4 is "
+        "deprecated; use blockscaled_contiguous_gather_grouped_gemm_act_fusion "
+        "instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    return blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         a,
         b,
         a_scale,
@@ -1011,6 +1024,13 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_mxfp8_mxfp4(
     MMA-swizzled E8M0 scale tensor.  The returned activation is E4M3 and its
     scale tensor uses the canonical 128x4 MMA layout with vector size 32.
     """
+    warnings.warn(
+        "blockscaled_contiguous_gather_grouped_gemm_act_fusion_mxfp8_mxfp4 "
+        "is deprecated; use "
+        "blockscaled_contiguous_gather_grouped_gemm_act_fusion instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if a.ndim != 2 or b.ndim != 3:
         raise ValueError(f"Expected A rank 2 and B rank 3, got {a.ndim} and {b.ndim}")
     if a.dtype != torch.float8_e4m3fn:
@@ -1061,7 +1081,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_mxfp8_mxfp4(
             if not tensor.is_contiguous():
                 raise ValueError(f"{name} must be contiguous")
 
-    result, result_scale = _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
+    result, result_scale = blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         a,
         b,
         a_scale,

@@ -15,3 +15,4 @@ class FusedMoeKernelConfig:
 
     moe_config: "MoEConfig"
     kernel_name: str = "fused_moe"
+    mxfp8_dispatch: bool = False

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import functools
 import struct
+import warnings
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -2012,22 +2013,22 @@ def _interleave_linear_and_gate(
     return x
 
 
-def prepare_cute_dsl_nvfp4_weights(
+def prepare_cute_dsl_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
     *,
+    variant=None,
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
     activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
-    """Build the CuteDSL NVFP4 ``cute_dsl_nvfp4`` weight view.
+    """Build the CuteDSL FP4 ``cute_dsl`` weight view.
 
     Gemm1 weights get the linear/gate interleave only for gated activations;
-    non-gated ones (ReLU2) skip it and keep their ``[E, I, H]`` rows as-is. Both
-    gemms are NVFP4 block-quantized (swizzled) with scales converted to the
-    CuteDSL MMA layout.
+    non-gated ones (ReLU2) skip it and keep their ``[E, I, H]`` rows as-is.
+    ``variant`` selects NVFP4/W4A4, MXFP4/W4A8, or W4A16 weights.
     Starts from the same canonical bf16 expert weights as
     :func:`prepare_trtllm_fp4_weights`, so a single weight set can feed both
     backends and a shared reference.
@@ -2035,12 +2036,20 @@ def prepare_cute_dsl_nvfp4_weights(
     Returns
     -------
     dict
-        Keys expected by ``CuteDslNvfp4Runner.pack_inputs``: ``w1_weight``,
+        Keys expected by ``CuteDslRunner.pack_inputs``: ``w1_weight``,
         ``w1_weight_sf``, ``w1_alpha``, ``fc2_input_scale``, ``w2_weight``,
         ``w2_weight_sf``, ``w2_alpha``.
     """
     from ..cute_dsl.utils import convert_sf_to_mma_layout
     from ..fp4_quantization import fp4_quantize
+    from .api import QuantVariant
+
+    if variant is None:
+        variant = QuantVariant.NVFP4
+    if variant not in (QuantVariant.NVFP4, QuantVariant.MXFP4, QuantVariant.W4A16):
+        raise ValueError(
+            f"CuTe-DSL FP4 weight preparation does not support {variant!r}"
+        )
 
     if device is None:
         device = w1_bf16.device
@@ -2049,7 +2058,12 @@ def prepare_cute_dsl_nvfp4_weights(
     w1_bf16 = w1_bf16.to(device)
     w2_bf16 = w2_bf16.to(device)
 
-    sf_vec_size = 16
+    is_mxfp4 = variant is QuantVariant.MXFP4
+    if is_mxfp4 and (hidden_size % 128 or intermediate_size % 128):
+        raise ValueError(
+            "CuTe-DSL MXFP4 requires hidden and intermediate sizes divisible by 128"
+        )
+    sf_vec_size = 32 if is_mxfp4 else 16
     gs = torch.tensor([1.0], device=device, dtype=torch.float32)
 
     activation = _normalize_activation(activation)
@@ -2061,7 +2075,11 @@ def prepare_cute_dsl_nvfp4_weights(
     )
     w1_flat = w1_interleaved.view(num_local_experts * gemm1_rows, hidden_size)
     w1_q_flat, w1_sf_flat = fp4_quantize(
-        w1_flat, global_scale=gs, sf_vec_size=sf_vec_size, is_sf_swizzled_layout=True
+        w1_flat,
+        global_scale=gs,
+        sf_vec_size=sf_vec_size,
+        sf_use_ue8m0=is_mxfp4,
+        is_sf_swizzled_layout=True,
     )
     w1_weight = w1_q_flat.view(num_local_experts, gemm1_rows, hidden_size // 2)
     w1_weight_sf = convert_sf_to_mma_layout(
@@ -2074,7 +2092,11 @@ def prepare_cute_dsl_nvfp4_weights(
 
     w2_flat = w2_bf16.view(num_local_experts * hidden_size, intermediate_size)
     w2_q_flat, w2_sf_flat = fp4_quantize(
-        w2_flat, global_scale=gs, sf_vec_size=sf_vec_size, is_sf_swizzled_layout=True
+        w2_flat,
+        global_scale=gs,
+        sf_vec_size=sf_vec_size,
+        sf_use_ue8m0=is_mxfp4,
+        is_sf_swizzled_layout=True,
     )
     w2_weight = w2_q_flat.view(num_local_experts, hidden_size, intermediate_size // 2)
     w2_weight_sf = convert_sf_to_mma_layout(
@@ -2086,15 +2108,17 @@ def prepare_cute_dsl_nvfp4_weights(
     )
 
     ones = torch.ones(num_local_experts, device=device, dtype=torch.float32)
-    return {
+    view = {
         "w1_weight": w1_weight,
         "w1_weight_sf": w1_weight_sf,
         "w1_alpha": ones,
-        "fc2_input_scale": torch.tensor([1.0], device=device, dtype=torch.float32),
         "w2_weight": w2_weight,
         "w2_weight_sf": w2_weight_sf,
         "w2_alpha": ones,
     }
+    if not is_mxfp4:
+        view["fc2_input_scale"] = gs
+    return view
 
 
 def _quantize_b12x_expert_weights(
@@ -2274,3 +2298,15 @@ def prepare_b12x_w4a16_weights(
         "w2_weight_sf": w2_blockscale,
         "w2_alpha": w2_global_scale,
     }
+
+
+def __getattr__(name: str):
+    if name == "prepare_cute_dsl_nvfp4_weights":
+        warnings.warn(
+            "prepare_cute_dsl_nvfp4_weights is deprecated; use "
+            "prepare_cute_dsl_weights with variant=QuantVariant.NVFP4 instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return prepare_cute_dsl_weights
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

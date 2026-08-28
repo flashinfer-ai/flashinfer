@@ -35,6 +35,40 @@ if TYPE_CHECKING:
     from flashinfer.fused_moe.api import MoEActivationPack, QuantVariant
 
 
+_NCCL_EP_LL_BF16_WIDTHS = (2048, 2560, 4096, 5120, 6144, 7168, 8192)
+
+
+def packed_mxfp8_dispatch_width(hidden: int) -> int:
+    """Return the smallest supported BF16 row that holds MXFP8 data + scales."""
+    if hidden % 64:
+        raise ValueError(f"mxfp8_dispatch requires hidden % 64 == 0, got {hidden}")
+    need = (hidden + hidden // 32) // 2
+    for width in _NCCL_EP_LL_BF16_WIDTHS:
+        if width >= need:
+            return width
+    raise ValueError(f"packed MXFP8 row for hidden={hidden} is too large")
+
+
+def pack_mxfp8_dispatch_payload(x: torch.Tensor) -> torch.Tensor:
+    """Pack per-token MXFP8 values and linear scale bytes into BF16 rows."""
+    if x.dim() != 2 or x.dtype != torch.bfloat16:
+        raise ValueError(
+            "mxfp8_dispatch expects 2D BF16 [num_tokens, hidden] tokens, "
+            f"got {x.dtype} shape {tuple(x.shape)}"
+        )
+    from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+
+    m, hidden = x.shape
+    send_width = packed_mxfp8_dispatch_width(hidden)
+    q, sf = mxfp8_quantize(x.contiguous(), is_sf_swizzled_layout=False)
+    packed = torch.zeros(m, 2 * send_width, dtype=torch.uint8, device=x.device)
+    packed[:, :hidden] = q.view(torch.uint8)
+    packed[:, hidden : hidden + hidden // 32] = sf.view(torch.uint8).reshape(
+        m, hidden // 32
+    )
+    return packed.view(torch.bfloat16)
+
+
 def build_activation_pack(
     expert_tensors: torch.Tensor,
     *,
@@ -42,6 +76,8 @@ def build_activation_pack(
     quant_variant: "QuantVariant",
     per_token_activation: bool = False,
     global_scale: Optional[torch.Tensor] = None,
+    mxfp8_dispatch: bool = False,
+    hidden_size: Optional[int] = None,
 ) -> "MoEActivationPack":
     """Translate the 3D expert-major dispatch output into a token-major pack.
 
@@ -86,6 +122,8 @@ def build_activation_pack(
         quant_variant=quant_variant,
         per_token_activation=per_token_activation,
         global_scale=global_scale,
+        mxfp8_dispatch=mxfp8_dispatch,
+        hidden_size=hidden_size,
     )
 
 
@@ -99,6 +137,8 @@ def build_activation_pack_rank_major(
     quant_variant: "QuantVariant",
     per_token_activation: bool = False,
     global_scale: Optional[torch.Tensor] = None,
+    mxfp8_dispatch: bool = False,
+    hidden_size: Optional[int] = None,
 ) -> "MoEActivationPack":
     """Translate the 3D RANK_MAJOR dispatch output into a token-major pack.
 
@@ -181,6 +221,8 @@ def build_activation_pack_rank_major(
         quant_variant=quant_variant,
         per_token_activation=per_token_activation,
         global_scale=global_scale,
+        mxfp8_dispatch=mxfp8_dispatch,
+        hidden_size=hidden_size,
     )
 
 
@@ -192,6 +234,8 @@ def _quantize_and_pack(
     quant_variant: "QuantVariant",
     per_token_activation: bool,
     global_scale: Optional[torch.Tensor],
+    mxfp8_dispatch: bool,
+    hidden_size: Optional[int],
 ) -> "MoEActivationPack":
     """Prepare ``flat`` for the configured activation path and assemble the pack.
 
@@ -251,6 +295,32 @@ def _quantize_and_pack(
         # Runners expect a 2D [M, H//16] scale; fp4_quantize may return a trailing dim.
         if hidden_states_scale.dim() > 2:
             hidden_states_scale = hidden_states_scale.squeeze(-1)
+    elif quant_variant is QuantVariant.MXFP4:
+        from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+
+        if mxfp8_dispatch:
+            if hidden_size is None:
+                raise ValueError("mxfp8_dispatch requires the logical hidden size")
+            send_width = packed_mxfp8_dispatch_width(hidden_size)
+            if flat.dtype != torch.bfloat16 or flat.shape[1] != send_width:
+                raise ValueError(
+                    f"packed MXFP8 input must be BF16 width {send_width}, got "
+                    f"{flat.dtype} width {flat.shape[1]}"
+                )
+            packed = flat.contiguous().view(torch.uint8)
+            hidden_states_q = (
+                packed[:, :hidden_size].contiguous().view(torch.float8_e4m3fn)
+            )
+            hidden_states_scale = packed[
+                :, hidden_size : hidden_size + hidden_size // 32
+            ].contiguous()
+        else:
+            hidden_states_q, hidden_states_scale = mxfp8_quantize(
+                flat.contiguous(), is_sf_swizzled_layout=False
+            )
+            hidden_states_scale = hidden_states_scale.view(torch.uint8).reshape(
+                flat.shape[0], flat.shape[1] // 32
+            )
     elif quant_variant in (QuantVariant.BF16, QuantVariant.W4A16):
         # BF16 and W4A16 runners consume the dispatched activations directly.
         hidden_states_q = flat

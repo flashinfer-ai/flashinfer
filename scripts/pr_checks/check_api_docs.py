@@ -57,7 +57,7 @@ SKIP_MISSING_MODULES = {"flashinfer"}
 SKIP_STALE_MODULES = {"flashinfer.testing"}
 # Per-module symbol ignore list
 DOC_IGNORE = {
-    "flashinfer.fused_moe": {"cute_dsl_fused_moe_nvfp4"},
+    "flashinfer.fused_moe": {"cute_dsl_fused_moe"},
 }
 
 
