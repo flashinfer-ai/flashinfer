@@ -226,12 +226,11 @@ def test_nvfp4_bs256_has_matching_gen_tile32_pair():
             and fc2.cluster_m == 2
             and fc2.num_stages_a == 4
             and fc2.use_unroll_loop_2x_for_mma
+            and fc1.tile_scheduler == int(TileScheduler.PERSISTENT)
+            and fc1.use_clc_fast_drain
+            and fc2.tile_scheduler == int(TileScheduler.PERSISTENT)
+            and fc2.use_clc_fast_drain
         ):
             break
     else:
         pytest.fail("missing the Gen-matched NVFP4 BS=256 tile-32 config pair")
-
-    assert fc1.tile_scheduler == int(TileScheduler.PERSISTENT)
-    assert fc1.use_clc_fast_drain
-    assert fc2.tile_scheduler == int(TileScheduler.PERSISTENT)
-    assert fc2.use_clc_fast_drain
