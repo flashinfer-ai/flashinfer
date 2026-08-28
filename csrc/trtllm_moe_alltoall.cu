@@ -484,10 +484,6 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
 
   // Handle quantization parameters if output scales are provided
   if (outputScales.has_value()) {
-    // Quantized combine (MXFP8/MXFP4/NVFP4) relies on Blackwell-only conversion instructions.
-    auto const sm_version = tensorrt_llm::common::getSMVersion();
-    TVM_FFI_ICHECK(sm_version >= 100)
-        << "Quantized moe_a2a_combine requires SM>=100 (Blackwell), but got SM" << sm_version;
     TVM_FFI_ICHECK(payload.dtype() == dl_bfloat16 || payload.dtype() == dl_float16)
         << "Quantization only supports for fp16 or bf16 inputs";
     TensorView const& scales = outputScales.value();
@@ -518,6 +514,13 @@ void moeA2ACombineIntoOp(TensorView payload, int64_t localNumTokens, TensorView 
         outputScaleExtent(localNumTokens, elementsPerToken, params.quant_mode, swizzleMode);
     TVM_FFI_ICHECK_EQ(scales.numel(), expectedScales)
         << "output_scales extent does not match the requested quantization layout";
+
+    // Quantized combine (MXFP8/MXFP4/NVFP4) relies on Blackwell-only conversion instructions.
+    // Validate the public tensor contract first so malformed inputs report their causal error
+    // consistently on every architecture.
+    auto const sm_version = tensorrt_llm::common::getSMVersion();
+    TVM_FFI_ICHECK(sm_version >= 100)
+        << "Quantized moe_a2a_combine requires SM>=100 (Blackwell), but got SM" << sm_version;
     params.output_scales = scales.data_ptr();
     // Preserve the public physical payload boundary through the inverse
     // combine: each owner stores one BF16/FP16 partial before the final

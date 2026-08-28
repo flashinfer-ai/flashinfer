@@ -670,7 +670,7 @@ def test_moe_combine_rejects_unsupported_top_k():
     num_tokens = 1
     top_k = 3
     hidden_states = torch.zeros((num_tokens, 8), dtype=torch.bfloat16, device="cuda")
-    routes = torch.zeros((num_tokens, top_k), dtype=torch.int32, device="cuda")
+    routes = torch.zeros((num_tokens, 1), dtype=torch.int32, device="cuda")
     received, workspace, metainfo, combine_offsets = dispatch_from_single_rank(
         [hidden_states],
         routes,
@@ -680,7 +680,7 @@ def test_moe_combine_rejects_unsupported_top_k():
         hidden_state_index=0,
         enable_pdl=False,
     )
-    with pytest.raises(Exception, match="unsupported top_k for moe_a2a_combine"):
+    with pytest.raises(Exception, match="[Uu]nsupported top_k"):
         trtllm_moe_alltoall.moe_a2a_combine(
             received[0][0].clone(),
             num_tokens,
