@@ -1687,3 +1687,217 @@ def test_sparse_mla_sm120_prefill_dsv4_dual_runtime_extra_topk(
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def _make_dsv3_2_prefill_case(
+    num_heads: int, num_tokens: int, topk: int = 2048
+) -> tuple:
+    """Shared inputs for prefill_impl tests (DSv3.2, pow2 inline scales)."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v = 576, 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv3_2(kv_bf16)
+    kv_dequant = dequantize_kv_dsv3_2(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+    return q, kv_packed, indices, sm_scale, d_v, ref_out, ref_lse
+
+
+def _run_prefill_impl(case: tuple, prefill_impl) -> tuple:
+    q, kv_packed, indices, sm_scale, d_v, _, _ = case
+    num_tokens, num_heads = q.shape[0], q.shape[1]
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=q.device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=q.device)
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        prefill_impl=prefill_impl,
+    )
+    return output, out_lse
+
+
+@pytest.mark.parametrize("num_heads", [64, 128])
+def test_sparse_mla_sm120_prefill_impl_swapab_forced(num_heads: int) -> None:
+    """Forced swapAB matches the reference at an eligible DSv3.2 shape."""
+    case = _make_dsv3_2_prefill_case(num_heads, num_tokens=128)
+    output, out_lse = _run_prefill_impl(case, "swapab")
+    torch.testing.assert_close(output, case[5], atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, case[6], atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("num_heads", [64, 128])
+def test_sparse_mla_sm120_prefill_impl_mg_matches_swapab(num_heads: int) -> None:
+    """Forced MG and forced swapAB agree on identical inputs (and the ref)."""
+    case = _make_dsv3_2_prefill_case(num_heads, num_tokens=128)
+    out_swapab, lse_swapab = _run_prefill_impl(case, "swapab")
+    out_mg, lse_mg = _run_prefill_impl(case, "mg")
+    torch.testing.assert_close(out_mg, out_swapab, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse_mg, lse_swapab, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_mg, case[5], atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse_mg, case[6], atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("num_heads", [64, 128])
+def test_sparse_mla_sm120_prefill_impl_auto_matches_swapab(num_heads: int) -> None:
+    """Auto dispatch keeps preferring swapAB where it is instantiated."""
+    case = _make_dsv3_2_prefill_case(num_heads, num_tokens=128)
+    out_auto, lse_auto = _run_prefill_impl(case, None)
+    out_swapab, lse_swapab = _run_prefill_impl(case, "swapab")
+    torch.testing.assert_close(out_auto, out_swapab, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse_auto, lse_swapab, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "num_heads,topk,match",
+    [
+        (32, 2048, "num_heads"),
+        (64, 512, "topk"),
+    ],
+)
+def test_sparse_mla_sm120_prefill_impl_swapab_ineligible_dsv3_2(
+    num_heads: int, topk: int, match: str
+) -> None:
+    """Forced swapAB rejects out-of-envelope DSv3.2 shapes in Python."""
+    case = _make_dsv3_2_prefill_case(num_heads, num_tokens=128, topk=topk)
+    with pytest.raises(ValueError, match=match):
+        _run_prefill_impl(case, "swapab")
+
+
+def test_sparse_mla_sm120_prefill_impl_swapab_rejects_dsv4() -> None:
+    """Forced swapAB is always an error for the DSv4 family."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_heads, num_tokens, topk = 64, 128, 512
+    d_qk, d_v = 512, 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+
+    with pytest.raises(ValueError, match="DSV3_2 family"):
+        sparse_mla_sm120_paged_attention(
+            q,
+            kv_packed,
+            indices,
+            output,
+            out_lse,
+            d_qk**-0.5,
+            d_v=d_v,
+            prefill_impl="swapab",
+        )
+
+
+def test_sparse_mla_sm120_prefill_impl_swapab_rejects_dual_cache() -> None:
+    """Forced swapAB is an error when a secondary cache is present."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_heads, num_tokens, topk = 64, 128, 128
+    d_qk, d_v = 512, 512
+    main_pbs = 64
+    main_num_blocks = 64
+    main_s_kv = main_num_blocks * main_pbs
+    extra_topk, extra_pbs = 64, 64
+    extra_num_blocks = 16
+    extra_s_kv = extra_num_blocks * extra_pbs
+
+    main_packed = quantize_kv_dsv4(
+        (
+            torch.randn(
+                main_num_blocks, main_pbs, 1, d_qk, device=device, dtype=torch.bfloat16
+            )
+            / 10.0
+        ).clamp(-1, 1)
+    )
+    extra_packed = quantize_kv_dsv4(
+        (
+            torch.randn(
+                extra_num_blocks,
+                extra_pbs,
+                1,
+                d_qk,
+                device=device,
+                dtype=torch.bfloat16,
+            )
+            / 10.0
+        ).clamp(-1, 1)
+    )
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    main_idx = torch.randint(
+        0, main_s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    extra_idx = torch.randint(
+        0, extra_s_kv, (num_tokens, extra_topk), device=device, dtype=torch.int32
+    )
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+
+    with pytest.raises(ValueError, match="dual-cache"):
+        sparse_mla_sm120_paged_attention(
+            q,
+            main_packed,
+            main_idx,
+            output,
+            out_lse,
+            d_qk**-0.5,
+            d_v=d_v,
+            extra_kv_cache=extra_packed,
+            extra_indices=extra_idx,
+            prefill_impl="swapab",
+        )
+
+
+def test_sparse_mla_sm120_prefill_impl_rejects_unknown_string() -> None:
+    """Unknown prefill_impl strings fail at the Python boundary."""
+    case = _make_dsv3_2_prefill_case(64, num_tokens=128)
+    with pytest.raises(ValueError, match="prefill_impl"):
+        _run_prefill_impl(case, "sg")

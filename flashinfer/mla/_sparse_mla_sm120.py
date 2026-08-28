@@ -148,6 +148,58 @@ _KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32"})
 _BPT_DSV3_2 = 656
 _BPT_DSV4 = 584
 
+# Prefill implementation override; the int values cross the FFI boundary.
+_PREFILL_IMPL_AUTO = 0
+_PREFILL_IMPL_SWAPAB = 1
+_PREFILL_IMPL_MG = 2
+_PREFILL_IMPL_FROM_STR = {
+    "auto": _PREFILL_IMPL_AUTO,
+    "swapab": _PREFILL_IMPL_SWAPAB,
+    "mg": _PREFILL_IMPL_MG,
+}
+# swapAB prefill is instantiated only for the DSV3_2 family (DSV3_2 / GLM_NSA),
+# single cache, topk=2048, filling whole 64-head CTAs.
+_SWAPAB_HEADS = frozenset({64, 128})
+_SWAPAB_TOPK = 2048
+
+
+def _normalize_prefill_impl(prefill_impl: Optional[str]) -> int:
+    if prefill_impl is None:
+        return _PREFILL_IMPL_AUTO
+    impl = _PREFILL_IMPL_FROM_STR.get(prefill_impl)
+    if impl is None:
+        raise ValueError(
+            f"prefill_impl must be one of None, 'auto', 'swapab', 'mg'; "
+            f"got {prefill_impl!r}"
+        )
+    return impl
+
+
+def _check_swapab_eligible(
+    model_type: int,
+    num_heads: int,
+    topk: int,
+    extra_kv_cache: Optional[torch.Tensor],
+) -> None:
+    """Raise ValueError when prefill_impl='swapab' meets an ineligible shape."""
+    if extra_kv_cache is not None:
+        raise ValueError("prefill_impl='swapab' does not support dual-cache")
+    if model_type not in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
+        raise ValueError(
+            "prefill_impl='swapab' requires the DSV3_2 family "
+            f"(d_qk=576); got family={_MODEL_TYPE_TO_FAMILY[model_type]!r}"
+        )
+    if topk != _SWAPAB_TOPK:
+        raise ValueError(
+            f"prefill_impl='swapab' requires topk={_SWAPAB_TOPK}; got topk={topk}"
+        )
+    if num_heads not in _SWAPAB_HEADS:
+        raise ValueError(
+            f"prefill_impl='swapab' requires num_heads in {sorted(_SWAPAB_HEADS)}; "
+            f"got num_heads={num_heads}"
+        )
+
+
 # Kernel-family names used in the public config query and error messages.
 _MODEL_TYPE_TO_FAMILY = {
     _MODEL_TYPE_DSV3_2: "dsv3_2",
@@ -492,6 +544,7 @@ def get_sparse_mla_sm120_module():
         sm_scale: float,
         d_v: int,
         model_type: int,
+        prefill_impl: int,
         topk_length: Optional[torch.Tensor],
         attn_sink: Optional[torch.Tensor],
         extra_kv_cache: Optional[torch.Tensor],
@@ -504,6 +557,8 @@ def get_sparse_mla_sm120_module():
         topk = indices.shape[-1]
         _require_d_v_512(d_v)
         _check_last_dim_512(output, "output")
+        if prefill_impl == _PREFILL_IMPL_SWAPAB:
+            _check_swapab_eligible(model_type, num_heads, topk, extra_kv_cache)
         if num_tokens == 0:
             # Empty request: outputs are already-sized empty tensors; a kernel
             # launch would hit a grid.x=0 CUDA error.
@@ -590,6 +645,7 @@ def get_sparse_mla_sm120_module():
             out_lse,
             sm_scale,
             model_type,
+            prefill_impl,
             topk_length,
             attn_sink,
             extra_kv_cache,
@@ -622,6 +678,7 @@ def _sparse_mla_sm120_paged_attention(
     extra_topk_length: Optional[torch.Tensor] = None,
     mid_out: Optional[torch.Tensor] = None,
     mid_lse: Optional[torch.Tensor] = None,
+    prefill_impl: Optional[str] = None,
 ) -> None:
     r"""Internal Sparse-MLA paged attention on SM120.
 
@@ -684,6 +741,15 @@ def _sparse_mla_sm120_paged_attention(
         Pre-allocated split-K LSE scratch, shape
         ``[>=num_tokens, >=num_heads, >=num_splits]``, dtype float32. Pair with
         ``mid_out`` when the call dispatches to a decode kernel.
+    prefill_impl : Optional[str]
+        Prefill-kernel override for calls that dispatch to prefill. ``None``
+        or ``"auto"`` keeps the default order (swapAB preferred where
+        instantiated); ``"swapab"`` forces the warp-specialized swapAB kernel
+        and raises ``ValueError`` unless the shape is swapAB-eligible (DSV3_2
+        family, single cache, ``topk=2048``, ``num_heads`` in {64, 128});
+        ``"mg"`` forces the non-swapAB SG/MG path. For the DSV4 family
+        ``"mg"`` and ``None`` are no-ops on dispatch, and ``"swapab"`` always
+        raises.
 
     Notes
     -----
@@ -703,6 +769,7 @@ def _sparse_mla_sm120_paged_attention(
         sm_scale,
         d_v,
         model_type,
+        _normalize_prefill_impl(prefill_impl),
         topk_length,
         attn_sink,
         extra_kv_cache,
@@ -866,6 +933,7 @@ class _SparseMLAPagedAttentionRunner:
         out_lse: Optional[torch.Tensor] = None,
         mid_out: Optional[torch.Tensor] = None,
         mid_lse: Optional[torch.Tensor] = None,
+        prefill_impl: Optional[str] = None,
         return_lse: bool = False,
     ) -> Optional[torch.Tensor]:
         """Run sparse-MLA paged attention.
@@ -880,6 +948,13 @@ class _SparseMLAPagedAttentionRunner:
         or as 4-D ``[num_tokens, 1, num_heads, head_dim]`` (some callers carry
         a singleton s_q dim); the 4-D form is squeezed in place. Calls that
         dispatch to a decode kernel must pass ``mid_out`` and ``mid_lse``.
+
+        ``prefill_impl`` (``None``/``"auto"``/``"swapab"``/``"mg"``) overrides
+        the prefill-kernel selection for calls that dispatch to prefill;
+        ``"swapab"`` raises ``ValueError`` on shapes outside its envelope
+        (DSV3_2 family, single cache, ``topk=2048``, ``num_heads`` in
+        {64, 128}) and is a no-op distinction for DSV4, where only the
+        non-swapAB path exists.
         """
         if q.dim() == 4:
             if q.size(1) != 1:
@@ -926,6 +1001,7 @@ class _SparseMLAPagedAttentionRunner:
             extra_topk_length=extra_topk_length,
             mid_out=mid_out,
             mid_lse=mid_lse,
+            prefill_impl=prefill_impl,
         )
         return out_lse_view if return_lse else None
 
