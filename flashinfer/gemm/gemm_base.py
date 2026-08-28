@@ -6414,7 +6414,7 @@ def _b12x_gemm_fp4_requirement(
 
 
 # Keyed by device, dtypes, launch options, and tactic.
-_LOW_LATENCY_BLOCK_SCALED_KERNEL_CACHE: dict[tuple, object] = {}
+_LOW_LATENCY_BLOCK_SCALED_KERNEL_CACHE: dict[tuple, Callable] = {}
 
 
 def _low_latency_blockscaled_gemm_runner(
