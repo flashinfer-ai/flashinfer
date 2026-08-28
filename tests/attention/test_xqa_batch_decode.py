@@ -589,6 +589,161 @@ def test_xqa_batch_decode(
     )
 
 
+def generate_causal_mask(
+    batch_size: int,
+    q_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Generate causal attention mask for speculative decoding."""
+    num_packed_masks_per_token = (q_seq_len + 31) // 32
+
+    q_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(1)
+    kv_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(0)
+
+    causal_bool_mask = kv_indices <= q_indices
+
+    padded_seq_len = num_packed_masks_per_token * 32
+    if padded_seq_len > q_seq_len:
+        padding = torch.zeros(
+            q_seq_len, padded_seq_len - q_seq_len, device=device, dtype=torch.bool
+        )
+        causal_bool_mask = torch.cat([causal_bool_mask, padding], dim=1)
+
+    causal_bool_mask = causal_bool_mask.view(q_seq_len, num_packed_masks_per_token, 32)
+
+    bit_positions = torch.tensor(
+        [1 << i for i in range(32)], device=device, dtype=torch.int64
+    )
+
+    mask_uint32 = (
+        (causal_bool_mask.to(torch.int64) * bit_positions).sum(dim=-1).to(torch.uint32)
+    )
+
+    mask_uint32 = (
+        mask_uint32.unsqueeze(0)
+        .expand(batch_size, q_seq_len, num_packed_masks_per_token)
+        .contiguous()
+    )
+
+    mask_uint16 = mask_uint32.view(torch.uint16)
+
+    return mask_uint16
+
+
+@pytest.mark.skipif(
+    get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
+    reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
+)
+def test_batch_decode_tensor_cores_mtp_uses_xqa_decode_path():
+    batch_size = 4
+    q_len_per_req = 2
+    page_size = 16
+    num_kv_heads = 2
+    head_grp_size = 4
+    num_qo_heads = num_kv_heads * head_grp_size
+    head_dim = 128
+    kv_layout = "NHD"
+
+    torch.manual_seed(0)
+    q_lens, _, seq_lens = generate_seq_lens_decode(
+        batch_size, q_len_per_req, max_in_kv_len=110
+    )
+    q, q_scale, _ = create_query_tensor(q_lens, num_qo_heads, head_dim, "bf16")
+    kv_cache, k_scale, v_scale, _, _, _ = create_kv_cache(
+        batch_size,
+        seq_lens,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        "bf16",
+        "bf16",
+        kv_layout,
+    )
+    page_table, all_page_ids, page_per_seq = create_page_table(
+        batch_size, seq_lens, page_size
+    )
+    kv_indptr = generate_cumsum_lens(page_per_seq)
+    kv_last_page_len = get_last_page_len(seq_lens, page_size)
+    mask = generate_causal_mask(batch_size, q_len_per_req, GPU_DEVICE)
+    sm_scale = float(1.0 / (head_dim**0.5))
+
+    workspace_direct, workspace_wrapper = create_workspace_buffers(GPU_DEVICE)
+    out_direct = torch.empty_like(q)
+    output_direct = flashinfer.decode.xqa_batch_decode_with_kv_cache(
+        q,
+        kv_cache,
+        workspace_direct,
+        page_table,
+        seq_lens.to(GPU_DEVICE),
+        torch.max(seq_lens).item(),
+        q_scale * k_scale * sm_scale,
+        v_scale,
+        out=out_direct,
+        kv_layout=kv_layout,
+        q_len_per_req=q_len_per_req,
+        mask=mask,
+    )
+
+    wrapper = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_wrapper, kv_layout, use_tensor_cores=True, backend="fa2"
+    )
+    wrapper.plan(
+        kv_indptr,
+        all_page_ids,
+        kv_last_page_len.to(GPU_DEVICE),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        block_tables=page_table,
+        q_len_per_req=q_len_per_req,
+    )
+    assert wrapper._use_xqa_mtp_decode
+
+    output_wrapper = wrapper.run(q, kv_cache)
+
+    torch.testing.assert_close(
+        output_wrapper.float(),
+        output_direct.float(),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+    workspace_implicit = torch.empty(
+        workspace_size, dtype=torch.int8, device=GPU_DEVICE
+    )
+    wrapper_implicit = flashinfer.decode.BatchDecodeWithPagedKVCacheWrapper(
+        workspace_implicit, kv_layout, use_tensor_cores=True, backend="fa2"
+    )
+    wrapper_implicit.plan(
+        kv_indptr,
+        all_page_ids,
+        kv_last_page_len.to(GPU_DEVICE),
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        page_size,
+        pos_encoding_mode="NONE",
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        q_len_per_req=q_len_per_req,
+    )
+    assert wrapper_implicit._use_xqa_mtp_decode
+    torch.testing.assert_close(wrapper_implicit._block_tables, page_table)
+
+    output_wrapper_implicit = wrapper_implicit.run(q, kv_cache)
+
+    torch.testing.assert_close(
+        output_wrapper_implicit.float(),
+        output_direct.float(),
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+
 @pytest.mark.skipif(
     get_compute_capability(torch.device(device="cuda"))[0] not in [9, 10, 12],
     reason="XQA is only supported on SM90, SM100, SM120/SM121 GPUs",
