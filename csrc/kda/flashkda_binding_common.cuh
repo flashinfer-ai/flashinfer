@@ -615,6 +615,16 @@ inline CUtensorMap EncodeValueTma(const TensorView& tensor) {
   return tensor_map;
 }
 
+template <int ValueRows, int ChunkTokens, bool QkStyleLayout>
+inline CUtensorMap EncodeValueTmaForKernel(const TensorView& tensor) {
+  if constexpr (QkStyleLayout) {
+    static_assert(ValueRows == 128);
+    return EncodeQkTma<ChunkTokens>(tensor, "v");
+  } else {
+    return EncodeValueTma<ValueRows, ChunkTokens>(tensor);
+  }
+}
+
 template <int ChunkTokens>
 inline CUtensorMap EncodeGateTma(const TensorView& tensor) {
   static_assert(ChunkTokens == 16 || ChunkTokens == 32);
@@ -726,7 +736,7 @@ static __global__ void PublishTensorMaps(uint64_t* destination, TensorMapWords s
 }
 
 template <int ValueRows, int ChunkTokens = 32, bool PairPackedBeta = false,
-          int ValueTmaRows = ValueRows>
+          int ValueTmaRows = ValueRows, bool QkStyleValueTma = false>
 inline TmaPointers EncodeTmaPointers(const TensorView& q, const TensorView& k, const TensorView& v,
                                      const TensorView& g, const TensorView& beta_tma,
                                      const TensorView& out, const TensorView& descriptor_storage,
@@ -742,7 +752,7 @@ inline TmaPointers EncodeTmaPointers(const TensorView& q, const TensorView& k, c
     const std::array<CUtensorMap, kTensorMapCount> host_maps = {
         EncodeQkTma<ChunkTokens>(q, "q"),
         EncodeQkTma<ChunkTokens>(k, "k"),
-        EncodeValueTma<ValueTmaRows, ChunkTokens>(v),
+        EncodeValueTmaForKernel<ValueTmaRows, ChunkTokens, QkStyleValueTma>(v),
         EncodeGateTma<ChunkTokens>(g),
         EncodeBetaTma<ChunkTokens, PairPackedBeta>(beta_tma),
         EncodeOutputTma<ValueRows, ChunkTokens>(out),
