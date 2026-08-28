@@ -15,7 +15,6 @@ def test_registered_capability_records_are_unique_and_complete():
     assert rows
     assert len(keys) == len(set(keys))
     assert all(row.activation_classes for row in rows)
-    assert all(row.routing_modes for row in rows)
 
 
 def test_documented_activation_matrix_matches_runner_registry():
@@ -30,4 +29,7 @@ def test_documented_activation_matrix_matches_runner_registry():
     end = "<!-- END GENERATED MOE ACTIVATION MATRIX -->"
 
     documented = text.split(begin, 1)[1].split(end, 1)[0].strip()
-    assert documented == render_moe_activation_matrix()
+    assert documented == render_moe_activation_matrix(), (
+        'regenerate with: python -c "from flashinfer.fused_moe.capabilities '
+        'import render_moe_activation_matrix as r; print(r())"'
+    )

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .api import ActivationConfig, QuantVariant, RoutingInputMode
+from .api import ActivationConfig, QuantVariant
 
 
 @dataclass(frozen=True)
@@ -13,12 +13,8 @@ class MoEBackendCapability:
 
     backend_key: str
     config_type: type
-    runner_type: type
     quant_variant: QuantVariant
     activation_classes: tuple[type[ActivationConfig], ...]
-    routing_modes: tuple[RoutingInputMode, ...]
-    supports_expert_parallelism: bool
-    supports_fused_shared_experts: bool
 
 
 def get_moe_backend_capabilities() -> tuple[MoEBackendCapability, ...]:
@@ -50,12 +46,8 @@ def get_moe_backend_capabilities() -> tuple[MoEBackendCapability, ...]:
                 MoEBackendCapability(
                     backend_key=runner_type.backend_key,
                     config_type=config_type,
-                    runner_type=runner_type,
                     quant_variant=variant,
                     activation_classes=activations,
-                    routing_modes=runner_type.supported_routing_modes,
-                    supports_expert_parallelism=runner_type.supports_expert_parallelism,
-                    supports_fused_shared_experts=runner_type.supports_fused_shared_experts,
                 )
             )
 

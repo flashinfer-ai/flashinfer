@@ -719,6 +719,11 @@ has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
 silently dropping the parameter.
 
 The class-level matrix below is generated from the registered runner classes.
+Regenerate its contents with:
+
+```bash
+python -c "from flashinfer.fused_moe.capabilities import render_moe_activation_matrix as r; print(r())"
+```
 
 <!-- BEGIN GENERATED MOE ACTIVATION MATRIX -->
 | Backend | Config | Quantization | Typed activations |

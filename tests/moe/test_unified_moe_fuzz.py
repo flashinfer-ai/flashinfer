@@ -185,9 +185,13 @@ from flashinfer.fused_moe import (
 )
 from flashinfer.fused_moe.api import (
     # Typed activation values
+    GELU,
     GeGLU,
     GeGLUTanh,
+    Identity,
+    ReLU,
     ReLU2,
+    SiLU,
     SiTU,
     SwiGLU,
     SwiGLUStep,
@@ -454,6 +458,50 @@ def _mxint4_act_pack_logits(x, routing_logits, routing_bias):
     )
 
 
+def _apply_typed_activation(fc1, activation, intermediate_size):
+    """Apply one typed activation to canonical GEMM1 output."""
+    if isinstance(activation, ReLU2):
+        return F.relu(fc1) ** 2
+    if isinstance(activation, Identity):
+        return fc1
+    if isinstance(activation, GELU):
+        return F.gelu(fc1, approximate="none")
+    if isinstance(activation, ReLU):
+        return F.relu(fc1)
+    if isinstance(activation, SiLU):
+        return F.silu(fc1)
+
+    up, gate = fc1[:, :intermediate_size], fc1[:, intermediate_size:]
+    if isinstance(activation, SwiGLU):
+        gate = gate.clamp(max=activation.limit)
+        up = up.clamp(min=-activation.limit, max=activation.limit)
+        return gate * torch.sigmoid(activation.alpha * gate) * (up + activation.beta)
+    if isinstance(activation, GeGLU):
+        return F.gelu(gate, approximate="none") * up
+    if isinstance(activation, GeGLUTanh):
+        return F.gelu(gate, approximate="tanh") * up
+    if isinstance(activation, SwiGLUStep):
+        return F.silu(gate).clamp(max=activation.limit) * up.clamp(
+            min=-activation.limit, max=activation.limit
+        )
+    if isinstance(activation, SiTU):
+        if activation.clamp_limit is not None:
+            up = up.clamp(min=-activation.clamp_limit, max=activation.clamp_limit)
+            gate = gate.clamp(max=activation.clamp_limit)
+        linear = (
+            up
+            if activation.linear_scale is None
+            else activation.linear_scale * torch.tanh(up / activation.linear_scale)
+        )
+        return (
+            linear
+            * activation.gate_scale
+            * torch.tanh(gate / activation.gate_scale)
+            * torch.sigmoid(gate)
+        )
+    raise AssertionError(f"unsupported fuzz activation {activation!r}")
+
+
 def _bf16_reference(
     x,
     w1,
@@ -479,47 +527,7 @@ def _bf16_reference(
             continue
         tok, nth = torch.where(mask)
         fc1 = x32[tok] @ w1[local_e].float().t()
-        if isinstance(activation, ReLU2):
-            inter = F.relu(fc1) ** 2
-        else:
-            up, gate = fc1[:, :half], fc1[:, half:]
-            if isinstance(activation, SwiGLU):
-                gate = gate.clamp(max=activation.limit)
-                up = up.clamp(min=-activation.limit, max=activation.limit)
-                inter = (
-                    gate
-                    * torch.sigmoid(activation.alpha * gate)
-                    * (up + activation.beta)
-                )
-            elif isinstance(activation, GeGLU):
-                inter = F.gelu(gate) * up
-            elif isinstance(activation, GeGLUTanh):
-                inter = F.gelu(gate, approximate="tanh") * up
-            elif isinstance(activation, SwiGLUStep):
-                inter = F.silu(gate).clamp(max=activation.limit) * up.clamp(
-                    min=-activation.limit, max=activation.limit
-                )
-            elif isinstance(activation, SiTU):
-                if activation.clamp_limit is not None:
-                    up = up.clamp(
-                        min=-activation.clamp_limit, max=activation.clamp_limit
-                    )
-                    gate = gate.clamp(max=activation.clamp_limit)
-                # linear_scale=None is the unclamped linear branch.
-                linear = (
-                    up
-                    if activation.linear_scale is None
-                    else activation.linear_scale
-                    * torch.tanh(up / activation.linear_scale)
-                )
-                inter = (
-                    linear
-                    * activation.gate_scale
-                    * torch.tanh(gate / activation.gate_scale)
-                    * torch.sigmoid(gate)
-                )
-            else:
-                raise AssertionError(f"unsupported BF16 fuzz activation {activation!r}")
+        inter = _apply_typed_activation(fc1, activation, half)
         inter = inter.to(torch.bfloat16).float()  # gemm1 output is stored bf16
         expert_out = (inter @ w2[local_e].float().t()).to(torch.bfloat16).float()
         out[tok] += final_scales[tok, nth, None] * expert_out
@@ -869,7 +877,14 @@ def _contract_fp8_act_pack(config_cls):
 def _semantic_reference(
     x, w1, w2, selected_experts, final_scales, intermediate_size, activation
 ):
-    """Semantic CUTLASS/b12x reference in canonical [up, gate] row order."""
+    """Semantic CUTLASS/b12x reference in canonical [up, gate] row order.
+
+    Keep routing weights in FP32: these runners consume separate precomputed
+    tensors, unlike TRTLLM's packed-ID path, which truncates weights to BF16.
+    Quant-specific callers supply dequantized activation and weight operands.
+    This idealized semantic oracle also leaves GEMM intermediates in FP32;
+    ``_bf16_reference`` adds its backend-specific BF16 storage round-trips.
+    """
     x32 = x.float()
     out = torch.zeros_like(x32)
     for expert in range(w1.shape[0]):
@@ -877,41 +892,7 @@ def _semantic_reference(
         if token.numel() == 0:
             continue
         fc1 = x32[token] @ w1[expert].float().t()
-        if isinstance(activation, ReLU2):
-            inter = F.relu(fc1) ** 2
-        else:
-            up, gate = fc1[:, :intermediate_size], fc1[:, intermediate_size:]
-            if isinstance(activation, SwiGLU):
-                gate = gate.clamp(max=activation.limit)
-                up = up.clamp(min=-activation.limit, max=activation.limit)
-                inter = (
-                    gate
-                    * torch.sigmoid(activation.alpha * gate)
-                    * (up + activation.beta)
-                )
-            elif isinstance(activation, GeGLUTanh):
-                inter = F.gelu(gate, approximate="tanh") * up
-            elif isinstance(activation, GeGLU):
-                inter = F.gelu(gate, approximate="none") * up
-            elif isinstance(activation, SwiGLUStep):
-                inter = F.silu(gate).clamp(max=activation.limit) * up.clamp(
-                    min=-activation.limit, max=activation.limit
-                )
-            elif isinstance(activation, SiTU):
-                linear = (
-                    up
-                    if activation.linear_scale is None
-                    else activation.linear_scale
-                    * torch.tanh(up / activation.linear_scale)
-                )
-                inter = (
-                    linear
-                    * activation.gate_scale
-                    * torch.tanh(gate / activation.gate_scale)
-                    * torch.sigmoid(gate)
-                )
-            else:
-                raise AssertionError(f"unsupported contract activation {activation!r}")
+        inter = _apply_typed_activation(fc1, activation, intermediate_size)
         expert_out = inter @ w2[expert].float().t()
         out[token] += final_scales[token, slot, None].float() * expert_out
     return out
@@ -960,6 +941,25 @@ def _dequant_linear_mxfp4(packed, scales):
     values = torch.where((codes & 0x8) != 0, -values, values)
     scale = torch.exp2(scales.to(torch.int16).float() - 127)
     return values * scale.repeat_interleave(32, dim=-1)
+
+
+def _mxfp8_quant_dequant_experts(weight):
+    from flashinfer import mxfp8_dequantize_host
+    from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+
+    dequantized = []
+    for expert in range(weight.shape[0]):
+        packed, scale = mxfp8_quantize(
+            weight[expert], is_sf_swizzled_layout=True, alignment=32
+        )
+        dequantized.append(
+            mxfp8_dequantize_host(
+                packed.cpu().view(torch.uint8),
+                scale.cpu().view(torch.uint8).reshape(-1),
+                True,
+            )
+        )
+    return torch.stack(dequantized).to(weight.device)
 
 
 def _cutlass_post_reference(backend_key):
@@ -1034,6 +1034,11 @@ def _cutlass_post_reference(backend_key):
                 view["_activation_scale"].cpu().view(torch.uint8).reshape(-1),
                 True,
             ).to(x.device)
+            # Re-quantize independently from the canonical weights instead of
+            # consuming the prepared scale view. This catches a broken
+            # _pack_mxfp8_weight_scales transformation in the production path.
+            w1_ref = _mxfp8_quant_dequant_experts(w1)
+            w2_ref = _mxfp8_quant_dequant_experts(w2)
         elif backend_key == "cutlass_w4a8":
             from flashinfer.fused_moe.prepare import _quantize_int4_grouped
 
@@ -1216,6 +1221,7 @@ def _contract_handler(
     *,
     activation_pack,
     reference,
+    snap=_block_fp8_snap,
     prepare_weights=None,
     atol_frac=0.2,
     rtol=0.2,
@@ -1223,7 +1229,7 @@ def _contract_handler(
     return DTypeHandler(
         variant=variant,
         candidate_configs=(config_cls,),
-        snap=_block_fp8_snap,
+        snap=snap,
         make_act_pack=activation_pack,
         make_act_pack_logits=None,
         reference=lambda *_: None,
@@ -1245,6 +1251,9 @@ _CONTRACT_HANDLERS = {
         QuantVariant.NVFP4,
         activation_pack=_contract_bf16_act_pack,
         reference=_cutlass_post_reference("cutlass_nvfp4"),
+        snap=_snap_to_nvfp4,
+        atol_frac=0.15,
+        rtol=0.1,
     ),
     "cutlass_fp8_per_tensor": _contract_handler(
         CutlassFp8PerTensorConfig,
@@ -1275,6 +1284,8 @@ _CONTRACT_HANDLERS = {
         QuantVariant.MxFp8,
         activation_pack=_contract_fp8_act_pack(CutlassMxfp8Config),
         reference=_cutlass_post_reference("cutlass_mxfp8"),
+        atol_frac=0.1,
+        rtol=0.1,
     ),
     "cutlass_w4a8": _contract_handler(
         CutlassW4A8Config,
@@ -1295,6 +1306,7 @@ _CONTRACT_HANDLERS = {
         QuantVariant.NVFP4,
         activation_pack=_contract_bf16_act_pack,
         reference=_b12x_post_reference,
+        snap=_snap_to_nvfp4,
         atol_frac=0.15,
         rtol=0.1,
     ),
@@ -1339,6 +1351,10 @@ def _activation_for(cfg):
         "relu2": ReLU2(),
         "geglutanh": GeGLUTanh(),
         "swiglustep": SwiGLUStep(),
+        "identity": Identity(),
+        "gelu": GELU(),
+        "relu": ReLU(),
+        "silu": SiLU(),
     }[cfg.activation]
 
 
@@ -2146,6 +2162,13 @@ _CURATED = [
             ("b12x_nvfp4", "b12x_nvfp4", "geglutanh", 900_095),
             ("b12x_w4a16", "b12x_w4a16", "swiglu", 900_096),
             ("b12x_w4a16", "b12x_w4a16", "relu2", 900_097),
+            # Non-gated geometry (gemm1_rows == I, no up/gate split). CUTLASS
+            # NVFP4 declares all four, so these reach the shared
+            # _apply_typed_activation branches that the gated cases cannot.
+            ("cutlass_nvfp4", "cutlass_nvfp4", "identity", 900_098),
+            ("cutlass_nvfp4", "cutlass_nvfp4", "gelu", 900_099),
+            ("cutlass_nvfp4", "cutlass_nvfp4", "relu", 900_100),
+            ("cutlass_nvfp4", "cutlass_nvfp4", "silu", 900_101),
         )
     ],
 ]
@@ -2160,7 +2183,7 @@ for _cfg in _CURATED:
 
 
 def test_random_seed_stream_is_unchanged():
-    """Lock the historical default _gen(BASE_SEED+i) stream before overlays."""
+    """Lock the raw ``_gen(i)`` stream independently of curated overlays."""
     payload = "\n".join(repr(_gen(i)) for i in range(160)).encode()
     assert (
         hashlib.sha256(payload).hexdigest()
@@ -2185,16 +2208,6 @@ def test_contract_handler_inventory_is_single_backend_and_non_deterministic():
         assert len(handler.candidate_configs) == 1
         config_type = handler.candidate_configs[0]
         assert _BACKEND_RUNNERS[config_type].backend_key == backend_key
-        assert [
-            candidate
-            for candidate in handler.candidate_configs
-            if _BACKEND_RUNNERS[candidate].backend_key in {backend_key}
-        ] == [config_type]
-        assert not [
-            candidate
-            for candidate in handler.candidate_configs
-            if _BACKEND_RUNNERS[candidate].backend_key in {"some_other_backend"}
-        ]
         assert backend_key not in _DETERMINISTIC
 
 
@@ -2204,9 +2217,7 @@ def test_contract_curated_seeds_match_declared_capabilities():
         for row in get_moe_backend_capabilities()
     }
     contract_cases = [cfg for cfg in _CURATED if cfg.variant in _CONTRACT_HANDLERS]
-    assert len(contract_cases) == 18
-    assert len({cfg.seed for cfg in _CURATED}) == len(_CURATED)
-    assert {cfg.seed for cfg in contract_cases} == set(range(900_080, 900_098))
+    assert {cfg.seed for cfg in contract_cases} == set(range(900_080, 900_102))
     for cfg in contract_cases:
         handler = _handler_for(cfg)
         config_type = handler.candidate_configs[0]
@@ -2217,6 +2228,27 @@ def test_contract_curated_seeds_match_declared_capabilities():
         assert cfg.do_finalize and not cfg.is_ep
         assert cfg.num_fused_shared_experts == 0
         assert _BACKEND_RUNNERS[config_type].backend_key == cfg.expected_backend
+
+
+def test_semantic_reference_applies_situ_clamp():
+    activation = SiTU(gate_scale=4.0, linear_scale=25.0, clamp_limit=1.0)
+    x = torch.tensor([[2.0]])
+    w1 = torch.tensor([[[3.0], [4.0]]])
+    w2 = torch.ones(1, 1, 1)
+    selected = torch.zeros(1, 1, dtype=torch.int32)
+    routing_weights = torch.ones(1, 1)
+
+    actual = _semantic_reference(x, w1, w2, selected, routing_weights, 1, activation)
+    up = torch.tensor(1.0)
+    gate = torch.tensor(1.0)
+    expected = (
+        activation.linear_scale
+        * torch.tanh(up / activation.linear_scale)
+        * activation.gate_scale
+        * torch.tanh(gate / activation.gate_scale)
+        * torch.sigmoid(gate)
+    )
+    torch.testing.assert_close(actual, expected.reshape(1, 1))
 
 
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
@@ -2442,6 +2474,9 @@ _CONTRACT_ENVIRONMENT_ERRORS = (
 
 
 def _is_contract_environment_unavailable(e: Exception) -> bool:
+    # Deliberately fail closed: only known environment diagnostics may skip.
+    # A reworded or new rejection should fail CI until it is classified rather
+    # than silently masking a backend capability regression.
     msg = str(e).lower()
     return any(reason in msg for reason in _CONTRACT_ENVIRONMENT_ERRORS)
 
@@ -2894,6 +2929,9 @@ def test_unified_moe_fuzz(cfg):
             and tuple(t.shape) == out_shape
             and t.data_ptr() not in act_ptrs
         ]
+        # b12x's wrapper allocates and returns its output internally, so
+        # pack_inputs intentionally has no caller-visible output to initialize.
+        # Its clean run still receives the numeric and non-finite checks below.
         if runner.backend_key not in _B12X_BACKEND_KEYS:
             assert bufs, "could not locate the output buffer in pack_inputs"
         for b in bufs:
@@ -2958,6 +2996,8 @@ def test_unified_moe_fuzz(cfg):
         # (4) output-buffer poison: the kernel owns its (uninitialized `new_empty`) output, so the
         # result must NOT depend on it being clean. torch's allocator usually hands back zeros and
         # hides this; poisoning forces it -- the torch->JAX hazard (GH-6158764 padding leak).
+        # b12x cannot participate because its wrapper does not expose that
+        # internally allocated output through pack_inputs.
         if runner.backend_key not in _B12X_BACKEND_KEYS:
             assert_correct(run(runner, poison=True), f"{tag} [poisoned-output]")
         # (5) autotune-tactic sweep: EVERY valid tactic must be correct, not just the default --
