@@ -48,10 +48,15 @@ from typing import Collection, Tuple
 BLACKWELL_CUBIN_ARCHS: Tuple[str, ...] = ("Sm100a", "Sm100f", "Sm103a")
 
 # Cubin architectures the *Rubin* trtllm-gen module can dispatch to.
-# Mirrors isArchCompatible() for smVersion == 107.  Note that sm100f cubins are
-# NOT loadable on Rubin for BMM/GEMM -- unlike trtllm-gen FMHA, whose
-# isSMCompatible() in include/flashinfer/trtllm/fmha/fmhaKernels.cuh does accept
-# kSM_100f on kSM_107.
+# Mirrors isArchCompatible() for smVersion == 107, which accepts only Sm107a.
+# That is a dispatch policy, not a hardware limit: sm100f cubins do load and
+# execute on Rubin (cuModuleLoadData succeeds for sm_100f on cc 10.7 and fails
+# with CUDA_ERROR_NO_BINARY_FOR_GPU for sm_100a/sm_103a).  Keep this tuple in
+# sync with isArchCompatible() -- listing an arch the runtime filter then
+# discards yields a module carrying cubins it will never dispatch to.
+# trtllm-gen FMHA makes the opposite policy choice: isSMCompatible() in
+# include/flashinfer/trtllm/fmha/fmhaKernels.cuh does accept kSM_100f on
+# kSM_107.
 RUBIN_CUBIN_ARCHS: Tuple[str, ...] = ("Sm107a",)
 
 # An entry starts at column 0 with the four leading POD members of

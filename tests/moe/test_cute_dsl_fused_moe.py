@@ -107,6 +107,12 @@ def _skip_sm107_unimplemented_moe_features(request):
     if request.node.function.__name__ == "test_geglu_tanh_accuracy":
         pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
 
+    if (
+        request.node.function.__name__
+        == "test_deterministic_finalize_numerical_accuracy"
+    ):
+        pytest.skip("SM107 finalize kernel implements only the fused path")
+
 
 def is_sm100_family():
     """Check for the SM100 family: Blackwell SM100/SM103 and Rubin SM107.
@@ -1182,6 +1188,8 @@ class TestAutotunerBucketConfig:
 @cute_dsl_available
 @sm100_required
 class TestCuteDslMoeW4A16:
+    pytestmark = _requires_dsl_arch
+
     @pytest.mark.parametrize("use_wrapper", [False, True])
     def test_weight_scale_update(self, use_wrapper: bool):
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe_nvfp4
@@ -1773,6 +1781,12 @@ class TestCuteDslFusedMoeFunctional:
         situ_linear_beta: float | None,
     ):
         """Accuracy test for SiTU with optional smooth up-branch clamping."""
+        if is_sm107():
+            pytest.skip(
+                "Rubin (SM107) cute-dsl MoE kernels do not implement SiTU; the "
+                "gather kernel is SwiGLU-only and silently ignores situ_beta/"
+                "situ_linear_beta"
+            )
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512

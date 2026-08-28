@@ -46,7 +46,7 @@ bool isArchCompatible(int smVersion, gemm::trtllm::gen::CudaArch cubinArch) {
     case CudaArch::Sm100a:
       return smVersion == 100;
     case CudaArch::Sm100f:
-      return smVersion == 100 || smVersion == 103;
+      return smVersion == 100 || smVersion == 103 || smVersion == 107;
     case CudaArch::Sm103a:
       return smVersion == 103;
 #ifdef TLLM_RUBIN_FEATURES

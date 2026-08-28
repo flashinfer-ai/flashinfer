@@ -855,7 +855,10 @@ class CuteDslNvfp4Runner(MoERunner):
         from ..cute_dsl.availability import is_rubin_cute_dsl_available
         from ..utils import get_compute_capability
 
-        if get_compute_capability(self.device) != (10, 7):
+        device = getattr(self, "device", None)
+        if device is None:
+            return
+        if get_compute_capability(device) != (10, 7):
             return
         if not is_rubin_cute_dsl_available():
             raise NotImplementedError(
