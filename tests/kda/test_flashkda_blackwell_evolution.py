@@ -26,6 +26,7 @@ from flashinfer.jit.flash_kda_evolution import (
     gen_flash_kda_evolution_module,
 )
 from flashinfer.kda_evolution import (
+    PreparedFlashKDAEvolution,
     _route,
     _use_evolution_route,
     prepare_flash_kda_evolution,
@@ -92,6 +93,46 @@ def test_flashkda_evolution_profile_is_frozen():
     assert metadata.value_rows == 128
     assert not metadata.has_tile_schedule
     assert metadata.kernel_symbol.endswith("vtile_f1_t8192_h96_p1_s96")
+
+
+def test_prepared_flashkda_evolution_rejects_cross_stream_launch(monkeypatch):
+    class FakeModule:
+        def __init__(self):
+            self.calls = []
+
+        def run(self, *args):
+            self.calls.append(args)
+
+    streams = iter(
+        (
+            SimpleNamespace(cuda_stream=17),
+            SimpleNamespace(cuda_stream=17),
+            SimpleNamespace(cuda_stream=23),
+        )
+    )
+    seen_devices = []
+
+    def current_stream(device):
+        seen_devices.append(device)
+        return next(streams)
+
+    monkeypatch.setattr(torch.cuda, "current_stream", current_stream)
+    prepared = PreparedFlashKDAEvolution.__new__(PreparedFlashKDAEvolution)
+    prepared.route = "evolution"
+    prepared._device = torch.device("cuda:1")
+    prepared._launch_stream_ptr = None
+    prepared._prepare_descriptors = True
+    prepared._args = ()
+    prepared._launch_scalars = ()
+    prepared.module = FakeModule()
+
+    prepared.launch()
+    prepared.launch()
+    with pytest.raises(RuntimeError, match="stream used by the first launch"):
+        prepared.launch()
+
+    assert prepared.module.calls == [(1, 17), (0, 17)]
+    assert seen_devices == [prepared._device] * 3
 
 
 def test_flashkda_evolution_module_ident_covers_all_included_sources(tmp_path):

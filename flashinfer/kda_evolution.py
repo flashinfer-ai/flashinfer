@@ -17,6 +17,7 @@ limitations under the License.
 from __future__ import annotations
 
 import heapq
+import itertools
 from dataclasses import dataclass
 from typing import cast
 
@@ -301,6 +302,9 @@ class PreparedFlashKDAEvolution:
     Stable generated winners retain their exported specialization. Other
     shapes use the production Cake dispatcher while preserving this adapter's
     independent initial-state and final-state buffers.
+
+    A prepared evolution route is bound to the CUDA stream used by its first
+    launch. Create a separate prepared instance for another stream.
     """
 
     def __init__(
@@ -335,7 +339,7 @@ class PreparedFlashKDAEvolution:
         else:
             offsets = tuple(int(value) for value in cu_seqlens.tolist())
         sequence_lengths = tuple(
-            end - start for start, end in zip(offsets, offsets[1:], strict=False)
+            end - start for start, end in itertools.pairwise(offsets)
         )
         target = _select_flash_kda_prefill_target(q.device)
         if not _use_evolution_route(sequence_lengths, num_heads, fixed_layout):
@@ -395,6 +399,8 @@ class PreparedFlashKDAEvolution:
         self.target = target
         self.grid_x = route.grid_x
         self.route = "evolution"
+        self._device = q.device
+        self._launch_stream_ptr: int | None = None
         self._prepare_descriptors = True
         self._args = (
             q.reshape(total_tokens, num_heads, _HEAD_DIM),
@@ -431,7 +437,17 @@ class PreparedFlashKDAEvolution:
         if self.route == "cake":
             _run_flash_kda_prefill(**self._cake_args)
             return
-        stream_ptr = int(torch.cuda.current_stream().cuda_stream)
+        stream_ptr = int(torch.cuda.current_stream(self._device).cuda_stream)
+        if self._launch_stream_ptr is None:
+            # Bind before entering FFI: if a launch reports an error after
+            # enqueueing descriptor publication, a retry cannot race it from
+            # another stream.
+            self._launch_stream_ptr = stream_ptr
+        elif stream_ptr != self._launch_stream_ptr:
+            raise RuntimeError(
+                "PreparedFlashKDAEvolution launches must remain on the CUDA "
+                "stream used by the first launch"
+            )
         self.module.run(
             *self._args,
             int(self._prepare_descriptors),

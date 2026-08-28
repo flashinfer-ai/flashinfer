@@ -189,7 +189,8 @@ def main() -> None:
     if args.dry_run_iters <= 0 or args.repeat_iters <= 0:
         parser.error("--dry-run-iters and --repeat-iters must be positive")
 
-    _require_cupti()
+    if not args.correctness_only:
+        _require_cupti()
     cases = LEGACY_CASES if args.suite == "six" else PRODUCTION_CASES
     rows = [
         _run_case(
