@@ -21,7 +21,7 @@ from collections import defaultdict
 from dataclasses import astuple, replace
 from enum import Enum
 from types import SimpleNamespace
-from typing import Callable, List, Literal, Optional, Tuple
+from typing import Callable, cast, List, Literal, Optional, Tuple
 
 from flashinfer.trtllm_low_latency_gemm import trtllm_low_latency_gemm
 import torch
@@ -2048,6 +2048,96 @@ def get_tgv_gemm_sm10x_module(
     )
 
 
+@supported_compute_capability([100, 103])
+def _cutedsl_low_latency_blockscaled_tgv_requirement(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor,
+    a_descale: Optional[torch.Tensor],
+    b_descale: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
+):
+    if a_descale is None or b_descale is None:
+        raise ValueError("Block-scaled TGV inputs require a_descale and b_descale")
+
+    fp4_dtype = get_native_fp4_dtype()
+    quantized_dtypes = (fp4_dtype, torch.float8_e4m3fn, torch.float8_e5m2)
+    if (
+        a.dtype not in quantized_dtypes
+        or b.dtype not in quantized_dtypes
+        or a_descale.dtype != b_descale.dtype
+    ):
+        raise ValueError(
+            "Block-scaled TGV requires FP4/FP8 operands and matching scale dtypes"
+        )
+    if a_descale.dtype == torch.float8_e4m3fn:
+        if a.dtype != fp4_dtype or b.dtype != fp4_dtype:
+            raise ValueError("E4M3 scale factors are only supported for NVFP4 x NVFP4")
+    elif a_descale.dtype != torch.float8_e8m0fnu:
+        raise ValueError("Block-scaled TGV scales must be E4M3 or E8M0")
+    if bias.dtype not in (torch.bfloat16, torch.float16):
+        raise ValueError("Block-scaled TGV bias must be BF16 or FP16")
+
+    if (
+        a.ndim != 2
+        or b.ndim != 2
+        or not a.is_contiguous()
+        or b.stride() != (1, b.shape[0])
+    ):
+        raise ValueError(
+            "Block-scaled TGV requires a contiguous (M, K) tensor and a "
+            "column-major (K, N) tensor"
+        )
+
+    m, a_k = a.shape
+    b_k, n = b.shape
+    logical_k = a_k * (2 if a.dtype == fp4_dtype else 1)
+    b_logical_k = b_k * (2 if b.dtype == fp4_dtype else 1)
+    if min(m, n, logical_k) <= 0:
+        raise ValueError("Block-scaled TGV requires positive M, N, and K")
+    if logical_k != b_logical_k:
+        raise ValueError("Input tensors must have the same logical K dimension")
+
+    is_nvfp4 = a_descale.dtype == torch.float8_e4m3fn
+    k_alignment = 64 if is_nvfp4 else 128
+    if m > 8 or logical_k % k_alignment:
+        raise ValueError(
+            f"Block-scaled TGV requires M <= 8 and K divisible by {k_alignment}"
+        )
+    if bias.shape != (n,) or not bias.is_contiguous():
+        raise ValueError(f"Block-scaled TGV bias must be contiguous with shape ({n},)")
+    if out is not None and out.shape != (m, n):
+        raise ValueError(f"Block-scaled TGV output must have shape ({m}, {n})")
+
+    sf_vec_size = 16 if is_nvfp4 else 32
+    sf_columns = ((logical_k // sf_vec_size + 3) // 4) * 4
+    expected_scale_sizes = (
+        ((m + 127) // 128) * 128 * sf_columns,
+        ((n + 127) // 128) * 128 * sf_columns,
+    )
+    for name, scale, expected_size in zip(
+        ("a_descale", "b_descale"),
+        (a_descale, b_descale),
+        expected_scale_sizes,
+        strict=True,
+    ):
+        if not scale.is_contiguous() or scale.numel() != expected_size:
+            raise ValueError(
+                f"{name} must be a contiguous 128x4 scale buffer with "
+                f"{expected_size} elements"
+            )
+
+    if any(
+        tensor.device != a.device
+        for tensor in (b, bias, a_descale, b_descale, out)
+        if tensor is not None
+    ):
+        raise ValueError("Block-scaled TGV tensors must be on the same device")
+
+    _check_cute_dsl_availability()
+    return True
+
+
 @flashinfer_api(trace=tgv_gemm_sm100_trace)
 def tgv_gemm_sm100(
     a: torch.Tensor,
@@ -2113,21 +2203,12 @@ def tgv_gemm_sm100(
     quantized_dtypes = (fp4_dtype, torch.float8_e4m3fn, torch.float8_e5m2)
     is_blockscaled = a.dtype in quantized_dtypes
     if is_blockscaled:
-        if a_descale is None or b_descale is None:
-            raise ValueError("Block-scaled TGV inputs require a_descale and b_descale")
-        if b.dtype not in quantized_dtypes or a_descale.dtype != b_descale.dtype:
-            raise ValueError(
-                "Block-scaled TGV requires FP4/FP8 operands and matching scale dtypes"
-            )
-        if a_descale.dtype == torch.float8_e4m3fn:
-            if a.dtype != fp4_dtype or b.dtype != fp4_dtype:
-                raise ValueError(
-                    "E4M3 scale factors are only supported for NVFP4 x NVFP4"
-                )
-        elif a_descale.dtype != torch.float8_e8m0fnu:
-            raise ValueError("Block-scaled TGV scales must be E4M3 or E8M0")
-        if bias.dtype not in (torch.bfloat16, torch.float16):
-            raise ValueError("Block-scaled TGV bias must be BF16 or FP16")
+        _cutedsl_low_latency_blockscaled_tgv_requirement(
+            a, b, bias, a_descale, b_descale, out
+        )
+        # cast: mypy doesn't know that a_descale and b_descale are not None
+        a_descale = cast(torch.Tensor, a_descale)
+        b_descale = cast(torch.Tensor, b_descale)
         out_dtype = bias.dtype
     else:
         if a_descale is not None or b_descale is not None:
@@ -2163,15 +2244,12 @@ def tgv_gemm_sm100(
             )
 
     if is_blockscaled:
-        _check_cute_dsl_availability()
-        logical_k = a.shape[1] * (2 if a.dtype == fp4_dtype else 1)
-        if logical_k != b.shape[0] * (2 if b.dtype == fp4_dtype else 1):
-            raise ValueError("Input tensors must have the same logical K dimension")
-        runner = _low_latency_blockscaled_gemm_runner(
+        runner = _cutedsl_low_latency_blockscaled_gemm_runner(
             get_compute_capability(a.device)[0] * 10
             + get_compute_capability(a.device)[1],
             pdl,
         )
+        logical_k = a.shape[1] * (2 if a.dtype == fp4_dtype else 1)
         inputs = [
             b.T,
             a,
@@ -4700,7 +4778,7 @@ def _trtllm_low_latency_gemm_fp8_requirement(**_):
 
 
 @supported_compute_capability([100, 103])
-def _low_latency_blockscaled_gemm_fp8_requirement(
+def _cutedsl_low_latency_blockscaled_gemm_fp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
     **_,
@@ -4713,15 +4791,17 @@ def _low_latency_blockscaled_gemm_fp8_requirement(
         or not b.is_contiguous()
     ):
         raise ValueError(
-            "low_latency mm_fp8 requires contiguous (M, K) and (N, K) inputs"
+            "cutedsl_low_latency mm_fp8 requires contiguous (M, K) and (N, K) inputs"
         )
     if a.shape[0] > 8 or a.shape[1] % 128:
-        raise ValueError("low_latency mm_fp8 requires M <= 8 and K divisible by 128")
+        raise ValueError(
+            "cutedsl_low_latency mm_fp8 requires M <= 8 and K divisible by 128"
+        )
     if a.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2) or b.dtype not in (
         torch.float8_e4m3fn,
         torch.float8_e5m2,
     ):
-        raise ValueError("low_latency mm_fp8 requires FP8 operands")
+        raise ValueError("cutedsl_low_latency mm_fp8 requires FP8 operands")
     _check_cute_dsl_availability()
     return True
 
@@ -4729,7 +4809,7 @@ def _low_latency_blockscaled_gemm_fp8_requirement(
 @backend_requirement(
     {
         "trtllm_low_latency": _trtllm_low_latency_gemm_fp8_requirement,
-        "low_latency": _low_latency_blockscaled_gemm_fp8_requirement,
+        "cutedsl_low_latency": _cutedsl_low_latency_blockscaled_gemm_fp8_requirement,
     }
 )
 @flashinfer_api(trace=mm_fp8_trace)
@@ -4739,7 +4819,9 @@ def mm_fp8(
     alpha: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
-    backend: Literal["trtllm_low_latency", "low_latency"] = "trtllm_low_latency",
+    backend: Literal[
+        "trtllm_low_latency", "cutedsl_low_latency"
+    ] = "trtllm_low_latency",
 ):
     r"""FP8 matrix multiplication.
 
@@ -4747,14 +4829,14 @@ def mm_fp8(
     ----------
     a: torch.Tensor
         Input tensor, shape (m, k), fp8 e4m3, or e5m2 with the
-        "low_latency" backend.
+        "cutedsl_low_latency" backend.
 
     b: torch.Tensor
         - When using "trtllm_low_latency" backend,
           Weight tensor, shape (k // block_size, n, block_size), fp8 e4m3
           B needs to be pre-processed using `prepare_low_latency_gemm_weights`.
           block_size is 128 for e4m3.
-        - When using "low_latency" backend, an unprocessed contiguous weight
+        - When using "cutedsl_low_latency" backend, an unprocessed contiguous weight
           tensor of shape (n, k), fp8 e4m3 or e5m2.
 
     alpha: Optional[torch.Tensor]
@@ -4766,10 +4848,10 @@ def mm_fp8(
     out: Optional[torch.Tensor]
         Output tensor, shape (m, n). If None, a new tensor will be allocated.
 
-    backend: Literal["trtllm_low_latency", "low_latency"]
+    backend: Literal["trtllm_low_latency", "cutedsl_low_latency"]
         Backend to use for computation. Default is "trtllm_low_latency".
         - "trtllm_low_latency": optimized for small M dimension.
-        - "low_latency": requires SM100/SM103, m <= 8, and k divisible by 128.
+        - "cutedsl_low_latency": requires SM100/SM103, m <= 8, and k divisible by 128.
 
     Returns
     -------
@@ -4795,12 +4877,12 @@ def mm_fp8(
     """
 
     supported_out_dtypes = (torch.bfloat16,)
-    supported_backends = ("trtllm_low_latency", "low_latency")
+    supported_backends = ("trtllm_low_latency", "cutedsl_low_latency")
 
     if backend == "trtllm_low_latency":
         m = a.shape[0]
         n = b.shape[1]
-    elif backend == "low_latency":
+    elif backend == "cutedsl_low_latency":
         m, n = a.shape[0], b.shape[0]
     else:
         raise ValueError(
@@ -4841,7 +4923,7 @@ def mm_fp8(
 
     if backend == "trtllm_low_latency":
         trtllm_low_latency_gemm(a, b, alpha, out)
-    elif backend == "low_latency":
+    elif backend == "cutedsl_low_latency":
         k = a.shape[1]
         scale_sizes = [((rows + 127) // 128) * (k // 128) * 512 for rows in (n, m)]
         workspace = _get_cache_buf(
@@ -4853,7 +4935,7 @@ def mm_fp8(
             workspace[: sum(scale_sizes)].fill_(127).view(torch.float8_e8m0fnu)
         )
         b_descale, a_descale = neutral_scales.split(scale_sizes)
-        runner = _low_latency_blockscaled_gemm_runner(
+        runner = _cutedsl_low_latency_blockscaled_gemm_runner(
             get_compute_capability(a.device)[0] * 10
             + get_compute_capability(a.device)[1],
             True,
@@ -4870,7 +4952,7 @@ def mm_fp8(
             None,
         ]
         runner, tactic = AutoTuner.get().choose_one(
-            "mm_fp8_low_latency", [runner], TuningConfig(), inputs
+            "mm_fp8_cutedsl_low_latency", [runner], TuningConfig(), inputs
         )
         runner(inputs=inputs, tactic=tactic)
     else:
@@ -5175,7 +5257,7 @@ def _cute_dsl_gemm_mxfp8_requirement(
 
 
 @supported_compute_capability([100, 103])
-def _low_latency_gemm_mxfp8_requirement(
+def _cutedsl_low_latency_gemm_mxfp8_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
     a_descale: torch.Tensor,
@@ -5183,16 +5265,18 @@ def _low_latency_gemm_mxfp8_requirement(
     out: Optional[torch.Tensor] = None,  # unused
     out_dtype: torch.dtype = torch.bfloat16,  # unused
     use_8x4_sf_layout: bool = False,
-    backend: Literal["low_latency", "auto"] = "auto",
+    backend: Literal["cutedsl_low_latency", "auto"] = "auto",
 ):
     if use_8x4_sf_layout or a_descale.ndim != 1 or b_descale.ndim != 1:
-        if backend != "low_latency":
+        if backend != "cutedsl_low_latency":
             return False
-        raise ValueError("low_latency mm_mxfp8 requires 1D 128x4 scale tensors")
+        raise ValueError("cutedsl_low_latency mm_mxfp8 requires 1D 128x4 scale tensors")
     if a.shape[0] > 8 or a.shape[1] % 128 != 0:
-        if backend != "low_latency":
+        if backend != "cutedsl_low_latency":
             return False
-        raise ValueError("low_latency mm_mxfp8 requires M <= 8 and K divisible by 128")
+        raise ValueError(
+            "cutedsl_low_latency mm_mxfp8 requires M <= 8 and K divisible by 128"
+        )
     _check_cute_dsl_availability()
     return True
 
@@ -5695,8 +5779,8 @@ def _heuristic_func_mm_mxfp8(
     # requirements are not met) when it is available.
     if CUDNN_AVAILABLE and "cudnn" in suitable_backends:
         return ["cudnn"]
-    if CUTE_DSL_AVAILABLE and "low_latency" in suitable_backends:
-        return ["low_latency"]
+    if CUTE_DSL_AVAILABLE and "cutedsl_low_latency" in suitable_backends:
+        return ["cutedsl_low_latency"]
     return []
 
 
@@ -5705,7 +5789,7 @@ def _heuristic_func_mm_mxfp8(
         "cutlass": _cutlass_gemm_mxfp8_requirement,
         "trtllm": _trtllm_gemm_mxfp8_requirement,
         "cute-dsl": _cute_dsl_gemm_mxfp8_requirement,
-        "low_latency": _low_latency_gemm_mxfp8_requirement,
+        "cutedsl_low_latency": _cutedsl_low_latency_gemm_mxfp8_requirement,
         "cudnn": _cudnn_mm_mxfp8_requirement,
         "b12x": _b12x_gemm_mxfp8_requirement,
     },
@@ -5722,7 +5806,7 @@ def mm_mxfp8(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cutlass", "cute-dsl", "low_latency", "trtllm", "cudnn", "b12x", "auto"
+        "cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"
     ] = "auto",
 ) -> torch.Tensor:
     r"""MM MXFP8 (block size 32)
@@ -5753,7 +5837,7 @@ def mm_mxfp8(
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16 or fp16. If provided, the result is written
-        into it (supported by the CUTLASS, cuDNN, b12x, and low_latency backends).
+        into it (supported by the CUTLASS, cuDNN, b12x, and cutedsl_low_latency backends).
         Defaults to ``None``.
 
     out_dtype: torch.dtype
@@ -5762,18 +5846,18 @@ def mm_mxfp8(
     use_8x4_sf_layout: bool
         Whether the scale tensors for a are in 8x4 layout (vs 128x4).
 
-    backend: Literal["cutlass", "cute-dsl", "low_latency", "trtllm", "cudnn", "b12x", "auto"]
+    backend: Literal["cutlass", "cute-dsl", "cutedsl_low_latency", "trtllm", "cudnn", "b12x", "auto"]
         The backend to use for the operation. Defaults to ``"auto"``.
         ``"auto"`` selects the CUTLASS backend when available and otherwise
         falls back to the cuDNN backend. On SM120/SM121 it prefers the b12x
-        backend when its requirements are met. Eligible ``"low_latency"``
+        backend when its requirements are met. Eligible ``"cutedsl_low_latency"``
         problems include it as the last heuristic candidate.
         - The ``"b12x"`` backend (SM120/SM121) is a warp-level MMA kernel with
           small-M decode tiles. It requires CUDA 13+, nvidia-cutlass-dsl >=
           4.6.0, 1D swizzled 128x4 scales, and K divisible by 128.
         - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
           (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
-        - The ``"low_latency"`` backend requires SM100/SM103, ``M <= 8``,
+        - The ``"cutedsl_low_latency"`` backend requires SM100/SM103, ``M <= 8``,
           ``K % 128 == 0``, and swizzled 1D scales in the 128x4 layout.
         - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
           a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`).
@@ -5852,7 +5936,7 @@ def mm_mxfp8(
             use_8x4_sf_layout
         ),
         "cute-dsl": lambda: _cute_dsl_gemm_mxfp8_runner(major, minor, True, out_dtype),
-        "low_latency": lambda: _low_latency_blockscaled_gemm_runner(
+        "cutedsl_low_latency": lambda: _cutedsl_low_latency_blockscaled_gemm_runner(
             major * 10 + minor, True
         ),
         "cudnn": lambda: _cudnn_mm_mxfp8_runner(),
@@ -5867,7 +5951,7 @@ def mm_mxfp8(
 
     tuning_config = (
         _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
-        if backends in (["cute-dsl"], ["low_latency"])
+        if backends in (["cute-dsl"], ["cutedsl_low_latency"])
         else _MM_MXFP8_TUNING_CONFIG
     )
 
@@ -6348,7 +6432,7 @@ def _cute_dsl_gemm_fp4_requirement(
 
 
 @supported_compute_capability([100, 103])
-def _low_latency_gemm_fp4_requirement(
+def _cutedsl_low_latency_gemm_fp4_requirement(
     a: torch.Tensor,
     b: torch.Tensor,
     a_descale: torch.Tensor,
@@ -6358,21 +6442,21 @@ def _low_latency_gemm_fp4_requirement(
     out: Optional[torch.Tensor] = None,  # unused
     block_size: int = 16,  # unused
     use_8x4_sf_layout: bool = False,
-    backend: Literal["low_latency", "auto"] = "auto",
+    backend: Literal["cutedsl_low_latency", "auto"] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
 ):
     if use_8x4_sf_layout:
-        if backend != "low_latency":
+        if backend != "cutedsl_low_latency":
             return False
-        raise ValueError("low_latency FP4 GEMM requires 128x4 scale tensors")
+        raise ValueError("cutedsl_low_latency FP4 GEMM requires 128x4 scale tensors")
     real_k = a.shape[1] * 2
     k_alignment = 64 if use_nvfp4 else 128
     if a.shape[0] > 8 or real_k % k_alignment != 0:
-        if backend != "low_latency":
+        if backend != "cutedsl_low_latency":
             return False
         raise ValueError(
-            f"low_latency FP4 GEMM requires M <= 8 and K divisible by {k_alignment}"
+            f"cutedsl_low_latency FP4 GEMM requires M <= 8 and K divisible by {k_alignment}"
         )
     _check_cute_dsl_availability()
     return True
@@ -6418,10 +6502,10 @@ def _b12x_gemm_fp4_requirement(
 
 
 # Keyed by device, dtypes, launch options, and tactic.
-_LOW_LATENCY_BLOCK_SCALED_KERNEL_CACHE: dict[tuple, Callable] = {}
+_CUTEDSL_LOW_LATENCY_BLOCK_SCALED_KERNEL_CACHE: dict[tuple, Callable] = {}
 
 
-def _low_latency_blockscaled_gemm_runner(
+def _cutedsl_low_latency_blockscaled_gemm_runner(
     sm_version: int,
     enable_pdl: bool,
 ) -> TunableRunner:
@@ -6520,7 +6604,7 @@ def _low_latency_blockscaled_gemm_runner(
             c_dtype,
         )
 
-    class LowLatencyBlockscaledGemmRunner(TunableRunner):
+    class CutedslLowLatencyBlockscaledGemmRunner(TunableRunner):
         """TunableRunner for CuTe DSL low-latency block-scaled dense GEMM.
 
         Tactics are tuples:
@@ -6660,7 +6744,9 @@ def _low_latency_blockscaled_gemm_runner(
                 bias_tensor is not None,
                 tactic,
             )
-            compiled_gemm = _LOW_LATENCY_BLOCK_SCALED_KERNEL_CACHE.get(cache_key)
+            compiled_gemm = _CUTEDSL_LOW_LATENCY_BLOCK_SCALED_KERNEL_CACHE.get(
+                cache_key
+            )
             if compiled_gemm is None:
                 fake_a_ptr = gmem_ptr(a_cutlass_dtype, 16, 16)
                 fake_b_ptr = gmem_ptr(b_cutlass_dtype, 16, 16)
@@ -6701,7 +6787,9 @@ def _low_latency_blockscaled_gemm_runner(
                     dummy_mnkl,
                     make_fake_stream(),
                 )
-                _LOW_LATENCY_BLOCK_SCALED_KERNEL_CACHE[cache_key] = compiled_gemm
+                _CUTEDSL_LOW_LATENCY_BLOCK_SCALED_KERNEL_CACHE[cache_key] = (
+                    compiled_gemm
+                )
 
             compiled_gemm(
                 a_ptr,
@@ -6722,7 +6810,7 @@ def _low_latency_blockscaled_gemm_runner(
                     out.view(batch_size, m, n).copy_(kernel_out.permute(2, 0, 1))
             return out
 
-    return LowLatencyBlockscaledGemmRunner()
+    return CutedslLowLatencyBlockscaledGemmRunner()
 
 
 # Module-level kernel cache for CuTe DSL GEMM, shared across runner instances.
@@ -7377,7 +7465,7 @@ def _heuristic_func_mm_fp4(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "b12x", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "cutedsl_low_latency", "b12x", "auto"
     ] = "cudnn",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
@@ -7425,8 +7513,8 @@ def _heuristic_func_mm_fp4(
         candidate_backends = ("cutlass", "cudnn", "cute-dsl")
     else:
         candidate_backends = ("cutlass", "cudnn")
-    if "low_latency" in suitable_backends:
-        candidate_backends = (*candidate_backends, "low_latency")
+    if "cutedsl_low_latency" in suitable_backends:
+        candidate_backends = (*candidate_backends, "cutedsl_low_latency")
     # Filter and return only supported backends
     return [c for c in candidate_backends if c in suitable_backends]
 
@@ -7555,7 +7643,7 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
         "trtllm": _trtllm_gemm_fp4_requirement,
         "cutlass": _cutlass_gemm_fp4_requirement,
         "cute-dsl": _cute_dsl_gemm_fp4_requirement,
-        "low_latency": _low_latency_gemm_fp4_requirement,
+        "cutedsl_low_latency": _cutedsl_low_latency_gemm_fp4_requirement,
         "b12x": _b12x_gemm_fp4_requirement,
     },
     common_check=_check_mm_fp4_problem_size,
@@ -7573,7 +7661,7 @@ def mm_fp4(
     block_size: int = 16,
     use_8x4_sf_layout: bool = False,
     backend: Literal[
-        "cudnn", "trtllm", "cutlass", "cute-dsl", "low_latency", "b12x", "auto"
+        "cudnn", "trtllm", "cutlass", "cute-dsl", "cutedsl_low_latency", "b12x", "auto"
     ] = "auto",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,
@@ -7609,13 +7697,13 @@ def mm_fp4(
     use_8x4_sf_layout: bool
         Whether to use 8x4 scale factor layout or 128x4 scale factor layout, defaults to False.
 
-    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "low_latency", "b12x", "auto"]
+    backend: Literal["cudnn", "trtllm", "cutlass", "cute-dsl", "cutedsl_low_latency", "b12x", "auto"]
         Backend to use, defaults to ``"auto"``. On SM120, ``"auto"`` prefers
         ``"b12x"`` (NVFP4 only), then ``"cutlass"``, then ``"cudnn"``. On other
         architectures, ``"auto"`` selects between ``"cudnn"`` and ``"cutlass"``
         based on the current CUDA and cuDNN versions. The ``"trtllm"`` and
         ``"cute-dsl"`` backends are never auto-selected because they require
-        different weight preparation. The ``"low_latency"`` backend is the last
+        different weight preparation. The ``"cutedsl_low_latency"`` backend is the last
         heuristic candidate for eligible SM100/SM103 problems and requires
         ``M <= 8``, 128x4 scale factors, and K divisible by 64 for NVFP4 or 128
         for MXFP4.
@@ -7626,7 +7714,7 @@ def mm_fp4(
 
     enable_pdl: bool
         Whether to enable Programmatic Dependent Launch (PDL) for the ``cute_dsl``
-        and ``low_latency`` backends, defaults to ``True``. PDL allows overlapping
+        and ``cutedsl_low_latency`` backends, defaults to ``True``. PDL allows overlapping
         the tail of one kernel with the start of the next for reduced launch latency.
         This parameter is ignored by other backends.
 
@@ -7636,7 +7724,7 @@ def mm_fp4(
     When trtllm backend is used, b must be quantized with 128x4 layout and `do_shuffle=True`. a can be quantized with either 128x4 or 8x4 layout (controlled by `use_8x4_sf_layout`) and `do_shuffle=False`.
     When cute_dsl backend is used, both a and b should be quantized with 128x4 scale factor layout:
     nvfp4_quantize(..., do_shuffle=False) for NVFP4, or mxfp4_quantize(...) for MXFP4.
-    The low_latency backend uses the same 128x4 scale factor layouts.
+    The cutedsl_low_latency backend uses the same 128x4 scale factor layouts.
 
     Returns
     -------
@@ -7696,7 +7784,7 @@ def mm_fp4(
         "cute-dsl": lambda: _cute_dsl_gemm_fp4_runner(
             major, minor, enable_pdl, out_dtype, use_nvfp4
         ),
-        "low_latency": lambda: _low_latency_blockscaled_gemm_runner(
+        "cutedsl_low_latency": lambda: _cutedsl_low_latency_blockscaled_gemm_runner(
             major * 10 + minor, enable_pdl
         ),
         "b12x": lambda: _b12x_gemm_fp4_runner(
