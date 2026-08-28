@@ -1253,10 +1253,18 @@ def _load_cupti():
         return None
 
 
-def _cupti_measure_spans(run_iteration: Callable[[], None], repeat: int) -> list[float]:
+def _cupti_measure_spans(
+    run_iteration: Callable[[], None],
+    repeat: int,
+    prologue: Optional[Callable[[], None]] = None,
+) -> list[float]:
     """Time *run_iteration* ``repeat`` times, returning per-iteration GPU
     kernel spans in milliseconds (first kernel start to last kernel end,
     from CUPTI activity records).
+
+    *prologue* (e.g. a cold-L2 flush), if given, runs once per iteration
+    BEFORE the correlation bracket opens and is drained by the same
+    synchronize, so its kernels are structurally excluded from the span.
 
     Each iteration is bracketed by a device synchronize and CPU timestamps;
     launch-API records inside the bracket give the correlation ids whose
@@ -1314,6 +1322,11 @@ def _cupti_measure_spans(run_iteration: Callable[[], None], repeat: int) -> list
         raise _CuptiInfraError(str(e)) from e
     try:
         for _ in range(repeat):
+            if prologue is not None:
+                prologue()
+            # Drains both the prologue (e.g. flush) and any prior work, so t0
+            # is taken after the prologue's kernels complete -> their launch
+            # records precede the [t0, t1] window and are excluded from the span.
             torch.cuda.synchronize()
             t0 = cupti.get_timestamp()
             run_iteration()
@@ -2843,12 +2856,14 @@ class AutoTuner:
         of a multi-kernel tactic are honestly included, queue-saturation
         effects are not (see ``MeasurementPolicy``).
 
-        Cold-L2 is achieved by zeroing an L2-sized flush buffer before
-        each iteration (excluded from the span: only kernel activity is
-        collected, and the memset finishes before the tactic's first
-        kernel starts).  Input-buffer rotation is not usable here because
-        the CUDA-graph mode replays a single captured iteration, which
-        binds the captured tensors.
+        Cold-L2 is achieved by zeroing an L2-sized flush buffer once per
+        iteration.  ``zero_()`` dispatches a fill KERNEL (not a memset), so
+        it is handed to ``_cupti_measure_spans`` as a prologue that runs and
+        is synced BEFORE the correlation window opens; running it inside the
+        window would fold ~100 us of flush into the tactic's measured span
+        and bias selection.  Input-buffer rotation is not usable here
+        because the CUDA-graph mode replays a single captured iteration,
+        which binds the captured tensors.
 
         Raises:
             _CuptiInfraError: propagated from ``_cupti_measure_spans`` when
@@ -2872,24 +2887,25 @@ class AutoTuner:
                     dtype=torch.int8,
                 )
 
+            # The flush is a fill kernel; keep it OUT of the measured window by
+            # running it as the per-iteration prologue (synced before the span).
+            prologue = flush_buffer.zero_ if flush_buffer is not None else None
+
             if tuning_config.use_cuda_graph:
                 torch.cuda.synchronize()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     runner(inputs, tactic=tactic, **kwargs)
 
-                def run_iteration():
-                    if flush_buffer is not None:
-                        flush_buffer.zero_()
-                    graph.replay()
+                run_iteration = graph.replay
             else:
 
                 def run_iteration():
-                    if flush_buffer is not None:
-                        flush_buffer.zero_()
                     runner(inputs, tactic=tactic, **kwargs)
 
-            spans_ms = _cupti_measure_spans(run_iteration, self.repeat)
+            spans_ms = _cupti_measure_spans(
+                run_iteration, self.repeat, prologue=prologue
+            )
 
         # Median, not mean: robust to first-iteration instrumentation
         # attach overhead and post-synchronize clock ramp.
