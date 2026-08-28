@@ -30,7 +30,7 @@ def _require_blackwell_source_arch(device: torch.device) -> None:
 
 def _get_blackwell_bf16_fp4_module():
     """Load the source-built module lazily through the public JIT boundary."""
-    from ..jit.gemm.blackwell_bf16_fp4 import get_blackwell_bf16_fp4_module
+    from ..jit.blackwell_bf16_fp4 import get_blackwell_bf16_fp4_module
 
     return get_blackwell_bf16_fp4_module()
 
