@@ -80,16 +80,22 @@ struct FusedAttnFwdSm100 {
   static constexpr int kRegsOther = 56;
 
   // ---- Named barriers (used by both mainloop softmax and mainloop correction) ----
-  // IDs 0-7: per-warp sm_stats (BSA pattern: bar.arrive + bar.sync for SMEM visibility).
+  // User IDs 0-7: per-warp sm_stats (BSA pattern: bar.arrive + bar.sync for SMEM visibility).
   //   stage(0,1) x warp(0,1,2,3) = 8 barriers, 64 threads each (32 softmax + 32 correction).
   //   Softmax: bar.arrive (non-blocking), Correction: bar.arrive_and_wait (blocking).
-  // IDs 4-5 reused for correction reduce (they don't overlap in time with sm_stats IDs 4-5).
+  //   CUTLASS offsets user IDs by ReservedNamedBarrierCount(8) => hardware 8..15,
+  //   which consumes the entire user ID space (8 + 8 = 16 = HardwareMaxNumNamedBarriers).
+  //
+  // The correction warp-pair reduce barriers used to be aliased onto user IDs 4-5
+  // on the assumption that they never overlap the sm_stats traffic in time. Nothing
+  // enforced that -- the four correction warps run independently -- so a reduce
+  // arrival could complete a stage-1 sm_stats barrier and wedge the CTA. They now
+  // live on hardware barriers 1-2 via the reserved enum; see
+  // CollectiveMainloopFwd::reduce_barrier_sync().
   enum NamedBarriers : int {
-    SmStatsNotify = 0,  // +(stage*4+warp_idx): IDs 0..7
+    SmStatsNotify = 0,  // +(stage*4+warp_idx): user IDs 0..7 (hardware 8..15)
                         // 64 threads each: 32 softmax + 32 correction
                         // Softmax: bar.arrive (non-blocking), Correction: bar.sync (blocking)
-    Reduce_02 = 4,      // Reused after sm_stats done. Correction warp-pair (8,10)
-    Reduce_13 = 5,      // Reused after sm_stats done. Correction warp-pair (9,11)
   };
 
   // ---- SharedStorage ----
@@ -255,6 +261,20 @@ struct FusedAttnFwdSm100 {
     CollectiveEpilogue epilogue;
 
     if (warp_idx == kSchedWarp) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+      // SM103 uses one statically assigned tile per CTA.  The scheduler warp
+      // does no work on this path, so it simply joins the exit rendezvous in
+      // consumer_advance() -- all 16 warps, hence the 512-thread count there.
+      // An earlier revision instead parked this warp on a completion flag set
+      // by the MMA warp, which made the rendezvous a 480-thread barrier plus a
+      // second, redundant handshake guarding an invariant the rendezvous
+      // already provides.  One barrier for all 512 threads is equivalent and
+      // leaves a single synchronization point to reason about.
+      flash::tcgen05_fence_before_sync();
+      cutlass::arch::NamedBarrier(512, cutlass::arch::ReservedNamedBarriers::Sm120MainloopBarrier)
+          .arrive_and_wait();
+      return;
+#else
       // ===== WG3 warp 15: CLC scheduler (lane 0 only) =====
       // Only lane 0 runs the scheduling loop (matching original pattern).
       // producer_tail drains the pipeline on exit.
@@ -273,6 +293,7 @@ struct FusedAttnFwdSm100 {
         }
         // producer_tail intentionally omitted (matches original)
       }
+#endif
     } else if (warp_idx == kMmaWarp) {
       // ===== WG3 warp 12: MMA (TMEM alloc here) =====
       tmem_alloc.allocate(TmemAllocator::Sm100TmemCapacityColumns, &shared_storage.tmem_base_ptr);
@@ -295,6 +316,9 @@ struct FusedAttnFwdSm100 {
         work = tile_sched.consumer_advance();
       }
 
+      // SM103: the 512-thread barrier inside the final consumer_advance() is
+      // the exit rendezvous; every consumer is done with TMEM once MMA gets
+      // here, so free directly -- no completion flag.
       tmem_alloc.free(shared_storage.tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
     } else if (warp_idx == kEpiWarp) {
       // ===== WG3 warp 13: Epilogue TMA store =====
