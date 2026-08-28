@@ -97,11 +97,15 @@ class BlockSparsePersistentTileScheduler:
         loc=None,
         ip=None,
     ) -> Params:
-        return BlockSparsePersistentTileScheduler.Params.create(args, scheduling_mode=scheduling_mode, loc=loc, ip=ip)
+        return BlockSparsePersistentTileScheduler.Params.create(
+            args, scheduling_mode=scheduling_mode, loc=loc, ip=ip
+        )
 
     @staticmethod
     @cute.jit
-    def create(params: Params, clc_response_ptr=None, *, loc=None, ip=None) -> "BlockSparsePersistentTileScheduler":
+    def create(
+        params: Params, clc_response_ptr=None, *, loc=None, ip=None
+    ) -> "BlockSparsePersistentTileScheduler":
         if const_expr(params.scheduling_mode == SchedulingMode.CLC):
             from cutlass.utils import (
                 ClcDynamicPersistentTileScheduler,
@@ -133,9 +137,13 @@ class BlockSparsePersistentTileScheduler:
                 grid_dim,
                 clc_response_ptr,
             )
-            return BlockSparsePersistentTileScheduler(params, block_idx[0], clc_scheduler, loc=loc, ip=ip)
+            return BlockSparsePersistentTileScheduler(
+                params, block_idx[0], clc_scheduler, loc=loc, ip=ip
+            )
         # Static path
-        return BlockSparsePersistentTileScheduler(params, cute.arch.block_idx()[0], loc=loc, ip=ip)
+        return BlockSparsePersistentTileScheduler(
+            params, cute.arch.block_idx()[0], loc=loc, ip=ip
+        )
 
     # called by host
     @staticmethod
@@ -193,9 +201,7 @@ class BlockSparsePersistentTileScheduler:
             self._tile_idx = work.tile_idx[0]
             return self._clc_work_to_coords(work)
         if const_expr(self.params.is_split_kv):
-            base_idx, split_idx = divmod(
-                self._tile_idx, self.params.num_splits_divmod
-            )
+            base_idx, split_idx = divmod(self._tile_idx, self.params.num_splits_divmod)
         else:
             base_idx = self._tile_idx
             split_idx = Int32(0)
@@ -263,7 +269,7 @@ class BlockSparsePersistentTileScheduler:
         objs = [self.params, self._tile_idx]
         if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
             objs += [self._clc_scheduler, self._clc_pipeline, self._clc_consumer_state]
-        for obj, n_items in zip(objs, self._values_pos):
+        for obj, n_items in zip(objs, self._values_pos, strict=False):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return BlockSparsePersistentTileScheduler(*(tuple(obj_list)), loc=self._loc)

@@ -7,6 +7,7 @@
 # omitted -- FlashInfer's blk64 integration is JIT-only, matching the existing
 # blk128 CuTe-DSL integration (see bsa_attn_sm100_blk128.py).
 
+import warnings
 from functools import lru_cache
 from typing import Optional, Tuple
 
@@ -20,6 +21,7 @@ from ..bsa_utils.cache_utils import get_jit_cache
 from ..bsa_utils.testing import is_fake_mode
 from ..bsa_utils.cute_tensor_utils import to_cute_tensor
 from .bsa_fwd_combine import BlockSparseAttnForwardCombine
+from .cute_dsl_utils import constexpr_tvm_ffi_converter_patched
 
 # Baseline KV-split combine kernel geometry (shared across SM90/SM100/SM110;
 # upstream keeps a single configuration to simplify maintenance).
@@ -32,20 +34,27 @@ _SM100_BLK64_INT32_MAX = torch.iinfo(torch.int32).max
 
 
 @lru_cache(maxsize=None)
-def _get_device_arch() -> int:
-    """Current CUDA device's compute-capability arch, e.g. 100 for SM100.
+def _get_device_arch(device_index: int) -> int:
+    """Given CUDA device index's compute-capability arch, e.g. 100 for SM100.
 
     Duplicated (not imported) from bsa_attn_sm100_blk128.py intentionally: the
     blk128 module has a hard dependency on the separate `quack-kernels`
     package, and blk64 must remain importable even when that package (or the
     blk128 backend) is unavailable.
+
+    Takes an explicit device index (rather than reading the ambient "current
+    device") so the lru_cache is keyed per-device: with a zero-arg signature,
+    the first call's device would be cached for the rest of the process,
+    silently returning the wrong arch on a mixed-architecture host or for
+    inputs living on a non-current device.
     """
-    major, minor = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability(device_index)
     return major * 10 + int(minor)
 
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
@@ -125,8 +134,7 @@ def sm100_blk64_requires_int64_kv_strides(
             stride_b,
         )
         if any(
-            stride < 0 or stride > _SM100_BLK64_INT32_MAX
-            for stride in rank6_stride
+            stride < 0 or stride > _SM100_BLK64_INT32_MAX for stride in rank6_stride
         ):
             return True
         block_stride = rank6_stride[4]
@@ -176,7 +184,7 @@ def dynamic_tensors_compile_key(
             _tensor_dynamic_layout_compile_key(tensor, leading_dim)
             if tensor is not None
             else None
-            for tensor, leading_dim in zip(tensors, leading_dims)
+            for tensor, leading_dim in zip(tensors, leading_dims, strict=False)
         ),
     )
 
@@ -252,9 +260,7 @@ def build_sm100_blk64_kv_split_offsets(
     use_even_split = aligned_base == 0
     remainder = valid_kv_i64 - aligned_base * kv_splits
 
-    even_offsets = (
-        valid_kv_i64[..., None] * split_ids + kv_splits - 1
-    ) // kv_splits
+    even_offsets = (valid_kv_i64[..., None] * split_ids + kv_splits - 1) // kv_splits
     aligned_offsets = aligned_base[..., None] * split_ids + torch.minimum(
         remainder[..., None], split_ids * 8
     )
@@ -266,7 +272,9 @@ def build_sm100_blk64_kv_split_offsets(
     )
 
 
-def _blk64_split_workspace_bytes(q: torch.Tensor, value_dim: int, kv_splits: int) -> int:
+def _blk64_split_workspace_bytes(
+    q: torch.Tensor, value_dim: int, kv_splits: int
+) -> int:
     """Estimate live split-KV partial, combine-output, and offset storage."""
     batch, num_heads, seqlen_q, _ = q.shape
     num_q_blocks = ceil_div_int(seqlen_q, 64)
@@ -277,16 +285,42 @@ def _blk64_split_workspace_bytes(q: torch.Tensor, value_dim: int, kv_splits: int
     return int(partial_bytes + final_bytes + offset_bytes)
 
 
+#: (device_index, q.shape, q.dtype, value_dim, kv_splits, allow_fallback) -> resolved
+#: kv_splits_i. Populated by resolve_sm100_blk64_split_workspace; see its docstring.
+_split_workspace_resolution_cache: dict = {}
+
+
 def resolve_sm100_blk64_split_workspace(
     q: torch.Tensor,
     value_dim: int,
     kv_splits: int,
     allow_fallback: bool,
 ) -> int:
-    """Fit split-KV workspace to currently available CUDA allocator capacity."""
+    """Fit split-KV workspace to currently available CUDA allocator capacity.
+
+    Resolved once per (device, q shape/dtype, requested kv_splits) and cached
+    thereafter, so otherwise-identical calls don't have their split count --
+    and therefore peak memory, first-compile latency, and even bitwise
+    results, since kv_splits_i feeds the compile key -- drift with transient
+    allocator state. Only successful resolutions are cached: a raised
+    RuntimeError (below, when allow_fallback is False) is not cached, so a
+    later call can still retry once more memory is free.
+    """
     kv_splits = int(kv_splits)
     if kv_splits <= 1 or is_fake_mode() or not q.is_cuda:
         return kv_splits
+
+    cache_key = (
+        q.device.index,
+        tuple(q.shape),
+        q.dtype,
+        value_dim,
+        kv_splits,
+        allow_fallback,
+    )
+    cached = _split_workspace_resolution_cache.get(cache_key)
+    if cached is not None:
+        return cached
 
     free_bytes, total_bytes = torch.cuda.mem_get_info(q.device)
     reclaimable_bytes = max(
@@ -300,6 +334,7 @@ def resolve_sm100_blk64_split_workspace(
     while candidate > 1:
         required_bytes = _blk64_split_workspace_bytes(q, value_dim, candidate)
         if required_bytes <= budget_bytes:
+            _split_workspace_resolution_cache[cache_key] = candidate
             return candidate
         if not allow_fallback:
             required_gib = required_bytes / (1 << 30)
@@ -311,6 +346,7 @@ def resolve_sm100_blk64_split_workspace(
                 "lower kv_splits"
             )
         candidate //= 2
+    _split_workspace_resolution_cache[cache_key] = 1
     return 1
 
 
@@ -596,15 +632,30 @@ def combine_blk64_kv_bucketed_partials(
             stages=_COMBINE_STAGES,
         )
         jit_args = _make_blk64_combine_cute_args(
-            o_partial, lse_partial, out_bshd, lse_bsh, current_stream, enable_tvm_ffi=True
+            o_partial,
+            lse_partial,
+            out_bshd,
+            lse_bsh,
+            current_stream,
+            enable_tvm_ffi=True,
         )
-        _combine_compile_cache[compile_key] = cute.compile(
-            combine_kernel, *jit_args, options="--enable-tvm-ffi"
-        )
+        with constexpr_tvm_ffi_converter_patched():
+            _combine_compile_cache[compile_key] = cute.compile(
+                combine_kernel, *jit_args, options="--enable-tvm-ffi"
+            )
 
     if not is_fake_mode():
         _combine_compile_cache[compile_key](
-            o_partial, lse_partial, out_bshd, lse_bsh, None, None, None, None, None, current_stream
+            o_partial,
+            lse_partial,
+            out_bshd,
+            lse_bsh,
+            None,
+            None,
+            None,
+            None,
+            None,
+            current_stream,
         )
 
     # Combine writes its native BSHD/BSH layout. Return BHSD/BHS views without D2D.
@@ -614,7 +665,16 @@ def combine_blk64_kv_bucketed_partials(
 
 
 def workaround_cutlass_hash_import_bug():
-    """Avoid optional generated dialect imports that are broken in this environment."""
+    """Avoid optional generated dialect imports that are broken in this environment.
+
+    The alias loop below is verified against the pinned nvidia-cutlass-dsl==4.7.0
+    (see requirements.txt): ``cutlass._mlir_helpers.<suffix>`` is the real
+    module and ``cutlass.base_dsl._mlir_helpers.<suffix>`` is the (missing)
+    alias some generated code expects, so the loop builds that alias. This
+    direction is version-sensitive -- it was reversed on nvidia-cutlass-dsl
+    4.3.5 -- so failures are surfaced via ``warnings.warn`` instead of being
+    swallowed silently, in case a future DSL upgrade flips it again.
+    """
     import importlib
     import sys
     import types
@@ -622,10 +682,17 @@ def workaround_cutlass_hash_import_bug():
     for suffix in ("arith", "dialect_proxy", "gpu", "lru_cache_ir", "op"):
         canonical = f"cutlass._mlir_helpers.{suffix}"
         alias = f"cutlass.base_dsl._mlir_helpers.{suffix}"
+        if alias in sys.modules:
+            continue
         try:
-            sys.modules.setdefault(alias, importlib.import_module(canonical))
-        except Exception:
-            pass
+            sys.modules[alias] = importlib.import_module(canonical)
+        except ImportError as e:
+            warnings.warn(
+                f"workaround_cutlass_hash_import_bug: could not alias {canonical} "
+                f"as {alias} ({e!r}); this shim may be stale for the installed "
+                "nvidia-cutlass-dsl version.",
+                stacklevel=2,
+            )
 
     for name in (
         "cutlass._mlir.dialects._iket_ops_gen",
@@ -633,7 +700,12 @@ def workaround_cutlass_hash_import_bug():
         "cutlass._mlir.dialects._pyir_ops_gen",
         "cutlass._mlir.dialects._ub_ops_gen",
     ):
-        sys.modules.setdefault(name, types.ModuleType(name))
+        if name in sys.modules:
+            continue
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            sys.modules[name] = types.ModuleType(name)
 
 
 def validate_sm100_blk64_fp8_sage(
@@ -673,7 +745,11 @@ def validate_sm100_blk64_fp8_sage(
             "Sage FP8 blk64 requires full 64-token KV blocks (block_sizes must "
             "be None); partial/padded KV blocks are not supported yet"
         )
-    if q_scale.dtype != torch.float32 or k_scale.dtype != torch.float32 or v_scale.dtype != torch.float32:
+    if (
+        q_scale.dtype != torch.float32
+        or k_scale.dtype != torch.float32
+        or v_scale.dtype != torch.float32
+    ):
         raise ValueError("Sage FP8 q_scale/k_scale/v_scale must be float32")
     expected_q_scale_shape = (batch_size, num_head, seqlen_q)
     if tuple(q_scale.shape) != expected_q_scale_shape:

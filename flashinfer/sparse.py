@@ -311,6 +311,7 @@ def _vsa_run_core_blk64(
     q_scale: Optional[torch.Tensor],
     k_scale: Optional[torch.Tensor],
     v_scale: Optional[torch.Tensor],
+    sage_fp8_block_sparse_num: Optional[int],
 ):
     """blk64-specific variant of :func:`_vsa_run_core` with kv_splits/use_clc/Sage-FP8 passthrough.
 
@@ -327,16 +328,10 @@ def _vsa_run_core_blk64(
     if is_sage_fp8:
         # Sage FP8 requires a uniform (dense) top-k: the underlying kernel
         # only accepts q2k_block_nums=None with a fixed block_sparse_num.
-        uniform_num = int(vsa_q2k_num[0, 0, 0].item())
-        if not torch.all(vsa_q2k_num == uniform_num):
-            raise ValueError(
-                "vsa_sm100_blk64 Sage FP8 requires a uniform number of KV "
-                "blocks per Q-block across the whole sparsity pattern "
-                "(upstream kernel limit: only a fixed block_sparse_num is "
-                "supported, not per-row q2k_block_nums)."
-            )
+        # The uniform value is validated and cached in plan() (which already
+        # syncs on vsa_q2k_num once) so run() never has to sync on it.
         block_nums_arg = None
-        block_sparse_num_arg = uniform_num
+        block_sparse_num_arg = sage_fp8_block_sparse_num
     else:
         block_nums_arg = vsa_q2k_num
         block_sparse_num_arg = 1  # ignored when q2k_block_nums is provided
@@ -351,7 +346,7 @@ def _vsa_run_core_blk64(
         q2k_block_nums=block_nums_arg,
         softmax_scale=sm_scale,
         return_lse=True,
-        kv_splits="auto" if kv_splits is None else kv_splits,
+        kv_splits=1 if kv_splits is None else kv_splits,
         use_clc=use_clc,
         q_scale=q_scale,
         k_scale=k_scale,
@@ -837,6 +832,11 @@ class BlockSparseAttentionWrapper:
                 raise ValueError(
                     f"vsa_sm100_blk64 backend requires head_dim=128 (got {head_dim})"
                 )
+            if kv_splits is not None and not isinstance(kv_splits, str):
+                if not (1 <= int(kv_splits) <= 256):
+                    raise ValueError(
+                        f"vsa_sm100_blk64 kv_splits must be in [1, 256], got {kv_splits}"
+                    )
             is_sage_fp8 = q_scale is not None
             if is_sage_fp8:
                 if k_scale is None or v_scale is None:
@@ -916,6 +916,23 @@ class BlockSparseAttentionWrapper:
             # sparse rows here to preserve existing behavior. Lifting this
             # restriction only requires removing the check above and passing
             # allow_empty_block_nums=True through to the kernel.
+
+            # Sage FP8 requires a uniform (dense) top-k across the whole
+            # sparsity pattern. Validate and cache the uniform value here
+            # (plan()-time, already synchronizing above on the same tensor)
+            # so run() doesn't need to sync on vsa_q2k_num on every call.
+            self._vsa_sage_fp8_block_sparse_num = None
+            if is_sage_fp8:
+                uniform_num = int(self._vsa_q2k_num[0, 0, 0].item())
+                if not torch.all(self._vsa_q2k_num == uniform_num):
+                    raise ValueError(
+                        "vsa_sm100_blk64 Sage FP8 requires a uniform number of "
+                        "KV blocks per Q-block across the whole sparsity "
+                        "pattern (upstream kernel limit: only a fixed "
+                        "block_sparse_num is supported, not per-row "
+                        "q2k_block_nums)."
+                    )
+                self._vsa_sage_fp8_block_sparse_num = uniform_num
 
             self.M = M
             self.N = N
@@ -1314,6 +1331,7 @@ class BlockSparseAttentionWrapper:
                 self._vsa_q_scale,
                 self._vsa_k_scale,
                 self._vsa_v_scale,
+                self._vsa_sage_fp8_block_sparse_num,
             )
 
         # ---- VSA SM120 blk64 backend (sm120_blk64 CuTe-DSL kernel) ---------------

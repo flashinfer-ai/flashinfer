@@ -5,7 +5,10 @@
 # this file are adapted from quack-kernels 0.4.1 (Apache-2.0) and modified for
 # cudnn-frontend's CUTLASS DSL integration.
 
+import contextlib
+import importlib.metadata
 import inspect
+import warnings
 from dataclasses import dataclass, fields
 from functools import partial
 from typing import Tuple, get_origin
@@ -24,23 +27,45 @@ from cutlass.cute.runtime import from_dlpack
 _STATIC_TYPES = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
 
 
-def _install_constexpr_tvm_ffi_converter() -> None:
-    """Teach CUTLASS DSL's TVM-FFI converter about Constexpr annotations.
+_EXPECTED_CUTLASS_DSL_VERSION = "4.7.0"  # keep in sync with requirements.txt
+
+
+@contextlib.contextmanager
+def constexpr_tvm_ffi_converter_patched():
+    """Scope CUTLASS DSL's TVM-FFI Constexpr support to a single compile call.
 
     Emitting ``ConstNone`` keeps static ``ParamsBase`` fields in the JIT
-    specialization, including tuple and enum values that CUTLASS DSL 4.6's
-    native Constexpr converter does not support. The NamedTuple case preserves
-    its concrete field annotations when a broader tuple type is used at the
-    call site.
+    specialization, including tuple and enum values that the pinned
+    nvidia-cutlass-dsl (see requirements.txt)'s native Constexpr converter
+    does not support. The NamedTuple case preserves its concrete field
+    annotations when a broader tuple type is used at the call site.
+
+    This must wrap only the ``cute.compile(..., options="--enable-tvm-ffi")``
+    call(s) that need it (see callers), not be installed at import time:
+    CUTLASS resolves ``_convert_single_arg`` via module-global lookup inside
+    its own recursive calls, so a permanent rebind would also intercept
+    every other backend's ``--enable-tvm-ffi`` compiles for the rest of the
+    process. Restoring the original on exit keeps that blast radius limited
+    to this call. This assumes ``cute.compile()`` calls are not issued
+    concurrently from multiple threads while this context manager is active
+    -- true today (no threaded/concurrent compilation path in the JIT
+    layer), but would need revisiting if that changes.
     """
+    installed_version = importlib.metadata.version("nvidia-cutlass-dsl")
+    if installed_version != _EXPECTED_CUTLASS_DSL_VERSION:
+        warnings.warn(
+            "blk64 CuTe-DSL Constexpr/TVM-FFI compat shim "
+            "(constexpr_tvm_ffi_converter_patched) was written against "
+            f"nvidia-cutlass-dsl=={_EXPECTED_CUTLASS_DSL_VERSION}; found "
+            f"{installed_version}. Verify _convert_single_arg's "
+            "signature/behavior still matches before trusting this shim.",
+            stacklevel=2,
+        )
+
     import cutlass.cute._tvm_ffi_args_spec_converter as converter
 
     original = converter._convert_single_arg
-    if getattr(original, "_cudnn_bsa_constexpr_compat", False):
-        return
-    supports_is_constexpr = (
-        "is_constexpr" in inspect.signature(original).parameters
-    )
+    supports_is_constexpr = "is_constexpr" in inspect.signature(original).parameters
 
     def convert_single_arg(
         arg,
@@ -68,11 +93,12 @@ def _install_constexpr_tvm_ffi_converter() -> None:
             )
         return original(arg, arg_name, arg_type, ctx)
 
-    convert_single_arg._cudnn_bsa_constexpr_compat = True
     converter._convert_single_arg = convert_single_arg
+    try:
+        yield
+    finally:
+        converter._convert_single_arg = original
 
-
-_install_constexpr_tvm_ffi_converter()
 
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
@@ -86,15 +112,25 @@ torch2cute_dtype_map = {
 def _partition_param_fields(obj):
     """Split dataclass fields into compile-time and MLIR-backed values."""
     all_fields = {field.name: getattr(obj, field.name) for field in fields(obj)}
-    constexpr = {name: value for name, value in all_fields.items() if isinstance(value, _STATIC_TYPES)}
-    dynamic = {name: value for name, value in all_fields.items() if not isinstance(value, _STATIC_TYPES)}
+    constexpr = {
+        name: value
+        for name, value in all_fields.items()
+        if isinstance(value, _STATIC_TYPES)
+    }
+    dynamic = {
+        name: value
+        for name, value in all_fields.items()
+        if not isinstance(value, _STATIC_TYPES)
+    }
     return constexpr, dynamic
 
 
 def _new_params_from_mlir_values(self, values):
     constexpr_fields, dynamic_fields = _partition_param_fields(self)
     values = list(values)
-    for (name, field), num_values in zip(dynamic_fields.items(), self._values_pos):
+    for (name, field), num_values in zip(
+        dynamic_fields.items(), self._values_pos, strict=False
+    ):
         dynamic_fields[name] = cutlass.new_from_mlir_values(field, values[:num_values])
         values = values[num_values:]
     return self.__class__(**dynamic_fields, **constexpr_fields)
@@ -126,7 +162,10 @@ def make_fake_tensor(dtype, shape, divisibility=1, leading_dim=-1):
         return None
     if leading_dim < 0:
         leading_dim += len(shape)
-    stride = tuple(1 if dim == leading_dim else cute.sym_int64(divisibility=divisibility) for dim in range(len(shape)))
+    stride = tuple(
+        1 if dim == leading_dim else cute.sym_int64(divisibility=divisibility)
+        for dim in range(len(shape))
+    )
     return cute.runtime.make_fake_tensor(
         dtype,
         shape,
@@ -149,7 +188,9 @@ def assume_strides_aligned(t):
     since they're static and don't need alignment assumptions.
     """
     divby = 128 // t.element_type.width
-    strides = tuple(s if isinstance(s, int) else cute.assume(s, divby=divby) for s in t.stride[:-1])
+    strides = tuple(
+        s if isinstance(s, int) else cute.assume(s, divby=divby) for s in t.stride[:-1]
+    )
     return (*strides, t.stride[-1])
 
 
@@ -157,10 +198,14 @@ def assume_tensor_aligned(t):
     """Rebuild a tensor with 128-bit aligned stride assumptions. Passes through None."""
     if t is None:
         return None
-    return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t)))
+    return cute.make_tensor(
+        t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t))
+    )
 
 
-def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
+def to_cute_tensor(
+    t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True
+):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
     # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
     # currently export raw bytes as uint8 and tell cutlass correct type
@@ -171,9 +216,15 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
             assumed_align=assumed_align,
             enable_tvm_ffi=enable_tvm_ffi,
         )
-        tensor.element_type = cutlass.Float8E4M3FN if t.dtype == torch.float8_e4m3fn else cutlass.Float8E5M2
+        tensor.element_type = (
+            cutlass.Float8E4M3FN
+            if t.dtype == torch.float8_e4m3fn
+            else cutlass.Float8E5M2
+        )
     else:
-        tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
+        tensor = from_dlpack(
+            t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi
+        )
     if fully_dynamic:
         return tensor.mark_layout_dynamic()
     if leading_dim == -1:

@@ -27,6 +27,7 @@ from .bsa_utils.cache_utils import get_jit_cache
 from .bsa_utils.testing import is_fake_mode
 from .bsa_utils import fa_logging
 from .sm100_blk64.bsa_fwd_sm100 import BlockSparseAttnForwardSm100Blk64
+from .sm100_blk64.cute_dsl_utils import constexpr_tvm_ffi_converter_patched
 from .sm100_blk64.dispatch_helpers import (
     _get_device_arch,
     maybe_contiguous,
@@ -60,7 +61,7 @@ def bsa_attn_sm100_blk64_fwd(
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
-    kv_splits: "int | str" = "auto",
+    kv_splits: "int | str" = 1,
     use_clc: Optional[bool] = None,
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
@@ -100,10 +101,8 @@ def bsa_attn_sm100_blk64_fwd(
             None (upstream kernel limits, not specific to this integration).
 
     Returns:
-        (out, lse) where lse is None if return_lse is False and no gradient
-        tracking is requested.
+        (out, lse) where lse is None if return_lse is False.
     """
-    q, k, v = (maybe_contiguous(t) for t in (q, k, v))
     batch_size, seqlen_q, num_head, head_dim = q.shape
     seqlen_k = k.shape[1]
     num_head_kv = k.shape[2]
@@ -114,6 +113,11 @@ def bsa_attn_sm100_blk64_fwd(
         assert k_scale is not None and v_scale is not None, "FP8 requires Q/K/V scales"
         assert q.dtype == torch.float8_e4m3fn, "FP8 inputs must use float8_e4m3fn"
         assert k.dtype == q.dtype and v.dtype == q.dtype
+        assert (
+            q_scale.device == q.device
+            and k_scale.device == q.device
+            and v_scale.device == q.device
+        ), "q_scale/k_scale/v_scale must be on the same CUDA device as Q/K/V"
         validate_sm100_blk64_fp8_sage(
             batch_size,
             num_head,
@@ -141,7 +145,7 @@ def bsa_attn_sm100_blk64_fwd(
     assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
     assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
 
-    arch = _get_device_arch()
+    arch = _get_device_arch(q.device.index)
     if arch not in (100, 103):
         raise RuntimeError(
             f"bsa_attn_sm100_blk64_fwd only supports SM100/SM103, got SM{arch}"
@@ -154,12 +158,20 @@ def bsa_attn_sm100_blk64_fwd(
     else:
         kv_splits_i = int(kv_splits)
         assert kv_splits_i >= 1, "kv_splits must be >= 1"
+        assert kv_splits_i <= 256, "kv_splits must be <= 256"
 
     # Convert to native BHSD layout for the kernel (public API stays BSHD to
-    # match the existing blk64/blk128 FlashInfer call convention).
-    q_bhsd = q.transpose(1, 2).contiguous()
-    k_bhsd = k.transpose(1, 2).contiguous()
-    v_bhsd = v.transpose(1, 2).contiguous()
+    # match the existing blk64/blk128 FlashInfer call convention). A
+    # transposed view keeps the head_dim (last) stride at 1 -- the only
+    # thing the TMA loads for Q/K/V actually require -- so maybe_contiguous
+    # skips the copy for the common case of physically-contiguous BSHD
+    # inputs, matching the pattern already used by the blk128 sibling
+    # backend (see maybe_contiguous import above). Verified against
+    # kv_splits=1/4/"auto" (split-KV + combine path), asymmetric seqlen, and
+    # Sage-FP8 -- all bit-correct with zero-copy views.
+    q_bhsd = maybe_contiguous(q.transpose(1, 2))
+    k_bhsd = maybe_contiguous(k.transpose(1, 2))
+    v_bhsd = maybe_contiguous(v.transpose(1, 2))
 
     requested_out = out
     requested_lse = lse
@@ -253,7 +265,7 @@ def bsa_attn_sm100_blk64_fwd(
     kv_splits_i = resolve_sm100_blk64_split_workspace(
         q_bhsd, head_dim_v, kv_splits_i, allow_fallback=auto_kv_splits
     )
-    allow_empty_block_nums = (has_variable_block_nums and False) or kv_splits_i > 1
+    allow_empty_block_nums = kv_splits_i > 1
     if use_clc is None:
         if kv_splits_i > 1:
             use_clc_scheduler = False
@@ -395,9 +407,10 @@ def bsa_attn_sm100_blk64_fwd(
             use_int64_kv_strides=use_int64_kv_strides,
         )
 
-        _sm100_blk64_compile_cache[compile_key] = cute.compile(
-            bsa_fwd, *jit_args, options="--enable-tvm-ffi"
-        )
+        with constexpr_tvm_ffi_converter_patched():
+            _sm100_blk64_compile_cache[compile_key] = cute.compile(
+                bsa_fwd, *jit_args, options="--enable-tvm-ffi"
+            )
 
     if not is_fake_mode():
         with torch.cuda.nvtx.range("bsa_attn_sm100_blk64_fwd_kernel"):
