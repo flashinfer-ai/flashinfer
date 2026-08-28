@@ -112,75 +112,73 @@ def _decode_chunk_width(model_type: int) -> int:
 # for the 64-token page layout; the C++ prefill launchers hardcode PBS=64.
 _PAGE_BLOCK_SIZE = 64
 
-# decode-dsv4 instantiation set. NH=8 is the small-TP corner case; the kernel
-# pads the head tile to HPB=16 with zero-Q rows and gates writes by NUM_HEADS.
+# decode-dsv4 eligibility. num_heads=8 keeps a dedicated instantiation per
+# topk (its true-H mid scratch makes the second-half writeback a compile-time
+# skip, worth 4-6% at small T); every other num_heads in [1, 128] is served by
+# one runtime-H instantiation per topk (NUM_HEADS=0; the kernel zero-Q-pads
+# the head tile and HPB-aligns the mid scratch). The dispatch set is therefore
+# the full [1, 128] x topks product. Keep it a frozenset of (num_heads, topk)
+# pairs: vLLM's has_flashinfer_sparse_mla_sm120_config probes membership.
+_DECODE_MAX_HEADS = 128
+_DECODE_DSV4_TOPKS = frozenset({128, 192, 256, 512, 1024})
 _DECODE_DSV4_DISPATCH = frozenset(
-    {
-        (8, 128),
-        (8, 192),
-        (8, 256),
-        (8, 512),
-        (8, 1024),
-        (16, 128),
-        (16, 192),
-        (16, 256),
-        (16, 512),
-        (16, 1024),
-        (32, 128),
-        (32, 192),
-        (32, 256),
-        (32, 512),
-        (32, 1024),
-        (64, 128),
-        (64, 192),
-        (64, 256),
-        (64, 512),
-        (64, 1024),
-        (128, 128),
-        (128, 192),
-        (128, 256),
-        (128, 512),
-        (128, 1024),
-    }
+    (h, k) for h in range(1, _DECODE_MAX_HEADS + 1) for k in _DECODE_DSV4_TOPKS
 )
 
-# decode-dsv3_2 instantiation set (shared with GLM-NSA).
+# decode-dsv3_2 eligibility (shared with GLM-NSA).
+_DECODE_DSV3_2_TOPKS = frozenset({128, 512, 1024, 2048})
 _DECODE_DSV3_2_DISPATCH = frozenset(
-    {
-        (8, 128),
-        (8, 512),
-        (8, 1024),
-        (8, 2048),
-        (16, 128),
-        (16, 512),
-        (16, 1024),
-        (16, 2048),
-        (32, 128),
-        (32, 512),
-        (32, 1024),
-        (32, 2048),
-        (64, 128),
-        (64, 512),
-        (64, 1024),
-        (64, 2048),
-        (128, 128),
-        (128, 512),
-        (128, 1024),
-        (128, 2048),
-    }
+    (h, k) for h in range(1, _DECODE_MAX_HEADS + 1) for k in _DECODE_DSV3_2_TOPKS
 )
 
 # GLM-5.3 native NoPE decode: topk=2176 folds the 128-token indexer tail
-# into the 2048 sparse selection. 64 heads is the TP1 shape; (32, 2176) is
-# the TP2 shape of the same model.
-_DECODE_GLM53_NOPE_DISPATCH = frozenset({(32, 2176), (64, 2176)})
+# into the 2048 sparse selection. One runtime-H instantiation covers the TP1
+# (64-head) and TP2 (32-head) shapes and any other shard.
+_DECODE_GLM53_NOPE_TOPK = 2176
+_DECODE_GLM53_NOPE_DISPATCH = frozenset(
+    (h, _DECODE_GLM53_NOPE_TOPK) for h in range(1, _DECODE_MAX_HEADS + 1)
+)
 
 # DOTS3_SWA sliding-window decode, served by the decode-dsv4 kernel at BI=32 /
 # 4 math warps. topk=576 is the tightest multiple of the BI=32 tile (18
 # chunks) covering the 513-wide window; the window itself is clamped inside
-# the kernel (DecodeTileCfg<DOTS3_SWA>::WINDOW). Head counts cover TP shards
-# of a 64-head layer (TP4 -> 16).
-_DECODE_DOTS3_SWA_DISPATCH = frozenset({(8, 576), (16, 576), (32, 576), (64, 576)})
+# the kernel (DecodeTileCfg<DOTS3_SWA>::WINDOW). Runtime-H covers TP shards
+# of a 64-head layer (TP4 -> 16) and any other count up to 128.
+_DECODE_DOTS3_SWA_TOPK = 576
+_DECODE_DOTS3_SWA_DISPATCH = frozenset(
+    (h, _DECODE_DOTS3_SWA_TOPK) for h in range(1, _DECODE_MAX_HEADS + 1)
+)
+
+# Crossover-calibration grids: the (num_heads, topk) pairs the tuning-mode
+# sweep times on both paths. Deliberately NOT the full eligibility product —
+# calibrating 128 head counts would explode the sweep. Shapes outside the
+# grid keep the decode-first default until a measured entry exists.
+_CALIBRATION_HEADS = (8, 16, 32, 64, 128)
+_DECODE_DSV4_CALIBRATION_GRID = frozenset(
+    (h, k) for h in _CALIBRATION_HEADS for k in _DECODE_DSV4_TOPKS
+)
+_DECODE_DSV3_2_CALIBRATION_GRID = frozenset(
+    (h, k) for h in _CALIBRATION_HEADS for k in _DECODE_DSV3_2_TOPKS
+)
+_DECODE_GLM53_NOPE_CALIBRATION_GRID = frozenset(
+    {(32, _DECODE_GLM53_NOPE_TOPK), (64, _DECODE_GLM53_NOPE_TOPK)}
+)
+_DECODE_DOTS3_SWA_CALIBRATION_GRID = frozenset(
+    (h, _DECODE_DOTS3_SWA_TOPK) for h in (8, 16, 32, 64)
+)
+
+
+def _decode_scratch_heads(num_heads: int) -> int:
+    """Head rows the split-K decode scratch must carry for ``num_heads``.
+
+    The dedicated num_heads=8 instantiation strides mid_out/mid_lse by the
+    true head count; the runtime-H instantiation (all other eligible counts)
+    HPB-aligns the scratch so both halves of the 16-head tile always exist.
+    """
+    if num_heads == 8:
+        return 8
+    return ((num_heads + 15) // 16) * 16
+
 
 # Prefill instantiation envelope (single cache unless noted).
 # DSV3_2-family prefill topk (SG, MG, and swapAB); GLM53_NOPE serves 2176.

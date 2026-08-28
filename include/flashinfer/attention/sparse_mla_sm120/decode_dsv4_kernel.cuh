@@ -184,8 +184,8 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
     const int* __restrict__ extra_topk_length_ptr,  // [num_tokens] or null
     int extra_topk,                                 // 0 = no extra cache
     int pbs_extra,  // page_block_size for extra cache (e.g. 2 for DSv4 C128A)
-    size_t stride_extra_kv_block, int num_tokens, int num_splits, int chunks_per_block,
-    float sm_scale, size_t stride_kv_block,
+    size_t stride_extra_kv_block, int num_tokens, int num_heads, int num_splits,
+    int chunks_per_block, float sm_scale, size_t stride_kv_block,
     // Row strides of (extra_)indices; either may exceed the row width when the
     // caller views a wider persistent buffer (last dim must stay contiguous).
     size_t stride_indices_token, size_t stride_extra_indices_token) {
@@ -205,8 +205,15 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
   constexpr int IO_STRIDE = D_NOPE + D_ROPE_C * 2;                  // 576
   constexpr int pbs = PAGE_BLOCK_SIZE;
   // Kernel always computes a full HPB×CAND tile (zero-Q-padded for unused
-  // head slots); NUM_HEADS=8 small-TP shards write back only VALID_HPB rows.
-  constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
+  // head slots). NUM_HEADS == 0 selects the runtime-head-count instantiation:
+  // one kernel per (MT, TOPK) serves any num_heads <= 128. Q/output carry the
+  // true num_heads stride while the mid scratch is HPB-aligned (gridDim.y *
+  // HPB head rows per token), so both halves of the head tile write back
+  // unconditionally and the merge kernel reads only h < num_heads. The
+  // dedicated NUM_HEADS=8 instantiation keeps its true-H scratch, which makes
+  // the second-half writeback a compile-time skip.
+  constexpr bool RUNTIME_H = (NUM_HEADS == 0);
+  constexpr int VALID_HPB = RUNTIME_H ? HPB : ((NUM_HEADS < HPB) ? NUM_HEADS : HPB);
 
   const int t_idx = blockIdx.x;
   const int h_block_idx = blockIdx.y;
@@ -214,6 +221,11 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
   if (t_idx >= num_tokens) return;
 
   const int h_start = h_block_idx * HPB;
+  // Gmem row strides: Q/output use the true head count; the split-K scratch
+  // is HPB-padded under RUNTIME_H so the (gid + 8) half-rows always exist.
+  const int q_heads = RUNTIME_H ? num_heads : NUM_HEADS;
+  const int mid_heads = RUNTIME_H ? (int)gridDim.y * HPB : NUM_HEADS;
+  const int valid_h = RUNTIME_H ? min(num_heads - h_start, HPB) : VALID_HPB;
   int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : TOPK;
   topk_len = topk_len < 0 ? 0 : (topk_len > TOPK ? TOPK : topk_len);
   // Sliding-window models cap the candidate count at the window regardless of
@@ -248,10 +260,10 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
 
   // Early-exit splits: only math threads write LSE; IO warp has nothing to do.
   if (chunk_lo >= num_chunks_total) {
-    if (!is_io && threadIdx.x < VALID_HPB) {
+    if (!is_io && threadIdx.x < valid_h) {
       const int h = h_start + threadIdx.x;
       const size_t lse_off =
-          (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h * num_splits + split_idx;
+          (size_t)t_idx * mid_heads * num_splits + (size_t)h * num_splits + split_idx;
       mid_lse[lse_off] = -1e30f;
     }
     return;
@@ -427,9 +439,9 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
   const int tid = lane & 3;
 
   // Stage 0: Q quantization (math threads only; the helper uses bar:2
-  // internally with count=Cfg::MATH_THREADS).
-  const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
-  quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, VALID_HPB);
+  // internally with count=Cfg::MATH_THREADS; rows past valid_h are zero-filled).
+  const bf16* q_base = Q + (size_t)t_idx * q_heads * D_QK + (size_t)h_start * D_QK;
+  quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, valid_h);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};
@@ -830,7 +842,7 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
   const float inv_g0 = (global_sum[0] > 0.f) ? (1.f / global_sum[0]) : 0.f;
   const float inv_g1 = (global_sum[1] > 0.f) ? (1.f / global_sum[1]) : 0.f;
 
-  const size_t mid_o_base = ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V_C +
+  const size_t mid_o_base = ((size_t)t_idx * mid_heads + h_start) * (size_t)num_splits * D_V_C +
                             (size_t)split_idx * D_V_C;
 
   // Pack adjacent (d0, d0+1) bf16 pairs into __nv_bfloat162 so the compiler
@@ -850,9 +862,10 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
           __floats2bfloat162_rn(acc_nope[vc][nt][2] * inv_g1, acc_nope[vc][nt][3] * inv_g1);
       *reinterpret_cast<__nv_bfloat162*>(
           &mid_out[mid_o_base + (size_t)gid * num_splits * D_V_C + d0]) = pair_lo;
-      // gid + 8 slot exists only when the kernel tile holds > 8 heads. For
-      // NUM_HEADS=8 (small-TP configs) the second half is invalid and writing
-      // would overflow mid_out's head dim.
+      // gid + 8 slot exists only when the kernel tile holds > 8 heads. The
+      // dedicated NUM_HEADS=8 instantiation strides mid_out by the true head
+      // count, so the second half would overflow it; the runtime-H
+      // instantiation HPB-aligns the scratch, making the write unconditional.
       if constexpr (VALID_HPB > 8) {
         *reinterpret_cast<__nv_bfloat162*>(
             &mid_out[mid_o_base + (size_t)(gid + 8) * num_splits * D_V_C + d0]) = pair_hi;
@@ -881,7 +894,7 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
   if (warp_id == 0 && tid == 0) {
     const float lse0 = (global_sum[0] > 0.f) ? (log2f(global_sum[0]) + global_max[0]) : -1e30f;
     const float lse1 = (global_sum[1] > 0.f) ? (log2f(global_sum[1]) + global_max[1]) : -1e30f;
-    const size_t lse_base = (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
+    const size_t lse_base = (size_t)t_idx * mid_heads * num_splits + (size_t)h_start * num_splits;
     mid_lse[lse_base + (size_t)gid * num_splits + split_idx] = lse0;
     if constexpr (VALID_HPB > 8) {
       mid_lse[lse_base + (size_t)(gid + 8) * num_splits + split_idx] = lse1;
@@ -901,16 +914,22 @@ template <int NUM_HEADS, int D_V_VAL, int BLOCK_THREADS, int DIMS_PER_THREAD>
 __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge_kernel(
     const bf16* __restrict__ mid_out, const float* __restrict__ mid_lse, bf16* __restrict__ output,
     float* __restrict__ out_lse,
-    const float* __restrict__ attn_sink,  // [NUM_HEADS], nullable. natural-log domain.
-    int num_tokens, int num_splits) {
+    const float* __restrict__ attn_sink,  // [num_heads], nullable. natural-log domain.
+    int num_tokens, int num_splits,
+    // Runtime head counts, used when NUM_HEADS == 0 (the runtime-H
+    // instantiation): num_heads strides output/out_lse; mid_heads strides the
+    // HPB-aligned split-K scratch (gridDim.y * HPB of the stage-1 launch).
+    int num_heads, int mid_heads) {
   static_assert(BLOCK_THREADS % 32 == 0, "BLOCK_THREADS must be multiple of 32");
   static_assert(DIMS_PER_THREAD % 8 == 0, "DIMS_PER_THREAD must be multiple of 8 (uint4)");
   static_assert(BLOCK_THREADS * DIMS_PER_THREAD == D_V_VAL, "block must cover the full D_V row");
   constexpr int VECS_PER_THREAD = DIMS_PER_THREAD / 8;  // 1 for D_V=512, BT=64
+  const int q_heads = (NUM_HEADS == 0) ? num_heads : NUM_HEADS;
+  const int m_heads = (NUM_HEADS == 0) ? mid_heads : NUM_HEADS;
 
   const int t_idx = blockIdx.x;
   const int h = blockIdx.y;
-  if (t_idx >= num_tokens || h >= NUM_HEADS) return;
+  if (t_idx >= num_tokens || h >= q_heads) return;
   const int tid = threadIdx.x;
 
   // Dynamic smem: cache runtime per-split LSE values so long C128A dual-cache
@@ -921,7 +940,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge
   __shared__ float sm_inv_gsum;
   __shared__ float sm_glse;
 
-  const float* lse_ptr = mid_lse + (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h * num_splits;
+  const float* lse_ptr = mid_lse + (size_t)t_idx * m_heads * num_splits + (size_t)h * num_splits;
 
   // Stage 0: cooperatively load mid_lse into smem.
   for (int sp = tid; sp < num_splits; sp += BLOCK_THREADS) {
@@ -973,8 +992,8 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge
   const float inv_global_sum = sm_inv_gsum;
 
   // Stage 2: vec-load the partial outputs per split and accumulate.
-  const bf16* mid_base = mid_out + ((size_t)t_idx * NUM_HEADS + h) * (size_t)num_splits * D_V_VAL;
-  bf16* out_ptr = output + ((size_t)t_idx * NUM_HEADS + h) * D_V_VAL;
+  const bf16* mid_base = mid_out + ((size_t)t_idx * m_heads + h) * (size_t)num_splits * D_V_VAL;
+  bf16* out_ptr = output + ((size_t)t_idx * q_heads + h) * D_V_VAL;
   const int dim_base = tid * DIMS_PER_THREAD;
 
   float acc[DIMS_PER_THREAD];
@@ -1012,7 +1031,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge
     *reinterpret_cast<uint4*>(out_ptr + dim_base + v * 8) = packed;
   }
   if (out_lse != nullptr && tid == 0) {
-    out_lse[(size_t)t_idx * NUM_HEADS + h] = sm_glse;
+    out_lse[(size_t)t_idx * q_heads + h] = sm_glse;
   }
 }
 

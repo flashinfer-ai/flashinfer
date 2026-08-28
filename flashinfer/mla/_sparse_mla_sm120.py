@@ -78,23 +78,33 @@ from ..utils import (
     register_fake_op,
     supported_compute_capability,
 )
+
+# The _DECODE_*_DISPATCH pair sets are re-exported here on purpose: vLLM's
+# has_flashinfer_sparse_mla_sm120_config probes membership of
+# ``flashinfer.mla._sparse_mla_sm120._DECODE_DSV4_DISPATCH`` directly.
 from ._sparse_mla_sm120_plan import (
     _BI,
     _BPT_DSV3_2,
     _BPT_DSV4,
     _BPT_DOTS3_SWA,
-    _DECODE_DSV3_2_DISPATCH,
-    _DECODE_DSV4_DISPATCH,
+    _DECODE_DSV3_2_DISPATCH,  # noqa: F401  (vLLM probe surface)
+    _DECODE_DSV4_DISPATCH,  # noqa: F401  (vLLM probe surface)
+    _DECODE_MAX_HEADS,
     _DECODE_MAX_TOKENS,
-    _DECODE_DOTS3_SWA_DISPATCH,
+    _DECODE_DSV3_2_TOPKS,
+    _DECODE_DSV4_TOPKS,
+    _DECODE_DOTS3_SWA_DISPATCH,  # noqa: F401  (vLLM probe surface)
+    _DECODE_DOTS3_SWA_TOPK,
     _MODEL_TYPE_DSV3_2,
     _MODEL_TYPE_DSV4,
     _MODEL_TYPE_GLM53_NOPE,
     _MODEL_TYPE_GLM_NSA,
     _MODEL_TYPE_DOTS3_SWA,
-    _DECODE_GLM53_NOPE_DISPATCH,
+    _DECODE_GLM53_NOPE_DISPATCH,  # noqa: F401  (vLLM probe surface)
+    _DECODE_GLM53_NOPE_TOPK,
     _D_V_BY_MODEL_TYPE,
     _decode_chunk_width,
+    _decode_scratch_heads,
     _MODEL_TYPE_TO_FAMILY,
     _D_V,
     KernelVariant,
@@ -136,30 +146,29 @@ class SparseMLASm120DecodeConfig:
         The only KV page block size the decode kernels are instantiated for.
     max_num_tokens : int
         Largest ``num_tokens`` routed to the decode kernels (inclusive).
-    head_topk_pairs : frozenset[tuple[int, int]]
-        The instantiated ``(num_heads, topk)`` pairs.
+    topks : frozenset[int]
+        The instantiated top-k values.
+    max_num_heads : int
+        Every ``num_heads`` in ``[1, max_num_heads]`` is served: a dedicated
+        ``num_heads=8`` instantiation plus one runtime-head-count
+        instantiation per topk covering any other count.
     """
 
     d_qk: int
     page_block_size: int
     max_num_tokens: int
-    head_topk_pairs: frozenset[tuple[int, int]]
+    topks: frozenset[int]
+    max_num_heads: int
 
     def supported_num_heads(self) -> tuple[int, ...]:
-        """Sorted head counts with at least one instantiated top-k."""
-        return tuple(sorted({h for h, _ in self.head_topk_pairs}))
+        """Every head count from 1 through ``max_num_heads`` (runtime-H)."""
+        return tuple(range(1, self.max_num_heads + 1))
 
     def supported_topk(self, num_heads: Optional[int] = None) -> tuple[int, ...]:
         """Sorted top-k values instantiated for ``num_heads`` (or any head count)."""
-        return tuple(
-            sorted(
-                {
-                    t
-                    for h, t in self.head_topk_pairs
-                    if num_heads is None or h == num_heads
-                }
-            )
-        )
+        if num_heads is None or 1 <= num_heads <= self.max_num_heads:
+            return tuple(sorted(self.topks))
+        return ()
 
     def supports_decode(
         self,
@@ -180,7 +189,8 @@ class SparseMLASm120DecodeConfig:
         return (
             num_tokens <= self.max_num_tokens
             and page_block_size == self.page_block_size
-            and (num_heads, topk) in self.head_topk_pairs
+            and 1 <= num_heads <= self.max_num_heads
+            and topk in self.topks
         )
 
 
@@ -213,14 +223,16 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
         d_qk=576,
         page_block_size=_DECODE_DSV3_2_PAGE_BLOCK_SIZE,
         max_num_tokens=_DECODE_MAX_TOKENS,
-        head_topk_pairs=_DECODE_DSV3_2_DISPATCH,
+        topks=_DECODE_DSV3_2_TOPKS,
+        max_num_heads=_DECODE_MAX_HEADS,
     )
     return {
         "dsv4": SparseMLASm120DecodeConfig(
             d_qk=512,
             page_block_size=_DECODE_DSV4_PAGE_BLOCK_SIZE,
             max_num_tokens=_DECODE_MAX_TOKENS,
-            head_topk_pairs=_DECODE_DSV4_DISPATCH,
+            topks=_DECODE_DSV4_TOPKS,
+            max_num_heads=_DECODE_MAX_HEADS,
         ),
         "dsv3_2": dsv3_2,
         "glm_nsa": dsv3_2,
@@ -228,13 +240,15 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
             d_qk=512,
             page_block_size=_DECODE_DSV3_2_PAGE_BLOCK_SIZE,
             max_num_tokens=_DECODE_MAX_TOKENS,
-            head_topk_pairs=_DECODE_GLM53_NOPE_DISPATCH,
+            topks=frozenset({_DECODE_GLM53_NOPE_TOPK}),
+            max_num_heads=_DECODE_MAX_HEADS,
         ),
         "dots3_swa": SparseMLASm120DecodeConfig(
             d_qk=1088,
             page_block_size=_DECODE_DSV4_PAGE_BLOCK_SIZE,
             max_num_tokens=_DECODE_MAX_TOKENS,
-            head_topk_pairs=_DECODE_DOTS3_SWA_DISPATCH,
+            topks=frozenset({_DECODE_DOTS3_SWA_TOPK}),
+            max_num_heads=_DECODE_MAX_HEADS,
         ),
     }
 
@@ -263,24 +277,16 @@ def _decode_dispatch_error_message(
             f"page_block_size={page_block_size} is unsupported; decode kernels "
             f"are instantiated only for page_block_size={config.page_block_size}"
         )
-    if (num_heads, topk) not in config.head_topk_pairs:
-        heads = config.supported_num_heads()
-        if num_heads in heads:
-            reasons.append(
-                f"topk={topk} is not instantiated for num_heads={num_heads}; "
-                f"available topk: {list(config.supported_topk(num_heads))}"
-            )
-        elif topk in config.supported_topk():
-            reasons.append(
-                f"num_heads={num_heads} is not instantiated for topk={topk}; "
-                f"available num_heads: {list(heads)}"
-            )
-        else:
-            reasons.append(
-                f"neither num_heads={num_heads} nor topk={topk} is instantiated; "
-                f"available num_heads: {list(heads)}; "
-                f"available topk: {list(config.supported_topk())}"
-            )
+    if topk not in config.topks:
+        reasons.append(
+            f"topk={topk} is not instantiated for the {family} decode family; "
+            f"available topk: {list(config.supported_topk())}"
+        )
+    if not 1 <= num_heads <= config.max_num_heads:
+        reasons.append(
+            f"num_heads={num_heads} exceeds the decode envelope "
+            f"[1, {config.max_num_heads}]"
+        )
     # The dispatch branches guarantee at least one reason; the fallback only
     # guards future drift between them and this diagnosis.
     detail = "; ".join(reasons) or "no matching decode instantiation"
@@ -474,34 +480,40 @@ def _decode_scratch_views(
     num_splits: int,
     d_v: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Resolve caller-supplied scratch buffers for split-K decode kernels."""
+    """Resolve caller-supplied scratch buffers for split-K decode kernels.
+
+    The scratch head dim is the true ``num_heads`` for the dedicated
+    ``num_heads=8`` instantiation and HPB(16)-aligned otherwise (the runtime-H
+    kernel writes both halves of its head tile unconditionally).
+    """
+    scratch_heads = _decode_scratch_heads(num_heads)
     if mid_out is None or mid_lse is None:
         raise ValueError(
             "SM120 sparse-MLA decode requires caller-supplied mid_out and "
             "mid_lse scratch. Allocate shapes "
-            f"[{num_tokens}, {num_heads}, {num_splits}, {d_v}] bf16 and "
-            f"[{num_tokens}, {num_heads}, {num_splits}] fp32."
+            f"[{num_tokens}, {scratch_heads}, {num_splits}, {d_v}] bf16 and "
+            f"[{num_tokens}, {scratch_heads}, {num_splits}] fp32."
         )
-    need_out = (num_tokens, num_heads, num_splits, d_v)
-    need_lse = (num_tokens, num_heads, num_splits)
+    need_out = (num_tokens, scratch_heads, num_splits, d_v)
+    need_lse = (num_tokens, scratch_heads, num_splits)
     # Exact-size scratch needs no slicing; identity views cost ~5us/call.
     if mid_out.shape == need_out and mid_lse.shape == need_lse:
         return mid_out, mid_lse
     if any(mid_out.size(d) < need_out[d] for d in range(4)):
         raise ValueError(
             f"mid_out shape {tuple(mid_out.shape)} too small for required "
-            f"[num_tokens={num_tokens}, num_heads={num_heads}, "
+            f"[num_tokens={num_tokens}, num_heads={scratch_heads}, "
             f"num_splits={num_splits}, d_v={d_v}]"
         )
     if any(mid_lse.size(d) < need_lse[d] for d in range(3)):
         raise ValueError(
             f"mid_lse shape {tuple(mid_lse.shape)} too small for required "
-            f"[num_tokens={num_tokens}, num_heads={num_heads}, "
+            f"[num_tokens={num_tokens}, num_heads={scratch_heads}, "
             f"num_splits={num_splits}]"
         )
     return (
-        mid_out[:num_tokens, :num_heads, :num_splits, :d_v],
-        mid_lse[:num_tokens, :num_heads, :num_splits],
+        mid_out[:num_tokens, :scratch_heads, :num_splits, :d_v],
+        mid_lse[:num_tokens, :scratch_heads, :num_splits],
     )
 
 
@@ -891,13 +903,14 @@ class _SparseMLAPagedAttentionRunner:
         # family, 32 for DOTS3_SWA); the split count must use the model's own.
         bi = _decode_chunk_width(_resolve_model_type(d_qk, self._kv_scale_format))
         num_splits = (topk + bi - 1) // bi + (extra_topk + bi - 1) // bi
+        scratch_heads = _decode_scratch_heads(num_heads)
         mid_out = torch.empty(
-            (num_tokens, num_heads, num_splits, self._d_v),
+            (num_tokens, scratch_heads, num_splits, self._d_v),
             dtype=torch.bfloat16,
             device=q.device,
         )
         mid_lse = torch.empty(
-            (num_tokens, num_heads, num_splits),
+            (num_tokens, scratch_heads, num_splits),
             dtype=torch.float32,
             device=q.device,
         )

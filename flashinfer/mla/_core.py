@@ -344,6 +344,11 @@ def _sparse_mla_decode_workspace(
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     if num_tokens > 64:
         return None, None
+    # The runtime-head-count decode kernels HPB-align the scratch head dim;
+    # only the dedicated num_heads=8 instantiation strides it by the true H.
+    from ._sparse_mla_sm120_plan import _decode_scratch_heads
+
+    scratch_heads = _decode_scratch_heads(num_heads)
     split_tile = 64
     num_splits = (topk + split_tile - 1) // split_tile + (
         extra_topk + split_tile - 1
@@ -351,7 +356,7 @@ def _sparse_mla_decode_workspace(
     mid_out, offset = _workspace_tensor_view(
         workspace_buffer,
         byte_offset=0,
-        shape=(num_tokens, num_heads, num_splits, d_v),
+        shape=(num_tokens, scratch_heads, num_splits, d_v),
         dtype=torch.bfloat16,
     )
     if mid_out is None:
@@ -359,7 +364,7 @@ def _sparse_mla_decode_workspace(
     mid_lse, _ = _workspace_tensor_view(
         workspace_buffer,
         byte_offset=offset,
-        shape=(num_tokens, num_heads, num_splits),
+        shape=(num_tokens, scratch_heads, num_splits),
         dtype=torch.float32,
     )
     if mid_lse is None:

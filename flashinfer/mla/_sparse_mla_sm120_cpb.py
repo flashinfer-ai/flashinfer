@@ -540,7 +540,9 @@ def calibrate_crossover(
     """Measure the decode/prefill crossover for the decode-instantiated
     configs of ``family`` on ``device``.
 
-    For every instantiated ``(num_heads, topk)`` pair, both paths are timed at
+    For every ``(num_heads, topk)`` pair on the family's calibration grid (the
+    dedicated-H corner plus the power-of-2 head counts; runtime-H shapes off
+    the grid keep the decode-first default), both paths are timed at
     each probed T with the HBM-faithful protocol of
     :func:`_time_call_fresh_indices`: the decode kernel runs with the model's
     ``select_cpb`` pick; the prefill orchestrator runs with
@@ -558,38 +560,44 @@ def calibrate_crossover(
     table: the largest probed T with ``decode_time <= 0.95 * prefill_time``,
     ``0`` when decode never wins, ``64`` when it wins everywhere probed.
     """
-    from ._sparse_mla_sm120 import (
-        _DECODE_DSV3_2_DISPATCH,
-        _DECODE_DSV4_DISPATCH,
-        _DECODE_GLM53_NOPE_DISPATCH,
-        _DECODE_DOTS3_SWA_DISPATCH,
+    from ._sparse_mla_sm120_plan import (
+        _DECODE_DSV3_2_CALIBRATION_GRID,
+        _DECODE_DSV4_CALIBRATION_GRID,
+        _DECODE_GLM53_NOPE_CALIBRATION_GRID,
+        _DECODE_DOTS3_SWA_CALIBRATION_GRID,
+        _PREFILL_IMPL_AUTO,
         _MODEL_TYPE_DSV3_2,
         _MODEL_TYPE_DSV4,
         _MODEL_TYPE_GLM_NSA,
         _MODEL_TYPE_GLM53_NOPE,
         _MODEL_TYPE_DOTS3_SWA,
-    )
-    from ._sparse_mla_sm120_plan import (
-        _PREFILL_IMPL_AUTO,
         prefill_variant,
     )
 
     device = torch.device(device)
     if family == "dsv4":
-        # (key prefix, instantiation set, FFI model_type)
-        spaces = [("dsv4", sorted(_DECODE_DSV4_DISPATCH), _MODEL_TYPE_DSV4)]
+        # (key prefix, calibration grid, FFI model_type)
+        spaces = [("dsv4", sorted(_DECODE_DSV4_CALIBRATION_GRID), _MODEL_TYPE_DSV4)]
     elif family == "dsv3_2":
         spaces = [
-            ("dsv3_2", sorted(_DECODE_DSV3_2_DISPATCH), _MODEL_TYPE_DSV3_2),
-            ("glm_nsa", sorted(_DECODE_DSV3_2_DISPATCH), _MODEL_TYPE_GLM_NSA),
+            ("dsv3_2", sorted(_DECODE_DSV3_2_CALIBRATION_GRID), _MODEL_TYPE_DSV3_2),
+            ("glm_nsa", sorted(_DECODE_DSV3_2_CALIBRATION_GRID), _MODEL_TYPE_GLM_NSA),
         ]
     elif family == "glm53_nope":
         spaces = [
-            ("glm53_nope", sorted(_DECODE_GLM53_NOPE_DISPATCH), _MODEL_TYPE_GLM53_NOPE)
+            (
+                "glm53_nope",
+                sorted(_DECODE_GLM53_NOPE_CALIBRATION_GRID),
+                _MODEL_TYPE_GLM53_NOPE,
+            )
         ]
     elif family == "dots3_swa":
         spaces = [
-            ("dots3_swa", sorted(_DECODE_DOTS3_SWA_DISPATCH), _MODEL_TYPE_DOTS3_SWA)
+            (
+                "dots3_swa",
+                sorted(_DECODE_DOTS3_SWA_CALIBRATION_GRID),
+                _MODEL_TYPE_DOTS3_SWA,
+            )
         ]
     else:
         raise ValueError(f"unknown sparse-MLA family {family!r}")

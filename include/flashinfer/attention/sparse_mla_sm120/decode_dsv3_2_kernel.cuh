@@ -126,7 +126,8 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     bf16* __restrict__ mid_out,               // [num_tokens, num_heads, num_splits, d_v=512] bf16
     float* __restrict__ mid_lse,              // [num_tokens, num_heads, num_splits] f32
     const int* __restrict__ topk_length_ptr,  // [num_tokens] or null
-    int num_tokens, int num_splits, int chunks_per_block, float sm_scale, size_t stride_kv_block,
+    int num_tokens, int num_heads, int num_splits, int chunks_per_block, float sm_scale,
+    size_t stride_kv_block,
     // Row stride of indices; may exceed topk when the caller views a wider
     // persistent buffer (last dim must stay contiguous).
     size_t stride_indices_token,
@@ -149,11 +150,17 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   // gmem offset KV_ROPE_GMEM_OFFSET=528 with 128 B/entry.
   constexpr int KV_ROPE_OFFSET = KV::KV_ROPE_GMEM_OFFSET;  // 528
   constexpr int pbs = PAGE_BLOCK_SIZE;
-  // Heads actually populated per CTA tile. For NUM_HEADS=8 (small TP),
-  // only the first 8 head slots carry valid data; the kernel computes a
-  // full HPB×CAND tile internally (zero-padded Q rows on invalid heads)
-  // but only writes back NUM_HEADS heads.
-  constexpr int VALID_HPB = (NUM_HEADS < HPB) ? NUM_HEADS : HPB;
+  // Heads actually populated per CTA tile. NUM_HEADS == 0 selects the
+  // runtime-head-count instantiation (one kernel per (MT, TOPK), any
+  // num_heads <= 128): Q/output carry the true num_heads stride, the mid
+  // scratch is HPB-aligned (gridDim.y * HPB rows per token) so both tile
+  // halves write back unconditionally, and the merge kernel reads only
+  // h < num_heads. The dedicated NUM_HEADS=8 instantiation keeps true-H
+  // scratch, making the second-half writeback a compile-time skip; the kernel
+  // still computes a full HPB×CAND tile internally (zero-padded Q rows on
+  // invalid heads).
+  constexpr bool RUNTIME_H = (NUM_HEADS == 0);
+  constexpr int VALID_HPB = RUNTIME_H ? HPB : ((NUM_HEADS < HPB) ? NUM_HEADS : HPB);
 
   const int t_idx = blockIdx.x;
   const int h_block_idx = blockIdx.y;
@@ -161,6 +168,11 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   if (t_idx >= num_tokens) return;
 
   const int h_start = h_block_idx * HPB;
+  // Gmem row strides: Q/output use the true head count; the split-K scratch
+  // is HPB-padded under RUNTIME_H so the (gid + 8) half-rows always exist.
+  const int q_heads = RUNTIME_H ? num_heads : NUM_HEADS;
+  const int mid_heads = RUNTIME_H ? (int)gridDim.y * HPB : NUM_HEADS;
+  const int valid_h = RUNTIME_H ? min(num_heads - h_start, HPB) : VALID_HPB;
   int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : TOPK;
   topk_len = topk_len < 0 ? 0 : (topk_len > TOPK ? TOPK : topk_len);
 
@@ -175,10 +187,10 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
 
   // Early-exit splits: only math threads write LSE; IO has nothing to do.
   if (chunk_lo >= num_chunks_total) {
-    if (!is_io && threadIdx.x < VALID_HPB) {
+    if (!is_io && threadIdx.x < valid_h) {
       const int h = h_start + threadIdx.x;
       const size_t lse_off =
-          (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h * num_splits + split_idx;
+          (size_t)t_idx * mid_heads * num_splits + (size_t)h * num_splits + split_idx;
       mid_lse[lse_off] = -1e30f;
     }
     return;
@@ -291,10 +303,9 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   const int gid = lane >> 2;
   const int tid = lane & 3;
 
-  // Stage 0: Q quantization.
-  const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
-  quantize_q_to_smem<MT, DSV3_2_MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base,
-                                              VALID_HPB);
+  // Stage 0: Q quantization (rows past valid_h are zero-filled).
+  const bf16* q_base = Q + (size_t)t_idx * q_heads * D_QK + (size_t)h_start * D_QK;
+  quantize_q_to_smem<MT, DSV3_2_MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, valid_h);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};
@@ -639,7 +650,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   const float inv_g0 = (global_sum[0] > 0.f) ? (1.f / global_sum[0]) : 0.f;
   const float inv_g1 = (global_sum[1] > 0.f) ? (1.f / global_sum[1]) : 0.f;
 
-  const size_t mid_o_base = ((size_t)t_idx * NUM_HEADS + h_start) * (size_t)num_splits * D_V_C +
+  const size_t mid_o_base = ((size_t)t_idx * mid_heads + h_start) * (size_t)num_splits * D_V_C +
                             (size_t)split_idx * D_V_C;
 
   // Pack adjacent (d0, d0+1) bf16 pairs into __nv_bfloat162 → STG.E.64.
@@ -663,7 +674,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   if (warp_id == 0 && tid == 0) {
     const float lse0 = (global_sum[0] > 0.f) ? (log2f(global_sum[0]) + global_max[0]) : -1e30f;
     const float lse1 = (global_sum[1] > 0.f) ? (log2f(global_sum[1]) + global_max[1]) : -1e30f;
-    const size_t lse_base = (size_t)t_idx * NUM_HEADS * num_splits + (size_t)h_start * num_splits;
+    const size_t lse_base = (size_t)t_idx * mid_heads * num_splits + (size_t)h_start * num_splits;
     mid_lse[lse_base + (size_t)gid * num_splits + split_idx] = lse0;
     if constexpr (VALID_HPB > 8) {
       mid_lse[lse_base + (size_t)(gid + 8) * num_splits + split_idx] = lse1;
