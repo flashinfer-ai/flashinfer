@@ -78,7 +78,7 @@ __device__ __forceinline__ uint32_t elect_sync() {
 }
 
 __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mbar_addr), "r"(count));
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(mbar_addr), "r"(count) : "memory");
 }
 
 __device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
@@ -111,19 +111,21 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
   return token;
 }
 
+// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
+// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
+// explicit loop still makes this helper blocking until acquire succeeds.
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-  uint32_t ticks = 0x989680;
   asm volatile(
       "{\n\t"
       ".reg .pred P1;\n\t"
       "LAB_WAIT:\n\t"
       "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-      " P1, [%0], %1, %2;\n\t"
+      " P1, [%0], %1;\n\t"
       "@P1 bra.uni DONE;\n\t"
       "bra.uni LAB_WAIT;\n\t"
       "DONE:\n\t"
       "}\n" ::"r"(mbar_addr),
-      "r"(phase), "r"(ticks)
+      "r"(phase)
       : "memory");
 }
 
@@ -266,6 +268,11 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
   extern __shared__ __align__(1024) char smem_raw[];
   int smem;
   smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+  const int mbar_base = smem;
+#define a_full_addr (mbar_base + 0)
+#define b_full_addr (mbar_base + 16)
+#define stage_empty_addr (mbar_base + 32)
+#define projection_done_addr (mbar_base + 48)
 
   const int bid = blockIdx.x;
   const int num_bids = gridDim.x;
@@ -306,7 +313,7 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
       mbarrier_init(smem + 40, 4);
       // projection_done: 1 barriers, init_count=1
       mbarrier_init(smem + 48, 1);
-      asm volatile("fence.mbarrier_init.release.cluster;");
+      asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
   }
 
@@ -326,11 +333,6 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
   __syncthreads();
   asm volatile("tcgen05.fence::after_thread_sync;");
 
-  const int mbar_base = smem;
-#define a_full_addr (mbar_base + 0)
-#define b_full_addr (mbar_base + 16)
-#define stage_empty_addr (mbar_base + 32)
-#define projection_done_addr (mbar_base + 48)
   const int taddr = tmem_addr_storage[0];
 
   // Kernel post-init ops
@@ -339,7 +341,7 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
   const int tmem_acc2 = taddr + 256;
   const int tmem_acc3 = taddr + 384;
 
-  // ---- Register redistribution for WGs split across roles ----
+  // ---- Ordered hardware-WG register redistribution ----
   // Dec phase frees registers before any WG attempts inc.
   if (warp >= 16 && warp <= 19) {
     asm volatile("setmaxnreg.dec.sync.aligned.u32 32;");
@@ -349,11 +351,12 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
   if (warp <= 15) {
     asm volatile("setmaxnreg.dec.sync.aligned.u32 96;");
     {  // prepare_main
-      int tile_m = bid / N_GROUPS;
-      int group_n = bid % N_GROUPS;
+      int tiles_m = (M + BLOCK_M - 1) / BLOCK_M;
+      int tile_m = bid % tiles_m;
+      int group_n = bid / tiles_m;
       int off_m = tile_m * BLOCK_M;
       int off_n = group_n * GROUP_N * BLOCK_N;
-#pragma unroll
+#pragma unroll 1
       for (int row_group = 0; row_group < BLOCK_M / 4; row_group++) {
         int row_slot = warp / 4;
         int warp_in_row = warp % 4;
@@ -604,11 +607,11 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
                        "r"(packed_values[0]), "r"(packed_values[1]), "r"(packed_values[2]),
                        "r"(packed_values[3])
                        : "memory");
+          asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         }
         asm volatile("barrier.sync 1, 512;" ::: "memory");
         if (warp == 0) {
           if (elect_sync()) {
-            asm volatile("fence.proxy.async;");
             mbarrier_arrive(a_full_addr + (load_stage) * 8);
           }
         }
@@ -624,19 +627,20 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
       asm volatile("tcgen05.fence::after_thread_sync;");
       int warp_id_in_role = (warp - 0);
       int prepare_warp_id = warp_id_in_role;
-      int tile_m_0 = bid / N_GROUPS;
-      int group_n_1 = bid % N_GROUPS;
-      int off_m_2 = tile_m_0 * BLOCK_M;
-      int off_n_3 = group_n_1 * GROUP_N * BLOCK_N;
+      int tiles_m_0 = (M + BLOCK_M - 1) / BLOCK_M;
+      int tile_m_1 = bid % tiles_m_0;
+      int group_n_2 = bid / tiles_m_0;
+      int off_m_3 = tile_m_1 * BLOCK_M;
+      int off_n_4 = group_n_2 * GROUP_N * BLOCK_N;
       int warp_in_wg = warp % 4;
       int row_addr = warp_in_wg * 32 << 16;
       int local_row_2 = warp_in_wg * 32 + lane;
-      int global_row_2 = off_m_2 + local_row_2;
+      int global_row_2 = off_m_3 + local_row_2;
       int safe_global_row = ((global_row_2 < M) ? global_row_2 : M - 1);
       int heads_per_destination = NUM_HEADS / P;
 #pragma unroll 1
       for (int subgroup = prepare_warp_id / 4; subgroup < prepare_warp_id / 4 + 1; subgroup++) {
-        int native_group = group_n_1 * GROUP_N + subgroup;
+        int native_group = group_n_2 * GROUP_N + subgroup;
         int head = native_group / QKV_KINDS;
         int kind = native_group % QKV_KINDS;
         int destination = head / heads_per_destination;
@@ -650,42 +654,57 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
                                       (unsigned long long)HEAD_DIM;
         int tmem_base = taddr + (unsigned int)row_addr + (unsigned int)(subgroup * BLOCK_N);
         if (kind < 2) {
-          float sum_partials[32];
+          float sum_partials[8];
 #pragma unroll
-          for (int chunk = 0; chunk < HEAD_DIM / 8; chunk++) {
+          for (int chunk = 0; chunk < HEAD_DIM / 16; chunk++) {
             float _tmem_load_0[8];
             tmem_ld_x8(&_tmem_load_0[0], tmem_base + chunk * 8);
-            float chunk_sum_lo = 0.0f;
-            float chunk_sum_hi = 0.0f;
+            float lower_sum_lo = 0.0f;
+            float lower_sum_hi = 0.0f;
 #pragma unroll
             for (int j_3 = 0; j_3 < 4; j_3++) {
               __nv_bfloat16 _cvt_bf16_3 = __float2bfloat16(_tmem_load_0[j_3]);
               float _cvt_f32_3 = __bfloat162float(_cvt_bf16_3);
               float rounded = _cvt_f32_3;
-              chunk_sum_lo += rounded * rounded;
+              lower_sum_lo += rounded * rounded;
               __nv_bfloat16 _cvt_bf16_4 = __float2bfloat16(_tmem_load_0[j_3 + 4]);
               float _cvt_f32_4 = __bfloat162float(_cvt_bf16_4);
               float rounded_hi = _cvt_f32_4;
-              chunk_sum_hi += rounded_hi * rounded_hi;
+              lower_sum_hi += rounded_hi * rounded_hi;
             }
-            sum_partials[chunk * 2] = chunk_sum_lo;
-            sum_partials[chunk * 2 + 1] = chunk_sum_hi;
+            int upper_chunk = chunk + HEAD_DIM / 16;
+            float _tmem_load_1[8];
+            tmem_ld_x8(&_tmem_load_1[0], tmem_base + upper_chunk * 8);
+            float upper_sum_lo = 0.0f;
+            float upper_sum_hi = 0.0f;
+#pragma unroll
+            for (int j_4 = 0; j_4 < 4; j_4++) {
+              __nv_bfloat16 _cvt_bf16_5 = __float2bfloat16(_tmem_load_1[j_4]);
+              float _cvt_f32_5 = __bfloat162float(_cvt_bf16_5);
+              float rounded_1 = _cvt_f32_5;
+              upper_sum_lo += rounded_1 * rounded_1;
+              __nv_bfloat16 _cvt_bf16_6 = __float2bfloat16(_tmem_load_1[j_4 + 4]);
+              float _cvt_f32_6 = __bfloat162float(_cvt_bf16_6);
+              float rounded_hi_1 = _cvt_f32_6;
+              upper_sum_hi += rounded_hi_1 * rounded_hi_1;
+            }
+            if (chunk < 4) {
+              sum_partials[chunk * 2] = lower_sum_lo + upper_sum_lo;
+              sum_partials[chunk * 2 + 1] = lower_sum_hi + upper_sum_hi;
+            } else {
+              sum_partials[(chunk - 4) * 2] =
+                  sum_partials[(chunk - 4) * 2] + (lower_sum_lo + upper_sum_lo);
+              sum_partials[(chunk - 4) * 2 + 1] =
+                  sum_partials[(chunk - 4) * 2 + 1] + (lower_sum_hi + upper_sum_hi);
+            }
           }
 #pragma unroll
-          for (int i = 0; i < 16; i++) {
-            sum_partials[i] = sum_partials[i] + sum_partials[i + 16];
+          for (int i = 0; i < 4; i++) {
+            sum_partials[i] = sum_partials[i] + sum_partials[i + 4];
           }
 #pragma unroll
-          for (int i_1 = 0; i_1 < 8; i_1++) {
-            sum_partials[i_1] = sum_partials[i_1] + sum_partials[i_1 + 8];
-          }
-#pragma unroll
-          for (int i_2 = 0; i_2 < 4; i_2++) {
-            sum_partials[i_2] = sum_partials[i_2] + sum_partials[i_2 + 4];
-          }
-#pragma unroll
-          for (int i_3 = 0; i_3 < 2; i_3++) {
-            sum_partials[i_3] = sum_partials[i_3] + sum_partials[i_3 + 2];
+          for (int i_1 = 0; i_1 < 2; i_1++) {
+            sum_partials[i_1] = sum_partials[i_1] + sum_partials[i_1 + 2];
           }
           float sum_sq_1 = sum_partials[0] + sum_partials[1];
           float _rsqrt_1 = rsqrtf(sum_sq_1 / (float)HEAD_DIM + eps);
@@ -694,10 +713,10 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
           for (int chunk_1 = 0; chunk_1 < ROPE_HALF / 8; chunk_1++) {
             int col_lo = chunk_1 * 8;
             int col_hi = col_lo + ROPE_HALF;
-            float _tmem_load_1[8];
-            tmem_ld_x8(&_tmem_load_1[0], tmem_base + col_lo);
             float _tmem_load_2[8];
-            tmem_ld_x8(&_tmem_load_2[0], tmem_base + col_hi);
+            tmem_ld_x8(&_tmem_load_2[0], tmem_base + col_lo);
+            float _tmem_load_3[8];
+            tmem_ld_x8(&_tmem_load_3[0], tmem_base + col_hi);
             float _vec_load_5[8];
             {
               const uint4* _vptr_5 = reinterpret_cast<const uint4*>(
@@ -795,27 +814,27 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
             float rotated_lo[8];
             float rotated_hi[8];
 #pragma unroll
-            for (int j_4 = 0; j_4 < 8; j_4++) {
-              __nv_bfloat16 _cvt_bf16_5 = __float2bfloat16(_tmem_load_1[j_4]);
-              float _cvt_f32_5 = __bfloat162float(_cvt_bf16_5);
-              float rounded_lo = _cvt_f32_5;
-              __nv_bfloat16 _cvt_bf16_6 = __float2bfloat16(_tmem_load_2[j_4]);
-              float _cvt_f32_6 = __bfloat162float(_cvt_bf16_6);
-              float rounded_hi_1 = _cvt_f32_6;
-              float scaled_lo = rstd * rounded_lo;
-              float scaled_hi = rstd * rounded_hi_1;
-              __nv_bfloat16 _cvt_bf16_7 = __float2bfloat16(_vec_load_5[j_4] * scaled_lo);
+            for (int j_5 = 0; j_5 < 8; j_5++) {
+              __nv_bfloat16 _cvt_bf16_7 = __float2bfloat16(_tmem_load_2[j_5]);
               float _cvt_f32_7 = __bfloat162float(_cvt_bf16_7);
-              float norm_lo = _cvt_f32_7;
-              __nv_bfloat16 _cvt_bf16_8 = __float2bfloat16(_vec_load_6[j_4] * scaled_hi);
+              float rounded_lo = _cvt_f32_7;
+              __nv_bfloat16 _cvt_bf16_8 = __float2bfloat16(_tmem_load_3[j_5]);
               float _cvt_f32_8 = __bfloat162float(_cvt_bf16_8);
-              float norm_hi = _cvt_f32_8;
-              float cos_lo = norm_lo * _vec_load_7[j_4];
-              float cos_hi = norm_hi * _vec_load_7[j_4];
-              float sin_lo = norm_lo * _vec_load_8[j_4];
-              float sin_hi = norm_hi * _vec_load_8[j_4];
-              rotated_lo[j_4] = cos_lo - sin_hi;
-              rotated_hi[j_4] = cos_hi + sin_lo;
+              float rounded_hi_2 = _cvt_f32_8;
+              float scaled_lo = rstd * rounded_lo;
+              float scaled_hi = rstd * rounded_hi_2;
+              __nv_bfloat16 _cvt_bf16_9 = __float2bfloat16(_vec_load_5[j_5] * scaled_lo);
+              float _cvt_f32_9 = __bfloat162float(_cvt_bf16_9);
+              float norm_lo = _cvt_f32_9;
+              __nv_bfloat16 _cvt_bf16_10 = __float2bfloat16(_vec_load_6[j_5] * scaled_hi);
+              float _cvt_f32_10 = __bfloat162float(_cvt_bf16_10);
+              float norm_hi = _cvt_f32_10;
+              float cos_lo = norm_lo * _vec_load_7[j_5];
+              float cos_hi = norm_hi * _vec_load_7[j_5];
+              float sin_lo = norm_lo * _vec_load_8[j_5];
+              float sin_hi = norm_hi * _vec_load_8[j_5];
+              rotated_lo[j_5] = cos_lo - sin_hi;
+              rotated_hi[j_5] = cos_hi + sin_lo;
             }
             if (global_row_2 < M) {
               {
@@ -843,8 +862,8 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
 #pragma unroll
           for (int chunk_2 = ROPE_DIM / 8; chunk_2 < HEAD_DIM / 8; chunk_2++) {
             int col = chunk_2 * 8;
-            float _tmem_load_3[8];
-            tmem_ld_x8(&_tmem_load_3[0], tmem_base + col);
+            float _tmem_load_4[8];
+            tmem_ld_x8(&_tmem_load_4[0], tmem_base + col);
             float _vec_load_9[8];
             {
               const uint4* _vptr_9 = reinterpret_cast<const uint4*>(
@@ -869,12 +888,12 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
             }
             float normalized[8];
 #pragma unroll
-            for (int j_5 = 0; j_5 < 8; j_5++) {
-              __nv_bfloat16 _cvt_bf16_9 = __float2bfloat16(_tmem_load_3[j_5]);
-              float _cvt_f32_9 = __bfloat162float(_cvt_bf16_9);
-              float rounded_1 = _cvt_f32_9;
-              float scaled = rstd * rounded_1;
-              normalized[j_5] = _vec_load_9[j_5] * scaled;
+            for (int j_6 = 0; j_6 < 8; j_6++) {
+              __nv_bfloat16 _cvt_bf16_11 = __float2bfloat16(_tmem_load_4[j_6]);
+              float _cvt_f32_11 = __bfloat162float(_cvt_bf16_11);
+              float rounded_2 = _cvt_f32_11;
+              float scaled = rstd * rounded_2;
+              normalized[j_6] = _vec_load_9[j_6] * scaled;
             }
             if (global_row_2 < M) {
               {
@@ -893,15 +912,15 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
 #pragma unroll
           for (int chunk_3 = 0; chunk_3 < HEAD_DIM / 8; chunk_3++) {
             int col_1 = chunk_3 * 8;
-            float _tmem_load_4[8];
-            tmem_ld_x8(&_tmem_load_4[0], tmem_base + col_1);
+            float _tmem_load_5[8];
+            tmem_ld_x8(&_tmem_load_5[0], tmem_base + col_1);
             if (global_row_2 < M) {
               {
                 __nv_bfloat162 _pk[4];
-                _pk[0] = __floats2bfloat162_rn(_tmem_load_4[0 + 0], _tmem_load_4[0 + 1]);
-                _pk[1] = __floats2bfloat162_rn(_tmem_load_4[0 + 2], _tmem_load_4[0 + 3]);
-                _pk[2] = __floats2bfloat162_rn(_tmem_load_4[0 + 4], _tmem_load_4[0 + 5]);
-                _pk[3] = __floats2bfloat162_rn(_tmem_load_4[0 + 6], _tmem_load_4[0 + 7]);
+                _pk[0] = __floats2bfloat162_rn(_tmem_load_5[0 + 0], _tmem_load_5[0 + 1]);
+                _pk[1] = __floats2bfloat162_rn(_tmem_load_5[0 + 2], _tmem_load_5[0 + 3]);
+                _pk[2] = __floats2bfloat162_rn(_tmem_load_5[0 + 4], _tmem_load_5[0 + 5]);
+                _pk[3] = __floats2bfloat162_rn(_tmem_load_5[0 + 6], _tmem_load_5[0 + 7]);
                 *reinterpret_cast<uint4*>(
                     &((__nv_bfloat16*)(out + (out_base + (unsigned long long)col_1)))[0]) =
                     *reinterpret_cast<uint4*>(&_pk[0]);
@@ -917,10 +936,11 @@ __launch_bounds__(640, 1) void kernel_minimax_h3_bf16_pre_attention_destination_
   // ---- Role: mma ----
   if (warp == 16) {
     {  // mma_main
-      int tile_m_1 = bid / N_GROUPS;
-      int group_n_2 = bid % N_GROUPS;
-      int off_m_1 = tile_m_1 * BLOCK_M;
-      int off_n_1 = group_n_2 * GROUP_N * BLOCK_N;
+      int tiles_m_1 = (M + BLOCK_M - 1) / BLOCK_M;
+      int tile_m_2 = bid % tiles_m_1;
+      int group_n_1 = bid / tiles_m_1;
+      int off_m_1 = tile_m_2 * BLOCK_M;
+      int off_n_1 = group_n_1 * GROUP_N * BLOCK_N;
       unsigned int mma_stage = 0;
       unsigned int _phase_a_full = 0;
       unsigned int _phase_b_full = 0;
