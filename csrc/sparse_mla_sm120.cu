@@ -72,23 +72,22 @@ inline ModelType resolve_model_type(int d_qk, int64_t model_type) {
         << "d_qk=512 supports model_type auto, DSV4, or GLM53_NOPE; got " << model_type;
     return mt;
   }
+  if (d_qk == 1088) {
+    const auto mt = static_cast<ModelType>(
+        model_type == kAuto ? static_cast<int64_t>(ModelType::DOTS3_SWA) : model_type);
+    TVM_FFI_ICHECK(mt == ModelType::DOTS3_SWA)
+        << "d_qk=1088 supports only model_type auto or DOTS3_SWA; got " << model_type;
+    return mt;
+  }
   TVM_FFI_ICHECK(false) << "Unsupported d_qk=" << d_qk
-                        << "; expected 576 (DSV3_2/GLM_NSA) or 512 (DSV4/GLM53_NOPE)";
+                        << "; expected 576 (DSV3_2/GLM_NSA), 512 (DSV4/GLM53_NOPE) or 1088 "
+                           "(DOTS3_SWA)";
   return ModelType::DSV4;
 }
 
-inline int bytes_per_token(ModelType mt) {
-  switch (mt) {
-    case ModelType::DSV3_2:
-    case ModelType::GLM_NSA:
-    case ModelType::GLM53_NOPE:
-      return 656;
-    case ModelType::DSV4:
-      return 584;
-  }
-  TVM_FFI_ICHECK(false) << "Unsupported sparse MLA model type";
-  return 0;
-}
+// Output width. Every DeepSeek-family model absorbs V into the 512-wide
+// latent; DOTS3_SWA's is 1024 (its 1024-wide latent, rope excluded).
+inline int d_v_for(ModelType mt) { return mt == ModelType::DOTS3_SWA ? 1024 : 512; }
 
 struct PagedKVLayout {
   int page_block_size;
@@ -181,10 +180,12 @@ void SparseMlaSm120PagedAttention(
   TVM_FFI_ICHECK_LE(num_heads, 128);
   TVM_FFI_ICHECK_GT(topk, 0);
   TVM_FFI_ICHECK_GT(page_block_size, 0);
-  TVM_FFI_ICHECK_EQ(output.ndim(), 3) << "output must be [num_tokens, num_heads, 512]";
+  const int d_v = d_v_for(mt);
+  TVM_FFI_ICHECK_EQ(output.ndim(), 3) << "output must be [num_tokens, num_heads, d_v]";
   TVM_FFI_ICHECK_EQ(output.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(output.size(1), num_heads);
-  TVM_FFI_ICHECK_EQ(output.size(2), 512) << "SM120 sparse-MLA requires d_v == 512";
+  TVM_FFI_ICHECK_EQ(output.size(2), d_v)
+      << "SM120 sparse-MLA requires d_v == " << d_v << " for this model type";
   TVM_FFI_ICHECK_EQ(out_lse.ndim(), 2) << "out_lse must be [num_tokens, num_heads]";
   TVM_FFI_ICHECK_EQ(out_lse.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(out_lse.size(1), num_heads);
@@ -273,14 +274,25 @@ void SparseMlaSm120PagedAttention(
       extra_page_block_size, Q_ptr, KV_ptr, idx_ptr, extra_kv_ptr, extra_idx_ptr, O_ptr, LSE_ptr,
       static_cast<float>(sm_scale), num_tokens, kv_layout.stride_kv_block, extra_stride_kv_block,
       attn_sink_ptr, tl_ptr, etl_ptr, stream);
+  const char* mt_name = "DSV4";
+  switch (mt) {
+    case ModelType::DSV3_2:
+      mt_name = "DSV3_2";
+      break;
+    case ModelType::GLM_NSA:
+      mt_name = "GLM_NSA";
+      break;
+    case ModelType::GLM53_NOPE:
+      mt_name = "GLM53_NOPE";
+      break;
+    case ModelType::DOTS3_SWA:
+      mt_name = "DOTS3_SWA";
+      break;
+    case ModelType::DSV4:
+      break;
+  }
   TVM_FFI_ICHECK(ok) << "Unsupported sparse-MLA prefill configuration: "
-                     << "model="
-                     << (mt == ModelType::DSV3_2
-                             ? "DSV3_2"
-                             : (mt == ModelType::GLM_NSA
-                                    ? "GLM_NSA"
-                                    : (mt == ModelType::GLM53_NOPE ? "GLM53_NOPE" : "DSV4")))
-                     << " num_heads=" << num_heads << " topk=" << topk
+                     << "model=" << mt_name << " num_heads=" << num_heads << " topk=" << topk
                      << " page_block_size=" << page_block_size << " topk_extra=" << extra_topk
                      << " extra_page_block_size=" << extra_page_block_size
                      << " variant=" << variant;

@@ -28,12 +28,13 @@
 
 // Sparse-MLA SM120 prefill. Single raw-pointer entry point that launches the
 // planner-selected PrefillVariant:
-//   - SWAPAB (warp specialized, 64 heads/CTA): DSV3_2 / GLM_NSA, num_heads
-//     64 / 128, topk 2048, single cache (GLM53_NOPE excluded: topk 2176 is
-//     not swapAB-instantiated)
-//   - SG (single-group, 16 heads/CTA): DSV3_2 family, num_heads 8 / 16,
-//     topk 2048 (GLM53_NOPE: 2176)
-//   - MG (multi-group, 32 heads/CTA): DSV3_2 family num_heads >= 32 topk
+//   - SWAPAB (warp specialized, 64 heads/CTA): the V32 family (DSV3_2 /
+//     GLM_NSA / GLM53_NOPE), num_heads 64 / 128, topk 2048 (GLM53_NOPE: 2176),
+//     single cache
+//   - SG (single-group, 16 heads/CTA): V32 family num_heads 8 / 16, topk 2048
+//     (GLM53_NOPE: 2176); DOTS3_SWA num_heads {8, 16, 32, 64} topk 576 — SG-only,
+//     its D_NOPE=1024 does not fit the MG layout
+//   - MG (multi-group, 32 heads/CTA): V32 family num_heads >= 32 topk
 //     2048 (GLM53_NOPE: 2176); DSV4 num_heads {8..128} topk {128..2048}
 //   - MG_DUAL: dual-cache MG variants (DSV4 only, topk 128)
 //
@@ -79,11 +80,12 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
                        const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
                        int num_tokens, size_t stride_kv_block, const int* topk_length_ptr,
                        cudaStream_t stream) {
-  constexpr size_t smem_bytes = SmemLayout<MT, CM>::TOTAL;
+  using Cfg = PrefillTileCfg<MT>;
+  constexpr size_t smem_bytes = SmemLayout<MT, CM, Cfg::BI, Cfg::MATH_WARPS>::TOTAL;
   // Ceil-div so NUM_HEADS < HPB (small-TP shards) still launches 1 CTA per token.
   constexpr int REPLICATE_H = (NUM_HEADS + HPB - 1) / HPB;
   dim3 grid(num_tokens * REPLICATE_H);
-  dim3 block(BLOCK_THREADS);
+  dim3 block(Cfg::BLOCK_THREADS);
 
   auto kernel = sparse_mla_prefill_kernel<MT, CM, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
   static bool configured[kMaxCachedCudaDevices] = {};
@@ -337,6 +339,45 @@ inline bool dispatch_v32_mg(int num_heads, int topk, int page_block_size, const 
 #undef DISPATCH_DSV3_2_MG
 }
 
+// DOTS3_SWA is SG-only: its D_NOPE=1024 puts the MG per-group buffers over the
+// sm120 smem cap at every BI that still satisfies the FP8 XV k=32 floor. SG
+// covers num_heads > HPB by replicating one CTA per 16-head tile
+// (`REPLICATE_H`), so TP1..TP8 shards of a 64-head layer are all reachable.
+//
+// TOPK is fixed at 576: the tightest multiple of the BI=32 tile that covers the
+// 513-wide sliding window. The window itself is baked into PrefillTilePrimary,
+// so a caller passing no topk_length still gets a correctly bounded scan.
+inline bool dispatch_dots3_swa_sg(int num_heads, int topk, int page_block_size, const bf16* Q,
+                                  const uint8_t* KV, const int32_t* indices, const float* attn_sink,
+                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
+                                  size_t stride_kv_block, const int* topk_length_ptr,
+                                  cudaStream_t stream) {
+  if (topk != 576 || page_block_size != 64) return false;
+
+#define DISPATCH_DOTS3_SWA_SG(NH)                                                        \
+  launch_prefill_sg<ModelType::DOTS3_SWA, ComputeMode::FP8, NH, 576, 64>(                \
+      Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block, \
+      topk_length_ptr, stream)
+
+  switch (num_heads) {
+    case 8:
+      DISPATCH_DOTS3_SWA_SG(8);
+      return true;
+    case 16:
+      DISPATCH_DOTS3_SWA_SG(16);
+      return true;
+    case 32:
+      DISPATCH_DOTS3_SWA_SG(32);
+      return true;
+    case 64:
+      DISPATCH_DOTS3_SWA_SG(64);
+      return true;
+    default:
+      return false;
+  }
+#undef DISPATCH_DOTS3_SWA_SG
+}
+
 inline bool dispatch_dsv4_single(int num_heads, int topk, int page_block_size, const bf16* Q,
                                  const uint8_t* KV, const int32_t* indices, const float* attn_sink,
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
@@ -529,6 +570,11 @@ bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_h
     }
     case PrefillVariant::SG: {
       if (extra_KV_cache != nullptr) return false;
+      if (mt == ModelType::DOTS3_SWA) {
+        return dispatch_dots3_swa_sg(num_heads, topk, page_block_size, Q, KV_cache, indices,
+                                     attn_sink, output, out_lse, sm_scale, num_tokens,
+                                     stride_kv_block, topk_length, stream);
+      }
       DISPATCH_V32(dispatch_v32_sg);
     }
     case PrefillVariant::MG: {

@@ -36,7 +36,9 @@
 // These determine smem strides, MMA loop counts, IO gather sizes,
 // and all dimension-dependent kernel parameters.
 //
-// Both model types share: D_ROPE=64, D_V=512, HPB=16, BI=64.
+// The DeepSeek-family model types share: D_ROPE=64, D_V=512, HPB=16, BI=64.
+// GLM53_NOPE diverges on D_ROPE (0); DOTS3_SWA diverges on D_V (1024) and runs
+// at BI=32 — see its traits below.
 
 template <ModelType MT>
 struct KVCacheTraits;
@@ -128,6 +130,57 @@ struct KVCacheTraits<ModelType::GLM53_NOPE> {
 };
 
 template <>
+struct KVCacheTraits<ModelType::DOTS3_SWA> {
+  // Sliding-window MLA: 1024-wide latent + 64-wide rope. First model with
+  // D_V != 512 — see the assert block below.
+  static constexpr int D_NOPE = 1024;
+  static constexpr int D_ROPE = 64;
+  static constexpr int D_QK = D_NOPE + D_ROPE;  // 1088
+  static constexpr int D_V = D_NOPE;            // 1024, rope excluded (V_HAS_ROPE=false)
+
+  // FP8 quantization. QUANT_TILE=128 (not DSV4's 64) keeps NUM_SCALES a power
+  // of two, so the footer is 8B with no pad — unlike DSV4's 7+1.
+  static constexpr int QUANT_TILE = 128;
+  static constexpr int NUM_SCALES = D_NOPE / QUANT_TILE;  // 8
+  static constexpr ScaleFormat SCALE_FORMAT = ScaleFormat::UE8M0_BYTE;
+
+  // KV cache layout (FlashMLA ABI): FOOTER, 1160 logical bytes per token.
+  // Physical layout per block (page_block_size tokens):
+  //   [0 : block_size*1152)                 nope+rope data (1152B each)
+  //     per token: [0:1024) FP8 nope, [1024:1152) BF16 rope
+  //   [block_size*1152 : block_size*1160)   scale footer (8B each: 8×UE8M0)
+  //
+  // IO stride = 1152 (data only), 1152 % 16 = 0 ✓ for cp.async.bulk.
+  static constexpr bool SCALE_INLINE = false;
+  static constexpr int SCALE_BYTES_PER_TOKEN = 8;
+  static constexpr int KV_GMEM_STRIDE =
+      D_NOPE + D_ROPE * sizeof(bf16) + SCALE_BYTES_PER_TOKEN;                  // 1160
+  static constexpr int KV_ROPE_GMEM_OFFSET = D_NOPE;                           // 1024
+  static constexpr int KV_SCALE_GMEM_OFFSET = D_NOPE + D_ROPE * sizeof(bf16);  // 1152
+
+  // Smem layout (nope only + padding, no rope, no inline scales).
+  // stride=1040: 1040/4=260, 260%32=4 → same 4-way conflict class as DSV3_2's
+  // 528, not DSV4's conflict-free 464. UNMEASURED — the M4b-equivalent
+  // benchmark has not been run for this stride.
+  // Must be 16B aligned for cp.async.bulk: 1040%16=0 ✓
+  static constexpr int KV_SMEM_STRIDE = D_NOPE + 16;  // 1040
+  static constexpr int KV_SMEM_COPY_BYTES = D_NOPE;   // copy 1024B nope per entry
+  static constexpr bool SCALE_IN_KV_SMEM = false;
+
+  // Q nope stride
+  static constexpr int Q_NOPE_STRIDE = D_NOPE + 16;      // 1040
+  static constexpr int Q_NOPE_BF16_STRIDE = D_NOPE + 8;  // 1032 bf16 (2064 B)
+
+  // V = pure nope. In this family's reference implementation the scores bmm
+  // uses the full 1088-wide head dim, but the output bmm reads only the
+  // 1024-wide latent (rope excluded).
+  static constexpr bool V_HAS_ROPE = false;
+
+  // UE8M0 scales are native — no conversion needed
+  __device__ static __forceinline__ uint8_t scale_to_ue8m0(uint8_t scale) { return scale; }
+};
+
+template <>
 struct KVCacheTraits<ModelType::DSV4> {
   // Dimensions
   static constexpr int D_NOPE = 448;
@@ -182,9 +235,13 @@ struct KVCacheTraits<ModelType::DSV4> {
 
 static constexpr int HPB = 16;
 static constexpr int BI = 64;
-// D_ROPE and D_V are shared across all supported models; the asserts below
-// pin them to KVCacheTraits<...> so a new model with diverging values has
-// to opt out explicitly.
+// D_V is shared across the DeepSeek-family models only; the asserts below pin
+// the shared values to KVCacheTraits<...> so a new model with diverging values
+// has to opt out explicitly (GLM53_NOPE already opts out of D_ROPE).
+//
+// DOTS3_SWA is the D_V opt-out: D_V = 1024. Anything reading the bare `D_V`
+// below is therefore DeepSeek-family-only and must not be reached from a
+// DOTS3_SWA instantiation — use KVCacheTraits<MT>::D_V.
 static constexpr int D_ROPE = 64;
 static constexpr int D_V = 512;
 static_assert(KVCacheTraits<ModelType::DSV3_2>::D_ROPE == D_ROPE);
@@ -195,6 +252,10 @@ static_assert(KVCacheTraits<ModelType::GLM_NSA>::D_ROPE == D_ROPE);
 static_assert(KVCacheTraits<ModelType::GLM_NSA>::D_V == D_V);
 static_assert(KVCacheTraits<ModelType::GLM53_NOPE>::D_ROPE == 0);
 static_assert(KVCacheTraits<ModelType::GLM53_NOPE>::D_V == D_V);
+static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::D_ROPE == D_ROPE);
+static_assert(KVCacheTraits<ModelType::DOTS3_SWA>::D_V != D_V,
+              "DOTS3_SWA is the D_V opt-out; if it ever equals 512, fold it back "
+              "into the shared assert above");
 
 // Warp configuration
 static constexpr int N_MATH_WARPS = 8;
@@ -207,7 +268,11 @@ static constexpr int IO_THREADS = N_IO_WARPS * 32;               // 128
 static constexpr int ENTRIES_PER_WARP = BI / N_MATH_WARPS;  // 8
 static constexpr int N_ROPE_CHUNKS = D_ROPE / 16;           // 4
 
-// Output staging (reuses KV buffer after main loop)
+// Output staging (reuses KV buffer after main loop).
+// NOTE: OUT_STAGING_STRIDE and OUT_TILES_PER_HEAD are currently unreferenced —
+// each kernel derives its own staging geometry. They read the bare D_V, so they
+// are DeepSeek-family-only; parameterize on KVCacheTraits<MT>::D_V before using
+// them from a DOTS3_SWA path.
 static constexpr int OUT_STAGING_STRIDE = D_V + 8;  // 520 bf16 elements
 static constexpr int OUT_VEC = 8;
 static constexpr int OUT_TILES_PER_HEAD = D_V / OUT_VEC;  // 64
@@ -232,29 +297,37 @@ static constexpr int OUT_TILES_PER_HEAD = D_V / OUT_VEC;  // 64
 //   QK/XV: BF16 MMA m16n8k16
 //   V in smem is BF16 → ldmatrix.x2.trans (no byte transpose)
 
-template <ModelType MT, ComputeMode CM>
+// ComputeTraits is parameterized on the tile config (candidates per iteration
+// and math-warp count). TILE_BI / TILE_MATH_WARPS default to the namespace-scope
+// BI / N_MATH_WARPS, so every `ComputeTraits<MT, CM>` spelling keeps the 64/8
+// values it had before. A model running a different tile — DOTS3_SWA decodes at
+// BI=32 with 4 math warps — must pass them explicitly, or V_TRANS_STRIDE /
+// NT_PER_WARP_XV / XV_KSTEPS come out silently wrong.
+template <ModelType MT, ComputeMode CM, int TILE_BI = BI, int TILE_MATH_WARPS = N_MATH_WARPS>
 struct ComputeTraits;
 
-template <ModelType MT>
-struct ComputeTraits<MT, ComputeMode::FP8> {
+template <ModelType MT, int TILE_BI, int TILE_MATH_WARPS>
+struct ComputeTraits<MT, ComputeMode::FP8, TILE_BI, TILE_MATH_WARPS> {
   using KV = KVCacheTraits<MT>;
-  static constexpr int V_CHUNK = KV::QUANT_TILE;                     // DSV3_2=128, DSV4=64
-  static constexpr int N_V_CHUNKS = KV::D_NOPE / V_CHUNK;            // DSV3_2=4, DSV4=7
-  static constexpr int V_TRANS_STRIDE = BI + 16;                     // 80
-  static constexpr int W_FP8_STRIDE = BI + 16;                       // 80
-  static constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / N_MATH_WARPS;  // DSV3_2=2, DSV4=1
-  static constexpr int ACC_TILES = N_V_CHUNKS * NT_PER_WARP_XV;      // DSV3_2=8, DSV4=7
-  static constexpr int XV_KSTEPS = BI / 32;                          // 2 (FP8 k=32)
+  static constexpr int V_CHUNK = KV::QUANT_TILE;                        // DSV3_2=128, DSV4=64
+  static constexpr int N_V_CHUNKS = KV::D_NOPE / V_CHUNK;               // DSV3_2=4, DSV4=7
+  static constexpr int V_TRANS_STRIDE = TILE_BI + 16;                   // 80 at BI=64
+  static constexpr int W_FP8_STRIDE = TILE_BI + 16;                     // 80 at BI=64
+  static constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / TILE_MATH_WARPS;  // DSV3_2=2, DSV4=1
+  static constexpr int ACC_TILES = N_V_CHUNKS * NT_PER_WARP_XV;         // DSV3_2=8, DSV4=7
+  static constexpr int XV_KSTEPS = TILE_BI / 32;                        // 2 (FP8 k=32)
+  static_assert(NT_PER_WARP_XV >= 1, "V chunk too narrow for this math-warp count");
 };
 
-template <ModelType MT>
-struct ComputeTraits<MT, ComputeMode::BF16> {
+template <ModelType MT, int TILE_BI, int TILE_MATH_WARPS>
+struct ComputeTraits<MT, ComputeMode::BF16, TILE_BI, TILE_MATH_WARPS> {
   using KV = KVCacheTraits<MT>;
   static constexpr int V_CHUNK = KV::QUANT_TILE;
   static constexpr int N_V_CHUNKS = KV::D_NOPE / V_CHUNK;
-  static constexpr int V_TRANS_STRIDE = BI + 8;  // 72 bf16 elements
+  static constexpr int V_TRANS_STRIDE = TILE_BI + 8;  // 72 bf16 elements at BI=64
   static constexpr int W_FP8_STRIDE = 0;
-  static constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / N_MATH_WARPS;
+  static constexpr int NT_PER_WARP_XV = V_CHUNK / 8 / TILE_MATH_WARPS;
   static constexpr int ACC_TILES = N_V_CHUNKS * NT_PER_WARP_XV;
-  static constexpr int XV_KSTEPS = BI / 16;  // 4 (BF16 k=16)
+  static constexpr int XV_KSTEPS = TILE_BI / 16;  // 4 (BF16 k=16)
+  static_assert(NT_PER_WARP_XV >= 1, "V chunk too narrow for this math-warp count");
 };

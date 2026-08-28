@@ -59,7 +59,14 @@ struct KVIOTraits {
 
 // Bulk gather token nope data (and inline scales for DSV3_2) from global to smem.
 // DSV3_2: flat addressing (idx * 656). DSV4: block-structured (footer layout).
-template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT = false>
+//
+// TILE_BI / TILE_IO_THREADS default to the namespace-scope 64/128, so every
+// existing `io_bulk_gather_tile<MT, PBS, HINT>` spelling keeps its old geometry.
+// A kernel running a different tile (DOTS3_SWA prefill: BI=32, 4 IO warps) must
+// pass them, or the mbarrier transaction count and the gather stride disagree
+// with the smem buffer it is filling.
+template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT = false, int TILE_BI = BI,
+          int TILE_IO_THREADS = IO_THREADS>
 __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t* indices,
                                                     const uint8_t* __restrict__ kv_ptr,
                                                     uint64_t* mbar, int io_tid,
@@ -70,10 +77,10 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t*
   constexpr int COPY_BYTES = KV::KV_SMEM_COPY_BYTES;
   constexpr int SMEM_STRIDE = KV::KV_SMEM_STRIDE;
 
-  if (io_tid == 0) mbarrier_arrive_expect_tx(mbar, BI * COPY_BYTES);
+  if (io_tid == 0) mbarrier_arrive_expect_tx(mbar, TILE_BI * COPY_BYTES);
 
 #pragma unroll 1
-  for (int bi = io_tid; bi < BI; bi += IO_THREADS) {
+  for (int bi = io_tid; bi < TILE_BI; bi += TILE_IO_THREADS) {
     int idx = indices[bi];
     idx = (idx >= 0) ? idx : 0;
 
@@ -93,7 +100,7 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t*
   }
 }
 
-template <ModelType MT, int PAGE_BLOCK_SIZE>
+template <ModelType MT, int PAGE_BLOCK_SIZE, int TILE_BI = BI, int TILE_IO_THREADS = IO_THREADS>
 __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, const int32_t* indices,
                                                  const uint8_t* __restrict__ kv_ptr, int io_tid,
                                                  size_t stride_kv_block) {
@@ -103,8 +110,13 @@ __device__ __forceinline__ void io_gather_scales(uint8_t* scale_dst, const int32
 
   constexpr int pbs = PAGE_BLOCK_SIZE;
   constexpr int SCALE_BYTES = KV::SCALE_BYTES_PER_TOKEN;
+  // Only reachable for footer-scale models (the inline ones return above), so
+  // the width check is disjoined rather than applied to every instantiation.
+  static_assert(KV::SCALE_IN_KV_SMEM || SCALE_BYTES == sizeof(uint64_t),
+                "the footer gather moves one uint64 per token; a different footer width needs a "
+                "different load");
 
-  for (int bi = io_tid; bi < BI; bi += IO_THREADS) {
+  for (int bi = io_tid; bi < TILE_BI; bi += TILE_IO_THREADS) {
     int idx = indices[bi];
     idx = (idx >= 0) ? idx : 0;
 

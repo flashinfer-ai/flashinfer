@@ -67,6 +67,7 @@ _MODEL_TYPE_DSV3_2 = 0
 _MODEL_TYPE_DSV4 = 1
 _MODEL_TYPE_GLM_NSA = 2
 _MODEL_TYPE_GLM53_NOPE = 3
+_MODEL_TYPE_DOTS3_SWA = 4
 # The V32 kernel family: the 656B/token inline-scale cache ABI. GLM53_NOPE is
 # the rope-free member (d_qk=512; bytes [528:656) are reserved padding).
 _V32_MODEL_TYPES = frozenset(
@@ -77,6 +78,17 @@ _V32_MODEL_TYPES = frozenset(
 _SWAPAB_MODEL_TYPES = _V32_MODEL_TYPES
 _BPT_DSV3_2 = 656
 _BPT_DSV4 = 584
+_BPT_DOTS3_SWA = 1160
+
+# d_v per model type. Every DeepSeek-family type is 512; DOTS3_SWA is the one
+# divergence (its latent V is the full 1024-wide latent, rope excluded).
+_D_V_BY_MODEL_TYPE = {
+    _MODEL_TYPE_DSV3_2: 512,
+    _MODEL_TYPE_DSV4: 512,
+    _MODEL_TYPE_GLM_NSA: 512,
+    _MODEL_TYPE_GLM53_NOPE: 512,
+    _MODEL_TYPE_DOTS3_SWA: 1024,
+}
 
 # Kernel-family names used in the public config query and error messages.
 _MODEL_TYPE_TO_FAMILY = {
@@ -84,7 +96,17 @@ _MODEL_TYPE_TO_FAMILY = {
     _MODEL_TYPE_DSV4: "dsv4",
     _MODEL_TYPE_GLM_NSA: "glm_nsa",
     _MODEL_TYPE_GLM53_NOPE: "glm53_nope",
+    _MODEL_TYPE_DOTS3_SWA: "dots3_swa",
 }
+
+
+def _decode_chunk_width(model_type: int) -> int:
+    """Kernel candidate-tile width (BI): candidates consumed per loop
+    iteration. DOTS3_SWA halves it to 32 because its 1040-byte KV smem stride
+    does not fit BI=64 on SM120 (see DecodeTileCfg in decode_dsv4_kernel.cuh).
+    """
+    return 32 if model_type == _MODEL_TYPE_DOTS3_SWA else _BI
+
 
 # Every instantiated kernel (decode and prefill, both families) is compiled
 # for the 64-token page layout; the C++ prefill launchers hardcode PBS=64.
@@ -153,6 +175,13 @@ _DECODE_DSV3_2_DISPATCH = frozenset(
 # the TP2 shape of the same model.
 _DECODE_GLM53_NOPE_DISPATCH = frozenset({(32, 2176), (64, 2176)})
 
+# DOTS3_SWA sliding-window decode, served by the decode-dsv4 kernel at BI=32 /
+# 4 math warps. topk=576 is the tightest multiple of the BI=32 tile (18
+# chunks) covering the 513-wide window; the window itself is clamped inside
+# the kernel (DecodeTileCfg<DOTS3_SWA>::WINDOW). Head counts cover TP shards
+# of a 64-head layer (TP4 -> 16).
+_DECODE_DOTS3_SWA_DISPATCH = frozenset({(8, 576), (16, 576), (32, 576), (64, 576)})
+
 # Prefill instantiation envelope (single cache unless noted).
 # DSV3_2-family prefill topk (SG, MG, and swapAB); GLM53_NOPE serves 2176.
 _V32_TOPK = {
@@ -206,6 +235,9 @@ def decode_splitk_eligible(
     if model_type == _MODEL_TYPE_GLM53_NOPE:
         # decode-v32 has no dual-cache form.
         return not has_extra and (num_heads, topk) in _DECODE_GLM53_NOPE_DISPATCH
+    if model_type == _MODEL_TYPE_DOTS3_SWA:
+        # decode-dsv4 kernel, DOTS3_SWA tile; no dual-cache form for this family.
+        return not has_extra and (num_heads, topk) in _DECODE_DOTS3_SWA_DISPATCH
     if model_type in _V32_MODEL_TYPES:
         # decode-dsv3_2 has no dual-cache form.
         return not has_extra and (num_heads, topk) in _DECODE_DSV3_2_DISPATCH
@@ -225,9 +257,22 @@ def prefill_swapab_eligible(
     )
 
 
+# DOTS3_SWA prefill is SG-only (D_NOPE=1024 does not fit the MG smem layout);
+# num_heads > 16 is served by CTA replication.
+_DOTS3_SWA_TOPK = 576
+_DOTS3_SWA_SG_HEADS = frozenset({8, 16, 32, 64})
+
+
 def prefill_sg_eligible(
     model_type: int, num_heads: int, topk: int, page_block_size: int, has_extra: bool
 ) -> bool:
+    if model_type == _MODEL_TYPE_DOTS3_SWA:
+        return (
+            not has_extra
+            and page_block_size == _PAGE_BLOCK_SIZE
+            and topk == _DOTS3_SWA_TOPK
+            and num_heads in _DOTS3_SWA_SG_HEADS
+        )
     return (
         model_type in _V32_MODEL_TYPES
         and not has_extra

@@ -129,7 +129,11 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     int num_tokens, int num_splits, int chunks_per_block, float sm_scale, size_t stride_kv_block,
     // Row stride of indices; may exceed topk when the caller views a wider
     // persistent buffer (last dim must stay contiguous).
-    size_t stride_indices_token) {
+    size_t stride_indices_token,
+    // Per-token advance in the KV cache. Equals KV::KV_GMEM_STRIDE for a packed
+    // cache, but is larger when the caller pads rows to share one KV cache
+    // group across layer geometries; the payload stays at the row start.
+    int stride_kv_row) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   constexpr int D_NOPE = KV::D_NOPE;                                // 512
@@ -249,7 +253,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
       const int block_idx_g = idx / pbs;
       const int local_idx_g = idx - block_idx_g * pbs;
       const uint8_t* data_base = KV_cache + (size_t)block_idx_g * stride_kv_block +
-                                 (size_t)local_idx_g * KV::KV_GMEM_STRIDE;
+                                 (size_t)local_idx_g * (size_t)stride_kv_row;
       // Bulk 1: NoPE + INLINE scales (528 B) → sm_kv_fp8 slot.
       cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
                         V2_BULK_NOPESC_BYTES, sm.mbar_full(buf));

@@ -29,39 +29,48 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
                                     size_t stride_kv_block, size_t stride_indices_token,
                                     size_t stride_extra_indices_token, cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
+  using Cfg = DecodeTileCfg<MT>;
   // Ceiling div so NUM_HEADS < HPB (small-TP configs, e.g. h=8) still get a
   // tile. The kernel internally clamps Q load + mid_out writes to
   // VALID_HPB = min(NUM_HEADS, HPB).
   constexpr int H_BLOCKS = (NUM_HEADS + HPB - 1) / HPB;
 
   // Stage 1: decode-dsv4 (A1.2) partial-output kernel.
-  // Dynamic smem layout (FP8 XV, DSV4, DSV4_BI=64, double-buffered KV):
-  //   sm_q_rope    HPB * D_ROPE * 2B                      =  2 KB
-  //   sm_q_fp8     HPB * Q_NOPE_STRIDE                    = 7.25 KB
-  //   sm_q_sc      HPB * NUM_SCALES * 4B                  = 0.44 KB
-  //   sm_kv_fp8    2 * DSV4_BI * KV_SMEM_STRIDE             = 58 KB
-  //   sm_kv_sc     2 * DSV4_BI * SCALE_BYTES_PER_TOKEN      =  1 KB
-  //   sm_kv_rope   2 * DSV4_BI * D_ROPE * 2B                = 16 KB
-  //   sm_reduce    2 * DSV4_N_WARPS * HPB * 4               = 1 KB
-  //   sm_w_head_sc N_V_CHUNKS * HPB * 4                   = 448 B
-  //   sm_w_fp8 ×2  2 * HPB * (DSV4_BI + 16)                 = 2.5 KB
-  //   Total                                               ~ 88 KB
-  // Static smem (kernel-side):
-  //   sm_p_full    HPB * DSV4_BI * 2B (bf16)                =  2 KB
-  // Grand total ~ 89 KB (under 100 KB SM120 carveout, 1 block/SM).
-  constexpr int N_V_CHUNKS_LAUNCH = KV::D_NOPE / KV::QUANT_TILE;  // 7
+  // Dynamic smem layout (FP8 XV, double-buffered KV). Measured on sm_120
+  // against a 101376 B per-block opt-in cap:
+  //
+  //   term                                        DSV4       DOTS3_SWA
+  //                                            (BI=64,W=8)  (BI=32,W=4)
+  //   sm_q_rope    HPB * D_ROPE * 2B               2048         2048
+  //   sm_q_fp8     HPB * Q_NOPE_STRIDE             7424        16640
+  //   sm_q_sc      HPB * NUM_SCALES * 4B            448          512
+  //   sm_kv_fp8    2 * BI * KV_SMEM_STRIDE        59392        66560
+  //   sm_kv_sc     2 * BI * SCALE_BYTES_PER_TOKEN  1024          512
+  //   sm_kv_rope   2 * BI * D_ROPE * 2B           16384         8192
+  //   mbar + pad                                     48           48
+  //   sm_reduce    2 * N_WARPS * HPB * 4           1024          512
+  //   sm_w_head_sc N_V_CHUNKS * HPB * 4             448          512
+  //   sm_w_fp8 x2  2 * HPB * (BI + 16)             2560         1536
+  //   dynamic total                               90800        97072
+  // Static smem (kernel-side), sm_p_full = HPB * BI * 2B:
+  //   DSV4 2048 B; DOTS3_SWA 0 (V_HAS_ROPE=false makes the bf16 P dead).
+  //   grand total                                 92848        97072
+  //
+  // DOTS3_SWA leaves ~4.2 KB spare. BI=64 for it needs 173872 B and the driver
+  // rejects the opt-in outright. Both configs run 1 block/SM.
+  constexpr int N_V_CHUNKS_LAUNCH = KV::D_NOPE / KV::QUANT_TILE;  // DSV4 7, DOTS3_SWA 8
   constexpr int DYN_SMEM_BYTES =
       HPB * KV::D_ROPE * (int)sizeof(bf16)                            // sm_q_rope
       + HPB * KV::Q_NOPE_STRIDE                                       // sm_q_fp8
       + HPB * KV::NUM_SCALES * (int)sizeof(float)                     // sm_q_sc
-      + DSV4_KV_BUF_COUNT * DSV4_BI * KV::KV_SMEM_STRIDE              // sm_kv_fp8 ×2
-      + DSV4_KV_BUF_COUNT * DSV4_BI * KV::SCALE_BYTES_PER_TOKEN       // sm_kv_sc ×2
-      + DSV4_KV_BUF_COUNT * DSV4_BI * KV::D_ROPE * (int)sizeof(bf16)  // sm_kv_rope ×2
+      + Cfg::KV_BUF_COUNT * Cfg::BI * KV::KV_SMEM_STRIDE              // sm_kv_fp8 ×2
+      + Cfg::KV_BUF_COUNT * Cfg::BI * KV::SCALE_BYTES_PER_TOKEN       // sm_kv_sc ×2
+      + Cfg::KV_BUF_COUNT * Cfg::BI * KV::D_ROPE * (int)sizeof(bf16)  // sm_kv_rope ×2
       + 16                                                            // mbar align pad
       + 4 * (int)sizeof(uint64_t)                                     // mbar_full+empty
-      + 2 * DSV4_N_WARPS * HPB * (int)sizeof(float)                   // sm_reduce
+      + 2 * Cfg::N_WARPS * HPB * (int)sizeof(float)                   // sm_reduce
       + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                  // sm_w_head_sc
-      + 2 * HPB * (DSV4_BI + 16);                                     // sm_w_fp8 ×2 (vc parity)
+      + 2 * HPB * (Cfg::BI + 16);                                     // sm_w_fp8 ×2 (vc parity)
 
   auto kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
   CUDA_CHECK_BOOL(
@@ -108,7 +117,7 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
   // which is cheap. This keeps the mid_out/mid_lse stride matching Python's
   // allocation without extra coordination.
   dim3 grid1(num_tokens, H_BLOCKS, num_splits);
-  dim3 block1(DSV4_BLOCK_THREADS);
+  dim3 block1(Cfg::BLOCK_THREADS);
   kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
       Q, KV_cache, indices, mid_out, mid_lse, topk_length, extra_KV_cache, extra_indices,
       extra_topk_length, extra_topk, pbs_extra, stride_extra_kv_block, num_tokens, num_splits,
@@ -118,7 +127,9 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
 
   // Stage 2: merge splits → final output + LSE.
   // Grid: (num_tokens, NUM_HEADS). One block (BLOCK_THREADS=64) covers the
-  // full D_V=512 via uint4 vec loads (8 bf16/thread × 64 threads = 512).
+  // full D_V via uint4 vec loads: D_V=512 -> 8 bf16/thread, D_V=1024 (DOTS3_SWA)
+  // -> 16, i.e. 2 uint4 per thread. Both keep DIMS_PER_THREAD % 8 == 0, which
+  // the merge kernel static_asserts.
   // For h=128/T=16 this is 2048 blocks vs the prior 8192 (4× fewer).
   constexpr int MERGE_BLOCK_THREADS = 64;
   constexpr int MERGE_DIMS_PER_THREAD = KV::D_V / MERGE_BLOCK_THREADS;
@@ -134,7 +145,7 @@ static bool launch_decode_dsv4_impl(const bf16* Q, const uint8_t* KV_cache, cons
 }
 
 // Public surface — explicit instantiation switch over the PR-body bench grid.
-// DSV4 only, page_block_size=64 only. NUM_HEADS ∈ {8, 16, 32, 64, 128},
+// page_block_size=64 only. DSV4: NUM_HEADS ∈ {8, 16, 32, 64, 128},
 // TOPK ∈ {128, 192, 256, 512, 1024}. TOPK=192 covers the padded
 // DeepSeek-V4-Flash-0731 DSpark K=5 shape (128 SWA + 5 active draft entries),
 // while TOPK=256 covers wider DSpark configurations.
@@ -146,16 +157,18 @@ bool launch_sparse_mla_decode_dsv4(
     int extra_topk, int pbs_extra, size_t stride_extra_kv_block, int chunks_per_block_override,
     float sm_scale, size_t stride_kv_block, size_t stride_indices_token,
     size_t stride_extra_indices_token, cudaStream_t stream) {
-  if (mt != ModelType::DSV4 || page_block_size != 64) return false;
+  if (mt != ModelType::DSV4 && mt != ModelType::DOTS3_SWA) return false;
+  if (page_block_size != 64) return false;
   if (num_splits <= 0) return false;
-#define DSV4_DISPATCH(H, K)                                                                 \
-  if (num_heads == (H) && topk == (K)) {                                                    \
-    return launch_decode_dsv4_impl<ModelType::DSV4, (H), (K), 64>(                          \
+#define DECODE_DISPATCH(MT_, H, K)                                                          \
+  if (mt == (MT_) && num_heads == (H) && topk == (K)) {                                     \
+    return launch_decode_dsv4_impl<(MT_), (H), (K), 64>(                                    \
         Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink,    \
         extra_KV_cache, extra_indices, extra_topk_length, extra_topk, pbs_extra,            \
         stride_extra_kv_block, num_tokens, num_splits, chunks_per_block_override, sm_scale, \
         stride_kv_block, stride_indices_token, stride_extra_indices_token, stream);         \
   }
+#define DSV4_DISPATCH(H, K) DECODE_DISPATCH(ModelType::DSV4, (H), (K))
   DSV4_DISPATCH(8, 128)
   DSV4_DISPATCH(8, 192)
   DSV4_DISPATCH(8, 256)
@@ -181,7 +194,22 @@ bool launch_sparse_mla_decode_dsv4(
   DSV4_DISPATCH(128, 256)
   DSV4_DISPATCH(128, 512)
   DSV4_DISPATCH(128, 1024)
+  // DOTS3_SWA sliding-window decode: 64 heads, a 513-token window carried as an
+  // index set. TOPK=576 is the tightest fit: it covers 513, divides BI=32
+  // (18 chunks) and the 64-wide split granularity (9 splits). The 1024 entry
+  // the DSV4 grid happens to offer would nearly double the split-K scratch
+  // (mid_out is [tokens, heads, num_splits, d_v]) for no extra coverage.
+  // topk_length is optional for DOTS3_SWA: DecodeTileCfg<DOTS3_SWA>::WINDOW caps
+  // the per-token candidate count inside the kernel, so omitting it costs
+  // nothing beyond the window itself. Unused slots must still carry -1, which
+  // the QK mask turns into -inf.
+  // The narrower head counts cover TP shards (TP4 of 64 heads -> 16).
+  DECODE_DISPATCH(ModelType::DOTS3_SWA, 8, 576)
+  DECODE_DISPATCH(ModelType::DOTS3_SWA, 16, 576)
+  DECODE_DISPATCH(ModelType::DOTS3_SWA, 32, 576)
+  DECODE_DISPATCH(ModelType::DOTS3_SWA, 64, 576)
 #undef DSV4_DISPATCH
+#undef DECODE_DISPATCH
   return false;
 }
 

@@ -41,10 +41,10 @@
 //
 // All offsets are in bytes.
 
-template <ModelType MT, ComputeMode CM>
+template <ModelType MT, ComputeMode CM, int TILE_BI = BI, int TILE_MATH_WARPS = N_MATH_WARPS>
 struct SmemLayout {
   using KV = KVCacheTraits<MT>;
-  using CT = ComputeTraits<MT, CM>;
+  using CT = ComputeTraits<MT, CM, TILE_BI, TILE_MATH_WARPS>;
 
   // Q buffers
   static constexpr bool BF16_Q = (CM == ComputeMode::BF16);
@@ -54,17 +54,27 @@ struct SmemLayout {
   static constexpr size_t SMEM_Q_ROPE = HPB * KV::D_ROPE * sizeof(bf16);
 
   // KV double buffer
-  static constexpr size_t SMEM_KV_BUF = BI * KV::KV_SMEM_STRIDE;
+  static constexpr size_t SMEM_KV_BUF = TILE_BI * KV::KV_SMEM_STRIDE;
 
   // KV scale buffer: needed when bulk copy doesn't include scales.
   // DSV3_2: copies 528B (nope+scale), scales in kv_smem → no extra buffer.
   // DSV4: copies 448B (nope only), scales at offset 576 → need separate buffer.
   static constexpr bool NEED_SCALE_BUF =
       (KV::KV_SMEM_COPY_BYTES < KV::KV_SCALE_GMEM_OFFSET + KV::SCALE_BYTES_PER_TOKEN);
-  static constexpr size_t SMEM_KV_SCALE_BUF = NEED_SCALE_BUF ? BI * KV::SCALE_BYTES_PER_TOKEN : 0;
+  static constexpr size_t SMEM_KV_SCALE_BUF =
+      NEED_SCALE_BUF ? TILE_BI * KV::SCALE_BYTES_PER_TOKEN : 0;
 
   // Cross-warp reduction; reduce_buf and sum_reduce_buf share memory.
-  static constexpr size_t SMEM_REDUCE = N_MATH_WARPS * HPB * sizeof(float);
+  // reduce_buf is also lent to quantize_q_to_smem as its per-(head, quant-tile)
+  // amax scratch, which wants HPB * NUM_SCALES floats. At the default 64/8 tile
+  // the 8-warp reduction dominates for every DeepSeek-family model (128 >= 112),
+  // so this max is a no-op there. DOTS3_SWA runs 4 math warps against 8 scales
+  // and is the first config where the amax use is the larger of the two —
+  // without the max it would quantize Q straight through m_smem/l_smem.
+  static constexpr size_t SMEM_REDUCE_WARPS = TILE_MATH_WARPS * HPB * sizeof(float);
+  static constexpr size_t SMEM_REDUCE_AMAX = HPB * KV::NUM_SCALES * sizeof(float);
+  static constexpr size_t SMEM_REDUCE =
+      SMEM_REDUCE_WARPS > SMEM_REDUCE_AMAX ? SMEM_REDUCE_WARPS : SMEM_REDUCE_AMAX;
 
   // Per-head online softmax state
   static constexpr size_t SMEM_M = HPB * sizeof(float);
@@ -73,7 +83,7 @@ struct SmemLayout {
   // XV phase — w_fp8 for all V chunks (batch W quant, single barrier).
   // XV is always FP8; CM only flips the QK side.
   static constexpr size_t SMEM_W_SC_ALL = CT::N_V_CHUNKS * HPB * sizeof(float);
-  static constexpr size_t SMEM_W_FP8_ONE = HPB * (BI + 16);
+  static constexpr size_t SMEM_W_FP8_ONE = HPB * (TILE_BI + 16);
   static constexpr size_t SMEM_W_FP8 = SMEM_W_FP8_ONE * CT::N_V_CHUNKS;
 
   // Mbarrier (double-buffered)
@@ -100,29 +110,37 @@ struct SmemLayout {
 };
 
 // MG (multi-group) layout: 2 head groups, shared reduce/sum_reduce buffer.
-template <ModelType MT, ComputeMode CM>
+template <ModelType MT, ComputeMode CM, int TILE_BI = BI, int TILE_MATH_WARPS = N_MATH_WARPS>
 struct SmemLayoutMG {
   using KV = KVCacheTraits<MT>;
-  using CT = ComputeTraits<MT, CM>;
+  using CT = ComputeTraits<MT, CM, TILE_BI, TILE_MATH_WARPS>;
   static constexpr int N_HG = 2;
 
   static constexpr bool BF16_Q = (CM == ComputeMode::BF16);
   static constexpr size_t SMEM_Q_NOPE =
       BF16_Q ? HPB * KV::Q_NOPE_BF16_STRIDE * sizeof(bf16) : HPB * KV::Q_NOPE_STRIDE;
   static constexpr size_t SMEM_Q_SC = BF16_Q ? 0 : HPB * KV::NUM_SCALES * sizeof(float);
-  static constexpr size_t SMEM_KV_BUF = BI * KV::KV_SMEM_STRIDE;
+  static constexpr size_t SMEM_KV_BUF = TILE_BI * KV::KV_SMEM_STRIDE;
   static constexpr size_t SMEM_KV_SCALE_BUF =
-      SmemLayout<MT, CM>::NEED_SCALE_BUF ? BI * KV::SCALE_BYTES_PER_TOKEN : 0;
+      SmemLayout<MT, CM, TILE_BI, TILE_MATH_WARPS>::NEED_SCALE_BUF
+          ? TILE_BI * KV::SCALE_BYTES_PER_TOKEN
+          : 0;
 
   // reduce_buf and sum_reduce_buf share the same memory.
-  static constexpr size_t SMEM_REDUCE_MG = N_HG * N_MATH_WARPS * HPB * sizeof(float);
+  static constexpr size_t SMEM_REDUCE_MG = N_HG * TILE_MATH_WARPS * HPB * sizeof(float);
+  // Same amax loan as the SG layout; MG has never needed a max because N_HG
+  // doubles the reduction size. Asserted rather than maxed so the MG smem
+  // footprint stays byte-identical.
+  static_assert(SMEM_REDUCE_MG >= HPB * KV::NUM_SCALES * sizeof(float),
+                "reduce_buf doubles as quantize_q_to_smem's amax scratch (HPB * NUM_SCALES "
+                "floats); this tile is too narrow to lend it");
 
   static constexpr size_t SMEM_M = N_HG * HPB * sizeof(float);
   static constexpr size_t SMEM_L = N_HG * HPB * sizeof(float);
   static constexpr size_t SMEM_W_SC_ALL = N_HG * CT::N_V_CHUNKS * HPB * sizeof(float);
   // Two parities let adjacent V chunks use separate FP8 weight buffers.
   static constexpr int W_FP8_PARITIES = 2;
-  static constexpr size_t SMEM_W_FP8_MG = W_FP8_PARITIES * N_HG * HPB * (BI + 16);
+  static constexpr size_t SMEM_W_FP8_MG = W_FP8_PARITIES * N_HG * HPB * (TILE_BI + 16);
   // q_rope is only needed before the main loop; reuse the W_FP8 region.
   static_assert(N_HG * HPB * KV::D_ROPE * sizeof(bf16) <= SMEM_W_FP8_MG);
   static constexpr size_t SMEM_SCRATCH = 0;
@@ -150,16 +168,16 @@ struct SmemLayoutMG {
 };
 
 // MG convenience accessor
-template <ModelType MT, ComputeMode CM>
+template <ModelType MT, ComputeMode CM, int TILE_BI = BI, int TILE_MATH_WARPS = N_MATH_WARPS>
 struct SmemPtrsMG {
-  using LMG = SmemLayoutMG<MT, CM>;
-  using CT = ComputeTraits<MT, CM>;
+  using LMG = SmemLayoutMG<MT, CM, TILE_BI, TILE_MATH_WARPS>;
+  using CT = ComputeTraits<MT, CM, TILE_BI, TILE_MATH_WARPS>;
 
   static constexpr int N_HG = LMG::N_HG;
-  static constexpr int REDUCE_GRP_STRIDE = N_MATH_WARPS * HPB;
+  static constexpr int REDUCE_GRP_STRIDE = TILE_MATH_WARPS * HPB;
   static constexpr int ML_GRP_STRIDE = HPB;
   static constexpr int WSC_GRP_STRIDE = CT::N_V_CHUNKS * HPB;
-  static constexpr int WFP8_GRP_SIZE = HPB * (BI + 16);
+  static constexpr int WFP8_GRP_SIZE = HPB * (TILE_BI + 16);
   // Stride between W_FP8 ping-pong parities.
   static constexpr int WFP8_PARITY_STRIDE = LMG::N_HG * WFP8_GRP_SIZE;
 
@@ -185,7 +203,7 @@ struct SmemPtrsMG {
     return reinterpret_cast<uint8_t*>(base + LMG::OFF_KV0 + i * LMG::SMEM_KV_BUF);
   }
   __device__ __forceinline__ uint8_t* kv_scale_buf(int i) const {
-    if constexpr (SmemLayout<MT, CM>::NEED_SCALE_BUF) {
+    if constexpr (SmemLayout<MT, CM, TILE_BI, TILE_MATH_WARPS>::NEED_SCALE_BUF) {
       return reinterpret_cast<uint8_t*>(base + LMG::OFF_KV_SC0 + i * LMG::SMEM_KV_SCALE_BUF);
     } else {
       return nullptr;
@@ -294,9 +312,9 @@ struct SmemPtrsSwapAB {
 };
 
 // SG convenience accessor (initialized from smem base pointer)
-template <ModelType MT, ComputeMode CM>
+template <ModelType MT, ComputeMode CM, int TILE_BI = BI, int TILE_MATH_WARPS = N_MATH_WARPS>
 struct SmemPtrs {
-  using L = SmemLayout<MT, CM>;
+  using L = SmemLayout<MT, CM, TILE_BI, TILE_MATH_WARPS>;
 
   // q_nope_fp8 / q_nope_bf16 alias the same OFF_Q_NOPE region; one is used
   // per ComputeMode. q_nope_sc is empty under CM=BF16.

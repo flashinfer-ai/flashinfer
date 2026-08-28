@@ -32,9 +32,9 @@ Decode-form calls (``num_tokens <= 64``) route to dedicated warp-spec
 standalone decode kernels when the shape is decode-instantiated, and to the
 shared prefill orchestrator otherwise (prefill serves any ``num_tokens >=
 1``). ``num_tokens > 64`` always routes to prefill. DSv3.2 / GLM-NSA
-(d_qk=576), DSv4 (d_qk=512), and GLM-5.3 native NoPE (d_qk=512,
-arbitrary FP32 scales) are supported; prefill dispatches through the
-orchestrator.
+(d_qk=576), DSv4 (d_qk=512), GLM-5.3 native NoPE (d_qk=512,
+arbitrary FP32 scales), and DOTS3_SWA (d_qk=1088, d_v=1024, sliding-window)
+are supported; prefill dispatches through the orchestrator.
 
 When crossover constants are calibrated (same ``autotune()`` tuning-mode
 pass as the cpb constants; see :mod:`._sparse_mla_sm120_cpb`), a
@@ -82,14 +82,19 @@ from ._sparse_mla_sm120_plan import (
     _BI,
     _BPT_DSV3_2,
     _BPT_DSV4,
+    _BPT_DOTS3_SWA,
     _DECODE_DSV3_2_DISPATCH,
     _DECODE_DSV4_DISPATCH,
     _DECODE_MAX_TOKENS,
+    _DECODE_DOTS3_SWA_DISPATCH,
     _MODEL_TYPE_DSV3_2,
     _MODEL_TYPE_DSV4,
     _MODEL_TYPE_GLM53_NOPE,
     _MODEL_TYPE_GLM_NSA,
+    _MODEL_TYPE_DOTS3_SWA,
     _DECODE_GLM53_NOPE_DISPATCH,
+    _D_V_BY_MODEL_TYPE,
+    _decode_chunk_width,
     _MODEL_TYPE_TO_FAMILY,
     _D_V,
     KernelVariant,
@@ -193,8 +198,9 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
         Mapping from kernel family to its instantiated decode set, keyed by
         ``"dsv4"`` (``d_qk=512``), ``"dsv3_2"`` (``d_qk=576``, power-of-2
         FP32 scales), ``"glm_nsa"`` (``d_qk=576``, arbitrary FP32 scales;
-        shares the DSv3.2 decode instantiations), and ``"glm53_nope"``
-        (GLM-5.3 native NoPE, ``d_qk=512``, arbitrary FP32 scales).
+        shares the DSv3.2 decode instantiations), ``"glm53_nope"``
+        (GLM-5.3 native NoPE, ``d_qk=512``, arbitrary FP32 scales), and
+        ``"dots3_swa"`` (sliding-window family, ``d_qk=1088``, UE8M0 scales).
 
     Examples
     --------
@@ -223,6 +229,12 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
             page_block_size=_DECODE_DSV3_2_PAGE_BLOCK_SIZE,
             max_num_tokens=_DECODE_MAX_TOKENS,
             head_topk_pairs=_DECODE_GLM53_NOPE_DISPATCH,
+        ),
+        "dots3_swa": SparseMLASm120DecodeConfig(
+            d_qk=1088,
+            page_block_size=_DECODE_DSV4_PAGE_BLOCK_SIZE,
+            max_num_tokens=_DECODE_MAX_TOKENS,
+            head_topk_pairs=_DECODE_DOTS3_SWA_DISPATCH,
         ),
     }
 
@@ -285,15 +297,43 @@ def _decode_dispatch_error_message(
     )
 
 
-def _require_d_v_512(d_v: int) -> None:
-    if int(d_v) != _D_V:
-        raise ValueError(f"SM120 sparse-MLA requires d_v == {_D_V}, got {d_v}")
-
-
-def _check_last_dim_512(tensor: torch.Tensor, name: str) -> None:
-    if tensor.shape[-1] != _D_V:
+def _expected_d_v(model_type: Optional[int] = None) -> int:
+    """d_v for a model type; the DeepSeek-family default when unspecified."""
+    if model_type is None:
+        return _D_V
+    try:
+        return _D_V_BY_MODEL_TYPE[model_type]
+    except KeyError:
         raise ValueError(
-            f"{name} last dimension must be {_D_V}, got shape {tuple(tensor.shape)}"
+            f"Unsupported SM120 sparse-MLA model_type={model_type}"
+        ) from None
+
+
+def _require_d_v(d_v: int, model_type: Optional[int] = None) -> None:
+    expected = _expected_d_v(model_type)
+    if int(d_v) != expected:
+        raise ValueError(f"SM120 sparse-MLA requires d_v == {expected}, got {d_v}")
+
+
+def _require_supported_d_v(d_v: int) -> None:
+    """Check ``d_v`` against every supported model type.
+
+    Used where the model type is not yet known -- the runner is constructed
+    before it sees a ``q`` to read ``d_qk`` from. Each call still goes through
+    the strict :func:`_require_d_v` once ``d_qk`` has resolved the model type.
+    """
+    supported = sorted(set(_D_V_BY_MODEL_TYPE.values()))
+    if int(d_v) not in supported:
+        raise ValueError(f"SM120 sparse-MLA requires d_v in {supported}, got {d_v}")
+
+
+def _check_last_dim(
+    tensor: torch.Tensor, name: str, model_type: Optional[int] = None
+) -> None:
+    expected = _expected_d_v(model_type)
+    if tensor.shape[-1] != expected:
+        raise ValueError(
+            f"{name} last dimension must be {expected}, got shape {tuple(tensor.shape)}"
         )
 
 
@@ -324,7 +364,17 @@ def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
                 f"'arbitrary_fp32' (GLM53_NOPE); got {kv_scale_format!r}"
             )
         return _MODEL_TYPE_DSV4
-    raise ValueError(f"SM120 sparse-MLA supports d_qk=576 or d_qk=512, got d_qk={d_qk}")
+    if d_qk == 1088:
+        # Sliding-window MLA family: 1024-wide latent + 64-wide rope.
+        if fmt != "auto":
+            raise ValueError(
+                "kv_scale_format is only configurable for d_qk=576 and "
+                f"d_qk=512; got d_qk=1088 with kv_scale_format={kv_scale_format!r}"
+            )
+        return _MODEL_TYPE_DOTS3_SWA
+    raise ValueError(
+        f"SM120 sparse-MLA supports d_qk=576, 512 or 1088, got d_qk={d_qk}"
+    )
 
 
 def _bytes_per_token_for_model_type(model_type: int) -> int:
@@ -332,6 +382,8 @@ def _bytes_per_token_for_model_type(model_type: int) -> int:
         return _BPT_DSV3_2
     if model_type == _MODEL_TYPE_DSV4:
         return _BPT_DSV4
+    if model_type == _MODEL_TYPE_DOTS3_SWA:
+        return _BPT_DOTS3_SWA
     raise ValueError(f"Unsupported SM120 sparse-MLA model_type={model_type}")
 
 
@@ -351,15 +403,21 @@ def _packed_kv_page_block_size(
             )
         return block_bytes // bytes_per_token
     if kv_cache.ndim == 3:
-        if kv_cache.shape[-1] != bytes_per_token:
+        # >=, not ==: callers may pad each token row so layers with different
+        # geometries share one KV cache group. The packed payload stays at the
+        # row start and the kernel advances by the real row stride.
+        if kv_cache.shape[-1] < bytes_per_token:
             raise ValueError(
-                f"{name} last dim must be {bytes_per_token}, got {kv_cache.shape[-1]}"
+                f"{name} last dim must be >= {bytes_per_token}, got {kv_cache.shape[-1]}"
             )
         return int(kv_cache.shape[1])
     if kv_cache.ndim == 4:
-        if kv_cache.shape[-1] != bytes_per_token:
+        # >=, not ==: callers may pad each token row so layers with different
+        # geometries share one KV cache group. The packed payload stays at the
+        # row start and the kernel advances by the real row stride.
+        if kv_cache.shape[-1] < bytes_per_token:
             raise ValueError(
-                f"{name} last dim must be {bytes_per_token}, got {kv_cache.shape[-1]}"
+                f"{name} last dim must be >= {bytes_per_token}, got {kv_cache.shape[-1]}"
             )
         if kv_cache.shape[1] == 1:
             # HND: [num_pages, 1, page_block_size, bytes_per_token].
@@ -395,9 +453,17 @@ def _decode_dsv4_dispatchable(
     The split count only affects scratch size; the merge kernel stores per-split
     LSE in dynamic shared memory.
     """
-    return d_qk == 512 and decode_splitk_eligible(
-        _MODEL_TYPE_DSV4, num_heads, topk, page_block_size, False, num_tokens
-    )
+    if d_qk == 512:
+        return decode_splitk_eligible(
+            _MODEL_TYPE_DSV4, num_heads, topk, page_block_size, False, num_tokens
+        )
+    if d_qk == 1088:
+        # The sliding-window family shares this kernel at BI=32 / 4 math warps;
+        # see DecodeTileCfg<DOTS3_SWA> in decode_dsv4_kernel.cuh.
+        return decode_splitk_eligible(
+            _MODEL_TYPE_DOTS3_SWA, num_heads, topk, page_block_size, False, num_tokens
+        )
+    return False
 
 
 def _decode_scratch_views(
@@ -468,8 +534,8 @@ def get_sparse_mla_sm120_module():
     ) -> None:
         num_tokens, num_heads, d_qk = q.shape
         topk = indices.shape[-1]
-        _require_d_v_512(d_v)
-        _check_last_dim_512(output, "output")
+        _require_d_v(d_v, model_type)
+        _check_last_dim(output, "output", model_type)
         if num_tokens == 0:
             # Empty request: outputs are already-sized empty tensors; a kernel
             # launch would hit a grid.x=0 CUDA error.
@@ -505,8 +571,8 @@ def get_sparse_mla_sm120_module():
                 )
             )
         if planned.variant is KernelVariant.DECODE_SPLITK:
-            if model_type == _MODEL_TYPE_DSV4:
-                num_splits = _decode_dsv4_num_splits(topk, extra_topk)
+            if model_type in (_MODEL_TYPE_DSV4, _MODEL_TYPE_DOTS3_SWA):
+                num_splits = _decode_dsv4_num_splits(topk, extra_topk, model_type)
                 mid_out_view, mid_lse_view = _decode_scratch_views(
                     mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
                 )
@@ -604,8 +670,9 @@ def _sparse_mla_sm120_paged_attention(
     ----------
     q : torch.Tensor
         Query tensor, shape ``[num_tokens, num_heads, d_qk]``, dtype bf16.
-        ``d_qk=576`` uses the V32-family inline-scale cache and
-        ``d_qk=512`` uses the DSv4 footer-scale cache.
+        ``d_qk=576`` uses the V32-family inline-scale cache,
+        ``d_qk=512`` uses the DSv4 footer-scale cache, and ``d_qk=1088``
+        uses the DOTS3_SWA sliding-window footer-scale cache (d_v=1024).
     kv_cache : torch.Tensor
         Byte-packed paged main KV cache. Accepted forms are 3D
         ``[num_blocks, page_block_size, bytes]``, HND
@@ -670,9 +737,9 @@ def _sparse_mla_sm120_paged_attention(
     -----
     Requires SM120a / SM121a (block-scaled MXFP8 MMA + cp.async.bulk TMA).
     """
-    _require_d_v_512(d_v)
-    _check_last_dim_512(output, "output")
     model_type = _resolve_model_type(q.shape[-1], kv_scale_format)
+    _require_d_v(d_v, model_type)
+    _check_last_dim(output, "output", model_type)
 
     impl = get_sparse_mla_sm120_module()
     impl.paged_attention(
@@ -713,7 +780,9 @@ class _SparseMLAPagedAttentionRunner:
     max_num_heads : Optional[int]
         Optional worst-case ``num_heads``.
     d_v : int
-        Value head dim. ``512`` for DSV3_2 / DSV4.
+        Value head dim. ``512`` for DSV3_2 / DSV4 / GLM variants, ``1024``
+        for DOTS3_SWA. Must agree with the model type ``d_qk`` selects on each
+        ``run``.
     kv_scale_format : str
         Scale semantics for ``d_qk=576``. ``"auto"`` and ``"pow2_fp32"``
         select DSv3.2 power-of-2 FP32 inline scales; ``"arbitrary_fp32"``
@@ -745,7 +814,7 @@ class _SparseMLAPagedAttentionRunner:
             raise ValueError(f"max_num_tokens must be > 0, got {max_num_tokens}")
         if max_num_heads is not None and (max_num_heads <= 0 or max_num_heads > 128):
             raise ValueError(f"max_num_heads must be in (0, 128], got {max_num_heads}")
-        _require_d_v_512(d_v)
+        _require_supported_d_v(d_v)
         self._kv_scale_format = _normalize_kv_scale_format(kv_scale_format)
 
         if device is None:
@@ -812,13 +881,16 @@ class _SparseMLAPagedAttentionRunner:
         if mid_out is not None:
             return mid_out, mid_lse
 
-        num_tokens, num_heads, _ = q.shape
+        num_tokens, num_heads, d_qk = q.shape
         if num_tokens > _DECODE_MAX_TOKENS:
             return None, None
 
         topk = indices.shape[-1]
         extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-        num_splits = (topk + _BI - 1) // _BI + (extra_topk + _BI - 1) // _BI
+        # The candidate-tile width is model-dependent (64 for the DeepSeek
+        # family, 32 for DOTS3_SWA); the split count must use the model's own.
+        bi = _decode_chunk_width(_resolve_model_type(d_qk, self._kv_scale_format))
+        num_splits = (topk + bi - 1) // bi + (extra_topk + bi - 1) // bi
         mid_out = torch.empty(
             (num_tokens, num_heads, num_splits, self._d_v),
             dtype=torch.bfloat16,
@@ -927,9 +999,19 @@ class _SparseMLAPagedAttentionRunner:
 # them the launcher's built-in heuristic (cpb_override=-1) is used.
 
 
-def _decode_dsv4_num_splits(topk: int, extra_topk: int = 0) -> int:
-    """Split-K partitions: one per ``_BI``-wide tile of each index set."""
-    return (topk + _BI - 1) // _BI + (extra_topk + _BI - 1) // _BI
+def _decode_dsv4_num_splits(
+    topk: int, extra_topk: int = 0, model_type: int = _MODEL_TYPE_DSV4
+) -> int:
+    """Split-K partitions: one per candidate-tile-wide chunk of each index set.
+
+    The tile width is model-dependent: the DeepSeek family consumes ``_BI``=64
+    candidates per iteration, DOTS3_SWA 32 (its 1040-byte KV smem stride does
+    not fit BI=64 on SM120). Deriving ``num_splits`` with the wrong width makes
+    the launch grid cover only part of each token's candidate list and silently
+    drop the tail.
+    """
+    bi = _decode_chunk_width(model_type)
+    return (topk + bi - 1) // bi + (extra_topk + bi - 1) // bi
 
 
 @functools.cache
@@ -963,14 +1045,14 @@ def sparse_mla_sm120_decode_dsv3_2(
     heuristic. DSv3.2 and GLM-NSA share the same calibrated constants;
     GLM53_NOPE has its own constants entry.
     """
-    _check_last_dim_512(output, "output")
-    _check_last_dim_512(mid_out, "mid_out")
+    _check_last_dim(output, "output", int(model_type))
+    _check_last_dim(mid_out, "mid_out", int(model_type))
     if q.shape[0] == 0:
         # Empty request: a kernel launch would hit a grid.x=0 CUDA error.
         return output
 
     module = _get_sparse_mla_sm120_decode_module()
-    num_splits = _decode_dsv4_num_splits(indices.shape[-1])
+    num_splits = _decode_dsv4_num_splits(indices.shape[-1], model_type=int(model_type))
 
     if chunks_per_block is not None:
         cpb_override = int(chunks_per_block)
@@ -1038,17 +1120,20 @@ def sparse_mla_sm120_decode_dsv4(
     Parameters
     ----------
     q : torch.Tensor
-        ``[T, num_heads, d_qk]`` bf16. ``d_qk == 512`` (DSV4 only).
+        ``[T, num_heads, d_qk]`` bf16. ``d_qk == 512`` (DSV4) or
+        ``d_qk == 1088`` (DOTS3_SWA; d_v is then 1024).
     kv_cache : torch.Tensor
         Paged FP8 cache, shape ``[num_blocks, page_bytes]`` uint8.
     indices : torch.Tensor
         ``[T, topk]`` int32. ``topk`` must be one of
-        {128, 192, 256, 512, 1024}; ``-1`` marks invalid slots. Row-strided
-        views into a wider persistent buffer are accepted (the last dim must
-        stay contiguous).
+        {128, 192, 256, 512, 1024} for DSV4, or 576 for DOTS3_SWA (tiled
+        32-wide, so ``num_splits`` uses the 32-candidate chunk width); ``-1``
+        marks invalid slots. Row-strided views into a wider persistent buffer
+        are accepted (the last dim must stay contiguous).
     mid_out : torch.Tensor
         Scratch, ``[T, num_heads, num_splits, d_v]`` bf16. ``num_splits =
-        ceil(topk / 64) + ceil(extra_topk / 64)``.
+        ceil(topk / 64) + ceil(extra_topk / 64)`` (64-wide candidate tiles;
+        DOTS3_SWA tiles 32).
     mid_lse : torch.Tensor
         Scratch, ``[T, num_heads, num_splits]`` float32.
     output : torch.Tensor
@@ -1081,8 +1166,11 @@ def sparse_mla_sm120_decode_dsv4(
     output : torch.Tensor
         The mutated output tensor (for chaining).
     """
-    _check_last_dim_512(output, "output")
-    _check_last_dim_512(mid_out, "mid_out")
+    # d_qk resolves the model type: 512 -> DSV4 (d_v 512), 1088 -> DOTS3_SWA
+    # (d_v 1024). The FFI applies the same resolution.
+    model_type = _MODEL_TYPE_DOTS3_SWA if q.shape[-1] == 1088 else _MODEL_TYPE_DSV4
+    _check_last_dim(output, "output", model_type)
+    _check_last_dim(mid_out, "mid_out", model_type)
     if q.shape[0] == 0:
         # Empty request: a kernel launch would hit a grid.x=0 CUDA error.
         return output
@@ -1090,13 +1178,18 @@ def sparse_mla_sm120_decode_dsv4(
     module = _get_sparse_mla_sm120_decode_module()
     topk = indices.shape[-1]  # 2D [T, topk] or 3D [T, 1, topk]
     extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-    num_splits = _decode_dsv4_num_splits(topk, extra_topk)
+    num_splits = _decode_dsv4_num_splits(topk, extra_topk, model_type)
 
     if chunks_per_block is not None:
         cpb_override = int(chunks_per_block)
     else:
         cpb_override = _resolve_cpb(
-            q.device, "dsv4", q.shape[0], q.shape[1], topk, extra_topk
+            q.device,
+            _MODEL_TYPE_TO_FAMILY[model_type],
+            q.shape[0],
+            q.shape[1],
+            topk,
+            extra_topk,
         )
 
     module.sparse_mla_sm120_decode_dsv4(
