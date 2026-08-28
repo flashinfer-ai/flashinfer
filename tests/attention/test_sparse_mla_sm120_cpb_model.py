@@ -524,3 +524,93 @@ def test_model_path_dual_cache_wiring(monkeypatch, tmp_path) -> None:
     assert recorded["cpb_override"] == select_cpb(
         num_tokens, num_heads, topk, extra_topk, _C
     )
+
+
+@requires_sm12x
+def test_glm_nsa_decode_uses_dsv3_2_cpb_family(clean_cpb_state, monkeypatch) -> None:
+    """GLM_NSA decode shares the dsv3_2 cpb constants (same kernel and ABI):
+    non-tuning picks up injected dsv3_2 constants, and tuning mode calibrates
+    under the "dsv3_2" family key instead of raising ValueError on the
+    unknown "glm_nsa" key. Crossover keys stay glm_nsa-flavored (produced by
+    the dsv3_2 crossover calibration, which covers both key spaces)."""
+    from types import SimpleNamespace
+
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.mla import _sparse_mla_sm120 as sm
+    from flashinfer.mla._sparse_mla_sm120 import _MODEL_TYPE_GLM_NSA
+
+    device = torch.device("cuda")
+    num_tokens, num_heads, topk = 2, 64, 2048
+    d_qk, d_v = 576, 512
+    num_splits = -(-topk // 64)
+
+    kv_cache = torch.empty(256, 64 * 656, dtype=torch.uint8, device=device)
+    q = torch.randn(num_tokens, num_heads, d_qk, device=device).to(torch.bfloat16)
+    indices = torch.randint(
+        0, kv_cache.shape[0] * 64, (num_tokens, topk), dtype=torch.int32, device=device
+    )
+    mid_out = torch.empty(
+        num_tokens, num_heads, num_splits, d_v, dtype=torch.bfloat16, device=device
+    )
+    mid_lse = torch.empty(
+        num_tokens, num_heads, num_splits, dtype=torch.float32, device=device
+    )
+    output = torch.empty(
+        num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
+
+    real_module = sm._get_sparse_mla_sm120_decode_module()
+    real_call = real_module.sparse_mla_sm120_decode_dsv3_2
+    recorded = {}
+
+    def spy(*args):
+        recorded["cpb_override"] = args[-1]
+        return real_call(*args)
+
+    monkeypatch.setattr(
+        sm,
+        "_get_sparse_mla_sm120_decode_module",
+        lambda: SimpleNamespace(sparse_mla_sm120_decode_dsv3_2=spy),
+    )
+
+    def call() -> None:
+        sm.sparse_mla_sm120_decode_dsv3_2(
+            q,
+            kv_cache,
+            indices,
+            mid_out,
+            mid_lse,
+            output,
+            out_lse,
+            d_qk**-0.5,
+            model_type=_MODEL_TYPE_GLM_NSA,
+        )
+
+    expected_cpb = select_cpb(num_tokens, num_heads, topk, 0, _C)
+
+    # Non-tuning: injected dsv3_2 constants drive the GLM_NSA decode call.
+    cpb_mod.save_constants(device, "dsv3_2", _C)
+    call()
+    assert recorded["cpb_override"] == expected_cpb
+
+    # Tuning mode with an empty cache: calibrate + crossover calibrate run
+    # under the dsv3_2 family key, not the unknown glm_nsa key.
+    cpb_mod._constants.clear()
+    cpb_mod._crossover.clear()
+    seen = {}
+
+    def fake_calibrate(module_getter, family, dev):
+        seen["calibrate"] = family
+        return _C
+
+    def fake_calibrate_crossover(module, dev, family, c):
+        seen["calibrate_crossover"] = family
+        return {"dsv3_2|64|2048": 32, "glm_nsa|64|2048": 32}
+
+    monkeypatch.setattr(cpb_mod, "calibrate", fake_calibrate)
+    monkeypatch.setattr(cpb_mod, "calibrate_crossover", fake_calibrate_crossover)
+    monkeypatch.setattr(AutoTuner.get(), "is_tuning_mode", True)
+    call()
+    assert seen == {"calibrate": "dsv3_2", "calibrate_crossover": "dsv3_2"}
+    assert recorded["cpb_override"] == expected_cpb

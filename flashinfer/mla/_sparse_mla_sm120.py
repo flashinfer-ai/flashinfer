@@ -71,153 +71,39 @@ from typing import Optional
 import torch
 
 from ..api_logging import flashinfer_api
-from ..autotuner import AutoTuner
 from ..jit.mla import gen_sparse_mla_sm120_module
 from ..utils import (
     register_custom_op,
     register_fake_op,
     supported_compute_capability,
 )
-from . import _sparse_mla_sm120_cpb as _cpb
-from ._sparse_mla_sm120_cpb import CalibrationError
+from ._sparse_mla_sm120_plan import (
+    _BI,
+    _BPT_DSV3_2,
+    _BPT_DSV4,
+    _DECODE_DSV3_2_DISPATCH,
+    _DECODE_DSV4_DISPATCH,
+    _DECODE_MAX_TOKENS,
+    _MODEL_TYPE_DSV3_2,
+    _MODEL_TYPE_DSV4,
+    _MODEL_TYPE_GLM_NSA,
+    _MODEL_TYPE_TO_FAMILY,
+    _D_V,
+    KernelVariant,
+    _normalize_prefill_impl,
+    _resolve_cpb,
+    decode_splitk_eligible,
+    plan,
+)
 
 logger = logging.getLogger(__name__)
 
-# Kernel-side constants. Mirrored from
-# include/flashinfer/attention/sparse_mla_sm120/{arch,model}/*.cuh.
-_D_V = 512  # value head dim (universal across DSV3_2 and DSV4)
-_BI = 64  # KV partition tile size in candidates (BLOCK_SIZE_N)
-
-# Decode-form cutoff: num_tokens > _DECODE_MAX_TOKENS always routes to the
-# prefill orchestrator. Decode-form calls route to the standalone decode
-# kernels or to prefill per the crossover policy in _paged_attention.
-_DECODE_MAX_TOKENS = 64
-
-# decode-dsv4 instantiation set. NH=8 is the small-TP corner case; the kernel
-# pads the head tile to HPB=16 with zero-Q rows and gates writes by NUM_HEADS.
-_DECODE_DSV4_DISPATCH = frozenset(
-    {
-        (8, 128),
-        (8, 192),
-        (8, 256),
-        (8, 512),
-        (8, 1024),
-        (16, 128),
-        (16, 192),
-        (16, 256),
-        (16, 512),
-        (16, 1024),
-        (32, 128),
-        (32, 192),
-        (32, 256),
-        (32, 512),
-        (32, 1024),
-        (64, 128),
-        (64, 192),
-        (64, 256),
-        (64, 512),
-        (64, 1024),
-        (128, 128),
-        (128, 192),
-        (128, 256),
-        (128, 512),
-        (128, 1024),
-    }
-)
-_DECODE_DSV4_PAGE_BLOCK_SIZE = 64
-
-# decode-dsv3_2 instantiation set.
-_DECODE_DSV3_2_DISPATCH = frozenset(
-    {
-        (8, 128),
-        (8, 512),
-        (8, 1024),
-        (8, 2048),
-        (16, 128),
-        (16, 512),
-        (16, 1024),
-        (16, 2048),
-        (32, 128),
-        (32, 512),
-        (32, 1024),
-        (32, 2048),
-        (64, 128),
-        (64, 512),
-        (64, 1024),
-        (64, 2048),
-        (128, 128),
-        (128, 512),
-        (128, 1024),
-        (128, 2048),
-    }
-)
-_DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
-
-_MODEL_TYPE_DSV3_2 = 0
-_MODEL_TYPE_DSV4 = 1
-_MODEL_TYPE_GLM_NSA = 2
 _KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32"})
-_BPT_DSV3_2 = 656
-_BPT_DSV4 = 584
 
-# Prefill implementation override; the int values cross the FFI boundary.
-_PREFILL_IMPL_AUTO = 0
-_PREFILL_IMPL_SWAPAB = 1
-_PREFILL_IMPL_MG = 2
-_PREFILL_IMPL_FROM_STR = {
-    "auto": _PREFILL_IMPL_AUTO,
-    "swapab": _PREFILL_IMPL_SWAPAB,
-    "mg": _PREFILL_IMPL_MG,
-}
-# swapAB prefill is instantiated only for the DSV3_2 family (DSV3_2 / GLM_NSA),
-# single cache, topk=2048, filling whole 64-head CTAs.
-_SWAPAB_HEADS = frozenset({64, 128})
-_SWAPAB_TOPK = 2048
-
-
-def _normalize_prefill_impl(prefill_impl: Optional[str]) -> int:
-    if prefill_impl is None:
-        return _PREFILL_IMPL_AUTO
-    impl = _PREFILL_IMPL_FROM_STR.get(prefill_impl)
-    if impl is None:
-        raise ValueError(
-            f"prefill_impl must be one of None, 'auto', 'swapab', 'mg'; "
-            f"got {prefill_impl!r}"
-        )
-    return impl
-
-
-def _check_swapab_eligible(
-    model_type: int,
-    num_heads: int,
-    topk: int,
-    extra_kv_cache: Optional[torch.Tensor],
-) -> None:
-    """Raise ValueError when prefill_impl='swapab' meets an ineligible shape."""
-    if extra_kv_cache is not None:
-        raise ValueError("prefill_impl='swapab' does not support dual-cache")
-    if model_type not in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
-        raise ValueError(
-            "prefill_impl='swapab' requires the DSV3_2 family "
-            f"(d_qk=576); got family={_MODEL_TYPE_TO_FAMILY[model_type]!r}"
-        )
-    if topk != _SWAPAB_TOPK:
-        raise ValueError(
-            f"prefill_impl='swapab' requires topk={_SWAPAB_TOPK}; got topk={topk}"
-        )
-    if num_heads not in _SWAPAB_HEADS:
-        raise ValueError(
-            f"prefill_impl='swapab' requires num_heads in {sorted(_SWAPAB_HEADS)}; "
-            f"got num_heads={num_heads}"
-        )
-
-
-# Kernel-family names used in the public config query and error messages.
-_MODEL_TYPE_TO_FAMILY = {
-    _MODEL_TYPE_DSV3_2: "dsv3_2",
-    _MODEL_TYPE_DSV4: "dsv4",
-    _MODEL_TYPE_GLM_NSA: "glm_nsa",
-}
+# Page block size the decode kernels are instantiated for (same constant for
+# both families; every instantiated kernel is pbs=64).
+_DECODE_DSV4_PAGE_BLOCK_SIZE = 64
+_DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
 
 
 @dataclass(frozen=True)
@@ -478,11 +364,8 @@ def _decode_dsv3_2_dispatchable(
     num_tokens: int, num_heads: int, topk: int, d_qk: int, page_block_size: int
 ) -> bool:
     """True iff decode-dsv3_2 supports this shape configuration."""
-    return (
-        num_tokens <= _DECODE_MAX_TOKENS
-        and d_qk == 576
-        and page_block_size == _DECODE_DSV3_2_PAGE_BLOCK_SIZE
-        and (num_heads, topk) in _DECODE_DSV3_2_DISPATCH
+    return d_qk == 576 and decode_splitk_eligible(
+        _MODEL_TYPE_DSV3_2, num_heads, topk, page_block_size, False, num_tokens
     )
 
 
@@ -498,90 +381,9 @@ def _decode_dsv4_dispatchable(
     The split count only affects scratch size; the merge kernel stores per-split
     LSE in dynamic shared memory.
     """
-    return (
-        num_tokens <= _DECODE_MAX_TOKENS
-        and d_qk == 512
-        and page_block_size == _DECODE_DSV4_PAGE_BLOCK_SIZE
-        and (num_heads, topk) in _DECODE_DSV4_DISPATCH
+    return d_qk == 512 and decode_splitk_eligible(
+        _MODEL_TYPE_DSV4, num_heads, topk, page_block_size, False, num_tokens
     )
-
-
-def _decode_instantiated(
-    model_type: int, num_heads: int, topk: int, page_block_size: int
-) -> bool:
-    """True iff the shape matches a standalone decode instantiation."""
-    if model_type == _MODEL_TYPE_DSV4:
-        return (
-            page_block_size == _DECODE_DSV4_PAGE_BLOCK_SIZE
-            and (num_heads, topk) in _DECODE_DSV4_DISPATCH
-        )
-    return (
-        page_block_size == _DECODE_DSV3_2_PAGE_BLOCK_SIZE
-        and (num_heads, topk) in _DECODE_DSV3_2_DISPATCH
-    )
-
-
-def _route_decode_form(
-    model_type: int,
-    num_heads: int,
-    topk: int,
-    page_block_size: int,
-    num_tokens: int,
-    has_extra: bool,
-    device: torch.device,
-) -> bool:
-    """True iff a decode-form call (``num_tokens <= _DECODE_MAX_TOKENS``)
-    routes to a standalone decode kernel.
-
-    Policy: uninstantiated shapes go to prefill (which serves any
-    ``num_tokens >= 1``); instantiated shapes go to decode up to the
-    calibrated ``decode_max_tokens`` crossover for
-    ``(model_type, num_heads, topk)``, and to prefill past it; without
-    crossover constants the historical decode-first default applies.
-    ``has_extra`` only keys the memo (the crossover table is single-cache)."""
-    if num_tokens > _DECODE_MAX_TOKENS:
-        return False
-    if not _decode_instantiated(model_type, num_heads, topk, page_block_size):
-        return False
-    crossover = _cpb.get_decode_max_tokens(
-        device, _MODEL_TYPE_TO_FAMILY[model_type], num_heads, topk
-    )
-    if crossover is None:
-        return True
-    return num_tokens <= crossover
-
-
-# Memoized routing decisions; the trailing constants-version entry makes
-# entries self-invalidating when calibration stores new crossover data.
-_route_hot_cache: dict = {}
-
-
-def _route_decode_form_memo(
-    model_type: int,
-    num_heads: int,
-    topk: int,
-    page_block_size: int,
-    num_tokens: int,
-    has_extra: bool,
-    device: torch.device,
-) -> bool:
-    key = (
-        model_type,
-        num_heads,
-        topk,
-        page_block_size,
-        num_tokens,
-        has_extra,
-        torch.device(device),
-        _cpb._constants_version,
-    )
-    decision = _route_hot_cache.get(key)
-    if decision is None:
-        decision = _route_decode_form(
-            model_type, num_heads, topk, page_block_size, num_tokens, has_extra, device
-        )
-        _route_hot_cache[key] = decision
-    return decision
 
 
 def _decode_scratch_views(
@@ -654,8 +456,6 @@ def get_sparse_mla_sm120_module():
         topk = indices.shape[-1]
         _require_d_v_512(d_v)
         _check_last_dim_512(output, "output")
-        if prefill_impl == _PREFILL_IMPL_SWAPAB:
-            _check_swapab_eligible(model_type, num_heads, topk, extra_kv_cache)
         if num_tokens == 0:
             # Empty request: outputs are already-sized empty tensors; a kernel
             # launch would hit a grid.x=0 CUDA error.
@@ -665,41 +465,58 @@ def get_sparse_mla_sm120_module():
             kv_cache, model_type=model_type, name="kv_cache"
         )
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
-        decode_route = _route_decode_form_memo(
-            model_type,
+        planned = plan(
+            num_tokens,
             num_heads,
             topk,
+            model_type,
             kv_pbs,
-            num_tokens,
             extra_kv_cache is not None,
+            prefill_impl,
             q.device,
+            extra_topk=extra_topk,
         )
-        if decode_route and model_type == _MODEL_TYPE_DSV4:
-            num_splits = _decode_dsv4_num_splits(topk, extra_topk)
-            mid_out_view, mid_lse_view = _decode_scratch_views(
-                mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
+        if planned is None:
+            # Neither the decode instantiations nor the prefill envelope
+            # serves this shape.
+            raise ValueError(
+                _decode_dispatch_error_message(
+                    num_tokens=num_tokens,
+                    num_heads=num_heads,
+                    topk=topk,
+                    d_qk=d_qk,
+                    page_block_size=kv_pbs,
+                    model_type=model_type,
+                    extra_topk=extra_topk,
+                )
             )
-            # FFI binding extracts the true block stride from kv_cache.stride(0),
-            # so paged layouts with padded strides and microbench 2-D layouts
-            # both work.
-            sparse_mla_sm120_decode_dsv4(
-                q,
-                kv_cache,
-                indices,
-                mid_out_view,
-                mid_lse_view,
-                output,
-                out_lse,
-                sm_scale,
-                topk_length=topk_length,
-                attn_sink=attn_sink,
-                extra_kv_cache=extra_kv_cache,
-                extra_indices=extra_indices,
-                extra_topk_length=extra_topk_length,
-            )
-            return
+        if planned.variant is KernelVariant.DECODE_SPLITK:
+            if model_type == _MODEL_TYPE_DSV4:
+                num_splits = _decode_dsv4_num_splits(topk, extra_topk)
+                mid_out_view, mid_lse_view = _decode_scratch_views(
+                    mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
+                )
+                # FFI binding extracts the true block stride from
+                # kv_cache.stride(0), so paged layouts with padded strides
+                # and microbench 2-D layouts both work.
+                sparse_mla_sm120_decode_dsv4(
+                    q,
+                    kv_cache,
+                    indices,
+                    mid_out_view,
+                    mid_lse_view,
+                    output,
+                    out_lse,
+                    sm_scale,
+                    topk_length=topk_length,
+                    attn_sink=attn_sink,
+                    extra_kv_cache=extra_kv_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_length,
+                    chunks_per_block=planned.cpb,
+                )
+                return
 
-        if decode_route:
             num_splits = (topk + _BI - 1) // _BI
             mid_out_view, mid_lse_view = _decode_scratch_views(
                 mid_out, mid_lse, num_tokens, num_heads, num_splits, d_v
@@ -716,47 +533,25 @@ def get_sparse_mla_sm120_module():
                 topk_length=topk_length,
                 attn_sink=attn_sink,
                 model_type=model_type,
+                chunks_per_block=planned.cpb,
             )
             return
 
-        # Prefill serves any num_tokens >= 1. A decode-form call reaches here
-        # when no decode instantiation matched (or the calibrated crossover
-        # prefers prefill); if the prefill envelope also rejects the shape,
-        # surface the dispatch diagnostic instead of the raw FFI error.
-        try:
-            module.sparse_mla_sm120_paged_attention(
-                q,
-                kv_cache,
-                indices,
-                output,
-                out_lse,
-                sm_scale,
-                model_type,
-                prefill_impl,
-                topk_length,
-                attn_sink,
-                extra_kv_cache,
-                extra_indices,
-                extra_topk_length,
-            )
-        except RuntimeError as e:
-            if (
-                num_tokens <= _DECODE_MAX_TOKENS
-                and not _decode_instantiated(model_type, num_heads, topk, kv_pbs)
-                and "Unsupported sparse-MLA prefill configuration" in str(e)
-            ):
-                raise ValueError(
-                    _decode_dispatch_error_message(
-                        num_tokens=num_tokens,
-                        num_heads=num_heads,
-                        topk=topk,
-                        d_qk=d_qk,
-                        page_block_size=kv_pbs,
-                        model_type=model_type,
-                        extra_topk=extra_topk,
-                    )
-                ) from e
-            raise
+        module.sparse_mla_sm120_paged_attention(
+            q,
+            kv_cache,
+            indices,
+            output,
+            out_lse,
+            sm_scale,
+            model_type,
+            int(planned.variant),
+            topk_length,
+            attn_sink,
+            extra_kv_cache,
+            extra_indices,
+            extra_topk_length,
+        )
 
     @register_fake_op("flashinfer::sparse_mla_sm120_paged_attention")
     def _fake_paged_attention(*_args, **_kwargs) -> None:
@@ -1127,76 +922,6 @@ def _decode_dsv4_num_splits(topk: int, extra_topk: int = 0) -> int:
 def _get_sparse_mla_sm120_decode_module():
     """Build and cache the SM120 sparse-MLA decode kernel module."""
     return gen_sparse_mla_sm120_module().build_and_load()
-
-
-# Memoized select_cpb results; the trailing constants-version entry makes
-# entries self-invalidating when calibration stores new constants.
-_cpb_hot_cache: dict = {}
-
-
-def _resolve_cpb(
-    device: torch.device,
-    family: str,
-    num_tokens: int,
-    num_heads: int,
-    topk: int,
-    extra_topk: int,
-) -> int:
-    """Model-picked chunks_per_block; -1 selects the C++ heuristic fallback."""
-    c = _cpb.get_constants(device, family)
-    if (
-        c is None
-        and AutoTuner.get().is_tuning_mode
-        and not _cpb.is_calibration_failed(device, family)
-    ):
-        try:
-            c = _cpb.calibrate(_get_sparse_mla_sm120_decode_module, family, device)
-        except (CalibrationError, torch.cuda.OutOfMemoryError) as e:
-            logger.warning(
-                "SM120 sparse-MLA %s cpb calibration failed (%s); "
-                "falling back to the C++ heuristic for this process.",
-                family,
-                e,
-            )
-            _cpb.mark_calibration_failed(device, family)
-        else:
-            _cpb.save_constants(device, family, c)
-    if (
-        c is not None
-        and AutoTuner.get().is_tuning_mode
-        and not _cpb.is_crossover_failed(device, family)
-        and not _cpb.has_crossover(device, family)
-    ):
-        try:
-            table = _cpb.calibrate_crossover(
-                _get_sparse_mla_sm120_decode_module(), device, family, c
-            )
-        except (CalibrationError, torch.cuda.OutOfMemoryError) as e:
-            logger.warning(
-                "SM120 sparse-MLA %s crossover calibration failed (%s); "
-                "keeping the decode-first routing default for this process.",
-                family,
-                e,
-            )
-            _cpb.mark_crossover_failed(device, family)
-        else:
-            _cpb.save_crossover(device, table)
-    if c is None:
-        return -1
-    hot_key = (
-        _cpb._device_key(device),
-        family,
-        num_tokens,
-        num_heads,
-        topk,
-        extra_topk,
-        _cpb._constants_version,
-    )
-    cpb = _cpb_hot_cache.get(hot_key)
-    if cpb is None:
-        cpb = _cpb.select_cpb(num_tokens, num_heads, topk, extra_topk, c)
-        _cpb_hot_cache[hot_key] = cpb
-    return cpb
 
 
 @supported_compute_capability([120, 121])

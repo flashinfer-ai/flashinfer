@@ -231,16 +231,20 @@ def test_error_message_keeps_shape_summary_format() -> None:
     assert re.search(r"no decode kernel.*num_tokens=1, num_heads=16, topk=384", msg)
 
 
-# Crossover-aware decode-form routing (pure Python; no GPU).
+# Crossover-aware decode-form routing via the dispatch planner (pure Python;
+# no GPU).
 
 
 @pytest.fixture
 def known_crossover(monkeypatch):
-    """Inject a decode_max_tokens lookup without touching disk state."""
-    import flashinfer.mla._sparse_mla_sm120 as sm
+    """Inject a decode_max_tokens lookup without touching disk/GPU state."""
     from flashinfer.mla import _sparse_mla_sm120_cpb as cpb_mod
+    from flashinfer.mla import _sparse_mla_sm120_plan as plan_mod
 
     table = {}
+    monkeypatch.setattr(cpb_mod, "_device_key", lambda device: "0:Fake GPU")
+    monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
+    monkeypatch.setattr(cpb_mod, "get_constants", lambda device, family: None)
     monkeypatch.setattr(
         cpb_mod,
         "get_decode_max_tokens",
@@ -248,67 +252,216 @@ def known_crossover(monkeypatch):
             f"{family}|{num_heads}|{topk}"
         ),
     )
-    return sm, table
+    plan_mod._plan_memo.clear()
+    yield plan_mod, table
+    plan_mod._plan_memo.clear()
 
 
-def test_route_decode_form_uninstantiated_goes_prefill(known_crossover) -> None:
-    """A shape outside the decode sets routes to prefill, not an error."""
-    sm, _ = known_crossover
-    assert not sm._route_decode_form(
-        _MODEL_TYPE_DSV4, 64, 2048, 64, 32, False, torch.device("cpu")
+def test_plan_uninstantiated_goes_prefill(known_crossover) -> None:
+    """A shape outside the decode sets routes to a prefill variant."""
+    plan_mod, _ = known_crossover
+    planned = plan_mod.plan(
+        32,
+        64,
+        2048,
+        _MODEL_TYPE_DSV4,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
     )
-    assert not sm._route_decode_form(
-        _MODEL_TYPE_DSV3_2, 48, 2048, 64, 8, False, torch.device("cpu")
+    assert planned is not None
+    assert planned.variant is plan_mod.KernelVariant.PREFILL_MG
+
+
+def test_plan_neither_envelope_returns_none(known_crossover) -> None:
+    """A shape rejected by both envelopes plans to None (caller raises)."""
+    plan_mod, _ = known_crossover
+    # num_heads=48 is in no instantiation.
+    assert (
+        plan_mod.plan(
+            8,
+            48,
+            2048,
+            _MODEL_TYPE_DSV3_2,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+        )
+        is None
     )
 
 
-def test_route_decode_form_unknown_crossover_keeps_decode(known_crossover) -> None:
+def test_plan_unknown_crossover_keeps_decode(known_crossover) -> None:
     """Instantiated shape, no calibration: the decode-first default holds."""
-    sm, _ = known_crossover
+    plan_mod, _ = known_crossover
     for num_tokens in (1, _DECODE_MAX_TOKENS):
-        assert sm._route_decode_form(
-            _MODEL_TYPE_DSV4, 64, 512, 64, num_tokens, False, torch.device("cpu")
+        planned = plan_mod.plan(
+            num_tokens,
+            64,
+            512,
+            _MODEL_TYPE_DSV4,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+        )
+        assert planned is not None
+        assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
+        assert planned.cpb == -1  # no calibrated constants
+
+
+def test_plan_honors_crossover(known_crossover) -> None:
+    """Instantiated shape with crossover=8: T<=8 decodes, T>8 prefills."""
+    plan_mod, table = known_crossover
+    table["dsv4|64|512"] = 8
+    plan_mod._plan_memo.clear()
+    planned = plan_mod.plan(
+        8,
+        64,
+        512,
+        _MODEL_TYPE_DSV4,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    assert (
+        planned is not None and planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
+    )
+    planned = plan_mod.plan(
+        16,
+        64,
+        512,
+        _MODEL_TYPE_DSV4,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_MG
+
+
+def test_plan_crossover_zero_always_prefill(known_crossover) -> None:
+    """decode_max_tokens=0 (decode never wins) routes even T=1 to prefill."""
+    plan_mod, table = known_crossover
+    table["dsv3_2|64|2048"] = 0
+    plan_mod._plan_memo.clear()
+    planned = plan_mod.plan(
+        1,
+        64,
+        2048,
+        _MODEL_TYPE_DSV3_2,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    # Auto prefill prefers swapAB at this shape.
+    assert (
+        planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_SWAPAB
+    )
+
+
+def test_plan_above_decode_form_cutoff(known_crossover) -> None:
+    """num_tokens > 64 is prefill regardless of instantiation/crossover."""
+    plan_mod, _ = known_crossover
+    planned = plan_mod.plan(
+        _DECODE_MAX_TOKENS + 1,
+        64,
+        512,
+        _MODEL_TYPE_DSV4,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_MG
+
+
+def test_plan_page_block_size_mismatch(known_crossover) -> None:
+    """A non-64 page size is served by neither envelope (pbs=64 is hardwired
+    in every instantiation); the planner returns None instead of letting C++
+    launch with a mismatched stride."""
+    plan_mod, _ = known_crossover
+    assert (
+        plan_mod.plan(
+            8,
+            64,
+            512,
+            _MODEL_TYPE_DSV4,
+            32,
+            False,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+        )
+        is None
+    )
+
+
+def test_plan_prefill_impl_pref(known_crossover) -> None:
+    """prefill_impl='mg' excludes swapAB; 'swapab' forces it or raises."""
+    plan_mod, _ = known_crossover
+    planned = plan_mod.plan(
+        128,
+        64,
+        2048,
+        _MODEL_TYPE_DSV3_2,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    assert (
+        planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_SWAPAB
+    )
+    planned = plan_mod.plan(
+        128,
+        64,
+        2048,
+        _MODEL_TYPE_DSV3_2,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_MG,
+        torch.device("cpu"),
+    )
+    assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_MG
+    with pytest.raises(ValueError, match="num_heads"):
+        plan_mod.plan(
+            128,
+            32,
+            2048,
+            _MODEL_TYPE_DSV3_2,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_SWAPAB,
+            torch.device("cpu"),
         )
 
 
-def test_route_decode_form_honors_crossover(known_crossover) -> None:
-    """Instantiated shape with crossover=8: T<=8 decodes, T>8 prefills."""
-    sm, table = known_crossover
-    table["dsv4|64|512"] = 8
-    assert sm._route_decode_form(
-        _MODEL_TYPE_DSV4, 64, 512, 64, 8, False, torch.device("cpu")
-    )
-    assert not sm._route_decode_form(
-        _MODEL_TYPE_DSV4, 64, 512, 64, 16, False, torch.device("cpu")
-    )
-
-
-def test_route_decode_form_crossover_zero_always_prefill(known_crossover) -> None:
-    """decode_max_tokens=0 (decode never wins) routes even T=1 to prefill."""
-    sm, table = known_crossover
-    table["dsv3_2|64|2048"] = 0
-    assert not sm._route_decode_form(
-        _MODEL_TYPE_DSV3_2, 64, 2048, 64, 1, False, torch.device("cpu")
-    )
-
-
-def test_route_decode_form_above_decode_form_cutoff(known_crossover) -> None:
-    """num_tokens > 64 is prefill regardless of instantiation/crossover."""
-    sm, _ = known_crossover
-    assert not sm._route_decode_form(
-        _MODEL_TYPE_DSV4,
+def test_plan_memo_buckets_large_t(known_crossover) -> None:
+    """All T > 64 share one memo entry (the plan is T-independent there)."""
+    plan_mod, _ = known_crossover
+    plan_mod.plan(
+        65,
         64,
         512,
+        _MODEL_TYPE_DSV4,
         64,
-        _DECODE_MAX_TOKENS + 1,
         False,
+        plan_mod._PREFILL_IMPL_AUTO,
         torch.device("cpu"),
     )
-
-
-def test_route_decode_form_page_block_size_mismatch(known_crossover) -> None:
-    """A non-64 page size is decode-uninstantiated and routes to prefill."""
-    sm, _ = known_crossover
-    assert not sm._route_decode_form(
-        _MODEL_TYPE_DSV4, 64, 512, 32, 8, False, torch.device("cpu")
+    size_after_first = len(plan_mod._plan_memo)
+    plan_mod.plan(
+        8192,
+        64,
+        512,
+        _MODEL_TYPE_DSV4,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
     )
+    assert len(plan_mod._plan_memo) == size_after_first

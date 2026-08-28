@@ -437,7 +437,8 @@ def calibrate_crossover(
     each probed T with the HBM-faithful protocol of
     :func:`_time_call_fresh_indices`: the decode kernel runs with the model's
     ``select_cpb`` pick; the prefill orchestrator runs with
-    ``prefill_impl=auto`` (swapAB preferred where instantiated). Family
+    ``prefill_impl=auto`` variant choice (swapAB preferred where
+    instantiated). Family
     ``"dsv3_2"`` covers both the ``dsv3_2`` and ``glm_nsa`` key spaces because
     the scale format changes prefill speed; the decode kernel is timed with
     the matching ``model_type`` too. A config the prefill envelope does not
@@ -453,7 +454,10 @@ def calibrate_crossover(
         _MODEL_TYPE_DSV3_2,
         _MODEL_TYPE_DSV4,
         _MODEL_TYPE_GLM_NSA,
+    )
+    from ._sparse_mla_sm120_plan import (
         _PREFILL_IMPL_AUTO,
+        prefill_variant,
     )
 
     device = torch.device(device)
@@ -542,6 +546,14 @@ def calibrate_crossover(
     def time_prefill(
         num_tokens: int, num_heads: int, topk: int, model_type: int
     ) -> float:
+        # The prefill variant the auto policy would pick; None when the
+        # prefill envelope does not serve the shape (e.g. DSV3_2-family
+        # topk != 2048).
+        variant = prefill_variant(
+            model_type, num_heads, topk, 64, False, _PREFILL_IMPL_AUTO
+        )
+        if variant is None:
+            return float("inf")
         q = (
             (
                 torch.randn(
@@ -566,7 +578,7 @@ def calibrate_crossover(
                 out_lse,
                 sm_scale,
                 model_type,
-                _PREFILL_IMPL_AUTO,
+                int(variant),
                 None,
                 None,
                 None,
@@ -575,9 +587,7 @@ def calibrate_crossover(
             )
 
         try:
-            # One probe launch: shapes outside the prefill envelope (e.g.
-            # DSV3_2-family topk != 2048) fail dispatch before any kernel
-            # launch, so catching here cannot leave a poisoned CUDA context.
+            # One probe launch to surface any launch-time failure early.
             call(
                 torch.randint(
                     0, num_slots, (num_tokens, topk), dtype=torch.int32, device=device

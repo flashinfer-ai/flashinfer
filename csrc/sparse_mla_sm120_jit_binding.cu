@@ -17,7 +17,7 @@ using bf16 = __nv_bfloat16;
 
 void SparseMlaSm120PagedAttention(TensorView q, TensorView kv_cache, TensorView indices,
                                   TensorView output, TensorView out_lse, double sm_scale,
-                                  int64_t model_type, int64_t prefill_impl,
+                                  int64_t model_type, int64_t variant,
                                   Optional<TensorView> topk_length, Optional<TensorView> attn_sink,
                                   Optional<TensorView> extra_kv_cache,
                                   Optional<TensorView> extra_indices,

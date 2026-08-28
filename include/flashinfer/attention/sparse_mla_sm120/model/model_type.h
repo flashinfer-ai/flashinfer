@@ -28,11 +28,20 @@
 
 #pragma once
 
+#include <cstdint>
+
 // ModelType determines KV cache layout, dimensions, and scale format.
 //   DSV3_2:  d_nope=512, power-of-2 FP32 scale inline, 656B/token
 //   DSV4:    d_nope=448, UE8M0 scale footer, 584B/token
 //   GLM_NSA: d_nope=512, arbitrary FP32 scale inline, 656B/token
 enum class ModelType { DSV3_2, DSV4, GLM_NSA };
+
+// Prefill kernel variants selected by the Python dispatch planner
+// (flashinfer/mla/_sparse_mla_sm120_plan.py, KernelVariant; the values must
+// match). The C++ dispatch is policy-free: it launches the named variant and
+// re-checks the variant's envelope defensively. DECODE_SPLITK=0 never crosses
+// this boundary (decode goes through the standalone decode entry points).
+enum class PrefillVariant : int64_t { SG = 1, MG = 2, MG_DUAL = 3, SWAPAB = 4 };
 
 enum class ScaleFormat { POW2_FP32, UE8M0_BYTE, ARBITRARY_FP32 };
 

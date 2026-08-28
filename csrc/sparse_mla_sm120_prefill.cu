@@ -26,15 +26,18 @@
 // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// Sparse-MLA SM120 prefill. Single raw-pointer entry point that dispatches:
-//   - DSV3_2 / DSV4 model split
-//   - swapAB (warp specialized, 64 heads/CTA) for the DSV3_2 family at
-//     num_heads 64 / 128
-//   - SG (single-group, 16 heads/CTA) for num_heads <= 16
-//   - MG (multi-group, 32 heads/CTA) for num_heads > 16
-//   - Dual-cache MG variants (DSV4 only)
+// Sparse-MLA SM120 prefill. Single raw-pointer entry point that launches the
+// planner-selected PrefillVariant:
+//   - SWAPAB (warp specialized, 64 heads/CTA): DSV3_2 family, num_heads
+//     64 / 128, topk 2048, single cache
+//   - SG (single-group, 16 heads/CTA): DSV3_2 family, num_heads 8 / 16,
+//     topk 2048
+//   - MG (multi-group, 32 heads/CTA): DSV3_2 family num_heads >= 32 topk
+//     2048; DSV4 num_heads {8..128} topk {128..2048}
+//   - MG_DUAL: dual-cache MG variants (DSV4 only, topk 128)
 //
-// Raw-pointer interface; framework-agnostic.
+// All routing policy lives in the Python planner; each dispatch branch only
+// re-checks its own envelope. Raw-pointer interface; framework-agnostic.
 
 #include <cuda_runtime.h>
 #include <flashinfer/attention/sparse_mla_sm120/model/model_type.h>
@@ -246,14 +249,16 @@ void launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cache, const int32_
   CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-// swapAB covers the head counts that fill whole 64-head CTAs; the rest fall
-// through to SG/MG below.
+// swapAB (warp specialized, 64 heads/CTA), DSV3_2 family, topk=2048 only.
+// swapAB takes no PBS template parameter (the KV stride is runtime), but the
+// envelope is pbs=64 like every other instantiation.
 template <ModelType MT>
-inline bool dispatch_v32_swapab(int num_heads, const bf16* Q, const uint8_t* KV,
-                                const int32_t* indices, const float* attn_sink, bf16* output,
-                                float* out_lse, float sm_scale, int num_tokens,
+inline bool dispatch_v32_swapab(int num_heads, int topk, int page_block_size, const bf16* Q,
+                                const uint8_t* KV, const int32_t* indices, const float* attn_sink,
+                                bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                 size_t stride_kv_block, const int* topk_length_ptr,
                                 cudaStream_t stream) {
+  if (topk != 2048 || page_block_size != 64) return false;
 #define DISPATCH_DSV3_2_SWAPAB(NH)                                                          \
   launch_prefill_swapab<MT, NH, 2048>(Q, KV, indices, attn_sink, output, out_lse, sm_scale, \
                                       num_tokens, stride_kv_block, topk_length_ptr, stream)
@@ -271,40 +276,38 @@ inline bool dispatch_v32_swapab(int num_heads, const bf16* Q, const uint8_t* KV,
 #undef DISPATCH_DSV3_2_SWAPAB
 }
 
+// SG (single-group, 16 heads/CTA). PBS=64 matches the V32 decode
+// (`decode_dsv3_2_kernel.cuh`). NH=8 covers small-TP shards; the SG kernel
+// zero-pads invalid head slots up to HPB=16 internally and gates write-back
+// by VALID_HPB.
 template <ModelType MT>
-inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* KV,
-                         const int32_t* indices, const float* attn_sink, bf16* output,
-                         float* out_lse, float sm_scale, int num_tokens, size_t stride_kv_block,
-                         const int* topk_length_ptr, int64_t prefill_impl, cudaStream_t stream) {
-  static_assert(KVCacheTraits<MT>::D_QK == 576);
-
-  if (topk != 2048) return false;
-
-  // prefill_impl: 0=auto (swapAB preferred), 1=force swapAB (fail if its
-  // instantiation does not cover the shape), 2=force the SG/MG path.
-  if (prefill_impl != 2) {
-    if (dispatch_v32_swapab<MT>(num_heads, Q, KV, indices, attn_sink, output, out_lse, sm_scale,
-                                num_tokens, stride_kv_block, topk_length_ptr, stream))
-      return true;
-    if (prefill_impl == 1) return false;
-  }
-
-  // PBS=64 matches the V32 decode (`decode_dsv3_2_kernel.cuh`). NH=8 covers
-  // small-TP shards; the SG kernel zero-pads invalid head slots up to HPB=16
-  // internally and gates write-back by VALID_HPB.
-  if (num_heads <= HPB) {
-    if (num_heads == 8) {
-      launch_prefill_sg<MT, ComputeMode::FP8, 8, 2048, 64>(
-          Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block,
-          topk_length_ptr, stream);
-      return true;
-    }
-    if (num_heads != 16) return false;
-    launch_prefill_sg<MT, ComputeMode::FP8, 16, 2048, 64>(Q, KV, indices, attn_sink, output,
-                                                          out_lse, sm_scale, num_tokens,
-                                                          stride_kv_block, topk_length_ptr, stream);
+inline bool dispatch_v32_sg(int num_heads, int topk, int page_block_size, const bf16* Q,
+                            const uint8_t* KV, const int32_t* indices, const float* attn_sink,
+                            bf16* output, float* out_lse, float sm_scale, int num_tokens,
+                            size_t stride_kv_block, const int* topk_length_ptr,
+                            cudaStream_t stream) {
+  if (topk != 2048 || page_block_size != 64) return false;
+  if (num_heads == 8) {
+    launch_prefill_sg<MT, ComputeMode::FP8, 8, 2048, 64>(Q, KV, indices, attn_sink, output, out_lse,
+                                                         sm_scale, num_tokens, stride_kv_block,
+                                                         topk_length_ptr, stream);
     return true;
   }
+  if (num_heads != 16) return false;
+  launch_prefill_sg<MT, ComputeMode::FP8, 16, 2048, 64>(Q, KV, indices, attn_sink, output, out_lse,
+                                                        sm_scale, num_tokens, stride_kv_block,
+                                                        topk_length_ptr, stream);
+  return true;
+}
+
+// Single-cache MG (multi-group, 32 heads/CTA).
+template <ModelType MT>
+inline bool dispatch_v32_mg(int num_heads, int topk, int page_block_size, const bf16* Q,
+                            const uint8_t* KV, const int32_t* indices, const float* attn_sink,
+                            bf16* output, float* out_lse, float sm_scale, int num_tokens,
+                            size_t stride_kv_block, const int* topk_length_ptr,
+                            cudaStream_t stream) {
+  if (topk != 2048 || page_block_size != 64) return false;
 
 #define DISPATCH_DSV3_2_MG(NH)                                                             \
   launch_prefill_mg<MT, ComputeMode::FP8, NH, 2048, 64>(Q, KV, indices, attn_sink, output, \
@@ -327,11 +330,12 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
 #undef DISPATCH_DSV3_2_MG
 }
 
-inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const uint8_t* KV,
-                                 const int32_t* indices, const float* attn_sink, bf16* output,
-                                 float* out_lse, float sm_scale, int num_tokens,
+inline bool dispatch_dsv4_single(int num_heads, int topk, int page_block_size, const bf16* Q,
+                                 const uint8_t* KV, const int32_t* indices, const float* attn_sink,
+                                 bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                  size_t stride_kv_block, const int* topk_length_ptr,
                                  cudaStream_t stream) {
+  if (page_block_size != 64) return false;
 #define DISPATCH_MG_CM(CM, NH, TK, NHG)                                                  \
   launch_prefill_mg<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, NHG>(                  \
       Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block, \
@@ -384,13 +388,15 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const u
   return false;  // unreachable
 }
 
-inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extra_page_block_size,
-                               const bf16* Q, const uint8_t* KV, const int32_t* indices,
-                               const uint8_t* KV_extra, const int32_t* idx_extra,
-                               const float* attn_sink, bf16* output, float* out_lse, float sm_scale,
-                               int num_tokens, size_t stride_kv_block, size_t stride_kv_block_extra,
+inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int page_block_size,
+                               int extra_page_block_size, const bf16* Q, const uint8_t* KV,
+                               const int32_t* indices, const uint8_t* KV_extra,
+                               const int32_t* idx_extra, const float* attn_sink, bf16* output,
+                               float* out_lse, float sm_scale, int num_tokens,
+                               size_t stride_kv_block, size_t stride_kv_block_extra,
                                const int* topk_length_ptr, const int* topk_length_extra_ptr,
                                cudaStream_t stream) {
+  if (page_block_size != 64) return false;
   if (topk == 128 && topk_length_ptr == nullptr && topk_length_extra_ptr == nullptr &&
       topk_extra % BI == 0 && (extra_page_block_size == 64 || extra_page_block_size == 2)) {
 #define DISPATCH_DUAL_MG_FULLTILE(NH, TK, PBSX, NHG)                                         \
@@ -474,41 +480,64 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
 
 }  // namespace
 
-// Public dispatcher. Returns false if no template variant matches; caller
-// is responsible for surfacing the supported envelope.
-// Dual-cache (extra_KV_cache != nullptr) is DSV4-only.
-// prefill_impl (0=auto, 1=swapab, 2=mg) gates the swapAB-first choice inside
-// dispatch_v32; the DSV4 paths have no swapAB variant and ignore it (the
-// caller rejects prefill_impl=swapab for DSV4 / dual-cache).
-bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page_block_size,
-                                 int topk_extra, int extra_page_block_size, const bf16* Q,
-                                 const uint8_t* KV_cache, const int32_t* indices,
+// Public dispatcher: a flat switch on the planner-selected variant. Each
+// branch re-checks its envelope defensively and returns false on mismatch;
+// the caller surfaces the supported envelope. All selection policy
+// (swapAB preference, prefill_impl override, decode crossover) lives in the
+// Python planner (flashinfer/mla/_sparse_mla_sm120_plan.py).
+bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_heads, int topk,
+                                 int page_block_size, int topk_extra, int extra_page_block_size,
+                                 const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                                  const uint8_t* extra_KV_cache, const int32_t* extra_indices,
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                  size_t stride_kv_block, size_t stride_kv_block_extra,
                                  const float* attn_sink, const int* topk_length,
-                                 const int* extra_topk_length, int64_t prefill_impl,
-                                 cudaStream_t stream) {
-  if (extra_KV_cache != nullptr) {
-    if (mt != ModelType::DSV4) return false;
-    return dispatch_dsv4_dual(num_heads, topk, topk_extra, extra_page_block_size, Q, KV_cache,
-                              indices, extra_KV_cache, extra_indices, attn_sink, output, out_lse,
-                              sm_scale, num_tokens, stride_kv_block, stride_kv_block_extra,
-                              topk_length, extra_topk_length, stream);
-  }
-
-  switch (mt) {
-    case ModelType::DSV3_2:
-      return dispatch_v32<ModelType::DSV3_2>(num_heads, topk, Q, KV_cache, indices, attn_sink,
-                                             output, out_lse, sm_scale, num_tokens, stride_kv_block,
-                                             topk_length, prefill_impl, stream);
-    case ModelType::GLM_NSA:
-      return dispatch_v32<ModelType::GLM_NSA>(num_heads, topk, Q, KV_cache, indices, attn_sink,
-                                              output, out_lse, sm_scale, num_tokens,
-                                              stride_kv_block, topk_length, prefill_impl, stream);
-    case ModelType::DSV4:
-      return dispatch_dsv4_single(num_heads, topk, Q, KV_cache, indices, attn_sink, output, out_lse,
-                                  sm_scale, num_tokens, stride_kv_block, topk_length, stream);
+                                 const int* extra_topk_length, cudaStream_t stream) {
+  const bool is_v32 = mt == ModelType::DSV3_2 || mt == ModelType::GLM_NSA;
+  switch (variant) {
+    case PrefillVariant::SWAPAB: {
+      if (!is_v32 || extra_KV_cache != nullptr) return false;
+      return mt == ModelType::DSV3_2
+                 ? dispatch_v32_swapab<ModelType::DSV3_2>(
+                       num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink, output,
+                       out_lse, sm_scale, num_tokens, stride_kv_block, topk_length, stream)
+                 : dispatch_v32_swapab<ModelType::GLM_NSA>(
+                       num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink, output,
+                       out_lse, sm_scale, num_tokens, stride_kv_block, topk_length, stream);
+    }
+    case PrefillVariant::SG: {
+      if (!is_v32 || extra_KV_cache != nullptr) return false;
+      return mt == ModelType::DSV3_2
+                 ? dispatch_v32_sg<ModelType::DSV3_2>(
+                       num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink, output,
+                       out_lse, sm_scale, num_tokens, stride_kv_block, topk_length, stream)
+                 : dispatch_v32_sg<ModelType::GLM_NSA>(
+                       num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink, output,
+                       out_lse, sm_scale, num_tokens, stride_kv_block, topk_length, stream);
+    }
+    case PrefillVariant::MG: {
+      if (extra_KV_cache != nullptr) return false;
+      if (is_v32) {
+        return mt == ModelType::DSV3_2
+                   ? dispatch_v32_mg<ModelType::DSV3_2>(
+                         num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink, output,
+                         out_lse, sm_scale, num_tokens, stride_kv_block, topk_length, stream)
+                   : dispatch_v32_mg<ModelType::GLM_NSA>(
+                         num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink, output,
+                         out_lse, sm_scale, num_tokens, stride_kv_block, topk_length, stream);
+      }
+      if (mt != ModelType::DSV4) return false;
+      return dispatch_dsv4_single(num_heads, topk, page_block_size, Q, KV_cache, indices, attn_sink,
+                                  output, out_lse, sm_scale, num_tokens, stride_kv_block,
+                                  topk_length, stream);
+    }
+    case PrefillVariant::MG_DUAL: {
+      if (mt != ModelType::DSV4 || extra_KV_cache == nullptr) return false;
+      return dispatch_dsv4_dual(num_heads, topk, topk_extra, page_block_size, extra_page_block_size,
+                                Q, KV_cache, indices, extra_KV_cache, extra_indices, attn_sink,
+                                output, out_lse, sm_scale, num_tokens, stride_kv_block,
+                                stride_kv_block_extra, topk_length, extra_topk_length, stream);
+    }
   }
   return false;
 }

@@ -1965,6 +1965,7 @@ def test_sparse_mla_sm120_crossover_routing_spy(monkeypatch) -> None:
     kernel, T=16 routes to prefill; both match the reference."""
     from flashinfer.mla import _sparse_mla_sm120 as sm
     from flashinfer.mla import _sparse_mla_sm120_cpb as cpb_mod
+    from flashinfer.mla import _sparse_mla_sm120_plan as plan_mod
 
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -1984,12 +1985,12 @@ def test_sparse_mla_sm120_crossover_routing_spy(monkeypatch) -> None:
     kv_dequant = dequantize_kv_dsv4(kv_packed)
     sm_scale = d_qk**-0.5
 
-    # Inject the crossover table in-process and invalidate the routing memo.
+    # Inject the crossover table in-process and invalidate the planner memo.
     dev_key = cpb_mod._device_key(device)
     monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
     monkeypatch.setitem(cpb_mod._crossover, dev_key, {"dsv4|64|512": 8})
     monkeypatch.setattr(cpb_mod, "_constants_version", cpb_mod._constants_version + 1)
-    sm._route_hot_cache.clear()
+    plan_mod._plan_memo.clear()
 
     real_decode = sm.sparse_mla_sm120_decode_dsv4
     calls = {"decode": 0}
@@ -2153,3 +2154,113 @@ def test_sparse_mla_sm120_crossover_cuda_graph(monkeypatch) -> None:
     replay_and_check(*res)
 
 
+# ── Envelope consistency: C++ accepts exactly what the planner claims ─────
+
+# (variant, model_type, num_heads, topk, page_block_size, has_extra)
+_ENVELOPE_PROBES = [
+    # PREFILL_SWAPAB: DSV3_2 family, H in {64,128}, topk=2048, single cache.
+    ("swapab", 0, 64, 2048, 64, False),
+    ("swapab", 2, 128, 2048, 64, False),
+    ("swapab", 0, 32, 2048, 64, False),  # H below swapAB
+    ("swapab", 0, 64, 512, 64, False),  # topk below
+    ("swapab", 0, 64, 2048, 32, False),  # pbs mismatch
+    ("swapab", 1, 64, 2048, 64, False),  # DSV4 has no swapAB
+    ("swapab", 0, 64, 2048, 64, True),  # dual-cache
+    # PREFILL_SG: DSV3_2 family, H in {8,16}, topk=2048.
+    ("sg", 0, 8, 2048, 64, False),
+    ("sg", 2, 16, 2048, 64, False),
+    ("sg", 0, 32, 2048, 64, False),  # H above SG
+    ("sg", 0, 16, 512, 64, False),  # topk below
+    ("sg", 1, 8, 2048, 64, False),  # DSV4 has no SG
+    # PREFILL_MG: DSV3_2 family H in {32,64,128} topk=2048; DSV4 H in
+    # {8..128} topk in {128,192,256,512,1024,2048}.
+    ("mg", 0, 32, 2048, 64, False),
+    ("mg", 2, 128, 2048, 64, False),
+    ("mg", 0, 16, 2048, 64, False),  # v32 H=16 is SG territory
+    ("mg", 0, 64, 1024, 64, False),  # v32 topk below 2048
+    ("mg", 1, 8, 128, 64, False),
+    ("mg", 1, 128, 2048, 64, False),
+    ("mg", 1, 64, 192, 64, False),
+    ("mg", 1, 64, 384, 64, False),  # dsv4 topk between instantiations
+    ("mg", 1, 17, 128, 64, False),  # dsv4 H off boundary
+    ("mg", 1, 64, 512, 32, False),  # pbs mismatch
+    ("mg", 1, 64, 512, 64, True),  # dual-cache must use MG_DUAL
+    # PREFILL_MG_DUAL: DSV4 only, topk=128, extra cache present.
+    ("mg_dual", 1, 32, 128, 64, True),
+    ("mg_dual", 1, 128, 128, 64, True),
+    ("mg_dual", 0, 32, 128, 64, True),  # dual is DSV4-only
+    ("mg_dual", 1, 32, 256, 64, True),  # dual topk must be 128
+    ("mg_dual", 1, 32, 128, 64, False),  # requires the extra cache
+]
+
+_VARIANT_ENUM = {
+    "swapab": ("PREFILL_SWAPAB", "prefill_swapab_eligible"),
+    "sg": ("PREFILL_SG", "prefill_sg_eligible"),
+    "mg": ("PREFILL_MG", "prefill_mg_eligible"),
+    ("mg_dual"): ("PREFILL_MG_DUAL", "prefill_mg_dual_eligible"),
+}
+
+
+@pytest.mark.parametrize(
+    "variant,model_type,num_heads,topk,page_block_size,has_extra", _ENVELOPE_PROBES
+)
+def test_sparse_mla_sm120_envelope_consistency(
+    variant: str,
+    model_type: int,
+    num_heads: int,
+    topk: int,
+    page_block_size: int,
+    has_extra: bool,
+) -> None:
+    """For each probed boundary point, the C++ variant dispatch accepts iff
+    the Python envelope predicate claims eligibility."""
+    from flashinfer.mla import _sparse_mla_sm120_plan as plan_mod
+    from flashinfer.mla._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
+
+    device = torch.device("cuda")
+    enum_name, predicate_name = _VARIANT_ENUM[variant]
+    variant_id = int(getattr(plan_mod.KernelVariant, enum_name))
+    expected = getattr(plan_mod, predicate_name)(
+        model_type, num_heads, topk, page_block_size, has_extra
+    )
+
+    d_qk = 576 if model_type in (0, 2) else 512
+    bpt = 656 if model_type in (0, 2) else 584
+    num_tokens = 2
+    kv_cache = torch.zeros(4, page_block_size * bpt, dtype=torch.uint8, device=device)
+    q = torch.zeros(num_tokens, num_heads, d_qk, dtype=torch.bfloat16, device=device)
+    indices = torch.zeros(num_tokens, topk, dtype=torch.int32, device=device)
+    output = torch.zeros(
+        num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros(num_tokens, num_heads, dtype=torch.float32, device=device)
+    extra_kv = extra_idx = None
+    if has_extra:
+        extra_kv = torch.zeros(4, 64 * bpt, dtype=torch.uint8, device=device)
+        extra_idx = torch.zeros(num_tokens, 64, dtype=torch.int32, device=device)
+
+    module = _get_sparse_mla_sm120_decode_module()
+
+    def call() -> None:
+        module.sparse_mla_sm120_paged_attention(
+            q,
+            kv_cache,
+            indices,
+            output,
+            out_lse,
+            d_qk**-0.5,
+            model_type,
+            variant_id,
+            None,
+            None,
+            extra_kv,
+            extra_idx,
+            None,
+        )
+
+    if expected:
+        call()
+        torch.cuda.synchronize()
+    else:
+        with pytest.raises(RuntimeError, match="sparse-MLA"):
+            call()

@@ -44,21 +44,15 @@ using tvm::ffi::Optional;
 
 namespace flashinfer::sparse_mla_sm120 {
 
-// Prefill implementation override crossing the FFI boundary.
-constexpr int64_t kPrefillImplAuto = 0;
-constexpr int64_t kPrefillImplSwapAB = 1;
-constexpr int64_t kPrefillImplMG = 2;
-
 // Forward declaration (defined in sparse_mla_sm120_prefill.cu).
-bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page_block_size,
-                                 int topk_extra, int extra_page_block_size, const bf16* Q,
-                                 const uint8_t* KV_cache, const int32_t* indices,
+bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_heads, int topk,
+                                 int page_block_size, int topk_extra, int extra_page_block_size,
+                                 const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
                                  const uint8_t* extra_KV_cache, const int32_t* extra_indices,
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                  size_t stride_kv_block, size_t extra_stride_kv_block,
                                  const float* attn_sink, const int* topk_length,
-                                 const int* extra_topk_length, int64_t prefill_impl,
-                                 cudaStream_t stream);
+                                 const int* extra_topk_length, cudaStream_t stream);
 
 namespace {
 
@@ -155,7 +149,7 @@ void SparseMlaSm120PagedAttention(
     TensorView output,    // [num_tokens, num_heads, d_v] bf16 — in-place
     TensorView out_lse,   // [num_tokens, num_heads] f32 — in-place
     double sm_scale, int64_t model_type,
-    int64_t prefill_impl,                    // 0=auto, 1=swapab, 2=mg
+    int64_t variant,                         // PrefillVariant; planner-selected
     Optional<TensorView> topk_length,        // [num_tokens] int32, optional
     Optional<TensorView> attn_sink,          // [num_heads] f32, optional
     Optional<TensorView> extra_kv_cache,     // optional dual cache
@@ -269,22 +263,15 @@ void SparseMlaSm120PagedAttention(
   TVM_FFI_ICHECK_GE(num_tokens, 1)
       << "prefill requires num_tokens >= 1; got num_tokens=" << num_tokens;
 
-  TVM_FFI_ICHECK(prefill_impl == kPrefillImplAuto || prefill_impl == kPrefillImplSwapAB ||
-                 prefill_impl == kPrefillImplMG)
-      << "prefill_impl must be 0 (auto), 1 (swapab), or 2 (mg); got " << prefill_impl;
-  if (prefill_impl == kPrefillImplSwapAB) {
-    // swapAB is instantiated for the DSV3_2 family only, single cache.
-    TVM_FFI_ICHECK(mt == ModelType::DSV3_2 || mt == ModelType::GLM_NSA)
-        << "prefill_impl=swapab requires the DSV3_2 family (d_qk=576); got model_type="
-        << model_type;
-    TVM_FFI_ICHECK(extra_kv_ptr == nullptr) << "prefill_impl=swapab does not support dual-cache";
-  }
+  TVM_FFI_ICHECK(variant >= static_cast<int64_t>(PrefillVariant::SG) &&
+                 variant <= static_cast<int64_t>(PrefillVariant::SWAPAB))
+      << "variant must be a PrefillVariant (1=SG, 2=MG, 3=MG_DUAL, 4=SWAPAB); got " << variant;
 
   const bool ok = sparse_mla_prefill_dispatch(
-      mt, num_heads, topk, page_block_size, extra_topk, extra_page_block_size, Q_ptr, KV_ptr,
-      idx_ptr, extra_kv_ptr, extra_idx_ptr, O_ptr, LSE_ptr, static_cast<float>(sm_scale),
-      num_tokens, kv_layout.stride_kv_block, extra_stride_kv_block, attn_sink_ptr, tl_ptr, etl_ptr,
-      prefill_impl, stream);
+      mt, static_cast<PrefillVariant>(variant), num_heads, topk, page_block_size, extra_topk,
+      extra_page_block_size, Q_ptr, KV_ptr, idx_ptr, extra_kv_ptr, extra_idx_ptr, O_ptr, LSE_ptr,
+      static_cast<float>(sm_scale), num_tokens, kv_layout.stride_kv_block, extra_stride_kv_block,
+      attn_sink_ptr, tl_ptr, etl_ptr, stream);
   TVM_FFI_ICHECK(ok) << "Unsupported sparse-MLA prefill configuration: "
                      << "model="
                      << (mt == ModelType::DSV3_2 ? "DSV3_2"
@@ -292,10 +279,7 @@ void SparseMlaSm120PagedAttention(
                      << " num_heads=" << num_heads << " topk=" << topk
                      << " page_block_size=" << page_block_size << " topk_extra=" << extra_topk
                      << " extra_page_block_size=" << extra_page_block_size
-                     << " prefill_impl=" << prefill_impl
-                     << (prefill_impl == kPrefillImplSwapAB
-                             ? " (forced swapab requires topk=2048 and num_heads in {64, 128})"
-                             : "");
+                     << " variant=" << variant;
 }
 
 }  // namespace flashinfer::sparse_mla_sm120
