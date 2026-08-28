@@ -677,3 +677,12 @@ def test_plan_dots3_swa_crossover(known_crossover) -> None:
         torch.device("cpu"),
     )
     assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_SG
+
+
+def test_sparse_mla_sm120_wrapper_public_export() -> None:
+    """The runner alias is public via ``flashinfer.mla`` and is the impl class."""
+    from flashinfer.mla import SparseMLASm120Wrapper
+    from flashinfer.mla._sparse_mla_sm120 import _SparseMLAPagedAttentionRunner
+
+    assert SparseMLASm120Wrapper is _SparseMLAPagedAttentionRunner
+    assert "SparseMLASm120Wrapper" in dir(flashinfer.mla)

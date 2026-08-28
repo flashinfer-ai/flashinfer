@@ -993,6 +993,22 @@ class _SparseMLAPagedAttentionRunner:
         return out_lse_view if return_lse else None
 
 
+# Public alias of the runner, exported as ``flashinfer.mla.SparseMLASm120Wrapper``.
+#
+# Public contract:
+# - Construct once and hold persistently (e.g. per framework attention layer).
+#   The constructor pre-allocates the LSE buffer from the ``max_num_tokens`` /
+#   ``max_num_heads`` upper bounds, so construction must complete before CUDA
+#   graph capture; steady-state ``run()`` calls then allocate nothing.
+# - ``run()`` is the single entry point. There is no separate plan stage;
+#   dispatch decisions are made internally per call and memoized.
+# - ``d_v`` and ``kv_scale_format`` are fixed at construction and select the
+#   model-type semantics applied to every ``run()`` call (512 for
+#   DSV3_2 / DSV4 / GLM variants, 1024 for DOTS3_SWA; scale semantics per
+#   ``kv_scale_format``).
+SparseMLASm120Wrapper = _SparseMLAPagedAttentionRunner
+
+
 # Decode-DSv3.2 / DSv4: chunks_per_block (cpb) comes from the calibrated
 # analytical model in _sparse_mla_sm120_cpb. Constants are calibrated once per
 # (device, family) during autotune() tuning mode and cached on disk; without

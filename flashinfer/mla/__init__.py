@@ -25,6 +25,7 @@ _PRIMS_TS_LAZY_EXPORTS = frozenset(
 _SPARSE_MLA_SM120_LAZY_EXPORTS = frozenset(
     {
         "SparseMLASm120DecodeConfig",
+        "SparseMLASm120Wrapper",
         "supported_sparse_mla_sm120_configs",
     }
 )
