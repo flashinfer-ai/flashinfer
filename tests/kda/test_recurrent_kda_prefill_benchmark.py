@@ -45,6 +45,26 @@ def test_recorded_cake_route_serializes_combined_bt16_module():
     )
 
 
+def test_recorded_cake_route_serializes_o1_bt16_modules():
+    assert _resolve_recorded_cake_route(
+        [("bt16_prepare_chain_m64_s8_o1", "sm100f")]
+    ) == (
+        "bt16_prepare_chain_m64",
+        "sm100f",
+        ["bt16_prepare_chain_m64_s8_o1"],
+    )
+    assert _resolve_recorded_cake_route(
+        [
+            ("bt16_prepare_o1", "sm100f"),
+            ("bt16_chain_m64_s9_o1", "sm100f"),
+        ]
+    ) == (
+        "bt16_prepare_chain_m64",
+        "sm100f",
+        ["bt16_prepare_o1", "bt16_chain_m64_s9_o1"],
+    )
+
+
 def test_recorded_cake_route_serializes_bt16_physical_pair():
     assert _resolve_recorded_cake_route(
         [

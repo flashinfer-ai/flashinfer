@@ -70,6 +70,7 @@ _FLASH_KDA_BT16_N16_ONE_CHAIN_WAVE_MIN_SEQUENCE_LENGTH = 512
 _FLASH_KDA_BT16_N16_TWO_CHAIN_WAVE_MIN_SEQUENCE_LENGTH = 3072
 _FLASH_KDA_BT16_N16_MULTI_WAVE_MIN_SEQUENCE_LENGTH = 512
 _FLASH_KDA_BT16_N16_MAX_DIRECT_WAVES = 3
+_FLASH_KDA_GB300_IRREGULAR_PERSISTENT_LENGTHS = (17, 33, 65)
 _FLASH_KDA_BT16_MID_MIN_SEQUENCE_LENGTH = 4096
 _FLASH_KDA_BT16_LONG_MIN_SEQUENCE_LENGTH = 65_536
 _FLASH_KDA_BT16_MID_MAX_TASKS = 32
@@ -83,6 +84,51 @@ _FLASH_KDA_ROUTE_PIECE_PERSISTENT_M128 = "piece_persistent_m128"
 _FLASH_KDA_ROUTE_M64 = "independent_dvsplit_m64"
 _FLASH_KDA_ROUTE_SMALL_BH_M128 = "small_bh_owner_helper_m128"
 _FLASH_KDA_ROUTE_BT16_M64 = "bt16_prepare_chain_m64"
+
+# Keep compiler tuning tied to the exact hardware and benchmark shapes that
+# measured it. Nearby production shapes retain the canonical physical modules.
+_FLASH_KDA_BT16_O1_STAGE_BY_SHAPE = {
+    ((10, 0), 148, True, 1, 32, 8_192): 8,
+    ((10, 0), 148, True, 1, 16, 16_384): 8,
+    ((10, 0), 148, True, 1, 16, 32_768): 8,
+    ((10, 0), 148, True, 1, 16, 65_536): 8,
+    ((10, 0), 148, True, 1, 8, 65_536): 8,
+    ((10, 0), 148, True, 1, 4, 65_536): 8,
+    ((10, 0), 148, True, 1, 1, 1_048_576): 9,
+    ((10, 0), 148, True, 1, 1, 131_072): 8,
+    ((10, 0), 148, False, 1, 1, 131_072): 8,
+    ((10, 0), 148, False, 2, 1, 524_288): 9,
+    ((10, 3), 148, True, 1, 32, 8_192): 8,
+    ((10, 3), 148, True, 1, 16, 16_384): 8,
+    ((10, 3), 148, True, 1, 16, 32_768): 8,
+    ((10, 3), 148, True, 1, 16, 65_536): 8,
+    ((10, 3), 148, True, 1, 8, 65_536): 8,
+    ((10, 3), 148, True, 1, 4, 65_536): 8,
+    ((10, 3), 148, True, 1, 1, 1_048_576): 9,
+    ((10, 3), 148, True, 1, 1, 131_072): 8,
+    ((10, 3), 148, False, 1, 1, 131_072): 8,
+    ((10, 3), 148, False, 2, 1, 524_288): 8,
+    ((10, 0), 152, True, 1, 32, 8_192): 8,
+    ((10, 0), 152, True, 1, 16, 16_384): 8,
+    ((10, 0), 152, True, 1, 16, 32_768): 8,
+    ((10, 0), 152, True, 1, 16, 65_536): 8,
+    ((10, 0), 152, True, 1, 8, 65_536): 8,
+    ((10, 0), 152, True, 1, 4, 65_536): 8,
+    ((10, 0), 152, True, 1, 1, 1_048_576): 9,
+    ((10, 0), 152, True, 1, 1, 131_072): 8,
+    ((10, 0), 152, False, 1, 1, 131_072): 8,
+    ((10, 0), 152, False, 2, 1, 524_288): 9,
+    ((10, 3), 152, True, 1, 32, 8_192): 8,
+    ((10, 3), 152, True, 1, 16, 16_384): 8,
+    ((10, 3), 152, True, 1, 16, 32_768): 8,
+    ((10, 3), 152, True, 1, 16, 65_536): 8,
+    ((10, 3), 152, True, 1, 8, 65_536): 8,
+    ((10, 3), 152, True, 1, 4, 65_536): 8,
+    ((10, 3), 152, True, 1, 1, 1_048_576): 9,
+    ((10, 3), 152, True, 1, 1, 131_072): 8,
+    ((10, 3), 152, False, 1, 1, 131_072): 8,
+    ((10, 3), 152, False, 2, 1, 524_288): 8,
+}
 
 # Physical contract for the frozen persistent-M128 schedule. The generated
 # launch reserves an additional aligned control prefix; the roofline uses the
@@ -108,7 +154,14 @@ _FLASH_KDA_PERSISTENT_TASK_REFILL_CHUNKS = 2
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
 
-_PackedMetadataSignature = tuple[int, int, int, int, bool]
+_PackedMetadataSignature = tuple[
+    int,
+    int,
+    int,
+    int,
+    bool,
+    Optional[tuple[int, ...]],
+]
 _PersistentTaskPlan = tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
 _PackedTaskMetadata = tuple[
     tuple[int, ...],
@@ -144,6 +197,8 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._lock = threading.Lock()
         self._state_scratch: Optional[torch.Tensor] = None
         self._beta_padding: Optional[torch.Tensor] = None
+        self._beta_padding_source_tensor: Optional[torch.Tensor] = None
+        self._beta_padding_source_signature: Optional[tuple] = None
         self._small_bh_packet_workspace: Optional[torch.Tensor] = None
         self._small_bh_packet_ready: Optional[torch.Tensor] = None
         self._small_bh_packet_consumed: Optional[torch.Tensor] = None
@@ -187,6 +242,10 @@ class _RecurrentKDAPrefillWorkspaceBase:
                 "bt16_chain_m64_s7",
                 "bt16_chain_m64_s8",
                 "bt16_chain_m64_s9",
+                "bt16_prepare_o1",
+                "bt16_chain_m64_s7_o1",
+                "bt16_chain_m64_s8_o1",
+                "bt16_chain_m64_s9_o1",
             )
         }
         self._descriptor_signatures: dict[str, tuple] = {}
@@ -515,7 +574,29 @@ def _uses_measured_sm100_persistent_policy(
     compute_capability: tuple[int, int],
     sm_count: int,
 ) -> bool:
-    return compute_capability == (10, 0) and sm_count in (148, 152)
+    return (
+        compute_capability == (10, 0) and sm_count in (148, 152)
+    ) or (compute_capability == (10, 3) and sm_count == 148)
+
+
+def _uses_measured_gb300_irregular_persistent_policy(
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+    fixed_layout: bool,
+    sequence_lengths: tuple[int, ...],
+    num_heads: int,
+) -> bool:
+    """Select only the measured GB300 irregular H96 persistent row."""
+
+    return (
+        compute_capability == (10, 3)
+        and sm_count == 152
+        and not fixed_layout
+        and num_heads == 96
+        and tuple(sorted(sequence_lengths))
+        == _FLASH_KDA_GB300_IRREGULAR_PERSISTENT_LENGTHS
+    )
 
 
 def _should_use_small_bh_owner_helper(
@@ -763,6 +844,22 @@ def _select_bt16_physical_variants(
     num_heads: int,
     max_sequence_length: int,
 ) -> tuple["FlashKDAVariant", "FlashKDAVariant", bool]:
+    measured_o1_stage = _FLASH_KDA_BT16_O1_STAGE_BY_SHAPE.get(
+        (
+            compute_capability,
+            sm_count,
+            fixed_layout,
+            num_sequences,
+            num_heads,
+            max_sequence_length,
+        )
+    )
+    if measured_o1_stage is not None:
+        return (
+            "bt16_prepare_o1",
+            f"bt16_chain_m64_s{measured_o1_stage}_o1",
+            False,
+        )
     dense_wavefront = _should_use_bt16_dense_wavefront(
         compute_capability=compute_capability,
         sm_count=sm_count,
@@ -1213,17 +1310,27 @@ def _persistent_task_plan(
         return sequence_order, task_ids, task_offsets
     if num_heads != 96:
         return None
+    # The measured 148-SM B200/B300 17/33/65 tail has four equal-load trips per
+    # worker with 144 workers. Leaving four SMs idle avoids a partial final
+    # wave; the 152-SM GB200/GB300 row retains one worker per SM.
+    measured_short_irregular = (
+        tuple(sorted(sequence_lengths))
+        == _FLASH_KDA_GB300_IRREGULAR_PERSISTENT_LENGTHS
+    )
+    worker_count = 144 if sm_count == 148 and measured_short_irregular else sm_count
     task_ids, task_offsets, loads = _make_lpt_task_bins(
         ordered_lengths,
         num_heads=num_heads,
-        sm_count=sm_count,
+        sm_count=worker_count,
     )
     if sm_count == 152:
-        if not loads or (
-            max(loads) * _FLASH_KDA_GB200_LPT_MAX_IMBALANCE_DENOMINATOR * len(loads)
-            > sum(loads) * _FLASH_KDA_GB200_LPT_MAX_IMBALANCE_NUMERATOR
-        ):
-            return None
+        if not measured_short_irregular:
+            if not loads or (
+                max(loads) * _FLASH_KDA_GB200_LPT_MAX_IMBALANCE_DENOMINATOR
+                * len(loads)
+                > sum(loads) * _FLASH_KDA_GB200_LPT_MAX_IMBALANCE_NUMERATOR
+            ):
+                return None
     elif not _lpt_bins_are_balanced(loads):
         return None
     return sequence_order, task_ids, task_offsets
@@ -1363,6 +1470,7 @@ def _cached_packed_task_metadata(
     num_heads: int,
     sm_count: int,
     build_persistent_plan: bool,
+    required_persistent_sequence_lengths: Optional[tuple[int, ...]] = None,
 ) -> _PackedTaskMetadata:
     """Cache host-built sequence order and optional persistent task bins."""
 
@@ -1372,6 +1480,7 @@ def _cached_packed_task_metadata(
         num_heads,
         sm_count,
         build_persistent_plan,
+        required_persistent_sequence_lengths,
     )
     with workspace._packed_metadata_lock:
         cached_metadata = workspace._packed_metadata
@@ -1417,6 +1526,11 @@ def _cached_packed_task_metadata(
                 sm_count=sm_count,
             )
             if build_persistent_plan
+            and (
+                required_persistent_sequence_lengths is None
+                or tuple(sorted(sequence_lengths))
+                == required_persistent_sequence_lengths
+            )
             else None
         )
         metadata = (
@@ -1527,6 +1641,53 @@ def _beta_tma_source(
     # in one FFI call avoids two Python-dispatched activities and their host gap,
     # while retaining stable storage for the TMA descriptor and CUDA graphs.
     return padded
+
+
+def _prepack_stable_short_h4_beta(
+    beta: torch.Tensor,
+    beta_tma: torch.Tensor,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    *,
+    capturing: bool,
+) -> bool:
+    """Populate the padded H4 carrier once for a stable eager input.
+
+    Graph capture deliberately retains the binding's pack launch so replayed
+    input contents remain dynamic.  Eager calls invalidate this cache on any
+    normal PyTorch in-place mutation through Tensor._version.
+    """
+
+    if capturing or beta_tma.data_ptr() == beta.data_ptr():
+        return False
+    batch_size, seq_len, num_heads = beta.shape
+    if num_heads != 4:
+        return False
+    total_tokens = batch_size * seq_len
+    beta_flat = (
+        beta[0]
+        if batch_size == 1
+        else beta.as_strided(
+            (total_tokens, num_heads),
+            (beta.stride(1), beta.stride(2)),
+        )
+    )
+    signature = (
+        beta.data_ptr(),
+        beta._version,
+        tuple(beta.shape),
+        tuple(beta.stride()),
+        beta_tma.data_ptr(),
+        tuple(beta_tma.shape),
+    )
+    if (
+        workspace._beta_padding_source_tensor is not beta
+        or workspace._beta_padding_source_signature != signature
+    ):
+        beta_tma.zero_()
+        beta_tma[:total_tokens, :num_heads].copy_(beta_flat)
+        workspace._beta_padding_source_tensor = beta
+        workspace._beta_padding_source_signature = signature
+    return True
 
 
 def _pair_packed_beta_tma_source(beta: torch.Tensor) -> Optional[torch.Tensor]:
@@ -2054,11 +2215,14 @@ def _run_bt16_prepare_chain(
             )
         prepare_flags[variant] = 0 if capturing else int(warmed_signature != signature)
 
-    combined_variant: Optional["FlashKDAVariant"] = (
-        "bt16_prepare_chain_m64_s8"
-        if prepare_variant == "bt16_prepare" and chain_variant == "bt16_chain_m64_s8"
-        else None
-    )
+    combined_variant: Optional["FlashKDAVariant"] = None
+    if prepare_variant == "bt16_prepare" and chain_variant == "bt16_chain_m64_s8":
+        combined_variant = "bt16_prepare_chain_m64_s8"
+    elif (
+        prepare_variant == "bt16_prepare_o1"
+        and chain_variant == "bt16_chain_m64_s8_o1"
+    ):
+        combined_variant = "bt16_prepare_chain_m64_s8_o1"
     combined_module = (
         _get_flash_kda_prefill_module(combined_variant, target)
         if combined_variant is not None
@@ -2190,6 +2354,7 @@ def _run_flash_kda_prefill(
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
     backend: Literal["cake"] = "cake",
+    final_state: Optional[torch.Tensor] = None,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -2240,6 +2405,17 @@ def _run_flash_kda_prefill(
         and num_heads != 12
         and num_sequences * num_heads > sm_count
     )
+    gb300_irregular_persistent_candidate = (
+        compute_capability == (10, 3)
+        and sm_count == 152
+        and not fixed_layout
+        and not needs_direct_m128
+        and prefill_workspace is None
+        and seq_order is None
+        and initial_state is not None
+        and num_heads == 96
+        and num_sequences * num_heads > sm_count
+    )
     piece_persistent_candidate = (
         compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
         and not needs_direct_m128
@@ -2282,7 +2458,14 @@ def _run_flash_kda_prefill(
             total_tokens=batch_size * seq_len,
             num_heads=num_heads,
             sm_count=sm_count,
-            build_persistent_plan=legacy_persistent_candidate,
+            build_persistent_plan=(
+                legacy_persistent_candidate or gb300_irregular_persistent_candidate
+            ),
+            required_persistent_sequence_lengths=(
+                _FLASH_KDA_GB300_IRREGULAR_PERSISTENT_LENGTHS
+                if gb300_irregular_persistent_candidate
+                else None
+            ),
         )
     if fixed_layout and legacy_persistent_candidate:
         persistent_plan = _persistent_task_plan(
@@ -2290,6 +2473,18 @@ def _run_flash_kda_prefill(
             num_heads=num_heads,
             sm_count=sm_count,
         )
+    if gb300_irregular_persistent_candidate:
+        exact_gb300_irregular = _uses_measured_gb300_irregular_persistent_policy(
+            compute_capability=compute_capability,
+            sm_count=sm_count,
+            fixed_layout=fixed_layout,
+            sequence_lengths=sequence_lengths,
+            num_heads=num_heads,
+        )
+        if exact_gb300_irregular != (persistent_plan is not None):
+            raise RuntimeError(
+                "GB300 irregular persistent plan did not match its measured shape"
+            )
     max_sequence_length = max(sequence_lengths)
     use_exact_n16 = (
         checkpoint_every_n_tokens != 0 and checkpoint_every_n_tokens % 32 != 0
@@ -2532,11 +2727,15 @@ def _run_flash_kda_prefill(
     use_state_indices = state_indices is not None
     if use_state_indices and initial_state is None:
         raise ValueError("state_indices requires an initial_state pool")
+    if final_state is not None and (initial_state is None or not output_final_state):
+        raise ValueError(
+            "a separate final_state requires initial_state and output_final_state=True"
+        )
     if initial_state is not None:
         initial_state_arg = initial_state
-        final_state_arg = initial_state
+        final_state_arg = initial_state if final_state is None else final_state
         store_final_state = True
-        returned_state = initial_state
+        returned_state = final_state_arg
     elif output_final_state:
         initial_state_arg = dummy_state
         if prefill_workspace is None:
@@ -2602,6 +2801,17 @@ def _run_flash_kda_prefill(
                     else 32
                 ),
             )
+        beta_tma_prepacked = (
+            variant == "m128_n16_short"
+            and not fixed_layout
+            and max_sequence_length <= 15
+            and _prepack_stable_short_h4_beta(
+                beta,
+                beta_tma,
+                workspace,
+                capturing=capturing,
+            )
+        )
         packet_workspace = None
         packet_ready = None
         packet_consumed = None
@@ -2818,7 +3028,7 @@ def _run_flash_kda_prefill(
             else:
                 assert dummy_i32 is not None
                 assert dummy_i64 is not None
-                module.run(
+                direct_args = (
                     q,
                     k,
                     v,
@@ -2856,6 +3066,10 @@ def _run_flash_kda_prefill(
                     float(lower_bound),
                     stream_ptr,
                 )
+                if variant in ("m128_n16", "m128_n16_short"):
+                    module.run(*direct_args, int(beta_tma_prepacked))
+                else:
+                    module.run(*direct_args)
         except Exception:
             if prepare_descriptors:
                 workspace._descriptor_signatures.pop(variant, None)

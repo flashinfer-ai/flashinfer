@@ -197,15 +197,22 @@ PRODUCTION_CASES = (
     Case("h1_packed_524288_524288", 1, (524288, 524288), True, 11022),
 )
 
-_BT16_PREPARE_VARIANTS = frozenset(("bt16_prepare", "bt16_prepare_beta_tma"))
+_BT16_PREPARE_VARIANTS = frozenset(
+    ("bt16_prepare", "bt16_prepare_beta_tma", "bt16_prepare_o1")
+)
 _BT16_CHAIN_VARIANTS = frozenset(
     (
         "bt16_chain_m64_s7",
         "bt16_chain_m64_s8",
         "bt16_chain_m64_s9",
+        "bt16_chain_m64_s7_o1",
+        "bt16_chain_m64_s8_o1",
+        "bt16_chain_m64_s9_o1",
     )
 )
-_BT16_COMBINED_VARIANTS = frozenset(("bt16_prepare_chain_m64_s8",))
+_BT16_COMBINED_VARIANTS = frozenset(
+    ("bt16_prepare_chain_m64_s8", "bt16_prepare_chain_m64_s8_o1")
+)
 
 
 def _resolve_recorded_cake_route(

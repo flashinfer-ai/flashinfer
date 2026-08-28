@@ -173,6 +173,35 @@ def test_combined_bt16_jit_spec(target, target_define):
 
 
 @pytest.mark.parametrize(
+    ("variant", "base_variant"),
+    (
+        ("bt16_prepare_o1", "bt16_prepare"),
+        ("bt16_chain_m64_s7_o1", "bt16_chain_m64_s7"),
+        ("bt16_chain_m64_s8_o1", "bt16_chain_m64_s8"),
+        ("bt16_chain_m64_s9_o1", "bt16_chain_m64_s9"),
+        (
+            "bt16_prepare_chain_m64_s8_o1",
+            "bt16_prepare_chain_m64_s8",
+        ),
+    ),
+)
+def test_bt16_o1_variant_is_separate_but_reuses_frozen_sources(
+    variant, base_variant
+):
+    flash_kda.gen_flash_kda_module.cache_clear()
+    base = flash_kda.gen_flash_kda_module(base_variant, "sm100f")
+    tuned = flash_kda.gen_flash_kda_module(variant, "sm100f")
+
+    assert tuned.name != base.name
+    assert tuned.sources == base.sources
+    assert "--ptxas-options=-O1" in tuned.extra_cuda_cflags
+    assert "--ptxas-options=-O1" not in base.extra_cuda_cflags
+    assert variant in flash_kda.FLASH_KDA_VARIANTS
+
+    flash_kda.gen_flash_kda_module.cache_clear()
+
+
+@pytest.mark.parametrize(
     ("target", "target_define"),
     (
         ("sm100a", "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=0"),
@@ -183,7 +212,7 @@ def test_short_n16_jit_spec_and_frozen_source(target, target_define):
     flash_kda.gen_flash_kda_module.cache_clear()
     spec = flash_kda.gen_flash_kda_module("m128_n16_short", target)
 
-    assert spec.name == f"flash_kda_bf16_m128_n16_short_969b84e4af_{target}"
+    assert spec.name == f"flash_kda_bf16_m128_n16_short_90aa86417c_{target}"
     assert spec.sources == [
         flash_kda._get_flash_kda_csrc_dir()
         / "cake_flashkda_bf16_fused_m128_n16_binding.cu"

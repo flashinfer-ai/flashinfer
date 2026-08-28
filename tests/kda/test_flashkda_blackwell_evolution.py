@@ -25,7 +25,51 @@ from flashinfer.jit.flash_kda_evolution import (
     _module_ident,
     gen_flash_kda_evolution_module,
 )
-from flashinfer.kda_evolution import _route, prepare_flash_kda_evolution
+from flashinfer.kda_evolution import (
+    _route,
+    _use_evolution_route,
+    prepare_flash_kda_evolution,
+)
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "seq_lens", "packed", "expected"),
+    (
+        (96, (8192,), False, True),
+        (96, (1300, 547, 2048, 963, 271, 3063), True, True),
+        (96, (1024,) * 8, True, True),
+        (64, (8192,), False, True),
+        (64, (1300, 547, 2048, 963, 271, 3063), True, True),
+        (64, (1024,) * 8, True, True),
+        (32, (8192,), False, False),
+        (32, (1300, 547, 2048, 963, 271, 3063), True, True),
+        (96, (1024,) * 16, True, True),
+        (96, (1024,) * 32, True, True),
+        (96, (1024,) * 64, True, True),
+        (96, (1024,) * 128, True, True),
+        (96, (1024,) * 256, True, True),
+        (96, (64, 128, 256), True, True),
+        (96, (17, 33, 65), True, False),
+        (16, (16384,), False, False),
+        (16, (32768,), False, False),
+        (16, (65536,), False, False),
+        (8, (65536,), False, False),
+        (4, (65536,), False, False),
+        (4, tuple(range(1, 16)), True, False),
+        (1, (1048576,), False, False),
+        (96, (37,), False, True),
+        (96, (97,), False, True),
+        (96, (16,), True, False),
+        (96, (16, 16), True, False),
+        (1, (131072,), False, False),
+        (1, (131072,), True, False),
+        (1, (524288, 524288), True, False),
+    ),
+)
+def test_flashkda_evolution_hybrid_route_manifest(
+    num_heads, seq_lens, packed, expected
+):
+    assert _use_evolution_route(seq_lens, num_heads, not packed) is expected
 
 
 def test_flashkda_evolution_profile_is_frozen():
@@ -109,15 +153,32 @@ def test_flashkda_evolution_jit_spec_has_one_generated_binding(variant, target):
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    ("seq_lens", "seed", "expected_variant"),
+    ("seq_lens", "packed", "seed", "expected_variant", "alias_state"),
     (
-        ((8192,), 20260826, "vtile_f1_t8192_h96_p1_s96"),
-        ((1300, 547, 2048, 963, 271, 3063), 10001, "persistent-h96-mixed"),
+        ((8192,), False, 20260826, "vtile_f1_t8192_h96_p1_s96", False),
+        (
+            (1300, 547, 2048, 963, 271, 3063),
+            True,
+            10001,
+            "persistent-h96-mixed",
+            False,
+        ),
+        ((17, 33, 65), True, 11016, "cake_dispatcher", False),
+        ((17, 33, 65), True, 11016, "cake_dispatcher", True),
+        ((16,), False, 11017, "cake_dispatcher", False),
+        ((16,), True, 11018, "cake_dispatcher", False),
     ),
-    ids=("fixed-8192", "mixed"),
+    ids=(
+        "fixed-8192",
+        "mixed",
+        "irregular-cake",
+        "irregular-cake-alias",
+        "fixed-t16-cake",
+        "packed-n1-t16-cake",
+    ),
 )
 def test_flashkda_evolution_h96_matches_public_backend(
-    seq_lens, seed, expected_variant
+    seq_lens, packed, seed, expected_variant, alias_state
 ):
     from flashinfer.kda import recurrent_kda
     from flashinfer.kda_prefill import _select_flash_kda_prefill_target
@@ -168,9 +229,7 @@ def test_flashkda_evolution_h96_matches_public_backend(
     for seq_len in seq_lens:
         offsets.append(offsets[-1] + seq_len)
     cu_seqlens = (
-        torch.tensor(offsets, dtype=torch.int64, device=device)
-        if len(seq_lens) > 1
-        else None
+        torch.tensor(offsets, dtype=torch.int64, device=device) if packed else None
     )
 
     expected_initial = initial.clone()
@@ -193,7 +252,8 @@ def test_flashkda_evolution_h96_matches_public_backend(
     )
 
     actual_out = torch.empty_like(q)
-    actual_state = torch.empty_like(initial)
+    actual_state = initial if alias_state else torch.empty_like(initial)
+    actual_initial_before = initial.clone()
     prepared = prepare_flash_kda_evolution(
         q,
         k,
@@ -219,9 +279,14 @@ def test_flashkda_evolution_h96_matches_public_backend(
         }[multiprocessor_count]
     assert prepared.variant == expected_variant
     assert prepared.target == _select_flash_kda_prefill_target(device)
+    assert prepared.route == (
+        "cake" if expected_variant == "cake_dispatcher" else "evolution"
+    )
     prepared.launch()
     torch.cuda.synchronize(device)
 
+    if not alias_state:
+        torch.testing.assert_close(initial, actual_initial_before, atol=0, rtol=0)
     torch.testing.assert_close(actual_out, expected_out, atol=1e-2, rtol=1e-2)
     assert expected_state is not None
     torch.testing.assert_close(actual_state, expected_state, atol=1e-2, rtol=1e-2)

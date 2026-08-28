@@ -45,6 +45,11 @@ FlashKDAVariant = Literal[
     "bt16_chain_m64_s8",
     "bt16_chain_m64_s9",
     "bt16_prepare_chain_m64_s8",
+    "bt16_prepare_o1",
+    "bt16_chain_m64_s7_o1",
+    "bt16_chain_m64_s8_o1",
+    "bt16_chain_m64_s9_o1",
+    "bt16_prepare_chain_m64_s8_o1",
 ]
 FlashKDATarget = Literal["sm100a", "sm100f"]
 
@@ -66,6 +71,11 @@ FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "bt16_chain_m64_s8",
     "bt16_chain_m64_s9",
     "bt16_prepare_chain_m64_s8",
+    "bt16_prepare_o1",
+    "bt16_chain_m64_s7_o1",
+    "bt16_chain_m64_s8_o1",
+    "bt16_chain_m64_s9_o1",
+    "bt16_prepare_chain_m64_s8_o1",
 )
 
 _FLASH_KDA_NVCC_FLAGS = {
@@ -86,13 +96,13 @@ _FLASH_KDA_MODULE_IDENTS = {
     "m128_tensor_state_decay": "92038073bd",
     "m128_h12_short": "598898446d",
     "m128_h12_long": "c5dc8b654c",
-    "m128_n16": "5cb1e5787e",
+    "m128_n16": "5dcb869fcf",
     # Generated body, binding, and shared binding header, separated by NUL
     # bytes without a trailing separator. Keep this route's cache key tied to
     # all compiled content.
     "m128_n16_checkpoint": "0d6dd01307",
-    "m128_n16_short": "969b84e4af",
-    "persistent_m128": "4ba4413032",
+    "m128_n16_short": "90aa86417c",
+    "persistent_m128": "cc0d237f88",
     "piece_persistent_m128": "02ba51c49a",
     "small_bh_m128": "7364f93860",
     "bt16_prepare": "2c6cc4c1f6",
@@ -127,6 +137,14 @@ _FLASH_KDA_VARIANT_DEFINES = {
     "m128_tensor_state_decay": "-DFLASHINFER_FLASH_KDA_TENSOR_STATE_DECAY=1",
     "m128_h12_short": "-DFLASHINFER_FLASH_KDA_H12_SHORT=1",
     "m128_h12_long": "-DFLASHINFER_FLASH_KDA_H12_LONG=1",
+}
+
+_FLASH_KDA_O1_BASE_VARIANTS: dict[FlashKDAVariant, FlashKDAVariant] = {
+    "bt16_prepare_o1": "bt16_prepare",
+    "bt16_chain_m64_s7_o1": "bt16_chain_m64_s7",
+    "bt16_chain_m64_s8_o1": "bt16_chain_m64_s8",
+    "bt16_chain_m64_s9_o1": "bt16_chain_m64_s9",
+    "bt16_prepare_chain_m64_s8_o1": "bt16_prepare_chain_m64_s8",
 }
 
 
@@ -170,7 +188,8 @@ def get_flash_kda_uri(variant: FlashKDAVariant, target: FlashKDATarget) -> str:
         raise ValueError(f"unsupported FlashKDA variant: {variant}")
     if target not in _FLASH_KDA_NVCC_FLAGS:
         raise ValueError(f"unsupported FlashKDA target: {target}")
-    module_ident = _FLASH_KDA_MODULE_IDENTS[variant]
+    base_variant = _FLASH_KDA_O1_BASE_VARIANTS.get(variant, variant)
+    module_ident = _FLASH_KDA_MODULE_IDENTS[base_variant]
     return f"flash_kda_bf16_{variant}_{module_ident}_{target}"
 
 
@@ -188,14 +207,17 @@ def gen_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget) -> Ji
     csrc_dir = _get_flash_kda_csrc_dir()
     include_dir = _get_flash_kda_include_dir()
     uri = get_flash_kda_uri(variant, target)
-    if variant == "bt16_prepare_chain_m64_s8":
+    base_variant = _FLASH_KDA_O1_BASE_VARIANTS.get(variant, variant)
+    if base_variant == "bt16_prepare_chain_m64_s8":
         sources = [
             csrc_dir / "cake_flashkda_bf16_bt16_prepare_binding.cu",
             csrc_dir / "cake_flashkda_bf16_bt16_chain_m64_binding.cu",
             csrc_dir / "cake_flashkda_bf16_bt16_prepare_chain_m64_binding.cu",
         ]
     else:
-        sources = [csrc_dir / f"{_FLASH_KDA_BINDING_STEMS[variant]}_binding.cu"]
+        sources = [
+            csrc_dir / f"{_FLASH_KDA_BINDING_STEMS[base_variant]}_binding.cu"
+        ]
     missing_sources = [source for source in sources if not source.exists()]
     if missing_sources:
         raise FileNotFoundError(
@@ -206,16 +228,21 @@ def gen_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget) -> Ji
         name=uri,
         sources=sources,
         extra_cuda_cflags=[
+            *(
+                ["--ptxas-options=-O1"]
+                if variant in _FLASH_KDA_O1_BASE_VARIANTS
+                else []
+            ),
             *_FLASH_KDA_NVCC_FLAGS[target],
             _FLASH_KDA_TARGET_DEFINE[target],
             *(
-                [_FLASH_KDA_VARIANT_DEFINES[variant]]
-                if variant in _FLASH_KDA_VARIANT_DEFINES
+                [_FLASH_KDA_VARIANT_DEFINES[base_variant]]
+                if base_variant in _FLASH_KDA_VARIANT_DEFINES
                 else []
             ),
             *(
                 ["-DFLASHINFER_FLASH_KDA_COMBINED_BT16=1"]
-                if variant == "bt16_prepare_chain_m64_s8"
+                if base_variant == "bt16_prepare_chain_m64_s8"
                 else []
             ),
         ],

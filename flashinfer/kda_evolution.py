@@ -27,11 +27,45 @@ from .jit.flash_kda_evolution import (
     FlashKDAEvolutionVariant,
     load_flash_kda_evolution_module,
 )
-from .kda_prefill import _select_flash_kda_prefill_target
+from .kda_prefill import _run_flash_kda_prefill, _select_flash_kda_prefill_target
 
 _HEAD_DIM = 128
 _PERSISTENT_SCALAR_CTAS = 152
 _DESCRIPTOR_STORAGE_BYTES = 6 * 128
+
+# These are the generated schedules that beat the public Cake dispatcher on
+# every measured SM100-family SKU (B200, B300, GB200, and GB300).  Keep the
+# manifest shape-exact: nearby shapes retain Cake's production dispatcher
+# rather than inheriting a benchmark result they did not measure.
+_EVOLUTION_WINNER_SHAPES = frozenset(
+    {
+        (False, 32, (1300, 547, 2048, 963, 271, 3063)),
+        (True, 64, (8192,)),
+        (False, 64, (1300, 547, 2048, 963, 271, 3063)),
+        (False, 64, (1024,) * 8),
+        (True, 96, (37,)),
+        (True, 96, (97,)),
+        (True, 96, (8192,)),
+        (False, 96, (64, 128, 256)),
+        (False, 96, (1300, 547, 2048, 963, 271, 3063)),
+        (False, 96, (1024,) * 8),
+        (False, 96, (1024,) * 16),
+        (False, 96, (1024,) * 32),
+        (False, 96, (1024,) * 64),
+        (False, 96, (1024,) * 128),
+        (False, 96, (1024,) * 256),
+    }
+)
+
+
+def _use_evolution_route(
+    sequence_lengths: tuple[int, ...],
+    num_heads: int,
+    fixed_layout: bool,
+) -> bool:
+    """Whether this measured shape should use its generated specialization."""
+
+    return (fixed_layout, num_heads, sequence_lengths) in _EVOLUTION_WINNER_SHAPES
 
 
 def _build_persistent_scalar_schedule(
@@ -262,7 +296,12 @@ def _route(
 
 
 class PreparedFlashKDAEvolution:
-    """Prepared launch of one generated Blackwell recurrent-KDA specialization."""
+    """Prepared launch of the measured-best Blackwell recurrent-KDA route.
+
+    Stable generated winners retain their exported specialization. Other
+    shapes use the production Cake dispatcher while preserving this adapter's
+    independent initial-state and final-state buffers.
+    """
 
     def __init__(
         self,
@@ -298,6 +337,38 @@ class PreparedFlashKDAEvolution:
         sequence_lengths = tuple(
             end - start for start, end in zip(offsets, offsets[1:], strict=False)
         )
+        target = _select_flash_kda_prefill_target(q.device)
+        if not _use_evolution_route(sequence_lengths, num_heads, fixed_layout):
+            self.module = None
+            self.variant = "cake_dispatcher"
+            self.target = target
+            self.grid_x = None
+            self.route = "cake"
+            self._cake_args = dict(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                scale=scale,
+                initial_state=initial_state,
+                output_final_state=True,
+                lower_bound=lower_bound,
+                cu_seqlens=None if fixed_layout else cu_seqlens,
+                output=output,
+                seq_order=None,
+                prefill_workspace=None,
+                state_indices=None,
+                state_checkpoints=None,
+                checkpoint_cu_starts=None,
+                checkpoint_every_n_tokens=0,
+                backend="cake",
+                final_state=final_state,
+            )
+            return
+
         route = _route(sequence_lengths, num_heads, fixed_layout, q.device)
         seq_order = torch.tensor(
             sorted(
@@ -319,11 +390,11 @@ class PreparedFlashKDAEvolution:
                 device=beta.device,
             )
 
-        target = _select_flash_kda_prefill_target(q.device)
         self.module = load_flash_kda_evolution_module(route.variant, target)
         self.variant = route.variant
         self.target = target
         self.grid_x = route.grid_x
+        self.route = "evolution"
         self._prepare_descriptors = True
         self._args = (
             q.reshape(total_tokens, num_heads, _HEAD_DIM),
@@ -357,6 +428,9 @@ class PreparedFlashKDAEvolution:
         )
 
     def launch(self) -> None:
+        if self.route == "cake":
+            _run_flash_kda_prefill(**self._cake_args)
+            return
         stream_ptr = int(torch.cuda.current_stream().cuda_stream)
         self.module.run(
             *self._args,
@@ -383,7 +457,7 @@ def prepare_flash_kda_evolution(
     lower_bound: float = -5.0,
     cu_seqlens: torch.Tensor | None = None,
 ) -> PreparedFlashKDAEvolution:
-    """Prepare one supported generated specialization for repeated launch."""
+    """Prepare the measured-best generated or production route for launch."""
     return PreparedFlashKDAEvolution(
         q,
         k,

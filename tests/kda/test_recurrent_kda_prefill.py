@@ -883,7 +883,7 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
     for compute_capability, sm_count, expected in (
         ((10, 0), 148, True),
         ((10, 0), 152, True),
-        ((10, 3), 148, False),
+        ((10, 3), 148, True),
         ((10, 3), 152, False),
     ):
         assert (
@@ -933,6 +933,20 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
     )
     assert large_sm_count_mixed is not None
     assert len(large_sm_count_mixed[2]) == 153
+    short_irregular_148 = kda_prefill_api._persistent_task_plan(
+        (17, 33, 65),
+        num_heads=96,
+        sm_count=148,
+    )
+    assert short_irregular_148 is not None
+    assert len(short_irregular_148[2]) == 145
+    short_irregular_152 = kda_prefill_api._persistent_task_plan(
+        (17, 33, 65),
+        num_heads=96,
+        sm_count=152,
+    )
+    assert short_irregular_152 is not None
+    assert len(short_irregular_152[2]) == 153
     assert (
         kda_prefill_api._persistent_task_plan(
             (3063, 2048, 1300, 963, 547, 271),
@@ -949,6 +963,32 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
         )
         is None
     )
+
+
+def test_gb300_irregular_persistent_policy_is_shape_exact():
+    exact = dict(
+        compute_capability=(10, 3),
+        sm_count=152,
+        fixed_layout=False,
+        sequence_lengths=(17, 33, 65),
+        num_heads=96,
+    )
+    assert kda_prefill_api._uses_measured_gb300_irregular_persistent_policy(
+        **exact
+    )
+    for field, value in (
+        ("compute_capability", (10, 0)),
+        ("sm_count", 148),
+        ("fixed_layout", True),
+        ("sequence_lengths", (17, 33, 64)),
+        ("sequence_lengths", (17, 33, 65, 65)),
+        ("num_heads", 64),
+    ):
+        nearby = dict(exact)
+        nearby[field] = value
+        assert not kda_prefill_api._uses_measured_gb300_irregular_persistent_policy(
+            **nearby
+        )
 
 
 @pytest.mark.parametrize(
@@ -1294,6 +1334,102 @@ def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
         max_sequence_length=3072,
     ) == ("bt16_prepare", "bt16_chain_m64_s7", False)
 
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 0),
+        sm_count=148,
+        fixed_layout=True,
+        num_sequences=1,
+        num_heads=4,
+        max_sequence_length=65_536,
+    ) == ("bt16_prepare_o1", "bt16_chain_m64_s8_o1", False)
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 0),
+        sm_count=148,
+        fixed_layout=True,
+        num_sequences=1,
+        num_heads=1,
+        max_sequence_length=1_048_576,
+    ) == ("bt16_prepare_o1", "bt16_chain_m64_s9_o1", False)
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 0),
+        sm_count=152,
+        fixed_layout=True,
+        num_sequences=1,
+        num_heads=4,
+        max_sequence_length=65_536,
+    ) == ("bt16_prepare_o1", "bt16_chain_m64_s8_o1", False)
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 3),
+        sm_count=148,
+        fixed_layout=False,
+        num_sequences=2,
+        num_heads=1,
+        max_sequence_length=524_288,
+    ) == ("bt16_prepare_o1", "bt16_chain_m64_s8_o1", False)
+
+
+@pytest.mark.parametrize(
+    "compute_capability,fixed_layout,num_sequences,num_heads,max_sequence_length,stage",
+    [
+        ((10, 0), True, 1, 32, 8_192, 8),
+        ((10, 0), True, 1, 16, 16_384, 8),
+        ((10, 0), True, 1, 16, 32_768, 8),
+        ((10, 0), True, 1, 16, 65_536, 8),
+        ((10, 0), True, 1, 8, 65_536, 8),
+        ((10, 0), True, 1, 4, 65_536, 8),
+        ((10, 0), True, 1, 1, 1_048_576, 9),
+        ((10, 0), True, 1, 1, 131_072, 8),
+        ((10, 0), False, 1, 1, 131_072, 8),
+        ((10, 0), False, 2, 1, 524_288, 9),
+        ((10, 3), True, 1, 32, 8_192, 8),
+        ((10, 3), True, 1, 16, 16_384, 8),
+        ((10, 3), True, 1, 16, 32_768, 8),
+        ((10, 3), True, 1, 16, 65_536, 8),
+        ((10, 3), True, 1, 8, 65_536, 8),
+        ((10, 3), True, 1, 4, 65_536, 8),
+        ((10, 3), True, 1, 1, 1_048_576, 9),
+        ((10, 3), True, 1, 1, 131_072, 8),
+        ((10, 3), False, 1, 1, 131_072, 8),
+        ((10, 3), False, 2, 1, 524_288, 8),
+    ],
+)
+def test_bt16_o1_152_sm_routes_only_measured_shapes(
+    compute_capability,
+    fixed_layout,
+    num_sequences,
+    num_heads,
+    max_sequence_length,
+    stage,
+):
+    def select(*, sm_count, sequence_length):
+        return kda_prefill_api._select_bt16_physical_variants(
+            compute_capability=compute_capability,
+            sm_count=sm_count,
+            fixed_layout=fixed_layout,
+            num_sequences=num_sequences,
+            num_heads=num_heads,
+            max_sequence_length=sequence_length,
+        )
+
+    assert select(sm_count=152, sequence_length=max_sequence_length) == (
+        "bt16_prepare_o1",
+        f"bt16_chain_m64_s{stage}_o1",
+        False,
+    )
+    for neighboring_sm_count in (151, 153):
+        prepare, chain, _ = select(
+            sm_count=neighboring_sm_count,
+            sequence_length=max_sequence_length,
+        )
+        assert "_o1" not in prepare
+        assert "_o1" not in chain
+    prepare, chain, _ = select(
+        sm_count=152,
+        sequence_length=max_sequence_length + 1,
+    )
+    assert "_o1" not in prepare
+    assert "_o1" not in chain
+
 
 def test_bt16_two_stage_adapter_reuses_descriptors_across_state_rotations(monkeypatch):
     prepare_module = _RecorderModule()
@@ -1629,6 +1765,7 @@ def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
     [
         (False, 64, "m128_n16_short"),
         (True, 64, "m128_n16_short"),
+        (True, 4, "m128_n16_short"),
         (True, 2, "m128_n16_short"),
         (False, 12, "m128_n16"),
     ],
@@ -1686,7 +1823,9 @@ def test_frozen_route_and_ffi_abi(
     assert set(modules) == {expected_variant}
     assert routes == [(expected_variant, expected_target)]
     (args,) = modules[expected_variant].calls
-    expected_arg_count = 21 if expected_variant == "m64" else 28
+    expected_arg_count = (
+        29 if expected_variant in ("m128_n16", "m128_n16_short") else 28
+    )
     assert len(args) == expected_arg_count
     assert args[0].data_ptr() == inputs["q"].data_ptr()
     assert args[4].data_ptr() == inputs["beta"].data_ptr()
@@ -1726,6 +1865,7 @@ def test_frozen_route_and_ffi_abi(
         assert math.isclose(args[25], 128**-0.5)
         assert args[26] == -5.0
         assert args[27] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
+        assert args[28] == int(packed and num_heads == 4)
     if num_heads % 8 != 0:
         assert args[5].data_ptr() != inputs["beta"].data_ptr()
 
@@ -1881,6 +2021,46 @@ def test_pair_packed_h12_beta_requires_an_even_dense_carrier(cuda_device):
     assert paired.data_ptr() == dense.data_ptr()
     odd = torch.empty((1, 129, 12), dtype=torch.bfloat16, device=cuda_device)
     assert kda_prefill_api._pair_packed_beta_tma_source(odd) is None
+
+
+def test_short_h4_beta_prepack_caches_and_invalidates_on_mutation():
+    beta = torch.arange(60, dtype=torch.bfloat16).view(1, 15, 4)
+    beta_tma = torch.full((16, 8), -1, dtype=torch.bfloat16)
+    workspace = SimpleNamespace(
+        _beta_padding_source_tensor=None,
+        _beta_padding_source_signature=None,
+    )
+
+    assert kda_prefill_api._prepack_stable_short_h4_beta(
+        beta, beta_tma, workspace, capturing=False
+    )
+    torch.testing.assert_close(beta_tma[:15, :4], beta[0], atol=0, rtol=0)
+    assert torch.count_nonzero(beta_tma[:, 4:]) == 0
+    assert torch.count_nonzero(beta_tma[15]) == 0
+
+    # An unchanged input reuses the prepared carrier without another device copy.
+    beta_tma[0, 0] = -7
+    assert kda_prefill_api._prepack_stable_short_h4_beta(
+        beta, beta_tma, workspace, capturing=False
+    )
+    assert beta_tma[0, 0] == -7
+
+    # A distinct tensor object cannot reuse the cache receipt, even when it
+    # aliases the same storage and therefore has an identical pointer/version.
+    detached = beta.detach()
+    assert kda_prefill_api._prepack_stable_short_h4_beta(
+        detached, beta_tma, workspace, capturing=False
+    )
+    assert beta_tma[0, 0] == beta[0, 0, 0]
+
+    beta.add_(1)
+    assert kda_prefill_api._prepack_stable_short_h4_beta(
+        beta, beta_tma, workspace, capturing=False
+    )
+    torch.testing.assert_close(beta_tma[:15, :4], beta[0], atol=0, rtol=0)
+    assert not kda_prefill_api._prepack_stable_short_h4_beta(
+        beta, beta_tma, workspace, capturing=True
+    )
 
 
 @pytest.mark.parametrize(
@@ -2070,6 +2250,73 @@ def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
     assert args[15].shape == (768,)
     assert args[16] == 1
     assert args[17] == 96
+
+
+def test_gb300_irregular_prefill_reaches_persistent_worker_abi(
+    cuda_device,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: (10, 3),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_is_cuda_version_at_least",
+        lambda version: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_device_sm_count",
+        lambda device: 152,
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(
+        seq_lens=[17, 33, 65],
+        num_heads=96,
+        packed=True,
+        initial_state=True,
+    )
+    output, state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        backend="cake",
+    )
+
+    assert output.shape == inputs["q"].shape
+    assert state is None
+    assert routes == [("persistent_m128", "sm100f")]
+    (args,) = module.calls
+    assert len(args) == 23
+    assert args[9].tolist() == [2, 1, 0]
+    assert sorted(args[10].tolist()) == list(range(3 * 96))
+    assert args[11].numel() == 153
+    assert args[11][0].item() == 0
+    assert args[11][-1].item() == 3 * 96
+    assert args[16] == 1
+    assert args[17] == 96
+
+    nearby = _make_inputs(
+        seq_lens=[17, 33, 64],
+        num_heads=96,
+        packed=True,
+        initial_state=True,
+    )
+    recurrent_kda(
+        **_strict_prefill_kwargs(nearby),
+        output=torch.empty_like(nearby["q"]),
+        backend="cake",
+    )
+    assert routes[-1] == ("m128", "sm100f")
 
 
 def test_uniform_piece_prefill_reaches_extended_worker_abi(

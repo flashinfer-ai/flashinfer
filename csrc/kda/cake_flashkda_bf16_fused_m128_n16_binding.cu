@@ -80,8 +80,10 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
                 int64_t prepare_descriptors, int64_t num_heads, int64_t beta_token_stride,
                 int64_t state_slot_stride, int64_t use_state_indices, int64_t use_initial_state,
                 int64_t store_final_state, int64_t checkpoint_every_n_tokens, double scale,
-                double lower_bound, int64_t cuda_stream) {
+                double lower_bound, int64_t cuda_stream, int64_t beta_tma_prepacked) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
+  TVM_FFI_ICHECK(beta_tma_prepacked == 0 || beta_tma_prepacked == 1)
+      << "beta_tma_prepacked must be 0 or 1";
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
@@ -119,7 +121,9 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
   const TmaPointers tma = EncodeTmaPointers<128, 16>(q, k, v, g, beta_tma, out, descriptor_storage,
                                                      prepare_descriptors, stream);
-  PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta_token_stride, stream);
+  if (!beta_tma_prepacked) {
+    PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta_token_stride, stream);
+  }
 
   kernel_flashkda_bf16_fused_m128<<<grid, block, kSmemBytes, stream>>>(
       reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
