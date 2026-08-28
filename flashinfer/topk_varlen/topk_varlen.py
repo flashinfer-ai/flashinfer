@@ -41,8 +41,12 @@ Backend choices
                        Datacentre Blackwell-class (sm_100/103/107) only;
                        requires nvidia-cutlass-dsl >= 4.8 (see below);
                        opt-in — never chosen by ``"auto"``.
-``"auto"``           — GVR (if pre_idx provided) > gvr_2 > radix (Blackwell) >
-                       radix_cutlass (default).
+``"auto"``           — shape/dtype-aware ranking that tracks the measured
+                       per-config winner (see ``_top_k_varlen_heuristic``):
+                       gvr_2 for hinted fp32; gvr only for large hinted
+                       batches of long rows; radix otherwise, with
+                       radix_cutlass preferred in its fp32 big-batch/long-row
+                       corner and as the universal fallback.
 """
 
 import functools
@@ -266,15 +270,33 @@ def _top_k_varlen_heuristic(
     load_balance: bool = True,
     workspace=None,
 ):
-    """GVR (needs pre_idx) > gvr_2 > radix (CuTe DSL, Blackwell) > radix_cutlass.
+    """Shape/dtype-aware ranking so auto tracks the measured per-config winner.
 
-    gvr_2 sits behind gvr until the perf comparison between the two settles the
-    default; since gvr supports a superset of gvr_2's dtypes, auto currently
-    only reaches gvr_2 when gvr is unsuitable.
+    Grounded in a 500+-cell B200 sweep (uniform/mixed/short lengths,
+    K in {512, 1024, 2048}, B in [1, 256], N in [1K, 128K], fp32/bf16/fp16,
+    cr in {1, 4}, next_n in {1, 2}; see PR #4811). Decision rules, using only
+    capture-stable host facts (dtype, logits width N, request count B):
+
+    1. fp32 + pre_idx: gvr_2 first — it won 211/213 measured cells (geomean
+       2.1-3.8x over every other backend) and ~1.00x vs its TRT-LLM origin.
+    2. gvr vs radix (when a hint is given but gvr_2 is unsuitable, and for
+       every bf16/fp16 hinted call): gvr only pays off when the batch is
+       large AND rows are long — B*N >= 2^22 (fp32) / 2^23 (bf16/fp16).
+       Below that radix wins by up to 2.8x; above it gvr wins by 1.03-1.76x.
+    3. radix vs radix_cutlass: the masked-CUTLASS fallback only wins the
+       fp32 big corner (N >= 65536 AND B*N >= 2^23, by up to 2.8x); radix
+       wins everywhere else, and always wins for bf16/fp16 (1.2-3.2x).
+
+    Known static blind spot: batches whose rows are mostly FAR shorter than
+    N (detectable only by reading seq_lens contents — a D2H sync auto must
+    not pay) favor radix over gvr_2 at large N; callers in that regime
+    should pass backend="radix" explicitly.
 
     The full signature must be spelled out (not **kwargs) so that the decorator can
     call this function with positional args on the skip_check=True path without
     raising TypeError.  Mirrors the pattern used by _heuristic_func_mm_fp4.
+    Tolerates logits/seq_lens=None (hardware-independent unit tests) by
+    falling back to a static order.
     """
     # "radix_filter" is deliberately absent: its checker accepts a strict
     # subset of radix's configurations and its CC list is a subset of
@@ -285,9 +307,31 @@ def _top_k_varlen_heuristic(
     # roughly N >= 64K with enough rows on SM100, wider on SM107); until
     # that rule exists it is explicit-only, as documented in the module
     # docstring.
-    return [
-        b for b in ("gvr", "gvr_2", "radix", "radix_cutlass") if b in suitable_backends
-    ]
+    if logits is None or seq_lens is None or logits.dim() != 2 or seq_lens.dim() != 1:
+        # None / malformed tensors: static fallback order. Malformed shapes
+        # must fall through so the API's own validation asserts fire (the
+        # heuristic must never be the thing that rejects bad input).
+        order = ["gvr_2", "gvr", "radix", "radix_cutlass"]
+        return [b for b in order if b in suitable_backends]
+
+    fp32 = logits.dtype == torch.float32
+    n_cols = logits.shape[1]
+    batch = seq_lens.shape[0]
+    elems = batch * n_cols
+    gvr_first = elems >= ((1 << 22) if fp32 else (1 << 23))
+    cutlass_first = fp32 and n_cols >= 65536 and elems >= (1 << 23)
+
+    order = ["gvr_2"]
+    if gvr_first:
+        order.append("gvr")
+    if cutlass_first:
+        order += ["radix_cutlass", "radix"]
+    else:
+        order += ["radix", "radix_cutlass"]
+    if "gvr" not in order:
+        # small-problem fallback rank: radix > gvr > radix_cutlass
+        order.insert(order.index("radix") + 1, "gvr")
+    return [b for b in order if b in suitable_backends]
 
 
 # ---------------------------------------------------------------------------
@@ -1364,11 +1408,24 @@ def top_k_varlen(
                               exactness) and fp32 logits;
                               ``top_k`` in {512, 1024, 2048}. ``load_balance``
                               is ignored (the kernel families load-balance
-                              internally).
+                              internally). Upstream caveat (reproduced
+                              bit-identically by the TRT-LLM implementation):
+                              literal ``+inf`` logits may not be selected;
+                              all finite values and ``-inf`` are tie-aware
+                              exact, and NaN ordering is
+                              implementation-specific.
         ``"radix_cutlass"`` — Masked CUTLASS radix top-K (all GPUs, no
                               ``pre_idx`` needed).
-        ``"auto"``          — GVR (if ``pre_idx`` supplied) > gvr_2 > radix
-                              (Blackwell) > radix_cutlass.
+        ``"auto"``          — shape/dtype-aware selection tracking the
+                              measured per-config winner: gvr_2 for hinted
+                              fp32; gvr only when ``batch * max_seq_len`` is
+                              large (>= 2^22 fp32 / 2^23 half precision);
+                              radix otherwise, with radix_cutlass preferred
+                              in its fp32 big-batch/long-row corner. Batches
+                              whose rows are mostly far shorter than
+                              ``max_seq_len`` are a known blind spot (auto
+                              cannot read ``seq_lens`` without a sync);
+                              prefer ``backend="radix"`` there.
     load_balance : bool, optional
         Selects the GVR kernel path (ignored by the radix backend).  Default
         ``True``.

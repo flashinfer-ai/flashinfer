@@ -59,7 +59,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--batch-sizes", type=str, default="1,4,16,32,64,128,256")
     p.add_argument("--n-vals", type=str, default="4096,8192,16384,32768,65536,131072")
-    p.add_argument("--top-k", type=int, default=1024, choices=[512, 1024, 2048])
+    p.add_argument("--top-k", type=int, default=1024)
     p.add_argument(
         "--scenarios",
         type=str,
@@ -69,6 +69,14 @@ def parse_args():
     )
     p.add_argument("--next-n", type=int, default=1)
     p.add_argument("--compress-ratio", type=int, default=1, choices=[1, 4])
+    p.add_argument(
+        "--dtype",
+        type=str,
+        default="fp32",
+        choices=["fp32", "bf16", "fp16"],
+        help="logits dtype; gvr_2/trtllm_gvr2 are fp32-only and are dropped "
+        "for bf16/fp16",
+    )
     p.add_argument("--hint-quality", type=float, default=0.6)
     p.add_argument("--oracle", action="store_true", help="perfect pre_idx hints")
     p.add_argument(
@@ -84,11 +92,13 @@ def parse_args():
     return p.parse_args()
 
 
-def make_inputs(scenario, batch, N, K, nn, cr, hint_quality, oracle, seed):
-    """fp32 logits [batch*nn, N] (compressed space), uncompressed seq_lens."""
+def make_inputs(scenario, batch, N, K, nn, cr, hint_quality, oracle, seed, dtype):
+    """Logits [batch*nn, N] (compressed space), uncompressed seq_lens."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     rows = batch * nn
-    logits = torch.randn(rows, N, generator=gen, device="cuda", dtype=torch.float32)
+    logits = torch.randn(rows, N, generator=gen, device="cuda", dtype=torch.float32).to(
+        dtype
+    )
     if scenario == "uniform":
         seq_lens = torch.full((batch,), N * cr, dtype=torch.int32, device="cuda")
     elif scenario == "mixed":
@@ -265,6 +275,16 @@ def main():
     scenarios = args.scenarios.split(",")
     backends = args.backends.split(",")
     K, nn, cr = args.top_k, args.next_n, args.compress_ratio
+    dtype = {
+        "fp32": torch.float32,
+        "bf16": torch.bfloat16,
+        "fp16": torch.float16,
+    }[args.dtype]
+    if args.dtype != "fp32":
+        dropped = [b for b in backends if b in ("fi_gvr2", "trtllm_gvr2")]
+        if dropped:
+            print(f"[WARN] {dropped} are fp32-only; dropping for {args.dtype}")
+            backends = [b for b in backends if b not in dropped]
 
     trt_host = None
     if "trtllm_gvr2" in backends:
@@ -281,7 +301,7 @@ def main():
 
     print(f"device: {torch.cuda.get_device_name(0)}")
     print(
-        f"top_k={K} next_n={nn} cr={cr} hint_quality="
+        f"dtype={args.dtype} top_k={K} next_n={nn} cr={cr} hint_quality="
         f"{'oracle' if args.oracle else args.hint_quality} "
         f"timing=cuda-graph median, repeat_ms={args.repeat_ms}"
     )
@@ -307,6 +327,7 @@ def main():
                     args.hint_quality,
                     args.oracle,
                     seed=args.seed + B * 7 + N // 64,
+                    dtype=dtype,
                 )
                 row = {}
                 for backend in backends:

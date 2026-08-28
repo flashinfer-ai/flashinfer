@@ -1199,31 +1199,70 @@ def test_cuda_graph_gvr(load_balance):
 
 
 def test_backend_heuristic_priority():
-    """Auto-selection priority is gvr > gvr_2 > radix (CuTe DSL) > radix_cutlass.
+    """Auto-selection is shape/dtype-aware and tracks the measured winners.
 
-    Hardware-independent: exercises the heuristic directly so a regression in
-    the backend ordering (e.g. from a future rename) is caught even off-GPU.
+    Hardware-independent: exercises the heuristic directly with meta tensors
+    (only .dtype/.shape are read) so a regression in the decision rules is
+    caught even off-GPU. The boundaries are grounded in the B200 sweep
+    documented on the heuristic itself.
     """
     from flashinfer.topk_varlen.topk_varlen import _top_k_varlen_heuristic
 
-    # The heuristic only uses suitable_backends; pass None for the tensor/scalar
-    # args required by the full signature (needed so skip_check=True works).
-    dummy = (None, None, None)
-    assert (
-        _top_k_varlen_heuristic(["gvr", "radix", "radix_cutlass"], *dummy)[0] == "gvr"
-    )
-    assert (
-        _top_k_varlen_heuristic(["gvr_2", "radix", "radix_cutlass"], *dummy)[0]
-        == "gvr_2"
-    )
-    assert _top_k_varlen_heuristic(["radix", "radix_cutlass"], *dummy)[0] == "radix"
-    assert _top_k_varlen_heuristic(["radix_cutlass"], *dummy)[0] == "radix_cutlass"
-    # order is preserved regardless of the suitable-set ordering
-    assert _top_k_varlen_heuristic(
-        ["radix_cutlass", "radix", "gvr_2", "gvr"], *dummy
-    ) == [
-        "gvr",
+    def order(suitable, dtype, batch, n_cols):
+        logits = torch.empty(batch, n_cols, dtype=dtype, device="meta")
+        seq_lens = torch.empty(batch, dtype=torch.int32, device="meta")
+        return _top_k_varlen_heuristic(suitable, logits, seq_lens, 1024)
+
+    all4 = ["radix_cutlass", "radix", "gvr_2", "gvr"]  # unordered on purpose
+
+    # fp32 + hint: gvr_2 always first; small problems rank radix over gvr.
+    assert order(all4, torch.float32, 1, 8192) == [
         "gvr_2",
+        "radix",
+        "gvr",
+        "radix_cutlass",
+    ]
+    # fp32 large batch x long rows: gvr ahead of radix; the fp32 big corner
+    # (N >= 64K and B*N >= 2^23) ranks radix_cutlass over radix.
+    assert order(all4, torch.float32, 256, 131072) == [
+        "gvr_2",
+        "gvr",
+        "radix_cutlass",
+        "radix",
+    ]
+    # B*N = 2^23 but N < 64K: gvr first, radix over radix_cutlass.
+    assert order(all4, torch.float32, 256, 32768) == [
+        "gvr_2",
+        "gvr",
+        "radix",
+        "radix_cutlass",
+    ]
+    # bf16 (gvr_2 never suitable): radix wins everywhere below B*N = 2^23...
+    assert order(["gvr", "radix", "radix_cutlass"], torch.bfloat16, 64, 65536) == [
+        "radix",
+        "gvr",
+        "radix_cutlass",
+    ]
+    # ...and gvr only above it; radix_cutlass never leads in half precision.
+    assert order(["gvr", "radix", "radix_cutlass"], torch.bfloat16, 256, 131072) == [
+        "gvr",
+        "radix",
+        "radix_cutlass",
+    ]
+    # no-hint fallbacks
+    assert order(["radix", "radix_cutlass"], torch.bfloat16, 256, 131072) == [
+        "radix",
+        "radix_cutlass",
+    ]
+    assert order(["radix", "radix_cutlass"], torch.float32, 256, 131072) == [
+        "radix_cutlass",
+        "radix",
+    ]
+    assert order(["radix_cutlass"], torch.float32, 1, 4096) == ["radix_cutlass"]
+    # None tensors (skip_check / doc examples): static fallback order.
+    assert _top_k_varlen_heuristic(all4, None, None, None) == [
+        "gvr_2",
+        "gvr",
         "radix",
         "radix_cutlass",
     ]
