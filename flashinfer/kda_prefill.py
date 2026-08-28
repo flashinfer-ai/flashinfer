@@ -85,51 +85,6 @@ _FLASH_KDA_ROUTE_M64 = "independent_dvsplit_m64"
 _FLASH_KDA_ROUTE_SMALL_BH_M128 = "small_bh_owner_helper_m128"
 _FLASH_KDA_ROUTE_BT16_M64 = "bt16_prepare_chain_m64"
 
-# Keep compiler tuning tied to the exact hardware and benchmark shapes that
-# measured it. Nearby production shapes retain the canonical physical modules.
-_FLASH_KDA_BT16_O1_STAGE_BY_SHAPE = {
-    ((10, 0), 148, True, 1, 32, 8_192): 8,
-    ((10, 0), 148, True, 1, 16, 16_384): 8,
-    ((10, 0), 148, True, 1, 16, 32_768): 8,
-    ((10, 0), 148, True, 1, 16, 65_536): 8,
-    ((10, 0), 148, True, 1, 8, 65_536): 8,
-    ((10, 0), 148, True, 1, 4, 65_536): 8,
-    ((10, 0), 148, True, 1, 1, 1_048_576): 9,
-    ((10, 0), 148, True, 1, 1, 131_072): 8,
-    ((10, 0), 148, False, 1, 1, 131_072): 8,
-    ((10, 0), 148, False, 2, 1, 524_288): 9,
-    ((10, 3), 148, True, 1, 32, 8_192): 8,
-    ((10, 3), 148, True, 1, 16, 16_384): 8,
-    ((10, 3), 148, True, 1, 16, 32_768): 8,
-    ((10, 3), 148, True, 1, 16, 65_536): 8,
-    ((10, 3), 148, True, 1, 8, 65_536): 8,
-    ((10, 3), 148, True, 1, 4, 65_536): 8,
-    ((10, 3), 148, True, 1, 1, 1_048_576): 9,
-    ((10, 3), 148, True, 1, 1, 131_072): 8,
-    ((10, 3), 148, False, 1, 1, 131_072): 8,
-    ((10, 3), 148, False, 2, 1, 524_288): 8,
-    ((10, 0), 152, True, 1, 32, 8_192): 8,
-    ((10, 0), 152, True, 1, 16, 16_384): 8,
-    ((10, 0), 152, True, 1, 16, 32_768): 8,
-    ((10, 0), 152, True, 1, 16, 65_536): 8,
-    ((10, 0), 152, True, 1, 8, 65_536): 8,
-    ((10, 0), 152, True, 1, 4, 65_536): 8,
-    ((10, 0), 152, True, 1, 1, 1_048_576): 9,
-    ((10, 0), 152, True, 1, 1, 131_072): 8,
-    ((10, 0), 152, False, 1, 1, 131_072): 8,
-    ((10, 0), 152, False, 2, 1, 524_288): 9,
-    ((10, 3), 152, True, 1, 32, 8_192): 8,
-    ((10, 3), 152, True, 1, 16, 16_384): 8,
-    ((10, 3), 152, True, 1, 16, 32_768): 8,
-    ((10, 3), 152, True, 1, 16, 65_536): 8,
-    ((10, 3), 152, True, 1, 8, 65_536): 8,
-    ((10, 3), 152, True, 1, 4, 65_536): 8,
-    ((10, 3), 152, True, 1, 1, 1_048_576): 9,
-    ((10, 3), 152, True, 1, 1, 131_072): 8,
-    ((10, 3), 152, False, 1, 1, 131_072): 8,
-    ((10, 3), 152, False, 2, 1, 524_288): 8,
-}
-
 # Physical contract for the frozen persistent-M128 schedule. The generated
 # launch reserves an additional aligned control prefix; the roofline uses the
 # schedule's data-pool footprint when resolving resident CTA count.
@@ -242,10 +197,6 @@ class _RecurrentKDAPrefillWorkspaceBase:
                 "bt16_chain_m64_s7",
                 "bt16_chain_m64_s8",
                 "bt16_chain_m64_s9",
-                "bt16_prepare_o1",
-                "bt16_chain_m64_s7_o1",
-                "bt16_chain_m64_s8_o1",
-                "bt16_chain_m64_s9_o1",
             )
         }
         self._descriptor_signatures: dict[str, tuple] = {}
@@ -844,22 +795,6 @@ def _select_bt16_physical_variants(
     num_heads: int,
     max_sequence_length: int,
 ) -> tuple["FlashKDAVariant", "FlashKDAVariant", bool]:
-    measured_o1_stage = _FLASH_KDA_BT16_O1_STAGE_BY_SHAPE.get(
-        (
-            compute_capability,
-            sm_count,
-            fixed_layout,
-            num_sequences,
-            num_heads,
-            max_sequence_length,
-        )
-    )
-    if measured_o1_stage is not None:
-        return (
-            "bt16_prepare_o1",
-            f"bt16_chain_m64_s{measured_o1_stage}_o1",
-            False,
-        )
     dense_wavefront = _should_use_bt16_dense_wavefront(
         compute_capability=compute_capability,
         sm_count=sm_count,
@@ -2218,11 +2153,6 @@ def _run_bt16_prepare_chain(
     combined_variant: Optional["FlashKDAVariant"] = None
     if prepare_variant == "bt16_prepare" and chain_variant == "bt16_chain_m64_s8":
         combined_variant = "bt16_prepare_chain_m64_s8"
-    elif (
-        prepare_variant == "bt16_prepare_o1"
-        and chain_variant == "bt16_chain_m64_s8_o1"
-    ):
-        combined_variant = "bt16_prepare_chain_m64_s8_o1"
     combined_module = (
         _get_flash_kda_prefill_module(combined_variant, target)
         if combined_variant is not None

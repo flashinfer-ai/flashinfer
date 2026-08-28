@@ -45,11 +45,6 @@ FlashKDAVariant = Literal[
     "bt16_chain_m64_s8",
     "bt16_chain_m64_s9",
     "bt16_prepare_chain_m64_s8",
-    "bt16_prepare_o1",
-    "bt16_chain_m64_s7_o1",
-    "bt16_chain_m64_s8_o1",
-    "bt16_chain_m64_s9_o1",
-    "bt16_prepare_chain_m64_s8_o1",
 ]
 FlashKDATarget = Literal["sm100a", "sm100f"]
 
@@ -71,11 +66,6 @@ FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "bt16_chain_m64_s8",
     "bt16_chain_m64_s9",
     "bt16_prepare_chain_m64_s8",
-    "bt16_prepare_o1",
-    "bt16_chain_m64_s7_o1",
-    "bt16_chain_m64_s8_o1",
-    "bt16_chain_m64_s9_o1",
-    "bt16_prepare_chain_m64_s8_o1",
 )
 
 _FLASH_KDA_NVCC_FLAGS = {
@@ -139,15 +129,6 @@ _FLASH_KDA_VARIANT_DEFINES = {
     "m128_h12_long": "-DFLASHINFER_FLASH_KDA_H12_LONG=1",
 }
 
-_FLASH_KDA_O1_BASE_VARIANTS: dict[FlashKDAVariant, FlashKDAVariant] = {
-    "bt16_prepare_o1": "bt16_prepare",
-    "bt16_chain_m64_s7_o1": "bt16_chain_m64_s7",
-    "bt16_chain_m64_s8_o1": "bt16_chain_m64_s8",
-    "bt16_chain_m64_s9_o1": "bt16_chain_m64_s9",
-    "bt16_prepare_chain_m64_s8_o1": "bt16_prepare_chain_m64_s8",
-}
-
-
 def _get_flash_kda_csrc_dir() -> Path:
     """Locate frozen FlashKDA sources in installed and source checkouts."""
 
@@ -188,8 +169,7 @@ def get_flash_kda_uri(variant: FlashKDAVariant, target: FlashKDATarget) -> str:
         raise ValueError(f"unsupported FlashKDA variant: {variant}")
     if target not in _FLASH_KDA_NVCC_FLAGS:
         raise ValueError(f"unsupported FlashKDA target: {target}")
-    base_variant = _FLASH_KDA_O1_BASE_VARIANTS.get(variant, variant)
-    module_ident = _FLASH_KDA_MODULE_IDENTS[base_variant]
+    module_ident = _FLASH_KDA_MODULE_IDENTS[variant]
     return f"flash_kda_bf16_{variant}_{module_ident}_{target}"
 
 
@@ -207,8 +187,7 @@ def gen_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget) -> Ji
     csrc_dir = _get_flash_kda_csrc_dir()
     include_dir = _get_flash_kda_include_dir()
     uri = get_flash_kda_uri(variant, target)
-    base_variant = _FLASH_KDA_O1_BASE_VARIANTS.get(variant, variant)
-    if base_variant == "bt16_prepare_chain_m64_s8":
+    if variant == "bt16_prepare_chain_m64_s8":
         sources = [
             csrc_dir / "cake_flashkda_bf16_bt16_prepare_binding.cu",
             csrc_dir / "cake_flashkda_bf16_bt16_chain_m64_binding.cu",
@@ -216,7 +195,7 @@ def gen_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget) -> Ji
         ]
     else:
         sources = [
-            csrc_dir / f"{_FLASH_KDA_BINDING_STEMS[base_variant]}_binding.cu"
+            csrc_dir / f"{_FLASH_KDA_BINDING_STEMS[variant]}_binding.cu"
         ]
     missing_sources = [source for source in sources if not source.exists()]
     if missing_sources:
@@ -228,21 +207,16 @@ def gen_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget) -> Ji
         name=uri,
         sources=sources,
         extra_cuda_cflags=[
-            *(
-                ["--ptxas-options=-O1"]
-                if variant in _FLASH_KDA_O1_BASE_VARIANTS
-                else []
-            ),
             *_FLASH_KDA_NVCC_FLAGS[target],
             _FLASH_KDA_TARGET_DEFINE[target],
             *(
-                [_FLASH_KDA_VARIANT_DEFINES[base_variant]]
-                if base_variant in _FLASH_KDA_VARIANT_DEFINES
+                [_FLASH_KDA_VARIANT_DEFINES[variant]]
+                if variant in _FLASH_KDA_VARIANT_DEFINES
                 else []
             ),
             *(
                 ["-DFLASHINFER_FLASH_KDA_COMBINED_BT16=1"]
-                if base_variant == "bt16_prepare_chain_m64_s8"
+                if variant == "bt16_prepare_chain_m64_s8"
                 else []
             ),
         ],
