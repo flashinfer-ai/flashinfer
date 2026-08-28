@@ -193,3 +193,35 @@ def test_strided_and_misaligned_inputs():
         sel = idx[b][idx[b] >= 0]
         kth = torch.topk(mis[b], k).values.min()
         assert bool((mis[b][sel.long()] >= kth - 1e-4).all())
+
+
+def test_truncate_policy_rejects_topk_equal_to_smem_capacity():
+    """TRUNCATE must require top_k strictly below the SMEM candidate capacity.
+
+    The fine-threshold search selects the bin whose inclusive cumulative count
+    STRICTLY exceeds the remaining k; truncation to exactly top_k candidates
+    makes the total equal k, so no bin qualifies and refinement consumes stale
+    control state. Host-only (constructor validation; nothing is compiled).
+
+    Regression for PR #4621 review (TRUNCATE boundary).
+    """
+    pytest.importorskip("cutlass")
+    import cutlass
+
+    from flashinfer.topk_varlen.kernels.filtered_topk_util import (
+        FilteredTopKKernelVarlen,
+    )
+
+    probe = FilteredTopKKernelVarlen(cutlass.Float32, 1 << 20, 512)
+    S = probe.filtered_topk_smem_input_size
+    assert S >= 512
+
+    # Equality must now be rejected up front...
+    with pytest.raises(ValueError, match=r"requires top_k \(\d+\) <"):
+        FilteredTopKKernelVarlen(
+            cutlass.Float32, 1 << 20, S, overflow_policy="TRUNCATE"
+        )
+    # ...while strictly-below remains accepted.
+    FilteredTopKKernelVarlen(
+        cutlass.Float32, 1 << 20, S - 256, overflow_policy="TRUNCATE"
+    )

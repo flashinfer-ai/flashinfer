@@ -328,7 +328,7 @@ class FilteredTopKKernelVarlen:
                                    the stored set.  Non-exact (may output fewer than
                                    top_k indices when the threshold bin is dense).  No
                                    extra_buffer needed.  Requires
-                                   top_k <= filtered_topk_smem_input_size.
+                                   top_k < filtered_topk_smem_input_size.
                 "REREAD_ALWAYS" -- Skip SMEM collection entirely in the coarse pass;
                                    always perform a second GMEM scan to collect
                                    threshold-bin candidates.  Exact result.  No
@@ -536,12 +536,19 @@ class FilteredTopKKernelVarlen:
                     self.enable_tma_load_p3 = False
 
         _needs_extra = self.max_num_cols > self.filtered_topk_smem_input_size
+        # STRICT bound (top_k < S, not <=): the fine-threshold search selects
+        # the bin where the inclusive cumulative count strictly exceeds
+        # topk_remaining. Truncation to exactly S == top_k candidates makes
+        # the total cumulative count equal top_k, so no bin qualifies, no
+        # threshold is selected, and refinement consumes stale control state.
+        # DIVERGENCE FROM UPSTREAM (<= bound), after review (flashinfer
+        # PR #4621).
         if (
             overflow_policy == "TRUNCATE"
-            and self.top_k > self.filtered_topk_smem_input_size
+            and self.top_k >= self.filtered_topk_smem_input_size
         ):
             raise ValueError(
-                f"TRUNCATE overflow_policy requires top_k ({self.top_k}) <= "
+                f"TRUNCATE overflow_policy requires top_k ({self.top_k}) < "
                 "filtered_topk_smem_input_size "
                 f"({self.filtered_topk_smem_input_size}); use REREAD or GMEM_SPILL."
             )
