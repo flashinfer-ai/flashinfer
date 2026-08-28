@@ -2511,7 +2511,11 @@ class TestApiConsistency:
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
     def test_functional_vs_wrapper_output(self, quant_mode: str):
         """Verify functional and wrapper APIs produce the same output."""
-        from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
+        from flashinfer import (
+            CuteDslMoEWrapper,
+            cute_dsl_fused_moe,
+            cute_dsl_fused_moe_nvfp4,
+        )
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
         num_experts, top_k = 256, 2
@@ -2527,7 +2531,7 @@ class TestApiConsistency:
         api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, quant_mode)
 
         # Functional API
-        result_functional = cute_dsl_fused_moe(
+        functional_inputs = dict(
             token_selected_experts=tensors["token_selected_experts"],
             token_final_scales=tensors["token_final_scales"],
             w1_weight=tensors["w1_weight"],
@@ -2538,9 +2542,15 @@ class TestApiConsistency:
             w2_alpha=tensors["w2_alpha"],
             num_experts=num_experts,
             top_k=top_k,
-            quant_mode=quant_mode,
             **api_inputs,
         )
+        result_functional = cute_dsl_fused_moe(
+            **functional_inputs, quant_mode=quant_mode
+        )
+        if quant_mode == "w4a4":
+            with pytest.warns(DeprecationWarning, match="cute_dsl_fused_moe_nvfp4"):
+                deprecated = cute_dsl_fused_moe_nvfp4(**functional_inputs)
+            torch.testing.assert_close(result_functional, deprecated)
 
         # Wrapper API
         moe = CuteDslMoEWrapper(
@@ -3288,42 +3298,96 @@ class TestMoeOutputMemsetInplaceContract:
 @cute_dsl_available
 @mxfp8_required
 @pytest.mark.parametrize(
-    "tactic,swiglu_alpha,swiglu_beta,swiglu_limit",
+    "tactic,hidden_size,swiglu_alpha,swiglu_beta,swiglu_limit,check_contract",
     [
         pytest.param(
             (128, ((128, 128), (1, 1), False), ((128, 128), (1, 1), False)),
+            256,
             1.0,
             0.0,
             torch.finfo(torch.float32).max,
+            True,
             id="n128-bias-off",
         ),
         pytest.param(
             (128, ((128, 128), (1, 1), False), ((128, 64), (1, 1), False)),
+            128,
             1.25,
             0.5,
             10.0,
+            False,
             id="n64-custom-bias",
         ),
         pytest.param(
             (256, ((256, 128), (2, 1), False), ((256, 192), (2, 1), False)),
+            384,
             1.702,
             1.0,
             7.0,
+            False,
+            id="n192-2cta-oai",
+        ),
+        pytest.param(
+            (256, ((256, 128), (2, 1), False), ((256, 128), (2, 1), False)),
+            256,
+            1.702,
+            1.0,
+            7.0,
+            False,
+            id="n128-2cta-oai",
+        ),
+        pytest.param(
+            (128, ((128, 128), (1, 1), False), ((128, 192), (1, 1), False)),
+            384,
+            1.0,
+            0.0,
+            torch.finfo(torch.float32).max,
+            False,
+            id="n192-1cta",
+        ),
+        pytest.param(
+            (256, ((256, 128), (2, 1), False), ((256, 64), (2, 1), False)),
+            128,
+            1.25,
+            0.5,
+            10.0,
+            False,
+            id="n64-2cta-custom-bias",
+        ),
+        pytest.param(
+            (128, ((128, 128), (1, 1), False), ((128, 192), (1, 1), False)),
+            256,
+            1.702,
+            1.0,
+            7.0,
+            False,
             id="n192-partial-oai",
         ),
     ],
 )
 def test_w4a8_fused_moe_tactics_and_apis(
-    monkeypatch, tactic, swiglu_alpha, swiglu_beta, swiglu_limit
+    monkeypatch,
+    tactic,
+    hidden_size,
+    swiglu_alpha,
+    swiglu_beta,
+    swiglu_limit,
+    check_contract,
 ):
-    from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe, mxfp8_quantize
+    from flashinfer import (
+        CuteDslMoEWrapper,
+        CuteDslMxfp8Mxfp4MoEWrapper,
+        cute_dsl_fused_moe,
+        cute_dsl_fused_moe_mxfp8_mxfp4,
+        mxfp8_quantize,
+    )
     from flashinfer.autotuner import AutoTuner
     from flashinfer.fused_moe import CuteDslConfig, QuantVariant
 
     torch.manual_seed(20260827)
     device = torch.device("cuda")
     num_tokens, num_experts, top_k = 17, 2, 2
-    hidden_size, intermediate_size = 256, 128
+    intermediate_size = 128
     x_bf16 = (
         torch.randn(num_tokens, hidden_size, dtype=torch.bfloat16, device=device) / 2
     )
@@ -3395,6 +3459,21 @@ def test_w4a8_fused_moe_tactics_and_apis(
         swiglu_limit=swiglu_limit,
         enable_pdl=False,
     )
+    deprecated_inputs = dict(inputs)
+    deprecated_inputs.pop("fc2_input_scale")
+    deprecated_api_kwargs = dict(
+        num_experts=num_experts,
+        top_k=top_k,
+        tactic=tactic,
+        swiglu_alpha=swiglu_alpha,
+        swiglu_beta=swiglu_beta,
+        swiglu_limit=swiglu_limit,
+        enable_pdl=False,
+    )
+    with pytest.warns(DeprecationWarning, match="cute_dsl_fused_moe_mxfp8_mxfp4"):
+        deprecated_functional = cute_dsl_fused_moe_mxfp8_mxfp4(
+            **deprecated_inputs, **deprecated_api_kwargs
+        )
     wrapper = CuteDslMoEWrapper(
         num_experts=num_experts,
         top_k=top_k,
@@ -3407,7 +3486,67 @@ def test_w4a8_fused_moe_tactics_and_apis(
         enable_pdl=False,
     )
     wrapped = wrapper.run(**inputs, tactic=tactic)
+    with pytest.warns(DeprecationWarning, match="CuteDslMxfp8Mxfp4MoEWrapper"):
+        deprecated_wrapper = CuteDslMxfp8Mxfp4MoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            swiglu_alpha=swiglu_alpha,
+            swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
+            enable_pdl=False,
+        )
+    deprecated_wrapped = deprecated_wrapper.run(**deprecated_inputs, tactic=tactic)
     torch.testing.assert_close(functional, wrapped, atol=0.5, rtol=0.05)
+    torch.testing.assert_close(functional, deprecated_functional, atol=0.5, rtol=0.05)
+    torch.testing.assert_close(functional, deprecated_wrapped, atol=0.5, rtol=0.05)
+    if check_contract:
+        import inspect
+
+        functional_params = inspect.signature(cute_dsl_fused_moe_mxfp8_mxfp4).parameters
+        wrapper_params = inspect.signature(CuteDslMxfp8Mxfp4MoEWrapper.run).parameters
+        assert "fc2_input_scale" not in functional_params
+        assert "fc2_input_scale" not in wrapper_params
+        assert "tactic" in functional_params
+        assert "tactic" in wrapper_params
+
+        snapshot = deprecated_wrapped.clone()
+        rerun = deprecated_wrapper.run(**deprecated_inputs, tactic=tactic)
+        assert torch.equal(snapshot, deprecated_wrapped)
+        torch.testing.assert_close(functional, rerun, atol=0.5, rtol=0.05)
+
+        smaller_inputs = dict(deprecated_inputs)
+        for name in ("x", "x_sf", "token_selected_experts", "token_final_scales"):
+            smaller_inputs[name] = smaller_inputs[name][:9]
+        smaller = deprecated_wrapper.run(**smaller_inputs, tactic=tactic)
+        assert smaller.shape == (9, hidden_size)
+        assert torch.isfinite(smaller).all()
+
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            streamed = deprecated_wrapper.run(**deprecated_inputs, tactic=tactic)
+        stream.synchronize()
+        assert streamed.shape == functional.shape
+
+        bad_inputs = dict(
+            deprecated_inputs,
+            token_final_scales=topk_weights.to(torch.bfloat16),
+        )
+        with (
+            pytest.warns(DeprecationWarning),
+            pytest.raises(TypeError, match="token_final_scales"),
+        ):
+            cute_dsl_fused_moe_mxfp8_mxfp4(**bad_inputs, **deprecated_api_kwargs)
+        bad_inputs = dict(
+            deprecated_inputs,
+            w1_weight_sf=deprecated_inputs["w1_weight_sf"].contiguous(),
+        )
+        with (
+            pytest.warns(DeprecationWarning),
+            pytest.raises(ValueError, match="MMA scale strides"),
+        ):
+            cute_dsl_fused_moe_mxfp8_mxfp4(**bad_inputs, **deprecated_api_kwargs)
     reference = compute_reference_moe_fp4(
         hidden_states=x_bf16,
         gemm1_weights=w1,

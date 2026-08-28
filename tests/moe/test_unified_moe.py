@@ -1173,6 +1173,20 @@ class TestMoERunnerSupport:
         assert packed[7] is None
         assert packed[-1].shape == (4, 128)
 
+    def test_cute_dsl_mxfp4_pack_rejects_unaligned_geometry(self):
+        w1 = torch.zeros(2, 2 * 96, 256, dtype=torch.bfloat16)
+        w2 = torch.zeros(2, 256, 96, dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match="divisible by 128"):
+            CuteDslConfig.prepare_weights(
+                w1,
+                w2,
+                variant=QuantVariant.MXFP4,
+                num_local_experts=2,
+                hidden_size=256,
+                intermediate_size=96,
+                device="cpu",
+            )
+
     def test_cute_dsl_rejects_unrepresentable_situ_clamp(self):
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(activation=SiTU(clamp_limit=4.0))

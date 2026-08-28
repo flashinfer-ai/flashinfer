@@ -25,10 +25,15 @@ class TestKernelRequiresWeights:
         assert kernel_requires_weights(IdentityConfig(kernel_name="identity")) is False
 
     def test_fused_moe_requires_moe_config(self) -> None:
-        from flashinfer.moe_ep import FusedMoeKernelConfig
+        from flashinfer.moe_ep import FusedMoeKernelConfig, IdentityConfig
+        from flashinfer.moe_ep.backends.split.kernel.fused_moe.backend import (
+            FusedMoeSplitKernelBackend,
+        )
 
         with pytest.raises(TypeError):
             FusedMoeKernelConfig()  # type: ignore[call-arg]
+        with pytest.raises(TypeError):
+            FusedMoeSplitKernelBackend(IdentityConfig())  # type: ignore[arg-type]
 
     @pytest.mark.parametrize(
         "variant,cute_dsl,valid",
@@ -38,7 +43,12 @@ class TestKernelRequiresWeights:
         self, variant, cute_dsl, valid
     ) -> None:
         import flashinfer.fused_moe as fm
-        from flashinfer.moe_ep import BootstrapConfig, FleetParams, FusedMoeKernelConfig
+        from flashinfer.moe_ep import (
+            BootstrapConfig,
+            FleetParams,
+            FusedMoeKernelConfig,
+            kernel_requires_weights,
+        )
         from flashinfer.moe_ep.core.kernel.registry import create_split_kernel
         from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
 
@@ -56,9 +66,9 @@ class TestKernelRequiresWeights:
                 candidates=((fm.CuteDslConfig() if cute_dsl else fm.TrtllmFp4Config()),)
             ),
         )
-        kernel = create_split_kernel(
-            FusedMoeKernelConfig(moe_config=moe, mxfp8_dispatch=True)
-        )
+        config = FusedMoeKernelConfig(moe_config=moe, mxfp8_dispatch=True)
+        assert kernel_requires_weights(config)
+        kernel = create_split_kernel(config)
         args = (
             BootstrapConfig(world_size=1, rank=0),
             FleetParams(num_experts=2, max_tokens_per_rank=1, token_hidden_size=256),

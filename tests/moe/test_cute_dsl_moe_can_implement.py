@@ -91,6 +91,9 @@ def _gemm1_ok(
         (384, (128, 256), (1, 1), True),
         # 3 exact 128-tiles, no cluster: fine.
         (384, (128, 128), (1, 1), True),
+        (384, (128, 192), (1, 1), True),
+        (256, (128, 192), (1, 1), True),
+        (128, (128, 256), (1, 1), True),
     ],
 )
 def test_finalize_n_tiling(n, mma, cluster, expect):
