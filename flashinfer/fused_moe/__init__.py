@@ -128,6 +128,12 @@ from .fused_routing_dsv3 import (  # noqa: F401
     fused_topk_deepseek as fused_topk_deepseek,
 )
 
+# The experimental fused MoE routing entry points (moe_routing_prologue /
+# _align / _finalize) are NOT re-exported here.  They live in
+# flashinfer/fused_moe/experimental/ and are surfaced at the top level, like
+# the other experimental-but-public ops -- one spelling, `flashinfer.<name>`.
+# See experimental/README.md.
+
 from .hash_topk import (  # noqa: F401
     hash_topk as hash_topk,
 )
