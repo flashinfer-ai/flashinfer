@@ -120,6 +120,118 @@ _STAGE_BINDINGS = {
         "local_partials_peers",
     ),
 }
+_STAGE_LAUNCH_CONTRACTS = {
+    "input_barrier": (
+        (1, 1, 1),
+        (32, 1, 1),
+        (1, 1, 1),
+        0,
+        (),
+        False,
+        False,
+        False,
+    ),
+    "dispatch": (
+        (1024, 1, 1),
+        (256, 1, 1),
+        (1, 1, 1),
+        15488,
+        (),
+        False,
+        False,
+        False,
+    ),
+    "route_reset": (
+        (1, 1, 1),
+        (256, 1, 1),
+        (1, 1, 1),
+        0,
+        (),
+        False,
+        False,
+        False,
+    ),
+    "route_count": (
+        (32, 1, 1),
+        (256, 1, 1),
+        (1, 1, 1),
+        0,
+        (),
+        False,
+        False,
+        False,
+    ),
+    "route_finalize": (
+        (1, 1, 1),
+        (32, 1, 1),
+        (1, 1, 1),
+        0,
+        (),
+        False,
+        False,
+        False,
+    ),
+    "route_scatter": (
+        (32, 1, 1),
+        (256, 1, 1),
+        (1, 1, 1),
+        0,
+        (),
+        False,
+        True,
+        False,
+    ),
+    "gemm1_swiglu": (
+        (32, 512, 1),
+        (384, 1, 1),
+        (2, 1, 1),
+        223232,
+        (("K", 7168),),
+        True,
+        True,
+        True,
+    ),
+    "gemm2": (
+        (56, 512, 1),
+        (256, 1, 1),
+        (2, 1, 1),
+        223360,
+        (("K", 2048),),
+        True,
+        True,
+        True,
+    ),
+    "local_unpermute": (
+        (1024, 1, 1),
+        (128, 1, 1),
+        (1, 1, 1),
+        128,
+        (("hidden_size", 7168),),
+        True,
+        False,
+        True,
+    ),
+    "partial_barrier": (
+        (1, 1, 1),
+        (32, 1, 1),
+        (1, 1, 1),
+        0,
+        (),
+        False,
+        False,
+        False,
+    ),
+    "combine": (
+        (128, 1, 1),
+        (256, 1, 1),
+        (1, 1, 1),
+        29696,
+        (),
+        False,
+        False,
+        False,
+    ),
+}
 
 
 def _check_cuda(result: tuple[Any, ...], operation: str) -> tuple[Any, ...]:
@@ -193,6 +305,11 @@ def _load_manifest() -> tuple[dict[str, Any], Path]:
             raise RuntimeError(
                 f"Blackwell BF16 rank-major stage {stage_name} use_pdl must be bool"
             )
+        for field in ("pdl_sync", "pdl_launch"):
+            if type(stage.get(field)) is not bool:
+                raise RuntimeError(
+                    f"Blackwell BF16 rank-major stage {stage_name} {field} must be bool"
+                )
         for field in ("grid", "block", "cluster"):
             value = stage.get(field)
             if not isinstance(value, list) or len(value) != 3 or not all(
@@ -206,6 +323,31 @@ def _load_manifest() -> tuple[dict[str, Any], Path]:
         ] < 0:
             raise RuntimeError(
                 f"Blackwell BF16 rank-major stage {stage.get('name')} has invalid shared memory"
+            )
+        scalar_bindings = stage.get("scalar_bindings")
+        if not isinstance(scalar_bindings, list) or not all(
+            isinstance(binding, list)
+            and len(binding) == 2
+            and isinstance(binding[0], str)
+            and isinstance(binding[1], int)
+            for binding in scalar_bindings
+        ):
+            raise RuntimeError(
+                f"Blackwell BF16 rank-major stage {stage_name} has invalid scalar bindings"
+            )
+        launch_contract = (
+            tuple(stage["grid"]),
+            tuple(stage["block"]),
+            tuple(stage["cluster"]),
+            stage["dynamic_smem_bytes"],
+            tuple(tuple(binding) for binding in scalar_bindings),
+            stage["pdl_sync"],
+            stage["pdl_launch"],
+            stage["use_pdl"],
+        )
+        if launch_contract != _STAGE_LAUNCH_CONTRACTS[stage_name]:
+            raise RuntimeError(
+                f"Blackwell BF16 rank-major stage {stage_name} launch contract drifted"
             )
     return manifest, source_path
 

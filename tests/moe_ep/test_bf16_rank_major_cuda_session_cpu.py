@@ -41,19 +41,35 @@ def _session_module():
 
 
 def _manifest(module, source: bytes) -> dict:
-    stages = [
-        {
-            "name": name,
-            "symbol": f"test_{name}",
-            "grid": [1, 1, 1],
-            "block": [32, 1, 1],
-            "cluster": [1, 1, 1],
-            "dynamic_smem_bytes": 0,
-            "use_pdl": False,
-            "bindings": [],
-        }
-        for name in module._STAGE_NAMES
-    ]
+    stages = []
+    for name in module._STAGE_NAMES:
+        (
+            grid,
+            block,
+            cluster,
+            dynamic_smem_bytes,
+            scalar_bindings,
+            pdl_sync,
+            pdl_launch,
+            use_pdl,
+        ) = module._STAGE_LAUNCH_CONTRACTS[name]
+        stages.append(
+            {
+                "name": name,
+                "symbol": f"test_{name}",
+                "grid": list(grid),
+                "block": list(block),
+                "cluster": list(cluster),
+                "dynamic_smem_bytes": dynamic_smem_bytes,
+                "scalar_bindings": [
+                    list(binding) for binding in scalar_bindings
+                ],
+                "pdl_sync": pdl_sync,
+                "pdl_launch": pdl_launch,
+                "use_pdl": use_pdl,
+                "bindings": list(module._STAGE_BINDINGS[name]),
+            }
+        )
     return {
         "schema_version": 1,
         "arch": "sm_100a",
@@ -154,6 +170,20 @@ def test_manifest_accepts_only_the_exact_host_contract(tmp_path, monkeypatch):
         (
             lambda manifest: manifest["stages"][0].update(grid=[1, 0, 1]),
             "invalid grid",
+        ),
+        (
+            lambda manifest: manifest["stages"][0].update(grid=[2, 1, 1]),
+            "launch contract drifted",
+        ),
+        (
+            lambda manifest: manifest["stages"][6].update(
+                scalar_bindings=[["K", 2048]]
+            ),
+            "launch contract drifted",
+        ),
+        (
+            lambda manifest: manifest["stages"][6].update(pdl_sync=False),
+            "launch contract drifted",
         ),
         (
             lambda manifest: manifest["stages"][0].update(
