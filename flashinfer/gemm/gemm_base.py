@@ -5038,6 +5038,7 @@ def _cute_dsl_gemm_mxfp8_requirement(
             "cute_dsl mm_mxfp8 requires swizzled 1D scale tensors for a_descale and b_descale."
         )
     _check_cute_dsl_availability()
+    _check_cute_dsl_arch(a.device)
     return True
 
 
@@ -5150,6 +5151,31 @@ def _get_sm100_block_scaled_tactics(
 
 
 _CUTE_DSL_MM_MXFP8_KERNEL_CACHE: dict[tuple, tuple] = {}
+
+
+def _check_cute_dsl_arch(device: torch.device) -> None:
+    """Reject the CuTe-DSL backend when the installed DSL cannot emit for ``device``.
+
+    Availability, not capability: the kernels exist for sm_107, so the static
+    ``@supported_compute_capability`` list rightly still contains it. What
+    varies is whether the installed DSL can generate code for that arch. Same
+    axis as ``CUDNN_AVAILABLE`` / ``_is_cudnn_override_shape_available``.
+
+    Delegates to :func:`require_cute_dsl_arch`, which owns the predicate and the
+    message (including the exact ``CUTE_DSL_ARCH`` value to export). Only the
+    exception type is adapted: ``suitable_auto_backends`` treats ``ValueError``
+    as "backend not suitable" and keeps searching, whereas the
+    ``NotImplementedError`` it raises would propagate and fail the call.
+    """
+    try:
+        from flashinfer.cute_dsl.utils import require_cute_dsl_arch
+    except Exception:
+        # Probe unavailable; never deselect an otherwise working backend.
+        return
+    try:
+        require_cute_dsl_arch(device)
+    except NotImplementedError as err:
+        raise ValueError(str(err)) from err
 
 
 def _check_cute_dsl_availability():
@@ -6178,6 +6204,7 @@ def _cute_dsl_gemm_fp4_requirement(
             return False
         raise ValueError(f"CuTe-DSL FP4 GEMM requires N % 8 == 0, got n={b.shape[1]}")
     _check_cute_dsl_availability()
+    _check_cute_dsl_arch(a.device)
     return True
 
 
@@ -7281,6 +7308,7 @@ def _cute_dsl_bmm_fp8_requirement(
         raise ValueError(
             "CuTe-DSL is not available. Please install cutlass with cute support."
         )
+    _check_cute_dsl_arch(A.device)
 
     # Check dimensions are 3D (batch, m, k) and (batch, k, n)
     if A.dim() != 3 or B.dim() != 3:
