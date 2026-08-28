@@ -1781,6 +1781,12 @@ class TestCuteDslFusedMoeFunctional:
         situ_linear_beta: float | None,
     ):
         """Accuracy test for SiTU with optional smooth up-branch clamping."""
+        if is_sm107():
+            pytest.skip(
+                "Rubin (SM107) cute-dsl MoE kernels do not implement SiTU; the "
+                "gather kernel is SwiGLU-only and silently ignores situ_beta/"
+                "situ_linear_beta"
+            )
         from flashinfer import cute_dsl_fused_moe_nvfp4
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
