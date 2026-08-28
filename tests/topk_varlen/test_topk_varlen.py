@@ -1009,6 +1009,7 @@ def test_radix_preallocated_outputs(return_values):
         ("radix_cutlass", None),
         ("gvr", True),
         ("gvr", False),
+        ("gvr_2", None),
     ],
 )
 def test_out_values_ignored_when_return_values_false(backend, load_balance):
@@ -1017,9 +1018,11 @@ def test_out_values_ignored_when_return_values_false(backend, load_balance):
     _compile_radix specialises the kernel on return_output_values: when False the
     compiled signature has None for the values slot.  Passing a real tensor there
     (without the 'out_values if return_output_values else None' guard) causes a
-    type mismatch.  Covers all three backends plus both GVR load-balance paths.
+    type mismatch.  Covers all backends plus both GVR load-balance paths.
     """
-    dtype, top_k, N, batch_size = torch.bfloat16, 512, 8192, 4
+    # gvr_2 is fp32-only; the other backends keep the original bf16 coverage.
+    dtype = torch.float32 if backend == "gvr_2" else torch.bfloat16
+    top_k, N, batch_size = 512, 8192, 4
     logits, pre_idx, seq_lens = _make_inputs(batch_size, N, top_k, dtype, seed=99)
     # Pre-allocate a values buffer but deliberately do NOT set return_values=True.
     out_v = torch.full((batch_size, top_k), float("nan"), dtype=dtype, device="cuda")
@@ -1028,6 +1031,8 @@ def test_out_values_ignored_when_return_values_false(backend, load_balance):
     if backend == "gvr":
         kwargs["pre_idx"] = pre_idx
         kwargs["load_balance"] = load_balance
+    elif backend == "gvr_2":
+        kwargs["pre_idx"] = pre_idx
 
     ret_i, ret_v = flashinfer.top_k_varlen(logits, seq_lens, top_k, **kwargs)
     torch.cuda.synchronize()
@@ -1194,7 +1199,7 @@ def test_cuda_graph_gvr(load_balance):
 
 
 def test_backend_heuristic_priority():
-    """Auto-selection priority is gvr > radix (CuTe DSL) > radix_cutlass.
+    """Auto-selection priority is gvr > gvr_2 > radix (CuTe DSL) > radix_cutlass.
 
     Hardware-independent: exercises the heuristic directly so a regression in
     the backend ordering (e.g. from a future rename) is caught even off-GPU.
@@ -1207,11 +1212,18 @@ def test_backend_heuristic_priority():
     assert (
         _top_k_varlen_heuristic(["gvr", "radix", "radix_cutlass"], *dummy)[0] == "gvr"
     )
+    assert (
+        _top_k_varlen_heuristic(["gvr_2", "radix", "radix_cutlass"], *dummy)[0]
+        == "gvr_2"
+    )
     assert _top_k_varlen_heuristic(["radix", "radix_cutlass"], *dummy)[0] == "radix"
     assert _top_k_varlen_heuristic(["radix_cutlass"], *dummy)[0] == "radix_cutlass"
     # order is preserved regardless of the suitable-set ordering
-    assert _top_k_varlen_heuristic(["radix_cutlass", "radix", "gvr"], *dummy) == [
+    assert _top_k_varlen_heuristic(
+        ["radix_cutlass", "radix", "gvr_2", "gvr"], *dummy
+    ) == [
         "gvr",
+        "gvr_2",
         "radix",
         "radix_cutlass",
     ]
@@ -1219,7 +1231,7 @@ def test_backend_heuristic_priority():
 
 @requires_blackwell
 def test_cross_backend_value_consistency():
-    """radix, radix_cutlass, and gvr select the same top-K *value* multiset.
+    """radix, radix_cutlass, gvr, and gvr_2 select the same top-K *value* multiset.
 
     Compares sorted selected values (not indices) so ties don't cause spurious
     failures. fp32 keeps ties rare; any real divergence between backends fails.
@@ -1231,17 +1243,24 @@ def test_cross_backend_value_consistency():
     idx_g, _ = flashinfer.top_k_varlen(
         logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr"
     )
+    idx_g2, _ = flashinfer.top_k_varlen(
+        logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr_2"
+    )
     torch.cuda.synchronize()
     lf = logits.float()
     for row in range(batch_size):
         vr = lf[row][idx_r[row].long()].sort(descending=True).values
         vc = lf[row][idx_c[row].long()].sort(descending=True).values
         vg = lf[row][idx_g[row].long()].sort(descending=True).values
+        vg2 = lf[row][idx_g2[row].long()].sort(descending=True).values
         assert torch.allclose(vr, vc, rtol=1e-4, atol=1e-4), (
             f"row={row}: radix vs radix_cutlass value multisets differ"
         )
         assert torch.allclose(vr, vg, rtol=1e-4, atol=1e-4), (
             f"row={row}: radix vs gvr value multisets differ"
+        )
+        assert torch.allclose(vr, vg2, rtol=1e-4, atol=1e-4), (
+            f"row={row}: radix vs gvr_2 value multisets differ"
         )
 
 

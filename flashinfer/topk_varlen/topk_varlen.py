@@ -30,6 +30,10 @@ Backend choices
                        Requires a datacentre Blackwell-class GPU (sm_100/103,
                        or Rubin sm_107), nvidia-cutlass-dsl, and a
                        ``pre_idx`` hint from the previous decode step.
+``"gvr_2"``          — self-sampling GVR V2 (sample-calibrated threshold
+                       ladders; TRT-LLM PR #17821 port). Requires datacenter
+                       Blackwell (sm_100/103), nvidia-cutlass-dsl, ``pre_idx``,
+                       and fp32 logits.
 ``"radix_cutlass"``  — masked-radix fallback; masks logits to ``seq_lens`` then
                        calls the FlashInfer CUTLASS radix top-K.  Runs on any GPU.
 ``"radix_filter"``   — filtered-radix (coarse histogram → filter → on-chip
@@ -37,7 +41,7 @@ Backend choices
                        Datacentre Blackwell-class (sm_100/103/107) only;
                        requires nvidia-cutlass-dsl >= 4.8 (see below);
                        opt-in — never chosen by ``"auto"``.
-``"auto"``           — GVR (if pre_idx provided) > radix (Blackwell) >
+``"auto"``           — GVR (if pre_idx provided) > gvr_2 > radix (Blackwell) >
                        radix_cutlass (default).
 """
 
@@ -199,6 +203,54 @@ def _gvr_top_k_varlen_check(
     return True
 
 
+@supported_compute_capability(_GVR_CCS)
+def _gvr2_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+):
+    """Return True only when the self-sampling GVR V2 port can run this config.
+
+    Mirrors the TRT-LLM ``run_varlen`` hard contract so backend="auto" (and an
+    explicit backend="gvr_2") never reaches a kernel-side RuntimeError.
+    """
+    if not (_CUTE_DSL_AVAILABLE and pre_idx is not None):
+        return False
+    # fp32 only: the upstream self-sampling kernels declare bf16/fp16 a
+    # follow-up (run_varlen raises on any other dtype).
+    if logits.dtype != torch.float32:
+        return False
+    # Validated K domain (matches the upstream dispatch tuning + dsa.py gate).
+    if top_k not in (512, 1024, 2048):
+        return False
+    if pre_idx.shape[1] != top_k:
+        # run_varlen derives k from pre_idx; a mismatched hint width would
+        # silently select pre_idx.shape[1] elements instead of top_k.
+        return False
+    if compress_ratio not in (1, 4):
+        return False
+    # float4 row loads: row stride must be a multiple of 4 and the base
+    # 16-byte aligned (fresh torch allocations always are; sliced views may
+    # not be). Wider-than-N row strides are accepted (paged arenas).
+    if logits.stride(1) != 1:
+        return False
+    npad = logits.stride(0) if logits.shape[0] > 1 else logits.shape[1]
+    if npad % 4 != 0:
+        return False
+    if logits.is_cuda and (logits.data_ptr() & 15):
+        return False
+    return True
+
+
 def _top_k_varlen_heuristic(
     suitable_backends,
     logits: torch.Tensor,
@@ -214,7 +266,11 @@ def _top_k_varlen_heuristic(
     load_balance: bool = True,
     workspace=None,
 ):
-    """GVR (needs pre_idx) > radix (CuTe DSL, Blackwell) > radix_cutlass (all GPUs).
+    """GVR (needs pre_idx) > gvr_2 > radix (CuTe DSL, Blackwell) > radix_cutlass.
+
+    gvr_2 sits behind gvr until the perf comparison between the two settles the
+    default; since gvr supports a superset of gvr_2's dtypes, auto currently
+    only reaches gvr_2 when gvr is unsuitable.
 
     The full signature must be spelled out (not **kwargs) so that the decorator can
     call this function with positional args on the skip_check=True path without
@@ -229,7 +285,9 @@ def _top_k_varlen_heuristic(
     # roughly N >= 64K with enough rows on SM100, wider on SM107); until
     # that rule exists it is explicit-only, as documented in the module
     # docstring.
-    return [b for b in ("gvr", "radix", "radix_cutlass") if b in suitable_backends]
+    return [
+        b for b in ("gvr", "gvr_2", "radix", "radix_cutlass") if b in suitable_backends
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +906,49 @@ def _run_gvr(
 
 
 # ---------------------------------------------------------------------------
+# Internal: gvr_2 (self-sampling GVR V2) backend implementation
+# ---------------------------------------------------------------------------
+
+
+def _run_gvr2(
+    logits: torch.Tensor,
+    pre_idx: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    return_output_values: bool,
+    out_indices: torch.Tensor,
+    out_values: Optional[torch.Tensor],
+    workspace: Optional[dict] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Self-sampling GVR V2: one launch for the whole batch via the per-row
+    in-kernel varlen engine (TRT-LLM ``run_varlen`` port).
+
+    ``max_seq_len`` is derived from the logits row width (in uncompressed
+    token space, hence ``* compress_ratio``), which is capture-stable — the
+    call performs NO host reads of device data and is CUDA-graph safe once
+    the launcher for this shape has been compiled (warm up before capture).
+    The kernel reads each request's ``seq_lens`` on device and re-derives its
+    sampling ladder per row, so no LJF sort or prepare kernel is needed.
+    """
+    from .kernels import gvr2_topk_host
+
+    gvr2_topk_host.run_varlen(
+        logits,
+        pre_idx,
+        seq_lens,
+        out_indices,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        values=out_values if return_output_values else None,
+        max_seq_len=logits.shape[1] * compress_ratio,
+        workspace=workspace.get("gvr2_workspace") if workspace else None,
+    )
+    return out_indices, (out_values if return_output_values else None)
+
+
+# ---------------------------------------------------------------------------
 # Internal: radix_cutlass (masked-radix CUTLASS) backend implementation
 # ---------------------------------------------------------------------------
 
@@ -1173,6 +1274,7 @@ def _run_radix_filter(
     {
         "radix": _radix_top_k_varlen_check,
         "gvr": _gvr_top_k_varlen_check,
+        "gvr_2": _gvr2_top_k_varlen_check,
         "radix_cutlass": _radix_cutlass_top_k_varlen_check,
         "radix_filter": _radix_filter_top_k_varlen_check,
     },
@@ -1189,7 +1291,7 @@ def top_k_varlen(
     return_values: bool = False,
     out_indices: Optional[torch.Tensor] = None,
     out_values: Optional[torch.Tensor] = None,
-    backend: Literal["radix", "gvr", "radix_cutlass", "radix_filter", "auto"] = "auto",
+    backend: Literal["radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "auto"] = "auto",
     load_balance: bool = True,
     workspace: Optional[dict] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -1244,7 +1346,7 @@ def top_k_varlen(
     out_values : torch.Tensor, optional
         Pre-allocated values buffer (same dtype as ``logits``).
         Only used when ``return_values=True``.
-    backend : {"radix", "gvr", "radix_cutlass", "auto"}, optional
+    backend : {"radix", "gvr", "gvr_2", "radix_cutlass", "auto"}, optional
         Backend to use.  Default ``"auto"``.
 
         ``"radix"``         — CuTe DSL single-pass multi-CTA radix top-K
@@ -1254,10 +1356,19 @@ def top_k_varlen(
         ``"gvr"``           — GVR kernel (Blackwell sm_100+ only; requires
                               ``pre_idx``). ``load_balance`` selects the LB vs
                               single-CTA path.
+        ``"gvr_2"``         — self-sampling GVR V2 (TRT-LLM PR #17821 port):
+                              sample-calibrated threshold ladders, exact
+                              tie-interchangeable top-K, one launch per batch.
+                              Datacenter Blackwell (sm_100/103) only; requires
+                              ``pre_idx`` (hints steer sampling, never
+                              exactness) and fp32 logits;
+                              ``top_k`` in {512, 1024, 2048}. ``load_balance``
+                              is ignored (the kernel families load-balance
+                              internally).
         ``"radix_cutlass"`` — Masked CUTLASS radix top-K (all GPUs, no
                               ``pre_idx`` needed).
-        ``"auto"``          — GVR (if ``pre_idx`` supplied) > radix (Blackwell)
-                              > radix_cutlass.
+        ``"auto"``          — GVR (if ``pre_idx`` supplied) > gvr_2 > radix
+                              (Blackwell) > radix_cutlass.
     load_balance : bool, optional
         Selects the GVR kernel path (ignored by the radix backend).  Default
         ``True``.
@@ -1284,6 +1395,14 @@ def top_k_varlen(
         * ``"gvr_order_row"``: shape ``(M,)`` where ``M`` is the smallest
           power of 2 in ``[64, 1024]`` that is ``>= seq_lens.shape[0]``.
         * ``"gvr_counters"``: shape ``(2,)``.
+
+        For the ``"gvr_2"`` backend the optional key ``"gvr2_workspace"``
+        (CUDA tensor of at least
+        ``flashinfer.topk_varlen.kernels.gvr2_topk_host.workspace_bytes()``
+        = 20,973,568 bytes, zero-initialized before first use, 8-byte
+        aligned) overrides the per-device cached slab — needed only when
+        concurrent streams on one device may both take the multi-CTA SPLIT
+        path.
 
         .. warning::
             Do **not** share the same workspace dict across concurrent CUDA
@@ -1407,6 +1526,19 @@ def top_k_varlen(
                 out_indices,
                 out_values,
             )
+    elif backend == "gvr_2":
+        out_i, out_v = _run_gvr2(
+            logits,
+            pre_idx,
+            seq_lens,
+            top_k,
+            next_n,
+            compress_ratio,
+            return_values,
+            out_indices,
+            out_values,
+            workspace=workspace,
+        )
     elif backend == "radix_cutlass":
         out_i, out_v = _run_radix_cutlass(
             logits,
@@ -1432,7 +1564,7 @@ def top_k_varlen(
     else:
         raise ValueError(
             f"Unknown backend: {backend!r}. "
-            f"Expected 'radix', 'gvr', 'radix_cutlass', or 'radix_filter'."
+            f"Expected 'radix', 'gvr', 'gvr_2', 'radix_cutlass', or 'radix_filter'."
         )
 
     return out_i, out_v

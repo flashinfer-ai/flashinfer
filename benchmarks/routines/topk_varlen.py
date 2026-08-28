@@ -29,12 +29,12 @@ from .flashinfer_benchmark_utils import (
     print_perf_metrics,
 )
 
-# top_k_varlen's three runners. Per-CC support is NOT hard-coded here; it is
+# top_k_varlen's runners. Per-CC support is NOT hard-coded here; it is
 # resolved at runtime from top_k_varlen's @backend_requirement decorator via
 # ``flashinfer.top_k_varlen.is_backend_supported(backend, cc)`` (the single
 # source of truth), mirroring how the GEMM routines rely on their support
 # checkers (e.g. mm_fp4 / bmm_fp8) instead of a compute-capability table.
-_TOP_K_VARLEN_BACKENDS = ("radix", "gvr", "radix_cutlass")
+_TOP_K_VARLEN_BACKENDS = ("radix", "gvr", "gvr_2", "radix_cutlass")
 
 
 def parse_topk_varlen_args(line, parser):
@@ -96,7 +96,7 @@ def run_topk_varlen_test(args):
 
 
 def testTopKVarlen(args):
-    """Benchmark top_k_varlen with three runners: 'radix', 'radix_cutlass', 'gvr'.
+    """Benchmark top_k_varlen with its runners: 'radix', 'radix_cutlass', 'gvr', 'gvr_2'.
 
     Runners
     -------
@@ -107,6 +107,9 @@ def testTopKVarlen(args):
                      (sm_100/103) only. Per-CC support is resolved via
                      ``top_k_varlen.is_backend_supported`` (its
                      ``@backend_requirement`` decorator).
+    gvr_2          — self-sampling GVR V2 (TRT-LLM PR #17821 port); passes the
+                     same ``pre_idx``. Blackwell (sm_100/103) + fp32 logits +
+                     top_k in {512, 1024, 2048} only; skipped otherwise.
 
     Reference check compares the *set* of selected indices against ``torch.topk``
     applied to logits masked to ``seq_lens``.
@@ -143,6 +146,16 @@ def testTopKVarlen(args):
                 f"[WARNING] {backend} for routine {args.routine} is not supported "
                 f"on compute capability {major}.{minor}. Skipping."
             )
+    # gvr_2's CC check passes on sm_100/103, but the backend is fp32-only with
+    # a fixed top_k domain — drop it up front instead of failing the call.
+    if "gvr_2" in backends and (
+        args.input_dtype != "float32" or top_k not in (512, 1024, 2048)
+    ):
+        backends.remove("gvr_2")
+        print(
+            "[WARNING] gvr_2 requires float32 logits and top_k in {512, 1024, "
+            "2048}. Skipping."
+        )
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
@@ -176,6 +189,10 @@ def testTopKVarlen(args):
         elif backend == "gvr":
             return flashinfer.top_k_varlen(
                 logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr"
+            )
+        elif backend == "gvr_2":
+            return flashinfer.top_k_varlen(
+                logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr_2"
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
