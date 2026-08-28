@@ -116,3 +116,35 @@ def test_num_sms_cache_is_per_device():
             f"device {i}: cached SM count {got} != actual {expected} -- "
             f"the cache is not keyed by device"
         )
+
+
+def test_compile_uses_persistent_jit_cache():
+    """radix_filter compiles must go through FlashInfer's persistent JIT cache.
+
+    A bare ``cute.compile`` keeps the kernel only in process memory: every new
+    process (e.g. each serving worker) recompiles on first use, and nothing
+    honors architecture/DSL/source invalidation or FLASHINFER_DISABLE_JIT.
+    After one call through the public API, the exported artifact must exist in
+    the on-disk module directory (tagged by compile architecture). Fails on
+    the unrouted code, which writes no artifact.
+
+    Regression for PR #4621 review (persistent JIT routing + arch in key).
+    """
+    device = torch.device("cuda")
+    _skip_unless_radix_filter(device)
+
+    from flashinfer.jit import env as jit_env
+
+    torch.manual_seed(3)
+    logits = torch.randn(4, 8192, dtype=torch.float32, device=device)
+    seq_lens = torch.full((4,), 8192, dtype=torch.int32, device=device)
+    flashinfer.top_k_varlen(logits, seq_lens, 512, backend="radix_filter")
+
+    module_dirs = list(jit_env.FLASHINFER_JIT_DIR.glob("radix_filter_topk_*_cute_dsl"))
+    assert module_dirs, (
+        f"no radix_filter_topk module directory under "
+        f"{jit_env.FLASHINFER_JIT_DIR} -- compiles are not routed through the "
+        f"persistent JIT cache"
+    )
+    objs = [o for d in module_dirs for o in d.glob("*.o")]
+    assert objs, f"module dir {module_dirs} contains no exported kernel objects"

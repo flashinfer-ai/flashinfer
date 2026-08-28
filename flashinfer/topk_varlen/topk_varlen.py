@@ -1094,13 +1094,18 @@ def _run_radix_filter(
         cute_dsl_radix_filter_topk_wrapper,
     )
 
-    idx, val = cute_dsl_radix_filter_topk_wrapper(
-        logits,
-        seq_lens,
-        top_k,
-        next_n,
-        return_val=return_output_values,
-    )
+    # Compile and launch under the input tensor's device: the persistent JIT
+    # cache tags artifacts by the CURRENT device's architecture, and the
+    # kernel launches on the current stream, so both must agree with where
+    # the data lives on a multi-GPU host.
+    with torch.cuda.device(logits.device):
+        idx, val = cute_dsl_radix_filter_topk_wrapper(
+            logits,
+            seq_lens,
+            top_k,
+            next_n,
+            return_val=return_output_values,
+        )
 
     if out_indices is not None and out_indices.data_ptr() != idx.data_ptr():
         out_indices.copy_(idx)

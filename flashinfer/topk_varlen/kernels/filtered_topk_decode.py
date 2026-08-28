@@ -80,6 +80,48 @@ def _get_num_sms(device: torch.device | None = None) -> int:
     return cache[idx]
 
 
+def _compile_cc(device: torch.device) -> str:
+    """Compute-capability tag for the compile cache keys (e.g. ``"sm100"``).
+
+    Both the in-process dict and the on-disk artifact are architecture
+    specific (SMEM sizing, occupancy config, cluster limits), so identical
+    shapes compiled on one GPU must not be reused on a different architecture
+    in the same process. DIVERGENCE FROM UPSTREAM, after review (flashinfer
+    PR #4621).
+    """
+    major, minor = torch.cuda.get_device_capability(device)
+    return f"sm{major}{minor}"
+
+
+def _persistent_compile(kernel_name: str, compile_fn):
+    """Route a ``cute.compile`` through FlashInfer's persistent JIT cache.
+
+    ``build_and_load_cute_dsl_kernel`` adds what a bare ``cute.compile``
+    lacks: an on-disk artifact keyed by architecture and DSL version,
+    cross-process locking, source-hash invalidation over the three files this
+    kernel is built from, and ``FLASHINFER_DISABLE_JIT`` support -- without it
+    every new process (e.g. each SGLang worker) recompiles on first use.
+    DIVERGENCE FROM UPSTREAM, after review (flashinfer PR #4621).
+    """
+    from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel  # noqa: PLC0415
+
+    from . import block_scan as _block_scan  # noqa: PLC0415
+    from . import filtered_topk_util as _util  # noqa: PLC0415
+
+    return build_and_load_cute_dsl_kernel(
+        "radix_filter_topk",
+        kernel_name,
+        compile_fn,
+        extra_key_files=(__file__, _util.__file__, _block_scan.__file__),
+    )
+
+
+def _kernel_name_from_key(key: tuple) -> str:
+    """Filename-safe specialization name derived from a compile-cache key."""
+    raw = "_".join(str(k) for k in key)
+    return "".join(ch if (ch.isalnum() or ch in "._") else "-" for ch in raw)
+
+
 """
 A high-performance topk kernel example based on radix-based filter algorithm for
 the NVIDIA Blackwell SM100 architecture based on CuTe DSL.
@@ -799,6 +841,7 @@ def _prepare_one_pass_topk(
     _enable_tma_load_p3 = _tma_ok and auto_tma_load(enable_tma_load_p3, _tuned_tma)
 
     key = (
+        _compile_cc(input_values.device),
         "single-pass-multi-cta" if single_pass_multi_cta else "single-cta",
         dtype,
         bucketed_num_cols,
@@ -888,17 +931,20 @@ def _prepare_one_pass_topk(
                 enable_tma_load_p3=_enable_tma_load_p3,
             )
 
-        compiled_kernel = cute.compile(
-            filtered_topk_func,
-            input_fake,
-            None,  # indices_fake: unused in this path; pass None to match runtime
-            buffer_fake,
-            seqlen_fake,
-            output_indices_fake,
-            output_values_fake,
-            stream=fake_stream,
-            min_blocks_per_mp=min_blocks_per_mp,
-            options="--enable-tvm-ffi",
+        compiled_kernel = _persistent_compile(
+            _kernel_name_from_key(key),
+            lambda: cute.compile(
+                filtered_topk_func,
+                input_fake,
+                None,  # indices_fake: unused in this path
+                buffer_fake,
+                seqlen_fake,
+                output_indices_fake,
+                output_values_fake,
+                stream=fake_stream,
+                min_blocks_per_mp=min_blocks_per_mp,
+                options="--enable-tvm-ffi",
+            ),
         )
         compiled_filter_topk_dict[key] = compiled_kernel
     else:
@@ -1056,6 +1102,7 @@ def _prepare_multi_pass_multi_cta_topk(
     enable_multi_cta = True
     num_ctas_per_row = math.ceil(num_cols / chunk_size_per_cta)
     key = (
+        _compile_cc(input_values.device),
         "multi-pass-multi-cta",
         dtype,
         bucketed_num_cols,
@@ -1128,20 +1175,21 @@ def _prepare_multi_pass_multi_cta_topk(
             architecture=architecture,
             unroll_factor=unroll_factor,
         )
-        # Compile the kernel
-        compiled_kernel_first = cute.compile(
-            filtered_topk_func_first,
-            input_fake,
-            None,  # indices_fake: unused in this path; pass None to match runtime
-            buffer_fake,
-            seqlen_fake,
-            # output_indices_fake,
-            # output_values_fake,
-            first_kernel_output_indices_fake,
-            first_kernel_output_values_fake,
-            stream=fake_stream,
-            min_blocks_per_mp=min_blocks_per_mp,
-            options="--enable-tvm-ffi",
+        # Compile the kernel (persistently cached; see _persistent_compile)
+        compiled_kernel_first = _persistent_compile(
+            _kernel_name_from_key(key) + "_p1",
+            lambda: cute.compile(
+                filtered_topk_func_first,
+                input_fake,
+                None,  # indices_fake: unused in this path
+                buffer_fake,
+                seqlen_fake,
+                first_kernel_output_indices_fake,
+                first_kernel_output_values_fake,
+                stream=fake_stream,
+                min_blocks_per_mp=min_blocks_per_mp,
+                options="--enable-tvm-ffi",
+            ),
         )
 
         # The merge stage consumes the first stage's candidate indices.
@@ -1181,18 +1229,21 @@ def _prepare_multi_pass_multi_cta_topk(
             architecture=architecture,
             unroll_factor=unroll_factor,
         )
-        # Compile the kernel
-        compiled_kernel_second = cute.compile(
-            filtered_topk_func_second,
-            input_fake,
-            indices_fake,
-            buffer_fake,
-            seqlen_fake,
-            output_indices_fake,
-            output_values_fake,
-            stream=fake_stream,
-            min_blocks_per_mp=min_blocks_per_mp,
-            options="--enable-tvm-ffi",
+        # Compile the kernel (persistently cached; see _persistent_compile)
+        compiled_kernel_second = _persistent_compile(
+            _kernel_name_from_key(key) + "_p2",
+            lambda: cute.compile(
+                filtered_topk_func_second,
+                input_fake,
+                indices_fake,
+                buffer_fake,
+                seqlen_fake,
+                output_indices_fake,
+                output_values_fake,
+                stream=fake_stream,
+                min_blocks_per_mp=min_blocks_per_mp,
+                options="--enable-tvm-ffi",
+            ),
         )
 
         compiled_filter_topk_dict[key] = (compiled_kernel_first, compiled_kernel_second)
