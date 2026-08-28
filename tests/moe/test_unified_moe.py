@@ -1102,7 +1102,7 @@ class TestMoERunnerSupport:
         )
         runner.device = torch.device("cuda")
         monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 7))
-        with pytest.raises(NotImplementedError, match="W4A8.*SM107"):
+        with pytest.raises(NotImplementedError, match=r"W4A8.*SM107"):
             runner.check_support()
 
     def test_cute_dsl_w4a8_requires_fused_finalize(self):

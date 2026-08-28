@@ -2480,7 +2480,7 @@ class TestCuteDslMoEWrapper:
             # are ProfilingCacheKey instances; see AutoTuner._get_cache_key
             # in flashinfer/autotuner/autotuner.py.
             assert any(
-                k.custom_op == "CuteDslMoEWrapper::run::Swiglu"
+                k.custom_op == "CuteDslMoEWrapper::run::w4a4::Swiglu"
                 for k in autotuner.profiling_cache
             ), "autotune(True) did not populate a CuteDslMoEWrapper::run cache entry"
             return ref, finalized

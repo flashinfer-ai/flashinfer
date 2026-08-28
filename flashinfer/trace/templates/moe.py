@@ -3597,11 +3597,19 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             description="intermediate_size // 2 (packed FP4)."
         ),
         "num_fp4_hidden_blocks": Var(
-            description="Scale-factor count along hidden_size."
+            description="Scale-factor count along hidden_size (x_sf)."
         ),
-        "num_fp4_intermediate_blocks": Var(
-            description="Scale-factor count along intermediate_size."
+        "sf_atom_m": Const(abbrev="", value=32, description="MMA SF atom rows."),
+        "sf_atom_m_inner": Const(
+            abbrev="", value=4, description="MMA SF atom inner-row count."
         ),
+        "sf_atom_k": Const(
+            abbrev="", value=4, description="MMA SF atom inner-K count."
+        ),
+        "w1_sf_m_tiles": Var(description="ceil(gemm1_out_size / 128)."),
+        "w1_sf_k_tiles": Var(description="ceil(hidden_size / 128)."),
+        "w2_sf_m_tiles": Var(description="ceil(hidden_size / 128)."),
+        "w2_sf_k_tiles": Var(description="ceil(intermediate_size / 128)."),
         "gemm1_out_size": Const(
             abbrev="",
             description=(
@@ -3635,8 +3643,18 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             description="Packed FP4 FC1 weights.",
         ),
         "w1_weight_sf": Tensor(
-            ["num_local_experts", "gemm1_out_size", "num_fp4_hidden_blocks"],
-            description="FC1 weight scales.",
+            [
+                "sf_atom_m",
+                "sf_atom_m_inner",
+                "w1_sf_m_tiles",
+                "sf_atom_k",
+                "w1_sf_k_tiles",
+                "num_local_experts",
+            ],
+            description=(
+                "FC1 weight scales in the 6D MMA layout emitted by "
+                "convert_sf_to_mma_layout."
+            ),
         ),
         "w1_alpha": Tensor(
             ["num_local_experts"],
@@ -3656,8 +3674,18 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             description="Packed FP4 FC2 weights.",
         ),
         "w2_weight_sf": Tensor(
-            ["num_local_experts", "hidden_size", "num_fp4_intermediate_blocks"],
-            description="FC2 weight scales.",
+            [
+                "sf_atom_m",
+                "sf_atom_m_inner",
+                "w2_sf_m_tiles",
+                "sf_atom_k",
+                "w2_sf_k_tiles",
+                "num_local_experts",
+            ],
+            description=(
+                "FC2 weight scales in the 6D MMA layout emitted by "
+                "convert_sf_to_mma_layout."
+            ),
         ),
         "w2_alpha": Tensor(
             ["num_local_experts"],

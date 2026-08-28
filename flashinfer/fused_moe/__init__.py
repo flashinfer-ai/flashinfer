@@ -163,6 +163,9 @@ try:
     from .cute_dsl import (
         cute_dsl_fused_moe,
         CuteDslMoEWrapper,
+        cute_dsl_fused_moe_nvfp4,
+        cute_dsl_fused_moe_mxfp8_mxfp4,
+        CuteDslMxfp8Mxfp4MoEWrapper,
         b12x_fused_moe,
         B12xMoEWrapper,
     )
@@ -180,14 +183,6 @@ def __getattr__(name: str):
             stacklevel=2,
         )
         return CuteDslRunner
-    if _cute_dsl_available and name in {
-        "cute_dsl_fused_moe_nvfp4",
-        "cute_dsl_fused_moe_mxfp8_mxfp4",
-        "CuteDslMxfp8Mxfp4MoEWrapper",
-    }:
-        from .cute_dsl import fused_moe as _cute_dsl_fused_moe
-
-        return getattr(_cute_dsl_fused_moe, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

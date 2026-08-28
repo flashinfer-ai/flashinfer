@@ -22,22 +22,15 @@ if is_cute_dsl_available():
         cute_dsl_fused_moe,
         CuteDslMoEWrapper,
     )
+    from .fused_moe import (
+        cute_dsl_fused_moe_nvfp4,
+        cute_dsl_fused_moe_mxfp8_mxfp4,
+        CuteDslMxfp8Mxfp4MoEWrapper,
+    )
     from .b12x_moe import (
         b12x_fused_moe,
         B12xMoEWrapper,
     )
-
-_DEPRECATED_APIS = (
-    "cute_dsl_fused_moe_nvfp4",
-    "cute_dsl_fused_moe_mxfp8_mxfp4",
-    "CuteDslMxfp8Mxfp4MoEWrapper",
-)
-
-
-def __getattr__(name: str):
-    if is_cute_dsl_available() and name in _DEPRECATED_APIS:
-        return getattr(_fused_moe, name)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
@@ -48,7 +41,9 @@ if is_cute_dsl_available():
     __all__ += [
         "cute_dsl_fused_moe",
         "CuteDslMoEWrapper",
-        *_DEPRECATED_APIS,
+        "cute_dsl_fused_moe_nvfp4",
+        "cute_dsl_fused_moe_mxfp8_mxfp4",
+        "CuteDslMxfp8Mxfp4MoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",
     ]

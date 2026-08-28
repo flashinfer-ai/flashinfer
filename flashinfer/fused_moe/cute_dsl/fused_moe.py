@@ -157,12 +157,18 @@ def validate_w4a8_inputs(
     expected_x_sf = (x.shape[0], x.shape[1] // 32)
     if tuple(x_sf.shape) != expected_x_sf:
         raise ValueError(f"x_sf must have shape {expected_x_sf}")
+    if x_sf.dtype is not torch.uint8:
+        raise TypeError(
+            "W4A8 x_sf must have dtype torch.uint8; view e8m0 scales as uint8"
+        )
     if token_final_scales.dtype is not torch.float32:
         raise TypeError("W4A8 token_final_scales must have dtype torch.float32")
     for name, weight, scale in (
         ("w1_weight_sf", w1_weight, w1_weight_sf),
         ("w2_weight_sf", w2_weight, w2_weight_sf),
     ):
+        if scale.dtype is not torch.uint8:
+            raise TypeError(f"W4A8 {name} must have dtype torch.uint8")
         rows, columns = weight.shape[1], weight.shape[2] * 2
         m_tiles, k_tiles = (rows + 127) // 128, (columns + 127) // 128
         shape = (32, 4, m_tiles, 4, k_tiles, weight.shape[0])
@@ -1222,6 +1228,8 @@ def cute_dsl_fused_moe(
         Optional SiTU tanh clamp for the up branch.
     per_token_scale : Optional[torch.Tensor]
         Optional W4A4 per-token input row scale for GEMM1.
+    tactic : Optional[Tuple]
+        Tactic tuple, or ``None`` for auto-selection via the runtime tuner.
 
     Returns
     -------
@@ -1364,26 +1372,163 @@ def cute_dsl_fused_moe(
     return runner(inputs, tactic=best_tactic, **runner_kwargs)
 
 
-def _cute_dsl_fused_moe_mxfp8_mxfp4_compat(*args, **kwargs) -> torch.Tensor:
-    """Adapt the legacy positional layout to the consolidated function."""
-    if len(args) > 16:
-        if "tactic" in kwargs:
-            raise TypeError("got multiple values for argument 'tactic'")
-        kwargs["tactic"] = args[16]
-        args = (*args[:16], *args[17:])
-    if len(args) > 14:
-        args = (*args[:14], torch.bfloat16, True, *args[14:])
-    if len(args) > 7:
-        args = (*args[:7], None, *args[7:])
-    else:
-        kwargs["fc2_input_scale"] = None
-    kwargs["quant_mode"] = "w4a8"
-    return cute_dsl_fused_moe(*args, **kwargs)
+@supported_compute_capability([100, 103, 107])
+@flashinfer_api
+def cute_dsl_fused_moe_nvfp4(
+    x: torch.Tensor,
+    x_sf: Optional[torch.Tensor],
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    w1_weight: torch.Tensor,
+    w1_weight_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    fc2_input_scale: Optional[torch.Tensor],
+    w2_weight: torch.Tensor,
+    w2_weight_sf: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    num_local_experts: Optional[int] = None,
+    local_expert_offset: int = 0,
+    output_dtype: torch.dtype = torch.bfloat16,
+    use_fused_finalize: bool = True,
+    moe_output: Optional[torch.Tensor] = None,
+    aux_stream: Optional[torch.cuda.Stream] = None,
+    enable_pdl: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    *,
+    quant_mode: str = "w4a4",
+    per_token_scale: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Run a fused MoE forward pass using the CuTe-DSL NVFP4 kernels.
+
+    Warning
+    -------
+    This API will be deprecated in the future, please use
+    :func:`cute_dsl_fused_moe` with ``quant_mode="w4a4"`` instead.
+
+    See :func:`cute_dsl_fused_moe` for the full parameter documentation; this
+    function forwards every argument unchanged.
+    """
+    return cute_dsl_fused_moe(
+        x,
+        x_sf,
+        token_selected_experts,
+        token_final_scales,
+        w1_weight,
+        w1_weight_sf,
+        w1_alpha,
+        fc2_input_scale,
+        w2_weight,
+        w2_weight_sf,
+        w2_alpha,
+        num_experts,
+        top_k,
+        num_local_experts,
+        local_expert_offset,
+        output_dtype,
+        use_fused_finalize,
+        moe_output,
+        aux_stream,
+        enable_pdl,
+        activation_type,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        situ_beta,
+        situ_linear_beta,
+        quant_mode=quant_mode,
+        per_token_scale=per_token_scale,
+    )
 
 
-class _CuteDslMxfp8Mxfp4MoEWrapperCompat(CuteDslMoEWrapper):
-    """Legacy argument adapter backed entirely by ``CuteDslMoEWrapper``."""
+@supported_compute_capability([100, 103])
+@flashinfer_api
+def cute_dsl_fused_moe_mxfp8_mxfp4(
+    x: torch.Tensor,
+    x_sf: torch.Tensor,
+    token_selected_experts: torch.Tensor,
+    token_final_scales: torch.Tensor,
+    w1_weight: torch.Tensor,
+    w1_weight_sf: torch.Tensor,
+    w1_alpha: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w2_weight_sf: torch.Tensor,
+    w2_alpha: torch.Tensor,
+    num_experts: int,
+    top_k: int,
+    num_local_experts: Optional[int] = None,
+    local_expert_offset: int = 0,
+    moe_output: Optional[torch.Tensor] = None,
+    aux_stream: Optional[torch.cuda.Stream] = None,
+    tactic: Optional[Tuple[Any, ...]] = None,
+    enable_pdl: bool = True,
+    activation_type: int = ActivationType.Swiglu.value,
+    swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
+    swiglu_beta: float = DEFAULT_SWIGLU_BETA,
+    swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
+) -> torch.Tensor:
+    """Run fused MoE with MXFP8 activations and packed MXFP4 weights.
 
+    Warning
+    -------
+    This API will be deprecated in the future, please use
+    :func:`cute_dsl_fused_moe` with ``quant_mode="w4a8"`` instead.
+
+    Unlike the NVFP4 entry point this interface has no ``fc2_input_scale``;
+    it is forwarded as ``None``. See :func:`cute_dsl_fused_moe` for the full
+    parameter documentation.
+    """
+    return cute_dsl_fused_moe(
+        x,
+        x_sf,
+        token_selected_experts,
+        token_final_scales,
+        w1_weight,
+        w1_weight_sf,
+        w1_alpha,
+        None,
+        w2_weight,
+        w2_weight_sf,
+        w2_alpha,
+        num_experts,
+        top_k,
+        num_local_experts,
+        local_expert_offset,
+        torch.bfloat16,
+        True,
+        moe_output,
+        aux_stream,
+        enable_pdl,
+        activation_type,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
+        quant_mode="w4a8",
+        tactic=tactic,
+    )
+
+
+class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
+    """Production wrapper for the MXFP8 x MXFP4 fused-MoE pipeline.
+
+    Warning
+    -------
+    This API will be deprecated in the future, please use
+    :class:`CuteDslMoEWrapper` with ``quant_mode="w4a8"`` instead.
+
+    Because the stream and event resources are reused, one wrapper instance is
+    not reentrant or safe for concurrent calls. The first ``run`` binds the
+    instance to that call's CUDA stream; create one wrapper per stream.
+    """
+
+    @supported_compute_capability([100, 103])
+    @flashinfer_api
     def __init__(
         self,
         num_experts: int,
@@ -1401,6 +1546,17 @@ class _CuteDslMxfp8Mxfp4MoEWrapperCompat(CuteDslMoEWrapper):
         swiglu_beta: float = DEFAULT_SWIGLU_BETA,
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
     ) -> None:
+        """Initialize a reusable mixed-precision fused-MoE runner.
+
+        Warning
+        -------
+        This API will be deprecated in the future, please use
+        :class:`CuteDslMoEWrapper` with ``quant_mode="w4a8"`` instead.
+
+        ``max_num_tokens`` is accepted for backwards compatibility but
+        ignored. See :class:`CuteDslMoEWrapper` for the full parameter
+        documentation.
+        """
         super().__init__(
             num_experts=num_experts,
             top_k=top_k,
@@ -1419,6 +1575,7 @@ class _CuteDslMxfp8Mxfp4MoEWrapperCompat(CuteDslMoEWrapper):
             quant_mode="w4a8",
         )
 
+    @flashinfer_api
     def run(
         self,
         x: torch.Tensor,
@@ -1433,6 +1590,17 @@ class _CuteDslMxfp8Mxfp4MoEWrapperCompat(CuteDslMoEWrapper):
         w2_alpha: torch.Tensor,
         tactic: Optional[Tuple[Any, ...]] = None,
     ) -> torch.Tensor:
+        """Run the MXFP8 x MXFP4 fused-MoE forward pass.
+
+        Warning
+        -------
+        This API will be deprecated in the future, please use
+        :meth:`CuteDslMoEWrapper.run` with ``quant_mode="w4a8"`` instead.
+
+        This entry point has no ``fc2_input_scale``; it is forwarded as
+        ``None``. See :meth:`CuteDslMoEWrapper.run` for the full parameter
+        documentation.
+        """
         return super().run(
             x,
             x_sf,
@@ -1449,36 +1617,10 @@ class _CuteDslMxfp8Mxfp4MoEWrapperCompat(CuteDslMoEWrapper):
         )
 
 
-_DEPRECATED_APIS = {
-    "cute_dsl_fused_moe_nvfp4": (
-        cute_dsl_fused_moe,
-        "cute_dsl_fused_moe with quant_mode='w4a4'",
-    ),
-    "cute_dsl_fused_moe_mxfp8_mxfp4": (
-        _cute_dsl_fused_moe_mxfp8_mxfp4_compat,
-        "cute_dsl_fused_moe with quant_mode='w4a8'",
-    ),
-    "CuteDslMxfp8Mxfp4MoEWrapper": (
-        _CuteDslMxfp8Mxfp4MoEWrapperCompat,
-        "CuteDslMoEWrapper with quant_mode='w4a8'",
-    ),
-}
-
-
-def __getattr__(name: str):
-    if name in _DEPRECATED_APIS:
-        target, replacement = _DEPRECATED_APIS[name]
-        warnings.warn(
-            f"{name} is deprecated; use {replacement} instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return target
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 __all__ = [
     "cute_dsl_fused_moe",
     "CuteDslMoEWrapper",
-    *_DEPRECATED_APIS,
+    "cute_dsl_fused_moe_nvfp4",
+    "cute_dsl_fused_moe_mxfp8_mxfp4",
+    "CuteDslMxfp8Mxfp4MoEWrapper",
 ]
