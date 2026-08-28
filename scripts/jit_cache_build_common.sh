@@ -115,12 +115,13 @@ install_released_sccache() {
   echo "sccache install duration: $((SECONDS - sccache_install_started_at)) seconds"
 }
 
-# Build and install a pinned sccache revision natively. Building inside each
-# manylinux builder produces the matching x86_64 or aarch64 binary without
-# relying on an unpublished binary artifact.
-install_patched_sccache() {
+# Build a pinned sccache revision natively. Building inside each manylinux
+# builder produces the matching x86_64 or aarch64 binary without relying on an
+# unpublished binary artifact.
+build_patched_sccache() {
   local sccache_revision=$1
   local expected_sha256=$2
+  local output_path=$3
   local sccache_package="sccache-${sccache_revision}"
   local sccache_archive="${sccache_package}.tar.gz"
   local sccache_url="https://github.com/mozilla/sccache/archive/${sccache_revision}.tar.gz"
@@ -128,9 +129,7 @@ install_patched_sccache() {
   local required_command
   local sccache_build_started_at=${SECONDS}
 
-  echo "::group::Build patched sccache (cu134, $(uname -m))"
-
-  for required_command in cargo curl env sha256sum tar; do
+  for required_command in cargo curl env install make perl sha256sum tar; do
     if ! command -v "${required_command}" >/dev/null 2>&1; then
       echo "ERROR: ${required_command} is required to build patched sccache"
       exit 1
@@ -153,14 +152,37 @@ install_patched_sccache() {
     --locked \
     --release \
     --no-default-features \
-    --features s3 \
+    --features s3,vendored-openssl \
     --bin sccache \
     --manifest-path "${sccache_tmpdir}/${sccache_package}/Cargo.toml"
-  mv "${sccache_tmpdir}/${sccache_package}/target/release/sccache" /usr/local/bin/
+  mkdir -p "$(dirname "${output_path}")"
+  install -m 0755 \
+    "${sccache_tmpdir}/${sccache_package}/target/release/sccache" \
+    "${output_path}"
   rm -rf "${sccache_tmpdir}"
-  chmod +x /usr/local/bin/sccache
-  echo "::endgroup::"
   echo "patched sccache build duration: $((SECONDS - sccache_build_started_at)) seconds"
+}
+
+# Install the pinned source build, reusing a binary produced by a dedicated
+# workflow step when available. Other call sites retain a self-contained
+# fallback that builds directly into /usr/local/bin.
+install_patched_sccache() {
+  local sccache_revision=$1
+  local expected_sha256=$2
+
+  if [ -n "${SCCACHE_PATCHED_BINARY_PATH:-}" ]; then
+    if [ ! -x "${SCCACHE_PATCHED_BINARY_PATH}" ]; then
+      echo "ERROR: Prebuilt patched sccache not found: ${SCCACHE_PATCHED_BINARY_PATH}"
+      exit 1
+    fi
+    echo "Installing prebuilt patched sccache from ${SCCACHE_PATCHED_BINARY_PATH}"
+    install -m 0755 "${SCCACHE_PATCHED_BINARY_PATH}" /usr/local/bin/sccache
+  else
+    build_patched_sccache \
+      "${sccache_revision}" \
+      "${expected_sha256}" \
+      /usr/local/bin/sccache
+  fi
 }
 
 # Install the official release by default. CUDA 13.4 uses the first upstream
