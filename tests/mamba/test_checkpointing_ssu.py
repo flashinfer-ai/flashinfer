@@ -15,6 +15,7 @@ from einops import repeat
 from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.mamba.checkpointing_ssu import (
     CheckpointingSSURunner,
+    _CTA_PER_SM_CANDIDATES,
     _checkpointing_ssu_tuning_config,
     _device_tuning_signature,
     _get_checkpointing_ssu_runner,
@@ -750,6 +751,13 @@ def test_autotune_tactics_deduplicate_identical_small_batch_grids():
 
     non_power_of_two_tactics = _make_tactics(14, 32, 14, 148, 1, 1)
     assert {tactic[2] for tactic in non_power_of_two_tactics[1:]} == {14, 7, 1}
+
+
+def test_autotune_tactics_sweep_every_cta_per_sm_candidate():
+    tactics = _make_tactics(16, 400, 16, 148, 1, 1)
+
+    assert tuple(range(1, 33)) == _CTA_PER_SM_CANDIDATES
+    assert {tactic[1] for tactic in tactics[1:]} == set(_CTA_PER_SM_CANDIDATES)
 
 
 def test_autotune_tactic_carries_profile_d_split(monkeypatch):

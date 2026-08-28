@@ -44,6 +44,7 @@ _ALGORITHM_TWO_KERNEL = 2
 # A tactic is (main pipeline stages, main CTAs/SM, precompute heads/CTA,
 # d_split).  All-zero launch controls select the monolithic kernel.
 _CheckpointingSSUTactic = tuple[int, int, int, int]
+_CTA_PER_SM_CANDIDATES = tuple(range(1, 33))
 
 
 @functools.cache
@@ -107,7 +108,7 @@ def _make_tactics(
     total_work = two_kernel_d_split * batch * num_heads
     seen_launches: set[tuple[int, int, int]] = set()
     for stages in (1, 2):
-        for ctas_per_sm in (1, 2, 4, 8, 16):
+        for ctas_per_sm in _CTA_PER_SM_CANDIDATES:
             grid = min(ctas_per_sm * num_sms, total_work)
             for heads_per_cta in heads_per_cta_candidates:
                 launch = (stages, grid, heads_per_cta)
@@ -395,6 +396,7 @@ class CheckpointingSSURunner(TunableRunner):
             self._pad_slot_id,
             self._requested_d_split,
             self._optional_tensor_presence,
+            _CTA_PER_SM_CANDIDATES,
             _device_tuning_signature(device),
         )
 
