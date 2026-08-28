@@ -1,6 +1,6 @@
 {
   "name": "prims_ts_decode_mla_wrapper_h128_d_qk576_ps32_sq4",
-  "description": "Reusable PrimTS MLA decode wrapper. Page tables, sequence lengths, Q offsets, masks, and static bounds are retained by plan(); run() receives only query, KV cache, scales, and an optional output buffer.",
+  "description": "Reusable PrimTS MLA decode wrapper. The plan fixes masks, static bounds, and exact batch size; page tables, sequence lengths, and Q offsets may be retained by the plan or supplied live to run().",
   "op_type": "mla_paged",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.mla_decode.BatchMLADecodePagedTSWrapper.run",
@@ -12,7 +12,7 @@
   "axes": {
     "batch_size": {
       "type": "var",
-      "description": "Number of plan-owned MLA requests."
+      "description": "Exact number of planned MLA requests."
     },
     "num_heads": {
       "type": "const",
@@ -34,9 +34,13 @@
       "type": "const",
       "value": 32
     },
+    "max_pages_per_seq": {
+      "type": "var",
+      "description": "Live block-table column capacity."
+    },
     "len_qo_indptr": {
       "type": "var",
-      "description": "Length of plan-owned cumulative Q offsets."
+      "description": "Length of cumulative Q offsets."
     },
     "seq_len_q": {
       "type": "const",
@@ -48,6 +52,7 @@
     "head_dim_qk == 576",
     "kv_lora_rank == 512",
     "page_size in (16, 32, 64, 128)",
+    "block_tables is None or block_tables.shape[0] == batch_size",
     "seq_len_q >= 1"
   ],
   "inputs": {
@@ -68,13 +73,30 @@
       ],
       "dtype": "bfloat16"
     },
+    "block_tables": {
+      "shape": [
+        "batch_size",
+        "max_pages_per_seq"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Physical page table supplied live to run()."
+    },
+    "seq_lens": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Per-request KV lengths supplied live to run()."
+    },
     "qo_indptr": {
       "shape": [
         "len_qo_indptr"
       ],
       "dtype": "int32",
       "optional": true,
-      "description": "Cumulative Q offsets retained by plan()."
+      "description": "Cumulative Q offsets retained or supplied live."
     },
     "max_seq_len_q": {
       "shape": null,
