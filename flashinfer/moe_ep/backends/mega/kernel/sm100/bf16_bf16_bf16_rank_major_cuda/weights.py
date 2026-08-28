@@ -36,9 +36,7 @@ def _shuffle_rows(weight: "torch.Tensor", *, gated: bool) -> "torch.Tensor":
         )
     logical_row = torch.arange(rows, device=weight.device)
     row_in_block = logical_row % 32
-    physical_row = (
-        (logical_row // 32) * 32 + (row_in_block % 4) * 8 + row_in_block // 4
-    )
+    physical_row = (logical_row // 32) * 32 + (row_in_block % 4) * 8 + row_in_block // 4
     inverse = torch.empty_like(physical_row)
     inverse[physical_row] = logical_row
     return weight.index_select(1, inverse)

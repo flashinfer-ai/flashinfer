@@ -32,8 +32,7 @@ def validate_rank_major_forward_inputs(
         )
     if scales is not None:
         raise MoEEpConfigError(
-            "sm100_bf16_bf16_bf16_rank_major_cuda does not accept "
-            "MoEEpTensors.scales"
+            "sm100_bf16_bf16_bf16_rank_major_cuda does not accept MoEEpTensors.scales"
         )
     validate_mega_forward_inputs(
         hidden_states,

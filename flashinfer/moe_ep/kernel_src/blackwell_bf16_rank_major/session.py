@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import hashlib
 import json
@@ -280,7 +281,10 @@ def _load_manifest() -> tuple[dict[str, Any], Path]:
     if manifest.get("constraints") != expected_constraints:
         raise RuntimeError("Blackwell BF16 rank-major manifest constraints drifted")
     stages = manifest.get("stages")
-    if not isinstance(stages, list) or tuple(stage.get("name") for stage in stages) != _STAGE_NAMES:
+    if (
+        not isinstance(stages, list)
+        or tuple(stage.get("name") for stage in stages) != _STAGE_NAMES
+    ):
         raise RuntimeError("Blackwell BF16 rank-major stage order drifted")
     symbols = manifest.get("kernel_symbols")
     if symbols != [stage.get("symbol") for stage in stages]:
@@ -295,9 +299,10 @@ def _load_manifest() -> tuple[dict[str, Any], Path]:
             raise RuntimeError("Blackwell BF16 rank-major stage has no symbol")
         stage_name = stage["name"]
         bindings = stage.get("bindings")
-        if not isinstance(bindings, list) or tuple(bindings) != _STAGE_BINDINGS[
-            stage_name
-        ]:
+        if (
+            not isinstance(bindings, list)
+            or tuple(bindings) != _STAGE_BINDINGS[stage_name]
+        ):
             raise RuntimeError(
                 f"Blackwell BF16 rank-major stage {stage_name} binding order drifted"
             )
@@ -312,15 +317,18 @@ def _load_manifest() -> tuple[dict[str, Any], Path]:
                 )
         for field in ("grid", "block", "cluster"):
             value = stage.get(field)
-            if not isinstance(value, list) or len(value) != 3 or not all(
-                isinstance(item, int) and item > 0 for item in value
+            if (
+                not isinstance(value, list)
+                or len(value) != 3
+                or not all(isinstance(item, int) and item > 0 for item in value)
             ):
                 raise RuntimeError(
                     f"Blackwell BF16 rank-major stage {stage.get('name')} has invalid {field}"
                 )
-        if not isinstance(stage.get("dynamic_smem_bytes"), int) or stage[
-            "dynamic_smem_bytes"
-        ] < 0:
+        if (
+            not isinstance(stage.get("dynamic_smem_bytes"), int)
+            or stage["dynamic_smem_bytes"] < 0
+        ):
             raise RuntimeError(
                 f"Blackwell BF16 rank-major stage {stage.get('name')} has invalid shared memory"
             )
@@ -397,8 +405,7 @@ def _compile_cubin(source_path: Path, manifest: dict[str, Any]) -> Path:
             if process.returncode != 0:
                 temporary.unlink(missing_ok=True)
                 raise RuntimeError(
-                    "Blackwell BF16 rank-major nvcc build failed:\n"
-                    f"{process.stderr}"
+                    f"Blackwell BF16 rank-major nvcc build failed:\n{process.stderr}"
                 )
             os.replace(temporary, cubin_path)
     return cubin_path
@@ -543,9 +550,7 @@ class _KernelLibrary:
                 "cluster"
             ]
             attribute = drv.CUlaunchAttribute()
-            attribute.id = (
-                drv.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
-            )
+            attribute.id = drv.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
             attribute.value = value
             attributes.append(attribute)
         if stage["use_pdl"]:
@@ -603,10 +608,15 @@ class BlackwellBf16RankMajorSession:
         }
         for name, (actual, wanted) in expected.items():
             if actual != wanted:
-                raise ValueError(f"Blackwell BF16 rank-major requires {name}={wanted}, got {actual}")
+                raise ValueError(
+                    f"Blackwell BF16 rank-major requires {name}={wanted}, got {actual}"
+                )
         if not torch.cuda.is_available():
             raise RuntimeError("Blackwell BF16 rank-major session requires CUDA")
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        if (
+            not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
             raise RuntimeError(
                 "Blackwell BF16 rank-major session requires initialized torch.distributed"
             )
@@ -676,9 +686,7 @@ class BlackwellBf16RankMajorSession:
         self._expert_scatter_offsets = torch.empty(
             (_LOCAL_EXPERTS,), dtype=torch.int32, device=self._device
         )
-        self._expert_padded_row_offsets = torch.empty_like(
-            self._expert_scatter_offsets
-        )
+        self._expert_padded_row_offsets = torch.empty_like(self._expert_scatter_offsets)
         self._cta_to_expert = torch.empty(
             (_MAX_Y_GROUPS,), dtype=torch.int32, device=self._device
         )
@@ -710,9 +718,7 @@ class BlackwellBf16RankMajorSession:
         self._library = _KernelLibrary(
             cubin_path, self._manifest["stages"], self._device_index
         )
-        self._weight_descriptor_sets: dict[
-            tuple[int, int], _WeightDescriptorSet
-        ] = {}
+        self._weight_descriptor_sets: dict[tuple[int, int], _WeightDescriptorSet] = {}
         self._active_weight_key: tuple[int, int] | None = None
         self._descriptors: dict[str, int] = {}
 
@@ -728,7 +734,12 @@ class BlackwellBf16RankMajorSession:
     ) -> None:
         self._require_open()
         expected = (
-            ("hidden_states", hidden_states, (_TOKENS_PER_RANK, _HIDDEN_SIZE), torch.bfloat16),
+            (
+                "hidden_states",
+                hidden_states,
+                (_TOKENS_PER_RANK, _HIDDEN_SIZE),
+                torch.bfloat16,
+            ),
             ("topk_ids", topk_ids, (_TOKENS_PER_RANK, _TOP_K), torch.int64),
             ("topk_weights", topk_weights, (_TOKENS_PER_RANK, _TOP_K), torch.float32),
         )
@@ -787,7 +798,11 @@ class BlackwellBf16RankMajorSession:
                 "fc1_weights",
                 w13_block_major,
                 (64, 2 * _INTERMEDIATE_SIZE, _HIDDEN_SIZE // 64, _LOCAL_EXPERTS),
-                (128, 2 * _INTERMEDIATE_SIZE * 64 * 2, (_HIDDEN_SIZE // 64) * 2 * _INTERMEDIATE_SIZE * 64 * 2),
+                (
+                    128,
+                    2 * _INTERMEDIATE_SIZE * 64 * 2,
+                    (_HIDDEN_SIZE // 64) * 2 * _INTERMEDIATE_SIZE * 64 * 2,
+                ),
                 (64, 64, 2, 1),
             ),
             (
@@ -801,21 +816,33 @@ class BlackwellBf16RankMajorSession:
                 "fc1_output",
                 self._compact_intermediate,
                 (_INTERMEDIATE_SIZE, 64, dim_max, dim_max),
-                (_INTERMEDIATE_SIZE * 2, (xlarge - _INTERMEDIATE_SIZE) * 2, _INTERMEDIATE_SIZE * 2),
+                (
+                    _INTERMEDIATE_SIZE * 2,
+                    (xlarge - _INTERMEDIATE_SIZE) * 2,
+                    _INTERMEDIATE_SIZE * 2,
+                ),
                 (64, 64, 1, 1),
             ),
             (
                 "fc2_weights",
                 w2_block_major,
                 (64, _HIDDEN_SIZE, _INTERMEDIATE_SIZE // 64, _LOCAL_EXPERTS),
-                (128, _HIDDEN_SIZE * 64 * 2, (_INTERMEDIATE_SIZE // 64) * _HIDDEN_SIZE * 64 * 2),
+                (
+                    128,
+                    _HIDDEN_SIZE * 64 * 2,
+                    (_INTERMEDIATE_SIZE // 64) * _HIDDEN_SIZE * 64 * 2,
+                ),
                 (64, 128, 2, 1),
             ),
             (
                 "fc2_input",
                 self._compact_intermediate,
                 (_INTERMEDIATE_SIZE, 64, dim_max, dim_max),
-                (_INTERMEDIATE_SIZE * 2, (xlarge - _INTERMEDIATE_SIZE) * 2, _INTERMEDIATE_SIZE * 2),
+                (
+                    _INTERMEDIATE_SIZE * 2,
+                    (xlarge - _INTERMEDIATE_SIZE) * 2,
+                    _INTERMEDIATE_SIZE * 2,
+                ),
                 (64, 32, 1, 1),
             ),
             (
@@ -868,63 +895,108 @@ class BlackwellBf16RankMajorSession:
         world_rank = (_WORLD_SIZE, self._rank)
         if name == "input_barrier":
             return (
-                (p(self._expert_ids_i64), p(self._topk_ids.local), *world_rank, p(self._flags.peers)),
-                (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p),
+                (
+                    p(self._expert_ids_i64),
+                    p(self._topk_ids.local),
+                    *world_rank,
+                    p(self._flags.peers),
+                ),
+                (
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_int32,
+                    ctypes.c_int32,
+                    ctypes.c_void_p,
+                ),
             )
         if name == "dispatch":
-            values = (
-                p(self._recv_hidden), p(self._recv_local_ids), p(self._recv_weights),
-                *world_rank, p(self._flags.peers), p(self._hidden_states.local),
-                p(self._hidden_states.peers), p(self._topk_ids.local),
-                p(self._topk_ids.peers), p(self._topk_weights.local),
+            values: tuple[Any, ...] = (
+                p(self._recv_hidden),
+                p(self._recv_local_ids),
+                p(self._recv_weights),
+                *world_rank,
+                p(self._flags.peers),
+                p(self._hidden_states.local),
+                p(self._hidden_states.peers),
+                p(self._topk_ids.local),
+                p(self._topk_ids.peers),
+                p(self._topk_weights.local),
                 p(self._topk_weights.peers),
             )
             return values, (
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
             )
         if name == "route_reset":
             sentinel = self._gemm2_output[_FIXED_EXPERT_ROWS]
             values = (p(self._expert_scatter_offsets), p(sentinel))
             return values, self._pointer_types(2)
         if name == "route_count":
-            values = (p(self._recv_local_ids), p(self._expert_scatter_offsets), p(self._token_to_permuted))
+            values = (
+                p(self._recv_local_ids),
+                p(self._expert_scatter_offsets),
+                p(self._token_to_permuted),
+            )
             return values, self._pointer_types(3)
         if name == "route_finalize":
             values = (
-                p(self._expert_scatter_offsets), p(self._cta_to_expert),
-                p(self._cta_to_mn_limit), p(self._expert_padded_row_offsets),
-                p(self._num_non_exiting_ctas), p(self._total_padded_rows),
+                p(self._expert_scatter_offsets),
+                p(self._cta_to_expert),
+                p(self._cta_to_mn_limit),
+                p(self._expert_padded_row_offsets),
+                p(self._num_non_exiting_ctas),
+                p(self._total_padded_rows),
                 p(self._route_map),
             )
             return values, self._pointer_types(7)
         if name == "route_scatter":
             values = (
-                p(self._recv_local_ids), p(self._expert_padded_row_offsets),
-                p(self._route_map), p(self._token_to_permuted),
+                p(self._recv_local_ids),
+                p(self._expert_padded_row_offsets),
+                p(self._route_map),
+                p(self._token_to_permuted),
             )
             return values, self._pointer_types(4)
         if name == "gemm1_swiglu":
             values = (
-                self._descriptors["fc1_weights"], self._descriptors["fc1_recv_hidden"],
-                self._descriptors["fc1_output"], p(self._route_map),
-                p(self._num_non_exiting_ctas), p(self._cta_to_expert),
-                p(self._cta_to_mn_limit), _HIDDEN_SIZE,
+                self._descriptors["fc1_weights"],
+                self._descriptors["fc1_recv_hidden"],
+                self._descriptors["fc1_output"],
+                p(self._route_map),
+                p(self._num_non_exiting_ctas),
+                p(self._cta_to_expert),
+                p(self._cta_to_mn_limit),
+                _HIDDEN_SIZE,
             )
             return values, (*self._pointer_types(7), ctypes.c_int32)
         if name == "gemm2":
             values = (
-                self._descriptors["fc2_weights"], self._descriptors["fc2_input"],
-                self._descriptors["fc2_output"], p(self._num_non_exiting_ctas),
-                p(self._cta_to_expert), p(self._cta_to_mn_limit), _INTERMEDIATE_SIZE,
+                self._descriptors["fc2_weights"],
+                self._descriptors["fc2_input"],
+                self._descriptors["fc2_output"],
+                p(self._num_non_exiting_ctas),
+                p(self._cta_to_expert),
+                p(self._cta_to_mn_limit),
+                _INTERMEDIATE_SIZE,
             )
             return values, (*self._pointer_types(6), ctypes.c_int32)
         if name == "local_unpermute":
             values = (
-                p(self._gemm2_output), p(self._recv_weights),
-                p(self._token_to_permuted), p(self._local_partials.local), _HIDDEN_SIZE,
+                p(self._gemm2_output),
+                p(self._recv_weights),
+                p(self._token_to_permuted),
+                p(self._local_partials.local),
+                _HIDDEN_SIZE,
             )
             return values, (*self._pointer_types(4), ctypes.c_int32)
         if name == "partial_barrier":
@@ -934,12 +1006,19 @@ class BlackwellBf16RankMajorSession:
             )
         if name == "combine":
             values = (
-                p(output), *world_rank, p(self._flags.peers),
-                p(self._local_partials.local), p(self._local_partials.peers),
+                p(output),
+                *world_rank,
+                p(self._flags.peers),
+                p(self._local_partials.local),
+                p(self._local_partials.peers),
             )
             return values, (
-                ctypes.c_void_p, ctypes.c_int32, ctypes.c_int32,
-                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_int32,
+                ctypes.c_int32,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
             )
         raise RuntimeError(f"unknown Blackwell BF16 rank-major stage {name!r}")
 
@@ -984,10 +1063,8 @@ class BlackwellBf16RankMajorSession:
         self._descriptors.clear()
 
     def __del__(self) -> None:
-        try:
+        with contextlib.suppress(Exception):
             self.destroy()
-        except Exception:
-            pass
 
 
 __all__ = ["BlackwellBf16RankMajorSession"]

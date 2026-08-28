@@ -39,9 +39,7 @@ class Bf16RankMajorCudaMegaKernelBackend(MegaKernelBackend):
         self,
         config: Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig,
     ) -> None:
-        if not isinstance(
-            config, Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig
-        ):
+        if not isinstance(config, Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig):
             raise TypeError(
                 f"{_KERNEL_NAME} config must be "
                 "Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig, got "
@@ -182,9 +180,7 @@ class Bf16RankMajorCudaMegaKernelBackend(MegaKernelBackend):
         output: torch.Tensor | None,
     ) -> torch.Tensor:
         if output is None:
-            raise MoEEpConfigError(
-                f"{_KERNEL_NAME} requires an owned output tensor"
-            )
+            raise MoEEpConfigError(f"{_KERNEL_NAME} requires an owned output tensor")
         workspace.bind_weights(
             transformed_weights.w13_block_major,
             transformed_weights.w2_block_major,

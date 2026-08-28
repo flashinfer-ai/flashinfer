@@ -18,11 +18,7 @@ import torch
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _PACKAGE_ROOT = (
-    _PROJECT_ROOT
-    / "flashinfer"
-    / "moe_ep"
-    / "kernel_src"
-    / "blackwell_bf16_rank_major"
+    _PROJECT_ROOT / "flashinfer" / "moe_ep" / "kernel_src" / "blackwell_bf16_rank_major"
 )
 _SESSION_PATH = _PACKAGE_ROOT / "session.py"
 _SOURCE_NAME = "flashinfer_blackwell_moe_ep_layer_sm100.cu"
@@ -61,9 +57,7 @@ def _manifest(module, source: bytes) -> dict:
                 "block": list(block),
                 "cluster": list(cluster),
                 "dynamic_smem_bytes": dynamic_smem_bytes,
-                "scalar_bindings": [
-                    list(binding) for binding in scalar_bindings
-                ],
+                "scalar_bindings": [list(binding) for binding in scalar_bindings],
                 "pdl_sync": pdl_sync,
                 "pdl_launch": pdl_launch,
                 "use_pdl": use_pdl,
@@ -113,12 +107,11 @@ def test_packaged_source_manifest_is_complete_and_self_consistent():
     manifest, source_path = module._load_manifest()
 
     assert source_path == _PACKAGE_ROOT / "src" / _SOURCE_NAME
-    assert manifest["source_sha256"] == hashlib.sha256(
-        source_path.read_bytes()
-    ).hexdigest()
-    assert tuple(stage["name"] for stage in manifest["stages"]) == (
-        module._STAGE_NAMES
+    assert (
+        manifest["source_sha256"]
+        == hashlib.sha256(source_path.read_bytes()).hexdigest()
     )
+    assert tuple(stage["name"] for stage in manifest["stages"]) == (module._STAGE_NAMES)
 
 
 def test_package_data_declares_the_immutable_source_pair():
@@ -186,9 +179,7 @@ def test_manifest_accepts_only_the_exact_host_contract(tmp_path, monkeypatch):
             "launch contract drifted",
         ),
         (
-            lambda manifest: manifest["stages"][0].update(
-                dynamic_smem_bytes=-1
-            ),
+            lambda manifest: manifest["stages"][0].update(dynamic_smem_bytes=-1),
             "invalid shared memory",
         ),
     ),
@@ -300,11 +291,15 @@ def test_weight_transform_matches_full_fc1_and_fc2_logical_layout():
     intermediate = hidden = 64
     elements_w13 = experts * 2 * intermediate * hidden
     elements_w2 = experts * hidden * intermediate
-    w13 = (torch.arange(elements_w13) % 997).to(torch.bfloat16).reshape(
-        experts, 2 * intermediate, hidden
+    w13 = (
+        (torch.arange(elements_w13) % 997)
+        .to(torch.bfloat16)
+        .reshape(experts, 2 * intermediate, hidden)
     )
-    w2 = (torch.arange(elements_w2) % 991).to(torch.bfloat16).reshape(
-        experts, hidden, intermediate
+    w2 = (
+        (torch.arange(elements_w2) % 991)
+        .to(torch.bfloat16)
+        .reshape(experts, hidden, intermediate)
     )
 
     transformed = preprocess_mega_weights(

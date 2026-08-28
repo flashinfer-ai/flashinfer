@@ -28,6 +28,9 @@ from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
 
 
+_CUDA_DEVICE = torch.device("cuda:0")
+
+
 def _exact_fleet() -> FleetParams:
     return FleetParams(
         num_experts=256,
@@ -40,9 +43,7 @@ def _exact_fleet() -> FleetParams:
 
 
 def _backend() -> Bf16RankMajorCudaMegaKernelBackend:
-    backend = create_mega_kernel(
-        Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig()
-    )
+    backend = create_mega_kernel(Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig())
     assert isinstance(backend, Bf16RankMajorCudaMegaKernelBackend)
     return backend
 
@@ -113,9 +114,7 @@ def test_init_rejects_high_throughput_mode():
     ("config", "message"),
     (
         (
-            Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig(
-                intermediate_size=1024
-            ),
+            Sm100_Bf16_Bf16_Bf16_RankMajorCuda_MegaMoeConfig(intermediate_size=1024),
             "intermediate_size=2048",
         ),
         (
@@ -220,7 +219,7 @@ def test_weight_preprocess_rejects_non_bf16_canonical_weights():
 
 
 class _FakeTensor:
-    def __init__(self, shape, dtype, *, device=torch.device("cuda:0")) -> None:
+    def __init__(self, shape, dtype, *, device=_CUDA_DEVICE) -> None:
         self.shape = shape
         self.ndim = len(shape)
         self.dtype = dtype
