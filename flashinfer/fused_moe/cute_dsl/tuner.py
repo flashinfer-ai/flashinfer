@@ -28,6 +28,7 @@ Tactic format follows TRT-LLM's style and is architecture-dependent:
 Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 """
 
+import dataclasses
 import itertools
 import logging
 import warnings
@@ -54,11 +55,12 @@ from ..utils import (
     map_to_hybrid_bucket_uncapped,
 )
 from ._inputs_helper import CuteDslMoEInputsHelper
-from .blackwell.moe_w4a16 import launch_w4a16_moe
+from .blackwell.moe_w4a16 import DEFAULT_W4A16_MOE_TACTIC, launch_w4a16_moe
 from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 from .moe_utils import (
     normalize_cute_dsl_moe_activation_type,
     normalize_cute_dsl_moe_weight_interleave,
+    prepare_moe_routing,
     validate_cute_dsl_moe_situ_config,
 )
 
@@ -71,6 +73,39 @@ def _seeded_activation(shapes, dtype, device):
         return torch.randn(shapes, device=device, generator=generator).to(dtype)
     return torch.randint(
         0, 256, shapes, dtype=dtype, device=device, generator=generator
+    )
+
+
+def _seeded_router_logits(shapes, dtype, device):
+    return torch.randn(
+        shapes,
+        dtype=dtype,
+        device=device,
+        generator=torch.Generator(device=device).manual_seed(515),
+    )
+
+
+def _optional_router_logits(inputs):
+    if len(inputs) > 1:
+        raise ValueError("expected at most one router_logits tensor")
+    return inputs[0] if inputs else None
+
+
+def _with_router_logits(config: TuningConfig, input_idx: int) -> TuningConfig:
+    dynamic_spec = config.dynamic_tensor_specs[0]
+    return dataclasses.replace(
+        config,
+        dynamic_tensor_specs=(
+            dataclasses.replace(
+                dynamic_spec,
+                input_idx=(*dynamic_spec.input_idx, input_idx),
+                dim_idx=(*dynamic_spec.dim_idx, 0),
+            ),
+        ),
+        tensor_initializers=(
+            *config.tensor_initializers,
+            (input_idx, _seeded_router_logits),
+        ),
     )
 
 
@@ -566,7 +601,9 @@ class CuteDslFusedMoERunner(TunableRunner):
         4-8: w1_weight, w1_weight_sf, w1_alpha, w1_bias, fc2_input_scale
         9-12: w2_weight, w2_weight_sf, w2_alpha, w2_bias
         13: moe_output, or per_token_scale when per-token activation is enabled
-        14: moe_output when per-token activation is enabled
+        14: moe_output with per-token activation, otherwise router_logits
+            when provided
+        15: router_logits with per-token activation when provided
 
     Args:
         forward_impl: The actual MoE implementation function.
@@ -600,7 +637,6 @@ class CuteDslFusedMoERunner(TunableRunner):
             integer to use one fixed factor.
         activation_format: Activation quantization format.
         weight_format: Weight quantization format.
-
     Also supports Rubin (SM107): tactic format is architecture-dependent —
     see _extract_tactic_params.
     """
@@ -664,6 +700,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.w2_pdl_count = w2_pdl_count
         self.enable_pdl = w1_pdl_count is not None or w2_pdl_count is not None
         self.w1_split_k = w1_split_k
+        self.routing_cache: dict[tuple, Dict[str, torch.Tensor]] = {}
         if (activation_format is None) != (weight_format is None):
             raise ValueError(
                 "activation_format and weight_format must be specified together"
@@ -694,14 +731,17 @@ class CuteDslFusedMoERunner(TunableRunner):
             num_experts, top_k, num_local_experts, local_expert_offset
         )
 
+        router_logits_idx = 15 if use_per_token_activation else 14
+        dynamic_input_indices = (0, 1, 2, 3, 13) + (
+            (14,) if use_per_token_activation else ()
+        )
         # Instance-level so dummy expert IDs span all local experts
         # (randint(0, num_experts)) for realistic profiling.
         self.tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
-                    input_idx=(0, 1, 2, 3, 13)
-                    + ((14,) if use_per_token_activation else ()),
-                    dim_idx=(0,) * (6 if use_per_token_activation else 5),
+                    input_idx=dynamic_input_indices,
+                    dim_idx=(0,) * len(dynamic_input_indices),
                     # Bare callables: autotuner adapts the bucket set to
                     # the actual input dim (matches the
                     # _FP8_GEMM_SM100_TUNING_CONFIG pattern in
@@ -797,6 +837,9 @@ class CuteDslFusedMoERunner(TunableRunner):
             use_cold_l2_cache=True,
             use_cuda_graph=True,
         )
+        self._logits_tuning_config = _with_router_logits(
+            self.tuning_config, router_logits_idx
+        )
 
     def __hash__(self):
         return hash(
@@ -861,6 +904,14 @@ class CuteDslFusedMoERunner(TunableRunner):
             w1_bias is not None,
             w2_bias is not None,
         )
+
+    def get_tuning_config(self, inputs: List[torch.Tensor]) -> TuningConfig:
+        num_inputs = 15 if self.use_per_token_activation else 14
+        if len(inputs) == num_inputs:
+            return self.tuning_config
+        if len(inputs) == num_inputs + 1:
+            return self._logits_tuning_config
+        raise ValueError(f"expected {num_inputs} inputs and optional router_logits")
 
     def get_valid_tactics(  # type: ignore[override]
         self,
@@ -1108,7 +1159,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                 [x, x_sf, token_selected_experts, token_final_scales,
                  w1_weight, w1_weight_sf, w1_alpha, w1_bias, fc2_input_scale,
                  w2_weight, w2_weight_sf, w2_alpha, w2_bias,
-                 per_token_scale (optional), moe_output (optional)]
+                 per_token_scale (optional), moe_output (optional), router_logits (optional)]
             tactic: Tactic tuple (tile_size, gemm1_tactic, gemm2_tactic) or None for default.
             do_preparation: If True, perform one-time setup (not used).
             **kwargs: Additional keyword arguments passed to forward_impl.
@@ -1145,15 +1196,30 @@ class CuteDslFusedMoERunner(TunableRunner):
                 )
             per_token_scale = optional_inputs[0]
             moe_output = optional_inputs[1] if len(optional_inputs) > 1 else None
+            router_inputs = optional_inputs[2:]
         else:
             per_token_scale = None
             moe_output = optional_inputs[0] if optional_inputs else None
+            router_inputs = optional_inputs[1:]
+        router_logits = _optional_router_logits(router_inputs)
 
+        routing = prepare_moe_routing(
+            router_logits,
+            token_final_scales,
+            token_selected_experts,
+            self.num_experts,
+            self.top_k,
+            self.num_local_experts,
+            self.local_expert_offset,
+            params["tile_size"],
+            self.use_fused_finalize,
+            self.enable_pdl,
+            self.routing_cache,
+        )
         common_kwargs = dict(
             x=x,
             x_sf=x_sf,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
+            routing=routing,
             w1_weight=w1_weight,
             w1_weight_sf=w1_weight_sf,
             w1_alpha=w1_alpha,
@@ -1256,7 +1322,8 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
     Inputs:
         [x, token_selected_experts, token_final_scales,
          w1_weight, w1_weight_sf, w1_alpha,
-         w2_weight, w2_weight_sf, w2_alpha, moe_output]
+         w2_weight, w2_weight_sf, w2_alpha, moe_output,
+         router_logits (optional)]
     """
 
     def __init__(
@@ -1292,13 +1359,14 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        self.routing_cache: dict[tuple, Dict[str, torch.Tensor]] = {}
         # Match production EP routing density while retaining seeded load
         # variance around route-tile boundaries.
         self.tuning_config = TuningConfig(
             dynamic_tensor_specs=(
                 DynamicTensorSpec(
                     input_idx=(0, 1, 2, 9),
-                    dim_idx=(0, 0, 0, 0),
+                    dim_idx=(0,) * 4,
                     gen_tuning_buckets=get_hybrid_num_tokens_buckets,
                     map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
                 ),
@@ -1344,6 +1412,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             ),
             use_cold_l2_cache=True,
         )
+        self._logits_tuning_config = _with_router_logits(self.tuning_config, 10)
 
     def __hash__(self):
         return hash(
@@ -1380,6 +1449,13 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             self.situ_beta,
             self.situ_linear_beta,
         )
+
+    def get_tuning_config(self, inputs: List[torch.Tensor]) -> TuningConfig:
+        if len(inputs) == 10:
+            return self.tuning_config
+        if len(inputs) == 11:
+            return self._logits_tuning_config
+        raise ValueError("expected 10 inputs and optional router_logits")
 
     def get_valid_tactics(  # type: ignore[override]
         self,
@@ -1450,7 +1526,9 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             w2_weight_sf,
             w2_alpha,
             moe_output,
+            *optional_inputs,
         ) = inputs
+        router_logits = _optional_router_logits(optional_inputs)
         if x.dtype != torch.bfloat16:
             raise TypeError(f"W4A16 requires x.dtype=torch.bfloat16, got {x.dtype}")
         if token_final_scales.dtype != torch.float32:
@@ -1470,10 +1548,25 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 f"moe_output must have shape {(num_tokens, hidden_size)}, "
                 f"got {tuple(moe_output.shape)}"
             )
+        resolved_tactic = None if tactic is None or tactic == -1 else tactic
+        route_tile = (resolved_tactic or DEFAULT_W4A16_MOE_TACTIC)[0][0][1]
+        routing = prepare_moe_routing(
+            router_logits,
+            token_final_scales,
+            token_selected_experts,
+            self.num_experts,
+            self.top_k,
+            self.num_local_experts,
+            self.local_expert_offset,
+            route_tile,
+            self.use_fused_finalize,
+            self.enable_pdl,
+            self.routing_cache,
+        )
+
         return launch_w4a16_moe(
             x=x,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
+            routing=routing,
             w1_weight=w1_weight,
             w1_weight_sf=w1_weight_sf,
             w1_alpha=w1_alpha,
@@ -1492,7 +1585,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
-            tactic=None if tactic is None or tactic == -1 else tactic,
+            tactic=resolved_tactic,
         )
 
 

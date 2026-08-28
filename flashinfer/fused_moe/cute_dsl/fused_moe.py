@@ -81,7 +81,6 @@ from ...utils import get_compute_capability, supported_compute_capability
 from ..api import QuantVariant
 from .moe_utils import (
     moe_output_memset_inplace,
-    moe_sort,
     moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
     normalize_cute_dsl_moe_weight_interleave,
@@ -140,6 +139,55 @@ def _get_cuda_graph_resources() -> Dict[str, Any]:
 # =============================================================================
 # Core Implementation (Shared by Functional and Wrapper APIs)
 # =============================================================================
+
+
+def validate_routing_inputs(
+    token_selected_experts: Optional[torch.Tensor],
+    token_final_scales: Optional[torch.Tensor],
+    router_logits: Optional[torch.Tensor],
+    num_experts: int,
+    top_k: int,
+    num_local_experts: int,
+    local_expert_offset: int,
+    device: torch.device,
+) -> Tuple[int, bool, torch.Tensor, torch.Tensor]:
+    if router_logits is None:
+        if token_selected_experts is None or token_final_scales is None:
+            raise ValueError(
+                "provide router_logits or both token_selected_experts and "
+                "token_final_scales"
+            )
+        return (
+            token_selected_experts.size(0),
+            False,
+            token_selected_experts,
+            token_final_scales,
+        )
+    if token_selected_experts is not None or token_final_scales is not None:
+        raise ValueError(
+            "provide either router_logits or token_selected_experts and "
+            "token_final_scales, not both"
+        )
+    if num_local_experts != num_experts or local_expert_offset != 0:
+        raise ValueError("router_logits requires all experts to be local")
+    if tuple(router_logits.shape[1:]) != (num_experts,):
+        raise ValueError(f"router_logits must have shape [num_tokens, {num_experts}]")
+    if not router_logits.is_contiguous():
+        raise ValueError("router_logits must be contiguous")
+    if router_logits.device != device:
+        raise ValueError("router_logits and x must be on the same device")
+    if router_logits.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+        raise TypeError(
+            "router_logits must have dtype torch.bfloat16, torch.float16, or "
+            f"torch.float32, got {router_logits.dtype}"
+        )
+    num_tokens = router_logits.size(0)
+    return (
+        num_tokens,
+        True,
+        torch.empty((num_tokens, top_k), dtype=torch.int32, device=device),
+        torch.empty((num_tokens, top_k), dtype=torch.float32, device=device),
+    )
 
 
 def validate_w4a8_inputs(
@@ -216,9 +264,7 @@ def _moe_core_impl(
     # Input
     x: torch.Tensor,
     x_sf: Optional[torch.Tensor],
-    # Routing
-    token_selected_experts: torch.Tensor,
-    token_final_scales: torch.Tensor,
+    routing: Dict[str, Any],
     # GEMM1 weights
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
@@ -253,8 +299,6 @@ def _moe_core_impl(
     gemm1_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     gemm2_mma_tiler: Optional[Tuple[int, int, int]] = None,
     gemm2_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
-    # Pre-allocated buffers (for CUDA graph)
-    moe_sort_buffers: Optional[Dict[str, torch.Tensor]] = None,
     gemm1_out: Optional[torch.Tensor] = None,
     gemm1_out_scale: Optional[torch.Tensor] = None,
     moe_output: Optional[torch.Tensor] = None,
@@ -281,7 +325,7 @@ def _moe_core_impl(
     """Core MoE implementation shared by functional and wrapper APIs.
 
     This function handles:
-    1. moe_sort: Token routing computation
+    1. Routed-token permutation
     2. GEMM1 + activation
     3. GEMM2 with optional atomic finalize
     4. Routing-weight reduction in deterministic mode
@@ -289,8 +333,7 @@ def _moe_core_impl(
     Args:
         x: Packed W4A4 or MXFP8 W4A8 input tensor.
         x_sf: W4A4 or W4A8 scale factors for x.
-        token_selected_experts: Expert assignments [num_tokens, top_k].
-        token_final_scales: Routing weights [num_tokens, top_k].
+        routing: Precomputed expert assignments, weights, and row mappings.
         w1_weight: GEMM1 weights (gate + up fused for gated activations, or a
             single projection for non-gated activations).
         w1_weight_sf: Scale factors for w1_weight.
@@ -306,7 +349,7 @@ def _moe_core_impl(
         top_k: Number of experts per token.
         num_local_experts: Number of local experts (for EP).
         local_expert_offset: Expert offset for EP.
-        tile_size: Tile size for moe_sort.
+        tile_size: Routed-row tile size.
         gemm1_mma_tiler_mn: GEMM1 MMA tiler shape.
         gemm1_cluster_shape_mn: GEMM1 cluster shape.
         w1_raster_along_m: GEMM1 rasterization direction.
@@ -316,7 +359,6 @@ def _moe_core_impl(
         gemm2_cluster_shape_mn: GEMM2 cluster shape.
         w2_raster_along_m: GEMM2 rasterization direction.
         w2_pdl_count: GEMM2 dependent-launch K-tile count.
-        moe_sort_buffers: Pre-allocated moe_sort output buffers.
         gemm1_out: Pre-allocated GEMM1 output buffer.
         gemm1_out_scale: Pre-allocated GEMM1 output scale buffer.
         moe_output: Pre-allocated final output buffer.
@@ -369,6 +411,8 @@ def _moe_core_impl(
         raise ValueError("SiTU is not supported when format is W4A8")
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
 
+    token_selected_experts = routing["token_selected_experts"]
+    token_final_scales = routing["token_final_scales"]
     num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
     use_per_token_activation = per_token_scale is not None
@@ -424,25 +468,16 @@ def _moe_core_impl(
             main_event = main_event or resources["main_event"]
             memset_event = memset_event or resources["memset_event"]
 
-    # Step 1: Sort tokens by expert
-    moe_sort_kwargs = moe_sort_buffers or {}
-    (
-        tile_idx_to_expert_idx,
-        tile_idx_to_mn_limit,
-        expanded_idx_to_permuted_idx,
-        permuted_idx_to_expanded_idx,
-        total_num_padded_tokens,
-        num_non_exiting_tiles,
-    ) = moe_sort(
-        token_selected_experts=token_selected_experts,
-        token_final_scales=token_final_scales,
-        num_experts=num_experts,
-        top_k=top_k,
-        local_expert_offset=local_expert_offset,
-        num_local_experts=num_local_experts,
-        tile_tokens_dim=tile_size,
-        **moe_sort_kwargs,
-    )
+    # Step 1: Route tokens by expert
+    tile_idx_to_expert_idx = routing["tile_idx_to_expert_idx"]
+    tile_idx_to_mn_limit = routing["tile_idx_to_mn_limit"]
+    expanded_idx_to_permuted_idx = routing["expanded_idx_to_permuted_idx"]
+    permuted_idx_to_expanded_idx = routing["permuted_idx_to_expanded_idx"]
+    num_non_exiting_tiles = routing["num_non_exiting_tiles"]
+    if not use_fused_finalize and expanded_idx_to_permuted_idx is None:
+        raise ValueError(
+            "deterministic finalize requires expanded-to-permuted routing metadata"
+        )
 
     # For Rubin, round num_non_exiting_tiles to the next EVEN number to
     # prevent a cluster-synchronization deadlock. With cluster_shape_m=2,
@@ -860,7 +895,7 @@ class CuteDslMoEWrapper:
             # Create auto-tuner runner. Use a weak trampoline instead of a bound
             # method so the runner cannot keep CUDA graph resources alive after the
             # wrapper drops out of scope.
-            self._runner = CuteDslFusedMoERunner(
+            runner_kwargs = dict(
                 forward_impl=_forward_with_tactic_weak,
                 num_experts=num_experts,
                 top_k=top_k,
@@ -875,31 +910,15 @@ class CuteDslMoEWrapper:
                 swiglu_limit=swiglu_limit,
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
-                use_per_token_activation=False,
                 activation_format=activation_format,
                 weight_format=weight_format,
                 weight_interleave=weight_interleave,
             )
+            self._runner = CuteDslFusedMoERunner(**runner_kwargs)
             if activation_format is QuantVariant.NVFP4:
                 self._per_token_runner = CuteDslFusedMoERunner(
-                    forward_impl=_forward_with_tactic_weak,
-                    num_experts=num_experts,
-                    top_k=top_k,
-                    num_local_experts=self.num_local_experts,
-                    local_expert_offset=local_expert_offset,
-                    use_fused_finalize=use_fused_finalize,
-                    output_dtype=output_dtype,
-                    enable_pdl=enable_pdl,
-                    activation_type=activation.value,
-                    swiglu_alpha=swiglu_alpha,
-                    swiglu_beta=swiglu_beta,
-                    swiglu_limit=swiglu_limit,
-                    situ_beta=situ_beta,
-                    situ_linear_beta=situ_linear_beta,
+                    **runner_kwargs,
                     use_per_token_activation=True,
-                    activation_format=activation_format,
-                    weight_format=weight_format,
-                    weight_interleave=weight_interleave,
                 )
 
             if use_cuda_graph:
@@ -907,7 +926,7 @@ class CuteDslMoEWrapper:
                 self._main_event = torch.cuda.Event()
                 self._memset_event = torch.cuda.Event()
         else:
-            self._w4a16_runner = CuteDslFusedMoEW4A16Runner(
+            runner_kwargs = dict(
                 num_experts=num_experts,
                 top_k=top_k,
                 num_local_experts=self.num_local_experts,
@@ -922,13 +941,13 @@ class CuteDslMoEWrapper:
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
             )
+            self._w4a16_runner = CuteDslFusedMoEW4A16Runner(**runner_kwargs)
 
     def _forward_with_tactic(
         self,
         x: torch.Tensor,
         x_sf: Optional[torch.Tensor],
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
+        routing: Dict[str, Any],
         w1_weight: torch.Tensor,
         w1_weight_sf: torch.Tensor,
         w1_alpha: Optional[torch.Tensor],
@@ -970,8 +989,7 @@ class CuteDslMoEWrapper:
         return _moe_core_impl(
             x=x,
             x_sf=x_sf,
-            token_selected_experts=token_selected_experts,
-            token_final_scales=token_final_scales,
+            routing=routing,
             w1_weight=w1_weight,
             w1_weight_sf=w1_weight_sf,
             w1_alpha=w1_alpha,
@@ -999,7 +1017,6 @@ class CuteDslMoEWrapper:
             gemm1_mma_inst_shape=gemm1_mma_inst_shape,
             gemm2_mma_tiler=gemm2_mma_tiler,
             gemm2_mma_inst_shape=gemm2_mma_inst_shape,
-            moe_sort_buffers=None,
             gemm1_out=None,
             gemm1_out_scale=None,
             moe_output=moe_output,
@@ -1066,17 +1083,18 @@ class CuteDslMoEWrapper:
         self,
         x: torch.Tensor,
         x_sf: Optional[torch.Tensor],
-        token_selected_experts: torch.Tensor,
-        token_final_scales: torch.Tensor,
-        w1_weight: torch.Tensor,
-        w1_weight_sf: torch.Tensor,
-        w1_alpha: Optional[torch.Tensor],
-        fc2_input_scale: Optional[torch.Tensor],
-        w2_weight: torch.Tensor,
-        w2_weight_sf: torch.Tensor,
-        w2_alpha: Optional[torch.Tensor],
+        token_selected_experts: Optional[torch.Tensor] = None,
+        token_final_scales: Optional[torch.Tensor] = None,
+        w1_weight: torch.Tensor = None,
+        w1_weight_sf: torch.Tensor = None,
+        w1_alpha: Optional[torch.Tensor] = None,
+        fc2_input_scale: Optional[torch.Tensor] = None,
+        w2_weight: torch.Tensor = None,
+        w2_weight_sf: torch.Tensor = None,
+        w2_alpha: Optional[torch.Tensor] = None,
         tactic: Optional[Tuple] = None,
         *,
+        router_logits: Optional[torch.Tensor] = None,
         per_token_scale: Optional[torch.Tensor] = None,
         w1_bias: Optional[torch.Tensor] = None,
         w2_bias: Optional[torch.Tensor] = None,
@@ -1095,10 +1113,10 @@ class CuteDslMoEWrapper:
             for W4A16.
         x_sf : Optional[torch.Tensor]
             Scale factors for W4A4 or W4A8; must be ``None`` for W4A16.
-        token_selected_experts : torch.Tensor
-            Expert assignments of shape ``[num_tokens, top_k]``.
-        token_final_scales : torch.Tensor
-            Routing weights of shape ``[num_tokens, top_k]``.
+        token_selected_experts : Optional[torch.Tensor]
+            Precomputed expert assignments of shape ``[num_tokens, top_k]``.
+        token_final_scales : Optional[torch.Tensor]
+            Precomputed routing weights of shape ``[num_tokens, top_k]``.
         w1_weight : torch.Tensor
             GEMM1 weights (gate + up fused for gated activations, or a single
             projection for non-gated activations).
@@ -1118,6 +1136,9 @@ class CuteDslMoEWrapper:
         tactic : Optional[Tuple]
             Tactic tuple, or ``None`` for auto-selection via the runtime
             tuner.
+        router_logits : Optional[torch.Tensor]
+            Router logits of shape ``[num_tokens, num_experts]``. Supply
+            instead of the precomputed routing tensors.
         per_token_scale : Optional[torch.Tensor]
             Optional W4A4 per-token input row scale for GEMM1.
         w1_bias : Optional[torch.Tensor]
@@ -1137,7 +1158,26 @@ class CuteDslMoEWrapper:
             Output tensor of shape ``[num_tokens, hidden_size]``.
         """
         self._bind_weight_interleave(weight_interleave)
-        num_tokens = token_selected_experts.size(0)
+        num_tokens, uses_router_logits, token_selected_experts, token_final_scales = (
+            validate_routing_inputs(
+                token_selected_experts,
+                token_final_scales,
+                router_logits,
+                self.num_experts,
+                self.top_k,
+                self.num_local_experts,
+                self.local_expert_offset,
+                x.device,
+            )
+        )
+        for name, tensor in (
+            ("w1_weight", w1_weight),
+            ("w1_weight_sf", w1_weight_sf),
+            ("w2_weight", w2_weight),
+            ("w2_weight_sf", w2_weight_sf),
+        ):
+            if tensor is None:
+                raise ValueError(f"{name} is required")
 
         if (
             self.activation_format is QuantVariant.MXFP8
@@ -1223,6 +1263,8 @@ class CuteDslMoEWrapper:
             if use_per_token_activation:
                 inputs.append(per_token_scale)
             inputs.append(moe_output)
+            if uses_router_logits:
+                inputs.append(router_logits)
         else:
             if (
                 x_sf is not None
@@ -1248,6 +1290,10 @@ class CuteDslMoEWrapper:
                 w2_alpha,
                 moe_output,
             ]
+            if uses_router_logits:
+                inputs.append(router_logits)
+        if uses_router_logits:
+            op_name += "::Logits"
         if runner is None:
             raise RuntimeError("CuTe-DSL MoE runner was not initialized")
         if tactic is not None:
@@ -1256,7 +1302,7 @@ class CuteDslMoEWrapper:
         _, best_tactic = tuner.choose_one(
             op_name,
             [runner],
-            runner.tuning_config,
+            runner.get_tuning_config(inputs),
             inputs,
         )
         if self.activation_format is not QuantVariant.BF16:
@@ -1285,8 +1331,7 @@ class CuteDslMoEWrapper:
 def _cute_dsl_fused_moe_impl(
     x: torch.Tensor,
     x_sf: Optional[torch.Tensor],
-    token_selected_experts: torch.Tensor,
-    token_final_scales: torch.Tensor,
+    routing: Dict[str, Any],
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
     w1_alpha: Optional[torch.Tensor],
@@ -1334,8 +1379,7 @@ def _cute_dsl_fused_moe_impl(
     return _moe_core_impl(
         x=x,
         x_sf=x_sf,
-        token_selected_experts=token_selected_experts,
-        token_final_scales=token_final_scales,
+        routing=routing,
         w1_weight=w1_weight,
         w1_weight_sf=w1_weight_sf,
         w1_alpha=w1_alpha,
@@ -1386,17 +1430,17 @@ def _cute_dsl_fused_moe_impl(
 def cute_dsl_fused_moe(
     x: torch.Tensor,
     x_sf: Optional[torch.Tensor],
-    token_selected_experts: torch.Tensor,
-    token_final_scales: torch.Tensor,
-    w1_weight: torch.Tensor,
-    w1_weight_sf: torch.Tensor,
-    w1_alpha: Optional[torch.Tensor],
-    fc2_input_scale: Optional[torch.Tensor],
-    w2_weight: torch.Tensor,
-    w2_weight_sf: torch.Tensor,
-    w2_alpha: Optional[torch.Tensor],
-    num_experts: int,
-    top_k: int,
+    token_selected_experts: Optional[torch.Tensor] = None,
+    token_final_scales: Optional[torch.Tensor] = None,
+    w1_weight: Optional[torch.Tensor] = None,
+    w1_weight_sf: Optional[torch.Tensor] = None,
+    w1_alpha: Optional[torch.Tensor] = None,
+    fc2_input_scale: Optional[torch.Tensor] = None,
+    w2_weight: Optional[torch.Tensor] = None,
+    w2_weight_sf: Optional[torch.Tensor] = None,
+    w2_alpha: Optional[torch.Tensor] = None,
+    num_experts: Optional[int] = None,
+    top_k: Optional[int] = None,
     num_local_experts: Optional[int] = None,
     local_expert_offset: int = 0,
     output_dtype: torch.dtype = torch.bfloat16,
@@ -1413,6 +1457,7 @@ def cute_dsl_fused_moe(
     w1_bias: Optional[torch.Tensor] = None,
     w2_bias: Optional[torch.Tensor] = None,
     *,
+    router_logits: Optional[torch.Tensor] = None,
     quant_mode: Optional[str] = None,
     activation_format: QuantVariant = QuantVariant.NVFP4,
     weight_format: QuantVariant = QuantVariant.NVFP4,
@@ -1438,10 +1483,10 @@ def cute_dsl_fused_moe(
         W4A16.
     x_sf : Optional[torch.Tensor]
         Scale factors for W4A4 or W4A8; must be ``None`` for W4A16.
-    token_selected_experts : torch.Tensor
-        Expert assignments of shape ``[num_tokens, top_k]``.
-    token_final_scales : torch.Tensor
-        Routing weights of shape ``[num_tokens, top_k]``.
+    token_selected_experts : Optional[torch.Tensor]
+        Precomputed expert assignments of shape ``[num_tokens, top_k]``.
+    token_final_scales : Optional[torch.Tensor]
+        Precomputed routing weights of shape ``[num_tokens, top_k]``.
     w1_weight : torch.Tensor
         GEMM1 weights (gate + up fused for gated activations, or a single
         projection for non-gated activations).
@@ -1507,6 +1552,15 @@ def cute_dsl_fused_moe(
     w2_bias : Optional[torch.Tensor]
         Optional per-expert FC2 bias with shape
         ``[num_local_experts, hidden_size]``.
+    router_logits : Optional[torch.Tensor]
+        Router logits of shape ``[num_tokens, num_experts]``. Supply instead
+        of the precomputed routing tensors.
+    quant_mode : Optional[str]
+        Deprecated alias for ``activation_format`` and ``weight_format``.
+    activation_format : QuantVariant
+        Activation quantization format. Defaults to ``QuantVariant.NVFP4``.
+    weight_format : QuantVariant
+        Weight quantization format. Defaults to ``QuantVariant.NVFP4``.
     per_token_scale : Optional[torch.Tensor]
         Optional W4A4 per-token input row scale for GEMM1.
     tactic : Optional[Tuple]
@@ -1565,6 +1619,30 @@ def cute_dsl_fused_moe(
     if activation_format is not QuantVariant.BF16:
         warn_deprecated_cute_dsl_moe_weight_interleave(weight_interleave, x.device)
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
+    if num_experts is None or top_k is None:
+        raise ValueError("num_experts and top_k are required")
+    if num_local_experts is None:
+        num_local_experts = num_experts
+    num_tokens, uses_router_logits, token_selected_experts, token_final_scales = (
+        validate_routing_inputs(
+            token_selected_experts,
+            token_final_scales,
+            router_logits,
+            num_experts,
+            top_k,
+            num_local_experts,
+            local_expert_offset,
+            x.device,
+        )
+    )
+    for name, tensor in (
+        ("w1_weight", w1_weight),
+        ("w1_weight_sf", w1_weight_sf),
+        ("w2_weight", w2_weight),
+        ("w2_weight_sf", w2_weight_sf),
+    ):
+        if tensor is None:
+            raise ValueError(f"{name} is required")
 
     if activation_format is QuantVariant.MXFP8:
         if x.dtype is not torch.float8_e4m3fn:
@@ -1603,10 +1681,6 @@ def cute_dsl_fused_moe(
     ):
         raise ValueError("w1_alpha and w2_alpha are required when format is W4A16")
 
-    if num_local_experts is None:
-        num_local_experts = num_experts
-
-    num_tokens = token_selected_experts.size(0)
     hidden_size = w2_weight.size(1)
 
     if moe_output is None:
@@ -1662,6 +1736,8 @@ def cute_dsl_fused_moe(
         if use_per_token_activation:
             inputs.append(per_token_scale)
         inputs.append(moe_output)
+        if uses_router_logits:
+            inputs.append(router_logits)
 
     else:
         if (
@@ -1702,13 +1778,17 @@ def cute_dsl_fused_moe(
             w2_alpha,
             moe_output,
         ]
+        if uses_router_logits:
+            inputs.append(router_logits)
+    if uses_router_logits:
+        op_name += "::Logits"
     if tactic is not None:
         return runner(inputs, tactic=tactic, aux_stream=aux_stream)
 
     _, best_tactic = tuner.choose_one(
         op_name,
         [runner],
-        runner.tuning_config,
+        runner.get_tuning_config(inputs),
         inputs,
         aux_stream=aux_stream,
     )

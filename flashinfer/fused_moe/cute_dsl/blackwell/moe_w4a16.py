@@ -4,7 +4,7 @@
 """SM100 NVFP4-weight, BF16-activation fused MoE launcher."""
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -16,11 +16,8 @@ from flashinfer.cute_dsl.utils import (
     make_ptr,
 )
 from flashinfer.fused_moe.cute_dsl.moe_utils import (
-    allocate_moe_sort_buffers,
     get_max_num_permuted_tokens,
-    moe_output_memset_inplace,
     moe_permute,
-    moe_sort,
     moe_unpermute,
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
@@ -48,7 +45,6 @@ DEFAULT_W4A16_MOE_TACTIC: W4A16MoeTactic = (
 
 @dataclass
 class _W4A16Workspace:
-    moe_sort_buffers: Dict[str, torch.Tensor]
     hidden_workspace: torch.Tensor
     intermediate: torch.Tensor
 
@@ -59,7 +55,6 @@ _kernel_cache: Dict[Tuple, object] = {}
 def _get_workspace(
     x: torch.Tensor,
     top_k: int,
-    num_experts: int,
     num_local_experts: int,
     intermediate_size: int,
     route_tile: int,
@@ -69,14 +64,6 @@ def _get_workspace(
         num_tokens, top_k, num_local_experts, route_tile
     )
     return _W4A16Workspace(
-        moe_sort_buffers=allocate_moe_sort_buffers(
-            num_tokens=num_tokens,
-            num_experts=num_experts,
-            top_k=top_k,
-            num_local_experts=num_local_experts,
-            tile_tokens_dim=route_tile,
-            device=x.device,
-        ),
         # Match the established W4A4 wrapper path: scratch tensors are local to
         # one invocation, so PyTorch's caching allocator can reuse them across
         # sequential layers and its private graph pool owns captured addresses.
@@ -357,8 +344,7 @@ def _run_grouped_gemm(
 
 def launch_w4a16_moe(
     x: torch.Tensor,
-    token_selected_experts: torch.Tensor,
-    token_final_scales: torch.Tensor,
+    routing: Dict[str, Any],
     w1_weight: torch.Tensor,
     w1_weight_sf: torch.Tensor,
     w1_alpha: torch.Tensor,
@@ -380,6 +366,8 @@ def launch_w4a16_moe(
     tactic: Optional[W4A16MoeTactic] = None,
 ) -> torch.Tensor:
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
+    token_selected_experts = routing["token_selected_experts"]
+    token_final_scales = routing["token_final_scales"]
     top_k = int(token_selected_experts.size(1))
     intermediate_size = int(w2_weight.size(2)) * 2
     activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
@@ -399,30 +387,20 @@ def launch_w4a16_moe(
     workspace = _get_workspace(
         x,
         top_k,
-        num_experts,
         num_local_experts,
         intermediate_size,
         route_tile,
     )
 
-    (
-        tile_idx_to_expert_idx,
-        tile_idx_to_mn_limit,
-        expanded_idx_to_permuted_idx,
-        permuted_idx_to_expanded_idx,
-        _,
-        num_non_exiting_tiles,
-    ) = moe_sort(
-        token_selected_experts=token_selected_experts,
-        token_final_scales=token_final_scales,
-        num_experts=num_experts,
-        top_k=top_k,
-        local_expert_offset=local_expert_offset,
-        num_local_experts=num_local_experts,
-        tile_tokens_dim=route_tile,
-        enable_pdl=enable_pdl,
-        **workspace.moe_sort_buffers,
-    )
+    tile_idx_to_expert_idx = routing["tile_idx_to_expert_idx"]
+    tile_idx_to_mn_limit = routing["tile_idx_to_mn_limit"]
+    expanded_idx_to_permuted_idx = routing["expanded_idx_to_permuted_idx"]
+    permuted_idx_to_expanded_idx = routing["permuted_idx_to_expanded_idx"]
+    num_non_exiting_tiles = routing["num_non_exiting_tiles"]
+    if not use_fused_finalize and expanded_idx_to_permuted_idx is None:
+        raise ValueError(
+            "deterministic finalize requires expanded-to-permuted routing metadata"
+        )
     num_tokens = int(x.size(0))
     route_slots = get_max_num_permuted_tokens(
         num_tokens, top_k, num_local_experts, route_tile
@@ -430,7 +408,8 @@ def launch_w4a16_moe(
     num_route_tiles = route_slots // route_tile
     tile_idx_to_expert_idx = tile_idx_to_expert_idx[:num_route_tiles]
     tile_idx_to_mn_limit = tile_idx_to_mn_limit[:num_route_tiles]
-    expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx[:num_tokens]
+    if expanded_idx_to_permuted_idx is not None:
+        expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx[:num_tokens]
     permuted_idx_to_expanded_idx = permuted_idx_to_expanded_idx[:route_slots]
     hidden_workspace = workspace.hidden_workspace[:route_slots]
     intermediate = workspace.intermediate[:route_slots]
@@ -469,7 +448,7 @@ def launch_w4a16_moe(
     )
     gemm2_output = moe_output if use_fused_finalize else hidden_workspace
     if use_fused_finalize:
-        moe_output_memset_inplace(moe_output)
+        moe_output.zero_()
     _run_grouped_gemm(
         weight=w2_weight,
         weight_sf=w2_weight_sf,

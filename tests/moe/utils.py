@@ -835,6 +835,7 @@ def create_moe_tensors(
         "x_bf16": x_bf16,
         "x_ref": x_ref,
         "x_per_token_scale": x_per_token_scale,
+        "router_logits": router_logits,
         "token_selected_experts": selected_experts,
         "token_final_scales": routing_weights,
         "w1_weight": w1_q,

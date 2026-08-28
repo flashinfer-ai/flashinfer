@@ -3578,7 +3578,7 @@ trtllm_mxint4_block_scale_moe_trace = TraceTemplate(
 
 
 # ---------------------------------------------------------------------------
-# CuteDSL MoE variants (precomputed routing, FP4 weights on SM100+)
+# CuteDSL MoE variants (FP4 weights on SM100+)
 # ---------------------------------------------------------------------------
 
 cute_dsl_fused_moe_trace = TraceTemplate(
@@ -3586,7 +3586,7 @@ cute_dsl_fused_moe_trace = TraceTemplate(
     name_prefix="cute_dsl_fused_moe",
     description=(
         "CuteDSL fused MoE on SM100, SM103, or SM107 (W4A8 excludes SM107). "
-        "Runs W4A4, W4A8, or W4A16 with precomputed top-k routing."
+        "Runs W4A4, W4A8, or W4A16 with precomputed or fused logits routing."
     ),
     axes={
         "num_tokens": Var(description="Total tokens across the batch."),
@@ -3637,12 +3637,28 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         "token_selected_experts": Tensor(
             ["num_tokens", "top_k"],
             dtype="int32",
-            description="Precomputed top-k expert ids per token.",
+            optional=True,
+            description=(
+                "Precomputed top-k expert ids per token; provide with "
+                "token_final_scales instead of router_logits."
+            ),
         ),
         "token_final_scales": Tensor(
             ["num_tokens", "top_k"],
             dtype="float32",
-            description="Precomputed per-token routing scales.",
+            optional=True,
+            description=(
+                "Precomputed per-token routing scales; provide with "
+                "token_selected_experts instead of router_logits."
+            ),
+        ),
+        "router_logits": Tensor(
+            ["num_tokens", "num_experts"],
+            optional=True,
+            description=(
+                "Router logits for fused top-k and CuTe routing; requires all "
+                "experts to be local."
+            ),
         ),
         "w1_weight": Tensor(
             ["num_local_experts", "gemm1_out_size", "num_packed_hidden"],
@@ -4212,8 +4228,6 @@ _b12x_wrapper_axes["top_k"] = Var(description="Experts per token.")
 def _cute_dsl_fused_moe_reference(
     x,
     x_sf,
-    token_selected_experts,
-    token_final_scales,
     w1_weight,
     w1_weight_sf,
     w1_alpha,
@@ -4223,6 +4237,8 @@ def _cute_dsl_fused_moe_reference(
     w2_alpha,
     num_experts,
     top_k,
+    token_selected_experts=None,
+    token_final_scales=None,
     activation_type=ActivationType.Swiglu.value,
     swiglu_alpha=DEFAULT_SWIGLU_ALPHA,
     swiglu_beta=DEFAULT_SWIGLU_BETA,
@@ -4235,6 +4251,7 @@ def _cute_dsl_fused_moe_reference(
     per_token_scale=None,
     w1_bias=None,
     w2_bias=None,
+    router_logits=None,
     **_unused,
 ):
     """Reference for CuteDSL block-scaled MoE with alpha folded into weights."""
@@ -4246,6 +4263,24 @@ def _cute_dsl_fused_moe_reference(
     weight_format = QuantVariant(
         QuantVariant.NVFP4 if weight_format is None else weight_format
     )
+    if router_logits is None:
+        if token_selected_experts is None or token_final_scales is None:
+            raise ValueError(
+                "provide router_logits or both token_selected_experts and "
+                "token_final_scales"
+            )
+    else:
+        if token_selected_experts is not None or token_final_scales is not None:
+            raise ValueError(
+                "provide either router_logits or token_selected_experts and "
+                "token_final_scales, not both"
+            )
+        sorted_logits, sorted_experts = torch.sort(
+            router_logits.float(), dim=-1, descending=True, stable=True
+        )
+        topk_logits = sorted_logits[:, : int(top_k)]
+        token_selected_experts = sorted_experts[:, : int(top_k)]
+        token_final_scales = torch.softmax(topk_logits.float(), dim=-1)
     E_local = w1_weight.shape[0]
     # Dequantize input and weights with alpha factors.
     if (activation_format, weight_format) == (

@@ -31,10 +31,10 @@ bijection check alone does not catch it.
 import pytest
 import torch
 
-from flashinfer.fused_moe.cute_dsl.moe_utils import allocate_moe_sort_buffers
+from flashinfer.fused_moe.cute_dsl.moe_utils import moe_sort
 from flashinfer.utils import is_sm100a_supported
 
-# Must match kContiguousRouteWindowMinTokens in csrc/moe_utils_binding.cu.
+# Must match CONTIGUOUS_ROUTE_WINDOW_MIN_TOKENS in blackwell/moe_sort.py.
 CONTIGUOUS_WINDOW_MIN_TOKENS = 65536
 
 NUM_EXPERTS = 256
@@ -52,8 +52,6 @@ sm100_required = pytest.mark.skipif(
 
 
 def _run_moe_sort(num_tokens: int, tile_size: int, seed: int):
-    from flashinfer.fused_moe.cute_dsl.moe_utils import _get_moe_utils_module
-
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(seed)
     selected = (
@@ -65,45 +63,15 @@ def _run_moe_sort(num_tokens: int, tile_size: int, seed: int):
     final_scales = torch.softmax(
         torch.randn(num_tokens, TOP_K, device=device, generator=generator), dim=-1
     ).contiguous()
-    buffers = allocate_moe_sort_buffers(
-        num_tokens,
-        NUM_EXPERTS,
-        TOP_K,
+    outputs = moe_sort(
+        token_selected_experts=selected,
+        token_final_scales=final_scales,
+        num_experts=NUM_EXPERTS,
+        top_k=TOP_K,
+        local_expert_offset=LOCAL_EXPERT_OFFSET,
         num_local_experts=LOCAL_EXPERTS,
         tile_tokens_dim=tile_size,
-    )
-    expert_counts = torch.empty(
-        (2 * NUM_EXPERTS,), dtype=torch.int32, device=selected.device
-    )
-    _get_moe_utils_module()["flashinfer_moe_sort"](
-        selected.data_ptr(),
-        final_scales.data_ptr(),
-        num_tokens,
-        NUM_EXPERTS,
-        TOP_K,
-        LOCAL_EXPERT_OFFSET,
-        LOCAL_EXPERTS,
-        tile_size,
-        False,
-        buffers["out_tile_idx_to_expert_idx"].data_ptr(),
-        buffers["out_tile_idx_to_mn_limit"].data_ptr(),
-        buffers["out_expanded_idx_to_permuted_idx"].data_ptr(),
-        buffers["out_permuted_idx_to_expanded_idx"].data_ptr(),
-        buffers["out_total_num_padded_tokens"].data_ptr(),
-        buffers["out_num_non_exiting_tiles"].data_ptr(),
-        expert_counts.data_ptr(),
-        torch.cuda.current_stream().cuda_stream,
-    )
-    outputs = tuple(
-        buffers[name]
-        for name in (
-            "out_tile_idx_to_expert_idx",
-            "out_tile_idx_to_mn_limit",
-            "out_expanded_idx_to_permuted_idx",
-            "out_permuted_idx_to_expanded_idx",
-            "out_total_num_padded_tokens",
-            "out_num_non_exiting_tiles",
-        )
+        enable_pdl=False,
     )
     torch.cuda.synchronize()
     return selected, outputs
