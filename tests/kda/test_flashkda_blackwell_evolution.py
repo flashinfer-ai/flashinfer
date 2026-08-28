@@ -102,7 +102,7 @@ def test_flashkda_evolution_jit_spec_has_one_generated_binding(variant, target):
     assert spec.name.endswith(target)
     assert len(spec.sources) == 1
     assert spec.sources[0].name == "binding.cu"
-    assert "--ptxas-options=-O1" in spec.extra_cuda_cflags
+    assert "--ptxas-options=-O1" not in spec.extra_cuda_cflags
 
 
 @pytest.mark.gpu

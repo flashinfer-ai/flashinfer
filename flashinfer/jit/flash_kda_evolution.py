@@ -135,7 +135,6 @@ _TARGET_DEFINE = {
     "sm100a": "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=0",
     "sm100f": "-DFLASHINFER_FLASH_KDA_TARGET_FAMILY=100",
 }
-_PTXAS_OPT_LEVEL = "--ptxas-options=-O1"
 
 
 def _get_csrc_dir() -> Path:
@@ -235,7 +234,6 @@ def gen_flash_kda_evolution_module(
         extra_cuda_cflags=[
             *_NVCC_FLAGS[target],
             _TARGET_DEFINE[target],
-            _PTXAS_OPT_LEVEL,
         ],
         extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
     )
