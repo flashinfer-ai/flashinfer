@@ -153,10 +153,7 @@ def _validate_blackwell_tiled_layout(
             f"blackwell-tiled requires N to be a multiple of 64; got N={n}"
         )
     expected_scale_shape = (k_tiles, n)
-    if (
-        b_descale.dtype != torch.uint8
-        or tuple(b_descale.shape) != expected_scale_shape
-    ):
+    if b_descale.dtype != torch.uint8 or tuple(b_descale.shape) != expected_scale_shape:
         raise ValueError(
             "blackwell-tiled expects S0E5M3 uint8 scales "
             f"with shape {expected_scale_shape}; got dtype={b_descale.dtype}, "
@@ -204,8 +201,7 @@ def _compute_blackwell_bf16_fp4(
         n, layout_code = _validate_blackwell_native_layout(a, b, b_descale)
         if out_dtype not in (torch.bfloat16, torch.float16):
             raise ValueError(
-                "blackwell-native supports bfloat16 or float16 output; "
-                f"got {out_dtype}"
+                f"blackwell-native supports bfloat16 or float16 output; got {out_dtype}"
             )
     elif backend == "blackwell-tiled":
         n, layout_code = _validate_blackwell_tiled_layout(a, b, b_descale)

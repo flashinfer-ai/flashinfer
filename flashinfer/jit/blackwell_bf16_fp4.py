@@ -137,7 +137,9 @@ def _load_abi_manifest(path: Path, target: str) -> tuple[dict[str, Any], bytes]:
             raw.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
         )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"invalid Blackwell BF16 x FP4 ABI manifest {path.name}") from error
+        raise ValueError(
+            f"invalid Blackwell BF16 x FP4 ABI manifest {path.name}"
+        ) from error
     if not isinstance(manifest, dict):
         raise ValueError("Blackwell BF16 x FP4 ABI manifest root must be an object")
 
@@ -161,13 +163,17 @@ def _load_abi_manifest(path: Path, target: str) -> tuple[dict[str, Any], bytes]:
     if manifest["tma_abi"] != "pointer":
         raise ValueError("Blackwell BF16 x FP4 ABI manifest requires pointer TMA ABI")
     if manifest["tensor_map_abi"] != _TENSOR_MAP_ABI:
-        raise ValueError("Blackwell BF16 x FP4 ABI manifest has an incompatible TensorMap ABI")
+        raise ValueError(
+            "Blackwell BF16 x FP4 ABI manifest has an incompatible TensorMap ABI"
+        )
     if manifest["adapter_boundary"] != "separate_translation_unit":
         raise ValueError(
             "Blackwell BF16 x FP4 ABI manifest requires a separate adapter translation unit"
         )
     if manifest["prepared_abis"] != _PREPARED_ABIS:
-        raise ValueError("Blackwell BF16 x FP4 ABI manifest has incompatible prepared layouts")
+        raise ValueError(
+            "Blackwell BF16 x FP4 ABI manifest has incompatible prepared layouts"
+        )
 
     ir_symbols = manifest["ir_symbols"]
     if (
@@ -183,8 +189,12 @@ def _load_abi_manifest(path: Path, target: str) -> tuple[dict[str, Any], bytes]:
         raise ValueError("Blackwell BF16 x FP4 ABI manifest requires 74 kernels")
     kernel_symbols = []
     for kernel in kernels:
-        if not isinstance(kernel, dict) or not isinstance(kernel.get("kernel_symbol"), str):
-            raise ValueError("Blackwell BF16 x FP4 ABI manifest has an invalid kernel record")
+        if not isinstance(kernel, dict) or not isinstance(
+            kernel.get("kernel_symbol"), str
+        ):
+            raise ValueError(
+                "Blackwell BF16 x FP4 ABI manifest has an invalid kernel record"
+            )
         arg_plan = kernel.get("arg_plan")
         if not isinstance(arg_plan, list) or any(
             not isinstance(entry, list)
@@ -192,7 +202,9 @@ def _load_abi_manifest(path: Path, target: str) -> tuple[dict[str, Any], bytes]:
             or any(not isinstance(value, str) or not value for value in entry)
             for entry in arg_plan
         ):
-            raise ValueError("Blackwell BF16 x FP4 ABI manifest kernel is missing arg_plan")
+            raise ValueError(
+                "Blackwell BF16 x FP4 ABI manifest kernel is missing arg_plan"
+            )
         descriptors = kernel.get("tma_descriptors")
         if not isinstance(descriptors, list):
             raise ValueError(
@@ -203,27 +215,39 @@ def _load_abi_manifest(path: Path, target: str) -> tuple[dict[str, Any], bytes]:
             for index, (kind, resource) in enumerate(arg_plan)
             if kind == "tma_buffer"
         ]
-        if any(not isinstance(descriptor, dict) for descriptor in descriptors) or [
-            (descriptor.get("host_argument_index"), descriptor.get("resource"))
-            for descriptor in descriptors
-        ] != tma_arguments:
+        if (
+            any(not isinstance(descriptor, dict) for descriptor in descriptors)
+            or [
+                (descriptor.get("host_argument_index"), descriptor.get("resource"))
+                for descriptor in descriptors
+            ]
+            != tma_arguments
+        ):
             raise ValueError(
                 "Blackwell BF16 x FP4 ABI manifest TMA descriptors do not match pointer arguments"
             )
         kernel_symbols.append(kernel["kernel_symbol"])
     if len(set(kernel_symbols)) != len(kernel_symbols):
-        raise ValueError("Blackwell BF16 x FP4 ABI manifest has duplicate kernel symbols")
+        raise ValueError(
+            "Blackwell BF16 x FP4 ABI manifest has duplicate kernel symbols"
+        )
 
     dispatch = manifest["dispatch"]
     if not isinstance(dispatch, dict):
         raise ValueError("Blackwell BF16 x FP4 ABI manifest dispatch must be an object")
     if dispatch.get("selection") != "ordered_first_match_after_input_validation":
-        raise ValueError("Blackwell BF16 x FP4 ABI manifest has incompatible dispatch ordering")
+        raise ValueError(
+            "Blackwell BF16 x FP4 ABI manifest has incompatible dispatch ordering"
+        )
     if dispatch.get("inputs") != _DISPATCH_INPUTS:
-        raise ValueError("Blackwell BF16 x FP4 ABI manifest has incompatible dispatch inputs")
+        raise ValueError(
+            "Blackwell BF16 x FP4 ABI manifest has incompatible dispatch inputs"
+        )
     routes = dispatch.get("routes")
     if not isinstance(routes, list) or len(routes) != 11:
-        raise ValueError("Blackwell BF16 x FP4 ABI manifest requires 11 dispatch routes")
+        raise ValueError(
+            "Blackwell BF16 x FP4 ABI manifest requires 11 dispatch routes"
+        )
 
     return manifest, raw
 
@@ -235,31 +259,43 @@ def _source_define(source: str, name: str) -> str:
     return match.group(1)
 
 
-def _validate_source_header(source_raw: bytes, manifest_raw: bytes, target: str) -> None:
+def _validate_source_header(
+    source_raw: bytes, manifest_raw: bytes, target: str
+) -> None:
     try:
         source = source_raw.decode("utf-8")
     except UnicodeDecodeError as error:
-        raise ValueError("generated Blackwell BF16 x FP4 source must be UTF-8") from error
+        raise ValueError(
+            "generated Blackwell BF16 x FP4 source must be UTF-8"
+        ) from error
 
     if _source_define(source, "FLASHINFER_BLACKWELL_BF16_FP4_SOURCE_READY") != "1":
         raise ValueError("generated Blackwell BF16 x FP4 source is not marked ready")
     if _source_define(source, "FLASHINFER_BLACKWELL_BF16_FP4_ABI_VERSION") != "2":
-        raise ValueError("generated Blackwell BF16 x FP4 source has an incompatible ABI version")
+        raise ValueError(
+            "generated Blackwell BF16 x FP4 source has an incompatible ABI version"
+        )
     if _source_define(source, "FLASHINFER_BLACKWELL_BF16_FP4_TARGET_SM") != str(
         _TARGET_SM[target]
     ):
-        raise ValueError("generated Blackwell BF16 x FP4 source target does not match manifest")
+        raise ValueError(
+            "generated Blackwell BF16 x FP4 source target does not match manifest"
+        )
 
     raw_source_sha256 = _source_define(
         source, "FLASHINFER_BLACKWELL_BF16_FP4_RAW_SOURCE_SHA256"
     ).strip('"')
     if _SHA256_PATTERN.fullmatch(raw_source_sha256) is None:
-        raise ValueError("generated Blackwell BF16 x FP4 source has an invalid source hash")
+        raise ValueError(
+            "generated Blackwell BF16 x FP4 source has an invalid source hash"
+        )
     manifest_sha256 = _source_define(
         source, "FLASHINFER_BLACKWELL_BF16_FP4_ABI_MANIFEST_SHA256"
     ).strip('"')
     if manifest_sha256 != hashlib.sha256(manifest_raw).hexdigest():
-        raise ValueError("generated Blackwell BF16 x FP4 source does not match its ABI manifest")
+        raise ValueError(
+            "generated Blackwell BF16 x FP4 source does not match its ABI manifest"
+        )
 
 
 def _source_package_key(
@@ -270,7 +306,13 @@ def _source_package_key(
     nvcc: Path,
 ) -> str:
     digest = hashlib.sha256()
-    for part in (source_raw, manifest_raw, binding_raw, target.encode(), str(nvcc).encode()):
+    for part in (
+        source_raw,
+        manifest_raw,
+        binding_raw,
+        target.encode(),
+        str(nvcc).encode(),
+    ):
         digest.update(len(part).to_bytes(8, "little"))
         digest.update(part)
     return digest.hexdigest()[:16]

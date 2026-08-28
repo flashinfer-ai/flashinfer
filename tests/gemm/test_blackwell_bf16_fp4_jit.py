@@ -113,7 +113,7 @@ def test_compute_capability_routing_is_exact(
 
 @pytest.mark.parametrize("capability", [(9, 0), (10, 1), (12, 0)])
 def test_compute_capability_routing_rejects_other_targets(
-    capability: tuple[int, int]
+    capability: tuple[int, int],
 ) -> None:
     with pytest.raises(ValueError, match="requires compute capability 10.0 or 10.3"):
         blackwell_jit._target_for_capability(capability)
@@ -186,9 +186,7 @@ def test_synthetic_launch_preserves_alpha_out_and_pdl(
     a = torch.zeros((2, 16), dtype=torch.bfloat16)
     if backend == "blackwell-native":
         b = torch.zeros((64, 8), dtype=torch.uint8)
-        b_descale = torch.zeros((64, 1), dtype=torch.uint8).view(
-            torch.float8_e4m3fn
-        )
+        b_descale = torch.zeros((64, 1), dtype=torch.uint8).view(torch.float8_e4m3fn)
         layout_code = 0
     else:
         b = torch.zeros((1, 128), dtype=torch.int32)
