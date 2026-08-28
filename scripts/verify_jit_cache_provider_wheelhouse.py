@@ -96,7 +96,10 @@ def read_provider_manifest(wheel: Wheel, provider: str) -> tuple[dict[str, Any],
 
 
 def validate_provider(
-    wheel: Wheel, provider: str, expected_version: str
+    wheel: Wheel,
+    provider: str,
+    expected_version: str,
+    expected_platform_tag: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     expected_distribution = f"flashinfer-jit-cache-{provider}"
     require(
@@ -108,6 +111,11 @@ def validate_provider(
         f"Provider version {wheel.version} does not match {expected_version}",
     )
     require(not wheel.requirements, "Provider wheel must not depend on other wheels")
+    if expected_platform_tag:
+        require(
+            wheel.path.name.endswith(f"-{expected_platform_tag}.whl"),
+            f"Provider wheel {wheel.path.name} does not use {expected_platform_tag}",
+        )
 
     manifest, package_prefix = read_provider_manifest(wheel, provider)
     require(manifest.get("schema_version") == 1, "Unsupported provider manifest")
@@ -388,6 +396,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wheelhouse", type=Path, required=True)
     parser.add_argument("--provider", required=True)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--provider-platform-tag", default="")
     parser.add_argument("--cuobjdump", type=Path)
     parser.add_argument(
         "--cuda-architecture-policy",
@@ -422,7 +431,10 @@ def main() -> int:
     provider_wheel = wheels[f"flashinfer-jit-cache-{args.provider}"]
     validate_flashinfer_python(flashinfer_python, args.version)
     manifest, module_paths = validate_provider(
-        provider_wheel, args.provider, args.version
+        provider_wheel,
+        args.provider,
+        args.version,
+        args.provider_platform_tag or None,
     )
     validate_shim(shim, args.provider, args.version)
 

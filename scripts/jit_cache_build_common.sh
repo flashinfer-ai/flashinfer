@@ -110,6 +110,7 @@ validate_jit_cache_cuda_toolchain() {
 #   $3 - PyTorch index label (e.g. "cu130" or "nightly/cu134").
 #
 # Exports: PIP_CONSTRAINT, PIP_EXTRA_INDEX_URL, and PIP_PRE for nightly indexes.
+# Call cleanup_jit_cache_python_build from the caller's existing EXIT handler.
 setup_jit_cache_python_build() {
   local python_bin=$1
   local expected_cuda_version=$2
@@ -154,16 +155,42 @@ print(f"PyTorch CUDA version check passed: {torch.__version__} ({torch.version.c
 print(f"PyTorch distribution version: {importlib.metadata.version('torch')}")
 PY
 
-  local torch_constraint
-  torch_constraint=$(mktemp)
+  if [[ -v PIP_CONSTRAINT ]]; then
+    JIT_CACHE_PREVIOUS_PIP_CONSTRAINT=${PIP_CONSTRAINT}
+    JIT_CACHE_RESTORE_PIP_CONSTRAINT=1
+  else
+    JIT_CACHE_PREVIOUS_PIP_CONSTRAINT=
+    JIT_CACHE_RESTORE_PIP_CONSTRAINT=0
+  fi
+
+  JIT_CACHE_TORCH_CONSTRAINT=$(mktemp)
   "${python_bin}" -c \
     'import importlib.metadata as m; print("torch==" + m.version("torch"))' \
-    > "${torch_constraint}"
-  export PIP_CONSTRAINT="${torch_constraint}"
-  export PIP_EXTRA_INDEX_URL="${pytorch_index_url}"
+    > "${JIT_CACHE_TORCH_CONSTRAINT}"
+  export PIP_CONSTRAINT="${JIT_CACHE_TORCH_CONSTRAINT}"
+  case " ${PIP_EXTRA_INDEX_URL:-} " in
+    *" ${pytorch_index_url} "*) ;;
+    *)
+      export PIP_EXTRA_INDEX_URL="${PIP_EXTRA_INDEX_URL:+${PIP_EXTRA_INDEX_URL} }${pytorch_index_url}"
+      ;;
+  esac
   if [[ "${pytorch_index}" == nightly/* ]]; then
     export PIP_PRE=1
   fi
+}
+
+cleanup_jit_cache_python_build() {
+  if [ -n "${JIT_CACHE_TORCH_CONSTRAINT:-}" ]; then
+    rm -f "${JIT_CACHE_TORCH_CONSTRAINT}"
+  fi
+  if [ "${JIT_CACHE_RESTORE_PIP_CONSTRAINT:-0}" = "1" ]; then
+    export PIP_CONSTRAINT="${JIT_CACHE_PREVIOUS_PIP_CONSTRAINT}"
+  else
+    unset PIP_CONSTRAINT
+  fi
+  unset JIT_CACHE_TORCH_CONSTRAINT
+  unset JIT_CACHE_PREVIOUS_PIP_CONSTRAINT
+  unset JIT_CACHE_RESTORE_PIP_CONSTRAINT
 }
 
 # Download and install a released sccache binary to /usr/local/bin/sccache,

@@ -10,6 +10,7 @@ source "${SCRIPT_DIR}/jit_cache_build_common.sh"
 
 finish_sccache_stats() {
   local exit_code=$?
+  cleanup_jit_cache_python_build || true
   collect_sccache_stats || true
   return "${exit_code}"
 }

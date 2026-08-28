@@ -234,6 +234,24 @@ def test_provider_backend_uses_configured_build_dependencies(monkeypatch, tmp_pa
         expected = ["setuptools>=77", "nvidia-cutlass-dsl[cu13]>=4.6.2a0"]
         assert module.get_requires_for_build_wheel(None) == expected
         assert module.get_requires_for_build_editable(None) == expected
+
+        monkeypatch.delenv(module.PROVIDER_PLATFORM_TAG_ENV, raising=False)
+        assert module._provider_platform_tag("linux_x86_64") == "linux_x86_64"
+
+        monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+        monkeypatch.setattr(module.platform, "machine", lambda: "x86_64")
+        monkeypatch.setattr(module.platform, "libc_ver", lambda: ("glibc", "2.28"))
+        monkeypatch.setenv(module.PROVIDER_PLATFORM_TAG_ENV, "manylinux_2_28_x86_64")
+        assert module._provider_platform_tag("linux_x86_64") == "manylinux_2_28_x86_64"
+
+        monkeypatch.setenv(module.PROVIDER_PLATFORM_TAG_ENV, "manylinux_2_28_aarch64")
+        with pytest.raises(RuntimeError, match="Unsupported provider platform tag"):
+            module._provider_platform_tag("linux_x86_64")
+
+        monkeypatch.setenv(module.PROVIDER_PLATFORM_TAG_ENV, "manylinux_2_28_x86_64")
+        monkeypatch.setattr(module.platform, "libc_ver", lambda: ("glibc", "2.34"))
+        with pytest.raises(RuntimeError, match="glibc 2.34 is too new"):
+            module._provider_platform_tag("linux_x86_64")
     finally:
         sys.modules.pop(module_name, None)
 
@@ -254,6 +272,7 @@ def test_provider_wheelhouse_resolves_cu134_from_shared_config():
     )
     env.pop("CUDA_VERSION", None)
     env.pop("DOCKER_IMAGE", None)
+    env.pop("FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG", None)
 
     result = subprocess.run(
         ["bash", str(script_path), "--print-config"],
@@ -267,6 +286,89 @@ def test_provider_wheelhouse_resolves_cu134_from_shared_config():
     assert "cuda_version=13.4" in result.stdout
     assert "pytorch_index=nightly/cu134" in result.stdout
     assert "container=pytorch/manylinuxaarch64-builder:cuda13.4" in result.stdout
+    assert "provider_platform_tag=manylinux_2_28_aarch64" in result.stdout
+
+
+def test_provider_wheelhouse_custom_container_defaults_to_native_tag():
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "build_jit_cache_provider_wheelhouse.sh"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "ARCH": "x86_64",
+            "DOCKER_IMAGE": "example.invalid/custom-builder:latest",
+            "FLASHINFER_JIT_CACHE_PROVIDER_ARCH": "10.7a",
+            "FLASHINFER_LOCAL_VERSION": "cu134",
+        }
+    )
+    env.pop("CUDA_VERSION", None)
+    env.pop("FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG", None)
+
+    result = subprocess.run(
+        ["bash", str(script_path), "--print-config"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert "container=example.invalid/custom-builder:latest" in result.stdout
+    assert "provider_platform_tag=native" in result.stdout
+
+
+@pytest.mark.parametrize(
+    "package_version",
+    ("0.6.18", "0.6.18+cu130", "0.6.18+cu134"),
+)
+def test_jit_cache_version_requires_exact_public_version(monkeypatch, package_version):
+    monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
+    monkeypatch.setattr(jit_env, "flashinfer_version", "0.6.18")
+
+    jit_env._check_jit_cache_version("flashinfer-jit-cache", package_version)
+
+
+def test_jit_cache_version_rejects_unbounded_prefix(monkeypatch):
+    monkeypatch.delenv("FLASHINFER_DISABLE_VERSION_CHECK", raising=False)
+    monkeypatch.setattr(jit_env, "flashinfer_version", "0.6.1")
+
+    with pytest.raises(RuntimeError, match="does not match flashinfer version"):
+        jit_env._check_jit_cache_version("flashinfer-jit-cache", "0.6.10+cu130")
+
+
+def test_jit_cache_build_setup_preserves_indexes_and_cleans_constraint(tmp_path):
+    common_script = (
+        Path(__file__).resolve().parents[2] / "scripts" / "jit_cache_build_common.sh"
+    )
+    fake_python = tmp_path / "python"
+    fake_python.write_text(
+        "#!/bin/bash\n"
+        'if [ "${1:-}" = "-c" ]; then\n'
+        "  printf '%s\\n' 'torch==2.9.0+cu130'\n"
+        "fi\n"
+    )
+    fake_python.chmod(0o755)
+    trap_marker = tmp_path / "trap-ran"
+    script = f"""
+set -euo pipefail
+trap 'touch "{trap_marker}"' EXIT
+source "{common_script}"
+export PIP_CONSTRAINT=/tmp/original-constraint
+export PIP_EXTRA_INDEX_URL=https://mirror.example/simple
+setup_jit_cache_python_build "{fake_python}" 13.0 cu130
+generated_constraint=${{PIP_CONSTRAINT}}
+test -f "${{generated_constraint}}"
+test "${{PIP_EXTRA_INDEX_URL}}" = "https://mirror.example/simple https://download.pytorch.org/whl/cu130"
+cleanup_jit_cache_python_build
+test ! -e "${{generated_constraint}}"
+test "${{PIP_CONSTRAINT}}" = /tmp/original-constraint
+"""
+
+    subprocess.run(["bash", "-c", script], check=True)
+
+    assert trap_marker.is_file()
 
 
 def test_native_provider_cuda_inspection_reports_no_ptx(

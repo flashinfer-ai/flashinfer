@@ -23,6 +23,8 @@ normalize_provider_tag() {
 resolve_cuda_config() {
     local config_values config_version config_pytorch_index config_arch_list
     local configured_cuda_version=${CUDA_VERSION:-}
+    local configured_docker_image=${DOCKER_IMAGE:-}
+    local default_platform_tag="manylinux_2_28_${ARCH}"
 
     config_values=$(python3 - \
         "${REPO_ROOT}/ci/cuda-versions.json" \
@@ -65,7 +67,7 @@ PY
     export PYTORCH_INDEX="${config_pytorch_index}"
     export FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS="${config_arch_list}"
 
-    if [ -z "${DOCKER_IMAGE:-}" ]; then
+    if [ -z "${configured_docker_image}" ]; then
         case "${ARCH}" in
             aarch64)
                 DOCKER_IMAGE="pytorch/manylinuxaarch64-builder:cuda${CUDA_VERSION}"
@@ -78,7 +80,9 @@ PY
                 exit 2
                 ;;
         esac
+        : "${FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG:=${default_platform_tag}}"
         export DOCKER_IMAGE
+        export FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG
     fi
 }
 
@@ -105,7 +109,38 @@ print_config() {
     echo "pytorch_index=${PYTORCH_INDEX}"
     echo "cpu_arch=${ARCH}"
     echo "container=${DOCKER_IMAGE}"
+    echo "provider_platform_tag=${FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG:-native}"
     echo "monolithic_arch_list=${FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS}"
+}
+
+validate_provider_platform_tag() {
+    local platform_tag=${FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG:-}
+    local expected_tag="manylinux_2_28_${ARCH}"
+    local libc_name libc_version libc_major libc_minor
+
+    if [ -z "${platform_tag}" ]; then
+        return
+    fi
+    if [ "${platform_tag}" != "${expected_tag}" ]; then
+        echo "Provider platform tag ${platform_tag} does not match ${expected_tag}" >&2
+        exit 2
+    fi
+    if ! read -r libc_name libc_version < <(getconf GNU_LIBC_VERSION 2>/dev/null); then
+        echo "${platform_tag} requires a glibc build environment" >&2
+        exit 2
+    fi
+    if [ "${libc_name}" != "glibc" ] || \
+       ! [[ "${libc_version}" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
+        echo "Could not verify glibc compatibility for ${platform_tag}: ${libc_name} ${libc_version}" >&2
+        exit 2
+    fi
+    libc_major=${BASH_REMATCH[1]}
+    libc_minor=${BASH_REMATCH[2]}
+    if (( libc_major > 2 || (libc_major == 2 && libc_minor > 28) )); then
+        echo "glibc ${libc_version} is too new to claim ${platform_tag}" >&2
+        exit 2
+    fi
+    echo "Verified ${platform_tag} builder with glibc ${libc_version}"
 }
 
 run_on_host() {
@@ -156,10 +191,12 @@ run_on_host() {
         -e CUDA_MINOR="${CUDA_MINOR}" \
         -e CUDA_VERSION="${CUDA_VERSION}" \
         -e CUDA_ARCHITECTURE_POLICY="${CUDA_ARCHITECTURE_POLICY}" \
+        -e DOCKER_IMAGE="${DOCKER_IMAGE}" \
         -e FLASHINFER_DEV_RELEASE_SUFFIX="${FLASHINFER_DEV_RELEASE_SUFFIX}" \
         -e FLASHINFER_JIT_CACHE_PROVIDER_ARCH="${FLASHINFER_JIT_CACHE_PROVIDER_ARCH}" \
         -e FLASHINFER_LOCAL_VERSION="${FLASHINFER_LOCAL_VERSION}" \
         -e FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS="${FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS}" \
+        -e FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG="${FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG:-}" \
         -e FLASHINFER_NVCC_THREADS="${FLASHINFER_NVCC_THREADS}" \
         -e HOST_GID="${host_gid}" \
         -e HOST_UID="${host_uid}" \
@@ -204,8 +241,15 @@ run_in_container() {
 
     # shellcheck source=scripts/jit_cache_build_common.sh
     source "${SCRIPT_DIR}/jit_cache_build_common.sh"
+    finish_provider_build() {
+        local exit_code=$?
+        cleanup_jit_cache_python_build || true
+        return "${exit_code}"
+    }
+    trap finish_provider_build EXIT
     compute_jit_cache_parallelism
     validate_jit_cache_cuda_toolchain "${CUDA_VERSION}" /usr/local/cuda/bin/nvcc
+    validate_provider_platform_tag
 
     echo "::group::Install build system"
     setup_jit_cache_python_build "${python}" "${CUDA_VERSION}" "${PYTORCH_INDEX}"
@@ -265,6 +309,7 @@ run_in_container() {
         --wheelhouse "${output_dir}" \
         --provider "${PROVIDER_TAG}" \
         --version "${PACKAGE_VERSION}" \
+        --provider-platform-tag "${FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG:-}" \
         --cuobjdump /usr/local/cuda/bin/cuobjdump \
         --cuda-architecture-policy "${CUDA_ARCHITECTURE_POLICY}" \
         --install-smoke

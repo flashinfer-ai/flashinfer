@@ -127,11 +127,12 @@ class AOTProvider:
 
 def _check_jit_cache_version(distribution: str, package_version: str) -> None:
     # NOTE(Zihao): jit-cache versions contain a CUDA local-version suffix,
-    # for example 0.3.1+cu129, so compare the FlashInfer version prefix.
+    # for example 0.3.1+cu129, so allow only that suffix after an exact version.
     if (
         not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
         and flashinfer_version != "0.0.0+unknown"
-        and not package_version.startswith(flashinfer_version)
+        and package_version != flashinfer_version
+        and not package_version.startswith(f"{flashinfer_version}+")
     ):
         raise RuntimeError(
             f"{distribution} version ({package_version}) does not match "

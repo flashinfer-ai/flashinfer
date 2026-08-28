@@ -3,6 +3,7 @@
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -25,6 +26,8 @@ from build_utils import get_build_dependency_requirements, get_git_version
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
 config = get_provider_build_config()
 os.environ["FLASHINFER_CUDA_ARCH_LIST"] = config.cuda_architecture
+
+PROVIDER_PLATFORM_TAG_ENV = "FLASHINFER_JIT_CACHE_PROVIDER_PLATFORM_TAG"
 
 
 def _write_build_metadata() -> None:
@@ -111,8 +114,38 @@ def _build_aot_modules(verbose: bool = True) -> None:
     _write_provider_manifest(jit_cache_dir)
 
 
+def _provider_platform_tag(default_platform_tag: str) -> str:
+    requested_tag = os.environ.get(PROVIDER_PLATFORM_TAG_ENV, "").strip()
+    if not requested_tag:
+        return default_platform_tag
+
+    machine = platform.machine()
+    expected_tag = f"manylinux_2_28_{machine}"
+    libc_name, libc_version = platform.libc_ver()
+    libc_match = re.fullmatch(r"(\d+)\.(\d+)", libc_version)
+    if (
+        platform.system() != "Linux"
+        or machine not in ("x86_64", "aarch64")
+        or requested_tag != expected_tag
+        or libc_name != "glibc"
+        or libc_match is None
+    ):
+        raise RuntimeError(
+            f"Unsupported provider platform tag {requested_tag!r} for "
+            f"{platform.system()} {machine} with {libc_name} {libc_version}; "
+            f"expected {expected_tag!r} on glibc 2.28 or older"
+        )
+    glibc_version = tuple(int(part) for part in libc_match.groups())
+    if glibc_version > (2, 28):
+        raise RuntimeError(
+            f"glibc {libc_version} is too new for provider platform tag "
+            f"{requested_tag!r}"
+        )
+    return requested_tag
+
+
 class PlatformSpecificBdistWheel(bdist_wheel):
-    """Mark provider wheels as Linux platform wheels using the stable ABI tag."""
+    """Build a native provider wheel with a stable Python ABI tag."""
 
     def finalize_options(self):
         super().finalize_options()
@@ -120,17 +153,8 @@ class PlatformSpecificBdistWheel(bdist_wheel):
         self.py_limited_api = "cp39"
 
     def get_tag(self):
-        machine = platform.machine()
-        if platform.system() == "Linux" and machine in ("x86_64", "aarch64"):
-            platform_tag = f"manylinux_2_28_{machine}"
-        elif platform.system() == "Linux":
-            platform_tag = f"linux_{machine}"
-        else:
-            import distutils.util
-
-            platform_tag = (
-                distutils.util.get_platform().replace("-", "_").replace(".", "_")
-            )
+        _, _, default_platform_tag = super().get_tag()
+        platform_tag = _provider_platform_tag(default_platform_tag)
         return "cp39", "abi3", platform_tag
 
 

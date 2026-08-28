@@ -178,6 +178,11 @@ FLASHINFER_LOCAL_VERSION=cu130 \
 python -m build --wheel flashinfer-jit-cache-provider
 ```
 
+A direct build uses the native `linux_<arch>` platform tag. The wheelhouse
+wrapper opts into `manylinux_2_28` only after verifying the selected container
+uses glibc 2.28 or older; custom `DOCKER_IMAGE` values remain native-tagged
+unless the caller explicitly requests and satisfies that check.
+
 Build a shim whose default dependencies include the tested provider set:
 
 ```bash
