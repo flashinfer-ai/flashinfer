@@ -1,7 +1,7 @@
 {
   "summary": {
-    "arithmetic_mean": 2.0138678026592025,
-    "geometric_mean": 1.7614660701165405,
+    "arithmetic_mean": 1.982948992288326,
+    "geometric_mean": 1.7482018448138397,
     "denominator": "cake",
     "baseline_provenance": {
       "backend": "cake",
@@ -22,25 +22,25 @@
       "workload": "bs=128 bf16 hq=8 hkv=8 d=128 m=256 n=512 sel=2 lse=1",
       "backends": {
         "cake": {
-          "median_ms": 0.008352,
-          "min_ms": 0.008128,
-          "max_ms": 0.008736,
+          "median_ms": 0.008545,
+          "min_ms": 0.008288,
+          "max_ms": 0.008896,
           "iters": 100,
           "timing": "cupti",
           "output_allocation": "outside_timed_region",
           "plan": "outside_timed_region"
         },
         "vibecuda": {
-          "median_ms": 0.00528,
-          "min_ms": 0.005088,
-          "max_ms": 0.005697,
+          "median_ms": 0.005408,
+          "min_ms": 0.005249,
+          "max_ms": 0.005824,
           "iters": 100,
           "timing": "cupti",
           "output_allocation": "outside_timed_region",
           "plan": "outside_timed_region"
         }
       },
-      "speedup_cake_over_vibecuda": 1.5818181818181818
+      "speedup_cake_over_vibecuda": 1.5800665680473376
     },
     {
       "workload": "bs=64 bf16 hq=8 hkv=8 d=128 m=128 n=256 sel=2 lse=1",
@@ -48,38 +48,86 @@
         "cake": {
           "median_ms": 0.006592,
           "min_ms": 0.0064,
-          "max_ms": 0.00688,
+          "max_ms": 0.006944,
           "iters": 100,
           "timing": "cupti",
           "output_allocation": "outside_timed_region",
           "plan": "outside_timed_region"
         },
         "vibecuda": {
-          "median_ms": 0.004577,
-          "min_ms": 0.004415,
-          "max_ms": 0.004928,
+          "median_ms": 0.004608,
+          "min_ms": 0.00448,
+          "max_ms": 0.004832,
           "iters": 100,
           "timing": "cupti",
           "output_allocation": "outside_timed_region",
           "plan": "outside_timed_region"
         }
       },
-      "speedup_cake_over_vibecuda": 1.440244701769718
+      "speedup_cake_over_vibecuda": 1.4305555555555556
     },
     {
       "workload": "bs=128 fp16 hq=8 hkv=1 d=128 m=256 n=512 sel=2 lse=0",
       "backends": {
         "cake": {
-          "median_ms": 0.028161,
-          "min_ms": 0.027584,
-          "max_ms": 0.030048,
+          "median_ms": 0.027457,
+          "min_ms": 0.026977,
+          "max_ms": 0.02992,
           "iters": 100,
           "timing": "cupti",
           "output_allocation": "outside_timed_region",
           "plan": "outside_timed_region"
         },
         "vibecuda": {
-          "median_ms": 0.004992,
+          "median_ms": 0.005057,
+          "min_ms": 0.004897,
+          "max_ms": 0.005408,
+          "iters": 100,
+          "timing": "cupti",
+          "output_allocation": "outside_timed_region",
+          "plan": "outside_timed_region"
+        }
+      },
+      "speedup_cake_over_vibecuda": 5.429503658295432
+    },
+    {
+      "workload": "bs=128 fp16 hq=8 hkv=8 d=128 m=256 n=512 sel=2 lse=1",
+      "backends": {
+        "cake": {
+          "median_ms": 0.008352,
+          "min_ms": 0.008127,
+          "max_ms": 0.00864,
+          "iters": 100,
+          "timing": "cupti",
+          "output_allocation": "outside_timed_region",
+          "plan": "outside_timed_region"
+        },
+        "vibecuda": {
+          "median_ms": 0.005376,
+          "min_ms": 0.005184,
+          "max_ms": 0.005729,
+          "iters": 100,
+          "timing": "cupti",
+          "output_allocation": "outside_timed_region",
+          "plan": "outside_timed_region"
+        }
+      },
+      "speedup_cake_over_vibecuda": 1.5535714285714286
+    },
+    {
+      "workload": "bs=128 bf16 hq=8 hkv=2 d=128 m=256 n=512 sel=2 lse=0",
+      "backends": {
+        "cake": {
+          "median_ms": 0.008416,
+          "min_ms": 0.008128,
+          "max_ms": 0.00896,
+          "iters": 100,
+          "timing": "cupti",
+          "output_allocation": "outside_timed_region",
+          "plan": "outside_timed_region"
+        },
+        "vibecuda": {
+          "median_ms": 0.005056,
           "min_ms": 0.004864,
           "max_ms": 0.005376,
           "iters": 100,
@@ -88,87 +136,39 @@
           "plan": "outside_timed_region"
         }
       },
-      "speedup_cake_over_vibecuda": 5.641225961538462
-    },
-    {
-      "workload": "bs=128 fp16 hq=8 hkv=8 d=128 m=256 n=512 sel=2 lse=1",
-      "backends": {
-        "cake": {
-          "median_ms": 0.00848,
-          "min_ms": 0.008224,
-          "max_ms": 0.00896,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        },
-        "vibecuda": {
-          "median_ms": 0.005344,
-          "min_ms": 0.00512,
-          "max_ms": 0.005696,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        }
-      },
-      "speedup_cake_over_vibecuda": 1.5868263473053892
-    },
-    {
-      "workload": "bs=128 bf16 hq=8 hkv=2 d=128 m=256 n=512 sel=2 lse=0",
-      "backends": {
-        "cake": {
-          "median_ms": 0.008256,
-          "min_ms": 0.008033,
-          "max_ms": 0.008736,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        },
-        "vibecuda": {
-          "median_ms": 0.005025,
-          "min_ms": 0.004864,
-          "max_ms": 0.005408,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        }
-      },
-      "speedup_cake_over_vibecuda": 1.6429850746268655
+      "speedup_cake_over_vibecuda": 1.6645569620253164
     },
     {
       "workload": "bs=128 bf16 hq=8 hkv=8 d=64 m=256 n=512 sel=2 lse=0",
       "backends": {
         "cake": {
-          "median_ms": 0.005792,
-          "min_ms": 0.005504,
-          "max_ms": 0.006081,
+          "median_ms": 0.005825,
+          "min_ms": 0.005664,
+          "max_ms": 0.006208,
           "iters": 100,
           "timing": "cupti",
           "output_allocation": "outside_timed_region",
           "plan": "outside_timed_region"
         },
         "vibecuda": {
-          "median_ms": 0.00432,
-          "min_ms": 0.004192,
-          "max_ms": 0.004768,
+          "median_ms": 0.004288,
+          "min_ms": 0.004096,
+          "max_ms": 0.004735,
           "iters": 100,
           "timing": "cupti",
           "output_allocation": "outside_timed_region",
           "plan": "outside_timed_region"
         }
       },
-      "speedup_cake_over_vibecuda": 1.3407407407407408
+      "speedup_cake_over_vibecuda": 1.3584421641791045
     },
     {
       "workload": "bs=128 bf16 hq=8 hkv=8 d=96 m=256 n=512 sel=2 lse=0",
       "backends": {
         "cake": {
-          "median_ms": 0.006655,
-          "min_ms": 0.006432,
-          "max_ms": 0.007041,
+          "median_ms": 0.00672,
+          "min_ms": 0.006528,
+          "max_ms": 0.007105,
           "iters": 100,
           "timing": "cupti",
           "output_allocation": "outside_timed_region",
@@ -176,39 +176,39 @@
         },
         "vibecuda": {
           "median_ms": 0.004897,
-          "min_ms": 0.004736,
-          "max_ms": 0.00528,
+          "min_ms": 0.004672,
+          "max_ms": 0.00544,
           "iters": 100,
           "timing": "cupti",
           "output_allocation": "outside_timed_region",
           "plan": "outside_timed_region"
         }
       },
-      "speedup_cake_over_vibecuda": 1.3589953032468858
+      "speedup_cake_over_vibecuda": 1.3722687359607924
     },
     {
       "workload": "bs=128 bf16 hq=8 hkv=8 d=128 m=128 n=16384 sel=8 lse=0",
       "backends": {
         "cake": {
-          "median_ms": 0.016224,
-          "min_ms": 0.015745,
-          "max_ms": 0.0168,
+          "median_ms": 0.015808,
+          "min_ms": 0.015296,
+          "max_ms": 0.016288,
           "iters": 100,
           "timing": "cupti",
           "output_allocation": "outside_timed_region",
           "plan": "outside_timed_region"
         },
         "vibecuda": {
-          "median_ms": 0.010687,
-          "min_ms": 0.010337,
-          "max_ms": 0.015105,
+          "median_ms": 0.01072,
+          "min_ms": 0.010432,
+          "max_ms": 0.01184,
           "iters": 100,
           "timing": "cupti",
           "output_allocation": "outside_timed_region",
           "plan": "outside_timed_region"
         }
       },
-      "speedup_cake_over_vibecuda": 1.518106110227379
+      "speedup_cake_over_vibecuda": 1.4746268656716417
     }
   ]
 }
