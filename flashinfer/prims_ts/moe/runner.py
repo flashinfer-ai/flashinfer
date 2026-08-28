@@ -1136,7 +1136,14 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
             ):
                 self._topk_initializer_cache = (
                     moe_inputs.topk_ids,
-                    make_repeating_tensor_initializer(moe_inputs.topk_ids),
+                    make_repeating_tensor_initializer(
+                        moe_inputs.topk_ids,
+                        num_experts=self.num_experts,
+                        packed=(
+                            routing_input_mode
+                            != RoutingInputMode.UnpackedPrecomputed
+                        ),
+                    ),
                 )
             init_packed_topk_ids = self._topk_initializer_cache[1]
         else:

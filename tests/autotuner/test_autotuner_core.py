@@ -105,6 +105,27 @@ def test_repeating_tensor_initializer_rejects_mismatched_width():
         initializer((4, 2), torch.float32, torch.device("cpu"))
 
 
+def test_repeating_tensor_initializer_resamples_expanded_route_profiles():
+    expert_ids = torch.tensor([[7, 19, 63, 101]], dtype=torch.int32)
+    weight_bits = torch.ones((1, 4), dtype=torch.bfloat16).view(torch.int16)
+    source = (expert_ids << 16) | weight_bits.to(torch.int32)
+    initializer = make_repeating_tensor_initializer(
+        source, num_experts=128, packed=True
+    )
+
+    assert torch.equal(
+        initializer((1, 4), torch.int32, torch.device("cpu")), source
+    )
+    first = initializer((512, 4), torch.int32, torch.device("cpu"))
+    second = initializer((512, 4), torch.int32, torch.device("cpu"))
+    expanded_ids = first >> 16
+
+    assert torch.equal(first, second)
+    assert torch.unique(expanded_ids).numel() == 128
+    assert torch.all((expanded_ids >= 0) & (expanded_ids < 128))
+    assert torch.all(torch.sort(expanded_ids, dim=1).values.diff(dim=1) != 0)
+
+
 def test_find_nearest_profile_passthrough_without_specs():
     """No dynamic/constraint specs should keep shape values unchanged."""
     shapes = (torch.Size([3, 5]), torch.Size([7, 11, 13]))
@@ -1995,7 +2016,7 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     ],
 )
 def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, packed):
-    """Tuning configs reuse a stable initializer that repeats live routes."""
+    """Tuning configs reuse live routes without repeating small histograms."""
     fn = core_mod._get_trtllm_moe_sm100_module_impl
     fn.cache_clear()
     try:
@@ -2061,10 +2082,11 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
             "a fresh closure on every call."
         )
         generated = init_a((16, 8), torch.int32, torch.device("cpu"))
-        assert torch.equal(generated[:8], moe_inputs.topk_ids)
-        assert torch.equal(generated[8:], moe_inputs.topk_ids)
+        generated_ids = generated >> 16 if packed else generated
+        assert torch.unique(generated_ids).numel() > torch.unique(expert_ids).numel()
 
         initialized = init_a((8, 8), torch.int32, torch.device("cpu"))
+        assert torch.equal(initialized, moe_inputs.topk_ids)
         if packed:
             # Packed routing stores the expert ID in the high 16 bits and a
             # deterministic BF16 routing weight of 1.0 in the low 16 bits.

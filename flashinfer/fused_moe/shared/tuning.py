@@ -53,11 +53,14 @@ def moe_topk_ids_init(num_experts: int, *, packed: bool = True):
         dtype: torch.dtype,
         device: torch.device,
     ) -> torch.Tensor:
+        generator = torch.Generator(device=device)
+        generator.manual_seed(0)
         expert_ids = make_random_topk_ids(
             num_experts=num_experts,
             num_tokens=math.prod(shapes[:-1]),
             top_k=shapes[-1],
             device=device,
+            generator=generator,
         ).view(shapes)
         if not packed:
             return expert_ids
@@ -69,13 +72,19 @@ def moe_topk_ids_init(num_experts: int, *, packed: bool = True):
     return _init
 
 
-def make_repeating_tensor_initializer(source: torch.Tensor) -> Callable:
-    """Initialize a tuning tensor by deterministically repeating runtime data.
+def make_repeating_tensor_initializer(
+    source: torch.Tensor,
+    *,
+    num_experts: int | None = None,
+    packed: bool = True,
+) -> Callable:
+    """Initialize tuning routes from runtime data without amplifying imbalance.
 
-    MoE tactic ranking depends on the local route histogram. Reusing the
-    caller's packed routing tensor keeps different backends on the same
-    workload and avoids shape-identical tuning runs sampling different random
-    expert sets.
+    Preserve the caller's exact route rows when the profile is no larger than
+    the runtime source. If a dynamic profile is larger, literal repetition can
+    turn a one-token route into a pathological all-tokens-to-four-experts
+    workload. When ``num_experts`` is provided, expanded profiles instead use
+    the deterministic realistic sampler shared by all backends.
     """
     if source.ndim < 1 or source.numel() == 0:
         raise ValueError("source must be a non-empty tensor")
@@ -93,6 +102,10 @@ def make_repeating_tensor_initializer(source: torch.Tensor) -> Callable:
         target_rows = math.prod(shapes[:-1])
         if target_rows == 0:
             return torch.empty(shapes, dtype=dtype, device=device)
+        if num_experts is not None and target_rows > source_rows.shape[0]:
+            return moe_topk_ids_init(num_experts, packed=packed)(
+                shapes, dtype, device
+            )
         repeats = (target_rows + source_rows.shape[0] - 1) // source_rows.shape[0]
         return (
             source_rows.to(device=device, dtype=dtype)
