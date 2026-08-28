@@ -10,7 +10,7 @@
 //   num_heads ∈ {8, 16, 32, 64, 128}
 //   topk      ∈ {128, 512, 1024, 2048}
 //   pbs       = 64
-// = 20 instantiations.
+// plus the GLM53_NOPE (num_heads=32, topk=2176) specialization.
 
 #include <cuda_runtime.h>
 

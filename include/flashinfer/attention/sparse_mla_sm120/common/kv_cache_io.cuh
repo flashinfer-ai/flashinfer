@@ -34,13 +34,14 @@
 
 // KV cache IO: gather BI entries from global KV pool to smem.
 //
-// FlashMLA ABI: stride_kv_row = bytes_per_token (DSV3_2: 656, DSV4: 584).
+// FlashMLA ABI: stride_kv_row = bytes_per_token (inline family: 656, DSV4: 584).
 // The IO stride used for address calculation is the DATA stride:
-//   DSV3_2:    656 (nope+scale+rope all contiguous, 656 % 16 = 0 ✓)
-//   DSV4: 576 (nope+rope only, footer scales excluded)
-//           576 % 16 = 0 ✓ for cp.async.bulk
+//   inline family: 656 (data/scales/padding contiguous, 656 % 16 = 0 ✓)
+//   DSV4:         576 (nope+rope only, footer scales excluded)
+//                 576 % 16 = 0 ✓ for cp.async.bulk
 //
-// DSV3_2 uses flat addressing: kv_ptr + global_idx * 656.
+// DSV3_2, GLM_NSA, and GLM53_NOPE use flat addressing:
+// kv_ptr + global_idx * 656.
 // DSV4 uses block-structured addressing (footer layout):
 //   data:  kv_ptr + block_idx * stride_kv_block + local_idx * 576
 //   scale: kv_ptr + block_idx * stride_kv_block + page_block_size * 576 + local_idx * 8
@@ -50,15 +51,15 @@
 template <ModelType MT>
 struct KVIOTraits {
   using KV = KVCacheTraits<MT>;
-  // DSV3_2: IO_STRIDE = KV_GMEM_STRIDE = 656 (inline, bulk copy includes scale)
+  // Inline family: IO_STRIDE = KV_GMEM_STRIDE = 656 (bulk copy includes scale)
   // DSV4: IO_STRIDE = D_NOPE + D_ROPE*2 = 576 (footer, data portion only)
   static constexpr int IO_STRIDE =
       KV::SCALE_IN_KV_SMEM ? KV::KV_GMEM_STRIDE : (KV::D_NOPE + KV::D_ROPE * sizeof(bf16));
   static_assert(IO_STRIDE % 16 == 0, "IO stride must be 16B aligned for cp.async.bulk");
 };
 
-// Bulk gather token nope data (and inline scales for DSV3_2) from global to smem.
-// DSV3_2: flat addressing (idx * 656). DSV4: block-structured (footer layout).
+// Bulk gather token nope data (and inline scales where present) from global to smem.
+// Inline family: flat addressing (idx * 656). DSV4: block-structured (footer layout).
 template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT = false>
 __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t* indices,
                                                     const uint8_t* __restrict__ kv_ptr,

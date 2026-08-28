@@ -53,11 +53,11 @@
 //   - No PDL (no dependent kernel)
 //
 // Template params (all constexpr):
-//   MT:              ModelType (DSV3_2 / DSV4)
+//   MT:              ModelType (DSV3_2 / DSV4 / GLM_NSA / GLM53_NOPE)
 //   CM:              ComputeMode (FP8 / BF16) for the QK MMA; XV is always FP8
 //   NUM_HEADS:       8, 16, 32, 64, 128 (NUM_HEADS < HPB=16 zero-pads + gates)
-//   TOPK:            128, 192, 256, 512, 1024, 2048
-//   PAGE_BLOCK_SIZE: 64 (DSV3_2 and DSV4 both use the 64-token page layout)
+//   TOPK:            128, 192, 256, 512, 1024, 2048, 2176
+//   PAGE_BLOCK_SIZE: 64 (all currently supported model types)
 // ============================================================================
 
 struct PrefillColdParams {

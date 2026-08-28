@@ -3569,9 +3569,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
         by kernels that use semaphore state.
     qk_nope_head_dim : int
         Non-RoPE query dimension. Dense MLA paths commonly use ``128`` or
-        ``64`` depending on model. The SM120/SM121 sparse v32/GLM backend
-        validates it together with ``query.shape[-1]``. GLM-5.3 uses the
-        native ``qk_rope_head_dim=0`` / ``query.shape[-1]=512`` geometry.
+        ``64`` depending on model. The SM120/SM121 packed sparse backend keeps
+        this legacy argument for API compatibility but ignores it; that path
+        validates ``kv_lora_rank``, ``qk_rope_head_dim``, and
+        ``query.shape[-1]`` instead. GLM-5.3 uses the native
+        ``qk_rope_head_dim=0`` / ``query.shape[-1]=512`` geometry.
     kv_lora_rank : int
         Latent KV rank. TRTLLM-GEN and SM120/SM121 sparse v32/GLM use ``512``.
     qk_rope_head_dim : int
@@ -3693,8 +3695,11 @@ def trtllm_batch_decode_with_kv_cache_mla(
           feature (e.g. ``sinks``).
     kv_scale_format : str = "auto"
         Scale semantics for the SM120/SM121 packed v32/GLM sparse backend.
-        ``"auto"`` and ``"pow2_fp32"`` select DSv3.2 power-of-2 FP32 inline
-        scales; ``"arbitrary_fp32"`` selects GLM-style arbitrary FP32 inline scales.
+        For ``head_dim_qk=576``, ``"auto"`` and ``"pow2_fp32"`` select
+        DSv3.2 power-of-2 FP32 inline scales, while ``"arbitrary_fp32"``
+        selects GLM-NSA. For ``head_dim_qk=512``, ``"auto"`` selects DSv4's
+        footer scales and ``"arbitrary_fp32"`` selects GLM-5.3's inline
+        scales; ``"pow2_fp32"`` is unsupported.
         Ignored by the ``trtllm-gen``, ``xqa``, and ``cute-dsl`` backends.
     cum_seq_lens_q : Optional[torch.Tensor] = None
         Cumulative query sequence lengths for variable-length query support,
