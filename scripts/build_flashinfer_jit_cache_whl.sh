@@ -28,6 +28,8 @@ echo "=========================================="
 echo "Building flashinfer-jit-cache wheel"
 echo "=========================================="
 
+: "${PYTORCH_INDEX:?PYTORCH_INDEX must be set}"
+
 compute_jit_cache_parallelism
 
 # Display build environment info
@@ -60,61 +62,10 @@ export PATH="/opt/python/${PYTHON_ABI}-${PYTHON_ABI}/bin:$PATH"
 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH"
 
 EXPECTED_CUDA_VERSION="${CUDA_MAJOR}.${CUDA_MINOR}"
-NVCC_CUDA_VERSION=$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -n1)
-if [ "${NVCC_CUDA_VERSION}" != "${EXPECTED_CUDA_VERSION}" ]; then
-  echo "ERROR: nvcc reports CUDA ${NVCC_CUDA_VERSION:-unknown}; expected ${EXPECTED_CUDA_VERSION}" >&2
-  exit 1
-fi
-echo "nvcc CUDA version check passed: ${NVCC_CUDA_VERSION}"
+validate_jit_cache_cuda_toolchain "${EXPECTED_CUDA_VERSION}"
 
 echo "::group::Install build system"
-pip install --upgrade build
-
-PYTORCH_INDEX_URL="https://download.pytorch.org/whl/${PYTORCH_INDEX}"
-if python3 - "${EXPECTED_CUDA_VERSION}" <<'PY'
-import sys
-
-try:
-    import torch
-except ImportError:
-    raise SystemExit(1)
-
-raise SystemExit(0 if torch.version.cuda == sys.argv[1] else 1)
-PY
-then
-  echo "Using preinstalled PyTorch for CUDA ${EXPECTED_CUDA_VERSION}"
-else
-  TORCH_INSTALL_ARGS=(--upgrade torch --index-url "${PYTORCH_INDEX_URL}")
-  if [[ "${PYTORCH_INDEX}" == nightly/* ]]; then
-    TORCH_INSTALL_ARGS=(--pre "${TORCH_INSTALL_ARGS[@]}")
-  fi
-  pip install "${TORCH_INSTALL_ARGS[@]}"
-fi
-
-python3 - "${EXPECTED_CUDA_VERSION}" <<'PY'
-import importlib.metadata
-import sys
-import torch
-
-expected = sys.argv[1]
-if torch.version.cuda != expected:
-    raise SystemExit(
-        f"ERROR: PyTorch targets CUDA {torch.version.cuda}; expected CUDA {expected}"
-    )
-print(f"PyTorch CUDA version check passed: {torch.__version__} ({torch.version.cuda})")
-print(f"PyTorch distribution version: {importlib.metadata.version('torch')}")
-PY
-
-# The PEP 517 build runs in an isolated environment. Constrain its torch build
-# dependency to the version selected above and expose the matching stable or
-# nightly PyTorch index to that environment.
-TORCH_CONSTRAINT=$(mktemp)
-python3 -c 'import importlib.metadata as m; print("torch==" + m.version("torch"))' > "${TORCH_CONSTRAINT}"
-export PIP_CONSTRAINT="${TORCH_CONSTRAINT}"
-export PIP_EXTRA_INDEX_URL="${PYTORCH_INDEX_URL}"
-if [[ "${PYTORCH_INDEX}" == nightly/* ]]; then
-  export PIP_PRE=1
-fi
+setup_jit_cache_python_build python3 "${EXPECTED_CUDA_VERSION}" "${PYTORCH_INDEX}"
 echo "::endgroup::"
 
 # Optional: set up sccache for compiler caching with S3 backend

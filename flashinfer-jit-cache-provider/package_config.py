@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -53,9 +54,19 @@ def get_package_version() -> str:
     return version
 
 
+def get_cuda_major() -> Optional[str]:
+    """Derive the CUDA major from a local wheel label such as ``cu134``."""
+    local_version = os.environ.get("FLASHINFER_LOCAL_VERSION", "").strip()
+    match = re.fullmatch(r"cu(\d{2,})", local_version)
+    if match is None:
+        return None
+    return match.group(1)[:-1]
+
+
 @dataclass(frozen=True)
 class ProviderBuildConfig:
     cuda_architecture: str
+    cuda_major: Optional[str]
     provider_tag: str
     distribution: str
     package: str
@@ -73,6 +84,7 @@ def get_provider_build_config() -> ProviderBuildConfig:
     cuda_architecture, provider_tag = normalize_cuda_architecture(architecture)
     return ProviderBuildConfig(
         cuda_architecture=cuda_architecture,
+        cuda_major=get_cuda_major(),
         provider_tag=provider_tag,
         distribution=f"flashinfer-jit-cache-{provider_tag}",
         package=f"flashinfer_jit_cache.providers.{provider_tag}",

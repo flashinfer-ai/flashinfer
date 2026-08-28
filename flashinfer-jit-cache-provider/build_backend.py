@@ -19,7 +19,7 @@ from package_config import (
 
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from build_utils import get_git_version
+from build_utils import get_build_dependency_requirements, get_git_version
 
 
 os.environ["FLASHINFER_DISABLE_VERSION_CHECK"] = "1"
@@ -181,7 +181,16 @@ def prepare_metadata_for_build_editable(metadata_directory, config_settings=None
         )
 
 
-get_requires_for_build_wheel = _orig.get_requires_for_build_wheel
-get_requires_for_build_editable = getattr(
-    _orig, "get_requires_for_build_editable", None
-)
+def get_requires_for_build_wheel(config_settings=None):
+    """Install configured dependencies in the isolated wheel build env."""
+    return [
+        *_orig.get_requires_for_build_wheel(config_settings),
+        *get_build_dependency_requirements(config.cuda_major),
+    ]
+
+
+def get_requires_for_build_editable(config_settings=None):
+    """Install configured dependencies in the isolated editable build env."""
+    get_requires = getattr(_orig, "get_requires_for_build_editable", None)
+    requirements = [] if get_requires is None else get_requires(config_settings)
+    return [*requirements, *get_build_dependency_requirements(config.cuda_major)]

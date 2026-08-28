@@ -21,6 +21,16 @@ The published jit-cache wheels contain host code plus architecture-specific
 SASS cubins. They do not contain PTX, so an sm80 cubin cannot provide a
 forward-compatible fallback for a later GPU architecture.
 
+The current monolithic build also uses size-oriented fatbin compression, omits
+single-request prefill/decode modules, and excludes selected architectures from
+size-constrained matrix entries. Those are useful tactical reductions, but they
+do not replace provider splitting: removing an architecture from an aggregate
+wheel removes its warm-cache coverage entirely. Provider coverage must therefore
+be a separate policy from the architecture list used to keep a monolithic wheel
+under its publication limit. In particular, standalone sm75 and sm121a providers
+can retain coverage even when those targets are absent from the corresponding
+aggregate wheel.
+
 The new layout must support both of these workflows:
 
 - A normal installation gets every provider published for its CUDA and CPU
@@ -179,8 +189,10 @@ python -m build --wheel flashinfer-jit-cache
 ```
 
 The provider backend forces `FLASHINFER_CUDA_ARCH_LIST` to exactly one declared
-target, compiles the AOT inventory, and generates the manifest from the copied
-libraries. Shim requirements exactly pin every provider to the shim version.
+target, installs the centrally configured provider-build dependencies in its
+isolated build environment, compiles the AOT inventory, and generates the
+manifest from the copied libraries. Shim requirements exactly pin every provider
+to the shim version.
 
 ### One-off SM121 wheelhouse
 
@@ -190,9 +202,11 @@ On an AArch64 Docker host, the experiment can be built with:
 scripts/build_jit_cache_provider_wheelhouse.sh
 ```
 
-The wrapper defaults to the CUDA 13.0 PyTorch manylinux AArch64 builder, target
-`12.1a`, local version `cu130`, one NVCC thread, and at most four concurrent
-jobs. It builds these aligned-version artifacts under `dist/`:
+The wrapper defaults to target `12.1a`, local version `cu130`, one NVCC thread,
+and at most four concurrent jobs. It resolves the CUDA version, PyTorch index,
+and manylinux builder from `ci/cuda-versions.json`, then constrains isolated PEP
+517 builds to the selected PyTorch distribution. It builds these aligned-version
+artifacts under `dist/`:
 
 - `flashinfer-python`
 - `flashinfer-jit-cache-sm121a`
@@ -201,6 +215,19 @@ jobs. It builds these aligned-version artifacts under `dist/`:
 Set `OUTPUT_DIR`, `FLASHINFER_DEV_RELEASE_SUFFIX`, or
 `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` to override the one-off defaults. Existing
 output is retained unless `CLEAN_OUTPUT=1` is explicit.
+
+Use the same wrapper for a CUDA 13.4 provider by selecting the central matrix
+label. This chooses the `nightly/cu134` PyTorch index and CUDA 13.4 builder:
+
+```bash
+FLASHINFER_LOCAL_VERSION=cu134 \
+FLASHINFER_JIT_CACHE_PROVIDER_ARCH=12.1a \
+scripts/build_jit_cache_provider_wheelhouse.sh
+```
+
+`--print-config` resolves and prints this configuration without starting Docker.
+The selected provider may intentionally be absent from the monolithic matrix
+architecture list; sm121a is one such size-driven exception.
 
 The build does not require a GPU. Its final validation checks distribution and
 version metadata, the shim's exact provider pin, provider entry-point discovery,
@@ -221,7 +248,9 @@ The initial DGX Spark build produced a 250,767,917-byte provider wheel containin
 657 modules (487,366,496 bytes uncompressed), a 16,105,950-byte
 `flashinfer-python` wheel, and a 4,349-byte shim. The build generated 3,404 Ninja
 steps with seven concurrent jobs. The installed provider resolved and launched
-`silu_and_mul` on an SM121 GB10 with JIT disabled.
+`silu_and_mul` on an SM121 GB10 with JIT disabled. These are historical prototype
+measurements; current module pruning and compression flags require a fresh
+wheelhouse measurement before release integration.
 
 ## Validation Gates
 
@@ -242,7 +271,10 @@ Before changing release workflows or making shim mode the default:
 6. Test a process with heterogeneous visible GPUs. Until a provider contains
    all required targets, it should miss AOT cleanly and fall back to JIT.
 7. Update release and nightly matrices, wheel-index parsing, documentation, and
-   stale-provider uninstall behavior only after the inventories pass.
+   stale-provider uninstall behavior only after the inventories pass. Keep the
+   CUDA version and PyTorch index in `ci/cuda-versions.json`, and add explicit
+   provider coverage fields rather than inferring them from size-pruned
+   monolithic architecture lists.
 
 ## Open Decisions
 
@@ -252,5 +284,7 @@ Before changing release workflows or making shim mode the default:
   providers as a size optimization.
 - Whether provider manifests should include hashes and per-module code targets,
   rather than the provider-wide target list used by the prototype.
+- Which architectures removed from aggregate wheels for size, including sm75
+  and sm121a, should remain in each platform's default provider set.
 - How long to retain legacy monolithic wheel production after the shim becomes
   the default.

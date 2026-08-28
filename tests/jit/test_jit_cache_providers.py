@@ -1,8 +1,10 @@
 import importlib.util
+import os
 import subprocess
 import sys
 import zipfile
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -145,6 +147,7 @@ def test_shim_ignores_invalid_provider(monkeypatch, caplog, jit_cache_shim_modul
     [
         ("8.0", "8.0", "sm80"),
         ("sm90a", "9.0a", "sm90a"),
+        ("10.7a", "10.7a", "sm107a"),
         ("compute_120f", "12.0f", "sm120f"),
         ("12.1a", "12.1a", "sm121a"),
     ],
@@ -170,9 +173,100 @@ def test_provider_build_config_uses_distinct_distribution_name(
     config = provider_package_config_module.get_provider_build_config()
 
     assert config.provider_tag == "sm90a"
+    assert config.cuda_major == "13"
     assert config.distribution == "flashinfer-jit-cache-sm90a"
     assert config.package == "flashinfer_jit_cache.providers.sm90a"
     assert config.version.endswith("+cu130")
+
+
+def test_provider_backend_uses_configured_build_dependencies(monkeypatch, tmp_path):
+    backend_path = (
+        Path(__file__).resolve().parents[2]
+        / "flashinfer-jit-cache-provider"
+        / "build_backend.py"
+    )
+    provider_source = tmp_path / "flashinfer_jit_cache_provider"
+    provider_source.mkdir()
+    config = SimpleNamespace(
+        cuda_architecture="10.7a",
+        cuda_major="13",
+        provider_tag="sm107a",
+        distribution="flashinfer-jit-cache-sm107a",
+        package="flashinfer_jit_cache.providers.sm107a",
+        version="0.6.18+cu134",
+    )
+
+    package_config = ModuleType("package_config")
+    package_config.PROJECT_ROOT = tmp_path
+    package_config.PROVIDER_SOURCE_DIR = provider_source
+    package_config.get_provider_build_config = lambda: config
+
+    build_utils = ModuleType("build_utils")
+    build_utils.get_git_version = lambda cwd=None: "deadbeef"
+    build_utils.get_build_dependency_requirements = lambda cuda_major: [
+        "nvidia-cutlass-dsl[cu13]>=4.6.2a0"
+        if cuda_major == "13"
+        else "nvidia-cutlass-dsl>=4.6.2a0"
+    ]
+
+    monkeypatch.setitem(sys.modules, "package_config", package_config)
+    monkeypatch.setitem(sys.modules, "build_utils", build_utils)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+
+    module_name = "_test_jit_cache_provider_build_backend"
+    spec = importlib.util.spec_from_file_location(module_name, backend_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+        monkeypatch.setattr(
+            module._orig,
+            "get_requires_for_build_wheel",
+            lambda _settings: ["setuptools>=77"],
+        )
+        monkeypatch.setattr(
+            module._orig,
+            "get_requires_for_build_editable",
+            lambda _settings: ["setuptools>=77"],
+        )
+
+        expected = ["setuptools>=77", "nvidia-cutlass-dsl[cu13]>=4.6.2a0"]
+        assert module.get_requires_for_build_wheel(None) == expected
+        assert module.get_requires_for_build_editable(None) == expected
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_provider_wheelhouse_resolves_cu134_from_shared_config():
+    script_path = (
+        Path(__file__).resolve().parents[2]
+        / "scripts"
+        / "build_jit_cache_provider_wheelhouse.sh"
+    )
+    env = os.environ.copy()
+    env.update(
+        {
+            "ARCH": "aarch64",
+            "FLASHINFER_JIT_CACHE_PROVIDER_ARCH": "12.1a",
+            "FLASHINFER_LOCAL_VERSION": "cu134",
+        }
+    )
+    env.pop("CUDA_VERSION", None)
+    env.pop("DOCKER_IMAGE", None)
+
+    result = subprocess.run(
+        ["bash", str(script_path), "--print-config"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert "provider=sm121a" in result.stdout
+    assert "cuda_version=13.4" in result.stdout
+    assert "pytorch_index=nightly/cu134" in result.stdout
+    assert "container=pytorch/manylinuxaarch64-builder:cuda13.4" in result.stdout
 
 
 def test_native_provider_cuda_inspection_reports_no_ptx(

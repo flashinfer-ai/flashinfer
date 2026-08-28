@@ -20,23 +20,93 @@ normalize_provider_tag() {
     printf 'sm%s\n' "${architecture}"
 }
 
+resolve_cuda_config() {
+    local config_values config_version config_pytorch_index config_arch_list
+    local configured_cuda_version=${CUDA_VERSION:-}
+
+    config_values=$(python3 - \
+        "${REPO_ROOT}/ci/cuda-versions.json" \
+        "${FLASHINFER_LOCAL_VERSION}" \
+        "${ARCH}" <<'PY'
+import json
+import sys
+
+config_path, label, machine = sys.argv[1:]
+with open(config_path) as config_file:
+    entries = json.load(config_file)["jit_cache"]
+
+try:
+    entry = next(item for item in entries if item["label"] == label)
+except StopIteration:
+    labels = ", ".join(item["label"] for item in entries)
+    raise SystemExit(f"Unknown JIT-cache CUDA label {label!r}; expected one of: {labels}")
+
+arch_field = f"{machine}_arch_list"
+try:
+    arch_list = entry[arch_field]
+except KeyError:
+    raise SystemExit(f"Unsupported provider CPU architecture {machine!r}") from None
+
+print(entry["version"], entry["pytorch_index"], arch_list, sep="\t")
+PY
+    )
+    IFS=$'\t' read -r config_version config_pytorch_index config_arch_list \
+        <<< "${config_values}"
+
+    if [ -n "${configured_cuda_version}" ] && \
+       [ "${configured_cuda_version}" != "${config_version}" ]; then
+        echo "CUDA_VERSION=${configured_cuda_version} conflicts with ${FLASHINFER_LOCAL_VERSION} (${config_version})" >&2
+        exit 2
+    fi
+
+    export CUDA_VERSION="${config_version}"
+    export CUDA_MAJOR="${config_version%%.*}"
+    export CUDA_MINOR="${config_version#*.}"
+    export PYTORCH_INDEX="${config_pytorch_index}"
+    export FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS="${config_arch_list}"
+
+    if [ -z "${DOCKER_IMAGE:-}" ]; then
+        case "${ARCH}" in
+            aarch64)
+                DOCKER_IMAGE="pytorch/manylinuxaarch64-builder:cuda${CUDA_VERSION}"
+                ;;
+            x86_64)
+                DOCKER_IMAGE="pytorch/manylinux2_28-builder:cuda${CUDA_VERSION}"
+                ;;
+            *)
+                echo "Unsupported provider CPU architecture: ${ARCH}" >&2
+                exit 2
+                ;;
+        esac
+        export DOCKER_IMAGE
+    fi
+}
+
 : "${FLASHINFER_JIT_CACHE_PROVIDER_ARCH:=12.1a}"
 : "${FLASHINFER_LOCAL_VERSION:=cu130}"
 : "${FLASHINFER_DEV_RELEASE_SUFFIX:=$(date -u +%Y%m%d)}"
-: "${CUDA_VERSION:=13.0}"
-: "${CUDA_MAJOR:=13}"
-: "${CUDA_MINOR:=0}"
 : "${ARCH:=aarch64}"
-: "${DOCKER_IMAGE:=pytorch/manylinuxaarch64-builder:cuda13.0}"
 : "${AOT_MAX_JOBS_CAP:=4}"
 : "${AOT_MAX_JOBS_MEMORY_GB:=16}"
 : "${FLASHINFER_NVCC_THREADS:=1}"
 : "${CUDA_ARCHITECTURE_POLICY:=strict}"
 : "${CLEAN_OUTPUT:=0}"
 
+resolve_cuda_config
+
 PROVIDER_TAG=$(normalize_provider_tag "${FLASHINFER_JIT_CACHE_PROVIDER_ARCH}")
 PACKAGE_VERSION=$(tr -d '[:space:]' < "${REPO_ROOT}/version.txt")
 PACKAGE_VERSION="${PACKAGE_VERSION}.dev${FLASHINFER_DEV_RELEASE_SUFFIX}+${FLASHINFER_LOCAL_VERSION}"
+
+print_config() {
+    echo "provider=${PROVIDER_TAG}"
+    echo "cuda_label=${FLASHINFER_LOCAL_VERSION}"
+    echo "cuda_version=${CUDA_VERSION}"
+    echo "pytorch_index=${PYTORCH_INDEX}"
+    echo "cpu_arch=${ARCH}"
+    echo "container=${DOCKER_IMAGE}"
+    echo "monolithic_arch_list=${FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS}"
+}
 
 run_on_host() {
     local output_dir cache_dir host_uid host_gid
@@ -89,11 +159,13 @@ run_on_host() {
         -e FLASHINFER_DEV_RELEASE_SUFFIX="${FLASHINFER_DEV_RELEASE_SUFFIX}" \
         -e FLASHINFER_JIT_CACHE_PROVIDER_ARCH="${FLASHINFER_JIT_CACHE_PROVIDER_ARCH}" \
         -e FLASHINFER_LOCAL_VERSION="${FLASHINFER_LOCAL_VERSION}" \
+        -e FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS="${FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS}" \
         -e FLASHINFER_NVCC_THREADS="${FLASHINFER_NVCC_THREADS}" \
         -e HOST_GID="${host_gid}" \
         -e HOST_UID="${host_uid}" \
         -e OUTPUT_DIR=/wheelhouse \
         -e PYTHON_BIN="${PYTHON_BIN:-/opt/python/cp312-cp312/bin/python}" \
+        -e PYTORCH_INDEX="${PYTORCH_INDEX}" \
         -e FLASHINFER_CI_CACHE=/ci-cache \
         -w /workspace \
         "${DOCKER_IMAGE}" \
@@ -129,11 +201,15 @@ run_in_container() {
 
     "${python_bin}" -m venv "${build_venv}"
     python="${build_venv}/bin/python"
-    "${python}" -m pip install --disable-pip-version-check --upgrade build
 
     # shellcheck source=scripts/jit_cache_build_common.sh
     source "${SCRIPT_DIR}/jit_cache_build_common.sh"
     compute_jit_cache_parallelism
+    validate_jit_cache_cuda_toolchain "${CUDA_VERSION}" /usr/local/cuda/bin/nvcc
+
+    echo "::group::Install build system"
+    setup_jit_cache_python_build "${python}" "${CUDA_VERSION}" "${PYTORCH_INDEX}"
+    echo "::endgroup::"
 
     export BUILD_NVEP=0
     export FLASHINFER_DISABLE_VERSION_CHECK=1
@@ -145,7 +221,9 @@ run_in_container() {
     echo "Version: ${PACKAGE_VERSION}"
     echo "Provider: ${PROVIDER_TAG} (${FLASHINFER_CUDA_ARCH_LIST})"
     echo "CUDA: $(/usr/local/cuda/bin/nvcc --version | tail -n 1)"
+    echo "PyTorch index: ${PYTORCH_INDEX}"
     echo "Architecture: $(uname -m)"
+    echo "Monolithic matrix targets: ${FLASHINFER_JIT_CACHE_MONOLITHIC_ARCHS}"
     echo "MAX_JOBS: ${MAX_JOBS}"
     echo "NVCC_THREADS: ${FLASHINFER_NVCC_THREADS}"
     echo "Memory budget per job: ${MEM_PER_JOB} GB"
@@ -202,8 +280,11 @@ case "${1:-}" in
     "")
         run_on_host
         ;;
+    --print-config)
+        print_config
+        ;;
     *)
-        echo "Usage: $0 [--inside-container]" >&2
+        echo "Usage: $0 [--inside-container|--print-config]" >&2
         exit 2
         ;;
 esac
