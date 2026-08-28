@@ -1,5 +1,8 @@
 {
-  "arch": "sm_100a",
+  "architectures": [
+    "sm_100a",
+    "sm_103a"
+  ],
   "compile_flags": [
     "--use_fast_math"
   ],
@@ -39,8 +42,8 @@
     ],
     "dynamic_smem_bytes": 256
   },
-  "schema_version": 2,
-  "source_sha256": "e23d45731b1bb38a1bd95f53ff6558e0abc7dd636cf11d5aa420d0e026264410",
+  "schema_version": 3,
+  "source_sha256": "f93ee6c70ac283533df960d8192ecd0dfc796c54aac9145a5efe1e5bfce14bad",
   "workspace_protocol": {
     "flag_region_bytes_by_world_size": {
       "2": 2048,
