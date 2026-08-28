@@ -232,6 +232,7 @@ def gen_flash_kda_evolution_module(
         name=uri,
         sources=[binding],
         extra_cuda_cflags=[
+            "--use_fast_math",
             *_NVCC_FLAGS[target],
             _TARGET_DEFINE[target],
         ],
