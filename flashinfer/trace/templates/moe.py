@@ -3826,7 +3826,6 @@ cute_dsl_moe_wrapper_run_trace = TraceTemplate(
 )
 
 
-
 # ---------------------------------------------------------------------------
 # Deprecated dtype-specific CuteDSL MoE (MXFP8 x MXFP4 / W4A8).
 # Kept so the deprecated cute_dsl_fused_moe_mxfp8_mxfp4 entry points keep
