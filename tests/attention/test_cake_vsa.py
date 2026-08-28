@@ -200,3 +200,68 @@ def test_cake_vsa_blk64_per_head_partial_blocks():
     torch.testing.assert_close(lse, reference_lse, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(direct_output, reference, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(direct_lse, reference_lse, atol=1e-2, rtol=1e-2)
+
+
+def test_cake_vsa_blk64_full_group_rows_use_weight_stationary_profile():
+    """Mixed full-group rows remain correct on the plan-wide WS route."""
+
+    torch.manual_seed(20260823)
+    device = torch.device("cuda")
+    block_size, heads, head_dim = 64, 2, 128
+    mb, nb = 2, 32
+    M, N = mb * block_size, nb * block_size
+    q2k_indices = (
+        torch.arange(nb, dtype=torch.int32, device=device)
+        .expand(heads, mb, nb)
+        .contiguous()
+    )
+    q2k_num = torch.tensor([[24, 28], [24, 28]], dtype=torch.int32, device=device)
+    q = torch.randn((M, heads, head_dim), dtype=torch.bfloat16, device=device)
+    k = torch.randn((N, heads, head_dim), dtype=torch.bfloat16, device=device)
+    v = torch.randn((N, heads, head_dim), dtype=torch.bfloat16, device=device)
+    inputs = tuple(tensor.clone() for tensor in (q, k, v, q2k_indices, q2k_num))
+
+    workspace = torch.empty((128 * 1024 * 1024,), dtype=torch.uint8, device=device)
+    wrapper = BlockSparseAttentionWrapper(workspace, backend="cake")
+    wrapper.plan(
+        None,
+        None,
+        M,
+        N,
+        block_size,
+        block_size,
+        heads,
+        heads,
+        head_dim,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        q2k_indices=q2k_indices,
+        q2k_num=q2k_num,
+    )
+    assert wrapper._cake_vsa_plan is not None
+    assert wrapper._cake_vsa_plan["blk64_profile"] == "blk64_persistent_ws_m64n256"
+
+    output, lse = wrapper.run(q, k, v, return_lse=True)
+    repeated_output, repeated_lse = wrapper.run(q, k, v, return_lse=True)
+    assert torch.equal(repeated_output, output)
+    assert torch.equal(repeated_lse, lse)
+
+    block_mask = torch.zeros((heads, mb, nb), dtype=torch.bool, device=device)
+    for head in range(heads):
+        for row in range(mb):
+            count = int(q2k_num[head, row].item())
+            block_mask[head, row, q2k_indices[head, row, :count].long()] = True
+    token_mask = block_mask.repeat_interleave(block_size, 1).repeat_interleave(
+        block_size, 2
+    )
+    scores = torch.einsum("mhd,nhd->hmn", q.float(), k.float()) / math.sqrt(head_dim)
+    scores.masked_fill_(~token_mask, float("-inf"))
+    reference = torch.einsum(
+        "hmn,nhd->mhd", torch.softmax(scores, dim=-1), v.float()
+    ).to(torch.bfloat16)
+    reference_lse = torch.logsumexp(scores, dim=-1).transpose(0, 1)
+    torch.testing.assert_close(output, reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, reference_lse, atol=1e-2, rtol=1e-2)
+
+    for tensor, original in zip((q, k, v, q2k_indices, q2k_num), inputs, strict=True):
+        assert torch.equal(tensor, original)
