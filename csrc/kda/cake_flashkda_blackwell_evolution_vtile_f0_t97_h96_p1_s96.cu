@@ -115,7 +115,7 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #define NUM_HEADS 96
 #define USE_INITIAL_STATE 1
 #define STORE_FINAL_STATE 1
-#define SCALE_VALUE 0.08838834764831845
+#define SCALE_VALUE 0.08838834764831843
 #define LOWER_BOUND_VALUE -5.0
 #define PERSISTENT_TASKS 1
 #define PERSISTENT_STRIDE 96
