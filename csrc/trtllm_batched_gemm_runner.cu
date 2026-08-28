@@ -50,12 +50,7 @@ bool isArchCompatible(int smVersion, tg::CudaArch cubinArch) {
     case tg::CudaArch::Sm100a:
       return smVersion == 100;
     case tg::CudaArch::Sm100f:
-      // Sm100f is the family-conditional target: valid across the whole SM100
-      // line, which includes SM107 (Rubin). Excluding 107 here discards every
-      // family cubin on Rubin, leaving only the Sm107a entries the pinned pack
-      // happens to carry -- and nothing at all when that pack lacks native
-      // sm107a coverage for the requested options.
-      return smVersion == 100 || smVersion == 103 || smVersion == 107;
+      return smVersion == 100 || smVersion == 103;
     case tg::CudaArch::Sm103a:
       return smVersion == 103;
 #ifdef TLLM_RUBIN_FEATURES
