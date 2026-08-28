@@ -184,6 +184,7 @@ def _encode_key_fields(key_fields: Any) -> Optional[Any]:
     Callers must treat None as "not preloadable" and fall back to a lazy read --
     never as an error.
     """
+
     def enc(v):
         if v is None or isinstance(v, (bool, int, float, str)):
             return v
@@ -207,6 +208,7 @@ def _encode_key_fields(key_fields: Any) -> Optional[Any]:
 
 def _decode_key_fields(obj: Any) -> Optional[Any]:
     """Inverse of _encode_key_fields.  None if the payload is unrecognised."""
+
     def dec(v):
         if v is None or isinstance(v, (bool, int, float, str)):
             return v
@@ -222,7 +224,11 @@ def _decode_key_fields(obj: Any) -> Optional[Any]:
                 return dt if isinstance(dt, torch.dtype) else _UNENCODABLE
             if "__tuple__" in v:
                 items = [dec(i) for i in v["__tuple__"]]
-                return _UNENCODABLE if any(i is _UNENCODABLE for i in items) else tuple(items)
+                return (
+                    _UNENCODABLE
+                    if any(i is _UNENCODABLE for i in items)
+                    else tuple(items)
+                )
             return _UNENCODABLE
         if isinstance(v, list):
             items = [dec(i) for i in v]
