@@ -20,7 +20,7 @@ import functools
 import math
 from enum import Enum
 from functools import lru_cache
-from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.version
@@ -224,18 +224,22 @@ def get_alibi_slopes(
 SINGLE_KERNEL_TMP_SIZE = 32 * 1024 * 1024
 
 _cache_buf: Dict[Tuple[str, torch.device], torch.Tensor] = {}
+_cache_buf_retired: List[torch.Tensor] = []
 
 
 def _get_cache_buf(
-    name: str, bytes: int, device: torch.device, zero_init: bool = False
+    name: str, num_bytes: int, device: torch.device, zero_init: bool = False
 ) -> torch.Tensor:
+    """Return the process-wide ``name`` scratch buffer, grown to ``num_bytes``."""
     key = (name, device)
     buf = _cache_buf.get(key)
-    if buf is None or buf.size(0) < bytes:
+    if buf is None or buf.size(0) < num_bytes:
+        if buf is not None:
+            _cache_buf_retired.append(buf)
         if zero_init:
-            buf = torch.zeros(bytes, dtype=torch.uint8, device=device)
+            buf = torch.zeros(num_bytes, dtype=torch.uint8, device=device)
         else:
-            buf = torch.empty(bytes, dtype=torch.uint8, device=device)
+            buf = torch.empty(num_bytes, dtype=torch.uint8, device=device)
         _cache_buf[key] = buf
     return buf
 

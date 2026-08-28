@@ -3157,13 +3157,6 @@ def testBatchMLAPagedAttentionWrapper(args):
             remove_trtllm_native = True
         if remove_trtllm_native:
             backends.remove("trtllm-native")
-    if "cute-dsl" in backends:
-        remove_cute_dsl = False
-        if num_qo_heads < 128:
-            print("[INFO] cute-dsl MLA backend requires num_heads >= 128. Skipping.")
-            remove_cute_dsl = True
-        if remove_cute_dsl:
-            backends.remove("cute-dsl")
     if s_qo > 1:
         for backend in ("fa2", "fa3", "cutlass"):
             _drop_backend(

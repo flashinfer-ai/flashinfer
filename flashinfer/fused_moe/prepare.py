@@ -53,6 +53,53 @@ _TRTLLM_FP8_PER_TENSOR_PERMUTE_CACHE: dict = {}
 _TRTLLM_MXINT4_PERMUTE_CACHE: dict = {}
 
 
+def _normalize_activation(activation=None):
+    from .api import ActivationConfig, SwiGLU
+
+    activation = SwiGLU() if activation is None else activation
+    if not isinstance(activation, ActivationConfig):
+        raise TypeError(
+            f"activation must be an ActivationConfig value, got {type(activation).__name__}."
+        )
+    return activation
+
+
+def _gemm1_rows(intermediate_size: int, activation=None) -> int:
+    activation = _normalize_activation(activation)
+    return intermediate_size * (2 if activation.is_gated else 1)
+
+
+def _activation_param_view(
+    activation, num_expert_rows: int, device: torch.device
+) -> Dict[str, torch.Tensor]:
+    """Expand typed scalar semantics into the existing per-expert launcher ABI."""
+    from .api import SiTU, SwiGLU
+
+    activation = _normalize_activation(activation)
+    values: Dict[str, torch.Tensor] = {}
+    params: Tuple[Tuple[str, Optional[float]], ...]
+    if isinstance(activation, SwiGLU) and activation != SwiGLU():
+        params = (
+            ("gemm1_alpha", activation.alpha),
+            ("gemm1_beta", activation.beta),
+            ("gemm1_clamp_limit", activation.limit),
+        )
+    elif isinstance(activation, SiTU):
+        params = (
+            ("gemm1_alpha", activation.gate_scale),
+            ("gemm1_beta", activation.linear_scale),
+            ("gemm1_clamp_limit", activation.clamp_limit),
+        )
+    else:
+        params = ()
+    for name, value in params:
+        if value is not None:
+            values[name] = torch.full(
+                (num_expert_rows,), value, dtype=torch.float32, device=device
+            )
+    return values
+
+
 # The E8M0 range clamp and residual-scale factorization are adapted from
 # Humming's HummingLayer.may_process_fused_e8m0_scale:
 # https://github.com/inclusionAI/humming/blob/f6241bba8d507c19ca9ce4e5958a5d0641fc8eb4/humming/layer.py#L322-L362
@@ -414,6 +461,7 @@ def prepare_trtllm_fp4_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
     permute_cache: Optional[dict] = None,
 ) -> Dict[str, torch.Tensor]:
@@ -427,7 +475,10 @@ def prepare_trtllm_fp4_weights(
     Parameters
     ----------
     w1_bf16 : Tensor
-        Gate+up expert weights ``[num_local_experts, 2*intermediate_size, hidden_size]``.
+        Expert weights for GEMM1. Gated activations use
+        ``[num_local_experts, 2*intermediate_size, hidden_size]`` in ``[up, gate]``
+        order; non-gated activations (ReLU2) use
+        ``[num_local_experts, intermediate_size, hidden_size]``.
     w2_bf16 : Tensor
         Down-projection expert weights ``[num_local_experts, hidden_size, intermediate_size]``.
     num_local_experts, hidden_size, intermediate_size : int
@@ -489,7 +540,20 @@ def prepare_trtllm_fp4_weights(
     epilogue_tile_m = 128  # TRTLLM kernel-internal constant
 
     w1_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
-    w1_flat = w1_bf16.view(num_local_experts * 2 * intermediate_size, hidden_size)
+    activation = _normalize_activation(activation)
+    gemm1_rows = _gemm1_rows(intermediate_size, activation)
+    # The alignment check above bounds intermediate_size, but the scale
+    # permutation tiles GEMM1 by epilogue_tile_m rows. A gated activation
+    # doubles the row count, so intermediate_size=64 is fine for SwiGLU (128
+    # rows) and short for ReLU2 (64). Without this the shortfall surfaces as a
+    # bare AssertionError from inside the permutation.
+    if gemm1_rows % epilogue_tile_m != 0:
+        raise ValueError(
+            f"{variant.name} requires GEMM1 rows divisible by {epilogue_tile_m}; "
+            f"{type(activation).__name__} gives {gemm1_rows} rows for "
+            f"intermediate_size={intermediate_size}."
+        )
+    w1_flat = w1_bf16.view(num_local_experts * gemm1_rows, hidden_size)
     w1_q_flat, w1_sf_flat = fp4_quantize(
         w1_flat,
         global_scale=w1_gs,
@@ -497,11 +561,11 @@ def prepare_trtllm_fp4_weights(
         sf_use_ue8m0=is_mxfp4,
         is_sf_swizzled_layout=False,
     )
-    g1_w = w1_q_flat.view(
-        num_local_experts, 2 * intermediate_size, hidden_size // 2
-    ).view(torch.uint8)
+    g1_w = w1_q_flat.view(num_local_experts, gemm1_rows, hidden_size // 2).view(
+        torch.uint8
+    )
     g1_s = w1_sf_flat.view(torch.float8_e4m3fn).reshape(
-        num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size
+        num_local_experts, gemm1_rows, hidden_size // sf_vec_size
     )
 
     w2_gs = torch.tensor([1.0], device=device, dtype=torch.float32)
@@ -523,7 +587,10 @@ def prepare_trtllm_fp4_weights(
     g1_w_sh, g1_s_sh, g2_w_sh, g2_s_sh = [], [], [], []
     for i in range(num_local_experts):
         p = _maybe_get_cached_w3_w1_permute_indices(
-            permute_cache, g1_w[i], epilogue_tile_m, is_gated_act_gemm=True
+            permute_cache,
+            g1_w[i],
+            epilogue_tile_m,
+            is_gated_act_gemm=activation.is_gated,
         )
         g1_w_sh.append(g1_w[i][p.to(device)].contiguous())
 
@@ -532,7 +599,7 @@ def prepare_trtllm_fp4_weights(
             g1_s[i].view(torch.uint8),
             epilogue_tile_m,
             num_elts_per_sf=16,
-            is_gated_act_gemm=True,
+            is_gated_act_gemm=activation.is_gated,
         )
         g1_s_sh.append(
             block_scale_interleave(
@@ -557,7 +624,7 @@ def prepare_trtllm_fp4_weights(
 
     ones = torch.ones(num_local_experts, device=device, dtype=torch.float32)
     gemm1_scale = torch.stack(g1_s_sh).reshape(
-        num_local_experts, 2 * intermediate_size, hidden_size // sf_vec_size
+        num_local_experts, gemm1_rows, hidden_size // sf_vec_size
     )
     gemm2_scale = torch.stack(g2_s_sh).reshape(
         num_local_experts, hidden_size, intermediate_size // sf_vec_size
@@ -575,8 +642,11 @@ def prepare_trtllm_fp4_weights(
         "output1_scale_gate_scalar": ones,
         "output2_scale_scalar": ones,
     }
-    if not is_mxfp4:
+    if not is_mxfp4 and activation.is_gated:
+        # NVFP4 gated kernels consume a per-expert gate alpha; non-gated
+        # activations do not, so ReLU2 must not receive this placeholder.
         result["gemm1_alpha"] = ones
+    result.update(_activation_param_view(activation, num_local_experts, device))
     return result
 
 
@@ -673,13 +743,18 @@ def _validate_trtllm_fp8_block_inputs(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
 ) -> None:
     if w1_bf16.dtype != torch.bfloat16 or w2_bf16.dtype != torch.bfloat16:
         raise ValueError(
             "prepare_trtllm_fp8_block_weights expects BF16 weights, got "
             f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
         )
-    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    expected_w1 = (
+        num_local_experts,
+        _gemm1_rows(intermediate_size, activation),
+        hidden_size,
+    )
     expected_w2 = (num_local_experts, hidden_size, intermediate_size)
     if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
         raise ValueError(
@@ -696,6 +771,7 @@ def prepare_trtllm_fp8_block_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Prepare canonical BF16 expert weights for TRTLLM block-FP8 MoE.
@@ -715,12 +791,15 @@ def prepare_trtllm_fp8_block_weights(
             "variant must be QuantVariant.DeepSeekFp8 or QuantVariant.MxFp8, "
             f"got {variant!r}."
         )
+    activation = _normalize_activation(activation)
+    gemm1_rows = _gemm1_rows(intermediate_size, activation)
     _validate_trtllm_fp8_block_inputs(
         w1_bf16,
         w2_bf16,
         num_local_experts=num_local_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
+        activation=activation,
     )
     if device is None:
         device = w1_bf16.device
@@ -731,7 +810,7 @@ def prepare_trtllm_fp8_block_weights(
         for name, dim in (
             ("hidden_size", hidden_size),
             ("intermediate_size", intermediate_size),
-            ("2 * intermediate_size", 2 * intermediate_size),
+            ("gemm1_rows", gemm1_rows),
         ):
             if dim % 128 != 0:
                 raise ValueError(f"DeepSeek FP8 requires {name} divisible by 128.")
@@ -753,19 +832,19 @@ def prepare_trtllm_fp8_block_weights(
         w1_q, w1_sf, w2_q, w2_sf = [], [], [], []
         for expert in range(num_local_experts):
             q, sf = mxfp8_quantize(w1_bf16[expert], is_sf_swizzled_layout=False)
-            sf = sf.view(torch.uint8).reshape(2 * intermediate_size, hidden_size // 32)
+            sf = sf.view(torch.uint8).reshape(gemm1_rows, hidden_size // 32)
             permute = _maybe_get_cached_w3_w1_permute_indices(
                 _TRTLLM_FP8_PERMUTE_CACHE,
                 q.view(torch.uint8),
                 128,
-                is_gated_act_gemm=True,
+                is_gated_act_gemm=activation.is_gated,
             )
             permute_sf = _maybe_get_cached_w3_w1_permute_indices(
                 _TRTLLM_FP8_PERMUTE_CACHE,
                 sf,
                 128,
                 num_elts_per_sf=32,
-                is_gated_act_gemm=True,
+                is_gated_act_gemm=activation.is_gated,
             )
             w1_q.append(q.view(torch.uint8)[permute.to(device)].view(q.dtype))
             w1_sf.append(
@@ -794,12 +873,14 @@ def prepare_trtllm_fp8_block_weights(
         w1_q, w1_sf = torch.stack(w1_q), torch.stack(w1_sf)
         w2_q, w2_sf = torch.stack(w2_q), torch.stack(w2_sf)
 
-    return {
+    result = {
         "gemm1_weights": w1_q,
         "gemm1_weights_scale": w1_sf,
         "gemm2_weights": w2_q,
         "gemm2_weights_scale": w2_sf,
     }
+    result.update(_activation_param_view(activation, num_local_experts, device))
+    return result
 
 
 def prepare_trtllm_fp8_block_activations(
@@ -871,6 +952,7 @@ def prepare_trtllm_fp8_per_tensor_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the TRTLLM per-tensor-FP8 MajorK weight view.
@@ -887,7 +969,9 @@ def prepare_trtllm_fp8_per_tensor_weights(
             "prepare_trtllm_fp8_per_tensor_weights expects BF16 weights, got "
             f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
         )
-    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    activation = _normalize_activation(activation)
+    gemm1_rows = _gemm1_rows(intermediate_size, activation)
+    expected_w1 = (num_local_experts, gemm1_rows, hidden_size)
     expected_w2 = (num_local_experts, hidden_size, intermediate_size)
     if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
         raise ValueError(
@@ -919,7 +1003,7 @@ def prepare_trtllm_fp8_per_tensor_weights(
             _TRTLLM_FP8_PER_TENSOR_PERMUTE_CACHE,
             w1_q[expert].view(torch.uint8),
             128,
-            is_gated_act_gemm=True,
+            is_gated_act_gemm=activation.is_gated,
         )
         w1_shuffled.append(
             w1_q[expert]
@@ -939,12 +1023,15 @@ def prepare_trtllm_fp8_per_tensor_weights(
             .view(torch.float8_e4m3fn)
         )
 
+    output1_scale = (
+        intermediate_scale / (w1_scale * input_scale)
+        if activation.is_gated
+        else torch.ones_like(w1_scale) * intermediate_scale
+    )
     return {
         "gemm1_weights": torch.stack(w1_shuffled),
         "gemm2_weights": torch.stack(w2_shuffled),
-        "output1_scales_scalar": (
-            intermediate_scale / (w1_scale * input_scale)
-        ).contiguous(),
+        "output1_scales_scalar": output1_scale.contiguous(),
         "output1_scales_gate_scalar": (1.0 / (w1_scale * input_scale)).contiguous(),
         "output2_scales_scalar": (1.0 / (intermediate_scale * w2_scale)).contiguous(),
         # Calibration metadata is retained for callers preparing activations or
@@ -1009,6 +1096,7 @@ def prepare_trtllm_mxint4_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
     permute_cache: Optional[dict] = None,
 ) -> Dict[str, torch.Tensor]:
@@ -1033,7 +1121,9 @@ def prepare_trtllm_mxint4_weights(
             "prepare_trtllm_mxint4_weights expects BF16 weights, got "
             f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
         )
-    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    activation = _normalize_activation(activation)
+    gemm1_rows = _gemm1_rows(intermediate_size, activation)
+    expected_w1 = (num_local_experts, gemm1_rows, hidden_size)
     expected_w2 = (num_local_experts, hidden_size, intermediate_size)
     if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
         raise ValueError(
@@ -1049,7 +1139,7 @@ def prepare_trtllm_mxint4_weights(
     w2 = w2_bf16.to(device).contiguous()
     w1_q, w1_sf = _mxint4_quantize(w1)
     w2_q, w2_sf = _mxint4_quantize(w2)
-    w1_sf = w1_sf.reshape(num_local_experts, 2 * intermediate_size, hidden_size // 32)
+    w1_sf = w1_sf.reshape(num_local_experts, gemm1_rows, hidden_size // 32)
     w2_sf = w2_sf.reshape(num_local_experts, hidden_size, intermediate_size // 32)
 
     if permute_cache is None:
@@ -1059,13 +1149,17 @@ def prepare_trtllm_mxint4_weights(
     w1_views, w1_scale_views, w2_views, w2_scale_views = [], [], [], []
     for expert in range(num_local_experts):
         w1_permute = _maybe_get_cached_w3_w1_permute_indices(
-            permute_cache, w1_q[expert], epilogue_tile_m
+            permute_cache,
+            w1_q[expert],
+            epilogue_tile_m,
+            is_gated_act_gemm=activation.is_gated,
         )
         w1_scale_permute = _maybe_get_cached_w3_w1_permute_indices(
             permute_cache,
             w1_sf[expert],
             epilogue_tile_m,
             num_elts_per_sf=32,
+            is_gated_act_gemm=activation.is_gated,
         )
         w2_permute = get_w2_permute_indices_with_cache(
             permute_cache, w2_q[expert], epilogue_tile_m
@@ -1100,12 +1194,14 @@ def prepare_trtllm_mxint4_weights(
             )
         )
 
-    return {
+    result = {
         "gemm1_weights": torch.stack(w1_views),
         "gemm1_weights_scale": torch.stack(w1_scale_views).view(torch.bfloat16),
         "gemm2_weights": torch.stack(w2_views),
         "gemm2_weights_scale": torch.stack(w2_scale_views).view(torch.bfloat16),
     }
+    result.update(_activation_param_view(activation, num_local_experts, device))
+    return result
 
 
 def prepare_trtllm_bf16_weights(
@@ -1115,6 +1211,7 @@ def prepare_trtllm_bf16_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
     permute_cache: Optional[dict] = None,
 ) -> Dict[str, torch.Tensor]:
@@ -1132,7 +1229,10 @@ def prepare_trtllm_bf16_weights(
     Parameters
     ----------
     w1_bf16 : Tensor
-        Gate+up expert weights ``[num_local_experts, 2*intermediate_size, hidden_size]``.
+        Expert weights for GEMM1. Gated activations use
+        ``[num_local_experts, 2*intermediate_size, hidden_size]`` in ``[up, gate]``
+        order; non-gated activations (ReLU2) use
+        ``[num_local_experts, intermediate_size, hidden_size]``.
     w2_bf16 : Tensor
         Down-projection expert weights ``[num_local_experts, hidden_size, intermediate_size]``.
     num_local_experts, hidden_size, intermediate_size : int
@@ -1162,7 +1262,9 @@ def prepare_trtllm_bf16_weights(
             f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype} (the uint8 byte-view below "
             f"would silently reinterpret other dtypes)"
         )
-    expect_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    activation = _normalize_activation(activation)
+    gemm1_rows = _gemm1_rows(intermediate_size, activation)
+    expect_w1 = (num_local_experts, gemm1_rows, hidden_size)
     expect_w2 = (num_local_experts, hidden_size, intermediate_size)
     if tuple(w1_bf16.shape) != expect_w1 or tuple(w2_bf16.shape) != expect_w2:
         raise ValueError(
@@ -1183,7 +1285,10 @@ def prepare_trtllm_bf16_weights(
     for i in range(num_local_experts):
         w1_u8 = w1_bf16[i].view(torch.uint8)
         p1 = _maybe_get_cached_w3_w1_permute_indices(
-            permute_cache, w1_u8, epilogue_tile_m, is_gated_act_gemm=True
+            permute_cache,
+            w1_u8,
+            epilogue_tile_m,
+            is_gated_act_gemm=activation.is_gated,
         )
         w1_views.append(
             convert_to_block_layout(w1_u8[p1.to(device)].contiguous(), block_k)
@@ -1195,10 +1300,12 @@ def prepare_trtllm_bf16_weights(
             convert_to_block_layout(w2_u8[p2.to(device)].contiguous(), block_k)
         )
 
-    return {
+    result = {
         "gemm1_weights": torch.stack(w1_views).view(torch.bfloat16),
         "gemm2_weights": torch.stack(w2_views).view(torch.bfloat16),
     }
+    result.update(_activation_param_view(activation, num_local_experts, device))
+    return result
 
 
 def prepare_cutlass_bf16_weights(
@@ -1208,15 +1315,17 @@ def prepare_cutlass_bf16_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the canonical BF16 view consumed by ``CutlassBf16Runner``.
 
-    ``w1_bf16`` is ``[E, 2*I, H]`` in semantic ``[up, gate]`` order (same as
-    the flat CUTLASS SwiGLU split that tests name ``(w3, w1)``: up first, gate
-    second) and ``w2_bf16`` is ``[E, H, I]``.  CUTLASS BF16 paths consume these
-    dense tensors directly; preparation validates the source contract
-    and materializes contiguous tensors on the requested device.
+    ``w1_bf16`` is ``[E, 2*I, H]`` in semantic ``[up, gate]`` order for gated
+    activations, or ``[E, I, H]`` for non-gated ones (ReLU2); the row
+    count follows ``activation.is_gated``. ``w2_bf16`` is ``[E, H, I]``.
+    CUTLASS BF16 paths consume these dense tensors directly; preparation
+    validates the source contract and materializes contiguous tensors on the
+    requested device.
     """
     if device is None:
         device = w1_bf16.device
@@ -1226,7 +1335,12 @@ def prepare_cutlass_bf16_weights(
             "prepare_cutlass_bf16_weights expects BF16 weights, got "
             f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
         )
-    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    activation = _normalize_activation(activation)
+    expected_w1 = (
+        num_local_experts,
+        _gemm1_rows(intermediate_size, activation),
+        hidden_size,
+    )
     expected_w2 = (num_local_experts, hidden_size, intermediate_size)
     if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
         raise ValueError(
@@ -1296,6 +1410,7 @@ def prepare_cutlass_w4a16_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the SM90 mixed-input MXFP4 view for ``CutlassW4A16Runner``.
@@ -1313,7 +1428,9 @@ def prepare_cutlass_w4a16_weights(
         raise ValueError(
             "Cutlass W4A16 requires hidden_size and intermediate_size divisible by 128."
         )
-    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    activation = _normalize_activation(activation)
+    gemm1_rows = _gemm1_rows(intermediate_size, activation)
+    expected_w1 = (num_local_experts, gemm1_rows, hidden_size)
     expected_w2 = (num_local_experts, hidden_size, intermediate_size)
     if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
         raise ValueError(
@@ -1336,7 +1453,7 @@ def prepare_cutlass_w4a16_weights(
             interleave_moe_scales_for_sm90_mixed_gemm(scales),
         )
 
-    w1, w1_scale = quantize(w1_bf16, 2 * intermediate_size, hidden_size)
+    w1, w1_scale = quantize(w1_bf16, gemm1_rows, hidden_size)
     w2, w2_scale = quantize(w2_bf16, hidden_size, intermediate_size)
     return {
         "fc1_expert_weights": w1,
@@ -1365,13 +1482,14 @@ def prepare_cutlass_nvfp4_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the CUTLASS NVFP4 view consumed by ``CutlassNvfp4Runner``.
 
-    Canonical source is BF16 ``w1_bf16 [E, 2*I, H]`` in semantic ``[up, gate]``
-    order (same as the flat CUTLASS SwiGLU split that tests name ``(w3, w1)``:
-    up first, gate second) and ``w2_bf16 [E, H, I]``. Each expert is quantized
+    Canonical source is BF16 ``w1_bf16 [E, rows, H]``, where ``rows`` is
+    ``2*I`` in semantic ``[up, gate]`` order for gated activations and ``I``
+    for non-gated activations, plus ``w2_bf16 [E, H, I]``. Each expert is quantized
     independently with ``fp4_quantize`` (``sf_vec_size=16``, swizzled scales)
     so 128-row swizzle tiles never cross expert boundaries. Global scales are
     fixed at 1.0 to match the other unified NVFP4 prepares; the kernel still
@@ -1395,7 +1513,9 @@ def prepare_cutlass_nvfp4_weights(
             "Cutlass NVFP4 requires hidden_size and intermediate_size "
             f"divisible by {_NVFP4_SF_VEC_SIZE}."
         )
-    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    activation = _normalize_activation(activation)
+    gemm1_rows = _gemm1_rows(intermediate_size, activation)
+    expected_w1 = (num_local_experts, gemm1_rows, hidden_size)
     expected_w2 = (num_local_experts, hidden_size, intermediate_size)
     if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
         raise ValueError(
@@ -1454,6 +1574,7 @@ def _require_canonical_cutlass_bf16_weights(
     hidden_size: int,
     intermediate_size: int,
     name: str,
+    activation=None,
     alignment: Optional[int] = None,
     require_cuda: bool = False,
     device: Optional[torch.device] = None,
@@ -1470,7 +1591,12 @@ def _require_canonical_cutlass_bf16_weights(
             f"{name} requires hidden_size and intermediate_size divisible by "
             f"{alignment}."
         )
-    expected_w1 = (num_local_experts, 2 * intermediate_size, hidden_size)
+    activation = _normalize_activation(activation)
+    expected_w1 = (
+        num_local_experts,
+        _gemm1_rows(intermediate_size, activation),
+        hidden_size,
+    )
     expected_w2 = (num_local_experts, hidden_size, intermediate_size)
     if tuple(w1_bf16.shape) != expected_w1 or tuple(w2_bf16.shape) != expected_w2:
         raise ValueError(
@@ -1511,6 +1637,7 @@ def prepare_cutlass_fp8_per_tensor_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the unshuffled per-tensor FP8 view for ``CutlassFp8PerTensorRunner``.
@@ -1526,6 +1653,7 @@ def prepare_cutlass_fp8_per_tensor_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_fp8_per_tensor_weights",
+        activation=activation,
         device=device,
     )
     w1_q, w1_mult = _quantize_fp8_per_expert(w1_bf16)
@@ -1545,6 +1673,7 @@ def prepare_cutlass_fp8_block_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the DeepSeek 128x128 FP8 block-scale view for CUTLASS.
@@ -1559,6 +1688,7 @@ def prepare_cutlass_fp8_block_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_fp8_block_weights",
+        activation=activation,
         alignment=128,
         device=device,
     )
@@ -1613,6 +1743,7 @@ def prepare_cutlass_mxfp8_mxfp4_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the CUTLASS MXFP4 weight view consumed with MXFP8 activations.
@@ -1627,6 +1758,7 @@ def prepare_cutlass_mxfp8_mxfp4_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_mxfp8_mxfp4_weights",
+        activation=activation,
         alignment=128,
         require_cuda=True,
         device=device,
@@ -1684,6 +1816,7 @@ def prepare_cutlass_mxfp8_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the CUTLASS MXFP8 weight view consumed with MXFP8 activations.
@@ -1700,10 +1833,13 @@ def prepare_cutlass_mxfp8_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_mxfp8_weights",
+        activation=activation,
         alignment=128,
         require_cuda=True,
         device=device,
     )
+    activation = _normalize_activation(activation)
+    gemm1_rows = _gemm1_rows(intermediate_size, activation)
     w1_q, w1_scale = _quantize_mxfp8_experts(w1_bf16, num_local_experts)
     w2_q, w2_scale = _quantize_mxfp8_experts(w2_bf16, num_local_experts)
     fake_input_scale = torch.ones(num_local_experts, device=device, dtype=torch.float32)
@@ -1711,7 +1847,7 @@ def prepare_cutlass_mxfp8_weights(
         "fc1_expert_weights": w1_q.contiguous(),
         "fc2_expert_weights": w2_q.contiguous(),
         "fc1_expert_scales": _pack_mxfp8_weight_scales(
-            w1_scale, 2 * round_up(intermediate_size, 128), hidden_size
+            w1_scale, gemm1_rows, hidden_size
         ),
         "fc2_expert_scales": _pack_mxfp8_weight_scales(
             w2_scale, hidden_size, intermediate_size
@@ -1751,6 +1887,7 @@ def prepare_cutlass_w4a8_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the SM90 packed INT4 view for ``CutlassW4A8Runner``.
@@ -1767,6 +1904,7 @@ def prepare_cutlass_w4a8_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_w4a8_weights",
+        activation=activation,
         alignment=group_size,
         require_cuda=True,
         device=device,
@@ -1802,6 +1940,7 @@ def prepare_cutlass_humming_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the Humming MXFP4 x FP8 mixed-input view for SM90 CUTLASS.
@@ -1818,6 +1957,7 @@ def prepare_cutlass_humming_weights(
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
         name="prepare_cutlass_humming_weights",
+        activation=activation,
         alignment=128,
         require_cuda=True,
         device=device,
@@ -1832,7 +1972,9 @@ def prepare_cutlass_humming_weights(
             scales.view(num_local_experts, rows, cols // 32),
         )
 
-    w1_packed, w1_scale = quantize(w1_bf16, 2 * intermediate_size, hidden_size)
+    activation = _normalize_activation(activation)
+    gemm1_rows = _gemm1_rows(intermediate_size, activation)
+    w1_packed, w1_scale = quantize(w1_bf16, gemm1_rows, hidden_size)
     w2_packed, w2_scale = quantize(w2_bf16, hidden_size, intermediate_size)
     w1_il, w1_scale_il, w1_residual = (
         preprocess_moe_weights_for_sm90_mixed_gemm_humming(w1_packed, w1_scale)
@@ -1877,12 +2019,15 @@ def prepare_cute_dsl_nvfp4_weights(
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
+    activation=None,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the CuteDSL NVFP4 ``cute_dsl_nvfp4`` weight view.
 
-    Gemm1 weights get the SwiGLU linear/gate interleave; both gemms are NVFP4
-    block-quantized (swizzled) with scales converted to the CuteDSL MMA layout.
+    Gemm1 weights get the linear/gate interleave only for gated activations;
+    non-gated ones (ReLU2) skip it and keep their ``[E, I, H]`` rows as-is. Both
+    gemms are NVFP4 block-quantized (swizzled) with scales converted to the
+    CuteDSL MMA layout.
     Starts from the same canonical bf16 expert weights as
     :func:`prepare_trtllm_fp4_weights`, so a single weight set can feed both
     backends and a shared reference.
@@ -1907,19 +2052,21 @@ def prepare_cute_dsl_nvfp4_weights(
     sf_vec_size = 16
     gs = torch.tensor([1.0], device=device, dtype=torch.float32)
 
-    w1_interleaved = _interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
-    w1_flat = w1_interleaved.view(
-        num_local_experts * 2 * intermediate_size, hidden_size
+    activation = _normalize_activation(activation)
+    gemm1_rows = _gemm1_rows(intermediate_size, activation)
+    w1_interleaved = (
+        _interleave_linear_and_gate(w1_bf16, group_size=64, dim=1)
+        if activation.is_gated
+        else w1_bf16
     )
+    w1_flat = w1_interleaved.view(num_local_experts * gemm1_rows, hidden_size)
     w1_q_flat, w1_sf_flat = fp4_quantize(
         w1_flat, global_scale=gs, sf_vec_size=sf_vec_size, is_sf_swizzled_layout=True
     )
-    w1_weight = w1_q_flat.view(
-        num_local_experts, 2 * intermediate_size, hidden_size // 2
-    )
+    w1_weight = w1_q_flat.view(num_local_experts, gemm1_rows, hidden_size // 2)
     w1_weight_sf = convert_sf_to_mma_layout(
         w1_sf_flat,
-        m=2 * intermediate_size,
+        m=gemm1_rows,
         k=hidden_size,
         num_groups=num_local_experts,
         sf_vec_size=sf_vec_size,

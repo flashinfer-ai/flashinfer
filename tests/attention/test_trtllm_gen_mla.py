@@ -1264,6 +1264,77 @@ def test_trtllm_batch_decode_q1_mla():
     )
 
 
+def test_trtllm_batch_decode_q1_mla_uses_cga_kernel():
+    if get_compute_capability(torch.device("cuda")) != (10, 0):
+        pytest.skip("MLA H512 CGA kernel selection is specific to SM100")
+
+    device = "cuda:0"
+    batch_size = 1
+    num_heads = 128
+    page_size = 32
+    max_seq_len = 4096
+    head_dim_qk = 576
+    head_dim_v = 512
+    num_pages = max_seq_len // page_size
+
+    query = torch.randn(
+        batch_size,
+        1,
+        num_heads,
+        head_dim_qk,
+        dtype=torch.bfloat16,
+        device=device,
+    ).to(torch.float8_e4m3fn)
+    kv_cache = torch.randn(
+        num_pages,
+        1,
+        page_size,
+        head_dim_qk,
+        dtype=torch.bfloat16,
+        device=device,
+    ).to(torch.float8_e4m3fn)
+    block_tables = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(
+        0
+    )
+    seq_lens = torch.tensor([max_seq_len], dtype=torch.int32, device=device)
+    workspace_buffer = torch.empty(workspace_size, dtype=torch.int8, device=device)
+
+    def run_decode():
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=128,
+            kv_lora_rank=head_dim_v,
+            qk_rope_head_dim=64,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            bmm1_scale=1.0 / (192**0.5),
+            bmm2_scale=1.0,
+            enable_pdl=False,
+            backend="trtllm-gen",
+        )
+
+    # Warm up JIT compilation so the profile contains only the runtime selection and launch.
+    run_decode()
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ) as kernel_profile:
+        run_decode()
+        torch.cuda.synchronize()
+
+    fmha_kernel_names = {
+        event.name for event in kernel_profile.events() if event.name.startswith("fmha")
+    }
+    expected_kernel = "HQk576HV512HVPerCta128PagedKvDenseP32MultiCtasKvCga"
+    assert any(expected_kernel in name for name in fmha_kernel_names), fmha_kernel_names
+
+
 def test_trtllm_batch_decode_grouped_mla_fixed_q_batch_stride():
     trtllm_batch_decode_mla(
         MLALayerDimensions(deepseek_mla_dimensions, 8),
