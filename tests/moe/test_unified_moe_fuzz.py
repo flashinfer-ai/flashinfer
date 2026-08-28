@@ -165,6 +165,7 @@ POINTERS for future agents (point me at this file and I know the rest):
 
 from __future__ import annotations
 
+import hashlib
 import os
 import random
 from dataclasses import dataclass
@@ -192,7 +193,16 @@ from flashinfer.fused_moe.api import (
     SwiGLUStep,
     # Unified configs and backend options
     BackendOptions,
+    B12xNvfp4Config,
+    B12xW4A16Config,
     CutlassBf16Config,
+    CutlassFp8BlockConfig,
+    CutlassFp8PerTensorConfig,
+    CutlassHummingConfig,
+    CutlassMxfp8Config,
+    CutlassMxfp8Mxfp4Config,
+    CutlassNvfp4Config,
+    CutlassW4A8Config,
     CutlassW4A16Config,
     CuteDslConfig,
     ExecutionConfig,
@@ -208,6 +218,7 @@ from flashinfer.fused_moe.api import (
     TrtllmFp8PerTensorConfig,
     TrtllmMxInt4Config,
 )
+from flashinfer.fused_moe.capabilities import get_moe_backend_capabilities
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe.runners import _TrtllmRunnerBase
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
@@ -266,6 +277,9 @@ _DETERMINISTIC = {
     "trtllm_fp8_block": True,
     "trtllm_fp8_per_tensor": True,
 }
+# The seven #4610 CUTLASS runners and both b12x runners are intentionally
+# absent until repeated-run bitwise calibration is completed on SM90 and
+# SM120/SM121 respectively.
 
 # Known-bug ledger (shared mechanism: tests/test_helpers/fuzz_ledger.py). Two severities:
 # quarantine=False entries are RUN with a tolerated wrong answer (xpass flags the fix);
@@ -327,6 +341,10 @@ class DTypeHandler:
     out_dtype: torch.dtype  # output buffer dtype (used to locate it in the inputs list)
     atol_frac: float  # numeric tolerance vs reference = atol_frac * ‖ref‖∞
     rtol: float
+    # Contract overlays use backend-native activation/preparation recipes and
+    # therefore need a reference derived after the prepared view exists.
+    post_prepare_reference: Callable | None = None
+    prepare_weights: Callable | None = None
 
 
 def _poison_bf16_out(buf, gen):
@@ -823,6 +841,254 @@ def _mxint4_reference(
     return out
 
 
+def _contract_bf16_act_pack(x, selected_experts, final_scales):
+    """Packed CUTLASS/b12x contract: BF16 x and FP32 routing weights."""
+    return MoEActivationPack(
+        hidden_states_q=x,
+        hidden_states_scale=None,
+        routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        topk_ids=selected_experts,
+        topk_weights=final_scales.float(),
+    )
+
+
+def _contract_fp8_act_pack(config_cls):
+    def make(x, selected_experts, final_scales):
+        q, scale = config_cls.prepare_activations(x)
+        return MoEActivationPack(
+            hidden_states_q=q,
+            hidden_states_scale=scale,
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+            topk_ids=selected_experts,
+            topk_weights=final_scales.float(),
+        )
+
+    return make
+
+
+def _semantic_reference(
+    x, w1, w2, selected_experts, final_scales, intermediate_size, activation
+):
+    """Semantic CUTLASS/b12x reference in canonical [up, gate] row order."""
+    x32 = x.float()
+    out = torch.zeros_like(x32)
+    for expert in range(w1.shape[0]):
+        token, slot = torch.where(selected_experts == expert)
+        if token.numel() == 0:
+            continue
+        fc1 = x32[token] @ w1[expert].float().t()
+        if isinstance(activation, ReLU2):
+            inter = F.relu(fc1) ** 2
+        else:
+            up, gate = fc1[:, :intermediate_size], fc1[:, intermediate_size:]
+            if isinstance(activation, SwiGLU):
+                gate = gate.clamp(max=activation.limit)
+                up = up.clamp(min=-activation.limit, max=activation.limit)
+                inter = (
+                    gate
+                    * torch.sigmoid(activation.alpha * gate)
+                    * (up + activation.beta)
+                )
+            elif isinstance(activation, GeGLUTanh):
+                inter = F.gelu(gate, approximate="tanh") * up
+            elif isinstance(activation, GeGLU):
+                inter = F.gelu(gate, approximate="none") * up
+            elif isinstance(activation, SwiGLUStep):
+                inter = F.silu(gate).clamp(max=activation.limit) * up.clamp(
+                    min=-activation.limit, max=activation.limit
+                )
+            elif isinstance(activation, SiTU):
+                linear = (
+                    up
+                    if activation.linear_scale is None
+                    else activation.linear_scale
+                    * torch.tanh(up / activation.linear_scale)
+                )
+                inter = (
+                    linear
+                    * activation.gate_scale
+                    * torch.tanh(gate / activation.gate_scale)
+                    * torch.sigmoid(gate)
+                )
+            else:
+                raise AssertionError(f"unsupported contract activation {activation!r}")
+        expert_out = inter @ w2[expert].float().t()
+        out[token] += final_scales[token, slot, None].float() * expert_out
+    return out
+
+
+def _dequant_cutlass_nvfp4(packed, scale):
+    rows, packed_cols = packed.shape
+    return e2m1_and_ufp8sf_scale_to_float(
+        packed.cpu(),
+        scale.cpu().reshape(-1),
+        torch.ones(1, dtype=torch.float32),
+        16,
+        1,
+        True,
+    ).view(rows, packed_cols * 2)
+
+
+def _dequant_cutlass_nvfp4_experts(packed, scales, device):
+    return torch.stack(
+        [_dequant_cutlass_nvfp4(packed[i], scales[i]) for i in range(packed.shape[0])]
+    ).to(device=device, dtype=torch.bfloat16)
+
+
+def _dequant_int4_grouped(packed, scale, group_size=128):
+    even = packed.to(torch.int16) & 0xF
+    odd = packed.to(torch.int16) >> 4
+    even = torch.where(even >= 8, even - 16, even)
+    odd = torch.where(odd >= 8, odd - 16, odd)
+    unpacked = torch.stack((even, odd), dim=-1).reshape(
+        *packed.shape[:-1], packed.shape[-1] * 2
+    )
+    return unpacked.float() * scale.float().repeat_interleave(group_size, dim=-1)
+
+
+def _dequant_linear_mxfp4(packed, scales):
+    low, high = packed & 0xF, packed >> 4
+    codes = torch.stack((low, high), dim=-1).reshape(
+        *packed.shape[:-1], packed.shape[-1] * 2
+    )
+    magnitudes = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=packed.device,
+        dtype=torch.float32,
+    )
+    values = magnitudes[codes.long() & 0x7]
+    values = torch.where((codes & 0x8) != 0, -values, values)
+    scale = torch.exp2(scales.to(torch.int16).float() - 127)
+    return values * scale.repeat_interleave(32, dim=-1)
+
+
+def _cutlass_post_reference(backend_key):
+    def reference(
+        x, w1, w2, selected_experts, final_scales, intermediate_size, view, activation
+    ):
+        x_ref, w1_ref, w2_ref = x, w1, w2
+        if backend_key == "cutlass_nvfp4":
+            one = torch.ones(1, device=x.device)
+            x_q, x_sf = fp4_quantize(
+                x, global_scale=one, sf_vec_size=16, is_sf_swizzled_layout=True
+            )
+            x_ref = _dequant_cutlass_nvfp4(x_q, x_sf).to(x.device)
+            w1_ref = _dequant_cutlass_nvfp4_experts(
+                view["fc1_expert_weights"], view["fc1_weight_block_scale"], x.device
+            )
+            w2_ref = _dequant_cutlass_nvfp4_experts(
+                view["fc2_expert_weights"], view["fc2_weight_block_scale"], x.device
+            )
+        elif backend_key == "cutlass_fp8_per_tensor":
+            x_ref = view["_activation_q"].float() * view["_activation_scale"]
+            w1_ref = (
+                view["fc1_expert_weights"].float() * view["fc1_dequant"][:, None, None]
+            )
+            w2_ref = (
+                view["fc2_expert_weights"].float() * view["fc2_dequant"][:, None, None]
+            )
+        elif backend_key == "cutlass_fp8_block":
+            w1_ref = view["fc1_expert_weights"].float() * view[
+                "fc1_block_scale"
+            ].repeat_interleave(128, -2).repeat_interleave(128, -1)
+            w2_ref = view["fc2_expert_weights"].float() * view[
+                "fc2_block_scale"
+            ].repeat_interleave(128, -2).repeat_interleave(128, -1)
+        elif backend_key == "cutlass_mxfp8_mxfp4":
+            from flashinfer import mxfp4_dequantize, mxfp8_dequantize_host
+
+            x_ref = mxfp8_dequantize_host(
+                view["_activation_q"].cpu().view(torch.uint8),
+                view["_activation_scale"].cpu().view(torch.uint8).reshape(-1),
+                True,
+            ).to(x.device)
+            w1_ref = torch.stack(
+                [
+                    mxfp4_dequantize(
+                        view["fc1_expert_weights"][i].cpu(),
+                        view["fc1_expert_scales"][i]
+                        .cpu()
+                        .view(torch.uint8)
+                        .reshape(-1),
+                    )
+                    for i in range(w1.shape[0])
+                ]
+            ).to(x.device)
+            w2_ref = torch.stack(
+                [
+                    mxfp4_dequantize(
+                        view["fc2_expert_weights"][i].cpu(),
+                        view["fc2_expert_scales"][i]
+                        .cpu()
+                        .view(torch.uint8)
+                        .reshape(-1),
+                    )
+                    for i in range(w2.shape[0])
+                ]
+            ).to(x.device)
+        elif backend_key == "cutlass_mxfp8":
+            from flashinfer import mxfp8_dequantize_host
+
+            x_ref = mxfp8_dequantize_host(
+                view["_activation_q"].cpu().view(torch.uint8),
+                view["_activation_scale"].cpu().view(torch.uint8).reshape(-1),
+                True,
+            ).to(x.device)
+        elif backend_key == "cutlass_w4a8":
+            from flashinfer.fused_moe.prepare import _quantize_int4_grouped
+
+            q1, s1 = _quantize_int4_grouped(w1)
+            q2, s2 = _quantize_int4_grouped(w2)
+            w1_ref, w2_ref = (
+                _dequant_int4_grouped(q1, s1),
+                _dequant_int4_grouped(q2, s2),
+            )
+        elif backend_key == "cutlass_humming":
+            q1, s1 = _quantize_mxfp4_linear(w1.reshape(-1, w1.shape[-1]))
+            q2, s2 = _quantize_mxfp4_linear(w2.reshape(-1, w2.shape[-1]))
+            w1_ref = _dequant_linear_mxfp4(q1, s1).view_as(w1)
+            w2_ref = _dequant_linear_mxfp4(q2, s2).view_as(w2)
+        return _semantic_reference(
+            x_ref,
+            w1_ref,
+            w2_ref,
+            selected_experts,
+            final_scales,
+            intermediate_size,
+            activation,
+        )
+
+    return reference
+
+
+def _b12x_post_reference(
+    x, w1, w2, selected_experts, final_scales, intermediate_size, view, activation
+):
+    # The b12x conformance tests intentionally use canonical BF16 weights as
+    # the authority for both NVFP4 and checkpoint-style W4A16.
+    return _semantic_reference(
+        x, w1, w2, selected_experts, final_scales, intermediate_size, activation
+    )
+
+
+def _prepare_b12x_w4a16(BackendCfg, w1, w2, **kwargs):
+    from flashinfer.fused_moe.prepare import _quantize_b12x_expert_weights
+
+    q1, sf1 = _quantize_b12x_expert_weights(w1)
+    q2, sf2 = _quantize_b12x_expert_weights(w2)
+    ones = torch.ones(w1.shape[0], device=w1.device, dtype=torch.float32)
+    return BackendCfg.prepare_weights(
+        q1,
+        sf1,
+        ones,
+        q2,
+        sf2,
+        ones.clone(),
+        activation=kwargs["activation"],
+        source_format="modelopt",
+    )
+
+
 _DTYPE = {
     QuantVariant.NVFP4: DTypeHandler(
         variant=QuantVariant.NVFP4,
@@ -943,8 +1209,112 @@ _DTYPE = {
     ),
 }
 
-# Cfg.variant string <-> handler lookup (labels stay lowercase enum names).
-_HANDLER_BY_ID = {variant.name.lower(): handler for variant, handler in _DTYPE.items()}
+
+def _contract_handler(
+    config_cls,
+    variant,
+    *,
+    activation_pack,
+    reference,
+    prepare_weights=None,
+    atol_frac=0.2,
+    rtol=0.2,
+):
+    return DTypeHandler(
+        variant=variant,
+        candidate_configs=(config_cls,),
+        snap=_block_fp8_snap,
+        make_act_pack=activation_pack,
+        make_act_pack_logits=None,
+        reference=lambda *_: None,
+        poison=_poison_bf16_out,
+        out_dtype=torch.bfloat16,
+        atol_frac=atol_frac,
+        rtol=rtol,
+        post_prepare_reference=reference,
+        prepare_weights=prepare_weights,
+    )
+
+
+# Synthetic ids keep activation-pack contracts isolated from TRTLLM handlers.
+# In particular, one Cfg creates exactly one activation pack, so backends with
+# BF16, per-tensor FP8, and MXFP8 inputs cannot safely share a handler.
+_CONTRACT_HANDLERS = {
+    "cutlass_nvfp4": _contract_handler(
+        CutlassNvfp4Config,
+        QuantVariant.NVFP4,
+        activation_pack=_contract_bf16_act_pack,
+        reference=_cutlass_post_reference("cutlass_nvfp4"),
+    ),
+    "cutlass_fp8_per_tensor": _contract_handler(
+        CutlassFp8PerTensorConfig,
+        QuantVariant.FP8PerTensor,
+        activation_pack=_contract_fp8_act_pack(CutlassFp8PerTensorConfig),
+        reference=_cutlass_post_reference("cutlass_fp8_per_tensor"),
+        atol_frac=0.1,
+        rtol=0.1,
+    ),
+    "cutlass_fp8_block": _contract_handler(
+        CutlassFp8BlockConfig,
+        QuantVariant.DeepSeekFp8,
+        activation_pack=_contract_bf16_act_pack,
+        reference=_cutlass_post_reference("cutlass_fp8_block"),
+        atol_frac=0.1,
+        rtol=0.1,
+    ),
+    "cutlass_mxfp8_mxfp4": _contract_handler(
+        CutlassMxfp8Mxfp4Config,
+        QuantVariant.MXFP4,
+        activation_pack=_contract_fp8_act_pack(CutlassMxfp8Mxfp4Config),
+        reference=_cutlass_post_reference("cutlass_mxfp8_mxfp4"),
+        atol_frac=0.1,
+        rtol=0.1,
+    ),
+    "cutlass_mxfp8": _contract_handler(
+        CutlassMxfp8Config,
+        QuantVariant.MxFp8,
+        activation_pack=_contract_fp8_act_pack(CutlassMxfp8Config),
+        reference=_cutlass_post_reference("cutlass_mxfp8"),
+    ),
+    "cutlass_w4a8": _contract_handler(
+        CutlassW4A8Config,
+        QuantVariant.W4A8,
+        activation_pack=_contract_bf16_act_pack,
+        reference=_cutlass_post_reference("cutlass_w4a8"),
+        atol_frac=0.1,
+        rtol=0.1,
+    ),
+    "cutlass_humming": _contract_handler(
+        CutlassHummingConfig,
+        QuantVariant.Humming,
+        activation_pack=_contract_bf16_act_pack,
+        reference=_cutlass_post_reference("cutlass_humming"),
+    ),
+    "b12x_nvfp4": _contract_handler(
+        B12xNvfp4Config,
+        QuantVariant.NVFP4,
+        activation_pack=_contract_bf16_act_pack,
+        reference=_b12x_post_reference,
+        atol_frac=0.15,
+        rtol=0.1,
+    ),
+    "b12x_w4a16": _contract_handler(
+        B12xW4A16Config,
+        QuantVariant.W4A16,
+        activation_pack=_contract_bf16_act_pack,
+        reference=_b12x_post_reference,
+        prepare_weights=_prepare_b12x_w4a16,
+        atol_frac=0.05,
+        rtol=0.3,
+    ),
+}
+_B12X_BACKEND_KEYS = frozenset(("b12x_nvfp4", "b12x_w4a16"))
+
+# Cfg.variant string <-> handler lookup (random-generation ids stay unchanged).
+_HANDLER_BY_ID = {
+    **{variant.name.lower(): handler for variant, handler in _DTYPE.items()},
+    **_CONTRACT_HANDLERS,
+}
 _FROMLOGITS_VARIANT_IDS = tuple(
     variant.name.lower()
     for variant, handler in _DTYPE.items()
@@ -1720,6 +2090,64 @@ _CURATED = [
             ("mxfp8", 900_075),
         )
     ],
+    # Contract-isolated CUTLASS and b12x coverage. These are deliberately
+    # curated-only: random generation and its historical seed stream remain
+    # unchanged. Every case is PackedPrecomputed, finalized, non-EP, and has a
+    # singleton backend candidate through its synthetic handler id.
+    *[
+        Cfg(
+            16,
+            128,
+            256,
+            4,
+            2,
+            variant,
+            "uniform",
+            seed,
+            activation=activation,
+            expected_backend=backend,
+        )
+        for variant, backend, activation, seed in (
+            ("cutlass_nvfp4", "cutlass_nvfp4", "swiglu", 900_080),
+            ("cutlass_nvfp4", "cutlass_nvfp4", "geglutanh", 900_081),
+            (
+                "cutlass_fp8_per_tensor",
+                "cutlass_fp8_per_tensor",
+                "swiglu",
+                900_082,
+            ),
+            (
+                "cutlass_fp8_per_tensor",
+                "cutlass_fp8_per_tensor",
+                "geglutanh",
+                900_083,
+            ),
+            ("cutlass_fp8_block", "cutlass_fp8_block", "swiglu", 900_084),
+            ("cutlass_fp8_block", "cutlass_fp8_block", "geglutanh", 900_085),
+            (
+                "cutlass_mxfp8_mxfp4",
+                "cutlass_mxfp8_mxfp4",
+                "swiglu",
+                900_086,
+            ),
+            (
+                "cutlass_mxfp8_mxfp4",
+                "cutlass_mxfp8_mxfp4",
+                "geglutanh",
+                900_087,
+            ),
+            ("cutlass_mxfp8", "cutlass_mxfp8", "swiglu", 900_088),
+            ("cutlass_mxfp8", "cutlass_mxfp8", "geglutanh", 900_089),
+            ("cutlass_w4a8", "cutlass_w4a8", "swiglu", 900_090),
+            ("cutlass_w4a8", "cutlass_w4a8", "geglutanh", 900_091),
+            ("cutlass_humming", "cutlass_humming", "swiglu", 900_092),
+            ("cutlass_humming", "cutlass_humming", "geglutanh", 900_093),
+            ("b12x_nvfp4", "b12x_nvfp4", "swiglu", 900_094),
+            ("b12x_nvfp4", "b12x_nvfp4", "geglutanh", 900_095),
+            ("b12x_w4a16", "b12x_w4a16", "swiglu", 900_096),
+            ("b12x_w4a16", "b12x_w4a16", "relu2", 900_097),
+        )
+    ],
 ]
 _CURATED_BY_SEED = {}
 for _cfg in _CURATED:
@@ -1729,6 +2157,67 @@ for _cfg in _CURATED:
             f"{_cfg.seed}: {_CURATED_BY_SEED[_cfg.seed].label} and {_cfg.label}"
         )
     _CURATED_BY_SEED[_cfg.seed] = _cfg
+
+
+def test_random_seed_stream_is_unchanged():
+    """Lock the historical default _gen(BASE_SEED+i) stream before overlays."""
+    payload = "\n".join(repr(_gen(i)) for i in range(160)).encode()
+    assert (
+        hashlib.sha256(payload).hexdigest()
+        == "cff06d91b524c74c66863e4078e24303b431eeffbedc94b3237390bccd837e70"
+    )
+
+
+def test_contract_handler_inventory_is_single_backend_and_non_deterministic():
+    expected = {
+        "cutlass_nvfp4": "cutlass_nvfp4",
+        "cutlass_fp8_per_tensor": "cutlass_fp8_per_tensor",
+        "cutlass_fp8_block": "cutlass_fp8_block",
+        "cutlass_mxfp8_mxfp4": "cutlass_mxfp8_mxfp4",
+        "cutlass_mxfp8": "cutlass_mxfp8",
+        "cutlass_w4a8": "cutlass_w4a8",
+        "cutlass_humming": "cutlass_humming",
+        "b12x_nvfp4": "b12x_nvfp4",
+        "b12x_w4a16": "b12x_w4a16",
+    }
+    for handler_id, backend_key in expected.items():
+        handler = _HANDLER_BY_ID[handler_id]
+        assert len(handler.candidate_configs) == 1
+        config_type = handler.candidate_configs[0]
+        assert _BACKEND_RUNNERS[config_type].backend_key == backend_key
+        assert [
+            candidate
+            for candidate in handler.candidate_configs
+            if _BACKEND_RUNNERS[candidate].backend_key in {backend_key}
+        ] == [config_type]
+        assert not [
+            candidate
+            for candidate in handler.candidate_configs
+            if _BACKEND_RUNNERS[candidate].backend_key in {"some_other_backend"}
+        ]
+        assert backend_key not in _DETERMINISTIC
+
+
+def test_contract_curated_seeds_match_declared_capabilities():
+    rows = {
+        (row.backend_key, row.quant_variant): row
+        for row in get_moe_backend_capabilities()
+    }
+    contract_cases = [cfg for cfg in _CURATED if cfg.variant in _CONTRACT_HANDLERS]
+    assert len(contract_cases) == 18
+    assert len({cfg.seed for cfg in _CURATED}) == len(_CURATED)
+    assert {cfg.seed for cfg in contract_cases} == set(range(900_080, 900_098))
+    for cfg in contract_cases:
+        handler = _handler_for(cfg)
+        config_type = handler.candidate_configs[0]
+        row = rows[(cfg.expected_backend, handler.variant)]
+        assert row.config_type is config_type
+        assert type(_activation_for(cfg)) in row.activation_classes
+        assert cfg.routing_input_mode == "prerouted"
+        assert cfg.do_finalize and not cfg.is_ep
+        assert cfg.num_fused_shared_experts == 0
+        assert _BACKEND_RUNNERS[config_type].backend_key == cfg.expected_backend
+
 
 if _ONLY_SEEDS:  # perfect-repro: run only the named seed(s)
     _CONFIGS = [
@@ -1945,6 +2434,18 @@ def _is_unsupported(e):
     return any(s in msg for s in _SKIP_SUBSTR)
 
 
+_CONTRACT_ENVIRONMENT_ERRORS = (
+    "requires cuda 13 or later",
+    "requires the cute dsl package",
+    "fp8 block scaling requires cuda 12.8 or newer",
+)
+
+
+def _is_contract_environment_unavailable(e: Exception) -> bool:
+    msg = str(e).lower()
+    return any(reason in msg for reason in _CONTRACT_ENVIRONMENT_ERRORS)
+
+
 @pytest.mark.parametrize(
     "exc,expected",
     (
@@ -1967,6 +2468,19 @@ def _is_unsupported(e):
 )
 def test_is_unsupported_classification(exc, expected):
     assert _is_unsupported(exc) is expected
+
+
+@pytest.mark.parametrize(
+    "exc,expected",
+    (
+        (ValueError("b12x unified MoE requires CUDA 13 or later."), True),
+        (RuntimeError("b12x unified MoE requires the CuTe DSL package."), True),
+        (NotImplementedError("backend does not support SiTU"), False),
+        (ValueError("hidden_size must be divisible by 128"), False),
+    ),
+)
+def test_contract_environment_classification(exc, expected):
+    assert _is_contract_environment_unavailable(exc) is expected
 
 
 # ---------------------------------------------------------------------------
@@ -2181,13 +2695,12 @@ def test_unified_moe_fuzz(cfg):
         cfg.intermediate,
         cfg.expert_offset,
     )
-    if handler.variant is QuantVariant.BF16:
-        ref = handler.reference(*reference_args, activation=_activation_for(cfg))
-    else:
-        ref = handler.reference(*reference_args)
-    ref_abs_max = ref.abs().max().item()
-    atol = handler.atol_frac * ref_abs_max + 1e-3
-    rtol = handler.rtol
+    ref = None
+    if handler.post_prepare_reference is None:
+        if handler.variant is QuantVariant.BF16:
+            ref = handler.reference(*reference_args, activation=_activation_for(cfg))
+        else:
+            ref = handler.reference(*reference_args)
 
     # One activation pack + one weight pack with each backend's native view, all built from the
     # SAME bf16 inputs (this rank's LOCAL shard) via the API's uniform prepare_weights. In-kernel
@@ -2207,6 +2720,7 @@ def test_unified_moe_fuzz(cfg):
                 routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
             )
     weight_pack = MoEWeightPack()
+    prepared_views = {}
     for BackendCfg in wired_backends:
         prepare_kwargs = dict(
             num_local_experts=cfg.n_weight_rows,
@@ -2224,14 +2738,37 @@ def test_unified_moe_fuzz(cfg):
                 hidden_states_scale_global=_fp8_per_tensor_global_scale(x),
                 intermediate_scale_global=torch.tensor(64.0, device=dev),
             )
-        weight_pack.prepare_for(
-            _BACKEND_RUNNERS[BackendCfg].backend_key,
-            BackendCfg.prepare_weights(
-                w1,
-                w2,
-                **prepare_kwargs,
-            ),
+        view = (
+            handler.prepare_weights(BackendCfg, w1, w2, **prepare_kwargs)
+            if handler.prepare_weights is not None
+            else BackendCfg.prepare_weights(w1, w2, **prepare_kwargs)
         )
+        backend_key = _BACKEND_RUNNERS[BackendCfg].backend_key
+        prepared_views[backend_key] = view
+        weight_pack.prepare_for(backend_key, view)
+
+    if handler.post_prepare_reference is not None:
+        assert len(prepared_views) == 1
+        view = next(iter(prepared_views.values()))
+        # Keep activation quantization artifacts beside the prepared view only
+        # for the independent reference; they are not added to MoEWeightPack.
+        reference_view = dict(view)
+        reference_view["_activation_q"] = act_pack.hidden_states_q
+        reference_view["_activation_scale"] = act_pack.hidden_states_scale
+        ref = handler.post_prepare_reference(
+            x,
+            w1,
+            w2,
+            selected_experts,
+            final_scales,
+            cfg.intermediate,
+            reference_view,
+            _activation_for(cfg),
+        )
+    assert ref is not None
+    ref_abs_max = ref.abs().max().item()
+    atol = handler.atol_frac * ref_abs_max + 1e-3
+    rtol = handler.rtol
 
     config = MoEConfig(
         routing=RoutingConfig(
@@ -2267,6 +2804,13 @@ def test_unified_moe_fuzz(cfg):
         layer = MoELayer(config)
     except Exception as e:
         if _is_unsupported(e):
+            if (
+                cfg.variant in _CONTRACT_HANDLERS
+                and _is_contract_environment_unavailable(e)
+            ):
+                pytest.skip(
+                    f"contract backend {cfg.expected_backend!r} unavailable: {e}"
+                )
             if expected_backend_available:
                 pytest.fail(
                     f"{cfg.label}: expected backend {cfg.expected_backend!r} "
@@ -2350,7 +2894,8 @@ def test_unified_moe_fuzz(cfg):
             and tuple(t.shape) == out_shape
             and t.data_ptr() not in act_ptrs
         ]
-        assert bufs, "could not locate the output buffer in pack_inputs"
+        if runner.backend_key not in _B12X_BACKEND_KEYS:
+            assert bufs, "could not locate the output buffer in pack_inputs"
         for b in bufs:
             handler.poison(b, poison_gen) if poison else b.zero_()
         out = runner.forward(inputs, tactic=-1)
@@ -2359,15 +2904,11 @@ def test_unified_moe_fuzz(cfg):
         return out
 
     def assert_correct(out, tag):
-        if (
-            handler.variant is QuantVariant.W4A16
-            and ref_abs_max > 0
-            and out.abs().max().item() == 0
-        ):
+        if ref_abs_max > 0 and out.abs().max().item() == 0:
             _fail(
                 cfg,
                 tag,
-                "all-zero W4A16 output for a nonzero reference",
+                "all-zero output for a nonzero reference",
                 out,
                 ref,
             )
@@ -2417,7 +2958,8 @@ def test_unified_moe_fuzz(cfg):
         # (4) output-buffer poison: the kernel owns its (uninitialized `new_empty`) output, so the
         # result must NOT depend on it being clean. torch's allocator usually hands back zeros and
         # hides this; poisoning forces it -- the torch->JAX hazard (GH-6158764 padding leak).
-        assert_correct(run(runner, poison=True), f"{tag} [poisoned-output]")
+        if runner.backend_key not in _B12X_BACKEND_KEYS:
+            assert_correct(run(runner, poison=True), f"{tag} [poisoned-output]")
         # (5) autotune-tactic sweep: EVERY valid tactic must be correct, not just the default --
         # the autotuner-picks-a-bad-tactic class (#3168/#3227) on the real MoELayer dispatch.
         inputs = runner.pack_inputs(act_pack, weight_pack)
