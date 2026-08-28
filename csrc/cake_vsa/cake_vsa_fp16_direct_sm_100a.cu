@@ -667,6 +667,9 @@ kernel_minimax_sparse_prefill_union_sm100(const __grid_constant__ CUtensorMap q,
                 if (batch < batch_size) {
                     tile_active = 1;
                 }
+                if (tile_active == 0) {
+                    batch = 0;
+                }
             } else {
                 for (int candidate_batch = 0; candidate_batch < batch_size; candidate_batch++) {
                     int candidate_q_begin = cu_seqlens_q[candidate_batch];
@@ -1205,6 +1208,9 @@ kernel_minimax_sparse_prefill_union_sm100(const __grid_constant__ CUtensorMap q,
                 if (batch_1 < batch_size) {
                     tile_active_1 = 1;
                 }
+                if (tile_active_1 == 0) {
+                    batch_1 = 0;
+                }
             } else {
                 for (int candidate_batch_1 = 0; candidate_batch_1 < batch_size; candidate_batch_1++) {
                     int candidate_q_begin_1 = cu_seqlens_q[candidate_batch_1];
@@ -1405,6 +1411,9 @@ kernel_minimax_sparse_prefill_union_sm100(const __grid_constant__ CUtensorMap q,
                 q_tile_2 = linear_tile_2 - batch_2 * uniform_tiles_2;
                 if (batch_2 < batch_size) {
                     tile_active_2 = 1;
+                }
+                if (tile_active_2 == 0) {
+                    batch_2 = 0;
                 }
             } else {
                 for (int candidate_batch_2 = 0; candidate_batch_2 < batch_size; candidate_batch_2++) {
@@ -2009,6 +2018,9 @@ kernel_minimax_sparse_prefill_union_sm100(const __grid_constant__ CUtensorMap q,
                 q_tile_3 = linear_tile_3 - batch_3 * uniform_tiles_3;
                 if (batch_3 < batch_size) {
                     tile_active_3 = 1;
+                }
+                if (tile_active_3 == 0) {
+                    batch_3 = 0;
                 }
             } else {
                 for (int candidate_batch_3 = 0; candidate_batch_3 < batch_size; candidate_batch_3++) {

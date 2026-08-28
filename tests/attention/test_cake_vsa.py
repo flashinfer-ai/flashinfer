@@ -19,6 +19,7 @@ import math
 import pytest
 import torch
 
+from flashinfer import cake_vsa
 from flashinfer.sparse import BlockSparseAttentionWrapper
 
 
@@ -115,6 +116,131 @@ def test_cake_vsa_against_dense_reference(
             repeated_lse.untyped_storage().data_ptr()
             != lse.untyped_storage().data_ptr()
         )
+
+
+def test_fp16_direct_overprovisioned_uniform_grid_is_inactive():
+    import tvm_ffi
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    M, N = 256, 512
+    num_qo_heads, num_kv_heads, head_dim = 8, 1, 128
+    mask = torch.zeros((num_qo_heads, 2, 4), dtype=torch.bool, device=device)
+    mask[:, :, :2] = True
+    q = torch.randn(
+        (M, num_qo_heads, head_dim), dtype=torch.float16, device=device
+    )
+    k = torch.randn(
+        (N, num_kv_heads, head_dim), dtype=torch.float16, device=device
+    )
+    v = torch.randn_like(k)
+    workspace = torch.empty((128 * 1024 * 1024,), dtype=torch.uint8, device=device)
+    wrapper = BlockSparseAttentionWrapper(workspace, backend="cake")
+    wrapper.plan(
+        None,
+        None,
+        M,
+        N,
+        128,
+        128,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+        block_mask=mask,
+    )
+    expected = wrapper.run(q, k, v)
+    plan = wrapper._cake_vsa_plan
+    assert plan is not None
+    q2k, cu_q, cu_k, q_offsets, kv_lens, page_table, scale_dummy, topk = (
+        cake_vsa._fp16_metadata(plan, q)
+    )
+    output = torch.empty_like(q)
+    stats = torch.empty((M, num_qo_heads), dtype=torch.float32, device=device)
+    module = cake_vsa._load_module("fp16_direct", cake_vsa._arch_for_device(device))
+    scale = float(plan["sm_scale"] or 1.0 / math.sqrt(head_dim))
+
+    launch_args = (
+        q,
+        k,
+        scale_dummy,
+        v,
+        scale_dummy,
+        output,
+        stats,
+        stats,
+        q2k,
+        cu_q,
+        cu_k,
+        q_offsets,
+        kv_lens,
+        page_table,
+        M,
+        num_qo_heads,
+        num_kv_heads,
+        topk,
+        1,
+        M,
+        0,
+        0,
+        0,
+        scale / math.log(2.0),
+        1.0,
+        1.0,
+        1.0,
+        0,
+        0,
+        2,
+        num_qo_heads,
+        1,
+    )
+    invalid_batch_args = list(launch_args)
+    invalid_batch_args[18] = 0
+
+    with tvm_ffi.use_torch_stream():
+        with pytest.raises(ValueError, match="batch_size"):
+            module.run(*invalid_batch_args)
+        module.run(*launch_args)
+
+    torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("bad_shape", [(128, 8, 64), (128, 1024)])
+def test_blk64_direct_rejects_invalid_output_shape(bad_shape):
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    M, N = 128, 256
+    num_heads, head_dim = 8, 128
+    mask = torch.zeros((num_heads, 2, 4), dtype=torch.bool, device=device)
+    mask[:, :, :2] = True
+    q = torch.randn((M, num_heads, head_dim), dtype=torch.bfloat16, device=device)
+    k = torch.randn((N, num_heads, head_dim), dtype=torch.bfloat16, device=device)
+    v = torch.randn_like(k)
+    workspace = torch.empty((128 * 1024 * 1024,), dtype=torch.uint8, device=device)
+    wrapper = BlockSparseAttentionWrapper(workspace, backend="cake")
+    wrapper.plan(
+        None,
+        None,
+        M,
+        N,
+        64,
+        64,
+        num_heads,
+        num_heads,
+        head_dim,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        block_mask=mask,
+    )
+    plan = wrapper._cake_vsa_plan
+    assert plan is not None
+    assert plan["blk64_profile"] == "blk64_persistent"
+    bad_output = torch.empty(bad_shape, dtype=q.dtype, device=device)
+    stats = torch.empty((M, num_heads), dtype=torch.float32, device=device)
+
+    with pytest.raises(ValueError, match="out"):
+        cake_vsa._run_blk64(plan, q, k, v, bad_output, stats, False)
 
 
 def test_cake_vsa_blk64_per_head_partial_blocks():

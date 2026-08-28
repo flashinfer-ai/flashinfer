@@ -17,6 +17,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <initializer_list>
 
 TVM_FFI_EMBED_CUBIN(flashinfer_vsa_blk64_persistent_m64_sm100_15f3d4ef20);
 
@@ -167,6 +168,22 @@ inline bool CakeConfigureDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_i
       << optin_max << " B) on cuda:" << device_id
       << " and this CUDA toolkit predates the 13.4 oversized shared-memory mode";
 #endif
+}
+
+inline int64_t CheckedHostExtent(std::initializer_list<int64_t> factors) {
+  int64_t extent = 1;
+  for (int64_t factor : factors) {
+    TVM_FFI_CHECK(factor >= 0, ValueError)
+        << "host extent factors must be non-negative, got " << factor;
+    if (factor != 0) {
+      TVM_FFI_CHECK(
+          extent <= std::numeric_limits<int64_t>::max() / factor,
+          ValueError)
+          << "host extent overflows int64";
+    }
+    extent *= factor;
+  }
+  return extent;
 }
 
 // 4D TMA descriptor for buffer 'q' — compiled from the
@@ -373,6 +390,10 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
       grid_z > 0 && grid_z <= std::numeric_limits<uint32_t>::max(), ValueError)
       << "launch grid dimensions must fit uint32_t, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
+  TVM_FFI_CHECK(arg_out.ndim() == 3, ValueError)
+      << "out must have rank 3, got " << arg_out.ndim();
+  TVM_FFI_CHECK(arg_out.size(-1) == 128, ValueError)
+      << "out dimension -1 must equal " << (128)      << ", got " << arg_out.size(-1);
 
   DLDevice dev = arg_q.device();
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);

@@ -783,6 +783,7 @@ def _fp16_metadata(plan: dict[str, Any], q: torch.Tensor):
         torch.zeros((1,), dtype=torch.int32, device=device),
         torch.tensor([plan["N"]], dtype=torch.int32, device=device),
         torch.zeros((1,), dtype=torch.int32, device=device),
+        torch.empty((1, 1, 128, 8), dtype=torch.uint8, device=device),
         topk,
     )
     plan["workspace"]["fp16_metadata"] = cached
@@ -801,13 +802,24 @@ def _run_fp16(
     import tvm_ffi
 
     module = _load_module("fp16_direct", _arch_for_device(q.device))
-    q2k, cu_q, cu_k, q_offsets, kv_lens, page_table, topk = _fp16_metadata(plan, q)
+    (
+        q2k,
+        cu_q,
+        cu_k,
+        q_offsets,
+        kv_lens,
+        page_table,
+        scale_dummy,
+        topk,
+    ) = _fp16_metadata(plan, q)
     scale = float(plan["sm_scale"] or 1.0 / math.sqrt(plan["head_dim"]))
     with tvm_ffi.use_torch_stream():
         module.run(
             q,
             k,
+            scale_dummy,
             v,
+            scale_dummy,
             out,
             stats,
             stats,
@@ -825,7 +837,10 @@ def _run_fp16(
             0,
             0,
             0,
+            0,
             scale / math.log(2.0),
+            1.0,
+            1.0,
             1.0,
             int(return_lse),
             0,

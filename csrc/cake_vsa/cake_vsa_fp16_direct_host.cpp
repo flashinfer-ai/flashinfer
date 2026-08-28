@@ -17,8 +17,9 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <initializer_list>
 
-TVM_FFI_EMBED_CUBIN(minimax_sparse_prefill_union_sm100_6e7cc1d785);
+TVM_FFI_EMBED_CUBIN(minimax_sparse_prefill_union_sm100_32b4157867);
 
 namespace cake_host_shim {
 
@@ -167,6 +168,22 @@ inline bool CakeConfigureDynamicSmem(tvm::ffi::CubinKernel& kernel, int device_i
       << optin_max << " B) on cuda:" << device_id
       << " and this CUDA toolkit predates the 13.4 oversized shared-memory mode";
 #endif
+}
+
+inline int64_t CheckedHostExtent(std::initializer_list<int64_t> factors) {
+  int64_t extent = 1;
+  for (int64_t factor : factors) {
+    TVM_FFI_CHECK(factor >= 0, ValueError)
+        << "host extent factors must be non-negative, got " << factor;
+    if (factor != 0) {
+      TVM_FFI_CHECK(
+          extent <= std::numeric_limits<int64_t>::max() / factor,
+          ValueError)
+          << "host extent overflows int64";
+    }
+    extent *= factor;
+  }
+  return extent;
 }
 
 // 4D TMA descriptor for buffer 'q' — compiled from the
@@ -450,6 +467,8 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_k_scale, TensorView 
       grid_z > 0 && grid_z <= std::numeric_limits<uint32_t>::max(), ValueError)
       << "launch grid dimensions must fit uint32_t, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
+  TVM_FFI_CHECK(arg_batch_size >= 1, ValueError)
+      << "batch_size must be >= 1, got " << arg_batch_size;
 
   DLDevice dev = arg_q.device();
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);
@@ -484,7 +503,7 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_k_scale, TensorView 
   int32_t v_return_temperature_lse = (int32_t)arg_return_temperature_lse;
   void* kargs[] = {&p_q, &p_k, &p_k_scale, &p_v, &p_v_scale, &p_out, &p_lse, &p_temperature_lse, &p_q2k_indices, &p_cu_seqlens_q, &p_cu_seqlens_k, &p_q_offsets, &p_kv_lens, &p_page_table, &v_total_q, &v_num_q_heads, &v_num_kv_heads, &v_topk, &v_batch_size, &v_uniform_q_len, &v_max_pages, &v_causal, &v_derive_q_offset, &v_softmax_scale_log2, &v_k_global_scale, &v_v_global_scale, &v_lse_temperature_scale, &v_return_softmax_lse, &v_return_temperature_lse};
 
-  static auto kernel = EmbedCubinModule_minimax_sparse_prefill_union_sm100_6e7cc1d785::Global()->mod.GetKernel("kernel_minimax_sparse_prefill_union_sm100");
+  static auto kernel = EmbedCubinModule_minimax_sparse_prefill_union_sm100_32b4157867::Global()->mod.GetKernel("kernel_minimax_sparse_prefill_union_sm100");
   static std::atomic<signed char> cake_smem_mode_cache[64]{};
   const bool use_oversized_smem = CakeConfigureDynamicSmem(
       kernel, (int)arg_q.device().device_id, 201728,

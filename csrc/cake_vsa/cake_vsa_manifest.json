@@ -3,7 +3,7 @@
     "sm_100a",
     "sm_103a"
   ],
-  "export_content_sha256": "ee43639cb386f85b85fb425ca783e1d51baccb431d769096997c06e74ea9c261",
+  "export_content_sha256": "c3150affcec9daea4fbf6b7eb0d982255b0c1b6849cf34ba3094b43d4347df35",
   "profiles": [
     {
       "arg_plan": [
@@ -204,8 +204,8 @@
       "dynamic_smem_bytes": 183296,
       "host": {
         "path": "cake_vsa_blk64_persistent_host.cpp",
-        "sha256": "209da0334bd099bcd06a90ddeab7312ac0004a01814c8238a162d7b2aae0c0d5",
-        "size_bytes": 20746
+        "sha256": "699ec495ab7379c7bdc001f7123b036f0f4e4c7ee6eb9a4b315b07b2e0e392f0",
+        "size_bytes": 21494
       },
       "kernel_symbol": "kernel_flashinfer_vsa_blk64_persistent_m64_sm100",
       "module_ident": "flashinfer_vsa_blk64_persistent_m64_sm100_15f3d4ef20",
@@ -310,8 +310,8 @@
       "dynamic_smem_bytes": 232448,
       "host": {
         "path": "cake_vsa_blk64_persistent_ws_m64n256_host.cpp",
-        "sha256": "a73deb8a870487b9b7e64bb3c3781652b0f734859ff03316ad11bd11c5ebca78",
-        "size_bytes": 22014
+        "sha256": "cb94577818fb583d0b3d347a7c5e3634558a19eaaadb47f3a2519bafec42bffd",
+        "size_bytes": 22260
       },
       "kernel_symbol": "kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100",
       "module_ident": "flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100_63c998b85a",
@@ -1080,23 +1080,23 @@
       "device": {
         "sm_100a": {
           "path": "cake_vsa_fp16_direct_sm_100a.cu",
-          "sha256": "d7c11d5677ec18a7293133c39364b2aaf4fe5562e0ce3d2985d2d11550d41e4c",
-          "size_bytes": 119209
+          "sha256": "444793d0696e2d32ea535d13c2d74aff5119509080183a2292215d069c5ae114",
+          "size_bytes": 119577
         },
         "sm_103a": {
           "path": "cake_vsa_fp16_direct_sm_103a.cu",
-          "sha256": "d7c11d5677ec18a7293133c39364b2aaf4fe5562e0ce3d2985d2d11550d41e4c",
-          "size_bytes": 119209
+          "sha256": "444793d0696e2d32ea535d13c2d74aff5119509080183a2292215d069c5ae114",
+          "size_bytes": 119577
         }
       },
       "dynamic_smem_bytes": 201728,
       "host": {
         "path": "cake_vsa_fp16_direct_host.cpp",
-        "sha256": "0c12f5455f5b1707f2ca88bb6a5242979d86847e0ee29695064956f0a20cbfe9",
-        "size_bytes": 26292
+        "sha256": "dd5bd65c6b612b6add8a71468b00ebd36cd841df16e9374c0dba28eff3e96a56",
+        "size_bytes": 26903
       },
       "kernel_symbol": "kernel_minimax_sparse_prefill_union_sm100",
-      "module_ident": "minimax_sparse_prefill_union_sm100_6e7cc1d785",
+      "module_ident": "minimax_sparse_prefill_union_sm100_32b4157867",
       "profile": "fp16_direct",
       "schedule_symbol": "minimax_sparse_prefill_union_sm100",
       "threads": 512

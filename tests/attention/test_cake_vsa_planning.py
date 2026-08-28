@@ -16,6 +16,7 @@ limitations under the License.
 
 import contextlib
 import hashlib
+import math
 import sys
 import types
 
@@ -369,6 +370,82 @@ def test_fp16_gqa_metadata_uses_each_kv_head_group(monkeypatch):
     assert tuple(q2k.shape) == (2, 256, 1)
     torch.testing.assert_close(q2k[0], torch.zeros_like(q2k[0]))
     torch.testing.assert_close(q2k[1], torch.full_like(q2k[1], 3))
+
+
+def test_fp16_direct_call_matches_generated_ffi_abi(monkeypatch):
+    launched = []
+    module = types.SimpleNamespace(run=lambda *args: launched.append(args))
+    monkeypatch.setattr(cake_vsa, "_load_module", lambda *_args: module)
+    monkeypatch.setattr(cake_vsa, "_arch_for_device", lambda _device: "sm_100a")
+    monkeypatch.setitem(
+        sys.modules,
+        "tvm_ffi",
+        types.SimpleNamespace(use_torch_stream=contextlib.nullcontext),
+    )
+
+    q = torch.empty((256, 4, 128), dtype=torch.float16)
+    k = torch.empty((512, 2, 128), dtype=torch.float16)
+    v = torch.empty_like(k)
+    out = torch.empty_like(q)
+    stats = torch.empty((256, 4), dtype=torch.float32)
+    q2k = torch.empty((2, 256, 2), dtype=torch.int32)
+    cu_q = torch.tensor([0, 256], dtype=torch.int32)
+    cu_k = torch.tensor([0, 512], dtype=torch.int32)
+    q_offsets = torch.zeros((1,), dtype=torch.int32)
+    kv_lens = torch.tensor([512], dtype=torch.int32)
+    page_table = torch.zeros((1,), dtype=torch.int32)
+    scale_dummy = torch.empty((1, 1, 128, 8), dtype=torch.uint8)
+    monkeypatch.setattr(
+        cake_vsa,
+        "_fp16_metadata",
+        lambda *_args: (
+            q2k,
+            cu_q,
+            cu_k,
+            q_offsets,
+            kv_lens,
+            page_table,
+            scale_dummy,
+            2,
+        ),
+    )
+    plan = {
+        "M": 256,
+        "num_qo_heads": 4,
+        "num_kv_heads": 2,
+        "head_dim": 128,
+        "sm_scale": 0.125,
+    }
+
+    cake_vsa._run_fp16(plan, q, k, v, out, stats, True)
+
+    assert len(launched) == 1
+    args = launched[0]
+    assert len(args) == 32
+    expected_tensors = (
+        q,
+        k,
+        scale_dummy,
+        v,
+        scale_dummy,
+        out,
+        stats,
+        stats,
+        q2k,
+        cu_q,
+        cu_k,
+        q_offsets,
+        kv_lens,
+        page_table,
+    )
+    assert all(
+        actual is expected
+        for actual, expected in zip(args[:14], expected_tensors)
+    )
+    assert args[14:23] == (256, 4, 2, 2, 1, 0, 0, 0, 0)
+    assert args[23] == pytest.approx(0.125 / math.log(2.0))
+    assert args[24:29] == (1.0, 1.0, 1.0, 1, 0)
+    assert args[29:] == (1, 4, 1)
 
 
 def test_ultrasparse_route_rejects_non_six_topk_before_launch(monkeypatch):

@@ -402,6 +402,10 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
       << "v must have rank 3, got " << arg_v.ndim();
   TVM_FFI_CHECK(arg_v.size(-1) == 128, ValueError)
       << "v dimension -1 must equal " << (128)      << ", got " << arg_v.size(-1);
+  TVM_FFI_CHECK(arg_out.ndim() == 3, ValueError)
+      << "out must have rank 3, got " << arg_out.ndim();
+  TVM_FFI_CHECK(arg_out.size(-1) == 128, ValueError)
+      << "out dimension -1 must equal " << (128)      << ", got " << arg_out.size(-1);
 
   DLDevice dev = arg_q.device();
   cudaStream_t stream = (cudaStream_t)TVMFFIEnvGetStream(dev.device_type, dev.device_id);
