@@ -224,11 +224,16 @@ def _top_k_varlen_heuristic(
     call this function with positional args on the skip_check=True path without
     raising TypeError.  Mirrors the pattern used by _heuristic_func_mm_fp4.
     """
-    return [
-        b
-        for b in ("gvr", "radix", "radix_filter", "radix_cutlass")
-        if b in suitable_backends
-    ]
+    # "radix_filter" is deliberately absent: its checker accepts a strict
+    # subset of radix's configurations and its CC list is a subset of
+    # radix's, so listed after radix it could never be chosen (a dead
+    # entry), and listed before radix it would regress the small-row and
+    # small-batch regions where radix wins. Making it auto-selectable needs
+    # a shape/architecture-aware crossover rule (it wins at large N --
+    # roughly N >= 64K with enough rows on SM100, wider on SM107); until
+    # that rule exists it is explicit-only, as documented in the module
+    # docstring.
+    return [b for b in ("gvr", "radix", "radix_cutlass") if b in suitable_backends]
 
 
 # ---------------------------------------------------------------------------
