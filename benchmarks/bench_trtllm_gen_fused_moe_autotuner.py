@@ -247,10 +247,11 @@ def _run_benchmark(
 
     measure = partial(_measure, warmups=warmups, iterations=iterations)
 
-    # measure untuned
-    ms_no_autotune = [measure(setup.fn, setup.input_kwargs) for setup in setups]
-
-    # Tune each backend once.  The tuning config controls whether this covers
+    # Tune before starting CUPTI activity tracing. Repeated CUPTI
+    # initialize/finalize cycles can destabilize later CuTe CUDA-graph tactic
+    # profiling in the same process. The timing order does not affect either
+    # reported value: autotuning and JIT stay outside every measured sample.
+    # The tuning config controls whether this covers
     # all buckets up to tune_max or only the explicit user-requested buckets.
     tuned_backends = set()
     tuning_buckets_tuple = None if tuning_buckets is None else tuple(tuning_buckets)
@@ -273,15 +274,18 @@ def _run_benchmark(
         tuning_buckets=tuning_buckets_tuple,
         cuda_graph_profile_replays=cuda_graph_profile_replays,
     ):
-        results = [
-            BenchmarkResult(
-                setup.batch_size,
-                setup.backend,
-                ms,
-                measure(setup.fn, setup.input_kwargs),
-            )
-            for setup, ms in zip(setups, ms_no_autotune, strict=True)
-        ]
+        ms_tuned = [measure(setup.fn, setup.input_kwargs) for setup in setups]
+
+    # Clear only selected tactics, then collect the heuristic controls. Kernel
+    # modules and generated input tensors remain unchanged.
+    AutoTuner.get().clear_cache()
+    ms_no_autotune = [measure(setup.fn, setup.input_kwargs) for setup in setups]
+    results = [
+        BenchmarkResult(setup.batch_size, setup.backend, ms, tuned_ms)
+        for setup, ms, tuned_ms in zip(
+            setups, ms_no_autotune, ms_tuned, strict=True
+        )
+    ]
 
     _print_table(results, config_str)
     return results
