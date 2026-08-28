@@ -7,7 +7,10 @@ on:
       - main
     paths:
       - '.python-version'
+      - 'build_utils.py'
+      - 'ci/validate_cuda_versions.py'
       - 'docker/**'
+      - 'ci/cuda-versions.json'
       - '.github/workflows/release-ci-docker.yml'
       - 'requirements.txt'
   pull_request:
@@ -15,36 +18,57 @@ on:
       - main
     paths:
       - '.python-version'
+      - 'build_utils.py'
+      - 'ci/validate_cuda_versions.py'
       - 'docker/**'
+      - 'ci/cuda-versions.json'
       - '.github/workflows/release-ci-docker.yml'
       - 'requirements.txt'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   generate-tag:
     runs-on: ubuntu-latest
     outputs:
       date_sha: ${{ steps.generate_tag.outputs.date_sha }}
+      runtime_cuda_matrix: ${{ steps.cuda-versions.outputs.runtime }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate CUDA configuration
+        run: python3 ci/validate_cuda_versions.py
 
       - name: Generate version tag
         id: generate_tag
         run: |
           DATE_SHA=$(date +'%Y%m%d')-$(git rev-parse --short HEAD)
-          echo "date_sha=${DATE_SHA}" >> $GITHUB_OUTPUT
+          echo "date_sha=${DATE_SHA}" >> "$GITHUB_OUTPUT"
           echo "Generated version tag: ${DATE_SHA}"
 
+      - name: Load runtime CUDA matrix
+        id: cuda-versions
+        run: echo "runtime=$(jq -c '.runtime' ci/cuda-versions.json)" >> "$GITHUB_OUTPUT"
+
   build:
-    runs-on: [self-hosted, linux, x64, cpu, on-demand]
+    name: Build and test CI image (${{ matrix.cuda.label }}, ${{ matrix.arch }})
+    runs-on: [self-hosted, linux, "${{ matrix.arch == 'arm64' && 'arm64' || 'x64' }}", cpu, on-demand]
     needs: generate-tag
+    timeout-minutes: 360
     strategy:
+      fail-fast: false
       matrix:
-        cuda: [cu126, cu128, cu129, cu130, cu132]
+        cuda: ${{ fromJSON(needs.generate-tag.outputs.runtime_cuda_matrix) }}
         arch: [amd64, arm64]
+    env:
+      IMAGE_TAG: flashinfer/flashinfer-ci-${{ matrix.cuda.label }}:${{ matrix.arch }}-${{ needs.generate-tag.outputs.date_sha }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -56,27 +80,51 @@ jobs:
           username: flashinfer
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push ${{ matrix.cuda }} ${{ matrix.arch }} image
+      - name: Build and load ${{ matrix.cuda.label }} ${{ matrix.arch }} image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: docker/Dockerfile.${{ matrix.cuda }}
+          file: docker/Dockerfile.ci
+          target: ci
+          build-args: |
+            CUDA_IMAGE=${{ matrix.cuda.image }}
+            PYTORCH_INDEX=${{ matrix.cuda.pytorch_index }}
+            CUDNN_VERSION=${{ matrix.cuda.cudnn_version }}
           platforms: linux/${{ matrix.arch }}
-          push: ${{ github.event_name != 'pull_request' }}
+          load: true
           pull: true  # Always pull the latest base image
           no-cache: true  # Disable all caching
-          tags: |
-            flashinfer/flashinfer-ci-${{ matrix.cuda }}:${{ matrix.arch }}-${{ needs.generate-tag.outputs.date_sha }}
+          tags: ${{ env.IMAGE_TAG }}
           provenance: false
           sbom: false
 
+      - name: Test candidate image before publishing
+        env:
+          CUDA_VERSION: ${{ matrix.cuda.version }}
+          TARGET_ARCH: ${{ matrix.arch }}
+        run: |
+          docker image inspect "${IMAGE_TAG}" >/dev/null
+          docker run --rm --pull=never --platform "linux/${TARGET_ARCH}" -i \
+            "${IMAGE_TAG}" \
+            python3 - "${CUDA_VERSION}" "${TARGET_ARCH}" \
+            < docker/test_ci_image.py
+
+      - name: Push tested image
+        if: github.event_name != 'pull_request'
+        run: docker push "${IMAGE_TAG}"
+
+      - name: Remove candidate image
+        if: always()
+        run: docker image rm "${IMAGE_TAG}" || true
+
   create-manifests:
+    name: CI manifest (${{ matrix.cuda.label }})
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     needs: [generate-tag, build]
     strategy:
       matrix:
-        cuda: [cu126, cu128, cu129, cu130, cu132]
+        cuda: ${{ fromJSON(needs.generate-tag.outputs.runtime_cuda_matrix) }}
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -87,15 +135,16 @@ jobs:
           username: flashinfer
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Create and push multi-arch manifest for ${{ matrix.cuda }}
+      - name: Create and push multi-arch manifest for ${{ matrix.cuda.label }}
         env:
           DATE_SHA: ${{ needs.generate-tag.outputs.date_sha }}
+          IMAGE_REPOSITORY: flashinfer/flashinfer-ci-${{ matrix.cuda.label }}
         run: |
           docker buildx imagetools create \
-            -t flashinfer/flashinfer-ci-${{ matrix.cuda }}:${DATE_SHA} \
-            -t flashinfer/flashinfer-ci-${{ matrix.cuda }}:latest \
-            flashinfer/flashinfer-ci-${{ matrix.cuda }}:amd64-${DATE_SHA} \
-            flashinfer/flashinfer-ci-${{ matrix.cuda }}:arm64-${DATE_SHA}
+            -t "${IMAGE_REPOSITORY}:${DATE_SHA}" \
+            -t "${IMAGE_REPOSITORY}:latest" \
+            "${IMAGE_REPOSITORY}:amd64-${DATE_SHA}" \
+            "${IMAGE_REPOSITORY}:arm64-${DATE_SHA}"
 
   update-docker-tags:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -104,19 +153,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify image inputs still match main
+        id: current_inputs
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          if git diff --quiet "${EXPECTED_SHA}" "$(git rev-parse FETCH_HEAD)" -- \
+            .python-version \
+            build_utils.py \
+            docker \
+            ci/cuda-versions.json \
+            .github/workflows/release-ci-docker.yml \
+            requirements.txt; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            echo "Image inputs changed on main; skipping this stale tag update."
+          fi
+
       - name: Update docker-tags.yml
+        if: steps.current_inputs.outputs.current == 'true'
         env:
           DATE_SHA: ${{ needs.generate-tag.outputs.date_sha }}
         run: |
-          cat > ci/docker-tags.yml << EOF
-          flashinfer/flashinfer-ci-cu126: ${DATE_SHA}
-          flashinfer/flashinfer-ci-cu128: ${DATE_SHA}
-          flashinfer/flashinfer-ci-cu129: ${DATE_SHA}
-          flashinfer/flashinfer-ci-cu130: ${DATE_SHA}
-          flashinfer/flashinfer-ci-cu132: ${DATE_SHA}
-          EOF
+          jq -r --arg tag "${DATE_SHA}" \
+            '.runtime[] | "flashinfer/flashinfer-ci-\(.label): \($tag)"' \
+            ci/cuda-versions.json > ci/docker-tags.yml
 
       - name: Create Pull Request
+        if: steps.current_inputs.outputs.current == 'true'
         uses: peter-evans/create-pull-request@v6
         with:
           token: ${{ secrets.FLASHINFER_BOT_TOKEN }}
@@ -125,15 +191,10 @@ jobs:
           body: |
             This PR updates the Docker CI image tags to the latest version: `${{ needs.generate-tag.outputs.date_sha }}`
 
-            Updated images:
-            - flashinfer/flashinfer-ci-cu126:${{ needs.generate-tag.outputs.date_sha }}
-            - flashinfer/flashinfer-ci-cu128:${{ needs.generate-tag.outputs.date_sha }}
-            - flashinfer/flashinfer-ci-cu129:${{ needs.generate-tag.outputs.date_sha }}
-            - flashinfer/flashinfer-ci-cu130:${{ needs.generate-tag.outputs.date_sha }}
-            - flashinfer/flashinfer-ci-cu132:${{ needs.generate-tag.outputs.date_sha }}
+            The image list is generated from `ci/cuda-versions.json`.
 
             Auto-generated by [release-ci-docker workflow](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
-          branch: update-docker-tags-${{ needs.generate-tag.outputs.date_sha }}
+          branch: update-docker-tags
           delete-branch: true
           labels: |
             docker

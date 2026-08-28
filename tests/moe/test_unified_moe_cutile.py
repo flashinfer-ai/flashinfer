@@ -16,6 +16,7 @@ from flashinfer.fused_moe import (
     CuTileNvfp4Runner,
     ExecutionConfig,
     ExpertConfig,
+    GeGLU,
     MoEActivationPack,
     MoEConfig,
     MoEFinalizeConfig,
@@ -23,7 +24,9 @@ from flashinfer.fused_moe import (
     MoEWeightPack,
     QuantConfig,
     QuantVariant,
+    ReLU2,
     RoutingConfig,
+    SwiGLU,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe.cutile.fp4 import (
@@ -60,7 +63,7 @@ def _config(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
         quant=QuantConfig(variant=QuantVariant.BF16),
         experts=ExpertConfig(intermediate_size=intermediate_size),
-        activation=ActivationConfig.swiglu,
+        activation=SwiGLU(),
         backend=BackendOptions((CuTileBf16Config(),)),
         finalize=MoEFinalizeConfig(do_finalize=True),
         execution=ExecutionConfig(
@@ -127,7 +130,7 @@ def test_cutile_permute_chunk_heuristic(num_assignments, num_experts, expected_c
             _config(quant=QuantConfig(variant=QuantVariant.NVFP4)),
             "QuantVariant.NVFP4",
         ),
-        (_config(activation=ActivationConfig.geglu), "Swiglu or Relu2"),
+        (_config(activation=GeGLU()), "supported activations are SwiGLU, ReLU2"),
         (_config(finalize=MoEFinalizeConfig(do_finalize=False)), "do_finalize=True"),
         (_config(execution=ExecutionConfig(enable_pdl=True)), "PDL"),
         (
@@ -195,9 +198,7 @@ def test_cutile_bf16_fused_epilogue_rejects_unsupported_activation():
 
 
 @pytest.mark.parametrize("num_tokens", (1, 1024))
-@pytest.mark.parametrize(
-    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
-)
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_cutile_bf16_tunes_stages_to_two_configs(monkeypatch, num_tokens, activation):
     tuner = RecordingTuner()
     monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
@@ -257,7 +258,7 @@ def test_cutile_bf16_non_gated_block_size_crossovers(arch, rows_per_expert):
 def test_cutile_bf16_gated_block_size_crossovers(arch, rows_per_expert):
     runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
     runner._device_arch = arch
-    runner.config = _config(num_experts=128, activation=ActivationConfig.swiglu)
+    runner.config = _config(num_experts=128, activation=SwiGLU())
 
     assert runner._gated_block_size((rows_per_expert - 1) * 128) == 32
     assert runner._gated_block_size(rows_per_expert * 128) == 64
@@ -320,7 +321,7 @@ def test_cutile_bf16_gated_gemm1_problem_uses_preactivation_width():
         num_experts=256,
         top_k=8,
         intermediate_size=512,
-        activation=ActivationConfig.swiglu,
+        activation=SwiGLU(),
     )
     inputs = [
         torch.empty(16, 2048),
@@ -372,9 +373,7 @@ def test_cutile_bf16_tuning_pre_hook_initializes_routing_and_workspace():
     torch.testing.assert_close(inputs[3], torch.full((7, 2), 0.5))
 
 
-@pytest.mark.parametrize(
-    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
-)
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_cutile_bf16_workspace_cache_uses_token_buckets(activation):
     class KernelModule:
         def __init__(self):
@@ -415,9 +414,7 @@ def test_cutile_bf16_workspace_cache_uses_token_buckets(activation):
     ("num_experts", "hidden_size", "intermediate_size"),
     ((1, 16, 8), (3, 24, 12)),
 )
-@pytest.mark.parametrize(
-    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
-)
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_prepare_cutile_bf16_weights_converts_native_layout(
     activation, num_experts, hidden_size, intermediate_size
 ):
@@ -479,7 +476,7 @@ def test_prepare_cutile_bf16_weights_rejects_invalid_source_contract():
             num_local_experts=2,
             hidden_size=16,
             intermediate_size=16,
-            activation=ActivationConfig.relu2,
+            activation=ReLU2(),
         )
 
 
@@ -497,9 +494,7 @@ cutile_bf16_required = pytest.mark.skipif(
 
 
 @cutile_bf16_required
-@pytest.mark.parametrize(
-    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
-)
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 @pytest.mark.parametrize(
     ("num_tokens", "num_experts", "top_k", "hidden_size", "intermediate_size"),
     (
@@ -587,9 +582,7 @@ def test_cutile_bf16_runner_matches_reference(
 
 
 @cutile_bf16_required
-@pytest.mark.parametrize(
-    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
-)
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_cutile_bf16_runner_supports_tuned_block_sizes(activation):
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -661,9 +654,7 @@ def test_cutile_bf16_runner_supports_tuned_block_sizes(activation):
 
 
 @cutile_bf16_required
-@pytest.mark.parametrize(
-    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
-)
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_cutile_bf16_runner_is_cuda_graph_capturable(activation):
     device = torch.device("cuda")
     num_tokens, hidden_size, intermediate_size = 4, 128, 256
@@ -737,9 +728,7 @@ def test_cutile_bf16_runner_is_cuda_graph_capturable(activation):
 
 
 @cutile_bf16_required
-@pytest.mark.parametrize(
-    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
-)
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_cutile_bf16_runs_through_unified_layer(activation):
     torch.manual_seed(1)
     device = torch.device("cuda")
@@ -803,14 +792,14 @@ def _nvfp4_config(
     num_experts: int = 4,
     top_k: int = 2,
     intermediate_size: int = 128,
-    activation: ActivationConfig = ActivationConfig.swiglu,
+    activation: ActivationConfig | None = None,
     max_num_tokens: int = 128,
 ) -> MoEConfig:
     return MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
         quant=QuantConfig(variant=QuantVariant.NVFP4),
         experts=ExpertConfig(intermediate_size=intermediate_size),
-        activation=activation,
+        activation=activation or SwiGLU(),
         backend=BackendOptions((CuTileNvfp4Config(),)),
         finalize=MoEFinalizeConfig(do_finalize=True),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=max_num_tokens),
@@ -917,7 +906,7 @@ def test_cutile_nvfp4_relu2_tunes_stages_to_two_configs(monkeypatch, num_tokens)
         num_experts=128,
         top_k=6,
         intermediate_size=1856,
-        activation=ActivationConfig.relu2,
+        activation=ReLU2(),
         max_num_tokens=1024,
     )
     inputs = [torch.empty(0) for _ in range(10)]
@@ -953,7 +942,7 @@ def test_cutile_nvfp4_swiglu_tunes_producer_stage_to_two_configs(
         num_experts=256,
         top_k=8,
         intermediate_size=512,
-        activation=ActivationConfig.swiglu,
+        activation=SwiGLU(),
         max_num_tokens=512,
     )
     inputs = [torch.empty(0) for _ in range(10)]
@@ -1000,7 +989,7 @@ def test_cutile_nvfp4_swiglu_fallback_heuristic(
         num_experts=256,
         top_k=8,
         intermediate_size=512,
-        activation=ActivationConfig.swiglu,
+        activation=SwiGLU(),
         max_num_tokens=8192,
     )
     inputs = [torch.empty(0) for _ in range(10)]
@@ -1020,7 +1009,7 @@ def test_cutile_nvfp4_relu2_block_size_heuristic(num_tokens, expected_block):
         num_experts=128,
         top_k=6,
         intermediate_size=1856,
-        activation=ActivationConfig.relu2,
+        activation=ReLU2(),
         max_num_tokens=1024,
     )
     inputs = [torch.empty(0) for _ in range(10)]
@@ -1072,9 +1061,7 @@ def test_cutile_nvfp4_activation_quantize_heuristic(
     )
 
 
-@pytest.mark.parametrize(
-    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
-)
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_prepare_cutile_nvfp4_weights(activation):
     num_experts, hidden_size, intermediate_size = 2, 128, 128
     w1_rows = intermediate_size * (2 if activation.is_gated else 1)
@@ -1193,7 +1180,7 @@ def test_prepare_cutile_nvfp4_weights_pads_only_scale_layout():
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        activation=ActivationConfig.relu2,
+        activation=ReLU2(),
     )
 
     assert view["w1"].shape == w1.shape
@@ -1249,10 +1236,10 @@ cutile_nvfp4_required = pytest.mark.skipif(
 @pytest.mark.parametrize(
     ("activation", "intermediate_size", "scale_row_major"),
     (
-        (ActivationConfig.swiglu, 128, False),
-        (ActivationConfig.relu2, 128, True),
-        (ActivationConfig.swiglu, 768, True),
-        (ActivationConfig.relu2, 768, False),
+        (SwiGLU(), 128, False),
+        (ReLU2(), 128, True),
+        (SwiGLU(), 768, True),
+        (ReLU2(), 768, False),
     ),
 )
 def test_cutile_fused_activation_quantize_matches_unfused(
@@ -1408,10 +1395,10 @@ def _make_nvfp4_case(
 @pytest.mark.parametrize(
     ("activation", "num_tokens", "top_k"),
     (
-        pytest.param(ActivationConfig.swiglu, 4, 2, id="swiglu"),
-        pytest.param(ActivationConfig.relu2, 4, 2, id="relu2"),
+        pytest.param(SwiGLU(), 4, 2, id="swiglu"),
+        pytest.param(ReLU2(), 4, 2, id="relu2"),
         pytest.param(
-            ActivationConfig.swiglu,
+            SwiGLU(),
             21,
             3,
             id="bucketed-small-gated-activation",
@@ -1442,8 +1429,8 @@ def test_cutile_nvfp4_runner_matches_reference(activation, num_tokens, top_k):
 @pytest.mark.parametrize(
     ("activation", "fuse_gemm1"),
     (
-        (ActivationConfig.relu2, 1),
-        (ActivationConfig.swiglu, 0),
+        (ReLU2(), 1),
+        (SwiGLU(), 0),
     ),
 )
 def test_cutile_nvfp4_supports_dimensions_divisible_by_64(activation, fuse_gemm1):
@@ -1601,14 +1588,14 @@ def test_cutile_nvfp4_sorted_io_matches_reference(monkeypatch):
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
-        activation=ActivationConfig.relu2,
+        activation=ReLU2(),
     )
     weights = MoEWeightPack()
     weights.prepare_for("cutile_nvfp4", view)
     runner = CuTileNvfp4Runner(
         _nvfp4_config(
             intermediate_size=intermediate_size,
-            activation=ActivationConfig.relu2,
+            activation=ReLU2(),
             max_num_tokens=num_tokens,
         ),
         device,
@@ -1637,9 +1624,7 @@ def test_cutile_nvfp4_sorted_io_matches_reference(monkeypatch):
 
 
 @cutile_nvfp4_required
-@pytest.mark.parametrize(
-    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
-)
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_cutile_nvfp4_runner_is_cuda_graph_capturable(activation):
     config, activations, weights, expected = _make_nvfp4_case(activation)
     runner = CuTileNvfp4Runner(config, torch.device("cuda"))
@@ -1661,9 +1646,7 @@ def test_cutile_nvfp4_runner_is_cuda_graph_capturable(activation):
 
 
 @cutile_nvfp4_required
-@pytest.mark.parametrize(
-    "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
-)
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_cutile_nvfp4_runs_through_unified_layer(activation):
     config, activations, weights, expected = _make_nvfp4_case(activation)
 

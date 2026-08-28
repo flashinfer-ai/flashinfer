@@ -183,7 +183,14 @@ from flashinfer.fused_moe import (
     RoutingInputMode,
 )
 from flashinfer.fused_moe.api import (
-    ActivationConfig,
+    # Typed activation values
+    GeGLU,
+    GeGLUTanh,
+    ReLU2,
+    SiTU,
+    SwiGLU,
+    SwiGLUStep,
+    # Unified configs and backend options
     BackendOptions,
     CutlassBf16Config,
     CutlassW4A16Config,
@@ -191,6 +198,7 @@ from flashinfer.fused_moe.api import (
     ExecutionConfig,
     ExpertConfig,
     MoEConfig,
+    MoEFinalizeConfig,
     QuantConfig,
     QuantVariant,
     RoutingConfig,
@@ -201,6 +209,7 @@ from flashinfer.fused_moe.api import (
     TrtllmMxInt4Config,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from flashinfer.fused_moe.runners import _TrtllmRunnerBase
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
 from flashinfer.quantization.fp8_quantization import mxfp8_quantize
@@ -428,7 +437,14 @@ def _mxint4_act_pack_logits(x, routing_logits, routing_bias):
 
 
 def _bf16_reference(
-    x, w1, w2, selected_experts, final_scales, intermediate_size, expert_offset=0
+    x,
+    w1,
+    w2,
+    selected_experts,
+    final_scales,
+    intermediate_size,
+    expert_offset=0,
+    activation=None,
 ):
     """Dense bf16 MoE authority: same SwiGLU convention as ``_nvfp4_reference``
     but no fp4 requant -- the only intermediate quantization is the bf16 rounding
@@ -436,6 +452,7 @@ def _bf16_reference(
     to match the packed-id truncation in pack_inputs, so the tolerance measures
     kernel error, not oracle mismatch."""
     final_scales = final_scales.to(torch.bfloat16).float()
+    activation = activation or SwiGLU()
     x32, half = x.float(), intermediate_size
     out = torch.zeros_like(x32)
     for local_e in range(w1.shape[0]):
@@ -443,8 +460,48 @@ def _bf16_reference(
         if not mask.any():
             continue
         tok, nth = torch.where(mask)
-        gate, up = w1[local_e][half:, :].float(), w1[local_e][:half, :].float()
-        inter = F.silu(x32[tok] @ gate.t()) * (x32[tok] @ up.t())
+        fc1 = x32[tok] @ w1[local_e].float().t()
+        if isinstance(activation, ReLU2):
+            inter = F.relu(fc1) ** 2
+        else:
+            up, gate = fc1[:, :half], fc1[:, half:]
+            if isinstance(activation, SwiGLU):
+                gate = gate.clamp(max=activation.limit)
+                up = up.clamp(min=-activation.limit, max=activation.limit)
+                inter = (
+                    gate
+                    * torch.sigmoid(activation.alpha * gate)
+                    * (up + activation.beta)
+                )
+            elif isinstance(activation, GeGLU):
+                inter = F.gelu(gate) * up
+            elif isinstance(activation, GeGLUTanh):
+                inter = F.gelu(gate, approximate="tanh") * up
+            elif isinstance(activation, SwiGLUStep):
+                inter = F.silu(gate).clamp(max=activation.limit) * up.clamp(
+                    min=-activation.limit, max=activation.limit
+                )
+            elif isinstance(activation, SiTU):
+                if activation.clamp_limit is not None:
+                    up = up.clamp(
+                        min=-activation.clamp_limit, max=activation.clamp_limit
+                    )
+                    gate = gate.clamp(max=activation.clamp_limit)
+                # linear_scale=None is the unclamped linear branch.
+                linear = (
+                    up
+                    if activation.linear_scale is None
+                    else activation.linear_scale
+                    * torch.tanh(up / activation.linear_scale)
+                )
+                inter = (
+                    linear
+                    * activation.gate_scale
+                    * torch.tanh(gate / activation.gate_scale)
+                    * torch.sigmoid(gate)
+                )
+            else:
+                raise AssertionError(f"unsupported BF16 fuzz activation {activation!r}")
         inter = inter.to(torch.bfloat16).float()  # gemm1 output is stored bf16
         expert_out = (inter @ w2[local_e].float().t()).to(torch.bfloat16).float()
         out[tok] += final_scales[tok, nth, None] * expert_out
@@ -878,9 +935,10 @@ _DTYPE = {
         reference=_mxint4_reference,
         poison=_poison_bf16_out,
         out_dtype=torch.bfloat16,
-        # The full 160-seed SM100 sweep observes max|diff| / ||ref||inf
-        # ~= 0.0535 for a 4096-token FromLogits case.
-        atol_frac=0.06,
+        # A 160-seed GB200 (SM100) sweep exercised 17 MxInt4 cases; seed 18
+        # requires atol_frac ~= 0.062 after the relative-tolerance contribution.
+        # Keep a small SM100-calibrated margin; SM103/SM107 remain uncalibrated.
+        atol_frac=0.065,
         rtol=0.3,
     ),
 }
@@ -901,6 +959,17 @@ _PREROUTED_VARIANT_IDS = tuple(
 
 def _handler_for(cfg):
     return _HANDLER_BY_ID[cfg.variant]
+
+
+def _activation_for(cfg):
+    return {
+        "swiglu": SwiGLU(),
+        "geglu": GeGLU(),
+        "situ": SiTU(),
+        "relu2": ReLU2(),
+        "geglutanh": GeGLUTanh(),
+        "swiglustep": SwiGLUStep(),
+    }[cfg.activation]
 
 
 # ---------------------------------------------------------------------------
@@ -990,6 +1059,13 @@ _EP_BACKENDS = {
     for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
     if runner_cls.supports_expert_parallelism
 }
+# Backend config classes whose runners support do_finalize=False and return the
+# three-tensor unfinalized output contract.
+_UNFINALIZED_BACKENDS = {
+    cfg_cls
+    for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
+    if issubclass(runner_cls, _TrtllmRunnerBase)
+}
 _UNPACKED_VARIANT_IDS = tuple(
     variant.name.lower()
     for variant, handler in _DTYPE.items()
@@ -1037,6 +1113,9 @@ class Cfg:
     n_group: int = 0  # DeepSeekV3 group count (0 -> None)
     topk_group: int = 0  # DeepSeekV3 groups kept (0 -> None)
     routed_scaling: float = 0.0  # DeepSeekV3 weight scale (0.0 -> None)
+    do_finalize: bool = True
+    activation: str = "swiglu"
+    expected_backend: str = ""  # curated execution assertion; empty for random cases
 
     @property
     def n_weight_rows(self):  # physical expert-major rows: routed + shared
@@ -1074,8 +1153,10 @@ class Cfg:
             if self.num_fused_shared_experts
             else ""
         )
+        finalize = "" if self.do_finalize else "unfinalized_"
         return (
-            f"{self.variant}_{sh}{mode}{self.routing_method.name}_{ld}{uwd}{self.route}_"
+            f"{self.variant}_{self.activation}_{sh}{mode}{finalize}"
+            f"{self.routing_method.name}_{ld}{uwd}{self.route}_"
             f"e{self.num_experts}_{ep}{grp}k{self.top_k}_"
             f"t{self.num_tokens}_h{self.hidden}_i{self.intermediate}_s{self.seed}"
         )
@@ -1187,6 +1268,16 @@ def _gen(seed):
         ):
             num_fused_shared_experts = rng.randint(1, max_shared)
 
+    activation = "swiglu"
+    if variant == "bf16":
+        # FromLogits and EP require TRTLLM, whose BF16 cubins expose SwiGLU
+        # and ReLU2. CUTLASS-only activations are valid only for non-EP
+        # pre-routed cases.
+        activation = rng.choice(
+            ("swiglu", "relu2")
+            if fromlogits or offset != 0 or local != ne
+            else ("swiglu", "relu2", "geglutanh", "swiglustep", "situ")
+        )
     return Cfg(
         num_tokens=rng.choice(_TOKENS),
         hidden=h,
@@ -1206,6 +1297,7 @@ def _gen(seed):
         n_group=n_group,
         topk_group=topk_group,
         routed_scaling=routed_scaling,
+        activation=activation,
         num_fused_shared_experts=num_fused_shared_experts,
     )
 
@@ -1315,6 +1407,45 @@ _CURATED = [
         topk_group=2,
         routed_scaling=1.0,
     ),  # BF16 FromLogits bias/group routing
+    # Deterministic typed-activation coverage. Keep CUTLASS-only activations
+    # pre-routed so they have an executable candidate.
+    Cfg(8, 256, 256, 8, 2, "bf16", "uniform", 900_014, activation="relu2"),
+    Cfg(
+        8,
+        256,
+        256,
+        8,
+        2,
+        "bf16",
+        "uniform",
+        900_015,
+        activation="geglutanh",
+        expected_backend="cutlass_bf16",
+    ),
+    Cfg(
+        8,
+        256,
+        256,
+        8,
+        2,
+        "bf16",
+        "uniform",
+        900_022,
+        activation="swiglustep",
+        expected_backend="cutlass_bf16",
+    ),
+    Cfg(
+        8,
+        256,
+        256,
+        8,
+        2,
+        "bf16",
+        "uniform",
+        900_023,
+        activation="situ",
+        expected_backend="cutlass_bf16",
+    ),
     Cfg(
         16,
         7168,
@@ -1532,6 +1663,63 @@ _CURATED = [
             ("w4a16", 1, 900_044),
         )
     ],
+    # Issue #3926: every unified TRTLLM operator that exposes unfinalized
+    # intermediates must return BF16 expert weights for either logits dtype.
+    *[
+        Cfg(
+            32,
+            512,
+            512,
+            16,
+            4,
+            variant,
+            "uniform",
+            seed,
+            routing_method=RoutingMethodType.Default,
+            routing_input_mode="fromlogits",
+            logits_dtype=logits_dtype,
+            do_finalize=False,
+        )
+        for variant, seed_base in (
+            ("bf16", 900_050),
+            ("fp8pertensor", 900_052),
+            ("deepseekfp8", 900_054),
+            ("mxint4", 900_056),
+            ("nvfp4", 900_058),
+            ("mxfp8", 900_060),
+        )
+        for logits_dtype, seed in (
+            ("bf16", seed_base),
+            ("fp32", seed_base + 1),
+        )
+    ],
+    # PackedPrecomputed + unfinalized coverage. Packed ids encode BF16 routing
+    # weights, but FP4 borrows topk_weights instead of allocating its own buffer.
+    # The value assertion below guards the returned weights across all TRTLLM
+    # variants and catches an invalid FP4 buffer.
+    *[
+        Cfg(
+            32,
+            512,
+            512,
+            16,
+            4,
+            variant,
+            "uniform",
+            seed,
+            routing_method=RoutingMethodType.RenormalizeNaive,
+            routing_input_mode="prerouted",
+            do_finalize=False,
+        )
+        for variant, seed in (
+            ("bf16", 900_070),
+            ("fp8pertensor", 900_071),
+            ("deepseekfp8", 900_072),
+            ("mxint4", 900_073),
+            ("nvfp4", 900_074),
+            ("mxfp8", 900_075),
+        )
+    ],
 ]
 _CURATED_BY_SEED = {}
 for _cfg in _CURATED:
@@ -1602,15 +1790,17 @@ def _route(
                 dim=-1
             )  # top-2 sum per group
             _, gidx = torch.topk(group_scores, k=topk_group, dim=-1)
-            gmask = torch.zeros_like(group_scores).scatter_(-1, gidx, 1.0)
+            gmask = torch.zeros_like(group_scores, dtype=torch.bool).scatter_(
+                -1, gidx, True
+            )
             smask = (
                 gmask.unsqueeze(-1)
                 .expand(*sel_scores.shape[:-1], n_group, E // n_group)
                 .reshape(sel_scores.shape)
             )
-            sel_scores = (
-                sel_scores * smask
-            )  # zero out experts outside the selected groups
+            # A routing bias can make scores negative. Zero-masking would let an
+            # unselected expert outrank a valid negative score in the selected group.
+            sel_scores = sel_scores.masked_fill(~smask, float("-inf"))
         _, sel = torch.topk(sel_scores, top_k, dim=-1)
         w = torch.gather(scores, -1, sel)  # UNBIASED sigmoid weights
         w = w / (w.sum(dim=-1, keepdim=True) + 1e-20)
@@ -1621,6 +1811,29 @@ def _route(
             f"routing method {method!r} not supported by the fuzzer oracle"
         )
     return sel.to(torch.int64), w.float()
+
+
+def test_deepseek_v3_route_excludes_unselected_groups_with_negative_scores():
+    logits = torch.zeros((1, 8), dtype=torch.float32)
+    # Group 0 wins by its top-2 sum, but its fourth selection score is negative.
+    # Experts in group 1 must remain ineligible rather than becoming zero-score
+    # candidates that can displace that valid negative-score expert.
+    bias = torch.tensor(
+        [[2.5, 1.5, 0.5, -1.5, 0.0, -0.1, -0.2, -0.3]],
+        dtype=torch.float32,
+    )
+
+    selected, _ = _route(
+        logits,
+        RoutingMethodType.DeepSeekV3,
+        top_k=4,
+        bias=bias,
+        n_group=2,
+        topk_group=1,
+        routed_scaling=1.0,
+    )
+
+    assert set(selected[0].tolist()) == {0, 1, 2, 3}
 
 
 def _master(cfg, handler):
@@ -1644,7 +1857,8 @@ def _master(cfg, handler):
     # Expert-major tensors carry the SHARED rows too (routed first, shared
     # appended); E_local stays routed-only, matching the API contract.
     rows = cfg.n_weight_rows
-    x, w1, w2 = sparse(T, H), sparse(rows, 2 * I, H), sparse(rows, H, I)
+    gemm1_rows = 2 * I if _activation_for(cfg).is_gated else I
+    x, w1, w2 = sparse(T, H), sparse(rows, gemm1_rows, H), sparse(rows, H, I)
 
     logits = torch.randn(T, E_local, device="cuda", generator=g)  # over the local shard
     if cfg.route in ("hot1", "all_to_one"):  # pile every token onto one expert
@@ -1707,13 +1921,52 @@ _SKIP_SUBSTR = (
     "only support",
 )
 _CRASH_SUBSTR = ("cuda error", "illegal memory", "misaligned", "device-side assert")
+# Broad skip terms also appear in real activation-plumbing errors, so these
+# concrete identifiers force such errors to fail. Do not add activation names:
+# "does not support SiTU" is a legitimate capability skip.
+_NEVER_SKIP_SUBSTR = (
+    "activation parameters",
+    "gemm1_alpha",
+    "gemm1_beta",
+    "gemm1_clamp_limit",
+)
 
 
 def _is_unsupported(e):
     msg = str(e).lower()
     if any(c in msg for c in _CRASH_SUBSTR):
         return False  # a crash is always a finding, never "unsupported"
-    return isinstance(e, NotImplementedError) or any(s in msg for s in _SKIP_SUBSTR)
+    # A runner raises NotImplementedError only for declared capability gaps, so
+    # honor it before the substring heuristics can second-guess the message.
+    if isinstance(e, NotImplementedError):
+        return True
+    if any(s in msg for s in _NEVER_SKIP_SUBSTR):
+        return False
+    return any(s in msg for s in _SKIP_SUBSTR)
+
+
+@pytest.mark.parametrize(
+    "exc,expected",
+    (
+        # A declared capability gap is a skip, even when the message names an
+        # activation -- matching on activation names would misreport this.
+        (NotImplementedError("backend does not support SiTU"), True),
+        (NotImplementedError("TrtllmBf16RoutedRunner does not support GeGLU"), True),
+        # Activation plumbing phrased as a shape error is the regression this
+        # fuzzer exists to catch, despite "must be" being a skip term.
+        (ValueError("gemm1_alpha must have shape (8,)"), False),
+        (
+            ValueError("runner: prepared weights are missing activation parameters"),
+            False,
+        ),
+        # Ordinary shape-capability rejections still skip.
+        (ValueError("hidden_size must be divisible by 128"), True),
+        # A crash is never "unsupported", however it is phrased.
+        (RuntimeError("CUDA error: illegal memory access"), False),
+    ),
+)
+def test_is_unsupported_classification(exc, expected):
+    assert _is_unsupported(exc) is expected
 
 
 # ---------------------------------------------------------------------------
@@ -1839,6 +2092,10 @@ def test_unified_moe_fuzz(cfg):
         # Backends that accept separate tensors through their own ABI are not
         # implementations of RoutingInputMode.UnpackedPrecomputed.
         wired_backends = [B for B in wired_backends if B in _UNPACKED_BACKENDS]
+    if not cfg.do_finalize:
+        # Only TRTLLM returns unfinalized intermediates; like the EP filter
+        # below, this keeps an unsupported arch on the precise skip path.
+        wired_backends = [B for B in wired_backends if B in _UNFINALIZED_BACKENDS]
     if cfg.is_ep:
         # An EP shard needs the runner to map global ids onto a local expert subset;
         # backends without that capability (CUTLASS, b12x) would fail MoELayer's
@@ -1850,6 +2107,26 @@ def test_unified_moe_fuzz(cfg):
             for B in wired_backends
             if _BACKEND_RUNNERS[B].backend_key in _BACKEND_FILTER
         ]
+    expected_backend_available = bool(
+        cfg.expected_backend
+        and any(
+            _BACKEND_RUNNERS[B].backend_key == cfg.expected_backend and B.supported(sm)
+            for B in handler.candidate_configs
+            if B in _BACKEND_RUNNERS
+        )
+    )
+    # The debug allowlist deliberately narrows execution to one backend, so it
+    # must retire the curated assertion rather than trip it: otherwise bisecting
+    # with FLASHINFER_UMOE_FUZZ_BACKENDS fails every curated case by design.
+    if _BACKEND_FILTER and cfg.expected_backend not in _BACKEND_FILTER:
+        expected_backend_available = False
+    if expected_backend_available and not any(
+        _BACKEND_RUNNERS[B].backend_key == cfg.expected_backend for B in wired_backends
+    ):
+        pytest.fail(
+            f"{cfg.label}: expected backend {cfg.expected_backend!r} was filtered "
+            "before execution"
+        )
     # A backend-scoped crash quarantine must take effect before backend-native
     # weight preparation or MoELayer construction: both can load modules and
     # launch CUDA preparation kernels. Keep the findings so the overall case
@@ -1861,6 +2138,12 @@ def test_unified_moe_fuzz(cfg):
         quarantine = LEDGER.skip_backend(cfg, backend_key)
         if quarantine:
             quarantined_backends.append((quarantine, backend_key))
+            # A quarantined backend is intentionally never launched, so the
+            # curated "expected backend must execute" assertion cannot hold.
+            # Leaving it armed would report a ledger-tracked crash as a plain
+            # test failure instead of the XFAIL the ledger asks for.
+            if backend_key == cfg.expected_backend:
+                expected_backend_available = False
         else:
             healthy_backends.append(BackendCfg)
     wired_backends = healthy_backends
@@ -1889,7 +2172,7 @@ def test_unified_moe_fuzz(cfg):
         if cfg.is_unpacked
         else final_scales
     )
-    ref = handler.reference(
+    reference_args = (
         x,
         w1,
         w2,
@@ -1898,6 +2181,10 @@ def test_unified_moe_fuzz(cfg):
         cfg.intermediate,
         cfg.expert_offset,
     )
+    if handler.variant is QuantVariant.BF16:
+        ref = handler.reference(*reference_args, activation=_activation_for(cfg))
+    else:
+        ref = handler.reference(*reference_args)
     ref_abs_max = ref.abs().max().item()
     atol = handler.atol_frac * ref_abs_max + 1e-3
     rtol = handler.rtol
@@ -1926,6 +2213,7 @@ def test_unified_moe_fuzz(cfg):
             hidden_size=cfg.hidden,
             intermediate_size=cfg.intermediate,
             device=dev,
+            activation=_activation_for(cfg),
         )
         # FP8BlockConfig distinguishes DeepSeekFp8/MxFp8; FP4Config distinguishes
         # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
@@ -1961,7 +2249,7 @@ def test_unified_moe_fuzz(cfg):
             local_expert_offset=cfg.expert_offset,
             num_fused_shared_experts=cfg.num_fused_shared_experts,
         ),
-        activation=ActivationConfig(),
+        activation=_activation_for(cfg),
         backend=BackendOptions(
             candidates=tuple(BackendCfg() for BackendCfg in wired_backends)
         ),
@@ -1972,14 +2260,67 @@ def test_unified_moe_fuzz(cfg):
                 else max(cfg.num_tokens, 8192)
             )
         ),
+        finalize=MoEFinalizeConfig(do_finalize=cfg.do_finalize),
     )
 
     try:
         layer = MoELayer(config)
     except Exception as e:
         if _is_unsupported(e):
+            if expected_backend_available:
+                pytest.fail(
+                    f"{cfg.label}: expected backend {cfg.expected_backend!r} "
+                    f"failed MoELayer construction: {e}"
+                )
             pytest.skip(f"MoELayer rejected {cfg.label}: {e}")
         raise
+
+    if not cfg.do_finalize:
+        result = layer(act_pack, weight_pack)
+        assert isinstance(result, list) and len(result) == 3, (
+            "do_finalize=False must return "
+            "[gemm2_output, expert_weights, expanded_idx_to_permuted_idx], got "
+            f"{type(result).__name__} of length "
+            f"{len(result) if isinstance(result, list) else 'n/a'}"
+        )
+        gemm2_output, expert_weights, expanded_idx_to_permuted_idx = result
+        assert gemm2_output.shape[-1] == cfg.hidden
+        assert expert_weights.dtype == torch.bfloat16, (
+            "do_finalize=False expert_weights must be bfloat16, got "
+            f"{expert_weights.dtype} for routing_logits dtype {cfg.logits_dtype}"
+        )
+        assert tuple(expert_weights.shape) == (cfg.num_tokens, cfg.top_k)
+        assert expanded_idx_to_permuted_idx.numel() == cfg.num_tokens * cfg.top_k
+        torch.testing.assert_close(
+            expert_weights.float(),
+            final_scales.to(torch.bfloat16).float(),
+            rtol=2e-2,
+            atol=2e-3,
+        )
+
+        permutation = expanded_idx_to_permuted_idx.to(torch.long)
+        assert (permutation >= 0).all()
+        assert permutation.unique().numel() == permutation.numel()
+        assert permutation.max().item() < gemm2_output.shape[0]
+
+        recombined = (
+            gemm2_output[permutation]
+            .view(cfg.num_tokens, cfg.top_k, cfg.hidden)
+            .float()
+            .mul(expert_weights.float().unsqueeze(-1))
+            .sum(dim=1)
+        )
+        abs_diff = (recombined - ref).abs()
+        over_tol = abs_diff > (atol + rtol * ref.abs())
+        if over_tol.any():
+            _fail(
+                cfg,
+                "unfinalized host recombination",
+                f"{int(over_tol.sum())}/{recombined.numel()} elems exceed tol",
+                recombined,
+                ref,
+            )
+        return
 
     out_shape = (cfg.num_tokens, cfg.hidden)
 
@@ -2091,6 +2432,7 @@ def test_unified_moe_fuzz(cfg):
             assert_correct(o, f"{tag} [tactic={tactic}]")
 
     n_ran = 0
+    ran_backends = set()
     expected_failures = []
     for runner in layer.runners:
         try:
@@ -2101,6 +2443,7 @@ def test_unified_moe_fuzz(cfg):
             raise
         tag = f"{runner.backend_key} {cfg.label}"
         n_ran += 1
+        ran_backends.add(runner.backend_key)
 
         known = LEDGER.find(cfg, backend=runner.backend_key)
         if known:  # tracked bug -> run it, tolerate a wrong answer, but flag if it starts passing
@@ -2119,6 +2462,10 @@ def test_unified_moe_fuzz(cfg):
             context=f"all candidate backends quarantined for {cfg.label}",
         )
         pytest.skip(f"no runner ran {cfg.label} on SM{sm}")
+    if expected_backend_available and cfg.expected_backend not in ran_backends:
+        pytest.fail(
+            f"{cfg.label}: expected backend {cfg.expected_backend!r} did not execute"
+        )
 
     # (6) autotune-ON: drive the REAL production path -- MoELayer._select_winner profiles every
     # tactic of every runner (the #3168 profiling-IMA class) then selects + caches a winner; the
@@ -2246,7 +2593,7 @@ def test_autotune_cache_coherence(base, variant):
             routing=RoutingConfig(num_experts=E, top_k=top_k),
             quant=QuantConfig(variant=variant),
             experts=ExpertConfig(intermediate_size=I, local_num_experts=E),
-            activation=ActivationConfig(),
+            activation=SwiGLU(),
             backend=BackendOptions(candidates=tuple(B() for B in wired)),
             execution=ExecutionConfig(tune_max_num_tokens=max(_CACHE_TOKEN_SEQ)),
         )

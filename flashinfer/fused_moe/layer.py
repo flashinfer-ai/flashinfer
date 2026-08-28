@@ -31,7 +31,14 @@ from .api import (
     B12xNvfp4Config,
     B12xW4A16Config,
     CutlassBf16Config,
+    CutlassFp8BlockConfig,
+    CutlassFp8PerTensorConfig,
+    CutlassHummingConfig,
+    CutlassMxfp8Config,
+    CutlassMxfp8Mxfp4Config,
+    CutlassNvfp4Config,
     CutlassW4A16Config,
+    CutlassW4A8Config,
     CuTileBf16Config,
     CuTileNvfp4Config,
     CuteDslConfig,
@@ -48,7 +55,14 @@ from .runners import (
     B12xNvfp4Runner,
     B12xW4A16Runner,
     CutlassBf16Runner,
+    CutlassFp8BlockRunner,
+    CutlassFp8PerTensorRunner,
+    CutlassHummingRunner,
+    CutlassMxfp8Mxfp4Runner,
+    CutlassMxfp8Runner,
+    CutlassNvfp4Runner,
     CutlassW4A16Runner,
+    CutlassW4A8Runner,
     CuTileBf16Runner,
     CuTileNvfp4Runner,
     CuteDslNvfp4Runner,
@@ -66,7 +80,14 @@ from .utils import map_to_hybrid_bucket
 # typing the list with this Union gives mypy the visibility it needs.
 _RunnerT = Union[
     CutlassBf16Runner,
+    CutlassFp8BlockRunner,
+    CutlassFp8PerTensorRunner,
+    CutlassHummingRunner,
+    CutlassMxfp8Mxfp4Runner,
+    CutlassMxfp8Runner,
+    CutlassNvfp4Runner,
     CutlassW4A16Runner,
+    CutlassW4A8Runner,
     CuTileBf16Runner,
     CuTileNvfp4Runner,
     CuteDslNvfp4Runner,
@@ -82,7 +103,14 @@ _RunnerT = Union[
 # Map backend-config class -> runner class
 _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CutlassBf16Config: CutlassBf16Runner,
+    CutlassFp8BlockConfig: CutlassFp8BlockRunner,
+    CutlassFp8PerTensorConfig: CutlassFp8PerTensorRunner,
+    CutlassHummingConfig: CutlassHummingRunner,
+    CutlassMxfp8Config: CutlassMxfp8Runner,
+    CutlassMxfp8Mxfp4Config: CutlassMxfp8Mxfp4Runner,
+    CutlassNvfp4Config: CutlassNvfp4Runner,
     CutlassW4A16Config: CutlassW4A16Runner,
+    CutlassW4A8Config: CutlassW4A8Runner,
     CuTileBf16Config: CuTileBf16Runner,
     CuTileNvfp4Config: CuTileNvfp4Runner,
     CuteDslConfig: CuteDslNvfp4Runner,
@@ -198,7 +226,7 @@ class MoELayer:
         self,
         act_pack: MoEActivationPack,
         weight_pack: MoEWeightPack,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
         ceiling = self.config.execution.tune_max_num_tokens
         if act_pack.num_tokens > ceiling:
             raise ValueError(

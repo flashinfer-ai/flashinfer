@@ -390,6 +390,7 @@ def compute_reference_moe_fp4(
     swiglu_limit: float | None = None,
     situ_beta: float | None = None,
     situ_linear_beta: float | None = None,
+    wrong_formula: bool = False,
     gemm1_alpha: torch.Tensor | None = None,
     gemm2_alpha: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -530,7 +531,15 @@ def compute_reference_moe_fp4(
                         * (linear + swiglu_beta)
                     )
             else:
-                act_out = torch.relu(gemm1_out) ** 2
+                # wrong_formula drops the square, giving a genuinely different
+                # non-gated activation over identical weights. Used as a
+                # negative control to prove a tolerance can distinguish
+                # activation formulas rather than just output magnitude.
+                act_out = (
+                    torch.relu(gemm1_out)
+                    if wrong_formula
+                    else torch.relu(gemm1_out) ** 2
+                )
 
             if fc2_input_scale is not None:
                 if use_per_token_activation:
@@ -1046,6 +1055,7 @@ def compute_reference_moe_relu2(
     hidden_size: int,
     intermediate_size: int,
     fc2_input_scale: torch.Tensor | None,
+    wrong_formula: bool = False,
 ) -> torch.Tensor:
     """Reference ReLU2 MoE: output = relu(FC1(x))^2, then FC2."""
     output = torch.zeros(num_tokens, hidden_size, dtype=torch.float32, device="cuda")
@@ -1062,7 +1072,14 @@ def compute_reference_moe_relu2(
 
             w1 = fc1_weights[expert_idx]
             fc1_out = token_input @ w1.T
-            activated = torch.square(torch.relu(fc1_out))
+            # wrong_formula drops the square: a genuinely different non-gated
+            # activation over the same weights, used as a negative control to
+            # prove a tolerance can distinguish activation formulas.
+            activated = (
+                torch.relu(fc1_out)
+                if wrong_formula
+                else torch.square(torch.relu(fc1_out))
+            )
 
             if fc2_input_scale is not None:
                 activated = quant_dequant_fp4_reference(
