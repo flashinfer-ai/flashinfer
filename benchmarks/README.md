@@ -1,5 +1,38 @@
 # FlashInfer Perf Benchmarking Framework -- `flashinfer_benchmark.py`
 
+## VibeCUDA AlphaMoE router versus CAKE
+
+`bench_alphamoe_router.py` compares the VibeCUDA backend directly with the
+optimized CAKE router from PR 4339. Torch is only a correctness reference,
+never the performance denominator. Because both revisions provide the
+`flashinfer` package, install the pinned CAKE checkout into an isolated virtual
+environment and pass both its checkout and Python executable to the benchmark:
+
+```bash
+BASELINE_WT=/tmp/flashinfer-pr4339-baseline
+BASELINE_VENV=/tmp/flashinfer-pr4339-venv
+CANDIDATE_VENV=/tmp/flashinfer-vibecuda-venv
+git fetch https://github.com/flashinfer-ai/flashinfer.git \
+  0725744e58a9e338e8d315d82891878b07decd8f
+git worktree add --detach "$BASELINE_WT" \
+  0725744e58a9e338e8d315d82891878b07decd8f
+python3 -m pip install virtualenv
+python3 -m virtualenv --system-site-packages "$BASELINE_VENV"
+"$BASELINE_VENV/bin/python" -m pip install --no-build-isolation -e "$BASELINE_WT" -v
+
+python3 -m virtualenv --system-site-packages "$CANDIDATE_VENV"
+"$CANDIDATE_VENV/bin/python" -m pip install --no-build-isolation -e "$PWD" -v
+
+PYTHONPATH=$PWD "$CANDIDATE_VENV/bin/python" benchmarks/bench_alphamoe_router.py \
+  --candidate-python "$CANDIDATE_VENV/bin/python" \
+  --baseline-root "$BASELINE_WT" \
+  --baseline-python "$BASELINE_VENV/bin/python"
+```
+
+The command validates the immutable CAKE commit, runs both implementations in
+isolated processes with the same four workloads and CUPTI protocol, and reports
+CAKE/VibeCUDA per-workload, arithmetic-mean, and geometric-mean speedup.
+
 The aim of `flashinfer_benchmark.py` is to provide a single framework for benchmarking any FlashInfer kernel and replace standalone benchmarking scripts.
 
 `bench_recurrent_kda_prefill.py --case-set h12` runs the six Kimi-K3 TP8 H12

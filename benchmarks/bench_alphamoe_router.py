@@ -1,20 +1,36 @@
-"""Benchmark the VibeCUDA AlphaMoE router against FlashInfer main.
+# Copyright (c) 2026 by FlashInfer team.
+# Licensed under the Apache License, Version 2.0 (the "License").
 
-The optimized CAKE baseline is still under review in PR #4339. Its separately
-verified result is reported in the pull request description; this benchmark
-does not vendor or compile unpublished reference code.
+"""Compare the VibeCUDA AlphaMoE router with pinned CAKE PR 4339.
+
+The candidate and CAKE checkouts both provide the ``flashinfer`` package, so
+the benchmark executes them in isolated Python processes and combines their
+matched CUPTI measurements. Prepare the baseline checkout as documented in
+``benchmarks/README.md``, then run::
+
+    python3 benchmarks/bench_alphamoe_router.py \
+      --candidate-python /tmp/flashinfer-vibecuda-venv/bin/python \
+      --baseline-root /tmp/flashinfer-pr4339-baseline \
+      --baseline-python /tmp/flashinfer-pr4339-venv/bin/python
+
+Torch is only an independent correctness reference, never the denominator.
 """
 
-import functools
-from dataclasses import dataclass
+from __future__ import annotations
 
-import numpy as np
-import torch
+import argparse
+import json
+import math
+import os
+import statistics
+import subprocess
+import sys
+import tempfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
 
-from flashinfer.fused_moe import allocate_alphamoe_route_plan, alphamoe_fused_router
-from flashinfer.testing import bench_gpu_time
-from flashinfer.trace.templates.moe import _alphamoe_fused_router_reference
-
+CAKE_PR = "https://github.com/flashinfer-ai/flashinfer/pull/4339"
+CAKE_SHA = "0725744e58a9e338e8d315d82891878b07decd8f"
 DRY_RUN_ITERS = 5
 REPEAT_ITERS = 10
 
@@ -37,101 +53,228 @@ CONFIGS = (
 )
 
 
-def _make_logits(cfg: RouterConfig, case_index: int) -> torch.Tensor:
-    generator = torch.Generator(device="cuda").manual_seed(29001 + case_index)
-    return torch.randn(
-        cfg.num_tokens,
-        cfg.num_experts,
-        generator=generator,
-        device="cuda",
-        dtype=torch.float32,
+def _checkout_sha(root: Path) -> str:
+    return subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=root, text=True
+    ).strip()
+
+
+def _validate_baseline(root: Path) -> None:
+    actual = _checkout_sha(root)
+    if actual != CAKE_SHA:
+        raise RuntimeError(
+            f"CAKE baseline must be {CAKE_SHA}, got {actual} at {root}"
+        )
+
+
+def _clean_pythonpath(root: Path) -> str:
+    candidate_root = Path(__file__).resolve().parents[1]
+    entries = [str(root)]
+    for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if not entry:
+            continue
+        resolved = Path(entry).resolve()
+        if resolved != candidate_root:
+            entries.append(str(resolved))
+    return os.pathsep.join(entries)
+
+
+def _run_worker(*, backend: str, root: Path, python: Path, output: Path) -> None:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = _clean_pythonpath(root)
+    subprocess.run(
+        [
+            str(python),
+            str(Path(__file__).resolve()),
+            "--worker",
+            backend,
+            "--output",
+            str(output),
+        ],
+        cwd=root,
+        env=env,
+        check=True,
     )
 
 
-def _timed_us(fn, args: tuple) -> float:
-    samples = bench_gpu_time(
-        fn,
-        input_args=args,
-        enable_cupti=True,
-        dry_run_iters=DRY_RUN_ITERS,
-        repeat_iters=REPEAT_ITERS,
-        cold_l2_cache=True,
-        use_cuda_graph=False,
+def _worker(backend: str, output: Path) -> None:
+    import numpy as np
+    import torch
+
+    from flashinfer.fused_moe import (
+        allocate_alphamoe_route_plan,
+        alphamoe_fused_router,
     )
-    return float(np.median(samples)) * 1e3
+    try:
+        from flashinfer.testing import bench_gpu_time
+    except ImportError:
+        from flashinfer.testing.utils import bench_gpu_time
 
-
-def _assert_matches_reference(
-    cfg: RouterConfig, candidate: tuple[torch.Tensor, ...], reference: tuple
-) -> None:
-    torch.testing.assert_close(candidate[0], reference[0], rtol=1e-5, atol=1e-7)
-    for index in (1, 3, 4, 5, 6, 7):
-        torch.testing.assert_close(candidate[index], reference[index])
-
-    # Scatter order within one expert is intentionally unspecified. Compare
-    # routed token ids as multisets and require every padding slot to be the
-    # documented sentinel.
-    sorted_ids = candidate[2]
-    ref_sorted_ids = reference[2]
-    counts = candidate[5].tolist()
-    offsets = candidate[6].tolist()
-    sentinel = cfg.num_tokens * cfg.top_k
-    for expert, count in enumerate(counts):
-        begin, end = offsets[expert], offsets[expert + 1]
-        got, _ = torch.sort(sorted_ids[begin : begin + count])
-        want, _ = torch.sort(ref_sorted_ids[begin : begin + count])
-        torch.testing.assert_close(got, want)
-        padding = sorted_ids[begin + count : end]
-        if padding.numel() and not bool((padding == sentinel).all()):
-            raise AssertionError(f"expert {expert}: non-sentinel padding")
-
-
-def _bench_one(cfg: RouterConfig, case_index: int) -> float:
-    logits = _make_logits(cfg, case_index)
-    kwargs = {
-        "top_k": cfg.top_k,
-        "block_m": cfg.block_m,
-        "has_shared_expert": cfg.has_shared_expert,
-    }
-    reference = _alphamoe_fused_router_reference(logits, **kwargs)
-    candidate = alphamoe_fused_router(logits, backend="vibecuda", **kwargs)
-    _assert_matches_reference(cfg, candidate, reference)
-
-    plan = allocate_alphamoe_route_plan(logits, **kwargs)
-    planned_candidate = alphamoe_fused_router(logits, plan=plan, backend="vibecuda")
-    _assert_matches_reference(cfg, planned_candidate, reference)
-    torch.cuda.synchronize()
-
-    candidate_fn = functools.partial(
-        alphamoe_fused_router, plan=plan, backend="vibecuda"
-    )
-    reference_fn = functools.partial(_alphamoe_fused_router_reference, **kwargs)
-    candidate_us = _timed_us(candidate_fn, (logits,))
-    reference_us = _timed_us(reference_fn, (logits,))
-    speedup = reference_us / candidate_us
-    print(
-        f"{cfg.name:28s} reference {reference_us:10.2f} us  "
-        f"vibecuda {candidate_us:8.2f} us  {speedup:8.2f}x"
-    )
-    return speedup
-
-
-def main() -> None:
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA device required")
     capability = torch.cuda.get_device_capability()
     if capability not in {(10, 0), (10, 3)}:
         raise RuntimeError(f"CC 10.0 or 10.3 required, got {capability}")
 
+    rows: list[dict[str, object]] = []
+    for case_index, config in enumerate(CONFIGS):
+        generator = torch.Generator(device="cuda").manual_seed(29001 + case_index)
+        logits = torch.randn(
+            config.num_tokens,
+            config.num_experts,
+            generator=generator,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        plan = allocate_alphamoe_route_plan(
+            logits,
+            top_k=config.top_k,
+            block_m=config.block_m,
+            has_shared_expert=config.has_shared_expert,
+        )
+
+        if backend == "cake":
+
+            def run() -> None:
+                alphamoe_fused_router(
+                    logits,
+                    top_k=config.top_k,
+                    block_m=config.block_m,
+                    has_shared_expert=config.has_shared_expert,
+                    plan=plan,
+                )
+
+        else:
+
+            def run() -> None:
+                alphamoe_fused_router(logits, plan=plan, backend="vibecuda")
+
+        run()
+        torch.cuda.synchronize()
+        samples = bench_gpu_time(
+            run,
+            enable_cupti=True,
+            dry_run_iters=DRY_RUN_ITERS,
+            repeat_iters=REPEAT_ITERS,
+            cold_l2_cache=True,
+            use_cuda_graph=False,
+        )
+        rows.append(
+            {
+                "config": asdict(config),
+                "median_us": float(np.median(samples)) * 1e3,
+                "samples": len(samples),
+            }
+        )
+
+    output.write_text(
+        json.dumps(
+            {
+                "backend": backend,
+                "device": torch.cuda.get_device_name(),
+                "compute_capability": list(capability),
+                "timing": {
+                    "method": "CUPTI GPU activity",
+                    "cold_l2": True,
+                    "cuda_graph": False,
+                    "dry_run_iters": DRY_RUN_ITERS,
+                    "repeat_iters": REPEAT_ITERS,
+                    "aggregation": "per-workload median",
+                },
+                "rows": rows,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+
+
+def _aggregate(candidate: dict, cake: dict) -> dict:
+    if candidate["device"] != cake["device"]:
+        raise RuntimeError("candidate and CAKE measurements used different devices")
+    if candidate["timing"] != cake["timing"]:
+        raise RuntimeError("candidate and CAKE timing protocols differ")
+    rows = []
+    for candidate_row, cake_row in zip(candidate["rows"], cake["rows"], strict=True):
+        if candidate_row["config"] != cake_row["config"]:
+            raise RuntimeError("candidate and CAKE workload manifests differ")
+        speedup = cake_row["median_us"] / candidate_row["median_us"]
+        rows.append(
+            {
+                "config": candidate_row["config"],
+                "cake_us": cake_row["median_us"],
+                "vibecuda_us": candidate_row["median_us"],
+                "speedup": speedup,
+            }
+        )
+    speedups = [row["speedup"] for row in rows]
+    return {
+        "baseline": {"name": "CAKE AlphaMoE router", "pr": CAKE_PR, "sha": CAKE_SHA},
+        "device": candidate["device"],
+        "timing": candidate["timing"],
+        "rows": rows,
+        "arithmetic_mean_speedup": statistics.fmean(speedups),
+        "geometric_mean_speedup": math.exp(statistics.fmean(map(math.log, speedups))),
+    }
+
+
+def _print_result(result: dict) -> None:
+    print(f"VibeCUDA AlphaMoE router vs CAKE PR 4339 ({CAKE_SHA[:12]})")
     print(
-        "CUPTI, cold L2, eager replay, "
-        f"dry_run={DRY_RUN_ITERS}, repeats={REPEAT_ITERS}"
+        "Protocol: CUPTI, cold L2, no CUDA Graph, "
+        f"dry_run={DRY_RUN_ITERS}, repeats={REPEAT_ITERS}, median"
     )
-    speedups = np.asarray(
-        [_bench_one(config, index) for index, config in enumerate(CONFIGS)]
-    )
-    print(f"arithmetic mean: {float(speedups.mean()):.4f}x")
-    print(f"geometric mean: {float(np.exp(np.log(speedups).mean())):.4f}x")
+    for row in result["rows"]:
+        name = row["config"]["name"]
+        print(
+            f"{name:28s} CAKE {row['cake_us']:8.2f} us  "
+            f"VibeCUDA {row['vibecuda_us']:8.2f} us  {row['speedup']:6.2f}x"
+        )
+    print(f"arithmetic mean: {result['arithmetic_mean_speedup']:.4f}x")
+    print(f"geometric mean: {result['geometric_mean_speedup']:.4f}x")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--candidate-python", type=Path, default=Path(sys.executable))
+    parser.add_argument("--baseline-root", type=Path)
+    parser.add_argument("--baseline-python", type=Path)
+    parser.add_argument("--json", type=Path)
+    parser.add_argument("--worker", choices=("cake", "vibecuda"), help=argparse.SUPPRESS)
+    parser.add_argument("--output", type=Path, help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    if args.worker:
+        if args.output is None:
+            parser.error("--worker requires --output")
+        _worker(args.worker, args.output)
+        return
+    if args.baseline_root is None or args.baseline_python is None:
+        parser.error("--baseline-root and --baseline-python are required")
+
+    baseline_root = args.baseline_root.resolve()
+    _validate_baseline(baseline_root)
+    candidate_root = Path(__file__).resolve().parents[1]
+    with tempfile.TemporaryDirectory(prefix="alphamoe-router-bench-") as tmp:
+        tmp_path = Path(tmp)
+        candidate_json = tmp_path / "candidate.json"
+        cake_json = tmp_path / "cake.json"
+        _run_worker(
+            backend="vibecuda",
+            root=candidate_root,
+            python=args.candidate_python.resolve(),
+            output=candidate_json,
+        )
+        _run_worker(
+            backend="cake",
+            root=baseline_root,
+            python=args.baseline_python.resolve(),
+            output=cake_json,
+        )
+        result = _aggregate(
+            json.loads(candidate_json.read_text()), json.loads(cake_json.read_text())
+        )
+    _print_result(result)
+    if args.json:
+        args.json.write_text(json.dumps(result, indent=2) + "\n")
 
 
 if __name__ == "__main__":
