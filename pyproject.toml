@@ -97,6 +97,13 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
   "src/fp8_gemm/*.cu",
   "src/fp8_gemm/*.cuh",
 ]
+# Generated SM100 BF16 rank-major mega-MoE CUDA bundle. The runtime validates
+# the manifest checksum before compiling the source on demand.
+"flashinfer.moe_ep.kernel_src.blackwell_bf16_rank_major" = [
+  "*.md",
+  "src/*.cu",
+  "src/*.json",
+]
 "flashinfer.data" = ["csrc/**", "include/**"]
 "flashinfer.data.cutlass" = ["include/**", "tools/util/include/**"]
 "flashinfer.data.spdlog" = ["include/**"]

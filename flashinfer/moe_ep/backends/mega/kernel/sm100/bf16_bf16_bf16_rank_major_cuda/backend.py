@@ -191,5 +191,20 @@ class Bf16RankMajorCudaMegaKernelBackend(MegaKernelBackend):
         )
         return workspace.run(output)
 
+    def _workspace_pool_key(self, fleet_params: FleetParams) -> Any:
+        """Share the large communication/scratch workspace across model layers."""
+        return (
+            _KERNEL_NAME,
+            torch.cuda.current_device(),
+            self.ep_rank,
+            self.ep_world_size,
+            id(self.ep_comm_group),
+            fleet_params.num_experts,
+            fleet_params.max_tokens_per_rank,
+            fleet_params.token_hidden_size,
+            self._kernel_config.intermediate_size,
+            self._kernel_config.top_k,
+        )
+
 
 __all__ = ["Bf16RankMajorCudaMegaKernelBackend"]
