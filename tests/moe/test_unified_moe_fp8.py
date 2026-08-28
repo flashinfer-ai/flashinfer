@@ -506,7 +506,7 @@ def _run_from_logits_with_replay(layer, act_pack, weights, expected_ids):
     runner = layer.runners[0]
     inputs = runner.pack_inputs(act_pack, weights)
     routing_replay = torch.empty_like(expected_ids, dtype=torch.int16)
-    runner._static_kwargs["routing_replay_out"] = routing_replay
+    inputs = inputs.with_launch_overrides(routing_replay_out=routing_replay)
     actual = runner.forward(inputs, tactic=-1)
     torch.testing.assert_close(
         torch.sort(routing_replay.to(torch.int32), dim=-1).values,
@@ -1038,7 +1038,7 @@ def test_fp8_per_tensor_routing_replay_matches_reference():
     replay = torch.full(
         (TOKENS, TOP_K), -1, dtype=torch.int16, device=torch.device("cuda")
     )
-    runner._static_kwargs["routing_replay_out"] = replay
+    inputs = inputs.with_launch_overrides(routing_replay_out=replay)
     runner.forward(inputs)
     torch.testing.assert_close(
         replay.to(torch.int32).sort(dim=-1).values,

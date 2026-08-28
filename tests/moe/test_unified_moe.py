@@ -38,7 +38,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.autotuner import autotune
+from flashinfer.autotuner import TuningConfig, autotune
 from flashinfer.autotuner.autotuner import ProfilingCacheKey
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe import (
@@ -88,7 +88,11 @@ from flashinfer.fused_moe import (
     TrtllmMxInt4Config,
     TrtllmMxInt4RoutedRunner,
 )
-from flashinfer.fused_moe.runners import MoERunner
+from flashinfer.fused_moe.runners import (
+    MoERunner,
+    _TrtllmLaunchState,
+    _TrtllmPackedInputs,
+)
 from flashinfer.fused_moe.core import _fake_trtllm_moe_output
 from flashinfer.tllm_enums import DEFAULT_SITU_BETA, DEFAULT_SITU_LINEAR_BETA
 from flashinfer.utils import get_compute_capability
@@ -211,6 +215,46 @@ class TestTrtllmFakeOutputContract:
         assert result[0].shape == (4, 32)
         assert result[1].shape == (8,)
         assert result[2].shape == (17, 64)
+
+
+def test_trtllm_interleaved_packed_calls_keep_their_launch_state():
+    """A later pack must not replace the kwargs paired with an earlier call."""
+
+    class RecordingInner:
+        def __init__(self):
+            self.call_ids = []
+
+        def forward(self, inputs, **kwargs):
+            self.call_ids.append(kwargs["call_id"])
+            return inputs[0]
+
+    runner = TrtllmBf16RoutedRunner.__new__(TrtllmBf16RoutedRunner)
+    runner._built = True
+    runner._support_checked = True
+    runner.config = SimpleNamespace(
+        finalize=SimpleNamespace(do_finalize=True),
+    )
+    runner._inner = RecordingInner()
+
+    def pack(call_id):
+        return _TrtllmPackedInputs(
+            [torch.tensor([call_id])],
+            tuning_config=TuningConfig(),
+            launch_state=_TrtllmLaunchState({"call_id": call_id}),
+        )
+
+    first = pack(1)
+    second = pack(2)
+    runner.forward(first)
+    runner.forward(second)
+    runner.forward(first)
+
+    assert runner._inner.call_ids == [1, 2, 1]
+    assert isinstance(hash(first.launch_state), int)
+    with pytest.raises(TypeError):
+        first.launch_state.static_kwargs["call_id"] = 3
+    with pytest.raises(RuntimeError, match="pack_inputs must return"):
+        runner.tuning_config_for(list(first))
 
 
 # ---------------------------------------------------------------------------
@@ -2653,7 +2697,10 @@ class TestTrtllmRoutedPackingContract:
         )
         assert torch.equal(topk_ids & 0xFFFF, expected_bits)
         # The offset travels to the kernel as a separate argument.
-        assert runner._static_kwargs["local_expert_offset"] == local_expert_offset
+        assert (
+            inputs.launch_state.static_kwargs["local_expert_offset"]
+            == local_expert_offset
+        )
 
 
 @sm100_required
@@ -2700,16 +2747,15 @@ class TestTrtllmFp4UnpackedContract:
             ),
         )
 
-        moe_inputs = MoeRunnerInputs.from_list(
-            runner.pack_inputs(act_pack, weight_pack)
-        )
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        moe_inputs = MoeRunnerInputs.from_list(inputs)
         assert moe_inputs.topk_ids is ids
         assert moe_inputs.expert_weights is weights
         assert (
-            runner._static_kwargs["routing_input_mode"]
+            inputs.launch_state.static_kwargs["routing_input_mode"]
             == RoutingInputMode.UnpackedPrecomputed
         )
-        assert runner._static_kwargs["local_expert_offset"] == 32
+        assert inputs.launch_state.static_kwargs["local_expert_offset"] == 32
 
     @pytest.mark.parametrize(
         "activation",
@@ -2785,7 +2831,7 @@ class TestTrtllmFp4UnpackedContract:
 
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         assert moe_inputs.per_token_scale is act_pack.per_token_scale
-        assert runner._static_kwargs["per_token_scale"] is act_pack.per_token_scale
+        assert "per_token_scale" not in inputs.launch_state.static_kwargs
         assert runner._inner.use_per_token_scaling is True
         for _ in range(3):
             runner.forward(inputs, tactic=-1)
@@ -2975,9 +3021,8 @@ class TestTrtllmFromLogitsPackingContract:
             ),
         )
 
-        moe_inputs = MoeRunnerInputs.from_list(
-            runner.pack_inputs(act_pack, weight_pack)
-        )
+        inputs = runner.pack_inputs(act_pack, weight_pack)
+        moe_inputs = MoeRunnerInputs.from_list(inputs)
 
         # Kernel-filled OUTPUT buffers: bf16 weights (gh #3595), int32 ids.
         assert moe_inputs.expert_weights.dtype == torch.bfloat16, (
@@ -2990,7 +3035,8 @@ class TestTrtllmFromLogitsPackingContract:
         # Logits thread through unchanged; mode reaches the kernel kwargs.
         assert moe_inputs.routing_logits is routing_logits
         assert (
-            runner._static_kwargs["routing_input_mode"] == RoutingInputMode.FromLogits
+            inputs.launch_state.static_kwargs["routing_input_mode"]
+            == RoutingInputMode.FromLogits
         )
 
     def _make_bf16_from_logits_inputs(self, logits_dtype):
@@ -3019,12 +3065,15 @@ class TestTrtllmFromLogitsPackingContract:
 
     @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
     def test_bf16_expert_weights_buffer_is_bf16(self, logits_dtype):
-        runner, _, moe_inputs, logits = self._make_bf16_from_logits_inputs(logits_dtype)
+        runner, inputs, moe_inputs, logits = self._make_bf16_from_logits_inputs(
+            logits_dtype
+        )
         assert moe_inputs.routing_logits is logits
         assert moe_inputs.topk_ids.dtype == torch.int32
         assert moe_inputs.expert_weights.dtype == torch.bfloat16
         assert (
-            runner._static_kwargs["routing_input_mode"] == RoutingInputMode.FromLogits
+            inputs.launch_state.static_kwargs["routing_input_mode"]
+            == RoutingInputMode.FromLogits
         )
 
     @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
