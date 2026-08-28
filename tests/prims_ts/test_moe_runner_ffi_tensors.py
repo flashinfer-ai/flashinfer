@@ -25,6 +25,7 @@ from flashinfer.prims_ts.moe import runner as runner_module
 from flashinfer.prims_ts.moe.tensor_adapter import _get_expert_scale_ones
 from flashinfer.prims_ts.moe.runner import (
     PrimsTsBf16MoERunner,
+    PrimsTsMxfp4Mxfp8MoERunner,
     _moe_topk_ids_init_for_routing,
     _routed_token_capacity,
     _torch_views_of_ffi_tensors,
@@ -111,6 +112,19 @@ def test_topk_initializer_matches_routing_representation():
     assert _moe_topk_ids_init_for_routing(
         num_experts, RoutingInputMode.UnpackedPrecomputed
     ) is moe_topk_ids_init(num_experts, packed=False)
+
+
+def test_mxfp4_mxfp8_runner_initializes_runtime_routing_cache():
+    runner = PrimsTsMxfp4Mxfp8MoERunner(
+        object(),
+        top_k=4,
+        num_local_experts=8,
+        hidden_size=128,
+        intermediate_size=128,
+    )
+
+    assert runner._topk_initializer_source is None
+    assert runner._topk_initializer is None
 
 
 def test_gemm_launches_use_local_expert_count():

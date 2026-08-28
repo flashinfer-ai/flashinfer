@@ -1118,6 +1118,8 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = use_per_token_scaling
         self.num_experts = num_experts if num_experts is not None else num_local_experts
+        self._topk_initializer_source = None
+        self._topk_initializer = None
 
     def _make_tuning_config(
         self,
