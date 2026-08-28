@@ -2227,10 +2227,10 @@ class Fp8PerChannelLauncher : public FusedMoeLauncher {
           static_cast<int*>(const_cast<void*>(expert_indices_.data_ptr()));
     }
 
-    if (is_unpacked_routing()) {
-      args->mDtypeExpW = expert_weights_dtype(expert_weights_);
-    }
     if (has_precomputed(expert_weights_)) {
+      if (is_unpacked_routing()) {
+        args->mDtypeExpW = expert_weights_dtype(expert_weights_);
+      }
       workspace.expert_weights = const_cast<void*>(expert_weights_.data_ptr());
     } else {
       FusedMoeLauncher::expert_weights =
