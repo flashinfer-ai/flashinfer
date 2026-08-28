@@ -256,12 +256,11 @@ void SparseMlaSm120PagedAttention(
   const auto LSE_ptr = static_cast<float*>(out_lse.data_ptr());
 
   // Decode (num_tokens <= 64) is dispatched by Python directly through the
-  // standalone decode-dsv3_2 / decode-dsv4 entry points. The orchestrator
-  // only handles prefill.
-  TVM_FFI_ICHECK_GT(num_tokens, 64)
-      << "Decode (num_tokens <= 64) must go through sparse_mla_sm120_decode_dsv3_2 "
-         "or sparse_mla_sm120_decode_dsv4; got num_tokens="
-      << num_tokens;
+  // standalone decode-dsv3_2 / decode-dsv4 entry points. The prefill kernels
+  // launch one CTA group per query token and guard s_i >= num_tokens, so any
+  // num_tokens >= 1 is valid here.
+  TVM_FFI_ICHECK_GE(num_tokens, 1)
+      << "prefill requires num_tokens >= 1; got num_tokens=" << num_tokens;
 
   const bool ok = sparse_mla_prefill_dispatch(
       mt, num_heads, topk, page_block_size, extra_topk, extra_page_block_size, Q_ptr, KV_ptr,
