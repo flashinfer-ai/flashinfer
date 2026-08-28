@@ -37,12 +37,10 @@ from flashinfer.autotuner import (
     DynamicTensorSpec,
     TuningConfig,
     TunableRunner,
-)
-from flashinfer.fused_moe.shared.tuning import make_repeating_tensor_initializer
-from flashinfer.fused_moe.utils import (
     make_bucket_mapper,
     round_to_nearest_bucket,
 )
+from flashinfer.fused_moe.shared.tuning import make_repeating_tensor_initializer
 
 from flashinfer.utils import last_positive_power_of_2
 
@@ -1070,7 +1068,9 @@ def test_cold_l2_profile_uses_full_flush_buffer(monkeypatch):
 
     monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id: 4096)
     monkeypatch.setattr(torch, "empty", tracked_empty)
-    monkeypatch.setattr("flashinfer.autotuner.delay_kernel", lambda delay_us: None)
+    monkeypatch.setattr(
+        "flashinfer.autotuner.autotuner.delay_kernel", lambda delay_us: None
+    )
 
     latency = tuner._profile_single_kernel(runner, inputs, 0, config)
 
@@ -1269,7 +1269,9 @@ def test_value_aware_choose_one_stages_one_sample_fairly(monkeypatch):
     tuner = reset_autotuner()
     runner = ValueAwareCudaRunner()
     monkeypatch.setattr(tuner, "repeat", 4)
-    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 1024)
+    monkeypatch.setattr(
+        tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 1024
+    )
     num_tokens = 128
     top_k = 4
     num_experts = 32
@@ -1365,7 +1367,9 @@ def test_value_aware_profiles_expert_distributions_in_one_transaction(monkeypatc
     monkeypatch.setattr(tuner, "repeat", 4)
     monkeypatch.setattr(tuner, "warmup", 0)
     monkeypatch.setattr(tuner, "stream_delay_micro_secs", 0)
-    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 1024)
+    monkeypatch.setattr(
+        tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 1024
+    )
     operation_key = "value_aware_moe_distribution"
     num_tokens = 1024
     top_k = 4
@@ -1537,7 +1541,7 @@ def test_prepare_input_tensors_with_batches_preserves_non_tensor(
 ):
     """Cold-L2 batches clone tensors while preserving scalar and optional inputs."""
     tuner = reset_autotuner()
-    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 4)
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda device_id=None: 4)
     inputs = [torch.ones(1), non_tensor]
 
     batches = tuner._prepare_input_tensors_with_batches(
@@ -1991,9 +1995,7 @@ def test_find_nearest_profile_cache_dedups_moe_config_with_initializers():
     ],
 )
 def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, packed):
-    """_make_tuning_config must return configs whose topk_ids initializer is the
-    same object across calls and matches the launcher's routing representation.
-    """
+    """Tuning configs reuse a stable initializer that repeats live routes."""
     fn = core_mod._get_trtllm_moe_sm100_module_impl
     fn.cache_clear()
     try:
@@ -2020,10 +2022,20 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
             intermediate_size=14336,
             num_experts=128,
         )
+        expert_ids = torch.arange(64, dtype=torch.int32).reshape(8, 8) % 128
+        if packed:
+            bf16_one_bits = (
+                torch.tensor(1.0, dtype=torch.bfloat16).view(torch.int16).item()
+                & 0xFFFF
+            )
+            topk_ids = (expert_ids << 16) | bf16_one_bits
+        else:
+            topk_ids = expert_ids
+
         moe_inputs = MoeRunnerInputs(
             output=torch.empty((8, 4096)),
             routing_logits=None,
-            topk_ids=torch.zeros((8, 8), dtype=torch.int32),
+            topk_ids=topk_ids,
             expert_weights=None,
             hidden_states=torch.empty((8, 4096)),
             hidden_states_scale=None,
@@ -2048,16 +2060,14 @@ def test_make_tuning_config_reuses_topk_ids_initializer(routing_input_mode, pack
             "equivalent config reuses one initializer object instead of allocating "
             "a fresh closure on every call."
         )
-        assert init_a is moe_topk_ids_init(128, packed=packed)
+        generated = init_a((16, 8), torch.int32, torch.device("cpu"))
+        assert torch.equal(generated[:8], moe_inputs.topk_ids)
+        assert torch.equal(generated[8:], moe_inputs.topk_ids)
 
         initialized = init_a((8, 8), torch.int32, torch.device("cpu"))
         if packed:
             # Packed routing stores the expert ID in the high 16 bits and a
             # deterministic BF16 routing weight of 1.0 in the low 16 bits.
-            bf16_one_bits = (
-                torch.tensor(1.0, dtype=torch.bfloat16).view(torch.int16).item()
-                & 0xFFFF
-            )
             assert torch.all((initialized >> 16) < 128)
             assert torch.all((initialized & 0xFFFF) == bf16_one_bits)
         else:

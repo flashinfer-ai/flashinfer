@@ -534,6 +534,8 @@ class PrimsTsBf16MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         self.weight_layout = WeightLayout(weight_layout)
         self.use_per_token_scaling = use_per_token_scaling
         self.num_experts = num_experts if num_experts is not None else num_local_experts
+        self._topk_initializer_source = None
+        self._topk_initializer = None
 
     def _make_tuning_config(
         self,
@@ -1124,11 +1126,17 @@ class PrimsTsMxfp4Mxfp8MoERunner(_PrimsTsMoERunnerMixin, TunableRunner):
         routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
         **kwargs,
     ) -> TuningConfig:
-        init_packed_topk_ids = (
-            make_repeating_tensor_initializer(moe_inputs.topk_ids)
-            if moe_inputs.topk_ids is not None and moe_inputs.topk_ids.numel() > 0
-            else _moe_topk_ids_init_for_routing(self.num_experts, routing_input_mode)
-        )
+        if moe_inputs.topk_ids is not None and moe_inputs.topk_ids.numel() > 0:
+            if self._topk_initializer_source is not moe_inputs.topk_ids:
+                self._topk_initializer_source = moe_inputs.topk_ids
+                self._topk_initializer = make_repeating_tensor_initializer(
+                    moe_inputs.topk_ids
+                )
+            init_packed_topk_ids = self._topk_initializer
+        else:
+            init_packed_topk_ids = _moe_topk_ids_init_for_routing(
+                self.num_experts, routing_input_mode
+            )
 
         return make_moe_tuning_config(
             moe_inputs,

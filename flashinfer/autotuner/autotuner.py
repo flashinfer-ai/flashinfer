@@ -2177,8 +2177,14 @@ class AutoTuner:
             picks based on intrinsic kernel time.
         """
         if input_tensor_batches is None:
-            input_tensor_batches = self._prepare_input_tensors_with_batches(
-                inputs, tuning_config
+            uses_profile_arena = bool(
+                tuning_config.profile_arena_input_indices
+                or tuning_config.value_aware_input_indices
+            )
+            input_tensor_batches = (
+                self._prepare_input_tensors_with_batches(inputs, tuning_config)
+                if uses_profile_arena or not tuning_config.use_cold_l2_cache
+                else [inputs]
             )
 
         stream = torch.cuda.current_stream()
@@ -2218,23 +2224,25 @@ class AutoTuner:
             ends = [torch.cuda.Event(enable_timing=True) for _ in range(num_samples)]
             graph = torch.cuda.CUDAGraph() if tuning_config.use_cuda_graph else None
 
-            def _run_once():
-                runner(inputs, tactic=tactic, **kwargs)
+            def _run_once(profile_inputs):
+                runner(profile_inputs, tactic=tactic, **kwargs)
 
             with torch.cuda.stream(stream):
                 if graph is not None:
                     with torch.cuda.graph(graph):
-                        _run_once()
+                        _run_once(input_tensor_batches[-1])
                     # Exercise the captured graph before collecting samples;
                     # every measured replay below is cold independently.
                     graph.replay()
 
                 stream.synchronize()
-                delay_kernel(
+                delay_kernel_time_usec = (
                     self._CUDA_GRAPH_DELAY_MICRO_SECS
                     if graph is not None
                     else self.stream_delay_micro_secs
                 )
+                if delay_kernel_time_usec > 0:
+                    delay_kernel(delay_kernel_time_usec)
 
                 for sample_idx in range(num_samples):
                     flush_buffer.zero_()
@@ -2242,7 +2250,11 @@ class AutoTuner:
                     if graph is not None:
                         graph.replay()
                     else:
-                        _run_once()
+                        _run_once(
+                            input_tensor_batches[
+                                sample_idx % len(input_tensor_batches)
+                            ]
+                        )
                     ends[sample_idx].record(stream)
 
                 # One synchronization after all samples keeps host overhead
@@ -2305,7 +2317,8 @@ class AutoTuner:
                     if tuning_config.use_cuda_graph
                     else self.stream_delay_micro_secs
                 )
-                delay_kernel(delay_kernel_time_usec)
+                if delay_kernel_time_usec > 0:
+                    delay_kernel(delay_kernel_time_usec)
 
                 if tuning_config.use_cuda_graph:
                     profile_replays = tuning_config.cuda_graph_profile_replays

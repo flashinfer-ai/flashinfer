@@ -544,7 +544,7 @@ def test_validation_rejects_invalid_epi_tile_n(epi_tile_n, expected):
     ("overrides", "expected"),
     (
         ({"mma_m": 96}, "mma_m must be 64/128/256"),
-        ({"mma_n": 12}, "mma_n must be 8/16/32/64/128/256"),
+        ({"mma_n": 12}, "mma_n must be 8/16/32/64/128/192/256"),
     ),
 )
 def test_validation_rejects_invalid_mma_shape(overrides, expected):
