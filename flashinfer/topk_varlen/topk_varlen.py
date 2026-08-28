@@ -35,6 +35,7 @@ Backend choices
 ``"radix_filter"``   — filtered-radix (coarse histogram → filter → on-chip
                        refine); hint-free like ``"radix"``, large-N specialist.
                        Datacentre Blackwell-class (sm_100/103/107) only;
+                       requires nvidia-cutlass-dsl >= 4.8 (see below);
                        opt-in — never chosen by ``"auto"``.
 ``"auto"``           — GVR (if pre_idx provided) > radix (Blackwell) >
                        radix_cutlass (default).
@@ -1035,10 +1036,15 @@ _RADIX_FILTER_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 def _radix_filter_kernel_dsl_ok() -> bool:
     """Whether the installed CuTe DSL has the APIs the vendored kernel uses.
 
-    The vendored files target the ``cutlass.memory`` namespace (``SmemAllocator``,
-    ``get_smem_capacity_in_bytes``), which exists only in DSL releases newer than
-    this repo's minimum pin -- on the pinned floor the kernel raises
-    ``AttributeError`` from inside ``cute.compile``. Unlike the arch probe above,
+    The vendored kernels require **nvidia-cutlass-dsl >= 4.8**. They use the
+    ``cutlass.memory`` namespace (``SmemAllocator``,
+    ``get_smem_capacity_in_bytes``); 4.7.x exposes those APIs under
+    ``cutlass.utils`` instead, lacks the sm_107 architecture/capacity
+    metadata the Rubin sizing needs, and predates the ``cutlass.block``
+    namespace the TMA path uses -- so a 4.7 "compatibility alias" would not
+    actually run these kernels, and this repo's minimum DSL pin is older
+    still. On such environments the kernel would raise ``AttributeError``
+    from inside ``cute.compile``. Unlike the arch probe above,
     this one fails CLOSED: without the module the kernel definitely cannot run,
     so reporting unsupported (clean fallback / clean dispatch error) is strictly
     better than the deferred crash.
