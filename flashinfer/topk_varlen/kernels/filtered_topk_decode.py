@@ -1077,6 +1077,17 @@ def cute_dsl_radix_filter_topk_wrapper(
     ).run()
 
 
+# KNOWN LIMITATION (flashinfer PR #4621 review): the merge stage scans the
+# fixed num_ctas_per_row * top_k candidate width, which includes stage-one
+# padding. Padded (-1, -inf) entries and genuinely valid -inf elements have
+# identical radix keys, so when a row contains valid -inf values among its
+# top-k, the merge can emit -1 for slots that had valid candidates. A correct
+# fix needs either a pad encoding that sorts strictly below -inf (which would
+# change the shared trivial-branch padding and the -inf output contract) or
+# index-aware masking in the shared hot scan loops -- both cross-stage
+# redesigns belonging upstream. This path is NOT reachable from
+# flashinfer's public top_k_varlen (the wrapper uses the one-pass path
+# exclusively); do not route public traffic here until fixed.
 def _prepare_multi_pass_multi_cta_topk(
     input_values,
     seq_lens,
