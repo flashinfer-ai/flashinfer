@@ -45,7 +45,8 @@
 #include <flashinfer/attention/sparse_mla_sm120/arch/common.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/common/smem_layout.cuh>
 #include <flashinfer/attention/sparse_mla_sm120/model/kv_cache_traits.cuh>
-#include <flashinfer/attention/sparse_mla_sm120/prefill_kernel.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/prefill_mg_kernel.cuh>
+#include <flashinfer/attention/sparse_mla_sm120/prefill_swapab_kernel.cuh>
 
 namespace flashinfer::sparse_mla_sm120 {
 
