@@ -28,12 +28,24 @@ request metadata. Every `run` reads live paged-KV row offsets, physical page
 IDs, per-request K/V lengths, per-KV-head sparse routes, and optional token
 bits from device tensors. The physical-page ID tensor is capacity: its live
 prefix ends at `paged_kv_indptr[-1]`, which may be smaller than its `numel()`.
-The caller owns the live length value contract: dense K/V lengths must be in
+The caller owns every live value contract: dense K/V lengths must be in
 `[1, max_seq_len_kv]`, and causal lengths must be in `[Sq, max_seq_len_kv]`.
-Attention reads those lengths directly; out-of-range values are unsupported
-instead of guaranteed to fail closed. Given valid lengths, invalid page-table
-or route metadata fails the affected request or row closed to finite zero
-without a host synchronization.
+`paged_kv_indptr` must start at zero and contain bounded, monotone rows with at
+least `ceil(seq_lens_kv[b] / page_size)` entries; every physical page ID in
+the live prefix ending at `paged_kv_indptr[-1]` must lie in `[0, P)`. Every BSR
+row must have bounded offsets, strictly increasing unique block IDs, and at
+most the planned `max_blocks_per_row` entries. Contiguous IDs must lie below
+`ceil(seq_len_kv / kv_block_size)`; paged IDs must start below the owning
+request's live K/V length.
+
+Reusable wrappers validate tensor structure but read values directly without
+host synchronization. Invalid values therefore have undefined behavior and
+may access out of bounds. Set `CUTE_DSL_ENABLE_ASSERTIONS=1` before the process
+first compiles these kernels to diagnose violations encountered while preparing
+selected routes; such assertions report asynchronously and leave the CUDA
+context unusable. The one-shot APIs instead synchronize once to validate all
+live values, including the complete physical-page-ID prefix, before creating
+their temporary plans and cannot run during CUDA Graph capture.
 
 The one-shot `block_sparse_attention_with_paged_kv_cache` API takes
 `max_seq_len_kv` as the static capacity and requires `seq_lens_kv` with the

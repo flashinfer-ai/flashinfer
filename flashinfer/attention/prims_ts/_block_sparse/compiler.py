@@ -249,7 +249,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             valid_bits_fake,
             row_route_offsets_fake,
             route_workspace_fake,
-            Int32(-1),
+            Int32(0),
             Float32(1.0),
         )
     else:
@@ -307,7 +307,7 @@ def _compile_block_sparse(key: _BlockSparseCompileKey) -> Callable[..., object]:
             seq_lens_kv_fake,
             row_route_offsets_fake,
             route_workspace_fake,
-            Int32(-1),
+            Int32(0),
             Int64(1),
             Int64(1),
             Int64(1),

@@ -14,10 +14,9 @@
 
 """Runtime validation and launch adapter for block-sparse attention."""
 
-from collections.abc import Callable
 from dataclasses import dataclass
 import math
-from typing import Protocol
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -30,6 +29,9 @@ from ..decode import (
     _validate_scale,
 )
 from .common import _SIGNED_INT32_MAX
+
+if TYPE_CHECKING:
+    from .plan import _BlockSparsePlanState
 
 
 @dataclass(frozen=True)
@@ -76,64 +78,6 @@ class _BlockSparseRunArgs:
     kv_valid_bits_is_live: bool
     sm_scale: float
     paged_kv: _PagedKVLaunchPayload | None
-
-
-class _BlockSparsePlanStateLike(Protocol):
-    """Structural launch state shared by contiguous and paged wrappers."""
-
-    @property
-    def device(self) -> torch.device: ...
-
-    @property
-    def batch_size(self) -> int: ...
-
-    @property
-    def seq_len_q(self) -> int: ...
-
-    @property
-    def seq_len_kv(self) -> int: ...
-
-    @property
-    def num_qo_heads(self) -> int: ...
-
-    @property
-    def num_kv_heads(self) -> int: ...
-
-    @property
-    def head_dim(self) -> int: ...
-
-    @property
-    def q_block_size(self) -> int: ...
-
-    @property
-    def q_dtype(self) -> torch.dtype: ...
-
-    @property
-    def kv_dtype(self) -> torch.dtype: ...
-
-    @property
-    def output_dtype(self) -> torch.dtype: ...
-
-    @property
-    def use_kv_valid_bits(self) -> bool: ...
-
-    @property
-    def page_size(self) -> int | None: ...
-
-    @property
-    def dummy_kv_valid_bits(self) -> torch.Tensor | None: ...
-
-    @property
-    def row_route_offsets(self) -> torch.Tensor: ...
-
-    @property
-    def route_workspace(self) -> torch.Tensor: ...
-
-    @property
-    def max_blocks_per_row(self) -> int: ...
-
-    @property
-    def compiled(self) -> Callable[..., object]: ...
 
 
 def _validate_metadata_tensor(
@@ -215,6 +159,31 @@ def validate_block_sparse_metadata(
         raise ValueError("kv_valid_bits must be None when use_kv_valid_bits=False")
 
 
+def validate_paged_kv_metadata(
+    paged_kv_indptr: torch.Tensor,
+    paged_kv_indices: torch.Tensor,
+    seq_lens_kv: torch.Tensor,
+    *,
+    device: torch.device,
+    batch_size: int,
+) -> None:
+    """Validate the shared structural ABI for live paged request metadata."""
+
+    for tensor, name, shape in (
+        (paged_kv_indptr, "paged_kv_indptr", (batch_size + 1,)),
+        (paged_kv_indices, "paged_kv_indices", None),
+        (seq_lens_kv, "seq_lens_kv", (batch_size,)),
+    ):
+        _validate_metadata_tensor(
+            tensor,
+            name,
+            ndim=1,
+            dtype=torch.int32,
+            expected_device=device,
+            expected_shape=shape,
+        )
+
+
 def _validate_bshd_tensor(
     tensor: torch.Tensor,
     name: str,
@@ -240,28 +209,11 @@ def _validate_bshd_tensor(
     _validate_16byte_alignment(tensor, name)
 
 
-def _resolve_effective_kv_valid_bits(
-    *,
-    kv_valid_bits: torch.Tensor | None,
-    dummy_kv_valid_bits: torch.Tensor | None,
-    use_kv_valid_bits: bool,
-    missing_dummy_message: str,
-) -> torch.Tensor:
-    """Resolve the always-present runtime mask tensor for one launch."""
-
-    if use_kv_valid_bits:
-        assert kv_valid_bits is not None
-        return kv_valid_bits
-    if dummy_kv_valid_bits is None:
-        raise RuntimeError(missing_dummy_message)
-    return dummy_kv_valid_bits
-
-
 def validate_block_sparse_run(
     q: torch.Tensor,
     kv_storage: _ContiguousKVStorage | _PagedKVStorage,
     *,
-    state: _BlockSparsePlanStateLike,
+    state: "_BlockSparsePlanState",
     block_indptr: torch.Tensor,
     block_indices: torch.Tensor,
     kv_valid_bits: torch.Tensor | None,
@@ -289,12 +241,13 @@ def validate_block_sparse_run(
         q_block_size=state.q_block_size,
         use_kv_valid_bits=state.use_kv_valid_bits,
     )
-    effective_kv_valid_bits = _resolve_effective_kv_valid_bits(
-        kv_valid_bits=kv_valid_bits,
-        dummy_kv_valid_bits=state.dummy_kv_valid_bits,
-        use_kv_valid_bits=state.use_kv_valid_bits,
-        missing_dummy_message="unmasked block-sparse plan is missing its dummy mask",
-    )
+    if state.use_kv_valid_bits:
+        assert kv_valid_bits is not None
+        effective_kv_valid_bits = kv_valid_bits
+    else:
+        effective_kv_valid_bits = state.dummy_kv_valid_bits
+        if effective_kv_valid_bits is None:
+            raise RuntimeError("unmasked block-sparse plan is missing its dummy mask")
 
     q_shape = (state.batch_size, state.seq_len_q, state.num_qo_heads, state.head_dim)
     _validate_bshd_tensor(
@@ -371,28 +324,12 @@ def validate_block_sparse_run(
             raise ValueError(
                 f"K/V dtype must match the plan ({state.kv_dtype}), got {k.dtype}"
             )
-        _validate_metadata_tensor(
+        validate_paged_kv_metadata(
             kv_storage.paged_kv_indptr,
-            "paged_kv_indptr",
-            ndim=1,
-            dtype=torch.int32,
-            expected_device=state.device,
-            expected_shape=(state.batch_size + 1,),
-        )
-        _validate_metadata_tensor(
             kv_storage.paged_kv_indices,
-            "paged_kv_indices",
-            ndim=1,
-            dtype=torch.int32,
-            expected_device=state.device,
-        )
-        _validate_metadata_tensor(
             kv_storage.seq_lens_kv,
-            "seq_lens_kv",
-            ndim=1,
-            dtype=torch.int32,
-            expected_device=state.device,
-            expected_shape=(state.batch_size,),
+            device=state.device,
+            batch_size=state.batch_size,
         )
         paged_kv = _PagedKVLaunchPayload(
             paged_kv_indptr=kv_storage.paged_kv_indptr,
@@ -470,7 +407,7 @@ def record_block_sparse_run_args(
 def launch_block_sparse(
     run_args: _BlockSparseRunArgs,
     *,
-    state: _BlockSparsePlanStateLike,
+    state: "_BlockSparsePlanState",
 ) -> torch.Tensor:
     """Invoke the exact contiguous or paged ABI chosen by validated payload."""
 
@@ -520,4 +457,5 @@ __all__ = [
     "record_block_sparse_run_args",
     "validate_block_sparse_metadata",
     "validate_block_sparse_run",
+    "validate_paged_kv_metadata",
 ]
