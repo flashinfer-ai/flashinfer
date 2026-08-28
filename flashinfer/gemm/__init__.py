@@ -57,11 +57,15 @@ try:
             Sm100BlockScaledPersistentDenseGemmKernel as Sm100BlockScaledPersistentDenseGemmKernel,
             create_scale_factor_tensor as create_scale_factor_tensor,
         )
+        from .kernels.cute_dsl.low_latency_blockscaled_gemm import (
+            LowLatencyBlockscaledGemmKernel as LowLatencyBlockscaledGemmKernel,
+        )
 
         _cute_dsl_kernels = [
             "grouped_gemm_nt_masked",
             "Sm100BlockScaledPersistentDenseGemmKernel",
             "create_scale_factor_tensor",
+            "LowLatencyBlockscaledGemmKernel",
         ]
 
         # The SM107 kernel imports cutlass.utils.rubin_helpers at module scope,

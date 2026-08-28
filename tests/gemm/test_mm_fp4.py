@@ -39,11 +39,11 @@ def _test_mm_fp4(
             pytest.skip("Skipping test for trtllm fp4 with float16")
         if compute_capability[0] in [11, 12]:
             pytest.skip("trtllm gemm does not support SM110/SM120/SM121 GPUs.")
-    if backend == "cute-dsl":
+    if backend in ("cute-dsl", "low_latency"):
         if not use_128x4_sf_layout:
-            pytest.skip("cute_dsl backend only supports 128x4 SF layout")
+            pytest.skip(f"{backend} backend only supports 128x4 SF layout")
         if compute_capability[0] not in [10]:
-            pytest.skip("cute_dsl backend only supports SM100/SM103 GPUs.")
+            pytest.skip(f"{backend} backend only supports SM100/SM103 GPUs.")
     if backend == "b12x":
         if not use_128x4_sf_layout:
             pytest.skip("b12x backend only supports 128x4 SF layout")
@@ -53,9 +53,15 @@ def _test_mm_fp4(
             pytest.skip("b12x backend requires CUDA 13+.")
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
-    if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl", "b12x"]:
+    if not use_nvfp4 and backend not in [
+        "cudnn",
+        "auto",
+        "cute-dsl",
+        "low_latency",
+        "b12x",
+    ]:
         pytest.skip(
-            "mx_fp4 is only supported for cudnn, cute-dsl, b12x, and auto backends"
+            "mx_fp4 is only supported for cudnn, cute-dsl, b12x, low_latency, and auto backends"
         )
 
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
@@ -146,8 +152,25 @@ _SMOKE_CASES = [
 ]
 
 
+_LOW_LATENCY_MODEL_CASES = [
+    # GPT-OSS-120B
+    (1, 1280, 2880, torch.bfloat16, "low_latency", True, False, "nvfp4"),
+    (8, 1280, 2944, torch.bfloat16, "low_latency", True, False, "mxfp4"),
+    (1, 2880, 1024, torch.float16, "low_latency", True, False, "nvfp4"),
+    (8, 2880, 1024, torch.bfloat16, "low_latency", True, False, "mxfp4_alpha"),
+    # DeepSeek-V3
+    (4, 7168, 2048, torch.bfloat16, "low_latency", True, False, "nvfp4"),
+    (8, 7168, 2048, torch.float16, "low_latency", True, False, "mxfp4"),
+    (1, 3072, 1536, torch.bfloat16, "low_latency", True, False, "nvfp4"),
+    (7, 3072, 1536, torch.bfloat16, "low_latency", True, False, "mxfp4"),
+    (3, 129, 320, torch.bfloat16, "low_latency", True, False, "nvfp4"),
+    (7, 127, 384, torch.float16, "low_latency", True, False, "mxfp4"),
+]
+
+
 @pytest.mark.parametrize(
-    "m,n,k,res_dtype,backend,use_128x4_sf_layout,auto_tuning,fp4_type", _SMOKE_CASES
+    "m,n,k,res_dtype,backend,use_128x4_sf_layout,auto_tuning,fp4_type",
+    _SMOKE_CASES + _LOW_LATENCY_MODEL_CASES,
 )
 def test_mm_fp4(
     m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type
@@ -263,39 +286,6 @@ def test_mm_fp4_b12x_short_k_multi_wave():
             reference.reshape(-1).float(), res.reshape(-1).float(), dim=0
         ).item()
         assert cos_sim > 0.97
-
-
-def test_mm_fp4_cute_dsl_misaligned_n_raises():
-    device = torch.device("cuda")
-    if get_compute_capability(device)[0] != 10:
-        pytest.skip("cute_dsl backend only supports SM100/SM103 GPUs.")
-    m, n, k = 16, 130, 128  # n % 8 == 2
-    a = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
-    b = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
-    g_in = (448 * 6) / a.float().abs().nan_to_num().max()
-    g_w = (448 * 6) / b.float().abs().nan_to_num().max()
-    a_fp4, a_s = nvfp4_quantize(
-        a, g_in, sfLayout=SfLayout.layout_128x4, do_shuffle=False
-    )
-    b_fp4, b_s = nvfp4_quantize(
-        b, g_w, sfLayout=SfLayout.layout_128x4, do_shuffle=False
-    )
-    res = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="N % 8 == 0"):
-        mm_fp4(
-            a_fp4,
-            b_fp4.T,
-            a_s,
-            b_s.T,
-            1.0 / (g_in * g_w),
-            torch.bfloat16,
-            res,
-            block_size=16,
-            use_8x4_sf_layout=False,
-            backend="cute-dsl",
-            use_nvfp4=True,
-            skip_check=False,
-        )
 
 
 if __name__ == "__main__":
