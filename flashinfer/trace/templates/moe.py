@@ -4736,3 +4736,145 @@ cute_dsl_fused_moe_bf16_trace = TraceTemplate(
     },
     tags=["status:experimental", "backend:cute-dsl", "moe:sm90"],
 )
+
+
+# Standalone trtllm-gen finalize stage
+# ---------------------------------------------------------------------------
+
+
+def _trtllm_gen_moe_finalize_reference(
+    *,
+    gemm2_output: torch.Tensor,
+    expert_weights: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    lora_delta=None,
+    lora_delta_scale: float = 1.0,
+    lora_apply_expert_weights: bool = False,
+    **_unused,
+):
+    """Reference for the trtllm-gen MoE finalize stage.
+
+    out[t] = sum_k w[t, k] * gemm2_output[perm(t, k)] (skipping -1 slots)
+           + lora_delta_scale * sum_k s[t, k] * lora_delta[t, k] (all slots),
+    with s[t, k] = w[t, k] if lora_apply_expert_weights else 1.
+    """
+    num_tokens, top_k = expert_weights.shape
+    hidden = gemm2_output.shape[1]
+    e2p = expanded_idx_to_permuted_idx.reshape(num_tokens * top_k).long()
+    active = (e2p >= 0).unsqueeze(-1)
+    gathered = gemm2_output[e2p.clamp(min=0)].float() * active
+    out = (
+        gathered.reshape(num_tokens, top_k, hidden)
+        * expert_weights.float().unsqueeze(-1)
+    ).sum(dim=1)
+    if lora_delta is not None:
+        delta = lora_delta.float()
+        if delta.dim() == 2:
+            delta = delta.unsqueeze(1)
+        if lora_apply_expert_weights:
+            delta = delta * expert_weights.float().unsqueeze(-1)
+        out = out + lora_delta_scale * delta.sum(dim=1)
+    return out.to(gemm2_output.dtype)
+
+
+def _trtllm_gen_moe_finalize_init(
+    *,
+    num_tokens: int,
+    hidden_size: int = 2880,
+    top_k: int = 8,
+    # Derived: the synthetic permutation below is a bijection over the
+    # num_tokens * top_k expanded slots, so num_padded tracks it exactly.
+    num_padded: int = 0,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for the standalone trtllm-gen MoE finalize stage.
+
+    Uses a synthetic bijective permutation over the expanded slots with ~1/8
+    of the slots marked inactive (-1), mimicking an expert-parallel shard.
+    Delta rows of inactive slots are zero-filled per the op contract.
+    """
+    torch.manual_seed(seed)
+    num_expanded = num_tokens * top_k
+    gemm2_output = torch.randn(
+        num_expanded, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    expert_weights = torch.rand(num_tokens, top_k, dtype=torch.bfloat16, device=device)
+    expanded_idx_to_permuted_idx = torch.randperm(
+        num_expanded, dtype=torch.int32, device=device
+    ).reshape(num_tokens, top_k)
+    inactive = torch.rand(num_tokens, top_k, device=device) < 0.125
+    expanded_idx_to_permuted_idx = torch.where(
+        inactive, -1, expanded_idx_to_permuted_idx
+    )
+    lora_delta = torch.randn(
+        num_tokens, top_k, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    lora_delta[inactive] = 0
+    return {
+        "gemm2_output": gemm2_output,
+        "expert_weights": expert_weights,
+        "expanded_idx_to_permuted_idx": expanded_idx_to_permuted_idx,
+        "lora_delta": lora_delta,
+        "lora_delta_scale": 1.0,
+        "lora_apply_expert_weights": False,
+    }
+
+
+trtllm_gen_moe_finalize_trace = TraceTemplate(
+    op_type="moe_finalize",
+    name_prefix="trtllm_gen_moe_finalize",
+    description=(
+        "Standalone trtllm-gen MoE finalize stage: gathers the permuted FC2 "
+        "output rows through expanded_idx_to_permuted_idx, applies the expert "
+        "weights, and reduces over the top_k slots — the same token combine "
+        "the fused MoE launchers run when do_finalize=true. Optionally fuses "
+        "in a per-(token, slot) delta (e.g. a LoRA down-projection delta) "
+        "scaled by lora_delta_scale; delta rows are addressed by the expanded "
+        "index and accumulated unconditionally, so inactive slots' rows must "
+        "be zero-filled by the producer. The single hidden_size axis is "
+        "resolved from gemm2_output's width, so the template only describes "
+        "unpadded calls (hidden_size == gemm2_output.shape[1]); padded-hidden "
+        "invocations pass an explicit hidden_size kwarg the template does not "
+        "model."
+    ),
+    axes={
+        "num_tokens": Var(),
+        "hidden_size": Const(abbrev="h"),
+        "top_k": Const(abbrev="k"),
+        "num_padded": Var(
+            description="Number of permuted FC2 rows (num_tokens * top_k here)."
+        ),
+    },
+    inputs={
+        "gemm2_output": Tensor(
+            ["num_padded", "hidden_size"],
+            dtype="bfloat16",
+            description="Permuted, unfinalized FC2 output rows.",
+        ),
+        "expert_weights": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="bfloat16",
+            description="Per-slot routing weights.",
+        ),
+        "expanded_idx_to_permuted_idx": Tensor(
+            ["num_tokens", "top_k"],
+            dtype="int32",
+            description="Expanded slot -> permuted row; -1 marks inactive slots.",
+        ),
+        "lora_delta": Tensor(
+            ["num_tokens", "top_k", "hidden_size"],
+            dtype="bfloat16",
+            optional=True,
+            description="Optional fused delta; zero rows at inactive slots.",
+        ),
+        "lora_delta_scale": Scalar("float32"),
+        "lora_apply_expert_weights": Scalar("bool"),
+    },
+    outputs={
+        "out": Tensor(["num_tokens", "hidden_size"], dtype_from="gemm2_output"),
+    },
+    tags=["status:verified", "moe"],
+    reference=_trtllm_gen_moe_finalize_reference,
+    init=_trtllm_gen_moe_finalize_init,
+)

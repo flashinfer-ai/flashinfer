@@ -711,6 +711,20 @@ __global__ void finalizeKernel(KernelParams params) {
         }
       }
 
+      // Optional fused delta (e.g. LoRA down-projection). Indexed by the expanded
+      // (token, slot) row, not the permutation: inactive slots contribute their
+      // (producer-zero-filled) rows unconditionally.
+      if (params.loraDeltaPtr != nullptr) {
+        for (int k = 0; k < params.loraTopK; k++) {
+          int64_t const deltaRow = int64_t{tokenIdx} * params.loraTopK + k;
+          float delta = float{params.loraDeltaPtr[deltaRow * params.hiddenDim + hiddenIdx]};
+          if (params.loraApplyExpertWeights) {
+            delta *= float{params.expertWeightsPtr[tokenIdx * params.topK + k]};
+          }
+          data += params.loraDeltaScale * delta;
+        }
+      }
+
       params.outPtr[tokenIdx * params.hiddenDim + hiddenIdx] = static_cast<Type>(data);
     }
   }
@@ -933,6 +947,28 @@ __global__ void finalizeKernelVecLoad(KernelParams params) {
         threadOutput = threadOutput + scale * expertResult;
       }
     }
+
+    // Optional fused delta (e.g. LoRA down-projection). Indexed by the expanded
+    // (token, slot) row, not the permutation: inactive slots contribute their
+    // (producer-zero-filled) rows unconditionally.
+    if (params.loraDeltaPtr != nullptr) {
+      auto const* deltaElemPtr = reinterpret_cast<InputElem const*>(params.loraDeltaPtr);
+      for (int k = 0; k < params.loraTopK; k++) {
+        int64_t const deltaRow = tokenIdx * params.loraTopK + k;
+        float4 deltaRaw = vectorizedLoadPtx(
+            reinterpret_cast<float4 const*>(&deltaElemPtr[deltaRow * numElemsInCol + elemIndex]));
+        ComputeElem deltaElem =
+            arrayConvert<InputElem, ComputeElem>(*reinterpret_cast<InputElem const*>(&deltaRaw));
+        float scale = params.loraDeltaScale;
+        if (params.loraApplyExpertWeights) {
+          auto scaleArr =
+              *reinterpret_cast<ScaleArrayType const*>(&scaleArrSmem[k / TopKUnrollFactor]);
+          scale *= float{scaleArr[k % TopKUnrollFactor]};
+        }
+        threadOutput = threadOutput + scale * deltaElem;
+      }
+    }
+
     OutputElem outputElem = arrayConvert<ComputeElem, OutputElem>(threadOutput);
     outElemPtr[elemIndex] = outputElem;
   }
@@ -1004,6 +1040,9 @@ __global__ void finalizeDeepSeekKernel(KernelParams params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 void run(Data const& data, void* stream) {
+  // The DeepSeek FP8 finalize kernel does not implement the fused delta path.
+  FLASHINFER_CHECK(data.loraDeltaPtr == nullptr || !data.mUseDeepSeekFp8,
+                   "The fused finalize delta is not supported with DeepSeek FP8 finalize.");
   if (data.mUseDeepSeekFp8) {
     int const numThreads = 128;
     int const numBlocksX = (data.hiddenDim - 1 + numThreads) / numThreads;
