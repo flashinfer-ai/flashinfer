@@ -18,6 +18,12 @@ on:
       - 'scripts/build_patched_sccache.sh'
       - 'scripts/jit_cache_build_common.sh'
 
+concurrency:
+  # Superseded PR dry-runs only waste runner time; real release dispatches use
+  # unique groups so they remain independent and are never auto-cancelled.
+  group: release-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   setup:
     runs-on: ubuntu-latest
