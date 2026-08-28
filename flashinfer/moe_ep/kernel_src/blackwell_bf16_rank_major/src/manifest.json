@@ -1,0 +1,399 @@
+{
+  "arch": "sm_100a",
+  "compile_flags": [
+    "--use_fast_math"
+  ],
+  "constraints": {
+    "activation_dtype": "bfloat16",
+    "hidden_dim": 7168,
+    "intermediate_dim": 2048,
+    "layout": "rank_major",
+    "local_experts": 32,
+    "num_experts": 256,
+    "output_dtype": "bfloat16",
+    "tokens_per_rank": 128,
+    "top_k": 8,
+    "weight_dtype": "bfloat16",
+    "world_size": 8
+  },
+  "kernel_symbols": [
+    "kernel_rank_major_input_barrier_v1",
+    "kernel_rank_major_dispatch_v1",
+    "kernel_rank_major_route_reset_exact_v1",
+    "kernel_rank_major_route_count_exact_v1",
+    "kernel_rank_major_route_finalize_exact_v1",
+    "kernel_rank_major_route_scatter_exact_v1",
+    "kernel_rank_major_exact_fc1_swiglu_v1",
+    "kernel_trtllm_moe_bmm_tile_n64_fc2_bf16",
+    "kernel_rank_major_exact_unpermute_v1",
+    "kernel_rank_major_partial_barrier_v1",
+    "kernel_rank_major_combine_v1"
+  ],
+  "schema_version": 1,
+  "source_sha256": "9fe9c783921a3aef3da1bed0ae825195a4d85524b021a5c8bc785e304a11d5f6",
+  "stages": [
+    {
+      "bindings": [
+        "expert_ids",
+        "topk_ids",
+        "pg_world",
+        "pg_rank",
+        "pg_flags"
+      ],
+      "block": [
+        32,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "name": "input_barrier",
+      "pdl_launch": false,
+      "pdl_sync": false,
+      "scalar_bindings": [],
+      "symbol": "kernel_rank_major_input_barrier_v1",
+      "use_pdl": false
+    },
+    {
+      "bindings": [
+        "recv_hidden",
+        "recv_local_ids",
+        "recv_weights",
+        "pg_world",
+        "pg_rank",
+        "pg_flags",
+        "hidden_states",
+        "hidden_states_peers",
+        "topk_ids",
+        "topk_ids_peers",
+        "topk_weights",
+        "topk_weights_peers"
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 15488,
+      "grid": [
+        1024,
+        1,
+        1
+      ],
+      "name": "dispatch",
+      "pdl_launch": false,
+      "pdl_sync": false,
+      "scalar_bindings": [],
+      "symbol": "kernel_rank_major_dispatch_v1",
+      "use_pdl": false
+    },
+    {
+      "bindings": [
+        "expert_scatter_offsets",
+        "zero_sentinel"
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "name": "route_reset",
+      "pdl_launch": false,
+      "pdl_sync": false,
+      "scalar_bindings": [],
+      "symbol": "kernel_rank_major_route_reset_exact_v1",
+      "use_pdl": false
+    },
+    {
+      "bindings": [
+        "recv_local_ids",
+        "expert_scatter_offsets",
+        "token_to_permuted"
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        32,
+        1,
+        1
+      ],
+      "name": "route_count",
+      "pdl_launch": false,
+      "pdl_sync": false,
+      "scalar_bindings": [],
+      "symbol": "kernel_rank_major_route_count_exact_v1",
+      "use_pdl": false
+    },
+    {
+      "bindings": [
+        "expert_scatter_offsets",
+        "cta_to_expert",
+        "cta_to_mn_limit",
+        "expert_padded_row_offsets",
+        "num_non_exiting_ctas",
+        "total_padded_rows",
+        "route_map"
+      ],
+      "block": [
+        32,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "name": "route_finalize",
+      "pdl_launch": false,
+      "pdl_sync": false,
+      "scalar_bindings": [],
+      "symbol": "kernel_rank_major_route_finalize_exact_v1",
+      "use_pdl": false
+    },
+    {
+      "bindings": [
+        "recv_local_ids",
+        "expert_padded_row_offsets",
+        "route_map",
+        "token_to_permuted"
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        32,
+        1,
+        1
+      ],
+      "name": "route_scatter",
+      "pdl_launch": true,
+      "pdl_sync": false,
+      "scalar_bindings": [],
+      "symbol": "kernel_rank_major_route_scatter_exact_v1",
+      "use_pdl": false
+    },
+    {
+      "bindings": [
+        "weights",
+        "recv_hidden",
+        "compact_intermediate",
+        "route_map",
+        "num_non_exiting_ctas",
+        "cta_idx_y_to_batch_idx",
+        "cta_idx_y_to_mn_limit",
+        "K"
+      ],
+      "block": [
+        384,
+        1,
+        1
+      ],
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 223232,
+      "grid": [
+        32,
+        512,
+        1
+      ],
+      "name": "gemm1_swiglu",
+      "pdl_launch": true,
+      "pdl_sync": true,
+      "scalar_bindings": [
+        [
+          "K",
+          7168
+        ]
+      ],
+      "symbol": "kernel_rank_major_exact_fc1_swiglu_v1",
+      "use_pdl": true
+    },
+    {
+      "bindings": [
+        "A",
+        "B",
+        "C",
+        "num_non_exiting_ctas",
+        "cta_idx_y_to_batch_idx",
+        "cta_idx_y_to_mn_limit",
+        "K"
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        2,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 223360,
+      "grid": [
+        56,
+        512,
+        1
+      ],
+      "name": "gemm2",
+      "pdl_launch": true,
+      "pdl_sync": true,
+      "scalar_bindings": [
+        [
+          "K",
+          2048
+        ]
+      ],
+      "symbol": "kernel_trtllm_moe_bmm_tile_n64_fc2_bf16",
+      "use_pdl": true
+    },
+    {
+      "bindings": [
+        "expert_output",
+        "topk_weights",
+        "token_to_permuted",
+        "final_output",
+        "hidden_size"
+      ],
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 128,
+      "grid": [
+        1024,
+        1,
+        1
+      ],
+      "name": "local_unpermute",
+      "pdl_launch": false,
+      "pdl_sync": true,
+      "scalar_bindings": [
+        [
+          "hidden_size",
+          7168
+        ]
+      ],
+      "symbol": "kernel_rank_major_exact_unpermute_v1",
+      "use_pdl": true
+    },
+    {
+      "bindings": [
+        "pg_world",
+        "pg_rank",
+        "pg_flags"
+      ],
+      "block": [
+        32,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        1,
+        1,
+        1
+      ],
+      "name": "partial_barrier",
+      "pdl_launch": false,
+      "pdl_sync": false,
+      "scalar_bindings": [],
+      "symbol": "kernel_rank_major_partial_barrier_v1",
+      "use_pdl": false
+    },
+    {
+      "bindings": [
+        "output",
+        "pg_world",
+        "pg_rank",
+        "pg_flags",
+        "local_partials",
+        "local_partials_peers"
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_smem_bytes": 29696,
+      "grid": [
+        128,
+        1,
+        1
+      ],
+      "name": "combine",
+      "pdl_launch": false,
+      "pdl_sync": false,
+      "scalar_bindings": [],
+      "symbol": "kernel_rank_major_combine_v1",
+      "use_pdl": false
+    }
+  ]
+}
