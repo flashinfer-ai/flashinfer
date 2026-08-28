@@ -285,6 +285,14 @@ def test_next_n_group_abi_validated(backend):
     device = torch.device("cuda")
     if backend == "radix_filter":
         _skip_unless_radix_filter(device)
+    else:
+        # @backend_requirement rejects an unregistered backend/CC combination
+        # before the API body's next_n validation can run.
+        cc = get_compute_capability(device)
+        if not flashinfer.top_k_varlen.is_backend_supported(
+            backend, cc[0] * 10 + cc[1]
+        ):
+            pytest.skip(f"{backend} not supported on SM{cc[0]}{cc[1]}")
 
     logits = torch.randn(5, 4096, dtype=torch.float32, device=device)
     seq_lens = torch.full((2,), 4096, dtype=torch.int32, device=device)
@@ -330,7 +338,9 @@ def test_out_buffers_written_in_place():
         out_values=out_v,
         backend="radix_filter",
     )
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    # CPU activity alone records aten::copy_ at dispatch level; CUDA activity
+    # would pull in CUPTI, which is not stable on every pre-release stack.
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
         idx, vals = flashinfer.top_k_varlen(
             logits,
             seq_lens,
