@@ -82,9 +82,7 @@ def _build_persistent_scalar_schedule(
             break
         split_mask = reachable[split_load]
         light_tasks = [
-            task
-            for index, task in enumerate(pair_tasks)
-            if split_mask & (1 << index)
+            task for index, task in enumerate(pair_tasks) if split_mask & (1 << index)
         ]
         heavy_tasks = [
             task
@@ -110,9 +108,7 @@ def _build_persistent_scalar_schedule(
             ),
         )
         selected_indices = (light_index, middle_index, heavy_index)
-        selected_tasks = [
-            task for index in selected_indices for task in bins[index][2]
-        ]
+        selected_tasks = [task for index in selected_indices for task in bins[index][2]]
         selected_load = sum(chunks for _task, chunks in selected_tasks)
         heavy_load = bins[heavy_index][0]
         if selected_load > 1024:
@@ -141,9 +137,7 @@ def _build_persistent_scalar_schedule(
             break
         (first_load, second_load), assignment = min(
             reachable_pairs.items(),
-            key=lambda item: max(
-                item[0][0], item[0][1], selected_load - sum(item[0])
-            ),
+            key=lambda item: max(item[0][0], item[0][1], selected_load - sum(item[0])),
         )
         split_loads = (
             first_load,
@@ -169,10 +163,10 @@ def _build_persistent_scalar_schedule(
     schedule = [0] * (num_ctas * stride)
     for _load, cta, tasks in bins:
         slot = 0
-        for task, chunks in tasks:
+        for encoded_task, chunks in tasks:
             for local_chunk in range(chunks):
                 schedule[cta * stride + slot] = (
-                    task | (local_chunk << 10) | (chunks << 18)
+                    encoded_task | (local_chunk << 10) | (chunks << 18)
                 )
                 slot += 1
     return (

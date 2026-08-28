@@ -53,9 +53,7 @@ def test_flashkda_evolution_profile_is_frozen():
 def test_flashkda_evolution_module_ident_covers_all_included_sources(tmp_path):
     metadata = FLASH_KDA_EVOLUTION_VARIANTS["m128_h96_p1_s166"]
     (tmp_path / f"{metadata.source_stem}.cu").write_bytes(b"body")
-    (tmp_path / "cake_flashkda_blackwell_evolution_binding.cuh").write_bytes(
-        b"binding"
-    )
+    (tmp_path / "cake_flashkda_blackwell_evolution_binding.cuh").write_bytes(b"binding")
     common = tmp_path / "flashkda_binding_common.cuh"
     common.write_bytes(b"common-v1")
     first = _module_ident(tmp_path, metadata)
