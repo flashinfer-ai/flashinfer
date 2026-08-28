@@ -268,7 +268,11 @@ def _run_benchmark(
     # The same override must remain active for lookup as for profiling.  Without
     # it, explicit buckets are cached under one profile mapping and measured
     # under the API's default mapping, which can silently fall back to tactic -1.
-    with autotune(False, tuning_buckets=tuning_buckets_tuple):
+    with autotune(
+        False,
+        tuning_buckets=tuning_buckets_tuple,
+        cuda_graph_profile_replays=cuda_graph_profile_replays,
+    ):
         results = [
             BenchmarkResult(
                 setup.batch_size,
