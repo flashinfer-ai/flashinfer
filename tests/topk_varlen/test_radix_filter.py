@@ -295,3 +295,61 @@ def test_next_n_group_abi_validated(backend):
     # 5 rows cannot be 2 groups of next_n=2.
     with pytest.raises(ValueError, match=r"row // next_n"):
         flashinfer.top_k_varlen(logits, seq_lens, 512, next_n=2, backend=backend)
+
+
+def test_out_buffers_written_in_place():
+    """Caller-supplied out_indices/out_values must be kernel destinations.
+
+    Previously the wrapper always allocated its own outputs and the public
+    path copied into the caller's buffers -- an extra num_rows x top_k
+    allocation and D2D copy per call, and unstable destinations for CUDA
+    graphs. The profiler assertion has teeth: the old path launches
+    aten::copy_, the threaded path launches none.
+
+    Regression for PR #4621 review (out-buffer threading).
+    """
+    device = torch.device("cuda")
+    _skip_unless_radix_filter(device)
+
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.manual_seed(13)
+    B, N, k = 8, 16384, 1024
+    logits = torch.randn(B, N, dtype=torch.float32, device=device)
+    seq_lens = torch.full((B,), N, dtype=torch.int32, device=device)
+    out_i = torch.empty(B * k, dtype=torch.int32, device=device)
+    out_v = torch.empty(B * k, dtype=torch.float32, device=device)
+
+    # warm-up (compile outside the profiled region)
+    flashinfer.top_k_varlen(
+        logits,
+        seq_lens,
+        k,
+        return_values=True,
+        out_indices=out_i,
+        out_values=out_v,
+        backend="radix_filter",
+    )
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        idx, vals = flashinfer.top_k_varlen(
+            logits,
+            seq_lens,
+            k,
+            return_values=True,
+            out_indices=out_i,
+            out_values=out_v,
+            backend="radix_filter",
+        )
+        torch.cuda.synchronize()
+
+    assert idx.data_ptr() == out_i.data_ptr()
+    assert vals is not None and vals.data_ptr() == out_v.data_ptr()
+    copies = [e.key for e in prof.key_averages() if "aten::copy_" in e.key]
+    assert not copies, f"output copy still present: {copies}"
+
+    # and the results in the caller's buffers are correct
+    oi = out_i.view(B, k)
+    for b in range(B):
+        sel = oi[b][oi[b] >= 0]
+        kth = torch.topk(logits[b], k).values.min()
+        assert bool((logits[b][sel.long()] >= kth - 1e-4).all())

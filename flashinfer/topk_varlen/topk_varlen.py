@@ -1124,21 +1124,24 @@ def _run_radix_filter(
     # kernel launches on the current stream, so both must agree with where
     # the data lives on a multi-GPU host.
     with torch.cuda.device(logits.device):
+        # Caller-supplied buffers are threaded through to the kernel launch, so
+        # the kernel writes them directly: no per-call output allocation, no
+        # num_rows x top_k device copy, and CUDA-graph users keep stable
+        # destinations across replays.
         idx, val = cute_dsl_radix_filter_topk_wrapper(
             logits,
             seq_lens,
             top_k,
             next_n,
             return_val=return_output_values,
+            out_indices=out_indices,
+            out_values=out_values if return_output_values else None,
         )
 
-    if out_indices is not None and out_indices.data_ptr() != idx.data_ptr():
-        out_indices.copy_(idx)
-        idx = out_indices
-    if return_output_values and out_values is not None and val is not None:
-        if out_values.data_ptr() != val.data_ptr():
-            out_values.copy_(val)
-            val = out_values
+    if out_indices is not None:
+        idx = out_indices  # same storage; preserve the caller's shape/object
+    if return_output_values and out_values is not None:
+        val = out_values
     return idx, (val if return_output_values else None)
 
 

@@ -784,6 +784,8 @@ def _prepare_one_pass_topk(
     enable_tma_load_p3: bool | None = None,
     spill_capacity: int | None = None,
     spill_budget_bytes: int | None = None,
+    out_indices=None,
+    out_values=None,
 ):
     torch_dtype = input_values.dtype
     dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
@@ -959,13 +961,37 @@ def _prepare_one_pass_topk(
     else:
         compiled_kernel = compiled_filter_topk_dict[key]
 
-    output_indices_torch = torch.empty(
-        num_rows, top_k, dtype=torch.int32, device="cuda"
-    )
-    if return_val:
-        output_values_torch = torch.empty(
-            num_rows, top_k, dtype=torch_dtype, device="cuda"
+    # Kernel-writable destinations. Caller-provided buffers are used
+    # directly (the kernel writes every slot, including -1 / -inf padding,
+    # so no stale data survives); otherwise allocate on the INPUT device --
+    # not the ambient one -- so multi-GPU callers get outputs next to their
+    # data. DIVERGENCE FROM UPSTREAM (internal-only allocation), after
+    # review (flashinfer PR #4621): threading the buffers through avoids a
+    # full num_rows x top_k allocate+copy per public call and gives
+    # CUDA-graph users stable destinations.
+    def _as_out(buf, dtype_, what):
+        if buf is None:
+            return None
+        if not (buf.is_cuda and buf.dtype == dtype_):
+            raise ValueError(f"{what} must be a CUDA {dtype_} tensor")
+        if buf.numel() != num_rows * top_k or not buf.is_contiguous():
+            raise ValueError(
+                f"{what} must be contiguous with numel == num_rows * top_k "
+                f"({num_rows * top_k}), got numel={buf.numel()}"
+            )
+        return buf.view(num_rows, top_k)
+
+    output_indices_torch = _as_out(out_indices, torch.int32, "out_indices")
+    if output_indices_torch is None:
+        output_indices_torch = torch.empty(
+            num_rows, top_k, dtype=torch.int32, device=input_values.device
         )
+    if return_val:
+        output_values_torch = _as_out(out_values, torch_dtype, "out_values")
+        if output_values_torch is None:
+            output_values_torch = torch.empty(
+                num_rows, top_k, dtype=torch_dtype, device=input_values.device
+            )
     else:
         output_values_torch = None
 
@@ -1048,6 +1074,8 @@ def cute_dsl_radix_filter_topk_wrapper(
     enable_tma_load_p3: bool | None = None,
     spill_capacity: int | None = None,
     spill_budget_bytes: int | None = None,
+    out_indices=None,
+    out_values=None,
 ):
     """Compile and launch the one-pass decode wrapper.
 
@@ -1074,6 +1102,8 @@ def cute_dsl_radix_filter_topk_wrapper(
         enable_tma_load_p3=enable_tma_load_p3,
         spill_capacity=spill_capacity,
         spill_budget_bytes=spill_budget_bytes,
+        out_indices=out_indices,
+        out_values=out_values,
     ).run()
 
 
