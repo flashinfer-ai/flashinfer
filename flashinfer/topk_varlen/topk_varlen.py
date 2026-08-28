@@ -113,8 +113,17 @@ def _cute_dsl_supports_arch(major: int, minor: int) -> bool:
     for; this says whether the *installed* DSL can emit code for the device. The
     two differ on new silicon: a DSL release predating Rubin resolves ``sm_107a``
     to a ``KeyError`` deep inside ``cute.compile``. Consulting this here makes
-    ``backend="auto"`` fall back to ``radix_cutlass`` instead, and makes
-    ``is_backend_supported`` report the truth. Mirrors
+    ``backend="auto"`` fall back to ``radix_cutlass`` instead of crashing, and
+    an explicit ``backend=`` request fail at dispatch with a clear error.
+
+    Note the introspection helper ``top_k_varlen.is_backend_supported`` does
+    NOT consult this (or any) runtime probe: it answers the *static* question
+    -- is the backend registered and does FlashInfer ship a kernel for this
+    compute capability -- from the registration dict and the CC lists alone.
+    Environment gates (installed-DSL arch support, the ``cutlass.memory``
+    requirement of ``radix_filter``) apply only at call time, through the
+    per-backend checkers. A True from ``is_backend_supported`` therefore does
+    not guarantee a call will be accepted in this environment. Mirrors
     ``flashinfer.norm._cute_dsl_supports_arch``.
     """
     try:
