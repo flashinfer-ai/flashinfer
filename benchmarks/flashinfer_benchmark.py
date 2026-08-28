@@ -76,21 +76,32 @@ def run_test(args):
 
     # Write results to output file if specified
     if args.output_path is not None:
-        with open(args.output_path, "a") as fout:
-            for cur_res in res:
-                for key in full_output_columns:
-                    # Backfill every output column the routine didn't set: from
-                    # args when available, else "".  Covers columns belonging to
-                    # other routines (e.g. attention's s_qo) that would otherwise
-                    # KeyError below.  Routine-set values are preserved.
-                    if key not in cur_res or cur_res[key] == "":
-                        cur_res[key] = getattr(args, key, "")
+        # Ensure atomic writes when multiple processes write to the same file
+        import os
+        import fcntl
 
-                output_line = ",".join(
-                    [str(cur_res[col]) for col in full_output_columns]
-                )
-                fout.write(output_line + "\n")
-            fout.flush()
+        lock_path = args.output_path + ".lock"
+        lock_fd = open(lock_path, "w")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            with open(args.output_path, "a") as fout:
+                for cur_res in res:
+                    for key in full_output_columns:
+                        # Backfill every output column the routine didn't set: from
+                        # args when available, else "".  Covers columns belonging to
+                        # other routines (e.g. attention's s_qo) that would otherwise
+                        # KeyError below.  Routine-set values are preserved.
+                        if key not in cur_res or cur_res[key] == "":
+                            cur_res[key] = getattr(args, key, "")
+
+                    output_line = ",".join(
+                        [str(cur_res[col]) for col in full_output_columns]
+                    )
+                    fout.write(output_line + "\n")
+                fout.flush()
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            lock_fd.close()
     return
 
 
