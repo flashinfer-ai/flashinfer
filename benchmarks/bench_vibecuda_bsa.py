@@ -17,7 +17,8 @@ Block-sparse attention benchmark: VibeCUDA backend vs the CAKE (PR #4593) backen
 
 Runs the canonical GQA boolean-block-mask workload matrix (shared with
 tests/attention/test_cake_vsa.py and tests/attention/test_vibecuda_bsa.py)
-and times ``BlockSparseAttentionWrapper.run`` per backend with CUPTI
+and times ``BlockSparseAttentionWrapper.run`` into caller-owned, preallocated
+output/LSE buffers per backend with CUPTI
 (5 dry-run + 100 repeat iterations, median per workload), reporting
 per-workload latency, per-workload speedup (cake / vibecuda), and the
 arithmetic and geometric mean speedups.  Both backends are validated against
@@ -33,7 +34,6 @@ from pathlib import Path
 
 import torch
 
-import flashinfer
 from flashinfer.sparse import BlockSparseAttentionWrapper
 from flashinfer.testing.utils import bench_gpu_time
 
@@ -50,7 +50,9 @@ WORKLOADS = (
 )
 
 
-def make_inputs(block_size, dtype, num_qo_heads, num_kv_heads, head_dim, M, N, selected):
+def make_inputs(
+    block_size, dtype, num_qo_heads, num_kv_heads, head_dim, M, N, selected
+):
     torch.manual_seed(0)
     device = torch.device("cuda")
     mb, nb = M // block_size, N // block_size
@@ -71,9 +73,7 @@ def dense_reference(q, k, v, mask, block_size):
     v_heads = v.repeat_interleave(group, dim=1)
     scale = 1.0 / math.sqrt(q.shape[2])
     scores = torch.einsum("mhd,nhd->hmn", q.float(), k_heads.float()) * scale
-    token_mask = mask.repeat_interleave(block_size, 1).repeat_interleave(
-        block_size, 2
-    )
+    token_mask = mask.repeat_interleave(block_size, 1).repeat_interleave(block_size, 2)
     scores.masked_fill_(~token_mask, float("-inf"))
     reference = torch.einsum(
         "hmn,nhd->mhd", torch.softmax(scores, dim=-1), v_heads.float()
@@ -82,7 +82,9 @@ def dense_reference(q, k, v, mask, block_size):
     return reference, reference_lse
 
 
-def make_wrapper(backend, block_size, dtype, num_qo_heads, num_kv_heads, head_dim, M, N, mask):
+def make_wrapper(
+    backend, block_size, dtype, num_qo_heads, num_kv_heads, head_dim, M, N, mask
+):
     workspace = torch.empty((128 * 1024 * 1024,), dtype=torch.uint8, device="cuda")
     wrapper = BlockSparseAttentionWrapper(workspace, backend=backend)
     wrapper.plan(
@@ -113,18 +115,37 @@ def workload_label(row):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backends", nargs="+", default=["cake", "vibecuda"],
-                        help="Backends to benchmark (default: cake vibecuda)")
-    parser.add_argument("--dry-run-iters", type=int, default=5,
-                        help="CUPTI warmup iterations not timed (matches the "
-                             "canonical suite contract; default: 5)")
-    parser.add_argument("--repeat-iters", type=int, default=100,
-                        help="CUPTI measured iterations (matches the canonical "
-                             "suite contract; default: 100)")
-    parser.add_argument("--no-refcheck", action="store_true",
-                        help="Skip dense-reference correctness checks")
-    parser.add_argument("--output", type=str, default=None,
-                        help="Optional JSON artifact path for the results")
+    parser.add_argument(
+        "--backends",
+        nargs="+",
+        default=["cake", "vibecuda"],
+        help="Backends to benchmark (default: cake vibecuda)",
+    )
+    parser.add_argument(
+        "--dry-run-iters",
+        type=int,
+        default=5,
+        help="CUPTI warmup iterations not timed (matches the "
+        "canonical suite contract; default: 5)",
+    )
+    parser.add_argument(
+        "--repeat-iters",
+        type=int,
+        default=100,
+        help="CUPTI measured iterations (matches the canonical "
+        "suite contract; default: 100)",
+    )
+    parser.add_argument(
+        "--no-refcheck",
+        action="store_true",
+        help="Skip dense-reference correctness checks",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Optional JSON artifact path for the results",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
@@ -137,8 +158,17 @@ def main():
 
     results = []
     for row in WORKLOADS:
-        (block_size, dtype, num_qo_heads, num_kv_heads, head_dim, M, N,
-         selected, return_lse) = row
+        (
+            block_size,
+            dtype,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            M,
+            N,
+            selected,
+            return_lse,
+        ) = row
         label = workload_label(row)
         q, k, v, mask = make_inputs(
             block_size, dtype, num_qo_heads, num_kv_heads, head_dim, M, N, selected
@@ -147,23 +177,49 @@ def main():
         reference, reference_lse = None, None
         for backend in args.backends:
             wrapper = make_wrapper(
-                backend, block_size, dtype, num_qo_heads, num_kv_heads, head_dim,
-                M, N, mask,
+                backend,
+                block_size,
+                dtype,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                M,
+                N,
+                mask,
+            )
+            output = torch.empty_like(q)
+            lse = (
+                torch.empty((M, num_qo_heads), dtype=torch.float32, device=q.device)
+                if return_lse
+                else None
             )
             if not args.no_refcheck:
                 if reference is None:
-                    reference, reference_lse = dense_reference(q, k, v, mask, block_size)
+                    reference, reference_lse = dense_reference(
+                        q, k, v, mask, block_size
+                    )
                 # Untimed sentinel-prefill/full-write check: poison the output
                 # of a first call by pre-filling via a preallocated buffer when
                 # the backend supports out=, then validate the full result.
-                result = wrapper.run(q, k, v, return_lse=return_lse)
-                output, lse = result if return_lse else (result, None)
-                torch.testing.assert_close(output, reference, atol=1e-2, rtol=1e-2,
-                                           msg=lambda m: f"{backend} {label}: {m}")
+                result = wrapper.run(
+                    q, k, v, out=output, lse=lse, return_lse=return_lse
+                )
+                output, returned_lse = result if return_lse else (result, None)
+                torch.testing.assert_close(
+                    output,
+                    reference,
+                    atol=1e-2,
+                    rtol=1e-2,
+                    msg=lambda m: f"{backend} {label}: {m}",
+                )
                 if return_lse:
-                    torch.testing.assert_close(lse, reference_lse, atol=1e-2,
-                                               rtol=1e-2,
-                                               msg=lambda m: f"{backend} {label} lse: {m}")
+                    torch.testing.assert_close(
+                        returned_lse,
+                        reference_lse,
+                        atol=1e-2,
+                        rtol=1e-2,
+                        msg=lambda m: f"{backend} {label} lse: {m}",
+                    )
             # Sentinel prefill through the public out= parameter: the timed
             # callable must overwrite every element it claims to produce.
             poisoned = torch.full_like(q, float("nan"))
@@ -174,7 +230,9 @@ def main():
             )
 
             times = bench_gpu_time(
-                lambda: wrapper.run(q, k, v, return_lse=return_lse),
+                lambda: wrapper.run(
+                    q, k, v, out=output, lse=lse, return_lse=return_lse
+                ),
                 dry_run_iters=args.dry_run_iters,
                 repeat_iters=args.repeat_iters,
                 enable_cupti=True,
@@ -188,13 +246,19 @@ def main():
                 "max_ms": times[-1],
                 "iters": len(times),
                 "timing": "cupti",
+                "output_allocation": "outside_timed_region",
+                "plan": "outside_timed_region",
             }
-            print(f"  [{label}] {backend}: {median_ms:.6f} ms "
-                  f"(min {times[0]:.6f}, max {times[-1]:.6f}, "
-                  f"{len(times)} CUPTI iters)")
+            print(
+                f"  [{label}] {backend}: {median_ms:.6f} ms "
+                f"(min {times[0]:.6f}, max {times[-1]:.6f}, "
+                f"{len(times)} CUPTI iters)"
+            )
         if "cake" in entry["backends"] and "vibecuda" in entry["backends"]:
-            speedup = (entry["backends"]["cake"]["median_ms"]
-                       / entry["backends"]["vibecuda"]["median_ms"])
+            speedup = (
+                entry["backends"]["cake"]["median_ms"]
+                / entry["backends"]["vibecuda"]["median_ms"]
+            )
             entry["speedup_cake_over_vibecuda"] = speedup
         results.append(entry)
 

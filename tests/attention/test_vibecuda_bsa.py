@@ -44,9 +44,7 @@ def _dense_reference(q, k, v, mask, block_size):
     v_heads = v.repeat_interleave(group, dim=1)
     scale = 1.0 / math.sqrt(q.shape[2])
     scores = torch.einsum("mhd,nhd->hmn", q.float(), k_heads.float()) * scale
-    token_mask = mask.repeat_interleave(block_size, 1).repeat_interleave(
-        block_size, 2
-    )
+    token_mask = mask.repeat_interleave(block_size, 1).repeat_interleave(block_size, 2)
     scores.masked_fill_(~token_mask, float("-inf"))
     reference = torch.einsum(
         "hmn,nhd->mhd", torch.softmax(scores, dim=-1), v_heads.float()
@@ -55,7 +53,9 @@ def _dense_reference(q, k, v, mask, block_size):
     return reference, reference_lse
 
 
-def _make_inputs(block_size, dtype, num_qo_heads, num_kv_heads, head_dim, M, N, selected):
+def _make_inputs(
+    block_size, dtype, num_qo_heads, num_kv_heads, head_dim, M, N, selected
+):
     torch.manual_seed(0)
     device = torch.device("cuda")
     mb, nb = M // block_size, N // block_size
@@ -167,8 +167,14 @@ def test_vibecuda_bsa_functional_against_dense_reference(
         ws = torch.zeros(ws_numel, dtype=torch.float32, device=q.device)
 
     result = vibecuda_block_sparse_attention(
-        q, k, v, mask, block_size, return_lse=return_lse,
-        workspace=ws, split_g=split_g,
+        q,
+        k,
+        v,
+        mask,
+        block_size,
+        return_lse=return_lse,
+        workspace=ws,
+        split_g=split_g,
     )
     output, lse = result if return_lse else (result, None)
     torch.testing.assert_close(output, reference, atol=1e-2, rtol=1e-2)
@@ -196,7 +202,9 @@ def test_vibecuda_bsa_out_and_sm_scale_parameters(dtype):
 
     sm_scale = 0.5 / math.sqrt(head_dim)
     out = torch.full_like(q, float("nan"))
-    lse = torch.full((M, num_qo_heads), float("nan"), dtype=torch.float32, device=device)
+    lse = torch.full(
+        (M, num_qo_heads), float("nan"), dtype=torch.float32, device=device
+    )
     result = vibecuda_block_sparse_attention(
         q, k, v, mask, block_size, sm_scale=sm_scale, out=out, lse=lse, return_lse=True
     )
@@ -207,11 +215,14 @@ def test_vibecuda_bsa_out_and_sm_scale_parameters(dtype):
     assert torch.isfinite(lse).all()
 
     group = num_qo_heads // num_kv_heads
-    scores = torch.einsum(
-        "mhd,nhd->hmn",
-        q.float(),
-        k.repeat_interleave(group, dim=1).float(),
-    ) * sm_scale
+    scores = (
+        torch.einsum(
+            "mhd,nhd->hmn",
+            q.float(),
+            k.repeat_interleave(group, dim=1).float(),
+        )
+        * sm_scale
+    )
     token_mask = mask.repeat_interleave(block_size, 1).repeat_interleave(block_size, 2)
     scores.masked_fill_(~token_mask, float("-inf"))
     reference = torch.einsum(

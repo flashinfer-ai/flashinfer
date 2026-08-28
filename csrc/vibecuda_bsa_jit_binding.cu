@@ -15,9 +15,8 @@
  */
 #include "tvm_ffi_utils.h"
 
-void vibecuda_bsa_fwd(TensorView out, TensorView lse, TensorView q, TensorView k,
-                      TensorView v, TensorView block_mask, TensorView workspace,
-                      int64_t block_size, double sm_scale, int64_t split_g,
-                      bool return_lse);
+void vibecuda_bsa_fwd(TensorView out, TensorView lse, TensorView q, TensorView k, TensorView v,
+                      TensorView block_mask, TensorView workspace, int64_t block_size,
+                      double sm_scale, int64_t split_g, bool return_lse);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(vibecuda_bsa_fwd, vibecuda_bsa_fwd);

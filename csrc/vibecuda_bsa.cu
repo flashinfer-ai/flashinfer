@@ -33,10 +33,9 @@ inline void check_contiguous_3d(const TensorView& t, const char* name) {
 
 }  // namespace
 
-void vibecuda_bsa_fwd(TensorView out, TensorView lse, TensorView q, TensorView k,
-                      TensorView v, TensorView block_mask, TensorView workspace,
-                      int64_t block_size, double sm_scale, int64_t split_g,
-                      bool return_lse) {
+void vibecuda_bsa_fwd(TensorView out, TensorView lse, TensorView q, TensorView k, TensorView v,
+                      TensorView block_mask, TensorView workspace, int64_t block_size,
+                      double sm_scale, int64_t split_g, bool return_lse) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(block_mask);
   CHECK_DEVICE(out, q);
@@ -55,18 +54,15 @@ void vibecuda_bsa_fwd(TensorView out, TensorView lse, TensorView q, TensorView k
   TVM_FFI_ICHECK(D == 64 || D == 96 || D == 128)
       << "vibecuda_bsa_fwd requires head_dim in {64, 96, 128} (got " << D << ")";
   TVM_FFI_ICHECK(block_size % 64 == 0)
-      << "vibecuda_bsa_fwd requires block_size to be a multiple of 64 (got " << block_size
-      << ")";
+      << "vibecuda_bsa_fwd requires block_size to be a multiple of 64 (got " << block_size << ")";
   TVM_FFI_ICHECK(split_g >= 1 && split_g <= 16)
       << "vibecuda_bsa_fwd requires 1 <= split_g <= 16 (got " << split_g << ")";
 
   const int64_t q_dtype = encode_dlpack_dtype(q.dtype());
   TVM_FFI_ICHECK(q_dtype == bfloat16_code || q_dtype == float16_code)
       << "vibecuda_bsa_fwd requires bfloat16 or float16 q";
-  TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(k.dtype()), q_dtype)
-      << "k must have the same dtype as q";
-  TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(v.dtype()), q_dtype)
-      << "v must have the same dtype as q";
+  TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(k.dtype()), q_dtype) << "k must have the same dtype as q";
+  TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(v.dtype()), q_dtype) << "v must have the same dtype as q";
   TVM_FFI_ICHECK(k.size(2) == D && v.size(0) == N && v.size(1) == HKV && v.size(2) == D)
       << "k/v must have matching [N, num_kv_heads, head_dim] shapes";
   TVM_FFI_ICHECK(HQ >= HKV && HQ % HKV == 0)
@@ -78,8 +74,7 @@ void vibecuda_bsa_fwd(TensorView out, TensorView lse, TensorView q, TensorView k
       << "block_mask must have dtype bool";
   const int64_t MB = (M + block_size - 1) / block_size;
   const int64_t NB = (N + block_size - 1) / block_size;
-  TVM_FFI_ICHECK(block_mask.size(0) == HQ && block_mask.size(1) == MB &&
-                 block_mask.size(2) == NB)
+  TVM_FFI_ICHECK(block_mask.size(0) == HQ && block_mask.size(1) == MB && block_mask.size(2) == NB)
       << "block_mask must have shape (num_qo_heads=" << HQ << ", ceil(M/block_size)=" << MB
       << ", ceil(N/block_size)=" << NB << "), got (" << block_mask.size(0) << ", "
       << block_mask.size(1) << ", " << block_mask.size(2) << ")";
@@ -112,8 +107,7 @@ void vibecuda_bsa_fwd(TensorView out, TensorView lse, TensorView q, TensorView k
         << "split workspace too small: need at least " << required << " float32 elements "
         << "(split_g=" << split_g << ", rows_pad=" << rows_pad << ", num_qo_heads=" << HQ
         << ", head_dim+4=" << (D + 4) << "), got " << workspace.numel();
-    TVM_FFI_ICHECK_EQ(workspace.stride(workspace.ndim() - 1), 1)
-        << "workspace must be contiguous";
+    TVM_FFI_ICHECK_EQ(workspace.stride(workspace.ndim() - 1), 1) << "workspace must be contiguous";
     ows_ptr = static_cast<float*>(workspace.data_ptr());
   }
 
@@ -123,9 +117,8 @@ void vibecuda_bsa_fwd(TensorView out, TensorView lse, TensorView q, TensorView k
   const cudaStream_t stream = get_stream(q.device());
   const cudaError_t status = VibeCUDABSAFwdRaw(
       out.data_ptr(), lse_ptr, q.data_ptr(), k.data_ptr(), v.data_ptr(),
-      static_cast<const bool*>(block_mask.data_ptr()), ows_ptr, (int)M, (int)N,
-      (int)HQ, (int)HKV, (int)D, (int)block_size, return_lse, (int)split_g, is_bf16,
-      (float)sm_scale, stream);
+      static_cast<const bool*>(block_mask.data_ptr()), ows_ptr, (int)M, (int)N, (int)HQ, (int)HKV,
+      (int)D, (int)block_size, return_lse, (int)split_g, is_bf16, (float)sm_scale, stream);
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "vibecuda_bsa_fwd failed with error " << cudaGetErrorString(status);
 }

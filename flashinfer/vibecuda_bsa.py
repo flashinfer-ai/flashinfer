@@ -82,11 +82,7 @@ def vibecuda_bsa_split_g(max_selected_blocks: int, block_size: int, n: int) -> i
         Number of key/value tokens ``N``.
     """
     cap = max(1, (n + 63) // 64)
-    est = (
-        max_selected_blocks * (block_size // 64)
-        if max_selected_blocks > 0
-        else cap
-    )
+    est = max_selected_blocks * (block_size // 64) if max_selected_blocks > 0 else cap
     return min(max(est // 2, 2), 16, cap) if est >= 8 else 1
 
 
@@ -228,7 +224,12 @@ def vibecuda_block_sparse_attention(
         if lse is None:
             lse = torch.empty((M, HQ), dtype=torch.float32, device=q.device)
     else:
-        lse = torch.empty(0, dtype=torch.float32, device=q.device)
+        if lse is None:
+            lse = torch.empty(0, dtype=torch.float32, device=q.device)
+        elif lse.numel() != 0 or lse.dtype != torch.float32 or lse.device != q.device:
+            raise ValueError(
+                "unused lse must be an empty float32 tensor on the query device"
+            )
     g = 1 if split_g is None else int(split_g)
     if not (1 <= g <= 16):
         raise ValueError(f"split_g must be in [1, 16] (got {g})")

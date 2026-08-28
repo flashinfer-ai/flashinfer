@@ -616,8 +616,7 @@ class BlockSparseAttentionWrapper:
             arch = cc[0] * 10 + cc[1]
             if cc not in ((10, 0), (10, 3)):
                 raise RuntimeError(
-                    f"vibecuda backend requires SM100/SM103, "
-                    f"current device is SM{arch}"
+                    f"vibecuda backend requires SM100/SM103, current device is SM{arch}"
                 )
             # Square blocks at 64-token granularity match the kernel's staged
             # 64-key chunk pipeline.
@@ -689,6 +688,9 @@ class BlockSparseAttentionWrapper:
                 torch.zeros(ws_numel, dtype=torch.float32, device=self.device)
                 if ws_numel > 0
                 else None
+            )
+            self._vibecuda_empty_lse = torch.empty(
+                0, dtype=torch.float32, device=self.device
             )
             self.M = M
             self.N = N
@@ -1216,9 +1218,7 @@ class BlockSparseAttentionWrapper:
             from flashinfer.vibecuda_bsa import vibecuda_block_sparse_attention
 
             if scale_q is not None or scale_k is not None or scale_v is not None:
-                raise ValueError(
-                    "vibecuda backend does not accept FP8 scale tensors"
-                )
+                raise ValueError("vibecuda backend does not accept FP8 scale tensors")
             if getattr(self, "_vibecuda_block_mask", None) is None:
                 raise RuntimeError("plan() must be called before run()")
             return vibecuda_block_sparse_attention(
@@ -1229,7 +1229,7 @@ class BlockSparseAttentionWrapper:
                 self.R,
                 sm_scale=self._sm_scale,
                 out=out,
-                lse=lse,
+                lse=lse if return_lse else self._vibecuda_empty_lse,
                 return_lse=return_lse,
                 workspace=self._vibecuda_workspace,
                 split_g=self._vibecuda_split_g,
