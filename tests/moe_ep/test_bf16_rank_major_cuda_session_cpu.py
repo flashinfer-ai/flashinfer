@@ -107,9 +107,11 @@ def test_fc1_weight_tensor_map_matches_kernel_transaction_bytes():
     module = _session_module()
 
     assert module._FC1_WEIGHT_BOX_DIM == (64, 128, 2, 1)
-    assert torch.tensor([], dtype=torch.bfloat16).element_size() * math.prod(
-        module._FC1_WEIGHT_BOX_DIM
-    ) == 32768
+    assert (
+        torch.tensor([], dtype=torch.bfloat16).element_size()
+        * math.prod(module._FC1_WEIGHT_BOX_DIM)
+        == 32768
+    )
 
 
 def test_packaged_source_manifest_is_complete_and_self_consistent():
