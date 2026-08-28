@@ -490,6 +490,44 @@ def test_get_aot_path_selects_provider_for_target_arch(monkeypatch, tmp_path):
     assert jit_env.get_aot_path("attention_module") == expected
 
 
+@pytest.mark.parametrize(
+    ("provider_architecture", "target_architecture"),
+    [
+        ("sm100a", "sm103a"),
+        ("sm120f", "sm121a"),
+        ("sm80", "sm86"),
+    ],
+)
+def test_get_aot_path_does_not_infer_provider_compatibility(
+    monkeypatch,
+    tmp_path,
+    provider_architecture,
+    target_architecture,
+):
+    legacy_root = tmp_path / "legacy"
+    provider_root = tmp_path / provider_architecture
+    _create_aot_module(provider_root, "attention_module")
+    provider = jit_env.AOTProvider(
+        provider_id=provider_architecture,
+        distribution=f"flashinfer-jit-cache-{provider_architecture}",
+        version="0.6.16+cu130",
+        jit_cache_dir=provider_root,
+        cuda_architectures=frozenset({provider_architecture}),
+        modules=frozenset({"attention_module"}),
+    )
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_DIR", legacy_root)
+    monkeypatch.setattr(jit_env, "FLASHINFER_AOT_PROVIDERS", (provider,))
+    monkeypatch.setattr(
+        jit_env,
+        "_target_cuda_architectures",
+        lambda: frozenset({target_architecture}),
+    )
+
+    assert jit_env.get_aot_path("attention_module") == (
+        legacy_root / "attention_module" / "attention_module.so"
+    )
+
+
 def test_get_aot_path_requires_provider_to_cover_all_targets(monkeypatch, tmp_path):
     legacy_root = tmp_path / "legacy"
     provider_root = tmp_path / "sm90a"

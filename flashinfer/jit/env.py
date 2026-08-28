@@ -193,6 +193,19 @@ def _target_cuda_architectures() -> FrozenSet[str]:
     )
 
 
+def _provider_covers_targets(
+    provider_architectures: FrozenSet[str], target_architectures: FrozenSet[str]
+) -> bool:
+    """Return whether a provider explicitly covers every active CUDA target.
+
+    Exact matching is intentional. In particular, ``a`` targets are
+    architecture-specific and cannot be forwarded to another compute capability.
+    Baseline and ``f`` targets also remain exact here until provider manifests can
+    distinguish executable compatibility from complete AOT module coverage.
+    """
+    return target_architectures.issubset(provider_architectures)
+
+
 def get_aot_path(module_name: str) -> pathlib.Path:
     """Resolve an AOT module from the legacy wheel or a compatible provider."""
     legacy_path = FLASHINFER_AOT_DIR / module_name / f"{module_name}.so"
@@ -205,7 +218,9 @@ def get_aot_path(module_name: str) -> pathlib.Path:
     for provider in FLASHINFER_AOT_PROVIDERS:
         if module_name not in provider.modules:
             continue
-        if not target_architectures.issubset(provider.cuda_architectures):
+        if not _provider_covers_targets(
+            provider.cuda_architectures, target_architectures
+        ):
             continue
         provider_path = provider.jit_cache_dir / module_name / f"{module_name}.so"
         if provider_path.exists():

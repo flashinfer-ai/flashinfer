@@ -209,6 +209,31 @@ def test_install_jit_cache_wheel_cmd_minimal_detects_visible_sm(monkeypatch):
     )
 
 
+def test_install_jit_cache_wheel_cmd_minimal_keeps_arch_specific_target_exact(
+    monkeypatch,
+):
+    import flashinfer.__main__ as flashinfer_main
+
+    monkeypatch.setattr(flashinfer_main.torch.version, "cuda", "13.0")
+    monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1")
+    monkeypatch.setattr(
+        flashinfer_main.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {(12, "1a")},
+    )
+
+    out = _test_cmd_helper(
+        ["install-jit-cache-wheel", "--mode", "minimal", "--dry-run"]
+    )
+
+    _assert_output_contains_all(
+        out,
+        "Providers: sm121a",
+        "flashinfer-jit-cache-sm121a==0.4.1+cu130",
+    )
+    assert "flashinfer-jit-cache-sm120f" not in out
+
+
 def test_install_cubin_wheel_cmd_nightly_dry_run(monkeypatch):
     monkeypatch.setattr("flashinfer.__main__.__version__", "0.4.1.dev20260421")
 

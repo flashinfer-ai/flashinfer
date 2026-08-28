@@ -17,9 +17,11 @@ split such as `flashinfer-jit-cache+cu130.sm90` does not solve installation:
 those artifacts are versions of the same distribution, and pip can install only
 one of them at a time.
 
-The published jit-cache wheels contain host code plus architecture-specific
-SASS cubins. They do not contain PTX, so an sm80 cubin cannot provide a
-forward-compatible fallback for a later GPU architecture.
+The published jit-cache wheels contain host code plus SASS cubins. They do not
+contain PTX. An unsuffixed sm80 cubin has CUDA's same-major binary compatibility,
+but cannot provide a fallback for Hopper or Blackwell. Architecture-specific
+targets such as sm90a and sm121a are exact-target binaries and are not forward
+compatible.
 
 The current monolithic build also uses size-oriented fatbin compression, omits
 single-request prefill/decode modules, and excludes selected architectures from
@@ -86,6 +88,27 @@ target in the active compilation context. If no provider matches, normal JIT
 compilation remains the fallback. The legacy monolithic directory is checked
 first while both formats are supported.
 
+### Target Compatibility Policy
+
+CUDA distinguishes three target kinds:
+
+- An architecture-specific `smXXa` or `compute_XXa` target runs only on that
+  exact compute capability. It is neither forward nor backward compatible.
+- A family-specific `smXXf` or `compute_XXf` target runs only on devices in the
+  CUDA-defined family for that target.
+- An unsuffixed cubin uses CUDA's baseline binary-compatibility rules, including
+  forward compatibility to a higher minor compute capability in the same major
+  family. Unsuffixed cubins are not compatible across major families.
+
+The initial provider implementation deliberately requires an exact manifest
+target match for all three forms. Minimal auto-detection on an SM121 device
+therefore installs the `sm121a` provider, not `sm120f`; similarly, an `sm100a`
+provider cannot satisfy an `sm103a` target. This conservative rule treats
+binary executability and complete AOT module coverage as separate questions.
+Broader baseline or family coverage can be introduced later only through
+explicit manifest coverage that has been validated for every packaged module;
+the resolver must never infer a closest lower provider from the target name.
+
 ## Installation Modes
 
 The normal mode installs the shim with dependencies enabled:
@@ -114,9 +137,11 @@ requested providers and never adds an implicit sm80 baseline.
 ## SM80 Is Not a Baseline Provider
 
 FlashInfer's NVCC flags emit SASS targets such as `code=sm_80`; they do not emit
-a PTX fallback such as `code=compute_80`. NVIDIA documents cubin compatibility
-within a GPU architecture family, while PTX is the forward-compatible
-representation. An sm80 cubin therefore cannot run on Hopper or Blackwell.
+a PTX fallback such as `code=compute_80`. NVIDIA documents unsuffixed cubin
+compatibility within the same major compute capability. Unsuffixed PTX can
+provide broader forward compatibility, but architecture-specific `compute_XXa`
+PTX remains exact-target only. An sm80 cubin therefore cannot run on Hopper or
+Blackwell.
 
 Artifact inspection confirms that this is also true of the published wheels,
 not just the current source flags. Every CUDA-bearing `.so` in the complete
@@ -275,7 +300,12 @@ Before changing release workflows or making shim mode the default:
    deterministic architecture selection.
 6. Test a process with heterogeneous visible GPUs. Until a provider contains
    all required targets, it should miss AOT cleanly and fall back to JIT.
-7. Update release and nightly matrices, wheel-index parsing, documentation, and
+7. Add negative selection tests proving that architecture-specific providers do
+   not match another compute capability, including sm100a versus sm103a and
+   sm121a versus future SM12x targets. Keep baseline and family providers exact
+   until broader coverage is represented explicitly and validated module by
+   module.
+8. Update release and nightly matrices, wheel-index parsing, documentation, and
    stale-provider uninstall behavior only after the inventories pass. Keep the
    CUDA version and PyTorch index in `ci/cuda-versions.json`, and add explicit
    provider coverage fields rather than inferring them from size-pruned
@@ -283,8 +313,9 @@ Before changing release workflows or making shim mode the default:
 
 ## Open Decisions
 
-- Whether provider granularity should remain exact SM targets or combine targets
-  only when every `.so` contains compatible code for the combined set.
+- Whether later provider manifests should add broader baseline or family
+  coverage after every `.so` and module inventory has been validated for the
+  additional devices. Architecture-specific `a` targets always remain exact.
 - Whether a measured common module set warrants separate common-module
   providers as a size optimization.
 - Whether provider manifests should include hashes and per-module code targets,
