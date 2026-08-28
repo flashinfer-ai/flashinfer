@@ -7,10 +7,11 @@ FlashInfer Attention Kernels
 Experimental Task-Scheduled Attention
 =====================================
 
-The experimental Blackwell task-scheduled FMHA context, FMHA decode, and MLA
-decode APIs are imported from ``flashinfer.attention.prims_ts``. Scheduling,
-tile selection, and split-KV reduction are automatic implementation details;
-there are no public tuning knobs.
+The experimental Blackwell task-scheduled FMHA context, FMHA decode,
+block-sparse FMHA, and MLA decode APIs are imported from
+``flashinfer.attention.prims_ts``. Scheduling, tile selection, and split-KV
+reduction are automatic implementation details; there are no public tuning
+knobs.
 
 See the `PrimTS guide index <https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/attention/prims_ts/README.md>`_
 for the public entry points, supported contracts, and examples. Current accuracy
@@ -49,6 +50,25 @@ FMHA Decode
     prims_ts_batch_decode_with_kv_cache
 
 .. autoclass:: BatchDecodePagedTSWrapper
+    :members:
+
+    .. automethod:: __init__
+
+Block-Sparse FMHA
+-----------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    block_sparse_attention
+    block_sparse_attention_with_paged_kv_cache
+
+.. autoclass:: BlockSparseTSWrapper
+    :members:
+
+    .. automethod:: __init__
+
+.. autoclass:: BlockSparsePagedTSWrapper
     :members:
 
     .. automethod:: __init__
@@ -92,6 +112,26 @@ Batch Decoding
     cudnn_batch_decode_with_kv_cache
     trtllm_batch_decode_with_kv_cache
     xqa_batch_decode_with_kv_cache
+
+DCP Speculative Decode Workspace
+--------------------------------
+
+The native Cake FMHA DCP speculative route of
+:func:`flashinfer.decode.trtllm_batch_decode_with_kv_cache` uses caller-owned
+scratch buffers so a prewarmed invocation can be captured in a CUDA Graph.
+The production D256 FP8/page64 ratio-16 profile supports speculative query
+lengths 1 through 8 and passes ``head_dim=256`` to the workspace-size helper;
+D128 remains the default.
+
+.. currentmodule:: flashinfer
+
+.. autosummary::
+    :toctree: ../generated
+
+    get_dcp_spec_workspace_size_bytes
+    get_dcp_spec_counter_bytes
+
+.. currentmodule:: flashinfer.decode
 
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
     :members:
@@ -205,6 +245,10 @@ MLA (Multi-head Latent Attention) is an attention mechanism proposed in DeepSeek
 `DeepSeek-V2 <https://arxiv.org/abs/2405.04434>`_, `DeepSeek-V3 <https://arxiv.org/abs/2412.19437>`_,
 and `DeepSeek-R1 <https://arxiv.org/abs/2501.12948>`_).
 
+See the `Batch MLA backend architecture <https://github.com/flashinfer-ai/flashinfer/blob/main/docs/design_docs/batch_mla_backend_architecture.md>`_
+for the planned wrapper's ownership, metadata, tensor-representation,
+transactionality, and hot-path contracts.
+
 .. currentmodule:: flashinfer.mla
 
 PageAttention for MLA
@@ -234,3 +278,25 @@ PageAttention for MLA
     :members:
 
     .. automethod:: __init__
+
+.. autoclass:: MLAPlanMetadata
+    :members:
+
+    ``BatchMLAPagedAttentionWrapper.plan`` accepts the preferred
+    ``metadata=MLAPlanMetadata.csr(...)`` or
+    ``metadata=MLAPlanMetadata.dense(...)`` keyword form.  The keyword form
+    defaults run inputs to packed ``query`` / ``kv_cache`` structural tensors.
+    The legacy flat CSR and dense metadata adapters remain available for
+    compatibility, emit a ``DeprecationWarning`` once per process, and default
+    run inputs to split ``q_nope`` / ``q_pe`` and ``ckv_cache`` / ``kpe_cache``.
+    Structural run inputs use an exact tuple grammar: a tensor is packed,
+    ``(left, right)`` is split, and ``(packed, (left, right))`` or
+    ``((left, right), packed)`` is a trusted redundant form.  The selected form
+    must match the planned rank, leading shape, dtype, device, and split widths.
+
+    LSE mode, output dtype/scaling, and KV scaling are plan/run contracts.  A
+    run that needs different values must re-plan first, except that deprecated
+    flat CSR FA2/FA3 plans temporarily preserve dynamic LSE behavior with a
+    ``DeprecationWarning``.  Explicit ``backend="cutlass"`` callers that omit
+    ``plan`` remain supported through a deprecated compatibility adapter when
+    ``kv_len`` and ``page_table`` are supplied.

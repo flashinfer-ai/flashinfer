@@ -2906,6 +2906,7 @@ class TrtllmGenDecodeModule:
             False,  # enable_block_sparse_attention
             None,  # sparse_mla_top_k_lens
             bf16q_fp8kv_transform_mode,
+            None,  # use_fp16_softmax
         )
         return out
 
@@ -3100,6 +3101,9 @@ def trtllm_batch_decode_with_kv_cache(
     bmm1_scale_log2: Optional[torch.Tensor] = None,
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     enable_block_sparse_attention: bool = False,
+    cp_world: int = 1,
+    cp_rank: int = 0,
+    causal_seqlens_kv_global: Optional[torch.Tensor] = None,
     bf16q_fp8kv_transform_mode: Optional[Literal["k_only", "separate_kv"]] = None,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
@@ -3272,6 +3276,47 @@ def trtllm_batch_decode_with_kv_cache(
         Not compatible with sliding window (``window_left != -1``),
         ``skip_softmax_threshold_scale_factor``, or ``uses_shared_paged_kv_idx=False``.
 
+    cp_world : int = 1
+        Decode-context-parallel world size. The DCP speculative path is enabled
+        only when :attr:`causal_seqlens_kv_global` is provided. Supported values
+        are 1, 2, 4, and 8 on SM100/SM103.
+
+    cp_rank : int = 0
+        Rank in the DCP group. Rank ``r`` owns global KV positions
+        ``r, r + cp_world, ...`` in its compact local paged cache.
+
+    causal_seqlens_kv_global : Optional[torch.Tensor] = None
+        Optional contiguous int32 tensor of shape ``[batch_size]`` containing
+        each request's global KV prefix length before speculative query row 0.
+        When provided, query row ``j`` sees exactly
+        ``max(0, floor((S + j - cp_rank) / cp_world) + 1)`` local keys. This
+        enables DCP + speculative decoding without a per-row length tensor.
+
+        The native Cake FMHA path requires BF16 Q/O, causal HND paging, and
+        ``return_lse=True`` (or a caller-owned ``lse``). The D128 profile uses
+        head group ratio in ``[1,8]``. BF16 KV uses page size 16 and
+        ``q_len_per_req`` in ``{1,2,4,5,6,8}``; FP8 e4m3 KV uses page size 64
+        and supports every ``q_len_per_req`` from 1 through 8. The D256
+        production profile is FP8/page64 with ``q_len_per_req`` in
+        ``{1,2,3,4,5,6,7,8}``, ``num_qo_heads=16``,
+        ``num_kv_heads=1``, and ``cp_world`` 1 or 4. ``bmm1_scale`` is the
+        fused QK scale and ``bmm2_scale`` is the FP8 V/output scale (BF16 KV
+        requires ``bmm2_scale=1``). LSE is FP32 base-2, matching the existing
+        TRT-LLM backend contract. Explicit ``enable_pdl=True`` is unsupported;
+        leave it at its default for this path. Here ``max_seq_len`` is the
+        maximum compact rank-local stored length; it may be zero for an
+        entirely empty rank, while ``block_tables`` still supplies one masked
+        physical page slot.
+        Long-context BF16 and underfilled FP8 Split-KV routes use
+        ``workspace_buffer`` for partials and require a zero-initialized,
+        reusable :attr:`multi_ctas_kv_counter_buffer`; the kernel resets those
+        completion tickets after every launch. The D128 FP8 route specializes
+        split1--4 and short-shard K/V retention in its JIT cache key. D256 uses
+        retain0 split1/2/3/4/8/16 bodies and measured B1/B8/B16/B32+ routing.
+        Size its workspace with ``get_dcp_spec_workspace_size_bytes(...,
+        head_dim=256)``. Prewarm a fixed tensor/layout binding before CUDA Graph
+        capture.
+
     bf16q_fp8kv_transform_mode : Optional[Literal["k_only", "separate_kv"]] = None
         Transform mode for BF16 query + FP8 E4M3 KV decode. ``None`` selects the
         default separate transformed-K/V cubins and is ignored by other paths.
@@ -3286,6 +3331,7 @@ def trtllm_batch_decode_with_kv_cache(
         Only returned when ``return_lse`` is True. Shape ``[num_tokens, num_qo_heads]``
         with dtype ``torch.float32``.
     """
+    explicit_enable_pdl = enable_pdl is True
     enable_pdl = device_support_pdl(query.device) if enable_pdl is None else enable_pdl
 
     if isinstance(kv_cache, tuple):
@@ -3328,6 +3374,108 @@ def trtllm_batch_decode_with_kv_cache(
             k_block_scales.dtype == torch.float8_e4m3fn
             and v_block_scales.dtype == torch.float8_e4m3fn
         ), "kv_cache_sf tensors should be float8 dtype."
+
+    dcp_spec_enabled = causal_seqlens_kv_global is not None
+    if not dcp_spec_enabled and (cp_world != 1 or cp_rank != 0):
+        raise ValueError(
+            "cp_world/cp_rank require causal_seqlens_kv_global to enable the "
+            "DCP speculative decode path"
+        )
+    if dcp_spec_enabled:
+        if explicit_enable_pdl:
+            raise ValueError(
+                "DCP speculative decode does not support an explicit enable_pdl=True"
+            )
+        if backend not in ("auto", "trtllm-gen"):
+            raise ValueError(
+                "DCP speculative decode is only available through backend='auto' "
+                "or backend='trtllm-gen'"
+            )
+        if kv_layout != "HND":
+            raise ValueError(
+                "DCP speculative decode currently requires kv_layout='HND'"
+            )
+        if is_nvfp4_kvcache or kv_cache_sf is not None:
+            raise ValueError(
+                "DCP speculative decode supports BF16 or FP8 e4m3 KV cache, "
+                "but not NVFP4 or block scale tensors"
+            )
+        if q_len_per_req is None:
+            raise ValueError("DCP speculative decode requires uniform q_len_per_req")
+        if max_q_len is not None or cum_seq_lens_q is not None:
+            raise ValueError(
+                "DCP speculative decode does not yet support ragged query lengths"
+            )
+        if window_left != -1 or mask is not None:
+            raise ValueError(
+                "DCP speculative decode currently supports causal full attention only"
+            )
+        if sinks is not None:
+            raise ValueError(
+                "DCP speculative decode does not yet support attention sinks"
+            )
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError("DCP speculative decode does not support skip-softmax")
+        if not uses_shared_paged_kv_idx:
+            raise ValueError("DCP speculative decode requires a shared K/V page table")
+        if enable_block_sparse_attention:
+            raise ValueError(
+                "DCP speculative decode does not support block-sparse attention"
+            )
+        if bmm1_scale_log2 is not None:
+            raise ValueError(
+                "DCP speculative decode takes a host bmm1_scale; bmm1_scale_log2 "
+                "device tensors are not yet supported"
+            )
+        if isinstance(bmm1_scale, torch.Tensor) or isinstance(bmm2_scale, torch.Tensor):
+            raise TypeError(
+                "DCP speculative decode requires host scalar bmm1/bmm2 scales"
+            )
+        if o_scale is not None and float(o_scale) != 1.0:
+            raise ValueError("DCP speculative decode currently requires o_scale=1.0")
+        if o_sf_scale is not None or o_sf_vec_size is not None:
+            raise ValueError(
+                "DCP speculative decode does not support scaled FP4 output"
+            )
+        if isinstance(out, FP4Tensor) or out_dtype == "nvfp4":
+            raise ValueError("DCP speculative decode requires BF16 output")
+        if out_dtype is not None and out_dtype != torch.bfloat16:
+            raise ValueError("DCP speculative decode requires out_dtype=torch.bfloat16")
+        if not return_lse and lse is None:
+            raise ValueError(
+                "DCP speculative decode requires return_lse=True or a caller-owned lse buffer"
+            )
+
+        num_qo_heads = query.shape[1]
+        lse_shape = (query.shape[0], num_qo_heads)
+        out = out if out is not None else torch.empty_like(query, dtype=torch.bfloat16)
+        lse = (
+            lse
+            if lse is not None
+            else torch.empty(lse_shape, dtype=torch.float32, device=query.device)
+        )
+        from .cake_dcp import run_dcp_spec_decode
+
+        run_dcp_spec_decode(
+            query=query,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            workspace_buffer=workspace_buffer,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            causal_seqlens_kv_global=causal_seqlens_kv_global,
+            max_local_seq_len=max_seq_len,
+            bmm1_scale=float(bmm1_scale),
+            bmm2_scale=float(bmm2_scale),
+            cp_world=cp_world,
+            cp_rank=cp_rank,
+            q_len_per_req=q_len_per_req,
+            out=out,
+            lse=lse,
+            completion_buffer=multi_ctas_kv_counter_buffer,
+            backend="cake",
+        )
+        return (out, lse) if return_lse else out
 
     if backend == "auto":
         backend = (
@@ -3600,6 +3748,7 @@ def trtllm_batch_decode_with_kv_cache(
             enable_block_sparse_attention,
             None,  # sparse_mla_top_k_lens
             bf16q_fp8kv_transform_mode_value,
+            None,  # use_fp16_softmax
         )
 
         result_out = (

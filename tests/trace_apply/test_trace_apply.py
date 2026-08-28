@@ -202,6 +202,51 @@ def test_stateful_plan_run_namespace_and_candidate_kwargs():
     assert ck["sm_scale"] == 0.125
 
 
+def test_mla_stateful_adapter_recovers_moved_wrapper_plan_state():
+    from flashinfer.trace_apply.plan_capture import adapter_for
+
+    moved = "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run"
+    import flashinfer.mla  # noqa: F401  # Registers the moved wrapper trace.
+
+    reg = _registry_by_fi_api()
+    assert moved in reg
+    run_original, templates = reg[moved]
+    template = templates[0]
+    adapter = adapter_for(moved)
+    assert adapter is not None
+
+    class _Wrapper:
+        _kv_indptr_buf = torch.tensor([0, 1, 2], dtype=torch.int32)
+        _kv_indices_buf = torch.tensor([3, 4], dtype=torch.int32)
+        _sm_scale = 0.125
+
+    q_nope = torch.empty(2, 4, 8, dtype=torch.bfloat16)
+    q_pe = torch.empty(2, 4, 3, dtype=torch.bfloat16)
+    ckv_cache = torch.empty(5, 7, 8, dtype=torch.bfloat16)
+    kpe_cache = torch.empty(5, 7, 3, dtype=torch.bfloat16)
+    build_ns = _stateful_namespace_builder(run_original, template, adapter)
+    namespace = build_ns((_Wrapper(), q_nope, q_pe, ckv_cache, kpe_cache), {})
+
+    candidate_kwargs = adapt.build_candidate_kwargs(template, namespace)
+    assert candidate_kwargs["kv_indptr"].tolist() == [0, 1, 2]
+    assert candidate_kwargs["kv_indices"].tolist() == [3, 4]
+    assert candidate_kwargs["sm_scale"] == 0.125
+
+
+def test_mla_trace_apply_accepts_historical_and_moved_wrapper_keys():
+    from flashinfer.trace_apply.plan_capture import adapter_for
+
+    historical = "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run"
+    moved = "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run"
+    import flashinfer.mla  # noqa: F401  # Registers the MLA wrapper trace.
+
+    reg = _registry_by_fi_api()
+    assert historical in reg
+    assert moved in reg
+    assert adapter_for(historical) is not None
+    assert adapter_for(moved) is not None
+
+
 def test_output_adapt_value_returning_returns_value():
     tmpl = _live_template(FI_API)
     x = torch.randn(4, 8)

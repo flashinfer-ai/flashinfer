@@ -23,6 +23,8 @@ from ..delta_rule_dsl.delta_rule_sm120 import _FullyFusedDeltaRuleSm120
 from ..delta_rule_dsl.varlen_helper import (
     CP_CHUNK_LEN_GRANULARITY,
     choose_cp_chunk_len_host,
+    integer_dtype_to_cutlass,
+    is_integer_dtype,
     max_num_chunks_host,
     workspace_num_chunks_host,
 )
@@ -31,6 +33,7 @@ from .gated_delta_net_cp import (
     CPDeltaRuleMNPrecomputeUtcmma1Sm100,
 )
 from .gated_delta_net_cp_prefill import CPDeltaRulePrefillTcgen05Sm100
+from ...cute_dsl.utils import cute_dsl_compile_arch
 from .gdn_prefill import _cutlass_state_dtype, _mark_state_layout
 
 
@@ -41,7 +44,11 @@ def _blackwell_compile_options(device: torch.device):
         raise RuntimeError(
             f"SM100 CP delta rule requires a compute 10.x device, got {major}.{minor}"
         )
-    return cute.EnableTVMFFI(True), cute.GPUArch(f"sm_{major}{minor}a")
+    # Resolve the arch instead of formatting it: this guard only checks the
+    # major, so Rubin (10.7) reaches here, and f"sm_107a" is absent from the
+    # Arch enum of any DSL older than 4.8 -- producing `KeyError: 'sm_107a'`
+    # from inside cute.compile with no frame pointing back here.
+    return cute.EnableTVMFFI(True), cute.GPUArch(cute_dsl_compile_arch(major, minor))
 
 
 def _get_cp_workspace(name, shape, dtype, device):
@@ -54,12 +61,7 @@ class CPDeltaRuleTPrecomputeSm100(CPDeltaRuleTPrecomputeSm120):
 
 
 def _cu_seqlens_dtype(dtype):
-    try:
-        return {torch.int32: cutlass.Int32, torch.int64: cutlass.Int64}[dtype]
-    except KeyError as err:
-        raise RuntimeError(
-            f"cu_seqlens must have dtype torch.int32 or torch.int64, got {dtype}"
-        ) from err
+    return integer_dtype_to_cutlass(dtype)
 
 
 @functools.cache
@@ -360,6 +362,9 @@ def _get_fixup_kernel(
     initial_state_dtype,
     output_state_dtype,
     use_state_indices,
+    state_indices_dtype,
+    initial_state_inner_strides,
+    output_state_inner_strides,
     kernel_kind,
     cu_seqlens_dtype,
 ):
@@ -372,6 +377,9 @@ def _get_fixup_kernel(
             state_dtype=output_state_dtype,
             cu_seqlens_dtype=cu_seqlens_dtype,
             use_state_indices=use_state_indices,
+            state_indices_dtype=state_indices_dtype,
+            initial_state_inner_strides=initial_state_inner_strides,
+            output_state_inner_strides=output_state_inner_strides,
             store_initial_state=needs_initial_state,
         )
     if kernel_kind == "simt_row8":
@@ -383,6 +391,9 @@ def _get_fixup_kernel(
             state_dtype=output_state_dtype,
             cu_seqlens_dtype=cu_seqlens_dtype,
             use_state_indices=use_state_indices,
+            state_indices_dtype=state_indices_dtype,
+            initial_state_inner_strides=initial_state_inner_strides,
+            output_state_inner_strides=output_state_inner_strides,
             store_initial_state=needs_initial_state,
         )
     if kernel_kind == "hmma":
@@ -393,6 +404,9 @@ def _get_fixup_kernel(
             state_dtype=output_state_dtype,
             cu_seqlens_dtype=cu_seqlens_dtype,
             use_state_indices=use_state_indices,
+            state_indices_dtype=state_indices_dtype,
+            initial_state_inner_strides=initial_state_inner_strides,
+            output_state_inner_strides=output_state_inner_strides,
             store_initial_state=needs_initial_state,
         )
     if kernel_kind in ("utcmma", "utcmma64", "utcmma128"):
@@ -404,6 +418,9 @@ def _get_fixup_kernel(
             state_dtype=output_state_dtype,
             cu_seqlens_dtype=cu_seqlens_dtype,
             use_state_indices=use_state_indices,
+            state_indices_dtype=state_indices_dtype,
+            initial_state_inner_strides=initial_state_inner_strides,
+            output_state_inner_strides=output_state_inner_strides,
             store_initial_state=needs_initial_state,
         )
     raise ValueError(f"Unsupported fixup kernel kind: {kernel_kind}")
@@ -464,16 +481,13 @@ def cp_delta_rule_fixup_dsl_sm100(
                         f"{('[N_pool]' if use_state_indices else f'[{cu_seqlens.shape[0] - 1}]')}"
                         f" + {expected_tail}, got {tuple(tensor.shape)}"
                     )
-                if tensor.dtype not in (torch.float32, torch.bfloat16, torch.float16):
-                    raise RuntimeError(
-                        f"{name} must have dtype float32, bfloat16, or float16, got {tensor.dtype}"
-                    )
+                _cutlass_state_dtype(tensor.dtype)
         if use_state_indices:
-            if state_indices.dtype != torch.int32 or state_indices.shape != (
+            if not is_integer_dtype(state_indices.dtype) or state_indices.shape != (
                 cu_seqlens.shape[0] - 1,
             ):
                 raise RuntimeError(
-                    f"state_indices must have shape {(cu_seqlens.shape[0] - 1,)} and dtype int32"
+                    f"state_indices must have shape {(cu_seqlens.shape[0] - 1,)} and an integer dtype"
                 )
         for name, tensor in (
             ("local_transfer", local_transfer),
@@ -486,10 +500,12 @@ def cp_delta_rule_fixup_dsl_sm100(
             ("initial_state", initial_state),
             ("output_state", output_state),
         ):
-            if tensor is not None and tensor.stride()[1:] != (128 * 128, 128, 1):
-                raise RuntimeError(
-                    f"{name} must be contiguous in its inner [H, V, K] modes"
-                )
+            if (
+                tensor is not None
+                and not use_state_indices
+                and not tensor.is_contiguous()
+            ):
+                raise RuntimeError(f"{name} must be contiguous")
 
     total_cp_chunks, num_heads, _, d = local_transfer.shape
     if not _skip_check:
@@ -560,6 +576,17 @@ def cp_delta_rule_fixup_dsl_sm100(
         initial_state_dtype,
         output_state_dtype,
         use_state_indices,
+        _cu_seqlens_dtype(state_indices.dtype) if use_state_indices else None,
+        (
+            tuple(initial_state.stride()[1:])
+            if use_state_indices and needs_initial_state
+            else None
+        ),
+        (
+            tuple(output_state.stride()[1:])
+            if use_state_indices and store_final_state
+            else None
+        ),
         _kernel_kind,
         _cu_seqlens_dtype(cu_seqlens.dtype),
     )
@@ -632,17 +659,21 @@ def cp_delta_rule_fixup_dsl_sm100(
 def _get_prefill_kernel(
     kernel_dtype,
     state_dtype,
+    checkpoint_dtype,
     num_sm,
     is_gqa,
     head_ratio,
     needs_initial_state,
     store_final_state,
+    enable_checkpoints,
     cu_seqlens_dtype,
+    checkpoint_cu_starts_dtype,
 ):
     return CPDeltaRulePrefillTcgen05Sm100(
         io_dtype=kernel_dtype,
         acc_dtype=cutlass.Float32,
         state_dtype=state_dtype,
+        checkpoint_dtype=checkpoint_dtype,
         mma_tiler_qk=(64, 64, 128),
         mma_tiler_qs=(128, 64, 128),
         mma_tiler_qkv=(128, 64, 64),
@@ -653,9 +684,10 @@ def _get_prefill_kernel(
         head_ratio=head_ratio,
         use_initial_state=needs_initial_state,
         store_final_state=store_final_state,
-        enable_checkpoints=False,
+        enable_checkpoints=enable_checkpoints,
         is_persistent=False,
         cu_seqlens_dtype=cu_seqlens_dtype,
+        checkpoint_cu_starts_dtype=checkpoint_cu_starts_dtype,
     )
 
 
@@ -674,6 +706,9 @@ def cp_delta_rule_prefill_dsl_sm100(
     cp_chunk_len: int = 4096,
     max_seqlen: int | None = None,
     initial_state: torch.Tensor | None = None,
+    state_checkpoints: torch.Tensor | None = None,
+    checkpoint_cu_starts: torch.Tensor | None = None,
+    checkpoint_every_n_tokens: int = 0,
     *,
     _skip_check: bool = False,
     _device=None,
@@ -723,6 +758,7 @@ def cp_delta_rule_prefill_dsl_sm100(
     num_k_heads = k.shape[1]
     num_v_heads = v.shape[1]
     num_sab_heads = max(num_q_heads, num_v_heads)
+    enable_checkpoints = checkpoint_every_n_tokens > 0
     total_t_blocks = workspace_num_chunks_host(cu_seqlens, 64, total_seqlen)
     total_cp_chunks = workspace_num_chunks_host(cu_seqlens, cp_chunk_len, total_seqlen)
     if not _skip_check:
@@ -762,15 +798,43 @@ def cp_delta_rule_prefill_dsl_sm100(
                 raise RuntimeError(
                     f"state must have shape {expected_state_shape}, got {tuple(state.shape)}"
                 )
-            if state.dtype not in (torch.float32, torch.bfloat16, torch.float16):
-                raise RuntimeError(
-                    f"state must have dtype float32, bfloat16, or float16, got {state.dtype}"
-                )
+            _cutlass_state_dtype(state.dtype)
         if initial_state is not None:
             if initial_state.shape != expected_state_shape:
                 raise RuntimeError(
                     f"initial_state must have shape {expected_state_shape}, got {tuple(initial_state.shape)}"
                 )
+        if checkpoint_every_n_tokens < 0 or checkpoint_every_n_tokens % 64 != 0:
+            raise RuntimeError(
+                "checkpoint_every_n_tokens must be a non-negative multiple of 64, "
+                f"got {checkpoint_every_n_tokens}"
+            )
+        if enable_checkpoints:
+            if state_checkpoints is None or checkpoint_cu_starts is None:
+                raise RuntimeError(
+                    "state_checkpoints and checkpoint_cu_starts are required when "
+                    "checkpointing is enabled"
+                )
+            if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, d, d):
+                raise RuntimeError(
+                    "state_checkpoints must have shape "
+                    f"[*, {num_sab_heads}, {d}, {d}], got {tuple(state_checkpoints.shape)}"
+                )
+            if checkpoint_cu_starts.shape != (num_seqs + 1,):
+                raise RuntimeError(
+                    "checkpoint_cu_starts must have shape "
+                    f"{(num_seqs + 1,)}, got {tuple(checkpoint_cu_starts.shape)}"
+                )
+            if not is_integer_dtype(checkpoint_cu_starts.dtype):
+                raise RuntimeError(
+                    "checkpoint_cu_starts must have an integer dtype, "
+                    f"got {checkpoint_cu_starts.dtype}"
+                )
+        elif state_checkpoints is not None or checkpoint_cu_starts is not None:
+            raise RuntimeError(
+                "state_checkpoints and checkpoint_cu_starts must be None when "
+                "checkpointing is disabled"
+            )
         if not _FullyFusedDeltaRuleSm120.can_implement(
             num_q_heads, num_k_heads, num_v_heads, d, q.element_size()
         ):
@@ -786,6 +850,8 @@ def cp_delta_rule_prefill_dsl_sm100(
             ("fixed_state", fixed_state),
             ("alpha", alpha),
             ("o", o),
+            ("state_checkpoints", state_checkpoints),
+            ("checkpoint_cu_starts", checkpoint_cu_starts),
         ):
             if tensor is not None and not tensor.is_contiguous():
                 raise RuntimeError(f"{name} must be contiguous")
@@ -831,15 +897,19 @@ def cp_delta_rule_prefill_dsl_sm100(
         if needs_initial_state
         else torch.float32
     )
+    checkpoint_dtype = state_checkpoints.dtype if enable_checkpoints else state_dtype
     kernel = _get_prefill_kernel(
         kernel_dtype,
         _cutlass_state_dtype(state_dtype),
+        _cutlass_state_dtype(checkpoint_dtype),
         num_sm,
         is_gqa,
         head_ratio,
         needs_initial_state,
         store_final_state,
+        enable_checkpoints,
         _cu_seqlens_dtype(cu_seqlens.dtype),
+        (_cu_seqlens_dtype(checkpoint_cu_starts.dtype) if enable_checkpoints else None),
     )
     compile_options = _blackwell_compile_options(device)
     workspace_size = (
@@ -865,6 +935,14 @@ def cp_delta_rule_prefill_dsl_sm100(
         if store_final_state:
             state_cute = from_dlpack(state, assumed_align=16)
             _mark_state_layout(state_cute, False, d)
+        state_checkpoints_cute = None
+        checkpoint_cu_starts_cute = None
+        if enable_checkpoints:
+            state_checkpoints_cute = from_dlpack(state_checkpoints, assumed_align=16)
+            _mark_state_layout(state_checkpoints_cute, False, d)
+            checkpoint_cu_starts_cute = from_dlpack(
+                checkpoint_cu_starts, assumed_align=8
+            ).mark_layout_dynamic()
         kernel_args = (
             from_dlpack(q, assumed_align=16).mark_layout_dynamic(),
             from_dlpack(k, assumed_align=16).mark_layout_dynamic(),
@@ -876,6 +954,9 @@ def cp_delta_rule_prefill_dsl_sm100(
             from_dlpack(fixed_state, assumed_align=16).mark_layout_dynamic(),
             initial_state_cute,
             state_cute,
+            state_checkpoints_cute,
+            checkpoint_cu_starts_cute,
+            cutlass.Int32(checkpoint_every_n_tokens),
             cutlass.Int32(cp_chunk_len),
             cutlass.Int32(total_cp_chunks),
             cutlass.Int32(max_cp_chunks_per_seq),
@@ -896,6 +977,9 @@ def cp_delta_rule_prefill_dsl_sm100(
         fixed_state,
         initial_state if needs_initial_state else None,
         state if store_final_state else None,
+        state_checkpoints if enable_checkpoints else None,
+        checkpoint_cu_starts if enable_checkpoints else None,
+        checkpoint_every_n_tokens,
         cp_chunk_len,
         total_cp_chunks,
         max_cp_chunks_per_seq,
@@ -919,6 +1003,9 @@ def cp_delta_rule_dsl_sm100(
     *,
     initial_state: torch.Tensor | None = None,
     state_indices: torch.Tensor | None = None,
+    state_checkpoints: torch.Tensor | None = None,
+    checkpoint_cu_starts: torch.Tensor | None = None,
+    checkpoint_every_n_tokens: int = 0,
     max_seqlen: int | None = None,
     cp_chunk_len: int | None = None,
     cp_chunk_len_granularity: int = CP_CHUNK_LEN_GRANULARITY,
@@ -985,6 +1072,7 @@ def cp_delta_rule_dsl_sm100(
     num_k_heads = k.shape[1]
     num_v_heads = v.shape[1]
     num_sab_heads = max(num_q_heads, num_v_heads)
+    enable_checkpoints = checkpoint_every_n_tokens > 0
     if o.shape[1] != num_sab_heads or alpha.shape[1] != num_sab_heads:
         raise RuntimeError(
             f"o/alpha/beta heads must equal max(q heads, v heads)={num_sab_heads}"
@@ -1020,10 +1108,41 @@ def cp_delta_rule_dsl_sm100(
             f"got {tuple(initial_state.shape)}"
         )
     if use_state_indices and (
-        state_indices.dtype != torch.int32 or state_indices.shape != (num_seqs,)
+        not is_integer_dtype(state_indices.dtype) or state_indices.shape != (num_seqs,)
     ):
         raise RuntimeError(
-            f"state_indices must have shape {(num_seqs,)} and dtype int32"
+            f"state_indices must have shape {(num_seqs,)} and an integer dtype"
+        )
+    if checkpoint_every_n_tokens < 0 or checkpoint_every_n_tokens % 64 != 0:
+        raise RuntimeError(
+            "checkpoint_every_n_tokens must be a non-negative multiple of 64, "
+            f"got {checkpoint_every_n_tokens}"
+        )
+    if enable_checkpoints:
+        if state_checkpoints is None or checkpoint_cu_starts is None:
+            raise RuntimeError(
+                "state_checkpoints and checkpoint_cu_starts are required when "
+                "checkpointing is enabled"
+            )
+        if tuple(state_checkpoints.shape[1:]) != (num_sab_heads, d, d):
+            raise RuntimeError(
+                "state_checkpoints must have shape "
+                f"[*, {num_sab_heads}, {d}, {d}], got {tuple(state_checkpoints.shape)}"
+            )
+        if checkpoint_cu_starts.shape != (num_seqs + 1,):
+            raise RuntimeError(
+                "checkpoint_cu_starts must have shape "
+                f"{(num_seqs + 1,)}, got {tuple(checkpoint_cu_starts.shape)}"
+            )
+        if not is_integer_dtype(checkpoint_cu_starts.dtype):
+            raise RuntimeError(
+                "checkpoint_cu_starts must have an integer dtype, "
+                f"got {checkpoint_cu_starts.dtype}"
+            )
+    elif state_checkpoints is not None or checkpoint_cu_starts is not None:
+        raise RuntimeError(
+            "state_checkpoints and checkpoint_cu_starts must be None when "
+            "checkpointing is disabled"
         )
     if d != 128:
         raise RuntimeError(f"CPDeltaRuleSm100 only supports D=128, got {d}")
@@ -1035,15 +1154,9 @@ def cp_delta_rule_dsl_sm100(
         raise RuntimeError("q/k/v/o dtypes must match")
     if alpha.dtype != torch.float32 or beta.dtype != torch.float32:
         raise RuntimeError("alpha and beta must have dtype torch.float32")
-    for name, tensor in (("state", state), ("initial_state", initial_state)):
-        if tensor is not None and tensor.dtype not in (
-            torch.float32,
-            torch.bfloat16,
-            torch.float16,
-        ):
-            raise RuntimeError(
-                f"{name} must have dtype float32, bfloat16, or float16, got {tensor.dtype}"
-            )
+    for tensor in (state, initial_state):
+        if tensor is not None:
+            _cutlass_state_dtype(tensor.dtype)
     for name, tensor in (
         ("q", q),
         ("k", k),
@@ -1052,14 +1165,14 @@ def cp_delta_rule_dsl_sm100(
         ("beta", beta),
         ("o", o),
         ("state_indices", state_indices),
+        ("state_checkpoints", state_checkpoints),
+        ("checkpoint_cu_starts", checkpoint_cu_starts),
     ):
         if tensor is not None and not tensor.is_contiguous():
             raise RuntimeError(f"{name} must be contiguous")
     for name, tensor in (("state", state), ("initial_state", initial_state)):
-        if tensor is not None and tensor.stride()[1:] != (d * d, d, 1):
-            raise RuntimeError(
-                f"{name} must be contiguous in its inner [H, V, K] modes"
-            )
+        if tensor is not None and not use_state_indices and not tensor.is_contiguous():
+            raise RuntimeError(f"{name} must be contiguous")
 
     with torch.cuda.nvtx.range("cp_delta_rule_sm100"):
         t = cp_delta_rule_t_precompute_dsl_sm100(
@@ -1122,6 +1235,9 @@ def cp_delta_rule_dsl_sm100(
             cp_chunk_len=cp_chunk_len,
             max_seqlen=max_seqlen,
             initial_state=initial_state_workspace,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             _skip_check=True,
             _device=device,
             _stream=stream,

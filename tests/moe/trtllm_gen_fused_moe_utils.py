@@ -2312,14 +2312,16 @@ def noaux_tc_ref(logits, bias, n_group, topk_group, top_k, routed_scaling_factor
         _, group_idx = torch.topk(
             group_scores, k=topk_group, dim=-1, largest=True, sorted=True
         )
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(-1, group_idx, 1)
+        group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+        group_mask.scatter_(-1, group_idx, True)
         score_mask = (
             group_mask.unsqueeze(-1)
             .expand(scores_shape[:-1] + [n_group, scores_shape[-1] // n_group])
             .reshape(scores_shape)
         )
-        scores_with_bias = scores_with_bias * score_mask
+        # A routing bias can make scores negative. Zero-masking would let an
+        # unselected expert outrank a valid negative score in the selected group.
+        scores_with_bias = scores_with_bias.masked_fill(~score_mask, float("-inf"))
 
     _, topk_idx = torch.topk(
         scores_with_bias, k=top_k, dim=-1, largest=True, sorted=True
@@ -3361,7 +3363,11 @@ RENORMALIZE_ZERO_HIDDEN_STATES = [
     pytest.param(False, id="RandomHiddenStates"),
 ]
 
-RENORMALIZE_NUM_TOKENS = [8, 768, 3072]
+# Shape fan-out is deliberately SMALL (boundary token counts + boundary intermediate
+# sizes only): the quant x routing x weight-layout matrix below is the coverage that
+# matters for kernel selection, and randomized shape breadth lives in
+# tests/moe/test_unified_moe_fuzz.py. Extend the fuzzer, not these lists.
+RENORMALIZE_NUM_TOKENS = [8, 3072]
 RENORMALIZE_HIDDEN_SIZES = [1024]
 RENORMALIZE_INTERMEDIATE_SIZES = [1024, 768, 512, 384]
 
@@ -3434,93 +3440,15 @@ RENORMALIZE_ROUTING_CONFIGS = [
         },
         id="RoutingRenormalize_large_experts",
     ),
-    pytest.param(
-        {
-            "num_experts": 128,
-            "top_k": 8,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": None,
-            "has_routing_bias": False,
-            "routing_method_type": RoutingMethodType.Default,
-            "compatible_moe_impls": [
-                FP8PerTensorMoe,
-                FP8BlockScaleMoe,
-                FP4Moe,
-                BF16Moe,
-                MxInt4BlockScaleMoe,
-            ],
-            "compatible_intermediate_size": [384, 768, 1024],
-            "enable_autotune": False,
-        },
-        id="Default_128e_top8",
-    ),
-    pytest.param(
-        {
-            "num_experts": 128,
-            "top_k": 8,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": None,
-            "has_routing_bias": False,
-            "routing_method_type": RoutingMethodType.SigmoidRenorm,
-            "compatible_moe_impls": [
-                FP8PerTensorMoe,
-                FP8BlockScaleMoe,
-                FP4Moe,
-                BF16Moe,
-                MxInt4BlockScaleMoe,
-            ],
-            "compatible_intermediate_size": [384, 768, 1024],
-            "enable_autotune": False,
-        },
-        id="SigmoidRenorm_128e_top8",
-    ),
-    pytest.param(
-        {
-            "num_experts": 256,
-            "top_k": 6,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": None,
-            "has_routing_bias": True,
-            "routing_method_type": RoutingMethodType.MiniMax2,
-            "compatible_moe_impls": [
-                FP8PerTensorMoe,
-                FP8BlockScaleMoe,
-                FP4Moe,
-                BF16Moe,
-                MxInt4BlockScaleMoe,
-            ],
-            "compatible_intermediate_size": [384, 768, 1024],
-            "enable_autotune": False,
-        },
-        id="MiniMax2_256e_top6_no_scale",
-    ),
-    # MiniMax2 with routed_scaling != None. The no_scale variant above uses routed_scaling=None
-    # (the kernel's scale multiply is a no-op there), so this is the only case exercising
-    # routing_reference_minimax2's `raw_weights * routed_scaling_factor` branch. routed_scaling is
-    # routing-math only and quant-independent, so it's pinned to a single quant + intermediate size
-    # (3 tests instead of the full quant x layout x shape sweep) — a routing-only smoke.
-    pytest.param(
-        {
-            "num_experts": 256,
-            "top_k": 6,
-            "padding": 8,
-            "n_groups": None,
-            "top_k_groups": None,
-            "routed_scaling": 3.0,
-            "has_routing_bias": True,
-            "routing_method_type": RoutingMethodType.MiniMax2,
-            "compatible_moe_impls": [BF16Moe],
-            "compatible_intermediate_size": [1024],
-            "enable_autotune": False,
-        },
-        id="MiniMax2_256e_top6_scale3",
-    ),
+    # Dropped from the dense grid: Default_128e_top8, SigmoidRenorm_128e_top8,
+    # MiniMax2_256e_top6_no_scale, MiniMax2_256e_top6_scale3. These files keep
+    # only Renormalize — the method production models (GPT-OSS, Qwen3,
+    # Qwen3-Next, Mixtral) route with. Routing math for Default / SigmoidRenorm
+    # / MiniMax2 (incl. routed_scaling and bias handling) is covered densely by
+    # tests/moe/test_trtllm_gen_routing.py against the same host oracles, and
+    # their from-logits launcher plumbing keeps smoke coverage via
+    # test_trtllm_gen_fused_moe.py::test_routing_dtype_flexibility. See
+    # docs/design_docs/moe_routing_test_decomposition.md.
 ]
 
 RENORMALIZE_WEIGHT_PROCESSING = [

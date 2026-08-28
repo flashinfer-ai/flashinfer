@@ -54,6 +54,19 @@ from tests.trace.template_registry import collect_registered_trace_templates
 # ---------------------------------------------------------------------------
 
 
+def test_svdquant_trace_activation_scale_tracks_variable_m():
+    from flashinfer.trace.templates.gemm import mm_nvfp4_svdquant_trace
+
+    assert isinstance(mm_nvfp4_svdquant_trace.axes["M"], Var)
+    assert isinstance(mm_nvfp4_svdquant_trace.axes["SF_A"], Var)
+    assert any(
+        constraint.startswith("SF_A ==")
+        and "M" in constraint
+        and "K_packed" in constraint
+        for constraint in mm_nvfp4_svdquant_trace.constraints
+    )
+
+
 def _resolved_param(json_key: str, descriptor) -> str:
     """Return the function-parameter name that descriptor maps to."""
     p = getattr(descriptor, "param", None)
@@ -160,6 +173,32 @@ def assert_template_axes_covered(
         f"{pfx}Template '{template.name_prefix or template.op_type}' "
         f"has Const axes with no tensor/scalar source: {uncovered}"
     )
+
+
+_ALLOWED_CONSTRAINT_BUILTINS = {"max"}
+
+
+def assert_template_constraints_valid(
+    template: TraceTemplate,
+    *,
+    label: str = "",
+) -> None:
+    """Assert constraints are expressions over declared axes and inputs."""
+    allowed_names = (
+        set(template.axes) | set(template.inputs) | _ALLOWED_CONSTRAINT_BUILTINS
+    )
+    for constraint in template.constraints:
+        expression = ast.parse(constraint, mode="eval")
+        referenced_names = {
+            node.id for node in ast.walk(expression) if isinstance(node, ast.Name)
+        }
+        unknown_names = referenced_names - allowed_names
+        pfx = f"[{label}] " if label else ""
+        assert not unknown_names, (
+            f"{pfx}Template '{template.name_prefix or template.op_type}' "
+            f"constraint {constraint!r} references undeclared names: "
+            f"{sorted(unknown_names)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +372,14 @@ _PAIR_IDS = [label for _, _, label in _ALL_PAIRS]
 
 _EXPECTED_PRIMTS_TRACE_VARIANTS = {
     (
+        "flashinfer.attention.prims_ts.block_sparse",
+        "block_sparse_attention",
+    ): 1,
+    (
+        "flashinfer.attention.prims_ts.block_sparse",
+        "block_sparse_attention_with_paged_kv_cache",
+    ): 2,
+    (
         "flashinfer.attention.prims_ts.decode",
         "batch_decode_with_paged_kv_cache",
     ): 12,
@@ -377,7 +424,7 @@ def test_template_axes_covered(func, template, label):
 
 
 def test_attention_ts_trace_registry_coverage():
-    """All six public decode surfaces register their complete variant sets."""
+    """All public PrimTS attention surfaces register their complete variants."""
 
     discovered = Counter(
         (func.__module__, func.__qualname__)
@@ -385,13 +432,15 @@ def test_attention_ts_trace_registry_coverage():
         if func.__module__.startswith("flashinfer.attention.prims_ts")
     )
     assert discovered == Counter(_EXPECTED_PRIMTS_TRACE_VARIANTS)
-    assert sum(discovered.values()) == 48
+    assert sum(discovered.values()) == 51
 
 
 def test_attention_ts_trace_constraints_match_cache_axes():
-    """PrimTS cache constraints are valid expressions over defined axes."""
+    """PrimTS constraints are valid expressions over defined axes."""
     from flashinfer.trace.templates.attention import (
         attention_ts_decode_trace_dispatch,
+        prims_ts_block_sparse_trace,
+        prims_ts_paged_block_sparse_trace_dispatch,
         prims_ts_decode_mla_one_shot_trace_dispatch,
         prims_ts_decode_mla_trace_dispatch,
         prims_ts_decode_mla_wrapper_trace_dispatch,
@@ -409,18 +458,15 @@ def test_attention_ts_trace_constraints_match_cache_axes():
         prims_ts_decode_mla_one_shot_trace_dispatch,
         prims_ts_decode_mla_wrapper_trace_dispatch,
     )
+    block_sparse_templates = (
+        prims_ts_block_sparse_trace,
+        *prims_ts_paged_block_sparse_trace_dispatch.templates,
+    )
     for dispatch in (*fmha_dispatches, *mla_dispatches):
         for template in dispatch.templates:
-            for constraint in template.constraints:
-                tree = ast.parse(constraint, mode="eval")
-                referenced_names = {
-                    node.id for node in ast.walk(tree) if isinstance(node, ast.Name)
-                }
-                allowed_names = set(template.axes) | set(template.inputs) | {"max"}
-                assert referenced_names <= allowed_names, (
-                    f"{template.name_prefix}: constraint {constraint!r} references "
-                    f"undeclared names {sorted(referenced_names - allowed_names)}"
-                )
+            assert_template_constraints_valid(template, label=dispatch.__name__)
+    for template in block_sparse_templates:
+        assert_template_constraints_valid(template, label="prims_ts_block_sparse")
 
     for dispatch in fmha_dispatches:
         for template in dispatch.templates:
@@ -438,6 +484,71 @@ def test_attention_ts_trace_constraints_match_cache_axes():
             assert ("kv_pad_dim == 1" in template.constraints) == (
                 "kv_pad_dim" in template.axes
             )
+
+
+def test_prims_ts_block_sparse_trace_describes_gqa_contract():
+    from flashinfer.trace.templates.attention import (
+        prims_ts_block_sparse_trace,
+        prims_ts_paged_block_sparse_trace_dispatch,
+    )
+
+    constraints = set(prims_ts_block_sparse_trace.constraints)
+    assert "num_qo_heads % num_kv_heads == 0" in constraints
+    assert "num_qo_heads // num_kv_heads in (1, 2, 4, 8, 16, 32)" in constraints
+    assert "num_qo_heads == num_kv_heads" not in constraints
+    assert "q_block_size > 0" in constraints
+    assert "(q_block_size * (num_qo_heads // num_kv_heads)) % 8 == 0" in constraints
+    assert "kv_block_size >= 64 or q_block_size in (8, 16, 32)" not in constraints
+    assert "MHA/GQA/MQA" in prims_ts_block_sparse_trace.description
+    assert "per-KV-head BSR" in prims_ts_block_sparse_trace.description
+
+    paged_templates = {
+        template.name_prefix: template
+        for template in prims_ts_paged_block_sparse_trace_dispatch.templates
+    }
+    tuple_trace = paged_templates["prims_ts_paged_block_sparse_tuple"]
+    combined_trace = paged_templates["prims_ts_paged_block_sparse_combined"]
+    common_inputs = {
+        "q",
+        "paged_kv_indptr",
+        "paged_kv_indices",
+        "seq_len_kv",
+        "seq_lens_kv",
+        "block_indptr",
+        "block_indices",
+        "q_block_size",
+        "kv_block_size",
+        "kv_valid_bits",
+        "mask_type",
+        "sm_scale",
+    }
+    for template in (tuple_trace, combined_trace):
+        assert common_inputs <= template.inputs.keys()
+        assert "paged KV" in template.description
+
+    assert tuple_trace.inputs["k_cache"].param == "paged_kv_cache"
+    assert tuple_trace.inputs["k_cache"].tuple_idx == 0
+    assert tuple_trace.inputs["v_cache"].param == "paged_kv_cache"
+    assert tuple_trace.inputs["v_cache"].tuple_idx == 1
+    assert combined_trace.inputs["paged_kv_cache"].dim_names == [
+        "num_pages",
+        "kv_planes",
+        "num_kv_heads",
+        "page_size",
+        "head_dim",
+    ]
+    assert "kv_planes == 2" in combined_trace.constraints
+
+    tuple_cache = (torch.empty(1), torch.empty(1))
+    combined_cache = torch.empty(1)
+    assert (
+        prims_ts_paged_block_sparse_trace_dispatch(paged_kv_cache=tuple_cache)
+        is tuple_trace
+    )
+    assert (
+        prims_ts_paged_block_sparse_trace_dispatch(paged_kv_cache=combined_cache)
+        is combined_trace
+    )
 
 
 def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():

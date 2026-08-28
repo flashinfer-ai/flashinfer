@@ -15,7 +15,7 @@ limitations under the License.
 """
 
 import os
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import jinja2
 import torch
@@ -42,6 +42,66 @@ from ..utils import (
 from .utils import _is_nvfp4_kv_dtype, generate_additional_params
 from .fmha_v2.generate_kernels import enumerate_kernels
 from .fmha_v2.fmha_library import generate_jit_sources
+
+
+class _BatchMLAModuleProxy:
+    """Stages Batch MLA planner metadata through PyTorch-owned pinned memory."""
+
+    def __init__(self, module: Any) -> None:
+        self._module = module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._module, name)
+
+    @staticmethod
+    def _validate_workspace(
+        int_workspace: torch.Tensor, page_locked_workspace: torch.Tensor
+    ) -> None:
+        if (
+            page_locked_workspace.device.type != "cpu"
+            or not page_locked_workspace.is_pinned()
+            or not page_locked_workspace.is_contiguous()
+        ):
+            raise ValueError(
+                "page_locked_workspace must be a pinned, contiguous CPU tensor."
+            )
+        if int_workspace.device.type != "cuda" or not int_workspace.is_contiguous():
+            raise ValueError("int_workspace must be a contiguous CUDA tensor.")
+
+    def plan_with_staged_workspace_bytes(self, *args: object) -> tuple[object, int]:
+        if (
+            len(args) < 3
+            or not isinstance(args[1], torch.Tensor)
+            or not isinstance(args[2], torch.Tensor)
+        ):
+            raise ValueError("Batch MLA plan requires integer and pinned workspaces.")
+        int_workspace = args[1]
+        page_locked_workspace = args[2]
+        self._validate_workspace(int_workspace, page_locked_workspace)
+        plan_info, staged_int_workspace_bytes = self._module.plan(*args)
+        staged_int_workspace_bytes = int(staged_int_workspace_bytes)
+        scratch_bytes = page_locked_workspace.view(torch.uint8)
+        device_bytes = int_workspace.view(torch.uint8)
+        if (
+            staged_int_workspace_bytes < 0
+            or staged_int_workspace_bytes > scratch_bytes.numel()
+            or staged_int_workspace_bytes > device_bytes.numel()
+        ):
+            raise ValueError(
+                "Batch MLA planner returned invalid "
+                f"staged_int_workspace_bytes={staged_int_workspace_bytes} for "
+                f"scratch={scratch_bytes.numel()} and device={device_bytes.numel()}."
+            )
+        staging = torch.empty(
+            staged_int_workspace_bytes, dtype=torch.uint8, pin_memory=True
+        )
+        staging.copy_(scratch_bytes[:staged_int_workspace_bytes])
+        with torch.cuda.device(int_workspace.device):
+            device_bytes[:staged_int_workspace_bytes].copy_(staging, non_blocking=True)
+        return plan_info, staged_int_workspace_bytes
+
+    def plan(self, *args: object) -> object:
+        return self.plan_with_staged_workspace_bytes(*args)[0]
 
 
 def get_single_decode_uri(
@@ -107,7 +167,7 @@ def get_batch_mla_uri(
         f"dtype_idx_{filename_safe_dtype_map[dtype_idx]}_"
         f"head_dim_ckv_{head_dim_ckv}_"
         f"head_dim_kpe_{head_dim_kpe}_"
-        f"profiler_{use_profiler}"
+        f"profiler_{use_profiler}_planabi2"
     ) + ("_sm90" if backend == "fa3" else "")
 
 
@@ -204,6 +264,7 @@ def gen_batch_mla_module(
         uri,
         source_paths,
         extra_cuda_cflags=extra_cuda_cflags,
+        post_load_adapter=_BatchMLAModuleProxy,
     )
 
 
