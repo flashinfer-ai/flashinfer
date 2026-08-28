@@ -167,10 +167,6 @@ def bsa_attn_sm120_blk64_fwd(
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
 
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-
     if out is not None:
         assert out.dtype == q.dtype, (
             f"out.dtype ({out.dtype}) must match q.dtype ({q.dtype}): "
