@@ -28,6 +28,7 @@ _TOP_K = 8
 _FIXED_EXPERT_ROWS = 32768
 _MAX_Y_GROUPS = 512
 _DESCRIPTOR_BYTES = 128
+_FC1_WEIGHT_BOX_DIM = (64, 128, 2, 1)
 _SOURCE_NAME = "flashinfer_blackwell_moe_ep_layer_sm100.cu"
 _STAGE_NAMES = (
     "input_barrier",
@@ -803,7 +804,7 @@ class BlackwellBf16RankMajorSession:
                     2 * _INTERMEDIATE_SIZE * 64 * 2,
                     (_HIDDEN_SIZE // 64) * 2 * _INTERMEDIATE_SIZE * 64 * 2,
                 ),
-                (64, 64, 2, 1),
+                _FC1_WEIGHT_BOX_DIM,
             ),
             (
                 "fc1_recv_hidden",

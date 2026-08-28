@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import math
 import sys
 from dataclasses import replace
 from functools import cache
@@ -100,6 +101,15 @@ def test_session_import_defers_optional_cuda_driver_bindings():
     driver_before = sys.modules.get("cuda.bindings.driver")
     _session_module()
     assert sys.modules.get("cuda.bindings.driver") is driver_before
+
+
+def test_fc1_weight_tensor_map_matches_kernel_transaction_bytes():
+    module = _session_module()
+
+    assert module._FC1_WEIGHT_BOX_DIM == (64, 128, 2, 1)
+    assert torch.tensor([], dtype=torch.bfloat16).element_size() * math.prod(
+        module._FC1_WEIGHT_BOX_DIM
+    ) == 32768
 
 
 def test_packaged_source_manifest_is_complete_and_self_consistent():
