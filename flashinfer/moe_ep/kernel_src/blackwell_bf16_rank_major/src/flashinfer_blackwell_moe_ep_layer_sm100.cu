@@ -20,6 +20,10 @@
 #include <cuda.h>
 #include <cuda_bf16.h>
 
+struct __align__(128) FlashInferTensorMap { uint64_t opaque[16]; };
+template <int N>
+struct __align__(128) FlashInferTensorMapPack { FlashInferTensorMap maps[N]; };
+
 __device__ __forceinline__ int make_warp_uniform(int x) {
     int result;
     asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
