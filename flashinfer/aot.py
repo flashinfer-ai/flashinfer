@@ -135,6 +135,7 @@ from .jit.page import gen_page_module
 from .jit.quantization import gen_quantization_module
 from .jit.rope import gen_rope_module
 from .jit.sampling import gen_sampling_module
+from .jit.vibecuda_softmax import gen_vibecuda_softmax_module
 from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
@@ -773,6 +774,10 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
+        # VibeCUDA cluster-softmax backend: SM100-class only (thread clusters,
+        # DSM pair pools, packed f32x2 exp math).
+        if has_sm100 or has_sm103:
+            jit_specs.append(gen_vibecuda_softmax_module())
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
         if has_sm100:
             for C in _SUPPORTED_C:
