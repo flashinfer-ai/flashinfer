@@ -467,7 +467,14 @@ def _resolve_cpb(
     )
     cpb = _cpb_hot_cache.get(hot_key)
     if cpb is None:
-        cpb = _cpb.select_cpb(num_tokens, num_heads, topk, extra_topk, c)
+        cpb = _cpb.select_cpb(
+            num_tokens,
+            num_heads,
+            topk,
+            extra_topk,
+            c,
+            chunk_width=_cpb._CHUNK_WIDTH[cpb_family],
+        )
         _cpb_hot_cache[hot_key] = cpb
     return cpb
 

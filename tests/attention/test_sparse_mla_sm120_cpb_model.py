@@ -246,7 +246,7 @@ def dsv4_constants() -> CpbConstants:
     )
 
 
-@pytest.fixture(scope="module", params=["dsv4", "glm53_nope"])
+@pytest.fixture(scope="module", params=["dsv4", "glm53_nope", "dots3_swa"])
 def family_constants(request: pytest.FixtureRequest) -> tuple[str, CpbConstants]:
     from flashinfer.mla._sparse_mla_sm120 import (
         _get_sparse_mla_sm120_decode_module,

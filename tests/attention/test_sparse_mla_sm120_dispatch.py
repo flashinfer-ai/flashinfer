@@ -51,10 +51,12 @@ from flashinfer.mla._sparse_mla_sm120 import (
     _DECODE_DSV4_DISPATCH,
     _DECODE_GLM53_NOPE_DISPATCH,
     _DECODE_MAX_TOKENS,
+    _DECODE_DOTS3_SWA_DISPATCH,
     _MODEL_TYPE_DSV3_2,
     _MODEL_TYPE_DSV4,
     _MODEL_TYPE_GLM_NSA,
     _MODEL_TYPE_GLM53_NOPE,
+    _MODEL_TYPE_DOTS3_SWA,
     _decode_dispatch_error_message,
     _decode_dsv3_2_dispatchable,
     _decode_dsv4_dispatchable,
@@ -64,7 +66,7 @@ from flashinfer.mla._sparse_mla_sm120 import (
 def test_supported_configs_families() -> None:
     """The query API mirrors the private dispatch tables exactly."""
     configs = supported_sparse_mla_sm120_configs()
-    assert set(configs) == {"dsv4", "dsv3_2", "glm_nsa", "glm53_nope"}
+    assert set(configs) == {"dsv4", "dsv3_2", "glm_nsa", "glm53_nope", "dots3_swa"}
     assert all(
         isinstance(config, SparseMLASm120DecodeConfig) for config in configs.values()
     )
@@ -87,6 +89,11 @@ def test_supported_configs_families() -> None:
     assert glm53.d_qk == 512
     assert glm53.page_block_size == 64
     assert glm53.head_topk_pairs == _DECODE_GLM53_NOPE_DISPATCH
+
+    dots3_swa = configs["dots3_swa"]
+    assert dots3_swa.d_qk == 1088
+    assert dots3_swa.page_block_size == 64
+    assert dots3_swa.head_topk_pairs == _DECODE_DOTS3_SWA_DISPATCH
 
     # The lazy export resolves through the public flashinfer.mla namespace.
     assert (
@@ -579,3 +586,94 @@ def test_plan_glm53_nope_swapab(known_crossover) -> None:
             plan_mod._PREFILL_IMPL_SWAPAB,
             torch.device("cpu"),
         )
+
+
+def test_plan_dots3_swa_decode_and_prefill(known_crossover) -> None:
+    """DOTS3_SWA: decode at (H, 576) for T<=64; SG-only prefill above."""
+    plan_mod, _ = known_crossover
+    for num_heads in (8, 16, 32, 64):
+        planned = plan_mod.plan(
+            4,
+            num_heads,
+            576,
+            _MODEL_TYPE_DOTS3_SWA,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+        )
+        assert planned is not None
+        assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
+    # Past the decode-form cutoff every supported head count routes to SG —
+    # DOTS3_SWA has no MG/swapAB form, so H=64 must not route to swapAB even
+    # though 64 is in the swapAB head set for the V32 family.
+    for num_heads in (8, 16, 32, 64):
+        planned = plan_mod.plan(
+            65,
+            num_heads,
+            576,
+            _MODEL_TYPE_DOTS3_SWA,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+        )
+        assert planned is not None
+        assert planned.variant is plan_mod.KernelVariant.PREFILL_SG
+    # topk != 576 is uninstantiated on both sides.
+    assert (
+        plan_mod.plan(
+            4,
+            64,
+            512,
+            _MODEL_TYPE_DOTS3_SWA,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+        )
+        is None
+    )
+    # Forcing swapAB on the SG-only family raises.
+    with pytest.raises(ValueError, match="V32-family"):
+        plan_mod.plan(
+            128,
+            64,
+            576,
+            _MODEL_TYPE_DOTS3_SWA,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_SWAPAB,
+            torch.device("cpu"),
+        )
+
+
+def test_plan_dots3_swa_crossover(known_crossover) -> None:
+    """Injected crossover applies to the dots3_swa key space."""
+    plan_mod, table = known_crossover
+    table["dots3_swa|64|576"] = 8
+    plan_mod._plan_memo.clear()
+    planned = plan_mod.plan(
+        8,
+        64,
+        576,
+        _MODEL_TYPE_DOTS3_SWA,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    assert (
+        planned is not None and planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
+    )
+    planned = plan_mod.plan(
+        16,
+        64,
+        576,
+        _MODEL_TYPE_DOTS3_SWA,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
+    )
+    assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_SG

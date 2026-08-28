@@ -66,8 +66,13 @@ _SCHEMA_VERSION = 2
 # v1 files predate the crossover table: constants load, crossover counts as
 # absent and the runtime falls back to the default decode-first policy.
 _LOADABLE_SCHEMA_VERSIONS = (1, 2)
-_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 656}
-_D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512}
+_BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 656, "dots3_swa": 1160}
+_D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512, "dots3_swa": 1088}
+_D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024}
+# Kernel candidate-tile width per family: DOTS3_SWA decodes at BI=32 (its
+# 1040-byte KV smem stride does not fit BI=64); the others run 64. The head
+# tile is HPB=16 for every family.
+_CHUNK_WIDTH = {"dsv4": 64, "dsv3_2": 64, "glm53_nope": 64, "dots3_swa": 32}
 
 # Device-level key in the JSON payload holding the crossover table.
 _DECODE_MAX_TOKENS_KEY = "decode_max_tokens"
@@ -99,6 +104,26 @@ _MEASUREMENTS_GLM53_NOPE = (
     # Half the waves of M3 at half the split count, keeping the (waves, s)
     # rows non-proportional for the c0/beta lstsq.
     (32, 64, 2176, 2),
+)
+# DOTS3_SWA decode is instantiated at topk=576 only (N=18 chunks at the 32-wide
+# tile, fixed). Its per-block fixed cost dwarfs the marginal per-chunk cost, so
+# a narrow same-splits cpb pair (like glm53_nope's) lands under timing noise.
+# Instead M1 (cpb=1) vs M2 (cpb=17) identify the per-chunk time from a two-
+# point solve over waves and cpb, assuming beta ~ 0 at identification
+# (measured 0 on every family; the lstsq re-solves c0/beta afterwards).
+# M5 is the latency point. The num_chunks basis is topk (the launched split
+# grid), not the 513-token window: the kernel clamps the scan to WINDOW inside
+# each block but the grid — and therefore the wave structure the model prices —
+# is sized from TOPK.
+_MEASUREMENTS_DOTS3_SWA = (
+    (64, 64, 576, 1),
+    (64, 64, 576, 17),
+    (64, 32, 576, 1),
+    (32, 64, 576, 2),
+    (1, 32, 576, 18),
+    # Same waves as M2 at a different cpb and split count, keeping the
+    # (waves, s) rows non-proportional for the c0/beta lstsq.
+    (64, 64, 576, 9),
 )
 
 _POOL_BYTES_TARGET = 2 << 30  # >> L2, so calibration traffic is HBM-faithful
@@ -148,8 +173,10 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
 
-def _num_chunks(topk: int, extra_topk: int) -> int:
-    return _ceil_div(topk, _BI) + (_ceil_div(extra_topk, _BI) if extra_topk else 0)
+def _num_chunks(topk: int, extra_topk: int, chunk_width: int = _BI) -> int:
+    return _ceil_div(topk, chunk_width) + (
+        _ceil_div(extra_topk, chunk_width) if extra_topk else 0
+    )
 
 
 def predict_time_s(
@@ -159,6 +186,7 @@ def predict_time_s(
     extra_topk: int,
     cpb: int,
     c: CpbConstants,
+    chunk_width: int = _BI,
 ) -> float:
     """Predicted wall time (seconds) of one decode call at ``cpb``.
 
@@ -169,7 +197,7 @@ def predict_time_s(
     concurrent SMs share HBM) and the single-SM latency-bound term.
     """
     h_b = _ceil_div(num_heads, _HPB)
-    n = _num_chunks(topk, extra_topk)
+    n = _num_chunks(topk, extra_topk, chunk_width)
     g = num_tokens * h_b * _ceil_div(n, cpb)
     waves = _ceil_div(g, c.sm_count)
     t_c = max(
@@ -180,7 +208,12 @@ def predict_time_s(
 
 
 def select_cpb(
-    num_tokens: int, num_heads: int, topk: int, extra_topk: int, c: CpbConstants
+    num_tokens: int,
+    num_heads: int,
+    topk: int,
+    extra_topk: int,
+    c: CpbConstants,
+    chunk_width: int = _BI,
 ) -> int:
     """Argmin of :func:`predict_time_s` over cpb in 1..N; ties prefer larger cpb.
 
@@ -192,11 +225,11 @@ def select_cpb(
     so candidates past the L2 footprint are excluded. Falls back to the
     unconstrained argmin if nothing fits (e.g. unknown L2 size).
     """
-    n = _num_chunks(topk, extra_topk)
+    n = _num_chunks(topk, extra_topk, chunk_width)
     h_b = _ceil_div(num_heads, _HPB)
     best_cpb, best_t = 1, float("inf")
     for cpb in range(1, n + 1):
-        t = predict_time_s(num_tokens, num_heads, topk, extra_topk, cpb, c)
+        t = predict_time_s(num_tokens, num_heads, topk, extra_topk, cpb, c, chunk_width)
         if t <= best_t:
             best_cpb, best_t = cpb, t
     if not c.l2_cache_bytes:
@@ -206,7 +239,7 @@ def select_cpb(
         g = num_tokens * h_b * _ceil_div(n, cpb)
         if min(g, c.sm_count) * cpb * c.bytes_per_chunk > c.l2_cache_bytes:
             continue
-        t = predict_time_s(num_tokens, num_heads, topk, extra_topk, cpb, c)
+        t = predict_time_s(num_tokens, num_heads, topk, extra_topk, cpb, c, chunk_width)
         if t <= capped_t:
             capped_cpb, capped_t = cpb, t
     return capped_cpb or best_cpb
@@ -216,8 +249,10 @@ def _allocate_kv_pool(family: str, device: torch.device) -> tuple[torch.Tensor, 
     """Allocate a ~2 GiB paged KV pool for ``family`` (halved on OOM down to
     512 MiB) and return it with its slot count. The 2-D ``[blocks, bytes]``
     form is accepted by the FFI binding, which derives the block stride from
-    the tensor metadata."""
-    w = _BI * _BYTES_PER_TOKEN[family]
+    the tensor metadata. The row is one 64-token page for every family — the
+    64 here is the page block size, not the family's chunk width (DOTS3_SWA
+    chunks 32 candidates per tile inside the same 64-token page)."""
+    w = 64 * _BYTES_PER_TOKEN[family]
     pool_bytes = _POOL_BYTES_TARGET
     while True:
         try:
@@ -231,7 +266,7 @@ def _allocate_kv_pool(family: str, device: torch.device) -> tuple[torch.Tensor, 
                 ) from None
             pool_bytes //= 2
             torch.cuda.empty_cache()
-    return kv_cache, kv_cache.shape[0] * _BI
+    return kv_cache, kv_cache.shape[0] * 64
 
 
 def _time_call(call: Callable[[], None]) -> float:
@@ -307,21 +342,27 @@ def calibrate(
     props = torch.cuda.get_device_properties(device)
     sm_count = int(props.multi_processor_count)
     l2_cache_bytes = int(getattr(props, "L2_cache_size", 0) or 0)
-    w = _BI * _BYTES_PER_TOKEN[family]
+    bi = _CHUNK_WIDTH[family]
+    w = bi * _BYTES_PER_TOKEN[family]
     d_qk = _D_QK[family]
-    if family == "glm53_nope":
-        measurements = _MEASUREMENTS_GLM53_NOPE
-        model_type = _MODEL_TYPE_GLM53_NOPE
-    else:
-        measurements = _MEASUREMENTS
-        model_type = _MODEL_TYPE_DSV3_2
+    d_v = _D_V[family]
+    # Families whose decode is instantiated at a single topk have a fixed N,
+    # so the bandwidth term is identified from a cpb pair instead of an N pair.
+    _CPB_PAIR_MEASUREMENTS = {
+        "glm53_nope": _MEASUREMENTS_GLM53_NOPE,
+        "dots3_swa": _MEASUREMENTS_DOTS3_SWA,
+    }
+    measurements = _CPB_PAIR_MEASUREMENTS.get(family, _MEASUREMENTS)
+    model_type = (
+        _MODEL_TYPE_GLM53_NOPE if family == "glm53_nope" else _MODEL_TYPE_DSV3_2
+    )
 
     kv_cache, num_slots = _allocate_kv_pool(family, device)
 
     module = module_getter()
 
     def measure(num_tokens: int, num_heads: int, topk: int, cpb: int) -> float:
-        num_splits = _ceil_div(topk, _BI)
+        num_splits = _ceil_div(topk, bi)
         q = (
             (
                 torch.randn(
@@ -333,17 +374,19 @@ def calibrate(
             .to(torch.bfloat16)
         )
         mid_out = torch.empty(
-            num_tokens, num_heads, num_splits, 512, dtype=torch.bfloat16, device=device
+            num_tokens, num_heads, num_splits, d_v, dtype=torch.bfloat16, device=device
         )
         mid_lse = torch.empty(
             num_tokens, num_heads, num_splits, dtype=torch.float32, device=device
         )
         output = torch.empty(
-            num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device
+            num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
         )
         out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
         sm_scale = d_qk**-0.5
-        if family == "dsv4":
+        if family in ("dsv4", "dots3_swa"):
+            # The decode-dsv4 FFI resolves the model type from d_qk (512 ->
+            # DSV4, 1088 -> DOTS3_SWA) and applies its tile config.
 
             def call(indices: torch.Tensor) -> None:
                 module.sparse_mla_sm120_decode_dsv4(
@@ -392,7 +435,7 @@ def calibrate(
 
     def shape_terms(num_tokens: int, num_heads: int, topk: int, cpb: int):
         h_b = _ceil_div(num_heads, _HPB)
-        n = _ceil_div(topk, _BI)
+        n = _ceil_div(topk, bi)
         splits = _ceil_div(n, cpb)
         waves = _ceil_div(num_tokens * h_b * splits, sm_count)
         return h_b, n, splits, waves
@@ -402,6 +445,11 @@ def calibrate(
     # The bytes_i * inv_bw residuals below carry a wave-quantization bias
     # (measured grid size g vs ceil-quantized waves) that partially cancels in
     # predict_time_s, which applies the same ceil.
+    def total_streamed_bytes(i: int) -> float:
+        tk, nh, tk_topk, _ = measurements[i]
+        h_b_i, n_i, _, _ = shape_terms(tk, nh, tk_topk, 1)
+        return tk * h_b_i * n_i * w
+
     if family == "glm53_nope":
         # N is fixed (topk=2176-only instantiation); M1/M2 differ in cpb
         # (17 vs 33) at identical waves and splits:
@@ -411,10 +459,38 @@ def calibrate(
         h_b1, _, splits1, waves1 = shape_terms(*measurements[0])
         g1 = tokens1 * h_b1 * splits1
         inv_bw = (t[1] - t[0]) / (waves1 * (cpb2 - cpb1) * min(g1, sm_count) * w)
+        residual_bytes = total_streamed_bytes
+    elif family == "dots3_swa":
+        # N is fixed (single-topk instantiation) and the marginal per-chunk
+        # cost is small next to the per-block fixed cost, so a same-waves cpb
+        # pair is noise-dominated. M1 (cpb=1) vs M2 (cpb=17) instead solve the
+        # two-equation system t_i = waves_i * (cpb_i * t_c + c0) + beta * s_i
+        # for t_c with beta ~ 0 at identification:
+        #   t_c = (t1/waves1 - t2/waves2) / (cpb1 - cpb2)
+        # The lstsq below re-solves (c0, beta); the identification-time c0 is
+        # discarded.
+        tokens1, _, _, cpb1 = measurements[0]
+        cpb2 = measurements[1][3]
+        h_b1, _, splits1, waves1 = shape_terms(*measurements[0])
+        _, _, _, waves2 = shape_terms(*measurements[1])
+        g1 = tokens1 * h_b1 * splits1
+        t_c = (t[0] / waves1 - t[1] / waves2) / (cpb1 - cpb2)
+        inv_bw = t_c / (min(g1, sm_count) * w)
+
+        # Wave-consistent residual: predict_time_s charges streaming per wave
+        # (waves * cpb * min(g, S) * W * inv_bw), so the residual must match
+        # that structure — the total-bytes form mischarges cpb-varying points.
+        def residual_bytes(i: int) -> float:
+            tk, nh, tk_topk, cpb_i = measurements[i]
+            h_b_i, _, splits_i, waves_i = shape_terms(tk, nh, tk_topk, cpb_i)
+            g_i = tk * h_b_i * splits_i
+            return waves_i * cpb_i * min(g_i, sm_count) * w
+
     else:
         h_b1, n1, _, _ = shape_terms(*measurements[0])
         _, n2, _, _ = shape_terms(*measurements[1])
         inv_bw = (t[1] - t[0]) / ((n2 - n1) * measurements[0][0] * h_b1 * w)
+        residual_bytes = total_streamed_bytes
 
     # Overheads over the saturated-regime points M1..M4 + M6 (M5 is the
     # latency point): t_i - bytes_i * inv_bw = c0 * waves_i + beta * s_i.
@@ -427,7 +503,7 @@ def calibrate(
         num_tokens, num_heads, topk, cpb = measurements[i]
         h_b, n, splits, waves = shape_terms(num_tokens, num_heads, topk, cpb)
         a_rows.append((waves, splits))
-        b_rows.append(t[i] - num_tokens * h_b * n * w * inv_bw)
+        b_rows.append(t[i] - residual_bytes(i) * inv_bw)
     (c0, beta), *_ = np.linalg.lstsq(np.array(a_rows), np.array(b_rows), rcond=None)
     if beta < 0:
         # NNLS active-set step; only a fallback for measurement noise, now
@@ -473,8 +549,9 @@ def calibrate_crossover(
     ``"dsv3_2"`` covers both the ``dsv3_2`` and ``glm_nsa`` key spaces because
     the scale format changes prefill speed; the decode kernel is timed with
     the matching ``model_type`` too. ``"glm53_nope"`` covers its own key
-    space at the topk=2176 instantiations. A config the prefill envelope does
-    not serve (e.g. DSV3_2-family topk != 2048) records
+    space at the topk=2176 instantiations, ``"dots3_swa"`` its own at the
+    topk=576 instantiations. A config the prefill envelope does not
+    serve (e.g. DSV3_2-family topk != 2048) records
     ``decode_max_tokens=64``.
 
     Returns a flat ``{"<family>|<num_heads>|<topk>": decode_max_tokens}``
@@ -485,10 +562,12 @@ def calibrate_crossover(
         _DECODE_DSV3_2_DISPATCH,
         _DECODE_DSV4_DISPATCH,
         _DECODE_GLM53_NOPE_DISPATCH,
+        _DECODE_DOTS3_SWA_DISPATCH,
         _MODEL_TYPE_DSV3_2,
         _MODEL_TYPE_DSV4,
         _MODEL_TYPE_GLM_NSA,
         _MODEL_TYPE_GLM53_NOPE,
+        _MODEL_TYPE_DOTS3_SWA,
     )
     from ._sparse_mla_sm120_plan import (
         _PREFILL_IMPL_AUTO,
@@ -508,18 +587,24 @@ def calibrate_crossover(
         spaces = [
             ("glm53_nope", sorted(_DECODE_GLM53_NOPE_DISPATCH), _MODEL_TYPE_GLM53_NOPE)
         ]
+    elif family == "dots3_swa":
+        spaces = [
+            ("dots3_swa", sorted(_DECODE_DOTS3_SWA_DISPATCH), _MODEL_TYPE_DOTS3_SWA)
+        ]
     else:
         raise ValueError(f"unknown sparse-MLA family {family!r}")
 
     d_qk = _D_QK[family]
+    d_v = _D_V[family]
+    bi = _CHUNK_WIDTH[family]
     sm_scale = d_qk**-0.5
     kv_cache, num_slots = _allocate_kv_pool(family, device)
 
     def time_decode(
         num_tokens: int, num_heads: int, topk: int, model_type: int
     ) -> float:
-        num_splits = _ceil_div(topk, _BI)
-        cpb = select_cpb(num_tokens, num_heads, topk, 0, c)
+        num_splits = _ceil_div(topk, bi)
+        cpb = select_cpb(num_tokens, num_heads, topk, 0, c, chunk_width=bi)
         q = (
             (
                 torch.randn(
@@ -531,16 +616,16 @@ def calibrate_crossover(
             .to(torch.bfloat16)
         )
         mid_out = torch.empty(
-            num_tokens, num_heads, num_splits, 512, dtype=torch.bfloat16, device=device
+            num_tokens, num_heads, num_splits, d_v, dtype=torch.bfloat16, device=device
         )
         mid_lse = torch.empty(
             num_tokens, num_heads, num_splits, dtype=torch.float32, device=device
         )
         output = torch.empty(
-            num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device
+            num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
         )
         out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
-        if family == "dsv4":
+        if family in ("dsv4", "dots3_swa"):
 
             def call(indices: torch.Tensor) -> None:
                 module.sparse_mla_sm120_decode_dsv4(
@@ -604,7 +689,7 @@ def calibrate_crossover(
             .to(torch.bfloat16)
         )
         output = torch.empty(
-            num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device
+            num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
         )
         out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
 
