@@ -86,8 +86,11 @@ class MoERunner(TunableRunner):
         self.use_packed_weights = use_packed_weights
         self.use_per_token_scaling = use_per_token_scaling
         self.num_experts = num_experts if num_experts is not None else num_local_experts
-        self._topk_initializer_source = None
-        self._topk_initializer = None
+        # Runtime routing tensors and their initializer closures carry object
+        # identity, so keep them in an attribute excluded by
+        # TunableRunner.__hash__.  Otherwise logically identical runners built
+        # by successive API calls cannot reuse an in-memory tuned tactic.
+        self._topk_initializer_cache = None
 
     def _make_tuning_config(
         self,
@@ -97,12 +100,15 @@ class MoERunner(TunableRunner):
         **kwargs,
     ) -> TuningConfig:
         if moe_inputs.topk_ids is not None and moe_inputs.topk_ids.numel() > 0:
-            if self._topk_initializer_source is not moe_inputs.topk_ids:
-                self._topk_initializer_source = moe_inputs.topk_ids
-                self._topk_initializer = make_repeating_tensor_initializer(
-                    moe_inputs.topk_ids
+            if (
+                self._topk_initializer_cache is None
+                or self._topk_initializer_cache[0] is not moe_inputs.topk_ids
+            ):
+                self._topk_initializer_cache = (
+                    moe_inputs.topk_ids,
+                    make_repeating_tensor_initializer(moe_inputs.topk_ids),
                 )
-            init_packed_topk_ids = self._topk_initializer
+            init_packed_topk_ids = self._topk_initializer_cache[1]
         else:
             init_packed_topk_ids = moe_topk_ids_init(
                 self.num_experts,

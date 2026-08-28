@@ -114,17 +114,40 @@ def test_topk_initializer_matches_routing_representation():
     ) is moe_topk_ids_init(num_experts, packed=False)
 
 
-def test_mxfp4_mxfp8_runner_initializes_runtime_routing_cache():
-    runner = PrimsTsMxfp4Mxfp8MoERunner(
-        object(),
-        top_k=4,
-        num_local_experts=8,
-        hidden_size=128,
-        intermediate_size=128,
-    )
+def test_mxfp4_mxfp8_runtime_routing_cache_preserves_runner_hash():
+    moe_op = object()
 
-    assert runner._topk_initializer_source is None
-    assert runner._topk_initializer is None
+    def make_runner():
+        return PrimsTsMxfp4Mxfp8MoERunner(
+            moe_op,
+            top_k=4,
+            num_local_experts=8,
+            hidden_size=128,
+            intermediate_size=128,
+        )
+
+    def make_inputs():
+        return MoeRunnerInputs(
+            output=torch.empty(4, 128),
+            routing_logits=None,
+            topk_ids=torch.zeros(4, 4, dtype=torch.int32),
+            expert_weights=torch.empty(4, 4),
+            hidden_states=torch.empty(4, 128),
+            hidden_states_scale=torch.empty(4, 4, dtype=torch.uint8),
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+
+    first, second = make_runner(), make_runner()
+    first_inputs, second_inputs = make_inputs(), make_inputs()
+    assert hash(first) == hash(second)
+
+    first._make_tuning_config(first_inputs, tune_max_num_tokens=4)
+    second._make_tuning_config(second_inputs, tune_max_num_tokens=4)
+
+    assert first._topk_initializer_cache[0] is first_inputs.topk_ids
+    assert second._topk_initializer_cache[0] is second_inputs.topk_ids
+    assert hash(first) == hash(second)
 
 
 def test_gemm_launches_use_local_expert_count():
