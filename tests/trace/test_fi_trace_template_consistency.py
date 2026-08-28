@@ -666,6 +666,9 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
             fmha_wrapper.run,
             q=q,
             paged_kv_cache=(k_cache, v_cache),
+            seq_lens=seq_lens,
+            paged_kv_indptr=kv_indptr,
+            paged_kv_indices=kv_indices,
             mask_type="causal",
         ),
     )
@@ -701,6 +704,8 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
             mla_wrapper.run,
             query=mla_q,
             kv_cache=mla_cache,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
             mask_type="causal",
         ),
     )
@@ -715,6 +720,12 @@ def test_attention_ts_sq4_trace_dispatch_covers_all_public_decode_apis():
     )
     definitions = (*fmha_definitions, *mla_definitions)
     assert tuple(definition["name"] for definition in definitions) == expected_names
+    assert {
+        "paged_kv_indptr",
+        "paged_kv_indices",
+        "seq_lens",
+    } <= fmha_definitions[2]["inputs"].keys()
+    assert {"block_tables", "seq_lens"} <= mla_definitions[2]["inputs"].keys()
     for definition in definitions:
         assert definition["axes"].get("seq_len_q", {}).get("value") == seq_len_q
         assert definition["inputs"]["mask_type"]["optional"] is True

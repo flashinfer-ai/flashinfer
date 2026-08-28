@@ -1,6 +1,6 @@
 {
   "name": "prims_ts_decode_wrapper_tuple_multi_q_sq4_h32_kv4_d128_ps32",
-  "description": "Reusable PrimTS GQA decode wrapper. Native CSR metadata, Q offsets, mask, window, and static bounds are retained by plan(); run() receives only Q, the HND cache, scales, and an optional output buffer.",
+  "description": "Reusable PrimTS GQA decode wrapper. The plan fixes mask, window, static bounds, and exact batch size; native CSR metadata and Q offsets may be retained by the plan or supplied live to run().",
   "op_type": "gqa_paged",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.decode.BatchDecodePagedTSWrapper.run",
@@ -38,9 +38,17 @@
       "type": "const",
       "value": 32
     },
+    "len_indptr": {
+      "type": "var",
+      "description": "Length of the live native CSR indptr."
+    },
+    "num_kv_indices": {
+      "type": "var",
+      "description": "Number of live page IDs."
+    },
     "len_qo_indptr": {
       "type": "var",
-      "description": "Length of plan-owned cumulative Q offsets."
+      "description": "Length of cumulative Q offsets."
     }
   },
   "constraints": [
@@ -49,6 +57,7 @@
     "num_qo_heads % num_kv_heads == 0",
     "1 <= num_qo_heads // num_kv_heads <= 32",
     "window_left == -1 or mask_type == 'causal'",
+    "paged_kv_indptr is None or len_indptr == batch_size + 1",
     "seq_len_q >= 2"
   ],
   "inputs": {
@@ -79,13 +88,37 @@
       ],
       "dtype": "bfloat16"
     },
+    "paged_kv_indptr": {
+      "shape": [
+        "len_indptr"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Native CSR offsets supplied live to run()."
+    },
+    "paged_kv_indices": {
+      "shape": [
+        "num_kv_indices"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Physical page IDs supplied live to run()."
+    },
+    "seq_lens": {
+      "shape": [
+        "batch_size"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Per-request KV lengths supplied live to run()."
+    },
     "qo_indptr": {
       "shape": [
         "len_qo_indptr"
       ],
       "dtype": "int32",
       "optional": true,
-      "description": "Cumulative Q offsets retained by plan()."
+      "description": "Cumulative Q offsets retained or supplied live."
     },
     "max_seq_len_q": {
       "shape": null,

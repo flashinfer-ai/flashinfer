@@ -1062,7 +1062,7 @@ prims_ts_decode_trace_dispatch.templates = list(  # type: ignore[attr-defined]
 def _make_prims_ts_decode_wrapper_trace(
     *, combined: bool, fp16_output: bool, q_mode: str
 ):
-    """Describe ``BatchDecodePagedTSWrapper.run`` and its plan-owned metadata."""
+    """Describe ``BatchDecodePagedTSWrapper.run`` and its retained/live metadata."""
 
     cache_form = "combined" if combined else "tuple"
     output_suffix = "_fp16_output" if fp16_output else ""
@@ -1074,7 +1074,9 @@ def _make_prims_ts_decode_wrapper_trace(
         "head_dim": Const(abbrev="d"),
         "num_pages": Var(description="Physical KV-cache page capacity."),
         "page_size": Const(abbrev="ps"),
-        "len_qo_indptr": Var(description="Length of plan-owned cumulative Q offsets."),
+        "len_indptr": Var(description="Length of the live native CSR indptr."),
+        "num_kv_indices": Var(description="Number of live page IDs."),
+        "len_qo_indptr": Var(description="Length of cumulative Q offsets."),
     }
     inputs: dict[str, Tensor | Scalar] = {"q": Tensor(q_shape)}
     _add_fmha_cache_schema(
@@ -1082,14 +1084,29 @@ def _make_prims_ts_decode_wrapper_trace(
     )
     inputs.update(
         {
-            # Wrapper metadata is supplied to plan(), not run(). It remains in
-            # the trace as optional context, matching the existing paged GQA
-            # wrapper templates elsewhere in this file.
+            "paged_kv_indptr": Tensor(
+                ["len_indptr"],
+                dtype="int32",
+                optional=True,
+                description="Native CSR offsets supplied live to run().",
+            ),
+            "paged_kv_indices": Tensor(
+                ["num_kv_indices"],
+                dtype="int32",
+                optional=True,
+                description="Physical page IDs supplied live to run().",
+            ),
+            "seq_lens": Tensor(
+                ["batch_size"],
+                dtype="int32",
+                optional=True,
+                description="Per-request KV lengths supplied live to run().",
+            ),
             "qo_indptr": Tensor(
                 ["len_qo_indptr"],
                 dtype="int32",
                 optional=True,
-                description="Cumulative Q offsets retained by plan().",
+                description="Cumulative Q offsets retained or supplied live.",
             ),
             "max_seq_len_q": Scalar("int32", optional=True),
             "mask_type": Scalar("string", optional=True),
@@ -1104,8 +1121,12 @@ def _make_prims_ts_decode_wrapper_trace(
         "num_qo_heads % num_kv_heads == 0",
         "1 <= num_qo_heads // num_kv_heads <= 32",
         "window_left == -1 or mask_type == 'causal'",
+        "paged_kv_indptr is None or len_indptr == batch_size + 1",
         *(
-            ["len_qo_indptr == batch_size + 1", "total_q == qo_indptr[-1].item()"]
+            [
+                "qo_indptr is None or len_qo_indptr == batch_size + 1",
+                "qo_indptr is None or total_q == qo_indptr[-1].item()",
+            ]
             if q_mode == _Q_PACKED
             else []
         ),
@@ -1118,9 +1139,9 @@ def _make_prims_ts_decode_wrapper_trace(
         op_type="gqa_paged",
         name_prefix=f"prims_ts_decode_wrapper_{cache_form}{output_suffix}{q_suffix}",
         description=(
-            "Reusable PrimTS GQA decode wrapper. Native CSR metadata, Q offsets, "
-            "mask, window, and static bounds are retained by plan(); run() receives "
-            "only Q, the HND cache, scales, and an optional output buffer."
+            "Reusable PrimTS GQA decode wrapper. The plan fixes mask, window, "
+            "static bounds, and exact batch size; native CSR metadata and Q "
+            "offsets may be retained by the plan or supplied live to run()."
         ),
         axes=axes,
         inputs=inputs,
@@ -1396,7 +1417,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(*, rank4_cache: bool, packed_query: 
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
     axes: dict[str, Var | Const] = {
-        "batch_size": Var(description="Number of plan-owned MLA requests."),
+        "batch_size": Var(description="Exact number of planned MLA requests."),
         "num_heads": Const(abbrev="h"),
         "head_dim_qk": Const(abbrev="d_qk"),
         # ``run()`` receives no scalar from which a literal value could be
@@ -1406,7 +1427,8 @@ def _make_prims_ts_decode_mla_wrapper_trace(*, rank4_cache: bool, packed_query: 
         "kv_lora_rank": Var(description="Fixed MLA output dimension (512)."),
         "num_pages": Var(description="Physical MLA cache page capacity."),
         "page_size": Const(abbrev="ps"),
-        "len_qo_indptr": Var(description="Length of plan-owned cumulative Q offsets."),
+        "max_pages_per_seq": Var(description="Live block-table column capacity."),
+        "len_qo_indptr": Var(description="Length of cumulative Q offsets."),
     }
     if packed_query:
         axes["total_q"] = Var(description="Total packed query-token count.")
@@ -1429,19 +1451,31 @@ def _make_prims_ts_decode_mla_wrapper_trace(*, rank4_cache: bool, packed_query: 
         op_type="mla_paged",
         name_prefix=f"prims_ts_decode_mla_wrapper{cache_suffix}{q_suffix}",
         description=(
-            "Reusable PrimTS MLA decode wrapper. Page tables, sequence lengths, "
-            "Q offsets, masks, and static bounds are retained by plan(); run() "
-            "receives only query, KV cache, scales, and an optional output buffer."
+            "Reusable PrimTS MLA decode wrapper. The plan fixes masks, static "
+            "bounds, and exact batch size; page tables, sequence lengths, and Q "
+            "offsets may be retained by the plan or supplied live to run()."
         ),
         axes=axes,
         inputs={
             "query": Tensor(query_dims),
             "kv_cache": Tensor(cache_dims),
+            "block_tables": Tensor(
+                ["batch_size", "max_pages_per_seq"],
+                dtype="int32",
+                optional=True,
+                description="Physical page table supplied live to run().",
+            ),
+            "seq_lens": Tensor(
+                ["batch_size"],
+                dtype="int32",
+                optional=True,
+                description="Per-request KV lengths supplied live to run().",
+            ),
             "qo_indptr": Tensor(
                 ["len_qo_indptr"],
                 dtype="int32",
                 optional=True,
-                description="Cumulative Q offsets retained by plan().",
+                description="Cumulative Q offsets retained or supplied live.",
             ),
             "max_seq_len_q": Scalar("int32", optional=True),
             "mask_type": Scalar("string", optional=True),
@@ -1453,9 +1487,13 @@ def _make_prims_ts_decode_mla_wrapper_trace(*, rank4_cache: bool, packed_query: 
             "head_dim_qk == 576",
             "kv_lora_rank == 512",
             "page_size in (16, 32, 64, 128)",
+            "block_tables is None or block_tables.shape[0] == batch_size",
             *(["kv_pad_dim == 1"] if rank4_cache else []),
             *(
-                ["len_qo_indptr == batch_size + 1", "total_q == qo_indptr[-1].item()"]
+                [
+                    "qo_indptr is None or len_qo_indptr == batch_size + 1",
+                    "qo_indptr is None or total_q == qo_indptr[-1].item()",
+                ]
                 if packed_query
                 else ["seq_len_q >= 1"]
             ),

@@ -1824,11 +1824,13 @@ with contextlib.suppress(Exception):
         kv_layout="HND",
     )
 
-    _pts_wrapper = _PrimTSDecodeWrapper(kv_layout="HND")
+    _pts_wrapper = _PrimTSDecodeWrapper(
+        kv_layout="HND", workspace_buffer=_pts_workspace
+    )
     _pts_wrapper.plan(
         _pts_indptr,
         _pts_indices,
-        _pts_last_page_len,
+        None,
         _pts_Hq,
         _pts_Hkv,
         _pts_D,
@@ -1839,8 +1841,15 @@ with contextlib.suppress(Exception):
         o_data_type=torch.bfloat16,
         mask_type="causal",
         max_kv_len=_pts_SK,
+        live_metadata=True,
     )
-    _pts_wrapper.run(_pts_q, _pts_cache)
+    _pts_wrapper.run(
+        _pts_q,
+        _pts_cache,
+        seq_lens=_pts_seq_lens,
+        paged_kv_indptr=_pts_indptr,
+        paged_kv_indices=_pts_indices,
+    )
 
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
 # surfaces (SM100/SM103 only).
@@ -1916,7 +1925,7 @@ with contextlib.suppress(Exception):
         mask_type="causal",
     )
 
-    _pmla_wrapper = _PrimTSMLADecodeWrapper()
+    _pmla_wrapper = _PrimTSMLADecodeWrapper(workspace_buffer=_pmla_workspace)
     _pmla_wrapper.plan(
         _pmla_block_tables,
         _pmla_seq_lens,
@@ -1930,8 +1939,14 @@ with contextlib.suppress(Exception):
         o_data_type=torch.bfloat16,
         mask_type="causal",
         max_kv_len=_pmla_SK,
+        live_metadata=True,
     )
-    _pmla_wrapper.run(_pmla_q, _pmla_cache)
+    _pmla_wrapper.run(
+        _pmla_q,
+        _pmla_cache,
+        block_tables=_pmla_block_tables,
+        seq_lens=_pmla_seq_lens,
+    )
 
 # trtllm_batch_decode_with_kv_cache with block-sparse attention (per-KV-head
 # page tables and seq lens; SM100/103 only).
