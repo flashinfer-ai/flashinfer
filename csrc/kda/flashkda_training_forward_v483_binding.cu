@@ -14,8 +14,8 @@ extern "C" __global__ void kernel_flashkda_forward_checkpoint_c16(
     unsigned int*, const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, __nv_bfloat16*,
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, __nv_bfloat16*,
-    __nv_bfloat16*, float*, float*, long long*, long long*, int*, float*, float*, int, int,
-    int, int, int, int, float, float);
+    __nv_bfloat16*, float*, float*, long long*, long long*, int*, float*, float*, int, int, int,
+    int, int, int, float, float);
 
 namespace flashinfer {
 namespace flash_kda_training {

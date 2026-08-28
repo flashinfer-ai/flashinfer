@@ -261,15 +261,9 @@ def _prepare_fla_paired(inputs):
 def _assert_paired_close(public_result, reference_result) -> None:
     public_output, public_final, public_gradients = public_result
     reference_output, reference_final, reference_gradients = reference_result
-    torch.testing.assert_close(
-        public_output, reference_output, atol=1e-2, rtol=1e-2
-    )
-    torch.testing.assert_close(
-        public_final, reference_final, atol=1e-2, rtol=1e-2
-    )
-    for public, reference in zip(
-        public_gradients, reference_gradients, strict=True
-    ):
+    torch.testing.assert_close(public_output, reference_output, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(public_final, reference_final, atol=1e-2, rtol=1e-2)
+    for public, reference in zip(public_gradients, reference_gradients, strict=True):
         torch.testing.assert_close(public, reference, atol=1e-2, rtol=1e-2)
 
 
@@ -390,9 +384,7 @@ def _benchmark_shape(
     }
     if not skip_fla:
         assert fla_paired is not None
-        fla_paired_ms, fla_paired_samples = _median_ms(
-            fla_paired, warmup_ms, bench_ms
-        )
+        fla_paired_ms, fla_paired_samples = _median_ms(fla_paired, warmup_ms, bench_ms)
         delta_ms = paired_ms - fla_paired_ms
         result.update(
             {
@@ -450,11 +442,7 @@ def main() -> None:
     if capability not in {(10, 0), (10, 3)}:
         raise RuntimeError("the training benchmark requires SM100a or SM103a")
     cupti_version, pyelftools_version = _require_timing_dependencies()
-    names = (
-        list(_SHAPES)
-        if args.all_shapes
-        else (args.shape or ["fixed_b8_t1024_h96"])
-    )
+    names = list(_SHAPES) if args.all_shapes else (args.shape or ["fixed_b8_t1024_h96"])
     results = [
         _benchmark_shape(
             name,

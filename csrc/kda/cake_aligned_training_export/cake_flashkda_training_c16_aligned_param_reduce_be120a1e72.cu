@@ -11,26 +11,31 @@
  * Minimum architecture: sm_100a.
  */
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
+typedef signed char int8_t;
+typedef unsigned char uint8_t;
+typedef unsigned short uint16_t;
+typedef unsigned int uint32_t;
 typedef unsigned long long uint64_t;
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
+typedef signed int int32_t;
+typedef short int int16_t;
+struct __align__(128) CakeTensorMap {
+  uint64_t opaque[16];
+};
 template <int N>
-struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
+struct __align__(128) CakeTensorMapPack {
+  CakeTensorMap maps[N];
+};
 
-typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
+typedef struct __align__(64) {
+  uint64_t opaque[16];
+} CUtensorMap;
 
 #include <cuda_bf16.h>
 
 __device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
+  int result;
+  asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;" : "=r"(result) : "r"(x));
+  return result;
 }
 
 #define CAKE_INF CUDART_INF_F
@@ -50,211 +55,222 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
-    uint32_t pred = 0;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred %%px;\n\t"
-        "elect.sync _|%%px, %1;\n\t"
-        "@%%px mov.s32 %0, 1;\n\t"
-        "}\n"
-        : "+r"(pred)
-        : "r"(0xFFFFFFFF));
-    return pred;
+  uint32_t pred = 0;
+  asm volatile(
+      "{\n\t"
+      ".reg .pred %%px;\n\t"
+      "elect.sync _|%%px, %1;\n\t"
+      "@%%px mov.s32 %0, 1;\n\t"
+      "}\n"
+      : "+r"(pred)
+      : "r"(0xFFFFFFFF));
+  return pred;
 }
 
 extern "C" {
 
-__global__ __launch_bounds__(128) void
-kernel_cake_flashkda_backward_param_reduce_c16_aligned(__nv_bfloat16* __restrict__ g, __nv_bfloat16* __restrict__ beta_active, float* __restrict__ A_log, float* __restrict__ dt_bias, float* __restrict__ dlog_decay, float* __restrict__ dlog_boundary, float* __restrict__ dbeta_active, __nv_bfloat16* __restrict__ dg, __nv_bfloat16* __restrict__ dbeta, float* __restrict__ gate_part_a, float* __restrict__ gate_part_dt, unsigned int* __restrict__ gate_finish_counters, float* __restrict__ dA_log, float* __restrict__ ddt_bias, int total_tokens, int num_heads, int beta_active_stride, int slice_len, float lower_bound)
-{
-    const int tid = threadIdx.x;
-    const int warp = make_warp_uniform(tid / 32);
-    const int lane = tid % 32;
+__global__ __launch_bounds__(128) void kernel_cake_flashkda_backward_param_reduce_c16_aligned(
+    __nv_bfloat16* __restrict__ g, __nv_bfloat16* __restrict__ beta_active,
+    float* __restrict__ A_log, float* __restrict__ dt_bias, float* __restrict__ dlog_decay,
+    float* __restrict__ dlog_boundary, float* __restrict__ dbeta_active,
+    __nv_bfloat16* __restrict__ dg, __nv_bfloat16* __restrict__ dbeta,
+    float* __restrict__ gate_part_a, float* __restrict__ gate_part_dt,
+    unsigned int* __restrict__ gate_finish_counters, float* __restrict__ dA_log,
+    float* __restrict__ ddt_bias, int total_tokens, int num_heads, int beta_active_stride,
+    int slice_len, float lower_bound) {
+  const int tid = threadIdx.x;
+  const int warp = make_warp_uniform(tid / 32);
+  const int lane = tid % 32;
 
-    extern __shared__ __align__(1024) char smem_raw[];
-    int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+  extern __shared__ __align__(1024) char smem_raw[];
+  int smem;
+  smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
+  const int bid = blockIdx.x;
+  const int num_bids = gridDim.x;
 
-    // Kernel setup ops
-    float* partial_a = reinterpret_cast<float*>(smem_raw + 0);
-    const int partial_a_addr = smem + 0;
-    float* partial_dt = reinterpret_cast<float*>(smem_raw + 2048);
-    const int partial_dt_addr = smem + 2048;
-    int* finish_flag = reinterpret_cast<int*>(smem_raw + 4096);
-    const int finish_flag_addr = smem + 4096;
+  // Kernel setup ops
+  float* partial_a = reinterpret_cast<float*>(smem_raw + 0);
+  const int partial_a_addr = smem + 0;
+  float* partial_dt = reinterpret_cast<float*>(smem_raw + 2048);
+  const int partial_dt_addr = smem + 2048;
+  int* finish_flag = reinterpret_cast<int*>(smem_raw + 4096);
+  const int finish_flag_addr = smem + 4096;
 
-    // === Task calls (dependency order) ===
-    int stripe = blockIdx.x;
-    int head = blockIdx.y;
-    int warp_0 = warp;
-    int dim0 = lane * 4;
-    float _expf_0 = __expf(A_log[head]);
-    float gate_rate = _expf_0;
-    float bias[4];
-    float acc_a[4];
-    float acc_dt[4];
-    #pragma unroll
-    for (int q0 = 0; q0 < 4; q0++) {
-        bias[q0] = dt_bias[head * 128 + dim0 + q0];
-        acc_a[q0] = 0.0f;
-        acc_dt[q0] = 0.0f;
+  // === Task calls (dependency order) ===
+  int stripe = blockIdx.x;
+  int head = blockIdx.y;
+  int warp_0 = warp;
+  int dim0 = lane * 4;
+  float _expf_0 = __expf(A_log[head]);
+  float gate_rate = _expf_0;
+  float bias[4];
+  float acc_a[4];
+  float acc_dt[4];
+#pragma unroll
+  for (int q0 = 0; q0 < 4; q0++) {
+    bias[q0] = dt_bias[head * 128 + dim0 + q0];
+    acc_a[q0] = 0.0f;
+    acc_dt[q0] = 0.0f;
+  }
+  int token_begin = stripe * slice_len;
+  int token_end = token_begin + slice_len;
+  if (token_end > total_tokens) {
+    token_end = total_tokens;
+  }
+#pragma unroll 1
+  for (int token = token_begin + warp_0; token < token_end; token += 4) {
+    long long gate_index =
+        ((long long)token * (long long)num_heads + (long long)head) * 128 + (long long)dim0;
+    float dgate_frag[4];
+    float gate_frag[4];
+    float dg_frag[4];
+    {
+      float4 _v4 = *reinterpret_cast<const float4*>(dlog_decay + gate_index);
+      dgate_frag[0 + 0] = _v4.x;
+      dgate_frag[0 + 1] = _v4.y;
+      dgate_frag[0 + 2] = _v4.z;
+      dgate_frag[0 + 3] = _v4.w;
     }
-    int token_begin = stripe * slice_len;
-    int token_end = token_begin + slice_len;
-    if (token_end > total_tokens) {
-        token_end = total_tokens;
+    if (token % 16 == 0) {
+      long long boundary_index =
+          ((long long)token / 16 * (long long)num_heads + (long long)head) * 128 + (long long)dim0;
+      {
+        float4 _v4 = *reinterpret_cast<const float4*>(dlog_boundary + boundary_index);
+        dgate_frag[0 + 0] = _v4.x;
+        dgate_frag[0 + 1] = _v4.y;
+        dgate_frag[0 + 2] = _v4.z;
+        dgate_frag[0 + 3] = _v4.w;
+      }
+      {
+        float4 _v4 =
+            make_float4(dgate_frag[0 + 0], dgate_frag[0 + 1], dgate_frag[0 + 2], dgate_frag[0 + 3]);
+        *reinterpret_cast<float4*>(dlog_decay + gate_index) = _v4;
+      }
     }
-    #pragma unroll 1
-    for (int token = token_begin + warp_0; token < token_end; token += 4) {
-        long long gate_index = ((long long)token * (long long)num_heads + (long long)head) * 128 + (long long)dim0;
-        float dgate_frag[4];
-        float gate_frag[4];
-        float dg_frag[4];
-        {
-            float4 _v4 = *reinterpret_cast<const float4*>(dlog_decay + gate_index);
-            dgate_frag[0 + 0] = _v4.x;
-            dgate_frag[0 + 1] = _v4.y;
-            dgate_frag[0 + 2] = _v4.z;
-            dgate_frag[0 + 3] = _v4.w;
-        }
-        if (token % 16 == 0) {
-            long long boundary_index = ((long long)token / 16 * (long long)num_heads + (long long)head) * 128 + (long long)dim0;
-            {
-                float4 _v4 = *reinterpret_cast<const float4*>(dlog_boundary + boundary_index);
-                dgate_frag[0 + 0] = _v4.x;
-                dgate_frag[0 + 1] = _v4.y;
-                dgate_frag[0 + 2] = _v4.z;
-                dgate_frag[0 + 3] = _v4.w;
-            }
-            {
-                float4 _v4 = make_float4(dgate_frag[0 + 0], dgate_frag[0 + 1], dgate_frag[0 + 2], dgate_frag[0 + 3]);
-                *reinterpret_cast<float4*>(dlog_decay + gate_index) = _v4;
-            }
-        }
-        {
-            uint2 _vld_2;
-            _vld_2 = *reinterpret_cast<const uint2*>(g + gate_index);
-            uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
-            #pragma unroll
-            for (int _pair = 0; _pair < 2; _pair++) {
-                asm volatile(
-                    "{\n\t"
-                    "shl.b32 %0, %2, 16;\n\t"
-                    "and.b32 %1, %2, 0xffff0000;\n\t"
-                    "}\n"
-                    : "=f"((&gate_frag[0 + _pair * 2])[0]), "=f"((&gate_frag[0 + _pair * 2])[1])
-                    : "r"(_vpairs_2[_pair]));
-            }
-        }
-        #pragma unroll
-        for (int q1 = 0; q1 < 4; q1++) {
-            float biased = gate_frag[q1] + bias[q1];
-            float z = gate_rate * biased;
-            float _tanh_approx_0;
-            asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_0) : "f"(z * 0.5f));
-            float gate_sigmoid = _tanh_approx_0 * 0.5f + 0.5f;
-            float sigmoid_prime = gate_sigmoid * (1.0f - gate_sigmoid);
-            float weighted = dgate_frag[q1] * lower_bound * sigmoid_prime;
-            float raw = weighted * gate_rate;
-            float _fma_0 = __fmaf_rn(weighted, z, acc_a[q1]);
-            acc_a[q1] = _fma_0;
-            __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(raw);
-            float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
-            acc_dt[q1] = acc_dt[q1] + _cvt_f32_0;
-            dg_frag[q1] = raw;
-        }
-        {
-            __nv_bfloat162 _pk = __floats2bfloat162_rn(dg_frag[0 + 0], dg_frag[0 + 1]);
-            *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(dg))[gate_index]) = _pk;
-        }
-        {
-            __nv_bfloat162 _pk = __floats2bfloat162_rn(dg_frag[2 + 0], dg_frag[2 + 1]);
-            *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(dg))[gate_index + 2]) = _pk;
-        }
+    {
+      uint2 _vld_2;
+      _vld_2 = *reinterpret_cast<const uint2*>(g + gate_index);
+      uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2);
+#pragma unroll
+      for (int _pair = 0; _pair < 2; _pair++) {
+        asm volatile(
+            "{\n\t"
+            "shl.b32 %0, %2, 16;\n\t"
+            "and.b32 %1, %2, 0xffff0000;\n\t"
+            "}\n"
+            : "=f"((&gate_frag[0 + _pair * 2])[0]), "=f"((&gate_frag[0 + _pair * 2])[1])
+            : "r"(_vpairs_2[_pair]));
+      }
     }
-    #pragma unroll
-    for (int q2 = 0; q2 < 4; q2++) {
-        partial_a[warp_0 * 128 + dim0 + q2] = acc_a[q2];
-        partial_dt[warp_0 * 128 + dim0 + q2] = acc_dt[q2];
+#pragma unroll
+    for (int q1 = 0; q1 < 4; q1++) {
+      float biased = gate_frag[q1] + bias[q1];
+      float z = gate_rate * biased;
+      float _tanh_approx_0;
+      asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_0) : "f"(z * 0.5f));
+      float gate_sigmoid = _tanh_approx_0 * 0.5f + 0.5f;
+      float sigmoid_prime = gate_sigmoid * (1.0f - gate_sigmoid);
+      float weighted = dgate_frag[q1] * lower_bound * sigmoid_prime;
+      float raw = weighted * gate_rate;
+      float _fma_0 = __fmaf_rn(weighted, z, acc_a[q1]);
+      acc_a[q1] = _fma_0;
+      __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(raw);
+      float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+      acc_dt[q1] = acc_dt[q1] + _cvt_f32_0;
+      dg_frag[q1] = raw;
     }
-    __syncthreads();
-    if (warp_0 == 0) {
-        #pragma unroll
-        for (int q3 = 0; q3 < 4; q3++) {
-            int dim = dim0 + q3;
-            int base = (stripe * num_heads + head) * 128 + dim;
-            gate_part_a[base] = partial_a[dim] + partial_a[128 + dim] + partial_a[256 + dim] + partial_a[384 + dim];
-            gate_part_dt[base] = partial_dt[dim] + partial_dt[128 + dim] + partial_dt[256 + dim] + partial_dt[384 + dim];
-        }
+    {
+      __nv_bfloat162 _pk = __floats2bfloat162_rn(dg_frag[0 + 0], dg_frag[0 + 1]);
+      *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(dg))[gate_index]) = _pk;
     }
-    #pragma unroll 1
-    for (int beta_token = token_begin + tid; beta_token < token_end; beta_token += 128) {
-        long long beta_index = (long long)beta_token * (long long)num_heads + (long long)head;
-        long long beta_active_index = (long long)beta_token * (long long)beta_active_stride + (long long)head;
-        float beta_value = (float)beta_active[beta_active_index];
-        __nv_bfloat16 _cvt_bf16_1 = __float2bfloat16(dbeta_active[beta_index] * beta_value * (1.0f - beta_value));
-        dbeta[beta_index] = _cvt_bf16_1;
+    {
+      __nv_bfloat162 _pk = __floats2bfloat162_rn(dg_frag[2 + 0], dg_frag[2 + 1]);
+      *reinterpret_cast<__nv_bfloat162*>(&((__nv_bfloat16*)(dg))[gate_index + 2]) = _pk;
     }
+  }
+#pragma unroll
+  for (int q2 = 0; q2 < 4; q2++) {
+    partial_a[warp_0 * 128 + dim0 + q2] = acc_a[q2];
+    partial_dt[warp_0 * 128 + dim0 + q2] = acc_dt[q2];
+  }
+  __syncthreads();
+  if (warp_0 == 0) {
+#pragma unroll
+    for (int q3 = 0; q3 < 4; q3++) {
+      int dim = dim0 + q3;
+      int base = (stripe * num_heads + head) * 128 + dim;
+      gate_part_a[base] =
+          partial_a[dim] + partial_a[128 + dim] + partial_a[256 + dim] + partial_a[384 + dim];
+      gate_part_dt[base] =
+          partial_dt[dim] + partial_dt[128 + dim] + partial_dt[256 + dim] + partial_dt[384 + dim];
+    }
+  }
+#pragma unroll 1
+  for (int beta_token = token_begin + tid; beta_token < token_end; beta_token += 128) {
+    long long beta_index = (long long)beta_token * (long long)num_heads + (long long)head;
+    long long beta_active_index =
+        (long long)beta_token * (long long)beta_active_stride + (long long)head;
+    float beta_value = (float)beta_active[beta_active_index];
+    __nv_bfloat16 _cvt_bf16_1 =
+        __float2bfloat16(dbeta_active[beta_index] * beta_value * (1.0f - beta_value));
+    dbeta[beta_index] = _cvt_bf16_1;
+  }
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) {
+    unsigned int _atomic_old_0 = atomicAdd(&gate_finish_counters[head], 1);
+    unsigned int old_count = _atomic_old_0;
+    finish_flag[0] = ((old_count + 1 == 128) ? 1 : 0);
+  }
+  __syncthreads();
+  if (finish_flag[0] != 0) {
     __threadfence();
-    __syncthreads();
-    if (tid == 0) {
-        unsigned int _atomic_old_0 = atomicAdd(&gate_finish_counters[head], 1);
-        unsigned int old_count = _atomic_old_0;
-        finish_flag[0] = ((old_count + 1 == 128) ? 1 : 0);
+    int dim_1 = tid;
+    float a8[8];
+    float dt8[8];
+#pragma unroll
+    for (int j0 = 0; j0 < 8; j0++) {
+      a8[j0] = 0.0f;
+      dt8[j0] = 0.0f;
+    }
+#pragma unroll 1
+    for (int chain = 0; chain < 16; chain++) {
+#pragma unroll
+      for (int j1 = 0; j1 < 8; j1++) {
+        int part_index = ((chain * 8 + j1) * num_heads + head) * 128 + dim_1;
+        a8[j1] = a8[j1] + gate_part_a[part_index];
+        dt8[j1] = dt8[j1] + gate_part_dt[part_index];
+      }
+    }
+    float p0a = a8[0] + a8[1];
+    float p1a = a8[2] + a8[3];
+    float p2a = a8[4] + a8[5];
+    float p3a = a8[6] + a8[7];
+    float p0dt = dt8[0] + dt8[1];
+    float p1dt = dt8[2] + dt8[3];
+    float p2dt = dt8[4] + dt8[5];
+    float p3dt = dt8[6] + dt8[7];
+    float col_a = p0a + p1a + (p2a + p3a);
+    float col_dt = p0dt + p1dt + (p2dt + p3dt);
+    __nv_bfloat16 _cvt_bf16_2 = __float2bfloat16(col_dt);
+    float _cvt_f32_1 = __bfloat162float(_cvt_bf16_2);
+    ddt_bias[head * 128 + dim_1] = _cvt_f32_1;
+    float _warp_reduce_0 = col_a;
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+      _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
+    col_a = _warp_reduce_0;
+    if (lane == 0) {
+      partial_a[warp] = col_a;
     }
     __syncthreads();
-    if (finish_flag[0] != 0) {
-        __threadfence();
-        int dim_1 = tid;
-        float a8[8];
-        float dt8[8];
-        #pragma unroll
-        for (int j0 = 0; j0 < 8; j0++) {
-            a8[j0] = 0.0f;
-            dt8[j0] = 0.0f;
-        }
-        #pragma unroll 1
-        for (int chain = 0; chain < 16; chain++) {
-            #pragma unroll
-            for (int j1 = 0; j1 < 8; j1++) {
-                int part_index = ((chain * 8 + j1) * num_heads + head) * 128 + dim_1;
-                a8[j1] = a8[j1] + gate_part_a[part_index];
-                dt8[j1] = dt8[j1] + gate_part_dt[part_index];
-            }
-        }
-        float p0a = a8[0] + a8[1];
-        float p1a = a8[2] + a8[3];
-        float p2a = a8[4] + a8[5];
-        float p3a = a8[6] + a8[7];
-        float p0dt = dt8[0] + dt8[1];
-        float p1dt = dt8[2] + dt8[3];
-        float p2dt = dt8[4] + dt8[5];
-        float p3dt = dt8[6] + dt8[7];
-        float col_a = p0a + p1a + (p2a + p3a);
-        float col_dt = p0dt + p1dt + (p2dt + p3dt);
-        __nv_bfloat16 _cvt_bf16_2 = __float2bfloat16(col_dt);
-        float _cvt_f32_1 = __bfloat162float(_cvt_bf16_2);
-        ddt_bias[head * 128 + dim_1] = _cvt_f32_1;
-        float _warp_reduce_0 = col_a;
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
-        col_a = _warp_reduce_0;
-        if (lane == 0) {
-            partial_a[warp] = col_a;
-        }
-        __syncthreads();
-        if (warp == 0) {
-            if (elect_sync()) {
-                dA_log[head] = partial_a[0] + partial_a[1] + partial_a[2] + partial_a[3];
-            }
-        }
+    if (warp == 0) {
+      if (elect_sync()) {
+        dA_log[head] = partial_a[0] + partial_a[1] + partial_a[2] + partial_a[3];
+      }
     }
+  }
 }
 
-} // extern "C"
-
-
+}  // extern "C"

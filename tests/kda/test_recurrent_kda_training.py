@@ -348,9 +348,7 @@ def test_packed_forward_validates_trusted_cpu_cu_seqlens():
     with pytest.raises(ValueError, match="must be provided for packed tensors"):
         recurrent_kda_training_forward(*args, inputs["cu_seqlens"])
     with pytest.raises(ValueError, match="must be provided for packed tensors"):
-        kda_training_api._validate_forward_inputs(
-            *args, inputs["cu_seqlens"], None
-        )
+        kda_training_api._validate_forward_inputs(*args, inputs["cu_seqlens"], None)
     with pytest.raises(ValueError, match="must be a CPU tensor"):
         kda_training_api._validate_forward_inputs(
             *args, inputs["cu_seqlens"], inputs["cu_seqlens"]
@@ -512,9 +510,7 @@ def test_grouped_row_forward_context_backward_matches_fla():
         ((513,), True),
     ],
 )
-def test_unaligned_c16_forward_context_backward_matches_fla(
-    seq_lens, split_work_items
-):
+def test_unaligned_c16_forward_context_backward_matches_fla(seq_lens, split_work_items):
     """C16 masks the final chunk instead of rejecting unaligned lengths."""
 
     _require_blackwell()
@@ -924,9 +920,7 @@ def test_strict_public_dtypes_are_rejected_before_ffi(monkeypatch):
         recurrent_kda_training_backward(
             context, inputs["do"].float(), inputs["dfinal_state"]
         )
-    with pytest.raises(
-        ValueError, match="dfinal_state must have dtype torch.float32"
-    ):
+    with pytest.raises(ValueError, match="dfinal_state must have dtype torch.float32"):
         recurrent_kda_training_backward(
             context, inputs["do"], inputs["dfinal_state"].to(torch.bfloat16)
         )

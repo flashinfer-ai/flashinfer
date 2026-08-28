@@ -62,6 +62,7 @@ class _TrainingRouteSpec:
     def grouped(self) -> bool:
         return self.tag.startswith("grouped_")
 
+
 @dataclass(frozen=True)
 class _Problem:
     seq_lens: tuple[int, ...]
@@ -244,9 +245,7 @@ def _select_training_route_cached(problem: _Problem) -> _TrainingRouteSpec:
 
     grouped = problem.grouped
     if template == "checkpoint_recurrent_c16":
-        return _TrainingRouteSpec(
-            "grouped_c16" if grouped else "c16", template, split
-        )
+        return _TrainingRouteSpec("grouped_c16" if grouped else "c16", template, split)
     if template == "tensor_tape_c32":
         return _TrainingRouteSpec("grouped_c32" if grouped else "c32", template)
     return _TrainingRouteSpec("grouped_row_split" if grouped else "row_split", template)

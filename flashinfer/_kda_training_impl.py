@@ -1238,9 +1238,7 @@ def recurrent_kda_training_forward(
     if not isinstance(context_out, RecurrentKDATrainingContext):
         raise TypeError("context_out must be a RecurrentKDATrainingContext")
     with context_out._lock:
-        return _recurrent_kda_training_forward_impl(
-            *args, context_out, cu_seqlens_cpu
-        )
+        return _recurrent_kda_training_forward_impl(*args, context_out, cu_seqlens_cpu)
 
 
 def _gradient_outputs(
