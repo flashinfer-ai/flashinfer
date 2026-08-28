@@ -704,7 +704,6 @@ class CuTileNvfp4Config:
             intermediate_size=intermediate_size,
             activation_type=activation.type,
             source_format=source_format,
-            activation_fp4=True,
             device=device,
         )
 

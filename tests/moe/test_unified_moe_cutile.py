@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from flashinfer.autotuner import AutoTuner
 from flashinfer.cutile import is_cuda_tile_available
 from flashinfer.fused_moe import (
     ActivationConfig,
@@ -24,6 +25,14 @@ from flashinfer.fused_moe import (
     RoutingConfig,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from flashinfer.fused_moe.cutile.moe import _combine_tile_h, _permute_shape
+from flashinfer.fused_moe.runners import (
+    _CUTILE_BF16_DEFAULT_GEMM_CONFIGS,
+    _CUTILE_BF16_DIVERSITY_GEMM_CONFIGS,
+    _CuTileBf16GemmProblem,
+    _cutile_bf16_config_rejection_reason,
+    _rank_cutile_bf16_gemm_configs,
+)
 from flashinfer.tllm_enums import ActivationType, RoutingMethodType
 
 
@@ -61,6 +70,42 @@ def test_cutile_bf16_config_architectures_and_registration():
     assert not CuTileBf16Config.supported(100)
     assert _BACKEND_RUNNERS[CuTileBf16Config] is CuTileBf16Runner
     assert repr(CuTileBf16Config()) == "CuTileBf16Config()"
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden_size", "expected"),
+    (
+        (1, 64, 64),
+        (1, 2048, 128),
+        (64, 2048, 128),
+        (65, 2048, 512),
+        (256, 2048, 512),
+        (257, 512, 512),
+        (257, 2048, 1024),
+    ),
+)
+def test_cutile_bf16_combine_tile_heuristic(num_tokens, hidden_size, expected):
+    assert _combine_tile_h(num_tokens, hidden_size) == expected
+
+
+@pytest.mark.parametrize(
+    ("num_assignments", "num_experts", "expected_chunk"),
+    (
+        (48, 128, 8),
+        (96, 128, 8),
+        (384, 128, 16),
+        (1536, 128, 64),
+        (6144, 128, 128),
+        (8192, 128, 128),
+        (12288, 128, 128),
+        (16384, 128, 32),
+        (2048, 256, 64),
+        (4096, 256, 64),
+        (8192, 256, 32),
+    ),
+)
+def test_cutile_permute_chunk_heuristic(num_assignments, num_experts, expected_chunk):
+    assert _permute_shape(num_assignments, num_experts)[1] == expected_chunk
 
 
 @pytest.mark.parametrize(
@@ -119,15 +164,31 @@ def test_cutile_bf16_runner_rejects_unsupported_architecture():
         runner.check_support()
 
 
+@pytest.mark.parametrize("arch", (89, 90, 120, 121))
+@pytest.mark.parametrize("num_tokens", (1, 1024))
 @pytest.mark.parametrize(
     "activation", (ActivationConfig.swiglu, ActivationConfig.relu2)
 )
-@pytest.mark.parametrize("arch", (89, 90, 120, 121))
-@pytest.mark.parametrize("num_tokens", (1, 1024))
-def test_cutile_bf16_tactic_shortlist(activation, arch, num_tokens):
+def test_cutile_bf16_tunes_stages_to_two_configs(
+    monkeypatch, arch, num_tokens, activation
+):
+    class RecordingTuner:
+        def __init__(self):
+            self.calls = []
+
+        def rank_tactics(
+            self, custom_op, runners, tuning_config, inputs, k=1, **kwargs
+        ):
+            del tuning_config, kwargs
+            self.calls.append((custom_op, k))
+            return runners[0].get_valid_tactics(inputs, None)[:k]
+
+    tuner = RecordingTuner()
+    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
     runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
     runner._built = True
     runner._device_arch = arch
+    runner._num_sms = 128
     runner.config = _config(
         num_experts=64,
         top_k=8,
@@ -146,11 +207,119 @@ def test_cutile_bf16_tactic_shortlist(activation, arch, num_tokens):
 
     tactics = runner.get_valid_tactics(inputs, None)
 
-    expected_blocks = {32, 64} if num_tokens == 1 or arch in (120, 121) else {64, 128}
-    assert len(tactics) == 12
-    assert {tactic[0] for tactic in tactics} == expected_blocks
+    expected_block = runner._fallback_tactic(inputs)[0]
+    assert len(tactics) == 4
+    assert {tactic[0] for tactic in tactics} == {expected_block}
     assert all(len(tactic) == 7 for tactic in tactics)
-    assert any(tactic[1] == 256 or tactic[4] == 256 for tactic in tactics)
+    assert len(tuner.calls) == 2
+    assert all(k == 2 for _, k in tuner.calls)
+
+
+@pytest.mark.parametrize(
+    ("arch", "rows_per_expert"),
+    ((89, 256), (90, 32), (120, 128), (121, 128)),
+)
+def test_cutile_bf16_non_gated_block_size_crossovers(arch, rows_per_expert):
+    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
+    runner._device_arch = arch
+    runner.config = _config(num_experts=128)
+
+    assert runner._candidate_non_gated_block_sizes((rows_per_expert - 1) * 128) == (
+        32,
+        64,
+    )
+    assert runner._candidate_non_gated_block_sizes(rows_per_expert * 128) == (
+        64,
+        128,
+    )
+
+
+@pytest.mark.parametrize(
+    ("arch", "rows_per_expert"),
+    ((89, 64), (90, 64), (120, 64), (121, 64)),
+)
+def test_cutile_bf16_gated_block_size_crossovers(arch, rows_per_expert):
+    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
+    runner._device_arch = arch
+    runner.config = _config(num_experts=128, activation=ActivationConfig.swiglu)
+
+    assert runner._gated_block_size((rows_per_expert - 1) * 128) == 32
+    assert runner._gated_block_size(rows_per_expert * 128) == 64
+    assert runner._gated_block_size(512 * 128) == 128
+
+
+def test_cutile_bf16_gemm_heuristic_keeps_defaults_and_rejects_small_shapes():
+    problem = _CuTileBf16GemmProblem(
+        stage=1,
+        arch=90,
+        num_sms=132,
+        num_assignments=4096,
+        num_experts=128,
+        block_size=32,
+        n=1856,
+        k=2688,
+    )
+    configs = _rank_cutile_bf16_gemm_configs(problem)
+
+    assert len(configs) == 8
+    assert set(_CUTILE_BF16_DEFAULT_GEMM_CONFIGS).issubset(configs)
+    assert all(
+        _cutile_bf16_config_rejection_reason(problem, config) is None
+        for config in configs
+    )
+
+    sm120_problem = _CuTileBf16GemmProblem(
+        stage=1,
+        arch=120,
+        num_sms=188,
+        num_assignments=4096,
+        num_experts=128,
+        block_size=64,
+        n=1856,
+        k=2688,
+    )
+    sm120_configs = _rank_cutile_bf16_gemm_configs(sm120_problem)
+    assert len(sm120_configs) == 10
+    assert set(_CUTILE_BF16_DIVERSITY_GEMM_CONFIGS).issubset(sm120_configs)
+
+    unsupported = _CuTileBf16GemmProblem(
+        stage=2,
+        arch=90,
+        num_sms=132,
+        num_assignments=1,
+        num_experts=1,
+        block_size=32,
+        n=31,
+        k=15,
+    )
+    with pytest.raises(NotImplementedError, match="no supported grouped GEMM"):
+        _rank_cutile_bf16_gemm_configs(unsupported)
+
+
+def test_cutile_bf16_gated_gemm1_problem_uses_preactivation_width():
+    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
+    runner._device_arch = 90
+    runner._num_sms = 132
+    runner.config = _config(
+        num_experts=256,
+        top_k=8,
+        intermediate_size=512,
+        activation=ActivationConfig.swiglu,
+    )
+    inputs = [
+        torch.empty(16, 2048),
+        torch.empty(16, 2048),
+        torch.empty(16, 8, dtype=torch.int32),
+        torch.empty(16, 8),
+        torch.empty(0),
+        torch.empty(0),
+    ]
+
+    gemm1 = runner._gemm_problem(inputs, stage=1, block_size=32)
+    gemm2 = runner._gemm_problem(inputs, stage=2, block_size=32)
+
+    assert (gemm1.n, gemm1.k) == (1024, 2048)
+    assert (gemm2.n, gemm2.k) == (2048, 512)
 
 
 @pytest.mark.parametrize(("k_in", "n"), ((15, 64), (64, 31)))

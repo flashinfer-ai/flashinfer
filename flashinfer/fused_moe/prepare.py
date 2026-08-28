@@ -1270,7 +1270,6 @@ def prepare_cutile_nvfp4_weights(
     intermediate_size: int,
     activation_type: ActivationType = ActivationType.Swiglu,
     source_format: str = "modelopt",
-    activation_fp4: bool,
     device: Optional[torch.device] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build checkpoint-native NVFP4 views for the cuTile MoE runners.
@@ -1287,11 +1286,7 @@ def prepare_cutile_nvfp4_weights(
             f"unsupported cuTile NVFP4 activation {activation_type!r}; expected "
             "Swiglu or Relu2."
         )
-    if hidden_size % 16 != 0 or intermediate_size % 16 != 0:
-        raise ValueError(
-            "cuTile NVFP4 requires hidden_size and intermediate_size divisible by 16."
-        )
-    if activation_fp4 and (hidden_size % 64 != 0 or intermediate_size % 64 != 0):
+    if hidden_size % 64 != 0 or intermediate_size % 64 != 0:
         raise ValueError(
             "cuTile W4A4 requires hidden_size and intermediate_size divisible by 64."
         )
@@ -1379,9 +1374,8 @@ def prepare_cutile_nvfp4_weights(
         "w2_scale": w2_block_scale.contiguous(),
         "w2_global_scale": w2_global_scale.contiguous(),
     }
-    if activation_fp4:
-        result["w1_scale"] = _swizzle_cutile_nvfp4_scales(result["w1_scale"])
-        result["w2_scale"] = _swizzle_cutile_nvfp4_scales(result["w2_scale"])
+    result["w1_scale"] = _swizzle_cutile_nvfp4_scales(result["w1_scale"])
+    result["w2_scale"] = _swizzle_cutile_nvfp4_scales(result["w2_scale"])
     return result
 
 

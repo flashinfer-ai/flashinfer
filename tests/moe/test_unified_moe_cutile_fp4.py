@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from flashinfer.autotuner import AutoTuner
 from flashinfer.cutile import is_cuda_tile_available
 from flashinfer.fused_moe import (
     ActivationConfig,
@@ -23,6 +24,17 @@ from flashinfer.fused_moe import (
     RoutingConfig,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
+from flashinfer.fused_moe.cutile.fp4 import (
+    _activation_quantize_config,
+    _input_quantize_config,
+)
+from flashinfer.fused_moe.runners import (
+    _CUTILE_W4A4_DEFAULT_GEMM_CONFIGS,
+    _CuTileW4A4GemmProblem,
+    _CuTileW4A4StageRunner,
+    _cutile_w4a4_config_rejection_reason,
+    _rank_cutile_w4a4_gemm_configs,
+)
 from flashinfer.tllm_enums import ActivationType
 
 
@@ -55,9 +67,11 @@ def test_cutile_nvfp4_config_is_registered_and_arch_gated():
     assert _BACKEND_RUNNERS[CuTileNvfp4Config] is CuTileNvfp4Runner
 
 
-def test_cutile_nvfp4_sm120_tactic_search_uses_sparse_block_sizes():
+def test_cutile_nvfp4_swiglu_stage_search_is_curated():
     runner = object.__new__(CuTileNvfp4Runner)
     runner._built = True
+    runner._device_arch = 120
+    runner._num_sms = 188
     runner.config = _config(
         QuantVariant.NVFP4,
         CuTileNvfp4Config(),
@@ -70,39 +84,280 @@ def test_cutile_nvfp4_sm120_tactic_search_uses_sparse_block_sizes():
     inputs[2] = torch.empty(8, dtype=torch.int32)
     inputs[6] = torch.empty(64, 2)
 
-    block_sizes = runner._candidate_block_sizes(inputs[2].numel())
-    gemm_pairs = runner._candidate_gemm_pairs(inputs)
-    assert block_sizes == (16, 32)
-    assert len(gemm_pairs) == 12
-    assert len(block_sizes) * len(gemm_pairs) == 24
-    assert len(runner.get_valid_tactics(inputs, None)) == 24
+    gemm1_runner = _CuTileW4A4StageRunner(runner, 1, block_size=16)
+    gemm2_runner = _CuTileW4A4StageRunner(runner, 2, block_size=16)
+    assert runner._candidate_block_sizes(inputs[2].numel()) == (16, 32)
+    small_gemm1 = gemm1_runner.get_valid_tactics(inputs, None)
+    assert len(small_gemm1) == 9
+    assert {tactic[0] for tactic in small_gemm1} == {0}
 
     inputs[2] = torch.empty(64, dtype=torch.int32)
-    tactics = runner.get_valid_tactics(inputs, None)
-    assert len(tactics) == 34
-    assert {tactic[1] for tactic in tactics} == {0, 1}
-    assert all(len(tactic) == 8 for tactic in tactics)
+    gemm1 = gemm1_runner.get_valid_tactics(inputs, None)
+    gemm2 = gemm2_runner.get_valid_tactics(inputs, None)
+    assert len(gemm1) == 9
+    assert {tactic[0] for tactic in gemm1} == {0, 1}
+    assert all(len(tactic) == 4 for tactic in gemm1)
+    assert len(gemm2) == 9
+    assert all(len(tactic) == 3 for tactic in gemm2)
 
     assert runner._candidate_block_sizes(64 * 9) == (32, 64, 128)
 
 
 def test_cutile_nvfp4_tactics_include_partial_128_tiles():
-    runner = object.__new__(CuTileNvfp4Runner)
+    problem = _CuTileW4A4GemmProblem(
+        stage=1,
+        arch=120,
+        num_sms=188,
+        num_assignments=8,
+        num_experts=4,
+        block_size=32,
+        n=192,
+        k=192,
+        fused_epilogue=True,
+        is_gated=False,
+        input_sorted=False,
+    )
+    configs = _rank_cutile_w4a4_gemm_configs(problem)
+
+    assert (128, 128, 2) in configs
+    assert (256, 128, 1) in configs
+    assert set(_CUTILE_W4A4_DEFAULT_GEMM_CONFIGS).issubset(configs)
+    assert all(
+        _cutile_w4a4_config_rejection_reason(problem, config) is None
+        for config in configs
+    )
+
+
+def test_cutile_nvfp4_gated_fusion_requires_wide_gemm1_tile():
+    problem = _CuTileW4A4GemmProblem(
+        stage=1,
+        arch=120,
+        num_sms=188,
+        num_assignments=64,
+        num_experts=256,
+        block_size=16,
+        n=512,
+        k=2048,
+        fused_epilogue=True,
+        is_gated=True,
+        input_sorted=False,
+    )
+
+    assert _cutile_w4a4_config_rejection_reason(problem, (256, 64, 2)) is None
+    assert "effective tile_n" in str(
+        _cutile_w4a4_config_rejection_reason(problem, (128, 64, 2))
+    )
+
+
+@pytest.mark.parametrize("num_tokens", (1, 1024))
+def test_cutile_nvfp4_relu2_tunes_stages_to_two_configs(monkeypatch, num_tokens):
+    class RecordingTuner:
+        def __init__(self):
+            self.calls = []
+
+        def rank_tactics(
+            self, custom_op, runners, tuning_config, inputs, k=1, **kwargs
+        ):
+            del tuning_config, kwargs
+            self.calls.append((custom_op, k))
+            return runners[0].get_valid_tactics(inputs, None)[:k]
+
+    tuner = RecordingTuner()
+    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
+    runner = CuTileNvfp4Runner.__new__(CuTileNvfp4Runner)
     runner._built = True
+    runner._device_arch = 120
+    runner._num_sms = 188
     runner.config = _config(
         QuantVariant.NVFP4,
         CuTileNvfp4Config(),
-        intermediate_size=192,
+        num_experts=128,
+        top_k=6,
+        intermediate_size=1856,
         activation=ActivationConfig.relu2,
+        max_num_tokens=1024,
     )
     inputs = [torch.empty(0) for _ in range(10)]
-    inputs[1] = torch.empty(1, 192)
-    inputs[2] = torch.empty(8, dtype=torch.int32)
-    inputs[6] = torch.empty(4)
+    inputs[0] = torch.empty(num_tokens, 2688)
+    inputs[1] = torch.empty(num_tokens, 2688)
+    inputs[2] = torch.empty(num_tokens, 6, dtype=torch.int32)
+    inputs[3] = torch.empty(num_tokens, 6)
 
     tactics = runner.get_valid_tactics(inputs, None)
-    assert (32, 0, 128, 128, 2, 128, 128, 2) in tactics
-    assert (32, 1, 128, 128, 2, 128, 128, 2) in tactics
+
+    expected_block = runner._w4a4_fallback_tactic(inputs)[0]
+    assert len(tactics) == 4
+    assert {tactic[0] for tactic in tactics} == {expected_block}
+    assert {tactic[1] for tactic in tactics} == {1}
+    assert all(len(tactic) == 8 for tactic in tactics)
+    assert len(tuner.calls) == 2
+    assert all(k == 2 for _, k in tuner.calls)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_fusion"), ((1, 0), (2, 0), (8, 1), (512, 0))
+)
+def test_cutile_nvfp4_swiglu_tunes_producer_stage_to_two_configs(
+    monkeypatch, num_tokens, expected_fusion
+):
+    class RecordingTuner:
+        def __init__(self):
+            self.calls = []
+
+        def rank_tactics(
+            self, custom_op, runners, tuning_config, inputs, k=1, **kwargs
+        ):
+            del tuning_config, kwargs
+            self.calls.append((custom_op, k))
+            return runners[0].get_valid_tactics(inputs, None)[:k]
+
+    tuner = RecordingTuner()
+    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
+    runner = CuTileNvfp4Runner.__new__(CuTileNvfp4Runner)
+    runner._built = True
+    runner._device_arch = 120
+    runner._num_sms = 188
+    runner.config = _config(
+        QuantVariant.NVFP4,
+        CuTileNvfp4Config(),
+        num_experts=256,
+        top_k=8,
+        intermediate_size=512,
+        activation=ActivationConfig.swiglu,
+        max_num_tokens=512,
+    )
+    inputs = [torch.empty(0) for _ in range(10)]
+    inputs[0] = torch.empty(num_tokens, 2048)
+    inputs[1] = torch.empty(num_tokens, 2048)
+    inputs[2] = torch.empty(num_tokens, 8, dtype=torch.int32)
+    inputs[3] = torch.empty(num_tokens, 8)
+
+    tactics = runner.get_valid_tactics(inputs, None)
+
+    expected_block = runner._w4a4_fallback_tactic(inputs)[0]
+    assert len(tactics) == 4
+    assert {tactic[0] for tactic in tactics} == {expected_block}
+    assert {tactic[1] for tactic in tactics} == {expected_fusion}
+    assert all(len(tactic) == 8 for tactic in tactics)
+    if num_tokens == 1:
+        assert any(tactic[2:5] == (128, 256, 2) for tactic in tactics)
+        assert any(tactic[5:8] == (128, 128, 2) for tactic in tactics)
+    elif num_tokens == 2:
+        assert any(tactic[2:5] == (256, 256, 1) for tactic in tactics)
+        assert any(tactic[5:8] == (256, 256, 1) for tactic in tactics)
+    assert len(tuner.calls) == 2
+    assert all(k == 2 for _, k in tuner.calls)
+
+
+@pytest.mark.parametrize(
+    ("num_tokens", "expected_block", "expected_fusion"),
+    (
+        (256, 16, 1),
+        (512, 32, 0),
+        (1024, 32, 1),
+        (2048, 64, 1),
+        (4096, 128, 0),
+        (8192, 64, 1),
+    ),
+)
+def test_cutile_nvfp4_swiglu_fallback_heuristic(
+    num_tokens, expected_block, expected_fusion
+):
+    runner = CuTileNvfp4Runner.__new__(CuTileNvfp4Runner)
+    runner._device_arch = 120
+    runner._num_sms = 188
+    runner.config = _config(
+        QuantVariant.NVFP4,
+        CuTileNvfp4Config(),
+        num_experts=256,
+        top_k=8,
+        intermediate_size=512,
+        activation=ActivationConfig.swiglu,
+        max_num_tokens=8192,
+    )
+    inputs = [torch.empty(0) for _ in range(10)]
+    inputs[1] = torch.empty(num_tokens, 2048)
+    inputs[2] = torch.empty(num_tokens, 8, dtype=torch.int32)
+
+    tactic = runner._w4a4_fallback_tactic(inputs)
+    assert tactic[:2] == (expected_block, expected_fusion)
+
+
+@pytest.mark.parametrize((("num_tokens", "expected_block")), ((512, 32), (1024, 64)))
+def test_cutile_nvfp4_relu2_block_size_heuristic(num_tokens, expected_block):
+    runner = CuTileNvfp4Runner.__new__(CuTileNvfp4Runner)
+    runner._device_arch = 120
+    runner._num_sms = 188
+    runner.config = _config(
+        QuantVariant.NVFP4,
+        CuTileNvfp4Config(),
+        num_experts=128,
+        top_k=6,
+        intermediate_size=1856,
+        activation=ActivationConfig.relu2,
+        max_num_tokens=1024,
+    )
+    inputs = [torch.empty(0) for _ in range(10)]
+    inputs[1] = torch.empty(num_tokens, 2688)
+    inputs[2] = torch.empty(num_tokens, 6, dtype=torch.int32)
+
+    assert runner._w4a4_fallback_tactic(inputs)[0] == expected_block
+
+
+def test_cutile_nvfp4_uses_shared_combine_heuristic():
+    from flashinfer.fused_moe.cutile import fp4
+
+    assert fp4._combine_tile_h(1, 2688) == 128
+    assert fp4._combine_tile_h(128, 2688) == 512
+    assert fp4._combine_tile_h(8192, 2688) == 1024
+
+
+@pytest.mark.parametrize(
+    (
+        "num_tokens",
+        "hidden_size",
+        "num_sms",
+        "scale_row_major",
+        "expected",
+    ),
+    (
+        (8, 4096, 188, False, (2, 128, 0)),
+        (16, 2688, 188, False, (4, 128, 0)),
+        (32, 2048, 188, False, (2, 256, 0)),
+        (32, 4096, 188, False, (2, 256, 4)),
+        (64, 2688, 188, False, (16, 64, 4)),
+        (128, 4096, 188, False, (8, 128, 4)),
+        (256, 2048, 188, False, (8, 128, 4)),
+        (512, 4096, 188, False, (32, 64, 4)),
+        (512, 2688, 188, True, (16, 128, 4)),
+        (1024, 2688, 188, True, (64, 64, 4)),
+        (1024, 4096, 188, True, (8, 256, 4)),
+    ),
+)
+def test_cutile_nvfp4_input_quantize_heuristic(
+    num_tokens, hidden_size, num_sms, scale_row_major, expected
+):
+    assert (
+        _input_quantize_config(num_tokens, hidden_size, num_sms, scale_row_major)
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("rows", "intermediate_size", "num_sms", "scale_row_major", "expected"),
+    (
+        (64, 512, 188, False, (64, 2)),
+        (2048, 512, 188, False, (64, 4)),
+        (64, 512, 188, True, (64, 4)),
+    ),
+)
+def test_cutile_nvfp4_activation_quantize_heuristic(
+    rows, intermediate_size, num_sms, scale_row_major, expected
+):
+    assert (
+        _activation_quantize_config(rows, intermediate_size, num_sms, scale_row_major)
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -350,10 +605,18 @@ def test_cutile_fused_activation_quantize_matches_unfused(
     )
     torch.cuda.synchronize()
 
-    torch.testing.assert_close(actual_q, expected_q, rtol=0, atol=0)
     torch.testing.assert_close(
-        actual_scale.view(torch.uint8),
-        expected_scale.view(torch.uint8),
+        actual_q[: rows + 1], expected_q[: rows + 1], rtol=0, atol=0
+    )
+    actual_valid_scale = (
+        actual_scale[: rows + 1] if scale_row_major else actual_scale[:, : rows + 1]
+    )
+    expected_valid_scale = (
+        expected_scale[: rows + 1] if scale_row_major else expected_scale[:, : rows + 1]
+    )
+    torch.testing.assert_close(
+        actual_valid_scale.view(torch.uint8),
+        expected_valid_scale.view(torch.uint8),
         rtol=0,
         atol=0,
     )
@@ -446,6 +709,9 @@ def test_cutile_nvfp4_runner_matches_reference(activation):
     phase1_tactic = (32, 0, 128, 64, 2, 128, 64, 2)
     phase1 = runner.forward(inputs, tactic=phase1_tactic).clone()
     torch.testing.assert_close(phase2, phase1, rtol=0, atol=0)
+    if activation.type is ActivationType.Relu2:
+        fallback = runner.forward(inputs, tactic=-1).clone()
+        torch.testing.assert_close(fallback, phase2, rtol=0, atol=0)
     actual = phase2
     expected = _reference_moe(
         hidden_states, ids, routing_weights, w1_dequant, w2_dequant, activation

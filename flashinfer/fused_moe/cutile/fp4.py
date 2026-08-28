@@ -30,6 +30,7 @@ from .moe import (
     GemmConfig,
     Workspace as Bf16Workspace,
     _combine,
+    _combine_tile_h,
     _permute,
     allocate_workspace as allocate_bf16_workspace,
 )
@@ -68,14 +69,14 @@ def _persistent_grid_m(
 
 @dataclass
 class Workspace(Bf16Workspace):
-    """Workspace shared by the W4A16 and W4A4 pipelines."""
+    """Graph-stable workspace for the W4A4 pipeline."""
 
-    input_q: torch.Tensor | None
-    input_scale: torch.Tensor | None
+    input_q: torch.Tensor
+    input_scale: torch.Tensor
     sorted_input_q: torch.Tensor | None
     sorted_input_scale: torch.Tensor | None
-    activation_q: torch.Tensor | None
-    activation_scale: torch.Tensor | None
+    activation_q: torch.Tensor
+    activation_scale: torch.Tensor
     scale_row_major: bool
 
 
@@ -88,10 +89,9 @@ def allocate_workspace(
     top_k: int,
     is_gated: bool,
     block_sizes: tuple[int, ...],
-    quantize_activations: bool,
     device: torch.device,
 ) -> Workspace:
-    """Allocate graph-stable routing, GEMM, and optional quantization buffers."""
+    """Allocate graph-stable routing, GEMM, and quantization buffers."""
     base = allocate_bf16_workspace(
         num_tokens=num_tokens,
         hidden_size=hidden_size,
@@ -100,79 +100,70 @@ def allocate_workspace(
         top_k=top_k,
         is_gated=is_gated,
         block_sizes=block_sizes,
-        allocate_activation_output=(
-            not quantize_activations or (is_gated and num_tokens * top_k <= 64)
-        ),
+        allocate_activation_output=is_gated and num_tokens * top_k <= 64,
         device=device,
     )
-    if quantize_activations:
-        input_rows = ((num_tokens + 127) // 128) * 128
-        use_sorted_layout = _use_row_major_scale_layout(
-            num_tokens * top_k, intermediate_size
-        )
-        assignment_rows = (
-            base.sorted_slots.shape[0]
-            if use_sorted_layout
-            else ((num_tokens * top_k + 127) // 128) * 128
-        )
-        scale_row_major = _use_row_major_scale_layout(
-            num_tokens * top_k, intermediate_size
-        )
-        input_q = torch.empty(
-            input_rows, hidden_size // 2, dtype=torch.uint8, device=device
-        )
-        input_scale_shape = (
-            (input_rows, hidden_size // _NVFP4_BLOCK_SIZE)
-            if scale_row_major
-            else (hidden_size // _NVFP4_BLOCK_SIZE, input_rows)
-        )
-        input_scale = torch.empty(
-            input_scale_shape,
-            dtype=torch.float8_e4m3fn,
-            device=device,
-        )
-        if use_sorted_layout:
-            sorted_input_q = torch.empty(
-                base.sorted_slots.shape[0],
-                hidden_size // 2,
-                dtype=torch.uint8,
-                device=device,
-            )
-            sorted_input_scale = torch.empty(
-                base.sorted_slots.shape[0],
-                hidden_size // _NVFP4_BLOCK_SIZE,
-                dtype=torch.float8_e4m3fn,
-                device=device,
-            )
-        else:
-            sorted_input_q = sorted_input_scale = None
-        activation_q = torch.empty(
-            assignment_rows,
-            intermediate_size // 2,
+    input_rows = ((num_tokens + 127) // 128) * 128
+    use_sorted_layout = _use_row_major_scale_layout(
+        num_tokens * top_k, intermediate_size
+    )
+    assignment_rows = (
+        base.sorted_slots.shape[0]
+        if use_sorted_layout
+        else ((num_tokens * top_k + 127) // 128) * 128
+    )
+    scale_row_major = _use_row_major_scale_layout(num_tokens * top_k, intermediate_size)
+    input_q = torch.empty(
+        input_rows, hidden_size // 2, dtype=torch.uint8, device=device
+    )
+    input_scale_shape = (
+        (input_rows, hidden_size // _NVFP4_BLOCK_SIZE)
+        if scale_row_major
+        else (hidden_size // _NVFP4_BLOCK_SIZE, input_rows)
+    )
+    input_scale = torch.empty(
+        input_scale_shape,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    if use_sorted_layout:
+        sorted_input_q = torch.empty(
+            base.sorted_slots.shape[0],
+            hidden_size // 2,
             dtype=torch.uint8,
             device=device,
         )
-        activation_scale_shape = (
-            (assignment_rows, intermediate_size // _NVFP4_BLOCK_SIZE)
-            if scale_row_major
-            else (intermediate_size // _NVFP4_BLOCK_SIZE, assignment_rows)
-        )
-        activation_scale = torch.empty(
-            activation_scale_shape,
+        sorted_input_scale = torch.empty(
+            base.sorted_slots.shape[0],
+            hidden_size // _NVFP4_BLOCK_SIZE,
             dtype=torch.float8_e4m3fn,
             device=device,
         )
-        if use_sorted_layout:
-            base.gemm1_out = torch.empty(
-                assignment_rows,
-                intermediate_size * (2 if is_gated else 1),
-                dtype=torch.bfloat16,
-                device=device,
-            )
     else:
-        input_q = input_scale = sorted_input_q = sorted_input_scale = None
-        activation_q = activation_scale = None
-        scale_row_major = False
+        sorted_input_q = sorted_input_scale = None
+    activation_q = torch.empty(
+        assignment_rows,
+        intermediate_size // 2,
+        dtype=torch.uint8,
+        device=device,
+    )
+    activation_scale_shape = (
+        (assignment_rows, intermediate_size // _NVFP4_BLOCK_SIZE)
+        if scale_row_major
+        else (intermediate_size // _NVFP4_BLOCK_SIZE, assignment_rows)
+    )
+    activation_scale = torch.empty(
+        activation_scale_shape,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    if use_sorted_layout:
+        base.gemm1_out = torch.empty(
+            assignment_rows,
+            intermediate_size * (2 if is_gated else 1),
+            dtype=torch.bfloat16,
+            device=device,
+        )
     return Workspace(
         **vars(base),
         input_q=input_q,
@@ -304,6 +295,49 @@ def _activation_quantize_nvfp4(
         )
 
 
+def _input_quantize_config(
+    rows: int,
+    k: int,
+    num_sms: int,
+    scale_row_major: bool,
+) -> tuple[int, int, int]:
+    """Select TILE_M, TILE_K, and occupancy for input quantization."""
+    max_tile_k = next(tile_k for tile_k in (256, 128, 64) if k % tile_k == 0)
+    if scale_row_major:
+        if max_tile_k == 256:
+            return 8, 256, 4
+        if rows < 4 * num_sms:
+            return 16, max_tile_k, 4
+        return 64, 64, 4
+
+    many_k_tiles = max_tile_k == 256 and k // 256 >= 16
+    if rows <= 8:
+        return 2, min(max_tile_k, 128), 0
+    if rows <= 16:
+        return 4, max_tile_k, 0
+    if rows <= 32:
+        return (2 if max_tile_k == 256 else 4), max_tile_k, (4 if many_k_tiles else 0)
+    if rows <= 64:
+        return (4, 256, 4) if max_tile_k == 256 else (16, 64, 4)
+    if rows <= 128:
+        if many_k_tiles:
+            return 8, 128, 4
+        return (4, 256, 4) if max_tile_k == 256 else (16, 64, 4)
+    if rows <= 256:
+        if many_k_tiles:
+            return 8, 256, 4
+        if max_tile_k >= 128:
+            return 8, 128, 4
+        return 16, 64, 4
+    if many_k_tiles:
+        return 32, 64, 4
+    if max_tile_k == 256:
+        return 4, 256, 4
+    if max_tile_k >= 128:
+        return 8, 128, 4
+    return 16, 64, 4
+
+
 def _quantize(
     x: torch.Tensor,
     q: torch.Tensor,
@@ -315,7 +349,6 @@ def _quantize(
     rows, k = x.shape
     if k % 64 != 0:
         raise ValueError(f"W4A4 activation dimension must be divisible by 64, got {k}.")
-    tile_k = 128 if k % 128 == 0 else 64
     expected_scale_shape = (
         (q.shape[0], k // _NVFP4_BLOCK_SIZE)
         if scale_row_major
@@ -326,12 +359,23 @@ def _quantize(
             f"cuTile NVFP4 scale shape must be {expected_scale_shape}, got "
             f"{tuple(scale.shape)}."
         )
-    # The permuted GEMMs use row ``rows`` as the zero-padding sentinel.
-    tile_m = min(128, next_positive_power_of_2(rows + 1))
+    num_sms = (
+        torch.cuda.get_device_properties(x.device).multi_processor_count
+        if scale_row_major
+        else 1
+    )
+    tile_m, tile_k, occupancy = _input_quantize_config(
+        rows, k, num_sms, scale_row_major
+    )
+    kernel = (
+        _quantize_nvfp4
+        if occupancy == 0
+        else cached_replace_hints(_quantize_nvfp4, occupancy=occupancy)
+    )
     ct.launch(
         torch.cuda.current_stream(x.device),
         (((rows + tile_m - 1) // tile_m), k // tile_k),
-        _quantize_nvfp4,
+        kernel,
         (x, q, scale, global_scale, k, tile_m, tile_k, scale_row_major),
     )
 
@@ -480,6 +524,56 @@ def _launch_activation_quantize(
     )
 
 
+def _activation_quantize_config(
+    rows: int,
+    intermediate_size: int,
+    num_sms: int,
+    scale_row_major: bool,
+) -> tuple[int, int]:
+    """Select TILE_I and occupancy for fused activation quantization."""
+    work = rows * intermediate_size
+    occupancy = 4 if scale_row_major or work >= num_sms * 4096 else 2
+    return 64, occupancy
+
+
+def _launch_unfused_activation_quantize(
+    gemm1_out: torch.Tensor,
+    workspace: Workspace,
+    activation_type: ActivationType,
+    *,
+    num_assignments: int,
+    num_sms: int,
+) -> None:
+    if activation_type.is_gated and num_assignments < 64:
+        if workspace.activation_out is None:
+            raise RuntimeError("W4A4 workspace is missing the activation buffer.")
+        activation_out = workspace.activation_out[:num_assignments]
+        launch_activation(gemm1_out, activation_out, activation_type)
+        _quantize(
+            activation_out,
+            workspace.activation_q,
+            workspace.activation_scale,
+            scale_row_major=workspace.scale_row_major,
+        )
+        return
+
+    tile_i, occupancy = _activation_quantize_config(
+        gemm1_out.shape[0],
+        workspace.activation_q.shape[1] * 2,
+        num_sms,
+        workspace.scale_row_major,
+    )
+    _launch_activation_quantize(
+        gemm1_out,
+        workspace.activation_q,
+        workspace.activation_scale,
+        activation_type,
+        tile_i=tile_i,
+        occupancy=occupancy,
+        scale_row_major=workspace.scale_row_major,
+    )
+
+
 def _unswizzle_32_4_4(scale):
     m0 = scale.shape[0]
     k0 = scale.shape[1]
@@ -487,33 +581,6 @@ def _unswizzle_32_4_4(scale):
         ct.permute(ct.reshape(scale, (m0, k0, 32, 4, 4)), (0, 3, 2, 1, 4)),
         (m0 * 128, k0 * 4),
     )
-
-
-def _decode_e2m1(weight_bytes):
-    shifts = ct.astype(ct.arange(2, dtype=ct.int32) * 4, ct.uint8)
-    codes = ct.reshape(
-        (ct.expand_dims(weight_bytes, axis=2) >> shifts) & 0xF,
-        (weight_bytes.shape[0], weight_bytes.shape[1] * 2),
-    )
-    magnitude_code = codes & 0x7
-    magnitude = ct.astype(magnitude_code, ct.float32)
-    value = ct.where(
-        magnitude_code <= 4,
-        magnitude * 0.5,
-        ct.where(magnitude_code <= 6, magnitude - 2.0, magnitude - 1.0),
-    )
-    return ct.where((codes & 0x8) != 0, -value, value)
-
-
-def _decode_e4m3(scale_bytes):
-    exponent = (scale_bytes >> 3) & 0xF
-    mantissa = ct.astype(scale_bytes & 0x7, ct.float32)
-    magnitude = ct.where(
-        exponent == 0,
-        mantissa * (2.0**-9),
-        (1.0 + mantissa * 0.125) * ct.exp2(ct.astype(exponent, ct.float32) - 7.0),
-    )
-    return ct.where((scale_bytes & 0x80) != 0, -magnitude, magnitude)
 
 
 def _load_w4a4_weight_tile(
@@ -656,117 +723,6 @@ def _load_w4a4_contiguous_activation_tile(
         (tile_m, groups_per_tile),
     )
     return decoded_activation, decoded_scale
-
-
-@ct.kernel
-def _grouped_gemm_w4a16(
-    X,
-    X_SCALE,
-    W,
-    W_SCALE,
-    W_GLOBAL_SCALE,
-    SORTED_SLOTS,
-    BLOCK_EXPERT,
-    NUM_POST_PAD,
-    OUT,
-    top_k,
-    grid_m,
-    activation_scale_groups,
-    global_scale_shards,
-    global_scale_shard_width,
-    K_IN: ConstInt,
-    TILE_M: ConstInt,
-    TILE_N: ConstInt,
-    TILE_K: ConstInt,
-):
-    initial_m_block = ct.bid(0)
-    n_block = ct.bid(1)
-    num_post_pad = ct.gather(
-        NUM_POST_PAD, ct.zeros((1,), dtype=ct.int32), padding_value=0
-    ).item()
-    num_live_blocks = (num_post_pad + TILE_M - 1) // TILE_M
-    num_iterations = (num_live_blocks - initial_m_block + grid_m - 1) // grid_m
-    groups_per_tile = TILE_K // _NVFP4_BLOCK_SIZE
-    n_offsets = n_block * TILE_N + ct.arange(TILE_N, dtype=ct.int32)
-    num_k_tiles = (K_IN + TILE_K - 1) // TILE_K
-    for iteration in range(num_iterations):
-        m_block = initial_m_block + iteration * grid_m
-        if m_block * TILE_M < num_post_pad:
-            m_offsets = m_block * TILE_M + ct.arange(TILE_M, dtype=ct.int32)
-            slots = ct.gather(SORTED_SLOTS, (m_offsets,), padding_value=0)
-            expert = ct.gather(
-                BLOCK_EXPERT,
-                ct.full((1,), m_block, dtype=ct.int32),
-                padding_value=0,
-            ).item()
-            shard = n_block * TILE_N // global_scale_shard_width
-            alpha = ct.gather(
-                W_GLOBAL_SCALE,
-                ct.full(
-                    (1,),
-                    expert * global_scale_shards + shard,
-                    dtype=ct.int32,
-                ),
-                padding_value=1.0,
-            ).item()
-            rows = slots // top_k
-            accumulator = ct.zeros((TILE_M, TILE_N), dtype=ct.float32)
-            for k_tile in range(num_k_tiles):
-                weight_bytes = ct.reshape(
-                    ct.load(
-                        W,
-                        index=(expert, n_block, k_tile),
-                        shape=(1, TILE_N, TILE_K // 2),
-                        padding_mode=ct.PaddingMode.ZERO,
-                        latency=3,
-                        allow_tma=True,
-                    ),
-                    (TILE_N, TILE_K // 2),
-                )
-                weight = _decode_e2m1(weight_bytes)
-                activation_indices = ct.reshape(rows, (TILE_M, 1)) * K_IN + ct.reshape(
-                    k_tile * TILE_K + ct.arange(TILE_K, dtype=ct.int32),
-                    (1, TILE_K),
-                )
-                activation = ct.gather(
-                    X,
-                    (activation_indices,),
-                    padding_value=0,
-                    latency=3,
-                )
-                weight_scale_bytes = ct.reshape(
-                    ct.load(
-                        W_SCALE,
-                        index=(expert, n_block, k_tile),
-                        shape=(1, TILE_N, groups_per_tile),
-                        padding_mode=ct.PaddingMode.ZERO,
-                        latency=3,
-                        allow_tma=True,
-                    ),
-                    (TILE_N, groups_per_tile),
-                )
-                weight_scale = _decode_e4m3(weight_scale_bytes)
-                dequantized_weight = ct.reshape(
-                    weight, (TILE_N, groups_per_tile, _NVFP4_BLOCK_SIZE)
-                ) * ct.expand_dims(weight_scale, axis=2)
-                dequantized_weight = ct.astype(
-                    ct.reshape(dequantized_weight, (TILE_N, TILE_K)),
-                    activation.dtype,
-                )
-                accumulator = ct.mma(
-                    activation,
-                    ct.permute(dequantized_weight, (1, 0)),
-                    accumulator,
-                )
-            ct.scatter(
-                OUT,
-                (
-                    ct.reshape(slots, (TILE_M, 1)),
-                    ct.reshape(n_offsets, (1, TILE_N)),
-                ),
-                ct.astype(accumulator * alpha, OUT.dtype),
-                check_bounds=True,
-            )
 
 
 @ct.kernel
@@ -1093,16 +1049,15 @@ def _grouped_gemm(
     top_k: int,
     block_size: int,
     config: GemmConfig,
-    activation_fp4: bool,
     scale_row_major: bool = False,
     sorted_x: torch.Tensor | None = None,
     sorted_x_scale: torch.Tensor | None = None,
     output_sorted: bool = False,
 ) -> None:
-    if activation_fp4 and (config.tile_n % 128 != 0 or config.tile_k % 64 != 0):
+    if config.tile_n % 128 != 0 or config.tile_k % 64 != 0:
         raise ValueError("W4A4 tiles require tile_n divisible by 128 and tile_k by 64.")
     n = output.shape[1]
-    k = x.shape[1] * (2 if activation_fp4 else 1)
+    k = x.shape[1] * 2
     num_assignment_rows = output.shape[0]
     m_blocks = (sorted_slots.shape[0] + block_size - 1) // block_size
     grid_m = max(1, min(m_blocks, num_assignment_rows))
@@ -1113,34 +1068,24 @@ def _grouped_gemm(
         raise ValueError(
             f"GEMM output size {n} is not divisible by {global_scale_shards} global-scale shards."
         )
-    kernel_impl = _grouped_gemm_w4a4 if activation_fp4 else _grouped_gemm_w4a16
-    kernel_x_scale = x_scale if activation_fp4 else x_scale.view(torch.uint8)
-    kernel_weight_scale = (
-        weight_scale if activation_fp4 else weight_scale.view(torch.uint8)
-    )
-    if (
-        activation_fp4
-        and k <= _PERSISTENT_MAX_K
-        and num_assignment_rows >= _PERSISTENT_MIN_ASSIGNMENTS
-    ):
+    if k <= _PERSISTENT_MAX_K and num_assignment_rows >= _PERSISTENT_MIN_ASSIGNMENTS:
         n_blocks = (n + config.tile_n - 1) // config.tile_n
         grid_m = _persistent_grid_m(x, grid_m, n_blocks)
-    kernel = cached_replace_hints(kernel_impl, occupancy=config.occupancy)
+    kernel = cached_replace_hints(_grouped_gemm_w4a4, occupancy=config.occupancy)
     launch_args: tuple[object, ...] = (
         x.reshape(-1),
-        kernel_x_scale.reshape(-1),
+        x_scale.reshape(-1),
     )
-    if activation_fp4:
-        input_sorted = sorted_x is not None
-        if input_sorted != (sorted_x_scale is not None):
-            raise ValueError("sorted W4A4 values and scales must be provided together.")
-        launch_args += (
-            sorted_x if sorted_x is not None else x,
-            sorted_x_scale if sorted_x_scale is not None else x_scale,
-        )
+    input_sorted = sorted_x is not None
+    if input_sorted != (sorted_x_scale is not None):
+        raise ValueError("sorted W4A4 values and scales must be provided together.")
+    launch_args += (
+        sorted_x if sorted_x is not None else x,
+        sorted_x_scale if sorted_x_scale is not None else x_scale,
+    )
     launch_args += (
         weights,
-        kernel_weight_scale,
+        weight_scale,
         weight_global_scale.reshape(-1),
         sorted_slots,
         block_expert,
@@ -1150,7 +1095,7 @@ def _grouped_gemm(
     launch_args += (top_k,)
     launch_args += (
         grid_m,
-        x_scale.shape[1] if activation_fp4 else 1,
+        x_scale.shape[1],
         global_scale_shards,
         n // global_scale_shards,
         k,
@@ -1158,13 +1103,12 @@ def _grouped_gemm(
         config.tile_n,
         config.tile_k,
     )
-    if activation_fp4:
-        launch_args += (
-            scale_row_major,
-            weight_global_scale.ndim == 2,
-            input_sorted,
-            output_sorted,
-        )
+    launch_args += (
+        scale_row_major,
+        weight_global_scale.ndim == 2,
+        input_sorted,
+        output_sorted,
+    )
     ct.launch(
         torch.cuda.current_stream(x.device),
         (grid_m, (n + config.tile_n - 1) // config.tile_n),
@@ -1285,13 +1229,13 @@ def run_moe(
     workspace: Workspace,
     *,
     activation_type: ActivationType,
-    activation_fp4: bool,
     fuse_gemm1: bool | None = None,
+    num_sms: int,
     block_size: int,
     gemm1_config: GemmConfig,
     gemm2_config: GemmConfig,
 ) -> torch.Tensor:
-    """Run a fixed A16/A16 or A4/A4 pre-routed NVFP4 MoE pipeline."""
+    """Run the pre-routed W4A4 NVFP4 MoE pipeline."""
     num_tokens, hidden_size = hidden_states.shape
     top_k = topk_ids.shape[1]
     num_assignments = num_tokens * top_k
@@ -1299,24 +1243,18 @@ def run_moe(
         topk_ids, w1.shape[0], block_size, workspace
     )
 
-    if activation_fp4:
-        if workspace.input_q is None or workspace.input_scale is None:
-            raise RuntimeError("W4A4 workspace is missing input quantization buffers.")
-        _quantize(
-            hidden_states,
-            workspace.input_q,
-            workspace.input_scale,
-            scale_row_major=workspace.scale_row_major,
-        )
-        gemm1_input = workspace.input_q
-        gemm1_input_scale = workspace.input_scale
-    else:
-        gemm1_input = hidden_states
-        gemm1_input_scale = w1_scale.reshape(-1)[:1]
+    _quantize(
+        hidden_states,
+        workspace.input_q,
+        workspace.input_scale,
+        scale_row_major=workspace.scale_row_major,
+    )
+    gemm1_input = workspace.input_q
+    gemm1_input_scale = workspace.input_scale
 
     sorted_gemm1_input = None
     sorted_gemm1_input_scale = None
-    use_sorted_io = activation_fp4 and _use_row_major_scale_layout(
+    use_sorted_io = _use_row_major_scale_layout(
         num_assignments, workspace.activation_q.shape[1] * 2
     )
     if use_sorted_io:
@@ -1335,20 +1273,16 @@ def run_moe(
         sorted_gemm1_input = workspace.sorted_input_q
         sorted_gemm1_input_scale = workspace.sorted_input_scale
 
-    can_fuse_gemm1 = activation_fp4 and _can_fuse_gemm1(
+    can_fuse_gemm1 = _can_fuse_gemm1(
         workspace.activation_q.shape[1] * 2,
         activation_type,
         gemm1_config,
     )
     auto_fuse_gemm1 = (
-        activation_fp4
-        and (
-            not activation_type.is_gated
-            or num_assignments >= 64
-            or workspace.activation_q.shape[1] * 2 % gemm1_config.tile_n != 0
-        )
-        and can_fuse_gemm1
-    )
+        not activation_type.is_gated
+        or num_assignments >= 64
+        or workspace.activation_q.shape[1] * 2 % gemm1_config.tile_n != 0
+    ) and can_fuse_gemm1
     use_fused_gemm1 = auto_fuse_gemm1 if fuse_gemm1 is None else fuse_gemm1
     if use_fused_gemm1 and not can_fuse_gemm1:
         raise ValueError(
@@ -1357,8 +1291,6 @@ def run_moe(
             f"tile_n={gemm1_config.tile_n}."
         )
     if use_fused_gemm1:
-        if workspace.activation_q is None or workspace.activation_scale is None:
-            raise RuntimeError("W4A4 workspace is missing GEMM2 quantization buffers.")
         intermediate_size = workspace.activation_q.shape[1] * 2
         _grouped_gemm1_fused(
             gemm1_input,
@@ -1398,42 +1330,21 @@ def run_moe(
             top_k=top_k,
             block_size=block_size,
             config=gemm1_config,
-            activation_fp4=activation_fp4,
             scale_row_major=workspace.scale_row_major,
             sorted_x=sorted_gemm1_input,
             sorted_x_scale=sorted_gemm1_input_scale,
             output_sorted=use_sorted_io,
         )
-    if activation_fp4 and not use_fused_gemm1:
-        if workspace.activation_q is None or workspace.activation_scale is None:
-            raise RuntimeError("W4A4 workspace is missing GEMM2 quantization buffers.")
-        if activation_type.is_gated and num_assignments < 64:
-            activation_out = workspace.activation_out[:num_assignments]
-            launch_activation(gemm1_out, activation_out, activation_type)
-            _quantize(
-                activation_out,
-                workspace.activation_q,
-                workspace.activation_scale,
-                scale_row_major=workspace.scale_row_major,
-            )
-        else:
-            _launch_activation_quantize(
-                gemm1_out,
-                workspace.activation_q,
-                workspace.activation_scale,
-                activation_type,
-                occupancy=4 if use_sorted_io else 2,
-                scale_row_major=workspace.scale_row_major,
-            )
-    if activation_fp4:
-        gemm2_input = workspace.activation_q
-        gemm2_input_scale = workspace.activation_scale
-    else:
-        gemm1_out = workspace.gemm1_out[:num_assignments]
-        activation_out = workspace.activation_out[:num_assignments]
-        launch_activation(gemm1_out, activation_out, activation_type)
-        gemm2_input = activation_out
-        gemm2_input_scale = w2_scale.reshape(-1)[:1]
+    if not use_fused_gemm1:
+        _launch_unfused_activation_quantize(
+            gemm1_out,
+            workspace,
+            activation_type,
+            num_assignments=num_assignments,
+            num_sms=num_sms,
+        )
+    gemm2_input = workspace.activation_q
+    gemm2_input_scale = workspace.activation_scale
 
     gemm2_out = workspace.gemm2_out[:num_assignments]
     _grouped_gemm(
@@ -1449,12 +1360,11 @@ def run_moe(
         top_k=1,
         block_size=block_size,
         config=gemm2_config,
-        activation_fp4=activation_fp4,
         scale_row_major=workspace.scale_row_major,
         sorted_x=gemm2_input if use_sorted_io else None,
         sorted_x_scale=gemm2_input_scale if use_sorted_io else None,
     )
-    tile_h = min(next_positive_power_of_2(hidden_size), 4096)
+    tile_h = _combine_tile_h(num_tokens, hidden_size)
     ct.launch(
         torch.cuda.current_stream(hidden_states.device),
         (num_tokens, (hidden_size + tile_h - 1) // tile_h),

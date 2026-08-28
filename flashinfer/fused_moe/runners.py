@@ -23,6 +23,7 @@ fragile backend-specific kernel-launch code lives in exactly one place.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, ClassVar, List
 
 import torch
@@ -811,6 +812,286 @@ class CutlassW4A16Runner(_CutlassRunnerBase):
 # ---------------------------------------------------------------------------
 
 
+_CUTILE_BF16_GEMM_HEURISTIC_VERSION = 5
+_CUTILE_BF16_DEFAULT_GEMM_CONFIGS = (
+    (128, 32, 4),
+    (128, 64, 1),
+    (128, 128, 1),
+)
+_CUTILE_BF16_DIVERSITY_GEMM_CONFIGS = (
+    (128, 64, 2),
+    (64, 128, 2),
+)
+_CUTILE_BF16_GEMM_CONFIG_UNIVERSE = (
+    (64, 32, 4),
+    (64, 64, 4),
+    (64, 128, 2),
+    (128, 32, 4),
+    (128, 64, 2),
+    (128, 64, 1),
+    (128, 128, 2),
+    (128, 128, 1),
+    (256, 32, 2),
+    (256, 32, 1),
+    (256, 64, 2),
+    (256, 64, 1),
+    (256, 128, 1),
+)
+
+
+@dataclass(frozen=True)
+class _CuTileBf16GemmProblem:
+    stage: int
+    arch: int
+    num_sms: int
+    num_assignments: int
+    num_experts: int
+    block_size: int
+    n: int
+    k: int
+
+    @property
+    def m_blocks(self) -> int:
+        rows, extra = divmod(self.num_assignments, self.num_experts)
+        full_blocks = (rows + self.block_size - 1) // self.block_size
+        extra_blocks = (rows + self.block_size) // self.block_size
+        return (self.num_experts - extra) * full_blocks + extra * extra_blocks
+
+
+def _cutile_bf16_config_rejection_reason(
+    problem: _CuTileBf16GemmProblem, config: tuple[int, int, int]
+) -> str | None:
+    if problem.stage not in (1, 2):
+        return f"stage must be 1 or 2, got {problem.stage}"
+    if problem.arch not in _CUTILE_BF16_ARCHS:
+        return f"SM{problem.arch} is unsupported"
+    if problem.num_sms <= 0:
+        return f"num_sms must be positive, got {problem.num_sms}"
+    if problem.num_assignments <= 0 or problem.num_experts <= 0:
+        return "num_assignments and num_experts must be positive"
+    if problem.block_size not in (32, 64, 128):
+        return f"block_size={problem.block_size} is unsupported"
+    if problem.n <= 0 or problem.k <= 0:
+        return f"N and K must be positive, got N={problem.n}, K={problem.k}"
+    if config not in _CUTILE_BF16_GEMM_CONFIG_UNIVERSE:
+        return f"config={config} is outside the supported cuTile BF16 tile set"
+    tile_n, tile_k, _ = config
+    if tile_n > 2 * problem.n:
+        return f"tile_n={tile_n} exceeds 2*N={2 * problem.n}"
+    if tile_k > 2 * problem.k:
+        return f"tile_k={tile_k} exceeds 2*K={2 * problem.k}"
+    return None
+
+
+def _cutile_bf16_config_score(
+    problem: _CuTileBf16GemmProblem, config: tuple[int, int, int]
+) -> float:
+    tile_n, tile_k, occupancy = config
+    padded_n = ((problem.n + tile_n - 1) // tile_n) * tile_n
+    padded_k = ((problem.k + tile_k - 1) // tile_k) * tile_k
+    n_util = problem.n / padded_n
+    k_util = problem.k / padded_k
+    programs = problem.m_blocks * ((problem.n + tile_n - 1) // tile_n)
+    programs_per_sm = programs / problem.num_sms
+
+    score = 4.0 * n_util + 2.0 * k_util
+    if programs_per_sm < 1.0:
+        score += 2.0 * programs_per_sm
+        score -= (tile_n // 64 - 1) * (1.0 - programs_per_sm)
+    else:
+        score += min(programs_per_sm, 4.0) / 4.0
+        score += {64: 0.0, 128: 0.3, 256: 0.6}[tile_n]
+
+    if programs_per_sm >= occupancy:
+        score += 0.1 * occupancy
+    else:
+        score -= 0.1 * (occupancy - programs_per_sm)
+
+    preferred_tile_k = 64 if problem.arch == 90 else 32
+    if tile_k == preferred_tile_k:
+        score += 0.25
+    return score
+
+
+def _rank_cutile_bf16_gemm_configs(
+    problem: _CuTileBf16GemmProblem,
+    *,
+    max_configs: int | None = None,
+) -> list[tuple[int, int, int]]:
+    if max_configs is None:
+        max_configs = 8 if problem.arch == 90 else 10
+    valid = [
+        config
+        for config in _CUTILE_BF16_GEMM_CONFIG_UNIVERSE
+        if _cutile_bf16_config_rejection_reason(problem, config) is None
+    ]
+    if not valid:
+        raise NotImplementedError(
+            "CuTileBf16Runner: no supported grouped GEMM configuration for "
+            f"stage={problem.stage}, SM{problem.arch}, num_sms={problem.num_sms}, "
+            f"assignments={problem.num_assignments}, experts={problem.num_experts}, "
+            f"block_size={problem.block_size}, N={problem.n}, K={problem.k}."
+        )
+
+    scored = sorted(
+        valid,
+        key=lambda config: (
+            -_cutile_bf16_config_score(problem, config),
+            config,
+        ),
+    )
+    anchors = list(_CUTILE_BF16_DEFAULT_GEMM_CONFIGS)
+    if problem.arch != 90:
+        anchors.extend(_CUTILE_BF16_DIVERSITY_GEMM_CONFIGS)
+    defaults = [config for config in anchors if config in valid]
+    selected = list(defaults)
+    for config in scored:
+        if config not in selected:
+            selected.append(config)
+        if len(selected) == max_configs:
+            break
+    selected = sorted(
+        selected,
+        key=lambda config: (
+            -_cutile_bf16_config_score(problem, config),
+            config,
+        ),
+    )
+    return selected[:max_configs]
+
+
+class _CuTileBf16StageRunner(TunableRunner):
+    def __init__(self, parent: CuTileBf16Runner, stage: int, block_size: int):
+        self.parent = parent
+        self.stage = stage
+        self.block_size = block_size
+        self._prepared_signature: tuple[int, int] | None = None
+        self._sorted_slots: torch.Tensor | None = None
+        self._block_expert: torch.Tensor | None = None
+        self._num_post_pad: torch.Tensor | None = None
+
+    def _problem(self, inputs: list[torch.Tensor]) -> _CuTileBf16GemmProblem:
+        return self.parent._gemm_problem(
+            inputs, stage=self.stage, block_size=self.block_size
+        )
+
+    def get_valid_tactics(self, inputs: list[torch.Tensor], _profile: Any) -> list[Any]:
+        return _rank_cutile_bf16_gemm_configs(self._problem(inputs))
+
+    def _prepare(self, inputs: list[torch.Tensor]) -> None:
+        num_tokens, hidden_size = inputs[1].shape
+        self.parent._ensure_workspace(num_tokens, hidden_size)
+        workspace = self.parent._workspace
+        if workspace is None:
+            raise RuntimeError("cuTile BF16 stage tuning workspace is unavailable.")
+        module = self.parent._kernel_module
+        (
+            self._sorted_slots,
+            self._block_expert,
+            self._num_post_pad,
+        ) = module._permute(
+            inputs[2],
+            self.parent.config.routing.num_experts,
+            self.block_size,
+            workspace,
+        )
+        if self.stage == 2:
+            workspace.activation_out[: inputs[2].numel()].zero_()
+        self._prepared_signature = (num_tokens, hidden_size)
+
+    def forward(
+        self,
+        inputs: list[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del kwargs
+        signature = (inputs[1].shape[0], inputs[1].shape[1])
+        if do_preparation or self._prepared_signature != signature:
+            self._prepare(inputs)
+        if do_preparation:
+            return inputs[0]
+        if tactic == -1:
+            config = _rank_cutile_bf16_gemm_configs(self._problem(inputs))[0]
+        elif isinstance(tactic, (tuple, list)) and len(tactic) == 3:
+            values = tuple(map(int, tactic))
+            config = (values[0], values[1], values[2])
+        else:
+            raise ValueError(
+                "cuTile BF16 stage tactic must be -1 or (tile_n, tile_k, occupancy)."
+            )
+        problem = self._problem(inputs)
+        reason = _cutile_bf16_config_rejection_reason(problem, config)
+        if reason is not None:
+            raise NotImplementedError(
+                f"CuTileBf16Runner GEMM{self.stage} tactic is unsupported: {reason}."
+            )
+        if (
+            self._sorted_slots is None
+            or self._block_expert is None
+            or self._num_post_pad is None
+        ):
+            raise RuntimeError("cuTile BF16 stage inputs were not prepared.")
+
+        workspace = self.parent._workspace
+        if workspace is None:
+            raise RuntimeError("cuTile BF16 stage tuning workspace is unavailable.")
+        gemm_config = self.parent._kernel_module.GemmConfig(*config)
+        num_assignments = inputs[2].numel()
+        if self.stage == 1:
+            output = (
+                workspace.gemm1_out[:num_assignments]
+                if self.parent.config.activation.is_gated
+                else workspace.activation_out[:num_assignments]
+            )
+            self.parent._kernel_module._grouped_gemm(
+                inputs[1],
+                inputs[4],
+                self._sorted_slots,
+                self._block_expert,
+                self._num_post_pad,
+                output,
+                top_k=self.parent.config.routing.top_k,
+                block_size=self.block_size,
+                config=gemm_config,
+                activation_type=(
+                    None
+                    if self.parent.config.activation.is_gated
+                    else self.parent.config.activation.type
+                ),
+            )
+        else:
+            output = workspace.gemm2_out[:num_assignments]
+            self.parent._kernel_module._grouped_gemm(
+                workspace.activation_out[:num_assignments],
+                inputs[5],
+                self._sorted_slots,
+                self._block_expert,
+                self._num_post_pad,
+                output,
+                top_k=1,
+                block_size=self.block_size,
+                config=gemm_config,
+            )
+        return output
+
+    def get_cache_key_extras(self, inputs: list[torch.Tensor]) -> tuple[Any, ...]:
+        del inputs
+        return (
+            "cutile_bf16_stage",
+            _CUTILE_BF16_GEMM_HEURISTIC_VERSION,
+            self.parent._device_arch,
+            self.parent._num_sms,
+            self.stage,
+            self.block_size,
+            int(self.parent.config.activation.type),
+            self.parent.config.routing.num_experts,
+            self.parent.config.routing.top_k,
+            self.parent.config.experts.intermediate_size,
+        )
+
+
 class CuTileBf16Runner(MoERunner):
     """Unified adapter for the cuTile BF16 MoE pipeline."""
 
@@ -819,6 +1100,7 @@ class CuTileBf16Runner(MoERunner):
     supported_quant_variants = (QuantVariant.BF16,)
     _block_sizes: ClassVar[tuple[int, ...]] = (32, 64, 128)
     _default_block_size: ClassVar[int] = 32
+    _num_top_tactics_per_stage: ClassVar[int] = 2
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -832,6 +1114,9 @@ class CuTileBf16Runner(MoERunner):
             self.device = torch.device("cuda", torch.cuda.current_device())
         major, minor = get_compute_capability(self.device)
         self._device_arch = major * 10 + minor
+        self._num_sms = torch.cuda.get_device_properties(
+            self.device
+        ).multi_processor_count
         self._kernel_module: Any = None
         self._workspace_cache: dict[tuple[int, int], Any] = {}
         self._workspace: Any = None
@@ -952,6 +1237,113 @@ class CuTileBf16Runner(MoERunner):
             )
         return configs
 
+    def _gemm_problem(
+        self,
+        inputs: List[torch.Tensor],
+        *,
+        stage: int,
+        block_size: int,
+    ) -> _CuTileBf16GemmProblem:
+        hidden_size = inputs[1].shape[1]
+        intermediate_size = self.config.experts.intermediate_size
+        if stage == 1:
+            n = intermediate_size * (2 if self.config.activation.is_gated else 1)
+            k = hidden_size
+        elif stage == 2:
+            n, k = hidden_size, intermediate_size
+        else:
+            raise ValueError(f"stage must be 1 or 2, got {stage}")
+        return _CuTileBf16GemmProblem(
+            stage=stage,
+            arch=self._device_arch,
+            num_sms=self._num_sms,
+            num_assignments=inputs[2].numel(),
+            num_experts=self.config.routing.num_experts,
+            block_size=block_size,
+            n=n,
+            k=k,
+        )
+
+    def _fallback_tactic(
+        self, inputs: List[torch.Tensor]
+    ) -> tuple[int, int, int, int, int, int, int]:
+        best: (
+            tuple[
+                float,
+                tuple[int, int, int, int, int, int, int],
+            ]
+            | None
+        ) = None
+        for block_size in self._factorized_block_sizes(inputs[2].numel()):
+            gemm1_problem = self._gemm_problem(inputs, stage=1, block_size=block_size)
+            gemm2_problem = self._gemm_problem(inputs, stage=2, block_size=block_size)
+            gemm1 = _rank_cutile_bf16_gemm_configs(gemm1_problem)[0]
+            gemm2 = _rank_cutile_bf16_gemm_configs(gemm2_problem)[0]
+            padded_rows = gemm1_problem.m_blocks * block_size
+            block_util = gemm1_problem.num_assignments / padded_rows
+            score = (
+                _cutile_bf16_config_score(gemm1_problem, gemm1)
+                + _cutile_bf16_config_score(gemm2_problem, gemm2)
+                + 2.0 * block_util
+            )
+            tactic = (block_size, *gemm1, *gemm2)
+            if best is None or score > best[0]:
+                best = (score, tactic)
+        if best is None:
+            raise NotImplementedError(
+                "CuTileBf16Runner: no supported grouped GEMM tactic."
+            )
+        return best[1]
+
+    def _factorized_tactics(
+        self, inputs: List[torch.Tensor]
+    ) -> list[tuple[int, int, int, int, int, int, int]]:
+        tuner = AutoTuner.get()
+        stage_tuning_config = TuningConfig(
+            use_cuda_graph=True,
+            inputs_pre_hook=self._prepare_tuning_inputs,
+        )
+        block_size = self._fallback_tactic(inputs)[0]
+        tactics: list[tuple[int, int, int, int, int, int, int]] = []
+        gemm1_runner = _CuTileBf16StageRunner(self, 1, block_size)
+        gemm2_runner = _CuTileBf16StageRunner(self, 2, block_size)
+        gemm1_tactics = tuner.rank_tactics(
+            f"moe_{self.backend_key}_sm{self._device_arch}_b{block_size}_gemm1",
+            [gemm1_runner],
+            stage_tuning_config,
+            inputs,
+            k=self._num_top_tactics_per_stage,
+        )
+        gemm2_tactics = tuner.rank_tactics(
+            f"moe_{self.backend_key}_sm{self._device_arch}_b{block_size}_gemm2",
+            [gemm2_runner],
+            stage_tuning_config,
+            inputs,
+            k=self._num_top_tactics_per_stage,
+        )
+
+        def resolve(
+            runner: _CuTileBf16StageRunner, stage_tactics: list[Any]
+        ) -> list[tuple[int, int, int]]:
+            fallback = _rank_cutile_bf16_gemm_configs(runner._problem(inputs))[0]
+            resolved = []
+            for tactic in stage_tactics:
+                if tactic == -1:
+                    resolved.append(fallback)
+                else:
+                    values = tuple(map(int, tactic))
+                    resolved.append((values[0], values[1], values[2]))
+            return list(dict.fromkeys(resolved))
+
+        gemm1_configs = resolve(gemm1_runner, gemm1_tactics)
+        gemm2_configs = resolve(gemm2_runner, gemm2_tactics)
+        tactics.extend(
+            (block_size, *gemm1, *gemm2)
+            for gemm1 in gemm1_configs
+            for gemm2 in gemm2_configs
+        )
+        return list(dict.fromkeys(tactics))
+
     def _candidate_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
         # Padding dominates while each expert receives few rows. The measured
         # M32 -> M64 crossover differs by architecture; retain the adjacent M
@@ -960,6 +1352,24 @@ class CuTileBf16Runner(MoERunner):
         rows_per_expert = (num_assignments + num_experts - 1) // num_experts
         prefill_threshold = {89: 64, 90: 128, 120: 512, 121: 512}[self._device_arch]
         return (32, 64) if rows_per_expert < prefill_threshold else (64, 128)
+
+    def _candidate_non_gated_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
+        num_experts = self.config.routing.num_experts
+        rows_per_expert = (num_assignments + num_experts - 1) // num_experts
+        prefill_threshold = {89: 256, 90: 32, 120: 128, 121: 128}[self._device_arch]
+        return (32, 64) if rows_per_expert < prefill_threshold else (64, 128)
+
+    def _gated_block_size(self, num_assignments: int) -> int:
+        num_experts = self.config.routing.num_experts
+        rows_per_expert = (num_assignments + num_experts - 1) // num_experts
+        if rows_per_expert < 64:
+            return 32
+        return 64 if rows_per_expert < 512 else 128
+
+    def _factorized_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
+        if self.config.activation.is_gated:
+            return (self._gated_block_size(num_assignments),)
+        return self._candidate_non_gated_block_sizes(num_assignments)
 
     def _candidate_gemm_pairs(
         self, inputs: List[torch.Tensor]
@@ -1031,13 +1441,7 @@ class CuTileBf16Runner(MoERunner):
             raise ValueError(
                 f"{type(self).__name__} expects 6 inputs, got {len(inputs)}."
             )
-        block_sizes = self._candidate_block_sizes(inputs[2].numel())
-        gemm_pairs = self._candidate_gemm_pairs(inputs)
-        return [
-            (block_size, *gemm1, *gemm2)
-            for block_size in block_sizes
-            for gemm1, gemm2 in gemm_pairs
-        ]
+        return self._factorized_tactics(inputs)
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -1148,22 +1552,8 @@ class CuTileBf16Runner(MoERunner):
                 f"{type(self).__name__} expects 6 inputs, got {len(inputs)}."
             )
         hidden_size = inputs[1].shape[1]
-        intermediate_size = self.config.experts.intermediate_size
         if tactic == -1:
-            gemm1_output_size = intermediate_size * (
-                2 if self.config.activation.is_gated else 1
-            )
-            first = self._gemm_configs(hidden_size, gemm1_output_size)[0]
-            second_candidates = self._gemm_configs(intermediate_size, hidden_size)
-            second = next(
-                (
-                    candidate
-                    for candidate in second_candidates
-                    if candidate == (128, 128, 1)
-                ),
-                second_candidates[0],
-            )
-            tactic = (self._default_block_size, *first, *second)
+            tactic = self._fallback_tactic(inputs)
         if not isinstance(tactic, (tuple, list)) or len(tactic) != 7:
             raise ValueError(
                 f"{type(self).__name__} tactic must be -1 or "
@@ -1176,6 +1566,16 @@ class CuTileBf16Runner(MoERunner):
                 f"cuTile BF16 block size must be one of {self._block_sizes}, "
                 f"got {block_size}."
             )
+        for stage, config in (
+            (1, (g1_n, g1_k, g1_occ)),
+            (2, (g2_n, g2_k, g2_occ)),
+        ):
+            problem = self._gemm_problem(inputs, stage=stage, block_size=block_size)
+            reason = _cutile_bf16_config_rejection_reason(problem, config)
+            if reason is not None:
+                raise NotImplementedError(
+                    f"CuTileBf16Runner GEMM{stage} tactic is unsupported: {reason}."
+                )
         self._ensure_workspace(inputs[1].shape[0], hidden_size)
         gemm1_config = self._kernel_module.GemmConfig(g1_n, g1_k, g1_occ)
         gemm2_config = self._kernel_module.GemmConfig(g2_n, g2_k, g2_occ)
@@ -1194,7 +1594,12 @@ class CuTileBf16Runner(MoERunner):
         )
 
     def _cache_key_extras(self) -> tuple:
-        return super()._cache_key_extras() + (self._device_arch, self._block_sizes)
+        return super()._cache_key_extras() + (
+            self._device_arch,
+            self._num_sms,
+            self._block_sizes,
+            _CUTILE_BF16_GEMM_HEURISTIC_VERSION,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1202,11 +1607,465 @@ class CuTileBf16Runner(MoERunner):
 # ---------------------------------------------------------------------------
 
 
-class _CuTileFp4Runner(CuTileBf16Runner):
-    """Shared adapter for fixed A16/A16 and A4/A4 NVFP4 pipelines."""
+_CUTILE_W4A4_GEMM_HEURISTIC_VERSION = 4
+_CUTILE_W4A4_SORT_INPUT_MIN_ASSIGNMENTS = 4096
+_CUTILE_W4A4_SORT_INPUT_SMALL_I_MIN_ASSIGNMENTS = 65536
+_CUTILE_W4A4_GATED_FUSION_MIN_ASSIGNMENTS = 64
+_CUTILE_W4A4_STAGE_MAX_CONFIGS = 9
+_CUTILE_W4A4_DEFAULT_GEMM_CONFIGS = (
+    (128, 128, 2),
+    (128, 64, 2),
+)
+_CUTILE_W4A4_DIVERSITY_GEMM_CONFIGS = (
+    (256, 128, 1),
+    (128, 64, 4),
+)
+_CUTILE_W4A4_GEMM_CONFIG_UNIVERSE = (
+    (128, 64, 2),
+    (128, 64, 4),
+    (128, 128, 2),
+    (128, 256, 2),
+    (256, 64, 1),
+    (256, 64, 2),
+    (256, 128, 1),
+    (256, 128, 2),
+    (256, 256, 1),
+)
+
+
+@dataclass(frozen=True)
+class _CuTileW4A4GemmProblem:
+    stage: int
+    arch: int
+    num_sms: int
+    num_assignments: int
+    num_experts: int
+    block_size: int
+    n: int
+    k: int
+    fused_epilogue: bool
+    is_gated: bool
+    input_sorted: bool
+
+    @property
+    def m_blocks(self) -> int:
+        rows, extra = divmod(self.num_assignments, self.num_experts)
+        full_blocks = (rows + self.block_size - 1) // self.block_size
+        extra_blocks = (rows + self.block_size) // self.block_size
+        return (self.num_experts - extra) * full_blocks + extra * extra_blocks
+
+
+def _cutile_w4a4_config_rejection_reason(
+    problem: _CuTileW4A4GemmProblem, config: tuple[int, int, int]
+) -> str | None:
+    if problem.stage not in (1, 2):
+        return f"stage must be 1 or 2, got {problem.stage}"
+    if problem.arch not in _CUTILE_NVFP4_ARCHS:
+        return f"SM{problem.arch} is unsupported"
+    if problem.num_sms <= 0:
+        return f"num_sms must be positive, got {problem.num_sms}"
+    if problem.num_assignments <= 0 or problem.num_experts <= 0:
+        return "num_assignments and num_experts must be positive"
+    if problem.block_size not in (16, 32, 64, 128):
+        return f"block_size={problem.block_size} is unsupported"
+    if problem.n <= 0 or problem.k <= 0:
+        return f"N and K must be positive, got N={problem.n}, K={problem.k}"
+    if config not in _CUTILE_W4A4_GEMM_CONFIG_UNIVERSE:
+        return f"config={config} is outside the supported cuTile W4A4 tile set"
+    tile_n, tile_k, _ = config
+    if tile_n % 128 != 0 or tile_k % 64 != 0:
+        return "W4A4 requires tile_n divisible by 128 and tile_k by 64"
+    effective_tile_n = (
+        tile_n // 2
+        if problem.stage == 1 and problem.fused_epilogue and problem.is_gated
+        else tile_n
+    )
+    if effective_tile_n > 2 * problem.n:
+        return f"effective tile_n={effective_tile_n} exceeds 2*N={2 * problem.n}"
+    if tile_k > 2 * problem.k:
+        return f"tile_k={tile_k} exceeds 2*K={2 * problem.k}"
+    if problem.fused_epilogue:
+        if problem.stage != 1:
+            return "only GEMM1 supports a fused activation epilogue"
+        if effective_tile_n < 128:
+            return (
+                "fused GEMM1 requires an effective tile_n of at least 128, "
+                f"got {effective_tile_n}"
+            )
+        if problem.is_gated and problem.n % effective_tile_n != 0:
+            return (
+                f"gated fused GEMM1 requires N={problem.n} to be divisible by "
+                f"effective tile_n={effective_tile_n}"
+            )
+    return None
+
+
+def _cutile_w4a4_config_score(
+    problem: _CuTileW4A4GemmProblem, config: tuple[int, int, int]
+) -> float:
+    tile_n, tile_k, occupancy = config
+    effective_tile_n = (
+        tile_n // 2
+        if problem.stage == 1 and problem.fused_epilogue and problem.is_gated
+        else tile_n
+    )
+    padded_n = (
+        (problem.n + effective_tile_n - 1) // effective_tile_n
+    ) * effective_tile_n
+    padded_k = ((problem.k + tile_k - 1) // tile_k) * tile_k
+    n_util = problem.n / padded_n
+    k_util = problem.k / padded_k
+    n_blocks = (problem.n + effective_tile_n - 1) // effective_tile_n
+    programs_per_sm = problem.m_blocks * n_blocks / problem.num_sms
+
+    score = 4.0 * n_util + 2.0 * k_util
+    if programs_per_sm < 1.0:
+        score += 2.0 * programs_per_sm
+        score -= (effective_tile_n // 128 - 1) * (1.0 - programs_per_sm)
+    else:
+        score += min(programs_per_sm, 4.0) / 4.0
+
+    if programs_per_sm >= occupancy:
+        score += 0.1 * occupancy
+    else:
+        score -= 0.1 * (occupancy - programs_per_sm)
+    if occupancy == 2:
+        score += 0.2
+    if tile_k == 128:
+        score += 0.2
+    if problem.fused_epilogue and effective_tile_n == 128:
+        score += 0.15
+    if problem.fused_epilogue and problem.is_gated and tile_k == 64:
+        score += 0.3
+    if (
+        problem.fused_epilogue
+        and problem.is_gated
+        and tile_k == 128
+        and (problem.num_assignments <= 64 or problem.input_sorted)
+    ):
+        score += 0.2
+    return score
+
+
+def _rank_cutile_w4a4_gemm_configs(
+    problem: _CuTileW4A4GemmProblem,
+    *,
+    max_configs: int = 9,
+) -> list[tuple[int, int, int]]:
+    valid = [
+        config
+        for config in _CUTILE_W4A4_GEMM_CONFIG_UNIVERSE
+        if _cutile_w4a4_config_rejection_reason(problem, config) is None
+    ]
+    if not valid:
+        raise NotImplementedError(
+            "CuTileNvfp4Runner: no supported grouped GEMM configuration for "
+            f"stage={problem.stage}, SM{problem.arch}, num_sms={problem.num_sms}, "
+            f"assignments={problem.num_assignments}, experts={problem.num_experts}, "
+            f"block_size={problem.block_size}, N={problem.n}, K={problem.k}."
+        )
+
+    scored = sorted(
+        valid,
+        key=lambda config: (
+            -_cutile_w4a4_config_score(problem, config),
+            config,
+        ),
+    )
+    anchors = _CUTILE_W4A4_DEFAULT_GEMM_CONFIGS + (_CUTILE_W4A4_DIVERSITY_GEMM_CONFIGS)
+    selected = [config for config in anchors if config in valid]
+    for config in scored:
+        if config not in selected:
+            selected.append(config)
+        if len(selected) == max_configs:
+            break
+    return sorted(
+        selected[:max_configs],
+        key=lambda config: (
+            -_cutile_w4a4_config_score(problem, config),
+            config,
+        ),
+    )
+
+
+class _CuTileW4A4StageRunner(TunableRunner):
+    def __init__(self, parent: _CuTileNvfp4RunnerBase, stage: int, block_size: int):
+        self.parent = parent
+        self.stage = stage
+        self.block_size = block_size
+        self._prepared_signature: tuple[int, int] | None = None
+        self._sorted_slots: torch.Tensor | None = None
+        self._block_expert: torch.Tensor | None = None
+        self._num_post_pad: torch.Tensor | None = None
+        self._sorted_input_q: torch.Tensor | None = None
+        self._sorted_input_scale: torch.Tensor | None = None
+        self._use_sorted_io = False
+
+    def _fusion_modes(self, inputs: list[torch.Tensor]) -> tuple[bool, ...]:
+        if self.stage != 1:
+            return (False,)
+        if not self.parent.config.activation.is_gated:
+            return (True,)
+        fallback = self.parent._w4a4_fallback_fuse_gemm1(inputs, self.block_size)
+        if (
+            inputs[2].numel() < _CUTILE_W4A4_GATED_FUSION_MIN_ASSIGNMENTS
+            or not self.parent._w4a4_fused_gemm1_supported(inputs, self.block_size)
+        ):
+            return (False,)
+        return (fallback, not fallback)
+
+    def _problem(
+        self, inputs: list[torch.Tensor], *, fuse_gemm1: bool | None = None
+    ) -> _CuTileW4A4GemmProblem:
+        return self.parent._w4a4_gemm_problem(
+            inputs,
+            stage=self.stage,
+            block_size=self.block_size,
+            fuse_gemm1=fuse_gemm1,
+        )
+
+    def get_valid_tactics(self, inputs: list[torch.Tensor], _profile: Any) -> list[Any]:
+        if self.stage == 2:
+            return _rank_cutile_w4a4_gemm_configs(
+                self._problem(inputs, fuse_gemm1=False),
+                max_configs=_CUTILE_W4A4_STAGE_MAX_CONFIGS,
+            )
+
+        fusion_modes = self._fusion_modes(inputs)
+        if len(fusion_modes) == 1:
+            fuse_gemm1 = fusion_modes[0]
+            return [
+                (int(fuse_gemm1), *config)
+                for config in _rank_cutile_w4a4_gemm_configs(
+                    self._problem(inputs, fuse_gemm1=fuse_gemm1),
+                    max_configs=_CUTILE_W4A4_STAGE_MAX_CONFIGS,
+                )
+            ]
+
+        tactics: list[tuple[int, int, int, int]] = []
+        quotas = (5, _CUTILE_W4A4_STAGE_MAX_CONFIGS - 5)
+        for fuse_gemm1, quota in zip(fusion_modes, quotas, strict=True):
+            tactics.extend(
+                (int(fuse_gemm1), *config)
+                for config in _rank_cutile_w4a4_gemm_configs(
+                    self._problem(inputs, fuse_gemm1=fuse_gemm1),
+                    max_configs=quota,
+                )
+            )
+        return tactics
+
+    def _prepare(self, inputs: list[torch.Tensor]) -> None:
+        num_tokens, hidden_size = inputs[1].shape
+        num_assignments = inputs[2].numel()
+        self.parent._ensure_workspace(num_tokens, hidden_size)
+        workspace = self.parent._workspace
+        if workspace is None:
+            raise RuntimeError("cuTile W4A4 stage tuning workspace is unavailable.")
+        module = self.parent._kernel_module
+        self._sorted_slots, self._block_expert, self._num_post_pad = module._permute(
+            inputs[2],
+            self.parent.config.routing.num_experts,
+            self.block_size,
+            workspace,
+        )
+        module._quantize(
+            inputs[1],
+            workspace.input_q,
+            workspace.input_scale,
+            scale_row_major=workspace.scale_row_major,
+        )
+        intermediate_size = self.parent.config.experts.intermediate_size
+        self._use_sorted_io = module._use_row_major_scale_layout(
+            num_assignments, intermediate_size
+        )
+        self._sorted_input_q = None
+        self._sorted_input_scale = None
+        if self._use_sorted_io:
+            if workspace.sorted_input_q is None or workspace.sorted_input_scale is None:
+                raise RuntimeError(
+                    "cuTile W4A4 stage tuning sorted input buffers are unavailable."
+                )
+            module._pack_input(
+                workspace.input_q,
+                workspace.input_scale,
+                self._sorted_slots,
+                workspace.sorted_input_q,
+                workspace.sorted_input_scale,
+                top_k=self.parent.config.routing.top_k,
+                block_size=self.block_size,
+                scale_row_major=workspace.scale_row_major,
+            )
+            self._sorted_input_q = workspace.sorted_input_q
+            self._sorted_input_scale = workspace.sorted_input_scale
+        if self.stage == 2:
+            workspace.activation_q.zero_()
+            workspace.activation_scale.fill_(1.0)
+        self._prepared_signature = (num_tokens, hidden_size)
+
+    def forward(
+        self,
+        inputs: list[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del kwargs
+        signature = (inputs[1].shape[0], inputs[1].shape[1])
+        if do_preparation or self._prepared_signature != signature:
+            self._prepare(inputs)
+        if do_preparation:
+            return inputs[0]
+        fuse_gemm1 = False
+        if self.stage == 1:
+            if tactic == -1:
+                fuse_gemm1 = self.parent._w4a4_fallback_fuse_gemm1(
+                    inputs, self.block_size
+                )
+                problem = self._problem(inputs, fuse_gemm1=fuse_gemm1)
+                config = _rank_cutile_w4a4_gemm_configs(problem)[0]
+            elif isinstance(tactic, (tuple, list)) and len(tactic) == 4:
+                fuse_value, tile_n, tile_k, occupancy = map(int, tactic)
+                if fuse_value not in (0, 1):
+                    raise ValueError("W4A4 GEMM1 fusion flag must be 0 or 1.")
+                fuse_gemm1 = bool(fuse_value)
+                problem = self._problem(inputs, fuse_gemm1=fuse_gemm1)
+                config = (tile_n, tile_k, occupancy)
+            else:
+                raise ValueError(
+                    "cuTile W4A4 GEMM1 stage tactic must be -1 or "
+                    "(fuse_gemm1, tile_n, tile_k, occupancy)."
+                )
+        else:
+            problem = self._problem(inputs, fuse_gemm1=False)
+            if tactic == -1:
+                config = _rank_cutile_w4a4_gemm_configs(problem)[0]
+            elif isinstance(tactic, (tuple, list)) and len(tactic) == 3:
+                tile_n, tile_k, occupancy = map(int, tactic)
+                config = (tile_n, tile_k, occupancy)
+            else:
+                raise ValueError(
+                    "cuTile W4A4 GEMM2 stage tactic must be -1 or "
+                    "(tile_n, tile_k, occupancy)."
+                )
+        reason = _cutile_w4a4_config_rejection_reason(problem, config)
+        if reason is not None:
+            raise NotImplementedError(
+                f"CuTileNvfp4Runner GEMM{self.stage} tactic is unsupported: {reason}."
+            )
+        if (
+            self._sorted_slots is None
+            or self._block_expert is None
+            or self._num_post_pad is None
+        ):
+            raise RuntimeError("cuTile W4A4 stage inputs were not prepared.")
+        workspace = self.parent._workspace
+        if workspace is None:
+            raise RuntimeError("cuTile W4A4 stage tuning workspace is unavailable.")
+        module = self.parent._kernel_module
+        gemm_config = module.GemmConfig(*config)
+        num_assignments = inputs[2].numel()
+        if self.stage == 1:
+            if fuse_gemm1:
+                module._grouped_gemm1_fused(
+                    workspace.input_q,
+                    workspace.input_scale,
+                    inputs[4],
+                    inputs[5],
+                    inputs[6],
+                    self._sorted_slots,
+                    self._block_expert,
+                    self._num_post_pad,
+                    workspace.activation_q,
+                    workspace.activation_scale,
+                    num_assignments=num_assignments,
+                    top_k=self.parent.config.routing.top_k,
+                    intermediate_size=self.parent.config.experts.intermediate_size,
+                    activation_type=self.parent.config.activation.type,
+                    block_size=self.block_size,
+                    config=gemm_config,
+                    scale_row_major=workspace.scale_row_major,
+                    sorted_x=self._sorted_input_q,
+                    sorted_x_scale=self._sorted_input_scale,
+                    output_sorted=self._use_sorted_io,
+                )
+            else:
+                gemm1_rows = (
+                    self._sorted_slots.shape[0]
+                    if self._use_sorted_io
+                    else num_assignments
+                )
+                gemm1_out = workspace.gemm1_out[:gemm1_rows]
+                module._grouped_gemm(
+                    workspace.input_q,
+                    workspace.input_scale,
+                    inputs[4],
+                    inputs[5],
+                    inputs[6],
+                    self._sorted_slots,
+                    self._block_expert,
+                    self._num_post_pad,
+                    gemm1_out,
+                    top_k=self.parent.config.routing.top_k,
+                    block_size=self.block_size,
+                    config=gemm_config,
+                    scale_row_major=workspace.scale_row_major,
+                    sorted_x=self._sorted_input_q,
+                    sorted_x_scale=self._sorted_input_scale,
+                    output_sorted=self._use_sorted_io,
+                )
+                module._launch_unfused_activation_quantize(
+                    gemm1_out,
+                    workspace,
+                    self.parent.config.activation.type,
+                    num_assignments=num_assignments,
+                    num_sms=self.parent._num_sms,
+                )
+            return workspace.activation_q
+
+        output = workspace.gemm2_out[:num_assignments]
+        module._grouped_gemm(
+            workspace.activation_q,
+            workspace.activation_scale,
+            inputs[7],
+            inputs[8],
+            inputs[9],
+            self._sorted_slots,
+            self._block_expert,
+            self._num_post_pad,
+            output,
+            top_k=1,
+            block_size=self.block_size,
+            config=gemm_config,
+            scale_row_major=workspace.scale_row_major,
+            sorted_x=workspace.activation_q if self._use_sorted_io else None,
+            sorted_x_scale=(
+                workspace.activation_scale if self._use_sorted_io else None
+            ),
+        )
+        return output
+
+    def get_cache_key_extras(self, inputs: list[torch.Tensor]) -> tuple[Any, ...]:
+        problem = self._problem(inputs, fuse_gemm1=False)
+        return (
+            "cutile_w4a4_stage",
+            _CUTILE_W4A4_GEMM_HEURISTIC_VERSION,
+            problem.arch,
+            problem.num_sms,
+            problem.stage,
+            problem.block_size,
+            self._fusion_modes(inputs),
+            problem.input_sorted,
+            int(self.parent.config.activation.type),
+            self.parent.config.routing.num_experts,
+            self.parent.config.routing.top_k,
+            self.parent.config.experts.intermediate_size,
+        )
+
+
+class _CuTileNvfp4RunnerBase(CuTileBf16Runner):
+    """Shared implementation for the cuTile W4A4 NVFP4 runner."""
 
     supports_expert_parallelism = False
-    _activation_fp4: ClassVar[bool]
     _supported_archs: ClassVar[tuple[int, ...]]
 
     def _check_support(self) -> None:
@@ -1265,107 +2124,278 @@ class _CuTileFp4Runner(CuTileBf16Runner):
                 top_k=self.config.routing.top_k,
                 is_gated=self.config.activation.is_gated,
                 block_sizes=self._block_sizes,
-                quantize_activations=self._activation_fp4,
                 device=self.device,
             )
             self._workspace_cache[key] = workspace
         self._workspace = workspace
 
-    def _gemm_configs(self, k_in: int, n: int) -> list[tuple[int, int, int]]:
-        if self._activation_fp4:
-            candidates = [
-                (128, 128, 2),
-                (128, 256, 2),
-                (128, 64, 2),
-                (256, 128, 1),
-                (128, 64, 4),
-                (256, 64, 1),
-                (256, 64, 2),
-                (256, 128, 2),
-                (256, 256, 1),
-            ]
-        else:
-            candidates = [
-                (64, 256, 2),
-                (64, 128, 2),
-                (128, 128, 1),
-                (128, 64, 1),
-                (32, 64, 2),
-                (16, 32, 2),
-            ]
-        configs = [
-            config
-            for config in candidates
-            if config[0] <= 2 * n and config[1] <= 2 * k_in
-        ]
-        if not configs:
-            raise ValueError(
-                f"{type(self).__name__}: no cuTile NVFP4 GEMM tile fits "
-                f"n={n}, k={k_in}."
-            )
-        return configs
-
     def _candidate_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
-        if self._activation_fp4:
-            num_experts = self.config.routing.num_experts
-            rows_per_expert = (num_assignments + num_experts - 1) // num_experts
-            if rows_per_expert <= 8:
-                return (16, 32)
-            intermediate_size = self.config.experts.intermediate_size
-            if num_assignments >= 4096 and (
-                intermediate_size >= 1024 or num_assignments >= 65536
-            ):
-                return (32, 64)
-            return (32, 64, 128)
-        return super()._candidate_block_sizes(num_assignments)
+        num_experts = self.config.routing.num_experts
+        rows_per_expert = (num_assignments + num_experts - 1) // num_experts
+        if rows_per_expert <= 8:
+            return (16, 32)
+        intermediate_size = self.config.experts.intermediate_size
+        if num_assignments >= 4096 and (
+            intermediate_size >= 1024 or num_assignments >= 65536
+        ):
+            return (32, 64)
+        return (32, 64, 128)
 
-    def _candidate_gemm_pairs(
-        self, inputs: List[torch.Tensor]
-    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+    def _w4a4_gemm_problem(
+        self,
+        inputs: List[torch.Tensor],
+        *,
+        stage: int,
+        block_size: int,
+        fuse_gemm1: bool | None = None,
+    ) -> _CuTileW4A4GemmProblem:
         hidden_size = inputs[1].shape[1]
         intermediate_size = self.config.experts.intermediate_size
-        gemm1_output_size = intermediate_size * (
-            2 if self.config.activation.is_gated else 1
-        )
-        gemm1 = self._gemm_configs(hidden_size, gemm1_output_size)
-        gemm2 = self._gemm_configs(intermediate_size, hidden_size)
-
-        if self._activation_fp4:
-            base = (128, 128, 2)
-            base_k256 = (128, 256, 2)
-            base_k64 = (128, 64, 2)
-            wide = (256, 128, 1)
-            base_k64_occ4 = (128, 64, 4)
-            wide_k64 = (256, 64, 1)
-            wide_k64_occ2 = (256, 64, 2)
-            wide_occ2 = (256, 128, 2)
-            wide_k256 = (256, 256, 1)
-            candidates = (
-                (base, base),
-                (base_k256, base),
-                (base, base_k256),
-                (base_k64, base),
-                (base, base_k64),
-                (wide, base),
-                (wide_k256, wide_k256),
-                (wide_k64_occ2, base),
-                (wide_k64, wide_k64_occ2),
-                (base_k64_occ4, base_k64_occ4),
-                (base_k64_occ4, base),
-                (wide_occ2, wide_occ2),
+        if stage == 1:
+            if fuse_gemm1 is None:
+                fuse_gemm1 = True
+            n = intermediate_size * (
+                2 if self.config.activation.is_gated and not fuse_gemm1 else 1
             )
-            available1, available2 = set(gemm1), set(gemm2)
-            return [
-                pair
-                for pair in candidates
-                if pair[0] in available1 and pair[1] in available2
-            ]
+            k = hidden_size
+        elif stage == 2:
+            fuse_gemm1 = False
+            n, k = hidden_size, intermediate_size
+        else:
+            raise ValueError(f"stage must be 1 or 2, got {stage}")
+        num_assignments = inputs[2].numel()
+        input_sorted = num_assignments >= _CUTILE_W4A4_SORT_INPUT_MIN_ASSIGNMENTS and (
+            intermediate_size >= 1024
+            or num_assignments >= _CUTILE_W4A4_SORT_INPUT_SMALL_I_MIN_ASSIGNMENTS
+        )
+        return _CuTileW4A4GemmProblem(
+            stage=stage,
+            arch=self._device_arch,
+            num_sms=self._num_sms,
+            num_assignments=num_assignments,
+            num_experts=self.config.routing.num_experts,
+            block_size=block_size,
+            n=n,
+            k=k,
+            fused_epilogue=bool(fuse_gemm1),
+            is_gated=self.config.activation.is_gated,
+            input_sorted=input_sorted,
+        )
 
-        pairs = [(gemm1[0], gemm2[0])]
-        for index in range(1, max(len(gemm1), len(gemm2))):
-            pairs.append((gemm1[min(index, len(gemm1) - 1)], gemm2[0]))
-            pairs.append((gemm1[0], gemm2[min(index, len(gemm2) - 1)]))
-        return list(dict.fromkeys(pairs))[:6]
+    def _w4a4_fused_gemm1_supported(
+        self, inputs: List[torch.Tensor], block_size: int
+    ) -> bool:
+        problem = self._w4a4_gemm_problem(
+            inputs, stage=1, block_size=block_size, fuse_gemm1=True
+        )
+        return any(
+            _cutile_w4a4_config_rejection_reason(problem, config) is None
+            for config in _CUTILE_W4A4_GEMM_CONFIG_UNIVERSE
+        )
+
+    def _w4a4_fallback_fuse_gemm1(
+        self, inputs: List[torch.Tensor], block_size: int
+    ) -> bool:
+        if not self.config.activation.is_gated:
+            return True
+        num_assignments = inputs[2].numel()
+        rows_per_expert = (
+            num_assignments + self.config.routing.num_experts - 1
+        ) // self.config.routing.num_experts
+        return (
+            num_assignments >= _CUTILE_W4A4_GATED_FUSION_MIN_ASSIGNMENTS
+            and block_size < 128
+            and not (rows_per_expert >= 16 and rows_per_expert < block_size)
+            and self._w4a4_fused_gemm1_supported(inputs, block_size)
+        )
+
+    def _w4a4_gated_block_size(self, num_assignments: int) -> int:
+        rows_per_expert = (
+            num_assignments + self.config.routing.num_experts - 1
+        ) // self.config.routing.num_experts
+        if rows_per_expert <= 8:
+            return 16
+        if rows_per_expert <= 32:
+            return 32
+        if rows_per_expert <= 64:
+            return 64
+        return 128 if rows_per_expert <= 128 else 64
+
+    def _w4a4_fallback_tactic(
+        self, inputs: List[torch.Tensor]
+    ) -> tuple[int, int, int, int, int, int, int, int]:
+        num_assignments = inputs[2].numel()
+        if self.config.activation.is_gated and num_assignments <= 64:
+            block_size = self._w4a4_gated_block_size(num_assignments)
+            if num_assignments <= 8:
+                tactic = (block_size, 0, 128, 256, 2, 128, 128, 2)
+            elif num_assignments <= 16:
+                tactic = (block_size, 0, 256, 256, 1, 256, 128, 2)
+            elif num_assignments <= 32:
+                tactic = (block_size, 0, 256, 128, 2, 256, 128, 2)
+            else:
+                tactic = (block_size, 1, 256, 128, 2, 128, 128, 2)
+            gemm1_problem = self._w4a4_gemm_problem(
+                inputs,
+                stage=1,
+                block_size=block_size,
+                fuse_gemm1=bool(tactic[1]),
+            )
+            gemm2_problem = self._w4a4_gemm_problem(
+                inputs, stage=2, block_size=block_size
+            )
+            if (
+                _cutile_w4a4_config_rejection_reason(gemm1_problem, tactic[2:5]) is None
+                and _cutile_w4a4_config_rejection_reason(gemm2_problem, tactic[5:8])
+                is None
+            ):
+                return tactic
+
+        best: (
+            tuple[
+                float,
+                tuple[int, int, int, int, int, int, int, int],
+            ]
+            | None
+        ) = None
+        block_sizes = (
+            (self._w4a4_gated_block_size(num_assignments),)
+            if self.config.activation.is_gated
+            else self._candidate_block_sizes(num_assignments)
+        )
+        for block_size in block_sizes:
+            fuse_gemm1 = self._w4a4_fallback_fuse_gemm1(inputs, block_size)
+            gemm1_problem = self._w4a4_gemm_problem(
+                inputs,
+                stage=1,
+                block_size=block_size,
+                fuse_gemm1=fuse_gemm1,
+            )
+            gemm2_problem = self._w4a4_gemm_problem(
+                inputs, stage=2, block_size=block_size
+            )
+            gemm1 = _rank_cutile_w4a4_gemm_configs(gemm1_problem)[0]
+            gemm2 = _rank_cutile_w4a4_gemm_configs(gemm2_problem)[0]
+            padded_rows = gemm1_problem.m_blocks * block_size
+            block_util = gemm1_problem.num_assignments / padded_rows
+            score = (
+                _cutile_w4a4_config_score(gemm1_problem, gemm1)
+                + _cutile_w4a4_config_score(gemm2_problem, gemm2)
+                + 2.0 * block_util
+                + {16: 0.0, 32: 0.05, 64: 0.1, 128: 0.15}[block_size]
+            )
+            tactic = (block_size, int(fuse_gemm1), *gemm1, *gemm2)
+            if best is None or score > best[0]:
+                best = (score, tactic)
+        if best is None:
+            raise NotImplementedError(
+                "CuTileNvfp4Runner: no supported W4A4 grouped GEMM tactic."
+            )
+        return best[1]
+
+    def _factorized_w4a4_tactics(
+        self, inputs: List[torch.Tensor]
+    ) -> list[tuple[int, int, int, int, int, int, int, int]]:
+        tuner = AutoTuner.get()
+        stage_tuning_config = TuningConfig(
+            use_cuda_graph=True,
+            inputs_pre_hook=self._prepare_tuning_inputs,
+        )
+        block_size = self._w4a4_fallback_tactic(inputs)[0]
+        gemm1_runner = _CuTileW4A4StageRunner(self, 1, block_size)
+        gemm2_runner = _CuTileW4A4StageRunner(self, 2, block_size)
+        activation_name = self.config.activation.type.name.lower()
+        gemm1_tactics = tuner.rank_tactics(
+            f"moe_{self.backend_key}_sm{self._device_arch}_b{block_size}_"
+            f"gemm1_{activation_name}",
+            [gemm1_runner],
+            stage_tuning_config,
+            inputs,
+            k=self._num_top_tactics_per_stage,
+        )
+        gemm2_tactics = tuner.rank_tactics(
+            f"moe_{self.backend_key}_sm{self._device_arch}_b{block_size}_"
+            f"gemm2_{activation_name}",
+            [gemm2_runner],
+            stage_tuning_config,
+            inputs,
+            k=self._num_top_tactics_per_stage,
+        )
+
+        fallback = self._w4a4_fallback_tactic(inputs)
+
+        def resolve_gemm1(stage_tactics: list[Any]) -> list[tuple[int, int, int, int]]:
+            fallback_stage = (fallback[1], fallback[2], fallback[3], fallback[4])
+            resolved = []
+            for tactic in stage_tactics:
+                if tactic == -1:
+                    resolved.append(fallback_stage)
+                else:
+                    values = tuple(map(int, tactic))
+                    if len(values) != 4:
+                        raise ValueError(
+                            "cuTile W4A4 GEMM1 stage tactics must contain the "
+                            "fusion flag and three GEMM configuration values."
+                        )
+                    resolved.append((values[0], values[1], values[2], values[3]))
+            return list(dict.fromkeys(resolved))
+
+        def resolve_gemm2(stage_tactics: list[Any]) -> list[tuple[int, int, int]]:
+            fallback_stage = (fallback[5], fallback[6], fallback[7])
+            resolved = []
+            for tactic in stage_tactics:
+                if tactic == -1:
+                    resolved.append(fallback_stage)
+                else:
+                    values = tuple(map(int, tactic))
+                    if len(values) != 3:
+                        raise ValueError(
+                            "cuTile W4A4 GEMM2 stage tactics must contain three "
+                            "GEMM configuration values."
+                        )
+                    resolved.append((values[0], values[1], values[2]))
+            return list(dict.fromkeys(resolved))
+
+        gemm1_configs = resolve_gemm1(gemm1_tactics)
+        gemm2_configs = resolve_gemm2(gemm2_tactics)
+        num_assignments = inputs[2].numel()
+        if self.config.activation.is_gated and num_assignments <= 16:
+            if num_assignments <= 8:
+                gemm1_default = (0, 128, 256, 2)
+                gemm2_default = (128, 128, 2)
+            else:
+                gemm1_default = (0, 256, 256, 1)
+                gemm2_default = (256, 256, 1)
+
+            gemm1_problem = self._w4a4_gemm_problem(
+                inputs,
+                stage=1,
+                block_size=block_size,
+                fuse_gemm1=False,
+            )
+            if (
+                _cutile_w4a4_config_rejection_reason(gemm1_problem, gemm1_default[1:])
+                is None
+                and gemm1_default not in gemm1_configs
+            ):
+                gemm1_configs[-1] = gemm1_default
+
+            gemm2_problem = self._w4a4_gemm_problem(
+                inputs, stage=2, block_size=block_size
+            )
+            if (
+                _cutile_w4a4_config_rejection_reason(gemm2_problem, gemm2_default)
+                is None
+                and gemm2_default not in gemm2_configs
+            ):
+                gemm2_configs[-1] = gemm2_default
+        return list(
+            dict.fromkeys(
+                (block_size, *gemm1, *gemm2)
+                for gemm1 in gemm1_configs
+                for gemm2 in gemm2_configs
+            )
+        )
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
         self._require_built()
@@ -1373,35 +2403,7 @@ class _CuTileFp4Runner(CuTileBf16Runner):
             raise ValueError(
                 f"{type(self).__name__} expects 10 inputs, got {len(inputs)}."
             )
-        if self._activation_fp4:
-            intermediate_size = self.config.experts.intermediate_size
-            num_assignments = inputs[2].numel()
-            tactics = []
-            for block_size in self._candidate_block_sizes(num_assignments):
-                for gemm1, gemm2 in self._candidate_gemm_pairs(inputs):
-                    tile_i = (
-                        gemm1[0] // 2 if self.config.activation.is_gated else gemm1[0]
-                    )
-                    fused_store_supported = (
-                        tile_i >= 128
-                        and intermediate_size % 64 == 0
-                        and (
-                            not self.config.activation.is_gated
-                            or intermediate_size % tile_i == 0
-                        )
-                        and (
-                            not self.config.activation.is_gated or num_assignments >= 64
-                        )
-                    )
-                    tactics.append((block_size, 0, *gemm1, *gemm2))
-                    if fused_store_supported:
-                        tactics.append((block_size, 1, *gemm1, *gemm2))
-            return tactics
-        return [
-            (block_size, *gemm1, *gemm2)
-            for block_size in self._candidate_block_sizes(inputs[2].numel())
-            for gemm1, gemm2 in self._candidate_gemm_pairs(inputs)
-        ]
+        return self._factorized_w4a4_tactics(inputs)
 
     def pack_inputs(
         self, act: MoEActivationPack, weights: MoEWeightPack
@@ -1467,24 +2469,20 @@ class _CuTileFp4Runner(CuTileBf16Runner):
                 f"cuTile NVFP4 weight shapes {tuple(w1.shape)}/{tuple(w2.shape)} "
                 f"!= expected {expected_w1}/{expected_w2}."
             )
-        if self._activation_fp4:
-            expected_s1: tuple[int, ...] = (
-                num_experts,
-                (w1_rows + 127) // 128,
-                hidden_size // 64,
-                32,
-                16,
-            )
-            expected_s2: tuple[int, ...] = (
-                num_experts,
-                (hidden_size + 127) // 128,
-                intermediate_size // 64,
-                32,
-                16,
-            )
-        else:
-            expected_s1 = (num_experts, w1_rows, hidden_size // 16)
-            expected_s2 = (num_experts, hidden_size, intermediate_size // 16)
+        expected_s1: tuple[int, ...] = (
+            num_experts,
+            (w1_rows + 127) // 128,
+            hidden_size // 64,
+            32,
+            16,
+        )
+        expected_s2: tuple[int, ...] = (
+            num_experts,
+            (hidden_size + 127) // 128,
+            intermediate_size // 64,
+            32,
+            16,
+        )
         if tuple(w1_scale.shape) != expected_s1 or tuple(w2_scale.shape) != expected_s2:
             raise ValueError(
                 "cuTile NVFP4 block-scale shapes "
@@ -1557,8 +2555,7 @@ class _CuTileFp4Runner(CuTileBf16Runner):
                 f"{type(self).__name__} expects 10 inputs, got {len(inputs)}."
             )
         if tactic == -1:
-            gemm1, gemm2 = self._candidate_gemm_pairs(inputs)[0]
-            tactic = (self._default_block_size, *gemm1, *gemm2)
+            tactic = self._w4a4_fallback_tactic(inputs)
         if not isinstance(tactic, (tuple, list)) or len(tactic) not in (7, 8):
             raise ValueError(
                 f"{type(self).__name__} tactic must be -1 or a seven- or "
@@ -1600,22 +2597,21 @@ class _CuTileFp4Runner(CuTileBf16Runner):
             inputs[0],
             self._workspace,
             activation_type=self.config.activation.type,
-            activation_fp4=self._activation_fp4,
             fuse_gemm1=None if fuse_gemm1 is None else bool(fuse_gemm1),
+            num_sms=self._num_sms,
             block_size=block_size,
             gemm1_config=self._kernel_module.GemmConfig(g1_n, g1_k, g1_occ),
             gemm2_config=self._kernel_module.GemmConfig(g2_n, g2_k, g2_occ),
         )
 
 
-class CuTileNvfp4Runner(_CuTileFp4Runner):
+class CuTileNvfp4Runner(_CuTileNvfp4RunnerBase):
     """cuTile NVFP4 weights and inputs for both grouped GEMMs."""
 
     backend_key = "cutile_nvfp4"
     supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
     supported_quant_variants = (QuantVariant.NVFP4,)
     _block_sizes = (16, 32, 64, 128)
-    _activation_fp4 = True
     _supported_archs = _CUTILE_NVFP4_ARCHS
 
 

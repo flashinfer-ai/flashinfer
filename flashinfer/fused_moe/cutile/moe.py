@@ -41,6 +41,7 @@ from .activation import _apply_activation, launch_activation
 ConstInt: TypeAlias = ct.Constant[int]
 
 _PERMUTE_TILE_CAP = 16384
+_PERMUTE_SMALL_MAX_ASSIGNMENTS = 24
 _NO_ACTIVATION = -1
 
 
@@ -72,10 +73,16 @@ class Workspace:
 
 def _permute_shape(num_assignments: int, num_experts: int) -> tuple[int, int, int]:
     epow2 = next_positive_power_of_2(num_experts)
+    max_chunk = max(8, _PERMUTE_TILE_CAP // epow2)
+    target_chunks = max(8, _PERMUTE_TILE_CAP // (4 * epow2))
     chunk = min(
-        max(8, _PERMUTE_TILE_CAP // epow2),
-        max(8, next_positive_power_of_2(num_assignments)),
+        max(8, max_chunk // 2),
+        max(8, next_positive_power_of_2(num_assignments) // target_chunks),
     )
+    if 32 * max_chunk <= num_assignments < 128 * max_chunk:
+        chunk = max_chunk
+    elif num_assignments >= 128 * max_chunk:
+        chunk = min(32, max(8, max_chunk // 2))
     num_chunks = max(1, (num_assignments + chunk - 1) // chunk)
     ncp = next_positive_power_of_2(num_chunks)
     return epow2, chunk, ncp
@@ -529,6 +536,16 @@ def _combine(
     )
 
 
+def _combine_tile_h(num_tokens: int, hidden_size: int) -> int:
+    if num_tokens <= 64:
+        tile_cap = 128
+    elif num_tokens <= 256:
+        tile_cap = 512
+    else:
+        tile_cap = 1024
+    return min(next_positive_power_of_2(hidden_size), tile_cap)
+
+
 def _permute(
     topk_ids: torch.Tensor,
     num_experts: int,
@@ -540,7 +557,7 @@ def _permute(
     num_blocks = (em + block_size - 1) // block_size
     sorted_slots = workspace.sorted_slots[:em]
     block_expert = workspace.block_expert[:num_blocks]
-    if num_assignments <= 16:
+    if num_assignments <= _PERMUTE_SMALL_MAX_ASSIGNMENTS:
         epow2 = next_positive_power_of_2(num_experts)
         ct.launch(
             torch.cuda.current_stream(topk_ids.device),
@@ -767,7 +784,7 @@ def run_moe(
         block_size=block_size,
         config=gemm2_config,
     )
-    tile_h = min(next_positive_power_of_2(hidden_size), 1024)
+    tile_h = _combine_tile_h(num_tokens, hidden_size)
     ct.launch(
         torch.cuda.current_stream(hidden_states.device),
         (num_tokens, (hidden_size + tile_h - 1) // tile_h),
