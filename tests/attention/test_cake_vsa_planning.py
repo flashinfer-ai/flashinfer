@@ -440,7 +440,7 @@ def test_fp16_direct_call_matches_generated_ffi_abi(monkeypatch):
     )
     assert all(
         actual is expected
-        for actual, expected in zip(args[:14], expected_tensors)
+        for actual, expected in zip(args[:14], expected_tensors, strict=True)
     )
     assert args[14:23] == (256, 4, 2, 2, 1, 0, 0, 0, 0)
     assert args[23] == pytest.approx(0.125 / math.log(2.0))

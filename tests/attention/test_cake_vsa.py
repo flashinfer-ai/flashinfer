@@ -127,12 +127,8 @@ def test_fp16_direct_overprovisioned_uniform_grid_is_inactive():
     num_qo_heads, num_kv_heads, head_dim = 8, 1, 128
     mask = torch.zeros((num_qo_heads, 2, 4), dtype=torch.bool, device=device)
     mask[:, :, :2] = True
-    q = torch.randn(
-        (M, num_qo_heads, head_dim), dtype=torch.float16, device=device
-    )
-    k = torch.randn(
-        (N, num_kv_heads, head_dim), dtype=torch.float16, device=device
-    )
+    q = torch.randn((M, num_qo_heads, head_dim), dtype=torch.float16, device=device)
+    k = torch.randn((N, num_kv_heads, head_dim), dtype=torch.float16, device=device)
     v = torch.randn_like(k)
     workspace = torch.empty((128 * 1024 * 1024,), dtype=torch.uint8, device=device)
     wrapper = BlockSparseAttentionWrapper(workspace, backend="cake")
