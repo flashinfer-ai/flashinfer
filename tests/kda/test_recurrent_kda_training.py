@@ -13,6 +13,7 @@ import os
 import pytest
 import torch
 
+import flashinfer._kda_training_impl as kda_training_impl
 from flashinfer import kda_training as kda_training_api
 from flashinfer.kda_training import (
     RecurrentKDATrainingContext,
@@ -809,9 +810,9 @@ def test_fallback_ffi_consumes_route_context_without_recompute(
     )
     # This test covers route-context reuse, not analytical route selection.
     monkeypatch.setattr(
-        kda_training_api,
+        kda_training_impl,
         "_select_training_route",
-        lambda *_args, **_kwargs: kda_training_api._TrainingRouteSpec(
+        lambda *_args, **_kwargs: kda_training_impl._TrainingRouteSpec(
             route, selected_template
         ),
     )
