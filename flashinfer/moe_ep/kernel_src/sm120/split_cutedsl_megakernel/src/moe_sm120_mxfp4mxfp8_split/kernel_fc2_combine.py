@@ -786,13 +786,14 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
                     cute.copy(smem_tiled_copy_B, tCsB_p[None, None, 0], tCrB_copy_view[None, None, 0])
                     cute.copy(smem_tiled_copy_SFA, tCsSFA_p_filtered[None, 0, 0], tCrSFA_copy_view_filtered[None, 0, 0])
                     cute.copy(smem_tiled_copy_SFB, tCsSFB_p_filtered[None, None, 0], tCrSFB_copy_view_filtered[None, 0, 0, None])
-                    tCrSFB_mma_lo = tCrSFB
-                    tCrSFB_mma_hi = tCrSFB
-                    sfb_tile_is_hi = cutlass.Boolean(0)
-                    if cutlass.const_expr(self.mma_tiler[1] < 128):
-                        tCrSFB_mma_hi = cute.make_tensor(tCrSFB.iterator + n_groups // 4, tCrSFB.layout)
-                        sfb_tiles_per_tma = 128 // self.mma_tiler[1]
-                        sfb_tile_is_hi = work_tile_info.tile_n_idx % cutlass.Int32(sfb_tiles_per_tma) != cutlass.Int32(0)
+                    # SFB is staged as N128. Select the current token sub-tile
+                    # with uniform branches so every register-fragment index
+                    # remains compile-time constant, including the N16 path.
+                    sfb_tiles_per_tma = 128 // self.mma_tiler[1]
+                    sfb_tile_slot = (
+                        work_tile_info.tile_n_idx
+                        % cutlass.Int32(sfb_tiles_per_tma)
+                    )
                     if trace_k_detail != cutlass.Int32(0):
                         iket.range_push('sm120_fc2_k128_compute')
                     for k_inner_mma in cutlass.range_constexpr(0, 4):
@@ -806,11 +807,27 @@ class Sm120Fc2CombineKernel(Sm120MegaMoEMxfp8SwapABKernel):
                             cute.copy(smem_tiled_copy_B, tCsB_p[None, None, k_inner_next], tCrB_copy_view[None, None, k_inner_next])
                             cute.copy(smem_tiled_copy_SFA, tCsSFA_p_filtered[None, 0, k_inner_next], tCrSFA_copy_view_filtered[None, 0, k_inner_next])
                             cute.copy(smem_tiled_copy_SFB, tCsSFB_p_filtered[None, None, k_inner_next], tCrSFB_copy_view_filtered[None, 0, k_inner_next, None])
-                        for ng in cutlass.range_constexpr(0, n_groups):
-                            if sfb_tile_is_hi:
-                                issue_m64n8k32_mxfp8(compute_tiled_mma, accumulators[None, None, ng], tCrA, tCrB, tCrSFA, tCrSFB_mma_hi, n_group=ng, active_n_groups=n_groups, sfa_m_group=0, k_inner=k_inner_mma, a_dtype=self.a_dtype, b_dtype=self.b_dtype, sf_dtype=self.sf_dtype)
-                            else:
-                                issue_m64n8k32_mxfp8(compute_tiled_mma, accumulators[None, None, ng], tCrA, tCrB, tCrSFA, tCrSFB_mma_lo, n_group=ng, active_n_groups=n_groups, sfa_m_group=0, k_inner=k_inner_mma, a_dtype=self.a_dtype, b_dtype=self.b_dtype, sf_dtype=self.sf_dtype)
+                        for sfb_slot in cutlass.range_constexpr(
+                            0, sfb_tiles_per_tma
+                        ):
+                            if sfb_tile_slot == cutlass.Int32(sfb_slot):
+                                for ng in cutlass.range_constexpr(0, n_groups):
+                                    issue_m64n8k32_mxfp8(
+                                        compute_tiled_mma,
+                                        accumulators[None, None, ng],
+                                        tCrA,
+                                        tCrB,
+                                        tCrSFA,
+                                        tCrSFB,
+                                        n_group=ng,
+                                        active_n_groups=n_groups,
+                                        sfb_n_group=sfb_slot * n_groups + ng,
+                                        sfa_m_group=0,
+                                        k_inner=k_inner_mma,
+                                        a_dtype=self.a_dtype,
+                                        b_dtype=self.b_dtype,
+                                        sf_dtype=self.sf_dtype,
+                                    )
                     if cutlass.const_expr(
                         self.k2_tile_trace_enabled and green_trace is not None
                     ):

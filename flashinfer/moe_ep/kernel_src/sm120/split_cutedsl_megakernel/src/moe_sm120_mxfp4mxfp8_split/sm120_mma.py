@@ -399,6 +399,7 @@ def issue_m64n8k32_mxfp8(
     *,
     n_group: int,
     active_n_groups: int,
+    sfb_n_group: int = -1,
     sfa_m_group,
     k_inner: int,
     a_dtype: Type[cutlass.Numeric],
@@ -414,12 +415,14 @@ def issue_m64n8k32_mxfp8(
     b_reg = b_frag[(None, n_group, k_inner)]
 
     sfa_scalar = sfa_frag[((0, 0), sfa_m_group, k_inner)]
+    if cutlass.const_expr(sfb_n_group < 0):
+        sfb_n_group = n_group
     sfb_scalar = sfb_frag[
         (
             (0, 0),
-            (n_group % 2, (n_group // 2) % 2),
+            (sfb_n_group % 2, (sfb_n_group // 2) % 2),
             k_inner,
-            n_group // 4,
+            sfb_n_group // 4,
         )
     ]
 

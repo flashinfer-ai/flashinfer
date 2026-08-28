@@ -298,8 +298,11 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
         if m != 64:
             raise ValueError(f"SM120 MXFP8 swap-AB starts with mma_tiler M=64; got {m}.")
 
-        if n not in (32, 64, 128):
-            raise ValueError(f"SM120 MXFP8 swap-AB supports N in (32,64,128); got {n}.")
+        if n not in (16, 32, 64, 128):
+            raise ValueError(
+                "SM120 swap-AB supports N in (16,32,64,128); "
+                f"got {n}."
+            )
 
         if k % 32 != 0:
             raise ValueError(
@@ -5095,7 +5098,10 @@ class Sm120SwapABSwigluMxfp8Fc12Kernel:
                                 cute.make_layout(1),
                             )
                             output_i32[0] = rFc1StoreI32[0]
-                    cute.arch.fence_acq_rel_sys()
+                    # FC1 output is consumed only by the local K2 kernel. A
+                    # GPU-scope release suffices before the local ready flag;
+                    # system scope needlessly drains stores toward peers.
+                    cute.arch.fence_acq_rel_gpu()
                     cute.arch.barrier(
                         barrier_id=self.epilog_sync_bar_id,
                         number_of_threads=32 * len(self.compute_warp_id),

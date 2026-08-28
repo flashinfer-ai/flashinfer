@@ -142,7 +142,7 @@ topology must validate peer access before launch.
 ```bash
 # DP1 x TP1 x EP8 (original path)
 torchrun --standalone --nproc_per_node=8 \
-  -m moe_sm120_mxfp8_split.mega_runner \
+  -m moe_sm120_mxfp4mxfp8_split.mega_runner \
   --num_tokens_per_rank 8192 \
   --num_topk 6 \
   --num_total_experts 256 \
@@ -155,7 +155,7 @@ torchrun --standalone --nproc_per_node=8 \
 
 # DP2 x TP1 x EP4: two complete expert replicas
 torchrun --standalone --nproc_per_node=8 \
-  -m moe_sm120_mxfp8_split.mega_runner \
+  -m moe_sm120_mxfp4mxfp8_split.mega_runner \
   --num_tokens_per_rank 8192 \
   --num_topk 6 \
   --num_total_experts 256 \
@@ -168,7 +168,7 @@ torchrun --standalone --nproc_per_node=8 \
 
 # DP1 x TP2 x EP4: NUMA-local dispatch/combine plus TP all-reduce
 torchrun --standalone --nproc_per_node=8 \
-  -m moe_sm120_mxfp8_split.mega_runner \
+  -m moe_sm120_mxfp4mxfp8_split.mega_runner \
   --num_tokens_per_rank 8192 \
   --num_topk 6 \
   --num_total_experts 256 \

@@ -14,6 +14,27 @@ from typing import Optional, Tuple
 
 Tile = Tuple[int, int, int]
 
+# Same-NUMA EP4 decode buckets validated on RTX Pro 5000. K1 remains N32;
+# only K2 benefits from N16 at these graph-row counts. The mapping value is
+# the ready-queue bundle selected by the controlled N16 sweep.
+_DECODE_SPLIT_K2_N16_BUNDLE_BY_BUCKET = {
+    7: 1,
+    16: 2,
+    32: 1,
+    64: 2,
+    128: 2,
+}
+_DECODE_ROW_BUCKETS = (7, 16, 32, 64, 128, 168, 256)
+
+
+def _select_decode_row_bucket(rows_per_rank: int) -> Optional[int]:
+    if rows_per_rank <= 0:
+        raise ValueError("rows_per_rank must be positive")
+    for bucket in _DECODE_ROW_BUCKETS:
+        if rows_per_rank <= bucket:
+            return bucket
+    return None
+
 
 # Blocking IBGDA puts avoid a long late-combine quiet/drain for large payloads,
 # but make tiny transfers pay the blocking round trip for every chunk.  This
@@ -528,6 +549,30 @@ def select_megamoe_config(
     )
     if overrides is not None:
         config = config.with_overrides(overrides)
+    # The decode optimization is deliberately expressed in graph rows and
+    # topology, not in model names. Explicit K2 overrides denote a controlled
+    # benchmark and suppress the production tuning.
+    explicit_k2_override = overrides is not None and any(
+        value is not None
+        for value in (overrides.k2_tile, overrides.k2_stages)
+    )
+    decode_bucket = _select_decode_row_bucket(shape.tokens_per_rank)
+    decode_bundle = _DECODE_SPLIT_K2_N16_BUNDLE_BY_BUCKET.get(decode_bucket)
+    if (
+        not explicit_k2_override
+        and config.kernel_comm_backend == "p2p_direct"
+        and config.k1_tile == (64, 32, 128)
+        and config.k2_tile == (64, 32, 128)
+        and decode_bundle is not None
+    ):
+        config = replace(
+            config,
+            k2_tile=(64, 16, 128),
+            k2_stages=2,
+            ready_queue_bundle=decode_bundle,
+            k2_natural_regs=False,
+            k2_min_blocks_per_sm=1,
+        )
     if config.total_sms != shape.num_sms:
         raise ValueError(
             "resolved SM partitions must cover all device SMs: "

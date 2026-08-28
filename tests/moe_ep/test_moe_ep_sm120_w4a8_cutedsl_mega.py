@@ -8,6 +8,31 @@ import pytest
 import torch
 
 
+def test_sm120_w4a8_graph_compile_bucket_selection() -> None:
+    from flashinfer.moe_ep.kernel_src.sm120.split_cutedsl_megakernel import (
+        select_graph_compile_bucket,
+    )
+
+    capacity = 8192
+    expected = {
+        1: 7,
+        7: 7,
+        8: 16,
+        16: 16,
+        17: 32,
+        127: 128,
+        129: 168,
+        168: 168,
+        169: 256,
+        256: 256,
+        257: capacity,
+        capacity: capacity,
+    }
+    for requested, bucket in expected.items():
+        assert select_graph_compile_bucket(requested, capacity) == bucket
+    assert select_graph_compile_bucket(None, capacity) == capacity
+
+
 def _packed_e2m1(
     shape: tuple[int, ...], generator: torch.Generator
 ) -> torch.Tensor:
@@ -258,6 +283,69 @@ def test_sm120_w4a8_single_rank_replay_and_cuda_graph() -> None:
 
 
 @pytest.mark.arch_sm120
+def test_sm120_w4a8_workspace_capacity_is_independent_of_compile_bucket() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    if int(os.environ.get("WORLD_SIZE", "1")) != 1:
+        pytest.skip("single-rank test")
+
+    capacity = 8192
+    problem7 = _problem(0, 1, tokens=7, capacity=capacity)
+    problem16_inputs = _problem(0, 1, tokens=16, capacity=capacity, seed_offset=31)[
+        "inputs"
+    ]
+    problem16 = dict(problem7, inputs=problem16_inputs)
+    layer = _make_layer(0, 1, problem7)
+    try:
+        outputs = []
+        for bucket, problem in ((7, problem7), (16, problem16)):
+            layer.stage_inputs(
+                problem["inputs"], compile_tokens_per_rank=bucket
+            )
+            outputs.append(layer.compute_staged(output=None).clone())
+            torch.cuda.synchronize()
+            reference = _torch_reference(problem)
+            rel_l2 = (
+                (outputs[-1].float() - reference).norm()
+                / reference.norm().clamp_min(1e-6)
+            )
+            assert rel_l2.item() < 0.03
+
+        workspace = layer._workspace
+        assert workspace.config.max_tokens_per_rank == capacity
+        assert set(workspace._executions) == {7, 16}
+        assert set(workspace._storages) == {7, 16}
+        assert {key[-1] for key in workspace._frontends} == {7, 16}
+        for bucket in (7, 16):
+            storage = workspace._storages[bucket]
+            execution = workspace._executions[bucket]
+            assert (
+                storage.local_workspace.numel()
+                >= execution.bundle.local_workspace_bytes
+            )
+            assert (
+                storage.shared_workspace.numel()
+                >= execution.bundle.shared_workspace_bytes
+            )
+            assert storage.combine_output.shape[0] == bucket
+        assert (
+            workspace._storages[7].shared_workspace.data_ptr()
+            != workspace._storages[16].shared_workspace.data_ptr()
+        )
+
+        graph = torch.cuda.CUDAGraph()
+        layer.stage_inputs(problem16_inputs, compile_tokens_per_rank=16)
+        with torch.cuda.graph(graph):
+            captured = layer.compute_staged(output=None)
+        graph.replay()
+        replay = captured.clone()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(outputs[-1], replay, atol=0.0, rtol=0.0)
+    finally:
+        layer.destroy()
+
+
+@pytest.mark.arch_sm120
 def test_sm120_w4a8_two_layers_share_workspace() -> None:
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
@@ -318,14 +406,18 @@ def test_sm120_w4a8_four_rank_tail_wave_and_cuda_graph_replay() -> None:
         rank,
         world_size,
         tokens=tokens_by_rank[rank],
-        capacity=80,
+        capacity=8192,
         skewed_routing=True,
     )
     layer = _make_layer(rank, world_size, problem)
     try:
-        layer.warmup(problem["inputs"])
-        eager0 = layer(problem["inputs"]).clone()
-        eager1 = layer(problem["inputs"]).clone()
+        eager_outputs = []
+        for _ in range(2):
+            layer.stage_inputs(
+                problem["inputs"], compile_tokens_per_rank=max(tokens_by_rank)
+            )
+            eager_outputs.append(layer.compute_staged(output=None).clone())
+        eager0, eager1 = eager_outputs
         torch.cuda.synchronize()
         dist.barrier()
         torch.testing.assert_close(eager0, eager1, atol=0.0, rtol=0.0)
@@ -340,7 +432,10 @@ def test_sm120_w4a8_four_rank_tail_wave_and_cuda_graph_replay() -> None:
         dist.barrier()
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            captured = layer(problem["inputs"])
+            layer.stage_inputs(
+                problem["inputs"], compile_tokens_per_rank=max(tokens_by_rank)
+            )
+            captured = layer.compute_staged(output=None)
         dist.barrier()
         replays = []
         for _ in range(16):

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -17,6 +19,38 @@ from .comm import (
 )
 from .staging import ACTIVATION_DTYPE
 from .weights import SCALE_DTYPE, TransformedWeights, ceil_div, round_up
+
+
+DECODE_GRAPH_COMPILE_BUCKETS = (7, 16, 32, 64, 128, 168, 256)
+
+
+def select_graph_compile_bucket(
+    requested_tokens_per_rank: int | None,
+    workspace_capacity: int,
+) -> int:
+    """Map a collective graph row count to a kernel specialization.
+
+    Buckets above the decode range intentionally fall back to the full
+    workspace capacity. This keeps the prefill policy unchanged while decode
+    graphs use the measured low-latency specializations.
+    """
+    if workspace_capacity <= 0:
+        raise ValueError("workspace_capacity must be positive")
+    if requested_tokens_per_rank is None:
+        return workspace_capacity
+    if not 0 < requested_tokens_per_rank <= workspace_capacity:
+        raise ValueError(
+            f"compile token count {requested_tokens_per_rank} is outside "
+            f"workspace capacity {workspace_capacity}"
+        )
+    return next(
+        (
+            bucket
+            for bucket in DECODE_GRAPH_COMPILE_BUCKETS
+            if requested_tokens_per_rank <= bucket <= workspace_capacity
+        ),
+        workspace_capacity,
+    )
 
 
 @dataclass(frozen=True)
@@ -64,6 +98,14 @@ class MegaMoESm120W4A8Inputs:
 
 
 @dataclass
+class _ExecutionStorage:
+    local_workspace: torch.Tensor
+    shared_workspace: torch.Tensor
+    combine_output: torch.Tensor
+    epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+@dataclass
 class _ExecutionBuffers:
     bundle: Any
     spec: Any
@@ -99,7 +141,11 @@ class MegaMoESm120W4A8Workspace:
     output: torch.Tensor
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _control_group: Any = None
-    _execution: _ExecutionBuffers | None = None
+    _storages: dict[int, _ExecutionStorage] = field(default_factory=dict)
+    _execution_plans: dict[int, tuple[Any, Any]] = field(default_factory=dict)
+    _compiled_k12: dict[int, tuple[Any, Any]] = field(default_factory=dict)
+    _executions: dict[int, _ExecutionBuffers] = field(default_factory=dict)
+    _compile_bucket: int = 0
     _frontends: dict[tuple[int, ...], "MegaMoESm120W4A8Frontend"] = field(
         default_factory=dict
     )
@@ -112,7 +158,10 @@ class MegaMoESm120W4A8Workspace:
         for frontend in self._frontends.values():
             frontend.release()
         self._frontends.clear()
-        self._execution = None
+        self._executions.clear()
+        self._compiled_k12.clear()
+        self._execution_plans.clear()
+        self._storages.clear()
         for root in reversed(self._sym_roots):
             free_sym_tensor(root)
         self._sym_roots.clear()
@@ -145,12 +194,19 @@ class MegaMoESm120W4A8Frontend:
         self,
         workspace: MegaMoESm120W4A8Workspace,
         *,
+        compile_bucket: int,
         control_group: Any = None,
     ) -> None:
         self.workspace = workspace
         self.config = workspace.config
+        self.compile_bucket = compile_bucket
         self.control_group = control_group
         self._compiled: _CompiledSplit | None = None
+        if compile_bucket not in (
+            *DECODE_GRAPH_COMPILE_BUCKETS,
+            self.config.max_tokens_per_rank,
+        ):
+            raise ValueError(f"unsupported W4A8 compile bucket {compile_bucket}")
 
     @staticmethod
     def _to_cute(
@@ -175,7 +231,7 @@ class MegaMoESm120W4A8Frontend:
             dist.barrier(group=self.control_group)
 
     def _heuristic_overrides(self):
-        from moe_sm120_mxfp8_split.heuristic import MegaMoEHeuristicOverrides
+        from moe_sm120_mxfp4mxfp8_split.heuristic import MegaMoEHeuristicOverrides
 
         fields = {field.name for field in dataclasses.fields(MegaMoEHeuristicOverrides)}
         values = dict(self.config.knobs or {})
@@ -189,13 +245,13 @@ class MegaMoESm120W4A8Frontend:
         values["comm_backend"] = "p2p_direct"
         return MegaMoEHeuristicOverrides(**values)
 
-    def _select_spec(self):
-        from moe_sm120_mxfp8_split.api import (
+    def _select_spec(self, tokens_per_rank: int):
+        from moe_sm120_mxfp4mxfp8_split.api import (
             MegaMoEProblemSpec,
             SplitKernelBuildOptions,
             select_compile_spec,
         )
-        from moe_sm120_mxfp8_split.runtime.green_context import (
+        from moe_sm120_mxfp4mxfp8_split.runtime.green_context import (
             query_green_context_sm_counts,
             query_sm_resource_info,
         )
@@ -203,7 +259,7 @@ class MegaMoESm120W4A8Frontend:
         cfg = self.config
         num_sms, minimum, alignment = query_sm_resource_info()
         problem = MegaMoEProblemSpec(
-            tokens_per_rank=cfg.max_tokens_per_rank,
+            tokens_per_rank=tokens_per_rank,
             num_topk=cfg.num_topk,
             num_total_experts=cfg.num_total_experts,
             hidden=cfg.hidden,
@@ -281,49 +337,80 @@ class MegaMoESm120W4A8Frontend:
             stream=stream,
         )
 
+    def _ensure_plan(self, bucket: int) -> tuple[Any, Any]:
+        plan = self.workspace._execution_plans.get(bucket)
+        if plan is not None:
+            return plan
+        from moe_sm120_mxfp4mxfp8_split.api import build_split_kernels
+
+        spec = self._select_spec(bucket)
+        if os.environ.get("FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC") == "1":
+            kernel = spec.kernel
+            print(
+                "[FlashInfer MegaMoE compile] "
+                f"rank={self.config.rank} "
+                f"capacity={self.config.max_tokens_per_rank} "
+                f"bucket={bucket} K1={kernel.k1_tile} "
+                f"K2={kernel.k2_tile}/stage{kernel.k2_stages} "
+                f"bundle={kernel.ready_queue_bundle} "
+                f"green={kernel.k1_sms}/{kernel.k2_sms}",
+                flush=True,
+            )
+        plan = (spec, build_split_kernels(spec))
+        self.workspace._execution_plans[bucket] = plan
+        return plan
+
     def _ensure_execution(self) -> _ExecutionBuffers:
-        execution = self.workspace._execution
+        execution = self.workspace._executions.get(self.compile_bucket)
         if execution is not None:
             return execution
         ensure_not_capturing("W4A8 shared execution-buffer allocation")
 
-        from moe_sm120_mxfp8_split.api import build_split_kernels
-
-        spec = self._select_spec()
-        bundle = build_split_kernels(spec)
-        local_workspace = torch.zeros(
-            (bundle.local_workspace_bytes,), dtype=torch.uint8, device="cuda"
-        )
-        shared_workspace = sym_zeros(
-            (bundle.shared_workspace_bytes,), torch.uint8
-        )
-        self.workspace._sym_roots.append(shared_workspace)
-        combine_output, root = sym_byte_view(
-            (
-                self.config.max_tokens_per_rank,
-                self.config.num_topk,
-                self.config.hidden,
-            ),
-            torch.bfloat16,
-        )
-        self.workspace._sym_roots.append(root)
-        epilogue_args = tuple(
-            torch.ones(
-                (self.config.local_experts,),
-                dtype=torch.float32,
+        spec, bundle = self._ensure_plan(self.compile_bucket)
+        storage = self.workspace._storages.get(self.compile_bucket)
+        if storage is None:
+            local_workspace = torch.zeros(
+                (bundle.local_workspace_bytes,),
+                dtype=torch.uint8,
                 device="cuda",
             )
-            for _ in range(3)
-        )
+            shared_workspace = sym_zeros(
+                (bundle.shared_workspace_bytes,), torch.uint8
+            )
+            self.workspace._sym_roots.append(shared_workspace)
+            combine_output, root = sym_byte_view(
+                (
+                    self.compile_bucket,
+                    self.config.num_topk,
+                    self.config.hidden,
+                ),
+                torch.bfloat16,
+            )
+            self.workspace._sym_roots.append(root)
+            epilogue_args = tuple(
+                torch.ones(
+                    (self.config.local_experts,),
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                for _ in range(3)
+            )
+            storage = _ExecutionStorage(
+                local_workspace=local_workspace,
+                shared_workspace=shared_workspace,
+                combine_output=combine_output,
+                epilogue_args=epilogue_args,
+            )
+            self.workspace._storages[self.compile_bucket] = storage
         execution = _ExecutionBuffers(
             bundle=bundle,
             spec=spec,
-            local_workspace=local_workspace,
-            shared_workspace=shared_workspace,
-            combine_output=combine_output,
-            epilogue_args=epilogue_args,
+            local_workspace=storage.local_workspace,
+            shared_workspace=storage.shared_workspace,
+            combine_output=storage.combine_output,
+            epilogue_args=storage.epilogue_args,
         )
-        self.workspace._execution = execution
+        self.workspace._executions[self.compile_bucket] = execution
         return execution
 
     def _ensure_compiled(self, inputs: MegaMoESm120W4A8Inputs) -> _CompiledSplit:
@@ -333,11 +420,12 @@ class MegaMoESm120W4A8Frontend:
 
         import cuda.bindings.driver as cuda
         import cutlass.cute as cute
-        from moe_sm120_mxfp8_split.api import compile_combine_reduce
-        from moe_sm120_mxfp8_split.runtime.green_context import (
+        from moe_sm120_mxfp4mxfp8_split.api import compile_combine_reduce
+        from moe_sm120_mxfp4mxfp8_split.runtime.green_context import (
             NativeGreenContextGraph,
         )
 
+        profile_start = time.monotonic()
         execution = self._ensure_execution()
         bundle = execution.bundle
         spec = execution.spec
@@ -364,8 +452,15 @@ class MegaMoESm120W4A8Frontend:
         runtime_k2 = dict(base_runtime, stream=k2_cuda)
         compile_k1 = dict(runtime_k1, max_active_clusters=spec.kernel.k1_sms)
         compile_k2 = dict(runtime_k2, max_active_clusters=spec.kernel.k2_sms)
-        compiled_k1 = cute.compile(bundle.k1, **compile_k1)
-        compiled_k2 = cute.compile(bundle.k2, **compile_k2)
+        compiled_pair = self.workspace._compiled_k12.get(self.compile_bucket)
+        if compiled_pair is None:
+            compiled_pair = (
+                cute.compile(bundle.k1, **compile_k1),
+                cute.compile(bundle.k2, **compile_k2),
+            )
+            self.workspace._compiled_k12[self.compile_bucket] = compiled_pair
+        compiled_k1, compiled_k2 = compiled_pair
+        kernels_compiled = time.monotonic()
 
         runtime_drain = None
         runtime_finalizer = None
@@ -383,9 +478,11 @@ class MegaMoESm120W4A8Frontend:
                 **dict(runtime_finalizer, max_active_clusters=1),
             )
 
+        combine_bucket = combine_output[: self.compile_bucket]
+        output_bucket = inputs.output[: self.compile_bucket]
         k3_plan = compile_combine_reduce(
-            combine_output,
-            inputs.output,
+            combine_bucket,
+            output_bucket,
             None,
             stream=root_cuda,
         )
@@ -404,6 +501,7 @@ class MegaMoESm120W4A8Frontend:
             compiled_finalizer.to(None) if compiled_finalizer else None
         )
         k3_executor = compiled_k3.to(None)
+        all_kernels_ready = time.monotonic()
         graph = NativeGreenContextGraph.capture(
             root_stream=root_stream,
             k1_stream=k1_stream,
@@ -428,6 +526,19 @@ class MegaMoESm120W4A8Frontend:
             launch_reset=lambda: self._reset_execution(execution),
             k1_sm_count=spec.kernel.k1_sms,
         )
+        graph_captured = time.monotonic()
+        if os.environ.get("FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC") == "1":
+            print(
+                "[FlashInfer MegaMoE frontend] "
+                f"rank={self.config.rank} "
+                f"bucket={self.compile_bucket} "
+                f"layer={len(self.workspace._frontends)} "
+                f"k12_compile={kernels_compiled - profile_start:.3f}s "
+                f"k3_compile={all_kernels_ready - kernels_compiled:.3f}s "
+                f"graph={graph_captured - all_kernels_ready:.3f}s "
+                f"total={graph_captured - profile_start:.3f}s",
+                flush=True,
+            )
         self._barrier()
         self._compiled = _CompiledSplit(
             execution=execution,
@@ -472,6 +583,16 @@ class MegaMoESm120W4A8Frontend:
         self._compiled = None
 
 
+def set_compile_tokens_per_rank(
+    workspace: MegaMoESm120W4A8Workspace,
+    compile_tokens_per_rank: int | None,
+) -> None:
+    workspace._compile_bucket = select_graph_compile_bucket(
+        compile_tokens_per_rank,
+        workspace.config.max_tokens_per_rank,
+    )
+
+
 def allocate_workspace(
     config: MegaMoESm120W4A8Config,
     *,
@@ -510,6 +631,7 @@ def allocate_workspace(
         output=output,
         _sym_roots=roots,
         _control_group=control_group,
+        _compile_bucket=config.max_tokens_per_rank,
     )
     return workspace
 
@@ -527,32 +649,36 @@ def run_split_mega_moe(
     weight_key = tuple(
         tensor.data_ptr()
         for tensor in (fc1_weight, fc1_scale, fc2_weight, fc2_scale)
-    ) + (graph_output.data_ptr(),)
+    ) + (graph_output.data_ptr(), workspace._compile_bucket)
     frontend = workspace._frontends.get(weight_key)
     if frontend is None:
         frontend = MegaMoESm120W4A8Frontend(
             workspace,
+            compile_bucket=workspace._compile_bucket,
             control_group=workspace._control_group,
         )
         workspace._frontends[weight_key] = frontend
     inputs = MegaMoESm120W4A8Inputs(
-        activation=workspace.x,
-        activation_scale=workspace.x_scale,
-        topk_ids=workspace.topk_ids,
-        topk_weights=workspace.topk_weights,
+        activation=workspace.x[: workspace._compile_bucket],
+        activation_scale=workspace.x_scale[: workspace._compile_bucket],
+        topk_ids=workspace.topk_ids[: workspace._compile_bucket],
+        topk_weights=workspace.topk_weights[: workspace._compile_bucket],
         fc1_weight=fc1_weight,
         fc1_weight_scale=fc1_scale,
         fc2_weight=fc2_weight,
         fc2_weight_scale=fc2_scale,
-        output=graph_output,
+        output=graph_output[: workspace._compile_bucket],
     )
     return frontend.run(inputs)
 
 
 __all__ = [
+    "DECODE_GRAPH_COMPILE_BUCKETS",
     "MegaMoESm120W4A8Config",
     "MegaMoESm120W4A8Inputs",
     "MegaMoESm120W4A8Workspace",
     "allocate_workspace",
     "run_split_mega_moe",
+    "select_graph_compile_bucket",
+    "set_compile_tokens_per_rank",
 ]

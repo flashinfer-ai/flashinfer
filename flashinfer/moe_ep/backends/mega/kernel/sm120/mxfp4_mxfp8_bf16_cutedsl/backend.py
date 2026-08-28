@@ -137,6 +137,17 @@ class Sm120Mxfp4Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             scales=tensors.scales,
         )
 
+    def set_compile_tokens_per_rank(
+        self,
+        workspace: Any,
+        compile_tokens_per_rank: int | None,
+    ) -> None:
+        from ......kernel_src.sm120.split_cutedsl_megakernel import (
+            set_compile_tokens_per_rank,
+        )
+
+        set_compile_tokens_per_rank(workspace, compile_tokens_per_rank)
+
     def stage_inputs(
         self,
         tensors: "MoEEpTensors",
@@ -146,14 +157,15 @@ class Sm120Mxfp4Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
     ) -> None:
         from ......kernel_src.sm120.split_cutedsl_megakernel import stage_inputs
 
+        compile_bucket = workspace._compile_bucket
         stage_inputs(
             tensors.hidden_states,
             tensors.topk_weights,
             tensors.topk_ids,
-            workspace.x,
-            workspace.x_scale,
-            workspace.topk_ids,
-            workspace.topk_weights,
+            workspace.x[:compile_bucket],
+            workspace.x_scale[:compile_bucket],
+            workspace.topk_ids[:compile_bucket],
+            workspace.topk_weights[:compile_bucket],
             quantize_input=quantize_input,
             scales=tensors.scales,
         )

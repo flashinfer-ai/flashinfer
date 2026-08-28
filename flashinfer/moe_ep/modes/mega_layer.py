@@ -185,14 +185,30 @@ class MoEEpMegaLayer(nn.Module):
             )
         return True
 
-    def stage_inputs(self, t: "MoEEpTensors") -> None:
+    def stage_inputs(
+        self,
+        t: "MoEEpTensors",
+        *,
+        compile_tokens_per_rank: int | None = None,
+    ) -> None:
         """Validate and stage one iteration without launching the mega kernel.
 
         Keeping staging separate lets frameworks capture its fixed-shape GPU
         work while replaying a backend-owned compute graph eagerly. This is
         useful when nesting that graph would discard backend-specific launch
         scheduling such as Green Context partitioning.
+
+        ``compile_tokens_per_rank`` is a collective hint: when provided, every
+        EP rank must pass the same padded row count. It selects a graph/kernel
+        specialization without changing the workspace capacity.
         """
+        if (
+            compile_tokens_per_rank is not None
+            and compile_tokens_per_rank < t.num_tokens
+        ):
+            raise MoEEpConfigError(
+                "compile_tokens_per_rank cannot be smaller than the live token count"
+            )
         if not self._bootstrap_validated:
             ensure_bootstrap_dist_validated(self._bootstrap)
             self._bootstrap_validated = True
@@ -256,6 +272,9 @@ class MoEEpMegaLayer(nn.Module):
                 f"got shape={tuple(caller_output.shape)}, "
                 f"dtype={caller_output.dtype}, device={caller_output.device}"
             )
+        self._kernel.set_compile_tokens_per_rank(
+            workspace, compile_tokens_per_rank
+        )
         self._kernel.stage_inputs(
             t,
             workspace,

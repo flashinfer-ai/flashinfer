@@ -1,10 +1,11 @@
 # SM120 W4A8 Split Kernel Drop
 
 The raw source under `src/` comes from `bangyus/cutedsl_megamoe`, branch
-`hanyueh/sm120-mxfp4mxfp8-split`, commit `ed30d53`.
+`hanyueh/sm120-mxfp4mxfp8-split`, commit `ed30d53`, plus the local package rename and decode N16 heuristic
+backport awaiting a source-repository commit.
 
-The historical raw package name remains `moe_sm120_mxfp8_split`; its actual
-weight/activation contract is MXFP4 E2M1 x MXFP8 E4M3 with E8M0 K32 scales.
+The raw package is named `moe_sm120_mxfp4mxfp8_split`; its weight/activation
+contract is MXFP4 E2M1 x MXFP8 E4M3 with E8M0 K32 scales.
 FlashInfer code imports only this package's `shim`, never raw modules directly.
 
 The first integration supports the production same-NUMA `p2p_direct` path.
@@ -24,7 +25,7 @@ reuse the same physical buffers without multiplying the symmetric heap by the
 model's MoE layer count.
 
 FlashInfer adaptation: `src/token_comm.py` imports `_nanosleep` and
-`spin_wait` from this drop's `moe_sm120_mxfp8_split.moe_utils` instead of the
+`spin_wait` from this drop's `moe_sm120_mxfp4mxfp8_split.moe_utils` instead of the
 unrelated `moe_nvfp4_swapab` package. The helper implementations are identical.
 
 `runtime/green_context.py` also injects the native Green Context graph as a
