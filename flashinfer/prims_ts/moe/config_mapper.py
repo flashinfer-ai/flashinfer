@@ -764,9 +764,7 @@ def _resolve_moe_json_config_pair(
             f"fc1_matches={len(fc1_indices)}, fc2_matches={len(fc2_indices)}"
         )
     config_pairs = [
-        (fc1_index, fc2_index)
-        for fc1_index in fc1_indices
-        for fc2_index in fc2_indices
+        (fc1_index, fc2_index) for fc1_index in fc1_indices for fc2_index in fc2_indices
     ]
     if use_deepseek_fp8:
         # Persisted autotuner caches store this pair index. Keep all original

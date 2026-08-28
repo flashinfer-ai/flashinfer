@@ -174,9 +174,7 @@ class GmemCResource(MemoryResource):
             ):
                 self.gCBytes = cutlass.Array(self.gC.data_ptr(), dtype=cutlass.Int8)
             if self.cfg.uses_fp8_output:
-                self.gCInt16 = cutlass.Array(
-                    self.gC.data_ptr(), dtype=cutlass.Int16
-                )
+                self.gCInt16 = cutlass.Array(self.gC.data_ptr(), dtype=cutlass.Int16)
         if self.sf_c_tensor is not None:
             self.gSfC = cutlass.make_array_view(self.sf_c_tensor)
             if self.cfg.has_epilogue_quant:
@@ -1490,12 +1488,8 @@ class GmemCResource(MemoryResource):
         v2 = self.sCFloat.load(idx2, vector_size=2, alignment=8)
         v3 = self.sCFloat.load(idx3, vector_size=2, alignment=8)
         return (
-            cute.arch.fmax(
-                cute.arch.fmax(v0[0], v1[0]), cute.arch.fmax(v2[0], v3[0])
-            ),
-            cute.arch.fmax(
-                cute.arch.fmax(v0[1], v1[1]), cute.arch.fmax(v2[1], v3[1])
-            ),
+            cute.arch.fmax(cute.arch.fmax(v0[0], v1[0]), cute.arch.fmax(v2[0], v3[0])),
+            cute.arch.fmax(cute.arch.fmax(v0[1], v1[1]), cute.arch.fmax(v2[1], v3[1])),
         )
 
     @cute.jit

@@ -2192,14 +2192,10 @@ def compute_warp_layout(cfg: BatchedGemmConfig) -> None:
         # so two warps saturate the routed operand while avoiding a larger CTA.
         max_gather_warps = (
             2
-            if cfg.is_nvfp4_mma
-            and cfg.is_swap_ab
-            and cfg.dtype_b_smem_bits == 4
+            if cfg.is_nvfp4_mma and cfg.is_swap_ab and cfg.dtype_b_smem_bits == 4
             else 4
         )
-        cfg.num_gather_warps = min(
-            max_gather_warps, max(1, (routed_rows + 3) // 4)
-        )
+        cfg.num_gather_warps = min(max_gather_warps, max(1, (routed_rows + 3) // 4))
     else:
         cfg.num_gather_warps = 0
     cfg.num_sync_warps = 1 if cfg.has_cluster and cfg.has_gather else 0

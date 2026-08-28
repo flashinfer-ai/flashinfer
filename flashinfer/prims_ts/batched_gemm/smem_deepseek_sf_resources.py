@@ -87,9 +87,7 @@ class SmemDeepSeekSfAbResource(MemoryResource):
     t2r_output_call_idx: Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
-    t2r_dequant_scale: Constexpr[TaskLocalVariable] = (
-        TaskLocalVariable.uninitialized()
-    )
+    t2r_dequant_scale: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     _alloc_dsfp8_sf: Constexpr[Optional[SmemAllocation]] = None
 
     def __post_init__(self):
@@ -411,9 +409,7 @@ class SmemDeepSeekSfAbResource(MemoryResource):
                 n_subtile_offset = t2r_output_call_idx * Int32(self.cfg.epi_tile_n)
             base_tmem_col = (lane_id % Int32(4)) * Int32(2)
 
-            dequant_scales = [Float32(0.0)] * (
-                max(1, self.cfg.epi_tile_n // 8) * 4
-            )
+            dequant_scales = [Float32(0.0)] * (max(1, self.cfg.epi_tile_n // 8) * 4)
             for group in cutlass.range_constexpr(max(1, self.cfg.epi_tile_n // 8)):
                 reg_base = group * 4
                 col_off = Int32(group * 8)
@@ -474,9 +470,7 @@ class SmemDeepSeekSfAbResource(MemoryResource):
                 rnd="rn",
             )
         if cutlass.const_expr(t2r_repx % 2 != 0):
-            vals0[-1] = (
-                t2r_rmem[-1] * t2r_dequant_scale[-1] + acc0[-1]
-            )
+            vals0[-1] = t2r_rmem[-1] * t2r_dequant_scale[-1] + acc0[-1]
         self.dsfp8_acc_rmem_state = cutlass.Vector.from_elements(
             tuple(vals0), dtype=cutlass.Float32
         )
@@ -497,16 +491,12 @@ class SmemDeepSeekSfAbResource(MemoryResource):
                     rnd="rn",
                 )
             if cutlass.const_expr(t2r_repx % 2 != 0):
-                vals1[-1] = (
-                    t2r_rmem_1[-1] * t2r_dequant_scale[-1] + acc1[-1]
-                )
+                vals1[-1] = t2r_rmem_1[-1] * t2r_dequant_scale[-1] + acc1[-1]
             self.dsfp8_acc_rmem_1_state = cutlass.Vector.from_elements(
                 tuple(vals1), dtype=cutlass.Float32
             )
         else:
-            self.dsfp8_acc_rmem_1_state = (
-                self.dsfp8_acc_rmem_1_state + t2r_rmem_1
-            )
+            self.dsfp8_acc_rmem_1_state = self.dsfp8_acc_rmem_1_state + t2r_rmem_1
         return (
             self.dsfp8_acc_rmem_state,
             self.dsfp8_acc_rmem_1_state,

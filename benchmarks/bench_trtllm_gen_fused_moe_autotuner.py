@@ -664,9 +664,7 @@ def bench_trtllm_gen_fused_moe_autotuner_fp8(
             w2_scalar.item(),
             device=device,
         )
-        w13, w2 = _shuffle_fp8_major_k(
-            w13, w2, activation_type=activation_type
-        )
+        w13, w2 = _shuffle_fp8_major_k(w13, w2, activation_type=activation_type)
     else:  # MxFP8xMxFP8
         w13, w13_scale = mxfp8_quantize(w13, True)
         w2, w2_scale = mxfp8_quantize(w2, True)
@@ -1311,6 +1309,7 @@ if __name__ == "__main__":
         )
 
     if args.output_json is not None:
+
         def package_version(name: str) -> Optional[str]:
             try:
                 return version(name)

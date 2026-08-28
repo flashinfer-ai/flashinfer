@@ -28,9 +28,7 @@ from flashinfer.tllm_enums import ActivationType, Fp8QuantizationType, WeightLay
 _expert_scale_ones: dict[tuple[torch.device, int], torch.Tensor] = {}
 
 
-def _get_expert_scale_ones(
-    num_experts: int, device: torch.device
-) -> torch.Tensor:
+def _get_expert_scale_ones(num_experts: int, device: torch.device) -> torch.Tensor:
     """Return the immutable per-expert unit scales shared by MoE launches."""
 
     key = (torch.device(device), int(num_experts))
