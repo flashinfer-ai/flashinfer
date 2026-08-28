@@ -804,6 +804,17 @@ def test_fallback_ffi_consumes_route_context_without_recompute(
     monkeypatch.setattr(
         kda_training_api, "_get_training_module", lambda _: training_module
     )
+    selected_template = (
+        "tensor_tape_c32" if route.endswith("c32") else "row_warp_checkpoint"
+    )
+    # This test covers route-context reuse, not analytical route selection.
+    monkeypatch.setattr(
+        kda_training_api,
+        "_select_training_route",
+        lambda *_args, **_kwargs: kda_training_api._TrainingRouteSpec(
+            route, selected_template
+        ),
+    )
     values = inputs()
     _, _, context = recurrent_kda_training_forward(
         values["q"],
