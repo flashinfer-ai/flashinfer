@@ -65,16 +65,7 @@ struct SmemLayout {
       NEED_SCALE_BUF ? TILE_BI * KV::SCALE_BYTES_PER_TOKEN : 0;
 
   // Cross-warp reduction; reduce_buf and sum_reduce_buf share memory.
-  // reduce_buf is also lent to quantize_q_to_smem as its per-(head, quant-tile)
-  // amax scratch, which wants HPB * NUM_SCALES floats. At the default 64/8 tile
-  // the 8-warp reduction dominates for every DeepSeek-family model (128 >= 112),
-  // so this max is a no-op there. DOTS3_SWA runs 4 math warps against 8 scales
-  // and is the first config where the amax use is the larger of the two —
-  // without the max it would quantize Q straight through m_smem/l_smem.
-  static constexpr size_t SMEM_REDUCE_WARPS = TILE_MATH_WARPS * HPB * sizeof(float);
-  static constexpr size_t SMEM_REDUCE_AMAX = HPB * KV::NUM_SCALES * sizeof(float);
-  static constexpr size_t SMEM_REDUCE =
-      SMEM_REDUCE_WARPS > SMEM_REDUCE_AMAX ? SMEM_REDUCE_WARPS : SMEM_REDUCE_AMAX;
+  static constexpr size_t SMEM_REDUCE = TILE_MATH_WARPS * HPB * sizeof(float);
 
   // Per-head online softmax state
   static constexpr size_t SMEM_M = HPB * sizeof(float);
@@ -128,12 +119,6 @@ struct SmemLayoutMG {
 
   // reduce_buf and sum_reduce_buf share the same memory.
   static constexpr size_t SMEM_REDUCE_MG = N_HG * TILE_MATH_WARPS * HPB * sizeof(float);
-  // Same amax loan as the SG layout; MG has never needed a max because N_HG
-  // doubles the reduction size. Asserted rather than maxed so the MG smem
-  // footprint stays byte-identical.
-  static_assert(SMEM_REDUCE_MG >= HPB * KV::NUM_SCALES * sizeof(float),
-                "reduce_buf doubles as quantize_q_to_smem's amax scratch (HPB * NUM_SCALES "
-                "floats); this tile is too narrow to lend it");
 
   static constexpr size_t SMEM_M = N_HG * HPB * sizeof(float);
   static constexpr size_t SMEM_L = N_HG * HPB * sizeof(float);

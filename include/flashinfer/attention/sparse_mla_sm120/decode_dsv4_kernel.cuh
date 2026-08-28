@@ -109,11 +109,6 @@ struct DecodeDsv4Smem {
   static constexpr size_t SMEM_KV_ROPE_BUF = Cfg::BI * KV::D_ROPE * sizeof(bf16);
   static constexpr size_t SMEM_MBAR_PAIR = 2 * sizeof(uint64_t);
   static constexpr size_t SMEM_REDUCE = 2 * Cfg::N_WARPS * HPB * sizeof(float);
-  // reduce() doubles as quantize_q_to_smem's amax scratch, which needs
-  // HPB * NUM_SCALES floats; at DOTS3_SWA (4 math warps, 8 scale blocks) the
-  // margin is exactly zero, so a future tile config must trip here.
-  static_assert(SMEM_REDUCE >= HPB * KV::NUM_SCALES * sizeof(float),
-                "reduce buffer must cover quantize_q_to_smem's amax scratch");
   static constexpr size_t SMEM_W_HEAD_SC = N_V_CHUNKS * HPB * sizeof(float);
   static constexpr size_t SMEM_W_FP8_BUF = HPB * (Cfg::BI + 16);
 
@@ -424,8 +419,7 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
   // Stage 0: Q quantization (math threads only; the helper uses bar:2
   // internally with count=Cfg::MATH_THREADS).
   const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
-  quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, sm.reduce(),
-                                            VALID_HPB);
+  quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base, VALID_HPB);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};

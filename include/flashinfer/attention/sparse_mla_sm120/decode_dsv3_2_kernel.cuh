@@ -294,7 +294,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   // Stage 0: Q quantization.
   const bf16* q_base = Q + (size_t)t_idx * NUM_HEADS * D_QK + (size_t)h_start * D_QK;
   quantize_q_to_smem<MT, DSV3_2_MATH_THREADS>(sm.q_fp8(), sm.q_sc(), sm.q_rope(), q_base,
-                                              sm.reduce(), VALID_HPB);
+                                              VALID_HPB);
 
   // Persistent state across chunks (per-thread registers).
   float acc_nope[N_V_CHUNKS][NT_PER_WARP_XV][4] = {0};

@@ -161,7 +161,7 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
       load_q_bf16_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_bf16, sm.q_rope, q_base, VALID_HPB);
     } else {
       quantize_q_to_smem<MT, Cfg::MATH_THREADS>(sm.q_nope_fp8, sm.q_nope_sc, sm.q_rope, q_base,
-                                                sm.reduce_buf, VALID_HPB);
+                                                VALID_HPB);
     }
     QRopeRegs<MT> q_rope_regs = preload_q_rope_regs<MT>(sm.q_rope, lane);
 
@@ -872,7 +872,7 @@ __device__ __forceinline__ void prefill_mg_impl(
       } else {
         quantize_q_to_smem<MT, MATH_THREADS>(sm.q_nope_fp8(g), sm.q_nope_sc(g),
                                              sm.q_rope() + g * HPB * KV::D_ROPE, q_base_g,
-                                             sm.reduce_buf(), VALID_HPB);
+                                             VALID_HPB);
       }
     }
 
