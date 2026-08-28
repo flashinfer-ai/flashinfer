@@ -2205,6 +2205,42 @@ def test_attention_ts_context_uniform_packed_window_offsets_accuracy():
     _assert_context_correct(wrapper.run(case.q, case.k, case.v), case)
 
 
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_qk_bf16_pv_fp8_dense_accuracy():
+    """QK-BF16/PV-FP8 mixed precision. Q/K stay BF16, only V is quantized to
+    FP8 before the PV GEMM. This tests the k_dtype != v_dtype SMEM
+    staging path in SmemKVResource.
+    """
+    case = _make_context_case(
+        q_lengths=(64, 96),
+        k_lengths=(192, 160),
+        num_qo_heads=4,
+        num_kv_heads=4,
+        head_dim=128,
+        qkv_dtype=torch.bfloat16,
+        packed=True,
+        mask_type="causal",
+        output_dtype=torch.bfloat16,
+        device="cuda",
+        seed=2026082701,
+    )
+    case = replace(case, v=case.v.to(_FP8))
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    actual = wrapper.run(case.q, case.k, case.v)
+    expected = _context_reference(case)
+    assert actual.shape == case.q.shape
+    assert actual.dtype == case.output_dtype
+    assert torch.isfinite(actual.float()).all()
+    # V's E4M3 quantization (both storage and the kernel's internal P-cast)
+    # dominates the error budget here, so use the FP8-tier tolerance
+    torch.testing.assert_close(actual.float(), expected, rtol=5e-2, atol=1.3e-1)
+    denominator = torch.linalg.vector_norm(expected).clamp_min(1e-6)
+    relative_l2 = torch.linalg.vector_norm(actual.float() - expected) / denominator
+    assert float(relative_l2) <= 1e-1
+
+
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
 @pytest.mark.parametrize(
     "k_lengths",

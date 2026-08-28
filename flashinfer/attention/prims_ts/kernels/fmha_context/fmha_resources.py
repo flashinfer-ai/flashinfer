@@ -250,6 +250,13 @@ class FmhaConfig:
     tma_copy_kv_elements: int = 0
     tma_copy_kv_granu_elems: int = 0
     tma_copy_kv_bytes: int = 0
+    # V-specific TMA copy granularity. V may use a narrower dtype than K,
+    # e.g. QK-BF16/PV-FP8.
+    tma_copy_v_iters: int = 1
+    tma_copy_v_granu_inner: int = 128
+    tma_copy_v_stage_iters: int = 0
+    tma_copy_v_granu_elems: int = 0
+    tma_copy_v_bytes: int = 0
     tma_copy_o_iters: int = 1
     tma_copy_o_granu_inner: int = 0
     tma_copy_o_elements: int = 0
@@ -1113,15 +1120,15 @@ def _qk_smem_desc_offsets(cfg: FmhaConfig) -> SmemDescOffsets:
 def _pv_smem_desc_offsets(cfg: FmhaConfig) -> SmemDescOffsets:
     """Return V descriptor leading and stride byte offsets for PV MMA."""
     leading_byte_offset = 0
-    if cfg.tma_copy_qkv_iters != 1:
-        tma_copy_kv_iters = (
-            cfg.tma_copy_kv_stage_iters
+    if cfg.tma_copy_v_iters != 1:
+        tma_copy_v_iters = (
+            cfg.tma_copy_v_stage_iters
             if cfg.stage_kv_by_head_dim
-            else cfg.tma_copy_qkv_iters
+            else cfg.tma_copy_v_iters
         )
-        leading_byte_offset = cfg.tma_copy_kv_bytes // tma_copy_kv_iters
+        leading_byte_offset = cfg.tma_copy_v_bytes // tma_copy_v_iters
     stride_byte_offset = (
-        cfg.pv_mma_tiler[1] * cfg.v_dtype.width // cfg.tma_copy_qkv_iters
+        cfg.pv_mma_tiler[1] * cfg.v_dtype.width // cfg.tma_copy_v_iters
     )
     return leading_byte_offset, stride_byte_offset
 
@@ -1695,9 +1702,22 @@ class SmemKVResource(MemoryResource):
             # d-half.
             tile_idx = kv_tile_start + stage_info.loop_offset + tile_offset
             pages_per_tile = self.cfg.kv_tile_n // self.cfg.num_tokens_per_page
-            d_granu_inner = self.cfg.tma_copy_kv_granu_inner
+            d_granu_inner = (
+                self.cfg.tma_copy_v_granu_inner
+                if cutlass.const_expr(is_v)
+                else self.cfg.tma_copy_kv_granu_inner
+            )
             page_d_elems = self.cfg.num_tokens_per_page * d_granu_inner
-            d_iter_elems = self.cfg.tma_copy_kv_granu_elems
+            d_iter_elems = (
+                self.cfg.tma_copy_v_granu_elems
+                if cutlass.const_expr(is_v)
+                else self.cfg.tma_copy_kv_granu_elems
+            )
+            stage_iters = (
+                self.cfg.tma_copy_v_stage_iters
+                if cutlass.const_expr(is_v)
+                else self.cfg.tma_copy_kv_stage_iters
+            )
             if prims.elect_sync():
                 # Only the elected TMA-issuing lane consumes page IDs. Loading
                 # the vector outside this guard made every lane perform the
@@ -1736,7 +1756,7 @@ class SmemKVResource(MemoryResource):
                             )
                 for frag in cutlass.range_constexpr(pages_per_tile):
                     page_id = Int32(page_ids[frag])
-                    for i in cutlass.range_constexpr(self.cfg.tma_copy_kv_stage_iters):
+                    for i in cutlass.range_constexpr(stage_iters):
                         d_offset = Int32(
                             head_dim_stage_idx * self.cfg.head_dim_per_stage_kv
                             + i * d_granu_inner
@@ -1751,9 +1771,23 @@ class SmemKVResource(MemoryResource):
             return
 
         if prims.elect_sync():
-            d_granu_inner = self.cfg.tma_copy_kv_granu_inner
+            d_granu_inner = (
+                self.cfg.tma_copy_v_granu_inner
+                if cutlass.const_expr(is_v)
+                else self.cfg.tma_copy_kv_granu_inner
+            )
+            d_granu_elems = (
+                self.cfg.tma_copy_v_granu_elems
+                if cutlass.const_expr(is_v)
+                else self.cfg.tma_copy_kv_granu_elems
+            )
+            stage_iters = (
+                self.cfg.tma_copy_v_stage_iters
+                if cutlass.const_expr(is_v)
+                else self.cfg.tma_copy_kv_stage_iters
+            )
             seq_coord_kv = cuseqlen_k + seq_offset
-            for i in cutlass.range_constexpr(self.cfg.tma_copy_kv_stage_iters):
+            for i in cutlass.range_constexpr(stage_iters):
                 d_offset = (
                     head_dim_stage_idx * self.cfg.head_dim_per_stage_kv
                     + i * d_granu_inner
@@ -1762,7 +1796,7 @@ class SmemKVResource(MemoryResource):
                 if cutlass.const_expr(self.cfg.has_varlen):
                     kv_coords = (d_offset, kv_head_coord, seq_coord_kv)
                 prims.cp_async_bulk_tensor_shared_cta_global(
-                    sK_curr.subview(i * self.cfg.tma_copy_kv_granu_elems),
+                    sK_curr.subview(i * d_granu_elems),
                     tma_desc,
                     kv_coords,
                     stage_info.barrier,
@@ -4155,20 +4189,20 @@ class TmemOResource(MemoryResource):
                 k_dim_per_mma * self.cfg.v_dtype.width // self.cfg.qk_acc_dtype.width
             )
             tma_copy_iters_per_head_dim_stage = (
-                self.cfg.tma_copy_qkv_iters // num_head_dim_stages
+                self.cfg.tma_copy_v_iters // num_head_dim_stages
             )
             if cutlass.const_expr(self.cfg.stage_kv_by_head_dim):
-                tma_copy_iters_per_head_dim_stage = self.cfg.tma_copy_kv_stage_iters
+                tma_copy_iters_per_head_dim_stage = self.cfg.tma_copy_v_stage_iters
             inc_bytes_v = (
                 k_dim_per_mma
                 * (pv_n_dim // tma_copy_iters_per_head_dim_stage)
                 * self.cfg.v_dtype.width
                 // 8
             )
-            kv_chunk_bytes = (
-                self.cfg.tma_copy_kv_bytes // self.cfg.tma_copy_kv_stage_iters
+            v_chunk_bytes = (
+                self.cfg.tma_copy_v_bytes // self.cfg.tma_copy_v_stage_iters
             )
-            head_dim_stage_bytes_v = kv_chunk_bytes * tma_copy_iters_per_head_dim_stage
+            head_dim_stage_bytes_v = v_chunk_bytes * tma_copy_iters_per_head_dim_stage
 
             # Select O buffer and P offset at trace time (compile-time constant)
             if cutlass.const_expr(self.cfg.single_qkv_instance or writes_o0):

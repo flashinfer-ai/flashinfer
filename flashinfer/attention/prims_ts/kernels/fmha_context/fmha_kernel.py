@@ -794,6 +794,10 @@ def build_context_task_manager(
     # ConsumerRelease. This keeps the previous V tile live while MMA starts the
     # next QK tile, giving QK0 -> PV1(previous V) -> QK1 ordering without
     # releasing the previous V tile first.
+    
+    # TODO(qk-bf16/pv-fp8): num_bytes is derived from K but shared with V's
+    # acquire/commit cycle on this pipeline. When V dtype is different than K dtype,
+    # this will cause the TMA barrier condition to never be met.
     smem_kv_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=cfg.kv_stage,
         num_bytes=cfg.tma_copy_kv_bytes,
@@ -1888,6 +1892,7 @@ def _configure_head_paired_tma_copy_metadata(
     *,
     q_dtype: type,
     k_dtype: type,
+    v_dtype: type,
     o_dtype: type,
 ) -> None:
     """Derive TMA copy granularities for head-paired Q/K/V/O tensors."""
@@ -1917,6 +1922,19 @@ def _configure_head_paired_tma_copy_metadata(
         cfg.tma_copy_kv_elements // cfg.tma_copy_kv_stage_iters
     )
     cfg.tma_copy_kv_bytes = cfg.tma_copy_kv_elements * k_dtype.width // 8
+
+    v_inner_dim_size = cfg.pv_mma_tiler[1] * v_dtype.width // 8
+    cfg.tma_copy_v_iters = 1
+    if v_inner_dim_size % 128 == 0:
+        cfg.tma_copy_v_iters = v_inner_dim_size // 128
+    elif v_inner_dim_size != 64 and v_inner_dim_size != 32:
+        raise RuntimeError(f"Unsupported inner dimension size: {v_inner_dim_size}")
+    cfg.tma_copy_v_granu_inner = cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters
+    cfg.tma_copy_v_stage_iters = kv_head_dim // cfg.tma_copy_v_granu_inner
+    cfg.tma_copy_v_granu_elems = (
+        cfg.tma_copy_kv_elements // cfg.tma_copy_v_stage_iters
+    )
+    cfg.tma_copy_v_bytes = cfg.tma_copy_kv_elements * v_dtype.width // 8
 
     output_inner_dim_size = cfg.epi_tile[1] * o_dtype.width // 8
     cfg.tma_copy_o_iters = 1
@@ -2501,6 +2519,7 @@ class FmhaTs:
                 cfg,
                 q_dtype=q_dtype,
                 k_dtype=k_dtype,
+                v_dtype=v_dtype,
                 o_dtype=o_dtype,
             )
             _configure_common_launch_flags(
@@ -2558,6 +2577,20 @@ class FmhaTs:
             cfg.tma_copy_kv_elements // cfg.tma_copy_kv_stage_iters
         )
         cfg.tma_copy_kv_bytes = cfg.tma_copy_kv_elements * k_dtype.width // 8
+
+        # TMA copy granularity for V
+        v_inner_dim_size = cfg.pv_mma_tiler[1] * v_dtype.width // 8
+        cfg.tma_copy_v_iters = 1
+        if v_inner_dim_size % 128 == 0:
+            cfg.tma_copy_v_iters = v_inner_dim_size // 128
+        elif v_inner_dim_size != 64 and v_inner_dim_size != 32:
+            raise RuntimeError(f"Unsupported inner dimension size: {v_inner_dim_size}")
+        cfg.tma_copy_v_granu_inner = cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters
+        cfg.tma_copy_v_stage_iters = kv_head_dim // cfg.tma_copy_v_granu_inner
+        cfg.tma_copy_v_granu_elems = (
+            cfg.tma_copy_kv_elements // cfg.tma_copy_v_stage_iters
+        )
+        cfg.tma_copy_v_bytes = cfg.tma_copy_kv_elements * v_dtype.width // 8
 
         # TMA copy granularity for O
         cfg.tma_copy_o_iters = (cfg.epi_tile[1] * o_dtype.width) // 1024
@@ -2659,13 +2692,22 @@ class FmhaTs:
         elif cutlass.const_expr(output_inner_dim_size == 32):
             tma_o_swizzle = cuda.TensorMapSwizzle.s32b
 
+        v_inner_dim_size = cfg.tma_copy_v_granu_inner * cfg.v_dtype.width // 8
+        tma_v_swizzle = cuda.TensorMapSwizzle.none
+        if cutlass.const_expr(v_inner_dim_size % 128 == 0):
+            tma_v_swizzle = cuda.TensorMapSwizzle.s128b
+        elif cutlass.const_expr(v_inner_dim_size == 64):
+            tma_v_swizzle = cuda.TensorMapSwizzle.s64b
+        elif cutlass.const_expr(v_inner_dim_size == 32):
+            tma_v_swizzle = cuda.TensorMapSwizzle.s32b
+
         q_box_dims = (1, cfg.qk_mma_tiler[0], 1, cfg.tma_copy_q_granu_inner)
         kv_box_dims = (1, cfg.qk_mma_tiler[1], 1, cfg.tma_copy_kv_granu_inner)
         v_box_dims = (
             1,
             cfg.pv_mma_tiler[2],
             1,
-            cfg.pv_mma_tiler[1] // cfg.tma_copy_qkv_iters,
+            cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters,
         )
         o_box_dims = (1, cfg.epi_tile[0], 1, cfg.tma_copy_o_granu_inner)
         stride_order = (3, 2, 1, 0)
@@ -2685,7 +2727,7 @@ class FmhaTs:
                 v_box_dims = (
                     cfg.pv_mma_tiler[2],
                     1,
-                    cfg.pv_mma_tiler[1] // cfg.tma_copy_qkv_iters,
+                    cfg.pv_mma_tiler[1] // cfg.tma_copy_v_iters,
                 )
                 kv_stride_order = stride_order
         if cutlass.const_expr(cum_seqlen_q is not None):
@@ -2750,7 +2792,7 @@ class FmhaTs:
                 v_cute,
                 box_dims=v_box_dims,
                 stride_order=kv_stride_order,
-                swizzle=tma_qkv_swizzle,
+                swizzle=tma_v_swizzle,
                 l2_promotion=tma_kv_l2_promotion,
             )
 
