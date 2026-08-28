@@ -19,11 +19,28 @@ extern "C" {
 __global__ void kernel_flashkda_forward_checkpoint_c16(
     unsigned int*, const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, __nv_bfloat16*,
+    const __grid_constant__ CUtensorMap, __nv_bfloat16*, const __grid_constant__ CUtensorMap,
+    __nv_bfloat16*, __nv_bfloat16*, float*, float*, long long*, long long*, int*, float*, float*,
+    int, int, int, int, int, int, float, float);
+
+__global__ void kernel_cake_flashkda_forward_checkpoint_c16_aligned(
+    unsigned int*, const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, __nv_bfloat16*,
-    __nv_bfloat16*, float*, float*, long long*, long long*, int*, float*, __nv_bfloat16*, int, int,
-    int, int, int, int, float, float);
+    const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, __nv_bfloat16*,
+    __nv_bfloat16*, float*, float*, long long*, long long*, int*, float*, float*, int, int, int,
+    int, int, int, float, float);
 
 __global__ void kernel_flashkda_backward_persistent_c16(
+    unsigned int*, const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
+    const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
+    const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, float*,
+    const __grid_constant__ CUtensorMap, __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, float*,
+    float*, float*, float*, float*, const __grid_constant__ CUtensorMap, float*, long long*,
+    long long*, int*, unsigned int*, float*, float*, float*, float*, float*, float*, float*, float*,
+    float*, float*, float*, float*, float*, float*, int, int, int, int, int, int, int, float,
+    float);
+
+__global__ void kernel_cake_flashkda_backward_persistent_c16_aligned(
     unsigned int*, const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap,
     const __grid_constant__ CUtensorMap, const __grid_constant__ CUtensorMap, float*,
@@ -36,6 +53,10 @@ __global__ void kernel_flashkda_refine_forgetting_horizons(__nv_bfloat16*, float
                                                            int*, unsigned int*, int, float, float);
 
 __global__ void kernel_flashkda_backward_param_reduce_c16_partial(
+    __nv_bfloat16*, __nv_bfloat16*, float*, float*, float*, float*, float*, __nv_bfloat16*,
+    __nv_bfloat16*, float*, float*, unsigned int*, float*, float*, int, int, int, int, float);
+
+__global__ void kernel_cake_flashkda_backward_param_reduce_c16_aligned(
     __nv_bfloat16*, __nv_bfloat16*, float*, float*, float*, float*, float*, __nv_bfloat16*,
     __nv_bfloat16*, float*, float*, unsigned int*, float*, float*, int, int, int, int, float);
 
@@ -226,6 +247,10 @@ void RunTrainingForward(
   TVM_FFI_ICHECK(boundary_count >= 0 && beta_active_stride >= num_v_heads);
   TVM_FFI_ICHECK(uniform_work_items == 0 || uniform_work_items == 1);
   TVM_FFI_ICHECK(prepare_final_descriptors == 0 || prepare_final_descriptors == 1);
+  TVM_FFI_ICHECK(total_chunks <= std::numeric_limits<int64_t>::max() / kChunk);
+  const int64_t tiled_tokens = total_chunks * kChunk;
+  TVM_FFI_ICHECK(tiled_tokens >= total_tokens);
+  const bool has_partial_tail = tiled_tokens != total_tokens;
 
   for (const auto& named : std::initializer_list<std::pair<TensorView*, const char*>>{
            {&q, "q"},
@@ -282,13 +307,13 @@ void RunTrainingForward(
   TVM_FFI_ICHECK(final_tensormap_workspace.numel() >= final_grid_ctas * kFinalWorkspaceBytesPerCta);
 
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
-  CheckCuda(
-      cudaMemcpyAsync(work_items.data_ptr(), base_work_items.data_ptr(),
-                      total_work_items * 8 * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream),
-      "copy training work items");
-  CheckCuda(cudaMemsetAsync(counters.data_ptr(), 0, counters.numel() * sizeof(uint32_t), stream),
-            "reset training counters");
   if (boundary_count != 0) {
+    CheckCuda(
+        cudaMemcpyAsync(work_items.data_ptr(), base_work_items.data_ptr(),
+                        total_work_items * 8 * sizeof(int32_t), cudaMemcpyDeviceToDevice, stream),
+        "copy training work items");
+    CheckCuda(cudaMemsetAsync(counters.data_ptr(), 0, counters.numel() * sizeof(uint32_t), stream),
+              "reset training counters");
     ConfigureDynamicSmem(kernel_flashkda_refine_forgetting_horizons, kRefineSmemBytes, device_id,
                          "cudaFuncSetAttribute(forgetting-horizon refinement)");
     kernel_flashkda_refine_forgetting_horizons<<<dim3(boundary_count, 1, 1), 128, kRefineSmemBytes,
@@ -299,6 +324,9 @@ void RunTrainingForward(
         reinterpret_cast<unsigned int*>(counters.data_ptr()), static_cast<int>(num_v_heads),
         static_cast<float>(lower_bound), kDefaultLog2Threshold);
     CheckCuda(cudaGetLastError(), "forgetting-horizon refinement launch");
+  } else if (uniform_work_items == 0) {
+    CheckCuda(cudaMemsetAsync(counters.data_ptr(), 0, sizeof(uint32_t), stream),
+              "reset training forward counter");
   }
 
   const CUtensorMap q_map = EncodeTokenMap(q, "q", total_tokens, num_qk_heads);
@@ -309,44 +337,44 @@ void RunTrainingForward(
   const CUtensorMap checkpoint_map =
       EncodeCheckpointMap(state_checkpoints, total_chunks, num_v_heads);
   const dim3 grid(std::min<int64_t>(total_work_items, ResidentCtas(device_id)), 1, 1);
-  ConfigureDynamicSmem(kernel_flashkda_forward_checkpoint_c16, kForwardSmemBytes, device_id,
-                       "cudaFuncSetAttribute(training forward)");
-  kernel_flashkda_forward_checkpoint_c16<<<grid, 512, kForwardSmemBytes, stream>>>(
-      reinterpret_cast<unsigned int*>(counters.data_ptr()), q_map, k_map, v_map, g_map,
-      reinterpret_cast<__nv_bfloat16*>(g.data_ptr()), out_map, checkpoint_map,
-      reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(beta_active.data_ptr()),
-      reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
-      reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
-      reinterpret_cast<long long*>(checkpoint_cu_starts.data_ptr()),
-      reinterpret_cast<int*>(work_items.data_ptr()),
-      reinterpret_cast<float*>(initial_state.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(beta_active.data_ptr()), static_cast<int>(total_work_items),
-      static_cast<int>(uniform_work_items), static_cast<int>(num_qk_heads),
-      static_cast<int>(num_v_heads), static_cast<int>(beta_active_stride), kChunk,
-      static_cast<float>(scale), static_cast<float>(lower_bound));
-  CheckCuda(cudaGetLastError(), "training forward launch");
-
-  PrepareFinalTensorMaps(q, k, v, g, final_output_scratch, final_descriptor_storage, total_tokens,
-                         num_qk_heads, num_v_heads, prepare_final_descriptors, stream);
-  ConfigureDynamicSmem(kernel_flashkda_blackwell_prefill_fp32_state_initial, kFinalSmemBytes,
-                       device_id, "cudaFuncSetAttribute(training final state)");
-  auto* final_maps =
-      reinterpret_cast<const FlashKDATrainingTensorMap*>(final_descriptor_storage.data_ptr());
-  kernel_flashkda_blackwell_prefill_fp32_state_initial<<<dim3(final_grid_ctas, 1, 1), 384,
-                                                         kFinalSmemBytes, stream>>>(
-      final_maps + 0, final_maps + 1, final_maps + 2, final_maps + 3, final_maps + 4,
-      reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()), reinterpret_cast<float*>(A_log.data_ptr()),
-      reinterpret_cast<float*>(dt_bias.data_ptr()),
-      reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
-      reinterpret_cast<float*>(initial_state.data_ptr()),
-      reinterpret_cast<float*>(final_state.data_ptr()),
-      reinterpret_cast<float*>(dummy_f32.data_ptr()), reinterpret_cast<int*>(dummy_i32.data_ptr()),
-      reinterpret_cast<uint8_t*>(final_tensormap_workspace.data_ptr()), 0,
-      static_cast<float>(scale), static_cast<int>(num_sequences), static_cast<int>(num_qk_heads),
-      static_cast<int>(num_v_heads), static_cast<int>(num_sequences * num_v_heads),
-      static_cast<float>(lower_bound));
-  CheckCuda(cudaGetLastError(), "training final-state launch");
+  if (!has_partial_tail) {
+    ConfigureDynamicSmem(kernel_cake_flashkda_forward_checkpoint_c16_aligned, kForwardSmemBytes,
+                         device_id, "cudaFuncSetAttribute(aligned training forward)");
+    kernel_cake_flashkda_forward_checkpoint_c16_aligned<<<grid, 512, kForwardSmemBytes, stream>>>(
+        reinterpret_cast<unsigned int*>(counters.data_ptr()), q_map, k_map, v_map, g_map,
+        reinterpret_cast<__nv_bfloat16*>(g.data_ptr()), out_map, checkpoint_map,
+        reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(beta_active.data_ptr()),
+        reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
+        reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
+        reinterpret_cast<long long*>(checkpoint_cu_starts.data_ptr()),
+        reinterpret_cast<int*>(work_items.data_ptr()),
+        reinterpret_cast<float*>(initial_state.data_ptr()),
+        reinterpret_cast<float*>(final_state.data_ptr()), static_cast<int>(total_work_items),
+        static_cast<int>(uniform_work_items), static_cast<int>(num_qk_heads),
+        static_cast<int>(num_v_heads), static_cast<int>(beta_active_stride), kChunk,
+        static_cast<float>(scale), static_cast<float>(lower_bound));
+    CheckCuda(cudaGetLastError(), "aligned training forward launch");
+  } else {
+    ConfigureDynamicSmem(kernel_flashkda_forward_checkpoint_c16, kForwardSmemBytes, device_id,
+                         "cudaFuncSetAttribute(partial training forward)");
+    kernel_flashkda_forward_checkpoint_c16<<<grid, 512, kForwardSmemBytes, stream>>>(
+        reinterpret_cast<unsigned int*>(counters.data_ptr()), q_map, k_map, v_map, g_map,
+        reinterpret_cast<__nv_bfloat16*>(g.data_ptr()), out_map,
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), checkpoint_map,
+        reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(beta_active.data_ptr()),
+        reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
+        reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
+        reinterpret_cast<long long*>(checkpoint_cu_starts.data_ptr()),
+        reinterpret_cast<int*>(work_items.data_ptr()),
+        reinterpret_cast<float*>(initial_state.data_ptr()),
+        reinterpret_cast<float*>(final_state.data_ptr()), static_cast<int>(total_work_items),
+        static_cast<int>(uniform_work_items), static_cast<int>(num_qk_heads),
+        static_cast<int>(num_v_heads), static_cast<int>(beta_active_stride), kChunk,
+        static_cast<float>(scale), static_cast<float>(lower_bound));
+    CheckCuda(cudaGetLastError(), "partial training forward launch");
+  }
 }
 
 void RunTrainingBackward(TensorView q, TensorView k, TensorView v, TensorView g, TensorView A_log,
@@ -372,6 +400,10 @@ void RunTrainingBackward(TensorView q, TensorView k, TensorView v, TensorView g,
   TVM_FFI_ICHECK(total_work_items > 0 && total_tokens > 0 && num_sequences > 0 &&
                  num_qk_heads > 0 && num_v_heads >= num_qk_heads &&
                  num_v_heads % num_qk_heads == 0 && total_chunks > 0);
+  TVM_FFI_ICHECK(total_chunks <= std::numeric_limits<int64_t>::max() / kChunk);
+  const int64_t tiled_tokens = total_chunks * kChunk;
+  TVM_FFI_ICHECK(tiled_tokens >= total_tokens);
+  const bool has_partial_tail = tiled_tokens != total_tokens;
 
   for (const auto& named : std::initializer_list<std::pair<TensorView*, const char*>>{
            {&q, "q"},
@@ -453,10 +485,9 @@ void RunTrainingBackward(TensorView q, TensorView k, TensorView v, TensorView g,
   CUtensorMap dv_map = EncodeTokenMap(dv, "dv", total_tokens, num_v_heads);
   CUtensorMap beta_map = EncodeBetaMap(beta_active, total_tokens, beta_active_stride);
   const dim3 grid(std::min<int64_t>(total_work_items, ResidentCtas(device_id)), 1, 1);
-  ConfigureDynamicSmem(kernel_flashkda_backward_persistent_c16, kBackwardSmemBytes, device_id,
-                       "cudaFuncSetAttribute(training backward)");
   auto* dynamic_counter = reinterpret_cast<unsigned int*>(counters.data_ptr()) + 1;
   auto* dfinal_state_ptr = reinterpret_cast<float*>(dfinal_state.data_ptr());
+  auto* dv_ptr = reinterpret_cast<__nv_bfloat16*>(dv.data_ptr());
   auto* dq_value_heads_ptr = reinterpret_cast<__nv_bfloat16*>(dq_value_heads.data_ptr());
   auto* dk_value_heads_ptr = reinterpret_cast<__nv_bfloat16*>(dk_value_heads.data_ptr());
   auto* dlog_decay_ptr = reinterpret_cast<float*>(dlog_decay.data_ptr());
@@ -489,6 +520,7 @@ void RunTrainingBackward(TensorView q, TensorView k, TensorView v, TensorView g,
       &state_map,
       &dfinal_state_ptr,
       &dv_map,
+      &dv_ptr,
       &dq_value_heads_ptr,
       &dk_value_heads_ptr,
       &dlog_decay_ptr,
@@ -526,30 +558,113 @@ void RunTrainingBackward(TensorView q, TensorView k, TensorView v, TensorView g,
       &scale_arg,
       &lower_bound_arg,
   };
-  CheckCuda(cudaLaunchKernel(reinterpret_cast<const void*>(kernel_flashkda_backward_persistent_c16),
-                             grid, dim3(512, 1, 1), kernel_args, kBackwardSmemBytes, stream),
-            "training backward launch");
+  if (!has_partial_tail) {
+    void* aligned_kernel_args[] = {
+        &dynamic_counter,
+        &q_map,
+        &k_map,
+        &g_map,
+        &do_map,
+        &v_map,
+        &state_map,
+        &dfinal_state_ptr,
+        &dv_map,
+        &dq_value_heads_ptr,
+        &dk_value_heads_ptr,
+        &dlog_decay_ptr,
+        &dlog_boundary_ptr,
+        &dinitial_state_ptr,
+        &A_log_ptr,
+        &dt_bias_ptr,
+        &beta_map,
+        &dbeta_active_ptr,
+        &cu_seqlens_ptr,
+        &checkpoint_cu_starts_ptr,
+        &work_items_ptr,
+        &visits_ptr,
+        &diagnostic,
+        &diagnostic,
+        &diagnostic,
+        &diagnostic,
+        &diagnostic,
+        &diagnostic,
+        &diagnostic,
+        &diagnostic,
+        &diagnostic,
+        &diagnostic,
+        &diagnostic,
+        &diagnostic,
+        &diagnostic,
+        &diagnostic,
+        &total_work_items_arg,
+        &uniform_work_items_arg,
+        &total_chunks_arg,
+        &num_qk_heads_arg,
+        &num_v_heads_arg,
+        &enable_kk,
+        &enable_tinv,
+        &scale_arg,
+        &lower_bound_arg,
+    };
+    ConfigureDynamicSmem(kernel_cake_flashkda_backward_persistent_c16_aligned, kBackwardSmemBytes,
+                         device_id, "cudaFuncSetAttribute(aligned training backward)");
+    CheckCuda(
+        cudaLaunchKernel(
+            reinterpret_cast<const void*>(kernel_cake_flashkda_backward_persistent_c16_aligned),
+            grid, dim3(512, 1, 1), aligned_kernel_args, kBackwardSmemBytes, stream),
+        "aligned training backward launch");
+  } else {
+    ConfigureDynamicSmem(kernel_flashkda_backward_persistent_c16, kBackwardSmemBytes, device_id,
+                         "cudaFuncSetAttribute(partial training backward)");
+    CheckCuda(
+        cudaLaunchKernel(reinterpret_cast<const void*>(kernel_flashkda_backward_persistent_c16),
+                         grid, dim3(512, 1, 1), kernel_args, kBackwardSmemBytes, stream),
+        "partial training backward launch");
+  }
 
-  ConfigureDynamicSmem(kernel_flashkda_backward_param_reduce_c16_partial, kReduceSmemBytes,
-                       device_id, "cudaFuncSetAttribute(training parameter reduction)");
-  kernel_flashkda_backward_param_reduce_c16_partial<<<dim3(128, num_v_heads, 1), 128,
-                                                      kReduceSmemBytes, stream>>>(
-      reinterpret_cast<__nv_bfloat16*>(g.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(beta_active.data_ptr()),
-      reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
-      reinterpret_cast<float*>(dlog_decay.data_ptr()),
-      reinterpret_cast<float*>(dlog_boundary.data_ptr()),
-      reinterpret_cast<float*>(dbeta_active.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(dg.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(dbeta.data_ptr()),
-      reinterpret_cast<float*>(gate_part_a.data_ptr()),
-      reinterpret_cast<float*>(gate_part_dt.data_ptr()),
-      reinterpret_cast<unsigned int*>(counters.data_ptr()) + 2,
-      reinterpret_cast<float*>(dA_log.data_ptr()), reinterpret_cast<float*>(ddt_bias.data_ptr()),
-      static_cast<int>(total_tokens), static_cast<int>(num_v_heads),
-      static_cast<int>(beta_active_stride), static_cast<int>((total_tokens + 127) / 128),
-      static_cast<float>(lower_bound));
-  CheckCuda(cudaGetLastError(), "training parameter-reduction launch");
+  if (!has_partial_tail) {
+    ConfigureDynamicSmem(kernel_cake_flashkda_backward_param_reduce_c16_aligned, kReduceSmemBytes,
+                         device_id, "cudaFuncSetAttribute(aligned training parameter reduction)");
+    kernel_cake_flashkda_backward_param_reduce_c16_aligned<<<dim3(128, num_v_heads, 1), 128,
+                                                             kReduceSmemBytes, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(g.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(beta_active.data_ptr()),
+        reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
+        reinterpret_cast<float*>(dlog_decay.data_ptr()),
+        reinterpret_cast<float*>(dlog_boundary.data_ptr()),
+        reinterpret_cast<float*>(dbeta_active.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(dg.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(dbeta.data_ptr()),
+        reinterpret_cast<float*>(gate_part_a.data_ptr()),
+        reinterpret_cast<float*>(gate_part_dt.data_ptr()),
+        reinterpret_cast<unsigned int*>(counters.data_ptr()) + 2,
+        reinterpret_cast<float*>(dA_log.data_ptr()), reinterpret_cast<float*>(ddt_bias.data_ptr()),
+        static_cast<int>(total_tokens), static_cast<int>(num_v_heads),
+        static_cast<int>(beta_active_stride), static_cast<int>((total_tokens + 127) / 128),
+        static_cast<float>(lower_bound));
+    CheckCuda(cudaGetLastError(), "aligned training parameter-reduction launch");
+  } else {
+    ConfigureDynamicSmem(kernel_flashkda_backward_param_reduce_c16_partial, kReduceSmemBytes,
+                         device_id, "cudaFuncSetAttribute(partial training parameter reduction)");
+    kernel_flashkda_backward_param_reduce_c16_partial<<<dim3(128, num_v_heads, 1), 128,
+                                                        kReduceSmemBytes, stream>>>(
+        reinterpret_cast<__nv_bfloat16*>(g.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(beta_active.data_ptr()),
+        reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
+        reinterpret_cast<float*>(dlog_decay.data_ptr()),
+        reinterpret_cast<float*>(dlog_boundary.data_ptr()),
+        reinterpret_cast<float*>(dbeta_active.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(dg.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(dbeta.data_ptr()),
+        reinterpret_cast<float*>(gate_part_a.data_ptr()),
+        reinterpret_cast<float*>(gate_part_dt.data_ptr()),
+        reinterpret_cast<unsigned int*>(counters.data_ptr()) + 2,
+        reinterpret_cast<float*>(dA_log.data_ptr()), reinterpret_cast<float*>(ddt_bias.data_ptr()),
+        static_cast<int>(total_tokens), static_cast<int>(num_v_heads),
+        static_cast<int>(beta_active_stride), static_cast<int>((total_tokens + 127) / 128),
+        static_cast<float>(lower_bound));
+    CheckCuda(cudaGetLastError(), "partial training parameter-reduction launch");
+  }
 
   if (grouped != 0) {
     kernel_flashkda_grouped_qk_reduce<<<dim3((total_tokens + 15) / 16, num_qk_heads, 1), 128, 0,
@@ -570,3 +685,9 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_training_forward,
                               flashinfer::flash_kda_training_paired::RunTrainingForward);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_training_backward,
                               flashinfer::flash_kda_training_paired::RunTrainingBackward);
+
+// The content digest is part of the filename so this included device program
+// participates in the JIT module identity through this translation unit.
+namespace cake_kda_aligned_backward_program {
+#include "cake_aligned_training_export/cake_flashkda_training_c16_aligned_backward_0f8187e742.cu"
+}

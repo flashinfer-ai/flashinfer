@@ -2186,6 +2186,19 @@ def _log_function_outputs(func_name: str, result: Any, level: int) -> None:
 # all registered templates without requiring manual maintenance.
 _TRACE_REGISTRY: List[Tuple[Callable, Any, str]] = []
 
+_TRACE_FI_API_ALIASES = {
+    "flashinfer.mla._batch_mla._wrapper.BatchMLAPagedAttentionWrapper.run": (
+        "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run"
+    ),
+}
+
+
+def _trace_fi_api_for(original: Callable) -> str:
+    module = getattr(original, "__module__", "") or ""
+    qualname = getattr(original, "__qualname__", "") or ""
+    fi_api = f"{module}.{qualname}" if module else qualname
+    return _TRACE_FI_API_ALIASES.get(fi_api, fi_api)
+
 
 def _attach_fi_trace(
     wrapped: Callable,
@@ -2220,10 +2233,7 @@ def _attach_fi_trace(
                 _is_trace_dump_enabled,
             )
 
-            # New interface: derive fi_api from the function's module + qualname.
-            module = getattr(original, "__module__", "") or ""
-            qualname = getattr(original, "__qualname__", "") or ""
-            fi_api = f"{module}.{qualname}" if module else qualname
+            fi_api = _trace_fi_api_for(original)
 
             fi_init_fn: Optional[Callable] = None
             if isinstance(trace_template, TraceTemplate):
