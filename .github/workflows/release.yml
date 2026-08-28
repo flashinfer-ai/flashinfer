@@ -231,8 +231,8 @@ jobs:
           FLASHINFER_CUDA_ARCH_LIST: ${{ matrix.arch == 'aarch64' && matrix.cuda.aarch64_arch_list || matrix.cuda.x86_64_arch_list }}
           FLASHINFER_LOCAL_VERSION: ${{ matrix.cuda.label }}
           PYTORCH_INDEX: ${{ matrix.cuda.pytorch_index }}
-          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET }}
-          SCCACHE_REGION: ${{ vars.SCCACHE_REGION }}
+          SCCACHE_BUCKET: ${{ vars.SCCACHE_BUCKET || 'flashinfer-build-cache' }}
+          SCCACHE_REGION: ${{ vars.SCCACHE_REGION || 'us-west-2' }}
         run: |
           # Extract CUDA major and minor versions
           IFS=. read -r CUDA_MAJOR CUDA_MINOR <<< "${CUDA_VERSION}"
