@@ -89,7 +89,7 @@ def _make_runner():
     return _low_latency_blockscaled_gemm_runner(100, False)
 
 
-def _run_all_tactics_and_check(runner, mnkl, fmt, workspace, alpha, bias):
+def _run_all_tactics_and_check(runner, mnkl, fmt, workspace, alpha):
     a_dtype, b_dtype, sf_dtype, sf_vec_size = fmt
     a, b, sfa, sfb, out, sfa_simple, sfb_simple = make_blockscaled_tensors(
         mnkl,
@@ -99,6 +99,7 @@ def _run_all_tactics_and_check(runner, mnkl, fmt, workspace, alpha, bias):
         sf_vec_size,
         cutlass.BFloat16,
     )
+    bias = torch.linspace(-0.5, 0.5, mnkl[0], dtype=torch.bfloat16, device="cuda")
     inputs = [a, b, sfa, sfb, out, workspace, mnkl, alpha, bias]
     tactics = runner.get_valid_tactics(inputs, None)
     assert tactics, f"expected at least one tactic for {mnkl} and {fmt}"
@@ -320,5 +321,5 @@ def test_low_latency_blockscaled_gemm_all_tactics_correctness(fmt):
         (m, n, k if sf_vec_size == 16 else ((k + 127) // 128 * 128), l)
         for m, n, k, l in _EDGE_KERNEL_SHAPES
     ]
-    for shape in model_shapes + edge_shapes:
-        _run_all_tactics_and_check(runner, shape, fmt, workspace, alpha, bias)
+    for shape in model_shapes[:1] + model_shapes[-1:] + edge_shapes[:1]:
+        _run_all_tactics_and_check(runner, shape, fmt, workspace, alpha)

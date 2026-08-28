@@ -65,6 +65,10 @@ def _blockscaled_tgv_case(m, n, k, a_dtype, b_dtype, sf_dtype, sf_vec_size):
 @pytest.mark.parametrize("m,n,k,a_dtype,b_dtype,sf_dtype,sf_vec_size", _TGV_GEMM_CASES)
 def test_tgv_gemm_sm100(m, n, k, a_dtype, b_dtype, sf_dtype, sf_vec_size):
     """Test tgv_gemm_sm100 with autotuner integration."""
+    device = torch.device("cuda")
+    if not _match_sm_version(device, ["100", "103"]):
+        pytest.skip("TGV GEMM requires SM100, SM103 architecture")
+
     if sf_dtype is not None:
         a, b, a_descale, b_descale, bias, reference = _blockscaled_tgv_case(
             m, n, k, a_dtype, b_dtype, sf_dtype, sf_vec_size
@@ -88,12 +92,9 @@ def test_tgv_gemm_sm100(m, n, k, a_dtype, b_dtype, sf_dtype, sf_vec_size):
         torch.testing.assert_close(result_pdl.cpu(), reference, atol=1e-1, rtol=1e-3)
         return
 
-    A = torch.randn(m, k, device="cuda", dtype=a_dtype)
-    B = torch.randn(n, k, device="cuda", dtype=b_dtype).t()  # column major
-    bias = torch.randn(n, device="cuda", dtype=a_dtype)
-
-    if not _match_sm_version(A.device, ["100", "103"]):
-        pytest.skip("TGV GEMM requires SM100, SM103 architecture")
+    A = torch.randn(m, k, device=device, dtype=a_dtype)
+    B = torch.randn(n, k, device=device, dtype=b_dtype).t()  # column major
+    bias = torch.randn(n, device=device, dtype=a_dtype)
 
     print(
         f"Input tensors: A {A.shape}, B {B.shape}, bias {bias.shape}, dtype: {A.dtype}",

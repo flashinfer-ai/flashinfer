@@ -4846,7 +4846,7 @@ def mm_fp8(
         scale_sizes = [((rows + 127) // 128) * (k // 128) * 512 for rows in (n, m)]
         workspace = _get_cache_buf(
             "mm_fp8_low_latency_workspace",
-            max(DEFAULT_WORKSPACE_SIZE, sum(scale_sizes)),
+            DEFAULT_WORKSPACE_SIZE + sum(scale_sizes),
             a.device,
         )
         neutral_scales = (
@@ -4864,7 +4864,7 @@ def mm_fp8(
             b_descale,
             a_descale,
             out.T,
-            workspace,
+            workspace[sum(scale_sizes) :],
             (n, m, k, 1),
             alpha,
             None,
@@ -6339,6 +6339,10 @@ def _cute_dsl_gemm_fp4_requirement(
     # preparation for 128x4 layout.
     if use_8x4_sf_layout:
         raise ValueError("cute_dsl FP4 GEMM only supports 128x4 scale factor layout.")
+    if b.shape[1] % 8 != 0:
+        if backend != "cute-dsl":
+            return False
+        raise ValueError(f"CuTe-DSL FP4 GEMM requires N % 8 == 0, got n={b.shape[1]}")
     _check_cute_dsl_availability()
     return True
 
@@ -6451,8 +6455,8 @@ def _low_latency_blockscaled_gemm_runner(
                 None,
             ]
             dtypes = (
-                cutlass.Float8E4M3FN,
-                cutlass.Float8E4M3FN,
+                torch_to_cutlass_dtype(b.dtype),
+                torch_to_cutlass_dtype(a.dtype),
                 cutlass.Float8E8M0FNU,
                 32,
             )
