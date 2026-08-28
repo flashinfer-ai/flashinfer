@@ -342,14 +342,19 @@ def _make_decode_scratch(
     # the kernel uses or the grid covers only part of each candidate list.
     bi = 32 if d_v == 1024 else 64
     num_splits = (topk + bi - 1) // bi + (extra_topk + bi - 1) // bi
+    # The runtime-H decode kernels HPB-align the scratch head dim (the
+    # dedicated num_heads=8 instantiation keeps the true count).
+    from flashinfer.mla._sparse_mla_sm120_plan import _decode_scratch_heads
+
+    scratch_heads = _decode_scratch_heads(num_heads)
     return (
         torch.empty(
-            (num_tokens, num_heads, num_splits, d_v),
+            (num_tokens, scratch_heads, num_splits, d_v),
             dtype=torch.bfloat16,
             device=device,
         ),
         torch.empty(
-            (num_tokens, num_heads, num_splits),
+            (num_tokens, scratch_heads, num_splits),
             dtype=torch.float32,
             device=device,
         ),
@@ -374,6 +379,12 @@ _DSV4_DECODE_CONFIGS = [
     (128, 192),
     (128, 256),
     (128, 1024),
+    # Runtime-H instantiation: arbitrary head counts ride the NUM_HEADS=0
+    # kernel (zero-Q-padded tile, HPB-aligned scratch). 12 exercises the
+    # in-block pad path, 24 a remainder second block, 80 an exact multiple.
+    (12, 512),
+    (24, 256),
+    (80, 128),
 ]
 
 
@@ -1121,6 +1132,8 @@ def test_sparse_mla_sm120_decode_dsv4_dual_large_extra_topk() -> None:
 
 
 _DSV3_2_DECODE_HEADS = [8, 16, 32, 64, 128]
+# Runtime-H decode-dsv3_2: arbitrary head counts (remainder-block pad path).
+_DSV3_2_DECODE_RUNTIME_HEADS = [12, 24]
 
 
 @pytest.mark.parametrize("num_heads", _DSV3_2_DECODE_HEADS)
@@ -1183,6 +1196,64 @@ def test_sparse_mla_sm120_decode_dsv3_2(
         sm_scale,
         d_v=d_v,
         attn_sink=attn_sink,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("num_heads", _DSV3_2_DECODE_RUNTIME_HEADS)
+@pytest.mark.parametrize("num_tokens", [1, 64])
+def test_sparse_mla_sm120_decode_dsv3_2_runtime_h(
+    num_heads: int, num_tokens: int
+) -> None:
+    """DSv3.2 decode at arbitrary head counts (runtime-H instantiation)."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v = 576, 512
+    topk = 2048
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv3_2(kv_bf16)
+    kv_dequant = dequantize_kv_dsv3_2(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+
+    sm_scale = d_qk**-0.5
+
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
         mid_out=mid_out,
         mid_lse=mid_lse,
     )

@@ -75,12 +75,19 @@ def test_supported_configs_families() -> None:
     assert dsv4.d_qk == 512
     assert dsv4.page_block_size == 64
     assert dsv4.max_num_tokens == _DECODE_MAX_TOKENS
-    assert dsv4.head_topk_pairs == _DECODE_DSV4_DISPATCH
+    assert dsv4.max_num_heads == 128
+    assert dsv4.topks == frozenset({128, 192, 256, 512, 1024})
+    # The eligibility frozenset is the full [1, 128] x topks product; vLLM
+    # probes its membership directly.
+    expected_dsv4 = frozenset((h, k) for h in range(1, 129) for k in dsv4.topks)
+    assert expected_dsv4 == _DECODE_DSV4_DISPATCH
 
     dsv3_2 = configs["dsv3_2"]
     assert dsv3_2.d_qk == 576
     assert dsv3_2.page_block_size == 64
-    assert dsv3_2.head_topk_pairs == _DECODE_DSV3_2_DISPATCH
+    assert dsv3_2.topks == frozenset({128, 512, 1024, 2048})
+    expected_dsv3_2 = frozenset((h, k) for h in range(1, 129) for k in dsv3_2.topks)
+    assert expected_dsv3_2 == _DECODE_DSV3_2_DISPATCH
 
     # GLM-NSA shares the DSv3.2 decode instantiations (same config object).
     assert configs["glm_nsa"] is dsv3_2
@@ -88,12 +95,16 @@ def test_supported_configs_families() -> None:
     glm53 = configs["glm53_nope"]
     assert glm53.d_qk == 512
     assert glm53.page_block_size == 64
-    assert glm53.head_topk_pairs == _DECODE_GLM53_NOPE_DISPATCH
+    assert glm53.topks == frozenset({2176})
+    expected_nope = frozenset((h, 2176) for h in range(1, 129))
+    assert expected_nope == _DECODE_GLM53_NOPE_DISPATCH
 
     dots3_swa = configs["dots3_swa"]
     assert dots3_swa.d_qk == 1088
     assert dots3_swa.page_block_size == 64
-    assert dots3_swa.head_topk_pairs == _DECODE_DOTS3_SWA_DISPATCH
+    assert dots3_swa.topks == frozenset({576})
+    expected_swa = frozenset((h, 576) for h in range(1, 129))
+    assert expected_swa == _DECODE_DOTS3_SWA_DISPATCH
 
     # The lazy export resolves through the public flashinfer.mla namespace.
     assert (
@@ -107,10 +118,12 @@ def test_supported_configs_families() -> None:
 def test_supported_helpers() -> None:
     """supported_num_heads / supported_topk return sorted tuples."""
     dsv4 = supported_sparse_mla_sm120_configs()["dsv4"]
-    assert dsv4.supported_num_heads() == (8, 16, 32, 64, 128)
+    # Runtime-H instantiation: every head count in [1, 128] is served.
+    assert dsv4.supported_num_heads() == tuple(range(1, 129))
     assert dsv4.supported_topk(64) == (128, 192, 256, 512, 1024)
     assert dsv4.supported_topk() == (128, 192, 256, 512, 1024)
-    assert dsv4.supported_topk(48) == ()
+    assert dsv4.supported_topk(48) == (128, 192, 256, 512, 1024)  # any H <= 128
+    assert dsv4.supported_topk(256) == ()  # beyond the runtime-H ceiling
 
     dsv3_2 = supported_sparse_mla_sm120_configs()["dsv3_2"]
     assert dsv3_2.supported_topk(64) == (128, 512, 1024, 2048)
@@ -120,13 +133,13 @@ def test_supports_decode_matches_dispatch_predicates() -> None:
     """config.supports_decode agrees with the internal dispatch predicates."""
     configs = supported_sparse_mla_sm120_configs()
     dsv4 = configs["dsv4"]
-    for num_heads, topk in sorted(dsv4.head_topk_pairs):
+    for num_heads, topk in sorted(_DECODE_DSV4_DISPATCH):
         assert dsv4.supports_decode(num_heads, topk)
         assert _decode_dsv4_dispatchable(1, num_heads, topk, 512, 64)
         assert _decode_dsv4_dispatchable(_DECODE_MAX_TOKENS, num_heads, topk, 512, 64)
 
     dsv3_2 = configs["dsv3_2"]
-    for num_heads, topk in sorted(dsv3_2.head_topk_pairs):
+    for num_heads, topk in sorted(_DECODE_DSV3_2_DISPATCH):
         assert dsv3_2.supports_decode(num_heads, topk)
         assert _decode_dsv3_2_dispatchable(1, num_heads, topk, 576, 64)
 
@@ -135,7 +148,8 @@ def test_supports_decode_rejects_mismatches() -> None:
     """supports_decode is False for any out-of-set shape parameter."""
     dsv4 = supported_sparse_mla_sm120_configs()["dsv4"]
     assert not dsv4.supports_decode(64, 384)  # topk not instantiated
-    assert not dsv4.supports_decode(48, 256)  # num_heads not instantiated
+    assert not dsv4.supports_decode(256, 256)  # num_heads past the runtime-H ceiling
+    assert dsv4.supports_decode(48, 256)  # arbitrary H <= 128 rides runtime-H
     assert not dsv4.supports_decode(64, 256, page_block_size=32)
     assert not dsv4.supports_decode(64, 256, num_tokens=_DECODE_MAX_TOKENS + 1)
     assert dsv4.supports_decode(64, 256, num_tokens=_DECODE_MAX_TOKENS)
@@ -154,7 +168,7 @@ def test_error_message_names_topk_mismatch() -> None:
         model_type=_MODEL_TYPE_DSV4,
         extra_topk=0,
     )
-    assert "topk=384 is not instantiated for num_heads=64" in msg
+    assert "topk=384 is not instantiated for the dsv4 decode family" in msg
     assert "available topk: [128, 192, 256, 512, 1024]" in msg
     assert "prefill envelope both reject" in msg
     assert "supported_sparse_mla_sm120_configs" in msg
@@ -163,33 +177,32 @@ def test_error_message_names_topk_mismatch() -> None:
 
 
 def test_error_message_names_num_heads_mismatch() -> None:
-    """An uninstantiated head count is named with the available ones."""
+    """A head count past the runtime-H ceiling names the envelope."""
     msg = _decode_dispatch_error_message(
         num_tokens=1,
-        num_heads=48,
+        num_heads=256,
         topk=256,
         d_qk=512,
         page_block_size=64,
         model_type=_MODEL_TYPE_DSV4,
         extra_topk=0,
     )
-    assert "num_heads=48 is not instantiated for topk=256" in msg
-    assert "available num_heads: [8, 16, 32, 64, 128]" in msg
+    assert "num_heads=256 exceeds the decode envelope [1, 128]" in msg
 
 
 def test_error_message_names_both_mismatches() -> None:
     """Both num_heads and topk out of set are reported together."""
     msg = _decode_dispatch_error_message(
         num_tokens=1,
-        num_heads=48,
+        num_heads=256,
         topk=384,
         d_qk=512,
         page_block_size=64,
         model_type=_MODEL_TYPE_DSV4,
         extra_topk=0,
     )
-    assert "neither num_heads=48 nor topk=384 is instantiated" in msg
-    assert "available num_heads: [8, 16, 32, 64, 128]" in msg
+    assert "topk=384 is not instantiated for the dsv4 decode family" in msg
+    assert "num_heads=256 exceeds the decode envelope [1, 128]" in msg
     assert "available topk: [128, 192, 256, 512, 1024]" in msg
 
 
@@ -226,7 +239,7 @@ def test_error_message_dsv3_2_family() -> None:
             extra_topk=0,
         )
         assert f"model_type={family}" in msg
-        assert "topk=192 is not instantiated for num_heads=128" in msg
+        assert "topk=192 is not instantiated for the " in msg
         assert "available topk: [128, 512, 1024, 2048]" in msg
 
 
@@ -291,11 +304,12 @@ def test_plan_uninstantiated_goes_prefill(known_crossover) -> None:
 def test_plan_neither_envelope_returns_none(known_crossover) -> None:
     """A shape rejected by both envelopes plans to None (caller raises)."""
     plan_mod, _ = known_crossover
-    # num_heads=48 is in no instantiation.
+    # num_heads=256 is past the runtime-H decode ceiling (128) and outside
+    # every prefill head set.
     assert (
         plan_mod.plan(
             8,
-            48,
+            256,
             2048,
             _MODEL_TYPE_DSV3_2,
             64,
@@ -324,6 +338,40 @@ def test_plan_unknown_crossover_keeps_decode(known_crossover) -> None:
         assert planned is not None
         assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
         assert planned.cpb == -1  # no calibrated constants
+
+
+def test_plan_arbitrary_num_heads_rides_runtime_h(known_crossover) -> None:
+    """Off-grid head counts (runtime-H instantiation) plan to DECODE_SPLITK
+    with the decode-first default (no calibrated crossover entry)."""
+    plan_mod, _ = known_crossover
+    for num_heads in (12, 24, 80):
+        planned = plan_mod.plan(
+            4,
+            num_heads,
+            256,
+            _MODEL_TYPE_DSV4,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+        )
+        assert planned is not None
+        assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
+        assert planned.cpb == -1  # no calibrated constants
+    # Past the runtime-H ceiling neither envelope serves the shape.
+    assert (
+        plan_mod.plan(
+            4,
+            256,
+            256,
+            _MODEL_TYPE_DSV4,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+        )
+        is None
+    )
 
 
 def test_plan_honors_crossover(known_crossover) -> None:
