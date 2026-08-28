@@ -344,25 +344,38 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
     bf16* kv_rope_dst = sm.kv_rope(buf);
     uint8_t* kv_sc_dst = sm.kv_sc(buf);
 
+    // Per-lane entries (BI / IO_THREADS, compile-time): read each candidate's
+    // index exactly once into registers — both the scale gather and the bulk
+    // issues below derive from them. The per-lane index loads issue
+    // back-to-back, as do the scale loads, so each round trip is paid once
+    // per chunk instead of twice serialized.
+    constexpr int EPW = Cfg::BI / Cfg::IO_THREADS;
+    static_assert(Cfg::BI % Cfg::IO_THREADS == 0, "IO lanes must split BI evenly");
+    int idx_raw[EPW];
 #pragma unroll
-    for (int eo = 0; eo < Cfg::BI; eo += Cfg::IO_THREADS) {
-      const int entry_idx = eo + lane;
-      if (entry_idx >= Cfg::BI) break;
-      const int cand_pos = g_start + entry_idx;
-      const bool is_valid_cand = (cand_pos < g_end);
-      const int idx_raw = is_valid_cand ? section_idx_base[cand_pos] : -1;
-      uint64_t scale_word = 0;
-      if (idx_raw >= 0) {
-        const int idx = idx_raw;
+    for (int e = 0; e < EPW; e++) {
+      const int cand_pos = g_start + e * Cfg::IO_THREADS + lane;
+      idx_raw[e] = (cand_pos < g_end) ? section_idx_base[cand_pos] : -1;
+    }
+
+    uint64_t scale_word[EPW];
+#pragma unroll
+    for (int e = 0; e < EPW; e++) {
+      scale_word[e] = 0;
+      if (idx_raw[e] >= 0) {
+        const int idx = idx_raw[e];
         const int block_idx_g = idx / section_pbs;
         const int local_idx_g = idx - block_idx_g * section_pbs;
         const uint8_t* scale_base = section_kv + (size_t)block_idx_g * section_stride +
                                     (size_t)section_pbs * IO_STRIDE +
                                     (size_t)local_idx_g * SCALE_BYTES_PER_TOKEN;
-        scale_word = __ldg(reinterpret_cast<const uint64_t*>(scale_base));
+        scale_word[e] = __ldg(reinterpret_cast<const uint64_t*>(scale_base));
       }
-      *reinterpret_cast<uint64_t*>(kv_sc_dst + (size_t)entry_idx * SCALE_BYTES_PER_TOKEN) =
-          scale_word;
+    }
+#pragma unroll
+    for (int e = 0; e < EPW; e++) {
+      *reinterpret_cast<uint64_t*>(kv_sc_dst + (size_t)(e * Cfg::IO_THREADS + lane) *
+                                                   SCALE_BYTES_PER_TOKEN) = scale_word[e];
     }
     __threadfence_block();
 
@@ -374,12 +387,9 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
     // Bulk completion decrements mbar tx; phase flips when arrival count
     // (1, by leader above) AND tx=0 both met.
 #pragma unroll
-    for (int eo = 0; eo < Cfg::BI; eo += Cfg::IO_THREADS) {
-      const int entry_idx = eo + lane;
-      if (entry_idx >= Cfg::BI) break;
-      const int cand_pos = g_start + entry_idx;
-      const int idx_raw = (cand_pos < g_end) ? section_idx_base[cand_pos] : -1;
-      const int idx = (idx_raw >= 0) ? idx_raw : 0;
+    for (int e = 0; e < EPW; e++) {
+      const int entry_idx = e * Cfg::IO_THREADS + lane;
+      const int idx = (idx_raw[e] >= 0) ? idx_raw[e] : 0;
       const int block_idx_g = idx / section_pbs;
       const int local_idx_g = idx - block_idx_g * section_pbs;
       const uint8_t* data_base =
