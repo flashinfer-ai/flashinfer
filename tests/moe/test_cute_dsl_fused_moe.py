@@ -1921,6 +1921,130 @@ class TestCuteDslMoEWrapper:
 
     pytestmark = _requires_dsl_arch
 
+    @staticmethod
+    def _caller_output_case(quant_mode: str, *, use_cuda_graph: bool = False):
+        from flashinfer import CuteDslMoEWrapper
+
+        num_tokens, hidden_size, intermediate_size = 128, 256, 512
+        num_experts, top_k = 256, 2
+        tensors = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+        )
+        api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, quant_mode)
+        moe = CuteDslMoEWrapper(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            use_cuda_graph=use_cuda_graph,
+            quant_mode=quant_mode,
+        )
+        run_kwargs = dict(
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            **api_inputs,
+        )
+        return moe, run_kwargs, num_tokens, hidden_size
+
+    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
+    def test_wrapper_caller_owned_output(self, quant_mode: str):
+        """Both wrapper runners write into caller-owned final storage."""
+        moe, run_kwargs, num_tokens, hidden_size = self._caller_output_case(quant_mode)
+        output = torch.full(
+            (num_tokens, hidden_size),
+            float("nan"),
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+
+        result = moe.run(**run_kwargs, moe_output=output)
+
+        assert result.data_ptr() == output.data_ptr()
+        assert not torch.isnan(result).any()
+        assert not torch.isinf(result).any()
+
+    @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
+    def test_wrapper_caller_owned_output_cuda_graph(self, quant_mode: str):
+        """Caller-owned final storage remains stable across graph replay."""
+        moe, run_kwargs, num_tokens, hidden_size = self._caller_output_case(
+            quant_mode, use_cuda_graph=True
+        )
+        output = torch.empty(
+            (num_tokens, hidden_size), device="cuda", dtype=torch.bfloat16
+        )
+        for _ in range(3):
+            result = moe.run(**run_kwargs, moe_output=output)
+        torch.cuda.synchronize()
+        assert result.data_ptr() == output.data_ptr()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = moe.run(**run_kwargs, moe_output=output)
+        assert captured.data_ptr() == output.data_ptr()
+
+        graph.replay()
+        torch.cuda.synchronize()
+        first = output.clone()
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert not torch.isnan(output).any()
+        assert (first - output).abs().max().item() < 0.5
+
+    @pytest.mark.parametrize(
+        "invalid_output,error_type,error_match",
+        [
+            ("shape", ValueError, "must have shape"),
+            ("dtype", TypeError, "must have dtype"),
+            ("device", ValueError, "must be on device"),
+            ("noncontiguous", ValueError, "must be contiguous"),
+            ("layout", ValueError, "must use torch.strided layout"),
+        ],
+    )
+    def test_wrapper_caller_owned_output_validation(
+        self, invalid_output: str, error_type: type[Exception], error_match: str
+    ):
+        """Reject caller output that cannot safely back the final kernel."""
+        moe, run_kwargs, num_tokens, hidden_size = self._caller_output_case("w4a4")
+        if invalid_output == "shape":
+            output = torch.empty(
+                (num_tokens + 1, hidden_size), device="cuda", dtype=torch.bfloat16
+            )
+        elif invalid_output == "dtype":
+            output = torch.empty(
+                (num_tokens, hidden_size), device="cuda", dtype=torch.float16
+            )
+        elif invalid_output == "device":
+            output = torch.empty(
+                (num_tokens, hidden_size), device="cpu", dtype=torch.bfloat16
+            )
+        elif invalid_output == "noncontiguous":
+            output = torch.empty(
+                (num_tokens, hidden_size * 2),
+                device="cuda",
+                dtype=torch.bfloat16,
+            )[:, ::2]
+        else:
+            output = torch.zeros(
+                (num_tokens, hidden_size),
+                device="cuda",
+                dtype=torch.bfloat16,
+            ).to_sparse()
+
+        with pytest.raises(error_type, match=error_match):
+            moe.run(**run_kwargs, moe_output=output)
+
     @pytest.mark.parametrize("num_tokens", [128, 256, 512])
     @pytest.mark.parametrize("use_fused_finalize", [False, True])
     @pytest.mark.parametrize(
