@@ -58,11 +58,26 @@ from .filtered_topk_util import (
 )
 
 
-def _get_num_sms() -> int:
-    """Return the number of SMs on the current device (cached)."""
-    if not hasattr(_get_num_sms, "_value"):
-        _get_num_sms._value = torch.cuda.get_device_properties().multi_processor_count
-    return _get_num_sms._value
+def _get_num_sms(device: torch.device | None = None) -> int:
+    """Return the number of SMs on ``device`` (default: current), cached.
+
+    Cached PER DEVICE: a single process-wide scalar would pin the first
+    caller's SM count and silently mis-size the persistent grid and the
+    large-occupancy mode decision for every later call on a different GPU of a
+    heterogeneous host. Call sites that have a tensor in scope pass its
+    device. DIVERGENCE FROM UPSTREAM (single ambient-device scalar), after
+    review (flashinfer PR #4621).
+    """
+    if device is not None and device.index is not None:
+        idx = device.index
+    else:
+        idx = torch.cuda.current_device()
+    cache = getattr(_get_num_sms, "_values", None)
+    if cache is None:
+        cache = _get_num_sms._values = {}
+    if idx not in cache:
+        cache[idx] = torch.cuda.get_device_properties(idx).multi_processor_count
+    return cache[idx]
 
 
 """
@@ -738,6 +753,7 @@ def _prepare_one_pass_topk(
             num_cols,
             num_rows,
             dtype == cutlass.Float32,
+            num_sms=_get_num_sms(input_values.device),
         )
     if cluster_size <= 0 or cluster_size > _SM100_MAX_CLUSTER_SIZE:
         raise ValueError(
@@ -746,7 +762,9 @@ def _prepare_one_pass_topk(
         )
 
     single_pass_multi_cta = cluster_size > 1
-    large_occupancy = not single_pass_multi_cta and num_rows > _get_num_sms()
+    large_occupancy = not single_pass_multi_cta and num_rows > _get_num_sms(
+        input_values.device
+    )
     architecture, large_occupancy_min_blocks_per_mp = get_topk_architecture_config()
     min_blocks_per_mp = large_occupancy_min_blocks_per_mp if large_occupancy else 1
     chunk_size_per_cta = (
@@ -1023,7 +1041,7 @@ def _prepare_multi_pass_multi_cta_topk(
     num_rows, num_cols = input_values.shape
     bucketed_num_cols = _bucket_num_cols(num_cols)
 
-    large_occupancy = num_rows > _get_num_sms()
+    large_occupancy = num_rows > _get_num_sms(input_values.device)
     architecture, large_occupancy_min_blocks_per_mp = get_topk_architecture_config()
     min_blocks_per_mp = large_occupancy_min_blocks_per_mp if large_occupancy else 1
 

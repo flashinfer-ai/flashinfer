@@ -91,3 +91,28 @@ def test_short_misaligned_rows(dtype, N):
         ref = torch.topk(logits[b, :n].float(), top_k).values
         got = torch.sort(vals[b].float(), descending=True).values
         torch.testing.assert_close(got, ref, atol=1e-2, rtol=1e-2)
+
+
+def test_num_sms_cache_is_per_device():
+    """The SM-count memo must be keyed by device, not first-caller-wins.
+
+    On a heterogeneous multi-GPU host, a process-wide scalar would pin the
+    first device's SM count and mis-size the persistent grid / occupancy-mode
+    decision for every other GPU. Host-only (no kernels launched), so it runs
+    on any multi-GPU box; it has real teeth wherever the visible devices have
+    differing SM counts (the unfixed code returns one count for all devices).
+
+    Regression for PR #4621 review (per-device SM-count cache).
+    """
+    from flashinfer.topk_varlen.kernels.filtered_topk_decode import _get_num_sms
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs >= 2 visible CUDA devices")
+
+    for i in range(torch.cuda.device_count()):
+        expected = torch.cuda.get_device_properties(i).multi_processor_count
+        got = _get_num_sms(torch.device("cuda", i))
+        assert got == expected, (
+            f"device {i}: cached SM count {got} != actual {expected} -- "
+            f"the cache is not keyed by device"
+        )
