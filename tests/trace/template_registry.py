@@ -76,6 +76,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.mamba.selective_state_update",
     "flashinfer.mamba.ssd_combined",
     "flashinfer.mhc",
+    "flashinfer.mla._batch_mla._wrapper",
     "flashinfer.mla._core",
     "flashinfer.msa_ops.proxy_score",
     "flashinfer.msa_ops.sparse_decode",
