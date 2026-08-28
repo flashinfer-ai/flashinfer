@@ -1094,6 +1094,17 @@ def _run_radix_filter(
         cute_dsl_radix_filter_topk_wrapper,
     )
 
+    # The kernel ABI declares a symbolic leading stride (padded row views are
+    # zero-copy) but requires a unit inner stride and a 32-byte-aligned base
+    # for its vectorized loads; anything else previously failed late with an
+    # opaque FFI alignment error. Materialize only the genuinely unsupported
+    # layouts (rare: transposed/gathered views, or a base sliced off
+    # alignment -- torch allocations themselves are 256-byte aligned).
+    if logits.stride(-1) != 1 or (logits.data_ptr() % 32) != 0:
+        logits = logits.contiguous()
+        if (logits.data_ptr() % 32) != 0:
+            logits = logits.clone()
+
     # Compile and launch under the input tensor's device: the persistent JIT
     # cache tags artifacts by the CURRENT device's architecture, and the
     # kernel launches on the current stream, so both must agree with where

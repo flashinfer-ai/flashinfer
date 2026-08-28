@@ -148,3 +148,48 @@ def test_compile_uses_persistent_jit_cache():
     )
     objs = [o for d in module_dirs for o in d.glob("*.o")]
     assert objs, f"module dir {module_dirs} contains no exported kernel objects"
+
+
+def test_strided_and_misaligned_inputs():
+    """Padded row views are zero-copy ABI; misaligned bases are materialized.
+
+    A framework score buffer sliced to the vocab width (leading stride wider
+    than the row) must produce identical results to the compact tensor -- the
+    kernel ABI now declares a symbolic leading stride, so this pins declared
+    behavior rather than an accident of the runtime. A base pointer sliced off
+    32-byte alignment previously failed late with an opaque FFI alignment
+    error; the wrapper now materializes it.
+
+    Regression for PR #4621 review (strided/offset input ABI).
+    """
+    device = torch.device("cuda")
+    _skip_unless_radix_filter(device)
+
+    torch.manual_seed(11)
+    B, N, k = 4, 8192, 512
+    seq_lens = torch.full((B,), N, dtype=torch.int32, device=device)
+
+    # Padded view: rows 1+ distinguish the true stride from a compact
+    # misinterpretation (row 0 is at offset 0 either way).
+    buf = torch.randn(B, 2 * N, dtype=torch.float32, device=device)
+    view = buf[:, :N]
+    assert not view.is_contiguous()
+    idx, _ = flashinfer.top_k_varlen(view, seq_lens, k, backend="radix_filter")
+    idx = idx.view(B, k)
+    for b in range(B):
+        sel = idx[b][idx[b] >= 0]
+        kth = torch.topk(view[b], k).values.min()
+        assert bool((view[b][sel.long()] >= kth - 1e-4).all()), (
+            f"row {b}: padded-view results do not match the view's own data"
+        )
+
+    # Misaligned base: previously an opaque late ValueError from the FFI.
+    base = torch.randn(B * N + 1, dtype=torch.float32, device=device)
+    mis = base[1:].view(B, N)
+    assert mis.data_ptr() % 32 != 0
+    idx, _ = flashinfer.top_k_varlen(mis, seq_lens, k, backend="radix_filter")
+    idx = idx.view(B, k)
+    for b in range(B):
+        sel = idx[b][idx[b] >= 0]
+        kth = torch.topk(mis[b], k).values.min()
+        assert bool((mis[b][sel.long()] >= kth - 1e-4).all())

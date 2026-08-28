@@ -863,8 +863,17 @@ def _prepare_one_pass_topk(
         _tma_on = _enable_tma_load or _enable_tma_load_p3
         n_cols = cute.sym_int(divisibility=_tma_div) if _tma_on else cute.sym_int()
         n_batch = cute.sym_int()
-        input_fake = cute.runtime.make_fake_compact_tensor(
-            dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=32
+        # Symbolic leading stride: a padded row view (stride0 > n_cols, e.g.
+        # a framework's score buffer sliced to the vocab width) is part of
+        # the declared ABI, zero-copy. Inner stride stays 1 and the base
+        # stays 32-byte aligned; the public wrapper materializes inputs
+        # violating those. DIVERGENCE FROM UPSTREAM (compact-only fake),
+        # after review (flashinfer PR #4621).
+        input_fake = cute.runtime.make_fake_tensor(
+            dtype,
+            (n_rows, n_cols),
+            stride=(cute.sym_int64(), 1),
+            assumed_align=32,
         )
         if overflow_policy in ("GMEM_SPILL", "BOUNDED_SPILL"):
             buffer_fake = cute.runtime.make_fake_compact_tensor(
@@ -1123,8 +1132,17 @@ def _prepare_multi_pass_multi_cta_topk(
         n_rows = cute.sym_int()
         n_cols = cute.sym_int()
         n_batch = cute.sym_int()
-        input_fake = cute.runtime.make_fake_compact_tensor(
-            dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=32
+        # Symbolic leading stride: a padded row view (stride0 > n_cols, e.g.
+        # a framework's score buffer sliced to the vocab width) is part of
+        # the declared ABI, zero-copy. Inner stride stays 1 and the base
+        # stays 32-byte aligned; the public wrapper materializes inputs
+        # violating those. DIVERGENCE FROM UPSTREAM (compact-only fake),
+        # after review (flashinfer PR #4621).
+        input_fake = cute.runtime.make_fake_tensor(
+            dtype,
+            (n_rows, n_cols),
+            stride=(cute.sym_int64(), 1),
+            assumed_align=32,
         )
         # Shared buffer for both kernels: only needed when policy spills to GMEM
         if overflow_policy in ("GMEM_SPILL", "BOUNDED_SPILL"):
