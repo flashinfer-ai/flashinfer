@@ -27,6 +27,10 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_decode_attention_trace
+from ._vibecuda_sm100 import (
+    require_vibecuda_device,
+    vibecuda_msa_sparse_decode_attention,
+)
 from ._common import _compile_cache, _cutlass_dtype, _fake, _resolve_packed_kv
 
 
@@ -190,6 +194,8 @@ def msa_sparse_decode_attention(
     q_offset=None,
     partial_dtype: Optional[torch.dtype] = None,
     force_fused: Optional[bool] = None,
+    workspace=None,
+    backend: str = "auto",
 ):
     """Sparse decode attention for SM120/SM121.
 
@@ -252,6 +258,12 @@ def msa_sparse_decode_attention(
         no combine). ``True``/``False`` force fused/split on; ``None`` (default)
         adapts. NVFP4 KV defaults to the per-block split at every batch size
         (the in-kernel dequant favors the extra parallelism).
+    workspace : optional
+        Optional backend workspace. The VibeCUDA backend currently rejects
+        caller-owned capture workspaces.
+    backend : str, default="auto"
+        ``"auto"`` preserves the existing SM120/SM121 CuTe-DSL path.
+        ``"vibecuda"`` explicitly selects the SM100/SM103 CUDA backend.
 
     Returns
     -------
@@ -259,6 +271,36 @@ def msa_sparse_decode_attention(
         ``(batch_size * seqlen_q, num_qo_heads, 128)`` in q's dtype; plus
         the natural-log LSE if ``return_softmax_lse``.
     """
+    if backend not in ("auto", "vibecuda"):
+        raise ValueError(
+            f"msa_sparse_decode_attention does not support backend {backend!r}; "
+            "expected 'auto' or 'vibecuda'"
+        )
+    if backend == "vibecuda":
+        require_vibecuda_device(q.device)
+        return vibecuda_msa_sparse_decode_attention(
+            q,
+            k,
+            v,
+            q2k_indices,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            cu_seqlens_k=cu_seqlens_k,
+            seqlen_q=seqlen_q,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            return_softmax_lse=return_softmax_lse,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            k_global_scale=k_global_scale,
+            v_global_scale=v_global_scale,
+            q_offset=q_offset,
+            partial_dtype=partial_dtype,
+            force_fused=force_fused,
+            workspace=workspace,
+        )
+    if workspace is not None:
+        raise ValueError("workspace is only supported by an explicit backend")
     import cutlass
     import cutlass.cute as cute
 

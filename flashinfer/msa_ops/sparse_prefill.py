@@ -21,6 +21,10 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_attention_trace
 from ..utils import is_sm12x_supported
+from ._vibecuda_sm100 import (
+    require_vibecuda_device,
+    vibecuda_msa_sparse_attention,
+)
 from ._common import (
     _BLK_KV,
     _compile_cache,
@@ -51,6 +55,8 @@ def msa_sparse_attention(
     q_offset=None,
     return_temperature_lse: bool = False,
     lse_temperature_scale: float = 1.0,
+    workspace=None,
+    backend: str = "auto",
 ):
     """Minimax Sparse Attention forward (prefill) for SM120/SM121.
 
@@ -125,6 +131,12 @@ def msa_sparse_attention(
         value is ``(out, lse, lse_t)``.
     lse_temperature_scale : float, default=1.0
         Scale applied to the exponent when computing temperature LSE.
+    workspace : optional
+        Optional backend workspace. The VibeCUDA backend currently rejects
+        caller-owned capture workspaces; the SM120/SM121 path ignores none.
+    backend : str, default="auto"
+        ``"auto"`` preserves the existing SM120/SM121 CuTe-DSL path.
+        ``"vibecuda"`` explicitly selects the SM100/SM103 CUDA backend.
 
     Returns
     -------
@@ -136,6 +148,36 @@ def msa_sparse_attention(
         false, returns ``out``. Each returned LSE tensor has shape
         ``(total_q, num_qo_heads)`` and dtype float32.
     """
+    if backend not in ("auto", "vibecuda"):
+        raise ValueError(
+            f"msa_sparse_attention does not support backend {backend!r}; "
+            "expected 'auto' or 'vibecuda'"
+        )
+    if backend == "vibecuda":
+        require_vibecuda_device(q.device)
+        return vibecuda_msa_sparse_attention(
+            q,
+            k,
+            v,
+            q2k_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            return_softmax_lse=return_softmax_lse,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            k_global_scale=k_global_scale,
+            v_global_scale=v_global_scale,
+            q_offset=q_offset,
+            return_temperature_lse=return_temperature_lse,
+            lse_temperature_scale=lse_temperature_scale,
+            workspace=workspace,
+        )
+    if workspace is not None:
+        raise ValueError("workspace is only supported by an explicit backend")
     if not is_sm12x_supported(q.device):
         raise RuntimeError(
             "msa_sparse_attention requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"
