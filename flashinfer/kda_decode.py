@@ -420,10 +420,69 @@ def fused_kda_decode_packed(
     non-positive or zero-length rows are padding and do not mutate either cache.
     These value constraints are caller-owned so CUDA Graph replay never performs
     a device-to-host validation sync.
+
+    Args:
+        x:
+            Packed QKV projection with shape ``[num_rows, 3 * H * 128]`` and
+            dtype bfloat16.
+        weight:
+            Depthwise convolution weights with shape ``[3, 4, H * 128]`` and
+            dtype float32.
+        conv_state:
+            Paged bfloat16 convolution cache. T=1 uses history length three;
+            T>1 uses the extended rolling history length ``T + 2``.
+        raw_gate:
+            Raw recurrence gate with shape ``[1, num_rows, H, 128]`` and dtype
+            bfloat16.
+        raw_beta:
+            Raw delta-rule learning-rate logits with shape
+            ``[1, num_rows, H]`` and dtype bfloat16.
+        A_log:
+            Log decay parameter with ``H`` elements and dtype float32.
+        dt_bias:
+            Per-channel decay bias with ``H * 128`` elements and dtype float32.
+        state_indices:
+            Contiguous int32 cache slots with shape ``[N, T]``. For T>1,
+            column ``t`` is the recurrent checkpoint destination for token
+            ``t``. Column zero also selects the rolling convolution cache.
+        query_start_loc:
+            Contiguous int32 packed-row offsets with shape ``[N + 1]``.
+        num_accepted_tokens:
+            Contiguous int32 accepted-token counts with shape ``[N]``.
+        state:
+            Paged recurrent state with shape ``[num_slots, H, 128, 128]``.
+            T=1 accepts float32 or bfloat16; T>1 requires float32.
+        output_gate:
+            Gated RMSNorm logits with shape ``[num_rows, H, 128]`` or
+            ``[1, num_rows, H, 128]`` and dtype bfloat16.
+        norm_weight:
+            RMSNorm weight with 128 elements and dtype float32.
+        lower_bound:
+            Negative recurrence-gate lower bound. T=1 also accepts ``None``
+            for the softplus gate; T>1 requires a finite negative value.
+        norm_eps:
+            Non-negative RMSNorm epsilon.
+        output:
+            Optional preallocated contiguous bfloat16 output with shape
+            ``[1, num_rows, H, 128]``.
+
+    Returns:
+        The packed bfloat16 output with shape ``[1, num_rows, H, 128]``.
     """
     if state_indices.ndim == 2 and state_indices.shape[1] == 1:
         if _run_fused_kda_decode is None:
             raise NotImplementedError("fused KDA decode backend is unavailable")
+        legacy_state_indices = state_indices[:, 0]
+        if x.shape[0] != legacy_state_indices.shape[0]:
+            packed_rows = torch.arange(
+                x.shape[0], dtype=query_start_loc.dtype, device=x.device
+            )
+            sequence_indices = torch.searchsorted(
+                query_start_loc[1:], packed_rows, right=True
+            )
+            legacy_state_indices = legacy_state_indices.index_select(
+                0, sequence_indices
+            )
         return _run_fused_kda_decode(
             x=x,
             weight=weight,
@@ -432,7 +491,7 @@ def fused_kda_decode_packed(
             raw_beta=raw_beta,
             A_log=A_log,
             dt_bias=dt_bias,
-            state_indices=state_indices[:, 0],
+            state_indices=legacy_state_indices,
             state=state,
             output_gate=output_gate,
             norm_weight=norm_weight,

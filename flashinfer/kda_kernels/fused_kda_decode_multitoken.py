@@ -343,15 +343,20 @@ def _kda_kernel(
         idx = nb * NT + tid
         if idx < T * 32:
             t = idx // 32
-            l = idx % 32
+            lane_idx = idx % 32
             if t < seq_len:
                 nq4 = cute.make_rmem_tensor(cute.make_layout(4), cutlass.BFloat16)
                 nk4 = cute.make_rmem_tensor(cute.make_layout(4), cutlass.BFloat16)
                 cute.autovec_copy(
-                    _svec(a_qkv, t * (3 * _D) + l * 4, cutlass.BFloat16), nq4
+                    _svec(a_qkv, t * (3 * _D) + lane_idx * 4, cutlass.BFloat16),
+                    nq4,
                 )
                 cute.autovec_copy(
-                    _svec(a_qkv, t * (3 * _D) + _D + l * 4, cutlass.BFloat16),
+                    _svec(
+                        a_qkv,
+                        t * (3 * _D) + _D + lane_idx * 4,
+                        cutlass.BFloat16,
+                    ),
                     nk4,
                 )
                 sqq = cutlass.Float32(0.0)
@@ -367,7 +372,7 @@ def _kda_kernel(
                     sqq = sqq + cute.arch.shuffle_sync_bfly(sqq, 1 << off)
                     skk = skk + cute.arch.shuffle_sync_bfly(skk, 1 << off)
                     skq = skq + cute.arch.shuffle_sync_bfly(skq, 1 << off)
-                if l == 0:
+                if lane_idx == 0:
                     sRed[t * 4] = (
                         cute.rsqrt(sqq + _L2_EPS, approx=True, ftz=True) * scale
                     )

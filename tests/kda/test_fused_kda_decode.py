@@ -492,6 +492,81 @@ def test_fused_kda_decode_packed_t1_uses_legacy_modes():
 
 
 @pytest.mark.parametrize(
+    "query_start_loc",
+    [
+        pytest.param([0, 0, 1, 2], id="empty-first"),
+        pytest.param([0, 1, 1, 2], id="empty-middle"),
+        pytest.param([0, 1, 2, 2], id="empty-last"),
+    ],
+)
+def test_fused_kda_decode_packed_t1_empty_sequence(query_start_loc):
+    inputs = _make_inputs(12, 3, state_dtype=torch.bfloat16)
+    for key in ("x", "raw_gate", "raw_beta", "output_gate"):
+        row_dimension = 1 if key in ("raw_gate", "raw_beta") else 0
+        inputs[key] = inputs[key].narrow(row_dimension, 0, 2)
+    inputs["state_indices"] = torch.arange(
+        1, 4, dtype=torch.int32, device=torch.device("cuda")
+    ).reshape(3, 1)
+    inputs["query_start_loc"] = torch.tensor(
+        query_start_loc, dtype=torch.int32, device=torch.device("cuda")
+    )
+    inputs["num_accepted_tokens"] = torch.ones(
+        3, dtype=torch.int32, device=torch.device("cuda")
+    )
+    live_sequences = [
+        sequence
+        for sequence in range(3)
+        if query_start_loc[sequence] != query_start_loc[sequence + 1]
+    ]
+    legacy_indices = inputs["state_indices"][live_sequences, 0].contiguous()
+    legacy_conv = _clone_strided(inputs["conv_state"])
+    legacy_state = _clone_strided(inputs["state"])
+    packed_conv = _clone_strided(inputs["conv_state"])
+    packed_state = _clone_strided(inputs["state"])
+
+    legacy = fused_kda_decode(
+        **{
+            **{
+                key: value
+                for key, value in inputs.items()
+                if key
+                not in (
+                    "query_start_loc",
+                    "num_accepted_tokens",
+                    "state_indices",
+                )
+            },
+            "conv_state": legacy_conv,
+            "state": legacy_state,
+            "state_indices": legacy_indices,
+            "lower_bound": None,
+        }
+    )
+    packed_output = torch.empty_like(legacy)
+    packed_kwargs = {
+        **inputs,
+        "conv_state": packed_conv,
+        "state": packed_state,
+        "lower_bound": None,
+        "output": packed_output,
+    }
+    fused_kda_decode_packed(**packed_kwargs)
+    packed_conv.copy_(inputs["conv_state"])
+    packed_state.copy_(inputs["state"])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused_kda_decode_packed(**packed_kwargs)
+    packed_conv.copy_(inputs["conv_state"])
+    packed_state.copy_(inputs["state"])
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert torch.equal(packed_output, legacy)
+    assert torch.equal(packed_conv, legacy_conv)
+    assert torch.equal(packed_state, legacy_state)
+
+
+@pytest.mark.parametrize(
     ("state_dtype", "lower_bound", "error", "match"),
     [
         pytest.param(
