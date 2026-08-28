@@ -115,6 +115,9 @@ class NcclEpHandle(Handle):
             topk_idx = topk_idx.to(torch.int64)
         self._topk_idx = topk_idx
         self._num_tokens_in = topk_idx.shape[0]
+        # Buffers are sized for the creating shape; update() may only
+        # rebind a token count at or below it.
+        self._max_num_tokens_in = topk_idx.shape[0]
         self._top_k = topk_idx.shape[1]
         self._topk_idx_t = self._wrap(topk_idx)
 
@@ -175,6 +178,8 @@ class NcclEpHandle(Handle):
             self._topk_idx_t,
             layout_info=create_layout_info,  # HT recv-count opt-in; None otherwise
             config=None,
+            # Creation is host-side allocation and must happen OUTSIDE any
+            # capture (nccl_ep.h:422), so it stays on the handle's own stream.
             stream=self._stream,
         )
         _t = _hp("hinit.create_handle_c", _t)
@@ -182,6 +187,25 @@ class NcclEpHandle(Handle):
     def _knob_stream(self) -> int:
         k = self._handle_knobs.get(HandleAlgoKnobUserStream)
         return int(k.stream) if k is not None else self._fleet.stream  # type: ignore[attr-defined]
+
+    def _op_stream(self) -> int:
+        """Stream to issue transport work on.
+
+        Normally the handle's own stream: the ``HandleAlgoKnobUserStream``
+        value, else the fleet's. Under CUDA-graph capture that is the wrong
+        one. A handle that outlives a capture is created *before* it begins
+        (see ``update``), so its creation-time stream is not the stream being
+        captured, and work issued there lands outside the graph entirely --
+        the capture records nothing and the replay is a no-op.
+
+        Outside capture this returns exactly what it always did, so non-graph
+        behaviour (including an explicit UserStream) is unchanged.
+        """
+        import torch
+
+        if torch.cuda.is_current_stream_capturing():
+            return torch.cuda.current_stream().cuda_stream
+        return self._stream
 
     # Only memoize wrappers of SMALL tensors: the wrapper keeps the torch tensor
     # alive, so caching wraps of large activations (e.g. 8k-token prefill inputs,
@@ -214,6 +238,49 @@ class NcclEpHandle(Handle):
             w = self._ep.Tensor(t)
             hot[key] = w
         return w
+
+    def update(self, params) -> None:
+        """Rebind to a new step's routing via ``ncclEpUpdateHandle``.
+
+        This is the per-step half of the split that makes CUDA-graph capture
+        possible: ``ncclEpInitHandle`` (done in ``__init__``, via
+        ``create_handle``) allocates and must stay outside the capture, while
+        this call only recomputes routing metadata and is safe to record
+        inside it. Without it a handle is created and destroyed per forward,
+        so a captured graph replays against freed device memory.
+
+        ``top_k`` is bound at handle creation (LL passes ``num_topk`` to
+        InitHandle), so only the token count may vary, and only downward --
+        the recv buffers were sized for the creating shape.
+        """
+        import torch
+
+        topk_idx = params.topk_ids
+        if topk_idx.dtype != torch.int64:
+            topk_idx = topk_idx.to(torch.int64)
+        if topk_idx.shape[1] != self._top_k:
+            raise ValueError(
+                f"Handle.update cannot change top_k: handle was created with "
+                f"top_k={self._top_k}, got {topk_idx.shape[1]}. Create a new "
+                "handle instead."
+            )
+        if topk_idx.shape[0] > self._max_num_tokens_in:
+            raise ValueError(
+                f"Handle.update: {topk_idx.shape[0]} tokens exceeds the "
+                f"{self._max_num_tokens_in} this handle's buffers were sized "
+                "for. Create the handle at the largest shape you will use."
+            )
+        self._topk_idx = topk_idx
+        self._num_tokens_in = topk_idx.shape[0]
+        self._topk_idx_t = self._wrap(topk_idx)
+        # layout_info is the HT recv-count opt-in and None for LL, which is
+        # exactly what ncclEpUpdateHandle requires of each mode. See
+        # _op_stream() for why this is not simply self._stream.
+        self._handle.update(
+            self._topk_idx_t,
+            layout_info=self._create_layout_info,
+            stream=self._op_stream(),
+        )
 
     def dispatch(self, params: DispatchInputParams) -> DispatchOutput:
         x = params.x[0]
@@ -285,10 +352,10 @@ class NcclEpHandle(Handle):
             outputs,
             layout_info=layout_info,
             config=config,
-            stream=self._stream,
+            stream=self._op_stream(),
         )
         _t = _hp("ll_disp.ffi_dispatch", _t)
-        self._handle.complete(stream=self._stream)
+        self._handle.complete(stream=self._op_stream())
         _t = _hp("ll_disp.ffi_complete", _t)
 
         self._dispatch_inputs = inputs
@@ -354,9 +421,9 @@ class NcclEpHandle(Handle):
             outputs,
             layout_info=layout_info,
             config=config,
-            stream=self._stream,
+            stream=self._op_stream(),
         )
-        self._handle.complete(stream=self._stream)
+        self._handle.complete(stream=self._op_stream())
 
         self._dispatch_inputs = inputs
         self._dispatch_outputs = outputs
@@ -449,10 +516,14 @@ class NcclEpHandle(Handle):
         _t = _hp("ht_disp.build_ffi_objs", _t)
 
         self._handle.dispatch(
-            inputs, outputs, layout_info=None, config=config, stream=self._stream
+            inputs,
+            outputs,
+            layout_info=None,
+            config=config,
+            stream=self._op_stream(),
         )
         _t = _hp("ht_disp.ffi_dispatch", _t)
-        self._handle.complete(stream=self._stream)
+        self._handle.complete(stream=self._op_stream())
         _t = _hp("ht_disp.ffi_complete", _t)
 
         self._dispatch_inputs = inputs
@@ -497,8 +568,10 @@ class NcclEpHandle(Handle):
                 self._hot[ck] = config
             outputs = self._ep.CombineOutputs(tokens=self._wrap(out_t))
             inputs = self._ep.CombineInputs(tokens=self._wrap(x2d))
-            self._handle.combine(inputs, outputs, config=config, stream=self._stream)
-            self._handle.complete(stream=self._stream)
+            self._handle.combine(
+                inputs, outputs, config=config, stream=self._op_stream()
+            )
+            self._handle.complete(stream=self._op_stream())
             self._combine_inputs = inputs
             self._combine_outputs = outputs
             self._combine_x2d = x2d
@@ -508,9 +581,11 @@ class NcclEpHandle(Handle):
             inputs = self._ep.CombineInputs(tokens=self._ep.Tensor(x))
             outputs = self._ep.CombineOutputs(tokens=self._ep.Tensor(out_t))
             config = self._ep.CombineConfig(send_only=int(self._staged))
-            self._handle.combine(inputs, outputs, config=config, stream=self._stream)
+            self._handle.combine(
+                inputs, outputs, config=config, stream=self._op_stream()
+            )
             if self._staged:
-                self._handle.complete(stream=self._stream)
+                self._handle.complete(stream=self._op_stream())
             self._combine_inputs = inputs
             self._combine_outputs = outputs
             return CombineOutput(x=out_t)
@@ -541,9 +616,9 @@ class NcclEpHandle(Handle):
             topk_weights=weights_t,
         )
 
-        self._handle.combine(inputs, outputs, config=config, stream=self._stream)
+        self._handle.combine(inputs, outputs, config=config, stream=self._op_stream())
         if self._staged:
-            self._handle.complete(stream=self._stream)
+            self._handle.complete(stream=self._op_stream())
 
         self._combine_inputs = inputs
         self._combine_outputs = outputs

@@ -81,6 +81,11 @@ def _make_fake_nccl_ep():
             self.create_kwargs = kw
             self.calls: list = []
 
+        def update(self, topk_idx, **kw):
+            # Mirrors ncclEpUpdateHandle: rebinds routing, never reallocates.
+            self.topk_idx = topk_idx
+            self.calls.append(("update", topk_idx, kw))
+
         def dispatch(self, inputs, outputs, **kw):
             self.calls.append(("dispatch", inputs, outputs, kw))
 

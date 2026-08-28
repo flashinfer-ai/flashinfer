@@ -305,3 +305,224 @@ def test_ll_ignores_recv_count_knob(fake_nccl_ep, bypass_build_checks):
     # LL rejects handle-time layout_info in the C library — the knob must not
     # leak into create_handle there.
     assert fake_nccl_ep._log["handles"][-1].create_kwargs["layout_info"] is None
+
+
+# ---------------------------------------------------------------- Handle.update
+#
+# update() exists so ONE handle can serve many forwards. That is what makes CUDA
+# graph capture possible: a graph records the device pointers it sees, so a
+# handle created and destroyed inside the captured forward leaves the replay
+# pointing at freed memory (observed on 4xB200 as an illegal memory access at
+# replay, with capture itself succeeding). Creating the handle outside the
+# capture and calling update() inside mirrors NCCL-EP's own graph recipe.
+
+
+def test_update_rebinds_routing_without_recreating_the_handle(
+    fake_nccl_ep, bypass_build_checks
+):
+    import torch
+
+    from flashinfer.moe_ep.config import HandleParams
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    h = _make_handle(_make_fleet(fake_nccl_ep), num_tokens=16, top_k=2)
+    n_handles = len(fake_nccl_ep._log["handles"])
+
+    second = torch.ones(16, 2, dtype=torch.int64, device="cuda")
+    h.update(HandleParams(topk_ids=second))
+
+    # No new native handle: the point is that the old one stays valid, so a
+    # captured graph's pointers remain live.
+    assert len(fake_nccl_ep._log["handles"]) == n_handles
+    native = fake_nccl_ep._log["handles"][-1]
+    assert [c[0] for c in native.calls].count("update") == 1
+
+
+def test_update_rejects_a_different_top_k(fake_nccl_ep, bypass_build_checks):
+    """top_k is bound at InitHandle; changing it would need new buffers."""
+    import torch
+
+    from flashinfer.moe_ep.config import HandleParams
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    h = _make_handle(_make_fleet(fake_nccl_ep), num_tokens=16, top_k=2)
+    with pytest.raises(ValueError, match="cannot change top_k"):
+        h.update(
+            HandleParams(topk_ids=torch.zeros(16, 4, dtype=torch.int64, device="cuda"))
+        )
+
+
+def test_update_rejects_growing_past_the_creating_token_count(
+    fake_nccl_ep, bypass_build_checks
+):
+    """Buffers were sized at creation; a larger step would overrun them."""
+    import torch
+
+    from flashinfer.moe_ep.config import HandleParams
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    h = _make_handle(_make_fleet(fake_nccl_ep), num_tokens=16, top_k=2)
+    with pytest.raises(ValueError, match="exceeds"):
+        h.update(
+            HandleParams(topk_ids=torch.zeros(32, 2, dtype=torch.int64, device="cuda"))
+        )
+    # Shrinking is fine -- decode steps are smaller than the capture shape.
+    h.update(HandleParams(topk_ids=torch.zeros(8, 2, dtype=torch.int64, device="cuda")))
+
+
+def test_update_is_optional_on_the_base_handle():
+    """Backends that cannot rebind must say so, not silently no-op."""
+    from flashinfer.moe_ep.core.comm.handle import Handle
+
+    class _Bare(Handle):
+        def dispatch(self, params):
+            raise NotImplementedError
+
+        def combine(self, params):
+            raise NotImplementedError
+
+        def complete(self):
+            pass
+
+    with pytest.raises(NotImplementedError, match="update"):
+        _Bare().update(None)
+
+
+def test_update_is_capturable(fake_nccl_ep, bypass_build_checks):
+    """update() must contain no host sync -- capture fails outright on one.
+
+    This is the property that separates update() from the HT prepare path,
+    which is uncapturable precisely because it does int(recv_total.item()).
+    A .item()/.cpu()/.tolist() added to update() would raise here rather than
+    surviving to become an illegal memory access at replay on real hardware.
+
+    Scope: the fake handle issues no device work, so this pins the Python
+    path only. End-to-end capture over real NCCL-EP kernels is covered by
+    tests/moe_ep/test_moe_ep_cudagraph_multirank.py.
+    """
+    import torch
+
+    from flashinfer.moe_ep.config import HandleParams
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    h = _make_handle(_make_fleet(fake_nccl_ep), num_tokens=16, top_k=2)
+    topk = torch.zeros(16, 2, dtype=torch.int64, device="cuda")
+
+    # Warm up on a side stream first, as torch requires before capture.
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        h.update(HandleParams(topk_ids=topk))
+    torch.cuda.current_stream().wait_stream(side)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        h.update(HandleParams(topk_ids=topk))
+    g.replay()
+    torch.cuda.synchronize()
+
+
+def test_update_binds_the_caller_buffer_not_a_copy(fake_nccl_ep, bypass_build_checks):
+    """The handle must reference the caller's tensor, not a snapshot of it.
+
+    Under CUDA graphs the routing buffer is written in place between replays,
+    so update() has to hand the transport that same allocation. If it copied,
+    every replay would re-run against stale routing and the graph would look
+    like it worked while silently ignoring new tokens.
+    """
+    import torch
+
+    from flashinfer.moe_ep.config import HandleParams
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    h = _make_handle(_make_fleet(fake_nccl_ep), num_tokens=16, top_k=2)
+    topk = torch.zeros(16, 2, dtype=torch.int64, device="cuda")
+    h.update(HandleParams(topk_ids=topk))
+
+    native = fake_nccl_ep._log["handles"][-1]
+    bound = [c for c in native.calls if c[0] == "update"][-1][1]
+    assert bound.buffer.data_ptr() == topk.data_ptr()
+
+
+def test_ops_use_the_knob_stream_outside_capture(fake_nccl_ep, bypass_build_checks):
+    """Outside capture, transport work stays on the handle's own stream.
+
+    Pins that the capture-aware _op_stream() did not change non-graph
+    behaviour: an explicit HandleAlgoKnobUserStream must still be honoured.
+    """
+    import torch
+
+    from flashinfer.moe_ep.algo_knobs import HandleAlgoKnobUserStream
+    from flashinfer.moe_ep.config import HandleParams
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    pinned = torch.cuda.Stream()
+    fleet = _make_fleet(fake_nccl_ep)
+    h = _make_handle(
+        fleet,
+        num_tokens=16,
+        top_k=2,
+        extra_knobs=(HandleAlgoKnobUserStream(stream=pinned.cuda_stream),),
+    )
+    topk = torch.zeros(16, 2, dtype=torch.int64, device="cuda")
+    h.update(HandleParams(topk_ids=topk))
+
+    native = fake_nccl_ep._log["handles"][-1]
+    stream = [c for c in native.calls if c[0] == "update"][-1][2]["stream"]
+    assert stream == pinned.cuda_stream
+
+
+def test_ops_move_to_the_capture_stream_under_capture(
+    fake_nccl_ep, bypass_build_checks
+):
+    """Under capture, work must be recorded on the stream being captured.
+
+    A handle that outlives a capture is created before it starts, so its own
+    stream is NOT the capture stream. Issuing there records nothing into the
+    graph, and the replay silently does no transport work -- the failure this
+    assertion exists to catch.
+    """
+    import torch
+
+    from flashinfer.moe_ep.algo_knobs import HandleAlgoKnobUserStream
+    from flashinfer.moe_ep.config import HandleParams
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    pinned = torch.cuda.Stream()
+    fleet = _make_fleet(fake_nccl_ep)
+    h = _make_handle(
+        fleet,
+        num_tokens=16,
+        top_k=2,
+        extra_knobs=(HandleAlgoKnobUserStream(stream=pinned.cuda_stream),),
+    )
+    topk = torch.zeros(16, 2, dtype=torch.int64, device="cuda")
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        h.update(HandleParams(topk_ids=topk))
+    torch.cuda.current_stream().wait_stream(side)
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        h.update(HandleParams(topk_ids=topk))
+        captured_stream = torch.cuda.current_stream().cuda_stream
+
+    native = fake_nccl_ep._log["handles"][-1]
+    stream = [c for c in native.calls if c[0] == "update"][-1][2]["stream"]
+    assert stream == captured_stream != pinned.cuda_stream
