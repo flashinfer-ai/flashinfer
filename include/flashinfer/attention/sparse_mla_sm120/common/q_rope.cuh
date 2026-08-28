@@ -87,3 +87,24 @@ __device__ __forceinline__ void compute_qk_rope(float qk[4], const QRopeRegs& qr
   qk[2] += ra[2];
   qk[3] += ra[3];
 }
+
+template <int KV_STRIDE>
+__device__ __forceinline__ void compute_qk_rope_swapab(float qk[4], const bf16* kv_rope_smem,
+                                                       const KVRopePrefetch& qr, int lane) {
+  float ra[4] = {0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+  for (int ks = 0; ks < N_ROPE_CHUNKS; ks++) {
+    uint32_t a0, a1, a2, a3;
+    ldmatrix_load_A_bf16(a0, a1, a2, a3, kv_rope_smem + ks * 16, KV_STRIDE / 2, lane);
+    MmaBf16Result r =
+        mma_bf16_m16n8k16(a0, a1, a2, a3, qr.b[ks][0], qr.b[ks][1], ra[0], ra[1], ra[2], ra[3]);
+    ra[0] = r.d0;
+    ra[1] = r.d1;
+    ra[2] = r.d2;
+    ra[3] = r.d3;
+  }
+  qk[0] += ra[0];
+  qk[1] += ra[1];
+  qk[2] += ra[2];
+  qk[3] += ra[3];
+}

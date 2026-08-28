@@ -84,6 +84,41 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
   return val;
 }
 
+// Reductions over the 8 lanes sharing `lane & 3` — one swapAB softmax row.
+__device__ __forceinline__ float warp8_reduce_max(float val) {
+#pragma unroll
+  for (int offset = 4; offset <= 16; offset <<= 1)
+    val = fmaxf(val, __shfl_xor_sync(0xffffffff, val, offset));
+  return val;
+}
+
+__device__ __forceinline__ float warp8_reduce_sum(float val) {
+#pragma unroll
+  for (int offset = 4; offset <= 16; offset <<= 1) val += __shfl_xor_sync(0xffffffff, val, offset);
+  return val;
+}
+
+// 4 × FP32 → one register of packed E4M3.
+__device__ __forceinline__ uint32_t cvt_e4m3x4(float a, float b, float c, float d) {
+  uint16_t lo, hi;
+  asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(lo) : "f"(b), "f"(a));
+  asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(hi) : "f"(d), "f"(c));
+  return static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+}
+
+// Residual limb of a packed E4M3 quad: what the first rounding dropped, so the
+// two limbs together widen the mantissa. F16x2 unpacks a pair per conversion.
+__device__ __forceinline__ uint32_t cvt_e4m3x4_residual(float a, float b, float c, float d,
+                                                        uint32_t high) {
+  uint32_t ab, cd;
+  asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(ab) : "h"(static_cast<uint16_t>(high)));
+  asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(cd) : "h"(static_cast<uint16_t>(high >> 16)));
+  const __half2 h_ab = *reinterpret_cast<const __half2*>(&ab);
+  const __half2 h_cd = *reinterpret_cast<const __half2*>(&cd);
+  return cvt_e4m3x4(a - __low2float(h_ab), b - __high2float(h_ab), c - __low2float(h_cd),
+                    d - __high2float(h_cd));
+}
+
 #ifndef CUDA_CHECK
 #define CUDA_CHECK(call)                                                                         \
   do {                                                                                           \
