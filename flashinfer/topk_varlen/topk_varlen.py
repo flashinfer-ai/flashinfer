@@ -1106,7 +1106,18 @@ def _run_radix_filter(
 
     The upstream wrapper's contract already matches this API: it takes the
     ``(batch * next_n, N)`` logits and the ``(batch,)`` int32 ``seq_lens``, and
-    returns row-relative indices padded with ``-1``. It allocates its own
+    returns row-relative indices padded with ``-1``.
+
+    Integration boundary (vs. the fused sparse-attention interface): this
+    backend produces ROW-RELATIVE TOP-K INDICES ONLY. It does not fuse the
+    page-table translation, does not take ``row_starts`` /
+    ``page_table_row_starts`` / ``row_to_batch``, offers no deterministic
+    tie-breaking, and has no ``dsa_graph_safe`` mode -- all of which
+    :func:`flashinfer.top_k_page_table_transform` provides in one fused
+    launch. A consumer of that interface can substitute this backend for
+    ordinary decode only by adding a separate index-transform launch, and
+    cannot substitute it at all where ``row_starts``-based ragged/extend
+    semantics or deterministic ties are required. It allocates its own
     outputs, so ``out_indices``/``out_values`` are filled by copy when the
     caller supplied them.
     """
