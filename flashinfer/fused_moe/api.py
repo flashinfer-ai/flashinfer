@@ -26,6 +26,7 @@ configuration.  They group related tensors for ergonomics (no more counting
 from __future__ import annotations
 
 import dataclasses
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import ClassVar, Dict, Optional, Tuple, Union
@@ -33,7 +34,16 @@ from typing import ClassVar, Dict, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
-from ..tllm_enums import ActivationType, RoutingInputMode, RoutingMethodType
+from ..tllm_enums import (
+    DEFAULT_SITU_BETA,
+    DEFAULT_SITU_LINEAR_BETA,
+    DEFAULT_SWIGLU_ALPHA,
+    DEFAULT_SWIGLU_BETA,
+    DEFAULT_SWIGLU_LIMIT,
+    ActivationType,
+    RoutingInputMode,
+    RoutingMethodType,
+)
 
 # ---------------------------------------------------------------------------
 # Kernel ceilings
@@ -46,13 +56,9 @@ MAX_SUPPORTED_TOTAL_EXPERTS = 512
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
-# Routing and activation reuse the shared kernel-level enums directly
-# (``RoutingMethodType`` / ``ActivationType`` from ``tllm_enums``): the API
-# speaks the kernels' vocabulary rather than mirroring it, so there is a single
-# source of truth (PR #3093 review G1).  Both are ``IntEnum`` — the value *is*
-# the kernel ABI int — and carry an eval-safe ``__repr__`` (defined in
-# ``tllm_enums``) plus ``ActivationType.is_gated`` for the repro round-trip and
-# config helpers.
+# Routing reuses the shared kernel-level ``RoutingMethodType`` enum directly.
+# Typed ActivationConfig values retain an accessible shared ``ActivationType``
+# for the kernel ABI while also carrying activation-specific scalar semantics.
 #
 # ``QuantVariant`` below is the one genuinely API-level enum: it has no single
 # kernel counterpart (the quant path is selected by dtype/scale wiring in the
@@ -149,28 +155,124 @@ class QuantConfig:
 
 @dataclass(frozen=True)
 class ActivationConfig:
-    """Fused activation between GEMM1 and GEMM2."""
+    """Typed fused activation value accepted by :class:`MoEConfig`.
 
-    # Convenience singletons — populated after class definition
-    swiglu: ClassVar[ActivationConfig]
-    geglu: ClassVar[ActivationConfig]
-    relu2: ClassVar[ActivationConfig]
-    identity: ClassVar[ActivationConfig]
+    Concrete subclasses combine the activation identity with every scalar that
+    changes its semantics. Per-expert tensor overrides remain properties of a
+    backend-native weight view.
+    """
 
-    type: ActivationType = ActivationType.Swiglu
+    type: ClassVar[ActivationType]
 
-    def __repr__(self) -> str:
-        return f"ActivationConfig(type={self.type!r})"
+    def __post_init__(self) -> None:
+        if type(self) is ActivationConfig:
+            raise TypeError(
+                "ActivationConfig is a common base; construct a typed activation "
+                "such as SwiGLU(), GeGLU(), or ReLU2()."
+            )
 
     @property
     def is_gated(self) -> bool:
         return self.type.is_gated
 
 
-ActivationConfig.swiglu = ActivationConfig(ActivationType.Swiglu)
-ActivationConfig.geglu = ActivationConfig(ActivationType.Geglu)
-ActivationConfig.relu2 = ActivationConfig(ActivationType.Relu2)
-ActivationConfig.identity = ActivationConfig(ActivationType.Identity)
+def _validate_finite(name: str, value: float, *, positive: bool = False) -> None:
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite scalar, got {value!r}.")
+    if positive and value <= 0:
+        raise ValueError(f"{name} must be positive, got {value!r}.")
+
+
+@dataclass(frozen=True)
+class SwiGLU(ActivationConfig):
+    """SwiGLU/OA activation.
+
+    The linear branch is clamped to ``[-limit, limit]`` and the gate branch to
+    ``(-inf, limit]`` before evaluating
+    ``gate * sigmoid(alpha * gate) * (linear + beta)``.
+    """
+
+    type: ClassVar[ActivationType] = ActivationType.Swiglu
+    alpha: float = DEFAULT_SWIGLU_ALPHA
+    beta: float = DEFAULT_SWIGLU_BETA
+    limit: float = DEFAULT_SWIGLU_LIMIT
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _validate_finite("alpha", self.alpha)
+        _validate_finite("beta", self.beta)
+        _validate_finite("limit", self.limit, positive=True)
+
+
+@dataclass(frozen=True)
+class SiTU(ActivationConfig):
+    """SiTU v2 with canonical gate, linear, and optional clamp scales.
+
+    ``linear_scale`` applies
+    ``linear_scale * tanh(linear / linear_scale)``; ``None`` selects an
+    unclamped linear branch, currently expressible only by CuTe-DSL. The
+    defaults are the canonical SiTU (Kimi-K3) scales. Backend adapters must
+    lower these exact values or reject unsupported semantics rather than rely
+    on different native defaults.
+    """
+
+    type: ClassVar[ActivationType] = ActivationType.Situ
+    gate_scale: float = DEFAULT_SITU_BETA
+    linear_scale: Optional[float] = DEFAULT_SITU_LINEAR_BETA
+    clamp_limit: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _validate_finite("gate_scale", self.gate_scale, positive=True)
+        if self.linear_scale is not None:
+            _validate_finite("linear_scale", self.linear_scale, positive=True)
+        if self.clamp_limit is not None:
+            _validate_finite("clamp_limit", self.clamp_limit, positive=True)
+
+
+@dataclass(frozen=True)
+class GeGLU(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Geglu
+
+
+@dataclass(frozen=True)
+class ReLU2(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Relu2
+
+
+@dataclass(frozen=True)
+class GeGLUTanh(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.GegluTanh
+
+
+@dataclass(frozen=True)
+class SwiGLUStep(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.SwigluStep
+    limit: float = 7.0
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _validate_finite("limit", self.limit, positive=True)
+
+
+@dataclass(frozen=True)
+class Identity(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Identity
+
+
+@dataclass(frozen=True)
+class GELU(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Gelu
+
+
+@dataclass(frozen=True)
+class ReLU(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Relu
+
+
+@dataclass(frozen=True)
+class SiLU(ActivationConfig):
+    type: ClassVar[ActivationType] = ActivationType.Silu
 
 
 @dataclass(frozen=True)
@@ -349,6 +451,7 @@ class TrtllmFp4Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
         permute_cache=None,
     ):
@@ -373,6 +476,7 @@ class TrtllmFp4Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
             permute_cache=permute_cache,
         )
@@ -415,6 +519,7 @@ class TrtllmFp8BlockConfig:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Build the ``trtllm_fp8_block`` weight view from canonical BF16.
@@ -440,6 +545,7 @@ class TrtllmFp8BlockConfig:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -472,6 +578,7 @@ class TrtllmFp8PerTensorConfig:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Build the ``trtllm_fp8_per_tensor`` MajorK weight view."""
@@ -485,6 +592,7 @@ class TrtllmFp8PerTensorConfig:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -518,6 +626,7 @@ class TrtllmBf16Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
         permute_cache=None,
     ):
@@ -534,6 +643,7 @@ class TrtllmBf16Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
             permute_cache=permute_cache,
         )
@@ -560,6 +670,7 @@ class TrtllmMxInt4Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
         permute_cache=None,
     ):
@@ -572,17 +683,13 @@ class TrtllmMxInt4Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
             permute_cache=permute_cache,
         )
 
     def __repr__(self) -> str:
         return "TrtllmMxInt4Config()"
-
-
-# Breaking change: the deprecated, unregistered CutlassConfig placeholder was
-# removed. It was never a runnable MoELayer backend (supported() always False).
-# Use a quant-specific Cutlass*Config below instead.
 
 
 @dataclass(frozen=True)
@@ -592,9 +699,9 @@ class CutlassBf16Config:
     Architecture coverage follows the dense-BF16 legacy flat API. The unified
     GPU tests currently exercise SM90.
 
-    This backend supports packed precomputed routing with SwiGLU and requires
-    ``do_finalize=True``. Expert parallelism and shared experts are not
-    supported.
+    This backend supports packed precomputed routing with all flat CUTLASS
+    activation semantics and requires ``do_finalize=True``.
+    Expert parallelism and shared experts are not supported.
     """
 
     @classmethod
@@ -609,6 +716,7 @@ class CutlassBf16Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Build the ``cutlass_bf16`` canonical BF16 weight view.
@@ -625,6 +733,7 @@ class CutlassBf16Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -636,10 +745,10 @@ class CutlassBf16Config:
 class CutlassW4A16Config:
     """CUTLASS MXFP4-weight x BF16-activation backend for SM90.
 
-    This backend supports packed precomputed routing with SwiGLU and requires
-    ``do_finalize=True``. Expert parallelism and shared experts are not
-    supported. Both ``hidden_size`` and ``intermediate_size`` must be divisible
-    by 128.
+    This backend supports packed precomputed routing with all flat CUTLASS
+    activation semantics and requires ``do_finalize=True``.
+    Expert parallelism and shared experts are not supported. Both
+    ``hidden_size`` and ``intermediate_size`` must be divisible by 128.
     """
 
     @classmethod
@@ -654,6 +763,7 @@ class CutlassW4A16Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize and interleave canonical BF16 weights for SM90 W4A16."""
@@ -665,6 +775,7 @@ class CutlassW4A16Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -676,7 +787,8 @@ class CutlassW4A16Config:
 class CutlassNvfp4Config:
     """CUTLASS NVFP4 backend for SM100 / SM110 / SM12x.
 
-    Packed precomputed routing with SwiGLU and ``do_finalize=True``. Expert
+    Packed precomputed routing with all flat CUTLASS activation semantics and
+    ``do_finalize=True``. Expert
     parallelism and shared experts are not supported. Both ``hidden_size``
     and ``intermediate_size`` must be divisible by 16 (the NVFP4 scale-vector
     size). Activations stay BF16; the kernel quantizes them internally.
@@ -699,6 +811,7 @@ class CutlassNvfp4Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into CUTLASS-swizzled NVFP4.
@@ -714,6 +827,7 @@ class CutlassNvfp4Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -727,7 +841,8 @@ class CutlassFp8PerTensorConfig:
 
     Activations are prequantized E4M3 with a scalar dequant scale on
     ``MoEActivationPack.hidden_states_scale``. Weights stay unshuffled; this is
-    not the TRTLLM MajorK view. Packed precomputed routing with SwiGLU and
+    not the TRTLLM MajorK view. Packed precomputed routing with all flat
+    CUTLASS activation semantics and
     ``do_finalize=True``. Not in the default backend search list: TRTLLM
     per-tensor FP8 folds the activation scale into the weight view, so the two
     contracts cannot share one pack without a conversion.
@@ -745,6 +860,7 @@ class CutlassFp8PerTensorConfig:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into unshuffled per-tensor FP8."""
@@ -756,6 +872,7 @@ class CutlassFp8PerTensorConfig:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -776,7 +893,7 @@ class CutlassFp8BlockConfig:
 
     Activations stay BF16; the kernel quantizes them internally. This is not
     the TRTLLM block-FP8 activation pack. Packed precomputed routing with
-    SwiGLU and ``do_finalize=True``.
+    all flat CUTLASS activation semantics and ``do_finalize=True``.
     """
 
     @classmethod
@@ -791,6 +908,7 @@ class CutlassFp8BlockConfig:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into 128x128 FP8 block scales."""
@@ -802,6 +920,7 @@ class CutlassFp8BlockConfig:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -814,8 +933,8 @@ class CutlassMxfp8Mxfp4Config:
     """CUTLASS MXFP8-activation x MXFP4-weight backend for SM100 / SM110 / SM12x.
 
     Activations are MXFP8 with a swizzled ``input_sf``. Weights are packed
-    MXFP4 viewed as int64 at launch. Packed precomputed routing with SwiGLU
-    and ``do_finalize=True``. Both ``hidden_size`` and ``intermediate_size``
+    MXFP4 viewed as int64 at launch. Packed precomputed routing with all flat
+    CUTLASS activation semantics and ``do_finalize=True``. Both ``hidden_size`` and ``intermediate_size``
     must be divisible by 128.
     """
 
@@ -831,6 +950,7 @@ class CutlassMxfp8Mxfp4Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into CUTLASS MXFP4."""
@@ -842,6 +962,7 @@ class CutlassMxfp8Mxfp4Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -863,7 +984,8 @@ class CutlassMxfp8Config:
     Activations are MXFP8 with a swizzled ``input_sf``. Weights stay E4M3 with
     packed int32 scale tiles. ``hidden_size`` and ``intermediate_size`` must be
     divisible by 128 so the gated fc1 scale layout matches the binding.
-    Packed precomputed routing with SwiGLU and ``do_finalize=True``.
+    Packed precomputed routing with all flat CUTLASS activation semantics and
+    ``do_finalize=True``.
     """
 
     @classmethod
@@ -878,6 +1000,7 @@ class CutlassMxfp8Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into CUTLASS MXFP8."""
@@ -889,6 +1012,7 @@ class CutlassMxfp8Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -908,7 +1032,8 @@ class CutlassW4A8Config:
     """CUTLASS INT4-weight x FP8-activation backend for SM90.
 
     Activations stay BF16; the kernel quantizes them internally with the packed
-    mixed-input INT4 layout. Packed precomputed routing with SwiGLU and
+    mixed-input INT4 layout. Packed precomputed routing with all flat CUTLASS
+    activation semantics and
     ``do_finalize=True``.
     """
 
@@ -924,6 +1049,7 @@ class CutlassW4A8Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into SM90 interleaved INT4."""
@@ -935,6 +1061,7 @@ class CutlassW4A8Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -947,7 +1074,8 @@ class CutlassHummingConfig:
     """CUTLASS Humming MXFP4-weight x FP8-activation backend for SM90.
 
     Activations stay BF16; weights use Humming pre-MMA E8M0 fusion plus the
-    SM90 mixed-input interleave. Packed precomputed routing with SwiGLU and
+    SM90 mixed-input interleave. Packed precomputed routing with all flat
+    CUTLASS activation semantics and
     ``do_finalize=True``.
     """
 
@@ -963,6 +1091,7 @@ class CutlassHummingConfig:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Quantize canonical BF16 weights into the Humming mixed-input layout."""
@@ -974,6 +1103,7 @@ class CutlassHummingConfig:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -1001,6 +1131,7 @@ class CuteDslConfig:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Build the ``cute_dsl_nvfp4`` weight view from canonical bf16 weights.
@@ -1016,6 +1147,7 @@ class CuteDslConfig:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
+            activation=activation,
             device=device,
         )
 
@@ -1039,7 +1171,7 @@ class B12xNvfp4Config:
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
-        activation: ActivationConfig = ActivationConfig.swiglu,
+        activation: Optional[ActivationConfig] = None,
         device=None,
     ):
         """Build the ``b12x_nvfp4`` weight view from canonical bf16 weights.
@@ -1048,7 +1180,7 @@ class B12xNvfp4Config:
         See :func:`flashinfer.fused_moe.prepare.prepare_b12x_nvfp4_weights`.
         """
         from .prepare import prepare_b12x_nvfp4_weights
-        from .utils import get_b12x_activation_name
+        from .utils import resolve_b12x_activation_name
 
         return prepare_b12x_nvfp4_weights(
             w1_bf16,
@@ -1056,7 +1188,7 @@ class B12xNvfp4Config:
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            activation=get_b12x_activation_name(activation.type),
+            activation=resolve_b12x_activation_name(activation),
             device=device,
         )
 
@@ -1081,7 +1213,7 @@ class B12xW4A16Config:
         w2_blockscale,
         w2_global_scale,
         *,
-        activation: ActivationConfig = ActivationConfig.swiglu,
+        activation: Optional[ActivationConfig] = None,
         source_format: str = "modelopt",
     ):
         """Build the ``b12x_w4a16`` weight view from checkpoint fp4 weights.
@@ -1090,7 +1222,7 @@ class B12xW4A16Config:
         See :func:`flashinfer.fused_moe.prepare.prepare_b12x_w4a16_weights`.
         """
         from .prepare import prepare_b12x_w4a16_weights
-        from .utils import get_b12x_activation_name
+        from .utils import resolve_b12x_activation_name
 
         return prepare_b12x_w4a16_weights(
             w1_fp4,
@@ -1099,7 +1231,7 @@ class B12xW4A16Config:
             w2_fp4,
             w2_blockscale,
             w2_global_scale,
-            activation=get_b12x_activation_name(activation.type),
+            activation=resolve_b12x_activation_name(activation),
             source_format=source_format,
         )
 
@@ -1225,9 +1357,7 @@ class MoEConfig:
     routing: RoutingConfig
     quant: QuantConfig
     experts: ExpertConfig
-    activation: ActivationConfig = field(
-        default_factory=lambda: ActivationConfig(ActivationType.Swiglu)
-    )
+    activation: ActivationConfig = field(default_factory=SwiGLU)
     backend: BackendOptions = field(default_factory=lambda: _DEFAULT_BACKEND)
     execution: ExecutionConfig = field(default_factory=ExecutionConfig)
     # Appended last so existing positional construction keeps working.
