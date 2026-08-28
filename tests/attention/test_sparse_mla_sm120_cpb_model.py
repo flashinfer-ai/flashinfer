@@ -133,9 +133,62 @@ def clean_cpb_state(monkeypatch, tmp_path):
     monkeypatch.setattr(cpb_mod, "_cache_mtime", -1.0)
     cpb_mod._constants.clear()
     cpb_mod._failed.clear()
+    cpb_mod._crossover.clear()
+    cpb_mod._crossover_failed.clear()
     yield tmp_path
     cpb_mod._constants.clear()
     cpb_mod._failed.clear()
+    cpb_mod._crossover.clear()
+    cpb_mod._crossover_failed.clear()
+
+
+def test_crossover_persistence_round_trip(clean_cpb_state, monkeypatch) -> None:
+    """Crossover tables merge into the JSON document and survive reload."""
+    device = torch.device("cpu")
+    cpb_mod.save_crossover(device, {"dsv4|64|512": 32, "dsv4|64|1024": 64})
+    cpb_mod.save_crossover(device, {"dsv3_2|64|2048": 16, "glm_nsa|64|2048": 8})
+    cpb_mod._crossover.clear()
+    monkeypatch.setattr(cpb_mod, "_cache_mtime", -1.0)
+    assert cpb_mod.get_decode_max_tokens(device, "dsv4", 64, 512) == 32
+    assert cpb_mod.get_decode_max_tokens(device, "dsv4", 64, 1024) == 64
+    assert cpb_mod.get_decode_max_tokens(device, "glm_nsa", 64, 2048) == 8
+    assert cpb_mod.get_decode_max_tokens(device, "dsv4", 8, 128) is None
+    assert cpb_mod.has_crossover(device, "dsv4")
+    assert cpb_mod.has_crossover(device, "dsv3_2")
+
+
+def test_v1_file_loads_constants_without_crossover(
+    clean_cpb_state, monkeypatch
+) -> None:
+    """A schema-v1 cache yields constants but an absent crossover table."""
+    import json
+    from dataclasses import asdict
+
+    device = torch.device("cpu")
+    path = cpb_mod.default_cache_path()
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "devices": {"0:Fake GPU": {"dsv4": asdict(_C)}},
+            }
+        )
+        + "\n"
+    )
+    assert cpb_mod.get_constants(device, "dsv4") == _C
+    assert cpb_mod.get_decode_max_tokens(device, "dsv4", 64, 512) is None
+    assert not cpb_mod.has_crossover(device, "dsv4")
+
+
+def test_dsv3_2_crossover_requires_glm_nsa_entries(
+    clean_cpb_state, monkeypatch
+) -> None:
+    """has_crossover('dsv3_2') needs both the dsv3_2 and glm_nsa key spaces."""
+    device = torch.device("cpu")
+    cpb_mod.save_crossover(device, {"dsv3_2|64|2048": 16})
+    assert not cpb_mod.has_crossover(device, "dsv3_2")
+    cpb_mod.save_crossover(device, {"glm_nsa|64|2048": 8})
+    assert cpb_mod.has_crossover(device, "dsv3_2")
 
 
 def test_persistence_round_trip(clean_cpb_state, monkeypatch) -> None:

@@ -38,6 +38,9 @@ from __future__ import annotations
 
 import re
 
+import pytest
+import torch
+
 import flashinfer
 from flashinfer.mla import (
     SparseMLASm120DecodeConfig,
@@ -139,7 +142,7 @@ def test_error_message_names_topk_mismatch() -> None:
     )
     assert "topk=384 is not instantiated for num_heads=64" in msg
     assert "available topk: [128, 192, 256, 512, 1024]" in msg
-    assert "num_tokens > 64" in msg
+    assert "prefill envelope both reject" in msg
     assert "supported_sparse_mla_sm120_configs" in msg
     # The matching page size must not be blamed.
     assert "page_block_size=64 is unsupported" not in msg
@@ -225,3 +228,87 @@ def test_error_message_keeps_shape_summary_format() -> None:
         extra_topk=0,
     )
     assert re.search(r"no decode kernel.*num_tokens=1, num_heads=16, topk=384", msg)
+    assert re.search(r"no decode kernel.*num_tokens=1, num_heads=16, topk=384", msg)
+
+
+# Crossover-aware decode-form routing (pure Python; no GPU).
+
+
+@pytest.fixture
+def known_crossover(monkeypatch):
+    """Inject a decode_max_tokens lookup without touching disk state."""
+    import flashinfer.mla._sparse_mla_sm120 as sm
+    from flashinfer.mla import _sparse_mla_sm120_cpb as cpb_mod
+
+    table = {}
+    monkeypatch.setattr(
+        cpb_mod,
+        "get_decode_max_tokens",
+        lambda device, family, num_heads, topk: table.get(
+            f"{family}|{num_heads}|{topk}"
+        ),
+    )
+    return sm, table
+
+
+def test_route_decode_form_uninstantiated_goes_prefill(known_crossover) -> None:
+    """A shape outside the decode sets routes to prefill, not an error."""
+    sm, _ = known_crossover
+    assert not sm._route_decode_form(
+        _MODEL_TYPE_DSV4, 64, 2048, 64, 32, False, torch.device("cpu")
+    )
+    assert not sm._route_decode_form(
+        _MODEL_TYPE_DSV3_2, 48, 2048, 64, 8, False, torch.device("cpu")
+    )
+
+
+def test_route_decode_form_unknown_crossover_keeps_decode(known_crossover) -> None:
+    """Instantiated shape, no calibration: the decode-first default holds."""
+    sm, _ = known_crossover
+    for num_tokens in (1, _DECODE_MAX_TOKENS):
+        assert sm._route_decode_form(
+            _MODEL_TYPE_DSV4, 64, 512, 64, num_tokens, False, torch.device("cpu")
+        )
+
+
+def test_route_decode_form_honors_crossover(known_crossover) -> None:
+    """Instantiated shape with crossover=8: T<=8 decodes, T>8 prefills."""
+    sm, table = known_crossover
+    table["dsv4|64|512"] = 8
+    assert sm._route_decode_form(
+        _MODEL_TYPE_DSV4, 64, 512, 64, 8, False, torch.device("cpu")
+    )
+    assert not sm._route_decode_form(
+        _MODEL_TYPE_DSV4, 64, 512, 64, 16, False, torch.device("cpu")
+    )
+
+
+def test_route_decode_form_crossover_zero_always_prefill(known_crossover) -> None:
+    """decode_max_tokens=0 (decode never wins) routes even T=1 to prefill."""
+    sm, table = known_crossover
+    table["dsv3_2|64|2048"] = 0
+    assert not sm._route_decode_form(
+        _MODEL_TYPE_DSV3_2, 64, 2048, 64, 1, False, torch.device("cpu")
+    )
+
+
+def test_route_decode_form_above_decode_form_cutoff(known_crossover) -> None:
+    """num_tokens > 64 is prefill regardless of instantiation/crossover."""
+    sm, _ = known_crossover
+    assert not sm._route_decode_form(
+        _MODEL_TYPE_DSV4,
+        64,
+        512,
+        64,
+        _DECODE_MAX_TOKENS + 1,
+        False,
+        torch.device("cpu"),
+    )
+
+
+def test_route_decode_form_page_block_size_mismatch(known_crossover) -> None:
+    """A non-64 page size is decode-uninstantiated and routes to prefill."""
+    sm, _ = known_crossover
+    assert not sm._route_decode_form(
+        _MODEL_TYPE_DSV4, 64, 512, 32, 8, False, torch.device("cpu")
+    )

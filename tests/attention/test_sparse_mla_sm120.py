@@ -439,7 +439,12 @@ def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation(
 
 
 def test_sparse_mla_sm120_decode_unsupported_shape_fails_before_prefill() -> None:
-    """An unsupported decode shape raises instead of entering prefill."""
+    """A shape served by neither decode nor the prefill envelope raises.
+
+    Decode-form calls whose shape is not decode-instantiated now route to
+    prefill; this shape (topk=384) is outside the DSV4 prefill envelope too,
+    so the FFI dispatch failure is converted to the diagnostic ValueError.
+    """
     device = torch.device("cuda")
     num_tokens, num_heads, topk = 1, 16, 384
     d_qk = d_v = 512
@@ -452,7 +457,7 @@ def test_sparse_mla_sm120_decode_unsupported_shape_fails_before_prefill() -> Non
     )
     out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=device)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="prefill envelope both reject"):
         sparse_mla_sm120_paged_attention(
             q,
             kv_cache,
@@ -1901,3 +1906,250 @@ def test_sparse_mla_sm120_prefill_impl_rejects_unknown_string() -> None:
     case = _make_dsv3_2_prefill_case(64, num_tokens=128)
     with pytest.raises(ValueError, match="prefill_impl"):
         _run_prefill_impl(case, "sg")
+
+
+@pytest.mark.parametrize("num_heads", [8, 64])
+def test_sparse_mla_sm120_decode_form_prefill_fallback(num_heads: int) -> None:
+    """A decode-form call at a prefill-legal but decode-uninstantiated shape
+    (DSv4 topk=2048; the decode sets stop at topk=1024) routes to prefill and
+    matches the reference."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_tokens, topk = 32, 2048
+    d_qk, d_v = 512, 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+    )
+
+    torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_crossover_routing_spy(monkeypatch) -> None:
+    """Injected crossover (decode_max_tokens=8): T=8 routes to the decode
+    kernel, T=16 routes to prefill; both match the reference."""
+    from flashinfer.mla import _sparse_mla_sm120 as sm
+    from flashinfer.mla import _sparse_mla_sm120_cpb as cpb_mod
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_heads, topk = 64, 512
+    d_qk, d_v = 512, 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4(kv_packed)
+    sm_scale = d_qk**-0.5
+
+    # Inject the crossover table in-process and invalidate the routing memo.
+    dev_key = cpb_mod._device_key(device)
+    monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
+    monkeypatch.setitem(cpb_mod._crossover, dev_key, {"dsv4|64|512": 8})
+    monkeypatch.setattr(cpb_mod, "_constants_version", cpb_mod._constants_version + 1)
+    sm._route_hot_cache.clear()
+
+    real_decode = sm.sparse_mla_sm120_decode_dsv4
+    calls = {"decode": 0}
+
+    def spy(*args, **kwargs):
+        calls["decode"] += 1
+        return real_decode(*args, **kwargs)
+
+    monkeypatch.setattr(sm, "sparse_mla_sm120_decode_dsv4", spy)
+
+    runner = sm._SparseMLAPagedAttentionRunner()
+    for num_tokens, expect_decode in ((8, True), (16, False)):
+        q = (
+            torch.randn(
+                num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16
+            )
+            / 10.0
+        ).clamp(-1, 1)
+        indices = torch.randint(
+            0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+        )
+        indices[:, topk // 2 :] = -1
+        ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+        output = torch.zeros(
+            (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+        )
+        calls["decode"] = 0
+        out_lse = runner.run(q, kv_packed, indices, output, sm_scale, return_lse=True)
+        assert (calls["decode"] == 1) == expect_decode
+        torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_crossover_cuda_graph(monkeypatch) -> None:
+    """Crossover dispatch under CUDA graphs (dsv4, H=128, topk=1024): with an
+    injected decode_max_tokens=16 a T=8 capture bakes in decode split-K and a
+    T=32 capture bakes in prefill; both replay correctly on fresh data. A T=8
+    capture without crossover constants pins the uncalibrated decode default."""
+    from flashinfer.mla import _sparse_mla_sm120 as sm
+    from flashinfer.mla import _sparse_mla_sm120_cpb as cpb_mod
+    from flashinfer.mla import _sparse_mla_sm120_plan as plan_mod
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    num_heads, topk = 128, 1024
+    d_qk, d_v = 512, 512
+    page_block_size = 64
+    num_blocks = 64
+    s_kv = num_blocks * page_block_size
+    num_splits = sm._decode_dsv4_num_splits(topk)
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4(kv_packed)
+    sm_scale = d_qk**-0.5
+
+    dev_key = cpb_mod._device_key(device)
+    monkeypatch.setattr(cpb_mod, "_maybe_load_disk", lambda: None)
+
+    real_decode = sm.sparse_mla_sm120_decode_dsv4
+    calls = {"decode": 0}
+
+    def spy(*args, **kwargs):
+        calls["decode"] += 1
+        return real_decode(*args, **kwargs)
+
+    monkeypatch.setattr(sm, "sparse_mla_sm120_decode_dsv4", spy)
+    runner = sm._SparseMLAPagedAttentionRunner()
+
+    def fresh_inputs(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+        q = (
+            torch.randn(
+                num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16
+            )
+            / 10.0
+        ).clamp(-1, 1)
+        indices = torch.randint(
+            0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+        )
+        indices[:, topk // 2 :] = -1
+        return q, indices
+
+    def capture(num_tokens: int):
+        # Everything the replay path touches — static buffers, the fresh
+        # replay payload, and its eager reference — is allocated BEFORE
+        # capture: the captured call performs a small internal allocation
+        # whose block would otherwise be recycled into post-capture tensors
+        # that g.replay() then overwrites.
+        q_s, idx_s = fresh_inputs(num_tokens)
+        q_new, idx_new = fresh_inputs(num_tokens)
+        ref_out, ref_lse = _ref_sparse_attn(q_new, kv_dequant, idx_new, sm_scale, d_v)
+        out_s = torch.zeros(
+            num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
+        )
+        lse_s = torch.zeros(num_tokens, num_heads, dtype=torch.float32, device=device)
+        mid_o = torch.empty(
+            num_tokens, num_heads, num_splits, d_v, dtype=torch.bfloat16, device=device
+        )
+        mid_l = torch.empty(
+            num_tokens, num_heads, num_splits, dtype=torch.float32, device=device
+        )
+
+        def run() -> None:
+            runner.run(
+                q_s,
+                kv_packed,
+                idx_s,
+                out_s,
+                sm_scale,
+                out_lse=lse_s,
+                mid_out=mid_o,
+                mid_lse=mid_l,
+            )
+
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                run()
+        torch.cuda.current_stream().wait_stream(s)
+        calls["decode"] = 0
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            run()
+        return g, q_s, idx_s, out_s, lse_s, q_new, idx_new, ref_out, ref_lse
+
+    def replay_and_check(
+        g, q_s, idx_s, out_s, lse_s, q_new, idx_new, ref_out, ref_lse
+    ) -> None:
+        q_s.copy_(q_new)
+        idx_s.copy_(idx_new)
+        out_s.zero_()
+        lse_s.zero_()
+        g.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out_s, ref_out, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(lse_s, ref_lse, atol=5e-2, rtol=5e-2)
+
+    # No crossover constants: the decode-first default survives capture.
+    monkeypatch.delitem(cpb_mod._crossover, dev_key, raising=False)
+    monkeypatch.setattr(cpb_mod, "_constants_version", cpb_mod._constants_version + 1)
+    plan_mod._plan_memo.clear()
+    res = capture(8)
+    assert calls["decode"] == 1
+    replay_and_check(*res)
+
+    # Injected crossover decode_max_tokens=16: T=8 -> decode, T=32 -> prefill.
+    monkeypatch.setitem(cpb_mod._crossover, dev_key, {"dsv4|128|1024": 16})
+    monkeypatch.setattr(cpb_mod, "_constants_version", cpb_mod._constants_version + 1)
+    plan_mod._plan_memo.clear()
+    res = capture(8)
+    assert calls["decode"] == 1
+    replay_and_check(*res)
+    res = capture(32)
+    assert calls["decode"] == 0
+    replay_and_check(*res)
+
+

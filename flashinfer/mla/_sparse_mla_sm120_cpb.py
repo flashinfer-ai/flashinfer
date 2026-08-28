@@ -35,6 +35,13 @@ once per device (in ``autotune()`` tuning mode), and a closed-form model
 picks cpb per call, with an L2-footprint guard rail for the head-tile reuse
 window (see :func:`select_cpb`). Without calibrated constants the launcher's
 built-in heuristic is used.
+
+The same tuning-mode pass also measures the decode/prefill crossover per
+decode-instantiated ``(num_heads, topk)`` config (:func:`calibrate_crossover`)
+and persists it as ``decode_max_tokens`` in the same JSON document (schema
+version 2; v1 files load constants only). The runtime decode/prefill routing
+in :mod:`._sparse_mla_sm120` consults it; absent entries keep the historical
+decode-first policy.
 """
 
 from __future__ import annotations
@@ -55,9 +62,18 @@ logger = logging.getLogger(__name__)
 _BI = 64  # chunk width in candidates (BLOCK_SIZE_N)
 _HPB = 16  # head tile per block
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+# v1 files predate the crossover table: constants load, crossover counts as
+# absent and the runtime falls back to the default decode-first policy.
+_LOADABLE_SCHEMA_VERSIONS = (1, 2)
 _BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656}
 _D_QK = {"dsv4": 512, "dsv3_2": 576}
+
+# Device-level key in the JSON payload holding the crossover table.
+_DECODE_MAX_TOKENS_KEY = "decode_max_tokens"
+# Probe grid and decode-wins margin for crossover calibration.
+_CROSSOVER_PROBED_T = (4, 8, 16, 24, 32, 48, 64)
+_CROSSOVER_MARGIN = 0.95
 
 # (num_tokens, num_heads, topk, chunks_per_block); see calibrate().
 _MEASUREMENTS = (
@@ -182,6 +198,28 @@ def select_cpb(
     return capped_cpb or best_cpb
 
 
+def _allocate_kv_pool(family: str, device: torch.device) -> tuple[torch.Tensor, int]:
+    """Allocate a ~2 GiB paged KV pool for ``family`` (halved on OOM down to
+    512 MiB) and return it with its slot count. The 2-D ``[blocks, bytes]``
+    form is accepted by the FFI binding, which derives the block stride from
+    the tensor metadata."""
+    w = _BI * _BYTES_PER_TOKEN[family]
+    pool_bytes = _POOL_BYTES_TARGET
+    while True:
+        try:
+            kv_cache = torch.empty(pool_bytes // w, w, dtype=torch.uint8, device=device)
+            break
+        except torch.cuda.OutOfMemoryError:
+            if pool_bytes <= _POOL_BYTES_MIN:
+                raise CalibrationError(
+                    f"cannot allocate a >= {_POOL_BYTES_MIN >> 20} MiB KV pool "
+                    "for sparse-MLA cpb calibration"
+                ) from None
+            pool_bytes //= 2
+            torch.cuda.empty_cache()
+    return kv_cache, kv_cache.shape[0] * _BI
+
+
 def _time_call(call: Callable[[], None]) -> float:
     """Min CUDA-event wall time (seconds) over warmup + timed iterations."""
     for _ in range(_WARMUP_ITERS):
@@ -193,6 +231,44 @@ def _time_call(call: Callable[[], None]) -> float:
     for _ in range(_TIMED_ITERS):
         start.record()
         call()
+        end.record()
+        torch.cuda.synchronize()
+        best = min(best, start.elapsed_time(end) / 1e3)
+    return best
+
+
+def _time_call_fresh_indices(
+    call: Callable[[torch.Tensor], None],
+    num_tokens: int,
+    topk: int,
+    num_slots: int,
+    device: torch.device,
+) -> float:
+    """Like :func:`_time_call`, but every rep (warmup included) gets a freshly
+    drawn full-pool uniform index set.
+
+    ``num_tokens * topk * bytes_per_token`` fits in L2 at these sizes, so
+    reusing one index set across reps makes the KV working set L2-resident
+    after warmup and understates the HBM-bound steady state — this tainted
+    earlier calibration rounds (decode looked artificially fast). The redraw
+    runs outside the timed region.
+    """
+
+    def fresh() -> torch.Tensor:
+        return torch.randint(
+            0, num_slots, (num_tokens, topk), dtype=torch.int32, device=device
+        )
+
+    for _ in range(_WARMUP_ITERS):
+        call(fresh())
+    torch.cuda.synchronize()
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    best = float("inf")
+    for _ in range(_TIMED_ITERS):
+        indices = fresh()
+        start.record()
+        call(indices)
         end.record()
         torch.cuda.synchronize()
         best = min(best, start.elapsed_time(end) / 1e3)
@@ -220,20 +296,7 @@ def calibrate(
     w = _BI * _BYTES_PER_TOKEN[family]
     d_qk = _D_QK[family]
 
-    pool_bytes = _POOL_BYTES_TARGET
-    while True:
-        try:
-            kv_cache = torch.empty(pool_bytes // w, w, dtype=torch.uint8, device=device)
-            break
-        except torch.cuda.OutOfMemoryError:
-            if pool_bytes <= _POOL_BYTES_MIN:
-                raise CalibrationError(
-                    f"cannot allocate a >= {_POOL_BYTES_MIN >> 20} MiB KV pool "
-                    "for sparse-MLA cpb calibration"
-                ) from None
-            pool_bytes //= 2
-            torch.cuda.empty_cache()
-    num_slots = kv_cache.shape[0] * _BI
+    kv_cache, num_slots = _allocate_kv_pool(family, device)
 
     module = module_getter()
 
@@ -364,6 +427,180 @@ def calibrate(
     )
 
 
+def calibrate_crossover(
+    module: Any, device: torch.device, family: str, c: CpbConstants
+) -> dict[str, int]:
+    """Measure the decode/prefill crossover for the decode-instantiated
+    configs of ``family`` on ``device``.
+
+    For every instantiated ``(num_heads, topk)`` pair, both paths are timed at
+    each probed T with the HBM-faithful protocol of
+    :func:`_time_call_fresh_indices`: the decode kernel runs with the model's
+    ``select_cpb`` pick; the prefill orchestrator runs with
+    ``prefill_impl=auto`` (swapAB preferred where instantiated). Family
+    ``"dsv3_2"`` covers both the ``dsv3_2`` and ``glm_nsa`` key spaces because
+    the scale format changes prefill speed; the decode kernel is timed with
+    the matching ``model_type`` too. A config the prefill envelope does not
+    serve (e.g. DSV3_2-family topk != 2048) records ``decode_max_tokens=64``.
+
+    Returns a flat ``{"<family>|<num_heads>|<topk>": decode_max_tokens}``
+    table: the largest probed T with ``decode_time <= 0.95 * prefill_time``,
+    ``0`` when decode never wins, ``64`` when it wins everywhere probed.
+    """
+    from ._sparse_mla_sm120 import (
+        _DECODE_DSV3_2_DISPATCH,
+        _DECODE_DSV4_DISPATCH,
+        _MODEL_TYPE_DSV3_2,
+        _MODEL_TYPE_DSV4,
+        _MODEL_TYPE_GLM_NSA,
+        _PREFILL_IMPL_AUTO,
+    )
+
+    device = torch.device(device)
+    if family == "dsv4":
+        # (key prefix, instantiation set, FFI model_type)
+        spaces = [("dsv4", sorted(_DECODE_DSV4_DISPATCH), _MODEL_TYPE_DSV4)]
+    elif family == "dsv3_2":
+        spaces = [
+            ("dsv3_2", sorted(_DECODE_DSV3_2_DISPATCH), _MODEL_TYPE_DSV3_2),
+            ("glm_nsa", sorted(_DECODE_DSV3_2_DISPATCH), _MODEL_TYPE_GLM_NSA),
+        ]
+    else:
+        raise ValueError(f"unknown sparse-MLA family {family!r}")
+
+    d_qk = _D_QK[family]
+    sm_scale = d_qk**-0.5
+    kv_cache, num_slots = _allocate_kv_pool(family, device)
+
+    def time_decode(
+        num_tokens: int, num_heads: int, topk: int, model_type: int
+    ) -> float:
+        num_splits = _ceil_div(topk, _BI)
+        cpb = select_cpb(num_tokens, num_heads, topk, 0, c)
+        q = (
+            (
+                torch.randn(
+                    num_tokens, num_heads, d_qk, device=device, dtype=torch.float32
+                )
+                / 10.0
+            )
+            .clamp(-1, 1)
+            .to(torch.bfloat16)
+        )
+        mid_out = torch.empty(
+            num_tokens, num_heads, num_splits, 512, dtype=torch.bfloat16, device=device
+        )
+        mid_lse = torch.empty(
+            num_tokens, num_heads, num_splits, dtype=torch.float32, device=device
+        )
+        output = torch.empty(
+            num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device
+        )
+        out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
+        if family == "dsv4":
+
+            def call(indices: torch.Tensor) -> None:
+                module.sparse_mla_sm120_decode_dsv4(
+                    q,
+                    kv_cache,
+                    indices,
+                    mid_out,
+                    mid_lse,
+                    output,
+                    out_lse,
+                    num_splits,
+                    sm_scale,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    cpb,
+                )
+
+        else:
+
+            def call(indices: torch.Tensor) -> None:
+                module.sparse_mla_sm120_decode_dsv3_2(
+                    q,
+                    kv_cache,
+                    indices,
+                    mid_out,
+                    mid_lse,
+                    output,
+                    out_lse,
+                    num_splits,
+                    sm_scale,
+                    None,
+                    None,
+                    model_type,
+                    cpb,
+                )
+
+        return _time_call_fresh_indices(call, num_tokens, topk, num_slots, device)
+
+    def time_prefill(
+        num_tokens: int, num_heads: int, topk: int, model_type: int
+    ) -> float:
+        q = (
+            (
+                torch.randn(
+                    num_tokens, num_heads, d_qk, device=device, dtype=torch.float32
+                )
+                / 10.0
+            )
+            .clamp(-1, 1)
+            .to(torch.bfloat16)
+        )
+        output = torch.empty(
+            num_tokens, num_heads, 512, dtype=torch.bfloat16, device=device
+        )
+        out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
+
+        def call(indices: torch.Tensor) -> None:
+            module.sparse_mla_sm120_paged_attention(
+                q,
+                kv_cache,
+                indices,
+                output,
+                out_lse,
+                sm_scale,
+                model_type,
+                _PREFILL_IMPL_AUTO,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+        try:
+            # One probe launch: shapes outside the prefill envelope (e.g.
+            # DSV3_2-family topk != 2048) fail dispatch before any kernel
+            # launch, so catching here cannot leave a poisoned CUDA context.
+            call(
+                torch.randint(
+                    0, num_slots, (num_tokens, topk), dtype=torch.int32, device=device
+                )
+            )
+            torch.cuda.synchronize()
+        except RuntimeError:
+            return float("inf")
+        return _time_call_fresh_indices(call, num_tokens, topk, num_slots, device)
+
+    table: dict[str, int] = {}
+    for prefix, pairs, model_type in spaces:
+        for num_heads, topk in pairs:
+            best = 0
+            for num_tokens in _CROSSOVER_PROBED_T:
+                t_dec = time_decode(num_tokens, num_heads, topk, model_type)
+                t_pre = time_prefill(num_tokens, num_heads, topk, model_type)
+                if t_dec <= _CROSSOVER_MARGIN * t_pre:
+                    best = num_tokens
+            table[f"{prefix}|{num_heads}|{topk}"] = best
+    return table
+
+
 def default_cache_path() -> pathlib.Path:
     """Default disk path for the calibrated cpb constants.
 
@@ -382,6 +619,9 @@ def default_cache_path() -> pathlib.Path:
 _cache_mtime: float = -1.0
 _constants: dict[tuple[str, str], CpbConstants] = {}
 _failed: set[tuple[str, str]] = set()
+# dev_key -> flat {"<family>|<num_heads>|<topk>": decode_max_tokens} table.
+_crossover: dict[str, dict[str, int]] = {}
+_crossover_failed: set[tuple[str, str]] = set()
 # Bumped whenever new constants enter the process (disk load or save), so
 # select_cpb memoization keyed on it never serves stale picks.
 _constants_version: int = 0
@@ -415,7 +655,10 @@ def _maybe_load_disk() -> None:
         return
     try:
         payload = json.loads(path.read_text())
-        if not isinstance(payload, dict) or payload.get("schema_version") != _SCHEMA_VERSION:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") not in _LOADABLE_SCHEMA_VERSIONS
+        ):
             return
         devices = payload["devices"]
         if not isinstance(devices, dict):
@@ -424,16 +667,22 @@ def _maybe_load_disk() -> None:
         # publish a prefix of the entries while leaving mtime/version stale.
         new_constants: dict = {}
         new_crossover: dict = {}
-        new_constants: dict = {}
         for dev_key, families in devices.items():
             if not isinstance(families, dict):
                 continue
             for family, raw in families.items():
+                if family == _DECODE_MAX_TOKENS_KEY:
+                    if isinstance(raw, dict):
+                        new_crossover[dev_key] = {
+                            str(k): int(v) for k, v in raw.items()
+                        }
+                    continue
                 new_constants[(dev_key, family)] = CpbConstants(**raw)
     except (OSError, ValueError, TypeError, KeyError):
         # Keep mtime unchanged so the next cold call retries.
         return
     _constants.update(new_constants)
+    _crossover.update(new_crossover)
     _cache_mtime = mtime
     _constants_version += 1
 
@@ -458,8 +707,11 @@ def save_constants(device: torch.device, family: str, c: CpbConstants) -> None:
     payload: dict = {"schema_version": _SCHEMA_VERSION, "devices": {}}
     try:
         existing = json.loads(path.read_text())
-        if isinstance(existing, dict) and existing.get("schema_version") == _SCHEMA_VERSION:
+        if isinstance(existing, dict) and existing.get("schema_version") in (
+            _LOADABLE_SCHEMA_VERSIONS
+        ):
             payload = existing
+            payload["schema_version"] = _SCHEMA_VERSION
     except (OSError, ValueError):
         pass
     if not isinstance(payload.get("devices"), dict):
@@ -493,3 +745,87 @@ def mark_calibration_failed(device: torch.device, family: str) -> None:
 def is_calibration_failed(device: torch.device, family: str) -> bool:
     """True iff calibration already failed for (device, family) in-process."""
     return (_device_key(device), family) in _failed
+
+
+def save_crossover(device: torch.device, table: dict[str, int]) -> None:
+    """Merge a crossover table into the disk cache (read-modify-write, atomic
+    replace) and the process cache. Same failure semantics as
+    :func:`save_constants`."""
+    global _cache_mtime, _constants_version
+    dev_key = _device_key(device)
+    path = default_cache_path()
+    payload: dict = {"schema_version": _SCHEMA_VERSION, "devices": {}}
+    try:
+        existing = json.loads(path.read_text())
+        if isinstance(existing, dict) and existing.get("schema_version") in (
+            _LOADABLE_SCHEMA_VERSIONS
+        ):
+            payload = existing
+            payload["schema_version"] = _SCHEMA_VERSION
+    except (OSError, ValueError):
+        pass
+    if not isinstance(payload.get("devices"), dict):
+        payload["devices"] = {}
+    dev = payload["devices"].setdefault(dev_key, {})
+    if not isinstance(dev, dict):
+        dev = payload["devices"][dev_key] = {}
+    xo = dev.setdefault(_DECODE_MAX_TOKENS_KEY, {})
+    if not isinstance(xo, dict):
+        xo = dev[_DECODE_MAX_TOKENS_KEY] = {}
+    xo.update(table)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2) + "\n")
+        os.replace(tmp, path)
+    except OSError as e:
+        logger.warning(
+            "SM120 sparse-MLA crossover table not persisted to %s (%s); "
+            "using it in-process only.",
+            path,
+            e,
+        )
+    _crossover.setdefault(dev_key, {}).update(table)
+    _constants_version += 1
+    with contextlib.suppress(OSError):
+        _cache_mtime = path.stat().st_mtime
+
+
+def get_decode_max_tokens(
+    device: torch.device, family: str, num_heads: int, topk: int
+) -> Optional[int]:
+    """Calibrated crossover for one config; None when absent (default policy:
+    decode-form calls always take the decode kernel)."""
+    dev_key = _device_key(device)
+    table = _crossover.get(dev_key)
+    if table is None:
+        _maybe_load_disk()
+        table = _crossover.get(dev_key)
+    if table is None:
+        return None
+    return table.get(f"{family}|{num_heads}|{topk}")
+
+
+def has_crossover(device: torch.device, family: str) -> bool:
+    """True iff the process/disk cache holds crossover entries for ``family``.
+    The ``dsv3_2`` calibration covers both the ``dsv3_2`` and ``glm_nsa`` key
+    spaces, so both must be present."""
+    dev_key = _device_key(device)
+    table = _crossover.get(dev_key)
+    if table is None:
+        _maybe_load_disk()
+        table = _crossover.get(dev_key)
+    if not table:
+        return False
+    prefixes = ("dsv3_2|", "glm_nsa|") if family == "dsv3_2" else (f"{family}|",)
+    return all(any(k.startswith(p) for k in table) for p in prefixes)
+
+
+def mark_crossover_failed(device: torch.device, family: str) -> None:
+    """Suppress further crossover calibration for (device, family) in-process."""
+    _crossover_failed.add((_device_key(device), family))
+
+
+def is_crossover_failed(device: torch.device, family: str) -> bool:
+    """True iff crossover calibration already failed for (device, family)."""
+    return (_device_key(device), family) in _crossover_failed
