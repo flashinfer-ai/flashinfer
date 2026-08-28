@@ -20,6 +20,19 @@ import flashinfer
 from flashinfer.utils import get_compute_capability
 
 
+def _radix_filter_dsl_ok() -> bool:
+    """Dynamic probe: does the installed CuTe DSL support the vendored kernels?
+
+    is_backend_supported() is static (registration + CC lists only), so it
+    stays True on a supported arch even when nvidia-cutlass-dsl < 4.8 -- and
+    the API then rejects every call via the backend's fail-closed DSL check.
+    Tests must skip on such environments, not fail.
+    """
+    from flashinfer.topk_varlen.topk_varlen import _radix_filter_kernel_dsl_ok
+
+    return _radix_filter_kernel_dsl_ok()
+
+
 def _skip_unless_radix_filter(device: torch.device) -> None:
     cc = get_compute_capability(device)
     if cc[0] * 10 + cc[1] not in (100, 103, 107):
@@ -28,6 +41,8 @@ def _skip_unless_radix_filter(device: torch.device) -> None:
         "radix_filter", cc[0] * 10 + cc[1]
     ):
         pytest.skip("radix_filter not supported in this environment")
+    if not _radix_filter_dsl_ok():
+        pytest.skip("radix_filter requires nvidia-cutlass-dsl >= 4.8")
 
 
 @pytest.mark.parametrize(
@@ -104,6 +119,9 @@ def test_num_sms_cache_is_per_device():
 
     Regression for PR #4621 review (per-device SM-count cache).
     """
+    if not _radix_filter_dsl_ok():
+        pytest.skip("radix_filter kernels require nvidia-cutlass-dsl >= 4.8")
+
     from flashinfer.topk_varlen.kernels.filtered_topk_decode import _get_num_sms
 
     if torch.cuda.device_count() < 2:
@@ -205,7 +223,8 @@ def test_truncate_policy_rejects_topk_equal_to_smem_capacity():
 
     Regression for PR #4621 review (TRUNCATE boundary).
     """
-    pytest.importorskip("cutlass")
+    if not _radix_filter_dsl_ok():
+        pytest.skip("radix_filter kernels require nvidia-cutlass-dsl >= 4.8")
     import cutlass
 
     from flashinfer.topk_varlen.kernels.filtered_topk_util import (
