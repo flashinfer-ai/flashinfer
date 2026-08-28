@@ -59,6 +59,7 @@ from .jit.fp4_quantization import (
 )
 from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
 from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
+from .jit.vibecuda import VibeCUDABSATarget, gen_vibecuda_bsa_module
 from .jit.blackwell_msa import (
     BLACKWELL_MSA_VARIANTS_BY_TARGET,
     BlackwellMSATarget,
@@ -575,6 +576,13 @@ def gen_all_modules(
                 gen_blackwell_msa_module(variant, blackwell_msa_target)
                 for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[blackwell_msa_target]
             )
+    vibecuda_bsa_targets: tuple[tuple[VibeCUDABSATarget, bool], ...] = (
+        ("sm100a", has_sm100),
+        ("sm103a", has_sm103),
+    )
+    for vibecuda_bsa_target, enabled in vibecuda_bsa_targets:
+        if enabled:
+            jit_specs.append(gen_vibecuda_bsa_module(vibecuda_bsa_target))
 
     # CUDA 12.8 predates the SM100-family target and retains one exact B200
     # cubin per variant. CUDA 12.9+ registers one family cubin per variant.

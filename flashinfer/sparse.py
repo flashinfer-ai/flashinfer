@@ -341,7 +341,8 @@ class BlockSparseAttentionWrapper:
             in the split-k algorithm. The recommended size is 128MB, the device of the workspace
             buffer should be the same as the device of the input tensors.
         backend : str
-            The implementation backend, could be ``auto``/``fa2``/``fa3`` or ``cake``. Defaults to ``auto``.
+            The implementation backend, could be ``auto``/``fa2``/``fa3``/``cake`` or
+            ``vibecuda``. Defaults to ``auto``.
             If set to ``auto``, the function will automatically choose the backend based on the
             device architecture and kernel availability.
         """
@@ -351,7 +352,7 @@ class BlockSparseAttentionWrapper:
             float_workspace_buffer.numel() * float_workspace_buffer.element_size()
         )
         self._backend = _BACKEND_ALIASES.get(backend, backend)
-        if self._backend == "cake":
+        if self._backend in ("cake", "vibecuda"):
             # Cake consumes the caller's direct VSA metadata and never invokes
             # the generic sparse planner. Avoid allocating its per-wrapper 8 MiB
             # device/host workspaces: video diffusion creates one wrapper per
@@ -526,8 +527,8 @@ class BlockSparseAttentionWrapper:
             for head ``h``.  For GQA (``num_qo_heads > num_kv_heads``), when providing
             ``(num_qo_heads, MB, NB)``, the first QO-head from each KV-head group is used
             (sparsity must be the same across QO-heads that share a KV-head).
-            Supported by the ``cake``, ``vsa_sm100_blk128``, ``vsa_sm100_blk64``,
-            and ``vsa_sm120_blk64`` backends.  When provided,
+            Supported by the ``cake``, ``vibecuda``, ``vsa_sm100_blk128``,
+            ``vsa_sm100_blk64``, and ``vsa_sm120_blk64`` backends.  When provided,
             ``indptr``/``indices`` are not required and will be ignored.
         kv_block_lens : torch.Tensor, optional
             Number of valid tokens in every KV block, shape ``(NB,)``. Entries
@@ -596,6 +597,98 @@ class BlockSparseAttentionWrapper:
                 q_data_type=q_data_type,
                 sm_scale=sm_scale,
                 device=self.device,
+            )
+            self.M = M
+            self.N = N
+            self.R = R
+            self.C = C
+            self._sm_scale = sm_scale
+            return
+
+        # ---- VibeCUDA backend (GQA boolean-block-mask BSA CUDA kernel, SM100/SM103)
+        if self._backend == "vibecuda":
+            from flashinfer.vibecuda_bsa import (
+                vibecuda_bsa_split_g,
+                vibecuda_bsa_workspace_numel,
+            )
+
+            cc = get_compute_capability(self.device)
+            arch = cc[0] * 10 + cc[1]
+            if cc not in ((10, 0), (10, 3)):
+                raise RuntimeError(
+                    f"vibecuda backend requires SM100/SM103, "
+                    f"current device is SM{arch}"
+                )
+            # Square blocks at 64-token granularity match the kernel's staged
+            # 64-key chunk pipeline.
+            if R != C or R % 64 != 0:
+                raise ValueError(
+                    f"vibecuda backend requires R == C with R % 64 == 0 "
+                    f"(got R={R}, C={C})"
+                )
+            if head_dim not in (64, 96, 128):
+                raise ValueError(
+                    f"vibecuda backend requires head_dim in {{64, 96, 128}} "
+                    f"(got {head_dim})"
+                )
+            if q_data_type not in (torch.float16, torch.bfloat16):
+                raise ValueError(
+                    "vibecuda backend only supports float16 and bfloat16 inputs"
+                )
+            _vsa_common_checks(
+                "vibecuda",
+                R,
+                C,
+                M,
+                N,
+                num_qo_heads,
+                num_kv_heads,
+                mask,
+                packed_mask,
+                causal,
+                pos_encoding_mode,
+                logits_soft_cap,
+            )
+            if kv_data_type != q_data_type:
+                raise ValueError("vibecuda backend requires matching Q/K/V dtypes")
+
+            MB = M // R
+            NB = N // C
+            # The kernel reads the per-QO-head boolean block mask directly on
+            # device (no indptr/indices conversion); keep the plan-time tensor
+            # alive for every run.
+            if block_mask is None:
+                raise ValueError(
+                    "vibecuda backend requires a per-head boolean block_mask; "
+                    "BSR indptr/indices and direct q2k selections are not "
+                    "supported."
+                )
+            if block_mask.dtype != torch.bool:
+                raise ValueError(
+                    f"vibecuda backend requires a bool block_mask "
+                    f"(got {block_mask.dtype})"
+                )
+            if block_mask.shape != (num_qo_heads, MB, NB):
+                raise ValueError(
+                    f"block_mask must have shape (num_qo_heads={num_qo_heads}, "
+                    f"MB={MB}, NB={NB}), got {tuple(block_mask.shape)}"
+                )
+            self._vibecuda_block_mask = block_mask.contiguous()
+            # Split-G heuristic from the densest admitted (head, row) - the same
+            # policy used by the standalone functional API.
+            max_selected = (
+                int(block_mask.to(torch.int32).sum(dim=-1).max().item())
+                if block_mask.numel()
+                else 0
+            )
+            self._vibecuda_split_g = vibecuda_bsa_split_g(max_selected, R, N)
+            ws_numel = vibecuda_bsa_workspace_numel(
+                M, num_qo_heads, head_dim, self._vibecuda_split_g
+            )
+            self._vibecuda_workspace = (
+                torch.zeros(ws_numel, dtype=torch.float32, device=self.device)
+                if ws_numel > 0
+                else None
             )
             self.M = M
             self.N = N
@@ -1116,6 +1209,30 @@ class BlockSparseAttentionWrapper:
                 lse=lse,
                 return_lse=return_lse,
                 backend="cake",
+            )
+
+        # ---- VibeCUDA backend (GQA boolean-block-mask BSA CUDA kernel, SM100/SM103)
+        if self._backend == "vibecuda":
+            from flashinfer.vibecuda_bsa import vibecuda_block_sparse_attention
+
+            if scale_q is not None or scale_k is not None or scale_v is not None:
+                raise ValueError(
+                    "vibecuda backend does not accept FP8 scale tensors"
+                )
+            if getattr(self, "_vibecuda_block_mask", None) is None:
+                raise RuntimeError("plan() must be called before run()")
+            return vibecuda_block_sparse_attention(
+                q,
+                k,
+                v,
+                self._vibecuda_block_mask,
+                self.R,
+                sm_scale=self._sm_scale,
+                out=out,
+                lse=lse,
+                return_lse=return_lse,
+                workspace=self._vibecuda_workspace,
+                split_g=self._vibecuda_split_g,
             )
 
         # ---- VSA blk128 backend (BSA CuTe-DSL kernel, SM100/SM103) ---------------

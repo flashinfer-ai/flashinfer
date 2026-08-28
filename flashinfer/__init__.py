@@ -281,6 +281,9 @@ from .trtllm_low_latency_gemm import (
     prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
 )
 from .utils import next_positive_power_of_2 as next_positive_power_of_2
+from .vibecuda_bsa import (
+    vibecuda_block_sparse_attention as vibecuda_block_sparse_attention,
+)
 from .xqa import xqa as xqa
 from .xqa import xqa_mla as xqa_mla
 from . import mamba as mamba
