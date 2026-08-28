@@ -59,8 +59,10 @@ import torch
 
 from ...api_logging import flashinfer_api
 from ...trace.templates.moe import (
+    cute_dsl_fused_moe_mxfp8_mxfp4_trace,
     cute_dsl_fused_moe_trace,
     cute_dsl_moe_wrapper_run_trace,
+    cute_dsl_mxfp8_mxfp4_moe_wrapper_run_trace,
 )
 from ...tllm_enums import (
     ActivationType,
@@ -1373,7 +1375,7 @@ def cute_dsl_fused_moe(
 
 
 @supported_compute_capability([100, 103, 107])
-@flashinfer_api
+@flashinfer_api(trace=cute_dsl_fused_moe_trace)
 def cute_dsl_fused_moe_nvfp4(
     x: torch.Tensor,
     x_sf: Optional[torch.Tensor],
@@ -1415,6 +1417,12 @@ def cute_dsl_fused_moe_nvfp4(
     See :func:`cute_dsl_fused_moe` for the full parameter documentation; this
     function forwards every argument unchanged.
     """
+    warnings.warn(
+        "cute_dsl_fused_moe_nvfp4 is deprecated; use cute_dsl_fused_moe with "
+        "quant_mode='w4a4' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return cute_dsl_fused_moe(
         x,
         x_sf,
@@ -1448,7 +1456,7 @@ def cute_dsl_fused_moe_nvfp4(
 
 
 @supported_compute_capability([100, 103])
-@flashinfer_api
+@flashinfer_api(trace=cute_dsl_fused_moe_mxfp8_mxfp4_trace)
 def cute_dsl_fused_moe_mxfp8_mxfp4(
     x: torch.Tensor,
     x_sf: torch.Tensor,
@@ -1484,6 +1492,12 @@ def cute_dsl_fused_moe_mxfp8_mxfp4(
     it is forwarded as ``None``. See :func:`cute_dsl_fused_moe` for the full
     parameter documentation.
     """
+    warnings.warn(
+        "cute_dsl_fused_moe_mxfp8_mxfp4 is deprecated; use cute_dsl_fused_moe "
+        "with quant_mode='w4a8' instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     return cute_dsl_fused_moe(
         x,
         x_sf,
@@ -1557,6 +1571,12 @@ class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
         ignored. See :class:`CuteDslMoEWrapper` for the full parameter
         documentation.
         """
+        warnings.warn(
+            "CuteDslMxfp8Mxfp4MoEWrapper is deprecated; use CuteDslMoEWrapper "
+            "with quant_mode='w4a8' instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         super().__init__(
             num_experts=num_experts,
             top_k=top_k,
@@ -1575,7 +1595,7 @@ class CuteDslMxfp8Mxfp4MoEWrapper(CuteDslMoEWrapper):
             quant_mode="w4a8",
         )
 
-    @flashinfer_api
+    @flashinfer_api(trace=cute_dsl_mxfp8_mxfp4_moe_wrapper_run_trace)
     def run(
         self,
         x: torch.Tensor,
