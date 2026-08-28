@@ -36,6 +36,7 @@ from .sm100_blk64.dispatch_helpers import (
     sm100_blk64_requires_int64_kv_strides,
     dynamic_tensors_compile_key,
     sm100_blk64_auto_kv_splits,
+    sm100_blk64_auto_fp8_kv_splits,
     build_sm100_blk64_kv_split_offsets,
     resolve_sm100_blk64_split_workspace,
     choose_sm100_blk64_use_clc,
@@ -259,9 +260,17 @@ def bsa_attn_sm100_blk64_fwd(
     tile_n = 256
 
     if auto_kv_splits:
-        kv_splits_i = sm100_blk64_auto_kv_splits(
-            q_bhsd, q2k_block_index, uniform_block_sparse_num
-        )
+        if is_sage_fp8:
+            # Sage-FP8 requires a uniform top-k (validate_sm100_blk64_fp8_sage
+            # rejects q2k_block_nums), so uniform_block_sparse_num is always
+            # the FP8 heuristic's topk_num.
+            kv_splits_i = sm100_blk64_auto_fp8_kv_splits(
+                uniform_block_sparse_num, num_head, seqlen_q
+            )
+        else:
+            kv_splits_i = sm100_blk64_auto_kv_splits(
+                q_bhsd, q2k_block_index, uniform_block_sparse_num
+            )
     kv_splits_i = resolve_sm100_blk64_split_workspace(
         q_bhsd,
         head_dim_v,

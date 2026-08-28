@@ -260,6 +260,45 @@ def sm100_blk64_auto_kv_splits(
     return sm100_blk64_kv_splits_from_count(kv_blocks, max_kv_splits)
 
 
+def sm100_blk64_auto_fp8_kv_splits(
+    topk_num: int,
+    heads: int = 4,
+    seqlen_q: int = 64,
+) -> int:
+    """Choose KV splits for the Sage-FP8 blk64 path.
+
+    Ported from upstream Block-Sparse-Attention/bsa_attn_interface.py's
+    ``_sm100_blk64_auto_fp8_kv_splits``, which the port previously dropped:
+    Sage-FP8's ``kv_splits="auto"`` was silently falling back to
+    ``sm100_blk64_auto_kv_splits``/``sm100_blk64_kv_splits_from_count``, a
+    heuristic tuned on BF16 shapes with no FP8 validation. Thresholds below
+    are upstream's, tuned separately on FP8 shapes ("SLA 0709") -- not
+    re-derived here. ``batch`` is intentionally not a parameter: Sage-FP8
+    blk64 requires batch_size == 1 (enforced by
+    ``validate_sm100_blk64_fp8_sage``), matching upstream's omission of it
+    from this formula.
+    """
+    topk_num = int(topk_num)
+    heads = int(heads)
+    q_tiles = heads * ceil_div_int(seqlen_q, 64)
+    if q_tiles >= 512:
+        # SLA-scale Q already exposes thousands of independent CTAs.
+        # Splitting medium top-k rows only adds FP32 partial workspace and a
+        # combine pass; a small split remains useful once each CTA traverses
+        # at least 900 KV blocks.
+        return 4 if topk_num >= 900 else 1
+    if topk_num < 128:
+        return 1
+    if heads == 8:
+        if topk_num < 256:
+            return 4
+        if topk_num < 500:
+            return 8
+    elif 224 <= topk_num < 400:
+        return 8
+    return 16
+
+
 def build_sm100_blk64_kv_split_offsets(
     q2k_block_nums: Optional[torch.Tensor],
     uniform_block_sparse_num: int,
@@ -446,14 +485,14 @@ def choose_sm100_blk64_use_clc(
         batch, h, seqlen_q, _ = q.shape
 
     num_m_blocks = (seqlen_q + 63) // 64
-    large_long_topk = num_m_blocks >= 8192 and block_sparse_num >= 512
+    total_tiles = batch * h * num_m_blocks
+    large_long_topk = total_tiles >= 8192 and block_sparse_num >= 256
     if large_long_topk:
         return True
 
     if h == 1:
         return False
 
-    total_tiles = batch * h * num_m_blocks
     enough_tiles = num_m_blocks >= 128 and total_tiles >= 512
     light_tile = block_sparse_num <= (64 if h == 2 else 128)
     return enough_tiles and light_tile

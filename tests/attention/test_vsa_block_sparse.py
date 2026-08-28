@@ -1163,6 +1163,110 @@ def test_vsa_blk64_sage_fp8_kv_splits(num_heads, kv_splits, workspace):
     torch.testing.assert_close(o_ref.float(), o.float(), atol=6e-2, rtol=6e-2)
 
 
+@_requires_sm100_or_sm103
+@pytest.mark.parametrize("num_heads", [4, 8])
+def test_vsa_blk64_sage_fp8_auto_kv_splits(num_heads, workspace):
+    """Sage-FP8 blk64 with kv_splits="auto" must use the FP8-specific heuristic
+    (sm100_blk64_auto_fp8_kv_splits), not silently fall back to the BF16-tuned
+    sm100_blk64_auto_kv_splits/sm100_blk64_kv_splits_from_count -- previously
+    untested (and previously unimplemented: the port had no FP8-specific
+    heuristic at all).
+
+    MB=8, NB=512 at density=0.5 -> exactly 256 active KV blocks per row,
+    with q_tiles = num_heads * MB well under the 512 large-Q gate for both
+    num_heads=4 and 8, so this exercises sm100_blk64_auto_fp8_kv_splits'
+    topk-tiered branches (not its own large-Q gate).
+    """
+    from unittest.mock import patch
+
+    from flashinfer.cute_dsl.sparse import bsa_attn_sm100_blk64 as _blk64_mod
+    from flashinfer.cute_dsl.sparse.sm100_blk64.dispatch_helpers import (
+        sm100_blk64_auto_fp8_kv_splits,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(6)
+    MB, NB = 8, 512
+    M, N = MB * R64, NB * R64
+    density = 0.5
+
+    q_bf16 = torch.randn(
+        M, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+    k_bf16 = torch.randn(
+        N, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+    v_bf16 = torch.randn(
+        N, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+
+    q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale = _quantize_fp8_sage(
+        q_bf16, k_bf16, v_bf16, num_heads, M, N, HEAD_DIM_BLK64
+    )
+
+    indptr, indices = _build_random_bsr(MB, NB, density, device)
+    active_blocks = int(indptr[1].item())
+    assert active_blocks == 256, (
+        f"expected exactly 256 active KV blocks per row, got {active_blocks}"
+    )
+    expected_kv_splits = sm100_blk64_auto_fp8_kv_splits(active_blocks, num_heads, M)
+    assert expected_kv_splits > 1, (
+        f"test shape should exercise the split-KV path, got kv_splits={expected_kv_splits}"
+    )
+
+    q_deq = (q_fp8.float() * q_scale.squeeze(0).permute(1, 0).unsqueeze(-1)).to(
+        torch.bfloat16
+    )
+    k_deq = (
+        k_fp8.float()
+        * k_scale.squeeze(0)
+        .permute(1, 0)
+        .repeat_interleave(16, dim=0)[:N]
+        .unsqueeze(-1)
+    ).to(torch.bfloat16)
+    v_deq = (v_fp8.float() * v_scale.unsqueeze(0)).to(torch.bfloat16)
+    o_ref = _pytorch_ref(q_deq, k_deq, v_deq, indptr, indices, R64, C64)
+
+    wrapper = _make_wrapper_blk64(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
+        q_data_type=torch.float8_e4m3fn,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_splits="auto",
+    )
+
+    original_resolve = _blk64_mod.resolve_sm100_blk64_split_workspace
+    resolved = {}
+
+    def _spy(q_bhsd, value_dim, kv_splits_i, allow_fallback, output_dtype):
+        result = original_resolve(
+            q_bhsd, value_dim, kv_splits_i, allow_fallback, output_dtype
+        )
+        resolved["kv_splits_i"] = result
+        return result
+
+    with patch.object(
+        _blk64_mod, "resolve_sm100_blk64_split_workspace", side_effect=_spy
+    ):
+        o = wrapper.run(q_fp8, k_fp8, v_fp8)
+
+    assert resolved.get("kv_splits_i") == expected_kv_splits, (
+        f"expected kv_splits='auto' to resolve via sm100_blk64_auto_fp8_kv_splits "
+        f"to {expected_kv_splits}, got {resolved}"
+    )
+    torch.testing.assert_close(o_ref.float(), o.float(), atol=6e-2, rtol=6e-2)
+
+
 # ---------------------------------------------------------------------------
 # blk64 performance: seqlen × density sweep
 # ---------------------------------------------------------------------------
