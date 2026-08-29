@@ -1331,6 +1331,30 @@ def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
         num_heads=12,
         max_sequence_length=3072,
     ) == ("bt16_prepare", "bt16_chain_m64_s7", False)
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 0),
+        sm_count=148,
+        fixed_layout=True,
+        num_sequences=1,
+        num_heads=32,
+        max_sequence_length=8192,
+    ) == ("bt16_prepare", "bt16_chain_m64_s7", False)
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 3),
+        sm_count=148,
+        fixed_layout=True,
+        num_sequences=1,
+        num_heads=16,
+        max_sequence_length=16_384,
+    ) == ("bt16_prepare", "bt16_chain_m64_s7", False)
+    assert kda_prefill_api._select_bt16_physical_variants(
+        compute_capability=(10, 3),
+        sm_count=152,
+        fixed_layout=True,
+        num_sequences=1,
+        num_heads=32,
+        max_sequence_length=8192,
+    ) == ("bt16_prepare", "bt16_chain_m64_s8", False)
 
 
 def test_bt16_two_stage_adapter_reuses_descriptors_across_state_rotations(monkeypatch):

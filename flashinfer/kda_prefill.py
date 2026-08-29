@@ -838,7 +838,13 @@ def _select_bt16_physical_variants(
         "bt16_chain_m64_s8",
         "bt16_chain_m64_s9",
     ]
-    if _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks > sm_count:
+    if _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks > sm_count or (
+        compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
+        and sm_count == 148
+        and fixed_layout
+        and num_sequences == 1
+        and (num_heads, max_sequence_length) in ((32, 8_192), (16, 16_384))
+    ):
         chain_variant = "bt16_chain_m64_s7"
     elif total_tasks <= 8 or (
         prepare_variant == "bt16_prepare_beta_tma"
