@@ -30,8 +30,7 @@
 #define CakeTensorMap flashkda_generated_CakeTensorMap
 #define CakeTensorMapPack flashkda_generated_CakeTensorMapPack
 #define CUtensorMap flashkda_generated_CUtensorMap
-#if defined(FLASHINFER_FLASH_KDA_N16_SHORT) || \
-    defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
+#if defined(FLASHINFER_FLASH_KDA_N16_SHORT) || defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
 #include "cake_flashkda_bf16_fused_m128_n16_short.cu"
 #else
 #include "cake_flashkda_bf16_fused_m128_n16.cu"
@@ -52,15 +51,13 @@
 namespace flashinfer {
 namespace flash_kda {
 
-#if defined(FLASHINFER_FLASH_KDA_N16_SHORT) || \
-    defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
+#if defined(FLASHINFER_FLASH_KDA_N16_SHORT) || defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
 using GeneratedTensorMap = flashkda_generated_CakeTensorMap;
 #else
 using GeneratedTensorMap = flashkda_generated_FlashKDATensorMap;
 #endif
 
-#if defined(FLASHINFER_FLASH_KDA_N16_SHORT) || \
-    defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
+#if defined(FLASHINFER_FLASH_KDA_N16_SHORT) || defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
 constexpr int kThreads = 512;
 #else
 // The frozen source declares __launch_bounds__(1024) but no longer emits a
@@ -69,8 +66,7 @@ constexpr int kThreads = 1024;
 #endif
 static_assert(STORE_BACKWARD_TAPE == 0);
 static_assert(SPLIT_WORK_ITEMS == 0);
-#if defined(FLASHINFER_FLASH_KDA_N16_SHORT) || \
-    defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
+#if defined(FLASHINFER_FLASH_KDA_N16_SHORT) || defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
 static_assert(SMEM_TOTAL == 112256);
 #else
 static_assert(SMEM_TOTAL == 117376);
@@ -103,8 +99,7 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
       store_final_state, scale, lower_bound, true, state_pool_slots);
 #if defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
   TVM_FFI_ICHECK(num_seqs == 1 && num_heads == 96 && use_state_indices == 0 &&
-                 use_initial_state == 1 && store_final_state == 1 &&
-                 checkpoint_every_n_tokens == 0)
+                 use_initial_state == 1 && store_final_state == 1 && checkpoint_every_n_tokens == 0)
       << "H96 short specialization requires N=1, H=96, in-place initial/final "
          "state, no state indices, and no checkpoints";
   TVM_FFI_ICHECK(initial_state.data_ptr() == final_state.data_ptr())

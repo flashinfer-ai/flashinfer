@@ -79,11 +79,11 @@ void RunPersistentM128(TensorView q, TensorView k, TensorView v, TensorView g, T
             "cudaDeviceGetAttribute(minor)");
   CheckCuda(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device_id),
             "cudaDeviceGetAttribute(multiProcessorCount)");
-  const bool validated_device = major == 10 && (minor == 0 || minor == 3) &&
-                                (sm_count == 148 || sm_count == 152);
+  const bool validated_device =
+      major == 10 && (minor == 0 || minor == 3) && (sm_count == 148 || sm_count == 152);
   TVM_FFI_ICHECK(validated_device)
-      << "persistent FlashKDA is validated only on CC10.0/CC10.3 with 148/152 SMs; got CC"
-      << major << "." << minor << " with " << sm_count << " SMs";
+      << "persistent FlashKDA is validated only on CC10.0/CC10.3 with 148/152 SMs; got CC" << major
+      << "." << minor << " with " << sm_count << " SMs";
   TVM_FFI_ICHECK(total_tasks > sm_count && worker_count > 0 && worker_count <= sm_count)
       << "persistent FlashKDA requires N * H > physical SM count and at most one worker per SM";
   TVM_FFI_ICHECK(use_initial_state == 1 && store_final_state == 1)
