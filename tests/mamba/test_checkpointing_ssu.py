@@ -714,10 +714,11 @@ def test_autotune_runner_key_is_synthesis_invariant():
 
 
 def test_autotune_device_tuning_signature(monkeypatch):
+    import importlib
+
+    module = importlib.import_module("flashinfer.mamba.checkpointing_ssu")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
-    monkeypatch.setattr(
-        "flashinfer.mamba.checkpointing_ssu._sm_count", lambda device: 132
-    )
+    monkeypatch.setattr(module, "_sm_count", lambda device: 132)
 
     assert _device_tuning_signature(torch.device("cpu")) == ("cpu",)
     assert _device_tuning_signature(torch.device("cuda", 0)) == ("cuda", 9, 0, 132)
