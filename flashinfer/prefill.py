@@ -3760,10 +3760,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 # for CUDA-graph mode, single normalized copy otherwise.
                 q_lens = self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
                 k_lens = self._kv_indptr_buf[1:] - self._kv_indptr_buf[:-1]
+                # Snapshot host-side seq-lens at plan time so run() can pass
+                # them into trtllm_ragged_attention_deepseek without touching
+                # the device during CUDA graph capture (see issue #4609).
+                q_lens_cpu = q_lens.to(torch.int32).cpu()
+                k_lens_cpu = k_lens.to(torch.int32).cpu()
                 self._cute_dsl_fmha_plan = {
                     "qo_indptr": self._qo_indptr_buf,
                     "kv_indptr": self._kv_indptr_buf,
                     "seq_lens": k_lens.to(torch.int32),
+                    "q_seq_lens_cpu": q_lens_cpu,
+                    "kv_seq_lens_cpu": k_lens_cpu,
                     "batch_size": qo_indptr.shape[0] - 1,
                     "max_q_len": int(q_lens.max().item()),
                     "max_kv_len": int(k_lens.max().item()),
@@ -4248,6 +4255,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     out=out,
                     lse=lse,
                     backend="cute-dsl",
+                    q_seq_lens_cpu=p["q_seq_lens_cpu"],
+                    kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
                 )
             # Modular CuTe DSL backend does not support scale parameters.
             if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
@@ -4887,10 +4896,15 @@ def trtllm_ragged_attention_deepseek(
     q_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row query lengths. When provided
         together with ``kv_seq_lens_cpu``, the Python wrapper can keep the
-        all-active ragged fast path asynchronous while still compacting empty-KV
-        rows. If omitted, the wrapper derives lengths from the device indptrs
-        and may synchronize to preserve correctness for direct callers.
-        Currently only consulted by the ``trtllm-gen`` backend.
+        all-active ragged fast path asynchronous while still compacting empty
+        rows (either ``q_len == 0`` or ``kv_len == 0``). If omitted, the
+        wrapper derives lengths from the device indptrs and may synchronize
+        to preserve correctness for direct callers. Under CUDA graph capture,
+        this device-side detection would require an illegal ``.item()``
+        readback, so both mirrors must be provided; without them the wrapper
+        cannot tell whether any row has ``q_len == 0`` or ``kv_len == 0`` and
+        will refuse to launch. Currently only consulted by the ``trtllm-gen``
+        backend.
     kv_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row KV lengths. Currently only
         consulted by the ``trtllm-gen`` backend.
@@ -5092,6 +5106,13 @@ def trtllm_ragged_attention_deepseek(
                 has_inactive_rows = True
                 has_active_rows = bool(active_rows_cpu.any().item())
         else:
+            # An active row requires q_len > 0 AND kv_len > 0; detecting
+            # either kind of empty row from device indptrs needs an
+            # ``.item()`` readback, which is illegal during CUDA graph
+            # capture. Callers who want compaction inside a captured region
+            # must pass q_seq_lens_cpu / kv_seq_lens_cpu; without them the
+            # wrapper cannot tell whether any row is empty and refuses to
+            # launch rather than risk an undefined empty-row kernel path.
             if (
                 query.is_cuda
                 and hasattr(torch.cuda, "is_current_stream_capturing")
@@ -5099,7 +5120,8 @@ def trtllm_ragged_attention_deepseek(
             ):
                 raise ValueError(
                     "q_seq_lens_cpu and kv_seq_lens_cpu must be provided during "
-                    "CUDA graph capture"
+                    "CUDA graph capture so empty rows (q_len == 0 or "
+                    "kv_len == 0) can be detected without a device sync"
                 )
             q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
             kv_lens = cum_seq_lens_kv[1:] - cum_seq_lens_kv[:-1]
