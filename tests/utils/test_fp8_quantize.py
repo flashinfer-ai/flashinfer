@@ -665,7 +665,7 @@ def test_mxfp8_grouped_quantize_cake_cuda_graph_and_streams():
     torch.manual_seed(20260829)
     shape = (2, 256, 4096)
     x = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
-    mask = torch.tensor([shape[1], shape[1] // 2], dtype=torch.int32, device="cuda")
+    mask = torch.full((shape[0],), shape[1], dtype=torch.int32, device="cuda")
     eager_q, eager_sf = mxfp8_grouped_quantize(x, mask, backend="cake")
     torch.cuda.synchronize()
 
