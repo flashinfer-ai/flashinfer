@@ -39,6 +39,11 @@ CORRECTNESS_KNOBS: Dict[str, Tuple[Any, ...]] = {
     "in_kernel_fc2_reduce": (False, True),
     "token_back_mode": ("epi_warps", "standalone_warps", "reuse_dispatch_warps"),
     "load_balance_mode": ("static", "atomic_counter"),
+    # Combine dedup + wire format change the combine numerics (fp32 group
+    # pre-reduce ordering; quantized wire), so an autotuner must keep the
+    # values it validated against.  Both are COLLECTIVE (wire format).
+    "grouped_token_back": (False, True),
+    "combine_format": ("bf16", "32e4m3xe8m0", "32e5m2xe8m0"),
 }
 
 _NONSWAP_TILES = ((64, 128, 128), (64, 256, 128))
@@ -48,6 +53,11 @@ _CLUSTER_SHAPES = ((1, 1, 1), (2, 1, 1), (1, 2, 1), (2, 2, 1))
 PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
     "swap_ab": (False, True),
     "pingpong": (False, True),
+    # Wire-level top-k dedup on dispatch; bit-exact with the non-dedup path
+    # (the duplicate pool rows receive the same payload bytes either way).
+    # COLLECTIVE: changes the route-word wire format -- all EP ranks must
+    # agree (a mixed on/off pair mis-decodes the flag bits).
+    "dedup_dispatch": (False, True),
     "mma_tiler_mnk": _NONSWAP_TILES + _SWAPAB_TILES,
     "cluster_shape_mnk": _CLUSTER_SHAPES,
     "fp8_accum_mode": ("1xacc", "2xacc"),
@@ -135,6 +145,19 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
     # reducer could apply routing weights.
     if in_kernel and not apply_topk_in_fc1:
         return False
+    grouped = bool(knobs.get("grouped_token_back", False))
+    combine_format = knobs.get("combine_format", "bf16")
+    if combine_format not in ("bf16", "32e4m3xe8m0", "32e5m2xe8m0"):
+        return False
+    if combine_format != "bf16" and not grouped:
+        return False
+    if grouped:
+        if knobs.get("token_back_mode", "reuse_dispatch_warps") != (
+            "reuse_dispatch_warps"
+        ):
+            return False
+        if in_kernel or not apply_topk_in_fc1:
+            return False
     return True
 
 

@@ -180,6 +180,9 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
             token_back_by_dispatch=k.token_back_by_dispatch,
             token_back_mode=k.token_back_mode,
+            dedup_dispatch=k.dedup_dispatch,
+            grouped_token_back=k.grouped_token_back,
+            combine_format=k.combine_format,
         )
 
     def validate_forward(
@@ -362,5 +365,8 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             k.in_kernel_fc2_reduce,
             k.token_back_by_dispatch,
             k.token_back_mode,
+            k.dedup_dispatch,
+            k.grouped_token_back,
+            k.combine_format,
             knobs_pool_key(k.knobs),
         )

@@ -138,6 +138,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         epi_flag_batch: Union[int, Tuple[int, int]] = 1,
         flag_batch: int = 1,
         gate_up_clamp: Optional[float] = None,
+        dedup_dispatch: bool = False,
+        grouped_token_back: bool = False,
+        combine_format: str = "bf16",
     ) -> None:
         if static_expert_shape is None:
             raise NotImplementedError(
@@ -237,7 +240,41 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         self.max_tokens_per_rank = max_tokens_per_rank
         self.hidden = hidden
         self.fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
-        self.combine_format = CombineFormat.parse("bf16")
+        self.combine_format = CombineFormat.parse(combine_format)
+        self.grouped_token_back = grouped_token_back
+        if self.combine_format.is_quantized:
+            # The FP8 epilogues have no combine encoder; the quantized wire is
+            # produced by the grouped token-back reduction (post-fc2, software
+            # per-32 e8m0 + fp8 encode), so it requires grouping.
+            if not grouped_token_back:
+                raise ValueError(
+                    "a quantized combine_format on the FP8 mega kernel "
+                    "requires grouped_token_back=True (the encoder lives in "
+                    "the grouped reduction)."
+                )
+            if self.combine_format.scale_dtype is not cutlass.Float8E8M0FNU:
+                raise ValueError(
+                    "the FP8 mega kernel supports the per-32 e8m0 combine "
+                    f"formats only, got {self.combine_format.name!r}."
+                )
+        if grouped_token_back and fc2_in_kernel_topk_reduce:
+            raise ValueError(
+                "grouped_token_back and fc2_in_kernel_topk_reduce both "
+                "collapse the combine; enable only one."
+            )
+        if grouped_token_back and not apply_topk_in_fc1:
+            raise ValueError(
+                "grouped_token_back requires apply_topk_in_fc1=True: the "
+                "group pre-reduce is a plain sum, so routing weights must "
+                "already be folded into the fc2 terms."
+            )
+        # Padded per-slot sf extent (bytes == e8m0 entries), 16B-aligned so
+        # the TMA sf push and the slot stride stay bulk-copy legal.
+        if self.combine_format.is_quantized:
+            sf_len = hidden // self.combine_format.scale_block
+            self.combine_sf_slot_bytes = ((sf_len + 15) // 16) * 16
+        else:
+            self.combine_sf_slot_bytes = 0
 
         # static_expert_shape = (num_experts_per_rank, intermediate_gateup, hidden).
         self.num_experts_per_rank = static_expert_shape[0]
@@ -325,6 +362,8 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
 
         self.token_comm = TokenInPullTokenBackPush(
             world_size=self.world_size,
+            combine_format=self.combine_format,
+            grouped_token_back=grouped_token_back,
             num_topk=self.num_topk,
             num_experts_per_rank=self.num_experts_per_rank,
             num_total_experts=self.num_total_experts,
@@ -346,7 +385,10 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             is_swap_ab=is_swap_ab,
             sf_atom_swizzled=(self.fp8_scale_mode != "blockwise"),
             flag_batch=flag_batch,
+            dedup_dispatch=dedup_dispatch,
+            max_tokens_per_rank=max_tokens_per_rank,
         )
+        self.dedup_dispatch = dedup_dispatch
 
         # Region layout (same call drives both get_workspace_sizes() and the
         # __call__ partition).
@@ -518,6 +560,49 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 )
             )
 
+        if self.dedup_dispatch:
+            # (src_rank, src_token) -> carrier pool row rendezvous, one u64
+            # per entry (bit63 valid | sf_row<<31 | data_row).  Lives in the
+            # zeroed counter prefix so kernel_tail resets it per launch.
+            specs.append(
+                _RegionSpec(
+                    "carrier_row_table",
+                    cutlass.Int64,
+                    (self.world_size * self.max_tokens_per_rank,),
+                    16,
+                )
+            )
+
+        if self.grouped_token_back:
+            # Per-(src_rank, src_token) group size / arrival counters plus the
+            # dispatch-complete gate; all in the zeroed prefix.  group_rows
+            # (the member lists) and token_rank_mask are count/mask-guided,
+            # so they live in the (unzeroed) data area below.
+            specs.append(
+                _RegionSpec(
+                    "group_count",
+                    cutlass.Int32,
+                    (self.world_size * self.max_tokens_per_rank,),
+                    16,
+                )
+            )
+            specs.append(
+                _RegionSpec(
+                    "group_done",
+                    cutlass.Int32,
+                    (self.world_size * self.max_tokens_per_rank,),
+                    16,
+                )
+            )
+            specs.append(
+                _RegionSpec(
+                    "dispatch_done_counter",
+                    cutlass.Int32,
+                    (1,),
+                    16,
+                )
+            )
+
         # Data buffers start at l1_token_buffer. The persistent NVLink phase
         # counter is intentionally after the reset prefix.
         specs += [
@@ -581,6 +666,24 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 )
             )
 
+        if self.grouped_token_back:
+            specs.append(
+                _RegionSpec(
+                    "group_rows",
+                    cutlass.Int32,
+                    (self.world_size * self.max_tokens_per_rank * self.num_topk,),
+                    16,
+                )
+            )
+            specs.append(
+                _RegionSpec(
+                    "token_rank_mask",
+                    cutlass.Int32,
+                    (self.max_tokens_per_rank,),
+                    16,
+                )
+            )
+
         return specs
 
     def _build_shared_region_specs(self) -> List[_RegionSpec]:
@@ -622,16 +725,34 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # It is the cross-rank STG/TMA target and therefore belongs in the shared
         # symmetric workspace. In-kernel reduce accumulates directly into
         # output_activation (REDG from epi_warps, or bulk reduce push from the
-        # dispatch token-back modes) and needs no staging.
+        # dispatch token-back modes) and needs no staging.  Grouped token-back
+        # pre-reduces per (src_rank, src_token) on the expert rank, so its
+        # inbox is keyed by contributing RANK instead of topk slot.
         if not self.fc2_in_kernel_topk_reduce:
+            combine_slots = (
+                world_size if self.grouped_token_back else num_topk
+            )
             specs.append(
                 _RegionSpec(
                     "combine_quant",
                     self.combine_format.act_dtype,
-                    (max_tokens_per_rank, num_topk, self.hidden),
+                    (max_tokens_per_rank, combine_slots, self.hidden),
                     128,
                 )
             )
+            if self.combine_format.is_quantized:
+                specs.append(
+                    _RegionSpec(
+                        "combine_sf",
+                        self.combine_format.scale_dtype,
+                        (
+                            max_tokens_per_rank,
+                            combine_slots,
+                            self.combine_sf_slot_bytes,
+                        ),
+                        16,
+                    )
+                )
         return specs
 
     # =========================================================================
@@ -938,6 +1059,38 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             16,
         )
 
+        if cutlass.const_expr(self.dedup_dispatch):
+            carrier_row_table = self._view_local(
+                local_workspace, "carrier_row_table",
+            )
+        else:
+            carrier_row_table = None
+
+        if cutlass.const_expr(self.grouped_token_back):
+            group_count = self._view_local(local_workspace, "group_count")
+            group_rows = self._view_local(local_workspace, "group_rows")
+            group_done = self._view_local(local_workspace, "group_done")
+            token_rank_mask = self._view_local(
+                local_workspace, "token_rank_mask",
+            )
+            dispatch_done_counter = self._view_local(
+                local_workspace, "dispatch_done_counter",
+            )
+        else:
+            group_count = None
+            group_rows = None
+            group_done = None
+            token_rank_mask = None
+            dispatch_done_counter = None
+
+        if cutlass.const_expr(
+            self.combine_format.is_quantized
+            and not self.fc2_in_kernel_topk_reduce
+        ):
+            combine_sf_view = self._view_shared(shared_workspace, "combine_sf")
+        else:
+            combine_sf_view = None
+
         token_comm_args = ExtractedTokenCommArgs(
             input_token_buffer=activation,
             input_sf_buffer=activation_sf,
@@ -952,6 +1105,13 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             fc1_input_topk_weights_buffer=l1_topk_weights_buffer,
             fc1_ready_counter=l1_arrival_count,
             token_src_metadata=token_src_metadata,
+            carrier_row_table=carrier_row_table,
+            group_count=group_count,
+            group_rows=group_rows,
+            group_done=group_done,
+            token_rank_mask=token_rank_mask,
+            dispatch_done_counter=dispatch_done_counter,
+            combine_sf=combine_sf_view,
             combine_output=combine_output_comm,
             fc2_output_workspace=fc2_output_workspace_u8,
             fc2_done_counter=fc2_done_counter,
@@ -1010,18 +1170,37 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 topk_weights if cutlass.const_expr(not self.apply_topk_in_fc1)
                 else None
             )
-            TopkReduce(
-                self.hidden,
-                self.num_topk,
-                self.combine_format,
-                sm_arch=get_cutedsl_target_arch(),
-            )(
-                combine_target,
-                None,
-                output_activation,
-                score,
-                stream,
-            )
+            if cutlass.const_expr(self.grouped_token_back):
+                # Rank-indexed reduce: one pre-reduced (weights already folded
+                # into FC1) row per contributing rank; the per-token rank
+                # bitmask keeps stale slots out of the sum, and the quantized
+                # wire is dequantized to fp32 before accumulating.
+                TopkReduce(
+                    self.hidden,
+                    self.world_size,
+                    self.combine_format,
+                    sm_arch=get_cutedsl_target_arch(),
+                )(
+                    combine_target,
+                    combine_sf_view,
+                    output_activation,
+                    None,
+                    stream,
+                    slot_mask=token_rank_mask,
+                )
+            else:
+                TopkReduce(
+                    self.hidden,
+                    self.num_topk,
+                    self.combine_format,
+                    sm_arch=get_cutedsl_target_arch(),
+                )(
+                    combine_target,
+                    None,
+                    output_activation,
+                    score,
+                    stream,
+                )
 
     # =========================================================================
     # TokenComm delegation surface consumed by the fc1/fc2 base kernel

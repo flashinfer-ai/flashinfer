@@ -219,6 +219,26 @@ def _parse_args() -> argparse.Namespace:
         "pin one path for A/B runs (reuse_dispatch_warps matches the "
         "drop's P03 perf-run setting).",
     )
+    p.add_argument(
+        "--dedup-dispatch",
+        action="store_true",
+        help="send each token once per destination rank on dispatch "
+        "(duplicate top-k routes copy the carrier's pool row locally)",
+    )
+    p.add_argument(
+        "--grouped-token-back",
+        action="store_true",
+        help="combine dedup: pre-reduce each (src_rank, src_token) group in "
+        "fp32 on the expert rank and return one row per contributing rank "
+        "(forces token-back reuse_dispatch_warps)",
+    )
+    p.add_argument(
+        "--combine-format",
+        choices=["bf16", "32e4m3xe8m0", "32e5m2xe8m0"],
+        default="bf16",
+        help="combine wire format; the quantized fp8 wires halve the return "
+        "bytes and require --grouped-token-back",
+    )
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=20)
     p.add_argument(
@@ -396,7 +416,14 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile):
         load_balance_mode=args.load_balance_mode,
         gate_up_clamp=args.gate_up_clamp,
         in_kernel_fc2_reduce=False,
-        token_back_mode=(None if args.token_back == "heuristic" else args.token_back),
+        token_back_mode=(
+            "reuse_dispatch_warps"
+            if args.grouped_token_back
+            else (None if args.token_back == "heuristic" else args.token_back)
+        ),
+        dedup_dispatch=args.dedup_dispatch,
+        grouped_token_back=args.grouped_token_back,
+        combine_format=args.combine_format,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )

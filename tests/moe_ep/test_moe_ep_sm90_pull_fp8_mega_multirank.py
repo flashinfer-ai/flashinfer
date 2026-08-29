@@ -150,11 +150,11 @@ def _mega_problem(
     swap_ab: bool = False,
     num_tokens: int = 64,
     max_tokens: int = 64,
+    num_experts: int = 8,
+    topk: int = 4,
 ):
     hidden = 2048
     intermediate = 1024
-    num_experts = 8
-    topk = 4
     gate_up_clamp = 10.0
     fast_math = True
     kind = "fp8_e4m3"
@@ -344,11 +344,38 @@ def _assert_ikr_close(y, y_ref, *, topk):
     )
 
 
+def _assert_grouped_close(y, ref, *, combine_format: str):
+    """Accuracy gate for the grouped (rank-slot) combine.
+
+    bf16 wire: the only deviation from the bit-exact baseline is one extra
+    bf16 rounding of the fp32 group partial sum -> tight tolerance.
+    Quantized wire: one per-32 e8m0+fp8 quantization of each group sum; gate
+    on SNR against the exact reference plus a loose elementwise band.
+    """
+    import torch
+
+    err = (y.float() - ref.float()).square().sum()
+    sig = ref.float().square().sum()
+    snr_db = float(10.0 * torch.log10(sig / err.clamp_min(1e-30)))
+    if combine_format == "bf16":
+        torch.testing.assert_close(y, ref, rtol=2e-2, atol=2e-2)
+        assert snr_db > 40.0, f"grouped bf16 combine SNR {snr_db:.1f} dB"
+    else:
+        assert snr_db > 20.0, f"quantized combine SNR {snr_db:.1f} dB"
+        torch.testing.assert_close(
+            y.float(), ref.float(), rtol=0.25, atol=0.08,
+        )
+    print(f"grouped combine ({combine_format}) SNR vs exact ref: {snr_db:.1f} dB")
+
+
 def _megakernel_config(
     problem: dict,
     *,
     in_kernel_fc2_reduce: bool = False,
     token_back_mode: str | None = None,
+    dedup_dispatch: bool = False,
+    grouped_token_back: bool = False,
+    combine_format: str = "bf16",
 ):
     from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
@@ -361,7 +388,12 @@ def _megakernel_config(
         gate_up_clamp=problem["gate_up_clamp"],
         fast_math=problem["fast_math"],
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        token_back_mode=token_back_mode,
+        token_back_mode=(
+            "reuse_dispatch_warps" if grouped_token_back else token_back_mode
+        ),
+        dedup_dispatch=dedup_dispatch,
+        grouped_token_back=grouped_token_back,
+        combine_format=combine_format,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )
@@ -378,6 +410,11 @@ def _run_mega_layer(
     max_tokens: int = 64,
     in_kernel_fc2_reduce: bool = False,
     token_back_mode: str | None = None,
+    dedup_dispatch: bool = False,
+    grouped_token_back: bool = False,
+    combine_format: str = "bf16",
+    num_experts: int = 8,
+    topk: int = 4,
 ):
     import torch
     import torch.distributed as dist
@@ -409,12 +446,17 @@ def _run_mega_layer(
         swap_ab=swap_ab,
         num_tokens=num_tokens,
         max_tokens=max_tokens,
+        num_experts=num_experts,
+        topk=topk,
     )
     kernel = create_mega_kernel(
         _megakernel_config(
             problem,
             in_kernel_fc2_reduce=in_kernel_fc2_reduce,
             token_back_mode=token_back_mode,
+            dedup_dispatch=dedup_dispatch,
+            grouped_token_back=grouped_token_back,
+            combine_format=combine_format,
         )
     )
     runtime = bootstrap_moe_ep_runtime(
@@ -458,7 +500,12 @@ def _run_mega_layer(
             weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
             backend=MegaConfig(
                 megakernel=_megakernel_config(
-                    problem, in_kernel_fc2_reduce=in_kernel_fc2_reduce
+                    problem,
+                    in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                    token_back_mode=token_back_mode,
+                    dedup_dispatch=dedup_dispatch,
+                    grouped_token_back=grouped_token_back,
+                    combine_format=combine_format,
                 ),
                 quantize_input=quantize_input,
                 preprocess_weights=True,
@@ -493,7 +540,10 @@ def _run_mega_layer(
         assert y_layer.shape == (problem["num_tokens"], problem["hidden"])
         assert y_layer.dtype == torch.bfloat16
         assert torch.isfinite(y_layer).all()
-        if in_kernel_fc2_reduce:
+        if grouped_token_back:
+            _assert_grouped_close(y_layer, y_ref, combine_format=combine_format)
+            _assert_grouped_close(y_layer2, y_ref, combine_format=combine_format)
+        elif in_kernel_fc2_reduce:
             # Tolerance verdict vs the explicit-reduce reference; see
             # _assert_ikr_close.  The repeated forward doubles as the
             # regression guard for the per-launch output_activation.zero_()
@@ -584,6 +634,140 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_token_back_matches_reference(
     print(
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
         f"({fp8_scale_mode}, token_back={token_back_mode}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,swap_ab,token_back_mode",
+    [
+        ("per_tensor", False, None),
+        ("blockwise", False, None),
+        ("per_tensor", True, None),
+        ("per_tensor", False, "reuse_dispatch_warps"),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_dedup_dispatch_matches_reference(
+    fp8_scale_mode, swap_ab, token_back_mode
+):
+    """Wire-level top-k dedup is bit-exact with the reference.
+
+    The 8-expert/4-rank/top-4 problem routes most tokens to both experts of
+    at least one rank, so the duplicate (carrier-table) path is exercised
+    heavily; the payload bytes must match the non-dedup pull exactly.  The
+    reuse_dispatch_warps case covers dedup sharing the dispatch warps with
+    the push-back token path.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        token_back_mode=token_back_mode,
+        dedup_dispatch=True,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"({fp8_scale_mode}, swap_ab={swap_ab}, token_back={token_back_mode}, "
+        "dedup_dispatch) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,combine_format,dedup_dispatch",
+    [
+        ("per_tensor", "bf16", False),
+        ("per_tensor", "32e4m3xe8m0", False),
+        ("per_tensor", "32e4m3xe8m0", True),
+        ("blockwise", "32e4m3xe8m0", True),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_grouped_token_back(
+    fp8_scale_mode, combine_format, dedup_dispatch
+):
+    """Combine dedup (grouped token-back), bf16 and quantized fp8 wires.
+
+    The group pre-reduce is fp32 with weights folded into FC1, so the bf16
+    wire differs from the exact reference only by one bf16 rounding of each
+    partial sum; the fp8 wire adds one per-32 e8m0+e4m3 quantization and is
+    gated on SNR.  The dedup_dispatch combinations exercise both wire-dedup
+    directions together.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=fp8_scale_mode,
+        dedup_dispatch=dedup_dispatch,
+        grouped_token_back=True,
+        combine_format=combine_format,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"({fp8_scale_mode}, grouped_token_back, combine={combine_format}, "
+        f"dedup={dedup_dispatch}) within tolerance"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+def test_moe_ep_sm90_pull_fp8_mega_layer_dedup_dispatch_multi_waiter():
+    """Dedup with several waiters per carrier and a partial warp lane group.
+
+    12 experts / 4 ranks (3 local) / top-6 makes two-or-three routes to one
+    rank common (two duplicates waiting on one carrier) and 6 does not
+    divide 32, exercising the inactive-lane path of the carrier election.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="per_tensor",
+        dedup_dispatch=True,
+        num_experts=12,
+        topk=6,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        "(dedup_dispatch, 12 experts top-6 multi-waiter) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+def test_moe_ep_sm90_pull_fp8_mega_layer_dedup_dispatch_in_kernel_reduce():
+    """Dedup composed with the REDG in-kernel fc2 reduce path."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="per_tensor",
+        in_kernel_fc2_reduce=True,
+        dedup_dispatch=True,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        "(dedup_dispatch + in_kernel_fc2_reduce) matches reference"
     )
 
 

@@ -22,10 +22,24 @@ heuristics for Hopper FP8 MegaMoE", 2026-08), **minus commit `4f9c042`**
 regions / token_comm bodies).  Re-exclude that commit's content when
 syncing future drops.
 
-Local extension pending upstream: `moe_hopper_fp8/heuristic_config.py`
-carries a `token_back_mode` field per bucket (2026-08-23 FI-layer
-epi-vs-reuse sweep winners); re-apply it when syncing a drop that has not
-picked it up.
+Local extensions pending upstream (re-apply when syncing a drop that has
+not picked them up):
+
+- `moe_hopper_fp8/heuristic_config.py` carries a `token_back_mode` field
+  per bucket (2026-08-23 FI-layer epi-vs-reuse sweep winners).
+- Wire-level top-k dedup (`dedup_dispatch`, 2026-08-24, design in
+  `dedup_topk_design.md`): `src/token_comm.py` (carrier election in
+  `dispatch_prep`, carrier-table rendezvous in `dispatch_pull`,
+  `TokenCommArgs.carrier_row_table`) and
+  `moe_hopper_fp8/megamoe_kernel_fp8.py` (ctor knob + workspace region).
+- Combine dedup + quantized combine wire (`grouped_token_back` /
+  `combine_format`, 2026-08-27, design in `dedup_topk_design.md` §4):
+  `src/token_comm.py` (group table + `grouped_reduce_push` with the
+  in-reduction per-32 e8m0/fp8 encoder), `moe_hopper_fp8/
+  megamoe_kernel_fp8.py` (ctor knobs, group/mask/combine_sf regions,
+  rank-indexed TopkReduce call), and `moe_nvfp4_swapab/topk_reduce.py`
+  (SM90 scalar mxfp8 decode via f16 + bit-math e8m0, `slot_mask`
+  rank-masked reduce -- keep NVFP4-compatible when re-syncing).
 
 ## Layout
 
