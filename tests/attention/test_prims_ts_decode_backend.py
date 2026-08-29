@@ -531,6 +531,37 @@ def test_cuda_graph_replan_then_replay(q_len_per_req, is_causal):
 
 
 @requires_prims_ts_gpu
+def test_graph_plan_rebinds_after_workspace_reset():
+    kv_lens = [64, 96]
+    plan_args = _plan_args(kv_lens, "cuda")
+    wrapper = _make_wrapper(
+        "prims-ts", use_cuda_graph=True, **_graph_buffers(2, max_pages=32)
+    )
+    wrapper.plan(*plan_args, q_data_type=torch.bfloat16)
+    old_workspace = wrapper._prims_ts_workspace
+
+    new_float = torch.zeros(64 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    new_int = torch.zeros(8 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    wrapper.reset_workspace_buffer(new_float, new_int)
+    wrapper.plan(*plan_args, q_data_type=torch.bfloat16)
+
+    workspace = wrapper._prims_ts_workspace
+    assert workspace.data_ptr() != old_workspace.data_ptr()
+    assert workspace.data_ptr() == new_float.data_ptr()
+
+    torch.manual_seed(0)
+    k_cache, v_cache = _make_cache(kv_lens, torch.bfloat16, "cuda")
+    q = torch.randn(2, NUM_QO_HEADS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    out = wrapper.run(q, (k_cache, v_cache))
+    torch.testing.assert_close(
+        out.float(),
+        _reference_decode(q, k_cache, v_cache, kv_lens, 1, False, PAGE_SIZE),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+@requires_prims_ts_gpu
 def test_cuda_graph_matches_eager_path():
     kv_lens = [64, 96]
     torch.manual_seed(0)

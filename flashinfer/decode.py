@@ -1035,6 +1035,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             device="cpu",
             pin_memory=True,
         )
+        if self._backend == "prims-ts":
+            self._prims_ts_graph_key = None
+            self._prims_ts_workspace = None
 
     @flashinfer_api
     def workspace_size(
