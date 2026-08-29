@@ -19,12 +19,12 @@ _TARGET_MINOR = {"sm100a": 0, "sm103a": 3}
 _INPUT_METADATA = {
     "bfloat16": (
         "cake_grouped_mxfp8_quantize_bf16_device.cu",
-        "kernel_cake_grouped_mxfp8_quantize_bf16",
+        "kernel_cake_grouped_mxfp8_quantize_row2d_bf16",
         "dl_bfloat16",
     ),
     "float16": (
         "cake_grouped_mxfp8_quantize_f16_device.cu",
-        "kernel_cake_grouped_mxfp8_quantize_f16",
+        "kernel_cake_grouped_mxfp8_quantize_row2d_f16",
         "dl_float16",
     ),
 }
