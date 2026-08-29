@@ -50,11 +50,10 @@ family, and non-zero values poisoned the latency-regime picks).
 The same tuning-mode pass also measures the decode/prefill crossover per
 decode-instantiated ``(num_heads, topk)`` config (:func:`calibrate_crossover`)
 and persists it as ``decode_max_tokens`` in the same JSON document (schema
-version 3; only current-schema files load — older files encode retired model
-semantics and count as absent, so their families recalibrate on the next
-tuning-mode pass). The runtime decode/prefill routing in
-:mod:`._sparse_mla_sm120` consults it; absent entries keep the historical
-decode-first policy.
+version 1; only current-schema files load — files at any other version count
+as absent, so their families recalibrate on the next tuning-mode pass). The
+runtime decode/prefill routing in :mod:`._sparse_mla_sm120` consults it;
+absent entries keep the historical decode-first policy.
 """
 
 from __future__ import annotations
@@ -77,11 +76,9 @@ logger = logging.getLogger(__name__)
 _BI = 64  # chunk width in candidates (BLOCK_SIZE_N)
 _HPB = 16  # head tile per block
 
-_SCHEMA_VERSION = 3
-# Only current-schema files load. Older files encode retired model
-# semantics (v2 added the crossover table; v3 replaced the ceil-wave +
-# beta constants form with the scheduling-makespan model) and count as
-# absent: families recalibrate on the next tuning-mode pass.
+_SCHEMA_VERSION = 1
+# Only current-schema files load; any other version counts as absent and the
+# families recalibrate on the next tuning-mode pass.
 _BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 656, "dots3_swa": 1160}
 _D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512, "dots3_swa": 1088}
 _D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024}
