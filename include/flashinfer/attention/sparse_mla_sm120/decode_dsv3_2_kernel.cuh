@@ -118,7 +118,7 @@ struct DecodeDsv3_2Smem {
 
 // No minBlocksPerSM hint on launch_bounds: kernel is smem-bound at 1
 // block/SM regardless.
-template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, int NUM_HEADS, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2_kernel(
     const bf16* __restrict__ Q,               // [num_tokens, num_heads, d_qk=576] bf16
     const uint8_t* __restrict__ KV_cache,     // FP8 paged (V32 INLINE layout, 656 B/token)
@@ -126,7 +126,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
     bf16* __restrict__ mid_out,               // [num_tokens, num_heads, num_splits, d_v=512] bf16
     float* __restrict__ mid_lse,              // [num_tokens, num_heads, num_splits] f32
     const int* __restrict__ topk_length_ptr,  // [num_tokens] or null
-    int num_tokens, int num_heads, int num_splits, int chunks_per_block, float sm_scale,
+    int num_tokens, int num_heads, int topk, int num_splits, int chunks_per_block, float sm_scale,
     size_t stride_kv_block,
     // Row stride of indices; may exceed topk when the caller views a wider
     // persistent buffer (last dim must stay contiguous).
@@ -151,7 +151,7 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   constexpr int KV_ROPE_OFFSET = KV::KV_ROPE_GMEM_OFFSET;  // 528
   constexpr int pbs = PAGE_BLOCK_SIZE;
   // Heads actually populated per CTA tile. NUM_HEADS == 0 selects the
-  // runtime-head-count instantiation (one kernel per (MT, TOPK), any
+  // runtime-head-count instantiation (one kernel per model type, any
   // num_heads <= 128): Q/output carry the true num_heads stride, the mid
   // scratch is HPB-aligned (gridDim.y * HPB rows per token) so both tile
   // halves write back unconditionally, and the merge kernel reads only
@@ -173,8 +173,10 @@ __global__ void __launch_bounds__(DSV3_2_BLOCK_THREADS) sparse_mla_decode_dsv3_2
   const int q_heads = RUNTIME_H ? num_heads : NUM_HEADS;
   const int mid_heads = RUNTIME_H ? (int)gridDim.y * HPB : NUM_HEADS;
   const int valid_h = RUNTIME_H ? min(num_heads - h_start, HPB) : VALID_HPB;
-  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : TOPK;
-  topk_len = topk_len < 0 ? 0 : (topk_len > TOPK ? TOPK : topk_len);
+  // topk is the runtime indices-row width (the buffer bound); topk_length,
+  // when given, is clamped to it.
+  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : topk;
+  topk_len = topk_len < 0 ? 0 : (topk_len > topk ? topk : topk_len);
 
   // Chunk range this block owns.
   const int num_chunks_total = (topk_len + DSV3_2_CAND_WINDOW - 1) / DSV3_2_CAND_WINDOW;

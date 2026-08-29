@@ -137,6 +137,13 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   TVM_FFI_ICHECK(d_qk == 512 || d_qk == 1088)
       << "decode-dsv4 supports d_qk 512 (DSV4) or 1088 (DOTS3_SWA); got " << d_qk;
   const ModelType mt = (d_qk == 512) ? ModelType::DSV4 : ModelType::DOTS3_SWA;
+  // DOTS3_SWA's sliding window (513 candidates, DecodeTileCfg::WINDOW) needs an
+  // indices buffer at least that wide; a narrower one can never name the full
+  // window. Report it here so the message names the actual constraint.
+  TVM_FFI_ICHECK(mt != ModelType::DOTS3_SWA || topk >= 513)
+      << "decode-dsv4 (dots3_swa) requires topk >= 513 to hold the 513-wide "
+         "sliding window; got indices width topk="
+      << topk;
 
   // topk_length is optional for DOTS3_SWA: DecodeTileCfg<DOTS3_SWA>::WINDOW caps
   // the per-token candidate count inside the kernel, so omitting it costs

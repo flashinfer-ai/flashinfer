@@ -147,17 +147,25 @@ class SparseMLASm120DecodeConfig:
     max_num_tokens : int
         Largest ``num_tokens`` routed to the decode kernels (inclusive).
     topks : frozenset[int]
-        The instantiated top-k values.
+        The calibrated top-k values (the crossover sweep points). Decode
+        serves ANY ``topk >= min_topk`` — topk is a runtime kernel argument —
+        so this set is documentation of what has measured crossover data,
+        not the eligibility boundary.
+    min_topk : int
+        Smallest legal ``topk`` (the indices-row width). ``513`` for the
+        sliding-window family (the window must fit the buffer); ``1``
+        elsewhere.
     max_num_heads : int
-        Every ``num_heads`` in ``[1, max_num_heads]`` is served: a dedicated
-        ``num_heads=8`` instantiation plus one runtime-head-count
-        instantiation per topk covering any other count.
+        Every ``num_heads`` in ``[1, max_num_heads]`` is served: dedicated
+        instantiations at ``{8, 16, 32, 64, 128}`` plus one
+        runtime-head-count instantiation covering any other count.
     """
 
     d_qk: int
     page_block_size: int
     max_num_tokens: int
     topks: frozenset[int]
+    min_topk: int
     max_num_heads: int
 
     def supported_num_heads(self) -> tuple[int, ...]:
@@ -165,7 +173,10 @@ class SparseMLASm120DecodeConfig:
         return tuple(range(1, self.max_num_heads + 1))
 
     def supported_topk(self, num_heads: Optional[int] = None) -> tuple[int, ...]:
-        """Sorted top-k values instantiated for ``num_heads`` (or any head count)."""
+        """Sorted calibrated top-k values for ``num_heads`` (or any head count).
+
+        Decode serves any ``topk >= min_topk``; these are the values with
+        measured crossover data."""
         if num_heads is None or 1 <= num_heads <= self.max_num_heads:
             return tuple(sorted(self.topks))
         return ()
@@ -190,7 +201,7 @@ class SparseMLASm120DecodeConfig:
             num_tokens <= self.max_num_tokens
             and page_block_size == self.page_block_size
             and 1 <= num_heads <= self.max_num_heads
-            and topk in self.topks
+            and topk >= self.min_topk
         )
 
 
@@ -224,6 +235,7 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
         page_block_size=_DECODE_DSV3_2_PAGE_BLOCK_SIZE,
         max_num_tokens=_DECODE_MAX_TOKENS,
         topks=_DECODE_DSV3_2_TOPKS,
+        min_topk=1,
         max_num_heads=_DECODE_MAX_HEADS,
     )
     return {
@@ -232,6 +244,7 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
             page_block_size=_DECODE_DSV4_PAGE_BLOCK_SIZE,
             max_num_tokens=_DECODE_MAX_TOKENS,
             topks=_DECODE_DSV4_TOPKS,
+            min_topk=1,
             max_num_heads=_DECODE_MAX_HEADS,
         ),
         "dsv3_2": dsv3_2,
@@ -241,6 +254,7 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
             page_block_size=_DECODE_DSV3_2_PAGE_BLOCK_SIZE,
             max_num_tokens=_DECODE_MAX_TOKENS,
             topks=frozenset({_DECODE_GLM53_NOPE_TOPK}),
+            min_topk=1,
             max_num_heads=_DECODE_MAX_HEADS,
         ),
         "dots3_swa": SparseMLASm120DecodeConfig(
@@ -248,6 +262,7 @@ def supported_sparse_mla_sm120_configs() -> dict[str, SparseMLASm120DecodeConfig
             page_block_size=_DECODE_DSV4_PAGE_BLOCK_SIZE,
             max_num_tokens=_DECODE_MAX_TOKENS,
             topks=frozenset({_DECODE_DOTS3_SWA_TOPK}),
+            min_topk=513,
             max_num_heads=_DECODE_MAX_HEADS,
         ),
     }
@@ -277,10 +292,16 @@ def _decode_dispatch_error_message(
             f"page_block_size={page_block_size} is unsupported; decode kernels "
             f"are instantiated only for page_block_size={config.page_block_size}"
         )
-    if topk not in config.topks:
+    if topk < config.min_topk:
         reasons.append(
-            f"topk={topk} is not instantiated for the {family} decode family; "
-            f"available topk: {list(config.supported_topk())}"
+            f"topk={topk} is below the {family} decode minimum "
+            f"(topk >= {config.min_topk}"
+            + (
+                ", the 513-wide sliding window must fit the indices buffer)"
+                if config.min_topk > 1
+                else ")"
+            )
+            + f"; calibrated topk values: {list(config.supported_topk())}"
         )
     if not 1 <= num_heads <= config.max_num_heads:
         reasons.append(

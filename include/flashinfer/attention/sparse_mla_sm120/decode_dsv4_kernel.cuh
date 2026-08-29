@@ -168,7 +168,7 @@ struct DecodeDsv4Smem {
 
 // No minBlocksPerSM on launch_bounds: kernel is smem-bound at 1 block/SM, and
 // the unconstrained register budget avoids the per-warp spill the hint forces.
-template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
+template <ModelType MT, int NUM_HEADS, int PAGE_BLOCK_SIZE>
 __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_decode_dsv4_kernel(
     const bf16* __restrict__ Q,               // [num_tokens, num_heads, d_qk] bf16
     const uint8_t* __restrict__ KV_cache,     // FP8 paged (DSV4 footer layout)
@@ -184,7 +184,7 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
     const int* __restrict__ extra_topk_length_ptr,  // [num_tokens] or null
     int extra_topk,                                 // 0 = no extra cache
     int pbs_extra,  // page_block_size for extra cache (e.g. 2 for DSv4 C128A)
-    size_t stride_extra_kv_block, int num_tokens, int num_heads, int num_splits,
+    size_t stride_extra_kv_block, int num_tokens, int num_heads, int topk, int num_splits,
     int chunks_per_block, float sm_scale, size_t stride_kv_block,
     // Row strides of (extra_)indices; either may exceed the row width when the
     // caller views a wider persistent buffer (last dim must stay contiguous).
@@ -206,7 +206,7 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
   constexpr int pbs = PAGE_BLOCK_SIZE;
   // Kernel always computes a full HPB×CAND tile (zero-Q-padded for unused
   // head slots). NUM_HEADS == 0 selects the runtime-head-count instantiation:
-  // one kernel per (MT, TOPK) serves any num_heads <= 128. Q/output carry the
+  // one kernel per model type serves any num_heads <= 128. Q/output carry the
   // true num_heads stride while the mid scratch is HPB-aligned (gridDim.y *
   // HPB head rows per token), so both halves of the head tile write back
   // unconditionally and the merge kernel reads only h < num_heads. The
@@ -226,16 +226,18 @@ __global__ void __launch_bounds__(DecodeTileCfg<MT>::BLOCK_THREADS) sparse_mla_d
   const int q_heads = RUNTIME_H ? num_heads : NUM_HEADS;
   const int mid_heads = RUNTIME_H ? (int)gridDim.y * HPB : NUM_HEADS;
   const int valid_h = RUNTIME_H ? min(num_heads - h_start, HPB) : VALID_HPB;
-  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : TOPK;
-  topk_len = topk_len < 0 ? 0 : (topk_len > TOPK ? TOPK : topk_len);
+  // topk is the runtime indices-row width (the buffer bound); topk_length,
+  // when given, is clamped to it.
+  int topk_len = topk_length_ptr ? __ldg(topk_length_ptr + t_idx) : topk;
+  topk_len = topk_len < 0 ? 0 : (topk_len > topk ? topk : topk_len);
   // Sliding-window models cap the candidate count at the window regardless of
-  // what the caller passed, so omitting topk_length costs nothing: TOPK is only
-  // the buffer width (576 covering a 513 window) and the extra slots can never
-  // hold valid candidates. Applied here rather than validated at the FFI so a
-  // caller passing a too-large length cannot make the kernel over-scan either.
+  // what the caller passed, so omitting topk_length costs nothing: topk is
+  // only the buffer width and the extra slots can never hold valid
+  // candidates. Applied here rather than validated at the FFI so a caller
+  // passing a too-large length cannot make the kernel over-scan either. The
+  // host side rejects a buffer narrower than the window with a readable
+  // error (SparseMlaSm120DecodeDsv4 in the JIT binding).
   if constexpr (Cfg::HAS_WINDOW) {
-    static_assert(Cfg::WINDOW <= TOPK,
-                  "TOPK must cover the sliding window; pick a wider instantiation");
     topk_len = topk_len > Cfg::WINDOW ? Cfg::WINDOW : topk_len;
   }
   int extra_topk_len =

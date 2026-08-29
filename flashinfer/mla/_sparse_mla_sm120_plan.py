@@ -112,48 +112,74 @@ def _decode_chunk_width(model_type: int) -> int:
 # for the 64-token page layout; the C++ prefill launchers hardcode PBS=64.
 _PAGE_BLOCK_SIZE = 64
 
-# decode-dsv4 eligibility. num_heads=8 keeps a dedicated instantiation per
-# topk (its true-H mid scratch makes the second-half writeback a compile-time
-# skip, worth 4-6% at small T); every other num_heads in [1, 128] is served by
-# one runtime-H instantiation per topk (NUM_HEADS=0; the kernel zero-Q-pads
-# the head tile and HPB-aligns the mid scratch). The dispatch set is therefore
-# the full [1, 128] x topks product. Keep it a frozenset of (num_heads, topk)
-# pairs: vLLM's has_flashinfer_sparse_mla_sm120_config probes membership.
+# decode-dsv4 eligibility. num_heads in {8, 16, 32, 64, 128} keeps dedicated
+# instantiations (measured 0.9-2.5% faster than runtime-H on hot shapes);
+# every other num_heads in [1, 128] is served by one runtime-H instantiation
+# (NUM_HEADS=0; the kernel zero-Q-pads the head tile and HPB-aligns the mid
+# scratch). topk is a runtime kernel argument (the indices-row width), so
+# eligibility is "num_heads in [1, 128] and topk >= min_topk" — not an
+# enumerable pair set. The _DECODE_*_DISPATCH objects below implement that
+# membership; vLLM's has_flashinfer_sparse_mla_sm120_config probes
+# ``(num_heads, topk) in _DECODE_DSV4_DISPATCH``.
 _DECODE_MAX_HEADS = 128
-_DECODE_DSV4_TOPKS = frozenset({128, 192, 256, 512, 1024})
-_DECODE_DSV4_DISPATCH = frozenset(
-    (h, k) for h in range(1, _DECODE_MAX_HEADS + 1) for k in _DECODE_DSV4_TOPKS
-)
+
+
+class _DecodeDispatchEnvelope:
+    """(num_heads, topk) membership for one decode kernel family.
+
+    topk is runtime, so the envelope is a predicate, not a pair set:
+    ``(h, k) in envelope`` iff ``1 <= h <= _DECODE_MAX_HEADS and k >=
+    min_topk``. ``min_topk`` is 513 for the sliding-window family (the window
+    must fit the indices buffer) and 1 elsewhere.
+    """
+
+    __slots__ = ("min_topk",)
+
+    def __init__(self, min_topk: int) -> None:
+        self.min_topk = min_topk
+
+    def __contains__(self, pair: object) -> bool:
+        if not isinstance(pair, tuple) or len(pair) != 2:
+            return False
+        h, k = pair
+        if not isinstance(h, int) or not isinstance(k, int):
+            return False
+        return 1 <= h <= _DECODE_MAX_HEADS and k >= self.min_topk
+
+    def __repr__(self) -> str:
+        return f"_DecodeDispatchEnvelope(num_heads<={_DECODE_MAX_HEADS}, topk>={self.min_topk})"
+
+
+_DECODE_DSV4_DISPATCH = _DecodeDispatchEnvelope(1)
 
 # decode-dsv3_2 eligibility (shared with GLM-NSA).
-_DECODE_DSV3_2_TOPKS = frozenset({128, 512, 1024, 2048})
-_DECODE_DSV3_2_DISPATCH = frozenset(
-    (h, k) for h in range(1, _DECODE_MAX_HEADS + 1) for k in _DECODE_DSV3_2_TOPKS
-)
+_DECODE_DSV3_2_DISPATCH = _DecodeDispatchEnvelope(1)
 
 # GLM-5.3 native NoPE decode: topk=2176 folds the 128-token indexer tail
-# into the 2048 sparse selection. One runtime-H instantiation covers the TP1
-# (64-head) and TP2 (32-head) shapes and any other shard.
-_DECODE_GLM53_NOPE_TOPK = 2176
-_DECODE_GLM53_NOPE_DISPATCH = frozenset(
-    (h, _DECODE_GLM53_NOPE_TOPK) for h in range(1, _DECODE_MAX_HEADS + 1)
-)
+# into the 2048 sparse selection; any runtime width is served (2176 remains
+# the calibration point).
+_DECODE_GLM53_NOPE_DISPATCH = _DecodeDispatchEnvelope(1)
 
 # DOTS3_SWA sliding-window decode, served by the decode-dsv4 kernel at BI=32 /
-# 4 math warps. topk=576 is the tightest multiple of the BI=32 tile (18
-# chunks) covering the 513-wide window; the window itself is clamped inside
-# the kernel (DecodeTileCfg<DOTS3_SWA>::WINDOW). Runtime-H covers TP shards
-# of a 64-head layer (TP4 -> 16) and any other count up to 128.
+# 4 math warps. topk is the buffer width and must cover the 513-wide window;
+# the window itself is clamped inside the kernel
+# (DecodeTileCfg<DOTS3_SWA>::WINDOW). Runtime-H covers TP shards of a 64-head
+# layer (TP4 -> 16) and any other count up to 128.
+_DECODE_DOTS3_SWA_DISPATCH = _DecodeDispatchEnvelope(513)
+
+# Calibration/documented topk values per family (the crossover sweep points).
+# Any width >= min_topk above is served; these are the values with measured
+# crossover data.
+_DECODE_DSV4_TOPKS = frozenset({128, 192, 256, 512, 1024})
+_DECODE_DSV3_2_TOPKS = frozenset({128, 512, 1024, 2048})
+_DECODE_GLM53_NOPE_TOPK = 2176
 _DECODE_DOTS3_SWA_TOPK = 576
-_DECODE_DOTS3_SWA_DISPATCH = frozenset(
-    (h, _DECODE_DOTS3_SWA_TOPK) for h in range(1, _DECODE_MAX_HEADS + 1)
-)
 
 # Crossover-calibration grids: the (num_heads, topk) pairs the tuning-mode
-# sweep times on both paths. Deliberately NOT the full eligibility product —
-# calibrating 128 head counts would explode the sweep. Every grid head count
-# hits a dedicated instantiation, so the sweep times exactly the kernels
-# production decode calls launch; runtime-H-only shapes off the grid keep the
+# sweep times on both paths. Deliberately NOT the full eligibility envelope —
+# calibrating every head count and topk width would explode the sweep. Every
+# grid head count hits a dedicated instantiation, so the sweep times exactly
+# the kernels production decode calls launch; off-grid shapes keep the
 # decode-first default until a measured entry exists.
 _CALIBRATION_HEADS = (8, 16, 32, 64, 128)
 _DECODE_DSV4_CALIBRATION_GRID = frozenset(

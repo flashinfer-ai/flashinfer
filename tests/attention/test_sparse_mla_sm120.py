@@ -385,6 +385,11 @@ _DSV4_DECODE_CONFIGS = [
     (12, 512),
     (24, 256),
     (80, 128),
+    # Runtime-topk: topk is a runtime kernel argument (the indices-row
+    # width). 384 is a multiple of the BI=64 tile off the calibrated grid;
+    # 500 exercises the partial tail chunk.
+    (64, 384),
+    (64, 500),
 ]
 
 
@@ -656,6 +661,72 @@ def test_sparse_mla_sm120_decode_dots3_swa_no_topk_length(num_heads: int) -> Non
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-3, rtol=5e-3)
 
 
+@pytest.mark.parametrize("num_heads", [8, 64])
+def test_sparse_mla_sm120_decode_dots3_swa_window_boundary(num_heads: int) -> None:
+    """Runtime-topk window boundary: topk=513 (exactly WINDOW) decodes
+    correctly; topk=512 (buffer narrower than the window) raises a readable
+    error naming the 513 minimum."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v, window = 1088, 1024, 513
+    page_block_size, num_blocks, num_tokens = 64, 64, 4
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dots3_swa(kv_bf16)
+    kv_dequant = dequantize_kv_dots3_swa(kv_packed)
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    sm_scale = d_qk**-0.5
+
+    # topk == 513: the tightest legal buffer; every slot is inside the window.
+    indices = torch.randint(
+        0, s_kv, (num_tokens, window), device=device, dtype=torch.int32
+    )
+    indices[:, window // 2 :] = -1
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, window, d_v, device)
+    sparse_mla_sm120_paged_attention(
+        q,
+        kv_packed,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        d_v=d_v,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
+    )
+    torch.testing.assert_close(output, ref_out, atol=5e-3, rtol=5e-3)
+    torch.testing.assert_close(out_lse, ref_lse, atol=5e-3, rtol=5e-3)
+
+    # topk == 512: cannot hold the window — rejected with the 513 minimum.
+    bad_indices = torch.randint(
+        0, s_kv, (num_tokens, 512), device=device, dtype=torch.int32
+    )
+    with pytest.raises(ValueError, match=r"topk=512 is below .*topk >= 513"):
+        sparse_mla_sm120_paged_attention(
+            q,
+            kv_packed,
+            bad_indices,
+            output,
+            out_lse,
+            sm_scale,
+            d_v=d_v,
+        )
+
+
 _DOTS3_SWA_DECODE_CONFIGS = [(8, 576), (16, 576), (32, 576), (64, 576)]
 
 
@@ -816,12 +887,12 @@ def test_sparse_mla_sm120_decode_dsv4_topk_length_truncation(
 def test_sparse_mla_sm120_decode_unsupported_shape_fails_before_prefill() -> None:
     """A shape served by neither decode nor the prefill envelope raises.
 
-    Decode-form calls whose shape is not decode-instantiated now route to
-    prefill; this shape (topk=384) is outside the DSV4 prefill envelope too,
-    so the FFI dispatch failure is converted to the diagnostic ValueError.
+    num_heads=256 is past the runtime-H decode ceiling (128) and outside
+    every prefill head set, so the planner's None is converted to the
+    diagnostic ValueError.
     """
     device = torch.device("cuda")
-    num_tokens, num_heads, topk = 1, 16, 384
+    num_tokens, num_heads, topk = 1, 256, 384
     d_qk = d_v = 512
 
     q = torch.empty((num_tokens, num_heads, d_qk), dtype=torch.bfloat16, device=device)
@@ -2738,9 +2809,10 @@ def test_sparse_mla_sm120_prefill_impl_rejects_unknown_string() -> None:
 
 @pytest.mark.parametrize("num_heads", [8, 64])
 def test_sparse_mla_sm120_decode_form_prefill_fallback(num_heads: int) -> None:
-    """A decode-form call at a prefill-legal but decode-uninstantiated shape
-    (DSv4 topk=2048; the decode sets stop at topk=1024) routes to prefill and
-    matches the reference."""
+    """A decode-form call at DSv4 topk=2048 — historically prefill-routed
+    (the old decode sets stopped at topk=1024) — is served by the
+    runtime-topk decode kernel under the decode-first default and matches
+    the reference."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     num_tokens, topk = 32, 2048
@@ -2774,6 +2846,8 @@ def test_sparse_mla_sm120_decode_form_prefill_fallback(num_heads: int) -> None:
         (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
     )
     out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    # Runtime-topk decode requires the caller-side split-K scratch.
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
     sparse_mla_sm120_paged_attention(
         q,
         kv_packed,
@@ -2782,6 +2856,8 @@ def test_sparse_mla_sm120_decode_form_prefill_fallback(num_heads: int) -> None:
         out_lse,
         sm_scale,
         d_v=d_v,
+        mid_out=mid_out,
+        mid_lse=mid_lse,
     )
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)

@@ -18,14 +18,17 @@ namespace flashinfer::sparse_mla_sm120 {
     }                                                                       \
   } while (0)
 
-template <ModelType MT, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE>
-static bool launch_decode_dsv4_impl(
-    int num_heads, const bf16* Q, const uint8_t* KV_cache, const int32_t* indices, bf16* mid_out,
-    float* mid_lse, const int* topk_length, bf16* output, float* out_lse, const float* attn_sink,
-    const uint8_t* extra_KV_cache, const int32_t* extra_indices, const int* extra_topk_length,
-    int extra_topk, int pbs_extra, size_t stride_extra_kv_block, int num_tokens, int num_splits,
-    int chunks_per_block_override, float sm_scale, size_t stride_kv_block,
-    size_t stride_indices_token, size_t stride_extra_indices_token, cudaStream_t stream) {
+template <ModelType MT, int NUM_HEADS, int PAGE_BLOCK_SIZE>
+static bool launch_decode_dsv4_impl(int num_heads, int topk, const bf16* Q, const uint8_t* KV_cache,
+                                    const int32_t* indices, bf16* mid_out, float* mid_lse,
+                                    const int* topk_length, bf16* output, float* out_lse,
+                                    const float* attn_sink, const uint8_t* extra_KV_cache,
+                                    const int32_t* extra_indices, const int* extra_topk_length,
+                                    int extra_topk, int pbs_extra, size_t stride_extra_kv_block,
+                                    int num_tokens, int num_splits, int chunks_per_block_override,
+                                    float sm_scale, size_t stride_kv_block,
+                                    size_t stride_indices_token, size_t stride_extra_indices_token,
+                                    cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
   using Cfg = DecodeTileCfg<MT>;
   // Ceiling div so NUM_HEADS < HPB (small-TP configs, e.g. h=8) still get a
@@ -73,7 +76,7 @@ static bool launch_decode_dsv4_impl(
       + N_V_CHUNKS_LAUNCH * HPB * (int)sizeof(float)                  // sm_w_head_sc
       + 2 * HPB * (Cfg::BI + 16);                                     // sm_w_fp8 ×2 (vc parity)
 
-  auto kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, TOPK, PAGE_BLOCK_SIZE>;
+  auto kernel = sparse_mla_decode_dsv4_kernel<MT, NUM_HEADS, PAGE_BLOCK_SIZE>;
   CUDA_CHECK_BOOL(
       cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, DYN_SMEM_BYTES));
 
@@ -121,7 +124,7 @@ static bool launch_decode_dsv4_impl(
   dim3 block1(Cfg::BLOCK_THREADS);
   kernel<<<grid1, block1, DYN_SMEM_BYTES, stream>>>(
       Q, KV_cache, indices, mid_out, mid_lse, topk_length, extra_KV_cache, extra_indices,
-      extra_topk_length, extra_topk, pbs_extra, stride_extra_kv_block, num_tokens, q_heads,
+      extra_topk_length, extra_topk, pbs_extra, stride_extra_kv_block, num_tokens, q_heads, topk,
       num_splits, chunks_per_block, sm_scale, stride_kv_block, stride_indices_token,
       stride_extra_indices_token);
   CUDA_CHECK_BOOL(cudaGetLastError());
@@ -146,16 +149,14 @@ static bool launch_decode_dsv4_impl(
   return true;
 }
 
-// Public surface — explicit instantiation switch.
-// page_block_size=64 only. DSV4: TOPK ∈ {128, 192, 256, 512, 1024}.
-// TOPK=192 covers the padded DeepSeek-V4-Flash-0731 DSpark K=5 shape (128 SWA
-// + 5 active draft entries), while TOPK=256 covers wider DSpark
-// configurations.
+// Public surface — explicit instantiation switch over num_heads only; topk
+// is a runtime kernel argument (the indices-row width), so one instantiation
+// per head count serves any topk. page_block_size=64 only.
 // Head counts: the production grid {8, 16, 32, 64, 128} keeps dedicated
 // instantiations — measured 0.9-2.5% faster than the runtime-H kernel on hot
 // shapes (compile-time head strides); every other num_heads in [1, 128] falls
-// back to one runtime-H instantiation per topk (NUM_HEADS == 0), which pads
-// the head tile with zero-Q rows and HPB-aligns the mid scratch.
+// back to one runtime-H instantiation (NUM_HEADS == 0), which pads the head
+// tile with zero-Q rows and HPB-aligns the mid scratch.
 bool launch_sparse_mla_decode_dsv4(
     ModelType mt, int num_heads, int topk, int page_block_size, int num_tokens, int num_splits,
     const bf16* Q, const uint8_t* KV_cache, const int32_t* indices, bf16* mid_out, float* mid_lse,
@@ -168,62 +169,50 @@ bool launch_sparse_mla_decode_dsv4(
   if (page_block_size != 64) return false;
   if (num_splits <= 0) return false;
   if (num_heads < 1 || num_heads > 128) return false;
-#define DECODE_DISPATCH(MT_, H, K)                                                          \
-  if (mt == (MT_) && num_heads == (H) && topk == (K)) {                                     \
-    return launch_decode_dsv4_impl<(MT_), (H), (K), 64>(                                    \
-        num_heads, Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse,    \
-        attn_sink, extra_KV_cache, extra_indices, extra_topk_length, extra_topk, pbs_extra, \
-        stride_extra_kv_block, num_tokens, num_splits, chunks_per_block_override, sm_scale, \
-        stride_kv_block, stride_indices_token, stride_extra_indices_token, stream);         \
+  if (topk < 1) return false;
+  // DOTS3_SWA's sliding window needs an indices buffer at least WINDOW wide;
+  // the binding reports this with a readable message before dispatch.
+  if (mt == ModelType::DOTS3_SWA && topk < DecodeTileCfg<ModelType::DOTS3_SWA>::WINDOW) {
+    return false;
+  }
+#define DECODE_DISPATCH(MT_, H)                                                                \
+  if (mt == (MT_) && num_heads == (H)) {                                                       \
+    return launch_decode_dsv4_impl<(MT_), (H), 64>(                                            \
+        num_heads, topk, Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, \
+        attn_sink, extra_KV_cache, extra_indices, extra_topk_length, extra_topk, pbs_extra,    \
+        stride_extra_kv_block, num_tokens, num_splits, chunks_per_block_override, sm_scale,    \
+        stride_kv_block, stride_indices_token, stride_extra_indices_token, stream);            \
   }
 // Runtime-H fallback: any num_heads in [1, 128] whose exact count no
 // dedicated instantiation above claimed (they return first).
-#define DECODE_DISPATCH_RT(MT_, K)                                                          \
-  if (mt == (MT_) && topk == (K)) {                                                         \
-    return launch_decode_dsv4_impl<(MT_), 0, (K), 64>(                                      \
-        num_heads, Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse,    \
-        attn_sink, extra_KV_cache, extra_indices, extra_topk_length, extra_topk, pbs_extra, \
-        stride_extra_kv_block, num_tokens, num_splits, chunks_per_block_override, sm_scale, \
-        stride_kv_block, stride_indices_token, stride_extra_indices_token, stream);         \
+#define DECODE_DISPATCH_RT(MT_)                                                                \
+  if (mt == (MT_)) {                                                                           \
+    return launch_decode_dsv4_impl<(MT_), 0, 64>(                                              \
+        num_heads, topk, Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, \
+        attn_sink, extra_KV_cache, extra_indices, extra_topk_length, extra_topk, pbs_extra,    \
+        stride_extra_kv_block, num_tokens, num_splits, chunks_per_block_override, sm_scale,    \
+        stride_kv_block, stride_indices_token, stride_extra_indices_token, stream);            \
   }
-#define DSV4_DISPATCH(H, K) DECODE_DISPATCH(ModelType::DSV4, (H), (K))
-#define DSV4_DISPATCH_RT(K) DECODE_DISPATCH_RT(ModelType::DSV4, (K))
-#define DSV4_DISPATCH_ROW(H) \
-  DSV4_DISPATCH(H, 128)      \
-  DSV4_DISPATCH(H, 192)      \
-  DSV4_DISPATCH(H, 256)      \
-  DSV4_DISPATCH(H, 512)      \
-  DSV4_DISPATCH(H, 1024)
-  DSV4_DISPATCH_ROW(8)
-  DSV4_DISPATCH_ROW(16)
-  DSV4_DISPATCH_ROW(32)
-  DSV4_DISPATCH_ROW(64)
-  DSV4_DISPATCH_ROW(128)
-#undef DSV4_DISPATCH_ROW
-  DSV4_DISPATCH_RT(128)
-  DSV4_DISPATCH_RT(192)
-  DSV4_DISPATCH_RT(256)
-  DSV4_DISPATCH_RT(512)
-  DSV4_DISPATCH_RT(1024)
-  // DOTS3_SWA sliding-window decode: 64 heads, a 513-token window carried as an
-  // index set. TOPK=576 is the tightest fit: it covers 513, divides BI=32
-  // (18 chunks) and the 64-wide split granularity (9 splits). The 1024 entry
-  // the DSV4 grid happens to offer would nearly double the split-K scratch
-  // (mid_out is [tokens, heads, num_splits, d_v]) for no extra coverage.
-  // topk_length is optional for DOTS3_SWA: DecodeTileCfg<DOTS3_SWA>::WINDOW caps
-  // the per-token candidate count inside the kernel, so omitting it costs
-  // nothing beyond the window itself. Unused slots must still carry -1, which
-  // the QK mask turns into -inf.
-  // Head counts cover the TP shards of a 64-head layer (TP4 -> 16) with
-  // dedicated instantiations; any other count up to 128 rides the runtime-H
-  // fallback.
-  DECODE_DISPATCH(ModelType::DOTS3_SWA, 8, 576)
-  DECODE_DISPATCH(ModelType::DOTS3_SWA, 16, 576)
-  DECODE_DISPATCH(ModelType::DOTS3_SWA, 32, 576)
-  DECODE_DISPATCH(ModelType::DOTS3_SWA, 64, 576)
-  DECODE_DISPATCH_RT(ModelType::DOTS3_SWA, 576)
-#undef DSV4_DISPATCH_RT
+#define DSV4_DISPATCH(H) DECODE_DISPATCH(ModelType::DSV4, (H))
+  DSV4_DISPATCH(8)
+  DSV4_DISPATCH(16)
+  DSV4_DISPATCH(32)
+  DSV4_DISPATCH(64)
+  DSV4_DISPATCH(128)
+  DECODE_DISPATCH_RT(ModelType::DSV4)
 #undef DSV4_DISPATCH
+  // DOTS3_SWA sliding-window decode: a 513-token window carried as an index
+  // set. topk is the buffer width (must be >= 513, checked above); the window
+  // itself is clamped inside the kernel (DecodeTileCfg<DOTS3_SWA>::WINDOW), so
+  // omitting topk_length costs nothing beyond the window. Unused slots must
+  // still carry -1, which the QK mask turns into -inf. Head counts cover the
+  // TP shards of a 64-head layer (TP4 -> 16) with dedicated instantiations;
+  // any other count up to 128 rides the runtime-H fallback.
+  DECODE_DISPATCH(ModelType::DOTS3_SWA, 8)
+  DECODE_DISPATCH(ModelType::DOTS3_SWA, 16)
+  DECODE_DISPATCH(ModelType::DOTS3_SWA, 32)
+  DECODE_DISPATCH(ModelType::DOTS3_SWA, 64)
+  DECODE_DISPATCH_RT(ModelType::DOTS3_SWA)
 #undef DECODE_DISPATCH_RT
 #undef DECODE_DISPATCH
   return false;

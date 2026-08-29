@@ -64,7 +64,7 @@ from flashinfer.mla._sparse_mla_sm120 import (
 
 
 def test_supported_configs_families() -> None:
-    """The query API mirrors the private dispatch tables exactly."""
+    """The query API mirrors the decode dispatch envelopes exactly."""
     configs = supported_sparse_mla_sm120_configs()
     assert set(configs) == {"dsv4", "dsv3_2", "glm_nsa", "glm53_nope", "dots3_swa"}
     assert all(
@@ -76,18 +76,22 @@ def test_supported_configs_families() -> None:
     assert dsv4.page_block_size == 64
     assert dsv4.max_num_tokens == _DECODE_MAX_TOKENS
     assert dsv4.max_num_heads == 128
-    assert dsv4.topks == frozenset({128, 192, 256, 512, 1024})
-    # The eligibility frozenset is the full [1, 128] x topks product; vLLM
-    # probes its membership directly.
-    expected_dsv4 = frozenset((h, k) for h in range(1, 129) for k in dsv4.topks)
-    assert expected_dsv4 == _DECODE_DSV4_DISPATCH
+    assert dsv4.topks == frozenset({128, 192, 256, 512, 1024})  # calibrated values
+    assert dsv4.min_topk == 1
+    # The dispatch envelope is a membership predicate (topk is a runtime
+    # kernel argument): any H in [1, 128] at any topk >= min_topk. vLLM
+    # probes ``(num_heads, topk) in _DECODE_DSV4_DISPATCH`` directly.
+    assert (64, 128) in _DECODE_DSV4_DISPATCH
+    assert (48, 384) in _DECODE_DSV4_DISPATCH  # off the calibrated grid
+    assert (256, 128) not in _DECODE_DSV4_DISPATCH
+    assert (64, 0) not in _DECODE_DSV4_DISPATCH
 
     dsv3_2 = configs["dsv3_2"]
     assert dsv3_2.d_qk == 576
     assert dsv3_2.page_block_size == 64
     assert dsv3_2.topks == frozenset({128, 512, 1024, 2048})
-    expected_dsv3_2 = frozenset((h, k) for h in range(1, 129) for k in dsv3_2.topks)
-    assert expected_dsv3_2 == _DECODE_DSV3_2_DISPATCH
+    assert dsv3_2.min_topk == 1
+    assert (96, 640) in _DECODE_DSV3_2_DISPATCH
 
     # GLM-NSA shares the DSv3.2 decode instantiations (same config object).
     assert configs["glm_nsa"] is dsv3_2
@@ -96,15 +100,17 @@ def test_supported_configs_families() -> None:
     assert glm53.d_qk == 512
     assert glm53.page_block_size == 64
     assert glm53.topks == frozenset({2176})
-    expected_nope = frozenset((h, 2176) for h in range(1, 129))
-    assert expected_nope == _DECODE_GLM53_NOPE_DISPATCH
+    assert glm53.min_topk == 1
+    assert (64, 2176) in _DECODE_GLM53_NOPE_DISPATCH
 
     dots3_swa = configs["dots3_swa"]
     assert dots3_swa.d_qk == 1088
     assert dots3_swa.page_block_size == 64
     assert dots3_swa.topks == frozenset({576})
-    expected_swa = frozenset((h, 576) for h in range(1, 129))
-    assert expected_swa == _DECODE_DOTS3_SWA_DISPATCH
+    assert dots3_swa.min_topk == 513  # the sliding window must fit the buffer
+    assert (64, 513) in _DECODE_DOTS3_SWA_DISPATCH
+    assert (64, 576) in _DECODE_DOTS3_SWA_DISPATCH
+    assert (64, 512) not in _DECODE_DOTS3_SWA_DISPATCH
 
     # The lazy export resolves through the public flashinfer.mla namespace.
     assert (
@@ -130,46 +136,56 @@ def test_supported_helpers() -> None:
 
 
 def test_supports_decode_matches_dispatch_predicates() -> None:
-    """config.supports_decode agrees with the internal dispatch predicates."""
+    """config.supports_decode agrees with the internal dispatch predicates,
+    on and off the calibrated grid (topk is a runtime kernel argument)."""
     configs = supported_sparse_mla_sm120_configs()
     dsv4 = configs["dsv4"]
-    for num_heads, topk in sorted(_DECODE_DSV4_DISPATCH):
-        assert dsv4.supports_decode(num_heads, topk)
-        assert _decode_dsv4_dispatchable(1, num_heads, topk, 512, 64)
-        assert _decode_dsv4_dispatchable(_DECODE_MAX_TOKENS, num_heads, topk, 512, 64)
+    for num_heads in (8, 16, 64, 128, 48, 3):
+        for topk in (128, 384, 256, 640, 1024, 4096):
+            assert dsv4.supports_decode(num_heads, topk)
+            assert _decode_dsv4_dispatchable(1, num_heads, topk, 512, 64)
+            assert _decode_dsv4_dispatchable(
+                _DECODE_MAX_TOKENS, num_heads, topk, 512, 64
+            )
 
     dsv3_2 = configs["dsv3_2"]
-    for num_heads, topk in sorted(_DECODE_DSV3_2_DISPATCH):
-        assert dsv3_2.supports_decode(num_heads, topk)
-        assert _decode_dsv3_2_dispatchable(1, num_heads, topk, 576, 64)
+    for num_heads in (8, 64, 128, 24):
+        for topk in (128, 512, 1024, 2048, 3000):
+            assert dsv3_2.supports_decode(num_heads, topk)
+            assert _decode_dsv3_2_dispatchable(1, num_heads, topk, 576, 64)
 
 
 def test_supports_decode_rejects_mismatches() -> None:
-    """supports_decode is False for any out-of-set shape parameter."""
+    """supports_decode is False only outside the envelope axes."""
     dsv4 = supported_sparse_mla_sm120_configs()["dsv4"]
-    assert not dsv4.supports_decode(64, 384)  # topk not instantiated
+    assert dsv4.supports_decode(64, 384)  # arbitrary topk rides runtime-topk
+    assert not dsv4.supports_decode(64, 0)  # topk below min_topk=1
     assert not dsv4.supports_decode(256, 256)  # num_heads past the runtime-H ceiling
     assert dsv4.supports_decode(48, 256)  # arbitrary H <= 128 rides runtime-H
     assert not dsv4.supports_decode(64, 256, page_block_size=32)
     assert not dsv4.supports_decode(64, 256, num_tokens=_DECODE_MAX_TOKENS + 1)
     assert dsv4.supports_decode(64, 256, num_tokens=_DECODE_MAX_TOKENS)
-    assert not _decode_dsv4_dispatchable(1, 64, 384, 512, 64)
+    assert not _decode_dsv4_dispatchable(1, 64, 0, 512, 64)
     assert not _decode_dsv4_dispatchable(_DECODE_MAX_TOKENS + 1, 64, 256, 512, 64)
+    # DOTS3_SWA's window constraint: topk < 513 is out of envelope.
+    dots3 = supported_sparse_mla_sm120_configs()["dots3_swa"]
+    assert dots3.supports_decode(64, 513)
+    assert not dots3.supports_decode(64, 512)
 
 
 def test_error_message_names_topk_mismatch() -> None:
-    """The issue-#4541 scenario: decode-form call, uninstantiated topk."""
+    """A sub-minimum topk is named with the family minimum."""
     msg = _decode_dispatch_error_message(
         num_tokens=5,
         num_heads=64,
-        topk=384,
-        d_qk=512,
+        topk=512,
+        d_qk=1088,
         page_block_size=64,
-        model_type=_MODEL_TYPE_DSV4,
+        model_type=_MODEL_TYPE_DOTS3_SWA,
         extra_topk=0,
     )
-    assert "topk=384 is not instantiated for the dsv4 decode family" in msg
-    assert "available topk: [128, 192, 256, 512, 1024]" in msg
+    assert "topk=512 is below the dots3_swa decode minimum (topk >= 513" in msg
+    assert "sliding window must fit the indices buffer" in msg
     assert "prefill envelope both reject" in msg
     assert "supported_sparse_mla_sm120_configs" in msg
     # The matching page size must not be blamed.
@@ -191,19 +207,18 @@ def test_error_message_names_num_heads_mismatch() -> None:
 
 
 def test_error_message_names_both_mismatches() -> None:
-    """Both num_heads and topk out of set are reported together."""
+    """Both num_heads and topk out of envelope are reported together."""
     msg = _decode_dispatch_error_message(
         num_tokens=1,
         num_heads=256,
-        topk=384,
-        d_qk=512,
+        topk=512,
+        d_qk=1088,
         page_block_size=64,
-        model_type=_MODEL_TYPE_DSV4,
+        model_type=_MODEL_TYPE_DOTS3_SWA,
         extra_topk=0,
     )
-    assert "topk=384 is not instantiated for the dsv4 decode family" in msg
+    assert "topk=512 is below the dots3_swa decode minimum (topk >= 513" in msg
     assert "num_heads=256 exceeds the decode envelope [1, 128]" in msg
-    assert "available topk: [128, 192, 256, 512, 1024]" in msg
 
 
 def test_error_message_names_page_block_size_mismatch() -> None:
@@ -219,19 +234,22 @@ def test_error_message_names_page_block_size_mismatch() -> None:
     )
     assert "page_block_size=32 is unsupported" in msg
     assert "instantiated only for page_block_size=64" in msg
-    # (num_heads=64, topk=256) is instantiated, so it must not be blamed.
-    assert "topk=256 is not instantiated" not in msg
+    # (num_heads=64, topk=256) is inside the envelope, so the Mismatch
+    # reasons blame neither (the shape summary echo is expected).
+    assert "num_heads=64 exceeds" not in msg
+    assert "topk=256 is below" not in msg
 
 
 def test_error_message_dsv3_2_family() -> None:
-    """DSv3.2 and GLM-NSA report their family name and topk set."""
+    """DSv3.2 and GLM-NSA report their family name; a legal topk is not
+    blamed (any width >= 1 is served)."""
     for model_type, family in (
         (_MODEL_TYPE_DSV3_2, "dsv3_2"),
         (_MODEL_TYPE_GLM_NSA, "glm_nsa"),
     ):
         msg = _decode_dispatch_error_message(
             num_tokens=2,
-            num_heads=128,
+            num_heads=256,
             topk=192,
             d_qk=576,
             page_block_size=64,
@@ -239,12 +257,15 @@ def test_error_message_dsv3_2_family() -> None:
             extra_topk=0,
         )
         assert f"model_type={family}" in msg
-        assert "topk=192 is not instantiated for the " in msg
-        assert "available topk: [128, 512, 1024, 2048]" in msg
+        assert "num_heads=256 exceeds the decode envelope [1, 128]" in msg
+        assert "is below" not in msg  # topk=192 is legal; not blamed
 
 
 def test_error_message_keeps_shape_summary_format() -> None:
-    """Callers grepping for the pre-existing message shape keep working."""
+    """Callers grepping for the pre-existing message shape keep working.
+
+    (The shape itself is decode-eligible under runtime-topk; the builder is
+    exercised directly here purely for the message format.)"""
     msg = _decode_dispatch_error_message(
         num_tokens=1,
         num_heads=16,
@@ -284,21 +305,25 @@ def known_crossover(monkeypatch):
     plan_mod._plan_memo.clear()
 
 
-def test_plan_uninstantiated_goes_prefill(known_crossover) -> None:
-    """A shape outside the decode sets routes to a prefill variant."""
+def test_plan_off_grid_topk_rides_runtime_topk(known_crossover) -> None:
+    """topk is a runtime kernel argument: off-grid widths (dsv4 topk=2048,
+    384) are decode-eligible and take the decode-first default when
+    uncalibrated. (topk=2048 was prefill-routed before runtime-topk.)"""
     plan_mod, _ = known_crossover
-    planned = plan_mod.plan(
-        32,
-        64,
-        2048,
-        _MODEL_TYPE_DSV4,
-        64,
-        False,
-        plan_mod._PREFILL_IMPL_AUTO,
-        torch.device("cpu"),
-    )
-    assert planned is not None
-    assert planned.variant is plan_mod.KernelVariant.PREFILL_MG
+    for topk in (384, 2048):
+        planned = plan_mod.plan(
+            32,
+            64,
+            topk,
+            _MODEL_TYPE_DSV4,
+            64,
+            False,
+            plan_mod._PREFILL_IMPL_AUTO,
+            torch.device("cpu"),
+        )
+        assert planned is not None
+        assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
+        assert planned.cpb == -1  # no calibrated constants
 
 
 def test_plan_neither_envelope_returns_none(known_crossover) -> None:
@@ -556,21 +581,20 @@ def test_plan_glm53_nope_decode_and_prefill(known_crossover) -> None:
         torch.device("cpu"),
     )
     assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_MG
-    # (64, 2048) is neither a NOPE decode instantiation nor a NOPE prefill
-    # shape (NOPE prefill serves topk=2176 only).
-    assert (
-        plan_mod.plan(
-            4,
-            64,
-            2048,
-            _MODEL_TYPE_GLM53_NOPE,
-            64,
-            False,
-            plan_mod._PREFILL_IMPL_AUTO,
-            torch.device("cpu"),
-        )
-        is None
+    # (64, 2048): decode-eligible under runtime-topk (any width >= 1), though
+    # NOPE prefill still serves topk=2176 only. Decode-first default applies.
+    planned = plan_mod.plan(
+        4,
+        64,
+        2048,
+        _MODEL_TYPE_GLM53_NOPE,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        torch.device("cpu"),
     )
+    assert planned is not None
+    assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
 
 
 def test_plan_glm53_nope_crossover(known_crossover) -> None:
