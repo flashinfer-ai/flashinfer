@@ -5271,6 +5271,13 @@ def _cutedsl_low_latency_gemm_mxfp8_requirement(
         if backend != "cutedsl_low_latency":
             return False
         raise ValueError("cutedsl_low_latency mm_mxfp8 requires 1D 128x4 scale tensors")
+    if not a.is_contiguous() or b.stride() != (1, b.shape[0]):
+        if backend != "cutedsl_low_latency":
+            return False
+        raise ValueError(
+            "cutedsl_low_latency mm_mxfp8 requires a contiguous (M, K) "
+            "tensor and a column-major (K, N) tensor"
+        )
     if a.shape[0] > 8 or a.shape[1] % 128 != 0:
         if backend != "cutedsl_low_latency":
             return False
@@ -6450,6 +6457,13 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
         if backend != "cutedsl_low_latency":
             return False
         raise ValueError("cutedsl_low_latency FP4 GEMM requires 128x4 scale tensors")
+    if not a.is_contiguous() or b.stride() != (1, b.shape[0]):
+        if backend != "cutedsl_low_latency":
+            return False
+        raise ValueError(
+            "cutedsl_low_latency FP4 GEMM requires a contiguous (M, K) "
+            "tensor and a column-major (K, N) tensor"
+        )
     real_k = a.shape[1] * 2
     k_alignment = 64 if use_nvfp4 else 128
     if a.shape[0] > 8 or real_k % k_alignment != 0:
