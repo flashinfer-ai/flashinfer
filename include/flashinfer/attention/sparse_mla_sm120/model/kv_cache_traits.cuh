@@ -268,14 +268,9 @@ static constexpr int IO_THREADS = N_IO_WARPS * 32;               // 128
 static constexpr int ENTRIES_PER_WARP = BI / N_MATH_WARPS;  // 8
 static constexpr int N_ROPE_CHUNKS = D_ROPE / 16;           // 4
 
-// Output staging (reuses KV buffer after main loop).
-// NOTE: OUT_STAGING_STRIDE and OUT_TILES_PER_HEAD are currently unreferenced —
-// each kernel derives its own staging geometry. They read the bare D_V, so they
-// are DeepSeek-family-only; parameterize on KVCacheTraits<MT>::D_V before using
-// them from a DOTS3_SWA path.
-static constexpr int OUT_STAGING_STRIDE = D_V + 8;  // 520 bf16 elements
+// Output staging (reuses KV buffer after main loop). Each kernel derives
+// its own staging geometry from OUT_VEC.
 static constexpr int OUT_VEC = 8;
-static constexpr int OUT_TILES_PER_HEAD = D_V / OUT_VEC;  // 64
 
 // ============================================================================
 // ComputeMode + ModelType dependent parameters

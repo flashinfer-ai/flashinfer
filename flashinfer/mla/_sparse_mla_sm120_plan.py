@@ -70,12 +70,10 @@ _MODEL_TYPE_GLM53_NOPE = 3
 _MODEL_TYPE_DOTS3_SWA = 4
 # The V32 kernel family: the 656B/token inline-scale cache ABI. GLM53_NOPE is
 # the rope-free member (d_qk=512; bytes [528:656) are reserved padding).
+# swapAB is instantiated for all V32 model types.
 _V32_MODEL_TYPES = frozenset(
     {_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE}
 )
-# swapAB is instantiated for all V32 model types; GLM53_NOPE serves
-# topk=2176, the others topk=2048.
-_SWAPAB_MODEL_TYPES = _V32_MODEL_TYPES
 _BPT_DSV3_2 = 656
 _BPT_DSV4 = 584
 _BPT_DOTS3_SWA = 1160
@@ -275,7 +273,7 @@ def prefill_swapab_eligible(
 ) -> bool:
     # Single-cache only; GLM53_NOPE is included at topk=2176.
     return (
-        model_type in _SWAPAB_MODEL_TYPES
+        model_type in _V32_MODEL_TYPES
         and not has_extra
         and page_block_size == _PAGE_BLOCK_SIZE
         and topk == _V32_TOPK[model_type]
@@ -365,7 +363,7 @@ def _check_swapab_eligible(
     """Raise ValueError when prefill_impl='swapab' meets an ineligible shape."""
     if has_extra:
         raise ValueError("prefill_impl='swapab' does not support dual-cache")
-    if model_type not in _SWAPAB_MODEL_TYPES:
+    if model_type not in _V32_MODEL_TYPES:
         raise ValueError(
             "prefill_impl='swapab' requires a V32-family model type "
             f"(dsv3_2, glm_nsa, or glm53_nope); got family={_MODEL_TYPE_TO_FAMILY[model_type]!r}"

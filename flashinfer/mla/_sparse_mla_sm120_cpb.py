@@ -50,10 +50,11 @@ family, and non-zero values poisoned the latency-regime picks).
 The same tuning-mode pass also measures the decode/prefill crossover per
 decode-instantiated ``(num_heads, topk)`` config (:func:`calibrate_crossover`)
 and persists it as ``decode_max_tokens`` in the same JSON document (schema
-version 3; v1/v2 files keep loading their crossover table but their
-constants encode the old ceil-wave semantics and are discarded). The runtime
-decode/prefill routing in :mod:`._sparse_mla_sm120` consults it; absent
-entries keep the historical decode-first policy.
+version 3; only current-schema files load — older files encode retired model
+semantics and count as absent, so their families recalibrate on the next
+tuning-mode pass). The runtime decode/prefill routing in
+:mod:`._sparse_mla_sm120` consults it; absent entries keep the historical
+decode-first policy.
 """
 
 from __future__ import annotations
@@ -77,13 +78,10 @@ _BI = 64  # chunk width in candidates (BLOCK_SIZE_N)
 _HPB = 16  # head tile per block
 
 _SCHEMA_VERSION = 3
-# v1/v2 files predate the scheduling-makespan model: their per-family
-# constants encode the old ceil-wave form (including a beta merge term the
-# v3 model dropped) and would mispredict under the v3 structure, so only
-# their crossover table loads. v3 files load fully.
-_LOADABLE_SCHEMA_VERSIONS = (1, 2, 3)
-# Constants entries load only from files written at this version.
-_CONSTANTS_SCHEMA_VERSION = 3
+# Only current-schema files load. Older files encode retired model
+# semantics (v2 added the crossover table; v3 replaced the ceil-wave +
+# beta constants form with the scheduling-makespan model) and count as
+# absent: families recalibrate on the next tuning-mode pass.
 _BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 656, "dots3_swa": 1160}
 _D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512, "dots3_swa": 1088}
 _D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024}
@@ -385,46 +383,27 @@ def _time_call_fresh_indices(
     return best
 
 
-def calibrate(
-    module_getter: Callable[[], Any], family: str, device: torch.device
-) -> CpbConstants:
-    """Calibrate the cpb model constants for ``family`` on ``device``.
+def _make_decode_call_builder(
+    module: Any, family: str, device: torch.device, kv_cache: torch.Tensor
+) -> Callable[[int, int, int, int, int], Callable[[torch.Tensor], None]]:
+    """Decode-call constructor shared by calibrate() and calibrate_crossover().
 
-    Drives the real decode kernel over a ~2 GiB KV pool (halved on OOM down
-    to 512 MiB) with fresh full-pool uniform indices per rep so the measured
-    working set stays HBM-resident, then fits the three constants to six
-    fixed shapes by Levenberg-Marquardt on relative residuals.
-    ``module_getter`` returns the loaded TVM-FFI kernel module.
+    Returns a builder mapping ``(num_tokens, num_heads, topk, model_type,
+    cpb)`` to a ``call(indices) -> None`` closure that drives the family's
+    decode kernel over ``kv_cache``, so the two calibration passes' FFI
+    argument lists cannot drift apart. ``model_type`` only reaches the
+    dsv3_2-kernel families; the decode-dsv4 FFI resolves the model type from
+    ``d_qk`` itself (512 -> DSV4, 1088 -> DOTS3_SWA).
     """
-    if family not in _BYTES_PER_TOKEN:
-        raise ValueError(f"unknown sparse-MLA family {family!r}")
-    from ._sparse_mla_sm120 import _MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM53_NOPE
-    from ._sparse_mla_sm120_plan import _decode_scratch_heads
-
-    device = torch.device(device)
-    props = torch.cuda.get_device_properties(device)
-    sm_count = int(props.multi_processor_count)
-    l2_cache_bytes = int(getattr(props, "L2_cache_size", 0) or 0)
-    bi = _CHUNK_WIDTH[family]
-    w = bi * _BYTES_PER_TOKEN[family]
     d_qk = _D_QK[family]
     d_v = _D_V[family]
-    # Families whose decode is instantiated at a single topk have a fixed N,
-    # so the bandwidth term is identified from a cpb pair instead of an N pair.
-    _CPB_PAIR_MEASUREMENTS = {
-        "glm53_nope": _MEASUREMENTS_GLM53_NOPE,
-        "dots3_swa": _MEASUREMENTS_DOTS3_SWA,
-    }
-    measurements = _CPB_PAIR_MEASUREMENTS.get(family, _MEASUREMENTS)
-    model_type = (
-        _MODEL_TYPE_GLM53_NOPE if family == "glm53_nope" else _MODEL_TYPE_DSV3_2
-    )
+    bi = _CHUNK_WIDTH[family]
+    sm_scale = d_qk**-0.5
+    from ._sparse_mla_sm120_plan import _decode_scratch_heads
 
-    kv_cache, num_slots = _allocate_kv_pool(family, device)
-
-    module = module_getter()
-
-    def measure(num_tokens: int, num_heads: int, topk: int, cpb: int) -> float:
+    def build(
+        num_tokens: int, num_heads: int, topk: int, model_type: int, cpb: int
+    ) -> Callable[[torch.Tensor], None]:
         num_splits = _ceil_div(topk, bi)
         q = (
             (
@@ -455,10 +434,7 @@ def calibrate(
             num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
         )
         out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
-        sm_scale = d_qk**-0.5
         if family in ("dsv4", "dots3_swa"):
-            # The decode-dsv4 FFI resolves the model type from d_qk (512 ->
-            # DSV4, 1088 -> DOTS3_SWA) and applies its tile config.
 
             def call(indices: torch.Tensor) -> None:
                 module.sparse_mla_sm120_decode_dsv4(
@@ -498,6 +474,53 @@ def calibrate(
                     cpb,
                 )
 
+        return call
+
+    return build
+
+
+def calibrate(
+    module_getter: Callable[[], Any], family: str, device: torch.device
+) -> CpbConstants:
+    """Calibrate the cpb model constants for ``family`` on ``device``.
+
+    Drives the real decode kernel over a ~2 GiB KV pool (halved on OOM down
+    to 512 MiB) with fresh full-pool uniform indices per rep so the measured
+    working set stays HBM-resident, then fits the three constants to six
+    fixed shapes by Levenberg-Marquardt on relative residuals.
+    ``module_getter`` returns the loaded TVM-FFI kernel module.
+    """
+    if family not in _BYTES_PER_TOKEN:
+        raise ValueError(f"unknown sparse-MLA family {family!r}")
+    from ._sparse_mla_sm120_plan import (
+        _MODEL_TYPE_DSV3_2,
+        _MODEL_TYPE_GLM53_NOPE,
+    )
+
+    device = torch.device(device)
+    props = torch.cuda.get_device_properties(device)
+    sm_count = int(props.multi_processor_count)
+    l2_cache_bytes = int(getattr(props, "L2_cache_size", 0) or 0)
+    bi = _CHUNK_WIDTH[family]
+    w = bi * _BYTES_PER_TOKEN[family]
+    # Families whose decode is instantiated at a single topk have a fixed N,
+    # so the bandwidth term is identified from a cpb pair instead of an N pair.
+    _CPB_PAIR_MEASUREMENTS = {
+        "glm53_nope": _MEASUREMENTS_GLM53_NOPE,
+        "dots3_swa": _MEASUREMENTS_DOTS3_SWA,
+    }
+    measurements = _CPB_PAIR_MEASUREMENTS.get(family, _MEASUREMENTS)
+    model_type = (
+        _MODEL_TYPE_GLM53_NOPE if family == "glm53_nope" else _MODEL_TYPE_DSV3_2
+    )
+
+    kv_cache, num_slots = _allocate_kv_pool(family, device)
+
+    module = module_getter()
+    build_call = _make_decode_call_builder(module, family, device, kv_cache)
+
+    def measure(num_tokens: int, num_heads: int, topk: int, cpb: int) -> float:
+        call = build_call(num_tokens, num_heads, topk, model_type, cpb)
         # Fresh full-pool uniform indices per rep: one fixed index set goes
         # L2-resident after warmup and understates the HBM-bound steady state
         # (the crossover calibration's protocol).
@@ -643,7 +666,6 @@ def calibrate_crossover(
         _MODEL_TYPE_GLM_NSA,
         _MODEL_TYPE_GLM53_NOPE,
         _MODEL_TYPE_DOTS3_SWA,
-        _decode_scratch_heads,
         prefill_variant,
     )
 
@@ -686,81 +708,13 @@ def calibrate_crossover(
     bi = _CHUNK_WIDTH[family]
     sm_scale = d_qk**-0.5
     kv_cache, num_slots = _allocate_kv_pool(family, device)
+    build_call = _make_decode_call_builder(module, family, device, kv_cache)
 
     def time_decode(
         num_tokens: int, num_heads: int, topk: int, model_type: int
     ) -> float:
-        num_splits = _ceil_div(topk, bi)
         cpb = select_cpb(num_tokens, num_heads, topk, 0, c, chunk_width=bi)
-        q = (
-            (
-                torch.randn(
-                    num_tokens, num_heads, d_qk, device=device, dtype=torch.float32
-                )
-                / 10.0
-            )
-            .clamp(-1, 1)
-            .to(torch.bfloat16)
-        )
-        mid_out = torch.empty(
-            num_tokens,
-            _decode_scratch_heads(num_heads),
-            num_splits,
-            d_v,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        mid_lse = torch.empty(
-            num_tokens,
-            _decode_scratch_heads(num_heads),
-            num_splits,
-            dtype=torch.float32,
-            device=device,
-        )
-        output = torch.empty(
-            num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
-        )
-        out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
-        if family in ("dsv4", "dots3_swa"):
-
-            def call(indices: torch.Tensor) -> None:
-                module.sparse_mla_sm120_decode_dsv4(
-                    q,
-                    kv_cache,
-                    indices,
-                    mid_out,
-                    mid_lse,
-                    output,
-                    out_lse,
-                    num_splits,
-                    sm_scale,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    cpb,
-                )
-
-        else:
-
-            def call(indices: torch.Tensor) -> None:
-                module.sparse_mla_sm120_decode_dsv3_2(
-                    q,
-                    kv_cache,
-                    indices,
-                    mid_out,
-                    mid_lse,
-                    output,
-                    out_lse,
-                    num_splits,
-                    sm_scale,
-                    None,
-                    None,
-                    model_type,
-                    cpb,
-                )
-
+        call = build_call(num_tokens, num_heads, topk, model_type, cpb)
         return _time_call_fresh_indices(call, num_tokens, topk, num_slots, device)
 
     def time_prefill(
@@ -887,17 +841,12 @@ def _maybe_load_disk() -> None:
         payload = json.loads(path.read_text())
         if (
             not isinstance(payload, dict)
-            or payload.get("schema_version") not in _LOADABLE_SCHEMA_VERSIONS
+            or payload.get("schema_version") != _SCHEMA_VERSION
         ):
             return
         devices = payload["devices"]
         if not isinstance(devices, dict):
             return
-        # Constants load only from current-schema files: v1/v2 constants
-        # encode the retired ceil-wave + beta form and would mispredict
-        # under the scheduling-makespan model. Their crossover table
-        # (semantics unchanged) still loads.
-        load_constants = payload["schema_version"] == _CONSTANTS_SCHEMA_VERSION
         # Parse fully into locals first: a mid-document failure must not
         # publish a prefix of the entries while leaving mtime/version stale.
         new_constants: dict = {}
@@ -912,8 +861,7 @@ def _maybe_load_disk() -> None:
                             str(k): int(v) for k, v in raw.items()
                         }
                     continue
-                if load_constants:
-                    new_constants[(dev_key, family)] = CpbConstants(**raw)
+                new_constants[(dev_key, family)] = CpbConstants(**raw)
     except (OSError, ValueError, TypeError, KeyError):
         # Keep mtime unchanged so the next cold call retries.
         return
@@ -934,33 +882,18 @@ def get_constants(device: torch.device, family: str) -> Optional[CpbConstants]:
 
 
 def _read_payload_for_merge(path: pathlib.Path) -> dict:
-    """Existing cache content to merge into, upgraded to the current schema.
-
-    Current-schema files merge wholesale. Older loadable files carry stale
-    per-family constants (retired ceil-wave + beta semantics), so the upgrade
-    keeps only their crossover tables; the families recalibrate on the next
-    tuning-mode pass.
-    """
-    payload: dict = {"schema_version": _SCHEMA_VERSION, "devices": {}}
+    """Existing cache content to merge into. Only current-schema files merge;
+    anything else starts fresh (stale entries recalibrate on the next
+    tuning-mode pass)."""
     try:
         existing = json.loads(path.read_text())
     except (OSError, ValueError):
-        return payload
-    if not isinstance(existing, dict) or existing.get("schema_version") not in (
-        _LOADABLE_SCHEMA_VERSIONS
+        existing = None
+    if isinstance(existing, dict) and existing.get("schema_version") == (
+        _SCHEMA_VERSION
     ):
-        return payload
-    if existing["schema_version"] == _SCHEMA_VERSION:
         return existing
-    devices = existing.get("devices")
-    if isinstance(devices, dict):
-        for dev_key, families in devices.items():
-            if not isinstance(families, dict):
-                continue
-            xo = families.get(_DECODE_MAX_TOKENS_KEY)
-            if isinstance(xo, dict):
-                payload["devices"][dev_key] = {_DECODE_MAX_TOKENS_KEY: xo}
-    return payload
+    return {"schema_version": _SCHEMA_VERSION, "devices": {}}
 
 
 def save_constants(device: torch.device, family: str, c: CpbConstants) -> None:
@@ -1089,8 +1022,10 @@ def _family_specs() -> dict[str, tuple[tuple[int, ...], tuple[int, ...], int]]:
         _CALIBRATION_HEADS,
         _DECODE_DSV3_2_TOPKS,
         _DECODE_DSV4_TOPKS,
-        _DECODE_DOTS3_SWA_TOPK,
+        _DECODE_GLM53_NOPE_CALIBRATION_GRID,
+        _DECODE_DOTS3_SWA_CALIBRATION_GRID,
         _DECODE_GLM53_NOPE_TOPK,
+        _DECODE_DOTS3_SWA_TOPK,
     )
 
     v32_topks = tuple(sorted(_DECODE_DSV3_2_TOPKS))
@@ -1098,8 +1033,16 @@ def _family_specs() -> dict[str, tuple[tuple[int, ...], tuple[int, ...], int]]:
         "dsv4": (_CALIBRATION_HEADS, tuple(sorted(_DECODE_DSV4_TOPKS)), 1),
         "dsv3_2": (_CALIBRATION_HEADS, v32_topks, 1),
         "glm_nsa": (_CALIBRATION_HEADS, v32_topks, 1),
-        "glm53_nope": ((32, 64), (_DECODE_GLM53_NOPE_TOPK,), 1),
-        "dots3_swa": ((8, 16, 32, 64), (_DECODE_DOTS3_SWA_TOPK,), 513),
+        "glm53_nope": (
+            tuple(sorted({h for h, _ in _DECODE_GLM53_NOPE_CALIBRATION_GRID})),
+            (_DECODE_GLM53_NOPE_TOPK,),
+            1,
+        ),
+        "dots3_swa": (
+            tuple(sorted({h for h, _ in _DECODE_DOTS3_SWA_CALIBRATION_GRID})),
+            (_DECODE_DOTS3_SWA_TOPK,),
+            513,
+        ),
     }
 
 

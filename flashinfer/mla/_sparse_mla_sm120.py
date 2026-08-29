@@ -50,10 +50,12 @@ for the DSv3.2 / GLM sparse top-k path. This module keeps only the SM120
 implementation hooks used by those dispatchers and focused kernel
 tests/benchmarks.
 
-Decode kernels are instantiated for a fixed set of ``(num_heads, topk)``
-pairs; ``flashinfer.mla.supported_sparse_mla_sm120_configs`` enumerates them
-so callers can validate a configuration at init time. Decode-eligible is not
-required: shapes outside the decode sets are served by prefill.
+Decode kernels serve, per family, any ``num_heads`` in [1, 128] and any
+``topk >= min_topk`` (513 for the sliding-window family, 1 elsewhere);
+``flashinfer.mla.supported_sparse_mla_sm120_configs`` describes each
+family's envelope so callers can validate a configuration at init time.
+Decode-eligible is not required: shapes outside the decode envelope are
+served by prefill.
 
 The decode launch parameter ``chunks_per_block`` is picked per call by the
 calibrated analytical model in :mod:`._sparse_mla_sm120_cpb` when constants
@@ -110,7 +112,6 @@ from ._sparse_mla_sm120_plan import (
     KernelVariant,
     _normalize_prefill_impl,
     _resolve_cpb,
-    decode_splitk_eligible,
     plan,
 )
 
@@ -465,40 +466,6 @@ def _packed_kv_page_block_size(
     raise ValueError(f"{name} must have ndim 2, 3, or 4, got {kv_cache.ndim}")
 
 
-def _decode_dsv3_2_dispatchable(
-    num_tokens: int, num_heads: int, topk: int, d_qk: int, page_block_size: int
-) -> bool:
-    """True iff decode-dsv3_2 supports this shape configuration."""
-    return d_qk == 576 and decode_splitk_eligible(
-        _MODEL_TYPE_DSV3_2, num_heads, topk, page_block_size, False, num_tokens
-    )
-
-
-def _decode_dsv4_dispatchable(
-    num_tokens: int,
-    num_heads: int,
-    topk: int,
-    d_qk: int,
-    page_block_size: int,
-) -> bool:
-    """True iff decode-dsv4 supports this shape configuration.
-
-    The split count only affects scratch size; the merge kernel stores per-split
-    LSE in dynamic shared memory.
-    """
-    if d_qk == 512:
-        return decode_splitk_eligible(
-            _MODEL_TYPE_DSV4, num_heads, topk, page_block_size, False, num_tokens
-        )
-    if d_qk == 1088:
-        # The sliding-window family shares this kernel at BI=32 / 4 math warps;
-        # see DecodeTileCfg<DOTS3_SWA> in decode_dsv4_kernel.cuh.
-        return decode_splitk_eligible(
-            _MODEL_TYPE_DOTS3_SWA, num_heads, topk, page_block_size, False, num_tokens
-        )
-    return False
-
-
 def _decode_scratch_views(
     mid_out: Optional[torch.Tensor],
     mid_lse: Optional[torch.Tensor],
@@ -730,11 +697,15 @@ def _sparse_mla_sm120_paged_attention(
     sm_scale : float
         Softmax scale (typically ``1 / sqrt(d_qk)``).
     d_v : int
-        Value head dim. ``512`` for both DSV3_2 and DSV4 today.
+        Value head dim. ``512`` for DSV3_2 / DSV4 / GLM variants, ``1024``
+        for DOTS3_SWA.
     kv_scale_format : str
-        Scale semantics for ``d_qk=576``. ``"auto"`` and ``"pow2_fp32"``
-        select DSv3.2 power-of-2 FP32 inline scales; ``"arbitrary_fp32"``
-        selects GLM-style arbitrary FP32 inline scales.
+        Scale semantics, disambiguating the families that share a query
+        width. ``"auto"`` and ``"pow2_fp32"`` select DSv3.2 power-of-2 FP32
+        inline scales at ``d_qk=576``; ``"arbitrary_fp32"`` selects
+        GLM-style arbitrary FP32 inline scales (GLM_NSA at ``d_qk=576``,
+        GLM53_NOPE at ``d_qk=512``); ``"auto"`` at ``d_qk=512`` selects
+        DSV4.
     topk_length : Optional[torch.Tensor]
         Effective top-k length per query token, shape ``[num_tokens]``, dtype
         int32. Required for sliding-window MLA near sequence start; ``None``
@@ -823,9 +794,12 @@ class _SparseMLAPagedAttentionRunner:
         for DOTS3_SWA. Must agree with the model type ``d_qk`` selects on each
         ``run``.
     kv_scale_format : str
-        Scale semantics for ``d_qk=576``. ``"auto"`` and ``"pow2_fp32"``
-        select DSv3.2 power-of-2 FP32 inline scales; ``"arbitrary_fp32"``
-        selects GLM-style arbitrary FP32 inline scales.
+        Scale semantics, disambiguating the families that share a query
+        width. ``"auto"`` and ``"pow2_fp32"`` select DSv3.2 power-of-2 FP32
+        inline scales at ``d_qk=576``; ``"arbitrary_fp32"`` selects
+        GLM-style arbitrary FP32 inline scales (GLM_NSA at ``d_qk=576``,
+        GLM53_NOPE at ``d_qk=512``); ``"auto"`` at ``d_qk=512`` selects
+        DSV4.
     device : Optional[torch.device]
         Allocation target. Defaults to the current CUDA device.
 
@@ -926,10 +900,9 @@ class _SparseMLAPagedAttentionRunner:
 
         topk = indices.shape[-1]
         extra_topk = extra_indices.shape[-1] if extra_indices is not None else 0
-        # The candidate-tile width is model-dependent (64 for the DeepSeek
-        # family, 32 for DOTS3_SWA); the split count must use the model's own.
-        bi = _decode_chunk_width(_resolve_model_type(d_qk, self._kv_scale_format))
-        num_splits = (topk + bi - 1) // bi + (extra_topk + bi - 1) // bi
+        num_splits = _decode_dsv4_num_splits(
+            topk, extra_topk, _resolve_model_type(d_qk, self._kv_scale_format)
+        )
         scratch_heads = _decode_scratch_heads(num_heads)
         mid_out = torch.empty(
             (num_tokens, scratch_heads, num_splits, self._d_v),
@@ -1181,10 +1154,10 @@ def sparse_mla_sm120_decode_dsv4(
     kv_cache : torch.Tensor
         Paged FP8 cache, shape ``[num_blocks, page_bytes]`` uint8.
     indices : torch.Tensor
-        ``[T, topk]`` int32. ``topk`` must be one of
-        {128, 192, 256, 512, 1024} for DSV4, or 576 for DOTS3_SWA (tiled
-        32-wide, so ``num_splits`` uses the 32-candidate chunk width); ``-1``
-        marks invalid slots. Row-strided views into a wider persistent buffer
+        ``[T, topk]`` int32. Any ``topk >= 1`` for DSV4 (any ``topk >= 513``
+        for DOTS3_SWA: the 513-token sliding-window floor; tiled 32-wide, so
+        ``num_splits`` uses the 32-candidate chunk width); ``-1`` marks
+        invalid slots. Row-strided views into a wider persistent buffer
         are accepted (the last dim must stay contiguous).
     mid_out : torch.Tensor
         Scratch, ``[T, num_heads, num_splits, d_v]`` bf16. ``num_splits =
