@@ -4895,19 +4895,23 @@ def trtllm_ragged_attention_deepseek(
         Attention backend to use. "trtllm-gen" (default) or "cute-dsl".
     q_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row query lengths. When provided
-        together with ``kv_seq_lens_cpu``, the Python wrapper can keep the
-        all-active ragged fast path asynchronous while still compacting empty
-        rows (either ``q_len == 0`` or ``kv_len == 0``). If omitted, the
-        wrapper derives lengths from the device indptrs and may synchronize
-        to preserve correctness for direct callers. Under CUDA graph capture,
-        this device-side detection would require an illegal ``.item()``
-        readback, so both mirrors must be provided; without them the wrapper
-        cannot tell whether any row has ``q_len == 0`` or ``kv_len == 0`` and
-        will refuse to launch. Currently only consulted by the ``trtllm-gen``
-        backend.
+        together with ``kv_seq_lens_cpu``, the Python wrapper can detect empty
+        rows (either ``q_len == 0`` or ``kv_len == 0``) without touching the
+        device, which keeps the call CUDA-graph-capturable. The ``trtllm-gen``
+        backend uses the mirrors to compact empty rows away before the kernel
+        launch; the ``cute-dsl`` backend uses them to neutralize the rows its
+        kernel skips (``q_len > 0, kv_len == 0`` rows are written as
+        ``out = 0`` / ``lse = -inf`` instead of being left uninitialized).
+        If omitted on the ``trtllm-gen`` backend, the wrapper derives lengths
+        from the device indptrs and may synchronize to preserve correctness
+        for direct callers; under CUDA graph capture this device-side
+        detection would require an illegal ``.item()`` readback, so both
+        mirrors must be provided or the wrapper refuses to launch. If omitted
+        on the ``cute-dsl`` backend, no empty-row handling is performed and
+        rows with ``q_len > 0, kv_len == 0`` yield undefined output.
     kv_seq_lens_cpu : Optional[torch.Tensor]
-        Optional trusted CPU mirror of the per-row KV lengths. Currently only
-        consulted by the ``trtllm-gen`` backend.
+        Optional trusted CPU mirror of the per-row KV lengths. See
+        ``q_seq_lens_cpu``.
 
     Returns
     -------
@@ -4974,6 +4978,62 @@ def trtllm_ragged_attention_deepseek(
             dtype=torch.float32,
         )
 
+    # --- CPU seq-len mirror validation (shared by all backends) ---
+    def _validate_cpu_seq_lens(
+        lengths: torch.Tensor,
+        name: str,
+        total_tokens: int,
+        max_len: int,
+    ) -> int:
+        if lengths.device.type != "cpu":
+            raise ValueError(f"{name} must be a CPU tensor")
+        if lengths.dtype not in (torch.int32, torch.int64):
+            raise ValueError(f"{name} must have dtype torch.int32 or torch.int64")
+        if lengths.shape != (batch_size,):
+            raise ValueError(f"{name} must have shape ({batch_size},)")
+        if bool((lengths < 0).any().item()):
+            raise ValueError(f"{name} must contain non-negative lengths")
+
+        actual_total = int(lengths.sum().item())
+        if actual_total != total_tokens:
+            raise ValueError(
+                f"{name} sums to {actual_total}, but expected {total_tokens} "
+                "tokens from the corresponding ragged tensor"
+            )
+        if batch_size > 0 and int(lengths.max().item()) > max_len:
+            raise ValueError(f"{name} contains a length larger than max_len")
+        return actual_total
+
+    q_lens_cpu = None
+    kv_lens_cpu = None
+    active_rows_cpu = None
+    if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
+        if q_seq_lens_cpu is None or kv_seq_lens_cpu is None:
+            raise ValueError(
+                "q_seq_lens_cpu and kv_seq_lens_cpu must be provided together"
+            )
+
+        _validate_cpu_seq_lens(
+            q_seq_lens_cpu,
+            "q_seq_lens_cpu",
+            query.shape[0],
+            max_q_len,
+        )
+        kv_total = _validate_cpu_seq_lens(
+            kv_seq_lens_cpu,
+            "kv_seq_lens_cpu",
+            key.shape[0],
+            max_kv_len,
+        )
+        if kv_total != value.shape[0]:
+            raise ValueError(
+                "kv_seq_lens_cpu must sum to both key and value token counts"
+            )
+
+        q_lens_cpu = q_seq_lens_cpu
+        kv_lens_cpu = kv_seq_lens_cpu
+        active_rows_cpu = (q_lens_cpu > 0) & (kv_lens_cpu > 0)
+
     if backend == "cute-dsl":
         from .attention.cute_dsl.fmha import cute_dsl_fmha_ragged_prefill
 
@@ -4994,30 +5054,57 @@ def trtllm_ragged_attention_deepseek(
         _bmm1 = bmm1_scale
         _bmm2 = bmm2_scale
 
+        # The DSL varlen kernel skips batches whose kv_len == 0 without
+        # writing their output rows, and ``out`` defaults to torch.empty.
+        # When CPU mirrors are provided, neutralize those rows here
+        # (out = 0, lse = -inf) to match the trtllm-gen empty-row
+        # semantics. The decisions below read only the CPU mirrors and the
+        # fill itself uses only device-resident tensors (``output_size``
+        # keeps repeat_interleave from syncing), so this path stays
+        # CUDA-graph-capturable.
+        should_launch = True
+        if active_rows_cpu is not None and not bool(active_rows_cpu.all().item()):
+            if not bool(active_rows_cpu.any().item()):
+                out.zero_()
+                if lse is not None:
+                    lse.fill_(-float("inf"))
+                should_launch = False
+            else:
+                q_lens_device = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
+                kv_lens_device = cum_seq_lens_kv[1:] - cum_seq_lens_kv[:-1]
+                row_active = (q_lens_device > 0) & (kv_lens_device > 0)
+                token_inactive = ~torch.repeat_interleave(
+                    row_active, q_lens_device, output_size=query.shape[0]
+                )
+                out.masked_fill_(token_inactive.view(-1, 1, 1), 0)
+                if lse is not None:
+                    lse.masked_fill_(token_inactive.view(-1, 1), -float("inf"))
+
         # bmm1_scale = scale_q * scale_k * sm_scale (already fused by caller)
         # bmm2_scale = scale_v
         # Pass the fused value as sm_scale with scale_q=scale_k=1.0
-        cute_dsl_fmha_ragged_prefill(
-            q=query,
-            k=key,
-            v=value,
-            o=out,
-            qo_indptr=cum_seq_lens_q,
-            kv_indptr=cum_seq_lens_kv,
-            is_causal=is_causal,
-            sm_scale=_bmm1,
-            window_left=window_left,
-            lse=lse if return_lse else None,
-            attention_sinks=attention_sinks,
-            scale_q=1.0,
-            scale_k=1.0,
-            scale_v=_bmm2,
-            scale_o=1.0,
-            max_qo_len=max_q_len,
-            max_kv_len=max_kv_len,
-            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
-            enable_pdl=enable_pdl,
-        )
+        if should_launch:
+            cute_dsl_fmha_ragged_prefill(
+                q=query,
+                k=key,
+                v=value,
+                o=out,
+                qo_indptr=cum_seq_lens_q,
+                kv_indptr=cum_seq_lens_kv,
+                is_causal=is_causal,
+                sm_scale=_bmm1,
+                window_left=window_left,
+                lse=lse if return_lse else None,
+                attention_sinks=attention_sinks,
+                scale_q=1.0,
+                scale_k=1.0,
+                scale_v=_bmm2,
+                scale_o=1.0,
+                max_qo_len=max_q_len,
+                max_kv_len=max_kv_len,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                enable_pdl=enable_pdl,
+            )
     else:
         # --- trtllm-gen backend ---
         run_func = get_trtllm_gen_fmha_module().trtllm_ragged_attention
@@ -5028,31 +5115,6 @@ def trtllm_ragged_attention_deepseek(
             bmm1_scale = bmm1_scale * log2e
         if isinstance(bmm2_scale, torch.Tensor):
             assert bmm2_scale.dtype == torch.float32
-
-        def _validate_cpu_seq_lens(
-            lengths: torch.Tensor,
-            name: str,
-            total_tokens: int,
-            max_len: int,
-        ) -> int:
-            if lengths.device.type != "cpu":
-                raise ValueError(f"{name} must be a CPU tensor")
-            if lengths.dtype not in (torch.int32, torch.int64):
-                raise ValueError(f"{name} must have dtype torch.int32 or torch.int64")
-            if lengths.shape != (batch_size,):
-                raise ValueError(f"{name} must have shape ({batch_size},)")
-            if bool((lengths < 0).any().item()):
-                raise ValueError(f"{name} must contain non-negative lengths")
-
-            actual_total = int(lengths.sum().item())
-            if actual_total != total_tokens:
-                raise ValueError(
-                    f"{name} sums to {actual_total}, but expected {total_tokens} "
-                    "tokens from the corresponding ragged tensor"
-                )
-            if batch_size > 0 and int(lengths.max().item()) > max_len:
-                raise ValueError(f"{name} contains a length larger than max_len")
-            return actual_total
 
         run_out = out
         run_lse = lse
@@ -5070,38 +5132,11 @@ def trtllm_ragged_attention_deepseek(
 
         q_lens = None
         kv_lens = None
-        q_lens_cpu = None
-        kv_lens_cpu = None
         active_rows = None
         has_inactive_rows = False
         has_active_rows = True
 
-        if q_seq_lens_cpu is not None or kv_seq_lens_cpu is not None:
-            if q_seq_lens_cpu is None or kv_seq_lens_cpu is None:
-                raise ValueError(
-                    "q_seq_lens_cpu and kv_seq_lens_cpu must be provided together"
-                )
-
-            _validate_cpu_seq_lens(
-                q_seq_lens_cpu,
-                "q_seq_lens_cpu",
-                query.shape[0],
-                max_q_len,
-            )
-            kv_total = _validate_cpu_seq_lens(
-                kv_seq_lens_cpu,
-                "kv_seq_lens_cpu",
-                key.shape[0],
-                max_kv_len,
-            )
-            if kv_total != value.shape[0]:
-                raise ValueError(
-                    "kv_seq_lens_cpu must sum to both key and value token counts"
-                )
-
-            q_lens_cpu = q_seq_lens_cpu
-            kv_lens_cpu = kv_seq_lens_cpu
-            active_rows_cpu = (q_lens_cpu > 0) & (kv_lens_cpu > 0)
+        if active_rows_cpu is not None:
             if not bool(active_rows_cpu.all().item()):
                 has_inactive_rows = True
                 has_active_rows = bool(active_rows_cpu.any().item())
@@ -5158,8 +5193,8 @@ def trtllm_ragged_attention_deepseek(
             else:
                 if q_lens_cpu is not None:
                     assert kv_lens_cpu is not None
+                    assert active_rows_cpu is not None
 
-                    active_rows_cpu = (q_lens_cpu > 0) & (kv_lens_cpu > 0)
                     q_active_mask_cpu = torch.repeat_interleave(
                         active_rows_cpu, q_lens_cpu
                     )
