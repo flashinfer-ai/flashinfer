@@ -44,6 +44,19 @@ def _get_csrc_dir() -> Path:
     )
 
 
+def _get_include_dir() -> Path:
+    if jit_env.FLASHINFER_INCLUDE_DIR.exists():
+        return jit_env.FLASHINFER_INCLUDE_DIR
+    checkout = Path(__file__).resolve().parents[2] / "include"
+    if checkout.exists():
+        return checkout
+    raise FileNotFoundError(
+        "FlashInfer headers were not found. Checked:\n"
+        f"  - {jit_env.FLASHINFER_INCLUDE_DIR}\n"
+        f"  - {checkout}"
+    )
+
+
 def cake_grouped_mxfp8_target(device: torch.device) -> CakeGroupedMXFP8Target:
     major, minor = torch.cuda.get_device_capability(device)
     if (major, minor) == (10, 0):
@@ -136,7 +149,7 @@ def gen_cake_grouped_mxfp8_quantize_module(
             *_TARGET_FLAGS[target],
             f"-DFLASHINFER_CAKE_GROUPED_MXFP8_TARGET_MINOR={_TARGET_MINOR[target]}",
         ],
-        extra_include_paths=[csrc_dir, csrc_dir.parent],
+        extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
     )
     logger.info(
         "Generated Cake grouped MXFP8 %s %s JIT spec: %s",
