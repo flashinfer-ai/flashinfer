@@ -377,10 +377,68 @@ def get_mxfp8_grouped_quantization_module():
     )
 
 
+@functools.cache
+def get_cake_mxfp8_grouped_quantization_module():
+    """Register the generated Cake grouped MXFP8 op and fake metadata twin."""
+
+    @register_custom_op(
+        "flashinfer::cake_mxfp8_grouped_quantize",
+        mutates_args=(),
+    )
+    def cake_mxfp8_grouped_quantize_impl(
+        a: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from ..jit.cake_grouped_mxfp8_quantize import (
+            get_cake_grouped_mxfp8_quantize_module,
+        )
+
+        b, m, k = a.shape
+        padded_k = _round_up(k, 128)
+        padded_m = _round_up(m, 128)
+        scale_k = padded_k // 32
+        input_tensor = a.contiguous()
+        mask_tensor = mask.contiguous()
+        output = torch.empty(
+            (b, m, padded_k),
+            dtype=torch.float8_e4m3fn,
+            device=a.device,
+        )
+        output_scales = torch.empty(
+            (b, padded_m, scale_k),
+            dtype=torch.uint8,
+            device=a.device,
+        )
+
+        module = get_cake_grouped_mxfp8_quantize_module(a.dtype, a.device)
+        stream = int(torch.cuda.current_stream(a.device).cuda_stream)
+        module.run(input_tensor, mask_tensor, output, output_scales, stream)
+
+        output = output.permute(1, 2, 0)
+        output_scales = output_scales.view(b, padded_m // 128, scale_k // 4, 32, 4, 4)
+        output_scales = output_scales.permute(3, 4, 1, 5, 2, 0)
+        return output, output_scales
+
+    @register_fake_op("flashinfer::cake_mxfp8_grouped_quantize")
+    def _fake_cake_mxfp8_grouped_quantize(
+        a: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return get_mxfp8_grouped_quantization_module()._fake_mxfp8_grouped_quantize(
+            a, mask
+        )
+
+    return SimpleNamespace(
+        cake_mxfp8_grouped_quantize_impl=cake_mxfp8_grouped_quantize_impl,
+        _fake_cake_mxfp8_grouped_quantize=_fake_cake_mxfp8_grouped_quantize,
+    )
+
+
 @flashinfer_api(trace=mxfp8_grouped_quantize_trace)
 def mxfp8_grouped_quantize(
     a: torch.Tensor,
     mask: torch.Tensor,
+    backend: Literal["cutile", "cake"] = "cutile",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize grouped inputs to MXFP8 with UE8M0 block scales.
 
@@ -398,6 +456,12 @@ def mxfp8_grouped_quantize(
         CUDA-graph capture. Out-of-range values are undefined behavior. The
         kernel writes scale factors with bounds checking disabled, so
         ``mask[i] > M`` corrupts neighboring groups or writes out of bounds.
+    backend : {``"cutile"``, ``"cake"``}
+        Implementation backend. ``"cutile"`` remains the default and fallback
+        path. ``"cake"`` explicitly selects a generated, exact-architecture
+        Blackwell profile and raises a clear error when that profile is not
+        installed; runtime launch failures are never silently retried through a
+        different implementation.
 
     Returns
     -------
@@ -414,6 +478,10 @@ def mxfp8_grouped_quantize(
         The consumer must use the same ``mask`` and read only the valid rows.
     """
 
+    if backend not in ("cutile", "cake"):
+        raise ValueError(
+            f"Unsupported backend for mxfp8_grouped_quantize: {backend!r}"
+        )
     if a.dim() != 3:
         raise ValueError("a must be a 3D tensor with shape [B, M, K]")
     if not a.is_cuda:
@@ -433,17 +501,37 @@ def mxfp8_grouped_quantize(
     if major < 10:
         raise RuntimeError("mxfp8_grouped_quantize requires SM100 or newer")
 
-    if not is_cuda_tile_available():
-        raise RuntimeError(
-            "mxfp8_grouped_quantize requires the cuTile backend; install "
-            "cuda-tile>=1.4.0 and ensure the tileiras compiler is available."
+    if backend == "cutile":
+        if not is_cuda_tile_available():
+            raise RuntimeError(
+                "mxfp8_grouped_quantize requires the cuTile backend; install "
+                "cuda-tile>=1.4.0 and ensure the tileiras compiler is available."
+            )
+        _, _, k = a.shape
+        if k % 32 != 0:
+            raise ValueError(f"K must be divisible by 32, got {k}")
+        return get_mxfp8_grouped_quantization_module().mxfp8_grouped_quantize_impl(
+            a, mask
         )
+
+    from ..jit.cake_grouped_mxfp8_quantize import (
+        cake_grouped_mxfp8_target,
+        is_cake_grouped_mxfp8_quantize_available,
+    )
 
     _, _, k = a.shape
     if k % 32 != 0:
         raise ValueError(f"K must be divisible by 32, got {k}")
-
-    return get_mxfp8_grouped_quantization_module().mxfp8_grouped_quantize_impl(a, mask)
+    target = cake_grouped_mxfp8_target(a.device)
+    if not is_cake_grouped_mxfp8_quantize_available(a.dtype, a.device):
+        raise RuntimeError(
+            "backend='cake' requires an installed generated grouped MXFP8 "
+            f"profile for dtype={a.dtype} and target={target}; use the default "
+            "backend='cutile' until that profile is installed"
+        )
+    return get_cake_mxfp8_grouped_quantization_module().cake_mxfp8_grouped_quantize_impl(
+        a, mask
+    )
 
 
 @flashinfer_api
