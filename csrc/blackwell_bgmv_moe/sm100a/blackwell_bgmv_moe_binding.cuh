@@ -198,9 +198,9 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   auto* x_ptr = static_cast<unsigned short*>(x.data_ptr());
   auto* a_ptr = static_cast<unsigned short*>(lora_a.data_ptr());
   auto* b_ptr = static_cast<unsigned short*>(lora_b.data_ptr());
-  auto* token_ptr = static_cast<int64_t*>(sorted_token_ids.data_ptr());
-  auto* expert_ptr = static_cast<int64_t*>(expert_ids.data_ptr());
-  auto* lora_ptr = static_cast<int64_t*>(lora_indices.data_ptr());
+  auto* token_ptr = static_cast<long long*>(sorted_token_ids.data_ptr());
+  auto* expert_ptr = static_cast<long long*>(expert_ids.data_ptr());
+  auto* lora_ptr = static_cast<long long*>(lora_indices.data_ptr());
   auto* weight_ptr = static_cast<float*>(topk_weights.data_ptr());
 
   if (schedule == Schedule::kPairOwnedT128) {
