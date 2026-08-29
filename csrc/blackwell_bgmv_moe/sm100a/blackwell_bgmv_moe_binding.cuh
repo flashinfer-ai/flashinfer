@@ -35,15 +35,13 @@
 #error "BLACKWELL_BGMV_MOE_EXPAND_PAIR must name the generated kernel symbol"
 #endif
 #ifndef BLACKWELL_BGMV_MOE_EXPAND_TOKEN_T64
-#error                                                                         \
-    "BLACKWELL_BGMV_MOE_EXPAND_TOKEN_T64 must name the generated kernel symbol"
+#error "BLACKWELL_BGMV_MOE_EXPAND_TOKEN_T64 must name the generated kernel symbol"
 #endif
 #ifndef BLACKWELL_BGMV_MOE_EXPAND_TOKEN
 #error "BLACKWELL_BGMV_MOE_EXPAND_TOKEN must name the generated kernel symbol"
 #endif
 #ifndef BLACKWELL_BGMV_MOE_EXPAND_TOKEN_DUAL
-#error                                                                         \
-    "BLACKWELL_BGMV_MOE_EXPAND_TOKEN_DUAL must name the generated kernel symbol"
+#error "BLACKWELL_BGMV_MOE_EXPAND_TOKEN_DUAL must name the generated kernel symbol"
 #endif
 
 #include <cuda.h>
@@ -94,37 +92,32 @@ enum class Schedule : int32_t {
   kTokenOwnedDualCol = 3,
 };
 
-inline void CheckCuda(cudaError_t status, const char *operation) {
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << operation << " failed: " << cudaGetErrorString(status);
+inline void CheckCuda(cudaError_t status, const char* operation) {
+  TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
 }
 
 inline void CheckExactSM100(int32_t device_id) {
   int major = 0;
   int minor = 0;
-  CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor,
-                                   device_id),
+  CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
             "cudaDeviceGetAttribute(major)");
-  CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor,
-                                   device_id),
+  CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
   TVM_FFI_ICHECK(major == 10 && minor == 0)
-      << "Blackwell BGMV MoE requires exact compute capability 10.0, got "
-      << major << "." << minor;
+      << "Blackwell BGMV MoE requires exact compute capability 10.0, got " << major << "." << minor;
 }
 
-inline void CheckCompact(const TensorView &tensor, const char *name) {
+inline void CheckCompact(const TensorView& tensor, const char* name) {
   CHECK_CONTIGUOUS(tensor);
   TVM_FFI_ICHECK(tensor.numel() <= std::numeric_limits<int32_t>::max())
       << name << " exceeds the generated kernel's int32 index range";
 }
 
-void Run(TensorView y_accum, TensorView shrink_out, TensorView x,
-         TensorView lora_a, TensorView lora_b, TensorView sorted_token_ids,
-         TensorView expert_ids, TensorView lora_indices,
-         TensorView topk_weights, int64_t schedule_value, int64_t cuda_stream) {
-  TVM_FFI_ICHECK(cuda_stream >= 0)
-      << "cuda_stream must be a non-negative stream handle";
+void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lora_a,
+         TensorView lora_b, TensorView sorted_token_ids, TensorView expert_ids,
+         TensorView lora_indices, TensorView topk_weights, int64_t schedule_value,
+         int64_t cuda_stream) {
+  TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   CHECK_CUDA(x);
   const int32_t device_id = x.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
@@ -172,20 +165,16 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x,
   TVM_FFI_ICHECK(shrink_out.ndim() == 3 && shrink_out.size(0) == 1 &&
                  shrink_out.size(1) == num_pairs && shrink_out.size(2) == kRank)
       << "shrink_out must have shape [1, num_pairs, 32]";
-  TVM_FFI_ICHECK(y_accum.ndim() == 2 && y_accum.size(0) == num_tokens &&
-                 y_accum.size(1) == kHidden)
+  TVM_FFI_ICHECK(y_accum.ndim() == 2 && y_accum.size(0) == num_tokens && y_accum.size(1) == kHidden)
       << "y_accum must have shape [num_tokens, " << kHidden << "]";
-  TVM_FFI_ICHECK(lora_a.ndim() == 4 && lora_a.size(0) > 0 &&
-                 lora_a.size(1) > 0 && lora_a.size(2) == kRank &&
-                 lora_a.size(3) == kHidden)
-      << "lora_a must have shape [num_loras, num_experts, 32, " << kHidden
-      << "]";
+  TVM_FFI_ICHECK(lora_a.ndim() == 4 && lora_a.size(0) > 0 && lora_a.size(1) > 0 &&
+                 lora_a.size(2) == kRank && lora_a.size(3) == kHidden)
+      << "lora_a must have shape [num_loras, num_experts, 32, " << kHidden << "]";
   const int32_t num_experts = static_cast<int32_t>(lora_a.size(1));
   TVM_FFI_ICHECK(lora_b.ndim() == 4 && lora_b.size(0) == lora_a.size(0) &&
                  lora_b.size(1) == num_experts && lora_b.size(2) == kHidden &&
                  lora_b.size(3) == kRank)
-      << "lora_b must have shape [num_loras, num_experts, " << kHidden
-      << ", 32]";
+      << "lora_b must have shape [num_loras, num_experts, " << kHidden << ", 32]";
 
   CheckCompact(x, "x");
   CheckCompact(y_accum, "y_accum");
@@ -197,43 +186,38 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x,
   CheckCompact(lora_indices, "lora_indices");
   CheckCompact(topk_weights, "topk_weights");
 
-  TVM_FFI_ICHECK(
-      schedule_value >= static_cast<int64_t>(Schedule::kPairOwnedT128) &&
-      schedule_value <= static_cast<int64_t>(Schedule::kTokenOwnedDualCol))
+  TVM_FFI_ICHECK(schedule_value >= static_cast<int64_t>(Schedule::kPairOwnedT128) &&
+                 schedule_value <= static_cast<int64_t>(Schedule::kTokenOwnedDualCol))
       << "invalid Blackwell BGMV MoE schedule id: " << schedule_value;
   const auto schedule = static_cast<Schedule>(schedule_value);
   const auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-  auto *y_ptr = static_cast<float *>(y_accum.data_ptr());
-  auto *shrink_ptr = static_cast<unsigned short *>(shrink_out.data_ptr());
-  auto *x_ptr = static_cast<unsigned short *>(x.data_ptr());
-  auto *a_ptr = static_cast<unsigned short *>(lora_a.data_ptr());
-  auto *b_ptr = static_cast<unsigned short *>(lora_b.data_ptr());
-  auto *token_ptr = static_cast<long long *>(sorted_token_ids.data_ptr());
-  auto *expert_ptr = static_cast<long long *>(expert_ids.data_ptr());
-  auto *lora_ptr = static_cast<long long *>(lora_indices.data_ptr());
-  auto *weight_ptr = static_cast<float *>(topk_weights.data_ptr());
+  auto* y_ptr = static_cast<float*>(y_accum.data_ptr());
+  auto* shrink_ptr = static_cast<unsigned short*>(shrink_out.data_ptr());
+  auto* x_ptr = static_cast<unsigned short*>(x.data_ptr());
+  auto* a_ptr = static_cast<unsigned short*>(lora_a.data_ptr());
+  auto* b_ptr = static_cast<unsigned short*>(lora_b.data_ptr());
+  auto* token_ptr = static_cast<long long*>(sorted_token_ids.data_ptr());
+  auto* expert_ptr = static_cast<long long*>(expert_ids.data_ptr());
+  auto* lora_ptr = static_cast<long long*>(lora_indices.data_ptr());
+  auto* weight_ptr = static_cast<float*>(topk_weights.data_ptr());
 
   if (schedule == Schedule::kPairOwnedT128) {
-    CheckCuda(
-        cudaMemsetAsync(y_ptr, 0, y_accum.numel() * sizeof(float), stream),
-        "Blackwell BGMV MoE output initialization");
+    CheckCuda(cudaMemsetAsync(y_ptr, 0, y_accum.numel() * sizeof(float), stream),
+              "Blackwell BGMV MoE output initialization");
   }
 
   const dim3 shrink_block(kShrinkThreads, 1, 1);
   if (num_pairs <= 32) {
-    const dim3 shrink_grid((num_pairs + kShrinkDecodePairsPerBlock - 1) /
-                               kShrinkDecodePairsPerBlock,
-                           kRank / 8, 1);
-    BLACKWELL_BGMV_MOE_SHRINK_DECODE<<<shrink_grid, shrink_block,
-                                       kShrinkDecodeSmemBytes, stream>>>(
-        shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs,
-        num_experts, num_tokens);
+    const dim3 shrink_grid(
+        (num_pairs + kShrinkDecodePairsPerBlock - 1) / kShrinkDecodePairsPerBlock, kRank / 8, 1);
+    BLACKWELL_BGMV_MOE_SHRINK_DECODE<<<shrink_grid, shrink_block, kShrinkDecodeSmemBytes, stream>>>(
+        shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
+        num_tokens);
   } else {
     const dim3 shrink_grid(num_pairs, kRank / 8, 1);
-    BLACKWELL_BGMV_MOE_SHRINK_PREFILL<<<shrink_grid, shrink_block,
-                                        kShrinkPrefillSmemBytes, stream>>>(
-        shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs,
-        num_experts, num_tokens);
+    BLACKWELL_BGMV_MOE_SHRINK_PREFILL<<<shrink_grid, shrink_block, kShrinkPrefillSmemBytes,
+                                        stream>>>(shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr,
+                                                  lora_ptr, num_pairs, num_experts, num_tokens);
   }
   CheckCuda(cudaGetLastError(), "Blackwell BGMV MoE shrink launch");
 
@@ -242,29 +226,28 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x,
   if (schedule == Schedule::kPairOwnedT128) {
     const dim3 grid(num_pairs, (kHidden + 127) / 128, 1);
     BLACKWELL_BGMV_MOE_EXPAND_PAIR<<<grid, 128, 0, stream>>>(
-        y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr,
-        num_pairs, num_experts, num_tokens, output_stride, output_offset);
+        y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
+        num_experts, num_tokens, output_stride, output_offset);
   } else if (schedule == Schedule::kTokenOwnedT64) {
     const dim3 grid(num_tokens, (kHidden + 63) / 64, 1);
     BLACKWELL_BGMV_MOE_EXPAND_TOKEN_T64<<<grid, 64, kExpandSmemBytes, stream>>>(
-        y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr,
-        num_pairs, num_experts, num_tokens, output_stride, output_offset);
+        y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
+        num_experts, num_tokens, output_stride, output_offset);
   } else if (schedule == Schedule::kTokenOwned) {
     const dim3 grid(num_tokens, (kHidden + 127) / 128, 1);
     BLACKWELL_BGMV_MOE_EXPAND_TOKEN<<<grid, 128, kExpandSmemBytes, stream>>>(
-        y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr,
-        num_pairs, num_experts, num_tokens, output_stride, output_offset);
+        y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
+        num_experts, num_tokens, output_stride, output_offset);
   } else {
     const dim3 grid(num_tokens, (kHidden + 255) / 256, 1);
-    BLACKWELL_BGMV_MOE_EXPAND_TOKEN_DUAL<<<grid, 128, kExpandSmemBytes,
-                                           stream>>>(
-        y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr,
-        num_pairs, num_experts, num_tokens, output_stride, output_offset);
+    BLACKWELL_BGMV_MOE_EXPAND_TOKEN_DUAL<<<grid, 128, kExpandSmemBytes, stream>>>(
+        y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
+        num_experts, num_tokens, output_stride, output_offset);
   }
   CheckCuda(cudaGetLastError(), "Blackwell BGMV MoE expand launch");
 }
 
-} // namespace blackwell_bgmv_moe
-} // namespace flashinfer
+}  // namespace blackwell_bgmv_moe
+}  // namespace flashinfer
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::blackwell_bgmv_moe::Run);
