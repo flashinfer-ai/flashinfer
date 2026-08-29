@@ -4172,6 +4172,7 @@ def test_frozen_unbounded_softplus_h32_prefix_resume_matches_uninterrupted(
     torch.testing.assert_close(resumed_output, full_output, atol=0, rtol=0)
     torch.testing.assert_close(returned_suffix_state, full_state, atol=0, rtol=0)
 
+
 @pytest.mark.parametrize("num_sequences", [171, 256])
 def test_cute_dsl_packed_tensor_map_stride_above_int32_matches_cake(
     flash_kda_device,

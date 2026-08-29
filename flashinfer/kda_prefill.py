@@ -2402,6 +2402,8 @@ def _run_flash_kda_prefill(
         "persistent_m128",
         "piece_persistent_m128",
         "small_bh_m128",
+        "m128_unbounded_softplus",
+        "m128_bt64_unbounded_softplus",
     ]
     if use_bt16:
         variant = "bt16"
@@ -2433,16 +2435,12 @@ def _run_flash_kda_prefill(
     else:
         variant = "m128"
     if lower_bound is None:
-        variant = _select_flash_kda_prefill_variant(
-            fixed_layout=fixed_layout,
-            num_sequences=num_sequences,
-            num_heads=num_heads,
-            unbounded_softplus=True,
-            use_bt64_unbounded_softplus=(
-                num_heads == 4
-                and checkpoint_every_n_tokens > 0
-                and checkpoint_every_n_tokens % 64 == 0
-            ),
+        variant = (
+            "m128_bt64_unbounded_softplus"
+            if num_heads == 4
+            and checkpoint_every_n_tokens > 0
+            and checkpoint_every_n_tokens % 64 == 0
+            else "m128_unbounded_softplus"
         )
         persistent_plan = None
     if checkpoint_every_n_tokens and variant == "m128_n16":
@@ -2686,9 +2684,10 @@ def _run_flash_kda_prefill(
             if initial_state is None:
                 returned_state = final_state_arg
         if variant == "bt16":
+            assert flash_target is not None
             _run_bt16_prepare_chain(
                 workspace=workspace,
-                target=target,
+                target=flash_target,
                 q=q,
                 k=k,
                 v=v,
