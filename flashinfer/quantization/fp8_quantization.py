@@ -434,6 +434,33 @@ def get_cake_mxfp8_grouped_quantization_module():
     )
 
 
+def _mxfp8_grouped_quantize_cake(
+    a: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    backend: Literal["cake"],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dispatch an already validated request to an installed Cake profile."""
+
+    if backend != "cake":
+        raise ValueError(f"internal Cake dispatch received backend={backend!r}")
+    from ..jit.cake_grouped_mxfp8_quantize import (
+        cake_grouped_mxfp8_target,
+        is_cake_grouped_mxfp8_quantize_available,
+    )
+
+    target = cake_grouped_mxfp8_target(a.device)
+    if not is_cake_grouped_mxfp8_quantize_available(a.dtype, a.device):
+        raise RuntimeError(
+            "backend='cake' requires an installed generated grouped MXFP8 "
+            f"profile for dtype={a.dtype} and target={target}; use the default "
+            "backend='cutile' until that profile is installed"
+        )
+    return get_cake_mxfp8_grouped_quantization_module().cake_mxfp8_grouped_quantize_impl(
+        a, mask
+    )
+
+
 @flashinfer_api(trace=mxfp8_grouped_quantize_trace)
 def mxfp8_grouped_quantize(
     a: torch.Tensor,
@@ -514,24 +541,10 @@ def mxfp8_grouped_quantize(
             a, mask
         )
 
-    from ..jit.cake_grouped_mxfp8_quantize import (
-        cake_grouped_mxfp8_target,
-        is_cake_grouped_mxfp8_quantize_available,
-    )
-
     _, _, k = a.shape
     if k % 32 != 0:
         raise ValueError(f"K must be divisible by 32, got {k}")
-    target = cake_grouped_mxfp8_target(a.device)
-    if not is_cake_grouped_mxfp8_quantize_available(a.dtype, a.device):
-        raise RuntimeError(
-            "backend='cake' requires an installed generated grouped MXFP8 "
-            f"profile for dtype={a.dtype} and target={target}; use the default "
-            "backend='cutile' until that profile is installed"
-        )
-    return get_cake_mxfp8_grouped_quantization_module().cake_mxfp8_grouped_quantize_impl(
-        a, mask
-    )
+    return _mxfp8_grouped_quantize_cake(a, mask, backend="cake")
 
 
 @flashinfer_api
