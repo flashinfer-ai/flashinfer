@@ -35,7 +35,9 @@
 #define uint64_t cake_grouped_mxfp8_generated_uint64_t
 #define int16_t cake_grouped_mxfp8_generated_int16_t
 #define int32_t cake_grouped_mxfp8_generated_int32_t
+#define CUtensorMap cake_grouped_mxfp8_generated_CUtensorMap
 #include CAKE_GROUPED_MXFP8_BODY_FILE
+#undef CUtensorMap
 #undef uint8_t
 #undef uint16_t
 #undef uint32_t
