@@ -101,6 +101,7 @@ class MegaMoENvfp4Config:
     epi_flag_batch: Tuple[int, int] = (1, 1)
     non_ubulk_fc2_store: bool = True
     in_kernel_fc2_reduce: bool = False
+    defer_topk_reduce: bool = False
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
@@ -168,6 +169,15 @@ class MegaMoENvfp4Config:
                 "in_kernel_fc2_reduce requires apply_topk_in_fc1=True; the REDG "
                 "path can only atomic-add terms whose topk score was already "
                 "absorbed before fc2."
+            )
+        if self.defer_topk_reduce and (
+            self.in_kernel_fc2_reduce
+            or self.combine_dtype != "bf16"
+            or not self.apply_topk_in_fc1
+        ):
+            raise ValueError(
+                "defer_topk_reduce requires in_kernel_fc2_reduce=False, "
+                "combine_dtype='bf16', and apply_topk_in_fc1=True."
             )
         if self.group_hint is not None and self.group_hint <= 0:
             raise ValueError(
@@ -313,6 +323,11 @@ class MegaMoENvfp4Frontend:
         a validated-once fast path: validation and cute-tensor construction
         run only when the launch cache misses.
         """
+        if self.config.defer_topk_reduce:
+            raise RuntimeError(
+                "run() cannot return an unreduced output when "
+                "defer_topk_reduce=True; use the terminal adapter"
+            )
         resolved = self._resolve_num_tokens(inputs, num_tokens)
         if resolved == 0:
             return None
@@ -388,6 +403,29 @@ class MegaMoENvfp4Frontend:
 
         return thunk
 
+    def deferred_topk_reduce_workspace(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
+        """Return a zero-copy combine view and its canonical root descriptor."""
+        if not self.config.defer_topk_reduce:
+            raise RuntimeError("deferred TopK-reduce mode is not enabled")
+        mega = self._mega
+        if mega is None or mega.compiled is None:
+            raise RuntimeError(
+                "deferred TopK-reduce workspace is unavailable before compilation"
+            )
+        descriptor = mega.kernel.deferred_topk_reduce_region()
+        root = mega.shared_workspace
+        byte_offset = int(descriptor["byte_offset"])
+        nbytes = int(descriptor["nbytes"])
+        raw = root.narrow(0, byte_offset, nbytes)
+        partials = raw.view(torch.bfloat16).view(tuple(descriptor["shape"]))
+        if partials.data_ptr() != root.data_ptr() + byte_offset:
+            raise RuntimeError("borrowed combine view does not match its root offset")
+        if partials.data_ptr() % int(descriptor["alignment"]):
+            raise RuntimeError("borrowed combine view violates canonical alignment")
+        return partials, root, dict(descriptor)
+
     @staticmethod
     def _launch_cache_key(inputs: MegaMoENvfp4Inputs, num_tokens: int) -> tuple:
         # Keyed on the RAW (pre-slice) input pointers + the resolved token
@@ -437,6 +475,7 @@ class MegaMoENvfp4Frontend:
             c.epi_flag_batch,
             c.non_ubulk_fc2_store,
             c.in_kernel_fc2_reduce,
+            c.defer_topk_reduce,
             c.token_back_mode,
             c.combine_dtype,
             c.apply_topk_in_fc1,
@@ -497,6 +536,7 @@ class MegaMoENvfp4Frontend:
             fc2_output_dtype=cutlass.BFloat16,
             non_ubulk_fc2_store=c.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
+            defer_topk_reduce=c.defer_topk_reduce,
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
             gate_up_clamp=self._gate_up_clamp,
@@ -1007,6 +1047,7 @@ def get_symm_buffer_for_mega_moe(
     activation_clamp: Optional[float] = None,
     apply_topk_in_fc1: bool = True,
     in_kernel_fc2_reduce: bool = False,
+    defer_topk_reduce: bool = False,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
@@ -1097,6 +1138,7 @@ def get_symm_buffer_for_mega_moe(
         gate_up_clamp=clamp,
         apply_topk_in_fc1=apply_topk_in_fc1,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        defer_topk_reduce=defer_topk_reduce,
         combine_dtype=combine_dtype,
         # Constructed valid even before knobs land: quantized combine rejects
         # the default epi_warps token-back in __post_init__.

@@ -189,6 +189,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         combine_format: CombineFormat = CombineFormat.parse("bf16"),
         non_ubulk_fc2_store: bool = True,
         in_kernel_fc2_reduce: bool = False,
+        defer_topk_reduce: bool = False,
         token_back_mode: Literal[
             "epi_warps", "standalone_warps", "reuse_dispatch_warps"
         ] = "epi_warps",
@@ -214,6 +215,15 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 "in_kernel_fc2_reduce requires apply_topk_in_fc1=True; "
                 "the REDG path can only atomic-add terms whose topk score "
                 "was already absorbed before fc2."
+            )
+        if defer_topk_reduce and (
+            in_kernel_fc2_reduce
+            or combine_format.is_quantized
+            or not apply_topk_in_fc1
+        ):
+            raise ValueError(
+                "defer_topk_reduce requires in_kernel_fc2_reduce=False, "
+                "a bf16 combine format, and apply_topk_in_fc1=True."
             )
         if combine_format.act_dtype is cutlass.Float4E2M1FN and not non_ubulk_fc2_store:
             raise ValueError(
@@ -305,6 +315,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         self.max_tokens_per_rank = max_tokens_per_rank
         self.hidden = hidden
         self.flag_batch = flag_batch  # stored so name() can encode it
+        self.defer_topk_reduce = defer_topk_reduce
 
         # static_expert_shape = (num_experts_per_rank, intermediate_gateup, hidden).
         self.num_experts_per_rank = static_expert_shape[0]
@@ -794,6 +805,28 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         """
         return self._local_total, self._shared_total
 
+    def deferred_topk_reduce_region(self) -> Dict[str, Any]:
+        """Describe the canonical borrowed BF16 ``combine_quant`` region.
+
+        The host adapter must consume this descriptor instead of duplicating
+        workspace offset arithmetic.  It is deliberately unavailable unless
+        this exact kernel instance was compiled in deferred terminal mode.
+        """
+        if not self.defer_topk_reduce:
+            raise RuntimeError("deferred TopK-reduce mode is not enabled")
+        spec = self._shared_region_by_name["combine_quant"]
+        if spec.cute_dtype is not cutlass.BFloat16:
+            raise RuntimeError("deferred TopK-reduce staging must be BF16")
+        return {
+            "name": spec.name,
+            "byte_offset": self._shared_offsets[spec.name],
+            "nbytes": spec.nbytes,
+            "shape": spec.shape,
+            "stride": spec.stride_row_major,
+            "dtype": "bfloat16",
+            "alignment": spec.align,
+        }
+
     # =========================================================================
     # Workspace partition helpers
     # =========================================================================
@@ -921,6 +954,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         cta = "2_cta" if self.use_2cta_instrs else "1_cta"
         fc2store = "fc2store_stg" if self.non_ubulk_fc2_store else "fc2store_ublk"
         inkred = "inkernel_redg" if self.in_kernel_fc2_reduce else "no_inkernel_redg"
+        topk_reduce = "defer_topk_reduce" if self.defer_topk_reduce else "nested_topk_reduce"
         apply_topk = (
             "apply_topk_fc1_pre_quant"
             if self.apply_topk_in_fc1
@@ -936,7 +970,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             f"_mmatiler_{m}x{n}x{k}_cluster_{cm}x{cn}_{cta}_sched_{self.load_balance_mode}"
             f"_expert_shape_{exp}_grouphint_{self.group_hint}"
             f"_padding_{self.token_padding_block}x{self.sf_padding_block}"
-            f"_{fc2store}_{inkred}_token_back_by_{token_back}_{apply_topk}"
+            f"_{fc2store}_{inkred}_{topk_reduce}_token_back_by_{token_back}_{apply_topk}"
             f"_fc2out{self.fc2_output_dtype.__name__}_combine{self.combine_format}_sfvec{self.sf_vec_size}"
             f"_acc{self.acc_dtype.__name__}_clamp{self.gate_up_clamp}_epiflag{epiflag}"
             # MegaMoE-specific constexpr:
@@ -1493,7 +1527,9 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         # exits). Weighting follows the compute graph: deepgemm (apply_topk_in_fc1)
         # folded the routing weight into fc1 -> plain K-sum; transformers applies
         # topk_weights here.
-        if cutlass.const_expr(not self.in_kernel_fc2_reduce):
+        if cutlass.const_expr(
+            not self.in_kernel_fc2_reduce and not self.defer_topk_reduce
+        ):
             score = (
                 topk_weights if cutlass.const_expr(not self.apply_topk_in_fc1) else None
             )

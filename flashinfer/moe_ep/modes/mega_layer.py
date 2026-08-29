@@ -80,6 +80,7 @@ class MoEEpMegaLayer(nn.Module):
         )
         self._transformed: Optional[Any] = None
         self._workspace: Any = None
+        self._preprocessing_count = 0
 
         if backend.transformed_weights is not None:
             self._transformed = backend.transformed_weights
@@ -100,6 +101,7 @@ class MoEEpMegaLayer(nn.Module):
         self._transformed = self._kernel.preprocess_weights(
             self._weights, self._fleet_params
         )
+        self._preprocessing_count += 1
         self._weights = None
 
     def _ensure_workspace(self) -> Any:
@@ -119,6 +121,64 @@ class MoEEpMegaLayer(nn.Module):
     def supports_output_view(self) -> bool:
         """Whether ``forward(return_workspace_view=True)`` is supported."""
         return self._kernel.supports_output_view
+
+    @property
+    def preprocessing_count(self) -> int:
+        """Number of successful weight transformations owned by this layer."""
+        return self._preprocessing_count
+
+    @property
+    def workspace_pool_refcount(self) -> int:
+        """Actual shared-workspace refcount, or zero before/after ownership."""
+        if self._workspace is None:
+            return 0
+        from ..core.kernel.workspace_pool import pooled_workspace_refcount
+
+        return pooled_workspace_refcount(self._workspace)
+
+    @property
+    def transformed_weights(self) -> Any:
+        """Return the one-time transformed weights for sibling capacity layers."""
+        if self._transformed is None:
+            if not self._mega_config.preprocess_weights:
+                raise MoEEpConfigError(
+                    "preprocess_weights=False requires "
+                    "MegaConfig.transformed_weights at init"
+                )
+            self._preprocess_weights()
+        assert self._transformed is not None
+        return self._transformed
+
+    def prepare_deferred_topk_reduce(self, t: "MoEEpTensors") -> dict[str, Any]:
+        """Stage one full MegaMoE round for a terminal same-stream reducer."""
+        ensure_bootstrap_dist_validated(self._bootstrap)
+        quantize_input = self._resolve_quantize_input(t)
+        self._kernel.validate_forward(
+            t,
+            self._fleet_params,
+            quantize_input=quantize_input,
+        )
+        prepare = getattr(self._kernel, "prepare_deferred_topk_reduce", None)
+        if not callable(prepare):
+            raise MoEEpConfigError(
+                "MegaMoE backend does not support deferred TopK reduction"
+            )
+        transformed_weights = self.transformed_weights
+        workspace = self._ensure_workspace()
+        self._kernel.stage_inputs(
+            t,
+            workspace,
+            quantize_input=quantize_input,
+        )
+        prepared = dict(prepare(workspace, transformed_weights))
+        prepared.update(
+            num_tokens=t.num_tokens,
+            workspace_capacity=self._fleet_params.max_tokens_per_rank,
+            hidden_size=self._fleet_params.token_hidden_size,
+            top_k=int(self._megakernel_config.top_k),
+            dtype="bfloat16",
+        )
+        return prepared
 
     def warmup(self, t: Optional["MoEEpTensors"] = None) -> None:
         """Run one full eager forward so ``forward`` becomes graph-capturable.
@@ -209,14 +269,7 @@ class MoEEpMegaLayer(nn.Module):
             quantize_input=quantize_input,
         )
 
-        if self._transformed is None:
-            if not self._mega_config.preprocess_weights:
-                raise MoEEpConfigError(
-                    "preprocess_weights=False requires "
-                    "MegaConfig.transformed_weights at init"
-                )
-            self._preprocess_weights()
-        assert self._transformed is not None
+        transformed_weights = self.transformed_weights
 
         workspace = self._ensure_workspace()
 
@@ -238,7 +291,7 @@ class MoEEpMegaLayer(nn.Module):
         )
         return self._kernel.compute(
             workspace,
-            self._transformed,
+            transformed_weights,
             output=y,
         )
 
