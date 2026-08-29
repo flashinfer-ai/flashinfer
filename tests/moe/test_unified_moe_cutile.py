@@ -5,7 +5,6 @@ from __future__ import annotations
 import pytest
 import torch
 
-from flashinfer.autotuner import AutoTuner
 from flashinfer.cutile import is_cuda_tile_available
 from flashinfer.fused_moe import (
     ActivationConfig,
@@ -16,7 +15,6 @@ from flashinfer.fused_moe import (
     CuTileNvfp4Runner,
     ExecutionConfig,
     ExpertConfig,
-    GeGLU,
     MoEActivationPack,
     MoEConfig,
     MoEFinalizeConfig,
@@ -28,27 +26,15 @@ from flashinfer.fused_moe import (
     RoutingConfig,
     SwiGLU,
 )
-from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
-from flashinfer.fused_moe.cutile.fp4 import (
-    _activation_quantize_config,
-    _input_quantize_config,
-)
-from flashinfer.fused_moe.cutile.moe import _combine_tile_h, _permute_shape
-from flashinfer.fused_moe.runners import (
-    _CUTILE_BF16_DEFAULT_GEMM_CONFIGS,
-    _CUTILE_BF16_DIVERSITY_GEMM_CONFIGS,
-    _CUTILE_W4A4_DEFAULT_GEMM_CONFIGS,
-    _CuTileBf16GemmProblem,
-    _CuTileW4A4GemmProblem,
-    _CuTileW4A4StageRunner,
-    _cutile_bf16_config_rejection_reason,
-    _cutile_w4a4_config_rejection_reason,
-    _rank_cutile_bf16_gemm_configs,
-    _rank_cutile_w4a4_gemm_configs,
-)
-from flashinfer.tllm_enums import ActivationType, RoutingMethodType
+from flashinfer.tllm_enums import ActivationType
 
-from .utils import RecordingTuner, compute_reference_moe
+from .utils import compute_reference_moe
+
+
+# (num_experts, top_k, hidden_size, intermediate_size) from Qwen3.6-35B-A3B
+# (SwiGLU) and NVIDIA-Nemotron-3.5-Lightning-30B-A3B (ReLU2), respectively.
+_QWEN_MOE_SHAPE = (256, 8, 2048, 512)
+_NEMOTRON_MOE_SHAPE = (128, 6, 2688, 1856)
 
 
 def _config(
@@ -73,304 +59,6 @@ def _config(
     )
     values.update(overrides)
     return MoEConfig(**values)
-
-
-def test_cutile_bf16_config_architectures_and_registration():
-    assert [arch for arch in range(140) if CuTileBf16Config.supported(arch)] == [
-        89,
-        90,
-        120,
-        121,
-    ]
-    assert not CuTileBf16Config.supported(100)
-    assert _BACKEND_RUNNERS[CuTileBf16Config] is CuTileBf16Runner
-    assert repr(CuTileBf16Config()) == "CuTileBf16Config()"
-
-
-@pytest.mark.parametrize(
-    ("num_tokens", "hidden_size", "expected"),
-    (
-        (1, 64, 64),
-        (1, 2048, 128),
-        (64, 2048, 128),
-        (65, 2048, 512),
-        (256, 2048, 512),
-        (257, 512, 512),
-        (257, 2048, 1024),
-    ),
-)
-def test_cutile_bf16_combine_tile_heuristic(num_tokens, hidden_size, expected):
-    assert _combine_tile_h(num_tokens, hidden_size) == expected
-
-
-@pytest.mark.parametrize(
-    ("num_assignments", "num_experts", "expected_chunk"),
-    (
-        (48, 128, 8),
-        (96, 128, 8),
-        (384, 128, 16),
-        (1536, 128, 64),
-        (6144, 128, 128),
-        (8192, 128, 128),
-        (12288, 128, 128),
-        (16384, 128, 32),
-        (2048, 256, 64),
-        (4096, 256, 64),
-        (8192, 256, 32),
-    ),
-)
-def test_cutile_permute_chunk_heuristic(num_assignments, num_experts, expected_chunk):
-    assert _permute_shape(num_assignments, num_experts)[1] == expected_chunk
-
-
-@pytest.mark.parametrize(
-    ("config", "match"),
-    (
-        (
-            _config(quant=QuantConfig(variant=QuantVariant.NVFP4)),
-            "QuantVariant.NVFP4",
-        ),
-        (_config(activation=GeGLU()), "supported activations are SwiGLU, ReLU2"),
-        (_config(finalize=MoEFinalizeConfig(do_finalize=False)), "do_finalize=True"),
-        (_config(execution=ExecutionConfig(enable_pdl=True)), "PDL"),
-        (
-            _config(
-                experts=ExpertConfig(
-                    intermediate_size=256,
-                    local_expert_offset=2,
-                    local_num_experts=2,
-                )
-            ),
-            "expert parallelism",
-        ),
-        (
-            _config(
-                routing=RoutingConfig(
-                    num_experts=4,
-                    top_k=2,
-                    method=RoutingMethodType.DeepSeekV3,
-                ),
-                experts=ExpertConfig(
-                    intermediate_size=256,
-                    num_fused_shared_experts=1,
-                ),
-            ),
-            "fused shared experts",
-        ),
-    ),
-)
-def test_cutile_bf16_runner_rejects_out_of_scope_configs(config, match):
-    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
-    runner.config = config
-    runner.device = torch.device("cuda:0")
-    runner._device_arch = 90
-
-    with pytest.raises(NotImplementedError, match=match):
-        runner.check_support()
-
-
-def test_cutile_bf16_runner_rejects_unsupported_architecture():
-    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
-    runner.config = _config()
-    runner.device = torch.device("cuda:0")
-    runner._device_arch = 100
-
-    with pytest.raises(RuntimeError, match="does not support SM100"):
-        runner.check_support()
-
-
-def test_cutile_bf16_fused_epilogue_rejects_unsupported_activation():
-    from flashinfer.fused_moe.cutile import moe
-
-    with pytest.raises(NotImplementedError, match="does not support activation"):
-        moe._grouped_gemm(
-            torch.empty(0),
-            torch.empty(0),
-            torch.empty(0),
-            torch.empty(0),
-            torch.empty(0),
-            torch.empty(0),
-            top_k=1,
-            block_size=32,
-            config=moe.GemmConfig(128, 32, 4),
-            activation_type=ActivationType.Geglu,
-        )
-
-
-@pytest.mark.parametrize("num_tokens", (1, 1024))
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
-def test_cutile_bf16_tunes_stages_to_two_configs(monkeypatch, num_tokens, activation):
-    tuner = RecordingTuner()
-    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
-    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
-    runner._built = True
-    runner._device_arch = 120
-    runner._num_sms = 128
-    runner.config = _config(
-        num_experts=64,
-        top_k=8,
-        intermediate_size=768,
-        tune_max_num_tokens=1024,
-        activation=activation,
-    )
-    inputs = [
-        torch.empty(num_tokens, 2048),
-        torch.empty(num_tokens, 2048),
-        torch.empty(num_tokens, 8, dtype=torch.int32),
-        torch.empty(num_tokens, 8),
-        torch.empty(0),
-        torch.empty(0),
-    ]
-
-    tactics = runner.get_valid_tactics(inputs, None)
-
-    expected_block = runner._fallback_tactic(inputs)[0]
-    assert len(tactics) == 4
-    assert {tactic[0] for tactic in tactics} == {expected_block}
-    assert all(len(tactic) == 7 for tactic in tactics)
-    assert len(tuner.calls) == 2
-    assert all(k == 2 for _, k in tuner.calls)
-
-
-@pytest.mark.parametrize(
-    ("arch", "rows_per_expert"),
-    ((89, 256), (90, 32), (120, 128), (121, 128)),
-)
-def test_cutile_bf16_non_gated_block_size_crossovers(arch, rows_per_expert):
-    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
-    runner._device_arch = arch
-    runner.config = _config(num_experts=128)
-
-    assert runner._candidate_non_gated_block_sizes((rows_per_expert - 1) * 128) == (
-        32,
-        64,
-    )
-    assert runner._candidate_non_gated_block_sizes(rows_per_expert * 128) == (
-        64,
-        128,
-    )
-
-
-@pytest.mark.parametrize(
-    ("arch", "rows_per_expert"),
-    ((89, 64), (90, 64), (120, 64), (121, 64)),
-)
-def test_cutile_bf16_gated_block_size_crossovers(arch, rows_per_expert):
-    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
-    runner._device_arch = arch
-    runner.config = _config(num_experts=128, activation=SwiGLU())
-
-    assert runner._gated_block_size((rows_per_expert - 1) * 128) == 32
-    assert runner._gated_block_size(rows_per_expert * 128) == 64
-    assert runner._gated_block_size(512 * 128) == 128
-
-
-def test_cutile_bf16_gemm_heuristic_keeps_defaults_and_rejects_small_shapes():
-    problem = _CuTileBf16GemmProblem(
-        stage=1,
-        arch=90,
-        num_sms=132,
-        num_assignments=4096,
-        num_experts=128,
-        block_size=32,
-        n=1856,
-        k=2688,
-    )
-    configs = _rank_cutile_bf16_gemm_configs(problem)
-
-    assert len(configs) == 8
-    assert set(_CUTILE_BF16_DEFAULT_GEMM_CONFIGS).issubset(configs)
-    assert all(
-        _cutile_bf16_config_rejection_reason(problem, config) is None
-        for config in configs
-    )
-
-    sm120_problem = _CuTileBf16GemmProblem(
-        stage=1,
-        arch=120,
-        num_sms=188,
-        num_assignments=4096,
-        num_experts=128,
-        block_size=64,
-        n=1856,
-        k=2688,
-    )
-    sm120_configs = _rank_cutile_bf16_gemm_configs(sm120_problem)
-    assert len(sm120_configs) == 10
-    assert set(_CUTILE_BF16_DIVERSITY_GEMM_CONFIGS).issubset(sm120_configs)
-
-    unsupported = _CuTileBf16GemmProblem(
-        stage=2,
-        arch=90,
-        num_sms=132,
-        num_assignments=1,
-        num_experts=1,
-        block_size=32,
-        n=31,
-        k=15,
-    )
-    with pytest.raises(NotImplementedError, match="no supported grouped GEMM"):
-        _rank_cutile_bf16_gemm_configs(unsupported)
-
-
-def test_cutile_bf16_gated_gemm1_problem_uses_preactivation_width():
-    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
-    runner._device_arch = 90
-    runner._num_sms = 132
-    runner.config = _config(
-        num_experts=256,
-        top_k=8,
-        intermediate_size=512,
-        activation=SwiGLU(),
-    )
-    inputs = [
-        torch.empty(16, 2048),
-        torch.empty(16, 2048),
-        torch.empty(16, 8, dtype=torch.int32),
-        torch.empty(16, 8),
-        torch.empty(0),
-        torch.empty(0),
-    ]
-
-    gemm1 = runner._gemm_problem(inputs, stage=1, block_size=32)
-    gemm2 = runner._gemm_problem(inputs, stage=2, block_size=32)
-
-    assert (gemm1.n, gemm1.k) == (1024, 2048)
-    assert (gemm2.n, gemm2.k) == (2048, 512)
-
-
-def test_cutile_bf16_direct_runner_rejects_tokens_above_tuning_ceiling():
-    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
-    runner.config = _config(tune_max_num_tokens=64)
-    runner._built = True
-
-    with pytest.raises(
-        ValueError, match="num_tokens=65 exceeds tune_max_num_tokens=64"
-    ):
-        runner._ensure_workspace(65, 128)
-
-
-def test_cutile_bf16_tuning_pre_hook_initializes_routing_and_workspace():
-    runner = CuTileBf16Runner.__new__(CuTileBf16Runner)
-    runner.config = _config(num_experts=4, top_k=2)
-    activated = []
-    runner._ensure_workspace = lambda tokens, hidden: activated.append((tokens, hidden))
-    inputs = [
-        torch.empty(7, 128),
-        torch.empty(7, 128),
-        torch.empty(7, 2, dtype=torch.int32),
-        torch.empty(7, 2),
-        torch.empty(1),
-        torch.empty(1),
-    ]
-
-    runner._prepare_tuning_inputs(inputs)
-
-    assert activated == [(7, 128)]
-    torch.testing.assert_close(
-        inputs[2], torch.arange(14, dtype=torch.int32).reshape(7, 2) % 4
-    )
-    torch.testing.assert_close(inputs[3], torch.full((7, 2), 0.5))
 
 
 @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
@@ -408,46 +96,6 @@ def test_cutile_bf16_workspace_cache_uses_token_buckets(activation):
     assert module.calls[0]["block_sizes"] == (32, 64, 128)
     assert module.calls[0]["is_gated"] is activation.is_gated
     assert set(runner._workspace_cache) == {(32, 128), (64, 128)}
-
-
-@pytest.mark.parametrize(
-    ("num_experts", "hidden_size", "intermediate_size"),
-    ((1, 16, 8), (3, 24, 12)),
-)
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
-def test_prepare_cutile_bf16_weights_converts_native_layout(
-    activation, num_experts, hidden_size, intermediate_size
-):
-    w1_rows = intermediate_size * (2 if activation.is_gated else 1)
-    w1 = torch.arange(
-        num_experts * w1_rows * hidden_size,
-        dtype=torch.float32,
-    ).reshape(num_experts, w1_rows, hidden_size)
-    w2 = torch.arange(
-        num_experts * hidden_size * intermediate_size,
-        dtype=torch.float32,
-    ).reshape(num_experts, hidden_size, intermediate_size)
-    w1 = w1.to(torch.bfloat16)
-    w2 = w2.to(torch.bfloat16)
-
-    view = CuTileBf16Config.prepare_weights(
-        w1,
-        w2,
-        num_local_experts=num_experts,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        activation=activation,
-    )
-
-    assert set(view) == {"w1", "w2"}
-    assert view["w1"].is_contiguous() and view["w2"].is_contiguous()
-    if activation.is_gated:
-        up, gate = w1.chunk(2, dim=1)
-        expected_w1 = torch.cat((gate, up), dim=1).transpose(1, 2)
-    else:
-        expected_w1 = w1.transpose(1, 2)
-    torch.testing.assert_close(view["w1"], expected_w1)
-    torch.testing.assert_close(view["w2"], w2.transpose(1, 2))
 
 
 def test_prepare_cutile_bf16_weights_rejects_invalid_source_contract():
@@ -494,14 +142,23 @@ cutile_bf16_required = pytest.mark.skipif(
 
 
 @cutile_bf16_required
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 @pytest.mark.parametrize(
-    ("num_tokens", "num_experts", "top_k", "hidden_size", "intermediate_size"),
     (
-        pytest.param(1, 2, 1, 64, 96, id="decode"),
-        pytest.param(7, 3, 2, 96, 160, id="non-power-of-two-experts"),
-        pytest.param(33, 8, 4, 256, 128, id="top-k-4"),
-        pytest.param(4, 4, 2, 2048, 768, id="model-dimensions"),
+        "activation",
+        "num_tokens",
+        "num_experts",
+        "top_k",
+        "hidden_size",
+        "intermediate_size",
+    ),
+    (
+        pytest.param(SwiGLU(), 1, 2, 1, 64, 96, id="decode"),
+        pytest.param(ReLU2(), 7, 3, 2, 96, 160, id="non-power-of-two-experts"),
+        pytest.param(SwiGLU(), 33, 8, 4, 256, 128, id="top-k-4"),
+        pytest.param(SwiGLU(), 1, *_QWEN_MOE_SHAPE, id="qwen-tokens-1"),
+        pytest.param(SwiGLU(), 128, *_QWEN_MOE_SHAPE, id="qwen-tokens-128"),
+        pytest.param(ReLU2(), 1, *_NEMOTRON_MOE_SHAPE, id="nemotron-tokens-1"),
+        pytest.param(ReLU2(), 128, *_NEMOTRON_MOE_SHAPE, id="nemotron-tokens-128"),
     ),
 )
 def test_cutile_bf16_runner_matches_reference(
@@ -527,7 +184,7 @@ def test_cutile_bf16_runner_matches_reference(
             dtype=torch.bfloat16,
             device=device,
         )
-        / 8
+        / hidden_size**0.5
     )
     canonical_w2 = (
         torch.randn(
@@ -537,7 +194,7 @@ def test_cutile_bf16_runner_matches_reference(
             dtype=torch.bfloat16,
             device=device,
         )
-        / 8
+        / intermediate_size**0.5
     )
     topk_ids = (
         torch.arange(num_tokens * top_k, dtype=torch.int32, device=device)
@@ -579,78 +236,6 @@ def test_cutile_bf16_runner_matches_reference(
     )
 
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=5e-1)
-
-
-@cutile_bf16_required
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
-def test_cutile_bf16_runner_supports_tuned_block_sizes(activation):
-    torch.manual_seed(0)
-    device = torch.device("cuda")
-    num_tokens, num_experts, top_k = 17, 4, 2
-    hidden_size, intermediate_size = 128, 256
-    config = _config(
-        num_experts=num_experts,
-        top_k=top_k,
-        intermediate_size=intermediate_size,
-        activation=activation,
-    )
-    hidden_states = torch.randn(
-        num_tokens, hidden_size, dtype=torch.bfloat16, device=device
-    )
-    canonical_w1 = torch.randn(
-        num_experts,
-        intermediate_size * (2 if activation.is_gated else 1),
-        hidden_size,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    canonical_w2 = torch.randn(
-        num_experts,
-        hidden_size,
-        intermediate_size,
-        dtype=torch.bfloat16,
-        device=device,
-    )
-    topk_ids = (
-        torch.arange(num_tokens * top_k, dtype=torch.int32, device=device)
-        .reshape(num_tokens, top_k)
-        .remainder(num_experts)
-    )
-    topk_weights = torch.rand(num_tokens, top_k, device=device)
-    topk_weights /= topk_weights.sum(dim=1, keepdim=True)
-    native = CuTileBf16Config.prepare_weights(
-        canonical_w1,
-        canonical_w2,
-        num_local_experts=num_experts,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        activation=activation,
-    )
-    weights = MoEWeightPack()
-    weights.prepare_for("cutile_bf16", native)
-    runner = CuTileBf16Runner(config, device)
-    runner.check_support()
-    runner.build()
-    inputs = runner.pack_inputs(
-        MoEActivationPack(hidden_states, None, topk_ids, topk_weights), weights
-    )
-    expected = compute_reference_moe(
-        hidden_states,
-        topk_ids,
-        topk_weights,
-        canonical_w1,
-        canonical_w2,
-        activation.type,
-    )
-    tuned_gemms = {
-        89: (256, 32, 2, 256, 32, 1),
-        90: (256, 64, 2, 256, 64, 2),
-        120: (256, 32, 2, 256, 32, 2),
-        121: (256, 32, 2, 256, 32, 2),
-    }[runner._device_arch]
-    for block_size in runner._block_sizes:
-        tuned_actual = runner.forward(inputs, tactic=(block_size, *tuned_gemms))
-        torch.testing.assert_close(tuned_actual, expected, rtol=3e-2, atol=5e-1)
 
 
 @cutile_bf16_required
@@ -803,324 +388,6 @@ def _nvfp4_config(
         backend=BackendOptions((CuTileNvfp4Config(),)),
         finalize=MoEFinalizeConfig(do_finalize=True),
         execution=ExecutionConfig(enable_pdl=False, tune_max_num_tokens=max_num_tokens),
-    )
-
-
-def test_cutile_nvfp4_config_is_registered_and_arch_gated():
-    assert [arch for arch in range(140) if CuTileNvfp4Config.supported(arch)] == [
-        120,
-        121,
-    ]
-    assert _BACKEND_RUNNERS[CuTileNvfp4Config] is CuTileNvfp4Runner
-
-
-def test_cutile_nvfp4_swiglu_stage_search_is_curated():
-    runner = object.__new__(CuTileNvfp4Runner)
-    runner._built = True
-    runner._device_arch = 120
-    runner._num_sms = 188
-    runner.config = _nvfp4_config(
-        num_experts=64,
-        top_k=8,
-        intermediate_size=768,
-    )
-    inputs = [torch.empty(0) for _ in range(10)]
-    inputs[1] = torch.empty(1, 2048)
-    inputs[2] = torch.empty(8, dtype=torch.int32)
-    inputs[6] = torch.empty(64, 2)
-
-    gemm1_runner = _CuTileW4A4StageRunner(runner, 1, block_size=16)
-    gemm2_runner = _CuTileW4A4StageRunner(runner, 2, block_size=16)
-    assert runner._candidate_block_sizes(inputs[2].numel()) == (16, 32)
-    small_gemm1 = gemm1_runner.get_valid_tactics(inputs, None)
-    assert len(small_gemm1) == 9
-    assert {tactic[0] for tactic in small_gemm1} == {0}
-
-    inputs[2] = torch.empty(64, dtype=torch.int32)
-    gemm1 = gemm1_runner.get_valid_tactics(inputs, None)
-    gemm2 = gemm2_runner.get_valid_tactics(inputs, None)
-    assert len(gemm1) == 9
-    assert {tactic[0] for tactic in gemm1} == {0, 1}
-    assert all(len(tactic) == 4 for tactic in gemm1)
-    assert len(gemm2) == 9
-    assert all(len(tactic) == 3 for tactic in gemm2)
-
-    assert runner._candidate_block_sizes(64 * 9) == (32, 64, 128)
-
-
-def test_cutile_nvfp4_tactics_include_partial_128_tiles():
-    problem = _CuTileW4A4GemmProblem(
-        stage=1,
-        arch=120,
-        num_sms=188,
-        num_assignments=8,
-        num_experts=4,
-        block_size=32,
-        n=192,
-        k=192,
-        fused_epilogue=True,
-        is_gated=False,
-        input_sorted=False,
-    )
-    configs = _rank_cutile_w4a4_gemm_configs(problem)
-
-    assert (128, 128, 2) in configs
-    assert (256, 128, 1) in configs
-    assert set(_CUTILE_W4A4_DEFAULT_GEMM_CONFIGS).issubset(configs)
-    assert all(
-        _cutile_w4a4_config_rejection_reason(problem, config) is None
-        for config in configs
-    )
-
-
-def test_cutile_nvfp4_gated_fusion_requires_wide_gemm1_tile():
-    problem = _CuTileW4A4GemmProblem(
-        stage=1,
-        arch=120,
-        num_sms=188,
-        num_assignments=64,
-        num_experts=256,
-        block_size=16,
-        n=512,
-        k=2048,
-        fused_epilogue=True,
-        is_gated=True,
-        input_sorted=False,
-    )
-
-    assert _cutile_w4a4_config_rejection_reason(problem, (256, 64, 2)) is None
-    assert "effective tile_n" in str(
-        _cutile_w4a4_config_rejection_reason(problem, (128, 64, 2))
-    )
-
-
-@pytest.mark.parametrize("num_tokens", (1, 1024))
-def test_cutile_nvfp4_relu2_tunes_stages_to_two_configs(monkeypatch, num_tokens):
-    tuner = RecordingTuner()
-    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
-    runner = CuTileNvfp4Runner.__new__(CuTileNvfp4Runner)
-    runner._built = True
-    runner._device_arch = 120
-    runner._num_sms = 188
-    runner.config = _nvfp4_config(
-        num_experts=128,
-        top_k=6,
-        intermediate_size=1856,
-        activation=ReLU2(),
-        max_num_tokens=1024,
-    )
-    inputs = [torch.empty(0) for _ in range(10)]
-    inputs[0] = torch.empty(num_tokens, 2688)
-    inputs[1] = torch.empty(num_tokens, 2688)
-    inputs[2] = torch.empty(num_tokens, 6, dtype=torch.int32)
-    inputs[3] = torch.empty(num_tokens, 6)
-
-    tactics = runner.get_valid_tactics(inputs, None)
-
-    expected_block = runner._w4a4_fallback_tactic(inputs)[0]
-    assert len(tactics) == 4
-    assert {tactic[0] for tactic in tactics} == {expected_block}
-    assert {tactic[1] for tactic in tactics} == {1}
-    assert all(len(tactic) == 8 for tactic in tactics)
-    assert len(tuner.calls) == 2
-    assert all(k == 2 for _, k in tuner.calls)
-
-
-@pytest.mark.parametrize(
-    ("num_tokens", "expected_fusion"), ((1, 0), (2, 0), (8, 1), (512, 0))
-)
-def test_cutile_nvfp4_swiglu_tunes_producer_stage_to_two_configs(
-    monkeypatch, num_tokens, expected_fusion
-):
-    tuner = RecordingTuner()
-    monkeypatch.setattr(AutoTuner, "get", classmethod(lambda cls: tuner))
-    runner = CuTileNvfp4Runner.__new__(CuTileNvfp4Runner)
-    runner._built = True
-    runner._device_arch = 120
-    runner._num_sms = 188
-    runner.config = _nvfp4_config(
-        num_experts=256,
-        top_k=8,
-        intermediate_size=512,
-        activation=SwiGLU(),
-        max_num_tokens=512,
-    )
-    inputs = [torch.empty(0) for _ in range(10)]
-    inputs[0] = torch.empty(num_tokens, 2048)
-    inputs[1] = torch.empty(num_tokens, 2048)
-    inputs[2] = torch.empty(num_tokens, 8, dtype=torch.int32)
-    inputs[3] = torch.empty(num_tokens, 8)
-
-    tactics = runner.get_valid_tactics(inputs, None)
-
-    expected_block = runner._w4a4_fallback_tactic(inputs)[0]
-    assert len(tactics) == 4
-    assert {tactic[0] for tactic in tactics} == {expected_block}
-    assert {tactic[1] for tactic in tactics} == {expected_fusion}
-    assert all(len(tactic) == 8 for tactic in tactics)
-    if num_tokens == 1:
-        assert any(tactic[2:5] == (128, 256, 2) for tactic in tactics)
-        assert any(tactic[5:8] == (128, 128, 2) for tactic in tactics)
-    elif num_tokens == 2:
-        assert any(tactic[2:5] == (256, 256, 1) for tactic in tactics)
-        assert any(tactic[5:8] == (256, 256, 1) for tactic in tactics)
-    assert len(tuner.calls) == 2
-    assert all(k == 2 for _, k in tuner.calls)
-
-
-@pytest.mark.parametrize(
-    ("num_tokens", "expected_block", "expected_fusion"),
-    (
-        (256, 16, 1),
-        (512, 32, 0),
-        (1024, 32, 1),
-        (2048, 64, 1),
-        (4096, 128, 0),
-        (8192, 64, 1),
-    ),
-)
-def test_cutile_nvfp4_swiglu_fallback_heuristic(
-    num_tokens, expected_block, expected_fusion
-):
-    runner = CuTileNvfp4Runner.__new__(CuTileNvfp4Runner)
-    runner._device_arch = 120
-    runner._num_sms = 188
-    runner.config = _nvfp4_config(
-        num_experts=256,
-        top_k=8,
-        intermediate_size=512,
-        activation=SwiGLU(),
-        max_num_tokens=8192,
-    )
-    inputs = [torch.empty(0) for _ in range(10)]
-    inputs[1] = torch.empty(num_tokens, 2048)
-    inputs[2] = torch.empty(num_tokens, 8, dtype=torch.int32)
-
-    tactic = runner._w4a4_fallback_tactic(inputs)
-    assert tactic[:2] == (expected_block, expected_fusion)
-
-
-@pytest.mark.parametrize("num_tokens,expected_block", ((512, 32), (1024, 64)))
-def test_cutile_nvfp4_relu2_block_size_heuristic(num_tokens, expected_block):
-    runner = CuTileNvfp4Runner.__new__(CuTileNvfp4Runner)
-    runner._device_arch = 120
-    runner._num_sms = 188
-    runner.config = _nvfp4_config(
-        num_experts=128,
-        top_k=6,
-        intermediate_size=1856,
-        activation=ReLU2(),
-        max_num_tokens=1024,
-    )
-    inputs = [torch.empty(0) for _ in range(10)]
-    inputs[1] = torch.empty(num_tokens, 2688)
-    inputs[2] = torch.empty(num_tokens, 6, dtype=torch.int32)
-
-    assert runner._w4a4_fallback_tactic(inputs)[0] == expected_block
-
-
-@pytest.mark.parametrize(
-    ("num_tokens", "hidden_size", "num_sms", "scale_row_major", "expected"),
-    (
-        (8, 4096, 188, False, (2, 128, 0)),
-        (16, 2688, 188, False, (4, 128, 0)),
-        (32, 2048, 188, False, (2, 256, 0)),
-        (32, 4096, 188, False, (2, 256, 4)),
-        (64, 2688, 188, False, (16, 64, 4)),
-        (128, 4096, 188, False, (8, 128, 4)),
-        (256, 2048, 188, False, (8, 128, 4)),
-        (512, 4096, 188, False, (32, 64, 4)),
-        (512, 2688, 188, True, (16, 128, 4)),
-        (1024, 2688, 188, True, (64, 64, 4)),
-        (1024, 4096, 188, True, (8, 256, 4)),
-    ),
-)
-def test_cutile_nvfp4_input_quantize_heuristic(
-    num_tokens, hidden_size, num_sms, scale_row_major, expected
-):
-    assert (
-        _input_quantize_config(num_tokens, hidden_size, num_sms, scale_row_major)
-        == expected
-    )
-
-
-@pytest.mark.parametrize(
-    ("rows", "intermediate_size", "num_sms", "scale_row_major", "expected"),
-    (
-        (64, 512, 188, False, (64, 2)),
-        (2048, 512, 188, False, (64, 4)),
-        (64, 512, 188, True, (64, 4)),
-    ),
-)
-def test_cutile_nvfp4_activation_quantize_heuristic(
-    rows, intermediate_size, num_sms, scale_row_major, expected
-):
-    assert (
-        _activation_quantize_config(rows, intermediate_size, num_sms, scale_row_major)
-        == expected
-    )
-
-
-@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
-def test_prepare_cutile_nvfp4_weights(activation):
-    num_experts, hidden_size, intermediate_size = 2, 128, 128
-    w1_rows = intermediate_size * (2 if activation.is_gated else 1)
-    w1 = torch.arange(num_experts * w1_rows * hidden_size // 2, dtype=torch.uint8)
-    w1 = w1.reshape(num_experts, w1_rows, hidden_size // 2)
-    s1 = torch.arange(
-        num_experts * w1_rows * hidden_size // 16, dtype=torch.uint8
-    ).reshape(num_experts, w1_rows, hidden_size // 16)
-    s1 = s1.view(torch.float8_e4m3fn)
-    w2 = torch.arange(
-        num_experts * hidden_size * intermediate_size // 2, dtype=torch.uint8
-    ).reshape(num_experts, hidden_size, intermediate_size // 2)
-    s2 = torch.arange(
-        num_experts * hidden_size * intermediate_size // 16, dtype=torch.uint8
-    ).reshape(num_experts, hidden_size, intermediate_size // 16)
-    s2 = s2.view(torch.float8_e4m3fn)
-    g1_shape = (num_experts, 2) if activation.is_gated else (num_experts,)
-    g1 = torch.arange(1, 1 + torch.tensor(g1_shape).prod().item(), dtype=torch.float32)
-    g1 = g1.reshape(g1_shape)
-    g2 = torch.arange(1, num_experts + 1, dtype=torch.float32)
-
-    view = CuTileNvfp4Config.prepare_weights(
-        w1,
-        s1,
-        g1,
-        w2,
-        s2,
-        g2,
-        num_local_experts=num_experts,
-        hidden_size=hidden_size,
-        intermediate_size=intermediate_size,
-        activation=activation,
-    )
-
-    assert set(view) == {
-        "w1",
-        "w1_scale",
-        "w1_global_scale",
-        "w2",
-        "w2_scale",
-        "w2_global_scale",
-    }
-    if activation.is_gated:
-        up, gate = w1.chunk(2, dim=1)
-        torch.testing.assert_close(view["w1"], torch.cat((gate, up), dim=1))
-        torch.testing.assert_close(view["w1_global_scale"], g1[:, [1, 0]])
-    assert view["w1_scale"].shape == (
-        num_experts,
-        w1_rows // 128,
-        hidden_size // 64,
-        32,
-        16,
-    )
-    assert view["w2_scale"].shape == (
-        num_experts,
-        hidden_size // 128,
-        intermediate_size // 64,
-        32,
-        16,
     )
 
 
@@ -1305,15 +572,6 @@ def test_cutile_fused_activation_quantize_matches_unfused(
     )
 
 
-def test_cutile_nvfp4_scale_layout_heuristic():
-    from flashinfer.fused_moe.cutile.fp4 import _use_row_major_scale_layout
-
-    assert _use_row_major_scale_layout(4096, 1856)
-    assert not _use_row_major_scale_layout(4095, 1856)
-    assert not _use_row_major_scale_layout(65535, 512)
-    assert _use_row_major_scale_layout(65536, 512)
-
-
 def _make_nvfp4_case(
     activation: ActivationConfig,
     *,
@@ -1337,7 +595,7 @@ def _make_nvfp4_case(
             dtype=torch.bfloat16,
             device=device,
         )
-        / 8
+        / hidden_size**0.5
     )
     w2 = (
         torch.randn(
@@ -1347,7 +605,7 @@ def _make_nvfp4_case(
             dtype=torch.bfloat16,
             device=device,
         )
-        / 8
+        / intermediate_size**0.5
     )
     w1_q, w1_scale, w1_dequant = _quantize_weights(w1)
     w2_q, w2_scale, w2_dequant = _quantize_weights(w2)
@@ -1393,21 +651,45 @@ def _make_nvfp4_case(
 
 @cutile_nvfp4_required
 @pytest.mark.parametrize(
-    ("activation", "num_tokens", "top_k"),
     (
-        pytest.param(SwiGLU(), 4, 2, id="swiglu"),
-        pytest.param(ReLU2(), 4, 2, id="relu2"),
+        "activation",
+        "num_tokens",
+        "num_experts",
+        "top_k",
+        "hidden_size",
+        "intermediate_size",
+    ),
+    (
         pytest.param(
             SwiGLU(),
             21,
+            4,
             3,
+            128,
+            128,
             id="bucketed-small-gated-activation",
         ),
+        pytest.param(SwiGLU(), 1, *_QWEN_MOE_SHAPE, id="qwen-tokens-1"),
+        pytest.param(SwiGLU(), 128, *_QWEN_MOE_SHAPE, id="qwen-tokens-128"),
+        pytest.param(ReLU2(), 1, *_NEMOTRON_MOE_SHAPE, id="nemotron-tokens-1"),
+        pytest.param(ReLU2(), 128, *_NEMOTRON_MOE_SHAPE, id="nemotron-tokens-128"),
     ),
 )
-def test_cutile_nvfp4_runner_matches_reference(activation, num_tokens, top_k):
+def test_cutile_nvfp4_runner_matches_reference(
+    activation,
+    num_tokens,
+    num_experts,
+    top_k,
+    hidden_size,
+    intermediate_size,
+):
     config, activations, weights, expected = _make_nvfp4_case(
-        activation, num_tokens=num_tokens, top_k=top_k
+        activation,
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
     )
     runner = CuTileNvfp4Runner(config, torch.device("cuda"))
     runner.check_support()

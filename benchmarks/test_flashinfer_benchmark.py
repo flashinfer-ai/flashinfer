@@ -101,6 +101,40 @@ def _parse_prims_ts_case(routine, extra_args):
     )
 
 
+def test_unified_moe_comparison_args():
+    args = flashinfer_benchmark.parse_args(
+        [
+            "--routine",
+            "unified_moe",
+            "--backends",
+            "cutlass",
+            "cutile",
+            "--quant-variant",
+            "nvfp4",
+            "--num_tokens",
+            "128",
+            "--hidden_size",
+            "2688",
+            "--intermediate_size",
+            "1856",
+            "--num_experts",
+            "128",
+            "--top_k",
+            "6",
+            "--activation-type",
+            "Relu2",
+            "--autotune",
+        ]
+    )
+
+    assert args.backends == ["cutlass", "cutile"]
+    assert args.quant_variant == "nvfp4"
+    assert args.num_tokens == 128
+    assert args.activation_type.name == "Relu2"
+    assert args.autotune
+    assert not hasattr(args, "tune_max_num_tokens")
+
+
 def test_prims_ts_backend_alias_is_canonicalized():
     args = flashinfer_benchmark.parse_args(
         [
