@@ -682,6 +682,15 @@ def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
     assert violations == []
 
 
+def test_attention_ts_context_paged_wrapper_has_no_workspace_api() -> None:
+    constructor_parameters = inspect.signature(
+        BatchPrefillPagedTSWrapper.__init__
+    ).parameters
+
+    assert "workspace_buffer" not in constructor_parameters
+    assert not hasattr(BatchPrefillPagedTSWrapper, "reset_workspace_buffer")
+
+
 def test_attention_ts_context_fixed_oracle_is_bottom_right_causal():
     case = _make_context_case(
         q_lengths=(2,),
