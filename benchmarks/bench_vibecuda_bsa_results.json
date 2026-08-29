@@ -1,214 +1,577 @@
 {
-  "summary": {
-    "arithmetic_mean": 1.982948992288326,
-    "geometric_mean": 1.7482018448138397,
-    "denominator": "cake",
-    "baseline_provenance": {
-      "backend": "cake",
-      "symbol": "flashinfer.sparse.BlockSparseAttentionWrapper(backend='cake')",
-      "source": "flashinfer PR #4593 (CAKE VSA), repository HEAD"
-    },
-    "timing": {
-      "method": "cupti",
-      "dry_run_iters": 5,
-      "repeat_iters": 100,
-      "statistic": "median",
-      "use_cuda_graph": false
-    },
-    "workload_count": 8
-  },
-  "workloads": [
+  "requested_rows": 18,
+  "passing_comparison_rows": 2,
+  "complete": false,
+  "arithmetic_mean": null,
+  "geometric_mean": null,
+  "minimum": null,
+  "maximum": null,
+  "partial_comparison_arithmetic_mean": 0.0833302855133844,
+  "partial_comparison_geometric_mean": 0.08332533446732573,
+  "baseline": "FlashInfer PR #4804 CAKE VSA",
+  "baseline_commit": "8fcf0fa6d44d5dc5ee7ab2ea9664ec96ea723c4e",
+  "results": [
     {
-      "workload": "bs=128 bf16 hq=8 hkv=8 d=128 m=256 n=512 sel=2 lse=1",
-      "backends": {
-        "cake": {
-          "median_ms": 0.008545,
-          "min_ms": 0.008288,
-          "max_ms": 0.008896,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        },
-        "vibecuda": {
-          "median_ms": 0.005408,
-          "min_ms": 0.005249,
-          "max_ms": 0.005824,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        }
+      "workload": {
+        "name": "canonical_blk128_s16384_d50",
+        "cohort": "canonical",
+        "block_size": 128,
+        "sequence": 16384,
+        "selected": 64,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
       },
-      "speedup_cake_over_vibecuda": 1.5800665680473376
-    },
-    {
-      "workload": "bs=64 bf16 hq=8 hkv=8 d=128 m=128 n=256 sel=2 lse=1",
       "backends": {
-        "cake": {
-          "median_ms": 0.006592,
-          "min_ms": 0.0064,
-          "max_ms": 0.006944,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        },
         "vibecuda": {
-          "median_ms": 0.004608,
-          "min_ms": 0.00448,
-          "max_ms": 0.004832,
-          "iters": 100,
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports query sequence lengths up to 1024 (got M=16384)"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.549204,
+          "min_ms": 0.546308,
+          "max_ms": 0.551556,
+          "samples": 100,
           "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
         }
-      },
-      "speedup_cake_over_vibecuda": 1.4305555555555556
+      }
     },
     {
-      "workload": "bs=128 fp16 hq=8 hkv=1 d=128 m=256 n=512 sel=2 lse=0",
-      "backends": {
-        "cake": {
-          "median_ms": 0.027457,
-          "min_ms": 0.026977,
-          "max_ms": 0.02992,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        },
-        "vibecuda": {
-          "median_ms": 0.005057,
-          "min_ms": 0.004897,
-          "max_ms": 0.005408,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        }
+      "workload": {
+        "name": "canonical_blk128_s16384_d25",
+        "cohort": "canonical",
+        "block_size": 128,
+        "sequence": 16384,
+        "selected": 32,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
       },
-      "speedup_cake_over_vibecuda": 5.429503658295432
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports query sequence lengths up to 1024 (got M=16384)"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.29737749999999996,
+          "min_ms": 0.29613,
+          "max_ms": 0.298434,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      }
     },
     {
-      "workload": "bs=128 fp16 hq=8 hkv=8 d=128 m=256 n=512 sel=2 lse=1",
-      "backends": {
-        "cake": {
-          "median_ms": 0.008352,
-          "min_ms": 0.008127,
-          "max_ms": 0.00864,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        },
-        "vibecuda": {
-          "median_ms": 0.005376,
-          "min_ms": 0.005184,
-          "max_ms": 0.005729,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        }
+      "workload": {
+        "name": "canonical_blk128_s16384_d10",
+        "cohort": "canonical",
+        "block_size": 128,
+        "sequence": 16384,
+        "selected": 13,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
       },
-      "speedup_cake_over_vibecuda": 1.5535714285714286
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports query sequence lengths up to 1024 (got M=16384)"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.147169,
+          "min_ms": 0.146049,
+          "max_ms": 0.148033,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      }
     },
     {
-      "workload": "bs=128 bf16 hq=8 hkv=2 d=128 m=256 n=512 sel=2 lse=0",
-      "backends": {
-        "cake": {
-          "median_ms": 0.008416,
-          "min_ms": 0.008128,
-          "max_ms": 0.00896,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        },
-        "vibecuda": {
-          "median_ms": 0.005056,
-          "min_ms": 0.004864,
-          "max_ms": 0.005376,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        }
+      "workload": {
+        "name": "canonical_blk128_s32768_d25",
+        "cohort": "canonical",
+        "block_size": 128,
+        "sequence": 32768,
+        "selected": 64,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
       },
-      "speedup_cake_over_vibecuda": 1.6645569620253164
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports query sequence lengths up to 1024 (got M=32768)"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 1.1472085,
+          "min_ms": 1.113801,
+          "max_ms": 1.211049,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      }
     },
     {
-      "workload": "bs=128 bf16 hq=8 hkv=8 d=64 m=256 n=512 sel=2 lse=0",
-      "backends": {
-        "cake": {
-          "median_ms": 0.005825,
-          "min_ms": 0.005664,
-          "max_ms": 0.006208,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        },
-        "vibecuda": {
-          "median_ms": 0.004288,
-          "min_ms": 0.004096,
-          "max_ms": 0.004735,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        }
+      "workload": {
+        "name": "canonical_blk128_s32768_d10",
+        "cohort": "canonical",
+        "block_size": 128,
+        "sequence": 32768,
+        "selected": 26,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
       },
-      "speedup_cake_over_vibecuda": 1.3584421641791045
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports query sequence lengths up to 1024 (got M=32768)"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.519428,
+          "min_ms": 0.516612,
+          "max_ms": 0.545541,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      }
     },
     {
-      "workload": "bs=128 bf16 hq=8 hkv=8 d=96 m=256 n=512 sel=2 lse=0",
-      "backends": {
-        "cake": {
-          "median_ms": 0.00672,
-          "min_ms": 0.006528,
-          "max_ms": 0.007105,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        },
-        "vibecuda": {
-          "median_ms": 0.004897,
-          "min_ms": 0.004672,
-          "max_ms": 0.00544,
-          "iters": 100,
-          "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
-        }
+      "workload": {
+        "name": "canonical_blk128_s80000_d25",
+        "cohort": "canonical",
+        "block_size": 128,
+        "sequence": 80000,
+        "selected": 156,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
       },
-      "speedup_cake_over_vibecuda": 1.3722687359607924
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports query sequence lengths up to 1024 (got M=80000)"
+        },
+        "cake": {
+          "status": "error",
+          "reason": "Cake ultrasparse route requires exactly six selected blocks"
+        }
+      }
     },
     {
-      "workload": "bs=128 bf16 hq=8 hkv=8 d=128 m=128 n=16384 sel=8 lse=0",
+      "workload": {
+        "name": "canonical_blk128_s80000_d10",
+        "cohort": "canonical",
+        "block_size": 128,
+        "sequence": 80000,
+        "selected": 62,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
+      },
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports query sequence lengths up to 1024 (got M=80000)"
+        },
+        "cake": {
+          "status": "error",
+          "reason": "Cake ultrasparse route requires exactly six selected blocks"
+        }
+      }
+    },
+    {
+      "workload": {
+        "name": "canonical_blk64_s1024_d25",
+        "cohort": "canonical",
+        "block_size": 64,
+        "sequence": 1024,
+        "selected": 4,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
+      },
       "backends": {
         "cake": {
-          "median_ms": 0.015808,
-          "min_ms": 0.015296,
-          "max_ms": 0.016288,
-          "iters": 100,
+          "status": "passed",
+          "median_ms": 0.007568,
+          "min_ms": 0.00736,
+          "max_ms": 0.008064,
+          "samples": 100,
           "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
         },
         "vibecuda": {
-          "median_ms": 0.01072,
-          "min_ms": 0.010432,
-          "max_ms": 0.01184,
-          "iters": 100,
+          "status": "passed",
+          "median_ms": 0.08984,
+          "min_ms": 0.086241,
+          "max_ms": 0.178178,
+          "samples": 100,
           "timing": "cupti",
-          "output_allocation": "outside_timed_region",
-          "plan": "outside_timed_region"
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
         }
       },
-      "speedup_cake_over_vibecuda": 1.4746268656716417
+      "precision": {
+        "status": "passed",
+        "reference": "refreshed CAKE output",
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "speedup": 0.08423864648263579
+    },
+    {
+      "workload": {
+        "name": "canonical_blk64_s1024_d50",
+        "cohort": "canonical",
+        "block_size": 64,
+        "sequence": 1024,
+        "selected": 8,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
+      },
+      "backends": {
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.008448,
+          "min_ms": 0.008256,
+          "max_ms": 0.008992,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        },
+        "vibecuda": {
+          "status": "passed",
+          "median_ms": 0.102497,
+          "min_ms": 0.099201,
+          "max_ms": 0.17261,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      },
+      "precision": {
+        "status": "passed",
+        "reference": "refreshed CAKE output",
+        "atol": 0.01,
+        "rtol": 0.01
+      },
+      "speedup": 0.082421924544133
+    },
+    {
+      "workload": {
+        "name": "canonical_blk64_s1024_d75",
+        "cohort": "canonical",
+        "block_size": 64,
+        "sequence": 1024,
+        "selected": 12,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
+      },
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports at most 8 selected blocks per (head, query block) row (got 12)"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.009568,
+          "min_ms": 0.00928,
+          "max_ms": 0.01008,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      }
+    },
+    {
+      "workload": {
+        "name": "canonical_blk64_s2048_d25",
+        "cohort": "canonical",
+        "block_size": 64,
+        "sequence": 2048,
+        "selected": 8,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
+      },
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports query sequence lengths up to 1024 (got M=2048)"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.013057,
+          "min_ms": 0.012737,
+          "max_ms": 0.013536,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      }
+    },
+    {
+      "workload": {
+        "name": "canonical_blk64_s2048_d50",
+        "cohort": "canonical",
+        "block_size": 64,
+        "sequence": 2048,
+        "selected": 16,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
+      },
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports query sequence lengths up to 1024 (got M=2048)"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.017231999999999997,
+          "min_ms": 0.016992,
+          "max_ms": 0.017792,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      }
+    },
+    {
+      "workload": {
+        "name": "canonical_blk64_s2048_d75",
+        "cohort": "canonical",
+        "block_size": 64,
+        "sequence": 2048,
+        "selected": 24,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
+      },
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports query sequence lengths up to 1024 (got M=2048)"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.021633,
+          "min_ms": 0.021376,
+          "max_ms": 0.022465,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      }
+    },
+    {
+      "workload": {
+        "name": "canonical_blk64_s4096_d25",
+        "cohort": "canonical",
+        "block_size": 64,
+        "sequence": 4096,
+        "selected": 16,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
+      },
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports query sequence lengths up to 1024 (got M=4096)"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.030112,
+          "min_ms": 0.0296,
+          "max_ms": 0.030688,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      }
+    },
+    {
+      "workload": {
+        "name": "canonical_blk64_s4096_d50",
+        "cohort": "canonical",
+        "block_size": 64,
+        "sequence": 4096,
+        "selected": 32,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
+      },
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports query sequence lengths up to 1024 (got M=4096)"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.046273,
+          "min_ms": 0.04576,
+          "max_ms": 0.046848,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      }
+    },
+    {
+      "workload": {
+        "name": "canonical_blk64_s4096_d75",
+        "cohort": "canonical",
+        "block_size": 64,
+        "sequence": 4096,
+        "selected": 48,
+        "heads": 8,
+        "head_dim": 128,
+        "real_sequence": null,
+        "dit_shape": null
+      },
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "vibecuda backend currently supports query sequence lengths up to 1024 (got M=4096)"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.059296,
+          "min_ms": 0.058624,
+          "max_ms": 0.059777,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      }
+    },
+    {
+      "workload": {
+        "name": "fastwan_61x448x832_s23296",
+        "cohort": "fastwan",
+        "block_size": 64,
+        "sequence": 23296,
+        "selected": 73,
+        "heads": 12,
+        "head_dim": 128,
+        "real_sequence": 23296,
+        "dit_shape": [
+          16,
+          28,
+          52
+        ]
+      },
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "VibeCUDA lacks direct q2k metadata with non-uniform kv_block_lens"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.668453,
+          "min_ms": 0.660677,
+          "max_ms": 0.750758,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      }
+    },
+    {
+      "workload": {
+        "name": "fastwan_61x480x832_s24960_p26624",
+        "cohort": "fastwan",
+        "block_size": 64,
+        "sequence": 26624,
+        "selected": 84,
+        "heads": 12,
+        "head_dim": 128,
+        "real_sequence": 24960,
+        "dit_shape": [
+          16,
+          30,
+          52
+        ]
+      },
+      "backends": {
+        "vibecuda": {
+          "status": "unsupported",
+          "reason": "VibeCUDA lacks direct q2k metadata with non-uniform kv_block_lens"
+        },
+        "cake": {
+          "status": "passed",
+          "median_ms": 0.928296,
+          "min_ms": 0.853383,
+          "max_ms": 0.968776,
+          "samples": 100,
+          "timing": "cupti",
+          "cold_l2_cache": true,
+          "plan": "outside_timed_region",
+          "output_allocation": "outside_timed_region"
+        }
+      }
     }
   ]
 }

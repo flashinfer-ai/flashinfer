@@ -653,6 +653,11 @@ class BlockSparseAttentionWrapper:
 
             MB = M // R
             NB = N // C
+            if M > 1024:
+                raise ValueError(
+                    "vibecuda backend currently supports query sequence "
+                    f"lengths up to 1024 (got M={M})"
+                )
             # The kernel reads the per-QO-head boolean block mask directly on
             # device (no indptr/indices conversion); keep the plan-time tensor
             # alive for every run.
@@ -680,6 +685,12 @@ class BlockSparseAttentionWrapper:
                 if block_mask.numel()
                 else 0
             )
+            if max_selected > 8:
+                raise ValueError(
+                    "vibecuda backend currently supports at most 8 selected "
+                    "blocks per (head, query block) row "
+                    f"(got {max_selected})"
+                )
             self._vibecuda_split_g = vibecuda_bsa_split_g(max_selected, R, N)
             ws_numel = vibecuda_bsa_workspace_numel(
                 M, num_qo_heads, head_dim, self._vibecuda_split_g

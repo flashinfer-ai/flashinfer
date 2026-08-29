@@ -301,3 +301,51 @@ def test_vibecuda_bsa_rejects_unsupported_configuration():
     # A block size that is not a multiple of 64 is rejected.
     with pytest.raises(ValueError, match="multiple of 64"):
         vibecuda_block_sparse_attention(q, k, v, mask, 32)
+
+    # The generated kernel currently has a fixed eight-block scheduling bound.
+    # Reject denser rows before launch instead of allowing an illegal instruction.
+    dense_n = 16 * 64
+    dense_mask = torch.ones(
+        (num_qo_heads, M // 64, dense_n // 64), dtype=torch.bool, device=device
+    )
+    with pytest.raises(ValueError, match="at most 8 selected blocks"):
+        wrapper.plan(
+            None,
+            None,
+            M,
+            dense_n,
+            64,
+            64,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            q_data_type=torch.bfloat16,
+            block_mask=dense_mask,
+        )
+
+    dense_k = torch.randn(
+        (dense_n, num_kv_heads, head_dim), dtype=q.dtype, device=device
+    )
+    dense_v = torch.randn_like(dense_k)
+    with pytest.raises(ValueError, match="at most 8 selected blocks"):
+        vibecuda_block_sparse_attention(q, dense_k, dense_v, dense_mask, 64)
+
+    long_m = 17 * 64
+    long_mask = torch.zeros(
+        (num_qo_heads, long_m // 64, N // 64), dtype=torch.bool, device=device
+    )
+    long_mask[..., :1] = True
+    with pytest.raises(ValueError, match="query sequence lengths up to 1024"):
+        wrapper.plan(
+            None,
+            None,
+            long_m,
+            N,
+            64,
+            64,
+            num_qo_heads,
+            num_kv_heads,
+            head_dim,
+            q_data_type=torch.bfloat16,
+            block_mask=long_mask,
+        )

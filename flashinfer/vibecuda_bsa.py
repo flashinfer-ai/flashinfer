@@ -44,6 +44,8 @@ from .utils import get_compute_capability
 
 _SUPPORTED_CC = ((10, 0), (10, 3))
 _SUPPORTED_HEAD_DIMS = (64, 96, 128)
+_MAX_SELECTED_BLOCKS = 8
+_MAX_QUERY_SEQUENCE_LENGTH = 1024
 
 
 def _vibecuda_bsa_target(device: torch.device) -> VibeCUDABSATarget:
@@ -122,6 +124,11 @@ def _check_vibecuda_bsa_inputs(
         raise ValueError(f"block_mask must have dtype bool (got {block_mask.dtype})")
     M, HQ, D = q.shape
     N, HKV, _ = k.shape
+    if M > _MAX_QUERY_SEQUENCE_LENGTH:
+        raise ValueError(
+            "vibecuda block-sparse attention currently supports query "
+            f"sequence lengths up to {_MAX_QUERY_SEQUENCE_LENGTH} (got M={M})"
+        )
     if D not in _SUPPORTED_HEAD_DIMS:
         raise ValueError(
             f"vibecuda block-sparse attention requires head_dim in "
@@ -142,6 +149,17 @@ def _check_vibecuda_bsa_inputs(
         raise ValueError(
             f"block_mask must have shape (num_qo_heads={HQ}, ceil(M/block_size)="
             f"{MB}, ceil(N/block_size)={NB}), got {tuple(block_mask.shape)}"
+        )
+    max_selected = (
+        int(block_mask.to(torch.int32).sum(dim=-1).max().item())
+        if block_mask.numel()
+        else 0
+    )
+    if max_selected > _MAX_SELECTED_BLOCKS:
+        raise ValueError(
+            "vibecuda block-sparse attention currently supports at most "
+            f"{_MAX_SELECTED_BLOCKS} selected blocks per (head, query block) "
+            f"row (got {max_selected})"
         )
 
 
