@@ -147,8 +147,9 @@ class SparseMLASm120DecodeConfig:
     Attributes
     ----------
     d_qk : int
-        Query/key head dim served by this family (``512`` for DSv4, ``576``
-        for DSv3.2 / GLM-NSA).
+        Query/key head dim served by this family (``512`` for DSv4 /
+        GLM53_NOPE, ``576`` for DSv3.2 / GLM-NSA, ``1088`` for the
+        DOTS3_SWA sliding-window family, whose ``d_v`` is then 1024).
     page_block_size : int
         The only KV page block size the decode kernels are instantiated for.
     max_num_tokens : int
@@ -750,6 +751,14 @@ def _sparse_mla_sm120_paged_attention(
     model_type = _resolve_model_type(q.shape[-1], kv_scale_format)
     _require_d_v(d_v, model_type)
     _check_last_dim(output, "output", model_type)
+    # The secondary cache is an all-or-nothing argument group: without this
+    # check, extra_indices without extra_kv_cache would reach the planner as
+    # has_extra=False with extra_topk>0, and could be forwarded to a
+    # single-cache variant alongside the null cache.
+    if (extra_kv_cache is None) != (extra_indices is None):
+        raise ValueError("extra_kv_cache and extra_indices must be provided together")
+    if extra_kv_cache is None and extra_topk_length is not None:
+        raise ValueError("extra_topk_length requires extra_kv_cache and extra_indices")
 
     impl = get_sparse_mla_sm120_module()
     impl.paged_attention(

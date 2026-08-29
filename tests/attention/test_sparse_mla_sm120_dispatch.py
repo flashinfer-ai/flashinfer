@@ -312,6 +312,38 @@ def test_plan_swapab_rejections(known_crossover) -> None:
         _normalize_prefill_impl("sg")
 
 
+def test_extra_cache_args_pairing() -> None:
+    """extra_kv_cache / extra_indices / extra_topk_length are an
+    all-or-nothing group: a mismatch must raise before planning (previously
+    extra_indices alone reached the planner as has_extra=False with
+    extra_topk>0). The check precedes any module load, so CPU tensors
+    suffice; this exercises the same funnel the runner path calls."""
+    from flashinfer.mla._sparse_mla_sm120 import _sparse_mla_sm120_paged_attention
+
+    q = torch.zeros(2, 16, 512, dtype=torch.bfloat16)
+    kv = torch.zeros(4, 64, 584, dtype=torch.uint8)
+    idx = torch.zeros(2, 128, dtype=torch.int32)
+    out = torch.zeros(2, 16, 512, dtype=torch.bfloat16)
+    lse = torch.zeros(2, 16, dtype=torch.float32)
+    extra_idx = torch.zeros(2, 64, dtype=torch.int32)
+    with pytest.raises(ValueError, match="must be provided together"):
+        _sparse_mla_sm120_paged_attention(
+            q, kv, idx, out, lse, 1.0, extra_indices=extra_idx
+        )
+    with pytest.raises(ValueError, match="must be provided together"):
+        _sparse_mla_sm120_paged_attention(q, kv, idx, out, lse, 1.0, extra_kv_cache=kv)
+    with pytest.raises(ValueError, match="requires extra_kv_cache"):
+        _sparse_mla_sm120_paged_attention(
+            q,
+            kv,
+            idx,
+            out,
+            lse,
+            1.0,
+            extra_topk_length=torch.zeros(2, dtype=torch.int32),
+        )
+
+
 # Crossover-aware decode-form routing via the dispatch planner (pure Python;
 # no GPU).
 
