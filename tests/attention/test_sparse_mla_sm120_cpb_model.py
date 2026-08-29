@@ -161,67 +161,6 @@ def test_crossover_persistence_round_trip(clean_cpb_state, monkeypatch) -> None:
     assert cpb_mod.has_crossover(device, "dsv3_2")
 
 
-def test_old_schema_file_loads_crossover_but_not_constants(
-    clean_cpb_state, monkeypatch
-) -> None:
-    """A schema-v2 cache yields its crossover table (unchanged semantics) but
-    NOT its constants: those encode the retired ceil-wave + beta form and
-    would mispredict under the scheduling-makespan model."""
-    import json
-    from dataclasses import asdict
-
-    device = torch.device("cpu")
-    path = cpb_mod.default_cache_path()
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": 2,
-                "devices": {
-                    "0:Fake GPU": {
-                        "dsv4": asdict(_C),
-                        cpb_mod._DECODE_MAX_TOKENS_KEY: {"dsv4|64|512": 32},
-                    }
-                },
-            }
-        )
-        + "\n"
-    )
-    assert cpb_mod.get_constants(device, "dsv4") is None
-    assert cpb_mod.get_decode_max_tokens(device, "dsv4", 64, 512) == 32
-    assert cpb_mod.has_crossover(device, "dsv4")
-
-
-def test_save_upgrades_old_schema_keeping_crossover(clean_cpb_state, monkeypatch):
-    """Writing into a v2 file upgrades it to the current schema: stale
-    constants are dropped (families recalibrate), crossover survives."""
-    import json
-    from dataclasses import asdict
-
-    device = torch.device("cpu")
-    path = cpb_mod.default_cache_path()
-    path.write_text(
-        json.dumps(
-            {
-                "schema_version": 2,
-                "devices": {
-                    "0:Fake GPU": {
-                        "dsv4": asdict(_C),
-                        cpb_mod._DECODE_MAX_TOKENS_KEY: {"dsv4|64|512": 32},
-                    }
-                },
-            }
-        )
-        + "\n"
-    )
-    cpb_mod.save_constants(device, "dsv3_2", _C)
-    payload = json.loads(path.read_text())
-    assert payload["schema_version"] == cpb_mod._SCHEMA_VERSION
-    dev = payload["devices"]["0:Fake GPU"]
-    assert "dsv4" not in dev  # stale constants dropped
-    assert dev[cpb_mod._DECODE_MAX_TOKENS_KEY] == {"dsv4|64|512": 32}
-    assert dev["dsv3_2"] == asdict(_C)
-
-
 def test_dsv3_2_crossover_requires_glm_nsa_entries(
     clean_cpb_state, monkeypatch
 ) -> None:

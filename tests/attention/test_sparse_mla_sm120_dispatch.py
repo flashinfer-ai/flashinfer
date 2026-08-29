@@ -58,8 +58,13 @@ from flashinfer.mla._sparse_mla_sm120 import (
     _MODEL_TYPE_GLM53_NOPE,
     _MODEL_TYPE_DOTS3_SWA,
     _decode_dispatch_error_message,
-    _decode_dsv3_2_dispatchable,
-    _decode_dsv4_dispatchable,
+    _resolve_model_type,
+)
+from flashinfer.mla._sparse_mla_sm120_plan import (
+    _PREFILL_IMPL_SWAPAB,
+    _normalize_prefill_impl,
+    decode_splitk_eligible,
+    plan,
 )
 
 
@@ -136,23 +141,26 @@ def test_supported_helpers() -> None:
 
 
 def test_supports_decode_matches_dispatch_predicates() -> None:
-    """config.supports_decode agrees with the internal dispatch predicates,
-    on and off the calibrated grid (topk is a runtime kernel argument)."""
+    """config.supports_decode agrees with the plan-layer decode predicate
+    (model_type resolved from d_qk), on and off the calibrated grid (topk is
+    a runtime kernel argument)."""
     configs = supported_sparse_mla_sm120_configs()
     dsv4 = configs["dsv4"]
     for num_heads in (8, 16, 64, 128, 48, 3):
         for topk in (128, 384, 256, 640, 1024, 4096):
             assert dsv4.supports_decode(num_heads, topk)
-            assert _decode_dsv4_dispatchable(1, num_heads, topk, 512, 64)
-            assert _decode_dsv4_dispatchable(
-                _DECODE_MAX_TOKENS, num_heads, topk, 512, 64
-            )
+            for t in (1, _DECODE_MAX_TOKENS):
+                assert decode_splitk_eligible(
+                    _resolve_model_type(512, "auto"), num_heads, topk, 64, False, t
+                )
 
     dsv3_2 = configs["dsv3_2"]
     for num_heads in (8, 64, 128, 24):
         for topk in (128, 512, 1024, 2048, 3000):
             assert dsv3_2.supports_decode(num_heads, topk)
-            assert _decode_dsv3_2_dispatchable(1, num_heads, topk, 576, 64)
+            assert decode_splitk_eligible(
+                _resolve_model_type(576, "auto"), num_heads, topk, 64, False, 1
+            )
 
 
 def test_supports_decode_rejects_mismatches() -> None:
@@ -165,8 +173,12 @@ def test_supports_decode_rejects_mismatches() -> None:
     assert not dsv4.supports_decode(64, 256, page_block_size=32)
     assert not dsv4.supports_decode(64, 256, num_tokens=_DECODE_MAX_TOKENS + 1)
     assert dsv4.supports_decode(64, 256, num_tokens=_DECODE_MAX_TOKENS)
-    assert not _decode_dsv4_dispatchable(1, 64, 0, 512, 64)
-    assert not _decode_dsv4_dispatchable(_DECODE_MAX_TOKENS + 1, 64, 256, 512, 64)
+    assert not decode_splitk_eligible(
+        _resolve_model_type(512, "auto"), 64, 0, 64, False, 1
+    )
+    assert not decode_splitk_eligible(
+        _resolve_model_type(512, "auto"), 64, 256, 64, False, _DECODE_MAX_TOKENS + 1
+    )
     # DOTS3_SWA's window constraint: topk < 513 is out of envelope.
     dots3 = supported_sparse_mla_sm120_configs()["dots3_swa"]
     assert dots3.supports_decode(64, 513)
@@ -276,7 +288,28 @@ def test_error_message_keeps_shape_summary_format() -> None:
         extra_topk=0,
     )
     assert re.search(r"no decode kernel.*num_tokens=1, num_heads=16, topk=384", msg)
-    assert re.search(r"no decode kernel.*num_tokens=1, num_heads=16, topk=384", msg)
+
+
+def test_plan_swapab_rejections() -> None:
+    """Forced swapab raises at the plan layer, before any launch: non-V32
+    family, dual-cache call, unknown prefill_impl string."""
+    dev = torch.device("cpu")
+    with pytest.raises(ValueError, match="V32-family"):
+        plan(128, 64, 512, _MODEL_TYPE_DSV4, 64, False, _PREFILL_IMPL_SWAPAB, dev)
+    with pytest.raises(ValueError, match="dual-cache"):
+        plan(
+            128,
+            64,
+            128,
+            _MODEL_TYPE_DSV4,
+            64,
+            True,
+            _PREFILL_IMPL_SWAPAB,
+            dev,
+            extra_topk=64,
+        )
+    with pytest.raises(ValueError, match="prefill_impl"):
+        _normalize_prefill_impl("sg")
 
 
 # Crossover-aware decode-form routing via the dispatch planner (pure Python;
@@ -399,16 +432,27 @@ def test_plan_arbitrary_num_heads_rides_runtime_h(known_crossover) -> None:
     )
 
 
-def test_plan_honors_crossover(known_crossover) -> None:
-    """Instantiated shape with crossover=8: T<=8 decodes, T>8 prefills."""
+@pytest.mark.parametrize(
+    "family_key,model_type,num_heads,topk,above_variant",
+    [
+        ("dsv4", _MODEL_TYPE_DSV4, 64, 512, "PREFILL_MG"),
+        ("glm53_nope", _MODEL_TYPE_GLM53_NOPE, 32, 2176, "PREFILL_MG"),
+        ("dots3_swa", _MODEL_TYPE_DOTS3_SWA, 64, 576, "PREFILL_SG"),
+    ],
+)
+def test_plan_crossover_injection(
+    known_crossover, family_key, model_type, num_heads, topk, above_variant
+) -> None:
+    """An injected crossover=8 applies to the family key space: T<=8 decodes,
+    T>8 prefills (MG where instantiated, SG for the SG-only family)."""
     plan_mod, table = known_crossover
-    table["dsv4|64|512"] = 8
+    table[f"{family_key}|{num_heads}|{topk}"] = 8
     plan_mod._plan_memo.clear()
     planned = plan_mod.plan(
         8,
-        64,
-        512,
-        _MODEL_TYPE_DSV4,
+        num_heads,
+        topk,
+        model_type,
         64,
         False,
         plan_mod._PREFILL_IMPL_AUTO,
@@ -419,15 +463,16 @@ def test_plan_honors_crossover(known_crossover) -> None:
     )
     planned = plan_mod.plan(
         16,
-        64,
-        512,
-        _MODEL_TYPE_DSV4,
+        num_heads,
+        topk,
+        model_type,
         64,
         False,
         plan_mod._PREFILL_IMPL_AUTO,
         torch.device("cpu"),
     )
-    assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_MG
+    assert planned is not None
+    assert planned.variant is getattr(plan_mod.KernelVariant, above_variant)
 
 
 def test_plan_crossover_zero_always_prefill(known_crossover) -> None:
@@ -597,37 +642,6 @@ def test_plan_glm53_nope_decode_and_prefill(known_crossover) -> None:
     assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
 
 
-def test_plan_glm53_nope_crossover(known_crossover) -> None:
-    """Injected crossover applies to the glm53_nope key space."""
-    plan_mod, table = known_crossover
-    table["glm53_nope|32|2176"] = 8
-    plan_mod._plan_memo.clear()
-    planned = plan_mod.plan(
-        8,
-        32,
-        2176,
-        _MODEL_TYPE_GLM53_NOPE,
-        64,
-        False,
-        plan_mod._PREFILL_IMPL_AUTO,
-        torch.device("cpu"),
-    )
-    assert (
-        planned is not None and planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
-    )
-    planned = plan_mod.plan(
-        16,
-        32,
-        2176,
-        _MODEL_TYPE_GLM53_NOPE,
-        64,
-        False,
-        plan_mod._PREFILL_IMPL_AUTO,
-        torch.device("cpu"),
-    )
-    assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_MG
-
-
 def test_plan_glm53_nope_swapab(known_crossover) -> None:
     """swapAB serves GLM53_NOPE at topk=2176: auto prefers it at H>=64, and
     forcing it works; an ineligible head count still raises."""
@@ -718,37 +732,6 @@ def test_plan_dots3_swa_decode_and_prefill(known_crossover) -> None:
             plan_mod._PREFILL_IMPL_SWAPAB,
             torch.device("cpu"),
         )
-
-
-def test_plan_dots3_swa_crossover(known_crossover) -> None:
-    """Injected crossover applies to the dots3_swa key space."""
-    plan_mod, table = known_crossover
-    table["dots3_swa|64|576"] = 8
-    plan_mod._plan_memo.clear()
-    planned = plan_mod.plan(
-        8,
-        64,
-        576,
-        _MODEL_TYPE_DOTS3_SWA,
-        64,
-        False,
-        plan_mod._PREFILL_IMPL_AUTO,
-        torch.device("cpu"),
-    )
-    assert (
-        planned is not None and planned.variant is plan_mod.KernelVariant.DECODE_SPLITK
-    )
-    planned = plan_mod.plan(
-        16,
-        64,
-        576,
-        _MODEL_TYPE_DOTS3_SWA,
-        64,
-        False,
-        plan_mod._PREFILL_IMPL_AUTO,
-        torch.device("cpu"),
-    )
-    assert planned is not None and planned.variant is plan_mod.KernelVariant.PREFILL_SG
 
 
 def test_sparse_mla_sm120_wrapper_public_export() -> None:
