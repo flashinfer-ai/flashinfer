@@ -23,7 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 import time
-from typing import Literal
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -474,10 +474,10 @@ class BlackwellGemmRSWorkspace:
         self.config = resolved_config
         self.multicast_team = _select_multicast_team(self.world_size)
         self._destroyed = False
-        self._compiled_gemm = None
-        self._compiled_key = None
-        self._compiled_a_tensor = None
-        self._compiled_b_tensor = None
+        self._compiled_gemm: Any | None = None
+        self._compiled_key: tuple[Any, ...] | None = None
+        self._compiled_a_tensor: Any | None = None
+        self._compiled_b_tensor: Any | None = None
 
         self.c_full = nvshmem.core.tensor((M, N), dtype=dtype)
         self.c_full.zero_()
@@ -788,6 +788,8 @@ def run_blackwell_gemm_rs_with_kernel(
         workspace._compiled_a_tensor = a_tensor
         workspace._compiled_b_tensor = b_tensor
     compiled_gemm = workspace._compiled_gemm
+    if compiled_gemm is None:
+        raise RuntimeError("Blackwell GEMM+RS compilation did not produce a kernel.")
     if profile:
         kernel_start = torch.cuda.Event(enable_timing=True)
         kernel_end = torch.cuda.Event(enable_timing=True)
