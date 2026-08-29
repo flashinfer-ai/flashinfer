@@ -223,6 +223,7 @@ def load_blackwell_bgmv_moe_module(
     dtype: BlackwellBGMVMoEDType,
 ):
     module = gen_blackwell_bgmv_moe_module(hidden_size, dtype).build_and_load()
+    module.configure()
     logger.info(
         "Loaded Blackwell BGMV MoE module for hidden_size=%d, dtype=%s",
         hidden_size,

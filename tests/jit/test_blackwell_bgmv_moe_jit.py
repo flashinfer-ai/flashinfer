@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import re
+
 import pytest
 
 from flashinfer.jit import blackwell_bgmv_moe
@@ -93,7 +95,21 @@ def test_binding_preserves_graph_and_tensor_contracts():
         blackwell_bgmv_moe._get_csrc_dir() / "blackwell_bgmv_moe_binding.cuh"
     ).read_text()
     assert "CheckExactSM100" in binding
+    assert "kShrinkDecodeSmemBytes = 221696" in binding
+    assert "kShrinkPrefillSmemBytes = 36992" in binding
+    assert "cudaDevAttrMaxSharedMemoryPerBlockOptin" in binding
+    assert "cudaFuncAttributeMaxDynamicSharedMemorySize" in binding
     assert "cudaMemsetAsync" in binding
     assert "BLACKWELL_BGMV_MOE_SHRINK_DECODE<<<" in binding
     assert "BLACKWELL_BGMV_MOE_EXPAND_TOKEN_DUAL<<<" in binding
+    assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure" in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run" in binding
+
+    for hidden_size in blackwell_bgmv_moe.BLACKWELL_BGMV_MOE_HIDDEN_SIZES:
+        for dtype in blackwell_bgmv_moe.BLACKWELL_BGMV_MOE_DTYPES:
+            body = (
+                blackwell_bgmv_moe._get_csrc_dir()
+                / blackwell_bgmv_moe._metadata(hidden_size, dtype).body
+            ).read_text()
+            smem_totals = re.findall(r"#define SMEM_TOTAL (\d+)", body)
+            assert smem_totals[:2] == ["221696", "36992"]

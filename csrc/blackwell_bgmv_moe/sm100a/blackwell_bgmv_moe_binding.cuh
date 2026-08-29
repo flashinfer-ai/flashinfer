@@ -81,8 +81,8 @@ constexpr int32_t kHidden = BLACKWELL_BGMV_MOE_HIDDEN;
 constexpr int32_t kRank = 32;
 constexpr int32_t kShrinkThreads = 128;
 constexpr int32_t kShrinkDecodePairsPerBlock = 4;
-constexpr int32_t kShrinkDecodeSmemBytes = 28160;
-constexpr int32_t kShrinkPrefillSmemBytes = 4736;
+constexpr int32_t kShrinkDecodeSmemBytes = 221696;
+constexpr int32_t kShrinkPrefillSmemBytes = 36992;
 constexpr int32_t kExpandSmemBytes = 128;
 
 enum class Schedule : int32_t {
@@ -105,6 +105,25 @@ inline void CheckExactSM100(int32_t device_id) {
             "cudaDeviceGetAttribute(minor)");
   TVM_FFI_ICHECK(major == 10 && minor == 0)
       << "Blackwell BGMV MoE requires exact compute capability 10.0, got " << major << "." << minor;
+}
+
+void Configure() {
+  int32_t device_id = 0;
+  CheckCuda(cudaGetDevice(&device_id), "cudaGetDevice");
+  CheckExactSM100(device_id);
+
+  int32_t max_dynamic_smem = 0;
+  CheckCuda(
+      cudaDeviceGetAttribute(&max_dynamic_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id),
+      "cudaDeviceGetAttribute(max opt-in shared memory)");
+  TVM_FFI_ICHECK(max_dynamic_smem >= kShrinkDecodeSmemBytes)
+      << "Blackwell BGMV MoE decode shrink requires " << kShrinkDecodeSmemBytes
+      << " bytes of dynamic shared memory, but device " << device_id << " supports "
+      << max_dynamic_smem;
+  CheckCuda(
+      cudaFuncSetAttribute(BLACKWELL_BGMV_MOE_SHRINK_DECODE,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkDecodeSmemBytes),
+      "cudaFuncSetAttribute(Blackwell BGMV MoE decode shrink)");
 }
 
 inline void CheckCompact(const TensorView& tensor, const char* name) {
@@ -250,4 +269,5 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
 }  // namespace blackwell_bgmv_moe
 }  // namespace flashinfer
 
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure, flashinfer::blackwell_bgmv_moe::Configure);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::blackwell_bgmv_moe::Run);
