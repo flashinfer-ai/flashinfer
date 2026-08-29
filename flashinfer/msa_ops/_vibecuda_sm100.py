@@ -229,9 +229,7 @@ def _resolve_uniform_seqlen_q(cu_q: torch.Tensor, batch_size: int) -> int:
     with _uniform_q_len_cache_lock:
         if len(_uniform_q_len_cache) >= 64:
             dead_keys = [
-                key
-                for key, value in _uniform_q_len_cache.items()
-                if value[0]() is None
+                key for key, value in _uniform_q_len_cache.items() if value[0]() is None
             ]
             for key in dead_keys:
                 _uniform_q_len_cache.pop(key, None)
@@ -478,9 +476,7 @@ def vibecuda_msa_sparse_attention(
             "the vibecuda MSA backend always right-aligns queries to the KV "
             "sequence (q_offset=None semantics)"
         )
-    if softmax_scale is not None and abs(
-        float(softmax_scale) - 128**-0.5
-    ) > 1e-12:
+    if softmax_scale is not None and abs(float(softmax_scale) - 128**-0.5) > 1e-12:
         raise NotImplementedError(
             "the vibecuda MSA backend uses the fixed head_dim**-0.5 softmax scale"
         )
@@ -494,9 +490,7 @@ def vibecuda_msa_sparse_attention(
         raise ValueError("paged K/V requires seqused_k")
     if cu_seqlens_k is None:
         # derive from seqused_k (paged path kernels only need the lengths).
-        cu_k = torch.zeros(
-            batch_size + 1, dtype=torch.int32, device=q.device
-        )
+        cu_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=q.device)
         cu_k[1:] = seqused_k.to(torch.int32).cumsum(0, dtype=torch.int32)
     else:
         cu_k = cu_seqlens_k
@@ -560,9 +554,7 @@ def vibecuda_msa_sparse_decode_attention(
             "the vibecuda MSA backend always right-aligns queries to the KV "
             "sequence (q_offset=None semantics)"
         )
-    if softmax_scale is not None and abs(
-        float(softmax_scale) - 128**-0.5
-    ) > 1e-12:
+    if softmax_scale is not None and abs(float(softmax_scale) - 128**-0.5) > 1e-12:
         raise NotImplementedError(
             "the vibecuda MSA backend uses the fixed head_dim**-0.5 softmax scale"
         )

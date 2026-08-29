@@ -411,9 +411,7 @@ def _run_worker(args: argparse.Namespace) -> None:
         "software": software,
     }
     if args.worker_backend == BACKEND_BASELINE:
-        result["baseline_revision_proof"] = _baseline_revision_proof(
-            source_root, torch
-        )
+        result["baseline_revision_proof"] = _baseline_revision_proof(source_root, torch)
     args.worker_json.write_text(
         json.dumps(result, indent=2, allow_nan=False) + "\n",
         encoding="utf-8",
@@ -593,9 +591,7 @@ def _run_parent(args: argparse.Namespace) -> None:
             baseline = by_backend[BACKEND_BASELINE]
             speedup = baseline["median_ms"] / candidate["median_ms"]
             if not math.isfinite(speedup) or speedup <= 0.0:
-                raise RuntimeError(
-                    f"invalid speedup for {shape.stable_id}: {speedup}"
-                )
+                raise RuntimeError(f"invalid speedup for {shape.stable_id}: {speedup}")
             row = {
                 "shape": shape.as_public_dict(),
                 "comparison_status": "measured",
@@ -620,9 +616,7 @@ def _run_parent(args: argparse.Namespace) -> None:
             rows.append(row)
             print(json.dumps(row, sort_keys=True, allow_nan=False), flush=True)
 
-    cake_bench._validate_checkout(
-        candidate_root, candidate_sha, "FlashInfer candidate"
-    )
+    cake_bench._validate_checkout(candidate_root, candidate_sha, "FlashInfer candidate")
     cake_bench._validate_checkout(baseline_root, baseline_sha, "FlashInfer baseline")
     _validate_cross_worker_metadata(measured_results)
 

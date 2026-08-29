@@ -28,8 +28,8 @@
 
 #include <cstdint>
 
-#include "tvm_ffi_utils.h"
 #include "msa_vibecuda_common.h"
+#include "tvm_ffi_utils.h"
 
 namespace flashinfer::msa_vibecuda {
 
@@ -57,15 +57,14 @@ inline void CheckDtype(const TensorView& t, const char* name, int code, int bits
 inline void CheckSameCudaDevice(const TensorView& t, const TensorView& reference, const char* name,
                                 const char* reference_name) {
   TVM_FFI_CHECK(t.device().device_id == reference.device().device_id, ValueError)
-      << name << " must be on the same CUDA device as " << reference_name << ": got cuda:"
-      << t.device().device_id << " versus cuda:" << reference.device().device_id;
+      << name << " must be on the same CUDA device as " << reference_name
+      << ": got cuda:" << t.device().device_id << " versus cuda:" << reference.device().device_id;
 }
 
 inline void CheckDevice(int32_t device_id) {
   int major = 0;
   int minor = 0;
-  cudaError_t status =
-      cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
+  cudaError_t status = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "cudaDeviceGetAttribute(major) failed: " << cudaGetErrorString(status);
   status = cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id);
@@ -92,10 +91,9 @@ inline int64_t G4WorkspaceInts(int64_t nbuckets, int64_t hn, int64_t topk, int64
 // Dummy 1-element tensors are accepted for every scratch argument the
 // selected route does not consume.
 void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_out,
-         TensorView arg_q2k, TensorView arg_cu_q,
-         TensorView arg_cu_k, TensorView arg_page_table, TensorView arg_seqused_k,
-         TensorView arg_ws_int, TensorView arg_ws_float, int64_t arg_kv_kind,
-         int64_t arg_seqlen_q, int64_t arg_causal, int64_t arg_ws_int_need,
+         TensorView arg_q2k, TensorView arg_cu_q, TensorView arg_cu_k, TensorView arg_page_table,
+         TensorView arg_seqused_k, TensorView arg_ws_int, TensorView arg_ws_float,
+         int64_t arg_kv_kind, int64_t arg_seqlen_q, int64_t arg_causal, int64_t arg_ws_int_need,
          int64_t arg_ws_float_need, int64_t cuda_stream) {
   TVM_FFI_CHECK(cuda_stream >= 0, ValueError) << "cuda_stream must be non-negative";
   ffi::CUDADeviceGuard device_guard(arg_q.device().device_id);
@@ -162,9 +160,9 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
       << "num_q_heads must be a positive multiple of num_kv_heads";
   const int group = num_q_heads / num_kv_heads;
   TVM_FFI_CHECK(group >= 1 && group <= 16, ValueError) << "group size must be in [1, 16]";
-  TVM_FFI_CHECK(arg_q2k.ndim() == 3 && arg_q2k.size(0) == num_kv_heads &&
-                    arg_q2k.size(1) == total_q,
-                ValueError)
+  TVM_FFI_CHECK(
+      arg_q2k.ndim() == 3 && arg_q2k.size(0) == num_kv_heads && arg_q2k.size(1) == total_q,
+      ValueError)
       << "q2k_indices must be (num_kv_heads, total_q, topk)";
   TVM_FFI_CHECK(arg_cu_k.size(0) == nbatch + 1, ValueError)
       << "cu_seqlens_k must have batch + 1 entries";
@@ -248,12 +246,10 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
     const int64_t nbuckets = (int64_t)num_kv_heads * nbatch * max_pages;
     const int64_t rows_bound = hn * topk + nbuckets * 32;
     const int64_t tiles_bound = hn * topk / 32 + nbuckets;
-    const int64_t need_i =
-        G4WorkspaceInts(nbuckets, hn, topk, rows_bound, tiles_bound);
+    const int64_t need_i = G4WorkspaceInts(nbuckets, hn, topk, rows_bound, tiles_bound);
     const int64_t need_f = slots * 64 + slots * 2;
     TVM_FFI_CHECK(need_i <= arg_ws_int_need, ValueError)
-        << "g4 int workspace too small: need " << need_i << ", plan returned "
-        << arg_ws_int_need;
+        << "g4 int workspace too small: need " << need_i << ", plan returned " << arg_ws_int_need;
     TVM_FFI_CHECK(need_f <= arg_ws_float_need, ValueError)
         << "g4 float workspace too small: need " << need_f << ", plan returned "
         << arg_ws_float_need;
@@ -278,8 +274,8 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
   kv.s0 = arg_k.stride(0);
   kv.s1 = arg_k.stride(1);
   kv.s2 = paged ? arg_k.stride(2) : 0;
-  msa_vibecuda_core::core_forward(p, kv, arg_k.data_ptr(), arg_v.data_ptr(), is_bf16,
-                                  kv_dtype_code, paged, stream);
+  msa_vibecuda_core::core_forward(p, kv, arg_k.data_ptr(), arg_v.data_ptr(), is_bf16, kv_dtype_code,
+                                  paged, stream);
 }
 
 }  // namespace flashinfer::msa_vibecuda

@@ -30,14 +30,13 @@
 #include <stdexcept>
 #include <string>
 
-#define MSAV_CHECK(cond, ...)                                   \
-  do {                                                          \
-    if (!(cond)) {                                              \
-      char msav_msg_[512];                                      \
-      snprintf(msav_msg_, sizeof(msav_msg_), __VA_ARGS__);      \
-      throw std::runtime_error(                                 \
-          std::string("msa_vibecuda: ") + msav_msg_);           \
-    }                                                           \
+#define MSAV_CHECK(cond, ...)                                              \
+  do {                                                                     \
+    if (!(cond)) {                                                         \
+      char msav_msg_[512];                                                 \
+      snprintf(msav_msg_, sizeof(msav_msg_), __VA_ARGS__);                 \
+      throw std::runtime_error(std::string("msa_vibecuda: ") + msav_msg_); \
+    }                                                                      \
   } while (0)
 
 namespace msa_vibecuda {
@@ -94,28 +93,28 @@ bool umma_g16_eligible(int group, int seqlen_q, int topk, int kv_dtype_code, boo
 
 // q_is_bf16 selects the BF16 or FP16 template instantiation. This route is
 // flat-only: k/v are [total_k, num_kv_heads, 128] dense tensors.
-void umma_g16_forward(const void* q, bool q_is_bf16, const void* k, const void* v,
-                      const int* q2k, const int* cu_q, const int* cu_k, void* out, int total_q,
-                      int total_k, int num_q_heads, int num_kv_heads, int topk, int nbatch,
-                      bool causal, cudaStream_t stream);
+void umma_g16_forward(const void* q, bool q_is_bf16, const void* k, const void* v, const int* q2k,
+                      const int* cu_q, const int* cu_k, void* out, int total_q, int total_k,
+                      int num_q_heads, int num_kv_heads, int topk, int nbatch, bool causal,
+                      cudaStream_t stream);
 
 }  // namespace msa_umma_g16
 
 // Round-24 block-bucketed UMMA/TMEM path (group_size==4, paged KV only).
 namespace msa_umma_g4 {
 
-bool umma_g4_eligible(int group, bool paged, int kv_dtype_code, int topk, int nbatch,
-                      int max_pages, int num_kv_heads, int total_q);
+bool umma_g4_eligible(int group, bool paged, int kv_dtype_code, int topk, int nbatch, int max_pages,
+                      int num_kv_heads, int total_q);
 
 // Scratch layout (ints, then floats) is defined by the routing math in
 // umma_g4_forward; the caller must provide at least
 // msa_vibecuda_g4_workspace_ints/floats elements (see the Python wrapper,
 // which mirrors those exact formulas).
-void umma_g4_forward(const void* q, bool q_is_bf16, const void* k, const void* v,
-                     const int* q2k, const int* cu_q, const int* cu_k, const int* page_table,
-                     void* out, int total_q, int num_q_heads, int num_kv_heads, int topk,
-                     int nbatch, int num_pages, int max_pages, long pt_stride, long q_tok,
-                     long q_head, long o_tok, long o_head, int* ws_int, float* ws_float,
-                     int seqlen_q, bool causal, cudaStream_t stream);
+void umma_g4_forward(const void* q, bool q_is_bf16, const void* k, const void* v, const int* q2k,
+                     const int* cu_q, const int* cu_k, const int* page_table, void* out,
+                     int total_q, int num_q_heads, int num_kv_heads, int topk, int nbatch,
+                     int num_pages, int max_pages, long pt_stride, long q_tok, long q_head,
+                     long o_tok, long o_head, int* ws_int, float* ws_float, int seqlen_q,
+                     bool causal, cudaStream_t stream);
 
 }  // namespace msa_umma_g4

@@ -10,20 +10,20 @@
 // ring (3 x 32KB), q_full[2], s_full[2], p_full[2] + p_full_tail[2],
 // corr_sig[2], corr_done[2], o_full[2], q2k_full, tmem_dealloc bar.
 #include <cuda.h>
-#include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <math_constants.h>
+#include <cuda_runtime.h>
 #include <math.h>
+#include <math_constants.h>
 #include <stdint.h>
 
 #include "msa_vibecuda_common.h"
 
 namespace msa_umma_g16 {
 
-constexpr int kTile = 16;      // queries per CTA tile
-constexpr int kGroup = 16;     // q heads per kv head
-constexpr int kRows = 256;     // 16 queries x 16 heads per tile
+constexpr int kTile = 16;   // queries per CTA tile
+constexpr int kGroup = 16;  // q heads per kv head
+constexpr int kRows = 256;  // 16 queries x 16 heads per tile
 constexpr int kHead = 128;
 constexpr int kThreads = 512;
 constexpr int kKVSlots = 3;
@@ -36,13 +36,13 @@ constexpr int kQ2KOff = 168960;
 
 // ---- flat params (flat KV only; paged stays on the HMMA path) ----
 struct G16Params {
-  const void* q;      // [total_q, num_q_heads, 128]
-  const void* k;      // [total_k, num_kv_heads, 128]
+  const void* q;  // [total_q, num_q_heads, 128]
+  const void* k;  // [total_k, num_kv_heads, 128]
   const void* v;
-  const int* q2k;     // [num_kv_heads, total_q, topk]
-  const int* cu_q;    // [nbatch+1]
-  const int* cu_k;    // [nbatch+1]
-  void* out;          // [total_q, num_q_heads, 128]
+  const int* q2k;   // [num_kv_heads, total_q, topk]
+  const int* cu_q;  // [nbatch+1]
+  const int* cu_k;  // [nbatch+1]
+  void* out;        // [total_q, num_q_heads, 128]
   int total_q, total_k, num_q_heads, num_kv_heads, topk, nbatch;
   int causal;
   float scale_log2e;  // head_dim^-0.5 * log2(e)
@@ -62,9 +62,7 @@ __device__ __forceinline__ bool elect_one() {
   return pred != 0;
 }
 
-__device__ __forceinline__ int warp_uni(int x) {
-  return __shfl_sync(0xFFFFFFFFu, x, 0);
-}
+__device__ __forceinline__ int warp_uni(int x) { return __shfl_sync(0xFFFFFFFFu, x, 0); }
 
 __device__ __forceinline__ void mbar_init(int addr, uint32_t count) {
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(addr), "r"(count));
@@ -87,26 +85,26 @@ __device__ __forceinline__ void mbar_wait(int addr, uint32_t parity) {
       "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1;\n\t"
       "@P1 bra DONE%=;\n\t"
       "bra LAB_WAIT%=;\n"
-      "DONE%=:\n\t}"
-      ::"r"(addr), "r"(parity)
+      "DONE%=:\n\t}" ::"r"(addr),
+      "r"(parity)
       : "memory");
 }
 
 // 4D TMA load; dst must be a completed expect_tx mbarrier.
-__device__ __forceinline__ void tma_load_4d(int dst, const CUtensorMap* map, int c0, int c1,
-                                            int c2, int c3, int mbar) {
+__device__ __forceinline__ void tma_load_4d(int dst, const CUtensorMap* map, int c0, int c1, int c2,
+                                            int c3, int mbar) {
   asm volatile(
       "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3, %4, %5}], [%6];"
-      ::"r"(dst), "l"(map), "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(mbar)
+      " [%0], [%1, {%2, %3, %4, %5}], [%6];" ::"r"(dst),
+      "l"(map), "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(mbar)
       : "memory");
 }
 
 __device__ __forceinline__ void tc_commit(int mbar) {
   asm volatile(
       "{\n\t.reg .pred leader;\n\telect.sync _|leader, 0xFFFFFFFF;\n\t"
-      "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n\t}"
-      ::"r"(mbar));
+      "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n\t}" ::
+          "r"(mbar));
 }
 
 __device__ __forceinline__ void tc_alloc(int smem_dst, int ncols) {
@@ -156,12 +154,12 @@ __device__ __forceinline__ void tmem_st32(int addr, const uint32_t* s) {
   asm volatile(
       "tcgen05.st.sync.aligned.32x32b.x32.b32 [%0], "
       "{%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,"
-      "%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,%32};"
-      ::"r"(addr), "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(s[4]), "r"(s[5]), "r"(s[6]),
-        "r"(s[7]), "r"(s[8]), "r"(s[9]), "r"(s[10]), "r"(s[11]), "r"(s[12]), "r"(s[13]),
-        "r"(s[14]), "r"(s[15]), "r"(s[16]), "r"(s[17]), "r"(s[18]), "r"(s[19]), "r"(s[20]),
-        "r"(s[21]), "r"(s[22]), "r"(s[23]), "r"(s[24]), "r"(s[25]), "r"(s[26]), "r"(s[27]),
-        "r"(s[28]), "r"(s[29]), "r"(s[30]), "r"(s[31]));
+      "%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,%32};" ::"r"(addr),
+      "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(s[4]), "r"(s[5]), "r"(s[6]), "r"(s[7]),
+      "r"(s[8]), "r"(s[9]), "r"(s[10]), "r"(s[11]), "r"(s[12]), "r"(s[13]), "r"(s[14]), "r"(s[15]),
+      "r"(s[16]), "r"(s[17]), "r"(s[18]), "r"(s[19]), "r"(s[20]), "r"(s[21]), "r"(s[22]),
+      "r"(s[23]), "r"(s[24]), "r"(s[25]), "r"(s[26]), "r"(s[27]), "r"(s[28]), "r"(s[29]),
+      "r"(s[30]), "r"(s[31]));
 }
 
 __device__ __forceinline__ void tmem_ld16(float* d, int addr) {
@@ -177,19 +175,17 @@ __device__ __forceinline__ void tmem_ld16(float* d, int addr) {
 __device__ __forceinline__ void tmem_st16f(int addr, const float* s) {
   asm volatile(
       "tcgen05.st.sync.aligned.32x32b.x16.b32 [%0], "
-      "{%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16};"
-      ::"r"(addr), "f"(s[0]), "f"(s[1]), "f"(s[2]), "f"(s[3]), "f"(s[4]), "f"(s[5]), "f"(s[6]),
-        "f"(s[7]), "f"(s[8]), "f"(s[9]), "f"(s[10]), "f"(s[11]), "f"(s[12]), "f"(s[13]),
-        "f"(s[14]), "f"(s[15]));
+      "{%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16};" ::"r"(addr),
+      "f"(s[0]), "f"(s[1]), "f"(s[2]), "f"(s[3]), "f"(s[4]), "f"(s[5]), "f"(s[6]), "f"(s[7]),
+      "f"(s[8]), "f"(s[9]), "f"(s[10]), "f"(s[11]), "f"(s[12]), "f"(s[13]), "f"(s[14]), "f"(s[15]));
 }
 
 __device__ __forceinline__ void tmem_st16u(int addr, const uint32_t* s) {
   asm volatile(
       "tcgen05.st.sync.aligned.32x32b.x16.b32 [%0], "
-      "{%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16};"
-      ::"r"(addr), "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(s[4]), "r"(s[5]), "r"(s[6]),
-        "r"(s[7]), "r"(s[8]), "r"(s[9]), "r"(s[10]), "r"(s[11]), "r"(s[12]), "r"(s[13]),
-        "r"(s[14]), "r"(s[15])
+      "{%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16};" ::"r"(addr),
+      "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(s[4]), "r"(s[5]), "r"(s[6]), "r"(s[7]),
+      "r"(s[8]), "r"(s[9]), "r"(s[10]), "r"(s[11]), "r"(s[12]), "r"(s[13]), "r"(s[14]), "r"(s[15])
       : "memory");
 }
 
@@ -253,8 +249,8 @@ constexpr uint32_t kDescHi = 0x40004040u;
 
 // QK^T for one 128-row stage: A = Q smem desc (a_lo), B = K smem desc (b_lo).
 // 8 k-steps of 16 dims; desc lo walks +2,2,2,1018,2,2,2 (16B units).
-__device__ __forceinline__ void mma_qk_group(int a_lo_in, int b_lo_in, int tmem_d,
-                                             uint32_t idesc, int first) {
+__device__ __forceinline__ void mma_qk_group(int a_lo_in, int b_lo_in, int tmem_d, uint32_t idesc,
+                                             int first) {
   asm volatile(
       "{\n\t"
       ".reg .pred leader, p0, p1;\n\t"
@@ -306,8 +302,8 @@ __device__ __forceinline__ void mma_qk_group(int a_lo_in, int b_lo_in, int tmem_
       "mov.b64 da, {alo, adhi};\n\t"
       "mov.b64 db, {blo, bdhi};\n\t"
       "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, idesc, p1;\n\t"
-      "}\n"
-      ::"r"(a_lo_in), "r"(b_lo_in), "r"(tmem_d), "r"(first), "r"(kDescHi), "r"(idesc));
+      "}\n" ::"r"(a_lo_in),
+      "r"(b_lo_in), "r"(tmem_d), "r"(first), "r"(kDescHi), "r"(idesc));
 }
 
 // P*V: A = P in TMEM (tmem_a, 64 cells = 128 packed tokens), B = V smem desc.
@@ -342,8 +338,8 @@ __device__ __forceinline__ void mma_pv_head(int v_lo_in, int tmem_d, int tmem_a,
       "add.u32 blo, blo, 128;\n\t"
       "mov.b64 db, {blo, bdhi};\n\t"
       "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%3 + 40], db, idesc, p1;\n\t"
-      "}\n"
-      ::"r"(tmem_d), "r"(v_lo_in), "r"(0), "r"(tmem_a), "r"(first), "r"(kDescHi), "r"(idesc)
+      "}\n" ::"r"(tmem_d),
+      "r"(v_lo_in), "r"(0), "r"(tmem_a), "r"(first), "r"(kDescHi), "r"(idesc)
       : "memory");
 }
 
@@ -364,8 +360,8 @@ __device__ __forceinline__ void mma_pv_tail(int v_lo_in, int tmem_d, int tmem_a,
       "add.u32 blo, blo, 128;\n\t"
       "mov.b64 db, {blo, bdhi};\n\t"
       "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%3 + 56], db, idesc, p1;\n\t"
-      "}\n"
-      ::"r"(tmem_d), "r"(v_lo_in), "r"(0), "r"(tmem_a), "r"(kDescHi), "r"(idesc)
+      "}\n" ::"r"(tmem_d),
+      "r"(v_lo_in), "r"(0), "r"(tmem_a), "r"(kDescHi), "r"(idesc)
       : "memory");
 }
 
@@ -388,7 +384,8 @@ __device__ __forceinline__ uint32_t g16_cluster_rank() {
 }
 
 struct TileMeta {
-  int batch, q_local_base, q_valid, query_base, k_start, kv_len, qoff, num_n_blocks, kv_head, q_head;
+  int batch, q_local_base, q_valid, query_base, k_start, kv_len, qoff, num_n_blocks, kv_head,
+      q_head;
 };
 
 __device__ __forceinline__ TileMeta compute_meta(const G16Params& p) {
@@ -636,8 +633,7 @@ __global__ void __launch_bounds__(512, 1)
       const int p_base = taddr + sbase + 64 + trow_base;
       // warp-converged vote BEFORE the 16-lane-group divergence below (a
       // full-mask vote inside the diverged branch deadlocks).
-      const bool warp_partial =
-          __any_sync(0xFFFFFFFFu, valid_cols > 0 && valid_cols < 128);
+      const bool warp_partial = __any_sync(0xFFFFFFFFu, valid_cols > 0 && valid_cols < 128);
       const float score_bias = -row_basis_scaled;
       const uint64_t scale2 = pack2(scale, scale);
       const uint64_t bias2 = pack2(score_bias, score_bias);
@@ -877,7 +873,10 @@ __global__ void __launch_bounds__(512, 1)
     tc_commit(b_sfull + 8);
     tc_commit(b_kvempty + kv_stage * 8);
     kv_stage++;
-    if (kv_stage == 3) { kv_stage = 0; kv_phase ^= 1; }
+    if (kv_stage == 3) {
+      kv_stage = 0;
+      kv_phase ^= 1;
+    }
     int first_pv = 1;
     unsigned ph_p0 = 0, ph_pt0 = 0, ph_p1 = 0, ph_pt1 = 0;
     unsigned ph_r0 = 0, ph_r1 = 0;
@@ -885,7 +884,10 @@ __global__ void __launch_bounds__(512, 1)
     for (int it = 0; it < nb_r - 1; it++) {
       const unsigned vs = kv_stage, vp = kv_phase;
       kv_stage++;
-      if (kv_stage == 3) { kv_stage = 0; kv_phase ^= 1; }
+      if (kv_stage == 3) {
+        kv_stage = 0;
+        kv_phase ^= 1;
+      }
       mbar_wait(b_kvfull + vs * 8, vp);
       mbar_wait(b_pfull + 0, ph_p0);
       ph_p0 ^= 1;
@@ -899,7 +901,10 @@ __global__ void __launch_bounds__(512, 1)
       tc_commit(b_pgate + 0);
       const unsigned ks = kv_stage, kp = kv_phase;
       kv_stage++;
-      if (kv_stage == 3) { kv_stage = 0; kv_phase ^= 1; }
+      if (kv_stage == 3) {
+        kv_stage = 0;
+        kv_phase ^= 1;
+      }
       mbar_wait(b_kvfull + ks * 8, kp);
       kb_lo = ring_lo + ks * 2048;
       mma_qk_group(q0_lo, kb_lo, taddr + 0, idesc_qk, 0);
@@ -998,7 +1003,10 @@ __global__ void __launch_bounds__(512, 1)
         tma_load_4d(dst + 24576, ktm, 0, token_base + 64, 1, m.kv_head, b_kvfull + stage * 8);
       }
       stage++;
-      if (stage == 3) { stage = 0; empty_phase ^= 1; }
+      if (stage == 3) {
+        stage = 0;
+        empty_phase ^= 1;
+      }
       mbar_wait(b_kvempty + stage * 8, empty_phase);
       if (elect_one()) {
         const int dst = smem + kRingOff + stage * 32768;
@@ -1009,7 +1017,10 @@ __global__ void __launch_bounds__(512, 1)
         tma_load_4d(dst + 24576, vtm, 0, token_base + 64, 1, m.kv_head, b_kvfull + stage * 8);
       }
       stage++;
-      if (stage == 3) { stage = 0; empty_phase ^= 1; }
+      if (stage == 3) {
+        stage = 0;
+        empty_phase ^= 1;
+      }
     }
     return;
   }
@@ -1061,10 +1072,10 @@ static void launch_g16(const G16Params& p, const CUtensorMap& qm, const CUtensor
   msa_g16_umma_kernel<QT, IS_BF16><<<grid, kThreads, smem_bytes, stream>>>(p, qm, km, vm);
 }
 
-void umma_g16_forward(const void* q, bool q_is_bf16, const void* k, const void* v,
-                      const int* q2k, const int* cu_q, const int* cu_k, void* out, int total_q,
-                      int total_k, int num_q_heads, int num_kv_heads, int topk, int nbatch,
-                      bool causal, cudaStream_t stream) {
+void umma_g16_forward(const void* q, bool q_is_bf16, const void* k, const void* v, const int* q2k,
+                      const int* cu_q, const int* cu_k, void* out, int total_q, int total_k,
+                      int num_q_heads, int num_kv_heads, int topk, int nbatch, bool causal,
+                      cudaStream_t stream) {
   G16Params p;
   p.q = q;
   p.k = k;
@@ -1081,8 +1092,8 @@ void umma_g16_forward(const void* q, bool q_is_bf16, const void* k, const void* 
   p.nbatch = nbatch;
   p.causal = causal ? 1 : 0;
   p.scale_log2e = (float)(0.08838834764831845 * M_LOG2E);  // 128^-0.5 * log2(e)
-  const CUtensorMapDataType dt = q_is_bf16 ? CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
-                                           : CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+  const CUtensorMapDataType dt =
+      q_is_bf16 ? CU_TENSOR_MAP_DATA_TYPE_BFLOAT16 : CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
   CUtensorMap qm = encode_q_map(p.q, p.total_q, p.num_q_heads, dt);
   CUtensorMap km = encode_kv_map(p.k, p.total_k, p.num_kv_heads, dt);
   CUtensorMap vm = encode_kv_map(p.v, p.total_k, p.num_kv_heads, dt);
@@ -1096,10 +1107,10 @@ void umma_g16_forward(const void* q, bool q_is_bf16, const void* k, const void* 
 
 // Flat-only UMMA route: g16 with dense bf16/fp16 KV, enough queries per CTA
 // tile, and a topk range whose q2k smem slice fits the 227 KB budget.
-bool umma_g16_eligible(int group, int seqlen_q, int topk, int kv_dtype_code,
-                       bool paged, bool causal_supported) {
-  return group == kGroup && seqlen_q >= kTile && !paged && kv_dtype_code != 2 &&
-         topk >= 12 && topk <= 64 && (topk % 4) == 0 && causal_supported;
+bool umma_g16_eligible(int group, int seqlen_q, int topk, int kv_dtype_code, bool paged,
+                       bool causal_supported) {
+  return group == kGroup && seqlen_q >= kTile && !paged && kv_dtype_code != 2 && topk >= 12 &&
+         topk <= 64 && (topk % 4) == 0 && causal_supported;
 }
 
 }  // namespace msa_umma_g16

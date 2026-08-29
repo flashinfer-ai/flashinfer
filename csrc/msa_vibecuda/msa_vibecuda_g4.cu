@@ -13,54 +13,55 @@
 // (M128 stages, TMEM S/P/O layout, descriptor walks) verbatim; the KV slab
 // layout matches the baseline paged m128 kernel: [elhalf 16KB][tokhalf 8KB]
 // [64 tok rows x 128B] with SWIZZLE_128B.
+#include <cooperative_groups.h>
 #include <cuda.h>
-#include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include <cooperative_groups.h>
-#include <math_constants.h>
+#include <cuda_runtime.h>
 #include <math.h>
+#include <math_constants.h>
 #include <stdint.h>
+
 #include <cstdlib>
 
 #include "msa_vibecuda_common.h"
 
 namespace msa_umma_g4 {
 
-constexpr int kGroup = 4;      // q heads per kv head (structural gate)
-constexpr int kQTile = 32;     // queries per routing tile (32 x 4 heads = 128 rows);
-                               // the dormant 512-thread kernel assumed two such
-                               // tiles per CTA and must not be dispatched now
+constexpr int kGroup = 4;   // q heads per kv head (structural gate)
+constexpr int kQTile = 32;  // queries per routing tile (32 x 4 heads = 128 rows);
+                            // the dormant 512-thread kernel assumed two such
+                            // tiles per CTA and must not be dispatched now
 constexpr int kHead = 128;
 constexpr int kThreads = 512;
-constexpr int kMaxTopk = 8;    // routing arrays + slot-rank packing budget
+constexpr int kMaxTopk = 8;  // routing arrays + slot-rank packing budget
 
 // ---- smem map (dynamic; offsets must stay 1024-aligned for TMA/UMMA) --
-constexpr int kBarBytes = 256;        // mbarriers + tmem_hold at [0, 256)
-constexpr int kMlOff = 1024;          // ml_m[256] | ml_l[256] floats = 2KB
-constexpr int kRowsOff = 3072;        // rown[64] | rowrank[64] | rowvcol[64] = 768B
-constexpr int kQ0Off = 4096;          // 32 KB stage 0
-constexpr int kQ1Off = 36864;         // 32 KB stage 1
-constexpr int kKOff = 69632;          // 32 KB K slab stage 0
-constexpr int kVOff = 102400;         // 32 KB V slab stage 0
-constexpr int kK1Off = 135168;        // 32 KB K slab stage 1 (paired chunk)
-constexpr int kV1Off = 167936;        // 32 KB V slab stage 1 (paired chunk)
+constexpr int kBarBytes = 256;  // mbarriers + tmem_hold at [0, 256)
+constexpr int kMlOff = 1024;    // ml_m[256] | ml_l[256] floats = 2KB
+constexpr int kRowsOff = 3072;  // rown[64] | rowrank[64] | rowvcol[64] = 768B
+constexpr int kQ0Off = 4096;    // 32 KB stage 0
+constexpr int kQ1Off = 36864;   // 32 KB stage 1
+constexpr int kKOff = 69632;    // 32 KB K slab stage 0
+constexpr int kVOff = 102400;   // 32 KB V slab stage 0
+constexpr int kK1Off = 135168;  // 32 KB K slab stage 1 (paired chunk)
+constexpr int kV1Off = 167936;  // 32 KB V slab stage 1 (paired chunk)
 constexpr int kSmemTotal = 200704;
 
 // mbarrier byte offsets inside the [0, kBarBytes) region
-constexpr int kB_qfull = 0;     // 2
-constexpr int kB_kvfull = 16;   // 2 (K, V) stage 0
-constexpr int kB_sfull = 32;    // 2
-constexpr int kB_pfull = 48;    // 2
-constexpr int kB_ptail = 64;    // 2
-constexpr int kB_ofull = 80;    // 2
-constexpr int kB_dealloc = 96;  // 1
-constexpr int kB_kv2full = 112; // 2 (K, V) stage 1
+constexpr int kB_qfull = 0;      // 2
+constexpr int kB_kvfull = 16;    // 2 (K, V) stage 0
+constexpr int kB_sfull = 32;     // 2
+constexpr int kB_pfull = 48;     // 2
+constexpr int kB_ptail = 64;     // 2
+constexpr int kB_ofull = 80;     // 2
+constexpr int kB_dealloc = 96;   // 1
+constexpr int kB_kv2full = 112;  // 2 (K, V) stage 1
 constexpr int kTmemHold = 192;
 
 struct G4Params {
-  const void* q;          // [total_q, Hq, 128]
-  const void* k;          // paged: [pages, Hkv, 128, 128]
+  const void* q;  // [total_q, Hq, 128]
+  const void* k;  // paged: [pages, Hkv, 128, 128]
   const void* v;
   const int* q2k;         // [Hkv, total_q, topk]
   const int* cu_q;        // [nbatch+1]
@@ -103,9 +104,7 @@ __device__ __forceinline__ bool elect_one() {
   return pred != 0;
 }
 
-__device__ __forceinline__ int warp_uni(int x) {
-  return __shfl_sync(0xFFFFFFFFu, x, 0);
-}
+__device__ __forceinline__ int warp_uni(int x) { return __shfl_sync(0xFFFFFFFFu, x, 0); }
 
 __device__ __forceinline__ void mbar_init(int addr, uint32_t count) {
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(addr), "r"(count));
@@ -128,8 +127,8 @@ __device__ __forceinline__ void mbar_wait(int addr, uint32_t parity) {
       "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [%0], %1;\n\t"
       "@P1 bra DONE%=;\n\t"
       "bra LAB_WAIT%=;\n"
-      "DONE%=:\n\t}"
-      ::"r"(addr), "r"(parity)
+      "DONE%=:\n\t}" ::"r"(addr),
+      "r"(parity)
       : "memory");
 }
 
@@ -137,9 +136,7 @@ __device__ __forceinline__ void cp16(uint32_t dst, const void* src) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst), "l"(src));
 }
 
-__device__ __forceinline__ void cp_commit() {
-  asm volatile("cp.async.commit_group;\n");
-}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
 
 template <int N>
 __device__ __forceinline__ void cp_wait() {
@@ -147,20 +144,20 @@ __device__ __forceinline__ void cp_wait() {
 }
 
 // 4D TMA load (paged KV); dst mbar gets the transaction bytes.
-__device__ __forceinline__ void tma_load_4d(int dst, const CUtensorMap* map, int c0, int c1,
-                                            int c2, int c3, int mbar) {
+__device__ __forceinline__ void tma_load_4d(int dst, const CUtensorMap* map, int c0, int c1, int c2,
+                                            int c3, int mbar) {
   asm volatile(
       "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3, %4, %5}], [%6];"
-      ::"r"(dst), "l"(map), "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(mbar)
+      " [%0], [%1, {%2, %3, %4, %5}], [%6];" ::"r"(dst),
+      "l"(map), "r"(c0), "r"(c1), "r"(c2), "r"(c3), "r"(mbar)
       : "memory");
 }
 
 __device__ __forceinline__ void tc_commit(int mbar) {
   asm volatile(
       "{\n\t.reg .pred leader;\n\telect.sync _|leader, 0xFFFFFFFF;\n\t"
-      "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n\t}"
-      ::"r"(mbar));
+      "@leader tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64 [%0];\n\t}" ::
+          "r"(mbar));
 }
 
 __device__ __forceinline__ void tc_alloc(int smem_dst, int ncols) {
@@ -218,22 +215,21 @@ __device__ __forceinline__ void tmem_st32(int addr, const uint32_t* s) {
   asm volatile(
       "tcgen05.st.sync.aligned.32x32b.x32.b32 [%0], "
       "{%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16,"
-      "%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,%32};"
-      ::"r"(addr), "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(s[4]), "r"(s[5]), "r"(s[6]),
-        "r"(s[7]), "r"(s[8]), "r"(s[9]), "r"(s[10]), "r"(s[11]), "r"(s[12]), "r"(s[13]),
-        "r"(s[14]), "r"(s[15]), "r"(s[16]), "r"(s[17]), "r"(s[18]), "r"(s[19]), "r"(s[20]),
-        "r"(s[21]), "r"(s[22]), "r"(s[23]), "r"(s[24]), "r"(s[25]), "r"(s[26]), "r"(s[27]),
-        "r"(s[28]), "r"(s[29]), "r"(s[30]), "r"(s[31])
+      "%17,%18,%19,%20,%21,%22,%23,%24,%25,%26,%27,%28,%29,%30,%31,%32};" ::"r"(addr),
+      "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(s[4]), "r"(s[5]), "r"(s[6]), "r"(s[7]),
+      "r"(s[8]), "r"(s[9]), "r"(s[10]), "r"(s[11]), "r"(s[12]), "r"(s[13]), "r"(s[14]), "r"(s[15]),
+      "r"(s[16]), "r"(s[17]), "r"(s[18]), "r"(s[19]), "r"(s[20]), "r"(s[21]), "r"(s[22]),
+      "r"(s[23]), "r"(s[24]), "r"(s[25]), "r"(s[26]), "r"(s[27]), "r"(s[28]), "r"(s[29]),
+      "r"(s[30]), "r"(s[31])
       : "memory");
 }
 
 __device__ __forceinline__ void tmem_st16u(int addr, const uint32_t* s) {
   asm volatile(
       "tcgen05.st.sync.aligned.32x32b.x16.b32 [%0], "
-      "{%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16};"
-      ::"r"(addr), "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(s[4]), "r"(s[5]), "r"(s[6]),
-        "r"(s[7]), "r"(s[8]), "r"(s[9]), "r"(s[10]), "r"(s[11]), "r"(s[12]), "r"(s[13]),
-        "r"(s[14]), "r"(s[15])
+      "{%1,%2,%3,%4,%5,%6,%7,%8,%9,%10,%11,%12,%13,%14,%15,%16};" ::"r"(addr),
+      "r"(s[0]), "r"(s[1]), "r"(s[2]), "r"(s[3]), "r"(s[4]), "r"(s[5]), "r"(s[6]), "r"(s[7]),
+      "r"(s[8]), "r"(s[9]), "r"(s[10]), "r"(s[11]), "r"(s[12]), "r"(s[13]), "r"(s[14]), "r"(s[15])
       : "memory");
 }
 
@@ -275,8 +271,8 @@ constexpr uint32_t kIdescQK = 136316048u;
 constexpr uint32_t kIdescPV = 136381584u;
 constexpr uint32_t kDescHi = 0x40004040u;
 
-__device__ __forceinline__ void mma_qk_group(int a_lo_in, int b_lo_in, int tmem_d,
-                                             uint32_t idesc, int first) {
+__device__ __forceinline__ void mma_qk_group(int a_lo_in, int b_lo_in, int tmem_d, uint32_t idesc,
+                                             int first) {
   asm volatile(
       "{\n\t"
       ".reg .pred leader, p0, p1;\n\t"
@@ -328,8 +324,8 @@ __device__ __forceinline__ void mma_qk_group(int a_lo_in, int b_lo_in, int tmem_
       "mov.b64 da, {alo, adhi};\n\t"
       "mov.b64 db, {blo, bdhi};\n\t"
       "@leader tcgen05.mma.cta_group::1.kind::f16 [%2], da, db, idesc, p1;\n\t"
-      "}\n"
-      ::"r"(a_lo_in), "r"(b_lo_in), "r"(tmem_d), "r"(first), "r"(kDescHi), "r"(idesc));
+      "}\n" ::"r"(a_lo_in),
+      "r"(b_lo_in), "r"(tmem_d), "r"(first), "r"(kDescHi), "r"(idesc));
 }
 
 __device__ __forceinline__ void mma_pv_head(int v_lo_in, int tmem_d, int tmem_a, uint32_t idesc,
@@ -362,8 +358,8 @@ __device__ __forceinline__ void mma_pv_head(int v_lo_in, int tmem_d, int tmem_a,
       "add.u32 blo, blo, 128;\n\t"
       "mov.b64 db, {blo, bdhi};\n\t"
       "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%3 + 40], db, idesc, p1;\n\t"
-      "}\n"
-      ::"r"(tmem_d), "r"(v_lo_in), "r"(0), "r"(tmem_a), "r"(first), "r"(kDescHi), "r"(idesc)
+      "}\n" ::"r"(tmem_d),
+      "r"(v_lo_in), "r"(0), "r"(tmem_a), "r"(first), "r"(kDescHi), "r"(idesc)
       : "memory");
 }
 
@@ -383,8 +379,8 @@ __device__ __forceinline__ void mma_pv_tail(int v_lo_in, int tmem_d, int tmem_a,
       "add.u32 blo, blo, 128;\n\t"
       "mov.b64 db, {blo, bdhi};\n\t"
       "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [%3 + 56], db, idesc, p1;\n\t"
-      "}\n"
-      ::"r"(tmem_d), "r"(v_lo_in), "r"(0), "r"(tmem_a), "r"(kDescHi), "r"(idesc)
+      "}\n" ::"r"(tmem_d),
+      "r"(v_lo_in), "r"(0), "r"(tmem_a), "r"(kDescHi), "r"(idesc)
       : "memory");
 }
 
@@ -399,7 +395,10 @@ __device__ __forceinline__ int g4_batch_of(const G4Params& p, long n) {
   int lo = 0, hi = p.nbatch - 1;
   while (lo < hi) {
     int mid = (lo + hi + 1) >> 1;
-    if (__ldg(p.cu_q + mid) <= n) lo = mid; else hi = mid - 1;
+    if (__ldg(p.cu_q + mid) <= n)
+      lo = mid;
+    else
+      hi = mid - 1;
   }
   return lo;
 }
@@ -436,16 +435,18 @@ __device__ __forceinline__ G4RowRoute g4_route_row(const G4Params& p, long hn) {
 #pragma unroll
   for (int s = 0; s < kMaxTopk; s++) {
     const int blk = r.blks[s];
-    const bool val = (blk >= 0) && ((long)blk * 128 < kv_len) &&
-                     (!p.causal || (long)blk * 128 <= qpos);
+    const bool val =
+        (blk >= 0) && ((long)blk * 128 < kv_len) && (!p.causal || (long)blk * 128 <= qpos);
     bool dup = false;
     int rank = 0;
     if (val) {
 #pragma unroll
       for (int t = 0; t < kMaxTopk; t++) {
         if (t < s && av[t]) {
-          if (r.blks[t] == blk) dup = true;
-          else rank++;
+          if (r.blks[t] == blk)
+            dup = true;
+          else
+            rank++;
         }
       }
     }
@@ -460,8 +461,7 @@ __device__ __forceinline__ G4RowRoute g4_route_row(const G4Params& p, long hn) {
   return r;
 }
 
-__device__ __forceinline__ int g4_bucket_of(const G4Params& p, const G4RowRoute& r,
-                                            int s) {
+__device__ __forceinline__ int g4_bucket_of(const G4Params& p, const G4RowRoute& r, int s) {
   return (r.h * p.nbatch + r.bat) * p.max_pages + r.blks[s];
 }
 
@@ -494,8 +494,8 @@ template <typename QT, bool IS_BF16>
 __device__ __forceinline__ void g4_merge_rows_warp(const G4Params& p, const long* rows,
                                                    const int* cnts, int ng) {
   const int lane = threadIdx.x & 31;
-  const int grp = lane >> 3;   // row slot 0..3
-  const int sub = lane & 7;    // owns elements [sub*16, sub*16+16)
+  const int grp = lane >> 3;  // row slot 0..3
+  const int sub = lane & 7;   // owns elements [sub*16, sub*16+16)
   if (grp >= ng) return;
   const long sbase = rows[grp] * p.topk;
   const int cnt = cnts[grp];
@@ -508,7 +508,8 @@ __device__ __forceinline__ void g4_merge_rows_warp(const G4Params& p, const long
   }
   float mmax = -CUDART_INF_F;
 #pragma unroll
-  for (int s = 0; s < 8; s++) if (s < cnt) mmax = fmaxf(mmax, mlv[s].x);
+  for (int s = 0; s < 8; s++)
+    if (s < cnt) mmax = fmaxf(mmax, mlv[s].x);
   float w[8];
   float l_tot = 0.f;
 #pragma unroll
@@ -602,8 +603,7 @@ __device__ __forceinline__ int ld_acq_gpu(const int* addr) {
   return v;
 }
 
-__device__ __forceinline__ void route_grid_sync(int* cnt, int* flag,
-                                                int expected) {
+__device__ __forceinline__ void route_grid_sync(int* cnt, int* flag, int expected) {
   __syncthreads();
   if (threadIdx.x == 0) {
     int old;
@@ -612,8 +612,7 @@ __device__ __forceinline__ void route_grid_sync(int* cnt, int* flag,
                  : "l"(cnt), "r"(1)
                  : "memory");
     if (old == expected - 1) {
-      asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(flag), "r"(1)
-                   : "memory");
+      asm volatile("st.release.gpu.global.s32 [%0], %1;" ::"l"(flag), "r"(1) : "memory");
     } else {
       while (ld_acq_gpu(flag) == 0) {
       }
@@ -634,12 +633,10 @@ __global__ void __launch_bounds__(256) g4_route_fused(const __grid_constant__ G4
   // for the experimental inline-merge path, the per-row completion counters.
   // (Round 27: a host-side cudaMemsetAsync for bcnt/bcnt2 measured NET
   // NEUTRAL-worse — the memset launch costs more than zeroing 3 KB here.)
-  for (int i = blockIdx.x * 256 + tid; i < 2 * nb; i += nctas * 256)
-    p.bcnt[i] = 0;
+  for (int i = blockIdx.x * 256 + tid; i < 2 * nb; i += nctas * 256) p.bcnt[i] = 0;
   if (p.inline_merge) {
     const long rows = (long)p.total_q * p.num_q_heads;
-    for (long i = blockIdx.x * 256 + tid; i < rows; i += (long)nctas * 256)
-      p.rowcnt[i] = 0;
+    for (long i = blockIdx.x * 256 + tid; i < rows; i += (long)nctas * 256) p.rowcnt[i] = 0;
   }
   route_grid_sync(bar_cnt, bar_flag, nctas);
   // phase 1: count, ranks in registers.
@@ -666,8 +663,7 @@ __global__ void __launch_bounds__(256) g4_route_fused(const __grid_constant__ G4
       // barrier (phase-2 release waits on the L2 atomic queue).
       const int bucket = (r.ranks[s] >= 0) ? g4_bucket_of(p, r, s) : -1;
       const unsigned grp = __match_any_sync(0xffffffffu, bucket);
-      if (bucket >= 0 && rl == __ffs(grp) - 1)
-        atomicAdd(&p.bcnt[bucket], __popc(grp));
+      if (bucket >= 0 && rl == __ffs(grp) - 1) atomicAdd(&p.bcnt[bucket], __popc(grp));
     }
   }
   route_grid_sync(bar_cnt + 2, bar_flag + 2, nctas);
@@ -693,9 +689,15 @@ __global__ void __launch_bounds__(256) g4_route_fused(const __grid_constant__ G4
   for (int d = 1; d < 32; d <<= 1) {
     const int q2 = __shfl_up_sync(0xffffffffu, sq, d);
     const int t2 = __shfl_up_sync(0xffffffffu, stv, d);
-    if (lane >= d) { sq += q2; stv += t2; }
+    if (lane >= d) {
+      sq += q2;
+      stv += t2;
+    }
   }
-  if (lane == 31) { s_pad[wp] = sq; s_tile[wp] = stv; }
+  if (lane == 31) {
+    s_pad[wp] = sq;
+    s_tile[wp] = stv;
+  }
   __syncthreads();
   if (wp == 0) {
     int q = (lane < 8) ? s_pad[lane] : 0;
@@ -704,9 +706,15 @@ __global__ void __launch_bounds__(256) g4_route_fused(const __grid_constant__ G4
     for (int d = 1; d < 8; d <<= 1) {
       const int q2 = __shfl_up_sync(0xffffffffu, q, d);
       const int t2 = __shfl_up_sync(0xffffffffu, t, d);
-      if (lane >= d && lane < 8) { q += q2; t += t2; }
+      if (lane >= d && lane < 8) {
+        q += q2;
+        t += t2;
+      }
     }
-    if (lane < 8) { s_pad[lane] = q; s_tile[lane] = t; }
+    if (lane < 8) {
+      s_pad[lane] = q;
+      s_tile[lane] = t;
+    }
   }
   __syncthreads();
   int run_q = sq + ((wp > 0) ? s_pad[wp - 1] : 0) - pad_sum;
@@ -798,13 +806,13 @@ __global__ void __launch_bounds__(1024) g4_route_scan(const __grid_constant__ G4
     p.boff[bkt] = run_q;
     p.btoff[bkt] = run_t;
     int* meta = p.bmeta + bkt * 5;
-    meta[0] = run_q;                 // rowlist start (queries)
-    meta[1] = c;                     // query count
+    meta[0] = run_q;                           // rowlist start (queries)
+    meta[1] = c;                               // query count
     meta[2] = bkt / (p.nbatch * p.max_pages);  // kv head
     const int rem = bkt % (p.nbatch * p.max_pages);
     const int bat = rem / p.max_pages;
     const int blk = rem - bat * p.max_pages;
-    meta[3] = bat * 65536 + blk;     // packed batch/block
+    meta[3] = bat * 65536 + blk;                                    // packed batch/block
     meta[4] = __ldg(p.page_table + (long)bat * p.pt_stride + blk);  // physical page
     for (int t = 0; t < tiles; t++) p.chunk_bkt[run_t + t] = bkt;
     run_q += tiles * kQTile;
@@ -864,10 +872,9 @@ __device__ __forceinline__ TileInfo load_tile(const G4Params& p, int chunk) {
 }
 
 template <typename QT, bool IS_BF16>
-__global__ void __launch_bounds__(512, 1) g4_umma_kernel(
-    const __grid_constant__ G4Params p,
-    const __grid_constant__ CUtensorMap k_map,
-    const __grid_constant__ CUtensorMap v_map) {
+__global__ void __launch_bounds__(512, 1)
+    g4_umma_kernel(const __grid_constant__ G4Params p, const __grid_constant__ CUtensorMap k_map,
+                   const __grid_constant__ CUtensorMap v_map) {
   const CUtensorMap* ktm = &k_map;
   const CUtensorMap* vtm = &v_map;
   const int tid = threadIdx.x;
@@ -990,10 +997,10 @@ __global__ void __launch_bounds__(512, 1) g4_umma_kernel(
     float tmax0 = -CUDART_INF_F, tmax1 = -CUDART_INF_F;
 #pragma unroll
     for (int j = 0; j < 16; j++) {
-      tmax0 = fmaxf(tmax0, fmaxf(fmaxf(s0[4 * j], s0[4 * j + 1]),
-                                 fmaxf(s0[4 * j + 2], s0[4 * j + 3])));
-      tmax1 = fmaxf(tmax1, fmaxf(fmaxf(s1[4 * j], s1[4 * j + 1]),
-                                 fmaxf(s1[4 * j + 2], s1[4 * j + 3])));
+      tmax0 =
+          fmaxf(tmax0, fmaxf(fmaxf(s0[4 * j], s0[4 * j + 1]), fmaxf(s0[4 * j + 2], s0[4 * j + 3])));
+      tmax1 =
+          fmaxf(tmax1, fmaxf(fmaxf(s1[4 * j], s1[4 * j + 1]), fmaxf(s1[4 * j + 2], s1[4 * j + 3])));
     }
     const float row_max = fmaxf(tmax0, tmax1);  // raw score max (>= -inf rows only)
     const uint64_t scale2 = pack2(scale, scale);
@@ -1118,8 +1125,7 @@ __global__ void __launch_bounds__(512, 1) g4_umma_kernel(
       g4_acquire_fence();  // earlier tickets' partials are visible now
 #pragma unroll 1
       for (int stage = 0; stage < 2; stage++) {
-        unsigned mask =
-            __ballot_sync(0xFFFFFFFFu, tick_of_stage[stage] == cnt_of_stage[stage] - 1);
+        unsigned mask = __ballot_sync(0xFFFFFFFFu, tick_of_stage[stage] == cnt_of_stage[stage] - 1);
         while (mask) {
           long rs[4];
           int cs[4], ng = 0;
@@ -1180,16 +1186,16 @@ __global__ void __launch_bounds__(512, 1) g4_umma_kernel(
       // early-return: the elected lane must still reach barrier 9 below.
       if (!share_kv) {
         const int ph1 = t_pg[1] * p.num_kv_heads + t_kvh[1];
-      mbar_arrive_tx(b_kv2full + 0, 32768);
-      tma_load_4d(smem + kK1Off + 0, ktm, 0, 0, 0, ph1, b_kv2full + 0);
-      tma_load_4d(smem + kK1Off + 8192, ktm, 0, 64, 0, ph1, b_kv2full + 0);
-      tma_load_4d(smem + kK1Off + 16384, ktm, 0, 0, 1, ph1, b_kv2full + 0);
-      tma_load_4d(smem + kK1Off + 24576, ktm, 0, 64, 1, ph1, b_kv2full + 0);
-      mbar_arrive_tx(b_kv2full + 8, 32768);
-      tma_load_4d(smem + kV1Off + 0, vtm, 0, 0, 0, ph1, b_kv2full + 8);
-      tma_load_4d(smem + kV1Off + 8192, vtm, 0, 64, 0, ph1, b_kv2full + 8);
-      tma_load_4d(smem + kV1Off + 16384, vtm, 0, 0, 1, ph1, b_kv2full + 8);
-      tma_load_4d(smem + kV1Off + 24576, vtm, 0, 64, 1, ph1, b_kv2full + 8);
+        mbar_arrive_tx(b_kv2full + 0, 32768);
+        tma_load_4d(smem + kK1Off + 0, ktm, 0, 0, 0, ph1, b_kv2full + 0);
+        tma_load_4d(smem + kK1Off + 8192, ktm, 0, 64, 0, ph1, b_kv2full + 0);
+        tma_load_4d(smem + kK1Off + 16384, ktm, 0, 0, 1, ph1, b_kv2full + 0);
+        tma_load_4d(smem + kK1Off + 24576, ktm, 0, 64, 1, ph1, b_kv2full + 0);
+        mbar_arrive_tx(b_kv2full + 8, 32768);
+        tma_load_4d(smem + kV1Off + 0, vtm, 0, 0, 0, ph1, b_kv2full + 8);
+        tma_load_4d(smem + kV1Off + 8192, vtm, 0, 64, 0, ph1, b_kv2full + 8);
+        tma_load_4d(smem + kV1Off + 16384, vtm, 0, 0, 1, ph1, b_kv2full + 8);
+        tma_load_4d(smem + kV1Off + 24576, vtm, 0, 64, 1, ph1, b_kv2full + 8);
       }
     }
     if (warp == 13) {
@@ -1200,8 +1206,7 @@ __global__ void __launch_bounds__(512, 1) g4_umma_kernel(
         const int ch = i >> 5;
         const int loc = i & 31;
         int ent = -1;
-        if (loc < t_rc[ch])
-          ent = __ldg(p.rowlist + t_rq0[ch] + loc);
+        if (loc < t_rc[ch]) ent = __ldg(p.rowlist + t_rq0[ch] + loc);
         sm_rown[i] = (ent < 0) ? -1 : (ent & 0x0FFFFFFF);
         sm_rowrank[i] = (ent < 0) ? 0 : (ent >> 28);
       }
@@ -1224,16 +1229,15 @@ __global__ void __launch_bounds__(512, 1) g4_umma_kernel(
       const int kvh_stage = sm_stile[stage * 2 + 1];
       // 2048 chunks per stage; 128 threads x 16 each
       for (int idx = t128; idx < 2048; idx += 128) {
-        const int r = idx >> 4;          // row in stage (0..127)
-        const int seg = idx & 7;         // 16B segment in elhalf
-        const int half = (idx >> 3) & 1; // elhalf
+        const int r = idx >> 4;           // row in stage (0..127)
+        const int seg = idx & 7;          // 16B segment in elhalf
+        const int half = (idx >> 3) & 1;  // elhalf
         const int q_i = (stage * 128 + r) >> 2;
         if (q_i - (stage << 5) >= rc_stage) continue;  // chunk-local row index
         const int n = sm_rown[q_i];
         const int gg = r & 3;
-        const long src_el = (long)n * p.q_tok +
-                            (long)(kvh_stage * kGroup + gg) * p.q_head +
-                            half * 64 + seg * 8;
+        const long src_el =
+            (long)n * p.q_tok + (long)(kvh_stage * kGroup + gg) * p.q_head + half * 64 + seg * 8;
         const int dst = qstage + half * 16384 + r * 128 + (((seg ^ (r & 7))) << 4);
         cp16(dst, qbase + src_el * (long)sizeof(QT));
       }
@@ -1259,10 +1263,8 @@ __global__ void __launch_bounds__(512, 1) g4_umma_kernel(
     // Same-bucket pairs and the fake tail tile share the stage-0 K/V slabs;
     // the producer skipped the stage-1 duplicate load under the same rule.
     const bool share_kv = __ldg(p.chunk_bkt + c0) == __ldg(p.chunk_bkt + c1v);
-    const int kb1_lo = share_kv ? kb_lo
-                                : warp_uni(((smem + kK1Off) >> 4) & 0x3FFF);
-    const int vb1_lo = share_kv ? vb_lo
-                                : warp_uni((((smem + kV1Off) >> 4) & 0x3FFF) | 0x4000000);
+    const int kb1_lo = share_kv ? kb_lo : warp_uni(((smem + kK1Off) >> 4) & 0x3FFF);
+    const int vb1_lo = share_kv ? vb_lo : warp_uni((((smem + kV1Off) >> 4) & 0x3FFF) | 0x4000000);
     mbar_wait(b_qfull + 0, 0);
     mbar_wait(b_kvfull + 0, 0);
     mma_qk_group(q0_lo, kb_lo, taddr + 0, idesc_qk, 0);
@@ -1288,7 +1290,6 @@ __global__ void __launch_bounds__(512, 1) g4_umma_kernel(
     tc_relinquish();
     return;
   }
-
 }
 
 // ==== ANCHOR:MERGE ====
@@ -1359,14 +1360,10 @@ __global__ void __launch_bounds__(256, 8) g4_merge_kernel(const __grid_constant_
     acc[7] += ws * f3.y;
   }
   uint4 pk;
-  pk.x = IS_BF16 ? pack_bf16x2(acc[0] * inv, acc[1] * inv)
-                 : pack_f16x2(acc[0] * inv, acc[1] * inv);
-  pk.y = IS_BF16 ? pack_bf16x2(acc[2] * inv, acc[3] * inv)
-                 : pack_f16x2(acc[2] * inv, acc[3] * inv);
-  pk.z = IS_BF16 ? pack_bf16x2(acc[4] * inv, acc[5] * inv)
-                 : pack_f16x2(acc[4] * inv, acc[5] * inv);
-  pk.w = IS_BF16 ? pack_bf16x2(acc[6] * inv, acc[7] * inv)
-                 : pack_f16x2(acc[6] * inv, acc[7] * inv);
+  pk.x = IS_BF16 ? pack_bf16x2(acc[0] * inv, acc[1] * inv) : pack_f16x2(acc[0] * inv, acc[1] * inv);
+  pk.y = IS_BF16 ? pack_bf16x2(acc[2] * inv, acc[3] * inv) : pack_f16x2(acc[2] * inv, acc[3] * inv);
+  pk.z = IS_BF16 ? pack_bf16x2(acc[4] * inv, acc[5] * inv) : pack_f16x2(acc[4] * inv, acc[5] * inv);
+  pk.w = IS_BF16 ? pack_bf16x2(acc[6] * inv, acc[7] * inv) : pack_f16x2(acc[6] * inv, acc[7] * inv);
   *reinterpret_cast<uint4*>(out_row) = pk;
 }
 
@@ -1386,8 +1383,8 @@ static CUtensorMap encode_paged_kv_map(const void* base, int num_pages, int hkv,
   return tm;
 }
 
-bool umma_g4_eligible(int group, bool paged, int kv_dtype_code, int topk, int nbatch,
-                      int max_pages, int num_kv_heads, int total_q) {
+bool umma_g4_eligible(int group, bool paged, int kv_dtype_code, int topk, int nbatch, int max_pages,
+                      int num_kv_heads, int total_q) {
   if (group != kGroup || !paged || kv_dtype_code == 2) return false;
   if (topk < 1 || topk > kMaxTopk) return false;
   const long nbuckets = (long)num_kv_heads * nbatch * max_pages;
@@ -1403,19 +1400,20 @@ static void launch_g4(G4Params& p, const CUtensorMap& km, const CUtensorMap& vm,
                       cudaStream_t stream) {
   static bool attr_set = false;
   if (!attr_set) {
-    cudaFuncSetAttribute(g4_umma_kernel<QT, IS_BF16>,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemTotal);
+    cudaFuncSetAttribute(g4_umma_kernel<QT, IS_BF16>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                         kSmemTotal);
     attr_set = true;
   }
-  g4_umma_kernel<QT, IS_BF16><<<dim3((unsigned)((p.tiles_bound + 1) / 2)), kThreads, kSmemTotal, stream>>>(p, km, vm);
+  g4_umma_kernel<QT, IS_BF16>
+      <<<dim3((unsigned)((p.tiles_bound + 1) / 2)), kThreads, kSmemTotal, stream>>>(p, km, vm);
 }
 
-void umma_g4_forward(const void* q, bool q_is_bf16, const void* k, const void* v,
-                     const int* q2k, const int* cu_q, const int* cu_k, const int* page_table,
-                     void* out, int total_q, int num_q_heads, int num_kv_heads, int topk,
-                     int nbatch, int num_pages, int max_pages, long pt_stride, long q_tok,
-                     long q_head, long o_tok, long o_head, int* ws_int, float* ws_float,
-                     int seqlen_q, bool causal, cudaStream_t stream) {
+void umma_g4_forward(const void* q, bool q_is_bf16, const void* k, const void* v, const int* q2k,
+                     const int* cu_q, const int* cu_k, const int* page_table, void* out,
+                     int total_q, int num_q_heads, int num_kv_heads, int topk, int nbatch,
+                     int num_pages, int max_pages, long pt_stride, long q_tok, long q_head,
+                     long o_tok, long o_head, int* ws_int, float* ws_float, int seqlen_q,
+                     bool causal, cudaStream_t stream) {
   G4Params p;
   p.q = q;
   p.k = k;
@@ -1501,8 +1499,8 @@ void umma_g4_forward(const void* q, bool q_is_bf16, const void* k, const void* v
     g4_route_scatter<<<dim3((unsigned)hn_blocks), 256, 0, s>>>(p);
   }
 
-  const CUtensorMapDataType dt = q_is_bf16 ? CU_TENSOR_MAP_DATA_TYPE_BFLOAT16
-                                           : CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+  const CUtensorMapDataType dt =
+      q_is_bf16 ? CU_TENSOR_MAP_DATA_TYPE_BFLOAT16 : CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
   CUtensorMap km = encode_paged_kv_map(p.k, num_pages, p.num_kv_heads, dt);
   CUtensorMap vm = encode_paged_kv_map(p.v, num_pages, p.num_kv_heads, dt);
   const unsigned merge_blocks = (unsigned)((rows + 15) / 16);

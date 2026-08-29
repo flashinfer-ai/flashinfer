@@ -9,11 +9,12 @@
 // softmax merge), so no cross-warp communication is needed inside the loop.
 
 #include <cuda.h>
-#include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
+#include <cuda_runtime.h>
 #include <stdint.h>
+
 #include <cstdlib>
 
 #include "msa_vibecuda_common.h"
@@ -59,8 +60,8 @@ constexpr int kBlockTok = 128;  // KV block size (fixed by the task)
 #ifndef MSA_PERSIST_FULLGRID
 #define MSA_PERSIST_FULLGRID 0
 #endif
-constexpr int kChunkTok = 64;   // tokens per pipeline stage
-constexpr int kWarpTok = 16;    // tokens per warp per chunk
+constexpr int kChunkTok = 64;  // tokens per pipeline stage
+constexpr int kWarpTok = 16;   // tokens per warp per chunk
 
 using Params = msa_vibecuda::CoreParams;
 using msa_vibecuda::KvLayout;
@@ -74,13 +75,11 @@ __device__ __forceinline__ uint32_t smem_u32(const void* p) {
 }
 
 __device__ __forceinline__ void cp16(uint32_t dst, const void* src, int src_size) {
-  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst),
-               "l"(src), "r"(src_size));
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src),
+               "r"(src_size));
 }
 
-__device__ __forceinline__ void cp_commit() {
-  asm volatile("cp.async.commit_group;\n");
-}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;\n"); }
 
 template <int N>
 __device__ __forceinline__ void cp_wait() {
@@ -88,15 +87,12 @@ __device__ __forceinline__ void cp_wait() {
 }
 
 __device__ __forceinline__ void mbar_init(uint64_t* mbar, uint32_t count) {
-  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(smem_u32(mbar)),
-               "r"(count));
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(smem_u32(mbar)), "r"(count));
 }
 
 __device__ __forceinline__ void mbar_expect_tx(uint64_t* mbar, uint32_t bytes) {
-  asm volatile(
-      "mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(
-          smem_u32(mbar)),
-      "r"(bytes));
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(mbar)),
+               "r"(bytes));
 }
 
 __device__ __forceinline__ void mbar_wait(uint64_t* mbar, uint32_t parity) {
@@ -143,8 +139,8 @@ __device__ __forceinline__ void ldsm_remote_v4f32(float (&v)[4], uint32_t addr) 
 }
 
 __device__ __forceinline__ void stsm_remote_v4u32(uint32_t addr, uint4 v) {
-  asm volatile("st.shared::cluster.v4.u32 [%0], {%1,%2,%3,%4};" ::"r"(addr),
-               "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w));
+  asm volatile("st.shared::cluster.v4.u32 [%0], {%1,%2,%3,%4};" ::"r"(addr), "r"(v.x), "r"(v.y),
+               "r"(v.z), "r"(v.w));
 }
 
 __device__ __forceinline__ void stsm_remote_u32(uint32_t addr, uint32_t v) {
@@ -157,29 +153,25 @@ __device__ __forceinline__ void cluster_sync() {
 }
 
 template <int RANK>
-__device__ __forceinline__ void tma_load(const CUtensorMap* map, uint64_t* mbar,
-                                         uint32_t dst, const int32_t* c) {
+__device__ __forceinline__ void tma_load(const CUtensorMap* map, uint64_t* mbar, uint32_t dst,
+                                         const int32_t* c) {
   if constexpr (RANK == 3) {
     asm volatile(
         "cp.async.bulk.tensor.3d.shared::cluster.global.tile."
-        "mbarrier::complete_tx::bytes [%0], [%1, {%3, %4, %5}], [%2];\n" ::
-            "r"(dst),
+        "mbarrier::complete_tx::bytes [%0], [%1, {%3, %4, %5}], [%2];\n" ::"r"(dst),
         "l"(map), "r"(smem_u32(mbar)), "r"(c[0]), "r"(c[1]), "r"(c[2])
         : "memory");
   } else if constexpr (RANK == 4) {
     asm volatile(
         "cp.async.bulk.tensor.4d.shared::cluster.global.tile."
-        "mbarrier::complete_tx::bytes [%0], [%1, {%3, %4, %5, %6}], [%2];\n" ::
-            "r"(dst),
+        "mbarrier::complete_tx::bytes [%0], [%1, {%3, %4, %5, %6}], [%2];\n" ::"r"(dst),
         "l"(map), "r"(smem_u32(mbar)), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3])
         : "memory");
   } else if constexpr (RANK == 5) {
     asm volatile(
         "cp.async.bulk.tensor.5d.shared::cluster.global.tile."
-        "mbarrier::complete_tx::bytes [%0], [%1, {%3, %4, %5, %6, %7}], [%2];\n" ::
-            "r"(dst),
-        "l"(map), "r"(smem_u32(mbar)), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]),
-        "r"(c[4])
+        "mbarrier::complete_tx::bytes [%0], [%1, {%3, %4, %5, %6, %7}], [%2];\n" ::"r"(dst),
+        "l"(map), "r"(smem_u32(mbar)), "r"(c[0]), "r"(c[1]), "r"(c[2]), "r"(c[3]), "r"(c[4])
         : "memory");
   }
 }
@@ -191,14 +183,15 @@ __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], uint32_t addr) {
 }
 
 __device__ __forceinline__ void ldsm_x4_trans(uint32_t (&r)[4], uint32_t addr) {
-  asm volatile(
-      "ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
-      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-      : "r"(addr));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(addr));
 }
 
-template <typename T> struct Mma;
-template <> struct Mma<bf16> {
+template <typename T>
+struct Mma;
+template <>
+struct Mma<bf16> {
   static __device__ __forceinline__ void run(float (&c)[4], const uint32_t (&a)[4],
                                              const uint32_t (&b)[2]) {
     asm volatile(
@@ -212,7 +205,8 @@ template <> struct Mma<bf16> {
     return *reinterpret_cast<uint32_t*>(&h);
   }
 };
-template <> struct Mma<f16> {
+template <>
+struct Mma<f16> {
   static __device__ __forceinline__ void run(float (&c)[4], const uint32_t (&a)[4],
                                              const uint32_t (&b)[2]) {
     asm volatile(
@@ -302,9 +296,8 @@ struct Smem {
   //    2-slot post-PV issue 95.5 us, joint-depth 88.7 us, rounds 8-9),
   //    and 102KB gives the same 2 CTA/SM as 86KB.
   static constexpr int kVSlots = VSL;
-  static constexpr int kRingBytes = (KVK == 2)
-      ? (kStages * kStageBytes)
-      : ((kStages + kVSlots) * kTensorBytes);
+  static constexpr int kRingBytes =
+      (KVK == 2) ? (kStages * kStageBytes) : ((kStages + kVSlots) * kTensorBytes);
   static constexpr int kConvOff = (KVK == 2) ? (kRingOff + kStages * kStageBytes) : 0;
   // fp32 merge accumulator overlays the ring (only touched after the loop)
   static constexpr int kAccOff = kRingOff;
@@ -315,9 +308,7 @@ struct Smem {
   // time flat in all three layouts (382.3/380.9/381.0 us, NCU 387 vs
   // 387.2/386.9 us). Conflicts on this path are latency-hidden; keep 132.
   static constexpr int kStripPitch = 132;
-  static constexpr int kTotal = (KVK == 2)
-      ? (kConvOff + 2 * 64 * 256)
-      : (kRingOff + kRingBytes);
+  static constexpr int kTotal = (KVK == 2) ? (kConvOff + 2 * 64 * 256) : (kRingOff + kRingBytes);
 };
 
 // ---------------------------------------------------------------------------
@@ -340,17 +331,13 @@ struct Smem {
 // forms: JV&&NSTG==2 (70KB, 3 CTAs/SM, K+V refilled after the loop-end
 // barrier — cross-CTA overlap covers the flight) and !JV&&NSTG==4 (102KB,
 // 2 CTAs/SM, K runs a full pair ahead with split V at pair top).
-template <typename QT, int KVK, bool PAGED, int NSTG, int VSL, bool PACK,
-          bool JV = (VSL != 1), bool PAIRP = false, bool CLUSTER = false,
-          bool PERSIST = false>
-__global__ void __launch_bounds__(kThreads,
-                                  (KVK == 2 && NSTG == 2)
-                                      ? 3
-                                      : ((VSL == 1) ? 4 : ((PAIRP && JV) ? 3 : 1)))
-msa_sparse_kernel(
-    const __grid_constant__ Params p,
-    const __grid_constant__ CUtensorMap kmap,
-    const __grid_constant__ CUtensorMap vmap) {
+template <typename QT, int KVK, bool PAGED, int NSTG, int VSL, bool PACK, bool JV = (VSL != 1),
+          bool PAIRP = false, bool CLUSTER = false, bool PERSIST = false>
+__global__ void __launch_bounds__(kThreads, (KVK == 2 && NSTG == 2)
+                                                ? 3
+                                                : ((VSL == 1) ? 4 : ((PAIRP && JV) ? 3 : 1)))
+    msa_sparse_kernel(const __grid_constant__ Params p, const __grid_constant__ CUtensorMap kmap,
+                      const __grid_constant__ CUtensorMap vmap) {
   constexpr int TMA_RANK = PAGED ? 4 : 3;
   extern __shared__ char smem_raw[];
   const int tid = threadIdx.x;
@@ -361,14 +348,13 @@ msa_sparse_kernel(
   // list and (rank 0) the final merge/store role.
   const int crank = CLUSTER ? (int)cluster_rank() : 0;
   int n = CLUSTER ? (int)(blockIdx.x >> 1) : (int)blockIdx.x;  // tile id
-  int h = blockIdx.y;   // kv head
+  int h = blockIdx.y;                                          // kv head
 
   static_assert(!PACK || KVK != 2, "packed path is bf16/fp16 only");
   // Pair forms: JV joint 4-slot ring (VSL=2), or the 3-buffer form (VSL=1,
   // !JV) — K in slots 0/1 with slot 1 re-armed as V(c+1) mid-pair; 54KB gives
   // 4 CTAs/SM instead of 3 (round 21).
-  static_assert(!PAIRP ||
-                (NSTG == 2 && ((JV && VSL > 1) || (!JV && VSL == 1))),
+  static_assert(!PAIRP || (NSTG == 2 && ((JV && VSL > 1) || (!JV && VSL == 1))),
                 "pair form: JV 4-slot ring or !JV 3-buffer ring, NSTG=2");
   static_assert(!PAIRP || JV || !CLUSTER, "3-buffer pair is single-CTA only");
   static_assert(!PAIRP || JV || !PERSIST, "3-buffer pair is non-persistent");
@@ -439,1357 +425,1368 @@ msa_sparse_kernel(
       n = w % p.ws_ntiles;
       h = w / p.ws_ntiles;
     }
-  const int ntok0 = PACK ? n * p.pack_T : n;
-  int b = 0, qpos = 0, cu_kb = 0;
-  if constexpr (!PACK) {
-    // ---- batch/locals -----------------------------------------------------
-    int lo = 0, hi = p.nbatch - 1;
-    while (lo < hi) {
-      int mid = (lo + hi + 1) >> 1;
-      if (__ldg(p.cu_q + mid) <= n) lo = mid; else hi = mid - 1;
+    const int ntok0 = PACK ? n * p.pack_T : n;
+    int b = 0, qpos = 0, cu_kb = 0;
+    if constexpr (!PACK) {
+      // ---- batch/locals -----------------------------------------------------
+      int lo = 0, hi = p.nbatch - 1;
+      while (lo < hi) {
+        int mid = (lo + hi + 1) >> 1;
+        if (__ldg(p.cu_q + mid) <= n)
+          lo = mid;
+        else
+          hi = mid - 1;
+      }
+      b = lo;
+      const int local_q = n - __ldg(p.cu_q + b);
+      const int kv_len = __ldg(p.cu_k + b + 1) - __ldg(p.cu_k + b);
+      qpos = kv_len - p.seqlen_q + local_q;
+      cu_kb = __ldg(p.cu_k + b);
     }
-    b = lo;
-    const int local_q = n - __ldg(p.cu_q + b);
-    const int kv_len = __ldg(p.cu_k + b + 1) - __ldg(p.cu_k + b);
-    qpos = kv_len - p.seqlen_q + local_q;
-    cu_kb = __ldg(p.cu_k + b);
-  }
 
-  // ---- zero reduction state -------------------------------------------------
-  {
-    if (tid < 16) sm_red[128 + tid] = 0.f;
-    if (tid == 0) *sm_cnt = 0;
-    // First-occurrence flag word — the PACK build's phase C1 publishes its
-    // per-warp ballot fragments with atomicOr, so it must start at zero.
-    if (tid == 16)
-      *reinterpret_cast<uint64_t*>(smem_raw + S::kUFirstOff) = 0;
-  }
-  if constexpr (!PERSIST) {
-    if (tid == 0) {
-#pragma unroll
-      for (int s = 0; s < 2 * kStages; ++s) mbar_init(&mbar[s], 1);
+    // ---- zero reduction state -------------------------------------------------
+    {
+      if (tid < 16) sm_red[128 + tid] = 0.f;
+      if (tid == 0) *sm_cnt = 0;
+      // First-occurrence flag word — the PACK build's phase C1 publishes its
+      // per-warp ballot fragments with atomicOr, so it must start at zero.
+      if (tid == 16) *reinterpret_cast<uint64_t*>(smem_raw + S::kUFirstOff) = 0;
     }
-  }
-  asm volatile("fence.proxy.async.shared::cta;\n");
-  __syncthreads();  // sm_cnt + barriers visible
-
-  // ---- Q tile issue (cp.async, one group) — hoisted before the list/union
-  // build (zero dependencies on it) so the global flight overlaps the
-  // build's gmem latency chain. Two 128B-pitch half atoms.
+    if constexpr (!PERSIST) {
+      if (tid == 0) {
 #pragma unroll
-  for (int it = 0; it < 2; ++it) {
-    int i = tid + it * kThreads;
-    int r = i >> 4, s = i & 15;
-    int t = PACK ? (r / p.group) : 0;
-    int hh = PACK ? (r - t * p.group) : r;
-    long nn = PACK ? (long)(ntok0 + t) : (long)n;
-    bool rv = PACK ? (nn < p.total_q) : (r < p.group);
-    int sz = rv ? 16 : 0;
-    const QT* src = reinterpret_cast<const QT*>(p.q) +
-                    nn * p.q_tok + (long)(h * p.group + hh) * p.q_head + s * 8;
-    cp16(smem_u32(sm_q + (s >> 3) * (kRows * 128) + tile_off(r, s & 7)), src, sz);
-  }
-  cp_commit();
+        for (int s = 0; s < 2 * kStages; ++s) mbar_init(&mbar[s], 1);
+      }
+    }
+    asm volatile("fence.proxy.async.shared::cta;\n");
+    __syncthreads();  // sm_cnt + barriers visible
 
-  // ---- compact the q2k block list -----------------------------------------
-  if constexpr (PACK) {
-    // Deduped union build, parallelized across all 4 warps (round 17). The
-    // round-16 form ran the whole build on warp 0 — a serial gmem-latency
-    // chain (cu_q search -> q2k gather -> page_table) plus O(nent^2) smem
-    // scans while 3 warps idled at the barrier (~30% of CTA wall per the
-    // round-15/16 clock and cluster A/B evidence). Phases below overlap the
-    // independent load streams (maps || gather || the hoisted Q flight) and
-    // split the filter/key/dedup passes over contiguous per-warp slices.
-    // Dedup key: paged -> physical page id (globally unique), flat -> global
-    // flat token base cu_k[b] + blk*128 (unique across batches); both +1 so 0
-    // marks an invalid entry. Entry word: (logical_blk << 4) | token_bits.
-    // Staging arrays overlay ring slot 0 — dead before the first chunk issue.
-    // CLUSTER: only rank 0 builds the union; rank 1 consumes the DSM push
-    // (union sharing is mandatory — duplicating the build per CTA of the
-    // pair made the cluster form strictly worse, round-17 A/B).
-    if (!CLUSTER || crank == 0) {
-      int* skey = reinterpret_cast<int*>(smem_raw + S::kRingOff);
-      int* stok = skey + S::kMaxUnion;
-      uint64_t* sm_ufirst = reinterpret_cast<uint64_t*>(smem_raw + S::kUFirstOff);
-      const int nent = p.pack_T * p.topk;
-      // ---- phase A: token maps (warp 0) || raw q2k gather (warp 1) -------
-      if (warp == 0) {
-        if (lane < p.pack_T) {
-          long nn = ntok0 + lane;
-          int bat = 0, qp = -1;
-          if (nn < p.total_q) {
-            int lo2 = 0, hi2 = p.nbatch - 1;
-            while (lo2 < hi2) {
-              int mid = (lo2 + hi2 + 1) >> 1;
-              if (__ldg(p.cu_q + mid) <= nn) lo2 = mid; else hi2 = mid - 1;
+    // ---- Q tile issue (cp.async, one group) — hoisted before the list/union
+    // build (zero dependencies on it) so the global flight overlaps the
+    // build's gmem latency chain. Two 128B-pitch half atoms.
+#pragma unroll
+    for (int it = 0; it < 2; ++it) {
+      int i = tid + it * kThreads;
+      int r = i >> 4, s = i & 15;
+      int t = PACK ? (r / p.group) : 0;
+      int hh = PACK ? (r - t * p.group) : r;
+      long nn = PACK ? (long)(ntok0 + t) : (long)n;
+      bool rv = PACK ? (nn < p.total_q) : (r < p.group);
+      int sz = rv ? 16 : 0;
+      const QT* src = reinterpret_cast<const QT*>(p.q) + nn * p.q_tok +
+                      (long)(h * p.group + hh) * p.q_head + s * 8;
+      cp16(smem_u32(sm_q + (s >> 3) * (kRows * 128) + tile_off(r, s & 7)), src, sz);
+    }
+    cp_commit();
+
+    // ---- compact the q2k block list -----------------------------------------
+    if constexpr (PACK) {
+      // Deduped union build, parallelized across all 4 warps (round 17). The
+      // round-16 form ran the whole build on warp 0 — a serial gmem-latency
+      // chain (cu_q search -> q2k gather -> page_table) plus O(nent^2) smem
+      // scans while 3 warps idled at the barrier (~30% of CTA wall per the
+      // round-15/16 clock and cluster A/B evidence). Phases below overlap the
+      // independent load streams (maps || gather || the hoisted Q flight) and
+      // split the filter/key/dedup passes over contiguous per-warp slices.
+      // Dedup key: paged -> physical page id (globally unique), flat -> global
+      // flat token base cu_k[b] + blk*128 (unique across batches); both +1 so 0
+      // marks an invalid entry. Entry word: (logical_blk << 4) | token_bits.
+      // Staging arrays overlay ring slot 0 — dead before the first chunk issue.
+      // CLUSTER: only rank 0 builds the union; rank 1 consumes the DSM push
+      // (union sharing is mandatory — duplicating the build per CTA of the
+      // pair made the cluster form strictly worse, round-17 A/B).
+      if (!CLUSTER || crank == 0) {
+        int* skey = reinterpret_cast<int*>(smem_raw + S::kRingOff);
+        int* stok = skey + S::kMaxUnion;
+        uint64_t* sm_ufirst = reinterpret_cast<uint64_t*>(smem_raw + S::kUFirstOff);
+        const int nent = p.pack_T * p.topk;
+        // ---- phase A: token maps (warp 0) || raw q2k gather (warp 1) -------
+        if (warp == 0) {
+          if (lane < p.pack_T) {
+            long nn = ntok0 + lane;
+            int bat = 0, qp = -1;
+            if (nn < p.total_q) {
+              int lo2 = 0, hi2 = p.nbatch - 1;
+              while (lo2 < hi2) {
+                int mid = (lo2 + hi2 + 1) >> 1;
+                if (__ldg(p.cu_q + mid) <= nn)
+                  lo2 = mid;
+                else
+                  hi2 = mid - 1;
+              }
+              bat = lo2;
+              int lq = (int)(nn - __ldg(p.cu_q + bat));
+              qp = (int)(__ldg(p.cu_k + bat + 1) - __ldg(p.cu_k + bat)) - p.seqlen_q + lq;
             }
-            bat = lo2;
-            int lq = (int)(nn - __ldg(p.cu_q + bat));
-            qp = (int)(__ldg(p.cu_k + bat + 1) - __ldg(p.cu_k + bat)) -
-                 p.seqlen_q + lq;
+            sm_tbat[lane] = bat;
+            sm_tqp[lane] = qp;
           }
-          sm_tbat[lane] = bat;
-          sm_tqp[lane] = qp;
-        }
-        __syncwarp();
-        for (int r = lane; r < kRows; r += 32) {
-          int t = r / p.group;
-          sm_rqpos[r] = sm_tqp[t];
-          sm_rtbit[r] = (ntok0 + t < p.total_q) ? (1 << t) : 0;
-        }
-      } else if (warp == 1) {
-        // Raw (unfiltered) block ids — the q2k load stream is independent of
-        // the warp-0 cu_q/cu_k map chain, so the two gmem rounds overlap.
-        // power-of-two topk uses shift/mask instead of the ~20-instr runtime
-        // s32 division sequence; exhausted NCU sampler attribution shows this
-        // idiom is a real hotspot in sibling kernels.
-        if ((p.topk & (p.topk - 1)) == 0) {
-          const int tsh = __ffs(p.topk) - 1;
-          for (int idx = lane; idx < nent; idx += 32) {
-            int t = idx >> tsh;
-            long nn = ntok0 + t;
-            int blk = -1;
-            if (nn < p.total_q)
-              blk = __ldg(p.q2k + (long)h * p.q2k_h + nn * p.q2k_n +
-                          (idx & (p.topk - 1)));
-            skey[idx] = blk;
+          __syncwarp();
+          for (int r = lane; r < kRows; r += 32) {
+            int t = r / p.group;
+            sm_rqpos[r] = sm_tqp[t];
+            sm_rtbit[r] = (ntok0 + t < p.total_q) ? (1 << t) : 0;
           }
-        } else {
-          for (int idx = lane; idx < nent; idx += 32) {
-            int t = idx / p.topk;
-            long nn = ntok0 + t;
-            int blk = -1;
-            if (nn < p.total_q)
-              blk = __ldg(p.q2k + (long)h * p.q2k_h + nn * p.q2k_n +
-                          (idx - t * p.topk));
-            skey[idx] = blk;
+        } else if (warp == 1) {
+          // Raw (unfiltered) block ids — the q2k load stream is independent of
+          // the warp-0 cu_q/cu_k map chain, so the two gmem rounds overlap.
+          // power-of-two topk uses shift/mask instead of the ~20-instr runtime
+          // s32 division sequence; exhausted NCU sampler attribution shows this
+          // idiom is a real hotspot in sibling kernels.
+          if ((p.topk & (p.topk - 1)) == 0) {
+            const int tsh = __ffs(p.topk) - 1;
+            for (int idx = lane; idx < nent; idx += 32) {
+              int t = idx >> tsh;
+              long nn = ntok0 + t;
+              int blk = -1;
+              if (nn < p.total_q)
+                blk = __ldg(p.q2k + (long)h * p.q2k_h + nn * p.q2k_n + (idx & (p.topk - 1)));
+              skey[idx] = blk;
+            }
+          } else {
+            for (int idx = lane; idx < nent; idx += 32) {
+              int t = idx / p.topk;
+              long nn = ntok0 + t;
+              int blk = -1;
+              if (nn < p.total_q)
+                blk = __ldg(p.q2k + (long)h * p.q2k_h + nn * p.q2k_n + (idx - t * p.topk));
+              skey[idx] = blk;
+            }
           }
         }
-      }
-      __syncthreads();
-      // ---- phase B: filter + key/token words, 4-warp contiguous slices ----
-      const int per = (nent + 3) >> 2;
-      const int i0 = warp * per;
-      const int tsh = __ffs(p.topk) - 1;
-      const bool tpow2 = (p.topk & (p.topk - 1)) == 0;
-      for (int idx = i0 + lane; idx < nent && idx < i0 + per; idx += 32) {
-        int t = tpow2 ? (idx >> tsh) : (idx / p.topk);
-        int blk = skey[idx];  // raw block id from phase A
-        int key = 0, tk = 0;
-        if (blk >= 0 && (!p.causal || blk * kBlockTok <= sm_tqp[t])) {
-          long base = PAGED
-              ? (long)__ldg(p.page_table + (long)sm_tbat[t] * p.pt_stride + blk)
-              : (long)__ldg(p.cu_k + sm_tbat[t]) + (long)blk * kBlockTok;
-          key = (int)base + 1;
-          tk = (blk << 4) | (1 << t);
+        __syncthreads();
+        // ---- phase B: filter + key/token words, 4-warp contiguous slices ----
+        const int per = (nent + 3) >> 2;
+        const int i0 = warp * per;
+        const int tsh = __ffs(p.topk) - 1;
+        const bool tpow2 = (p.topk & (p.topk - 1)) == 0;
+        for (int idx = i0 + lane; idx < nent && idx < i0 + per; idx += 32) {
+          int t = tpow2 ? (idx >> tsh) : (idx / p.topk);
+          int blk = skey[idx];  // raw block id from phase A
+          int key = 0, tk = 0;
+          if (blk >= 0 && (!p.causal || blk * kBlockTok <= sm_tqp[t])) {
+            long base = PAGED ? (long)__ldg(p.page_table + (long)sm_tbat[t] * p.pt_stride + blk)
+                              : (long)__ldg(p.cu_k + sm_tbat[t]) + (long)blk * kBlockTok;
+            key = (int)base + 1;
+            tk = (blk << 4) | (1 << t);
+          }
+          skey[idx] = key;
+          stok[idx] = tk;
         }
-        skey[idx] = key;
-        stok[idx] = tk;
-      }
-      __syncthreads();
-      // ---- phase C1: first-occurrence flags (one ballot per warp slice) ---
-      {
-        bool f = false;
-        int idx = i0 + lane;
-        if (idx < nent && idx < i0 + per) {
-          int ki = skey[idx];
-          f = ki > 0;
-          if (f)
-            for (int j = 0; j < idx; ++j)
-              if (skey[j] == ki) { f = false; break; }
+        __syncthreads();
+        // ---- phase C1: first-occurrence flags (one ballot per warp slice) ---
+        {
+          bool f = false;
+          int idx = i0 + lane;
+          if (idx < nent && idx < i0 + per) {
+            int ki = skey[idx];
+            f = ki > 0;
+            if (f)
+              for (int j = 0; j < idx; ++j)
+                if (skey[j] == ki) {
+                  f = false;
+                  break;
+                }
+          }
+          unsigned bal = __ballot_sync(0xffffffffu, f);
+          if (lane == 0 && bal)
+            atomicOr(reinterpret_cast<unsigned long long*>(sm_ufirst),
+                     (unsigned long long)bal << i0);
         }
-        unsigned bal = __ballot_sync(0xffffffffu, f);
-        if (lane == 0 && bal)
-          atomicOr(reinterpret_cast<unsigned long long*>(sm_ufirst),
-                   (unsigned long long)bal << i0);
-      }
-      __syncthreads();
-      const uint64_t fmask = *sm_ufirst;
-      // ---- phase C2: survivors store; position counts DISTINCT smaller
-      // keys (first-occurrence flags); duplicates merge token bits after ----
-      {
-        int idx = i0 + lane;
-        bool f = false;
-        if (idx < nent && idx < i0 + per) {
+        __syncthreads();
+        const uint64_t fmask = *sm_ufirst;
+        // ---- phase C2: survivors store; position counts DISTINCT smaller
+        // keys (first-occurrence flags); duplicates merge token bits after ----
+        {
+          int idx = i0 + lane;
+          bool f = false;
+          if (idx < nent && idx < i0 + per) {
+            int key = skey[idx];
+            f = key > 0 && ((fmask >> idx) & 1);
+            if (f) {
+              int pos = 0;
+              for (int j = 0; j < nent; ++j) {
+                int kj = skey[j];
+                pos += (kj > 0 && kj < key && ((fmask >> j) & 1));
+              }
+              sm_ubase[pos] = key - 1;
+              sm_utok[pos] = stok[idx];
+            }
+          }
+          unsigned sbal = __ballot_sync(0xffffffffu, f);
+          if (lane == 0 && sbal) atomicAdd(sm_cnt, __popc(sbal));
+        }
+        __syncthreads();  // survivor stores visible before duplicate merge
+        for (int idx = i0 + lane; idx < nent && idx < i0 + per; idx += 32) {
           int key = skey[idx];
-          f = key > 0 && ((fmask >> idx) & 1);
-          if (f) {
+          if (key > 0 && !((fmask >> idx) & 1)) {
             int pos = 0;
             for (int j = 0; j < nent; ++j) {
               int kj = skey[j];
               pos += (kj > 0 && kj < key && ((fmask >> j) & 1));
             }
-            sm_ubase[pos] = key - 1;
-            sm_utok[pos] = stok[idx];
+            atomicOr(&sm_utok[pos], stok[idx] & 0xF);
           }
         }
-        unsigned sbal = __ballot_sync(0xffffffffu, f);
-        if (lane == 0 && sbal) atomicAdd(sm_cnt, __popc(sbal));
-      }
-      __syncthreads();  // survivor stores visible before duplicate merge
-      for (int idx = i0 + lane; idx < nent && idx < i0 + per; idx += 32) {
-        int key = skey[idx];
-        if (key > 0 && !((fmask >> idx) & 1)) {
-          int pos = 0;
-          for (int j = 0; j < nent; ++j) {
-            int kj = skey[j];
-            pos += (kj > 0 && kj < key && ((fmask >> j) & 1));
+        __syncthreads();  // union final CTA-wide
+        // CLUSTER: hand the resolved union + row maps to rank 1 over DSM —
+        // ubase[40] + utok[40] + rqpos[16] + rtbit[16] = 112 ints = 448
+        // contiguous bytes from kUBaseOff (16B aligned), plus the entry count.
+        // The cluster arrival below carries release semantics, and the CTA
+        // barrier + arrival chain makes these stores visible to rank 1.
+        if constexpr (CLUSTER) {
+          if (warp == 0) {
+            const uint32_t r_ub = mapa_cta(smem_u32(sm_ubase), 1);
+            const uint4* src4 = reinterpret_cast<const uint4*>(sm_ubase);
+            for (int i = lane; i < 28; ++i) stsm_remote_v4u32(r_ub + i * 16, src4[i]);
+            if (lane == 0) stsm_remote_u32(mapa_cta(smem_u32(sm_cnt), 1), (uint32_t)*sm_cnt);
           }
-          atomicOr(&sm_utok[pos], stok[idx] & 0xF);
         }
       }
-      __syncthreads();  // union final CTA-wide
-      // CLUSTER: hand the resolved union + row maps to rank 1 over DSM —
-      // ubase[40] + utok[40] + rqpos[16] + rtbit[16] = 112 ints = 448
-      // contiguous bytes from kUBaseOff (16B aligned), plus the entry count.
-      // The cluster arrival below carries release semantics, and the CTA
-      // barrier + arrival chain makes these stores visible to rank 1.
-      if constexpr (CLUSTER) {
-        if (warp == 0) {
-          const uint32_t r_ub = mapa_cta(smem_u32(sm_ubase), 1);
-          const uint4* src4 = reinterpret_cast<const uint4*>(sm_ubase);
-          for (int i = lane; i < 28; ++i) stsm_remote_v4u32(r_ub + i * 16, src4[i]);
-          if (lane == 0)
-            stsm_remote_u32(mapa_cta(smem_u32(sm_cnt), 1), (uint32_t)*sm_cnt);
-        }
-      }
-    }
-    __syncthreads();  // build + (CLUSTER: rank-0 push issued) CTA-wide
-    if constexpr (CLUSTER) cluster_sync();  // pushed arrays visible to rank 1
-  } else {
-    if (warp == 0) {
-      for (int j = lane; j < p.topk; j += 32) {
-        int blk = __ldg(p.q2k + (long)h * p.q2k_h + (long)n * p.q2k_n + j);
-        bool ok = (blk >= 0) && (!p.causal || (blk * kBlockTok) <= qpos);
-        if (ok) sm_list[atomicAdd(sm_cnt, 1)] = blk;
-      }
-    }
-    __syncthreads();  // list + count visible
-  }
-  const int nblk = *sm_cnt;
-  const int nchunks = nblk * 2;  // 64-token chunks
-  // CLUSTER: this CTA consumes union blocks crank, crank+2, ... — local chunk
-  // count is 2x the local pair count; union block index of local chunk c is
-  // crank + (c & ~1). Grid covers every union block exactly once per tile.
-  const int nloc = CLUSTER ? (((nblk - crank + 1) >> 1) * 2) : nchunks;
-
-  // ---- TMA chunk issue helpers -------------------------------------------------
-  // bf16/fp16 joint-depth rings (VSL > 1): one mbarrier covers K+V per chunk
-  // (round-7 form). The single-V prefill variant (VSL == 1) splits K and V
-  // onto separate barriers so QK starts at K arrival while V streams in.
-  // fp8 keeps one joint barrier because convert_chunk consumes both tensors
-  // together.
-  auto issue_chunk = [&](int c, int bidx) {
-    // PACK: union entries carry the resolved TMA source (paged: physical
-    // page; flat: global token base) so no page_table/cu_k lookup is needed.
-    // bidx >= 0 (cluster pair) overrides the union index of chunk c.
-    int blk = PACK ? sm_ubase[bidx < 0 ? (c >> 1) : bidx] : sm_list[c >> 1];
-    int chalf = c & 1;
-    char* dst = sm_ring + (c % kStages) * S::kStageBytes;
-    if (KVK == 2) {
-      uint64_t* mb = &mbar[c % kStages];
-      mbar_expect_tx(mb, S::kStageBytes);
-      int32_t gc[4];
-      if (PAGED) {
-        int page = __ldg(p.page_table + (long)b * p.pt_stride + blk);
-        gc[0] = 0; gc[1] = chalf * kChunkTok; gc[2] = h; gc[3] = page;
-      } else {
-        gc[0] = 0; gc[1] = h; gc[2] = cu_kb + blk * kBlockTok + chalf * kChunkTok;
-      }
-      tma_load<TMA_RANK>(&kmap, mb, smem_u32(dst), gc);
-      tma_load<TMA_RANK>(&vmap, mb, smem_u32(dst + 64 * 128), gc);
+      __syncthreads();                        // build + (CLUSTER: rank-0 push issued) CTA-wide
+      if constexpr (CLUSTER) cluster_sync();  // pushed arrays visible to rank 1
     } else {
-      uint64_t* mbk = &mbar[c % kStages];
-      // Joint-barrier regime (VSL > 1): ONE expect covers K+V — round-7's
-      // form. Splitting K/V barriers measured a win only for the single-V
-      // prefill variant; on joint-depth rings the extra PV-side mbarrier
-      // spin cost ~3-4% (b128 q4 flat 211 -> 220 us, b3 q4096 topk4 paged
-      // 556 -> 574 us, round-9 A/B).
-      mbar_expect_tx(mbk, (JV ? 2 : 1) * S::kTensorBytes);
-      char* dst_k = sm_ring + (c % kStages) * S::kTensorBytes;
-      char* dst_v =
-          sm_ring + (kStages + (c % S::kVSlots)) * S::kTensorBytes;
+      if (warp == 0) {
+        for (int j = lane; j < p.topk; j += 32) {
+          int blk = __ldg(p.q2k + (long)h * p.q2k_h + (long)n * p.q2k_n + j);
+          bool ok = (blk >= 0) && (!p.causal || (blk * kBlockTok) <= qpos);
+          if (ok) sm_list[atomicAdd(sm_cnt, 1)] = blk;
+        }
+      }
+      __syncthreads();  // list + count visible
+    }
+    const int nblk = *sm_cnt;
+    const int nchunks = nblk * 2;  // 64-token chunks
+    // CLUSTER: this CTA consumes union blocks crank, crank+2, ... — local chunk
+    // count is 2x the local pair count; union block index of local chunk c is
+    // crank + (c & ~1). Grid covers every union block exactly once per tile.
+    const int nloc = CLUSTER ? (((nblk - crank + 1) >> 1) * 2) : nchunks;
+
+    // ---- TMA chunk issue helpers -------------------------------------------------
+    // bf16/fp16 joint-depth rings (VSL > 1): one mbarrier covers K+V per chunk
+    // (round-7 form). The single-V prefill variant (VSL == 1) splits K and V
+    // onto separate barriers so QK starts at K arrival while V streams in.
+    // fp8 keeps one joint barrier because convert_chunk consumes both tensors
+    // together.
+    auto issue_chunk = [&](int c, int bidx) {
+      // PACK: union entries carry the resolved TMA source (paged: physical
+      // page; flat: global token base) so no page_table/cu_k lookup is needed.
+      // bidx >= 0 (cluster pair) overrides the union index of chunk c.
+      int blk = PACK ? sm_ubase[bidx < 0 ? (c >> 1) : bidx] : sm_list[c >> 1];
+      int chalf = c & 1;
+      char* dst = sm_ring + (c % kStages) * S::kStageBytes;
+      if (KVK == 2) {
+        uint64_t* mb = &mbar[c % kStages];
+        mbar_expect_tx(mb, S::kStageBytes);
+        int32_t gc[4];
+        if (PAGED) {
+          int page = __ldg(p.page_table + (long)b * p.pt_stride + blk);
+          gc[0] = 0;
+          gc[1] = chalf * kChunkTok;
+          gc[2] = h;
+          gc[3] = page;
+        } else {
+          gc[0] = 0;
+          gc[1] = h;
+          gc[2] = cu_kb + blk * kBlockTok + chalf * kChunkTok;
+        }
+        tma_load<TMA_RANK>(&kmap, mb, smem_u32(dst), gc);
+        tma_load<TMA_RANK>(&vmap, mb, smem_u32(dst + 64 * 128), gc);
+      } else {
+        uint64_t* mbk = &mbar[c % kStages];
+        // Joint-barrier regime (VSL > 1): ONE expect covers K+V — round-7's
+        // form. Splitting K/V barriers measured a win only for the single-V
+        // prefill variant; on joint-depth rings the extra PV-side mbarrier
+        // spin cost ~3-4% (b128 q4 flat 211 -> 220 us, b3 q4096 topk4 paged
+        // 556 -> 574 us, round-9 A/B).
+        mbar_expect_tx(mbk, (JV ? 2 : 1) * S::kTensorBytes);
+        char* dst_k = sm_ring + (c % kStages) * S::kTensorBytes;
+        char* dst_v = sm_ring + (kStages + (c % S::kVSlots)) * S::kTensorBytes;
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+          int32_t gc[4];
+          if (PAGED) {
+            int page = PACK ? blk : __ldg(p.page_table + (long)b * p.pt_stride + blk);
+            gc[0] = half * 64;
+            gc[1] = chalf * kChunkTok;
+            gc[2] = h;
+            gc[3] = page;
+          } else {
+            gc[0] = half * 64;
+            gc[1] = h;
+            gc[2] =
+                PACK ? (blk + chalf * kChunkTok) : (cu_kb + blk * kBlockTok + chalf * kChunkTok);
+          }
+          tma_load<TMA_RANK>(&kmap, mbk, smem_u32(dst_k + half * (64 * 128)), gc);
+          if (JV) tma_load<TMA_RANK>(&vmap, mbk, smem_u32(dst_v + half * (64 * 128)), gc);
+        }
+      }
+    };
+
+    // V half of chunk c (single-V prefill variant only; joint rings load V
+    // inside issue_chunk): the sole V slot lives past the K slots at
+    // sm_ring + kStages. Issued at chunk-consume top (write window =
+    // QK+softmax of c); PV(c)'s ldmatrix reads are fenced from the next V
+    // write by the loop's per-chunk __syncthreads. Barrier phase toggles per
+    // use (parity c&1).
+    auto issue_v = [&](int c) {
+      int blk = PACK ? sm_ubase[c >> 1] : sm_list[c >> 1];
+      int chalf = c & 1;
+      uint64_t* mbv = &mbar[kStages + (c % S::kVSlots)];
+      mbar_expect_tx(mbv, S::kTensorBytes);
+      char* dst_v = sm_ring + kStages * S::kTensorBytes + (c % S::kVSlots) * S::kTensorBytes;
 #pragma unroll
       for (int half = 0; half < 2; ++half) {
         int32_t gc[4];
         if (PAGED) {
           int page = PACK ? blk : __ldg(p.page_table + (long)b * p.pt_stride + blk);
-          gc[0] = half * 64; gc[1] = chalf * kChunkTok; gc[2] = h; gc[3] = page;
+          gc[0] = half * 64;
+          gc[1] = chalf * kChunkTok;
+          gc[2] = h;
+          gc[3] = page;
         } else {
-          gc[0] = half * 64; gc[1] = h;
-          gc[2] = PACK ? (blk + chalf * kChunkTok)
-                       : (cu_kb + blk * kBlockTok + chalf * kChunkTok);
+          gc[0] = half * 64;
+          gc[1] = h;
+          gc[2] = PACK ? (blk + chalf * kChunkTok) : (cu_kb + blk * kBlockTok + chalf * kChunkTok);
         }
-        tma_load<TMA_RANK>(&kmap, mbk, smem_u32(dst_k + half * (64 * 128)), gc);
-        if (JV)
-          tma_load<TMA_RANK>(&vmap, mbk, smem_u32(dst_v + half * (64 * 128)), gc);
+        tma_load<TMA_RANK>(&vmap, mbv, smem_u32(dst_v + half * (64 * 128)), gc);
       }
-    }
-  };
+    };
 
-  // V half of chunk c (single-V prefill variant only; joint rings load V
-  // inside issue_chunk): the sole V slot lives past the K slots at
-  // sm_ring + kStages. Issued at chunk-consume top (write window =
-  // QK+softmax of c); PV(c)'s ldmatrix reads are fenced from the next V
-  // write by the loop's per-chunk __syncthreads. Barrier phase toggles per
-  // use (parity c&1).
-  auto issue_v = [&](int c) {
-    int blk = PACK ? sm_ubase[c >> 1] : sm_list[c >> 1];
-    int chalf = c & 1;
-    uint64_t* mbv = &mbar[kStages + (c % S::kVSlots)];
-    mbar_expect_tx(mbv, S::kTensorBytes);
-    char* dst_v = sm_ring + kStages * S::kTensorBytes + (c % S::kVSlots) * S::kTensorBytes;
+    // ---- 3-buffer pair-ring issues (PACK pair !JV form, round 21) -------------
+    // Slot map in the 48KB ring: S0=[0,16KB) K, S1=[16KB,32KB) K then re-armed
+    // as V mid-pair, SLV=[32KB,48KB) the single rolling V slot. Barriers: b0 /
+    // b1 / bV = mbar[0/1/2]. Per pair p: b0 and bV see one use each (parity
+    // p&1); b1 sees two uses — K(c+1) (use 2p, parity 0) then V(c+1) (use
+    // 2p+1, parity 1) — all phases issued strictly in order by tid0.
+    auto issue3b_k = [&](int c, int slot) {
+      int blk = sm_ubase[c >> 1];
+      int chalf = c & 1;
+      uint64_t* mb = &mbar[slot];
+      mbar_expect_tx(mb, S::kTensorBytes);
+      char* dst = sm_ring + slot * S::kTensorBytes;
 #pragma unroll
-    for (int half = 0; half < 2; ++half) {
-      int32_t gc[4];
-      if (PAGED) {
-        int page = PACK ? blk : __ldg(p.page_table + (long)b * p.pt_stride + blk);
-        gc[0] = half * 64; gc[1] = chalf * kChunkTok; gc[2] = h; gc[3] = page;
-      } else {
-        gc[0] = half * 64; gc[1] = h;
-        gc[2] = PACK ? (blk + chalf * kChunkTok)
-                     : (cu_kb + blk * kBlockTok + chalf * kChunkTok);
-      }
-      tma_load<TMA_RANK>(&vmap, mbv, smem_u32(dst_v + half * (64 * 128)), gc);
-    }
-  };
-
-  // ---- 3-buffer pair-ring issues (PACK pair !JV form, round 21) -------------
-  // Slot map in the 48KB ring: S0=[0,16KB) K, S1=[16KB,32KB) K then re-armed
-  // as V mid-pair, SLV=[32KB,48KB) the single rolling V slot. Barriers: b0 /
-  // b1 / bV = mbar[0/1/2]. Per pair p: b0 and bV see one use each (parity
-  // p&1); b1 sees two uses — K(c+1) (use 2p, parity 0) then V(c+1) (use
-  // 2p+1, parity 1) — all phases issued strictly in order by tid0.
-  auto issue3b_k = [&](int c, int slot) {
-    int blk = sm_ubase[c >> 1];
-    int chalf = c & 1;
-    uint64_t* mb = &mbar[slot];
-    mbar_expect_tx(mb, S::kTensorBytes);
-    char* dst = sm_ring + slot * S::kTensorBytes;
-#pragma unroll
-    for (int half = 0; half < 2; ++half) {
-      int32_t gc[4];
-      if (PAGED) {
-        gc[0] = half * 64; gc[1] = chalf * kChunkTok; gc[2] = h; gc[3] = blk;
-      } else {
-        gc[0] = half * 64; gc[1] = h;
-        gc[2] = blk + chalf * kChunkTok;
-      }
-      tma_load<TMA_RANK>(&kmap, mb, smem_u32(dst + half * (64 * 128)), gc);
-    }
-  };
-  auto issue3b_v = [&](int c, int slot) {
-    int blk = sm_ubase[c >> 1];
-    int chalf = c & 1;
-    uint64_t* mb = &mbar[slot];
-    mbar_expect_tx(mb, S::kTensorBytes);
-    char* dst = sm_ring + slot * S::kTensorBytes;
-#pragma unroll
-    for (int half = 0; half < 2; ++half) {
-      int32_t gc[4];
-      if (PAGED) {
-        gc[0] = half * 64; gc[1] = chalf * kChunkTok; gc[2] = h; gc[3] = blk;
-      } else {
-        gc[0] = half * 64; gc[1] = h;
-        gc[2] = blk + chalf * kChunkTok;
-      }
-      tma_load<TMA_RANK>(&vmap, mb, smem_u32(dst + half * (64 * 128)), gc);
-    }
-  };
-
-  if (tid == 0) {
-    // Pair mode pre-issues only the first 128-token pair; the pair loop
-    // pre-issues chunk c+2/c+3 at pair top (split-V) or past the loop-end
-    // barrier (joint), so a kStages-1 prologue would double-issue chunk 2
-    // (two arrives on one mbarrier phase -> trap).
-    const int npro = PAIRP ? 2 : (kStages - 1);
-    if constexpr (CLUSTER) {
-      // Local chunks 0/1 are the two halves of this rank's first union block.
-      for (int c = 0; c < npro && c < nloc; ++c) issue_chunk(c, crank);
-    } else if constexpr (PAIRP && !JV) {
-      // 3-buffer: K(0)->S0, K(1)->S1, V(0)->SLV (nloc is even when nonzero).
-      if (nloc > 0) {
-        issue3b_k(0, 0);
-        issue3b_k(1, 1);
-        issue3b_v(0, 2);
-      }
-    } else {
-      for (int c = 0; c < npro && c < nchunks; ++c) issue_chunk(c, -1);
-    }
-  }
-
-  cp_wait<0>();
-  __syncthreads();  // Q tile visible
-
-  // ---- load Q fragments into registers -------------------------------------
-  // The 3-buffer pair form (!JV) skips this persistent staging to stay at the
-  // 128-reg/thread bound of 4 CTAs/SM; its QK restages Q from smem per pair
-  // (persistent-Q at 128 regs spilled 32B and measured 435.9 vs 394.3 f9).
-  uint32_t qa[8][4];  // [k16 step][a0..a3]
-  if constexpr (!(PAIRP && !JV)) {
-#pragma unroll
-  for (int kk = 0; kk < 8; ++kk) {
-    int row = lane & 15;
-    int seg = (kk & 3) * 2 + (lane >> 4);
-    ldsm_x4(qa[kk], smem_u32(sm_q + (kk >> 2) * (kRows * 128) + tile_off(row, seg)));
-  }
-  }
-
-  // ---- per-warp softmax state ----------------------------------------------
-  float m0 = -1e38f, m1 = -1e38f, l0 = 0.f, l1 = 0.f;
-  float acc[16][4];
-#pragma unroll
-  for (int i = 0; i < 16; ++i)
-#pragma unroll
-    for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
-
-  const int kcol0 = (lane & 3) * 2;
-
-  // PACK: this thread's two fragment rows belong to (possibly) two packed
-  // tokens — hoist their causal positions and token-mask bits to registers.
-  int qp0 = 0, qp1 = 0, bit0 = 0, bit1 = 0;
-  if constexpr (PACK) {
-    const int r0 = lane >> 2;
-    qp0 = sm_rqpos[r0];
-    qp1 = sm_rqpos[r0 + 8];
-    bit0 = sm_rtbit[r0];
-    bit1 = sm_rtbit[r0 + 8];
-  }
-
-  // fp8 -> bf16 conversion of this warp's 16 rows of K and V.
-  // uint4 loads (16 fp8) -> four u64 stores into the swizzled split atoms.
-  auto convert_chunk = [&](int c) {
-    const char* rk = sm_ring + (c % kStages) * S::kStageBytes;
-    const char* rv = rk + 64 * 128;
-    const int r0 = warp * kWarpTok;
-#pragma unroll
-    for (int tensor = 0; tensor < 2; ++tensor) {
-      const char* src = tensor ? rv : rk;
-      char* ct = sm_conv + tensor * (2 * 64 * 128);
-#pragma unroll
-      for (int it = 0; it < 4; ++it) {
-        int i = lane + it * 32;         // 0..127
-        int r = r0 + (i >> 3);          // row within tile
-        int s = i & 7;                  // 16B seg of raw row
-        uint4 raw = *reinterpret_cast<const uint4*>(src + r * 128 + s * 16);
-        char* hbase = ct + (s >> 2) * (64 * 128);
-        int ws0 = 2 * (s & 3);          // within-half 16B seg base
-        uint32_t xs[4] = {raw.x, raw.y, raw.z, raw.w};
-        // Bank-conflict-free store schedule: the u64 for raw word t lands in
-        // bank pair P = ((2*(s&3) + (t>>1)) ^ (r&7))*2 + (t&1). With lockstep
-        // t-order every lane of the warp hits only 8 of the 16 bank pairs per
-        // store instruction (~4-way conflict, measured 40% excessive smem
-        // wavefronts). Rotating the per-lane store order by
-        // g = ((s&3) ^ (r&3)) ^ ((s>>2)*2) spreads each instruction's 32
-        // stores over all 16 bank pairs exactly twice (2 wavefronts, the
-        // minimum for 8B stores) — verified by enumeration of (M,x,h)
-        // groups; each lane still stores all 4 of its words over 4 steps.
-        int g = ((s & 3) ^ (r & 3)) ^ ((s >> 2) << 1);
-        // Convert the 4 raw words to bf16 u64s with STATIC indices (dynamic
-        // xs[t] would force the array to local memory).
-        uint64_t ws_w[4];
-#pragma unroll
-        for (int t = 0; t < 4; ++t) {
-          ws_w[t] = cvt_fp8x4_bf16(xs[t]);
+      for (int half = 0; half < 2; ++half) {
+        int32_t gc[4];
+        if (PAGED) {
+          gc[0] = half * 64;
+          gc[1] = chalf * kChunkTok;
+          gc[2] = h;
+          gc[3] = blk;
+        } else {
+          gc[0] = half * 64;
+          gc[1] = h;
+          gc[2] = blk + chalf * kChunkTok;
         }
-        // Two static segment addresses; per-step SEL picks word/address per
-        // the rotated schedule (lockstep, no divergence, no local memory).
-        char* a0 = hbase + tile_off(r, ws0);
-        char* a1 = hbase + tile_off(r, ws0 + 1);
+        tma_load<TMA_RANK>(&kmap, mb, smem_u32(dst + half * (64 * 128)), gc);
+      }
+    };
+    auto issue3b_v = [&](int c, int slot) {
+      int blk = sm_ubase[c >> 1];
+      int chalf = c & 1;
+      uint64_t* mb = &mbar[slot];
+      mbar_expect_tx(mb, S::kTensorBytes);
+      char* dst = sm_ring + slot * S::kTensorBytes;
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          int t = (j + g) & 3;
-          uint64_t wlo = (t & 2) ? ws_w[2] : ws_w[0];
-          uint64_t whi = (t & 2) ? ws_w[3] : ws_w[1];
-          uint64_t w = (t & 1) ? whi : wlo;
-          char* a = ((t & 2) ? a1 : a0) + ((t & 1) << 3);
-          *reinterpret_cast<uint64_t*>(a) = w;
+      for (int half = 0; half < 2; ++half) {
+        int32_t gc[4];
+        if (PAGED) {
+          gc[0] = half * 64;
+          gc[1] = chalf * kChunkTok;
+          gc[2] = h;
+          gc[3] = blk;
+        } else {
+          gc[0] = half * 64;
+          gc[1] = h;
+          gc[2] = blk + chalf * kChunkTok;
         }
+        tma_load<TMA_RANK>(&vmap, mb, smem_u32(dst + half * (64 * 128)), gc);
+      }
+    };
+
+    if (tid == 0) {
+      // Pair mode pre-issues only the first 128-token pair; the pair loop
+      // pre-issues chunk c+2/c+3 at pair top (split-V) or past the loop-end
+      // barrier (joint), so a kStages-1 prologue would double-issue chunk 2
+      // (two arrives on one mbarrier phase -> trap).
+      const int npro = PAIRP ? 2 : (kStages - 1);
+      if constexpr (CLUSTER) {
+        // Local chunks 0/1 are the two halves of this rank's first union block.
+        for (int c = 0; c < npro && c < nloc; ++c) issue_chunk(c, crank);
+      } else if constexpr (PAIRP && !JV) {
+        // 3-buffer: K(0)->S0, K(1)->S1, V(0)->SLV (nloc is even when nonzero).
+        if (nloc > 0) {
+          issue3b_k(0, 0);
+          issue3b_k(1, 1);
+          issue3b_v(0, 2);
+        }
+      } else {
+        for (int c = 0; c < npro && c < nchunks; ++c) issue_chunk(c, -1);
       }
     }
-    __syncwarp();
-  };
 
-  // ---- consume one 64-token chunk -------------------------------------------
-  // bf16/fp16 ring layout: [K x kStages slots 16KB each | V x kVSlots slots].
-  // Prefill (NSTG=2): single V slot — V(c) is issued at chunk top and its
-  // write window only has to beat the post-softmax PV read; the saved 16KB
-  // raises the CTA limit 3 -> 4 per SM. Decode (NSTG=3): full-depth V ring
-  // issued at K-pipeline lookahead (see main loop). fp8 keeps the joint
-  // K+V stage (convert path).
-  auto consume_chunk = [&](int c) {
-    const char* tk;
-    const char* tv;
-    if (KVK == 2) {
-      tk = sm_conv;
-      tv = sm_conv + 64 * 256;
-    } else {
-      tk = sm_ring + (c % kStages) * (64 * 128 * 2);
-      tv = sm_ring + (kStages + (c % S::kVSlots)) * (64 * 128 * 2);
+    cp_wait<0>();
+    __syncthreads();  // Q tile visible
+
+    // ---- load Q fragments into registers -------------------------------------
+    // The 3-buffer pair form (!JV) skips this persistent staging to stay at the
+    // 128-reg/thread bound of 4 CTAs/SM; its QK restages Q from smem per pair
+    // (persistent-Q at 128 regs spilled 32B and measured 435.9 vs 394.3 f9).
+    uint32_t qa[8][4];  // [k16 step][a0..a3]
+    if constexpr (!(PAIRP && !JV)) {
+#pragma unroll
+      for (int kk = 0; kk < 8; ++kk) {
+        int row = lane & 15;
+        int seg = (kk & 3) * 2 + (lane >> 4);
+        ldsm_x4(qa[kk], smem_u32(sm_q + (kk >> 2) * (kRows * 128) + tile_off(row, seg)));
+      }
     }
-    // PACK: union word gives the logical block (for the causal compare — the
-    // TMA source is already resolved at issue time) and the token mask.
-    int tm = 0;
-    int blk;
+
+    // ---- per-warp softmax state ----------------------------------------------
+    float m0 = -1e38f, m1 = -1e38f, l0 = 0.f, l1 = 0.f;
+    float acc[16][4];
+#pragma unroll
+    for (int i = 0; i < 16; ++i)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) acc[i][j] = 0.f;
+
+    const int kcol0 = (lane & 3) * 2;
+
+    // PACK: this thread's two fragment rows belong to (possibly) two packed
+    // tokens — hoist their causal positions and token-mask bits to registers.
+    int qp0 = 0, qp1 = 0, bit0 = 0, bit1 = 0;
     if constexpr (PACK) {
-      int uw = sm_utok[c >> 1];
-      tm = uw & 0xF;
-      blk = uw >> 4;
-    } else {
-      blk = sm_list[c >> 1];
+      const int r0 = lane >> 2;
+      qp0 = sm_rqpos[r0];
+      qp1 = sm_rqpos[r0 + 8];
+      bit0 = sm_rtbit[r0];
+      bit1 = sm_rtbit[r0 + 8];
     }
-    const int tok_base = blk * kBlockTok + (c & 1) * kChunkTok + warp * kWarpTok;
 
-    float s[2][4];
+    // fp8 -> bf16 conversion of this warp's 16 rows of K and V.
+    // uint4 loads (16 fp8) -> four u64 stores into the swizzled split atoms.
+    auto convert_chunk = [&](int c) {
+      const char* rk = sm_ring + (c % kStages) * S::kStageBytes;
+      const char* rv = rk + 64 * 128;
+      const int r0 = warp * kWarpTok;
 #pragma unroll
-    for (int j = 0; j < 2; ++j)
+      for (int tensor = 0; tensor < 2; ++tensor) {
+        const char* src = tensor ? rv : rk;
+        char* ct = sm_conv + tensor * (2 * 64 * 128);
 #pragma unroll
-      for (int q4 = 0; q4 < 4; ++q4) s[j][q4] = 0.f;
+        for (int it = 0; it < 4; ++it) {
+          int i = lane + it * 32;  // 0..127
+          int r = r0 + (i >> 3);   // row within tile
+          int s = i & 7;           // 16B seg of raw row
+          uint4 raw = *reinterpret_cast<const uint4*>(src + r * 128 + s * 16);
+          char* hbase = ct + (s >> 2) * (64 * 128);
+          int ws0 = 2 * (s & 3);  // within-half 16B seg base
+          uint32_t xs[4] = {raw.x, raw.y, raw.z, raw.w};
+          // Bank-conflict-free store schedule: the u64 for raw word t lands in
+          // bank pair P = ((2*(s&3) + (t>>1)) ^ (r&7))*2 + (t&1). With lockstep
+          // t-order every lane of the warp hits only 8 of the 16 bank pairs per
+          // store instruction (~4-way conflict, measured 40% excessive smem
+          // wavefronts). Rotating the per-lane store order by
+          // g = ((s&3) ^ (r&3)) ^ ((s>>2)*2) spreads each instruction's 32
+          // stores over all 16 bank pairs exactly twice (2 wavefronts, the
+          // minimum for 8B stores) — verified by enumeration of (M,x,h)
+          // groups; each lane still stores all 4 of its words over 4 steps.
+          int g = ((s & 3) ^ (r & 3)) ^ ((s >> 2) << 1);
+          // Convert the 4 raw words to bf16 u64s with STATIC indices (dynamic
+          // xs[t] would force the array to local memory).
+          uint64_t ws_w[4];
+#pragma unroll
+          for (int t = 0; t < 4; ++t) {
+            ws_w[t] = cvt_fp8x4_bf16(xs[t]);
+          }
+          // Two static segment addresses; per-step SEL picks word/address per
+          // the rotated schedule (lockstep, no divergence, no local memory).
+          char* a0 = hbase + tile_off(r, ws0);
+          char* a1 = hbase + tile_off(r, ws0 + 1);
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            int t = (j + g) & 3;
+            uint64_t wlo = (t & 2) ? ws_w[2] : ws_w[0];
+            uint64_t whi = (t & 2) ? ws_w[3] : ws_w[1];
+            uint64_t w = (t & 1) ? whi : wlo;
+            char* a = ((t & 2) ? a1 : a0) + ((t & 1) << 3);
+            *reinterpret_cast<uint64_t*>(a) = w;
+          }
+        }
+      }
+      __syncwarp();
+    };
 
-    // S = Q . K^T (this warp's 16 tokens) via x4 ldmatrix on 2 n8 tiles
-    // ldsm x4 reg order: (tok0-7,klo),(tok8-15,klo),(tok0-7,khi),(tok8-15,khi)
-    if constexpr (PACK) {
-      // Dual accumulator chains per n8 tile: the 8-step k loop otherwise
-      // serializes 8 dependent HMMA accumulations per tile (~130-190cyc of
-      // fixed-latency wait, the top stall at 28.5%). Alternating kk between
-      // sb[0]/sb[1] halves the chain; +8 fp32 regs (short-lived, QK scope).
-      // The step kk+1 ldmatrix prefetch also rides the MMA issue window.
-      float sb[2][4];
+    // ---- consume one 64-token chunk -------------------------------------------
+    // bf16/fp16 ring layout: [K x kStages slots 16KB each | V x kVSlots slots].
+    // Prefill (NSTG=2): single V slot — V(c) is issued at chunk top and its
+    // write window only has to beat the post-softmax PV read; the saved 16KB
+    // raises the CTA limit 3 -> 4 per SM. Decode (NSTG=3): full-depth V ring
+    // issued at K-pipeline lookahead (see main loop). fp8 keeps the joint
+    // K+V stage (convert path).
+    auto consume_chunk = [&](int c) {
+      const char* tk;
+      const char* tv;
+      if (KVK == 2) {
+        tk = sm_conv;
+        tv = sm_conv + 64 * 256;
+      } else {
+        tk = sm_ring + (c % kStages) * (64 * 128 * 2);
+        tv = sm_ring + (kStages + (c % S::kVSlots)) * (64 * 128 * 2);
+      }
+      // PACK: union word gives the logical block (for the causal compare — the
+      // TMA source is already resolved at issue time) and the token mask.
+      int tm = 0;
+      int blk;
+      if constexpr (PACK) {
+        int uw = sm_utok[c >> 1];
+        tm = uw & 0xF;
+        blk = uw >> 4;
+      } else {
+        blk = sm_list[c >> 1];
+      }
+      const int tok_base = blk * kBlockTok + (c & 1) * kChunkTok + warp * kWarpTok;
+
+      float s[2][4];
 #pragma unroll
       for (int j = 0; j < 2; ++j)
 #pragma unroll
-        for (int q4 = 0; q4 < 4; ++q4) sb[j][q4] = 0.f;
-      uint32_t bn[4];
-      {
-        int row = warp * kWarpTok + (lane & 15);
-        int seg = (lane >> 4);
-        ldsm_x4(bn, smem_u32(tk + tile_off(row, seg)));
-      }
+        for (int q4 = 0; q4 < 4; ++q4) s[j][q4] = 0.f;
+
+      // S = Q . K^T (this warp's 16 tokens) via x4 ldmatrix on 2 n8 tiles
+      // ldsm x4 reg order: (tok0-7,klo),(tok8-15,klo),(tok0-7,khi),(tok8-15,khi)
+      if constexpr (PACK) {
+        // Dual accumulator chains per n8 tile: the 8-step k loop otherwise
+        // serializes 8 dependent HMMA accumulations per tile (~130-190cyc of
+        // fixed-latency wait, the top stall at 28.5%). Alternating kk between
+        // sb[0]/sb[1] halves the chain; +8 fp32 regs (short-lived, QK scope).
+        // The step kk+1 ldmatrix prefetch also rides the MMA issue window.
+        float sb[2][4];
 #pragma unroll
-      for (int kk = 0; kk < 8; ++kk) {
-        uint32_t bc[4] = {bn[0], bn[1], bn[2], bn[3]};
-        if (kk < 7) {
+        for (int j = 0; j < 2; ++j)
+#pragma unroll
+          for (int q4 = 0; q4 < 4; ++q4) sb[j][q4] = 0.f;
+        uint32_t bn[4];
+        {
           int row = warp * kWarpTok + (lane & 15);
-          int seg = ((kk + 1) & 3) * 2 + (lane >> 4);
-          ldsm_x4(bn, smem_u32(tk + ((kk + 1) >> 2) * (64 * 128) + tile_off(row, seg)));
+          int seg = (lane >> 4);
+          ldsm_x4(bn, smem_u32(tk + tile_off(row, seg)));
         }
-        uint32_t b0[2] = {bc[0], bc[2]};  // n8 tile 0: klo, khi
-        uint32_t b1[2] = {bc[1], bc[3]};  // n8 tile 1: klo, khi
-        Mma<QT>::run(kk & 1 ? sb[0] : s[0], qa[kk], b0);
-        Mma<QT>::run(kk & 1 ? sb[1] : s[1], qa[kk], b1);
-      }
 #pragma unroll
-      for (int q4 = 0; q4 < 4; ++q4) {
-        s[0][q4] += sb[0][q4];
-        s[1][q4] += sb[1][q4];
-      }
-    } else {
+        for (int kk = 0; kk < 8; ++kk) {
+          uint32_t bc[4] = {bn[0], bn[1], bn[2], bn[3]};
+          if (kk < 7) {
+            int row = warp * kWarpTok + (lane & 15);
+            int seg = ((kk + 1) & 3) * 2 + (lane >> 4);
+            ldsm_x4(bn, smem_u32(tk + ((kk + 1) >> 2) * (64 * 128) + tile_off(row, seg)));
+          }
+          uint32_t b0[2] = {bc[0], bc[2]};  // n8 tile 0: klo, khi
+          uint32_t b1[2] = {bc[1], bc[3]};  // n8 tile 1: klo, khi
+          Mma<QT>::run(kk & 1 ? sb[0] : s[0], qa[kk], b0);
+          Mma<QT>::run(kk & 1 ? sb[1] : s[1], qa[kk], b1);
+        }
 #pragma unroll
-      for (int kk = 0; kk < 8; ++kk) {
-        uint32_t b[4];
+        for (int q4 = 0; q4 < 4; ++q4) {
+          s[0][q4] += sb[0][q4];
+          s[1][q4] += sb[1][q4];
+        }
+      } else {
+#pragma unroll
+        for (int kk = 0; kk < 8; ++kk) {
+          uint32_t b[4];
+          int row = warp * kWarpTok + (lane & 15);
+          int seg = (kk & 3) * 2 + (lane >> 4);
+          ldsm_x4(b, smem_u32(tk + (kk >> 2) * (64 * 128) + tile_off(row, seg)));
+          uint32_t b0[2] = {b[0], b[2]};  // n8 tile 0: klo, khi
+          uint32_t b1[2] = {b[1], b[3]};  // n8 tile 1: klo, khi
+          Mma<QT>::run(s[0], qa[kk], b0);
+          Mma<QT>::run(s[1], qa[kk], b1);
+        }
+      }
+
+      // selection/causal mask in RAW score space (PACK: per-row token bit +
+      // per-row causal position). The softmax scale is NOT applied here: the
+      // max tree/online state stay unscaled and the scale enters once per row
+      // as ns = -mn*scale, making each exp2 argument a single FFMA instead of
+      // a scale-FMUL + FSUB pair. Max comparisons are scale-invariant.
+#pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        int tok = tok_base + j * 8 + kcol0;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          if constexpr (PACK) {
+            bool ok0 = (tm & bit0) && (!p.causal || (tok + i) <= qp0);
+            bool ok1 = (tm & bit1) && (!p.causal || (tok + i) <= qp1);
+            s[j][i] = ok0 ? s[j][i] : -1e38f;
+            s[j][2 + i] = ok1 ? s[j][2 + i] : -1e38f;
+          } else {
+            bool ok = !p.causal || (tok + i) <= qpos;
+            s[j][i] = ok ? s[j][i] : -1e38f;
+            s[j][2 + i] = ok ? s[j][2 + i] : -1e38f;
+          }
+        }
+      }
+
+      // PV step-0 ldsm prefetch, issued before the exp2/shfl softmax chain so
+      // its LDS latency hides under it (jointly-resident on VSL>1 rings);
+      // discarded harmlessly on fully-masked chunks.
+      uint32_t bv[4];
+      if constexpr (PACK) {
+        int row = warp * kWarpTok + (lane & 15);
+        ldsm_x4_trans(bv, smem_u32(tv + tile_off(row, lane >> 4)));
+      }
+
+      float rmax0 = fmaxf(fmaxf(s[0][0], s[0][1]), fmaxf(s[1][0], s[1][1]));
+      float rmax1 = fmaxf(fmaxf(s[0][2], s[0][3]), fmaxf(s[1][2], s[1][3]));
+      if constexpr (PACK) {
+        // 64-bit packed shfl tree: both row maxima reduced with 2 shfls
+        // instead of 4 (softmax scalar chain is 28.5% of warp stalls).
+        unsigned long long mp = ((unsigned long long)__float_as_uint(rmax0) << 32) |
+                                (unsigned long long)__float_as_uint(rmax1);
+        unsigned long long x1 = __shfl_xor_sync(0xffffffffu, mp, 1);
+        rmax0 = fmaxf(__uint_as_float((unsigned)(mp >> 32)), __uint_as_float((unsigned)(x1 >> 32)));
+        rmax1 = fmaxf(__uint_as_float((unsigned)mp), __uint_as_float((unsigned)x1));
+        mp = ((unsigned long long)__float_as_uint(rmax0) << 32) |
+             (unsigned long long)__float_as_uint(rmax1);
+        unsigned long long x2 = __shfl_xor_sync(0xffffffffu, mp, 2);
+        rmax0 = fmaxf(rmax0, __uint_as_float((unsigned)(x2 >> 32)));
+        rmax1 = fmaxf(rmax1, __uint_as_float((unsigned)x2));
+      } else {
+        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffff, rmax0, 1));
+        rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffff, rmax0, 2));
+        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffff, rmax1, 1));
+        rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffff, rmax1, 2));
+      }
+
+      // PACK: this predicate is only quad-uniform — each quad's two rows carry
+      // different packed-token bits/causal positions, so one row pair can be
+      // fully masked while another is live. The branch body holds warp-
+      // collective ops (shfl reduce, ldmatrix, HMMA); divergent entry
+      // deadlocks. Promote the test to warp-uniform via __any_sync: fully-
+      // masked quads contribute exact zeros (pe guards + the mn>m rescale skip
+      // already handle all-(-inf) rows). Non-PACK rows share one token mask,
+      // so the quad predicate is already warp-uniform there — keep it.
+      const bool anylive = PACK ? __any_sync(0xffffffffu, (rmax0 > -1e37f) || (rmax1 > -1e37f))
+                                : ((rmax0 > -1e37f) || (rmax1 > -1e37f));
+      if (anylive) {
+        float mn0 = fmaxf(m0, rmax0);
+        float mn1 = fmaxf(m1, rmax1);
+        const float ns0 = -mn0 * p.scale_log2e;  // raw-space max -> scaled exp2 bias
+        const float ns1 = -mn1 * p.scale_log2e;
+        // skip the accumulator rescale entirely when the row maxima did not move
+        if (mn0 > m0 || mn1 > m1) {
+          float f0 = exp2f(fmaf(m0, p.scale_log2e, ns0));
+          float f1 = exp2f(fmaf(m1, p.scale_log2e, ns1));
+          l0 *= f0;
+          l1 *= f1;
+#pragma unroll
+          for (int dt = 0; dt < 16; ++dt) {
+            acc[dt][0] *= f0;
+            acc[dt][1] *= f0;
+            acc[dt][2] *= f1;
+            acc[dt][3] *= f1;
+          }
+        }
+        m0 = mn0;
+        m1 = mn1;
+        float pe[2][4];
+        pe[0][0] = (s[0][0] <= -1e37f) ? 0.f : exp2f(fmaf(s[0][0], p.scale_log2e, ns0));
+        pe[0][1] = (s[0][1] <= -1e37f) ? 0.f : exp2f(fmaf(s[0][1], p.scale_log2e, ns0));
+        pe[0][2] = (s[0][2] <= -1e37f) ? 0.f : exp2f(fmaf(s[0][2], p.scale_log2e, ns1));
+        pe[0][3] = (s[0][3] <= -1e37f) ? 0.f : exp2f(fmaf(s[0][3], p.scale_log2e, ns1));
+        pe[1][0] = (s[1][0] <= -1e37f) ? 0.f : exp2f(fmaf(s[1][0], p.scale_log2e, ns0));
+        pe[1][1] = (s[1][1] <= -1e37f) ? 0.f : exp2f(fmaf(s[1][1], p.scale_log2e, ns0));
+        pe[1][2] = (s[1][2] <= -1e37f) ? 0.f : exp2f(fmaf(s[1][2], p.scale_log2e, ns1));
+        pe[1][3] = (s[1][3] <= -1e37f) ? 0.f : exp2f(fmaf(s[1][3], p.scale_log2e, ns1));
+        float rs0 = pe[0][0] + pe[0][1] + pe[1][0] + pe[1][1];
+        float rs1 = pe[0][2] + pe[0][3] + pe[1][2] + pe[1][3];
+        if constexpr (PACK) {
+          unsigned long long rp = ((unsigned long long)__float_as_uint(rs0) << 32) |
+                                  (unsigned long long)__float_as_uint(rs1);
+          unsigned long long y1 = __shfl_xor_sync(0xffffffffu, rp, 1);
+          rs0 += __uint_as_float((unsigned)(y1 >> 32));
+          rs1 += __uint_as_float((unsigned)y1);
+          rp = ((unsigned long long)__float_as_uint(rs0) << 32) |
+               (unsigned long long)__float_as_uint(rs1);
+          unsigned long long y2 = __shfl_xor_sync(0xffffffffu, rp, 2);
+          rs0 += __uint_as_float((unsigned)(y2 >> 32));
+          rs1 += __uint_as_float((unsigned)y2);
+        } else {
+          rs0 += __shfl_xor_sync(0xffffffff, rs0, 1);
+          rs0 += __shfl_xor_sync(0xffffffff, rs0, 2);
+          rs1 += __shfl_xor_sync(0xffffffff, rs1, 1);
+          rs1 += __shfl_xor_sync(0xffffffff, rs1, 2);
+        }
+        l0 += rs0;
+        l1 += rs1;
+
+        uint32_t a[4];
+        a[0] = Mma<QT>::pack(pe[0][0], pe[0][1]);
+        a[1] = Mma<QT>::pack(pe[0][2], pe[0][3]);
+        a[2] = Mma<QT>::pack(pe[1][0], pe[1][1]);
+        a[3] = Mma<QT>::pack(pe[1][2], pe[1][3]);
+
+        // V of this chunk only needs to be resident by PV time: QK+softmax
+        // already gave TMA a full compute window. Only the single-V prefill
+        // variant tracks K/V on separate barriers; joint rings and fp8 waited
+        // jointly at chunk top.
+        if (KVK != 2 && !JV) mbar_wait(&mbar[kStages + (c % S::kVSlots)], (c / S::kVSlots) & 1);
+
+#pragma unroll
+        for (int dt = 0; dt < 16; dt += 2) {
+          uint32_t b4[4];
+          if constexpr (PACK) {
+            b4[0] = bv[0];
+            b4[1] = bv[1];
+            b4[2] = bv[2];
+            b4[3] = bv[3];
+            if (dt < 14) {  // prefetch the next PV step under this step's HMMA
+              int row = warp * kWarpTok + (lane & 15);
+              int seg = ((dt + 2) & 7) + (lane >> 4);
+              ldsm_x4_trans(bv, smem_u32(tv + ((dt + 2) >> 3) * (64 * 128) + tile_off(row, seg)));
+            }
+          } else {
+            int row = warp * kWarpTok + (lane & 15);
+            int seg = (dt & 7) + (lane >> 4);
+            ldsm_x4_trans(b4, smem_u32(tv + (dt >> 3) * (64 * 128) + tile_off(row, seg)));
+          }
+          uint32_t b0[2] = {b4[0], b4[1]};
+          uint32_t b1[2] = {b4[2], b4[3]};
+          Mma<QT>::run(acc[dt], a, b0);
+          Mma<QT>::run(acc[dt + 1], a, b1);
+        }
+      } else if (KVK != 2 && !JV) {
+        // Fully masked chunk (all -inf): PV skipped, but the V barrier must
+        // still be consumed before this ring slot is re-armed, otherwise a
+        // late V(c) TMA write could race the next chunk's V fill.
+        mbar_wait(&mbar[kStages + (c % S::kVSlots)], (c / S::kVSlots) & 1);
+      }
+    };
+
+    // ---- consume one union block as a 2-chunk pair (PACK pair loop, JV) -------
+    // A union block IS 2 chunks (64-token halves of one 128-token block), so the
+    // block becomes the loop unit: QK over both halves, then ONE mask/scale +
+    // max/rescale/exp2/sum softmax chain over 128 tokens, then PV of both
+    // halves. Halves the per-block __syncthreads / softmax-chain / rescale cost
+    // of the 64-token form (round-14 profile of the g4 paged PACK path: wait
+    // 28% + barrier 19%, tensor pipe 36.6% — a latency-chained loop, not math
+    // or DRAM bound). c is always even (block-aligned); the joint 2-slot ring
+    // waits are staggered so QK of chunk c covers the refill flight of chunk
+    // c+1 (removed the refill-stall the double-wait form paid at pair top).
+    auto qk_pair = [&](int c, float(*s)[4]) {
+      const char* tk0 = sm_ring + (c % kStages) * (64 * 128 * 2);
+      const char* tk1 = sm_ring + ((c + 1) % kStages) * (64 * 128 * 2);
+      auto ldsm_step = [&](const char* tk, int kk, uint32_t(&b)[4]) {
         int row = warp * kWarpTok + (lane & 15);
         int seg = (kk & 3) * 2 + (lane >> 4);
         ldsm_x4(b, smem_u32(tk + (kk >> 2) * (64 * 128) + tile_off(row, seg)));
-        uint32_t b0[2] = {b[0], b[2]};  // n8 tile 0: klo, khi
-        uint32_t b1[2] = {b[1], b[3]};  // n8 tile 1: klo, khi
+      };
+      // Chunk c's k-steps, then the staggered wait, then chunk c+1 (the refill
+      // flight hides under chunk c's QK). Interleaving both chunks' steps for
+      // extra accumulator-bank ILP measured -1% (395.4 vs 391.3 local fixture9):
+      // the staggered split already leaves the MMA pipe fed.
+      uint32_t bn0[4], bn1[4];
+      ldsm_step(tk0, 0, bn0);
+#pragma unroll
+      for (int kk = 0; kk < 8; ++kk) {
+        uint32_t bc0[4] = {bn0[0], bn0[1], bn0[2], bn0[3]};
+        if (kk < 7) ldsm_step(tk0, kk + 1, bn0);
+        uint32_t b0[2] = {bc0[0], bc0[2]};
+        uint32_t b1[2] = {bc0[1], bc0[3]};
         Mma<QT>::run(s[0], qa[kk], b0);
         Mma<QT>::run(s[1], qa[kk], b1);
       }
-    }
+      mbar_wait(&mbar[(c + 1) % kStages], (((c + 1) >> 1) + wphase[1]) & 1);
+      ldsm_step(tk1, 0, bn1);
+#pragma unroll
+      for (int kk = 0; kk < 8; ++kk) {
+        uint32_t bc1[4] = {bn1[0], bn1[1], bn1[2], bn1[3]};
+        if (kk < 7) ldsm_step(tk1, kk + 1, bn1);
+        uint32_t b0[2] = {bc1[0], bc1[2]};
+        uint32_t b1[2] = {bc1[1], bc1[3]};
+        Mma<QT>::run(s[2], qa[kk], b0);
+        Mma<QT>::run(s[3], qa[kk], b1);
+      }
+    };
 
-    // selection/causal mask in RAW score space (PACK: per-row token bit +
-    // per-row causal position). The softmax scale is NOT applied here: the
-    // max tree/online state stay unscaled and the scale enters once per row
-    // as ns = -mn*scale, making each exp2 argument a single FFMA instead of
-    // a scale-FMUL + FSUB pair. Max comparisons are scale-invariant.
+    auto consume_pair = [&](int c, int bidx) {
+      const char* tv0 = sm_ring + (kStages + (c % S::kVSlots)) * (64 * 128 * 2);
+      const char* tv1 = sm_ring + (kStages + ((c + 1) % S::kVSlots)) * (64 * 128 * 2);
+      const int uw = sm_utok[bidx];
+      const int tm = uw & 0xF;
+      const int blk = uw >> 4;
+      const int tok0 = blk * kBlockTok + warp * kWarpTok;
+      const int tok1 = tok0 + kChunkTok;
+
+      mbar_wait(&mbar[c % kStages], ((c >> 1) + wphase[0]) & 1);
+
+      // Warp-uniform early skip: tm bits are per-BLOCK (identical for both
+      // halves) and every warp covers all 16 packed rows, so this only fires
+      // on degenerate tail packs. BOTH barriers must still be waited before
+      // returning — the post-syncthreads expect_tx is only phase-safe once
+      // every warp observed this pair's phases complete.
+      if (!__any_sync(0xffffffffu, (tm & (bit0 | bit1)) != 0)) {
+        mbar_wait(&mbar[(c + 1) % kStages], (((c + 1) >> 1) + wphase[1]) & 1);
+        return;
+      }
+
+      float s[4][4];  // [chunk*2 + n8 tile][frag cols]
 #pragma unroll
-    for (int j = 0; j < 2; ++j) {
-      int tok = tok_base + j * 8 + kcol0;
+      for (int j = 0; j < 4; ++j)
 #pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        if constexpr (PACK) {
+        for (int q4 = 0; q4 < 4; ++q4) s[j][q4] = 0.f;
+
+      qk_pair(c, s);
+
+      // selection/causal mask for all 4 tiles in RAW score space (halves share
+      // tm; the second half is 64 tokens further along the same block). Scale
+      // enters once per row via ns below (see the single-block site).
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        int tok = (j < 2 ? tok0 : tok1) + (j & 1) * 8 + kcol0;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
           bool ok0 = (tm & bit0) && (!p.causal || (tok + i) <= qp0);
           bool ok1 = (tm & bit1) && (!p.causal || (tok + i) <= qp1);
           s[j][i] = ok0 ? s[j][i] : -1e38f;
           s[j][2 + i] = ok1 ? s[j][2 + i] : -1e38f;
-        } else {
-          bool ok = !p.causal || (tok + i) <= qpos;
-          s[j][i] = ok ? s[j][i] : -1e38f;
-          s[j][2 + i] = ok ? s[j][2 + i] : -1e38f;
         }
       }
-    }
 
-    // PV step-0 ldsm prefetch, issued before the exp2/shfl softmax chain so
-    // its LDS latency hides under it (jointly-resident on VSL>1 rings);
-    // discarded harmlessly on fully-masked chunks.
-    uint32_t bv[4];
-    if constexpr (PACK) {
-      int row = warp * kWarpTok + (lane & 15);
-      ldsm_x4_trans(bv, smem_u32(tv + tile_off(row, lane >> 4)));
-    }
-
-    float rmax0 = fmaxf(fmaxf(s[0][0], s[0][1]), fmaxf(s[1][0], s[1][1]));
-    float rmax1 = fmaxf(fmaxf(s[0][2], s[0][3]), fmaxf(s[1][2], s[1][3]));
-    if constexpr (PACK) {
-      // 64-bit packed shfl tree: both row maxima reduced with 2 shfls
-      // instead of 4 (softmax scalar chain is 28.5% of warp stalls).
-      unsigned long long mp =
-          ((unsigned long long)__float_as_uint(rmax0) << 32) |
-          (unsigned long long)__float_as_uint(rmax1);
-      unsigned long long x1 = __shfl_xor_sync(0xffffffffu, mp, 1);
-      rmax0 = fmaxf(__uint_as_float((unsigned)(mp >> 32)),
-                    __uint_as_float((unsigned)(x1 >> 32)));
-      rmax1 = fmaxf(__uint_as_float((unsigned)mp),
-                    __uint_as_float((unsigned)x1));
-      mp = ((unsigned long long)__float_as_uint(rmax0) << 32) |
-           (unsigned long long)__float_as_uint(rmax1);
-      unsigned long long x2 = __shfl_xor_sync(0xffffffffu, mp, 2);
-      rmax0 = fmaxf(rmax0, __uint_as_float((unsigned)(x2 >> 32)));
-      rmax1 = fmaxf(rmax1, __uint_as_float((unsigned)x2));
-    } else {
-      rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffff, rmax0, 1));
-      rmax0 = fmaxf(rmax0, __shfl_xor_sync(0xffffffff, rmax0, 2));
-      rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffff, rmax1, 1));
-      rmax1 = fmaxf(rmax1, __shfl_xor_sync(0xffffffff, rmax1, 2));
-    }
-
-    // PACK: this predicate is only quad-uniform — each quad's two rows carry
-    // different packed-token bits/causal positions, so one row pair can be
-    // fully masked while another is live. The branch body holds warp-
-    // collective ops (shfl reduce, ldmatrix, HMMA); divergent entry
-    // deadlocks. Promote the test to warp-uniform via __any_sync: fully-
-    // masked quads contribute exact zeros (pe guards + the mn>m rescale skip
-    // already handle all-(-inf) rows). Non-PACK rows share one token mask,
-    // so the quad predicate is already warp-uniform there — keep it.
-    const bool anylive = PACK
-        ? __any_sync(0xffffffffu, (rmax0 > -1e37f) || (rmax1 > -1e37f))
-        : ((rmax0 > -1e37f) || (rmax1 > -1e37f));
-    if (anylive) {
-      float mn0 = fmaxf(m0, rmax0);
-      float mn1 = fmaxf(m1, rmax1);
-      const float ns0 = -mn0 * p.scale_log2e;  // raw-space max -> scaled exp2 bias
-      const float ns1 = -mn1 * p.scale_log2e;
-      // skip the accumulator rescale entirely when the row maxima did not move
-      if (mn0 > m0 || mn1 > m1) {
-        float f0 = exp2f(fmaf(m0, p.scale_log2e, ns0));
-        float f1 = exp2f(fmaf(m1, p.scale_log2e, ns1));
-        l0 *= f0;
-        l1 *= f1;
-#pragma unroll
-        for (int dt = 0; dt < 16; ++dt) {
-          acc[dt][0] *= f0;
-          acc[dt][1] *= f0;
-          acc[dt][2] *= f1;
-          acc[dt][3] *= f1;
-        }
-      }
-      m0 = mn0;
-      m1 = mn1;
-      float pe[2][4];
-      pe[0][0] = (s[0][0] <= -1e37f) ? 0.f : exp2f(fmaf(s[0][0], p.scale_log2e, ns0));
-      pe[0][1] = (s[0][1] <= -1e37f) ? 0.f : exp2f(fmaf(s[0][1], p.scale_log2e, ns0));
-      pe[0][2] = (s[0][2] <= -1e37f) ? 0.f : exp2f(fmaf(s[0][2], p.scale_log2e, ns1));
-      pe[0][3] = (s[0][3] <= -1e37f) ? 0.f : exp2f(fmaf(s[0][3], p.scale_log2e, ns1));
-      pe[1][0] = (s[1][0] <= -1e37f) ? 0.f : exp2f(fmaf(s[1][0], p.scale_log2e, ns0));
-      pe[1][1] = (s[1][1] <= -1e37f) ? 0.f : exp2f(fmaf(s[1][1], p.scale_log2e, ns0));
-      pe[1][2] = (s[1][2] <= -1e37f) ? 0.f : exp2f(fmaf(s[1][2], p.scale_log2e, ns1));
-      pe[1][3] = (s[1][3] <= -1e37f) ? 0.f : exp2f(fmaf(s[1][3], p.scale_log2e, ns1));
-      float rs0 = pe[0][0] + pe[0][1] + pe[1][0] + pe[1][1];
-      float rs1 = pe[0][2] + pe[0][3] + pe[1][2] + pe[1][3];
-      if constexpr (PACK) {
-        unsigned long long rp =
-            ((unsigned long long)__float_as_uint(rs0) << 32) |
-            (unsigned long long)__float_as_uint(rs1);
-        unsigned long long y1 = __shfl_xor_sync(0xffffffffu, rp, 1);
-        rs0 += __uint_as_float((unsigned)(y1 >> 32));
-        rs1 += __uint_as_float((unsigned)y1);
-        rp = ((unsigned long long)__float_as_uint(rs0) << 32) |
-             (unsigned long long)__float_as_uint(rs1);
-        unsigned long long y2 = __shfl_xor_sync(0xffffffffu, rp, 2);
-        rs0 += __uint_as_float((unsigned)(y2 >> 32));
-        rs1 += __uint_as_float((unsigned)y2);
-      } else {
-        rs0 += __shfl_xor_sync(0xffffffff, rs0, 1);
-        rs0 += __shfl_xor_sync(0xffffffff, rs0, 2);
-        rs1 += __shfl_xor_sync(0xffffffff, rs1, 1);
-        rs1 += __shfl_xor_sync(0xffffffff, rs1, 2);
-      }
-      l0 += rs0;
-      l1 += rs1;
-
-      uint32_t a[4];
-      a[0] = Mma<QT>::pack(pe[0][0], pe[0][1]);
-      a[1] = Mma<QT>::pack(pe[0][2], pe[0][3]);
-      a[2] = Mma<QT>::pack(pe[1][0], pe[1][1]);
-      a[3] = Mma<QT>::pack(pe[1][2], pe[1][3]);
-
-      // V of this chunk only needs to be resident by PV time: QK+softmax
-      // already gave TMA a full compute window. Only the single-V prefill
-      // variant tracks K/V on separate barriers; joint rings and fp8 waited
-      // jointly at chunk top.
-      if (KVK != 2 && !JV)
-        mbar_wait(&mbar[kStages + (c % S::kVSlots)], (c / S::kVSlots) & 1);
-
-#pragma unroll
-      for (int dt = 0; dt < 16; dt += 2) {
-        uint32_t b4[4];
-        if constexpr (PACK) {
-          b4[0] = bv[0]; b4[1] = bv[1]; b4[2] = bv[2]; b4[3] = bv[3];
-          if (dt < 14) {  // prefetch the next PV step under this step's HMMA
-            int row = warp * kWarpTok + (lane & 15);
-            int seg = ((dt + 2) & 7) + (lane >> 4);
-            ldsm_x4_trans(bv, smem_u32(tv + ((dt + 2) >> 3) * (64 * 128) + tile_off(row, seg)));
-          }
-        } else {
-          int row = warp * kWarpTok + (lane & 15);
-          int seg = (dt & 7) + (lane >> 4);
-          ldsm_x4_trans(b4, smem_u32(tv + (dt >> 3) * (64 * 128) + tile_off(row, seg)));
-        }
-        uint32_t b0[2] = {b4[0], b4[1]};
-        uint32_t b1[2] = {b4[2], b4[3]};
-        Mma<QT>::run(acc[dt], a, b0);
-        Mma<QT>::run(acc[dt + 1], a, b1);
-      }
-    } else if (KVK != 2 && !JV) {
-      // Fully masked chunk (all -inf): PV skipped, but the V barrier must
-      // still be consumed before this ring slot is re-armed, otherwise a
-      // late V(c) TMA write could race the next chunk's V fill.
-      mbar_wait(&mbar[kStages + (c % S::kVSlots)], (c / S::kVSlots) & 1);
-    }
-  };
-
-  // ---- consume one union block as a 2-chunk pair (PACK pair loop, JV) -------
-  // A union block IS 2 chunks (64-token halves of one 128-token block), so the
-  // block becomes the loop unit: QK over both halves, then ONE mask/scale +
-  // max/rescale/exp2/sum softmax chain over 128 tokens, then PV of both
-  // halves. Halves the per-block __syncthreads / softmax-chain / rescale cost
-  // of the 64-token form (round-14 profile of the g4 paged PACK path: wait
-  // 28% + barrier 19%, tensor pipe 36.6% — a latency-chained loop, not math
-  // or DRAM bound). c is always even (block-aligned); the joint 2-slot ring
-  // waits are staggered so QK of chunk c covers the refill flight of chunk
-  // c+1 (removed the refill-stall the double-wait form paid at pair top).
-  auto qk_pair = [&](int c, float (*s)[4]) {
-    const char* tk0 = sm_ring + (c % kStages) * (64 * 128 * 2);
-    const char* tk1 = sm_ring + ((c + 1) % kStages) * (64 * 128 * 2);
-    auto ldsm_step = [&](const char* tk, int kk, uint32_t (&b)[4]) {
-      int row = warp * kWarpTok + (lane & 15);
-      int seg = (kk & 3) * 2 + (lane >> 4);
-      ldsm_x4(b, smem_u32(tk + (kk >> 2) * (64 * 128) + tile_off(row, seg)));
-    };
-    // Chunk c's k-steps, then the staggered wait, then chunk c+1 (the refill
-    // flight hides under chunk c's QK). Interleaving both chunks' steps for
-    // extra accumulator-bank ILP measured -1% (395.4 vs 391.3 local fixture9):
-    // the staggered split already leaves the MMA pipe fed.
-    uint32_t bn0[4], bn1[4];
-    ldsm_step(tk0, 0, bn0);
-#pragma unroll
-    for (int kk = 0; kk < 8; ++kk) {
-      uint32_t bc0[4] = {bn0[0], bn0[1], bn0[2], bn0[3]};
-      if (kk < 7) ldsm_step(tk0, kk + 1, bn0);
-      uint32_t b0[2] = {bc0[0], bc0[2]};
-      uint32_t b1[2] = {bc0[1], bc0[3]};
-      Mma<QT>::run(s[0], qa[kk], b0);
-      Mma<QT>::run(s[1], qa[kk], b1);
-    }
-    mbar_wait(&mbar[(c + 1) % kStages], (((c + 1) >> 1) + wphase[1]) & 1);
-    ldsm_step(tk1, 0, bn1);
-#pragma unroll
-    for (int kk = 0; kk < 8; ++kk) {
-      uint32_t bc1[4] = {bn1[0], bn1[1], bn1[2], bn1[3]};
-      if (kk < 7) ldsm_step(tk1, kk + 1, bn1);
-      uint32_t b0[2] = {bc1[0], bc1[2]};
-      uint32_t b1[2] = {bc1[1], bc1[3]};
-      Mma<QT>::run(s[2], qa[kk], b0);
-      Mma<QT>::run(s[3], qa[kk], b1);
-    }
-  };
-
-  auto consume_pair = [&](int c, int bidx) {
-    const char* tv0 = sm_ring + (kStages + (c % S::kVSlots)) * (64 * 128 * 2);
-    const char* tv1 = sm_ring + (kStages + ((c + 1) % S::kVSlots)) * (64 * 128 * 2);
-    const int uw = sm_utok[bidx];
-    const int tm = uw & 0xF;
-    const int blk = uw >> 4;
-    const int tok0 = blk * kBlockTok + warp * kWarpTok;
-    const int tok1 = tok0 + kChunkTok;
-
-    mbar_wait(&mbar[c % kStages], ((c >> 1) + wphase[0]) & 1);
-
-    // Warp-uniform early skip: tm bits are per-BLOCK (identical for both
-    // halves) and every warp covers all 16 packed rows, so this only fires
-    // on degenerate tail packs. BOTH barriers must still be waited before
-    // returning — the post-syncthreads expect_tx is only phase-safe once
-    // every warp observed this pair's phases complete.
-    if (!__any_sync(0xffffffffu, (tm & (bit0 | bit1)) != 0)) {
-      mbar_wait(&mbar[(c + 1) % kStages], (((c + 1) >> 1) + wphase[1]) & 1);
-      return;
-    }
-
-    float s[4][4];  // [chunk*2 + n8 tile][frag cols]
-#pragma unroll
-    for (int j = 0; j < 4; ++j)
-#pragma unroll
-      for (int q4 = 0; q4 < 4; ++q4) s[j][q4] = 0.f;
-
-    qk_pair(c, s);
-
-    // selection/causal mask for all 4 tiles in RAW score space (halves share
-    // tm; the second half is 64 tokens further along the same block). Scale
-    // enters once per row via ns below (see the single-block site).
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      int tok = (j < 2 ? tok0 : tok1) + (j & 1) * 8 + kcol0;
-#pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        bool ok0 = (tm & bit0) && (!p.causal || (tok + i) <= qp0);
-        bool ok1 = (tm & bit1) && (!p.causal || (tok + i) <= qp1);
-        s[j][i] = ok0 ? s[j][i] : -1e38f;
-        s[j][2 + i] = ok1 ? s[j][2 + i] : -1e38f;
-      }
-    }
-
-    float rmax0 = fmaxf(fmaxf(fmaxf(s[0][0], s[0][1]), fmaxf(s[1][0], s[1][1])),
-                        fmaxf(fmaxf(s[2][0], s[2][1]), fmaxf(s[3][0], s[3][1])));
-    float rmax1 = fmaxf(fmaxf(fmaxf(s[0][2], s[0][3]), fmaxf(s[1][2], s[1][3])),
-                        fmaxf(fmaxf(s[2][2], s[2][3]), fmaxf(s[3][2], s[3][3])));
-    {
-      unsigned long long mp =
-          ((unsigned long long)__float_as_uint(rmax0) << 32) |
-          (unsigned long long)__float_as_uint(rmax1);
-      unsigned long long x1 = __shfl_xor_sync(0xffffffffu, mp, 1);
-      rmax0 = fmaxf(__uint_as_float((unsigned)(mp >> 32)),
-                    __uint_as_float((unsigned)(x1 >> 32)));
-      rmax1 = fmaxf(__uint_as_float((unsigned)mp),
-                    __uint_as_float((unsigned)x1));
-      mp = ((unsigned long long)__float_as_uint(rmax0) << 32) |
-           (unsigned long long)__float_as_uint(rmax1);
-      unsigned long long x2 = __shfl_xor_sync(0xffffffffu, mp, 2);
-      rmax0 = fmaxf(rmax0, __uint_as_float((unsigned)(x2 >> 32)));
-      rmax1 = fmaxf(rmax1, __uint_as_float((unsigned)x2));
-    }
-
-    const bool anylive =
-        __any_sync(0xffffffffu, (rmax0 > -1e37f) || (rmax1 > -1e37f));
-    if (anylive) {
-      float mn0 = fmaxf(m0, rmax0);
-      float mn1 = fmaxf(m1, rmax1);
-      const float ns0 = -mn0 * p.scale_log2e;
-      const float ns1 = -mn1 * p.scale_log2e;
-      if (mn0 > m0 || mn1 > m1) {
-        float f0 = exp2f(fmaf(m0, p.scale_log2e, ns0));
-        float f1 = exp2f(fmaf(m1, p.scale_log2e, ns1));
-        l0 *= f0;
-        l1 *= f1;
-#pragma unroll
-        for (int dt = 0; dt < 16; ++dt) {
-          acc[dt][0] *= f0;
-          acc[dt][1] *= f0;
-          acc[dt][2] *= f1;
-          acc[dt][3] *= f1;
-        }
-      }
-      m0 = mn0;
-      m1 = mn1;
-      float pe[4][4];
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        pe[j][0] = (s[j][0] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][0], p.scale_log2e, ns0));
-        pe[j][1] = (s[j][1] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][1], p.scale_log2e, ns0));
-        pe[j][2] = (s[j][2] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][2], p.scale_log2e, ns1));
-        pe[j][3] = (s[j][3] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][3], p.scale_log2e, ns1));
-      }
-      float rs0 = pe[0][0] + pe[0][1] + pe[1][0] + pe[1][1] + pe[2][0] +
-                  pe[2][1] + pe[3][0] + pe[3][1];
-      float rs1 = pe[0][2] + pe[0][3] + pe[1][2] + pe[1][3] + pe[2][2] +
-                  pe[2][3] + pe[3][2] + pe[3][3];
+      float rmax0 = fmaxf(fmaxf(fmaxf(s[0][0], s[0][1]), fmaxf(s[1][0], s[1][1])),
+                          fmaxf(fmaxf(s[2][0], s[2][1]), fmaxf(s[3][0], s[3][1])));
+      float rmax1 = fmaxf(fmaxf(fmaxf(s[0][2], s[0][3]), fmaxf(s[1][2], s[1][3])),
+                          fmaxf(fmaxf(s[2][2], s[2][3]), fmaxf(s[3][2], s[3][3])));
       {
-        unsigned long long rp =
-            ((unsigned long long)__float_as_uint(rs0) << 32) |
-            (unsigned long long)__float_as_uint(rs1);
-        unsigned long long y1 = __shfl_xor_sync(0xffffffffu, rp, 1);
-        rs0 += __uint_as_float((unsigned)(y1 >> 32));
-        rs1 += __uint_as_float((unsigned)y1);
-        rp = ((unsigned long long)__float_as_uint(rs0) << 32) |
-             (unsigned long long)__float_as_uint(rs1);
-        unsigned long long y2 = __shfl_xor_sync(0xffffffffu, rp, 2);
-        rs0 += __uint_as_float((unsigned)(y2 >> 32));
-        rs1 += __uint_as_float((unsigned)y2);
+        unsigned long long mp = ((unsigned long long)__float_as_uint(rmax0) << 32) |
+                                (unsigned long long)__float_as_uint(rmax1);
+        unsigned long long x1 = __shfl_xor_sync(0xffffffffu, mp, 1);
+        rmax0 = fmaxf(__uint_as_float((unsigned)(mp >> 32)), __uint_as_float((unsigned)(x1 >> 32)));
+        rmax1 = fmaxf(__uint_as_float((unsigned)mp), __uint_as_float((unsigned)x1));
+        mp = ((unsigned long long)__float_as_uint(rmax0) << 32) |
+             (unsigned long long)__float_as_uint(rmax1);
+        unsigned long long x2 = __shfl_xor_sync(0xffffffffu, mp, 2);
+        rmax0 = fmaxf(rmax0, __uint_as_float((unsigned)(x2 >> 32)));
+        rmax1 = fmaxf(rmax1, __uint_as_float((unsigned)x2));
       }
-      l0 += rs0;
-      l1 += rs1;
 
-      auto pv_half = [&](const char* tv, int half) {
-        const float (*peh)[4] = &pe[half * 2];
-        uint32_t a[4];
-        a[0] = Mma<QT>::pack(peh[0][0], peh[0][1]);
-        a[1] = Mma<QT>::pack(peh[0][2], peh[0][3]);
-        a[2] = Mma<QT>::pack(peh[1][0], peh[1][1]);
-        a[3] = Mma<QT>::pack(peh[1][2], peh[1][3]);
-        uint32_t bvx[4];
-        {
-          int row = warp * kWarpTok + (lane & 15);
-          ldsm_x4_trans(bvx, smem_u32(tv + tile_off(row, lane >> 4)));
-        }
+      const bool anylive = __any_sync(0xffffffffu, (rmax0 > -1e37f) || (rmax1 > -1e37f));
+      if (anylive) {
+        float mn0 = fmaxf(m0, rmax0);
+        float mn1 = fmaxf(m1, rmax1);
+        const float ns0 = -mn0 * p.scale_log2e;
+        const float ns1 = -mn1 * p.scale_log2e;
+        if (mn0 > m0 || mn1 > m1) {
+          float f0 = exp2f(fmaf(m0, p.scale_log2e, ns0));
+          float f1 = exp2f(fmaf(m1, p.scale_log2e, ns1));
+          l0 *= f0;
+          l1 *= f1;
 #pragma unroll
-        for (int dt = 0; dt < 16; dt += 2) {
-          uint32_t b4[4] = {bvx[0], bvx[1], bvx[2], bvx[3]};
-          if (dt < 14) {  // prefetch the next PV step under this step's HMMA
-            int row = warp * kWarpTok + (lane & 15);
-            int seg = ((dt + 2) & 7) + (lane >> 4);
-            ldsm_x4_trans(bvx, smem_u32(
-                                     tv + ((dt + 2) >> 3) * (64 * 128) + tile_off(row, seg)));
+          for (int dt = 0; dt < 16; ++dt) {
+            acc[dt][0] *= f0;
+            acc[dt][1] *= f0;
+            acc[dt][2] *= f1;
+            acc[dt][3] *= f1;
           }
-          uint32_t b0[2] = {b4[0], b4[1]};
-          uint32_t b1[2] = {b4[2], b4[3]};
-          Mma<QT>::run(acc[dt], a, b0);
-          Mma<QT>::run(acc[dt + 1], a, b1);
         }
-      };
-
-      // Joint ring: K+V were both waited at/inside pair top; PV reads V of
-      // each half directly from its joint slot.
-      pv_half(tv0, 0);
-      pv_half(tv1, 1);
-    }
-  };
-
-  // ---- consume one union block as a 2-chunk pair (3-buffer form, PACK !JV) ---
-  // 48KB ring + 6KB prologue = 54KB/CTA -> 4 CTAs/SM (vs 3 at 70KB joint).
-  // K(c) in S0 and K(c+1) in S1 are pre-armed one pair ahead; V(c) pre-armed
-  // one pair ahead into the single V slot; V(c+1) is issued INTO S1 right
-  // after both QKs drained K from it — its TMA flight hides under the softmax
-  // chain + PV(c). Q fragments restage from smem per half-pair (two 4-step
-  // halves) — under the 128-reg cap persistent-Q spilled 32B and measured
-  // 435.9 vs 394.3 on fixture9, so restage stays. Barrier discipline:
-  // every phase is always waited (mask-skipped pairs too), so tid0's next
-  // expect_tx after the loop-end barrier never folds into an open phase.
-  auto consume_pair_3b = [&](int c, int bidx) {
-    const char* s0 = sm_ring;
-    const char* slv = sm_ring + 2 * S::kTensorBytes;
-    const int uw = sm_utok[bidx];
-    const int tm = uw & 0xF;
-    const int blk = uw >> 4;
-    const int tok0 = blk * kBlockTok + warp * kWarpTok;
-    const int tok1 = tok0 + kChunkTok;
-    const int pp = c >> 1;
-
-    mbar_wait(&mbar[0], 0);  // K(c) in S0 (two uses/pair: K at use 2p -> parity 0)
-
-    // Warp-uniform mask-skip: waits/syncs still execute on every warp.
-    const bool live = __any_sync(0xffffffffu, (tm & (bit0 | bit1)) != 0);
-
-    float s[4][4];  // [chunk*2 + n8 tile][frag cols]
-#pragma unroll
-    for (int j = 0; j < 4; ++j)
-#pragma unroll
-      for (int q4 = 0; q4 < 4; ++q4) s[j][q4] = 0.f;
-
-    // QK of one 64-token half into s[base..base+1]; Q fragments restaged from
-    // smem in two halves of 4 k16 steps (~16 live regs vs 32 persistent; the
-    // persistent-Q variant spilled and measured 435.9 vs 394.3 — restage is
-    // cheaper than the 32B spill the 128-reg cap forces).
-    auto qk_half = [&](const char* tk, int base) {
-      auto ldsm_step = [&](int kk, uint32_t (&b)[4]) {
-        int row = warp * kWarpTok + (lane & 15);
-        int seg = (kk & 3) * 2 + (lane >> 4);
-        ldsm_x4(b, smem_u32(tk + (kk >> 2) * (64 * 128) + tile_off(row, seg)));
-      };
-#pragma unroll
-      for (int kh = 0; kh < 2; ++kh) {
-        uint32_t qx[4][4];
+        m0 = mn0;
+        m1 = mn1;
+        float pe[4][4];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          int row = lane & 15;
-          ldsm_x4(qx[j], smem_u32(sm_q + kh * (kRows * 128) +
-                                  tile_off(row, j * 2 + (lane >> 4))));
+          pe[j][0] = (s[j][0] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][0], p.scale_log2e, ns0));
+          pe[j][1] = (s[j][1] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][1], p.scale_log2e, ns0));
+          pe[j][2] = (s[j][2] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][2], p.scale_log2e, ns1));
+          pe[j][3] = (s[j][3] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][3], p.scale_log2e, ns1));
         }
-        uint32_t bn[4];
-        ldsm_step(kh * 4, bn);
+        float rs0 =
+            pe[0][0] + pe[0][1] + pe[1][0] + pe[1][1] + pe[2][0] + pe[2][1] + pe[3][0] + pe[3][1];
+        float rs1 =
+            pe[0][2] + pe[0][3] + pe[1][2] + pe[1][3] + pe[2][2] + pe[2][3] + pe[3][2] + pe[3][3];
+        {
+          unsigned long long rp = ((unsigned long long)__float_as_uint(rs0) << 32) |
+                                  (unsigned long long)__float_as_uint(rs1);
+          unsigned long long y1 = __shfl_xor_sync(0xffffffffu, rp, 1);
+          rs0 += __uint_as_float((unsigned)(y1 >> 32));
+          rs1 += __uint_as_float((unsigned)y1);
+          rp = ((unsigned long long)__float_as_uint(rs0) << 32) |
+               (unsigned long long)__float_as_uint(rs1);
+          unsigned long long y2 = __shfl_xor_sync(0xffffffffu, rp, 2);
+          rs0 += __uint_as_float((unsigned)(y2 >> 32));
+          rs1 += __uint_as_float((unsigned)y2);
+        }
+        l0 += rs0;
+        l1 += rs1;
+
+        auto pv_half = [&](const char* tv, int half) {
+          const float(*peh)[4] = &pe[half * 2];
+          uint32_t a[4];
+          a[0] = Mma<QT>::pack(peh[0][0], peh[0][1]);
+          a[1] = Mma<QT>::pack(peh[0][2], peh[0][3]);
+          a[2] = Mma<QT>::pack(peh[1][0], peh[1][1]);
+          a[3] = Mma<QT>::pack(peh[1][2], peh[1][3]);
+          uint32_t bvx[4];
+          {
+            int row = warp * kWarpTok + (lane & 15);
+            ldsm_x4_trans(bvx, smem_u32(tv + tile_off(row, lane >> 4)));
+          }
 #pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          const int kk = kh * 4 + j;
-          uint32_t bc[4] = {bn[0], bn[1], bn[2], bn[3]};
-          if (j < 3) ldsm_step(kk + 1, bn);
-          uint32_t b0[2] = {bc[0], bc[2]};  // n8 tile 0: klo, khi
-          uint32_t b1[2] = {bc[1], bc[3]};  // n8 tile 1: klo, khi
-          Mma<QT>::run(s[base + 0], qx[j], b0);
-          Mma<QT>::run(s[base + 1], qx[j], b1);
-        }
+          for (int dt = 0; dt < 16; dt += 2) {
+            uint32_t b4[4] = {bvx[0], bvx[1], bvx[2], bvx[3]};
+            if (dt < 14) {  // prefetch the next PV step under this step's HMMA
+              int row = warp * kWarpTok + (lane & 15);
+              int seg = ((dt + 2) & 7) + (lane >> 4);
+              ldsm_x4_trans(bvx, smem_u32(tv + ((dt + 2) >> 3) * (64 * 128) + tile_off(row, seg)));
+            }
+            uint32_t b0[2] = {b4[0], b4[1]};
+            uint32_t b1[2] = {b4[2], b4[3]};
+            Mma<QT>::run(acc[dt], a, b0);
+            Mma<QT>::run(acc[dt + 1], a, b1);
+          }
+        };
+
+        // Joint ring: K+V were both waited at/inside pair top; PV reads V of
+        // each half directly from its joint slot.
+        pv_half(tv0, 0);
+        pv_half(tv1, 1);
       }
     };
 
-    if (live) qk_half(s0, 0);
-    __syncthreads();  // all warps done with S0's K; free for V(c+1)
-    if (tid == 0) issue3b_v(c + 1, 0);  // V(c+1) -> S0 (phase 2pp+1, parity 1)
-    const char* s1 = sm_ring + S::kTensorBytes;
-    mbar_wait(&mbar[1], pp & 1);  // K(c+1) in S1 (one use/pair, parity pp&1)
-    if (live) qk_half(s1, 2);
+    // ---- consume one union block as a 2-chunk pair (3-buffer form, PACK !JV) ---
+    // 48KB ring + 6KB prologue = 54KB/CTA -> 4 CTAs/SM (vs 3 at 70KB joint).
+    // K(c) in S0 and K(c+1) in S1 are pre-armed one pair ahead; V(c) pre-armed
+    // one pair ahead into the single V slot; V(c+1) is issued INTO S1 right
+    // after both QKs drained K from it — its TMA flight hides under the softmax
+    // chain + PV(c). Q fragments restage from smem per half-pair (two 4-step
+    // halves) — under the 128-reg cap persistent-Q spilled 32B and measured
+    // 435.9 vs 394.3 on fixture9, so restage stays. Barrier discipline:
+    // every phase is always waited (mask-skipped pairs too), so tid0's next
+    // expect_tx after the loop-end barrier never folds into an open phase.
+    auto consume_pair_3b = [&](int c, int bidx) {
+      const char* s0 = sm_ring;
+      const char* slv = sm_ring + 2 * S::kTensorBytes;
+      const int uw = sm_utok[bidx];
+      const int tm = uw & 0xF;
+      const int blk = uw >> 4;
+      const int tok0 = blk * kBlockTok + warp * kWarpTok;
+      const int tok1 = tok0 + kChunkTok;
+      const int pp = c >> 1;
 
-    // selection/causal mask, RAW space (identical to the JV pair form)
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-      int tok = (j < 2 ? tok0 : tok1) + (j & 1) * 8 + kcol0;
-#pragma unroll
-      for (int i = 0; i < 2; ++i) {
-        bool ok0 = (tm & bit0) && (!p.causal || (tok + i) <= qp0);
-        bool ok1 = (tm & bit1) && (!p.causal || (tok + i) <= qp1);
-        s[j][i] = ok0 ? s[j][i] : -1e38f;
-        s[j][2 + i] = ok1 ? s[j][2 + i] : -1e38f;
-      }
-    }
+      mbar_wait(&mbar[0], 0);  // K(c) in S0 (two uses/pair: K at use 2p -> parity 0)
 
-    float rmax0 = fmaxf(fmaxf(fmaxf(s[0][0], s[0][1]), fmaxf(s[1][0], s[1][1])),
-                        fmaxf(fmaxf(s[2][0], s[2][1]), fmaxf(s[3][0], s[3][1])));
-    float rmax1 = fmaxf(fmaxf(fmaxf(s[0][2], s[0][3]), fmaxf(s[1][2], s[1][3])),
-                        fmaxf(fmaxf(s[2][2], s[2][3]), fmaxf(s[3][2], s[3][3])));
-    {
-      unsigned long long mp =
-          ((unsigned long long)__float_as_uint(rmax0) << 32) |
-          (unsigned long long)__float_as_uint(rmax1);
-      unsigned long long x1 = __shfl_xor_sync(0xffffffffu, mp, 1);
-      rmax0 = fmaxf(__uint_as_float((unsigned)(mp >> 32)),
-                    __uint_as_float((unsigned)(x1 >> 32)));
-      rmax1 = fmaxf(__uint_as_float((unsigned)mp),
-                    __uint_as_float((unsigned)x1));
-      mp = ((unsigned long long)__float_as_uint(rmax0) << 32) |
-           (unsigned long long)__float_as_uint(rmax1);
-      unsigned long long x2 = __shfl_xor_sync(0xffffffffu, mp, 2);
-      rmax0 = fmaxf(rmax0, __uint_as_float((unsigned)(x2 >> 32)));
-      rmax1 = fmaxf(rmax1, __uint_as_float((unsigned)x2));
-    }
+      // Warp-uniform mask-skip: waits/syncs still execute on every warp.
+      const bool live = __any_sync(0xffffffffu, (tm & (bit0 | bit1)) != 0);
 
-    const bool anylive =
-        __any_sync(0xffffffffu, (rmax0 > -1e37f) || (rmax1 > -1e37f));
-    mbar_wait(&mbar[2], pp & 1);  // V(c) in SLV (phase always consumed)
-    if (anylive) {
-      float mn0 = fmaxf(m0, rmax0);
-      float mn1 = fmaxf(m1, rmax1);
-      const float ns0 = -mn0 * p.scale_log2e;
-      const float ns1 = -mn1 * p.scale_log2e;
-      if (mn0 > m0 || mn1 > m1) {
-        float f0 = exp2f(fmaf(m0, p.scale_log2e, ns0));
-        float f1 = exp2f(fmaf(m1, p.scale_log2e, ns1));
-        l0 *= f0;
-        l1 *= f1;
+      float s[4][4];  // [chunk*2 + n8 tile][frag cols]
 #pragma unroll
-        for (int dt = 0; dt < 16; ++dt) {
-          acc[dt][0] *= f0;
-          acc[dt][1] *= f0;
-          acc[dt][2] *= f1;
-          acc[dt][3] *= f1;
-        }
-      }
-      m0 = mn0;
-      m1 = mn1;
-      float pe[4][4];
+      for (int j = 0; j < 4; ++j)
 #pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        pe[j][0] = (s[j][0] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][0], p.scale_log2e, ns0));
-        pe[j][1] = (s[j][1] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][1], p.scale_log2e, ns0));
-        pe[j][2] = (s[j][2] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][2], p.scale_log2e, ns1));
-        pe[j][3] = (s[j][3] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][3], p.scale_log2e, ns1));
-      }
-      float rs0 = pe[0][0] + pe[0][1] + pe[1][0] + pe[1][1] + pe[2][0] +
-                  pe[2][1] + pe[3][0] + pe[3][1];
-      float rs1 = pe[0][2] + pe[0][3] + pe[1][2] + pe[1][3] + pe[2][2] +
-                  pe[2][3] + pe[3][2] + pe[3][3];
-      {
-        unsigned long long rp =
-            ((unsigned long long)__float_as_uint(rs0) << 32) |
-            (unsigned long long)__float_as_uint(rs1);
-        unsigned long long y1 = __shfl_xor_sync(0xffffffffu, rp, 1);
-        rs0 += __uint_as_float((unsigned)(y1 >> 32));
-        rs1 += __uint_as_float((unsigned)y1);
-        rp = ((unsigned long long)__float_as_uint(rs0) << 32) |
-             (unsigned long long)__float_as_uint(rs1);
-        unsigned long long y2 = __shfl_xor_sync(0xffffffffu, rp, 2);
-        rs0 += __uint_as_float((unsigned)(y2 >> 32));
-        rs1 += __uint_as_float((unsigned)y2);
-      }
-      l0 += rs0;
-      l1 += rs1;
+        for (int q4 = 0; q4 < 4; ++q4) s[j][q4] = 0.f;
 
-      auto pv_half = [&](const char* tv, int half) {
-        const float (*peh)[4] = &pe[half * 2];
-        uint32_t a[4];
-        a[0] = Mma<QT>::pack(peh[0][0], peh[0][1]);
-        a[1] = Mma<QT>::pack(peh[0][2], peh[0][3]);
-        a[2] = Mma<QT>::pack(peh[1][0], peh[1][1]);
-        a[3] = Mma<QT>::pack(peh[1][2], peh[1][3]);
-        uint32_t bvx[4];
-        {
+      // QK of one 64-token half into s[base..base+1]; Q fragments restaged from
+      // smem in two halves of 4 k16 steps (~16 live regs vs 32 persistent; the
+      // persistent-Q variant spilled and measured 435.9 vs 394.3 — restage is
+      // cheaper than the 32B spill the 128-reg cap forces).
+      auto qk_half = [&](const char* tk, int base) {
+        auto ldsm_step = [&](int kk, uint32_t(&b)[4]) {
           int row = warp * kWarpTok + (lane & 15);
-          ldsm_x4_trans(bvx, smem_u32(tv + tile_off(row, lane >> 4)));
-        }
+          int seg = (kk & 3) * 2 + (lane >> 4);
+          ldsm_x4(b, smem_u32(tk + (kk >> 2) * (64 * 128) + tile_off(row, seg)));
+        };
 #pragma unroll
-        for (int dt = 0; dt < 16; dt += 2) {
-          uint32_t b4[4] = {bvx[0], bvx[1], bvx[2], bvx[3]};
-          if (dt < 14) {  // prefetch the next PV step under this step's HMMA
-            int row = warp * kWarpTok + (lane & 15);
-            int seg = ((dt + 2) & 7) + (lane >> 4);
-            ldsm_x4_trans(bvx, smem_u32(
-                                     tv + ((dt + 2) >> 3) * (64 * 128) + tile_off(row, seg)));
+        for (int kh = 0; kh < 2; ++kh) {
+          uint32_t qx[4][4];
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            int row = lane & 15;
+            ldsm_x4(qx[j],
+                    smem_u32(sm_q + kh * (kRows * 128) + tile_off(row, j * 2 + (lane >> 4))));
           }
-          uint32_t b0[2] = {b4[0], b4[1]};
-          uint32_t b1[2] = {b4[2], b4[3]};
-          Mma<QT>::run(acc[dt], a, b0);
-          Mma<QT>::run(acc[dt + 1], a, b1);
+          uint32_t bn[4];
+          ldsm_step(kh * 4, bn);
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            const int kk = kh * 4 + j;
+            uint32_t bc[4] = {bn[0], bn[1], bn[2], bn[3]};
+            if (j < 3) ldsm_step(kk + 1, bn);
+            uint32_t b0[2] = {bc[0], bc[2]};  // n8 tile 0: klo, khi
+            uint32_t b1[2] = {bc[1], bc[3]};  // n8 tile 1: klo, khi
+            Mma<QT>::run(s[base + 0], qx[j], b0);
+            Mma<QT>::run(s[base + 1], qx[j], b1);
+          }
         }
       };
 
-      pv_half(slv, 0);
-      mbar_wait(&mbar[0], 1);  // V(c+1) in S0 (V phase, parity 1)
-      pv_half(s0, 1);
-    } else {
-      mbar_wait(&mbar[0], 1);  // drain the V(c+1) phase on skipped pairs too
-    }
-  };
+      if (live) qk_half(s0, 0);
+      __syncthreads();                    // all warps done with S0's K; free for V(c+1)
+      if (tid == 0) issue3b_v(c + 1, 0);  // V(c+1) -> S0 (phase 2pp+1, parity 1)
+      const char* s1 = sm_ring + S::kTensorBytes;
+      mbar_wait(&mbar[1], pp & 1);  // K(c+1) in S1 (one use/pair, parity pp&1)
+      if (live) qk_half(s1, 2);
 
-  // ---- main loop -------------------------------------------------------------
-  if constexpr (PAIRP) {
-    // Pair form: one 128-token union block per iteration (joint 2-slot ring,
-    // 3 CTAs/SM). Both chunks of the NEXT pair (K+V jointly) are issued only
-    // after the loop-end __syncthreads frees their slots — the ring holds
-    // exactly one pair, so the refill flight is covered by the staggered
-    // waits inside consume_pair (QK of the resident chunk) and by co-resident
-    // CTAs.
-    for (int c = 0; c < nloc; c += 2) {
-      if constexpr (PERSIST && MSA_PERSIST_FULLGRID != 2) {
-        // Final pair: claim this CTA's NEXT work item now, so the queue
-        // atomic's L2 round-trip hides under this pair's consume + the
-        // merge/epilogue that follow (claiming at the loop-top barrier
-        // measured +6% end-to-end — tid0's atomic stall held the whole CTA).
-        if (tid == 0 && c + 2 >= nloc)
-          *sm_claim = (int)gridDim.x + atomicAdd(p.ws_next, 1);
+      // selection/causal mask, RAW space (identical to the JV pair form)
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        int tok = (j < 2 ? tok0 : tok1) + (j & 1) * 8 + kcol0;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+          bool ok0 = (tm & bit0) && (!p.causal || (tok + i) <= qp0);
+          bool ok1 = (tm & bit1) && (!p.causal || (tok + i) <= qp1);
+          s[j][i] = ok0 ? s[j][i] : -1e38f;
+          s[j][2 + i] = ok1 ? s[j][2 + i] : -1e38f;
+        }
       }
-      const int bidx = CLUSTER ? (crank + (c & ~1)) : (c >> 1);
-      if constexpr (JV) {
-        consume_pair(c, bidx);
+
+      float rmax0 = fmaxf(fmaxf(fmaxf(s[0][0], s[0][1]), fmaxf(s[1][0], s[1][1])),
+                          fmaxf(fmaxf(s[2][0], s[2][1]), fmaxf(s[3][0], s[3][1])));
+      float rmax1 = fmaxf(fmaxf(fmaxf(s[0][2], s[0][3]), fmaxf(s[1][2], s[1][3])),
+                          fmaxf(fmaxf(s[2][2], s[2][3]), fmaxf(s[3][2], s[3][3])));
+      {
+        unsigned long long mp = ((unsigned long long)__float_as_uint(rmax0) << 32) |
+                                (unsigned long long)__float_as_uint(rmax1);
+        unsigned long long x1 = __shfl_xor_sync(0xffffffffu, mp, 1);
+        rmax0 = fmaxf(__uint_as_float((unsigned)(mp >> 32)), __uint_as_float((unsigned)(x1 >> 32)));
+        rmax1 = fmaxf(__uint_as_float((unsigned)mp), __uint_as_float((unsigned)x1));
+        mp = ((unsigned long long)__float_as_uint(rmax0) << 32) |
+             (unsigned long long)__float_as_uint(rmax1);
+        unsigned long long x2 = __shfl_xor_sync(0xffffffffu, mp, 2);
+        rmax0 = fmaxf(rmax0, __uint_as_float((unsigned)(x2 >> 32)));
+        rmax1 = fmaxf(rmax1, __uint_as_float((unsigned)x2));
+      }
+
+      const bool anylive = __any_sync(0xffffffffu, (rmax0 > -1e37f) || (rmax1 > -1e37f));
+      mbar_wait(&mbar[2], pp & 1);  // V(c) in SLV (phase always consumed)
+      if (anylive) {
+        float mn0 = fmaxf(m0, rmax0);
+        float mn1 = fmaxf(m1, rmax1);
+        const float ns0 = -mn0 * p.scale_log2e;
+        const float ns1 = -mn1 * p.scale_log2e;
+        if (mn0 > m0 || mn1 > m1) {
+          float f0 = exp2f(fmaf(m0, p.scale_log2e, ns0));
+          float f1 = exp2f(fmaf(m1, p.scale_log2e, ns1));
+          l0 *= f0;
+          l1 *= f1;
+#pragma unroll
+          for (int dt = 0; dt < 16; ++dt) {
+            acc[dt][0] *= f0;
+            acc[dt][1] *= f0;
+            acc[dt][2] *= f1;
+            acc[dt][3] *= f1;
+          }
+        }
+        m0 = mn0;
+        m1 = mn1;
+        float pe[4][4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          pe[j][0] = (s[j][0] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][0], p.scale_log2e, ns0));
+          pe[j][1] = (s[j][1] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][1], p.scale_log2e, ns0));
+          pe[j][2] = (s[j][2] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][2], p.scale_log2e, ns1));
+          pe[j][3] = (s[j][3] <= -1e37f) ? 0.f : exp2f(fmaf(s[j][3], p.scale_log2e, ns1));
+        }
+        float rs0 =
+            pe[0][0] + pe[0][1] + pe[1][0] + pe[1][1] + pe[2][0] + pe[2][1] + pe[3][0] + pe[3][1];
+        float rs1 =
+            pe[0][2] + pe[0][3] + pe[1][2] + pe[1][3] + pe[2][2] + pe[2][3] + pe[3][2] + pe[3][3];
+        {
+          unsigned long long rp = ((unsigned long long)__float_as_uint(rs0) << 32) |
+                                  (unsigned long long)__float_as_uint(rs1);
+          unsigned long long y1 = __shfl_xor_sync(0xffffffffu, rp, 1);
+          rs0 += __uint_as_float((unsigned)(y1 >> 32));
+          rs1 += __uint_as_float((unsigned)y1);
+          rp = ((unsigned long long)__float_as_uint(rs0) << 32) |
+               (unsigned long long)__float_as_uint(rs1);
+          unsigned long long y2 = __shfl_xor_sync(0xffffffffu, rp, 2);
+          rs0 += __uint_as_float((unsigned)(y2 >> 32));
+          rs1 += __uint_as_float((unsigned)y2);
+        }
+        l0 += rs0;
+        l1 += rs1;
+
+        auto pv_half = [&](const char* tv, int half) {
+          const float(*peh)[4] = &pe[half * 2];
+          uint32_t a[4];
+          a[0] = Mma<QT>::pack(peh[0][0], peh[0][1]);
+          a[1] = Mma<QT>::pack(peh[0][2], peh[0][3]);
+          a[2] = Mma<QT>::pack(peh[1][0], peh[1][1]);
+          a[3] = Mma<QT>::pack(peh[1][2], peh[1][3]);
+          uint32_t bvx[4];
+          {
+            int row = warp * kWarpTok + (lane & 15);
+            ldsm_x4_trans(bvx, smem_u32(tv + tile_off(row, lane >> 4)));
+          }
+#pragma unroll
+          for (int dt = 0; dt < 16; dt += 2) {
+            uint32_t b4[4] = {bvx[0], bvx[1], bvx[2], bvx[3]};
+            if (dt < 14) {  // prefetch the next PV step under this step's HMMA
+              int row = warp * kWarpTok + (lane & 15);
+              int seg = ((dt + 2) & 7) + (lane >> 4);
+              ldsm_x4_trans(bvx, smem_u32(tv + ((dt + 2) >> 3) * (64 * 128) + tile_off(row, seg)));
+            }
+            uint32_t b0[2] = {b4[0], b4[1]};
+            uint32_t b1[2] = {b4[2], b4[3]};
+            Mma<QT>::run(acc[dt], a, b0);
+            Mma<QT>::run(acc[dt + 1], a, b1);
+          }
+        };
+
+        pv_half(slv, 0);
+        mbar_wait(&mbar[0], 1);  // V(c+1) in S0 (V phase, parity 1)
+        pv_half(s0, 1);
       } else {
-        consume_pair_3b(c, bidx);
+        mbar_wait(&mbar[0], 1);  // drain the V(c+1) phase on skipped pairs too
       }
-      __syncthreads();  // this pair's slots dead for reuse
-      if (tid == 0) {
+    };
+
+    // ---- main loop -------------------------------------------------------------
+    if constexpr (PAIRP) {
+      // Pair form: one 128-token union block per iteration (joint 2-slot ring,
+      // 3 CTAs/SM). Both chunks of the NEXT pair (K+V jointly) are issued only
+      // after the loop-end __syncthreads frees their slots — the ring holds
+      // exactly one pair, so the refill flight is covered by the staggered
+      // waits inside consume_pair (QK of the resident chunk) and by co-resident
+      // CTAs.
+      for (int c = 0; c < nloc; c += 2) {
+        if constexpr (PERSIST && MSA_PERSIST_FULLGRID != 2) {
+          // Final pair: claim this CTA's NEXT work item now, so the queue
+          // atomic's L2 round-trip hides under this pair's consume + the
+          // merge/epilogue that follow (claiming at the loop-top barrier
+          // measured +6% end-to-end — tid0's atomic stall held the whole CTA).
+          if (tid == 0 && c + 2 >= nloc) *sm_claim = (int)gridDim.x + atomicAdd(p.ws_next, 1);
+        }
+        const int bidx = CLUSTER ? (crank + (c & ~1)) : (c >> 1);
         if constexpr (JV) {
-          if (c + 2 < nloc) issue_chunk(c + 2, CLUSTER ? (bidx + 2) : -1);
-          if (c + 3 < nloc) issue_chunk(c + 3, CLUSTER ? (bidx + 2) : -1);
+          consume_pair(c, bidx);
         } else {
-          // 3-buffer: next pair's K halves + the V slot's next fill.
-          if (c + 2 < nloc) issue3b_k(c + 2, 0);
-          if (c + 3 < nloc) {
-            issue3b_k(c + 3, 1);
-            issue3b_v(c + 2, 2);
+          consume_pair_3b(c, bidx);
+        }
+        __syncthreads();  // this pair's slots dead for reuse
+        if (tid == 0) {
+          if constexpr (JV) {
+            if (c + 2 < nloc) issue_chunk(c + 2, CLUSTER ? (bidx + 2) : -1);
+            if (c + 3 < nloc) issue_chunk(c + 3, CLUSTER ? (bidx + 2) : -1);
+          } else {
+            // 3-buffer: next pair's K halves + the V slot's next fill.
+            if (c + 2 < nloc) issue3b_k(c + 2, 0);
+            if (c + 3 < nloc) {
+              issue3b_k(c + 3, 1);
+              issue3b_v(c + 2, 2);
+            }
           }
         }
       }
-    }
-  } else {
-    for (int c = 0; c < nchunks; ++c) {
-      mbar_wait(&mbar[c % kStages], (c / kStages) & 1);
-      // Issue the next TMA chunk as soon as its ring slot is provably free
-      // (slot (c + kStages-1) % kStages last held chunk c-1, consumed and
-      // barrier-synced in the previous iteration). With issue-at-loop-end
-      // (previous form) a 2-stage ring kept ZERO chunks inflight while the
-      // warps computed — every chunk paid the full serial TMA latency. Here
-      // the fetch of chunk c+kStages-1 overlaps compute of chunk c.
-      if (tid == 0 && c + kStages - 1 < nchunks) issue_chunk(c + kStages - 1, -1);
-      if (KVK == 2) {
-        convert_chunk(c);
-      } else if (tid == 0 && !JV) {
-        // single V slot: can only fire after the loop-end __syncthreads below,
-        // so issue V for THIS chunk; the QK+softmax window covers its write.
-        // (Joint-barrier rings load V inside issue_chunk.)
-        issue_v(c);
+    } else {
+      for (int c = 0; c < nchunks; ++c) {
+        mbar_wait(&mbar[c % kStages], (c / kStages) & 1);
+        // Issue the next TMA chunk as soon as its ring slot is provably free
+        // (slot (c + kStages-1) % kStages last held chunk c-1, consumed and
+        // barrier-synced in the previous iteration). With issue-at-loop-end
+        // (previous form) a 2-stage ring kept ZERO chunks inflight while the
+        // warps computed — every chunk paid the full serial TMA latency. Here
+        // the fetch of chunk c+kStages-1 overlaps compute of chunk c.
+        if (tid == 0 && c + kStages - 1 < nchunks) issue_chunk(c + kStages - 1, -1);
+        if (KVK == 2) {
+          convert_chunk(c);
+        } else if (tid == 0 && !JV) {
+          // single V slot: can only fire after the loop-end __syncthreads below,
+          // so issue V for THIS chunk; the QK+softmax window covers its write.
+          // (Joint-barrier rings load V inside issue_chunk.)
+          issue_v(c);
+        }
+        consume_chunk(c);
+        __syncthreads();
       }
-      consume_chunk(c);
-      __syncthreads();
     }
-  }
 
-  if constexpr (PERSIST && MSA_PERSIST_FULLGRID != 2) {
-    // Empty-union tiles never enter the pair loop, so their next-item claim
-    // has no pair window to hide in — issue it here (rare path: empty tiles
-    // have almost no other work to overlap anyway).
-    if (tid == 0 && nloc == 0)
-      *sm_claim = (int)gridDim.x + atomicAdd(p.ws_next, 1);
-  }
+    if constexpr (PERSIST && MSA_PERSIST_FULLGRID != 2) {
+      // Empty-union tiles never enter the pair loop, so their next-item claim
+      // has no pair window to hide in — issue it here (rare path: empty tiles
+      // have almost no other work to overlap anyway).
+      if (tid == 0 && nloc == 0) *sm_claim = (int)gridDim.x + atomicAdd(p.ws_next, 1);
+    }
 
-  // ---- merge the 4 per-warp softmax states -----------------------------------
-  // Stage each warp's scaled accumulator into its own smem strip (overlaid on
-  // the now-idle TMA ring), then reduce strips with plain loads (no atomics).
-  if ((lane & 3) == 0) {
-    int r = lane >> 2;
-    // the mainloop's online state now keeps raw (unscaled) maxima; convert to
-    // scaled space here so the merge below (e0/e1, cluster fa/fb) is unchanged
-    sm_red[warp * 16 + r] = m0 * p.scale_log2e;
-    sm_red[warp * 16 + r + 8] = m1 * p.scale_log2e;
-    sm_red[64 + warp * 16 + r] = l0;
-    sm_red[64 + warp * 16 + r + 8] = l1;
-  }
-  __syncthreads();
-  const int r0 = lane >> 2;
-  float M0 = fmaxf(fmaxf(sm_red[r0], sm_red[16 + r0]),
-                   fmaxf(sm_red[32 + r0], sm_red[48 + r0]));
-  float M1 = fmaxf(fmaxf(sm_red[r0 + 8], sm_red[16 + r0 + 8]),
-                   fmaxf(sm_red[32 + r0 + 8], sm_red[48 + r0 + 8]));
-  float e0 = exp2f(m0 * p.scale_log2e - M0);  // m raw -> scaled; M0 already scaled
-  float e1 = exp2f(m1 * p.scale_log2e - M1);
-  if ((lane & 3) == 0) {
-    atomicAdd(&sm_red[128 + r0], l0 * e0);
-    atomicAdd(&sm_red[128 + r0 + 8], l1 * e1);
-  }
-  float* strip = sm_acc + warp * (kRows * S::kStripPitch);
+    // ---- merge the 4 per-warp softmax states -----------------------------------
+    // Stage each warp's scaled accumulator into its own smem strip (overlaid on
+    // the now-idle TMA ring), then reduce strips with plain loads (no atomics).
+    if ((lane & 3) == 0) {
+      int r = lane >> 2;
+      // the mainloop's online state now keeps raw (unscaled) maxima; convert to
+      // scaled space here so the merge below (e0/e1, cluster fa/fb) is unchanged
+      sm_red[warp * 16 + r] = m0 * p.scale_log2e;
+      sm_red[warp * 16 + r + 8] = m1 * p.scale_log2e;
+      sm_red[64 + warp * 16 + r] = l0;
+      sm_red[64 + warp * 16 + r + 8] = l1;
+    }
+    __syncthreads();
+    const int r0 = lane >> 2;
+    float M0 = fmaxf(fmaxf(sm_red[r0], sm_red[16 + r0]), fmaxf(sm_red[32 + r0], sm_red[48 + r0]));
+    float M1 = fmaxf(fmaxf(sm_red[r0 + 8], sm_red[16 + r0 + 8]),
+                     fmaxf(sm_red[32 + r0 + 8], sm_red[48 + r0 + 8]));
+    float e0 = exp2f(m0 * p.scale_log2e - M0);  // m raw -> scaled; M0 already scaled
+    float e1 = exp2f(m1 * p.scale_log2e - M1);
+    if ((lane & 3) == 0) {
+      atomicAdd(&sm_red[128 + r0], l0 * e0);
+      atomicAdd(&sm_red[128 + r0 + 8], l1 * e1);
+    }
+    float* strip = sm_acc + warp * (kRows * S::kStripPitch);
 #pragma unroll
-  for (int dt = 0; dt < 16; ++dt) {
-    int col = dt * 8 + kcol0;
-    float2 x0 = make_float2(acc[dt][0] * e0, acc[dt][1] * e0);
-    float2 x1 = make_float2(acc[dt][2] * e1, acc[dt][3] * e1);
-    *reinterpret_cast<float2*>(&strip[r0 * S::kStripPitch + col]) = x0;
-    *reinterpret_cast<float2*>(&strip[(r0 + 8) * S::kStripPitch + col]) = x1;
-  }
-  __syncthreads();
+    for (int dt = 0; dt < 16; ++dt) {
+      int col = dt * 8 + kcol0;
+      float2 x0 = make_float2(acc[dt][0] * e0, acc[dt][1] * e0);
+      float2 x1 = make_float2(acc[dt][2] * e1, acc[dt][3] * e1);
+      *reinterpret_cast<float2*>(&strip[r0 * S::kStripPitch + col]) = x0;
+      *reinterpret_cast<float2*>(&strip[(r0 + 8) * S::kStripPitch + col]) = x1;
+    }
+    __syncthreads();
 
-  // ---- reduce strips + epilogue write ------------------------------------------
-  // warp w owns output cols [w*32, w*32+32) for all 16 rows
-  if constexpr (CLUSTER) {
-    // Cluster pair merge. Each CTA first reduces its 4 warp strips into a
-    // compact 16x128 FP32 partial (still scaled to this CTA's per-row max,
-    // like the l sums in sm_red[128+g]) and publishes M_cta per row. After a
-    // cluster barrier, rank 0 pulls the peer's partial + (m, l) over DSM,
-    // merges the two online-softmax states exactly (fa/fb rescale), and does
-    // the single final store; rank 1 waits on a second barrier so its shared
-    // memory stays live until every remote read has completed.
-    float* sm_part = sm_acc + 4 * (kRows * S::kStripPitch);  // 16x128 fp32, past strips
-    if (tid < 16) {
-      sm_red[144 + tid] =
-          fmaxf(fmaxf(sm_red[tid], sm_red[16 + tid]),
-                fmaxf(sm_red[32 + tid], sm_red[48 + tid]));
+    // ---- reduce strips + epilogue write ------------------------------------------
+    // warp w owns output cols [w*32, w*32+32) for all 16 rows
+    if constexpr (CLUSTER) {
+      // Cluster pair merge. Each CTA first reduces its 4 warp strips into a
+      // compact 16x128 FP32 partial (still scaled to this CTA's per-row max,
+      // like the l sums in sm_red[128+g]) and publishes M_cta per row. After a
+      // cluster barrier, rank 0 pulls the peer's partial + (m, l) over DSM,
+      // merges the two online-softmax states exactly (fa/fb rescale), and does
+      // the single final store; rank 1 waits on a second barrier so its shared
+      // memory stays live until every remote read has completed.
+      float* sm_part = sm_acc + 4 * (kRows * S::kStripPitch);  // 16x128 fp32, past strips
+      if (tid < 16) {
+        sm_red[144 + tid] =
+            fmaxf(fmaxf(sm_red[tid], sm_red[16 + tid]), fmaxf(sm_red[32 + tid], sm_red[48 + tid]));
+      }
+#pragma unroll
+      for (int it = 0; it < 2; ++it) {
+        int i = lane + it * 32;  // 0..63
+        int g = i >> 2;          // row 0..15
+        int c8 = i & 3;          // 8-col group inside warp slice
+        int col = warp * 32 + c8 * 8;
+        float vals[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) vals[j] = 0.f;
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+          const float* sp = sm_acc + s * (kRows * S::kStripPitch) + g * S::kStripPitch + col;
+          float4 x0 = *reinterpret_cast<const float4*>(sp);
+          float4 x1 = *reinterpret_cast<const float4*>(sp + 4);
+          vals[0] += x0.x;
+          vals[1] += x0.y;
+          vals[2] += x0.z;
+          vals[3] += x0.w;
+          vals[4] += x1.x;
+          vals[5] += x1.y;
+          vals[6] += x1.z;
+          vals[7] += x1.w;
+        }
+        float* pp = sm_part + g * 128 + col;
+        *reinterpret_cast<float4*>(pp) = make_float4(vals[0], vals[1], vals[2], vals[3]);
+        *reinterpret_cast<float4*>(pp + 4) = make_float4(vals[4], vals[5], vals[6], vals[7]);
+      }
+      __syncthreads();  // partial + M_cta visible CTA-wide before cluster sync
+      cluster_sync();
+      if (crank == 0) {
+        const uint32_t r_part = mapa_cta(smem_u32(sm_part), 1);
+        const uint32_t r_red = mapa_cta(smem_u32(sm_red), 1);
+#pragma unroll
+        for (int it = 0; it < 2; ++it) {
+          int i = lane + it * 32;
+          int g = i >> 2;
+          int c8 = i & 3;
+          int col = warp * 32 + c8 * 8;
+          // Row g's output token/head come from the packed row map; rows of
+          // tokens past total_q carry bit 0 and are skipped.
+          const int t = g / p.group;
+          if (sm_rtbit[g] != 0) {
+            const float* pp = sm_part + g * 128 + col;
+            const float4 a0 = *reinterpret_cast<const float4*>(pp);
+            const float4 a1 = *reinterpret_cast<const float4*>(pp + 4);
+            const uint32_t roff = (uint32_t)((g * 128 + col) * 4);
+            float b0[4], b1[4];
+            ldsm_remote_v4f32(b0, r_part + roff);
+            ldsm_remote_v4f32(b1, r_part + roff + 16);
+            const float mA = sm_red[144 + g];
+            const float lA = sm_red[128 + g];
+            const float mB = ldsm_remote_f32(r_red + (144 + g) * 4);
+            const float lB = ldsm_remote_f32(r_red + (128 + g) * 4);
+            const float M = fmaxf(mA, mB);
+            const float fa = exp2f(mA - M);
+            const float fb = exp2f(mB - M);
+            const float vals[8] = {a0.x * fa + b0[0] * fb, a0.y * fa + b0[1] * fb,
+                                   a0.z * fa + b0[2] * fb, a0.w * fa + b0[3] * fb,
+                                   a1.x * fa + b1[0] * fb, a1.y * fa + b1[1] * fb,
+                                   a1.z * fa + b1[2] * fb, a1.w * fa + b1[3] * fb};
+            const float l = lA * fa + lB * fb;
+            const float inv = l > 0.f ? 1.f / l : 0.f;
+            uint32_t pack4[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+              pack4[j] = Mma<QT>::pack(vals[j * 2] * inv, vals[j * 2 + 1] * inv);
+            QT* dst = reinterpret_cast<QT*>(p.out) + (long)(ntok0 + t) * p.o_tok +
+                      (long)(h * p.group + (g - t * p.group)) * p.o_head + col;
+            *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<uint4*>(pack4);
+          }
+        }
+      }
+      cluster_sync();  // rank 1's smem must stay live until rank 0 finished
+      return;
     }
 #pragma unroll
     for (int it = 0; it < 2; ++it) {
-      int i = lane + it * 32;              // 0..63
-      int g = i >> 2;                      // row 0..15
-      int c8 = i & 3;                      // 8-col group inside warp slice
+      int i = lane + it * 32;  // 0..63
+      int g = i >> 2;          // row 0..15
+      int c8 = i & 3;          // 8-col group inside warp slice
       int col = warp * 32 + c8 * 8;
       float vals[8];
 #pragma unroll
       for (int j = 0; j < 8; ++j) vals[j] = 0.f;
 #pragma unroll
       for (int s = 0; s < 4; ++s) {
-        const float* sp = sm_acc + s * (kRows * S::kStripPitch) +
-                        g * S::kStripPitch + col;
+        const float* sp = sm_acc + s * (kRows * S::kStripPitch) + g * S::kStripPitch + col;
         float4 x0 = *reinterpret_cast<const float4*>(sp);
         float4 x1 = *reinterpret_cast<const float4*>(sp + 4);
-        vals[0] += x0.x; vals[1] += x0.y; vals[2] += x0.z; vals[3] += x0.w;
-        vals[4] += x1.x; vals[5] += x1.y; vals[6] += x1.z; vals[7] += x1.w;
+        vals[0] += x0.x;
+        vals[1] += x0.y;
+        vals[2] += x0.z;
+        vals[3] += x0.w;
+        vals[4] += x1.x;
+        vals[5] += x1.y;
+        vals[6] += x1.z;
+        vals[7] += x1.w;
       }
-      float* pp = sm_part + g * 128 + col;
-      *reinterpret_cast<float4*>(pp) = make_float4(vals[0], vals[1], vals[2], vals[3]);
-      *reinterpret_cast<float4*>(pp + 4) = make_float4(vals[4], vals[5], vals[6], vals[7]);
-    }
-    __syncthreads();  // partial + M_cta visible CTA-wide before cluster sync
-    cluster_sync();
-    if (crank == 0) {
-      const uint32_t r_part = mapa_cta(smem_u32(sm_part), 1);
-      const uint32_t r_red = mapa_cta(smem_u32(sm_red), 1);
+      // PACK: row g's output token/head come from the packed row map; rows of
+      // tokens past total_q carry bit 0 and are skipped.
+      long otok = n;
+      int oh = h * p.group + g;
+      bool rvalid = g < p.group;
+      if constexpr (PACK) {
+        int t = g / p.group;
+        otok = PACK ? (long)(ntok0 + t) : otok;
+        oh = h * p.group + (g - t * p.group);
+        rvalid = sm_rtbit[g] != 0;
+      }
+      if (rvalid) {
+        float lr = sm_red[128 + g];
+        float inv = lr > 0.f ? 1.f / lr : 0.f;
+        uint32_t pack4[4];
 #pragma unroll
-      for (int it = 0; it < 2; ++it) {
-        int i = lane + it * 32;
-        int g = i >> 2;
-        int c8 = i & 3;
-        int col = warp * 32 + c8 * 8;
-        // Row g's output token/head come from the packed row map; rows of
-        // tokens past total_q carry bit 0 and are skipped.
-        const int t = g / p.group;
-        if (sm_rtbit[g] != 0) {
-          const float* pp = sm_part + g * 128 + col;
-          const float4 a0 = *reinterpret_cast<const float4*>(pp);
-          const float4 a1 = *reinterpret_cast<const float4*>(pp + 4);
-          const uint32_t roff = (uint32_t)((g * 128 + col) * 4);
-          float b0[4], b1[4];
-          ldsm_remote_v4f32(b0, r_part + roff);
-          ldsm_remote_v4f32(b1, r_part + roff + 16);
-          const float mA = sm_red[144 + g];
-          const float lA = sm_red[128 + g];
-          const float mB = ldsm_remote_f32(r_red + (144 + g) * 4);
-          const float lB = ldsm_remote_f32(r_red + (128 + g) * 4);
-          const float M = fmaxf(mA, mB);
-          const float fa = exp2f(mA - M);
-          const float fb = exp2f(mB - M);
-          const float vals[8] = {a0.x * fa + b0[0] * fb, a0.y * fa + b0[1] * fb,
-                                 a0.z * fa + b0[2] * fb, a0.w * fa + b0[3] * fb,
-                                 a1.x * fa + b1[0] * fb, a1.y * fa + b1[1] * fb,
-                                 a1.z * fa + b1[2] * fb, a1.w * fa + b1[3] * fb};
-          const float l = lA * fa + lB * fb;
-          const float inv = l > 0.f ? 1.f / l : 0.f;
-          uint32_t pack4[4];
-#pragma unroll
-          for (int j = 0; j < 4; ++j)
-            pack4[j] = Mma<QT>::pack(vals[j * 2] * inv, vals[j * 2 + 1] * inv);
-          QT* dst = reinterpret_cast<QT*>(p.out) + (long)(ntok0 + t) * p.o_tok +
-                    (long)(h * p.group + (g - t * p.group)) * p.o_head + col;
-          *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<uint4*>(pack4);
-        }
+        for (int j = 0; j < 4; ++j)
+          pack4[j] = Mma<QT>::pack(vals[j * 2] * inv, vals[j * 2 + 1] * inv);
+        QT* dst = reinterpret_cast<QT*>(p.out) + otok * p.o_tok + (long)oh * p.o_head + col;
+        *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<uint4*>(pack4);
       }
     }
-    cluster_sync();  // rank 1's smem must stay live until rank 0 finished
-    return;
-  }
-#pragma unroll
-  for (int it = 0; it < 2; ++it) {
-    int i = lane + it * 32;              // 0..63
-    int g = i >> 2;                      // row 0..15
-    int c8 = i & 3;                      // 8-col group inside warp slice
-    int col = warp * 32 + c8 * 8;
-    float vals[8];
-#pragma unroll
-    for (int j = 0; j < 8; ++j) vals[j] = 0.f;
-#pragma unroll
-    for (int s = 0; s < 4; ++s) {
-      const float* sp = sm_acc + s * (kRows * S::kStripPitch) +
-                        g * S::kStripPitch + col;
-      float4 x0 = *reinterpret_cast<const float4*>(sp);
-      float4 x1 = *reinterpret_cast<const float4*>(sp + 4);
-      vals[0] += x0.x; vals[1] += x0.y; vals[2] += x0.z; vals[3] += x0.w;
-      vals[4] += x1.x; vals[5] += x1.y; vals[6] += x1.z; vals[7] += x1.w;
+    if constexpr (PERSIST && MSA_PERSIST_FULLGRID == 2) {
+      // A/B: static-equivalent traversal — no queue op anywhere; every CTA
+      // runs its pre-assigned tile and exits.
+      return;
+    } else if constexpr (PERSIST) {
+      // Pair mode: every union-block pair iteration consumed exactly one use
+      // of both ring slots; account this tile's nloc/2 uses so the next
+      // claimed tile's wait parities match the carried-over barrier phases.
+      wphase[0] += nloc >> 1;
+      wphase[1] += nloc >> 1;
+    } else {
+      break;
     }
-    // PACK: row g's output token/head come from the packed row map; rows of
-    // tokens past total_q carry bit 0 and are skipped.
-    long otok = n;
-    int oh = h * p.group + g;
-    bool rvalid = g < p.group;
-    if constexpr (PACK) {
-      int t = g / p.group;
-      otok = PACK ? (long)(ntok0 + t) : otok;
-      oh = h * p.group + (g - t * p.group);
-      rvalid = sm_rtbit[g] != 0;
-    }
-    if (rvalid) {
-      float lr = sm_red[128 + g];
-      float inv = lr > 0.f ? 1.f / lr : 0.f;
-      uint32_t pack4[4];
-#pragma unroll
-      for (int j = 0; j < 4; ++j)
-        pack4[j] = Mma<QT>::pack(vals[j * 2] * inv, vals[j * 2 + 1] * inv);
-      QT* dst = reinterpret_cast<QT*>(p.out) + otok * p.o_tok +
-                (long)oh * p.o_head + col;
-      *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<uint4*>(pack4);
-    }
-  }
-  if constexpr (PERSIST && MSA_PERSIST_FULLGRID == 2) {
-    // A/B: static-equivalent traversal — no queue op anywhere; every CTA
-    // runs its pre-assigned tile and exits.
-    return;
-  } else if constexpr (PERSIST) {
-    // Pair mode: every union-block pair iteration consumed exactly one use
-    // of both ring slots; account this tile's nloc/2 uses so the next
-    // claimed tile's wait parities match the carried-over barrier phases.
-    wphase[0] += nloc >> 1;
-    wphase[1] += nloc >> 1;
-  } else {
-    break;
-  }
   }  // PERSIST claim loop (single pass when !PERSIST)
 }
 
@@ -1800,15 +1797,20 @@ msa_sparse_kernel(
 // kind: 0 = bf16, 1 = fp16, 2 = fp8-e4m3
 CUtensorMapDataType tma_dtype(int kind) {
   switch (kind) {
-    case 0: return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
-    case 1: return CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
-    case 2: return CU_TENSOR_MAP_DATA_TYPE_UINT8;
-    default: MSAV_CHECK(false, "unsupported KV dtype kind %d", kind); return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+    case 0:
+      return CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+    case 1:
+      return CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+    case 2:
+      return CU_TENSOR_MAP_DATA_TYPE_UINT8;
+    default:
+      MSAV_CHECK(false, "unsupported KV dtype kind %d", kind);
+      return CU_TENSOR_MAP_DATA_TYPE_UINT8;
   }
 }
 
-void encode_tmap(CUtensorMap* map, const void* base, const KvLayout& kv, int kind,
-                 bool paged, int box_tok) {
+void encode_tmap(CUtensorMap* map, const void* base, const KvLayout& kv, int kind, bool paged,
+                 int box_tok) {
   // Build the (rank, dims, strides, box) description shared by K and V.
   const bool is_fp8 = (kind == 2);
   const int es = is_fp8 ? 1 : 2;
@@ -1820,12 +1822,14 @@ void encode_tmap(CUtensorMap* map, const void* base, const KvLayout& kv, int kin
     if (!paged) {
       // [total_tokens, kvh, 128] -> dims {64 elem half, kvh, tokens}
       rank = 3;
-      dims[0] = kHead;   // full head dim; box[0] selects the 64-elem half
+      dims[0] = kHead;  // full head dim; box[0] selects the 64-elem half
       dims[1] = (cuuint64_t)kv.d1;
       dims[2] = (cuuint64_t)kv.d0;
       strides[0] = (cuuint64_t)kv.s1 * es;
       strides[1] = (cuuint64_t)kv.s0 * es;
-      box[0] = 64; box[1] = 1; box[2] = box_tok;
+      box[0] = 64;
+      box[1] = 1;
+      box[2] = box_tok;
     } else {
       // [pages, kvh, 128, 128] -> dims {64 elem half, 128 tok, kvh, pages}
       rank = 4;
@@ -1836,7 +1840,10 @@ void encode_tmap(CUtensorMap* map, const void* base, const KvLayout& kv, int kin
       strides[0] = (cuuint64_t)kv.s2 * es;
       strides[1] = (cuuint64_t)kv.s1 * es;
       strides[2] = (cuuint64_t)kv.s0 * es;
-      box[0] = 64; box[1] = box_tok; box[2] = 1; box[3] = 1;
+      box[0] = 64;
+      box[1] = box_tok;
+      box[2] = 1;
+      box[3] = 1;
     }
   } else {
     if (!paged) {
@@ -1847,7 +1854,9 @@ void encode_tmap(CUtensorMap* map, const void* base, const KvLayout& kv, int kin
       dims[2] = (cuuint64_t)kv.d0;
       strides[0] = (cuuint64_t)kv.s1 * es;
       strides[1] = (cuuint64_t)kv.s0 * es;
-      box[0] = kHead; box[1] = 1; box[2] = kChunkTok;
+      box[0] = kHead;
+      box[1] = 1;
+      box[2] = kChunkTok;
     } else {
       // dims {128, 128 tok, kvh, pages}
       rank = 4;
@@ -1858,29 +1867,32 @@ void encode_tmap(CUtensorMap* map, const void* base, const KvLayout& kv, int kin
       strides[0] = (cuuint64_t)kv.s2 * es;
       strides[1] = (cuuint64_t)kv.s1 * es;
       strides[2] = (cuuint64_t)kv.s0 * es;
-      box[0] = kHead; box[1] = kChunkTok; box[2] = 1; box[3] = 1;
+      box[0] = kHead;
+      box[1] = kChunkTok;
+      box[2] = 1;
+      box[3] = 1;
     }
   }
   cuuint32_t elem_strides[5] = {1, 1, 1, 1, 1};
-  CUresult r = cuTensorMapEncodeTiled(
-      map, tma_dtype(kind), rank, const_cast<void*>(base), dims, strides, box,
-      elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-      is_fp8 ? CU_TENSOR_MAP_SWIZZLE_NONE : CU_TENSOR_MAP_SWIZZLE_128B,
-      CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  CUresult r =
+      cuTensorMapEncodeTiled(map, tma_dtype(kind), rank, const_cast<void*>(base), dims, strides,
+                             box, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
+                             is_fp8 ? CU_TENSOR_MAP_SWIZZLE_NONE : CU_TENSOR_MAP_SWIZZLE_128B,
+                             CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   MSAV_CHECK(r == CUDA_SUCCESS, "cuTensorMapEncodeTiled failed: %d", (int)r);
 }
 
-template <typename QT, int KVK, bool PAGED, int NSTG, int VSL, bool PACK,
-          bool JV = (VSL != 1), bool PAIRP = false>
-void launch_msa(const Params& p, const CUtensorMap& kmap, const CUtensorMap& vmap,
-                int grid_x, int kvh, cudaStream_t stream) {
+template <typename QT, int KVK, bool PAGED, int NSTG, int VSL, bool PACK, bool JV = (VSL != 1),
+          bool PAIRP = false>
+void launch_msa(const Params& p, const CUtensorMap& kmap, const CUtensorMap& vmap, int grid_x,
+                int kvh, cudaStream_t stream) {
   constexpr size_t kSmem = Smem<KVK, NSTG, VSL>::kTotal;
   auto kern = msa_sparse_kernel<QT, KVK, PAGED, NSTG, VSL, PACK, JV, PAIRP>;
   static bool inited = [&] {
     cudaError_t e =
         cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kSmem);
-    MSAV_CHECK(e == cudaSuccess, "cudaFuncSetAttribute failed: %s smem=%d",
-               cudaGetErrorString(e), (int)kSmem);
+    MSAV_CHECK(e == cudaSuccess, "cudaFuncSetAttribute failed: %s smem=%d", cudaGetErrorString(e),
+               (int)kSmem);
     return true;
   }();
   (void)inited;
@@ -1897,17 +1909,14 @@ void launch_msa(const Params& p, const CUtensorMap& kmap, const CUtensorMap& vma
 // +36-51% and +5-7% respectively on the grid-saturated fixture9 —
 // and were pruned in round 22 (evidence in ncu_evidence.md).
 template <typename QT, int KVK, bool PAGED>
-void launch_pack_pair(const Params& pin, const CUtensorMap& kmap,
-                      const CUtensorMap& vmap, int ntiles, int kvh,
-                      cudaStream_t stream) {
-  launch_msa<QT, KVK, PAGED, 2, 2, true, true, true>(pin, kmap, vmap, ntiles,
-                                                     kvh, stream);
+void launch_pack_pair(const Params& pin, const CUtensorMap& kmap, const CUtensorMap& vmap,
+                      int ntiles, int kvh, cudaStream_t stream) {
+  launch_msa<QT, KVK, PAGED, 2, 2, true, true, true>(pin, kmap, vmap, ntiles, kvh, stream);
 }
 
 template <typename QT, int KVK, bool PAGED>
-void dispatch_stages(Params p, const CUtensorMap& kmap,
-                     const CUtensorMap& vmap, int total_q, int kvh,
-                     cudaStream_t stream) {
+void dispatch_stages(Params p, const CUtensorMap& kmap, const CUtensorMap& vmap, int total_q,
+                     int kvh, cudaStream_t stream) {
   // Structural variant dispatch (keyed only on runtime tensor structure):
   //  * seqlen_q >= kRows (16): long-query/prefill variant with a shallow
   //    2-stage ring so three CTAs fit per SM for cross-CTA latency hiding
@@ -1958,8 +1967,7 @@ void dispatch_stages(Params p, const CUtensorMap& kmap,
         // cost), 3-buffer ring (54KB/CTA, 4 CTAs/SM) +3.1-14% loss in three
         // variants (4-CTA residency confirmed by NCU but the shorter ring
         // inflates per-pair warp latency 6.26 -> 7.41 cyc/inst).
-        launch_pack_pair<QT, KVK, PAGED>(p, kmap, vmap,
-                                         (total_q + T - 1) / T, kvh, stream);
+        launch_pack_pair<QT, KVK, PAGED>(p, kmap, vmap, (total_q + T - 1) / T, kvh, stream);
         return;
       }
     }
@@ -1971,8 +1979,8 @@ void dispatch_stages(Params p, const CUtensorMap& kmap,
       launch_msa<QT, KVK, PAGED, 2, 1, false>(p, kmap, vmap, total_q, kvh, stream);
     }
   } else {
-    launch_msa<QT, KVK, PAGED, (KVK == 2) ? 4 : 3, (KVK == 2) ? 4 : 3, false>(
-        p, kmap, vmap, total_q, kvh, stream);
+    launch_msa<QT, KVK, PAGED, (KVK == 2) ? 4 : 3, (KVK == 2) ? 4 : 3, false>(p, kmap, vmap,
+                                                                              total_q, kvh, stream);
   }
 }
 
