@@ -290,7 +290,7 @@ def test_error_message_keeps_shape_summary_format() -> None:
     assert re.search(r"no decode kernel.*num_tokens=1, num_heads=16, topk=384", msg)
 
 
-def test_plan_swapab_rejections() -> None:
+def test_plan_swapab_rejections(known_crossover) -> None:
     """Forced swapab raises at the plan layer, before any launch: non-V32
     family, dual-cache call, unknown prefill_impl string."""
     dev = torch.device("cpu")
