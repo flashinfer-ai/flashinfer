@@ -27,8 +27,10 @@ and TAIL is the one-time cleanup and drain after LOOP exits.
 SMEM resources (TMA pipelines)
 ------------------------------
 - SmemQResource   : SMEM Q buffer, TmaUmma pipeline. Load -> MMA.
-- SmemKVResource  : SMEM KV buffer, TmaUmma pipeline. Load -> MMA. The D256
+- SmemKResource   : SMEM K buffer, TmaUmma pipeline. Load -> MMA. The D256
                     depth is derived from the public SM100 SMEM capacity.
+- SmemVResource   : SMEM V buffer, TmaUmma pipeline. Load -> MMA. Sized from
+                    v_dtype independently of SmemKResource's k_dtype.
 - SmemOResource   : One SMEM O buffer per Q/O instance, AsyncAsync pipeline.
                     Correction -> Epilogue.
 
@@ -1322,7 +1324,7 @@ class SmemPageOffsetsKvResource(MemoryResource):
     - Single ``load_k`` / ``load_v`` producer pair (context has no
       ``num_insts_kv > 1`` four-way split).
     - Consumer release labels bind to ``{"k_load", "v_load"}`` (matching
-      ``SmemKVResource`` producer names).
+      ``SmemKResource``/``SmemVResource`` producer names).
     - Driven by the staged D256 ``cfg.empty_warp_id`` (warp 11).
       Paired D128 does not instantiate this resource.
     """
@@ -1556,75 +1558,64 @@ class SmemPageOffsetsKvResource(MemoryResource):
         self, downstream: MemoryResource
     ) -> set[str] | None:
         """Bind page-offset releases to the K/V TMA loads that consumed them."""
-        if isinstance(downstream, SmemKVResource):
-            if self.cfg.reuses_page_table_windows:
-                if self.page_table_is_v:
-                    return {"v_load", "v_load_stage", "v_load_stage_cached"}
-                return {"k_load", "k_load_stage"}
-            return {
-                "k_load",
-                "v_load",
-                "k_load_stage",
-                "v_load_stage",
-                "v_load_stage_cached",
-            }
+        if isinstance(downstream, SmemKResource):
+            if self.cfg.reuses_page_table_windows and self.page_table_is_v:
+                return None
+            return {"k_load", "k_load_stage"}
+        if isinstance(downstream, SmemVResource):
+            if self.cfg.reuses_page_table_windows and not self.page_table_is_v:
+                return None
+            return {"v_load", "v_load_stage", "v_load_stage_cached"}
         return None
 
 
 # ---------------------------------------------------------------------------
-# SmemKVResource -- SMEM K/V tile buffer with TMA pipeline
+# SmemKResource / SmemVResource -- SMEM K and V tile buffers with TMA pipelines
 # ---------------------------------------------------------------------------
 
 
 @dataclass(kw_only=True)
-class SmemKVResource(MemoryResource):
-    """SMEM buffer for K and V tiles with a capacity-derived TmaUmma pipeline.
+class SmemKResource(MemoryResource):
+    """SMEM buffer for K tiles with its own capacity-derived TmaUmma pipeline.
 
-    K and V tiles alternate in the pipeline stages: K0, V0, K1, V1, ...
-    Producer: LoadTask (TMA loads K/V tiles).
-    Consumer: MmaTask (builds SMEM descriptors for QK and PV MMAs).
+    Producer: LoadTask (TMA loads K tiles).
+    Consumer: MmaTask (builds the SMEM descriptor for QK MMA).
     """
 
     sK_array: cutlass.Array = field(init=False, default=None)
     tma_k_desc: cutlass.Pointer | None = field(init=False, default=None)
-    tma_v_desc: cutlass.Pointer | None = field(init=False, default=None)
     page_offsets_kv: Optional["SmemPageOffsetsKvResource"] = field(
-        init=False, default=None
-    )
-    page_offsets_v: Optional["SmemPageOffsetsKvResource"] = field(
         init=False, default=None
     )
     page_idx_kv: cute.Pointer | None = field(init=False, default=None)
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
     _alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
     desc_k_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
-    desc_v_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
 
     def __init__(
         self,
         tma_k_desc: cutlass.Pointer | None,
-        tma_v_desc: cutlass.Pointer | None,
         pipeline_config: PipelineConfig,
         cfg: FmhaConfig,
         page_offsets_kv: Optional["SmemPageOffsetsKvResource"] = None,
-        page_offsets_v: Optional["SmemPageOffsetsKvResource"] = None,
         page_idx_kv: cute.Pointer | None = None,
         **kwargs: Any,
     ) -> None:
-        """Bind K/V TMA descriptors and reserve shared SMEM staging."""
+        """Bind the K TMA descriptor and reserve K's own SMEM staging.
+
+        Sized at ``pipeline_config.num_stages``, which is K's own split of 
+        the combined pipeline depth). The allocator's normal bump allocation 
+        places this next to SmemVResource's independently-sized allocation. 
+        """
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.tma_k_desc = tma_k_desc
-        self.tma_v_desc = tma_v_desc
         self.page_offsets_kv = page_offsets_kv
-        self.page_offsets_v = (
-            page_offsets_v if page_offsets_v is not None else page_offsets_kv
-        )
         self.page_idx_kv = page_idx_kv
         self.cfg = cfg
-        total_elements = cfg.sK_shape[0] * cfg.sK_shape[1]
+        total_elements = pipeline_config.num_stages * cfg.sK_shape[1]
         size_bytes = total_elements * cfg.k_dtype.width // 8
         self._alloc = SmemAllocation(
-            "smem_kv", size_bytes, alignment=cfg.buffer_align_bytes
+            "smem_k", size_bytes, alignment=cfg.buffer_align_bytes
         )
         self.sK_array = _placeholder_smem_array(cfg.k_dtype)
         self.desc_k_base = TaskLocalVariable(
@@ -1632,21 +1623,16 @@ class SmemKVResource(MemoryResource):
             default=cutlass.Int64(0),
             docs="SMEM descriptor base for the current K tile.",
         )
-        self.desc_v_base = TaskLocalVariable(
-            dtype=cutlass.Int64,
-            default=cutlass.Int64(0),
-            docs="SMEM descriptor base for the current V tile.",
-        )
 
     def get_smem_requirements(self) -> list[SmemAllocation]:
-        """Return the SMEM allocation required for staged K/V tiles."""
+        """Return the SMEM allocation required for staged K tiles."""
         return [self._alloc]
 
     @cute.jit
     def _init_smem_state(self, stage_info: StageInfo) -> None:
-        """Materialize K/V SMEM storage and descriptor dataflow slots."""
+        """Materialize K SMEM storage and descriptor dataflow slots."""
         smem_base = stage_info.context.smem_base
-        total_elements = self.cfg.sK_shape[0] * self.cfg.sK_shape[1]
+        total_elements = self.pipeline_config.num_stages * self.cfg.sK_shape[1]
         self.sK_array = cutlass.Array(
             smem_base.data_ptr() + self._alloc.offset,
             dtype=self.cfg.k_dtype,
@@ -1666,7 +1652,7 @@ class SmemKVResource(MemoryResource):
 
     @property
     def loop_offset_sensitive(self) -> bool:
-        """Return true because K/V loads index the current loop tile."""
+        """Return true because K loads index the current loop tile."""
         # producer_work uses loop_offset to compute seq_coord_kv.
         return True
 
@@ -1675,7 +1661,6 @@ class SmemKVResource(MemoryResource):
         self,
         stage_info: StageInfo,
         tma_desc: cutlass.Pointer | None,
-        is_v: cutlass.Constexpr[bool] = False,
         tile_offset: cutlass.Constexpr[int] = 0,
         head_dim_stage_idx: cutlass.Constexpr[int] = 0,
         cached_page_ids: cutlass.Array | None = None,
@@ -1685,7 +1670,7 @@ class SmemKVResource(MemoryResource):
         cuseqlen_k: Int32,
         kv_tile_start: Int32,
     ) -> None:
-        """Issue TMA bulk-copy for one K or V tile."""
+        """Issue TMA bulk-copy for one K tile."""
         seq_offset = (
             kv_tile_start + stage_info.loop_offset + tile_offset
         ) * self.cfg.kv_tile_n
@@ -1702,33 +1687,17 @@ class SmemKVResource(MemoryResource):
             # d-half.
             tile_idx = kv_tile_start + stage_info.loop_offset + tile_offset
             pages_per_tile = self.cfg.kv_tile_n // self.cfg.num_tokens_per_page
-            d_granu_inner = (
-                self.cfg.tma_copy_v_granu_inner
-                if cutlass.const_expr(is_v)
-                else self.cfg.tma_copy_kv_granu_inner
-            )
+            d_granu_inner = self.cfg.tma_copy_kv_granu_inner
             page_d_elems = self.cfg.num_tokens_per_page * d_granu_inner
-            d_iter_elems = (
-                self.cfg.tma_copy_v_granu_elems
-                if cutlass.const_expr(is_v)
-                else self.cfg.tma_copy_kv_granu_elems
-            )
-            stage_iters = (
-                self.cfg.tma_copy_v_stage_iters
-                if cutlass.const_expr(is_v)
-                else self.cfg.tma_copy_kv_stage_iters
-            )
+            d_iter_elems = self.cfg.tma_copy_kv_granu_elems
+            stage_iters = self.cfg.tma_copy_kv_stage_iters
             if prims.elect_sync():
                 # Only the elected TMA-issuing lane consumes page IDs. Loading
                 # the vector outside this guard made every lane perform the
-                # same SMEM read for every K and V tile.
+                # same SMEM read for every K tile.
                 page_ids = cached_page_ids
                 if cutlass.const_expr(page_ids is None):
-                    page_offsets = (
-                        self.page_offsets_v
-                        if cutlass.const_expr(is_v)
-                        else self.page_offsets_kv
-                    )
+                    page_offsets = self.page_offsets_kv
                     if cutlass.const_expr(page_offsets is not None):
                         page_ids = page_offsets.page_ids(tile_idx)
                     else:
@@ -1771,21 +1740,9 @@ class SmemKVResource(MemoryResource):
             return
 
         if prims.elect_sync():
-            d_granu_inner = (
-                self.cfg.tma_copy_v_granu_inner
-                if cutlass.const_expr(is_v)
-                else self.cfg.tma_copy_kv_granu_inner
-            )
-            d_granu_elems = (
-                self.cfg.tma_copy_v_granu_elems
-                if cutlass.const_expr(is_v)
-                else self.cfg.tma_copy_kv_granu_elems
-            )
-            stage_iters = (
-                self.cfg.tma_copy_v_stage_iters
-                if cutlass.const_expr(is_v)
-                else self.cfg.tma_copy_kv_stage_iters
-            )
+            d_granu_inner = self.cfg.tma_copy_kv_granu_inner
+            d_granu_elems = self.cfg.tma_copy_kv_granu_elems
+            stage_iters = self.cfg.tma_copy_kv_stage_iters
             seq_coord_kv = cuseqlen_k + seq_offset
             for i in cutlass.range_constexpr(stage_iters):
                 d_offset = (
@@ -1844,7 +1801,6 @@ class SmemKVResource(MemoryResource):
         self._tma_load(
             stage_info,
             self.tma_k_desc,
-            False,
             tile_offset=tile_offset,
             head_dim_stage_idx=stage_id,
             kv_head_coord=kv_head_coord,
@@ -1852,6 +1808,207 @@ class SmemKVResource(MemoryResource):
             cuseqlen_k=cuseqlen_k,
             kv_tile_start=kv_tile_start,
         )
+
+    @consumer_work(returns=desc_k_base)
+    @cute.jit
+    def k_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
+        """Build K SMEM descriptor (K-major layout for QK MMA) -> desc_k_base."""
+        smem_stage_elements = self.cfg.tma_copy_kv_elements
+        sK_curr = self.sK_array.subview(stage_info.stage_idx * smem_stage_elements)
+        leading_byte_offset, stride_byte_offset = _qk_smem_desc_offsets(self.cfg)
+        desc_k_base = prims.Tcgen05SmemDesc.build(
+            sK_curr,
+            leading_byte_offset=leading_byte_offset,
+            stride_byte_offset=stride_byte_offset,
+            layout=_qk_smem_layout(self.cfg),
+        )
+        return desc_k_base
+
+
+@dataclass(kw_only=True)
+class SmemVResource(MemoryResource):
+    """SMEM buffer for V tiles with its own capacity-derived TmaUmma pipeline.
+
+    Producer: LoadTask (TMA loads V tiles).
+    Consumer: MmaTask (builds the SMEM descriptor for PV MMA).
+    """
+
+    sV_array: cutlass.Array = field(init=False, default=None)
+    tma_v_desc: cutlass.Pointer | None = field(init=False, default=None)
+    page_offsets_v: Optional["SmemPageOffsetsKvResource"] = field(
+        init=False, default=None
+    )
+    page_idx_kv: cute.Pointer | None = field(init=False, default=None)
+    cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
+    _alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
+    desc_v_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+
+    def __init__(
+        self,
+        tma_v_desc: cutlass.Pointer | None,
+        pipeline_config: PipelineConfig,
+        cfg: FmhaConfig,
+        page_offsets_v: Optional["SmemPageOffsetsKvResource"] = None,
+        page_idx_kv: cute.Pointer | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Bind the V TMA descriptor and reserve V's own SMEM staging.
+
+        Sized at ``pipeline_config.num_stages``, which is V's own split of 
+        the combined pipeline depth). The allocator's normal bump allocation 
+        places this next to SmemKResource's independently-sized allocation. 
+        """
+        super().__init__(pipeline_config=pipeline_config, **kwargs)
+        self.tma_v_desc = tma_v_desc
+        self.page_offsets_v = page_offsets_v
+        self.page_idx_kv = page_idx_kv
+        self.cfg = cfg
+        total_elements = pipeline_config.num_stages * cfg.sK_shape[1]
+        size_bytes = total_elements * cfg.v_dtype.width // 8
+        self._alloc = SmemAllocation(
+            "smem_v", size_bytes, alignment=cfg.buffer_align_bytes
+        )
+        self.sV_array = _placeholder_smem_array(cfg.v_dtype)
+        self.desc_v_base = TaskLocalVariable(
+            dtype=cutlass.Int64,
+            default=cutlass.Int64(0),
+            docs="SMEM descriptor base for the current V tile.",
+        )
+
+    def get_smem_requirements(self) -> list[SmemAllocation]:
+        """Return the SMEM allocation required for staged V tiles."""
+        return [self._alloc]
+
+    @cute.jit
+    def _init_smem_state(self, stage_info: StageInfo) -> None:
+        """Materialize V SMEM storage and descriptor dataflow slots."""
+        smem_base = stage_info.context.smem_base
+        total_elements = self.pipeline_config.num_stages * self.cfg.sK_shape[1]
+        self.sV_array = cutlass.Array(
+            smem_base.data_ptr() + self._alloc.offset,
+            dtype=self.cfg.v_dtype,
+            shape=(total_elements,),
+            addrspace=3,
+        )
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_load_state(self, stage_info: StageInfo) -> None:
+        self._init_smem_state(stage_info)
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def init_descriptor_state(self, stage_info: StageInfo) -> None:
+        self._init_smem_state(stage_info)
+
+    @property
+    def loop_offset_sensitive(self) -> bool:
+        """Return true because V loads index the current loop tile."""
+        # producer_work uses loop_offset to compute seq_coord_kv.
+        return True
+
+    @cute.jit
+    def _tma_load(
+        self,
+        stage_info: StageInfo,
+        tma_desc: cutlass.Pointer | None,
+        tile_offset: cutlass.Constexpr[int] = 0,
+        head_dim_stage_idx: cutlass.Constexpr[int] = 0,
+        cached_page_ids: cutlass.Array | None = None,
+        *,
+        kv_head_coord: Int32,
+        batch_coord: Int32,
+        cuseqlen_k: Int32,
+        kv_tile_start: Int32,
+    ) -> None:
+        """Issue TMA bulk-copy for one V tile."""
+        seq_offset = (
+            kv_tile_start + stage_info.loop_offset + tile_offset
+        ) * self.cfg.kv_tile_n
+        smem_stage_elements = self.cfg.tma_copy_kv_elements
+        sV_curr = self.sV_array.subview(stage_info.stage_idx * smem_stage_elements)
+
+        if cutlass.const_expr(self.cfg.use_paged_kv):
+            # Paged-KV path: read pre-staged page IDs and issue one TMA per
+            # (page fragment, d fragment). The descriptor is shaped
+            # (d_inner, num_tokens_per_page, h_kv, total_pages); coords are
+            # (d_off, 0, kv_head_coord, page_id). SMEM layout per stage matches
+            # the contiguous path: two d-halves (tma_copy_v_granu_elems each)
+            # with page fragments concatenated along the seq axis inside each
+            # d-half.
+            tile_idx = kv_tile_start + stage_info.loop_offset + tile_offset
+            pages_per_tile = self.cfg.kv_tile_n // self.cfg.num_tokens_per_page
+            d_granu_inner = self.cfg.tma_copy_v_granu_inner
+            page_d_elems = self.cfg.num_tokens_per_page * d_granu_inner
+            d_iter_elems = self.cfg.tma_copy_v_granu_elems
+            stage_iters = self.cfg.tma_copy_v_stage_iters
+            if prims.elect_sync():
+                # Only the elected TMA-issuing lane consumes page IDs. Loading
+                # the vector outside this guard made every lane perform the
+                # same SMEM read for every V tile.
+                page_ids = cached_page_ids
+                if cutlass.const_expr(page_ids is None):
+                    page_offsets = self.page_offsets_v
+                    if cutlass.const_expr(page_offsets is not None):
+                        page_ids = page_offsets.page_ids(tile_idx)
+                    else:
+                        # The paired K/V schedule consumes K and V together.
+                        # Reading its four contiguous page IDs directly avoids
+                        # a producer warp spinning on an always-full auxiliary
+                        # pipeline and leaves that warp available for CLC.
+                        # FlashInfer's context ABI publishes the same dense
+                        # logical page row for K and V, so both descriptors use
+                        # the first row here.
+                        page_table_offset = batch_coord * Int32(
+                            2 * self.cfg.max_num_pages_per_seq_kv
+                        )
+                        logical_page_idx = tile_idx * Int32(pages_per_tile)
+                        page_ids = cutlass.Array(
+                            Int32,
+                            pages_per_tile,
+                            space=cutlass.AddressSpace.rmem,
+                        )
+                        for frag in cutlass.range_constexpr(pages_per_tile):
+                            page_ids[frag] = Int32(
+                                self.page_idx_kv[
+                                    page_table_offset + logical_page_idx + frag
+                                ]
+                            )
+                for frag in cutlass.range_constexpr(pages_per_tile):
+                    page_id = Int32(page_ids[frag])
+                    for i in cutlass.range_constexpr(stage_iters):
+                        d_offset = Int32(
+                            head_dim_stage_idx * self.cfg.head_dim_per_stage_kv
+                            + i * d_granu_inner
+                        )
+                        smem_offset = Int32(i * d_iter_elems + frag * page_d_elems)
+                        prims.cp_async_bulk_tensor_shared_cta_global(
+                            sV_curr.subview(smem_offset),
+                            tma_desc,
+                            (d_offset, Int32(0), kv_head_coord, page_id),
+                            stage_info.barrier,
+                        )
+            return
+
+        if prims.elect_sync():
+            d_granu_inner = self.cfg.tma_copy_v_granu_inner
+            d_granu_elems = self.cfg.tma_copy_v_granu_elems
+            stage_iters = self.cfg.tma_copy_v_stage_iters
+            seq_coord_kv = cuseqlen_k + seq_offset
+            for i in cutlass.range_constexpr(stage_iters):
+                d_offset = (
+                    head_dim_stage_idx * self.cfg.head_dim_per_stage_kv
+                    + i * d_granu_inner
+                )
+                kv_coords = (d_offset, kv_head_coord, seq_coord_kv, batch_coord)
+                if cutlass.const_expr(self.cfg.has_varlen):
+                    kv_coords = (d_offset, kv_head_coord, seq_coord_kv)
+                prims.cp_async_bulk_tensor_shared_cta_global(
+                    sV_curr.subview(i * d_granu_elems),
+                    tma_desc,
+                    kv_coords,
+                    stage_info.barrier,
+                )
 
     @producer_work
     @cute.jit
@@ -1870,7 +2027,6 @@ class SmemKVResource(MemoryResource):
         self._tma_load(
             stage_info,
             self.tma_v_desc,
-            True,
             tile_offset=tile_offset,
             head_dim_stage_idx=head_dim_stage_idx,
             kv_head_coord=kv_head_coord,
@@ -1897,7 +2053,6 @@ class SmemKVResource(MemoryResource):
         self._tma_load(
             stage_info,
             self.tma_v_desc,
-            True,
             tile_offset=tile_offset + (-1 if previous else 0),
             head_dim_stage_idx=stage_id,
             kv_head_coord=kv_head_coord,
@@ -1924,7 +2079,6 @@ class SmemKVResource(MemoryResource):
         self._tma_load(
             stage_info,
             self.tma_v_desc,
-            True,
             tile_offset=tile_offset,
             head_dim_stage_idx=stage_id,
             cached_page_ids=cached_v_page_ids,
@@ -1934,30 +2088,15 @@ class SmemKVResource(MemoryResource):
             kv_tile_start=kv_tile_start,
         )
 
-    @consumer_work(returns=desc_k_base)
-    @cute.jit
-    def k_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
-        """Build K SMEM descriptor (K-major layout for QK MMA) -> desc_k_base."""
-        smem_stage_elements = self.cfg.tma_copy_kv_elements
-        sK_curr = self.sK_array.subview(stage_info.stage_idx * smem_stage_elements)
-        leading_byte_offset, stride_byte_offset = _qk_smem_desc_offsets(self.cfg)
-        desc_k_base = prims.Tcgen05SmemDesc.build(
-            sK_curr,
-            leading_byte_offset=leading_byte_offset,
-            stride_byte_offset=stride_byte_offset,
-            layout=_qk_smem_layout(self.cfg),
-        )
-        return desc_k_base
-
     @consumer_work(returns=desc_v_base)
     @cute.jit
     def v_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
         """Build V SMEM descriptor (MN-major layout for PV MMA) -> desc_v_base."""
         smem_stage_elements = self.cfg.tma_copy_kv_elements
-        sK_curr = self.sK_array.subview(stage_info.stage_idx * smem_stage_elements)
+        sV_curr = self.sV_array.subview(stage_info.stage_idx * smem_stage_elements)
         leading_byte_offset, stride_byte_offset = _pv_smem_desc_offsets(self.cfg)
         desc_v_base = prims.Tcgen05SmemDesc.build(
-            sK_curr,
+            sV_curr,
             leading_byte_offset=leading_byte_offset,
             stride_byte_offset=stride_byte_offset,
             layout=_pv_smem_layout(self.cfg),

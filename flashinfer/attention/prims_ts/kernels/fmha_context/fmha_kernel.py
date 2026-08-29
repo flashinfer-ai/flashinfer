@@ -166,10 +166,11 @@ from .fmha_resources import (
     GmemOResource,
     GmemQKVResource,
     S0S1SequenceResource,
-    SmemKVResource,
+    SmemKResource,
     SmemOResource,
     SmemPageOffsetsKvResource,
     SmemQResource,
+    SmemVResource,
     TmemOResource,
     TmemPResource,
     TmemSPResource,
@@ -789,18 +790,25 @@ def build_context_task_manager(
         cta_layout_vmnk=cluster_shape_vmnk,
         advance_on_wait=True,
     )
-    # SmemKV: capacity-derived stages, Load -> MMA.
+    # SmemK/SmemV: capacity-derived stages, Load -> MMA. Independent
+    # pipelines (independent num_bytes) since K and V can have different
+    # per-element byte widths (e.g. QK-BF16/PV-FP8).
     # advance_on_wait=True advances consumer_state at ConsumerWait rather than
     # ConsumerRelease. This keeps the previous V tile live while MMA starts the
     # next QK tile, giving QK0 -> PV1(previous V) -> QK1 ordering without
     # releasing the previous V tile first.
-    
-    # TODO(qk-bf16/pv-fp8): num_bytes is derived from K but shared with V's
-    # acquire/commit cycle on this pipeline. When V dtype is different than K dtype,
-    # this will cause the TMA barrier condition to never be met.
-    smem_kv_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
-        num_stages=cfg.kv_stage,
+    kv_stage_k, kv_stage_v = _split_kv_stage(cfg)
+    smem_k_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
+        num_stages=kv_stage_k,
         num_bytes=cfg.tma_copy_kv_bytes,
+        producer_group=tma_producer_group,
+        consumer_group=pipeline.CooperativeGroup(Agent.Thread),
+        cta_layout_vmnk=cluster_shape_vmnk,
+        advance_on_wait=True,
+    )
+    smem_v_pipeline_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
+        num_stages=kv_stage_v,
+        num_bytes=cfg.tma_copy_v_bytes,
         producer_group=tma_producer_group,
         consumer_group=pipeline.CooperativeGroup(Agent.Thread),
         cta_layout_vmnk=cluster_shape_vmnk,
@@ -991,15 +999,21 @@ def build_context_task_manager(
                 page_table_is_v=True,
                 name="smem_page_offsets_v",
             )
-    smem_kv = SmemKVResource(
+    smem_k = SmemKResource(
         tma_k_desc=tma_k_desc,
-        tma_v_desc=tma_v_desc,
-        pipeline_config=smem_kv_pipeline_cfg,
+        pipeline_config=smem_k_pipeline_cfg,
         cfg=cfg,
         page_offsets_kv=smem_page_offsets_kv,
+        page_idx_kv=g_page_idx_kv,
+        name="smem_k",
+    )
+    smem_v = SmemVResource(
+        tma_v_desc=tma_v_desc,
+        pipeline_config=smem_v_pipeline_cfg,
+        cfg=cfg,
         page_offsets_v=smem_page_offsets_v,
         page_idx_kv=g_page_idx_kv,
-        name="smem_kv",
+        name="smem_v",
     )
 
     # WorkQueue: persistent tile scheduler state (static or CLC dynamic), not
@@ -1226,7 +1240,8 @@ def build_context_task_manager(
     load_task = create_load_task(
         gmem_qkv,
         smem_q,
-        smem_kv,
+        smem_k,
+        smem_v,
         work_queue,
         smem_page_offsets_kv=smem_page_offsets_kv,
         smem_page_offsets_v=smem_page_offsets_v,
@@ -1234,7 +1249,8 @@ def build_context_task_manager(
     )
     mma_task = create_mma_task(
         smem_q,
-        smem_kv,
+        smem_k,
+        smem_v,
         tmem_sp0,
         tmem_sp1,
         tmem_p0,
@@ -1369,16 +1385,20 @@ def build_context_task_manager(
             raise ValueError("paired resource graph requires peer-1 resources")
         tmem_o_dependencies = scheduler_deps(tmem_sp0, tmem_sp1)
 
-    smem_kv_deps: list[MemoryResource] = [gmem_qkv]
+    smem_k_deps: list[MemoryResource] = [gmem_qkv]
     if smem_page_offsets_kv is not None:
-        smem_kv_deps.append(smem_page_offsets_kv)
+        smem_k_deps.append(smem_page_offsets_kv)
+    smem_v_deps: list[MemoryResource] = [gmem_qkv]
     if smem_page_offsets_v is not None:
-        smem_kv_deps.append(smem_page_offsets_v)
+        smem_v_deps.append(smem_page_offsets_v)
     stats_done_0_deps = [] if cfg.stats_via_smem else [tmem_stats_done_0]
     resource_dependency_graph: dict[MemoryResource, list[MemoryResource]] = {
         smem_q: scheduler_deps(gmem_qkv),
-        smem_kv: scheduler_deps(*smem_kv_deps),
-        tmem_sp0: scheduler_deps(tmem_sp0, smem_q, smem_kv, *stats_done_0_deps),
+        smem_k: scheduler_deps(*smem_k_deps),
+        smem_v: scheduler_deps(*smem_v_deps),
+        tmem_sp0: scheduler_deps(
+            tmem_sp0, smem_q, smem_k, smem_v, *stats_done_0_deps
+        ),
         tmem_vec0: scheduler_deps(tmem_sp0),
         tmem_o: tmem_o_dependencies,
         smem_o_0: scheduler_deps(tmem_vec0, tmem_o),
@@ -1394,7 +1414,8 @@ def build_context_task_manager(
                 tmem_sp1: scheduler_deps(
                     tmem_sp1,
                     smem_q,
-                    smem_kv,
+                    smem_k,
+                    smem_v,
                     s0s1_seq,
                     *([] if cfg.stats_via_smem else [tmem_stats_done_1]),
                 ),
@@ -1424,7 +1445,8 @@ def build_context_task_manager(
         registered_smem_resource_ids.add(id(resource))
 
     add_smem_resource(smem_q)
-    add_smem_resource(smem_kv)
+    add_smem_resource(smem_k)
+    add_smem_resource(smem_v)
     if smem_page_offsets_kv is not None:
         add_smem_resource(smem_page_offsets_kv)
     if smem_page_offsets_v is not None:
@@ -1498,11 +1520,13 @@ def build_context_task_manager(
             )
         )
     smem_allocator.compute_layout()
+    kv_stage_k, kv_stage_v = _split_kv_stage(cfg)
     expected_barrier_bytes = (
         sum(
             _context_pipeline_stage_counts(
                 cfg,
-                kv_stages=cfg.kv_stage,
+                kv_stages_k=kv_stage_k,
+                kv_stages_v=kv_stage_v,
                 is_clc_dynamic=is_clc_dynamic,
             ).values()
         )
@@ -1595,16 +1619,27 @@ _Q_ROW_SMEM_ALIGNMENT_BYTES = 128
 _PIPELINE_BARRIER_BYTES_PER_STAGE = 2 * cutlass.Int64.width // 8
 
 
+def _split_kv_stage(cfg: FmhaConfig) -> tuple[int, int]:
+    """Split the combined K/V ring depth between K's and V's own pipelines.
+    """
+    cadence = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
+    kv_stage_k = cfg.kv_stage * cfg.num_head_dim_stages_k // cadence
+    kv_stage_v = cfg.kv_stage * cfg.num_head_dim_stages_v // cadence
+    return kv_stage_k, kv_stage_v
+
+
 def _context_pipeline_stage_counts(
     cfg: FmhaConfig,
     *,
-    kv_stages: int,
+    kv_stages_k: int,
+    kv_stages_v: int,
     is_clc_dynamic: bool,
 ) -> dict[str, int]:
     """Return every physical pipeline's mbarrier stage count."""
     counts = {
         "smem_q": cfg.q_stage,
-        "smem_kv": kv_stages,
+        "smem_k": kv_stages_k,
+        "smem_v": kv_stages_v,
         "smem_page_offsets": (
             sum(cfg.page_offset_pipeline_stage_counts)
             if cfg.stages_page_offsets_in_smem
@@ -1677,7 +1712,8 @@ def _infer_single_instance_kv_stages(
     fixed_barrier_stages = sum(
         _context_pipeline_stage_counts(
             cfg,
-            kv_stages=0,
+            kv_stages_k=0,
+            kv_stages_v=0,
             is_clc_dynamic=is_clc_dynamic,
         ).values()
     )
@@ -1689,11 +1725,15 @@ def _infer_single_instance_kv_stages(
         + control_bytes
         + fixed_barrier_stages * _PIPELINE_BARRIER_BYTES_PER_STAGE
     )
-    kv_dtype_width = max(cfg.k_dtype.width, cfg.v_dtype.width)
-    kv_stage_bytes = (
-        cfg.qk_mma_tiler[1] * cfg.head_dim_per_stage_kv * kv_dtype_width // 8
+    # K and V share one combined SMEM data buffer (disjoint sub-ranges, sized
+    # to the wider of the two dtypes) but keep independent pipelines/barriers. 
+    combined_stage_bytes = (
+        cfg.qk_mma_tiler[1]
+        * cfg.head_dim_per_stage_kv
+        * max(cfg.k_dtype.width, cfg.v_dtype.width)
+        // 8
     )
-    kv_stage_footprint_bytes = kv_stage_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
+    kv_stage_footprint_bytes = combined_stage_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
     kv_budget_bytes = utils.get_smem_capacity_in_bytes("sm_100") - fixed_smem_bytes
     memory_fit_stages = kv_budget_bytes // kv_stage_footprint_bytes
     cadence_stages = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
