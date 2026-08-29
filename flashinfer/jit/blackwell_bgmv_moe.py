@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""JIT registration for the generated SM100 BGMV MoE programs."""
-
 from __future__ import annotations
 
 import functools
@@ -65,11 +63,12 @@ def _dtype_tag(dtype: BlackwellBGMVMoEDType) -> str:
     raise ValueError(f"unsupported Blackwell BGMV MoE dtype: {dtype}")
 
 
-def _metadata(hidden_size: int, dtype: BlackwellBGMVMoEDType) -> BlackwellBGMVMoEMetadata:
+def _metadata(
+    hidden_size: int, dtype: BlackwellBGMVMoEDType
+) -> BlackwellBGMVMoEMetadata:
     if hidden_size not in BLACKWELL_BGMV_MOE_HIDDEN_SIZES:
         raise ValueError(
-            "Blackwell BGMV MoE hidden_size must be 2688 or 3072, got "
-            f"{hidden_size}"
+            f"Blackwell BGMV MoE hidden_size must be 2688 or 3072, got {hidden_size}"
         )
     tag = _dtype_tag(dtype)
     return BlackwellBGMVMoEMetadata(
@@ -91,8 +90,7 @@ def _metadata(hidden_size: int, dtype: BlackwellBGMVMoEDType) -> BlackwellBGMVMo
             f"kernel_flashinfer_bgmv_moe_expand_token_{tag}_h{hidden_size}_r32"
         ),
         token_dual_col_symbol=(
-            "kernel_flashinfer_bgmv_moe_expand_token_dual_col_"
-            f"{tag}_h{hidden_size}_r32"
+            f"kernel_flashinfer_bgmv_moe_expand_token_dual_col_{tag}_h{hidden_size}_r32"
         ),
     )
 
@@ -105,8 +103,7 @@ def select_blackwell_bgmv_moe_schedule(
 
     if hidden_size not in BLACKWELL_BGMV_MOE_HIDDEN_SIZES:
         raise ValueError(
-            "Blackwell BGMV MoE hidden_size must be 2688 or 3072, got "
-            f"{hidden_size}"
+            f"Blackwell BGMV MoE hidden_size must be 2688 or 3072, got {hidden_size}"
         )
     if num_tokens <= 0:
         raise ValueError(f"num_tokens must be positive, got {num_tokens}")
@@ -146,8 +143,7 @@ def get_blackwell_bgmv_moe_uri(
     tag = _dtype_tag(dtype)
     if hidden_size not in BLACKWELL_BGMV_MOE_HIDDEN_SIZES:
         raise ValueError(
-            "Blackwell BGMV MoE hidden_size must be 2688 or 3072, got "
-            f"{hidden_size}"
+            f"Blackwell BGMV MoE hidden_size must be 2688 or 3072, got {hidden_size}"
         )
     return f"blackwell_bgmv_moe_{tag}_h{hidden_size}_sm100a"
 

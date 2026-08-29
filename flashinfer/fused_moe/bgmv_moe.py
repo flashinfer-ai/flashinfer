@@ -263,9 +263,9 @@ class BGMVMoEBlackwellPlan:
                 topk_weights,
             )
         )
-        self._graph = None
-        self._capture_stream = None
-        self._owner_stream = None
+        self._graph: Optional[torch.cuda.CUDAGraph] = None
+        self._capture_stream: Optional[torch.cuda.Stream] = None
+        self._owner_stream: Optional[torch.cuda.Stream] = None
         self._lock = threading.RLock()
 
     def _validate_binding(self) -> None:
@@ -314,7 +314,8 @@ class BGMVMoEBlackwellPlan:
 
         with self._lock:
             replay_stream = torch.cuda.current_stream(self.x.device)
-            if self._graph is None:
+            graph = self._graph
+            if graph is None:
                 capture_stream = torch.cuda.Stream(device=self.x.device)
                 capture_stream.wait_stream(replay_stream)
                 capture_stream.synchronize()
@@ -333,7 +334,7 @@ class BGMVMoEBlackwellPlan:
                 raise RuntimeError(
                     "BGMVMoEBlackwellPlan must replay on its original CUDA stream"
                 )
-            self._graph.replay()
+            graph.replay()
         return self.y_accum
 
     def close(self) -> None:
@@ -371,10 +372,31 @@ def prepare_bgmv_moe(
     This optimized path currently supports one LoRA slice, rank 32, hidden
     sizes 2688 or 3072, BF16/FP16 inputs, and exact SM100 devices. Routing may
     be arbitrary; the contiguous top-k=2 layout takes the optimized fast path.
+
+    Args:
+        x: Input activations with shape ``[num_tokens, hidden_size]``.
+        lora_a_weights: One LoRA-A tensor with shape
+            ``[num_loras, num_experts, 32, hidden_size]``.
+        lora_b_weights: One LoRA-B tensor with shape
+            ``[num_loras, num_experts, hidden_size, 32]``.
+        sorted_token_ids: Routed token indices with shape ``[num_pairs]``.
+        expert_ids: Expert index for each routed pair.
+        lora_indices: LoRA index for each input token.
+        topk_weights: FP32 routing weight for each routed pair.
+        num_experts: Number of experts in both LoRA tensors.
+        backend: Backend selector. Only ``"blackwell"`` is supported.
+        shrink_out: Optional pointer-stable FP32 shrink workspace.
+        y_accum: Optional pointer-stable FP32 output accumulator.
+
+    Returns:
+        A reusable graph-backed execution plan whose ``run`` method returns
+        the FP32 accumulated output.
     """
 
     if backend != "blackwell":
-        raise ValueError(f"prepare_bgmv_moe only supports backend='blackwell', got {backend}")
+        raise ValueError(
+            f"prepare_bgmv_moe only supports backend='blackwell', got {backend}"
+        )
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(x.device) != (
         10,
         0,
@@ -459,7 +481,11 @@ def prepare_bgmv_moe(
             f"y_accum must have shape {expected_output} and dtype torch.float32"
         )
     for name, tensor in (("shrink_out", shrink_out), ("y_accum", y_accum)):
-        if not tensor.is_cuda or tensor.device != x.device or not tensor.is_contiguous():
+        if (
+            not tensor.is_cuda
+            or tensor.device != x.device
+            or not tensor.is_contiguous()
+        ):
             raise ValueError(f"{name} must be a contiguous tensor on {x.device}")
 
     from ..jit.blackwell_bgmv_moe import (

@@ -125,9 +125,7 @@ def _run_shape(hidden_size: int, num_tokens: int, repeat_time_ms: int):
     ) = inputs
     num_pairs = int(sorted_token_ids.numel())
 
-    baseline_shrink = torch.empty(
-        1, num_pairs, 32, dtype=x.dtype, device=x.device
-    )
+    baseline_shrink = torch.empty(1, num_pairs, 32, dtype=x.dtype, device=x.device)
     baseline_output = torch.empty(
         num_tokens, hidden_size, dtype=torch.float32, device=x.device
     )

@@ -177,9 +177,7 @@ def test_invalid_pair_padding_and_outer_graph_capture(dtype):
     inputs[3] = torch.cat(
         [inputs[3], torch.tensor([-1, 8], dtype=torch.int64, device=device)]
     )
-    inputs[4] = torch.cat(
-        [inputs[4], torch.zeros(2, dtype=torch.int64, device=device)]
-    )
+    inputs[4] = torch.cat([inputs[4], torch.zeros(2, dtype=torch.int64, device=device)])
     inputs[6] = torch.cat(
         [inputs[6], torch.zeros(2, dtype=torch.float32, device=device)]
     )

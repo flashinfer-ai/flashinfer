@@ -39,9 +39,7 @@ from flashinfer.jit import core as jit_core
         (2688, 1024, "token_owned_dual_col"),
     ],
 )
-def test_selector_matches_measured_shape_portfolio(
-    hidden_size, num_tokens, expected
-):
+def test_selector_matches_measured_shape_portfolio(hidden_size, num_tokens, expected):
     assert (
         blackwell_bgmv_moe.select_blackwell_bgmv_moe_schedule(hidden_size, num_tokens)
         == expected
@@ -55,7 +53,9 @@ def test_selector_rejects_unsupported_shapes():
         blackwell_bgmv_moe.select_blackwell_bgmv_moe_schedule(3072, 0)
 
 
-@pytest.mark.parametrize("hidden_size", blackwell_bgmv_moe.BLACKWELL_BGMV_MOE_HIDDEN_SIZES)
+@pytest.mark.parametrize(
+    "hidden_size", blackwell_bgmv_moe.BLACKWELL_BGMV_MOE_HIDDEN_SIZES
+)
 @pytest.mark.parametrize("dtype", blackwell_bgmv_moe.BLACKWELL_BGMV_MOE_DTYPES)
 def test_jit_spec_binds_generated_sm100_source(
     monkeypatch, tmp_path, hidden_size, dtype
