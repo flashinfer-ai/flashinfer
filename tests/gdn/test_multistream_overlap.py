@@ -309,6 +309,11 @@ def test_blackwell_prefill_workspace_not_in_compile_cache():
         True,
         False,
         False,
+        str(x1["cu_seqlens"].dtype),
+        "none",
+        "none",
+        None,
+        None,
     )
     assert set(cache.keys()) <= {"compiled", "num_sm"}, (
         f"compile cache holds mutable execution state: {set(cache.keys())}"
