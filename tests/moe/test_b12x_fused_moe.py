@@ -252,7 +252,11 @@ def test_w4a16_quant_mode_selects_internal_workspace(monkeypatch):
 
 @cute_dsl_available
 def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
-    """W4A16 bypasses NVFP4 static/dynamic cutovers via quant_mode."""
+    """W4A16 bypasses NVFP4 static/dynamic cutovers via quant_mode.
+
+    The NVFP4 static/dynamic cutover was re-tuned to 512 routed pairs
+    (64 tokens at top-8) after the gate+up FC1 fusion.
+    """
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
     _clear_static_cutover_env(monkeypatch)
@@ -260,7 +264,7 @@ def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
     try:
         assert (
             moe_dispatch.select_sm120_moe_backend(
-                num_tokens=80,
+                num_tokens=64,
                 num_topk=8,
                 activation_precision="fp4",
             )
@@ -268,7 +272,7 @@ def test_sm120_backend_cutovers_are_precision_specific(monkeypatch):
         )
         assert (
             moe_dispatch.select_sm120_moe_backend(
-                num_tokens=81,
+                num_tokens=65,
                 num_topk=8,
                 activation_precision="fp4",
             )
@@ -302,7 +306,7 @@ def test_w4a16_static_cutover_env_override_is_precision_scoped(monkeypatch):
     moe_dispatch._STATIC_COMPACT_CUTOVER_PAIRS_CACHE.clear()
     monkeypatch.setenv("FLASHINFER_B12X_W4A16_STATIC_COMPACT_CUTOVER_PAIRS", "256")
     try:
-        assert moe_dispatch._get_static_compact_cutover_pairs("fp4") == 640
+        assert moe_dispatch._get_static_compact_cutover_pairs("fp4") == 512
         assert (
             moe_dispatch.select_sm120_moe_backend(
                 num_tokens=32,
