@@ -973,9 +973,7 @@ def test_gb300_irregular_persistent_policy_is_shape_exact():
         sequence_lengths=(17, 33, 65),
         num_heads=96,
     )
-    assert kda_prefill_api._uses_measured_gb300_irregular_persistent_policy(
-        **exact
-    )
+    assert kda_prefill_api._uses_measured_gb300_irregular_persistent_policy(**exact)
     for field, value in (
         ("compute_capability", (10, 0)),
         ("sm_count", 148),
@@ -1334,6 +1332,7 @@ def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
         max_sequence_length=3072,
     ) == ("bt16_prepare", "bt16_chain_m64_s7", False)
 
+
 def test_bt16_two_stage_adapter_reuses_descriptors_across_state_rotations(monkeypatch):
     prepare_module = _RecorderModule()
     chain_module = _RecorderModule()
@@ -1574,6 +1573,33 @@ def test_h96_uniform_n128_keeps_n16_on_148_sm():
                 num_heads=96,
                 uniform_sequences=True,
             ) is (sm_count == 148)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    (
+        ({}, True),
+        ({"fixed_layout": True}, False),
+        ({"num_sequences": 2}, False),
+        ({"num_heads": 64}, False),
+        ({"max_sequence_length": 15}, False),
+        ({"has_in_place_state": False}, False),
+        ({"use_state_indices": True}, False),
+        ({"checkpoint_every_n_tokens": 16}, False),
+    ),
+)
+def test_h96_short_const_policy_is_exact(overrides, expected):
+    kwargs = {
+        "fixed_layout": False,
+        "num_sequences": 1,
+        "num_heads": 96,
+        "max_sequence_length": 16,
+        "has_in_place_state": True,
+        "use_state_indices": False,
+        "checkpoint_every_n_tokens": 0,
+    }
+    kwargs.update(overrides)
+    assert kda_prefill_api._should_use_h96_short_const(**kwargs) is expected
 
 
 class _RecorderModule:
@@ -2510,6 +2536,61 @@ def test_b200_prefill_without_initial_state_stays_direct(cuda_device, monkeypatc
     assert routes == [("m128_n16_short", "sm100f")]
     (args,) = module.calls
     assert args[9].tolist() == [0, 1]
+
+
+@pytest.mark.parametrize(
+    ("seq_lens", "expected_variant"),
+    (
+        ([16], "m128_n16_short_h96_const"),
+        ([16, 16], "m128_n16_short"),
+    ),
+)
+def test_h96_short_const_route_requires_n1_in_place_state(
+    cuda_device,
+    monkeypatch,
+    seq_lens,
+    expected_variant,
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: (10, 0),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_is_cuda_version_at_least",
+        lambda version: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_device_sm_count",
+        lambda device: 148,
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(
+        seq_lens=seq_lens,
+        num_heads=96,
+        packed=True,
+        initial_state=True,
+    )
+    recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        backend="cake",
+    )
+
+    assert routes == [(expected_variant, "sm100f")]
+    (args,) = module.calls
+    assert len(args) == 29
+    assert args[11].data_ptr() == args[13].data_ptr()
 
 
 @pytest.mark.parametrize(
@@ -3580,15 +3661,18 @@ def test_frozen_prefill_matches_reference(flash_kda_device, packed, non_default_
     )
 
 
-def test_frozen_prefill_h96_short_beta_workspace_matches_reference(flash_kda_device):
+@pytest.mark.parametrize(("packed", "seed"), ((False, 11018), (True, 11019)))
+def test_frozen_prefill_h96_short_beta_workspace_matches_reference(
+    flash_kda_device, packed, seed
+):
     """Cover token-padded beta TMA storage when H is already eight-aligned."""
 
     inputs = _make_inputs(
         seq_lens=[16],
         num_heads=96,
-        packed=False,
+        packed=packed,
         initial_state=True,
-        seed=11018,
+        seed=seed,
     )
     reference_inputs = {
         **inputs,

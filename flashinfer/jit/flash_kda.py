@@ -36,6 +36,7 @@ FlashKDAVariant = Literal[
     "m128_n16",
     "m128_n16_checkpoint",
     "m128_n16_short",
+    "m128_n16_short_h96_const",
     "persistent_m128",
     "piece_persistent_m128",
     "small_bh_m128",
@@ -57,6 +58,7 @@ FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "m128_n16",
     "m128_n16_checkpoint",
     "m128_n16_short",
+    "m128_n16_short_h96_const",
     "persistent_m128",
     "piece_persistent_m128",
     "small_bh_m128",
@@ -86,12 +88,13 @@ _FLASH_KDA_MODULE_IDENTS = {
     "m128_tensor_state_decay": "92038073bd",
     "m128_h12_short": "598898446d",
     "m128_h12_long": "c5dc8b654c",
-    "m128_n16": "5dcb869fcf",
+    "m128_n16": "f89a4e86a2",
     # Generated body, binding, and shared binding header, separated by NUL
     # bytes without a trailing separator. Keep this route's cache key tied to
     # all compiled content.
     "m128_n16_checkpoint": "0d6dd01307",
-    "m128_n16_short": "90aa86417c",
+    "m128_n16_short": "9252e6f1c0",
+    "m128_n16_short_h96_const": "9252e6f1c0",
     "persistent_m128": "cc0d237f88",
     "piece_persistent_m128": "02ba51c49a",
     "small_bh_m128": "7364f93860",
@@ -112,6 +115,7 @@ _FLASH_KDA_BINDING_STEMS = {
     "m128_n16": "cake_flashkda_bf16_fused_m128_n16",
     "m128_n16_checkpoint": "flashkda_bf16_fused_m128_n16_checkpoint",
     "m128_n16_short": "cake_flashkda_bf16_fused_m128_n16",
+    "m128_n16_short_h96_const": "cake_flashkda_bf16_fused_m128_n16",
     "persistent_m128": "cake_flashkda_bf16_persistent_m128",
     "piece_persistent_m128": "cake_flashkda_bf16_piece_persistent_m128",
     "small_bh_m128": "cake_flashkda_bf16_small_bh_m128",
@@ -124,10 +128,12 @@ _FLASH_KDA_BINDING_STEMS = {
 
 _FLASH_KDA_VARIANT_DEFINES = {
     "m128_n16_short": "-DFLASHINFER_FLASH_KDA_N16_SHORT=1",
+    "m128_n16_short_h96_const": "-DFLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST=1",
     "m128_tensor_state_decay": "-DFLASHINFER_FLASH_KDA_TENSOR_STATE_DECAY=1",
     "m128_h12_short": "-DFLASHINFER_FLASH_KDA_H12_SHORT=1",
     "m128_h12_long": "-DFLASHINFER_FLASH_KDA_H12_LONG=1",
 }
+
 
 def _get_flash_kda_csrc_dir() -> Path:
     """Locate frozen FlashKDA sources in installed and source checkouts."""
@@ -194,9 +200,7 @@ def gen_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget) -> Ji
             csrc_dir / "cake_flashkda_bf16_bt16_prepare_chain_m64_binding.cu",
         ]
     else:
-        sources = [
-            csrc_dir / f"{_FLASH_KDA_BINDING_STEMS[variant]}_binding.cu"
-        ]
+        sources = [csrc_dir / f"{_FLASH_KDA_BINDING_STEMS[variant]}_binding.cu"]
     missing_sources = [source for source in sources if not source.exists()]
     if missing_sources:
         raise FileNotFoundError(
@@ -278,6 +282,14 @@ def gen_flash_kda_m128_n16_short_module(target: FlashKDATarget) -> JitSpec:
     """Generate the generic one-tile M128 module with one N16 stage."""
 
     return gen_flash_kda_module("m128_n16_short", target)
+
+
+def gen_flash_kda_m128_n16_short_h96_const_module(
+    target: FlashKDATarget,
+) -> JitSpec:
+    """Generate the in-place packed N=1/H=96/T=16 specialization."""
+
+    return gen_flash_kda_module("m128_n16_short_h96_const", target)
 
 
 def gen_flash_kda_persistent_m128_module(target: FlashKDATarget) -> JitSpec:
@@ -387,6 +399,12 @@ def load_flash_kda_m128_n16_short_module(target: FlashKDATarget):
     return load_flash_kda_module("m128_n16_short", target)
 
 
+def load_flash_kda_m128_n16_short_h96_const_module(target: FlashKDATarget):
+    """Load the in-place packed N=1/H=96/T=16 specialization."""
+
+    return load_flash_kda_module("m128_n16_short_h96_const", target)
+
+
 def load_flash_kda_persistent_m128_module(target: FlashKDATarget):
     """Load the SM100-only static-binned persistent M128 module."""
 
@@ -453,6 +471,7 @@ __all__ = [
     "gen_flash_kda_m128_n16_module",
     "gen_flash_kda_m128_n16_checkpoint_module",
     "gen_flash_kda_m128_n16_short_module",
+    "gen_flash_kda_m128_n16_short_h96_const_module",
     "gen_flash_kda_piece_persistent_m128_module",
     "gen_flash_kda_persistent_m128_module",
     "gen_flash_kda_small_bh_m128_module",
@@ -466,6 +485,7 @@ __all__ = [
     "load_flash_kda_m128_h12_long_module",
     "load_flash_kda_m128_n16_module",
     "load_flash_kda_m128_n16_short_module",
+    "load_flash_kda_m128_n16_short_h96_const_module",
     "load_flash_kda_piece_persistent_m128_module",
     "load_flash_kda_persistent_m128_module",
     "load_flash_kda_small_bh_m128_module",

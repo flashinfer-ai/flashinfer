@@ -189,6 +189,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
                 "m128_n16",
                 "m128_n16_checkpoint",
                 "m128_n16_short",
+                "m128_n16_short_h96_const",
                 "persistent_m128",
                 "piece_persistent_m128",
                 "small_bh_m128",
@@ -513,6 +514,29 @@ def _select_flash_kda_prefill_variant(
     return "m128"
 
 
+def _should_use_h96_short_const(
+    *,
+    fixed_layout: bool,
+    num_sequences: int,
+    num_heads: int,
+    max_sequence_length: int,
+    has_in_place_state: bool,
+    use_state_indices: bool,
+    checkpoint_every_n_tokens: int,
+) -> bool:
+    """Select the packed N=1/H=96/T=16 in-place-state specialization."""
+
+    return (
+        not fixed_layout
+        and num_sequences == 1
+        and num_heads == 96
+        and max_sequence_length == 16
+        and has_in_place_state
+        and not use_state_indices
+        and checkpoint_every_n_tokens == 0
+    )
+
+
 @functools.cache
 def _flash_kda_device_sm_count(device: torch.device) -> int:
     """Resolve and cache the physical SM count for one CUDA device."""
@@ -525,9 +549,9 @@ def _uses_measured_sm100_persistent_policy(
     compute_capability: tuple[int, int],
     sm_count: int,
 ) -> bool:
-    return (
-        compute_capability == (10, 0) and sm_count in (148, 152)
-    ) or (compute_capability == (10, 3) and sm_count == 148)
+    return (compute_capability == (10, 0) and sm_count in (148, 152)) or (
+        compute_capability == (10, 3) and sm_count == 148
+    )
 
 
 def _uses_measured_gb300_irregular_persistent_policy(
@@ -1249,8 +1273,7 @@ def _persistent_task_plan(
     # worker with 144 workers. Leaving four SMs idle avoids a partial final
     # wave; the 152-SM GB200/GB300 row retains one worker per SM.
     measured_short_irregular = (
-        tuple(sorted(sequence_lengths))
-        == _FLASH_KDA_GB300_IRREGULAR_PERSISTENT_LENGTHS
+        tuple(sorted(sequence_lengths)) == _FLASH_KDA_GB300_IRREGULAR_PERSISTENT_LENGTHS
     )
     worker_count = 144 if sm_count == 148 and measured_short_irregular else sm_count
     task_ids, task_offsets, loads = _make_lpt_task_bins(
@@ -1261,8 +1284,7 @@ def _persistent_task_plan(
     if sm_count == 152:
         if not measured_short_irregular:
             if not loads or (
-                max(loads) * _FLASH_KDA_GB200_LPT_MAX_IMBALANCE_DENOMINATOR
-                * len(loads)
+                max(loads) * _FLASH_KDA_GB200_LPT_MAX_IMBALANCE_DENOMINATOR * len(loads)
                 > sum(loads) * _FLASH_KDA_GB200_LPT_MAX_IMBALANCE_NUMERATOR
             ):
                 return None
@@ -2485,6 +2507,7 @@ def _run_flash_kda_prefill(
         "m128_n16",
         "m128_n16_checkpoint",
         "m128_n16_short",
+        "m128_n16_short_h96_const",
         "persistent_m128",
         "piece_persistent_m128",
         "small_bh_m128",
@@ -2502,13 +2525,24 @@ def _run_flash_kda_prefill(
     elif persistent_plan is not None:
         variant = "persistent_m128"
     elif route == _FLASH_KDA_ROUTE_DIRECT_M128_N16:
-        variant = (
-            "m128_n16_short"
-            if num_heads != 12
-            and 0 < max_sequence_length <= _FLASH_KDA_BT16_CHUNK
-            and checkpoint_every_n_tokens == 0
-            else "m128_n16"
-        )
+        if _should_use_h96_short_const(
+            fixed_layout=fixed_layout,
+            num_sequences=num_sequences,
+            num_heads=num_heads,
+            max_sequence_length=max_sequence_length,
+            has_in_place_state=initial_state is not None and final_state is None,
+            use_state_indices=state_indices is not None,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        ):
+            variant = "m128_n16_short_h96_const"
+        else:
+            variant = (
+                "m128_n16_short"
+                if num_heads != 12
+                and 0 < max_sequence_length <= _FLASH_KDA_BT16_CHUNK
+                and checkpoint_every_n_tokens == 0
+                else "m128_n16"
+            )
     elif num_heads == 12:
         variant = (
             "m128_h12_short"
@@ -2727,7 +2761,13 @@ def _run_flash_kda_prefill(
                 workspace,
                 chunk_tokens=(
                     16
-                    if variant in ("m128_n16", "m128_n16_checkpoint", "m128_n16_short")
+                    if variant
+                    in (
+                        "m128_n16",
+                        "m128_n16_checkpoint",
+                        "m128_n16_short",
+                        "m128_n16_short_h96_const",
+                    )
                     else 32
                 ),
             )
@@ -2996,7 +3036,11 @@ def _run_flash_kda_prefill(
                     float(lower_bound),
                     stream_ptr,
                 )
-                if variant in ("m128_n16", "m128_n16_short"):
+                if variant in (
+                    "m128_n16",
+                    "m128_n16_short",
+                    "m128_n16_short_h96_const",
+                ):
                     module.run(*direct_args, int(beta_tma_prepacked))
                 else:
                     module.run(*direct_args)
