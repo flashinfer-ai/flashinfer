@@ -180,7 +180,7 @@ def main() -> None:
         "schema": "flashinfer-grouped-mxfp8-backend-comparison-v1",
         "gpu": properties.name,
         "compute_capability": list(capability),
-        "clock_rate_khz": properties.clock_rate,
+        "clock_rate_khz": getattr(properties, "clock_rate", None),
         "cupti_python_version": cupti_version,
         "timing_backend": "CUPTI activity",
         "cold_l2": True,
