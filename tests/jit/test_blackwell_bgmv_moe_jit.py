@@ -76,6 +76,7 @@ def test_jit_spec_binds_generated_sm100_source(
     assert spec.sources == [tmp_path / uri / "blackwell_bgmv_moe_binding.cu"]
     assert "-gencode=arch=compute_100a,code=sm_100a" in spec.extra_cuda_cflags
     assert "-use_fast_math" in spec.extra_cuda_cflags
+    assert blackwell_bgmv_moe._get_csrc_dir().parents[1] in spec.extra_include_dirs
     assert blackwell_bgmv_moe._get_include_dir() in spec.extra_include_dirs
     body = (blackwell_bgmv_moe._get_csrc_dir() / metadata.body).read_text()
     for symbol in metadata[1:]:

@@ -211,7 +211,7 @@ def gen_blackwell_bgmv_moe_module(
         name=uri,
         sources=[binding],
         extra_cuda_cflags=[*sm100a_nvcc_flags, "-use_fast_math"],
-        extra_include_paths=[csrc_dir, include_dir],
+        extra_include_paths=[csrc_dir, csrc_dir.parents[1], include_dir],
     )
     logger.info("Generated Blackwell BGMV MoE JIT spec: %s", spec.name)
     return spec
