@@ -245,6 +245,89 @@ gqa_paged_decode_trace = TraceTemplate(
 )
 
 
+class _BatchDecodePlanTraceTemplate(TraceTemplate):
+    """Trace batch-decode planning metadata, including compatibility kwargs."""
+
+    def build_fi_trace_fn(self, fi_api):
+        build_definition = super().build_fi_trace_fn(fi_api)
+
+        def fi_trace(save_dir=None, name=None, **kwargs):
+            kwargs = dict(kwargs)
+            nested_kwargs = kwargs.pop("kwargs", None)
+            if isinstance(nested_kwargs, dict):
+                kwargs.update(nested_kwargs)
+            return build_definition(save_dir=save_dir, name=name, **kwargs)
+
+        return fi_trace
+
+
+gqa_paged_decode_plan_trace = _BatchDecodePlanTraceTemplate(
+    op_type="gqa_paged_plan",
+    name_prefix="gqa_paged_decode_plan",
+    description=(
+        "Batch-decode planning metadata for a paged KV cache, including "
+        "query length and explicit causal-mode request."
+    ),
+    axes={
+        "batch_size": Var(description="Number of requests."),
+        "num_qo_heads": Const(abbrev="h"),
+        "num_kv_heads": Const(abbrev="kv"),
+        "head_dim": Const(abbrev="d"),
+        "page_size": Const(abbrev="ps"),
+        "len_indptr": Var(description="Length of indptr array."),
+        "num_kv_indices": Var(description="Total number of KV page indices."),
+        "max_num_blocks_per_seq": Var(
+            description="Maximum number of block-table entries per request."
+        ),
+    },
+    inputs={
+        "indptr": Tensor(["len_indptr"], dtype="int32"),
+        "indices": Tensor(["num_kv_indices"], dtype="int32"),
+        "last_page_len": Tensor(["batch_size"], dtype="int32"),
+        "num_qo_heads": Scalar("int32"),
+        "num_kv_heads": Scalar("int32"),
+        "head_dim": Scalar("int32"),
+        "page_size": Scalar("int32"),
+        "q_len_per_req": Scalar(
+            "int32",
+            optional=True,
+            description="Uniform query tokens per request.",
+        ),
+        "is_causal": Scalar(
+            "bool",
+            optional=True,
+            description="Whether the planned attention mask is causal.",
+        ),
+        "pos_encoding_mode": Scalar("string", optional=True),
+        "window_left": Scalar("int32", optional=True),
+        "window_right": Scalar("int32", optional=True),
+        "logits_soft_cap": Scalar("float32", optional=True),
+        "q_data_type": Scalar("dtype", optional=True),
+        "kv_data_type": Scalar("dtype", optional=True),
+        "o_data_type": Scalar("dtype", optional=True),
+        "data_type": Scalar("dtype", optional=True),
+        "sm_scale": Scalar("float32", optional=True),
+        "rope_scale": Scalar("float32", optional=True),
+        "rope_theta": Scalar("float32", optional=True),
+        "non_blocking": Scalar("bool", optional=True),
+        "fixed_split_size": Scalar("int32", optional=True),
+        "disable_split_kv": Scalar("bool", optional=True),
+        "seq_lens": Tensor(["batch_size"], dtype="int32", optional=True),
+        "block_tables": Tensor(
+            ["batch_size", "max_num_blocks_per_seq"],
+            dtype="int32",
+            optional=True,
+        ),
+    },
+    outputs={},
+    constraints=[
+        "len_indptr == batch_size + 1",
+        "num_qo_heads % num_kv_heads == 0",
+    ],
+    tags=["stage:decode", "phase:plan", "status:experimental"],
+)
+
+
 # PrimTS block-sparse schema. Only the one-shot API can fully express its BSR
 # metadata and block geometry in a trace definition.
 
