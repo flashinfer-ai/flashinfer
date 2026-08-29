@@ -51,7 +51,6 @@ _C = CpbConstants(
     inv_bw=1e-12,
     inv_rsm=1e-10,
     c0=1e-6,
-    beta=5e-6,
     sm_count=148,
     bytes_per_chunk=37376,
     l2_cache_bytes=0,  # guard rail disabled unless a test sets it
@@ -67,16 +66,21 @@ def test_model_regime_behavior() -> None:
     assert large > small
 
 
-def test_beta_penalizes_splits() -> None:
-    """A larger per-split merge cost shifts the optimum toward fewer splits
-    (weakly larger cpb); with beta=0 the merge term vanishes and cpb drops."""
-    shape = (1, 16, 1024, 0)
-    base = select_cpb(*shape, _C)
-    zero_beta = select_cpb(*shape, CpbConstants(**{**_C.__dict__, "beta": 0.0}))
-    high_beta = select_cpb(
-        *shape, CpbConstants(**{**_C.__dict__, "beta": _C.beta * 20})
+def test_select_cpb_tail_imbalance_sawtooth() -> None:
+    """Mid-cpb sawtooth: at T=8/H=128/topk=1024 (N=16) the 7+7+2 split must
+    beat 8+8 — one heavy round plus a short tail that fills freed SMs beats a
+    second full chunk round. The retired ceil-wave form priced this backwards
+    (kernel-bench v6: the model picked 8, the sweep's best is 7)."""
+    c = CpbConstants(
+        inv_bw=5e-13,
+        inv_rsm=1.2e-10,
+        c0=6.4e-6,
+        sm_count=188,
+        bytes_per_chunk=37376,
+        l2_cache_bytes=0,
     )
-    assert zero_beta <= base <= high_beta
+    assert predict_time_s(8, 128, 1024, 0, 7, c) < predict_time_s(8, 128, 1024, 0, 8, c)
+    assert select_cpb(8, 128, 1024, 0, c) == 7
 
 
 def test_select_cpb_bounds() -> None:
@@ -95,17 +99,16 @@ def test_select_cpb_tie_prefers_larger() -> None:
         inv_bw=0.0,
         inv_rsm=0.5,
         c0=0.0,
-        beta=0.5,
         sm_count=148,
         bytes_per_chunk=1,
         l2_cache_bytes=0,
     )
-    # T=1, H=16 (one head tile), topk=128 (N=2): both cpb=1 and cpb=2
-    # predict exactly 2.0 s.
-    t1 = predict_time_s(1, 16, 128, 0, 1, c)
-    t2 = predict_time_s(1, 16, 128, 0, 2, c)
+    # T=148, H=16 (one head tile), topk=128 (N=2): cpb=1 runs two 0.5 s
+    # rounds of 148 blocks, cpb=2 one 1.0 s round — both exactly 1.0 s.
+    t1 = predict_time_s(148, 16, 128, 0, 1, c)
+    t2 = predict_time_s(148, 16, 128, 0, 2, c)
     assert t1 == t2
-    assert select_cpb(1, 16, 128, 0, c) == 2
+    assert select_cpb(148, 16, 128, 0, c) == 2
 
 
 def test_select_cpb_l2_guard_rail() -> None:
@@ -113,10 +116,11 @@ def test_select_cpb_l2_guard_rail() -> None:
     excluded; if none fit, fall back to the unconstrained argmin."""
     shape = (64, 128, 3200, 0)  # N=50, saturated grid
     uncapped = select_cpb(*shape, _C)
-    assert uncapped == 25
-    # L2 = 10 * S * W: allowed footprint caps cpb at 10.
+    assert uncapped == 24
+    # L2 = 10 * S * W: allowed footprint caps cpb at 10, and the best
+    # fitting candidate is 8.
     capped = CpbConstants(**{**_C.__dict__, "l2_cache_bytes": 148 * 10 * 37376})
-    assert select_cpb(*shape, capped) == 10
+    assert select_cpb(*shape, capped) == 8
     # Cap above the unconstrained pick's footprint: no change.
     loose = CpbConstants(**{**_C.__dict__, "l2_cache_bytes": 148 * 30 * 37376})
     assert select_cpb(*shape, loose) == uncapped
@@ -157,10 +161,12 @@ def test_crossover_persistence_round_trip(clean_cpb_state, monkeypatch) -> None:
     assert cpb_mod.has_crossover(device, "dsv3_2")
 
 
-def test_v1_file_loads_constants_without_crossover(
+def test_old_schema_file_loads_crossover_but_not_constants(
     clean_cpb_state, monkeypatch
 ) -> None:
-    """A schema-v1 cache yields constants but an absent crossover table."""
+    """A schema-v2 cache yields its crossover table (unchanged semantics) but
+    NOT its constants: those encode the retired ceil-wave + beta form and
+    would mispredict under the scheduling-makespan model."""
     import json
     from dataclasses import asdict
 
@@ -169,15 +175,51 @@ def test_v1_file_loads_constants_without_crossover(
     path.write_text(
         json.dumps(
             {
-                "schema_version": 1,
-                "devices": {"0:Fake GPU": {"dsv4": asdict(_C)}},
+                "schema_version": 2,
+                "devices": {
+                    "0:Fake GPU": {
+                        "dsv4": asdict(_C),
+                        cpb_mod._DECODE_MAX_TOKENS_KEY: {"dsv4|64|512": 32},
+                    }
+                },
             }
         )
         + "\n"
     )
-    assert cpb_mod.get_constants(device, "dsv4") == _C
-    assert cpb_mod.get_decode_max_tokens(device, "dsv4", 64, 512) is None
-    assert not cpb_mod.has_crossover(device, "dsv4")
+    assert cpb_mod.get_constants(device, "dsv4") is None
+    assert cpb_mod.get_decode_max_tokens(device, "dsv4", 64, 512) == 32
+    assert cpb_mod.has_crossover(device, "dsv4")
+
+
+def test_save_upgrades_old_schema_keeping_crossover(clean_cpb_state, monkeypatch):
+    """Writing into a v2 file upgrades it to the current schema: stale
+    constants are dropped (families recalibrate), crossover survives."""
+    import json
+    from dataclasses import asdict
+
+    device = torch.device("cpu")
+    path = cpb_mod.default_cache_path()
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "devices": {
+                    "0:Fake GPU": {
+                        "dsv4": asdict(_C),
+                        cpb_mod._DECODE_MAX_TOKENS_KEY: {"dsv4|64|512": 32},
+                    }
+                },
+            }
+        )
+        + "\n"
+    )
+    cpb_mod.save_constants(device, "dsv3_2", _C)
+    payload = json.loads(path.read_text())
+    assert payload["schema_version"] == cpb_mod._SCHEMA_VERSION
+    dev = payload["devices"]["0:Fake GPU"]
+    assert "dsv4" not in dev  # stale constants dropped
+    assert dev[cpb_mod._DECODE_MAX_TOKENS_KEY] == {"dsv4|64|512": 32}
+    assert dev["dsv3_2"] == asdict(_C)
 
 
 def test_dsv3_2_crossover_requires_glm_nsa_entries(
@@ -261,7 +303,7 @@ def family_constants(request: pytest.FixtureRequest) -> tuple[str, CpbConstants]
 @requires_sm12x
 def test_calibration_smoke(family_constants: tuple[str, CpbConstants]) -> None:
     family, c = family_constants
-    assert c.inv_bw > 0 and c.inv_rsm > 0 and c.c0 > 0 and c.beta >= 0
+    assert c.inv_bw > 0 and c.inv_rsm > 0 and c.c0 > 0
     assert (
         c.sm_count
         == torch.cuda.get_device_properties(torch.device("cuda")).multi_processor_count

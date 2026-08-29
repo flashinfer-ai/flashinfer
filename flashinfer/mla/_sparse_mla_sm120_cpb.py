@@ -30,18 +30,30 @@
 
 The old per-shape sweep profiled with synthetic indices drawn from a tiny
 pool, so the working set was L2-resident and the tuned cpb was distorted on
-some GPUs. Instead, six fixed measurements calibrate four hardware constants
-once per device (in ``autotune()`` tuning mode), and a closed-form model
-picks cpb per call, with an L2-footprint guard rail for the head-tile reuse
-window (see :func:`select_cpb`). Without calibrated constants the launcher's
-built-in heuristic is used.
+some GPUs. Instead, six fixed measurements calibrate three hardware
+constants once per device (in ``autotune()`` tuning mode), and a closed-form
+model picks cpb per call, with an L2-footprint guard rail for the head-tile
+reuse window (see :func:`select_cpb`). Without calibrated constants the
+launcher's built-in heuristic is used.
+
+The model prices a call as the exact list-scheduling makespan of its active
+blocks on ``sm_count`` SMs (see :func:`predict_time_s`): blocks of a split
+are identical, splits launch in z order, and the full ``num_splits`` grid's
+inactive splits early-exit at negligible cost. This replaces the previous
+ceil-wave form (``ceil(G/S) * (cpb*t_c + c0) + beta*splits``), which
+over-charged imbalanced mid-cpb candidates — at e.g. T=8/H=128/N=16 the
+7+7+2 split finishes in one heavy round while 8+8 pays a full extra chunk
+round, the sawtooth the ceil form cannot see — and whose ``beta`` merge term
+was unidentifiable from the measurement grid (it fit to zero on every
+family, and non-zero values poisoned the latency-regime picks).
 
 The same tuning-mode pass also measures the decode/prefill crossover per
 decode-instantiated ``(num_heads, topk)`` config (:func:`calibrate_crossover`)
 and persists it as ``decode_max_tokens`` in the same JSON document (schema
-version 2; v1 files load constants only). The runtime decode/prefill routing
-in :mod:`._sparse_mla_sm120` consults it; absent entries keep the historical
-decode-first policy.
+version 3; v1/v2 files keep loading their crossover table but their
+constants encode the old ceil-wave semantics and are discarded). The runtime
+decode/prefill routing in :mod:`._sparse_mla_sm120` consults it; absent
+entries keep the historical decode-first policy.
 """
 
 from __future__ import annotations
@@ -49,6 +61,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import pathlib
 import time
@@ -63,10 +76,14 @@ logger = logging.getLogger(__name__)
 _BI = 64  # chunk width in candidates (BLOCK_SIZE_N)
 _HPB = 16  # head tile per block
 
-_SCHEMA_VERSION = 2
-# v1 files predate the crossover table: constants load, crossover counts as
-# absent and the runtime falls back to the default decode-first policy.
-_LOADABLE_SCHEMA_VERSIONS = (1, 2)
+_SCHEMA_VERSION = 3
+# v1/v2 files predate the scheduling-makespan model: their per-family
+# constants encode the old ceil-wave form (including a beta merge term the
+# v3 model dropped) and would mispredict under the v3 structure, so only
+# their crossover table loads. v3 files load fully.
+_LOADABLE_SCHEMA_VERSIONS = (1, 2, 3)
+# Constants entries load only from files written at this version.
+_CONSTANTS_SCHEMA_VERSION = 3
 _BYTES_PER_TOKEN = {"dsv4": 584, "dsv3_2": 656, "glm53_nope": 656, "dots3_swa": 1160}
 _D_QK = {"dsv4": 512, "dsv3_2": 576, "glm53_nope": 512, "dots3_swa": 1088}
 _D_V = {"dsv4": 512, "dsv3_2": 512, "glm53_nope": 512, "dots3_swa": 1024}
@@ -88,42 +105,40 @@ _MEASUREMENTS = (
     (64, 128, 1024, 1),
     (64, 128, 512, 1),
     (1, 8, 1024, 16),
-    # Same split count as M4 at half the waves: breaks the (waves, s)
-    # collinearity that makes the c0/beta split unidentifiable over M1..M4.
+    # Second saturated mid-size point at a different wave count: keeps the
+    # streaming/overhead directions non-collinear for the LM fit.
     (32, 128, 512, 1),
 )
 # glm53_nope decode is instantiated at topk=2176 only (N=34 chunks, fixed),
-# so M1/M2 isolate the bandwidth term by varying cpb (17 vs 33) at identical
-# waves and split count s=2 instead of varying N. The wide cpb gap keeps the
-# signal well above min-of-iters timing noise. M5 is the latency point.
+# so M1/M2 isolate the streaming term by varying cpb (17 vs 33) at identical
+# token/head counts instead of varying N. The wide cpb gap keeps the signal
+# well above min-of-iters timing noise. M5 is the latency point.
 _MEASUREMENTS_GLM53_NOPE = (
     (64, 64, 2176, 17),
     (64, 64, 2176, 33),
     (64, 64, 2176, 1),
     (64, 32, 2176, 1),
     (1, 32, 2176, 34),
-    # Half the waves of M3 at half the split count, keeping the (waves, s)
-    # rows non-proportional for the c0/beta lstsq.
+    # Half the waves of M3 at a different split count, keeping the
+    # streaming/overhead directions non-collinear for the LM fit.
     (32, 64, 2176, 2),
 )
 # DOTS3_SWA decode is instantiated at topk=576 only (N=18 chunks at the 32-wide
 # tile, fixed). Its per-block fixed cost dwarfs the marginal per-chunk cost, so
-# a narrow same-splits cpb pair (like glm53_nope's) lands under timing noise.
-# Instead M1 (cpb=1) vs M2 (cpb=17) identify the per-chunk time from a two-
-# point solve over waves and cpb, assuming beta ~ 0 at identification
-# (measured 0 on every family; the lstsq re-solves c0/beta afterwards).
-# M5 is the latency point. The num_chunks basis is topk (the launched split
-# grid), not the 513-token window: the kernel clamps the scan to WINDOW inside
-# each block but the grid — and therefore the wave structure the model prices —
-# is sized from TOPK.
+# a narrow same-shape cpb pair (like glm53_nope's) lands under timing noise;
+# M1 (cpb=1) vs M2 (cpb=17) instead spans the full cpb range. M5 is the
+# latency point. The num_chunks basis is topk (the launched split grid), not
+# the 513-token window: the kernel clamps the scan to WINDOW inside each block
+# but the grid — and therefore the makespan structure the model prices — is
+# sized from TOPK.
 _MEASUREMENTS_DOTS3_SWA = (
     (64, 64, 576, 1),
     (64, 64, 576, 17),
     (64, 32, 576, 1),
     (32, 64, 576, 2),
     (1, 32, 576, 18),
-    # Same waves as M2 at a different cpb and split count, keeping the
-    # (waves, s) rows non-proportional for the c0/beta lstsq.
+    # Same shape as M2 at a different cpb and split count, keeping the
+    # streaming/overhead directions non-collinear for the LM fit.
     (64, 64, 576, 9),
 )
 
@@ -149,8 +164,6 @@ class CpbConstants:
         s/byte; inverse single-SM streaming rate (latency-bound regime).
     c0 : float
         s; fixed per-block overhead (Q load, epilogue).
-    beta : float
-        s per split; merge-kernel cost.
     sm_count : int
         Device SM count at calibration time.
     bytes_per_chunk : int
@@ -164,7 +177,6 @@ class CpbConstants:
     inv_bw: float
     inv_rsm: float
     c0: float
-    beta: float
     sm_count: int
     bytes_per_chunk: int
     l2_cache_bytes: int
@@ -180,6 +192,43 @@ def _num_chunks(topk: int, extra_topk: int, chunk_width: int = _BI) -> int:
     )
 
 
+def _graham_makespan(sm_count: int, batches: tuple[tuple[int, float], ...]) -> float:
+    """Exact Graham list-scheduling makespan for ``sm_count`` SMs.
+
+    ``batches`` are ``(job_count, job_duration)`` pairs in queue order, jobs
+    identical within a batch; a freed SM always takes the next queued block
+    (the GPU work distributor's behavior). Compressed per level: SMs tied at
+    the minimum availability rise in lockstep, so each iteration raises the
+    whole min pool instead of stepping job by job. Iterations are bounded by
+    the level-merge count (<= ~2 per batch here: the batches start from at
+    most two distinct availability levels).
+    """
+    avail = np.zeros(sm_count)
+    for k, d in batches:
+        if k <= 0 or d <= 0:
+            continue
+        while k > 0:
+            avail.sort()
+            v = avail[0]
+            c = int(np.searchsorted(avail, v, side="right"))
+            nxt = avail[c] if c < sm_count else np.inf
+            t_jobs = -(-k // c)  # rounds to exhaust the queue on this pool
+            t_reach = (
+                np.inf if np.isinf(nxt) else max(1, math.ceil((nxt - v) / d - 1e-9))
+            )
+            if t_jobs <= t_reach:
+                # Jobs run out while the pool is still the minimum: spread
+                # round-robin; the first k % c machines take one extra.
+                q, rem = divmod(k, c)
+                avail[:c] += q * d
+                avail[:rem] += d
+                k = 0
+            else:
+                avail[:c] += int(t_reach) * d
+                k -= c * int(t_reach)
+    return float(avail.max())
+
+
 def predict_time_s(
     num_tokens: int,
     num_heads: int,
@@ -191,21 +240,32 @@ def predict_time_s(
 ) -> float:
     """Predicted wall time (seconds) of one decode call at ``cpb``.
 
-    The grid is ``G = T * H_b * ceil(N / cpb)`` blocks, run in
-    ``ceil(G / sm_count)`` waves. Each block streams ``cpb`` chunks, pays the
-    fixed per-block overhead ``c0``, and each split pays the merge cost
-    ``beta``. Per-chunk time is the larger of the bandwidth-bound term (``g``
-    concurrent SMs share HBM) and the single-SM latency-bound term.
+    The launcher always fires the full ``T * H_b * num_splits`` grid; split z
+    owns chunks ``[z*cpb, z*cpb+cpb)`` and splits past ``ceil(N/cpb)``
+    early-exit. Blocks of one split are identical and launch in z order, so
+    the stage-1 makespan is the Graham list schedule of the active blocks on
+    ``sm_count`` SMs: ``m*(s-1)`` full blocks of ``cpb`` chunks followed by
+    ``m`` tail blocks of the short last split, each block paying the fixed
+    per-block overhead ``c0`` plus per-chunk time ``t_c``. ``t_c`` is the
+    larger of the bandwidth-bound term (``g`` concurrent blocks share HBM)
+    and the single-SM latency-bound term. Early-exit blocks only write their
+    LSE sentinel and retire; their scheduling churn is neglected (charging
+    them ``c0`` each measurably over-predicts mid-cpb candidates).
     """
     h_b = _ceil_div(num_heads, _HPB)
     n = _num_chunks(topk, extra_topk, chunk_width)
-    g = num_tokens * h_b * _ceil_div(n, cpb)
-    waves = _ceil_div(g, c.sm_count)
+    m = num_tokens * h_b
+    s = _ceil_div(n, cpb)
+    g = m * s
     t_c = max(
         c.bytes_per_chunk * min(g, c.sm_count) * c.inv_bw,
         c.bytes_per_chunk * c.inv_rsm,
     )
-    return waves * (cpb * t_c + c.c0) + c.beta * _ceil_div(n, cpb)
+    c_last = n - (s - 1) * cpb
+    return _graham_makespan(
+        c.sm_count,
+        ((m * (s - 1), cpb * t_c + c.c0), (m, c_last * t_c + c.c0)),
+    )
 
 
 def select_cpb(
@@ -332,8 +392,9 @@ def calibrate(
 
     Drives the real decode kernel over a ~2 GiB KV pool (halved on OOM down
     to 512 MiB) with fresh full-pool uniform indices per rep so the measured
-    working set stays HBM-resident, then solves the four constants from six
-    fixed shapes. ``module_getter`` returns the loaded TVM-FFI kernel module.
+    working set stays HBM-resident, then fits the three constants to six
+    fixed shapes by Levenberg-Marquardt on relative residuals.
+    ``module_getter`` returns the loaded TVM-FFI kernel module.
     """
     if family not in _BYTES_PER_TOKEN:
         raise ValueError(f"unknown sparse-MLA family {family!r}")
@@ -444,101 +505,95 @@ def calibrate(
 
     t = [measure(*m) for m in measurements]
 
-    def shape_terms(num_tokens: int, num_heads: int, topk: int, cpb: int):
-        h_b = _ceil_div(num_heads, _HPB)
-        n = _ceil_div(topk, bi)
-        splits = _ceil_div(n, cpb)
-        waves = _ceil_div(num_tokens * h_b * splits, sm_count)
-        return h_b, n, splits, waves
+    # Fit (inv_bw, inv_rsm, c0) to the six points by Levenberg-Marquardt on
+    # relative residuals, in log space (positivity by construction). The
+    # scheduling-makespan model is piecewise-linear in the constants, so a
+    # closed-form solve does not exist; LM converges in <10 iterations from
+    # the fixed inits below on every family. When the bandwidth term is
+    # shadowed by the single-SM latency floor at all six points, inv_bw is
+    # unidentifiable and stays near its init — harmless, because predictions
+    # are then insensitive to it.
+    def predict_with(x: np.ndarray, m: tuple[int, int, int, int]) -> float:
+        num_tokens, num_heads, topk, cpb = m
+        return predict_time_s(
+            num_tokens,
+            num_heads,
+            topk,
+            0,
+            cpb,
+            CpbConstants(
+                inv_bw=float(x[0]),
+                inv_rsm=float(x[1]),
+                c0=float(x[2]),
+                sm_count=sm_count,
+                bytes_per_chunk=w,
+                l2_cache_bytes=l2_cache_bytes,
+            ),
+            chunk_width=bi,
+        )
 
-    # M1 and M2 share waves, split count, and overheads, so their difference
-    # isolates the bandwidth term: t2 - t1 = (N2 - N1) * T * H_b * W * inv_bw.
-    # The bytes_i * inv_bw residuals below carry a wave-quantization bias
-    # (measured grid size g vs ceil-quantized waves) that partially cancels in
-    # predict_time_s, which applies the same ceil.
-    def total_streamed_bytes(i: int) -> float:
-        tk, nh, tk_topk, _ = measurements[i]
-        h_b_i, n_i, _, _ = shape_terms(tk, nh, tk_topk, 1)
-        return tk * h_b_i * n_i * w
+    def resid(theta: np.ndarray) -> np.ndarray:
+        x = np.exp(theta)
+        return np.array(
+            [
+                (predict_with(x, m) - t_i) / t_i
+                for m, t_i in zip(measurements, t, strict=True)
+            ]
+        )
 
-    if family == "glm53_nope":
-        # N is fixed (topk=2176-only instantiation); M1/M2 differ in cpb
-        # (17 vs 33) at identical waves and splits:
-        # t2 - t1 = waves * (cpb2 - cpb1) * min(g, S) * W * inv_bw.
-        tokens1, _, _, cpb1 = measurements[0]
-        cpb2 = measurements[1][3]
-        h_b1, _, splits1, waves1 = shape_terms(*measurements[0])
-        g1 = tokens1 * h_b1 * splits1
-        inv_bw = (t[1] - t[0]) / (waves1 * (cpb2 - cpb1) * min(g1, sm_count) * w)
-        residual_bytes = total_streamed_bytes
-    elif family == "dots3_swa":
-        # N is fixed (single-topk instantiation) and the marginal per-chunk
-        # cost is small next to the per-block fixed cost, so a same-waves cpb
-        # pair is noise-dominated. M1 (cpb=1) vs M2 (cpb=17) instead solve the
-        # two-equation system t_i = waves_i * (cpb_i * t_c + c0) + beta * s_i
-        # for t_c with beta ~ 0 at identification:
-        #   t_c = (t1/waves1 - t2/waves2) / (cpb1 - cpb2)
-        # The lstsq below re-solves (c0, beta); the identification-time c0 is
-        # discarded.
-        tokens1, _, _, cpb1 = measurements[0]
-        cpb2 = measurements[1][3]
-        h_b1, _, splits1, waves1 = shape_terms(*measurements[0])
-        _, _, _, waves2 = shape_terms(*measurements[1])
-        g1 = tokens1 * h_b1 * splits1
-        t_c = (t[0] / waves1 - t[1] / waves2) / (cpb1 - cpb2)
-        inv_bw = t_c / (min(g1, sm_count) * w)
+    theta = np.log(np.array([5e-13, 1.5e-10, 6e-6]))
+    r = resid(theta)
+    cost = 0.5 * float(r @ r)
+    lam = 1e-3
+    for _ in range(64):
+        jac = np.empty((len(measurements), 3))
+        for j in range(3):
+            h = 1e-4
+            theta_p = theta.copy()
+            theta_p[j] += h
+            theta_m = theta.copy()
+            theta_m[j] -= h
+            jac[:, j] = (resid(theta_p) - resid(theta_m)) / (2 * h)
+        grad = jac.T @ r
+        step_matrix = jac.T @ jac + lam * np.diag(
+            np.maximum(np.diag(jac.T @ jac), 1e-24)
+        )
+        try:
+            delta = np.linalg.solve(step_matrix, -grad)
+        except np.linalg.LinAlgError:
+            break
+        theta_new = theta + delta
+        if not np.all(np.isfinite(theta_new)):
+            break
+        r_new = resid(theta_new)
+        cost_new = 0.5 * float(r_new @ r_new)
+        if np.isfinite(cost_new) and cost_new < cost:
+            theta, r, cost = theta_new, r_new, cost_new
+            lam = max(lam / 4.0, 1e-12)
+            if np.max(np.abs(delta)) < 1e-6:
+                break
+        else:
+            lam *= 8.0
+            if lam > 1e12:
+                break
 
-        # Wave-consistent residual: predict_time_s charges streaming per wave
-        # (waves * cpb * min(g, S) * W * inv_bw), so the residual must match
-        # that structure — the total-bytes form mischarges cpb-varying points.
-        def residual_bytes(i: int) -> float:
-            tk, nh, tk_topk, cpb_i = measurements[i]
-            h_b_i, _, splits_i, waves_i = shape_terms(tk, nh, tk_topk, cpb_i)
-            g_i = tk * h_b_i * splits_i
-            return waves_i * cpb_i * min(g_i, sm_count) * w
-
-    else:
-        h_b1, n1, _, _ = shape_terms(*measurements[0])
-        _, n2, _, _ = shape_terms(*measurements[1])
-        inv_bw = (t[1] - t[0]) / ((n2 - n1) * measurements[0][0] * h_b1 * w)
-        residual_bytes = total_streamed_bytes
-
-    # Overheads over the saturated-regime points M1..M4 + M6 (M5 is the
-    # latency point): t_i - bytes_i * inv_bw = c0 * waves_i + beta * s_i.
-    # Each grid keeps the (waves, s) rows non-proportional (default grid: M6
-    # shares M4's split count at half its waves), so the c0/beta split is
-    # identifiable by design.
-    sat = list(range(4)) + [5]
-    a_rows, b_rows = [], []
-    for i in sat:
-        num_tokens, num_heads, topk, cpb = measurements[i]
-        h_b, n, splits, waves = shape_terms(num_tokens, num_heads, topk, cpb)
-        a_rows.append((waves, splits))
-        b_rows.append(t[i] - residual_bytes(i) * inv_bw)
-    (c0, beta), *_ = np.linalg.lstsq(np.array(a_rows), np.array(b_rows), rcond=None)
-    if beta < 0:
-        # NNLS active-set step; only a fallback for measurement noise, now
-        # that the measurement set is identifiable by design.
-        waves_arr = np.array([r[0] for r in a_rows])
-        c0 = float(waves_arr @ np.array(b_rows) / (waves_arr @ waves_arr))
-        beta = 0.0
-
-    # M5 launches a single block (latency-bound): t5 = waves * (cpb * W *
-    # inv_rsm + c0) + beta * splits.
-    num_tokens, num_heads, topk, cpb = measurements[4]
-    _, _, splits5, waves5 = shape_terms(num_tokens, num_heads, topk, cpb)
-    inv_rsm = (t[4] - waves5 * c0 - beta * splits5) / (waves5 * cpb * w)
-
-    if inv_bw <= 0 or inv_rsm <= 0 or c0 <= 0 or beta < 0:
+    inv_bw, inv_rsm, c0 = (float(v) for v in np.exp(theta))
+    rel_rms = float(np.sqrt(2.0 * cost / len(measurements)))
+    if (
+        not all(np.isfinite([inv_bw, inv_rsm, c0]))
+        or inv_bw <= 0
+        or inv_rsm <= 0
+        or c0 <= 0
+        or rel_rms > 0.25
+    ):
         raise CalibrationError(
             f"implausible cpb calibration constants for {family}: inv_bw={inv_bw}, "
-            f"inv_rsm={inv_rsm}, c0={c0}, beta={beta}"
+            f"inv_rsm={inv_rsm}, c0={c0} (relative rms residual {rel_rms:.3f})"
         )
     return CpbConstants(
-        inv_bw=float(inv_bw),
-        inv_rsm=float(inv_rsm),
-        c0=float(c0),
-        beta=float(beta),
+        inv_bw=inv_bw,
+        inv_rsm=inv_rsm,
+        c0=c0,
         sm_count=sm_count,
         bytes_per_chunk=w,
         l2_cache_bytes=l2_cache_bytes,
@@ -838,6 +893,11 @@ def _maybe_load_disk() -> None:
         devices = payload["devices"]
         if not isinstance(devices, dict):
             return
+        # Constants load only from current-schema files: v1/v2 constants
+        # encode the retired ceil-wave + beta form and would mispredict
+        # under the scheduling-makespan model. Their crossover table
+        # (semantics unchanged) still loads.
+        load_constants = payload["schema_version"] == _CONSTANTS_SCHEMA_VERSION
         # Parse fully into locals first: a mid-document failure must not
         # publish a prefix of the entries while leaving mtime/version stale.
         new_constants: dict = {}
@@ -852,7 +912,8 @@ def _maybe_load_disk() -> None:
                             str(k): int(v) for k, v in raw.items()
                         }
                     continue
-                new_constants[(dev_key, family)] = CpbConstants(**raw)
+                if load_constants:
+                    new_constants[(dev_key, family)] = CpbConstants(**raw)
     except (OSError, ValueError, TypeError, KeyError):
         # Keep mtime unchanged so the next cold call retries.
         return
@@ -872,6 +933,36 @@ def get_constants(device: torch.device, family: str) -> Optional[CpbConstants]:
     return _constants.get(key)
 
 
+def _read_payload_for_merge(path: pathlib.Path) -> dict:
+    """Existing cache content to merge into, upgraded to the current schema.
+
+    Current-schema files merge wholesale. Older loadable files carry stale
+    per-family constants (retired ceil-wave + beta semantics), so the upgrade
+    keeps only their crossover tables; the families recalibrate on the next
+    tuning-mode pass.
+    """
+    payload: dict = {"schema_version": _SCHEMA_VERSION, "devices": {}}
+    try:
+        existing = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return payload
+    if not isinstance(existing, dict) or existing.get("schema_version") not in (
+        _LOADABLE_SCHEMA_VERSIONS
+    ):
+        return payload
+    if existing["schema_version"] == _SCHEMA_VERSION:
+        return existing
+    devices = existing.get("devices")
+    if isinstance(devices, dict):
+        for dev_key, families in devices.items():
+            if not isinstance(families, dict):
+                continue
+            xo = families.get(_DECODE_MAX_TOKENS_KEY)
+            if isinstance(xo, dict):
+                payload["devices"][dev_key] = {_DECODE_MAX_TOKENS_KEY: xo}
+    return payload
+
+
 def save_constants(device: torch.device, family: str, c: CpbConstants) -> None:
     """Merge ``c`` into the disk cache (read-modify-write, atomic replace) and
     the process cache. A failed disk write only loses cross-process sharing;
@@ -879,16 +970,7 @@ def save_constants(device: torch.device, family: str, c: CpbConstants) -> None:
     global _cache_mtime, _constants_version
     key = (_device_key(device), family)
     path = default_cache_path()
-    payload: dict = {"schema_version": _SCHEMA_VERSION, "devices": {}}
-    try:
-        existing = json.loads(path.read_text())
-        if isinstance(existing, dict) and existing.get("schema_version") in (
-            _LOADABLE_SCHEMA_VERSIONS
-        ):
-            payload = existing
-            payload["schema_version"] = _SCHEMA_VERSION
-    except (OSError, ValueError):
-        pass
+    payload = _read_payload_for_merge(path)
     if not isinstance(payload.get("devices"), dict):
         payload["devices"] = {}
     if not isinstance(payload["devices"].get(key[0]), dict):
@@ -929,16 +1011,7 @@ def save_crossover(device: torch.device, table: dict[str, int]) -> None:
     global _cache_mtime, _constants_version
     dev_key = _device_key(device)
     path = default_cache_path()
-    payload: dict = {"schema_version": _SCHEMA_VERSION, "devices": {}}
-    try:
-        existing = json.loads(path.read_text())
-        if isinstance(existing, dict) and existing.get("schema_version") in (
-            _LOADABLE_SCHEMA_VERSIONS
-        ):
-            payload = existing
-            payload["schema_version"] = _SCHEMA_VERSION
-    except (OSError, ValueError):
-        pass
+    payload = _read_payload_for_merge(path)
     if not isinstance(payload.get("devices"), dict):
         payload["devices"] = {}
     dev = payload["devices"].setdefault(dev_key, {})
