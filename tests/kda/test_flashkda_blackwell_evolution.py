@@ -27,9 +27,19 @@ from flashinfer.jit.flash_kda_evolution import (
 )
 from flashinfer.kda_evolution import (
     PreparedFlashKDAEvolution,
+    _EVOLUTION_WINNER_SHAPES,
     _route,
     _use_evolution_route,
+    _uses_production_general,
     prepare_flash_kda_evolution,
+)
+
+
+_BLACKWELL_ROUTE_CONFIGS = (
+    pytest.param((10, 0), 148, id="b200"),
+    pytest.param((10, 3), 148, id="b300"),
+    pytest.param((10, 0), 152, id="gb200"),
+    pytest.param((10, 3), 152, id="gb300"),
 )
 
 
@@ -50,7 +60,7 @@ from flashinfer.kda_evolution import (
         (96, (1024,) * 128, True, True),
         (96, (1024,) * 256, True, True),
         (96, (64, 128, 256), True, True),
-        (96, (17, 33, 65), True, False),
+        (96, (17, 33, 65), True, True),
         (16, (16384,), False, False),
         (16, (32768,), False, False),
         (16, (65536,), False, False),
@@ -71,6 +81,92 @@ def test_flashkda_evolution_hybrid_route_manifest(
     num_heads, seq_lens, packed, expected
 ):
     assert _use_evolution_route(seq_lens, num_heads, not packed) is expected
+
+
+@pytest.mark.parametrize(("compute_capability", "sm_count"), _BLACKWELL_ROUTE_CONFIGS)
+def test_flashkda_evolution_n128_uses_production_general_only_at_148_sms(
+    compute_capability, sm_count
+):
+    sequence_lengths = (1024,) * 128
+
+    assert _use_evolution_route(sequence_lengths, 96, False)
+    assert _uses_production_general(
+        sequence_lengths,
+        96,
+        False,
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        use_initial_state=True,
+        store_final_state=True,
+    ) is (sm_count == 148)
+
+
+@pytest.mark.parametrize(("compute_capability", "sm_count"), _BLACKWELL_ROUTE_CONFIGS)
+def test_flashkda_evolution_irregular_route_stays_generated(
+    compute_capability, sm_count
+):
+    sequence_lengths = (17, 33, 65)
+
+    assert _use_evolution_route(sequence_lengths, 96, False)
+    assert not _uses_production_general(
+        sequence_lengths,
+        96,
+        False,
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        use_initial_state=True,
+        store_final_state=True,
+    )
+
+
+@pytest.mark.parametrize(("compute_capability", "sm_count"), _BLACKWELL_ROUTE_CONFIGS)
+def test_flashkda_evolution_fixed_h64_keeps_independent_value_split(
+    compute_capability, sm_count
+):
+    sequence_lengths = (8192,)
+
+    assert _use_evolution_route(sequence_lengths, 64, True)
+    assert not _uses_production_general(
+        sequence_lengths,
+        64,
+        True,
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        use_initial_state=True,
+        store_final_state=True,
+    )
+
+
+@pytest.mark.parametrize(("compute_capability", "sm_count"), _BLACKWELL_ROUTE_CONFIGS)
+@pytest.mark.parametrize(
+    ("fixed_layout", "num_heads", "sequence_lengths"),
+    tuple(
+        sorted(
+            _EVOLUTION_WINNER_SHAPES
+            - {
+                (False, 96, (1024,) * 128),
+                (False, 96, (17, 33, 65)),
+                (True, 64, (8192,)),
+            }
+        )
+    ),
+)
+def test_flashkda_evolution_other_frozen_routes_stay_generated(
+    fixed_layout,
+    num_heads,
+    sequence_lengths,
+    compute_capability,
+    sm_count,
+):
+    assert not _uses_production_general(
+        sequence_lengths,
+        num_heads,
+        fixed_layout,
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        use_initial_state=True,
+        store_final_state=True,
+    )
 
 
 def test_flashkda_evolution_profile_is_frozen():
@@ -204,16 +300,16 @@ def test_flashkda_evolution_jit_spec_has_one_generated_binding(variant, target):
             "persistent-h96-mixed",
             False,
         ),
-        ((17, 33, 65), True, 11016, "cake_dispatcher", False),
-        ((17, 33, 65), True, 11016, "cake_dispatcher", True),
+        ((17, 33, 65), True, 11016, "m128_h96_p0_s1", False),
+        ((17, 33, 65), True, 11016, "m128_h96_p0_s1", True),
         ((16,), False, 11017, "cake_dispatcher", False),
         ((16,), True, 11018, "cake_dispatcher", False),
     ),
     ids=(
         "fixed-8192",
         "mixed",
-        "irregular-cake",
-        "irregular-cake-alias",
+        "irregular-evolution",
+        "irregular-evolution-alias",
         "fixed-t16-cake",
         "packed-n1-t16-cake",
     ),

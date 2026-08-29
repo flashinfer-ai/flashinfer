@@ -53,10 +53,6 @@ _COMMON_HEADER_VARIANT_BODIES = (
         "flashkda_bf16_fused_m128_n16_checkpoint.cu",
     ),
     ("m128_n16_short", "cake_flashkda_bf16_fused_m128_n16_short.cu"),
-    (
-        "m128_n16_short_h96_const",
-        "cake_flashkda_bf16_fused_m128_n16_short.cu",
-    ),
     ("persistent_m128", "cake_flashkda_bf16_persistent_m128.cu"),
     (
         "piece_persistent_m128",
@@ -177,38 +173,22 @@ def test_combined_bt16_jit_spec(target, target_define):
 
 
 @pytest.mark.parametrize(
-    ("variant", "variant_define"),
-    (
-        ("m128_n16_short", "-DFLASHINFER_FLASH_KDA_N16_SHORT=1"),
-        (
-            "m128_n16_short_h96_const",
-            "-DFLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST=1",
-        ),
-    ),
-)
-@pytest.mark.parametrize(
     ("target", "target_define"),
     (
         ("sm100a", "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=0"),
         ("sm100f", "-DFLASHINFER_FLASH_KDA_TARGET_FAMILY=100"),
     ),
 )
-def test_short_n16_jit_spec_and_frozen_source(
-    variant, variant_define, target, target_define
-):
+def test_short_n16_jit_spec_and_frozen_source(target, target_define):
     flash_kda.gen_flash_kda_module.cache_clear()
-    spec = flash_kda.gen_flash_kda_module(variant, target)
+    spec = flash_kda.gen_flash_kda_module("m128_n16_short", target)
 
-    assert spec.name == f"flash_kda_bf16_{variant}_9252e6f1c0_{target}"
+    assert spec.name == f"flash_kda_bf16_m128_n16_short_969b84e4af_{target}"
     assert spec.sources == [
         flash_kda._get_flash_kda_csrc_dir()
         / "cake_flashkda_bf16_fused_m128_n16_binding.cu"
     ]
-    assert variant_define in spec.extra_cuda_cflags
-    assert (
-        sum("FLASHINFER_FLASH_KDA_N16_SHORT" in flag for flag in spec.extra_cuda_cflags)
-        == 1
-    )
+    assert "-DFLASHINFER_FLASH_KDA_N16_SHORT=1" in spec.extra_cuda_cflags
     assert target_define in spec.extra_cuda_cflags
     assert sum("-gencode=arch=compute_" in flag for flag in spec.extra_cuda_cflags) == 1
 
@@ -218,12 +198,12 @@ def test_short_n16_jit_spec_and_frozen_source(
     )
     payload = frozen_source.read_bytes()
     assert hashlib.sha256(payload).hexdigest() == (
-        "4adc8feeff3f877d299751120507978a59b79391cb17409afefb4be31cbc6db9"
+        "7a9b1c01a0abd04c0d2baddbcfc6043b693c80be728691f1fc6d2325db6a238e"
     )
     text = payload.decode()
     assert "#define SMEM_TOTAL 112256" in text
     assert "__launch_bounds__(512)" in text
-    assert variant in flash_kda.FLASH_KDA_VARIANTS
+    assert "m128_n16_short" in flash_kda.FLASH_KDA_VARIANTS
 
     flash_kda.gen_flash_kda_module.cache_clear()
 

@@ -883,7 +883,7 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
     for compute_capability, sm_count, expected in (
         ((10, 0), 148, True),
         ((10, 0), 152, True),
-        ((10, 3), 148, True),
+        ((10, 3), 148, False),
         ((10, 3), 152, False),
     ):
         assert (
@@ -933,20 +933,6 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
     )
     assert large_sm_count_mixed is not None
     assert len(large_sm_count_mixed[2]) == 153
-    short_irregular_148 = kda_prefill_api._persistent_task_plan(
-        (17, 33, 65),
-        num_heads=96,
-        sm_count=148,
-    )
-    assert short_irregular_148 is not None
-    assert len(short_irregular_148[2]) == 145
-    short_irregular_152 = kda_prefill_api._persistent_task_plan(
-        (17, 33, 65),
-        num_heads=96,
-        sm_count=152,
-    )
-    assert short_irregular_152 is not None
-    assert len(short_irregular_152[2]) == 153
     assert (
         kda_prefill_api._persistent_task_plan(
             (3063, 2048, 1300, 963, 547, 271),
@@ -963,30 +949,6 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
         )
         is None
     )
-
-
-def test_gb300_irregular_persistent_policy_is_shape_exact():
-    exact = dict(
-        compute_capability=(10, 3),
-        sm_count=152,
-        fixed_layout=False,
-        sequence_lengths=(17, 33, 65),
-        num_heads=96,
-    )
-    assert kda_prefill_api._uses_measured_gb300_irregular_persistent_policy(**exact)
-    for field, value in (
-        ("compute_capability", (10, 0)),
-        ("sm_count", 148),
-        ("fixed_layout", True),
-        ("sequence_lengths", (17, 33, 64)),
-        ("sequence_lengths", (17, 33, 65, 65)),
-        ("num_heads", 64),
-    ):
-        nearby = dict(exact)
-        nearby[field] = value
-        assert not kda_prefill_api._uses_measured_gb300_irregular_persistent_policy(
-            **nearby
-        )
 
 
 @pytest.mark.parametrize(
@@ -1331,30 +1293,6 @@ def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
         num_heads=12,
         max_sequence_length=3072,
     ) == ("bt16_prepare", "bt16_chain_m64_s7", False)
-    assert kda_prefill_api._select_bt16_physical_variants(
-        compute_capability=(10, 0),
-        sm_count=148,
-        fixed_layout=True,
-        num_sequences=1,
-        num_heads=32,
-        max_sequence_length=8192,
-    ) == ("bt16_prepare", "bt16_chain_m64_s7", False)
-    assert kda_prefill_api._select_bt16_physical_variants(
-        compute_capability=(10, 3),
-        sm_count=148,
-        fixed_layout=True,
-        num_sequences=1,
-        num_heads=16,
-        max_sequence_length=16_384,
-    ) == ("bt16_prepare", "bt16_chain_m64_s7", False)
-    assert kda_prefill_api._select_bt16_physical_variants(
-        compute_capability=(10, 3),
-        sm_count=152,
-        fixed_layout=True,
-        num_sequences=1,
-        num_heads=32,
-        max_sequence_length=8192,
-    ) == ("bt16_prepare", "bt16_chain_m64_s8", False)
 
 
 def test_bt16_two_stage_adapter_reuses_descriptors_across_state_rotations(monkeypatch):
@@ -1599,33 +1537,6 @@ def test_h96_uniform_n128_keeps_n16_on_148_sm():
             ) is (sm_count == 148)
 
 
-@pytest.mark.parametrize(
-    ("overrides", "expected"),
-    (
-        ({}, True),
-        ({"fixed_layout": True}, False),
-        ({"num_sequences": 2}, False),
-        ({"num_heads": 64}, False),
-        ({"max_sequence_length": 15}, False),
-        ({"has_in_place_state": False}, False),
-        ({"use_state_indices": True}, False),
-        ({"checkpoint_every_n_tokens": 16}, False),
-    ),
-)
-def test_h96_short_const_policy_is_exact(overrides, expected):
-    kwargs = {
-        "fixed_layout": False,
-        "num_sequences": 1,
-        "num_heads": 96,
-        "max_sequence_length": 16,
-        "has_in_place_state": True,
-        "use_state_indices": False,
-        "checkpoint_every_n_tokens": 0,
-    }
-    kwargs.update(overrides)
-    assert kda_prefill_api._should_use_h96_short_const(**kwargs) is expected
-
-
 class _RecorderModule:
     def __init__(self, *, final_value=None):
         self.calls = []
@@ -1776,10 +1687,7 @@ def test_frozen_route_and_ffi_abi(
     assert set(modules) == {expected_variant}
     assert routes == [(expected_variant, expected_target)]
     (args,) = modules[expected_variant].calls
-    expected_arg_count = (
-        29 if expected_variant in ("m128_n16", "m128_n16_short") else 28
-    )
-    assert len(args) == expected_arg_count
+    assert len(args) == 28
     assert args[0].data_ptr() == inputs["q"].data_ptr()
     assert args[4].data_ptr() == inputs["beta"].data_ptr()
     assert args[5].shape == (
@@ -1818,7 +1726,6 @@ def test_frozen_route_and_ffi_abi(
         assert math.isclose(args[25], 128**-0.5)
         assert args[26] == -5.0
         assert args[27] == int(torch.cuda.current_stream(cuda_device).cuda_stream)
-        assert args[28] == int(packed and num_heads == 4)
     if num_heads % 8 != 0:
         assert args[5].data_ptr() != inputs["beta"].data_ptr()
 
@@ -1974,46 +1881,6 @@ def test_pair_packed_h12_beta_requires_an_even_dense_carrier(cuda_device):
     assert paired.data_ptr() == dense.data_ptr()
     odd = torch.empty((1, 129, 12), dtype=torch.bfloat16, device=cuda_device)
     assert kda_prefill_api._pair_packed_beta_tma_source(odd) is None
-
-
-def test_short_h4_beta_prepack_caches_and_invalidates_on_mutation():
-    beta = torch.arange(60, dtype=torch.bfloat16).view(1, 15, 4)
-    beta_tma = torch.full((16, 8), -1, dtype=torch.bfloat16)
-    workspace = SimpleNamespace(
-        _beta_padding_source_tensor=None,
-        _beta_padding_source_signature=None,
-    )
-
-    assert kda_prefill_api._prepack_stable_short_h4_beta(
-        beta, beta_tma, workspace, capturing=False
-    )
-    torch.testing.assert_close(beta_tma[:15, :4], beta[0], atol=0, rtol=0)
-    assert torch.count_nonzero(beta_tma[:, 4:]) == 0
-    assert torch.count_nonzero(beta_tma[15]) == 0
-
-    # An unchanged input reuses the prepared carrier without another device copy.
-    beta_tma[0, 0] = -7
-    assert kda_prefill_api._prepack_stable_short_h4_beta(
-        beta, beta_tma, workspace, capturing=False
-    )
-    assert beta_tma[0, 0] == -7
-
-    # A distinct tensor object cannot reuse the cache receipt, even when it
-    # aliases the same storage and therefore has an identical pointer/version.
-    detached = beta.detach()
-    assert kda_prefill_api._prepack_stable_short_h4_beta(
-        detached, beta_tma, workspace, capturing=False
-    )
-    assert beta_tma[0, 0] == beta[0, 0, 0]
-
-    beta.add_(1)
-    assert kda_prefill_api._prepack_stable_short_h4_beta(
-        beta, beta_tma, workspace, capturing=False
-    )
-    torch.testing.assert_close(beta_tma[:15, :4], beta[0], atol=0, rtol=0)
-    assert not kda_prefill_api._prepack_stable_short_h4_beta(
-        beta, beta_tma, workspace, capturing=True
-    )
 
 
 @pytest.mark.parametrize(
@@ -2203,73 +2070,6 @@ def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
     assert args[15].shape == (768,)
     assert args[16] == 1
     assert args[17] == 96
-
-
-def test_gb300_irregular_prefill_reaches_persistent_worker_abi(
-    cuda_device,
-    monkeypatch,
-):
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "get_compute_capability",
-        lambda device: (10, 3),
-    )
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_is_cuda_version_at_least",
-        lambda version: True,
-    )
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_flash_kda_device_sm_count",
-        lambda device: 152,
-    )
-    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
-    module = _RecorderModule()
-    routes = []
-
-    def get_module(variant, target):
-        routes.append((variant, target))
-        return module
-
-    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
-    inputs = _make_inputs(
-        seq_lens=[17, 33, 65],
-        num_heads=96,
-        packed=True,
-        initial_state=True,
-    )
-    output, state = recurrent_kda(
-        **_strict_prefill_kwargs(inputs),
-        output=torch.empty_like(inputs["q"]),
-        backend="cake",
-    )
-
-    assert output.shape == inputs["q"].shape
-    assert state is None
-    assert routes == [("persistent_m128", "sm100f")]
-    (args,) = module.calls
-    assert len(args) == 23
-    assert args[9].tolist() == [2, 1, 0]
-    assert sorted(args[10].tolist()) == list(range(3 * 96))
-    assert args[11].numel() == 153
-    assert args[11][0].item() == 0
-    assert args[11][-1].item() == 3 * 96
-    assert args[16] == 1
-    assert args[17] == 96
-
-    nearby = _make_inputs(
-        seq_lens=[17, 33, 64],
-        num_heads=96,
-        packed=True,
-        initial_state=True,
-    )
-    recurrent_kda(
-        **_strict_prefill_kwargs(nearby),
-        output=torch.empty_like(nearby["q"]),
-        backend="cake",
-    )
-    assert routes[-1] == ("m128", "sm100f")
 
 
 def test_uniform_piece_prefill_reaches_extended_worker_abi(
@@ -2560,61 +2360,6 @@ def test_b200_prefill_without_initial_state_stays_direct(cuda_device, monkeypatc
     assert routes == [("m128_n16_short", "sm100f")]
     (args,) = module.calls
     assert args[9].tolist() == [0, 1]
-
-
-@pytest.mark.parametrize(
-    ("seq_lens", "expected_variant"),
-    (
-        ([16], "m128_n16_short_h96_const"),
-        ([16, 16], "m128_n16_short"),
-    ),
-)
-def test_h96_short_const_route_requires_n1_in_place_state(
-    cuda_device,
-    monkeypatch,
-    seq_lens,
-    expected_variant,
-):
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "get_compute_capability",
-        lambda device: (10, 0),
-    )
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_is_cuda_version_at_least",
-        lambda version: True,
-    )
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_flash_kda_device_sm_count",
-        lambda device: 148,
-    )
-    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
-    module = _RecorderModule()
-    routes = []
-
-    def get_module(variant, target):
-        routes.append((variant, target))
-        return module
-
-    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
-    inputs = _make_inputs(
-        seq_lens=seq_lens,
-        num_heads=96,
-        packed=True,
-        initial_state=True,
-    )
-    recurrent_kda(
-        **_strict_prefill_kwargs(inputs),
-        output=torch.empty_like(inputs["q"]),
-        backend="cake",
-    )
-
-    assert routes == [(expected_variant, "sm100f")]
-    (args,) = module.calls
-    assert len(args) == 29
-    assert args[11].data_ptr() == args[13].data_ptr()
 
 
 @pytest.mark.parametrize(

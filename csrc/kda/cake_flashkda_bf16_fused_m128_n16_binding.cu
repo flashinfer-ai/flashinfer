@@ -30,7 +30,7 @@
 #define CakeTensorMap flashkda_generated_CakeTensorMap
 #define CakeTensorMapPack flashkda_generated_CakeTensorMapPack
 #define CUtensorMap flashkda_generated_CUtensorMap
-#if defined(FLASHINFER_FLASH_KDA_N16_SHORT) || defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
+#if defined(FLASHINFER_FLASH_KDA_N16_SHORT)
 #include "cake_flashkda_bf16_fused_m128_n16_short.cu"
 #else
 #include "cake_flashkda_bf16_fused_m128_n16.cu"
@@ -51,13 +51,13 @@
 namespace flashinfer {
 namespace flash_kda {
 
-#if defined(FLASHINFER_FLASH_KDA_N16_SHORT) || defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
+#if defined(FLASHINFER_FLASH_KDA_N16_SHORT)
 using GeneratedTensorMap = flashkda_generated_CakeTensorMap;
 #else
 using GeneratedTensorMap = flashkda_generated_FlashKDATensorMap;
 #endif
 
-#if defined(FLASHINFER_FLASH_KDA_N16_SHORT) || defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
+#if defined(FLASHINFER_FLASH_KDA_N16_SHORT)
 constexpr int kThreads = 512;
 #else
 // The frozen source declares __launch_bounds__(1024) but no longer emits a
@@ -66,7 +66,7 @@ constexpr int kThreads = 1024;
 #endif
 static_assert(STORE_BACKWARD_TAPE == 0);
 static_assert(SPLIT_WORK_ITEMS == 0);
-#if defined(FLASHINFER_FLASH_KDA_N16_SHORT) || defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
+#if defined(FLASHINFER_FLASH_KDA_N16_SHORT)
 static_assert(SMEM_TOTAL == 112256);
 #else
 static_assert(SMEM_TOTAL == 117376);
@@ -80,10 +80,8 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
                 int64_t prepare_descriptors, int64_t num_heads, int64_t beta_token_stride,
                 int64_t state_slot_stride, int64_t use_state_indices, int64_t use_initial_state,
                 int64_t store_final_state, int64_t checkpoint_every_n_tokens, double scale,
-                double lower_bound, int64_t cuda_stream, int64_t beta_tma_prepacked) {
+                double lower_bound, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
-  TVM_FFI_ICHECK(beta_tma_prepacked == 0 || beta_tma_prepacked == 1)
-      << "beta_tma_prepacked must be 0 or 1";
   TVM_FFI_ICHECK(q.device().device_type == kDLCUDA) << "q must be a CUDA tensor";
   const int32_t device_id = q.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
@@ -97,14 +95,6 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
       q, k, v, g, beta, beta_tma, A_log, dt_bias, cu_seqlens, seq_order, initial_state, out,
       final_state, descriptor_storage, prepare_descriptors, num_heads, use_initial_state,
       store_final_state, scale, lower_bound, true, state_pool_slots);
-#if defined(FLASHINFER_FLASH_KDA_N16_SHORT_H96_CONST)
-  TVM_FFI_ICHECK(num_seqs == 1 && num_heads == 96 && use_state_indices == 0 &&
-                 use_initial_state == 1 && store_final_state == 1 && checkpoint_every_n_tokens == 0)
-      << "H96 short specialization requires N=1, H=96, in-place initial/final "
-         "state, no state indices, and no checkpoints";
-  TVM_FFI_ICHECK(initial_state.data_ptr() == final_state.data_ptr())
-      << "H96 short specialization requires in-place state";
-#endif
   TVM_FFI_ICHECK(beta_token_stride == beta.stride(beta.ndim() - 2))
       << "beta_token_stride must match beta's physical token stride";
   CheckServingCheckpointInputs(state_checkpoints, checkpoint_cu_starts, device_id, num_seqs,
@@ -129,9 +119,7 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
   const TmaPointers tma = EncodeTmaPointers<128, 16>(q, k, v, g, beta_tma, out, descriptor_storage,
                                                      prepare_descriptors, stream);
-  if (!beta_tma_prepacked) {
-    PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta_token_stride, stream);
-  }
+  PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta_token_stride, stream);
 
   kernel_flashkda_bf16_fused_m128<<<grid, block, kSmemBytes, stream>>>(
       reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),

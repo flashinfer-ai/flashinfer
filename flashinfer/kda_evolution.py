@@ -28,16 +28,21 @@ from .jit.flash_kda_evolution import (
     FlashKDAEvolutionVariant,
     load_flash_kda_evolution_module,
 )
-from .kda_prefill import _run_flash_kda_prefill, _select_flash_kda_prefill_target
+from .kda_prefill import (
+    _FLASH_KDA_ROUTE_BT16_M64,
+    _FLASH_KDA_ROUTE_DIRECT_M128_N16,
+    _run_flash_kda_prefill,
+    _select_flash_kda_bf16_route,
+    _select_flash_kda_prefill_target,
+)
 
 _HEAD_DIM = 128
 _PERSISTENT_SCALAR_CTAS = 152
 _DESCRIPTOR_STORAGE_BYTES = 6 * 128
 
-# These are the generated schedules that beat the public Cake dispatcher on
-# every measured SM100-family SKU (B200, B300, GB200, and GB300).  Keep the
-# manifest shape-exact: nearby shapes retain Cake's production dispatcher
-# rather than inheriting a benchmark result they did not measure.
+# Keep the exported specialization manifest shape-exact. Nearby shapes retain
+# the production dispatcher rather than inheriting a frozen schedule selected
+# for a different workload.
 _EVOLUTION_WINNER_SHAPES = frozenset(
     {
         (False, 32, (1300, 547, 2048, 963, 271, 3063)),
@@ -48,6 +53,7 @@ _EVOLUTION_WINNER_SHAPES = frozenset(
         (True, 96, (97,)),
         (True, 96, (8192,)),
         (False, 96, (64, 128, 256)),
+        (False, 96, (17, 33, 65)),
         (False, 96, (1300, 547, 2048, 963, 271, 3063)),
         (False, 96, (1024,) * 8),
         (False, 96, (1024,) * 16),
@@ -67,6 +73,42 @@ def _use_evolution_route(
     """Whether this measured shape should use its generated specialization."""
 
     return (fixed_layout, num_heads, sequence_lengths) in _EVOLUTION_WINNER_SHAPES
+
+
+def _uses_production_general(
+    sequence_lengths: tuple[int, ...],
+    num_heads: int,
+    fixed_layout: bool,
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+    use_initial_state: bool,
+    store_final_state: bool,
+) -> bool:
+    """Whether the shared planner selects a materially different schedule."""
+
+    route = _select_flash_kda_bf16_route(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=len(sequence_lengths),
+        num_heads=num_heads,
+        uniform_sequences=len(set(sequence_lengths)) == 1,
+        max_sequence_length=max(sequence_lengths),
+        use_initial_state=use_initial_state,
+        store_final_state=store_final_state,
+    )
+    independent_dvsplit = (
+        fixed_layout and len(sequence_lengths) == 1 and num_heads == 64
+    )
+    return (
+        route
+        in {
+            _FLASH_KDA_ROUTE_BT16_M64,
+            _FLASH_KDA_ROUTE_DIRECT_M128_N16,
+        }
+        and not independent_dvsplit
+    )
 
 
 def _build_persistent_scalar_schedule(
@@ -300,7 +342,7 @@ class PreparedFlashKDAEvolution:
     """Prepared launch of the measured-best Blackwell recurrent-KDA route.
 
     Stable generated winners retain their exported specialization. Other
-    shapes use the production Cake dispatcher while preserving this adapter's
+    shapes use the production dispatcher while preserving this adapter's
     independent initial-state and final-state buffers.
 
     A prepared evolution route is bound to the CUDA stream used by its first
@@ -342,7 +384,19 @@ class PreparedFlashKDAEvolution:
             end - start for start, end in itertools.pairwise(offsets)
         )
         target = _select_flash_kda_prefill_target(q.device)
-        if not _use_evolution_route(sequence_lengths, num_heads, fixed_layout):
+        properties = torch.cuda.get_device_properties(q.device)
+        use_evolution = _use_evolution_route(
+            sequence_lengths, num_heads, fixed_layout
+        ) and not _uses_production_general(
+            sequence_lengths,
+            num_heads,
+            fixed_layout,
+            compute_capability=(properties.major, properties.minor),
+            sm_count=properties.multi_processor_count,
+            use_initial_state=initial_state is not None,
+            store_final_state=final_state is not None,
+        )
+        if not use_evolution:
             self.module = None
             self.variant = "cake_dispatcher"
             self.target = target
