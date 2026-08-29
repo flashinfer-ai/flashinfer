@@ -53,11 +53,15 @@ def _require_environment() -> tuple[tuple[int, int], str]:
     except (ImportError, RuntimeError) as error:
         raise RuntimeError("reportable timings require cupti-python >= 13") from error
     if int(cupti_version.split(".", 1)[0]) < 13:
-        raise RuntimeError(f"reportable timings require cupti-python >= 13, got {cupti_version}")
+        raise RuntimeError(
+            f"reportable timings require cupti-python >= 13, got {cupti_version}"
+        )
     if not is_cake_grouped_mxfp8_quantize_available(
         torch.bfloat16, torch.device("cuda", torch.cuda.current_device())
     ):
-        raise RuntimeError("an exported Cake BF16 grouped MXFP8 profile is not installed")
+        raise RuntimeError(
+            "an exported Cake BF16 grouped MXFP8 profile is not installed"
+        )
     if not is_cuda_tile_available():
         raise RuntimeError("the cuTile grouped MXFP8 baseline is not available")
     return capability, cupti_version
@@ -169,7 +173,9 @@ def main() -> None:
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
     if args.warmup_ms < 100 or args.benchmark_ms < 1000:
-        raise ValueError("reportable runs require >=100 ms warmup and >=1000 ms measurement")
+        raise ValueError(
+            "reportable runs require >=100 ms warmup and >=1000 ms measurement"
+        )
 
     wall_start = time.perf_counter()
     capability, cupti_version = _require_environment()

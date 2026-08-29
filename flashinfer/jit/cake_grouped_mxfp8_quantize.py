@@ -34,7 +34,9 @@ def _get_csrc_dir() -> Path:
     installed = jit_env.FLASHINFER_CSRC_DIR / "cake_grouped_mxfp8_quantize"
     if installed.exists():
         return installed
-    checkout = Path(__file__).resolve().parents[2] / "csrc" / "cake_grouped_mxfp8_quantize"
+    checkout = (
+        Path(__file__).resolve().parents[2] / "csrc" / "cake_grouped_mxfp8_quantize"
+    )
     if checkout.exists():
         return checkout
     raise FileNotFoundError(
@@ -140,7 +142,9 @@ def gen_cake_grouped_mxfp8_quantize_module(
             )
 
     uri = f"cake_grouped_mxfp8_quantize_{input_name}_{target}"
-    binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_grouped_mxfp8_quantize_binding.cu"
+    binding = (
+        jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_grouped_mxfp8_quantize_binding.cu"
+    )
     write_if_different(binding, _binding_source(input_name))
     spec = gen_jit_spec(
         name=uri,

@@ -456,8 +456,10 @@ def _mxfp8_grouped_quantize_cake(
             f"profile for dtype={a.dtype} and target={target}; use the default "
             "backend='cutile' until that profile is installed"
         )
-    return get_cake_mxfp8_grouped_quantization_module().cake_mxfp8_grouped_quantize_impl(
-        a, mask
+    return (
+        get_cake_mxfp8_grouped_quantization_module().cake_mxfp8_grouped_quantize_impl(
+            a, mask
+        )
     )
 
 
@@ -506,9 +508,7 @@ def mxfp8_grouped_quantize(
     """
 
     if backend not in ("cutile", "cake"):
-        raise ValueError(
-            f"Unsupported backend for mxfp8_grouped_quantize: {backend!r}"
-        )
+        raise ValueError(f"Unsupported backend for mxfp8_grouped_quantize: {backend!r}")
     if a.dim() != 3:
         raise ValueError("a must be a 3D tensor with shape [B, M, K]")
     if not a.is_cuda:

@@ -586,9 +586,7 @@ def test_mxfp8_grouped_quantize_backend_validation():
         mxfp8_grouped_quantize(a, mask, backend="unknown")
 
 
-@pytest.mark.parametrize(
-    "batch_shape", [(1, 120, 64), (2, 256, 4096), (3, 200, 160)]
-)
+@pytest.mark.parametrize("batch_shape", [(1, 120, 64), (2, 256, 4096), (3, 200, 160)])
 def test_mxfp8_grouped_quantize_cake_fake_op_metadata(batch_shape):
     """The Cake registered fake preserves the public grouped-GEMM ABI."""
     from flashinfer.quantization.fp8_quantization import (
@@ -621,7 +619,9 @@ def test_mxfp8_grouped_quantize_cake_exact(batch_shape, dtype):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
     if not is_cake_grouped_mxfp8_available(dtype):
-        pytest.skip(f"a generated Cake grouped MXFP8 profile for {dtype} is not installed")
+        pytest.skip(
+            f"a generated Cake grouped MXFP8 profile for {dtype} is not installed"
+        )
 
     torch.manual_seed(20260829)
     b, m, k = batch_shape
@@ -645,9 +645,7 @@ def test_mxfp8_grouped_quantize_cake_exact(batch_shape, dtype):
             rtol=0,
             atol=0,
         )
-        got_scale = _unswizzle_mxfp8_scales_128x4(
-            out_scale[group], m, padded_k
-        )
+        got_scale = _unswizzle_mxfp8_scales_128x4(out_scale[group], m, padded_k)
         expected_scale = _unswizzle_mxfp8_scales_128x4(ref_scale, m, padded_k)
         torch.testing.assert_close(
             got_scale[:valid_rows], expected_scale[:valid_rows], rtol=0, atol=0
@@ -690,9 +688,12 @@ def test_mxfp8_grouped_quantize_cake_cuda_graph_and_streams():
         (stream_b_q, eager_q),
         (stream_b_sf, eager_sf),
     ):
-        torch.testing.assert_close(got.contiguous().view(torch.uint8),
-                                   expected.contiguous().view(torch.uint8),
-                                   rtol=0, atol=0)
+        torch.testing.assert_close(
+            got.contiguous().view(torch.uint8),
+            expected.contiguous().view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
 
 
 @pytest.mark.parametrize("batch_shape", [(2, 128, 128), (3, 256, 160)])
