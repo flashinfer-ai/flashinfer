@@ -136,6 +136,23 @@ def _get_csrc_dir() -> Path:
     )
 
 
+def _get_include_dir() -> Path:
+    """Locate FlashInfer headers in installed and source checkouts."""
+
+    if jit_env.FLASHINFER_INCLUDE_DIR.exists():
+        return jit_env.FLASHINFER_INCLUDE_DIR
+
+    checkout = Path(__file__).resolve().parents[2] / "include"
+    if checkout.exists():
+        return checkout
+
+    raise FileNotFoundError(
+        "FlashInfer headers were not found. Checked:\n"
+        f"  - {jit_env.FLASHINFER_INCLUDE_DIR}\n"
+        f"  - {checkout}"
+    )
+
+
 def get_blackwell_bgmv_moe_uri(
     hidden_size: int,
     dtype: BlackwellBGMVMoEDType,
@@ -177,6 +194,7 @@ def gen_blackwell_bgmv_moe_module(
 ) -> JitSpec:
     metadata = _metadata(hidden_size, dtype)
     csrc_dir = _get_csrc_dir()
+    include_dir = _get_include_dir()
     body = csrc_dir / metadata.body
     binding_header = csrc_dir / "blackwell_bgmv_moe_binding.cuh"
     if not body.is_file():
@@ -193,7 +211,7 @@ def gen_blackwell_bgmv_moe_module(
         name=uri,
         sources=[binding],
         extra_cuda_cflags=[*sm100a_nvcc_flags, "-use_fast_math"],
-        extra_include_paths=[csrc_dir],
+        extra_include_paths=[csrc_dir, include_dir],
     )
     logger.info("Generated Blackwell BGMV MoE JIT spec: %s", spec.name)
     return spec
