@@ -51,6 +51,7 @@ import json
 import logging
 import os
 import pathlib
+import time
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Optional
 
@@ -337,6 +338,7 @@ def calibrate(
     if family not in _BYTES_PER_TOKEN:
         raise ValueError(f"unknown sparse-MLA family {family!r}")
     from ._sparse_mla_sm120 import _MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM53_NOPE
+    from ._sparse_mla_sm120_plan import _decode_scratch_heads
 
     device = torch.device(device)
     props = torch.cuda.get_device_properties(device)
@@ -374,10 +376,19 @@ def calibrate(
             .to(torch.bfloat16)
         )
         mid_out = torch.empty(
-            num_tokens, num_heads, num_splits, d_v, dtype=torch.bfloat16, device=device
+            num_tokens,
+            _decode_scratch_heads(num_heads),
+            num_splits,
+            d_v,
+            dtype=torch.bfloat16,
+            device=device,
         )
         mid_lse = torch.empty(
-            num_tokens, num_heads, num_splits, dtype=torch.float32, device=device
+            num_tokens,
+            _decode_scratch_heads(num_heads),
+            num_splits,
+            dtype=torch.float32,
+            device=device,
         )
         output = torch.empty(
             num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
@@ -535,14 +546,20 @@ def calibrate(
 
 
 def calibrate_crossover(
-    module: Any, device: torch.device, family: str, c: CpbConstants
+    module: Any,
+    device: torch.device,
+    family: str,
+    c: CpbConstants,
+    grid_override: Optional[list[tuple[int, int]]] = None,
 ) -> dict[str, int]:
     """Measure the decode/prefill crossover for the decode-instantiated
     configs of ``family`` on ``device``.
 
     For every ``(num_heads, topk)`` pair on the family's calibration grid (the
     dedicated-H corner plus the power-of-2 head counts; runtime-H shapes off
-    the grid keep the decode-first default), both paths are timed at
+    the grid keep the decode-first default) — or on ``grid_override`` when
+    given (the public calibration API's arbitrary-shape entries) — both paths
+    are timed at
     each probed T with the HBM-faithful protocol of
     :func:`_time_call_fresh_indices`: the decode kernel runs with the model's
     ``select_cpb`` pick; the prefill orchestrator runs with
@@ -571,23 +588,30 @@ def calibrate_crossover(
         _MODEL_TYPE_GLM_NSA,
         _MODEL_TYPE_GLM53_NOPE,
         _MODEL_TYPE_DOTS3_SWA,
+        _decode_scratch_heads,
         prefill_variant,
     )
 
     device = torch.device(device)
+    grid: Optional[list[tuple[int, int]]] = (
+        sorted(grid_override) if grid_override is not None else None
+    )
     if family == "dsv4":
         # (key prefix, calibration grid, FFI model_type)
-        spaces = [("dsv4", sorted(_DECODE_DSV4_CALIBRATION_GRID), _MODEL_TYPE_DSV4)]
-    elif family == "dsv3_2":
         spaces = [
-            ("dsv3_2", sorted(_DECODE_DSV3_2_CALIBRATION_GRID), _MODEL_TYPE_DSV3_2),
-            ("glm_nsa", sorted(_DECODE_DSV3_2_CALIBRATION_GRID), _MODEL_TYPE_GLM_NSA),
+            ("dsv4", grid or sorted(_DECODE_DSV4_CALIBRATION_GRID), _MODEL_TYPE_DSV4)
+        ]
+    elif family == "dsv3_2":
+        pairs = grid or sorted(_DECODE_DSV3_2_CALIBRATION_GRID)
+        spaces = [
+            ("dsv3_2", pairs, _MODEL_TYPE_DSV3_2),
+            ("glm_nsa", pairs, _MODEL_TYPE_GLM_NSA),
         ]
     elif family == "glm53_nope":
         spaces = [
             (
                 "glm53_nope",
-                sorted(_DECODE_GLM53_NOPE_CALIBRATION_GRID),
+                grid or sorted(_DECODE_GLM53_NOPE_CALIBRATION_GRID),
                 _MODEL_TYPE_GLM53_NOPE,
             )
         ]
@@ -595,7 +619,7 @@ def calibrate_crossover(
         spaces = [
             (
                 "dots3_swa",
-                sorted(_DECODE_DOTS3_SWA_CALIBRATION_GRID),
+                grid or sorted(_DECODE_DOTS3_SWA_CALIBRATION_GRID),
                 _MODEL_TYPE_DOTS3_SWA,
             )
         ]
@@ -624,10 +648,19 @@ def calibrate_crossover(
             .to(torch.bfloat16)
         )
         mid_out = torch.empty(
-            num_tokens, num_heads, num_splits, d_v, dtype=torch.bfloat16, device=device
+            num_tokens,
+            _decode_scratch_heads(num_heads),
+            num_splits,
+            d_v,
+            dtype=torch.bfloat16,
+            device=device,
         )
         mid_lse = torch.empty(
-            num_tokens, num_heads, num_splits, dtype=torch.float32, device=device
+            num_tokens,
+            _decode_scratch_heads(num_heads),
+            num_splits,
+            dtype=torch.float32,
+            device=device,
         )
         output = torch.empty(
             num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
@@ -971,3 +1004,245 @@ def mark_crossover_failed(device: torch.device, family: str) -> None:
 def is_crossover_failed(device: torch.device, family: str) -> bool:
     """True iff crossover calibration already failed for (device, family)."""
     return (_device_key(device), family) in _crossover_failed
+
+
+# ── Public calibration entry point ─────────────────────────────────────────
+
+
+# Per-family calibration defaults and legality bounds, derived from the
+# plan-layer envelope constants. ("<grid heads>", "<grid topks>", min_topk)
+def _family_specs() -> dict[str, tuple[tuple[int, ...], tuple[int, ...], int]]:
+    from ._sparse_mla_sm120_plan import (
+        _CALIBRATION_HEADS,
+        _DECODE_DSV3_2_TOPKS,
+        _DECODE_DSV4_TOPKS,
+        _DECODE_DOTS3_SWA_TOPK,
+        _DECODE_GLM53_NOPE_TOPK,
+    )
+
+    v32_topks = tuple(sorted(_DECODE_DSV3_2_TOPKS))
+    return {
+        "dsv4": (_CALIBRATION_HEADS, tuple(sorted(_DECODE_DSV4_TOPKS)), 1),
+        "dsv3_2": (_CALIBRATION_HEADS, v32_topks, 1),
+        "glm_nsa": (_CALIBRATION_HEADS, v32_topks, 1),
+        "glm53_nope": ((32, 64), (_DECODE_GLM53_NOPE_TOPK,), 1),
+        "dots3_swa": ((8, 16, 32, 64), (_DECODE_DOTS3_SWA_TOPK,), 513),
+    }
+
+
+@dataclass(frozen=True)
+class SparseMLASm120CalibrationReport:
+    """Outcome of one :func:`calibrate_sparse_mla_sm120` call.
+
+    Attributes
+    ----------
+    device : str
+        The device key the entries were recorded under.
+    constants_calibrated : tuple[str, ...]
+        Families whose cpb constants were (re)measured this call.
+    constants_present : tuple[str, ...]
+        Families whose cpb constants were already on disk (skipped).
+    entries_calibrated : int
+        Crossover ``(family, num_heads, topk)`` entries newly measured.
+    entries_skipped : int
+        Requested crossover entries already present (idempotent default).
+    failed : tuple[str, ...]
+        Human-readable per-family/per-entry failures, if any. Calibration
+        failures are collected here instead of raised so a multi-family call
+        still records the families that did succeed.
+    cache_path : str
+        The JSON document the entries were merged into.
+    elapsed_s : float
+        Wall-clock seconds for the whole call.
+    """
+
+    device: str
+    constants_calibrated: tuple[str, ...]
+    constants_present: tuple[str, ...]
+    entries_calibrated: int
+    entries_skipped: int
+    failed: tuple[str, ...]
+    cache_path: str
+    elapsed_s: float
+
+
+def calibrate_sparse_mla_sm120(
+    device: Optional[torch.device] = None,
+    *,
+    heads: Optional[tuple[int, ...]] = None,
+    topks: Optional[tuple[int, ...]] = None,
+    families: Optional[tuple[str, ...]] = None,
+    force: bool = False,
+) -> SparseMLASm120CalibrationReport:
+    """Calibrate the SM120 sparse-MLA decode model on ``device`` and persist it.
+
+    One call does both layers: the per-family cpb constants (measured when
+    absent, or always when ``force=True``) and then the decode/prefill
+    crossover entry for every requested ``(family, num_heads, topk)``
+    combination. Results merge into the JSON cache (see
+    :func:`default_cache_path`) and take effect in-process immediately (the
+    ``_constants_version`` bump self-invalidates the plan memoization).
+
+    The default is idempotent skip-existing: frameworks may call this
+    unconditionally on every startup warmup. ``force=True`` re-measures even
+    present entries — the escape hatch after a kernel upgrade changes the
+    measured optimum.
+
+    Measure on an idle GPU (the protocol is timing-sensitive), and calibrate
+    per machine — the constants are device-local. A full default sweep (all
+    families, grid heads x grid topks) takes on the order of minutes; a
+    single ``(family, heads, topks)`` combination is seconds.
+
+    Parameters
+    ----------
+    device : Optional[torch.device]
+        Target device; defaults to the current CUDA device.
+    heads : Optional[tuple[int, ...]]
+        Head counts to calibrate. Defaults to the family's crossover grid
+        (``{8,16,32,64,128}`` for the DeepSeek families, ``{32,64}`` for
+        glm53_nope, ``{8,16,32,64}`` for dots3_swa). Any count in
+        ``[1, 128]`` is accepted — off-grid counts ride the runtime-H
+        instantiation.
+    topks : Optional[tuple[int, ...]]
+        Top-k widths to calibrate; defaults to the family's calibrated
+        values. Any width above the family minimum is accepted (topk is a
+        runtime kernel argument).
+    families : Optional[tuple[str, ...]]
+        Subset of ``{"dsv4", "dsv3_2", "glm_nsa", "glm53_nope",
+        "dots3_swa"}``; defaults to all. ``dsv3_2`` and ``glm_nsa`` share
+        constants and are measured in one sweep (requesting either calibrates
+        both key spaces).
+    force : bool
+        Re-measure entries already present in the cache.
+
+    Returns
+    -------
+    SparseMLASm120CalibrationReport
+        Counts and the cache path, for framework logging.
+
+    Raises
+    ------
+    ValueError
+        If any requested ``(family, num_heads, topk)`` is outside the decode
+        envelope (e.g. dots3_swa topk < 513); all invalid combinations are
+        listed.
+    """
+    from ._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
+    from ._sparse_mla_sm120_plan import _CPB_FAMILY_ALIAS
+
+    t0 = time.monotonic()
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device(device)
+
+    specs = _family_specs()
+    fams = tuple(families) if families is not None else tuple(specs)
+    unknown = [f for f in fams if f not in specs]
+    if unknown:
+        raise ValueError(
+            f"unknown sparse-MLA families: {unknown}; available: {sorted(specs)}"
+        )
+
+    # Validate every requested combination up front; nothing is measured or
+    # written when any combination is out of envelope.
+    invalid = []
+    for fam in fams:
+        grid_heads, grid_topks, min_topk = specs[fam]
+        for h in tuple(heads) if heads is not None else grid_heads:
+            for k in tuple(topks) if topks is not None else grid_topks:
+                if not (1 <= h <= 128 and k >= min_topk):
+                    invalid.append(
+                        f"{fam}(num_heads={h}, topk={k}) "
+                        f"[need 1<=num_heads<=128, topk>={min_topk}]"
+                    )
+    if invalid:
+        raise ValueError(
+            "calibrate_sparse_mla_sm120: combinations outside the decode "
+            "envelope: " + "; ".join(invalid)
+        )
+
+    constants_calibrated: list[str] = []
+    constants_present: list[str] = []
+    failed: list[str] = []
+    entries_calibrated = 0
+    entries_skipped = 0
+
+    # Phase 1: cpb constants per cpb family (glm_nsa aliases dsv3_2).
+    cpb_families = sorted({_CPB_FAMILY_ALIAS.get(f, f) for f in fams})
+    constants: dict[str, CpbConstants] = {}
+    for cpb_family in cpb_families:
+        existing = None if force else get_constants(device, cpb_family)
+        if existing is not None:
+            constants_present.append(cpb_family)
+            constants[cpb_family] = existing
+            continue
+        try:
+            c = calibrate(_get_sparse_mla_sm120_decode_module, cpb_family, device)
+        except (CalibrationError, torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            logger.warning(
+                "SM120 sparse-MLA %s cpb calibration failed (%s)", cpb_family, e
+            )
+            failed.append(f"{cpb_family} constants: {e}")
+            mark_calibration_failed(device, cpb_family)
+            continue
+        save_constants(device, cpb_family, c)
+        constants[cpb_family] = c
+        constants_calibrated.append(cpb_family)
+
+    # Phase 2: crossover entries, one sweep per cpb family over the requested
+    # pairs that still need measuring. The dsv3_2 sweep writes both the dsv3_2
+    # and glm_nsa key spaces, so a request for either covers both.
+    for cpb_family in cpb_families:
+        c = constants.get(cpb_family)
+        if c is None:
+            continue  # constants failed above; crossover entries need them
+        requested = [f for f in fams if _CPB_FAMILY_ALIAS.get(f, f) == cpb_family]
+        pairs: set[tuple[int, int]] = set()
+        for fam in requested:
+            grid_heads, grid_topks, _ = specs[fam]
+            for h in tuple(heads) if heads is not None else grid_heads:
+                for k in tuple(topks) if topks is not None else grid_topks:
+                    if (
+                        not force
+                        and get_decode_max_tokens(device, fam, h, k) is not None
+                    ):
+                        entries_skipped += 1
+                    else:
+                        pairs.add((h, k))
+        if not pairs:
+            continue
+        try:
+            table = calibrate_crossover(
+                _get_sparse_mla_sm120_decode_module(),
+                device,
+                cpb_family,
+                c,
+                grid_override=sorted(pairs),
+            )
+        except (CalibrationError, torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            logger.warning(
+                "SM120 sparse-MLA %s crossover calibration failed (%s)",
+                cpb_family,
+                e,
+            )
+            failed.append(f"{cpb_family} crossover: {e}")
+            mark_crossover_failed(device, cpb_family)
+            continue
+        save_crossover(device, table)
+        # Count a requested entry as calibrated iff its key landed in the
+        # table written above (the dsv3_2 sweep writes both key spaces).
+        for fam in requested:
+            for h, k in pairs:
+                if f"{fam}|{h}|{k}" in table:
+                    entries_calibrated += 1
+
+    return SparseMLASm120CalibrationReport(
+        device=_device_key(device),
+        constants_calibrated=tuple(constants_calibrated),
+        constants_present=tuple(constants_present),
+        entries_calibrated=entries_calibrated,
+        entries_skipped=entries_skipped,
+        failed=tuple(failed),
+        cache_path=str(default_cache_path()),
+        elapsed_s=time.monotonic() - t0,
+    )

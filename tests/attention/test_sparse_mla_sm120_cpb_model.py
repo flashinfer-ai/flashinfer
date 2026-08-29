@@ -626,3 +626,136 @@ def test_glm_nsa_decode_uses_dsv3_2_cpb_family(clean_cpb_state, monkeypatch) -> 
     call()
     assert seen == {"calibrate": "dsv3_2", "calibrate_crossover": "dsv3_2"}
     assert recorded["cpb_override"] == expected_cpb
+
+
+# ── Public calibration API (calibrate_sparse_mla_sm120) ────────────────────
+
+
+def test_public_calibrate_validates_envelope(clean_cpb_state) -> None:
+    """Unknown families raise before any measurement (envelope misses are
+    covered by the listing test below)."""
+    import flashinfer.mla
+
+    calibrate = flashinfer.mla.calibrate_sparse_mla_sm120  # lazy export resolves
+    with pytest.raises(ValueError, match="unknown sparse-MLA families") as exc:
+        calibrate(
+            torch.device("cpu"),
+            families=("dsv4", "dots3_swa", "bogus_family"),
+        )
+    assert "bogus_family" in str(exc.value)
+
+
+def test_public_calibrate_lists_all_invalid_combinations(clean_cpb_state) -> None:
+    import flashinfer.mla
+
+    with pytest.raises(ValueError) as exc:
+        flashinfer.mla.calibrate_sparse_mla_sm120(
+            torch.device("cpu"),
+            families=("dots3_swa",),
+            heads=(64, 256),
+            topks=(512, 576),
+        )
+    msg = str(exc.value)
+    assert "num_heads=256" in msg and "topk=512" in msg and "topk>=513" in msg
+    # The legal combination (64, 576) must not be blamed.
+    assert "(num_heads=64, topk=576)" not in msg
+
+
+@requires_sm12x
+def test_public_calibrate_offgrid_shape_idempotent_force(clean_cpb_state) -> None:
+    """End-to-end on GPU: calibrate an off-grid shape, check the disk entry,
+    idempotent second call, force re-measure, and in-process plan() pickup."""
+    import json
+
+    import flashinfer.mla
+    from flashinfer.mla import _sparse_mla_sm120_plan as plan_mod
+
+    device = torch.device("cuda")
+    calibrate = flashinfer.mla.calibrate_sparse_mla_sm120
+
+    # A grid shape both envelopes serve, so a measured crossover < 64 must
+    # flip plan() routing in-process (no restart, no manual memo clear).
+    t_probe, h_probe, k_probe = 48, 64, 512
+    planned = plan_mod.plan(
+        t_probe,
+        h_probe,
+        k_probe,
+        plan_mod._MODEL_TYPE_DSV4,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        device,
+    )
+    assert planned is not None
+    assert planned.variant is plan_mod.KernelVariant.DECODE_SPLITK  # decode-first
+
+    report = calibrate(device, families=("dsv4",), heads=(64, 80), topks=(384, 512))
+    assert report.failed == ()
+    assert report.constants_calibrated == ("dsv4",)
+    assert report.entries_calibrated == 4
+    assert report.entries_skipped == 0
+    assert report.elapsed_s > 0
+
+    # Disk: the JSON document carries every requested entry, incl. the
+    # off-grid (80, 384) one.
+    payload = json.loads((clean_cpb_state / "sparse_mla_sm120_cpb.json").read_text())
+    xo = payload["devices"]["0:Fake GPU"]["decode_max_tokens"]
+    for h in (64, 80):
+        for k in (384, 512):
+            assert f"dsv4|{h}|{k}" in xo
+    # Off-grid H=80 / topk=384: the prefill envelope cannot serve them, so
+    # decode always wins by construction.
+    assert xo["dsv4|80|384"] == 64
+    assert xo["dsv4|80|512"] == 64
+    assert xo["dsv4|64|384"] == 64
+
+    # The (64, 512) entry must be a real measured crossover below 64 on this
+    # GPU class, and plan() must pick it up in-process via the
+    # _constants_version invalidation (deliberately no _plan_memo.clear()).
+    dmt = cpb_mod.get_decode_max_tokens(device, "dsv4", 64, 512)
+    assert dmt is not None and dmt < 64
+    planned = plan_mod.plan(
+        t_probe,
+        h_probe,
+        k_probe,
+        plan_mod._MODEL_TYPE_DSV4,
+        64,
+        False,
+        plan_mod._PREFILL_IMPL_AUTO,
+        device,
+    )
+    assert planned is not None
+    assert planned.variant is plan_mod.KernelVariant.PREFILL_MG
+
+    # Idempotent second call: everything already present.
+    report2 = calibrate(device, families=("dsv4",), heads=(64, 80), topks=(384, 512))
+    assert report2.failed == ()
+    assert report2.constants_present == ("dsv4",)
+    assert report2.constants_calibrated == ()
+    assert report2.entries_calibrated == 0
+    assert report2.entries_skipped == 4
+
+    # force re-measures present entries.
+    report3 = calibrate(
+        device, families=("dsv4",), heads=(64, 80), topks=(384, 512), force=True
+    )
+    assert report3.failed == ()
+    assert report3.constants_calibrated == ("dsv4",)
+    assert report3.entries_calibrated == 4
+    assert report3.entries_skipped == 0
+
+
+def test_public_calibrate_report_type_is_public(clean_cpb_state) -> None:
+    """The report class rides the same lazy export as the other public names."""
+    import flashinfer.mla
+
+    assert "calibrate_sparse_mla_sm120" in dir(flashinfer.mla)
+    assert "SparseMLASm120CalibrationReport" in dir(flashinfer.mla)
+    from flashinfer.mla._sparse_mla_sm120_cpb import (
+        SparseMLASm120CalibrationReport,
+    )
+
+    assert (
+        flashinfer.mla.SparseMLASm120CalibrationReport
+        is SparseMLASm120CalibrationReport
+    )

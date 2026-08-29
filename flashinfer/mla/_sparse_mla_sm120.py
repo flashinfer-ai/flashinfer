@@ -114,6 +114,12 @@ from ._sparse_mla_sm120_plan import (
     plan,
 )
 
+# Public calibration API, re-exported for the flashinfer.mla lazy export.
+from ._sparse_mla_sm120_cpb import (  # noqa: E402
+    SparseMLASm120CalibrationReport,  # noqa: F401  (lazy re-export)
+    calibrate_sparse_mla_sm120,  # noqa: F401  (lazy re-export)
+)
+
 logger = logging.getLogger(__name__)
 
 _KV_SCALE_FORMATS = frozenset({"auto", "pow2_fp32", "arbitrary_fp32"})
