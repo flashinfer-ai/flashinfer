@@ -243,6 +243,25 @@ Both bf16 and NVFP4 are supported in the compute path (`MoEConfig.quant.variant`
 
 **Mega:** pass `MegaConfig(megakernel=...)`. Weights required as the layer's `weights` argument. Workspace allocated on first forward. Output is bf16 `[num_tokens, token_hidden_size]` where `num_tokens = MoEEpTensors.num_tokens` (may be `< max_tokens_per_rank`). `fleet_knobs` are ignored. NIXL-EP split layers require `BootstrapConfig.tcp_store` at init.
 
+For serving several token capacities with one layer and one transformed weight
+set, allocate explicit profiles before capture:
+
+```python
+decode_workspace = layer.create_workspace(max_tokens_per_rank=256)
+prefill_workspace = layer.create_workspace(max_tokens_per_rank=4096)
+
+decode_out = layer.forward(decode_inputs, workspace=decode_workspace)
+prefill_out = layer.forward(prefill_inputs, workspace=prefill_workspace)
+```
+
+Creation and destruction are collective across EP ranks.  A handle belongs to
+the layer that created it, accepts any live token count up to its capacity, and
+owns stable workspace/output addresses until `close()`/`destroy()` or layer
+destruction.  Warm each handle with `layer.warmup(..., workspace=handle)` before
+capturing a separate CUDA graph for it.  Do not use one handle concurrently or
+destroy it while a graph that references it can replay.  Calls without an
+explicit handle preserve the original lazy default-workspace behavior.
+
 ## Architecture
 
 ```mermaid
@@ -313,7 +332,8 @@ Split comm backends ship native libs under `backends/split/comm/*/_libs/`. Probe
 | Process runtime | layer init (if `auto_bootstrap`) | layer destroy (ref-counted) |
 | Fleet | first split forward | layer destroy |
 | Handle | each split forward | end of forward |
-| Mega workspace | first mega forward | layer destroy |
+| Default mega workspace | first mega forward | layer destroy |
+| Explicit mega workspace | `create_workspace()` | handle or layer destroy |
 
 ## Usage
 

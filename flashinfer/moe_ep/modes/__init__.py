@@ -8,7 +8,7 @@ from ..backends.split.kernel.sm100.mxfp8_mxfp4_bf16_cutedsl import (
 )
 from ..core.kernel import SplitKernelContext, kernel_requires_weights, run_split_kernel
 from .config import MegaConfig, SplitConfig
-from .mega_layer import MoEEpMegaLayer
+from .mega_layer import MoEEpMegaLayer, MoEEpMegaWorkspace
 from .split_layer import MoEEpSplitLayer
 
 __all__ = [
@@ -17,6 +17,7 @@ __all__ = [
     "Sm100_Mxfp8_Mxfp4_Bf16_Cutedsl_SplitConfig",
     "MegaConfig",
     "MoEEpMegaLayer",
+    "MoEEpMegaWorkspace",
     "MoEEpSplitLayer",
     "NCCLEPConfig",
     "NcclEpConfig",

@@ -208,6 +208,13 @@ class MegaKernelBackend(ABC):
     ) -> None:
         """Optional per-iteration validation before staging/compute."""
 
+    def validate_capture_ready(  # noqa: B027 - intentional no-op default
+        self,
+        workspace: Any,
+        transformed_weights: Any,
+    ) -> None:
+        """Fail before staging if a selected workspace has lazy capture work."""
+
     def validate_transformed_weights(  # noqa: B027 - intentional no-op default
         self,
         transformed_weights: Any,

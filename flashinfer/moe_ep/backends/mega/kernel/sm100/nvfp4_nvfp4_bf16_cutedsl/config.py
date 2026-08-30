@@ -31,11 +31,6 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # workspace.  Requires apply_topk_in_fc1=True and combine_dtype="bf16";
     # accumulation order is nondeterministic (tolerance-compare outputs).
     in_kernel_fc2_reduce: bool = False
-    # Terminal integration mode: preserve the explicit-reduce BF16 combine
-    # staging, but omit only the nested upstream TopkReduce launch.  The
-    # standard forward API rejects this mode; a same-stream terminal adapter
-    # must consume the borrowed combine staging and produce the final output.
-    defer_topk_reduce: bool = False
     # Cross-rank combine wire format: "bf16" (exact), "mxfp8" (2x less combine
     # traffic), "nvfp4" (4x less).  Quantized wires trade accuracy for NVLink
     # bandwidth and require in_kernel_fc2_reduce=False.
@@ -51,14 +46,3 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # shim.autotune candidate set on the live problem and keep the winner
     # (one cute.compile per candidate, paid once per session).
     knobs: dict | str | None = None
-
-    def __post_init__(self) -> None:
-        if self.defer_topk_reduce and (
-            self.in_kernel_fc2_reduce
-            or self.combine_dtype != "bf16"
-            or not self.apply_topk_in_fc1
-        ):
-            raise ValueError(
-                "defer_topk_reduce requires in_kernel_fc2_reduce=False, "
-                "combine_dtype='bf16', and apply_topk_in_fc1=True."
-            )

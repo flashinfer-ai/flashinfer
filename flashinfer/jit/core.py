@@ -525,6 +525,7 @@ def gen_jit_spec(
     extra_include_paths: Optional[List[Union[str, Path]]] = None,
     needs_device_linking: bool = False,
     post_load_adapter: Optional[Callable[[Any], Any]] = None,
+    use_fast_math: bool = True,
 ) -> JitSpec:
     check_cuda_arch()
     # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
@@ -546,7 +547,6 @@ def gen_jit_spec(
 
     cuda_cflags = [
         *get_nvcc_parallelism_flags(),
-        "-use_fast_math",
         "-Xfatbin=-compress-all",  # Ensure all device binaries are compressed
         "--compress-mode=size",
         "-DFLASHINFER_ENABLE_F16",
@@ -554,6 +554,8 @@ def gen_jit_spec(
         "-DFLASHINFER_ENABLE_FP8_E4M3",
         "-DFLASHINFER_ENABLE_FP8_E5M2",
     ]
+    if use_fast_math:
+        cuda_cflags.insert(len(get_nvcc_parallelism_flags()), "-use_fast_math")
     if not cuda_cflags_has_std:
         cuda_cflags.insert(0, "-std=c++17")
 

@@ -135,12 +135,26 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             activation_clamp=k.activation_clamp,
             apply_topk_in_fc1=k.apply_topk_in_fc1,
             in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
-            defer_topk_reduce=k.defer_topk_reduce,
+            defer_topk_reduce=self._uses_native_topk_reduce(fleet_params),
             combine_dtype=k.combine_dtype,
             fc1_alpha=k.fc1_alpha,
             fc2_alpha=k.fc2_alpha,
             fc1_norm_const=k.fc1_norm_const,
             knobs=k.knobs if isinstance(k.knobs, dict) else None,
+        )
+
+    def _uses_native_topk_reduce(self, fleet_params: FleetParams) -> bool:
+        """Whether this exact workspace can use the frozen SM100a reducer."""
+
+        k = self._kernel_config
+        return (
+            torch.cuda.get_device_capability(torch.cuda.current_device()) == (10, 0)
+            and fleet_params.max_tokens_per_rank in (256, 4096)
+            and fleet_params.token_hidden_size == 4096
+            and k.top_k == 6
+            and not k.in_kernel_fc2_reduce
+            and k.combine_dtype == "bf16"
+            and k.apply_topk_in_fc1
         )
 
     def validate_forward(
@@ -217,6 +231,32 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         if t.fc1_norm_const is not None:
             workspace.fc1_norm_const.copy_(t.fc1_norm_const)
 
+    def validate_capture_ready(
+        self,
+        workspace: Any,
+        transformed_weights: TransformedMegaWeights,
+    ) -> None:
+        frontend = workspace._frontend
+        mega = frontend._mega
+        if mega is None or mega.compiled is None:
+            raise RuntimeError(
+                "MegaMoE workspace is not warmed for CUDA graph capture; "
+                "call layer.warmup(..., workspace=workspace) first"
+            )
+        if frontend.config.defer_topk_reduce:
+            from flashinfer.jit.cake_megamoe_topk_reduce import (
+                is_cake_megamoe_topk_reduce_module_loaded,
+            )
+
+            if not is_cake_megamoe_topk_reduce_module_loaded():
+                raise RuntimeError(
+                    "MegaMoE terminal reducer is not warmed for CUDA graph capture; "
+                    "call layer.warmup(..., workspace=workspace) first"
+                )
+        # Materialize the thunk for the current capture stream before staging
+        # mutates workspace buffers or records any graph node.
+        self._prepared_thunk_state(workspace, transformed_weights)
+
     @staticmethod
     def _mega_inputs(
         workspace: Any,
@@ -273,31 +313,6 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             self._thunk_states[key] = state
         return state
 
-    def prepare_deferred_topk_reduce(
-        self,
-        workspace: Any,
-        transformed_weights: TransformedMegaWeights,
-    ) -> dict[str, Any]:
-        """Prepare the upstream-only launch and canonical borrowed buffers."""
-        if not self._kernel_config.defer_topk_reduce:
-            raise RuntimeError("deferred TopK-reduce mode is not enabled")
-        key, thunk, out_buf = self._prepared_thunk_state(
-            workspace,
-            transformed_weights,
-        )
-        partials, workspace_root, region = (
-            workspace._frontend.deferred_topk_reduce_workspace()
-        )
-        return {
-            "launch": thunk,
-            "partials": partials,
-            "out": out_buf,
-            "workspace_root": workspace_root,
-            "region": region,
-            "stream": key[3],
-            "internal_topk_reduce_disabled": True,
-        }
-
     def compute(
         self,
         workspace: Any,
@@ -305,11 +320,6 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self._kernel_config.defer_topk_reduce:
-            raise RuntimeError(
-                "compute() cannot return an unreduced output when "
-                "defer_topk_reduce=True; use prepare_deferred_topk_reduce()"
-            )
         from ......kernel_src.cutedsl_megamoe import staged_tokens
 
         if output is not None:
@@ -357,8 +367,31 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         # graph. A knobs/clamp change nulls the frontend's compiled session,
         # changing the key and forcing a rebuild through the validated path.
         state = self._prepared_thunk_state(workspace, transformed_weights)
-        _, thunk, out_buf = state
+        key, thunk, out_buf = state
+        reducer_state = None
+        if workspace._frontend.config.defer_topk_reduce:
+            partials, workspace_root, _region = (
+                workspace._frontend.deferred_topk_reduce_workspace()
+            )
+            # Resolve/load the native module and borrowed view before the
+            # upstream launch.  The terminal interval below must contain only
+            # the two same-stream device launches—no lazy compilation,
+            # allocation, copy, event, or synchronization.
+            from flashinfer.jit.cake_megamoe_topk_reduce import (
+                get_cake_megamoe_topk_reduce_module,
+            )
+
+            reducer_state = (
+                get_cake_megamoe_topk_reduce_module(),
+                partials,
+                workspace_root,
+                key[3],
+            )
         thunk()
+        if reducer_state is not None:
+            reducer, partials, workspace_root, stream = reducer_state
+            reducer.run(partials, out_buf, num_tokens, stream)
+            del workspace_root
         if output is not None:
             output.copy_(out_buf[:num_tokens])
             return output
@@ -391,7 +424,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             _resolve_gate_up_clamp(k),
             k.apply_topk_in_fc1,
             k.in_kernel_fc2_reduce,
-            k.defer_topk_reduce,
+            self._uses_native_topk_reduce(fleet_params),
             k.combine_dtype,
             epilogue_pool_key(k.fc1_alpha),
             epilogue_pool_key(k.fc2_alpha),
