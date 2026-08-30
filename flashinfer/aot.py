@@ -65,24 +65,10 @@ from .jit.blackwell_msa import (
     gen_blackwell_msa_module,
 )
 from .jit.flash_kda import (
-    FlashKDATarget,
-    gen_flash_kda_bt16_chain_m64_s7_module,
-    gen_flash_kda_bt16_chain_m64_s8_module,
-    gen_flash_kda_bt16_chain_m64_s9_module,
-    gen_flash_kda_bt16_prepare_chain_m64_s8_module,
-    gen_flash_kda_bt16_prepare_beta_tma_module,
-    gen_flash_kda_bt16_prepare_module,
-    gen_flash_kda_m64_module,
-    gen_flash_kda_m128_module,
-    gen_flash_kda_m128_tensor_state_decay_module,
-    gen_flash_kda_m128_h12_long_module,
-    gen_flash_kda_m128_h12_short_module,
+    GeneratedFlashKDATarget,
+    gen_flash_kda_generated_module,
     gen_flash_kda_m128_n16_checkpoint_module,
-    gen_flash_kda_m128_n16_module,
-    gen_flash_kda_m128_n16_short_module,
-    gen_flash_kda_piece_persistent_m128_module,
-    gen_flash_kda_persistent_m128_module,
-    gen_flash_kda_small_bh_m128_module,
+    get_flash_kda_generated_variant_ids,
 )
 from .jit.flash_kda_backward import gen_flash_kda_backward_module
 from .jit.flash_kda_training import gen_flash_kda_training_module
@@ -519,8 +505,8 @@ def gen_all_modules(
     has_flash_kda_prefill_sm100a = sm_capabilities.get(
         "flash_kda_prefill_sm100a", False
     )
-    has_flash_kda_prefill_sm100f = sm_capabilities.get(
-        "flash_kda_prefill_sm100f", False
+    has_flash_kda_prefill_sm103a = sm_capabilities.get(
+        "flash_kda_prefill_sm103a", False
     )
     has_flash_kda_decode_sm100a_legacy = sm_capabilities.get(
         "flash_kda_decode_sm100a_legacy", False
@@ -576,35 +562,21 @@ def gen_all_modules(
                 for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[blackwell_msa_target]
             )
 
-    # CUDA 12.8 predates the SM100-family target and retains one exact B200
-    # cubin per variant. CUDA 12.9+ registers one family cubin per variant.
-    flash_kda_targets: tuple[tuple[FlashKDATarget, bool], ...] = (
+    # Register the physical source-closed portfolio independently for each
+    # exact Blackwell target. Each JitSpec contains one generated selector TU.
+    # The checkpoint route remains as the only legacy fallback because it is
+    # intentionally outside the generated portfolio.
+    flash_kda_targets: tuple[tuple[GeneratedFlashKDATarget, bool], ...] = (
         ("sm100a", has_flash_kda_prefill_sm100a),
-        ("sm100f", has_flash_kda_prefill_sm100f),
+        ("sm103a", has_flash_kda_prefill_sm103a),
     )
     for flash_kda_target, enabled in flash_kda_targets:
         if enabled:
             jit_specs.extend(
-                [
-                    gen_flash_kda_m64_module(flash_kda_target),
-                    gen_flash_kda_m128_module(flash_kda_target),
-                    gen_flash_kda_m128_tensor_state_decay_module(flash_kda_target),
-                    gen_flash_kda_m128_h12_short_module(flash_kda_target),
-                    gen_flash_kda_m128_h12_long_module(flash_kda_target),
-                    gen_flash_kda_m128_n16_module(flash_kda_target),
-                    gen_flash_kda_m128_n16_checkpoint_module(flash_kda_target),
-                    gen_flash_kda_m128_n16_short_module(flash_kda_target),
-                    gen_flash_kda_piece_persistent_m128_module(flash_kda_target),
-                    gen_flash_kda_small_bh_m128_module(flash_kda_target),
-                    gen_flash_kda_bt16_prepare_module(flash_kda_target),
-                    gen_flash_kda_bt16_prepare_beta_tma_module(flash_kda_target),
-                    gen_flash_kda_bt16_chain_m64_s7_module(flash_kda_target),
-                    gen_flash_kda_bt16_chain_m64_s8_module(flash_kda_target),
-                    gen_flash_kda_bt16_chain_m64_s9_module(flash_kda_target),
-                    gen_flash_kda_bt16_prepare_chain_m64_s8_module(flash_kda_target),
-                ]
+                gen_flash_kda_generated_module(variant_id)
+                for variant_id in get_flash_kda_generated_variant_ids(flash_kda_target)
             )
-            jit_specs.append(gen_flash_kda_persistent_m128_module(flash_kda_target))
+            jit_specs.append(gen_flash_kda_m128_n16_checkpoint_module(flash_kda_target))
 
     # CUDA 12.8 predates the SM100-family target, so B200 keeps one exact
     # SM100a module for every frozen body. CUDA 12.9+ builds the 23-body
@@ -1135,10 +1107,10 @@ def detect_sm_capabilities():
         ),
         "flash_kda_prefill_sm100a": (
             (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
-            and Version("12.8") <= cuda_version < Version("12.9")
+            and cuda_version >= Version("12.8")
         ),
-        "flash_kda_prefill_sm100f": (
-            bool(flash_kda_family_arches & compilation_context.TARGET_CUDA_ARCHS)
+        "flash_kda_prefill_sm103a": (
+            (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
             and cuda_version >= Version("12.9")
         ),
         "sm100f": has_sm("compute_100", "12.9"),

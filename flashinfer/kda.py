@@ -393,7 +393,16 @@ def recurrent_kda(
             )
 
     use_flash_kda_prefill = (
-        backend != "cute-dsl"
+        not (
+            initial_state is not None
+            and initial_state.dtype == torch.float32
+            and (
+                checkpoint_every_n_tokens != 0
+                or state_checkpoints is not None
+                or checkpoint_cu_starts is not None
+            )
+        )
+        and backend != "cute-dsl"
         and _kda_prefill._flash_kda_prefill_is_eligible(
             q=q,
             k=k,
@@ -419,6 +428,18 @@ def recurrent_kda(
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         )
     )
+    if (
+        backend in ("auto", "cake")
+        and is_plain_prefill
+        and initial_state is not None
+        and initial_state.dtype == torch.float32
+        and (
+            checkpoint_every_n_tokens != 0
+            or state_checkpoints is not None
+            or checkpoint_cu_starts is not None
+        )
+    ):
+        raise ValueError("FP32 state checkpoints are not supported by Cake prefill")
     if use_flash_kda_prefill:
         assert A_log is not None
         assert dt_bias is not None

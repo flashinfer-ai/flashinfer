@@ -538,6 +538,7 @@ def _make_inputs(
     num_heads: int,
     packed: bool,
     initial_state: bool = False,
+    state_dtype: torch.dtype = torch.bfloat16,
     seed: int = 0,
 ):
     torch.manual_seed(seed)
@@ -575,7 +576,7 @@ def _make_inputs(
                 dtype=torch.float32,
                 device="cuda",
             )
-        ).to(torch.bfloat16)
+        ).to(state_dtype)
     return {
         "q": q,
         "k": k,
@@ -823,9 +824,9 @@ def flash_kda_device(cuda_device):
     ("compute_capability", "cuda_version", "expected_target", "error_match"),
     [
         ((10, 0), "12.8", "sm100a", None),
-        ((10, 0), "12.9", "sm100f", None),
+        ((10, 0), "12.9", "sm100a", None),
         ((10, 3), "12.8", None, "10.3 requires CUDA 12.9"),
-        ((10, 3), "12.9", "sm100f", None),
+        ((10, 3), "12.9", "sm103a", None),
         ((12, 0), "13.0", None, "requires compute capability 10.0"),
         ((10, 0), "12.7", None, "10.0 requires CUDA 12.8"),
     ],
@@ -877,6 +878,379 @@ def test_flash_kda_sm_count_is_cached_per_device(monkeypatch):
         assert calls == [torch.device("cuda:0"), torch.device("cuda:1")]
     finally:
         kda_prefill_api._flash_kda_device_sm_count.cache_clear()
+
+
+def _make_padded_state_pool(*, slots, num_heads, dtype, device):
+    slot_numel = num_heads * 128 * 128
+    storage = torch.empty(
+        (slots, slot_numel + 64),
+        dtype=dtype,
+        device=device,
+    )
+    return storage.as_strided(
+        (slots, num_heads, 128, 128),
+        (storage.stride(0), 128 * 128, 128, 1),
+    )
+
+
+def _frozen_prefill_eligibility_kwargs(inputs, *, output, state_indices=None):
+    return {
+        "q": inputs["q"],
+        "k": inputs["k"],
+        "v": inputs["v"],
+        "g": inputs["g"],
+        "beta": inputs["beta"],
+        "A_log": inputs["A_log"],
+        "dt_bias": inputs["dt_bias"],
+        "initial_state": inputs["initial_state"],
+        "use_qk_l2norm_in_kernel": True,
+        "use_gate_in_kernel": True,
+        "lower_bound": -5.0,
+        "cu_seqlens": inputs["cu_seqlens"],
+        "ssm_state_indices": state_indices,
+        "num_spec_tokens": None,
+        "num_accepted_tokens": None,
+        "output": output,
+        "initial_state_source": None,
+        "initial_state_indices": None,
+        "beta_is_logit": True,
+        "state_checkpoints": None,
+        "checkpoint_cu_starts": None,
+        "checkpoint_every_n_tokens": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("state_dtype", "state_mode"),
+    [
+        (torch.bfloat16, "compact"),
+        (torch.bfloat16, "indexed"),
+        (torch.float32, "indexed"),
+    ],
+)
+@pytest.mark.parametrize("packed", [False, True], ids=["fixed", "packed"])
+@pytest.mark.parametrize("num_heads", [6, 12], ids=["h6", "h12"])
+def test_frozen_prefill_state_pool_eligibility_accepts_supported_contracts(
+    flash_kda_device,
+    state_dtype,
+    state_mode,
+    packed,
+    num_heads,
+):
+    seq_lens = [17, 33] if packed else [33, 33]
+    inputs = _make_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        packed=packed,
+        initial_state=True,
+        state_dtype=state_dtype,
+        seed=23_000 + num_heads + int(packed),
+    )
+    compact_seed = inputs["initial_state"]
+    state_indices = None
+    if state_mode == "compact":
+        state_pool = _make_padded_state_pool(
+            slots=len(seq_lens),
+            num_heads=num_heads,
+            dtype=state_dtype,
+            device=flash_kda_device,
+        )
+        state_pool.copy_(compact_seed)
+    else:
+        state_indices = torch.tensor([3, 1], dtype=torch.int32, device=flash_kda_device)
+        state_pool = _make_padded_state_pool(
+            slots=5,
+            num_heads=num_heads,
+            dtype=state_dtype,
+            device=flash_kda_device,
+        )
+        state_pool.index_copy_(0, state_indices.to(torch.int64), compact_seed)
+    inputs["initial_state"] = state_pool
+
+    assert kda_prefill_api._flash_kda_prefill_is_eligible(
+        **_frozen_prefill_eligibility_kwargs(
+            inputs,
+            output=torch.empty_like(inputs["q"]),
+            state_indices=state_indices,
+        )
+    )
+
+
+def test_frozen_prefill_state_pool_eligibility_rejects_compact_fp32_state(
+    flash_kda_device,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=23_058,
+    )
+
+    eligibility_kwargs = _frozen_prefill_eligibility_kwargs(
+        inputs,
+        output=torch.empty_like(inputs["q"]),
+    )
+    assert not kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility_kwargs)
+    with pytest.raises(ValueError, match="backend='cake' does not support"):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=eligibility_kwargs["output"],
+            output_final_state=True,
+            backend="cake",
+        )
+
+
+@pytest.mark.parametrize(
+    "invalid_contract",
+    [
+        "state_dtype",
+        "state_inner_stride",
+        "compact_slot_count",
+        "index_dtype",
+        "index_length",
+        "index_contiguity",
+        "index_without_state",
+    ],
+)
+def test_frozen_prefill_state_pool_eligibility_rejects_invalid_contracts(
+    flash_kda_device,
+    invalid_contract,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        seed=23_106,
+    )
+    state_indices = None
+    if invalid_contract == "state_dtype":
+        inputs["initial_state"] = inputs["initial_state"].to(torch.float16)
+    elif invalid_contract == "state_inner_stride":
+        inputs["initial_state"] = inputs["initial_state"].transpose(-1, -2)
+    elif invalid_contract == "compact_slot_count":
+        inputs["initial_state"] = _make_padded_state_pool(
+            slots=3,
+            num_heads=6,
+            dtype=torch.bfloat16,
+            device=flash_kda_device,
+        )
+    elif invalid_contract == "index_without_state":
+        inputs["initial_state"] = None
+        state_indices = torch.tensor([3, 1], dtype=torch.int32, device=flash_kda_device)
+    else:
+        state_pool = _make_padded_state_pool(
+            slots=5,
+            num_heads=6,
+            dtype=torch.bfloat16,
+            device=flash_kda_device,
+        )
+        inputs["initial_state"] = state_pool
+        if invalid_contract == "index_dtype":
+            state_indices = torch.tensor(
+                [3, 1], dtype=torch.int64, device=flash_kda_device
+            )
+        elif invalid_contract == "index_length":
+            state_indices = torch.tensor(
+                [3], dtype=torch.int32, device=flash_kda_device
+            )
+        else:
+            state_indices = torch.tensor(
+                [3, 0, 1, 0], dtype=torch.int32, device=flash_kda_device
+            )[::2]
+            assert not state_indices.is_contiguous()
+
+    eligibility_kwargs = _frozen_prefill_eligibility_kwargs(
+        inputs,
+        output=torch.empty_like(inputs["q"]),
+        state_indices=state_indices,
+    )
+    assert not kda_prefill_api._flash_kda_prefill_is_eligible(**eligibility_kwargs)
+    with pytest.raises(ValueError, match="backend='cake' does not support"):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            ssm_state_indices=state_indices,
+            output=eligibility_kwargs["output"],
+            backend="cake",
+        )
+
+
+def test_frozen_prefill_auto_falls_back_only_when_state_contract_is_ineligible(
+    flash_kda_device,
+    monkeypatch,
+):
+    inputs = _make_inputs(
+        seq_lens=[17, 33],
+        num_heads=6,
+        packed=True,
+        initial_state=True,
+        seed=23_206,
+    )
+    inputs["initial_state"] = inputs["initial_state"].to(torch.float16)
+    sentinel = (object(), object())
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_run_flash_kda_prefill",
+        lambda **kwargs: pytest.fail("an ineligible state must not enter Cake prefill"),
+    )
+    monkeypatch.setattr(kda_decode_api, "_run_recurrent_kda", lambda **kwargs: sentinel)
+
+    assert recurrent_kda(**_strict_prefill_kwargs(inputs)) is sentinel
+
+
+@pytest.mark.parametrize("backend", ["auto", "cake"])
+def test_frozen_prefill_missing_selected_module_is_fail_closed(
+    flash_kda_device,
+    monkeypatch,
+    backend,
+):
+    inputs = _make_inputs(
+        seq_lens=[33, 33],
+        num_heads=6,
+        packed=False,
+        initial_state=True,
+        seed=23_306,
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_prefill_eligible",
+        lambda **kwargs: False,
+    )
+    monkeypatch.setattr(
+        kda_decode_api,
+        "_run_recurrent_kda",
+        lambda **kwargs: pytest.fail("an eligible Cake route must not fall back"),
+    )
+
+    def missing_module(variant, target):
+        raise FileNotFoundError(
+            f"selected generated module is not materialized: {variant}/{target}"
+        )
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        missing_module,
+    )
+
+    with pytest.raises(FileNotFoundError, match="not materialized"):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=torch.empty_like(inputs["q"]),
+            output_final_state=True,
+            backend=backend,
+        )
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["fixed", "packed"])
+@pytest.mark.parametrize("num_heads", [6, 12], ids=["h6", "h12"])
+def test_frozen_prefill_compact_and_indexed_state_contracts_match(
+    flash_kda_device,
+    packed,
+    num_heads,
+):
+    """Selected pool slots must behave exactly like compact in-place state.
+
+    This is deliberately a public-API contract test.  It does not name a
+    private launcher class or freeze a route that may legitimately differ by
+    physical Blackwell SKU.  The route/source receipt tests separately pin the
+    selected physical module.
+    """
+
+    seq_lens = [17, 33] if packed else [33, 33]
+    inputs = _make_inputs(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        packed=packed,
+        initial_state=True,
+        state_dtype=torch.bfloat16,
+        seed=24_000 + num_heads + int(packed),
+    )
+    state_seed = inputs.pop("initial_state")
+    compact_state = state_seed.clone()
+    compact_output, compact_final = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": compact_state}),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    state_indices = torch.tensor([3, 1], dtype=torch.int32, device=flash_kda_device)
+    indexed_state = (
+        0.1
+        * torch.randn(
+            (5, num_heads, 128, 128),
+            dtype=torch.float32,
+            device=flash_kda_device,
+        )
+    ).to(torch.bfloat16)
+    indexed_state.index_copy_(0, state_indices.to(torch.int64), state_seed)
+    indexed_state_before = indexed_state.clone()
+    indexed_output, indexed_final = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": indexed_state}),
+        ssm_state_indices=state_indices,
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        backend="cake",
+    )
+
+    assert compact_final is compact_state
+    assert indexed_final is indexed_state
+    assert compact_final.dtype == indexed_final.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        indexed_output.float(), compact_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        indexed_state.index_select(0, state_indices.to(torch.int64)).float(),
+        compact_final.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    unselected = torch.tensor([0, 2, 4], dtype=torch.int64, device=flash_kda_device)
+    assert torch.equal(
+        indexed_state.index_select(0, unselected),
+        indexed_state_before.index_select(0, unselected),
+    )
+
+
+def test_frozen_prefill_rejects_fp32_state_checkpoints_explicitly(
+    flash_kda_device,
+):
+    inputs = _make_inputs(
+        seq_lens=[32],
+        num_heads=6,
+        packed=False,
+        initial_state=True,
+        state_dtype=torch.float32,
+        seed=24_106,
+    )
+    checkpoints = torch.empty(
+        (1, 6, 128, 128), dtype=torch.float32, device=flash_kda_device
+    )
+    checkpoint_cu_starts = torch.tensor(
+        [0, 1], dtype=torch.int64, device=flash_kda_device
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"(?i)(fp32.*checkpoint|checkpoint.*fp32)",
+    ):
+        recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=torch.empty_like(inputs["q"]),
+            output_final_state=True,
+            state_checkpoints=checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=32,
+            backend="cake",
+        )
 
 
 def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
@@ -949,6 +1323,295 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
         )
         is None
     )
+
+
+@pytest.mark.parametrize(
+    ("route", "route_role", "state_mode", "specialization", "abi_family"),
+    (
+        (
+            "direct_m128",
+            "main",
+            "bf16",
+            {
+                "chunk": 32,
+                "serving_native_abi": False,
+                "unbounded_softplus": False,
+                "checkpoint_tma": False,
+                "pair_packed_beta": False,
+                "scalar_beta": False,
+                "early_n32_state_pack": False,
+                "generic_register_inverse": False,
+                "n32_prediction_first": False,
+                "tensor_state_decay": False,
+                "state_dtype_is_fp32": False,
+                "n32_ft_slab": False,
+                "pdl_wait_initial_state_f32": False,
+                "pdl_publish_final_state": False,
+                "affine_main_indexed_initial": False,
+            },
+            "direct_m128",
+        ),
+        (
+            "source599_vtile_m128",
+            "main",
+            "bf16",
+            {
+                "full_n32_chunks": True,
+                "num_heads": 96,
+                "use_initial_state": True,
+                "store_final_state": True,
+                "scale": 0.08838834764831845,
+                "lower_bound": -5.0,
+                "persistent_mode": True,
+                "persistent_six_task_schedule": True,
+                "persistent_stride_head_aligned": False,
+                "state_dtype_is_fp32": False,
+            },
+            "vtile_m128",
+        ),
+        (
+            "bt16_prepare_chain_m64",
+            "bt16_prepare",
+            "none",
+            {},
+            "bt16_prepare",
+        ),
+        (
+            "bt16_prepare_chain_m64",
+            "main",
+            "bf16",
+            {
+                "bt16_stage_count": 8,
+                "state_dtype_is_fp32": False,
+                "serving_native_abi": False,
+            },
+            "bt16_chain",
+        ),
+        (
+            "independent_dvsplit_m64",
+            "main",
+            "bf16",
+            {
+                "full_n32_chunks": True,
+                "num_heads": 64,
+                "use_initial_state": True,
+                "store_final_state": True,
+                "scale": 0.08838834764831845,
+                "lower_bound": -5.0,
+                "state_dtype_is_fp32": False,
+            },
+            "m64",
+        ),
+        (
+            "scalar_chunk_lpt_m128",
+            "main",
+            "bf16",
+            {
+                "num_heads": 96,
+                "use_initial_state": True,
+                "store_final_state": True,
+                "scale": 0.08838834764831845,
+                "lower_bound": -5.0,
+                "persistent_schedule": True,
+                "state_dtype_is_fp32": False,
+            },
+            "scalar_lpt_m128",
+        ),
+        (
+            "piece_persistent_m128",
+            "main",
+            "fp32",
+            {"piece_tasks": True, "state_dtype_is_fp32": True},
+            "taskized_persistent_m128",
+        ),
+        (
+            "small_bh_owner_helper_m128",
+            "main",
+            "fp32",
+            {"serving_native_abi": True, "state_dtype_is_fp32": True},
+            "small_bh_m128",
+        ),
+        (
+            "affine_split_m128",
+            "affine_scan",
+            "none",
+            {"use_pdl": True},
+            "affine_scan",
+        ),
+    ),
+)
+def test_generated_prefill_selector_key_uses_receipt_field_order(
+    route, route_role, state_mode, specialization, abi_family
+):
+    selector_key = kda_prefill_api._make_flash_kda_generated_selector_key(
+        target="sm103a",
+        route=route,
+        route_role=route_role,
+        state_mode=state_mode,
+        family_specialization=specialization,
+    )
+    assert selector_key["arch"] == "sm_103a"
+    assert selector_key["route"] == route
+    assert selector_key["route_role"] == route_role
+    assert selector_key["abi_family"] == abi_family
+    assert selector_key["state_mode"] == state_mode
+    assert selector_key["family_specialization_vector"] == [
+        [field, specialization[field]]
+        for field in kda_prefill_api._FLASH_KDA_GENERATED_SPECIALIZATION_FIELDS[
+            abi_family
+        ]
+    ]
+
+
+def test_generated_prefill_selector_key_fails_closed():
+    direct_specialization = {
+        field: False
+        for field in kda_prefill_api._FLASH_KDA_GENERATED_SPECIALIZATION_FIELDS[
+            "direct_m128"
+        ]
+    }
+    direct_specialization["chunk"] = 32
+    with pytest.raises(ValueError, match="no exact architecture"):
+        kda_prefill_api._make_flash_kda_generated_selector_key(
+            target="sm100f",
+            route="direct_m128",
+            route_role="main",
+            state_mode="bf16",
+            family_specialization=direct_specialization,
+        )
+    with pytest.raises(ValueError, match="no receipt-backed ABI family"):
+        kda_prefill_api._make_flash_kda_generated_selector_key(
+            target="sm100a",
+            route="benchmark_shape_0",
+            route_role="main",
+            state_mode="bf16",
+            family_specialization={},
+        )
+    with pytest.raises(ValueError, match="specialization fields differ"):
+        kda_prefill_api._make_flash_kda_generated_selector_key(
+            target="sm100a",
+            route="direct_m128",
+            route_role="main",
+            state_mode="bf16",
+            family_specialization={"chunk": 32},
+        )
+    with pytest.raises(ValueError, match="requires state_mode=none"):
+        kda_prefill_api._make_flash_kda_generated_selector_key(
+            target="sm100a",
+            route="bt16_prepare_chain_m64",
+            route_role="bt16_prepare",
+            state_mode="bf16",
+            family_specialization={},
+        )
+
+
+def test_generated_prefill_runtime_specialization_helpers():
+    assert not kda_prefill_api._flash_kda_generated_serving_native_abi(
+        use_state_indices=False,
+        checkpoint_every_n_tokens=0,
+        beta_token_stride=64,
+        num_heads=64,
+        state_slot_stride=64 * 128 * 128,
+    )
+    assert kda_prefill_api._flash_kda_generated_serving_native_abi(
+        use_state_indices=True,
+        checkpoint_every_n_tokens=0,
+        beta_token_stride=64,
+        num_heads=64,
+        state_slot_stride=64 * 128 * 128,
+    )
+    assert (
+        kda_prefill_api._flash_kda_generated_bt16_stage_count(
+            total_tasks=96, sm_count=148, use_beta_tma=False
+        )
+        == 7
+    )
+    assert (
+        kda_prefill_api._flash_kda_generated_bt16_stage_count(
+            total_tasks=8, sm_count=148, use_beta_tma=False
+        )
+        == 9
+    )
+    assert (
+        kda_prefill_api._flash_kda_generated_bt16_stage_count(
+            total_tasks=64, sm_count=148, use_beta_tma=False
+        )
+        == 8
+    )
+    assert kda_prefill_api._flash_kda_generated_full_n32_chunks((32, 64))
+    assert not kda_prefill_api._flash_kda_generated_full_n32_chunks((32, 63))
+
+    direct = kda_prefill_api._flash_kda_generated_direct_specialization(
+        target="sm103a",
+        route="direct_m128",
+        num_heads=96,
+        num_sequences=1,
+        uniform_sequences=True,
+        max_sequence_length=512,
+        serving_native_abi=False,
+        unbounded_softplus=False,
+        checkpoint_every_n_tokens=0,
+        pair_packed_beta=False,
+        state_dtype_is_fp32=False,
+    )
+    assert direct["chunk"] == 32
+    assert direct["generic_register_inverse"]
+    assert direct["n32_prediction_first"]
+    assert direct["tensor_state_decay"]
+
+    vtile = kda_prefill_api._flash_kda_generated_vtile_specialization(
+        sequence_lengths=(512,) * 8,
+        num_heads=96,
+        fixed_layout=False,
+        use_initial_state=True,
+        store_final_state=True,
+        scale=0.08838834764831845,
+        lower_bound=-5.0,
+        state_dtype_is_fp32=False,
+    )
+    assert vtile["full_n32_chunks"]
+    assert vtile["persistent_mode"]
+    assert vtile["persistent_six_task_schedule"]
+    assert not vtile["persistent_stride_head_aligned"]
+
+    assert kda_prefill_api._flash_kda_generated_bt16_prepare_specialization() == {}
+    assert kda_prefill_api._flash_kda_generated_bt16_chain_specialization(
+        total_tasks=64,
+        sm_count=148,
+        use_beta_tma=False,
+        state_dtype_is_fp32=False,
+        serving_native_abi=False,
+    ) == {
+        "bt16_stage_count": 8,
+        "state_dtype_is_fp32": False,
+        "serving_native_abi": False,
+    }
+    assert kda_prefill_api._flash_kda_generated_m64_specialization(
+        sequence_lengths=(512,),
+        num_heads=64,
+        use_initial_state=True,
+        store_final_state=True,
+        scale=0.08838834764831845,
+        lower_bound=-5.0,
+        state_dtype_is_fp32=False,
+    )["full_n32_chunks"]
+    assert kda_prefill_api._flash_kda_generated_scalar_lpt_specialization(
+        num_heads=96,
+        use_initial_state=True,
+        store_final_state=True,
+        scale=0.08838834764831845,
+        lower_bound=-5.0,
+        state_dtype_is_fp32=True,
+    )["persistent_schedule"]
+    assert kda_prefill_api._flash_kda_generated_taskized_persistent_specialization(
+        piece_tasks=True, state_dtype_is_fp32=False
+    ) == {"piece_tasks": True, "state_dtype_is_fp32": False}
+    assert kda_prefill_api._flash_kda_generated_small_bh_specialization(
+        serving_native_abi=True, state_dtype_is_fp32=True
+    ) == {"serving_native_abi": True, "state_dtype_is_fp32": True}
+    assert kda_prefill_api._flash_kda_generated_affine_scan_specialization() == {
+        "use_pdl": True
+    }
 
 
 @pytest.mark.parametrize(
@@ -1636,7 +2299,7 @@ def test_multi_token_gqa_stays_on_existing_backend(cuda_device, monkeypatch):
 )
 @pytest.mark.parametrize(
     ("compute_capability", "expected_target"),
-    [((10, 0), "sm100f"), ((10, 3), "sm100f")],
+    [((10, 0), "sm100a"), ((10, 3), "sm103a")],
 )
 def test_frozen_route_and_ffi_abi(
     cuda_device,
@@ -1771,7 +2434,7 @@ def test_h12_n32_specializations_reach_ffi(
         backend="cake",
     )
 
-    assert routes == [(expected_variant, "sm100f")]
+    assert routes == [(expected_variant, "sm103a")]
     (args,) = module.calls
     assert len(args) == 28
     assert tuple(args[5].shape) == expected_beta_tma_shape
@@ -1807,7 +2470,7 @@ def test_sm103_uniform_n32_tensor_state_decay_reaches_m128_ffi(
         backend="cake",
     )
 
-    assert routes == [("m128_tensor_state_decay", "sm100f")]
+    assert routes == [("m128_tensor_state_decay", "sm103a")]
     assert len(module.calls[0]) == 28
 
 
@@ -2058,7 +2721,7 @@ def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
     )
     assert output.shape == inputs["q"].shape
     assert state is None
-    assert routes == [("persistent_m128", "sm100f")]
+    assert routes == [("persistent_m128", "sm100a")]
     (args,) = module.calls
     assert len(args) == 23
     assert args[9].tolist() == [0, 1]
@@ -2128,7 +2791,7 @@ def test_uniform_piece_prefill_reaches_extended_worker_abi(
 
     assert output.shape == inputs["q"].shape
     assert state is None
-    assert routes == [("piece_persistent_m128", "sm100f")]
+    assert routes == [("piece_persistent_m128", "sm103a")]
     (args,) = module.calls
     assert len(args) == 29
     assert args[9].tolist() == list(range(8))
@@ -2191,7 +2854,7 @@ def test_explicit_workspace_keeps_uniform_piece_candidate_on_direct_abi(
         backend="cake",
     )
 
-    assert routes == [("m128", "sm100f")]
+    assert routes == [("m128", "sm103a")]
     assert len(module.calls[0]) == 28
 
 
@@ -2315,7 +2978,7 @@ def test_explicit_seq_order_keeps_direct_worker_and_reaches_ffi(
         backend="cake",
     )
 
-    assert routes == [("m128", "sm100f")]
+    assert routes == [("m128", "sm100a")]
     (args,) = module.calls
     assert len(args) == 28
     assert args[9].data_ptr() == seq_order.data_ptr()
@@ -2357,20 +3020,21 @@ def test_b200_prefill_without_initial_state_stays_direct(cuda_device, monkeypatc
         output=torch.empty_like(inputs["q"]),
         backend="cake",
     )
-    assert routes == [("m128_n16_short", "sm100f")]
+    assert routes == [("m128_n16_short", "sm100a")]
     (args,) = module.calls
     assert args[9].tolist() == [0, 1]
 
 
 @pytest.mark.parametrize(
-    ("compute_capability", "sm_count"),
-    [((10, 0), 148), ((10, 3), 152)],
+    ("compute_capability", "sm_count", "expected_target"),
+    [((10, 0), 148, "sm100a"), ((10, 3), 152, "sm103a")],
 )
 def test_fixed_small_bh_prefill_reaches_owner_helper_abi(
     cuda_device,
     monkeypatch,
     compute_capability,
     sm_count,
+    expected_target,
 ):
     monkeypatch.setattr(
         kda_prefill_api,
@@ -2411,7 +3075,7 @@ def test_fixed_small_bh_prefill_reaches_owner_helper_abi(
     assert output.shape == inputs["q"].shape
     assert state is not None
     assert torch.all(state == 0.5)
-    assert routes == [("small_bh_m128", "sm100f")]
+    assert routes == [("small_bh_m128", expected_target)]
     (args,) = module.calls
     assert len(args) == 25
     assert args[13].dtype == torch.uint8
@@ -2606,7 +3270,7 @@ def test_strided_beta_indexed_state_and_checkpoints_reach_native_ffi(
     assert output.shape == inputs["q"].shape
     assert returned_state is state_pool
     assert returned_checkpoints is state_checkpoints
-    assert routes == [("m128_n16_checkpoint", "sm100f")]
+    assert routes == [("m128_n16_checkpoint", "sm100a")]
     (args,) = module.calls
     assert len(args) == 28
     assert args[4].data_ptr() == inputs["beta"].data_ptr()
