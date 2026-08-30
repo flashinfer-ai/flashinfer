@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
@@ -128,11 +129,13 @@ kernel_cake_fmha_decode_quant_fp8_reduce(float* __restrict__ partial_O, float* _
     out_quad[3] = out_pair1[1];
     {
         unsigned int _fp8_pk[1];
-        { unsigned short _lo, _hi;
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_lo) : "f"(out_quad[0 + 1]), "f"(out_quad[0 + 0]));
-            asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_hi) : "f"(out_quad[0 + 3]), "f"(out_quad[0 + 2]));
-            _fp8_pk[0] = (unsigned)_lo | ((unsigned)_hi << 16);
-        }
+        asm("{\n\t"
+            ".reg .b16 _lo, _hi;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+            "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+            "mov.b32 %0, {_lo, _hi};\n\t"
+            "}\n"
+            : "=r"(_fp8_pk[0]) : "f"(out_quad[0 + 0]), "f"(out_quad[0 + 1]), "f"(out_quad[0 + 2]), "f"(out_quad[0 + 3]));
         *reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned char*>(O + o_off) + (0)) = *reinterpret_cast<unsigned int*>(_fp8_pk);
     }
 }

@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
@@ -99,7 +100,7 @@ __device__ __forceinline__ uint32_t elect_sync() {
 
 __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-        :: "r"(mbar_addr), "r"(count));
+        :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
 
@@ -131,19 +132,21 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
     return token;
 }
 
+// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
+// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
+// explicit loop still makes this helper blocking until acquire succeeds.
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    uint32_t ticks = 0x989680;
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
         "LAB_WAIT:\n\t"
         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
+        " P1, [%0], %1;\n\t"
         "@P1 bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
         "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
+        :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
 __device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
@@ -369,11 +372,11 @@ __device__ __forceinline__ void row_max_x32_accum(const float* sv, float2& acc) 
 }
 
 
-__device__ __forceinline__ void ex2_emulation_f32x2(float* x0_ptr, float* x1_ptr) {
+__device__ __forceinline__ float2 ex2_emulation_f32x2_value(float2 value) {
     const float c0 = 1.0f, c1 = 0.695146143436431884765625f;
     const float c2 = 0.227564394474029541015625f, c3 = 0.077119089663028717041015625f;
     const float magic = 12582912.0f;
-    float x0 = max_noftz(*x0_ptr, -127.0f), x1 = max_noftz(*x1_ptr, -127.0f);
+    float x0 = max_noftz(value.x, -127.0f), x1 = max_noftz(value.y, -127.0f);
     float2 xc2 = make_float2(x0, x1), magic2 = make_float2(magic, magic);
     float2 xr2;
     asm("add.rm.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&xr2)
@@ -398,7 +401,12 @@ __device__ __forceinline__ void ex2_emulation_f32x2(float* x0_ptr, float* x1_ptr
     float r0, r1;
     asm("mov.b32 %0, %1;" : "=f"(r0) : "r"((x0r_i << 23) + p0_i));
     asm("mov.b32 %0, %1;" : "=f"(r1) : "r"((x1r_i << 23) + p1_i));
-    *x0_ptr = r0; *x1_ptr = r1;
+    return make_float2(r0, r1);
+}
+
+__device__ __forceinline__ void ex2_emulation_f32x2(float* x0_ptr, float* x1_ptr) {
+    float2 result = ex2_emulation_f32x2_value(make_float2(*x0_ptr, *x1_ptr));
+    *x0_ptr = result.x; *x1_ptr = result.y;
 }
 
 __device__ __forceinline__ void softmax_frag_exp2_cast(
@@ -486,6 +494,15 @@ __device__ __forceinline__ void fma_scale_x32(
 __device__ __forceinline__ float2 fma_f32x2(float2 a, float2 b, float2 c) {
     float2 r;
     asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
+        : "=l"(*(unsigned long long*)&r)
+        : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
+          "l"(*(unsigned long long*)&c));
+    return r;
+}
+
+__device__ __forceinline__ float2 fma_f32x2_noftz(float2 a, float2 b, float2 c) {
+    float2 r;
+    asm("fma.rn.f32x2 %0, %1, %2, %3;"
         : "=l"(*(unsigned long long*)&r)
         : "l"(*(unsigned long long*)&a), "l"(*(unsigned long long*)&b),
           "l"(*(unsigned long long*)&c));
@@ -596,6 +613,23 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+    const int mbar_base = smem;
+    #define q_full_addr (mbar_base + 0)
+    #define kv_full_addr (mbar_base + 16)
+    #define kv_empty_addr (mbar_base + 40)
+    #define s_full_addr (mbar_base + 64)
+    #define p_full_addr (mbar_base + 80)
+    #define p_full_2_addr (mbar_base + 96)
+    #define corr_sig_addr (mbar_base + 112)
+    #define corr_done_addr (mbar_base + 128)
+    #define order_p01_0_addr (mbar_base + 144)
+    #define order_p01_1_addr (mbar_base + 152)
+    #define o_full_addr (mbar_base + 160)
+    #define q_empty_addr (mbar_base + 176)
+    #define page_full_addr (mbar_base + 184)
+    #define page_empty_addr (mbar_base + 232)
+    #define work_id_full_addr (mbar_base + 280)
+    #define work_id_empty_addr (mbar_base + 288)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -684,7 +718,7 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
             mbarrier_init(smem + 280, 1);
             // work_id_empty: 1 barriers, init_count=15
             mbarrier_init(smem + 288, 15);
-            asm volatile("fence.mbarrier_init.release.cluster;");
+            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
@@ -701,23 +735,6 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;");
 
-    const int mbar_base = smem;
-    #define q_full_addr (mbar_base + 0)
-    #define kv_full_addr (mbar_base + 16)
-    #define kv_empty_addr (mbar_base + 40)
-    #define s_full_addr (mbar_base + 64)
-    #define p_full_addr (mbar_base + 80)
-    #define p_full_2_addr (mbar_base + 96)
-    #define corr_sig_addr (mbar_base + 112)
-    #define corr_done_addr (mbar_base + 128)
-    #define order_p01_0_addr (mbar_base + 144)
-    #define order_p01_1_addr (mbar_base + 152)
-    #define o_full_addr (mbar_base + 160)
-    #define q_empty_addr (mbar_base + 176)
-    #define page_full_addr (mbar_base + 184)
-    #define page_empty_addr (mbar_base + 232)
-    #define work_id_full_addr (mbar_base + 280)
-    #define work_id_empty_addr (mbar_base + 288)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
@@ -728,7 +745,7 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
     const int tmem_output_0 = taddr + 256;
     const int tmem_output_1 = taddr + 384;
 
-    // ---- Register redistribution for WGs split across roles ----
+    // ---- Ordered hardware-WG register redistribution ----
     // Dec phase frees registers before any WG attempts inc.
     if (warp >= 12 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
@@ -783,10 +800,26 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     _phase_s_full ^= 1;
                     int s_base = taddr + (unsigned int)tmem_s_off + (unsigned int)(warp % 4 * 32 << 16);
                     float _tmem_load_0[128];
-                    tmem_ld_x32(&_tmem_load_0[0], s_base);
-                    tmem_ld_x32(&_tmem_load_0[32], s_base + 32);
-                    tmem_ld_x32(&_tmem_load_0[64], s_base + 64);
-                    tmem_ld_x32(&_tmem_load_0[96], s_base + 96);
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_0[0]), "=f"(_tmem_load_0[1]), "=f"(_tmem_load_0[2]), "=f"(_tmem_load_0[3]), "=f"(_tmem_load_0[4]), "=f"(_tmem_load_0[5]), "=f"(_tmem_load_0[6]), "=f"(_tmem_load_0[7]), "=f"(_tmem_load_0[8]), "=f"(_tmem_load_0[9]), "=f"(_tmem_load_0[10]), "=f"(_tmem_load_0[11]), "=f"(_tmem_load_0[12]), "=f"(_tmem_load_0[13]), "=f"(_tmem_load_0[14]), "=f"(_tmem_load_0[15]), "=f"(_tmem_load_0[16]), "=f"(_tmem_load_0[17]), "=f"(_tmem_load_0[18]), "=f"(_tmem_load_0[19]), "=f"(_tmem_load_0[20]), "=f"(_tmem_load_0[21]), "=f"(_tmem_load_0[22]), "=f"(_tmem_load_0[23]), "=f"(_tmem_load_0[24]), "=f"(_tmem_load_0[25]), "=f"(_tmem_load_0[26]), "=f"(_tmem_load_0[27]), "=f"(_tmem_load_0[28]), "=f"(_tmem_load_0[29]), "=f"(_tmem_load_0[30]), "=f"(_tmem_load_0[31])
+                        : "r"(s_base));
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_0[32]), "=f"(_tmem_load_0[33]), "=f"(_tmem_load_0[34]), "=f"(_tmem_load_0[35]), "=f"(_tmem_load_0[36]), "=f"(_tmem_load_0[37]), "=f"(_tmem_load_0[38]), "=f"(_tmem_load_0[39]), "=f"(_tmem_load_0[40]), "=f"(_tmem_load_0[41]), "=f"(_tmem_load_0[42]), "=f"(_tmem_load_0[43]), "=f"(_tmem_load_0[44]), "=f"(_tmem_load_0[45]), "=f"(_tmem_load_0[46]), "=f"(_tmem_load_0[47]), "=f"(_tmem_load_0[48]), "=f"(_tmem_load_0[49]), "=f"(_tmem_load_0[50]), "=f"(_tmem_load_0[51]), "=f"(_tmem_load_0[52]), "=f"(_tmem_load_0[53]), "=f"(_tmem_load_0[54]), "=f"(_tmem_load_0[55]), "=f"(_tmem_load_0[56]), "=f"(_tmem_load_0[57]), "=f"(_tmem_load_0[58]), "=f"(_tmem_load_0[59]), "=f"(_tmem_load_0[60]), "=f"(_tmem_load_0[61]), "=f"(_tmem_load_0[62]), "=f"(_tmem_load_0[63])
+                        : "r"(s_base + 32));
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_0[64]), "=f"(_tmem_load_0[65]), "=f"(_tmem_load_0[66]), "=f"(_tmem_load_0[67]), "=f"(_tmem_load_0[68]), "=f"(_tmem_load_0[69]), "=f"(_tmem_load_0[70]), "=f"(_tmem_load_0[71]), "=f"(_tmem_load_0[72]), "=f"(_tmem_load_0[73]), "=f"(_tmem_load_0[74]), "=f"(_tmem_load_0[75]), "=f"(_tmem_load_0[76]), "=f"(_tmem_load_0[77]), "=f"(_tmem_load_0[78]), "=f"(_tmem_load_0[79]), "=f"(_tmem_load_0[80]), "=f"(_tmem_load_0[81]), "=f"(_tmem_load_0[82]), "=f"(_tmem_load_0[83]), "=f"(_tmem_load_0[84]), "=f"(_tmem_load_0[85]), "=f"(_tmem_load_0[86]), "=f"(_tmem_load_0[87]), "=f"(_tmem_load_0[88]), "=f"(_tmem_load_0[89]), "=f"(_tmem_load_0[90]), "=f"(_tmem_load_0[91]), "=f"(_tmem_load_0[92]), "=f"(_tmem_load_0[93]), "=f"(_tmem_load_0[94]), "=f"(_tmem_load_0[95])
+                        : "r"(s_base + 64));
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_0[96]), "=f"(_tmem_load_0[97]), "=f"(_tmem_load_0[98]), "=f"(_tmem_load_0[99]), "=f"(_tmem_load_0[100]), "=f"(_tmem_load_0[101]), "=f"(_tmem_load_0[102]), "=f"(_tmem_load_0[103]), "=f"(_tmem_load_0[104]), "=f"(_tmem_load_0[105]), "=f"(_tmem_load_0[106]), "=f"(_tmem_load_0[107]), "=f"(_tmem_load_0[108]), "=f"(_tmem_load_0[109]), "=f"(_tmem_load_0[110]), "=f"(_tmem_load_0[111]), "=f"(_tmem_load_0[112]), "=f"(_tmem_load_0[113]), "=f"(_tmem_load_0[114]), "=f"(_tmem_load_0[115]), "=f"(_tmem_load_0[116]), "=f"(_tmem_load_0[117]), "=f"(_tmem_load_0[118]), "=f"(_tmem_load_0[119]), "=f"(_tmem_load_0[120]), "=f"(_tmem_load_0[121]), "=f"(_tmem_load_0[122]), "=f"(_tmem_load_0[123]), "=f"(_tmem_load_0[124]), "=f"(_tmem_load_0[125]), "=f"(_tmem_load_0[126]), "=f"(_tmem_load_0[127])
+                        : "r"(s_base + 96));
                     int tail_valid = seqlen_kv_bh - n_block * BLOCK_N;
                     if (tail_valid < BLOCK_N) {
                         uint32_t _slice_lo_mask_0;
@@ -802,137 +835,361 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                                     "}" : "=r"(_slice_lo_mask_0) : "r"(_lim_0));
                             }
                         }
-                        #pragma unroll
-                        for (int _i_1 = 0; _i_1 < 32; _i_1++) {
-                            if (!(_slice_lo_mask_0 & (1u << _i_1))) _tmem_load_0[0 + _i_1] = -CAKE_FMHA_INF;
-                        }
+                        if (!(_slice_lo_mask_0 & (1u << 0))) _tmem_load_0[0] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 1))) _tmem_load_0[1] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 2))) _tmem_load_0[2] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 3))) _tmem_load_0[3] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 4))) _tmem_load_0[4] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 5))) _tmem_load_0[5] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 6))) _tmem_load_0[6] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 7))) _tmem_load_0[7] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 8))) _tmem_load_0[8] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 9))) _tmem_load_0[9] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 10))) _tmem_load_0[10] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 11))) _tmem_load_0[11] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 12))) _tmem_load_0[12] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 13))) _tmem_load_0[13] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 14))) _tmem_load_0[14] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 15))) _tmem_load_0[15] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 16))) _tmem_load_0[16] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 17))) _tmem_load_0[17] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 18))) _tmem_load_0[18] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 19))) _tmem_load_0[19] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 20))) _tmem_load_0[20] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 21))) _tmem_load_0[21] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 22))) _tmem_load_0[22] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 23))) _tmem_load_0[23] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 24))) _tmem_load_0[24] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 25))) _tmem_load_0[25] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 26))) _tmem_load_0[26] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 27))) _tmem_load_0[27] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 28))) _tmem_load_0[28] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 29))) _tmem_load_0[29] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 30))) _tmem_load_0[30] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_0 & (1u << 31))) _tmem_load_0[31] = -CAKE_FMHA_INF;
                         uint32_t _slice_lo_mask_1;
                         {
-                            int _lim_2 = tail_valid - 32;
-                            if (_lim_2 <= 0) { _slice_lo_mask_1 = 0u; }
-                            else if (_lim_2 >= 32) { _slice_lo_mask_1 = 0xFFFFFFFFu; }
+                            int _lim_1 = tail_valid - 32;
+                            if (_lim_1 <= 0) { _slice_lo_mask_1 = 0u; }
+                            else if (_lim_1 >= 32) { _slice_lo_mask_1 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_1) : "r"(_lim_2));
+                                    "}" : "=r"(_slice_lo_mask_1) : "r"(_lim_1));
                             }
                         }
-                        #pragma unroll
-                        for (int _i_3 = 0; _i_3 < 32; _i_3++) {
-                            if (!(_slice_lo_mask_1 & (1u << _i_3))) _tmem_load_0[32 + _i_3] = -CAKE_FMHA_INF;
-                        }
+                        if (!(_slice_lo_mask_1 & (1u << 0))) _tmem_load_0[32] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 1))) _tmem_load_0[33] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 2))) _tmem_load_0[34] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 3))) _tmem_load_0[35] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 4))) _tmem_load_0[36] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 5))) _tmem_load_0[37] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 6))) _tmem_load_0[38] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 7))) _tmem_load_0[39] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 8))) _tmem_load_0[40] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 9))) _tmem_load_0[41] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 10))) _tmem_load_0[42] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 11))) _tmem_load_0[43] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 12))) _tmem_load_0[44] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 13))) _tmem_load_0[45] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 14))) _tmem_load_0[46] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 15))) _tmem_load_0[47] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 16))) _tmem_load_0[48] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 17))) _tmem_load_0[49] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 18))) _tmem_load_0[50] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 19))) _tmem_load_0[51] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 20))) _tmem_load_0[52] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 21))) _tmem_load_0[53] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 22))) _tmem_load_0[54] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 23))) _tmem_load_0[55] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 24))) _tmem_load_0[56] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 25))) _tmem_load_0[57] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 26))) _tmem_load_0[58] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 27))) _tmem_load_0[59] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 28))) _tmem_load_0[60] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 29))) _tmem_load_0[61] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 30))) _tmem_load_0[62] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_1 & (1u << 31))) _tmem_load_0[63] = -CAKE_FMHA_INF;
                         uint32_t _slice_lo_mask_2;
                         {
-                            int _lim_4 = tail_valid - 64;
-                            if (_lim_4 <= 0) { _slice_lo_mask_2 = 0u; }
-                            else if (_lim_4 >= 32) { _slice_lo_mask_2 = 0xFFFFFFFFu; }
+                            int _lim_2 = tail_valid - 64;
+                            if (_lim_2 <= 0) { _slice_lo_mask_2 = 0u; }
+                            else if (_lim_2 >= 32) { _slice_lo_mask_2 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_2) : "r"(_lim_4));
+                                    "}" : "=r"(_slice_lo_mask_2) : "r"(_lim_2));
                             }
                         }
-                        #pragma unroll
-                        for (int _i_5 = 0; _i_5 < 32; _i_5++) {
-                            if (!(_slice_lo_mask_2 & (1u << _i_5))) _tmem_load_0[64 + _i_5] = -CAKE_FMHA_INF;
-                        }
+                        if (!(_slice_lo_mask_2 & (1u << 0))) _tmem_load_0[64] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 1))) _tmem_load_0[65] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 2))) _tmem_load_0[66] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 3))) _tmem_load_0[67] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 4))) _tmem_load_0[68] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 5))) _tmem_load_0[69] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 6))) _tmem_load_0[70] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 7))) _tmem_load_0[71] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 8))) _tmem_load_0[72] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 9))) _tmem_load_0[73] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 10))) _tmem_load_0[74] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 11))) _tmem_load_0[75] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 12))) _tmem_load_0[76] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 13))) _tmem_load_0[77] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 14))) _tmem_load_0[78] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 15))) _tmem_load_0[79] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 16))) _tmem_load_0[80] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 17))) _tmem_load_0[81] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 18))) _tmem_load_0[82] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 19))) _tmem_load_0[83] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 20))) _tmem_load_0[84] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 21))) _tmem_load_0[85] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 22))) _tmem_load_0[86] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 23))) _tmem_load_0[87] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 24))) _tmem_load_0[88] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 25))) _tmem_load_0[89] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 26))) _tmem_load_0[90] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 27))) _tmem_load_0[91] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 28))) _tmem_load_0[92] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 29))) _tmem_load_0[93] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 30))) _tmem_load_0[94] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_2 & (1u << 31))) _tmem_load_0[95] = -CAKE_FMHA_INF;
                         uint32_t _slice_lo_mask_3;
                         {
-                            int _lim_6 = tail_valid - 96;
-                            if (_lim_6 <= 0) { _slice_lo_mask_3 = 0u; }
-                            else if (_lim_6 >= 32) { _slice_lo_mask_3 = 0xFFFFFFFFu; }
+                            int _lim_3 = tail_valid - 96;
+                            if (_lim_3 <= 0) { _slice_lo_mask_3 = 0u; }
+                            else if (_lim_3 >= 32) { _slice_lo_mask_3 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_3) : "r"(_lim_6));
+                                    "}" : "=r"(_slice_lo_mask_3) : "r"(_lim_3));
                             }
                         }
-                        #pragma unroll
-                        for (int _i_7 = 0; _i_7 < 32; _i_7++) {
-                            if (!(_slice_lo_mask_3 & (1u << _i_7))) _tmem_load_0[96 + _i_7] = -CAKE_FMHA_INF;
-                        }
+                        if (!(_slice_lo_mask_3 & (1u << 0))) _tmem_load_0[96] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 1))) _tmem_load_0[97] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 2))) _tmem_load_0[98] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 3))) _tmem_load_0[99] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 4))) _tmem_load_0[100] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 5))) _tmem_load_0[101] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 6))) _tmem_load_0[102] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 7))) _tmem_load_0[103] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 8))) _tmem_load_0[104] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 9))) _tmem_load_0[105] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 10))) _tmem_load_0[106] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 11))) _tmem_load_0[107] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 12))) _tmem_load_0[108] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 13))) _tmem_load_0[109] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 14))) _tmem_load_0[110] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 15))) _tmem_load_0[111] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 16))) _tmem_load_0[112] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 17))) _tmem_load_0[113] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 18))) _tmem_load_0[114] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 19))) _tmem_load_0[115] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 20))) _tmem_load_0[116] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 21))) _tmem_load_0[117] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 22))) _tmem_load_0[118] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 23))) _tmem_load_0[119] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 24))) _tmem_load_0[120] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 25))) _tmem_load_0[121] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 26))) _tmem_load_0[122] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 27))) _tmem_load_0[123] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 28))) _tmem_load_0[124] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 29))) _tmem_load_0[125] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 30))) _tmem_load_0[126] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_3 & (1u << 31))) _tmem_load_0[127] = -CAKE_FMHA_INF;
                     }
                     int valid_count = causal_row - n_block * BLOCK_N + 1;
                     uint32_t _slice_lo_mask_4;
                     {
-                        int _lim_8 = valid_count;
-                        if (_lim_8 <= 0) { _slice_lo_mask_4 = 0u; }
-                        else if (_lim_8 >= 32) { _slice_lo_mask_4 = 0xFFFFFFFFu; }
+                        int _lim_4 = valid_count;
+                        if (_lim_4 <= 0) { _slice_lo_mask_4 = 0u; }
+                        else if (_lim_4 >= 32) { _slice_lo_mask_4 = 0xFFFFFFFFu; }
                         else {
                             asm volatile("{"
                                 ".reg .u32 t;\n\t"
                                 "shl.b32 t, 1, %1;\n\t"
                                 "add.u32 %0, t, -1;\n\t"
-                                "}" : "=r"(_slice_lo_mask_4) : "r"(_lim_8));
+                                "}" : "=r"(_slice_lo_mask_4) : "r"(_lim_4));
                         }
                     }
-                    #pragma unroll
-                    for (int _i_9 = 0; _i_9 < 32; _i_9++) {
-                        if (!(_slice_lo_mask_4 & (1u << _i_9))) _tmem_load_0[0 + _i_9] = -CAKE_FMHA_INF;
-                    }
+                    if (!(_slice_lo_mask_4 & (1u << 0))) _tmem_load_0[0] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 1))) _tmem_load_0[1] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 2))) _tmem_load_0[2] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 3))) _tmem_load_0[3] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 4))) _tmem_load_0[4] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 5))) _tmem_load_0[5] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 6))) _tmem_load_0[6] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 7))) _tmem_load_0[7] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 8))) _tmem_load_0[8] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 9))) _tmem_load_0[9] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 10))) _tmem_load_0[10] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 11))) _tmem_load_0[11] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 12))) _tmem_load_0[12] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 13))) _tmem_load_0[13] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 14))) _tmem_load_0[14] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 15))) _tmem_load_0[15] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 16))) _tmem_load_0[16] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 17))) _tmem_load_0[17] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 18))) _tmem_load_0[18] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 19))) _tmem_load_0[19] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 20))) _tmem_load_0[20] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 21))) _tmem_load_0[21] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 22))) _tmem_load_0[22] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 23))) _tmem_load_0[23] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 24))) _tmem_load_0[24] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 25))) _tmem_load_0[25] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 26))) _tmem_load_0[26] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 27))) _tmem_load_0[27] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 28))) _tmem_load_0[28] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 29))) _tmem_load_0[29] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 30))) _tmem_load_0[30] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_4 & (1u << 31))) _tmem_load_0[31] = -CAKE_FMHA_INF;
                     uint32_t _slice_lo_mask_5;
                     {
-                        int _lim_10 = valid_count - 32;
-                        if (_lim_10 <= 0) { _slice_lo_mask_5 = 0u; }
-                        else if (_lim_10 >= 32) { _slice_lo_mask_5 = 0xFFFFFFFFu; }
+                        int _lim_5 = valid_count - 32;
+                        if (_lim_5 <= 0) { _slice_lo_mask_5 = 0u; }
+                        else if (_lim_5 >= 32) { _slice_lo_mask_5 = 0xFFFFFFFFu; }
                         else {
                             asm volatile("{"
                                 ".reg .u32 t;\n\t"
                                 "shl.b32 t, 1, %1;\n\t"
                                 "add.u32 %0, t, -1;\n\t"
-                                "}" : "=r"(_slice_lo_mask_5) : "r"(_lim_10));
+                                "}" : "=r"(_slice_lo_mask_5) : "r"(_lim_5));
                         }
                     }
-                    #pragma unroll
-                    for (int _i_11 = 0; _i_11 < 32; _i_11++) {
-                        if (!(_slice_lo_mask_5 & (1u << _i_11))) _tmem_load_0[32 + _i_11] = -CAKE_FMHA_INF;
-                    }
+                    if (!(_slice_lo_mask_5 & (1u << 0))) _tmem_load_0[32] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 1))) _tmem_load_0[33] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 2))) _tmem_load_0[34] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 3))) _tmem_load_0[35] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 4))) _tmem_load_0[36] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 5))) _tmem_load_0[37] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 6))) _tmem_load_0[38] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 7))) _tmem_load_0[39] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 8))) _tmem_load_0[40] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 9))) _tmem_load_0[41] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 10))) _tmem_load_0[42] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 11))) _tmem_load_0[43] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 12))) _tmem_load_0[44] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 13))) _tmem_load_0[45] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 14))) _tmem_load_0[46] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 15))) _tmem_load_0[47] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 16))) _tmem_load_0[48] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 17))) _tmem_load_0[49] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 18))) _tmem_load_0[50] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 19))) _tmem_load_0[51] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 20))) _tmem_load_0[52] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 21))) _tmem_load_0[53] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 22))) _tmem_load_0[54] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 23))) _tmem_load_0[55] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 24))) _tmem_load_0[56] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 25))) _tmem_load_0[57] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 26))) _tmem_load_0[58] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 27))) _tmem_load_0[59] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 28))) _tmem_load_0[60] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 29))) _tmem_load_0[61] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 30))) _tmem_load_0[62] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_5 & (1u << 31))) _tmem_load_0[63] = -CAKE_FMHA_INF;
                     uint32_t _slice_lo_mask_6;
                     {
-                        int _lim_12 = valid_count - 64;
-                        if (_lim_12 <= 0) { _slice_lo_mask_6 = 0u; }
-                        else if (_lim_12 >= 32) { _slice_lo_mask_6 = 0xFFFFFFFFu; }
+                        int _lim_6 = valid_count - 64;
+                        if (_lim_6 <= 0) { _slice_lo_mask_6 = 0u; }
+                        else if (_lim_6 >= 32) { _slice_lo_mask_6 = 0xFFFFFFFFu; }
                         else {
                             asm volatile("{"
                                 ".reg .u32 t;\n\t"
                                 "shl.b32 t, 1, %1;\n\t"
                                 "add.u32 %0, t, -1;\n\t"
-                                "}" : "=r"(_slice_lo_mask_6) : "r"(_lim_12));
+                                "}" : "=r"(_slice_lo_mask_6) : "r"(_lim_6));
                         }
                     }
-                    #pragma unroll
-                    for (int _i_13 = 0; _i_13 < 32; _i_13++) {
-                        if (!(_slice_lo_mask_6 & (1u << _i_13))) _tmem_load_0[64 + _i_13] = -CAKE_FMHA_INF;
-                    }
+                    if (!(_slice_lo_mask_6 & (1u << 0))) _tmem_load_0[64] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 1))) _tmem_load_0[65] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 2))) _tmem_load_0[66] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 3))) _tmem_load_0[67] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 4))) _tmem_load_0[68] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 5))) _tmem_load_0[69] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 6))) _tmem_load_0[70] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 7))) _tmem_load_0[71] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 8))) _tmem_load_0[72] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 9))) _tmem_load_0[73] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 10))) _tmem_load_0[74] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 11))) _tmem_load_0[75] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 12))) _tmem_load_0[76] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 13))) _tmem_load_0[77] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 14))) _tmem_load_0[78] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 15))) _tmem_load_0[79] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 16))) _tmem_load_0[80] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 17))) _tmem_load_0[81] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 18))) _tmem_load_0[82] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 19))) _tmem_load_0[83] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 20))) _tmem_load_0[84] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 21))) _tmem_load_0[85] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 22))) _tmem_load_0[86] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 23))) _tmem_load_0[87] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 24))) _tmem_load_0[88] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 25))) _tmem_load_0[89] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 26))) _tmem_load_0[90] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 27))) _tmem_load_0[91] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 28))) _tmem_load_0[92] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 29))) _tmem_load_0[93] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 30))) _tmem_load_0[94] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_6 & (1u << 31))) _tmem_load_0[95] = -CAKE_FMHA_INF;
                     uint32_t _slice_lo_mask_7;
                     {
-                        int _lim_14 = valid_count - 96;
-                        if (_lim_14 <= 0) { _slice_lo_mask_7 = 0u; }
-                        else if (_lim_14 >= 32) { _slice_lo_mask_7 = 0xFFFFFFFFu; }
+                        int _lim_7 = valid_count - 96;
+                        if (_lim_7 <= 0) { _slice_lo_mask_7 = 0u; }
+                        else if (_lim_7 >= 32) { _slice_lo_mask_7 = 0xFFFFFFFFu; }
                         else {
                             asm volatile("{"
                                 ".reg .u32 t;\n\t"
                                 "shl.b32 t, 1, %1;\n\t"
                                 "add.u32 %0, t, -1;\n\t"
-                                "}" : "=r"(_slice_lo_mask_7) : "r"(_lim_14));
+                                "}" : "=r"(_slice_lo_mask_7) : "r"(_lim_7));
                         }
                     }
-                    #pragma unroll
-                    for (int _i_15 = 0; _i_15 < 32; _i_15++) {
-                        if (!(_slice_lo_mask_7 & (1u << _i_15))) _tmem_load_0[96 + _i_15] = -CAKE_FMHA_INF;
-                    }
-                    float2 _reg_reduce_max2_16 = {-CAKE_FMHA_INF, -CAKE_FMHA_INF};
-                    row_max_x32_accum(&_tmem_load_0[0], _reg_reduce_max2_16);
-                    row_max_x32_accum(&_tmem_load_0[32], _reg_reduce_max2_16);
-                    row_max_x32_accum(&_tmem_load_0[64], _reg_reduce_max2_16);
-                    row_max_x32_accum(&_tmem_load_0[96], _reg_reduce_max2_16);
-                    float _tmem_load_0_max = row_max_reduce(_reg_reduce_max2_16);
+                    if (!(_slice_lo_mask_7 & (1u << 0))) _tmem_load_0[96] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 1))) _tmem_load_0[97] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 2))) _tmem_load_0[98] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 3))) _tmem_load_0[99] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 4))) _tmem_load_0[100] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 5))) _tmem_load_0[101] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 6))) _tmem_load_0[102] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 7))) _tmem_load_0[103] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 8))) _tmem_load_0[104] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 9))) _tmem_load_0[105] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 10))) _tmem_load_0[106] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 11))) _tmem_load_0[107] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 12))) _tmem_load_0[108] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 13))) _tmem_load_0[109] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 14))) _tmem_load_0[110] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 15))) _tmem_load_0[111] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 16))) _tmem_load_0[112] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 17))) _tmem_load_0[113] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 18))) _tmem_load_0[114] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 19))) _tmem_load_0[115] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 20))) _tmem_load_0[116] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 21))) _tmem_load_0[117] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 22))) _tmem_load_0[118] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 23))) _tmem_load_0[119] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 24))) _tmem_load_0[120] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 25))) _tmem_load_0[121] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 26))) _tmem_load_0[122] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 27))) _tmem_load_0[123] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 28))) _tmem_load_0[124] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 29))) _tmem_load_0[125] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 30))) _tmem_load_0[126] = -CAKE_FMHA_INF;
+                    if (!(_slice_lo_mask_7 & (1u << 31))) _tmem_load_0[127] = -CAKE_FMHA_INF;
+                    float2 _reg_reduce_max2_8 = {-CAKE_FMHA_INF, -CAKE_FMHA_INF};
+                    row_max_x32_accum(&_tmem_load_0[0], _reg_reduce_max2_8);
+                    row_max_x32_accum(&_tmem_load_0[32], _reg_reduce_max2_8);
+                    row_max_x32_accum(&_tmem_load_0[64], _reg_reduce_max2_8);
+                    row_max_x32_accum(&_tmem_load_0[96], _reg_reduce_max2_8);
+                    float _tmem_load_0_max = row_max_reduce(_reg_reduce_max2_8);
                     float new_max = _tmem_load_0_max;
                     float _max_0 = max_noftz(new_max, row_max_val);
                     new_max = _max_0;
@@ -961,19 +1218,19 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     } else {
                         mbarrier_wait(order_p01_1_addr, order_p01_phase);
                     }
-                    const float2 _fma_b2_17 = {softmax_scale_log2, softmax_scale_log2};
-                    const float2 _fma_c2_18 = {p_log2_bias, p_log2_bias};
+                    const float2 _fma_b2_9 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_10 = {p_log2_bias, p_log2_bias};
                     #pragma unroll
                     for (int _lf = 0; _lf < 64; _lf++)
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_0)[_lf], _fma_b2_17, _fma_c2_18);
+                        fma_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_0)[_lf], _fma_b2_9, _fma_c2_10);
                     #pragma unroll
                     for (int _le = 0; _le < 128; _le++) {
                         _tmem_load_0[_le] = approx_exp2(_tmem_load_0[_le]);
                     }
-                    float2 _reg_reduce_sum2_19 = make_float2(0.0f, 0.0f);
-                    softmax_block_sum(&_tmem_load_0[0], &_reg_reduce_sum2_19);
-                    softmax_block_sum(&_tmem_load_0[32], &_reg_reduce_sum2_19);
-                    float _tmem_load_0_sum = _reg_reduce_sum2_19.x + _reg_reduce_sum2_19.y;
+                    float2 _reg_reduce_sum2_11 = make_float2(0.0f, 0.0f);
+                    softmax_block_sum(&_tmem_load_0[0], &_reg_reduce_sum2_11);
+                    softmax_block_sum(&_tmem_load_0[32], &_reg_reduce_sum2_11);
+                    float _tmem_load_0_sum = _reg_reduce_sum2_11.x + _reg_reduce_sum2_11.y;
                     block_sum0 = _tmem_load_0_sum;
                     {
                         uint32_t _packed;
@@ -1183,10 +1440,13 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                                                "f"(_tmem_load_0[62]), "f"(_tmem_load_0[63]));
                         pv0[15] = _packed;
                     }
-                    tmem_st_x16(p_base, pv0);
-                    float2 _reg_reduce_sum2_20 = make_float2(0.0f, 0.0f);
-                    softmax_block_sum(&_tmem_load_0[(64) + 0], &_reg_reduce_sum2_20);
-                    float _tmem_load_0_sum_0 = _reg_reduce_sum2_20.x + _reg_reduce_sum2_20.y;
+                    asm volatile(
+                        "tcgen05.st.sync.aligned.32x32b.x16.b32"
+                        " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+                        :: "r"(p_base), "r"(*reinterpret_cast<const uint32_t*>(&pv0[0])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[1])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[2])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[3])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[4])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[5])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[6])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[7])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[8])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[9])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[10])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[11])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[12])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[13])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[14])), "r"(*reinterpret_cast<const uint32_t*>(&pv0[15])));
+                    float2 _reg_reduce_sum2_12 = make_float2(0.0f, 0.0f);
+                    softmax_block_sum(&_tmem_load_0[(64) + 0], &_reg_reduce_sum2_12);
+                    float _tmem_load_0_sum_0 = _reg_reduce_sum2_12.x + _reg_reduce_sum2_12.y;
                     block_sum1 = _tmem_load_0_sum_0;
                     {
                         uint32_t _packed;
@@ -1295,9 +1555,9 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     tmem_st_x8_u32(p_base + 16, (const uint32_t*)pv1);
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(p_full_addr + (stage) * 8);
-                    float2 _reg_reduce_sum2_21 = make_float2(0.0f, 0.0f);
-                    softmax_block_sum(&_tmem_load_0[(96) + 0], &_reg_reduce_sum2_21);
-                    float _tmem_load_0_sum_1 = _reg_reduce_sum2_21.x + _reg_reduce_sum2_21.y;
+                    float2 _reg_reduce_sum2_13 = make_float2(0.0f, 0.0f);
+                    softmax_block_sum(&_tmem_load_0[(96) + 0], &_reg_reduce_sum2_13);
+                    float _tmem_load_0_sum_1 = _reg_reduce_sum2_13.x + _reg_reduce_sum2_13.y;
                     block_sum2 = _tmem_load_0_sum_1;
                     {
                         uint32_t _packed;
@@ -1408,8 +1668,7 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     } else {
                         mbarrier_arrive(order_p01_0_addr);
                     }
-                    order_p01_stage += 1;
-                    if (order_p01_stage == 1) { order_p01_stage = 0; order_p01_phase ^= 1; }
+                    order_p01_phase ^= 1;
                     tmem_st_x8_u32(p_base + 24, (const uint32_t*)pv2);
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(p_full_2_addr + (stage) * 8);
@@ -1424,87 +1683,215 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     _phase_s_full ^= 1;
                     int s_base_1 = taddr + (unsigned int)tmem_s_off + (unsigned int)(warp % 4 * 32 << 16);
                     float _tmem_load_1[128];
-                    tmem_ld_x32(&_tmem_load_1[0], s_base_1);
-                    tmem_ld_x32(&_tmem_load_1[32], s_base_1 + 32);
-                    tmem_ld_x32(&_tmem_load_1[64], s_base_1 + 64);
-                    tmem_ld_x32(&_tmem_load_1[96], s_base_1 + 96);
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_1[0]), "=f"(_tmem_load_1[1]), "=f"(_tmem_load_1[2]), "=f"(_tmem_load_1[3]), "=f"(_tmem_load_1[4]), "=f"(_tmem_load_1[5]), "=f"(_tmem_load_1[6]), "=f"(_tmem_load_1[7]), "=f"(_tmem_load_1[8]), "=f"(_tmem_load_1[9]), "=f"(_tmem_load_1[10]), "=f"(_tmem_load_1[11]), "=f"(_tmem_load_1[12]), "=f"(_tmem_load_1[13]), "=f"(_tmem_load_1[14]), "=f"(_tmem_load_1[15]), "=f"(_tmem_load_1[16]), "=f"(_tmem_load_1[17]), "=f"(_tmem_load_1[18]), "=f"(_tmem_load_1[19]), "=f"(_tmem_load_1[20]), "=f"(_tmem_load_1[21]), "=f"(_tmem_load_1[22]), "=f"(_tmem_load_1[23]), "=f"(_tmem_load_1[24]), "=f"(_tmem_load_1[25]), "=f"(_tmem_load_1[26]), "=f"(_tmem_load_1[27]), "=f"(_tmem_load_1[28]), "=f"(_tmem_load_1[29]), "=f"(_tmem_load_1[30]), "=f"(_tmem_load_1[31])
+                        : "r"(s_base_1));
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_1[32]), "=f"(_tmem_load_1[33]), "=f"(_tmem_load_1[34]), "=f"(_tmem_load_1[35]), "=f"(_tmem_load_1[36]), "=f"(_tmem_load_1[37]), "=f"(_tmem_load_1[38]), "=f"(_tmem_load_1[39]), "=f"(_tmem_load_1[40]), "=f"(_tmem_load_1[41]), "=f"(_tmem_load_1[42]), "=f"(_tmem_load_1[43]), "=f"(_tmem_load_1[44]), "=f"(_tmem_load_1[45]), "=f"(_tmem_load_1[46]), "=f"(_tmem_load_1[47]), "=f"(_tmem_load_1[48]), "=f"(_tmem_load_1[49]), "=f"(_tmem_load_1[50]), "=f"(_tmem_load_1[51]), "=f"(_tmem_load_1[52]), "=f"(_tmem_load_1[53]), "=f"(_tmem_load_1[54]), "=f"(_tmem_load_1[55]), "=f"(_tmem_load_1[56]), "=f"(_tmem_load_1[57]), "=f"(_tmem_load_1[58]), "=f"(_tmem_load_1[59]), "=f"(_tmem_load_1[60]), "=f"(_tmem_load_1[61]), "=f"(_tmem_load_1[62]), "=f"(_tmem_load_1[63])
+                        : "r"(s_base_1 + 32));
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_1[64]), "=f"(_tmem_load_1[65]), "=f"(_tmem_load_1[66]), "=f"(_tmem_load_1[67]), "=f"(_tmem_load_1[68]), "=f"(_tmem_load_1[69]), "=f"(_tmem_load_1[70]), "=f"(_tmem_load_1[71]), "=f"(_tmem_load_1[72]), "=f"(_tmem_load_1[73]), "=f"(_tmem_load_1[74]), "=f"(_tmem_load_1[75]), "=f"(_tmem_load_1[76]), "=f"(_tmem_load_1[77]), "=f"(_tmem_load_1[78]), "=f"(_tmem_load_1[79]), "=f"(_tmem_load_1[80]), "=f"(_tmem_load_1[81]), "=f"(_tmem_load_1[82]), "=f"(_tmem_load_1[83]), "=f"(_tmem_load_1[84]), "=f"(_tmem_load_1[85]), "=f"(_tmem_load_1[86]), "=f"(_tmem_load_1[87]), "=f"(_tmem_load_1[88]), "=f"(_tmem_load_1[89]), "=f"(_tmem_load_1[90]), "=f"(_tmem_load_1[91]), "=f"(_tmem_load_1[92]), "=f"(_tmem_load_1[93]), "=f"(_tmem_load_1[94]), "=f"(_tmem_load_1[95])
+                        : "r"(s_base_1 + 64));
+                    asm volatile(
+                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
+                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
+                        : "=f"(_tmem_load_1[96]), "=f"(_tmem_load_1[97]), "=f"(_tmem_load_1[98]), "=f"(_tmem_load_1[99]), "=f"(_tmem_load_1[100]), "=f"(_tmem_load_1[101]), "=f"(_tmem_load_1[102]), "=f"(_tmem_load_1[103]), "=f"(_tmem_load_1[104]), "=f"(_tmem_load_1[105]), "=f"(_tmem_load_1[106]), "=f"(_tmem_load_1[107]), "=f"(_tmem_load_1[108]), "=f"(_tmem_load_1[109]), "=f"(_tmem_load_1[110]), "=f"(_tmem_load_1[111]), "=f"(_tmem_load_1[112]), "=f"(_tmem_load_1[113]), "=f"(_tmem_load_1[114]), "=f"(_tmem_load_1[115]), "=f"(_tmem_load_1[116]), "=f"(_tmem_load_1[117]), "=f"(_tmem_load_1[118]), "=f"(_tmem_load_1[119]), "=f"(_tmem_load_1[120]), "=f"(_tmem_load_1[121]), "=f"(_tmem_load_1[122]), "=f"(_tmem_load_1[123]), "=f"(_tmem_load_1[124]), "=f"(_tmem_load_1[125]), "=f"(_tmem_load_1[126]), "=f"(_tmem_load_1[127])
+                        : "r"(s_base_1 + 96));
                     int tail_valid_1 = seqlen_kv_bh - n_block_1 * BLOCK_N;
                     if (tail_valid_1 < BLOCK_N) {
                         uint32_t _slice_lo_mask_8;
                         {
-                            int _lim_22 = tail_valid_1;
-                            if (_lim_22 <= 0) { _slice_lo_mask_8 = 0u; }
-                            else if (_lim_22 >= 32) { _slice_lo_mask_8 = 0xFFFFFFFFu; }
+                            int _lim_14 = tail_valid_1;
+                            if (_lim_14 <= 0) { _slice_lo_mask_8 = 0u; }
+                            else if (_lim_14 >= 32) { _slice_lo_mask_8 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_8) : "r"(_lim_22));
+                                    "}" : "=r"(_slice_lo_mask_8) : "r"(_lim_14));
                             }
                         }
-                        #pragma unroll
-                        for (int _i_23 = 0; _i_23 < 32; _i_23++) {
-                            if (!(_slice_lo_mask_8 & (1u << _i_23))) _tmem_load_1[0 + _i_23] = -CAKE_FMHA_INF;
-                        }
+                        if (!(_slice_lo_mask_8 & (1u << 0))) _tmem_load_1[0] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 1))) _tmem_load_1[1] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 2))) _tmem_load_1[2] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 3))) _tmem_load_1[3] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 4))) _tmem_load_1[4] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 5))) _tmem_load_1[5] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 6))) _tmem_load_1[6] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 7))) _tmem_load_1[7] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 8))) _tmem_load_1[8] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 9))) _tmem_load_1[9] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 10))) _tmem_load_1[10] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 11))) _tmem_load_1[11] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 12))) _tmem_load_1[12] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 13))) _tmem_load_1[13] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 14))) _tmem_load_1[14] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 15))) _tmem_load_1[15] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 16))) _tmem_load_1[16] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 17))) _tmem_load_1[17] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 18))) _tmem_load_1[18] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 19))) _tmem_load_1[19] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 20))) _tmem_load_1[20] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 21))) _tmem_load_1[21] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 22))) _tmem_load_1[22] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 23))) _tmem_load_1[23] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 24))) _tmem_load_1[24] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 25))) _tmem_load_1[25] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 26))) _tmem_load_1[26] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 27))) _tmem_load_1[27] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 28))) _tmem_load_1[28] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 29))) _tmem_load_1[29] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 30))) _tmem_load_1[30] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_8 & (1u << 31))) _tmem_load_1[31] = -CAKE_FMHA_INF;
                         uint32_t _slice_lo_mask_9;
                         {
-                            int _lim_24 = tail_valid_1 - 32;
-                            if (_lim_24 <= 0) { _slice_lo_mask_9 = 0u; }
-                            else if (_lim_24 >= 32) { _slice_lo_mask_9 = 0xFFFFFFFFu; }
+                            int _lim_15 = tail_valid_1 - 32;
+                            if (_lim_15 <= 0) { _slice_lo_mask_9 = 0u; }
+                            else if (_lim_15 >= 32) { _slice_lo_mask_9 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_9) : "r"(_lim_24));
+                                    "}" : "=r"(_slice_lo_mask_9) : "r"(_lim_15));
                             }
                         }
-                        #pragma unroll
-                        for (int _i_25 = 0; _i_25 < 32; _i_25++) {
-                            if (!(_slice_lo_mask_9 & (1u << _i_25))) _tmem_load_1[32 + _i_25] = -CAKE_FMHA_INF;
-                        }
+                        if (!(_slice_lo_mask_9 & (1u << 0))) _tmem_load_1[32] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 1))) _tmem_load_1[33] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 2))) _tmem_load_1[34] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 3))) _tmem_load_1[35] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 4))) _tmem_load_1[36] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 5))) _tmem_load_1[37] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 6))) _tmem_load_1[38] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 7))) _tmem_load_1[39] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 8))) _tmem_load_1[40] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 9))) _tmem_load_1[41] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 10))) _tmem_load_1[42] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 11))) _tmem_load_1[43] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 12))) _tmem_load_1[44] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 13))) _tmem_load_1[45] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 14))) _tmem_load_1[46] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 15))) _tmem_load_1[47] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 16))) _tmem_load_1[48] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 17))) _tmem_load_1[49] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 18))) _tmem_load_1[50] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 19))) _tmem_load_1[51] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 20))) _tmem_load_1[52] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 21))) _tmem_load_1[53] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 22))) _tmem_load_1[54] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 23))) _tmem_load_1[55] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 24))) _tmem_load_1[56] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 25))) _tmem_load_1[57] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 26))) _tmem_load_1[58] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 27))) _tmem_load_1[59] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 28))) _tmem_load_1[60] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 29))) _tmem_load_1[61] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 30))) _tmem_load_1[62] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_9 & (1u << 31))) _tmem_load_1[63] = -CAKE_FMHA_INF;
                         uint32_t _slice_lo_mask_10;
                         {
-                            int _lim_26 = tail_valid_1 - 64;
-                            if (_lim_26 <= 0) { _slice_lo_mask_10 = 0u; }
-                            else if (_lim_26 >= 32) { _slice_lo_mask_10 = 0xFFFFFFFFu; }
+                            int _lim_16 = tail_valid_1 - 64;
+                            if (_lim_16 <= 0) { _slice_lo_mask_10 = 0u; }
+                            else if (_lim_16 >= 32) { _slice_lo_mask_10 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_10) : "r"(_lim_26));
+                                    "}" : "=r"(_slice_lo_mask_10) : "r"(_lim_16));
                             }
                         }
-                        #pragma unroll
-                        for (int _i_27 = 0; _i_27 < 32; _i_27++) {
-                            if (!(_slice_lo_mask_10 & (1u << _i_27))) _tmem_load_1[64 + _i_27] = -CAKE_FMHA_INF;
-                        }
+                        if (!(_slice_lo_mask_10 & (1u << 0))) _tmem_load_1[64] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 1))) _tmem_load_1[65] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 2))) _tmem_load_1[66] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 3))) _tmem_load_1[67] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 4))) _tmem_load_1[68] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 5))) _tmem_load_1[69] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 6))) _tmem_load_1[70] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 7))) _tmem_load_1[71] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 8))) _tmem_load_1[72] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 9))) _tmem_load_1[73] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 10))) _tmem_load_1[74] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 11))) _tmem_load_1[75] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 12))) _tmem_load_1[76] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 13))) _tmem_load_1[77] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 14))) _tmem_load_1[78] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 15))) _tmem_load_1[79] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 16))) _tmem_load_1[80] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 17))) _tmem_load_1[81] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 18))) _tmem_load_1[82] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 19))) _tmem_load_1[83] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 20))) _tmem_load_1[84] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 21))) _tmem_load_1[85] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 22))) _tmem_load_1[86] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 23))) _tmem_load_1[87] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 24))) _tmem_load_1[88] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 25))) _tmem_load_1[89] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 26))) _tmem_load_1[90] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 27))) _tmem_load_1[91] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 28))) _tmem_load_1[92] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 29))) _tmem_load_1[93] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 30))) _tmem_load_1[94] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_10 & (1u << 31))) _tmem_load_1[95] = -CAKE_FMHA_INF;
                         uint32_t _slice_lo_mask_11;
                         {
-                            int _lim_28 = tail_valid_1 - 96;
-                            if (_lim_28 <= 0) { _slice_lo_mask_11 = 0u; }
-                            else if (_lim_28 >= 32) { _slice_lo_mask_11 = 0xFFFFFFFFu; }
+                            int _lim_17 = tail_valid_1 - 96;
+                            if (_lim_17 <= 0) { _slice_lo_mask_11 = 0u; }
+                            else if (_lim_17 >= 32) { _slice_lo_mask_11 = 0xFFFFFFFFu; }
                             else {
                                 asm volatile("{"
                                     ".reg .u32 t;\n\t"
                                     "shl.b32 t, 1, %1;\n\t"
                                     "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_11) : "r"(_lim_28));
+                                    "}" : "=r"(_slice_lo_mask_11) : "r"(_lim_17));
                             }
                         }
-                        #pragma unroll
-                        for (int _i_29 = 0; _i_29 < 32; _i_29++) {
-                            if (!(_slice_lo_mask_11 & (1u << _i_29))) _tmem_load_1[96 + _i_29] = -CAKE_FMHA_INF;
-                        }
+                        if (!(_slice_lo_mask_11 & (1u << 0))) _tmem_load_1[96] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 1))) _tmem_load_1[97] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 2))) _tmem_load_1[98] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 3))) _tmem_load_1[99] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 4))) _tmem_load_1[100] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 5))) _tmem_load_1[101] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 6))) _tmem_load_1[102] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 7))) _tmem_load_1[103] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 8))) _tmem_load_1[104] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 9))) _tmem_load_1[105] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 10))) _tmem_load_1[106] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 11))) _tmem_load_1[107] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 12))) _tmem_load_1[108] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 13))) _tmem_load_1[109] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 14))) _tmem_load_1[110] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 15))) _tmem_load_1[111] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 16))) _tmem_load_1[112] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 17))) _tmem_load_1[113] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 18))) _tmem_load_1[114] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 19))) _tmem_load_1[115] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 20))) _tmem_load_1[116] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 21))) _tmem_load_1[117] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 22))) _tmem_load_1[118] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 23))) _tmem_load_1[119] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 24))) _tmem_load_1[120] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 25))) _tmem_load_1[121] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 26))) _tmem_load_1[122] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 27))) _tmem_load_1[123] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 28))) _tmem_load_1[124] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 29))) _tmem_load_1[125] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 30))) _tmem_load_1[126] = -CAKE_FMHA_INF;
+                        if (!(_slice_lo_mask_11 & (1u << 31))) _tmem_load_1[127] = -CAKE_FMHA_INF;
                     }
-                    float2 _reg_reduce_max2_30 = {-CAKE_FMHA_INF, -CAKE_FMHA_INF};
-                    row_max_x32_accum(&_tmem_load_1[0], _reg_reduce_max2_30);
-                    row_max_x32_accum(&_tmem_load_1[32], _reg_reduce_max2_30);
-                    row_max_x32_accum(&_tmem_load_1[64], _reg_reduce_max2_30);
-                    row_max_x32_accum(&_tmem_load_1[96], _reg_reduce_max2_30);
-                    float _tmem_load_1_max = row_max_reduce(_reg_reduce_max2_30);
+                    float2 _reg_reduce_max2_18 = {-CAKE_FMHA_INF, -CAKE_FMHA_INF};
+                    row_max_x32_accum(&_tmem_load_1[0], _reg_reduce_max2_18);
+                    row_max_x32_accum(&_tmem_load_1[32], _reg_reduce_max2_18);
+                    row_max_x32_accum(&_tmem_load_1[64], _reg_reduce_max2_18);
+                    row_max_x32_accum(&_tmem_load_1[96], _reg_reduce_max2_18);
+                    float _tmem_load_1_max = row_max_reduce(_reg_reduce_max2_18);
                     float new_max_1 = _tmem_load_1_max;
                     float _max_1 = max_noftz(new_max_1, row_max_val);
                     new_max_1 = _max_1;
@@ -1533,19 +1920,19 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     } else {
                         mbarrier_wait(order_p01_1_addr, order_p01_phase);
                     }
-                    const float2 _fma_b2_31 = {softmax_scale_log2, softmax_scale_log2};
-                    const float2 _fma_c2_32 = {p_log2_bias_1, p_log2_bias_1};
+                    const float2 _fma_b2_19 = {softmax_scale_log2, softmax_scale_log2};
+                    const float2 _fma_c2_20 = {p_log2_bias_1, p_log2_bias_1};
                     #pragma unroll
                     for (int _lf = 0; _lf < 64; _lf++)
-                        fma_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_1)[_lf], _fma_b2_31, _fma_c2_32);
+                        fma_f32x2_inplace(&reinterpret_cast<float2*>(_tmem_load_1)[_lf], _fma_b2_19, _fma_c2_20);
                     #pragma unroll
                     for (int _le = 0; _le < 128; _le++) {
                         _tmem_load_1[_le] = approx_exp2(_tmem_load_1[_le]);
                     }
-                    float2 _reg_reduce_sum2_33 = make_float2(0.0f, 0.0f);
-                    softmax_block_sum(&_tmem_load_1[0], &_reg_reduce_sum2_33);
-                    softmax_block_sum(&_tmem_load_1[32], &_reg_reduce_sum2_33);
-                    float _tmem_load_1_sum = _reg_reduce_sum2_33.x + _reg_reduce_sum2_33.y;
+                    float2 _reg_reduce_sum2_21 = make_float2(0.0f, 0.0f);
+                    softmax_block_sum(&_tmem_load_1[0], &_reg_reduce_sum2_21);
+                    softmax_block_sum(&_tmem_load_1[32], &_reg_reduce_sum2_21);
+                    float _tmem_load_1_sum = _reg_reduce_sum2_21.x + _reg_reduce_sum2_21.y;
                     block_sum0_1 = _tmem_load_1_sum;
                     {
                         uint32_t _packed;
@@ -1755,10 +2142,13 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                                                "f"(_tmem_load_1[62]), "f"(_tmem_load_1[63]));
                         pv0_1[15] = _packed;
                     }
-                    tmem_st_x16(p_base_1, pv0_1);
-                    float2 _reg_reduce_sum2_34 = make_float2(0.0f, 0.0f);
-                    softmax_block_sum(&_tmem_load_1[(64) + 0], &_reg_reduce_sum2_34);
-                    float _tmem_load_1_sum_0 = _reg_reduce_sum2_34.x + _reg_reduce_sum2_34.y;
+                    asm volatile(
+                        "tcgen05.st.sync.aligned.32x32b.x16.b32"
+                        " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+                        :: "r"(p_base_1), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&pv0_1[15])));
+                    float2 _reg_reduce_sum2_22 = make_float2(0.0f, 0.0f);
+                    softmax_block_sum(&_tmem_load_1[(64) + 0], &_reg_reduce_sum2_22);
+                    float _tmem_load_1_sum_0 = _reg_reduce_sum2_22.x + _reg_reduce_sum2_22.y;
                     block_sum1_1 = _tmem_load_1_sum_0;
                     {
                         uint32_t _packed;
@@ -1867,9 +2257,9 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     tmem_st_x8_u32(p_base_1 + 16, (const uint32_t*)pv1_1);
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(p_full_addr + (stage) * 8);
-                    float2 _reg_reduce_sum2_35 = make_float2(0.0f, 0.0f);
-                    softmax_block_sum(&_tmem_load_1[(96) + 0], &_reg_reduce_sum2_35);
-                    float _tmem_load_1_sum_1 = _reg_reduce_sum2_35.x + _reg_reduce_sum2_35.y;
+                    float2 _reg_reduce_sum2_23 = make_float2(0.0f, 0.0f);
+                    softmax_block_sum(&_tmem_load_1[(96) + 0], &_reg_reduce_sum2_23);
+                    float _tmem_load_1_sum_1 = _reg_reduce_sum2_23.x + _reg_reduce_sum2_23.y;
                     block_sum2_1 = _tmem_load_1_sum_1;
                     {
                         uint32_t _packed;
@@ -1980,8 +2370,7 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     } else {
                         mbarrier_arrive(order_p01_0_addr);
                     }
-                    order_p01_stage += 1;
-                    if (order_p01_stage == 1) { order_p01_stage = 0; order_p01_phase ^= 1; }
+                    order_p01_phase ^= 1;
                     tmem_st_x8_u32(p_base_1 + 24, (const uint32_t*)pv2_1);
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     mbarrier_arrive(p_full_2_addr + (stage) * 8);
@@ -2135,26 +2524,34 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                                         _tmem_load_4[0 + _ps] *= final_scale;
                                     #endif
                                     unsigned int _fp8_pk[4];
-                                    { unsigned short _lo, _hi;
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_lo) : "f"(_tmem_load_4[0 + 1]), "f"(_tmem_load_4[0 + 0]));
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_hi) : "f"(_tmem_load_4[0 + 3]), "f"(_tmem_load_4[0 + 2]));
-                                        _fp8_pk[0] = (unsigned)_lo | ((unsigned)_hi << 16);
-                                    }
-                                    { unsigned short _lo, _hi;
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_lo) : "f"(_tmem_load_4[0 + 5]), "f"(_tmem_load_4[0 + 4]));
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_hi) : "f"(_tmem_load_4[0 + 7]), "f"(_tmem_load_4[0 + 6]));
-                                        _fp8_pk[1] = (unsigned)_lo | ((unsigned)_hi << 16);
-                                    }
-                                    { unsigned short _lo, _hi;
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_lo) : "f"(_tmem_load_4[0 + 9]), "f"(_tmem_load_4[0 + 8]));
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_hi) : "f"(_tmem_load_4[0 + 11]), "f"(_tmem_load_4[0 + 10]));
-                                        _fp8_pk[2] = (unsigned)_lo | ((unsigned)_hi << 16);
-                                    }
-                                    { unsigned short _lo, _hi;
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_lo) : "f"(_tmem_load_4[0 + 13]), "f"(_tmem_load_4[0 + 12]));
-                                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_hi) : "f"(_tmem_load_4[0 + 15]), "f"(_tmem_load_4[0 + 14]));
-                                        _fp8_pk[3] = (unsigned)_lo | ((unsigned)_hi << 16);
-                                    }
+                                    asm("{\n\t"
+                                        ".reg .b16 _lo, _hi;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                                        "mov.b32 %0, {_lo, _hi};\n\t"
+                                        "}\n"
+                                        : "=r"(_fp8_pk[0]) : "f"(_tmem_load_4[0 + 0]), "f"(_tmem_load_4[0 + 1]), "f"(_tmem_load_4[0 + 2]), "f"(_tmem_load_4[0 + 3]));
+                                    asm("{\n\t"
+                                        ".reg .b16 _lo, _hi;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                                        "mov.b32 %0, {_lo, _hi};\n\t"
+                                        "}\n"
+                                        : "=r"(_fp8_pk[1]) : "f"(_tmem_load_4[0 + 4]), "f"(_tmem_load_4[0 + 5]), "f"(_tmem_load_4[0 + 6]), "f"(_tmem_load_4[0 + 7]));
+                                    asm("{\n\t"
+                                        ".reg .b16 _lo, _hi;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                                        "mov.b32 %0, {_lo, _hi};\n\t"
+                                        "}\n"
+                                        : "=r"(_fp8_pk[2]) : "f"(_tmem_load_4[0 + 8]), "f"(_tmem_load_4[0 + 9]), "f"(_tmem_load_4[0 + 10]), "f"(_tmem_load_4[0 + 11]));
+                                    asm("{\n\t"
+                                        ".reg .b16 _lo, _hi;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                                        "mov.b32 %0, {_lo, _hi};\n\t"
+                                        "}\n"
+                                        : "=r"(_fp8_pk[3]) : "f"(_tmem_load_4[0 + 12]), "f"(_tmem_load_4[0 + 13]), "f"(_tmem_load_4[0 + 14]), "f"(_tmem_load_4[0 + 15]));
                                     *reinterpret_cast<uint4*>(reinterpret_cast<unsigned char*>(O_ptr + o_elem) + (0)) = *reinterpret_cast<uint4*>(_fp8_pk);
                                 }
                             }
@@ -2295,7 +2692,7 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -2303,15 +2700,18 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 256;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 256;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output_0), "r"(_mma_b_lo_2), "r"(tmem_softmax_0), "r"(((first_pv_flag) ? 0 : 1)));
                     mbarrier_wait(p_full_2_addr, _phase_p_full_2_0);
@@ -2366,7 +2766,7 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -2374,15 +2774,18 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 256;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 256;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output_1), "r"(_mma_b_lo_5), "r"(tmem_softmax_1), "r"(((first_pv_flag) ? 0 : 1)));
                     mbarrier_wait(p_full_2_addr + 8, _phase_p_full_2_1);
@@ -2439,7 +2842,7 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -2447,15 +2850,18 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 256;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 256;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output_0), "r"(_mma_b_lo_8), "r"(tmem_softmax_0), "r"(((first_pv_flag_1) ? 0 : 1)));
                 mbarrier_wait(p_full_2_addr, _phase_p_full_2_0);
@@ -2468,7 +2874,7 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, id;\n\t"
+                    ".reg .b32 dhi, blo, ta, id;\n\t"
                     ".reg .b64 db;\n\t"
                     "elect.sync _|leader, 0xFFFFFFFF;\n\t"
                     "setp.ne.b32 p0, %3, 0;\n\t"
@@ -2476,15 +2882,18 @@ kernel_cake_fmha_context_fp8(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap const
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
                     "mov.b32 id, 136380432;\n\t"
+                    "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [%2], db, id, p0;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p0;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 256;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [%2 + 8], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p1;\n\t"
+                    "add.u32 ta, ta, 8;\n\t"
                     "add.u32 blo, blo, 256;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [%2 + 16], db, id, p1;\n\t"
+                    "@leader tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
                     :: "r"(tmem_output_1), "r"(_mma_b_lo_10), "r"(tmem_softmax_1), "r"(((first_pv_flag_1) ? 0 : 1)));
                 mbarrier_wait(p_full_2_addr + 8, _phase_p_full_2_1);

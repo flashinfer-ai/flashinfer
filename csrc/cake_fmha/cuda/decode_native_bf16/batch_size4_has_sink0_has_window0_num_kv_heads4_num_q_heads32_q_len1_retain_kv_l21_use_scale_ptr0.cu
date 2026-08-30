@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
 typedef unsigned int       uint32_t;
@@ -105,7 +106,7 @@ __device__ __forceinline__ uint32_t elect_sync() {
 
 __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;"
-        :: "r"(mbar_addr), "r"(count));
+        :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
 
@@ -137,19 +138,21 @@ __device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int
     return token;
 }
 
+// CTA-local pipelines have short, resident producer/consumer edges.  Omitting
+// suspendTimeHint keeps a miss on the lightweight TRYWAIT retry path; the
+// explicit loop still makes this helper blocking until acquire succeeds.
 __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
-    uint32_t ticks = 0x989680;
     asm volatile(
         "{\n\t"
         ".reg .pred P1;\n\t"
         "LAB_WAIT:\n\t"
         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
+        " P1, [%0], %1;\n\t"
         "@P1 bra.uni DONE;\n\t"
         "bra.uni LAB_WAIT;\n\t"
         "DONE:\n\t"
         "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(ticks) : "memory");
+        :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
 __device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
@@ -386,6 +389,27 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+    const int mbar_base = smem;
+    #define q_full_addr (mbar_base + 0)
+    #define q_empty_addr (mbar_base + 16)
+    #define kv_full_addr (mbar_base + 32)
+    #define kv_empty_addr (mbar_base + 64)
+    #define page_full_addr (mbar_base + 96)
+    #define page_empty_addr (mbar_base + 144)
+    #define s_full_0_addr (mbar_base + 192)
+    #define s_full_1_addr (mbar_base + 200)
+    #define p_full_0_addr (mbar_base + 208)
+    #define p_full_1_addr (mbar_base + 216)
+    #define corr_scale_0_addr (mbar_base + 224)
+    #define corr_empty_0_addr (mbar_base + 232)
+    #define corr_empty_1_addr (mbar_base + 240)
+    #define stats_empty_addr (mbar_base + 248)
+    #define o_ready_addr (mbar_base + 256)
+    #define o_empty_addr (mbar_base + 272)
+    #define order_p01_0_addr (mbar_base + 288)
+    #define order_p01_1_addr (mbar_base + 296)
+    #define tmem_dealloc_addr (mbar_base + 304)
+    #define reduction_bar_addr (mbar_base + 312)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -502,7 +526,7 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
             mbarrier_init(smem + 304, 128);
             // reduction_bar: 1 barriers, init_count=1
             mbarrier_init(smem + 312, 1);
-            asm volatile("fence.mbarrier_init.release.cluster;");
+            asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
@@ -520,27 +544,6 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
     asm volatile("barrier.cluster.wait.acquire.aligned;");
     asm volatile("tcgen05.fence::after_thread_sync;");
 
-    const int mbar_base = smem;
-    #define q_full_addr (mbar_base + 0)
-    #define q_empty_addr (mbar_base + 16)
-    #define kv_full_addr (mbar_base + 32)
-    #define kv_empty_addr (mbar_base + 64)
-    #define page_full_addr (mbar_base + 96)
-    #define page_empty_addr (mbar_base + 144)
-    #define s_full_0_addr (mbar_base + 192)
-    #define s_full_1_addr (mbar_base + 200)
-    #define p_full_0_addr (mbar_base + 208)
-    #define p_full_1_addr (mbar_base + 216)
-    #define corr_scale_0_addr (mbar_base + 224)
-    #define corr_empty_0_addr (mbar_base + 232)
-    #define corr_empty_1_addr (mbar_base + 240)
-    #define stats_empty_addr (mbar_base + 248)
-    #define o_ready_addr (mbar_base + 256)
-    #define o_empty_addr (mbar_base + 272)
-    #define order_p01_0_addr (mbar_base + 288)
-    #define order_p01_1_addr (mbar_base + 296)
-    #define tmem_dealloc_addr (mbar_base + 304)
-    #define reduction_bar_addr (mbar_base + 312)
     const int taddr = tmem_addr_storage[0];
 
     // Kernel post-init ops
@@ -551,7 +554,7 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
     const int tmem_tmem_o0 = taddr + 80;
     const int tmem_tmem_o1 = taddr + 88;
 
-    // ---- Register redistribution for WGs split across roles ----
+    // ---- Ordered hardware-WG register redistribution ----
     // Dec phase frees registers before any WG attempts inc.
     if (warp >= 12 && warp <= 15) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
@@ -628,14 +631,12 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                     " {%0, %1, %2, %3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&sv_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&sv_lo[1])), "=r"(*reinterpret_cast<uint32_t*>(&sv_lo[2])), "=r"(*reinterpret_cast<uint32_t*>(&sv_lo[3]))
-                    : "r"(my_tmem_s_base)
-                    : "memory");
+                    : "r"(my_tmem_s_base));
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                     " {%0, %1, %2, %3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[0])), "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[1])), "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[2])), "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[3]))
-                    : "r"(my_tmem_s_base + 1048576)
-                    : "memory");
+                    : "r"(my_tmem_s_base + 1048576));
                 #pragma unroll
                 for (int c = 0; c < 4; c++) {
                     sv[c] = sv_lo[c];
@@ -755,8 +756,7 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                     } else {
                         mbarrier_arrive(order_p01_1_addr);
                     }
-                    op01_stage += 1;
-                    if (op01_stage == 1) { op01_stage = 0; op01_phase ^= 1; }
+                    op01_phase ^= 1;
                     #pragma unroll
                     for (int c_5 = 2; c_5 < 8; c_5++) {
                         float _exp2_3 = approx_exp2(exp_vals[c_5]);
@@ -844,14 +844,12 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                             " {%0, %1, %2, %3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&sv_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&sv_lo[1])), "=r"(*reinterpret_cast<uint32_t*>(&sv_lo[2])), "=r"(*reinterpret_cast<uint32_t*>(&sv_lo[3]))
-                            : "r"(my_tmem_s_base)
-                            : "memory");
+                            : "r"(my_tmem_s_base));
                         asm volatile(
                             "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                             " {%0, %1, %2, %3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[0])), "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[1])), "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[2])), "=r"(*reinterpret_cast<uint32_t*>(&sv_hi[3]))
-                            : "r"(my_tmem_s_base + 1048576)
-                            : "memory");
+                            : "r"(my_tmem_s_base + 1048576));
                         #pragma unroll
                         for (int c_9 = 0; c_9 < 4; c_9++) {
                             sv[c_9] = sv_lo[c_9];
@@ -968,14 +966,12 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                             " {%0, %1, %2, %3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&o0_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&o0_lo[1])), "=r"(*reinterpret_cast<uint32_t*>(&o0_lo[2])), "=r"(*reinterpret_cast<uint32_t*>(&o0_lo[3]))
-                            : "r"(taddr + 80)
-                            : "memory");
+                            : "r"(taddr + 80));
                         asm volatile(
                             "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                             " {%0, %1, %2, %3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&o0_hi[0])), "=r"(*reinterpret_cast<uint32_t*>(&o0_hi[1])), "=r"(*reinterpret_cast<uint32_t*>(&o0_hi[2])), "=r"(*reinterpret_cast<uint32_t*>(&o0_hi[3]))
-                            : "r"(taddr + 80 + 1048576)
-                            : "memory");
+                            : "r"(taddr + 80 + 1048576));
                         float o0[8];
                         #pragma unroll
                         for (int h = 0; h < 4; h++) {
@@ -994,13 +990,11 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                         asm volatile(
                             "tcgen05.st.sync.aligned.16x256b.x1.b32"
                             " [%0], {%1, %2, %3, %4};"
-                            :: "r"(taddr + 80), "r"(*reinterpret_cast<const uint32_t*>(&o0_lo[0])), "r"(*reinterpret_cast<const uint32_t*>(&o0_lo[1])), "r"(*reinterpret_cast<const uint32_t*>(&o0_lo[2])), "r"(*reinterpret_cast<const uint32_t*>(&o0_lo[3]))
-                            : "memory");
+                            :: "r"(taddr + 80), "r"(*reinterpret_cast<const uint32_t*>(&o0_lo[0])), "r"(*reinterpret_cast<const uint32_t*>(&o0_lo[1])), "r"(*reinterpret_cast<const uint32_t*>(&o0_lo[2])), "r"(*reinterpret_cast<const uint32_t*>(&o0_lo[3])));
                         asm volatile(
                             "tcgen05.st.sync.aligned.16x256b.x1.b32"
                             " [%0], {%1, %2, %3, %4};"
-                            :: "r"(taddr + 80 + 1048576), "r"(*reinterpret_cast<const uint32_t*>(&o0_hi[0])), "r"(*reinterpret_cast<const uint32_t*>(&o0_hi[1])), "r"(*reinterpret_cast<const uint32_t*>(&o0_hi[2])), "r"(*reinterpret_cast<const uint32_t*>(&o0_hi[3]))
-                            : "memory");
+                            :: "r"(taddr + 80 + 1048576), "r"(*reinterpret_cast<const uint32_t*>(&o0_hi[0])), "r"(*reinterpret_cast<const uint32_t*>(&o0_hi[1])), "r"(*reinterpret_cast<const uint32_t*>(&o0_hi[2])), "r"(*reinterpret_cast<const uint32_t*>(&o0_hi[3])));
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     }
                     mbarrier_arrive(o_empty_addr);
@@ -1032,14 +1026,12 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                             "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                             " {%0, %1, %2, %3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&o1_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&o1_lo[1])), "=r"(*reinterpret_cast<uint32_t*>(&o1_lo[2])), "=r"(*reinterpret_cast<uint32_t*>(&o1_lo[3]))
-                            : "r"(taddr + 88)
-                            : "memory");
+                            : "r"(taddr + 88));
                         asm volatile(
                             "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                             " {%0, %1, %2, %3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&o1_hi[0])), "=r"(*reinterpret_cast<uint32_t*>(&o1_hi[1])), "=r"(*reinterpret_cast<uint32_t*>(&o1_hi[2])), "=r"(*reinterpret_cast<uint32_t*>(&o1_hi[3]))
-                            : "r"(taddr + 88 + 1048576)
-                            : "memory");
+                            : "r"(taddr + 88 + 1048576));
                         float o1[8];
                         #pragma unroll
                         for (int h_3 = 0; h_3 < 4; h_3++) {
@@ -1058,13 +1050,11 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                         asm volatile(
                             "tcgen05.st.sync.aligned.16x256b.x1.b32"
                             " [%0], {%1, %2, %3, %4};"
-                            :: "r"(taddr + 88), "r"(*reinterpret_cast<const uint32_t*>(&o1_lo[0])), "r"(*reinterpret_cast<const uint32_t*>(&o1_lo[1])), "r"(*reinterpret_cast<const uint32_t*>(&o1_lo[2])), "r"(*reinterpret_cast<const uint32_t*>(&o1_lo[3]))
-                            : "memory");
+                            :: "r"(taddr + 88), "r"(*reinterpret_cast<const uint32_t*>(&o1_lo[0])), "r"(*reinterpret_cast<const uint32_t*>(&o1_lo[1])), "r"(*reinterpret_cast<const uint32_t*>(&o1_lo[2])), "r"(*reinterpret_cast<const uint32_t*>(&o1_lo[3])));
                         asm volatile(
                             "tcgen05.st.sync.aligned.16x256b.x1.b32"
                             " [%0], {%1, %2, %3, %4};"
-                            :: "r"(taddr + 88 + 1048576), "r"(*reinterpret_cast<const uint32_t*>(&o1_hi[0])), "r"(*reinterpret_cast<const uint32_t*>(&o1_hi[1])), "r"(*reinterpret_cast<const uint32_t*>(&o1_hi[2])), "r"(*reinterpret_cast<const uint32_t*>(&o1_hi[3]))
-                            : "memory");
+                            :: "r"(taddr + 88 + 1048576), "r"(*reinterpret_cast<const uint32_t*>(&o1_hi[0])), "r"(*reinterpret_cast<const uint32_t*>(&o1_hi[1])), "r"(*reinterpret_cast<const uint32_t*>(&o1_hi[2])), "r"(*reinterpret_cast<const uint32_t*>(&o1_hi[3])));
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     }
                     mbarrier_arrive(o_empty_addr + 8);
@@ -1110,26 +1100,22 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                     " {%0, %1, %2, %3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&o0_epi_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&o0_epi_lo[1])), "=r"(*reinterpret_cast<uint32_t*>(&o0_epi_lo[2])), "=r"(*reinterpret_cast<uint32_t*>(&o0_epi_lo[3]))
-                    : "r"(taddr + 80)
-                    : "memory");
+                    : "r"(taddr + 80));
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                     " {%0, %1, %2, %3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&o0_epi_hi[0])), "=r"(*reinterpret_cast<uint32_t*>(&o0_epi_hi[1])), "=r"(*reinterpret_cast<uint32_t*>(&o0_epi_hi[2])), "=r"(*reinterpret_cast<uint32_t*>(&o0_epi_hi[3]))
-                    : "r"(taddr + 80 + 1048576)
-                    : "memory");
+                    : "r"(taddr + 80 + 1048576));
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                     " {%0, %1, %2, %3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&o1_epi_lo[0])), "=r"(*reinterpret_cast<uint32_t*>(&o1_epi_lo[1])), "=r"(*reinterpret_cast<uint32_t*>(&o1_epi_lo[2])), "=r"(*reinterpret_cast<uint32_t*>(&o1_epi_lo[3]))
-                    : "r"(taddr + 88)
-                    : "memory");
+                    : "r"(taddr + 88));
                 asm volatile(
                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                     " {%0, %1, %2, %3}, [%4];"
                     : "=r"(*reinterpret_cast<uint32_t*>(&o1_epi_hi[0])), "=r"(*reinterpret_cast<uint32_t*>(&o1_epi_hi[1])), "=r"(*reinterpret_cast<uint32_t*>(&o1_epi_hi[2])), "=r"(*reinterpret_cast<uint32_t*>(&o1_epi_hi[3]))
-                    : "r"(taddr + 88 + 1048576)
-                    : "memory");
+                    : "r"(taddr + 88 + 1048576));
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 int head_pair_slot_o = lane % 4;
                 float selected_scale0[2];
