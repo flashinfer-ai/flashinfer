@@ -56,10 +56,11 @@ static_assert(static_cast<int>(ActType::SwiGlu) ==
 static_assert(static_cast<int>(ActType::GeGlu) ==
               static_cast<int>(batchedGemm::gemmGatedAct::ActType::GeGlu));
 #ifndef TLLM_RUBIN_FEATURES
-// The pinned Rubin BMM package (TRTLLM_GEN_BMM_RUBIN) predates SiTuGlu: its
-// gemmGatedAct::ActType is {SwiGlu, GeGlu, None} with None == 2, so these two
-// symbols/values exist only in the Blackwell package. Drop this guard when the
-// Rubin pin is bumped to a package that carries SiTuGlu.
+// Historically the separate Rubin BMM pin predated SiTuGlu: its
+// gemmGatedAct::ActType was {SwiGlu, GeGlu, None} with None == 2, so these two
+// symbols/values existed only in the Blackwell package. The BMM pin is now a
+// single multi-arch package that carries SiTuGlu for both, so this guard is
+// vestigial and can be dropped once the Rubin build is re-verified.
 static_assert(static_cast<int>(ActType::SiTuGlu) ==
               static_cast<int>(batchedGemm::gemmGatedAct::ActType::SiTuGlu));
 static_assert(static_cast<int>(ActType::None) ==

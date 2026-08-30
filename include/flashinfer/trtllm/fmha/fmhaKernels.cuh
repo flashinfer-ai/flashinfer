@@ -535,6 +535,13 @@ class TllmGenFmhaKernel {
     }
   }
 
+  bool hasCgaSmemReductionKernel(RunnerParams const& params,
+                                 SelectKernelParams selectKernelParams) const {
+    selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::CgaSmemReduction;
+    auto const hashId = hashFromRunnerParams(params, selectKernelParams).first;
+    return mKernelMetaMap.find(hashId) != mKernelMetaMap.end();
+  }
+
   // Compute the number of CTAs in X, Y and Z dimension and the cluster size in the X dimension.
   void computeCtaAndClusterConfig(CtaLaunchParams& ctaLaunchParams, RunnerParams const& params,
                                   KernelMeta const& kernelMeta,
@@ -669,17 +676,25 @@ class TllmGenFmhaKernel {
         selectKernelParams.mSelectNewKernel = true;
       }
 
+      // The P32 cubin inventory contains an H576/V512 CGA kernel for the split-V
+      // headDimPerCtaV=128 form. Let the first selection pass split V, then use CGA for the
+      // exact one-token decode shape when the matching dtype-specific cubin is registered.
+      bool const useMlaH512Cga = isDsv3MinLatencyMode && params.mMaxSeqLenQ == 1 &&
+                                 selectKernelParams.mNumTokensPerPage == 32 &&
+                                 selectKernelParams.mHeadDimPerCtaV == 128 &&
+                                 selectKernelParams.mTileSizeQ == 16 &&
+                                 hasCgaSmemReductionKernel(params, selectKernelParams);
+      bool const useCgaSmemReduction =
+          (!isDsv3MinLatencyMode && params.mHeadDimV < 512) || useMlaH512Cga;
+
       // Enable the CgaSmemReduction if the numCtasPerSeqKv <= 16 as the maximum cluster dimension
       // is 16. Only the swapsMmaAbForGeneration kernel supports the CgaSmemReduction for now.
-      // headDimV >= 512 is excluded: the current trtllm-gen cubin ships no SwapsMmaAb
-      // CgaSmemReduction kernels at headDimV >= 512 (covers both MLA headDimQk=576/V=512 and
-      // non-MLA H=512), and for tileSizeQ >= 32 the CGA variant also exceeds the device smem
-      // limit. This guard can be narrowed once trtllm-gen ships a cubin with the
-      // tileSizeQ>=32 + headDimPerCtaV>=512 skip predicate.
-      if (!isDsv3MinLatencyMode && numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16 &&
+      // Other headDimV >= 512 shapes remain excluded because the cubin inventory is incomplete,
+      // and tileSizeQ >= 32 CGA variants can exceed the device shared-memory limit.
+      if (useCgaSmemReduction && numCtasPerSeqKv > 1 && numCtasPerSeqKv <= 16 &&
           isSwapsMmaAbForGenerationKernel(selectKernelParams.mKernelType) &&
           isGmemReduction(selectKernelParams.mMultiCtasKvMode) &&
-          !selectKernelParams.mForceGmemReduction && params.mHeadDimV < 512) {
+          !selectKernelParams.mForceGmemReduction) {
         selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::CgaSmemReduction;
         // Need to select a different kernel.
         selectKernelParams.mSelectNewKernel = true;

@@ -17,6 +17,7 @@
 #include <flashinfer/sampling.cuh>
 #include <flashinfer/topk.cuh>
 
+#include "topk_transform_checks.h"
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
@@ -92,52 +93,9 @@ void radix_topk_page_table_transform(TensorView input, TensorView output_page_ta
                                      bool dsa_graph_safe, Optional<TensorView> maybe_row_starts,
                                      Optional<TensorView> maybe_page_table_row_starts,
                                      Optional<TensorView> maybe_output_raw_indices) {
-  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
-  CHECK_INPUT_AND_TYPE(output_page_table, dl_int32);
-  CHECK_INPUT_AND_TYPE(src_page_table, dl_int32);
-  CHECK_INPUT_AND_TYPE(lengths, dl_int32);
-  CHECK_DEVICE(output_page_table, input);
-  CHECK_DEVICE(src_page_table, input);
-  CHECK_DEVICE(lengths, input);
-  CHECK_DIM(2, input);              // input: (num_rows, max_len)
-  CHECK_DIM(2, output_page_table);  // output_page_table: (num_rows, top_k)
-  CHECK_DIM(2, src_page_table);     // src_page_table: (batch_size, max_page_table_length)
-  CHECK_DIM(1, lengths);            // lengths: (num_rows,)
-  TVM_FFI_ICHECK_EQ(output_page_table.size(0), input.size(0))
-      << "output_page_table must have shape (num_rows, top_k)";
-  TVM_FFI_ICHECK_EQ(output_page_table.size(1), top_k)
-      << "output_page_table must have shape (num_rows, top_k)";
-  TVM_FFI_ICHECK_EQ(lengths.size(0), input.size(0)) << "lengths must have shape (num_rows,)";
-  TVM_FFI_ICHECK_GE(input.stride(0), input.size(1)) << "input rows must not overlap";
-  TVM_FFI_ICHECK_GT(page_size, 0) << "page_size must be positive";
-  TVM_FFI_ICHECK_EQ(page_size & (page_size - 1), 0) << "page_size must be a power of two";
-  TVM_FFI_ICHECK_LE(page_size, static_cast<int64_t>(1) << 30) << "page_size must not exceed 2^30";
-  TVM_FFI_ICHECK(
-      !(page_size > 1 && maybe_row_starts.has_value() && !maybe_page_table_row_starts.has_value()))
-      << "page_table_row_starts is required with page_size > 1 and row_starts";
-  if (maybe_row_starts.has_value()) {
-    CHECK_INPUT_AND_TYPE(maybe_row_starts.value(), dl_int32);
-    CHECK_DEVICE(maybe_row_starts.value(), input);
-    CHECK_DIM(1, maybe_row_starts.value());
-  }
-  if (maybe_page_table_row_starts.has_value()) {
-    CHECK_INPUT_AND_TYPE(maybe_page_table_row_starts.value(), dl_int32);
-    CHECK_DEVICE(maybe_page_table_row_starts.value(), input);
-    CHECK_DIM(1, maybe_page_table_row_starts.value());
-  }
-  if (maybe_row_to_batch.has_value()) {
-    CHECK_INPUT_AND_TYPE(maybe_row_to_batch.value(), dl_int32);
-    CHECK_DEVICE(maybe_row_to_batch.value(), input);
-    CHECK_DIM(1, maybe_row_to_batch.value());
-    TVM_FFI_ICHECK_EQ(maybe_row_to_batch.value().size(0), input.size(0))
-        << "row_to_batch must have shape (num_rows,)";
-  }
-  if (maybe_output_raw_indices.has_value()) {
-    CHECK_INPUT_AND_TYPE(maybe_output_raw_indices.value(), dl_int32);
-    CHECK_DEVICE(maybe_output_raw_indices.value(), input);
-    CHECK_DIM(2, maybe_output_raw_indices.value());
-    CHECK_SHAPE(maybe_output_raw_indices.value(), output_page_table);
-  }
+  CheckPageTableTransformArgs(input, output_page_table, src_page_table, lengths, maybe_row_to_batch,
+                              maybe_row_starts, maybe_page_table_row_starts,
+                              maybe_output_raw_indices, top_k, page_size);
   if (maybe_row_states_buffer.has_value()) {
     CHECK_DEVICE(maybe_row_states_buffer.value(), input);
   }

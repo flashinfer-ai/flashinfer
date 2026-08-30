@@ -41,8 +41,6 @@ from .jit.attention import (
     gen_batch_prefill_module,
     gen_cudnn_fmha_module,
     gen_fmha_cutlass_sm100a_module,
-    gen_single_decode_module,
-    gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
     gen_trtllm_fmha_v2_sm120_module,
 )
@@ -61,12 +59,28 @@ from .jit.fp4_quantization import (
 )
 from .jit.fp4_kv_dequantization import gen_fp4_kv_dequantization_module
 from .jit.fp4_kv_quantization import gen_fp4_kv_quantization_module
+from .jit.blackwell_msa import (
+    BLACKWELL_MSA_VARIANTS_BY_TARGET,
+    BlackwellMSATarget,
+    gen_blackwell_msa_module,
+)
 from .jit.flash_kda import (
     FlashKDATarget,
+    gen_flash_kda_bt16_chain_m64_s7_module,
+    gen_flash_kda_bt16_chain_m64_s8_module,
+    gen_flash_kda_bt16_chain_m64_s9_module,
+    gen_flash_kda_bt16_prepare_chain_m64_s8_module,
+    gen_flash_kda_bt16_prepare_beta_tma_module,
+    gen_flash_kda_bt16_prepare_module,
     gen_flash_kda_m64_module,
     gen_flash_kda_m128_module,
+    gen_flash_kda_m128_tensor_state_decay_module,
+    gen_flash_kda_m128_h12_long_module,
+    gen_flash_kda_m128_h12_short_module,
     gen_flash_kda_m128_n16_checkpoint_module,
     gen_flash_kda_m128_n16_module,
+    gen_flash_kda_m128_n16_short_module,
+    gen_flash_kda_piece_persistent_m128_module,
     gen_flash_kda_persistent_m128_module,
     gen_flash_kda_small_bh_m128_module,
 )
@@ -96,6 +110,11 @@ from .jit.fused_moe import (
     gen_trtllm_gen_routing_module,
 )
 from .jit.bgmv_moe import gen_bgmv_moe_module
+from .jit.blackwell_bgmv_moe import (
+    BLACKWELL_BGMV_MOE_DTYPES,
+    BLACKWELL_BGMV_MOE_HIDDEN_SIZES,
+    gen_blackwell_bgmv_moe_module,
+)
 from .jit.monomoe import gen_monomoe_module
 from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
 from .jit.gemm import (
@@ -157,19 +176,6 @@ def gen_fa2(
     if dtype_qo.itemsize == 1:
         return  # fp8 tensor cores not supported in fa2
 
-    yield gen_single_prefill_module(
-        backend="fa2",
-        dtype_q=dtype_qo,
-        dtype_kv=dtype_kv,
-        dtype_o=dtype_qo,
-        head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        pos_encoding_mode=0,
-        use_sliding_window=use_sliding_window,
-        use_logits_soft_cap=use_logits_soft_cap,
-        use_fp16_qk_reduction=False,
-    )
-
     yield gen_batch_prefill_module(
         backend="fa2",
         dtype_q=dtype_qo,
@@ -185,17 +191,6 @@ def gen_fa2(
     )
 
     if not prefill_only:
-        yield gen_single_decode_module(
-            dtype_q=dtype_qo,
-            dtype_kv=dtype_kv,
-            dtype_o=dtype_qo,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            pos_encoding_mode=0,
-            use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-        )
-
         yield gen_batch_decode_module(
             dtype_q=dtype_qo,
             dtype_kv=dtype_kv,
@@ -524,6 +519,8 @@ def gen_all_modules(
     has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
+    has_blackwell_msa_sm100a = sm_capabilities.get("blackwell_msa_sm100a", False)
+    has_blackwell_msa_sm103a = sm_capabilities.get("blackwell_msa_sm103a", False)
     has_flash_kda_prefill_sm100a = sm_capabilities.get(
         "flash_kda_prefill_sm100a", False
     )
@@ -573,6 +570,17 @@ def gen_all_modules(
     )
     if has_sm120 or has_sm121:
         jit_specs.append(gen_nvfp4_attention_sm120_module())
+    blackwell_msa_targets: tuple[tuple[BlackwellMSATarget, bool], ...] = (
+        ("sm100a", has_blackwell_msa_sm100a),
+        ("sm103a", has_blackwell_msa_sm103a),
+    )
+    for blackwell_msa_target, enabled in blackwell_msa_targets:
+        if enabled:
+            jit_specs.extend(
+                gen_blackwell_msa_module(variant, blackwell_msa_target)
+                for variant in BLACKWELL_MSA_VARIANTS_BY_TARGET[blackwell_msa_target]
+            )
+
     # CUDA 12.8 predates the SM100-family target and retains one exact B200
     # cubin per variant. CUDA 12.9+ registers one family cubin per variant.
     flash_kda_targets: tuple[tuple[FlashKDATarget, bool], ...] = (
@@ -585,9 +593,20 @@ def gen_all_modules(
                 [
                     gen_flash_kda_m64_module(flash_kda_target),
                     gen_flash_kda_m128_module(flash_kda_target),
+                    gen_flash_kda_m128_tensor_state_decay_module(flash_kda_target),
+                    gen_flash_kda_m128_h12_short_module(flash_kda_target),
+                    gen_flash_kda_m128_h12_long_module(flash_kda_target),
                     gen_flash_kda_m128_n16_module(flash_kda_target),
                     gen_flash_kda_m128_n16_checkpoint_module(flash_kda_target),
+                    gen_flash_kda_m128_n16_short_module(flash_kda_target),
+                    gen_flash_kda_piece_persistent_m128_module(flash_kda_target),
                     gen_flash_kda_small_bh_m128_module(flash_kda_target),
+                    gen_flash_kda_bt16_prepare_module(flash_kda_target),
+                    gen_flash_kda_bt16_prepare_beta_tma_module(flash_kda_target),
+                    gen_flash_kda_bt16_chain_m64_s7_module(flash_kda_target),
+                    gen_flash_kda_bt16_chain_m64_s8_module(flash_kda_target),
+                    gen_flash_kda_bt16_chain_m64_s9_module(flash_kda_target),
+                    gen_flash_kda_bt16_prepare_chain_m64_s8_module(flash_kda_target),
                 ]
             )
             jit_specs.append(gen_flash_kda_persistent_m128_module(flash_kda_target))
@@ -657,6 +676,12 @@ def gen_all_modules(
         jit_specs.append(gen_gemm_module())
         # Multi-LoRA MoE BGMV kernel
         jit_specs.append(gen_bgmv_moe_module())
+        if sm_capabilities.get("sm100a_exact", False):
+            jit_specs.extend(
+                gen_blackwell_bgmv_moe_module(hidden_size, dtype)
+                for hidden_size in BLACKWELL_BGMV_MOE_HIDDEN_SIZES
+                for dtype in BLACKWELL_BGMV_MOE_DTYPES
+            )
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
         if has_sm90:
@@ -1111,6 +1136,14 @@ def detect_sm_capabilities():
         "sm100": has_sm("compute_100", "12.8"),
         "sm100a_exact": (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
         and cuda_version >= Version("12.8"),
+        "blackwell_msa_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
+        ),
+        "blackwell_msa_sm103a": (
+            bool({(10, "3a"), (10, "3f")} & compilation_context.TARGET_CUDA_ARCHS)
+            and cuda_version >= Version("12.9")
+        ),
         "flash_kda_prefill_sm100a": (
             (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
             and Version("12.8") <= cuda_version < Version("12.9")

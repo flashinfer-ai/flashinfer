@@ -208,6 +208,39 @@ def _rows_for_impl(impl: str) -> tuple:
     return tuple(row for row in load_gdn_fused_decode_registry() if row["impl"] == impl)
 
 
+# The geometry fields, in the order the kernel modules take them.
+_GEOMETRY_FIELDS = (
+    "hidden",
+    "n_ba",
+    "qkv_dim",
+    "h_q",
+    "hv",
+    "d",
+    "conv_width",
+    "conv_state_len",
+)
+
+
+def registry_geometries() -> List[tuple]:
+    """Distinct layer geometries in the registry, in first-seen order.
+
+    The layer geometry is a compile-time parameter of both impls, so this is
+    the set that would have to be covered to precompile this op ahead of time
+    (one CUDA module per geometry); batch size, the query scale and the
+    conv-state layout are handled inside a module or per compiled CuTe-DSL
+    variant.  Both impls JIT-compile on first eager dispatch instead (see the
+    AOT note in README.md), so nothing in the build path calls this today --
+    it is what the tiling test enumerates, and what a JIT-disabled deployment
+    would iterate over to restore an AOT entry.
+    """
+    geometries: dict = {}
+    for row in load_gdn_fused_decode_registry():
+        geometries.setdefault(
+            tuple(int(row[field]) for field in _GEOMETRY_FIELDS), None
+        )
+    return list(geometries)
+
+
 @functools.cache
 def _load_impl(impl: str):
     """Import the ``kernel/gdn_fused_decode_<impl>`` module, or None."""
@@ -648,7 +681,7 @@ def try_run_gdn_fused_decode_specialized(
             if row is None or impl is None or row["impl"] in _failed_impls:
                 continue
             if capturing and not impl.ready_for_graph_capture(
-                hidden_states, conv_state, scale
+                signature, hidden_states, conv_state, scale
             ):
                 skipped_unready = True
                 continue
@@ -694,8 +727,8 @@ def try_run_gdn_fused_decode_specialized(
                 "CUDA-graph capture hit a registered gdn_fused_decode_step "
                 "signature before any specialized backend was compiled and "
                 "warmed; capturing the composable path instead. Run one eager "
-                "call per (batch size, scale, conv-state layout) before "
-                "capture to enable the specialized kernels."
+                "call per (layer geometry, batch size, scale, conv-state "
+                "layout) before capture to enable the specialized kernels."
             )
     return None
 
@@ -758,6 +791,7 @@ __all__ = [
     "gdn_fused_decode_supported_geometry",
     "load_gdn_fused_decode_registry",
     "match_gdn_fused_decode_signature",
+    "registry_geometries",
     "signature_from_geometry",
     "signature_from_tensors",
     "try_run_gdn_fused_decode_specialized",
