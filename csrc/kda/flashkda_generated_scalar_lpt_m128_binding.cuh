@@ -56,7 +56,8 @@ inline void RunScalarLptM128(
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const auto prepared = PrepareCommonInputs<
       FLASHKDA_GENERATED_VALUE_ROWS, FLASHKDA_GENERATED_TMA_TILE_TOKENS,
-      FLASHKDA_GENERATED_PAIR_PACKED_BETA != 0>(
+      FLASHKDA_GENERATED_PAIR_PACKED_BETA != 0,
+      FLASHKDA_GENERATED_VALUE_TMA_RANK == 4>(
       q, k, v, g, beta, beta_tma, a_log, dt_bias, cu_seqlens, seq_order,
       state_indices, initial_state, out, final_state, descriptor_storage,
       prepare_descriptors, num_heads, beta_token_stride, state_slot_stride,

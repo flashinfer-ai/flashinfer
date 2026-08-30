@@ -201,7 +201,7 @@ inline StatePointerSlots ResolveStatePointerSlots(
 inline cudaStream_t CheckedStream(int64_t cuda_stream);
 
 template <int ValueRows, int ChunkTokens, bool PairPackedBeta,
-          bool QkStyleValueTma = (ValueRows == 128)>
+          bool QkStyleValueTma>
 inline PreparedCommonInputs PrepareCommonInputs(
     const TensorView& q, const TensorView& k, const TensorView& v,
     const TensorView& g, const TensorView& beta, const TensorView& beta_tma,
@@ -242,7 +242,7 @@ inline PreparedCommonInputs PrepareCommonInputs(
 }
 
 template <int ValueRows, int ChunkTokens, bool PairPackedBeta,
-          bool QkStyleValueTma = (ValueRows == 128)>
+          bool QkStyleValueTma>
 inline PreparedCommonInputs PrepareCommonInputsWithRawState(
     const TensorView& q, const TensorView& k, const TensorView& v,
     const TensorView& g, const TensorView& beta, const TensorView& beta_tma,

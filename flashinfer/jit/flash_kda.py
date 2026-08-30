@@ -452,6 +452,8 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
         raise ValueError("generated FlashKDA receipt lacks physical-selector evidence")
     if receipt.get("physical_selector_collision_count") != 0:
         raise ValueError("generated FlashKDA receipt has selector collisions")
+    if receipt.get("launch_contract_schema_version") != 2:
+        raise ValueError("unsupported generated FlashKDA launch-contract schema")
     receipt_selector_index_sha256 = _require_sha256(
         receipt.get("physical_selector_index_sha256"),
         "generated FlashKDA receipt physical_selector_index_sha256",
@@ -504,6 +506,18 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
         abi_variant = row.get("abi_variant")
         state_mode = row.get("state_mode")
         launch_contract = row.get("launch_contract")
+        if (
+            not isinstance(launch_contract, dict)
+            or launch_contract.get("schema_version") != 2
+        ):
+            raise ValueError(f"{label} has an unsupported launch contract")
+        value_tma_rank = launch_contract.get("value_tma_rank")
+        if (
+            value_tma_rank == 0
+            if abi_family in ("bt16_prepare", "affine_scan")
+            else value_tma_rank in (3, 4)
+        ) is not True:
+            raise ValueError(f"{label} has an invalid sealed V TensorMap rank")
         route_role = (
             launch_contract.get("route_role")
             if isinstance(launch_contract, dict)
