@@ -253,6 +253,7 @@ class TRTLLMAllReduceFusionWorkspace(AllReduceFusionWorkspace):
         _initialize_allreduce_fusion_protocol(
             ipc_handles=self.ipc_handles,
             tp_rank=self.rank,
+            tp_size=self.metadata["tp_size"],
             flag_size=self.metadata["flag_size"],
             lamport_buffer_size=self.metadata["lamport_buffer_size"],
             lamport_comm_size=self.metadata["lamport_comm_size"],

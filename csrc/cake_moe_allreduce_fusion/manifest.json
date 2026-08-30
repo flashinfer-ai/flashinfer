@@ -1,0 +1,63 @@
+{
+  "architectures": [
+    "sm_100a",
+    "sm_103a"
+  ],
+  "compile_flags": [
+    "--use_fast_math"
+  ],
+  "constraints": {
+    "dtypes": [
+      "float16",
+      "bfloat16"
+    ],
+    "hidden_dim": 7168,
+    "max_tokens": 2048,
+    "quantization": false,
+    "world_sizes": [
+      2,
+      4
+    ]
+  },
+  "kernel_symbols": [
+    "kernel_cake_trtllm_moe_reduction_float16_ws2_o0110",
+    "kernel_cake_trtllm_moe_reduction_float16_ws2_o1110",
+    "kernel_cake_trtllm_moe_reduction_float16_ws4_o0110",
+    "kernel_cake_trtllm_moe_reduction_float16_ws4_o1110",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws2_o0110",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws2_o1110",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws4_o0110",
+    "kernel_cake_trtllm_moe_reduction_bfloat16_ws4_o1110",
+    "kernel_cake_trtllm_moe_finalize_float16_ws2_o110",
+    "kernel_cake_trtllm_moe_finalize_float16_ws4_o110",
+    "kernel_cake_trtllm_moe_finalize_bfloat16_ws2_o110",
+    "kernel_cake_trtllm_moe_finalize_bfloat16_ws4_o110"
+  ],
+  "launch": {
+    "block_threads": 224,
+    "cluster_dim": [
+      4,
+      1,
+      1
+    ],
+    "dynamic_smem_bytes": 256
+  },
+  "schema_version": 3,
+  "source_sha256": "f93ee6c70ac283533df960d8192ecd0dfc796c54aac9145a5efe1e5bfce14bad",
+  "workspace_protocol": {
+    "flag_region_bytes_by_world_size": {
+      "2": 2048,
+      "4": 4288
+    },
+    "tp4_ack_tail": {
+      "bytes": 192,
+      "consumers": 4,
+      "empty_sentinel_u16": 32768,
+      "generation_stride_bytes": 64,
+      "generations": 3,
+      "offset_bytes": 4096,
+      "ready_u16": 0,
+      "slot_bytes": 16
+    }
+  }
+}
