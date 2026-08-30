@@ -156,7 +156,7 @@ class _ScalarFinalizeUnicastDeviceKernel:
         token = block // self.ctas_per_token
         hidden_index = (block % self.ctas_per_token) * self.threads + tidx
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         staged_indices = smem.allocate_array(Int32, self.top_k)
         staged_weights = smem.allocate_array(Float32, self.top_k)
         metadata_index = Int32(tidx)
@@ -365,7 +365,7 @@ class _NarrowVectorFinalizeUnicastDeviceKernel:
         token = block // self.ctas_per_token
         fragment = (block % self.ctas_per_token) * self.threads + tidx
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         staged_indices = smem.allocate_array(Int32, self.top_k)
         staged_weights = smem.allocate_array(Float32, self.top_k)
         metadata_index = Int32(tidx)
@@ -664,7 +664,7 @@ class _VectorFinalizeUnicastDeviceKernel:
         token = block // self.ctas_per_token
         fragment = (block % self.ctas_per_token) * self.threads + tidx
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         staged_indices = smem.allocate_array(Int32, self.top_k)
         staged_weights = smem.allocate_array(Float32, self.top_k)
         metadata_index = Int32(tidx)
@@ -1244,7 +1244,7 @@ class _MaterializeRMSNormDeviceKernel:
                     reduction_profile=0,
                 )
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         warp_sums = smem.allocate_array(Float32, self.warps)
         full_sum = _block_sum(thread_sum, warp_sums, self.warps)
         inverse_rms = cute.math.rsqrt(

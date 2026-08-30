@@ -834,7 +834,7 @@ def _kda_packed_t1_smem_kernel(
     warp_idx = tidx // 32
     WARP_ROWS: cutlass.Constexpr[int] = 2 * ilp_rows
 
-    smem = cutlass.utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
     sH = smem.allocate_tensor(
         cutlass.BFloat16,
         cute.make_layout((n_stages, CHUNK_ROWS, K), stride=(CHUNK_ROWS * K, K, 1)),
@@ -1402,7 +1402,7 @@ def _kda_packed_t1_persist_kernel(
     VALSI = tuple(range(vals))
     ITERI = tuple(range(ITERS))
 
-    smem = cutlass.utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
     sH = smem.allocate_tensor(
         cutlass.BFloat16,
         cute.make_layout((n_stages, CHUNK_ROWS, K), stride=(CHUNK_ROWS * K, K, 1)),

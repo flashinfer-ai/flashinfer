@@ -38,7 +38,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu.common import OperandMajorMode
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -487,10 +486,10 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.cta_tiler,
             self.is_persistent,
         )
-        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
-        self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
-        self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
-        self.o_layout = utils.LayoutEnum.from_tensor(o)
+        self.q_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(q).mma_major_mode()
+        self.k_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(k).mma_major_mode()
+        self.v_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(v).mma_major_mode()
+        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(o)
 
         if cutlass.const_expr(self.q_major_mode != OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
@@ -806,7 +805,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_o)
 
         # Alloc
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         load_q_producer, load_q_consumer = pipeline.PipelineTmaUmma.create(
@@ -927,7 +926,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             barrier_storage=storage.s1_p0_inplace_barrier_ptr.data_ptr(),
             defer_sync=True,
         ).make_participants()
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             # Correction warp is the last one that accesses tmem

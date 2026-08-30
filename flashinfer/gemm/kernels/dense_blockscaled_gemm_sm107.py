@@ -211,7 +211,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         self.use_2cta_instrs = mma_inst_shape[0] == 256
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         self.arch = "sm_107"
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(self.arch)
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
         self.swizzle_size = swizzle_size
         self.raster_order = raster_order
@@ -374,9 +374,9 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         a_major_mode = OperandMajorMode.K
         b_major_mode = OperandMajorMode.K
         if cutlass.const_expr(swap_ab):
-            c_layout = utils.LayoutEnum.COL_MAJOR
+            c_layout = cutlass.tensor_utils.LayoutEnum.COL_MAJOR
         else:
-            c_layout = utils.LayoutEnum.ROW_MAJOR
+            c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
 
         layouts = (a_major_mode, b_major_mode, c_layout)
         problem_mnkl = (cutlass.Int32(m), cutlass.Int32(n), cutlass.Int32(k), l)
@@ -418,7 +418,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         b_dtype: Type[cutlass.Numeric],
         epi_tile: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: cutlass.tensor_utils.LayoutEnum,
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         smem_capacity: int,
@@ -440,7 +440,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         :param c_dtype: Data type of operand C (output).
         :type c_dtype: type[cutlass.Numeric]
         :param c_layout: Layout enum of operand C.
-        :type c_layout: utils.LayoutEnum
+        :type c_layout: cutlass.tensor_utils.LayoutEnum
         :param sf_dtype: Data type of Scale factor.
         :type sf_dtype: type[cutlass.Numeric]
         :param sf_vec_size: Scale factor vector size.
@@ -869,7 +869,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         sfb_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
         alpha: cute.Tensor,
-        layouts: cutlass.Constexpr[Tuple[OperandMajorMode, OperandMajorMode, utils.LayoutEnum]],
+        layouts: cutlass.Constexpr[Tuple[OperandMajorMode, OperandMajorMode, cutlass.tensor_utils.LayoutEnum]],
         problem_mnkl: Tuple[int, int, int, int],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
@@ -922,7 +922,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
             b_layout = cute.make_ordered_layout((cute.assume(n, 32), k, l), order=(1, 0, 2))
         # c supports strided output for uGPU shared buffers.
         # c_ld: leading dimension (0 = use default contiguous layout).
-        if cutlass.const_expr(self.c_layout == utils.LayoutEnum.ROW_MAJOR):
+        if cutlass.const_expr(self.c_layout == cutlass.tensor_utils.LayoutEnum.ROW_MAJOR):
             actual_c_ld = c_ld + (n - c_ld) * (c_ld == 0)
             c_out_layout = cute.make_layout(
                 (m, cute.assume(n, 32), l), stride=(actual_c_ld, 1, m * actual_c_ld)
@@ -1277,7 +1277,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # Initialize mainloop ab_pipeline (barrier) and states
@@ -1311,7 +1311,7 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
         )
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -2760,7 +2760,7 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         sfa_ptr: cute.Pointer,
         sfb_ptr: cute.Pointer,
         c_ptr: cute.Pointer,
-        layouts: cutlass.Constexpr[Tuple[OperandMajorMode, OperandMajorMode, utils.LayoutEnum]],
+        layouts: cutlass.Constexpr[Tuple[OperandMajorMode, OperandMajorMode, cutlass.tensor_utils.LayoutEnum]],
         problem_mnkl: Tuple[int, int, int, int],
         preferred_max_active_clusters: cutlass.Constexpr,
         fallback_max_active_clusters: cutlass.Constexpr,
@@ -2817,7 +2817,7 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
             b_layout = cute.make_ordered_layout((cute.assume(n, 32), k, l), order=(1, 0, 2))
         # c supports strided output for uGPU shared buffers.
         # c_ld: leading dimension (0 = use default contiguous layout).
-        if cutlass.const_expr(self.c_layout == utils.LayoutEnum.ROW_MAJOR):
+        if cutlass.const_expr(self.c_layout == cutlass.tensor_utils.LayoutEnum.ROW_MAJOR):
             actual_c_ld = c_ld + (n - c_ld) * (c_ld == 0)
             c_layout = cute.make_layout(
                 (m, cute.assume(n, 32), l), stride=(actual_c_ld, 1, m * actual_c_ld)
@@ -3230,7 +3230,7 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # Initialize mainloop ab_pipeline (barrier) and states
@@ -3264,7 +3264,7 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         )
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -4073,9 +4073,9 @@ class Sm107BlockScaledPersistentDenseGemmMixedClustersKernel(
         a_major_mode = OperandMajorMode.K
         b_major_mode = OperandMajorMode.K
         if cutlass.const_expr(swap_ab):
-            c_layout = utils.LayoutEnum.COL_MAJOR
+            c_layout = cutlass.tensor_utils.LayoutEnum.COL_MAJOR
         else:
-            c_layout = utils.LayoutEnum.ROW_MAJOR
+            c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
 
         self(
             a_ptr,

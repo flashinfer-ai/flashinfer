@@ -33,7 +33,7 @@ from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.utils.smem_allocator import SmemAllocator
+from cutlass.memory import SmemAllocator
 
 from .block_scan import block_prefix_sum_kernel
 from .gvr_topk_decode import GvrTopKKernel

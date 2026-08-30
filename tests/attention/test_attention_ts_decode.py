@@ -35,7 +35,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float16, Float8E4M3FN, Int32
 from cutlass.cute.runtime import make_ptr
-from cutlass import utils as cutlass_utils
 from cutlass.experimental.task_scheduling.memory import SmemAllocation
 
 from flashinfer.attention.prims_ts import (
@@ -2022,7 +2021,7 @@ def _assert_decode_smem_within_capacity(cfg, smem_allocator) -> None:
         + smem_allocator.barrier_smem_bytes
     )
     launch_smem_bytes = _align_up(unified_smem_bytes, cfg.stensor_align)
-    assert launch_smem_bytes <= cutlass_utils.get_smem_capacity_in_bytes("sm_100")
+    assert launch_smem_bytes <= cutlass.memory.get_smem_capacity_in_bytes("sm_100")
 
 
 @pytest.mark.parametrize("page_size", (16, 32, 64, 128))

@@ -118,7 +118,7 @@ class TopKSelectRadixSm12x:
             scal: cute.struct.MemRange[cutlass.Int32, 8]
             pat: cute.struct.MemRange[cutlass.Uint32, 1]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         st = smem.allocate(SharedStorage)
         hist = st.hist.get_tensor(cute.make_layout(_NUM_BINS))
         grpsum = st.grpsum.get_tensor(cute.make_layout(_NUM_BINS // _GROUP))

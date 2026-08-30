@@ -170,7 +170,7 @@ class _ScalarFinalizePublishDeviceKernel:
         cta_in_token = block % self.ctas_per_token
         hidden_index = cta_in_token * self.threads + tidx
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         staged_indices = smem.allocate_array(Int32, self.top_k)
         staged_weights = smem.allocate_array(Float32, self.top_k)
         metadata_index = Int32(tidx)
@@ -381,7 +381,7 @@ class _QuadFinalizePublishDeviceKernel:
         cta_in_token = block % self.ctas_per_token
         fragment = cta_in_token * self.threads + tidx
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         staged_indices = smem.allocate_array(Int32, self.top_k)
         staged_weights = smem.allocate_array(Float32, self.top_k)
         metadata_index = Int32(tidx)
@@ -959,7 +959,7 @@ class _LamportResidualRMSNormDeviceKernel:
                     reduction_profile=0,
                 )
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         warp_sums = smem.allocate_array(Float32, self.warps)
         cluster_sums = smem.allocate_array(Float32, self.cluster_size)
         cta_sum = _group_leader_block_sum(

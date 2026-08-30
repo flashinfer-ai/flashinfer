@@ -20,7 +20,6 @@ from cutlass.cutlass_dsl import Int64, T
 from src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import AddressSpace
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 
@@ -1121,7 +1120,7 @@ class SwapABSwigluFp4Epilogue:
     ) -> Union[cute.Layout, cute.ComposedLayout]:
         layout = sm100_utils.make_smem_layout_epi(
             self.fc1_output_dtype,
-            utils.LayoutEnum.ROW_MAJOR,
+            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
             (self._EpilogueTokenTileSize, self._EpilogueFc1IntermediateDownTileSize),
             n_stages,
         )

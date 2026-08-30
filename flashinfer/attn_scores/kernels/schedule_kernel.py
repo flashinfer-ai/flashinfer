@@ -33,7 +33,7 @@ from typing import Tuple
 import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
-from cutlass.utils.smem_allocator import SmemAllocator
+from cutlass.memory import SmemAllocator
 
 
 class PagedMQALogitsScheduleKernel:

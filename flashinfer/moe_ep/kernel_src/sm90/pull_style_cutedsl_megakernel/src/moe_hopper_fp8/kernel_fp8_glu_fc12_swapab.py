@@ -14,7 +14,6 @@ except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.typing import Float32
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.hopper_helpers as sm90_utils
@@ -290,7 +289,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         self.token_back_reg_cnt = 32
         self.task_reg_cnt = 32
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(self.arch)
 
     def _validate_mma_tiler_and_cluster_shape(self) -> None:
         """Validate user-provided geometry against v1 fused-fc12 constraints.
@@ -795,11 +794,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         self.b_dtype: Type[cutlass.Numeric] = activation_gemm.element_type
         self.fc1_output_dtype: Type[cutlass.Numeric] = fc1_output_gemm.element_type
         self.sf_dtype: Type[cutlass.Numeric] = activation_sf.element_type
-        self.a_layout = utils.LayoutEnum.from_tensor(fc1_weight_gemm)
-        self.b_layout = utils.LayoutEnum.from_tensor(activation_gemm)
+        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_weight_gemm)
+        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(activation_gemm)
         self.a_major_mode = self.a_layout.sm90_mma_major_mode()
         self.b_major_mode = self.b_layout.sm90_mma_major_mode()
-        self.fc1_output_layout = utils.LayoutEnum.from_tensor(fc1_output_gemm)
+        self.fc1_output_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_output_gemm)
 
         self._setup_attributes()
         tiled_mma = self._create_tiled_mma()
@@ -1177,7 +1176,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             ]
             sched_storage: SchedStorage
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # MegaMoE-only dispatch-warp SMEM (pull_buffer, mbarriers, etc.).

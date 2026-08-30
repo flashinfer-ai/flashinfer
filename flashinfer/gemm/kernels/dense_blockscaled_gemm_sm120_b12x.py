@@ -311,7 +311,7 @@ class DenseGemmKernel:
             self.num_mma_warps + 1  # 1 warp for DMA
         ) * self.num_threads_per_warp
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_120")
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
 
         self.ab_stage = None
         self.epi_stage = None
@@ -432,7 +432,7 @@ class DenseGemmKernel:
                 ),
             )
             self.svdquant_a_smem_layout = sm90_utils.make_smem_layout_a(
-                utils.LayoutEnum.ROW_MAJOR,
+                cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
                 (
                     self.mma_tile_shape_mnk[0],
                     self.mma_tile_shape_mnk[1],
@@ -442,7 +442,7 @@ class DenseGemmKernel:
                 self.ab_stage,
             )
             self.svdquant_b_smem_layout = sm90_utils.make_smem_layout_b(
-                utils.LayoutEnum.ROW_MAJOR,
+                cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
                 (
                     self.mma_tile_shape_mnk[0],
                     self.mma_tile_shape_mnk[1],
@@ -515,9 +515,9 @@ class DenseGemmKernel:
         self.sf_dtype = sfa.element_type
         self.is_mxfp8 = self.a_dtype == cutlass.Float8E4M3FN
 
-        self.a_layout = utils.LayoutEnum.from_tensor(a)
-        self.b_layout = utils.LayoutEnum.from_tensor(b)
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
+        self.a_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(a)
+        self.b_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(b)
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
         self.svdquant_enabled = svdquant_d is not None
         if cutlass.const_expr(self.svdquant_enabled):
             self.svdquant_dtype = svdquant_d.element_type
@@ -1112,7 +1112,7 @@ class DenseGemmKernel:
             )
 
         # Allocate shared memory
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # Pipeline setup

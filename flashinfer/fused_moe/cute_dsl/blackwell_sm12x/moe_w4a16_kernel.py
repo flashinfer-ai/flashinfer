@@ -996,7 +996,7 @@ class W4A16GemmKernel:
         tid = Int32(tidx)
         cta = Int32(bidx)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         @cute.struct
         class Storage:
@@ -4393,7 +4393,7 @@ class W4A16FusedMoeKernel:
         cta = Int32(bidx)
         grid_x = Int32(grid_x_raw)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         @cute.struct
         class Storage:

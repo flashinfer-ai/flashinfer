@@ -1690,7 +1690,9 @@ def _infer_single_instance_kv_stages(
         cfg.qk_mma_tiler[1] * cfg.head_dim_per_stage_kv * kv_dtype_width // 8
     )
     kv_stage_footprint_bytes = kv_stage_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
-    kv_budget_bytes = utils.get_smem_capacity_in_bytes("sm_100") - fixed_smem_bytes
+    kv_budget_bytes = (
+        cutlass.memory.get_smem_capacity_in_bytes("sm_100") - fixed_smem_bytes
+    )
     memory_fit_stages = kv_budget_bytes // kv_stage_footprint_bytes
     cadence_stages = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
     if require_cadence and memory_fit_stages < cadence_stages:

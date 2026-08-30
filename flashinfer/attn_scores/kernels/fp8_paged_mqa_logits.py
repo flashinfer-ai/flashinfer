@@ -76,7 +76,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Float16, Int32
 from cutlass._mlir import ir
@@ -287,7 +286,7 @@ class FP8MQALogitsKernel:
             self.num_umma_stages = 1
 
         if max_kv_pipeline:
-            smem_capacity = utils.get_smem_capacity_in_bytes()
+            smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
             # Reserve ~1 KB for barriers and misc
             SMEM_BUDGET = smem_capacity - 1024
             # KV+Scale per stage (×2 groups):
@@ -377,7 +376,7 @@ class FP8MQALogitsKernel:
 
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
-        self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        self.num_tmem_alloc_cols = cutlass.memory.get_num_tmem_alloc_cols(tCtAcc_fake)
         self.num_tmem_alloc_cols_total = (
             self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages
         )
@@ -440,8 +439,8 @@ class FP8MQALogitsKernel:
 
         a_dtype = a.element_type
         b_dtype = b.element_type
-        a_major = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        b_major = utils.LayoutEnum.ROW_MAJOR.mma_major_mode()
+        a_major = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
+        b_major = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR.mma_major_mode()
 
         tiled_mma = self._setup_mma(a_dtype, b_dtype, a_major, b_major)
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
@@ -640,7 +639,7 @@ class FP8MQALogitsKernel:
             cpasync.prefetch_descriptor(tma_atom_w)
             cpasync.prefetch_descriptor(tma_atom_s)
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         block_kv_val = self.block_kv
@@ -776,7 +775,7 @@ class FP8MQALogitsKernel:
         tmem_alloc_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=tmem_alloc_num_threads
         )
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=0,  # math warp 0 does alloc+free (last TMEM consumer)
@@ -933,7 +932,7 @@ class FP8MQALogitsKernel:
         num_tmem_alloc_cols_total = self.num_tmem_alloc_cols_total
 
         # Epilogue setup
-        c_layout = utils.LayoutEnum.ROW_MAJOR
+        c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
         epi_sub_mn = (epi_tile[0], num_heads // num_epi_subtiles)
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             self.cta_tile_shape_mnk,

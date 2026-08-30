@@ -410,7 +410,7 @@ class SparsePrefillSm12x:
             tile_first = q_tile * tpt
             q_off = mQOffset[batch_idx]
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             storage = smem.allocate(SharedStorage)
             sK = storage.sK.get_tensor(self._make_skv_layout())
             sV = storage.sV.get_tensor(self._make_skv_layout())

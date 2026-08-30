@@ -217,7 +217,7 @@ class MsaProxyScoreFp4MmaSm12x:
                     cute.struct.MemRange[cutlass.Float32, self._M * 2], 1024
                 ]
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             storage = smem.allocate(SharedStorage)
             sA = storage.sA.get_tensor(sA_layout)
             sB = storage.sB.get_tensor(sB_layout)
@@ -774,7 +774,7 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
                 cute.struct.MemRange[cutlass.Float32, self._M * 2], 1024
             ]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sA = storage.sA.get_tensor(sA_layout)
         sB = storage.sB.get_tensor(sB_layout)

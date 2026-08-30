@@ -65,7 +65,6 @@ def _get_max_tmem_alloc_cols(compute_capability: str) -> int:
 
 
 import cutlass.cute.nvgpu.cpasync as cpasync
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -1209,7 +1208,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose)
 
         # Alloc
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Tensor memory dealloc barrier init.
@@ -1218,7 +1217,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         # keeps reading P / writing O until its mma_o.producer_tail. Putting
         # allocate + free on W11 avoids the race where W8 frees TMEM while
         # W11 still has in-flight mma_pv. See OPT#14.
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
             allocator_warp_id=self.mma_pv_warp_id,
@@ -1961,7 +1960,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
 
         # Inactive compact rows still complete the PDL protocol, but do not
         # touch workspace or enter the active-row shared-memory barrier.
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.reducer_max_splits * self.acc_dtype.width // 8, 16)
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
         smem_lse_scale = cute.make_tensor(

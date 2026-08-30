@@ -36,7 +36,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import tcgen05, OperandMajorMode
 import cutlass.cute.nvgpu.cpasync as cpasync
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -1041,11 +1040,11 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose_cmp)
 
         # Alloc
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
             allocator_warp_id=self.mma_pv_warp_id,
@@ -1667,7 +1666,7 @@ class BlackwellHeavilyCompressedAttentionForwardFP8:
         local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
 
         # Alloc shared memory
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(MAX_SPLITS * self.acc_dtype.width // 8, 16)
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
         smem_lse_scale = cute.make_tensor(lse_scale_ptr, cute.make_layout(MAX_SPLITS))

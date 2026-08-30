@@ -272,7 +272,7 @@ class DataPreprocess:
         tid = cute.arch.thread_idx()[0]
         hidden = activation_bf16.shape[1]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         warp_partials = smem.allocate_array(Float32, num_warps)
 
         is_padding = False
@@ -366,7 +366,7 @@ class DataPreprocess:
         # Stage the whole bf16 row into swizzled smem via cp.async (LDGSTS):
         # coalesced 16 B loads (8 bf16/lane), all issued up front, no mbarrier.
         # The swizzle makes the later per-block LDS.128 bank-conflict free.
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         smem_row = smem.allocate_tensor(
             cutlass.BFloat16,
             cute.make_layout(hidden),
@@ -488,7 +488,7 @@ class DataPreprocess:
         data_rcp_limit = Float32(self._mxfp8_data_rcp_limit)
         fp32_max = Fp32Max
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         smem_row = smem.allocate_tensor(
             cutlass.BFloat16,
             cute.make_layout(hidden),

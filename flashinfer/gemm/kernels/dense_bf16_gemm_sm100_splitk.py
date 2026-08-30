@@ -15,7 +15,6 @@ import functools
 import cuda.bindings.driver as _cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Int32
 from cutlass._mlir.dialects import llvm
@@ -26,7 +25,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
-_SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
+_SMEM_CAPACITY_BYTES = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
 
 #: K extent of one CTA tile.
 _CTA_K = 128
@@ -372,7 +371,7 @@ class SplitKDenseGemmKernel:
             ),
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            smem=cute.Int64(cutlass.memory.get_smem_capacity_in_bytes("sm_100")),
             stream=stream,
             use_pdl=self.use_pdl,
         )
@@ -392,8 +391,8 @@ class SplitKDenseGemmKernel:
         tiled_mma = sm100_utils.make_trivial_tiled_mma(
             ab_dtype,
             ab_dtype,
-            utils.LayoutEnum.from_tensor(mA).mma_major_mode(),
-            utils.LayoutEnum.from_tensor(mB).mma_major_mode(),
+            cutlass.tensor_utils.LayoutEnum.from_tensor(mA).mma_major_mode(),
+            cutlass.tensor_utils.LayoutEnum.from_tensor(mB).mma_major_mode(),
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_mn,
@@ -557,7 +556,7 @@ class SplitKDenseGemmKernel:
                 cute.local_tile(mBias, c_tiler_mn, (bidx, n_idx, l_idx)),
                 cute.arch.thread_idx()[0] - 128,
                 mC.element_type,
-                utils.LayoutEnum.from_tensor(mC),
+                cutlass.tensor_utils.LayoutEnum.from_tensor(mC),
                 mailbox,
                 bar_reduce,
                 split_rank,

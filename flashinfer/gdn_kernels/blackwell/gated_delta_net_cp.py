@@ -1164,7 +1164,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             seq_idx, seq_start, chunk_idx_in_seq * t_blocks_per_cp_chunk, self.BLK
         )
 
-        allocator = utils.SmemAllocator()
+        allocator = cutlass.memory.SmemAllocator()
         storage = allocator.allocate(self.shared_storage)
         sK = storage.sK.get_tensor(k_layout.outer, swizzle=k_layout.inner)
         sK_trans = storage.sK.get_tensor(
@@ -1332,7 +1332,7 @@ class CPDeltaRuleMNPrecomputeUtcmma1Sm100(KeyedCompileMixin):
             cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True
         )
         pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.compute_group_1_warp_ids[0],
@@ -2031,7 +2031,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         )
         num_iters = num_chunks - start
 
-        allocator = utils.SmemAllocator()
+        allocator = cutlass.memory.SmemAllocator()
         storage = allocator.allocate(self.shared_storage)
         sM = storage.sM.get_tensor(m_layout.outer, swizzle=m_layout.inner)
         sN = storage.sN.get_tensor(n_layout.outer, swizzle=n_layout.inner)
@@ -2158,7 +2158,7 @@ class CPDeltaRuleFixupUtcmmaSm100(KeyedCompileMixin):
         else:
             gOutputState = gFixedStateCta[None, None, chunk_start]
 
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=0,

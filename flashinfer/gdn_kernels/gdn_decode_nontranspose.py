@@ -99,7 +99,7 @@ def gdn_decode_kernel_small_batch_nontranspose(
         v_base = warp_idx * V_PER_WARP_SMALL
         v_idx = v_base + v_local
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
         smem_o_layout = cute.make_layout((TILE_V_SMALL_NT,), stride=(1,))
         smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)
@@ -330,7 +330,7 @@ def gdn_decode_kernel_big_batch_nontranspose(
         v_base = warp_idx * V_PER_WARP_NT
         v_idx = v_base + v_local
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sData = smem.allocate_tensor(cutlass.Float32, smem_layout_staged, 128)
         smem_o_layout = cute.make_layout((TILE_V_NT,), stride=(1,))
         smem_o = smem.allocate_tensor(cutlass.Float32, smem_o_layout, 128)

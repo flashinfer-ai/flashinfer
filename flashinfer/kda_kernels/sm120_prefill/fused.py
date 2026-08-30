@@ -3547,7 +3547,7 @@ def fused_kda_kernel(
     # --- fixed arena ------------------------------------
     # One allocation of exactly DYNAMIC_SMEM_BYTES, so the launch parameter is
     # the plan's number and every region base is a compile-time constant.
-    alloc = cutlass.utils.SmemAllocator()
+    alloc = cutlass.memory.SmemAllocator()
     p_base = alloc.allocate(DYNAMIC_SMEM_BYTES, 1024)
     p16 = cute.recast_ptr(p_base, dtype=cutlass.BFloat16)
     p32 = cute.recast_ptr(p_base, dtype=cutlass.Float32)

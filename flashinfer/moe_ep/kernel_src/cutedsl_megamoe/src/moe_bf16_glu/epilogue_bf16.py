@@ -6,7 +6,6 @@ from typing import Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.utils as utils
 
 from common.megamoe_constants import Log2E
 from cutlass.cute.typing import Float32
@@ -101,7 +100,7 @@ class GluBf16Epilogue(GluMxfp8Epilogue):
         cluster_shape_mn: Tuple[int, int],
         use_2cta_instrs: bool,
         fc1_output_dtype: Type[cutlass.Numeric],
-        fc1_output_layout: utils.LayoutEnum,
+        fc1_output_layout: cutlass.tensor_utils.LayoutEnum,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         c_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
         glu_clamp: Optional[float] = None,

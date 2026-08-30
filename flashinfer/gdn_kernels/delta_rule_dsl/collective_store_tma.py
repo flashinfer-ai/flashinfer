@@ -3,7 +3,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass._mlir.dialects.cute as _cute_ir
 from cutlass.cute.nvgpu import cpasync
-from cutlass.utils.tensormap_manager import TensorMapManager, TensorMapUpdateMode
+from cutlass.tensor_utils import TensorMapManager, TensorMapUpdateMode
 from .helpers import smid, tensormap_replace_global_dim_1
 
 
