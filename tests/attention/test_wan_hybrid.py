@@ -311,7 +311,10 @@ def test_wan_hybrid_dispatch_binding_preserves_sources_and_launch_order() -> Non
         "Encode2D",
         "PrepareTensorMaps",
     ):
-        assert f"inline void {helper}" in common or f"inline CUtensorMap {helper}" in common
+        assert (
+            f"inline void {helper}" in common
+            or f"inline CUtensorMap {helper}" in common
+        )
         assert f"void {helper}(" not in binding
     assert body.index("PrepareTensorMaps(") < body.index(
         "kernel_wan_hybrid_quantize_value<<<"
