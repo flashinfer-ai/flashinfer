@@ -1157,8 +1157,8 @@ def test_t3_frozen_runner_forwards_real_gate_parameters_cpu(monkeypatch):
     assert args[5] is tensors["A_log"]
     assert args[6] is tensors["dt_bias"]
     assert args[13] == tensors["lower_bound"]
-    assert args[14] == 0
-    assert args[15] == 0xFACE
+    assert len(args) == 15
+    assert args[14] == 0xFACE
 
 
 def _padded_slot_state(slots, num_value_heads, device, *, seed):
@@ -1928,7 +1928,9 @@ def test_cake_backend_rejects_unexported_precomputed_t3_without_entering_cute_ds
         "_get_compiled_kernel",
         unexpected_cute_compile,
     )
-    with pytest.raises(ValueError, match="backend='cake' does not support"):
+    with pytest.raises(
+        ValueError, match="Cake recurrent_kda decode contract is unsupported"
+    ):
         recurrent_kda(**_call_kwargs(case), backend="cake")
 
 
