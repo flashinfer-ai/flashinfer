@@ -13,11 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Minimax Sparse Attention decode wrapper for SM120/SM121. Decode has too few
-query tokens to fill the GPU, so work is split across each token's selected KV
-blocks and the partials are merged by an LSE-weighted combine kernel; the
-launch shape depends only on tensor shapes, keeping the whole path CUDA-graph
-capturable.
+Minimax Sparse Attention decode wrapper. Public dispatch supports compute
+capability 10.0/10.3 and SM120/SM121. The implementation below this module's
+public dispatcher is the SM120/SM121 split-and-combine path.
 """
 
 import functools
@@ -27,6 +25,11 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_decode_attention_trace
+from ._blackwell_sm100 import (
+    MSASparseAttentionWorkspace,
+    blackwell_msa_sparse_decode_attention,
+    is_blackwell_msa_device,
+)
 from ._vibecuda_sm100 import (
     require_vibecuda_device,
     vibecuda_msa_sparse_decode_attention,
@@ -194,15 +197,17 @@ def msa_sparse_decode_attention(
     q_offset=None,
     partial_dtype: Optional[torch.dtype] = None,
     force_fused: Optional[bool] = None,
-    workspace=None,
+    workspace: Optional[MSASparseAttentionWorkspace] = None,
     backend: str = "auto",
 ):
-    """Sparse decode attention for SM120/SM121.
+    """Sparse decode attention for SM100/SM103 and SM120/SM121 GPUs.
 
     Computes attention for a decode step: each request contributes
     ``seqlen_q`` query tokens (uniform across the batch) attending only the
     KV blocks selected in ``q2k_indices``. Decode tokens are right-aligned:
     token ``i`` of a request sits at position ``seqlen_k - seqlen_q + i``.
+    On compute capability 10.0/10.3, ``topk`` must be 16 and Q1 through
+    multi-token decode use the direct persistent M16 path.
 
     Parameters
     ----------
@@ -214,7 +219,9 @@ def msa_sparse_decode_attention(
         with ``cu_seqlens_k``. May be fp8 E4M3 (upconverted in-kernel).
         On the paged path, ``k``/``v`` may also be views split from a cache
         that packs K and V in one ``2 * head_dim`` content dim per token
-        (see ``SUPPORTS_PACKED_KV``).
+        on SM120/SM121 (see ``supports_packed_kv``). Compute capability
+        10.0/10.3 requires separate contiguous K and V tensors and never
+        copies packed views implicitly.
     q2k_indices : torch.Tensor
         ``(num_kv_heads, batch_size * seqlen_q, topk)`` int32, ascending,
         ``-1`` tail-padded (the format produced by
@@ -239,15 +246,18 @@ def msa_sparse_decode_attention(
         layout produced by :func:`flashinfer.nvfp4_quantize` (one scale per
         16 elements, rows padded to a multiple of 128). Scale rows follow the
         cache layout: ``(token, head)`` order for flat K/V, ``(page, head,
-        token)`` for paged.
+        token)`` for paged. SM120/SM121-only.
     k_global_scale, v_global_scale : float, optional
-        Global dequant scales. ``k_global_scale`` folds into the softmax
-        scale (NVFP4 K only); ``v_global_scale`` scales the output for any
-        KV dtype (e.g. an fp8 per-tensor V descale).
+        Global dequant scales. On SM120/SM121, ``k_global_scale`` folds into
+        the softmax scale for NVFP4 K and ``v_global_scale`` scales the output
+        for any KV dtype. On SM100/SM103, both are supported only for uniform
+        FP8 Q/K/V decode.
     q_offset : int or torch.Tensor, optional
         Optional query-position offset used by causal alignment.
     partial_dtype : torch.dtype, optional
         Accumulator / partial-result dtype override for supported kernels.
+        The compute capability 10.0/10.3 backend always uses its native float32
+        split storage and ignores this override.
     force_fused : bool, optional
         Override the adaptive split-K decision. By default each token's selected
         list is split into chunks (one CTA per chunk online-softmaxes its blocks
@@ -258,18 +268,24 @@ def msa_sparse_decode_attention(
         no combine). ``True``/``False`` force fused/split on; ``None`` (default)
         adapts. NVFP4 KV defaults to the per-block split at every batch size
         (the in-kernel dequant favors the extra parallelism).
-    workspace : optional
-        Optional backend workspace. The VibeCUDA backend currently rejects
-        caller-owned capture workspaces.
+        On compute capability 10.0/10.3 this argument is accepted for API
+        compatibility; the production direct-M16 route does not split.
+    workspace : MSASparseAttentionWorkspace, optional
+        Caller-owned storage required for CUDA graph capture on compute
+        capability 10.0/10.3. Warm the workspace eagerly with the exact
+        tensors, options, and capture stream before capture. It is not used by
+        the SM120/SM121 backend.
     backend : str, default="auto"
-        ``"auto"`` preserves the existing SM120/SM121 CuTe-DSL path.
-        ``"vibecuda"`` explicitly selects the SM100/SM103 CUDA backend.
+        ``"auto"`` selects FlashInfer's canonical backend for the current
+        architecture. ``"vibecuda"`` explicitly selects the VibeCUDA
+        SM100/SM103 CUDA backend.
 
     Returns
     -------
     torch.Tensor or (torch.Tensor, torch.Tensor)
-        ``(batch_size * seqlen_q, num_qo_heads, 128)`` in q's dtype; plus
-        the natural-log LSE if ``return_softmax_lse``.
+        ``(batch_size * seqlen_q, num_qo_heads, 128)`` in q's dtype, except
+        uniform FP8 Q/K/V returns BF16; plus the natural-log LSE if
+        ``return_softmax_lse``.
     """
     if backend not in ("auto", "vibecuda"):
         raise ValueError(
@@ -299,8 +315,33 @@ def msa_sparse_decode_attention(
             force_fused=force_fused,
             workspace=workspace,
         )
+    if is_blackwell_msa_device(q.device):
+        return blackwell_msa_sparse_decode_attention(
+            q,
+            k,
+            v,
+            q2k_indices,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            cu_seqlens_k=cu_seqlens_k,
+            seqlen_q=seqlen_q,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            return_softmax_lse=return_softmax_lse,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            k_global_scale=k_global_scale,
+            v_global_scale=v_global_scale,
+            q_offset=q_offset,
+            partial_dtype=partial_dtype,
+            force_fused=force_fused,
+            workspace=workspace,
+        )
     if workspace is not None:
-        raise ValueError("workspace is only supported by an explicit backend")
+        raise ValueError(
+            "MSASparseAttentionWorkspace is only used by the compute "
+            "capability 10.0/10.3 backend"
+        )
     import cutlass
     import cutlass.cute as cute
 

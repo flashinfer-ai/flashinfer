@@ -21,6 +21,11 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_attention_trace
 from ..utils import is_sm12x_supported
+from ._blackwell_sm100 import (
+    MSASparseAttentionWorkspace,
+    blackwell_msa_sparse_attention,
+    is_blackwell_msa_device,
+)
 from ._vibecuda_sm100 import (
     require_vibecuda_device,
     vibecuda_msa_sparse_attention,
@@ -55,10 +60,10 @@ def msa_sparse_attention(
     q_offset=None,
     return_temperature_lse: bool = False,
     lse_temperature_scale: float = 1.0,
-    workspace=None,
+    workspace: Optional[MSASparseAttentionWorkspace] = None,
     backend: str = "auto",
 ):
-    """Minimax Sparse Attention forward (prefill) for SM120/SM121.
+    """Minimax Sparse Attention forward for SM100/SM103 and SM120/SM121 GPUs.
 
     Each query attends only the top-K KV blocks selected in ``q2k_indices``.
     Query tokens are processed in tiles: each tile runs one online softmax over
@@ -70,6 +75,8 @@ def msa_sparse_attention(
     Packed NVFP4 stores two values per byte, so its K/V last dimension is
     ``head_dim // 2`` instead of ``head_dim``. ``q2k_indices`` is
     ``(num_kv_heads, total_q, topk)`` int32 (ascending, ``-1`` padded).
+    Packed NVFP4 is SM120/SM121-only; compute capability 10.0/10.3 supports
+    bf16/fp16 K/V and E4M3 K/V with bf16 Q, and requires ``topk == 16``.
 
     Parameters
     ----------
@@ -101,7 +108,9 @@ def msa_sparse_attention(
         ``(batch_size, max_pages)`` and maps batch-local KV block indices to
         pages. Requires ``seqused_k``. ``k``/``v`` may also be views split
         from a cache that packs K and V in one ``2 * head_dim`` content dim
-        per token (see ``SUPPORTS_PACKED_KV``).
+        per token on SM120/SM121 (see ``supports_packed_kv``). Compute
+        capability 10.0/10.3 requires separate contiguous K and V tensors and
+        never copies packed views implicitly.
     seqused_k : Optional[torch.Tensor], default=None
         Int32 tensor of shape ``(batch_size,)`` giving the valid KV length per
         sequence in the paged path.
@@ -114,16 +123,18 @@ def msa_sparse_attention(
         :func:`flashinfer.nvfp4_quantize` with ``sf_vec_size=16`` and the
         swizzled 128x4 layout (one scale per 16 elements, with rows padded to a
         multiple of 128). Scale rows follow ``(token, head)`` order for flat K
-        and ``(page, head, token)`` order for paged K.
+        and ``(page, head, token)`` order for paged K. Packed NVFP4, and thus
+        this argument, is supported only on SM120/SM121.
     v_scale : Optional[torch.Tensor], default=None
         NVFP4 block scales for V, with the same dtype, layout, and row-order
         contract as ``k_scale``.
     k_global_scale : Optional[float], default=None
         Global dequant scale for K; folds into the softmax scale (NVFP4 K
-        only).
+        only). SM100/SM103 prefill does not support global K/V scales.
     v_global_scale : Optional[float], default=None
-        Global dequant scale applied to the output, for any KV dtype (e.g. an
-        fp8 per-tensor V descale).
+        Global dequant scale applied to the output on SM120/SM121, for any KV
+        dtype (e.g. an fp8 per-tensor V descale). SM100/SM103 prefill does not
+        support global K/V scales.
     q_offset : optional
         Optional per-query offset tensor used by specific MSA workflows.
     return_temperature_lse : bool, default=False
@@ -131,12 +142,15 @@ def msa_sparse_attention(
         value is ``(out, lse, lse_t)``.
     lse_temperature_scale : float, default=1.0
         Scale applied to the exponent when computing temperature LSE.
-    workspace : optional
-        Optional backend workspace. The VibeCUDA backend currently rejects
-        caller-owned capture workspaces; the SM120/SM121 path ignores none.
+    workspace : MSASparseAttentionWorkspace, optional
+        Caller-owned storage required for CUDA graph capture on compute
+        capability 10.0/10.3. Warm the workspace eagerly with the exact
+        tensors, options, and capture stream before capture. It is not used by
+        the SM120/SM121 backend.
     backend : str, default="auto"
-        ``"auto"`` preserves the existing SM120/SM121 CuTe-DSL path.
-        ``"vibecuda"`` explicitly selects the SM100/SM103 CUDA backend.
+        ``"auto"`` selects FlashInfer's canonical backend for the current
+        architecture. ``"vibecuda"`` explicitly selects the VibeCUDA
+        SM100/SM103 CUDA backend.
 
     Returns
     -------
@@ -176,8 +190,33 @@ def msa_sparse_attention(
             lse_temperature_scale=lse_temperature_scale,
             workspace=workspace,
         )
+    if is_blackwell_msa_device(q.device):
+        return blackwell_msa_sparse_attention(
+            q,
+            k,
+            v,
+            q2k_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            return_softmax_lse=return_softmax_lse,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            k_global_scale=k_global_scale,
+            v_global_scale=v_global_scale,
+            q_offset=q_offset,
+            return_temperature_lse=return_temperature_lse,
+            lse_temperature_scale=lse_temperature_scale,
+            workspace=workspace,
+        )
     if workspace is not None:
-        raise ValueError("workspace is only supported by an explicit backend")
+        raise ValueError(
+            "MSASparseAttentionWorkspace is only used by the compute "
+            "capability 10.0/10.3 backend"
+        )
     if not is_sm12x_supported(q.device):
         raise RuntimeError(
             "msa_sparse_attention requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"

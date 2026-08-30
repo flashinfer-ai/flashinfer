@@ -42,18 +42,19 @@ config = MoEConfig(
     ),
     quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    backends=[TrtllmFp4Config(extra_backend_params...), CutlassConfig(extra_backend_params...)],
+    backends=[TrtllmFp4Config(extra_backend_params...), CutlassNvfp4Config()],
 )
 # --- Find possible backends ---
 backends = MoELayer.find_backends(**config)
-# this contains {"trtllm_fp4":TrtllmFp4Config(), "cutlass_fp4":CutlassConfig()}
-# or {"trtllm_fp4":"unsupported reason...", "cutlass_fp4":CutlassConfig()}
+# this contains {"trtllm_fp4":TrtllmFp4Config(), "cutlass_nvfp4":CutlassNvfp4Config()}
+# or {"trtllm_fp4":"unsupported reason...", "cutlass_nvfp4":CutlassNvfp4Config()}
 # more modification to the backends' parameters could be done here
-backends=["trtllm_fp4":TrtllmFp4Config(extra_backend_params...),"cutlass_fp4":CutlassConfig(extra_backend_params...)]
+backends=["trtllm_fp4":TrtllmFp4Config(extra_backend_params...),"cutlass_nvfp4":CutlassNvfp4Config()]
 # --- Prepare Inputs Data ---
 weight_pack = MoEWeightPack()
 # the data is possibly obtained through helper functions then added here
-weight_pack.prepare_for("trtllm_fp4", trtllm_weights) weight_pack.prepare_for("cutlass_fp4", cutlass_weights)
+weight_pack.prepare_for("trtllm_fp4", trtllm_weights)
+weight_pack.prepare_for("cutlass_nvfp4", CutlassNvfp4Config.prepare_weights(...))
 act_pack = MoEActivationPack(
     hidden_states_q=cute_dsl_data["x"],
     hidden_states_scale=x_sf,
@@ -92,7 +93,7 @@ All configs are frozen dataclasses registered with TVM's object system. The hier
 | RoutingConfig | num_experts, top_k, routing method, grouping params, scaling factor |
 | QuantConfig | dtype (fp4/fp8/bf16), granularity (per-tensor/per-token/block) |
 | ExpertConfig | intermediate_size, local sharding params |
-| ActivationConfig | activation type (swiglu/geglu/relu2/identity) |
+| ActivationConfig | common base for typed activation values and their scalar parameters |
 | BackendOptions | ordered candidate set via \| operator |
 | ExecutionConfig | enable_pdl, tune_max_num_tokens |
 | MoEFinalizeConfig | do_finalize, use_fused_finalize |
@@ -120,9 +121,8 @@ Individual backend configs provided in an ordered list. The autotuner or heurist
 # Single backend
 backends = [TrtllmFp4Config()]
 # Multiple candidates — autotuner or heuristic picks best
-backends = [TrtllmFp4Config(), TrtllmFp8BlockConfig(), CutlassConfig()]
+backends = [TrtllmFp4Config(), CutlassNvfp4Config()]
 # | is associative, returns BackendOptions
-# CutlassConfig is always the universal fallback
 ```
 
 Each backend config declares its own preconditions:
@@ -131,11 +131,11 @@ Each backend config declares its own preconditions:
 class TrtllmFp4Config:
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return arch >= 90  # Hopper+
-class CutlassConfig:
+        return arch in (100, 103, 107)
+class CutlassNvfp4Config:
     @classmethod
     def supported(cls, arch: int) -> bool:
-        return True  # universal fallback
+        return arch in (100, 103, 107, 110, 120, 121)
 ```
 
 ### 3.3 MoEConfig — \*\*unpack protocol
@@ -147,7 +147,7 @@ config = MoEConfig(
     routing=RoutingConfig(num_experts=256, top_k=8, method=RoutingMethodType.DeepSeekV3),
     quant=QuantConfig(QuantDtype.FP4, QuantGranularity.BlockScale),
     experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
-    backends=[TrtllmFp4Config(), CutlassConfig()],
+    backends=[TrtllmFp4Config(), CutlassNvfp4Config()],
 )
 # Unpack into any call accepting these kwargs
 output = moe_layer(tensors, **config)
@@ -258,7 +258,7 @@ repro.benchmark_all()
 # FinalizeConfig    0.11ms
 # Total             3.13ms
 # Isolate backend to narrow regression
-repro.isolate_backend(CutlassConfig())
+repro.isolate_backend(CutlassNvfp4Config())
 repro.isolate_backend(TrtllmFp4Config())
 ```
 
@@ -297,7 +297,7 @@ flashinfer/
       __init__.py     # BACKEND_REGISTRY, DEFAULT_PRIORITY
       trtllm_fp4.py   # TrtllmFp4Config + adapter
       trtllm_fp8.py   # Fp8Block + Fp8PerTensor + adapters
-      cutlass.py      # CutlassConfig + adapter
+      cutlass.py      # CutlassBf16 / W4A16 / Nvfp4 / Fp8 / Mxfp8 / W4A8 / Humming + adapters
     repro.py          # MoERepro
     tensors.py        # MoETensors, Gemm1Tensors, Gemm2Tensors
 ```
@@ -644,7 +644,7 @@ The aspirational API in §2–§4 (eager `moe_layer(...)`, `MoETensors`, `find_b
 import torch
 from flashinfer.fused_moe import (
     MoEConfig, RoutingConfig, QuantConfig, QuantVariant, ExpertConfig,
-    ActivationConfig, ExecutionConfig, MoELayer,
+    SwiGLU, ExecutionConfig, MoELayer,
     MoEActivationPack, MoEWeightPack, CuteDslConfig, TrtllmFp4Config,
 )
 from flashinfer.fused_moe.api import BackendOptions
@@ -655,7 +655,7 @@ config = MoEConfig(
     routing=RoutingConfig(num_experts=32, top_k=2),
     quant=QuantConfig(variant=QuantVariant.NVFP4),       # MVP: NVFP4 only
     experts=ExpertConfig(intermediate_size=512, local_num_experts=32),
-    activation=ActivationConfig(),                       # MVP: Swiglu only
+    activation=SwiGLU(alpha=1.0, beta=0.0),              # typed + hashable
     backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
     execution=ExecutionConfig(tune_max_num_tokens=8192),
 )
@@ -689,11 +689,67 @@ out = layer(act, weights)            # subsequent calls: cached winner dispatch
 Key mechanisms (and where they live):
 
 - **Two packs, two lifetimes.** `MoEWeightPack` holds long-lived, backend-native weight materializations keyed by `backend_key` (`prepare_for` / `get_view`); `MoEActivationPack` carries per-call pre-routed activations. This is the concrete answer to reviewers' "backends need different weight preprocessing" concern (C29–C32): each backend stores its own view, none is hidden from the caller.
-- **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` (backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7).
+- **First-class prep.** `TrtllmFp4Config.prepare_weights(...)` / `CuteDslConfig.prepare_weights(...)` / `CutlassNvfp4Config.prepare_weights(...)` (and the other quant-specific `Cutlass*Config.prepare_weights` helpers, backed by `flashinfer/fused_moe/prepare.py`) turn canonical bf16 weights into the native views (C6/C7). CUTLASS NVFP4 uses swizzled `fp4_quantize` scales, not the TRTLLM shuffle / BlockMajorK path. CUTLASS FP8 / MXFP8 / W4A8 / Humming likewise keep unshuffled or mixed-input layouts distinct from TRTLLM. Each quant mode uses its matching `Cutlass*Config` / `Cutlass*Runner`; there is no quant-neutral CUTLASS fallback.
+- **Breaking change — `CutlassConfig` removed.** The deprecated, unregistered `CutlassConfig` placeholder is gone. It was never a runnable `MoELayer` backend (`supported()` always returned false; it was not in `_BACKEND_RUNNERS`). Import, annotate, serialize, or feature-detect a quant-specific type instead (`CutlassBf16Config`, `CutlassNvfp4Config`, `CutlassFp8PerTensorConfig`, `CutlassFp8BlockConfig`, `CutlassMxfp8Config`, `CutlassMxfp8Mxfp4Config`, `CutlassW4A16Config`, `CutlassW4A8Config`, `CutlassHummingConfig`). Historical **Anchor:** / CR1 quotes earlier in this document still mention `CutlassConfig` as review history, not current API.
 - **Two-stage cross-backend autotune** (`MoELayer._select_winner`, runners' delegation): for each candidate, the `AutoTuner.choose_one` picks the best *within-backend tactic* (each backend tuned in its own native input schema), then `bench_gpu_time` compares the candidates at their winning tactics and the fastest backend is dispatched. A single `choose_one` over both runners is not possible because their input schemas differ — hence the explicit two stages.
 - **Winner caching is per token-bucket** (`map_to_hybrid_bucket`): reusing one `MoELayer` across token counts re-selects per bucket; `winner_backend` reports the most-recent choice and `reset_winner()` clears the cache.
-- **Fail-fast scope** (`MoELayer._validate_mvp_scope`): non-NVFP4 quant or non-Swiglu activation raises `NotImplementedError` at construction.
+- **Fail-fast scope:** each runner declares quantization and typed-activation
+  capabilities; unsupported pairs are filtered before build and direct-runner
+  calls raise a specific `NotImplementedError`.
 - **Runners delegate** to canonical inner runners (`CuteDslFusedMoENvfp4Runner` / `core.MoERunner`); the unified adapters only translate Packs ⇄ the inner runner's native tensor list.
+
+### Typed activation values and backend parity
+
+The unreleased enum-wrapper/singleton spelling was replaced by frozen values:
+`SwiGLU(alpha, beta, limit)`, `SiTU(gate_scale, linear_scale, clamp_limit)`,
+`GeGLU()`, `ReLU2()`, `GeGLUTanh()`, `SwiGLUStep(limit)`, `Identity()`,
+`GELU()`, `ReLU()`, and `SiLU()`.
+Every value exposes `.type` and `.is_gated`; scalar fields participate in
+equality, hashing, repr serialization, and tactic-cache identity. Per-expert
+controls remain in backend-native `MoEWeightPack` views: TRT-LLM uses
+`gemm1_alpha` / `gemm1_beta` / `gemm1_clamp_limit`, while CUTLASS SiTU uses
+`situ_beta` / `situ_linear_beta`. Where supported, these tensors override the
+config-derived values.
+
+`SiTU.linear_scale` is the linear-branch soft-clamp scale, applied as
+`linear_scale * tanh(linear / linear_scale)`. It accepts `None` for the
+unclamped linear branch, which only the CuTe-DSL scalar ABI can express: the
+TRT-LLM path carries the value in a per-expert `gemm1_beta` float tensor that
+has no encoding for "no clamp", so TRT-LLM runners reject `None` rather than
+silently dropping the parameter.
+
+The truthful unified support matrix follows the already executable flat path:
+
+| Runner / quantization | Unified activations |
+| --- | --- |
+| TRTLLM BF16 | SwiGLU (typed scalars), ReLU2 |
+| TRTLLM FP8 per-tensor | SwiGLU (default scalars), ReLU2 |
+| TRTLLM DeepSeek block FP8 | SwiGLU (typed scalars) |
+| TRTLLM MXFP8 block FP8 | SwiGLU (typed scalars), GeGLU, ReLU2 |
+| TRTLLM NVFP4 / MXFP4 | SwiGLU (typed scalars), GeGLU, SiTU, ReLU2 |
+| TRTLLM W4A16 | SwiGLU |
+| TRTLLM MxInt4 | SwiGLU (typed scalars) |
+| CUTLASS BF16 / NVFP4 / FP8 per-tensor / FP8 block / MXFP8×MXFP4 / MXFP8 / W4A16 / W4A8 / Humming | SwiGLU (typed scalars), SwiGLUStep, GeGLU, GeGLUTanh, ReLU2, SiTU (typed scalars), Identity, GELU, ReLU, SiLU |
+| CuTe-DSL NVFP4 / W4A16 | SwiGLU (typed scalars), GeGLUTanh, ReLU2, SiTU (typed scalars) |
+| b12x NVFP4 | SwiGLU (default scalars), GeGLUTanh, ReLU2 |
+| b12x W4A16 | SwiGLU (default scalars), ReLU2 |
+
+TRT-LLM FP4 SiTU is supported on SM100/SM103 but rejected on SM107 while the
+pinned Rubin BMM artifact predates `SiTuGlu`.
+
+CuTe-DSL SiTU uses its existing scalar ABI (`situ_beta` and
+`situ_linear_beta`); its flat kernel does not expose a separate SiTU
+`clamp_limit`, so that non-default field is rejected. CUTLASS SiTU uses the
+same two native keys and likewise has no clamp channel or unclamped-linear
+encoding, so `clamp_limit` and `linear_scale=None` are rejected there too.
+`SiTU()` defaults to the canonical Kimi-K3 scales, which are the CUTLASS
+`SituAdaptor` compile-time defaults, so CUTLASS materializes config-derived
+per-expert tensors only for a non-default value. The TRT-LLM path cannot do the
+same: it reuses the SwiGLU alpha/beta channels, whose null default is
+`1.0`/`1.0` for SiTU, so its runners require the tensors even at the default.
+b12x runners keep their flat-proven activation subsets. Weight preparation
+derives GEMM1 rows from `activation.is_gated` across backends (`2I` gated, `I`
+non-gated) and forwards the gated mode into TRTLLM row permutations.
 
 ### Today's MVP Cut
 
