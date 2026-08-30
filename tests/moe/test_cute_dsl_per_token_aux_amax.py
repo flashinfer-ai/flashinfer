@@ -73,6 +73,7 @@ def _make_gemm1_output(
     num_local_experts: int,
     tile_size: int,
     intermediate_size: int,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     from flashinfer.fused_moe.cute_dsl.moe_utils import (
         get_max_num_permuted_tokens,
@@ -89,7 +90,7 @@ def _make_gemm1_output(
     return torch.full(
         (max_num_permuted_tokens, intermediate_size),
         17.0,
-        dtype=torch.bfloat16,
+        dtype=output_dtype,
         device="cuda",
     )
 
@@ -106,6 +107,7 @@ def _make_core_kwargs(
     tile_size: int,
     gemm1_n: int,
     activation_type: ActivationType,
+    output_dtype: torch.dtype = torch.bfloat16,
 ) -> dict:
     return {
         "x": tensors["x"],
@@ -132,6 +134,7 @@ def _make_core_kwargs(
         "use_fused_finalize": False,
         "enable_pdl": True,
         "activation_type": activation_type.value,
+        "output_dtype": output_dtype,
         "per_token_scale": tensors["x_per_token_scale"],
         "gemm1_out": _make_gemm1_output(
             num_tokens=num_tokens,
@@ -139,6 +142,7 @@ def _make_core_kwargs(
             num_local_experts=num_local_experts,
             tile_size=tile_size,
             intermediate_size=intermediate_size,
+            output_dtype=output_dtype,
         ),
     }
 
@@ -313,19 +317,48 @@ def _assert_legacy_and_aux_paths_are_bitwise_equal(
 
 @pytest.mark.parametrize("deterministic_quant", [False, True])
 @pytest.mark.parametrize(
-    ("tile_size", "gemm1_n", "activation_type", "gated"),
+    ("tile_size", "gemm1_n", "activation_type", "gated", "output_dtype"),
     [
-        pytest.param(128, 128, ActivationType.Swiglu, True, id="m128-n128-swiglu"),
-        pytest.param(128, 256, ActivationType.Swiglu, True, id="m128-n256-swiglu"),
+        pytest.param(
+            128,
+            128,
+            ActivationType.Swiglu,
+            True,
+            torch.bfloat16,
+            id="m128-n128-swiglu",
+        ),
+        pytest.param(
+            128,
+            256,
+            ActivationType.Swiglu,
+            True,
+            torch.float16,
+            id="m128-n256-swiglu-fp16",
+        ),
         pytest.param(
             256,
             256,
             ActivationType.Swiglu,
             True,
+            torch.bfloat16,
             id="m256-2cta-n256-swiglu",
         ),
-        pytest.param(256, 128, ActivationType.Relu2, False, id="m256-n128-relu2"),
-        pytest.param(256, 256, ActivationType.Relu2, False, id="m256-n256-relu2"),
+        pytest.param(
+            256,
+            128,
+            ActivationType.Relu2,
+            False,
+            torch.bfloat16,
+            id="m256-n128-relu2",
+        ),
+        pytest.param(
+            256,
+            256,
+            ActivationType.Relu2,
+            False,
+            torch.bfloat16,
+            id="m256-n256-relu2",
+        ),
     ],
 )
 def test_gemm1_aux_amax_and_per_token_output_are_bitwise_equal(
@@ -334,6 +367,7 @@ def test_gemm1_aux_amax_and_per_token_output_are_bitwise_equal(
     gemm1_n: int,
     activation_type: ActivationType,
     gated: bool,
+    output_dtype: torch.dtype,
     deterministic_quant: bool,
 ):
     """Check producer values and the exact legacy/accelerated MoE boundary."""
@@ -379,6 +413,7 @@ def test_gemm1_aux_amax_and_per_token_output_are_bitwise_equal(
         tile_size=tile_size,
         gemm1_n=gemm1_n,
         activation_type=activation_type,
+        output_dtype=output_dtype,
     )
 
     _assert_legacy_and_aux_paths_are_bitwise_equal(
