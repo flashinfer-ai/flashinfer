@@ -149,8 +149,7 @@ inline void RunDirectM128(
                                 final_state.data_ptr(), dl_float32, 0};
     return PrepareCommonInputsWithRawState<
         FLASHKDA_GENERATED_VALUE_ROWS, FLASHKDA_GENERATED_TMA_TILE_TOKENS,
-        FLASHKDA_GENERATED_PAIR_PACKED_BETA != 0,
-        FLASHKDA_GENERATED_VALUE_TMA_RANK == 4>(
+        FLASHKDA_GENERATED_PAIR_PACKED_BETA != 0, false>(
         q, k, v, g, beta, beta_tma, a_log, dt_bias, cu_seqlens, seq_order,
         initial_state, out, final_state, descriptor_storage,
         prepare_descriptors, num_heads, beta_token_stride, scale, lower_bound,
@@ -172,8 +171,7 @@ inline void RunDirectM128(
                                 norm_inv_out.data_ptr(), dl_bfloat16, 0};
     return PrepareCommonInputsWithRawState<
         FLASHKDA_GENERATED_VALUE_ROWS, FLASHKDA_GENERATED_TMA_TILE_TOKENS,
-        FLASHKDA_GENERATED_PAIR_PACKED_BETA != 0,
-        FLASHKDA_GENERATED_VALUE_TMA_RANK == 4>(
+        FLASHKDA_GENERATED_PAIR_PACKED_BETA != 0, false>(
         q, k, v, g, beta, beta_tma, a_log, dt_bias, cu_seqlens, seq_order,
         initial_state, out, final_state, descriptor_storage,
         prepare_descriptors, num_heads, beta_token_stride, scale, lower_bound,
@@ -181,8 +179,7 @@ inline void RunDirectM128(
 #else
     return PrepareCommonInputs<
         FLASHKDA_GENERATED_VALUE_ROWS, FLASHKDA_GENERATED_TMA_TILE_TOKENS,
-        FLASHKDA_GENERATED_PAIR_PACKED_BETA != 0,
-        FLASHKDA_GENERATED_VALUE_TMA_RANK == 4>(
+        FLASHKDA_GENERATED_PAIR_PACKED_BETA != 0, false>(
         q, k, v, g, beta, beta_tma, a_log, dt_bias, cu_seqlens, seq_order,
         state_indices, initial_state, out, final_state, descriptor_storage,
         prepare_descriptors, num_heads, beta_token_stride, state_slot_stride,
