@@ -4363,7 +4363,15 @@ def _flash_kda_generated_affine_direct_selector_key(
         target=target,
         route=_FLASH_KDA_ROUTE_AFFINE_M128,
         route_role=role,
-        state_mode="bf16" if role == "affine_map" else "fp32",
+        state_mode=(
+            "bf16"
+            if role == "affine_map"
+            else (
+                "bf16_f32_dependency"
+                if role == "affine_main" and not external_state_is_fp32
+                else "fp32"
+            )
+        ),
         family_specialization=specialization,
     )
 

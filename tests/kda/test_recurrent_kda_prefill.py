@@ -1582,6 +1582,7 @@ def test_generated_affine_selector_construction_is_cached(monkeypatch):
         first = direct_cache(**direct_kwargs)
         assert direct_cache(**direct_kwargs) is first
         assert len(calls) == 1
+        assert first["state_mode"] == "bf16"
 
         direct_cache(**{**direct_kwargs, "max_sequence_length": 32768})
         assert len(calls) == 2
@@ -1600,6 +1601,7 @@ def test_generated_affine_selector_construction_is_cached(monkeypatch):
         bf16_main_specialization = bf16_main["family_specialization"]
         assert bf16_main_specialization["affine_main_indexed_initial"]
         assert bf16_main_specialization["affine_main_indexed_initial_bf16"]
+        assert bf16_main["state_mode"] == "bf16_f32_dependency"
 
         fp32_main = direct_cache(
             **{
@@ -1611,6 +1613,7 @@ def test_generated_affine_selector_construction_is_cached(monkeypatch):
         fp32_main_specialization = fp32_main["family_specialization"]
         assert fp32_main_specialization["affine_main_indexed_initial"]
         assert not fp32_main_specialization["affine_main_indexed_initial_bf16"]
+        assert fp32_main["state_mode"] == "fp32"
     finally:
         direct_cache.cache_clear()
         scan_cache.cache_clear()
