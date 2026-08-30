@@ -9,6 +9,9 @@ import torch.nn.functional as F
 
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
+    # Typed activation values
+    ReLU2,
+    # Unified configs, packs, and runners
     BackendOptions,
     ExpertConfig,
     MoEActivationPack,
@@ -23,6 +26,7 @@ from flashinfer.fused_moe import (
     TrtllmMxInt4RoutedRunner,
 )
 from flashinfer.fused_moe.core import (
+    MoeRunnerInputs,
     _maybe_get_cached_w3_w1_permute_indices,
     get_w2_permute_indices_with_cache,
 )
@@ -258,6 +262,55 @@ def test_mxint4_prepare_rejects_unaligned_geometry():
         )
 
 
+def test_mxint4_prepare_uses_non_gated_permutation_for_non_gated_activation():
+    """GEMM1 permutation must follow activation.is_gated, not just row count.
+
+    get_reorder_rows_for_gated_act_gemm_row_indices only asserts M % 2 == 0, so
+    a non-gated GEMM1 passed through the gated path is silently interleaved as
+    if its rows were [up, gate] halves -- a corrupted weight view rather than an
+    error. The row count already honored the activation; the permutation did
+    not, so pin the emitted view against an explicitly non-gated permutation.
+    """
+    from flashinfer.fused_moe.core import _maybe_get_cached_w3_w1_permute_indices
+    from flashinfer.fused_moe.prepare import _mxint4_quantize
+
+    device = torch.device("cuda")
+    E, H, I = 2, 256, 256
+    generator = torch.Generator(device=device).manual_seed(20260824)
+    w1 = (
+        torch.randn(E, I, H, device=device, dtype=torch.bfloat16, generator=generator)
+        * 0.02
+    )
+    w2 = (
+        torch.randn(E, H, I, device=device, dtype=torch.bfloat16, generator=generator)
+        * 0.02
+    )
+    view = TrtllmMxInt4Config.prepare_weights(
+        w1,
+        w2,
+        num_local_experts=E,
+        hidden_size=H,
+        intermediate_size=I,
+        activation=ReLU2(),
+    )
+
+    w1_q, _ = _mxint4_quantize(w1.reshape(E * I, H))
+    w1_q = w1_q.reshape(E, I, H // 2)
+    expected = torch.stack(
+        [
+            w1_q[e][
+                _maybe_get_cached_w3_w1_permute_indices(
+                    {}, w1_q[e], 128, is_gated_act_gemm=False
+                ).to(device)
+            ]
+            for e in range(E)
+        ]
+    )
+    torch.testing.assert_close(
+        view["gemm1_weights"].reshape(expected.shape), expected, rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize(
     ("compute_capability", "supported"),
     [((10, 0), True), ((10, 3), True), ((10, 7), True), ((12, 0), False)],
@@ -389,26 +442,31 @@ def test_mxint4_explicit_autotune_matches_reference():
 
 
 @mxint4_required
-def test_mxint4_from_logits_rejects_fp32_until_validated():
-    act, weights, config, _, _ = _make_case(
+def test_mxint4_from_logits_supports_fp32():
+    act, weights, config, reference, _ = _make_case(
         routing_input_mode=RoutingInputMode.FromLogits
     )
     act.routing_logits = act.routing_logits.float()
     runner = _build_mxint4_runner(config)
-    with pytest.raises(TypeError, match="requires bfloat16 routing_logits"):
-        runner.pack_inputs(act, weights)
+    inputs = runner.pack_inputs(act, weights)
+    packed = MoeRunnerInputs.from_list(inputs)
+    assert packed.topk_ids.numel() == 0
+    assert packed.expert_weights.numel() == 0
+    output = runner.forward(inputs)
+    _assert_mxint4_close(output, reference)
 
 
 @mxint4_required
-def test_mxint4_from_logits_rejects_fp32_bias():
-    act, weights, config, _, _ = _make_case(
+def test_mxint4_from_logits_supports_fp32_bias():
+    act, weights, config, reference, _ = _make_case(
         routing_input_mode=RoutingInputMode.FromLogits,
         routing_method=RoutingMethodType.DeepSeekV3,
     )
+    act.routing_logits = act.routing_logits.float()
     act.routing_bias = act.routing_bias.float()
     runner = _build_mxint4_runner(config)
-    with pytest.raises(TypeError, match="routing_bias must be bfloat16"):
-        runner.pack_inputs(act, weights)
+    output = runner.forward(runner.pack_inputs(act, weights))
+    _assert_mxint4_close(output, reference)
 
 
 @mxint4_required

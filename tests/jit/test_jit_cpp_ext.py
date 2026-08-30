@@ -28,6 +28,16 @@ def test_nvcc_parallelism_flags_ignore_sccache_launcher(monkeypatch):
     assert cpp_ext.get_nvcc_parallelism_flags() == ["--threads=4"]
 
 
+def test_jit_uses_size_optimized_fatbin_compression(monkeypatch):
+    monkeypatch.setattr(core, "check_cuda_arch", lambda: None)
+    monkeypatch.setattr(core, "get_nvcc_parallelism_flags", lambda: ["--threads=1"])
+
+    spec = core.gen_jit_spec(name="test_module", sources=[])
+
+    assert "-Xfatbin=-compress-all" in spec.extra_cuda_cflags
+    assert "--compress-mode=size" in spec.extra_cuda_cflags
+
+
 def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
     monkeypatch, tmp_path
 ):
@@ -164,6 +174,28 @@ def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
     spec.build(verbose=False, need_lock=False)
 
     assert writes == [True]
+
+
+@pytest.mark.parametrize("is_aot", [False, True])
+def test_jit_spec_post_load_adapter_applies_to_jit_and_aot_load_paths(
+    monkeypatch, tmp_path, is_aot
+):
+    raw_module = object()
+    seen = []
+    spec = core.JitSpecNvcc(
+        name="test_module",
+        sources=[],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+        post_load_adapter=lambda module: seen.append(module) or ("wrapped", module),
+    )
+    monkeypatch.setattr(core.tvm_ffi, "load_module", lambda _path: raw_module)
+    path = tmp_path / ("aot.so" if is_aot else "jit.so")
+
+    assert spec.load(path if is_aot else None) == ("wrapped", raw_module)
+    assert seen == [raw_module]
 
 
 def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
