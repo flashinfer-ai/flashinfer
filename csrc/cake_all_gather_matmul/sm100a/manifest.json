@@ -22,14 +22,6 @@
         2048
       ]
     },
-    "prepared_packed_qkv_n_by_world_size": {
-      "4": [
-        2560
-      ],
-      "8": [
-        1280
-      ]
-    },
     "world_sizes": [
       2,
       4,

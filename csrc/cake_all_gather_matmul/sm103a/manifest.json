@@ -22,13 +22,18 @@
         2048
       ]
     },
-    "prepared_packed_qkv_n_by_world_size": {
-      "4": [
-        2560
+    "prepared_packed_qkv": {
+      "dtypes": [
+        "bfloat16"
       ],
-      "8": [
-        1280
-      ]
+      "n_by_world_size": {
+        "4": [
+          2560
+        ],
+        "8": [
+          1280
+        ]
+      }
     },
     "world_sizes": [
       2,

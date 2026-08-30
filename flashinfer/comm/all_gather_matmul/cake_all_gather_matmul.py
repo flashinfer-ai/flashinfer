@@ -70,7 +70,7 @@ _MANIFEST_KEYS = frozenset(
     }
 )
 _SMEM_TOTAL_PATTERN = re.compile(rb"^#define SMEM_TOTAL ([1-9][0-9]*)$", re.MULTILINE)
-_CONSTRAINTS = {
+_COMMON_CONSTRAINTS = {
     "dtypes": ["float16", "bfloat16"],
     "k": 8192,
     "m_multiple": 128,
@@ -78,10 +78,6 @@ _CONSTRAINTS = {
         "2": [2048],
         "4": [2048],
         "8": [1280, 2048],
-    },
-    "prepared_packed_qkv_n_by_world_size": {
-        "4": [2560],
-        "8": [1280],
     },
     "world_sizes": [2, 4, 8],
 }
@@ -767,6 +763,25 @@ def _launch_contract(source: bytes) -> dict[str, Any]:
     }
 
 
+def _constraints_for_arch(arch: str) -> dict[str, Any]:
+    constraints = {
+        "dtypes": list(_COMMON_CONSTRAINTS["dtypes"]),
+        "k": _COMMON_CONSTRAINTS["k"],
+        "m_multiple": _COMMON_CONSTRAINTS["m_multiple"],
+        "n_by_world_size": {
+            key: list(values)
+            for key, values in _COMMON_CONSTRAINTS["n_by_world_size"].items()
+        },
+        "world_sizes": list(_COMMON_CONSTRAINTS["world_sizes"]),
+    }
+    if arch == "sm_103a":
+        constraints["prepared_packed_qkv"] = {
+            "dtypes": ["bfloat16"],
+            "n_by_world_size": {"4": [2560], "8": [1280]},
+        }
+    return constraints
+
+
 def _render_host_source(module_ident: str, manifest: dict[str, Any]) -> str:
     main_smem_bytes = int(manifest["launch"]["main"]["dynamic_smem_bytes"])
     if main_smem_bytes <= 0:
@@ -814,7 +829,7 @@ def _program_source(arch: str) -> tuple[Path, dict[str, Any]]:
         "tma_abi": "pointer",
         "kernel_count": 12,
         "launch": _launch_contract(source_bytes),
-        "constraints": _CONSTRAINTS,
+        "constraints": _constraints_for_arch(arch),
         "kernel_symbols": list(_KERNEL_SYMBOLS),
         "route_coverage": _ROUTE_COVERAGE,
         "source_sha256": source_sha256,

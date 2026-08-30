@@ -57,7 +57,7 @@ def _manifest(backend, source: bytes, arch: str):
         "tma_abi": "pointer",
         "kernel_count": 12,
         "launch": backend._launch_contract(source),
-        "constraints": copy.deepcopy(backend._CONSTRAINTS),
+        "constraints": backend._constraints_for_arch(arch),
         "kernel_symbols": list(backend._KERNEL_SYMBOLS),
         "route_coverage": copy.deepcopy(backend._ROUTE_COVERAGE),
         "source_sha256": hashlib.sha256(source).hexdigest(),
@@ -200,9 +200,9 @@ def test_packaged_bf16_ws4_derives_private_packed_width_from_grid():
         "4": [2048],
         "8": [1280, 2048],
     }
-    assert manifest["constraints"]["prepared_packed_qkv_n_by_world_size"] == {
-        "4": [2560],
-        "8": [1280],
+    assert manifest["constraints"]["prepared_packed_qkv"] == {
+        "dtypes": ["bfloat16"],
+        "n_by_world_size": {"4": [2560], "8": [1280]},
     }
     assert manifest["launch"]["main"]["grid_x"] == (
         "(min(M, 2432) / 128) * (N / 256)"
@@ -210,8 +210,9 @@ def test_packaged_bf16_ws4_derives_private_packed_width_from_grid():
     rendered = backend._render_host_source("test_module", manifest)
     assert "kPackedQkvExperimentSupported =\n    true;" in rendered
 
-    sm100_source, _ = backend._program_source("sm_100a")
+    sm100_source, sm100_manifest = backend._program_source("sm_100a")
     assert sm100_source.read_bytes() == source_path.read_bytes()
+    assert "prepared_packed_qkv" not in sm100_manifest["constraints"]
 
 
 @pytest.mark.parametrize(
@@ -597,6 +598,8 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
         def synchronize(self):
             lifecycle.append("tail-sync")
 
+    initialization_event = object()
+
     class FakeStream:
         cuda_stream = 17
 
@@ -604,7 +607,8 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
             lifecycle.append("current-sync")
 
         def wait_event(self, event):
-            pass
+            assert event is initialization_event
+            lifecycle.append("initialization-wait")
 
         def wait_stream(self, stream):
             pass
@@ -656,6 +660,8 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
             lifecycle.append("launch-state")
             state.flags = object()
             state.flag_peers = object()
+            state.initialization_event = initialization_event
+            state.initialization_stream = 23
 
     monkeypatch.setattr(backend, "_ensure_launch_state", ensure_launch_state)
     monkeypatch.setattr(
@@ -705,8 +711,102 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
         "current-sync",
         "launch-state",
         "workspace",
+        "initialization-wait",
         "tail-record",
+        "initialization-wait",
         "tail-record",
+    ]
+
+
+def test_ensure_launch_state_records_initialization_after_device_state(monkeypatch):
+    backend = _backend()
+    lifecycle = []
+
+    class FakeFlags:
+        def zero_(self):
+            lifecycle.append("flags-zero")
+
+    class FakePeer:
+        def __init__(self, pointer):
+            self.pointer = pointer
+
+        def data_ptr(self):
+            lifecycle.append(f"peer-{self.pointer}")
+            return self.pointer
+
+    class FakeHandle:
+        rank = 2
+        world_size = 4
+
+        def get_buffer(self, peer, shape, dtype, offset):
+            assert shape == (2,)
+            assert dtype == torch.uint32
+            assert offset == 0
+            return FakePeer(1000 + peer)
+
+    class FakeEvent:
+        def __init__(self, **kwargs):
+            assert kwargs == {"enable_timing": False}
+            lifecycle.append("event-create")
+
+        def record(self, stream):
+            lifecycle.append(("event-record", stream.cuda_stream))
+
+    class FakeStream:
+        cuda_stream = 29
+
+    flags = FakeFlags()
+    handle = FakeHandle()
+    peer_tensor = object()
+    monkeypatch.setattr(
+        backend.symm_mem,
+        "empty",
+        lambda *args, **kwargs: (lifecycle.append("flags-allocate"), flags)[1],
+    )
+    monkeypatch.setattr(
+        backend.symm_mem,
+        "rendezvous",
+        lambda value, *, group: (
+            lifecycle.append(("rendezvous", value is flags, group)),
+            handle,
+        )[1],
+    )
+    monkeypatch.setattr(
+        backend.torch,
+        "tensor",
+        lambda values, *, dtype, device: (
+            lifecycle.append(("peer-upload", tuple(values), dtype, device)),
+            peer_tensor,
+        )[1],
+    )
+    monkeypatch.setattr(backend.torch.cuda, "Event", FakeEvent)
+
+    state = backend._LaunchState()
+    stream = FakeStream()
+    backend._ensure_launch_state(
+        state,
+        device_index=3,
+        rank=2,
+        world_size=4,
+        group_name="tp-group",
+        main_stream=stream,
+    )
+
+    assert state.flags is flags
+    assert state.flag_handle is handle
+    assert state.flag_peers is peer_tensor
+    assert state.initialization_stream == 29
+    assert lifecycle == [
+        "flags-allocate",
+        ("rendezvous", True, "tp-group"),
+        "flags-zero",
+        "peer-1000",
+        "peer-1001",
+        "peer-1002",
+        "peer-1003",
+        ("peer-upload", (1000, 1001, 1002, 1003), torch.int64, 3),
+        "event-create",
+        ("event-record", 29),
     ]
 
 
