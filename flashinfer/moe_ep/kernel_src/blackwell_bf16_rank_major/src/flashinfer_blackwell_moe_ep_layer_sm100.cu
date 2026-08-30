@@ -389,6 +389,7 @@ kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __re
                             if (__v == __arrival_epoch) break;
                         }
                     }
+                    asm volatile("fence.proxy.alias;" ::: "memory");
                     for (int __r = 0; __r < __ws; ++__r) {
                         unsigned* __peer_flag = pg_flags[__r] + __slot;
                         asm volatile("st.release.sys.global.u32 [%0], %1;"
@@ -400,6 +401,7 @@ kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __re
                         asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
                         if (__v == __release_epoch) break;
                     }
+                    asm volatile("fence.proxy.alias;" ::: "memory");
                 }
                 asm volatile("fence.proxy.async.global;" ::: "memory");
             }
@@ -3422,6 +3424,7 @@ kernel_rank_major_partial_barrier_v1(int32_t pg_world, int32_t pg_rank, unsigned
                             if (__v == __arrival_epoch) break;
                         }
                     }
+                    asm volatile("fence.proxy.alias;" ::: "memory");
                     for (int __r = 0; __r < __ws; ++__r) {
                         unsigned* __peer_flag = pg_flags[__r] + __slot;
                         asm volatile("st.release.sys.global.u32 [%0], %1;"
@@ -3433,6 +3436,7 @@ kernel_rank_major_partial_barrier_v1(int32_t pg_world, int32_t pg_rank, unsigned
                         asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
                         if (__v == __release_epoch) break;
                     }
+                    asm volatile("fence.proxy.alias;" ::: "memory");
                 }
                 asm volatile("fence.proxy.async.global;" ::: "memory");
             }
