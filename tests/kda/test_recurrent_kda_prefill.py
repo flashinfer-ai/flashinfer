@@ -137,7 +137,9 @@ def test_cake_kda_affine_selector_builds_exact_blackwell_partition(
     assert all(offset % 32 == 0 for offset in plan.token_offsets)
     assert all(
         left < right
-        for left, right in zip(plan.token_offsets, plan.token_offsets[1:], strict=True)
+        for left, right in zip(
+            plan.token_offsets[:-1], plan.token_offsets[1:], strict=True
+        )
     )
 
 
