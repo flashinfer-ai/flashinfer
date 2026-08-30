@@ -849,6 +849,36 @@ def test_public_dispatch_allows_gdn_cp_before_cuda_13(
     assert calls == ["gdn_cp"]
 
 
+@pytest.mark.parametrize("cuda_version", ["11.8", "12.7"])
+def test_public_dispatch_rejects_gdn_cp_before_cuda_12_8(
+    monkeypatch: pytest.MonkeyPatch,
+    cuda_version: str,
+) -> None:
+    calls: list[str] = []
+
+    monkeypatch.setattr(gdn_prefill, "get_device_sm_count", lambda _device: 148)
+    monkeypatch.setattr(gdn_prefill, "get_compute_capability", lambda _device: (10, 0))
+    monkeypatch.setattr(gdn_prefill, "get_device_name", lambda _device: "NVIDIA B200")
+    monkeypatch.setattr(gdn_prefill.torch.version, "cuda", cuda_version)
+    monkeypatch.setattr(
+        gdn_prefill,
+        "_chunk_gated_delta_rule_gdn_cp_sm100",
+        lambda *_args, **_kwargs: calls.append("gdn_cp"),
+    )
+
+    q = torch.zeros((2, 1, 128), dtype=torch.float16)
+    with pytest.raises(ValueError, match="GDN CP SM100 kernel requires CUDA 12.8"):
+        gdn_prefill.chunk_gated_delta_rule(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 2], dtype=torch.int32),
+            use_cp=True,
+        )
+
+    assert calls == []
+
+
 @pytest.mark.parametrize("cuda_version", ["12.8", "12.9"])
 def test_public_dispatch_keeps_cuda_13_gate_for_sm100_dsl(
     monkeypatch: pytest.MonkeyPatch,

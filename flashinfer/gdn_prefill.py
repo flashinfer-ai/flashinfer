@@ -95,7 +95,7 @@ def _use_gdn_cp_sm100(
 def _cp_delta_rule_rejection_reason(
     *,
     arch_major: int,
-    cuda_major: int,
+    cuda_version: tuple[int, int],
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -122,7 +122,9 @@ def _cp_delta_rule_rejection_reason(
             checkpoint_cu_starts=checkpoint_cu_starts,
             cp_chunk_len=cp_chunk_len,
         )
-        if not use_gdn_cp and cuda_major < 13:
+        if use_gdn_cp and cuda_version < (12, 8):
+            return "GDN CP SM100 kernel requires CUDA 12.8 or newer"
+        if not use_gdn_cp and cuda_version < (13, 0):
             return "CP delta rule SM100 DSL kernel requires CUDA 13 or newer"
         if use_gdn_cp and _chunk_gated_delta_rule_gdn_cp_sm100 is None:
             return "GDN CP SM100 kernel is unavailable"
@@ -414,7 +416,13 @@ def chunk_gated_delta_rule(
     _scale = scale if scale is not None and scale != 0.0 else 1.0 / math.sqrt(head_size)
 
     _sm_count = get_device_sm_count(device)
-    _cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+    _cuda_version_parts = torch.version.cuda.split(".") if torch.version.cuda else []
+    _cuda_version = (
+        (int(_cuda_version_parts[0]), int(_cuda_version_parts[1]))
+        if len(_cuda_version_parts) >= 2
+        else (0, 0)
+    )
+    _cuda_major = _cuda_version[0]
     _device_capability = get_compute_capability(device)
     _arch_major = _device_capability[0]
     _device_name = get_device_name(device)
@@ -455,7 +463,7 @@ def chunk_gated_delta_rule(
     if will_use_cp:
         cp_rejection_reason = _cp_delta_rule_rejection_reason(
             arch_major=_arch_major,
-            cuda_major=_cuda_major,
+            cuda_version=_cuda_version,
             q=q,
             k=k,
             v=v,
