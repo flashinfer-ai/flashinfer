@@ -27,8 +27,10 @@ import functools
 import heapq
 import math
 import threading
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Mapping, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, Literal, Mapping, Optional
 
 import torch
 
@@ -242,6 +244,63 @@ class _GeneratedAffineCarriers:
     empty_u8: torch.Tensor
 
 
+@dataclass(frozen=True)
+class _GeneratedAffineModule:
+    """One exact selector-to-module resolution for an affine launch role."""
+
+    role: str
+    selector_key: dict[str, object]
+    metadata: object
+    module: object
+
+
+@dataclass(frozen=True)
+class _GeneratedAffineModuleBundle:
+    """Workspace-local immutable resolutions for one affine launch plan."""
+
+    main: _GeneratedAffineModule
+    map: _GeneratedAffineModule
+    scan: _GeneratedAffineModule
+    correction: _GeneratedAffineModule
+
+
+_GeneratedAffineLaunchObserver = Callable[
+    [str, dict[str, object], object, object], None
+]
+_generated_affine_launch_observer: ContextVar[
+    Optional[_GeneratedAffineLaunchObserver]
+] = ContextVar("generated_affine_launch_observer", default=None)
+
+
+@contextmanager
+def _observe_generated_affine_launches(
+    observer: _GeneratedAffineLaunchObserver,
+) -> Iterator[None]:
+    """Observe exact affine physical launches within the current context."""
+
+    token = _generated_affine_launch_observer.set(observer)
+    try:
+        yield
+    finally:
+        _generated_affine_launch_observer.reset(token)
+
+
+def _generated_affine_module_for_launch(
+    resolved: _GeneratedAffineModule,
+    observer: Optional[_GeneratedAffineLaunchObserver],
+) -> object:
+    """Record one exact physical launch immediately before returning its module."""
+
+    if observer is not None:
+        observer(
+            resolved.role,
+            resolved.selector_key,
+            resolved.metadata,
+            resolved.module,
+        )
+    return resolved.module
+
+
 class _RecurrentKDAPrefillWorkspaceBase:
     def __init__(self, device: torch.device | str) -> None:
         normalized_device = torch.device(device)
@@ -310,6 +369,9 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._affine_buffers: dict[str, torch.Tensor] = {}
         self._affine_map_identity_data_ptr: Optional[int] = None
         self._generated_affine_carriers: Optional[_GeneratedAffineCarriers] = None
+        self._generated_affine_module_bundle: Optional[_GeneratedAffineModuleBundle] = (
+            None
+        )
         self._packed_metadata_lock = threading.Lock()
         self._packed_metadata_tensor: Optional[torch.Tensor] = None
         self._packed_metadata_signature: Optional[_PackedMetadataSignature] = None
@@ -4221,11 +4283,49 @@ def _flash_kda_generated_affine_scan_selector_key(
     )
 
 
+def _generated_affine_module_bundle(
+    *,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    main_selector_key: dict[str, object],
+    map_selector_key: dict[str, object],
+    scan_selector_key: dict[str, object],
+    correction_selector_key: dict[str, object],
+    capturing: bool,
+) -> _GeneratedAffineModuleBundle:
+    cached = workspace._generated_affine_module_bundle
+    if (
+        cached is not None
+        and cached.main.selector_key is main_selector_key
+        and cached.map.selector_key is map_selector_key
+        and cached.scan.selector_key is scan_selector_key
+        and cached.correction.selector_key is correction_selector_key
+    ):
+        return cached
+    if capturing:
+        raise RuntimeError(
+            "generated affine modules are not warmed for CUDA graph capture"
+        )
+
+    def resolve(role: str, selector_key: dict[str, object]):
+        metadata, module = _get_flash_kda_generated_module(selector_key)
+        return _GeneratedAffineModule(role, selector_key, metadata, module)
+
+    resolved = _GeneratedAffineModuleBundle(
+        main=resolve("affine_main", main_selector_key),
+        map=resolve("affine_map", map_selector_key),
+        scan=resolve("affine_scan", scan_selector_key),
+        correction=resolve("affine_correction", correction_selector_key),
+    )
+    workspace._generated_affine_module_bundle = resolved
+    return resolved
+
+
 def _run_generated_affine_direct_role(
     *,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
     carriers: _GeneratedAffineCarriers,
-    target: "FlashKDATarget",
+    resolved_module: _GeneratedAffineModule,
+    launch_observer: Optional[_GeneratedAffineLaunchObserver],
     role: str,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -4249,25 +4349,14 @@ def _run_generated_affine_direct_role(
     scale: float,
     lower_bound: float,
     grid_x: int,
-    external_state_is_fp32: bool,
     stream_ptr: int,
     capturing: bool,
 ) -> None:
     num_sequences = cu_seqlens.numel() - 1
     if len(sequence_lengths) != num_sequences:
         raise ValueError("affine role lengths must match its sequence offsets")
-    pair_packed_beta = beta_tma.ndim == 2 and beta_tma.shape[-1] == 24
-    selector_key = _flash_kda_generated_affine_direct_selector_key(
-        target=target,
-        role=role,
-        num_heads=num_heads,
-        num_sequences=num_sequences,
-        uniform_sequences=len(set(sequence_lengths)) == 1,
-        max_sequence_length=max(sequence_lengths),
-        pair_packed_beta=pair_packed_beta,
-        external_state_is_fp32=external_state_is_fp32,
-    )
-    metadata, module = _get_flash_kda_generated_module(selector_key)
+    metadata = resolved_module.metadata
+    module = resolved_module.module
     descriptor_storage = _affine_descriptor_storage(
         workspace=workspace,
         role=role.removeprefix("affine_"),
@@ -4285,6 +4374,7 @@ def _run_generated_affine_direct_role(
     prepare_descriptors = 0 if capturing else int(warmed_signature != signature)
     empty_state = carriers.empty_bf16 if role == "affine_map" else carriers.empty_f32
     try:
+        module = _generated_affine_module_for_launch(resolved_module, launch_observer)
         module.run(
             q,
             k,
@@ -4524,11 +4614,54 @@ def _run_generated_affine_route(
         for left, right in zip(token_offsets, token_offsets[1:], strict=False)
     )
     tail_lengths = main_lengths[1:]
+    main_selector_key = _flash_kda_generated_affine_direct_selector_key(
+        target=target,
+        role="affine_main",
+        num_heads=num_heads,
+        num_sequences=len(main_lengths),
+        uniform_sequences=len(set(main_lengths)) == 1,
+        max_sequence_length=max(main_lengths),
+        pair_packed_beta=(main_beta_tma.ndim == 2 and main_beta_tma.shape[-1] == 24),
+        external_state_is_fp32=external_state_is_fp32,
+    )
+    map_selector_key = _flash_kda_generated_affine_direct_selector_key(
+        target=target,
+        role="affine_map",
+        num_heads=num_heads,
+        num_sequences=len(tail_lengths),
+        uniform_sequences=len(set(tail_lengths)) == 1,
+        max_sequence_length=max(tail_lengths),
+        pair_packed_beta=(map_beta_tma.ndim == 2 and map_beta_tma.shape[-1] == 24),
+        external_state_is_fp32=False,
+    )
+    scan_selector_key = _flash_kda_generated_affine_scan_selector_key(target=target)
+    correction_selector_key = _flash_kda_generated_affine_direct_selector_key(
+        target=target,
+        role="affine_correction",
+        num_heads=num_heads,
+        num_sequences=len(tail_lengths),
+        uniform_sequences=len(set(tail_lengths)) == 1,
+        max_sequence_length=max(tail_lengths),
+        pair_packed_beta=(
+            correction_beta_tma.ndim == 2 and correction_beta_tma.shape[-1] == 24
+        ),
+        external_state_is_fp32=True,
+    )
+    module_bundle = _generated_affine_module_bundle(
+        workspace=workspace,
+        main_selector_key=main_selector_key,
+        map_selector_key=map_selector_key,
+        scan_selector_key=scan_selector_key,
+        correction_selector_key=correction_selector_key,
+        capturing=capturing,
+    )
+    launch_observer = _generated_affine_launch_observer.get()
 
     _run_generated_affine_direct_role(
         workspace=workspace,
         carriers=carriers,
-        target=target,
+        resolved_module=module_bundle.main,
+        launch_observer=launch_observer,
         role="affine_main",
         q=q,
         k=k,
@@ -4552,14 +4685,14 @@ def _run_generated_affine_route(
         scale=scale,
         lower_bound=lower_bound,
         grid_x=num_parts * num_heads,
-        external_state_is_fp32=external_state_is_fp32,
         stream_ptr=stream_ptr,
         capturing=capturing,
     )
     _run_generated_affine_direct_role(
         workspace=workspace,
         carriers=carriers,
-        target=target,
+        resolved_module=module_bundle.map,
+        launch_observer=launch_observer,
         role="affine_map",
         q=q_tail,
         k=k_tail,
@@ -4583,12 +4716,12 @@ def _run_generated_affine_route(
         scale=scale,
         lower_bound=lower_bound,
         grid_x=(num_parts - 1) * num_heads,
-        external_state_is_fp32=False,
         stream_ptr=stream_ptr,
         capturing=capturing,
     )
-    scan_key = _flash_kda_generated_affine_scan_selector_key(target=target)
-    _scan_metadata, scan_module = _get_flash_kda_generated_module(scan_key)
+    scan_module = _generated_affine_module_for_launch(
+        module_bundle.scan, launch_observer
+    )
     scan_module.run(
         main_final,
         map_state,
@@ -4603,7 +4736,8 @@ def _run_generated_affine_route(
     _run_generated_affine_direct_role(
         workspace=workspace,
         carriers=carriers,
-        target=target,
+        resolved_module=module_bundle.correction,
+        launch_observer=launch_observer,
         role="affine_correction",
         q=q_tail,
         k=k_tail,
@@ -4627,7 +4761,6 @@ def _run_generated_affine_route(
         scale=scale,
         lower_bound=lower_bound,
         grid_x=(num_parts - 1) * num_heads,
-        external_state_is_fp32=True,
         stream_ptr=stream_ptr,
         capturing=capturing,
     )

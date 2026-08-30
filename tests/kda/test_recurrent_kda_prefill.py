@@ -1609,6 +1609,127 @@ def test_generated_affine_carriers_are_workspace_cached(monkeypatch):
     assert len(calls) == 18
 
 
+def test_generated_affine_module_bundle_resolves_cold_and_observes_hot(monkeypatch):
+    roles = ("affine_main", "affine_map", "affine_scan", "affine_correction")
+    selector_keys = {role: {"role": role, "shape": 32} for role in roles}
+    resolver_calls = []
+
+    def resolve(selector_key):
+        resolver_calls.append(selector_key)
+        role = selector_key["role"]
+        return SimpleNamespace(variant_id=f"{role}_test"), _RecorderModule()
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_generated_module", resolve)
+    workspace = SimpleNamespace(_generated_affine_module_bundle=None)
+
+    def get_bundle(keys, *, capturing=False):
+        return kda_prefill_api._generated_affine_module_bundle(
+            workspace=workspace,
+            main_selector_key=keys["affine_main"],
+            map_selector_key=keys["affine_map"],
+            scan_selector_key=keys["affine_scan"],
+            correction_selector_key=keys["affine_correction"],
+            capturing=capturing,
+        )
+
+    cold = get_bundle(selector_keys)
+    assert resolver_calls == [selector_keys[role] for role in roles]
+    assert get_bundle(selector_keys) is cold
+    assert get_bundle(selector_keys, capturing=True) is cold
+    assert len(resolver_calls) == 4
+
+    observed = []
+
+    def observer(role, selector_key, metadata, module):
+        observed.append((role, selector_key, metadata, module))
+
+    entries = (cold.main, cold.map, cold.scan, cold.correction)
+    with kda_prefill_api._observe_generated_affine_launches(observer):
+        launch_observer = kda_prefill_api._generated_affine_launch_observer.get()
+        for entry in entries:
+            kda_prefill_api._generated_affine_module_for_launch(
+                entry, launch_observer
+            ).run()
+        hot = get_bundle(selector_keys)
+        for entry in (hot.main, hot.map, hot.scan, hot.correction):
+            kda_prefill_api._generated_affine_module_for_launch(
+                entry, launch_observer
+            ).run()
+
+    assert [row[0] for row in observed] == list(roles) * 2
+    for row, entry in zip(observed[:4], entries, strict=True):
+        assert row[1] is entry.selector_key
+        assert row[2] is entry.metadata
+        assert row[3] is entry.module
+        assert entry.module.calls == [(), ()]
+    assert len(resolver_calls) == 4
+
+    changed_keys = dict(selector_keys)
+    changed_keys["affine_main"] = {"role": "affine_main", "shape": 64}
+    changed = get_bundle(changed_keys)
+    assert changed is not cold
+    assert workspace._generated_affine_module_bundle is changed
+    assert len(resolver_calls) == 8
+    assert [row["role"] for row in resolver_calls[4:]] == list(roles)
+
+    cold_workspace = SimpleNamespace(_generated_affine_module_bundle=None)
+    workspace = cold_workspace
+    with pytest.raises(RuntimeError, match="not warmed for CUDA graph capture"):
+        get_bundle(selector_keys, capturing=True)
+    assert cold_workspace._generated_affine_module_bundle is None
+    assert len(resolver_calls) == 8
+
+
+def test_generated_affine_launch_observer_scope_is_context_local_and_resets():
+    def outer(*_args):
+        return None
+
+    def inner(*_args):
+        return None
+
+    observer_context = kda_prefill_api._generated_affine_launch_observer
+    assert observer_context.get() is None
+
+    child_values = []
+    with kda_prefill_api._observe_generated_affine_launches(outer):
+        assert observer_context.get() is outer
+        thread = threading.Thread(
+            target=lambda: child_values.append(observer_context.get())
+        )
+        thread.start()
+        thread.join()
+        with kda_prefill_api._observe_generated_affine_launches(inner):
+            assert observer_context.get() is inner
+        assert observer_context.get() is outer
+    assert child_values == [None]
+    assert observer_context.get() is None
+
+    with (
+        pytest.raises(RuntimeError, match="observer scope failure"),
+        kda_prefill_api._observe_generated_affine_launches(outer),
+    ):
+        raise RuntimeError("observer scope failure")
+    assert observer_context.get() is None
+
+    module = _RecorderModule()
+    resolved = kda_prefill_api._GeneratedAffineModule(
+        "affine_main", {"role": "affine_main"}, object(), module
+    )
+
+    def failing_observer(*_args):
+        raise RuntimeError("observer callback failure")
+
+    with (
+        pytest.raises(RuntimeError, match="observer callback failure"),
+        kda_prefill_api._observe_generated_affine_launches(failing_observer),
+    ):
+        kda_prefill_api._generated_affine_module_for_launch(
+            resolved, observer_context.get()
+        ).run()
+    assert module.calls == []
+    assert observer_context.get() is None
+
+
 def test_generated_affine_direct_role_uses_supplied_carriers(monkeypatch):
     def unexpected_lookup(*_args, **_kwargs):
         pytest.fail("affine role repeated a global dummy/empty carrier lookup")
@@ -1626,19 +1747,10 @@ def test_generated_affine_direct_role_uses_supplied_carriers(monkeypatch):
     module = _RecorderModule()
     metadata = SimpleNamespace(variant_id="affine_map_test")
     selector_key = {"selector": "affine_map_test"}
+    resolved_module = kda_prefill_api._GeneratedAffineModule(
+        "affine_map", selector_key, metadata, module
+    )
     descriptor_storage = object()
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_flash_kda_generated_affine_direct_selector_key",
-        lambda **_kwargs: selector_key,
-    )
-    monkeypatch.setattr(
-        kda_prefill_api,
-        "_get_flash_kda_generated_module",
-        lambda selected: (metadata, module)
-        if selected is selector_key
-        else pytest.fail("unexpected affine selector"),
-    )
     monkeypatch.setattr(
         kda_prefill_api,
         "_affine_descriptor_storage",
@@ -1665,39 +1777,44 @@ def test_generated_affine_direct_role_uses_supplied_carriers(monkeypatch):
     beta = torch.empty((1, 32, 4), dtype=torch.bfloat16)
     state = torch.empty((1, 4, 128, 128), dtype=torch.bfloat16)
     dependency = torch.empty((1, 4, 128, 128), dtype=torch.float32)
+    observed = []
 
-    kda_prefill_api._run_generated_affine_direct_role(
-        workspace=workspace,
-        carriers=carriers,
-        target="sm100a",
-        role="affine_map",
-        q=q,
-        k=q,
-        v=q,
-        g=q,
-        beta=beta,
-        beta_tma=beta,
-        A_log=torch.empty(4, dtype=torch.float32),
-        dt_bias=torch.empty((4, 128), dtype=torch.float32),
-        cu_seqlens=torch.tensor([0, 32], dtype=torch.int64),
-        seq_order=torch.tensor([0], dtype=torch.int32),
-        state_indices=carriers.dummy_i32,
-        initial_state=state,
-        out=q,
-        final_state=state,
-        initial_state_f32_dependency=dependency,
-        sequence_lengths=(32,),
-        num_heads=4,
-        use_state_indices=False,
-        state_slot_stride=4 * 128 * 128,
-        scale=0.125,
-        lower_bound=-5.0,
-        grid_x=4,
-        external_state_is_fp32=False,
-        stream_ptr=17,
-        capturing=False,
-    )
+    def run(role_q, *, capturing):
+        kda_prefill_api._run_generated_affine_direct_role(
+            workspace=workspace,
+            carriers=carriers,
+            resolved_module=resolved_module,
+            launch_observer=lambda *args: observed.append(args),
+            role="affine_map",
+            q=role_q,
+            k=role_q,
+            v=role_q,
+            g=role_q,
+            beta=beta,
+            beta_tma=beta,
+            A_log=torch.empty(4, dtype=torch.float32),
+            dt_bias=torch.empty((4, 128), dtype=torch.float32),
+            cu_seqlens=torch.tensor([0, 32], dtype=torch.int64),
+            seq_order=torch.tensor([0], dtype=torch.int32),
+            state_indices=carriers.dummy_i32,
+            initial_state=state,
+            out=role_q,
+            final_state=state,
+            initial_state_f32_dependency=dependency,
+            sequence_lengths=(32,),
+            num_heads=4,
+            use_state_indices=False,
+            state_slot_stride=4 * 128 * 128,
+            scale=0.125,
+            lower_bound=-5.0,
+            grid_x=4,
+            stream_ptr=17,
+            capturing=capturing,
+        )
 
+    run(q, capturing=False)
+
+    assert observed == [("affine_map", selector_key, metadata, module)]
     (args,) = module.calls
     assert len(args) == 49
     assert args[14] is carriers.empty_bf16
@@ -1708,6 +1825,11 @@ def test_generated_affine_direct_role_uses_supplied_carriers(monkeypatch):
     assert args[30] is carriers.dummy_u32
     assert args[31] is carriers.empty_u8
     assert args[32] is descriptor_storage
+
+    with pytest.raises(RuntimeError, match="descriptors are not warmed"):
+        run(torch.empty_like(q), capturing=True)
+    assert observed == [("affine_map", selector_key, metadata, module)]
+    assert len(module.calls) == 1
 
 
 def test_generated_prefill_runtime_specialization_helpers():
