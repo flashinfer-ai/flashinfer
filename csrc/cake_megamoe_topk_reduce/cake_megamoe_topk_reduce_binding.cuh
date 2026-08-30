@@ -73,8 +73,7 @@ inline void CheckTarget(int32_t device_id) {
       << "." << minor;
 }
 
-inline std::pair<uintptr_t, uintptr_t> TensorByteRange(const TensorView& tensor,
-                                                       const char* name) {
+inline std::pair<uintptr_t, uintptr_t> TensorByteRange(const TensorView& tensor, const char* name) {
   const DLDataType dtype = tensor.dtype();
   const uint64_t bits = static_cast<uint64_t>(dtype.bits) * dtype.lanes;
   TVM_FFI_ICHECK(bits > 0 && bits % 8 == 0) << name << " has a non-byte dtype";
@@ -110,8 +109,7 @@ void Run(TensorView partials, TensorView out, int64_t num_tokens, int64_t cuda_s
   CHECK_INPUT_TYPE(partials, dl_bfloat16);
   CHECK_INPUT_TYPE(out, dl_bfloat16);
 
-  TVM_FFI_ICHECK(partials.ndim() == 3)
-      << "partials must have shape [capacity, 6, 4096]";
+  TVM_FFI_ICHECK(partials.ndim() == 3) << "partials must have shape [capacity, 6, 4096]";
   const int64_t capacity = partials.ndim() == 3 ? partials.size(0) : -1;
   TVM_FFI_ICHECK((capacity == 256 || capacity == 4096) && partials.size(1) == kTopK &&
                  partials.size(2) == kHiddenSize)

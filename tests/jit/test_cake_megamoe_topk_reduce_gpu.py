@@ -158,9 +158,7 @@ def test_reducer_cuda_graph_capture_and_replay_tracks_input_updates() -> None:
     torch.cuda.synchronize()
     graph.replay()
     torch.cuda.synchronize()
-    _assert_prefix_and_tail(
-        out, _ordered_reference(partials, num_tokens), num_tokens
-    )
+    _assert_prefix_and_tail(out, _ordered_reference(partials, num_tokens), num_tokens)
 
     updated = _partials(capacity, seed=3106)
     partials.copy_(updated)
@@ -168,6 +166,4 @@ def test_reducer_cuda_graph_capture_and_replay_tracks_input_updates() -> None:
     torch.cuda.synchronize()
     graph.replay()
     torch.cuda.synchronize()
-    _assert_prefix_and_tail(
-        out, _ordered_reference(updated, num_tokens), num_tokens
-    )
+    _assert_prefix_and_tail(out, _ordered_reference(updated, num_tokens), num_tokens)

@@ -43,8 +43,7 @@ _TOP_K = 6
 _ATOL = 1e-2
 _RTOL = 1e-2
 _CUTEDSL_SOURCE = (
-    "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/"
-    "moe_nvfp4_swapab/topk_reduce.py"
+    "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py"
 )
 
 
@@ -93,9 +92,7 @@ def _make_ordered_pytorch_runner(
 ) -> Callable[[torch.Tensor, torch.Tensor], None]:
     # Keep all scratch outside the timed region. Each invocation is six
     # stream-ordered BF16->FP32 accumulations followed by one BF16 store.
-    acc = torch.empty(
-        (num_tokens, _HIDDEN_SIZE), dtype=torch.float32, device="cuda"
-    )
+    acc = torch.empty((num_tokens, _HIDDEN_SIZE), dtype=torch.float32, device="cuda")
 
     def run(partials: torch.Tensor, out: torch.Tensor) -> None:
         acc.copy_(partials[:num_tokens, 0])
@@ -168,9 +165,7 @@ def _make_vendored_cutedsl_runner(
             combine_sf=None,
             reduced_output=out_cute,
             topk_score=None,
-            stream=cuda_driver.CUstream(
-                torch.cuda.current_stream().cuda_stream
-            ),
+            stream=cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
         )
 
     return run
@@ -215,21 +210,15 @@ def _run_shape(
         device="cuda",
         generator=generator,
     ).contiguous()
-    out = torch.empty(
-        (capacity, _HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda"
-    )
+    out = torch.empty((capacity, _HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda")
     expected = _ordered_reference(partials, num_tokens)
 
     def native_runner(native_partials: torch.Tensor, native_out: torch.Tensor) -> None:
-        run_cake_megamoe_topk_reduce(
-            native_partials, native_out, num_tokens
-        )
+        run_cake_megamoe_topk_reduce(native_partials, native_out, num_tokens)
 
     native_runner(partials, out)
     torch.cuda.synchronize()
-    torch.testing.assert_close(
-        out[:num_tokens], expected, atol=_ATOL, rtol=_RTOL
-    )
+    torch.testing.assert_close(out[:num_tokens], expected, atol=_ATOL, rtol=_RTOL)
     native_ms = _median_cupti_ms(
         native_runner, partials, out, dry_run_iters, repeat_iters
     )
@@ -240,16 +229,12 @@ def _run_shape(
         baseline_source = "PyTorch eager: six ordered FP32 accumulations + BF16 store"
     else:
         baseline_label = "vendored_cutedsl_topk_reduce_fixed_path"
-        baseline_runner = _make_vendored_cutedsl_runner(
-            partials, out, num_tokens
-        )
+        baseline_runner = _make_vendored_cutedsl_runner(partials, out, num_tokens)
         baseline_source = _CUTEDSL_SOURCE
 
     baseline_runner(partials, out)
     torch.cuda.synchronize()
-    torch.testing.assert_close(
-        out[:num_tokens], expected, atol=_ATOL, rtol=_RTOL
-    )
+    torch.testing.assert_close(out[:num_tokens], expected, atol=_ATOL, rtol=_RTOL)
     baseline_ms = _median_cupti_ms(
         baseline_runner, partials, out, dry_run_iters, repeat_iters
     )
@@ -310,9 +295,7 @@ def main() -> None:
     native_geomean_ms = _geomean(
         [result["native_reducer_median_ms"] for result in results]
     )
-    baseline_geomean_ms = _geomean(
-        [result["baseline_median_ms"] for result in results]
-    )
+    baseline_geomean_ms = _geomean([result["baseline_median_ms"] for result in results])
     speedup_geomean = _geomean(
         [result["native_speedup_vs_baseline"] for result in results]
     )

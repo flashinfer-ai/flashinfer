@@ -177,9 +177,7 @@ class MoEEpMegaLayer(nn.Module):
             )
         return self._workspace
 
-    def create_workspace(
-        self, max_tokens_per_rank: int
-    ) -> MoEEpMegaWorkspace:
+    def create_workspace(self, max_tokens_per_rank: int) -> MoEEpMegaWorkspace:
         """Allocate a reusable capacity-specific workspace for this layer.
 
         The handle reuses this layer's transformed weights and backend.  Call
@@ -225,7 +223,9 @@ class MoEEpMegaLayer(nn.Module):
                 raise MoEEpConfigError("MegaMoE layer has been destroyed")
             return self._fleet_params, self._ensure_workspace()
         if not isinstance(workspace, MoEEpMegaWorkspace):
-            raise TypeError("workspace must be created by MoEEpMegaLayer.create_workspace()")
+            raise TypeError(
+                "workspace must be created by MoEEpMegaLayer.create_workspace()"
+            )
         if workspace._layer_ref() is not self:
             raise MoEEpConfigError("MegaMoE workspace belongs to a different layer")
         if workspace._destroyed or workspace._backend_workspace is None:
@@ -301,7 +301,9 @@ class MoEEpMegaLayer(nn.Module):
         cannot be fabricated here.
         """
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
-            raise MoEEpConfigError("MegaMoE warmup cannot run during CUDA graph capture")
+            raise MoEEpConfigError(
+                "MegaMoE warmup cannot run during CUDA graph capture"
+            )
         fleet_params, _backend_workspace = self._resolve_workspace(workspace)
         if t is None:
             if not self._mega_config.quantize_input:

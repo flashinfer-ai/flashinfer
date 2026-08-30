@@ -60,11 +60,7 @@ def _get_csrc_dir() -> Path:
     installed = jit_env.FLASHINFER_CSRC_DIR / "cake_megamoe_topk_reduce"
     if installed.is_dir():
         return installed
-    checkout = (
-        Path(__file__).resolve().parents[2]
-        / "csrc"
-        / "cake_megamoe_topk_reduce"
-    )
+    checkout = Path(__file__).resolve().parents[2] / "csrc" / "cake_megamoe_topk_reduce"
     if checkout.is_dir():
         return checkout
     raise FileNotFoundError(
@@ -189,9 +185,7 @@ def gen_cake_megamoe_topk_reduce_module() -> JitSpec:
     csrc_dir = source.parent
     uri = _module_identity(source, manifest, csrc_dir / _BINDING_HEADER)
     binding = (
-        jit_env.FLASHINFER_GEN_SRC_DIR
-        / uri
-        / "cake_megamoe_topk_reduce_binding.cu"
+        jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_megamoe_topk_reduce_binding.cu"
     )
     write_if_different(binding, _binding_source())
     spec = gen_jit_spec(

@@ -143,9 +143,7 @@ def test_same_capacity_shares_pool_entry_and_different_capacity_does_not(
     allocated: list[tuple[int, mock.MagicMock]] = []
 
     def allocate(fleet_params):
-        workspace = mock.MagicMock(
-            name=f"workspace_{fleet_params.max_tokens_per_rank}"
-        )
+        workspace = mock.MagicMock(name=f"workspace_{fleet_params.max_tokens_per_rank}")
         allocated.append((fleet_params.max_tokens_per_rank, workspace))
         return workspace
 
@@ -248,9 +246,7 @@ def test_workspace_over_capacity_rejected_before_allocation_stage_or_compute():
     tensors = _inputs(129)
 
     with (
-        mock.patch(
-            "flashinfer.moe_ep.modes.mega_layer.torch.empty"
-        ) as allocate_output,
+        mock.patch("flashinfer.moe_ep.modes.mega_layer.torch.empty") as allocate_output,
         mock.patch.object(layer._kernel, "stage_inputs") as stage_inputs,
         mock.patch.object(layer._kernel, "compute") as compute,
         pytest.raises(MoEEpConfigError, match="max_tokens_per_rank"),

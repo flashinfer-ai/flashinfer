@@ -22,8 +22,7 @@ from flashinfer.jit import core as jit_core
 def _write_bundle(directory: Path) -> dict:
     directory.mkdir(parents=True, exist_ok=True)
     source = (
-        cake_megamoe_topk_reduce._get_csrc_dir()
-        / cake_megamoe_topk_reduce._SOURCE_FILE
+        cake_megamoe_topk_reduce._get_csrc_dir() / cake_megamoe_topk_reduce._SOURCE_FILE
     ).read_bytes()
     (directory / cake_megamoe_topk_reduce._SOURCE_FILE).write_bytes(source)
     (directory / cake_megamoe_topk_reduce._BINDING_HEADER).write_text(
@@ -68,9 +67,7 @@ def test_manifest_loader_accepts_only_the_frozen_identity(monkeypatch, tmp_path)
     assert loaded == manifest
 
 
-def test_manifest_loader_rejects_joint_source_and_manifest_drift(
-    monkeypatch, tmp_path
-):
+def test_manifest_loader_rejects_joint_source_and_manifest_drift(monkeypatch, tmp_path):
     bundle = tmp_path / "bundle"
     manifest = _write_bundle(bundle)
     source_path = bundle / cake_megamoe_topk_reduce._SOURCE_FILE
@@ -113,9 +110,7 @@ def test_manifest_loader_rejects_joint_source_and_manifest_drift(
         ("source_sha256", "0" * 64),
     ],
 )
-def test_manifest_loader_rejects_identity_drift(
-    monkeypatch, tmp_path, field, value
-):
+def test_manifest_loader_rejects_identity_drift(monkeypatch, tmp_path, field, value):
     bundle = tmp_path / "bundle"
     manifest = _write_bundle(bundle)
     manifest[field] = value
@@ -155,9 +150,7 @@ def test_manifest_loader_rejects_incomplete_bundle(monkeypatch, tmp_path):
         cake_megamoe_topk_reduce._program_source()
 
 
-def test_jit_spec_is_content_addressed_and_binds_frozen_launch(
-    monkeypatch, tmp_path
-):
+def test_jit_spec_is_content_addressed_and_binds_frozen_launch(monkeypatch, tmp_path):
     bundle = tmp_path / "bundle"
     _write_bundle(bundle)
     include = tmp_path / "include"
@@ -271,10 +264,7 @@ def test_aot_detects_exact_sm100a_reducer(
     monkeypatch.setattr(aot, "CompilationContext", FakeCompilationContext)
     monkeypatch.setattr(aot, "get_cuda_version", lambda: Version(cuda_version))
 
-    assert (
-        aot.detect_sm_capabilities()["cake_megamoe_topk_reduce_sm100a"]
-        is expected
-    )
+    assert aot.detect_sm_capabilities()["cake_megamoe_topk_reduce_sm100a"] is expected
 
 
 @pytest.mark.parametrize("enabled", [False, True])

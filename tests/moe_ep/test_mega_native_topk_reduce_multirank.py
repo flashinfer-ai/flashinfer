@@ -55,9 +55,7 @@ def _problem(rank: int, world_size: int) -> dict:
         hidden=_HIDDEN,
         intermediate=_INTERMEDIATE,
     )
-    fc1_alpha, fc2_alpha, fc1_norm_const = _identity_epilogue_params(
-        num_local_experts
-    )
+    fc1_alpha, fc2_alpha, fc1_norm_const = _identity_epilogue_params(num_local_experts)
     return {
         "hidden": _HIDDEN,
         "intermediate": _INTERMEDIATE,
@@ -105,13 +103,9 @@ def _empty_batch():
     from flashinfer.moe_ep import MoEEpTensors
 
     return MoEEpTensors(
-        hidden_states=torch.empty(
-            (0, _HIDDEN), dtype=torch.bfloat16, device="cuda"
-        ),
+        hidden_states=torch.empty((0, _HIDDEN), dtype=torch.bfloat16, device="cuda"),
         topk_ids=torch.empty((0, _TOP_K), dtype=torch.int64, device="cuda"),
-        topk_weights=torch.empty(
-            (0, _TOP_K), dtype=torch.float32, device="cuda"
-        ),
+        topk_weights=torch.empty((0, _TOP_K), dtype=torch.float32, device="cuda"),
     )
 
 
@@ -189,9 +183,7 @@ def _public_pointer_snapshot(workspace) -> tuple[int, ...]:
 
 
 def _deferred_pointer_snapshot(workspace) -> tuple[int, int, tuple[int, ...]]:
-    partials, root, descriptor = (
-        workspace._frontend.deferred_topk_reduce_workspace()
-    )
+    partials, root, descriptor = workspace._frontend.deferred_topk_reduce_workspace()
     return partials.data_ptr(), root.data_ptr(), tuple(descriptor["shape"])
 
 
@@ -296,12 +288,8 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         # These reference sessions differ only in terminal reduction: they
         # retain the vendored non-deferred CuTeDSL reducer and consume the
         # layer's already-transformed weights.
-        reference_small = _allocate_reference_workspace(
-            problem, 256, rank, world_size
-        )
-        reference_large = _allocate_reference_workspace(
-            problem, 4096, rank, world_size
-        )
+        reference_small = _allocate_reference_workspace(problem, 256, rank, world_size)
+        reference_large = _allocate_reference_workspace(problem, 4096, rank, world_size)
         transformed_weights = layer.transformed_weights
         assert layer.preprocessing_count == 1
 
@@ -357,9 +345,7 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         side_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side_stream):
             zero = layer.forward(_empty_batch(), workspace=small)
-            after_zero = layer.forward(
-                batches[(8, 256)], workspace=small
-            ).clone()
+            after_zero = layer.forward(batches[(8, 256)], workspace=small).clone()
         assert zero.shape == (0, _HIDDEN)
         torch.cuda.current_stream().wait_stream(side_stream)
         torch.cuda.synchronize()
@@ -386,16 +372,12 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         graph_small = torch.cuda.CUDAGraph()
         dist.barrier()
         with torch.cuda.graph(graph_small, stream=small_capture_stream):
-            graph_small_output = layer.forward(
-                batches[(64, 256)], workspace=small
-            )
+            graph_small_output = layer.forward(batches[(64, 256)], workspace=small)
         dist.barrier()
 
         graph_large = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph_large, stream=large_capture_stream):
-            graph_large_output = layer.forward(
-                batches[(4096, 4096)], workspace=large
-            )
+            graph_large_output = layer.forward(batches[(4096, 4096)], workspace=large)
         dist.barrier()
 
         assert graph_small_output.data_ptr() == small_raw.output_activation.data_ptr()
