@@ -82,8 +82,7 @@ inline void CheckTarget(int32_t device_id, const char* component) {
             "cudaDeviceGetAttribute(major)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
-  TVM_FFI_ICHECK_EQ(major, 10)
-      << "wan_hybrid " << component << " requires compute capability 10.x";
+  TVM_FFI_ICHECK_EQ(major, 10) << "wan_hybrid " << component << " requires compute capability 10.x";
   TVM_FFI_ICHECK_EQ(minor, FLASHINFER_WAN_HYBRID_TARGET_MINOR)
       << "wan_hybrid " << component << " module target does not match the CUDA device";
 }
