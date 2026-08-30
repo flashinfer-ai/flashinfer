@@ -89,6 +89,7 @@ def render_kda_decode_binding(
  */
 
 {define_lines}
+
 #include "{binding_header}"
 """
 
