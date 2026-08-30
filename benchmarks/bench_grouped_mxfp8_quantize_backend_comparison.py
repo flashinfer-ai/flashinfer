@@ -1,7 +1,8 @@
-"""Strict cold-L2 CUPTI benchmark for grouped MXFP8 public backends.
+"""Strict cold-L2 CUPTI benchmark for grouped MXFP8 quantization kernels.
 
-The timed boundary is one complete eager ``mxfp8_grouped_quantize`` call,
-including output allocation and every GPU activity attributed to that call.
+Both arms use preallocated outputs and prepared scheduling metadata.  The
+timed boundary contains exactly one quantization-kernel launch; cuTile prefix
+construction and all Python/output-allocation work stay outside that boundary.
 CUDA-event and CUDA-graph timing fallbacks are deliberately rejected.
 """
 
@@ -16,11 +17,15 @@ from pathlib import Path
 
 import torch
 
-import flashinfer
 import flashinfer.testing.utils as timing_utils
 from flashinfer.cutile import is_cuda_tile_available
 from flashinfer.jit.cake_grouped_mxfp8_quantize import (
+    get_cake_grouped_mxfp8_quantize_module,
     is_cake_grouped_mxfp8_quantize_available,
+)
+from flashinfer.quantization.kernels.cutile.mxfp8_grouped_quantize_cutile import (
+    build_mxfp8_grouped_quant_prefix_schedule,
+    mxfp8_grouped_quantize_cutile_with_prefix_schedule,
 )
 
 
@@ -103,7 +108,7 @@ def _measure_strict_cupti(call, *, warmup_ms: int, benchmark_ms: int) -> dict:
         "timing_backend": "CUPTI activity",
         "cold_l2": True,
         "cuda_graph": False,
-        "activity_scope": "first_to_last_correlated_GPU_activity_in_one_public_call",
+        "activity_scope": "one_quantization_kernel_with_preallocated_outputs",
         "samples_ms": samples,
         "sample_count": len(samples),
         "median_ms": float(statistics.median(samples)),
@@ -115,20 +120,67 @@ def _run_shape(shape: tuple[int, int, int], warmup_ms: int, benchmark_ms: int) -
     generator = torch.Generator(device="cuda").manual_seed(20260829 + sum(shape))
     x = torch.randn(shape, generator=generator, dtype=torch.bfloat16, device="cuda")
     mask = torch.full((batch,), rows, dtype=torch.int32, device="cuda")
-
-    cutile_q, cutile_sf = flashinfer.mxfp8_grouped_quantize(x, mask, backend="cutile")
-    cake_q, cake_sf = flashinfer.mxfp8_grouped_quantize(x, mask, backend="cake")
-    torch.cuda.synchronize()
-    torch.testing.assert_close(
-        cake_q.contiguous().view(torch.uint8),
-        cutile_q.contiguous().view(torch.uint8),
-        rtol=0,
-        atol=0,
-    )
     padded_k = (columns + 127) // 128 * 128
+    padded_m = (rows + 127) // 128 * 128
+    scale_k = padded_k // 32
 
-    def valid_scales(sf):
-        physical = sf.permute(5, 2, 4, 0, 1, 3)
+    if padded_k == columns:
+        input_tensor = x.contiguous()
+    else:
+        input_tensor = x.new_zeros((batch, rows, padded_k))
+        input_tensor[:, :, :columns] = x
+
+    problem_sizes = torch.empty((batch, 3), dtype=torch.int32, device="cuda")
+    problem_sizes[:, 0] = mask
+    problem_sizes[:, 1] = 0
+    problem_sizes[:, 2] = padded_k
+    group_ids = torch.arange(batch, dtype=torch.int32, device="cuda")
+    expert_offsets = group_ids * rows
+    blockscale_offsets = group_ids * padded_m
+    prefix_schedule = build_mxfp8_grouped_quant_prefix_schedule(
+        input_tensor.view(batch * rows, padded_k), problem_sizes
+    )
+
+    cutile_q = torch.empty(
+        (batch, rows, padded_k), dtype=torch.float8_e4m3fn, device="cuda"
+    )
+    cutile_sf = torch.empty(
+        (batch, padded_m, scale_k), dtype=torch.uint8, device="cuda"
+    )
+    cake_q = torch.empty_like(cutile_q)
+    cake_sf = torch.empty_like(cutile_sf)
+
+    cake_module = get_cake_grouped_mxfp8_quantize_module(x.dtype, x.device)
+    stream = int(torch.cuda.current_stream(x.device).cuda_stream)
+
+    def run_cutile_kernel():
+        mxfp8_grouped_quantize_cutile_with_prefix_schedule(
+            input_tensor.view(batch * rows, padded_k),
+            problem_sizes,
+            expert_offsets,
+            blockscale_offsets,
+            cutile_q.view(batch * rows, padded_k),
+            cutile_sf,
+            prefix_schedule,
+        )
+
+    def run_cake_kernel():
+        cake_module.run(input_tensor, mask, cake_q, cake_sf, stream)
+
+    run_cutile_kernel()
+    run_cake_kernel()
+    torch.cuda.synchronize()
+
+    for group in range(batch):
+        valid_rows = int(mask[group].item())
+        torch.testing.assert_close(
+            cake_q[group, :valid_rows].view(torch.uint8),
+            cutile_q[group, :valid_rows].view(torch.uint8),
+            rtol=0,
+            atol=0,
+        )
+
+    def valid_scales(physical):
         m_tiles = (rows + 127) // 128
         k_tiles = padded_k // 128
         unswizzled = physical.reshape(batch, m_tiles, k_tiles, 32, 4, 4)
@@ -139,27 +191,24 @@ def _run_shape(shape: tuple[int, int, int], warmup_ms: int, benchmark_ms: int) -
         valid_scales(cake_sf), valid_scales(cutile_sf), rtol=0, atol=0
     )
 
-    retained = {}
-
-    def make_call(backend):
-        def call():
-            retained[backend] = flashinfer.mxfp8_grouped_quantize(
-                x, mask, backend=backend
-            )
-
-        return call
-
-    arms = {}
-    for backend in ("cutile", "cake"):
-        arms[backend] = _measure_strict_cupti(
-            make_call(backend), warmup_ms=warmup_ms, benchmark_ms=benchmark_ms
-        )
+    arms = {
+        "cutile": _measure_strict_cupti(
+            run_cutile_kernel, warmup_ms=warmup_ms, benchmark_ms=benchmark_ms
+        ),
+        "cake": _measure_strict_cupti(
+            run_cake_kernel, warmup_ms=warmup_ms, benchmark_ms=benchmark_ms
+        ),
+    }
     return {
         "shape": {"B": batch, "M": rows, "K": columns},
         "dtype": "bfloat16",
         "mask": "full",
         "correctness": "exact_bits_and_scales",
-        "timed_boundary": "one_complete_eager_public_API_call",
+        "timed_boundary": (
+            "one_quantization_kernel_with_preallocated_outputs_and_"
+            "prebuilt_cutile_prefix"
+        ),
+        "expected_gpu_activity_count_per_call": 1,
         "arms": arms,
         "cake_speedup": arms["cutile"]["median_ms"] / arms["cake"]["median_ms"],
     }
@@ -183,7 +232,7 @@ def main() -> None:
     shapes = tuple(args.shape) if args.shape else DEFAULT_SHAPES
     rows = [_run_shape(shape, args.warmup_ms, args.benchmark_ms) for shape in shapes]
     report = {
-        "schema": "flashinfer-grouped-mxfp8-backend-comparison-v1",
+        "schema": "flashinfer-grouped-mxfp8-kernel-comparison-v2",
         "gpu": properties.name,
         "compute_capability": list(capability),
         "clock_rate_khz": getattr(properties, "clock_rate", None),
