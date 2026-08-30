@@ -110,6 +110,11 @@ from .jit.fused_moe import (
     gen_trtllm_gen_routing_module,
 )
 from .jit.bgmv_moe import gen_bgmv_moe_module
+from .jit.blackwell_bgmv_moe import (
+    BLACKWELL_BGMV_MOE_DTYPES,
+    BLACKWELL_BGMV_MOE_HIDDEN_SIZES,
+    gen_blackwell_bgmv_moe_module,
+)
 from .jit.monomoe import gen_monomoe_module
 from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
 from .jit.gemm import (
@@ -671,6 +676,12 @@ def gen_all_modules(
         jit_specs.append(gen_gemm_module())
         # Multi-LoRA MoE BGMV kernel
         jit_specs.append(gen_bgmv_moe_module())
+        if sm_capabilities.get("sm100a_exact", False):
+            jit_specs.extend(
+                gen_blackwell_bgmv_moe_module(hidden_size, dtype)
+                for hidden_size in BLACKWELL_BGMV_MOE_HIDDEN_SIZES
+                for dtype in BLACKWELL_BGMV_MOE_DTYPES
+            )
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
         if has_sm90:
