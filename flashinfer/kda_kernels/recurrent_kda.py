@@ -1934,7 +1934,7 @@ def run_recurrent_kda(
         T == 1
         and H == HV == _T1_FAST_PATH_HEADS
         and K == _T1_FAST_PATH_HEAD_DIM
-        and backend == "cute-dsl"
+        and backend in ("cute-dsl", "auto")
         and initial_state_indices is None
         and (
             fast_path_mode := _t1_fast_path_mode(
