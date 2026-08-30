@@ -178,6 +178,28 @@ def _sdpa_prefill_key_fn(
         # (see _build_prefill_graph); omitting it here silently replays a
         # stale-scale graph for any same-shape call with a different scale.
         scale,
+        # _build_prefill_graph bakes each tensor's strides into the graph via
+        # set_stride(), so two same-shape calls with different layouts (e.g. a
+        # contiguous K/V vs views into one interleaved KV buffer) must not share
+        # a graph -- otherwise the first layout's graph is replayed against the
+        # second layout's pointers and silently returns wrong values.
+        q.stride(),
+        k_cache.stride(),
+        v_cache.stride(),
+        # K/V may carry a different dtype from Q (e.g. an FP8 KV cache), and the
+        # graph's data types come from these tensors, not from q alone.
+        k_cache.dtype,
+        v_cache.dtype,
+        # the output tensor's data type is part of the built graph too
+        o_data_type,
+        # ragged offsets change the graph structure (set_ragged_offset)
+        batch_offsets_q is not None,
+        batch_offsets_o is not None,
+        batch_offsets_k is not None,
+        batch_offsets_v is not None,
+        batch_offsets_stats is not None,
+        actual_seq_lens_q is not None,
+        actual_seq_lens_kv is not None,
     )
     return key
 
@@ -353,8 +375,9 @@ if CUDNN_AVAILABLE:
                 cudnn_q.set_ragged_offset(ragged_q)
                 if use_cu_seq_lens:
                     # Offsets are token-unit indptrs; the engine scales them
-                    # back to elements.
-                    cudnn_q.set_ragged_offset_multiplier(h_qo * d_qk)
+                    # back to elements, so the multiplier is this tensor's own
+                    # token stride, not the packed h * d.
+                    cudnn_q.set_ragged_offset_multiplier(s_stride)
 
             if v_cache.dim() == 3:
                 assert block_tables is None, (
@@ -383,7 +406,7 @@ if CUDNN_AVAILABLE:
                     ragged_k.set_uid(UIDs.RAGGED_K_UID.value)
                     cudnn_k_cache.set_ragged_offset(ragged_k)
                     if use_cu_seq_lens:
-                        cudnn_k_cache.set_ragged_offset_multiplier(h_kv * d_qk)
+                        cudnn_k_cache.set_ragged_offset_multiplier(s_stride)
 
                 assert v_cache.dim() == 3, (
                     "v_cache must have 3 dimensions since k_cache has 3 dimensions"
@@ -401,7 +424,7 @@ if CUDNN_AVAILABLE:
                     ragged_v.set_uid(UIDs.RAGGED_V_UID.value)
                     cudnn_v_cache.set_ragged_offset(ragged_v)
                     if use_cu_seq_lens:
-                        cudnn_v_cache.set_ragged_offset_multiplier(h_kv * d_vo)
+                        cudnn_v_cache.set_ragged_offset_multiplier(s_stride)
 
             elif k_cache.dim() == 4:
                 cudnn_k_cache = g.tensor(
@@ -909,6 +932,9 @@ def cudnn_batch_prefill_with_kv_cache(
 
     if return_lse:
         if lse is None:
+            # cuDNN writes only the rows covered by actual_seq_len, so rows past it
+            # are undefined here and in any caller-supplied buffer. Callers that
+            # merge partial attention states must mask by sequence length.
             lse = torch.empty(
                 num_sequences,
                 max_token_per_sequence,

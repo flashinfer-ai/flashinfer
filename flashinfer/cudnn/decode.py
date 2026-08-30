@@ -50,6 +50,13 @@ class UIDs(Enum):
     STATS_UID = 1001  # Stats tensor
 
 
+def _tensor_desc(t: Optional[torch.Tensor]):
+    """Everything about a tensor that tensor_like() bakes into the built graph."""
+    if t is None:
+        return None
+    return (tuple(t.shape), t.dtype, tuple(t.stride()))
+
+
 def _sdpa_decode_key_fn(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -69,15 +76,33 @@ def _sdpa_decode_key_fn(
         max_sequence_kv,
         tuple(q.shape),
         tuple(k_cache.shape),
+        tuple(v_cache.shape),
         # attn_scale is baked into the built graph as a compile-time constant;
         # omitting it silently replays a stale-scale graph on same-shape calls.
         scale,
+        # The graph's cuDNN data types come from these tensors. Without them a
+        # bf16 call and an fp16 call at the same shapes share one graph, which
+        # also bypasses cuDNN's own support check: a dtype cuDNN rejects on a
+        # cold cache executes anyway against the other dtype's graph.
+        q.dtype,
+        k_cache.dtype,
+        v_cache.dtype,
+        # strides are baked into the graph via set_stride()
+        q.stride(),
+        k_cache.stride(),
+        v_cache.stride(),
+        # page size is a graph constant
+        block_size,
         # These presence flags change the built graph's structure (padding
         # mask, paged tables) the same way: same-shape calls that differ only
         # in them must not share a graph.
         actual_seq_lens_q is not None,
         actual_seq_lens_kv is not None,
         block_tables is not None,
+        # The ragged-offset tensors are described to cuDNN with tensor_like(), so
+        # their shape/dtype/stride are baked into the graph, not just their presence.
+        _tensor_desc(batch_offsets_q),
+        _tensor_desc(batch_offsets_o),
     )
 
 
@@ -101,14 +126,13 @@ if CUDNN_AVAILABLE:
     ):
         handle = _create_cudnn_handle(torch.cuda.current_stream())
 
-        # WAR: override batch offsets for now, as it leads to a poor performance
-        batch_offsets_q = None
-        batch_offsets_o = None
-
         with cudnn.graph(handle) as (g, _):
             if q.dim() == 3:
                 s_qo = 1
                 b, h_qo, d_qk = q.shape[0], q.shape[1], q.shape[2]
+                b_stride, h_stride, d_stride = q.stride()
+                # s_qo == 1, so the s stride is never dereferenced
+                s_stride = b_stride
             elif q.dim() == 4:
                 b, h_qo, s_qo, d_qk = (
                     q.shape[0],
@@ -116,6 +140,7 @@ if CUDNN_AVAILABLE:
                     q.shape[2],
                     q.shape[3],
                 )
+                b_stride, h_stride, s_stride, d_stride = q.stride()
             else:
                 raise ValueError(f"q must have 3 or 4 dimensions, got {q.dim()}")
 
@@ -124,11 +149,13 @@ if CUDNN_AVAILABLE:
 
             d_vo = v_cache.shape[3]
 
+            cudnn_q_data_type = cudnn.datatypes._torch_to_cudnn_data_type(q.dtype)
+
             cudnn_q = g.tensor(
                 name="q",
                 dim=(b, h_qo, s_qo, d_qk),
-                stride=(h_qo * d_qk, d_qk, d_qk * h_qo, 1),
-                data_type=cudnn.data_type.BFLOAT16,
+                stride=(b_stride, h_stride, s_stride, d_stride),
+                data_type=cudnn_q_data_type,
             )
             if batch_offsets_q is not None:
                 ragged_q = g.tensor_like(batch_offsets_q)
@@ -191,7 +218,7 @@ if CUDNN_AVAILABLE:
             O.set_uid(UIDs.O_UID.value).set_output(True).set_dim(
                 [b, h_qo, s_qo, d_vo]
             ).set_stride([d_vo * h_qo, d_vo, d_vo * h_qo, 1]).set_data_type(
-                cudnn.data_type.BFLOAT16
+                cudnn_q_data_type
             )
 
         tensors_to_return = [cudnn_q, cudnn_k_cache, cudnn_v_cache, O]
@@ -232,8 +259,8 @@ def _batch_decode_with_kv_cache(
         actual_seq_lens_kv=actual_seq_lens_kv,
         block_tables=block_tables,
         block_size=block_size,
-        batch_offsets_q=batch_offsets_q if batch_offsets_q is not None else None,
-        batch_offsets_o=batch_offsets_q if batch_offsets_q is not None else None,
+        batch_offsets_q=batch_offsets_q,
+        batch_offsets_o=batch_offsets_o,
     )
 
     handle_ = _create_cudnn_handle(torch.cuda.current_stream())
@@ -310,8 +337,10 @@ def cudnn_batch_decode_with_kv_cache(
         Whether to plan the operation in a CUDA-graph-capture-safe mode.
     batch_offsets_q : Optional[torch.Tensor]
         Per-request offsets into the query tensor, shape ``(batch_size,)`` on GPU.
+        Not supported by the cuDNN backend; raises ``NotImplementedError``.
     batch_offsets_o : Optional[torch.Tensor]
         Per-request offsets into the output tensor, shape ``(batch_size,)`` on GPU.
+        Not supported by the cuDNN backend; raises ``NotImplementedError``.
     batch_offsets_k : Optional[torch.Tensor]
         Per-request offsets into the key tensor, shape ``(batch_size,)`` on GPU.
     batch_offsets_v : Optional[torch.Tensor]
@@ -331,6 +360,14 @@ def cudnn_batch_decode_with_kv_cache(
     on the same CUDA device.  Query and KV heads may differ
     (``num_heads_qo >= num_heads_kv``, multi-query / grouped-query attention).
     """
+
+    # Accepted by the signature but unused: decode addresses the KV cache through
+    # block_tables, so silently ignoring these would misdescribe the caller's layout.
+    if batch_offsets_k is not None or batch_offsets_v is not None:
+        raise NotImplementedError(
+            "cuDNN decode does not use batch_offsets_k/batch_offsets_v; the KV cache "
+            "is addressed through block_tables"
+        )
 
     bs = q.shape[0]
     h_qo = q.shape[1]

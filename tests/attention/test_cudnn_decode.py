@@ -7,7 +7,7 @@ import flashinfer
 
 
 @pytest.mark.parametrize("batch_size", [8, 16, 32])
-@pytest.mark.parametrize("s_kv", [512, 8192])
+@pytest.mark.parametrize("s_kv", [512, 1000, 8192])
 @pytest.mark.parametrize("page_size", [16])
 @pytest.mark.parametrize("num_kv_heads", [8])
 @pytest.mark.parametrize("num_qo_heads", [32])
@@ -80,10 +80,6 @@ def test_cudnn_decode(
         0, s_kv + 1, (batch_size, 1, 1, 1), dtype=torch.int32, device=device
     )
 
-    ragged_q = torch.arange(0, batch_size + 1, device=device) * (
-        num_qo_heads * head_dim
-    )
-
     workspace_buffer_size = math.ceil(
         (
             batch_size * s_qo * num_qo_heads * head_dim * 4
@@ -108,8 +104,6 @@ def test_cudnn_decode(
         actual_seq_lens_kv=actual_seq_lens_kv,
         block_tables=block_tables,
         is_cuda_graph_compatible=is_cuda_graph_compatible,
-        batch_offsets_q=ragged_q,
-        batch_offsets_o=ragged_q,
     )
 
     actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
@@ -170,3 +164,77 @@ def test_cudnn_decode(
     output_ref = wrapper.run(q, kv_cache)
 
     torch.testing.assert_close(output, output_ref, rtol=1e-2, atol=1e-2)
+
+
+def _decode_offsets_fixture(device="cuda:0"):
+    batch_size, num_heads, head_dim, page_size, s_kv = 2, 8, 128, 16, 64
+    num_pages_per_seq = (s_kv + page_size - 1) // page_size
+    total_num_pages = num_pages_per_seq * batch_size
+
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size, num_heads, head_dim, device=device, dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        total_num_pages,
+        num_heads,
+        page_size,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn_like(k_cache)
+    block_tables = torch.arange(total_num_pages, dtype=torch.int32, device=device).view(
+        batch_size, num_pages_per_seq
+    )
+    actual_seq_lens_kv = torch.full(
+        (batch_size, 1, 1, 1), s_kv, dtype=torch.int32, device=device
+    )
+    workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    packed = torch.arange(0, batch_size + 1, device=device, dtype=torch.int32) * (
+        num_heads * head_dim
+    )
+    return (
+        dict(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            scale=float(1.0 / (head_dim**0.5)),
+            workspace_buffer=workspace_buffer,
+            max_sequence_kv=s_kv,
+            actual_seq_lens_kv=actual_seq_lens_kv,
+            block_tables=block_tables,
+        ),
+        packed,
+    )
+
+
+def test_cudnn_decode_packed_batch_offsets_match_omitted():
+    """The packed q/out indptr describes the same addressing as omitting the offsets,
+    so both must produce identical output."""
+    from flashinfer.cudnn import decode as cudnn_decode
+
+    if not cudnn_decode.CUDNN_AVAILABLE:
+        pytest.skip("cudnn-frontend python package not available")
+
+    call, packed = _decode_offsets_fixture()
+    out_omitted = flashinfer.decode.cudnn_batch_decode_with_kv_cache(**call)
+    out_packed = flashinfer.decode.cudnn_batch_decode_with_kv_cache(
+        **call, batch_offsets_q=packed, batch_offsets_o=packed
+    )
+    torch.testing.assert_close(out_packed, out_omitted, rtol=1e-2, atol=1e-2)
+
+
+def test_cudnn_decode_rejects_kv_batch_offsets():
+    """batch_offsets_k/v have no effect on decode (the KV cache is addressed through
+    block_tables), so they must be rejected rather than silently ignored."""
+    from flashinfer.cudnn import decode as cudnn_decode
+
+    if not cudnn_decode.CUDNN_AVAILABLE:
+        pytest.skip("cudnn-frontend python package not available")
+
+    call, packed = _decode_offsets_fixture()
+    with pytest.raises(NotImplementedError):
+        flashinfer.decode.cudnn_batch_decode_with_kv_cache(
+            **call, batch_offsets_k=packed
+        )
