@@ -55,7 +55,7 @@ def _manifest(backend, source: bytes, arch: str):
         "arch": arch,
         "compile_flags": ["--use_fast_math"],
         "tma_abi": "pointer",
-        "kernel_count": 8,
+        "kernel_count": 12,
         "launch": backend._launch_contract(source),
         "constraints": copy.deepcopy(backend._CONSTRAINTS),
         "kernel_symbols": list(backend._KERNEL_SYMBOLS),
@@ -66,7 +66,7 @@ def _manifest(backend, source: bytes, arch: str):
 
 def _write_bundle(tmp_path: Path, backend, arch: str = "sm_100a"):
     source = (
-        b"#define SMEM_TOTAL 197632\n" * 4
+        b"#define SMEM_TOTAL 197632\n" * 6
         + b'extern "C" __global__ void generated() {}\n'
     )
     directory = tmp_path / arch.replace("sm_", "sm")
@@ -106,7 +106,7 @@ def test_host_launch_consumes_manifest_smem(tmp_path, monkeypatch):
     assert "CAKE_PACKED_QKV_EXPERIMENT_SUPPORTED" not in rendered
     assert "main_cuda_stream != 0" not in rendered
     assert "comm_cuda_stream != 0 && bridge_cuda_event != 0" in rendered
-    assert source_path.read_bytes().count(b"#define SMEM_TOTAL 197632") == 4
+    assert source_path.read_bytes().count(b"#define SMEM_TOTAL 197632") == 6
 
 
 def test_host_descriptor_encoder_writes_cpu_staging_only(tmp_path, monkeypatch):
@@ -131,11 +131,31 @@ def test_host_descriptor_encoder_writes_cpu_staging_only(tmp_path, monkeypatch):
     assert "cuMemcpyHtoD" not in rendered
 
 
+def test_host_prepared_launcher_has_fixed_tp8_peer_abi(tmp_path, monkeypatch):
+    backend = _backend()
+    _write_bundle(tmp_path, backend, arch="sm_103a")
+    monkeypatch.setattr(backend, "_source_dir", lambda: tmp_path)
+    _, manifest = backend._program_source("sm_103a")
+
+    rendered = backend._render_host_source("test_module", manifest)
+
+    assert "TensorView peer_scratch_6, TensorView peer_signal_6" in rendered
+    assert "std::array<const TensorView*, 7> peer_scratch" in rendered
+    assert "std::array<const TensorView*, 7> peer_signal" in rendered
+    assert "std::array<int64_t, 7> expected_peer_scratch" in rendered
+    assert "std::array<int64_t, 7> expected_peer_signal" in rendered
+    assert "world_size == 4 && weight.size(1) == 2560" in rendered
+    assert "world_size == 8 && weight.size(1) == 1280" in rendered
+    assert "int64_t ready_target, int64_t main_cuda_stream" in rendered
+    assert "static_cast<uint32_t>(ready_target)" in rendered
+    assert "cuMemsetD32Async" not in rendered
+
+
 @pytest.mark.parametrize(
     "source",
     [
-        b"#define SMEM_TOTAL 197632\n" * 3,
-        b"#define SMEM_TOTAL 197632\n" * 3 + b"#define SMEM_TOTAL 196608\n",
+        b"#define SMEM_TOTAL 197632\n" * 5,
+        b"#define SMEM_TOTAL 197632\n" * 5 + b"#define SMEM_TOTAL 196608\n",
     ],
 )
 def test_source_launch_contract_rejects_missing_or_divergent_main_smem(source):
@@ -156,7 +176,7 @@ def test_packaged_program_has_self_contained_pointer_abi(arch):
         source.count(b"struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };")
         == 1
     )
-    assert source.count(b"CakeTensorMap const*") == 12
+    assert source.count(b"CakeTensorMap const*") == 18
     assert backend._resolved_main_smem_bytes(source) == 197632
 
 
@@ -175,8 +195,14 @@ def test_sm103_bf16_ws4_derives_private_packed_width_from_grid():
     assert "const int n_tiles = num_bids / first_chunk_tiles_m;" in function
     assert "const int output_n = n_tiles * 256;" in function
     assert "(out_m + epi_tid) * output_n" in function
-    assert manifest["constraints"]["n"] == 2048
-    assert manifest["launch"]["main"]["grid_x"].endswith("* 8")
+    assert manifest["constraints"]["n_by_world_size"] == {
+        "2": [2048],
+        "4": [2048],
+        "8": [1280, 2048],
+    }
+    assert manifest["launch"]["main"]["grid_x"] == (
+        "(min(M, 2432) / 128) * (N / 256)"
+    )
     rendered = backend._render_host_source("test_module", manifest)
     assert "kPackedQkvExperimentSupported =\n    true;" in rendered
 
@@ -598,7 +624,7 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
     def run_main(*args):
         output = args[3]
         output.value = len(launches) + 1
-        launches.append((output, args[-1]))
+        launches.append((output, args[6], args[-1]))
 
     module = SimpleNamespace(
         run_barrier=lambda *args: barriers.append(args[-1]), run_main=run_main
@@ -665,7 +691,7 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
     assert first.data_ptr() != second.data_ptr()
     assert first.value == 1
     assert second.value == 2
-    assert launches == [(first, 17), (second, 17)]
+    assert launches == [(first, 1, 17), (second, 2, 17)]
     assert barriers == [17, 17]
     assert input_streams == [main_stream, comm_stream, main_stream, comm_stream]
     assert weight_streams == [main_stream, main_stream]
@@ -724,7 +750,48 @@ def test_validate_inputs_uses_the_exact_passed_subgroup(monkeypatch):
     assert seen_groups == [subgroup, subgroup]
 
 
-def test_validate_inputs_keeps_packed_qkv_route_private(monkeypatch):
+@pytest.mark.parametrize("n", [1280, 2048])
+def test_validate_inputs_accepts_exact_tp8_widths(monkeypatch, n):
+    backend = _backend()
+    subgroup = SimpleNamespace(group_name="tp8-group")
+    device = torch.device("cuda:7")
+    inp = SimpleNamespace(
+        device=device,
+        dtype=torch.bfloat16,
+        ndim=2,
+        shape=(512, 8192),
+        is_contiguous=lambda: True,
+    )
+    weight = SimpleNamespace(
+        device=device,
+        dtype=torch.bfloat16,
+        ndim=2,
+        shape=(8192, n),
+        is_contiguous=lambda: True,
+    )
+    monkeypatch.setattr(backend.dist, "is_available", lambda: True)
+    monkeypatch.setattr(backend.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(backend.dist, "get_backend", lambda group: "nccl")
+    monkeypatch.setattr(backend.dist, "get_world_size", lambda group: 8)
+    monkeypatch.setattr(backend.dist, "get_rank", lambda group: 7)
+    monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: "NVSHMEM")
+    monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_103a")
+
+    assert backend._validate_inputs(inp, weight, subgroup) == (
+        7,
+        7,
+        8,
+        "tp8-group",
+    )
+
+
+@pytest.mark.parametrize(
+    ("world_size", "rank", "n"),
+    [(4, 2, 2560), (8, 7, 1280)],
+)
+def test_validate_inputs_keeps_packed_qkv_routes_private(
+    monkeypatch, world_size, rank, n
+):
     backend = _backend()
     subgroup = SimpleNamespace(group_name="tp-group")
     device = torch.device("cuda:3")
@@ -739,35 +806,48 @@ def test_validate_inputs_keeps_packed_qkv_route_private(monkeypatch):
         device=device,
         dtype=torch.bfloat16,
         ndim=2,
-        shape=(8192, 2560),
+        shape=(8192, n),
         is_contiguous=lambda: True,
     )
     monkeypatch.setattr(backend.dist, "is_available", lambda: True)
     monkeypatch.setattr(backend.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(backend.dist, "get_backend", lambda group: "nccl")
-    monkeypatch.setattr(backend.dist, "get_world_size", lambda group: 4)
-    monkeypatch.setattr(backend.dist, "get_rank", lambda group: 2)
+    monkeypatch.setattr(
+        backend.dist, "get_world_size", lambda group: world_size
+    )
+    monkeypatch.setattr(backend.dist, "get_rank", lambda group: rank)
     monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: "NVSHMEM")
     monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_103a")
 
-    with pytest.raises(ValueError, match="exact K=8192 and N=2048"):
-        backend._validate_inputs(inp, weight, subgroup)
+    if world_size == 4:
+        with pytest.raises(ValueError, match="an N supported by world_size=4"):
+            backend._validate_inputs(inp, weight, subgroup)
+    else:
+        assert backend._validate_inputs(inp, weight, subgroup) == (
+            3,
+            rank,
+            world_size,
+            "tp-group",
+        )
     assert backend._validate_inputs(
         inp, weight, subgroup, packed_qkv_experiment=True
-    ) == (3, 2, 4, "tp-group")
+    ) == (3, rank, world_size, "tp-group")
     assert "_all_gather_matmul_cake_packed_qkv_sm103_tp4" not in backend.__all__
+    assert "_prepare_all_gather_matmul_cake_packed_qkv_sm103" not in backend.__all__
 
 
 @pytest.mark.parametrize(
-    ("arch", "dtype", "world_size"),
+    ("arch", "dtype", "world_size", "n", "message"),
     [
-        ("sm_100a", torch.bfloat16, 4),
-        ("sm_103a", torch.float16, 4),
-        ("sm_103a", torch.bfloat16, 2),
+        ("sm_100a", torch.bfloat16, 4, 2560, "requires SM103 and bfloat16"),
+        ("sm_103a", torch.float16, 4, 2560, "requires SM103 and bfloat16"),
+        ("sm_103a", torch.bfloat16, 2, 2560, "requires exact K=8192"),
+        ("sm_103a", torch.bfloat16, 4, 1280, "requires exact K=8192"),
+        ("sm_103a", torch.bfloat16, 8, 2560, "requires exact K=8192"),
     ],
 )
 def test_validate_inputs_rejects_other_packed_qkv_routes(
-    monkeypatch, arch, dtype, world_size
+    monkeypatch, arch, dtype, world_size, n, message
 ):
     backend = _backend()
     subgroup = SimpleNamespace(group_name="tp-group")
@@ -783,7 +863,7 @@ def test_validate_inputs_rejects_other_packed_qkv_routes(
         device=device,
         dtype=dtype,
         ndim=2,
-        shape=(8192, 2560),
+        shape=(8192, n),
         is_contiguous=lambda: True,
     )
     monkeypatch.setattr(backend.dist, "is_available", lambda: True)
@@ -794,7 +874,7 @@ def test_validate_inputs_rejects_other_packed_qkv_routes(
     monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: "NVSHMEM")
     monkeypatch.setattr(backend, "_target_arch", lambda device: arch)
 
-    with pytest.raises(ValueError, match="requires SM103, bfloat16"):
+    with pytest.raises(ValueError, match=message):
         backend._validate_inputs(inp, weight, subgroup, packed_qkv_experiment=True)
 
 
@@ -843,14 +923,28 @@ class _FakePreparedTensor:
 
 
 def _fake_prepared_packed_qkv(
-    monkeypatch, backend, *, handle_world_size=4, bad_peer_scratch=False
+    monkeypatch,
+    backend,
+    *,
+    world_size=4,
+    rank=2,
+    device_index=3,
+    n=None,
+    handle_world_size=None,
+    bad_peer_scratch=False,
 ):
     backend._LAUNCH_STATES.clear()
     backend._WORKSPACES.clear()
-    device = torch.device("cuda:3")
+    if n is None:
+        n = 2560 if world_size == 4 else 1280
+    if handle_world_size is None:
+        handle_world_size = world_size
+    device = torch.device("cuda", device_index)
     inp = _FakePreparedTensor(1001, (128, 8192), torch.bfloat16, device)
-    weight = _FakePreparedTensor(2001, (8192, 2560), torch.bfloat16, device)
-    scratch = _FakePreparedTensor(3001, (4, 128, 8192), torch.bfloat16, device)
+    weight = _FakePreparedTensor(2001, (8192, n), torch.bfloat16, device)
+    scratch = _FakePreparedTensor(
+        3001, (world_size, 128, 8192), torch.bfloat16, device
+    )
     group = SimpleNamespace(group_name="tp-group")
     module = SimpleNamespace(name="bound-module")
     state = backend._LaunchState(flags=object(), flag_peers=object())
@@ -868,10 +962,9 @@ def _fake_prepared_packed_qkv(
         cuda_stream = 23
 
     class FakeScratchHandle:
-        rank = 2
-        world_size = handle_world_size
-
         def __init__(self):
+            self.rank = rank
+            self.world_size = handle_world_size
             self.calls = []
 
         def get_signal_pad(self, peer, shape, dtype, offset):
@@ -892,13 +985,13 @@ def _fake_prepared_packed_qkv(
         comm_stream=FakeStream(),
         bridge_event=FakeEvent(),
     )
-    state_key = (3, id(group), "tp-group")
+    state_key = (device_index, id(group), "tp-group")
     workspace_key = (
-        3,
+        device_index,
         id(group),
         "tp-group",
         torch.bfloat16,
-        4,
+        world_size,
         128,
     )
     backend._LAUNCH_STATES[state_key] = state
@@ -910,7 +1003,7 @@ def _fake_prepared_packed_qkv(
 
     def validate(*args, **kwargs):
         validation_calls.append((args, kwargs))
-        return 3, 2, 4, "tp-group"
+        return device_index, rank, world_size, "tp-group"
 
     monkeypatch.setattr(backend, "_validate_inputs", validate)
     monkeypatch.setattr(
@@ -948,7 +1041,7 @@ def _fake_prepared_packed_qkv(
             descriptor_entry,
         )[1],
     )
-    launcher = backend._prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
+    launcher = backend._prepare_all_gather_matmul_cake_packed_qkv_sm103(
         inp, weight, group
     )
     calls = SimpleNamespace(
@@ -977,6 +1070,7 @@ def test_prepare_packed_qkv_binds_host_identity_once(monkeypatch):
     assert launcher.arch == "sm_103a"
     assert launcher.dtype == torch.bfloat16
     assert launcher.rows == 128
+    assert launcher.output_n == 2560
     assert launcher.module is module
     assert launcher.state is state
     assert launcher.workspace is workspace
@@ -993,6 +1087,38 @@ def test_prepare_packed_qkv_binds_host_identity_once(monkeypatch):
     assert len(launcher.peer_routes) == 3
     assert launcher.peer_scratch_ptrs == (5004, 5001, 5002)
     assert launcher.peer_signal_ptrs == (4004, 4001, 4002)
+    assert launcher.native_peer_args == (
+        launcher.peer_routes[0][0],
+        launcher.peer_routes[0][1],
+        launcher.peer_routes[1][0],
+        launcher.peer_routes[1][1],
+        launcher.peer_routes[2][0],
+        launcher.peer_routes[2][1],
+        launcher.peer_routes[2][0],
+        launcher.peer_routes[2][1],
+        launcher.peer_routes[2][0],
+        launcher.peer_routes[2][1],
+        launcher.peer_routes[2][0],
+        launcher.peer_routes[2][1],
+        launcher.peer_routes[2][0],
+        launcher.peer_routes[2][1],
+    )
+    assert launcher.native_expected_peer_args == (
+        5004,
+        4004,
+        5001,
+        4001,
+        5002,
+        4002,
+        5002,
+        4002,
+        5002,
+        4002,
+        5002,
+        4002,
+        5002,
+        4002,
+    )
     assert [call[:2] for call in workspace.scratch_handle.calls] == [
         ("signal", 2),
         ("remote", 3),
@@ -1008,9 +1134,85 @@ def test_prepare_packed_qkv_binds_host_identity_once(monkeypatch):
     assert calls.arch == [torch.device("cuda:3")]
     assert calls.module == ["sm_103a"]
     assert len(calls.descriptor) == 1
-    assert "_prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4" not in backend.__all__
+    assert "_prepare_all_gather_matmul_cake_packed_qkv_sm103" not in backend.__all__
     with pytest.raises(AttributeError):
         launcher.peer_routes = ()
+
+
+def test_prepare_packed_qkv_tp8_binds_and_submits_all_seven_peers(monkeypatch):
+    backend = _backend()
+    launcher, inp, weight, _, state, workspace, module, _ = (
+        _fake_prepared_packed_qkv(
+            monkeypatch,
+            backend,
+            world_size=8,
+            rank=7,
+            device_index=7,
+        )
+    )
+
+    assert launcher.world_size == 8
+    assert launcher.rank == 7
+    assert launcher.device == torch.device("cuda:7")
+    assert launcher.output_n == 1280
+    assert launcher.signal_pad.shape == (8, 1)
+    assert launcher.signal_pad_ptr == 4007
+    assert len(launcher.peer_routes) == 7
+    assert launcher.peer_scratch_ptrs == tuple(range(5001, 5008))
+    assert launcher.peer_signal_ptrs == tuple(range(4001, 4008))
+    assert len(launcher.native_peer_args) == 14
+    assert launcher.native_expected_peer_args == tuple(
+        pointer
+        for pair in zip(
+            launcher.peer_scratch_ptrs,
+            launcher.peer_signal_ptrs,
+        )
+        for pointer in pair
+    )
+    assert [call[:2] for call in workspace.scratch_handle.calls] == [
+        ("signal", 7),
+        ("remote", 0),
+        ("signal", 0),
+        ("remote", 1),
+        ("signal", 1),
+        ("remote", 2),
+        ("signal", 2),
+        ("remote", 3),
+        ("signal", 3),
+        ("remote", 4),
+        ("signal", 4),
+        ("remote", 5),
+        ("signal", 5),
+        ("remote", 6),
+        ("signal", 6),
+    ]
+
+    output = _FakePreparedTensor(
+        7001,
+        (launcher.world_size * launcher.rows, launcher.output_n),
+        torch.bfloat16,
+        launcher.device,
+    )
+    allocations = []
+    monkeypatch.setattr(
+        backend.torch,
+        "empty",
+        lambda *args, **kwargs: (allocations.append((args, kwargs)), output)[1],
+    )
+    submissions = []
+    module.run_prepared_packed_qkv = lambda *args: submissions.append(args)
+
+    assert launcher(inp) is output
+    assert allocations == [
+        ((8 * 128, 1280), {"dtype": torch.bfloat16, "device": 7})
+    ]
+    assert len(submissions) == 1
+    submission = submissions[0]
+    assert submission[7:21] == launcher.native_peer_args
+    assert submission[21:31] == (8, 7, 128, 0, 1, 0, 23, 29, 3001, 4007)
+    assert submission[31:] == launcher.native_expected_peer_args
+    assert state.next_phase == 1
+    assert state.ready_epoch == 1
 
 
 def test_prepared_packed_qkv_hot_path_uses_one_native_submission(monkeypatch):
@@ -1020,7 +1222,7 @@ def test_prepared_packed_qkv_hot_path_uses_one_native_submission(monkeypatch):
     )
     output = _FakePreparedTensor(
         7001,
-        (launcher.world_size * launcher.rows, 2560),
+        (launcher.world_size * launcher.rows, launcher.output_n),
         torch.bfloat16,
         launcher.device,
     )
@@ -1050,32 +1252,22 @@ def test_prepared_packed_qkv_hot_path_uses_one_native_submission(monkeypatch):
     assert descriptor.data_ptr() == 6001
     assert submission[5] is launcher.signal_pad
     assert submission[6] is state.flag_peers
-    assert submission[7:13] == (
-        launcher.peer_routes[0][0],
-        launcher.peer_routes[0][1],
-        launcher.peer_routes[1][0],
-        launcher.peer_routes[1][1],
-        launcher.peer_routes[2][0],
-        launcher.peer_routes[2][1],
-    )
-    assert submission[13:] == (
+    assert submission[7:21] == launcher.native_peer_args
+    assert submission[21:] == (
         4,
         2,
         128,
         0,
+        1,
         0,
         23,
         29,
         3001,
         4002,
-        5004,
-        4004,
-        5001,
-        4001,
-        5002,
-        4002,
+        *launcher.native_expected_peer_args,
     )
     assert state.next_phase == 1
+    assert state.ready_epoch == 1
     assert state.tail_stream == 0
     assert state.tail_event.recorded_streams
     main_stream = descriptor.recorded_streams[0]
@@ -1091,7 +1283,7 @@ def test_prepared_packed_qkv_first_other_stream_waits_for_descriptor(monkeypatch
     )
     output = _FakePreparedTensor(
         7001,
-        (launcher.world_size * launcher.rows, 2560),
+        (launcher.world_size * launcher.rows, launcher.output_n),
         torch.bfloat16,
         launcher.device,
     )
@@ -1133,7 +1325,7 @@ def test_prepared_packed_qkv_first_call_waits_for_descriptor_and_tail(monkeypatc
     )
     output = _FakePreparedTensor(
         7001,
-        (launcher.world_size * launcher.rows, 2560),
+        (launcher.world_size * launcher.rows, launcher.output_n),
         torch.bfloat16,
         launcher.device,
     )
@@ -1272,5 +1464,5 @@ def test_validate_inputs_rejects_unsupported_subgroup_size(monkeypatch):
     monkeypatch.setattr(backend.dist, "get_world_size", lambda group: 3)
     monkeypatch.setattr(backend.dist, "get_rank", lambda group: 0)
 
-    with pytest.raises(ValueError, match="world size 2 or 4"):
+    with pytest.raises(ValueError, match="world size 2, 4, or 8"):
         backend._validate_inputs(inp, weight, subgroup)
