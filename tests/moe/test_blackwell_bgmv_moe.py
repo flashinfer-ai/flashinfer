@@ -190,3 +190,56 @@ def test_invalid_pair_padding_and_outer_graph_capture(dtype):
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_extra_valid_route_uses_general_path(dtype):
+    _require_sm100()
+    inputs = list(_make_inputs(2688, 32, dtype))
+    device = inputs[0].device
+    inputs[3] = torch.cat(
+        [inputs[3], torch.tensor([0], dtype=torch.int64, device=device)]
+    )
+    inputs[4] = torch.cat(
+        [inputs[4], torch.tensor([0], dtype=torch.int64, device=device)]
+    )
+    inputs[6] = torch.cat(
+        [inputs[6], torch.tensor([0.25], dtype=torch.float32, device=device)]
+    )
+    inputs = tuple(inputs)
+    expected = _reference(inputs)
+    actual = prepare_bgmv_moe(*inputs, backend="blackwell").run()
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+def test_cpu_input_reports_device_requirement():
+    x = torch.empty((1, 2688), dtype=torch.bfloat16)
+    empty_i64 = torch.empty((1,), dtype=torch.int64)
+    empty_f32 = torch.empty((1,), dtype=torch.float32)
+    with pytest.raises(ValueError, match="exact SM100 CUDA device"):
+        prepare_bgmv_moe(
+            x,
+            [],
+            [],
+            empty_i64,
+            empty_i64,
+            empty_i64,
+            empty_f32,
+            1,
+            backend="blackwell",
+        )
+
+
+@pytest.mark.parametrize(
+    ("tensor_index", "value", "message"),
+    [
+        (4, 128, "expert_ids values"),
+        (5, 2, "lora_indices values"),
+    ],
+)
+def test_invalid_routing_indices_rejected(tensor_index, value, message):
+    _require_sm100()
+    inputs = list(_make_inputs(2688, 4, torch.bfloat16))
+    inputs[tensor_index][0] = value
+    with pytest.raises(ValueError, match=message):
+        prepare_bgmv_moe(*inputs, backend="blackwell")

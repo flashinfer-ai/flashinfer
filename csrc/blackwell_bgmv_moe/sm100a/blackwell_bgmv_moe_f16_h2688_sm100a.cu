@@ -972,10 +972,12 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
       if (lora_id >= 0) {
         int pair_base = token * 2;
         int contiguous = 0;
-        if (pair_base + 1 < num_pairs) {
-          if (sorted_token_ids[pair_base] == (long long)token) {
-            if (sorted_token_ids[pair_base + 1] == (long long)token) {
-              contiguous = 1;
+        if (num_pairs == num_tokens * 2) {
+          if (pair_base + 1 < num_pairs) {
+            if (sorted_token_ids[pair_base] == (long long)token) {
+              if (sorted_token_ids[pair_base + 1] == (long long)token) {
+                contiguous = 1;
+              }
             }
           }
         }

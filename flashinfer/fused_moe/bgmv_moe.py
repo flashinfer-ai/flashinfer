@@ -397,9 +397,10 @@ def prepare_bgmv_moe(
         raise ValueError(
             f"prepare_bgmv_moe only supports backend='blackwell', got {backend}"
         )
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability(x.device) != (
-        10,
-        0,
+    if (
+        not torch.cuda.is_available()
+        or not x.is_cuda
+        or torch.cuda.get_device_capability(x.device) != (10, 0)
     ):
         capability = (
             torch.cuda.get_device_capability(x.device)
@@ -465,6 +466,11 @@ def prepare_bgmv_moe(
     ):
         if tensor.dtype != torch.int64:
             raise ValueError(f"{name} must have dtype torch.int64")
+    if bool(((expert_ids < 0) | (expert_ids >= num_experts)).any()):
+        raise ValueError("expert_ids values must be in [0, num_experts)")
+    num_loras = int(lora_a.shape[0])
+    if bool(((lora_indices < -1) | (lora_indices >= num_loras)).any()):
+        raise ValueError("lora_indices values must be -1 or in [0, num_loras)")
 
     expected_shrink = (1, num_pairs, 32)
     if shrink_out is None:
