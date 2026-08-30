@@ -193,7 +193,8 @@ def test_packaged_bf16_ws4_derives_private_packed_width_from_grid():
     assert f"active_tiles = chunk_tiles_m * {n_tiles}" in function
     assert f"active_tiles_1 = chunk_tiles_m_1 * {n_tiles}" in function
     assert f"active_tiles_2 = chunk_tiles_m_2 * {n_tiles}" in function
-    assert f"(out_m + epi_tid) * ({n_tiles} * 256)" in function
+    packed_width = "(num_bids / (((M < 2432) ? M : 2432) / 128) * 256)"
+    assert f"(out_m + epi_tid) * {packed_width}" in function
     assert manifest["constraints"]["n_by_world_size"] == {
         "2": [2048],
         "4": [2048],
