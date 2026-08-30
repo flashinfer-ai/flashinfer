@@ -939,7 +939,7 @@ def test_frozen_runner_selects_physical_target_and_forwards_ffi_abi_cpu(
 
     assert loaded == [(variant, expected_target)]
     (args,) = module.calls
-    assert len(args) == 16
+    assert len(args) == 15
     assert args[:5] == (
         tensors["q"],
         tensors["k"],
@@ -957,8 +957,7 @@ def test_frozen_runner_selects_physical_target_and_forwards_ffi_abi_cpu(
     )
     assert args[12] == tensors["scale"]
     assert args[13] == 0.0
-    assert args[14] == 0
-    assert args[15] == 0xCAFE
+    assert args[14] == 0xCAFE
 
 
 @pytest.mark.parametrize(
@@ -1046,7 +1045,10 @@ def test_unbounded_runner_selects_cake_module_and_physical_target_cpu(
     )
 
     assert loaded == [(variant, expected_target)]
-    assert len(module.calls) == 1
+    (args,) = module.calls
+    assert len(args) == 16
+    assert args[14] == 1
+    assert args[15] == 0xCAFE
 
 
 def test_frozen_runner_rejects_sm103a_before_cuda_12_9_cpu(monkeypatch):
