@@ -33,7 +33,7 @@ from flashinfer.jit import core as jit_core
         (3072, 512, "token_owned_dual_col"),
         (3072, 1024, "token_owned_dual_col"),
         (2688, 1, "token_owned_t64"),
-        (2688, 4, "pair_owned_t128"),
+        (2688, 4, "token_owned_t64"),
         (2688, 8, "token_owned_t64"),
         (2688, 32, "token_owned"),
         (2688, 256, "token_owned"),
@@ -99,7 +99,8 @@ def test_binding_preserves_graph_and_tensor_contracts():
     assert "kShrinkPrefillSmemBytes = 36992" in binding
     assert "cudaDevAttrMaxSharedMemoryPerBlockOptin" in binding
     assert "cudaFuncAttributeMaxDynamicSharedMemorySize" in binding
-    assert "cudaMemsetAsync" in binding
+    assert "cudaMemsetAsync" not in binding
+    assert "EXPAND_PAIR" not in binding
     assert "BLACKWELL_BGMV_MOE_SHRINK_DECODE<<<" in binding
     assert "BLACKWELL_BGMV_MOE_EXPAND_TOKEN_DUAL<<<" in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure" in binding
@@ -113,3 +114,5 @@ def test_binding_preserves_graph_and_tensor_contracts():
             ).read_text()
             smem_totals = re.findall(r"#define SMEM_TOTAL (\d+)", body)
             assert smem_totals[:2] == ["221696", "36992"]
+            assert "atomicAdd(" not in body
+            assert "expand_pair_owned" not in body

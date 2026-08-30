@@ -84,7 +84,12 @@ def _make_inputs(hidden_size, num_tokens, dtype, *, arbitrary_routes=False):
     if num_tokens > 1:
         lora_indices[0] = -1
     if arbitrary_routes:
-        order = torch.randperm(num_pairs, device=device)
+        order = (
+            torch.arange(num_pairs, dtype=torch.int64, device=device)
+            .reshape(num_tokens, top_k)
+            .transpose(0, 1)
+            .reshape(-1)
+        )
         sorted_token_ids = sorted_token_ids[order].contiguous()
         expert_ids = expert_ids[order].contiguous()
         topk_weights = topk_weights[order].contiguous()
@@ -167,6 +172,21 @@ def test_arbitrary_route_order_and_nondefault_stream(dtype, num_tokens):
         actual = plan.run()
     stream.synchronize()
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_prepared_pipeline_is_bitwise_reproducible(dtype):
+    _require_sm100()
+    inputs = _make_inputs(2688, 4, dtype, arbitrary_routes=True)
+    expected = _reference(inputs)
+    plan = prepare_bgmv_moe(*inputs, backend="blackwell")
+    first = plan.run().clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
+    for _ in range(7):
+        replay = plan.run().clone()
+        torch.cuda.synchronize()
+        assert torch.equal(replay, first)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

@@ -207,7 +207,10 @@ def main():
     report = {
         "gpu": torch.cuda.get_device_name(),
         "timing": "CUPTI GPU activity span, cold L2",
-        "scope": "zero + shrink + expand",
+        "scope": (
+            "initialized-output pipeline: baseline zero + shrink + expand; "
+            "prepared backend total-store shrink + expand"
+        ),
         "rows": rows,
         "baseline_geomean_us": baseline_geomean_us,
         "candidate_geomean_us": candidate_geomean_us,

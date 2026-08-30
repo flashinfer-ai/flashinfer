@@ -31,9 +31,6 @@
 #ifndef BLACKWELL_BGMV_MOE_SHRINK_PREFILL
 #error "BLACKWELL_BGMV_MOE_SHRINK_PREFILL must name the generated kernel symbol"
 #endif
-#ifndef BLACKWELL_BGMV_MOE_EXPAND_PAIR
-#error "BLACKWELL_BGMV_MOE_EXPAND_PAIR must name the generated kernel symbol"
-#endif
 #ifndef BLACKWELL_BGMV_MOE_EXPAND_TOKEN_T64
 #error "BLACKWELL_BGMV_MOE_EXPAND_TOKEN_T64 must name the generated kernel symbol"
 #endif
@@ -86,10 +83,9 @@ constexpr int32_t kShrinkPrefillSmemBytes = 36992;
 constexpr int32_t kExpandSmemBytes = 128;
 
 enum class Schedule : int32_t {
-  kPairOwnedT128 = 0,
-  kTokenOwnedT64 = 1,
-  kTokenOwned = 2,
-  kTokenOwnedDualCol = 3,
+  kTokenOwnedT64 = 0,
+  kTokenOwned = 1,
+  kTokenOwnedDualCol = 2,
 };
 
 inline void CheckCuda(cudaError_t status, const char* operation) {
@@ -205,7 +201,7 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   CheckCompact(lora_indices, "lora_indices");
   CheckCompact(topk_weights, "topk_weights");
 
-  TVM_FFI_ICHECK(schedule_value >= static_cast<int64_t>(Schedule::kPairOwnedT128) &&
+  TVM_FFI_ICHECK(schedule_value >= static_cast<int64_t>(Schedule::kTokenOwnedT64) &&
                  schedule_value <= static_cast<int64_t>(Schedule::kTokenOwnedDualCol))
       << "invalid Blackwell BGMV MoE schedule id: " << schedule_value;
   const auto schedule = static_cast<Schedule>(schedule_value);
@@ -219,11 +215,6 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   auto* expert_ptr = static_cast<long long*>(expert_ids.data_ptr());
   auto* lora_ptr = static_cast<long long*>(lora_indices.data_ptr());
   auto* weight_ptr = static_cast<float*>(topk_weights.data_ptr());
-
-  if (schedule == Schedule::kPairOwnedT128) {
-    CheckCuda(cudaMemsetAsync(y_ptr, 0, y_accum.numel() * sizeof(float), stream),
-              "Blackwell BGMV MoE output initialization");
-  }
 
   const dim3 shrink_block(kShrinkThreads, 1, 1);
   if (num_pairs <= 32) {
@@ -242,12 +233,7 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
 
   const int32_t output_stride = kHidden;
   const int32_t output_offset = 0;
-  if (schedule == Schedule::kPairOwnedT128) {
-    const dim3 grid(num_pairs, (kHidden + 127) / 128, 1);
-    BLACKWELL_BGMV_MOE_EXPAND_PAIR<<<grid, 128, 0, stream>>>(
-        y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
-        num_experts, num_tokens, output_stride, output_offset);
-  } else if (schedule == Schedule::kTokenOwnedT64) {
+  if (schedule == Schedule::kTokenOwnedT64) {
     const dim3 grid(num_tokens, (kHidden + 63) / 64, 1);
     BLACKWELL_BGMV_MOE_EXPAND_TOKEN_T64<<<grid, 64, kExpandSmemBytes, stream>>>(
         y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,

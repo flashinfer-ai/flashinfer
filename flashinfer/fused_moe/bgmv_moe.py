@@ -371,7 +371,9 @@ def prepare_bgmv_moe(
 
     This optimized path currently supports one LoRA slice, rank 32, hidden
     sizes 2688 or 3072, BF16/FP16 inputs, and exact SM100 devices. Routing may
-    be arbitrary; the contiguous top-k=2 layout takes the optimized fast path.
+    be arbitrary; each output has one owner that accumulates routes in fixed
+    input order, so identical prepared replays are bitwise reproducible. The
+    contiguous top-k=2 layout takes the optimized fast path.
 
     Args:
         x: Input activations with shape ``[num_tokens, hidden_size]``.

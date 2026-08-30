@@ -26,7 +26,6 @@ from .utils import write_if_different
 
 BlackwellBGMVMoEDType = Literal["bfloat16", "float16"]
 BlackwellBGMVMoESchedule = Literal[
-    "pair_owned_t128",
     "token_owned_t64",
     "token_owned",
     "token_owned_dual_col",
@@ -38,10 +37,9 @@ BLACKWELL_BGMV_MOE_DTYPES: tuple[BlackwellBGMVMoEDType, ...] = (
     "float16",
 )
 BLACKWELL_BGMV_MOE_SCHEDULE_IDS: dict[BlackwellBGMVMoESchedule, int] = {
-    "pair_owned_t128": 0,
-    "token_owned_t64": 1,
-    "token_owned": 2,
-    "token_owned_dual_col": 3,
+    "token_owned_t64": 0,
+    "token_owned": 1,
+    "token_owned_dual_col": 2,
 }
 
 
@@ -49,7 +47,6 @@ class BlackwellBGMVMoEMetadata(NamedTuple):
     body: str
     shrink_decode_symbol: str
     shrink_prefill_symbol: str
-    pair_owned_symbol: str
     token_t64_symbol: str
     token_symbol: str
     token_dual_col_symbol: str
@@ -79,10 +76,6 @@ def _metadata(
         shrink_prefill_symbol=(
             f"kernel_flashinfer_bgmv_moe_shrink_{tag}_h{hidden_size}_r32_p1_s2"
         ),
-        pair_owned_symbol=(
-            "kernel_flashinfer_bgmv_moe_expand_pair_owned_"
-            f"{tag}_h{hidden_size}_r32_t128"
-        ),
         token_t64_symbol=(
             f"kernel_flashinfer_bgmv_moe_expand_token_t64_{tag}_h{hidden_size}_r32"
         ),
@@ -109,11 +102,9 @@ def select_blackwell_bgmv_moe_schedule(
         raise ValueError(f"num_tokens must be positive, got {num_tokens}")
 
     if (hidden_size == 3072 and num_tokens in (1, 4, 8)) or (
-        hidden_size == 2688 and num_tokens in (1, 8)
+        hidden_size == 2688 and num_tokens in (1, 4, 8)
     ):
         return "token_owned_t64"
-    if hidden_size == 2688 and num_tokens == 4:
-        return "pair_owned_t128"
     if hidden_size == 3072 and num_tokens in (512, 1024):
         return "token_owned_dual_col"
     if hidden_size == 2688 and num_tokens == 1024:
@@ -178,7 +169,6 @@ def _binding_source(metadata: BlackwellBGMVMoEMetadata, hidden_size: int) -> str
 #define BLACKWELL_BGMV_MOE_INPUT_DTYPE {input_dtype}
 #define BLACKWELL_BGMV_MOE_SHRINK_DECODE {metadata.shrink_decode_symbol}
 #define BLACKWELL_BGMV_MOE_SHRINK_PREFILL {metadata.shrink_prefill_symbol}
-#define BLACKWELL_BGMV_MOE_EXPAND_PAIR {metadata.pair_owned_symbol}
 #define BLACKWELL_BGMV_MOE_EXPAND_TOKEN_T64 {metadata.token_t64_symbol}
 #define BLACKWELL_BGMV_MOE_EXPAND_TOKEN {metadata.token_symbol}
 #define BLACKWELL_BGMV_MOE_EXPAND_TOKEN_DUAL {metadata.token_dual_col_symbol}
