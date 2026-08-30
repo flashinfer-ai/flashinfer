@@ -166,10 +166,46 @@ def _assert_legacy_and_aux_paths_are_bitwise_equal(
         return result
 
     monkeypatch.setattr(fused_moe_module, "moe_sort", checked_sort)
-    monkeypatch.setenv("FLASHINFER_CUTEDSL_MOE_PER_TOKEN_AUX_AMAX", "0")
-    legacy_output = fused_moe_module._moe_core_impl(**kwargs)
-
+    original_gemm1 = (
+        fused_moe_module.blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4
+    )
     original_quantize = fused_moe_module.nvfp4_quantize_per_token_cute_dsl
+    legacy_gemm1_calls = 0
+    legacy_quantize_calls = 0
+
+    def legacy_gemm1(*args, **call_kwargs):
+        nonlocal legacy_gemm1_calls
+        assert call_kwargs.get("out_amax") is not None
+        call_kwargs = dict(call_kwargs)
+        call_kwargs["out_amax"] = None
+        legacy_gemm1_calls += 1
+        return original_gemm1(*args, **call_kwargs)
+
+    def legacy_quantize(*args, **call_kwargs):
+        nonlocal legacy_quantize_calls
+        assert call_kwargs.get("input_amax") is not None
+        assert call_kwargs.get("input_amax_valid_rows") is not None
+        call_kwargs = dict(call_kwargs)
+        call_kwargs.pop("input_amax")
+        call_kwargs.pop("input_amax_valid_rows")
+        legacy_quantize_calls += 1
+        return original_quantize(*args, **call_kwargs)
+
+    with monkeypatch.context() as legacy_patch:
+        legacy_patch.setattr(
+            fused_moe_module,
+            "blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4",
+            legacy_gemm1,
+        )
+        legacy_patch.setattr(
+            fused_moe_module,
+            "nvfp4_quantize_per_token_cute_dsl",
+            legacy_quantize,
+        )
+        legacy_output = fused_moe_module._moe_core_impl(**kwargs)
+
+    assert legacy_gemm1_calls == 1
+    assert legacy_quantize_calls == 1
     calls_checked = 0
 
     def checked_quantize(
@@ -242,7 +278,6 @@ def _assert_legacy_and_aux_paths_are_bitwise_equal(
         "nvfp4_quantize_per_token_cute_dsl",
         checked_quantize,
     )
-    monkeypatch.setenv("FLASHINFER_CUTEDSL_MOE_PER_TOKEN_AUX_AMAX", "1")
     accelerated_output = fused_moe_module._moe_core_impl(**kwargs)
 
     assert calls_checked == 1

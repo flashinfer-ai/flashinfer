@@ -74,7 +74,6 @@ from ...quantization.kernels.nvfp4_quantize import (
     SF_LAYOUT_128x4,
     nvfp4_quantize_per_token_cute_dsl,
 )
-from ...quantization.nvfp4_quantization_utils import env_flag_enabled
 from ...utils import supported_compute_capability
 from .moe_utils import (
     moe_output_memset_inplace,
@@ -329,14 +328,9 @@ def _moe_core_impl(
             "c_dtype": "float4_e2m1fn",
         }
     )
-    # Temporary experiment gate.  This will be removed once the benchmark and
-    # layout arms have selected the production implementation.
-    use_intermediate_amax = use_per_token_activation and env_flag_enabled(
-        "FLASHINFER_CUTEDSL_MOE_PER_TOKEN_AUX_AMAX"
-    )
     intermediate_per_token_scale = None
     intermediate_amax = None
-    if use_intermediate_amax:
+    if use_per_token_activation:
         intermediate_size = w1_weight.shape[1] // (2 if gated else 1)
         output_tile_n = gemm1_mma_tiler_mn[1] // (2 if gated else 1)
         num_output_tiles = (intermediate_size + output_tile_n - 1) // output_tile_n
