@@ -372,21 +372,34 @@ kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __re
                 const int __me = pg_rank;
                 const int __slot = 0;
                 unsigned* __local_flag = pg_flags[__me] + __slot;
-                unsigned __old_sense = 0u;
-                const unsigned __delta = (__me == 0) ? (0x80000000u - (unsigned)(__ws - 1)) : 1u;
+                unsigned __previous_epoch;
+                asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                    : "=r"(__previous_epoch) : "l"(__local_flag) : "memory");
+                const unsigned __arrival_epoch = __previous_epoch + 1u;
+                const unsigned __release_epoch = __previous_epoch + 2u;
                 asm volatile("fence.proxy.async.global;" ::: "memory");
-                for (int __r = 0; __r < __ws; ++__r) {
-                    unsigned* __peer_flag = pg_flags[__r] + __slot;
-                    unsigned __old_peer;
-                    asm volatile("atom.add.release.sys.u32 %0, [%1], %2;"
-                        : "=r"(__old_peer) : "l"(__peer_flag), "r"(__delta) : "memory");
-                    if (__r == __me) __old_sense = __old_peer;
-                }
-                asm volatile("fence.proxy.alias;" ::: "memory");
-                while (true) {
-                    unsigned __v;
-                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
-                    if (((__old_sense ^ __v) & 0x80000000u) != 0u) break;
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__local_flag), "r"(__arrival_epoch) : "memory");
+                if (__me == 0) {
+                    for (int __r = 0; __r < __ws; ++__r) {
+                        unsigned* __peer_flag = pg_flags[__r] + __slot;
+                        while (true) {
+                            unsigned __v;
+                            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__peer_flag) : "memory");
+                            if (__v == __arrival_epoch) break;
+                        }
+                    }
+                    for (int __r = 0; __r < __ws; ++__r) {
+                        unsigned* __peer_flag = pg_flags[__r] + __slot;
+                        asm volatile("st.release.sys.global.u32 [%0], %1;"
+                            :: "l"(__peer_flag), "r"(__release_epoch) : "memory");
+                    }
+                } else {
+                    while (true) {
+                        unsigned __v;
+                        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
+                        if (__v == __release_epoch) break;
+                    }
                 }
                 asm volatile("fence.proxy.async.global;" ::: "memory");
             }
@@ -3392,21 +3405,34 @@ kernel_rank_major_partial_barrier_v1(int32_t pg_world, int32_t pg_rank, unsigned
                 const int __me = pg_rank;
                 const int __slot = 1;
                 unsigned* __local_flag = pg_flags[__me] + __slot;
-                unsigned __old_sense = 0u;
-                const unsigned __delta = (__me == 0) ? (0x80000000u - (unsigned)(__ws - 1)) : 1u;
+                unsigned __previous_epoch;
+                asm volatile("ld.relaxed.sys.global.u32 %0, [%1];"
+                    : "=r"(__previous_epoch) : "l"(__local_flag) : "memory");
+                const unsigned __arrival_epoch = __previous_epoch + 1u;
+                const unsigned __release_epoch = __previous_epoch + 2u;
                 asm volatile("fence.proxy.async.global;" ::: "memory");
-                for (int __r = 0; __r < __ws; ++__r) {
-                    unsigned* __peer_flag = pg_flags[__r] + __slot;
-                    unsigned __old_peer;
-                    asm volatile("atom.add.release.sys.u32 %0, [%1], %2;"
-                        : "=r"(__old_peer) : "l"(__peer_flag), "r"(__delta) : "memory");
-                    if (__r == __me) __old_sense = __old_peer;
-                }
-                asm volatile("fence.proxy.alias;" ::: "memory");
-                while (true) {
-                    unsigned __v;
-                    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
-                    if (((__old_sense ^ __v) & 0x80000000u) != 0u) break;
+                asm volatile("st.release.sys.global.u32 [%0], %1;"
+                    :: "l"(__local_flag), "r"(__arrival_epoch) : "memory");
+                if (__me == 0) {
+                    for (int __r = 0; __r < __ws; ++__r) {
+                        unsigned* __peer_flag = pg_flags[__r] + __slot;
+                        while (true) {
+                            unsigned __v;
+                            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__peer_flag) : "memory");
+                            if (__v == __arrival_epoch) break;
+                        }
+                    }
+                    for (int __r = 0; __r < __ws; ++__r) {
+                        unsigned* __peer_flag = pg_flags[__r] + __slot;
+                        asm volatile("st.release.sys.global.u32 [%0], %1;"
+                            :: "l"(__peer_flag), "r"(__release_epoch) : "memory");
+                    }
+                } else {
+                    while (true) {
+                        unsigned __v;
+                        asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(__v) : "l"(__local_flag) : "memory");
+                        if (__v == __release_epoch) break;
+                    }
                 }
                 asm volatile("fence.proxy.async.global;" ::: "memory");
             }
