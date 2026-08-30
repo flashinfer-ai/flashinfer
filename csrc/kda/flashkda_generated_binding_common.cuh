@@ -200,7 +200,8 @@ inline StatePointerSlots ResolveStatePointerSlots(
     int64_t use_initial_state, int64_t store_final_state);
 inline cudaStream_t CheckedStream(int64_t cuda_stream);
 
-template <int ValueRows, int ChunkTokens, bool PairPackedBeta>
+template <int ValueRows, int ChunkTokens, bool PairPackedBeta,
+          bool QkStyleValueTma = false>
 inline PreparedCommonInputs PrepareCommonInputs(
     const TensorView& q, const TensorView& k, const TensorView& v,
     const TensorView& g, const TensorView& beta, const TensorView& beta_tma,
@@ -233,7 +234,8 @@ inline PreparedCommonInputs PrepareCommonInputs(
   if constexpr (!PairPackedBeta) {
     PackBetaForTmaIfNeeded(beta, beta_tma, num_heads, beta_token_stride, stream);
   }
-  TmaPointers tma = EncodeTmaPointers<ValueRows, ChunkTokens, PairPackedBeta>(
+  TmaPointers tma = EncodeTmaPointers<ValueRows, ChunkTokens, PairPackedBeta,
+                                      ValueRows, QkStyleValueTma>(
       q, k, v, g, beta_tma, out, descriptor_storage, prepare_descriptors,
       stream);
   return {device_id, num_sequences, stream, state, tma};

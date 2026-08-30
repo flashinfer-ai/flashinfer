@@ -316,7 +316,7 @@ inline void RunDirectM128Vtile(
     int64_t grid_x,int64_t grid_y,int64_t grid_z,int64_t cuda_stream) {
   TVM_FFI_ICHECK(q.device().device_type==kDLCUDA); ffi::CUDADeviceGuard guard(q.device().device_id);
   const auto p=PrepareCommonInputs<FLASHKDA_GENERATED_VALUE_ROWS,
-      FLASHKDA_GENERATED_TMA_TILE_TOKENS,FLASHKDA_GENERATED_PAIR_PACKED_BETA!=0>(
+      FLASHKDA_GENERATED_TMA_TILE_TOKENS,FLASHKDA_GENERATED_PAIR_PACKED_BETA!=0,true>(
       q,k,v,g,beta,beta_tma,a_log,dt_bias,cu_seqlens,seq_order,state_indices,initial_state,
       out,final_state,descriptor_storage,prepare_descriptors,num_heads,beta_token_stride,
       state_slot_stride,use_state_indices,use_initial_state,store_final_state,scale,lower_bound,
