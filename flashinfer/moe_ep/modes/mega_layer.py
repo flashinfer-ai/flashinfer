@@ -304,13 +304,14 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError(
                 "MegaMoE warmup cannot run during CUDA graph capture"
             )
-        fleet_params, _backend_workspace = self._resolve_workspace(workspace)
         if t is None:
             if not self._mega_config.quantize_input:
                 raise MoEEpConfigError(
                     "warmup() cannot build a dummy pre-quantized batch; pass "
                     "MoEEpTensors explicitly when quantize_input=False"
                 )
+        fleet_params, _backend_workspace = self._resolve_workspace(workspace)
+        if t is None:
             from ..tensors import MoEEpTensors
 
             fp = fleet_params
@@ -376,7 +377,13 @@ class MoEEpMegaLayer(nn.Module):
                 "return_workspace_view=True is not supported by this MegaMoE backend"
             )
 
-        fleet_params, backend_workspace = self._resolve_workspace(workspace)
+        if workspace is None:
+            if self._destroyed:
+                raise MoEEpConfigError("MegaMoE layer has been destroyed")
+            fleet_params = self._fleet_params
+            backend_workspace = None
+        else:
+            fleet_params, backend_workspace = self._resolve_workspace(workspace)
         self._kernel.validate_forward(
             t,
             fleet_params,
@@ -384,6 +391,8 @@ class MoEEpMegaLayer(nn.Module):
         )
 
         transformed_weights = self.transformed_weights
+        if backend_workspace is None:
+            backend_workspace = self._ensure_workspace()
 
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             self._kernel.validate_capture_ready(
