@@ -500,12 +500,13 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         a_per_token_scale: Optional per-token row scale for operand A,
             shape (seq_len,), float32. Indexed by the original token ID and
             applied before the fused activation.
-        out_amax: Optional float32 buffer for per-row, per-GEMM-N-tile output
-            absolute maxima. Its shape is ``(permuted_m, num_output_n_tiles)``.
-            Values are reduced after conversion to ``c_dtype`` so a downstream
-            per-token quantizer can recover the exact row maximum. Only rows
-            belonging to scheduled routing tiles are defined; the unused tail
-            of a maximum-sized routing buffer is left unchanged.
+        out_amax: Optional 4-byte-aligned ``c_dtype`` buffer for per-row,
+            per-GEMM-N-tile output absolute maxima. It uses the contiguous blocked-8 layout
+            ``(permuted_m // 8, num_output_n_tiles, 8)``. Values are reduced
+            after conversion to ``c_dtype`` so a downstream per-token quantizer
+            can recover the exact row maximum. Only rows belonging to scheduled
+            routing tiles are defined; the unused tail of a maximum-sized
+            routing buffer is left unchanged.
         topk: Number of experts per token. Default: 8
         a_dtype: Data type for the A matrix.
         b_dtype: Data type for the B matrix.
@@ -765,16 +766,33 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
                 "out_amax requires a materialized FP16 or BF16 GEMM1 output"
             )
         output_tile_n = mma_tiler_mn[1] // (2 if gated else 1)
+        if permuted_m % 8 != 0:
+            raise ValueError(
+                f"out_amax blocked-8 layout requires permuted_m={permuted_m} "
+                "to be divisible by 8"
+            )
+        if intermediate_size % output_tile_n != 0:
+            raise ValueError(
+                f"intermediate_size={intermediate_size} must be divisible by "
+                f"output_tile_n={output_tile_n}"
+            )
+        num_output_n_tiles = intermediate_size // output_tile_n
         expected_amax_shape = (
-            permuted_m,
-            (intermediate_size + output_tile_n - 1) // output_tile_n,
+            permuted_m // 8,
+            num_output_n_tiles,
+            8,
         )
         if out_amax.device != a.device:
             raise ValueError("out_amax must be on the same CUDA device as a")
-        if out_amax.dtype != torch.float32:
-            raise ValueError("out_amax must have dtype torch.float32")
+        expected_amax_dtype = cutlass_to_torch_dtype(c_dtype_cutlass)
+        if out_amax.dtype != expected_amax_dtype:
+            raise ValueError(
+                f"out_amax must have dtype {expected_amax_dtype} to match c_dtype"
+            )
         if not out_amax.is_contiguous():
             raise ValueError("out_amax must be contiguous")
+        if out_amax.data_ptr() % 4 != 0:
+            raise ValueError("out_amax must be 4-byte aligned")
         if tuple(out_amax.shape) != expected_amax_shape:
             raise ValueError(
                 f"out_amax must have shape {expected_amax_shape}, "
@@ -839,7 +857,7 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         a_per_token_scale_ptr = None
     output_amax_ptr = (
         make_ptr(
-            cutlass.Float32,
+            c_dtype_cutlass,
             out_amax.data_ptr(),
             cute.AddressSpace.gmem,
             assumed_align=4,

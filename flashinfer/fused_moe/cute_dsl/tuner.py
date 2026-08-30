@@ -61,6 +61,11 @@ from .moe_utils import (
 
 logger = logging.getLogger(__name__)
 
+# Bump this token whenever the SM100 per-token producer/consumer handoff changes
+# in a way that can affect GEMM tactic ranking.  Persisted autotune file keys do
+# not include the runner hash, so the pipeline contract belongs in ``extras``.
+_SM100_PER_TOKEN_PIPELINE_CACHE_SCHEMA = "aux_amax_blocked8_native_v1"
+
 
 # =============================================================================
 # Blackwell (SM100) Tactics
@@ -622,7 +627,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-        return (
+        extras = (
             int(self.activation_type),
             self.swiglu_alpha,
             self.swiglu_beta,
@@ -630,6 +635,9 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             self.situ_beta,
             self.situ_linear_beta,
         )
+        if self.use_per_token_activation:
+            extras += (_SM100_PER_TOKEN_PIPELINE_CACHE_SCHEMA,)
+        return extras
 
     def get_valid_tactics(  # type: ignore[override]
         self,

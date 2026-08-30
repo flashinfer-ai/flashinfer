@@ -339,12 +339,15 @@ def _moe_core_impl(
     if use_intermediate_amax:
         intermediate_size = w1_weight.shape[1] // (2 if gated else 1)
         output_tile_n = gemm1_mma_tiler_mn[1] // (2 if gated else 1)
+        num_output_tiles = (intermediate_size + output_tile_n - 1) // output_tile_n
+        num_permuted_rows = permuted_idx_to_expanded_idx.shape[0]
         intermediate_amax = torch.empty(
             (
-                permuted_idx_to_expanded_idx.shape[0],
-                (intermediate_size + output_tile_n - 1) // output_tile_n,
+                (num_permuted_rows + 7) // 8,
+                num_output_tiles,
+                8,
             ),
-            dtype=torch.float32,
+            dtype=output_dtype,
             device=x.device,
         )
     intermediate, intermediate_sf = (
@@ -384,6 +387,9 @@ def _moe_core_impl(
                 sf_layout=SF_LAYOUT_128x4,
                 enable_pdl=enable_pdl,
                 input_amax=intermediate_amax,
+                input_amax_valid_rows=(
+                    total_num_padded_tokens if intermediate_amax is not None else None
+                ),
             )
         )
         intermediate_sf = convert_sf_to_mma_layout(

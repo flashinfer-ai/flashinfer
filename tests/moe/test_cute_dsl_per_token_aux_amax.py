@@ -57,12 +57,238 @@ def _set_quant_mode(monkeypatch: pytest.MonkeyPatch, deterministic: bool) -> Non
         monkeypatch.setenv(name, value)
 
 
+def _unpack_blocked8(input_amax: torch.Tensor) -> torch.Tensor:
+    """Return the logical [row, GEMM-N-tile] view of the aux buffer."""
+    return (
+        input_amax.permute(0, 2, 1)
+        .reshape(input_amax.shape[0] * 8, input_amax.shape[1])
+        .contiguous()
+    )
+
+
+def _make_gemm1_output(
+    *,
+    num_tokens: int,
+    top_k: int,
+    num_local_experts: int,
+    tile_size: int,
+    intermediate_size: int,
+) -> torch.Tensor:
+    from flashinfer.fused_moe.cute_dsl.moe_utils import (
+        get_max_num_permuted_tokens,
+    )
+
+    max_num_permuted_tokens = get_max_num_permuted_tokens(
+        num_tokens,
+        top_k,
+        num_local_experts,
+        tile_size,
+    )
+    # A finite sentinel makes the deliberately unused routing-buffer tail
+    # deterministic. GEMM1 must not touch it and GEMM2 must not consume it.
+    return torch.full(
+        (max_num_permuted_tokens, intermediate_size),
+        17.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+
+
+def _make_core_kwargs(
+    tensors: dict,
+    *,
+    num_tokens: int,
+    intermediate_size: int,
+    num_experts: int,
+    top_k: int,
+    num_local_experts: int,
+    local_expert_offset: int,
+    tile_size: int,
+    gemm1_n: int,
+    activation_type: ActivationType,
+) -> dict:
+    return {
+        "x": tensors["x"],
+        "x_sf": tensors["x_sf"],
+        "token_selected_experts": tensors["token_selected_experts"],
+        "token_final_scales": tensors["token_final_scales"],
+        "w1_weight": tensors["w1_weight"],
+        "w1_weight_sf": tensors["w1_weight_sf"],
+        "w1_alpha": tensors["w1_alpha"],
+        "fc2_input_scale": tensors["fc2_input_scale"],
+        "w2_weight": tensors["w2_weight"],
+        "w2_weight_sf": tensors["w2_weight_sf"],
+        "w2_alpha": tensors["w2_alpha"],
+        "num_experts": num_experts,
+        "top_k": top_k,
+        "num_local_experts": num_local_experts,
+        "local_expert_offset": local_expert_offset,
+        "tile_size": tile_size,
+        "gemm1_mma_tiler_mn": (tile_size, gemm1_n),
+        "gemm1_cluster_shape_mn": (tile_size // 128, 1),
+        "gemm2_mma_tiler_mn": (tile_size, 128),
+        "gemm2_cluster_shape_mn": (tile_size // 128, 1),
+        "use_async_memset": False,
+        "use_fused_finalize": False,
+        "enable_pdl": True,
+        "activation_type": activation_type.value,
+        "per_token_scale": tensors["x_per_token_scale"],
+        "gemm1_out": _make_gemm1_output(
+            num_tokens=num_tokens,
+            top_k=top_k,
+            num_local_experts=num_local_experts,
+            tile_size=tile_size,
+            intermediate_size=intermediate_size,
+        ),
+    }
+
+
+def _assert_legacy_and_aux_paths_are_bitwise_equal(
+    monkeypatch: pytest.MonkeyPatch,
+    kwargs: dict,
+    *,
+    tile_size: int,
+    gemm1_n: int,
+    gated: bool,
+    expect_unused_rows: bool,
+    expect_masked_routes: bool = False,
+    expect_padded_rows: bool = False,
+) -> None:
+    """Compare every defined intermediate row and the final MoE output."""
+    import flashinfer.fused_moe.cute_dsl.fused_moe as fused_moe_module
+
+    original_sort = fused_moe_module.moe_sort
+    sort_results = []
+
+    def checked_sort(*args, **sort_kwargs):
+        result = original_sort(*args, **sort_kwargs)
+        sort_results.append(result)
+        return result
+
+    monkeypatch.setattr(fused_moe_module, "moe_sort", checked_sort)
+    monkeypatch.setenv("FLASHINFER_CUTEDSL_MOE_PER_TOKEN_AUX_AMAX", "0")
+    legacy_output = fused_moe_module._moe_core_impl(**kwargs)
+
+    original_quantize = fused_moe_module.nvfp4_quantize_per_token_cute_dsl
+    calls_checked = 0
+
+    def checked_quantize(
+        input: torch.Tensor,
+        global_scale_inv: torch.Tensor,
+        sf_layout: int,
+        enable_pdl: bool,
+        input_amax: torch.Tensor | None = None,
+        input_amax_valid_rows: torch.Tensor | None = None,
+    ):
+        nonlocal calls_checked
+        assert input_amax is not None
+
+        sort_result = sort_results[-1]
+        permuted_idx_to_expanded_idx = sort_result[3]
+        num_non_exiting_tiles = int(sort_result[5].item())
+        active_rows = num_non_exiting_tiles * tile_size
+        assert input.shape[0] == permuted_idx_to_expanded_idx.shape[0]
+        assert active_rows <= input.shape[0]
+        assert input_amax_valid_rows is not None
+        assert input_amax_valid_rows.dtype == torch.int32
+        assert input_amax_valid_rows.shape == (1,)
+        assert int(input_amax_valid_rows.item()) == active_rows
+
+        output_tile_n = gemm1_n // (2 if gated else 1)
+        expected_amax = (
+            input[:active_rows]
+            .float()
+            .abs()
+            .reshape(
+                active_rows,
+                input.shape[1] // output_tile_n,
+                output_tile_n,
+            )
+            .amax(dim=2)
+            .to(input.dtype)
+        )
+        # Only scheduled epilogue rows are defined. Rows in the allocation
+        # tail are deliberately not synchronized or initialized.
+        logical_input_amax = _unpack_blocked8(input_amax)
+        assert input_amax.dtype == input.dtype
+        assert torch.equal(logical_input_amax[:active_rows], expected_amax)
+
+        legacy_quantized = original_quantize(
+            input,
+            global_scale_inv,
+            sf_layout=sf_layout,
+            enable_pdl=False,
+        )
+        accelerated_quantized = original_quantize(
+            input,
+            global_scale_inv,
+            sf_layout=sf_layout,
+            enable_pdl=enable_pdl,
+            input_amax=input_amax,
+            input_amax_valid_rows=input_amax_valid_rows,
+        )
+        # FP4 codes, swizzled block scales, and per-token scales are compared
+        # bitwise for every row GEMM1 actually produced. active_rows is a
+        # multiple of 128, so it also covers whole 128x4 scale-layout tiles.
+        for accelerated, legacy in zip(
+            accelerated_quantized, legacy_quantized, strict=True
+        ):
+            assert torch.equal(accelerated[:active_rows], legacy[:active_rows])
+        calls_checked += 1
+        return accelerated_quantized
+
+    monkeypatch.setattr(
+        fused_moe_module,
+        "nvfp4_quantize_per_token_cute_dsl",
+        checked_quantize,
+    )
+    monkeypatch.setenv("FLASHINFER_CUTEDSL_MOE_PER_TOKEN_AUX_AMAX", "1")
+    accelerated_output = fused_moe_module._moe_core_impl(**kwargs)
+
+    assert calls_checked == 1
+    assert len(sort_results) == 2
+    # Within-expert permutation order is not part of moe_sort's contract, but
+    # both launches must agree on the padded and scheduled extents.
+    assert torch.equal(sort_results[0][4], sort_results[1][4])
+    assert torch.equal(sort_results[0][5], sort_results[1][5])
+
+    active_rows = int(sort_results[1][5].item()) * tile_size
+    expanded_idx_to_permuted_idx = sort_results[1][2]
+    gemm1_out = kwargs["gemm1_out"]
+    if expect_unused_rows:
+        assert active_rows < gemm1_out.shape[0]
+        assert torch.equal(
+            gemm1_out[active_rows:],
+            torch.full_like(gemm1_out[active_rows:], 17.0),
+        )
+    else:
+        assert active_rows == gemm1_out.shape[0]
+    if expect_masked_routes:
+        assert (expanded_idx_to_permuted_idx < 0).any()
+        assert (expanded_idx_to_permuted_idx >= 0).any()
+    if expect_padded_rows:
+        # The sort kernel does not promise a sentinel value in its padded
+        # inverse-map entries. Prove that padding exists from the number of
+        # valid local routes instead of reading those deliberately undefined
+        # entries.
+        num_valid_local_routes = int((expanded_idx_to_permuted_idx >= 0).sum().item())
+        assert num_valid_local_routes < active_rows
+    assert torch.equal(accelerated_output, legacy_output)
+
+
 @pytest.mark.parametrize("deterministic_quant", [False, True])
 @pytest.mark.parametrize(
     ("tile_size", "gemm1_n", "activation_type", "gated"),
     [
         pytest.param(128, 128, ActivationType.Swiglu, True, id="m128-n128-swiglu"),
         pytest.param(128, 256, ActivationType.Swiglu, True, id="m128-n256-swiglu"),
+        pytest.param(
+            256,
+            256,
+            ActivationType.Swiglu,
+            True,
+            id="m256-2cta-n256-swiglu",
+        ),
         pytest.param(256, 128, ActivationType.Relu2, False, id="m256-n128-relu2"),
         pytest.param(256, 256, ActivationType.Relu2, False, id="m256-n256-relu2"),
     ],
@@ -76,8 +302,6 @@ def test_gemm1_aux_amax_and_per_token_output_are_bitwise_equal(
     deterministic_quant: bool,
 ):
     """Check producer values and the exact legacy/accelerated MoE boundary."""
-    import flashinfer.fused_moe.cute_dsl.fused_moe as fused_moe_module
-
     _set_quant_mode(monkeypatch, deterministic_quant)
 
     num_tokens, top_k, num_experts = 8, 2, 16
@@ -109,84 +333,152 @@ def test_gemm1_aux_amax_and_per_token_output_are_bitwise_equal(
         )
     )
 
-    kwargs = {
-        "x": tensors["x"],
-        "x_sf": tensors["x_sf"],
-        "token_selected_experts": tensors["token_selected_experts"],
-        "token_final_scales": tensors["token_final_scales"],
-        "w1_weight": tensors["w1_weight"],
-        "w1_weight_sf": tensors["w1_weight_sf"],
-        "w1_alpha": tensors["w1_alpha"],
-        "fc2_input_scale": tensors["fc2_input_scale"],
-        "w2_weight": tensors["w2_weight"],
-        "w2_weight_sf": tensors["w2_weight_sf"],
-        "w2_alpha": tensors["w2_alpha"],
-        "num_experts": num_experts,
-        "top_k": top_k,
-        "num_local_experts": num_experts,
-        "tile_size": tile_size,
-        "gemm1_mma_tiler_mn": (tile_size, gemm1_n),
-        "gemm1_cluster_shape_mn": (tile_size // 128, 1),
-        "gemm2_mma_tiler_mn": (tile_size, 128),
-        "gemm2_cluster_shape_mn": (tile_size // 128, 1),
-        "use_async_memset": False,
-        "use_fused_finalize": False,
-        "enable_pdl": True,
-        "activation_type": activation_type.value,
-        "per_token_scale": tensors["x_per_token_scale"],
-    }
-
-    monkeypatch.setenv("FLASHINFER_CUTEDSL_MOE_PER_TOKEN_AUX_AMAX", "0")
-    legacy_output = fused_moe_module._moe_core_impl(**kwargs)
-
-    original_quantize = fused_moe_module.nvfp4_quantize_per_token_cute_dsl
-    calls_checked = 0
-
-    def checked_quantize(
-        input: torch.Tensor,
-        global_scale_inv: torch.Tensor,
-        sf_layout: int,
-        enable_pdl: bool,
-        input_amax: torch.Tensor | None = None,
-    ):
-        nonlocal calls_checked
-        assert input_amax is not None
-        output_tile_n = gemm1_n // (2 if gated else 1)
-        expected_amax = (
-            input.float()
-            .abs()
-            .reshape(input.shape[0], input.shape[1] // output_tile_n, output_tile_n)
-            .amax(dim=2)
-        )
-        assert torch.equal(input_amax, expected_amax)
-
-        legacy_quantized = original_quantize(
-            input,
-            global_scale_inv,
-            sf_layout=sf_layout,
-            enable_pdl=False,
-        )
-        accelerated_quantized = original_quantize(
-            input,
-            global_scale_inv,
-            sf_layout=sf_layout,
-            enable_pdl=enable_pdl,
-            input_amax=input_amax,
-        )
-        for accelerated, legacy in zip(
-            accelerated_quantized, legacy_quantized, strict=True
-        ):
-            assert torch.equal(accelerated, legacy)
-        calls_checked += 1
-        return accelerated_quantized
-
-    monkeypatch.setattr(
-        fused_moe_module,
-        "nvfp4_quantize_per_token_cute_dsl",
-        checked_quantize,
+    kwargs = _make_core_kwargs(
+        tensors,
+        num_tokens=num_tokens,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        gemm1_n=gemm1_n,
+        activation_type=activation_type,
     )
-    monkeypatch.setenv("FLASHINFER_CUTEDSL_MOE_PER_TOKEN_AUX_AMAX", "1")
-    accelerated_output = fused_moe_module._moe_core_impl(**kwargs)
 
-    assert calls_checked == 1
-    assert torch.equal(accelerated_output, legacy_output)
+    _assert_legacy_and_aux_paths_are_bitwise_equal(
+        monkeypatch,
+        kwargs,
+        tile_size=tile_size,
+        gemm1_n=gemm1_n,
+        gated=gated,
+        expect_unused_rows=False,
+    )
+
+
+@pytest.mark.parametrize("deterministic_quant", [False, True])
+def test_local_routing_with_padded_unused_rows_is_bitwise_equal(
+    monkeypatch: pytest.MonkeyPatch,
+    deterministic_quant: bool,
+):
+    """EP-local routes ignore both in-tile padding and allocation-tail rows."""
+    _set_quant_mode(monkeypatch, deterministic_quant)
+
+    num_tokens, top_k, num_experts = 9, 2, 16
+    num_local_experts, local_expert_offset = 4, 4
+    hidden_size, intermediate_size = 256, 512
+    tile_size, gemm1_n = 128, 128
+    tensors = create_moe_tensors(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        num_local_experts=num_local_experts,
+        top_k=top_k,
+        gated=True,
+        use_per_token_activation=True,
+    )
+
+    # Experts [4, 8) are local. Only experts 4 and 5 receive local routes, so
+    # moe_sort emits two heavily padded tiles into a four-tile allocation.
+    tensors["token_selected_experts"].copy_(
+        torch.tensor(
+            [
+                [4, 0],
+                [5, 15],
+                [4, 1],
+                [5, 14],
+                [4, 2],
+                [5, 13],
+                [4, 3],
+                [5, 12],
+                [4, 8],
+            ],
+            device="cuda",
+            dtype=torch.int32,
+        )
+    )
+    tensors["token_final_scales"].copy_(
+        torch.tensor([0.75, 0.25], device="cuda", dtype=torch.float32).repeat(
+            num_tokens, 1
+        )
+    )
+
+    kwargs = _make_core_kwargs(
+        tensors,
+        num_tokens=num_tokens,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_local_experts,
+        local_expert_offset=local_expert_offset,
+        tile_size=tile_size,
+        gemm1_n=gemm1_n,
+        activation_type=ActivationType.Swiglu,
+    )
+    _assert_legacy_and_aux_paths_are_bitwise_equal(
+        monkeypatch,
+        kwargs,
+        tile_size=tile_size,
+        gemm1_n=gemm1_n,
+        gated=True,
+        expect_unused_rows=True,
+        expect_masked_routes=True,
+        expect_padded_rows=True,
+    )
+
+
+@pytest.mark.parametrize("deterministic_quant", [False, True])
+def test_large_token_moe_aux_path_is_bitwise_equal(
+    monkeypatch: pytest.MonkeyPatch,
+    deterministic_quant: bool,
+):
+    """Exercise a 1K-token benchmark shape without adding a new kernel tactic."""
+    _set_quant_mode(monkeypatch, deterministic_quant)
+
+    num_tokens, top_k, num_experts = 1024, 2, 16
+    hidden_size, intermediate_size = 256, 512
+    tile_size, gemm1_n = 128, 128
+    tensors = create_moe_tensors(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        num_local_experts=num_experts,
+        top_k=top_k,
+        gated=True,
+        use_per_token_activation=True,
+    )
+
+    # Two dense experts produce 16 scheduled M tiles. The tight worst-case
+    # allocation has 31 tiles, which simultaneously exercises a long unused
+    # tail while keeping the weight and compilation footprint small.
+    tensors["token_selected_experts"].copy_(
+        torch.tensor([0, 1], device="cuda", dtype=torch.int32).repeat(num_tokens, 1)
+    )
+    tensors["token_final_scales"].copy_(
+        torch.tensor([0.375, 0.625], device="cuda", dtype=torch.float32).repeat(
+            num_tokens, 1
+        )
+    )
+
+    kwargs = _make_core_kwargs(
+        tensors,
+        num_tokens=num_tokens,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        gemm1_n=gemm1_n,
+        activation_type=ActivationType.Swiglu,
+    )
+    _assert_legacy_and_aux_paths_are_bitwise_equal(
+        monkeypatch,
+        kwargs,
+        tile_size=tile_size,
+        gemm1_n=gemm1_n,
+        gated=True,
+        expect_unused_rows=True,
+    )
