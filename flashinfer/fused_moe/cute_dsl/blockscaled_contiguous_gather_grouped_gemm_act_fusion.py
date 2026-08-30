@@ -238,6 +238,7 @@ def _get_compiled_gather_kernel(
     num_tiles_ptr,
     norm_const_ptr,
     a_per_token_scale_ptr,
+    output_amax_ptr,
     max_active_clusters: int,
     stream,
     # Dtype parameters (compile-time - IN cache key)
@@ -269,6 +270,7 @@ def _get_compiled_gather_kernel(
     situ_linear_beta: Optional[float] = None,
     gated: bool = True,
     use_a_per_token_scale: bool = False,
+    store_output_amax: bool = False,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -317,6 +319,7 @@ def _get_compiled_gather_kernel(
         situ_linear_beta,
         gated,
         use_a_per_token_scale,
+        store_output_amax,
     )
 
     if cache_key not in _gather_kernel_cache:
@@ -374,18 +377,20 @@ def _get_compiled_gather_kernel(
                 situ_linear_beta=situ_linear_beta,
                 gated=gated,
                 use_a_per_token_scale=use_a_per_token_scale,
+                store_output_amax=store_output_amax,
             )
         wrapper_fn = gemm.wrapper
 
         # Compile with runtime parameters - they can vary across calls.
         # Order must match the wrapper signature, and the two wrappers have
         # DIFFERENT arities: the Blackwell wrapper takes a_per_token_scale_ptr
-        # (13 pointers), the Rubin SM107 wrapper does not (12 pointers).
-        # Passing 13 pointers to the SM107 wrapper shifts every argument one
+        # and output_amax_ptr; the Rubin SM107 wrapper takes neither.
+        # Passing the Blackwell-only pointers to the SM107 wrapper shifts arguments
         # slot and dies with "multiple values for argument 'tile_size'".
         # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
         #  tile_idx_to_group_idx_ptr, tile_idx_to_mn_limit_ptr, token_id_mapping_ptr,
-        #  num_non_exiting_tiles_ptr, global_sf_ptr, [a_per_token_scale_ptr],
+        #  num_non_exiting_tiles_ptr, global_sf_ptr,
+        #  [a_per_token_scale_ptr, output_amax_ptr],
         #  orig_m, m, n, k, l, tile_size, scaling_vector_size,
         #  max_active_clusters, stream)
         compiled_gemm = cute.compile(
@@ -402,7 +407,7 @@ def _get_compiled_gather_kernel(
             token_id_ptr,
             num_tiles_ptr,
             norm_const_ptr,
-            *([] if is_rubin else [a_per_token_scale_ptr]),
+            *([] if is_rubin else [a_per_token_scale_ptr, output_amax_ptr]),
             orig_m,
             permuted_m,
             n,
@@ -434,6 +439,7 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     global_scale: Optional[torch.Tensor] = None,
     *,
     a_per_token_scale: Optional[torch.Tensor] = None,
+    out_amax: Optional[torch.Tensor] = None,
     topk: int = 8,
     a_dtype: str = "float4_e2m1fn",
     b_dtype: str = "float4_e2m1fn",
@@ -494,6 +500,12 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         a_per_token_scale: Optional per-token row scale for operand A,
             shape (seq_len,), float32. Indexed by the original token ID and
             applied before the fused activation.
+        out_amax: Optional float32 buffer for per-row, per-GEMM-N-tile output
+            absolute maxima. Its shape is ``(permuted_m, num_output_n_tiles)``.
+            Values are reduced after conversion to ``c_dtype`` so a downstream
+            per-token quantizer can recover the exact row maximum. Only rows
+            belonging to scheduled routing tiles are defined; the unused tail
+            of a maximum-sized routing buffer is left unchanged.
         topk: Number of experts per token. Default: 8
         a_dtype: Data type for the A matrix.
         b_dtype: Data type for the B matrix.
@@ -606,6 +618,8 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
                 f"got {tuple(a_per_token_scale.shape)}"
             )
 
+    store_output_amax = out_amax is not None
+
     if n % 128 != 0:
         raise ValueError(f"GEMM1 output dim n={n} must be a multiple of 128.")
 
@@ -633,6 +647,10 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     # Check compute capability
     major, minor = get_compute_capability(a.device)
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
+    if store_output_amax and is_rubin:
+        raise NotImplementedError(
+            "out_amax is only supported by the SM100 GEMM1 kernel"
+        )
     if major != 10:
         raise ValueError(
             f"Blockscaled contiguous gather grouped GEMM requires SM10x family. "
@@ -741,6 +759,28 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
 
     tile_size = mma_tiler[0] if is_rubin else mma_tiler_mn[0]
 
+    if store_output_amax:
+        if generate_sfc or c_dtype not in {"float16", "bfloat16"}:
+            raise ValueError(
+                "out_amax requires a materialized FP16 or BF16 GEMM1 output"
+            )
+        output_tile_n = mma_tiler_mn[1] // (2 if gated else 1)
+        expected_amax_shape = (
+            permuted_m,
+            (intermediate_size + output_tile_n - 1) // output_tile_n,
+        )
+        if out_amax.device != a.device:
+            raise ValueError("out_amax must be on the same CUDA device as a")
+        if out_amax.dtype != torch.float32:
+            raise ValueError("out_amax must have dtype torch.float32")
+        if not out_amax.is_contiguous():
+            raise ValueError("out_amax must be contiguous")
+        if tuple(out_amax.shape) != expected_amax_shape:
+            raise ValueError(
+                f"out_amax must have shape {expected_amax_shape}, "
+                f"got {tuple(out_amax.shape)}"
+            )
+
     # Create raw pointers (TRT-LLM style) - allows same compiled kernel for different sizes
     a_ptr = make_ptr(
         a_dtype_cutlass, a.data_ptr(), cute.AddressSpace.gmem, assumed_align=32
@@ -797,6 +837,16 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         )
     else:
         a_per_token_scale_ptr = None
+    output_amax_ptr = (
+        make_ptr(
+            cutlass.Float32,
+            out_amax.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=4,
+        )
+        if store_output_amax
+        else None
+    )
     tile_idx_ptr = make_ptr(
         cutlass.Int32, tile_idx_to_expert_idx.data_ptr(), cute.AddressSpace.gmem
     )
@@ -833,6 +883,7 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         num_tiles_ptr=num_tiles_ptr,
         norm_const_ptr=norm_const_ptr,
         a_per_token_scale_ptr=a_per_token_scale_ptr,
+        output_amax_ptr=output_amax_ptr,
         max_active_clusters=max_active_clusters,
         stream=stream,
         # Dtype parameters (compile-time, in cache key)
@@ -860,16 +911,17 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         situ_linear_beta=situ_linear_beta,
         gated=gated,
         use_a_per_token_scale=use_a_per_token_scale,
+        store_output_amax=store_output_amax,
     )
 
     # Execute kernel with runtime parameters.
     # Order must match the wrapper signature; the Rubin SM107 wrapper has no
-    # a_per_token_scale_ptr parameter (see the arity note at the compile site),
-    # so on Rubin the extra pointer must be omitted here too or every argument
+    # Blackwell-only optional pointer parameters (see the arity note at the
+    # compile site), so on Rubin the extra pointers must be omitted here or every argument
     # shifts one slot ("multiple values for argument 'stream'").
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
     #  tile_idx_ptr, mn_limit_ptr, token_id_ptr, num_tiles_ptr, global_sf_ptr,
-    #  [a_per_token_scale_ptr], orig_m, m, n, k, l, stream)
+    #  [a_per_token_scale_ptr, output_amax_ptr], orig_m, m, n, k, l, stream)
     compiled_gemm(
         a_ptr,
         b_ptr,
@@ -883,7 +935,7 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         token_id_ptr,
         num_tiles_ptr,
         norm_const_ptr,
-        *([] if is_rubin else [a_per_token_scale_ptr]),
+        *([] if is_rubin else [a_per_token_scale_ptr, output_amax_ptr]),
         seq_len,  # orig_m
         permuted_m,
         n,
@@ -910,6 +962,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
     global_scale: Optional[torch.Tensor] = None,
     *,
     a_per_token_scale: Optional[torch.Tensor] = None,
+    out_amax: Optional[torch.Tensor] = None,
     topk: int = 8,
     ab_dtype: str = "float4_e2m1fn",
     sf_dtype: str = "float8_e4m3fn",
@@ -953,6 +1006,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
         out_scale,
         global_scale,
         a_per_token_scale=a_per_token_scale,
+        out_amax=out_amax,
         topk=topk,
         a_dtype=ab_dtype,
         b_dtype=ab_dtype,

@@ -50,6 +50,7 @@ from flashinfer.quantization.quantization_cute_dsl_utils import (
     float_to_ue8m0_fast,
     ue8m0_to_inv_scale_fast,
 )
+from flashinfer.cute_dsl.fp4_common import fabs_f32, fmax_f32
 
 from ..moe_utils import (
     normalize_cute_dsl_moe_activation_type,
@@ -429,6 +430,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         situ_linear_beta: Optional[float] = None,
         gated: bool = True,
         use_a_per_token_scale: bool = False,
+        store_output_amax: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -492,6 +494,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.sf_vec_size = sf_vec_size
         self.enable_pdl = enable_pdl
         self.use_a_per_token_scale = use_a_per_token_scale
+        self.store_output_amax = store_output_amax
         self.topk = topk
         self.gated = gated
         self.out_n_factor = 2 if gated else 1
@@ -810,6 +813,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        output_amax: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -1173,6 +1177,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             a_per_token_scale,
+            output_amax,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1260,6 +1265,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        output_amax: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -2642,6 +2648,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
             num_prev_subtiles = cutlass.Int32(0)
             while is_valid_tile:
+                tile_amax = cutlass.Float32(0.0)
                 mma_tile_coord_mnl = (
                     tile_info[0] // cute.size(tiled_mma.thr_id.shape),
                     tile_info[1],
@@ -3208,6 +3215,15 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         acc_vec = tiled_copy_r2s.retile(tCompute).load()
                         acc_vec = epilogue_op(acc_vec.to(self.c_dtype))
                         tRS_rC.store(acc_vec)
+                        if cutlass.const_expr(self.store_output_amax):
+                            # Match the standalone per-token quantizer exactly:
+                            # reduce values after the FP16/BF16 output rounding
+                            # that is visible in the materialized intermediate.
+                            for i in cutlass.range_constexpr(cute.size(acc_vec.shape)):
+                                tile_amax = fmax_f32(
+                                    tile_amax,
+                                    fabs_f32(cutlass.Float32(acc_vec[i])),
+                                )
 
                     #
                     # Store C to shared memory
@@ -3246,6 +3262,16 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 if cutlass.const_expr(not self.overlapping_accum):
                     acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
+
+                if cutlass.const_expr(self.store_output_amax):
+                    # One epilogue thread owns one logical output row.  Fold
+                    # all 64-column epilogue subtiles belonging to this GEMM
+                    # N tile, then publish one partial row maximum.  Use the
+                    # scheduler's logical coordinate because a persistent CTA
+                    # processes multiple tiles over its lifetime.
+                    output_row = tile_info[0] * self.cta_tile_shape_mnk_c[0] + epi_tidx
+                    if output_row < output_amax.shape[0]:
+                        output_amax[(output_row, tile_info[1])] = tile_amax
 
                 #
                 # Advance to next tile
@@ -4000,6 +4026,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles_ptr: cute.Pointer,
         global_sf_ptr: Optional[cute.Pointer],
         a_per_token_scale_ptr: Optional[cute.Pointer],
+        output_amax_ptr: Optional[cute.Pointer],
         orig_m: cutlass.Int64,
         m: cutlass.Int64,
         n: cutlass.Int64,
@@ -4057,6 +4084,22 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             if cutlass.const_expr(a_per_token_scale_ptr is not None)
             else None
         )
+        output_amax = (
+            cute.make_tensor(
+                output_amax_ptr,
+                layout=cute.make_ordered_layout(
+                    (
+                        m,
+                        cute.ceil_div(
+                            interm_size, self.mma_tiler[1] // self.out_n_factor
+                        ),
+                    ),
+                    order=(1, 0),
+                ),
+            )
+            if cutlass.const_expr(output_amax_ptr is not None)
+            else None
+        )
 
         tile_idx_to_group_idx = cute.make_tensor(
             tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
@@ -4090,6 +4133,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             a_per_token_scale,
+            output_amax,
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,

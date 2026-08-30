@@ -698,9 +698,9 @@ _PER_TOKEN_WARPS = _PER_TOKEN_THREADS // WARP_SIZE
 
 class NVFP4QuantizePerTokenKernel:
     """
-    One CTA per token row. The first pass reduces the row amax, then the
-    second pass reuses the regular NVFP4 block quantizer with that row's
-    global encode scale.
+    One CTA per token row. The first pass reduces either the input row or a
+    precomputed row of tile amax values, then the second pass reuses the
+    regular NVFP4 block quantizer with that row's global encode scale.
     """
 
     def __init__(
@@ -711,6 +711,7 @@ class NVFP4QuantizePerTokenKernel:
         enable_pdl: bool = False,
         disable_fp4_quant_fast_math: bool = False,
         nvfp4_4over6_config: NVFP44Over6Config | None = None,
+        has_input_amax: bool = False,
     ):
         self.dtype = dtype
         self.K = K
@@ -718,6 +719,7 @@ class NVFP4QuantizePerTokenKernel:
         self.enable_pdl = enable_pdl
         self.disable_fp4_quant_fast_math = disable_fp4_quant_fast_math
         self.nvfp4_4over6_config = nvfp4_4over6_config
+        self.has_input_amax = has_input_amax
         self.sf_layout = sf_layout
         self.sf_is_128x4 = sf_layout == SF_LAYOUT_128x4
         self.sf_is_8x4 = sf_layout == SF_LAYOUT_8x4
@@ -801,6 +803,38 @@ class NVFP4QuantizePerTokenKernel:
             use_pdl=self.enable_pdl,
         )
 
+    @cute.jit
+    def run_with_input_amax(
+        self,
+        mInput: cute.Tensor,
+        mOutput: cute.Tensor,
+        mScales: cute.Tensor,
+        mPerTokenScale: cute.Tensor,
+        M: Int32,
+        mGlobalScaleInv: cute.Tensor,
+        mInputAmax: cute.Tensor,
+        input_amax_cols: Int32,
+        stream,
+    ):
+        """Launch the specialization that reduces precomputed tile amaxes."""
+        self.kernel(
+            mInput,
+            mOutput,
+            mScales,
+            mPerTokenScale,
+            M,
+            mGlobalScaleInv,
+            mInputAmax,
+            input_amax_cols,
+        ).launch(
+            grid=[M, 1, 1],
+            block=[_PER_TOKEN_THREADS, 1, 1],
+            max_number_threads=[_MAX_THREADS_PER_BLOCK, 1, 1],
+            min_blocks_per_mp=_BLOCKS_PER_SM,
+            stream=stream,
+            use_pdl=self.enable_pdl,
+        )
+
     @cute.kernel
     def kernel(
         self,
@@ -810,6 +844,8 @@ class NVFP4QuantizePerTokenKernel:
         mPerTokenScale: cute.Tensor,
         M: Int32,
         mGlobalScaleInv: cute.Tensor,
+        mInputAmax: cute.Tensor | None = None,
+        input_amax_cols: Int32 | None = None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
@@ -858,21 +894,41 @@ class NVFP4QuantizePerTokenKernel:
         )
 
         local_amax = Float32(0.0)
-        sf_col_idx = tidx
-        while sf_col_idx < num_sf_blocks_per_row:
-            elem_base = sf_col_idx * NVFP4_SF_VEC_SIZE
-            ptr0 = get_ptr_as_int64(row_input, elem_base)
-            ptr1 = get_ptr_as_int64(row_input, elem_base + Int32(8))
-            h0, h1, h2, h3 = ld_global_v4_u32(ptr0)
-            h4, h5, h6, h7 = ld_global_v4_u32(ptr1)
-            if cutlass.const_expr(self.is_bfloat16):
-                block_max_h2 = bfloat2_max_abs_8_fn(h0, h1, h2, h3, h4, h5, h6, h7)
-                block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
-            else:
-                block_max_h2 = half2_max_abs_8_fn(h0, h1, h2, h3, h4, h5, h6, h7)
-                block_max = hmax_reduce_to_f32(block_max_h2)
-            local_amax = fmax_f32(local_amax, block_max)
-            sf_col_idx = sf_col_idx + Int32(_PER_TOKEN_THREADS)
+        if cutlass.const_expr(self.has_input_amax):
+            # Keep row addressing 64-bit like the input/output paths above so
+            # larger future aux shapes do not inherit an Int32 offset limit.
+            input_amax_row_addr = get_ptr_as_int64(mInputAmax, Int32(0)) + Int64(
+                row_idx
+            ) * Int64(input_amax_cols) * Int64(4)
+            row_input_amax = cute.make_tensor(
+                cute.make_ptr(
+                    Float32,
+                    input_amax_row_addr,
+                    cute.AddressSpace.gmem,
+                    assumed_align=4,
+                ),
+                cute.make_layout((input_amax_cols,)),
+            )
+            amax_col_idx = tidx
+            while amax_col_idx < input_amax_cols:
+                local_amax = fmax_f32(local_amax, Float32(row_input_amax[amax_col_idx]))
+                amax_col_idx = amax_col_idx + Int32(_PER_TOKEN_THREADS)
+        else:
+            sf_col_idx = tidx
+            while sf_col_idx < num_sf_blocks_per_row:
+                elem_base = sf_col_idx * NVFP4_SF_VEC_SIZE
+                ptr0 = get_ptr_as_int64(row_input, elem_base)
+                ptr1 = get_ptr_as_int64(row_input, elem_base + Int32(8))
+                h0, h1, h2, h3 = ld_global_v4_u32(ptr0)
+                h4, h5, h6, h7 = ld_global_v4_u32(ptr1)
+                if cutlass.const_expr(self.is_bfloat16):
+                    block_max_h2 = bfloat2_max_abs_8_fn(h0, h1, h2, h3, h4, h5, h6, h7)
+                    block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
+                else:
+                    block_max_h2 = half2_max_abs_8_fn(h0, h1, h2, h3, h4, h5, h6, h7)
+                    block_max = hmax_reduce_to_f32(block_max_h2)
+                local_amax = fmax_f32(local_amax, block_max)
+                sf_col_idx = sf_col_idx + Int32(_PER_TOKEN_THREADS)
 
         warp_amax = warp_reduce(local_amax, fmax_f32)
         row_amax = block_reduce(warp_amax, fmax_f32, reduction_buffer, Float32(0.0))
@@ -1660,6 +1716,7 @@ def _get_compiled_kernel_nvfp4_per_token(
     enable_pdl: bool = False,
     disable_fp4_quant_fast_math: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
+    has_input_amax: bool = False,
 ) -> Callable:
     _dtype_map = {
         "float16": cutlass.Float16,
@@ -1694,31 +1751,63 @@ def _get_compiled_kernel_nvfp4_per_token(
         enable_pdl=enable_pdl,
         disable_fp4_quant_fast_math=disable_fp4_quant_fast_math,
         nvfp4_4over6_config=nvfp4_4over6_config,
+        has_input_amax=has_input_amax,
     )
+
+    kernel_name = _nvfp4_kernel_name(
+        "per_token",
+        dtype_key,
+        K,
+        sf_layout,
+        enable_pdl,
+        disable_fp4_quant_fast_math,
+        silu_and_mul=False,
+        nvfp4_4over6_config=nvfp4_4over6_config,
+    )
+    if has_input_amax:
+        kernel_name += "_input_amax"
+        sym_input_amax_cols = cute.sym_int()
+        input_amax_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Float32,
+            (sym_m, sym_input_amax_cols),
+            stride_order=(1, 0),
+            assumed_align=4,
+        )
+
+        def compile_fn():
+            return cute.compile(
+                kernel_obj.run_with_input_amax,
+                input_fake,
+                output_fake,
+                scales_fake,
+                per_token_scale_fake,
+                Int32(1),
+                global_scale_inv_fake,
+                input_amax_fake,
+                Int32(1),
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
+
+    else:
+
+        def compile_fn():
+            return cute.compile(
+                kernel_obj,
+                input_fake,
+                output_fake,
+                scales_fake,
+                per_token_scale_fake,
+                Int32(1),
+                global_scale_inv_fake,
+                stream_fake,
+                options="--enable-tvm-ffi",
+            )
 
     return build_and_load_cute_dsl_kernel(
         _CUTE_DSL_MODULE,
-        _nvfp4_kernel_name(
-            "per_token",
-            dtype_key,
-            K,
-            sf_layout,
-            enable_pdl,
-            disable_fp4_quant_fast_math,
-            silu_and_mul=False,
-            nvfp4_4over6_config=nvfp4_4over6_config,
-        ),
-        lambda: cute.compile(
-            kernel_obj,
-            input_fake,
-            output_fake,
-            scales_fake,
-            per_token_scale_fake,
-            Int32(1),
-            global_scale_inv_fake,
-            stream_fake,
-            options="--enable-tvm-ffi",
-        ),
+        kernel_name,
+        compile_fn,
         extra_key_files=_kernel_source_files(),
     )
 
@@ -2318,6 +2407,7 @@ def nvfp4_quantize_per_token_cute_dsl(
     global_scale_inv: torch.Tensor,
     sf_layout: int = SF_LAYOUT_128x4,
     enable_pdl: bool | None = None,
+    input_amax: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Per-token NVFP4 activation quantization using the CuTe-DSL kernel.
 
@@ -2332,8 +2422,10 @@ def nvfp4_quantize_per_token_cute_dsl(
     - E2M1 output format (4-bit, 2 values per byte)
     - Supports 128x4, 8x4, and linear scale-factor layouts
 
-    The kernel is compiled once per ``(K, dtype, sf_layout, pdl)`` tuple and
-    handles varying ``M`` (number of tokens) at runtime without recompilation.
+    The kernel is specialized by K, dtype, scale-factor layout, PDL, fast-math
+    and 4-over-6 settings, and whether ``input_amax`` is present. It handles
+    varying M (number of tokens) and aux widths at runtime without
+    recompilation.
 
     Parameters
     ----------
@@ -2350,6 +2442,16 @@ def nvfp4_quantize_per_token_cute_dsl(
         Whether to enable Programmatic Dependent Launch. Auto-detected from
         device capability (SM >= 9.0) when ``None``; pass ``False`` to force it
         off.
+    input_amax : torch.Tensor, optional
+        Contiguous 2-D CUDA ``float32`` tensor of shape ``[M, num_tiles]`` on
+        the same device as ``input``, with ``num_tiles > 0``. Each entry must
+        be the exact maximum absolute value, computed after conversion to
+        ``input.dtype``, for a subset of the corresponding input row; the
+        subsets must cover the row so that reducing this tensor's second
+        dimension produces the same row amax as reducing ``input`` directly.
+        When supplied, the kernel trusts this contract and skips its full-input
+        row-amax pass. Quantization and per-token-scale math are otherwise
+        unchanged.
 
     Returns
     -------
@@ -2384,6 +2486,30 @@ def nvfp4_quantize_per_token_cute_dsl(
     assert k % NVFP4_SF_VEC_SIZE == 0, (
         f"K ({k}) must be divisible by NVFP4_SF_VEC_SIZE={NVFP4_SF_VEC_SIZE}"
     )
+
+    if input_amax is not None:
+        assert isinstance(input_amax, torch.Tensor), (
+            "input_amax must be a torch.Tensor when provided"
+        )
+        assert input_amax.dtype == torch.float32, (
+            f"input_amax must have dtype torch.float32, got {input_amax.dtype}"
+        )
+        assert input_amax.is_cuda, "input_amax must be on a CUDA device"
+        assert input_amax.device == input.device, (
+            f"input_amax must be on the same device as input ({input.device}), "
+            f"got {input_amax.device}"
+        )
+        assert input_amax.dim() == 2, (
+            f"input_amax must be 2-D, got {input_amax.dim()} dimensions"
+        )
+        assert input_amax.shape[0] == m, (
+            f"input_amax must have one row per input row ({m}), "
+            f"got {input_amax.shape[0]}"
+        )
+        assert input_amax.shape[1] > 0 and input_amax.numel() > 0, (
+            "input_amax must be nonempty and have at least one tile per row"
+        )
+        assert input_amax.is_contiguous(), "input_amax must be contiguous"
 
     _torch_to_dtype_key = {
         torch.float16: "float16",
@@ -2423,6 +2549,7 @@ def nvfp4_quantize_per_token_cute_dsl(
         enable_pdl,
         disable_fp4_quant_fast_math,
         nvfp4_4over6_config,
+        input_amax is not None,
     )
 
     fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)
@@ -2431,14 +2558,26 @@ def nvfp4_quantize_per_token_cute_dsl(
     )
     per_token_scale = torch.empty(m, dtype=torch.float32, device=input.device)
 
-    kernel_fn(
-        input,
-        fp4_output,
-        scale_output,
-        per_token_scale,
-        m,
-        global_scale_inv_tensor,
-    )
+    if input_amax is None:
+        kernel_fn(
+            input,
+            fp4_output,
+            scale_output,
+            per_token_scale,
+            m,
+            global_scale_inv_tensor,
+        )
+    else:
+        kernel_fn(
+            input,
+            fp4_output,
+            scale_output,
+            per_token_scale,
+            m,
+            global_scale_inv_tensor,
+            input_amax,
+            input_amax.shape[1],
+        )
 
     scale_output = scale_output.reshape(-1, padded_sf_cols)
     return fp4_output, scale_output, per_token_scale

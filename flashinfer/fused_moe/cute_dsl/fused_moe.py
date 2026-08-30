@@ -74,6 +74,7 @@ from ...quantization.kernels.nvfp4_quantize import (
     SF_LAYOUT_128x4,
     nvfp4_quantize_per_token_cute_dsl,
 )
+from ...quantization.nvfp4_quantization_utils import env_flag_enabled
 from ...utils import supported_compute_capability
 from .moe_utils import (
     moe_output_memset_inplace,
@@ -328,7 +329,24 @@ def _moe_core_impl(
             "c_dtype": "float4_e2m1fn",
         }
     )
+    # Temporary experiment gate.  This will be removed once the benchmark and
+    # layout arms have selected the production implementation.
+    use_intermediate_amax = use_per_token_activation and env_flag_enabled(
+        "FLASHINFER_CUTEDSL_MOE_PER_TOKEN_AUX_AMAX"
+    )
     intermediate_per_token_scale = None
+    intermediate_amax = None
+    if use_intermediate_amax:
+        intermediate_size = w1_weight.shape[1] // (2 if gated else 1)
+        output_tile_n = gemm1_mma_tiler_mn[1] // (2 if gated else 1)
+        intermediate_amax = torch.empty(
+            (
+                permuted_idx_to_expanded_idx.shape[0],
+                (intermediate_size + output_tile_n - 1) // output_tile_n,
+            ),
+            dtype=torch.float32,
+            device=x.device,
+        )
     intermediate, intermediate_sf = (
         blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
             a=x,
@@ -341,6 +359,7 @@ def _moe_core_impl(
             token_id_mapping=permuted_idx_to_expanded_idx,
             num_non_exiting_tiles=kernel_num_non_exiting_tiles,
             out=gemm1_out,
+            out_amax=intermediate_amax,
             **output_kwargs,
             topk=top_k,
             mma_tiler_mn=gemm1_mma_tiler_mn,
@@ -364,6 +383,7 @@ def _moe_core_impl(
                 fc2_input_scale,
                 sf_layout=SF_LAYOUT_128x4,
                 enable_pdl=enable_pdl,
+                input_amax=intermediate_amax,
             )
         )
         intermediate_sf = convert_sf_to_mma_layout(
