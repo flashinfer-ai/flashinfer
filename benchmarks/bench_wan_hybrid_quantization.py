@@ -92,7 +92,11 @@ def main() -> None:
     }
     print(json.dumps(report, indent=2, sort_keys=True))
     if not report["allocation_stable"]:
-        raise RuntimeError("reused quantization allocated persistent CUDA storage")
+        raise RuntimeError(
+            "reused quantization changed CUDA allocation state: "
+            f"allocated_before={allocated_before}, allocated_after={allocated_after}, "
+            f"peak_temporary_allocation_bytes={peak_temporary_allocation_bytes}"
+        )
 
 
 if __name__ == "__main__":

@@ -13,6 +13,11 @@ import pytest
 _BENCHMARK_PATH = (
     Path(__file__).resolve().parents[2] / "benchmarks" / "bench_wan_hybrid_attention.py"
 )
+_QUANTIZATION_BENCHMARK_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "benchmarks"
+    / "bench_wan_hybrid_quantization.py"
+)
 _SPEC = importlib.util.spec_from_file_location(
     "flashinfer_wan_hybrid_benchmark_test_target", _BENCHMARK_PATH
 )
@@ -56,10 +61,13 @@ def test_baseline_quality_is_required_for_promotion() -> None:
 
 
 def test_benchmark_records_peak_temporary_allocations() -> None:
-    source = _BENCHMARK_PATH.read_text(encoding="utf-8")
+    source = _QUANTIZATION_BENCHMARK_PATH.read_text(encoding="utf-8")
     assert "torch.cuda.reset_peak_memory_stats(device)" in source
     assert "torch.cuda.max_memory_allocated(device)" in source
     assert '"peak_temporary_allocation_bytes"' in source
+    assert "allocated_before={allocated_before}" in source
+    assert "allocated_after={allocated_after}" in source
+    assert "peak_temporary_allocation_bytes={peak_temporary_allocation_bytes}" in source
 
 
 def test_load_production_fa4_uses_sglang_runtime_package(monkeypatch) -> None:

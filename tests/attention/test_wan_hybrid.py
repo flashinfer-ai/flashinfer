@@ -249,6 +249,7 @@ def test_wan_hybrid_quantizer_binding_matches_frozen_device_abi() -> None:
 
 def test_wan_hybrid_attention_binding_matches_frozen_device_abi() -> None:
     source_root = Path(__file__).resolve().parents[2] / "csrc" / "wan_hybrid"
+    common = (source_root / "wan_hybrid_common.cuh").read_text(encoding="utf-8")
     binding = (source_root / "wan_hybrid_attention_binding.cu").read_text(
         encoding="utf-8"
     )
@@ -263,14 +264,16 @@ def test_wan_hybrid_attention_binding_matches_frozen_device_abi() -> None:
     ):
         assert f"TensorView {argument}" in binding
     assert "cudaLaunchKernelEx(&config, kernel_wan_hybrid_attention" in binding
-    assert "kSequence = 4800" in binding
-    assert "kHeads = 40" in binding
-    assert "kHeadDim = 128" in binding
-    assert "kTensorMapCount = 6" in binding
-    assert "kMaximumTiles = 147" in binding
-    assert "kDynamicSmemBytes = 231'424" in binding
-    assert 'EncodeNHD(k, 128, "cuTensorMapEncodeTiled(k)")' in binding
-    assert "kPackedValueRows, 64, 128" in binding
+    assert '#include "wan_hybrid_common.cuh"' in binding
+    assert "kSequence = 4800" in common
+    assert "kHeads = 40" in common
+    assert "kHeadDim = 128" in common
+    assert "kTensorMapCount = 6" in common
+    assert "kMaximumTiles = 147" in common
+    assert "kAttentionDynamicSmemBytes = 231'424" in common
+    assert 'EncodeNHD(k, 128, "cuTensorMapEncodeTiled(k)")' in common
+    assert "kPackedValueRows, 64, 128" in common
+    assert 'CheckTarget(device_id, "attention");' in binding
     assert "physical_num_blocks = kPaddedSequence / 128" in binding
     assert "cudaLaunchAttributeClusterDimension" not in binding
     for removed in ("TensorView sfq", "TensorView sfk", "TensorView qk_correction"):
@@ -285,15 +288,31 @@ def test_wan_hybrid_attention_binding_matches_frozen_device_abi() -> None:
 
 def test_wan_hybrid_dispatch_binding_preserves_sources_and_launch_order() -> None:
     source_root = Path(__file__).resolve().parents[2] / "csrc" / "wan_hybrid"
+    common = (source_root / "wan_hybrid_common.cuh").read_text(encoding="utf-8")
     binding = (source_root / "wan_hybrid_dispatch_binding.cu").read_text(
         encoding="utf-8"
     )
     body = binding[binding.index("void Dispatch(") :]
     assert binding.count('#include "device/wan_hybrid_quantize_value_sm') == 2
     assert binding.count('#include "device/wan_hybrid_attention_sm') == 2
-    assert "kTensorMapCount = 6" in binding
-    assert "kAttentionDynamicSmemBytes = SMEM_TOTAL" in binding
+    assert '#include "wan_hybrid_common.cuh"' in binding
+    assert "kTensorMapCount = 6" in common
+    assert "kAttentionDynamicSmemBytes = 231'424" in common
+    assert "static_assert(SMEM_TOTAL == kAttentionDynamicSmemBytes)" in binding
     assert "kWanHybridQuantDynamicSmemBytes = SMEM_TOTAL" in binding
+    assert 'CheckTarget(device_id, "dispatch");' in binding
+    for helper in (
+        "CheckCuda",
+        "CheckDriver",
+        "CheckExactTensor",
+        "CheckTarget",
+        "EncodeTensorMap",
+        "EncodeNHD",
+        "Encode2D",
+        "PrepareTensorMaps",
+    ):
+        assert f"inline void {helper}" in common or f"inline CUtensorMap {helper}" in common
+        assert f"void {helper}(" not in binding
     assert body.index("PrepareTensorMaps(") < body.index(
         "kernel_wan_hybrid_quantize_value<<<"
     )
