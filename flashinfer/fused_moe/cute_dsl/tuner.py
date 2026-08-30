@@ -627,7 +627,7 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-        extras = (
+        extras: tuple[Any, ...] = (
             int(self.activation_type),
             self.swiglu_alpha,
             self.swiglu_beta,
