@@ -1098,21 +1098,41 @@ def test_cute_dsl_decode_paged_sliding_window_blasst_normalization():
     """Page rebasing must not change BLASST's full-length normalization."""
     dtype = torch.bfloat16
     page_size, window_left = 16, 511
-    seq_lens_host = [1025, 2051]
-    batch_size = len(seq_lens_host)
-    torch.manual_seed(0)
-    # Zero Q/K makes every active-window probability exactly 1 / 512.
-    # A scale factor of 1.5 yields a lower threshold with the full lengths
-    # (1.5 / 1025 and 1.5 / 2051), but a higher threshold with the rebased
-    # lengths (about 1.5 / 514). Thus this case detects which denominator the
-    # BLASST path uses instead of merely checking that the path launches.
-    q = torch.zeros(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    seq_lens_host = [1025]
+    q = torch.zeros(1, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    q[..., 0] = 1
     kv, kv_indptr, kv_indices, _last_page_len, seq_lens = _make_paged_kv_varlen(
         seq_lens_host, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
     )
     k_cache, v_cache = kv.unbind(dim=1)
     k_cache.zero_()
+    v_cache.zero_()
     sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    # The BLASST specialization uses 128-token sequence tiles and always keeps
+    # its first two tiles. Give the third retained tile a maximum-score drop
+    # that the full-length threshold accepts but a rebased-length threshold
+    # rejects, and make it the only tile with nonzero values.
+    threshold_scale_factor = 1.5
+    full_seqlen = seq_lens_host[0]
+    first_active_token = full_seqlen - 1 - window_left
+    skipped_tokens = (first_active_token // page_size) * page_size
+    rebased_seqlen = full_seqlen - skipped_tokens
+    score_delta_log2 = -9.0
+    full_threshold_log2 = math.log2(threshold_scale_factor / full_seqlen)
+    rebased_threshold_log2 = math.log2(threshold_scale_factor / rebased_seqlen)
+    assert full_threshold_log2 < score_delta_log2 < rebased_threshold_log2
+
+    blasst_tile_size = 128
+    later_tile_start = skipped_tokens + 2 * blasst_tile_size
+    later_tile_end = later_tile_start + blasst_tile_size
+    assert later_tile_start % page_size == later_tile_end % page_size == 0
+    later_page_start = later_tile_start // page_size
+    later_page_end = later_tile_end // page_size
+    key_component = score_delta_log2 / (sm_scale * math.log2(math.e))
+    k_cache[later_page_start:later_page_end, :, :, 0] = key_component
+    v_cache[later_page_start:later_page_end] = 32
+
     wrapper = BatchDecodePagedCuteDSLWrapper(
         torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
     )
@@ -1126,18 +1146,26 @@ def test_cute_dsl_decode_paged_sliding_window_blasst_normalization():
         page_size=page_size,
         q_data_type=dtype,
         sm_scale=sm_scale,
-        kv_splits=3,
+        kv_splits=1,
         reduction="kernel",
         window_left=window_left,
         window_right=0,
         max_kv_len=max(seq_lens_host),
     )
     out_std = wrapper.run(q, k_cache, v_cache)
-    out_blasst = wrapper.run(
+    out_full_threshold = wrapper.run(
         q,
         k_cache,
         v_cache,
-        skip_softmax_threshold_scale_factor=1.5,
+        skip_softmax_threshold_scale_factor=threshold_scale_factor,
+    )
+    out_rebased_threshold = wrapper.run(
+        q,
+        k_cache,
+        v_cache,
+        skip_softmax_threshold_scale_factor=(
+            threshold_scale_factor * full_seqlen / rebased_seqlen
+        ),
     )
     ref = _decode_reference_paged_window(
         q,
@@ -1150,7 +1178,14 @@ def test_cute_dsl_decode_paged_sliding_window_blasst_normalization():
         window_left,
     )[:, 0]
     torch.testing.assert_close(out_std, ref, rtol=5e-3, atol=5e-3)
-    torch.testing.assert_close(out_blasst, out_std, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(out_full_threshold, out_std, rtol=5e-3, atol=5e-3)
+    assert out_full_threshold.abs().min() > 1e-2
+    torch.testing.assert_close(
+        out_rebased_threshold,
+        torch.zeros_like(out_rebased_threshold),
+        rtol=0,
+        atol=1e-4,
+    )
 
 
 @pytest.mark.parametrize("batch_size", [4])

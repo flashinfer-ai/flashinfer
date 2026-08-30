@@ -967,16 +967,15 @@ class GroupedQueryAttentionDecodePaged:
         # handle the boundary, while rebasing both KV indices and seqlen keeps
         # causal/window coordinates unchanged for multi-token decode.
         full_seqlen = seqlen
-        if cutlass.const_expr(
-            isinstance(mask_config, SlidingWindowMask)
-            and mask_config.window_left is not None
-        ):
-            first_active_token = cutlass.max(
-                0, seqlen - prediction - mask_config.window_left
-            )
-            skipped_pages = first_active_token // page_size
-            table_offset += skipped_pages
-            seqlen -= skipped_pages * page_size
+        if cutlass.const_expr(isinstance(mask_config, SlidingWindowMask)):
+            sliding_window = cast(SlidingWindowMask, mask_config)
+            window_left = sliding_window.window_left
+            if cutlass.const_expr(window_left is not None):
+                assert window_left is not None
+                first_active_token = cutlass.max(0, seqlen - prediction - window_left)
+                skipped_pages = first_active_token // page_size
+                table_offset += skipped_pages
+                seqlen -= skipped_pages * page_size
 
         page_count = cute.ceil_div(seqlen, page_size)
         tiles_s = cute.ceil_div(seqlen, blk_tile_s)
