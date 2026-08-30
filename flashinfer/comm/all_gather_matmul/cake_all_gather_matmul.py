@@ -79,6 +79,10 @@ _CONSTRAINTS = {
         "4": [2048],
         "8": [1280, 2048],
     },
+    "prepared_packed_qkv_n_by_world_size": {
+        "4": [2560],
+        "8": [1280],
+    },
     "world_sizes": [2, 4, 8],
 }
 _ROUTE_COVERAGE = {
@@ -885,6 +889,8 @@ class _LaunchState:
     flags: Any = None
     flag_handle: Any = None
     flag_peers: Any = None
+    initialization_event: Any = None
+    initialization_stream: int | None = None
     poisoned: bool = False
 
 
@@ -1003,6 +1009,7 @@ def _ensure_launch_state(
     rank: int,
     world_size: int,
     group_name: str,
+    main_stream: torch.cuda.Stream,
 ) -> None:
     if state.flags is not None:
         return
@@ -1018,6 +1025,9 @@ def _ensure_launch_state(
     state.flags = flags
     state.flag_handle = handle
     state.flag_peers = torch.tensor(peer_ptrs, dtype=torch.int64, device=device_index)
+    state.initialization_event = torch.cuda.Event(enable_timing=False)
+    state.initialization_event.record(main_stream)
+    state.initialization_stream = int(main_stream.cuda_stream)
 
 
 def _workspace(
@@ -1242,6 +1252,12 @@ class _PreparedPackedQkvSm103Launcher:
                 )
             try:
                 main_stream = torch.cuda.current_stream(self.device_index)
+                main_stream_id = int(main_stream.cuda_stream)
+                if (
+                    state.initialization_event is not None
+                    and state.initialization_stream != main_stream_id
+                ):
+                    main_stream.wait_event(state.initialization_event)
                 descriptor_entry = _prepared_descriptor_storage(
                     workspace,
                     self.module,
@@ -1266,7 +1282,6 @@ class _PreparedPackedQkvSm103Launcher:
                 inp.record_stream(workspace.comm_stream)
                 w.record_stream(main_stream)
                 descriptors.record_stream(main_stream)
-                main_stream_id = int(main_stream.cuda_stream)
                 if descriptor_entry.ready_stream != main_stream_id:
                     main_stream.wait_event(descriptor_entry.ready_event)
                 if state.tail_event is not None and state.tail_stream != main_stream_id:
@@ -1364,6 +1379,7 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103(
                 rank=rank,
                 world_size=world_size,
                 group_name=group_name,
+                main_stream=main_stream,
             )
             if workspace is None:
                 with _CACHE_LOCK:
@@ -1569,6 +1585,7 @@ def _run_cake_validated(
                 rank=rank,
                 world_size=world_size,
                 group_name=group_name,
+                main_stream=main_stream,
             )
             if workspace is None:
                 with _CACHE_LOCK:
@@ -1580,6 +1597,13 @@ def _run_cake_validated(
                         world_size=world_size,
                         rows=rows,
                     )
+
+            main_stream_id = int(main_stream.cuda_stream)
+            if (
+                state.initialization_event is not None
+                and state.initialization_stream != main_stream_id
+            ):
+                main_stream.wait_event(state.initialization_event)
 
             descriptors = _descriptor_storage(
                 workspace,
@@ -1604,7 +1628,6 @@ def _run_cake_validated(
             inp.record_stream(workspace.comm_stream)
             w.record_stream(main_stream)
             descriptors.record_stream(main_stream)
-            main_stream_id = int(main_stream.cuda_stream)
             if state.tail_event is not None and state.tail_stream != main_stream_id:
                 main_stream.wait_event(state.tail_event)
 

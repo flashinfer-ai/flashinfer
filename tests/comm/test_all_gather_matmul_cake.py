@@ -200,6 +200,10 @@ def test_packaged_bf16_ws4_derives_private_packed_width_from_grid():
         "4": [2048],
         "8": [1280, 2048],
     }
+    assert manifest["constraints"]["prepared_packed_qkv_n_by_world_size"] == {
+        "4": [2560],
+        "8": [1280],
+    }
     assert manifest["launch"]["main"]["grid_x"] == (
         "(min(M, 2432) / 128) * (N / 256)"
     )
@@ -948,7 +952,6 @@ def _fake_prepared_packed_qkv(
     )
     group = SimpleNamespace(group_name="tp-group")
     module = SimpleNamespace(name="bound-module")
-    state = backend._LaunchState(flags=object(), flag_peers=object())
 
     class FakeEvent:
         cuda_event = 29
@@ -961,6 +964,14 @@ def _fake_prepared_packed_qkv(
 
     class FakeStream:
         cuda_stream = 23
+
+    initialization_event = FakeEvent()
+    state = backend._LaunchState(
+        flags=object(),
+        flag_peers=object(),
+        initialization_event=initialization_event,
+        initialization_stream=0,
+    )
 
     class FakeScratchHandle:
         def __init__(self):
@@ -1215,6 +1226,30 @@ def test_prepare_packed_qkv_tp8_binds_and_submits_all_seven_peers(monkeypatch):
     assert state.next_phase == 1
     assert state.ready_epoch == 1
 
+    assert launcher(inp) is output
+    assert allocations == [
+        ((8 * 128, 1280), {"dtype": torch.bfloat16, "device": 7}),
+        ((8 * 128, 1280), {"dtype": torch.bfloat16, "device": 7}),
+    ]
+    assert len(submissions) == 2
+    second_submission = submissions[1]
+    assert second_submission[7:21] == launcher.native_peer_args
+    assert second_submission[21:31] == (
+        8,
+        7,
+        128,
+        1,
+        2,
+        0,
+        23,
+        29,
+        3001,
+        4007,
+    )
+    assert second_submission[31:] == launcher.native_expected_peer_args
+    assert state.next_phase == 0
+    assert state.ready_epoch == 2
+
 
 def test_prepared_packed_qkv_hot_path_uses_one_native_submission(monkeypatch):
     backend = _backend()
@@ -1277,7 +1312,9 @@ def test_prepared_packed_qkv_hot_path_uses_one_native_submission(monkeypatch):
     assert descriptor.recorded_streams == [main_stream]
 
 
-def test_prepared_packed_qkv_first_other_stream_waits_for_descriptor(monkeypatch):
+def test_prepared_packed_qkv_first_other_stream_waits_for_initialization_and_descriptor(
+    monkeypatch,
+):
     backend = _backend()
     launcher, inp, _, _, state, _, module, calls = _fake_prepared_packed_qkv(
         monkeypatch, backend
@@ -1315,7 +1352,10 @@ def test_prepared_packed_qkv_first_other_stream_waits_for_descriptor(monkeypatch
 
     launcher(inp)
 
-    assert first_call_stream.waited_events == [calls.descriptor_entry.ready_event]
+    assert first_call_stream.waited_events == [
+        state.initialization_event,
+        calls.descriptor_entry.ready_event,
+    ]
     assert state.tail_stream == 19
 
 
@@ -1357,6 +1397,7 @@ def test_prepared_packed_qkv_first_call_waits_for_descriptor_and_tail(monkeypatc
     launcher(inp)
 
     assert first_call_stream.waited_events == [
+        state.initialization_event,
         calls.descriptor_entry.ready_event,
         prior_tail,
     ]

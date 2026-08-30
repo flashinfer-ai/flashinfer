@@ -168,8 +168,8 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
 
 
 @pytest.mark.skipif(
-    torch.cuda.device_count() not in (2, 4),
-    reason="Cake all-gather matmul e2e requires exactly two or four visible GPUs",
+    torch.cuda.device_count() not in (2, 4, 8),
+    reason="Cake all-gather matmul e2e requires exactly two, four, or eight visible GPUs",
 )
 @pytest.mark.skipif(
     torch.cuda.device_count() == 0
