@@ -64,7 +64,7 @@ logger = logging.getLogger(__name__)
 # Bump this token whenever the SM100 per-token producer/consumer handoff changes
 # in a way that can affect GEMM tactic ranking.  Persisted autotune file keys do
 # not include the runner hash, so the pipeline contract belongs in ``extras``.
-_SM100_PER_TOKEN_PIPELINE_CACHE_SCHEMA = "aux_amax_blocked8_native_v1"
+_SM100_PER_TOKEN_PIPELINE_CACHE_SCHEMA = "aux_amax_blocked8_native_min_tokens_4_v2"
 
 
 # =============================================================================

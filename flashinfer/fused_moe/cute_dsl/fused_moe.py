@@ -100,6 +100,7 @@ from .tuner import (
 # =============================================================================
 
 _cuda_graph_resources: Dict[str, Any] = {}
+_PER_TOKEN_AUX_AMAX_MIN_TOKENS = 4
 
 
 def _intermediate_c_dtype(output_dtype: torch.dtype) -> str:
@@ -328,9 +329,15 @@ def _moe_core_impl(
             "c_dtype": "float4_e2m1fn",
         }
     )
+    # The aux handoff has fixed producer/consumer overhead at very small M.
+    # num_tokens is host-static, so CUDA graph capture specializes one path
+    # without a device-side branch or synchronization.
+    use_intermediate_amax = (
+        use_per_token_activation and num_tokens >= _PER_TOKEN_AUX_AMAX_MIN_TOKENS
+    )
     intermediate_per_token_scale = None
     intermediate_amax = None
-    if use_per_token_activation:
+    if use_intermediate_amax:
         intermediate_size = w1_weight.shape[1] // (2 if gated else 1)
         output_tile_n = gemm1_mma_tiler_mn[1] // (2 if gated else 1)
         num_output_tiles = (intermediate_size + output_tile_n - 1) // output_tile_n

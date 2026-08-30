@@ -73,7 +73,6 @@ def _make_gemm1_output(
     num_local_experts: int,
     tile_size: int,
     intermediate_size: int,
-    output_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     from flashinfer.fused_moe.cute_dsl.moe_utils import (
         get_max_num_permuted_tokens,
@@ -90,7 +89,7 @@ def _make_gemm1_output(
     return torch.full(
         (max_num_permuted_tokens, intermediate_size),
         17.0,
-        dtype=output_dtype,
+        dtype=torch.bfloat16,
         device="cuda",
     )
 
@@ -107,7 +106,6 @@ def _make_core_kwargs(
     tile_size: int,
     gemm1_n: int,
     activation_type: ActivationType,
-    output_dtype: torch.dtype = torch.bfloat16,
 ) -> dict:
     return {
         "x": tensors["x"],
@@ -134,7 +132,6 @@ def _make_core_kwargs(
         "use_fused_finalize": False,
         "enable_pdl": True,
         "activation_type": activation_type.value,
-        "output_dtype": output_dtype,
         "per_token_scale": tensors["x_per_token_scale"],
         "gemm1_out": _make_gemm1_output(
             num_tokens=num_tokens,
@@ -142,7 +139,6 @@ def _make_core_kwargs(
             num_local_experts=num_local_experts,
             tile_size=tile_size,
             intermediate_size=intermediate_size,
-            output_dtype=output_dtype,
         ),
     }
 
@@ -315,50 +311,223 @@ def _assert_legacy_and_aux_paths_are_bitwise_equal(
     assert torch.equal(accelerated_output, legacy_output)
 
 
+@pytest.mark.parametrize(
+    ("num_tokens", "expect_aux"),
+    [
+        pytest.param(2, False, id="tokens2-legacy"),
+        pytest.param(4, True, id="tokens4-aux"),
+    ],
+)
+def test_per_token_aux_amax_dispatch_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    num_tokens: int,
+    expect_aux: bool,
+):
+    """The host-static token threshold selects the intended exact path."""
+    import flashinfer.fused_moe.cute_dsl.fused_moe as fused_moe_module
+
+    _set_quant_mode(monkeypatch, deterministic=False)
+
+    top_k, num_experts = 2, 16
+    hidden_size, intermediate_size = 256, 512
+    tile_size, gemm1_n = 128, 128
+    tensors = create_moe_tensors(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        num_local_experts=num_experts,
+        top_k=top_k,
+        gated=True,
+        use_per_token_activation=True,
+    )
+    kwargs = _make_core_kwargs(
+        tensors,
+        num_tokens=num_tokens,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_experts,
+        local_expert_offset=0,
+        tile_size=tile_size,
+        gemm1_n=gemm1_n,
+        activation_type=ActivationType.Swiglu,
+    )
+
+    original_gemm1 = (
+        fused_moe_module.blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4
+    )
+    original_quantize = fused_moe_module.nvfp4_quantize_per_token_cute_dsl
+    producer_uses_aux = []
+    quantizer_aux_args = []
+
+    def checked_gemm1(*args, **call_kwargs):
+        producer_uses_aux.append(call_kwargs.get("out_amax") is not None)
+        return original_gemm1(*args, **call_kwargs)
+
+    def checked_quantize(*args, **call_kwargs):
+        quantizer_aux_args.append(
+            (
+                call_kwargs.get("input_amax") is not None,
+                call_kwargs.get("input_amax_valid_rows") is not None,
+            )
+        )
+        return original_quantize(*args, **call_kwargs)
+
+    monkeypatch.setattr(
+        fused_moe_module,
+        "blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4",
+        checked_gemm1,
+    )
+    monkeypatch.setattr(
+        fused_moe_module,
+        "nvfp4_quantize_per_token_cute_dsl",
+        checked_quantize,
+    )
+
+    output = fused_moe_module._moe_core_impl(**kwargs)
+    torch.cuda.synchronize()
+
+    assert output.shape == (num_tokens, hidden_size)
+    assert producer_uses_aux == [expect_aux]
+    assert quantizer_aux_args == [(expect_aux, expect_aux)]
+
+
+def test_fp16_gemm1_aux_amax_handoff_is_bitwise_equal(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Exercise the real FP16 producer/consumer boundary without GEMM2."""
+    from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
+        blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4,
+    )
+    from flashinfer.fused_moe.cute_dsl.moe_utils import moe_sort
+    from flashinfer.quantization.kernels.nvfp4_quantize import (
+        SF_LAYOUT_128x4,
+        nvfp4_quantize_per_token_cute_dsl,
+    )
+
+    _set_quant_mode(monkeypatch, deterministic=False)
+
+    num_tokens = 128
+    hidden_size, intermediate_size = 256, 512
+    tile_size, gemm1_n = 128, 256
+    tensors = create_moe_tensors(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=1,
+        num_local_experts=1,
+        top_k=1,
+        gated=True,
+        use_per_token_activation=True,
+    )
+
+    (
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        _,
+        permuted_idx_to_expanded_idx,
+        total_num_padded_tokens,
+        num_non_exiting_tiles,
+    ) = moe_sort(
+        tensors["token_selected_experts"],
+        tensors["token_final_scales"],
+        num_experts=1,
+        top_k=1,
+        num_local_experts=1,
+        tile_tokens_dim=tile_size,
+        enable_pdl=True,
+    )
+
+    num_permuted_rows = permuted_idx_to_expanded_idx.shape[0]
+    output_tile_n = gemm1_n // 2
+    num_output_tiles = intermediate_size // output_tile_n
+    intermediate = torch.empty(
+        (num_permuted_rows, intermediate_size),
+        dtype=torch.float16,
+        device="cuda",
+    )
+    intermediate_amax = torch.empty(
+        (num_permuted_rows // 8, num_output_tiles, 8),
+        dtype=torch.float16,
+        device="cuda",
+    )
+
+    produced_intermediate, produced_sf = (
+        blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4(
+            a=tensors["x"],
+            b=tensors["w1_weight"],
+            a_scale=tensors["x_sf"],
+            b_scale=tensors["w1_weight_sf"],
+            alpha=tensors["w1_alpha"],
+            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            token_id_mapping=permuted_idx_to_expanded_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            out=intermediate,
+            a_per_token_scale=tensors["x_per_token_scale"],
+            out_amax=intermediate_amax,
+            topk=1,
+            c_dtype="float16",
+            mma_tiler_mn=(tile_size, gemm1_n),
+            cluster_shape_mn=(1, 1),
+            enable_pdl=True,
+            activation_type=ActivationType.Swiglu.value,
+            gated=True,
+        )
+    )
+    assert produced_intermediate is intermediate
+    assert produced_sf is None
+
+    # Keep this launch immediately after GEMM1 so the test exercises the real
+    # producer-to-consumer PDL chain without a host synchronization in between.
+    accelerated_quantized = nvfp4_quantize_per_token_cute_dsl(
+        intermediate,
+        tensors["fc2_input_scale"],
+        sf_layout=SF_LAYOUT_128x4,
+        enable_pdl=True,
+        input_amax=intermediate_amax,
+        input_amax_valid_rows=total_num_padded_tokens,
+    )
+    legacy_quantized = nvfp4_quantize_per_token_cute_dsl(
+        intermediate,
+        tensors["fc2_input_scale"],
+        sf_layout=SF_LAYOUT_128x4,
+        enable_pdl=False,
+    )
+
+    assert int(total_num_padded_tokens.item()) == num_tokens
+    assert int(num_non_exiting_tiles.item()) == 1
+    assert intermediate.dtype == intermediate_amax.dtype == torch.float16
+    expected_amax = (
+        intermediate.float()
+        .abs()
+        .reshape(num_tokens, num_output_tiles, output_tile_n)
+        .amax(dim=2)
+        .to(torch.float16)
+    )
+    assert torch.equal(_unpack_blocked8(intermediate_amax), expected_amax)
+    for accelerated, legacy in zip(
+        accelerated_quantized, legacy_quantized, strict=True
+    ):
+        assert torch.equal(accelerated, legacy)
+
+
 @pytest.mark.parametrize("deterministic_quant", [False, True])
 @pytest.mark.parametrize(
-    ("tile_size", "gemm1_n", "activation_type", "gated", "output_dtype"),
+    ("tile_size", "gemm1_n", "activation_type", "gated"),
     [
-        pytest.param(
-            128,
-            128,
-            ActivationType.Swiglu,
-            True,
-            torch.bfloat16,
-            id="m128-n128-swiglu",
-        ),
-        pytest.param(
-            128,
-            256,
-            ActivationType.Swiglu,
-            True,
-            torch.float16,
-            id="m128-n256-swiglu-fp16",
-        ),
+        pytest.param(128, 128, ActivationType.Swiglu, True, id="m128-n128-swiglu"),
+        pytest.param(128, 256, ActivationType.Swiglu, True, id="m128-n256-swiglu"),
         pytest.param(
             256,
             256,
             ActivationType.Swiglu,
             True,
-            torch.bfloat16,
             id="m256-2cta-n256-swiglu",
         ),
-        pytest.param(
-            256,
-            128,
-            ActivationType.Relu2,
-            False,
-            torch.bfloat16,
-            id="m256-n128-relu2",
-        ),
-        pytest.param(
-            256,
-            256,
-            ActivationType.Relu2,
-            False,
-            torch.bfloat16,
-            id="m256-n256-relu2",
-        ),
+        pytest.param(256, 128, ActivationType.Relu2, False, id="m256-n128-relu2"),
+        pytest.param(256, 256, ActivationType.Relu2, False, id="m256-n256-relu2"),
     ],
 )
 def test_gemm1_aux_amax_and_per_token_output_are_bitwise_equal(
@@ -367,7 +536,6 @@ def test_gemm1_aux_amax_and_per_token_output_are_bitwise_equal(
     gemm1_n: int,
     activation_type: ActivationType,
     gated: bool,
-    output_dtype: torch.dtype,
     deterministic_quant: bool,
 ):
     """Check producer values and the exact legacy/accelerated MoE boundary."""
@@ -413,7 +581,6 @@ def test_gemm1_aux_amax_and_per_token_output_are_bitwise_equal(
         tile_size=tile_size,
         gemm1_n=gemm1_n,
         activation_type=activation_type,
-        output_dtype=output_dtype,
     )
 
     _assert_legacy_and_aux_paths_are_bitwise_equal(
