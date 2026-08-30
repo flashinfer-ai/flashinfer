@@ -21,14 +21,12 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal
 
-from . import env as jit_env
-from .core import (
-    JitSpec,
-    gen_jit_spec,
-    logger,
-    sm100a_nvcc_flags,
-    sm103a_nvcc_flags,
+from ._kda_jit_common import (
+    gen_kda_jit_spec,
+    get_kda_csrc_dir as _get_cake_kda_csrc_dir,
+    get_flashinfer_include_dir as _get_cake_kda_include_dir,
 )
+from .core import JitSpec, logger
 
 CakeKDAVariant = Literal[
     "m128_unbounded_softplus",
@@ -68,10 +66,7 @@ _CAKE_KDA_AFFINE_CONTRACT = {
     "token_multiple": 32,
 }
 
-_CAKE_KDA_NVCC_FLAGS = {
-    "sm100a": sm100a_nvcc_flags,
-    "sm103a": sm103a_nvcc_flags,
-}
+_CAKE_KDA_TARGETS: tuple[CakeKDATarget, ...] = ("sm100a", "sm103a")
 _CAKE_KDA_TARGET_DEFINE = {
     "sm100a": "-DFLASHINFER_CAKE_KDA_TARGET_MINOR=0",
     "sm103a": "-DFLASHINFER_CAKE_KDA_TARGET_MINOR=3",
@@ -94,39 +89,6 @@ class CakeKDAAffineModuleSpec:
     module_ident: str
     binding_path: Path
     sources: tuple[Path, ...]
-
-
-def _get_cake_kda_csrc_dir() -> Path:
-    """Locate frozen CakeKDA sources in installed and source checkouts."""
-
-    installed = jit_env.FLASHINFER_CSRC_DIR / "kda"
-    if installed.exists():
-        return installed
-
-    checkout = Path(__file__).resolve().parents[2] / "csrc" / "kda"
-    if checkout.exists():
-        return checkout
-
-    raise FileNotFoundError(
-        "CakeKDA CUDA sources were not found. Checked:\n"
-        f"  - {installed}\n"
-        f"  - {checkout}"
-    )
-
-
-def _get_cake_kda_include_dir() -> Path:
-    """Locate FlashInfer headers in installed and source checkouts."""
-
-    if jit_env.FLASHINFER_INCLUDE_DIR.exists():
-        return jit_env.FLASHINFER_INCLUDE_DIR
-    checkout = Path(__file__).resolve().parents[2] / "include"
-    if checkout.exists():
-        return checkout
-    raise FileNotFoundError(
-        "FlashInfer headers were not found. Checked:\n"
-        f"  - {jit_env.FLASHINFER_INCLUDE_DIR}\n"
-        f"  - {checkout}"
-    )
 
 
 def _require_affine_manifest(condition: bool, message: str) -> None:
@@ -204,7 +166,7 @@ def get_cake_kda_affine_module_specs() -> tuple[CakeKDAAffineModuleSpec, ...]:
 
     expected: set[tuple[str, CakeKDAAffineRole]] = {
         (target, role)
-        for target in _CAKE_KDA_NVCC_FLAGS
+        for target in _CAKE_KDA_TARGETS
         for role in CAKE_KDA_AFFINE_ROLES
     }
     observed: set[tuple[str, CakeKDAAffineRole]] = set()
@@ -214,7 +176,7 @@ def get_cake_kda_affine_module_specs() -> tuple[CakeKDAAffineModuleSpec, ...]:
         _require_affine_manifest(isinstance(item, dict), f"{label} must be an object")
         target = item.get("target")
         role = item.get("role")
-        _require_affine_manifest(target in _CAKE_KDA_NVCC_FLAGS, f"{label}.target")
+        _require_affine_manifest(target in _CAKE_KDA_TARGETS, f"{label}.target")
         _require_affine_manifest(role in CAKE_KDA_AFFINE_ROLES, f"{label}.role")
         key = (target, role)
         _require_affine_manifest(
@@ -278,7 +240,7 @@ def cake_kda_affine_is_available() -> bool:
     """Return whether the complete sealed affine export is installed."""
 
     return len(get_cake_kda_affine_module_specs()) == (
-        len(_CAKE_KDA_NVCC_FLAGS) * len(CAKE_KDA_AFFINE_ROLES)
+        len(_CAKE_KDA_TARGETS) * len(CAKE_KDA_AFFINE_ROLES)
     )
 
 
@@ -312,18 +274,13 @@ def gen_cake_kda_affine_module(
 
     spec = get_cake_kda_affine_module_spec(target, role)
     csrc_dir = _get_cake_kda_csrc_dir()
-    jit_spec = gen_jit_spec(
+    jit_spec = gen_kda_jit_spec(
         name=get_cake_kda_affine_uri(target, role),
         sources=[spec.binding_path],
-        extra_cuda_cflags=[
-            *_CAKE_KDA_NVCC_FLAGS[target],
-            _CAKE_KDA_TARGET_DEFINE[target],
-        ],
-        extra_include_paths=[
-            csrc_dir,
-            csrc_dir.parent,
-            _get_cake_kda_include_dir(),
-        ],
+        target=target,
+        target_define=_CAKE_KDA_TARGET_DEFINE[target],
+        csrc_dir=csrc_dir,
+        include_dir=_get_cake_kda_include_dir(),
     )
     logger.info(f"Generated Cake KDA affine {role} {target} JIT spec: {jit_spec.name}")
     return jit_spec
@@ -349,7 +306,7 @@ def get_cake_kda_uri(variant: CakeKDAVariant, target: CakeKDATarget) -> str:
 
     if variant not in CAKE_KDA_VARIANTS:
         raise ValueError(f"unsupported CakeKDA variant: {variant}")
-    if target not in _CAKE_KDA_NVCC_FLAGS:
+    if target not in _CAKE_KDA_TARGETS:
         raise ValueError(f"unsupported CakeKDA target: {target}")
     module_ident = _CAKE_KDA_MODULE_IDENTS[variant]
     return f"cake_kda_bf16_fused_{variant}_{module_ident}_{target}"
@@ -373,18 +330,13 @@ def gen_cake_kda_module(variant: CakeKDAVariant, target: CakeKDATarget) -> JitSp
     if not binding.exists():
         raise FileNotFoundError(f"CakeKDA binding source not found: {binding}")
 
-    spec = gen_jit_spec(
+    spec = gen_kda_jit_spec(
         name=uri,
         sources=[binding],
-        extra_cuda_cflags=[
-            *_CAKE_KDA_NVCC_FLAGS[target],
-            _CAKE_KDA_TARGET_DEFINE[target],
-        ],
-        extra_include_paths=[
-            csrc_dir,
-            csrc_dir.parent,
-            include_dir,
-        ],
+        target=target,
+        target_define=_CAKE_KDA_TARGET_DEFINE[target],
+        csrc_dir=csrc_dir,
+        include_dir=include_dir,
     )
     logger.info(f"Generated CakeKDA {variant} {target} JIT spec: {spec.name}")
     return spec
