@@ -65,7 +65,10 @@ from .jit.blackwell_msa import (
     gen_blackwell_msa_module,
 )
 from .jit.cake_kda import (
+    CAKE_KDA_AFFINE_ROLES,
     CakeKDATarget,
+    cake_kda_affine_is_available,
+    gen_cake_kda_affine_module,
     gen_cake_kda_m128_unbounded_softplus_module,
 )
 from .jit.cake_kda_decode import (
@@ -639,6 +642,11 @@ def gen_all_modules(
             jit_specs.append(
                 gen_cake_kda_m128_unbounded_softplus_module(cake_kda_target)
             )
+            if cake_kda_affine_is_available():
+                jit_specs.extend(
+                    gen_cake_kda_affine_module(cake_kda_target, role)
+                    for role in CAKE_KDA_AFFINE_ROLES
+                )
 
     # CUDA 12.8 predates the SM100-family target, so B200 keeps one exact
     # SM100a module for every frozen body. CUDA 12.9+ builds the 23-body

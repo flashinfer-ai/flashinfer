@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import json
 import math
 import threading
 from types import SimpleNamespace
@@ -60,6 +61,145 @@ def test_cake_kda_prefill_jit_surface_includes_checkpoint_aligned_bt64():
     assert (
         csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus_binding.cu"
     ).is_file()
+
+
+def test_cake_kda_affine_manifest_controls_export_availability():
+    csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
+    manifest = json.loads(
+        (
+            csrc_dir
+            / "cake_kda_bf16_affine_unbounded_softplus_import_manifest.json"
+        ).read_text()
+    )
+    cake_kda_jit_api.get_cake_kda_affine_module_specs.cache_clear()
+    specs = cake_kda_jit_api.get_cake_kda_affine_module_specs()
+    if manifest["status"] == "pending_generated_sources":
+        assert manifest["modules"] == []
+        assert manifest["remaining_generated_inputs"]
+        assert specs == ()
+        assert not cake_kda_jit_api.cake_kda_affine_is_available()
+    else:
+        assert manifest["status"] == "complete"
+        assert len(specs) == 8
+        assert cake_kda_jit_api.cake_kda_affine_is_available()
+        assert {spec.target for spec in specs} == {"sm100a", "sm103a"}
+        assert {spec.role for spec in specs} == {
+            "main",
+            "map",
+            "scan",
+            "correction",
+        }
+
+
+def _valid_cake_kda_affine_selector_kwargs():
+    return {
+        "export_available": True,
+        "compute_capability": (10, 0),
+        "sm_count": 148,
+        "fixed_layout": True,
+        "batch_size": 1,
+        "total_tokens": 8192,
+        "num_heads": 32,
+        "head_dim": 128,
+        "qkv_shapes_equal": True,
+        "qkv_dtype": torch.bfloat16,
+        "beta_contiguous": True,
+        "beta_dtype": torch.bfloat16,
+        "indexed_state": True,
+        "initial_state_dtype": torch.bfloat16,
+        "has_checkpoints": False,
+        "lower_bound": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "expected_affine"),
+    ((4, True), (8, True), (16, True), (32, False)),
+)
+@pytest.mark.parametrize(
+    ("compute_capability", "expected_target"),
+    (((10, 0), "sm100a"), ((10, 3), "sm103a")),
+)
+def test_cake_kda_affine_selector_builds_exact_blackwell_partition(
+    num_heads, expected_affine, compute_capability, expected_target
+):
+    kwargs = _valid_cake_kda_affine_selector_kwargs()
+    kwargs["num_heads"] = num_heads
+    kwargs["compute_capability"] = compute_capability
+    plan = kda_prefill_api._select_cake_kda_affine_plan(**kwargs)
+    if not expected_affine:
+        assert plan is None
+        return
+    assert plan is not None
+    assert plan.target == expected_target
+    assert plan.num_parts >= 2
+    assert plan.token_offsets[0] == 0
+    assert plan.token_offsets[-1] == kwargs["total_tokens"]
+    assert all(offset % 32 == 0 for offset in plan.token_offsets)
+    assert all(
+        left < right
+        for left, right in zip(plan.token_offsets, plan.token_offsets[1:])
+    )
+
+
+@pytest.mark.parametrize(
+    ("override", "value"),
+    (
+        ("export_available", False),
+        ("compute_capability", (9, 0)),
+        ("sm_count", 1),
+        ("fixed_layout", False),
+        ("batch_size", 2),
+        ("total_tokens", 8160),
+        ("total_tokens", 8193),
+        ("num_heads", 33),
+        ("head_dim", 64),
+        ("qkv_shapes_equal", False),
+        ("qkv_dtype", torch.float16),
+        ("beta_contiguous", False),
+        ("beta_dtype", torch.float32),
+        ("indexed_state", False),
+        ("initial_state_dtype", torch.float32),
+        ("has_checkpoints", True),
+        ("lower_bound", -1.0),
+    ),
+)
+def test_cake_kda_affine_selector_rejects_out_of_contract_calls(override, value):
+    kwargs = _valid_cake_kda_affine_selector_kwargs()
+    kwargs[override] = value
+    assert kda_prefill_api._select_cake_kda_affine_plan(**kwargs) is None
+
+
+def test_cake_kda_affine_workspace_buffer_is_grow_only(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    workspace = SimpleNamespace(_cake_kda_affine_buffers={})
+    first = kda_prefill_api._cake_kda_affine_workspace_buffer(
+        workspace=workspace,
+        name="carry",
+        device=torch.device("cpu"),
+        shape=(4, 8),
+        dtype=torch.float32,
+        zero_on_allocate=True,
+    )
+    assert torch.count_nonzero(first) == 0
+    smaller = kda_prefill_api._cake_kda_affine_workspace_buffer(
+        workspace=workspace,
+        name="carry",
+        device=torch.device("cpu"),
+        shape=(2, 8),
+        dtype=torch.float32,
+    )
+    assert smaller.data_ptr() == first.data_ptr()
+    assert workspace._cake_kda_affine_buffers["carry"].numel() == 32
+
+    with pytest.raises(ValueError, match="dimensions must be positive"):
+        kda_prefill_api._cake_kda_affine_workspace_buffer(
+            workspace=workspace,
+            name="carry",
+            device=torch.device("cpu"),
+            shape=(0, 8),
+            dtype=torch.float32,
+        )
 
 
 def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device):

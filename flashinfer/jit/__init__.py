@@ -104,7 +104,16 @@ from .fp4_kv_quantization import (
     gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
 )
 from .cake_kda import (
+    cake_kda_affine_is_available as cake_kda_affine_is_available,
+)
+from .cake_kda import (
+    gen_cake_kda_affine_module as gen_cake_kda_affine_module,
+)
+from .cake_kda import (
     gen_cake_kda_m128_unbounded_softplus_module as gen_cake_kda_m128_unbounded_softplus_module,
+)
+from .cake_kda import (
+    get_cake_kda_affine_module as get_cake_kda_affine_module,
 )
 from .cake_kda import (
     get_cake_kda_prefill_module as get_cake_kda_prefill_module,
