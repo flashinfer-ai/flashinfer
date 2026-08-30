@@ -3012,13 +3012,19 @@ def _make_flash_kda_generated_selector_key(
             "generated FlashKDA has no receipt-backed ABI family for "
             f"route {route!r} role {route_role!r}"
         ) from error
-    if state_mode not in ("bf16", "fp32", "none"):
+    if state_mode not in (
+        "bf16",
+        "fp32",
+        "bf16_f32_dependency",
+        "none",
+    ):
         raise ValueError(f"generated FlashKDA has no state mode {state_mode!r}")
     stateless_family = abi_family in ("bt16_prepare", "affine_scan")
     if (state_mode == "none") != stateless_family:
         raise ValueError(
             f"generated FlashKDA {abi_family} requires "
-            f"state_mode={'none' if stateless_family else 'bf16 or fp32'}"
+            "state_mode="
+            f"{'none' if stateless_family else 'bf16, fp32, or bf16_f32_dependency'}"
         )
     expected_fields = _FLASH_KDA_GENERATED_SPECIALIZATION_FIELDS[abi_family]
     if not isinstance(family_specialization, Mapping) or set(
