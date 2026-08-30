@@ -46,8 +46,7 @@ def get_kda_csrc_dir() -> Path:
     if checkout.exists():
         return checkout
     raise FileNotFoundError(
-        "KDA CUDA sources were not found. Checked:\n"
-        f"  - {installed}\n  - {checkout}"
+        f"KDA CUDA sources were not found. Checked:\n  - {installed}\n  - {checkout}"
     )
 
 

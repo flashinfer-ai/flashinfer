@@ -165,9 +165,7 @@ def get_cake_kda_affine_module_specs() -> tuple[CakeKDAAffineModuleSpec, ...]:
     _require_affine_manifest(status == "complete", f"unsupported status {status!r}")
 
     expected: set[tuple[str, CakeKDAAffineRole]] = {
-        (target, role)
-        for target in _CAKE_KDA_TARGETS
-        for role in CAKE_KDA_AFFINE_ROLES
+        (target, role) for target in _CAKE_KDA_TARGETS for role in CAKE_KDA_AFFINE_ROLES
     }
     observed: set[tuple[str, CakeKDAAffineRole]] = set()
     specs: list[CakeKDAAffineModuleSpec] = []
