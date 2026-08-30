@@ -1545,6 +1545,171 @@ def test_generated_affine_selector_construction_is_cached(monkeypatch):
         scan_cache.cache_clear()
 
 
+def test_generated_affine_carriers_are_workspace_cached(monkeypatch):
+    calls = []
+
+    def fake_dummy(name):
+        def make(_device):
+            value = object()
+            calls.append((name, None, value))
+            return value
+
+        return make
+
+    def fake_empty(_device, dtype):
+        value = object()
+        calls.append(("empty", dtype, value))
+        return value
+
+    for name in ("bf16", "i32", "i64", "f32", "u32"):
+        monkeypatch.setattr(
+            kda_prefill_api,
+            f"_dummy_{name}",
+            fake_dummy(name),
+        )
+    monkeypatch.setattr(kda_prefill_api, "_empty_cuda_tensor", fake_empty)
+
+    first_workspace = SimpleNamespace(_generated_affine_carriers=None)
+    first = kda_prefill_api._generated_affine_carriers(
+        workspace=first_workspace,
+        device=torch.device("cuda:0"),
+    )
+    assert (
+        kda_prefill_api._generated_affine_carriers(
+            workspace=first_workspace,
+            device=torch.device("cuda:0"),
+        )
+        is first
+    )
+    assert len(calls) == 9
+    assert [name for name, _dtype, _value in calls] == [
+        "bf16",
+        "i32",
+        "i64",
+        "f32",
+        "u32",
+        "empty",
+        "empty",
+        "empty",
+        "empty",
+    ]
+    assert [dtype for name, dtype, _value in calls if name == "empty"] == [
+        torch.bfloat16,
+        torch.float32,
+        torch.int64,
+        torch.uint8,
+    ]
+
+    second_workspace = SimpleNamespace(_generated_affine_carriers=None)
+    second = kda_prefill_api._generated_affine_carriers(
+        workspace=second_workspace,
+        device=torch.device("cuda:0"),
+    )
+    assert second is not first
+    assert len(calls) == 18
+
+
+def test_generated_affine_direct_role_uses_supplied_carriers(monkeypatch):
+    def unexpected_lookup(*_args, **_kwargs):
+        pytest.fail("affine role repeated a global dummy/empty carrier lookup")
+
+    for helper in (
+        "_dummy_bf16",
+        "_dummy_i32",
+        "_dummy_i64",
+        "_dummy_f32",
+        "_dummy_u32",
+        "_empty_cuda_tensor",
+    ):
+        monkeypatch.setattr(kda_prefill_api, helper, unexpected_lookup)
+
+    module = _RecorderModule()
+    metadata = SimpleNamespace(variant_id="affine_map_test")
+    selector_key = {"selector": "affine_map_test"}
+    descriptor_storage = object()
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_generated_affine_direct_selector_key",
+        lambda **_kwargs: selector_key,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_generated_module",
+        lambda selected: (metadata, module)
+        if selected is selector_key
+        else pytest.fail("unexpected affine selector"),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_affine_descriptor_storage",
+        lambda **_kwargs: descriptor_storage,
+    )
+
+    carrier_values = {
+        name: object()
+        for name in (
+            "dummy_bf16",
+            "dummy_i32",
+            "dummy_i64",
+            "dummy_f32",
+            "dummy_u32",
+            "empty_bf16",
+            "empty_f32",
+            "empty_i64",
+            "empty_u8",
+        )
+    }
+    carriers = kda_prefill_api._GeneratedAffineCarriers(**carrier_values)
+    workspace = SimpleNamespace(_descriptor_signatures={})
+    q = torch.empty((1, 32, 4, 128), dtype=torch.bfloat16)
+    beta = torch.empty((1, 32, 4), dtype=torch.bfloat16)
+    state = torch.empty((1, 4, 128, 128), dtype=torch.bfloat16)
+    dependency = torch.empty((1, 4, 128, 128), dtype=torch.float32)
+
+    kda_prefill_api._run_generated_affine_direct_role(
+        workspace=workspace,
+        carriers=carriers,
+        target="sm100a",
+        role="affine_map",
+        q=q,
+        k=q,
+        v=q,
+        g=q,
+        beta=beta,
+        beta_tma=beta,
+        A_log=torch.empty(4, dtype=torch.float32),
+        dt_bias=torch.empty((4, 128), dtype=torch.float32),
+        cu_seqlens=torch.tensor([0, 32], dtype=torch.int64),
+        seq_order=torch.tensor([0], dtype=torch.int32),
+        state_indices=carriers.dummy_i32,
+        initial_state=state,
+        out=q,
+        final_state=state,
+        initial_state_f32_dependency=dependency,
+        sequence_lengths=(32,),
+        num_heads=4,
+        use_state_indices=False,
+        state_slot_stride=4 * 128 * 128,
+        scale=0.125,
+        lower_bound=-5.0,
+        grid_x=4,
+        external_state_is_fp32=False,
+        stream_ptr=17,
+        capturing=False,
+    )
+
+    (args,) = module.calls
+    assert len(args) == 49
+    assert args[14] is carriers.empty_bf16
+    assert args[15] is carriers.empty_i64
+    assert args[16] is carriers.dummy_i64
+    assert args[17] is carriers.dummy_bf16
+    assert args[18] is carriers.dummy_u32
+    assert args[30] is carriers.dummy_u32
+    assert args[31] is carriers.empty_u8
+    assert args[32] is descriptor_storage
+
+
 def test_generated_prefill_runtime_specialization_helpers():
     assert not kda_prefill_api._flash_kda_generated_serving_native_abi(
         use_state_indices=False,

@@ -227,6 +227,21 @@ class _PersistentM128Roofline:
     piece_ns: float
 
 
+@dataclass(frozen=True)
+class _GeneratedAffineCarriers:
+    """Workspace-cached typed carriers shared by the affine module roles."""
+
+    dummy_bf16: torch.Tensor
+    dummy_i32: torch.Tensor
+    dummy_i64: torch.Tensor
+    dummy_f32: torch.Tensor
+    dummy_u32: torch.Tensor
+    empty_bf16: torch.Tensor
+    empty_f32: torch.Tensor
+    empty_i64: torch.Tensor
+    empty_u8: torch.Tensor
+
+
 class _RecurrentKDAPrefillWorkspaceBase:
     def __init__(self, device: torch.device | str) -> None:
         normalized_device = torch.device(device)
@@ -294,6 +309,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
         ] = {}
         self._affine_buffers: dict[str, torch.Tensor] = {}
         self._affine_map_identity_data_ptr: Optional[int] = None
+        self._generated_affine_carriers: Optional[_GeneratedAffineCarriers] = None
         self._packed_metadata_lock = threading.Lock()
         self._packed_metadata_tensor: Optional[torch.Tensor] = None
         self._packed_metadata_signature: Optional[_PackedMetadataSignature] = None
@@ -1830,6 +1846,28 @@ def _empty_cuda_tensor(device: torch.device, dtype: torch.dtype) -> torch.Tensor
             "graph capture; invoke the same device once before capture"
         ),
     )
+
+
+def _generated_affine_carriers(
+    *,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    device: torch.device,
+) -> _GeneratedAffineCarriers:
+    carriers = workspace._generated_affine_carriers
+    if carriers is None:
+        carriers = _GeneratedAffineCarriers(
+            dummy_bf16=_dummy_bf16(device),
+            dummy_i32=_dummy_i32(device),
+            dummy_i64=_dummy_i64(device),
+            dummy_f32=_dummy_f32(device),
+            dummy_u32=_dummy_u32(device),
+            empty_bf16=_empty_cuda_tensor(device, torch.bfloat16),
+            empty_f32=_empty_cuda_tensor(device, torch.float32),
+            empty_i64=_empty_cuda_tensor(device, torch.int64),
+            empty_u8=_empty_cuda_tensor(device, torch.uint8),
+        )
+        workspace._generated_affine_carriers = carriers
+    return carriers
 
 
 def _stream_cache_key(device: torch.device) -> tuple[int, int]:
@@ -4186,6 +4224,7 @@ def _flash_kda_generated_affine_scan_selector_key(
 def _run_generated_affine_direct_role(
     *,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
+    carriers: _GeneratedAffineCarriers,
     target: "FlashKDATarget",
     role: str,
     q: torch.Tensor,
@@ -4244,14 +4283,7 @@ def _run_generated_affine_direct_role(
             f"affine {role} descriptors are not warmed for CUDA graph capture"
         )
     prepare_descriptors = 0 if capturing else int(warmed_signature != signature)
-    dummy_bf16 = _dummy_bf16(q.device)
-    dummy_f32 = _dummy_f32(q.device)
-    dummy_i64 = _dummy_i64(q.device)
-    dummy_u32 = _dummy_u32(q.device)
-    empty_state = _empty_cuda_tensor(
-        q.device, torch.bfloat16 if role == "affine_map" else torch.float32
-    )
-    empty_u8 = _empty_cuda_tensor(q.device, torch.uint8)
+    empty_state = carriers.empty_bf16 if role == "affine_map" else carriers.empty_f32
     try:
         module.run(
             q,
@@ -4269,23 +4301,23 @@ def _run_generated_affine_direct_role(
             out,
             final_state,
             empty_state,
-            _empty_cuda_tensor(q.device, torch.int64),
-            dummy_i64,
-            dummy_bf16,
-            dummy_u32,
-            dummy_bf16,
-            dummy_bf16,
-            dummy_bf16,
-            dummy_bf16,
+            carriers.empty_i64,
+            carriers.dummy_i64,
+            carriers.dummy_bf16,
+            carriers.dummy_u32,
+            carriers.dummy_bf16,
+            carriers.dummy_bf16,
+            carriers.dummy_bf16,
+            carriers.dummy_bf16,
             initial_state_f32_dependency,
-            dummy_bf16,
-            dummy_bf16,
-            dummy_bf16,
-            dummy_f32,
-            dummy_bf16,
-            dummy_f32,
-            dummy_u32,
-            empty_u8,
+            carriers.dummy_bf16,
+            carriers.dummy_bf16,
+            carriers.dummy_bf16,
+            carriers.dummy_f32,
+            carriers.dummy_bf16,
+            carriers.dummy_f32,
+            carriers.dummy_u32,
+            carriers.empty_u8,
             descriptor_storage,
             prepare_descriptors,
             num_heads,
@@ -4335,6 +4367,7 @@ def _run_generated_affine_route(
     capturing: bool,
 ) -> None:
     device = q.device
+    carriers = _generated_affine_carriers(workspace=workspace, device=device)
     num_parts = len(token_offsets) - 1
     tail_start = token_offsets[1]
     total_tokens = q.numel() // (num_heads * _FLASH_KDA_HEAD_DIM)
@@ -4486,8 +4519,6 @@ def _run_generated_affine_route(
     correction_beta_tma = _affine_beta_tma_source(
         workspace=workspace, name="beta_tma_correction", beta=beta_tail
     )
-    dummy_i32 = _dummy_i32(device)
-    dummy_f32 = _dummy_f32(device)
     main_lengths = tuple(
         right - left
         for left, right in zip(token_offsets, token_offsets[1:], strict=False)
@@ -4496,6 +4527,7 @@ def _run_generated_affine_route(
 
     _run_generated_affine_direct_role(
         workspace=workspace,
+        carriers=carriers,
         target=target,
         role="affine_main",
         q=q,
@@ -4508,11 +4540,11 @@ def _run_generated_affine_route(
         dt_bias=dt_bias,
         cu_seqlens=split_cu_seqlens,
         seq_order=main_seq_order,
-        state_indices=state_indices if main_use_indices else dummy_i32,
+        state_indices=(state_indices if main_use_indices else carriers.dummy_i32),
         initial_state=main_initial_arg,
         out=out,
         final_state=main_final,
-        initial_state_f32_dependency=dummy_f32,
+        initial_state_f32_dependency=carriers.dummy_f32,
         sequence_lengths=main_lengths,
         num_heads=num_heads,
         use_state_indices=main_use_indices,
@@ -4526,6 +4558,7 @@ def _run_generated_affine_route(
     )
     _run_generated_affine_direct_role(
         workspace=workspace,
+        carriers=carriers,
         target=target,
         role="affine_map",
         q=q_tail,
@@ -4538,7 +4571,7 @@ def _run_generated_affine_route(
         dt_bias=dt_bias,
         cu_seqlens=tail_cu_seqlens,
         seq_order=tail_seq_order,
-        state_indices=dummy_i32,
+        state_indices=carriers.dummy_i32,
         initial_state=map_identity,
         out=map_out,
         final_state=map_state,
@@ -4569,6 +4602,7 @@ def _run_generated_affine_route(
     )
     _run_generated_affine_direct_role(
         workspace=workspace,
+        carriers=carriers,
         target=target,
         role="affine_correction",
         q=q_tail,
@@ -4581,7 +4615,7 @@ def _run_generated_affine_route(
         dt_bias=dt_bias,
         cu_seqlens=tail_cu_seqlens,
         seq_order=tail_seq_order,
-        state_indices=dummy_i32,
+        state_indices=carriers.dummy_i32,
         initial_state=carry,
         out=correction_out,
         final_state=correction_final,
