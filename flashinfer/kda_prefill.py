@@ -264,6 +264,61 @@ class _GeneratedAffineModuleBundle:
     correction: _GeneratedAffineModule
 
 
+_AffineBetaTMALayout = Literal["pair_packed", "direct", "padded"]
+
+
+@dataclass(frozen=True)
+class _GeneratedAffineLaunchPlanKey:
+    """Tensor-free identity of one workspace-local affine launch plan."""
+
+    target: str
+    token_offsets: tuple[int, ...]
+    num_heads: int
+    state_dtype: torch.dtype
+    beta_layouts: tuple[
+        _AffineBetaTMALayout,
+        _AffineBetaTMALayout,
+        _AffineBetaTMALayout,
+    ]
+
+
+@dataclass(frozen=True)
+class _GeneratedAffineLaunchPlan:
+    """Static scalars and workspace-owned views for one affine route shape."""
+
+    key: _GeneratedAffineLaunchPlanKey
+    num_parts: int
+    tail_start: int
+    total_tokens: int
+    tail_tokens: int
+    main_lengths: tuple[int, ...]
+    tail_lengths: tuple[int, ...]
+    main_initial: torch.Tensor
+    main_final: torch.Tensor
+    map_identity: torch.Tensor
+    map_state: torch.Tensor
+    carry: torch.Tensor
+    correction_final: torch.Tensor
+    final_compact: torch.Tensor
+    zero_v: torch.Tensor
+    map_out: torch.Tensor
+    correction_out: torch.Tensor
+    state_indices_i64: torch.Tensor
+    selected_initial: Optional[torch.Tensor]
+    final_external: Optional[torch.Tensor]
+    main_beta_padded: Optional[torch.Tensor]
+    map_beta_padded: Optional[torch.Tensor]
+    correction_beta_padded: Optional[torch.Tensor]
+    split_cu_seqlens: torch.Tensor
+    tail_cu_seqlens: torch.Tensor
+    main_seq_order: torch.Tensor
+    tail_seq_order: torch.Tensor
+    main_descriptor_storage: torch.Tensor
+    map_descriptor_storage: torch.Tensor
+    correction_descriptor_storage: torch.Tensor
+    modules: _GeneratedAffineModuleBundle
+
+
 _GeneratedAffineLaunchObserver = Callable[
     [str, dict[str, object], object, object], None
 ]
@@ -372,6 +427,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._generated_affine_module_bundle: Optional[_GeneratedAffineModuleBundle] = (
             None
         )
+        self._generated_affine_launch_plan: Optional[_GeneratedAffineLaunchPlan] = None
         self._packed_metadata_lock = threading.Lock()
         self._packed_metadata_tensor: Optional[torch.Tensor] = None
         self._packed_metadata_signature: Optional[_PackedMetadataSignature] = None
@@ -2833,6 +2889,7 @@ def _flash_kda_generated_affine_scan_specialization() -> dict[str, object]:
     return {"use_pdl": True}
 
 
+@functools.cache
 def _flash_kda_affine_token_offsets(
     *,
     total_tokens: int,
@@ -4190,12 +4247,9 @@ def _run_generated_single_route(
     return True
 
 
-def _affine_beta_tma_source(
-    *,
-    workspace: _RecurrentKDAPrefillWorkspaceBase,
-    name: str,
+def _affine_beta_tma_layout(
     beta: torch.Tensor,
-) -> torch.Tensor:
+) -> tuple[_AffineBetaTMALayout, torch.Tensor]:
     rows = beta.numel() // beta.shape[-1]
     num_heads = beta.shape[-1]
     flat = beta.reshape(rows, num_heads)
@@ -4205,14 +4259,39 @@ def _affine_beta_tma_source(
         and flat.is_contiguous()
         and flat.data_ptr() % 16 == 0
     ):
-        return flat.view(rows // 2, 24)
+        return "pair_packed", flat
     if (
         rows >= _FLASH_KDA_M128_CHUNK
         and num_heads >= _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
         and flat.data_ptr() % 16 == 0
         and flat.stride(0) * beta.element_size() % 16 == 0
     ):
+        return "direct", flat
+    return "padded", flat
+
+
+def _affine_beta_tma_from_plan(
+    *,
+    layout: _AffineBetaTMALayout,
+    flat: torch.Tensor,
+    padded: Optional[torch.Tensor],
+) -> torch.Tensor:
+    if layout == "pair_packed":
+        return flat.view(flat.shape[0] // 2, 24)
+    if layout == "direct":
         return flat
+    assert padded is not None
+    return padded
+
+
+def _affine_padded_beta_tma(
+    *,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    name: str,
+    device: torch.device,
+    rows: int,
+    num_heads: int,
+) -> torch.Tensor:
     padded_heads = (
         (num_heads + _FLASH_KDA_BETA_TMA_HEADS_PER_BOX - 1)
         // _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
@@ -4221,7 +4300,7 @@ def _affine_beta_tma_source(
     return _affine_workspace_buffer(
         workspace=workspace,
         name=name,
-        device=beta.device,
+        device=device,
         shape=(max(rows, _FLASH_KDA_M128_CHUNK), padded_heads),
         dtype=torch.bfloat16,
     )
@@ -4320,11 +4399,225 @@ def _generated_affine_module_bundle(
     return resolved
 
 
+def _generated_affine_launch_plan(
+    *,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    target: "FlashKDATarget",
+    device: torch.device,
+    token_offsets: tuple[int, ...],
+    num_heads: int,
+    state_dtype: torch.dtype,
+    beta_layouts: tuple[
+        _AffineBetaTMALayout,
+        _AffineBetaTMALayout,
+        _AffineBetaTMALayout,
+    ],
+    capturing: bool,
+) -> _GeneratedAffineLaunchPlan:
+    key = _GeneratedAffineLaunchPlanKey(
+        target=target,
+        token_offsets=token_offsets,
+        num_heads=num_heads,
+        state_dtype=state_dtype,
+        beta_layouts=beta_layouts,
+    )
+    cached = workspace._generated_affine_launch_plan
+    if cached is not None and cached.key == key:
+        return cached
+    if capturing:
+        raise RuntimeError(
+            "generated affine launch plan is not warmed for CUDA graph capture"
+        )
+
+    num_parts = len(token_offsets) - 1
+    tail_start = token_offsets[1]
+    total_tokens = token_offsets[-1]
+    tail_tokens = total_tokens - tail_start
+    state_shape = (num_parts, num_heads, _FLASH_KDA_HEAD_DIM, _FLASH_KDA_HEAD_DIM)
+    tail_state_shape = (
+        num_parts - 1,
+        num_heads,
+        _FLASH_KDA_HEAD_DIM,
+        _FLASH_KDA_HEAD_DIM,
+    )
+    main_lengths = tuple(
+        right - left
+        for left, right in zip(token_offsets, token_offsets[1:], strict=False)
+    )
+    tail_lengths = main_lengths[1:]
+    tail_offsets = tuple(offset - tail_start for offset in token_offsets[1:])
+
+    def buffer(
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        *,
+        zero_on_allocate: bool = False,
+    ) -> torch.Tensor:
+        return _affine_workspace_buffer(
+            workspace=workspace,
+            name=name,
+            device=device,
+            shape=shape,
+            dtype=dtype,
+            zero_on_allocate=zero_on_allocate,
+        )
+
+    main_initial = buffer(
+        "main_initial_fp32", state_shape, torch.float32, zero_on_allocate=True
+    )
+    main_final = buffer("main_final_fp32", state_shape, torch.float32)
+    map_identity = buffer(
+        "map_identity_bfloat16",
+        tail_state_shape,
+        torch.bfloat16,
+        zero_on_allocate=True,
+    )
+    if workspace._affine_map_identity_data_ptr != map_identity.data_ptr():
+        map_identity.diagonal(dim1=-2, dim2=-1).fill_(1)
+        workspace._affine_map_identity_data_ptr = map_identity.data_ptr()
+    map_state = buffer("map_state_bfloat16", tail_state_shape, torch.bfloat16)
+    carry = buffer("carry_float32", tail_state_shape, torch.float32)
+    correction_final = buffer(
+        "correction_final_float32", tail_state_shape, torch.float32
+    )
+    final_compact_shape = (1, num_heads, _FLASH_KDA_HEAD_DIM, _FLASH_KDA_HEAD_DIM)
+    final_compact = buffer("final_compact_float32", final_compact_shape, torch.float32)
+    zero_v_shape = (1, tail_tokens, num_heads, _FLASH_KDA_HEAD_DIM)
+    zero_v = buffer("zero_v", zero_v_shape, torch.bfloat16, zero_on_allocate=True)
+    map_out = buffer("map_out", zero_v_shape, torch.bfloat16)
+    correction_out = buffer("correction_out", zero_v_shape, torch.bfloat16)
+    state_indices_i64 = buffer("state_indices_i64", (1,), torch.int64)
+    selected_initial = (
+        buffer("selected_initial", final_compact_shape, torch.bfloat16)
+        if state_dtype == torch.bfloat16
+        else None
+    )
+    final_external = (
+        buffer("final_external", final_compact_shape, torch.bfloat16)
+        if state_dtype == torch.bfloat16
+        else None
+    )
+
+    def padded_beta(
+        layout: _AffineBetaTMALayout, name: str, rows: int
+    ) -> Optional[torch.Tensor]:
+        if layout != "padded":
+            return None
+        return _affine_padded_beta_tma(
+            workspace=workspace,
+            name=name,
+            device=device,
+            rows=rows,
+            num_heads=num_heads,
+        )
+
+    main_beta_padded = padded_beta(beta_layouts[0], "beta_tma_main", total_tokens)
+    map_beta_padded = padded_beta(beta_layouts[1], "beta_tma_map", tail_tokens)
+    correction_beta_padded = padded_beta(
+        beta_layouts[2], "beta_tma_correction", tail_tokens
+    )
+    split_cu_seqlens = _cached_tensor(
+        ("affine_split_cu", *_stream_cache_key(device), token_offsets),
+        lambda: torch.tensor(token_offsets, dtype=torch.int64, device=device),
+        capture_error="affine split offsets are not warmed for CUDA graph capture",
+    )
+    tail_cu_seqlens = _cached_tensor(
+        ("affine_tail_cu", *_stream_cache_key(device), tail_offsets),
+        lambda: torch.tensor(tail_offsets, dtype=torch.int64, device=device),
+        capture_error="affine tail offsets are not warmed for CUDA graph capture",
+    )
+    main_seq_order = _identity_seq_order(device=device, num_sequences=num_parts)
+    tail_seq_order = _identity_seq_order(device=device, num_sequences=num_parts - 1)
+
+    main_selector_key = _flash_kda_generated_affine_direct_selector_key(
+        target=target,
+        role="affine_main",
+        num_heads=num_heads,
+        num_sequences=len(main_lengths),
+        uniform_sequences=len(set(main_lengths)) == 1,
+        max_sequence_length=max(main_lengths),
+        pair_packed_beta=beta_layouts[0] == "pair_packed",
+        external_state_is_fp32=state_dtype == torch.float32,
+    )
+    map_selector_key = _flash_kda_generated_affine_direct_selector_key(
+        target=target,
+        role="affine_map",
+        num_heads=num_heads,
+        num_sequences=len(tail_lengths),
+        uniform_sequences=len(set(tail_lengths)) == 1,
+        max_sequence_length=max(tail_lengths),
+        pair_packed_beta=beta_layouts[1] == "pair_packed",
+        external_state_is_fp32=False,
+    )
+    scan_selector_key = _flash_kda_generated_affine_scan_selector_key(target=target)
+    correction_selector_key = _flash_kda_generated_affine_direct_selector_key(
+        target=target,
+        role="affine_correction",
+        num_heads=num_heads,
+        num_sequences=len(tail_lengths),
+        uniform_sequences=len(set(tail_lengths)) == 1,
+        max_sequence_length=max(tail_lengths),
+        pair_packed_beta=beta_layouts[2] == "pair_packed",
+        external_state_is_fp32=True,
+    )
+    modules = _generated_affine_module_bundle(
+        workspace=workspace,
+        main_selector_key=main_selector_key,
+        map_selector_key=map_selector_key,
+        scan_selector_key=scan_selector_key,
+        correction_selector_key=correction_selector_key,
+        capturing=False,
+    )
+    resolved = _GeneratedAffineLaunchPlan(
+        key=key,
+        num_parts=num_parts,
+        tail_start=tail_start,
+        total_tokens=total_tokens,
+        tail_tokens=tail_tokens,
+        main_lengths=main_lengths,
+        tail_lengths=tail_lengths,
+        main_initial=main_initial,
+        main_final=main_final,
+        map_identity=map_identity,
+        map_state=map_state,
+        carry=carry,
+        correction_final=correction_final,
+        final_compact=final_compact,
+        zero_v=zero_v,
+        map_out=map_out,
+        correction_out=correction_out,
+        state_indices_i64=state_indices_i64,
+        selected_initial=selected_initial,
+        final_external=final_external,
+        main_beta_padded=main_beta_padded,
+        map_beta_padded=map_beta_padded,
+        correction_beta_padded=correction_beta_padded,
+        split_cu_seqlens=split_cu_seqlens,
+        tail_cu_seqlens=tail_cu_seqlens,
+        main_seq_order=main_seq_order,
+        tail_seq_order=tail_seq_order,
+        main_descriptor_storage=_affine_descriptor_storage(
+            workspace=workspace, role="main", device=device
+        ),
+        map_descriptor_storage=_affine_descriptor_storage(
+            workspace=workspace, role="map", device=device
+        ),
+        correction_descriptor_storage=_affine_descriptor_storage(
+            workspace=workspace, role="correction", device=device
+        ),
+        modules=modules,
+    )
+    workspace._generated_affine_launch_plan = resolved
+    return resolved
+
+
 def _run_generated_affine_direct_role(
     *,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
     carriers: _GeneratedAffineCarriers,
     resolved_module: _GeneratedAffineModule,
+    descriptor_storage: torch.Tensor,
     launch_observer: Optional[_GeneratedAffineLaunchObserver],
     role: str,
     q: torch.Tensor,
@@ -4357,11 +4650,6 @@ def _run_generated_affine_direct_role(
         raise ValueError("affine role lengths must match its sequence offsets")
     metadata = resolved_module.metadata
     module = resolved_module.module
-    descriptor_storage = _affine_descriptor_storage(
-        workspace=workspace,
-        role=role.removeprefix("affine_"),
-        device=q.device,
-    )
     signature = tuple(
         _tensor_descriptor_signature(tensor) for tensor in (q, k, v, g, beta_tma, out)
     )
@@ -4458,209 +4746,70 @@ def _run_generated_affine_route(
 ) -> None:
     device = q.device
     carriers = _generated_affine_carriers(workspace=workspace, device=device)
-    num_parts = len(token_offsets) - 1
-    tail_start = token_offsets[1]
     total_tokens = q.numel() // (num_heads * _FLASH_KDA_HEAD_DIM)
-    tail_tokens = total_tokens - tail_start
-    state_shape = (num_parts, num_heads, _FLASH_KDA_HEAD_DIM, _FLASH_KDA_HEAD_DIM)
-    tail_state_shape = (
-        num_parts - 1,
-        num_heads,
-        _FLASH_KDA_HEAD_DIM,
-        _FLASH_KDA_HEAD_DIM,
-    )
-    main_initial = _affine_workspace_buffer(
-        workspace=workspace,
-        name="main_initial_fp32",
-        device=device,
-        shape=state_shape,
-        dtype=torch.float32,
-        zero_on_allocate=True,
-    )
-    main_final = _affine_workspace_buffer(
-        workspace=workspace,
-        name="main_final_fp32",
-        device=device,
-        shape=state_shape,
-        dtype=torch.float32,
-    )
-    map_identity = _affine_workspace_buffer(
-        workspace=workspace,
-        name="map_identity_bfloat16",
-        device=device,
-        shape=tail_state_shape,
-        dtype=torch.bfloat16,
-        zero_on_allocate=True,
-    )
-    # The map kernel only reads this buffer. Initialize each backing allocation
-    # once; smaller views preserve the same contiguous sequence of identities.
-    if workspace._affine_map_identity_data_ptr != map_identity.data_ptr():
-        map_identity.diagonal(dim1=-2, dim2=-1).fill_(1)
-        workspace._affine_map_identity_data_ptr = map_identity.data_ptr()
-    map_state = _affine_workspace_buffer(
-        workspace=workspace,
-        name="map_state_bfloat16",
-        device=device,
-        shape=tail_state_shape,
-        dtype=torch.bfloat16,
-    )
-    carry = _affine_workspace_buffer(
-        workspace=workspace,
-        name="carry_float32",
-        device=device,
-        shape=tail_state_shape,
-        dtype=torch.float32,
-    )
-    correction_final = _affine_workspace_buffer(
-        workspace=workspace,
-        name="correction_final_float32",
-        device=device,
-        shape=tail_state_shape,
-        dtype=torch.float32,
-    )
-    final_compact = _affine_workspace_buffer(
-        workspace=workspace,
-        name="final_compact_float32",
-        device=device,
-        shape=(1, num_heads, _FLASH_KDA_HEAD_DIM, _FLASH_KDA_HEAD_DIM),
-        dtype=torch.float32,
-    )
-    zero_v = _affine_workspace_buffer(
-        workspace=workspace,
-        name="zero_v",
-        device=device,
-        shape=(1, tail_tokens, num_heads, _FLASH_KDA_HEAD_DIM),
-        dtype=torch.bfloat16,
-        zero_on_allocate=True,
-    )
-    map_out = _affine_workspace_buffer(
-        workspace=workspace,
-        name="map_out",
-        device=device,
-        shape=zero_v.shape,
-        dtype=torch.bfloat16,
-    )
-    correction_out = _affine_workspace_buffer(
-        workspace=workspace,
-        name="correction_out",
-        device=device,
-        shape=zero_v.shape,
-        dtype=torch.bfloat16,
-    )
-    state_indices_i64 = _affine_workspace_buffer(
-        workspace=workspace,
-        name="state_indices_i64",
-        device=device,
-        shape=(1,),
-        dtype=torch.int64,
-    )
-    state_indices_i64.copy_(state_indices)
-
-    split_cu_seqlens = _cached_tensor(
-        ("affine_split_cu", *_stream_cache_key(device), token_offsets),
-        lambda: torch.tensor(token_offsets, dtype=torch.int64, device=device),
-        capture_error="affine split offsets are not warmed for CUDA graph capture",
-    )
-    tail_offsets = tuple(offset - tail_start for offset in token_offsets[1:])
-    tail_cu_seqlens = _cached_tensor(
-        ("affine_tail_cu", *_stream_cache_key(device), tail_offsets),
-        lambda: torch.tensor(tail_offsets, dtype=torch.int64, device=device),
-        capture_error="affine tail offsets are not warmed for CUDA graph capture",
-    )
-    main_seq_order = _identity_seq_order(device=device, num_sequences=num_parts)
-    tail_seq_order = _identity_seq_order(device=device, num_sequences=num_parts - 1)
-    state_stride = initial_state.stride(0)
-    external_state_is_fp32 = initial_state.dtype == torch.float32
-    if external_state_is_fp32:
-        main_initial_arg = initial_state
-        main_use_indices = True
-        main_state_stride = state_stride
-    else:
-        selected_initial = _affine_workspace_buffer(
-            workspace=workspace,
-            name="selected_initial",
-            device=device,
-            shape=(1, num_heads, _FLASH_KDA_HEAD_DIM, _FLASH_KDA_HEAD_DIM),
-            dtype=torch.bfloat16,
-        )
-        torch.index_select(initial_state, 0, state_indices_i64, out=selected_initial)
-        # The direct main kernel does not mutate its initial-state buffer, so
-        # allocation-time zeros remain valid for every slot after slot zero.
-        main_initial[0].copy_(selected_initial[0])
-        main_initial_arg = main_initial
-        main_use_indices = False
-        main_state_stride = num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
-
     q_flat = q.reshape(total_tokens, num_heads, _FLASH_KDA_HEAD_DIM)
     k_flat = k.reshape_as(q_flat)
     g_flat = g.reshape_as(q_flat)
-    beta_flat = beta.reshape(total_tokens, num_heads)
+    main_beta_layout, beta_flat = _affine_beta_tma_layout(beta)
     out_flat = out.reshape_as(q_flat)
+    tail_start = token_offsets[1]
+    tail_tokens = total_tokens - tail_start
     q_tail = q_flat[tail_start:].view(1, tail_tokens, num_heads, _FLASH_KDA_HEAD_DIM)
     k_tail = k_flat[tail_start:].view_as(q_tail)
     g_tail = g_flat[tail_start:].view_as(q_tail)
     beta_tail = beta_flat[tail_start:].view(1, tail_tokens, num_heads)
-    main_beta_tma = _affine_beta_tma_source(
-        workspace=workspace, name="beta_tma_main", beta=beta
-    )
-    map_beta_tma = _affine_beta_tma_source(
-        workspace=workspace, name="beta_tma_map", beta=beta_tail
-    )
-    correction_beta_tma = _affine_beta_tma_source(
-        workspace=workspace, name="beta_tma_correction", beta=beta_tail
-    )
-    main_lengths = tuple(
-        right - left
-        for left, right in zip(token_offsets, token_offsets[1:], strict=False)
-    )
-    tail_lengths = main_lengths[1:]
-    main_selector_key = _flash_kda_generated_affine_direct_selector_key(
-        target=target,
-        role="affine_main",
-        num_heads=num_heads,
-        num_sequences=len(main_lengths),
-        uniform_sequences=len(set(main_lengths)) == 1,
-        max_sequence_length=max(main_lengths),
-        pair_packed_beta=(main_beta_tma.ndim == 2 and main_beta_tma.shape[-1] == 24),
-        external_state_is_fp32=external_state_is_fp32,
-    )
-    map_selector_key = _flash_kda_generated_affine_direct_selector_key(
-        target=target,
-        role="affine_map",
-        num_heads=num_heads,
-        num_sequences=len(tail_lengths),
-        uniform_sequences=len(set(tail_lengths)) == 1,
-        max_sequence_length=max(tail_lengths),
-        pair_packed_beta=(map_beta_tma.ndim == 2 and map_beta_tma.shape[-1] == 24),
-        external_state_is_fp32=False,
-    )
-    scan_selector_key = _flash_kda_generated_affine_scan_selector_key(target=target)
-    correction_selector_key = _flash_kda_generated_affine_direct_selector_key(
-        target=target,
-        role="affine_correction",
-        num_heads=num_heads,
-        num_sequences=len(tail_lengths),
-        uniform_sequences=len(set(tail_lengths)) == 1,
-        max_sequence_length=max(tail_lengths),
-        pair_packed_beta=(
-            correction_beta_tma.ndim == 2 and correction_beta_tma.shape[-1] == 24
-        ),
-        external_state_is_fp32=True,
-    )
-    module_bundle = _generated_affine_module_bundle(
+    map_beta_layout, map_beta_flat = _affine_beta_tma_layout(beta_tail)
+    correction_beta_layout = map_beta_layout
+    plan = _generated_affine_launch_plan(
         workspace=workspace,
-        main_selector_key=main_selector_key,
-        map_selector_key=map_selector_key,
-        scan_selector_key=scan_selector_key,
-        correction_selector_key=correction_selector_key,
+        target=target,
+        device=device,
+        token_offsets=token_offsets,
+        num_heads=num_heads,
+        state_dtype=initial_state.dtype,
+        beta_layouts=(
+            main_beta_layout,
+            map_beta_layout,
+            correction_beta_layout,
+        ),
         capturing=capturing,
     )
+    main_beta_tma = _affine_beta_tma_from_plan(
+        layout=main_beta_layout,
+        flat=beta_flat,
+        padded=plan.main_beta_padded,
+    )
+    map_beta_tma = _affine_beta_tma_from_plan(
+        layout=map_beta_layout,
+        flat=map_beta_flat,
+        padded=plan.map_beta_padded,
+    )
+    correction_beta_tma = _affine_beta_tma_from_plan(
+        layout=correction_beta_layout,
+        flat=map_beta_flat,
+        padded=plan.correction_beta_padded,
+    )
+    external_state_is_fp32 = initial_state.dtype == torch.float32
+    if external_state_is_fp32:
+        main_initial_arg = initial_state
+        main_use_indices = True
+        main_state_stride = initial_state.stride(0)
+    else:
+        assert plan.selected_initial is not None
+        torch.index_select(initial_state, 0, state_indices, out=plan.selected_initial)
+        # The direct main kernel does not mutate its initial-state buffer, so
+        # allocation-time zeros remain valid for every slot after slot zero.
+        plan.main_initial[0].copy_(plan.selected_initial[0])
+        main_initial_arg = plan.main_initial
+        main_use_indices = False
+        main_state_stride = num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
     launch_observer = _generated_affine_launch_observer.get()
 
     _run_generated_affine_direct_role(
         workspace=workspace,
         carriers=carriers,
-        resolved_module=module_bundle.main,
+        resolved_module=plan.modules.main,
+        descriptor_storage=plan.main_descriptor_storage,
         launch_observer=launch_observer,
         role="affine_main",
         q=q,
@@ -4671,63 +4820,64 @@ def _run_generated_affine_route(
         beta_tma=main_beta_tma,
         A_log=A_log,
         dt_bias=dt_bias,
-        cu_seqlens=split_cu_seqlens,
-        seq_order=main_seq_order,
+        cu_seqlens=plan.split_cu_seqlens,
+        seq_order=plan.main_seq_order,
         state_indices=(state_indices if main_use_indices else carriers.dummy_i32),
         initial_state=main_initial_arg,
         out=out,
-        final_state=main_final,
+        final_state=plan.main_final,
         initial_state_f32_dependency=carriers.dummy_f32,
-        sequence_lengths=main_lengths,
+        sequence_lengths=plan.main_lengths,
         num_heads=num_heads,
         use_state_indices=main_use_indices,
         state_slot_stride=main_state_stride,
         scale=scale,
         lower_bound=lower_bound,
-        grid_x=num_parts * num_heads,
+        grid_x=plan.num_parts * num_heads,
         stream_ptr=stream_ptr,
         capturing=capturing,
     )
     _run_generated_affine_direct_role(
         workspace=workspace,
         carriers=carriers,
-        resolved_module=module_bundle.map,
+        resolved_module=plan.modules.map,
+        descriptor_storage=plan.map_descriptor_storage,
         launch_observer=launch_observer,
         role="affine_map",
         q=q_tail,
         k=k_tail,
-        v=zero_v,
+        v=plan.zero_v,
         g=g_tail,
         beta=beta_tail,
         beta_tma=map_beta_tma,
         A_log=A_log,
         dt_bias=dt_bias,
-        cu_seqlens=tail_cu_seqlens,
-        seq_order=tail_seq_order,
+        cu_seqlens=plan.tail_cu_seqlens,
+        seq_order=plan.tail_seq_order,
         state_indices=carriers.dummy_i32,
-        initial_state=map_identity,
-        out=map_out,
-        final_state=map_state,
-        initial_state_f32_dependency=main_final,
-        sequence_lengths=tail_lengths,
+        initial_state=plan.map_identity,
+        out=plan.map_out,
+        final_state=plan.map_state,
+        initial_state_f32_dependency=plan.main_final,
+        sequence_lengths=plan.tail_lengths,
         num_heads=num_heads,
         use_state_indices=False,
         state_slot_stride=num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM,
         scale=scale,
         lower_bound=lower_bound,
-        grid_x=(num_parts - 1) * num_heads,
+        grid_x=(plan.num_parts - 1) * num_heads,
         stream_ptr=stream_ptr,
         capturing=capturing,
     )
     scan_module = _generated_affine_module_for_launch(
-        module_bundle.scan, launch_observer
+        plan.modules.scan, launch_observer
     )
     scan_module.run(
-        main_final,
-        map_state,
-        carry,
+        plan.main_final,
+        plan.map_state,
+        plan.carry,
         num_heads,
-        num_parts,
+        plan.num_parts,
         32 * num_heads,
         1,
         1,
@@ -4736,48 +4886,49 @@ def _run_generated_affine_route(
     _run_generated_affine_direct_role(
         workspace=workspace,
         carriers=carriers,
-        resolved_module=module_bundle.correction,
+        resolved_module=plan.modules.correction,
+        descriptor_storage=plan.correction_descriptor_storage,
         launch_observer=launch_observer,
         role="affine_correction",
         q=q_tail,
         k=k_tail,
-        v=zero_v,
+        v=plan.zero_v,
         g=g_tail,
         beta=beta_tail,
         beta_tma=correction_beta_tma,
         A_log=A_log,
         dt_bias=dt_bias,
-        cu_seqlens=tail_cu_seqlens,
-        seq_order=tail_seq_order,
+        cu_seqlens=plan.tail_cu_seqlens,
+        seq_order=plan.tail_seq_order,
         state_indices=carriers.dummy_i32,
-        initial_state=carry,
-        out=correction_out,
-        final_state=correction_final,
-        initial_state_f32_dependency=carry,
-        sequence_lengths=tail_lengths,
+        initial_state=plan.carry,
+        out=plan.correction_out,
+        final_state=plan.correction_final,
+        initial_state_f32_dependency=plan.carry,
+        sequence_lengths=plan.tail_lengths,
         num_heads=num_heads,
         use_state_indices=False,
         state_slot_stride=num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM,
         scale=scale,
         lower_bound=lower_bound,
-        grid_x=(num_parts - 1) * num_heads,
+        grid_x=(plan.num_parts - 1) * num_heads,
         stream_ptr=stream_ptr,
         capturing=capturing,
     )
-    out_flat[tail_start:].add_(correction_out.reshape_as(out_flat[tail_start:]))
-    torch.add(main_final[-1:], correction_final[-1:], out=final_compact)
+    out_flat[tail_start:].add_(plan.correction_out.reshape_as(out_flat[tail_start:]))
+    torch.add(
+        plan.main_final[-1:],
+        plan.correction_final[-1:],
+        out=plan.final_compact,
+    )
     if final_state.dtype == torch.bfloat16:
-        final_external = _affine_workspace_buffer(
-            workspace=workspace,
-            name="final_external",
-            device=device,
-            shape=final_compact.shape,
-            dtype=torch.bfloat16,
-        )
-        final_external.copy_(final_compact)
-        final_state.index_copy_(0, state_indices_i64, final_external)
+        assert plan.final_external is not None
+        plan.final_external.copy_(plan.final_compact)
+        plan.state_indices_i64.copy_(state_indices)
+        final_state.index_copy_(0, plan.state_indices_i64, plan.final_external)
     else:
-        final_state.index_copy_(0, state_indices_i64, final_compact)
+        plan.state_indices_i64.copy_(state_indices)
+        final_state.index_copy_(0, plan.state_indices_i64, plan.final_compact)
 
 
 def _run_flash_kda_prefill(
@@ -4857,13 +5008,12 @@ def _run_flash_kda_prefill(
     )
     automatic_sequence_order = None
     persistent_plan = None
+    cu_seqlens_i64: Optional[torch.Tensor]
     if fixed_layout:
         sequence_lengths = (seq_len,) * num_sequences
         offsets = tuple(index * seq_len for index in range(num_sequences + 1))
         uniform_sequences = True
-        cu_seqlens_i64 = _fixed_cu_seqlens(
-            device=q.device, batch_size=batch_size, seq_len=seq_len
-        )
+        cu_seqlens_i64 = None
     else:
         assert cu_seqlens is not None
         if cu_seqlens.dtype == torch.int32 and capturing:
@@ -4897,17 +5047,37 @@ def _run_flash_kda_prefill(
             sm_count=sm_count,
         )
     max_sequence_length = max(sequence_lengths)
-    use_exact_n16 = (
-        checkpoint_every_n_tokens != 0 and checkpoint_every_n_tokens % 32 != 0
-    ) or _requires_exact_n16_recurrence(
-        compute_capability=compute_capability,
-        sm_count=sm_count,
-        fixed_layout=fixed_layout,
-        num_sequences=num_sequences,
-        num_heads=num_heads,
-        uniform_sequences=uniform_sequences,
-    )
-    if needs_direct_m128:
+    affine_token_offsets = None
+    if (
+        fixed_layout
+        and batch_size == 1
+        and state_indices is not None
+        and initial_state is not None
+        and beta.is_contiguous()
+        and checkpoint_every_n_tokens == 0
+        and state_checkpoints is None
+        and checkpoint_cu_starts is None
+    ):
+        affine_token_offsets = _flash_kda_affine_token_offsets(
+            total_tokens=batch_size * seq_len,
+            num_heads=num_heads,
+            sm_count=sm_count,
+            state_dtype=initial_state.dtype,
+        )
+    if affine_token_offsets is not None:
+        route = _FLASH_KDA_ROUTE_AFFINE_M128
+        persistent_plan = None
+    elif needs_direct_m128:
+        use_exact_n16 = (
+            checkpoint_every_n_tokens != 0 and checkpoint_every_n_tokens % 32 != 0
+        ) or _requires_exact_n16_recurrence(
+            compute_capability=compute_capability,
+            sm_count=sm_count,
+            fixed_layout=fixed_layout,
+            num_sequences=num_sequences,
+            num_heads=num_heads,
+            uniform_sequences=uniform_sequences,
+        )
         route = (
             _FLASH_KDA_ROUTE_DIRECT_M128_N16
             if use_exact_n16
@@ -4939,26 +5109,6 @@ def _run_flash_kda_prefill(
                 num_heads=num_heads,
                 max_sequence_length=max_sequence_length,
             )
-    affine_token_offsets = None
-    if (
-        fixed_layout
-        and batch_size == 1
-        and state_indices is not None
-        and initial_state is not None
-        and beta.is_contiguous()
-        and checkpoint_every_n_tokens == 0
-        and state_checkpoints is None
-        and checkpoint_cu_starts is None
-    ):
-        affine_token_offsets = _flash_kda_affine_token_offsets(
-            total_tokens=batch_size * seq_len,
-            num_heads=num_heads,
-            sm_count=sm_count,
-            state_dtype=initial_state.dtype,
-        )
-        if affine_token_offsets is not None:
-            route = _FLASH_KDA_ROUTE_AFFINE_M128
-            persistent_plan = None
     if (
         route == _FLASH_KDA_ROUTE_PIECE_PERSISTENT_M128
         and not piece_persistent_candidate
@@ -5074,7 +5224,10 @@ def _run_flash_kda_prefill(
         persistent_plan = None
     persistent_task_ids = None
     persistent_task_offsets = None
-    if persistent_plan is None:
+    seq_order_i32: Optional[torch.Tensor] = None
+    if route == _FLASH_KDA_ROUTE_AFFINE_M128:
+        pass
+    elif persistent_plan is None:
         if seq_order is not None or automatic_sequence_order is None:
             seq_order_i32 = _validate_prefill_seq_order(
                 seq_order,
@@ -5151,9 +5304,14 @@ def _run_flash_kda_prefill(
             kind="piece_persistent_task_state_destinations",
             values=state_destinations,
         )
-    dummy_state = _dummy_bf16(q.device)
-    dummy_i32 = _dummy_i32(q.device) if variant != "m64" else None
-    dummy_i64 = _dummy_i64(q.device) if variant != "m64" else None
+    if route == _FLASH_KDA_ROUTE_AFFINE_M128:
+        dummy_state = None
+        dummy_i32 = None
+        dummy_i64 = None
+    else:
+        dummy_state = _dummy_bf16(q.device)
+        dummy_i32 = _dummy_i32(q.device) if variant != "m64" else None
+        dummy_i64 = _dummy_i64(q.device) if variant != "m64" else None
 
     if output is None:
         if capturing:
@@ -5194,6 +5352,7 @@ def _run_flash_kda_prefill(
         store_final_state = True
         returned_state = final_state_arg
     elif output_final_state:
+        assert dummy_state is not None
         initial_state_arg = dummy_state
         if prefill_workspace is None:
             final_state_arg = torch.empty(
@@ -5205,6 +5364,7 @@ def _run_flash_kda_prefill(
             returned_state = None
         store_final_state = True
     else:
+        assert dummy_state is not None
         initial_state_arg = dummy_state
         final_state_arg = dummy_state
         store_final_state = False
@@ -5264,6 +5424,12 @@ def _run_flash_kda_prefill(
             if capturing and explicit_workspace:
                 workspace._captured = True
             return (out_buf, returned_state if output_final_state else None)
+        if cu_seqlens_i64 is None:
+            cu_seqlens_i64 = _fixed_cu_seqlens(
+                device=q.device, batch_size=batch_size, seq_len=seq_len
+            )
+        assert seq_order_i32 is not None
+        assert dummy_state is not None
         if variant == "m128_h12_long":
             pair_packed_beta_tma = _pair_packed_beta_tma_source(beta)
             if pair_packed_beta_tma is None:

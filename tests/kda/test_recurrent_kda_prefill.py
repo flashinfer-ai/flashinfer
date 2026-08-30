@@ -1253,6 +1253,54 @@ def test_frozen_prefill_rejects_fp32_state_checkpoints_explicitly(
         )
 
 
+def test_affine_launch_plan_reads_mutated_state_indices_each_call(
+    flash_kda_device,
+):
+    inputs = _make_inputs(
+        seq_lens=[65_536],
+        num_heads=4,
+        packed=False,
+        initial_state=True,
+        state_dtype=torch.bfloat16,
+        seed=24_204,
+    )
+    compact_state = inputs.pop("initial_state")
+    state_pool = torch.cat(
+        (compact_state, compact_state + 0.25, compact_state - 0.25), dim=0
+    )
+    state_indices = torch.tensor([0], dtype=torch.int32, device=flash_kda_device)
+    workspace = RecurrentKDAPrefillWorkspace(flash_kda_device)
+    first_output = torch.empty_like(inputs["q"])
+    first_result, first_state = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": state_pool}),
+        ssm_state_indices=state_indices,
+        output=first_output,
+        output_final_state=True,
+        prefill_workspace=workspace,
+        backend="cake",
+    )
+    assert first_result is first_output
+    assert first_state is state_pool
+
+    state_before_second = state_pool.clone()
+    state_indices.fill_(2)
+    second_output = torch.empty_like(inputs["q"])
+    second_result, second_state = recurrent_kda(
+        **_strict_prefill_kwargs({**inputs, "initial_state": state_pool}),
+        ssm_state_indices=state_indices,
+        output=second_output,
+        output_final_state=True,
+        prefill_workspace=workspace,
+        backend="cake",
+    )
+    assert second_result is second_output
+    assert second_state is state_pool
+    assert torch.equal(state_pool[0], state_before_second[0])
+    assert torch.equal(state_pool[1], state_before_second[1])
+    assert not torch.equal(state_pool[2], state_before_second[2])
+    assert not torch.equal(first_output, second_output)
+
+
 def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
     for compute_capability, sm_count, expected in (
         ((10, 0), 148, True),
@@ -1680,6 +1728,181 @@ def test_generated_affine_module_bundle_resolves_cold_and_observes_hot(monkeypat
     assert len(resolver_calls) == 8
 
 
+def test_generated_affine_launch_plan_caches_only_workspace_views(monkeypatch):
+    buffer_calls = []
+    buffers = {}
+
+    def workspace_buffer(*, name, shape, dtype, **_kwargs):
+        buffer_calls.append((name, shape, dtype))
+        tensor = torch.zeros(shape, dtype=dtype)
+        buffers[name] = tensor
+        return tensor
+
+    modules = object()
+    monkeypatch.setattr(kda_prefill_api, "_affine_workspace_buffer", workspace_buffer)
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_cached_tensor",
+        lambda key, _factory, **_kwargs: ("metadata", key),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_stream_cache_key",
+        lambda _device: (0, 17),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_identity_seq_order",
+        lambda **kwargs: ("seq_order", kwargs["num_sequences"]),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_generated_affine_module_bundle",
+        lambda **_kwargs: modules,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_affine_descriptor_storage",
+        lambda **kwargs: ("descriptor", kwargs["role"]),
+    )
+    workspace = SimpleNamespace(
+        _generated_affine_launch_plan=None,
+        _affine_map_identity_data_ptr=None,
+    )
+
+    def get_plan(token_offsets, *, capturing=False):
+        return kda_prefill_api._generated_affine_launch_plan(
+            workspace=workspace,
+            target="sm100a",
+            device=torch.device("cuda:0"),
+            token_offsets=token_offsets,
+            num_heads=4,
+            state_dtype=torch.bfloat16,
+            beta_layouts=("padded", "padded", "padded"),
+            capturing=capturing,
+        )
+
+    cold = get_plan((0, 4096, 8192))
+    assert len(buffer_calls) == 16
+    assert get_plan((0, 4096, 8192)) is cold
+    assert get_plan((0, 4096, 8192), capturing=True) is cold
+    assert len(buffer_calls) == 16
+    assert cold.modules is modules
+    assert all(not isinstance(value, torch.Tensor) for value in vars(cold.key).values())
+    assert set(buffers) == {
+        "main_initial_fp32",
+        "main_final_fp32",
+        "map_identity_bfloat16",
+        "map_state_bfloat16",
+        "carry_float32",
+        "correction_final_float32",
+        "final_compact_float32",
+        "zero_v",
+        "map_out",
+        "correction_out",
+        "state_indices_i64",
+        "selected_initial",
+        "final_external",
+        "beta_tma_main",
+        "beta_tma_map",
+        "beta_tma_correction",
+    }
+
+    changed = get_plan((0, 4096, 8192, 12288))
+    assert changed is not cold
+    assert workspace._generated_affine_launch_plan is changed
+    assert len(buffer_calls) == 32
+
+    workspace._generated_affine_launch_plan = None
+    with pytest.raises(RuntimeError, match="not warmed for CUDA graph capture"):
+        get_plan((0, 4096, 8192), capturing=True)
+    assert workspace._generated_affine_launch_plan is None
+    assert len(buffer_calls) == 32
+
+
+def test_affine_route_skips_general_metadata_and_dummy_materialization(monkeypatch):
+    q = torch.empty((1, 256, 4, 128), dtype=torch.bfloat16)
+    beta = torch.empty((1, 256, 4), dtype=torch.bfloat16)
+    state = torch.empty((3, 4, 128, 128), dtype=torch.bfloat16)
+    state_indices = torch.tensor([2], dtype=torch.int32)
+    output = torch.empty_like(q)
+    workspace = SimpleNamespace(_lock=threading.Lock())
+    launches = []
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda _device: SimpleNamespace(cuda_stream=17),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_select_flash_kda_prefill_target", lambda _device: "sm100a"
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda _device: (10, 0)
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_flash_kda_device_sm_count", lambda _device: 148
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_get_stream_workspace", lambda _device: workspace
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_affine_token_offsets",
+        lambda **_kwargs: (0, 128, 256),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_bind_workspace", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_run_generated_affine_route",
+        lambda **kwargs: launches.append(kwargs),
+    )
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("affine fast path materialized general route metadata")
+
+    for name in (
+        "select_bf16_schedule_route",
+        "_fixed_cu_seqlens",
+        "_validate_prefill_seq_order",
+        "_dummy_bf16",
+        "_dummy_i32",
+        "_dummy_i64",
+    ):
+        monkeypatch.setattr(kda_prefill_api, name, unexpected)
+
+    result = kda_prefill_api._run_flash_kda_prefill(
+        q=q,
+        k=q,
+        v=q,
+        g=q,
+        beta=beta,
+        A_log=torch.empty(4, dtype=torch.float32),
+        dt_bias=torch.empty((4, 128), dtype=torch.float32),
+        scale=0.125,
+        initial_state=state,
+        output_final_state=True,
+        lower_bound=-5.0,
+        cu_seqlens=None,
+        output=output,
+        seq_order=None,
+        prefill_workspace=None,
+        state_indices=state_indices,
+        state_checkpoints=None,
+        checkpoint_cu_starts=None,
+        checkpoint_every_n_tokens=0,
+    )
+
+    assert result[0] is output
+    assert result[1] is state
+    assert len(launches) == 1
+    assert launches[0]["state_indices"] is state_indices
+    assert launches[0]["token_offsets"] == (0, 128, 256)
+
+
 def test_generated_affine_launch_observer_scope_is_context_local_and_resets():
     def outer(*_args):
         return None
@@ -1784,6 +2007,7 @@ def test_generated_affine_direct_role_uses_supplied_carriers(monkeypatch):
             workspace=workspace,
             carriers=carriers,
             resolved_module=resolved_module,
+            descriptor_storage=descriptor_storage,
             launch_observer=lambda *args: observed.append(args),
             role="affine_map",
             q=role_q,
