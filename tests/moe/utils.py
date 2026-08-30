@@ -50,18 +50,6 @@ class QuantMode(IntEnum):
     MXINT4_BF16_BF16 = 8
 
 
-class RecordingTuner:
-    """Minimal stage tuner used by unified-MoE factorization tests."""
-
-    def __init__(self):
-        self.calls = []
-
-    def rank_tactics(self, custom_op, runners, tuning_config, inputs, k=1, **kwargs):
-        del tuning_config, kwargs
-        self.calls.append((custom_op, k))
-        return runners[0].get_valid_tactics(inputs, None)[:k]
-
-
 def compute_reference_moe(
     hidden_states: torch.Tensor,
     topk_ids: torch.Tensor,

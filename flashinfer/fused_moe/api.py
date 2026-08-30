@@ -786,7 +786,10 @@ class CuTileBf16Config:
 
 @dataclass(frozen=True)
 class CuTileNvfp4Config:
-    """cuTile NVFP4-weight x NVFP4-activation backend."""
+    """cuTile NVFP4-weight x NVFP4-activation backend.
+
+    Expert parallelism and fused shared experts are not supported.
+    """
 
     @classmethod
     def supported(cls, arch: int) -> bool:

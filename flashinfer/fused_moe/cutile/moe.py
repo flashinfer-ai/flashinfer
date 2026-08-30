@@ -37,10 +37,13 @@ from ...cutile.cutile_common import cached_replace_hints
 from ...tllm_enums import ActivationType
 from ...utils import next_positive_power_of_2
 from .activation import _apply_activation, _validate_activation, launch_activation
+from .indexing import needs_int64_indexing
 
 ConstInt: TypeAlias = ct.Constant[int]
+ConstBool: TypeAlias = ct.Constant[bool]
 
 _PERMUTE_TILE_CAP = 16384
+# A single-CTA histogram avoids multi-stage routing overhead at decode sizes.
 _PERMUTE_SMALL_MAX_ASSIGNMENTS = 24
 _NO_ACTIVATION = -1
 
@@ -80,12 +83,48 @@ def _permute_shape(num_assignments: int, num_experts: int) -> tuple[int, int, in
         max(8, next_positive_power_of_2(num_assignments) // target_chunks),
     )
     if 32 * max_chunk <= num_assignments < 128 * max_chunk:
+        # Bound the histogram count after the initial parallelism ramp.
         chunk = max_chunk
     elif num_assignments >= 128 * max_chunk:
+        # Reintroduce chunks to expose enough CTAs for large routing batches.
         chunk = min(32, max(8, max_chunk // 2))
     num_chunks = max(1, (num_assignments + chunk - 1) // chunk)
     ncp = next_positive_power_of_2(num_chunks)
     return epow2, chunk, ncp
+
+
+def _permute_workspace_shape(
+    max_num_assignments: int, num_experts: int
+) -> tuple[int, int, int]:
+    """Return routing scratch capacities for every shape up to a bucket limit.
+
+    ``_permute_shape`` deliberately changes chunking regimes at large assignment
+    counts and is therefore not monotone. Workspace buckets must cover the
+    largest power-of-two chunk count and slab count on either side of those
+    transitions, rather than only the shape at the bucket capacity.
+    """
+    max_num_assignments = max(1, max_num_assignments)
+    epow2 = next_positive_power_of_2(num_experts)
+    max_chunk = max(8, _PERMUTE_TILE_CAP // epow2)
+    transitions = {1, max_num_assignments}
+
+    power_of_two = 1
+    while power_of_two <= max_num_assignments:
+        transitions.update((power_of_two - 1, power_of_two, power_of_two + 1))
+        power_of_two *= 2
+    for boundary in (32 * max_chunk, 128 * max_chunk):
+        transitions.update((boundary - 1, boundary, boundary + 1))
+
+    max_ncp = 1
+    max_num_slabs = 1
+    for num_assignments in transitions:
+        if not 1 <= num_assignments <= max_num_assignments:
+            continue
+        _, _, ncp = _permute_shape(num_assignments, num_experts)
+        chunks_per_slab = max(1, min(ncp, _PERMUTE_TILE_CAP // epow2))
+        max_ncp = max(max_ncp, ncp)
+        max_num_slabs = max(max_num_slabs, ncp // chunks_per_slab)
+    return epow2, max_ncp, max_num_slabs
 
 
 def allocate_workspace(
@@ -99,11 +138,19 @@ def allocate_workspace(
     block_sizes: Sequence[int],
     device: torch.device,
     allocate_activation_output: bool = True,
+    allocate_gemm1_output: bool | None = None,
+    gemm1_output_rows: int | None = None,
 ) -> Workspace:
     """Allocate graph-stable buffers for one exact token shape and tactic set."""
     if not block_sizes or any(block_size <= 0 for block_size in block_sizes):
         raise ValueError("block_sizes must contain positive integers.")
     num_assignments = num_tokens * top_k
+    if allocate_gemm1_output is None:
+        allocate_gemm1_output = is_gated
+    if gemm1_output_rows is None:
+        gemm1_output_rows = num_assignments
+    if allocate_gemm1_output and gemm1_output_rows < num_assignments:
+        raise ValueError("gemm1_output_rows must cover every routed assignment.")
     max_em = max(
         num_assignments + num_experts * (block_size - 1) for block_size in block_sizes
     )
@@ -112,9 +159,9 @@ def allocate_workspace(
         // block_size
         for block_size in block_sizes
     )
-    epow2, _, ncp = _permute_shape(num_assignments, num_experts)
-    ncp_slab = max(1, min(ncp, _PERMUTE_TILE_CAP // epow2))
-    num_slabs = ncp // ncp_slab
+    epow2, max_ncp, max_num_slabs = _permute_workspace_shape(
+        num_assignments, num_experts
+    )
     int32 = torch.int32
     bf16 = torch.bfloat16
     return Workspace(
@@ -122,13 +169,19 @@ def allocate_workspace(
         block_expert=torch.empty(max_blocks, dtype=int32, device=device),
         num_post_pad=torch.empty(1, dtype=int32, device=device),
         ranks=torch.empty(num_assignments, dtype=int32, device=device),
-        hist=torch.empty(ncp * epow2, dtype=int32, device=device),
-        base=torch.empty(ncp * epow2, dtype=int32, device=device),
+        hist=torch.empty(max_ncp * epow2, dtype=int32, device=device),
+        base=torch.empty(max_ncp * epow2, dtype=int32, device=device),
         pad_off=torch.empty(num_experts + 1, dtype=int32, device=device),
-        slab_tot=torch.empty(num_slabs * epow2, dtype=int32, device=device),
+        slab_tot=torch.empty(max_num_slabs * epow2, dtype=int32, device=device),
         gemm1_out=torch.empty(
-            num_assignments,
-            intermediate_size * (2 if is_gated else 1),
+            (
+                (
+                    gemm1_output_rows,
+                    intermediate_size * (2 if is_gated else 1),
+                )
+                if allocate_gemm1_output
+                else 0
+            ),
             dtype=bf16,
             device=device,
         ),
@@ -430,8 +483,8 @@ def _permute_small(
     )
 
 
-@ct.kernel
-def _grouped_gemm_bf16(
+@ct.function
+def _grouped_gemm_bf16_impl(
     X,
     W,
     SORTED_SLOTS,
@@ -445,6 +498,7 @@ def _grouped_gemm_bf16(
     TILE_N: ConstInt,
     TILE_K: ConstInt,
     ACTIVATION_TYPE: ConstInt,
+    USE_INT64: ConstBool,
 ):
     initial_m_block = ct.bid(0)
     n_block = ct.bid(1)
@@ -467,12 +521,21 @@ def _grouped_gemm_bf16(
                 padding_value=0,
             ).item()
             rows = slots // top_k
+            if USE_INT64:
+                rows = ct.astype(rows, ct.int64)
             accumulator = ct.zeros((TILE_M, TILE_N), dtype=ct.float32)
             for k_tile in range(num_k_tiles):
                 a_indices = ct.reshape(rows, (TILE_M, 1)) * K_IN + ct.reshape(
                     k_tile * TILE_K + k_offsets, (1, TILE_K)
                 )
-                a = ct.gather(X, (a_indices,), padding_value=0, latency=3)
+                # Padded routing slots carry a one-past-the-end row sentinel.
+                a = ct.gather(
+                    X,
+                    (a_indices,),
+                    padding_value=0,
+                    check_bounds=True,
+                    latency=3,
+                )
                 b = ct.reshape(
                     ct.load(
                         W,
@@ -486,6 +549,8 @@ def _grouped_gemm_bf16(
                     (TILE_K, TILE_N),
                 )
                 accumulator = ct.mma(a, b, accumulator)
+            # Materialize BF16 before an optional fused activation so the
+            # fused and unfused paths have the same precision boundary.
             values = ct.astype(accumulator, OUT.dtype)
             if ACTIVATION_TYPE != _NO_ACTIVATION:
                 values = _apply_activation(
@@ -503,23 +568,97 @@ def _grouped_gemm_bf16(
 
 
 @ct.kernel
-def _combine(
+def _grouped_gemm_bf16(
+    X,
+    W,
+    SORTED_SLOTS,
+    BLOCK_EXPERT,
+    NUM_POST_PAD,
+    OUT,
+    top_k,
+    grid_m,
+    K_IN: ConstInt,
+    TILE_M: ConstInt,
+    TILE_N: ConstInt,
+    TILE_K: ConstInt,
+    ACTIVATION_TYPE: ConstInt,
+):
+    _grouped_gemm_bf16_impl(
+        X,
+        W,
+        SORTED_SLOTS,
+        BLOCK_EXPERT,
+        NUM_POST_PAD,
+        OUT,
+        top_k,
+        grid_m,
+        K_IN,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        ACTIVATION_TYPE,
+        False,
+    )
+
+
+@ct.kernel
+def _grouped_gemm_bf16_i64(
+    X: ct.IndexedWithInt64,
+    W: ct.IndexedWithInt64,
+    SORTED_SLOTS,
+    BLOCK_EXPERT,
+    NUM_POST_PAD,
+    OUT: ct.IndexedWithInt64,
+    top_k,
+    grid_m,
+    K_IN: ConstInt,
+    TILE_M: ConstInt,
+    TILE_N: ConstInt,
+    TILE_K: ConstInt,
+    ACTIVATION_TYPE: ConstInt,
+):
+    _grouped_gemm_bf16_impl(
+        X,
+        W,
+        SORTED_SLOTS,
+        BLOCK_EXPERT,
+        NUM_POST_PAD,
+        OUT,
+        top_k,
+        grid_m,
+        K_IN,
+        TILE_M,
+        TILE_N,
+        TILE_K,
+        ACTIVATION_TYPE,
+        True,
+    )
+
+
+@ct.function
+def _combine_impl(
     Y,
     ROUTING_WEIGHTS,
     OUT,
     top_k,
     H: ConstInt,
     TILE_H: ConstInt,
+    USE_INT64: ConstBool,
 ):
-    token = ct.bid(0)
+    token_i32 = ct.bid(0)
     h_tile = ct.bid(1)
-    h_offsets = h_tile * TILE_H + ct.arange(TILE_H, dtype=ct.int32)
-    valid = h_offsets < H
+    h_offsets_i32 = h_tile * TILE_H + ct.arange(TILE_H, dtype=ct.int32)
+    valid = h_offsets_i32 < H
+    token = token_i32
+    h_offsets = h_offsets_i32
+    if USE_INT64:
+        token = ct.astype(ct.full((1,), token_i32, dtype=ct.int32), ct.int64).item()
+        h_offsets = ct.astype(h_offsets_i32, ct.int64)
     accumulator = ct.zeros((TILE_H,), dtype=ct.float32)
     for expert_slot in range(top_k):
         weight = ct.gather(
             ROUTING_WEIGHTS,
-            (ct.full((1,), token * top_k + expert_slot, dtype=ct.int32),),
+            (ct.full((1,), token_i32 * top_k + expert_slot, dtype=ct.int32),),
             padding_value=0.0,
         ).item()
         values = ct.gather(
@@ -536,7 +675,32 @@ def _combine(
     )
 
 
+@ct.kernel
+def _combine(
+    Y,
+    ROUTING_WEIGHTS,
+    OUT,
+    top_k,
+    H: ConstInt,
+    TILE_H: ConstInt,
+):
+    _combine_impl(Y, ROUTING_WEIGHTS, OUT, top_k, H, TILE_H, False)
+
+
+@ct.kernel
+def _combine_i64(
+    Y: ct.IndexedWithInt64,
+    ROUTING_WEIGHTS,
+    OUT: ct.IndexedWithInt64,
+    top_k,
+    H: ConstInt,
+    TILE_H: ConstInt,
+):
+    _combine_impl(Y, ROUTING_WEIGHTS, OUT, top_k, H, TILE_H, True)
+
+
 def _combine_tile_h(num_tokens: int, hidden_size: int) -> int:
+    """Select the cold-L2 combine width without per-shape autotuning."""
     if num_tokens <= 64:
         tile_cap = 128
     elif num_tokens <= 256:
@@ -696,7 +860,12 @@ def _grouped_gemm(
     n = output.shape[1]
     m_blocks = (sorted_slots.shape[0] + block_size - 1) // block_size
     grid_m = max(1, min(m_blocks, num_assignment_rows))
-    kernel = cached_replace_hints(_grouped_gemm_bf16, occupancy=config.occupancy)
+    base_kernel = (
+        _grouped_gemm_bf16_i64
+        if needs_int64_indexing(x, weights, output)
+        else _grouped_gemm_bf16
+    )
+    kernel = cached_replace_hints(base_kernel, occupancy=config.occupancy)
     ct.launch(
         torch.cuda.current_stream(x.device),
         (grid_m, (n + config.tile_n - 1) // config.tile_n),
@@ -790,11 +959,11 @@ def run_moe(
     ct.launch(
         torch.cuda.current_stream(hidden_states.device),
         (num_tokens, (hidden_size + tile_h - 1) // tile_h),
-        _combine,
+        (_combine_i64 if needs_int64_indexing(gemm2_out, output) else _combine),
         (
             gemm2_out.reshape(-1),
             topk_weights.reshape(-1),
-            output.reshape(-1),
+            output.view(-1),
             top_k,
             hidden_size,
             tile_h,

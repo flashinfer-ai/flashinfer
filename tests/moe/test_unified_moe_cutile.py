@@ -26,6 +26,7 @@ from flashinfer.fused_moe import (
     RoutingConfig,
     SwiGLU,
 )
+from flashinfer.fused_moe.runners import _validate_cutile_int32_routing
 from flashinfer.tllm_enums import ActivationType
 
 from .utils import compute_reference_moe
@@ -35,6 +36,14 @@ from .utils import compute_reference_moe
 # (SwiGLU) and NVIDIA-Nemotron-3.5-Lightning-30B-A3B (ReLU2), respectively.
 _QWEN_MOE_SHAPE = (256, 8, 2048, 512)
 _NEMOTRON_MOE_SHAPE = (128, 6, 2688, 1856)
+
+
+def test_cutile_rejects_int64_routing_ranges():
+    _validate_cutile_int32_routing("CuTileTestRunner", (1 << 31) - 2, (1 << 31) - 1)
+    with pytest.raises(
+        NotImplementedError, match=r"fewer than 2\^31 routed and padded assignments"
+    ):
+        _validate_cutile_int32_routing("CuTileTestRunner", 1 << 31, 1 << 31)
 
 
 def _config(
@@ -141,6 +150,120 @@ cutile_bf16_required = pytest.mark.skipif(
 )
 
 
+def _force_cutile_int64(monkeypatch):
+    from flashinfer.fused_moe.cutile import activation, fp4, moe
+
+    for module in (activation, fp4, moe):
+        monkeypatch.setattr(module, "needs_int64_indexing", lambda *_args: True)
+
+
+@cutile_bf16_required
+@pytest.mark.parametrize(
+    ("override", "error"),
+    (
+        (
+            {"execution": ExecutionConfig(enable_pdl=True, tune_max_num_tokens=8)},
+            "does not support PDL",
+        ),
+        (
+            {"finalize": MoEFinalizeConfig(do_finalize=False)},
+            "requires do_finalize=True",
+        ),
+    ),
+)
+def test_cutile_check_support_rejects_unsupported_options(override, error):
+    runner = CuTileBf16Runner(_config(**override), torch.device("cuda"))
+    with pytest.raises(NotImplementedError, match=error):
+        runner.check_support()
+
+
+@cutile_bf16_required
+@pytest.mark.parametrize("invalid_input", ("fp16", "non-contiguous"))
+def test_cutile_pack_inputs_rejects_invalid_hidden_states(invalid_input):
+    device = torch.device("cuda")
+    num_tokens, hidden_size, intermediate_size = 2, 64, 64
+    config = _config(
+        intermediate_size=intermediate_size,
+        tune_max_num_tokens=num_tokens,
+    )
+    w1 = torch.randn(
+        4, 2 * intermediate_size, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    w2 = torch.randn(
+        4, hidden_size, intermediate_size, dtype=torch.bfloat16, device=device
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(
+        "cutile_bf16",
+        CuTileBf16Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=4,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+        ),
+    )
+    if invalid_input == "fp16":
+        hidden_states = torch.randn(
+            num_tokens, hidden_size, dtype=torch.float16, device=device
+        )
+        error = "requires 2D BF16"
+    else:
+        hidden_states = torch.randn(
+            num_tokens, hidden_size * 2, dtype=torch.bfloat16, device=device
+        )[:, ::2]
+        error = "requires contiguous hidden states"
+    topk_ids = torch.zeros(num_tokens, 2, dtype=torch.int32, device=device)
+    topk_weights = torch.full((num_tokens, 2), 0.5, device=device)
+    runner = CuTileBf16Runner(config, device)
+    runner.check_support()
+    runner.build()
+    with pytest.raises((TypeError, ValueError), match=error):
+        runner.pack_inputs(
+            MoEActivationPack(hidden_states, None, topk_ids, topk_weights), weights
+        )
+
+
+@cutile_bf16_required
+@pytest.mark.parametrize(
+    ("num_experts", "top_k", "capacity_tokens"),
+    (
+        (16, 8, 4096),
+        (256, 8, 256),
+        (512, 8, 128),
+    ),
+)
+def test_cutile_workspace_covers_all_permute_shapes_in_bucket(
+    num_experts, top_k, capacity_tokens
+):
+    from flashinfer.fused_moe.cutile import moe
+
+    max_num_assignments = capacity_tokens * top_k
+    epow2, max_ncp, max_num_slabs = moe._permute_workspace_shape(
+        max_num_assignments, num_experts
+    )
+    for num_assignments in range(1, max_num_assignments + 1):
+        actual_epow2, _, ncp = moe._permute_shape(num_assignments, num_experts)
+        chunks_per_slab = max(1, min(ncp, moe._PERMUTE_TILE_CAP // actual_epow2))
+        assert actual_epow2 == epow2
+        assert ncp <= max_ncp
+        assert ncp // chunks_per_slab <= max_num_slabs
+
+    workspace = moe.allocate_workspace(
+        num_tokens=capacity_tokens,
+        hidden_size=64,
+        intermediate_size=64,
+        num_experts=num_experts,
+        top_k=top_k,
+        is_gated=True,
+        block_sizes=(32, 64, 128),
+        device=torch.device("cuda"),
+    )
+    assert workspace.hist.numel() == max_ncp * epow2
+    assert workspace.base.numel() == max_ncp * epow2
+    assert workspace.slab_tot.numel() == max_num_slabs * epow2
+
+
 @cutile_bf16_required
 @pytest.mark.parametrize(
     (
@@ -155,6 +278,15 @@ cutile_bf16_required = pytest.mark.skipif(
         pytest.param(SwiGLU(), 1, 2, 1, 64, 96, id="decode"),
         pytest.param(ReLU2(), 7, 3, 2, 96, 160, id="non-power-of-two-experts"),
         pytest.param(SwiGLU(), 33, 8, 4, 256, 128, id="top-k-4"),
+        pytest.param(
+            SwiGLU(),
+            255,
+            256,
+            8,
+            64,
+            64,
+            id="non-monotonic-workspace-bucket",
+        ),
         pytest.param(SwiGLU(), 1, *_QWEN_MOE_SHAPE, id="qwen-tokens-1"),
         pytest.param(SwiGLU(), 128, *_QWEN_MOE_SHAPE, id="qwen-tokens-128"),
         pytest.param(ReLU2(), 1, *_NEMOTRON_MOE_SHAPE, id="nemotron-tokens-1"),
@@ -235,7 +367,57 @@ def test_cutile_bf16_runner_matches_reference(
         activation.type,
     )
 
-    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=5e-1)
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-1)
+
+
+@cutile_bf16_required
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+def test_cutile_bf16_int64_specialization_matches_int32(activation, monkeypatch):
+    device = torch.device("cuda")
+    num_tokens, hidden_size, intermediate_size = 3, 64, 64
+    config = _config(
+        intermediate_size=intermediate_size,
+        tune_max_num_tokens=num_tokens,
+        activation=activation,
+    )
+    hidden_states = torch.randn(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=device
+    )
+    w1 = torch.randn(
+        4,
+        intermediate_size * (2 if activation.is_gated else 1),
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    w2 = torch.randn(
+        4, hidden_size, intermediate_size, dtype=torch.bfloat16, device=device
+    )
+    ids = torch.arange(6, dtype=torch.int32, device=device).reshape(3, 2) % 4
+    routing_weights = torch.rand(num_tokens, 2, device=device)
+    weights = MoEWeightPack()
+    weights.prepare_for(
+        "cutile_bf16",
+        CuTileBf16Config.prepare_weights(
+            w1,
+            w2,
+            num_local_experts=4,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=activation,
+        ),
+    )
+    runner = CuTileBf16Runner(config, device)
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(
+        MoEActivationPack(hidden_states, None, ids, routing_weights), weights
+    )
+    tactic = runner._fallback_tactic(inputs)
+    expected = runner.forward(inputs, tactic=tactic).clone()
+    _force_cutile_int64(monkeypatch)
+    actual = runner.forward(inputs, tactic=tactic).clone()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @cutile_bf16_required
@@ -285,13 +467,7 @@ def test_cutile_bf16_runner_is_cuda_graph_capturable(activation):
     inputs = runner.pack_inputs(
         MoEActivationPack(hidden_states, None, ids, routing_weights), weights
     )
-    tuned_gemms = {
-        89: (256, 32, 2, 256, 32, 1),
-        90: (256, 64, 2, 256, 64, 2),
-        120: (256, 32, 2, 256, 32, 2),
-        121: (256, 32, 2, 256, 32, 2),
-    }[runner._device_arch]
-    tactic = (128, *tuned_gemms)
+    tactic = runner._fallback_tactic(inputs)
     runner.forward(inputs, tactic=tactic)
     torch.cuda.synchronize()
 
@@ -309,7 +485,7 @@ def test_cutile_bf16_runner_is_cuda_graph_capturable(activation):
         canonical_w2,
         activation.type,
     )
-    torch.testing.assert_close(output, expected, rtol=3e-2, atol=5e-1)
+    torch.testing.assert_close(output, expected, rtol=3e-2, atol=2e-1)
 
 
 @cutile_bf16_required
@@ -369,7 +545,7 @@ def test_cutile_bf16_runs_through_unified_layer(activation):
     )
 
     assert layer.winner_backend == "cutile_bf16"
-    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=5e-1)
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=2e-1)
 
 
 def _nvfp4_config(
@@ -650,6 +826,21 @@ def _make_nvfp4_case(
 
 
 @cutile_nvfp4_required
+@pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+def test_cutile_nvfp4_int64_specialization_matches_int32(activation, monkeypatch):
+    config, activations, weights, _ = _make_nvfp4_case(activation)
+    runner = CuTileNvfp4Runner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(activations, weights)
+    tactic = runner._w4a4_fallback_tactic(inputs)
+    expected = runner.forward(inputs, tactic=tactic).clone()
+    _force_cutile_int64(monkeypatch)
+    actual = runner.forward(inputs, tactic=tactic).clone()
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@cutile_nvfp4_required
 @pytest.mark.parametrize(
     (
         "activation",
@@ -705,6 +896,20 @@ def test_cutile_nvfp4_runner_matches_reference(
         fallback = runner.forward(inputs, tactic=-1).clone()
         torch.testing.assert_close(fallback, actual, rtol=0, atol=0)
     torch.testing.assert_close(actual, expected, rtol=0.25, atol=1.0)
+
+
+@cutile_nvfp4_required
+def test_cutile_nvfp4_runner_rejects_stale_tactics():
+    config, activations, weights, _ = _make_nvfp4_case(ReLU2())
+    runner = CuTileNvfp4Runner(config, torch.device("cuda"))
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(activations, weights)
+
+    with pytest.raises(NotImplementedError, match="GEMM1 tactic is unsupported"):
+        runner.forward(inputs, tactic=(32, 1, 64, 64, 2, 128, 64, 2))
+    with pytest.raises(NotImplementedError, match="GEMM2 tactic is unsupported"):
+        runner.forward(inputs, tactic=(32, 1, 128, 64, 2, 128, 64, 3))
 
 
 @cutile_nvfp4_required

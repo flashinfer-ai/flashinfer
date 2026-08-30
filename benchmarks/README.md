@@ -121,8 +121,6 @@ timing. Without `--autotune`, results are named `cutlass` and `cutile`; autotune
 results use `cutlass_autotune` and `cutile_autotune`.
 
 Representative Qwen3.6 and Nemotron cases are in `samples/sample_testlist.txt`.
-The complete power-of-two token sweep from 1 through 8192 is in
-`samples/unified_moe_comparison.txt`.
 
 *See samples in samples/sample_testlist.txt for various example test flags.*
 Example commands and outputs areas follows

@@ -24,6 +24,7 @@ import torch
 from ...tllm_enums import ActivationType
 from ...utils import next_positive_power_of_2
 from ..api import _CUTILE_SUPPORTED_ACTIVATIONS
+from .indexing import needs_int64_indexing
 
 ConstInt: TypeAlias = ct.Constant[int]
 
@@ -48,8 +49,8 @@ def _validate_activation(activation_type: ActivationType) -> ActivationType:
     return activation_type
 
 
-@ct.kernel
-def _gated_activation(
+@ct.function
+def _gated_activation_impl(
     X,
     OUT,
     activation_type: ConstInt,
@@ -65,7 +66,7 @@ def _gated_activation(
         ct.float32,
     )
     up = ct.astype(
-        ct.gather(X, (row, offsets + I), check_bounds=True, latency=1),
+        ct.gather(X, (row, offsets + I), check_bounds=check_bounds, latency=1),
         ct.float32,
     )
     result = _apply_activation(gate, activation_type) * up
@@ -79,7 +80,31 @@ def _gated_activation(
 
 
 @ct.kernel
-def _ungated_activation(
+def _gated_activation(
+    X,
+    OUT,
+    activation_type: ConstInt,
+    I: ConstInt,
+    TILE_I: ConstInt,
+    NUM_TILES: ConstInt,
+):
+    _gated_activation_impl(X, OUT, activation_type, I, TILE_I, NUM_TILES)
+
+
+@ct.kernel
+def _gated_activation_i64(
+    X: ct.IndexedWithInt64,
+    OUT: ct.IndexedWithInt64,
+    activation_type: ConstInt,
+    I: ConstInt,
+    TILE_I: ConstInt,
+    NUM_TILES: ConstInt,
+):
+    _gated_activation_impl(X, OUT, activation_type, I, TILE_I, NUM_TILES)
+
+
+@ct.function
+def _ungated_activation_impl(
     X,
     OUT,
     activation_type: ConstInt,
@@ -104,6 +129,30 @@ def _ungated_activation(
     )
 
 
+@ct.kernel
+def _ungated_activation(
+    X,
+    OUT,
+    activation_type: ConstInt,
+    I: ConstInt,
+    TILE_I: ConstInt,
+    NUM_TILES: ConstInt,
+):
+    _ungated_activation_impl(X, OUT, activation_type, I, TILE_I, NUM_TILES)
+
+
+@ct.kernel
+def _ungated_activation_i64(
+    X: ct.IndexedWithInt64,
+    OUT: ct.IndexedWithInt64,
+    activation_type: ConstInt,
+    I: ConstInt,
+    TILE_I: ConstInt,
+    NUM_TILES: ConstInt,
+):
+    _ungated_activation_impl(X, OUT, activation_type, I, TILE_I, NUM_TILES)
+
+
 def launch_activation(
     x: torch.Tensor,
     output: torch.Tensor,
@@ -126,7 +175,11 @@ def launch_activation(
 
     tile_i = min(next_positive_power_of_2(intermediate_size), 1024)
     num_tiles = (intermediate_size + tile_i - 1) // tile_i
-    kernel = _gated_activation if activation_type.is_gated else _ungated_activation
+    use_int64 = needs_int64_indexing(x, output)
+    if activation_type.is_gated:
+        kernel = _gated_activation_i64 if use_int64 else _gated_activation
+    else:
+        kernel = _ungated_activation_i64 if use_int64 else _ungated_activation
     ct.launch(
         torch.cuda.current_stream(x.device),
         (x.shape[0], num_tiles),

@@ -88,6 +88,19 @@ _CUTLASS_SEMANTIC_ACTIVATIONS: tuple[type[ActivationConfig], ...] = (
     SiLU,
 )
 
+_CUTILE_INT32_INDEX_LIMIT = 1 << 31
+
+
+def _validate_cutile_int32_routing(
+    runner: str, num_assignments: int, max_padded_assignments: int
+) -> None:
+    """Keep routing IDs and positions within their intentional int32 storage."""
+    if max(num_assignments, max_padded_assignments) >= _CUTILE_INT32_INDEX_LIMIT:
+        raise NotImplementedError(
+            f"{runner} requires fewer than 2^31 routed and padded assignments; "
+            f"got assignments={num_assignments}, padded={max_padded_assignments}."
+        )
+
 
 def _validate_pack_devices(act: MoEActivationPack, runner: str) -> None:
     """Recheck pack tensor placement at the mutable runner boundary."""
@@ -2083,7 +2096,6 @@ class CuTileBf16Runner(MoERunner):
     supported_activation_classes = (SwiGLU, ReLU2)
     supports_expert_parallelism = False
     _block_sizes: ClassVar[tuple[int, ...]] = (32, 64, 128)
-    _default_block_size: ClassVar[int] = 32
     _num_top_tactics_per_stage: ClassVar[int] = 2
     _supported_archs: ClassVar[tuple[int, ...]] = _CUTILE_BF16_ARCHS
     _precision_name: ClassVar[str] = "BF16"
@@ -2332,7 +2344,7 @@ class CuTileBf16Runner(MoERunner):
         num_experts = self.config.routing.num_experts
         rows_per_expert = (num_assignments + num_experts - 1) // num_experts
         prefill_threshold = {89: 256, 90: 32, 120: 128, 121: 128}[self._device_arch]
-        return (32, 64) if rows_per_expert < prefill_threshold else (64, 128)
+        return (32,) if rows_per_expert < prefill_threshold else (64,)
 
     def _gated_block_size(self, num_assignments: int) -> int:
         num_experts = self.config.routing.num_experts
@@ -2387,6 +2399,16 @@ class CuTileBf16Runner(MoERunner):
         if not w1.is_contiguous() or not w2.is_contiguous():
             raise ValueError("cuTile BF16 prepared weights must be contiguous.")
 
+        capacity = map_to_hybrid_bucket(
+            num_tokens, self.config.execution.tune_max_num_tokens
+        )
+        num_assignments = capacity * self.config.routing.top_k
+        max_padded_assignments = num_assignments + num_experts * (
+            max(self._block_sizes) - 1
+        )
+        _validate_cutile_int32_routing(
+            type(self).__name__, num_assignments, max_padded_assignments
+        )
         self._configure_tuning(num_tokens, hidden_size)
         return [
             hidden_states.new_empty((num_tokens, hidden_size)),
@@ -2865,6 +2887,16 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
         ):
             raise ValueError("cuTile NVFP4 prepared weights must be contiguous.")
 
+        capacity = map_to_hybrid_bucket(
+            num_tokens, self.config.execution.tune_max_num_tokens
+        )
+        num_assignments = capacity * self.config.routing.top_k
+        max_padded_assignments = num_assignments + num_experts * (
+            max(self._block_sizes) - 1
+        )
+        _validate_cutile_int32_routing(
+            type(self).__name__, num_assignments, max_padded_assignments
+        )
         self._configure_tuning(num_tokens, hidden_size)
         return [
             hidden_states.new_empty((num_tokens, hidden_size)),
@@ -2914,6 +2946,21 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
                 f"cuTile NVFP4 block size must be one of {self._block_sizes}, "
                 f"got {block_size}."
             )
+        for stage, config in (
+            (1, (g1_n, g1_k, g1_occ)),
+            (2, (g2_n, g2_k, g2_occ)),
+        ):
+            problem = self._w4a4_gemm_problem(
+                inputs,
+                stage=stage,
+                block_size=block_size,
+                fuse_gemm1=bool(fuse_gemm1) if stage == 1 else False,
+            )
+            reason = _cutile_w4a4_config_rejection_reason(problem, config)
+            if reason is not None:
+                raise NotImplementedError(
+                    f"CuTileNvfp4Runner GEMM{stage} tactic is unsupported: {reason}."
+                )
         hidden_size = inputs[1].shape[1]
         self._ensure_workspace(inputs[1].shape[0], hidden_size)
         return self._kernel_module.run_moe(
