@@ -32,6 +32,19 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNNER = REPO_ROOT / "scripts" / "unit_test_runner.py"
 
 
+def _require_external_tmp(tmp_path: Path) -> None:
+    """Skip when the pytest temp directory resolves inside the repository.
+
+    ``runner._pytest_root`` anchors in-repository test paths at the repository
+    root, so a temporary suite that physically lives inside the checkout
+    collects with repository-relative node IDs instead of the suite-relative
+    ones these tests assert. That happens on hosts whose system temp directory
+    falls back into the checkout (see issue #4498).
+    """
+    if tmp_path.resolve().is_relative_to(REPO_ROOT):
+        pytest.skip("system temp directory is inside the repository")
+
+
 def _queue_test_unit(identifier: str) -> Unit:
     return Unit(
         id=identifier,
@@ -372,6 +385,7 @@ def test_cli_summary_ignores_unscoped_start_time_environment(tmp_path: Path) -> 
 
 
 def test_optional_timing_files_use_first_matching_rows(tmp_path: Path) -> None:
+    _require_external_tmp(tmp_path)
     suite = tmp_path / "suite"
     suite.mkdir()
     source = suite / "test_sample.py"
@@ -508,6 +522,7 @@ def test_slow_collection_reports_a_live_heartbeat(
 
 
 def test_collection_isolates_sm90_pull_multirank_modules(tmp_path: Path) -> None:
+    _require_external_tmp(tmp_path)
     suite = tmp_path / "suite"
     suite.mkdir()
     sm100 = suite / "sm100"
@@ -568,6 +583,7 @@ def test_sm90():
 def test_pytest_root_is_stable_for_repository_and_external_scopes(
     tmp_path: Path,
 ) -> None:
+    _require_external_tmp(tmp_path)
     suite = tmp_path / "suite"
     suite.mkdir()
     test_file = suite / "test_sample.py"
@@ -579,6 +595,7 @@ def test_pytest_root_is_stable_for_repository_and_external_scopes(
 
 
 def test_collection_preserves_external_pytest_config(tmp_path: Path) -> None:
+    _require_external_tmp(tmp_path)
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "pytest.ini").write_text(
@@ -1041,6 +1058,7 @@ def test_plan_run_and_completed_reuse_publish_resumable_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _require_external_tmp(tmp_path)
     # Pytest 9 may otherwise inherit the repository root for this external
     # temporary suite, which used to leak pytest-of-*/... prefixes into node IDs.
     monkeypatch.setenv("PYTEST_ADDOPTS", f"--rootdir={REPO_ROOT}")
@@ -1566,6 +1584,7 @@ def test_terminal_timeout_policies_synthesize_junit(
 def test_timeout_policy_resume_starts_a_new_attempt_without_fake_results(
     tmp_path: Path,
 ) -> None:
+    _require_external_tmp(tmp_path)
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "test_slow.py").write_text(
@@ -1779,6 +1798,7 @@ def test_missing_test_path_fails_closed(tmp_path: Path) -> None:
 
 
 def test_collect_nodes_unions_multiple_directories(tmp_path: Path) -> None:
+    _require_external_tmp(tmp_path)
     first = tmp_path / "a"
     second = tmp_path / "b"
     first.mkdir()
