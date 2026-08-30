@@ -293,6 +293,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
             tuple, tuple[torch.Tensor, torch.Tensor, int]
         ] = {}
         self._affine_buffers: dict[str, torch.Tensor] = {}
+        self._affine_map_identity_data_ptr: Optional[int] = None
         self._packed_metadata_lock = threading.Lock()
         self._packed_metadata_tensor: Optional[torch.Tensor] = None
         self._packed_metadata_signature: Optional[_PackedMetadataSignature] = None
@@ -4126,6 +4127,62 @@ def _affine_beta_tma_source(
     )
 
 
+@functools.cache
+def _flash_kda_generated_affine_direct_selector_key(
+    *,
+    target: "FlashKDATarget",
+    role: str,
+    num_heads: int,
+    num_sequences: int,
+    uniform_sequences: bool,
+    max_sequence_length: int,
+    pair_packed_beta: bool,
+    external_state_is_fp32: bool,
+) -> dict[str, object]:
+    state_dtype_is_fp32 = role != "affine_map"
+    specialization = _flash_kda_generated_direct_specialization(
+        target=target,
+        route=_FLASH_KDA_ROUTE_AFFINE_M128,
+        num_heads=num_heads,
+        num_sequences=num_sequences,
+        uniform_sequences=uniform_sequences,
+        max_sequence_length=max_sequence_length,
+        serving_native_abi=False,
+        unbounded_softplus=False,
+        checkpoint_every_n_tokens=0,
+        pair_packed_beta=pair_packed_beta,
+        state_dtype_is_fp32=state_dtype_is_fp32,
+        n32_ft_slab=True,
+        pdl_wait_initial_state_f32=role
+        in (
+            "affine_map",
+            "affine_correction",
+        ),
+        pdl_publish_final_state=role in ("affine_main", "affine_map"),
+        affine_main_indexed_initial=(role == "affine_main" and external_state_is_fp32),
+    )
+    return _make_flash_kda_generated_selector_key(
+        target=target,
+        route=_FLASH_KDA_ROUTE_AFFINE_M128,
+        route_role=role,
+        state_mode="bf16" if role == "affine_map" else "fp32",
+        family_specialization=specialization,
+    )
+
+
+@functools.cache
+def _flash_kda_generated_affine_scan_selector_key(
+    *, target: "FlashKDATarget"
+) -> dict[str, object]:
+    return _make_flash_kda_generated_selector_key(
+        target=target,
+        route=_FLASH_KDA_ROUTE_AFFINE_M128,
+        route_role="affine_scan",
+        state_mode="none",
+        family_specialization=_flash_kda_generated_affine_scan_specialization(),
+    )
+
+
 def _run_generated_affine_direct_role(
     *,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
@@ -4160,35 +4217,16 @@ def _run_generated_affine_direct_role(
     num_sequences = cu_seqlens.numel() - 1
     if len(sequence_lengths) != num_sequences:
         raise ValueError("affine role lengths must match its sequence offsets")
-    state_dtype_is_fp32 = role != "affine_map"
     pair_packed_beta = beta_tma.ndim == 2 and beta_tma.shape[-1] == 24
-    specialization = _flash_kda_generated_direct_specialization(
+    selector_key = _flash_kda_generated_affine_direct_selector_key(
         target=target,
-        route=_FLASH_KDA_ROUTE_AFFINE_M128,
+        role=role,
         num_heads=num_heads,
         num_sequences=num_sequences,
         uniform_sequences=len(set(sequence_lengths)) == 1,
         max_sequence_length=max(sequence_lengths),
-        serving_native_abi=False,
-        unbounded_softplus=False,
-        checkpoint_every_n_tokens=0,
         pair_packed_beta=pair_packed_beta,
-        state_dtype_is_fp32=state_dtype_is_fp32,
-        n32_ft_slab=True,
-        pdl_wait_initial_state_f32=role
-        in (
-            "affine_map",
-            "affine_correction",
-        ),
-        pdl_publish_final_state=role in ("affine_main", "affine_map"),
-        affine_main_indexed_initial=(role == "affine_main" and external_state_is_fp32),
-    )
-    selector_key = _make_flash_kda_generated_selector_key(
-        target=target,
-        route=_FLASH_KDA_ROUTE_AFFINE_M128,
-        route_role=role,
-        state_mode="bf16" if role == "affine_map" else "fp32",
-        family_specialization=specialization,
+        external_state_is_fp32=external_state_is_fp32,
     )
     metadata, module = _get_flash_kda_generated_module(selector_key)
     descriptor_storage = _affine_descriptor_storage(
@@ -4329,7 +4367,13 @@ def _run_generated_affine_route(
         device=device,
         shape=tail_state_shape,
         dtype=torch.bfloat16,
+        zero_on_allocate=True,
     )
+    # The map kernel only reads this buffer. Initialize each backing allocation
+    # once; smaller views preserve the same contiguous sequence of identities.
+    if workspace._affine_map_identity_data_ptr != map_identity.data_ptr():
+        map_identity.diagonal(dim1=-2, dim2=-1).fill_(1)
+        workspace._affine_map_identity_data_ptr = map_identity.data_ptr()
     map_state = _affine_workspace_buffer(
         workspace=workspace,
         name="map_state_bfloat16",
@@ -4388,9 +4432,6 @@ def _run_generated_affine_route(
         dtype=torch.int64,
     )
     state_indices_i64.copy_(state_indices)
-    map_identity.zero_()
-    map_identity.diagonal(dim1=-2, dim2=-1).fill_(1)
-    zero_v.zero_()
 
     split_cu_seqlens = _cached_tensor(
         ("affine_split_cu", *_stream_cache_key(device), token_offsets),
@@ -4420,7 +4461,8 @@ def _run_generated_affine_route(
             dtype=torch.bfloat16,
         )
         torch.index_select(initial_state, 0, state_indices_i64, out=selected_initial)
-        main_initial.zero_()
+        # The direct main kernel does not mutate its initial-state buffer, so
+        # allocation-time zeros remain valid for every slot after slot zero.
         main_initial[0].copy_(selected_initial[0])
         main_initial_arg = main_initial
         main_use_indices = False
@@ -4512,13 +4554,7 @@ def _run_generated_affine_route(
         stream_ptr=stream_ptr,
         capturing=capturing,
     )
-    scan_key = _make_flash_kda_generated_selector_key(
-        target=target,
-        route=_FLASH_KDA_ROUTE_AFFINE_M128,
-        route_role="affine_scan",
-        state_mode="none",
-        family_specialization=_flash_kda_generated_affine_scan_specialization(),
-    )
+    scan_key = _flash_kda_generated_affine_scan_selector_key(target=target)
     _scan_metadata, scan_module = _get_flash_kda_generated_module(scan_key)
     scan_module.run(
         main_final,

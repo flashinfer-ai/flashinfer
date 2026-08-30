@@ -1505,6 +1505,46 @@ def test_generated_prefill_selector_key_fails_closed():
         )
 
 
+def test_generated_affine_selector_construction_is_cached(monkeypatch):
+    direct_cache = kda_prefill_api._flash_kda_generated_affine_direct_selector_key
+    scan_cache = kda_prefill_api._flash_kda_generated_affine_scan_selector_key
+    direct_cache.cache_clear()
+    scan_cache.cache_clear()
+    calls = []
+
+    def fake_selector(**selector_fields):
+        calls.append(selector_fields)
+        return selector_fields
+
+    monkeypatch.setattr(
+        kda_prefill_api, "_make_flash_kda_generated_selector_key", fake_selector
+    )
+    direct_kwargs = {
+        "target": "sm103a",
+        "role": "affine_map",
+        "num_heads": 4,
+        "num_sequences": 4,
+        "uniform_sequences": True,
+        "max_sequence_length": 16384,
+        "pair_packed_beta": False,
+        "external_state_is_fp32": False,
+    }
+    try:
+        first = direct_cache(**direct_kwargs)
+        assert direct_cache(**direct_kwargs) is first
+        assert len(calls) == 1
+
+        direct_cache(**{**direct_kwargs, "max_sequence_length": 32768})
+        assert len(calls) == 2
+
+        scan = scan_cache(target="sm103a")
+        assert scan_cache(target="sm103a") is scan
+        assert len(calls) == 3
+    finally:
+        direct_cache.cache_clear()
+        scan_cache.cache_clear()
+
+
 def test_generated_prefill_runtime_specialization_helpers():
     assert not kda_prefill_api._flash_kda_generated_serving_native_abi(
         use_state_indices=False,
