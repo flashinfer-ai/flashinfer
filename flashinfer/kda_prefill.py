@@ -4677,7 +4677,11 @@ def _run_generated_affine_direct_role(
             f"affine {role} descriptors are not warmed for CUDA graph capture"
         )
     prepare_descriptors = 0 if capturing else int(warmed_signature != signature)
-    empty_state = carriers.empty_bf16 if role == "affine_map" else carriers.empty_f32
+    empty_state = (
+        carriers.empty_f32
+        if initial_state.dtype == torch.float32
+        else carriers.empty_bf16
+    )
     try:
         module = _generated_affine_module_for_launch(resolved_module, launch_observer)
         module.run(

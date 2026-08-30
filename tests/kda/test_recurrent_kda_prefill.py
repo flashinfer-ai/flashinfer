@@ -2026,14 +2026,14 @@ def test_generated_affine_direct_role_uses_supplied_carriers(monkeypatch):
     dependency = torch.empty((1, 4, 128, 128), dtype=torch.float32)
     observed = []
 
-    def run(role_q, *, capturing):
+    def run(role_q, *, capturing, role="affine_map", role_state=state):
         kda_prefill_api._run_generated_affine_direct_role(
             workspace=workspace,
             carriers=carriers,
             resolved_module=resolved_module,
             descriptor_storage=descriptor_storage,
             launch_observer=lambda *args: observed.append(args),
-            role="affine_map",
+            role=role,
             q=role_q,
             k=role_q,
             v=role_q,
@@ -2045,9 +2045,9 @@ def test_generated_affine_direct_role_uses_supplied_carriers(monkeypatch):
             cu_seqlens=torch.tensor([0, 32], dtype=torch.int64),
             seq_order=torch.tensor([0], dtype=torch.int32),
             state_indices=carriers.dummy_i32,
-            initial_state=state,
+            initial_state=role_state,
             out=role_q,
-            final_state=state,
+            final_state=role_state,
             initial_state_f32_dependency=dependency,
             sequence_lengths=(32,),
             num_heads=4,
@@ -2074,10 +2074,16 @@ def test_generated_affine_direct_role_uses_supplied_carriers(monkeypatch):
     assert args[31] is carriers.empty_u8
     assert args[32] is descriptor_storage
 
+    run(q, capturing=False, role="affine_main")
+    assert module.calls[1][14] is carriers.empty_bf16
+    fp32_state = torch.empty((1, 4, 128, 128), dtype=torch.float32)
+    run(q, capturing=False, role="affine_main", role_state=fp32_state)
+    assert module.calls[2][14] is carriers.empty_f32
+
     with pytest.raises(RuntimeError, match="descriptors are not warmed"):
         run(torch.empty_like(q), capturing=True)
-    assert observed == [("affine_map", selector_key, metadata, module)]
-    assert len(module.calls) == 1
+    assert observed == [("affine_map", selector_key, metadata, module)] * 3
+    assert len(module.calls) == 3
 
 
 def test_generated_prefill_runtime_specialization_helpers():
