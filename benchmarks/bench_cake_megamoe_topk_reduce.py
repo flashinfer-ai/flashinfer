@@ -7,18 +7,24 @@ kernel and not a claimed historical FlashInfer performance baseline.
 
 ``--baseline vendored-cutedsl`` selects the exact vendored implementation at
 ``flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py``.
-That module is not a stable public API. Import or compilation failure is fatal;
-the benchmark never substitutes the PyTorch path while labelling it CuTeDSL.
+It preserves the issue denominator's fixed C=4096 workspace for every live-token
+shape; preparation, zero-fill, and compilation remain outside timing. That module
+is not a stable public API. Source drift, import failure, or compilation failure
+is fatal; the benchmark never substitutes the PyTorch path while labelling it
+CuTeDSL.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
+import inspect
 import json
 import math
 import statistics
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -40,10 +46,14 @@ _SHAPES = (
 )
 _HIDDEN_SIZE = 4096
 _TOP_K = 6
+_BASELINE_CAPACITY = 4096
 _ATOL = 1e-2
 _RTOL = 1e-2
 _CUTEDSL_SOURCE = (
     "flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py"
+)
+_CUTEDSL_SOURCE_SHA256 = (
+    "d7d1fc2361c30dcd8a37269edda27e75953dadf396014e47a3c3cbd7a2551184"
 )
 
 
@@ -105,10 +115,8 @@ def _make_ordered_pytorch_runner(
 
 def _make_vendored_cutedsl_runner(
     partials: torch.Tensor,
-    out: torch.Tensor,
-    num_tokens: int,
-) -> Callable[[torch.Tensor, torch.Tensor], None]:
-    """Compile the pinned vendored CuTeDSL reducer, with no fallback path."""
+) -> tuple[Callable[[torch.Tensor, torch.Tensor], None], torch.Tensor]:
+    """Prepare the pinned fixed-C=4096 CuTeDSL denominator."""
 
     try:
         import cuda.bindings.driver as cuda_driver
@@ -129,10 +137,32 @@ def _make_vendored_cutedsl_runner(
             "no fallback was used"
         ) from error
 
-    partials_view = partials[:num_tokens]
-    out_view = out[:num_tokens]
-    partials_cute = cutlass_torch.from_dlpack(partials_view, assumed_align=16)
-    out_cute = cutlass_torch.from_dlpack(out_view, assumed_align=16)
+    source_path = inspect.getsourcefile(TopkReduce)
+    if source_path is None:
+        raise RuntimeError(f"cannot locate vendored CuTeDSL source {_CUTEDSL_SOURCE}")
+    actual_source_sha256 = hashlib.sha256(Path(source_path).read_bytes()).hexdigest()
+    if actual_source_sha256 != _CUTEDSL_SOURCE_SHA256:
+        raise RuntimeError(
+            f"vendored CuTeDSL baseline {_CUTEDSL_SOURCE} changed: expected "
+            f"{_CUTEDSL_SOURCE_SHA256}, got {actual_source_sha256}"
+        )
+
+    # The production denominator owns a fixed full-capacity workspace. Keeping
+    # this physical shape is essential: slicing to num_tokens asks CuTeDSL to
+    # compile a smaller shape-specialized kernel and is not the issue baseline.
+    baseline_partials = torch.zeros(
+        (_BASELINE_CAPACITY, _TOP_K, _HIDDEN_SIZE),
+        dtype=torch.bfloat16,
+        device=partials.device,
+    )
+    baseline_partials[: partials.shape[0]].copy_(partials)
+    baseline_out = torch.empty(
+        (_BASELINE_CAPACITY, _HIDDEN_SIZE),
+        dtype=torch.bfloat16,
+        device=partials.device,
+    )
+    partials_cute = cutlass_torch.from_dlpack(baseline_partials, assumed_align=16)
+    out_cute = cutlass_torch.from_dlpack(baseline_out, assumed_align=16)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
     kernel = TopkReduce(
         _HIDDEN_SIZE,
@@ -168,7 +198,7 @@ def _make_vendored_cutedsl_runner(
             stream=cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
         )
 
-    return run
+    return run, baseline_out
 
 
 def _median_cupti_ms(
@@ -226,15 +256,20 @@ def _run_shape(
     if baseline == "ordered-pytorch":
         baseline_label = "ordered_pytorch_fp32_k0_to_k5"
         baseline_runner = _make_ordered_pytorch_runner(num_tokens)
+        baseline_validation_out = out
         baseline_source = "PyTorch eager: six ordered FP32 accumulations + BF16 store"
     else:
-        baseline_label = "vendored_cutedsl_topk_reduce_fixed_path"
-        baseline_runner = _make_vendored_cutedsl_runner(partials, out, num_tokens)
+        baseline_label = "vendored_cutedsl_topk_reduce_fixed_c4096"
+        baseline_runner, baseline_validation_out = _make_vendored_cutedsl_runner(
+            partials
+        )
         baseline_source = _CUTEDSL_SOURCE
 
     baseline_runner(partials, out)
     torch.cuda.synchronize()
-    torch.testing.assert_close(out[:num_tokens], expected, atol=_ATOL, rtol=_RTOL)
+    torch.testing.assert_close(
+        baseline_validation_out[:num_tokens], expected, atol=_ATOL, rtol=_RTOL
+    )
     baseline_ms = _median_cupti_ms(
         baseline_runner, partials, out, dry_run_iters, repeat_iters
     )
@@ -244,6 +279,12 @@ def _run_shape(
         "native_reducer_median_ms": native_ms,
         "baseline_label": baseline_label,
         "baseline_source": baseline_source,
+        "baseline_source_sha256": (
+            _CUTEDSL_SOURCE_SHA256 if baseline == "vendored-cutedsl" else None
+        ),
+        "baseline_capacity": (
+            _BASELINE_CAPACITY if baseline == "vendored-cutedsl" else num_tokens
+        ),
         "baseline_median_ms": baseline_ms,
         "native_speedup_vs_baseline": baseline_ms / native_ms,
     }
