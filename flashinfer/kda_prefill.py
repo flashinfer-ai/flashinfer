@@ -28,7 +28,7 @@ import heapq
 import math
 import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, Literal, Optional, Protocol
 
 import torch
 
@@ -147,12 +147,16 @@ class _CakeKDAAffinePlan:
         return len(self.token_offsets) - 1
 
 
+class _CakeKDAAffineModule(Protocol):
+    def run(self, *args: object) -> object: ...
+
+
 @dataclass(frozen=True)
 class _CakeKDAAffineModuleBundle:
-    main: object
-    map: object
-    scan: object
-    correction: object
+    main: _CakeKDAAffineModule
+    map: _CakeKDAAffineModule
+    scan: _CakeKDAAffineModule
+    correction: _CakeKDAAffineModule
 
 
 @dataclass(frozen=True)
@@ -647,10 +651,7 @@ def _select_cake_kda_affine_plan(
     chunks_per_part = (chunks + candidate_parts - 1) // candidate_parts
     chunk_offsets = tuple(
         sorted(
-            {
-                min(part * chunks_per_part, chunks)
-                for part in range(candidate_parts + 1)
-            }
+            {min(part * chunks_per_part, chunks) for part in range(candidate_parts + 1)}
         )
     )
     if len(chunk_offsets) < 3:
@@ -661,8 +662,7 @@ def _select_cake_kda_affine_plan(
     return _CakeKDAAffinePlan(
         target=target,
         token_offsets=tuple(
-            chunk_offset * _FLASH_KDA_M128_CHUNK
-            for chunk_offset in chunk_offsets
+            chunk_offset * _FLASH_KDA_M128_CHUNK for chunk_offset in chunk_offsets
         ),
     )
 
@@ -849,9 +849,7 @@ def _cake_kda_affine_launch_plan(
         split_cu_seqlens=split_cu_seqlens,
         tail_cu_seqlens=tail_cu_seqlens,
         main_seq_order=_identity_seq_order(device=device, num_sequences=num_parts),
-        tail_seq_order=_identity_seq_order(
-            device=device, num_sequences=num_parts - 1
-        ),
+        tail_seq_order=_identity_seq_order(device=device, num_sequences=num_parts - 1),
         main_descriptor_storage=buffer(
             "affine_main_descriptors",
             (_FLASH_KDA_DESCRIPTOR_STORAGE_BYTES,),
@@ -879,7 +877,7 @@ def _cake_kda_affine_launch_plan(
 def _run_cake_kda_affine_direct_role(
     *,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
-    module: object,
+    module: _CakeKDAAffineModule,
     role: Literal["main", "map", "correction"],
     q: torch.Tensor,
     k: torch.Tensor,
@@ -905,9 +903,7 @@ def _run_cake_kda_affine_direct_role(
     stream_ptr: int,
     capturing: bool,
 ) -> None:
-    signature = _descriptor_signature(
-        q=q, k=k, v=v, g=g, beta_tma=beta_tma, out=out
-    )
+    signature = _descriptor_signature(q=q, k=k, v=v, g=g, beta_tma=beta_tma, out=out)
     signature_key = f"cake_affine:{role}"
     warmed_signature = workspace._descriptor_signatures.get(signature_key)
     if capturing and warmed_signature != signature:
@@ -3279,6 +3275,7 @@ def _run_flash_kda_prefill(
             if capturing and explicit_workspace:
                 workspace._captured = True
             return (out_buf, returned_state if output_final_state else None)
+        assert variant != "cake_affine_m128"
         if variant == "m128_h12_long":
             pair_packed_beta_tma = _pair_packed_beta_tma_source(beta)
             if pair_packed_beta_tma is None:

@@ -67,8 +67,7 @@ def test_cake_kda_affine_manifest_controls_export_availability():
     csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
     manifest = json.loads(
         (
-            csrc_dir
-            / "cake_kda_bf16_affine_unbounded_softplus_import_manifest.json"
+            csrc_dir / "cake_kda_bf16_affine_unbounded_softplus_import_manifest.json"
         ).read_text()
     )
     cake_kda_jit_api.get_cake_kda_affine_module_specs.cache_clear()
@@ -138,7 +137,7 @@ def test_cake_kda_affine_selector_builds_exact_blackwell_partition(
     assert all(offset % 32 == 0 for offset in plan.token_offsets)
     assert all(
         left < right
-        for left, right in zip(plan.token_offsets, plan.token_offsets[1:])
+        for left, right in zip(plan.token_offsets, plan.token_offsets[1:], strict=True)
     )
 
 

@@ -430,8 +430,8 @@ def _selector_binding(module: ProducerModule, body_name: str) -> bytes:
         + f"#define FLASHINFER_CAKE_KDA_AFFINE_SMEM_BYTES {module.smem_bytes}\n"
         + f"#define FLASHINFER_CAKE_KDA_AFFINE_USE_PDL {int(module.use_pdl)}\n"
         + f"#define FLASHINFER_CAKE_KDA_AFFINE_ROLE {ROLE_MACROS[module.role]}\n"
-        + "#define FLASHINFER_CAKE_KDA_AFFINE_ARG_PLAN_SHA256 "
-        + f'"{module.arg_plan_sha256}"\n'
+        + "#define FLASHINFER_CAKE_KDA_AFFINE_ARG_PLAN_SHA256 \\\n"
+        + f'  "{module.arg_plan_sha256}"\n'
         + f'#include "{header}"\n'
     ).encode()
 

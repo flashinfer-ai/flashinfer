@@ -134,10 +134,9 @@ def _require_affine_manifest(condition: bool, message: str) -> None:
         raise ValueError(f"invalid Cake KDA affine import manifest: {message}")
 
 
-def _resolve_affine_manifest_file(
-    csrc_dir: Path, value: object, label: str
-) -> Path:
+def _resolve_affine_manifest_file(csrc_dir: Path, value: object, label: str) -> Path:
     _require_affine_manifest(isinstance(value, str) and bool(value), f"{label} missing")
+    assert isinstance(value, str)
     relative = PurePosixPath(value)
     _require_affine_manifest(
         not relative.is_absolute()
@@ -203,12 +202,12 @@ def get_cake_kda_affine_module_specs() -> tuple[CakeKDAAffineModuleSpec, ...]:
         return ()
     _require_affine_manifest(status == "complete", f"unsupported status {status!r}")
 
-    expected = {
+    expected: set[tuple[str, CakeKDAAffineRole]] = {
         (target, role)
         for target in _CAKE_KDA_NVCC_FLAGS
         for role in CAKE_KDA_AFFINE_ROLES
     }
-    observed: set[tuple[str, str]] = set()
+    observed: set[tuple[str, CakeKDAAffineRole]] = set()
     specs: list[CakeKDAAffineModuleSpec] = []
     for index, item in enumerate(modules):
         label = f"modules[{index}]"
@@ -218,7 +217,9 @@ def get_cake_kda_affine_module_specs() -> tuple[CakeKDAAffineModuleSpec, ...]:
         _require_affine_manifest(target in _CAKE_KDA_NVCC_FLAGS, f"{label}.target")
         _require_affine_manifest(role in CAKE_KDA_AFFINE_ROLES, f"{label}.role")
         key = (target, role)
-        _require_affine_manifest(key not in observed, f"duplicate module {target}/{role}")
+        _require_affine_manifest(
+            key not in observed, f"duplicate module {target}/{role}"
+        )
         observed.add(key)
 
         module_ident = item.get("module_ident")
@@ -296,9 +297,7 @@ def get_cake_kda_affine_module_spec(
     )
 
 
-def get_cake_kda_affine_uri(
-    target: CakeKDATarget, role: CakeKDAAffineRole
-) -> str:
+def get_cake_kda_affine_uri(target: CakeKDATarget, role: CakeKDAAffineRole) -> str:
     """Return the exact target-and-role cache identity from the sealed export."""
 
     spec = get_cake_kda_affine_module_spec(target, role)
@@ -331,9 +330,7 @@ def gen_cake_kda_affine_module(
 
 
 @functools.cache
-def load_cake_kda_affine_module(
-    target: CakeKDATarget, role: CakeKDAAffineRole
-):
+def load_cake_kda_affine_module(target: CakeKDATarget, role: CakeKDAAffineRole):
     """Build or load one verified affine target-and-role module."""
 
     module = gen_cake_kda_affine_module(target, role).build_and_load()
