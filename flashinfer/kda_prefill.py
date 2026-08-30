@@ -119,7 +119,7 @@ _FLASH_KDA_GENERATED_SPECIALIZATION_FIELDS = {
     "direct_m128": (
         "chunk",
         "serving_native_abi",
-        "unbounded_softplus",
+        "gate_kind",
         "checkpoint_tma",
         "pair_packed_beta",
         "scalar_beta",
@@ -132,6 +132,7 @@ _FLASH_KDA_GENERATED_SPECIALIZATION_FIELDS = {
         "pdl_wait_initial_state_f32",
         "pdl_publish_final_state",
         "affine_main_indexed_initial",
+        "affine_main_indexed_initial_bf16",
     ),
     "vtile_m128": (
         "full_n32_chunks",
@@ -293,7 +294,6 @@ class _GeneratedAffineLaunchPlan:
     tail_tokens: int
     main_lengths: tuple[int, ...]
     tail_lengths: tuple[int, ...]
-    main_initial: torch.Tensor
     main_final: torch.Tensor
     map_identity: torch.Tensor
     map_state: torch.Tensor
@@ -304,7 +304,6 @@ class _GeneratedAffineLaunchPlan:
     map_out: torch.Tensor
     correction_out: torch.Tensor
     state_indices_i64: torch.Tensor
-    selected_initial: Optional[torch.Tensor]
     final_external: Optional[torch.Tensor]
     main_beta_padded: Optional[torch.Tensor]
     map_beta_padded: Optional[torch.Tensor]
@@ -2658,7 +2657,7 @@ def _flash_kda_generated_direct_specialization(
     uniform_sequences: bool,
     max_sequence_length: int,
     serving_native_abi: bool,
-    unbounded_softplus: bool,
+    gate_kind: str,
     checkpoint_every_n_tokens: int,
     pair_packed_beta: bool,
     state_dtype_is_fp32: bool,
@@ -2666,6 +2665,7 @@ def _flash_kda_generated_direct_specialization(
     pdl_wait_initial_state_f32: bool = False,
     pdl_publish_final_state: bool = False,
     affine_main_indexed_initial: bool = False,
+    affine_main_indexed_initial_bf16: bool = False,
 ) -> dict[str, object]:
     """Compute the direct-family specialization from runtime-resolved facts."""
 
@@ -2681,6 +2681,15 @@ def _flash_kda_generated_direct_specialization(
         raise ValueError("direct specialization requires positive resolved extents")
     if checkpoint_every_n_tokens < 0:
         raise ValueError("checkpoint_every_n_tokens must be nonnegative")
+    if gate_kind not in ("lower_bound", "unbounded_softplus"):
+        raise ValueError(f"unsupported KDA gate kind {gate_kind!r}")
+    if affine_main_indexed_initial and not state_dtype_is_fp32:
+        raise ValueError("affine indexed initial state requires FP32 state I/O")
+    if affine_main_indexed_initial_bf16 and not affine_main_indexed_initial:
+        raise ValueError(
+            "BF16 affine indexed initial state requires indexed initial state"
+        )
+    unbounded_softplus = gate_kind == "unbounded_softplus"
     direct_n16 = route == _FLASH_KDA_ROUTE_DIRECT_M128_N16
     chunk = _FLASH_KDA_BT16_CHUNK if direct_n16 else _FLASH_KDA_M128_CHUNK
     scalar_beta = (
@@ -2734,7 +2743,7 @@ def _flash_kda_generated_direct_specialization(
     return {
         "chunk": chunk,
         "serving_native_abi": serving_native_abi,
-        "unbounded_softplus": unbounded_softplus,
+        "gate_kind": gate_kind,
         "checkpoint_tma": bool(checkpoint_every_n_tokens and direct_n16),
         "pair_packed_beta": pair_packed_beta,
         "scalar_beta": scalar_beta,
@@ -2747,6 +2756,7 @@ def _flash_kda_generated_direct_specialization(
         "pdl_wait_initial_state_f32": pdl_wait_initial_state_f32,
         "pdl_publish_final_state": pdl_publish_final_state,
         "affine_main_indexed_initial": affine_main_indexed_initial,
+        "affine_main_indexed_initial_bf16": affine_main_indexed_initial_bf16,
     }
 
 
@@ -3824,7 +3834,7 @@ def _run_generated_single_route(
             uniform_sequences=uniform_sequences,
             max_sequence_length=max(sequence_lengths),
             serving_native_abi=serving_native_abi,
-            unbounded_softplus=False,
+            gate_kind="lower_bound",
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             pair_packed_beta=pair_packed_beta,
             state_dtype_is_fp32=state_dtype_is_fp32,
@@ -4327,7 +4337,7 @@ def _flash_kda_generated_affine_direct_selector_key(
         uniform_sequences=uniform_sequences,
         max_sequence_length=max_sequence_length,
         serving_native_abi=False,
-        unbounded_softplus=False,
+        gate_kind="lower_bound",
         checkpoint_every_n_tokens=0,
         pair_packed_beta=pair_packed_beta,
         state_dtype_is_fp32=state_dtype_is_fp32,
@@ -4338,7 +4348,10 @@ def _flash_kda_generated_affine_direct_selector_key(
             "affine_correction",
         ),
         pdl_publish_final_state=role in ("affine_main", "affine_map"),
-        affine_main_indexed_initial=(role == "affine_main" and external_state_is_fp32),
+        affine_main_indexed_initial=role == "affine_main",
+        affine_main_indexed_initial_bf16=(
+            role == "affine_main" and not external_state_is_fp32
+        ),
     )
     return _make_flash_kda_generated_selector_key(
         target=target,
@@ -4463,9 +4476,6 @@ def _generated_affine_launch_plan(
             zero_on_allocate=zero_on_allocate,
         )
 
-    main_initial = buffer(
-        "main_initial_fp32", state_shape, torch.float32, zero_on_allocate=True
-    )
     main_final = buffer("main_final_fp32", state_shape, torch.float32)
     map_identity = buffer(
         "map_identity_bfloat16",
@@ -4488,11 +4498,6 @@ def _generated_affine_launch_plan(
     map_out = buffer("map_out", zero_v_shape, torch.bfloat16)
     correction_out = buffer("correction_out", zero_v_shape, torch.bfloat16)
     state_indices_i64 = buffer("state_indices_i64", (1,), torch.int64)
-    selected_initial = (
-        buffer("selected_initial", final_compact_shape, torch.bfloat16)
-        if state_dtype == torch.bfloat16
-        else None
-    )
     final_external = (
         buffer("final_external", final_compact_shape, torch.bfloat16)
         if state_dtype == torch.bfloat16
@@ -4577,7 +4582,6 @@ def _generated_affine_launch_plan(
         tail_tokens=tail_tokens,
         main_lengths=main_lengths,
         tail_lengths=tail_lengths,
-        main_initial=main_initial,
         main_final=main_final,
         map_identity=map_identity,
         map_state=map_state,
@@ -4588,7 +4592,6 @@ def _generated_affine_launch_plan(
         map_out=map_out,
         correction_out=correction_out,
         state_indices_i64=state_indices_i64,
-        selected_initial=selected_initial,
         final_external=final_external,
         main_beta_padded=main_beta_padded,
         map_beta_padded=map_beta_padded,
@@ -4789,20 +4792,9 @@ def _run_generated_affine_route(
         flat=map_beta_flat,
         padded=plan.correction_beta_padded,
     )
-    external_state_is_fp32 = initial_state.dtype == torch.float32
-    if external_state_is_fp32:
-        main_initial_arg = initial_state
-        main_use_indices = True
-        main_state_stride = initial_state.stride(0)
-    else:
-        assert plan.selected_initial is not None
-        torch.index_select(initial_state, 0, state_indices, out=plan.selected_initial)
-        # The direct main kernel does not mutate its initial-state buffer, so
-        # allocation-time zeros remain valid for every slot after slot zero.
-        plan.main_initial[0].copy_(plan.selected_initial[0])
-        main_initial_arg = plan.main_initial
-        main_use_indices = False
-        main_state_stride = num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
+    main_initial_arg = initial_state
+    main_use_indices = True
+    main_state_stride = initial_state.stride(0)
     launch_observer = _generated_affine_launch_observer.get()
 
     _run_generated_affine_direct_role(

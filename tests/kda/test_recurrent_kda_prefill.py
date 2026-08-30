@@ -1383,7 +1383,7 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
             {
                 "chunk": 32,
                 "serving_native_abi": False,
-                "unbounded_softplus": False,
+                "gate_kind": "lower_bound",
                 "checkpoint_tma": False,
                 "pair_packed_beta": False,
                 "scalar_beta": False,
@@ -1396,6 +1396,7 @@ def test_persistent_policy_uses_physical_arch_and_sm_count_independently():
                 "pdl_wait_initial_state_f32": False,
                 "pdl_publish_final_state": False,
                 "affine_main_indexed_initial": False,
+                "affine_main_indexed_initial_bf16": False,
             },
             "direct_m128",
         ),
@@ -1588,6 +1589,28 @@ def test_generated_affine_selector_construction_is_cached(monkeypatch):
         scan = scan_cache(target="sm103a")
         assert scan_cache(target="sm103a") is scan
         assert len(calls) == 3
+
+        bf16_main = direct_cache(
+            **{
+                **direct_kwargs,
+                "role": "affine_main",
+                "external_state_is_fp32": False,
+            }
+        )
+        bf16_main_specialization = bf16_main["family_specialization"]
+        assert bf16_main_specialization["affine_main_indexed_initial"]
+        assert bf16_main_specialization["affine_main_indexed_initial_bf16"]
+
+        fp32_main = direct_cache(
+            **{
+                **direct_kwargs,
+                "role": "affine_main",
+                "external_state_is_fp32": True,
+            }
+        )
+        fp32_main_specialization = fp32_main["family_specialization"]
+        assert fp32_main_specialization["affine_main_indexed_initial"]
+        assert not fp32_main_specialization["affine_main_indexed_initial_bf16"]
     finally:
         direct_cache.cache_clear()
         scan_cache.cache_clear()
@@ -1783,14 +1806,13 @@ def test_generated_affine_launch_plan_caches_only_workspace_views(monkeypatch):
         )
 
     cold = get_plan((0, 4096, 8192))
-    assert len(buffer_calls) == 16
+    assert len(buffer_calls) == 14
     assert get_plan((0, 4096, 8192)) is cold
     assert get_plan((0, 4096, 8192), capturing=True) is cold
-    assert len(buffer_calls) == 16
+    assert len(buffer_calls) == 14
     assert cold.modules is modules
     assert all(not isinstance(value, torch.Tensor) for value in vars(cold.key).values())
     assert set(buffers) == {
-        "main_initial_fp32",
         "main_final_fp32",
         "map_identity_bfloat16",
         "map_state_bfloat16",
@@ -1801,7 +1823,6 @@ def test_generated_affine_launch_plan_caches_only_workspace_views(monkeypatch):
         "map_out",
         "correction_out",
         "state_indices_i64",
-        "selected_initial",
         "final_external",
         "beta_tma_main",
         "beta_tma_map",
@@ -1811,13 +1832,13 @@ def test_generated_affine_launch_plan_caches_only_workspace_views(monkeypatch):
     changed = get_plan((0, 4096, 8192, 12288))
     assert changed is not cold
     assert workspace._generated_affine_launch_plan is changed
-    assert len(buffer_calls) == 32
+    assert len(buffer_calls) == 28
 
     workspace._generated_affine_launch_plan = None
     with pytest.raises(RuntimeError, match="not warmed for CUDA graph capture"):
         get_plan((0, 4096, 8192), capturing=True)
     assert workspace._generated_affine_launch_plan is None
-    assert len(buffer_calls) == 32
+    assert len(buffer_calls) == 28
 
 
 def test_affine_route_skips_general_metadata_and_dummy_materialization(monkeypatch):
@@ -2100,7 +2121,7 @@ def test_generated_prefill_runtime_specialization_helpers():
         uniform_sequences=True,
         max_sequence_length=512,
         serving_native_abi=False,
-        unbounded_softplus=False,
+        gate_kind="lower_bound",
         checkpoint_every_n_tokens=0,
         pair_packed_beta=False,
         state_dtype_is_fp32=False,
@@ -2109,6 +2130,24 @@ def test_generated_prefill_runtime_specialization_helpers():
     assert direct["generic_register_inverse"]
     assert direct["n32_prediction_first"]
     assert direct["tensor_state_decay"]
+
+    with pytest.raises(
+        ValueError, match="affine indexed initial state requires FP32 state I/O"
+    ):
+        kda_prefill_api._flash_kda_generated_direct_specialization(
+            target="sm103a",
+            route="affine_m128",
+            num_heads=96,
+            num_sequences=1,
+            uniform_sequences=True,
+            max_sequence_length=512,
+            serving_native_abi=False,
+            gate_kind="lower_bound",
+            checkpoint_every_n_tokens=0,
+            pair_packed_beta=False,
+            state_dtype_is_fp32=False,
+            affine_main_indexed_initial=True,
+        )
 
     vtile = kda_prefill_api._flash_kda_generated_vtile_specialization(
         sequence_lengths=(512,) * 8,

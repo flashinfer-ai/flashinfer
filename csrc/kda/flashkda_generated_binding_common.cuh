@@ -69,6 +69,7 @@
 #define FLASHKDA_GENERATED_AFFINE_FP32_SPLIT_STATE 1
 #define FLASHKDA_GENERATED_AFFINE_BF16_STATE_WITH_FP32_SPLIT_DEPENDENCY 2
 #define FLASHKDA_GENERATED_AFFINE_FP32_CARRY_DEPENDENCY 3
+#define FLASHKDA_GENERATED_AFFINE_BF16_INDEXED_INITIAL_FP32_FINAL 4
 
 static_assert(FLASHKDA_GENERATED_THREADS > 0);
 static_assert(FLASHKDA_GENERATED_SMEM_BYTES > 0);
@@ -242,7 +243,7 @@ inline PreparedCommonInputs PrepareCommonInputs(
 }
 
 template <int ValueRows, int ChunkTokens, bool PairPackedBeta,
-          bool QkStyleValueTma>
+          bool QkStyleValueTma, bool FinalStateIsFP32 = false>
 inline PreparedCommonInputs PrepareCommonInputsWithRawState(
     const TensorView& q, const TensorView& k, const TensorView& v,
     const TensorView& g, const TensorView& beta, const TensorView& beta_tma,
@@ -260,7 +261,7 @@ inline PreparedCommonInputs PrepareCommonInputsWithRawState(
       q, k, v, g, beta, beta_tma, a_log, dt_bias, cu_seqlens, seq_order,
       initial_state, out, final_state, descriptor_storage, prepare_descriptors,
       num_heads, 0, 0, scale, lower_bound, true, 0, PairPackedBeta,
-      state.dtype);
+      state.dtype, FinalStateIsFP32);
   TVM_FFI_ICHECK(beta_token_stride == beta.stride(beta.ndim() - 2))
       << "beta_token_stride must match beta's physical token stride";
   const cudaStream_t stream = CheckedStream(cuda_stream);

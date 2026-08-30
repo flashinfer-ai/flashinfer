@@ -138,6 +138,21 @@ inline void RunDirectM128(
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
   const auto prepared = [&]() {
 #if FLASHKDA_GENERATED_AFFINE_DEPENDENCY == \
+    FLASHKDA_GENERATED_AFFINE_BF16_INDEXED_INITIAL_FP32_FINAL
+    CheckCudaTensorDevice(initial_state, "initial_state", q.device().device_id);
+    CheckCudaTensorDevice(final_state, "final_state_f32", q.device().device_id);
+    CheckDtype(initial_state, "initial_state", dl_bfloat16);
+    CheckDtype(final_state, "final_state_f32", dl_float32);
+    StatePointerSlots raw_state{initial_state.data_ptr(), nullptr, nullptr,
+                                final_state.data_ptr(), dl_bfloat16, 0};
+    return PrepareCommonInputsWithRawState<
+        FLASHKDA_GENERATED_VALUE_ROWS, FLASHKDA_GENERATED_TMA_TILE_TOKENS,
+        FLASHKDA_GENERATED_PAIR_PACKED_BETA != 0, false, true>(
+        q, k, v, g, beta, beta_tma, a_log, dt_bias, cu_seqlens, seq_order,
+        initial_state, out, final_state, descriptor_storage,
+        prepare_descriptors, num_heads, beta_token_stride, scale, lower_bound,
+        cuda_stream, raw_state);
+#elif FLASHKDA_GENERATED_AFFINE_DEPENDENCY == \
     FLASHKDA_GENERATED_AFFINE_FP32_SPLIT_STATE || \
     FLASHKDA_GENERATED_AFFINE_DEPENDENCY == \
     FLASHKDA_GENERATED_AFFINE_FP32_CARRY_DEPENDENCY

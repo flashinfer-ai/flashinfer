@@ -1,1 +1,2 @@
 csrc/cake_mamba_ssd_combined/generated/** whitespace=-blank-at-eof
+csrc/kda/flashkda_generated_*.cu whitespace=-blank-at-eof

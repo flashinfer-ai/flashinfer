@@ -114,7 +114,59 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_05a2502f00.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_1911ee41ee.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_1911ee41ee"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_1958795cd0.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "183296",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+      },
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_1958795cd0"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_238ed63928.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -129,7 +181,7 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_05a2502f00"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_238ed63928"
     },
     {
       "required_definitions": {
@@ -140,48 +192,22 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_0fafce81a0.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_28f9a8a79e.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
         "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "183296",
         "FLASHKDA_GENERATED_STATE_MODE": "bf16",
         "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
         "FLASHKDA_GENERATED_USE_PDL": "0",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_0fafce81a0"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_split_state",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_16426aa377.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "30b331c6131218864c8790aa088b2ba6e57febd4901eceb50375587820932634",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_16426aa377"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_28f9a8a79e"
     },
     {
       "required_definitions": {
@@ -192,7 +218,7 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_19f7973956.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_3b858569ea.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -207,137 +233,7 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_19f7973956"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_1b4824f0d4.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_1b4824f0d4"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_20e82ee7c1.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "183296",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
-      },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_20e82ee7c1"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_224dac8858.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "183296",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
-      },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_224dac8858"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_split_state",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_4928fb4fd5.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "30b331c6131218864c8790aa088b2ba6e57febd4901eceb50375587820932634",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_4928fb4fd5"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_4957c95e48.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_4957c95e48"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_3b858569ea"
     },
     {
       "required_definitions": {
@@ -348,7 +244,7 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "bf16_state_with_fp32_split_dependency",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_4dcc3ed337.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_43c4df0716.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -363,7 +259,7 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_4dcc3ed337"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_43c4df0716"
     },
     {
       "required_definitions": {
@@ -374,22 +270,22 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_50efe9aa95.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_46d409052b.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "44562835a95711536ced73e6eb5d1655f07b4beb9a57d26ee63038ea8a8f27f7",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
         "FLASHKDA_GENERATED_STATE_MODE": "bf16",
         "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
         "FLASHKDA_GENERATED_USE_PDL": "0",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_50efe9aa95"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_46d409052b"
     },
     {
       "required_definitions": {
@@ -398,24 +294,24 @@
       "selector_definitions": {
         "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_carry_dependency",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_541b1c9c28.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_47d37072a8.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "207d45e4fdd8f87d03080bb757e26b0a633394c9fbe18f7fc9c8ed2f6e855b83",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "44562835a95711536ced73e6eb5d1655f07b4beb9a57d26ee63038ea8a8f27f7",
         "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_correction",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
         "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
         "FLASHKDA_GENERATED_STATE_MODE": "fp32",
         "FLASHKDA_GENERATED_THREADS": "1024",
         "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "1",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_541b1c9c28"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_47d37072a8"
     },
     {
       "required_definitions": {
@@ -426,22 +322,22 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_5a688107fe.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_55d1d32d26.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
         "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
         "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
         "FLASHKDA_GENERATED_USE_PDL": "0",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_5a688107fe"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_55d1d32d26"
     },
     {
       "required_definitions": {
@@ -452,22 +348,22 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_5adbedf131.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_56abbe7691.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
         "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
         "FLASHKDA_GENERATED_STATE_MODE": "bf16",
         "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
         "FLASHKDA_GENERATED_USE_PDL": "0",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_5adbedf131"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_56abbe7691"
     },
     {
       "required_definitions": {
@@ -504,59 +400,7 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_6e89bbb832.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_6e89bbb832"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_76c7496530.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "218752",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "864",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_76c7496530"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_78f7679eda.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_5c3c67a77b.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -571,7 +415,7 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_78f7679eda"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_5c3c67a77b"
     },
     {
       "required_definitions": {
@@ -582,7 +426,33 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_793c685fe3.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_5e5566137f.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+      },
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_5e5566137f"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_70f79eeed3.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -597,7 +467,59 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_793c685fe3"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_70f79eeed3"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_72857a9eaf.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+      },
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_72857a9eaf"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "bf16_indexed_initial_fp32_final",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_774027cb32.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6eb1b97ff6df93d639fad73748d1fc8f2a987a6f6e856bed3a63adeb52fa4a00",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16_f32_dependency",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_774027cb32"
     },
     {
       "required_definitions": {
@@ -660,48 +582,22 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_95078d6474.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_7c208337d1.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "44562835a95711536ced73e6eb5d1655f07b4beb9a57d26ee63038ea8a8f27f7",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
         "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "218752",
+        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
+        "FLASHKDA_GENERATED_THREADS": "864",
         "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
         "FLASHKDA_GENERATED_USE_PDL": "0",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_95078d6474"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "bf16_state_with_fp32_split_dependency",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_9a2e0f24b8.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "d75457e734b66a5f32a9305ba229ec015a41731aab114e53949db09eb7caeddf",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_map",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "1",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_9a2e0f24b8"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_7c208337d1"
     },
     {
       "required_definitions": {
@@ -712,7 +608,33 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_a11fda9a58.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_7ec1d7bda4.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_7ec1d7bda4"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_853cfdda38.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -727,7 +649,33 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_a11fda9a58"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_853cfdda38"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "bf16_state_with_fp32_split_dependency",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_a3a4f21be7.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "d75457e734b66a5f32a9305ba229ec015a41731aab114e53949db09eb7caeddf",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_map",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "1",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_a3a4f21be7"
     },
     {
       "required_definitions": {
@@ -738,12 +686,12 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_carry_dependency",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_b37e84748d.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_ae1498fea5.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "51539c0bf457f27cdb50d95b0278bc81ec1a5fe3cf03f2e23940ab06604d936d",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "207d45e4fdd8f87d03080bb757e26b0a633394c9fbe18f7fc9c8ed2f6e855b83",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
         "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_correction",
         "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
         "FLASHKDA_GENERATED_STATE_MODE": "fp32",
@@ -753,33 +701,7 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_b37e84748d"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_b8557b2baa.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "44562835a95711536ced73e6eb5d1655f07b4beb9a57d26ee63038ea8a8f27f7",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_b8557b2baa"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_ae1498fea5"
     },
     {
       "required_definitions": {
@@ -790,7 +712,33 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_split_state",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_b9aec0f1ba.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_ae4f1aefcb.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "30b331c6131218864c8790aa088b2ba6e57febd4901eceb50375587820932634",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_ae4f1aefcb"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_split_state",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_c587d58abd.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -805,7 +753,33 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_b9aec0f1ba"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_c587d58abd"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_carry_dependency",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_c6d8fdfe70.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "51539c0bf457f27cdb50d95b0278bc81ec1a5fe3cf03f2e23940ab06604d936d",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_correction",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "1",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_c6d8fdfe70"
     },
     {
       "required_definitions": {
@@ -842,85 +816,7 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_dc544dd45d.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_dc544dd45d"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_e00d5c6ad0.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
-      },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_e00d5c6ad0"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_split_state",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_e2015b760f.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "7a4ac151575d93f6e27cc09d50e3b852feb3f4f23acf0664cb0530641e5e2eee",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_e2015b760f"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_e688790b25.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_ce63b5d638.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -935,7 +831,111 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_100a:flashkda_bf16_fused_m128_e688790b25"
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_ce63b5d638"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "bf16_indexed_initial_fp32_final",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_d860c5a53e.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "5d3e929a72c96989cb6e94865fbef8c4d3fa6b8d0dbd715728e80472ece61f55",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16_f32_dependency",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_d860c5a53e"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_dc01198745.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_dc01198745"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_e2c9d7c101.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+      },
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_e2c9d7c101"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "0"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_ef2d32976c.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+      },
+      "variant_id": "sm_100a:flashkda_bf16_fused_m128_ef2d32976c"
     },
     {
       "required_definitions": {
@@ -1336,7 +1336,85 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_05a2502f00.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_048e872a57.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_048e872a57"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_1911ee41ee.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_1911ee41ee"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_1958795cd0.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "183296",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_1958795cd0"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_238ed63928.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -1351,7 +1429,7 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_05a2502f00"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_238ed63928"
     },
     {
       "required_definitions": {
@@ -1362,111 +1440,7 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_0fafce81a0.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_0fafce81a0"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_split_state",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_16426aa377.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "30b331c6131218864c8790aa088b2ba6e57febd4901eceb50375587820932634",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_16426aa377"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_19f7973956.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_19f7973956"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_1b4824f0d4.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_1b4824f0d4"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_20e82ee7c1.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_28f9a8a79e.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -1481,7 +1455,7 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_20e82ee7c1"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_28f9a8a79e"
     },
     {
       "required_definitions": {
@@ -1492,59 +1466,7 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_224dac8858.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "183296",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_224dac8858"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_2742d4db9f.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_2742d4db9f"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_413906d2b0.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_29898d6f0d.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -1559,33 +1481,7 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_413906d2b0"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_split_state",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_4928fb4fd5.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "30b331c6131218864c8790aa088b2ba6e57febd4901eceb50375587820932634",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_4928fb4fd5"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_29898d6f0d"
     },
     {
       "required_definitions": {
@@ -1596,22 +1492,22 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_4957c95e48.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_3b858569ea.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
         "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
         "FLASHKDA_GENERATED_STATE_MODE": "fp32",
         "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
         "FLASHKDA_GENERATED_USE_PDL": "0",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_4957c95e48"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_3b858569ea"
     },
     {
       "required_definitions": {
@@ -1622,7 +1518,7 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "bf16_state_with_fp32_split_dependency",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_4dcc3ed337.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_43c4df0716.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -1637,7 +1533,7 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_4dcc3ed337"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_43c4df0716"
     },
     {
       "required_definitions": {
@@ -1648,22 +1544,22 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_50efe9aa95.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_46d409052b.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "44562835a95711536ced73e6eb5d1655f07b4beb9a57d26ee63038ea8a8f27f7",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
         "FLASHKDA_GENERATED_STATE_MODE": "bf16",
         "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
         "FLASHKDA_GENERATED_USE_PDL": "0",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_50efe9aa95"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_46d409052b"
     },
     {
       "required_definitions": {
@@ -1672,50 +1568,24 @@
       "selector_definitions": {
         "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_carry_dependency",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_541b1c9c28.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_47d37072a8.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "207d45e4fdd8f87d03080bb757e26b0a633394c9fbe18f7fc9c8ed2f6e855b83",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "44562835a95711536ced73e6eb5d1655f07b4beb9a57d26ee63038ea8a8f27f7",
         "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_correction",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
         "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
         "FLASHKDA_GENERATED_STATE_MODE": "fp32",
         "FLASHKDA_GENERATED_THREADS": "1024",
         "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "1",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_541b1c9c28"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_5456e2ff97.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "232064",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
         "FLASHKDA_GENERATED_USE_PDL": "0",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_5456e2ff97"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_47d37072a8"
     },
     {
       "required_definitions": {
@@ -1726,33 +1596,7 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_55fa793d72.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "232064",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_55fa793d72"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_5a48d3100e.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_4dd0821068.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -1767,7 +1611,7 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_5a48d3100e"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_4dd0821068"
     },
     {
       "required_definitions": {
@@ -1778,22 +1622,22 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_5a688107fe.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_55d1d32d26.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
         "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
         "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
         "FLASHKDA_GENERATED_USE_PDL": "0",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_5a688107fe"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_55d1d32d26"
     },
     {
       "required_definitions": {
@@ -1804,22 +1648,22 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_5adbedf131.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_56abbe7691.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
         "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
         "FLASHKDA_GENERATED_STATE_MODE": "bf16",
         "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
         "FLASHKDA_GENERATED_USE_PDL": "0",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_5adbedf131"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_56abbe7691"
     },
     {
       "required_definitions": {
@@ -1856,59 +1700,7 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_6e89bbb832.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_6e89bbb832"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_76c7496530.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "218752",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "864",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_76c7496530"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_78f7679eda.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_5c3c67a77b.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -1923,7 +1715,7 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_78f7679eda"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_5c3c67a77b"
     },
     {
       "required_definitions": {
@@ -1934,7 +1726,33 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_793c685fe3.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_5e5566137f.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_5e5566137f"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_70f79eeed3.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -1949,7 +1767,59 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_793c685fe3"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_70f79eeed3"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_72857a9eaf.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_72857a9eaf"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "bf16_indexed_initial_fp32_final",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_774027cb32.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6eb1b97ff6df93d639fad73748d1fc8f2a987a6f6e856bed3a63adeb52fa4a00",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16_f32_dependency",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_774027cb32"
     },
     {
       "required_definitions": {
@@ -2012,48 +1882,22 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_95078d6474.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_7c208337d1.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "44562835a95711536ced73e6eb5d1655f07b4beb9a57d26ee63038ea8a8f27f7",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
         "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "218752",
+        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
+        "FLASHKDA_GENERATED_THREADS": "864",
         "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
         "FLASHKDA_GENERATED_USE_PDL": "0",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_95078d6474"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "bf16_state_with_fp32_split_dependency",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_9a2e0f24b8.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "d75457e734b66a5f32a9305ba229ec015a41731aab114e53949db09eb7caeddf",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_map",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "1",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_9a2e0f24b8"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_7c208337d1"
     },
     {
       "required_definitions": {
@@ -2064,7 +1908,33 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_a11fda9a58.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_7ec1d7bda4.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_7ec1d7bda4"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_853cfdda38.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -2079,7 +1949,7 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_a11fda9a58"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_853cfdda38"
     },
     {
       "required_definitions": {
@@ -2088,24 +1958,24 @@
       "selector_definitions": {
         "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_carry_dependency",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "bf16_state_with_fp32_split_dependency",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_b37e84748d.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_a3a4f21be7.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "51539c0bf457f27cdb50d95b0278bc81ec1a5fe3cf03f2e23940ab06604d936d",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_correction",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "d75457e734b66a5f32a9305ba229ec015a41731aab114e53949db09eb7caeddf",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_map",
         "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
         "FLASHKDA_GENERATED_THREADS": "1024",
         "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
         "FLASHKDA_GENERATED_USE_PDL": "1",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_b37e84748d"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_a3a4f21be7"
     },
     {
       "required_definitions": {
@@ -2116,22 +1986,74 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_b8557b2baa.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_a754a98a1c.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "44562835a95711536ced73e6eb5d1655f07b4beb9a57d26ee63038ea8a8f27f7",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
         "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "232064",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
         "FLASHKDA_GENERATED_THREADS": "1024",
         "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
         "FLASHKDA_GENERATED_USE_PDL": "0",
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_b8557b2baa"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_a754a98a1c"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_a9282d2030.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "232064",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_a9282d2030"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_carry_dependency",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_ae1498fea5.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "207d45e4fdd8f87d03080bb757e26b0a633394c9fbe18f7fc9c8ed2f6e855b83",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_correction",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "1",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_ae1498fea5"
     },
     {
       "required_definitions": {
@@ -2142,7 +2064,33 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_split_state",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_b9aec0f1ba.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_ae4f1aefcb.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "30b331c6131218864c8790aa088b2ba6e57febd4901eceb50375587820932634",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_ae4f1aefcb"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_split_state",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_c587d58abd.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -2157,7 +2105,33 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_b9aec0f1ba"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_c587d58abd"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_carry_dependency",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_c6d8fdfe70.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "51539c0bf457f27cdb50d95b0278bc81ec1a5fe3cf03f2e23940ab06604d936d",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_correction",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "1",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_c6d8fdfe70"
     },
     {
       "required_definitions": {
@@ -2194,111 +2168,7 @@
         "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
         "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
         "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_d8e69142a9.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_d8e69142a9"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_dc544dd45d.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_dc544dd45d"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_e00d5c6ad0.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
-        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_e00d5c6ad0"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "fp32_split_state",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_e2015b760f.cu",
-        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
-        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
-        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
-        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "7a4ac151575d93f6e27cc09d50e3b852feb3f4f23acf0664cb0530641e5e2eee",
-        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
-        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_main",
-        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
-        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
-        "FLASHKDA_GENERATED_THREADS": "1024",
-        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
-        "FLASHKDA_GENERATED_USE_PDL": "0",
-        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
-        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
-      },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_e2015b760f"
-    },
-    {
-      "required_definitions": {
-        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
-      },
-      "selector_definitions": {
-        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
-        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
-        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
-        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
-        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_e688790b25.cu",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_ce63b5d638.cu",
         "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
         "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
         "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
@@ -2313,7 +2183,137 @@
         "FLASHKDA_GENERATED_VALUE_ROWS": "128",
         "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
       },
-      "variant_id": "sm_103a:flashkda_bf16_fused_m128_e688790b25"
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_ce63b5d638"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "bf16_indexed_initial_fp32_final",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_d860c5a53e.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "affine_split_dispatcher",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_positive_1d_grid",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "5d3e929a72c96989cb6e94865fbef8c4d3fa6b8d0dbd715728e80472ece61f55",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "1",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "affine_split_m128:affine_main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16_f32_dependency",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_d860c5a53e"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_dc01198745.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_dc01198745"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_e2c9d7c101.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_e2c9d7c101"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_ef2d32976c.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "89a7367c67a46001c1193d0ab6ef0c3aba003e4a939a12a26502719974f5566d",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128_n16:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "117376",
+        "FLASHKDA_GENERATED_STATE_MODE": "bf16",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "16",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "4"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_ef2d32976c"
+    },
+    {
+      "required_definitions": {
+        "FLASHINFER_FLASH_KDA_TARGET_MINOR": "3"
+      },
+      "selector_definitions": {
+        "FLASHKDA_GENERATED_ABI_FAMILY": "direct_m128",
+        "FLASHKDA_GENERATED_ABI_VARIANT": "serving",
+        "FLASHKDA_GENERATED_AFFINE_DEPENDENCY": "none",
+        "FLASHKDA_GENERATED_ARG_PLAN_SHA256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+        "FLASHKDA_GENERATED_BODY_FILE": "flashkda_generated_bf16_fused_m128_f0eacae1c2.cu",
+        "FLASHKDA_GENERATED_GRID_POLICY": "sequence_head",
+        "FLASHKDA_GENERATED_GRID_POLICY_EVIDENCE": "observed_head_factorization",
+        "FLASHKDA_GENERATED_KERNEL": "kernel_flashkda_bf16_fused_m128",
+        "FLASHKDA_GENERATED_LAUNCH_CONTRACT_SHA256": "6bf4f3573ac3c5ac3df5c70a81a9d305eadfa3bb204790ed89273189e2af1801",
+        "FLASHKDA_GENERATED_PAIR_PACKED_BETA": "0",
+        "FLASHKDA_GENERATED_ROUTE_ROLE": "direct_m128:main",
+        "FLASHKDA_GENERATED_SMEM_BYTES": "227968",
+        "FLASHKDA_GENERATED_STATE_MODE": "fp32",
+        "FLASHKDA_GENERATED_THREADS": "1024",
+        "FLASHKDA_GENERATED_TMA_TILE_TOKENS": "32",
+        "FLASHKDA_GENERATED_USE_PDL": "0",
+        "FLASHKDA_GENERATED_VALUE_ROWS": "128",
+        "FLASHKDA_GENERATED_VALUE_TMA_RANK": "3"
+      },
+      "variant_id": "sm_103a:flashkda_bf16_fused_m128_f0eacae1c2"
     },
     {
       "required_definitions": {

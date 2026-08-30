@@ -198,7 +198,8 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
                                  int64_t store_final_state, double scale, double lower_bound,
                                  bool allow_serving_layouts = false, int64_t state_pool_slots = 0,
                                  bool allow_pair_packed_beta_tma = false,
-                                 DLDataType state_dtype = dl_bfloat16) {
+                                 DLDataType state_dtype = dl_bfloat16,
+                                 bool final_state_is_fp32 = false) {
   TVM_FFI_ICHECK(prepare_descriptors == 0 || prepare_descriptors == 1)
       << "prepare_descriptors must be 0 or 1, got " << prepare_descriptors;
   TVM_FFI_ICHECK(num_heads > 0 && num_heads <= std::numeric_limits<int32_t>::max())
@@ -215,6 +216,9 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
          "float32, got "
       << lower_bound;
   ServingStateElementBytes(state_dtype);
+  const DLDataType final_state_dtype =
+      final_state_is_fp32 ? dl_float32 : state_dtype;
+  ServingStateElementBytes(final_state_dtype);
 
   const int32_t device_id = q.device().device_id;
   CheckCudaTensor(q, "q", device_id);
@@ -244,7 +248,7 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
   CheckDtype(seq_order, "seq_order", dl_int32);
   CheckDtype(initial_state, "initial_state", state_dtype);
   CheckDtype(out, "out", dl_bfloat16);
-  CheckDtype(final_state, "final_state", state_dtype);
+  CheckDtype(final_state, "final_state", final_state_dtype);
   CheckDtype(descriptor_storage, "descriptor_storage", dl_uint8);
 
   if (!allow_serving_layouts) {
