@@ -15,6 +15,13 @@ try:
 except (ImportError, RuntimeError):
     cp_delta_rule_dsl_sm100 = None  # type: ignore
 
+try:
+    from .gdn_cp_backend import (
+        chunk_gated_delta_rule_gdn_cp_sm100 as _chunk_gated_delta_rule_gdn_cp_sm100,
+    )
+except (ImportError, RuntimeError):
+    _chunk_gated_delta_rule_gdn_cp_sm100 = None  # type: ignore
+
 __all__ = [
     "chunk_gated_delta_rule_sm100",
     "cp_delta_rule_dsl_sm100",
