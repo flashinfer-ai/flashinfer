@@ -83,6 +83,7 @@ class MoEEpMegaWorkspace:
     def __exit__(self, *exc_info: object) -> None:
         self.destroy()
 
+
 class MoEEpMegaLayer(nn.Module):
     """Fused EP mega kernel — no separate dispatch/combine transport.
 

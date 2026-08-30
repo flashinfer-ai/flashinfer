@@ -432,11 +432,19 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             knobs_pool_key(k.knobs),
         )
 
+    def _forget_local_workspace_state(self, workspace) -> None:
+        # Launch thunks close over this backend owner's workspace tensors.
+        # Drop them on every release, not only the final pooled release.
+        workspace_id = id(workspace)
+        self._thunk_states = {
+            key: state
+            for key, state in self._thunk_states.items()
+            if key[0] != workspace_id
+        }
+
     def _forget_workspace_state(self, workspace) -> None:
-        # The fused-stage memos key on topk_idx.data_ptr(); the symmetric
-        # heap reuses freed addresses, so evict before the buffer dies.
-        # sys.modules lookup (not an import): if the shim was never loaded,
-        # no memo exists and the heavy import must not happen.
+        # The fused-stage memo is process-global and keys on
+        # topk_idx.data_ptr(); evict only before the final physical free.
         import sys
 
         quant_stage = sys.modules.get(
@@ -445,9 +453,3 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         topk_idx = getattr(workspace, "topk_idx", None)
         if quant_stage is not None and topk_idx is not None:
             quant_stage.forget_staged_tokens(topk_idx)
-        workspace_id = id(workspace)
-        self._thunk_states = {
-            key: state
-            for key, state in self._thunk_states.items()
-            if key[0] != workspace_id
-        }

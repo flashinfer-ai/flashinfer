@@ -61,6 +61,7 @@ def release_workspace(workspace: Any) -> bool:
         return True
     return False
 
+
 def pooled_workspace_refcount(workspace: Any) -> int:
     """Return the actual live pool refcount for one workspace."""
     key = _KEY_BY_ID.get(id(workspace))
@@ -70,7 +71,6 @@ def pooled_workspace_refcount(workspace: Any) -> int:
     if entry is None or entry.workspace is not workspace:
         return 0
     return entry.refcount
-
 
 
 def pooled_workspace_count() -> int:

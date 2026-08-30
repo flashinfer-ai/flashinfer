@@ -30,6 +30,7 @@ _SOURCE_FILE = "cake_megamoe_topk_reduce_kernels.cu"
 _MANIFEST_FILE = "manifest.json"
 _BINDING_HEADER = "cake_megamoe_topk_reduce_binding.cuh"
 _KERNEL_SYMBOL = "kernel_cake_megamoe_workspace_topk_reduce_bfloat16_h4096_k6"
+_SOURCE_SHA256 = "a0d7bab5d380023d9cc8983fb812ba551157d941e452c5f42da5ffca01e087dc"
 _MANIFEST_KEYS = {
     "arch",
     "compile_flags",
@@ -122,6 +123,9 @@ def _program_source() -> tuple[Path, dict[str, Any]]:
         raise RuntimeError("MegaMoE TopK-reduce manifest is invalid JSON") from error
 
     source_bytes = source.read_bytes()
+    source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+    if source_sha256 != _SOURCE_SHA256:
+        raise RuntimeError("MegaMoE TopK-reduce source identity is invalid")
     expected = {
         "schema_version": 1,
         "arch": "sm_100a",
@@ -131,7 +135,7 @@ def _program_source() -> tuple[Path, dict[str, Any]]:
         "launch": _LAUNCH,
         "constraints": _CONSTRAINTS,
         "kernel_symbols": [_KERNEL_SYMBOL],
-        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        "source_sha256": _SOURCE_SHA256,
     }
     if (
         not isinstance(manifest, dict)

@@ -29,6 +29,11 @@
 #error "CAKE_MEGAMOE_TOPK_REDUCE_SMEM_BYTES must describe dynamic shared memory"
 #endif
 
+// The frozen body is a self-contained CUDA translation-unit fragment.  Keep
+// its fixed-width types intact: rewriting names such as uint32_t here would
+// make the generated vector-load code refer to undefined aliases.
+#include CAKE_MEGAMOE_TOPK_REDUCE_BODY_FILE
+
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -38,31 +43,6 @@
 #include <utility>
 
 #include "tvm_ffi_utils.h"
-
-// Generated bodies use private fixed-width aliases.  Rename them at the
-// include boundary so they cannot collide with the CUDA and TVM-FFI headers.
-#define uint8_t cake_megamoe_generated_uint8_t
-#define uint16_t cake_megamoe_generated_uint16_t
-#define uint32_t cake_megamoe_generated_uint32_t
-#define uint64_t cake_megamoe_generated_uint64_t
-#define int32_t cake_megamoe_generated_int32_t
-#define int16_t cake_megamoe_generated_int16_t
-#define CakeTensorMap cake_megamoe_generated_CakeTensorMap
-#define CakeTensorMapPack cake_megamoe_generated_CakeTensorMapPack
-#define CUtensorMap cake_megamoe_generated_CUtensorMap
-#include CAKE_MEGAMOE_TOPK_REDUCE_BODY_FILE
-#undef uint8_t
-#undef uint16_t
-#undef uint32_t
-#undef uint64_t
-#undef int32_t
-#undef int16_t
-#undef CakeTensorMap
-#undef CakeTensorMapPack
-#undef CUtensorMap
-#undef THREADS
-#undef NUM_MAIN_STAGES
-#undef CAKE_INF
 
 namespace flashinfer {
 namespace cake_megamoe_topk_reduce {

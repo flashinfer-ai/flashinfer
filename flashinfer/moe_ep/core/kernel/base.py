@@ -250,13 +250,22 @@ class MegaKernelBackend(ABC):
             return
         from .workspace_pool import release_workspace
 
+        # Backend-local launch state belongs to this owner even when the
+        # physical workspace is pooled with other backend instances.
+        self._forget_local_workspace_state(workspace)
         if release_workspace(workspace):
             self._forget_workspace_state(workspace)
             workspace.destroy()
 
+    def _forget_local_workspace_state(self, workspace: Any) -> None:  # noqa: B027
+        """Drop this backend instance's memoized state for ``workspace``.
+
+        Called for every owner release, including non-final pooled releases.
+        """
+
     def _forget_workspace_state(self, workspace: Any) -> None:  # noqa: B027
-        """Backend hook: drop memoized state keyed on this workspace's buffers.
+        """Drop process-global state keyed on this workspace's buffers.
 
         Called on the last release, just before ``workspace.destroy()`` frees
         the buffers (whose addresses the symmetric heap may reuse). Default is
-        a no-op; backends with per-workspace memos override this."""
+        a no-op; backends with cross-owner memos override this."""

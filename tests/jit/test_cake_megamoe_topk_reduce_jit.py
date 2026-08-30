@@ -19,17 +19,12 @@ from flashinfer.jit import cake_megamoe_topk_reduce
 from flashinfer.jit import core as jit_core
 
 
-def _fake_source() -> str:
-    return f'''extern "C" __global__ void \
-{cake_megamoe_topk_reduce._KERNEL_SYMBOL}(
-    __nv_bfloat16* __restrict__ partials,
-    __nv_bfloat16* __restrict__ out) {{}}
-'''
-
-
 def _write_bundle(directory: Path) -> dict:
     directory.mkdir(parents=True, exist_ok=True)
-    source = _fake_source().encode()
+    source = (
+        cake_megamoe_topk_reduce._get_csrc_dir()
+        / cake_megamoe_topk_reduce._SOURCE_FILE
+    ).read_bytes()
     (directory / cake_megamoe_topk_reduce._SOURCE_FILE).write_bytes(source)
     (directory / cake_megamoe_topk_reduce._BINDING_HEADER).write_text(
         "// test binding\n", encoding="utf-8"
@@ -55,6 +50,9 @@ def test_packaged_bundle_matches_frozen_manifest():
     source, manifest = cake_megamoe_topk_reduce._program_source()
 
     assert source.name == cake_megamoe_topk_reduce._SOURCE_FILE
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == (
+        cake_megamoe_topk_reduce._SOURCE_SHA256
+    )
     assert manifest["source_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
     assert manifest["kernel_symbols"] == [cake_megamoe_topk_reduce._KERNEL_SYMBOL]
 
@@ -68,6 +66,23 @@ def test_manifest_loader_accepts_only_the_frozen_identity(monkeypatch, tmp_path)
 
     assert source == bundle / cake_megamoe_topk_reduce._SOURCE_FILE
     assert loaded == manifest
+
+
+def test_manifest_loader_rejects_joint_source_and_manifest_drift(
+    monkeypatch, tmp_path
+):
+    bundle = tmp_path / "bundle"
+    manifest = _write_bundle(bundle)
+    source_path = bundle / cake_megamoe_topk_reduce._SOURCE_FILE
+    source_path.write_bytes(source_path.read_bytes() + b"\n// drift\n")
+    manifest["source_sha256"] = hashlib.sha256(source_path.read_bytes()).hexdigest()
+    (bundle / cake_megamoe_topk_reduce._MANIFEST_FILE).write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+    monkeypatch.setattr(cake_megamoe_topk_reduce, "_get_csrc_dir", lambda: bundle)
+
+    with pytest.raises(RuntimeError, match="source identity is invalid"):
+        cake_megamoe_topk_reduce._program_source()
 
 
 @pytest.mark.parametrize(

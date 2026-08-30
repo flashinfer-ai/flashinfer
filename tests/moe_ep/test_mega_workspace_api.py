@@ -153,6 +153,16 @@ def test_same_capacity_shares_pool_entry_and_different_capacity_does_not(
         mock.patch.object(layer._kernel, "validate_init"),
         mock.patch.object(
             layer._kernel,
+            "_forget_local_workspace_state",
+            wraps=layer._kernel._forget_local_workspace_state,
+        ) as forget_local,
+        mock.patch.object(
+            layer._kernel,
+            "_forget_workspace_state",
+            wraps=layer._kernel._forget_workspace_state,
+        ) as forget_global,
+        mock.patch.object(
+            layer._kernel,
             "_workspace_pool_key",
             side_effect=lambda fp: ("workspace-api", fp.max_tokens_per_rank),
         ),
@@ -175,11 +185,18 @@ def test_same_capacity_shares_pool_entry_and_different_capacity_does_not(
     shared_raw = first._backend_workspace
     large_raw = large._backend_workspace
     first.destroy()
+    forget_local.assert_called_once_with(shared_raw)
+    forget_global.assert_not_called()
     shared_raw.destroy.assert_not_called()
     assert workspace_pool.pooled_workspace_refcount(shared_raw) == 1
     second.destroy()
+    assert forget_local.call_count == 2
+    forget_global.assert_called_once_with(shared_raw)
     shared_raw.destroy.assert_called_once()
     large.destroy()
+    assert forget_local.call_count == 3
+    assert forget_global.call_count == 2
+    forget_global.assert_called_with(large_raw)
     large_raw.destroy.assert_called_once()
     assert workspace_pool.pooled_workspace_count() == 0
     layer.destroy()
