@@ -956,12 +956,29 @@ class GroupedQueryAttentionDecodePaged:
         # Runtime control flow
         if cutlass.const_expr(is_varlen):
             seqlen = seqlen_smem[0]
-            page_count = cute.ceil_div(seqlen, page_size)
             table_offset = table_offset_smem[0]
         else:
             seqlen = seqlens_iter
-            page_count = cute.ceil_div(seqlen, page_size)
-            table_offset = coord_b * page_count
+            full_page_count = cute.ceil_div(seqlen, page_size)
+            table_offset = coord_b * full_page_count
+
+        # Drop only complete pages that precede every query's left-window
+        # bound.  Keeping the leading partial page lets the existing mask
+        # handle the boundary, while rebasing both KV indices and seqlen keeps
+        # causal/window coordinates unchanged for multi-token decode.
+        full_seqlen = seqlen
+        if cutlass.const_expr(
+            isinstance(mask_config, SlidingWindowMask)
+            and mask_config.window_left is not None
+        ):
+            first_active_token = cutlass.max(
+                0, seqlen - prediction - mask_config.window_left
+            )
+            skipped_pages = first_active_token // page_size
+            table_offset += skipped_pages
+            seqlen -= skipped_pages * page_size
+
+        page_count = cute.ceil_div(seqlen, page_size)
         tiles_s = cute.ceil_div(seqlen, blk_tile_s)
         iters_s = cute.ceil_div(tiles_s - kv_split_idx, kv_splits)
         exit_early = kv_split_idx >= tiles_s
@@ -1476,7 +1493,7 @@ class GroupedQueryAttentionDecodePaged:
                 # Per-batch BLASST threshold, matching trtllm:
                 # effective threshold_p = scale_factor / seqlen
                 log2_threshold_p = log2_threshold_scale_factor - cute.math.log2(
-                    Float32(seqlen)
+                    Float32(full_seqlen)
                 )
 
             # Masking phase loop over all sequence tiles

@@ -132,6 +132,42 @@ def _decode_reference_paged_non_causal(
     return out.to(q.dtype)
 
 
+def _decode_reference_paged_window(
+    q,
+    k_cache,
+    v_cache,
+    kv_indptr,
+    kv_indices,
+    seq_lens,
+    sm_scale,
+    window_left,
+    window_right=0,
+):
+    """Bottom-right aligned sliding-window reference for paged GQA decode."""
+    if q.ndim == 3:
+        q = q[:, None]
+    batch_size, q_len, num_qo_heads, head_dim = q.shape
+    num_kv_heads = k_cache.shape[2]
+    group = num_qo_heads // num_kv_heads
+    out = torch.empty_like(q, dtype=torch.float32)
+    for b in range(batch_size):
+        length = int(seq_lens[b].item())
+        pages_b = kv_indices[kv_indptr[b] : kv_indptr[b + 1]]
+        keys = k_cache[pages_b].float().reshape(-1, num_kv_heads, head_dim)
+        values = v_cache[pages_b].float().reshape(-1, num_kv_heads, head_dim)
+        keys = keys[:length].repeat_interleave(group, dim=1)
+        values = values[:length].repeat_interleave(group, dim=1)
+        logits = torch.einsum("qhd,nhd->hqn", q[b].float(), keys) * sm_scale
+        query_positions = torch.arange(length - q_len, length, device=q.device)[:, None]
+        key_positions = torch.arange(length, device=q.device)[None, :]
+        keep = key_positions >= query_positions - window_left
+        if window_right is not None:
+            keep &= key_positions <= query_positions + window_right
+        logits.masked_fill_(~keep[None], float("-inf"))
+        out[b] = torch.einsum("hqn,nhd->qhd", torch.softmax(logits, dim=-1), values)
+    return out.to(q.dtype)
+
+
 def _decode_reference_contiguous(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -923,6 +959,198 @@ def test_batch_decode_wrapper_cute_dsl_sliding_window(dtype):
     out = cd.run(q, kv)
     ref = ref_wrapper.run(q, kv)
     torch.testing.assert_close(out, ref, rtol=5e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("page_size", [8, 16, 32, 64])
+@pytest.mark.parametrize("q_len_per_req", [1, 4])
+def test_cute_dsl_decode_paged_sliding_window_skips_full_pages(
+    page_size, q_len_per_req
+):
+    """Sliding-window page rebasing preserves ragged split-K numerics."""
+    dtype = torch.bfloat16
+    seq_lens_host = [257, 1025, 2051]
+    window_left = 511
+    batch_size = len(seq_lens_host)
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size,
+        q_len_per_req,
+        NUM_QO_HEADS,
+        HEAD_DIM,
+        device=DEVICE,
+        dtype=dtype,
+    )
+    kv, kv_indptr, kv_indices, _last_page_len, seq_lens = _make_paged_kv_varlen(
+        seq_lens_host, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    k_cache, v_cache = kv.unbind(dim=1)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+
+    wrapper = BatchDecodePagedCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        seq_lens,
+        num_qo_heads=NUM_QO_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        page_size=page_size,
+        q_data_type=dtype,
+        sm_scale=sm_scale,
+        kv_splits=3,
+        reduction="kernel",
+        q_len_per_req=q_len_per_req,
+        window_left=window_left,
+        window_right=0,
+        max_kv_len=max(seq_lens_host),
+    )
+    out = wrapper.run(
+        q.reshape(batch_size * q_len_per_req, NUM_QO_HEADS, HEAD_DIM),
+        k_cache,
+        v_cache,
+    )
+    ref = _decode_reference_paged_window(
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        seq_lens,
+        sm_scale,
+        window_left,
+    )
+    torch.testing.assert_close(out.reshape_as(ref), ref, rtol=5e-3, atol=5e-3)
+
+
+def test_cute_dsl_decode_paged_sliding_window_cuda_graph_runtime_lengths():
+    """Graph replay must observe changed lengths without changing page tables."""
+    dtype = torch.bfloat16
+    page_size, q_len_per_req, window_left = 16, 4, 511
+    capacity_lens_host = [1025, 2051]
+    initial_lens_host = [769, 1537]
+    batch_size = len(capacity_lens_host)
+    torch.manual_seed(0)
+    q = torch.randn(
+        batch_size,
+        q_len_per_req,
+        NUM_QO_HEADS,
+        HEAD_DIM,
+        device=DEVICE,
+        dtype=dtype,
+    )
+    kv, kv_indptr, kv_indices, _last_page_len, seq_lens = _make_paged_kv_varlen(
+        capacity_lens_host, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    seq_lens.copy_(torch.tensor(initial_lens_host, device=DEVICE, dtype=torch.int32))
+    k_cache, v_cache = kv.unbind(dim=1)
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    wrapper = BatchDecodePagedCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEVICE),
+        use_cuda_graph=True,
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        seq_lens,
+        num_qo_heads=NUM_QO_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        page_size=page_size,
+        q_data_type=dtype,
+        sm_scale=sm_scale,
+        kv_splits=3,
+        reduction="kernel",
+        q_len_per_req=q_len_per_req,
+        window_left=window_left,
+        window_right=0,
+        max_kv_len=max(capacity_lens_host),
+    )
+    q_flat = q.reshape(batch_size * q_len_per_req, NUM_QO_HEADS, HEAD_DIM)
+    out = torch.empty_like(q_flat)
+    wrapper.run(q_flat, k_cache, v_cache, out=out)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = wrapper.run(q_flat, k_cache, v_cache, out=out)
+    replay_lens = torch.tensor(capacity_lens_host, device=DEVICE, dtype=torch.int32)
+    seq_lens.copy_(replay_lens)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    ref = _decode_reference_paged_window(
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        replay_lens,
+        sm_scale,
+        window_left,
+    )
+    assert graph_out.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(graph_out.reshape_as(ref), ref, rtol=5e-3, atol=5e-3)
+
+
+def test_cute_dsl_decode_paged_sliding_window_blasst_normalization():
+    """Page rebasing must not change BLASST's full-length normalization."""
+    dtype = torch.bfloat16
+    page_size, window_left = 16, 511
+    seq_lens_host = [1025, 2051]
+    batch_size = len(seq_lens_host)
+    torch.manual_seed(0)
+    # Zero Q/K makes every active-window probability exactly 1 / 512.
+    # A scale factor of 1.5 yields a lower threshold with the full lengths
+    # (1.5 / 1025 and 1.5 / 2051), but a higher threshold with the rebased
+    # lengths (about 1.5 / 514). Thus this case detects which denominator the
+    # BLASST path uses instead of merely checking that the path launches.
+    q = torch.zeros(batch_size, NUM_QO_HEADS, HEAD_DIM, device=DEVICE, dtype=dtype)
+    kv, kv_indptr, kv_indices, _last_page_len, seq_lens = _make_paged_kv_varlen(
+        seq_lens_host, page_size, NUM_KV_HEADS, HEAD_DIM, dtype, DEVICE
+    )
+    k_cache, v_cache = kv.unbind(dim=1)
+    k_cache.zero_()
+    sm_scale = 1.0 / math.sqrt(HEAD_DIM)
+    wrapper = BatchDecodePagedCuteDSLWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=DEVICE)
+    )
+    wrapper.plan(
+        kv_indptr,
+        kv_indices,
+        seq_lens,
+        num_qo_heads=NUM_QO_HEADS,
+        num_kv_heads=NUM_KV_HEADS,
+        head_dim=HEAD_DIM,
+        page_size=page_size,
+        q_data_type=dtype,
+        sm_scale=sm_scale,
+        kv_splits=3,
+        reduction="kernel",
+        window_left=window_left,
+        window_right=0,
+        max_kv_len=max(seq_lens_host),
+    )
+    out_std = wrapper.run(q, k_cache, v_cache)
+    out_blasst = wrapper.run(
+        q,
+        k_cache,
+        v_cache,
+        skip_softmax_threshold_scale_factor=1.5,
+    )
+    ref = _decode_reference_paged_window(
+        q,
+        k_cache,
+        v_cache,
+        kv_indptr,
+        kv_indices,
+        seq_lens,
+        sm_scale,
+        window_left,
+    )[:, 0]
+    torch.testing.assert_close(out_std, ref, rtol=5e-3, atol=5e-3)
+    torch.testing.assert_close(out_blasst, out_std, rtol=5e-3, atol=5e-3)
 
 
 @pytest.mark.parametrize("batch_size", [4])
