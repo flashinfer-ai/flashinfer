@@ -332,8 +332,8 @@ inline void RunDirectM128Vtile(
   a.persistent_stride=CheckedInt32(persistent_stride,"persistent_stride");
   a.num_heads=CheckedInt32(num_heads,"num_heads");a.use_initial_state=CheckedInt32(use_initial_state,"use_initial_state");
   a.store_final_state=CheckedInt32(store_final_state,"store_final_state");a.scale=static_cast<float>(scale);a.lower_bound=static_cast<float>(lower_bound);
-  TVM_FFI_ICHECK(grid_x==persistent_tasks && grid_y==1 && grid_z==1)
-      << "vtile grid_x must equal persistent_tasks";
+  TVM_FFI_ICHECK(grid_x==persistent_stride && grid_y==1 && grid_z==1)
+      << "vtile grid_x must equal persistent_stride";
   LaunchDirectM128Vtile(a,p.state,CheckedGrid(grid_x,grid_y,grid_z),p.stream);
 }
 
