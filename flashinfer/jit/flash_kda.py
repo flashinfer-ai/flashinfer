@@ -553,7 +553,7 @@ def get_flash_kda_generated_registry() -> Mapping[str, GeneratedFlashKDAModule]:
         )
         if launch_contract_sha256 != _canonical_json_sha256(launch_contract):
             raise ValueError(f"{label} launch-contract digest mismatch")
-        if state_mode not in ("bf16", "fp32", "none"):
+        if state_mode not in ("bf16", "bf16_f32_dependency", "fp32", "none"):
             raise ValueError(f"{label} has unsupported state mode")
 
         physical_selector_rows = row.get("physical_selectors")

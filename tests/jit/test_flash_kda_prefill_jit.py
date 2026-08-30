@@ -215,6 +215,9 @@ def test_generated_prefill_registry_is_receipt_closed_and_exact_targeted():
         "sm100a",
         "sm103a",
     }
+    assert "bf16_f32_dependency" in {
+        module.state_mode for module in registry.values()
+    }
     selector_registry = flash_kda.get_flash_kda_generated_selector_registry()
     assert receipt["physical_selector_count"] == len(selector_registry)
 
