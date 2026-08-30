@@ -26,11 +26,21 @@ from __future__ import annotations
 
 import threading
 import weakref
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
 
 from ..utils import get_compute_capability
+from ._blackwell_sm100 import (
+    MSASparseAttentionWorkspace,
+    _bind_workspace,
+    _check_warmed_launch,
+    _explicit_q_offsets,
+    _launch_signature,
+    _record_successful_launch,
+    _workspace_buffer,
+)
 
 _SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 
@@ -202,9 +212,23 @@ _uniform_q_len_cache: dict[int, tuple] = {}
 _uniform_q_len_cache_lock = threading.Lock()
 
 
-def _resolve_uniform_seqlen_q(cu_q: torch.Tensor, batch_size: int) -> int:
+def _resolve_uniform_seqlen_q(
+    cu_q: torch.Tensor,
+    batch_size: int,
+    workspace: Optional[MSASparseAttentionWorkspace],
+) -> int:
     """Right-aligned MSA semantics use one scalar seqlen_q per call; verify
     uniformity of the per-batch query lengths (one sync per cu_q mutation)."""
+
+    workspace_key = (tuple(cu_q.shape), tuple(cu_q.stride()), cu_q.dtype)
+    if workspace is not None and torch.cuda.is_current_stream_capturing():
+        state = getattr(workspace, "_vibecuda_uniform_q_lengths", {})
+        if workspace_key not in state:
+            raise RuntimeError(
+                "VibeCUDA MSA prefill workspace was not warmed for this "
+                "cu_seqlens_q shape before CUDA graph capture"
+            )
+        return int(state[workspace_key])
 
     def resolve() -> int:
         lengths = (cu_q[1:] - cu_q[:-1]).cpu().tolist()
@@ -226,6 +250,12 @@ def _resolve_uniform_seqlen_q(cu_q: torch.Tensor, batch_size: int) -> int:
         if cached is not None and cached[0]() is cu_q and cached[1] == version:
             return cached[2]
     seqlen_q = resolve()
+    if workspace is not None:
+        state = getattr(workspace, "_vibecuda_uniform_q_lengths", None)
+        if state is None:
+            state = {}
+            workspace._vibecuda_uniform_q_lengths = state
+        state[workspace_key] = seqlen_q
     with _uniform_q_len_cache_lock:
         if len(_uniform_q_len_cache) >= 64:
             dead_keys = [
@@ -237,6 +267,52 @@ def _resolve_uniform_seqlen_q(cu_q: torch.Tensor, batch_size: int) -> int:
                 _uniform_q_len_cache.clear()
         _uniform_q_len_cache[tensor_id] = (weakref.ref(cu_q), version, seqlen_q)
     return seqlen_q
+
+
+def _validate_right_aligned_q_offset(
+    q_offset,
+    *,
+    cu_q: torch.Tensor,
+    cu_k: torch.Tensor,
+    workspace: Optional[MSASparseAttentionWorkspace],
+) -> None:
+    """Accept SGLang's explicit spelling of this backend's fixed alignment."""
+
+    if q_offset is None:
+        return
+    batch_size = int(cu_q.numel()) - 1
+    key = (
+        tuple(cu_q.shape),
+        tuple(cu_q.stride()),
+        tuple(cu_k.shape),
+        tuple(cu_k.stride()),
+    )
+    if workspace is not None and torch.cuda.is_current_stream_capturing():
+        if key not in getattr(workspace, "_vibecuda_right_aligned_offsets", set()):
+            raise RuntimeError(
+                "VibeCUDA MSA prefill workspace was not warmed with explicit "
+                "right-aligned q_offset values before CUDA graph capture"
+            )
+        return
+    offsets = _explicit_q_offsets(
+        q_offset,
+        batch_size=batch_size,
+        device=cu_q.device,
+        workspace=workspace,
+        name="vibecuda_prefill_q_offsets",
+    )
+    expected = (cu_k[1:] - cu_k[:-1]) - (cu_q[1:] - cu_q[:-1])
+    if not torch.equal(offsets, expected):
+        raise NotImplementedError(
+            "the vibecuda MSA backend supports explicit q_offset only when it "
+            "equals kv_len - q_len for every request (right-aligned queries)"
+        )
+    if workspace is not None:
+        state = getattr(workspace, "_vibecuda_right_aligned_offsets", None)
+        if state is None:
+            state = set()
+            workspace._vibecuda_right_aligned_offsets = state
+        state.add(key)
 
 
 def _validate_inputs(
@@ -323,6 +399,14 @@ def _validate_inputs(
                 "page_table must be contiguous CUDA int32 with shape "
                 "(batch_size, max_pages)"
             )
+        if (
+            not isinstance(seqused_k, torch.Tensor)
+            or seqused_k.device != q.device
+            or seqused_k.dtype != torch.int32
+            or seqused_k.ndim != 1
+            or not seqused_k.is_contiguous()
+        ):
+            raise ValueError("seqused_k must be contiguous CUDA int32 on q's device")
     elif not causal and cu_seqlens_k is None:
         # non-causal flat still needs cu_seqlens_k for batch membership
         pass
@@ -337,7 +421,6 @@ def _reject_unsupported_options(
     v_scale,
     k_global_scale,
     v_global_scale,
-    workspace,
 ) -> None:
     if return_softmax_lse or return_temperature_lse:
         raise NotImplementedError(
@@ -349,11 +432,6 @@ def _reject_unsupported_options(
     ):
         raise NotImplementedError(
             "K/V scale arguments are not supported by the vibecuda MSA backend"
-        )
-    if workspace is not None:
-        raise NotImplementedError(
-            "CUDA graph capture workspaces are not supported by the "
-            "vibecuda MSA backend"
         )
 
 
@@ -369,6 +447,7 @@ def _run(
     seqused_k: Optional[torch.Tensor],
     seqlen_q: int,
     causal: bool,
+    workspace: Optional[MSASparseAttentionWorkspace],
 ) -> torch.Tensor:
     device = q.device
     total_q, num_q_heads, num_kv_heads, group_size, kv_fp8 = _validate_inputs(
@@ -383,59 +462,118 @@ def _run(
     paged = page_table is not None
     kv_kind = 2 if kv_fp8 else (0 if q.dtype == torch.bfloat16 else 1)
 
-    out = torch.empty_like(q)
+    capturing = torch.cuda.is_current_stream_capturing()
+    if capturing and workspace is None:
+        raise RuntimeError(
+            "CUDA graph capture of the VibeCUDA MSA backend requires an "
+            "explicit MSASparseAttentionWorkspace warmed with the exact "
+            "tensors and capture stream"
+        )
+    if workspace is not None and not isinstance(workspace, MSASparseAttentionWorkspace):
+        raise TypeError("workspace must be an MSASparseAttentionWorkspace")
     target = _select_target(device)
     module = _get_module(target)
-
-    k_arg = k.view(torch.uint8) if kv_fp8 else k
-    v_arg = v.view(torch.uint8) if kv_fp8 else v
-
-    dummy_i32, dummy_f32 = _dummies(device)
-    ws_int, ws_float = dummy_i32, dummy_f32
-    need_i = need_f = 0
-
-    g16_ok = _g16_eligible(group_size, seqlen_q, topk, paged, kv_fp8)
-    if not g16_ok and _g4_eligible(
-        group_size,
-        paged,
-        kv_fp8,
-        topk,
-        batch_size,
-        int(page_table.shape[1]) if paged else 0,
-        num_kv_heads,
-        total_q,
-    ):
-        need_i, need_f = _g4_workspace(
-            total_q,
-            num_q_heads,
-            num_kv_heads,
+    stream_ptr = _stream_ptr(device)
+    context = workspace._lock if workspace is not None else nullcontext()
+    with context:
+        if workspace is not None:
+            _bind_workspace(
+                workspace,
+                device=device,
+                stream_ptr=stream_ptr,
+                capturing=capturing,
+            )
+        out = _workspace_buffer(
+            workspace,
+            "vibecuda_out",
+            tuple(q.shape),
+            dtype=q.dtype,
+            device=device,
+        )
+        k_arg = k.view(torch.uint8) if kv_fp8 else k
+        v_arg = v.view(torch.uint8) if kv_fp8 else v
+        if workspace is None:
+            dummy_i32, dummy_f32 = _dummies(device)
+        else:
+            dummy_i32 = _workspace_buffer(
+                workspace, "vibecuda_dummy_i32", (1,), dtype=torch.int32, device=device
+            )
+            dummy_f32 = _workspace_buffer(
+                workspace,
+                "vibecuda_dummy_f32",
+                (1,),
+                dtype=torch.float32,
+                device=device,
+            )
+        ws_int, ws_float = dummy_i32, dummy_f32
+        need_i = need_f = 0
+        g16_ok = _g16_eligible(group_size, seqlen_q, topk, paged, kv_fp8)
+        g4_ok = _g4_eligible(
+            group_size,
+            paged,
+            kv_fp8,
             topk,
             batch_size,
-            int(page_table.shape[1]),
+            int(page_table.shape[1]) if paged else 0,
+            num_kv_heads,
+            total_q,
         )
-        ws_int = torch.empty(need_i, dtype=torch.int32, device=device)
-        ws_float = torch.empty(need_f, dtype=torch.float32, device=device)
-
-    module.run(
-        q,
-        k_arg,
-        v_arg,
-        out,
-        q2k_indices,
-        cu_q,
-        cu_k,
-        page_table if paged else dummy_i32,
-        seqused_k if paged else dummy_i32,
-        ws_int,
-        ws_float,
-        kv_kind,
-        int(seqlen_q),
-        int(causal),
-        need_i,
-        need_f,
-        _stream_ptr(device),
-    )
-    return out
+        if not g16_ok and not g4_ok and topk > 36:
+            raise NotImplementedError(
+                "the VibeCUDA MSA general route supports topk <= 36; "
+                "larger topk requires the eligible GQA-16 prefill route"
+            )
+        if g4_ok:
+            need_i, need_f = _g4_workspace(
+                total_q,
+                num_q_heads,
+                num_kv_heads,
+                topk,
+                batch_size,
+                int(page_table.shape[1]),
+            )
+            ws_int = _workspace_buffer(
+                workspace,
+                "vibecuda_g4_int",
+                (need_i,),
+                dtype=torch.int32,
+                device=device,
+            )
+            ws_float = _workspace_buffer(
+                workspace,
+                "vibecuda_g4_float",
+                (need_f,),
+                dtype=torch.float32,
+                device=device,
+            )
+            ws_int[-4:].zero_()
+        page_arg = page_table if paged else dummy_i32
+        seqused_arg = seqused_k if paged else dummy_i32
+        tensors = (
+            q,
+            k_arg,
+            v_arg,
+            out,
+            q2k_indices,
+            cu_q,
+            cu_k,
+            page_arg,
+            seqused_arg,
+            ws_int,
+            ws_float,
+        )
+        scalars = (kv_kind, int(seqlen_q), int(causal), need_i, need_f)
+        signature = _launch_signature(
+            variant="vibecuda",
+            target=target,
+            tensors=tensors,
+            scalars=scalars,
+            grid=(1, 1, 1),
+        )
+        _check_warmed_launch(workspace, signature, capturing=capturing)
+        module.run(*tensors, *scalars, stream_ptr)
+        _record_successful_launch(workspace, signature, capturing=capturing)
+        return out
 
 
 def vibecuda_msa_sparse_attention(
@@ -462,6 +600,8 @@ def vibecuda_msa_sparse_attention(
     """Sparse prefill on the VibeCUDA backend (compute capability 10.0/10.3)."""
 
     del lse_temperature_scale
+    if workspace is not None and not isinstance(workspace, MSASparseAttentionWorkspace):
+        raise TypeError("workspace must be an MSASparseAttentionWorkspace")
     _reject_unsupported_options(
         return_softmax_lse=return_softmax_lse,
         return_temperature_lse=return_temperature_lse,
@@ -469,13 +609,7 @@ def vibecuda_msa_sparse_attention(
         v_scale=v_scale,
         k_global_scale=k_global_scale,
         v_global_scale=v_global_scale,
-        workspace=workspace,
     )
-    if q_offset is not None:
-        raise NotImplementedError(
-            "the vibecuda MSA backend always right-aligns queries to the KV "
-            "sequence (q_offset=None semantics)"
-        )
     if softmax_scale is not None and abs(float(softmax_scale) - 128**-0.5) > 1e-12:
         raise NotImplementedError(
             "the vibecuda MSA backend uses the fixed head_dim**-0.5 softmax scale"
@@ -490,11 +624,21 @@ def vibecuda_msa_sparse_attention(
         raise ValueError("paged K/V requires seqused_k")
     if cu_seqlens_k is None:
         # derive from seqused_k (paged path kernels only need the lengths).
-        cu_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=q.device)
-        cu_k[1:] = seqused_k.to(torch.int32).cumsum(0, dtype=torch.int32)
+        cu_k = _workspace_buffer(
+            workspace,
+            "vibecuda_prefill_cu_k",
+            (batch_size + 1,),
+            dtype=torch.int32,
+            device=q.device,
+        )
+        cu_k[0].zero_()
+        torch.cumsum(seqused_k, 0, dtype=torch.int32, out=cu_k[1:])
     else:
         cu_k = cu_seqlens_k
-    seqlen_q = _resolve_uniform_seqlen_q(cu_q, batch_size)
+    _validate_right_aligned_q_offset(
+        q_offset, cu_q=cu_q, cu_k=cu_k, workspace=workspace
+    )
+    seqlen_q = _resolve_uniform_seqlen_q(cu_q, batch_size, workspace)
     return _run(
         q=q,
         k=k,
@@ -506,6 +650,7 @@ def vibecuda_msa_sparse_attention(
         seqused_k=seqused_k,
         seqlen_q=seqlen_q,
         causal=causal,
+        workspace=workspace,
     )
 
 
@@ -547,7 +692,6 @@ def vibecuda_msa_sparse_decode_attention(
         v_scale=v_scale,
         k_global_scale=k_global_scale,
         v_global_scale=v_global_scale,
-        workspace=workspace,
     )
     if q_offset is not None:
         raise NotImplementedError(
@@ -558,6 +702,8 @@ def vibecuda_msa_sparse_decode_attention(
         raise NotImplementedError(
             "the vibecuda MSA backend uses the fixed head_dim**-0.5 softmax scale"
         )
+    if workspace is not None and not isinstance(workspace, MSASparseAttentionWorkspace):
+        raise TypeError("workspace must be an MSASparseAttentionWorkspace")
     if force_fused not in (None, True, False):
         raise ValueError("force_fused must be True, False, or None")
     total_q = int(q.shape[0])
@@ -575,8 +721,15 @@ def vibecuda_msa_sparse_decode_attention(
     if page_table is not None and seqused_k is None:
         raise ValueError("paged K/V requires seqused_k")
     if cu_seqlens_k is None:
-        cu_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=q.device)
-        cu_k[1:] = seqused_k.to(torch.int32).cumsum(0, dtype=torch.int32)
+        cu_k = _workspace_buffer(
+            workspace,
+            "vibecuda_decode_cu_k",
+            (batch_size + 1,),
+            dtype=torch.int32,
+            device=q.device,
+        )
+        cu_k[0].zero_()
+        torch.cumsum(seqused_k, 0, dtype=torch.int32, out=cu_k[1:])
     else:
         cu_k = cu_seqlens_k
     cu_q = _uniform_cu_q(batch_size, int(seqlen_q), q.device)
@@ -591,6 +744,7 @@ def vibecuda_msa_sparse_decode_attention(
         seqused_k=seqused_k,
         seqlen_q=int(seqlen_q),
         causal=causal,
+        workspace=workspace,
     )
 
 

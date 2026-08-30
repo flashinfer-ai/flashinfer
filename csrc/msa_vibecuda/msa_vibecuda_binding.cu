@@ -81,7 +81,7 @@ inline void CheckDevice(int32_t device_id) {
 inline int64_t G4WorkspaceInts(int64_t nbuckets, int64_t hn, int64_t topk, int64_t rows_bound,
                                int64_t tiles_bound) {
   return nbuckets * 2 + hn + (nbuckets + 1) * 2 + nbuckets * 5 + tiles_bound + hn * topk +
-         rows_bound + 1;
+         rows_bound + 1 + 4;
 }
 
 }  // namespace
@@ -109,8 +109,10 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
   CheckDtype(arg_q, "q", is_bf16 ? 4 : 2, 16, 1);
 
   CheckCudaTensor(arg_k, "k");
+  CheckSameCudaDevice(arg_k, arg_q, "k", "q");
   CheckContiguous(arg_k, "k");
   CheckCudaTensor(arg_v, "v");
+  CheckSameCudaDevice(arg_v, arg_q, "v", "q");
   CheckContiguous(arg_v, "v");
   TVM_FFI_CHECK(arg_k.ndim() == arg_v.ndim() && (arg_k.ndim() == 3 || arg_k.ndim() == 4),
                 ValueError)
@@ -133,6 +135,7 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
   }
 
   CheckCudaTensor(arg_out, "out");
+  CheckSameCudaDevice(arg_out, arg_q, "out", "q");
   CheckContiguous(arg_out, "out");
   CheckDtype(arg_out, "out", is_bf16 ? 4 : 2, 16, 1);
   TVM_FFI_CHECK(arg_out.ndim() == 3 && arg_out.size(0) == arg_q.size(0) &&
@@ -141,12 +144,15 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
       << "out must match q's (total_q, num_q_heads, 128)";
 
   CheckCudaTensor(arg_q2k, "q2k_indices");
+  CheckSameCudaDevice(arg_q2k, arg_q, "q2k_indices", "q");
   CheckContiguous(arg_q2k, "q2k_indices");
   CheckDtype(arg_q2k, "q2k_indices", 0, 32, 1);
   CheckCudaTensor(arg_cu_q, "cu_seqlens_q");
+  CheckSameCudaDevice(arg_cu_q, arg_q, "cu_seqlens_q", "q");
   CheckContiguous(arg_cu_q, "cu_seqlens_q");
   CheckDtype(arg_cu_q, "cu_seqlens_q", 0, 32, 1);
   CheckCudaTensor(arg_cu_k, "cu_seqlens_k");
+  CheckSameCudaDevice(arg_cu_k, arg_q, "cu_seqlens_k", "q");
   CheckContiguous(arg_cu_k, "cu_seqlens_k");
   CheckDtype(arg_cu_k, "cu_seqlens_k", 0, 32, 1);
 
@@ -177,11 +183,13 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
   const int* seqused_ptr = nullptr;
   if (paged) {
     CheckCudaTensor(arg_page_table, "page_table");
+    CheckSameCudaDevice(arg_page_table, arg_q, "page_table", "q");
     CheckContiguous(arg_page_table, "page_table");
     CheckDtype(arg_page_table, "page_table", 0, 32, 1);
     TVM_FFI_CHECK(arg_page_table.size(0) == nbatch, ValueError)
         << "page_table must have batch rows";
     CheckCudaTensor(arg_seqused_k, "seqused_k");
+    CheckSameCudaDevice(arg_seqused_k, arg_q, "seqused_k", "q");
     CheckContiguous(arg_seqused_k, "seqused_k");
     CheckDtype(arg_seqused_k, "seqused_k", 0, 32, 1);
     TVM_FFI_CHECK(arg_seqused_k.ndim() == 1 && arg_seqused_k.size(0) == nbatch, ValueError)
@@ -254,9 +262,11 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
         << "g4 float workspace too small: need " << need_f << ", plan returned "
         << arg_ws_float_need;
     CheckCudaTensor(arg_ws_int, "ws_int");
+    CheckSameCudaDevice(arg_ws_int, arg_q, "ws_int", "q");
     CheckContiguous(arg_ws_int, "ws_int");
     CheckDtype(arg_ws_int, "ws_int", 0, 32, 1);
     CheckCudaTensor(arg_ws_float, "ws_float");
+    CheckSameCudaDevice(arg_ws_float, arg_q, "ws_float", "q");
     CheckContiguous(arg_ws_float, "ws_float");
     CheckDtype(arg_ws_float, "ws_float", 2, 32, 1);
     msa_umma_g4::umma_g4_forward(arg_q.data_ptr(), is_bf16, arg_k.data_ptr(), arg_v.data_ptr(),
@@ -268,6 +278,9 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_ou
                                  (float*)arg_ws_float.data_ptr(), seqlen_q, causal, stream);
     return;
   }
+  TVM_FFI_CHECK(topk <= 36, ValueError)
+      << "the VibeCUDA MSA general route supports topk <= 36; larger topk requires "
+         "the eligible GQA-16 prefill route";
   ::msa_vibecuda::KvLayout kv;
   kv.d0 = arg_k.size(0);
   kv.d1 = num_kv_heads;

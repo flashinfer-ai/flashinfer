@@ -8,9 +8,9 @@ implementation and input generator as the CAKE SM100 tests:
   3. the general per-token / packed-pair HMMA fallback (any group, flat or
      paged, fp8 K/V included).
 
-The backend intentionally rejects LSE outputs, K/V scale arguments, CUDA
-graph workspaces, ragged prefill ``cu_seqlens_q``, and non-default softmax
-scales with loud errors; those contracts are asserted directly.
+The backend intentionally rejects LSE outputs, K/V scale arguments, ragged
+prefill ``cu_seqlens_q``, and non-default softmax scales with loud errors.
+Caller-owned workspaces are exercised through warm/capture/replay below.
 """
 
 from typing import Any
@@ -30,7 +30,7 @@ HEAD_DIM = 128
 
 
 def _case(operation: str, **kwargs: Any) -> dict[str, Any]:
-    # The VibeCUDA backend emits no LSE outputs and captures no CUDA graphs.
+    # The VibeCUDA backend emits no LSE outputs.
     return attention_case(
         operation,
         use_workspace=False,
@@ -187,7 +187,7 @@ CASES = [
 ]
 
 
-def _run_vibecuda(inputs: dict[str, Any]) -> torch.Tensor:
+def _run_vibecuda(inputs: dict[str, Any], workspace=None) -> torch.Tensor:
     from flashinfer.msa_ops import msa_sparse_attention, msa_sparse_decode_attention
 
     if inputs["operation"] == "sparse_prefill":
@@ -201,6 +201,7 @@ def _run_vibecuda(inputs: dict[str, Any]) -> torch.Tensor:
             causal=inputs["causal"],
             page_table=inputs["page_table"],
             seqused_k=inputs["seqused_k"],
+            workspace=workspace,
             backend="vibecuda",
         )
     return msa_sparse_decode_attention(
@@ -214,6 +215,7 @@ def _run_vibecuda(inputs: dict[str, Any]) -> torch.Tensor:
         seqlen_q=inputs["seqlen_q"],
         causal=inputs["causal"],
         force_fused=inputs["force_fused"],
+        workspace=workspace,
         backend="vibecuda",
     )
 
@@ -228,50 +230,6 @@ def test_vibecuda_msa_public_api_correctness(case: dict[str, Any]) -> None:
     assert actual.dtype == inputs["q"].dtype
     tolerance = 0.1 if inputs["kv_dtype"] == FP8 else 0.01
     torch.testing.assert_close(actual, expected, atol=tolerance, rtol=tolerance)
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        pytest.param(CASES[0].values[0], id=CASES[0].id),
-        pytest.param(CASES[3].values[0], id=CASES[3].id),
-        pytest.param(CASES[2].values[0], id=CASES[2].id),
-    ],
-)
-def test_default_backend_remains_sm12_only(case: dict[str, Any]) -> None:
-    """Adding VibeCUDA must not change current-main ``auto`` dispatch."""
-    device = require_supported_msa_gpu()
-    from flashinfer.msa_ops import msa_sparse_attention, msa_sparse_decode_attention
-
-    inputs = make_attention_inputs(case, device)
-    with pytest.raises(RuntimeError, match="SM120 or SM121"):
-        if inputs["operation"] == "sparse_prefill":
-            msa_sparse_attention(
-                inputs["q"],
-                inputs["k"],
-                inputs["v"],
-                inputs["q2k_indices"],
-                inputs["cu_seqlens_q"],
-                inputs["cu_seqlens_k"],
-                causal=inputs["causal"],
-                page_table=inputs["page_table"],
-                seqused_k=inputs["seqused_k"],
-                backend="auto",
-            )
-        else:
-            msa_sparse_decode_attention(
-                inputs["q"],
-                inputs["k"],
-                inputs["v"],
-                inputs["q2k_indices"],
-                page_table=inputs["page_table"],
-                seqused_k=inputs["seqused_k"],
-                cu_seqlens_k=inputs["cu_seqlens_k"],
-                causal=inputs["causal"],
-                backend="auto",
-                seqlen_q=inputs["seqlen_q"],
-                force_fused=inputs["force_fused"],
-            )
 
 
 def test_vibecuda_route_mirrors() -> None:
@@ -333,7 +291,7 @@ def test_vibecuda_rejects_unsupported_options() -> None:
         msa_sparse_attention(
             *positional, causal=True, return_softmax_lse=True, backend="vibecuda"
         )
-    with pytest.raises(NotImplementedError, match="CUDA graph capture"):
+    with pytest.raises(TypeError, match="MSASparseAttentionWorkspace"):
         msa_sparse_attention(
             *positional, causal=True, workspace=object(), backend="vibecuda"
         )
@@ -351,6 +309,95 @@ def test_vibecuda_rejects_unsupported_options() -> None:
             ragged["cu_seqlens_q"],
             ragged["cu_seqlens_k"],
             causal=True,
+            backend="vibecuda",
+        )
+
+
+def test_vibecuda_accepts_only_right_aligned_explicit_q_offsets() -> None:
+    device = require_supported_msa_gpu()
+    from flashinfer.msa_ops import msa_sparse_attention
+
+    inputs = _sample_prefill_args(device, [256, 256])
+    positional = (
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["q2k_indices"],
+        inputs["cu_seqlens_q"],
+        inputs["cu_seqlens_k"],
+    )
+    right_aligned = torch.full((2,), 2048 - 256, dtype=torch.int32, device=device)
+    msa_sparse_attention(
+        *positional,
+        causal=True,
+        q_offset=right_aligned,
+        backend="vibecuda",
+    )
+    with pytest.raises(NotImplementedError, match="right-aligned queries"):
+        msa_sparse_attention(
+            *positional,
+            causal=True,
+            q_offset=right_aligned - 1,
+            backend="vibecuda",
+        )
+
+
+@pytest.mark.parametrize(
+    "case", [CASES[0].values[0], CASES[2].values[0], CASES[3].values[0]]
+)
+def test_vibecuda_workspace_cuda_graph_replays_new_values(case: dict[str, Any]) -> None:
+    device = require_supported_msa_gpu()
+    from flashinfer.msa_ops import MSASparseAttentionWorkspace
+
+    inputs = make_attention_inputs(case, device)
+    workspace = MSASparseAttentionWorkspace(device)
+
+    def run():
+        return _run_vibecuda(inputs, workspace)
+
+    capture_stream = torch.cuda.Stream(device=device)
+    capture_stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(capture_stream):
+        run()
+    capture_stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        captured = run()
+
+    inputs["q"].normal_(mean=0.0, std=0.2)
+    expected = reference_attention(inputs)[0]
+    graph.replay()
+    torch.cuda.synchronize(device)
+    torch.testing.assert_close(captured, expected, atol=0.01, rtol=0.01)
+
+
+def test_vibecuda_general_route_rejects_topk_over_shared_list_bound() -> None:
+    device = require_supported_msa_gpu()
+    from flashinfer.msa_ops import msa_sparse_decode_attention
+
+    case = _case(
+        "sparse_decode",
+        q_dtype="bfloat16",
+        kv_dtype="bfloat16",
+        kv_layout="flat_varlen",
+        batch_size=1,
+        seqlen_q=1,
+        seqlen_kv=8192,
+        num_q_heads=8,
+        num_kv_heads=1,
+        topk=40,
+        causal=True,
+        force_fused=True,
+        seed=151,
+    )
+    inputs = make_attention_inputs(case, device)
+    with pytest.raises(NotImplementedError, match="topk <= 36"):
+        msa_sparse_decode_attention(
+            inputs["q"],
+            inputs["k"],
+            inputs["v"],
+            inputs["q2k_indices"],
+            cu_seqlens_k=inputs["cu_seqlens_k"],
             backend="vibecuda",
         )
 
