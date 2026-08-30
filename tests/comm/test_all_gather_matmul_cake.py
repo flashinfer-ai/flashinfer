@@ -180,7 +180,7 @@ def test_packaged_program_has_self_contained_pointer_abi(arch):
     assert backend._resolved_main_smem_bytes(source) == 197632
 
 
-def test_sm103_bf16_ws4_derives_private_packed_width_from_grid():
+def test_packaged_bf16_ws4_derives_private_packed_width_from_grid():
     backend = _backend()
 
     source_path, manifest = backend._program_source("sm_103a")
@@ -189,12 +189,11 @@ def test_sm103_bf16_ws4_derives_private_packed_width_from_grid():
         1
     ].split("} // extern", 1)[0]
 
-    assert "active_tiles = chunk_tiles_m * n_tiles" in function
-    assert "active_tiles_1 = chunk_tiles_m_1 * n_tiles" in function
-    assert "active_tiles_2 = chunk_tiles_m_2 * n_tiles" in function
-    assert "const int n_tiles = num_bids / first_chunk_tiles_m;" in function
-    assert "const int output_n = n_tiles * 256;" in function
-    assert "(out_m + epi_tid) * output_n" in function
+    n_tiles = "(num_bids / (((M < 2432) ? M : 2432) / 128))"
+    assert f"active_tiles = chunk_tiles_m * {n_tiles}" in function
+    assert f"active_tiles_1 = chunk_tiles_m_1 * {n_tiles}" in function
+    assert f"active_tiles_2 = chunk_tiles_m_2 * {n_tiles}" in function
+    assert f"(out_m + epi_tid) * ({n_tiles} * 256)" in function
     assert manifest["constraints"]["n_by_world_size"] == {
         "2": [2048],
         "4": [2048],
@@ -207,7 +206,7 @@ def test_sm103_bf16_ws4_derives_private_packed_width_from_grid():
     assert "kPackedQkvExperimentSupported =\n    true;" in rendered
 
     sm100_source, _ = backend._program_source("sm_100a")
-    assert b"n_tiles" not in sm100_source.read_bytes()
+    assert sm100_source.read_bytes() == source_path.read_bytes()
 
 
 @pytest.mark.parametrize(
@@ -572,6 +571,7 @@ def test_consecutive_calls_return_fresh_outputs_without_overwriting(monkeypatch)
         record_stream=lambda stream: input_streams.append(stream),
     )
     weight = SimpleNamespace(
+        shape=(8192, 2048),
         record_stream=lambda stream: weight_streams.append(stream),
     )
     group = object()
