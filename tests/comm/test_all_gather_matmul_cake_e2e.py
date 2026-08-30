@@ -59,12 +59,8 @@ def _run_cake_subgroup(rank: int, world_size: int, port: int, dtype: torch.dtype
         torch.cuda.current_stream(device).wait_stream(packed_stream)
         assert packed_first.data_ptr() != packed_second.data_ptr()
         torch.testing.assert_close(packed_first, packed_first_snapshot, atol=0, rtol=0)
-        torch.testing.assert_close(
-            packed_first, packed_expected, atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(
-            packed_second, packed_expected, atol=1e-2, rtol=1e-2
-        )
+        torch.testing.assert_close(packed_first, packed_expected, atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(packed_second, packed_expected, atol=1e-2, rtol=1e-2)
         del (
             active_inp,
             packed_expected,

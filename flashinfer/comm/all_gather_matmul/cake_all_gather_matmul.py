@@ -70,7 +70,7 @@ _MANIFEST_KEYS = frozenset(
     }
 )
 _SMEM_TOTAL_PATTERN = re.compile(rb"^#define SMEM_TOTAL ([1-9][0-9]*)$", re.MULTILINE)
-_COMMON_CONSTRAINTS = {
+_COMMON_CONSTRAINTS: dict[str, Any] = {
     "dtypes": ["float16", "bfloat16"],
     "k": 8192,
     "m_multiple": 128,
@@ -982,7 +982,9 @@ def _validate_inputs(
     world_size = int(dist.get_world_size(group))
     rank = int(dist.get_rank(group))
     if world_size not in _SUPPORTED_WORLD_SIZES:
-        raise ValueError("the Cake backend requires process-group world size 2, 4, or 8")
+        raise ValueError(
+            "the Cake backend requires process-group world size 2, 4, or 8"
+        )
     if not 0 <= rank < world_size:
         raise RuntimeError("process-group rank is outside its world size")
     if packed_qkv_experiment:
@@ -1008,12 +1010,8 @@ def _validate_inputs(
             "the Cake backend requires the NVSHMEM symmetric-memory backend"
         )
     arch = _target_arch(inp.device)
-    if packed_qkv_experiment and (
-        arch != "sm_103a" or inp.dtype != torch.bfloat16
-    ):
-        raise ValueError(
-            "the packed-QKV experiment requires SM103 and bfloat16"
-        )
+    if packed_qkv_experiment and (arch != "sm_103a" or inp.dtype != torch.bfloat16):
+        raise ValueError("the packed-QKV experiment requires SM103 and bfloat16")
     return device_index, rank, world_size, _group_name(group)
 
 
@@ -1481,12 +1479,12 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103(
             )
             padding = 7 - len(peer_routes)
             native_peer_routes = tuple(peer_routes) + (peer_routes[-1],) * padding
-            native_peer_scratch_ptrs = peer_scratch_ptrs + (
-                peer_scratch_ptrs[-1],
-            ) * padding
-            native_peer_signal_ptrs = peer_signal_ptrs + (
-                peer_signal_ptrs[-1],
-            ) * padding
+            native_peer_scratch_ptrs = (
+                peer_scratch_ptrs + (peer_scratch_ptrs[-1],) * padding
+            )
+            native_peer_signal_ptrs = (
+                peer_signal_ptrs + (peer_signal_ptrs[-1],) * padding
+            )
             native_peer_args = tuple(
                 tensor for route in native_peer_routes for tensor in route
             )
@@ -1495,6 +1493,7 @@ def _prepare_all_gather_matmul_cake_packed_qkv_sm103(
                 for pair in zip(
                     native_peer_scratch_ptrs,
                     native_peer_signal_ptrs,
+                    strict=True,
                 )
                 for pointer in pair
             )

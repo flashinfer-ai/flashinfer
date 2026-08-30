@@ -204,9 +204,7 @@ def test_packaged_bf16_ws4_derives_private_packed_width_from_grid():
         "dtypes": ["bfloat16"],
         "n_by_world_size": {"4": [2560], "8": [1280]},
     }
-    assert manifest["launch"]["main"]["grid_x"] == (
-        "(min(M, 2432) / 128) * (N / 256)"
-    )
+    assert manifest["launch"]["main"]["grid_x"] == ("(min(M, 2432) / 128) * (N / 256)")
     rendered = backend._render_host_source("test_module", manifest)
     assert "kPackedQkvExperimentSupported =\n    true;" in rendered
 
@@ -917,9 +915,7 @@ def test_validate_inputs_keeps_packed_qkv_routes_private(
     monkeypatch.setattr(backend.dist, "is_available", lambda: True)
     monkeypatch.setattr(backend.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(backend.dist, "get_backend", lambda group: "nccl")
-    monkeypatch.setattr(
-        backend.dist, "get_world_size", lambda group: world_size
-    )
+    monkeypatch.setattr(backend.dist, "get_world_size", lambda group: world_size)
     monkeypatch.setattr(backend.dist, "get_rank", lambda group: rank)
     monkeypatch.setattr(backend.symm_mem, "get_backend", lambda device: "NVSHMEM")
     monkeypatch.setattr(backend, "_target_arch", lambda device: "sm_103a")
@@ -1047,9 +1043,7 @@ def _fake_prepared_packed_qkv(
     device = torch.device("cuda", device_index)
     inp = _FakePreparedTensor(1001, (128, 8192), torch.bfloat16, device)
     weight = _FakePreparedTensor(2001, (8192, n), torch.bfloat16, device)
-    scratch = _FakePreparedTensor(
-        3001, (world_size, 128, 8192), torch.bfloat16, device
-    )
+    scratch = _FakePreparedTensor(3001, (world_size, 128, 8192), torch.bfloat16, device)
     group = SimpleNamespace(group_name="tp-group")
     module = SimpleNamespace(name="bound-module")
 
@@ -1253,14 +1247,12 @@ def test_prepare_packed_qkv_binds_host_identity_once(monkeypatch):
 
 def test_prepare_packed_qkv_tp8_binds_and_submits_all_seven_peers(monkeypatch):
     backend = _backend()
-    launcher, inp, weight, _, state, workspace, module, _ = (
-        _fake_prepared_packed_qkv(
-            monkeypatch,
-            backend,
-            world_size=8,
-            rank=7,
-            device_index=7,
-        )
+    launcher, inp, weight, _, state, workspace, module, _ = _fake_prepared_packed_qkv(
+        monkeypatch,
+        backend,
+        world_size=8,
+        rank=7,
+        device_index=7,
     )
 
     assert launcher.world_size == 8
@@ -1278,6 +1270,7 @@ def test_prepare_packed_qkv_tp8_binds_and_submits_all_seven_peers(monkeypatch):
         for pair in zip(
             launcher.peer_scratch_ptrs,
             launcher.peer_signal_ptrs,
+            strict=True,
         )
         for pointer in pair
     )
@@ -1315,9 +1308,7 @@ def test_prepare_packed_qkv_tp8_binds_and_submits_all_seven_peers(monkeypatch):
     module.run_prepared_packed_qkv = lambda *args: submissions.append(args)
 
     assert launcher(inp) is output
-    assert allocations == [
-        ((8 * 128, 1280), {"dtype": torch.bfloat16, "device": 7})
-    ]
+    assert allocations == [((8 * 128, 1280), {"dtype": torch.bfloat16, "device": 7})]
     assert len(submissions) == 1
     submission = submissions[0]
     assert submission[7:21] == launcher.native_peer_args
