@@ -24,6 +24,7 @@ Algorithm (push-wait):
 Routing:
     - SM >= 100 (Blackwell+): cuTile implementation (all_gather_matmul_cutile)
     - SM <  100             : Triton implementation  (all_gather_matmul_triton)
+    - ``backend="cake"``    : exact source-built SM100/SM103 implementation
 
 Example (run with torchrun or mp.spawn across all GPU ranks)::
 
@@ -49,12 +50,12 @@ Example (run with torchrun or mp.spawn across all GPU ranks)::
     out = all_gather_matmul(inp, w, group)
 """
 
+from typing import Callable
+
 import torch
 import torch.distributed as dist
 
 from flashinfer.utils import register_custom_op
-from .all_gather_matmul_cutile import all_gather_matmul_cutile
-from .all_gather_matmul_triton import all_gather_matmul_triton
 
 
 @register_custom_op(
@@ -66,10 +67,54 @@ def all_gather_matmul(
     w: torch.Tensor,
     group: dist.ProcessGroup,
     *,
+    backend: str = "auto",
     verbose: bool = False,
 ):
-    """Push-wait all-gather matmul; dispatches to cuTile (SM>=100) or Triton."""
+    """Run push-wait all-gather matmul.
+
+    ``backend="auto"`` preserves the existing cuTile-on-Blackwell and
+    Triton-otherwise routing. ``backend="cake"`` selects the exact
+    source-built Blackwell implementation and rejects unsupported inputs.
+    """
+    if backend == "cake":
+        from .cake_all_gather_matmul import all_gather_matmul_cake
+
+        return all_gather_matmul_cake(inp, w, group, backend="cake", verbose=verbose)
+    if backend != "auto":
+        raise ValueError("backend must be exactly 'auto' or 'cake'")
     major, _ = torch.cuda.get_device_capability(inp.device)
     if major >= 10:
+        from .all_gather_matmul_cutile import all_gather_matmul_cutile
+
         return all_gather_matmul_cutile(inp, w, group, verbose=verbose)
+    from .all_gather_matmul_triton import all_gather_matmul_triton
+
     return all_gather_matmul_triton(inp, w, group, verbose=verbose)
+
+
+def prepare_all_gather_matmul(
+    inp: torch.Tensor,
+    w: torch.Tensor,
+    group: dist.ProcessGroup,
+    *,
+    backend: str = "auto",
+    verbose: bool = False,
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """Prepare the packed-QKV all-gather matmul launcher.
+
+    The returned callable binds ``w`` and ``group`` and accepts a new input
+    tensor with the same shape, dtype, and device as ``inp``. Both
+    ``backend="auto"`` and ``backend="cake"`` select the source-built
+    prepared launcher. Unsupported inputs raise during preparation instead of
+    falling back to another implementation.
+    """
+    if backend not in {"auto", "cake"}:
+        raise ValueError("backend must be exactly 'auto' or 'cake'")
+
+    from .cake_all_gather_matmul import (
+        _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4,
+    )
+
+    return _prepare_all_gather_matmul_cake_packed_qkv_sm103_tp4(
+        inp, w, group, verbose=verbose
+    )

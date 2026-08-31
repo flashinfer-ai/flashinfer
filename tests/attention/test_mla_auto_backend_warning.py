@@ -39,18 +39,24 @@ def buf():
     return torch.empty(8 * 1024 * 1024, dtype=torch.int8, device="cuda")
 
 
-@patch("flashinfer.mla._core.get_compute_capability", return_value=(10, 0))
+@patch(
+    "flashinfer.mla._batch_mla._wrapper._get_compute_capability", return_value=(10, 0)
+)
 def test_auto_warns_once_on_blackwell(_cc, buf):
     assert len(_make(buf, "auto")) == 1
     assert len(_make(buf, "auto")) == 0  # one-time
 
 
-@patch("flashinfer.mla._core.get_compute_capability", return_value=(10, 0))
+@patch(
+    "flashinfer.mla._batch_mla._wrapper._get_compute_capability", return_value=(10, 0)
+)
 def test_explicit_backend_does_not_warn(_cc, buf):
     assert _make(buf, "fa2") == []
     assert _make(buf, "cutlass") == []
 
 
-@patch("flashinfer.mla._core.get_compute_capability", return_value=(9, 0))
+@patch(
+    "flashinfer.mla._batch_mla._wrapper._get_compute_capability", return_value=(9, 0)
+)
 def test_no_warn_on_hopper(_cc, buf):
     assert _make(buf, "auto") == []

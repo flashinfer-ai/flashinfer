@@ -23,6 +23,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Test public API checker
+        id: public_api_tests
+        continue-on-error: true
+        run: python -m unittest discover -s scripts/tests -p 'test_check_pr_api_diff.py' -v
+
       - name: Check public API signature and export changes
         id: public_api
         continue-on-error: true
@@ -68,6 +73,7 @@ jobs:
       - name: Record non-blocking checker status
         if: always()
         env:
+          PUBLIC_API_TEST_OUTCOME: ${{ steps.public_api_tests.outcome }}
           PUBLIC_API_OUTCOME: ${{ steps.public_api.outcome }}
           STATIC_DOCUMENTATION_OUTCOME: ${{ steps.static_documentation.outcome }}
         run: |
@@ -78,6 +84,7 @@ jobs:
           from pathlib import Path
 
           outcomes = {
+              "public_api_tests": os.environ["PUBLIC_API_TEST_OUTCOME"],
               "public_api": os.environ["PUBLIC_API_OUTCOME"],
               "static_documentation": os.environ["STATIC_DOCUMENTATION_OUTCOME"],
           }
