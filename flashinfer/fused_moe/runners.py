@@ -204,8 +204,20 @@ def _validate_logits_inputs(
             f"({num_tokens}, {num_experts}) (num_tokens, num_experts) — "
             "routing scores are over the GLOBAL expert set."
         )
-    if not logits.is_contiguous():
-        raise ValueError(f"{runner}: routing_logits must be contiguous.")
+    # The trtllm-gen routing kernels index score rows with a row stride, so a
+    # strided (e.g. sliced) logits tensor is fine as long as each row is
+    # contiguous and rows do not overlap. See DataBase::mStrideScores in
+    # include/flashinfer/trtllm/fused_moe/RoutingKernel.h.
+    if logits.stride(1) != 1:
+        raise ValueError(
+            f"{runner}: routing_logits must be contiguous along the expert "
+            f"dimension (stride(1) == 1), got strides {logits.stride()}."
+        )
+    if num_tokens > 1 and logits.stride(0) < num_experts:
+        raise ValueError(
+            f"{runner}: routing_logits rows must not overlap: stride(0) must be "
+            f">= num_experts ({num_experts}), got strides {logits.stride()}."
+        )
     if act.routing_bias is not None:
         if act.routing_bias.dtype not in (torch.bfloat16, torch.float32):
             raise TypeError(

@@ -93,7 +93,7 @@ struct DataBase {
   // If it is given, it represents the scores without sigmoid activation for
   // each token and expert.
   // note: if it is provided, we always re-compute the top1 scores
-  // dim: [mNumTokens, mNumExperts]
+  // dim: [mNumTokens, mNumExperts], rows `mStrideScores` elements apart
   void const* mPtrScores{nullptr};
 
   //
@@ -130,6 +130,17 @@ struct DataBase {
   int16_t* mPtrRoutingReplayOut{nullptr};
   // optional: final token count for each expert, separate from histogram scratch
   int32_t* mPtrNumTokensPerExpert{nullptr};
+  // Row stride of `mPtrScores` in elements, i.e. the distance between the score
+  // rows of two consecutive tokens. 0 (the default) means the rows are tightly
+  // packed and the stride is mNumExperts; any other value must be >= mNumExperts
+  // (0 is the "packed" sentinel, so it cannot double as an overlapping stride).
+  // Only the token dimension may be strided: the scores *within* a row must stay
+  // contiguous (unit expert stride), which is what a view into a wider router
+  // output looks like (e.g. `logits[:, :num_experts]` of a padded buffer, or a
+  // token slice of a larger allocation).
+  // NOTE: appended at the end of the struct for the same reason as
+  // mPtrRoutingReplayOut above.
+  int64_t mStrideScores{0};
 };
 
 template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
@@ -176,6 +187,10 @@ struct KernelParamsBase {
   bool mUseContiguousRouteWindows = false;
   // Optional final token count for each expert, separate from histogram scratch.
   int32_t* mPtrNumTokensPerExpert = nullptr;
+  // Resolved row stride of mPtrScores in elements (see DataBase::mStrideScores).
+  // Always positive after setBaseParams(), so kernels index score rows with it
+  // unconditionally instead of assuming tightly packed rows.
+  int64_t mStrideScores = 0;
 
   // Public initialization function - make it a template to accept different Data types
   template <typename DataType>
@@ -196,6 +211,12 @@ struct KernelParamsBase {
     mPtrScores = (InputT const*)data.mPtrScores;
     mPtrRoutingReplayOut = data.mPtrRoutingReplayOut;
     mPtrNumTokensPerExpert = data.mPtrNumTokensPerExpert;
+    // Resolve the "tightly packed" default here so the kernels never have to.
+    // Note this must stay ahead of any host-side mutation of mNumExperts (the
+    // DeepSeek path bumps it by the fused shared experts *after* launching the
+    // score-reading kernel).
+    mStrideScores =
+        data.mStrideScores > 0 ? data.mStrideScores : static_cast<int64_t>(data.mNumExperts);
 
     mNumTokens = data.mNumTokens;
     mNumExperts = data.mNumExperts;

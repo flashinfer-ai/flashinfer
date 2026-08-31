@@ -926,6 +926,88 @@ def _run_trtllm_gen_bf16_routed_fused_moe_case(
     assert mismatch_pct < 10, f"Mismatch percentage is {mismatch_pct:.2f}%"
 
 
+def test_trtllm_gen_bf16_moe_strided_routing_logits():
+    """A strided routing_logits view must match its contiguous copy.
+
+    The routing kernels index score rows with a row stride
+    (DataBase::mStrideScores in RoutingKernel.h), so a window into a wider
+    router-output buffer is a supported input. This anchors the stride plumbing
+    through the fused launcher; the routing kernels themselves are covered
+    per-method by tests/moe/test_trtllm_gen_routing.py::test_strided_logits.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10]:
+        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    torch.manual_seed(42)
+    device = torch.device("cuda:0")
+    enable_pdl = device_support_pdl(device)
+    num_tokens, hidden_size, intermediate_size = 64, 1024, 1024
+    num_experts, top_k = 8, 2
+
+    logits = torch.rand(num_tokens, num_experts, device=device).to(torch.bfloat16)
+    # Window into a wider buffer, offset in both dimensions. The padding holds a
+    # value far above any real logit, so reading it would change the selection.
+    wide = torch.full(
+        (num_tokens + 3, num_experts + 5), 100.0, device=device, dtype=torch.bfloat16
+    )
+    strided_logits = wide[3:, 5:]
+    strided_logits.copy_(logits)
+    assert strided_logits.stride() == (num_experts + 5, 1)
+
+    hidden_states = (
+        torch.randn(num_tokens, hidden_size, device=device).to(torch.bfloat16) * 0.1
+    )
+    gemm1_weights = torch.randn(
+        num_experts, 2 * intermediate_size, hidden_size, device=device
+    ).to(torch.bfloat16)
+    gemm2_weights = torch.randn(
+        num_experts, hidden_size, intermediate_size, device=device
+    ).to(torch.bfloat16)
+    block_k = 128
+    gemm1_weights = torch.stack(
+        [
+            convert_to_block_layout(
+                shuffle_matrix_a(gemm1_weights[i].view(torch.uint8), 64), block_k
+            )
+            for i in range(num_experts)
+        ]
+    ).view(torch.bfloat16)
+    gemm2_weights = torch.stack(
+        [
+            convert_to_block_layout(
+                shuffle_matrix_a(gemm2_weights[i].view(torch.uint8), 64), block_k
+            )
+            for i in range(num_experts)
+        ]
+    ).view(torch.bfloat16)
+
+    def run(routing_logits):
+        return trtllm_bf16_moe(
+            routing_logits=routing_logits,
+            routing_bias=None,
+            hidden_states=hidden_states,
+            gemm1_weights=gemm1_weights,
+            gemm2_weights=gemm2_weights,
+            num_experts=num_experts,
+            top_k=top_k,
+            n_group=None,
+            topk_group=None,
+            intermediate_size=intermediate_size,
+            local_expert_offset=0,
+            local_num_experts=num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Renormalize.value,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.BlockMajorK,
+            do_finalize=True,
+            enable_pdl=enable_pdl,
+        )
+
+    # Identical inputs reached through a different row stride: the kernels are
+    # deterministic here, so the outputs must match exactly.
+    torch.testing.assert_close(run(strided_logits), run(logits), atol=0.0, rtol=0.0)
+
+
 @pytest.mark.parametrize("num_tokens", [8, 64])
 @pytest.mark.parametrize("hidden_size", [1024, 2048])
 @pytest.mark.parametrize("intermediate_size", [1024, 2048])

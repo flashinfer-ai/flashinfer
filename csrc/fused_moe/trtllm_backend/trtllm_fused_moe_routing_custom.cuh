@@ -88,7 +88,7 @@ __global__ void __launch_bounds__(KernelParams::MaxNumExperts <= 1024 ? KernelPa
 
   int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
   int32_t const laneIdx = cutlass::arch::LaneId();
-  auto scoreOffset = warpIdx * params.mNumExperts;
+  int64_t const scoreOffset = int64_t{warpIdx} * params.mStrideScores;
   bool validToken = warpIdx < params.mNumTokens;
 
   static constexpr int VecSize = KernelParams::MaxNumExperts / WarpSize;
@@ -461,7 +461,7 @@ __global__ void routingIndicesDynBlockKernel(KernelParams params) {
       BaseType warpTopKScore[KernelParams::MaxNumTopExperts];
       int32_t warpTopKExpertIdx[KernelParams::MaxNumTopExperts];
 
-      auto scoreOff = tokenIdx * params.mNumExperts;
+      int64_t const scoreOff = int64_t{tokenIdx} * params.mStrideScores;
       KernelParams::ExpertSelectPolicy::template apply<BaseType, InputT, VecSize,
                                                        KernelParams::MaxNumTopExperts>(
           warp, warpTopKScore, warpTopKExpertIdx, laneIdx, params.mNumExperts, params.mTopK,
@@ -736,7 +736,7 @@ __device__ __forceinline__ void routingIndicesClusterKernelBody(
   int32_t const warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WarpSize, 0);
   int32_t const laneIdx = cutlass::arch::LaneId();
   auto warpTokenIdx = clusterBlockRank * ClusterNumWarps + warpIdx;
-  auto scoreOffset = warpTokenIdx * params.mNumExperts;
+  int64_t const scoreOffset = int64_t{warpTokenIdx} * params.mStrideScores;
   bool validToken = warpTokenIdx < params.mNumTokens;
   auto block = cg::this_thread_block();
   auto warp = cg::tiled_partition<WarpSize>(block);
@@ -1033,7 +1033,7 @@ __global__ void __launch_bounds__(
   // in this case, each warp represents a token, and we use a grid-stride loop
   // over all warps/tokens
   for (int tokenIdx = globalWarpIdx; tokenIdx < params.mNumTokens; tokenIdx += globalWarpStride) {
-    auto scoreOffset = tokenIdx * params.mNumExperts;
+    int64_t const scoreOffset = int64_t{tokenIdx} * params.mStrideScores;
 
     BaseType laneTopKScore;
     int32_t laneTopKExpertIdx;
@@ -1242,7 +1242,7 @@ __global__ void __launch_bounds__(kBlockScoresKernelBlockDim)
     // Phase 1: block-parallel preprocess.  Dispatches on PreProc so the kernel
     // works for all registered preprocess policies (single-pass NoOp / Sigmoid /
     // SigmoidBias, two-pass Softmax).
-    int64_t const scoreBase = int64_t{tokenIdx} * int64_t{params.mNumExperts};
+    int64_t const scoreBase = int64_t{tokenIdx} * params.mStrideScores;
     if constexpr (std::is_same_v<PreProc, SoftmaxPreprocess>) {
       // Softmax needs block-level reductions; pass the block size as a template
       // parameter so it can construct cub::BlockReduce with the right size.

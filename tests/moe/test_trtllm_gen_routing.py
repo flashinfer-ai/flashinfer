@@ -376,6 +376,136 @@ def test_large_batch_smoke(routing_method, num_experts, top_k):
         )
 
 
+# ---------------------------------------------------------------------------
+# Strided logits
+#
+# The kernels index score rows with a row stride (DataBase::mStrideScores), so
+# routing_logits only has to be contiguous along the expert dimension (with
+# non-overlapping rows). A view into a wider router-output buffer -- e.g.
+# logits[:, :E] of a padded GEMM output, or a token slice of a larger
+# allocation -- must give exactly the same result as its contiguous copy.
+# ---------------------------------------------------------------------------
+
+
+def make_strided_view(logits, token_pad=3, expert_pad=5):
+    """Window into a wider buffer whose contents equal ``logits``.
+
+    Rows sit ``num_experts + expert_pad`` elements apart and the window starts
+    at a non-zero offset in both dimensions, so a kernel that assumes tightly
+    packed rows reads the wrong data. The padding is filled with a value far
+    above any real logit: if it were read as a score it would win topK and fail
+    the selection check, rather than silently passing as a plausible logit.
+    """
+    num_tokens, num_experts = logits.shape
+    buf = torch.full(
+        (num_tokens + token_pad, num_experts + expert_pad),
+        100.0,
+        dtype=logits.dtype,
+        device=logits.device,
+    )
+    view = buf[token_pad:, expert_pad:]
+    view.copy_(logits)
+    # (a single-row view still reports as contiguous, hence the stride check)
+    assert view.stride() == (num_experts + expert_pad, 1)
+    return view
+
+
+# num_tokens spans the score-reading kernels: the single-block kernel (<= 4
+# tokens), the cluster / block-scores path, and the large-batch coop path.
+@pytest.mark.parametrize("num_tokens", [1, 150, 4096])
+@pytest.mark.parametrize(
+    "routing_method",
+    [
+        pytest.param(RoutingMethodType.Renormalize, id="Renormalize"),
+        pytest.param(RoutingMethodType.DeepSeekV3, id="DeepSeekV3"),
+        pytest.param(RoutingMethodType.Llama4, id="Llama4"),
+    ],
+)
+def test_strided_logits(routing_method, num_tokens):
+    """One case per routing-kernel family: routingCustom, DeepSeek, Llama4."""
+    num_experts, tile_tokens_dim = 128, 8
+    seed = stable_seed("strided", int(routing_method), num_tokens)
+    logits = make_logits(num_tokens, num_experts, torch.float32, seed)
+    strided = make_strided_view(logits)
+
+    if routing_method == RoutingMethodType.DeepSeekV3:
+        top_k, n_group, topk_group, routed_scaling = 8, 4, 2, 2.5
+        bias = make_bias(num_experts, torch.bfloat16, seed + 1)
+        run_and_check(
+            routing_method,
+            lambda: routing_reference_no_aux(
+                logits,
+                bias,
+                top_k,
+                n_group,
+                topk_group,
+                routed_scaling,
+                tile_tokens_dim,
+            ),
+            strided,
+            top_k,
+            tile_tokens_dim,
+            routing_bias=bias,
+            n_group=n_group,
+            topk_group=topk_group,
+            routed_scaling_factor=routed_scaling,
+        )
+    elif routing_method == RoutingMethodType.Llama4:
+        top_k = 1
+        run_and_check(
+            routing_method,
+            lambda: routing_reference_no_aux(
+                logits,
+                None,
+                top_k,
+                0,
+                0,
+                1.0,
+                tile_tokens_dim,
+                use_routing_scales_on_input=True,
+            ),
+            strided,
+            top_k,
+            tile_tokens_dim,
+        )
+    else:
+        top_k = 8
+        run_and_check(
+            routing_method,
+            lambda: routing_reference_renormalize(
+                logits, top_k, num_experts, tile_tokens_dim
+            ),
+            strided,
+            top_k,
+            tile_tokens_dim,
+        )
+
+
+def test_overlapping_logits_rejected():
+    """Rows must not overlap, which also rules out a broadcast (0-stride) view.
+
+    A zero row stride is the kernels' "tightly packed" sentinel
+    (DataBase::mStrideScores), so an overlapping stride cannot be expressed
+    unambiguously and is refused instead of being read back as packed.
+    """
+    num_experts = 64
+    row = make_logits(1, num_experts, torch.float32, stable_seed("broadcast"))
+    broadcast = row.expand(96, num_experts)
+    assert broadcast.stride() == (0, 1)
+    with pytest.raises(ValueError, match="rows must not overlap"):
+        trtllm_gen_routing(broadcast, None, RoutingMethodType.Renormalize, 4)
+
+
+def test_expert_strided_logits_rejected():
+    """Only the token dimension may be strided; rows must stay contiguous."""
+    logits = make_logits(8, 16, torch.float32, 0)
+    # Same values and shape, but stride(1) == 8: an expert-major layout.
+    expert_major = logits.t().contiguous().t()
+    assert expert_major.stride(1) != 1
+    with pytest.raises(ValueError, match="contiguous along the expert dimension"):
+        trtllm_gen_routing(expert_major, None, RoutingMethodType.Renormalize, 4)
+
+
 def test_invalid_group_args_rejected():
     """Grouped-routing argument validation at the FFI boundary.
 
