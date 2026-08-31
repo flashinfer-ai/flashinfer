@@ -1,4 +1,4 @@
-"""Tests for tinygemm2_sm100 — the generated SM100/SM103 tinygemm2 variants.
+"""Tests for tinygemm2_sm100 — the generated SM100/SM103/SM107 tinygemm2 variants.
 
 The four frozen variants in ``csrc/tinygemm2_sm100/tinygemm2_sm100.cu`` are
 generated Loom schedules exactly porting ``csrc/tinygemm2.cu``; the contract
@@ -17,7 +17,7 @@ def _skip_if_not_sm100_family():
     if not torch.cuda.is_available():
         pytest.skip("tinygemm2_sm100 tests require a CUDA device")
     if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("tinygemm2_sm100 requires SM100/SM103")
+        pytest.skip("tinygemm2_sm100 requires SM100/SM103/SM107")
 
 
 def _make_case(batch_size, output_features, input_features, seed=0):
