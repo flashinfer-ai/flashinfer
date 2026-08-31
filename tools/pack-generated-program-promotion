@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+
+"""Pack sanitized target promotions into one multi-architecture payload."""
+
+from __future__ import annotations
+
+import argparse
+import importlib.util
+from pathlib import Path
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MODULE_PATH = ROOT / "flashinfer" / "jit" / "generated_program_pack.py"
+SPEC = importlib.util.spec_from_file_location("_flashinfer_program_pack", MODULE_PATH)
+if SPEC is None or SPEC.loader is None:
+    raise RuntimeError(f"could not load promotion packer from {MODULE_PATH}")
+PACK = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = PACK
+SPEC.loader.exec_module(PACK)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--input", action="append", required=True, metavar="TARGET=PATH"
+    )
+    parser.add_argument("--mode", choices=("cuda", "cubin"), required=True)
+    parser.add_argument("--name", required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--runtime-manifest-destination", required=True)
+    args = parser.parse_args()
+    inputs = {}
+    for value in args.input:
+        target, separator, path = value.partition("=")
+        if not separator or not target or not path or target in inputs:
+            parser.error(f"invalid or repeated --input {value!r}; expected TARGET=PATH")
+        inputs[target] = Path(path)
+    try:
+        result = PACK.pack_public_promotions(
+            inputs,
+            mode=args.mode,
+            name=args.name,
+            target=args.output,
+            runtime_manifest_destination=args.runtime_manifest_destination,
+        )
+    except PACK.PromotionPackError as exc:
+        parser.exit(2, f"promotion pack error: {exc}\n")
+    print(f"packed {len(result['entries'])} targets in {result['mode']} mode")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

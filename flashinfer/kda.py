@@ -137,13 +137,15 @@ def recurrent_kda(
         scale (Optional[float]):
             Scale factor for queries. If ``None``, defaults to ``1 / sqrt(K)``.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape ``[N, HV, V, K]``. Must be bfloat16.
-            If ``None``, zero-initialized. Updated in-place. For batched spec
+            Initial state of shape ``[N, HV, V, K]``. Normally bfloat16. If
+            ``None``, zero-initialized. Updated in-place. For batched spec
             decode without ``cu_seqlens``, ``N`` is the packed checkpoint-slot
             count ``B * (1 + num_spec_tokens)`` when ``ssm_state_indices`` is
             omitted. For eligible frozen prefill with ``ssm_state_indices``,
             this is a state pool ``[N_pool, H, 128, 128]`` whose inner slots
-            are contiguous; padding between pool slots is allowed.
+            are contiguous; padding between pool slots is allowed. An
+            installed deterministic promotion may additionally accept a
+            float32 indexed state pool for its exact declared contract.
         output_final_state (bool):
             Whether to return the final state. Default: ``False``.
         use_qk_l2norm_in_kernel (bool):
@@ -468,6 +470,14 @@ def recurrent_kda(
         raise ValueError(
             "state checkpoints are supported only by eligible frozen "
             "SM100/SM103 recurrent_kda prefill"
+        )
+
+    if is_plain_prefill and _kda_prefill._is_fp32_indexed_state_pool_request(
+        initial_state, ssm_state_indices
+    ):
+        raise RuntimeError(
+            "float32 indexed recurrent_kda prefill requires an installed "
+            "deterministic promotion payload for this device and contract"
         )
 
     if prefill_workspace is not None:

@@ -25,6 +25,7 @@ support for recurrent KDA prefill.  The stable public dispatcher remains in
 
 import functools
 import heapq
+import importlib
 import math
 import threading
 from dataclasses import dataclass
@@ -109,6 +110,7 @@ _FLASH_KDA_PERSISTENT_STATE_BYTES = _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM * 
 _FLASH_KDA_PERSISTENT_TASK_REFILL_CHUNKS = 2
 _flash_kda_tensor_cache: dict[tuple, torch.Tensor] = {}
 _flash_kda_tensor_cache_lock = threading.Lock()
+_FP32_INDEXED_KDA_PREFILL_ADAPTER = "flashinfer.jit.kda_fp32_indexed_promotion"
 
 _PackedMetadataSignature = tuple[int, int, int, int, bool]
 _PersistentTaskPlan = tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
@@ -371,12 +373,13 @@ def _is_state_pool_tensor(
     *,
     device: torch.device,
     num_heads: int,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> bool:
     return (
         isinstance(tensor, torch.Tensor)
         and tensor.is_cuda
         and tensor.device == device
-        and tensor.dtype == torch.bfloat16
+        and tensor.dtype == dtype
         and tensor.ndim == 4
         and tensor.shape[0] > 0
         and tensor.data_ptr() % 16 == 0
@@ -387,6 +390,48 @@ def _is_state_pool_tensor(
         and tensor.stride(-3) == _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
         and tensor.stride(0) >= num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
         and tensor.stride(0) * tensor.element_size() % 16 == 0
+    )
+
+
+@functools.cache
+def _get_fp32_indexed_kda_prefill_adapter():
+    """Load the optional deterministic-promotion adapter.
+
+    The promoted payload owns this module.  Keeping the import name stable
+    lets either an exact CUDA-source payload or an exact cubin payload satisfy
+    the same public dispatcher contract without weakening the BF16 routes.
+    """
+
+    try:
+        adapter = importlib.import_module(_FP32_INDEXED_KDA_PREFILL_ADAPTER)
+    except ModuleNotFoundError as exc:
+        if exc.name == _FP32_INDEXED_KDA_PREFILL_ADAPTER:
+            return None
+        raise
+    for attribute in ("is_available", "run"):
+        if not callable(getattr(adapter, attribute, None)):
+            raise RuntimeError(
+                f"{_FP32_INDEXED_KDA_PREFILL_ADAPTER} must define callable "
+                f"{attribute}()"
+            )
+    return adapter
+
+
+def _fp32_indexed_kda_prefill_is_available(device: torch.device) -> bool:
+    adapter = _get_fp32_indexed_kda_prefill_adapter()
+    return adapter is not None and bool(
+        adapter.is_available(compute_capability=get_compute_capability(device))
+    )
+
+
+def _is_fp32_indexed_state_pool_request(
+    initial_state: object,
+    state_indices: object,
+) -> bool:
+    return (
+        isinstance(initial_state, torch.Tensor)
+        and initial_state.dtype == torch.float32
+        and state_indices is not None
     )
 
 
@@ -415,7 +460,7 @@ def _flash_kda_prefill_is_eligible(
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
 ) -> bool:
-    """Return whether the call exactly matches the frozen FlashKDA contract."""
+    """Return whether the call matches one installed deterministic contract."""
 
     if not _is_plain_multi_token_prefill(q, cu_seqlens, num_spec_tokens):
         return False
@@ -505,10 +550,24 @@ def _flash_kda_prefill_is_eligible(
         ):
             return False
     if initial_state is not None:
+        state_dtype = (
+            initial_state.dtype if isinstance(initial_state, torch.Tensor) else None
+        )
+        if state_dtype not in (torch.bfloat16, torch.float32):
+            return False
+        if state_dtype == torch.float32 and (
+            ssm_state_indices is None
+            or checkpoint_every_n_tokens != 0
+            or state_checkpoints is not None
+            or checkpoint_cu_starts is not None
+            or not _fp32_indexed_kda_prefill_is_available(q.device)
+        ):
+            return False
         if not _is_state_pool_tensor(
             initial_state,
             device=q.device,
             num_heads=num_heads,
+            dtype=state_dtype,
         ):
             return False
         if ssm_state_indices is None and initial_state.shape[0] != num_sequences:
@@ -2818,6 +2877,37 @@ def _run_flash_kda_prefill(
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
 ):
+    if _is_fp32_indexed_state_pool_request(initial_state, state_indices):
+        adapter = _get_fp32_indexed_kda_prefill_adapter()
+        if adapter is None or not adapter.is_available(
+            compute_capability=get_compute_capability(q.device)
+        ):
+            raise RuntimeError(
+                "float32 indexed recurrent_kda prefill requires an installed "
+                "deterministic promotion payload"
+            )
+        return adapter.run(
+            compute_capability=get_compute_capability(q.device),
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            seq_order=seq_order,
+            prefill_workspace=prefill_workspace,
+            state_indices=state_indices,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        )
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing and prefill_workspace is None:
         raise RuntimeError(
