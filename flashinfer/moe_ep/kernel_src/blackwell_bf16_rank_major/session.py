@@ -255,8 +255,7 @@ def _active_stage_grids(
     """Return launch grids for one active prefix within the fixed capacity."""
     if not 1 <= active_tokens_per_rank <= _TOKENS_PER_RANK:
         raise ValueError(
-            "active tokens per rank must be in [1, 128], got "
-            f"{active_tokens_per_rank}"
+            f"active tokens per rank must be in [1, 128], got {active_tokens_per_rank}"
         )
     active_routes = _WORLD_SIZE * active_tokens_per_rank * _TOP_K
     route_blocks = (active_routes + 255) // 256
@@ -983,7 +982,9 @@ class BlackwellBf16RankMajorSession:
     ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
         p = self._ptr
         if self._active_tokens_per_rank is None:
-            raise RuntimeError("Blackwell BF16 rank-major active token count is not set")
+            raise RuntimeError(
+                "Blackwell BF16 rank-major active token count is not set"
+            )
         active_tokens_per_rank = self._active_tokens_per_rank
         world_rank = (_WORLD_SIZE, self._rank)
         if name == "input_barrier":
@@ -1129,7 +1130,9 @@ class BlackwellBf16RankMajorSession:
         if not self._inputs_staged:
             raise RuntimeError("Blackwell BF16 rank-major inputs are not staged")
         if self._active_tokens_per_rank is None:
-            raise RuntimeError("Blackwell BF16 rank-major active token count is not set")
+            raise RuntimeError(
+                "Blackwell BF16 rank-major active token count is not set"
+            )
         active_tokens_per_rank = self._active_tokens_per_rank
         if (
             tuple(output.shape) != (active_tokens_per_rank, _HIDDEN_SIZE)
