@@ -534,3 +534,53 @@ def test_out_buffers_foreign_device_rejected():
             backend="radix_filter",
             out_indices=foreign,
         )
+
+
+@pytest.mark.xfail(
+    strict=False,
+    reason="upstream DKG multi-pass merge scans the padded candidate width; "
+    "padded (-1, -inf) entries tie with genuinely valid -inf elements, so "
+    "slots that should hold valid indices can come back as -1. strict=False "
+    "because the leak depends on tie-collection order, which is not "
+    "deterministic across runs/architectures. Preserved as xfail until the "
+    "upstream fix lands (see the PR #4621 review thread).",
+)
+def test_multipass_merge_padding_vs_valid_neg_inf():
+    """xfail: multi-pass merge can emit -1 despite >= k valid elements.
+
+    Two chunks per row (N = 2 * 16384) with a nearly-empty second chunk
+    (1 valid element < k), so stage one pads that chunk's candidate list
+    with k - 1 (-1, -inf) entries; only 8 values are finite and the rest of
+    the row is genuinely valid -inf. The row length (16385) exceeds k, so
+    every output slot must be a valid index -- but padded and valid -inf
+    candidates share a radix key, and the merge's fixed-width scan selects
+    pads (measured ~1087/2048 slots on SM100 with this shape; a fully-valid
+    second chunk produces no padding, which is why that case passes). Three
+    seeds are tried because tie-collection order varies run to run. NOT
+    reachable from public top_k_varlen.
+    """
+    device = torch.device("cuda")
+    _skip_unless_radix_filter(device)
+
+    from flashinfer.topk_varlen.kernels.filtered_topk_decode import (
+        cute_dsl_radix_filter_topk_multi_cta_wrapper,
+    )
+
+    B, N, k = 2, 32768, 1024
+    total_neg = 0
+    for trial in range(3):
+        vals = torch.full((B, N), float("-inf"), dtype=torch.float32, device=device)
+        vals[:, :8] = torch.arange(
+            8 + trial, trial, -1, dtype=torch.float32, device=device
+        )
+        # 16384 + 1: the second chunk holds one valid element < k, forcing
+        # k - 1 stage-one pads into the merge width. Total valid still >= k.
+        seq_lens = torch.full((B,), 16384 + 1, dtype=torch.int32, device=device)
+        idx, _ = cute_dsl_radix_filter_topk_multi_cta_wrapper(
+            vals, seq_lens, k, 1, return_val=False
+        )
+        total_neg += int((idx.view(B, k) < 0).sum())
+    assert total_neg == 0, (
+        "merge emitted padded -1 for rows with >= k valid elements: "
+        f"{total_neg} invalid slots across 3 trials"
+    )
