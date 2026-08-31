@@ -42,13 +42,12 @@ template <int Stages, class ClusterShape, class KernelSchedule_, class TileShape
           class TiledMma_, class GmemTiledCopyA_, class SmemLayoutAtomA_, class SmemCopyAtomA_,
           class TransformA_, class GmemTiledCopyB_, class SmemLayoutAtomB_, class SmemCopyAtomB_,
           class TransformB_, class ElementActivationScaleUnused_>
-struct CollectiveMmaArrayMixedInput<MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInputPreScale<
-                                        Stages, ClusterShape, KernelSchedule_>,
-                                    TileShape_, ElementAOptionalTuple, StrideA_,
-                                    ElementBOptionalTuple, StrideB_, TiledMma_, GmemTiledCopyA_,
-                                    SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_, GmemTiledCopyB_,
-                                    SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_,
-                                    ElementActivationScaleUnused_> {
+struct CollectiveMmaArrayMixedInput<
+    MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInputPreScale<Stages, ClusterShape,
+                                                              KernelSchedule_>,
+    TileShape_, ElementAOptionalTuple, StrideA_, ElementBOptionalTuple, StrideB_, TiledMma_,
+    GmemTiledCopyA_, SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_, GmemTiledCopyB_,
+    SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_, ElementActivationScaleUnused_> {
  public:
   enum class ConversionMode { DirectConvert, ConvertAndScale, ConvertAndScaleWithZero };
 

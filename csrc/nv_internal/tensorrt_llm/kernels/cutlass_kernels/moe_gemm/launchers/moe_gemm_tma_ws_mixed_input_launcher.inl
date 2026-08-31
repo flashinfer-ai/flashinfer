@@ -331,9 +331,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
     // legacy ScaleMode, so their Args are byte-identical; only the block-scaled collective, whose
     // Arguments declares ptr_AS as NonVoidElementActivationScale (bf16), compiles this line.
     if constexpr (use_act_block_scale) {
-      arguments.mainloop.ptr_AS =
-          reinterpret_cast<decltype(arguments.mainloop.ptr_AS)>(
-              hopper_inputs.int4_groupwise_params.ptr_act_block_scale);
+      arguments.mainloop.ptr_AS = reinterpret_cast<decltype(arguments.mainloop.ptr_AS)>(
+          hopper_inputs.int4_groupwise_params.ptr_act_block_scale);
     }
   }
 

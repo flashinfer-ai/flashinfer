@@ -3469,16 +3469,12 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
             )
             x_fp8_tensor = (x_rows * fc1_quant[:, None]).to(torch.float8_e4m3fn)
             x_fp8 = x_fp8_tensor.to(torch.float32)
-            route_fc1_scale = (
-                1.0 / fc1_quant
-            ) * fc1_residual_expert_scale[local_expert_id]
+            route_fc1_scale = (1.0 / fc1_quant) * fc1_residual_expert_scale[
+                local_expert_id
+            ]
         # FC1 token scale is applied in the GEMM epilogue before activation, so
         # both gated branches must be scaled before the SiLU/product.
-        fc1_scale = (
-            route_fc1_scale
-            if use_act_block_scale
-            else route_fc1_scale[:, None]
-        )
+        fc1_scale = route_fc1_scale if use_act_block_scale else route_fc1_scale[:, None]
         fc1_w1 = (x_fp8 @ w1_expert.t()) * fc1_scale
         fc1_w3 = (x_fp8 @ w3_expert.t()) * fc1_scale
         fc1 = F.silu(fc1_w1) * fc1_w3
@@ -3508,14 +3504,10 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
             )
             fc1_fp8_tensor = (fc1 * fc2_quant[:, None]).to(torch.float8_e4m3fn)
             fc1_fp8 = fc1_fp8_tensor.to(torch.float32)
-            route_fc2_scale = (
-                1.0 / fc2_quant
-            ) * fc2_residual_expert_scale[local_expert_id]
-        fc2_scale = (
-            route_fc2_scale
-            if use_act_block_scale
-            else route_fc2_scale[:, None]
-        )
+            route_fc2_scale = (1.0 / fc2_quant) * fc2_residual_expert_scale[
+                local_expert_id
+            ]
+        fc2_scale = route_fc2_scale if use_act_block_scale else route_fc2_scale[:, None]
         fc2 = (fc1_fp8 @ w2_ref[local_expert_id].t()) * fc2_scale
         ref_output[batch_idx] += routing_weights[batch_idx, nth_expert, None] * fc2
 

@@ -258,8 +258,8 @@ struct CollectiveBuilderMixedInput<
       "Pre-MMA E8M0 scale mode is only implemented for grouped MXFP4 weight x FP8 activation.");
 
   // Per-block (K group=32) activation-scale mode: MXFP4 weight x MXFP8 activation only. The gate is
-  // threaded to the collective as a trailing type parameter (bf16 = enabled, void = disabled); every
-  // other ScaleMode keeps it void so legacy instantiations are byte-identical.
+  // threaded to the collective as a trailing type parameter (bf16 = enabled, void = disabled);
+  // every other ScaleMode keeps it void so legacy instantiations are byte-identical.
   static constexpr bool UseActBlockScale = ScaleMode == MixedInputScaleMode::kPostMmaActBlockScale;
   static_assert(
       !UseActBlockScale || (IsArrayOfPointersGemm && IsATransformed &&

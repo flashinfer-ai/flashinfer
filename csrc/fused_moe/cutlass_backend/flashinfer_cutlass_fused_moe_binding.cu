@@ -321,10 +321,12 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
     if (mSm90Wfp4Afp8Mode == kernels::Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act) {
       auto erase_unaligned_tile_k = [](auto& tactics) {
         tactics.erase(
-            std::remove_if(tactics.begin(), tactics.end(), [](auto const& profile) {
-              return std::get<2>(tensorrt_llm::cutlass_extensions::enum_to_shape_tuple(
-                         profile.tile_config_sm90)) < 256;
-            }),
+            std::remove_if(tactics.begin(), tactics.end(),
+                           [](auto const& profile) {
+                             return std::get<2>(
+                                        tensorrt_llm::cutlass_extensions::enum_to_shape_tuple(
+                                            profile.tile_config_sm90)) < 256;
+                           }),
             tactics.end());
       };
       erase_unaligned_tile_k(gemm1_tactics);

@@ -252,17 +252,16 @@ void sm90_dispatch_moe_mixed_dtype_gemm_to_cutlass(
                  ? cutlass::gemm::collective::MixedInputScaleMode::kPostMmaActBlockScale
                  : cutlass::gemm::collective::MixedInputScaleMode::kPostMma);
 
-#define DISPATCH_MIXED_DTYPE_MOE_TILE(ENUM_NAME, TILE_M, TILE_N, TILE_K)                    \
-  case tkc::CutlassTileConfigSM90::ENUM_NAME:                                               \
-    if constexpr (Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act &&            \
-                  TILE_K < 256) {                                                           \
-      TLLM_THROW("SM90 activation block scale requires TileK >= 256.");                     \
-    } else {                                                                                \
-      sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag, \
-                                                Shape<Int<TILE_M>, Int<TILE_N>, Int<TILE_K>>, \
-                                                ScaleMode>(inputs, hopper_inputs, sm_count_, \
-                                                           workspace_size);                 \
-    }                                                                                       \
+#define DISPATCH_MIXED_DTYPE_MOE_TILE(ENUM_NAME, TILE_M, TILE_N, TILE_K)                         \
+  case tkc::CutlassTileConfigSM90::ENUM_NAME:                                                    \
+    if constexpr (Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act && TILE_K < 256) { \
+      TLLM_THROW("SM90 activation block scale requires TileK >= 256.");                          \
+    } else {                                                                                     \
+      sm90_dispatch_moe_mixed_dtype_gemm_config<T, WeightType, GemmOutputType, EpilogueTag,      \
+                                                Shape<Int<TILE_M>, Int<TILE_N>, Int<TILE_K>>,    \
+                                                ScaleMode>(inputs, hopper_inputs, sm_count_,     \
+                                                           workspace_size);                      \
+    }                                                                                            \
     break
 
 #define DISPATCH_MIXED_DTYPE_MOE_TILE_WITH_SMALL_K(ENUM_NAME, TILE_M, TILE_N, TILE_K)          \

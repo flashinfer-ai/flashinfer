@@ -1327,14 +1327,14 @@ __device__ void computeTmaWarpSpecializedInputStrides(
   // (N) contiguous only conceptually; the mainloop indexes it manually (token-major, K contiguous),
   // so this stride is informational and mirrors the weight-scale layout along the token axis.
   if (layout_info.int4_groupwise_params.use_act_block_scale) {
-    layout_info.int4_groupwise_params.stride_act_block_scale[out_idx] =
-        cutlass::make_cute_packed_stride(
-            TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::StrideActBlockScale{},
-            cute::make_shape(
-                gemm_m,
-                gemm_k /
-                    TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::act_block_scale_group_size,
-                1));
+    layout_info.int4_groupwise_params
+        .stride_act_block_scale[out_idx] = cutlass::make_cute_packed_stride(
+        TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::StrideActBlockScale{},
+        cute::make_shape(
+            gemm_m,
+            gemm_k /
+                TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::act_block_scale_group_size,
+            1));
   }
 }
 
@@ -1794,42 +1794,42 @@ __global__ void expandInputRowsKernel(
         }
       } else {
         using AmaxOp = AbsMaxOp<InputActivationsType>;
-      typename AmaxOp::Accum thread_amax = AmaxOp::zero();
-      for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
-        auto input_value = source_row_ptr[elem_index];
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < ELEM_PER_THREAD; ++i) {
-          thread_amax = AmaxOp::update(thread_amax, input_value[i]);
+        typename AmaxOp::Accum thread_amax = AmaxOp::zero();
+        for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
+          auto input_value = source_row_ptr[elem_index];
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < ELEM_PER_THREAD; ++i) {
+            thread_amax = AmaxOp::update(thread_amax, input_value[i]);
+          }
         }
-      }
 
-      using BlockReduce = cub::BlockReduce<float, EXPAND_THREADS_PER_BLOCK>;
-      __shared__ typename BlockReduce::TempStorage reduce_storage;
-      __shared__ float shared_token_quant_scale;
-      float const row_amax =
-          BlockReduce(reduce_storage).Reduce(AmaxOp::to_float(thread_amax), FloatMaxOp{});
-      if (threadIdx.x == 0) {
-        float const quant = row_amax > 0.0f ? (448.0f / row_amax) : 1.0f;
-        float residual = 1.0f;
-        if (fp8_expert_residual_scale) {
-          int const expert = permuted_token_selected_experts[permuted_row];
-          residual = fp8_expert_residual_scale[expert];
+        using BlockReduce = cub::BlockReduce<float, EXPAND_THREADS_PER_BLOCK>;
+        __shared__ typename BlockReduce::TempStorage reduce_storage;
+        __shared__ float shared_token_quant_scale;
+        float const row_amax =
+            BlockReduce(reduce_storage).Reduce(AmaxOp::to_float(thread_amax), FloatMaxOp{});
+        if (threadIdx.x == 0) {
+          float const quant = row_amax > 0.0f ? (448.0f / row_amax) : 1.0f;
+          float residual = 1.0f;
+          if (fp8_expert_residual_scale) {
+            int const expert = permuted_token_selected_experts[permuted_row];
+            residual = fp8_expert_residual_scale[expert];
+          }
+          shared_token_quant_scale = quant;
+          fp8_token_dequant_scale[permuted_row] = (1.0f / quant) * residual;
         }
-        shared_token_quant_scale = quant;
-        fp8_token_dequant_scale[permuted_row] = (1.0f / quant) * residual;
-      }
-      __syncthreads();
+        __syncthreads();
 
-      for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
-        auto input_value = arrayConvert<DataElem, cutlass::Array<float, ELEM_PER_THREAD>>(
-            source_row_ptr[elem_index]);
-        CUTLASS_PRAGMA_UNROLL
-        for (int i = 0; i < ELEM_PER_THREAD; ++i) {
-          input_value[i] *= shared_token_quant_scale;
+        for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
+          auto input_value = arrayConvert<DataElem, cutlass::Array<float, ELEM_PER_THREAD>>(
+              source_row_ptr[elem_index]);
+          CUTLASS_PRAGMA_UNROLL
+          for (int i = 0; i < ELEM_PER_THREAD; ++i) {
+            input_value[i] *= shared_token_quant_scale;
+          }
+          dest_row_ptr[elem_index] =
+              arrayConvert<cutlass::Array<float, ELEM_PER_THREAD>, OutputElem>(input_value);
         }
-        dest_row_ptr[elem_index] =
-            arrayConvert<cutlass::Array<float, ELEM_PER_THREAD>, OutputElem>(input_value);
-      }
       }
     } else {
       for (int elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride) {
@@ -1902,8 +1902,7 @@ void expandInputRowsKernelLauncher(
     if constexpr (std::is_same_v<ExpandedActivationsType, __nv_fp8_e4m3> &&
                   !std::is_same_v<InputActivationsType, __nv_fp8_e4m3>) {
       bool const use_per_token_fp8_quant = fp8_token_dequant_scale != nullptr;
-      bool const use_online_fp8_quant =
-          use_per_token_fp8_quant || act_block_scale_flat != nullptr;
+      bool const use_online_fp8_quant = use_per_token_fp8_quant || act_block_scale_flat != nullptr;
       TLLM_CHECK_WITH_INFO(quant_params.mxfp8_mxfp4.fc1.weight_block_scale ||
                                quant_params.mxfp8_mxfp8.fc1.weight_block_scale || prequant_scales ||
                                use_online_fp8_quant,
@@ -2616,8 +2615,7 @@ __global__ __launch_bounds__(MAX_ACTIVATION_THREADS_PER_BLOCK) void doActivation
             }
           }
           float const quant = group_amax > 0.0f ? (448.0f / group_amax) : 1.0f;
-          row_scale_out[group] =
-              __float2bfloat16(group_amax > 0.0f ? (group_amax / 448.0f) : 1.0f);
+          row_scale_out[group] = __float2bfloat16(group_amax > 0.0f ? (group_amax / 448.0f) : 1.0f);
           CUTLASS_PRAGMA_UNROLL
           for (int v = 0; v < kVecPerGroup; ++v) {
             CUTLASS_PRAGMA_UNROLL
@@ -3568,12 +3566,11 @@ void CutlassMoeFCRunner<
                    float const* const fc2_fp8_quant, float* const act_fp8_token_scale,
                    TmaWarpSpecializedGroupedGemmInput::ElementSF const* fc1_fp4_act_flat,
                    TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat,
-                   __nv_bfloat16* act_block_scale_flat,
-                   QuantParams quant_params, int64_t const num_rows,
-                   int64_t const expanded_num_rows, int64_t const hidden_size,
-                   int64_t const inter_size, int const num_experts_per_node,
-                   ActivationParams fc1_activation_type, float const** alpha_scale_ptr_array,
-                   bool bias_is_broadcast, cudaStream_t stream,
+                   __nv_bfloat16* act_block_scale_flat, QuantParams quant_params,
+                   int64_t const num_rows, int64_t const expanded_num_rows,
+                   int64_t const hidden_size, int64_t const inter_size,
+                   int const num_experts_per_node, ActivationParams fc1_activation_type,
+                   float const** alpha_scale_ptr_array, bool bias_is_broadcast, cudaStream_t stream,
                    cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
                    int* num_active_experts_per, int* active_expert_global_ids, bool enable_pdl) {
   if (fp8_blockscale_gemm_runner) {
@@ -3622,8 +3619,7 @@ void CutlassMoeFCRunner<
       alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
                                                      quant_params.groupwise.fc1.alpha, stream);
     }
-    if constexpr (use_wfp4afp8 &&
-                  Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act) {
+    if constexpr (use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act) {
       alpha_scale_ptr_array =
           computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
                                  quant_params.fp8_mxfp4.fc1.global_scale, stream);
@@ -3883,11 +3879,9 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMX
     alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
                                                    quant_params.groupwise.fc2.alpha, stream);
   }
-  if constexpr (use_wfp4afp8 &&
-                Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act) {
-    alpha_scale_ptr_array =
-        computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
-                               quant_params.fp8_mxfp4.fc2.global_scale, stream);
+  if constexpr (use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act) {
+    alpha_scale_ptr_array = computeFP8DequantScale(alpha_scale_ptr_array, num_experts_per_node,
+                                                   quant_params.fp8_mxfp4.fc2.global_scale, stream);
     TLLM_CHECK(alpha_scale_ptr_array != nullptr);
   }
   if constexpr (use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kHummingPreMmaE8M0) {
@@ -4409,10 +4403,10 @@ void CutlassMoeFCRunner<
                 fc1_int_scales, fc1_fp8_dequant,
                 use_wfp4afp8 ? fc2_wfp4afp8_quant_scale : fc2_fp8_quant, act_fp8_token_scale_,
                 input_sf /*input fp4 scale or expanded fp4 scale*/, fc2_fp4_act_scale_,
-                act_block_scale_flat_,
-                quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
-                num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_, !use_lora,
-                stream, *gemm1_config_, true, min_latency_params.num_active_experts_per_node,
+                act_block_scale_flat_, quant_params, num_rows, expanded_num_rows, hidden_size,
+                inter_size, num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_,
+                !use_lora, stream, *gemm1_config_, true,
+                min_latency_params.num_active_experts_per_node,
                 min_latency_params.active_expert_global_ids, enable_pdl);
     sync_check_cuda_error(stream);
 
@@ -4542,9 +4536,8 @@ void CutlassMoeFCRunner<
                 use_wfp4afp8 ? fc2_wfp4afp8_quant_scale : fc2_fp8_quant, act_fp8_token_scale_,
                 fc1_fp4_act_scale_, fc2_fp4_act_scale_, act_block_scale_flat_, quant_params,
                 num_rows, expanded_num_rows, hidden_size, inter_size, num_experts_per_node,
-                fc1_activation_type,
-                alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_, false, nullptr,
-                nullptr, enable_pdl);
+                fc1_activation_type, alpha_scale_ptr_array_fc1_, !use_lora, stream, *gemm1_config_,
+                false, nullptr, nullptr, enable_pdl);
     sync_check_cuda_error(stream);
 
     if (use_lora) {
@@ -4771,8 +4764,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, IsMXFPX, 
     }
 
     TLLM_CHECK_WITH_INFO(gemm1_input != gemm1_output, "Input and output buffers are overlapping");
-    if constexpr (use_wfp4afp8 &&
-                  Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act) {
+    if constexpr (use_wfp4afp8 && Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act) {
       gemm1_tma_ws_input.int4_groupwise_params.act_block_scale_flat = act_block_scale_flat_;
       gemm2_tma_ws_input.int4_groupwise_params.act_block_scale_flat = act_block_scale_flat_;
     }

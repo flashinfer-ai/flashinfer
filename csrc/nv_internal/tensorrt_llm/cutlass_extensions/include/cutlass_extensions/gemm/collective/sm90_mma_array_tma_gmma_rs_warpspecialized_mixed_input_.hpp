@@ -61,12 +61,10 @@ struct CollectiveMmaArrayMixedInput<
  private:
   template <class T>
   friend struct detail::MixedGroupedGemmInputUtils;
-  using CollectiveType =
-      CollectiveMmaArrayMixedInput<DispatchPolicy, TileShape_, ElementAOptionalTuple, StrideA_,
-                                   ElementBOptionalTuple, StrideB_, TiledMma_, GmemTiledCopyA_,
-                                   SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_, GmemTiledCopyB_,
-                                   SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_,
-                                   ElementActivationScale_>;
+  using CollectiveType = CollectiveMmaArrayMixedInput<
+      DispatchPolicy, TileShape_, ElementAOptionalTuple, StrideA_, ElementBOptionalTuple, StrideB_,
+      TiledMma_, GmemTiledCopyA_, SmemLayoutAtomA_, SmemCopyAtomA_, TransformA_, GmemTiledCopyB_,
+      SmemLayoutAtomB_, SmemCopyAtomB_, TransformB_, ElementActivationScale_>;
   using Utils = detail::MixedGroupedGemmInputUtils<CollectiveType>;
 
   //
@@ -98,12 +96,13 @@ struct CollectiveMmaArrayMixedInput<
   // ElementActivationScale_: it is void for every legacy instantiation (int4a8, mxfp4-bf16,
   // per-token post-MMA), so HasActivationScale is false, every `if constexpr (HasActivationScale)`
   // block below is removed, and the SASS is byte-identical to the pre-change kernel. The builder
-  // passes cutlass::bfloat16_t only for MixedInputScaleMode::kPostMmaActBlockScale, and only for the
-  // mxfp4 weight x fp8 activation element combination.
+  // passes cutlass::bfloat16_t only for MixedInputScaleMode::kPostMmaActBlockScale, and only for
+  // the mxfp4 weight x fp8 activation element combination.
   static constexpr bool HasActivationScale = !cute::is_void_v<ElementActivationScale_> &&
                                              cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
                                              cute::is_same_v<ElementB, cutlass::float_e4m3_t>;
-  using ElementActivationScale = cute::conditional_t<HasActivationScale, ElementActivationScale_, void>;
+  using ElementActivationScale =
+      cute::conditional_t<HasActivationScale, ElementActivationScale_, void>;
   using NonVoidElementActivationScale =
       cute::conditional_t<cute::is_void_v<ElementActivationScale>, cutlass::bfloat16_t,
                           ElementActivationScale>;
@@ -898,18 +897,18 @@ struct CollectiveMmaArrayMixedInput<
           if constexpr (HasActivationScale) {
             // Read ptr_AS directly for the current group. The scheduler can enter load() for its
             // initial group before tensors_perform_update() has populated the cached pointer.
-            auto const* act_scale_base =
-                (mainloop_params.ptr_AS != nullptr) ? mainloop_params.ptr_AS[current_group_idx_]
-                                                    : nullptr;
+            auto const* act_scale_base = (mainloop_params.ptr_AS != nullptr)
+                                             ? mainloop_params.ptr_AS[current_group_idx_]
+                                             : nullptr;
             if (act_scale_base != nullptr) {
               // total K/32 chunks per token = (K/128) * (128/32)
               int const act_total_k_chunks =
                   scale_total_k128_blocks * (WeightScaleLogicalKPerFoldBlock / ScalingGroupSize);
               int const act_k_chunk_offset = scale_k_tile * ActScaleChunksPerTileK;
               int const act_token_base = int(n_coord) * ActScaleTileN;
-              Tensor sASRaw = make_tensor(
-                  make_smem_ptr(shared_tensors.smem_activation_scale.begin()),
-                  SmemLayoutActivationScale{});
+              Tensor sASRaw =
+                  make_tensor(make_smem_ptr(shared_tensors.smem_activation_scale.begin()),
+                              SmemLayoutActivationScale{});
               CUTLASS_PRAGMA_UNROLL
               for (int local_token = 0; local_token < ActScaleTileN; ++local_token) {
                 int64_t const act_gmem_offset =
@@ -917,8 +916,7 @@ struct CollectiveMmaArrayMixedInput<
                     int64_t(act_k_chunk_offset);
                 auto* act_gmem_addr =
                     reinterpret_cast<void const*>(act_scale_base + act_gmem_offset);
-                auto* act_smem_addr =
-                    static_cast<void*>(&sASRaw(local_token, 0, write_stage));
+                auto* act_smem_addr = static_cast<void*>(&sASRaw(local_token, 0, write_stage));
                 cute::SM90_BULK_COPY_G2S::copy(act_gmem_addr,
                                                reinterpret_cast<uint64_t*>(tma_barrier),
                                                act_smem_addr, ActScaleBulkCopyBytesPerToken);
@@ -963,9 +961,9 @@ struct CollectiveMmaArrayMixedInput<
       // FP4->E4M3 conversion is exactly equivalent to multiplying the rewritten FP4 value by
       // 2^(o-6). The expert residual and the existing epilogue x64 compensation supply the
       // remaining global exponent.
-      uint32_t const exponent =
-          HasActivationScale ? static_cast<uint32_t>(scale_ue8m0.storage) + 121u
-                             : static_cast<uint32_t>(scale_ue8m0.storage);
+      uint32_t const exponent = HasActivationScale
+                                    ? static_cast<uint32_t>(scale_ue8m0.storage) + 121u
+                                    : static_cast<uint32_t>(scale_ue8m0.storage);
       uint32_t temp = exponent << 23;
       return cutlass::detail::copy_bits<uint32_t, float>(temp);
     } else {
@@ -1036,13 +1034,10 @@ struct CollectiveMmaArrayMixedInput<
   }
 
   template <class AccumTensor, class IntermTensor, class ScaleTensor, class CoordTensor>
-  CUTLASS_DEVICE void apply_groupwise_scale_smem(AccumTensor& accum,
-                                                 IntermTensor const& intermediate,
-                                                 ScaleTensor const& tCsS, int scale_idx,
-                                                 int read_stage, bool is_first_accum,
-                                                 CoordTensor const& tCcAS,
-                                                 NonVoidElementActivationScale const* act_smem_raw,
-                                                 int act_chunk_id) {
+  CUTLASS_DEVICE void apply_groupwise_scale_smem(
+      AccumTensor& accum, IntermTensor const& intermediate, ScaleTensor const& tCsS, int scale_idx,
+      int read_stage, bool is_first_accum, CoordTensor const& tCcAS,
+      NonVoidElementActivationScale const* act_smem_raw, int act_chunk_id) {
     multiply_add<ElementAccumulator> fma_op;
 
     CUTLASS_PRAGMA_UNROLL
