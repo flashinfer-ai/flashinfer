@@ -54,9 +54,9 @@ if __name__ == "__main__":
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sys.path.insert(0, os.path.join(current_dir, ".."))
 
-# Import from the nvidia-cutlass-dsl wheel's Blackwell kernel (not TRT-LLM's modified version)
-# The wheel's Blackwell kernel is the correct parent for Rubin
-from nvidia_cutlass_dsl.examples.CuTeDSL.cute.blackwell.kernel.blockscaled_gemm import (
+# nvidia-cutlass-dsl 4.8 no longer packages the examples tree.  Use the
+# Blackwell parent shipped with FlashInfer's pinned CUTLASS submodule instead.
+from flashinfer.data.cutlass.examples.python.CuTeDSL.blackwell import (
     dense_blockscaled_gemm_persistent as _sm100_blockscaled_gemm,
 )
 
@@ -224,6 +224,37 @@ class Sm107BlockScaledPersistentDenseGemmKernel(Sm100BlockScaledPersistentDenseG
 
         # Prefetch configuration: None=auto (num_ab_stage), 0=disable, >0=explicit distance
         self.prefetch_dist_param = prefetch_dist
+
+    @staticmethod
+    def _compute_grid(
+        c: cute.Tensor,
+        cta_tile_shape_mnk: Tuple[int, int, int],
+        cluster_shape_mn: Tuple[int, int],
+        max_active_clusters: cutlass.Constexpr,
+        swizzle_size: int = 1,
+        raster_order: Literal["m", "n"] = "m",
+    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+        """Adapt the bundled Blackwell parent to the CuTe DSL 4.8 scheduler ABI.
+
+        The SM107 kernel passes the swizzle and raster-order controls introduced
+        by the newer CUTLASS example.  FlashInfer's pinned Blackwell parent has
+        the older helper signature, although its scheduler implementation
+        already supports both fields.
+        """
+        c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
+        gc = cute.zipped_divide(c, tiler=c_shape)
+        num_ctas_mnl = gc[(0, (None, None, None))].shape
+        cluster_shape_mnl = (*cluster_shape_mn, 1)
+        tile_sched_params = utils.PersistentTileSchedulerParams(
+            num_ctas_mnl,
+            cluster_shape_mnl,
+            swizzle_size,
+            raster_order == "m",
+        )
+        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+            tile_sched_params, max_active_clusters
+        )
+        return tile_sched_params, grid
 
     # ------------------------------------------------------------------
     # flashinfer compatibility shims (not in TRT-LLM): the mm_fp4 cute-dsl
