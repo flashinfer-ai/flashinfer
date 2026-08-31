@@ -21,7 +21,9 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
 import torch
@@ -170,7 +172,7 @@ def test_source_catalog_verifies_complete_target_module_and_source_closure(
     )
 
     targets[0].modules[0].cuda_source.path.write_bytes(b"drift")
-    with pytest.raises(loader.CakeKDAIndexedPrefillError, match="content identity"):
+    with pytest.raises(loader.CakeKDAIndexedPrefillError, match="source closure"):
         loader._read_catalog(tmp_path)
 
 
@@ -279,3 +281,144 @@ def test_public_cake_wrapper_contains_literal_backend_and_forwards_it(
 
     assert observed["backend"] == "cake"
     assert 'backend="cake"' in inspect.getsource(kda_api.recurrent_kda_cake)
+
+
+def test_source_backend_rejects_output_alias_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tensors = _public_call_tensors()
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(
+        loader,
+        "_target_for_device",
+        lambda _device: pytest.fail("alias validation must precede dispatch"),
+    )
+
+    with pytest.raises(ValueError, match="output must not overlap q"):
+        loader.run_cake_kda_indexed_prefill(
+            q=tensors["q"],
+            k=tensors["k"],
+            v=tensors["v"],
+            g=tensors["g"],
+            beta=tensors["beta"],
+            A_log=tensors["A_log"],
+            dt_bias=tensors["dt_bias"],
+            scale=128**-0.5,
+            initial_state=tensors["initial_state"],
+            output_final_state=True,
+            lower_bound=-5.0,
+            cu_seqlens=None,
+            output=tensors["q"].view_as(tensors["q"]),
+            state_indices=tensors["ssm_state_indices"],
+        )
+
+
+@pytest.mark.gpu
+def test_indexed_fp32_source_backend_matches_flash_kda_reference() -> None:
+    flash_kda = pytest.importorskip("flash_kda")
+    flash_kda_C = pytest.importorskip("flash_kda_C")
+    reference_root_value = os.environ.get("FLASH_KDA_REFERENCE_ROOT")
+    if reference_root_value is None:
+        pytest.skip("FLASH_KDA_REFERENCE_ROOT must identify the pinned reference checkout")
+    reference_root = Path(reference_root_value).resolve(strict=True)
+    reference_commit = subprocess.check_output(
+        ["git", "-C", str(reference_root), "rev-parse", "HEAD^{commit}"],
+        text=True,
+    ).strip()
+    assert reference_commit == "1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b"
+    Path(flash_kda.__file__).resolve(strict=True).relative_to(reference_root)
+    Path(flash_kda_C.__file__).resolve(strict=True).relative_to(reference_root)
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}:
+        pytest.skip("the generated source package targets SM100a and SM103a")
+
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(13008)
+    batch_size, tokens, heads, head_dim = 1, 63, 6, 128
+    shape = (batch_size, tokens, heads, head_dim)
+    q = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
+    k = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
+    v = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
+    g = torch.randn(shape, dtype=torch.bfloat16, device=device, generator=generator)
+    beta = torch.randn(
+        (batch_size, tokens, heads),
+        dtype=torch.bfloat16,
+        device=device,
+        generator=generator,
+    )
+    A_log = torch.rand((heads,), dtype=torch.float32, device=device, generator=generator)
+    dt_bias = torch.rand(
+        (heads, head_dim), dtype=torch.float32, device=device, generator=generator
+    )
+    state_pool = 0.25 * torch.randn(
+        (4, heads, head_dim, head_dim),
+        dtype=torch.float32,
+        device=device,
+        generator=generator,
+    )
+    state_before = state_pool.clone()
+    state_indices = torch.tensor([2], dtype=torch.int32, device=device)
+    compact_initial = state_before.index_select(0, state_indices.long()).contiguous()
+    compact_final = torch.empty_like(compact_initial)
+    expected_output = torch.empty_like(q)
+    scale = head_dim**-0.5
+    workspace = torch.empty(
+        flash_kda.get_workspace_size(tokens, heads, batch_size),
+        dtype=torch.uint8,
+        device=device,
+    )
+    flash_kda._fwd_raw(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale,
+        expected_output,
+        workspace,
+        A_log,
+        dt_bias,
+        -5.0,
+        initial_state=compact_initial,
+        final_state=compact_final,
+        cu_seqlens=None,
+    )
+    expected_state = state_before.clone()
+    expected_state.index_copy_(0, state_indices.long(), compact_final)
+
+    output = torch.empty_like(q)
+    actual_output, actual_state = kda_api.recurrent_kda(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        scale=scale,
+        initial_state=state_pool,
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=-5.0,
+        ssm_state_indices=state_indices,
+        output=output,
+        beta_is_logit=True,
+        backend="cake",
+    )
+    torch.cuda.synchronize()
+
+    assert actual_output is output
+    assert actual_state is state_pool
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        actual_state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+    unselected = torch.tensor([0, 1, 3], dtype=torch.int64, device=device)
+    assert torch.equal(
+        actual_state.index_select(0, unselected),
+        state_before.index_select(0, unselected),
+    )

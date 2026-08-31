@@ -754,12 +754,9 @@ def cake_kda_indexed_prefill_is_eligible(
         or not isinstance(dt_bias, torch.Tensor)
         or dt_bias.device != q.device
         or dt_bias.dtype != torch.float32
-        or dt_bias.numel() != heads * 128
-        or dt_bias.ndim not in (1, 2)
+        or dt_bias.shape != (heads, 128)
         or not dt_bias.is_contiguous()
     ):
-        return False
-    if dt_bias.ndim == 2 and dt_bias.shape != (heads, 128):
         return False
     num_sequences = batch_size
     if cu_seqlens is not None:
@@ -767,7 +764,7 @@ def cake_kda_indexed_prefill_is_eligible(
             batch_size != 1
             or not isinstance(cu_seqlens, torch.Tensor)
             or cu_seqlens.device != q.device
-            or cu_seqlens.dtype not in (torch.int32, torch.int64)
+            or cu_seqlens.dtype != torch.int64
             or cu_seqlens.ndim != 1
             or not cu_seqlens.is_contiguous()
             or cu_seqlens.numel() < 2
@@ -841,6 +838,18 @@ def run_cake_kda_indexed_prefill(
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError(
             "Cake KDA indexed prefill must be warmed and launched outside CUDA graph capture"
+        )
+    from .kda_prefill import _check_output_does_not_overlap_inputs
+
+    if output is not None:
+        _check_output_does_not_overlap_inputs(
+            output,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
         )
     target = _target_for_device(q.device)
     dispatcher = get_cake_kda_indexed_prefill_dispatcher(target)
