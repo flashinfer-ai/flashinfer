@@ -8,6 +8,7 @@ template cudaError_t BatchFP8PrefillWithPagedKVCacheDispatched
     <{{ head_dim_qk }},
      {{ mask_mode }},
      /*USE_SLIDING_WINDOW=*/{{ use_sliding_window }},
+     /*USE_VARIABLE_WINDOW=*/{{ use_variable_window }},
      /*SAME_SCHEDULER_FOR_ALL_HEADS=*/{{ same_scheduler_for_all_heads }},
      {{ variant_name }}, PagedParams>(PagedParams& params, bool enable_pdl, cudaStream_t stream);
 {% endfor %}

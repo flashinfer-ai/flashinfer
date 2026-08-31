@@ -22,6 +22,9 @@ constexpr int HEAD_DIM_QK = {{ head_dim_qk }};
 constexpr int HEAD_DIM_VO = {{ head_dim_vo }};
 constexpr auto USE_LOGITS_SOFT_CAP = {{ use_logits_soft_cap }};
 constexpr auto USE_SLIDING_WINDOW = {{ use_sliding_window }};
+constexpr auto USE_VARIABLE_WINDOW = {{ use_variable_window }};
+static_assert(!(USE_SLIDING_WINDOW && USE_VARIABLE_WINDOW),
+              "VariableWindow cannot be combined with sliding window");
 
 struct RaggedParams {
   using DTypeQ = DTypeQ;

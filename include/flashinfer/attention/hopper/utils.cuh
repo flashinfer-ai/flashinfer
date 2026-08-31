@@ -46,6 +46,126 @@ CUTLASS_DEVICE int get_swa_end_kv_tile_idx(int window_left, int q_tile_idx, cons
   return std::max(((q_tile_idx + 1) * CTA_Q + kv_len - qo_len - window_left) / CTA_KV, -1);
 }
 
+struct VariableWindowKvTileBounds {
+  int begin;  // inclusive first KV tile to load
+  int end;    // inclusive last KV tile to load
+};
+
+DEFINE_HAS_MEMBER(maybe_variable_window_token_starts)
+DEFINE_HAS_MEMBER(maybe_variable_window_token_ends)
+
+// Min start / max end over valid Q rows in this CTA tile. packed_qo_offset is
+// qo_indptr[batch] into the packed [nnz_qo] start/end arrays.
+template <int CTA_Q, int CTA_KV>
+CUTLASS_DEVICE VariableWindowKvTileBounds
+get_variable_window_kv_tile_bounds(int32_t const* starts, int32_t const* ends, int packed_qo_offset,
+                                   int q_tile_idx, int qo_len, int kv_len) {
+  int q_start = q_tile_idx * CTA_Q;
+  int q_end = std::min(q_start + CTA_Q, qo_len);
+  int min_start = kv_len;
+  int max_end = -1;
+#pragma unroll 1
+  for (int q = q_start; q < q_end; ++q) {
+    min_start = std::min(min_start, __ldg(starts + packed_qo_offset + q));
+    max_end = std::max(max_end, __ldg(ends + packed_qo_offset + q));
+  }
+  int num_kv_tiles = cute::ceil_div(kv_len, CTA_KV);
+  int first = std::max(min_start / CTA_KV - 1, 0);
+  int last = std::min(num_kv_tiles - 1, std::max(max_end, 0) / CTA_KV);
+  if (last < first) {
+    last = first;
+  }
+  return {first, last};
+}
+
+template <int CTA_Q, int CTA_KV, bool LEFT_SLIDING_WINDOW, bool LEFT_VARIABLE_WINDOW,
+          typename Params>
+CUTLASS_DEVICE void apply_window_kv_tile_skip(Params const& mainloop_params, int packed_qo_offset,
+                                              int q_tile_idx, int qo_len, int kv_len,
+                                              int& kv_tile_idx, int& swa_begin_kv_tile_idx) {
+  static_assert(!(LEFT_SLIDING_WINDOW && LEFT_VARIABLE_WINDOW),
+                "VariableWindow cannot be combined with sliding window");
+  if constexpr (LEFT_SLIDING_WINDOW) {
+    swa_begin_kv_tile_idx = get_swa_begin_kv_tile_idx<CTA_Q, CTA_KV>(mainloop_params.window_left,
+                                                                     q_tile_idx, qo_len, kv_len);
+  } else if constexpr (LEFT_VARIABLE_WINDOW) {
+    using AdditionalParamsT = decltype(mainloop_params.additional_params);
+    if constexpr (has_maybe_variable_window_token_starts_v<AdditionalParamsT> &&
+                  has_maybe_variable_window_token_ends_v<AdditionalParamsT>) {
+      auto bounds = get_variable_window_kv_tile_bounds<CTA_Q, CTA_KV>(
+          mainloop_params.additional_params.maybe_variable_window_token_starts,
+          mainloop_params.additional_params.maybe_variable_window_token_ends, packed_qo_offset,
+          q_tile_idx, qo_len, kv_len);
+      swa_begin_kv_tile_idx = bounds.begin;
+      kv_tile_idx = bounds.end;
+    }
+  }
+}
+
+template <int CTA_Q, int CTA_KV, bool LEFT_SLIDING_WINDOW, bool LEFT_VARIABLE_WINDOW,
+          typename Params>
+CUTLASS_DEVICE void apply_window_kv_tile_skip_consumer(Params const& mainloop_params,
+                                                       int packed_qo_offset, int q_tile_idx,
+                                                       int qo_len, int kv_len, int& num_kv_tiles,
+                                                       int& swa_begin_kv_tile_idx,
+                                                       int& swa_end_kv_tile_idx) {
+  static_assert(!(LEFT_SLIDING_WINDOW && LEFT_VARIABLE_WINDOW),
+                "VariableWindow cannot be combined with sliding window");
+  if constexpr (LEFT_SLIDING_WINDOW) {
+    swa_begin_kv_tile_idx = get_swa_begin_kv_tile_idx<CTA_Q, CTA_KV>(mainloop_params.window_left,
+                                                                     q_tile_idx, qo_len, kv_len);
+    swa_end_kv_tile_idx = get_swa_end_kv_tile_idx<CTA_Q, CTA_KV>(mainloop_params.window_left,
+                                                                 q_tile_idx, qo_len, kv_len);
+  } else if constexpr (LEFT_VARIABLE_WINDOW) {
+    using AdditionalParamsT = decltype(mainloop_params.additional_params);
+    if constexpr (has_maybe_variable_window_token_starts_v<AdditionalParamsT> &&
+                  has_maybe_variable_window_token_ends_v<AdditionalParamsT>) {
+      auto bounds = get_variable_window_kv_tile_bounds<CTA_Q, CTA_KV>(
+          mainloop_params.additional_params.maybe_variable_window_token_starts,
+          mainloop_params.additional_params.maybe_variable_window_token_ends, packed_qo_offset,
+          q_tile_idx, qo_len, kv_len);
+      // Drain is unused: middle loop consumes (first, last], init consumes last.
+      swa_begin_kv_tile_idx = bounds.begin;
+      swa_end_kv_tile_idx = bounds.begin - 1;
+      num_kv_tiles = bounds.end + 1;
+    }
+  }
+}
+
+template <typename Acc>
+CUTLASS_DEVICE void mask_variable_window_score(int32_t const* starts, int32_t const* ends,
+                                               int packed_qo_offset, int qo_idx, int qo_len,
+                                               int kv_idx, int kv_len, Acc& score, Acc fill_value) {
+  if (qo_idx >= qo_len || kv_idx >= kv_len) {
+    score = fill_value;
+    return;
+  }
+  int32_t window_start = __ldg(starts + packed_qo_offset + qo_idx);
+  int32_t window_end = __ldg(ends + packed_qo_offset + qo_idx);
+  if (kv_idx < window_start || kv_idx > window_end) {
+    score = fill_value;
+  }
+}
+
+// Field access is gated on AdditionalParams so FA3 modules compiled with
+// LEFT_VARIABLE_WINDOW=false (no start/end pointers) stay well-formed under NVCC.
+template <bool LEFT_VARIABLE_WINDOW, typename Params, typename Acc>
+CUTLASS_DEVICE void apply_variable_window_score_mask(Params const& mainloop_params,
+                                                     int packed_qo_offset, int qo_idx, int qo_len,
+                                                     int kv_idx, int kv_len, Acc& score,
+                                                     Acc fill_value) {
+  if constexpr (LEFT_VARIABLE_WINDOW) {
+    using AdditionalParamsT = decltype(mainloop_params.additional_params);
+    if constexpr (has_maybe_variable_window_token_starts_v<AdditionalParamsT> &&
+                  has_maybe_variable_window_token_ends_v<AdditionalParamsT>) {
+      mask_variable_window_score(
+          mainloop_params.additional_params.maybe_variable_window_token_starts,
+          mainloop_params.additional_params.maybe_variable_window_token_ends, packed_qo_offset,
+          qo_idx, qo_len, kv_idx, kv_len, score, fill_value);
+    }
+  }
+}
+
 template <typename TensorT>
 CUTLASS_HOST_DEVICE auto flatten_1(TensorT tensor) {
   Tensor tensor_flatten = cute::flatten(tensor);

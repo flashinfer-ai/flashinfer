@@ -445,8 +445,9 @@ def get_batch_prefill_uri(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_variable_window: bool = False,
 ) -> str:
-    return (
+    uri = (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -458,6 +459,9 @@ def get_batch_prefill_uri(
         f"use_logits_cap_{use_logits_soft_cap}_"
         f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
     )
+    if use_variable_window:
+        uri += "_use_vw_True"
+    return uri
 
 
 def get_batch_prefill_attention_sink_uri(
@@ -1034,6 +1038,7 @@ def gen_batch_prefill_module(
     use_sliding_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
+    use_variable_window: bool = False,
 ) -> JitSpec:
     uri = get_batch_prefill_uri(
         backend,
@@ -1047,6 +1052,7 @@ def gen_batch_prefill_module(
         use_sliding_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
+        use_variable_window,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -1060,6 +1066,11 @@ def gen_batch_prefill_module(
     assert dtype_o not in [torch.float8_e4m3fn, torch.float8_e5m2], (
         "FP8 output is not supported in fa2/fa3 backends yet"
     )
+    if use_variable_window:
+        if backend != "fa3":
+            raise ValueError("variable_window is only supported for the fa3 backend")
+        if use_sliding_window:
+            raise ValueError("variable_window cannot be combined with sliding window")
 
     if backend == "fa2":
         assert not fp8_enabled, "fp8 tensor core is not supported in fa2 backend"
@@ -1127,6 +1138,15 @@ def gen_batch_prefill_module(
             additional_scalar_dtypes = ["double", "double", "double", "double"]
             variant_name = "DefaultFP8Attention"
             variant_decl = "#include<flashinfer/attention/hopper/variants.cuh>"
+        if use_variable_window:
+            additional_tensor_names = additional_tensor_names + [
+                "maybe_variable_window_token_starts",
+                "maybe_variable_window_token_ends",
+            ]
+            additional_tensor_dtypes = additional_tensor_dtypes + [
+                "int32_t",
+                "int32_t",
+            ]
 
     return gen_customize_batch_prefill_module(
         backend,
@@ -1148,6 +1168,7 @@ def gen_batch_prefill_module(
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
+        use_variable_window=use_variable_window,
     )
 
 
@@ -1679,6 +1700,7 @@ def gen_customize_batch_prefill_module(
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
+    use_variable_window: bool = False,
 ) -> JitSpec:
     require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
     if require_fp4_kv_cache:
@@ -1708,6 +1730,7 @@ def gen_customize_batch_prefill_module(
         "use_sliding_window": str(use_sliding_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
+        "use_variable_window": str(use_variable_window).lower(),
     }
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")

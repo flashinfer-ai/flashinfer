@@ -12,12 +12,14 @@
 #include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 
+#include "../utils.cuh"
+
 namespace flashinfer {
 
-template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, typename WarpScheduler,
-          typename AttentionVariant, typename Params, typename MainloopPipeline,
-          typename MainloopPipelineVt, typename PipelineState, typename SharedStorage,
-          typename FrgTensorO, typename AttentionUpdater>
+template <typename Ktraits, bool LEFT_SLIDING_WINDOW, bool CAUSAL, bool LEFT_VARIABLE_WINDOW,
+          typename WarpScheduler, typename AttentionVariant, typename Params,
+          typename MainloopPipeline, typename MainloopPipelineVt, typename PipelineState,
+          typename SharedStorage, typename FrgTensorO, typename AttentionUpdater>
 CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& variant,
                             MainloopPipeline pipeline_k, MainloopPipelineVt pipeline_vt,
                             PipelineState& smem_pipe_read_k, PipelineState& smem_pipe_read_v,
@@ -26,7 +28,8 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
                             int swa_end_kv_tile_idx, int thread_idx, int work_idx, int q_tile_idx,
                             SharedStorage& shared_storage, const int32_t qo_len,
                             const int32_t kv_len, const int32_t qo_head_idx,
-                            const int32_t kv_head_idx, const int32_t batch_idx) {
+                            const int32_t kv_head_idx, const int32_t batch_idx,
+                            const int packed_qo_offset = 0) {
   using DTypeQ = typename Ktraits::DTypeQ;
   using DTypeKV = typename Ktraits::DTypeKV;
   using IdType = typename Ktraits::IdType;
@@ -93,6 +96,11 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
   auto col_limit_left = [&](int qo_idx) {
     return qo_idx + kv_len - qo_len - mainloop_params.window_left;
   };
+  auto apply_variable_window_mask = [&](auto& score, int qo_idx, int kv_idx) {
+    apply_variable_window_score_mask<LEFT_VARIABLE_WINDOW>(mainloop_params, packed_qo_offset,
+                                                           qo_idx, qo_len, kv_idx, kv_len, score,
+                                                           AttentionUpdater::fill_value);
+  };
   {
     Tensor cS = cute::make_identity_tensor(select<0, 1>(TileShape_QKD{}));
     Tensor tScS = threadMmaQK.partition_C(cS);
@@ -116,6 +124,7 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
           tSrS(i) = AttentionUpdater::fill_value;
         }
       }
+      apply_variable_window_mask(tSrS(i), qo_idx, kv_idx);
     }
   }
 
@@ -163,6 +172,7 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
           tSrS(i) = AttentionUpdater::fill_value;
         }
       }
+      apply_variable_window_mask(tSrS(i), qo_idx, kv_idx);
     }
     attention_updater.update</*init=*/false>(tSrS);
     // Re-quantize P after softmax
@@ -201,6 +211,7 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
       int kv_idx = get<1>(tScS(i)) + (kv_tile_idx - 1) * CTA_KV;
       tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/batch_idx, qo_idx,
                                         kv_idx, qo_head_idx, kv_head_idx);
+      apply_variable_window_mask(tSrS(i), qo_idx, kv_idx);
     }
 
     attention_updater.update</*init=*/false>(tSrS);
@@ -217,7 +228,7 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
     permute_regs_A_to_C(tOrP);
   }
 
-  if constexpr (LEFT_SLIDING_WINDOW) {
+  if constexpr (LEFT_SLIDING_WINDOW || LEFT_VARIABLE_WINDOW) {
 #pragma unroll 1
     for (; kv_tile_idx > swa_begin_kv_tile_idx; --kv_tile_idx) {
       Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_QKD{}));
@@ -240,9 +251,12 @@ CUTLASS_DEVICE void mma_fp8(const Params& mainloop_params, AttentionVariant& var
         int kv_idx = get<1>(tScS(i)) + (kv_tile_idx - 1) * CTA_KV;
         tSrS(i) = variant.LogitsTransform(mainloop_params, tSrS(i), /*batch_idx=*/batch_idx, qo_idx,
                                           kv_idx, qo_head_idx, kv_head_idx);
-        if (kv_idx < col_limit_left(qo_idx)) {
-          tSrS(i) = AttentionUpdater::fill_value;
+        if constexpr (LEFT_SLIDING_WINDOW) {
+          if (kv_idx < col_limit_left(qo_idx)) {
+            tSrS(i) = AttentionUpdater::fill_value;
+          }
         }
+        apply_variable_window_mask(tSrS(i), qo_idx, kv_idx);
       }
       attention_updater.update</*init=*/false>(tSrS);
       // Re-quantize P after softmax
