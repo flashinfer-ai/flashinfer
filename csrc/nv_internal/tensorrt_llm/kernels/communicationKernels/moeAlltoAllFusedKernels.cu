@@ -4,11 +4,10 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
-#include <set>
-#include <utility>
 
 #include "flashinfer/exception.h"
 #include "tensorrt_llm/common/dataType.h"
@@ -97,6 +96,26 @@ constexpr int kDTypeBFloat16 = 0;
 constexpr int kDTypeFloat16 = 1;
 constexpr int kDTypeFloat8E4M3 = 2;
 constexpr int kDTypeFloat32 = 3;
+constexpr int kMaxPreloadDevices = 64;
+
+enum class PreloadKernelSlot {
+  kStageCombine,
+  kPublishCombine,
+  kCombineTopK1,
+  kCombineTopK2,
+  kCombineTopK4,
+  kCombineTopK6,
+  kCombineTopK8,
+  kCombineTopK10,
+  kCombineTopK12,
+  kCombineTopK14,
+  kCombineTopK16,
+  kCombineTopK18,
+  kCombineTopK22,
+  kCombineBf16TopK6,
+  kCombineBf16TopK8,
+  kQuantizeCombine,
+};
 
 template <typename T>
 int ceilDiv(T numerator, T denominator) {
@@ -110,27 +129,25 @@ uint64_t byteOffset(void const* pointer, uint8_t const* base) {
   return static_cast<uint64_t>(address - base_address);
 }
 
-template <typename KernelFn>
+template <PreloadKernelSlot Slot, typename KernelFn>
 void preloadKernel(char const* name, KernelFn kernel_fn) {
   int device = -1;
   cudaError_t const device_error = cudaGetDevice(&device);
   FLASHINFER_CHECK(device_error == cudaSuccess, "cudaGetDevice (", name,
                    ") failed: ", cudaGetErrorString(device_error));
+  FLASHINFER_CHECK(device >= 0 && device < kMaxPreloadDevices, "CUDA device index (", device,
+                   ") is out of the preload cache range");
 
-  using PreloadKey = std::pair<int, uintptr_t>;
-  static std::mutex preload_mutex;
-  static std::set<PreloadKey> preloaded_kernels;
-  PreloadKey const key{device, reinterpret_cast<uintptr_t>(kernel_fn)};
-  std::lock_guard<std::mutex> lock(preload_mutex);
-  if (preloaded_kernels.find(key) != preloaded_kernels.end()) {
-    return;
-  }
-
-  cudaFuncAttributes attributes{};
-  cudaError_t const error = cudaFuncGetAttributes(&attributes, kernel_fn);
-  FLASHINFER_CHECK(error == cudaSuccess, "cudaFuncGetAttributes (", name,
-                   ") failed: ", cudaGetErrorString(error));
-  preloaded_kernels.insert(key);
+  // Slot is part of this template specialization, so every fixed kernel owns
+  // an independent per-device once flag. Steady-state calls avoid the global
+  // mutex and ordered-tree lookup that used to serialize prepare_combine.
+  static std::array<std::once_flag, kMaxPreloadDevices> preloaded_devices;
+  std::call_once(preloaded_devices[device], [name, kernel_fn] {
+    cudaFuncAttributes attributes{};
+    cudaError_t const error = cudaFuncGetAttributes(&attributes, kernel_fn);
+    FLASHINFER_CHECK(error == cudaSuccess, "cudaFuncGetAttributes (", name,
+                     ") failed: ", cudaGetErrorString(error));
+  });
 }
 
 int dtypeBytes(nvinfer1::DataType dtype) {
@@ -165,10 +182,11 @@ int dtypeCode(nvinfer1::DataType dtype) {
 }
 
 void preloadCombineKernel(int top_k) {
-#define PRELOAD_COMBINE_TOP_K(TOP_K)                                           \
-  case TOP_K:                                                                  \
-    preloadKernel("mnnvl_moe_alltoall_combine_top_k_" #TOP_K,                  \
-                  kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_##TOP_K); \
+#define PRELOAD_COMBINE_TOP_K(TOP_K)                                                \
+  case TOP_K:                                                                       \
+    preloadKernel<PreloadKernelSlot::kCombineTopK##TOP_K>(                          \
+        "mnnvl_moe_alltoall_combine_top_k_" #TOP_K,                                \
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_##TOP_K);                \
     return
   switch (top_k) {
     PRELOAD_COMBINE_TOP_K(1);
@@ -270,24 +288,29 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
       useBf16TopK6Combine(params) && params.prepare_payload != nullptr;
   // CUDA lazy module loading may synchronize the device. Load every downstream
   // function before publication can enter its cross-rank wait.
-  preloadKernel("mnnvl_moe_alltoall_stage_combine",
-                kernel_flashinfer_mnnvl_moe_alltoall_stage_combine);
+  preloadKernel<PreloadKernelSlot::kStageCombine>(
+      "mnnvl_moe_alltoall_stage_combine",
+      kernel_flashinfer_mnnvl_moe_alltoall_stage_combine);
   if (!fuse_topk6_publication) {
-    preloadKernel("mnnvl_moe_alltoall_publish_combine",
-                  kernel_flashinfer_mnnvl_moe_alltoall_publish_combine);
+    preloadKernel<PreloadKernelSlot::kPublishCombine>(
+        "mnnvl_moe_alltoall_publish_combine",
+        kernel_flashinfer_mnnvl_moe_alltoall_publish_combine);
   }
   if (useBf16TopK6Combine(params)) {
-    preloadKernel("mnnvl_moe_alltoall_combine_bf16_topk6",
-                  kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6);
+    preloadKernel<PreloadKernelSlot::kCombineBf16TopK6>(
+        "mnnvl_moe_alltoall_combine_bf16_topk6",
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6);
   } else if (useBf16TopK8Combine(params)) {
-    preloadKernel("mnnvl_moe_alltoall_combine_bf16_topk8",
-                  kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8);
+    preloadKernel<PreloadKernelSlot::kCombineBf16TopK8>(
+        "mnnvl_moe_alltoall_combine_bf16_topk8",
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8);
   } else {
     preloadCombineKernel(params.top_k);
   }
   if (params.quant_mode != MoeA2ACombineQuantMode::NONE) {
-    preloadKernel("mnnvl_moe_alltoall_quantize_combine",
-                  kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine);
+    preloadKernel<PreloadKernelSlot::kQuantizeCombine>(
+        "mnnvl_moe_alltoall_quantize_combine",
+        kernel_flashinfer_mnnvl_moe_alltoall_quantize_combine);
   }
   auto* rank_workspace =
       localWorkspace(params.workspace, params.workspace_stride_bytes, params.ep_rank);
