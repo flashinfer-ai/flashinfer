@@ -368,6 +368,14 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
       topk_extra, stride_kv_block, stride_kv_block_extra, topk_length_ptr, topk_length_extra_ptr, \
       stream)
 
+  // DeepSeek V4 Vision widens the primary causal-SWA candidate set from
+  // 128 to 512 entries and pairs it with a 512-entry global cache. Keep this
+  // instantiation limited to the live-tested TP shape and cache layout.
+  if (num_heads == 32 && topk == 512 && topk_extra == 512 && extra_page_block_size == 64) {
+    DISPATCH_DUAL_MG_CM(BF16, 32, 512, 64, 2);
+    return true;
+  }
+
 #define DISPATCH_BY_NH_PBSX(PBSX)                     \
   do {                                                \
     switch (num_heads) {                              \
@@ -416,7 +424,8 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
                                  const float* attn_sink, const int* topk_length,
                                  const int* extra_topk_length, cudaStream_t stream) {
   if (extra_KV_cache != nullptr) {
-    if (mt != ModelType::DSV4) return false;
+    // Every dual-cache instantiation below fixes the primary page size at 64.
+    if (mt != ModelType::DSV4 || page_block_size != 64) return false;
     return dispatch_dsv4_dual(num_heads, topk, topk_extra, extra_page_block_size, Q, KV_cache,
                               indices, extra_KV_cache, extra_indices, attn_sink, output, out_lse,
                               sm_scale, num_tokens, stride_kv_block, stride_kv_block_extra,

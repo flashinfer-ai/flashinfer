@@ -1103,25 +1103,26 @@ def test_sparse_mla_sm120_prefill_dsv4_topk_length_truncation(
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
+_DSV4_PREFILL_DUAL_HEADS = [8, 16, 32, 64, 128]
 _DSV4_PREFILL_DUAL_CONFIGS = [
-    (128, 64),
-    (512, 64),
-    (512, 2),
+    (num_heads, 128, extra_topk, extra_pbs)
+    for num_heads in _DSV4_PREFILL_DUAL_HEADS
+    for extra_topk, extra_pbs in [(128, 64), (512, 64), (512, 2)]
+] + [
+    (32, 512, 512, 64),
 ]
 
-_DSV4_PREFILL_DUAL_HEADS = [8, 16, 32, 64, 128]
 
-
-@pytest.mark.parametrize("num_heads", _DSV4_PREFILL_DUAL_HEADS)
-@pytest.mark.parametrize("extra_topk,extra_pbs", _DSV4_PREFILL_DUAL_CONFIGS)
+@pytest.mark.parametrize(
+    "num_heads,topk,extra_topk,extra_pbs", _DSV4_PREFILL_DUAL_CONFIGS
+)
 def test_sparse_mla_sm120_prefill_dsv4_dual(
-    num_heads: int, extra_topk: int, extra_pbs: int
+    num_heads: int, topk: int, extra_topk: int, extra_pbs: int
 ) -> None:
     """DSv4 dual-cache prefill."""
     torch.manual_seed(0)
     device = torch.device("cuda")
     d_qk, d_v = 512, 512
-    topk = 128
     main_pbs = 64
     num_tokens = 128
 
