@@ -1301,6 +1301,29 @@ def _cutile_ragged_block_scaled_bmm_requirement(
     backend: Literal["cutile"] = "cutile",
 ):
     """Validate shapes, dtypes and backend support for the cuTile ragged_block_scaled_bmm path."""
+    # Only NT layout (a row-major, b transposed) is implemented; a transposed
+    # input would otherwise trip an assert deep in the kernel.
+    if transpose_a or not transpose_b:
+        raise ValueError(
+            "ragged_block_scaled_bmm cuTile backend only supports NT layout "
+            f"(transpose_a=False, transpose_b=True); got transpose_a={transpose_a}, "
+            f"transpose_b={transpose_b}."
+        )
+    # This is the block-scaled FP8 path: FP8 inputs dequantized by fp32 scales.
+    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e5m2)
+    if a.dtype not in fp8_dtypes or b.dtype not in fp8_dtypes:
+        raise ValueError(
+            "ragged_block_scaled_bmm cuTile backend expects FP8 (float8_e4m3fn / "
+            f"float8_e5m2) inputs; got a.dtype={a.dtype}, b.dtype={b.dtype}."
+        )
+    if b_scale.dtype != torch.float32 or (
+        a_scale is not None and a_scale.dtype != torch.float32
+    ):
+        raise ValueError(
+            "ragged_block_scaled_bmm cuTile backend expects float32 block scales; "
+            f"got a_scale.dtype={None if a_scale is None else a_scale.dtype}, "
+            f"b_scale.dtype={b_scale.dtype}."
+        )
     return True
 
 
