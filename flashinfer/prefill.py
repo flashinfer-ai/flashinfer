@@ -297,8 +297,11 @@ def get_trtllm_gen_prefill_module():
             0,  # o_sf_start_index
             batch_size,
             window_left,
+            0 if is_causal and window_left >= 0 else -1,
             cum_seq_lens_q,
             cum_seq_lens_kv,
+            None,
+            None,
             sm_count,
             enable_pdl,
             workspace_size,
@@ -5375,6 +5378,9 @@ def trtllm_batch_context_with_kv_cache(
     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     use_fp16_softmax: Optional[bool] = None,
     uses_spcompress: Optional[bool] = None,
+    window_right: int = -1,
+    variable_window_token_starts: Optional[torch.Tensor] = None,
+    variable_window_token_ends: Optional[torch.Tensor] = None,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -5420,8 +5426,22 @@ def trtllm_batch_context_with_kv_cache(
     cum_seq_lens_kv : torch.Tensor
         cumulative sequence length for kv_cache. shape: ``[batch_size + 1]``
     window_left : int = -1
-        The left (inclusive) window size for the attention window, when set to ``-1``, the window
-        size will be set to the full length of the sequence. Defaults to ``-1``.
+        Number of tokens to the left of the current query position that remain visible, excluding
+        the current token. ``-1`` means unbounded. Defaults to ``-1``.
+    window_right : int = -1
+        Number of tokens to the right of the current query position that remain visible, excluding
+        the current token. For backward compatibility, causal attention with ``window_left >= 0``
+        treats ``window_right=-1`` as ``0``. A non-causal fixed window requires a non-negative
+        value. Defaults to ``-1``.
+    variable_window_token_starts : Optional[torch.Tensor]
+        Contiguous int32 tensor with one entry per packed query token. Together with
+        ``variable_window_token_ends``, supplies the inclusive K/V interval visible to every query
+        token. Bounds use positions within each batch item's full K/V sequence and must be
+        nondecreasing within a sequence.
+    variable_window_token_ends : Optional[torch.Tensor]
+        Inclusive interval ends paired with ``variable_window_token_starts``. Variable windows
+        cannot be combined with fixed ``window_left``/``window_right`` bounds; when supplied, they
+        define the complete attention mask and the ``causal`` flag is ignored.
     out : Optional[Union[torch.Tensor, FP4Tensor]] = None
         output tensor, if not provided, will be allocated with ``out_dtype``, if ``out_dtype`` is not provided, will use the type of ``query``.
     out_dtype : Optional[Union[torch.dtype, str]] = None
@@ -5517,11 +5537,56 @@ def trtllm_batch_context_with_kv_cache(
     )
     if enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
-    if not causal and window_left >= 0:
-        raise NotImplementedError(
-            "Sliding-window non-causal attention is not supported for trtllm-gen paged KV cache. "
-            "Use window_left=-1 for dense bidirectional attention."
+    if isinstance(window_left, bool) or not isinstance(window_left, int):
+        raise TypeError("window_left must be an integer")
+    if isinstance(window_right, bool) or not isinstance(window_right, int):
+        raise TypeError("window_right must be an integer")
+    if window_left < -1 or window_right < -1:
+        raise ValueError("window_left and window_right must be at least -1")
+    has_variable_window = (
+        variable_window_token_starts is not None
+        or variable_window_token_ends is not None
+    )
+    if has_variable_window:
+        if variable_window_token_starts is None or variable_window_token_ends is None:
+            raise ValueError(
+                "variable_window_token_starts and variable_window_token_ends "
+                "must be provided together"
+            )
+        if window_left != -1 or window_right != -1:
+            raise ValueError(
+                "variable windows cannot be combined with fixed window bounds"
+            )
+        check_shape_dtype_device(
+            variable_window_token_starts,
+            (query.size(0),),
+            torch.int32,
+            query.device,
+            "variable_window_token_starts",
         )
+        check_shape_dtype_device(
+            variable_window_token_ends,
+            (query.size(0),),
+            torch.int32,
+            query.device,
+            "variable_window_token_ends",
+        )
+        if (
+            not variable_window_token_starts.is_contiguous()
+            or not variable_window_token_ends.is_contiguous()
+        ):
+            raise ValueError("variable window bounds must be contiguous")
+        effective_window_right = -1
+    elif causal:
+        if window_right not in (-1, 0):
+            raise ValueError("causal attention requires window_right to be -1 or 0")
+        effective_window_right = 0 if window_left >= 0 else -1
+    else:
+        if window_left != -1 and window_right == -1:
+            raise ValueError(
+                "non-causal fixed-window attention requires window_right >= 0"
+            )
+        effective_window_right = window_right
 
     if isinstance(kv_cache, tuple):
         k_cache, v_cache = kv_cache
@@ -5685,8 +5750,11 @@ def trtllm_batch_context_with_kv_cache(
         o_sf_start_index,
         batch_size,
         window_left,
+        effective_window_right,
         cum_seq_lens_q,
         cum_seq_lens_kv,
+        variable_window_token_starts,
+        variable_window_token_ends,
         sm_count,
         enable_pdl,
         workspace_size,

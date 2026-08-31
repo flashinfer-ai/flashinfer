@@ -35,7 +35,11 @@ enum class TrtllmGenAttentionMaskType {
   // Sliding window or chunked causal mask.
   SlidingOrChunkedCausal,
   // Custom mask.
-  Custom
+  Custom,
+  // Sliding window mask combined with a custom packed mask.
+  SlidingWindowCustom,
+  // Per-query-token inclusive K/V bounds.
+  VariableWindow
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -51,6 +55,8 @@ ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
 ATTENTION_MASK_TYPE_FUNCTION(Custom)
+ATTENTION_MASK_TYPE_FUNCTION(SlidingWindowCustom)
+ATTENTION_MASK_TYPE_FUNCTION(VariableWindow)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
 
@@ -220,6 +226,9 @@ struct TllmGenFmhaRunnerParams {
   int32_t const* firstSparseMaskOffsetsKvPtr;
   // Runtime sparse MLA top-k lengths, one value per query token.
   int32_t const* sparseMlaTopKLensPtr;
+  // Inclusive VariableWindow bounds, one pair per packed Q token.
+  int32_t const* variableWindowTokenStartsPtr;
+  int32_t const* variableWindowTokenEndsPtr;
   // The counter for the multiCtasKv mode.
   int32_t* multiCtasKvCounterPtr;
   // The sequence length buffer for K/V.
@@ -307,10 +316,10 @@ struct TllmGenFmhaRunnerParams {
   int mMaxSeqLenQ;
   // The max kv sequence length.
   int mMaxSeqLenKv;
-  // The attention window size for sliding window attention (sliding-window-attention is enabled
-  // when seqLenKv > mAttentionWindowSize).
-  int mAttentionWindowSize;
-  // The chunked attention size (chunked-context is enabled when seqLenKv > mChunkedAttentionSize).
+  // Sliding-window reaches excluding the current token. -1 means unbounded.
+  int mLeftSlidingWindow;
+  int mRightSlidingWindow;
+  // The exact chunk size. Zero disables chunked attention.
   int mChunkedAttentionSize;
   // The sum of sequence lengths for Q and K/V. (Only used when mSupportsVarSeqLens = true)
   int mSumOfSeqLensQ;
@@ -381,6 +390,12 @@ struct TllmGenFmhaRunnerParams {
         break;
       case 3:  // tensorrt_llm::kernels::ContextAttentionMaskType::CUSTOM_MASK
         mMaskType = TrtllmGenAttentionMaskType::Custom;
+        break;
+      case 4:  // tensorrt_llm::kernels::ContextAttentionMaskType::SLIDING_WINDOW_CUSTOM
+        mMaskType = TrtllmGenAttentionMaskType::SlidingWindowCustom;
+        break;
+      case 5:  // tensorrt_llm::kernels::ContextAttentionMaskType::VARIABLE_WINDOW
+        mMaskType = TrtllmGenAttentionMaskType::VariableWindow;
         break;
       default:
         FLASHINFER_ERROR("Invalid attention mask type");

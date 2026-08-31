@@ -9,6 +9,8 @@ helper were moved here so the parametrize matrices remain byte-identical
 to the originals.
 """
 
+import math
+
 import pytest
 import torch
 
@@ -247,6 +249,54 @@ def _spcompress_reference(
     return out
 
 
+def _variable_window_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    sm_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Independent PyTorch reference for packed per-query inclusive K/V bounds."""
+    qo_indptr_cpu = qo_indptr.cpu()
+    kv_indptr_cpu = kv_indptr.cpu()
+    num_qo_heads = q.shape[1]
+    num_kv_heads = k.shape[1]
+    head_group_size = num_qo_heads // num_kv_heads
+    out = torch.empty_like(q, dtype=torch.float32)
+    lse = torch.empty(q.shape[:2], device=q.device, dtype=torch.float32)
+
+    for batch_idx in range(qo_indptr_cpu.numel() - 1):
+        q_begin = int(qo_indptr_cpu[batch_idx].item())
+        q_end = int(qo_indptr_cpu[batch_idx + 1].item())
+        kv_begin = int(kv_indptr_cpu[batch_idx].item())
+        kv_end = int(kv_indptr_cpu[batch_idx + 1].item())
+        q_batch = q[q_begin:q_end].float().transpose(0, 1)
+        k_batch = k[kv_begin:kv_end].float()
+        v_batch = v[kv_begin:kv_end].float()
+        if head_group_size > 1:
+            k_batch = k_batch.repeat_interleave(head_group_size, dim=1)
+            v_batch = v_batch.repeat_interleave(head_group_size, dim=1)
+        k_batch = k_batch.transpose(0, 1)
+        v_batch = v_batch.transpose(0, 1)
+        logits = torch.matmul(q_batch, k_batch.transpose(-1, -2)) * sm_scale
+        k_positions = torch.arange(kv_end - kv_begin, device=q.device)
+        visible = (k_positions[None, :] >= starts[q_begin:q_end, None]) & (
+            k_positions[None, :] <= ends[q_begin:q_end, None]
+        )
+        logits = logits.masked_fill(~visible.unsqueeze(0), -float("inf"))
+        probs = torch.softmax(logits, dim=-1)
+        out[q_begin:q_end] = torch.matmul(probs, v_batch).transpose(0, 1)
+        # TRTLLM-Gen exposes its online-softmax statistic in base 2.
+        lse[q_begin:q_end] = torch.logsumexp(logits, dim=-1).transpose(
+            0, 1
+        ) * math.log2(math.e)
+
+    return out, lse
+
+
 def _test_trtllm_batch_prefill(
     kv_layout: str,
     batch_size: int,
@@ -271,11 +321,13 @@ def _test_trtllm_batch_prefill(
     provide_lse: bool = False,
     use_fp16_softmax: bool = False,
     uses_spcompress: bool = False,
+    variable_window: bool = False,
+    window_right: int = -1,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
-    if not causal and window_left >= 0:
+    if not causal and window_left >= 0 and window_right < 0:
         pytest.skip("Non-causal paged trtllm-gen tests only cover dense attention")
 
     if skips_softmax and q_dtype != kv_dtype:
@@ -379,7 +431,80 @@ def _test_trtllm_batch_prefill(
     }
     lse_ref = None
     sink = torch.rand(num_qo_heads, device=GPU_DEVICE, dtype=torch.float32) * 5
-    if uses_spcompress:
+    variable_window_token_starts = None
+    variable_window_token_ends = None
+    if variable_window:
+        assert causal and not enable_sink and not uses_spcompress
+        starts: list[int] = []
+        ends: list[int] = []
+        for q_len, kv_len in zip(
+            q_lens.cpu().tolist(), seq_lens.cpu().tolist(), strict=True
+        ):
+            q_offset = kv_len - q_len
+            batch_ends = [q_offset + q_idx for q_idx in range(q_len)]
+            if q_len >= 3:
+                block_begin = 1
+                block_end = min(q_len - 1, 3)
+                for q_idx in range(block_begin, block_end + 1):
+                    batch_ends[q_idx] = q_offset + block_end
+            starts.extend([0] * q_len)
+            ends.extend(batch_ends)
+        variable_window_token_starts = torch.tensor(
+            starts, dtype=torch.int32, device=GPU_DEVICE
+        )
+        variable_window_token_ends = torch.tensor(
+            ends, dtype=torch.int32, device=GPU_DEVICE
+        )
+        k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
+            ref_kv_cache,
+            page_table,
+            seq_lens.to(GPU_DEVICE),
+            page_size,
+            kv_last_page_len,
+            kv_layout,
+        )
+        output_ref, lse_ref = _variable_window_reference(
+            ref_q,
+            k_flat,
+            v_flat,
+            q_indptr,
+            kv_indptr_tokens,
+            variable_window_token_starts,
+            variable_window_token_ends,
+            sm_scale,
+        )
+    elif window_right >= 0:
+        starts = []
+        ends = []
+        for q_len, kv_len in zip(
+            q_lens.cpu().tolist(), seq_lens.cpu().tolist(), strict=True
+        ):
+            q_offset = kv_len - q_len
+            for q_idx in range(q_len):
+                q_pos = q_offset + q_idx
+                starts.append(max(0, q_pos - window_left) if window_left >= 0 else 0)
+                ends.append(min(kv_len - 1, q_pos + window_right))
+        fixed_starts = torch.tensor(starts, dtype=torch.int32, device=GPU_DEVICE)
+        fixed_ends = torch.tensor(ends, dtype=torch.int32, device=GPU_DEVICE)
+        k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
+            ref_kv_cache,
+            page_table,
+            seq_lens.to(GPU_DEVICE),
+            page_size,
+            kv_last_page_len,
+            kv_layout,
+        )
+        output_ref, lse_ref = _variable_window_reference(
+            ref_q,
+            k_flat,
+            v_flat,
+            q_indptr,
+            kv_indptr_tokens,
+            fixed_starts,
+            fixed_ends,
+            sm_scale,
+        )
+    elif uses_spcompress:
         # Boundary tiles attend densely; interior tiles get 2:4 keep-largest along K.
         k_flat, v_flat, kv_indptr_tokens = flatten_paged_kv(
             ref_kv_cache,
@@ -545,6 +670,9 @@ def _test_trtllm_batch_prefill(
         return_lse=effective_return_lse,
         use_fp16_softmax=use_fp16_softmax,
         uses_spcompress=uses_spcompress,
+        window_right=window_right,
+        variable_window_token_starts=variable_window_token_starts,
+        variable_window_token_ends=variable_window_token_ends,
     )
     if expects_lse:
         if effective_return_lse:
@@ -626,7 +754,9 @@ def _test_trtllm_batch_prefill(
         and uses_shared_paged_kv_idx
         and not use_fp16_softmax
         and not uses_spcompress
-    ):  # wrapper api does not support fp4 output/kv, separate KV page indices, or the cubin-variant flags.
+        and not variable_window
+        and window_right < 0
+    ):  # wrapper api does not support fp4 output/kv, two-sided/variable windows, or variant flags.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout, backend="trtllm-gen"
@@ -739,6 +869,143 @@ def test_trtllm_batch_prefill(
         skips_softmax=skips_softmax,
         uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
     )
+
+
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("kv_layout", ["HND", "NHD"])
+def test_trtllm_batch_prefill_variable_window(head_dim: int, kv_layout: str):
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability not in ((10, 0), (10, 3)):
+        pytest.skip("VariableWindow candidate coverage targets SM100 and SM103")
+    _test_trtllm_batch_prefill(
+        kv_layout,
+        2,
+        16,
+        2,
+        2,
+        True,
+        -1,
+        "bf16",
+        "bf16",
+        "bf16",
+        False,
+        False,
+        64,
+        128,
+        False,
+        head_dim,
+        uses_shared_paged_kv_idx=True,
+        return_lse=True,
+        variable_window=True,
+    )
+
+
+@pytest.mark.parametrize("q_dtype,kv_dtype,o_dtype", TRTLLM_BATCH_PREFILL_DTYPES)
+def test_trtllm_batch_prefill_variable_window_dtypes(
+    q_dtype: str, kv_dtype: str, o_dtype: str
+):
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability not in ((10, 0), (10, 3)):
+        pytest.skip("VariableWindow candidate coverage targets SM100 and SM103")
+    _test_trtllm_batch_prefill(
+        "HND",
+        2,
+        16,
+        2,
+        2,
+        True,
+        -1,
+        q_dtype,
+        o_dtype,
+        kv_dtype,
+        False,
+        False,
+        64,
+        128,
+        kv_dtype in ("fp8", "nvfp4"),
+        128,
+        uses_shared_paged_kv_idx=True,
+        return_lse=False,
+        variable_window=True,
+    )
+
+
+@pytest.mark.parametrize("window_left,window_right", [(31, 15), (63, 63)])
+def test_trtllm_batch_prefill_two_sided_window(window_left: int, window_right: int):
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability not in ((10, 0), (10, 3)):
+        pytest.skip(
+            "two-sided sliding-window candidate coverage targets SM100 and SM103"
+        )
+    _test_trtllm_batch_prefill(
+        "HND",
+        2,
+        16,
+        2,
+        2,
+        False,
+        window_left,
+        "bf16",
+        "bf16",
+        "bf16",
+        False,
+        False,
+        64,
+        128,
+        False,
+        128,
+        uses_shared_paged_kv_idx=True,
+        return_lse=True,
+        window_right=window_right,
+    )
+
+
+def test_trtllm_batch_prefill_window_validation():
+    _skip_if_not_blackwell()
+    query = torch.empty((2, 2, 128), dtype=torch.bfloat16, device=GPU_DEVICE)
+    kv_cache = torch.empty((1, 2, 2, 16, 128), dtype=torch.bfloat16, device=GPU_DEVICE)
+    common = {
+        "query": query,
+        "kv_cache": kv_cache,
+        "workspace_buffer": torch.empty(1 << 20, dtype=torch.uint8, device=GPU_DEVICE),
+        "block_tables": torch.zeros((1, 1), dtype=torch.int32, device=GPU_DEVICE),
+        "seq_lens": torch.tensor([2], dtype=torch.uint32, device=GPU_DEVICE),
+        "max_q_len": 2,
+        "max_kv_len": 2,
+        "bmm1_scale": 1.0,
+        "bmm2_scale": 1.0,
+        "batch_size": 1,
+        "cum_seq_lens_q": torch.tensor([0, 2], dtype=torch.int32, device=GPU_DEVICE),
+        "cum_seq_lens_kv": torch.tensor([0, 2], dtype=torch.int32, device=GPU_DEVICE),
+    }
+    starts = torch.zeros(2, dtype=torch.int32, device=GPU_DEVICE)
+    ends = torch.ones(2, dtype=torch.int32, device=GPU_DEVICE)
+
+    with pytest.raises(ValueError, match="must be provided together"):
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            **common, variable_window_token_starts=starts
+        )
+    with pytest.raises(ValueError, match="cannot be combined"):
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            **common,
+            window_left=1,
+            variable_window_token_starts=starts,
+            variable_window_token_ends=ends,
+        )
+    with pytest.raises(ValueError, match="Invalid dtype"):
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            **common,
+            variable_window_token_starts=starts.to(torch.int64),
+            variable_window_token_ends=ends,
+        )
+    with pytest.raises(ValueError, match="causal attention requires"):
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            **common, window_left=1, window_right=1
+        )
+    with pytest.raises(ValueError, match="requires window_right >= 0"):
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            **common, causal=False, window_left=1
+        )
 
 
 @pytest.mark.parametrize("return_lse", [False, True])

@@ -130,8 +130,12 @@ struct KernelParams {
   // The variable sparseMla topK lengths with shape of [numTokensQ].
   int32_t const* ptrSparseMlaTopKLens;
 
-  // The attention window size for sliding window attention.
-  int32_t mAttentionWindowSize;
+  // Sliding-window reaches excluding the current token. -1 means unbounded.
+  int32_t mLeftSlidingWindow{-1};
+  int32_t mRightSlidingWindow{-1};
+  // Inclusive VariableWindow bounds, one pair per packed Q token.
+  int32_t const* ptrVariableWindowTokenStarts{nullptr};
+  int32_t const* ptrVariableWindowTokenEnds{nullptr};
   // The batch size
   int32_t mBatchSize;
   // The chunked attention size in log2.
@@ -852,6 +856,8 @@ struct KernelParams {
     // The sequence lengths for Kv.
     params.ptrSeqLensKv = options.seqLensKvPtr;
     params.ptrSparseMlaTopKLens = options.sparseMlaTopKLensPtr;
+    params.ptrVariableWindowTokenStarts = options.variableWindowTokenStartsPtr;
+    params.ptrVariableWindowTokenEnds = options.variableWindowTokenEndsPtr;
 
     // Attention sink
     params.ptrAttentionSinks = options.ptrAttentionSinks;
@@ -869,10 +875,11 @@ struct KernelParams {
     params.ptrScaleSfO = options.oSfScalePtr;
     params.mScaleSfO = options.mScaleSfO;
 
-    params.mAttentionWindowSize = options.mAttentionWindowSize;
+    params.mLeftSlidingWindow = options.mLeftSlidingWindow;
+    params.mRightSlidingWindow = options.mRightSlidingWindow;
     if (isSlidingOrChunkedCausalMask(
             static_cast<TrtllmGenAttentionMaskType>(kernelMeta.mMaskType)) &&
-        options.mChunkedAttentionSize != INT_MAX) {
+        options.mChunkedAttentionSize > 0) {
       FLASHINFER_CHECK((options.mChunkedAttentionSize & (options.mChunkedAttentionSize - 1)) == 0,
                        "Chunked attention size must be a power of 2");
       params.mChunkedAttentionSizeLog2 = std::log2(options.mChunkedAttentionSize);
@@ -899,7 +906,6 @@ struct KernelParams {
     params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
     params.mSumOfSeqLensKv = options.mSumOfSeqLensKv;
     params.mBatchSize = options.mBatchSize;
-    params.mChunkedAttentionSizeLog2 = 0;
     params.mNumHeadsQ = options.mNumHeadsQ;
     params.mNumHeadsKv = options.mNumHeadsKv;
     params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;
