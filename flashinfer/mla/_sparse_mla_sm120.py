@@ -134,6 +134,7 @@ _DECODE_DSV3_2_DISPATCH = frozenset(
 )
 # GLM-5.3-Flash has 64 attention heads: H=32 is TP2 and H=64 is TP1.
 _DECODE_GLM53_NOPE_DISPATCH = frozenset({(32, 2176), (64, 2176)})
+_PREFILL_GLM53_NOPE_HEADS = frozenset({32, 64})
 _DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
 
 _MODEL_TYPE_DSV3_2 = 0
@@ -168,6 +169,7 @@ def _normalize_kv_scale_format(kv_scale_format: str) -> str:
 
 
 def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
+    """Resolve a packed sparse-MLA model type from geometry and scale ABI."""
     fmt = _normalize_kv_scale_format(kv_scale_format)
     if d_qk == 576:
         if fmt == "arbitrary_fp32":
@@ -185,6 +187,7 @@ def _resolve_model_type(d_qk: int, kv_scale_format: str) -> int:
 
 
 def _bytes_per_token_for_model_type(model_type: int) -> int:
+    """Return the packed KV-row ABI width for a model type."""
     if model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA, _MODEL_TYPE_GLM53_NOPE):
         return _BPT_DSV3_2
     if model_type == _MODEL_TYPE_DSV4:
@@ -198,6 +201,7 @@ def _packed_kv_page_block_size(
     model_type: int,
     name: str,
 ) -> int:
+    """Validate a packed KV layout and return its page-block size."""
     bytes_per_token = _bytes_per_token_for_model_type(model_type)
     if kv_cache.ndim == 2:
         block_bytes = int(kv_cache.shape[1])
@@ -278,6 +282,11 @@ def _decode_dsv4_dispatchable(
     )
 
 
+def _glm53_nope_prefill_shape_supported(num_heads: int, topk: int) -> bool:
+    """Return whether GLM-5.3 prefill has a native standalone specialization."""
+    return num_heads in _PREFILL_GLM53_NOPE_HEADS and topk == 2176
+
+
 def _decode_scratch_views(
     mid_out: Optional[torch.Tensor],
     mid_lse: Optional[torch.Tensor],
@@ -340,6 +349,7 @@ def get_sparse_mla_sm120_module():
         mid_out: Optional[torch.Tensor],
         mid_lse: Optional[torch.Tensor],
     ) -> None:
+        """Dispatch one validated packed sparse-MLA request to decode or prefill."""
         num_tokens, num_heads, d_qk = q.shape
         topk = indices.shape[-1]
         _require_d_v_512(d_v)
@@ -349,6 +359,15 @@ def get_sparse_mla_sm120_module():
             kv_cache, model_type=model_type, name="kv_cache"
         )
         extra_topk = int(extra_indices.size(-1)) if extra_indices is not None else 0
+        if (
+            model_type == _MODEL_TYPE_GLM53_NOPE
+            and num_tokens > _DECODE_MAX_TOKENS
+            and not _glm53_nope_prefill_shape_supported(num_heads, topk)
+        ):
+            raise ValueError(
+                "GLM53_NOPE prefill supports only num_heads in {32, 64} "
+                f"with topk=2176; got num_heads={num_heads}, topk={topk}"
+            )
         if (
             model_type == _MODEL_TYPE_DSV4
             and kv_pbs == _DECODE_DSV4_PAGE_BLOCK_SIZE

@@ -10,8 +10,10 @@ from flashinfer.mla._sparse_mla_sm120 import (
     _DECODE_GLM53_NOPE_DISPATCH,
     _MODEL_TYPE_DSV4,
     _MODEL_TYPE_GLM53_NOPE,
+    _PREFILL_GLM53_NOPE_HEADS,
     _bytes_per_token_for_model_type,
     _decode_dsv3_2_dispatchable,
+    _glm53_nope_prefill_shape_supported,
     _resolve_model_type,
 )
 
@@ -47,3 +49,12 @@ def test_glm53_nope_decode_envelope_rejects_uninstantiated_heads() -> None:
     assert not _decode_dsv3_2_dispatchable(
         64, 32, 2176, 512, 64, _MODEL_TYPE_DSV4
     )
+
+
+def test_glm53_nope_prefill_envelope() -> None:
+    """Standalone GLM prefill stays limited to native TP2/TP1 geometry."""
+    assert _PREFILL_GLM53_NOPE_HEADS == {32, 64}
+    assert _glm53_nope_prefill_shape_supported(32, 2176)
+    assert _glm53_nope_prefill_shape_supported(64, 2176)
+    assert not _glm53_nope_prefill_shape_supported(8, 2176)
+    assert not _glm53_nope_prefill_shape_supported(32, 2048)

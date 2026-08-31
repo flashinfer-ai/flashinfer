@@ -40,8 +40,8 @@
 //   DSV4:         576 (nope+rope only, footer scales excluded)
 //                 576 % 16 = 0 ✓ for cp.async.bulk
 //
-// DSV3_2, GLM_NSA, and GLM53_NOPE use flat addressing:
-// kv_ptr + global_idx * 656.
+// DSV3_2 and GLM_NSA retain their flat 656-byte addressing. GLM53_NOPE uses
+// the supplied page stride so padded page layouts preserve row identity.
 // DSV4 uses block-structured addressing (footer layout):
 //   data:  kv_ptr + block_idx * stride_kv_block + local_idx * 576
 //   scale: kv_ptr + block_idx * stride_kv_block + page_block_size * 576 + local_idx * 8
@@ -59,7 +59,8 @@ struct KVIOTraits {
 };
 
 // Bulk gather token nope data (and inline scales where present) from global to smem.
-// Inline family: flat addressing (idx * 656). DSV4: block-structured (footer layout).
+// RoPE-bearing inline family: flat addressing (idx * 656). GLM53_NOPE and
+// DSV4: block-structured addressing through stride_kv_block.
 template <ModelType MT, int PAGE_BLOCK_SIZE, bool USE_L2_HINT = false>
 __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t* indices,
                                                     const uint8_t* __restrict__ kv_ptr,
@@ -79,7 +80,12 @@ __device__ __forceinline__ void io_bulk_gather_tile(uint8_t* dst, const int32_t*
     idx = (idx >= 0) ? idx : 0;
 
     const uint8_t* src;
-    if constexpr (KV::SCALE_IN_KV_SMEM) {
+    if constexpr (MT == ModelType::GLM53_NOPE) {
+      constexpr int pbs = PAGE_BLOCK_SIZE;
+      int block_idx = idx / pbs;
+      int local_idx = idx % pbs;
+      src = kv_ptr + (size_t)block_idx * stride_kv_block + (size_t)local_idx * IO::IO_STRIDE;
+    } else if constexpr (KV::SCALE_IN_KV_SMEM) {
       src = kv_ptr + (size_t)idx * IO::IO_STRIDE;
     } else {
       constexpr int pbs = PAGE_BLOCK_SIZE;

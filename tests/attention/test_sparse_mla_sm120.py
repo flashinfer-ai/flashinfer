@@ -987,6 +987,7 @@ def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None
 
 @pytest.mark.parametrize("num_heads", [32, 64])
 def test_sparse_mla_sm120_decode_glm53_nope(num_heads: int) -> None:
+    """GLM-5.3 NoPE decode matches the BF16 reference for TP2 and TP1."""
     torch.manual_seed(3)
     device = torch.device("cuda")
     d_qk = d_v = 512
@@ -1041,6 +1042,7 @@ def test_sparse_mla_sm120_decode_glm53_nope(num_heads: int) -> None:
 
 @pytest.mark.parametrize("num_heads", [32, 64])
 def test_sparse_mla_sm120_prefill_glm53_nope(num_heads: int) -> None:
+    """GLM-5.3 NoPE prefill matches the BF16 reference for TP2 and TP1."""
     torch.manual_seed(4)
     device = torch.device("cuda")
     d_qk = d_v = 512
@@ -1088,6 +1090,67 @@ def test_sparse_mla_sm120_prefill_glm53_nope(num_heads: int) -> None:
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_glm53_nope_public_api_padded_page_stride() -> None:
+    """Public GLM prefill uses seq_lens and honors a padded KV page stride."""
+    torch.manual_seed(13)
+    device = torch.device("cuda")
+    d_qk = d_v = 512
+    num_tokens, num_heads, topk = 65, 32, 2176
+    num_blocks, page_block_size = 64, 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_glm53_nope(kv_bf16)
+    page_stride = page_block_size * kv_packed.size(-1) + 128
+    kv_padded = torch.empty_strided(
+        kv_packed.shape,
+        (page_stride, kv_packed.size(-1), kv_packed.size(-1), 1),
+        dtype=torch.uint8,
+        device=device,
+    )
+    kv_padded.copy_(kv_packed)
+    kv_dequant = dequantize_kv_dsv3_2(kv_packed)[..., :d_qk]
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    active_topk = 128
+    ref_indices = indices.clone()
+    ref_indices[:, active_topk:] = -1
+    sm_scale = d_qk**-0.5
+    ref_out, _ = _ref_sparse_attn(q, kv_dequant, ref_indices, sm_scale, d_v)
+
+    out = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla(
+        query=q.unsqueeze(1),
+        kv_cache=kv_padded,
+        workspace_buffer=torch.empty(8 << 20, dtype=torch.uint8, device=device),
+        qk_nope_head_dim=512,
+        kv_lora_rank=512,
+        qk_rope_head_dim=0,
+        block_tables=indices.unsqueeze(1),
+        seq_lens=torch.full(
+            (num_tokens,), active_topk, dtype=torch.int32, device=device
+        ),
+        max_seq_len=topk,
+        sparse_mla_top_k=topk,
+        bmm1_scale=sm_scale,
+        bmm2_scale=1.0,
+        backend="sparse",
+        kv_scale_format="arbitrary_fp32",
+    )
+
+    torch.testing.assert_close(out.squeeze(1), ref_out, atol=5e-2, rtol=5e-2)
 
 
 def test_sparse_mla_sm120_glm53_nope_reserved_padding_is_ignored() -> None:

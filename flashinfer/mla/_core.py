@@ -525,6 +525,7 @@ def _trtllm_batch_decode_sparse_mla_v32_sm120(
     return_lse: bool,
     kv_scale_format: str,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Run the packed SM120/SM121 v32 or GLM sparse-MLA backend."""
     del qk_nope_head_dim
     if sparse_mla_top_k <= 0:
         raise ValueError("SM120 sparse MLA v32/GLM requires sparse_mla_top_k > 0")
@@ -2947,8 +2948,9 @@ def trtllm_batch_decode_with_kv_cache_mla(
     kv_lora_rank : int
         Latent KV rank. TRTLLM-GEN and SM120/SM121 sparse v32/GLM use ``512``.
     qk_rope_head_dim : int
-        RoPE head dimension. Sparse MLA paths use ``64``; the native
-        no-RoPE TRTLLM-GEN path (``kv_lora_rank=512``) uses ``0``.
+        RoPE head dimension. RoPE-bearing v32/GLM-NSA sparse MLA uses ``64``;
+        GLM-5.3 sparse MLA and the native no-RoPE TRTLLM-GEN path
+        (``kv_lora_rank=512``) use ``0``.
     block_tables : torch.Tensor
         Page table for dense MLA backends when ``sparse_mla_top_k == 0``. For
         SM100/SM103 TRTLLM-GEN sparse MLA it is the usual paged block table.
@@ -3175,29 +3177,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
     )
     if is_nope_mla and sparse_mla_top_k <= 0:
         raise ValueError(
-            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k > 0"
+            "Native qk_rope_head_dim=0 sparse MLA requires sparse_mla_top_k > 0"
         )
-    if is_nope_mla and sparse_mla_top_k_lens is None:
-        raise ValueError(
-            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k_lens"
-        )
-    if sparse_mla_top_k_lens is not None:
-        if not is_nope_mla:
-            raise ValueError(
-                "sparse_mla_top_k_lens is currently only supported by the "
-                "native qk_rope_head_dim=0 TRTLLM-GEN MLA path"
-            )
-        expected_num_query_tokens = (
-            query.size(0) * query.size(1) if query.ndim == 4 else query.size(0)
-        )
-        check_shape_dtype_device(
-            sparse_mla_top_k_lens,
-            (expected_num_query_tokens,),
-            torch.int32,
-            query.device,
-            "sparse_mla_top_k_lens",
-        )
-        sparse_mla_top_k_lens = sparse_mla_top_k_lens.contiguous()
 
     backend = _validate_mla_dcp_args(
         query=query,
@@ -3222,6 +3203,29 @@ def trtllm_batch_decode_with_kv_cache_mla(
             backend = "sparse"
         elif cc[0] != 10:
             backend = "xqa"
+
+    uses_trtllm_gen = backend in ("auto", "trtllm-gen")
+    if is_nope_mla and uses_trtllm_gen and sparse_mla_top_k_lens is None:
+        raise ValueError(
+            "Native qk_rope_head_dim=0 TRTLLM-GEN MLA requires sparse_mla_top_k_lens"
+        )
+    if sparse_mla_top_k_lens is not None:
+        if not is_nope_mla or not uses_trtllm_gen:
+            raise ValueError(
+                "sparse_mla_top_k_lens is currently only supported by the "
+                "native qk_rope_head_dim=0 TRTLLM-GEN MLA path"
+            )
+        expected_num_query_tokens = (
+            query.size(0) * query.size(1) if query.ndim == 4 else query.size(0)
+        )
+        check_shape_dtype_device(
+            sparse_mla_top_k_lens,
+            (expected_num_query_tokens,),
+            torch.int32,
+            query.device,
+            "sparse_mla_top_k_lens",
+        )
+        sparse_mla_top_k_lens = sparse_mla_top_k_lens.contiguous()
 
     if backend == "xqa":
         if multi_ctas_kv_counter_buffer is not None:

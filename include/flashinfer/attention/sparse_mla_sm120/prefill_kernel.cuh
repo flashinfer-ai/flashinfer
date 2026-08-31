@@ -210,7 +210,10 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
       } else {
         int idx = ib[qk_nb + gid];
         idx = (idx >= 0) ? idx : 0;
-        entry_base[gid] = KV_cache + (size_t)idx * IO::IO_STRIDE;
+        int bi_e = idx / page_block_size;
+        int li_e = idx % page_block_size;
+        entry_base[gid] =
+            KV_cache + (size_t)bi_e * stride_kv_block + (size_t)li_e * IO::IO_STRIDE;
       }
 
       for (int i = threadIdx.x; i < CT::N_V_CHUNKS * HPB; i += MATH_THREADS)
@@ -642,7 +645,7 @@ __device__ __forceinline__ const uint8_t* prefill_kv_entry_base(
   using KV = KVCacheTraits<MT>;
   using IO = KVIOTraits<MT>;
   idx = (idx >= 0) ? idx : 0;
-  if constexpr (KV::V_HAS_ROPE) {
+  if constexpr (KV::V_HAS_ROPE || MT == ModelType::GLM53_NOPE) {
     const int bi = idx / PAGE_BLOCK_SIZE;
     const int li = idx % PAGE_BLOCK_SIZE;
     return kv_global + (size_t)bi * stride_kv_block + (size_t)li * IO::IO_STRIDE;

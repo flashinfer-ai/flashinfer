@@ -220,6 +220,9 @@ inline bool dispatch_v32(int num_heads, int topk, const bf16* Q, const uint8_t* 
                 (MT == ModelType::GLM53_NOPE && KVCacheTraits<MT>::D_QK == 512));
   constexpr int TOPK = MT == ModelType::GLM53_NOPE ? 2176 : 2048;
   if (topk != TOPK) return false;
+  if constexpr (MT == ModelType::GLM53_NOPE) {
+    if (num_heads != 32 && num_heads != 64) return false;
+  }
 
   // PBS=64 matches the V32 decode (`decode_dsv3_2_kernel.cuh`). NH=8 covers
   // small-TP shards; the SG kernel zero-pads invalid head slots up to HPB=16
@@ -417,6 +420,7 @@ bool sparse_mla_prefill_dispatch(ModelType mt, int num_heads, int topk, int page
                                  size_t stride_kv_block, size_t stride_kv_block_extra,
                                  const float* attn_sink, const int* topk_length,
                                  const int* extra_topk_length, cudaStream_t stream) {
+  if (page_block_size != 64) return false;
   if (extra_KV_cache != nullptr) {
     if (mt != ModelType::DSV4) return false;
     return dispatch_dsv4_dual(num_heads, topk, topk_extra, extra_page_block_size, Q, KV_cache,
