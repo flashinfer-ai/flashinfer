@@ -551,6 +551,8 @@ def cute_dsl_mla_decode(
     enable_dcp : bool
         Enable static cyclic decode context-parallel masking. DCP returns a
         rank-local attention state and therefore requires ``return_lse=True``.
+        Compact variable-Q input is supported when ``cum_seq_lens_q`` and
+        ``max_q_len`` are provided.
     cp_world : int
         Compile-time context-parallel world size. The local cache owns global
         token positions ``cp_world * local_k + cp_rank``.
@@ -604,8 +606,6 @@ def cute_dsl_mla_decode(
         raise TypeError(f"cp_rank must be an integer, got {type(cp_rank).__name__}")
 
     if enable_dcp:
-        if is_var_q:
-            raise ValueError("DCP does not support cum_seq_lens_q / max_q_len")
         if not 0 <= cp_rank < cp_world:
             raise ValueError(
                 f"cp_rank must satisfy 0 <= cp_rank < cp_world, got "
