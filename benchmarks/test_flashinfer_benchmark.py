@@ -601,15 +601,20 @@ def test_mla_benchmark_passes_rank_one_kv_len_arr(monkeypatch):
     """Keep MLA's CSR metadata separate from generic attention length shapes."""
 
     class RecordingMLAWrapper:
+        """Record MLA wrapper metadata and calls without invoking GPU kernels."""
+
         def __init__(self, **kwargs):
+            """Store constructor metadata for later assertions."""
             self.constructor_kwargs = kwargs
             self.plan_kwargs = None
             self.run_kwargs = None
 
         def plan(self, **kwargs):
+            """Record the planned metadata."""
             self.plan_kwargs = kwargs
 
         def run(self, q_nope, *_args, **kwargs):
+            """Record runtime metadata and return a shape-compatible output."""
             self.run_kwargs = kwargs
             return torch.zeros_like(q_nope)
 
@@ -627,15 +632,18 @@ def test_mla_benchmark_passes_rank_one_kv_len_arr(monkeypatch):
     monkeypatch.setattr(attention_routine, "print_perf_metrics", lambda *_args: None)
 
     def small_workspace_empty(*args, **kwargs):
+        """Avoid allocating the benchmark's production-sized workspace."""
         if args == (512 * 1024 * 1024,):
             return real_torch_empty(1, **kwargs)
         return real_torch_empty(*args, **kwargs)
 
     def fake_bench_gpu_time(*, fn, input_args, **_kwargs):
+        """Run the callback once and return a deterministic timing sample."""
         fn(*input_args)
         return np.array([1.0])
 
     def constructor(**kwargs):
+        """Build and retain a recording wrapper for the mocked MLA API."""
         wrapper = RecordingMLAWrapper(**kwargs)
         wrappers.append(wrapper)
         return wrapper
