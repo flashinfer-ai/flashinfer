@@ -46,6 +46,40 @@ def enumerate_m_grouped_masked():
             )
 
 
+def select_correctness_cases():
+    """Pick a small but representative subset of the full GB200 shape sweep.
+
+    ``enumerate_m_grouped_masked`` yields ~106 realistic shapes; running every
+    one (x4 trans_a/trans_b combos) is too slow for a correctness gate, so the
+    test deliberately uses a smaller set. The old ``[:2]`` prefix, however, kept
+    the same ``(num_groups=6, m_per_group=512)`` config twice (only the two n/k
+    pairs differed) and exercised none of the group-count / M-per-group variety
+    the sweep was written to cover. Instead, for every distinct ``num_groups``
+    take the cases at its smallest and largest ``expected_m_per_group`` (both
+    n/k pairs) — so each group count and its per-group-M extremes are covered,
+    deterministically and at bounded cost.
+    """
+    all_cases = list(enumerate_m_grouped_masked())
+    by_groups = {}
+    for c in all_cases:
+        by_groups.setdefault(c["num_groups"], []).append(c)
+
+    selected = []
+    seen = set()
+    for num_groups in sorted(by_groups):
+        group = by_groups[num_groups]
+        m_values = [c["expected_m_per_group"] for c in group]
+        m_lo, m_hi = min(m_values), max(m_values)
+        for c in group:
+            if c["expected_m_per_group"] not in (m_lo, m_hi):
+                continue
+            key = (c["num_groups"], c["expected_m_per_group"], c["n"], c["k"])
+            if key not in seen:
+                seen.add(key)
+                selected.append(c)
+    return selected
+
+
 def create_masked_m(num_groups, expected_m_per_group, max_m):
     """Draw random per-group row counts bounded by `max_m`."""
     masked_m = torch.empty((num_groups,), dtype=torch.int32, device="cuda")
@@ -117,9 +151,7 @@ class Test_FlashInfer_MaskedBMM:
                 case["n"],
                 case["k"],
             )
-            for case in list(enumerate_m_grouped_masked())[
-                :2
-            ]  # Use smaller set for correctness
+            for case in select_correctness_cases()
         ],
     )
     @pytest.mark.parametrize("dtype", [torch.float16])
