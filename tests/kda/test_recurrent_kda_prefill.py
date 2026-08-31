@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import json
 import math
 import threading
 from types import SimpleNamespace
@@ -31,6 +32,7 @@ kda_decode_api = importlib.import_module("flashinfer.kda_decode")
 kda_api = importlib.import_module("flashinfer.kda")
 kda_prefill_api = importlib.import_module("flashinfer.kda_prefill")
 kda_prefill_cute_api = importlib.import_module("flashinfer.kda_prefill_cute")
+cake_kda_jit_api = importlib.import_module("flashinfer.jit.cake_kda")
 
 
 def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
@@ -40,6 +42,165 @@ def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
         is kda_prefill_api.RecurrentKDAPrefillWorkspace
     )
     assert flashinfer.RecurrentKDAPrefillWrapper is RecurrentKDAPrefillWrapper
+
+
+def test_cake_kda_prefill_jit_surface_includes_checkpoint_aligned_bt64():
+    assert cake_kda_jit_api.CAKE_KDA_VARIANTS == (
+        "m128_unbounded_softplus",
+        "m128_bt64_unbounded_softplus",
+    )
+    for target in ("sm100a", "sm103a"):
+        n32_uri = cake_kda_jit_api.get_cake_kda_uri("m128_unbounded_softplus", target)
+        bt64_uri = cake_kda_jit_api.get_cake_kda_uri(
+            "m128_bt64_unbounded_softplus", target
+        )
+        assert n32_uri != bt64_uri
+        assert bt64_uri.endswith(f"_8f5147c17f_{target}")
+    csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
+    assert (csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus.cu").is_file()
+    assert (
+        csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus_binding.cu"
+    ).is_file()
+
+
+def test_cake_kda_affine_manifest_controls_export_availability():
+    csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
+    manifest = json.loads(
+        (
+            csrc_dir / "cake_kda_bf16_affine_unbounded_softplus_import_manifest.json"
+        ).read_text()
+    )
+    cake_kda_jit_api.get_cake_kda_affine_module_specs.cache_clear()
+    specs = cake_kda_jit_api.get_cake_kda_affine_module_specs()
+    if manifest["status"] == "pending_generated_sources":
+        assert manifest["modules"] == []
+        assert manifest["remaining_generated_inputs"]
+        assert specs == ()
+        assert not cake_kda_jit_api.cake_kda_affine_is_available()
+    else:
+        assert manifest["status"] == "complete"
+        assert len(specs) == 8
+        assert cake_kda_jit_api.cake_kda_affine_is_available()
+        assert {spec.target for spec in specs} == {"sm100a", "sm103a"}
+        assert {spec.role for spec in specs} == {
+            "main",
+            "map",
+            "scan",
+            "correction",
+        }
+
+
+def _valid_cake_kda_affine_selector_kwargs():
+    return {
+        "export_available": True,
+        "compute_capability": (10, 0),
+        "sm_count": 148,
+        "fixed_layout": True,
+        "batch_size": 1,
+        "total_tokens": 8192,
+        "num_heads": 32,
+        "head_dim": 128,
+        "qkv_shapes_equal": True,
+        "qkv_dtype": torch.bfloat16,
+        "beta_contiguous": True,
+        "beta_dtype": torch.bfloat16,
+        "indexed_state": True,
+        "initial_state_dtype": torch.bfloat16,
+        "has_checkpoints": False,
+        "lower_bound": None,
+    }
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "expected_affine"),
+    ((4, True), (8, True), (16, True), (32, False)),
+)
+@pytest.mark.parametrize(
+    ("compute_capability", "expected_target"),
+    (((10, 0), "sm100a"), ((10, 3), "sm103a")),
+)
+def test_cake_kda_affine_selector_builds_exact_blackwell_partition(
+    num_heads, expected_affine, compute_capability, expected_target
+):
+    kwargs = _valid_cake_kda_affine_selector_kwargs()
+    kwargs["num_heads"] = num_heads
+    kwargs["compute_capability"] = compute_capability
+    plan = kda_prefill_api._select_cake_kda_affine_plan(**kwargs)
+    if not expected_affine:
+        assert plan is None
+        return
+    assert plan is not None
+    assert plan.target == expected_target
+    assert plan.num_parts >= 2
+    assert plan.token_offsets[0] == 0
+    assert plan.token_offsets[-1] == kwargs["total_tokens"]
+    assert all(offset % 32 == 0 for offset in plan.token_offsets)
+    assert all(
+        left < right
+        for left, right in zip(
+            plan.token_offsets[:-1], plan.token_offsets[1:], strict=True
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("override", "value"),
+    (
+        ("export_available", False),
+        ("compute_capability", (9, 0)),
+        ("sm_count", 1),
+        ("fixed_layout", False),
+        ("batch_size", 2),
+        ("total_tokens", 8160),
+        ("total_tokens", 8193),
+        ("num_heads", 33),
+        ("head_dim", 64),
+        ("qkv_shapes_equal", False),
+        ("qkv_dtype", torch.float16),
+        ("beta_contiguous", False),
+        ("beta_dtype", torch.float32),
+        ("indexed_state", False),
+        ("initial_state_dtype", torch.float32),
+        ("has_checkpoints", True),
+        ("lower_bound", -1.0),
+    ),
+)
+def test_cake_kda_affine_selector_rejects_out_of_contract_calls(override, value):
+    kwargs = _valid_cake_kda_affine_selector_kwargs()
+    kwargs[override] = value
+    assert kda_prefill_api._select_cake_kda_affine_plan(**kwargs) is None
+
+
+def test_cake_kda_affine_workspace_buffer_is_grow_only(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    workspace = SimpleNamespace(_cake_kda_affine_buffers={})
+    first = kda_prefill_api._cake_kda_affine_workspace_buffer(
+        workspace=workspace,
+        name="carry",
+        device=torch.device("cpu"),
+        shape=(4, 8),
+        dtype=torch.float32,
+        zero_on_allocate=True,
+    )
+    assert torch.count_nonzero(first) == 0
+    smaller = kda_prefill_api._cake_kda_affine_workspace_buffer(
+        workspace=workspace,
+        name="carry",
+        device=torch.device("cpu"),
+        shape=(2, 8),
+        dtype=torch.float32,
+    )
+    assert smaller.data_ptr() == first.data_ptr()
+    assert workspace._cake_kda_affine_buffers["carry"].numel() == 32
+
+    with pytest.raises(ValueError, match="dimensions must be positive"):
+        kda_prefill_api._cake_kda_affine_workspace_buffer(
+            workspace=workspace,
+            name="carry",
+            device=torch.device("cpu"),
+            shape=(0, 8),
+            dtype=torch.float32,
+        )
 
 
 def test_prefill_wrapper_plan_builds_stable_device_metadata(cuda_device):
@@ -522,12 +683,12 @@ def test_cute_dsl_engine_workspace_query_does_not_read_device_offsets(monkeypatc
     assert kernel_module.workspace_size(cu_seqlens, heads=64) == 0
 
 
-def _strict_prefill_kwargs(inputs):
+def _strict_prefill_kwargs(inputs, *, lower_bound=-5.0):
     return {
         **inputs,
         "use_qk_l2norm_in_kernel": True,
         "use_gate_in_kernel": True,
-        "lower_bound": -5.0,
+        "lower_bound": lower_bound,
         "beta_is_logit": True,
     }
 
@@ -636,7 +797,7 @@ def test_public_prefill_auto_falls_back_for_non_tensor_arguments(
     assert recurrent_kda(**kwargs) is sentinel
 
 
-def _reference(inputs, *, lower_bound=-5.0, scale=None):
+def _reference(inputs, *, lower_bound=-5.0, scale=None, checkpoint_every_n_tokens=0):
     q = inputs["q"]
     batch_size, seq_len, num_heads, head_dim = q.shape
     scale = head_dim**-0.5 if scale is None else scale
@@ -645,10 +806,15 @@ def _reference(inputs, *, lower_bound=-5.0, scale=None):
     v_flat = inputs["v"].float().reshape(-1, num_heads, head_dim)
     g_flat = inputs["g"].float().reshape(-1, num_heads, head_dim)
     beta_flat = torch.sigmoid(inputs["beta"].float().reshape(-1, num_heads))
-    gate = lower_bound * torch.sigmoid(
-        torch.exp(inputs["A_log"]).reshape(1, num_heads, 1)
-        * (g_flat + inputs["dt_bias"].reshape(1, num_heads, head_dim))
-    )
+    gate_input = g_flat + inputs["dt_bias"].reshape(1, num_heads, head_dim)
+    if lower_bound is None:
+        gate = -torch.exp(inputs["A_log"]).reshape(1, num_heads, 1) * F.softplus(
+            gate_input
+        )
+    else:
+        gate = lower_bound * torch.sigmoid(
+            torch.exp(inputs["A_log"]).reshape(1, num_heads, 1) * gate_input
+        )
     decay = torch.exp(gate)
     if inputs["cu_seqlens"] is None:
         offsets = [index * seq_len for index in range(batch_size + 1)]
@@ -663,8 +829,14 @@ def _reference(inputs, *, lower_bound=-5.0, scale=None):
     else:
         state = inputs["initial_state"].clone()
     out = torch.empty_like(q_flat)
+    checkpoints = []
     for sequence in range(len(offsets) - 1):
-        for token in range(offsets[sequence], offsets[sequence + 1]):
+        if checkpoint_every_n_tokens:
+            checkpoints.append(state[sequence].clone())
+        sequence_length = offsets[sequence + 1] - offsets[sequence]
+        for local_token, token in enumerate(
+            range(offsets[sequence], offsets[sequence + 1]), start=1
+        ):
             state_f32 = state[sequence].float()
             decayed = state_f32 * decay[token].unsqueeze(1)
             predicted = torch.einsum("hk,hvk->hv", k_flat[token], decayed)
@@ -675,7 +847,16 @@ def _reference(inputs, *, lower_bound=-5.0, scale=None):
                 "hk,hvk->hv", q_flat[token], state[sequence].float()
             )
             out[token] = (scale * projected).to(torch.bfloat16)
-    return out.reshape_as(q), state
+            if (
+                checkpoint_every_n_tokens
+                and local_token % checkpoint_every_n_tokens == 0
+                and local_token < sequence_length
+            ):
+                checkpoints.append(state[sequence].clone())
+    result = (out.reshape_as(q), state)
+    if checkpoint_every_n_tokens:
+        return (*result, torch.stack(checkpoints))
+    return result
 
 
 def _h12_bf16_residual_carriers(torch, *, value, prediction, beta_logit):
@@ -996,6 +1177,25 @@ def test_n32_tensor_state_decay_policy_matches_measured_region(
 def test_variant_selector_exposes_specialized_routes_only_when_requested():
     assert (
         kda_prefill_api._select_flash_kda_prefill_variant(
+            fixed_layout=False,
+            num_sequences=2,
+            num_heads=4,
+            unbounded_softplus=True,
+        )
+        == "m128_unbounded_softplus"
+    )
+    assert (
+        kda_prefill_api._select_flash_kda_prefill_variant(
+            fixed_layout=False,
+            num_sequences=2,
+            num_heads=4,
+            unbounded_softplus=True,
+            use_bt64_unbounded_softplus=True,
+        )
+        == "m128_bt64_unbounded_softplus"
+    )
+    assert (
+        kda_prefill_api._select_flash_kda_prefill_variant(
             fixed_layout=True,
             num_sequences=1,
             num_heads=8,
@@ -1114,6 +1314,117 @@ def test_bt16_route_policy_matches_measured_crossovers(
         )
         == expected_route
     )
+
+
+def test_uniform_piece_bins_cover_tasks_and_match_h96_h64_bounds():
+    for num_heads, expected_handoffs, expected_max in (
+        (96, 32, 167),
+        (64, 56, 112),
+    ):
+        (
+            tasks,
+            offsets,
+            token_starts,
+            token_counts,
+            sources,
+            destinations,
+            handoff_count,
+            loads,
+        ) = kda_prefill_api._make_uniform_piece_task_bins(
+            num_sequences=8,
+            num_heads=num_heads,
+            sequence_length=1024,
+            worker_count=152,
+        )
+        assert len(offsets) == 153
+        assert len(tasks) == len(token_starts) == len(token_counts)
+        assert len(tasks) == len(sources) == len(destinations)
+        assert handoff_count == expected_handoffs
+        assert max(loads) == expected_max
+        assert sum(loads) == 8 * num_heads * 32
+
+        produced = sorted(value for value in destinations if value >= 0)
+        consumed = sorted(value for value in sources if value >= 0)
+        assert produced == consumed == list(range(handoff_count))
+        coverage = {}
+        for task, start, count in zip(tasks, token_starts, token_counts, strict=True):
+            coverage.setdefault(task, []).append((start, start + count))
+        assert set(coverage) == set(range(8 * num_heads))
+        for intervals in coverage.values():
+            ordered = sorted(intervals)
+            assert ordered[0][0] == 0
+            assert ordered[-1][1] == 1024
+            assert all(
+                left[1] == right[0]
+                for left, right in zip(ordered, ordered[1:], strict=False)
+            )
+
+
+def test_uniform_piece_policy_uses_occupancy_and_dependency_dag():
+    common = {
+        "compute_capability": (10, 3),
+        "sm_count": 152,
+        "num_sequences": 8,
+        "uniform_sequences": True,
+        "max_sequence_length": 1024,
+    }
+    for num_heads in (60, 64, 96, 104):
+        estimate = kda_prefill_api._persistent_m128_roofline(
+            compute_capability=common["compute_capability"],
+            sm_count=common["sm_count"],
+            num_sequences=common["num_sequences"],
+            num_heads=num_heads,
+            sequence_length=common["max_sequence_length"],
+            use_initial_state=True,
+            store_final_state=True,
+        )
+        assert estimate is not None
+        assert estimate.resident_ctas_per_sm == 1
+        assert estimate.worker_count == common["sm_count"]
+        assert estimate.handoff_count > 0
+        assert estimate.piece_ns < estimate.direct_ns
+        assert kda_prefill_api._should_use_uniform_piece_persistent(
+            num_heads=num_heads,
+            **common,
+        )
+        assert (
+            kda_prefill_api._select_flash_kda_bf16_route(
+                fixed_layout=False,
+                num_heads=num_heads,
+                **common,
+            )
+            == "piece_persistent_m128"
+        )
+
+    assert kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96,
+        **(common | {"compute_capability": (10, 0), "sm_count": 148}),
+    )
+    assert not kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96, **(common | {"num_sequences": 4})
+    )
+    assert not kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96, **(common | {"sm_count": 149})
+    )
+    assert kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96, **(common | {"max_sequence_length": 992})
+    )
+    assert not kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96, **(common | {"max_sequence_length": 32})
+    )
+    assert not kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=48, **common
+    )
+    assert not kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96, **(common | {"uniform_sequences": False})
+    )
+    assert kda_prefill_api._should_use_uniform_piece_persistent(
+        num_heads=96, **(common | {"num_sequences": 16})
+    )
+    for num_sequences in (32, 64):
+        assert not kda_prefill_api._should_use_uniform_piece_persistent(
+            num_heads=96, **(common | {"num_sequences": num_sequences})
+        )
 
 
 def test_bt16_prepare_walk_and_physical_variants_match_production_policy():
@@ -1904,6 +2215,128 @@ def test_frozen_h12_long_ffi_rejects_disjoint_pair_carrier(
         module.run(*disjoint_args)
 
 
+@pytest.mark.parametrize("num_heads", [4, 8, 16, 32])
+@pytest.mark.parametrize(
+    ("compute_capability", "expected_target"),
+    [((10, 0), "sm100a"), ((10, 3), "sm103a")],
+)
+def test_unbounded_softplus_prefill_routes_to_cake_runtime_head_module(
+    cuda_device, monkeypatch, num_heads, compute_capability, expected_target
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: compute_capability,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_is_cuda_version_at_least", lambda version: True
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    routes = []
+
+    def get_cake_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(
+        kda_prefill_api, "_get_cake_kda_prefill_module", get_cake_module
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        lambda variant, target: pytest.fail(
+            f"unbounded route reached provenanced FlashKDA module {variant}/{target}"
+        ),
+    )
+    inputs = _make_inputs(
+        seq_lens=[33, 65],
+        num_heads=num_heads,
+        packed=True,
+    )
+    output, state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs, lower_bound=None),
+        output=torch.empty_like(inputs["q"]),
+    )
+
+    assert output.shape == inputs["q"].shape
+    assert state is None
+    assert routes == [("m128_unbounded_softplus", expected_target)]
+    (args,) = module.calls
+    assert len(args) == 28
+    assert args[18] == num_heads
+    assert args[26] == 0.0
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "checkpoint_every_n_tokens", "checkpoint_cu_starts", "expected"),
+    [
+        (4, 64, [0, 2, 5], "m128_bt64_unbounded_softplus"),
+        (4, 32, [0, 3, 8], "m128_unbounded_softplus"),
+        (8, 64, [0, 2, 5], "m128_unbounded_softplus"),
+    ],
+)
+def test_unbounded_softplus_bt64_route_is_checkpoint_and_head_specific(
+    cuda_device,
+    monkeypatch,
+    num_heads,
+    checkpoint_every_n_tokens,
+    checkpoint_cu_starts,
+    expected,
+):
+    monkeypatch.setattr(
+        kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_is_cuda_version_at_least", lambda version: True
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    module = _RecorderModule()
+    routes = []
+
+    def get_cake_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(
+        kda_prefill_api, "_get_cake_kda_prefill_module", get_cake_module
+    )
+    inputs = _make_inputs(
+        seq_lens=[65, 131],
+        num_heads=num_heads,
+        packed=True,
+    )
+    checkpoint_cu_starts_tensor = torch.tensor(
+        checkpoint_cu_starts, dtype=torch.int64, device=cuda_device
+    )
+    state_checkpoints = torch.empty(
+        (checkpoint_cu_starts[-1], num_heads, 128, 128),
+        dtype=torch.bfloat16,
+        device=cuda_device,
+    )
+
+    output, state, returned_checkpoints = recurrent_kda(
+        **_strict_prefill_kwargs(inputs, lower_bound=None),
+        output=torch.empty_like(inputs["q"]),
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts_tensor,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+        backend="cake",
+    )
+
+    assert output.shape == inputs["q"].shape
+    assert state is None
+    assert returned_checkpoints is state_checkpoints
+    assert routes == [(expected, "sm100a")]
+    (args,) = module.calls
+    assert len(args) == 28
+    assert args[14].data_ptr() == state_checkpoints.data_ptr()
+    assert args[15].data_ptr() == checkpoint_cu_starts_tensor.data_ptr()
+    assert args[18] == num_heads
+    assert args[24] == checkpoint_every_n_tokens
+    assert args[26] == 0.0
+
+
 @pytest.mark.parametrize("sm_count", [148, 152])
 def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
     cuda_device,
@@ -1959,6 +2392,207 @@ def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
     assert args[15].shape == (768,)
     assert args[16] == 1
     assert args[17] == 96
+
+
+def test_uniform_piece_prefill_reaches_extended_worker_abi(
+    cuda_device,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: (10, 3),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_is_cuda_version_at_least",
+        lambda version: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_device_sm_count",
+        lambda device: 152,
+    )
+    monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_uniform_piece_persistent",
+        lambda **kwargs: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_persistent_m128_roofline",
+        lambda **kwargs: SimpleNamespace(
+            worker_count=152,
+            piece_ns=1.0,
+            direct_ns=2.0,
+        ),
+    )
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(
+        seq_lens=[64] * 8,
+        num_heads=96,
+        packed=True,
+        initial_state=True,
+    )
+    output, state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        backend="cake",
+    )
+
+    assert output.shape == inputs["q"].shape
+    assert state is None
+    assert routes == [("piece_persistent_m128", "sm100f")]
+    (args,) = module.calls
+    assert len(args) == 29
+    assert args[9].tolist() == list(range(8))
+    assert args[10].numel() > 8 * 96
+    assert args[11].numel() == 153
+    assert args[10].numel() == args[12].numel() == args[13].numel()
+    assert args[10].numel() == args[14].numel() == args[15].numel()
+    assert args[16].shape[1:] == (128, 128)
+    assert args[17].dtype == torch.uint32
+    assert args[16].shape[0] == args[17].numel()
+    assert args[21].dtype == torch.uint8
+    assert args[21].shape == (768,)
+    assert args[22] == 1
+    assert args[23] == 96
+
+
+def test_explicit_workspace_keeps_uniform_piece_candidate_on_direct_abi(
+    cuda_device,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "get_compute_capability",
+        lambda device: (10, 3),
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_is_cuda_version_at_least",
+        lambda version: True,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_flash_kda_device_sm_count",
+        lambda device: 152,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_uniform_piece_persistent",
+        lambda **kwargs: True,
+    )
+    module = _RecorderModule()
+    routes = []
+
+    def get_module(variant, target):
+        routes.append((variant, target))
+        return module
+
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", get_module)
+    inputs = _make_inputs(
+        seq_lens=[64] * 8,
+        num_heads=96,
+        packed=True,
+        initial_state=True,
+    )
+    workspace = RecurrentKDAPrefillWorkspace(cuda_device)
+    recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        prefill_workspace=workspace,
+        backend="cake",
+    )
+
+    assert routes == [("m128", "sm100f")]
+    assert len(module.calls[0]) == 28
+
+
+@pytest.mark.parametrize("num_heads", [40, 64, 96])
+def test_frozen_uniform_piece_prefill_repeats_and_matches_direct_control(
+    flash_kda_device,
+    monkeypatch,
+    num_heads,
+):
+    inputs = _make_inputs(
+        seq_lens=[1024] * 8,
+        num_heads=num_heads,
+        packed=True,
+        initial_state=True,
+        seed=102400 + num_heads,
+    )
+    initial_state_seed = inputs["initial_state"].clone()
+    routes = []
+    get_module = kda_prefill_api._get_flash_kda_prefill_module
+
+    def recording_get_module(variant, target):
+        routes.append((variant, target))
+        return get_module(variant, target)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_prefill_module",
+        recording_get_module,
+    )
+
+    piece_results = []
+    for _ in range(2):
+        inputs["initial_state"].copy_(initial_state_seed)
+        piece_output, piece_state = recurrent_kda(
+            **_strict_prefill_kwargs(inputs),
+            output=torch.empty_like(inputs["q"]),
+            output_final_state=True,
+            backend="cake",
+        )
+        piece_results.append((piece_output.clone(), piece_state.clone()))
+
+    stream_workspace = kda_prefill_api._get_stream_workspace(flash_kda_device)
+    assert stream_workspace._piece_mid_state_ready is not None
+    assert not torch.count_nonzero(stream_workspace._piece_mid_state_ready).item()
+
+    inputs["initial_state"].copy_(initial_state_seed)
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_should_use_uniform_piece_persistent",
+        lambda **kwargs: False,
+    )
+    direct_output, direct_state = recurrent_kda(
+        **_strict_prefill_kwargs(inputs),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        seq_order=torch.arange(8, dtype=torch.int32, device=flash_kda_device),
+        backend="cake",
+    )
+
+    expected_target = kda_prefill_api._select_flash_kda_prefill_target(flash_kda_device)
+    direct_variant = (
+        "m128_tensor_state_decay"
+        if get_compute_capability(flash_kda_device) == (10, 3) and num_heads >= 64
+        else "m128"
+    )
+    assert routes == [
+        ("piece_persistent_m128", expected_target),
+        ("piece_persistent_m128", expected_target),
+        (direct_variant, expected_target),
+    ]
+    for piece_output, piece_state in piece_results:
+        torch.testing.assert_close(
+            piece_output.float(), direct_output.float(), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            piece_state.float(), direct_state.float(), atol=1e-2, rtol=1e-2
+        )
+    assert torch.equal(piece_results[0][0], piece_results[1][0])
+    assert torch.equal(piece_results[0][1], piece_results[1][1])
 
 
 def test_explicit_seq_order_keeps_direct_worker_and_reaches_ffi(
@@ -3435,6 +4069,53 @@ def test_cute_dsl_checkpoints_match_cake(
         )
 
 
+def test_prefill_without_cute_dsl_experimental_falls_back_to_cake(
+    flash_kda_device, monkeypatch
+):
+    if not kda_prefill_cute_api._is_cute_dsl_kda_runtime_available():
+        pytest.skip("reference output requires nvidia-cutlass-dsl>=4.7.0")
+    run_kwargs = _strict_prefill_kwargs(
+        _make_inputs(seq_lens=(33,), num_heads=12, packed=False, seed=4711)
+    )
+    expected = recurrent_kda(**run_kwargs, backend="cute-dsl")
+
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_runtime_available",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_run_cute_dsl_kda_prefill",
+        lambda **kwargs: pytest.fail("auto must not reach the CuTe DSL kernel"),
+    )
+
+    fallback = recurrent_kda(**run_kwargs)
+    torch.testing.assert_close(
+        fallback[0].float(), expected[0].float(), atol=1e-2, rtol=1e-2
+    )
+    with pytest.raises(ImportError, match=r"nvidia-cutlass-dsl>=4\.7\.0"):
+        recurrent_kda(**run_kwargs, backend="cute-dsl")
+
+
+def test_dsl_version_guard_is_scoped_to_the_sm100_family(cuda_device, monkeypatch):
+    monkeypatch.setattr(
+        kda_prefill_cute_api,
+        "_is_cute_dsl_kda_runtime_available",
+        lambda: False,
+    )
+    q = torch.empty(1, 1, 1, 1, device=cuda_device)
+    for capability, blocked in (((10, 0), True), ((10, 3), True), ((12, 0), False)):
+        monkeypatch.setattr(
+            kda_prefill_cute_api,
+            "get_compute_capability",
+            lambda _device, capability=capability: capability,
+        )
+        assert (
+            kda_prefill_cute_api._is_cute_dsl_kda_prefill_dsl_too_old(q) is blocked
+        ), capability
+
+
 @pytest.mark.parametrize(
     ("seq_lens", "num_heads", "packed"),
     [((17,), 96, False), ((17, 33), 12, True)],
@@ -3493,6 +4174,144 @@ def test_cute_dsl_padded_indexed_state_matches_cake(
         torch.testing.assert_close(
             cute_value.float(), cake_value.float(), atol=1e-2, rtol=1e-2
         )
+
+
+@pytest.mark.parametrize(
+    ("num_heads", "checkpoint_every_n_tokens"),
+    [
+        (1, 64),
+        (2, 64),
+        (4, 32),
+        (4, 64),
+        (8, 64),
+        (16, 64),
+        (32, 64),
+    ],
+)
+def test_frozen_unbounded_softplus_tp_shapes_strided_beta_state_and_checkpoints(
+    flash_kda_device, num_heads, checkpoint_every_n_tokens
+):
+    inputs = _make_inputs(
+        seq_lens=[65, 131],
+        num_heads=num_heads,
+        packed=True,
+        initial_state=True,
+        seed=2088 + num_heads,
+    )
+    compact_initial_state = inputs["initial_state"].clone()
+    beta_carrier = torch.empty(
+        (inputs["q"].shape[1], num_heads + 16),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+    )
+    beta_carrier[:, 8 : 8 + num_heads].copy_(inputs["beta"][0])
+    inputs["beta"] = beta_carrier[None, :, 8 : 8 + num_heads]
+    expected_output, expected_state, expected_checkpoints = _reference(
+        {**inputs, "initial_state": compact_initial_state},
+        lower_bound=None,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+    )
+
+    state_slot_numel = num_heads * 128 * 128
+    state_storage = torch.zeros(
+        (5, state_slot_numel + 64),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+    )
+    state_pool = state_storage.as_strided(
+        (5, num_heads, 128, 128),
+        (state_storage.stride(0), 128 * 128, 128, 1),
+    )
+    state_indices = torch.tensor([1, 3], dtype=torch.int32, device=flash_kda_device)
+    state_indices_i64 = state_indices.to(torch.int64)
+    state_pool[state_indices_i64] = compact_initial_state
+    untouched_before = state_pool[[0, 2, 4]].clone()
+    inputs["initial_state"] = state_pool
+    checkpoint_counts = [
+        (seq_len + checkpoint_every_n_tokens - 1) // checkpoint_every_n_tokens
+        for seq_len in (65, 131)
+    ]
+    checkpoint_cu_starts = torch.tensor(
+        [0, checkpoint_counts[0], sum(checkpoint_counts)],
+        dtype=torch.int64,
+        device=flash_kda_device,
+    )
+    state_checkpoints = torch.empty(
+        (sum(checkpoint_counts), num_heads, 128, 128),
+        dtype=torch.bfloat16,
+        device=flash_kda_device,
+    )
+
+    actual_output, actual_state, actual_checkpoints = recurrent_kda(
+        **_strict_prefill_kwargs(inputs, lower_bound=None),
+        output=torch.empty_like(inputs["q"]),
+        output_final_state=True,
+        ssm_state_indices=state_indices,
+        state_checkpoints=state_checkpoints,
+        checkpoint_cu_starts=checkpoint_cu_starts,
+        checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+    )
+
+    assert actual_state is state_pool
+    assert actual_checkpoints is state_checkpoints
+    assert inputs["beta"].data_ptr() == beta_carrier[:, 8 : 8 + num_heads].data_ptr()
+    torch.testing.assert_close(
+        actual_output.float(), expected_output.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        state_pool[state_indices_i64].float(),
+        expected_state.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(
+        actual_checkpoints.float(),
+        expected_checkpoints.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    torch.testing.assert_close(state_pool[[0, 2, 4]], untouched_before)
+
+
+def test_frozen_unbounded_softplus_h32_prefix_resume_matches_uninterrupted(
+    flash_kda_device,
+):
+    """A BF16 radix checkpoint must reproduce uninterrupted prefill exactly."""
+
+    inputs = _make_inputs(
+        seq_lens=[321],
+        num_heads=32,
+        packed=False,
+        initial_state=True,
+        seed=2091,
+    )
+    initial_state = inputs["initial_state"].clone()
+
+    def run_slice(start, end, state):
+        sliced = {
+            **inputs,
+            "q": inputs["q"][:, start:end],
+            "k": inputs["k"][:, start:end],
+            "v": inputs["v"][:, start:end],
+            "g": inputs["g"][:, start:end],
+            "beta": inputs["beta"][:, start:end],
+            "initial_state": state,
+        }
+        return recurrent_kda(
+            **_strict_prefill_kwargs(sliced, lower_bound=None),
+            output_final_state=True,
+        )
+
+    full_output, full_state = run_slice(0, 321, initial_state.clone())
+    resumed_state = initial_state.clone()
+    prefix_output, returned_prefix_state = run_slice(0, 256, resumed_state)
+    assert returned_prefix_state is resumed_state
+    suffix_output, returned_suffix_state = run_slice(256, 321, resumed_state)
+    assert returned_suffix_state is resumed_state
+
+    resumed_output = torch.cat((prefix_output, suffix_output), dim=1)
+    torch.testing.assert_close(resumed_output, full_output, atol=0, rtol=0)
+    torch.testing.assert_close(returned_suffix_state, full_state, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("num_sequences", [171, 256])

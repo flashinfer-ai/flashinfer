@@ -35,6 +35,33 @@ _SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
 _HEAD_DIM = 128
 
 
+def _is_cute_dsl_kda_runtime_available() -> bool:
+    """Whether the BT=16 kernel can be imported at all.
+
+    It is built on ``cutlass.experimental``, which needs CuTe DSL >= 4.7. The import
+    is guarded because a broken DSL install can fail on load.
+    """
+    try:
+        from .cute_dsl.utils import is_cute_dsl_experimental_available
+    except (ImportError, RuntimeError):
+        return False
+    return is_cute_dsl_experimental_available()
+
+
+def _is_cute_dsl_kda_prefill_dsl_too_old(q: torch.Tensor) -> bool:
+    """Whether this device wants the BT=16 kernel but the installed DSL lacks it.
+
+    Architecture-scoped so that devices served by another CuTe DSL prefill backend,
+    such as SM120, are not told to upgrade a DSL they do not need.
+    """
+    return (
+        isinstance(q, torch.Tensor)
+        and q.is_cuda
+        and get_compute_capability(q.device) in _SUPPORTED_COMPUTE_CAPABILITIES
+        and not _is_cute_dsl_kda_runtime_available()
+    )
+
+
 def _is_cute_dsl_kda_prefill_eligible(
     *,
     q: torch.Tensor,
@@ -61,7 +88,10 @@ def _is_cute_dsl_kda_prefill_eligible(
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
 ) -> bool:
-    """Return whether the call matches the ported BT=16 kernel contract."""
+    """Return whether the ported BT=16 kernel can serve this call.
+
+    Covers both the kernel contract and whether the installed CuTe DSL provides it.
+    """
 
     if not isinstance(q, torch.Tensor) or q.ndim != 4 or q.shape[1] <= 1:
         return False
@@ -222,7 +252,8 @@ def _is_cute_dsl_kda_prefill_eligible(
             return False
     elif state_checkpoints is not None or checkpoint_cu_starts is not None:
         return False
-    return True
+    # Probed last so that calls rejected above reach Cake exactly as before.
+    return _is_cute_dsl_kda_runtime_available()
 
 
 def _get_compiled_cute_dsl_kda(
@@ -459,6 +490,8 @@ def _run_cute_dsl_kda_prefill(
 
 
 __all__ = [
+    "_is_cute_dsl_kda_prefill_dsl_too_old",
     "_is_cute_dsl_kda_prefill_eligible",
+    "_is_cute_dsl_kda_runtime_available",
     "_run_cute_dsl_kda_prefill",
 ]

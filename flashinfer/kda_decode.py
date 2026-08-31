@@ -20,7 +20,7 @@ Kimi Delta Attention Decode - API Layer
 
 This file provides the public API for recurrent KDA decode operations.
 Kernel implementations are in ``flashinfer.kda_kernels``; callers may
-explicitly select the exported Cake backend.
+explicitly select Cake or use its narrow native auto-dispatch contract.
 """
 
 from typing import Literal, Optional
@@ -102,7 +102,7 @@ def recurrent_kda(
     initial_state_indices: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
     *,
-    backend: Literal["cute-dsl", "cake"] = "cute-dsl",
+    backend: Literal["cute-dsl", "cake", "auto"] = "cute-dsl",
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Recurrent KDA (Kimi Delta Attention) decode kernel.
 
@@ -149,7 +149,9 @@ def recurrent_kda(
             ``g``. Default: ``False``.
         lower_bound (Optional[float]):
             If set, uses ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
-            gate formula instead of softplus. Must be negative.
+            gate formula. If ``None``, uses
+            ``-exp(A_log) * softplus(g + dt_bias)``. A supplied bound must be
+            negative.
         cu_seqlens (Optional[torch.Tensor]):
             Cumulative sequence lengths of shape ``[N+1]``. Must be int32.
         ssm_state_indices (Optional[torch.Tensor]):
@@ -177,11 +179,13 @@ def recurrent_kda(
             with ``initial_state_source``.
         beta_is_logit (bool):
             If ``True``, apply sigmoid to ``beta`` inside the recurrent kernel.
-        backend (Literal["cute-dsl", "cake"]):
+        backend (Literal["cute-dsl", "cake", "auto"]):
             Implementation backend. ``"cute-dsl"`` preserves the existing
             FlashInfer implementation. ``"cake"`` strictly selects an
             exported Cake kernel and raises when the call does not match one
-            of its supported contracts. Default: ``"cute-dsl"``.
+            of its supported contracts. ``"auto"`` selects Cake only for its
+            equal-head/D128/T1 unbounded-softplus contract, preserving CuTe
+            DSL for every other decode surface. Default: ``"cute-dsl"``.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -189,8 +193,10 @@ def recurrent_kda(
         :func:`flashinfer.kda_kernels.recurrent_kda.run_recurrent_kda` for the
         backend implementation.
     """
-    if backend not in ("cute-dsl", "cake"):
-        raise ValueError(f"backend must be 'cute-dsl' or 'cake', got {backend!r}")
+    if backend not in ("cute-dsl", "cake", "auto"):
+        raise ValueError(
+            f"backend must be 'cute-dsl', 'cake', or 'auto', got {backend!r}"
+        )
     if _run_recurrent_kda is None:
         raise NotImplementedError("recurrent KDA backend is unavailable")
 
@@ -217,9 +223,7 @@ def recurrent_kda(
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
     )
-    if backend == "cake":
-        return _run_recurrent_kda(**run_kwargs, backend="cake")
-    return _run_recurrent_kda(**run_kwargs, backend="cute-dsl")
+    return _run_recurrent_kda(**run_kwargs, backend=backend)
 
 
 @flashinfer_api(trace=packed_kda_decode_trace)

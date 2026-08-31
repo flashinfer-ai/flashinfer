@@ -83,6 +83,25 @@ def is_rubin_cute_dsl_available() -> bool:
 
 
 @functools.cache
+def is_cute_dsl_experimental_available() -> bool:
+    r"""Return ``True`` when the installed CuTe DSL exposes ``cutlass.experimental``.
+
+    The namespace landed in CuTe DSL 4.7, while FlashInfer's dependency floor is
+    4.6.2, so kernels built on it probe before importing and an older DSL loses
+    only those kernels.
+
+    Returns
+    -------
+    bool
+        ``True`` if ``cutlass.experimental`` is importable.
+    """
+    return (
+        is_cute_dsl_available()
+        and importlib.util.find_spec("cutlass.experimental") is not None
+    )
+
+
+@functools.cache
 def is_cute_dsl_arch_supported(
     major: int, minor: int, native_only: bool = False
 ) -> bool:
@@ -100,9 +119,13 @@ def is_cute_dsl_arch_supported(
     When the device's own architecture is missing but the DSL has the
     family-conditional target for its major line (e.g. ``sm_100f`` for an
     sm_107 device), kernels restricted to family-portable features still
-    compile and run correctly; this probe then pins the DSL's default target
-    via the ``CUTE_DSL_ARCH`` environment variable and reports the arch
-    supported. Pass ``native_only=True`` for kernels that require
+    compile and run correctly. This probe does **not** arrange that: it only
+    *observes* whether the DSL is already targeting the family arch, and
+    reports the arch supported when it is. Retargeting the DSL is the
+    caller's responsibility and must happen before ``cutlass`` is first
+    imported -- normally by exporting ``CUTE_DSL_ARCH=sm_100f`` in the
+    environment, since setting it later does not retarget an already
+    imported DSL. Pass ``native_only=True`` for kernels that require
     architecture-specific instructions (e.g. block-scaled ``tcgen05.mma``
     kinds, which the DSL only accepts for ``sm_100a``/``sm_103a`` targets).
     """
@@ -165,6 +188,40 @@ def _dsl_captured_arch() -> Optional[str]:
         return str(CuTeDSL._get_dsl().envar.arch)
     except Exception:
         return None
+
+
+def cute_dsl_compile_arch(major: int, minor: int) -> str:
+    r"""Return the arch name to pass to ``cute.GPUArch`` for a device.
+
+    Prefers the device's own arch (e.g. ``sm_107a``). When the installed DSL
+    predates the device but is targeting the family-conditional arch because
+    the user exported ``CUTE_DSL_ARCH=sm_100f``, returns that instead --
+    handing it ``sm_107a`` would raise ``KeyError`` from inside the DSL's
+    ``Arch`` enum, which is the failure this exists to prevent.
+
+    Raises :class:`NotImplementedError` when neither is available, so callers
+    fail with an actionable message instead of a bare ``KeyError``.
+    """
+    from cutlass.base_dsl.arch import Arch
+
+    for name in (f"sm_{major}{minor}a", f"sm_{major}{minor}"):
+        try:
+            Arch[name]
+            return name
+        except KeyError:
+            continue
+    # Native arch absent. is_cute_dsl_arch_supported returns True here only
+    # when the DSL is already targeting the family arch, which is exactly when
+    # compiling for it is valid.
+    if is_cute_dsl_arch_supported(major, minor):
+        family = _family_fallback_arch(major, minor)
+        if family is not None:
+            return family
+    raise NotImplementedError(
+        f"the installed CuTe DSL cannot target sm_{major}{minor}; export "
+        f"CUTE_DSL_ARCH=sm_{major}0f before starting the process to build "
+        f"family-portable kernels on this device"
+    )
 
 
 def require_cute_dsl_arch(device, native_only: bool = False) -> None:

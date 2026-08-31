@@ -39,11 +39,15 @@ def _parse_arch_str(arch_str):
 
 
 @lru_cache(maxsize=None)
-def _get_device_arch():
+def _get_device_arch(device_index: int):
+    # device_index is unused when FLASH_ATTENTION_ARCH is set, but keeping it
+    # in the signature keeps the lru_cache keyed per-device below -- a
+    # zero-arg cache would pin the first-seen device's arch for the rest of
+    # the process on a mixed-architecture host.
     arch_override = os.environ.get("FLASH_ATTENTION_ARCH", None)
     if arch_override is not None:
         return _parse_arch_str(arch_override)
-    major, minor = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability(device_index)
     return major * 10 + int(minor)
 
 
@@ -112,7 +116,7 @@ def bsa_attn_sm100_blk128_fwd(
     if not is_fake_mode():
         assert all(t.is_cuda for t in (q, k, v)), "inputs must be on CUDA device"
 
-    arch = _get_device_arch()
+    arch = _get_device_arch(q.device.index)
     assert arch in (100, 103), (
         f"bsa_attn_sm100_blk128_fwd only supports SM100/SM103, got SM{arch}"
     )

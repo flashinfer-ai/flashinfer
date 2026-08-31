@@ -64,6 +64,8 @@ def _is_sm12x_supported():
     """Check SM120/SM121 support using repo-standard utility checks."""
     from flashinfer.utils import is_sm120a_supported, is_sm121a_supported
 
+    if not torch.cuda.is_available():
+        return False
     device = torch.device("cuda")
     return is_sm120a_supported(device) or is_sm121a_supported(device)
 
