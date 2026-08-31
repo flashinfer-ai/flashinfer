@@ -154,7 +154,7 @@ class Test_FlashInfer_MaskedScaledBMM:
             (4, 512, 128, 256, 256),
         ],
     )
-    @pytest.mark.parametrize("block_scale_type", ["mxfp8", "nvfp4"])
+    @pytest.mark.parametrize("block_scale_type", ["mxfp8", "nvfp4", "mxfp4", "mixed"])
     @pytest.mark.parametrize("trans_a", [False])
     @pytest.mark.parametrize("trans_b", [True])
     @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
@@ -185,7 +185,13 @@ class Test_FlashInfer_MaskedScaledBMM:
             pytest.skip(
                 f"masked_scaled_bmm {backend} backend not supported on compute capability {cc_num}."
             )
-        if block_scale_type == "nvfp4" and (cc_major, cc_minor) == (10, 3):
+        # nvfp4/mxfp4/mixed all pack a fp4 operand (B-side ELEM_PER_BYTE == 2),
+        # so all three need ct.unpack_from_bytes on load; mxfp8 (both operands
+        # fp8) does not. Skip the fp4 modes on sm103 where unpack is unavailable.
+        if block_scale_type in ("nvfp4", "mxfp4", "mixed") and (cc_major, cc_minor) == (
+            10,
+            3,
+        ):
             pytest.skip("ct.unpack_from_bytes not available in cuTile on sm103")
 
         torch.manual_seed(0)
