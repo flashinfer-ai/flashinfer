@@ -291,6 +291,92 @@ def test_fp8_groupwise_group_gemm(
     torch.testing.assert_close(out, ref_c, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("segment_alignment", [128, 256])
+@pytest.mark.parametrize("m", [256, 512])
+@pytest.mark.parametrize("n", [256])
+@pytest.mark.parametrize("k", [256])
+@pytest.mark.parametrize("group_size", [4])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16])
+def test_fp8_groupwise_group_gemm_cutile_tma_fast_path(
+    m,
+    n,
+    k,
+    group_size,
+    segment_alignment,
+    out_dtype,
+):
+    """cuTile group GEMM: exercise the ``segment_alignment>=128`` aligned-segment TMA path.
+
+    ``group_gemm_fp8_nt_groupwise(backend="cutile")`` uses the gather kernel for the
+    default ``segment_alignment=1`` and only takes the faster aligned-segment TMA
+    path (which dispatches into ``ragged_block_scaled_bmm``) when the caller
+    guarantees ``segment_alignment`` is a multiple of 128 AND ``block_n == block_k``
+    AND ``K % block_k == 0`` (see ``gemm_fp8_nt_groupwise_cutile.py``). Every other
+    group-GEMM test leaves ``segment_alignment`` at its default, so that branch had
+    no coverage. Equal groups of ``m`` rows (``m`` a multiple of
+    ``segment_alignment``) make every ``m_indptr`` offset ``segment_alignment``-
+    aligned, satisfying the fast path's caller contract.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if compute_capability[0] not in [10, 11, 12]:
+        pytest.skip("group_gemm_fp8_nt_groupwise cuTile backend requires SM100+ GPUs.")
+    if group_size > 1 and compute_capability[0] == 12:
+        # Public-op validator raises for num_groups > 1 on SM120/121; mirror the
+        # skip in test_fp8_groupwise_group_gemm so this errors nowhere.
+        pytest.skip(
+            "group_gemm_fp8_nt_groupwise has correctness issues for num_groups > 1 on SM120/121"
+        )
+    if not is_cuda_tile_available():
+        pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
+    # Offsets are i*m; they are segment_alignment-aligned iff m is. Guard the
+    # contract so a mismatched parametrization can never silently miscompile.
+    assert m % segment_alignment == 0
+
+    torch.random.manual_seed(0)
+    tile_size = 128
+    scale_major_mode = "K"  # cuTile group GEMM supports K-major scales only.
+
+    a_val = torch.randn((group_size * m, k), dtype=torch.float, device="cuda")
+    b_val = torch.randn(
+        (group_size, n, k), dtype=torch.float, device="cuda"
+    ) / math.sqrt(k)
+
+    a_scale_shape = (group_size * m, k // tile_size)
+    b_scale_shape = (group_size, n // tile_size, k // tile_size)
+    a_tile_shape = (1, tile_size)
+    b_tile_shape = (1, tile_size, tile_size)
+
+    a_fp8, a_scale = quantize_fp8(a_val, a_scale_shape, a_tile_shape, scale_major_mode)
+    b_fp8, b_scale = quantize_fp8(b_val, b_scale_shape, b_tile_shape, scale_major_mode)
+
+    a_dequant = dequantize_fp8(a_fp8, a_scale, scale_major_mode)
+    b_dequant = dequantize_fp8(b_fp8, b_scale, scale_major_mode)
+
+    m_indptr = torch.arange(0, group_size + 1, dtype=torch.int32, device="cuda") * m
+
+    out = group_gemm_fp8_nt_groupwise(
+        a_fp8,
+        b_fp8,
+        a_scale,
+        b_scale,
+        m_indptr,
+        scale_major_mode=scale_major_mode,
+        out_dtype=out_dtype,
+        backend="cutile",
+        segment_alignment=segment_alignment,
+    )
+    ref_c = (
+        einsum(
+            a_dequant.view((group_size, m, k)),
+            b_dequant,
+            "b m k, b n k -> b m n",
+        )
+        .view((group_size * m, n))
+        .to(out_dtype)
+    )
+    torch.testing.assert_close(out, ref_c, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])
 @pytest.mark.parametrize("nk", [(128, 512), (512, 128), (4096, 7168), (7168, 2048)])
 @pytest.mark.parametrize("group_size", [1, 4, 8, 64, 128, 256])
