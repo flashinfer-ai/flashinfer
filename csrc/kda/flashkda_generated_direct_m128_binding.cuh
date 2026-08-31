@@ -111,7 +111,7 @@ inline void LaunchDirectM128(DirectM128Args args, const StatePointerSlots& state
       &args.initial_state_f32, &args.zero_workspace, &args.zero_words,
       &args.num_sequences, &args.state_checkpoints_tma, &args.final_state_f32};
   CheckArgumentCount<50>(kernel_args);
-  ConfigureAndLaunch(reinterpret_cast<const void*>(FLASHKDA_GENERATED_KERNEL), grid,
+  ConfigureAndLaunch(FLASHKDA_GENERATED_KERNEL_ARGUMENT, grid,
                      stream, kernel_args, "generated direct-M128 launch");
 }
 
@@ -316,7 +316,7 @@ inline void LaunchDirectM128Vtile(DirectM128VtileArgs args,const StatePointerSlo
     &args.persistent_stride,&args.num_heads,&args.use_initial_state,&args.store_final_state,
     &args.scale,&args.lower_bound};
   CheckArgumentCount<31>(kernel_args);
-  ConfigureAndLaunch(reinterpret_cast<const void*>(FLASHKDA_GENERATED_KERNEL),grid,stream,
+  ConfigureAndLaunch(FLASHKDA_GENERATED_KERNEL_ARGUMENT,grid,stream,
                      kernel_args,"generated direct-M128 vtile launch");
 }
 

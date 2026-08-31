@@ -34,7 +34,7 @@ inline void LaunchBt16Chain(Bt16ChainArgs args, const StatePointerSlots& state,
       &args.state_indices_addr, &args.state_slot_stride, &args.use_state_indices,
       &args.initial_state_f32, &args.final_state_f32};
   CheckArgumentCount<28>(kernel_args);
-  ConfigureAndLaunch(reinterpret_cast<const void*>(FLASHKDA_GENERATED_KERNEL), grid,
+  ConfigureAndLaunch(FLASHKDA_GENERATED_KERNEL_ARGUMENT, grid,
                      stream, kernel_args, "generated BT16 chain launch");
 }
 

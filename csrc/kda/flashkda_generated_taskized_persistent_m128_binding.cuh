@@ -38,7 +38,7 @@ inline void LaunchTaskizedPersistentM128(TaskizedPersistentM128Args args,
       &args.num_heads, &args.use_initial_state, &args.store_final_state,
       &args.scale, &args.lower_bound};
   CheckArgumentCount<36>(kernel_args);
-  ConfigureAndLaunch(reinterpret_cast<const void*>(FLASHKDA_GENERATED_KERNEL), grid,
+  ConfigureAndLaunch(FLASHKDA_GENERATED_KERNEL_ARGUMENT, grid,
                      stream, kernel_args,
                      "generated taskized-persistent M128 launch");
 }

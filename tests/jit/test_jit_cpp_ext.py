@@ -58,6 +58,31 @@ def test_generate_ninja_uses_sccache_compatible_nvcc_depfile_flag(
     assert "--dependency-output" not in ninja
 
 
+def test_generate_ninja_embeds_cubin_before_link(monkeypatch, tmp_path):
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    monkeypatch.setattr(cpp_ext.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "7.5")
+    cubin = tmp_path / "kernel.cubin"
+    cubin.write_bytes(b"cubin")
+
+    ninja = cpp_ext.generate_ninja_build_for_op(
+        name="test_module",
+        sources=[tmp_path / "generated" / "binding.cu"],
+        extra_cflags=None,
+        extra_cuda_cflags=None,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+        embedded_cubins={"exact_kernel": cubin},
+    )
+
+    assert "rule embed_cubin" in ninja
+    assert "--name $cubin_name" in ninja
+    assert f"| {cubin.resolve()}" in ninja
+    assert "cubin_name = exact_kernel" in ninja
+    link_line = next(line for line in ninja.splitlines() if ": link " in line)
+    assert "embedded_0_" in link_line
+
+
 def test_debug_jit_uses_sccache_compatible_nvcc_device_debug_flag(monkeypatch):
     monkeypatch.setenv("FLASHINFER_JIT_DEBUG", "1")
     monkeypatch.setattr(core, "check_cuda_arch", lambda: None)

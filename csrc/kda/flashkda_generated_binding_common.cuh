@@ -22,6 +22,28 @@
 #include "flashkda_binding_common.cuh"
 #include "flashkda_generated_bt16_descriptor_common.cuh"
 
+#if defined(FLASHKDA_GENERATED_EMBEDDED_CUBIN)
+#include <tvm/ffi/extra/cuda/cubin_launcher.h>
+#ifndef FLASHKDA_GENERATED_CUBIN_IDENT
+#error "FLASHKDA_GENERATED_CUBIN_IDENT must name the embedded cubin"
+#endif
+#define FLASHKDA_GENERATED_EMBED_CUBIN_IMPL(name) TVM_FFI_EMBED_CUBIN(name)
+#define FLASHKDA_GENERATED_EMBED_CUBIN(name) \
+  FLASHKDA_GENERATED_EMBED_CUBIN_IMPL(name)
+FLASHKDA_GENERATED_EMBED_CUBIN(FLASHKDA_GENERATED_CUBIN_IDENT);
+#define FLASHKDA_GENERATED_GET_KERNEL_IMPL(name, kernel_name) \
+  TVM_FFI_EMBED_CUBIN_GET_KERNEL(name, kernel_name)
+#define FLASHKDA_GENERATED_GET_KERNEL(name, kernel_name) \
+  FLASHKDA_GENERATED_GET_KERNEL_IMPL(name, kernel_name)
+#define FLASHKDA_GENERATED_STRINGIFY_IMPL(value) #value
+#define FLASHKDA_GENERATED_STRINGIFY(value) \
+  FLASHKDA_GENERATED_STRINGIFY_IMPL(value)
+#define FLASHKDA_GENERATED_KERNEL_ARGUMENT nullptr
+#else
+#define FLASHKDA_GENERATED_KERNEL_ARGUMENT \
+  reinterpret_cast<const void*>(FLASHKDA_GENERATED_KERNEL)
+#endif
+
 #ifndef FLASHKDA_GENERATED_BODY_FILE
 #error "FLASHKDA_GENERATED_BODY_FILE must name one audited generated body"
 #endif
@@ -77,6 +99,7 @@ static_assert(FLASHKDA_GENERATED_USE_PDL == 0 || FLASHKDA_GENERATED_USE_PDL == 1
 static_assert(FLASHKDA_GENERATED_STATE_MODE >= FLASHKDA_GENERATED_STATE_NONE &&
               FLASHKDA_GENERATED_STATE_MODE <= FLASHKDA_GENERATED_STATE_BF16_F32_DEPENDENCY);
 
+#if !defined(FLASHKDA_GENERATED_EMBEDDED_CUBIN)
 // The generated source is standalone and owns private fixed-width aliases.
 // Isolate them from CUDA and TVM-FFI declarations in this translation unit.
 #define int8_t flashkda_generated_private_int8_t
@@ -107,6 +130,7 @@ static_assert(THREADS == FLASHKDA_GENERATED_THREADS,
 #endif
 static_assert(SMEM_TOTAL == FLASHKDA_GENERATED_SMEM_BYTES,
               "generated body and selector shared-memory sizes disagree");
+#endif
 
 namespace flashinfer {
 namespace flash_kda_generated {
@@ -318,6 +342,49 @@ inline void ConfigureAndLaunch(const void* kernel, dim3 grid, cudaStream_t strea
   int32_t device_id = 0;
   CheckCuda(cudaGetDevice(&device_id), "cudaGetDevice");
   CheckDynamicSmemCapacity(device_id, FLASHKDA_GENERATED_SMEM_BYTES);
+#if defined(FLASHKDA_GENERATED_EMBEDDED_CUBIN)
+  (void)kernel;
+  static auto embedded_kernel = FLASHKDA_GENERATED_GET_KERNEL(
+      FLASHKDA_GENERATED_CUBIN_IDENT,
+      FLASHKDA_GENERATED_STRINGIFY(FLASHKDA_GENERATED_KERNEL));
+  namespace cuda_api = tvm::ffi::cuda_api;
+  auto device = cuda_api::GetDeviceHandle(device_id);
+  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(cuda_api::SetKernelMaxDynamicSharedMem(
+      embedded_kernel.GetHandle(), FLASHKDA_GENERATED_SMEM_BYTES, device));
+#if FLASHKDA_GENERATED_USE_PDL
+  cuda_api::LaunchConfig config{};
+#if TVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API
+  CUlaunchAttribute attribute{};
+  attribute.id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION;
+  attribute.value.programmaticStreamSerializationAllowed = 1;
+  config.gridDimX = grid.x;
+  config.gridDimY = grid.y;
+  config.gridDimZ = grid.z;
+  config.blockDimX = FLASHKDA_GENERATED_THREADS;
+  config.blockDimY = 1;
+  config.blockDimZ = 1;
+  config.sharedMemBytes = FLASHKDA_GENERATED_SMEM_BYTES;
+  config.hStream = stream;
+#else
+  cudaLaunchAttribute attribute{};
+  attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attribute.val.programmaticStreamSerializationAllowed = 1;
+  config.gridDim = grid;
+  config.blockDim = dim3(FLASHKDA_GENERATED_THREADS, 1, 1);
+  config.dynamicSmemBytes = FLASHKDA_GENERATED_SMEM_BYTES;
+  config.stream = stream;
+#endif
+  config.attrs = &attribute;
+  config.numAttrs = 1;
+  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(
+      embedded_kernel.LaunchEx(args, config));
+#else
+  TVM_FFI_CHECK_CUBIN_LAUNCHER_CUDA_ERROR(embedded_kernel.Launch(
+      args, tvm::ffi::dim3(grid.x, grid.y, grid.z),
+      tvm::ffi::dim3(FLASHKDA_GENERATED_THREADS, 1, 1), stream,
+      FLASHKDA_GENERATED_SMEM_BYTES));
+#endif
+#else
   CheckCuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                  FLASHKDA_GENERATED_SMEM_BYTES),
             "cudaFuncSetAttribute(generated FlashKDA kernel)");
@@ -337,6 +404,7 @@ inline void ConfigureAndLaunch(const void* kernel, dim3 grid, cudaStream_t strea
   CheckCuda(cudaLaunchKernel(kernel, grid, dim3(FLASHKDA_GENERATED_THREADS, 1, 1), args,
                              FLASHKDA_GENERATED_SMEM_BYTES, stream),
             launch_name);
+#endif
 #endif
 }
 

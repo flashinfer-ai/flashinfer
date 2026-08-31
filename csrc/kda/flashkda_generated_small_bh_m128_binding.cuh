@@ -88,7 +88,7 @@ inline void LaunchSmallBhM128(SmallBhM128Args args,
       &args.packet_ready, &args.packet_consumed, &args.helper_done,
       &args.initial_state_f32, &args.final_state_f32};
   CheckArgumentCount<36>(kernel_args);
-  ConfigureAndLaunch(reinterpret_cast<const void*>(FLASHKDA_GENERATED_KERNEL), grid,
+  ConfigureAndLaunch(FLASHKDA_GENERATED_KERNEL_ARGUMENT, grid,
                      stream, kernel_args, "generated small-BH M128 launch");
 }
 

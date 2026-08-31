@@ -287,6 +287,12 @@ def test_generated_prefill_registry_is_receipt_closed_and_exact_targeted():
             assert spec.name.endswith(module.cache_ident)
             assert gencode in spec.extra_cuda_cflags
             assert target_define in spec.extra_cuda_cflags
+            assert "-DFLASHKDA_GENERATED_EMBEDDED_CUBIN=1" in spec.extra_cuda_cflags
+            assert (
+                f"-DFLASHKDA_GENERATED_CUBIN_IDENT={module.module_ident}"
+                in spec.extra_cuda_cflags
+            )
+            assert spec.embedded_cubin_factory is not None
             assert all("sm100f" not in flag for flag in spec.extra_cuda_cflags)
             assert all("_o1" not in flag.lower() for flag in spec.extra_cuda_cflags)
 

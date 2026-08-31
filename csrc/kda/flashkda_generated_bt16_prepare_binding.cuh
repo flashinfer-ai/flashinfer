@@ -28,7 +28,7 @@ inline void LaunchBt16Prepare(Bt16PrepareArgs args, dim3 grid,
       &args.ws_diag, &args.total_chunks, &args.num_heads,
       &args.gate_lower_bound};
   CheckArgumentCount<24>(kernel_args);
-  ConfigureAndLaunch(reinterpret_cast<const void*>(FLASHKDA_GENERATED_KERNEL), grid,
+  ConfigureAndLaunch(FLASHKDA_GENERATED_KERNEL_ARGUMENT, grid,
                      stream, kernel_args, "generated BT16 prepare launch");
 }
 

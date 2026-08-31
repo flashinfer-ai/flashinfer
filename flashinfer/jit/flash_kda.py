@@ -33,6 +33,7 @@ from .core import (
     sm100f_nvcc_flags,
     sm103a_nvcc_flags,
 )
+from .flash_kda_nvrtc import prepare_generated_flash_kda_cubin
 
 FlashKDAVariant = Literal[
     "m64",
@@ -820,12 +821,23 @@ def gen_flash_kda_generated_module(variant_id: str) -> JitSpec:
         extra_cuda_cflags=[
             *_FLASH_KDA_GENERATED_NVCC_FLAGS[module.target],
             _FLASH_KDA_GENERATED_TARGET_DEFINE[module.target],
+            "-DFLASHKDA_GENERATED_EMBEDDED_CUBIN=1",
+            f"-DFLASHKDA_GENERATED_CUBIN_IDENT={module.module_ident}",
         ],
         extra_include_paths=[
             csrc_dir,
             csrc_dir.parent,
             _get_flash_kda_include_dir(),
         ],
+        embedded_cubin_factory=functools.partial(
+            prepare_generated_flash_kda_cubin,
+            selector_path=_resolve_generated_source(
+                csrc_dir, module.binding_relpath
+            ),
+            body_path=_resolve_generated_source(csrc_dir, module.body_relpath),
+            module_ident=module.module_ident,
+            target=module.target,
+        ),
     )
     logger.info(
         "Generated FlashKDA physical module %s JIT spec: %s",

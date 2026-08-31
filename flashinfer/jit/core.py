@@ -6,7 +6,7 @@ import os
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union, Hashable
+from typing import Any, Callable, Dict, Hashable, List, Mapping, Optional, Sequence, Union
 
 import tvm_ffi
 from filelock import FileLock
@@ -332,6 +332,9 @@ class JitSpecNvcc(JitSpec):
     is_class: bool = False
     needs_device_linking: bool = False
     post_load_adapter: Optional[Callable[[Any], Any]] = None
+    embedded_cubin_factory: Optional[
+        Callable[[Path], Mapping[str, Path]]
+    ] = None
 
     @property
     def ninja_path(self) -> Path:
@@ -379,6 +382,11 @@ class JitSpecNvcc(JitSpec):
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
         self.build_dir.mkdir(parents=True, exist_ok=True)
+        embedded_cubins = (
+            self.embedded_cubin_factory(self.build_dir)
+            if self.embedded_cubin_factory is not None
+            else None
+        )
         content = generate_ninja_build_for_op(
             name=self.name,
             sources=self.sources,
@@ -387,6 +395,7 @@ class JitSpecNvcc(JitSpec):
             extra_ldflags=self.extra_ldflags,
             extra_include_dirs=self.extra_include_dirs,
             needs_device_linking=self.needs_device_linking,
+            embedded_cubins=embedded_cubins,
         )
         write_if_different(ninja_path, content)
 
@@ -525,6 +534,9 @@ def gen_jit_spec(
     extra_include_paths: Optional[List[Union[str, Path]]] = None,
     needs_device_linking: bool = False,
     post_load_adapter: Optional[Callable[[Any], Any]] = None,
+    embedded_cubin_factory: Optional[
+        Callable[[Path], Mapping[str, Path]]
+    ] = None,
 ) -> JitSpec:
     check_cuda_arch()
     # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
@@ -594,6 +606,7 @@ def gen_jit_spec(
         ),
         needs_device_linking=needs_device_linking,
         post_load_adapter=post_load_adapter,
+        embedded_cubin_factory=embedded_cubin_factory,
     )
 
     # Register the spec in the global registry

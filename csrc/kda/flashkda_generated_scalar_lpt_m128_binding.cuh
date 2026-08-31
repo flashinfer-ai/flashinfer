@@ -36,7 +36,7 @@ inline void LaunchScalarLptM128(ScalarLptM128Args args,
       &args.final_state_f32, &args.num_heads, &args.use_initial_state,
       &args.store_final_state, &args.scale, &args.lower_bound};
   CheckArgumentCount<31>(kernel_args);
-  ConfigureAndLaunch(reinterpret_cast<const void*>(FLASHKDA_GENERATED_KERNEL), grid,
+  ConfigureAndLaunch(FLASHKDA_GENERATED_KERNEL_ARGUMENT, grid,
                      stream, kernel_args, "generated scalar-LPT M128 launch");
 }
 

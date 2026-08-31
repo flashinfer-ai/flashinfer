@@ -20,7 +20,7 @@ inline void LaunchAffineScan(AffineScanArgs args, dim3 grid,
   void* kernel_args[] = {&args.split_state, &args.map_state_bf16, &args.carry,
                          &args.num_heads, &args.num_parts};
   CheckArgumentCount<5>(kernel_args);
-  ConfigureAndLaunch(reinterpret_cast<const void*>(FLASHKDA_GENERATED_KERNEL), grid,
+  ConfigureAndLaunch(FLASHKDA_GENERATED_KERNEL_ARGUMENT, grid,
                      stream, kernel_args, "generated affine-scan launch");
 }
 
