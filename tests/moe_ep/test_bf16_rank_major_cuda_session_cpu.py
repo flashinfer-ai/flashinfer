@@ -131,7 +131,10 @@ def test_active_stage_grids_are_bounded_by_capacity(tokens, route_blocks, gemm_y
     assert grids["combine"] == (tokens, 1, 1)
     for name, grid in grids.items():
         maximum = module._STAGE_LAUNCH_CONTRACTS[name][0]
-        assert all(value <= bound for value, bound in zip(grid, maximum))
+        assert all(
+            value <= bound
+            for value, bound in zip(grid, maximum, strict=True)
+        )
 
 
 @pytest.mark.parametrize("tokens", (0, 129))

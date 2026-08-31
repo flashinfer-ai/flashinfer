@@ -605,14 +605,20 @@ class _KernelLibrary:
         if (
             len(launch_grid) != 3
             or any(type(value) is not int or value <= 0 for value in launch_grid)
-            or any(value > maximum for value, maximum in zip(launch_grid, manifest_grid))
+            or any(
+                value > maximum
+                for value, maximum in zip(launch_grid, manifest_grid, strict=True)
+            )
         ):
             raise RuntimeError(
                 f"stage {stage['name']} grid {launch_grid} exceeds its positive "
                 f"manifest bound {manifest_grid}"
             )
         cluster = tuple(stage["cluster"])
-        if any(value % cluster_dim for value, cluster_dim in zip(launch_grid, cluster)):
+        if any(
+            value % cluster_dim
+            for value, cluster_dim in zip(launch_grid, cluster, strict=True)
+        ):
             raise RuntimeError(
                 f"stage {stage['name']} grid {launch_grid} is not divisible by "
                 f"cluster {cluster}"

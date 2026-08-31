@@ -268,7 +268,9 @@ def test_forward_validation_rejects_active_count_outside_capacity(
 
 def test_forward_validation_rejects_dtype_drift():
     backend = _backend()
-    with pytest.raises(MoEEpConfigError, match="topk_ids must be torch.int32 or torch.int64"):
+    with pytest.raises(
+        MoEEpConfigError, match="topk_ids must be torch.int32 or torch.int64"
+    ):
         backend.validate_forward(
             _fake_inputs(ids_dtype=torch.int16),
             _exact_fleet(),
