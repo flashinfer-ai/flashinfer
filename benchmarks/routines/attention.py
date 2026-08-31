@@ -3314,6 +3314,9 @@ def testBatchMLAPagedAttentionWrapper(args):
         print(f"[VVERBOSE] {workspace_buffer.shape = }")
 
     # Create wrapper
+    # The shared sampler retains singleton dimensions for other attention
+    # routines, but MLA CSR metadata requires one KV length per request.
+    mla_kv_len_arr = actual_seq_lens_kv.flatten()
     backend_wrappers = {}
     for backend in backends:
         if backend in ["fa2", "fa3", "cutlass"]:
@@ -3323,7 +3326,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
-                kv_len_arr=actual_seq_lens_kv,
+                kv_len_arr=mla_kv_len_arr,
                 backend=backend,
             )
             if backend != "cutlass":
@@ -3331,7 +3334,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                     qo_indptr=qo_indptr,
                     kv_indptr=kv_indptr,
                     kv_indices=kv_indices,
-                    kv_len_arr=actual_seq_lens_kv,
+                    kv_len_arr=mla_kv_len_arr,
                     num_heads=num_qo_heads,
                     head_dim_ckv=head_dim_ckv,
                     head_dim_kpe=head_dim_kpe,

@@ -597,6 +597,92 @@ def test_prims_ts_mla_decode_sq_gt_one_adapter_contract(
     assert benchmark_outputs[0].shape == (6, 2, 512)
 
 
+def test_mla_benchmark_passes_rank_one_kv_len_arr(monkeypatch):
+    """Keep MLA's CSR metadata separate from generic attention length shapes."""
+
+    class RecordingMLAWrapper:
+        def __init__(self, **kwargs):
+            self.constructor_kwargs = kwargs
+            self.plan_kwargs = None
+
+        def plan(self, **kwargs):
+            self.plan_kwargs = kwargs
+
+        def run(self, q_nope, *_args, **_kwargs):
+            return torch.zeros_like(q_nope)
+
+    wrappers = []
+    real_torch_empty = torch.empty
+
+    monkeypatch.setattr(
+        attention_routine, "get_device", lambda _args: torch.device("cpu")
+    )
+    monkeypatch.setattr(
+        attention_routine,
+        "filter_backends_by_compute_capability",
+        lambda backends, *_args: list(backends),
+    )
+    monkeypatch.setattr(attention_routine, "print_perf_metrics", lambda *_args: None)
+
+    def small_workspace_empty(*args, **kwargs):
+        if args == (512 * 1024 * 1024,):
+            return real_torch_empty(1, **kwargs)
+        return real_torch_empty(*args, **kwargs)
+
+    def fake_bench_gpu_time(*, fn, input_args, **_kwargs):
+        fn(*input_args)
+        return np.array([1.0])
+
+    def constructor(**kwargs):
+        wrapper = RecordingMLAWrapper(**kwargs)
+        wrappers.append(wrapper)
+        return wrapper
+
+    monkeypatch.setattr(attention_routine.torch, "empty", small_workspace_empty)
+    monkeypatch.setattr(attention_routine, "bench_gpu_time", fake_bench_gpu_time)
+    monkeypatch.setattr(
+        attention_routine.flashinfer.mla,
+        "BatchMLAPagedAttentionWrapper",
+        constructor,
+    )
+
+    args = flashinfer_benchmark.parse_args(
+        [
+            "--routine",
+            "BatchMLAPagedAttentionWrapper",
+            "--backends",
+            "fa2",
+            "--page_size",
+            "16",
+            "--batch_size",
+            "2",
+            "--s_qo",
+            "1",
+            "--s_kv",
+            "16",
+            "--num_qo_heads",
+            "2",
+            "--num_kv_heads",
+            "1",
+            "--head_dim_ckv",
+            "512",
+            "--head_dim_kpe",
+            "64",
+            "--no_cuda_graph",
+            "--num_iters",
+            "1",
+            "--dry_run_iters",
+            "0",
+        ]
+    )
+
+    attention_routine.testBatchMLAPagedAttentionWrapper(args)
+
+    assert len(wrappers) == 1
+    assert wrappers[0].constructor_kwargs["kv_len_arr"].shape == (2,)
+    assert wrappers[0].plan_kwargs["kv_len_arr"].shape == (2,)
+
+
 @pytest.mark.parametrize("batch_size", [16, 32])
 @pytest.mark.parametrize("s_kv", [1024, 2048])
 @pytest.mark.parametrize("page_size", [8, 16])
