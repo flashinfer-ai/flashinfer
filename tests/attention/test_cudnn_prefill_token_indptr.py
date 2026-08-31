@@ -11,7 +11,6 @@ import torch
 
 from flashinfer.cudnn import cudnn_batch_prefill_with_kv_cache
 from flashinfer.cudnn import prefill as cudnn_prefill
-from flashinfer.utils import get_compute_capability
 
 
 @pytest.mark.parametrize("batch_size", [1, 4])
@@ -222,9 +221,6 @@ def test_cudnn_prefill_lse_is_base2(num_kv_heads):
     path folds them to base-2; verify against a float reference."""
     if not cudnn_prefill.CUDNN_AVAILABLE:
         pytest.skip("cudnn-frontend python package not available")
-    # cuDNN fused SDPA prefill requires Ampere or newer.
-    if get_compute_capability(torch.device("cuda:0"))[0] < 8:
-        pytest.skip("cuDNN SDPA prefill requires compute capability >= 8.0")
 
     from flashinfer.utils import log2e
 
