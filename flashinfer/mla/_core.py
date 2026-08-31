@@ -812,8 +812,14 @@ def _normalize_dsv4_topk_lens(
     return topk_lens
 
 
-def _validate_dsv4_sync_checks() -> bool:
-    return os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") not in ("0", "")
+def _validate_dsv4_sync_checks(device: torch.device) -> bool:
+    if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") in ("0", ""):
+        return False
+    if device.type == "cuda":
+        with torch.cuda.device(device):
+            if torch.cuda.is_current_stream_capturing():
+                return False
+    return True
 
 
 def _check_dsv4_sparse_mla_inputs(
@@ -998,7 +1004,7 @@ def _check_dsv4_sparse_mla_inputs(
         query.device,
         cum_seq_lens_q,
     )
-    if _validate_dsv4_sync_checks() and normalized_sparse_lens.numel() > 0:
+    if _validate_dsv4_sync_checks(query.device) and normalized_sparse_lens.numel() > 0:
         sparse_topk_capacity = sparse_indices.size(-1)
         invalid_sparse_lens = torch.logical_or(
             normalized_sparse_lens < 128,
@@ -1911,7 +1917,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         q_lens = seq_lens.new_full((batch_size,), q_len_per_request)
     else:
         q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
-    if _validate_dsv4_sync_checks() and torch.any(seq_lens < q_lens).item():
+    if _validate_dsv4_sync_checks(query.device) and torch.any(seq_lens < q_lens).item():
         raise ValueError(
             "seq_lens must be greater than or equal to the per-request query "
             "lengths so TRTLLM-GEN can derive the SWA-128 valid window"

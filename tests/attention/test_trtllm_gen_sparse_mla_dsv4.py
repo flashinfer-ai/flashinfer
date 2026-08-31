@@ -1040,8 +1040,9 @@ def test_trtllm_gen_sparse_mla_dsv4_strided_pages(
 
 
 @torch.inference_mode()
-def test_trtllm_gen_sparse_mla_dsv4_strided_pages_cuda_graph() -> None:
+def test_trtllm_gen_sparse_mla_dsv4_strided_pages_cuda_graph(monkeypatch) -> None:
     _skip_unless_sm100_or_sm103()
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
     p = RawTestParamForDecode(
         b=2,
         h_q=64,
