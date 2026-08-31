@@ -606,12 +606,37 @@ class _CutlassRunnerBase(MoERunner):
     _use_mxfp8_act_scaling: ClassVar[bool] = False
     _use_packed_weights: ClassVar[bool] = False
     _use_wfp4afp8_humming: ClassVar[bool] = False
+    # Online-quant Humming variant that additionally applies a per-block (K group=32) MXFP8
+    # activation dequant scale after each K-chunk MMA (C++ Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act,
+    # selected by isWMxfp4AMxfp8HummingQuant()). The binding distinguishes it purely by
+    # use_mxfp8_act_scaling=True combined with the Humming contract, but unlike the SM100 MXFP8
+    # path this stays online-quant: the activation block scale is produced internally in the
+    # row-expand / activation kernels, so no external hidden_states_scale / input_sf is plumbed.
+    # Therefore this flag only lifts the binding's use_mxfp8_act_scaling argument; every Python-side
+    # activation-scale path stays gated by _use_mxfp8_act_scaling, which remains False here.
+    _use_wfp4afp8_humming_block_scale: ClassVar[bool] = False
     _required_weight_keys: ClassVar[tuple[str, ...]]
     _expected_num_inputs: ClassVar[int]
+    # Backend key under which prepared weights are registered / looked up. Defaults to backend_key;
+    # a runner variant that shares another backend's byte-identical weight preparation (e.g. the
+    # Humming block-scale variant reusing the Humming weight view) overrides this to point at the
+    # producing backend while keeping its own backend_key for tuning-cache / custom-op identity.
+    _weight_view_key: ClassVar[str] = ""
     # Keep the best N tactics per GEMM stage, then return their Cartesian
     # product as compound candidates for the outer end-to-end autotuner. N=1
     # preserves the legacy independent-winner behavior.
     _num_top_tactics_per_stage: ClassVar[int] = 2
+
+    @property
+    def _binding_use_mxfp8_act_scaling(self) -> bool:
+        """Value fed to the C++ binding's use_mxfp8_act_scaling argument.
+
+        The online-quant Humming per-block variant is selected in the binding by combining the
+        Humming contract with use_mxfp8_act_scaling=True (isWMxfp4AMxfp8HummingQuant). It carries no
+        external activation scale, so _use_mxfp8_act_scaling (which drives every Python-side
+        input_sf / hidden_states_scale path) stays False; only the binding argument is lifted here.
+        """
+        return self._use_mxfp8_act_scaling or self._use_wfp4afp8_humming_block_scale
 
     def _check_support(self) -> None:
         super()._check_support()
@@ -705,7 +730,7 @@ class _CutlassRunnerBase(MoERunner):
                 enable_alltoall=False,
                 use_deepseek_fp8_block_scale=self._use_deepseek_fp8_block_scale,
                 use_w4_group_scaling=self._use_w4_group_scaling,
-                use_mxfp8_act_scaling=self._use_mxfp8_act_scaling,
+                use_mxfp8_act_scaling=self._binding_use_mxfp8_act_scaling,
                 min_latency_mode=False,
                 enable_pdl=self._enable_pdl,
                 activation_type=self.config.activation.type,
@@ -912,7 +937,7 @@ class _CutlassRunnerBase(MoERunner):
             activation_type=self.config.activation.type,
             use_deepseek_fp8_block_scale=self._use_deepseek_fp8_block_scale,
             use_w4_group_scaling=self._use_w4_group_scaling,
-            use_mxfp8_act_scaling=self._use_mxfp8_act_scaling,
+            use_mxfp8_act_scaling=self._binding_use_mxfp8_act_scaling,
             use_fused_finalize=self._use_fused_finalize,
             use_packed_weights=self._use_packed_weights,
             use_wfp4afp8_humming=self._use_wfp4afp8_humming,
@@ -960,11 +985,12 @@ class _CutlassRunnerBase(MoERunner):
             require_contiguous=True,
         )
 
-        view = weights.get_view(self.backend_key)
+        view = weights.get_view(self._weight_view_key or self.backend_key)
         missing = [key for key in self._required_weight_keys if key not in view]
         if missing:
             raise KeyError(
-                f"{self.backend_key} prepared weights are missing {missing}."
+                f"{self._weight_view_key or self.backend_key} prepared weights are "
+                f"missing {missing}."
             )
         weight_inputs = self._pack_weight_inputs(view, hidden_size)
         scale_inputs = self._pack_activation_scale_inputs(act)
@@ -1157,7 +1183,7 @@ class _CutlassRunnerBase(MoERunner):
             activation_type=self.config.activation.type,
             use_deepseek_fp8_block_scale=self._use_deepseek_fp8_block_scale,
             use_w4_group_scaling=self._use_w4_group_scaling,
-            use_mxfp8_act_scaling=self._use_mxfp8_act_scaling,
+            use_mxfp8_act_scaling=self._binding_use_mxfp8_act_scaling,
             use_packed_weights=self._use_packed_weights,
             use_wfp4afp8_humming=self._use_wfp4afp8_humming,
             use_fused_finalize=self._use_fused_finalize,
@@ -1858,6 +1884,21 @@ class CutlassHummingRunner(_CutlassRunnerBase):
             inputs[7].view(torch.int32),
             inputs[9],
         ]
+
+
+class CutlassHummingBlockScaleRunner(CutlassHummingRunner):
+    """Humming MXFP4 x MXFP8 variant with per-block (K group=32) activation scaling.
+
+    Identical online-quant contract, weight preparation, and quant-scale ABI as
+    :class:`CutlassHummingRunner`; the only difference is that the activation carries an internally
+    produced per-block dequant scale applied post-MMA (C++ Sm90Wfp4Afp8ScaleMode::kPostMmaMxfp8Act).
+    That extra scale requires no additional host tensor, so this runner reuses every Humming
+    packing/scale hook and only flips the binding-selection flag.
+    """
+
+    backend_key = "cutlass_humming_block_scale"
+    _weight_view_key = "cutlass_humming"
+    _use_wfp4afp8_humming_block_scale = True
 
 
 # ---------------------------------------------------------------------------

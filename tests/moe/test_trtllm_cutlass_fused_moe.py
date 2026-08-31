@@ -3248,15 +3248,21 @@ def test_moe_bf16_mxfp4_hopper_activations(
     list(PHASE3_HUMMING_E2E_CASES.items()),
     ids=list(PHASE3_HUMMING_E2E_CASES.keys()),
 )
-@pytest.mark.parametrize("use_autotune", [False, True])
+@pytest.mark.parametrize(
+    "use_autotune,use_act_block_scale",
+    [(False, False), (True, False), (False, True)],
+    ids=["default", "autotune", "act_block_scale"],
+)
 def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
-    case_name, case, use_autotune
+    case_name, case, use_autotune, use_act_block_scale
 ):
     if use_autotune and case.get("skip_autotune", False):
         pytest.skip(
             "autotune is covered by other Humming cases; "
             "this case only checks EP expert mapping"
         )
+    if use_act_block_scale and case["k"] % 256 != 0:
+        pytest.skip("SM90 activation block scale requires a TileK=256-compatible K")
     torch.manual_seed(case["seed"])
     device = torch.device("cuda")
     e, m, n, k, top_k = (
@@ -3417,6 +3423,7 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
             quant_scales=quant_scales,
             use_w4_group_scaling=True,
             use_wfp4afp8_humming=True,
+            use_mxfp8_act_scaling=use_act_block_scale,
             ep_size=ep_size,
             ep_rank=ep_rank,
             output=flash_output,
@@ -3437,31 +3444,79 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         batch_idx, nth_expert = torch.where(mask)
         w3_expert, w1_expert = torch.chunk(w1_ref[local_expert_id], 2, dim=0)
         x_rows = x_ref[batch_idx]
-        fc1_amax = x_rows.abs().amax(dim=1)
-        fc1_quant = torch.where(
-            fc1_amax > 0,
-            torch.full_like(fc1_amax, 448.0) / fc1_amax,
-            torch.ones_like(fc1_amax),
-        )
-        x_fp8_tensor = (x_rows * fc1_quant[:, None]).to(torch.float8_e4m3fn)
-        x_fp8 = x_fp8_tensor.to(torch.float32)
-        route_fc1_scale = (1.0 / fc1_quant) * fc1_residual_expert_scale[local_expert_id]
+        if use_act_block_scale:
+            x_groups = x_rows.reshape(x_rows.shape[0], -1, 32)
+            fc1_amax = x_groups.abs().amax(dim=2)
+            fc1_quant = torch.where(
+                fc1_amax > 0,
+                torch.full_like(fc1_amax, 448.0) / fc1_amax,
+                torch.ones_like(fc1_amax),
+            )
+            x_fp8 = (x_groups * fc1_quant[:, :, None]).to(torch.float8_e4m3fn)
+            fc1_dequant = torch.where(
+                fc1_amax > 0, fc1_amax / 448.0, torch.ones_like(fc1_amax)
+            ).to(torch.bfloat16)
+            x_fp8 = (
+                x_fp8.to(torch.float32) * fc1_dequant.float()[:, :, None]
+            ).reshape_as(x_rows)
+            route_fc1_scale = fc1_residual_expert_scale[local_expert_id]
+        else:
+            fc1_amax = x_rows.abs().amax(dim=1)
+            fc1_quant = torch.where(
+                fc1_amax > 0,
+                torch.full_like(fc1_amax, 448.0) / fc1_amax,
+                torch.ones_like(fc1_amax),
+            )
+            x_fp8_tensor = (x_rows * fc1_quant[:, None]).to(torch.float8_e4m3fn)
+            x_fp8 = x_fp8_tensor.to(torch.float32)
+            route_fc1_scale = (
+                1.0 / fc1_quant
+            ) * fc1_residual_expert_scale[local_expert_id]
         # FC1 token scale is applied in the GEMM epilogue before activation, so
         # both gated branches must be scaled before the SiLU/product.
-        fc1_w1 = (x_fp8 @ w1_expert.t()) * route_fc1_scale[:, None]
-        fc1_w3 = (x_fp8 @ w3_expert.t()) * route_fc1_scale[:, None]
+        fc1_scale = (
+            route_fc1_scale
+            if use_act_block_scale
+            else route_fc1_scale[:, None]
+        )
+        fc1_w1 = (x_fp8 @ w1_expert.t()) * fc1_scale
+        fc1_w3 = (x_fp8 @ w3_expert.t()) * fc1_scale
         fc1 = F.silu(fc1_w1) * fc1_w3
 
-        fc2_amax = fc1.abs().amax(dim=1)
-        fc2_quant = torch.where(
-            fc2_amax > 0,
-            torch.full_like(fc2_amax, 448.0) / fc2_amax,
-            torch.ones_like(fc2_amax),
+        if use_act_block_scale:
+            fc1_groups = fc1.reshape(fc1.shape[0], -1, 32)
+            fc2_amax = fc1_groups.abs().amax(dim=2)
+            fc2_quant = torch.where(
+                fc2_amax > 0,
+                torch.full_like(fc2_amax, 448.0) / fc2_amax,
+                torch.ones_like(fc2_amax),
+            )
+            fc1_fp8 = (fc1_groups * fc2_quant[:, :, None]).to(torch.float8_e4m3fn)
+            fc2_dequant = torch.where(
+                fc2_amax > 0, fc2_amax / 448.0, torch.ones_like(fc2_amax)
+            ).to(torch.bfloat16)
+            fc1_fp8 = (
+                fc1_fp8.to(torch.float32) * fc2_dequant.float()[:, :, None]
+            ).reshape_as(fc1)
+            route_fc2_scale = fc2_residual_expert_scale[local_expert_id]
+        else:
+            fc2_amax = fc1.abs().amax(dim=1)
+            fc2_quant = torch.where(
+                fc2_amax > 0,
+                torch.full_like(fc2_amax, 448.0) / fc2_amax,
+                torch.ones_like(fc2_amax),
+            )
+            fc1_fp8_tensor = (fc1 * fc2_quant[:, None]).to(torch.float8_e4m3fn)
+            fc1_fp8 = fc1_fp8_tensor.to(torch.float32)
+            route_fc2_scale = (
+                1.0 / fc2_quant
+            ) * fc2_residual_expert_scale[local_expert_id]
+        fc2_scale = (
+            route_fc2_scale
+            if use_act_block_scale
+            else route_fc2_scale[:, None]
         )
-        fc1_fp8_tensor = (fc1 * fc2_quant[:, None]).to(torch.float8_e4m3fn)
-        fc1_fp8 = fc1_fp8_tensor.to(torch.float32)
-        route_fc2_scale = (1.0 / fc2_quant) * fc2_residual_expert_scale[local_expert_id]
-        fc2 = (fc1_fp8 @ w2_ref[local_expert_id].t()) * route_fc2_scale[:, None]
+        fc2 = (fc1_fp8 @ w2_ref[local_expert_id].t()) * fc2_scale
         ref_output[batch_idx] += routing_weights[batch_idx, nth_expert, None] * fc2
 
     torch_ref_rtol, torch_ref_atol = case["torch_ref_tolerance"]

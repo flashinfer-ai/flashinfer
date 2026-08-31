@@ -68,7 +68,7 @@ void expandInputRowsKernelLauncher(
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, bool const swizzled_input_sf,
     void const* prequant_scales, float* fp8_token_dequant_scale,
     float const* fp8_expert_residual_scale, float const** fp8_token_scale_ptr_array,
-    bool enable_pdl, cudaStream_t stream);
+    __nv_bfloat16* act_block_scale_flat, bool enable_pdl, cudaStream_t stream);
 
 template <class OutputType, class GemmOutputType, class ScaleBiasType>
 void finalizeMoeRoutingKernelLauncher(

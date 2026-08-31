@@ -215,6 +215,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
       cutlass::epilogue::PtrArrayTmaWarpSpecializedCooperative>;  // Epilogue to launch
   constexpr bool use_fused_e8m0_scale =
       ScaleMode == cutlass::gemm::collective::MixedInputScaleMode::kPreMmaE8M0;
+  constexpr bool use_act_block_scale =
+      ScaleMode == cutlass::gemm::collective::MixedInputScaleMode::kPostMmaActBlockScale;
   constexpr bool use_single_warpgroup =
       KernelType == tkc::MainloopScheduleType::SINGLE_WARPGROUP_PREFILL ||
       KernelType == tkc::MainloopScheduleType::SINGLE_WARPGROUP_ROLLING;
@@ -277,14 +279,15 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
     fusion_args.token_scale_default = ElementAccumulator(1);
     fusion_args.token_scale_ptr_array = inputs.alpha_scales;
   } else {
-    fusion_args.alpha = use_mxfp4_weight ? 1 : 0;
+    constexpr bool use_epilogue_alpha = !use_mxfp4_weight || use_act_block_scale;
+    fusion_args.alpha = use_epilogue_alpha ? 0 : 1;
     fusion_args.beta = 0;
     fusion_args.alpha_ptr = nullptr;
     fusion_args.beta_ptr = nullptr;
-    fusion_args.alpha_ptr_array = use_mxfp4_weight ? nullptr : inputs.alpha_scales;
+    fusion_args.alpha_ptr_array = use_epilogue_alpha ? inputs.alpha_scales : nullptr;
     fusion_args.beta_ptr_array = nullptr;
     // One alpha and beta per each group
-    fusion_args.dAlpha = {cute::_0{}, cute::_0{}, use_mxfp4_weight ? 0 : 1};
+    fusion_args.dAlpha = {cute::_0{}, cute::_0{}, use_epilogue_alpha ? 1 : 0};
     fusion_args.dBeta = {cute::_0{}, cute::_0{}, use_mxfp4_weight ? 0 : 1};
   }
 
@@ -322,6 +325,16 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher_impl(
          reinterpret_cast<ElementD**>(hopper_inputs.ptr_d),
          reinterpret_cast<StrideD*>(hopper_inputs.stride_d)},
         hw_info};
+    // ptr_AS: per-block MXFP8 activation scale (bf16). Set by name (not positionally) because the
+    // trailing mainloop-Arguments field differs across collectives sharing this launcher (the
+    // prescale collective has no ptr_AS at this slot). The if constexpr is discarded for every
+    // legacy ScaleMode, so their Args are byte-identical; only the block-scaled collective, whose
+    // Arguments declares ptr_AS as NonVoidElementActivationScale (bf16), compiles this line.
+    if constexpr (use_act_block_scale) {
+      arguments.mainloop.ptr_AS =
+          reinterpret_cast<decltype(arguments.mainloop.ptr_AS)>(
+              hopper_inputs.int4_groupwise_params.ptr_act_block_scale);
+    }
   }
 
   // Optimize tile scheduling for better L2 locality

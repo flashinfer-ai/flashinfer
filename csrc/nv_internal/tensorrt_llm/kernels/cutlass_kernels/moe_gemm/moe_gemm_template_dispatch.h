@@ -600,9 +600,11 @@ MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType, IsMXFPX,
   int const enable_hopper = sm == 90 ? CutlassGemmConfig::HOPPER : CutlassGemmConfig::NONE;
   static constexpr auto fp8_only_flag =
       use_fp8 ? CutlassGemmConfig::FP8_ONLY : CutlassGemmConfig::NONE;
-  static constexpr auto fp4_only_flag = (use_fp4 || (use_wfp4afp8 && !use_sm90_humming_pre_mma))
-                                            ? CutlassGemmConfig::FP4_ONLY
-                                            : CutlassGemmConfig::NONE;
+  static constexpr auto fp4_only_flag =
+      (use_fp4 || (use_wfp4afp8 &&
+                   Sm90Wfp4Afp8Mode == Sm90Wfp4Afp8ScaleMode::kPostMmaFp8Act))
+          ? CutlassGemmConfig::FP4_ONLY
+          : CutlassGemmConfig::NONE;
   static constexpr auto fp8fp4_mixed_flag =
       use_wfp4afp8 ? CutlassGemmConfig::FP8FP4_MIXED : CutlassGemmConfig::NONE;
   auto config_type_param = static_cast<CutlassGemmConfig::CandidateConfigTypeParam>(

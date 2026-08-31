@@ -257,6 +257,18 @@ struct CollectiveBuilderMixedInput<
                                    cute::is_same_v<ElementB, cutlass::float_e4m3_t>),
       "Pre-MMA E8M0 scale mode is only implemented for grouped MXFP4 weight x FP8 activation.");
 
+  // Per-block (K group=32) activation-scale mode: MXFP4 weight x MXFP8 activation only. The gate is
+  // threaded to the collective as a trailing type parameter (bf16 = enabled, void = disabled); every
+  // other ScaleMode keeps it void so legacy instantiations are byte-identical.
+  static constexpr bool UseActBlockScale = ScaleMode == MixedInputScaleMode::kPostMmaActBlockScale;
+  static_assert(
+      !UseActBlockScale || (IsArrayOfPointersGemm && IsATransformed &&
+                            cute::is_same_v<ElementA, cutlass::float_e2m1_t> &&
+                            cute::is_same_v<ElementB, cutlass::float_e4m3_t>),
+      "Post-MMA per-block activation scale is only implemented for grouped MXFP4 weight x FP8 "
+      "activation.");
+  using ElementActivationScale = cute::conditional_t<UseActBlockScale, cutlass::bfloat16_t, void>;
+
   using ArrayMixedInputDispatchPolicy =
       cute::conditional_t<UseFusedE8M0PreMmaScale,
                           MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInputPreScale<
@@ -290,7 +302,7 @@ struct CollectiveBuilderMixedInput<
       CollectiveMmaArrayMixedInput<DispatchPolicy, TileShape_MNK, ElementPairA, StrideA,
                                    ElementPairB, StrideB, TiledMma, GmemTiledCopyA, SmemLayoutAtomA,
                                    SmemCopyAtomA, cute::identity, GmemTiledCopyB, SmemLayoutAtomB,
-                                   SmemCopyAtomB, cute::identity>;
+                                   SmemCopyAtomB, cute::identity, ElementActivationScale>;
 
   static_assert(SmemAlignment == static_cast<int>(cute::max(CollectiveOp::SmemAlignmentA,
                                                             CollectiveOp::SmemAlignmentB)));
