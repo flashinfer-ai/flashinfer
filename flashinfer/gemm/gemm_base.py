@@ -5828,12 +5828,11 @@ def mm_mxfp8(
 
     tuner = AutoTuner.get()
 
-    if backends == ["cute-dsl"]:
-        tuning_config = _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
-    elif backends == ["trtllm"]:
-        tuning_config = _MM_MXFP8_TUNING_CONFIG
-    else:
-        tuning_config = _MM_MXFP8_TUNING_CONFIG
+    tuning_config = (
+        _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
+        if backends == ["cute-dsl"]
+        else _MM_MXFP8_TUNING_CONFIG
+    )
 
     inputs = [
         a,

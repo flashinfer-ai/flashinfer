@@ -311,11 +311,11 @@ def test_mm_mxfp8_dynamic_quant_offers_both_layouts(
     real_quantize = gemm_base.mxfp8_quantize
 
     def recording_quantize(
-        input: torch.Tensor,
+        tensor: torch.Tensor,
         **kwargs: Any,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         quantized_layouts.append(kwargs["sf_swizzle_layout"])
-        return real_quantize(input, **kwargs)
+        return real_quantize(tensor, **kwargs)
 
     monkeypatch.setattr(gemm_base, "mxfp8_quantize", recording_quantize)
 
