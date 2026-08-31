@@ -422,7 +422,7 @@ def test_alpha_absent_requires_output_and_requested_final_state_recurrences(
 @pytest.mark.parametrize("io_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("use_qk_l2norm_in_kernel", [False, True])
 @pytest.mark.parametrize("output_final_state", [False, True])
-def test_explicit_alpha_preserves_existing_recurrence_policy(
+def test_explicit_alpha_recomputes_requested_bf16_final_state(
     io_dtype: torch.dtype,
     use_qk_l2norm_in_kernel: bool,
     output_final_state: bool,
@@ -435,7 +435,8 @@ def test_explicit_alpha_preserves_existing_recurrence_policy(
     )
 
     assert needs_final_state is (
-        output_final_state and use_qk_l2norm_in_kernel
+        output_final_state
+        and (use_qk_l2norm_in_kernel or io_dtype == torch.bfloat16)
     )
     assert needs_output is (
         io_dtype == torch.bfloat16 and not use_qk_l2norm_in_kernel

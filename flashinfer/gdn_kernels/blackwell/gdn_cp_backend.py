@@ -286,10 +286,12 @@ def _recurrence_requirements(
     use_qk_l2norm_in_kernel: bool,
     output_final_state: bool,
 ) -> tuple[bool, bool, int]:
-    """Resolve semantic recurrence launches without changing explicit-alpha paths."""
+    """Resolve semantic recurrence launches, including BF16 state repair."""
 
     needs_final_state = output_final_state and (
-        alpha_was_none or use_qk_l2norm_in_kernel
+        alpha_was_none
+        or use_qk_l2norm_in_kernel
+        or io_dtype == torch.bfloat16
     )
     needs_output = alpha_was_none or (
         io_dtype == torch.bfloat16 and not use_qk_l2norm_in_kernel
