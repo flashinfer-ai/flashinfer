@@ -33,6 +33,19 @@ from . import kda_decode as _kda_decode
 from . import kda_prefill as _kda_prefill
 from . import kda_prefill_cute as _kda_prefill_cute
 from .api_logging import flashinfer_api
+from .kda_backward import (
+    RecurrentKDABackwardWorkspace as RecurrentKDABackwardWorkspace,
+)
+from .kda_backward import recurrent_kda_backward as recurrent_kda_backward
+from .kda_training import (
+    RecurrentKDATrainingContext as RecurrentKDATrainingContext,
+)
+from .kda_training import (
+    recurrent_kda_training_backward as recurrent_kda_training_backward,
+)
+from .kda_training import (
+    recurrent_kda_training_forward as recurrent_kda_training_forward,
+)
 from .trace.templates.kda import recurrent_kda_trace
 from .utils import get_compute_capability
 
@@ -80,8 +93,17 @@ def recurrent_kda(
     multi-token prefill uses the architecture-specific CuTe DSL backend. On
     SM100a (B200/GB200) and SM103a (B300/GB300), the FlashKDA-compatible subset
     can use either the frozen Cake schedules or the source-level CuTe DSL BT=16
-    kernel. ``backend="auto"`` prefers CuTe DSL for supported plain prefill
-    contracts and keeps Cake as the feature-complete fallback.
+    kernel. The Cake backend includes a generated two-stage BT=16
+    prepare/chain portfolio with device- and shape-specific S7/S8/S9 pipeline
+    selection. ``backend="auto"`` prefers CuTe DSL for supported plain prefill
+    contracts and keeps Cake as the feature-complete fallback; use
+    ``backend="cake"`` to select and benchmark the generated portfolio
+    explicitly.
+    Compatible equal-head D128 unbounded-softplus T=1 decode calls use their
+    frozen Cake specialization automatically. The Cake path accepts any
+    positive runtime head count, so Kimi-Linear tensor parallelism maps global
+    H32 to per-rank H32/H16/H8/H4 without an adapter. Other decode and
+    speculative-decode calls retain the CuTe DSL backend.
 
     Args:
         q (torch.Tensor):
@@ -131,7 +153,9 @@ def recurrent_kda(
             ``g``. Default: ``False``.
         lower_bound (Optional[float]):
             If set, uses ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
-            gate formula instead of softplus. Must be negative.
+            gate formula. If ``None``, uses
+            ``-exp(A_log) * softplus(g + dt_bias)``. A supplied bound must be
+            negative.
         cu_seqlens (Optional[torch.Tensor]):
             Contiguous CUDA cumulative sequence lengths of shape ``[N+1]``.
             May be int32 or int64. Frozen prefill converts int32 offsets to
@@ -183,9 +207,10 @@ def recurrent_kda(
             in one wave. CUDA Graph capture of a packed CuTe DSL engine call
             requires an explicit plan prepared with
             :class:`RecurrentKDAPrefillWrapper`. Cake constructs and caches its
-            own eager host metadata. On Cake, supplying an order keeps the direct
-            schedule so caller-owned ordering is not replaced by persistent task
-            bins.
+            own eager host metadata. On Cake, supplying an order disables
+            persistent host task-bin planning but does not force direct M128;
+            the selected non-persistent route may still be BT16 prepare/chain,
+            M64, small-BH, or direct according to the input shape.
             Fixed-layout prefill and decode calls must leave it as ``None``.
         prefill_workspace (Optional[RecurrentKDAPrefillWorkspace]):
             Caller-owned workspace for SM100-family and SM120 prefill backends.
@@ -193,28 +218,39 @@ def recurrent_kda(
             capture. Warm it eagerly with the exact tensors on the capture
             stream before capture. Use one workspace per captured
             ``recurrent_kda`` invocation. Explicit workspaces and CUDA Graph
-            capture use direct/M64 schedules; persistent task planning is an
+            capture use non-persistent schedules, including eligible BT16,
+            M64, small-BH, and direct routes. Persistent task planning is an
             eager-only B200/GB200 route because its bins depend on host-visible
             sequence lengths.
         state_checkpoints (Optional[torch.Tensor]):
             Caller-owned BF16 checkpoint output ``[C, H, 128, 128]`` for
             frozen prefill. Row zero for each sequence is its initial state;
             later rows are the states before token blocks beginning at
-            ``N, 2N, ...``. Required when ``checkpoint_every_n_tokens > 0``.
+            ``N, 2N, ...``. ``C`` must be at least
+            ``checkpoint_cu_starts[N_seq]``; this capacity contract is not
+            host-validated. Required when ``checkpoint_every_n_tokens > 0``.
         checkpoint_cu_starts (Optional[torch.Tensor]):
             Contiguous CUDA int64 cumulative checkpoint counts ``[N_seq+1]``.
-            Each count must equal ``ceil(seq_len / checkpoint_every_n_tokens)``.
+            The first value must be zero, and each consecutive difference must
+            equal ``ceil(seq_len / checkpoint_every_n_tokens)`` for that
+            sequence.
         checkpoint_every_n_tokens (int):
             Checkpoint interval. Zero disables checkpoints; a positive value
-            must be divisible by 32. SGLang normally uses 64 or a larger
-            cache-page-aligned multiple.
+            must be divisible by 32, except that the SM100-family exact-N16
+            frozen route also accepts multiples of 16. SGLang normally uses
+            64 or a larger cache-page-aligned multiple.
         backend (Literal["auto", "cute-dsl", "cake"]):
             Implementation backend. ``"auto"`` selects the architecture-
             appropriate CuTe DSL kernel for supported ordinary multi-token
             prefill, including the SM120 backend and SM100-family state
             checkpoints, and otherwise falls back to an exported frozen Cake
             specialization.
-            ``"cake"`` and ``"cute-dsl"`` select those backends strictly.
+            ``"cake"`` and ``"cute-dsl"`` select those backends strictly. The
+            Cake prefill path chooses among direct, persistent, small-BH, and
+            two-stage BT16 schedules from the input shape and physical device.
+            The SM100-family kernel additionally needs
+            ``nvidia-cutlass-dsl>=4.7``; below that ``"auto"`` uses Cake there
+            and ``"cute-dsl"`` raises :class:`ImportError`.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -328,6 +364,11 @@ def recurrent_kda(
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
         )
         if backend == "cute-dsl" and not cute_dsl_eligible:
+            if _kda_prefill_cute._is_cute_dsl_kda_prefill_dsl_too_old(q):
+                raise ImportError(
+                    "backend='cute-dsl' requires nvidia-cutlass-dsl>=4.7.0 "
+                    "(cutlass.experimental); backend='auto' falls back to Cake"
+                )
             raise ValueError(
                 "backend='cute-dsl' does not support this recurrent_kda "
                 "prefill contract"
@@ -392,7 +433,6 @@ def recurrent_kda(
     if use_flash_kda_prefill:
         assert A_log is not None
         assert dt_bias is not None
-        assert lower_bound is not None
         return _kda_prefill._run_flash_kda_prefill(
             q=q,
             k=k,
@@ -413,7 +453,6 @@ def recurrent_kda(
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            backend="cake",
         )
 
     if backend == "cake" and is_plain_prefill:
@@ -466,7 +505,7 @@ def recurrent_kda(
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
-        backend="cake" if backend == "cake" else "cute-dsl",
+        backend=backend,
     )
 
 

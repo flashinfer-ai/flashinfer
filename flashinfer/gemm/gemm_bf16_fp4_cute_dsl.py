@@ -606,7 +606,6 @@ _SM100_BF16_FP4_KERNEL_CACHE: Dict[Tuple, object] = {}
 
 _SM100_BF16_FP4_N_TILES = (8, 16, 32, 64, 128, 192)
 _SM100_BF16_FP4_K_TILE = 256
-_SM100_BF16_FP4_RASTER_ALONG_M = True
 
 
 def _sm100_bf16_fp4_tactic_configs() -> List[Tuple]:
@@ -627,13 +626,14 @@ def _sm100_bf16_fp4_tactic_configs() -> List[Tuple]:
                 continue
             if route_tile == 192 and gemm_m == 128:
                 continue
-            tactics.append(
-                (
-                    (gemm_m, route_tile, _SM100_BF16_FP4_K_TILE),
-                    cluster_shape_mn,
-                    _SM100_BF16_FP4_RASTER_ALONG_M,
+            for raster_along_m in (True, False):
+                tactics.append(
+                    (
+                        (gemm_m, route_tile, _SM100_BF16_FP4_K_TILE),
+                        cluster_shape_mn,
+                        raster_along_m,
+                    )
                 )
-            )
     return tactics
 
 
@@ -717,7 +717,7 @@ def _get_sm100_bf16_fp4_kernel(
         k,
         max_active_clusters=max_active_clusters,
         stream=stream,
-        options="--opt-level 2 --enable-tvm-ffi",
+        options="--opt-level 3 --enable-tvm-ffi",
     )
     _SM100_BF16_FP4_KERNEL_CACHE[cache_key] = compiled
     return compiled
