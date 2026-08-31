@@ -62,6 +62,11 @@ DECLARE_COMBINE_TOP_K(22)
 
 #undef DECLARE_COMBINE_TOP_K
 
+extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6(
+    uint8_t*, uint8_t*, unsigned long long, unsigned long long, unsigned long long,
+    unsigned long long, unsigned long long, unsigned long long, int, int, int, int, int, int, int,
+    int, bool, bool, bool, bool, unsigned long long);
+
 extern "C" __global__ void kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8(
     uint8_t*, uint8_t*, unsigned long long, unsigned long long, unsigned long long,
     unsigned long long, int, int, int, int, int, int, int, bool, bool);
@@ -170,6 +175,11 @@ bool useBf16TopK8Combine(MoeA2ACombineParams const& params) {
          params.elements_per_token % 8 == 0;
 }
 
+bool useBf16TopK6Combine(MoeA2ACombineParams const& params) {
+  return params.top_k == 6 && params.dtype == nvinfer1::DataType::kBF16 &&
+         params.elements_per_token % 8 == 0;
+}
+
 uint8_t* localWorkspace(uint8_t* workspace, uint64_t stride, int rank) {
   return workspace + static_cast<uint64_t>(rank) * stride;
 }
@@ -238,13 +248,20 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
   FLASHINFER_CHECK(params.workspace != nullptr, "workspace must be defined");
+  bool const fuse_topk6_publication =
+      useBf16TopK6Combine(params) && params.prepare_payload != nullptr;
   // CUDA lazy module loading may synchronize the device. Load every downstream
   // function before publication can enter its cross-rank wait.
   preloadKernel("mnnvl_moe_alltoall_stage_combine",
                 kernel_flashinfer_mnnvl_moe_alltoall_stage_combine);
-  preloadKernel("mnnvl_moe_alltoall_publish_combine",
-                kernel_flashinfer_mnnvl_moe_alltoall_publish_combine);
-  if (useBf16TopK8Combine(params)) {
+  if (!fuse_topk6_publication) {
+    preloadKernel("mnnvl_moe_alltoall_publish_combine",
+                  kernel_flashinfer_mnnvl_moe_alltoall_publish_combine);
+  }
+  if (useBf16TopK6Combine(params)) {
+    preloadKernel("mnnvl_moe_alltoall_combine_bf16_topk6",
+                  kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6);
+  } else if (useBf16TopK8Combine(params)) {
     preloadKernel("mnnvl_moe_alltoall_combine_bf16_topk8",
                   kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8);
   } else {
@@ -285,13 +302,17 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   uint64_t const flag_offset = byteOffset(params.flag_val, rank_workspace);
   uint64_t const completion_offset =
       byteOffset(params.completion_flags[params.ep_rank], rank_workspace);
+  bool const fuse_topk6_publication =
+      useBf16TopK6Combine(params) && params.prepare_payload != nullptr;
 
-  launchWithPdlWhenEnabled("mnnvl_moe_alltoall_publish_combine", params.enable_pdl,
-                           kernel_flashinfer_mnnvl_moe_alltoall_publish_combine, 1,
-                           kPublicationThreads, 0, params.stream, params.workspace,
-                           params.workspace_stride_bytes, flag_offset, completion_offset, false,
-                           params.ep_rank, params.ep_size, params.enable_pdl,
-                           params.enable_rank_mask, params.active_rank_mask[0]);
+  if (!fuse_topk6_publication) {
+    launchWithPdlWhenEnabled("mnnvl_moe_alltoall_publish_combine", params.enable_pdl,
+                             kernel_flashinfer_mnnvl_moe_alltoall_publish_combine, 1,
+                             kPublicationThreads, 0, params.stream, params.workspace,
+                             params.workspace_stride_bytes, flag_offset, completion_offset, false,
+                             params.ep_rank, params.ep_size, params.enable_pdl,
+                             params.enable_rank_mask, params.active_rank_mask[0]);
+  }
 
   bool const quantized = params.quant_mode != MoeA2ACombineQuantMode::NONE;
   void* accumulation = params.local_num_tokens == 0
@@ -300,7 +321,23 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params) {
   FLASHINFER_CHECK(accumulation != nullptr, "combine accumulation output must be defined");
   int const output_dtype_code = params.use_low_precision ? kDTypeBFloat16 : dtypeCode(params.dtype);
   int const grid = std::max(params.local_num_tokens, 1);
-  if (useBf16TopK8Combine(params)) {
+  if (useBf16TopK6Combine(params)) {
+    dim3 const topk6_grid(
+        static_cast<unsigned int>(grid),
+        static_cast<unsigned int>(ceilDiv(params.elements_per_token, kCombineThreads * 8)), 1);
+    launchWithPdlWhenEnabled(
+        "mnnvl_moe_alltoall_combine_bf16_topk6", params.enable_pdl,
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6, topk6_grid, kCombineThreads, 0,
+        params.stream, params.workspace, static_cast<uint8_t*>(accumulation),
+        params.workspace_stride_bytes, flag_offset, completion_offset,
+        byteOffset(params.topk_target_ranks, rank_workspace),
+        byteOffset(params.topk_send_indices, rank_workspace),
+        byteOffset(params.recv_buffers[params.ep_rank], rank_workspace), params.max_tokens_per_rank,
+        params.local_num_tokens, params.elements_per_token, dtypeBytes(params.dtype),
+        dtypeCode(params.dtype), output_dtype_code, params.ep_rank, params.ep_size,
+        params.use_low_precision, params.enable_pdl, fuse_topk6_publication,
+        params.enable_rank_mask, params.active_rank_mask[0]);
+  } else if (useBf16TopK8Combine(params)) {
     launchWithPdlWhenEnabled(
         "mnnvl_moe_alltoall_combine_bf16_topk8", params.enable_pdl,
         kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8, grid, kCombineThreads, 0,

@@ -81,6 +81,7 @@ COMBINE_PARAMS = [
     # Coverage for popular model specifications
     (4, 16, 4096, 2, torch.bfloat16, True),  # Mixtral-8x7B
     (4, 16, 2880, 4, torch.bfloat16, True),  # GPT-OSS-120B
+    (4, 16, 4096, 6, torch.bfloat16, True),  # DeepSeek-V4-Flash
     (8, 16, 5120, 6, torch.bfloat16, True),  # DeepSeek-V2
     (8, 16, 7168, 8, torch.bfloat16, True),  # DeepSeek-V3
     (8, 16, 4096, 8, torch.bfloat16, True),  # Qwen3-235B-A22B

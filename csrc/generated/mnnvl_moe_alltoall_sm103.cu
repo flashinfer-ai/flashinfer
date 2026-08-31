@@ -150,7 +150,76 @@ __global__ __launch_bounds__(256) void kernel_flashinfer_mnnvl_moe_alltoall_disp
     asm volatile("griddepcontrol.wait;" ::: "memory");
   }
   if (local_num_tokens > 0) {
-    if (tid == 0) {
+    if (top_k == 6) {
+      if (warp == 0) {
+        int route = lane;
+        int target_rank = -1;
+        if (route < 6) {
+          int ep_base = num_experts / ep_size;
+          int ep_remainder = num_experts - ep_base * ep_size;
+          int split = ep_remainder * (ep_base + 1);
+          int route_base = local_token_idx * 6;
+          int expert_id = token_selected_experts[route_base + route];
+          target_rank = 0;
+          if (ep_remainder == 0) {
+            target_rank = expert_id / ep_base;
+          } else if (expert_id < split) {
+            target_rank = expert_id / (ep_base + 1);
+          } else {
+            target_rank = ep_remainder + (expert_id - split) / ep_base;
+          }
+        }
+        int prior_rank_0 = __shfl_sync(0xFFFFFFFF, target_rank, 0);
+        int prior_rank_1 = __shfl_sync(0xFFFFFFFF, target_rank, 1);
+        int prior_rank_2 = __shfl_sync(0xFFFFFFFF, target_rank, 2);
+        int prior_rank_3 = __shfl_sync(0xFFFFFFFF, target_rank, 3);
+        int prior_rank_4 = __shfl_sync(0xFFFFFFFF, target_rank, 4);
+        int first_for_rank = ((route < 6) ? 1 : 0);
+        if (route > 0 && target_rank == prior_rank_0) {
+          first_for_rank = 0;
+        }
+        if (route > 1 && target_rank == prior_rank_1) {
+          first_for_rank = 0;
+        }
+        if (route > 2 && target_rank == prior_rank_2) {
+          first_for_rank = 0;
+        }
+        if (route > 3 && target_rank == prior_rank_3) {
+          first_for_rank = 0;
+        }
+        if (route > 4 && target_rank == prior_rank_4) {
+          first_for_rank = 0;
+        }
+        int stored_rank = -1;
+        int send_index = -1;
+        if (route < 6) {
+          unsigned long long rank_bit_one = 1;
+          unsigned long long target_bit = rank_bit_one << (unsigned long long)target_rank;
+          int rank_is_active = 1;
+          if (enable_rank_mask) {
+            rank_is_active = (((active_rank_mask & target_bit) != 0) ? 1 : 0);
+          }
+          if (first_for_rank != 0 && rank_is_active != 0) {
+            unsigned long long send_counter_index =
+                (local_workspace_base + send_counters_offset) / 4 +
+                (unsigned long long)target_rank;
+            int _atomic_old_0 = atomicAdd(&workspace_i32[send_counter_index], 1);
+            send_index = _atomic_old_0;
+            stored_rank = target_rank;
+          }
+          unsigned long long topk_workspace_base =
+              (local_workspace_base + topk_target_ranks_offset) / 4 +
+              (unsigned long long)local_token_idx * 6;
+          unsigned long long send_index_workspace_base =
+              (local_workspace_base + topk_send_indices_offset) / 4 +
+              (unsigned long long)local_token_idx * 6;
+          smem_target_ranks[route] = stored_rank;
+          smem_send_indices[route] = send_index;
+          workspace_i32[topk_workspace_base + (unsigned long long)route] = stored_rank;
+          workspace_i32[send_index_workspace_base + (unsigned long long)route] = send_index;
+        }
+      }
+    } else if (tid == 0) {
       int ep_base = num_experts / ep_size;
       int ep_remainder = num_experts - ep_base * ep_size;
       int split = ep_remainder * (ep_base + 1);
@@ -2621,6 +2690,250 @@ __global__ __launch_bounds__(256) void kernel_flashinfer_mnnvl_moe_alltoall_comb
 #undef NUM_MAIN_STAGES
 #undef THREADS
 #undef TOP_K
+
+#define FLASHINFER_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define THREADS 256
+
+extern "C" {
+
+__global__ __launch_bounds__(256) void kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6(
+    uint8_t* __restrict__ workspace, uint8_t* __restrict__ output,
+    unsigned long long workspace_stride_bytes, unsigned long long flag_val_offset,
+    unsigned long long completion_flags_offset, unsigned long long topk_target_ranks_offset,
+    unsigned long long topk_send_indices_offset, unsigned long long combine_payload_offset,
+    int max_tokens_per_rank, int local_num_tokens, int elements_per_token,
+    int payload_element_bytes, int payload_dtype_code, int output_dtype_code, int ep_rank,
+    int ep_size, bool use_low_precision, bool enable_pdl, bool fuse_publication,
+    bool enable_rank_mask, unsigned long long active_rank_mask) {
+  const int tid = threadIdx.x;
+  const int warp = make_warp_uniform(tid / 32);
+  const int lane = tid % 32;
+
+  const int bid = blockIdx.x;
+  const int num_bids = gridDim.x;
+
+  // === Task calls (dependency order) ===
+  if (enable_pdl) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+  }
+  int* workspace_i32 = reinterpret_cast<int*>(workspace);
+  __nv_bfloat16* workspace_bf16 = reinterpret_cast<__nv_bfloat16*>(workspace);
+  __nv_bfloat16* output_bf16 = reinterpret_cast<__nv_bfloat16*>(output);
+  unsigned long long local_workspace_base = (unsigned long long)ep_rank * workspace_stride_bytes;
+  if (fuse_publication) {
+    unsigned int* workspace_u32 = reinterpret_cast<unsigned int*>(workspace);
+    unsigned long long expected_index = (local_workspace_base + flag_val_offset) / 4;
+    unsigned int expected_value = workspace_u32[expected_index];
+    if (bid == 0) {
+      if (tid < 32) {
+        asm volatile("fence.release.sys;" ::: "memory");
+#pragma unroll 1
+        for (int target_rank = lane; target_rank < ep_size; target_rank += 32) {
+          int target_is_active = 1;
+          if (enable_rank_mask) {
+            unsigned long long target_bit = active_rank_mask >> (unsigned long long)target_rank & 1;
+            target_is_active = ((target_bit != 0) ? 1 : 0);
+          }
+          if (target_is_active != 0) {
+            unsigned long long remote_flag_index =
+                ((unsigned long long)target_rank * workspace_stride_bytes +
+                 completion_flags_offset) /
+                    4 +
+                (unsigned long long)ep_rank;
+            asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"((
+                             reinterpret_cast<unsigned int*>(workspace_u32) + (remote_flag_index))),
+                         "r"(static_cast<unsigned int>(expected_value))
+                         : "memory");
+          }
+        }
+      }
+    }
+    if (tid < 32) {
+#pragma unroll 1
+      for (int peer_rank = lane; peer_rank < ep_size; peer_rank += 32) {
+        int peer_is_active = 1;
+        if (enable_rank_mask) {
+          unsigned long long peer_bit = active_rank_mask >> (unsigned long long)peer_rank & 1;
+          peer_is_active = ((peer_bit != 0) ? 1 : 0);
+        }
+        if (peer_is_active != 0) {
+          unsigned long long local_flag_index =
+              (local_workspace_base + completion_flags_offset) / 4 + (unsigned long long)peer_rank;
+          {
+            unsigned int* _sre_ptr_0 =
+                (reinterpret_cast<unsigned int*>(workspace_u32) + (local_flag_index));
+            const unsigned int _sre_expected_0 = static_cast<unsigned int>(expected_value);
+            const unsigned long long _sre_start_0 = clock64();
+            bool _sre_matched_0 = false;
+            do {
+              unsigned int _sre_value_0;
+              asm volatile("ld.relaxed.sys.u32 %0, [%1];"
+                           : "=r"(_sre_value_0)
+                           : "l"(_sre_ptr_0)
+                           : "memory");
+              _sre_matched_0 = (_sre_value_0 == _sre_expected_0);
+            } while (!_sre_matched_0 &&
+                     ((clock64() - _sre_start_0) <= static_cast<unsigned long long>(600000000000)));
+            if (__builtin_expect(!_sre_matched_0, 0)) {
+              asm volatile("trap;");
+              return;
+            }
+          }
+        }
+      }
+      asm volatile("fence.acquire.sys;" ::: "memory");
+    }
+    __syncthreads();
+  }
+  int token = bid;
+  if (token < local_num_tokens) {
+    unsigned long long target_base =
+        (local_workspace_base + topk_target_ranks_offset) / 4 + (unsigned long long)token * 6;
+    unsigned long long send_base =
+        (local_workspace_base + topk_send_indices_offset) / 4 + (unsigned long long)token * 6;
+#pragma unroll 1
+    for (int column = tid * 8; column < elements_per_token; column += 2048) {
+      float contributions[48];
+      contributions[0] = 0.0f;
+      contributions[1] = 0.0f;
+      contributions[2] = 0.0f;
+      contributions[3] = 0.0f;
+      contributions[4] = 0.0f;
+      contributions[5] = 0.0f;
+      contributions[6] = 0.0f;
+      contributions[7] = 0.0f;
+      contributions[8] = 0.0f;
+      contributions[9] = 0.0f;
+      contributions[10] = 0.0f;
+      contributions[11] = 0.0f;
+      contributions[12] = 0.0f;
+      contributions[13] = 0.0f;
+      contributions[14] = 0.0f;
+      contributions[15] = 0.0f;
+      contributions[16] = 0.0f;
+      contributions[17] = 0.0f;
+      contributions[18] = 0.0f;
+      contributions[19] = 0.0f;
+      contributions[20] = 0.0f;
+      contributions[21] = 0.0f;
+      contributions[22] = 0.0f;
+      contributions[23] = 0.0f;
+      contributions[24] = 0.0f;
+      contributions[25] = 0.0f;
+      contributions[26] = 0.0f;
+      contributions[27] = 0.0f;
+      contributions[28] = 0.0f;
+      contributions[29] = 0.0f;
+      contributions[30] = 0.0f;
+      contributions[31] = 0.0f;
+      contributions[32] = 0.0f;
+      contributions[33] = 0.0f;
+      contributions[34] = 0.0f;
+      contributions[35] = 0.0f;
+      contributions[36] = 0.0f;
+      contributions[37] = 0.0f;
+      contributions[38] = 0.0f;
+      contributions[39] = 0.0f;
+      contributions[40] = 0.0f;
+      contributions[41] = 0.0f;
+      contributions[42] = 0.0f;
+      contributions[43] = 0.0f;
+      contributions[44] = 0.0f;
+      contributions[45] = 0.0f;
+      contributions[46] = 0.0f;
+      contributions[47] = 0.0f;
+#pragma unroll
+      for (int route = 0; route < 6; route++) {
+        int target_rank_1 = workspace_i32[target_base + (unsigned long long)route];
+        int send_index = workspace_i32[send_base + (unsigned long long)route];
+        if (target_rank_1 >= 0 && send_index >= 0) {
+          unsigned long long payload_item =
+              ((unsigned long long)ep_rank * (unsigned long long)max_tokens_per_rank +
+               (unsigned long long)send_index) *
+                  (unsigned long long)elements_per_token +
+              (unsigned long long)column;
+          unsigned long long byte_index =
+              (unsigned long long)target_rank_1 * workspace_stride_bytes + combine_payload_offset +
+              payload_item * (unsigned long long)payload_element_bytes;
+          float _vec_load_0[8];
+          {
+            const uint4* _vptr_1 = reinterpret_cast<const uint4*>(workspace_bf16 + byte_index / 2);
+            uint4 _vld_1[1];
+#pragma unroll
+            for (int _blk = 0; _blk < 1; _blk++) {
+              _vld_1[_blk] = _vptr_1[_blk];
+              uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
+#pragma unroll
+              for (int _pair = 0; _pair < 4; _pair++) {
+                asm volatile(
+                    "{\n\t"
+                    "shl.b32 %0, %2, 16;\n\t"
+                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                    "}\n"
+                    : "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[0]),
+                      "=f"((&_vec_load_0[0 + _blk * 8 + _pair * 2])[1])
+                    : "r"(_vpairs_1[_pair]));
+              }
+            }
+          }
+#pragma unroll
+          for (int element = 0; element < 8; element++) {
+            float value = _vec_load_0[element];
+            if (use_low_precision) {
+              float _fp8_rt_0;
+              uint16_t _e4m3x2_2;
+              uint32_t _f16x2_2;
+              asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;"
+                           : "=h"(_e4m3x2_2)
+                           : "f"(0.0f), "f"(value));
+              asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_2) : "h"(_e4m3x2_2));
+              uint16_t _fp8_h0_2 = (uint16_t)(_f16x2_2 & 0xFFFFu);
+              asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_2));
+              value = _fp8_rt_0;
+            }
+            contributions[route * 8 + element] = value;
+          }
+        }
+      }
+#pragma unroll
+      for (int element_1 = 0; element_1 < 8; element_1++) {
+        contributions[element_1] = contributions[element_1] + contributions[8 + element_1];
+        contributions[16 + element_1] =
+            contributions[16 + element_1] + contributions[24 + element_1];
+        contributions[32 + element_1] =
+            contributions[32 + element_1] + contributions[40 + element_1];
+        contributions[element_1] = contributions[element_1] + contributions[16 + element_1];
+        contributions[element_1] = contributions[element_1] + contributions[32 + element_1];
+      }
+      {
+        __nv_bfloat162 _pk[4];
+        _pk[0] = __floats2bfloat162_rn(contributions[0 + 0], contributions[0 + 1]);
+        _pk[1] = __floats2bfloat162_rn(contributions[0 + 2], contributions[0 + 3]);
+        _pk[2] = __floats2bfloat162_rn(contributions[0 + 4], contributions[0 + 5]);
+        _pk[3] = __floats2bfloat162_rn(contributions[0 + 6], contributions[0 + 7]);
+        *reinterpret_cast<uint4*>(
+            &((__nv_bfloat16*)(output_bf16 +
+                               ((unsigned long long)token * (unsigned long long)elements_per_token +
+                                (unsigned long long)column)))[0]) =
+            *reinterpret_cast<uint4*>(&_pk[0]);
+      }
+    }
+  }
+  if (enable_pdl) {
+    if (warp == 0) {
+      if (elect_sync()) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+      }
+    }
+  }
+}
+
+}  // extern "C"
+
+#undef FLASHINFER_INF
+#undef NUM_MAIN_STAGES
+#undef THREADS
 
 #define FLASHINFER_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1

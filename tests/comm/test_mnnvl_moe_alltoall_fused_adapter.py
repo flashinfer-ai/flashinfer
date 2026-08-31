@@ -474,23 +474,129 @@ def test_combine_inventory_is_specialized_and_fail_closed():
     assert "int ep_rank, int top_k" not in combine_source
 
 
-def test_bf16_topk8_route_and_stage_grid_keep_exact_boundaries():
+def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
     launcher_source = (
         Path(__file__).resolve().parents[2]
         / "csrc/nv_internal/tensorrt_llm/kernels/communicationKernels/moeAlltoAllFusedKernels.cu"
     ).read_text()
 
-    specialized_kernel = "kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8"
-    assert launcher_source.count(specialized_kernel) == 3
+    for top_k in (6, 8):
+        specialized_kernel = (
+            f"kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk{top_k}"
+        )
+        assert launcher_source.count(specialized_kernel) == 3
+        assert (
+            f"params.top_k == {top_k} && params.dtype == nvinfer1::DataType::kBF16 &&"
+            in launcher_source
+        )
+        assert (
+            f'preloadKernel("mnnvl_moe_alltoall_combine_bf16_topk{top_k}",'
+            in launcher_source
+        )
+        assert (
+            f'"mnnvl_moe_alltoall_combine_bf16_topk{top_k}", params.enable_pdl,'
+            in launcher_source
+        )
+    assert launcher_source.count("params.elements_per_token % 8 == 0") == 2
+    assert launcher_source.count("dim3 const topk6_grid(") == 1
     assert (
-        "params.top_k == 8 && params.dtype == nvinfer1::DataType::kBF16 &&"
+        "ceilDiv(params.elements_per_token, kCombineThreads * 8)" in launcher_source
+    )
+    assert (
+        "kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6, topk6_grid, "
+        "kCombineThreads, 0," in launcher_source
+    )
+    assert launcher_source.count("bool const fuse_topk6_publication =") == 2
+    assert launcher_source.count(
+        "useBf16TopK6Combine(params) && params.prepare_payload != nullptr"
+    ) == 2
+    assert launcher_source.count("if (!fuse_topk6_publication)") == 2
+    assert (
+        "params.workspace_stride_bytes, flag_offset, completion_offset,"
         in launcher_source
     )
-    assert "params.elements_per_token % 8 == 0" in launcher_source
-    assert 'preloadKernel("mnnvl_moe_alltoall_combine_bf16_topk8",' in launcher_source
     assert (
-        '"mnnvl_moe_alltoall_combine_bf16_topk8", params.enable_pdl,' in launcher_source
+        "params.ep_rank, params.ep_size,\n"
+        "        params.use_low_precision, params.enable_pdl, "
+        "fuse_topk6_publication,\n"
+        "        params.enable_rank_mask, params.active_rank_mask[0]"
+        in launcher_source
     )
+
+    generated_root = Path(__file__).resolve().parents[2] / "csrc/generated"
+    for generated_name in (
+        "mnnvl_moe_alltoall_sm100.cu",
+        "mnnvl_moe_alltoall_sm103.cu",
+    ):
+        generated_source = (generated_root / generated_name).read_text()
+        normalized_generated_source = " ".join(generated_source.split())
+        assert normalized_generated_source.count(
+            "void kernel_flashinfer_mnnvl_moe_alltoall_"
+        ) == 19
+        for top_k in (6, 8):
+            assert (
+                normalized_generated_source.count(
+                    f"void kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk{top_k}"
+                )
+                == 1
+            )
+        assert normalized_generated_source.count("if (fuse_publication) {") == 1
+        assert (
+            "unsigned long long workspace_stride_bytes, "
+            "unsigned long long flag_val_offset," in normalized_generated_source
+        )
+        assert (
+            "unsigned long long completion_flags_offset, "
+            "unsigned long long topk_target_ranks_offset," in normalized_generated_source
+        )
+        assert (
+            "int ep_size, bool use_low_precision, bool enable_pdl, "
+            "bool fuse_publication," in normalized_generated_source
+        )
+        assert (
+            "bool enable_rank_mask, unsigned long long active_rank_mask)"
+            in normalized_generated_source
+        )
+        topk6_source = normalized_generated_source.split(
+            "void kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6(",
+            1,
+        )[1].split(
+            "void kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk8(",
+            1,
+        )[0]
+        assert (
+            'asm volatile("fence.acquire.sys;" ::: "memory"); } __syncthreads();'
+            in topk6_source
+        )
+        assert (
+            '__syncthreads(); asm volatile("fence.acquire.sys;" ::: "memory");'
+            not in topk6_source
+        )
+        assert "if (bid == 0 && blockIdx.y == 0)" in topk6_source
+        assert "int column_chunk = blockIdx.y * 2048;" in topk6_source
+        assert "int column = column_chunk + tid * 8;" in topk6_source
+        dispatch_source = normalized_generated_source.split(
+            "void kernel_flashinfer_mnnvl_moe_alltoall_dispatch(",
+            1,
+        )[1].split(
+            "void kernel_flashinfer_mnnvl_moe_alltoall_stage_combine(",
+            1,
+        )[0]
+        assert "if (top_k == 6) { if (warp == 0) {" in dispatch_source
+        assert (
+            dispatch_source.count(
+                "__shfl_sync(0xFFFFFFFF, target_rank,"
+            )
+            == 5
+        )
+        assert "} else if (tid == 0) {" in dispatch_source
+        assert "smem_target_ranks[route] = stored_rank;" in dispatch_source
+        assert (
+            "workspace_i32[topk_workspace_base + "
+            "(unsigned long long)route] = stored_rank;"
+            in dispatch_source
+        )
+
     assert "uint64_t{kCombineThreads * 16}" in launcher_source
     assert "std::min(128, ceilDiv(payload_bytes," in launcher_source
     assert "unsigned long long, bool, int, bool);" in launcher_source
@@ -502,10 +608,11 @@ def test_bf16_topk8_route_and_stage_grid_keep_exact_boundaries():
         "unsigned long long, unsigned long long, unsigned long long, bool, int, int, bool,\n"
         "    bool, unsigned long long);" in launcher_source
     )
+    normalized_launcher_source = " ".join(launcher_source.split())
     assert (
-        "completion_offset, false,\n"
-        "                           params.ep_rank, params.ep_size, params.enable_pdl,"
-        in launcher_source
+        "completion_offset, false, params.ep_rank, params.ep_size, "
+        "params.enable_pdl, params.enable_rank_mask, params.active_rank_mask[0]"
+        in normalized_launcher_source
     )
 
 
