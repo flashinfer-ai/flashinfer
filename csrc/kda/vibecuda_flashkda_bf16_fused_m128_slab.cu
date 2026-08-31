@@ -25,6 +25,12 @@ typedef signed int         int32_t;
 typedef short int          int16_t;
 
 #include <cuda_bf16.h>
+#if defined(KDA_SM103) && !defined(KDA_PREP_NORM_ILP)
+#define KDA_PREP_NORM_ILP
+#endif
+#if defined(KDA_SM103) && !defined(KDA_SCAN_ILP)
+#define KDA_SCAN_ILP
+#endif
 #if defined(KDA_U2_PACK)
 // KDA_U2_PACK (R35): the u/u2/final_trans inner operand chain flips bf16 ->
 // fp16 so the SIR-inverse UMMA-3 can write u2 as a PACKED F16 TMEM
@@ -3188,6 +3194,49 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                         }
                         prefix_log2 = 0.0f;
 #else
+#if defined(KDA_SCAN_ILP)
+                        {
+                            float pa = 0.0f, pb = 0.0f;
+                            float2 pbv[8];
+                            #pragma unroll
+                            for (int i = 0; i < 16; i++) {
+                                const int half_b = i >> 3;
+                                const int gate_row = ((i & 7) << 1) + (half_b << 4);
+                                float& acc = half_b ? pb : pa;
+                                float2 g2;
+                                g2.x = __bfloat162float(smem_g_raw_all[stage_bf16 + gate_row * 128 + gate_col]);
+                                g2.y = __bfloat162float(smem_g_raw_all[stage_bf16 + (gate_row + 1) * 128 + gate_col]);
+                                float2 arg2 = g2;
+                                fma_f32x2_inplace(&arg2, c0_r2, c1_r2);
+                                float2 t2;
+                                asm volatile("tanh.approx.f32 %0, %1;" : "=f"(t2.x) : "f"(arg2.x));
+                                asm volatile("tanh.approx.f32 %0, %1;" : "=f"(t2.y) : "f"(arg2.y));
+                                float2 gl2 = t2;
+                                fma_f32x2_inplace(&gl2, hk_log2v, hk_log2v);
+                                acc += gl2.x;
+                                if (half_b == 0) {
+                                    smem_gate_all[stage_f32 + gate_row * 128 + gate_col_p] = acc;
+                                } else {
+                                    pbv[i & 7].x = acc;
+                                }
+                                acc += gl2.y;
+                                if (half_b == 0) {
+                                    smem_gate_all[stage_f32 + (gate_row + 1) * 128 + gate_col_p] = acc;
+                                } else {
+                                    pbv[i & 7].y = acc;
+                                }
+                            }
+                            const float2 pa2 = {pa, pa};
+                            #pragma unroll
+                            for (int i = 0; i < 8; i++) {
+                                add_f32x2_inplace(&pbv[i], pa2);
+                                const int gate_row = 16 + (i << 1);
+                                smem_gate_all[stage_f32 + gate_row * 128 + gate_col_p] = pbv[i].x;
+                                smem_gate_all[stage_f32 + (gate_row + 1) * 128 + gate_col_p] = pbv[i].y;
+                            }
+                            prefix_log2 = pa + pb;
+                        }
+#else
                         #pragma unroll
                         for (int gate_row = 0; gate_row < 32; gate_row += 2) {
                             float2 g2;
@@ -3205,6 +3254,7 @@ kernel_flashkda_bf16_fused_m128(__nv_bfloat16* __restrict__ q, const void* __res
                             prefix_log2 += gl2.y;
                             smem_gate_all[stage_f32 + (gate_row + 1) * 128 + gate_col_p] = prefix_log2;
                         }
+#endif
 #endif  // KDA_PREP_NULL
                     } else
 #endif

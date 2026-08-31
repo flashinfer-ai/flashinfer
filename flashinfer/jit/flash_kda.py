@@ -25,6 +25,7 @@ from .core import (
     logger,
     sm100a_nvcc_flags,
     sm100f_nvcc_flags,
+    sm103a_nvcc_flags,
 )
 
 FlashKDAVariant = Literal[
@@ -46,7 +47,7 @@ FlashKDAVariant = Literal[
     "bt16_chain_m64_s9",
     "bt16_prepare_chain_m64_s8",
 ]
-FlashKDATarget = Literal["sm100a", "sm100f"]
+FlashKDATarget = Literal["sm100a", "sm100f", "sm103a"]
 
 FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "m64",
@@ -71,10 +72,12 @@ FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
 _FLASH_KDA_NVCC_FLAGS = {
     "sm100a": sm100a_nvcc_flags,
     "sm100f": sm100f_nvcc_flags,
+    "sm103a": sm103a_nvcc_flags,
 }
 _FLASH_KDA_TARGET_DEFINE = {
     "sm100a": "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=0",
     "sm100f": "-DFLASHINFER_FLASH_KDA_TARGET_FAMILY=100",
+    "sm103a": "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=3",
 }
 
 # Keep every frozen cache key tied to its complete generated-plus-integration
@@ -350,7 +353,7 @@ def load_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget):
 # run_persistent_m128 / sort_seqs_into). The four binding TUs define
 # distinct raw-pointer launchers in the kda_flash / kda_flash_slab
 # namespaces, so they link together in a single module.
-_VIBECUDA_FLASH_KDA_MODULE_IDENT = "51f6c68ed0"
+_VIBECUDA_FLASH_KDA_MODULE_IDENT = "3db5a6ddce"
 
 
 def get_vibecuda_flash_kda_uri(target: FlashKDATarget) -> str:
@@ -393,6 +396,7 @@ def gen_vibecuda_flash_kda_module(target: FlashKDATarget) -> JitSpec:
         extra_cuda_cflags=[
             *_FLASH_KDA_NVCC_FLAGS[target],
             _FLASH_KDA_TARGET_DEFINE[target],
+            *(["-DKDA_SM103"] if target == "sm103a" else []),
             "--extra-device-vectorization",
             "-DKDA_DTB_HOIST",
             "-DKDA_F32X2",

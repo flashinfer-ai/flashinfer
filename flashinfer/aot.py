@@ -523,6 +523,12 @@ def gen_all_modules(
     has_flash_kda_prefill_sm100f = sm_capabilities.get(
         "flash_kda_prefill_sm100f", False
     )
+    has_vibecuda_flash_kda_sm100a = sm_capabilities.get(
+        "vibecuda_flash_kda_sm100a", False
+    )
+    has_vibecuda_flash_kda_sm103a = sm_capabilities.get(
+        "vibecuda_flash_kda_sm103a", False
+    )
     has_flash_kda_decode_sm100a_legacy = sm_capabilities.get(
         "flash_kda_decode_sm100a_legacy", False
     )
@@ -606,7 +612,10 @@ def gen_all_modules(
                 ]
             )
             jit_specs.append(gen_flash_kda_persistent_m128_module(flash_kda_target))
-            jit_specs.append(gen_vibecuda_flash_kda_module(flash_kda_target))
+    if has_vibecuda_flash_kda_sm100a:
+        jit_specs.append(gen_vibecuda_flash_kda_module("sm100a"))
+    if has_vibecuda_flash_kda_sm103a:
+        jit_specs.append(gen_vibecuda_flash_kda_module("sm103a"))
 
     # CUDA 12.8 predates the SM100-family target, so B200 keeps one exact
     # SM100a module for every frozen body. CUDA 12.9+ builds the 23-body
@@ -1141,6 +1150,14 @@ def detect_sm_capabilities():
         ),
         "flash_kda_prefill_sm100f": (
             bool(flash_kda_family_arches & compilation_context.TARGET_CUDA_ARCHS)
+            and cuda_version >= Version("12.9")
+        ),
+        "vibecuda_flash_kda_sm100a": (
+            (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.8")
+        ),
+        "vibecuda_flash_kda_sm103a": (
+            bool({(10, "3a"), (10, "3f")} & compilation_context.TARGET_CUDA_ARCHS)
             and cuda_version >= Version("12.9")
         ),
         "sm100f": has_sm("compute_100", "12.9"),

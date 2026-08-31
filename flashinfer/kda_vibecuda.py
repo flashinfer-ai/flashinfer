@@ -46,10 +46,9 @@ beta, speculative or grouped-query layouts) stay on the Cake backend; an
 explicit ``backend="vibecuda"`` request for them raises instead of
 silently rerouting.
 
-JIT targets: CC 10.0 devices load an exact-arch (``sm_100a``) build of the
-VibeCUDA schedule family — measured faster than the family image on the
-same launches — while CC 10.3 keeps the frozen backend's ``sm_100f``
-family target (see ``_vibecuda_prefill_target``).
+JIT targets: CC 10.0 and CC 10.3 devices load exact-architecture
+``sm_100a`` and ``sm_103a`` builds so each target can use its measured
+architecture-specific schedule (see ``_vibecuda_prefill_target``).
 """
 
 import math
@@ -68,7 +67,6 @@ from .kda_prefill import (
     _flash_kda_device_sm_count,
     _fixed_cu_seqlens,
     _identity_seq_order,
-    _select_flash_kda_prefill_target,
     _stream_cache_key,
     _validate_prefill_seq_order,
     _workspace_buffer,
@@ -423,17 +421,19 @@ def _get_vibecuda_prefill_module(target):
 def _vibecuda_prefill_target(device: torch.device):
     """Select the VibeCUDA JIT target for ``device``.
 
-    On CC 10.0 devices the VibeCUDA schedules load an exact-arch
-    (``sm_100a``) build: measuring the split-seq small-BH workloads against
-    the family build shows the exact-arch image 2-5% faster (same window,
-    same launches, same kernel sources), matching the schedule family's
-    tuned standalone build. CC 10.3 keeps the frozen backend's family
-    target so one image covers both family members.
+    The VibeCUDA schedules use exact-architecture images because the SM100
+    and SM103 builds carry independently measured schedule choices.
     """
 
-    if get_compute_capability(device) == (10, 0):
+    compute_capability = get_compute_capability(device)
+    if compute_capability == (10, 0):
         return "sm100a"
-    return _select_flash_kda_prefill_target(device)
+    if compute_capability == (10, 3):
+        return "sm103a"
+    raise RuntimeError(
+        "The VibeCUDA recurrent KDA prefill backend supports only compute "
+        f"capabilities 10.0 and 10.3, got {compute_capability}"
+    )
 
 
 def _run_vibecuda_kda_prefill(

@@ -26,6 +26,10 @@ typedef short int          int16_t;
 
 #include <cuda_bf16.h>
 
+#if defined(KDA_SM103) && !defined(KDA_M64_NORM_ILP)
+#define KDA_M64_NORM_ILP
+#endif
+
 #define LOOM_INF CUDART_INF_F
 #define TMEM_NCOLS 256
 #define TMEM_TMEM_STATE_OFFSET 64
@@ -3318,6 +3322,26 @@ kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, const void* __rest
                                 }
                             }
 #endif
+#if defined(KDA_M64_NORM_ILP)
+                            float2 qk_sum_a = {0.0f, 0.0f};
+                            #pragma unroll
+                            for (int elem_in_segment = 0; elem_in_segment < 4; elem_in_segment++) {
+                                float2 x2 = {q_raw_vec[elem_in_segment], k_raw_vec[elem_in_segment]};
+                                float2 t2 = x2;
+                                fma_f32x2_inplace(&t2, x2, qk_sum_a);
+                                qk_sum_a = t2;
+                            }
+                            float2 qk_sum_b = {0.0f, 0.0f};
+                            #pragma unroll
+                            for (int elem_in_segment = 4; elem_in_segment < 8; elem_in_segment++) {
+                                float2 x2 = {q_raw_vec[elem_in_segment], k_raw_vec[elem_in_segment]};
+                                float2 t2 = x2;
+                                fma_f32x2_inplace(&t2, x2, qk_sum_b);
+                                qk_sum_b = t2;
+                            }
+                            float2 qk_sum2 = qk_sum_a;
+                            add_f32x2_inplace(&qk_sum2, qk_sum_b);
+#else
                             float2 qk_sum2 = {0.0f, 0.0f};
                             #pragma unroll
                             for (int elem_in_segment = 0; elem_in_segment < 8; elem_in_segment++) {
@@ -3326,6 +3350,7 @@ kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, const void* __rest
                                 fma_f32x2_inplace(&t2, x2, qk_sum2);
                                 qk_sum2 = t2;
                             }
+#endif
                             #pragma unroll
                             for (int _off = 8; _off >= 1; _off >>= 1) {
                                 float2 s2;
@@ -3668,6 +3693,26 @@ kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, const void* __rest
                     }
 #endif
 #if defined(KDA_F32X2)
+#if defined(KDA_M64_NORM_ILP)
+                    float2 qk_sum_a = {0.0f, 0.0f};
+                    #pragma unroll
+                    for (int elem_in_segment = 0; elem_in_segment < 4; elem_in_segment++) {
+                        float2 x2 = {q_raw_vec[elem_in_segment], k_raw_vec[elem_in_segment]};
+                        float2 t2 = x2;
+                        fma_f32x2_inplace(&t2, x2, qk_sum_a);
+                        qk_sum_a = t2;
+                    }
+                    float2 qk_sum_b = {0.0f, 0.0f};
+                    #pragma unroll
+                    for (int elem_in_segment = 4; elem_in_segment < 8; elem_in_segment++) {
+                        float2 x2 = {q_raw_vec[elem_in_segment], k_raw_vec[elem_in_segment]};
+                        float2 t2 = x2;
+                        fma_f32x2_inplace(&t2, x2, qk_sum_b);
+                        qk_sum_b = t2;
+                    }
+                    float2 qk_sum2 = qk_sum_a;
+                    add_f32x2_inplace(&qk_sum2, qk_sum_b);
+#else
                     float2 qk_sum2 = {0.0f, 0.0f};
                     #pragma unroll
                     for (int elem_in_segment = 0; elem_in_segment < 8; elem_in_segment++) {
@@ -3676,6 +3721,7 @@ kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, const void* __rest
                         fma_f32x2_inplace(&t2, x2, qk_sum2);
                         qk_sum2 = t2;
                     }
+#endif
                     #pragma unroll
                     for (int _off = 8; _off >= 1; _off >>= 1) {
                         float2 s2;

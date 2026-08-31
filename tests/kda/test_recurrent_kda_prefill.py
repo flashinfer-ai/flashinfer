@@ -4641,30 +4641,31 @@ def test_vibecuda_packed_prefill_cuda_graph_capture_and_replay(flash_kda_device)
 
 
 @pytest.mark.parametrize(
-    ("compute_capability", "frozen_target", "expected_target"),
+    ("compute_capability", "expected_target"),
     [
-        # CC 10.0 loads the exact-arch image regardless of the frozen
-        # backend's family choice (measured faster on the same launches).
-        ((10, 0), "sm100f", "sm100a"),
-        ((10, 0), "sm100a", "sm100a"),
-        # CC 10.3 keeps the frozen backend's family target.
-        ((10, 3), "sm100f", "sm100f"),
+        ((10, 0), "sm100a"),
+        ((10, 3), "sm103a"),
     ],
 )
 def test_vibecuda_prefill_target_resolution(
-    monkeypatch, compute_capability, frozen_target, expected_target
+    monkeypatch, compute_capability, expected_target
 ):
     monkeypatch.setattr(
         kda_vibecuda_api,
         "get_compute_capability",
         lambda device: compute_capability,
     )
-    monkeypatch.setattr(
-        kda_vibecuda_api,
-        "_select_flash_kda_prefill_target",
-        lambda device: frozen_target,
-    )
     assert (
         kda_vibecuda_api._vibecuda_prefill_target(torch.device("cuda"))
         == expected_target
     )
+
+
+def test_vibecuda_prefill_target_rejects_unsupported_arch(monkeypatch):
+    monkeypatch.setattr(
+        kda_vibecuda_api,
+        "get_compute_capability",
+        lambda device: (9, 0),
+    )
+    with pytest.raises(RuntimeError, match="10.0 and 10.3"):
+        kda_vibecuda_api._vibecuda_prefill_target(torch.device("cuda"))

@@ -156,12 +156,37 @@ LEGACY_CASES = (
     Case("h64_mixed", 64, (1300, 547, 2048, 963, 271, 3063), True, 10004),
     Case("h64_uniform", 64, (1024,) * 8, True, 10005),
 )
+
+# SeedKernelBench task 377 combines this Kimi-K3 serving sweep with the
+# upstream PR4262 legacy matrix and PR4571 small-BH matrix.
+# https://github.com/sgl-project/sglang/blob/c8b56b1f44d5c5370f47470ee490da3b04375e1c/python/sglang/srt/models/kimi_k3.py#L1373-L1880
+KIMI_K3_FIXED_CASES = tuple(
+    Case(f"h{num_heads}_fixed_{seq_len}", num_heads, (seq_len,), False, 12000 + i)
+    for i, (num_heads, seq_len) in enumerate(
+        (
+            [(64, 512), (64, 1024), (64, 2048), (64, 4096), (64, 8192)]
+            + [(96, 512), (96, 1024), (96, 2048), (96, 4096), (96, 8192)]
+        )
+    )
+)
 H12_CASES = _load_h12_cases()
 SMALL_BH_CASES = (
     Case("h8_fixed_65536", 8, (65536,), False, 11000),
     Case("h4_fixed_65536_holdout", 4, (65536,), False, 11001),
     Case("h1_fixed_131072", 1, (131072,), False, 11002),
     Case("h1_fixed_1048576", 1, (1048576,), False, 11003),
+)
+_KIMI_K3_FIXED_KEYS = {
+    (case.num_heads, case.seq_lens, case.packed) for case in KIMI_K3_FIXED_CASES
+}
+SKB_CASES = (
+    KIMI_K3_FIXED_CASES
+    + tuple(
+        case
+        for case in LEGACY_CASES
+        if (case.num_heads, case.seq_lens, case.packed) not in _KIMI_K3_FIXED_KEYS
+    )
+    + SMALL_BH_CASES
 )
 CASES = LEGACY_CASES + H12_CASES + SMALL_BH_CASES
 
@@ -739,11 +764,12 @@ def main() -> None:
     parser.add_argument("--repeat-iters", type=int, default=100)
     parser.add_argument(
         "--case-set",
-        choices=("all", "legacy", "h12", "small_bh", "production"),
+        choices=("all", "legacy", "h12", "small_bh", "skb", "production"),
         default="all",
         help=(
             "Run all cases, the original H64/H96 cases, the Kimi-K3 TP8 H12 "
-            "cases, the fixed-layout small-BH cases, or the complete "
+            "cases, the fixed-layout small-BH cases, the 18-shape SKB contract, "
+            "or the complete "
             "29-shape production portfolio."
         ),
     )
@@ -859,6 +885,7 @@ def main() -> None:
         "legacy": LEGACY_CASES,
         "h12": H12_CASES,
         "small_bh": SMALL_BH_CASES,
+        "skb": SKB_CASES,
         "production": PRODUCTION_CASES,
     }[args.case_set]
     results = []
