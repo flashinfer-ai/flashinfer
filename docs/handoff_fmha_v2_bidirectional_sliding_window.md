@@ -92,10 +92,21 @@ SWA tests still pass `causal=True`, so they only get the left bound.
 
 ## Setup on H100
 
+The branch lives on **Rohan's fork** (no write access to `flashinfer-ai/flashinfer`):
+
+- Fork: https://github.com/nvrohanv/flashinfer
+- Branch: `feat/fmha-v2-bidirectional-sliding-window`
+- Commit: `5abb561`
+
 ```bash
-git fetch origin
-git checkout feat/fmha-v2-bidirectional-sliding-window
-git pull
+# If this is already a flashinfer-ai checkout:
+git remote add nvrohanv https://github.com/nvrohanv/flashinfer.git  # skip if present
+git fetch nvrohanv feat/fmha-v2-bidirectional-sliding-window
+git checkout -B feat/fmha-v2-bidirectional-sliding-window nvrohanv/feat/fmha-v2-bidirectional-sliding-window
+
+# Or clone the fork directly:
+# git clone -b feat/fmha-v2-bidirectional-sliding-window --recursive https://github.com/nvrohanv/flashinfer.git
+# cd flashinfer
 
 # Editable install if this machine is not already set up
 pip install --no-build-isolation -e . -v
