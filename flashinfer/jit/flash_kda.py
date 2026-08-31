@@ -24,13 +24,16 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Mapping
 
-from . import env as jit_env
+from ._kda_jit_common import (
+    gen_kda_jit_spec,
+    get_flashinfer_include_dir as _get_flash_kda_include_dir,
+    get_kda_csrc_dir as _get_flash_kda_csrc_dir,
+)
 from .core import (
     JitSpec,
     gen_jit_spec,
     logger,
     sm100a_nvcc_flags,
-    sm100f_nvcc_flags,
     sm103a_nvcc_flags,
 )
 from .flash_kda_nvrtc import prepare_generated_flash_kda_cubin
@@ -77,11 +80,11 @@ FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "bt16_prepare_chain_m64_s8",
 )
 
-_FLASH_KDA_NVCC_FLAGS = {
-    "sm100a": sm100a_nvcc_flags,
-    "sm100f": sm100f_nvcc_flags,
-    "sm103a": sm103a_nvcc_flags,
-}
+_FLASH_KDA_TARGETS: tuple[FlashKDATarget, ...] = (
+    "sm100a",
+    "sm100f",
+    "sm103a",
+)
 _FLASH_KDA_TARGET_DEFINE = {
     "sm100a": "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=0",
     "sm100f": "-DFLASHINFER_FLASH_KDA_TARGET_FAMILY=100",
@@ -235,39 +238,6 @@ _FLASH_KDA_VARIANT_DEFINES = {
     "m128_h12_short": "-DFLASHINFER_FLASH_KDA_H12_SHORT=1",
     "m128_h12_long": "-DFLASHINFER_FLASH_KDA_H12_LONG=1",
 }
-
-
-def _get_flash_kda_csrc_dir() -> Path:
-    """Locate frozen FlashKDA sources in installed and source checkouts."""
-
-    installed = jit_env.FLASHINFER_CSRC_DIR / "kda"
-    if installed.exists():
-        return installed
-
-    checkout = Path(__file__).resolve().parents[2] / "csrc" / "kda"
-    if checkout.exists():
-        return checkout
-
-    raise FileNotFoundError(
-        "FlashKDA CUDA sources were not found. Checked:\n"
-        f"  - {installed}\n"
-        f"  - {checkout}"
-    )
-
-
-def _get_flash_kda_include_dir() -> Path:
-    """Locate FlashInfer headers in installed and source checkouts."""
-
-    if jit_env.FLASHINFER_INCLUDE_DIR.exists():
-        return jit_env.FLASHINFER_INCLUDE_DIR
-    checkout = Path(__file__).resolve().parents[2] / "include"
-    if checkout.exists():
-        return checkout
-    raise FileNotFoundError(
-        "FlashInfer headers were not found. Checked:\n"
-        f"  - {jit_env.FLASHINFER_INCLUDE_DIR}\n"
-        f"  - {checkout}"
-    )
 
 
 def _canonical_json_sha256(value: object) -> str:
@@ -859,7 +829,7 @@ def get_flash_kda_uri(variant: FlashKDAVariant, target: FlashKDATarget) -> str:
 
     if variant not in FLASH_KDA_VARIANTS:
         raise ValueError(f"unsupported FlashKDA variant: {variant}")
-    if target not in _FLASH_KDA_NVCC_FLAGS:
+    if target not in _FLASH_KDA_TARGETS:
         raise ValueError(f"unsupported FlashKDA target: {target}")
     module_ident = _FLASH_KDA_MODULE_IDENTS[variant]
     return f"flash_kda_bf16_{variant}_{module_ident}_{target}"
@@ -893,28 +863,26 @@ def gen_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget) -> Ji
             f"FlashKDA binding source not found: {missing_sources[0]}"
         )
 
-    spec = gen_jit_spec(
+    extra_cuda_cflags = [
+        *(
+            [_FLASH_KDA_VARIANT_DEFINES[variant]]
+            if variant in _FLASH_KDA_VARIANT_DEFINES
+            else []
+        ),
+        *(
+            ["-DFLASHINFER_FLASH_KDA_COMBINED_BT16=1"]
+            if variant == "bt16_prepare_chain_m64_s8"
+            else []
+        ),
+    ]
+    spec = gen_kda_jit_spec(
         name=uri,
         sources=sources,
-        extra_cuda_cflags=[
-            *_FLASH_KDA_NVCC_FLAGS[target],
-            _FLASH_KDA_TARGET_DEFINE[target],
-            *(
-                [_FLASH_KDA_VARIANT_DEFINES[variant]]
-                if variant in _FLASH_KDA_VARIANT_DEFINES
-                else []
-            ),
-            *(
-                ["-DFLASHINFER_FLASH_KDA_COMBINED_BT16=1"]
-                if variant == "bt16_prepare_chain_m64_s8"
-                else []
-            ),
-        ],
-        extra_include_paths=[
-            csrc_dir,
-            csrc_dir.parent,
-            include_dir,
-        ],
+        target=target,
+        target_define=_FLASH_KDA_TARGET_DEFINE[target],
+        csrc_dir=csrc_dir,
+        include_dir=include_dir,
+        extra_cuda_cflags=extra_cuda_cflags,
     )
     logger.info(f"Generated FlashKDA {variant} {target} JIT spec: {spec.name}")
     return spec
