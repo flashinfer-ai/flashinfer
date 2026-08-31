@@ -77,9 +77,7 @@ def test_fixed_capacity_comparison_is_labelled_as_a_serving_scenario(
         "vendored-cutedsl-fixed-capacity",
     )
 
-    assert (
-        plan["comparison_kind"] == "legacy_fixed_capacity_serving_scenario"
-    )
+    assert plan["comparison_kind"] == "legacy_fixed_capacity_serving_scenario"
     assert plan["baseline_work_tokens"] == 4096
     assert plan["baseline_tensor_extent"] == 4096
     assert plan["same_token_extent"] is (num_tokens == 4096)
