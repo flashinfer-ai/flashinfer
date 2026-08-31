@@ -173,8 +173,18 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
         trans_b=True,
         out_dtype=torch.bfloat16,
         segment_mode="uniform",
+        segment_alignment=128,
     ):
-        """Build the ragged FP8 A/B, their block scales and the segment offsets."""
+        """Build the ragged FP8 A/B, their block scales and the segment offsets.
+
+        ``segment_alignment`` is the row alignment the caller guarantees for every
+        segment offset. It is passed straight through to ``ragged_block_scaled_bmm``
+        and bounds the largest BLOCK_M the kernel may pick, so the generated offsets
+        MUST really be aligned to it: a false 256 contract with only 128-aligned
+        offsets would be a latent miscompile if a BLOCK_M>128 config were ever
+        selected. Both generators therefore align to ``segment_alignment`` rather
+        than a hard-coded 128.
+        """
         Q = num_groups
         assert not trans_a and trans_b, "Only NT layout is supported"
         device = torch.device("cuda")
@@ -185,21 +195,21 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
         fp8_max, fp8_min = fp8_info.max, fp8_info.min
 
         if segment_mode == "ragged":
-            # Non-uniform segments, still BLOCK_M(128)-aligned as CuTile requires.
+            # Non-uniform segments, aligned to segment_alignment as CuTile requires.
             max_m, segment_offsets = (
                 Test_FlashInfer_RaggedBlockScaledBMM.create_ragged_aligned_m_segments(
                     num_groups=num_groups,
                     m=M,
-                    block_m=128,  # BLOCK_M for CuTile
+                    block_m=segment_alignment,
                 )
             )
         else:
-            # Uniform (equal-size) segments aligned to BLOCK_M (128).
+            # Uniform (equal-size) segments aligned to segment_alignment.
             max_m, segment_offsets, aligned_m = (
                 Test_FlashInfer_RaggedBlockScaledBMM.create_aligned_m_segments(
                     num_groups=num_groups,
                     m=M,
-                    block_m=128,  # BLOCK_M for CuTile
+                    block_m=segment_alignment,
                 )
             )
         total_m = segment_offsets[-1].item()
@@ -263,6 +273,14 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
     )
     @pytest.mark.parametrize("trans_a, trans_b", [(False, True)])
     @pytest.mark.parametrize("segment_mode", ["uniform", "ragged"])
+    # segment_alignment=256 exercises the >=256 caller contract: 256-aligned
+    # offsets, the segment_alignment plumbing, and the host segment_alignment %
+    # BLOCK_M guard. The BLOCK_M=256 fast path these cases would feed is sm90-only
+    # in _get_default_kernel_configs, and sm90 is NOT in this op's supported
+    # compute capabilities ([100,103,110,120,121]), so that kernel branch is
+    # unreachable via the public API today (an H100 run would skip): every case
+    # here runs at BLOCK_M=128 on all supported archs.
+    @pytest.mark.parametrize("segment_alignment", [128, 256])
     @pytest.mark.parametrize("backend", ["cutile"])
     def test_op(
         self,
@@ -275,6 +293,7 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
         trans_a,
         trans_b,
         segment_mode,
+        segment_alignment,
         backend,
     ):
         """cuTile ragged_block_scaled_bmm must match the native groupwise FP8 GEMM."""
@@ -313,6 +332,7 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
             trans_b,
             out_dtype,
             segment_mode=segment_mode,
+            segment_alignment=segment_alignment,
         )
 
         c = ragged_block_scaled_bmm(
@@ -326,6 +346,7 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
             transpose_a=trans_a,
             transpose_b=trans_b,
             out_dtype=out_dtype,
+            segment_alignment=segment_alignment,
             backend=backend,
         )
 
