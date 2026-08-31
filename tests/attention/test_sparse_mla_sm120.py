@@ -985,11 +985,12 @@ def test_sparse_mla_sm120_prefill_glm_nsa_arbitrary_fp32(num_heads: int) -> None
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_decode_glm53_nope() -> None:
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_sparse_mla_sm120_decode_glm53_nope(num_heads: int) -> None:
     torch.manual_seed(3)
     device = torch.device("cuda")
     d_qk = d_v = 512
-    num_tokens, num_heads, topk = 4, 32, 2176
+    num_tokens, topk = 4, 2176
     page_block_size = 64
     num_blocks = 64
     s_kv = num_blocks * page_block_size
@@ -1038,11 +1039,12 @@ def test_sparse_mla_sm120_decode_glm53_nope() -> None:
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
 
 
-def test_sparse_mla_sm120_prefill_glm53_nope() -> None:
+@pytest.mark.parametrize("num_heads", [32, 64])
+def test_sparse_mla_sm120_prefill_glm53_nope(num_heads: int) -> None:
     torch.manual_seed(4)
     device = torch.device("cuda")
     d_qk = d_v = 512
-    num_tokens, num_heads, topk = 65, 32, 2176
+    num_tokens, topk = 65, 2176
     page_block_size = 64
     num_blocks = 64
     s_kv = num_blocks * page_block_size
@@ -1086,6 +1088,74 @@ def test_sparse_mla_sm120_prefill_glm53_nope() -> None:
 
     torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(out_lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+
+def test_sparse_mla_sm120_glm53_nope_reserved_padding_is_ignored() -> None:
+    """Changing packed bytes [528:656) must not affect native NoPE decode."""
+    torch.manual_seed(12)
+    device = torch.device("cuda")
+    d_qk = d_v = 512
+    num_tokens, num_heads, topk = 1, 32, 2176
+    num_blocks, page_block_size = 2, 64
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_glm53_nope(kv_bf16)
+    kv_poisoned = kv_packed.clone()
+    kv_poisoned[..., 528:656] = torch.randint(
+        0,
+        256,
+        kv_poisoned[..., 528:656].shape,
+        dtype=torch.uint8,
+        device=device,
+    )
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0,
+        num_blocks * page_block_size,
+        (num_tokens, topk),
+        device=device,
+        dtype=torch.int32,
+    )
+    topk_length = torch.tensor([128], dtype=torch.int32, device=device)
+    sm_scale = d_qk**-0.5
+
+    results = []
+    for packed in (kv_packed, kv_poisoned):
+        output = torch.empty(
+            (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+        )
+        out_lse = torch.empty(
+            (num_tokens, num_heads), dtype=torch.float32, device=device
+        )
+        mid_out, mid_lse = _make_decode_scratch(
+            num_tokens, num_heads, topk, d_v, device
+        )
+        sparse_mla_sm120_paged_attention(
+            q,
+            packed,
+            indices,
+            output,
+            out_lse,
+            sm_scale,
+            d_v=d_v,
+            kv_scale_format="arbitrary_fp32",
+            topk_length=topk_length,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+        )
+        results.append((output, out_lse))
+
+    assert torch.equal(results[0][0], results[1][0])
+    assert torch.equal(results[0][1], results[1][1])
 
 
 _DSV4_PREFILL_CONFIGS = [
