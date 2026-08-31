@@ -839,9 +839,7 @@ def _layer_graph_case(fixture: PhysicalFixture) -> dict[str, Any]:
     # The first public call runs the real one-backend winner-selection path.
     # Its timing helper uses its own warmup/capture streams, which is the exact
     # framework path that a permanently stream-claimed workspace cannot serve.
-    with autotune(True, tuning_buckets=(num_tokens,)), torch.cuda.stream(
-        warmup_stream
-    ):
+    with autotune(True, tuning_buckets=(num_tokens,)), torch.cuda.stream(warmup_stream):
         eager = layer(activations, weights).clone()
         expected_eager = _prepare_baseline(case).invoke().clone()
     tuned_total = layer.tuner.stats.tuned_op_total_configs.get("moe_cake", 0)
