@@ -378,6 +378,20 @@ def ragged_block_scaled_bmm(
             "b_scale whose N and K granularities match, or the gather kernel."
         )
 
+    # The kernel indexes a_scale on K by the k-tile counter (one column per
+    # BLOCK_K, loaded as shape=(BLOCK_M, 1) at index=(row, k)), exactly like
+    # b_scale on N. So a_scale's K granularity must also equal BLOCK_K, i.e.
+    # rka == K_A // BLOCK_K; otherwise column k of a_scale is applied to the
+    # wrong K block and the result is silently wrong. Only total_ma was checked.
+    if a_scale is not None:
+        a_scale_k_granularity = K_A // rka
+        if a_scale_k_granularity != BLOCK_K:
+            raise ValueError(
+                f"a_scale K granularity ({a_scale_k_granularity} = K {K_A} // {rka}) "
+                f"must equal BLOCK_K ({BLOCK_K}); this kernel indexes a_scale on K by "
+                "BLOCK_K. Use an a_scale whose K granularity matches BLOCK_K."
+            )
+
     # Calculate grid size for persistent scheduling. Use total_m (a guaranteed
     # host-side upper bound, always > 0 for nonempty input) rather than the
     # max_m hint: a stale/zero max_m would make num_programs 0 and leave the
