@@ -67,7 +67,7 @@ from .fmha_decode_constants import (
 )
 
 ConfigValue = int | float | bool | str | type | None
-_GroupedKeepsProfileKey = tuple[type, type, type, int, int, int, int]
+_GroupedKeepsProfileKey = tuple[type, type, type, type, int, int, int, int]
 
 # Public APIs use the strings ``dense`` and ``causal``.  Keep the value carried
 # through FmhaDecodeConfig as a small integer so mask selection remains a
@@ -84,6 +84,7 @@ _GROUPED_KEEPS_MAIN_PROFILE: _GroupedKeepsProfileKey = (
     Float16,
     Float16,
     Float16,
+    Float16,
     128,
     0,
     2,
@@ -94,12 +95,12 @@ _GROUPED_KEEPS_MAIN_PROFILE: _GroupedKeepsProfileKey = (
 # resource recipes qualified for that already-validated launch domain.
 _BLOCK_SPARSE_GROUPED_KEEPS_PROFILES = {
     _GROUPED_KEEPS_MAIN_PROFILE,
-    (BFloat16, BFloat16, BFloat16, 128, 0, 2, 2),
+    (BFloat16, BFloat16, BFloat16, BFloat16, 128, 0, 2, 2),
 }
 _GROUPED_KEEPS_STATIC_ONLY_PROFILES = {
-    (Float8E4M3FN, Float8E4M3FN, Float16, 128, 0, 2, 2),
-    (BFloat16, BFloat16, BFloat16, 64, 0, 2, 2),
-    (Float16, Float16, Float16, 256, 128, 1, 1),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float16, 128, 0, 2, 2),
+    (BFloat16, BFloat16, BFloat16, BFloat16, 64, 0, 2, 2),
+    (Float16, Float16, Float16, Float16, 256, 128, 1, 1),
 }
 
 # Per-thread register budgets for the Q64/KV256 warp groups once the launch
@@ -156,10 +157,10 @@ _KV_TILE_256_TUNABLE_FIELDS = frozenset(("kv_stages",))
 # families rather than shape exceptions: batch size, KV length, tile choice,
 # and legal GMEM split fanout remain unrestricted by this declaration.
 _GROUPED_KEEPS_PAGED_FP8_PROFILES = {
-    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 64, 0, 2, 2),
-    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 128, 0, 2, 2),
-    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 256, 128, 1, 1),
-    (Float8E4M3FN, Float8E4M3FN, Float16, 256, 128, 1, 1),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 64, 0, 2, 2),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 128, 0, 2, 2),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, 256, 128, 1, 1),
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, Float16, 256, 128, 1, 1),
 }
 
 
@@ -539,11 +540,13 @@ class FmhaDecodeConfig:
     # Data types
     # ------------------------------------------------------------------
     # Q element type. One of Float16 / BFloat16 / Float8E4M3FN. Must equal
-    # kv_dtype — mixed Q/KV element types are not supported yet; enforced by
-    # the guard in make_decode_config.
+    # k_dtype and v_dtype — mixed Q/K/V element types are not supported yet;
+    # enforced by the guard in validate_dtypes.
     q_dtype: type = Float16
-    # K and V element type. One of Float16 / BFloat16 / Float8E4M3FN.
-    kv_dtype: type = Float16
+    # K element type. One of Float16 / BFloat16 / Float8E4M3FN.
+    k_dtype: type = Float16
+    # V element type. One of Float16 / BFloat16 / Float8E4M3FN.
+    v_dtype: type = Float16
     # Output O element type. One of Float16 / BFloat16 / Float8E4M3FN.
     out_dtype: type = Float16
     # Accumulator type (BMM accumulators and softmax stats), always Float32
@@ -850,7 +853,7 @@ class FmhaDecodeConfig:
         )
 
     # ------------------------------------------------------------------
-    # Inferred dtype attributes (derived from q_dtype / kv_dtype / out_dtype)
+    # Inferred dtype attributes (derived from q_dtype / k_dtype / v_dtype / out_dtype)
     # ------------------------------------------------------------------
     @property
     def q_dtype_bytes(self) -> int:
@@ -863,7 +866,18 @@ class FmhaDecodeConfig:
     @property
     def kv_dtype_bytes(self) -> int:
         """Byte width of one K/V element (fp16/bf16=2, e4m3=1)."""
-        return 1 if self.kv_dtype == Float8E4M3FN else 2
+        assert self.k_dtype == self.v_dtype
+        return 1 if self.k_dtype == Float8E4M3FN else 2
+
+    @property
+    def k_dtype_bytes(self) -> int:
+        """Byte width of one K element (fp16/bf16=2, e4m3=1)."""
+        return 1 if self.k_dtype == Float8E4M3FN else 2
+
+    @property
+    def v_dtype_bytes(self) -> int:
+        """Byte width of one V element (fp16/bf16=2, e4m3=1)."""
+        return 1 if self.v_dtype == Float8E4M3FN else 2
 
     @property
     def o_dtype_bytes(self) -> int:
@@ -878,7 +892,7 @@ class FmhaDecodeConfig:
     @property
     def use_bf16_qkv(self) -> bool:
         """Whether Q/K/V use BF16 storage and MMA inputs."""
-        return self.kv_dtype == BFloat16
+        return self.q_dtype == self.k_dtype == self.v_dtype == BFloat16
 
     @property
     def use_bf16_output(self) -> bool:
@@ -888,7 +902,7 @@ class FmhaDecodeConfig:
     @property
     def use_fp8_qkv(self) -> bool:
         """fp8 (E4M3) Q/K/V path: switches MMA kind and P-quantization."""
-        return self.kv_dtype == Float8E4M3FN
+        return self.q_dtype == self.k_dtype == self.v_dtype == Float8E4M3FN
 
     @property
     def use_fp8_output(self) -> bool:
@@ -1218,16 +1232,18 @@ class FmhaDecodeConfig:
         """Validate decode input, output, and accumulator dtypes."""
         for name, dtype, supported in (
             ("q_dtype", self.q_dtype, SUPPORTED_IO_DTYPES),
-            ("kv_dtype", self.kv_dtype, SUPPORTED_IO_DTYPES),
+            ("k_dtype", self.k_dtype, SUPPORTED_IO_DTYPES),
+            ("v_dtype", self.v_dtype, SUPPORTED_IO_DTYPES),
             ("out_dtype", self.out_dtype, SUPPORTED_IO_DTYPES),
             ("acc_dtype", self.acc_dtype, SUPPORTED_ACC_DTYPES),
         ):
             if dtype not in supported:
                 raise ValueError(f"Unsupported {name}: {dtype}")
-        if self.q_dtype != self.kv_dtype:
+        if self.q_dtype != self.k_dtype or self.k_dtype != self.v_dtype:
             raise ValueError(
-                f"q_dtype ({self.q_dtype}) != kv_dtype ({self.kv_dtype}): "
-                "mixed Q/KV element types are not supported"
+                f"q_dtype ({self.q_dtype}), k_dtype ({self.k_dtype}), "
+                f"v_dtype ({self.v_dtype}) must all match: "
+                "mixed Q/K/V element types are not supported"
             )
 
     def validate_boolean_fields(self) -> None:
@@ -1296,8 +1312,10 @@ class FmhaDecodeConfig:
                 )
             return
 
-        if not (self.q_dtype == self.kv_dtype == self.out_dtype):
-            raise ValueError("block-sparse requires q_dtype == kv_dtype == out_dtype")
+        if not (self.q_dtype == self.k_dtype == self.v_dtype == self.out_dtype):
+            raise ValueError(
+                "block-sparse requires q_dtype == k_dtype == v_dtype == out_dtype"
+            )
         if self.q_dtype not in (Float16, BFloat16):
             raise ValueError(
                 "block-sparse supports only matching Float16 or BFloat16 IO"
@@ -1452,7 +1470,8 @@ class FmhaDecodeConfig:
         """Return the dtype, shape, and staging key used by Keeps recipe tables."""
         return (
             self.q_dtype,
-            self.kv_dtype,
+            self.k_dtype,
+            self.v_dtype,
             self.out_dtype,
             self.headdim,
             self.head_dim_per_stage_kv,
@@ -1888,7 +1907,7 @@ class FmhaDecodeConfig:
                 or self.tile_size_q != 64
                 or self.headdim != 128
                 or self.q_dtype not in (Float16, BFloat16)
-                or not (self.q_dtype == self.kv_dtype == self.out_dtype)
+                or not (self.q_dtype == self.k_dtype == self.v_dtype == self.out_dtype)
                 or self.use_cluster_smem_reduction
                 or not self.matches_kv256_task_topology
             ):
@@ -3019,7 +3038,7 @@ def _try_apply_auto_kv256_profile(
         and cfg.groups_tokens_heads_q
         and cfg.headdim == 128
         and cfg.q_dtype in (Float16, BFloat16)
-        and cfg.q_dtype == cfg.kv_dtype == cfg.out_dtype
+        and cfg.q_dtype == cfg.k_dtype == cfg.v_dtype == cfg.out_dtype
         and num_heads_q // num_heads_kv <= 64
     )
     if not profile_is_eligible:
@@ -3074,7 +3093,7 @@ def _resolve_grouped_q_launch_candidates(
         and candidate.tile_size_q == 64
         and probe.headdim == 128
         and probe.q_dtype == BFloat16
-        and probe.q_dtype == probe.kv_dtype == probe.out_dtype
+        and probe.q_dtype == probe.k_dtype == probe.v_dtype == probe.out_dtype
     ):
         # TileQ selection uses a common KV128 cost basis and is independent of
         # the later KV-tile decision. BF16 Q64 has no final KV128 profile, but
@@ -3082,7 +3101,8 @@ def _resolve_grouped_q_launch_candidates(
         # logical candidate. The KV selector materializes and validates the
         # actual BF16 profile only after the Q winner is known.
         probe.q_dtype = Float16
-        probe.kv_dtype = Float16
+        probe.k_dtype = Float16
+        probe.v_dtype = Float16
         probe.out_dtype = Float16
     try:
         _finalize_static_decode_config(
@@ -3597,7 +3617,8 @@ def _validate_profile_support(
         and cfg.use_separate_reduction_kernel
         and not cfg.use_cluster_smem_reduction
         and cfg.q_dtype == Float8E4M3FN
-        and cfg.kv_dtype == Float8E4M3FN
+        and cfg.k_dtype == Float8E4M3FN
+        and cfg.v_dtype == Float8E4M3FN
         and (
             (headdim == 128 and cfg.out_dtype == Float8E4M3FN)
             or (
@@ -3767,7 +3788,8 @@ def _validate_profile_support(
             and cfg.use_paged_kv
             and cfg.num_tokens_per_page == 32
             and cfg.q_dtype == Float8E4M3FN
-            and cfg.kv_dtype == Float8E4M3FN
+            and cfg.k_dtype == Float8E4M3FN
+            and cfg.v_dtype == Float8E4M3FN
             and cfg.out_dtype == (Float16 if headdim == 256 else Float8E4M3FN)
             and cfg.splits_kv == cfg.max_splits_kv
             and 2 <= cfg.max_splits_kv <= 128
@@ -3880,7 +3902,9 @@ def make_decode_config(
     batch_size: int | None = None,
     num_heads_q: int | None = None,
     num_heads_kv: int | None = None,
-    qkv_dtype: type = Float16,
+    q_dtype: type = Float16,
+    k_dtype: type = Float16,
+    v_dtype: type = Float16,
     o_dtype: type = Float16,
     qkv_layout: str = "contiguousKv",
     num_tokens_per_page: int = 32,
@@ -3984,8 +4008,9 @@ def make_decode_config(
         explicit_fields=explicit_fields,
         heads_q_per_kv=num_heads_q // num_heads_kv,
     )
-    cfg.q_dtype = qkv_dtype
-    cfg.kv_dtype = qkv_dtype
+    cfg.q_dtype = q_dtype
+    cfg.k_dtype = k_dtype
+    cfg.v_dtype = v_dtype
     cfg.out_dtype = o_dtype
 
     qkv_layout = _apply_layout_config(

@@ -523,7 +523,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
             self.pipeline_config.num_stages if self.pipeline_config is not None else 1
         )
         self._smem_base_kv = _placeholder_smem_array(
-            self.cfg.kv_dtype,
+            self.cfg.v_dtype if self.kv_kind == KV_KIND_V else self.cfg.k_dtype,
             self.cfg.smem_kv_tile_elements * num_stages,
         )
         self._desc_base = prims.Tcgen05SmemDesc(0)
@@ -558,7 +558,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
             )
             self._smem_base_kv = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc.offset,
-                dtype=self.cfg.kv_dtype,
+                dtype=self.cfg.v_dtype if self.kv_kind == KV_KIND_V else self.cfg.k_dtype,
                 shape=(self.cfg.smem_kv_tile_elements * num_stages,),
                 addrspace=3,
             )
@@ -1538,8 +1538,11 @@ class SmemKvResource(DecodeGenResourceBase):
             if self.pipeline_config is not None
             else self.cfg.kv_stages
         )
+        # The shared ring has one allocation for both operands, so it cannot
+        # yet express differing K/V byte-widths.
+        assert self.cfg.k_dtype == self.cfg.v_dtype
         self._smem_base_kv = _placeholder_smem_array(
-            self.cfg.kv_dtype,
+            self.cfg.k_dtype,
             self.cfg.smem_kv_tile_elements * num_stages,
         )
         self._k_desc_base = prims.Tcgen05SmemDesc(0)
@@ -1571,7 +1574,10 @@ class SmemKvResource(DecodeGenResourceBase):
         """Bind the shared K/V ring and build K/V base descriptors."""
         if cutlass.const_expr(context is not None and context.smem_base is not None):
             # Bind the shared K/V SMEM ring. K and V descriptors use the same
-            # allocation but may differ in leading-byte offset.
+            # allocation but may differ in leading-byte offset. The ring
+            # cannot yet express differing K/V byte-widths; this assumes
+            # k_dtype == v_dtype (enforced by validate_dtypes).
+            assert self.cfg.k_dtype == self.cfg.v_dtype
             num_stages = (
                 self.pipeline_config.num_stages
                 if self.pipeline_config is not None
@@ -1579,7 +1585,7 @@ class SmemKvResource(DecodeGenResourceBase):
             )
             self._smem_base_kv = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc.offset,
-                dtype=self.cfg.kv_dtype,
+                dtype=self.cfg.k_dtype,
                 shape=(self.cfg.smem_kv_tile_elements * num_stages,),
                 addrspace=3,
             )
