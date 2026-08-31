@@ -2160,6 +2160,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ----------
         qo_indptr : torch.Tensor
             The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
+            For the ``cudnn`` backend this is interpreted in **element units**
+            (``cumsum(seq_lens_q) * num_qo_heads * head_dim_qk``), not token units;
+            every entry must be an exact multiple of ``num_qo_heads * head_dim_qk``.
         paged_kv_indptr : torch.Tensor
             The indptr of the paged kv-cache, shape: ``[batch_size + 1]``.
         paged_kv_indices : torch.Tensor
@@ -2327,6 +2330,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
         qo_indptr_host = qo_indptr.to("cpu")
         self._qo_indptr_last = int(qo_indptr_host[-1])
+        if self._backend == "cudnn":
+            # cuDNN takes an element-unit qo_indptr (tokens * num_qo_heads *
+            # head_dim_qk). Every boundary -- not just the last -- must be an exact
+            # multiple so the element->token recovery in run() is lossless. Checked
+            # host-side here, off the CUDA-graph-captured run path.
+            elements_per_token = num_qo_heads * head_dim_qk
+            if not torch.all(qo_indptr_host % elements_per_token == 0):
+                raise ValueError(
+                    "cuDNN prefill expects an element-unit qo_indptr "
+                    "(cumsum(seq_lens_q) * num_qo_heads * head_dim_qk); every entry "
+                    f"must be a multiple of {elements_per_token}."
+                )
         total_num_rows = self._qo_indptr_last
         if max_token_per_sequence is not None:
             self._max_q_len = max_token_per_sequence
@@ -2994,14 +3009,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # this also lets the low level apply the correct per-tensor multipliers
             # for head_dim_qk != head_dim_vo. When the direct path is unsupported it
             # falls back to the identical element-offset graph.
+            # qo_indptr is element-unit; plan() validated that every entry is a
+            # multiple of num_qo_heads * head_dim_qk, so this recovery is lossless.
             elements_per_token = self._num_qo_heads * q.shape[-1]
-            if self._qo_indptr_last % elements_per_token != 0:
-                raise ValueError(
-                    "cuDNN prefill expects an element-unit qo_indptr "
-                    "(tokens * num_qo_heads * head_dim_qk); qo_indptr[-1] "
-                    f"({self._qo_indptr_last}) is not a multiple of "
-                    f"{elements_per_token}."
-                )
             qo_indptr_tokens = self._qo_indptr_buf // elements_per_token
 
             cudnn_batch_prefill_with_kv_cache(
@@ -3499,6 +3509,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         ----------
         qo_indptr : torch.Tensor
             The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
+            For the ``cudnn`` backend the ``qo_indptr`` and ``kv_indptr`` are
+            interpreted in **element units** (``cumsum(seq_lens) * num_heads *
+            head_dim_qk``), not token units; every entry must be an exact multiple
+            of ``num_heads * head_dim_qk``. The ``cudnn`` backend also requires
+            ``kv_layout="NHD"``.
         kv_indptr : torch.Tensor
             The indptr of the key/value tensor, shape: ``[batch_size + 1]``.
         num_qo_heads : int
@@ -3649,7 +3664,22 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         kv_indptr_host = kv_indptr.to("cpu")
 
         self._qo_indptr_last = int(qo_indptr_host[-1])
-        self._kv_indptr_last = int(kv_indptr_host[-1])
+        if self._backend == "cudnn":
+            # cuDNN takes element-unit qo/kv indptrs (tokens * num_heads *
+            # head_dim_qk). Every boundary -- not just the last -- must be an exact
+            # multiple so the element->token recovery in run() is lossless. Checked
+            # host-side here, off the CUDA-graph-captured run path.
+            for indptr_host, heads, name in (
+                (qo_indptr_host, num_qo_heads, "qo_indptr"),
+                (kv_indptr_host, num_kv_heads, "kv_indptr"),
+            ):
+                elements_per_token = heads * head_dim_qk
+                if not torch.all(indptr_host % elements_per_token == 0):
+                    raise ValueError(
+                        f"cuDNN prefill expects an element-unit {name} "
+                        "(cumsum(seq_lens) * num_heads * head_dim_qk); every entry "
+                        f"must be a multiple of {elements_per_token}."
+                    )
         total_num_rows = self._qo_indptr_last
 
         if self.is_cuda_graph_enabled:
@@ -4313,24 +4343,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             # share Q's and K's token boundaries, so we let the low level re-derive
             # their element offsets with the correct per-tensor multipliers
             # (batch_offsets_o/v default to q/k under batch_offsets_units="tokens").
-            qo_elements_per_token = q.shape[-2] * q.shape[-1]
-            kv_elements_per_token = k.shape[-2] * k.shape[-1]
-            if self._qo_indptr_last % qo_elements_per_token != 0:
-                raise ValueError(
-                    "cuDNN prefill expects an element-unit qo_indptr "
-                    "(tokens * num_qo_heads * head_dim_qk); qo_indptr[-1] "
-                    f"({self._qo_indptr_last}) is not a multiple of "
-                    f"{qo_elements_per_token}."
-                )
-            if self._kv_indptr_last % kv_elements_per_token != 0:
-                raise ValueError(
-                    "cuDNN prefill expects an element-unit kv_indptr "
-                    "(tokens * num_kv_heads * head_dim_qk); kv_indptr[-1] "
-                    f"({self._kv_indptr_last}) is not a multiple of "
-                    f"{kv_elements_per_token}."
-                )
-            qo_indptr_tokens = self._qo_indptr_buf // qo_elements_per_token
-            kv_indptr_tokens = self._kv_indptr_buf // kv_elements_per_token
+            # qo/kv indptrs are element-unit; plan() validated that every entry is a
+            # multiple of num_heads * head_dim_qk (with the NHD layout guarded above,
+            # k.shape[-2] is num_kv_heads), so these recoveries are lossless.
+            qo_indptr_tokens = self._qo_indptr_buf // (q.shape[-2] * q.shape[-1])
+            kv_indptr_tokens = self._kv_indptr_buf // (k.shape[-2] * k.shape[-1])
 
             cudnn_batch_prefill_with_kv_cache(
                 q,

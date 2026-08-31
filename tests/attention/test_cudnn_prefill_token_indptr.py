@@ -344,3 +344,57 @@ def test_cudnn_prefill_direct_build_unsupported_falls_back(monkeypatch):
 
     torch.testing.assert_close(out_probe, out_legacy, atol=1e-3, rtol=1e-3)
     torch.testing.assert_close(lse_probe, lse_legacy, atol=1e-3, rtol=1e-3)
+
+
+def test_cudnn_wrapper_rejects_interior_non_divisible_indptr():
+    """The wrapper validates element-unit indptr divisibility for cuDNN at plan
+    time for EVERY boundary, not just the last: an interior entry that is not a
+    multiple of num_heads * head_dim would otherwise be silently truncated by the
+    element->token recovery in run()."""
+    import flashinfer
+
+    _skip_if_cudnn_prefill_unsupported()
+
+    torch.manual_seed(0)
+    device = "cuda:0"
+    batch_size, num_qo_heads, num_kv_heads, head_dim = 3, 8, 2, 128
+    seq_q = torch.tensor([4, 5, 6], dtype=torch.int32, device=device)
+    seq_kv = torch.tensor([16, 20, 24], dtype=torch.int32, device=device)
+    zero = torch.zeros(1, dtype=torch.int32, device=device)
+
+    qo_indptr = (
+        torch.cat([zero, torch.cumsum(seq_q, 0)]) * num_qo_heads * head_dim
+    ).int()
+    kv_indptr = (
+        torch.cat([zero, torch.cumsum(seq_kv, 0)]) * num_kv_heads * head_dim
+    ).int()
+    o_indptr = qo_indptr.clone()
+    v_indptr = kv_indptr.clone()
+    # Corrupt an interior qo boundary (keep the final entry a valid multiple), so a
+    # last-entry-only check would miss it.
+    qo_indptr[1] += 1
+
+    ws = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        ws, "NHD", backend="cudnn"
+    )
+    with pytest.raises(ValueError, match="element-unit"):
+        wrapper.plan(
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim_qk=head_dim,
+            head_dim_vo=head_dim,
+            causal=True,
+            sm_scale=float(head_dim**-0.5),
+            q_data_type=torch.bfloat16,
+            kv_data_type=torch.bfloat16,
+            o_data_type=torch.bfloat16,
+            seq_lens=seq_kv.view(batch_size, 1, 1, 1),
+            seq_lens_q=seq_q.view(batch_size, 1, 1, 1),
+            max_token_per_sequence=int(seq_q.max()),
+            max_sequence_kv=int(seq_kv.max()),
+            v_indptr=v_indptr,
+            o_indptr=o_indptr,
+        )
