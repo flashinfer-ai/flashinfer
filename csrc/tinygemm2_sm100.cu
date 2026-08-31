@@ -2038,9 +2038,19 @@ inline void CheckSm100Family(int device_id) {
             "cudaDeviceGetAttribute(compute capability major)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(compute capability minor)");
-  TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3 || minor == 7))
-      << "tinygemm2_sm100 requires an SM100/SM103/SM107 (B200/B300/Rubin class) device, got sm_"
-      << major << minor;
+  // SM107 is only accepted when this file was compiled by a toolkit that can emit
+  // compute_107a (CUDA 13.4+). gen_tinygemm2_sm100_module gates the gencode the same
+  // way, so on older toolkits there is no sm_107a image here and admitting the device
+  // would trade this message for an opaque load failure.
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+  constexpr bool kSupportsSm107 = true;
+#else
+  constexpr bool kSupportsSm107 = false;
+#endif
+  TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3 || (minor == 7 && kSupportsSm107)))
+      << "tinygemm2_sm100 requires an SM100/SM103 (B200/B300) device, or an SM107 (Rubin) "
+      << "device with a CUDA 13.4+ toolkit, got sm_" << major << minor;
   {
     std::lock_guard<std::mutex> lock(fam_mu);
     fam_ok.push_back(device_id);

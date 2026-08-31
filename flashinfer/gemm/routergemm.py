@@ -4,6 +4,7 @@ from ..trace.templates.gemm import (
     mm_M1_16_K7168_N256_trace,
     tinygemm_bf16_trace,
 )
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.jit import (
     gen_dsv3_router_gemm_module,
     gen_tinygemm2_module,
@@ -500,13 +501,22 @@ _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 
 def _use_tinygemm2_sm100(device: torch.device) -> bool:
+    """Whether the generated tinygemm2_sm100 variants may serve ``device``."""
     if os.environ.get("FLASHINFER_DISABLE_TINYGEMM2_SM100", "0") == "1":
         return False
-    return get_compute_capability(
-        device
-    ) in _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES and version_at_least(
-        torch.version.cuda, "12.8"
-    )
+    compute_capability = get_compute_capability(device)
+    if compute_capability not in _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES:
+        return False
+    if compute_capability == (10, 7) and not is_cuda_version_at_least("13.4"):
+        # gen_tinygemm2_sm100_module only emits compute_107a on CUDA >= 13.4, so on
+        # older toolkits the module contains no image for this device and dispatching
+        # here would fail at module load rather than fall back to the reference
+        # kernel. Ask the same question the build asks -- is_cuda_version_at_least
+        # reads the *toolkit* (nvcc) version, whereas torch.version.cuda below
+        # describes the torch build; the two can disagree, and it is the toolkit that
+        # decides whether the sm_107a image exists.
+        return False
+    return version_at_least(torch.version.cuda, "12.8")
 
 
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)
