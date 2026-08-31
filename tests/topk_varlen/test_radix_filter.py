@@ -490,3 +490,47 @@ def test_tma_auto_falls_back_on_misaligned_stride():
         assert sel.numel() == k and sel.unique().numel() == k
         kth = torch.topk(view[b], k).values.min()
         assert bool((view[b][sel.long()] >= kth - 1e-4).all()), f"row {b}"
+
+
+def test_out_buffers_foreign_device_rejected():
+    """Caller out-buffers on a different device than the input must be rejected.
+
+    The kernel launches on input_values.device; a foreign-device buffer passes
+    dtype/shape validation but hands the kernel a pointer it cannot legally
+    write. No pre-fix teeth run here on purpose: executing the unfixed path
+    performs a cross-device write that can poison the CUDA context, so this
+    is functional coverage of the rejection only.
+
+    Regression for PR #4621 review round 2 (out-buffer device validation).
+    """
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs >= 2 visible CUDA devices")
+
+    in_dev = None
+    for i in range(torch.cuda.device_count()):
+        d = torch.device("cuda", i)
+        cc = get_compute_capability(d)
+        if cc[0] * 10 + cc[1] in (100, 103, 107):
+            in_dev = d
+            break
+    if in_dev is None:
+        pytest.skip("no radix_filter-capable device visible")
+    _skip_unless_radix_filter(in_dev)
+    other = torch.device("cuda", (in_dev.index + 1) % torch.cuda.device_count())
+
+    B, N, k = 4, 4096, 512
+    logits = torch.randn(B, N, dtype=torch.float32, device=in_dev)
+    seq_lens = torch.full((B,), N, dtype=torch.int32, device=in_dev)
+    foreign = torch.empty(B * k, dtype=torch.int32, device=other)
+
+    with (
+        torch.cuda.device(in_dev),
+        pytest.raises(ValueError, match=r"input device"),
+    ):
+        flashinfer.top_k_varlen(
+            logits,
+            seq_lens,
+            k,
+            backend="radix_filter",
+            out_indices=foreign,
+        )
