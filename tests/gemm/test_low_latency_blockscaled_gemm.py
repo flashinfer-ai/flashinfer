@@ -5,7 +5,7 @@ import torch
 
 cutlass = pytest.importorskip("cutlass")
 
-from flashinfer.gemm.gemm_base import _low_latency_blockscaled_gemm_runner
+from flashinfer.gemm.gemm_base import _cutedsl_low_latency_blockscaled_gemm_runner
 from flashinfer.gemm.kernels.cute_dsl.low_latency_blockscaled_gemm import (
     LowLatencyBlockscaledGemmKernel,
     _decode_ab_to_f32,
@@ -86,7 +86,7 @@ def _reference_output(a, b, sfa, sfb, sf_vec_size, mnkl, alpha, bias):
 
 
 def _make_runner():
-    return _low_latency_blockscaled_gemm_runner(100, False)
+    return _cute_dsl_low_latency_blockscaled_gemm_runner(100, False)
 
 
 def _run_all_tactics_and_check(runner, mnkl, fmt, workspace, alpha):

@@ -152,25 +152,25 @@ _SMOKE_CASES = [
 ]
 
 
-_LOW_LATENCY_MODEL_CASES = [
+_CUTEDSL_LOW_LATENCY_MODEL_CASES = [
     # GPT-OSS-120B
-    (1, 1280, 2880, torch.bfloat16, "low_latency", True, False, "nvfp4"),
-    (8, 1280, 2944, torch.bfloat16, "low_latency", True, False, "mxfp4"),
-    (1, 2880, 1024, torch.float16, "low_latency", True, False, "nvfp4"),
-    (8, 2880, 1024, torch.bfloat16, "low_latency", True, False, "mxfp4_alpha"),
+    (1, 1280, 2880, torch.bfloat16, "cutedsl_low_latency", True, False, "nvfp4"),
+    (8, 1280, 2944, torch.bfloat16, "cutedsl_low_latency", True, False, "mxfp4"),
+    (1, 2880, 1024, torch.float16, "cutedsl_low_latency", True, False, "nvfp4"),
+    (8, 2880, 1024, torch.bfloat16, "cutedsl_low_latency", True, False, "mxfp4_alpha"),
     # DeepSeek-V3
-    (4, 7168, 2048, torch.bfloat16, "low_latency", True, False, "nvfp4"),
-    (8, 7168, 2048, torch.float16, "low_latency", True, False, "mxfp4"),
-    (1, 3072, 1536, torch.bfloat16, "low_latency", True, False, "nvfp4"),
-    (7, 3072, 1536, torch.bfloat16, "low_latency", True, False, "mxfp4"),
-    (3, 129, 320, torch.bfloat16, "low_latency", True, False, "nvfp4"),
-    (7, 127, 384, torch.float16, "low_latency", True, False, "mxfp4"),
+    (4, 7168, 2048, torch.bfloat16, "cutedsl_low_latency", True, False, "nvfp4"),
+    (8, 7168, 2048, torch.float16, "cutedsl_low_latency", True, False, "mxfp4"),
+    (1, 3072, 1536, torch.bfloat16, "cutedsl_low_latency", True, False, "nvfp4"),
+    (7, 3072, 1536, torch.bfloat16, "cutedsl_low_latency", True, False, "mxfp4"),
+    (3, 129, 320, torch.bfloat16, "cutedsl_low_latency", True, False, "nvfp4"),
+    (7, 127, 384, torch.float16, "cutedsl_low_latency", True, False, "mxfp4"),
 ]
 
 
 @pytest.mark.parametrize(
     "m,n,k,res_dtype,backend,use_128x4_sf_layout,auto_tuning,fp4_type",
-    _SMOKE_CASES + _LOW_LATENCY_MODEL_CASES,
+    _SMOKE_CASES + _CUTEDSL_LOW_LATENCY_MODEL_CASES,
 )
 def test_mm_fp4(
     m, n, k, res_dtype, backend, use_128x4_sf_layout, auto_tuning, fp4_type

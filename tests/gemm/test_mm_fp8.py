@@ -17,7 +17,7 @@ _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
 @pytest.mark.parametrize("input_dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mat2_dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16])
-@pytest.mark.parametrize("backend", ["trtllm_low_latency", "low_latency"])
+@pytest.mark.parametrize("backend", ["trtllm_low_latency", "cutedsl_low_latency"])
 def test_mm_fp8(
     m: int,
     n: int,
@@ -30,8 +30,8 @@ def test_mm_fp8(
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("mm_fp8 is only supported on Blackwell GPUs.")
-    if backend == "low_latency" and (compute_capability[1] not in (0, 3) or m > 8):
-        pytest.skip("low_latency mm_fp8 requires SM100/SM103 and M <= 8")
+    if backend == "cutedsl_low_latency" and (compute_capability[1] not in (0, 3)):
+        pytest.skip("cutedsl_low_latency mm_fp8 requires SM100/SM103")
 
     torch.manual_seed(123)
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
