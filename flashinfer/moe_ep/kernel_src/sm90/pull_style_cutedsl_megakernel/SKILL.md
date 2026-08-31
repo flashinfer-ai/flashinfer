@@ -40,6 +40,12 @@ not picked them up):
   rank-indexed TopkReduce call), and `moe_nvfp4_swapab/topk_reduce.py`
   (SM90 scalar mxfp8 decode via f16 + bit-math e8m0, `slot_mask`
   rank-masked reduce -- keep NVFP4-compatible when re-syncing).
+- `active_dispatch_warps` (2026-08-30): `src/token_comm.py` ctor knob
+  (default 1) sizing the WORKING subset of the 4 dispatch warps (prep /
+  barrier / pull / reuse token-back all follow it; barrier and grid-sync
+  arrival counts scale with it, and the base kernels route the idle warps
+  straight to kernel_tail).  Touches `kernel_fp8_glu_fc12{,_swapab}.py`
+  (dispatch-body gating) too; the drop tree still hardcodes 4.
 
 ## Layout
 

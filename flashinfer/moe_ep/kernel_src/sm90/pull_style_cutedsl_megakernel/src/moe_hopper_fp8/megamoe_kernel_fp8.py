@@ -141,6 +141,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         dedup_dispatch: bool = False,
         grouped_token_back: bool = False,
         combine_format: str = "bf16",
+        active_dispatch_warps: int = 1,
     ) -> None:
         if static_expert_shape is None:
             raise NotImplementedError(
@@ -387,6 +388,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             flag_batch=flag_batch,
             dedup_dispatch=dedup_dispatch,
             max_tokens_per_rank=max_tokens_per_rank,
+            active_dispatch_warps=active_dispatch_warps,
         )
         self.dedup_dispatch = dedup_dispatch
 

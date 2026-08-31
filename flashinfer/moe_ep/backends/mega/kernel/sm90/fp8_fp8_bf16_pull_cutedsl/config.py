@@ -94,6 +94,11 @@ class Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig:
     # dequantizes to fp32 before accumulating).  Quantized formats require
     # grouped_token_back.  COLLECTIVE.
     combine_format: Literal["bf16", "32e4m3xe8m0", "32e5m2xe8m0"] = "bf16"
+    # How many of the 4 dispatch warps do token-comm work at all (1/2/4);
+    # the rest stay fully idle (reserved for future in-kernel work).  The
+    # physical warp layout stays at 4.  Output-invariant work partitioning
+    # (rank-local -- no cross-rank agreement needed).
+    active_dispatch_warps: int = 1
     # Per-tensor static calibration scales (see class docstring).
     fc1_activation_dequant_scale: float = 1.0
     fc2_activation_dequant_scale: float = 1.0

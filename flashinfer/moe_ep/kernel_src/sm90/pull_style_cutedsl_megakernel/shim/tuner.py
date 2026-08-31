@@ -58,6 +58,9 @@ PERF_KNOBS: Dict[str, Tuple[Any, ...]] = {
     # COLLECTIVE: changes the route-word wire format -- all EP ranks must
     # agree (a mixed on/off pair mis-decodes the flag bits).
     "dedup_dispatch": (False, True),
+    # How many of the 4 dispatch warps do token-comm work (the rest idle);
+    # output-invariant partitioning (rank-local, no wire-format coupling).
+    "active_dispatch_warps": (1, 2, 4),
     "mma_tiler_mnk": _NONSWAP_TILES + _SWAPAB_TILES,
     "cluster_shape_mnk": _CLUSTER_SHAPES,
     "fp8_accum_mode": ("1xacc", "2xacc"),
@@ -144,6 +147,8 @@ def is_valid(knobs: Dict[str, Any], *, apply_topk_in_fc1: bool = True) -> bool:
     # Kernel invariant: the in-kernel reduce collapses topk before a separate
     # reducer could apply routing weights.
     if in_kernel and not apply_topk_in_fc1:
+        return False
+    if knobs.get("active_dispatch_warps", 1) not in (1, 2, 4):
         return False
     grouped = bool(knobs.get("grouped_token_back", False))
     combine_format = knobs.get("combine_format", "bf16")

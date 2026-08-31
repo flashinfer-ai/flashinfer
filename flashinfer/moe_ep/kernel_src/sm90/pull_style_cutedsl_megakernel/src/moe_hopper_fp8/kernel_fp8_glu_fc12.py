@@ -3172,9 +3172,17 @@ class Sm90SwigluFp8Fc12Kernel:
         # guard is const_expr-eliminated in the standalone path.
         if cutlass.const_expr(self.enable_token_comm):
             if warp_idx >= self.dispatch_warp_id[0]:
+                # Dispatch warps beyond token_comm.active_dispatch_warps fall
+                # through both branches: they stay fully idle (reserved for
+                # future work) and rejoin the CTA at the kernel-tail
+                # rendezvous below.
                 lane_idx_for_dispatch = cute.arch.lane_idx()
+                active_dispatch_end: cutlass.Constexpr[int] = (
+                    self.dispatch_warp_id[0]
+                    + self.token_comm.active_dispatch_warps
+                )
                 if cutlass.const_expr(self.token_back_standalone):
-                    if warp_idx < self.token_back_warp_id[0]:
+                    if warp_idx < active_dispatch_end:
                         self.token_comm_hook_dispatch_warp_body(
                             token_comm_args,
                             token_comm_storage,
@@ -3183,21 +3191,23 @@ class Sm90SwigluFp8Fc12Kernel:
                             tidx=tidx,
                         )
                     else:
-                        self.token_comm_hook_token_back_warp_body(
+                        if warp_idx >= self.token_back_warp_id[0]:
+                            self.token_comm_hook_token_back_warp_body(
+                                token_comm_args,
+                                token_comm_storage,
+                                warp_idx=warp_idx,
+                                lane_idx=lane_idx_for_dispatch,
+                                tidx=tidx,
+                            )
+                else:
+                    if warp_idx < active_dispatch_end:
+                        self.token_comm_hook_dispatch_warp_body(
                             token_comm_args,
                             token_comm_storage,
                             warp_idx=warp_idx,
                             lane_idx=lane_idx_for_dispatch,
                             tidx=tidx,
                         )
-                else:
-                    self.token_comm_hook_dispatch_warp_body(
-                        token_comm_args,
-                        token_comm_storage,
-                        warp_idx=warp_idx,
-                        lane_idx=lane_idx_for_dispatch,
-                        tidx=tidx,
-                    )
 
             # ════════════════════════════════════════════════════════════════════
             # Kernel tail hook (MegaMoE-only; lean base = no-op)

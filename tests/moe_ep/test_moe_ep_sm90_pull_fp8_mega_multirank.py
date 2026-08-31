@@ -376,6 +376,7 @@ def _megakernel_config(
     dedup_dispatch: bool = False,
     grouped_token_back: bool = False,
     combine_format: str = "bf16",
+    active_dispatch_warps: int = 1,
 ):
     from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
 
@@ -394,6 +395,7 @@ def _megakernel_config(
         dedup_dispatch=dedup_dispatch,
         grouped_token_back=grouped_token_back,
         combine_format=combine_format,
+        active_dispatch_warps=active_dispatch_warps,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )
@@ -413,6 +415,7 @@ def _run_mega_layer(
     dedup_dispatch: bool = False,
     grouped_token_back: bool = False,
     combine_format: str = "bf16",
+    active_dispatch_warps: int = 1,
     num_experts: int = 8,
     topk: int = 4,
 ):
@@ -457,6 +460,7 @@ def _run_mega_layer(
             dedup_dispatch=dedup_dispatch,
             grouped_token_back=grouped_token_back,
             combine_format=combine_format,
+            active_dispatch_warps=active_dispatch_warps,
         )
     )
     runtime = bootstrap_moe_ep_runtime(
@@ -506,6 +510,7 @@ def _run_mega_layer(
                     dedup_dispatch=dedup_dispatch,
                     grouped_token_back=grouped_token_back,
                     combine_format=combine_format,
+                    active_dispatch_warps=active_dispatch_warps,
                 ),
                 quantize_input=quantize_input,
                 preprocess_weights=True,
@@ -718,6 +723,33 @@ def test_moe_ep_sm90_pull_fp8_mega_layer_grouped_token_back(
         f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
         f"({fp8_scale_mode}, grouped_token_back, combine={combine_format}, "
         f"dedup={dedup_dispatch}) within tolerance"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("active_dispatch_warps", [2, 4])
+def test_moe_ep_sm90_pull_fp8_mega_layer_active_dispatch_warps(active_dispatch_warps):
+    """Non-default active pull-warp counts are bit-exact.
+
+    The knob only re-partitions which dispatch warps issue the NVLink pulls
+    (the default 2 is covered by every other case in this file), so all
+    three settings must reproduce the reference exactly.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="per_tensor",
+        active_dispatch_warps=active_dispatch_warps,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"(active_dispatch_warps={active_dispatch_warps}) matches reference"
     )
 
 

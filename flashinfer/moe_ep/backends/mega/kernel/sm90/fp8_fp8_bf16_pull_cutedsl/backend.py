@@ -183,6 +183,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             dedup_dispatch=k.dedup_dispatch,
             grouped_token_back=k.grouped_token_back,
             combine_format=k.combine_format,
+            active_dispatch_warps=k.active_dispatch_warps,
         )
 
     def validate_forward(
@@ -368,5 +369,6 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             k.dedup_dispatch,
             k.grouped_token_back,
             k.combine_format,
+            k.active_dispatch_warps,
             knobs_pool_key(k.knobs),
         )

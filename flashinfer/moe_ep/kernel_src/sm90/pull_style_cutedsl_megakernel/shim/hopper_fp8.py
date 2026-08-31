@@ -164,6 +164,12 @@ class MegaMoEHopperFp8Config:
     # receiver dequantizes to fp32 before accumulating).  Quantized formats
     # require grouped_token_back (the encoder lives in the group reduce).
     combine_format: str = "bf16"
+    # How many of the 4 dispatch warps do token-comm work at all (1/2/4):
+    # prep, barrier, pull, and the reuse token-back.  The physical layout
+    # stays at 4 (setmaxnreg is warpgroup-granular); warps beyond this count
+    # are FULLY idle until kernel_tail, reserved for future work.
+    # Output-invariant work partitioning.
+    active_dispatch_warps: int = 1
     # deepgemm compute graph: routing weights folded into the SwiGLU output
     # before FC1-output quantization (the driver's ref_compute_graph switch).
     # False leaves the staged FC2 terms unweighted and applies scores in the
@@ -238,6 +244,11 @@ class MegaMoEHopperFp8Config:
             raise ValueError(
                 f"token_back_mode must be one of {_TOKEN_BACK_MODES}, "
                 f"got {self.token_back_mode!r}."
+            )
+        if self.active_dispatch_warps not in (1, 2, 4):
+            raise ValueError(
+                f"active_dispatch_warps must be 1, 2, or 4; got "
+                f"{self.active_dispatch_warps!r}."
             )
         if self.combine_format not in ("bf16", "32e4m3xe8m0", "32e5m2xe8m0"):
             raise ValueError(
@@ -717,6 +728,7 @@ class MegaMoEHopperFp8Frontend:
             dedup_dispatch=c.dedup_dispatch,
             grouped_token_back=c.grouped_token_back,
             combine_format=c.combine_format,
+            active_dispatch_warps=c.active_dispatch_warps,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -1259,6 +1271,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     dedup_dispatch: bool = False,
     grouped_token_back: bool = False,
     combine_format: str = "bf16",
+    active_dispatch_warps: int = 1,
     apply_topk_in_fc1: bool = True,
     load_balance_mode: Literal["static", "atomic_counter"] = "static",
     group_hint: Optional[int] = None,
@@ -1395,6 +1408,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         dedup_dispatch=dedup_dispatch,
         grouped_token_back=grouped_token_back,
         combine_format=combine_format,
+        active_dispatch_warps=active_dispatch_warps,
         apply_topk_in_fc1=apply_topk_in_fc1,
         load_balance_mode=load_balance_mode,
         group_hint=group_hint,

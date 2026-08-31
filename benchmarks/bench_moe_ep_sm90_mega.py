@@ -187,6 +187,9 @@ def _parse_args() -> argparse.Namespace:
         "shim's per-layout default (non-swap 64,128 / swap-AB 256,32).",
     )
     p.add_argument("--top-k", type=int, default=6)
+    # TOTAL experts across all EP ranks (DSV4-Pro: 384), fixed regardless of
+    # world size -- each rank owns num_experts // world_size local experts
+    # (4 ranks -> 96/rank, 8 ranks -> 48/rank).  Do NOT scale this per rank.
     p.add_argument("--num-experts", type=int, default=384)
     p.add_argument("--hidden", type=int, default=7168)
     p.add_argument(
@@ -238,6 +241,14 @@ def _parse_args() -> argparse.Namespace:
         default="bf16",
         help="combine wire format; the quantized fp8 wires halve the return "
         "bytes and require --grouped-token-back",
+    )
+    p.add_argument(
+        "--active-dispatch-warps",
+        type=int,
+        choices=[1, 2, 4],
+        default=1,
+        help="dispatch warps doing token-comm work; the rest stay idle "
+        "(physical layout stays 4)",
     )
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--iters", type=int, default=20)
@@ -424,6 +435,7 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile):
         dedup_dispatch=args.dedup_dispatch,
         grouped_token_back=args.grouped_token_back,
         combine_format=args.combine_format,
+        active_dispatch_warps=args.active_dispatch_warps,
         fc1_activation_dequant_scale=FC1_ACT_SCALE,
         fc2_activation_dequant_scale=FC2_ACT_SCALE,
     )

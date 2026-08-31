@@ -134,6 +134,19 @@ derived programmatically) crossed with both validated token-back modes —
 - `in_kernel_fc2_reduce` — REDG atomic-add combine (bf16 unordered sum,
   nondeterministic; validated in `mega_sm90` with the roundoff-envelope
   band, not measured in the sweep above).
+- `active_dispatch_warps` — how many of the 4 dispatch warps do token-comm
+  work AT ALL (prep + barrier + pull + reuse token-back; 1/2/4, default 1).
+  The physical layout stays at 4 (setmaxnreg is warpgroup-granular); warps
+  beyond the count skip the whole dispatch body and only rejoin at
+  kernel_tail — fully idle, reserved for future in-kernel work.
+  Output-invariant: sustained pull bandwidth ~= warps x SMs x hidden_bytes
+  / read-RTT, and on H200 two warps per SM is ~2x the bandwidth-delay
+  product — enough headroom while keeping the NVLink read queue shallow
+  (a 2026-08-29 clock-locked sweep measured 1/2 warps ahead of 4 by 1-3%
+  in the dispatch-sensitive 256..8192 buckets, flat elsewhere).
+- `dedup_dispatch`, `grouped_token_back`, `combine_format` — top-k dedup
+  on dispatch / combine and the quantized combine wire; see
+  `dedup_topk_design.md`.
 - `fp8_accum_mode`, `kind` (e4m3/e5m2), clamps.
 
 ## Sweep methodology + environment (reproduce recipe)

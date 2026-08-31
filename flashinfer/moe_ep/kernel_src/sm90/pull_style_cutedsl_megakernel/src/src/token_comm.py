@@ -414,6 +414,7 @@ class TokenInPullTokenBackPush:
         dedup_dispatch: bool = False,
         max_tokens_per_rank: int = 0,
         grouped_token_back: bool = False,
+        active_dispatch_warps: int = 1,
     ) -> None:
         self.world_size = world_size
         self.num_topk = num_topk
@@ -497,6 +498,28 @@ class TokenInPullTokenBackPush:
                 f"'atomic_counter'; got {token_back_schedule_mode!r}."
             )
         self.token_back_schedule_mode = token_back_schedule_mode
+        # How many of the (warpgroup-aligned) dispatch warps do token-comm
+        # work AT ALL (prep + barrier + pull + reuse token-back).  The
+        # physical warp count stays num_dispatch_warps -- the setmaxnreg
+        # register reallocation is warpgroup(4)-granular -- but the warps
+        # beyond active_dispatch_warps skip the whole dispatch body and only
+        # rejoin at kernel_tail, leaving them fully idle for future use.
+        # Sizing: sustained pull bandwidth ~= active_warps * SMs *
+        # hidden_bytes / read-RTT (one row in flight per warp); on H200
+        # (450 GB/s unidirectional) even 1 warp/SM (~132 rows in flight)
+        # exceeds the bandwidth-delay product, and measured EP4/EP8 sweeps
+        # rank 1 > 2 > 4 warps -- the shallowest NVLink read queue wins
+        # (a deep queue lengthens per-request RTT and fights the GEMM for
+        # L2/issue slots).  Deeper per-warp pipelining (donating idle
+        # warps' smem slots as extra in-flight stages) was measured at
+        # -0.8%..+0.1% net -- in-flight depth is not the bottleneck.
+        if active_dispatch_warps not in (1, 2, self.num_dispatch_warps):
+            raise ValueError(
+                "active_dispatch_warps must be 1, 2, or "
+                f"{self.num_dispatch_warps}; got {active_dispatch_warps}."
+            )
+        self.active_dispatch_warps = active_dispatch_warps
+        self.active_dispatch_threads = active_dispatch_warps * self.warp_threads
         self.dispatch_warp_start = dispatch_warp_start
         # Warps that share this CTA with the dispatch group but are not part
         # of it. They participate in kernel-tail / dispatch-with-other
@@ -531,7 +554,7 @@ class TokenInPullTokenBackPush:
             + self.num_token_back_threads
         )
         self.dispatch_to_sched_threads = (
-            self.num_dispatch_warps + 1 + self.num_token_back_warps
+            self.active_dispatch_warps + 1 + self.num_token_back_warps
         ) * self.warp_threads
         self.kernel_tail_threads = self.num_total_threads
 
@@ -690,17 +713,21 @@ class TokenInPullTokenBackPush:
         i = thread_idx_in_dispatch
         while i < Int32(self.num_total_experts):
             (smem_count_ptr + i).store(Int32(0))
-            i = i + Int32(self.num_dispatch_threads)
+            i = i + Int32(self.active_dispatch_threads)
         cute.arch.barrier(
             barrier_id=self.dispatch_intra_cta_bar_id,
-            number_of_threads=self.num_dispatch_threads,
+            number_of_threads=self.active_dispatch_threads,
         )
 
         tokens_per_warp: cutlass.Constexpr[int] = 32 // self.num_topk
         active_lanes: cutlass.Constexpr[int] = tokens_per_warp * self.num_topk
-        num_dispatch_warps_per_grid: cutlass.Constexpr[int] = num_sms * self.num_dispatch_warps
+        num_dispatch_warps_per_grid: cutlass.Constexpr[int] = (
+            num_sms * self.active_dispatch_warps
+        )
 
-        base_token_for_warp = (sm_idx * self.num_dispatch_warps + warp_idx) * tokens_per_warp
+        base_token_for_warp = (
+            sm_idx * self.active_dispatch_warps + warp_idx
+        ) * tokens_per_warp
         grid_token_stride = num_dispatch_warps_per_grid * tokens_per_warp
 
         t = base_token_for_warp
@@ -722,11 +749,11 @@ class TokenInPullTokenBackPush:
 
         cute.arch.barrier(
             barrier_id=self.dispatch_intra_cta_bar_id,
-            number_of_threads=self.num_dispatch_threads,
+            number_of_threads=self.active_dispatch_threads,
         )
 
         for offset in cutlass.range_constexpr(
-            0, self.num_total_experts, self.experts_per_dispatch_pass,
+            0, self.num_total_experts, self.active_dispatch_threads,
         ):
             expert_id = Int32(offset + warp_idx * self.warp_threads + lane_idx)
             if expert_id < Int32(self.num_total_experts):
@@ -743,7 +770,7 @@ class TokenInPullTokenBackPush:
                 (slot_ptr).store(base_slot)
         cute.arch.barrier(
             barrier_id=self.dispatch_intra_cta_bar_id,
-            number_of_threads=self.num_dispatch_threads,
+            number_of_threads=self.active_dispatch_threads,
         )
 
         if cutlass.const_expr(self.dedup_dispatch):
@@ -910,11 +937,11 @@ class TokenInPullTokenBackPush:
         tid_in_group = warp_idx * Int32(self.warp_threads) + lane_idx
 
         software_grid_sync(grid_sync_counter, sm_idx, num_sms, tid_in_group,
-                           num_threads=self.num_dispatch_threads)
+                           num_threads=self.active_dispatch_threads)
 
         if sm_idx == 0:
             for offset in cutlass.range_constexpr(
-                0, self.num_total_experts, self.experts_per_dispatch_pass,
+                0, self.num_total_experts, self.active_dispatch_threads,
             ):
                 expert_id = Int32(offset + warp_idx * self.warp_threads + lane_idx)
                 if expert_id < Int32(self.num_total_experts):
@@ -944,7 +971,7 @@ class TokenInPullTokenBackPush:
             cute.arch.fence_acq_rel_sys()
         cute.arch.barrier(
             barrier_id=self.dispatch_intra_cta_bar_id,
-            number_of_threads=self.num_dispatch_threads,
+            number_of_threads=self.active_dispatch_threads,
         )
 
         self.nvlink_barrier(
@@ -958,6 +985,7 @@ class TokenInPullTokenBackPush:
             num_sms=num_sms,
             prologue_grid_sync=False,
             epilogue_grid_sync=True,
+            sync_threads=self.active_dispatch_threads,
         )
     @cute.jit
     def dispatch_pull(
@@ -1033,8 +1061,10 @@ class TokenInPullTokenBackPush:
                 )
         cute.arch.sync_warp()
 
-        num_global_warps: cutlass.Constexpr[int] = num_sms * self.num_dispatch_warps
-        token_idx = sm_idx * Int32(self.num_dispatch_warps) + warp_idx
+        num_global_warps: cutlass.Constexpr[int] = (
+            num_sms * self.active_dispatch_warps
+        )
+        token_idx = sm_idx * Int32(self.active_dispatch_warps) + warp_idx
 
         _iket_pull_emit = (
             (sm_idx == Int32(0))
@@ -1743,6 +1773,7 @@ class TokenInPullTokenBackPush:
         local_rank,
         num_sms,
         chunk_bytes: cutlass.Constexpr[int],
+        num_walker_warps: cutlass.Constexpr[int],
     ):
         _iket_emit = (sm_idx == Int32(0)) and (warp_idx == Int32(0))
         avg_token_back_window = Int32(2500)
@@ -1771,9 +1802,7 @@ class TokenInPullTokenBackPush:
         num_experts_per_lane: cutlass.Constexpr[int] = (
             self.num_experts_per_rank + 31
         ) // 32
-        num_global_warps: cutlass.Constexpr[int] = (
-            num_sms * self.num_dispatch_warps
-        )
+        num_global_warps: cutlass.Constexpr[int] = num_sms * num_walker_warps
 
         if cutlass.const_expr(self.grouped_token_back):
             # A group's rows can belong to experts owned by OTHER dispatch
@@ -1783,7 +1812,7 @@ class TokenInPullTokenBackPush:
             # dispatch_pull's tail.
             spin_wait(
                 dispatch_done_counter.iterator,
-                lambda v: v >= Int32(num_global_warps),
+                lambda v: v >= Int32(num_sms * self.active_dispatch_warps),
                 fail_sleep_cycles=500,
             )
 
@@ -1826,7 +1855,7 @@ class TokenInPullTokenBackPush:
                 schedule_mode, atomic_batch, num_global_warps,
             )
         else:
-            token_idx = sm_idx * Int32(self.num_dispatch_warps) + warp_idx
+            token_idx = sm_idx * Int32(num_walker_warps) + warp_idx
             batch_remaining = Int32(0)
 
         current_expert_idx = Int32(-1)
@@ -2075,13 +2104,19 @@ class TokenInPullTokenBackPush:
         num_sms,
         prologue_grid_sync: cutlass.Constexpr[bool],
         epilogue_grid_sync: cutlass.Constexpr[bool],
+        sync_threads: cutlass.Constexpr[int] = 0,
     ):
         # software_grid_sync expects a dispatch-group-relative thread id.
+        # sync_threads: per-CTA arrival count for the grid syncs (0 -> the
+        # full dispatch group; dispatch_barrier passes the ACTIVE subset).
+        arrivals: cutlass.Constexpr[int] = (
+            sync_threads if sync_threads > 0 else self.num_dispatch_threads
+        )
         tid_in_group = warp_idx * Int32(self.warp_threads) + lane_idx
 
         if prologue_grid_sync:
             software_grid_sync(grid_sync_counter, sm_idx, num_sms, tid_in_group,
-                               num_threads=self.num_dispatch_threads)
+                               num_threads=arrivals)
 
         if sm_idx == 0:
             if warp_idx == 0:
@@ -2122,7 +2157,7 @@ class TokenInPullTokenBackPush:
 
         if epilogue_grid_sync:
             software_grid_sync(grid_sync_counter, sm_idx, num_sms, tid_in_group,
-                               num_threads=self.num_dispatch_threads)
+                               num_threads=arrivals)
 
     @cute.jit
     def dispatch_warp_body(
@@ -2247,6 +2282,7 @@ class TokenInPullTokenBackPush:
                 local_rank=token_comm_args.local_rank,
                 num_sms=token_comm_args.sm_count,
                 chunk_bytes=self.hidden_bytes,
+                num_walker_warps=self.active_dispatch_warps,
             )
 
             if iket_active:
@@ -2326,6 +2362,7 @@ class TokenInPullTokenBackPush:
             local_rank=token_comm_args.local_rank,
             num_sms=token_comm_args.sm_count,
             chunk_bytes=self.tb_chunk_bytes,
+            num_walker_warps=self.num_token_back_warps,
         )
 
         if iket_active:
