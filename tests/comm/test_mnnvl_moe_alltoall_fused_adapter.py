@@ -499,17 +499,18 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
         )
     assert launcher_source.count("params.elements_per_token % 8 == 0") == 2
     assert launcher_source.count("dim3 const topk6_grid(") == 1
-    assert (
-        "ceilDiv(params.elements_per_token, kCombineThreads * 8)" in launcher_source
-    )
+    assert "ceilDiv(params.elements_per_token, kCombineThreads * 8)" in launcher_source
     assert (
         "kernel_flashinfer_mnnvl_moe_alltoall_combine_bf16_topk6, topk6_grid, "
         "kCombineThreads, 0," in launcher_source
     )
     assert launcher_source.count("bool const fuse_topk6_publication =") == 2
-    assert launcher_source.count(
-        "useBf16TopK6Combine(params) && params.prepare_payload != nullptr"
-    ) == 2
+    assert (
+        launcher_source.count(
+            "useBf16TopK6Combine(params) && params.prepare_payload != nullptr"
+        )
+        == 2
+    )
     assert launcher_source.count("if (!fuse_topk6_publication)") == 2
     assert (
         "params.workspace_stride_bytes, flag_offset, completion_offset,"
@@ -519,8 +520,7 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
         "params.ep_rank, params.ep_size,\n"
         "        params.use_low_precision, params.enable_pdl, "
         "fuse_topk6_publication,\n"
-        "        params.enable_rank_mask, params.active_rank_mask[0]"
-        in launcher_source
+        "        params.enable_rank_mask, params.active_rank_mask[0]" in launcher_source
     )
 
     generated_root = Path(__file__).resolve().parents[2] / "csrc/generated"
@@ -530,9 +530,12 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
     ):
         generated_source = (generated_root / generated_name).read_text()
         normalized_generated_source = " ".join(generated_source.split())
-        assert normalized_generated_source.count(
-            "void kernel_flashinfer_mnnvl_moe_alltoall_"
-        ) == 19
+        assert (
+            normalized_generated_source.count(
+                "void kernel_flashinfer_mnnvl_moe_alltoall_"
+            )
+            == 19
+        )
         for top_k in (6, 8):
             assert (
                 normalized_generated_source.count(
@@ -547,7 +550,8 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
         )
         assert (
             "unsigned long long completion_flags_offset, "
-            "unsigned long long topk_target_ranks_offset," in normalized_generated_source
+            "unsigned long long topk_target_ranks_offset,"
+            in normalized_generated_source
         )
         assert (
             "int ep_size, bool use_low_precision, bool enable_pdl, "
@@ -583,18 +587,12 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
             1,
         )[0]
         assert "if (top_k == 6) { if (warp == 0) {" in dispatch_source
-        assert (
-            dispatch_source.count(
-                "__shfl_sync(0xFFFFFFFF, target_rank,"
-            )
-            == 5
-        )
+        assert dispatch_source.count("__shfl_sync(0xFFFFFFFF, target_rank,") == 5
         assert "} else if (tid == 0) {" in dispatch_source
         assert "smem_target_ranks[route] = stored_rank;" in dispatch_source
         assert (
             "workspace_i32[topk_workspace_base + "
-            "(unsigned long long)route] = stored_rank;"
-            in dispatch_source
+            "(unsigned long long)route] = stored_rank;" in dispatch_source
         )
 
     assert "uint64_t{kCombineThreads * 16}" in launcher_source
