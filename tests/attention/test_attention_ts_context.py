@@ -32,7 +32,7 @@ pytest.importorskip(
     reason="PrimTS attention tests require nvidia-cutlass-dsl==4.7.0",
 )
 
-from cutlass import BFloat16, Float16, Float8E4M3FN
+from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
 from cutlass.experimental.task_scheduling.enums import TileSchedulerType
 
 import flashinfer.attention.prims_ts.context as context_module
@@ -909,6 +909,47 @@ def test_attention_ts_context_heavy_first_static_raster_policy(
         )
         is expected
     )
+
+
+def test_attention_ts_context_uses_ldtm_stat_default_is_off():
+    """LDTM.STAT row_max is off unless FmhaTs(uses_ldtm_stat=True) is passed."""
+    from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
+        FmhaConfig,
+    )
+
+    assert FmhaConfig().uses_ldtm_stat is False
+
+    default_fmha = FmhaTs(
+        qk_acc_dtype=Float32,
+        pv_acc_dtype=Float32,
+        d=128,
+        is_persistent=True,
+    )
+    assert default_fmha.cfg.uses_ldtm_stat is False
+
+    enabled_fmha = FmhaTs(
+        qk_acc_dtype=Float32,
+        pv_acc_dtype=Float32,
+        d=128,
+        is_persistent=True,
+        uses_ldtm_stat=True,
+    )
+    assert enabled_fmha.cfg.uses_ldtm_stat is True
+
+
+def test_attention_ts_context_uses_ldtm_stat_schedule_builds():
+    """uses_ldtm_stat=True still builds the non-masked FMHA task graph."""
+    kernel = FmhaTs(
+        qk_acc_dtype=Float32,
+        pv_acc_dtype=Float32,
+        d=128,
+        is_persistent=True,
+        is_causal=False,
+        is_clc_dynamic=False,
+        uses_ldtm_stat=True,
+    )
+    assert kernel.cfg.uses_ldtm_stat is True
+    build_fmha_task_manager(kernel.cfg)
 
 
 @pytest.mark.parametrize(
