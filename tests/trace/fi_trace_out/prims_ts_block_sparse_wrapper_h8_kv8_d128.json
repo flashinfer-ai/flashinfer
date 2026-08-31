@@ -1,9 +1,9 @@
 {
-  "name": "prims_ts_block_sparse_h8_kv8_d128_qb64_kb64",
-  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact BSHD Q/K/V and per-KV-head BSR metadata.",
+  "name": "prims_ts_block_sparse_wrapper_h8_kv8_d128",
+  "description": "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact BSHD Q/K/V and live per-KV-head BSR metadata. Block geometry and mask type are retained by plan() and represented as optional trace context.",
   "op_type": "block_sparse",
   "tags": [
-    "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention",
+    "fi_api:flashinfer.attention.prims_ts.block_sparse.BlockSparseTSWrapper.run",
     "backend:prims-ts",
     "sparse:block",
     "status:experimental"
@@ -44,14 +44,6 @@
     "num_kv_valid_words": {
       "type": "var",
       "description": "Number of optional token-validity words per batch."
-    },
-    "q_block_size": {
-      "type": "const",
-      "value": 64
-    },
-    "kv_block_size": {
-      "type": "const",
-      "value": 64
     }
   },
   "constraints": [
@@ -100,7 +92,7 @@
         "num_q_block_offsets"
       ],
       "dtype": "int32",
-      "description": "Absolute offsets into block_indices, consumed by the one-shot call."
+      "description": "Absolute offsets into live block_indices for this wrapper run."
     },
     "block_indices": {
       "shape": [
@@ -116,15 +108,17 @@
       ],
       "dtype": "uint32",
       "optional": true,
-      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond Skv are ignored; consumed by the one-shot call."
+      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond the planned K/V capacity are ignored."
     },
     "q_block_size": {
       "shape": null,
-      "dtype": "int32"
+      "dtype": "int32",
+      "optional": true
     },
     "kv_block_size": {
       "shape": null,
-      "dtype": "int32"
+      "dtype": "int32",
+      "optional": true
     },
     "mask_type": {
       "shape": null,

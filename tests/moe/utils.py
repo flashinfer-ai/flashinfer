@@ -48,6 +48,7 @@ class QuantMode(IntEnum):
     FP8_PER_TENSOR = 6
     BF16 = 7
     MXINT4_BF16_BF16 = 8
+    FP8_PER_CHANNEL = 9
 
 
 @contextmanager
@@ -103,6 +104,7 @@ NON_GATED_ACTIVATION_SUPPORTED_QUANT_MODES = [
     QuantMode.FP8_BLOCK_SCALE_MXFP8,
     QuantMode.FP8_PER_TENSOR,
     QuantMode.BF16,
+    QuantMode.FP8_PER_CHANNEL,
 ]
 
 GEGLU_SUPPORTED_QUANT_MODES = [

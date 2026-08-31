@@ -2124,11 +2124,26 @@ def _validate_mla_dcp_args(
             )
         return backend
 
-    if query.ndim != 4:
-        raise ValueError(
-            "DCP requires a dense query with shape "
-            "[batch_size, q_len_per_request, num_heads, head_dim_qk]"
-        )
+    is_var_q = cum_seq_lens_q is not None
+    if is_var_q:
+        if not isinstance(cum_seq_lens_q, torch.Tensor):
+            raise TypeError(
+                "cum_seq_lens_q must be a torch.Tensor when DCP is enabled, got "
+                f"{type(cum_seq_lens_q).__name__}"
+            )
+        if query.ndim != 3:
+            raise ValueError(
+                "DCP with cum_seq_lens_q requires a compact query with shape "
+                "[total_q, num_heads, head_dim_qk]"
+            )
+        batch_size = cum_seq_lens_q.numel() - 1
+    else:
+        if query.ndim != 4:
+            raise ValueError(
+                "DCP without cum_seq_lens_q requires a dense query with shape "
+                "[batch_size, q_len_per_request, num_heads, head_dim_qk]"
+            )
+        batch_size = query.shape[0]
     if not 0 <= cp_rank < cp_world:
         raise ValueError(
             f"cp_rank must satisfy 0 <= cp_rank < cp_world, got "
@@ -2149,8 +2164,6 @@ def _validate_mla_dcp_args(
             "DCP cannot be combined with sinks: DCP requires monolithic "
             "CuTeDSL MLA, while sinks require the modular implementation"
         )
-    if cum_seq_lens_q is not None or max_q_len is not None:
-        raise ValueError("DCP does not support cum_seq_lens_q / max_q_len")
     if causal_seqlens_kv_global is None:
         raise ValueError("causal_seqlens_kv_global is required when enable_dcp=True")
     if not isinstance(causal_seqlens_kv_global, torch.Tensor):
@@ -2170,10 +2183,10 @@ def _validate_mla_dcp_args(
             "causal_seqlens_kv_global must be on the query device "
             f"{query.device}, got {causal_seqlens_kv_global.device}"
         )
-    if tuple(causal_seqlens_kv_global.shape) != (query.shape[0],):
+    if tuple(causal_seqlens_kv_global.shape) != (batch_size,):
         raise ValueError(
             "causal_seqlens_kv_global must have shape "
-            f"({query.shape[0]},), got {tuple(causal_seqlens_kv_global.shape)}"
+            f"({batch_size},), got {tuple(causal_seqlens_kv_global.shape)}"
         )
     if not causal_seqlens_kv_global.is_contiguous():
         raise ValueError("causal_seqlens_kv_global must be contiguous")
@@ -3082,6 +3095,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
         Statically enable cyclic decode context parallelism in the monolithic
         CuTeDSL MLA kernel. DCP returns a rank-local output/LSE state, so
         ``return_lse=True`` is required and the caller must merge rank states.
+        Both fixed-Q input and compact variable-Q input described by
+        ``cum_seq_lens_q`` are supported.
     cp_world : int = 1
         Compile-time context-parallel world size. Rank ``r`` stores global KV
         positions whose token index modulo ``cp_world`` equals ``r``.
@@ -3389,6 +3404,8 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 cute_dsl_impl=cute_dsl_impl,
                 cum_seq_lens_q=cum_seq_lens_q,
                 max_q_len=max_q_len,
+                enable_dcp=enable_dcp,
+                cp_world=cp_world,
             )
 
         selected_var_q_backend: str
@@ -3487,6 +3504,10 @@ def trtllm_batch_decode_with_kv_cache_mla(
                 cute_dsl_impl=cute_dsl_impl,
                 cum_seq_lens_q=cum_seq_lens_q,
                 max_q_len=max_q_len,
+                enable_dcp=enable_dcp,
+                cp_world=cp_world,
+                cp_rank=cp_rank,
+                causal_seqlens_kv_global=causal_seqlens_kv_global,
             )
 
         multi_ctas_kv_counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
