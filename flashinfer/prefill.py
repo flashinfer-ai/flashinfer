@@ -3496,7 +3496,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The indptr of the query/output tensor, shape: ``[batch_size + 1]``.
             For the ``cudnn`` backend the ``qo_indptr`` and ``kv_indptr`` are
             interpreted in **element units** (``cumsum(seq_lens) * num_heads *
-            head_dim_qk``), not token units.
+            head_dim_qk``), not token units. The ``cudnn`` backend also requires
+            ``kv_layout="NHD"``.
         kv_indptr : torch.Tensor
             The indptr of the key/value tensor, shape: ``[batch_size + 1]``.
         num_qo_heads : int
@@ -4289,6 +4290,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
             return (out, lse) if return_lse else out
         elif self._backend == "cudnn":
+            # cuDNN's ragged prefill graph has no kv_layout input and reads
+            # k.shape[1] as the kv head count, i.e. it assumes NHD. Reject HND
+            # loudly rather than silently addressing the wrong data.
+            if self._kv_layout != "NHD":
+                raise NotImplementedError(
+                    "cuDNN ragged prefill backend requires kv_layout='NHD'"
+                )
             if self._seq_lens_q.dim() == 1:
                 batch_size = self._seq_lens_q.shape[0]
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
