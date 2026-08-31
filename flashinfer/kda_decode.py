@@ -453,11 +453,20 @@ def kda_output_only_decode(
             ``use_gate_in_kernel=True``.
         dt_bias: ``[H*128]`` float32 per-channel decay bias (optional).
         scale: Query scale; defaults to ``128**-0.5``.
-        use_gate_in_kernel: Compute the gate in-kernel from raw ``g``.
-        lower_bound: If set (negative, e.g. ``-5.0`` for Kimi K3), uses the
-            ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`` gate;
-            otherwise the ``-exp(A_log) * softplus(g + dt_bias)`` gate. Only
-            meaningful with ``use_gate_in_kernel=True``.
+        use_gate_in_kernel: Compute the log-space gate in-kernel from raw
+            ``g``. The gate has three modes:
+
+            - ``use_gate_in_kernel=False``: ``g`` is already the log-space
+              gate and is used as-is (``A_log``, ``dt_bias`` and
+              ``lower_bound`` are ignored).
+            - ``use_gate_in_kernel=True, lower_bound=<negative float>``:
+              ``g_log = lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
+              (the Kimi K3 contract; ``lower_bound=-5.0``).
+            - ``use_gate_in_kernel=True, lower_bound=None``:
+              ``g_log = -exp(A_log) * softplus(g + dt_bias)``
+              (the original Kimi-Linear gate).
+        lower_bound: Selects the in-kernel gate formula; see
+            ``use_gate_in_kernel``. Must be negative when set.
         beta_is_logit: Apply sigmoid to ``beta`` inside the kernel.
         output: Optional preallocated contiguous ``[B, T, HV, 128]`` bf16
             output (required for allocation-free CUDA-graph replay).
