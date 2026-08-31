@@ -260,6 +260,7 @@ def test_fused_module_registers_the_existing_custom_ops(monkeypatch):
     import flashinfer.comm.trtllm_moe_alltoall as api
 
     registrations = []
+    capability_queries = []
 
     def register(name, *, mutates_args):
         def decorate(function):
@@ -276,9 +277,16 @@ def test_fused_module_registers_the_existing_custom_ops(monkeypatch):
     monkeypatch.setattr(api, "register_custom_op", register)
     monkeypatch.setattr(api, "gen_moe_alltoall_module", lambda target: FakeSpec())
     monkeypatch.setattr(api.torch.cuda, "current_device", lambda: 0)
-    monkeypatch.setattr(api.torch.cuda, "get_device_capability", lambda device: (10, 0))
+
+    def get_device_capability(device):
+        capability_queries.append(device)
+        return (10, 0)
+
+    monkeypatch.setattr(api.torch.cuda, "get_device_capability", get_device_capability)
     try:
         module = api.get_moe_alltoall_module()
+        assert api.get_moe_alltoall_module() is module
+        assert capability_queries == [0]
         assert set(vars(module)) == {
             "moe_a2a_initialize",
             "moe_a2a_dispatch",

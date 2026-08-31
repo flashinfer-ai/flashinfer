@@ -68,6 +68,7 @@ class _A2AState:
     eplb_gathered_stats: Optional[torch.Tensor] = None
 
 
+@functools.cache
 def _moe_alltoall_target(device_index: int) -> MoeAlltoAllTarget:
     capability = torch.cuda.get_device_capability(device_index)
     if capability == (10, 0):
@@ -367,8 +368,13 @@ def get_moe_alltoall_module():
     return _get_moe_alltoall_module_for_target(_moe_alltoall_target(device_index))
 
 
+def _clear_moe_alltoall_module_cache() -> None:
+    _moe_alltoall_target.cache_clear()
+    _get_moe_alltoall_module_for_target.cache_clear()
+
+
 get_moe_alltoall_module.cache_clear = (  # type: ignore[attr-defined]
-    _get_moe_alltoall_module_for_target.cache_clear
+    _clear_moe_alltoall_module_cache
 )
 
 

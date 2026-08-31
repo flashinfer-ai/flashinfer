@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <set>
+#include <utility>
 
 #include "flashinfer/exception.h"
 #include "tensorrt_llm/common/dataType.h"
@@ -109,10 +112,25 @@ uint64_t byteOffset(void const* pointer, uint8_t const* base) {
 
 template <typename KernelFn>
 void preloadKernel(char const* name, KernelFn kernel_fn) {
+  int device = -1;
+  cudaError_t const device_error = cudaGetDevice(&device);
+  FLASHINFER_CHECK(device_error == cudaSuccess, "cudaGetDevice (", name,
+                   ") failed: ", cudaGetErrorString(device_error));
+
+  using PreloadKey = std::pair<int, uintptr_t>;
+  static std::mutex preload_mutex;
+  static std::set<PreloadKey> preloaded_kernels;
+  PreloadKey const key{device, reinterpret_cast<uintptr_t>(kernel_fn)};
+  std::lock_guard<std::mutex> lock(preload_mutex);
+  if (preloaded_kernels.find(key) != preloaded_kernels.end()) {
+    return;
+  }
+
   cudaFuncAttributes attributes{};
   cudaError_t const error = cudaFuncGetAttributes(&attributes, kernel_fn);
   FLASHINFER_CHECK(error == cudaSuccess, "cudaFuncGetAttributes (", name,
                    ") failed: ", cudaGetErrorString(error));
+  preloaded_kernels.insert(key);
 }
 
 int dtypeBytes(nvinfer1::DataType dtype) {
