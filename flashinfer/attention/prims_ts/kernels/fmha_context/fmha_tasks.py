@@ -1078,6 +1078,18 @@ def create_softmax_task(
             src = _src_resources(tmem_sp, work_queue=work_queue)
             dst = [tmem_vec, tmem_p]
 
+            # Software-pipeline the vec-mbarrier acquire past the LDTM.STAT
+            # issue so the mbarrier try_wait overlaps with the in-flight
+            # tcgen05.ld.red.max latency.  Restricted to the schedule shape
+            # where it was measured to help (LDTM.STAT + causal-balanced);
+            # dense LDTM.STAT regresses under this reordering, so fall back
+            # to the original schedule for all other configs.
+            use_sw_pipeline = (
+                tmem_sp.cfg.uses_ldtm_stat
+                and tmem_sp.cfg.is_causal
+                and tmem_sp.cfg.balance_causal_workload
+            )
+
             @schedule
             def softmax_schedule(
                 sp: TmemSPResource,
@@ -1101,7 +1113,9 @@ def create_softmax_task(
                     window_end = Int32(0)
                     if tmem_sp.uses_variable_window:
                         window_start, window_end = sp.cache_variable_window_bounds()
-                    vec.acquire()
+                    if not use_sw_pipeline:
+                        # Reserve the first stats slot up-front.
+                        vec.acquire()
                     with domain_loop(loop_start, loop_end, loop_step):
                         # Softmax(i): wait for QK(Q,Ki) -> S(i).
                         sp.wait()
@@ -1140,6 +1154,12 @@ def create_softmax_task(
                         else:
                             old_row_max, row_max = sp.compute_row_max(row_max=row_max)
                         # Stats(i): S(i) -> row max/sum for correction.
+                        if use_sw_pipeline:
+                            # Acquire this iter's stats slot after LDTM.STAT
+                            # has been issued so the mbarrier try_wait
+                            # overlaps with the in-flight tcgen05.ld.red.max
+                            # latency.
+                            vec.acquire()
                         vec.store_vec(
                             old_row_max=old_row_max,
                             row_max=row_max,
@@ -1165,7 +1185,9 @@ def create_softmax_task(
                             p_chunk=p_chunk,
                             scale_softmax_log2=scale_softmax_log2,
                         )
-                        vec.acquire()
+                        if not use_sw_pipeline:
+                            # Reserve next iter / tail's stats slot.
+                            vec.acquire()
 
                     if tmem_sp.uses_head_paired_causal_tail_mask:
                         # Tail S: consume and mask the final head-paired score tile.
@@ -1175,6 +1197,8 @@ def create_softmax_task(
                             q_offset=q_offset,
                             section=FmhaStage.Tail,
                         )
+                        if use_sw_pipeline:
+                            vec.acquire()
                         vec.store_vec(
                             old_row_max=old_row_max,
                             row_max=row_max,
@@ -1196,13 +1220,17 @@ def create_softmax_task(
                             p_chunk=p_chunk,
                             scale_softmax_log2=scale_softmax_log2,
                         )
-                        vec.acquire()
+                        if not use_sw_pipeline:
+                            # Reserve the identity-drain stats slot.
+                            vec.acquire()
                         # Drain the final SP/P-ready slots and publish identity stats.
                         sp.wait()
                         sp.release()
                         tp.acquire()
                         tp.commit()
                         old_row_max = sp.softmax_aux_identity(row_max=row_max)
+                        if use_sw_pipeline:
+                            vec.acquire()
                         vec.store_vec(
                             old_row_max=old_row_max,
                             row_max=row_max,
@@ -1217,6 +1245,8 @@ def create_softmax_task(
                             row_max=row_max,
                             q_offset=q_offset,
                         )
+                        if use_sw_pipeline:
+                            vec.acquire()
                         vec.store_vec(
                             old_row_max=old_row_max,
                             row_max=row_max,
@@ -1272,6 +1302,8 @@ def create_softmax_task(
                             row_max=row_max,
                             q_offset=q_offset,
                         )
+                        if use_sw_pipeline:
+                            vec.acquire()
                         vec.store_vec(
                             old_row_max=old_row_max,
                             row_max=row_max,
@@ -1314,6 +1346,8 @@ def create_softmax_task(
                         tp.acquire()
                         tp.commit()
                         old_row_max = sp.softmax_aux_identity(row_max=row_max)
+                        if use_sw_pipeline:
+                            vec.acquire()
                         vec.store_vec(
                             old_row_max=old_row_max,
                             row_max=row_max,
@@ -1354,6 +1388,13 @@ def create_softmax_task(
         src = _src_resources(tmem_sp, work_queue=work_queue)
         dst = [tmem_vec]
 
+        # See variant above for the gating rationale.
+        use_sw_pipeline = (
+            tmem_sp.cfg.uses_ldtm_stat
+            and tmem_sp.cfg.is_causal
+            and tmem_sp.cfg.balance_causal_workload
+        )
+
         @schedule
         def softmax_schedule(
             sp: TmemSPResource,
@@ -1383,7 +1424,8 @@ def create_softmax_task(
                 window_end = Int32(0)
                 if tmem_sp.uses_variable_window:
                     window_start, window_end = sp.cache_variable_window_bounds()
-                vec.acquire()
+                if not use_sw_pipeline:
+                    vec.acquire()
                 with domain_loop(loop_start, loop_end, loop_step):
                     sp.wait()
                     if tmem_sp.uses_variable_window:
@@ -1420,6 +1462,11 @@ def create_softmax_task(
                         )
                     else:
                         old_row_max, row_max = sp.row_max(row_max)
+                    if use_sw_pipeline:
+                        # Acquire this iter's stats slot after LDTM.STAT has
+                        # been issued so the mbarrier try_wait overlaps with
+                        # the in-flight tcgen05.ld.red.max latency.
+                        vec.acquire()
                     vec.store_vec(
                         old_row_max,
                         row_max,
@@ -1431,7 +1478,8 @@ def create_softmax_task(
                     row_sum = sp.softmax_post_release_reduce(
                         old_row_max, row_max, row_sum, p_chunk
                     )
-                    vec.acquire()
+                    if not use_sw_pipeline:
+                        vec.acquire()
 
                 if tmem_sp.uses_head_paired_causal_tail_mask:
                     sp.wait()
@@ -1440,6 +1488,8 @@ def create_softmax_task(
                         q_offset=q_offset,
                         section=FmhaStage.Tail,
                     )
+                    if use_sw_pipeline:
+                        vec.acquire()
                     vec.store_vec(
                         old_row_max,
                         row_max,
@@ -1451,10 +1501,13 @@ def create_softmax_task(
                     row_sum = sp.softmax_post_release_reduce(
                         old_row_max, row_max, row_sum, p_chunk
                     )
-                    vec.acquire()
+                    if not use_sw_pipeline:
+                        vec.acquire()
                     sp.wait()
                     sp.release()
                     old_row_max = sp.softmax_post_release_identity(row_max)
+                    if use_sw_pipeline:
+                        vec.acquire()
                     vec.store_vec(
                         old_row_max,
                         row_max,
@@ -1468,6 +1521,8 @@ def create_softmax_task(
                         row_max=row_max,
                         q_offset=q_offset,
                     )
+                    if use_sw_pipeline:
+                        vec.acquire()
                     vec.store_vec(old_row_max, row_max, row_sum)
                     vec.commit()
                     p_chunk = sp.masked_exp2_p(
@@ -1502,6 +1557,8 @@ def create_softmax_task(
                         row_max=row_max,
                         q_offset=q_offset,
                     )
+                    if use_sw_pipeline:
+                        vec.acquire()
                     vec.store_vec(old_row_max, row_max, row_sum)
                     vec.commit()
                     p_chunk = sp.masked_exp2_p(
@@ -1526,6 +1583,8 @@ def create_softmax_task(
                     sp.wait()
                     sp.release()
                     old_row_max = sp.softmax_post_release_identity(row_max)
+                    if use_sw_pipeline:
+                        vec.acquire()
                     vec.store_vec(old_row_max, row_max, row_sum)
                     vec.commit()
 
@@ -1552,6 +1611,17 @@ def create_softmax_task(
     dst = [tmem_vec]
     if s0s1_seq is not None and index == 0:
         dst.append(s0s1_seq)
+
+    # Software-pipeline the vec-mbarrier acquire past the LDTM.STAT issue so the
+    # mbarrier try_wait overlaps with the in-flight tcgen05.ld.red.max latency.
+    # Restricted to the schedule shape where it was measured to help (LDTM.STAT
+    # + causal-balanced); dense LDTM.STAT regresses under this reordering, so
+    # fall back to the original schedule for all other configs.
+    use_sw_pipeline = (
+        tmem_sp.cfg.uses_ldtm_stat
+        and tmem_sp.cfg.is_causal
+        and tmem_sp.cfg.balance_causal_workload
+    )
 
     @schedule
     def softmax_schedule(
@@ -1581,8 +1651,9 @@ def create_softmax_task(
             window_end = Int32(0)
             if tmem_sp.uses_variable_window:
                 window_start, window_end = sp.cache_variable_window_bounds()
-            # Reserve a stats slot before the first softmax result is published.
-            vec.acquire()
+            if not use_sw_pipeline:
+                # Reserve the first stats slot up-front.
+                vec.acquire()
             with domain_loop(loop_start, loop_end, loop_step):
                 sp.wait()
                 # Compute row max and publish vec.
@@ -1620,6 +1691,11 @@ def create_softmax_task(
                     )
                 else:
                     old_row_max, row_max = sp.compute_row_max(row_max=row_max)
+                if use_sw_pipeline:
+                    # Acquire this iter's stats slot after LDTM.STAT has been
+                    # issued so the mbarrier try_wait overlaps with the
+                    # in-flight tcgen05.ld.red.max latency.
+                    vec.acquire()
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -1654,8 +1730,9 @@ def create_softmax_task(
                     p_chunk=p_chunk,
                     scale_softmax_log2=scale_softmax_log2,
                 )
-                # Acquire vec for next iter.
-                vec.acquire()
+                if not use_sw_pipeline:
+                    # Reserve next iter / tail's stats slot.
+                    vec.acquire()
 
             if tmem_sp.uses_head_paired_causal_tail_mask:
                 # Head-paired maps Q0/Q1 to adjacent Hq slices at the same S
@@ -1667,6 +1744,8 @@ def create_softmax_task(
                     q_offset=q_offset,
                     section=FmhaStage.Tail,
                 )
+                if use_sw_pipeline:
+                    vec.acquire()
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -1697,10 +1776,14 @@ def create_softmax_task(
                     p_chunk=p_chunk,
                     scale_softmax_log2=scale_softmax_log2,
                 )
-                vec.acquire()
+                if not use_sw_pipeline:
+                    # Reserve the identity-drain stats slot.
+                    vec.acquire()
                 sp.wait()
                 sp.release()
                 old_row_max = sp.softmax_aux_identity(row_max=row_max)
+                if use_sw_pipeline:
+                    vec.acquire()
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -1717,6 +1800,8 @@ def create_softmax_task(
                     row_max=row_max,
                     q_offset=q_offset,
                 )
+                if use_sw_pipeline:
+                    vec.acquire()
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -1773,6 +1858,8 @@ def create_softmax_task(
                     row_max=row_max,
                     q_offset=q_offset,
                 )
+                if use_sw_pipeline:
+                    vec.acquire()
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,
@@ -1812,6 +1899,8 @@ def create_softmax_task(
                 sp.wait()
                 sp.release()
                 old_row_max = sp.softmax_aux_identity(row_max=row_max)
+                if use_sw_pipeline:
+                    vec.acquire()
                 vec.store_vec(
                     old_row_max=old_row_max,
                     row_max=row_max,

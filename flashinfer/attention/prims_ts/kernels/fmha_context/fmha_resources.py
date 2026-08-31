@@ -91,6 +91,7 @@ from .helpers import (
     variable_window_cta_min_start,
 )
 from cutlass.experimental import primitives as prims
+from cutlass._mlir.dialects import arith as arith_dialect
 
 SmemDescOffsets: TypeAlias = tuple[int, int]
 TmemAddr: TypeAlias = int | Int32
@@ -331,6 +332,14 @@ class FmhaConfig:
 
     seq_tile_n: int = 128
     tmem_x_load_s: int = 32
+    # Opt-in to `tcgen05.ld.red.max` (LDTM.STAT) for the non-masked
+    # `compute_row_max` path: fuses the per-chunk max into the TMEM load.
+    # Requires SM103+/SM110+ with tcgen05.ld.red support; the primitive is
+    # emitted with the 32dp x 32bit x 32rep shape only.
+    # Also switches the correction O-rescale loop to a software-pipelined
+    # form (ld[i] issued alongside st[i-1]) so the shared tcgen05 issue pipe
+    # can overlap loads and stores while softmax LDTM.STAT is in flight.
+    uses_ldtm_stat: bool = False
     # Causal S_q < S_kv shifts Q rows right by q_offset = S_kv - S_q.
     # This flag selects the shifted causal mask; there is no second causal mode.
     has_q_offset: bool = False
@@ -2530,6 +2539,53 @@ class TmemSPResource(MemoryResource):
         return old_row_max, row_max_safe
 
     @cute.jit
+    def _load_s_chunks_and_reduce_row_max(
+        self,
+        stage_info: StageInfo,
+        row_max: SoftmaxScalar,
+    ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
+        """LDTM.STAT: fuse S load and per-chunk row_max via tcgen05.ld.red.max.
+
+        Instead of loading each S chunk with ``tcgen05.ld`` and then folding
+        a per-lane max in registers, use ``tcgen05.ld.red.max`` so the
+        reduction happens as part of the TMEM load.  Only valid on the
+        non-masked path (masked variants must observe raw S values before
+        applying the mask).
+        """
+        tmem_s_addr = self.tmem_s_addr_cached + self._stage_col_offset(stage_info)
+        tmem_x = self.cfg.tmem_x_load_s
+        num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
+        old_row_max = row_max
+        s_data: SoftmaxChunks = [None] * num_chunks
+        for chunk_idx in cutlass.range_constexpr(num_chunks):
+            loaded_words, red_word = prims.tcgen05_ld_red(
+                prims.Tcgen05LdStShape.SHAPE_32X32B,
+                prims.make_tmem_ptr(
+                    tmem_s_addr + chunk_idx * tmem_x, self.cfg.qk_acc_dtype
+                ),
+                prims.ReductionKind.MAX,
+                num=tmem_x,
+            )
+            s_data[chunk_idx] = cutlass.Vector.from_elements(
+                tuple(
+                    loaded_words[i].bitcast(self.cfg.qk_acc_dtype)
+                    for i in range(tmem_x)
+                ),
+                dtype=self.cfg.qk_acc_dtype,
+            )
+            chunk_max = self.cfg.qk_acc_dtype(
+                arith_dialect.bitcast(
+                    self.cfg.qk_acc_dtype.mlir_type, red_word.ir_value()
+                )
+            )
+            row_max = cute.math.max(row_max, chunk_max)
+        _tmem_sp_sdata[id(self)] = s_data
+        row_max_safe = row_max
+        if row_max == -Float32.inf:
+            row_max_safe = Float32(0.0)
+        return old_row_max, row_max_safe
+
+    @cute.jit
     def _exp2_p_store(
         self,
         stage_col_offset: TmemAddr,
@@ -2970,6 +3026,8 @@ class TmemSPResource(MemoryResource):
         row_max: SoftmaxScalar,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Main K-loop stage: load S from TMEM and compute unmasked row_max."""
+        if cutlass.const_expr(self.cfg.uses_ldtm_stat):
+            return self._load_s_chunks_and_reduce_row_max(stage_info, row_max)
         s_data = self._load_s_chunks(stage_info)
         return self._reduce_row_max(s_data, row_max)
 
@@ -4342,20 +4400,43 @@ class TmemOResource(MemoryResource):
             tmem_x = 16
 
             num_iters = self.cfg.cta_tiler[2] // tmem_x
-            for i in cutlass.range_constexpr(num_iters):
-                tmem_tile_addr = tmem_o_addr + i * tmem_x
-                tmem_ptr = cutlass.inttoptr(
-                    tmem_tile_addr,
+
+            def _tmem_ptr(i: int):
+                return cutlass.inttoptr(
+                    tmem_o_addr + i * tmem_x,
                     mem_space=6,
                     dtype=self.cfg.pv_acc_dtype,
                 )
 
-                # Load from TMEM as vector, scale, store back
-                o_vec = prims.tcgen05_ld(tmem_shape, tmem_ptr, num=tmem_x)
+            if cutlass.const_expr(self.cfg.uses_ldtm_stat):
+                # Software-pipeline: ld[i] issued alongside st[i-1] each
+                # iteration, breaking the ld->st chain so the tcgen05 issue
+                # pipe can overlap loads and stores. Prologue issues ld[0];
+                # steady-state issues ld[i]+st[i-1]; epilogue drains st[N-1].
+                ptr0 = _tmem_ptr(0)
+                v_prev = prims.tcgen05_ld(tmem_shape, ptr0, num=tmem_x)
                 cute.arch.fence_view_async_tmem_load()
-                scale_vec = cutlass.vector.full_like(o_vec, scale)
-                o_scaled = o_vec * scale_vec
-                prims.tcgen05_st(tmem_shape, tmem_ptr, o_scaled)
+                scale_vec = cutlass.vector.full_like(v_prev, scale)
+                s_prev = v_prev * scale_vec
+                ptr_prev = ptr0
+
+                for i in cutlass.range_constexpr(1, num_iters):
+                    ptr_i = _tmem_ptr(i)
+                    v_i = prims.tcgen05_ld(tmem_shape, ptr_i, num=tmem_x)
+                    cute.arch.fence_view_async_tmem_load()
+                    prims.tcgen05_st(tmem_shape, ptr_prev, s_prev)
+                    s_prev = v_i * scale_vec
+                    ptr_prev = ptr_i
+
+                prims.tcgen05_st(tmem_shape, ptr_prev, s_prev)
+            else:
+                for i in cutlass.range_constexpr(num_iters):
+                    tmem_ptr = _tmem_ptr(i)
+                    o_vec = prims.tcgen05_ld(tmem_shape, tmem_ptr, num=tmem_x)
+                    cute.arch.fence_view_async_tmem_load()
+                    scale_vec = cutlass.vector.full_like(o_vec, scale)
+                    o_scaled = o_vec * scale_vec
+                    prims.tcgen05_st(tmem_shape, tmem_ptr, o_scaled)
 
             cute.arch.fence_view_async_tmem_store()
         # else: skip TMEM rescale entirely when scale=1.0

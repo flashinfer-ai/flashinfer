@@ -32,7 +32,7 @@ pytest.importorskip(
     reason="PrimTS attention tests require nvidia-cutlass-dsl==4.7.0",
 )
 
-from cutlass import BFloat16, Float16, Float8E4M3FN
+from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
 from cutlass.experimental.task_scheduling.enums import TileSchedulerType
 
 import flashinfer.attention.prims_ts.context as context_module
@@ -909,6 +909,57 @@ def test_attention_ts_context_heavy_first_static_raster_policy(
         )
         is expected
     )
+
+
+def test_attention_ts_context_uses_ldtm_stat_default_is_off():
+    """The LDTM.STAT (tcgen05.ld.red.max) row_max path is opt-in.
+
+    Existing callers must not see a behavior change: FmhaConfig defaults the
+    flag to False, and FmhaTs must forward the kwarg to cfg.uses_ldtm_stat so
+    callers can flip the routing without reaching into resource internals.
+    """
+    from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_resources import (
+        FmhaConfig,
+    )
+
+    assert FmhaConfig().uses_ldtm_stat is False
+
+    default_fmha = FmhaTs(
+        qk_acc_dtype=Float32,
+        pv_acc_dtype=Float32,
+        d=128,
+        is_persistent=True,
+    )
+    assert default_fmha.cfg.uses_ldtm_stat is False
+
+    enabled_fmha = FmhaTs(
+        qk_acc_dtype=Float32,
+        pv_acc_dtype=Float32,
+        d=128,
+        is_persistent=True,
+        uses_ldtm_stat=True,
+    )
+    assert enabled_fmha.cfg.uses_ldtm_stat is True
+
+
+def test_attention_ts_context_uses_ldtm_stat_schedule_builds():
+    """The LDTM.STAT flag flows through the non-masked schedule without
+    changing schedule shape (routing is inside compute_row_max, not the
+    task graph)."""
+    kernel = FmhaTs(
+        qk_acc_dtype=Float32,
+        pv_acc_dtype=Float32,
+        d=128,
+        is_persistent=True,
+        is_causal=False,
+        is_clc_dynamic=False,
+        uses_ldtm_stat=True,
+    )
+    assert kernel.cfg.uses_ldtm_stat is True
+    # Building the task manager exercises the full task graph construction,
+    # which is where any schedule-shape divergence would surface. The routing
+    # itself lives inside compute_row_max on TmemSPResource.
+    build_fmha_task_manager(kernel.cfg)
 
 
 @pytest.mark.parametrize(
