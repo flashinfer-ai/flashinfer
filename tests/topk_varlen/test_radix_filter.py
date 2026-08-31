@@ -382,3 +382,83 @@ def test_out_buffers_written_in_place():
         sel = oi[b][oi[b] >= 0]
         kth = torch.topk(logits[b], k).values.min()
         assert bool((logits[b][sel.long()] >= kth - 1e-4).all())
+
+
+def test_tma_forced_on_misaligned_stride_fails_fast():
+    """Forced TMA with a 16-byte-misaligned leading stride must fail fast.
+
+    With the symbolic leading stride, num_cols divisibility no longer implies
+    the row byte-stride alignment cuTensorMapEncodeTiled requires; a padded
+    view (stride(0) = N + 1) previously reached the descriptor and failed with
+    an opaque error after compiling. Now the wrapper raises an actionable
+    ValueError before compilation. Runs on any radix_filter arch because
+    enable_tma_load=True bypasses the tuned default.
+
+    Regression for PR #4621 review round 2 (TMA stride gate).
+    """
+    device = torch.device("cuda")
+    _skip_unless_radix_filter(device)
+
+    from flashinfer.topk_varlen.kernels.filtered_topk_decode import (
+        _get_num_sms,
+        cute_dsl_radix_filter_topk_wrapper,
+    )
+
+    sms = _get_num_sms(device)
+    B, N, k = sms + 2, 4096, 512  # rows > SMs => large-occupancy TMA path
+    base = torch.randn(B, N + 1, dtype=torch.float32, device=device)
+    view = base[:, :N]
+    assert view.stride(0) % 4 != 0  # fp32 _tma_div == 4
+    seq_lens = torch.full((B,), N, dtype=torch.int32, device=device)
+
+    with pytest.raises(ValueError, match=r"16-byte"):
+        cute_dsl_radix_filter_topk_wrapper(
+            view,
+            seq_lens,
+            k,
+            1,
+            return_val=False,
+            cluster_size=1,
+            enable_tma_load=True,
+        )
+
+
+def test_tma_auto_falls_back_on_misaligned_stride():
+    """The tuned auto-TMA default must fall back to LDG on misaligned strides.
+
+    On the arch where the tuned default fires (fp32, Rubin, large N,
+    rows > SMs), a padded view with stride(0) % 4 != 0 previously auto-enabled
+    TMA and failed inside cuTensorMapEncodeTiled; the stride-aware gate keeps
+    the call on the LDG path, which must produce correct top-k.
+
+    Regression for PR #4621 review round 2 (TMA stride gate, auto path).
+    """
+    device = torch.device("cuda")
+    _skip_unless_radix_filter(device)
+
+    import cutlass
+
+    from flashinfer.topk_varlen.kernels.filtered_topk_util import (
+        get_topk_architecture_config,
+        tma_tuned_default,
+    )
+
+    architecture, _ = get_topk_architecture_config()
+    if not tma_tuned_default(cutlass.Float32, architecture, 131072):
+        pytest.skip("async-TMA tuned default not active on this arch")
+
+    torch.manual_seed(23)
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    B, N, k = sms + 2, 131072, 2048
+    base = torch.randn(B, N + 1, dtype=torch.float32, device=device)
+    view = base[:, :N]
+    assert view.stride(0) % 4 != 0
+    seq_lens = torch.full((B,), N, dtype=torch.int32, device=device)
+
+    idx, _ = flashinfer.top_k_varlen(view, seq_lens, k, backend="radix_filter")
+    idx = idx.view(B, k)
+    for b in (0, B // 2, B - 1):
+        sel = idx[b][idx[b] >= 0]
+        assert sel.numel() == k and sel.unique().numel() == k
+        kth = torch.topk(view[b], k).values.min()
+        assert bool((view[b][sel.long()] >= kth - 1e-4).all()), f"row {b}"

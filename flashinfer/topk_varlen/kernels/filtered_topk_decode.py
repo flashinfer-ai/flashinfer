@@ -835,12 +835,32 @@ def _prepare_one_pass_topk(
     _tuned_tma = (
         tma_tuned_default(dtype, architecture, bucketed_num_cols)
         and (num_cols % _tma_div == 0)
+        # With the symbolic leading stride, num_cols divisibility alone no
+        # longer proves the TMA row stride is 16-byte aligned: a padded view
+        # (stride(0) > num_cols) can carry a misaligned byte stride that
+        # cuTensorMapEncodeTiled rejects. The auto default therefore also
+        # requires an aligned leading stride and falls back to LDG otherwise.
+        # DIVERGENCE FROM UPSTREAM (compact-only fake), after review
+        # (flashinfer PR #4621).
+        and (input_values.stride(0) % _tma_div == 0)
         # TMA aliases the candidate buffer; REREAD_ALWAYS allocates none, so the
         # auto default must skip it (env-forced TMA still hits the explicit guard).
         and overflow_policy != "REREAD_ALWAYS"
     )
     _enable_tma_load = _tma_ok and auto_tma_load(enable_tma_load, _tuned_tma)
     _enable_tma_load_p3 = _tma_ok and auto_tma_load(enable_tma_load_p3, _tuned_tma)
+    if (_enable_tma_load or _enable_tma_load_p3) and (
+        input_values.stride(0) % _tma_div != 0
+    ):
+        # Only reachable when TMA is forced explicitly (argument or env var):
+        # fail fast with an actionable message instead of the opaque
+        # cuTensorMapEncodeTiled error from inside the launch.
+        raise ValueError(
+            f"TMA load requires the input leading stride to be 16-byte "
+            f"aligned (divisible by {_tma_div} elements for this dtype); got "
+            f"stride(0)={input_values.stride(0)}. Disable enable_tma_load or "
+            f"pass a compact/aligned input."
+        )
 
     key = (
         _compile_cc(input_values.device),
@@ -869,12 +889,18 @@ def _prepare_one_pass_topk(
         # a framework's score buffer sliced to the vocab width) is part of
         # the declared ABI, zero-copy. Inner stride stays 1 and the base
         # stays 32-byte aligned; the public wrapper materializes inputs
-        # violating those. DIVERGENCE FROM UPSTREAM (compact-only fake),
-        # after review (flashinfer PR #4621).
+        # violating those. When TMA is enabled the leading stride also
+        # declares the 16-byte divisibility the descriptor needs, so a
+        # misaligned runtime stride is rejected at argument check rather
+        # than inside cuTensorMapEncodeTiled. DIVERGENCE FROM UPSTREAM
+        # (compact-only fake), after review (flashinfer PR #4621).
         input_fake = cute.runtime.make_fake_tensor(
             dtype,
             (n_rows, n_cols),
-            stride=(cute.sym_int64(), 1),
+            stride=(
+                cute.sym_int64(divisibility=_tma_div) if _tma_on else cute.sym_int64(),
+                1,
+            ),
             assumed_align=32,
         )
         if overflow_policy in ("GMEM_SPILL", "BOUNDED_SPILL"):
