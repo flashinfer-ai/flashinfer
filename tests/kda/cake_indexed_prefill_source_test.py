@@ -45,6 +45,21 @@ def _write_record(root: Path, relative: str, payload: bytes) -> dict[str, object
     }
 
 
+def _manifest(root: Path) -> list[dict[str, object]]:
+    records = []
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            payload = path.read_bytes()
+            records.append(
+                {
+                    "path": path.relative_to(root).as_posix(),
+                    "sha256": _sha256(payload),
+                    "size_bytes": len(payload),
+                }
+            )
+    return records
+
+
 def _catalog_tree(root: Path) -> tuple[loader._TargetRecord, ...]:
     targets = []
     for target, architecture in (("sm100a", "sm_100a"), ("sm103a", "sm_103a")):
@@ -124,8 +139,14 @@ def _catalog_tree(root: Path) -> tuple[loader._TargetRecord, ...]:
         "kind": "flashinfer.cake_kda_indexed_prefill.import_receipt",
         "schema_version": 1,
         "catalog_sha256": _sha256(catalog_payload),
-        "inputs": [],
-        "outputs": [],
+        "inputs": [
+            {
+                "target": target,
+                "archive_sha256": _sha256(f"archive-{target}".encode()),
+            }
+            for target in ("sm100a", "sm103a")
+        ],
+        "outputs": _manifest(root),
         "passed": True,
     }
     (root / "cake_kda_import_receipt.json").write_text(
@@ -150,6 +171,14 @@ def test_source_catalog_verifies_complete_target_module_and_source_closure(
 
     targets[0].modules[0].cuda_source.path.write_bytes(b"drift")
     with pytest.raises(loader.CakeKDAIndexedPrefillError, match="content identity"):
+        loader._read_catalog(tmp_path)
+
+
+def test_source_catalog_rejects_files_outside_the_import_receipt(tmp_path: Path) -> None:
+    _catalog_tree(tmp_path)
+    (tmp_path / "cake_unbound_source.cu").write_text("// unbound\n")
+
+    with pytest.raises(loader.CakeKDAIndexedPrefillError, match="source closure"):
         loader._read_catalog(tmp_path)
 
 

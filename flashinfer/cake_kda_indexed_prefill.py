@@ -194,6 +194,28 @@ def _source_record(root: Path, value: object, label: str) -> _SourceRecord:
     )
 
 
+def _installed_source_manifest(root: Path) -> list[dict[str, object]]:
+    records: list[dict[str, object]] = []
+    receipt_name = "cake_kda_import_receipt.json"
+    for path in sorted(root.rglob("*")):
+        _require(not path.is_symlink(), "Cake KDA source closure contains a symlink")
+        if path.is_dir():
+            continue
+        _require(path.is_file(), "Cake KDA source closure contains a non-regular file")
+        relative = path.relative_to(root).as_posix()
+        if relative == receipt_name:
+            continue
+        payload = path.read_bytes()
+        records.append(
+            {
+                "path": relative,
+                "sha256": _sha256(payload),
+                "size_bytes": len(payload),
+            }
+        )
+    return records
+
+
 def _verify_catalog_receipt(root: Path, catalog_payload: bytes) -> None:
     receipt_path = root / "cake_kda_import_receipt.json"
     _require(
@@ -218,10 +240,29 @@ def _verify_catalog_receipt(root: Path, catalog_payload: bytes) -> None:
     )
     _require(
         _full_sha256(receipt["catalog_sha256"], "import receipt.catalog_sha256")
-        == _sha256(catalog_payload)
-        and isinstance(receipt["inputs"], list)
-        and isinstance(receipt["outputs"], list),
+        == _sha256(catalog_payload),
         "Cake KDA source catalog differs from its import receipt",
+    )
+    inputs = receipt["inputs"]
+    _require(
+        isinstance(inputs, list) and len(inputs) == len(_TARGET_ARCHITECTURES),
+        "Cake KDA import receipt input denominator differs",
+    )
+    for index, target in enumerate(_TARGET_ARCHITECTURES):
+        item = _object(
+            inputs[index],
+            {"target", "archive_sha256"},
+            f"import receipt.inputs[{index}]",
+        )
+        _require(item["target"] == target, "Cake KDA import receipt target order differs")
+        _full_sha256(
+            item["archive_sha256"],
+            f"import receipt.inputs[{index}].archive_sha256",
+        )
+    outputs = receipt["outputs"]
+    _require(
+        isinstance(outputs, list) and outputs == _installed_source_manifest(root),
+        "Cake KDA installed source closure differs from its import receipt",
     )
 
 
