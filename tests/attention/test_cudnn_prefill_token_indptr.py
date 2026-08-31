@@ -14,16 +14,6 @@ from flashinfer.cudnn import prefill as cudnn_prefill
 from flashinfer.utils import get_compute_capability
 
 
-def _skip_if_cudnn_prefill_unsupported():
-    if not cudnn_prefill.CUDNN_AVAILABLE:
-        pytest.skip("cudnn-frontend python package not available")
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA device required")
-    # cuDNN fused SDPA prefill requires Ampere or newer.
-    if get_compute_capability(torch.device("cuda:0"))[0] < 8:
-        pytest.skip("cuDNN SDPA prefill requires compute capability >= 8.0")
-
-
 @pytest.mark.parametrize("batch_size", [1, 4])
 @pytest.mark.parametrize("s_qo", [32, 87])
 @pytest.mark.parametrize("s_kv", [87, 512])
@@ -230,7 +220,11 @@ def test_cudnn_prefill_lse_is_base2(num_kv_heads):
     """cuDNN returns base-2 LSE (log2 sum exp scores), matching every other
     FlashInfer backend. cuDNN's frontend emits natural-log stats, so the prefill
     path folds them to base-2; verify against a float reference."""
-    _skip_if_cudnn_prefill_unsupported()
+    if not cudnn_prefill.CUDNN_AVAILABLE:
+        pytest.skip("cudnn-frontend python package not available")
+    # cuDNN fused SDPA prefill requires Ampere or newer.
+    if get_compute_capability(torch.device("cuda:0"))[0] < 8:
+        pytest.skip("cuDNN SDPA prefill requires compute capability >= 8.0")
 
     from flashinfer.utils import log2e
 
