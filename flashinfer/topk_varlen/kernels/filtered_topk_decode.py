@@ -93,6 +93,21 @@ def _compile_cc(device: torch.device) -> str:
     return f"sm{major}{minor}"
 
 
+def _dsl_gpu_arch(device: torch.device) -> str:
+    """Explicit ``cute.compile`` target for *device* (e.g. ``"sm_100a"``).
+
+    Without an explicit ``--gpu-arch``, the DSL resolves its target from the
+    process-ambient device, which can disagree with the INPUT tensor's device
+    on a multi-GPU host (e.g. cutlass imported while cuda:0 is current, input
+    on cuda:1): the kernel then compiles for the wrong architecture even
+    under ``torch.cuda.device(input.device)``, failing in ptxas at best and
+    persisting a wrong-arch artifact under the right-arch module directory at
+    worst. DIVERGENCE FROM UPSTREAM, after review (flashinfer PR #4621).
+    """
+    major, minor = torch.cuda.get_device_capability(device)
+    return f"sm_{major}{minor}{'a' if major >= 9 else ''}"
+
+
 def _persistent_compile(kernel_name: str, compile_fn):
     """Route a ``cute.compile`` through FlashInfer's persistent JIT cache.
 
@@ -980,7 +995,7 @@ def _prepare_one_pass_topk(
                 output_values_fake,
                 stream=fake_stream,
                 min_blocks_per_mp=min_blocks_per_mp,
-                options="--enable-tvm-ffi",
+                options=f"--enable-tvm-ffi --gpu-arch={_dsl_gpu_arch(input_values.device)}",
             ),
         )
         compiled_filter_topk_dict[key] = compiled_kernel
@@ -1273,7 +1288,7 @@ def _prepare_multi_pass_multi_cta_topk(
                 first_kernel_output_values_fake,
                 stream=fake_stream,
                 min_blocks_per_mp=min_blocks_per_mp,
-                options="--enable-tvm-ffi",
+                options=f"--enable-tvm-ffi --gpu-arch={_dsl_gpu_arch(input_values.device)}",
             ),
         )
 
@@ -1327,7 +1342,7 @@ def _prepare_multi_pass_multi_cta_topk(
                 output_values_fake,
                 stream=fake_stream,
                 min_blocks_per_mp=min_blocks_per_mp,
-                options="--enable-tvm-ffi",
+                options=f"--enable-tvm-ffi --gpu-arch={_dsl_gpu_arch(input_values.device)}",
             ),
         )
 
