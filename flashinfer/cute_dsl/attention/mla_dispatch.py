@@ -10,7 +10,8 @@ controlled by the ``cute_dsl_impl`` kwarg, with three valid values:
 * ``"auto"`` (default) — library picks the right implementation.
   Monolithic by default, automatically promoted to modular when the call
   uses a feature monolithic doesn't support (currently: ``sinks``).
-  Compact variable Q and DCP select the monolithic implementation.
+  Compact variable Q, DCP, and their combination select the monolithic
+  implementation.
 * ``"modular"`` — strict.  Always run the modular implementation; reject
   monolithic-only features such as compact variable Q and DCP.
 * ``"monolithic"`` — strict.  Always run the monolithic implementation;
@@ -140,9 +141,6 @@ def _resolve_impl(*, requested: str, kwargs: dict) -> str:
             "monolithic CuTeDSL MLA implementation, while the requested feature "
             "requires the modular implementation."
         )
-    if enable_dcp and needs_monolithic is not None:
-        raise ValueError("DCP does not support cum_seq_lens_q / max_q_len")
-
     if requested == "auto":
         if needs_modular is not None:
             return "modular"
@@ -183,7 +181,7 @@ def cute_dsl_mla_decode(*args, cute_dsl_impl: str = "auto", **kwargs):
     :func:`flashinfer.cute_dsl.attention.wrappers.batch_mla.cute_dsl_mla_decode`
     (modular, supports ``sinks=``) and
     :func:`flashinfer.cute_dsl.attention.monolithic.mla_decode.cute_dsl_mla_decode`
-    (monolithic, supports compact variable Q and static DCP).
+    (monolithic, supports compact variable Q, static DCP, and their combination).
     Implementation-specific keyword
     arguments are validated before dispatch and stripped only when their
     default values make them irrelevant to the selected implementation.
@@ -193,7 +191,8 @@ def cute_dsl_mla_decode(*args, cute_dsl_impl: str = "auto", **kwargs):
     cute_dsl_impl : str, default ``"auto"``
         ``"auto"`` (default) lets the dispatcher pick: monolithic by
         default, modular when the call uses a modular-only feature
-        (currently ``sinks``); compact variable Q and DCP require monolithic.
+        (currently ``sinks``); compact variable Q, DCP, and their combination
+        require monolithic.
         ``"modular"`` and
         ``"monolithic"`` are strict — the dispatcher will not silently switch
         implementations, and raises :class:`ValueError` for an incompatible
