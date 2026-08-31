@@ -56,8 +56,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
         if config.knobs is not None:
             if not (isinstance(config.knobs, dict) or config.knobs == "auto"):
                 raise ValueError(
-                    "knobs must be None, a knob dict, or 'auto'; "
-                    f"got {config.knobs!r}"
+                    f"knobs must be None, a knob dict, or 'auto'; got {config.knobs!r}"
                 )
             if any(
                 v is not None
@@ -308,6 +307,11 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
                 num_tokens=num_tokens,
                 gate_up_clamp=_resolve_gate_up_clamp(kcfg),
                 activation_clamp=kcfg.activation_clamp,
+                process_group=(
+                    self._ep_comm_group
+                    if self._ep_comm_group is not None
+                    else (self.ep_comm_group if self.ep_world_size > 1 else None)
+                ),
             )
             # Cleared only on success: if the collective tune raises, a retried
             # compute() re-attempts it (all ranks fail together, so lockstep

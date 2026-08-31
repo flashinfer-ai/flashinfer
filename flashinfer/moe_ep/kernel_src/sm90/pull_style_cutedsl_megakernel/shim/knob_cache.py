@@ -27,13 +27,19 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import fcntl
 import json
 import os
 import tempfile
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
+from flashinfer.moe_ep.sm90_routing import (
+    SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
+)
+
 _CACHE_VERSION = 1
+_MXFP4_DTYPE_PREFIX = "sm90_w_mxfp4_"
 _KEY_FIELDS = (
     "device",
     "dtype",
@@ -43,6 +49,7 @@ _KEY_FIELDS = (
     "intermediate",
     "num_experts",
     "topk",
+    "gate_up_clamp",
 )
 
 
@@ -105,6 +112,31 @@ def _knobs_from_json(knobs: Dict[str, Any]) -> Dict[str, Any]:
     return {k: tuple(v) if isinstance(v, list) else v for k, v in knobs.items()}
 
 
+def _entry_matches_key(
+    entry: Dict[str, Any],
+    key: Dict[str, Any],
+    *,
+    routing_profile: Optional[str],
+) -> bool:
+    """Match one v1 entry, including the append-only routing-profile axis.
+
+    Historical FP8 entries remain byte-for-byte compatible: a caller that
+    does not request a routing profile matches only entries where the field is
+    absent. Historical MXFP4 entries predate this axis and therefore denote
+    the original block-permutation workload. Exact-balanced routing is always
+    fail-closed against such an entry.
+    """
+
+    if not all(entry.get(field) == key[field] for field in _KEY_FIELDS):
+        return False
+    if "routing_profile" in entry:
+        return entry["routing_profile"] == routing_profile
+    return routing_profile is None or (
+        routing_profile == SM90_ROUTING_PROFILE_BLOCK_PERMUTATION
+        and str(key["dtype"]).startswith(_MXFP4_DTYPE_PREFIX)
+    )
+
+
 def lookup_knobs(
     *,
     dtype: str,
@@ -116,6 +148,8 @@ def lookup_knobs(
     topk: int,
     max_tokens: int,
     device: Optional[str] = None,
+    gate_up_clamp: Optional[float] = None,
+    routing_profile: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss."""
     path = _cache_path()
@@ -130,11 +164,12 @@ def lookup_knobs(
         intermediate=intermediate,
         num_experts=num_experts,
         topk=topk,
+        gate_up_clamp=gate_up_clamp,
     )
     matches = [
         e
         for e in _load_entries(path)
-        if all(e.get(f) == key[f] for f in _KEY_FIELDS)
+        if _entry_matches_key(e, key, routing_profile=routing_profile)
         and isinstance(e.get("knobs"), dict)
         and isinstance(e.get("max_tokens"), int)
     ]
@@ -160,6 +195,8 @@ def record_knobs(
     topk: int,
     max_tokens: int,
     device: Optional[str] = None,
+    gate_up_clamp: Optional[float] = None,
+    routing_profile: Optional[str] = None,
     p50_us: Optional[float] = None,
     source: str = "autotune",
 ) -> Optional[str]:
@@ -181,34 +218,50 @@ def record_knobs(
         num_experts=num_experts,
         topk=topk,
         max_tokens=max_tokens,
+        gate_up_clamp=gate_up_clamp,
         knobs=_knobs_to_json(knobs),
         p50_us=p50_us,
         source=source,
         tuned_at=datetime.datetime.now().isoformat(timespec="seconds"),
     )
+    if routing_profile is not None:
+        entry["routing_profile"] = routing_profile
     try:
-        entries = _load_entries(path)
-        entries = [
-            e
-            for e in entries
-            if not (
-                all(e.get(f) == entry[f] for f in _KEY_FIELDS)
-                and e.get("max_tokens") == max_tokens
-            )
-        ]
-        entries.append(entry)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        fd, tmp = tempfile.mkstemp(
-            dir=os.path.dirname(path), prefix=".moe_ep_knob_cache."
-        )
-        try:
-            with os.fdopen(fd, "w") as f:
-                json.dump({"version": _CACHE_VERSION, "entries": entries}, f, indent=1)
-            os.replace(tmp, path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp)
-            raise
+        directory = os.path.dirname(path) or "."
+        os.makedirs(directory, exist_ok=True)
+        lock_path = path + ".lock"
+        with open(lock_path, "a+") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                entries = _load_entries(path)
+                entries = [
+                    e
+                    for e in entries
+                    if not (
+                        _entry_matches_key(
+                            e,
+                            entry,
+                            routing_profile=routing_profile,
+                        )
+                        and e.get("max_tokens") == max_tokens
+                    )
+                ]
+                entries.append(entry)
+                fd, tmp = tempfile.mkstemp(dir=directory, prefix=".moe_ep_knob_cache.")
+                try:
+                    with os.fdopen(fd, "w") as f:
+                        json.dump(
+                            {"version": _CACHE_VERSION, "entries": entries}, f, indent=1
+                        )
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, path)
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        os.unlink(tmp)
+                    raise
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
     except (OSError, TypeError, ValueError) as exc:
         warnings.warn(
             f"[moe_ep-knob-cache] could not write {path!r}: {exc}",
@@ -229,6 +282,7 @@ def resolve_knobs(
     num_experts: int,
     topk: int,
     max_tokens: int,
+    gate_up_clamp: Optional[float] = None,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else built-in heuristic.
 
@@ -245,6 +299,7 @@ def resolve_knobs(
         num_experts=num_experts,
         topk=topk,
         max_tokens=max_tokens,
+        gate_up_clamp=gate_up_clamp,
     )
     if cached is not None:
         return cached, "cache"

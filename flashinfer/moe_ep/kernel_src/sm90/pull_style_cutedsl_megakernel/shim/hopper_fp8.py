@@ -121,7 +121,7 @@ class MegaMoEHopperFp8Config:
     intermediate: int
 
     kind: Literal["fp8_e4m3", "fp8_e5m2"] = "fp8_e4m3"
-    fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor"
+    fp8_scale_mode: Literal["per_tensor", "blockwise", "mxfp4_hybrid"] = "per_tensor"
     fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc"
     swap_ab: bool = False
     # Ping-pong task-tile scheduling: two WGMMA+epilogue warpgroups alternate
@@ -1310,6 +1310,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
                 num_experts=num_total_experts,
                 topk=num_topk,
                 max_tokens=num_max_tokens,
+                gate_up_clamp=clamp,
             )
         geometry = default_knobs(num_max_tokens, fp8_scale_mode=fp8_scale_mode)
         geometry.update({k: resolved[k] for k in GEOMETRY_KNOBS if k in resolved})
