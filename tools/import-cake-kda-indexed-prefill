@@ -1,0 +1,454 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Import sealed source-only Cake indexed-state KDA programs.
+
+The two inputs are public CUDA-mode generated-program archives, one for each
+Blackwell target.  This tool verifies every consumed artifact reference,
+rejects binaries and private provenance, gives every installed implementation
+source a ``cake_`` basename, and emits a content-addressed source catalog.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import tarfile
+import tempfile
+from typing import Any, Mapping
+
+
+CATALOG_KIND = "flashinfer.cake_kda_indexed_prefill.source_catalog"
+CATALOG_SCHEMA_VERSION = 1
+IMPORT_RECEIPT_KIND = "flashinfer.cake_kda_indexed_prefill.import_receipt"
+EXPECTED_MODULE_COUNT = 18
+EXPECTED_ROUTE_COUNT = 48
+TARGETS = {
+    "sm100a": "sm_100a",
+    "sm103a": "sm_103a",
+}
+_SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+_FORBIDDEN_BUILD_PROVENANCE = (
+    b"ssh://",
+    b"file://",
+    b"/home/",
+    b"/data/",
+    b"/tmp/",
+)
+
+
+class ImportError(ValueError):
+    """The source export is incomplete, inconsistent, or unsafe to import."""
+
+
+def _canonical_bytes(value: object) -> bytes:
+    return json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+
+
+def _sha256(payload: bytes) -> str:
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _require(condition: bool, message: str) -> None:
+    if not condition:
+        raise ImportError(message)
+
+
+def _object(value: object, label: str) -> Mapping[str, object]:
+    _require(isinstance(value, Mapping), f"{label} must be an object")
+    assert isinstance(value, Mapping)
+    return value
+
+
+def _safe_relative(value: object, label: str) -> PurePosixPath:
+    _require(isinstance(value, str) and bool(value), f"{label} must be a path")
+    assert isinstance(value, str)
+    path = PurePosixPath(value)
+    _require(
+        not path.is_absolute()
+        and path.as_posix() == value
+        and ".." not in path.parts
+        and "." not in path.parts,
+        f"{label} must be a normalized relative path",
+    )
+    return path
+
+
+def _assert_public(payload: bytes, label: str) -> None:
+    lowered = payload.lower()
+    for forbidden in _FORBIDDEN_BUILD_PROVENANCE:
+        _require(forbidden not in lowered, f"{label} contains private provenance")
+
+
+def _dispatcher_module_ids(payload: bytes) -> tuple[str, ...]:
+    try:
+        module = ast.parse(payload.decode("utf-8"), filename="cake_kda_dispatcher.py")
+    except (UnicodeDecodeError, SyntaxError) as error:
+        raise ImportError("generated dispatcher is not valid UTF-8 Python") from error
+    assignments = [
+        node
+        for node in module.body
+        if isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "FLASHINFER_MODULE_IDS"
+    ]
+    _require(len(assignments) == 1, "generated dispatcher module inventory is unresolved")
+    try:
+        value = ast.literal_eval(assignments[0].value)
+    except (ValueError, TypeError) as error:
+        raise ImportError("generated dispatcher module inventory is not literal") from error
+    _require(
+        isinstance(value, tuple)
+        and len(value) == EXPECTED_MODULE_COUNT
+        and all(isinstance(item, str) and item for item in value),
+        "generated dispatcher module inventory differs",
+    )
+    return value
+
+
+class _Archive:
+    def __init__(self, path: Path) -> None:
+        self.path = path.resolve(strict=True)
+        _require(self.path.is_file(), f"archive is not a regular file: {self.path}")
+        self.payload_sha256 = _sha256(self.path.read_bytes())
+        try:
+            self.tar = tarfile.open(self.path, mode="r:*")
+        except tarfile.TarError as error:
+            raise ImportError(f"cannot read archive {self.path}: {error}") from error
+        self.members: dict[str, tarfile.TarInfo] = {}
+        for member in self.tar.getmembers():
+            normalized = member.name.removeprefix("./")
+            if normalized in ("", "."):
+                continue
+            _safe_relative(normalized.rstrip("/"), "archive member")
+            _require(normalized not in self.members, f"duplicate archive member: {normalized}")
+            _require(
+                not member.issym() and not member.islnk(),
+                f"archive links are forbidden: {normalized}",
+            )
+            self.members[normalized] = member
+
+    def close(self) -> None:
+        self.tar.close()
+
+    def read(self, path: PurePosixPath | str, *, label: str) -> bytes:
+        normalized = _safe_relative(str(path), label).as_posix()
+        member = self.members.get(normalized)
+        _require(member is not None and member.isfile(), f"{label} is absent: {normalized}")
+        assert member is not None
+        extracted = self.tar.extractfile(member)
+        _require(extracted is not None, f"cannot read {label}: {normalized}")
+        assert extracted is not None
+        payload = extracted.read()
+        _require(len(payload) == member.size, f"{label} size changed while reading")
+        return payload
+
+    def read_reference(
+        self,
+        value: object,
+        *,
+        label: str,
+        expected_kind: str,
+    ) -> tuple[PurePosixPath, bytes]:
+        reference = _object(value, label)
+        _require(
+            set(reference) == {"artifact_id", "kind", "path", "sha256", "size_bytes"},
+            f"{label} fields differ",
+        )
+        _require(reference.get("kind") == expected_kind, f"{label} kind differs")
+        digest = reference.get("sha256")
+        size = reference.get("size_bytes")
+        _require(
+            isinstance(digest, str) and _SHA256.fullmatch(digest),
+            f"{label} sha256 is invalid",
+        )
+        _require(isinstance(size, int) and size >= 0, f"{label} size is invalid")
+        path = _safe_relative(reference.get("path"), f"{label}.path")
+        payload = self.read(path, label=label)
+        _require(
+            len(payload) == size and _sha256(payload) == digest,
+            f"{label} content identity differs",
+        )
+        _assert_public(payload, label)
+        return path, payload
+
+
+def _write(root: Path, relative: PurePosixPath, payload: bytes) -> dict[str, object]:
+    path = root.joinpath(*relative.parts)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _require(not path.exists() and not path.is_symlink(), f"duplicate output: {relative}")
+    path.write_bytes(payload)
+    return {
+        "path": relative.as_posix(),
+        "sha256": _sha256(payload),
+        "size_bytes": len(payload),
+    }
+
+
+def _load_fragment(archive: _Archive, target: str) -> tuple[Mapping[str, object], bytes]:
+    relative = PurePosixPath("generated_program") / target / "cuda" / "fragment.json"
+    payload = archive.read(relative, label=f"{target} fragment")
+    _assert_public(payload, f"{target} fragment")
+    try:
+        fragment = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ImportError(f"{target} fragment is invalid JSON") from error
+    fragment = _object(fragment, f"{target} fragment")
+    _require(
+        fragment.get("kind") == "flashinfer.generated_program_pack.fragment"
+        and fragment.get("schema_version") == 1
+        and fragment.get("mode") == "cuda"
+        and fragment.get("target") == target
+        and fragment.get("architecture") == TARGETS[target],
+        f"{target} fragment identity differs",
+    )
+    routes = fragment.get("routes")
+    modules = fragment.get("modules")
+    build = _object(fragment.get("build"), f"{target} build")
+    _require(
+        isinstance(routes, list) and len(routes) == EXPECTED_ROUTE_COUNT,
+        f"{target} route denominator differs",
+    )
+    _require(
+        isinstance(modules, list) and len(modules) == EXPECTED_MODULE_COUNT,
+        f"{target} module denominator differs",
+    )
+    _require(build.get("kind") == "nvrtc", f"{target} is not a CUDA source export")
+    return fragment, payload
+
+
+def _import_target(
+    archive: _Archive,
+    *,
+    target: str,
+    staging: Path,
+) -> dict[str, object]:
+    fragment, fragment_payload = _load_fragment(archive, target)
+    dispatcher_ref = fragment.get("dispatcher")
+    _dispatcher_input, dispatcher = archive.read_reference(
+        dispatcher_ref,
+        label=f"{target} dispatcher",
+        expected_kind="python_source",
+    )
+    module_ids = _dispatcher_module_ids(dispatcher)
+
+    generated_root = PurePosixPath("generated") / target
+    dispatcher_output = generated_root / "cake_kda_dispatcher.py"
+    dispatcher_record = _write(staging, dispatcher_output, dispatcher)
+    modules: list[dict[str, object]] = []
+    observed_ids: list[str] = []
+    for index, raw_module in enumerate(fragment["modules"]):
+        module = _object(raw_module, f"{target} module {index}")
+        module_id = module.get("id")
+        module_ident = module.get("module_ident")
+        entry_point = module.get("entry_point")
+        kernel_name = module.get("kernel_name")
+        _require(
+            all(
+                isinstance(value, str) and value
+                for value in (module_id, module_ident, entry_point, kernel_name)
+            ),
+            f"{target} module {index} ABI is unresolved",
+        )
+        observed_ids.append(module_id)
+        _cuda_input, cuda_source = archive.read_reference(
+            module.get("cuda_source"),
+            label=f"{target} module {index} CUDA source",
+            expected_kind="cuda_source",
+        )
+        _host_input, host_source = archive.read_reference(
+            module.get("host_source"),
+            label=f"{target} module {index} host source",
+            expected_kind="host_source",
+        )
+        receipt = _object(module.get("build_receipt"), f"{target} module {index} build receipt")
+        _require(
+            set(receipt)
+            == {
+                "compile_options",
+                "cooperative",
+                "cubin_sha256",
+                "cubin_size_bytes",
+                "cuda_source_sha256",
+                "cuda_source_size_bytes",
+                "host_source_sha256",
+                "host_source_size_bytes",
+                "tma_abi",
+                "use_pdl",
+            },
+            f"{target} module {index} build receipt fields differ",
+        )
+        compile_options = receipt.get("compile_options")
+        _require(
+            isinstance(compile_options, list)
+            and all(isinstance(option, str) and option for option in compile_options),
+            f"{target} module {index} compile options are invalid",
+        )
+        _require(
+            receipt.get("cuda_source_sha256") == _sha256(cuda_source)
+            and receipt.get("cuda_source_size_bytes") == len(cuda_source)
+            and receipt.get("host_source_sha256") == _sha256(host_source)
+            and receipt.get("host_source_size_bytes") == len(host_source),
+            f"{target} module {index} source receipt differs",
+        )
+        cubin_sha256 = receipt.get("cubin_sha256")
+        cubin_size = receipt.get("cubin_size_bytes")
+        _require(
+            isinstance(cubin_sha256, str)
+            and _SHA256.fullmatch(cubin_sha256)
+            and isinstance(cubin_size, int)
+            and cubin_size > 0,
+            f"{target} module {index} cubin receipt is invalid",
+        )
+        module_root = generated_root / f"cake_kda_module_{index:03d}"
+        cuda_record = _write(
+            staging,
+            module_root / f"cake_kda_module_{index:03d}_kernel.cu",
+            cuda_source,
+        )
+        host_record = _write(
+            staging,
+            module_root / f"cake_kda_module_{index:03d}_host.cpp",
+            host_source,
+        )
+        modules.append(
+            {
+                "id": module_id,
+                "module_ident": module_ident,
+                "entry_point": entry_point,
+                "kernel_name": kernel_name,
+                "compile_options": compile_options,
+                "cooperative": receipt.get("cooperative"),
+                "tma_abi": receipt.get("tma_abi"),
+                "use_pdl": receipt.get("use_pdl"),
+                "cuda_source": cuda_record,
+                "host_source": host_record,
+                "expected_cubin": {
+                    "sha256": cubin_sha256,
+                    "size_bytes": cubin_size,
+                },
+            }
+        )
+    _require(tuple(observed_ids) == module_ids, f"{target} dispatcher/module order differs")
+    _require(len(observed_ids) == len(set(observed_ids)), f"{target} module ids are not unique")
+    return {
+        "target": target,
+        "architecture": TARGETS[target],
+        "input_archive_sha256": archive.payload_sha256,
+        "input_fragment_sha256": _sha256(fragment_payload),
+        "route_denominator_sha256": fragment.get("route_denominator_sha256"),
+        "dispatcher_seed_identity": fragment.get("dispatcher_seed_identity"),
+        "contract": fragment.get("contract"),
+        "dispatcher": dispatcher_record,
+        "modules": modules,
+    }
+
+
+def _manifest(root: Path) -> list[dict[str, object]]:
+    records = []
+    for path in sorted(root.rglob("*")):
+        if path.is_file():
+            relative = path.relative_to(root).as_posix()
+            payload = path.read_bytes()
+            records.append(
+                {"path": relative, "sha256": _sha256(payload), "size_bytes": len(payload)}
+            )
+    return records
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sm100a-archive", required=True, type=Path)
+    parser.add_argument("--sm103a-archive", required=True, type=Path)
+    parser.add_argument("--repo", required=True, type=Path)
+    args = parser.parse_args()
+
+    repository = args.repo.resolve(strict=True)
+    _require((repository / ".git").exists(), f"not a Git worktree: {repository}")
+    destination = repository / "csrc" / "cake_kda_indexed_prefill"
+    _require(
+        not destination.exists() and not destination.is_symlink(),
+        f"destination already exists: {destination}",
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".cake_kda_indexed_prefill-", dir=destination.parent))
+    archives = {
+        "sm100a": _Archive(args.sm100a_archive),
+        "sm103a": _Archive(args.sm103a_archive),
+    }
+    try:
+        targets = [
+            _import_target(archives[target], target=target, staging=staging)
+            for target in TARGETS
+        ]
+        catalog = {
+            "kind": CATALOG_KIND,
+            "schema_version": CATALOG_SCHEMA_VERSION,
+            "targets": targets,
+        }
+        catalog_payload = _canonical_bytes(catalog) + b"\n"
+        _assert_public(catalog_payload, "source catalog")
+        _write(staging, PurePosixPath("cake_kda_source_catalog.json"), catalog_payload)
+        manifest = _manifest(staging)
+        receipt = {
+            "kind": IMPORT_RECEIPT_KIND,
+            "schema_version": 1,
+            "catalog_sha256": _sha256(catalog_payload),
+            "inputs": [
+                {"target": target, "archive_sha256": archives[target].payload_sha256}
+                for target in TARGETS
+            ],
+            "outputs": manifest,
+            "passed": True,
+        }
+        receipt_payload = _canonical_bytes(receipt) + b"\n"
+        _assert_public(receipt_payload, "import receipt")
+        _write(staging, PurePosixPath("cake_kda_import_receipt.json"), receipt_payload)
+        os.replace(staging, destination)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    finally:
+        for archive in archives.values():
+            archive.close()
+
+    print(
+        json.dumps(
+            {
+                "destination": str(destination),
+                "targets": list(TARGETS),
+                "modules_per_target": EXPECTED_MODULE_COUNT,
+                "binary_files": 0,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+if __name__ == "__main__":
+    main()

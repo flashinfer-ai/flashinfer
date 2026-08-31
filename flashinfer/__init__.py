@@ -175,6 +175,7 @@ from .kda_prefill import (
 )
 from .kda import RecurrentKDAPrefillWrapper as RecurrentKDAPrefillWrapper
 from .kda import recurrent_kda as recurrent_kda
+from .kda import recurrent_kda_cake as recurrent_kda_cake
 from .kda_decode import fused_kda_decode as fused_kda_decode
 from .kda_decode import packed_kda_decode as packed_kda_decode
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
