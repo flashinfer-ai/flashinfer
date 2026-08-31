@@ -410,7 +410,7 @@ def test_optional_timing_files_use_first_matching_rows(tmp_path: Path) -> None:
     assert set(manifest["estimate_files"]) == {"duration", "overhead"}
 
 
-def test_manifest_freezes_timing_content_not_input_path(tmp_path: Path) -> None:
+def test_manifest_resume_does_not_depend_on_timing_inputs(tmp_path: Path) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "test_sample.py").write_text("def test_case(): pass\n", encoding="utf-8")
@@ -428,8 +428,8 @@ def test_manifest_freezes_timing_content_not_input_path(tmp_path: Path) -> None:
     assert created.returncode == 0, created.stdout
     assert reused.returncode == 0, reused.stdout
     assert "Using plan" in reused.stdout
-    assert changed.returncode == 3
-    assert "estimate_files" in changed.stdout
+    assert changed.returncode == 0, changed.stdout
+    assert "Using plan" in changed.stdout
 
 
 def test_run_streams_current_pytest_node_before_it_finishes(tmp_path: Path) -> None:
