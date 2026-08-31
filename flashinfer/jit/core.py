@@ -6,7 +6,17 @@ import os
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Hashable, List, Mapping, Optional, Sequence, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Hashable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Union,
+)
 
 import tvm_ffi
 from filelock import FileLock
@@ -332,9 +342,7 @@ class JitSpecNvcc(JitSpec):
     is_class: bool = False
     needs_device_linking: bool = False
     post_load_adapter: Optional[Callable[[Any], Any]] = None
-    embedded_cubin_factory: Optional[
-        Callable[[Path], Mapping[str, Path]]
-    ] = None
+    embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None
 
     @property
     def ninja_path(self) -> Path:
@@ -534,9 +542,7 @@ def gen_jit_spec(
     extra_include_paths: Optional[List[Union[str, Path]]] = None,
     needs_device_linking: bool = False,
     post_load_adapter: Optional[Callable[[Any], Any]] = None,
-    embedded_cubin_factory: Optional[
-        Callable[[Path], Mapping[str, Path]]
-    ] = None,
+    embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None,
 ) -> JitSpec:
     check_cuda_arch()
     # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)

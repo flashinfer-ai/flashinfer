@@ -187,19 +187,16 @@ inline void CheckFlashKDAPersistentDevice(int32_t device_id) {
 
 inline int64_t ServingStateElementBytes(DLDataType state_dtype);
 
-inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const TensorView& v,
-                                 const TensorView& g, const TensorView& beta,
-                                 const TensorView& beta_tma, const TensorView& A_log,
-                                 const TensorView& dt_bias, const TensorView& cu_seqlens,
-                                 const TensorView& seq_order, const TensorView& initial_state,
-                                 const TensorView& out, const TensorView& final_state,
-                                 const TensorView& descriptor_storage, int64_t prepare_descriptors,
-                                 int64_t num_heads, int64_t use_initial_state,
-                                 int64_t store_final_state, double scale, double lower_bound,
-                                 bool allow_serving_layouts = false, int64_t state_pool_slots = 0,
-                                 bool allow_pair_packed_beta_tma = false,
-                                 DLDataType state_dtype = dl_bfloat16,
-                                 bool final_state_is_fp32 = false) {
+inline int64_t CheckCommonInputs(
+    const TensorView& q, const TensorView& k, const TensorView& v, const TensorView& g,
+    const TensorView& beta, const TensorView& beta_tma, const TensorView& A_log,
+    const TensorView& dt_bias, const TensorView& cu_seqlens, const TensorView& seq_order,
+    const TensorView& initial_state, const TensorView& out, const TensorView& final_state,
+    const TensorView& descriptor_storage, int64_t prepare_descriptors, int64_t num_heads,
+    int64_t use_initial_state, int64_t store_final_state, double scale, double lower_bound,
+    bool allow_serving_layouts = false, int64_t state_pool_slots = 0,
+    bool allow_pair_packed_beta_tma = false, DLDataType state_dtype = dl_bfloat16,
+    bool final_state_is_fp32 = false) {
   TVM_FFI_ICHECK(prepare_descriptors == 0 || prepare_descriptors == 1)
       << "prepare_descriptors must be 0 or 1, got " << prepare_descriptors;
   TVM_FFI_ICHECK(num_heads > 0 && num_heads <= std::numeric_limits<int32_t>::max())
@@ -216,8 +213,7 @@ inline int64_t CheckCommonInputs(const TensorView& q, const TensorView& k, const
          "float32, got "
       << lower_bound;
   ServingStateElementBytes(state_dtype);
-  const DLDataType final_state_dtype =
-      final_state_is_fp32 ? dl_float32 : state_dtype;
+  const DLDataType final_state_dtype = final_state_is_fp32 ? dl_float32 : state_dtype;
   ServingStateElementBytes(final_state_dtype);
 
   const int32_t device_id = q.device().device_id;
@@ -486,9 +482,9 @@ inline int64_t ResolveAndCheckServingStatePool(
 }
 
 inline void CheckServingCheckpointInputsForStateDtype(
-    const TensorView& state_checkpoints, const TensorView& checkpoint_cu_starts,
-    int32_t device_id, int64_t num_seqs, int64_t num_heads, int64_t checkpoint_every_n_tokens,
-    DLDataType state_dtype, int64_t checkpoint_token_granularity = 32) {
+    const TensorView& state_checkpoints, const TensorView& checkpoint_cu_starts, int32_t device_id,
+    int64_t num_seqs, int64_t num_heads, int64_t checkpoint_every_n_tokens, DLDataType state_dtype,
+    int64_t checkpoint_token_granularity = 32) {
   ServingStateElementBytes(state_dtype);
   TVM_FFI_ICHECK(checkpoint_token_granularity > 0)
       << "checkpoint_token_granularity must be positive";
@@ -520,9 +516,9 @@ inline void CheckServingCheckpointInputs(const TensorView& state_checkpoints,
                                          int64_t num_seqs, int64_t num_heads,
                                          int64_t checkpoint_every_n_tokens,
                                          int64_t checkpoint_token_granularity = 32) {
-  CheckServingCheckpointInputsForStateDtype(
-      state_checkpoints, checkpoint_cu_starts, device_id, num_seqs, num_heads,
-      checkpoint_every_n_tokens, dl_bfloat16, checkpoint_token_granularity);
+  CheckServingCheckpointInputsForStateDtype(state_checkpoints, checkpoint_cu_starts, device_id,
+                                            num_seqs, num_heads, checkpoint_every_n_tokens,
+                                            dl_bfloat16, checkpoint_token_granularity);
 }
 
 inline void CheckServingAuxiliaryNoOverlap(

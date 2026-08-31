@@ -76,9 +76,7 @@ def _compile_cubin(
 ) -> bytes:
     from cuda.bindings import nvrtc
 
-    result, program = nvrtc.nvrtcCreateProgram(
-        source, source_name.encode(), 0, [], []
-    )
+    result, program = nvrtc.nvrtcCreateProgram(source, source_name.encode(), 0, [], [])
     if not _result_ok(result):
         raise RuntimeError(
             f"nvrtcCreateProgram failed for generated FlashKDA {source_name}: {result}"
@@ -127,11 +125,15 @@ def prepare_generated_flash_kda_cubin(
     """Compile and return one content-addressed cubin for Ninja embedding."""
 
     if _C_IDENTIFIER.fullmatch(module_ident) is None:
-        raise ValueError(f"invalid generated FlashKDA module identifier: {module_ident!r}")
+        raise ValueError(
+            f"invalid generated FlashKDA module identifier: {module_ident!r}"
+        )
     try:
         arch = _TARGET_ARCH[target]
     except KeyError as error:
-        raise ValueError(f"unsupported generated FlashKDA NVRTC target: {target}") from error
+        raise ValueError(
+            f"unsupported generated FlashKDA NVRTC target: {target}"
+        ) from error
 
     selector = selector_path.read_text()
     body_match = _BODY_DEFINE.search(selector)
@@ -156,7 +158,9 @@ def prepare_generated_flash_kda_cubin(
         "--use_fast_math",
     )
     if any("o1" in option.lower() for option in options):
-        raise RuntimeError(f"forbidden O1 option in generated FlashKDA NVRTC flags: {options}")
+        raise RuntimeError(
+            f"forbidden O1 option in generated FlashKDA NVRTC flags: {options}"
+        )
     inputs = {
         "schema_version": _SCHEMA_VERSION,
         "source_name": body_path.name,
@@ -180,16 +184,13 @@ def prepare_generated_flash_kda_cubin(
                 receipt = json.loads(receipt_path.read_text())
                 reusable = (
                     receipt.get("inputs") == inputs
-                    and receipt.get("cubin_sha256")
-                    == _sha256(cubin_path.read_bytes())
+                    and receipt.get("cubin_sha256") == _sha256(cubin_path.read_bytes())
                     and receipt.get("cubin_size") == cubin_path.stat().st_size
                 )
             except (OSError, TypeError, ValueError):
                 reusable = False
         if not reusable:
-            cubin = _compile_cubin(
-                source, source_name=body_path.name, options=options
-            )
+            cubin = _compile_cubin(source, source_name=body_path.name, options=options)
             receipt = {
                 "schema_version": _SCHEMA_VERSION,
                 "inputs": inputs,

@@ -198,8 +198,8 @@ void RunM128N16Checkpoint(TensorView q, TensorView k, TensorView v, TensorView g
       reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(A_log.data_ptr()),
       reinterpret_cast<unsigned int*>(descriptor_storage.data_ptr()), 0,
       static_cast<int32_t>(num_seqs),
-      reinterpret_cast<flashkda_checkpoint_generated_LoomTensorMap const*>(
-          descriptor_bytes + 6 * sizeof(CUtensorMap)),
+      reinterpret_cast<flashkda_checkpoint_generated_LoomTensorMap const*>(descriptor_bytes +
+                                                                           6 * sizeof(CUtensorMap)),
       nullptr);
   CheckCuda(cudaGetLastError(), "checkpoint N16 FlashKDA launch");
 }

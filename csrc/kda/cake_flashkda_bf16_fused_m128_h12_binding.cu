@@ -143,8 +143,7 @@ void RunM128H12(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
       static_cast<int32_t>(use_state_indices), static_cast<int32_t>(checkpoint_every_n_tokens),
       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
       nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, static_cast<int32_t>(0),
-      static_cast<int32_t>(0),
-      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.q),
+      static_cast<int32_t>(0), reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.q),
       nullptr);
   CheckCuda(cudaGetLastError(), "kernel_flashkda_bf16_fused_m128 H12 launch");
 }

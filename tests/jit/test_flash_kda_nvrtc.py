@@ -18,12 +18,10 @@ def test_prepare_generated_cubin_is_content_addressed_and_revalidates(
     selector = tmp_path / "selector.cu"
     body = tmp_path / "body.cu"
     selector.write_text(_selector(body.name))
-    body.write_text("extern \"C\" __global__ void kernel_flashkda_test() {}\n")
+    body.write_text('extern "C" __global__ void kernel_flashkda_test() {}\n')
     cuda_include = tmp_path / "cuda" / "include"
     cuda_include.mkdir(parents=True)
-    monkeypatch.setattr(
-        flash_kda_nvrtc, "_cuda_include_dirs", lambda: (cuda_include,)
-    )
+    monkeypatch.setattr(flash_kda_nvrtc, "_cuda_include_dirs", lambda: (cuda_include,))
     calls = []
 
     def fake_compile(source, *, source_name, options):
