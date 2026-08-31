@@ -27,7 +27,7 @@ from flashinfer.jit import flash_kda
 _H12_CASES = (
     (
         "m128_h12_short",
-        "ed36b1e7dd",
+        "47c46019cc",
         "d25044154d",
         "-DFLASHINFER_FLASH_KDA_H12_SHORT=1",
         "cake_flashkda_bf16_fused_m128_h12_short.cu",
@@ -35,7 +35,7 @@ _H12_CASES = (
     ),
     (
         "m128_h12_long",
-        "6b344b8fab",
+        "b813a7edd3",
         "88cedfb168",
         "-DFLASHINFER_FLASH_KDA_H12_LONG=1",
         "cake_flashkda_bf16_fused_m128_h12_long.cu",
@@ -398,7 +398,7 @@ def test_short_n16_jit_spec_and_frozen_source(target, target_define):
     flash_kda.gen_flash_kda_module.cache_clear()
     spec = flash_kda.gen_flash_kda_module("m128_n16_short", target)
 
-    assert spec.name == f"flash_kda_bf16_m128_n16_short_5398e3c677_{target}"
+    assert spec.name == f"flash_kda_bf16_m128_n16_short_3f90fe2347_{target}"
     assert spec.sources == [
         flash_kda._get_flash_kda_csrc_dir()
         / "cake_flashkda_bf16_fused_m128_n16_binding.cu"
@@ -434,7 +434,7 @@ def test_tensor_state_decay_jit_spec_and_frozen_source(target, target_define):
     flash_kda.gen_flash_kda_module.cache_clear()
     spec = flash_kda.gen_flash_kda_module("m128_tensor_state_decay", target)
 
-    assert spec.name == (f"flash_kda_bf16_m128_tensor_state_decay_9303395b92_{target}")
+    assert spec.name == (f"flash_kda_bf16_m128_tensor_state_decay_9614ba2d29_{target}")
     assert spec.sources == [
         flash_kda._get_flash_kda_csrc_dir() / "flashkda_bf16_fused_m128_binding.cu"
     ]

@@ -191,20 +191,20 @@ class GeneratedFlashKDAModule:
 # implementation. This prevents an installed JIT/AOT cache from satisfying a
 # refreshed export or binding specialization after an in-place package upgrade.
 _FLASH_KDA_MODULE_IDENTS = {
-    "m64": "d3188b57de",
-    "m128": "1207c5c520",
-    "m128_tensor_state_decay": "9303395b92",
-    "m128_h12_short": "ed36b1e7dd",
-    "m128_h12_long": "6b344b8fab",
-    "m128_n16": "eaee364d43",
+    "m64": "535ed3e2ce",
+    "m128": "ec6d5fdb56",
+    "m128_tensor_state_decay": "9614ba2d29",
+    "m128_h12_short": "47c46019cc",
+    "m128_h12_long": "b813a7edd3",
+    "m128_n16": "a00baf7312",
     # Generated body, binding, and shared binding header, separated by NUL
     # bytes without a trailing separator. Keep this route's cache key tied to
     # all compiled content.
-    "m128_n16_checkpoint": "bd3d4f67bf",
-    "m128_n16_short": "5398e3c677",
-    "persistent_m128": "a4b3f84117",
-    "piece_persistent_m128": "6cee59c41d",
-    "small_bh_m128": "bbe09a1855",
+    "m128_n16_checkpoint": "c08d679107",
+    "m128_n16_short": "3f90fe2347",
+    "persistent_m128": "4a2c82bde2",
+    "piece_persistent_m128": "dd8e3a5ca0",
+    "small_bh_m128": "b2593f3697",
     "bt16_prepare": "2c6cc4c1f6",
     "bt16_prepare_beta_tma": "d9394ce430",
     "bt16_chain_m64_s7": "350dbb8897",
