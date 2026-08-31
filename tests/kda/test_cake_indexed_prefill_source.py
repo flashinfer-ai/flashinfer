@@ -313,13 +313,16 @@ def test_source_backend_rejects_output_alias_before_dispatch(
         )
 
 
-@pytest.mark.gpu
 def test_indexed_fp32_source_backend_matches_flash_kda_reference() -> None:
-    flash_kda = pytest.importorskip("flash_kda")
-    flash_kda_C = pytest.importorskip("flash_kda_C")
     reference_root_value = os.environ.get("FLASH_KDA_REFERENCE_ROOT")
     if reference_root_value is None:
         pytest.skip("FLASH_KDA_REFERENCE_ROOT must identify the pinned reference checkout")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}:
+        pytest.skip("the generated source package targets SM100a and SM103a")
+    flash_kda = pytest.importorskip("flash_kda")
+    flash_kda_C = pytest.importorskip("flash_kda_C")
     reference_root = Path(reference_root_value).resolve(strict=True)
     reference_commit = subprocess.check_output(
         ["git", "-C", str(reference_root), "rev-parse", "HEAD^{commit}"],
@@ -328,10 +331,6 @@ def test_indexed_fp32_source_backend_matches_flash_kda_reference() -> None:
     assert reference_commit == "1ce47ea3bb22c84eb9cc665028399cf35e8ffb0b"
     Path(flash_kda.__file__).resolve(strict=True).relative_to(reference_root)
     Path(flash_kda_C.__file__).resolve(strict=True).relative_to(reference_root)
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required")
-    if torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}:
-        pytest.skip("the generated source package targets SM100a and SM103a")
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(13008)
