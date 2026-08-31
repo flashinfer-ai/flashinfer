@@ -596,6 +596,30 @@ def habs2(x: Uint32, *, loc=None, ip=None) -> Uint32:
 
 
 @dsl_user_op
+def half2_max_abs(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Return the per-lane maximum magnitude of two packed FP16x2 words.
+
+    ``max.xorsign.abs`` has maximumNumber behavior: a single NaN yields the
+    numeric operand.  Its result sign is the xor of the input signs and is not
+    a magnitude sign, so callers must clear each surviving lane's sign bit
+    before interpreting the final result.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
+            "max.xorsign.abs.f16x2 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def hmax2(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
     """Half2 max - element-wise max of 2 fp16 pairs."""
     return Uint32(
@@ -718,6 +742,30 @@ def bfloat2_habs2(x: Uint32, *, loc=None, ip=None) -> Uint32:
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def bfloat2_max_abs(a: Uint32, b: Uint32, *, loc=None, ip=None) -> Uint32:
+    """Return the per-lane maximum magnitude of two packed BF16x2 words.
+
+    ``max.xorsign.abs`` has maximumNumber behavior: a single NaN yields the
+    numeric operand.  Its result sign is the xor of the input signs and is not
+    a magnitude sign, so callers must clear each surviving lane's sign bit
+    before interpreting the final result.
+    """
+    return Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [Uint32(a).ir_value(loc=loc, ip=ip), Uint32(b).ir_value(loc=loc, ip=ip)],
+            "max.xorsign.abs.bf16x2 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 

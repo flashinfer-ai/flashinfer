@@ -50,7 +50,7 @@ from flashinfer.quantization.quantization_cute_dsl_utils import (
     float_to_ue8m0_fast,
     ue8m0_to_inv_scale_fast,
 )
-
+from flashinfer.cute_dsl.fp4_common import bfloat2_max_abs, half2_max_abs
 from ..moe_utils import (
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
@@ -429,6 +429,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         situ_linear_beta: Optional[float] = None,
         gated: bool = True,
         use_a_per_token_scale: bool = False,
+        store_output_amax: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel with
         gather operation and FC1 activation fusion.
@@ -492,6 +493,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         self.sf_vec_size = sf_vec_size
         self.enable_pdl = enable_pdl
         self.use_a_per_token_scale = use_a_per_token_scale
+        self.store_output_amax = store_output_amax
         self.topk = topk
         self.gated = gated
         self.out_n_factor = 2 if gated else 1
@@ -810,6 +812,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        output_amax: Optional[cute.Tensor],
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
         epilogue_op: cutlass.Constexpr = lambda x: x,
@@ -1173,6 +1176,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             a_per_token_scale,
+            output_amax,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
             self.a_smem_layout_staged,
@@ -1260,6 +1264,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles: cute.Tensor,
         alpha: cute.Tensor,
         a_per_token_scale: Optional[cute.Tensor],
+        output_amax: Optional[cute.Tensor],
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -2642,6 +2647,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
 
             num_prev_subtiles = cutlass.Int32(0)
             while is_valid_tile:
+                tile_amax_packed = cutlass.Uint32(0)
                 mma_tile_coord_mnl = (
                     tile_info[0] // cute.size(tiled_mma.thr_id.shape),
                     tile_info[1],
@@ -3238,6 +3244,79 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         c_pipeline.producer_commit()
                         c_pipeline.producer_acquire()
+                    if cutlass.const_expr(self.store_output_amax):
+                        # Match the standalone per-token quantizer exactly by
+                        # reducing the rounded FP16/BF16 values visible in the
+                        # materialized intermediate.  Issue the shared/TMA
+                        # output store first, then use four independent packed
+                        # native-width maxNum trees while that asynchronous
+                        # store is in flight.  Keep one packed accumulator for
+                        # the whole GEMM N tile and defer lane folding and
+                        # widening until its final aux store.
+                        packed_acc = acc_vec.bitcast(cutlass.Uint32).to_vector(
+                            force_flatten=True
+                        )
+                        fragment_amax = cute.make_rmem_tensor(
+                            (cute.size(packed_acc.shape) // 8,), cutlass.Uint32
+                        )
+                        for packed_group in cutlass.range_constexpr(
+                            cute.size(fragment_amax)
+                        ):
+                            packed_idx = packed_group * 8
+                            if cutlass.const_expr(self.c_dtype is cutlass.BFloat16):
+                                max_01 = bfloat2_max_abs(
+                                    packed_acc[packed_idx], packed_acc[packed_idx + 1]
+                                )
+                                max_23 = bfloat2_max_abs(
+                                    packed_acc[packed_idx + 2],
+                                    packed_acc[packed_idx + 3],
+                                )
+                                max_45 = bfloat2_max_abs(
+                                    packed_acc[packed_idx + 4],
+                                    packed_acc[packed_idx + 5],
+                                )
+                                max_67 = bfloat2_max_abs(
+                                    packed_acc[packed_idx + 6],
+                                    packed_acc[packed_idx + 7],
+                                )
+                                max_0123 = bfloat2_max_abs(max_01, max_23)
+                                max_4567 = bfloat2_max_abs(max_45, max_67)
+                                fragment_amax[packed_group] = bfloat2_max_abs(
+                                    max_0123, max_4567
+                                )
+                            else:
+                                max_01 = half2_max_abs(
+                                    packed_acc[packed_idx], packed_acc[packed_idx + 1]
+                                )
+                                max_23 = half2_max_abs(
+                                    packed_acc[packed_idx + 2],
+                                    packed_acc[packed_idx + 3],
+                                )
+                                max_45 = half2_max_abs(
+                                    packed_acc[packed_idx + 4],
+                                    packed_acc[packed_idx + 5],
+                                )
+                                max_67 = half2_max_abs(
+                                    packed_acc[packed_idx + 6],
+                                    packed_acc[packed_idx + 7],
+                                )
+                                max_0123 = half2_max_abs(max_01, max_23)
+                                max_4567 = half2_max_abs(max_45, max_67)
+                                fragment_amax[packed_group] = half2_max_abs(
+                                    max_0123, max_4567
+                                )
+
+                        for packed_group in cutlass.range_constexpr(
+                            cute.size(fragment_amax)
+                        ):
+                            if cutlass.const_expr(self.c_dtype is cutlass.BFloat16):
+                                tile_amax_packed = bfloat2_max_abs(
+                                    tile_amax_packed, fragment_amax[packed_group]
+                                )
+                            else:
+                                tile_amax_packed = half2_max_abs(
+                                    tile_amax_packed, fragment_amax[packed_group]
+                                )
                     self.epilog_sync_barrier.arrive_and_wait()
 
                 #
@@ -3246,6 +3325,36 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 if cutlass.const_expr(not self.overlapping_accum):
                     acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
+
+                if cutlass.const_expr(self.store_output_amax):
+                    # One epilogue thread owns one logical output row.  Fold
+                    # the accumulator's two native-width lanes only once, then
+                    # clear the junk xor-sign before reinterpreting the low
+                    # lane in c_dtype for the final store.  Use the scheduler's
+                    # logical coordinate because a persistent CTA processes
+                    # multiple tiles over its lifetime.
+                    if cutlass.const_expr(self.c_dtype is cutlass.BFloat16):
+                        tile_amax_packed = bfloat2_max_abs(
+                            tile_amax_packed,
+                            tile_amax_packed >> cutlass.Uint32(16),
+                        )
+                    else:
+                        tile_amax_packed = half2_max_abs(
+                            tile_amax_packed,
+                            tile_amax_packed >> cutlass.Uint32(16),
+                        )
+                    tile_amax_bits = cute.make_rmem_tensor((1,), cutlass.Uint32)
+                    tile_amax_bits[0] = tile_amax_packed & cutlass.Uint32(0x7FFF)
+                    tile_amax = cute.recast_tensor(tile_amax_bits, self.c_dtype)[0]
+                    output_row = tile_info[0] * self.cta_tile_shape_mnk_c[0] + epi_tidx
+                    if output_row < output_amax.shape[0] * 8:
+                        output_amax[
+                            (
+                                output_row // 8,
+                                tile_info[1],
+                                output_row % 8,
+                            )
+                        ] = tile_amax
 
                 #
                 # Advance to next tile
@@ -4000,6 +4109,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
         num_non_exiting_tiles_ptr: cute.Pointer,
         global_sf_ptr: Optional[cute.Pointer],
         a_per_token_scale_ptr: Optional[cute.Pointer],
+        output_amax_ptr: Optional[cute.Pointer],
         orig_m: cutlass.Int64,
         m: cutlass.Int64,
         n: cutlass.Int64,
@@ -4013,6 +4123,8 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
     ):
         scale_k = k // scaling_vector_size
         interm_size = n // self.out_n_factor
+        output_tile_n = self.mma_tiler[1] // self.out_n_factor
+        num_output_n_tiles = interm_size // output_tile_n
         num_tiles = m // tile_size
         a = cute.make_tensor(
             a_ptr, layout=cute.make_ordered_layout((orig_m, k, 1), order=(1, 0, 2))
@@ -4057,6 +4169,21 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             if cutlass.const_expr(a_per_token_scale_ptr is not None)
             else None
         )
+        output_amax = (
+            cute.make_tensor(
+                output_amax_ptr,
+                layout=cute.make_ordered_layout(
+                    (
+                        m // 8,
+                        num_output_n_tiles,
+                        8,
+                    ),
+                    order=(2, 1, 0),
+                ),
+            )
+            if cutlass.const_expr(output_amax_ptr is not None)
+            else None
+        )
 
         tile_idx_to_group_idx = cute.make_tensor(
             tile_idx_to_group_idx_ptr, layout=cute.make_layout((num_tiles,))
@@ -4090,6 +4217,7 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
             num_non_exiting_tiles,
             alpha,
             a_per_token_scale,
+            output_amax,
             max_active_clusters=max_active_clusters,
             stream=stream,
             epilogue_op=epilogue_op,
