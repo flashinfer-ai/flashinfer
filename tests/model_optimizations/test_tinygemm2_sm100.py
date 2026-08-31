@@ -10,13 +10,24 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.gemm.routergemm import (
+    _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES,
+)
+from flashinfer.utils import get_compute_capability, is_sm100a_supported
 
 
 def _skip_if_not_sm100_family():
     if not torch.cuda.is_available():
         pytest.skip("tinygemm2_sm100 tests require a CUDA device")
-    if not is_sm100a_supported(torch.device("cuda")):
+    device = torch.device("cuda")
+    # is_sm100a_supported() only tests major == 10 (plus CUDA >= 12.8), but the
+    # kernel's own TVM_FFI_ICHECK accepts minor 0/3/7 only. Gate on the same
+    # tuple the dispatcher uses so any other 10.x device skips rather than
+    # tripping that check.
+    if not is_sm100a_supported(device) or (
+        get_compute_capability(device)
+        not in _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES
+    ):
         pytest.skip("tinygemm2_sm100 requires SM100/SM103/SM107")
 
 
