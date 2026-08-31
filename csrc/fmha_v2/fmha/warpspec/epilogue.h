@@ -58,6 +58,9 @@ struct Softmax_base {
   // Whether do we attend to the specific sliding window or chunk ?
   enum { SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION };
 
+  // Whether use the bidirectional sliding window attention or not.
+  enum { BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION };
+
   // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
   enum { APPLY_ALIBI = Kernel_traits::APPLY_ALIBI };
 
@@ -96,7 +99,7 @@ struct Softmax_base {
     // The corresponding row/col for each thread after MMA.
     // fixed 4x1 warp layout.
     quad_col_ = lane % 4;
-    if (CAUSAL_MASK) {
+    if (CAUSAL_MASK || SLIDING_OR_CHUNKED_ATTENTION) {
       quad_row_ = warp * 16 + lane / 4;
     }
   }
@@ -107,8 +110,10 @@ struct Softmax_base {
     if (log2_chunked_attention_size_ > 0) {
       // The attention chunk start.
       return (row >> log2_chunked_attention_size_) << log2_chunked_attention_size_;
+    } else if constexpr (BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION) {
+      return max(0, row - sliding_window_size_ / 2);
     } else {
-      // The sliding window start is the max of 0 and row - sliding_window_size.
+      // The sliding window start is the max of 0 and row + 1 - sliding_window_size.
       return max(0, row + 1 - sliding_window_size_);
     }
   }
@@ -214,19 +219,30 @@ struct Softmax_base {
             // Packed mask input.
             valid_positions(mi, ni, v0, v1);
             // Causal mask.
-          } else if constexpr (CAUSAL_MASK) {
+          } else if constexpr (CAUSAL_MASK || SLIDING_OR_CHUNKED_ATTENTION) {
             // Causal Mask: we have to apply mask before getting max.
             int row = row_offset + quad_row_ + mi * 8;
             col = col_offset + quad_col_ * 2 + ni * 8;
-            // Mask for the two N elements.
-            v0 = (col <= row);
-            v1 = (col + 1 <= row);
+
+            if constexpr (CAUSAL_MASK) {
+              // Mask for the two N elements.
+              v0 &= (col <= row);
+              v1 &= (col + 1 <= row);
+            }
 
             // Attend to the specific sliding window or chunk.
             if constexpr (SLIDING_OR_CHUNKED_ATTENTION) {
               int sliding_window_or_chunk_start = compute_sliding_window_or_chunk_start(row);
               v0 &= (col >= sliding_window_or_chunk_start);
               v1 &= (col + 1 >= sliding_window_or_chunk_start);
+
+              if constexpr (BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION) {
+                assert(log2_chunked_attention_size_ == 0 &&
+                       "Bidirectional sliding window attention should not use chunked attention");
+                int sliding_window_end = min(actual_seqlen - 1, row + sliding_window_size_ / 2);
+                v0 &= (col <= sliding_window_end);
+                v1 &= (col + 1 <= sliding_window_end);
+              }
             }
             // Dense(padding) mask.
           } else {

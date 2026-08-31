@@ -324,6 +324,8 @@ static inline Attention_mask_type string_to_mask_type(const std::string& s) {
   if (s == "causal") return Attention_mask_type::CAUSAL;
   if (s == "sliding_window" || s == "chunked")
     return Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
+  if (s == "bidirectional_sliding_window")
+    return Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW;
   if (s == "custom") return Attention_mask_type::CUSTOM_MASK;
   return Attention_mask_type::CAUSAL;  // default
 }
@@ -434,14 +436,22 @@ void fmha_v2_run(
   // - E4M3 kernels: force_fp32_acc (force_fp32_acc = true)
   bool force_fp32_acc = (data_type == DATA_TYPE_BF16 || data_type == DATA_TYPE_E4M3);
 
-  // Sliding window attention parameters
-  if (window_left > 0 && window_left < static_cast<int>(s)) {
+  // Sliding window attention parameters.
+  // Do not override an explicit bidirectional sliding-window mask: that mode is
+  // not causal (each query attends [i - W/2, i + W/2]).
+  if (window_left > 0 && window_left < static_cast<int>(s) &&
+      attention_mask_type != Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW) {
     assert(chunked_attention_size == 0 &&
            "chunked_attention_size should not be used when sliding_window_size is set");
     attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
   }
   // Chunked attention.
   if (chunked_attention_size > 0) {
+    if (attention_mask_type == Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW) {
+      throw std::invalid_argument(
+          "chunked_attention_size cannot be combined with bidirectional sliding window "
+          "attention.");
+    }
     assert((chunked_attention_size & (chunked_attention_size - 1)) == 0 &&
            "chunked_attention_size has to be a power of 2");
     // Chunked-causal masking is only implemented by the warp-specialized (SM90)
@@ -460,7 +470,16 @@ void fmha_v2_run(
     attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
   }
   size_t sliding_window_size = size_t(INT_MAX);
-  if (attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL) {
+  if (attention_mask_type == Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW) {
+    if (window_left < 0) {
+      throw std::invalid_argument(
+          "bidirectional_sliding_window requires window_left >= 0 (tokens on each side "
+          "of the query, excluding the query itself).");
+    }
+    // Kernel Mask<...,5> attends [row - W/2, row + W/2]. Map FlashInfer's
+    // window_left (tokens on each side) so W/2 == window_left.
+    sliding_window_size = size_t(2 * window_left);
+  } else if (attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL) {
     if (window_left != -1) {
       // Adjust sliding_window_size so that FMHA v2 matches FlashInfer's window_left semantics.
       // Set sliding_window_size = window_left + 1.

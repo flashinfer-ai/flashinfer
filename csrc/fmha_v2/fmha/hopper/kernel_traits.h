@@ -44,7 +44,8 @@ template <
     int WARPS_N,
     // The version of the kernel.
     int VERSION_,
-    // The mask version of the kernel, (2 denotes dense mask, 3 denotes causal mask)
+    // The mask version of the kernel, (2 denotes dense mask, 3 denotes causal mask, 4 denotes
+    // sliding window causal mask, 5 denotes bidirectional sliding window mask)
     int MASK_VERSION_ = 2,
     // The flags to control the behaviour of LDGs.
     uint32_t FLAGS = 0x8u>
@@ -89,10 +90,13 @@ struct FMHA_kernel_traits_hopper {
   enum { MASK_VERSION = MASK_VERSION_ };
 
   // Whether use causal mask or not.
-  enum { CAUSAL_MASK = MASK_VERSION_ >= 3 };
+  enum { CAUSAL_MASK = MASK_VERSION_ == 3 || MASK_VERSION_ == 4 };
 
   // Whether use the sliding window attention mask or not.
   enum { SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 4 };
+
+  // Whether use the bidirectional sliding window attention mask or not.
+  enum { BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = MASK_VERSION_ == 5 };
 
   // Do we use LDGSTS for Q, K or V. If not, TMA is used!
   enum { USE_LDGSTS_Q = (FLAGS & 0x1u) != 0u };

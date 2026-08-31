@@ -399,9 +399,52 @@ struct Mask<Traits, Cta_tile, 4> : public Mask<Traits, Cta_tile, 3> {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Bidirectional sliding-window-size tokens around each query.
+// v v v x x x x x x
+// v v v v x x x x x
+// v v v v v x x x x
+// x v v v v v x x x
+// x x v v v v v x x
+// x x x v v v v v x
+// x x x x v v v v v
+
+template <typename Traits, typename Cta_tile>
+struct Mask<Traits, Cta_tile, 5> : public Mask<Traits, Cta_tile, 4> {
+  // V5 mask is the bidirectional sliding window mask.
+  using Base = Mask<Traits, Cta_tile, 4>;
+
+  // The shape of the MMA tile.
+  using Mma_tile = typename Base::Mma_tile;
+
+  // Ctor.
+  template <typename Params, typename Block_info>
+  inline __device__ Mask(Params const& params, Block_info const& block_info, int tidx)
+      : Base(params, block_info, tidx), seqlen_(block_info.actual_seqlen) {}
+
+  // Is a given position valid?
+  inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const {
+    int row, col;
+    this->get_row_col(row, col, mi, ni, ii, jj);
+
+    // Is it a valid position in the sequence?
+    return is_valid(row, col);
+  }
+
+  // Is a given position valid?
+  inline __device__ bool is_valid(int row, int col) const {
+    return (col >= max(0, row - Base::sliding_window_size_ / 2)) &&
+           (col <= min(seqlen_ - 1, row + Base::sliding_window_size_ / 2));
+  }
+
+  // The sequence length.
+  int seqlen_;
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // The custom mask (from global memory).
 template <typename Traits, typename Cta_tile>
-struct Mask<Traits, Cta_tile, 5> : public Mask<Traits, Cta_tile, 3> {
+struct Mask<Traits, Cta_tile, 6> : public Mask<Traits, Cta_tile, 3> {
   using Base = Mask<Traits, Cta_tile, 3>;
 
   // The shape of the MMA tile.
@@ -778,6 +821,38 @@ struct Mask_hopper<Traits, Cta_tile, 4> : public Mask_hopper<Traits, Cta_tile, 3
 
   // The sliding window size for attention.
   int sliding_window_size_;
+};
+
+template <typename Traits, typename Cta_tile>
+struct Mask_hopper<Traits, Cta_tile, 5> : public Mask_hopper<Traits, Cta_tile, 4> {
+  // V5 mask is the bidirectional sliding window mask.
+  using Base = Mask_hopper<Traits, Cta_tile, 4>;
+
+  // The shape of the MMA tile.
+  using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
+
+  // Ctor.
+  template <typename Params, typename Block_info>
+  inline __device__ Mask_hopper(Params const& params, Block_info const& block_info, int tidx)
+      : Base(params, block_info, tidx), seqlen_(block_info.actual_seqlen) {}
+
+  // Is a given position valid?
+  inline __device__ bool is_valid(int mi, int ni, int ii, int jj) const {
+    int row, col;
+    this->get_row_col(row, col, mi, ni, ii, jj);
+
+    // Is it a valid position in the sequence?
+    return is_valid(row, col);
+  }
+
+  // Is a given position valid?
+  inline __device__ bool is_valid(int row, int col) const {
+    return col >= max(0, row - Base::sliding_window_size_ / 2) &&
+           col <= min(seqlen_ - 1, row + Base::sliding_window_size_ / 2);
+  }
+
+  // The sequence length.
+  int seqlen_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

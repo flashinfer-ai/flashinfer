@@ -92,6 +92,9 @@ struct Compute {
   // Whether we attend to the specific sliding window or chunk ?
   enum { SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION };
 
+  // Whether use the bidirectional sliding window attention or not.
+  enum { BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION };
+
   // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
   enum { APPLY_ALIBI = Kernel_traits::APPLY_ALIBI };
 
@@ -208,18 +211,23 @@ struct Compute {
     // Is the chunked_attention used ?
     bool is_chunked_attention = params.log2_chunked_attention_size > 0;
 
-    // The left mask is needed when we attend to a specific sliding window or chunk.
+    // Handle sliding window or chunked attention masking
     if constexpr (SLIDING_OR_CHUNKED_ATTENTION) {
-      // The kv_left_mask_end is the start of the chunk.
-      kv_left_mask_end =
-          div_up(is_chunked_attention ? ((tile_offset_end >> params.log2_chunked_attention_size)
-                                         << params.log2_chunked_attention_size)
-                                      : (tile_offset_end + 1 - params.sliding_window_size),
-                 STEP_KV);
+      if constexpr (BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION) {
+        kv_left_mask_end = div_up(
+            max(0, tile_offset_end - params.sliding_window_size / 2), STEP_KV);
+        kv_right_mask_start =
+            min(kv_idx_end - 1, (tile_offset_start + params.sliding_window_size / 2 + 1) / STEP_KV);
+      } else if (is_chunked_attention) {
+        kv_left_mask_end = div_up(((tile_offset_end >> params.log2_chunked_attention_size)
+                                   << params.log2_chunked_attention_size),
+                                  STEP_KV);
+      } else {
+        kv_left_mask_end = div_up(tile_offset_end + 1 - params.sliding_window_size, STEP_KV);
+      }
     }
 
-    // The right mask is needed when causal mask (including sliding_window_attention or chunked
-    // attention) is used.
+    // The right mask is needed when causal mask is used.
     if constexpr (SKIP_CAUSAL_MASK_TILES) {
       kv_right_mask_start = tile_offset_start / STEP_KV;
     }

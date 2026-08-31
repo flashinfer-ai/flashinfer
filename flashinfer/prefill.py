@@ -6170,12 +6170,18 @@ def trtllm_fmha_v2_prefill(
     logits_soft_cap_scale
         The logits soft cap scale. Defaults to ``None``, which means no soft cap.
     mask_mode
-        The mask mode, could be ``causal``, ``sliding_window``, or ``chunked``.
+        The mask mode, could be ``causal``, ``sliding_window``,
+        ``bidirectional_sliding_window``, ``chunked``, or ``padding``.
         Defaults to ``causal``.
+        ``bidirectional_sliding_window`` attends to tokens in
+        ``[i - window_left, i + window_left]`` (query included).
     window_left
-        The left (inclusive) window size for the attention window, when set to ``-1``,
-        the window size will be set to the full length of the sequence. Defaults to ``-1``.
-        Only effective when :attr:`mask_mode` is ``sliding_window``.
+        Tokens on each side of the query for sliding-window masking.
+        When set to ``-1``, the window size will be set to the full length of
+        the sequence (causal sliding window only). Defaults to ``-1``.
+        Required (``>= 0``) when :attr:`mask_mode` is ``bidirectional_sliding_window``.
+        For ``sliding_window``, this is the number of tokens to the left of the
+        query (excluding the query itself).
     chunked_attention_size
         The chunked attention size. Defaults to ``0``, which means no chunked attention.
         Only effective when :attr:`mask_mode` is ``chunked``. Must be a power of 2.
@@ -6293,9 +6299,22 @@ def trtllm_fmha_v2_prefill(
 
     uses_sliding_window = window_left is not None and window_left >= 0
     uses_chunked = chunked_attention_size is not None and chunked_attention_size > 0
-    is_non_causal = mask_mode is not None and mask_mode.lower() == "padding"
+    mask_mode_l = mask_mode.lower() if mask_mode is not None else "causal"
+    is_non_causal = mask_mode_l == "padding"
+    is_bidirectional_swa = mask_mode_l == "bidirectional_sliding_window"
 
-    if (uses_sliding_window or uses_chunked) and is_non_causal:
+    if is_bidirectional_swa:
+        if not uses_sliding_window:
+            raise ValueError(
+                "bidirectional_sliding_window requires window_left >= 0 "
+                "(tokens on each side of the query, excluding the query itself)."
+            )
+        if uses_chunked:
+            raise ValueError(
+                "chunked_attention_size cannot be combined with "
+                "bidirectional_sliding_window."
+            )
+    elif (uses_sliding_window or uses_chunked) and is_non_causal:
         feature = "Sliding window" if uses_sliding_window else "Chunked"
         raise ValueError(
             f"{feature} attention requires causal masking. "

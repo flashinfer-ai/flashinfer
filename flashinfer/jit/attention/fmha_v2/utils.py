@@ -102,7 +102,8 @@ class AttentionMaskType(IntEnum):
     PADDING = 0
     CAUSAL = 1
     SLIDING_OR_CHUNKED_CAUSAL = 2
-    CUSTOM_MASK = 3
+    BIDIRECTIONAL_SLIDING_WINDOW = 3
+    CUSTOM_MASK = 4
 
 
 class InputLayout(IntEnum):
@@ -441,6 +442,7 @@ def selected_mask_types(kspec):
     padding_mask = "1"
     causal_mask = "1"
     sliding_or_chunked_causal_mask = "1"
+    bidirectional_sliding_window_mask = "1"
     custom_mask = "1"
     # only generate certain needed combinations of input_layout and mask types for trt-llm.
     if "GENERATE_CUBIN" in os.environ:
@@ -448,15 +450,18 @@ def selected_mask_types(kspec):
             # SageAttention only needs padding mask now
             causal_mask = "0"
             sliding_or_chunked_causal_mask = "0"
+            bidirectional_sliding_window_mask = "0"
             custom_mask = "0"
         elif (kspec.head_size, kspec.head_size_v) == (192, 128):
             # MLA context phase only needs causal mask and padding mask (for chunked prefill) now
             sliding_or_chunked_causal_mask = "0"
+            bidirectional_sliding_window_mask = "0"
             custom_mask = "0"
         elif (kspec.head_size, kspec.head_size_v) == (576, 512):
             # MLA generation phase only needs padding mask (MtpMask) now
             causal_mask = "0"
             sliding_or_chunked_causal_mask = "0"
+            bidirectional_sliding_window_mask = "0"
             custom_mask = "0"
         # encoder models (head_size = 32 / 64 / 128) need packed_qkv input layout + padding mask.
         elif kspec.input_layout == InputLayout.PACKED_QKV:
@@ -467,6 +472,7 @@ def selected_mask_types(kspec):
         elif kspec.input_layout == InputLayout.CONTIGUOUS_Q_KV:
             causal_mask = "0"
             sliding_or_chunked_causal_mask = "0"
+            bidirectional_sliding_window_mask = "0"
             if kspec.head_size not in [32, 64, 72, 128]:
                 padding_mask = "0"
                 custom_mask = "0"
@@ -480,14 +486,22 @@ def selected_mask_types(kspec):
         if kspec.alibi and kspec.warp_specialization:
             padding_mask = "0"
             sliding_or_chunked_causal_mask = "0"
+            bidirectional_sliding_window_mask = "0"
             custom_mask = "0"
 
         # enable_attn_logit_softcapping kernels only need causal mask or sliding_or_chunked_causal_mask.
         if kspec.enable_attn_logit_softcapping:
             padding_mask = "0"
             custom_mask = "0"
+            bidirectional_sliding_window_mask = "0"
 
-    return padding_mask, causal_mask, sliding_or_chunked_causal_mask, custom_mask
+    return (
+        padding_mask,
+        causal_mask,
+        sliding_or_chunked_causal_mask,
+        bidirectional_sliding_window_mask,
+        custom_mask,
+    )
 
 
 def get_api_code(specs_names):
