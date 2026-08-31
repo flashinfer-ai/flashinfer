@@ -239,18 +239,38 @@ def _fake_inputs(*, tokens: int = 128, ids_dtype=torch.int64):
     )
 
 
-def test_forward_validation_accepts_exact_abi_and_rejects_shape_or_dtype_drift():
+@pytest.mark.parametrize("tokens", (1, 127, 128))
+@pytest.mark.parametrize("ids_dtype", (torch.int32, torch.int64))
+def test_forward_validation_accepts_active_prefix_abi(tokens: int, ids_dtype):
     backend = _backend()
-    backend.validate_forward(_fake_inputs(), _exact_fleet(), quantize_input=True)
-    with pytest.raises(MoEEpConfigError, match=r"shape \(128, 7168\)"):
+    backend.validate_forward(
+        _fake_inputs(tokens=tokens, ids_dtype=ids_dtype),
+        _exact_fleet(),
+        quantize_input=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("tokens", "message"),
+    ((0, "1..128 active tokens"), (129, "exceeds max_tokens_per_rank=128")),
+)
+def test_forward_validation_rejects_active_count_outside_capacity(
+    tokens: int, message: str
+):
+    backend = _backend()
+    with pytest.raises(MoEEpConfigError, match=message):
         backend.validate_forward(
-            _fake_inputs(tokens=127),
+            _fake_inputs(tokens=tokens),
             _exact_fleet(),
             quantize_input=True,
         )
-    with pytest.raises(MoEEpConfigError, match="topk_ids must be torch.int64"):
+
+
+def test_forward_validation_rejects_dtype_drift():
+    backend = _backend()
+    with pytest.raises(MoEEpConfigError, match="topk_ids must be torch.int32 or torch.int64"):
         backend.validate_forward(
-            _fake_inputs(ids_dtype=torch.int32),
+            _fake_inputs(ids_dtype=torch.int16),
             _exact_fleet(),
             quantize_input=True,
         )

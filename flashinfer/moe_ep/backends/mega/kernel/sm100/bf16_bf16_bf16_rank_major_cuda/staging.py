@@ -22,7 +22,7 @@ def validate_rank_major_forward_inputs(
     quantize_input: bool,
     scales: "torch.Tensor | None",
 ) -> None:
-    """Validate the fixed per-rank input ABI without inspecting device values."""
+    """Validate one capacity-bounded active prefix without inspecting values."""
     import torch
 
     if not quantize_input:
@@ -42,25 +42,31 @@ def validate_rank_major_forward_inputs(
         top_k=top_k,
         quantize_input=True,
     )
-    if tuple(hidden_states.shape) != (128, 7168):
+    num_tokens = hidden_states.shape[0]
+    if not 1 <= num_tokens <= 128:
+        raise MoEEpConfigError(
+            "sm100_bf16_bf16_bf16_rank_major_cuda requires 1..128 active "
+            f"tokens per rank, got {num_tokens}"
+        )
+    if tuple(hidden_states.shape) != (num_tokens, 7168):
         raise MoEEpConfigError(
             "sm100_bf16_bf16_bf16_rank_major_cuda hidden_states must have "
-            f"shape (128, 7168), got {tuple(hidden_states.shape)}"
+            f"shape ({num_tokens}, 7168), got {tuple(hidden_states.shape)}"
         )
-    if tuple(topk_ids.shape) != (128, 8):
+    if tuple(topk_ids.shape) != (num_tokens, 8):
         raise MoEEpConfigError(
             "sm100_bf16_bf16_bf16_rank_major_cuda topk_ids must have shape "
-            f"(128, 8), got {tuple(topk_ids.shape)}"
+            f"({num_tokens}, 8), got {tuple(topk_ids.shape)}"
         )
     if hidden_states.dtype != torch.bfloat16:
         raise MoEEpConfigError(
             "sm100_bf16_bf16_bf16_rank_major_cuda hidden_states must be "
             f"torch.bfloat16, got {hidden_states.dtype}"
         )
-    if topk_ids.dtype != torch.int64:
+    if topk_ids.dtype not in (torch.int32, torch.int64):
         raise MoEEpConfigError(
-            "sm100_bf16_bf16_bf16_rank_major_cuda topk_ids must be "
-            f"torch.int64, got {topk_ids.dtype}"
+            "sm100_bf16_bf16_bf16_rank_major_cuda topk_ids must be torch.int32 "
+            f"or torch.int64, got {topk_ids.dtype}"
         )
     if topk_weights.dtype != torch.float32:
         raise MoEEpConfigError(

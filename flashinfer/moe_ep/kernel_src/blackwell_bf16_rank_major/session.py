@@ -1,4 +1,4 @@
-"""Runtime owner for the fixed 11-stage SM100 BF16 rank-major MoE-EP DAG."""
+"""Runtime owner for the capacity-bounded SM100 BF16 rank-major MoE-EP DAG."""
 
 from __future__ import annotations
 
@@ -47,6 +47,7 @@ _STAGE_BINDINGS = {
     "input_barrier": (
         "expert_ids",
         "topk_ids",
+        "active_tokens_per_rank",
         "pg_world",
         "pg_rank",
         "pg_flags",
@@ -55,6 +56,7 @@ _STAGE_BINDINGS = {
         "recv_hidden",
         "recv_local_ids",
         "recv_weights",
+        "active_tokens_per_rank",
         "pg_world",
         "pg_rank",
         "pg_flags",
@@ -70,6 +72,7 @@ _STAGE_BINDINGS = {
         "recv_local_ids",
         "expert_scatter_offsets",
         "token_to_permuted",
+        "active_tokens_per_rank",
     ),
     "route_finalize": (
         "expert_scatter_offsets",
@@ -85,6 +88,7 @@ _STAGE_BINDINGS = {
         "expert_padded_row_offsets",
         "route_map",
         "token_to_permuted",
+        "active_tokens_per_rank",
     ),
     "gemm1_swiglu": (
         "weights",
@@ -111,6 +115,7 @@ _STAGE_BINDINGS = {
         "token_to_permuted",
         "final_output",
         "hidden_size",
+        "active_tokens_per_rank",
     ),
     "partial_barrier": ("pg_world", "pg_rank", "pg_flags"),
     "combine": (
@@ -128,7 +133,7 @@ _STAGE_LAUNCH_CONTRACTS = {
         (32, 1, 1),
         (1, 1, 1),
         0,
-        (),
+        (("active_tokens_per_rank", 128),),
         False,
         False,
         False,
@@ -138,7 +143,7 @@ _STAGE_LAUNCH_CONTRACTS = {
         (256, 1, 1),
         (1, 1, 1),
         15488,
-        (),
+        (("active_tokens_per_rank", 128),),
         False,
         False,
         False,
@@ -158,7 +163,7 @@ _STAGE_LAUNCH_CONTRACTS = {
         (256, 1, 1),
         (1, 1, 1),
         0,
-        (),
+        (("active_tokens_per_rank", 128),),
         False,
         False,
         False,
@@ -178,7 +183,7 @@ _STAGE_LAUNCH_CONTRACTS = {
         (256, 1, 1),
         (1, 1, 1),
         0,
-        (),
+        (("active_tokens_per_rank", 128),),
         False,
         True,
         False,
@@ -208,7 +213,7 @@ _STAGE_LAUNCH_CONTRACTS = {
         (128, 1, 1),
         (1, 1, 1),
         128,
-        (("hidden_size", 7168),),
+        (("hidden_size", 7168), ("active_tokens_per_rank", 128)),
         True,
         False,
         True,
@@ -242,6 +247,37 @@ def _check_cuda(result: tuple[Any, ...], operation: str) -> tuple[Any, ...]:
     if int(result[0]) != 0:
         raise RuntimeError(f"{operation} failed with CUDA status {result[0]}")
     return result[1:]
+
+
+def _active_stage_grids(
+    active_tokens_per_rank: int,
+) -> dict[str, tuple[int, int, int]]:
+    """Return launch grids for one active prefix within the fixed capacity."""
+    if not 1 <= active_tokens_per_rank <= _TOKENS_PER_RANK:
+        raise ValueError(
+            "active tokens per rank must be in [1, 128], got "
+            f"{active_tokens_per_rank}"
+        )
+    active_routes = _WORLD_SIZE * active_tokens_per_rank * _TOP_K
+    route_blocks = (active_routes + 255) // 256
+    # One local expert group needs at most 64 routed rows.  With 32 local
+    # experts, spreading the first row across every expert costs 32 groups;
+    # each further group needs another 64 routes, so N + 31 bounds the active
+    # y-groups.  Keep the published capacity coordinate exactly at y=512.
+    gemm_y = (
+        _MAX_Y_GROUPS
+        if active_tokens_per_rank == _TOKENS_PER_RANK
+        else active_tokens_per_rank + _LOCAL_EXPERTS - 1
+    )
+    return {
+        "dispatch": (_WORLD_SIZE * active_tokens_per_rank, 1, 1),
+        "route_count": (route_blocks, 1, 1),
+        "route_scatter": (route_blocks, 1, 1),
+        "gemm1_swiglu": (32, gemm_y, 1),
+        "gemm2": (56, gemm_y, 1),
+        "local_unpermute": (_WORLD_SIZE * active_tokens_per_rank, 1, 1),
+        "combine": (active_tokens_per_rank, 1, 1),
+    }
 
 
 def _source_dir() -> Path:
@@ -542,6 +578,8 @@ class _KernelLibrary:
         values: tuple[Any, ...],
         types: tuple[Any, ...],
         stream: int,
+        *,
+        grid: tuple[int, int, int] | None = None,
     ) -> None:
         drv = self._drv
         attributes = []
@@ -562,8 +600,26 @@ class _KernelLibrary:
             attribute.value = value
             attributes.append(attribute)
 
+        launch_grid = tuple(stage["grid"]) if grid is None else grid
+        manifest_grid = tuple(stage["grid"])
+        if (
+            len(launch_grid) != 3
+            or any(type(value) is not int or value <= 0 for value in launch_grid)
+            or any(value > maximum for value, maximum in zip(launch_grid, manifest_grid))
+        ):
+            raise RuntimeError(
+                f"stage {stage['name']} grid {launch_grid} exceeds its positive "
+                f"manifest bound {manifest_grid}"
+            )
+        cluster = tuple(stage["cluster"])
+        if any(value % cluster_dim for value, cluster_dim in zip(launch_grid, cluster)):
+            raise RuntimeError(
+                f"stage {stage['name']} grid {launch_grid} is not divisible by "
+                f"cluster {cluster}"
+            )
+
         config = drv.CUlaunchConfig()
-        config.gridDimX, config.gridDimY, config.gridDimZ = stage["grid"]
+        config.gridDimX, config.gridDimY, config.gridDimZ = launch_grid
         config.blockDimX, config.blockDimY, config.blockDimZ = stage["block"]
         config.sharedMemBytes = stage["dynamic_smem_bytes"]
         config.hStream = drv.CUstream(stream)
@@ -586,7 +642,12 @@ class _KernelLibrary:
 
 
 class BlackwellBf16RankMajorSession:
-    """Own exact workspace, descriptors, and launches for one EP rank."""
+    """Own exact workspace, descriptors, and launches for one EP rank.
+
+    Every rank in the process group must stage the same active row count for a
+    launch.  The count may vary between launches from one through the fixed
+    128-row capacity.
+    """
 
     def __init__(
         self,
@@ -631,6 +692,7 @@ class BlackwellBf16RankMajorSession:
 
         self._closed = False
         self._inputs_staged = False
+        self._active_tokens_per_rank: int | None = None
         self._process_group = process_group
         self._rank = rank
         self._device_index = torch.cuda.current_device()
@@ -733,28 +795,49 @@ class BlackwellBf16RankMajorSession:
         topk_ids: torch.Tensor,
         topk_weights: torch.Tensor,
     ) -> None:
+        """Stage one active prefix; all EP ranks must use the same row count."""
         self._require_open()
+        active_tokens_per_rank = hidden_states.shape[0]
+        if not 1 <= active_tokens_per_rank <= _TOKENS_PER_RANK:
+            raise ValueError(
+                "active tokens per rank must be in [1, 128], got "
+                f"{active_tokens_per_rank}"
+            )
         expected = (
             (
                 "hidden_states",
                 hidden_states,
-                (_TOKENS_PER_RANK, _HIDDEN_SIZE),
+                (active_tokens_per_rank, _HIDDEN_SIZE),
                 torch.bfloat16,
             ),
-            ("topk_ids", topk_ids, (_TOKENS_PER_RANK, _TOP_K), torch.int64),
-            ("topk_weights", topk_weights, (_TOKENS_PER_RANK, _TOP_K), torch.float32),
+            ("topk_ids", topk_ids, (active_tokens_per_rank, _TOP_K), None),
+            (
+                "topk_weights",
+                topk_weights,
+                (active_tokens_per_rank, _TOP_K),
+                torch.float32,
+            ),
         )
         for name, tensor, shape, dtype in expected:
-            if tuple(tensor.shape) != shape or tensor.dtype is not dtype:
+            valid_dtype = (
+                tensor.dtype in (torch.int32, torch.int64)
+                if dtype is None
+                else tensor.dtype is dtype
+            )
+            if tuple(tensor.shape) != shape or not valid_dtype:
+                dtype_requirement = (
+                    "torch.int32 or torch.int64" if dtype is None else str(dtype)
+                )
                 raise ValueError(
-                    f"{name} must have shape {shape} and dtype {dtype}, got "
+                    f"{name} must have shape {shape} and dtype {dtype_requirement}, got "
                     f"shape={tuple(tensor.shape)} dtype={tensor.dtype}"
                 )
             if tensor.device != self._device or not tensor.is_contiguous():
                 raise ValueError(f"{name} must be contiguous on {self._device}")
-        self._hidden_states.local.copy_(hidden_states)
-        self._expert_ids_i64.copy_(topk_ids)
-        self._topk_weights.local.copy_(topk_weights)
+        self._hidden_states.local[:active_tokens_per_rank].copy_(hidden_states)
+        self._expert_ids_i64[:active_tokens_per_rank].copy_(topk_ids)
+        self._topk_weights.local[:active_tokens_per_rank].copy_(topk_weights)
+        self._active_tokens_per_rank = active_tokens_per_rank
         self._inputs_staged = True
 
     def bind_weights(
@@ -893,18 +976,23 @@ class BlackwellBf16RankMajorSession:
         self, name: str, output: torch.Tensor
     ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
         p = self._ptr
+        if self._active_tokens_per_rank is None:
+            raise RuntimeError("Blackwell BF16 rank-major active token count is not set")
+        active_tokens_per_rank = self._active_tokens_per_rank
         world_rank = (_WORLD_SIZE, self._rank)
         if name == "input_barrier":
             return (
                 (
                     p(self._expert_ids_i64),
                     p(self._topk_ids.local),
+                    active_tokens_per_rank,
                     *world_rank,
                     p(self._flags.peers),
                 ),
                 (
                     ctypes.c_void_p,
                     ctypes.c_void_p,
+                    ctypes.c_int32,
                     ctypes.c_int32,
                     ctypes.c_int32,
                     ctypes.c_void_p,
@@ -915,6 +1003,7 @@ class BlackwellBf16RankMajorSession:
                 p(self._recv_hidden),
                 p(self._recv_local_ids),
                 p(self._recv_weights),
+                active_tokens_per_rank,
                 *world_rank,
                 p(self._flags.peers),
                 p(self._hidden_states.local),
@@ -928,6 +1017,7 @@ class BlackwellBf16RankMajorSession:
                 ctypes.c_void_p,
                 ctypes.c_void_p,
                 ctypes.c_void_p,
+                ctypes.c_int32,
                 ctypes.c_int32,
                 ctypes.c_int32,
                 ctypes.c_void_p,
@@ -947,8 +1037,9 @@ class BlackwellBf16RankMajorSession:
                 p(self._recv_local_ids),
                 p(self._expert_scatter_offsets),
                 p(self._token_to_permuted),
+                active_tokens_per_rank,
             )
-            return values, self._pointer_types(3)
+            return values, (*self._pointer_types(3), ctypes.c_int32)
         if name == "route_finalize":
             values = (
                 p(self._expert_scatter_offsets),
@@ -966,8 +1057,9 @@ class BlackwellBf16RankMajorSession:
                 p(self._expert_padded_row_offsets),
                 p(self._route_map),
                 p(self._token_to_permuted),
+                active_tokens_per_rank,
             )
-            return values, self._pointer_types(4)
+            return values, (*self._pointer_types(4), ctypes.c_int32)
         if name == "gemm1_swiglu":
             values = (
                 self._descriptors["fc1_weights"],
@@ -998,8 +1090,9 @@ class BlackwellBf16RankMajorSession:
                 p(self._token_to_permuted),
                 p(self._local_partials.local),
                 _HIDDEN_SIZE,
+                active_tokens_per_rank,
             )
-            return values, (*self._pointer_types(4), ctypes.c_int32)
+            return values, (*self._pointer_types(4), ctypes.c_int32, ctypes.c_int32)
         if name == "partial_barrier":
             return (
                 (*world_rank, p(self._flags.peers)),
@@ -1029,15 +1122,20 @@ class BlackwellBf16RankMajorSession:
             raise RuntimeError("Blackwell BF16 rank-major expert weights are not bound")
         if not self._inputs_staged:
             raise RuntimeError("Blackwell BF16 rank-major inputs are not staged")
+        if self._active_tokens_per_rank is None:
+            raise RuntimeError("Blackwell BF16 rank-major active token count is not set")
+        active_tokens_per_rank = self._active_tokens_per_rank
         if (
-            tuple(output.shape) != (_TOKENS_PER_RANK, _HIDDEN_SIZE)
+            tuple(output.shape) != (active_tokens_per_rank, _HIDDEN_SIZE)
             or output.dtype is not torch.bfloat16
             or output.device != self._device
             or not output.is_contiguous()
         ):
             raise ValueError(
-                "output must be contiguous bfloat16 [128, 7168] on the session device"
+                "output must be contiguous bfloat16 "
+                f"[{active_tokens_per_rank}, 7168] on the session device"
             )
+        active_grids = _active_stage_grids(active_tokens_per_rank)
         stream = torch.cuda.current_stream(self._device).cuda_stream
         for stage in self._manifest["stages"]:
             values, types = self._stage_arguments(stage["name"], output)
@@ -1045,8 +1143,15 @@ class BlackwellBf16RankMajorSession:
                 raise RuntimeError(
                     f"stage {stage['name']} argument count differs from the manifest"
                 )
-            self._library.launch(stage, values, types, stream)
+            self._library.launch(
+                stage,
+                values,
+                types,
+                stream,
+                grid=active_grids.get(stage["name"]),
+            )
         self._inputs_staged = False
+        self._active_tokens_per_rank = None
         return output
 
     def destroy(self) -> None:

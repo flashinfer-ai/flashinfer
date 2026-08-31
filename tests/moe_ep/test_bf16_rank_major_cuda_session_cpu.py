@@ -114,6 +114,32 @@ def test_fc1_weight_tensor_map_matches_kernel_transaction_bytes():
     )
 
 
+@pytest.mark.parametrize(
+    ("tokens", "route_blocks", "gemm_y"),
+    ((1, 1, 32), (4, 1, 35), (5, 2, 36), (127, 32, 158), (128, 32, 512)),
+)
+def test_active_stage_grids_are_bounded_by_capacity(tokens, route_blocks, gemm_y):
+    module = _session_module()
+    grids = module._active_stage_grids(tokens)
+
+    assert grids["dispatch"] == (8 * tokens, 1, 1)
+    assert grids["route_count"] == (route_blocks, 1, 1)
+    assert grids["route_scatter"] == (route_blocks, 1, 1)
+    assert grids["gemm1_swiglu"] == (32, gemm_y, 1)
+    assert grids["gemm2"] == (56, gemm_y, 1)
+    assert grids["local_unpermute"] == (8 * tokens, 1, 1)
+    assert grids["combine"] == (tokens, 1, 1)
+    for name, grid in grids.items():
+        maximum = module._STAGE_LAUNCH_CONTRACTS[name][0]
+        assert all(value <= bound for value, bound in zip(grid, maximum))
+
+
+@pytest.mark.parametrize("tokens", (0, 129))
+def test_active_stage_grids_reject_counts_outside_capacity(tokens):
+    with pytest.raises(ValueError, match=r"\[1, 128\]"):
+        _session_module()._active_stage_grids(tokens)
+
+
 def test_packaged_source_manifest_is_complete_and_self_consistent():
     module = _session_module()
     manifest, source_path = module._load_manifest()
