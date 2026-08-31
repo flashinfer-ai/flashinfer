@@ -446,7 +446,8 @@ except Exception:
     pass  # Requires Blackwell (SM100+)
 
 # ── Dynamic-quant MXFP8 GEMM (Blackwell: BF16 M×256 @ MXFP8 160×256) ─────────
-try:
+major, minor = torch.cuda.get_device_capability(torch.device(device))
+if flashinfer.mm_mxfp8_dynamic_quant.is_backend_supported("trtllm", major * 10 + minor):
     M, K, N = 3, 256, 160
     a_bf16 = torch.zeros(M, K, dtype=torch.bfloat16, device=device)
     weight_bf16 = torch.zeros(N, K, dtype=torch.bfloat16, device=device)
@@ -458,13 +459,7 @@ try:
         weight_mxfp8,
         weight_scale,
     )
-    flashinfer.mm_mxfp8_dynamic_quant(
-        a_bf16,
-        weight_prepared,
-        scale_prepared,
-    )
-except Exception:
-    pass  # Requires Blackwell (SM100/103/107)
+    flashinfer.mm_mxfp8_dynamic_quant(a_bf16, weight_prepared, scale_prepared)
 
 # ── BMM mxfp8 (Blackwell SM100+: 2×128×128, block=32) ────────────────────────
 try:
