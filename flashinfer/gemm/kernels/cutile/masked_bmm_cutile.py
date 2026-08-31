@@ -413,6 +413,12 @@ def masked_bmm(
         )
     c = torch.empty((Q, M, N), device=a.device, dtype=a.dtype)
 
+    # A zero-sized dim makes total_tiles==0 -> num_programs==0 -> a (0,1,1) grid
+    # that the cuda.tile launcher rejects. Return the already-allocated empty
+    # output, matching torch.bmm's behavior for empty shapes.
+    if Q == 0 or M == 0 or N == 0:
+        return c
+
     enable_autotune = not _AUTOTUNE_DISABLED
 
     if enable_autotune:
