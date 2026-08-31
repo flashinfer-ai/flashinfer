@@ -31,6 +31,19 @@ if is_cute_dsl_available():
         b12x_fused_moe,
         B12xMoEWrapper,
     )
+    from .blackwell_sm12x import (
+        cute_dsl_sm12x_moe_gemm_fp8,
+        cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4,
+        cute_dsl_sm12x_fc1_act_fp8,
+        cute_dsl_sm12x_fc1_act_mxfp8_mxfp4,
+        cute_dsl_sm12x_fc1_act_q1_fp8,
+        cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4,
+        cute_dsl_sm12x_fc2_finalize_fp8,
+        cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4,
+    )
+    from .sm12x_fused_moe_mxfp8_mxfp4 import (
+        cute_dsl_sm12x_fused_moe_mxfp8_mxfp4,
+    )
 
 __all__ = [
     "is_cute_dsl_available",
@@ -44,4 +57,13 @@ if is_cute_dsl_available():
         "CuteDslMxfp8Mxfp4MoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",
+        "cute_dsl_sm12x_moe_gemm_fp8",
+        "cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4",
+        "cute_dsl_sm12x_fc1_act_fp8",
+        "cute_dsl_sm12x_fc1_act_mxfp8_mxfp4",
+        "cute_dsl_sm12x_fc1_act_q1_fp8",
+        "cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4",
+        "cute_dsl_sm12x_fc2_finalize_fp8",
+        "cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4",
+        "cute_dsl_sm12x_fused_moe_mxfp8_mxfp4",
     ]
