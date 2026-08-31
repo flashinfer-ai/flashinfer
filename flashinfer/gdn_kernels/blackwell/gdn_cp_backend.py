@@ -774,6 +774,9 @@ class GDNCPPrefill:
         self.k = k
         self.v = v
         self.output = output
+        if self._qk_norm is None:
+            self.q_normalized = q
+            self.k_normalized = k
         if alpha is not None:
             self.alpha = alpha
         if beta is not None:

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 import hashlib
 import json
 from pathlib import Path
@@ -538,6 +539,52 @@ def test_public_gdn_cp_cache_reuses_equal_metadata_and_rebinds_tensor_addresses(
         output_final_state=True,
     )
     assert replays == ["replay"]
+
+
+def test_direct_binding_refreshes_unnormalized_qk_aliases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    prepared = object.__new__(gdn_cp.GDNCPPrefill)
+    prepared._graph = None
+    prepared._stream = SimpleNamespace(cuda_stream=7)
+    prepared._qk_norm = None
+    prepared._gather = None
+    prepared._scatter = None
+    prepared.q_normalized = torch.full((1,), -1.0)
+    prepared.k_normalized = torch.full((1,), -2.0)
+    prepared.alpha = torch.ones((1,))
+    prepared.beta = torch.ones((1,))
+    prepared._retained_tensors = ()
+    prepared._refresh_retained_tensors = lambda: None
+    launched: list[tuple[torch.Tensor, torch.Tensor]] = []
+    prepared._launch_direct = lambda: launched.append(
+        (prepared.q_normalized, prepared.k_normalized)
+    )
+    monkeypatch.setattr(
+        gdn_cp.torch.cuda,
+        "current_stream",
+        lambda _device: SimpleNamespace(cuda_stream=7),
+    )
+    monkeypatch.setattr(gdn_cp.torch.cuda, "device", lambda _device: nullcontext())
+    monkeypatch.setattr(gdn_cp.tvm_ffi, "use_torch_stream", nullcontext)
+
+    q = torch.zeros((1,))
+    k = torch.ones((1,))
+    prepared.launch_with_bindings(
+        q=q,
+        k=k,
+        v=torch.full((1,), 2.0),
+        alpha=torch.full((1,), 3.0),
+        beta=torch.full((1,), 4.0),
+        initial_state=None,
+        output=torch.empty((1,)),
+        output_state=None,
+        state_checkpoints=None,
+    )
+
+    assert launched == [(q, k)]
+    assert prepared.q_normalized is q
+    assert prepared.k_normalized is k
 
 
 def test_public_gdn_cp_cache_accepts_inference_metadata_during_graph_capture(
