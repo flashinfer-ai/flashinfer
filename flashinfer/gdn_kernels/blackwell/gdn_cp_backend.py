@@ -1251,7 +1251,7 @@ _public_metadata_binding: (
         torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
-        int,
+        int | None,
         int | None,
         int | None,
         tuple[
@@ -1262,6 +1262,14 @@ _public_metadata_binding: (
     ]
     | None
 ) = None
+
+
+def _metadata_version(tensor: torch.Tensor | None) -> int | None:
+    """Return a version counter when the tensor tracks one."""
+
+    if tensor is None or torch.is_inference(tensor):
+        return None
+    return int(tensor._version)
 
 
 def _metadata_signature(
@@ -1322,12 +1330,9 @@ def chunk_gated_delta_rule_gdn_cp_sm100(
 
     global _public_key, _public_metadata_binding, _public_prepared
     stream = torch.cuda.current_stream(q.device)
-    state_indices_version = (
-        int(state_indices._version) if state_indices is not None else None
-    )
-    checkpoint_cu_starts_version = (
-        int(checkpoint_cu_starts._version) if checkpoint_cu_starts is not None else None
-    )
+    cu_seqlens_version = _metadata_version(cu_seqlens)
+    state_indices_version = _metadata_version(state_indices)
+    checkpoint_cu_starts_version = _metadata_version(checkpoint_cu_starts)
     capturing = torch.cuda.is_current_stream_capturing()
     if capturing:
         if not (
@@ -1335,7 +1340,7 @@ def chunk_gated_delta_rule_gdn_cp_sm100(
             and _public_metadata_binding[0] is cu_seqlens
             and _public_metadata_binding[1] is state_indices
             and _public_metadata_binding[2] is checkpoint_cu_starts
-            and _public_metadata_binding[3] == int(cu_seqlens._version)
+            and _public_metadata_binding[3] == cu_seqlens_version
             and _public_metadata_binding[4] == state_indices_version
             and _public_metadata_binding[5] == checkpoint_cu_starts_version
         ):
@@ -1407,7 +1412,7 @@ def chunk_gated_delta_rule_gdn_cp_sm100(
             cu_seqlens,
             state_indices,
             checkpoint_cu_starts,
-            int(cu_seqlens._version),
+            cu_seqlens_version,
             state_indices_version,
             checkpoint_cu_starts_version,
             metadata_signature,
@@ -1420,7 +1425,7 @@ def chunk_gated_delta_rule_gdn_cp_sm100(
             cu_seqlens,
             state_indices,
             checkpoint_cu_starts,
-            int(cu_seqlens._version),
+            cu_seqlens_version,
             state_indices_version,
             checkpoint_cu_starts_version,
             metadata_signature,

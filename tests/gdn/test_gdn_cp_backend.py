@@ -540,6 +540,83 @@ def test_public_gdn_cp_cache_reuses_equal_metadata_and_rebinds_tensor_addresses(
     assert replays == ["replay"]
 
 
+def test_public_gdn_cp_cache_accepts_inference_metadata_during_graph_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preparations: list[str] = []
+    dynamic_launches: list[str] = []
+    capturing = False
+
+    class FakePrepared:
+        def launch_with_bindings(self, **_kwargs) -> None:
+            dynamic_launches.append("launch")
+
+        def replay(self) -> None:
+            pass
+
+    def fake_prepare(*_args, **_kwargs):
+        preparations.append("prepare")
+        return FakePrepared()
+
+    monkeypatch.setattr(gdn_cp, "prepare_gdn_cp_prefill", fake_prepare)
+    monkeypatch.setattr(
+        gdn_cp.torch.cuda,
+        "current_stream",
+        lambda _device: SimpleNamespace(cuda_stream=7),
+    )
+    monkeypatch.setattr(
+        gdn_cp.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: capturing,
+    )
+    gdn_cp._reset_gdn_cp_prefill_cache()
+
+    with torch.inference_mode():
+        cu_seqlens = torch.tensor([0, 2], dtype=torch.int64)
+        state_indices = torch.tensor([0], dtype=torch.int64)
+        checkpoint_cu_starts = torch.tensor([0, 1], dtype=torch.int64)
+    assert all(
+        torch.is_inference(tensor)
+        for tensor in (cu_seqlens, state_indices, checkpoint_cu_starts)
+    )
+
+    q = torch.zeros((2, 1, 128), dtype=torch.float16)
+    output = torch.empty_like(q)
+    alpha = torch.ones((2, 1), dtype=torch.float32)
+    beta = torch.ones((2, 1), dtype=torch.float32)
+    state = torch.zeros((1, 1, 128, 128), dtype=torch.float32)
+    output_state = torch.empty_like(state)
+    state_checkpoints = torch.empty_like(state)
+
+    def invoke() -> None:
+        gdn_cp.chunk_gated_delta_rule_gdn_cp_sm100(
+            output,
+            output_state,
+            q,
+            q,
+            q,
+            alpha,
+            beta,
+            cu_seqlens,
+            0.125,
+            initial_state=state,
+            state_indices=state_indices,
+            output_final_state=True,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=checkpoint_cu_starts,
+            checkpoint_every_n_tokens=64,
+        )
+
+    invoke()
+    capturing = True
+    invoke()
+
+    assert preparations == ["prepare"]
+    assert dynamic_launches == ["launch"]
+    assert gdn_cp._public_metadata_binding is not None
+    assert gdn_cp._public_metadata_binding[3:6] == (None, None, None)
+
+
 def test_public_gdn_cp_cache_preserves_alpha_absence_across_address_rebinds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
