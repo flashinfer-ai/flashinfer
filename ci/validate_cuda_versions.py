@@ -19,10 +19,13 @@ CUDNN_PATTERN = re.compile(r"^[0-9]+(?:\.[0-9]+){3}$")
 ARCH_LIST_PATTERN = re.compile(r"^[0-9]+\.[0-9]+[a-z]?(?: [0-9]+\.[0-9]+[a-z]?)*$")
 DEPENDENCY_PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 DEPENDENCY_VERSION_PATTERN = re.compile(
-    r"^(?P<release>[0-9]+(?:\.[0-9]+)*)(?:(?P<phase>a|b|rc)(?P<serial>[0-9]+))?$"
+    r"^(?P<release>[0-9]+(?:\.[0-9]+)*)"
+    r"(?:(?P<phase>a|b|rc)(?P<serial>[0-9]+))?"
+    r"(?:\.dev(?P<dev>[0-9]+))?$"
 )
 DEPENDENCY_SPECIFIER_PATTERN = re.compile(
-    r"^(?P<operator>==|>=)(?P<version>[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?)$"
+    r"^(?P<operator>==|>=)"
+    r"(?P<version>[0-9]+(?:\.[0-9]+)*(?:(?:a|b|rc)[0-9]+)?(?:\.dev[0-9]+)?)$"
 )
 DEPENDENCY_EXTRA_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 CUDA_MAJOR_PATTERN = re.compile(r"^[0-9]+$")
@@ -63,9 +66,23 @@ def _version_key(version: str) -> tuple[int, ...]:
     release = tuple(int(part) for part in match.group("release").split("."))
     release = (*release, *(0 for _ in range(4 - len(release))))
     phase = match.group("phase")
-    phase_rank = {"a": 0, "b": 1, "rc": 2, None: 3}[phase]
+    dev = match.group("dev")
+    # PEP 440 ordering within one release, lowest to highest:
+    #   X.devN  <  XaN  <  XbN  <  XrcN  <  X (final)
+    # A dev release with no pre-release phase precedes every pre-release, so it
+    # ranks below alpha; a final release (no phase, no dev) ranks above them.
+    if phase is not None:
+        phase_rank = {"a": 0, "b": 1, "rc": 2}[phase]
+    elif dev is not None:
+        phase_rank = -1
+    else:
+        phase_rank = 3
     serial = int(match.group("serial") or 0)
-    return (*release, phase_rank, serial)
+    # Within the same (release, phase, serial) a dev release precedes its
+    # non-dev counterpart, e.g. 4.8.0a1.dev2 < 4.8.0a1: (0, dev) sorts before
+    # (1, 0).
+    dev_key = (0, int(dev)) if dev is not None else (1, 0)
+    return (*release, phase_rank, serial, *dev_key)
 
 
 def _toml_string_arrays(path: Path, section: str) -> dict[str, list[str]]:

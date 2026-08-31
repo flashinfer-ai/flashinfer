@@ -781,8 +781,8 @@ def combine_blk64_kv_bucketed_partials(
 def workaround_cutlass_hash_import_bug():
     """Avoid optional generated dialect imports that are broken in this environment.
 
-    The alias loop below is verified against the pinned nvidia-cutlass-dsl==4.7.0
-    (see requirements.txt): ``cutlass._mlir_helpers.<suffix>`` is the real
+    The alias loop below is verified against the pinned nvidia-cutlass-dsl==4.8.0.dev0
+    (see ci/cuda-versions.json): ``cutlass._mlir_helpers.<suffix>`` is the real
     module and ``cutlass.base_dsl._mlir_helpers.<suffix>`` is the (missing)
     alias some generated code expects, so the loop builds that alias. This
     direction is version-sensitive -- it was reversed on nvidia-cutlass-dsl

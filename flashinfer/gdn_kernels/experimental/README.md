@@ -435,7 +435,7 @@ the composable path.
    A CuTe-DSL impl must also stay inside the DSL surface its *deployed*
    version offers, not the newest one installed while developing.  **The
    runtime floor for this package is nvidia-cutlass-dsl 4.5**, which is
-   deliberately lower than the `==4.7.0` FlashInfer itself pins in
+   deliberately lower than the `==4.8.0.dev0` FlashInfer itself pins in
    `requirements.txt` and the `cu12`/`cu13` extras.  The two answer different
    questions: the pin says which DSL a FlashInfer install brings along, the
    floor says which DSL the shipped kernel must still compile under — and

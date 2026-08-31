@@ -25,8 +25,8 @@ import torch
 
 pytest.importorskip(
     "cutlass",
-    minversion="4.7.0",
-    reason="prims-ts decode requires nvidia-cutlass-dsl==4.7.0",
+    minversion="4.8.0.dev0",
+    reason="prims-ts decode requires nvidia-cutlass-dsl==4.8.0.dev0",
 )
 
 import flashinfer  # noqa: E402

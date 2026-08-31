@@ -28,7 +28,8 @@ from cutlass.cute.runtime import from_dlpack
 _STATIC_TYPES = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
 
 
-_EXPECTED_CUTLASS_DSL_VERSION = "4.7.0"  # keep in sync with requirements.txt
+# Keep in sync with ci/cuda-versions.json (ci_image_specifier).
+_EXPECTED_CUTLASS_DSL_VERSION = "4.8.0.dev0"
 
 # Serializes the save/patch/restore sequence below so overlapping
 # cute.compile(..., "--enable-tvm-ffi") calls from different threads can't
