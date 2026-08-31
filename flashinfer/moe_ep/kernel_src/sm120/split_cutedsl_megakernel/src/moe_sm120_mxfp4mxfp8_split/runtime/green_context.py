@@ -308,6 +308,7 @@ class NativeGreenContextGraph:
         launch_k3: Optional[Callable[[], None]],
         launch_reset: Optional[Callable[[], None]],
         k1_sm_count: int,
+        k2_grid_blocks: Optional[int] = None,
         green_resources: Optional[NativeGreenContextResources] = None,
         device: Optional[int] = None,
     ) -> "NativeGreenContextGraph":
@@ -417,6 +418,10 @@ class NativeGreenContextGraph:
                 green_resources.execution_contexts[0],
                 green_resources.execution_contexts[3],
             ]
+        if k2_grid_blocks is None:
+            k2_grid_blocks = k2_sm_count
+        if k2_grid_blocks <= 0:
+            raise ValueError("k2_grid_blocks must be positive")
         try:
             if green_resources is None:
                 for index, resource in enumerate(resources):
@@ -482,7 +487,7 @@ class NativeGreenContextGraph:
                     context_index = (
                         0 if grid_blocks == k1_sm_count
                         else 1
-                        if grid_blocks == k2_sm_count
+                        if grid_blocks == k2_grid_blocks
                         else None
                     )
                 if context_index is None:

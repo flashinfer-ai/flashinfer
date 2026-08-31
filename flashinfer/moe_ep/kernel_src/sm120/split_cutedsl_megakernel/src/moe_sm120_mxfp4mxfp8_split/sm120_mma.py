@@ -21,9 +21,10 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.warp.mma as warp_mma
 import cutlass.utils.blackwell_helpers as sm120_utils
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass import Float32, Uint32
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
+from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir, llvm
 from cutlass.cute.nvgpu.warp.mma import _pack_shape
 
 
@@ -320,6 +321,76 @@ def _arch_mma_m16n8k32_mxfp8(
     acc[3] = acc_dtype(res[3])
 
 
+@dsl_user_op
+def _arch_mma_m16n8k32_mxfp8_packed_sfb(
+    acc: cute.Tensor,
+    a_reg: cute.Tensor,
+    b_reg: cute.Tensor,
+    sfa_scalar,
+    sfb_packed,
+    *,
+    byte_id_b: int,
+    loc=None,
+    ip=None,
+) -> None:
+    """Issue mixed W4A8 QMMA using one packed SFB register.
+
+    PTX selects one byte from ``sfb_packed`` with ``byte_id_b``. This keeps
+    the N16 scale word intact across the four K32 issues and avoids explicit
+    SHF/LOP3 byte extraction in the persistent K2 loop.
+    """
+
+    a_i32 = a_reg.load(loc=loc, ip=ip).bitcast(cutlass.Int32, loc=loc, ip=ip)
+    b_i32 = b_reg.load(loc=loc, ip=ip).bitcast(cutlass.Int32, loc=loc, ip=ip)
+    sfa_u8 = sfa_scalar.bitcast(cutlass.Uint8, loc=loc, ip=ip)
+    bid_a = cutlass.Int16(0).ir_value(loc=loc, ip=ip)
+    tid_a = cutlass.Int16(0).ir_value(loc=loc, ip=ip)
+    bid_b = cutlass.Int16(byte_id_b).ir_value(loc=loc, ip=ip)
+    tid_b = cutlass.Int16(0).ir_value(loc=loc, ip=ip)
+    result = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32(), T.f32(), T.f32()]),
+        [
+            Uint32(a_i32[0]).ir_value(loc=loc, ip=ip),
+            Uint32(a_i32[1]).ir_value(loc=loc, ip=ip),
+            Uint32(a_i32[2]).ir_value(loc=loc, ip=ip),
+            Uint32(a_i32[3]).ir_value(loc=loc, ip=ip),
+            Uint32(b_i32[0]).ir_value(loc=loc, ip=ip),
+            Uint32(b_i32[1]).ir_value(loc=loc, ip=ip),
+            Uint32(sfa_u8).ir_value(loc=loc, ip=ip),
+            bid_a,
+            tid_a,
+            Uint32(sfb_packed).ir_value(loc=loc, ip=ip),
+            bid_b,
+            tid_b,
+            Float32(acc[0]).ir_value(loc=loc, ip=ip),
+            Float32(acc[1]).ir_value(loc=loc, ip=ip),
+            Float32(acc[2]).ir_value(loc=loc, ip=ip),
+            Float32(acc[3]).ir_value(loc=loc, ip=ip),
+        ],
+        """
+        mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e2m1.e4m3.f32.ue8m0
+        {$0, $1, $2, $3},
+        {$4, $5, $6, $7},
+        {$8, $9},
+        {$0, $1, $2, $3},
+        {$10},
+        {$11, $12},
+        {$13},
+        {$14, $15};
+        """,
+        "=f,=f,=f,=f,r,r,r,r,r,r,r,h,h,r,h,h,0,1,2,3",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    acc[0] = Float32(llvm.extractvalue(T.f32(), result, [0], loc=loc, ip=ip))
+    acc[1] = Float32(llvm.extractvalue(T.f32(), result, [1], loc=loc, ip=ip))
+    acc[2] = Float32(llvm.extractvalue(T.f32(), result, [2], loc=loc, ip=ip))
+    acc[3] = Float32(llvm.extractvalue(T.f32(), result, [3], loc=loc, ip=ip))
+
+
 @cute.jit
 def partition_sfa_for_sm120_mma(
     tiled_mma: cute.TiledMma,
@@ -436,6 +507,76 @@ def issue_m64n8k32_mxfp8(
         b_dtype=b_dtype,
         acc_dtype=cutlass.Float32,
         sf_dtype=sf_dtype,
+    )
+
+
+@cute.jit
+def issue_m64n8k32_mxfp8_compact_sfb(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    a_frag,
+    b_frag,
+    sfa_frag,
+    sfb_frag,
+    *,
+    n_group: int,
+    active_n_groups: int,
+    sfa_m_group,
+    k_inner: int,
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+) -> None:
+    """Issue one QMMA from a fixed four-byte K32 SFB fragment.
+
+    The caller encodes the dynamic N128 sub-tile in the shared-memory load
+    address. Keeping only the four K32 bytes in registers avoids rebuilding a
+    CuTe layout inside the persistent loop and removes the eight-way selector.
+    """
+
+    if cutlass.const_expr(n_group >= active_n_groups):
+        return
+    _arch_mma_m16n8k32_mxfp8(
+        acc,
+        a_frag[(None, 0, k_inner)],
+        b_frag[(None, n_group, k_inner)],
+        sfa_frag[((0, 0), sfa_m_group, k_inner)],
+        sfb_frag[k_inner],
+        a_dtype=a_dtype,
+        b_dtype=b_dtype,
+        acc_dtype=cutlass.Float32,
+        sf_dtype=sf_dtype,
+    )
+
+
+@cute.jit
+def issue_m64n8k32_mxfp8_packed_sfb(
+    tiled_mma: cute.TiledMma,
+    acc: cute.Tensor,
+    a_frag,
+    b_frag,
+    sfa_frag,
+    sfb_packed,
+    *,
+    n_group: int,
+    active_n_groups: int,
+    sfa_m_group,
+    k_inner: int,
+    a_dtype: Type[cutlass.Numeric],
+    b_dtype: Type[cutlass.Numeric],
+    sf_dtype: Type[cutlass.Numeric],
+) -> None:
+    """Issue one QMMA using byte-id selection from packed SFB."""
+
+    if cutlass.const_expr(n_group >= active_n_groups):
+        return
+    _arch_mma_m16n8k32_mxfp8_packed_sfb(
+        acc,
+        a_frag[(None, 0, k_inner)],
+        b_frag[(None, n_group, k_inner)],
+        sfa_frag[((0, 0), sfa_m_group, k_inner)],
+        sfb_packed,
+        byte_id_b=k_inner,
     )
 
 

@@ -16,7 +16,9 @@ Tile = Tuple[int, int, int]
 
 # Same-NUMA EP4 decode buckets validated on RTX Pro 5000. K1 remains N32;
 # only K2 benefits from N16 at these graph-row counts. The mapping value is
-# the ready-queue bundle selected by the controlled N16 sweep.
+# the ready-queue bundle selected by the controlled N16 sweep. Keep the
+# single-group K2 until the dual-group 76-CTA replay lifecycle is proven safe
+# for the full 4096-wide production shape.
 _DECODE_SPLIT_K2_N16_BUNDLE_BY_BUCKET = {
     7: 1,
     16: 2,
@@ -25,6 +27,12 @@ _DECODE_SPLIT_K2_N16_BUNDLE_BY_BUCKET = {
     128: 2,
 }
 _DECODE_ROW_BUCKETS = (7, 16, 32, 64, 128, 168, 256)
+
+# Keep both decode experiments opt-in until the exact N16 selector and the
+# dual-N8 replay/barrier lifecycle complete production validation. Explicit
+# benchmark overrides can still instantiate N16 without affecting callers.
+_ENABLE_PRODUCTION_DECODE_N16 = False
+_ENABLE_EXPERIMENTAL_DUAL_N8 = False
 
 
 def _select_decode_row_bucket(rows_per_rank: int) -> Optional[int]:
@@ -198,6 +206,7 @@ class MegaMoEHeuristicOverrides:
     k2_tile: Optional[Tile] = None
     k2_stages: Optional[int] = None
     k2_warps: Optional[int] = None
+    ready_queue_bundle: Optional[int] = None
     k1_sms: Optional[int] = None
     k2_sms: Optional[int] = None
     tx_sms: Optional[int] = None
@@ -271,6 +280,11 @@ class MegaMoEKernelConfig:
     def with_overrides(
         self, overrides: MegaMoEHeuristicOverrides
     ) -> "MegaMoEKernelConfig":
+        if (
+            overrides.ready_queue_bundle is not None
+            and overrides.ready_queue_bundle <= 0
+        ):
+            raise ValueError("ready_queue_bundle must be positive")
         updates = {
             name: value
             for name, value in vars(overrides).items()
@@ -540,10 +554,9 @@ def select_megamoe_config(
         ),
         k2_natural_regs=(token_n == 32),
         k2_min_blocks_per_sm=2 if token_n == 32 else 1,
-        # Tail reclaim uses an alternate K2 scheduler/workspace contract.  It
-        # is not part of the validated FlashInfer production path, so the pure
-        # selector never enables it implicitly.  The CLI override remains
-        # available for isolated scheduler experiments.
+        # The decode-specific selector below enables tail reclaim only for the
+        # validated dual-group N16 path. Other shapes keep the regular K2
+        # scheduler/workspace contract.
         k2_tail_reclaim=False,
         expected_rows_per_expert=rows,
     )
@@ -556,8 +569,15 @@ def select_megamoe_config(
         value is not None
         for value in (overrides.k2_tile, overrides.k2_stages)
     )
+    explicit_tail_override = (
+        overrides is not None and overrides.k2_tail_reclaim is not None
+    )
     decode_bucket = _select_decode_row_bucket(shape.tokens_per_rank)
-    decode_bundle = _DECODE_SPLIT_K2_N16_BUNDLE_BY_BUCKET.get(decode_bucket)
+    decode_bundle = (
+        _DECODE_SPLIT_K2_N16_BUNDLE_BY_BUCKET.get(decode_bucket)
+        if _ENABLE_PRODUCTION_DECODE_N16
+        else None
+    )
     if (
         not explicit_k2_override
         and config.kernel_comm_backend == "p2p_direct"
@@ -565,13 +585,20 @@ def select_megamoe_config(
         and config.k2_tile == (64, 32, 128)
         and decode_bundle is not None
     ):
+        use_dual_group = _ENABLE_EXPERIMENTAL_DUAL_N8
         config = replace(
             config,
             k2_tile=(64, 16, 128),
             k2_stages=2,
+            k2_warps=12 if use_dual_group else 8,
             ready_queue_bundle=decode_bundle,
-            k2_natural_regs=False,
-            k2_min_blocks_per_sm=1,
+            k2_natural_regs=True,
+            k2_min_blocks_per_sm=2 if use_dual_group else 1,
+            k2_tail_reclaim=(
+                config.k2_tail_reclaim
+                if explicit_tail_override
+                else use_dual_group
+            ),
         )
     if config.total_sms != shape.num_sms:
         raise ValueError(

@@ -103,6 +103,7 @@ class _ExecutionStorage:
     shared_workspace: torch.Tensor
     combine_output: torch.Tensor
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    green_trace: torch.Tensor | None = None
 
 
 @dataclass
@@ -113,6 +114,7 @@ class _ExecutionBuffers:
     shared_workspace: torch.Tensor
     combine_output: torch.Tensor
     epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    green_trace: torch.Tensor | None = None
 
 
 @dataclass
@@ -257,6 +259,14 @@ class MegaMoESm120W4A8Frontend:
         )
 
         cfg = self.config
+        jit = None
+        if (
+            os.environ.get("MEGA_SPLIT_GLOBALTIMER") == "1"
+            or os.environ.get("MEGA_SPLIT_K2_TILE_TRACE") == "1"
+        ):
+            from moe_sm120_mxfp4mxfp8_split.jit_config import Sm120JitConfig
+
+            jit = Sm120JitConfig.from_environment()
         num_sms, minimum, alignment = query_sm_resource_info()
         problem = MegaMoEProblemSpec(
             tokens_per_rank=tokens_per_rank,
@@ -278,6 +288,7 @@ class MegaMoESm120W4A8Frontend:
             sm_min_partition=minimum,
             sm_partition_alignment=alignment,
             overrides=self._heuristic_overrides(),
+            jit=jit,
         )
         actual_k1, actual_k2 = query_green_context_sm_counts(
             k1_sm_count=spec.kernel.k1_sms
@@ -304,6 +315,7 @@ class MegaMoESm120W4A8Frontend:
         shared_workspace: torch.Tensor,
         combine_output: torch.Tensor,
         epilogue_args: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        green_trace: torch.Tensor | None,
         stream,
     ) -> dict[str, Any]:
         from src.sym_buffer import SymBufferHost
@@ -327,7 +339,11 @@ class MegaMoESm120W4A8Frontend:
             fc2_block_done_counter=None,
             local_workspace=self._to_cute(local_workspace, static_layout=True),
             shared_workspace=self._to_cute(shared_workspace),
-            green_trace=None,
+            green_trace=(
+                self._to_cute(green_trace, static_layout=True)
+                if green_trace is not None
+                else None
+            ),
             peer_rank_ptr_mapper_host=SymBufferHost(
                 base_addr=base,
                 offsets=offsets,
@@ -353,6 +369,7 @@ class MegaMoESm120W4A8Frontend:
                 f"bucket={bucket} K1={kernel.k1_tile} "
                 f"K2={kernel.k2_tile}/stage{kernel.k2_stages} "
                 f"bundle={kernel.ready_queue_bundle} "
+                f"tail_reclaim={kernel.k2_tail_reclaim} "
                 f"green={kernel.k1_sms}/{kernel.k2_sms}",
                 flush=True,
             )
@@ -395,11 +412,28 @@ class MegaMoESm120W4A8Frontend:
                 )
                 for _ in range(3)
             )
+            green_trace = None
+            if (
+                os.environ.get("MEGA_SPLIT_GLOBALTIMER") == "1"
+                or os.environ.get("MEGA_SPLIT_K2_TILE_TRACE") == "1"
+            ):
+                from moe_sm120_mxfp4mxfp8_split.split_timestamp import (
+                    K2_TILE_TRACE_WORDS,
+                    TRACE_BASE_WORDS,
+                )
+
+                trace_words = TRACE_BASE_WORDS
+                if os.environ.get("MEGA_SPLIT_K2_TILE_TRACE") == "1":
+                    trace_words += K2_TILE_TRACE_WORDS
+                green_trace = torch.zeros(
+                    (trace_words,), dtype=torch.int64, device="cuda"
+                )
             storage = _ExecutionStorage(
                 local_workspace=local_workspace,
                 shared_workspace=shared_workspace,
                 combine_output=combine_output,
                 epilogue_args=epilogue_args,
+                green_trace=green_trace,
             )
             self.workspace._storages[self.compile_bucket] = storage
         execution = _ExecutionBuffers(
@@ -409,6 +443,7 @@ class MegaMoESm120W4A8Frontend:
             shared_workspace=storage.shared_workspace,
             combine_output=storage.combine_output,
             epilogue_args=storage.epilogue_args,
+            green_trace=storage.green_trace,
         )
         self.workspace._executions[self.compile_bucket] = execution
         return execution
@@ -433,6 +468,7 @@ class MegaMoESm120W4A8Frontend:
         shared_workspace = execution.shared_workspace
         combine_output = execution.combine_output
         epilogue_args = execution.epilogue_args
+        green_trace = execution.green_trace
 
         root_stream = torch.cuda.Stream(priority=0)
         k1_stream = torch.cuda.Stream(priority=-1)
@@ -446,12 +482,18 @@ class MegaMoESm120W4A8Frontend:
             shared_workspace,
             combine_output,
             epilogue_args,
+            green_trace,
             root_cuda,
         )
         runtime_k1 = dict(base_runtime, stream=k1_cuda)
         runtime_k2 = dict(base_runtime, stream=k2_cuda)
         compile_k1 = dict(runtime_k1, max_active_clusters=spec.kernel.k1_sms)
-        compile_k2 = dict(runtime_k2, max_active_clusters=spec.kernel.k2_sms)
+        k2_ctas_per_sm = 2 if spec.kernel.k2_warps == 12 else 1
+        k2_launch_clusters = spec.kernel.k2_sms * k2_ctas_per_sm
+        compile_k2 = dict(
+            runtime_k2,
+            max_active_clusters=k2_launch_clusters,
+        )
         compiled_pair = self.workspace._compiled_k12.get(self.compile_bucket)
         if compiled_pair is None:
             compiled_pair = (
@@ -466,13 +508,25 @@ class MegaMoESm120W4A8Frontend:
         runtime_finalizer = None
         compiled_drain = None
         compiled_finalizer = None
+        k2_drain_launch_clusters = 0
         if bundle.k2_drain is not None:
             runtime_drain = dict(base_runtime, stream=k1_cuda)
-            runtime_finalizer = dict(base_runtime, stream=root_cuda)
+            # The dual-N8 specialization is verified at two resident CTAs/SM.
+            # Use both slots on the SMs released by K1 during the drain phase.
+            drain_ctas_per_sm = 2 if spec.kernel.k2_warps == 12 else 1
+            k2_drain_launch_clusters = (
+                spec.kernel.k1_sms * drain_ctas_per_sm
+            )
             compiled_drain = cute.compile(
                 bundle.k2_drain,
-                **dict(runtime_drain, max_active_clusters=spec.kernel.k1_sms),
+                **dict(
+                    runtime_drain,
+                    max_active_clusters=k2_drain_launch_clusters,
+                ),
             )
+
+        if bundle.k2_finalizer is not None:
+            runtime_finalizer = dict(base_runtime, stream=root_cuda)
             compiled_finalizer = cute.compile(
                 bundle.k2_finalizer,
                 **dict(runtime_finalizer, max_active_clusters=1),
@@ -525,6 +579,7 @@ class MegaMoESm120W4A8Frontend:
             launch_k3=lambda: k3_executor(**runtime_k3),
             launch_reset=lambda: self._reset_execution(execution),
             k1_sm_count=spec.kernel.k1_sms,
+            k2_grid_blocks=k2_launch_clusters,
         )
         graph_captured = time.monotonic()
         if os.environ.get("FLASHINFER_MEGAMOE_LOG_COMPILE_SPEC") == "1":
@@ -532,6 +587,8 @@ class MegaMoESm120W4A8Frontend:
                 "[FlashInfer MegaMoE frontend] "
                 f"rank={self.config.rank} "
                 f"bucket={self.compile_bucket} "
+                f"k2_launch_ctas={k2_launch_clusters} "
+                f"k2_drain_launch_ctas={k2_drain_launch_clusters} "
                 f"layer={len(self.workspace._frontends)} "
                 f"k12_compile={kernels_compiled - profile_start:.3f}s "
                 f"k3_compile={all_kernels_ready - kernels_compiled:.3f}s "
@@ -568,6 +625,8 @@ class MegaMoESm120W4A8Frontend:
             offset = int(kernel._shared_offsets["expert_recv_count_sum"])
             size = int(kernel._shared_region_by_name["expert_recv_count_sum"].nbytes)
             execution.shared_workspace[offset : offset + size].zero_()
+        if execution.green_trace is not None:
+            execution.green_trace.zero_()
 
     def run(self, inputs: MegaMoESm120W4A8Inputs) -> torch.Tensor:
         compiled = self._ensure_compiled(inputs)

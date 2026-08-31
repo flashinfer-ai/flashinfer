@@ -214,6 +214,7 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
         k2_ready_queue_bundle: int = 16,
         k2_natural_regs: bool = False,
         k2_min_blocks_per_sm: int = 1,
+        k2_n16_dual_group: bool = False,
         green_trace_role: Optional[int] = None,
         k1_ready_queue_m_rotation: int = 0,
         jit_config: Optional[Sm120JitConfig] = None,
@@ -396,6 +397,19 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
             // self.fc1_producer_tile_tokens
         )
         self.compact_k2 = compact_k2
+        self.k2_n16_dual_group = bool(
+            split_role == "k2" and k2_n16_dual_group
+        )
+        if self.k2_n16_dual_group:
+            if mma_tiler_mnk != (64, 16, 128):
+                raise ValueError(
+                    "K2 dual-group mapping requires tile (64,16,128)"
+                )
+            self.compute_warp_id = tuple(range(8))
+            self.tma_a_warp_id = 8
+            self.tma_b_warp_id = 9
+            self.sched_warp_id = 10
+            self.sm120_aux_warp_id = 11
         default_natural_regs = (
             split_role == "k2"
             and compact_k2
@@ -454,6 +468,11 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
             + (len(self.dispatch_warp_id) if self.dispatch_warp_id else 0)
             + num_token_back_warps
         )
+        if self.k2_n16_dual_group:
+            # The compact K2 path has no work for the legacy aux warp.  Keep
+            # 8 compute + TMA-A + TMA-B + scheduler so two CTAs fit by the
+            # natural register allocation instead of forcing spills.
+            self.threads_per_cta = 32 * 11
 
         # Independent MegaMoE-specific constants.
         self.world_size = world_size
@@ -550,8 +569,10 @@ class Sm120MegaMoEMxfp8SwapABKernel(Sm120SwapABSwigluMxfp8Fc12Kernel):
             # the kernel-tail rank release/reset after their FC2 work; the
             # remaining producer/scheduler/aux warps are the four cohabitants.
             token_comm_dispatch_warp_start = 0
-            num_other_warps = (
-                len(self.compute_warp_id) - 4 + 4
+            # Remaining compute warps plus TMA-A, TMA-B, scheduler and,
+            # except for the dual-N8 compact path, the legacy aux warp.
+            num_other_warps = len(self.compute_warp_id) - 4 + (
+                3 if self.k2_n16_dual_group else 4
             )
         else:
             token_comm_dispatch_warp_start = self.dispatch_warp_id[0]

@@ -22,8 +22,10 @@ from .heuristic import (
 from .jit_config import Sm120JitConfig
 
 
-# Bump when a generated-kernel ABI or opaque workspace layout changes.
-KERNEL_CACHE_ABI = 2
+# Bump for every generated-kernel code path or opaque workspace change. This
+# revision separates the restored N32/N64/N128 SFB fast selector and the exact
+# N16 slot-0/fallback lowering from previously cached graph/kernel bundles.
+KERNEL_CACHE_ABI = 6
 
 
 @dataclass(frozen=True)
@@ -217,6 +219,10 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     from common.megamoe_constants import SfPaddingBlock
     from .kernel_dispatch_fc1 import build_sm120_dispatch_fc1_kernel
     from .kernel_fc2_combine import Sm120Fc2CombineKernel
+    from .kernel_fc2_combine_n16_dual import (
+        Sm120Fc2CombineN16DualGroupKernel,
+    )
+    from .kernel_k2_finalizer import Sm120K2TailFinalizerKernel
     from .sm120_mma import CTA_TOKEN_TILE
 
     problem = spec.problem
@@ -225,8 +231,10 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     cluster_size = options.cluster_shape_mnk[0] * options.cluster_shape_mnk[1]
     k1_clusters = options.k1_active_clusters or config.k1_sms // cluster_size
     k2_clusters = options.k2_active_clusters or config.k2_sms // cluster_size
+    k2_ctas_per_sm = 2 if config.k2_warps == 12 else 1
+    k2_launch_clusters = k2_clusters * k2_ctas_per_sm
     k1_group_hint = options.group_hint or k1_clusters
-    k2_group_hint = options.group_hint or k2_clusters
+    k2_group_hint = options.group_hint or k2_launch_clusters
 
     k1_token_n = config.k1_tile[1]
     k2_token_n = config.k2_tile[1]
@@ -298,16 +306,21 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
         group_hint=k2_group_hint,
         mma_tiler_mnk=config.k2_tile,
         num_ab_stages_override=config.k2_stages,
-        compact_k2=(config.k2_warps == 8 or config.k2_tile[1] == 256),
+        compact_k2=(config.k2_warps in (8, 12) or config.k2_tile[1] == 256),
         load_balance_mode=k2_load_balance,
         k2_tail_reclaim=config.k2_tail_reclaim,
-        skip_global_tail=config.k2_tail_reclaim,
+        skip_global_tail=(config.k2_tail_reclaim or config.k2_warps == 12),
         producer_sm_count=(
             k1_clusters * cluster_size if options.concurrent_k1_k2 else 0
         ),
         green_trace_role=1,
     )
-    k2 = Sm120Fc2CombineKernel(**k2_common, **common_kwargs)
+    k2_kernel_cls = (
+        Sm120Fc2CombineN16DualGroupKernel
+        if config.k2_warps == 12
+        else Sm120Fc2CombineKernel
+    )
+    k2 = k2_kernel_cls(**k2_common, **common_kwargs)
 
     k2_drain = None
     k2_finalizer = None
@@ -318,16 +331,30 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
             k2_tail_reclaim=True,
             producer_sm_count=0,
         )
-        tail_common.update(group_hint=k1_group_hint, green_trace_role=2)
-        k2_drain = Sm120Fc2CombineKernel(**tail_common, **common_kwargs)
-        tail_common.update(
+        tail_common.update(group_hint=k2_group_hint, green_trace_role=2)
+        # The drain shares the main K2 atomic queue and opaque scheduler
+        # storage.  N16 dual-group K2 has a distinct physical warp layout, so
+        # its drain must use the same kernel class even though the K1 stream
+        # launches only one drain CTA per newly released SM.
+        k2_drain = k2_kernel_cls(**tail_common, **common_kwargs)
+
+    if config.k2_tail_reclaim or config.k2_warps == 12:
+        finalizer_common = dict(k2_common)
+        finalizer_common.update(
             group_hint=1,
+            load_balance_mode=options.load_balance_mode,
+            k2_tail_reclaim=config.k2_tail_reclaim,
+            producer_sm_count=0,
             skip_global_tail=False,
             green_trace_role=3,
         )
-        k2_finalizer = Sm120Fc2CombineKernel(**tail_common, **common_kwargs)
+        k2_finalizer = Sm120K2TailFinalizerKernel(
+            **finalizer_common, **common_kwargs
+        )
 
-    expected_threads = 32 * config.k2_warps
+    # The dual-N8 policy reserves the historical twelfth role slot in the
+    # config/cache key, but physically omits the idle aux warp at launch.
+    expected_threads = 32 * (11 if config.k2_warps == 12 else config.k2_warps)
     if k2.threads_per_cta != expected_threads:
         raise RuntimeError(
             f"K2 requested {expected_threads} threads, got {k2.threads_per_cta}"
@@ -335,9 +362,17 @@ def build_split_kernels(spec: MegaMoECompileSpec) -> SplitKernelBundle:
     workspace_sizes = k1.get_workspace_sizes()
     peers = [k2]
     if k2_drain is not None:
-        peers.extend((k2_drain, k2_finalizer))
-    if any(kernel.get_workspace_sizes() != workspace_sizes for kernel in peers):
-        raise RuntimeError("K1/K2 workspace layouts are not byte-identical")
+        peers.append(k2_drain)
+    if k2_finalizer is not None:
+        peers.append(k2_finalizer)
+    peer_workspace_sizes = [
+        (type(kernel).__name__, kernel.get_workspace_sizes()) for kernel in peers
+    ]
+    if any(sizes != workspace_sizes for _, sizes in peer_workspace_sizes):
+        raise RuntimeError(
+            "K1/K2 workspace layouts are not byte-identical: "
+            f"K1={workspace_sizes}, peers={peer_workspace_sizes}"
+        )
 
     return SplitKernelBundle(
         k1=k1,

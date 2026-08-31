@@ -2138,6 +2138,77 @@ class Sm120SysmemTokenInPullTokenBackPush(TokenInPullTokenBackPush):
             _iket.range_pop()
 
     @cute.jit
+    def kernel_tail_after_grid_drain(
+        self,
+        token_comm_args,
+        *,
+        warp_idx,
+        lane_idx,
+    ):
+        """Run the cross-rank tail from the elected finalizer CTA."""
+        if (warp_idx >= self.dispatch_warp_start) and (
+            warp_idx < self.dispatch_warp_start + self.num_dispatch_warps
+        ):
+            local_warp_idx = Int32(warp_idx) - Int32(self.dispatch_warp_start)
+            for _ in cutlass.range_constexpr(0, 2):
+                self.nvlink_barrier(
+                    token_comm_args.nvlink_barrier_signal,
+                    token_comm_args.nvlink_barrier_counter,
+                    token_comm_args.grid_sync_counter,
+                    token_comm_args.peer_rank_ptr_mapper,
+                    Int32(0),
+                    local_warp_idx,
+                    lane_idx,
+                    slot=1,
+                    num_sms=1,
+                    prologue_grid_sync=True,
+                    epilogue_grid_sync=True,
+                )
+
+            thread_linear = (
+                local_warp_idx * Int32(self.warp_threads) + lane_idx
+            )
+            stride = Int32(self.num_dispatch_threads)
+            recv_total: cutlass.Constexpr[int] = (
+                self.world_size * self.num_experts_per_rank
+            )
+            i = thread_linear
+            while i < Int32(recv_total):
+                rank_idx = i // Int32(self.num_experts_per_rank)
+                expert_idx = i % Int32(self.num_experts_per_rank)
+                token_comm_args.expert_recv_count[
+                    rank_idx, expert_idx
+                ] = Int64(0)
+                i = i + stride
+
+            i = thread_linear
+            while i < Int32(self.num_experts_per_rank):
+                token_comm_args.expert_recv_count_sum[i] = Int64(0)
+                if cutlass.const_expr(self.enable_token_back):
+                    token_comm_args.fc2_done_counter[i] = Int32(0)
+                i = i + stride
+
+            if cutlass.const_expr(
+                self.token_back_schedule_mode == "atomic_counter"
+            ):
+                if thread_linear == Int32(0):
+                    token_comm_args.token_back_schedule_counter.store(Int32(0))
+
+            self.nvlink_barrier(
+                token_comm_args.nvlink_barrier_signal,
+                token_comm_args.nvlink_barrier_counter,
+                token_comm_args.grid_sync_counter,
+                token_comm_args.peer_rank_ptr_mapper,
+                Int32(0),
+                local_warp_idx,
+                lane_idx,
+                slot=0,
+                num_sms=1,
+                prologue_grid_sync=True,
+                epilogue_grid_sync=True,
+            )
+
+    @cute.jit
     def kernel_tail_ibgda(
         self,
         token_comm_args,
