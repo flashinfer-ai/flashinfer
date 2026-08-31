@@ -113,8 +113,7 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_state_v1(__half* __restrict__ q
         }
         long long v_base = ((long long)token * (long long)num_v_heads + (long long)value_head) * 128;
         float input_value = (float)v[v_base + (long long)value_dim];
-        float new_value = beta_value * input_value + (1.0f - beta_value) * old_value;
-        float residual = new_value - old_value;
+        float residual = (input_value - old_value) * beta_value;
         #pragma unroll
         for (int key_dim_update = 0; key_dim_update < 128; key_dim_update++) {
             float _fma_1 = __fmaf_rn(shared_k[key_dim_update], residual, state_values[key_dim_update]);
