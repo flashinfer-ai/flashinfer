@@ -269,6 +269,8 @@ def test_wan_hybrid_attention_binding_matches_frozen_device_abi() -> None:
     assert "kHeads = 40" in common
     assert "kHeadDim = 128" in common
     assert "kTensorMapCount = 6" in common
+    assert "kTensorMapGlobalBaseAlignment = 16" in common
+    assert 'global address must be 16-byte aligned"' in common
     assert "kMaximumTiles = 147" in common
     assert "kAttentionDynamicSmemBytes = 231'424" in common
     assert 'EncodeNHD(k, 128, "cuTensorMapEncodeTiled(k)")' in common
@@ -472,6 +474,18 @@ def test_wan_hybrid_rejects_noncontiguous_nhd() -> None:
             out=_meta_tensor(),
             workspace=_uninitialized_workspace(),
         )
+
+
+@pytest.mark.parametrize("name", ["q", "k", "out"])
+def test_wan_hybrid_rejects_misaligned_tma_base(name: str) -> None:
+    storage = torch.empty(17, dtype=torch.uint8)
+    assert storage.data_ptr() % 16 == 0
+    misaligned = storage[1:]
+    assert misaligned.is_contiguous()
+    assert misaligned.data_ptr() % 16 != 0
+
+    with pytest.raises(ValueError, match=rf"{name} must be 16-byte aligned for TMA"):
+        wan_hybrid._validate_tma_base_alignment(name, misaligned)
 
 
 @pytest.mark.parametrize("name", ["q", "k", "v"])

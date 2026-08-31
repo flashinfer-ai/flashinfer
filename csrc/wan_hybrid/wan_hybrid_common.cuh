@@ -45,6 +45,7 @@ constexpr int64_t kScaleColumns = 32;
 constexpr int64_t kValueScaleRows = 2 * kScaleRows;
 constexpr int64_t kTensorMapCount = 6;
 constexpr int64_t kTensorMapBytes = 128;
+constexpr uintptr_t kTensorMapGlobalBaseAlignment = 16;
 constexpr int64_t kAttentionThreads = 512;
 constexpr int64_t kMaximumTiles = 147;
 constexpr size_t kAttentionDynamicSmemBytes = 231'424;
@@ -102,6 +103,10 @@ inline CUtensorMap EncodeTensorMap(const void* address, CUtensorMapDataType data
 }
 
 inline CUtensorMap EncodeNHD(const TensorView& tensor, uint32_t rows_per_box, const char* name) {
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(tensor.data_ptr()) %
+                        kTensorMapGlobalBaseAlignment,
+                    0)
+      << name << " global address must be 16-byte aligned";
   constexpr uint64_t global_dims[5] = {64, kSequence, kHeads, kBatch, 2};
   constexpr uint64_t global_strides[4] = {
       kHeads * kHeadDim * sizeof(__nv_bfloat16),

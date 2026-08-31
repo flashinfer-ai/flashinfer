@@ -37,6 +37,7 @@ _WAN_HYBRID_PACKED_VALUE_SHAPE = (
 _WAN_HYBRID_SCALE_PLANE_SHAPE = (25_600, 32)
 _WAN_HYBRID_TENSOR_MAP_COUNT = 6
 _WAN_HYBRID_TENSOR_MAP_BYTES = 128
+_WAN_HYBRID_TMA_BASE_ALIGNMENT = 16
 _WAN_HYBRID_UNAVAILABLE_MESSAGE = (
     "wan_hybrid attention is not available in this FlashInfer installation"
 )
@@ -286,6 +287,13 @@ def _validate_tensor_metadata(name: str, tensor: torch.Tensor) -> None:
         raise ValueError(f"{name} must be contiguous, got stride={tensor.stride()}")
 
 
+def _validate_tma_base_alignment(name: str, tensor: torch.Tensor) -> None:
+    if tensor.data_ptr() % _WAN_HYBRID_TMA_BASE_ALIGNMENT:
+        raise ValueError(
+            f"{name} must be {_WAN_HYBRID_TMA_BASE_ALIGNMENT}-byte aligned for TMA"
+        )
+
+
 def _validate_wan_hybrid_attention_contract(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -314,6 +322,8 @@ def _validate_wan_hybrid_attention_contract(
 
     for name, tensor in (("q", q), ("k", k), ("v", v), ("out", out)):
         _validate_tensor_metadata(name, tensor)
+    for name, tensor in (("q", q), ("k", k), ("out", out)):
+        _validate_tma_base_alignment(name, tensor)
 
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         if out is tensor:
@@ -431,9 +441,10 @@ def wan_hybrid_attention(
     ----------
     q, k, v : torch.Tensor
         Contiguous post-RoPE BF16 tensors with shape ``(1, 4800, 40, 128)``.
+        ``q`` and ``k`` must have 16-byte-aligned data pointers.
     out : torch.Tensor
         Caller-owned contiguous BF16 output tensor with the same shape and
-        device as ``q``.
+        device as ``q`` and a 16-byte-aligned data pointer.
     workspace : WanHybridAttentionWorkspace
         Reusable workspace on the same CUDA device as the input tensors.
     sm_scale : float, optional
