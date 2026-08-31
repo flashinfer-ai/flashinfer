@@ -647,10 +647,6 @@ def _blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             f"mma_tiler/mma_inst_shape select the Rubin (SM107) kernel, but "
             f"the device is SM{major}{minor}."
         )
-    if not is_rubin and minor == 7:
-        raise ValueError(
-            "SM107 requires the Rubin tactic parameters mma_tiler and mma_inst_shape."
-        )
 
     # Validate configuration
     a_dtype_cutlass = get_cutlass_dtype(a_dtype)
