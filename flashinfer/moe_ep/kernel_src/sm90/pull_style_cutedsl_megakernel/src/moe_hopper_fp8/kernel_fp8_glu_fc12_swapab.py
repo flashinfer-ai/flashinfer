@@ -98,8 +98,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         sf_vec_size: int = Fp8E8M0SfVecSize,
         ab_dtype: Type[cutlass.Numeric] = cutlass.Float4E2M1FN,
-        fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor",
+        fp8_scale_mode: Literal[
+            "per_tensor", "blockwise", "mxfp4_hybrid"
+        ] = "per_tensor",
         fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc",
+        execution_phase: Literal["fused", "fc1", "fc2"] = "fused",
         pingpong: bool = False,
         scenario: Literal["2Dx3D"] = "2Dx3D",
         fc2_in_kernel_topk_reduce: bool = False,
@@ -162,9 +165,10 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
 
         # Store ab_dtype so workspace-size helpers can use it without tensors.
         self.ab_dtype = ab_dtype
-        if fp8_scale_mode not in ("per_tensor", "blockwise"):
+        if fp8_scale_mode not in ("per_tensor", "blockwise", "mxfp4_hybrid"):
             raise ValueError(
-                f"fp8_scale_mode must be 'per_tensor' or 'blockwise', "
+                "fp8_scale_mode must be 'per_tensor', 'blockwise', or "
+                f"'mxfp4_hybrid', "
                 f"got {fp8_scale_mode!r}."
             )
         self.fp8_scale_mode = fp8_scale_mode
@@ -174,6 +178,21 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 f"got {fp8_accum_mode!r}."
             )
         self.fp8_accum_mode = fp8_accum_mode
+        if execution_phase not in ("fused", "fc1", "fc2"):
+            raise ValueError(
+                "execution_phase must be 'fused', 'fc1', or 'fc2'; "
+                f"got {execution_phase!r}."
+            )
+        self.execution_phase = execution_phase
+        # ``execution_phase`` is the PR #4688 public spelling.  The donor
+        # split kernels use the more explicit fc12/fc1/fc2 compile-time role.
+        # Keep both names mapped here so standalone callers and MegaMoE split
+        # subclasses share one codegen-time phase contract.
+        self.phase_mode = {
+            "fused": "fc12",
+            "fc1": "fc1",
+            "fc2": "fc2",
+        }[execution_phase]
         self.pingpong = pingpong
         if ab_dtype == cutlass.Float8E4M3FN:
             self.fp8_output_rcp_limit = Fp8E4M3RcpLimit
@@ -291,6 +310,17 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         self.token_back_warp_id: Optional[Tuple[int, int, int, int]] = None
         self.token_back_standalone: bool = False
 
+        # Split-Mega protocol knobs. Mega subclasses opt in after base init;
+        # lean P0/P1 and the production fused path retain these defaults.
+        self.split_publish_fc1_done: bool = False
+        self.split_consume_fc1_done: bool = False
+        self.split_fc1_tile_m: Optional[int] = None
+        # Mega split subclasses may set these before entering this base init.
+        # Preserve them instead of overwriting their codegen-time handoff ABI.
+        if not hasattr(self, "split_fc1_token_n"):
+            self.split_fc1_token_n: Optional[int] = None
+        if not hasattr(self, "split_handoff_token_n"):
+            self.split_handoff_token_n: Optional[int] = None
         # MegaMoE-only register policy.  These defaults are safe for the
         # standalone-token-back CTA; Mega subclasses can raise epi_reg_cnt when
         # token-back reuses dispatch warps and the CTA has fewer resident warps.
@@ -304,6 +334,147 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         self.task_reg_cnt = 32
 
         self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
+
+    # ------------------------------------------------------------------
+    # Weight-A policy hooks
+    # ------------------------------------------------------------------
+    # FP8 keeps identity defaults. Packed-weight specializations override
+    # these hooks without replacing scheduler, multicast, or ping-pong code.
+
+    def _weight_storage_k(self, logical_k):
+        return logical_k
+
+    def _logical_weight_k(self, storage_k):
+        return storage_k
+
+    def _mma_a_dtype(self, gmem_dtype: Type[cutlass.Numeric]):
+        return gmem_dtype
+
+    def _a_smem_dtype(self) -> Type[cutlass.Numeric]:
+        return self.a_dtype
+
+    def _a_tma_tiler(self):
+        return cute.slice_(self.mma_tiler, (None, 0, None))
+
+    @cute.jit
+    def _a_tma_gmem_tensor(self, physical_a: cute.Tensor) -> cute.Tensor:
+        return physical_a
+
+    def _a_tma_internal_type(self):
+        return None
+
+    def _make_a_tma_atom(self, op, gmem_tensor, smem_layout):
+        internal_type = self._a_tma_internal_type()
+        if internal_type is None:
+            # Preserve the exact target FP8 construction path.
+            return cpasync.make_tiled_tma_atom(
+                op,
+                gmem_tensor,
+                smem_layout,
+                self._a_tma_tiler(),
+                num_multicast=self.num_mcast_ctas_a,
+            )
+        return cpasync.make_tiled_tma_atom(
+            op,
+            gmem_tensor,
+            smem_layout,
+            self._a_tma_tiler(),
+            num_multicast=self.num_mcast_ctas_a,
+            internal_type=internal_type,
+        )
+
+    def _a_tma_smem_layout(self, logical_a_smem_layout):
+        return logical_a_smem_layout
+
+    @cute.jit
+    def _a_tma_smem_tensor(self, logical_smem_a: cute.Tensor) -> cute.Tensor:
+        return logical_smem_a
+
+    def _uses_weight_aux_pipeline(self) -> bool:
+        return self.fp8_scale_mode == "blockwise"
+
+    def _weight_aux_smem_dtype(self) -> Type[cutlass.Numeric]:
+        return cutlass.Float32
+
+    def _weight_aux_smem_layout_staged(self) -> cute.Layout:
+        return cute.make_layout(
+            (self.wgmma_warpgroup_count, self.num_ab_stage),
+            stride=(1, self.wgmma_warpgroup_count),
+        )
+
+    def _bind_static_fc1_weight(
+        self,
+        fc1_weight: cute.Tensor,
+        experts: int,
+        hidden: int,
+        intermediate_gateup: int,
+    ) -> cute.Tensor:
+        return cute.make_tensor(
+            fc1_weight.iterator,
+            cute.make_layout(
+                (experts, self._weight_storage_k(hidden), intermediate_gateup),
+                stride=fc1_weight.stride,
+            ),
+        )
+
+    def _bind_static_fc2_weight(
+        self,
+        fc2_weight: cute.Tensor,
+        experts: int,
+        intermediate_downproj: int,
+        hidden: int,
+    ) -> cute.Tensor:
+        return cute.make_tensor(
+            fc2_weight.iterator,
+            cute.make_layout(
+                (experts, self._weight_storage_k(intermediate_downproj), hidden),
+                stride=fc2_weight.stride,
+            ),
+        )
+
+    def _fc1_staging_smem_budget_bytes(self) -> int:
+        """Return the FC1-only epilogue storage reserved by this role.
+
+        Keep the legacy reservation byte-for-byte for fused and FC1-only
+        kernels.  FC2-only aliases the unused typed ``sC``/amax arguments to
+        ``sB`` at codegen time, so reserving their nonexistent storage here
+        would unnecessarily reduce its independent AB pipeline depth.
+        """
+        if self.phase_mode == "fc2":
+            return 0
+        return (
+            self.epilogue.bytes_per_stage * self.num_c_stage
+            + self.epilogue.fc1_amax_smem_bytes
+        )
+
+    def _scheduler_fc2_done_peek_enabled(self) -> bool:
+        """Whether scheduler enrichment should emit its optional FC2 peek.
+
+        Split MXFP4 K2 uses an independent canonical counter mapping and its
+        TMA-B warp always performs the authoritative acquire/spin.  No Hopper
+        split consumer reads the scheduler's packed ``peek_ready`` bit there,
+        so compiling that extra counter load is pure overhead.  Keep it for
+        every fused, FP8, and legacy role to preserve their existing codegen.
+        """
+        return not (
+            self.fp8_scale_mode == "mxfp4_hybrid"
+            and self.phase_mode == "fc2"
+            and self.split_consume_fc1_done
+        )
+
+    def _post_spin_fc1_done_acquire_enabled(self) -> bool:
+        """Whether to reload the FC1-done counter after the canonical spin.
+
+        spin_wait already finishes with an acquire/GPU load.  Hopper MXFP4
+        split K2 therefore needs only the following proxy fences before
+        issuing its handoff TMA loads.  Preserve the historical second acquire
+        for every other precision and fused/legacy role.
+        """
+        return not (
+            self.fp8_scale_mode == "mxfp4_hybrid"
+            and self.phase_mode == "fc2"
+            and self.split_consume_fc1_done
+        )
 
     def _validate_mma_tiler_and_cluster_shape(self) -> None:
         """Validate user-provided geometry against v1 fused-fc12 constraints.
@@ -344,7 +515,12 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         The fc12 path shares ``mma_tiler_mnk`` and SMEM layouts across phases.
         """
         if self.enable_token_comm:
-            dispatch_warp_start = self.empty_warp_id + 1
+            enable_empty_warp = getattr(self, "enable_empty_warp", True)
+            dispatch_warp_start = (
+                self.empty_warp_id + 1
+                if enable_empty_warp
+                else self.sched_warp_id + 1
+            )
             self.dispatch_warp_id = tuple(
                 range(dispatch_warp_start, dispatch_warp_start + 4)
             )
@@ -356,14 +532,20 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             token_back_warp_ids = (
                 self.token_back_warp_id if self.token_back_standalone else ()
             )
+            active_dispatch_warp_ids = (
+                self.dispatch_warp_id if self.enable_dispatch_warps else ()
+            )
+            empty_warp_ids = (
+                (self.empty_warp_id,) if enable_empty_warp else ()
+            )
             self.threads_per_cta = 32 * len(
                 (
                     *self.epilogue_warp_id,
                     self.tma_a_warp_id,
                     self.tma_b_warp_id,
                     self.sched_warp_id,
-                    self.empty_warp_id,
-                    *self.dispatch_warp_id,
+                    *empty_warp_ids,
+                    *active_dispatch_warp_ids,
                     *token_back_warp_ids,
                 )
             )
@@ -416,6 +598,8 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             fp8_scale_mode=self.fp8_scale_mode,
             fp8_output_rcp_limit=self.fp8_output_rcp_limit,
             pingpong=self.pingpong,
+            split_handoff_token_n=self.split_handoff_token_n,
+            split_role=getattr(self, "split_role", "fused"),
         )
         self.epilogue = SwapABFp8GluEpilogue(**_epi_common)
 
@@ -425,11 +609,8 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # sC stages are WG-private FC1 store buffers: each WG folds M=128 to
         # one token-N x output-channel64 stage. M=128/M=256 therefore use
         # one/two stages respectively.
-        self.num_c_stage = self.epilogue_warpgroup_count
-        c_bytes_total = (
-            self.epilogue.bytes_per_stage * self.num_c_stage
-            + self.epilogue.fc1_amax_smem_bytes
-        )
+        self.num_c_stage = self.epilogue.fc1_store_stage_count
+        c_bytes_total = self._fc1_staging_smem_budget_bytes()
 
         (
             self.num_acc_stage,
@@ -447,7 +628,10 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         )
 
         self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
-            self.a_layout, self.mma_tiler, self.a_dtype, self.num_ab_stage,
+            self.a_layout,
+            self.mma_tiler,
+            self._a_smem_dtype(),
+            self.num_ab_stage,
         )
         self.b_smem_layout_staged = sm90_utils.make_smem_layout_b(
             self.b_layout,
@@ -472,7 +656,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         self.atom_thr_size = atom_thr_size  # store as Python int for use in @cute.kernel
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, 0))
-        a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
+        a_copy_size = cute.size_in_bytes(self._a_smem_dtype(), a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
         self.num_tma_load_bytes = (
             a_copy_size
@@ -601,6 +785,408 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         )
 
     @cute.jit
+    def launch_fc1_only(
+        self,
+        activation: cute.Tensor,
+        fc1_weight: cute.Tensor,
+        activation_sf: cute.Tensor,
+        fc1_weight_sf: cute.Tensor,
+        fc1_weight_dequant_scale: cute.Tensor,
+        fc1_output: cute.Tensor,
+        fc1_output_sf: cute.Tensor,
+        topk_scores: cute.Tensor,
+        fc1_done_counter: cute.Tensor,
+        offs: Optional[cute.Tensor] = None,
+        max_active_clusters: cutlass.Constexpr = None,
+        stream: cuda.CUstream = None,
+        load_balance_counter: Optional[cute.Tensor] = None,
+        expert_token_sizes: Optional[cute.Tensor] = None,
+        token_comm_args=None,
+    ) -> None:
+        """Launch strict MXFP4-hybrid FC1 without FC2 host descriptors."""
+        if cutlass.const_expr(self.phase_mode != "fc1"):
+            raise ValueError("launch_fc1_only requires phase_mode='fc1'.")
+        if cutlass.const_expr(self.fp8_scale_mode != "mxfp4_hybrid"):
+            raise ValueError("strict FC1 launcher requires mxfp4_hybrid.")
+        if cutlass.const_expr(self.static_expert_shape is None):
+            raise ValueError("strict FC1 launcher requires static expert shape.")
+
+        experts, intermediate_gateup, hidden = self.static_expert_shape
+        intermediate_downproj = intermediate_gateup // 2
+        fc1_weight = self._bind_static_fc1_weight(
+            fc1_weight, experts, hidden, intermediate_gateup,
+        )
+        activation = cute.make_tensor(
+            activation.iterator,
+            cute.make_layout(
+                (activation.shape[0], hidden), stride=activation.stride,
+            ),
+        )
+        fc1_output = cute.make_tensor(
+            fc1_output.iterator,
+            cute.make_layout(
+                (fc1_output.shape[0], intermediate_downproj),
+                stride=fc1_output.stride,
+            ),
+        )
+        # Keep the fake batch-L dimension compile-time static.  A runtime
+        # Int32(1) is folded by TMA rank refinement but survives in the target
+        # profile as "?", producing verifier-invalid cute.derefine IR.
+        c1 = 1
+        c0 = 0
+        tokens_sum = activation.shape[0]
+        activation_gemm = cute.make_tensor(
+            activation.iterator,
+            cute.make_layout(
+                (tokens_sum, hidden, c1),
+                stride=(activation.stride[0], activation.stride[1], c0),
+            ),
+        )
+        fc1_weight_gemm = cute.make_tensor(
+            fc1_weight.iterator,
+            cute.make_layout(
+                (
+                    intermediate_gateup,
+                    self._weight_storage_k(hidden),
+                    experts,
+                ),
+                stride=(
+                    fc1_weight.stride[2],
+                    fc1_weight.stride[1],
+                    fc1_weight.stride[0],
+                ),
+            ),
+        )
+        fc1_output_gemm = cute.make_tensor(
+            fc1_output.iterator,
+            cute.make_layout(
+                (tokens_sum, intermediate_downproj, c1),
+                stride=(fc1_output.stride[0], fc1_output.stride[1], c0),
+            ),
+        )
+        activation_sf_gemm = cute.make_tensor(
+            activation_sf.iterator,
+            cute.make_layout(
+                (activation_sf.shape[0], 4, c1),
+                stride=(activation_sf.stride[0], activation_sf.stride[1], c0),
+            ),
+        )
+        fc1_output_sf_gemm = cute.make_tensor(
+            fc1_output_sf.iterator,
+            cute.make_layout(
+                (
+                    fc1_output_sf.shape[0],
+                    intermediate_downproj // Fp8Fc2ActivationScaleK,
+                    c1,
+                ),
+                stride=(
+                    fc1_output_sf.stride[0],
+                    fc1_output_sf.stride[1],
+                    c0,
+                ),
+            ),
+        )
+
+        self.a_gmem_dtype = fc1_weight_gemm.element_type
+        self.a_dtype = self._mma_a_dtype(self.a_gmem_dtype)
+        self.b_dtype = activation_gemm.element_type
+        self.fc1_output_dtype = fc1_output_gemm.element_type
+        self.sf_dtype = activation_sf.element_type
+        self.a_layout = utils.LayoutEnum.from_tensor(fc1_weight_gemm)
+        self.b_layout = utils.LayoutEnum.from_tensor(activation_gemm)
+        self.a_major_mode = self.a_layout.sm90_mma_major_mode()
+        self.b_major_mode = self.b_layout.sm90_mma_major_mode()
+        self.fc1_output_layout = utils.LayoutEnum.from_tensor(fc1_output_gemm)
+        self._setup_attributes()
+        tiled_mma = self._create_tiled_mma()
+
+        a_op = (
+            cpasync.CopyBulkTensorTileG2SMulticastOp()
+            if self.is_a_mcast
+            else cpasync.CopyBulkTensorTileG2SOp()
+        )
+        a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, 0))
+        a_tma_smem_layout = self._a_tma_smem_layout(a_smem_layout)
+        tma_atom_weight, tma_tensor_weight = self._make_a_tma_atom(
+            a_op,
+            self._a_tma_gmem_tensor(fc1_weight_gemm),
+            a_tma_smem_layout,
+        )
+        b_op = cpasync.CopyBulkTensorTileG2SOp()
+        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, 0))
+        tma_atom_activation, tma_tensor_activation = (
+            cpasync.make_tiled_tma_atom(
+                b_op,
+                activation_gemm,
+                b_smem_layout,
+                cute.slice_(self.mma_tiler, (0, None, None)),
+            )
+        )
+        tma_atom_handoff_output, tma_tensor_handoff_output = (
+            cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileS2GOp(),
+                fc1_output_gemm,
+                self.epilogue.fc1_tma_store_smem_layout,
+                self.epilogue.fc1_tma_store_tile,
+            )
+        )
+        activation_sf_smem_layout = cute.slice_(
+            self.activation_sf_smem_layout_staged, (None, None, 0),
+        )
+        tma_atom_activation_sf, tma_tensor_activation_sf = (
+            cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                activation_sf_gemm,
+                activation_sf_smem_layout,
+                (self.token_tile_size, 4),
+            )
+        )
+
+        if cutlass.const_expr(self.load_balance_mode == "atomic_counter"):
+            if cutlass.const_expr(load_balance_counter is None):
+                raise ValueError("atomic_counter requires a counter tensor.")
+            load_balance_counter_ptr = load_balance_counter.iterator
+        else:
+            load_balance_counter_ptr = None
+        if cutlass.const_expr((offs is None) == (expert_token_sizes is None)):
+            raise ValueError("Exactly one of offs/expert_token_sizes is required.")
+        sched_params = MoEFusedFc12SchedulerParams(
+            scenario=self.scenario,
+            expert_shape=(experts, intermediate_gateup, hidden),
+            cta_tile_shape_mnk=self.cta_tile_shape_mnk,
+            cluster_shape_mn=self.cluster_shape_mn,
+            group_hint=self.group_hint,
+            token_padding_block=self.token_padding_block,
+            sf_padding_block=self.sf_padding_block,
+            load_balance_mode=self.load_balance_mode,
+            load_balance_counter_ptr=load_balance_counter_ptr,
+            override_num_stages=self.num_sched_stages,
+            is_swap_ab=True,
+            expert_token_prefix_sum=offs,
+            expert_token_sizes=expert_token_sizes,
+            execution_phase="fc1",
+        )
+        grid = sched_params.get_grid_shape(max_active_clusters)
+        self.kernel_fc1_only(
+            tiled_mma,
+            tma_atom_weight,
+            tma_tensor_weight,
+            tma_atom_activation,
+            tma_tensor_activation,
+            tma_atom_handoff_output,
+            tma_tensor_handoff_output,
+            tma_atom_activation_sf,
+            tma_tensor_activation_sf,
+            activation_gemm,
+            fc1_weight_gemm,
+            activation_sf_gemm,
+            fc1_weight_sf,
+            fc1_weight_dequant_scale,
+            fc1_output_gemm,
+            fc1_output_sf_gemm,
+            topk_scores,
+            fc1_done_counter,
+            offs,
+            sched_params,
+            self.cluster_layout_mnk,
+            self.cluster_layout_vmnk,
+            self.a_smem_layout_staged,
+            self.b_smem_layout_staged,
+            self.activation_sf_smem_layout_staged,
+            self.c_smem_layout_staged,
+            token_comm_args,
+        ).launch(
+            grid=grid,
+            block=[self.threads_per_cta, 1, 1],
+            cluster=(*self.cluster_shape_mn, 1),
+            stream=stream,
+        )
+
+    @cute.jit
+    def launch_fc2_only(
+        self,
+        fc1_output: cute.Tensor,
+        fc1_output_sf: cute.Tensor,
+        fc1_done_counter: cute.Tensor,
+        fc2_weight: cute.Tensor,
+        fc2_weight_sf: cute.Tensor,
+        fc2_weight_dequant_scale: cute.Tensor,
+        fc2_output: cute.Tensor,
+        offs: Optional[cute.Tensor] = None,
+        max_active_clusters: cutlass.Constexpr = None,
+        stream: cuda.CUstream = None,
+        load_balance_counter: Optional[cute.Tensor] = None,
+        expert_token_sizes: Optional[cute.Tensor] = None,
+        token_comm_args=None,
+    ) -> None:
+        """Launch strict MXFP4-hybrid FC2 without FC1 model descriptors."""
+        if cutlass.const_expr(self.phase_mode != "fc2"):
+            raise ValueError("launch_fc2_only requires phase_mode='fc2'.")
+        if cutlass.const_expr(self.fp8_scale_mode != "mxfp4_hybrid"):
+            raise ValueError("strict FC2 launcher requires mxfp4_hybrid.")
+        if cutlass.const_expr(self.static_expert_shape is None):
+            raise ValueError("strict FC2 launcher requires static expert shape.")
+
+        experts, intermediate_gateup, hidden = self.static_expert_shape
+        intermediate_downproj = intermediate_gateup // 2
+        fc2_weight = self._bind_static_fc2_weight(
+            fc2_weight, experts, intermediate_downproj, hidden,
+        )
+        fc1_output = cute.make_tensor(
+            fc1_output.iterator,
+            cute.make_layout(
+                (fc1_output.shape[0], intermediate_downproj),
+                stride=fc1_output.stride,
+            ),
+        )
+        if cutlass.const_expr(len(fc2_output.shape) != 3):
+            raise ValueError("strict Mega FC2 output must be a 3D combine plane.")
+        # Match the fused launcher: fake batch-L is a Python static extent.
+        c1 = 1
+        c0 = 0
+        tokens_sum = fc1_output.shape[0]
+        fc1_output_gemm = cute.make_tensor(
+            fc1_output.iterator,
+            cute.make_layout(
+                (tokens_sum, intermediate_downproj, c1),
+                stride=(fc1_output.stride[0], fc1_output.stride[1], c0),
+            ),
+        )
+        fc1_output_sf_gemm = cute.make_tensor(
+            fc1_output_sf.iterator,
+            cute.make_layout(
+                (
+                    fc1_output_sf.shape[0],
+                    intermediate_downproj // Fp8Fc2ActivationScaleK,
+                    c1,
+                ),
+                stride=(
+                    fc1_output_sf.stride[0],
+                    fc1_output_sf.stride[1],
+                    c0,
+                ),
+            ),
+        )
+        fc2_weight_gemm = cute.make_tensor(
+            fc2_weight.iterator,
+            cute.make_layout(
+                (hidden, self._weight_storage_k(intermediate_downproj), experts),
+                stride=(
+                    fc2_weight.stride[2],
+                    fc2_weight.stride[1],
+                    fc2_weight.stride[0],
+                ),
+            ),
+        )
+        fc2_output_gemm = cute.make_tensor(
+            fc2_output.iterator,
+            cute.make_layout(
+                (fc2_output.shape[0], hidden, c1),
+                stride=(fc2_output.stride[0], fc2_output.stride[2], c0),
+            ),
+        )
+
+        self.a_gmem_dtype = fc2_weight_gemm.element_type
+        self.a_dtype = self._mma_a_dtype(self.a_gmem_dtype)
+        self.b_dtype = fc1_output_gemm.element_type
+        self.fc1_output_dtype = fc1_output_gemm.element_type
+        self.sf_dtype = fc1_output_sf.element_type
+        self.a_layout = utils.LayoutEnum.from_tensor(fc2_weight_gemm)
+        self.b_layout = utils.LayoutEnum.from_tensor(fc1_output_gemm)
+        self.a_major_mode = self.a_layout.sm90_mma_major_mode()
+        self.b_major_mode = self.b_layout.sm90_mma_major_mode()
+        self.fc1_output_layout = utils.LayoutEnum.from_tensor(fc1_output_gemm)
+        self._setup_attributes()
+        tiled_mma = self._create_tiled_mma()
+
+        a_op = (
+            cpasync.CopyBulkTensorTileG2SMulticastOp()
+            if self.is_a_mcast
+            else cpasync.CopyBulkTensorTileG2SOp()
+        )
+        a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, 0))
+        tma_atom_weight, tma_tensor_weight = self._make_a_tma_atom(
+            a_op,
+            self._a_tma_gmem_tensor(fc2_weight_gemm),
+            self._a_tma_smem_layout(a_smem_layout),
+        )
+        b_op = cpasync.CopyBulkTensorTileG2SOp()
+        b_smem_layout = cute.slice_(self.b_smem_layout_staged, (None, None, 0))
+        tma_atom_handoff, tma_tensor_handoff = cpasync.make_tiled_tma_atom(
+            b_op,
+            fc1_output_gemm,
+            b_smem_layout,
+            cute.slice_(self.mma_tiler, (0, None, None)),
+        )
+        activation_sf_smem_layout = cute.slice_(
+            self.activation_sf_smem_layout_staged, (None, None, 0),
+        )
+        tma_atom_handoff_sf, tma_tensor_handoff_sf = (
+            cpasync.make_tiled_tma_atom(
+                cpasync.CopyBulkTensorTileG2SOp(),
+                fc1_output_sf_gemm,
+                activation_sf_smem_layout,
+                (self.token_tile_size, 4),
+            )
+        )
+
+        if cutlass.const_expr(self.load_balance_mode == "atomic_counter"):
+            if cutlass.const_expr(load_balance_counter is None):
+                raise ValueError("atomic_counter requires a counter tensor.")
+            load_balance_counter_ptr = load_balance_counter.iterator
+        else:
+            load_balance_counter_ptr = None
+        if cutlass.const_expr((offs is None) == (expert_token_sizes is None)):
+            raise ValueError("Exactly one of offs/expert_token_sizes is required.")
+        sched_params = MoEFusedFc12SchedulerParams(
+            scenario=self.scenario,
+            expert_shape=(experts, intermediate_gateup, hidden),
+            cta_tile_shape_mnk=self.cta_tile_shape_mnk,
+            cluster_shape_mn=self.cluster_shape_mn,
+            group_hint=self.group_hint,
+            token_padding_block=self.token_padding_block,
+            sf_padding_block=self.sf_padding_block,
+            load_balance_mode=self.load_balance_mode,
+            load_balance_counter_ptr=load_balance_counter_ptr,
+            override_num_stages=self.num_sched_stages,
+            is_swap_ab=True,
+            expert_token_prefix_sum=offs,
+            expert_token_sizes=expert_token_sizes,
+            execution_phase="fc2",
+        )
+        grid = sched_params.get_grid_shape(max_active_clusters)
+        self.kernel_fc2_only(
+            tiled_mma,
+            tma_atom_weight,
+            tma_tensor_weight,
+            tma_atom_handoff,
+            tma_tensor_handoff,
+            tma_atom_handoff_sf,
+            tma_tensor_handoff_sf,
+            fc1_output_gemm,
+            fc1_output_sf_gemm,
+            fc2_weight_gemm,
+            fc2_weight_sf,
+            fc2_weight_dequant_scale,
+            fc2_output_gemm,
+            fc1_done_counter,
+            offs,
+            sched_params,
+            self.cluster_layout_mnk,
+            self.cluster_layout_vmnk,
+            self.a_smem_layout_staged,
+            self.b_smem_layout_staged,
+            self.activation_sf_smem_layout_staged,
+            self.c_smem_layout_staged,
+            token_comm_args,
+        ).launch(
+            grid=grid,
+            block=[self.threads_per_cta, 1, 1],
+            cluster=(*self.cluster_shape_mn, 1),
+            stream=stream,
+        )
+
+    @cute.jit
     def __call__(
         self,
         # ── fc1 (Linear1) problem tensors ────────────────────────────────
@@ -657,19 +1243,17 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             ) = self.static_expert_shape
             intermediate_downproj_static = intermediate_gateup_static // 2
 
-            fc1_weight = cute.make_tensor(
-                fc1_weight.iterator,
-                cute.make_layout(
-                    (experts_static, hidden_static, intermediate_gateup_static),
-                    stride=fc1_weight.stride,
-                ),
+            fc1_weight = self._bind_static_fc1_weight(
+                fc1_weight,
+                experts_static,
+                hidden_static,
+                intermediate_gateup_static,
             )
-            fc2_weight = cute.make_tensor(
-                fc2_weight.iterator,
-                cute.make_layout(
-                    (experts_static, intermediate_downproj_static, hidden_static),
-                    stride=fc2_weight.stride,
-                ),
+            fc2_weight = self._bind_static_fc2_weight(
+                fc2_weight,
+                experts_static,
+                intermediate_downproj_static,
+                hidden_static,
             )
             activation = cute.make_tensor(
                 activation.iterator,
@@ -721,11 +1305,12 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
 
         # A_gemm (fc1 weights): (experts, hidden, intermediate_gateup)
         # -> (M=intermediate_gateup, K=hidden, L=experts).
-        experts, hidden_b, intermediate_gateup = fc1_weight.shape
+        experts, hidden_storage_b, intermediate_gateup = fc1_weight.shape
+        hidden_b = self._logical_weight_k(hidden_storage_b)
         fc1_weight_gemm = cute.make_tensor(
             fc1_weight.iterator,
             cute.make_layout(
-                (intermediate_gateup, hidden_b, experts),
+                (intermediate_gateup, hidden_storage_b, experts),
                 stride=(fc1_weight.stride[2], fc1_weight.stride[1], fc1_weight.stride[0]),
             ),
         )
@@ -746,11 +1331,14 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
 
         # A_gemm (fc2 weights): (experts, intermediate_downproj, hidden)
         # -> (M=hidden, K=intermediate_downproj, L=experts).
-        experts2, intermediate_downproj_b2, hidden_b2 = fc2_weight.shape
+        experts2, intermediate_storage_b2, hidden_b2 = fc2_weight.shape
+        intermediate_downproj_b2 = self._logical_weight_k(
+            intermediate_storage_b2
+        )
         fc2_weight_gemm = cute.make_tensor(
             fc2_weight.iterator,
             cute.make_layout(
-                (hidden_b2, intermediate_downproj_b2, experts2),
+                (hidden_b2, intermediate_storage_b2, experts2),
                 stride=(fc2_weight.stride[2], fc2_weight.stride[1], fc2_weight.stride[0]),
             ),
         )
@@ -800,7 +1388,12 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # raw WGMMA and are interpreted by the selected scale-mode path.
         # ``self.fc1_output_dtype`` drives the sC SMEM element type and flows
         # into the epilogue ctor as ``fc1_output_dtype``.
-        self.a_dtype: Type[cutlass.Numeric] = fc1_weight_gemm.element_type
+        self.a_gmem_dtype: Type[cutlass.Numeric] = (
+            fc1_weight_gemm.element_type
+        )
+        self.a_dtype: Type[cutlass.Numeric] = self._mma_a_dtype(
+            self.a_gmem_dtype
+        )
         self.b_dtype: Type[cutlass.Numeric] = activation_gemm.element_type
         self.fc1_output_dtype: Type[cutlass.Numeric] = fc1_output_gemm.element_type
         self.sf_dtype: Type[cutlass.Numeric] = activation_sf.element_type
@@ -822,12 +1415,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             else cpasync.CopyBulkTensorTileG2SOp()
         )
         a_smem_layout = cute.slice_(self.a_smem_layout_staged, (None, None, 0))
-        tma_atom_fc1_weight, tma_tensor_fc1_weight = cpasync.make_tiled_tma_atom(
+        a_tma_smem_layout = self._a_tma_smem_layout(a_smem_layout)
+        tma_atom_fc1_weight, tma_tensor_fc1_weight = self._make_a_tma_atom(
             a_op,
-            fc1_weight_gemm,
-            a_smem_layout,
-            cute.slice_(self.mma_tiler, (None, 0, None)),
-            num_multicast=self.num_mcast_ctas_a,
+            self._a_tma_gmem_tensor(fc1_weight_gemm),
+            a_tma_smem_layout,
         )
 
         # TMA load B1 (= fc1 activations).
@@ -852,8 +1444,8 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         tma_atom_fc1_output, tma_tensor_fc1_output = cpasync.make_tiled_tma_atom(
             fc1_output_tma_op,
             fc1_output_gemm,
-            self.epilogue.smem_layout_one_stage,
-            self.epilogue.epi_tile,
+            self.epilogue.fc1_tma_store_smem_layout,
+            self.epilogue.fc1_tma_store_tile,
         )
 
         if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
@@ -912,6 +1504,38 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                     ),
                 ),
             )
+        elif cutlass.const_expr(self.fp8_scale_mode == "mxfp4_hybrid"):
+            # FC1 carries one per-token scale replicated to a 16-byte row.
+            # FC2 carries one FP32 scale per token and K64 activation group.
+            activation_sf_gemm = cute.make_tensor(
+                activation_sf.iterator,
+                cute.make_layout(
+                    (activation_sf.shape[0], 4, 1),
+                    stride=(
+                        activation_sf.stride[0],
+                        activation_sf.stride[1],
+                        0,
+                    ),
+                ),
+            )
+            fc1_output_sf_gemm = cute.make_tensor(
+                fc1_output_sf.iterator,
+                cute.make_layout(
+                    (
+                        fc1_output_sf.shape[0],
+                        intermediate_downproj // Fp8Fc2ActivationScaleK,
+                        1,
+                    ),
+                    stride=(
+                        fc1_output_sf.stride[0],
+                        fc1_output_sf.stride[1],
+                        0,
+                    ),
+                ),
+            )
+            # Folded uint8 Humming offsets already use their production layout.
+            fc1_weight_sf_gemm = fc1_weight_sf
+            fc2_weight_sf_gemm = fc2_weight_sf
         else:
             # fc1 SFC GMEM tensor (= fc1_output_sf user view).  No TMA atom; it is
             # per-thread STG.
@@ -927,7 +1551,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             fc1_weight_sf_gemm = fc1_weight_sf
             fc2_weight_sf_gemm = fc2_weight_sf
 
-        if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+        if cutlass.const_expr(
+            self.fp8_scale_mode in ("blockwise", "mxfp4_hybrid")
+        ):
             activation_sf_smem_layout = cute.slice_(
                 self.activation_sf_smem_layout_staged,
                 (None, None, 0),
@@ -969,12 +1595,10 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # ── fc2 TMA atoms: fc2_weight → A-side, fc1_output → B-side ──
 
         tma_atom_fc2_weight, tma_tensor_fc2_weight = (
-            cpasync.make_tiled_tma_atom(
+            self._make_a_tma_atom(
                 a_op,
-                fc2_weight_gemm,
-                a_smem_layout,
-                cute.slice_(self.mma_tiler, (None, 0, None)),
-                num_multicast=self.num_mcast_ctas_a,
+                self._a_tma_gmem_tensor(fc2_weight_gemm),
+                a_tma_smem_layout,
             )
         )
         tma_atom_fc2_activation, tma_tensor_fc2_activation = (
@@ -1040,6 +1664,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             load_balance_counter_ptr=load_balance_counter_ptr,
             override_num_stages=self.num_sched_stages,
             is_swap_ab=True,
+            execution_phase=self.execution_phase,
             expert_token_prefix_sum=offs,
             expert_token_sizes=expert_token_sizes,
         )
@@ -1100,6 +1725,281 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         )
 
 
+    @cute.jit
+    def _issue_selected_weight_tma_tile(
+        self,
+        range_name,
+        tma_atom_weight: cute.CopyAtom,
+        tma_tensor_weight: cute.Tensor,
+        weight_sf_gemm: cute.Tensor,
+        sA: cute.Tensor,
+        sWeightSf: cute.Tensor,
+        ab_producer,
+        weight_sf_producer,
+        work_tile_info,
+        k_tile_cnt,
+        ext,
+        tidx,
+        tma_cta_coord,
+        tma_cta_layout,
+        mcast_mask,
+        _iket_active,
+    ):
+        """Issue one selected phase's weight/offset load."""
+        if _iket_active:
+            iket.range_push(range_name)
+        real_a, desc_ptr_a = ext.get_gmem_tensor(
+            "a", tma_tensor_weight, work_tile_info,
+        )
+        if cutlass.const_expr(self._uses_weight_aux_pipeline()):
+            output_scale_block_base = (
+                work_tile_info.tile_m_idx
+                * cutlass.Int32(self.wgmma_warpgroup_count)
+            )
+            ab_producer, weight_sf_producer = (
+                self._tma_load_a_with_weight_sf_task_tile(
+                    tma_atom=tma_atom_weight,
+                    real_a=real_a,
+                    desc_ptr_a=desc_ptr_a,
+                    sA=sA,
+                    weight_sf_gemm=weight_sf_gemm,
+                    smem_weight_sf=sWeightSf,
+                    ab_producer=ab_producer,
+                    weight_sf_producer=weight_sf_producer,
+                    work_tile_info=work_tile_info,
+                    tile_m_idx=work_tile_info.tile_m_idx,
+                    output_scale_block_base=output_scale_block_base,
+                    k_tile_cnt=k_tile_cnt,
+                    tidx=tidx,
+                    tma_cta_coord=tma_cta_coord,
+                    tma_cta_layout=tma_cta_layout,
+                    mcast_mask=mcast_mask,
+                    _iket_active=_iket_active,
+                )
+            )
+        else:
+            ab_producer = self._tma_load_a_task_tile(
+                tma_atom_weight,
+                real_a,
+                desc_ptr_a,
+                sA,
+                ab_producer,
+                work_tile_info.tile_m_idx,
+                k_tile_cnt,
+                tma_cta_coord,
+                tma_cta_layout,
+                mcast_mask,
+                _iket_active,
+            )
+        if _iket_active:
+            iket.range_pop()
+        return ab_producer, weight_sf_producer
+
+    @cute.jit
+    def _issue_fc1_activation_tma_tile(
+        self,
+        tma_atom_activation: cute.CopyAtom,
+        tma_tensor_activation: cute.Tensor,
+        tma_atom_activation_sf: cute.CopyAtom,
+        tma_tensor_activation_sf: cute.Tensor,
+        sB: cute.Tensor,
+        sActivationSf: cute.Tensor,
+        ab_producer,
+        work_tile_info,
+        k_tile_cnt,
+        ext,
+        token_comm_args,
+        tma_cta_coord,
+        tma_cta_layout,
+        mcast_mask,
+        _iket_active,
+    ):
+        """Issue one FC1 activation/scale load."""
+        if _iket_active:
+            iket.range_push(self._iket_fc1_activation_load_range)
+        self.token_comm_hook_fc1_tma_b_predispatch_spin(
+            token_comm_args, work_tile_info,
+        )
+        real_b, desc_ptr_b = ext.get_gmem_tensor(
+            "b", tma_tensor_activation, work_tile_info,
+        )
+        if cutlass.const_expr(
+            self.fp8_scale_mode in ("blockwise", "mxfp4_hybrid")
+        ):
+            if cutlass.const_expr(self.enable_token_comm):
+                sf_token_base = (
+                    work_tile_info.cumulative_sf_physical_row
+                    + work_tile_info.tile_n_idx
+                    * cutlass.Int32(self.token_tile_size)
+                )
+            else:
+                sf_token_base = (
+                    work_tile_info.cumulative_data_physical_row
+                    + work_tile_info.tile_n_idx
+                    * cutlass.Int32(self.token_tile_size)
+                )
+            ab_producer = self._tma_load_b_with_activation_sf_task_tile(
+                tma_atom_activation,
+                real_b,
+                desc_ptr_b,
+                sB,
+                tma_atom_activation_sf,
+                tma_tensor_activation_sf,
+                sActivationSf,
+                ab_producer,
+                work_tile_info.tile_n_idx,
+                sf_token_base // cutlass.Int32(self.token_tile_size),
+                k_tile_cnt,
+                k_tiles_per_scale_group=4,
+                reuse_single_scale_tile=(
+                    self.fp8_scale_mode == "mxfp4_hybrid"
+                ),
+                tma_cta_coord=tma_cta_coord,
+                tma_cta_layout=tma_cta_layout,
+                mcast_mask=mcast_mask,
+                _iket_active=_iket_active,
+            )
+        else:
+            ab_producer = self._tma_load_b_task_tile(
+                tma_atom_activation,
+                real_b,
+                desc_ptr_b,
+                sB,
+                ab_producer,
+                work_tile_info.tile_n_idx,
+                k_tile_cnt,
+                tma_cta_coord,
+                tma_cta_layout,
+                mcast_mask,
+                _iket_active,
+            )
+        if _iket_active:
+            iket.range_pop()
+        return ab_producer
+
+    @cute.jit
+    def _issue_fc2_handoff_tma_tile(
+        self,
+        tma_atom_handoff: cute.CopyAtom,
+        tma_tensor_handoff: cute.Tensor,
+        tma_atom_handoff_sf: cute.CopyAtom,
+        tma_tensor_handoff_sf: cute.Tensor,
+        sB: cute.Tensor,
+        sActivationSf: cute.Tensor,
+        ab_producer,
+        work_tile_info,
+        k_tile_cnt,
+        fc1_done_counter: cute.Tensor,
+        fc2_spin_threshold,
+        ext,
+        tma_cta_coord,
+        tma_cta_layout,
+        mcast_mask,
+        _iket_active,
+    ):
+        """Wait for and load one FC2 handoff tile and its K64 scales."""
+        if _iket_active:
+            iket.range_push(self._iket_fc2_activation_load_range)
+        if cutlass.const_expr(
+            self.phase_mode != "fc2" or self.split_consume_fc1_done
+        ):
+            if cutlass.const_expr(self.split_handoff_token_n is not None):
+                counter_slot = (
+                    work_tile_info.cumulative_data_physical_row
+                    // cutlass.Int32(self.split_handoff_token_n)
+                    + (
+                        work_tile_info.tile_n_idx
+                        * cutlass.Int32(self.token_tile_size)
+                    )
+                    // cutlass.Int32(self.split_handoff_token_n)
+                )
+                fc1_token_tiles = (
+                    work_tile_info.valid_tokens_in_cta_tile
+                    + cutlass.Int32(self.split_fc1_token_n - 1)
+                ) // cutlass.Int32(self.split_fc1_token_n)
+                wait_threshold = (
+                    fc2_spin_threshold * fc1_token_tiles
+                )
+            else:
+                counter_slot = (
+                    work_tile_info.cumulative_token_block_count
+                    * cutlass.Int32(self.cluster_shape_mn[1])
+                    + work_tile_info.tile_n_idx
+                )
+                wait_threshold = fc2_spin_threshold
+            counter_ptr = fc1_done_counter.iterator + counter_slot
+            if _iket_active:
+                iket.range_push("swapab_fc2_fc1_done_spin")
+            spin_wait(
+                counter_ptr,
+                lambda v: v >= wait_threshold,
+                fail_sleep_cycles=20,
+            )
+            if _iket_active:
+                iket.range_pop()
+            if cutlass.const_expr(
+                self._post_spin_fc1_done_acquire_enabled()
+            ):
+                cute.arch.load(
+                    counter_ptr,
+                    counter_ptr.dtype,
+                    sem="acquire",
+                    scope="gpu",
+                )
+            cute.arch.fence_proxy("async")
+            cute.arch.fence_proxy("async.global")
+        real_b, desc_ptr_b = ext.get_gmem_tensor(
+            "b", tma_tensor_handoff, work_tile_info,
+        )
+        if cutlass.const_expr(
+            self.fp8_scale_mode in ("blockwise", "mxfp4_hybrid")
+        ):
+            sf_token_base = (
+                work_tile_info.cumulative_data_physical_row
+                + work_tile_info.tile_n_idx
+                * cutlass.Int32(self.token_tile_size)
+            )
+            ab_producer = self._tma_load_b_with_activation_sf_task_tile(
+                tma_atom_handoff,
+                real_b,
+                desc_ptr_b,
+                sB,
+                tma_atom_handoff_sf,
+                tma_tensor_handoff_sf,
+                sActivationSf,
+                ab_producer,
+                work_tile_info.tile_n_idx,
+                sf_token_base // cutlass.Int32(self.token_tile_size),
+                k_tile_cnt,
+                k_tiles_per_scale_group=(
+                    1
+                    if self.fp8_scale_mode == "mxfp4_hybrid"
+                    and self.mma_tiler[2] == 256
+                    else 2
+                ),
+                tma_cta_coord=tma_cta_coord,
+                tma_cta_layout=tma_cta_layout,
+                mcast_mask=mcast_mask,
+                _iket_active=_iket_active,
+            )
+        else:
+            ab_producer = self._tma_load_b_task_tile(
+                tma_atom_handoff,
+                real_b,
+                desc_ptr_b,
+                sB,
+                ab_producer,
+                work_tile_info.tile_n_idx,
+                k_tile_cnt,
+                tma_cta_coord,
+                tma_cta_layout,
+                mcast_mask,
+                _iket_active,
+            )
+        if _iket_active:
+            iket.range_pop()
+        return ab_producer
+
     @cute.kernel
     def kernel(
         self,
@@ -1150,6 +2050,246 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
         token_comm_args=None,
     ):
+        self._kernel_body(
+            tiled_mma,
+            tma_atom_fc1_weight,
+            tma_tensor_fc1_weight,
+            tma_atom_fc1_activation,
+            tma_tensor_fc1_activation,
+            tma_atom_fc1_output,
+            tma_tensor_fc1_output,
+            tma_atom_fc2_weight,
+            tma_tensor_fc2_weight,
+            tma_atom_fc2_activation,
+            tma_tensor_fc2_activation,
+            tma_atom_fc1_activation_sf,
+            tma_tensor_fc1_activation_sf,
+            tma_atom_fc2_activation_sf,
+            tma_tensor_fc2_activation_sf,
+            activation_gemm,
+            fc1_weight_gemm,
+            activation_sf_gemm,
+            fc1_weight_sf_gemm,
+            fc1_activation_dequant_scale,
+            fc1_weight_dequant_scale,
+            fc1_output_gemm,
+            fc1_output_sf_gemm,
+            fc2_weight_gemm,
+            fc2_weight_sf_gemm,
+            fc2_activation_dequant_scale,
+            fc2_weight_dequant_scale,
+            fc2_output_gemm,
+            topk_scores,
+            fc1_done_counter,
+            offs,
+            sched_params,
+            cluster_layout_mnk,
+            cluster_layout_vmnk,
+            a_smem_layout_staged,
+            b_smem_layout_staged,
+            activation_sf_smem_layout_staged,
+            c_smem_layout_staged,
+            token_comm_args,
+        )
+
+    @cute.kernel
+    def kernel_fc1_only(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_weight: cute.CopyAtom,
+        tma_tensor_weight: cute.Tensor,
+        tma_atom_activation: cute.CopyAtom,
+        tma_tensor_activation: cute.Tensor,
+        tma_atom_handoff_output: cute.CopyAtom,
+        tma_tensor_handoff_output: cute.Tensor,
+        tma_atom_activation_sf: cute.CopyAtom,
+        tma_tensor_activation_sf: cute.Tensor,
+        activation_gemm: cute.Tensor,
+        weight_gemm: cute.Tensor,
+        activation_sf_gemm: cute.Tensor,
+        weight_sf_gemm: cute.Tensor,
+        weight_dequant_scale: cute.Tensor,
+        fc1_output_gemm: cute.Tensor,
+        fc1_output_sf_gemm: cute.Tensor,
+        topk_scores: cute.Tensor,
+        fc1_done_counter: cute.Tensor,
+        offs: Optional[cute.Tensor],
+        sched_params: MoEFusedFc12SchedulerParams,
+        cluster_layout_mnk: cute.Layout,
+        cluster_layout_vmnk: cute.Layout,
+        a_smem_layout_staged: cute.ComposedLayout,
+        b_smem_layout_staged: cute.ComposedLayout,
+        activation_sf_smem_layout_staged: cute.Layout,
+        c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
+        token_comm_args=None,
+    ):
+        """Strict K1 device ABI: dispatch + FC1/SwiGLU/quantize only."""
+        self._kernel_body(
+            tiled_mma=tiled_mma,
+            tma_atom_fc1_weight=tma_atom_weight,
+            tma_tensor_fc1_weight=tma_tensor_weight,
+            tma_atom_fc1_activation=tma_atom_activation,
+            tma_tensor_fc1_activation=tma_tensor_activation,
+            tma_atom_fc1_output=tma_atom_handoff_output,
+            tma_tensor_fc1_output=tma_tensor_handoff_output,
+            tma_atom_fc2_weight=None,
+            tma_tensor_fc2_weight=None,
+            tma_atom_fc2_activation=None,
+            tma_tensor_fc2_activation=None,
+            tma_atom_fc1_activation_sf=tma_atom_activation_sf,
+            tma_tensor_fc1_activation_sf=tma_tensor_activation_sf,
+            tma_atom_fc2_activation_sf=None,
+            tma_tensor_fc2_activation_sf=None,
+            activation_gemm=activation_gemm,
+            fc1_weight_gemm=weight_gemm,
+            activation_sf_gemm=activation_sf_gemm,
+            fc1_weight_sf_gemm=weight_sf_gemm,
+            fc1_activation_dequant_scale=None,
+            fc1_weight_dequant_scale=weight_dequant_scale,
+            fc1_output_gemm=fc1_output_gemm,
+            fc1_output_sf_gemm=fc1_output_sf_gemm,
+            fc2_weight_gemm=None,
+            fc2_weight_sf_gemm=None,
+            fc2_activation_dequant_scale=None,
+            fc2_weight_dequant_scale=None,
+            fc2_output_gemm=None,
+            topk_scores=topk_scores,
+            fc1_done_counter=fc1_done_counter,
+            offs=offs,
+            sched_params=sched_params,
+            cluster_layout_mnk=cluster_layout_mnk,
+            cluster_layout_vmnk=cluster_layout_vmnk,
+            a_smem_layout_staged=a_smem_layout_staged,
+            b_smem_layout_staged=b_smem_layout_staged,
+            activation_sf_smem_layout_staged=(
+                activation_sf_smem_layout_staged
+            ),
+            c_smem_layout_staged=c_smem_layout_staged,
+            token_comm_args=token_comm_args,
+        )
+
+    @cute.kernel
+    def kernel_fc2_only(
+        self,
+        tiled_mma: cute.TiledMma,
+        tma_atom_weight: cute.CopyAtom,
+        tma_tensor_weight: cute.Tensor,
+        tma_atom_handoff: cute.CopyAtom,
+        tma_tensor_handoff: cute.Tensor,
+        tma_atom_handoff_sf: cute.CopyAtom,
+        tma_tensor_handoff_sf: cute.Tensor,
+        fc1_output_gemm: cute.Tensor,
+        fc1_output_sf_gemm: cute.Tensor,
+        weight_gemm: cute.Tensor,
+        weight_sf_gemm: cute.Tensor,
+        weight_dequant_scale: cute.Tensor,
+        output_gemm: cute.Tensor,
+        fc1_done_counter: cute.Tensor,
+        offs: Optional[cute.Tensor],
+        sched_params: MoEFusedFc12SchedulerParams,
+        cluster_layout_mnk: cute.Layout,
+        cluster_layout_vmnk: cute.Layout,
+        a_smem_layout_staged: cute.ComposedLayout,
+        b_smem_layout_staged: cute.ComposedLayout,
+        activation_sf_smem_layout_staged: cute.Layout,
+        c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
+        token_comm_args=None,
+    ):
+        """Strict K2 device ABI: FC2 + direct combine only."""
+        self._kernel_body(
+            tiled_mma=tiled_mma,
+            tma_atom_fc1_weight=None,
+            tma_tensor_fc1_weight=None,
+            tma_atom_fc1_activation=None,
+            tma_tensor_fc1_activation=None,
+            tma_atom_fc1_output=None,
+            tma_tensor_fc1_output=None,
+            tma_atom_fc2_weight=tma_atom_weight,
+            tma_tensor_fc2_weight=tma_tensor_weight,
+            tma_atom_fc2_activation=tma_atom_handoff,
+            tma_tensor_fc2_activation=tma_tensor_handoff,
+            tma_atom_fc1_activation_sf=None,
+            tma_tensor_fc1_activation_sf=None,
+            tma_atom_fc2_activation_sf=tma_atom_handoff_sf,
+            tma_tensor_fc2_activation_sf=tma_tensor_handoff_sf,
+            activation_gemm=None,
+            fc1_weight_gemm=None,
+            activation_sf_gemm=None,
+            fc1_weight_sf_gemm=None,
+            fc1_activation_dequant_scale=None,
+            fc1_weight_dequant_scale=None,
+            fc1_output_gemm=fc1_output_gemm,
+            fc1_output_sf_gemm=fc1_output_sf_gemm,
+            fc2_weight_gemm=weight_gemm,
+            fc2_weight_sf_gemm=weight_sf_gemm,
+            fc2_activation_dequant_scale=None,
+            fc2_weight_dequant_scale=weight_dequant_scale,
+            fc2_output_gemm=output_gemm,
+            topk_scores=None,
+            fc1_done_counter=fc1_done_counter,
+            offs=offs,
+            sched_params=sched_params,
+            cluster_layout_mnk=cluster_layout_mnk,
+            cluster_layout_vmnk=cluster_layout_vmnk,
+            a_smem_layout_staged=a_smem_layout_staged,
+            b_smem_layout_staged=b_smem_layout_staged,
+            activation_sf_smem_layout_staged=(
+                activation_sf_smem_layout_staged
+            ),
+            c_smem_layout_staged=c_smem_layout_staged,
+            token_comm_args=token_comm_args,
+        )
+
+    @cute.jit
+    def _kernel_body(
+        self,
+        tiled_mma: cute.TiledMma,
+        # fc1 TMA atoms / tensors
+        tma_atom_fc1_weight: Optional[cute.CopyAtom],
+        tma_tensor_fc1_weight: Optional[cute.Tensor],
+        tma_atom_fc1_activation: Optional[cute.CopyAtom],
+        tma_tensor_fc1_activation: Optional[cute.Tensor],
+        tma_atom_fc1_output: Optional[cute.CopyAtom],
+        tma_tensor_fc1_output: Optional[cute.Tensor],
+        # fc2 TMA atoms / tensors (fc2_weight→A, fc1_output→B)
+        tma_atom_fc2_weight: Optional[cute.CopyAtom],
+        tma_tensor_fc2_weight: Optional[cute.Tensor],
+        tma_atom_fc2_activation: Optional[cute.CopyAtom],
+        tma_tensor_fc2_activation: Optional[cute.Tensor],
+        tma_atom_fc1_activation_sf: Optional[cute.CopyAtom],
+        tma_tensor_fc1_activation_sf: Optional[cute.Tensor],
+        tma_atom_fc2_activation_sf: Optional[cute.CopyAtom],
+        tma_tensor_fc2_activation_sf: Optional[cute.Tensor],
+        # GEMM-domain tensors (fc1)
+        activation_gemm: Optional[cute.Tensor],
+        fc1_weight_gemm: Optional[cute.Tensor],
+        activation_sf_gemm: Optional[cute.Tensor],
+        fc1_weight_sf_gemm: Optional[cute.Tensor],
+        fc1_activation_dequant_scale: Optional[cute.Tensor],
+        fc1_weight_dequant_scale: Optional[cute.Tensor],
+        fc1_output_gemm: cute.Tensor,
+        fc1_output_sf_gemm: cute.Tensor,
+        # GEMM-domain tensors (fc2)
+        fc2_weight_gemm: Optional[cute.Tensor],
+        fc2_weight_sf_gemm: Optional[cute.Tensor],
+        fc2_activation_dequant_scale: Optional[cute.Tensor],
+        fc2_weight_dequant_scale: Optional[cute.Tensor],
+        fc2_output_gemm: Optional[cute.Tensor],
+        # topk + cross-phase sync workspace
+        topk_scores: Optional[cute.Tensor],
+        fc1_done_counter: cute.Tensor,
+        # Scheduling
+        offs: Optional[cute.Tensor],
+        sched_params: MoEFusedFc12SchedulerParams,
+        cluster_layout_mnk: cute.Layout,
+        cluster_layout_vmnk: cute.Layout,
+        # SMEM layouts
+        a_smem_layout_staged: cute.ComposedLayout,
+        b_smem_layout_staged: cute.ComposedLayout,
+        activation_sf_smem_layout_staged: cute.Layout,
+        c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
+        token_comm_args=None,
+    ):
         """Device kernel for fused fc1+fc2 swap-AB FP8 grouped GEMM.
 
         The lean path uses one/two WGMMA+epilogue warpgroups for M=128/256,
@@ -1165,26 +2305,44 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         a_smem_layout = cute.slice_(a_smem_layout_staged, (None, None, 0))
         b_smem_layout = cute.slice_(b_smem_layout_staged, (None, None, 0))
 
-        # Round the FC1 channel count to whole cluster-M groups because each CTA
-        # publishes one completion for its independent token-N tile.
+        # fc2 waits for all fc1 intermediate N-tiles in the same token block.
+        # 1CTA path: each N-tile contributes exactly one fc1-done increment.
+        fc1_completion_tile_m = (
+            self.split_fc1_tile_m
+            if self.split_fc1_tile_m is not None
+            else self.cta_tile_shape_mnk[0]
+        )
+        if cutlass.const_expr(self.phase_mode == "fc2"):
+            if cutlass.const_expr(self.static_expert_shape is None):
+                raise ValueError(
+                    "FC2-only completion threshold requires static expert shape."
+                )
+            fc1_intermediate_gateup = self.static_expert_shape[1]
+        else:
+            fc1_intermediate_gateup = fc1_weight_gemm.shape[0]
         ext_fc2_spin_threshold = (
-            (
-                fc1_weight_gemm.shape[0]
-                + self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0]
-                - 1
-            )
-            // (self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0])
-        ) * self.cluster_shape_mn[0]
+            fc1_intermediate_gateup + fc1_completion_tile_m - 1
+        ) // fc1_completion_tile_m
 
+        # Independent-N uses a canonical counter mapping in the TMA-B warp.
+        # The generic scheduler extension still knows only the legacy same-N
+        # slot, so make its optional non-blocking FC2 peek fail closed; the
+        # authoritative canonical spin below remains unchanged.
+        ext_fc2_peek_threshold = (
+            cutlass.Int32(0x7FFFFFFF)
+            if self.split_handoff_token_n is not None
+            else ext_fc2_spin_threshold
+        )
         ext = SwapABSwigluFp4Fc12SchedExtension(
             sf_vec_size=self.sf_vec_size,
             fc1_done_counter_ptr=fc1_done_counter.iterator,
-            fc2_spin_threshold=ext_fc2_spin_threshold,
+            fc2_spin_threshold=ext_fc2_peek_threshold,
             fc1_ready_counter_ptr=self.token_comm_hook_fc1_ready_counter_ptr(
                 token_comm_args
             ),
             token_cluster_size=self.cluster_shape_mn[1],
             fc1_done_per_cta_token=True,
+            enable_fc2_done_peek=self._scheduler_fc2_done_peek_enabled(),
         )
 
         warp_idx = cute.arch.warp_idx()
@@ -1286,7 +2444,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             defer_sync=True,
         )
         ab_producer = ab_pipeline.make_producer()
-        if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+        if cutlass.const_expr(self._uses_weight_aux_pipeline()):
             weight_sf_pipeline = pipeline.PipelineCpAsync.create(
                 barrier_storage=storage.weight_sf_mbar_ptr.data_ptr(),
                 num_stages=self.num_ab_stage,
@@ -1370,7 +2528,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
 
         # ── SMEM tensors A / B (shared by fc1 / fc2) ──
         sA = smem.allocate_tensor(
-            element_type=self.a_dtype,
+            element_type=self._a_smem_dtype(),
             layout=a_smem_layout_staged.outer,
             byte_alignment=128,
             swizzle=a_smem_layout_staged.inner,
@@ -1381,23 +2539,26 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             byte_alignment=128,
             swizzle=b_smem_layout_staged.inner,
         )
-        if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
-            weight_sf_smem_layout_staged = cute.make_layout(
-                (self.wgmma_warpgroup_count, self.num_ab_stage),
-                stride=(1, self.wgmma_warpgroup_count),
-            )
+        if cutlass.const_expr(
+            self.fp8_scale_mode in ("blockwise", "mxfp4_hybrid")
+        ):
             sActivationSf = smem.allocate_tensor(
                 element_type=cutlass.Float32,
                 layout=activation_sf_smem_layout_staged,
                 byte_alignment=128,
             )
+        else:
+            sActivationSf = sB
+        if cutlass.const_expr(self._uses_weight_aux_pipeline()):
+            weight_sf_smem_layout_staged = (
+                self._weight_aux_smem_layout_staged()
+            )
             sWeightSf = smem.allocate_tensor(
-                element_type=cutlass.Float32,
+                element_type=self._weight_aux_smem_dtype(),
                 layout=weight_sf_smem_layout_staged,
                 byte_alignment=16,
             )
         else:
-            sActivationSf = sB
             sWeightSf = sB
 
         # Cluster wait after pipeline init and before producer/consumer use.
@@ -1412,14 +2573,26 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 cute.arch.setmaxregister_decrease(self.tma_b_reg_cnt)
             elif warp_idx == self.sched_warp_id:
                 cute.arch.setmaxregister_decrease(self.sched_reg_cnt)
-            elif warp_idx == self.empty_warp_id:
-                cute.arch.setmaxregister_decrease(self.empty_reg_cnt)
             else:
-                if cutlass.const_expr(self.token_back_standalone):
-                    if warp_idx < self.token_back_warp_id[0]:
-                        cute.arch.setmaxregister_decrease(self.dispatch_reg_cnt)
+                if cutlass.const_expr(
+                    getattr(self, "enable_empty_warp", True)
+                ):
+                    if warp_idx == self.empty_warp_id:
+                        cute.arch.setmaxregister_decrease(self.empty_reg_cnt)
                     else:
-                        cute.arch.setmaxregister_decrease(self.token_back_reg_cnt)
+                        if cutlass.const_expr(self.token_back_standalone):
+                            if warp_idx < self.token_back_warp_id[0]:
+                                cute.arch.setmaxregister_decrease(
+                                    self.dispatch_reg_cnt
+                                )
+                            else:
+                                cute.arch.setmaxregister_decrease(
+                                    self.token_back_reg_cnt
+                                )
+                        else:
+                            cute.arch.setmaxregister_decrease(
+                                self.dispatch_reg_cnt
+                            )
                 else:
                     cute.arch.setmaxregister_decrease(self.dispatch_reg_cnt)
 
@@ -1430,18 +2603,23 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         # (rewritten on ``fc1_weight`` / ``fc2_weight`` at ``__call__``
         # entry); otherwise they are runtime Int32 from tensor metadata.
         # The arithmetic below folds to an immediate in the static path.
-        k_tile_cnt_fc1 = (fc1_weight_gemm.shape[1] + mma_tiler_k - 1) // mma_tiler_k
-        k_tile_cnt_fc2 = (fc2_weight_gemm.shape[1] + mma_tiler_k - 1) // mma_tiler_k
+        if cutlass.const_expr(self.phase_mode == "fc2"):
+            logical_k_fc1 = cutlass.Int32(0)
+        else:
+            logical_k_fc1 = self._logical_weight_k(
+                fc1_weight_gemm.shape[1]
+            )
+        if cutlass.const_expr(self.phase_mode == "fc1"):
+            logical_k_fc2 = cutlass.Int32(0)
+        else:
+            logical_k_fc2 = self._logical_weight_k(
+                fc2_weight_gemm.shape[1]
+            )
+        k_tile_cnt_fc1 = (logical_k_fc1 + mma_tiler_k - 1) // mma_tiler_k
+        k_tile_cnt_fc2 = (logical_k_fc2 + mma_tiler_k - 1) // mma_tiler_k
         # Each raw gate/up CTA-M tile publishes one completion for the same
         # compile-time token-N block.
-        fc2_spin_threshold = (
-            (
-                fc1_weight_gemm.shape[0]
-                + self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0]
-                - 1
-            )
-            // (self.cta_tile_shape_mnk[0] * self.cluster_shape_mn[0])
-        ) * self.cluster_shape_mn[0]
+        fc2_spin_threshold = ext_fc2_spin_threshold
 
         # ════════════════════════════════════════════════════════════════════
         # Scheduler warp (after the two TMA warps)
@@ -1482,116 +2660,101 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 iket.range_pop()
 
             while work_tile_info.is_valid_tile:
-                is_phase_linear1 = (
-                    work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
-                )
-                if is_phase_linear1:
-                    # Covers descriptor lookup and weight TMA issue. Blockwise
-                    # mode additionally stages weight scales with cp.async.
-                    if _iket_tma_a_active:
-                        iket.range_push(self._iket_fc1_weight_load_range)
-                    k_tile_cnt = k_tile_cnt_fc1
-                    real_a, desc_ptr_a = ext.get_gmem_tensor(
-                        "a", tma_tensor_fc1_weight, work_tile_info,
-                    )
-                    if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
-                        output_scale_block_base = (
-                            work_tile_info.tile_m_idx
-                            * cutlass.Int32(self.wgmma_warpgroup_count)
-                        )
-                        ab_producer, weight_sf_producer = (
-                            self._tma_load_a_with_weight_sf_task_tile(
-                                tma_atom=tma_atom_fc1_weight,
-                                real_a=real_a,
-                                desc_ptr_a=desc_ptr_a,
-                                sA=sA,
-                                weight_sf_gemm=fc1_weight_sf_gemm,
-                                smem_weight_sf=sWeightSf,
-                                ab_producer=ab_producer,
-                                weight_sf_producer=weight_sf_producer,
-                                work_tile_info=work_tile_info,
-                                tile_m_idx=work_tile_info.tile_m_idx,
-                                output_scale_block_base=output_scale_block_base,
-                                k_tile_cnt=k_tile_cnt_fc1,
-                                tidx=tidx,
-                                tma_cta_coord=a_cta_coord,
-                                tma_cta_layout=a_cta_layout,
-                                mcast_mask=a_mcast_mask,
-                                _iket_active=_iket_tma_a_active,
-                            )
-                        )
-                    else:
-                        ab_producer = self._tma_load_a_task_tile(
+                if cutlass.const_expr(self.phase_mode == "fc1"):
+                    ab_producer, weight_sf_producer = (
+                        self._issue_selected_weight_tma_tile(
+                            self._iket_fc1_weight_load_range,
                             tma_atom_fc1_weight,
-                            real_a,
-                            desc_ptr_a,
+                            tma_tensor_fc1_weight,
+                            fc1_weight_sf_gemm,
                             sA,
+                            sWeightSf,
                             ab_producer,
-                            work_tile_info.tile_m_idx,
+                            weight_sf_producer,
+                            work_tile_info,
                             k_tile_cnt_fc1,
+                            ext,
+                            tidx,
                             a_cta_coord,
                             a_cta_layout,
                             a_mcast_mask,
                             _iket_tma_a_active,
                         )
-                else:
-                    # Covers descriptor lookup and weight TMA issue. Blockwise
-                    # mode additionally stages weight scales with cp.async.
-                    if _iket_tma_a_active:
-                        iket.range_push(self._iket_fc2_weight_load_range)
-                    k_tile_cnt = k_tile_cnt_fc2
-                    real_a, desc_ptr_a = ext.get_gmem_tensor(
-                        "a", tma_tensor_fc2_weight, work_tile_info,
                     )
-                    if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
-                        output_scale_block_base = (
-                            work_tile_info.tile_m_idx
-                            * cutlass.Int32(self.wgmma_warpgroup_count)
+                elif cutlass.const_expr(self.phase_mode == "fc2"):
+                    ab_producer, weight_sf_producer = (
+                        self._issue_selected_weight_tma_tile(
+                            self._iket_fc2_weight_load_range,
+                            tma_atom_fc2_weight,
+                            tma_tensor_fc2_weight,
+                            fc2_weight_sf_gemm,
+                            sA,
+                            sWeightSf,
+                            ab_producer,
+                            weight_sf_producer,
+                            work_tile_info,
+                            k_tile_cnt_fc2,
+                            ext,
+                            tidx,
+                            a_cta_coord,
+                            a_cta_layout,
+                            a_mcast_mask,
+                            _iket_tma_a_active,
                         )
+                    )
+                else:
+                    if (
+                        work_tile_info.phase
+                        == cutlass.Int32(BlockPhase.Linear1)
+                    ):
                         ab_producer, weight_sf_producer = (
-                            self._tma_load_a_with_weight_sf_task_tile(
-                                tma_atom=tma_atom_fc2_weight,
-                                real_a=real_a,
-                                desc_ptr_a=desc_ptr_a,
-                                sA=sA,
-                                weight_sf_gemm=fc2_weight_sf_gemm,
-                                smem_weight_sf=sWeightSf,
-                                ab_producer=ab_producer,
-                                weight_sf_producer=weight_sf_producer,
-                                work_tile_info=work_tile_info,
-                                tile_m_idx=work_tile_info.tile_m_idx,
-                                output_scale_block_base=output_scale_block_base,
-                                k_tile_cnt=k_tile_cnt_fc2,
-                                tidx=tidx,
-                                tma_cta_coord=a_cta_coord,
-                                tma_cta_layout=a_cta_layout,
-                                mcast_mask=a_mcast_mask,
-                                _iket_active=_iket_tma_a_active,
+                            self._issue_selected_weight_tma_tile(
+                                self._iket_fc1_weight_load_range,
+                                tma_atom_fc1_weight,
+                                tma_tensor_fc1_weight,
+                                fc1_weight_sf_gemm,
+                                sA,
+                                sWeightSf,
+                                ab_producer,
+                                weight_sf_producer,
+                                work_tile_info,
+                                k_tile_cnt_fc1,
+                                ext,
+                                tidx,
+                                a_cta_coord,
+                                a_cta_layout,
+                                a_mcast_mask,
+                                _iket_tma_a_active,
                             )
                         )
                     else:
-                        ab_producer = self._tma_load_a_task_tile(
-                            tma_atom_fc2_weight,
-                            real_a,
-                            desc_ptr_a,
-                            sA,
-                            ab_producer,
-                            work_tile_info.tile_m_idx,
-                            k_tile_cnt_fc2,
-                            a_cta_coord,
-                            a_cta_layout,
-                            a_mcast_mask,
-                            _iket_tma_a_active,
+                        ab_producer, weight_sf_producer = (
+                            self._issue_selected_weight_tma_tile(
+                                self._iket_fc2_weight_load_range,
+                                tma_atom_fc2_weight,
+                                tma_tensor_fc2_weight,
+                                fc2_weight_sf_gemm,
+                                sA,
+                                sWeightSf,
+                                ab_producer,
+                                weight_sf_producer,
+                                work_tile_info,
+                                k_tile_cnt_fc2,
+                                ext,
+                                tidx,
+                                a_cta_coord,
+                                a_cta_layout,
+                                a_mcast_mask,
+                                _iket_tma_a_active,
+                            )
                         )
-
                 if _iket_tma_a_active:
-                    iket.range_pop()
                     iket.range_push("swapab_tma_a_sched_consume")
                 work_tile_info = sched_consumer.consume_work()
                 if _iket_tma_a_active:
                     iket.range_pop()
 
-            if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+            if cutlass.const_expr(self._uses_weight_aux_pipeline()):
                 weight_sf_producer.tail()
             ab_producer.tail()
 
@@ -1607,145 +2770,85 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 iket.range_pop()
 
             while work_tile_info.is_valid_tile:
-                is_phase_linear1 = (
-                    work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
-                )
-
-                if is_phase_linear1:
-                    # Covers optional Mega dispatch readiness, descriptor
-                    # lookup, and activation TMA issue. Blockwise mode also
-                    # issues activation-scale TMA loads.
-                    if _iket_tma_b_active:
-                        iket.range_push(self._iket_fc1_activation_load_range)
-                    self.token_comm_hook_fc1_tma_b_predispatch_spin(
-                        token_comm_args, work_tile_info,
+                if cutlass.const_expr(self.phase_mode == "fc1"):
+                    ab_producer = self._issue_fc1_activation_tma_tile(
+                        tma_atom_fc1_activation,
+                        tma_tensor_fc1_activation,
+                        tma_atom_fc1_activation_sf,
+                        tma_tensor_fc1_activation_sf,
+                        sB,
+                        sActivationSf,
+                        ab_producer,
+                        work_tile_info,
+                        k_tile_cnt_fc1,
+                        ext,
+                        token_comm_args,
+                        b_cta_coord,
+                        b_cta_layout,
+                        b_mcast_mask,
+                        _iket_tma_b_active,
                     )
-                    real_b, desc_ptr_b = ext.get_gmem_tensor(
-                        "b", tma_tensor_fc1_activation, work_tile_info,
+                elif cutlass.const_expr(self.phase_mode == "fc2"):
+                    ab_producer = self._issue_fc2_handoff_tma_tile(
+                        tma_atom_fc2_activation,
+                        tma_tensor_fc2_activation,
+                        tma_atom_fc2_activation_sf,
+                        tma_tensor_fc2_activation_sf,
+                        sB,
+                        sActivationSf,
+                        ab_producer,
+                        work_tile_info,
+                        k_tile_cnt_fc2,
+                        fc1_done_counter,
+                        fc2_spin_threshold,
+                        ext,
+                        b_cta_coord,
+                        b_cta_layout,
+                        b_mcast_mask,
+                        _iket_tma_b_active,
                     )
-                    if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
-                        if cutlass.const_expr(self.enable_token_comm):
-                            sf_token_base = (
-                                work_tile_info.cumulative_sf_physical_row
-                                + work_tile_info.tile_n_idx
-                                * cutlass.Int32(self.token_tile_size)
-                            )
-                        else:
-                            sf_token_base = (
-                                work_tile_info.cumulative_data_physical_row
-                                + work_tile_info.tile_n_idx
-                                * cutlass.Int32(self.token_tile_size)
-                            )
-                        ab_producer = (
-                            self._tma_load_b_with_activation_sf_task_tile(
-                                tma_atom_fc1_activation,
-                                real_b,
-                                desc_ptr_b,
-                                sB,
-                                tma_atom_fc1_activation_sf,
-                                tma_tensor_fc1_activation_sf,
-                                sActivationSf,
-                                ab_producer,
-                                work_tile_info.tile_n_idx,
-                                sf_token_base
-                                // cutlass.Int32(self.token_tile_size),
-                                k_tile_cnt_fc1,
-                                k_tiles_per_scale_group=4,
-                                tma_cta_coord=b_cta_coord,
-                                tma_cta_layout=b_cta_layout,
-                                mcast_mask=b_mcast_mask,
-                                _iket_active=_iket_tma_b_active,
-                            )
-                        )
-                    else:
-                        ab_producer = self._tma_load_b_task_tile(
+                else:
+                    if (
+                        work_tile_info.phase
+                        == cutlass.Int32(BlockPhase.Linear1)
+                    ):
+                        ab_producer = self._issue_fc1_activation_tma_tile(
                             tma_atom_fc1_activation,
-                            real_b,
-                            desc_ptr_b,
+                            tma_tensor_fc1_activation,
+                            tma_atom_fc1_activation_sf,
+                            tma_tensor_fc1_activation_sf,
                             sB,
+                            sActivationSf,
                             ab_producer,
-                            work_tile_info.tile_n_idx,
+                            work_tile_info,
                             k_tile_cnt_fc1,
+                            ext,
+                            token_comm_args,
                             b_cta_coord,
                             b_cta_layout,
                             b_mcast_mask,
                             _iket_tma_b_active,
                         )
-                else:
-                    # Covers the FC1-done wait/fences, descriptor lookup, and
-                    # FC2-activation TMA issue. Blockwise mode also issues
-                    # activation-scale TMA loads.
-                    if _iket_tma_b_active:
-                        iket.range_push(self._iket_fc2_activation_load_range)
-                    counter_slot = (
-                        cutlass.Int32(self.cluster_shape_mn[1])
-                        * work_tile_info.cumulative_token_block_count
-                        + work_tile_info.tile_n_idx
-                    )
-                    counter_ptr = fc1_done_counter.iterator + counter_slot
-                    # Nested inside the swap-AB FC2 activation-load range:
-                    # only the FC1 completion-counter spin. The enclosing
-                    # range continues through acquire/fence and TMA issue.
-                    if _iket_tma_b_active:
-                        iket.range_push("swapab_fc2_fc1_done_spin")
-                    spin_wait(
-                        counter_ptr,
-                        lambda v: v >= fc2_spin_threshold,
-                        fail_sleep_cycles=20,
-                    )
-                    if _iket_tma_b_active:
-                        iket.range_pop()
-                    cute.arch.load(
-                        counter_ptr, counter_ptr.dtype, sem="acquire", scope="gpu"
-                    )
-                    cute.arch.fence_proxy("async")
-                    cute.arch.fence_proxy("async.global")
-                    real_b, desc_ptr_b = ext.get_gmem_tensor(
-                        "b", tma_tensor_fc2_activation, work_tile_info,
-                    )
-                    if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
-                        sf_token_base = (
-                            work_tile_info.cumulative_data_physical_row
-                            + work_tile_info.tile_n_idx
-                            * cutlass.Int32(self.token_tile_size)
-                        )
-                        ab_producer = (
-                            self._tma_load_b_with_activation_sf_task_tile(
-                                tma_atom_fc2_activation,
-                                real_b,
-                                desc_ptr_b,
-                                sB,
-                                tma_atom_fc2_activation_sf,
-                                tma_tensor_fc2_activation_sf,
-                                sActivationSf,
-                                ab_producer,
-                                work_tile_info.tile_n_idx,
-                                sf_token_base
-                                // cutlass.Int32(self.token_tile_size),
-                                k_tile_cnt_fc2,
-                                k_tiles_per_scale_group=2,
-                                tma_cta_coord=b_cta_coord,
-                                tma_cta_layout=b_cta_layout,
-                                mcast_mask=b_mcast_mask,
-                                _iket_active=_iket_tma_b_active,
-                            )
-                        )
                     else:
-                        ab_producer = self._tma_load_b_task_tile(
+                        ab_producer = self._issue_fc2_handoff_tma_tile(
                             tma_atom_fc2_activation,
-                            real_b,
-                            desc_ptr_b,
+                            tma_tensor_fc2_activation,
+                            tma_atom_fc2_activation_sf,
+                            tma_tensor_fc2_activation_sf,
                             sB,
+                            sActivationSf,
                             ab_producer,
-                            work_tile_info.tile_n_idx,
+                            work_tile_info,
                             k_tile_cnt_fc2,
+                            fc1_done_counter,
+                            fc2_spin_threshold,
+                            ext,
                             b_cta_coord,
                             b_cta_layout,
                             b_mcast_mask,
                             _iket_tma_b_active,
                         )
                 if _iket_tma_b_active:
-                    iket.range_pop()
                     iket.range_push("swapab_tma_b_sched_consume")
                 work_tile_info = sched_consumer.consume_work()
                 if _iket_tma_b_active:
@@ -1795,7 +2898,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             )
             accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
             if cutlass.const_expr(
-                self.fp8_scale_mode == "blockwise"
+                self.fp8_scale_mode in ("blockwise", "mxfp4_hybrid")
                 or self.fp8_accum_mode == "2xacc"
             ):
                 accum_temp = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
@@ -1805,55 +2908,135 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             # physical warpgroup. Every lane in local warp 0 participates.
             _iket_active = local_warp_idx == cutlass.Int32(0)
 
-            # Build common kwargs shared by both epilogue flavours.
-            _run_kwargs = dict(
-                sched_consumer=sched_consumer,
-                sched_ext=ext,
-                smem_fc1_output_buffer=sC,
-                smem_fc1_amax=sFc1Amax,
-                tma_atom_fc1_output=tma_atom_fc1_output,
-                gmem_fc1_output=tma_tensor_fc1_output,
-                gmem_fc1_output_sf=fc1_output_sf_gemm,
-                smem_activation_sf=sActivationSf,
-                smem_weight_sf=sWeightSf,
-                gmem_topk_scores=topk_scores,
-                gmem_fc2_output=fc2_output_gemm,
-                gmem_fc1_done_counter=fc1_done_counter,
-                local_warp_idx=local_warp_idx,
-                tidx=tidx,
-                fc1_activation_dequant_scale=fc1_activation_dequant_scale,
-                fc1_weight_dequant_scale=fc1_weight_dequant_scale,
-                fc2_activation_dequant_scale=fc2_activation_dequant_scale,
-                fc2_weight_dequant_scale=fc2_weight_dequant_scale,
-                norm_const=cutlass.Float32(1.0),
-                tiled_mma=tiled_mma,
-                tCrA=tCrA,
-                tCrB=tCrB,
-                accumulators=accumulators,
-                accum_temp=accum_temp,
-                run_wgmma_task_tile=self.run_wgmma_task_tile,
-                ab_pipeline=ab_pipeline,
-                weight_sf_pipeline=weight_sf_pipeline,
-                ab_consumer_state=ab_consumer_state,
-                k_tile_cnt_fc1=k_tile_cnt_fc1,
-                k_tile_cnt_fc2=k_tile_cnt_fc2,
-                _iket_active=_iket_active,
-                n_half=n_half,
-                warpgroup_idx=epilogue_group_idx,
-                math_wg_order_barrier=math_wg_order_barrier,
-                epi_wg_order_barrier=epi_wg_order_barrier,
-            )
-
-            # MegaMoE: pass token_comm_args only when it is a real bundle (not
-            # None).  Passing Python None explicitly to @cute.jit methods
-            # triggers a CuteDSL codegen issue; const_expr dispatch avoids any
-            # None-as-JIT-argument path.
-            if cutlass.const_expr(token_comm_args is not None):
-                self.epilogue.run(
-                    **_run_kwargs, token_comm_args=token_comm_args
+            if cutlass.const_expr(self.phase_mode == "fc12"):
+                # Build common kwargs shared by both epilogue flavours.
+                _run_kwargs = dict(
+                    sched_consumer=sched_consumer,
+                    sched_ext=ext,
+                    smem_fc1_output_buffer=sC,
+                    smem_fc1_amax=sFc1Amax,
+                    tma_atom_fc1_output=tma_atom_fc1_output,
+                    gmem_fc1_output=tma_tensor_fc1_output,
+                    gmem_fc1_output_sf=fc1_output_sf_gemm,
+                    smem_activation_sf=sActivationSf,
+                    smem_weight_sf=sWeightSf,
+                    gmem_topk_scores=topk_scores,
+                    gmem_fc2_output=fc2_output_gemm,
+                    gmem_fc1_done_counter=fc1_done_counter,
+                    local_warp_idx=local_warp_idx,
+                    tidx=tidx,
+                    fc1_activation_dequant_scale=fc1_activation_dequant_scale,
+                    fc1_weight_dequant_scale=fc1_weight_dequant_scale,
+                    fc2_activation_dequant_scale=fc2_activation_dequant_scale,
+                    fc2_weight_dequant_scale=fc2_weight_dequant_scale,
+                    norm_const=cutlass.Float32(1.0),
+                    tiled_mma=tiled_mma,
+                    tCrA=tCrA,
+                    tCrB=tCrB,
+                    accumulators=accumulators,
+                    accum_temp=accum_temp,
+                    run_wgmma_task_tile=self.run_wgmma_task_tile,
+                    ab_pipeline=ab_pipeline,
+                    weight_sf_pipeline=weight_sf_pipeline,
+                    ab_consumer_state=ab_consumer_state,
+                    k_tile_cnt_fc1=k_tile_cnt_fc1,
+                    k_tile_cnt_fc2=k_tile_cnt_fc2,
+                    _iket_active=_iket_active,
+                    n_half=n_half,
+                    warpgroup_idx=epilogue_group_idx,
+                    math_wg_order_barrier=math_wg_order_barrier,
+                    epi_wg_order_barrier=epi_wg_order_barrier,
                 )
+
+                # MegaMoE: pass token_comm_args only when it is a real bundle
+                # (not None). Passing Python None explicitly to @cute.jit
+                # methods triggers a CuteDSL codegen issue; const_expr dispatch
+                # avoids any None-as-JIT-argument path.
+                if cutlass.const_expr(token_comm_args is not None):
+                    self.epilogue.run(
+                        **_run_kwargs, token_comm_args=token_comm_args
+                    )
+                else:
+                    self.epilogue.run(**_run_kwargs)
             else:
-                self.epilogue.run(**_run_kwargs)
+                if cutlass.const_expr(self.phase_mode == "fc1"):
+                    self.epilogue.run_fc1_only(
+                        sched_consumer=sched_consumer,
+                        sched_ext=ext,
+                        smem_fc1_output_buffer=sC,
+                        smem_fc1_amax=sFc1Amax,
+                        tma_atom_fc1_output=tma_atom_fc1_output,
+                        gmem_fc1_output=tma_tensor_fc1_output,
+                        gmem_fc1_output_sf=fc1_output_sf_gemm,
+                        smem_activation_sf=sActivationSf,
+                        smem_weight_sf=sWeightSf,
+                        gmem_topk_scores=topk_scores,
+                        gmem_fc1_done_counter=fc1_done_counter,
+                        local_warp_idx=local_warp_idx,
+                        tidx=tidx,
+                        fc1_activation_dequant_scale=(
+                            fc1_activation_dequant_scale
+                        ),
+                        fc1_weight_dequant_scale=(
+                            fc1_weight_dequant_scale
+                        ),
+                        output_activation_dequant_scale=(
+                            fc2_activation_dequant_scale
+                        ),
+                        norm_const=cutlass.Float32(1.0),
+                        tiled_mma=tiled_mma,
+                        tCrA=tCrA,
+                        tCrB=tCrB,
+                        accumulators=accumulators,
+                        accum_temp=accum_temp,
+                        run_wgmma_task_tile=(
+                            self.run_wgmma_fc1_task_tile
+                        ),
+                        ab_pipeline=ab_pipeline,
+                        weight_sf_pipeline=weight_sf_pipeline,
+                        ab_consumer_state=ab_consumer_state,
+                        k_tile_cnt_fc1=k_tile_cnt_fc1,
+                        _iket_active=_iket_active,
+                        n_half=n_half,
+                        publish_fc1_done=self.split_publish_fc1_done,
+                    )
+                else:
+                    _fc2_only_kwargs = dict(
+                        sched_consumer=sched_consumer,
+                        sched_ext=ext,
+                        smem_activation_sf=sActivationSf,
+                        smem_weight_sf=sWeightSf,
+                        gmem_fc2_output=fc2_output_gemm,
+                        local_warp_idx=local_warp_idx,
+                        tidx=tidx,
+                        fc2_activation_dequant_scale=(
+                            fc2_activation_dequant_scale
+                        ),
+                        fc2_weight_dequant_scale=(
+                            fc2_weight_dequant_scale
+                        ),
+                        tiled_mma=tiled_mma,
+                        tCrA=tCrA,
+                        tCrB=tCrB,
+                        accumulators=accumulators,
+                        accum_temp=accum_temp,
+                        run_wgmma_task_tile=(
+                            self.run_wgmma_fc2_task_tile
+                        ),
+                        ab_pipeline=ab_pipeline,
+                        weight_sf_pipeline=weight_sf_pipeline,
+                        ab_consumer_state=ab_consumer_state,
+                        k_tile_cnt_fc2=k_tile_cnt_fc2,
+                        _iket_active=_iket_active,
+                        n_half=n_half,
+                    )
+                    if cutlass.const_expr(token_comm_args is not None):
+                        self.epilogue.run_fc2_only(
+                            **_fc2_only_kwargs,
+                            token_comm_args=token_comm_args,
+                        )
+                    else:
+                        self.epilogue.run_fc2_only(**_fc2_only_kwargs)
 
             if cutlass.const_expr(self.enable_token_comm):
                 cute.arch.fence_acq_rel_sys()
@@ -1864,10 +3047,31 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         #
         # ``enable_token_comm=False`` removes this role at compile time.
         if cutlass.const_expr(self.enable_token_comm):
-            if warp_idx >= self.dispatch_warp_id[0]:
-                lane_idx_for_dispatch = cute.arch.lane_idx()
-                if cutlass.const_expr(self.token_back_standalone):
-                    if warp_idx < self.token_back_warp_id[0]:
+            # Keep the role toggle in its own compile-time branch. Combining
+            # it with a runtime warp predicate using ``and`` still makes CuTe
+            # lower the RHS branch, which is invalid for split K2 because K2
+            # intentionally has neither dispatch warps nor dispatch SMEM.
+            if cutlass.const_expr(self.enable_dispatch_warps):
+                if warp_idx >= self.dispatch_warp_id[0]:
+                    lane_idx_for_dispatch = cute.arch.lane_idx()
+                    if cutlass.const_expr(self.token_back_standalone):
+                        if warp_idx < self.token_back_warp_id[0]:
+                            self.token_comm_hook_dispatch_warp_body(
+                                token_comm_args,
+                                token_comm_storage,
+                                warp_idx=warp_idx,
+                                lane_idx=lane_idx_for_dispatch,
+                                tidx=tidx,
+                            )
+                        else:
+                            self.token_comm_hook_token_back_warp_body(
+                                token_comm_args,
+                                token_comm_storage,
+                                warp_idx=warp_idx,
+                                lane_idx=lane_idx_for_dispatch,
+                                tidx=tidx,
+                            )
+                    else:
                         self.token_comm_hook_dispatch_warp_body(
                             token_comm_args,
                             token_comm_storage,
@@ -1875,22 +3079,6 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                             lane_idx=lane_idx_for_dispatch,
                             tidx=tidx,
                         )
-                    else:
-                        self.token_comm_hook_token_back_warp_body(
-                            token_comm_args,
-                            token_comm_storage,
-                            warp_idx=warp_idx,
-                            lane_idx=lane_idx_for_dispatch,
-                            tidx=tidx,
-                        )
-                else:
-                    self.token_comm_hook_dispatch_warp_body(
-                        token_comm_args,
-                        token_comm_storage,
-                        warp_idx=warp_idx,
-                        lane_idx=lane_idx_for_dispatch,
-                        tidx=tidx,
-                    )
             # ════════════════════════════════════════════════════════════════════
             # Kernel tail hook (MegaMoE-only; lean base = no-op)
             # ════════════════════════════════════════════════════════════════════

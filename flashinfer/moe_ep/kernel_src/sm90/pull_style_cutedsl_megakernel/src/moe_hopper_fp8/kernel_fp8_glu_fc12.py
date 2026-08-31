@@ -81,6 +81,11 @@ class Sm90SwigluFp8Fc12Kernel:
         mma_mode = "bw"
         if self.fp8_scale_mode == "per_tensor":
             mma_mode = f"pt_{self.fp8_accum_mode[:2]}"
+        elif self.fp8_scale_mode == "mxfp4_hybrid":
+            # IKET event names have a hard 32-character limit.  Keep the
+            # specialization visible while leaving room for the swap-AB,
+            # FC1/FC2, and mainloop prefixes below.
+            mma_mode = "mx4hyb"
 
         self._iket_fc1_mma_mainloop_range = (
             f"{variant}_fc1_mma_mainloop_{mma_mode}"
@@ -93,6 +98,9 @@ class Sm90SwigluFp8Fc12Kernel:
         if self.fp8_scale_mode == "blockwise":
             activation_load = "act_sf_tma_bw"
             weight_load = "wgt_sf_cpasync_bw"
+        elif self.fp8_scale_mode == "mxfp4_hybrid":
+            activation_load = "act_sf_tma_mxfp4"
+            weight_load = "wgt_aux_cpa_humming"
         self._iket_fc1_activation_load_range = (
             f"{variant}_fc1_{activation_load}"
         )
@@ -127,6 +135,7 @@ class Sm90SwigluFp8Fc12Kernel:
         ab_dtype: Type[cutlass.Numeric] = cutlass.Float4E2M1FN,
         fp8_scale_mode: Literal["per_tensor", "blockwise"] = "per_tensor",
         fp8_accum_mode: Literal["1xacc", "2xacc"] = "1xacc",
+        execution_phase: Literal["fused", "fc1", "fc2"] = "fused",
         pingpong: bool = False,
         scenario: Literal["2Dx3D"] = "2Dx3D",
         fc2_in_kernel_topk_reduce: bool = False,
@@ -201,6 +210,12 @@ class Sm90SwigluFp8Fc12Kernel:
                 f"got {fp8_accum_mode!r}."
             )
         self.fp8_accum_mode = fp8_accum_mode
+        if execution_phase not in ("fused", "fc1", "fc2"):
+            raise ValueError(
+                "execution_phase must be 'fused', 'fc1', or 'fc2'; "
+                f"got {execution_phase!r}."
+            )
+        self.execution_phase = execution_phase
         self.pingpong = pingpong
         self._set_iket_range_names()
         if ab_dtype == cutlass.Float8E4M3FN:
@@ -557,7 +572,7 @@ class Sm90SwigluFp8Fc12Kernel:
         ) * atom_thr_size
 
     def _activation_sf_bytes_per_stage(self) -> int:
-        if self.fp8_scale_mode != "blockwise":
+        if self.fp8_scale_mode not in ("blockwise", "mxfp4_hybrid"):
             return 0
         return self.token_tile_size * 4 * cutlass.Float32.width // 8
 
@@ -689,10 +704,10 @@ class Sm90SwigluFp8Fc12Kernel:
             data_total_rows * intermediate_downproj * self.ab_dtype.width // 8
         )
 
-        if self.fp8_scale_mode == "blockwise":
+        if self.fp8_scale_mode in ("blockwise", "mxfp4_hybrid"):
             if intermediate_downproj % Fp8Fc2ActivationScaleK != 0:
                 raise ValueError(
-                    "blockwise FP8 requires intermediate_downproj divisible by "
+                    "blockwise/hybrid FP8 requires intermediate_downproj divisible by "
                     f"{Fp8Fc2ActivationScaleK}, got {intermediate_downproj}."
                 )
             fc1_output_sf_bytes = (
@@ -1429,6 +1444,7 @@ class Sm90SwigluFp8Fc12Kernel:
         tma_cta_layout,
         mcast_mask,
         _iket_active,
+        reuse_single_scale_tile: cutlass.Constexpr = False,
     ):
         gA_mkl = cute.local_tile(
             real_a,
@@ -1641,6 +1657,7 @@ class Sm90SwigluFp8Fc12Kernel:
         tma_cta_layout,
         mcast_mask,
         _iket_active,
+        reuse_single_scale_tile: cutlass.Constexpr = False,
     ):
         gA_mkl = cute.local_tile(
             real_a,
@@ -1696,9 +1713,12 @@ class Sm90SwigluFp8Fc12Kernel:
             )
             if _iket_active:
                 iket.range_pop()
-            scale_group_tile = handle.count // cutlass.Int32(
-                k_tiles_per_scale_group
-            )
+            if cutlass.const_expr(reuse_single_scale_tile):
+                scale_group_tile = cutlass.Int32(0)
+            else:
+                scale_group_tile = handle.count // cutlass.Int32(
+                    k_tiles_per_scale_group
+                )
             if _iket_active:
                 iket.range_push("tma_activation_sf_copy")
             cute.copy(
@@ -1784,6 +1804,7 @@ class Sm90SwigluFp8Fc12Kernel:
         tma_cta_layout,
         mcast_mask,
         _iket_active,
+        reuse_single_scale_tile: cutlass.Constexpr = False,
     ):
         gB_nkl = cute.local_tile(
             real_b,
@@ -1839,9 +1860,12 @@ class Sm90SwigluFp8Fc12Kernel:
             )
             if _iket_active:
                 iket.range_pop()
-            scale_group_tile = handle.count // cutlass.Int32(
-                k_tiles_per_scale_group
-            )
+            if cutlass.const_expr(reuse_single_scale_tile):
+                scale_group_tile = cutlass.Int32(0)
+            else:
+                scale_group_tile = handle.count // cutlass.Int32(
+                    k_tiles_per_scale_group
+                )
             if _iket_active:
                 iket.range_push("tma_activation_sf_copy")
             cute.copy(
@@ -2303,6 +2327,7 @@ class Sm90SwigluFp8Fc12Kernel:
             load_balance_counter_ptr=load_balance_counter_ptr,
             override_num_stages=self.num_sched_stages,
             is_swap_ab=False,
+            execution_phase=self.execution_phase,
             expert_token_prefix_sum=offs,
             expert_token_sizes=expert_token_sizes,
         )

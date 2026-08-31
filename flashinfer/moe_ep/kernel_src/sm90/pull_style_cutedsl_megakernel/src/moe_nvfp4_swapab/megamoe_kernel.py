@@ -1421,7 +1421,12 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 self.combine_format,
                 sm_arch=get_cutedsl_target_arch(),
             )(
-                combine_target, combine_sf, output_activation, score, stream,
+                combine_target,
+                combine_sf,
+                output_activation,
+                topk_idx,
+                score,
+                stream,
             )
 
     # =========================================================================

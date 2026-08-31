@@ -53,7 +53,14 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Type, Union
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int64, Int32
+from cutlass.cutlass_dsl import (
+    Int64,
+    Int32,
+    extract_mlir_values,
+    new_from_mlir_values,
+)
+from cutlass.base_dsl.dsl import extract_mlir_attributes
+from cutlass._mlir import ir
 
 from common.host_utils import get_cutedsl_target_arch
 
@@ -68,6 +75,9 @@ from moe_hopper_fp8.kernel_fp8_glu_fc12 import (
 from moe_hopper_fp8.kernel_fp8_glu_fc12_swapab import (
     Sm90SwapABSwigluFp8Fc12Kernel,
 )
+from moe_hopper_fp8.kernel_mxfp4_fp8_glu_fc12_swapab import (
+    Sm90SwapABSwigluMxfp4Fp8Fc12Kernel,
+)
 from moe_nvfp4_swapab.moe_utils import spin_wait
 from moe_nvfp4_swapab.topk_reduce import TopkReduce
 from src.token_comm import (
@@ -75,6 +85,7 @@ from src.token_comm import (
     TokenCommArgs as ExtractedTokenCommArgs,
     TokenInPullTokenBackPush,
 )
+from src.sym_buffer import SingleRankSymBufferDevice
 from common.megamoe_constants import (
     Fp8DispatchScaleAtomK,
     Fp8E8M0SfVecSize,
@@ -92,6 +103,112 @@ from moe_nvfp4_swapab.megamoe_kernel import (
     _GridSyncSlotCount,
     _NvlinkSlotCount,
 )
+
+
+# =============================================================================
+# Split-role TokenComm ABIs
+# =============================================================================
+
+
+class _SplitTokenCommArgs:
+    """Concrete JIT-serializable argument bundle for one split role."""
+
+    _mlir_value_fields: Tuple[str, ...] = ()
+    _const_fields: Tuple[str, ...] = ()
+
+    def __init__(self, **kwargs) -> None:
+        expected = set(self._mlir_value_fields + self._const_fields)
+        provided = set(kwargs)
+        if provided != expected:
+            raise TypeError(
+                f"{type(self).__name__} fields mismatch: "
+                f"missing={sorted(expected - provided)} "
+                f"unexpected={sorted(provided - expected)}"
+            )
+        for name, value in kwargs.items():
+            setattr(self, name, value)
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        values: List[ir.Value] = []
+        for name in self._mlir_value_fields:
+            values.extend(extract_mlir_values(getattr(self, name)))
+        return values
+
+    def __extract_mlir_attributes__(self) -> List[Any]:
+        attrs: List[Any] = []
+        for name in self._mlir_value_fields:
+            attrs.extend(extract_mlir_attributes(getattr(self, name)))
+        return attrs
+
+    def __new_from_mlir_values__(
+        self, values: List[ir.Value]
+    ) -> "_SplitTokenCommArgs":
+        index = 0
+        rebuilt: Dict[str, Any] = {}
+        for name in self._mlir_value_fields:
+            prototype = getattr(self, name)
+            value_count = len(extract_mlir_values(prototype))
+            rebuilt[name] = new_from_mlir_values(
+                prototype, values[index : index + value_count]
+            )
+            index += value_count
+        assert index == len(values), (
+            f"{type(self).__name__} serialization mismatch: "
+            f"consumed={index} provided={len(values)}"
+        )
+        for name in self._const_fields:
+            rebuilt[name] = getattr(self, name)
+        return type(self)(**rebuilt)
+
+
+class SplitK1TokenCommArgs(_SplitTokenCommArgs):
+    """Dispatch/FC1-only communication state; no combine/K2 fields."""
+
+    _mlir_value_fields = (
+        "input_token_buffer",
+        "input_sf_buffer",
+        "topk_idx",
+        "input_topk_weights_buffer",
+        "expert_send_count",
+        "expert_recv_count",
+        "expert_recv_count_sum",
+        "src_token_topk_idx",
+        "fc1_input_token_buffer",
+        "fc1_input_sf_buffer",
+        "fc1_input_topk_weights_buffer",
+        "fc1_ready_counter",
+        "token_src_metadata",
+        "nvlink_barrier_signal",
+        "nvlink_barrier_counter",
+        "grid_sync_counter",
+        "local_zero_prefix",
+        "shared_zero_prefix",
+        "split_dispatch_ready",
+        "peer_rank_ptr_mapper",
+        "local_rank",
+    )
+    _const_fields = (
+        "world_size",
+        "num_total_experts",
+        "num_experts_per_rank",
+        "num_topk",
+        "hidden_bytes",
+        "sf_uint32_per_token",
+        "token_padding_block",
+        "sf_padding_block",
+        "sm_count",
+    )
+
+
+class SplitK2TokenCommArgs(_SplitTokenCommArgs):
+    """FC2/direct-combine state; no dispatch or FC1-ready fields."""
+
+    _mlir_value_fields = (
+        "token_src_metadata",
+        "combine_output",
+        "split_dispatch_ready",
+        "peer_rank_ptr_mapper",
+    )
 
 
 # =============================================================================
@@ -121,6 +238,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         sf_vec_size: int = Fp8E8M0SfVecSize,
         fp8_scale_mode: str = "per_tensor",
         fp8_accum_mode: str = "1xacc",
+        execution_phase: Literal["fused", "fc1", "fc2"] = "fused",
         pingpong: bool = False,
         scenario: str = "2Dx3D",
         # MegaMoE-specific independent constants.
@@ -138,7 +256,135 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         epi_flag_batch: Union[int, Tuple[int, int]] = 1,
         flag_batch: int = 1,
         gate_up_clamp: Optional[float] = None,
+        split_role: str = "fused",
+        split_fc1_tile_m: Optional[int] = None,
+        split_fc1_token_n: Optional[int] = None,
+        split_handoff_token_n: Optional[int] = None,
+        split_workspace_counter_tile_tokens: Optional[int] = None,
+        split_counter_epoch_banks: int = 1,
+        split_counter_epoch_bank: int = 0,
     ) -> None:
+        if token_back_mode not in (
+            "epi_warps", "standalone_warps", "reuse_dispatch_warps",
+        ):
+            raise ValueError(f"unsupported token_back_mode '{token_back_mode}'")
+        # PR4688 keeps the explicit three-mode frontend while the donor split
+        # contract names the same device choice as a boolean.
+        token_back_by_dispatch = token_back_mode != "epi_warps"
+        if split_role not in ("fused", "k1", "k2"):
+            raise ValueError(
+                "split_role must be 'fused', 'k1', or 'k2'; "
+                f"got {split_role!r}."
+            )
+        if split_role != "fused" and pingpong:
+            raise ValueError(
+                "split K1/K2 execution currently requires pingpong=False."
+            )
+        if split_role != "fused" and token_back_by_dispatch:
+            raise ValueError(
+                "split K1/K2 use direct combine and cannot enable "
+                "token_back_by_dispatch."
+            )
+        if split_role != "fused" and fc2_in_kernel_topk_reduce:
+            raise ValueError(
+                "split K1/K2 require standalone K3 TopkReduce."
+            )
+        if split_role == "k2" and split_fc1_tile_m not in (128, 256):
+            raise ValueError(
+                "split K2 requires split_fc1_tile_m=128 or 256."
+            )
+        if split_role != "fused" and split_fc1_token_n not in (16, 32, 64, 128):
+            raise ValueError(
+                "split K1/K2 require split_fc1_token_n in "
+                "(16, 32, 64, 128)."
+            )
+        if split_handoff_token_n is not None:
+            if split_role == "fused":
+                raise ValueError("fused MegaMoE cannot use a split handoff tile.")
+            if split_handoff_token_n not in (32, 64, 128):
+                raise ValueError(
+                    "split_handoff_token_n must be 32, 64, or 128."
+                )
+            if split_handoff_token_n % mma_tiler_mnk[1] != 0:
+                raise ValueError(
+                    "split handoff tile must be divisible by this role's "
+                    f"token N, got {split_handoff_token_n} and "
+                    f"{mma_tiler_mnk[1]}."
+                )
+            if cluster_shape_mnk != (1, 1, 1):
+                raise ValueError(
+                    "independent split token-N requires cluster (1, 1, 1)."
+                )
+            if token_padding_block != split_handoff_token_n:
+                raise ValueError(
+                    "independent split physical token padding must equal the "
+                    f"handoff tile, got {token_padding_block} and "
+                    f"{split_handoff_token_n}."
+                )
+            if split_handoff_token_n % split_fc1_token_n != 0:
+                raise ValueError(
+                    "split handoff tile must be divisible by FC1 token N."
+                )
+            if split_role == "k1" and mma_tiler_mnk[1] != split_fc1_token_n:
+                raise ValueError(
+                    "K1 tactic token N must equal split_fc1_token_n."
+                )
+        if split_role != "fused":
+            if (
+                not isinstance(split_workspace_counter_tile_tokens, int)
+                or isinstance(split_workspace_counter_tile_tokens, bool)
+                or split_workspace_counter_tile_tokens <= 0
+                or token_padding_block % split_workspace_counter_tile_tokens != 0
+            ):
+                raise ValueError(
+                    "split workspace counter tile must be a positive divisor "
+                    f"of token padding, got "
+                    f"{split_workspace_counter_tile_tokens!r} and "
+                    f"{token_padding_block}."
+                )
+        if (
+            isinstance(split_counter_epoch_banks, bool)
+            or not isinstance(split_counter_epoch_banks, int)
+            or split_counter_epoch_banks not in (1, 2)
+        ):
+            raise ValueError(
+                "split_counter_epoch_banks must be 1 or 2, got "
+                f"{split_counter_epoch_banks!r}."
+            )
+        if (
+            isinstance(split_counter_epoch_bank, bool)
+            or not isinstance(split_counter_epoch_bank, int)
+            or not 0 <= split_counter_epoch_bank < split_counter_epoch_banks
+        ):
+            raise ValueError(
+                "split_counter_epoch_bank must select an existing bank, got "
+                f"bank={split_counter_epoch_bank!r}, "
+                f"banks={split_counter_epoch_banks}."
+            )
+        if split_role == "fused" and (
+            split_counter_epoch_banks != 1 or split_counter_epoch_bank != 0
+        ):
+            raise ValueError(
+                "fused MegaMoE cannot use split counter epoch banks."
+            )
+        self.split_role = split_role
+        # Set before ``super`` so the swap-AB base can carry the codegen-time
+        # values into its autonomous epilogue construction.
+        self.split_fc1_token_n = split_fc1_token_n
+        self.split_handoff_token_n = split_handoff_token_n
+        self.split_workspace_counter_tile_tokens = (
+            split_workspace_counter_tile_tokens
+        )
+        self.counter_epoch_banks = split_counter_epoch_banks
+        self.counter_epoch_bank = split_counter_epoch_bank
+        if split_role != "fused":
+            role_phase = {"k1": "fc1", "k2": "fc2"}[split_role]
+            if execution_phase not in ("fused", role_phase):
+                raise ValueError(
+                    f"split_role={split_role!r} conflicts with "
+                    f"execution_phase={execution_phase!r}."
+                )
+            execution_phase = role_phase
         if static_expert_shape is None:
             raise NotImplementedError(
                 "Sm90MegaMoEFp8Kernel requires "
@@ -149,13 +395,6 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 f"hidden ({hidden}) must equal "
                 f"static_expert_shape[2] ({static_expert_shape[2]})."
             )
-        if token_back_mode not in (
-            "epi_warps", "standalone_warps", "reuse_dispatch_warps",
-        ):
-            raise ValueError(f"unsupported token_back_mode '{token_back_mode}'")
-        # NVFP4 naming: any non-epi mode stages fc2 rows locally and pushes
-        # them back from the dispatch warp area.
-        token_back_by_dispatch = token_back_mode != "epi_warps"
         if fc2_in_kernel_topk_reduce and not apply_topk_in_fc1:
             raise ValueError(
                 "fc2_in_kernel_topk_reduce requires apply_topk_in_fc1=True; "
@@ -180,6 +419,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             sf_vec_size=sf_vec_size,
             fp8_scale_mode=fp8_scale_mode,
             fp8_accum_mode=fp8_accum_mode,
+            execution_phase=execution_phase,
             pingpong=pingpong,
             scenario=scenario,
             fc2_in_kernel_topk_reduce=fc2_in_kernel_topk_reduce,
@@ -189,8 +429,33 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             gate_up_clamp=gate_up_clamp,
         )
 
+        if split_role != "fused" and not getattr(self, "is_swap_ab", False):
+            raise ValueError("split K1/K2 currently require swap-AB.")
+        self.phase_mode = {
+            "fused": "fc12",
+            "k1": "fc1",
+            "k2": "fc2",
+        }[split_role]
+        self.split_publish_fc1_done = split_role == "k1"
+        self.split_consume_fc1_done = split_role == "k2"
+        self.split_fc1_tile_m = (
+            split_fc1_tile_m
+            if split_role == "k2"
+            else (mma_tiler_mnk[0] if split_role == "k1" else None)
+        )
         self.enable_token_comm = True
-        dispatch_warp_start = self.empty_warp_id + 1
+        self.execution_phase = execution_phase
+        self.enable_dispatch_warps = split_role != "k2"
+        # SM90 setmaxnreg.*.sync.aligned is warpgroup-synchronous.  Keep one
+        # non-compute alignment/register-donor warp after the producer trio so
+        # K1/K2 both launch complete 4-warp groups; this is not opposite-phase
+        # state and is required even by a purpose-built split role.
+        self.enable_empty_warp = True
+        dispatch_warp_start = (
+            self.empty_warp_id + 1
+            if self.enable_empty_warp
+            else self.sched_warp_id + 1
+        )
         self.dispatch_warp_id = tuple(
             range(dispatch_warp_start, dispatch_warp_start + 4)
         )
@@ -214,8 +479,14 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         ):
             self.epi_reg_cnt = 256
         self.token_back_reg_cnt = 32
+        active_dispatch_warp_ids = (
+            self.dispatch_warp_id if self.enable_dispatch_warps else ()
+        )
         token_back_warp_ids = (
             self.token_back_warp_id if self.token_back_standalone else ()
+        )
+        empty_warp_ids = (
+            (self.empty_warp_id,) if self.enable_empty_warp else ()
         )
         self.threads_per_cta = 32 * len(
             (
@@ -223,11 +494,24 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 self.tma_a_warp_id,
                 self.tma_b_warp_id,
                 self.sched_warp_id,
-                self.empty_warp_id,
-                *self.dispatch_warp_id,
+                *empty_warp_ids,
+                *active_dispatch_warp_ids,
                 *token_back_warp_ids,
             )
         )
+        if self.threads_per_cta % 128 != 0:
+            raise ValueError(
+                "MegaMoE warp roles must form complete SM90 warpgroups; "
+                f"got {self.threads_per_cta} threads."
+            )
+        if (
+            self.enable_dispatch_warps
+            and self.dispatch_warp_id[0] % 4 != 0
+        ):
+            raise ValueError(
+                "dispatch warps must start on a 4-warp boundary; "
+                f"got warp {self.dispatch_warp_id[0]}."
+            )
         self.validate_register_policy()
 
         # Independent MegaMoE-specific constants.
@@ -248,7 +532,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         )
         self.fc2_activation_sf_storage_cols = (
             _round_up(logical_fc2_activation_sf_cols, 4)
-            if self.fp8_scale_mode == "blockwise"
+            if self.fp8_scale_mode in ("blockwise", "mxfp4_hybrid")
             else logical_fc2_activation_sf_cols
         )
 
@@ -262,11 +546,16 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         logical_sf_uint32_per_token = (
             (self.hidden + sf_atom_k_elements - 1) // sf_atom_k_elements
         )
-        self.sf_uint32_per_token = (
-            _round_up(logical_sf_uint32_per_token, 4)
-            if self.fp8_scale_mode == "blockwise"
-            else logical_sf_uint32_per_token
-        )
+        if self.fp8_scale_mode == "mxfp4_hybrid":
+            # One logical FP32 activation scale is replicated across a
+            # 16-byte row so dispatch and TMA keep aligned transactions.
+            self.sf_uint32_per_token = 4
+        else:
+            self.sf_uint32_per_token = (
+                _round_up(logical_sf_uint32_per_token, 4)
+                if self.fp8_scale_mode == "blockwise"
+                else logical_sf_uint32_per_token
+            )
         # Cross-rank totals: per-rank count * world_size.
         self.num_total_experts = world_size * self.num_experts_per_rank
 
@@ -287,13 +576,16 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # Cohabiting warps before the dispatch group: one or two
         # epilogue/WGMMA warpgroups plus TMA-A/TMA-B/scheduler and the empty
         # old-MMA warp.
+        empty_warp_ids = (
+            (self.empty_warp_id,) if self.enable_empty_warp else ()
+        )
         num_other_warps = len(
             (
                 *self.epilogue_warp_id,
                 self.tma_a_warp_id,
                 self.tma_b_warp_id,
                 self.sched_warp_id,
-                self.empty_warp_id,
+                *empty_warp_ids,
             )
         )
 
@@ -344,8 +636,13 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             dispatch_warp_start=self.dispatch_warp_id[0],
             num_other_warps=num_other_warps,
             is_swap_ab=is_swap_ab,
-            sf_atom_swizzled=(self.fp8_scale_mode != "blockwise"),
+            sf_atom_swizzled=(
+                self.fp8_scale_mode not in (
+                    "blockwise", "mxfp4_hybrid"
+                )
+            ),
             flag_batch=flag_batch,
+            execution_phase=self.execution_phase,
         )
 
         # Region layout (same call drives both get_workspace_sizes() and the
@@ -368,6 +665,38 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         shared_leading = self._shared_offsets["src_token_topk_idx"]
         self.local_zero_i32_count = local_leading // 4
         self.shared_zero_i32_count = shared_leading // 4
+        self.local_counter_bank_spans = self._counter_bank_spans(
+            self._local_counter_region_specs,
+            self._local_offsets,
+            data_offset=local_leading,
+        )
+        self.shared_counter_bank_spans = self._counter_bank_spans(
+            self._shared_counter_region_specs,
+            self._shared_offsets,
+            data_offset=shared_leading,
+        )
+
+    def estimated_register_budget(self) -> int:
+        """Account only warp roles physically launched by this Mega role."""
+        dispatch_warps = (
+            len(self.dispatch_warp_id) if self.enable_dispatch_warps else 0
+        )
+        token_back_warps = (
+            len(self.token_back_warp_id)
+            if self.token_back_standalone and self.token_back_warp_id
+            else 0
+        )
+        empty_warps = 1 if self.enable_empty_warp else 0
+        regs_per_warp = (
+            len(self.epilogue_warp_id) * self.epi_reg_cnt
+            + self.tma_a_reg_cnt
+            + self.tma_b_reg_cnt
+            + self.sched_reg_cnt
+            + empty_warps * self.empty_reg_cnt
+            + dispatch_warps * self.dispatch_reg_cnt
+            + token_back_warps * self.token_back_reg_cnt
+        )
+        return 32 * regs_per_warp
 
     def sched_ext_fc1_peek_threshold(self) -> int:
         # Peek threshold must match the spin threshold (physical token-N tile)
@@ -419,7 +748,11 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         num_experts_per_rank = self.num_experts_per_rank
         token_padding_block = self.token_padding_block
         sf_padding_block = self.sf_padding_block
-        cluster_tile_tokens = self.cluster_tile_tokens
+        counter_tile_tokens = (
+            self.split_workspace_counter_tile_tokens
+            if self.split_workspace_counter_tile_tokens is not None
+            else self.cluster_tile_tokens
+        )
 
         max_recv = world_size * max_tokens_per_rank
         max_per_token = min(num_topk, num_experts_per_rank)
@@ -432,7 +765,8 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             (pool_token_capacity // token_padding_block) * sf_padding_block
         )
         pool_task_tile_capacity = (
-            (pool_token_capacity + cluster_tile_tokens - 1) // cluster_tile_tokens
+            (pool_token_capacity + counter_tile_tokens - 1)
+            // counter_tile_tokens
             + num_experts_per_rank
         )
         return (
@@ -444,6 +778,57 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
     # =========================================================================
     # Region tables
     # =========================================================================
+
+    def _counter_region_name(
+        self, logical_name: str, bank: Optional[int] = None
+    ) -> str:
+        selected = self.counter_epoch_bank if bank is None else bank
+        return (
+            logical_name
+            if selected == 0
+            else f"{logical_name}__bank{selected}"
+        )
+
+    def _expand_counter_region_specs(
+        self, specs: List[_RegionSpec]
+    ) -> List[_RegionSpec]:
+        if self.counter_epoch_banks == 1:
+            return specs
+        return [
+            _RegionSpec(
+                self._counter_region_name(spec.name, bank),
+                spec.cute_dtype,
+                spec.shape,
+                spec.align,
+            )
+            for bank in range(self.counter_epoch_banks)
+            for spec in specs
+        ]
+
+    def _counter_bank_spans(
+        self,
+        counter_specs: Tuple[_RegionSpec, ...],
+        offsets: Dict[str, int],
+        *,
+        data_offset: int,
+    ) -> Tuple[Tuple[int, int], ...]:
+        if self.counter_epoch_banks == 1:
+            return ((0, data_offset),)
+        relative_offsets, bank_span = _layout_regions(list(counter_specs))
+        spans = []
+        for bank in range(self.counter_epoch_banks):
+            bank_offset = bank * bank_span
+            for spec in counter_specs:
+                physical_name = self._counter_region_name(spec.name, bank)
+                expected = bank_offset + relative_offsets[spec.name]
+                actual = offsets[physical_name]
+                if actual != expected:
+                    raise RuntimeError(
+                        f"counter bank layout mismatch for {physical_name}: "
+                        f"expected {expected}, got {actual}"
+                    )
+            spans.append((bank_offset, bank_span))
+        return tuple(spans)
 
     def _build_local_region_specs(self) -> List[_RegionSpec]:
         pool_token_capacity = self.pool_token_capacity
@@ -463,15 +848,16 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         sf_block_cols = (
             ((per_tensor_sf_cols + 3) // 4) * 4
         )
-        fc1_done_slots = (
-            (pool_token_capacity + self.token_tile_size - 1)
-            // self.token_tile_size
-            + num_experts_per_rank
+        cluster_token_ctas = (
+            self.cluster_shape_mn[1]
+            if getattr(self, "is_swap_ab", False)
+            else self.cluster_shape_mn[0]
         )
+        fc1_done_slots = pool_task_tile_capacity * cluster_token_ctas
 
         # Accumulating counters are front-placed so kernel_tail can reset them
         # as one contiguous Int32 prefix before the next launch.
-        specs: List[_RegionSpec] = [
+        counter_specs: List[_RegionSpec] = [
             _RegionSpec(
                 "l1_arrival_count",
                 cutlass.Int32,
@@ -498,8 +884,17 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             ),
         ]
 
+        if self.split_role != "fused":
+            counter_specs.append(
+                _RegionSpec(
+                    "split_dispatch_ready",
+                    cutlass.Int32,
+                    (1,),
+                    16,
+                )
+            )
         if self.token_back_by_dispatch:
-            specs.append(
+            counter_specs.append(
                 _RegionSpec(
                     "fc2_done_counter",
                     cutlass.Int32,
@@ -509,15 +904,17 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             )
 
         if self.load_balance_mode == "atomic_counter":
-            specs.append(
+            counter_specs.append(
                 _RegionSpec(
                     "load_balance_counter",
                     cutlass.Int32,
-                    (1,),
+                    (2,),
                     16,
                 )
             )
 
+        self._local_counter_region_specs = tuple(counter_specs)
+        specs = self._expand_counter_region_specs(counter_specs)
         # Data buffers start at l1_token_buffer. The persistent NVLink phase
         # counter is intentionally after the reset prefix.
         specs += [
@@ -560,11 +957,15 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             _RegionSpec(
                 "fc1_output_sf",
                 cutlass.Float32
-                if self.fp8_scale_mode == "blockwise"
+                if self.fp8_scale_mode in (
+                    "blockwise", "mxfp4_hybrid"
+                )
                 else cutlass.Float8E8M0FNU,
                 (
                     (pool_token_capacity, self.fc2_activation_sf_storage_cols)
-                    if self.fp8_scale_mode == "blockwise"
+                    if self.fp8_scale_mode in (
+                        "blockwise", "mxfp4_hybrid"
+                    )
                     else (sf_total_rows_upper, sf_block_cols)
                 ),
                 128,
@@ -591,7 +992,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
 
         max_slot = max_tokens_per_rank * num_topk
 
-        specs = [
+        counter_specs = [
             _RegionSpec(
                 "expert_recv_count",
                 cutlass.Int64,
@@ -604,6 +1005,18 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 (num_experts_per_rank,),
                 16,
             ),
+        ]
+        if self.split_role != "fused":
+            # K3's cross-rank join counter must be peer-addressable and part
+            # of the shared reset prefix. Each rank publishes local K2
+            # completion to every peer before any rank reduces its remotely
+            # populated combine plane.
+            counter_specs.append(
+                _RegionSpec("split_k2_join_count", cutlass.Int32, (1,), 16)
+            )
+        self._shared_counter_region_specs = tuple(counter_specs)
+        specs = self._expand_counter_region_specs(counter_specs)
+        specs += [
             _RegionSpec(
                 "src_token_topk_idx",
                 cutlass.Int32,
@@ -701,6 +1114,39 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             stride=stride,
         )
 
+    def _view_local_split_counter(
+        self,
+        local_workspace: cute.Pointer,
+        name: str,
+        *,
+        cute_dtype: Optional[Any] = None,
+        shape: Optional[Tuple[int, ...]] = None,
+        stride: Optional[Tuple[int, ...]] = None,
+    ) -> cute.Tensor:
+        return self._view_local(
+            local_workspace,
+            self._counter_region_name(name),
+            cute_dtype=cute_dtype,
+            shape=shape,
+            stride=stride,
+        )
+
+    def _view_shared_split_counter(
+        self,
+        shared_workspace: cute.Pointer,
+        name: str,
+        *,
+        cute_dtype: Optional[Any] = None,
+        shape: Optional[Tuple[int, ...]] = None,
+        stride: Optional[Tuple[int, ...]] = None,
+    ) -> cute.Tensor:
+        return self._view_shared(
+            shared_workspace,
+            self._counter_region_name(name),
+            cute_dtype=cute_dtype,
+            shape=shape,
+            stride=stride,
+        )
     def _partition_region(
         self,
         byte_workspace: cute.Pointer,
@@ -728,7 +1174,266 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         )
 
     # =========================================================================
-    # __call__
+    # Split role entrypoints
+    # =========================================================================
+
+    @cute.jit
+    def split_k1_entry(
+        self,
+        activation: cute.Tensor,
+        activation_sf: cute.Tensor,
+        topk_idx: cute.Tensor,
+        topk_weights: cute.Tensor,
+        fc1_weight: cute.Tensor,
+        fc1_weight_sf: cute.Tensor,
+        fc1_weight_dequant_scale: cute.Tensor,
+        local_workspace: cute.Pointer,
+        shared_workspace: cute.Pointer,
+        peer_rank_ptr_mapper_host,
+        max_active_clusters: cutlass.Constexpr,
+        stream,
+    ) -> None:
+        """Strict dispatch + FC1 ABI with no FC2 model state."""
+        if cutlass.const_expr(self.split_role != "k1"):
+            raise ValueError("split_k1_entry requires split_role='k1'.")
+        if cutlass.const_expr(self.fp8_scale_mode != "mxfp4_hybrid"):
+            raise ValueError("split K1 requires mxfp4_hybrid scaling.")
+        cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
+        sm_count = max_active_clusters * cluster_size
+        if cutlass.const_expr(self.world_size == 1):
+            peer_rank_ptr_mapper = SingleRankSymBufferDevice()
+            local_rank = Int32(self.local_rank)
+        else:
+            if cutlass.const_expr(peer_rank_ptr_mapper_host is None):
+                raise ValueError("multi-rank split K1 requires a peer mapper")
+            peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_obj()
+            local_rank = peer_rank_ptr_mapper_host.rank_idx
+
+        l1_token_buffer_u8 = self._view_local(
+            local_workspace, "l1_token_buffer",
+        )
+        l1_token_buffer_fp8 = self._make_typed_view(
+            local_workspace,
+            self._local_offsets["l1_token_buffer"],
+            self.ab_dtype,
+            (self.pool_token_capacity, self.hidden),
+            (self.hidden, 1),
+            self._local_region_by_name["l1_token_buffer"].align,
+        )
+        l1_sf_buffer_i32 = self._view_local(local_workspace, "l1_sf_buffer")
+        l1_sf_buffer_fp32 = self._make_typed_view(
+            local_workspace,
+            self._local_offsets["l1_sf_buffer"],
+            cutlass.Float32,
+            (self.pool_sf_capacity, self.sf_uint32_per_token),
+            (self.sf_uint32_per_token, 1),
+            self._local_region_by_name["l1_sf_buffer"].align,
+        )
+        l1_topk_weights = self._view_local(
+            local_workspace, "l1_topk_weights_buffer",
+        )
+        l1_arrival_count = self._view_local_split_counter(
+            local_workspace, "l1_arrival_count",
+        )
+        token_src_metadata = self._view_local(
+            local_workspace, "token_src_metadata",
+        )
+        expert_send_count = self._view_local_split_counter(
+            local_workspace, "expert_send_count",
+        )
+        grid_sync_counter = self._view_local_split_counter(
+            local_workspace, "grid_sync_counter",
+        )
+        nvlink_barrier_counter = self._view_local(
+            local_workspace, "nvlink_barrier_counter",
+        )
+        fc1_output = self._view_local(local_workspace, "fc1_output")
+        fc1_output_sf = self._view_local(local_workspace, "fc1_output_sf")
+        fc1_done_counter = self._view_local_split_counter(
+            local_workspace, "fc1_done_counter",
+        )
+        split_dispatch_ready = self._view_local_split_counter(
+            local_workspace, "split_dispatch_ready",
+        )
+        load_balance_counter = None
+        if cutlass.const_expr(self.load_balance_mode == "atomic_counter"):
+            load_balance_counter = self._view_local_split_counter(
+                local_workspace, "load_balance_counter",
+            )
+
+        src_token_topk_idx = self._view_shared(
+            shared_workspace, "src_token_topk_idx",
+        )
+        expert_recv_count = self._view_shared_split_counter(
+            shared_workspace, "expert_recv_count",
+        )
+        expert_recv_count_sum = self._view_shared_split_counter(
+            shared_workspace, "expert_recv_count_sum",
+        )
+        nvlink_barrier_signal = self._view_shared(
+            shared_workspace, "nvlink_barrier_signal",
+        )
+        expert_token_sizes = self._view_shared_split_counter(
+            shared_workspace,
+            "expert_recv_count_sum",
+            cute_dtype=cutlass.Int32,
+            shape=(self.num_experts_per_rank,),
+            stride=(2,),
+        )
+        local_bank_offset, local_bank_bytes = self.local_counter_bank_spans[
+            self.counter_epoch_bank
+        ]
+        shared_bank_offset, shared_bank_bytes = self.shared_counter_bank_spans[
+            self.counter_epoch_bank
+        ]
+        local_zero_prefix = self._make_typed_view(
+            local_workspace,
+            local_bank_offset,
+            cutlass.Int32,
+            (local_bank_bytes // 4,),
+            (1,),
+            16,
+        )
+        shared_zero_prefix = self._make_typed_view(
+            shared_workspace,
+            shared_bank_offset,
+            cutlass.Int32,
+            (shared_bank_bytes // 4,),
+            (1,),
+            16,
+        )
+        token_comm_args = SplitK1TokenCommArgs(
+            input_token_buffer=activation,
+            input_sf_buffer=activation_sf,
+            topk_idx=topk_idx,
+            input_topk_weights_buffer=topk_weights,
+            expert_send_count=expert_send_count,
+            expert_recv_count=expert_recv_count,
+            expert_recv_count_sum=expert_recv_count_sum,
+            src_token_topk_idx=src_token_topk_idx,
+            fc1_input_token_buffer=l1_token_buffer_u8,
+            fc1_input_sf_buffer=l1_sf_buffer_i32,
+            fc1_input_topk_weights_buffer=l1_topk_weights,
+            fc1_ready_counter=l1_arrival_count,
+            token_src_metadata=token_src_metadata,
+            nvlink_barrier_signal=nvlink_barrier_signal,
+            nvlink_barrier_counter=nvlink_barrier_counter,
+            grid_sync_counter=grid_sync_counter,
+            local_zero_prefix=local_zero_prefix,
+            shared_zero_prefix=shared_zero_prefix,
+            split_dispatch_ready=split_dispatch_ready,
+            peer_rank_ptr_mapper=peer_rank_ptr_mapper,
+            world_size=self.world_size,
+            local_rank=local_rank,
+            num_total_experts=self.num_total_experts,
+            num_experts_per_rank=self.num_experts_per_rank,
+            num_topk=self.num_topk,
+            hidden_bytes=self.hidden_bytes,
+            sf_uint32_per_token=self.sf_uint32_per_token,
+            token_padding_block=self.token_padding_block,
+            sf_padding_block=self.sf_padding_block,
+            sm_count=sm_count,
+        )
+        Sm90SwapABSwigluFp8Fc12Kernel.launch_fc1_only(
+            self,
+            activation=l1_token_buffer_fp8,
+            fc1_weight=fc1_weight,
+            activation_sf=l1_sf_buffer_fp32,
+            fc1_weight_sf=fc1_weight_sf,
+            fc1_weight_dequant_scale=fc1_weight_dequant_scale,
+            fc1_output=fc1_output,
+            fc1_output_sf=fc1_output_sf,
+            topk_scores=l1_topk_weights,
+            fc1_done_counter=fc1_done_counter,
+            offs=None,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+            load_balance_counter=load_balance_counter,
+            expert_token_sizes=expert_token_sizes,
+            token_comm_args=token_comm_args,
+        )
+
+    @cute.jit
+    def split_k2_entry(
+        self,
+        fc2_weight: cute.Tensor,
+        fc2_weight_sf: cute.Tensor,
+        fc2_weight_dequant_scale: cute.Tensor,
+        local_workspace: cute.Pointer,
+        shared_workspace: cute.Pointer,
+        peer_rank_ptr_mapper_host,
+        max_active_clusters: cutlass.Constexpr,
+        stream,
+    ) -> None:
+        """Strict FC2 + direct-combine ABI with no FC1 model state."""
+        if cutlass.const_expr(self.split_role != "k2"):
+            raise ValueError("split_k2_entry requires split_role='k2'.")
+        if cutlass.const_expr(self.fp8_scale_mode != "mxfp4_hybrid"):
+            raise ValueError("split K2 requires mxfp4_hybrid scaling.")
+
+        cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
+        sm_count = max_active_clusters * cluster_size
+        if cutlass.const_expr(self.world_size == 1):
+            peer_rank_ptr_mapper = SingleRankSymBufferDevice()
+            local_rank = Int32(self.local_rank)
+        else:
+            if cutlass.const_expr(peer_rank_ptr_mapper_host is None):
+                raise ValueError("multi-rank split K2 requires a peer mapper")
+            peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_obj()
+            local_rank = peer_rank_ptr_mapper_host.rank_idx
+
+        fc1_output = self._view_local(local_workspace, "fc1_output")
+        fc1_output_sf = self._view_local(local_workspace, "fc1_output_sf")
+        fc1_done_counter = self._view_local_split_counter(
+            local_workspace, "fc1_done_counter",
+        )
+        split_dispatch_ready = self._view_local_split_counter(
+            local_workspace, "split_dispatch_ready",
+        )
+        token_src_metadata = self._view_local(
+            local_workspace, "token_src_metadata",
+        )
+        combine_output = self._view_shared(
+            shared_workspace, "combine_quant",
+        )
+        expert_token_sizes = self._view_shared_split_counter(
+            shared_workspace,
+            "expert_recv_count_sum",
+            cute_dtype=cutlass.Int32,
+            shape=(self.num_experts_per_rank,),
+            stride=(2,),
+        )
+        load_balance_counter = None
+        if cutlass.const_expr(self.load_balance_mode == "atomic_counter"):
+            load_balance_counter = self._view_local_split_counter(
+                local_workspace, "load_balance_counter",
+            )
+
+        token_comm_args = SplitK2TokenCommArgs(
+            token_src_metadata=token_src_metadata,
+            combine_output=combine_output,
+            split_dispatch_ready=split_dispatch_ready,
+            peer_rank_ptr_mapper=peer_rank_ptr_mapper,
+        )
+        Sm90SwapABSwigluFp8Fc12Kernel.launch_fc2_only(
+            self,
+            fc1_output=fc1_output,
+            fc1_output_sf=fc1_output_sf,
+            fc1_done_counter=fc1_done_counter,
+            fc2_weight=fc2_weight,
+            fc2_weight_sf=fc2_weight_sf,
+            fc2_weight_dequant_scale=fc2_weight_dequant_scale,
+            fc2_output=combine_output,
+            offs=None,
+            max_active_clusters=max_active_clusters,
+            stream=stream,
+            load_balance_counter=load_balance_counter,
+            expert_token_sizes=expert_token_sizes,
+            token_comm_args=token_comm_args,
+        )
+
+    # =========================================================================
+    # Legacy fused entrypoint
     # =========================================================================
 
     @cute.jit
@@ -817,7 +1522,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # keeps the atom-swizzled E8M0 view; blockwise stores one FP32 scale per
         # uint32 word in row-major order.
         l1_sf_buffer_i32 = self._view_local(local_workspace, "l1_sf_buffer")
-        if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+        if cutlass.const_expr(
+            self.fp8_scale_mode in ("blockwise", "mxfp4_hybrid")
+        ):
             l1_sf_buffer_for_fc1 = self._make_typed_view(
                 local_workspace,
                 self._local_offsets["l1_sf_buffer"],
@@ -847,6 +1554,11 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         )
         expert_send_count = self._view_local(local_workspace, "expert_send_count")
         grid_sync_counter = self._view_local(local_workspace, "grid_sync_counter")
+        split_dispatch_ready = None
+        if cutlass.const_expr(self.split_role != "fused"):
+            split_dispatch_ready = self._view_local(
+                local_workspace, "split_dispatch_ready",
+            )
         nvlink_barrier_counter = self._view_local(
             local_workspace, "nvlink_barrier_counter",
         )
@@ -858,6 +1570,11 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         if cutlass.const_expr(self.load_balance_mode == "atomic_counter"):
             load_balance_counter = self._view_local(
                 local_workspace, "load_balance_counter",
+            )
+            phase_counter_idx = 1 if self.execution_phase == "fc2" else 0
+            load_balance_counter = cute.make_tensor(
+                load_balance_counter.iterator + phase_counter_idx,
+                cute.make_layout(1),
             )
 
         # MoE-domain cross-rank combine target. Separate reduce stages one
@@ -958,6 +1675,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             nvlink_barrier_signal=nvlink_barrier_signal,
             nvlink_barrier_counter=nvlink_barrier_counter,
             grid_sync_counter=grid_sync_counter,
+            split_dispatch_ready=split_dispatch_ready,
             local_zero_prefix=local_zero_prefix,
             shared_zero_prefix=shared_zero_prefix,
             peer_rank_ptr_mapper=peer_rank_ptr_mapper,
@@ -1005,7 +1723,10 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         # into the SwiGLU output before FC1-output quantization, while the
         # transformers graph leaves each term unweighted and applies scores in
         # this standalone reducer.
-        if cutlass.const_expr(not self.fc2_in_kernel_topk_reduce):
+        if cutlass.const_expr(
+            not self.fc2_in_kernel_topk_reduce
+            and self.split_role == "fused"
+        ):
             score = (
                 topk_weights if cutlass.const_expr(not self.apply_topk_in_fc1)
                 else None
@@ -1019,6 +1740,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 combine_target,
                 None,
                 output_activation,
+                topk_idx,
                 score,
                 stream,
             )
@@ -1028,14 +1750,30 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
     # =========================================================================
 
     def token_comm_extra_smem_storage_class(self) -> type:
+        if self.split_role == "k2":
+            return None
         return self.token_comm.extra_smem_storage_class()
 
     def token_comm_hook_fc1_ready_counter_ptr(self, token_comm_args):
+        if self.split_role == "k2":
+            return None
         return self.token_comm.fc1_ready_counter_ptr(token_comm_args)
 
     @cute.jit
     def token_comm_hook_sched_warp_pre_init_wait(self, token_comm_args):
-        self.token_comm.sched_warp_pre_init_wait(token_comm_args)
+        if cutlass.const_expr(self.split_role == "k2"):
+            ready_ptr = token_comm_args.split_dispatch_ready.iterator
+            spin_wait(
+                ready_ptr,
+                lambda value: value >= Int32(1),
+                fail_sleep_cycles=20,
+            )
+            cute.arch.load(
+                ready_ptr, Int32, sem="acquire", scope="sys",
+            )
+            cute.arch.fence_acq_rel_sys()
+        else:
+            self.token_comm.sched_warp_pre_init_wait(token_comm_args)
 
     @cute.jit
     def token_comm_hook_fc1_tma_b_predispatch_spin(
@@ -1055,13 +1793,22 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         lane_idx,
         tidx,
     ):
-        self.token_comm.dispatch_warp_body(
-            token_comm_args,
-            token_comm_storage,
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-            tidx=tidx,
-        )
+        if cutlass.const_expr(self.execution_phase == "fc2"):
+            self.token_comm.split_fc2_dispatch_warp_body(
+                token_comm_args,
+                token_comm_storage,
+                warp_idx=warp_idx,
+                lane_idx=lane_idx,
+                tidx=tidx,
+            )
+        else:
+            self.token_comm.dispatch_warp_body(
+                token_comm_args,
+                token_comm_storage,
+                warp_idx=warp_idx,
+                lane_idx=lane_idx,
+                tidx=tidx,
+            )
 
     @cute.jit
     def token_comm_hook_token_back_warp_body(
@@ -1106,12 +1853,13 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         lane_idx,
         tidx,
     ):
-        self.token_comm.kernel_tail(
-            token_comm_args,
-            warp_idx=warp_idx,
-            lane_idx=lane_idx,
-            tidx=tidx,
-        )
+        if cutlass.const_expr(self.split_role == "fused"):
+            self.token_comm.kernel_tail(
+                token_comm_args,
+                warp_idx=warp_idx,
+                lane_idx=lane_idx,
+                tidx=tidx,
+            )
 
 
 class Sm90MegaMoESwapABFp8Kernel(
@@ -1121,3 +1869,60 @@ class Sm90MegaMoESwapABFp8Kernel(
     """MegaMoE wiring that reuses token communication with the swap-AB base."""
 
     pass
+
+
+class Sm90MegaMoESwapABMxfp4Fp8Kernel(
+    Sm90MegaMoEFp8Kernel,
+    Sm90SwapABSwigluMxfp4Fp8Fc12Kernel,
+):
+    """MegaMoE with the packed MXFP4 RS FC12 specialization."""
+
+    pass
+
+
+class MegaMoEFp8TopkReduceLauncher:
+    """Launch standalone K3 from the shared workspace after Green Contexts join."""
+
+    def __init__(self, mega_kernel: Sm90MegaMoEFp8Kernel) -> None:
+        if mega_kernel.fc2_in_kernel_topk_reduce:
+            raise ValueError("standalone TopK reduce is disabled for in-kernel reduce")
+        combine_spec = mega_kernel._shared_region_by_name["combine_quant"]
+        self.combine_offset = mega_kernel._shared_offsets["combine_quant"]
+        self.combine_align = combine_spec.align
+        self.max_tokens_per_rank = mega_kernel.max_tokens_per_rank
+        self.num_topk = mega_kernel.num_topk
+        self.hidden = mega_kernel.hidden
+        self.combine_format = mega_kernel.combine_format
+        self.apply_topk_in_fc1 = mega_kernel.apply_topk_in_fc1
+
+    @cute.jit
+    def __call__(
+        self,
+        shared_workspace: cute.Pointer,
+        topk_idx: cute.Tensor,
+        topk_weights: cute.Tensor,
+        output_activation: cute.Tensor,
+        stream,
+    ) -> None:
+        combine_target = Sm90MegaMoEFp8Kernel._make_typed_view(
+            shared_workspace,
+            self.combine_offset,
+            self.combine_format.act_dtype,
+            (self.max_tokens_per_rank, self.num_topk, self.hidden),
+            (self.num_topk * self.hidden, self.hidden, 1),
+            self.combine_align,
+        )
+        score = None if self.apply_topk_in_fc1 else topk_weights
+        TopkReduce(
+            self.hidden,
+            self.num_topk,
+            self.combine_format,
+            sm_arch=get_cutedsl_target_arch(),
+        )(
+            combine_target,
+            None,
+            output_activation,
+            topk_idx,
+            score,
+            stream,
+        )
