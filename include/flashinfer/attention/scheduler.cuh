@@ -30,6 +30,7 @@
 #include "../pos_enc.cuh"
 #include "../utils.cuh"
 #include "heap.h"
+#include "prefill_occupancy.cuh"
 
 namespace flashinfer {
 
@@ -541,6 +542,39 @@ inline cudaError_t DecodePlanWorkspaceSize(size_t& float_workspace_size_in_bytes
       enable_cuda_graph, stream, work_estimation_func);
 }
 
+/*!
+ * \brief The CTA_TILE_Q the FA2 prefill run path will dispatch on for this plan.
+ *
+ * Factored out of PrefillSplitQOKVIndptr so that PrefillPlanImpl can size its
+ * occupancy budget against the same tile without the two ever drifting apart.
+ * It reads only qo_indptr_h and shape metadata, so it can be evaluated before
+ * the split budget it feeds into.
+ */
+template <typename IdType>
+inline uint32_t FA2PlanCtaTileQ(IdType* qo_indptr_h, uint32_t total_num_rows, uint32_t batch_size,
+                                uint32_t gqa_group_size, bool enable_cuda_graph,
+                                int64_t uniform_q_len, uint32_t head_dim_vo, uint32_t head_dim_qk,
+                                uint32_t kv_dtype_bytes) {
+  if (enable_cuda_graph) {
+    if (uniform_q_len > 0) {
+      // The caller guarantees that every request has exactly uniform_q_len rows
+      // in every plan replayed through this graph.
+      const uint64_t packed_uniform_len = uint64_t(uniform_q_len) * gqa_group_size;
+      return FA2DetermineCtaTileQ(packed_uniform_len, head_dim_vo, head_dim_qk, kv_dtype_bytes);
+    }
+    // The dummy data the graph is captured with fixes the maximum token count.
+    const uint64_t max_seq_len = total_num_rows - batch_size + 1;
+    const uint64_t max_qo_len = uint64_t(max_seq_len) * gqa_group_size;
+    return FA2DetermineCtaTileQ(max_qo_len, head_dim_vo, head_dim_qk, kv_dtype_bytes);
+  }
+  int64_t sum_packed_qo_len = 0;
+  for (uint32_t i = 0; i < batch_size; ++i) {
+    sum_packed_qo_len += int64_t(qo_indptr_h[i + 1] - qo_indptr_h[i]) * int64_t(gqa_group_size);
+  }
+  const int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
+  return FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim_vo, head_dim_qk, kv_dtype_bytes);
+}
+
 template <typename IdType>
 inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    uint32_t total_num_rows, uint32_t batch_size,
@@ -577,7 +611,10 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
 
   // step 2: determine cta_tile_q, kv_chunk_size and total_num_tiles_q
   const uint32_t min_kv_chunk_size = std::max((128 / page_size), 1U);
-  uint32_t cta_tile_q;
+  // Single source of truth, shared with PrefillPlanImpl's occupancy budget.
+  const uint32_t cta_tile_q =
+      FA2PlanCtaTileQ(qo_indptr_h, total_num_rows, batch_size, gqa_group_size, enable_cuda_graph,
+                      uniform_q_len, head_dim, head_dim_qk, kv_dtype_bytes);
   uint32_t total_num_tiles_q;
   if (enable_cuda_graph) {
     if (uniform_q_len > 0) {
@@ -594,16 +631,8 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
           FLASHINFER_ERROR(err_msg.str());
         }
       }
-      cta_tile_q = FA2DetermineCtaTileQ(packed_uniform_len, head_dim, head_dim_qk, kv_dtype_bytes);
       total_num_tiles_q = batch_size * ceil_div(packed_uniform_len, cta_tile_q);
     } else {
-      // When CUDA graphs are enabled, the lengths of sequences determined by
-      // qo_indptr_h can vary. We assume that the dummy data based on which
-      // the CUDA graph is created fixes the maximum number of tokens.
-      const uint64_t max_seq_len = total_num_rows - batch_size + 1;
-      uint64_t max_qo_len = uint64_t(max_seq_len) * gqa_group_size;
-      cta_tile_q = FA2DetermineCtaTileQ(max_qo_len, head_dim, head_dim_qk, kv_dtype_bytes);
-
       // Find an upper bound for the number of tiles, derived from the total
       // number of rows and the batch size.  The sum of qo lengths rounded
       // up to cta_tile_q will not exceed this number derived from the total
@@ -611,13 +640,6 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
       total_num_tiles_q = ceil_div(total_num_rows * gqa_group_size, cta_tile_q) + batch_size - 1;
     }
   } else {
-    int64_t sum_packed_qo_len = 0;
-    for (uint32_t i = 0; i < batch_size; ++i) {
-      sum_packed_qo_len += packed_qo_len_arr[i];
-    }
-    const int64_t avg_packed_qo_len = sum_packed_qo_len / batch_size;
-    cta_tile_q = FA2DetermineCtaTileQ(avg_packed_qo_len, head_dim, head_dim_qk, kv_dtype_bytes);
-
     total_num_tiles_q = 0;
     for (uint32_t i = 0; i < batch_size; ++i) {
       total_num_tiles_q += ceil_div(packed_qo_len_arr[i], cta_tile_q);
@@ -771,8 +793,16 @@ inline cudaError_t PrefillPlanImpl(
     bool disable_split_kv,
     int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                  // splits by #colocated decode CTAs
-    int64_t uniform_q_len, cudaStream_t stream, uint32_t kv_dtype_bytes = 2) {
+    int64_t uniform_q_len,
+    // Built by MakeFA2PrefillDTypeInfo<DTypeQ, DTypeKV>() so the three dtype facts
+    // cannot disagree with each other. Deliberately has no default: no constant is
+    // safe for kv_is_fp4 (see FA2PrefillDTypeInfo).
+    FA2PrefillDTypeInfo dtype_info, cudaStream_t stream) {
   (void)sizeof_dtype_o;
+  // Single source of truth for the KV element size: it used to arrive both here
+  // and as a separate defaulted kv_dtype_bytes parameter, which is two facts that
+  // can disagree. Read it off dtype_info instead.
+  const uint32_t kv_dtype_bytes = dtype_info.kv_dtype_bytes();
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads " << num_qo_heads << " should be divisible by num_kv_heads "
@@ -780,12 +810,60 @@ inline cudaError_t PrefillPlanImpl(
     FLASHINFER_ERROR(err_msg.str());
   }
 
-  // step 0: get the number of SMs
+  // step 0: get the number of SMs and how many CTAs of this kernel fit on one
   int num_sm = 0;
   int dev_id = 0;
+  int max_smem_per_sm = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
   FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&num_sm, cudaDevAttrMultiProcessorCount, dev_id));
+  FLASHINFER_CUDA_CALL(cudaDeviceGetAttribute(&max_smem_per_sm,
+                                              cudaDevAttrMaxSharedMemoryPerMultiprocessor, dev_id));
+  // The run path already derives its CTAs-per-SM from this same attribute
+  // (num_ctas_per_sm in BatchPrefillWith{Ragged,Paged}KVCacheDispatched), and on
+  // shared-memory-tight parts it resolves to 1 while this planner used to assume
+  // 2 unconditionally -- budgeting the split-KV grid against twice the CTAs the
+  // machine can actually hold, which costs a second, mostly empty wave.
+  //
+  // Mirror that decision here. FA2PrefillCtaSmemLowerBound is a *lower* bound on
+  // the kernel's per-CTA shared memory (prefill.cuh static_asserts this for every
+  // instantiation), so num_blocks_per_sm drops to 1 only when the launcher will
+  // also pick 1; whenever the launcher fits two CTAs the historical value of 2 is
+  // preserved exactly. cta_tile_q comes from the same helper PrefillSplitQOKVIndptr
+  // uses below, so the tile the estimate is made against is the tile that runs.
+  //
+  // Two paths keep the historical value of 2 instead:
+  //
+  //  * fixed_split_size > 0 (and split-KV not disabled). There the caller supplies
+  //    kv_chunk_size directly and PrefillSplitQOKVIndptr skips the binary search,
+  //    so new_batch_size does not depend on this budget at all -- while under CUDA
+  //    graphs padded_batch_size = max(max_batch_size_if_split, total_num_tiles_q)
+  //    still does. Lowering the budget on that path cannot help (the split is
+  //    already pinned) and can push padded_batch_size below new_batch_size, which
+  //    trips the FLASHINFER_CHECK below and turns a working plan() into an error.
+  //  * num_colocated_ctas > 0, i.e. the POD prefill leg that actually has decode
+  //    CTAs colocated with it. That leg is planned here but *run* by a different
+  //    kernel (batch_pod.cu) with a different shared-memory footprint, and
+  //    halving this budget would also halve the point at which POD stops
+  //    splitting; out of scope for a correction aimed at the FA2 launchers.
+  //    This bypass is a subset of POD, not all of it: PODWithPagedKVCacheWrapper
+  //    (single prefill) and the decode leg of BatchPODWithPagedKVCacheWrapper
+  //    both pass 0 here, and the batch wrapper zeroes it again for the prefill
+  //    leg when the prefill is large (total_num_rows_p > 1536, flashinfer/pod.py).
+  //    Those plans take the correction like any other FA2 prefill plan.
+  const bool uses_fixed_split = (fixed_split_size > 0) && !disable_split_kv;
+  const bool apply_occupancy_correction = !uses_fixed_split && (num_colocated_ctas == 0);
   int num_blocks_per_sm = 2;
+  if (apply_occupancy_correction) {
+    const uint32_t cta_tile_q_hint =
+        FA2PlanCtaTileQ(qo_indptr_h, total_num_rows, batch_size, num_qo_heads / num_kv_heads,
+                        enable_cuda_graph, uniform_q_len, head_dim_vo, head_dim_qk, kv_dtype_bytes);
+    const uint32_t cta_smem_lower_bound =
+        FA2PrefillCtaSmemLowerBound(cta_tile_q_hint, head_dim_qk, head_dim_vo, dtype_info);
+    num_blocks_per_sm =
+        (static_cast<int64_t>(max_smem_per_sm) >= 2 * static_cast<int64_t>(cta_smem_lower_bound))
+            ? 2
+            : 1;
+  }
   int64_t available_ctas = static_cast<int64_t>(num_blocks_per_sm) * num_sm - num_colocated_ctas;
   int max_grid_size = static_cast<int>(std::max<int64_t>(0, available_ctas));
   uint32_t max_batch_size_if_split = max_grid_size / num_kv_heads;
@@ -904,8 +982,8 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                int32_t fixed_split_size, bool disable_split_kv,
                                int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                                             // splits by #colocated decode CTAs
-                               int64_t uniform_q_len, cudaStream_t stream,
-                               uint32_t kv_dtype_bytes = 2) {
+                               int64_t uniform_q_len, FA2PrefillDTypeInfo dtype_info,
+                               cudaStream_t stream) {
   size_t used_float_workspace_size = 0;
   size_t used_int_workspace_size = 0;
   return PrefillPlanImpl<true>(used_float_workspace_size, used_int_workspace_size, float_buffer,
@@ -914,7 +992,7 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk,
                                head_dim_vo, page_size, enable_cuda_graph, sizeof_dtype_o,
                                window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
-                               uniform_q_len, stream, kv_dtype_bytes);
+                               uniform_q_len, dtype_info, stream);
 }
 
 template <typename IdType>
@@ -923,8 +1001,8 @@ inline cudaError_t PrefillPlanWorkspaceSize(
     IdType* kv_indptr_h, uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads,
     uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
-    bool disable_split_kv, int64_t num_colocated_ctas, int64_t uniform_q_len, cudaStream_t stream,
-    uint32_t kv_dtype_bytes = 2) {
+    bool disable_split_kv, int64_t num_colocated_ctas, int64_t uniform_q_len,
+    FA2PrefillDTypeInfo dtype_info, cudaStream_t stream) {
   PrefillPlanInfo plan_info;
   return PrefillPlanImpl<false>(float_workspace_size_in_bytes, int_workspace_size_in_bytes,
                                 /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
@@ -933,7 +1011,7 @@ inline cudaError_t PrefillPlanWorkspaceSize(
                                 kv_indptr_h, total_num_rows, batch_size, num_qo_heads, num_kv_heads,
                                 head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
                                 sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv,
-                                num_colocated_ctas, uniform_q_len, stream, kv_dtype_bytes);
+                                num_colocated_ctas, uniform_q_len, dtype_info, stream);
 }
 
 inline float cost_function(int qo_len, int kv_len) { return 2 * float(qo_len) + kv_len; }
