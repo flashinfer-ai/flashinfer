@@ -393,19 +393,33 @@ def test_runtime_module_selection_uses_exact_current_device_capability(monkeypat
 
     monkeypatch.setattr(api.torch.cuda, "current_device", lambda: 7)
     selected = []
-    monkeypatch.setattr(
-        api,
-        "_get_moe_alltoall_module_for_target",
-        lambda target: selected.append(target) or target,
-    )
 
-    monkeypatch.setattr(api.torch.cuda, "get_device_capability", lambda device: (10, 0))
-    assert api.get_moe_alltoall_module() == "sm100a"
-    monkeypatch.setattr(api.torch.cuda, "get_device_capability", lambda device: (10, 3))
-    assert api.get_moe_alltoall_module() == "sm103a"
-    monkeypatch.setattr(api.torch.cuda, "get_device_capability", lambda device: (9, 0))
-    assert api.get_moe_alltoall_module() == "legacy"
-    assert selected == ["sm100a", "sm103a", "legacy"]
+    def select_target(target):
+        selected.append(target)
+        return target
+
+    select_target.cache_clear = lambda: None
+    monkeypatch.setattr(api, "_get_moe_alltoall_module_for_target", select_target)
+
+    try:
+        monkeypatch.setattr(
+            api.torch.cuda, "get_device_capability", lambda device: (10, 0)
+        )
+        api.get_moe_alltoall_module.cache_clear()
+        assert api.get_moe_alltoall_module() == "sm100a"
+        monkeypatch.setattr(
+            api.torch.cuda, "get_device_capability", lambda device: (10, 3)
+        )
+        api.get_moe_alltoall_module.cache_clear()
+        assert api.get_moe_alltoall_module() == "sm103a"
+        monkeypatch.setattr(
+            api.torch.cuda, "get_device_capability", lambda device: (9, 0)
+        )
+        api.get_moe_alltoall_module.cache_clear()
+        assert api.get_moe_alltoall_module() == "legacy"
+        assert selected == ["sm100a", "sm103a", "legacy"]
+    finally:
+        api.get_moe_alltoall_module.cache_clear()
 
 
 def test_aot_registers_each_exact_mnnvl_moe_target(monkeypatch):
