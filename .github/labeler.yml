@@ -98,8 +98,9 @@
 "op: misc":
   - changed-files:
       - any-glob-to-any-file:
-          - "flashinfer/norm.py"
+          - "flashinfer/norm/**"
           - "flashinfer/jit/norm.py"
+          - "flashinfer/jit/rmsnorm_silu.py"
           - "flashinfer/triton/norm.py"
           - "flashinfer/triton/kernels/norm.py"
           - "flashinfer/trace/templates/norm.py"
