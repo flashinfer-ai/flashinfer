@@ -64,15 +64,13 @@ def _masked_m_max_device_cutile(masked_m: torch.Tensor) -> torch.Tensor:
     BLOCK = min(BLOCK, 1024)
 
     if Q > BLOCK:
-        # For large Q, fall back to torch.max on device (still async, no CPU sync).
-        # torch.max requires out[0].dtype to match input.dtype, so cast masked_m
-        # to int32 first if needed.
+        # For large Q, fall back to a device reduction (still async, no CPU sync).
+        # Use torch.amax with keepdim=True so the output keeps shape (1,): a
+        # dim-reduction via torch.max would need a 0-dim out and would resize the
+        # cached max_m_buf in place from (1,) to (), poisoning _max_m_cache for
+        # every subsequent call on this device.
         src = masked_m if masked_m.dtype == torch.int32 else masked_m.to(torch.int32)
-        torch.max(
-            src,
-            dim=0,
-            out=(max_m_buf, torch.empty(1, device=device, dtype=torch.int64)),
-        )
+        torch.amax(src, dim=0, keepdim=True, out=max_m_buf)
         return max_m_buf
 
     ct.launch(
