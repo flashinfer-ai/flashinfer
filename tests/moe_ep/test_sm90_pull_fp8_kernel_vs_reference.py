@@ -234,15 +234,68 @@ def _reference_reduced(pkg, *, problem, symm_buffer, l1, l2, fp8_scale_mode, s1)
 
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize(
-    "fp8_scale_mode,swap_ab",
+    "fp8_scale_mode,swap_ab,pingpong,mma_tiler_mnk,cluster_shape_mnk",
     [
-        ("per_tensor", False),
-        ("per_tensor", True),
-        ("blockwise", False),
-        ("blockwise", True),
+        pytest.param(
+            "per_tensor",
+            False,
+            False,
+            (64, 128, 128),
+            (1, 1, 1),
+            id="per_tensor-native",
+        ),
+        pytest.param(
+            "per_tensor",
+            True,
+            False,
+            (256, 32, 128),
+            (1, 1, 1),
+            id="per_tensor-swapab",
+        ),
+        pytest.param(
+            "blockwise",
+            False,
+            False,
+            (64, 128, 128),
+            (1, 1, 1),
+            id="blockwise-native",
+        ),
+        pytest.param(
+            "blockwise",
+            True,
+            False,
+            (256, 32, 128),
+            (1, 1, 1),
+            id="blockwise-swapab",
+        ),
+        # Runtime—not merely config-construction—coverage for Hopper CGA/TMA
+        # multicast plus ping-pong scheduling in both physical layouts.
+        pytest.param(
+            "per_tensor",
+            False,
+            True,
+            (64, 128, 128),
+            (2, 2, 1),
+            id="per_tensor-native-pingpong-cga2x2",
+        ),
+        pytest.param(
+            "blockwise",
+            True,
+            True,
+            (128, 32, 128),
+            (1, 2, 1),
+            id="blockwise-swapab-pingpong-cga1x2",
+        ),
     ],
 )
-def test_sm90_fp8_kernel_matches_drop_reference(monkeypatch, fp8_scale_mode, swap_ab):
+def test_sm90_fp8_kernel_matches_drop_reference(
+    monkeypatch,
+    fp8_scale_mode,
+    swap_ab,
+    pingpong,
+    mma_tiler_mnk,
+    cluster_shape_mnk,
+):
     """Single-rank ``hopper_fp8_mega_moe`` matches ``compute_megamoe_reference_fp8``."""
     _require_cuda()
 
@@ -301,9 +354,17 @@ def test_sm90_fp8_kernel_matches_drop_reference(monkeypatch, fp8_scale_mode, swa
         kind="fp8_e4m3",
         fp8_scale_mode=fp8_scale_mode,
         swap_ab=swap_ab,
+        pingpong=pingpong,
+        mma_tiler_mnk=mma_tiler_mnk,
+        cluster_shape_mnk=cluster_shape_mnk,
         gate_up_clamp=problem["gate_up_clamp"],
     )
     try:
+        live_cfg = symm_buffer._frontend.config
+        assert live_cfg.swap_ab is swap_ab
+        assert live_cfg.pingpong is pingpong
+        assert live_cfg.mma_tiler_mnk == mma_tiler_mnk
+        assert live_cfg.cluster_shape_mnk == cluster_shape_mnk
         stage_mega_moe_inputs(
             problem["hidden_states"],
             problem["topk_weights"],
@@ -342,6 +403,30 @@ def test_sm90_fp8_kernel_matches_drop_reference(monkeypatch, fp8_scale_mode, swa
             gate_up_clamp=problem["gate_up_clamp"],
             sync=True,
         )
+        compiled = symm_buffer._frontend._mega
+        assert compiled is not None and compiled.compiled is not None
+        assert compiled.launch_key is not None
+        assert compiled.launch_kwargs is not None
+        launch_key = compiled.launch_key
+        launch_kwargs = compiled.launch_kwargs
+
+        # The second launch must take the validated launch-cache fast path and
+        # reuse the same compiled object/workspaces without a host counter
+        # reset.  Byte-identical output makes stale tail counters observable.
+        y_repeat = torch.empty_like(y_kernel)
+        pkg.hopper_fp8_mega_moe(
+            y_repeat,
+            l1,
+            l2,
+            symm_buffer,
+            num_tokens=n,
+            gate_up_clamp=problem["gate_up_clamp"],
+            sync=True,
+        )
+        assert symm_buffer._frontend._mega is compiled
+        assert compiled.launch_key is launch_key
+        assert compiled.launch_kwargs is launch_kwargs
+        assert torch.equal(y_repeat, y_kernel)
 
         assert torch.isfinite(y_kernel).all()
         yk = y_kernel.to(torch.float32)
@@ -361,5 +446,61 @@ def test_sm90_fp8_kernel_matches_drop_reference(monkeypatch, fp8_scale_mode, swa
         # real numerical break either way.
         torch.testing.assert_close(yk, yr, atol=1e-2, rtol=1e-2)
         assert rel_l2.item() < 0.02
+
+        # Reuse this exact compiled session and symmetric workspace after an
+        # all-valid launch, but mask half of the routing slots.  The previous
+        # FC2 combine payload remains in those slots, so a reducer that does
+        # not honor topk_idx == -1 will deterministically consume stale data.
+        masked_topk_ids = problem["topk_ids"].clone()
+        masked_topk_ids[:, 1::2] = -1
+        assert (problem["topk_ids"] >= 0).all()
+        assert (masked_topk_ids < 0).any()
+        stage_mega_moe_inputs(
+            problem["hidden_states"],
+            problem["topk_weights"],
+            masked_topk_ids,
+            symm_buffer.x,
+            symm_buffer.x_sf,
+            symm_buffer.topk_idx,
+            symm_buffer.topk_weights,
+            kind="fp8_e4m3",
+            fp8_scale_mode=fp8_scale_mode,
+            fc1_activation_dequant_scale=s1,
+        )
+        assert torch.equal(symm_buffer.topk_idx[:n], masked_topk_ids)
+
+        y_masked_ref, masked_fc2_scale = _reference_reduced(
+            pkg,
+            problem=problem,
+            symm_buffer=symm_buffer,
+            l1=l1,
+            l2=l2,
+            fp8_scale_mode=fp8_scale_mode,
+            s1=s1,
+        )
+        if fp8_scale_mode == "per_tensor":
+            assert masked_fc2_scale is not None
+            # Preserve the scale pointer already captured by launch_kwargs;
+            # only its runtime value changes for the newly staged routing.
+            l2[2].copy_(masked_fc2_scale)
+
+        y_masked = torch.empty_like(y_kernel)
+        pkg.hopper_fp8_mega_moe(
+            y_masked,
+            l1,
+            l2,
+            symm_buffer,
+            num_tokens=n,
+            gate_up_clamp=problem["gate_up_clamp"],
+            sync=True,
+        )
+        assert symm_buffer._frontend._mega is compiled
+        assert compiled.launch_key is launch_key
+        assert compiled.launch_kwargs is launch_kwargs
+        assert torch.isfinite(y_masked).all()
+        ym = y_masked.to(torch.float32)
+        masked_rel_l2 = (ym - y_masked_ref).norm() / y_masked_ref.norm().clamp_min(1e-6)
+        torch.testing.assert_close(ym, y_masked_ref, atol=1e-2, rtol=1e-2)
+        assert masked_rel_l2.item() < 0.02
     finally:
         symm_buffer.destroy()

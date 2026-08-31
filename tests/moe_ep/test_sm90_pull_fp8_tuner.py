@@ -9,8 +9,10 @@ from __future__ import annotations
 import dataclasses
 import json
 import warnings
+from unittest import mock
 
 import pytest
+import torch
 
 
 def _pkg():
@@ -83,6 +85,12 @@ class TestIsValid:
         # 16 sweep geometries x {epi_warps, reuse_dispatch_warps}.
         assert len(cands) >= 30
         assert all(pkg.is_valid(c) for c in cands)
+        # standalone_warps is a correctness-supported explicit mode, but is
+        # intentionally outside the perf sweep until measured winners exist.
+        assert {c["token_back_mode"] for c in cands} == {
+            "epi_warps",
+            "reuse_dispatch_warps",
+        }
         # heuristic winner leads (ties keep the established default).
         assert cands[0] == pkg.default_knobs(2048, fp8_scale_mode=scale_mode)
         # deduplicated.
@@ -184,6 +192,39 @@ class TestKnobCache:
         assert source == "heuristic"
         assert knobs == pkg.default_knobs(4096, fp8_scale_mode="per_tensor")
 
+    def test_resolve_returns_recorded_cache_hit(self, tmp_path, monkeypatch):
+        pkg = _pkg()
+        monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "cache.json"))
+        knobs = pkg.default_knobs(2048, fp8_scale_mode="per_tensor")
+        assert pkg.record_knobs(knobs, **self._KEY, max_tokens=2048) is not None
+        got, source = pkg.resolve_knobs(**self._KEY, max_tokens=2048)
+        assert source == "cache"
+        assert got == knobs
+
+    def test_every_session_axis_isolated(self, tmp_path, monkeypatch):
+        pkg = _pkg()
+        monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "cache.json"))
+        knobs = pkg.default_knobs(2048, fp8_scale_mode="per_tensor")
+        assert (
+            pkg.record_knobs(knobs, **self._KEY, max_tokens=2048, device="test-gpu")
+            is not None
+        )
+        variants = [
+            {"dtype": "fp8_e5m2"},
+            {"fp8_scale_mode": "blockwise"},
+            {"world_size": 2},
+            {"hidden": self._KEY["hidden"] + 128},
+            {"intermediate": self._KEY["intermediate"] + 128},
+            {"num_experts": self._KEY["num_experts"] + 4},
+            {"topk": self._KEY["topk"] + 1},
+        ]
+        for changed in variants:
+            key = {**self._KEY, **changed}
+            assert pkg.lookup_knobs(**key, max_tokens=2048, device="test-gpu") is None
+        assert (
+            pkg.lookup_knobs(**self._KEY, max_tokens=2048, device="other-gpu") is None
+        )
+
     def test_disabled_cache(self, monkeypatch):
         pkg = _pkg()
         monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "off")
@@ -267,3 +308,175 @@ class TestShimAndBackendWiring:
                 dataclasses.replace(base, knobs="auto")
             )
         assert backend._autotune_pending
+
+    def test_frontend_compile_key_covers_regression_matrix_axes(self):
+        pkg = _pkg()
+        base = pkg.MegaMoEHopperFp8Config(
+            rank=0,
+            world_size=1,
+            num_tokens_per_rank=64,
+            num_topk=4,
+            num_total_experts=4,
+            hidden=1024,
+            intermediate=512,
+        )
+        variants = [
+            dataclasses.replace(base, fp8_scale_mode="blockwise"),
+            dataclasses.replace(base, fp8_accum_mode="2xacc"),
+            dataclasses.replace(base, swap_ab=True, mma_tiler_mnk=(256, 32, 128)),
+            dataclasses.replace(base, pingpong=True),
+            dataclasses.replace(base, cluster_shape_mnk=(2, 2, 1)),
+            dataclasses.replace(base, token_back_mode="standalone_warps"),
+            dataclasses.replace(base, in_kernel_fc2_reduce=True),
+            dataclasses.replace(base, load_balance_mode="atomic_counter"),
+        ]
+        baseline = pkg.MegaMoEHopperFp8Frontend(base)._mega_compile_key()
+        changed = [
+            pkg.MegaMoEHopperFp8Frontend(cfg)._mega_compile_key() for cfg in variants
+        ]
+        assert all(key != baseline for key in changed)
+        assert len(set(changed)) == len(changed)
+
+    def test_backend_workspace_pool_key_covers_regression_matrix_axes(self):
+        from flashinfer.moe_ep import (
+            FleetParams,
+            Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
+        )
+        from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.backend import (  # noqa: E501
+            Sm90PullFp8MegaKernelBackend,
+        )
+
+        base = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
+            intermediate_size=512,
+            top_k=4,
+        )
+        fleet = FleetParams(
+            num_experts=8,
+            max_tokens_per_rank=64,
+            token_hidden_size=1024,
+        )
+        group = object()
+
+        def pool_key(config, problem=fleet):
+            backend = Sm90PullFp8MegaKernelBackend(config)
+            backend._ep_bootstrap = object()
+            backend._ep_rank = 1
+            backend._ep_world_size = 4
+            backend._ep_comm_group = group
+            return backend._workspace_pool_key(problem)
+
+        config_variants = [
+            dataclasses.replace(base, kind="fp8_e5m2"),
+            dataclasses.replace(base, fp8_scale_mode="blockwise"),
+            dataclasses.replace(base, fp8_accum_mode="2xacc"),
+            dataclasses.replace(
+                base,
+                swap_ab=True,
+                pingpong=False,
+                mma_tiler_mnk=(256, 32, 128),
+                cluster_shape_mnk=(1, 1, 1),
+            ),
+            dataclasses.replace(
+                base,
+                swap_ab=False,
+                pingpong=True,
+                mma_tiler_mnk=(64, 128, 128),
+                cluster_shape_mnk=(2, 2, 1),
+            ),
+            dataclasses.replace(base, token_back_mode="standalone_warps"),
+            dataclasses.replace(base, in_kernel_fc2_reduce=True),
+            dataclasses.replace(base, load_balance_mode="atomic_counter"),
+            dataclasses.replace(base, knobs={"flag_batch": 4}),
+        ]
+        problem_variants = [
+            dataclasses.replace(fleet, num_experts=12),
+            dataclasses.replace(fleet, max_tokens_per_rank=128),
+            dataclasses.replace(fleet, token_hidden_size=1152),
+        ]
+        with mock.patch("torch.cuda.current_device", return_value=3):
+            baseline = pool_key(base)
+            changed = [pool_key(cfg) for cfg in config_variants]
+            changed.extend(pool_key(base, problem) for problem in problem_variants)
+        assert all(key != baseline for key in changed)
+        assert len(set(changed)) == len(changed)
+
+
+def test_backend_auto_uses_ep_singleton_group_inside_larger_global_job(
+    monkeypatch,
+):
+    from flashinfer.moe_ep import (
+        Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.backend import (
+        Sm90PullFp8MegaKernelBackend,
+    )
+
+    ep_singleton = object()
+    autotune = mock.Mock(return_value={"winner": True})
+    launch = mock.Mock(return_value=object())
+    pkg = _pkg()
+    monkeypatch.setattr(pkg, "autotune_hopper_fp8_mega_moe", autotune)
+    monkeypatch.setattr(pkg, "hopper_fp8_mega_moe", launch)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 4)
+    config = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
+        intermediate_size=128, top_k=2, knobs="auto"
+    )
+    with pytest.warns(UserWarning, match="COLLECTIVE"):
+        backend = Sm90PullFp8MegaKernelBackend(config)
+    backend._ep_bootstrap = object()
+    backend._ep_rank = 0
+    backend._ep_world_size = 1
+    backend._ep_comm_group = ep_singleton
+
+    output = torch.empty((3, 128), dtype=torch.bfloat16)
+    transformed = (object(), object())
+    assert backend.compute(object(), transformed, output=output) is output
+    autotune.assert_called_once()
+    assert autotune.call_args.kwargs["process_group"] is ep_singleton
+
+
+def test_backend_local_tune_one_propagates_nondefault_clamp_to_cache_and_record(
+    monkeypatch,
+):
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl import (
+        tuner as tuner_module,
+    )
+
+    pkg = _pkg()
+    symm_buffer = mock.Mock()
+    create_inputs = mock.Mock(return_value=("y", "l1", "l2", symm_buffer))
+    candidate = {"swap_ab": True, "mma_tiler_mnk": (128, 32, 128)}
+    enumerate_candidates = mock.Mock(return_value=[candidate])
+    resolve = mock.Mock(return_value=(candidate, "cache"))
+    schedule = mock.Mock(return_value=[candidate])
+    autotune = mock.Mock()
+    finish = mock.Mock(return_value={"winner": candidate})
+    monkeypatch.setattr(pkg, "create_dummy_hopper_fp8_inputs", create_inputs)
+    monkeypatch.setattr(pkg, "hopper_fp8_candidates", enumerate_candidates)
+    monkeypatch.setattr(pkg, "resolve_knobs", resolve)
+    monkeypatch.setattr(pkg, "autotune_hopper_fp8_mega_moe", autotune)
+    monkeypatch.setattr(tuner_module, "schedule_candidates", schedule)
+    monkeypatch.setattr(tuner_module, "finish_sweep", finish)
+    args = mock.Mock(
+        dtype="sm90_fp8_e4m3",
+        live_tokens=None,
+        num_experts=8,
+        topk=2,
+        hidden=128,
+        intermediate=128,
+        fp8_scale_mode="per_tensor",
+        gate_up_clamp=7.5,
+        seed=123,
+        sweep="schedule",
+        base_knobs=None,
+    )
+
+    assert tuner_module.tune_one(args, rank=0, world_size=4, max_tokens=64) == {
+        "winner": candidate
+    }
+    assert create_inputs.call_args.kwargs["gate_up_clamp"] == 7.5
+    assert resolve.call_args.kwargs["gate_up_clamp"] == 7.5
+    assert finish.call_args.kwargs["tune_kwargs"] == {"gate_up_clamp": 7.5}
+    schedule.assert_called_once_with(candidate)
+    symm_buffer.destroy.assert_called_once_with()
