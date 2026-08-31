@@ -54,6 +54,12 @@ if is_cute_dsl_available():
         add_rmsnorm_fp4quant,
         AddRMSNormFP4QuantKernel,
     )
+    from .dsa_compress_norm_rope import (
+        DSACompressKernel,
+        DSANormRopeStoreKernel,
+        dsa_compress_kv,
+        dsa_norm_rope_store,
+    )
 
     # Backwards-compatible re-exports from flashinfer.norm.kernels submodule
     from ..norm.kernels import (
@@ -99,6 +105,11 @@ if is_cute_dsl_available():
         # Add + RMSNorm + FP4 Quantization
         "add_rmsnorm_fp4quant",
         "AddRMSNormFP4QuantKernel",
+        # DeepSeek-style sparse KV cache compression
+        "dsa_compress_kv",
+        "dsa_norm_rope_store",
+        "DSACompressKernel",
+        "DSANormRopeStoreKernel",
         # Norm kernels (CuTe DSL) - backwards-compatible re-exports
         "RMSNormKernel",
         "QKRMSNormKernel",
