@@ -166,6 +166,16 @@ SMALL_BH_CASES = (
 )
 CASES = LEGACY_CASES + H12_CASES + SMALL_BH_CASES
 
+# Exact source groups used by the public comparison table:
+# https://github.com/flashinfer-ai/flashinfer/pull/4262
+# https://github.com/flashinfer-ai/flashinfer/pull/4445
+# https://github.com/flashinfer-ai/flashinfer/pull/4571
+WORKLOAD_SOURCE_GROUPS = {
+    "flashinfer_pr_4262": LEGACY_CASES,
+    "flashinfer_pr_4445": H12_CASES,
+    "flashinfer_pr_4571": SMALL_BH_CASES,
+}
+
 # This public, executable inventory is intentionally expressed with tuple
 # multiplication for the large uniform packed cases. It preserves every shape
 # without checking in megabytes of repeated JSON integers.
@@ -734,6 +744,13 @@ def _aggregate_speedups(values: list[float]) -> dict[str, float | int]:
     }
 
 
+def _workload_source(case: Case) -> str:
+    for source, source_cases in WORKLOAD_SOURCE_GROUPS.items():
+        if case in source_cases:
+            return source
+    return "production_portfolio"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run-iters", type=int, default=20)
@@ -897,7 +914,11 @@ def main() -> None:
                 candidate_route=args.candidate_route,
                 candidate_backend="cake",
             )
-        result = {**prepared.metadata, "hardware": hardware}
+        result = {
+            **prepared.metadata,
+            "hardware": hardware,
+            "workload_source": _workload_source(case),
+        }
         if sota_prepared is not None:
             for item in (sota_prepared, prepared):
                 item.reset_state_pools()
@@ -1092,7 +1113,31 @@ def main() -> None:
     if args.compare_to_sota:
         speedups = [result["speedup_vs_sota"] for result in results]
         aggregate = _aggregate_speedups(speedups)
-        results.append({"aggregate_speedups_vs_sota": aggregate})
+        source_aggregates = {
+            source: _aggregate_speedups(
+                [
+                    result["speedup_vs_sota"]
+                    for result in results
+                    if result["workload_source"] == source
+                ]
+            )
+            for source in dict.fromkeys(result["workload_source"] for result in results)
+        }
+        results.append(
+            {
+                "aggregate_speedups_vs_sota": aggregate,
+                "aggregate_speedups_vs_sota_by_workload_source": (source_aggregates),
+            }
+        )
+        for source, source_aggregate in source_aggregates.items():
+            print(
+                f"{source} ({source_aggregate['workloads']} workloads): "
+                f"arithmetic mean "
+                f"{source_aggregate['arithmetic_mean_speedup']:.4f}x, "
+                f"geometric mean "
+                f"{source_aggregate['geometric_mean_speedup']:.4f}x, minimum "
+                f"{source_aggregate['minimum_speedup']:.4f}x"
+            )
         print(
             f"all cases ({aggregate['workloads']} workloads): arithmetic mean "
             f"{aggregate['arithmetic_mean_speedup']:.4f}x, geometric mean "
