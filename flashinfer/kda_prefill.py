@@ -46,7 +46,11 @@ from .utils import get_compute_capability
 
 if TYPE_CHECKING:
     from .jit.cake_kda import CakeKDATarget, CakeKDAVariant
-    from .jit.flash_kda import FlashKDATarget, FlashKDAVariant
+    from .jit.flash_kda import (
+        FlashKDATarget,
+        FlashKDAVariant,
+        GeneratedFlashKDAModule,
+    )
 
 _FLASH_KDA_HEAD_DIM = 128
 _FLASH_KDA_DEFAULT_SCALE = _FLASH_KDA_HEAD_DIM**-0.5
@@ -261,8 +265,12 @@ class _GeneratedAffineModule:
 
     role: str
     selector_key: dict[str, object]
-    metadata: object
-    module: object
+    metadata: "GeneratedFlashKDAModule"
+    module: "_GeneratedAffineRuntimeModule"
+
+
+class _GeneratedAffineRuntimeModule(Protocol):
+    def run(self, *args: object) -> object: ...
 
 
 @dataclass(frozen=True)
@@ -414,7 +422,7 @@ def _observe_generated_affine_launches(
 def _generated_affine_module_for_launch(
     resolved: _GeneratedAffineModule,
     observer: Optional[_GeneratedAffineLaunchObserver],
-) -> object:
+) -> _GeneratedAffineRuntimeModule:
     """Record one exact physical launch immediately before returning its module."""
 
     if observer is not None:

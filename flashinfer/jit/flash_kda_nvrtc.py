@@ -7,7 +7,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping, cast
 
 from filelock import FileLock
 
@@ -41,17 +41,18 @@ def _sha256(payload: bytes) -> str:
 
 def _result_ok(result: object) -> bool:
     try:
-        return int(result) == 0
+        return int(cast(Any, result)) == 0
     except TypeError:
         return getattr(result, "value", result) == 0
 
 
 def _compile_log(nvrtc: object, program: object) -> str:
-    result, size = nvrtc.nvrtcGetProgramLogSize(program)
+    nvrtc_api = cast(Any, nvrtc)
+    result, size = nvrtc_api.nvrtcGetProgramLogSize(program)
     if not _result_ok(result) or size <= 1:
         return ""
     log = b"\0" * size
-    (result,) = nvrtc.nvrtcGetProgramLog(program, log)
+    (result,) = nvrtc_api.nvrtcGetProgramLog(program, log)
     if not _result_ok(result):
         return ""
     return log.decode(errors="replace").rstrip("\0")
