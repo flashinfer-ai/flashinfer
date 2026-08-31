@@ -1,0 +1,71 @@
+{
+  "arch": "sm_100a",
+  "compile_flags": [
+    "--use_fast_math"
+  ],
+  "constraints": {
+    "dtypes": [
+      "float16",
+      "bfloat16"
+    ],
+    "k": 8192,
+    "m_multiple": 128,
+    "n": 2048,
+    "world_sizes": [
+      2,
+      4
+    ]
+  },
+  "kernel_count": 8,
+  "kernel_symbols": [
+    "kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p0",
+    "kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p1",
+    "kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p0",
+    "kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p1",
+    "kernel_cake_blackwell_all_gather_matmul_float16_ws2",
+    "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2",
+    "kernel_cake_blackwell_all_gather_matmul_float16_ws4",
+    "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4"
+  ],
+  "launch": {
+    "barrier": {
+      "block_threads": 32,
+      "dynamic_smem_bytes": 0,
+      "grid": [
+        1,
+        1,
+        1
+      ]
+    },
+    "main": {
+      "block_threads": 192,
+      "dynamic_smem_bytes": 197632,
+      "grid_x": "(min(M, 2432) / 128) * 8"
+    }
+  },
+  "route_coverage": {
+    "ws2": {
+      "barrier": [
+        "kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p0",
+        "kernel_cake_blackwell_all_gather_matmul_barrier_ws2_p1"
+      ],
+      "main": {
+        "bfloat16": "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws2",
+        "float16": "kernel_cake_blackwell_all_gather_matmul_float16_ws2"
+      }
+    },
+    "ws4": {
+      "barrier": [
+        "kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p0",
+        "kernel_cake_blackwell_all_gather_matmul_barrier_ws4_p1"
+      ],
+      "main": {
+        "bfloat16": "kernel_cake_blackwell_all_gather_matmul_bfloat16_ws4",
+        "float16": "kernel_cake_blackwell_all_gather_matmul_float16_ws4"
+      }
+    }
+  },
+  "schema_version": 1,
+  "source_sha256": "b393d3730e845f6ae4eb642e76ac3486661ee2fd396c6830167c330457b641ab",
+  "tma_abi": "pointer"
+}

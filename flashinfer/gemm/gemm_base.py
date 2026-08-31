@@ -16,6 +16,7 @@ limitations under the License.
 
 import functools
 import logging
+import os
 import warnings
 from collections import defaultdict
 from dataclasses import astuple, replace
@@ -142,7 +143,49 @@ from ..utils import (
     get_compute_capability,
 )
 
-DEFAULT_WORKSPACE_SIZE = 32 * 1024 * 1024
+# cuDNN's cuBLASLt matmul engine (plan candidate 0) asks for a flat 32 MiB + 256 B
+# on SM90+ for every shape, so 32 MiB grew this buffer on the very first GEMM.
+DEFAULT_WORKSPACE_SIZE = 40 * 1024 * 1024
+
+
+class CudnnCaptureUnsafeError(RuntimeError):
+    """A cuDNN GEMM step that is unsafe under CUDA graph capture was reached.
+
+    The runners re-raise this base type instead of retrying with tactic=-1.
+    """
+
+
+class CudnnWorkspaceTooSmallInCaptureError(CudnnCaptureUnsafeError):
+    """The shared GEMM workspace was too small during CUDA graph capture."""
+
+
+def _gemm_workspace_at_least(workspace: torch.Tensor, size: int) -> torch.Tensor:
+    """Return a workspace of at least ``size`` bytes, never moving ``workspace``.
+
+    ``workspace`` is shared process-wide, including with already-captured graphs.
+    ``resize_()`` would free its storage and leave those graphs replaying against a
+    recycled pointer (#4549), so hand back a call-local buffer instead.
+    """
+    if workspace.numel() >= size:
+        return workspace
+
+    # A call-local buffer would come from the capturing graph's private pool.
+    if torch.cuda.is_current_stream_capturing():
+        raise CudnnWorkspaceTooSmallInCaptureError(
+            f"cuDNN needs a {size} byte GEMM workspace but the shared buffer is "
+            f"only {workspace.numel()} bytes, and growing or replacing it under "
+            f"CUDA graph capture is unsafe. Raise DEFAULT_WORKSPACE_SIZE above "
+            f"{size} and call this shape once eagerly before capturing, or use "
+            "another GEMM backend."
+        )
+
+    warnings.warn(
+        f"cuDNN asked for a {size} byte GEMM workspace, larger than the shared "
+        f"{workspace.numel()} byte buffer; falling back to a per-call allocation.",
+        stacklevel=2,
+    )
+    return torch.empty(size, dtype=torch.uint8, device=workspace.device)
+
 
 # sizeof(cublasLtMatmulAlgo_t) = uint64_t[8] = 64 bytes.
 # Shared by cuBLAS FP8, cuBLASLt BF16, and any other cuBLASLt-based runners.
@@ -345,9 +388,16 @@ def _cublaslt_mm_bf16_requirement(
     backend: Literal["cudnn", "cutlass", "tgv", "cublaslt", "auto"] = "cudnn",
 ):
     if bias is not None:
-        raise ValueError(
-            "You cannot use the cuBLASLt backend with a bias. Use the TGV backend instead."
-        )
+        if out_dtype != torch.bfloat16:
+            raise ValueError("cuBLASLt fused bias requires bfloat16 output.")
+        if bias.shape != (b.shape[1],):
+            raise ValueError(
+                f"cuBLASLt bias must have shape {(b.shape[1],)}, got {bias.shape}."
+            )
+        if bias.device != a.device:
+            raise ValueError("cuBLASLt bias must be on the same CUDA device as A.")
+        if not bias.is_contiguous():
+            raise ValueError("cuBLASLt bias must be contiguous.")
     if pdl:
         raise ValueError(
             "The cuBLASLt backend does not support PDL. Use the TGV backend instead."
@@ -447,6 +497,10 @@ def _cute_dsl_mm_bf16_requirement(
     ):
         raise ValueError(
             f"Bias must be contiguous on A's device with shape {(b.shape[1],)}."
+        )
+    if a.shape[0] > 32:
+        return _cublaslt_mm_bf16_requirement(
+            a, b, out, out_dtype, bias, False, "cublaslt"
         )
 
     from flashinfer.cute_dsl.utils import is_cute_dsl_available
@@ -583,6 +637,8 @@ def _heuristic_func_mm_bf16(
             heuristic_backends.append("tgv")
         if "cudnn" in suitable_backends:
             heuristic_backends.append("cudnn")
+        if bias is not None and not pdl and "cublaslt" in suitable_backends:
+            heuristic_backends.append("cublaslt")
     else:
         if "cutlass" in suitable_backends:
             heuristic_backends.append("cutlass")
@@ -643,11 +699,13 @@ def mm_bf16(
 
     bias: Optional[torch.Tensor]
         Optional bias tensor, shape (n,). Enabled for TGV, TinyGEMM, and
-        CuTeDSL backends. Defaults to ``None``.
+        CuTeDSL backends; cuBLASLt supports bias with BF16 output. Defaults to
+        ``None``.
 
     pdl: bool
         Whether to use Programmatic Dependent Launch. Enabled for TGV,
-        TinyGEMM, and CuTeDSL backends. Defaults to ``False``.
+        TinyGEMM, and CuTeDSL backends. The CuTeDSL M > 32 fallback ignores
+        PDL because cuBLASLt does not expose it. Defaults to ``False``.
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16, fp16, or fp32. FP16 and FP32 output are enabled
@@ -663,14 +721,16 @@ def mm_bf16(
         ``"cudnn"`` uses the cuDNN backend.
         ``"cutlass"`` uses the CUTLASS backend.
         ``"tgv"`` uses the TGV backend.
-        ``"cublaslt"`` uses the cuBLASLt backend with heuristic algorithm search.
+        ``"cublaslt"`` uses the cuBLASLt backend with heuristic algorithm
+        search and an optional fused BF16 bias epilogue for BF16 output.
         ``"tinygemm"`` uses the TinyGEMM backend for small-M BF16 GEMM.
         ``"cutile"`` uses the cuTile (cuda.tile Python) backend. Pure-Python
             persistent-scheduled GEMM with per-shape exhaustive autotune; ignores
             ``bias`` / ``pdl``. Requires SM >= 90.
         ``"cute-dsl"`` uses standalone Blackwell low-M direct and split-K
-        kernels for M <= 32. It is never auto-selected; serving frameworks
-        must select it explicitly. Without autotuning, a measured shape
+        kernels for M <= 32 and falls back to cuBLASLt for larger M. It is
+        never auto-selected; serving frameworks must select it explicitly.
+        Without autotuning, a measured shape
         heuristic chooses between the algorithms. With autotuning, both tactic
         spaces are profiled when bias is disabled; bias uses split-K only.
         ``"auto"`` allows selecting the best tactic from all available backends when autotune is enabled.
@@ -750,14 +810,16 @@ def mm_bf16(
         )
     elif backend == "cublaslt":
         backends = _heuristic_func_mm_bf16(
-            ["cublaslt"], a, b, None, False, out, out_dtype, backend
+            ["cublaslt"], a, b, bias, pdl, out, out_dtype, backend
         )
     elif backend == "tinygemm":
         backends = _heuristic_func_mm_bf16(
             ["tinygemm"], a, b, bias, pdl, out, out_dtype, backend
         )
     elif backend == "cute-dsl":
-        backends = ["cute-dsl"]
+        # The low-M kernels cap M at 32. Use cuBLASLt above that range;
+        # pdl is intentionally ignored because cuBLASLt has no PDL API.
+        backends = ["cute-dsl"] if a.shape[0] <= 32 else ["cublaslt"]
     else:
         backends = [backend]
 
@@ -1275,13 +1337,21 @@ def get_mm_bf16_cublaslt_module():
                 self._algo_cache: dict = {}
 
             def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
-                a, b, _, _, out, _ = inputs
+                a, b, bias, _, out, _ = inputs
                 return (
                     a.shape[0],
                     b.shape[1],
                     a.shape[1],
                     self._compute_dtype(out.dtype),
+                    self._pointer_alignment(bias),
                 )
+
+            @staticmethod
+            def _pointer_alignment(tensor):
+                if tensor is None:
+                    return 0
+                address = tensor.data_ptr()
+                return min(address & -address, 256)
 
             @staticmethod
             def _compute_dtype(out_dtype):
@@ -1293,7 +1363,7 @@ def get_mm_bf16_cublaslt_module():
                 return out_dtype
 
             def _get_algos(self, inputs):
-                a, b, _, _, out, workspace_buffer = inputs
+                a, b, bias, _, out, workspace_buffer = inputs
                 compute_dt = self._compute_dtype(out.dtype)
                 key = self.get_cache_key_extras(inputs)
                 cached = self._algo_cache.get(key)
@@ -1314,6 +1384,7 @@ def get_mm_bf16_cublaslt_module():
                 count = module.mm_bf16_cublaslt_get_algos(
                     a,
                     b.transpose(-2, -1),
+                    bias,
                     proxy_out,
                     workspace_buffer,
                     cublas_handle,
@@ -1338,7 +1409,7 @@ def get_mm_bf16_cublaslt_module():
                 do_preparation: bool = False,
                 **kwargs,
             ) -> torch.Tensor:
-                a, b, _, _, out, workspace_buffer = inputs
+                a, b, bias, _, out, workspace_buffer = inputs
                 with torch.cuda.device(a.device):
                     cublas_handle = torch.cuda.current_blas_handle()
                 b_t = b.transpose(-2, -1)
@@ -1369,6 +1440,7 @@ def get_mm_bf16_cublaslt_module():
                 module.mm_bf16_cublaslt_run_with_algo(
                     a,
                     b_t,
+                    bias,
                     compute_out,
                     workspace_buffer,
                     cublas_handle,
@@ -2825,9 +2897,40 @@ def _get_cudnn_plan_index_for_tactic(graph, tactic) -> int:
     return plan_index
 
 
+_ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE = (
+    os.environ.get("FLASHINFER_ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE", "0") == "1"
+)
+
+
+class CudnnPlanBuildInCaptureError(CudnnCaptureUnsafeError):
+    """A cuDNN execution plan was about to be built during CUDA graph capture."""
+
+
+def _check_cudnn_plan_build_not_capturing(what: str) -> None:
+    """Refuse to build a cuDNN execution plan while capturing a CUDA graph."""
+    if not torch.cuda.is_current_stream_capturing():
+        return
+
+    message = (
+        f"Building a cuDNN {what} execution plan while the current stream is "
+        "capturing a CUDA graph. cuDNN does its one-time host-side setup here "
+        "(kernel module load, NVRTC compilation, the first cublasLtCreate()), "
+        "which cuDNN itself documents as unsafe under capture. Run this shape "
+        "once outside the capture region to warm it up first; FlashInfer caches "
+        "the plan per shape, so the captured call will then reuse it. Set "
+        "FLASHINFER_ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE=1 to downgrade this to a "
+        "warning."
+    )
+    if _ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE:
+        warnings.warn(message, stacklevel=3)
+        return
+    raise CudnnPlanBuildInCaptureError(message)
+
+
 def _finalize_cudnn_graph_for_tactic(
     graph, tactic, heur_modes, deselect_eng0: bool = False
 ) -> None:
+    _check_cudnn_plan_build_not_capturing("GEMM")
     graph.validate()
     graph.build_operation_graph()
 
@@ -3089,8 +3192,7 @@ def execute_cudnn_gemm_fp4_graph(
     plan_index = _get_cudnn_plan_index_for_tactic(graph, tactic)
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
-    if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+    workspace_buffer = _gemm_workspace_at_least(workspace_buffer, workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
 
@@ -3324,8 +3426,7 @@ def execute_cudnn_gemm_fp4_graph_override_shape(
         override_shapes,
         override_strides,
     )
-    if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+    workspace = _gemm_workspace_at_least(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(
@@ -3408,8 +3509,7 @@ def execute_cudnn_gemm_mxfp8_graph(
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
 
-    if workspace_buffer.numel() < workspace_size:
-        workspace_buffer.resize_(workspace_size)
+    workspace_buffer = _gemm_workspace_at_least(workspace_buffer, workspace_size)
 
     stream = torch.cuda.current_stream(a.device)
 
@@ -3631,8 +3731,7 @@ def execute_cudnn_gemm_mxfp8_graph_override_shape(
         override_shapes,
         override_strides,
     )
-    if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+    workspace = _gemm_workspace_at_least(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(
@@ -3750,8 +3849,7 @@ def execute_cudnn_gemm_fp8_graph(
     plan_index = _get_cudnn_plan_index_for_tactic(graph, tactic)
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
-    if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+    workspace = _gemm_workspace_at_least(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(variant_pack, workspace, handle=cudnn_handle)
@@ -3889,8 +3987,7 @@ def execute_cudnn_gemm_fp8_graph_override_shape(
         override_shapes,
         override_strides,
     )
-    if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+    workspace = _gemm_workspace_at_least(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(
@@ -4055,6 +4152,8 @@ def _cudnn_gemm_fp8_runner():
                         out.dtype,
                         tactic=tactic,
                     )
+            except CudnnCaptureUnsafeError:
+                raise
             except Exception as exc:
                 warnings.warn(
                     "cuDNN fp8 GEMM tactic failed; falling back to default "
@@ -4184,8 +4283,7 @@ def execute_cudnn_gemm_bf16_graph(graph, a, b, bias, c_final, workspace, tactic=
     plan_index = _get_cudnn_plan_index_for_tactic(graph, tactic)
 
     workspace_size = _get_cudnn_workspace_size(graph, plan_index)
-    if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+    workspace = _gemm_workspace_at_least(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(variant_pack, workspace, handle=cudnn_handle)
@@ -4360,8 +4458,7 @@ def execute_cudnn_gemm_bf16_graph_override_shape(
         override_shapes,
         override_strides,
     )
-    if workspace.numel() < workspace_size:
-        workspace.resize_(workspace_size)
+    workspace = _gemm_workspace_at_least(workspace, workspace_size)
 
     if plan_index < 0:
         graph.execute(
@@ -4571,6 +4668,8 @@ def _cudnn_gemm_bf16_runner(
                     )
                 else:
                     _cudnn_gemm_bf16(workspace_buffer, a, b, bias, out, tactic=tactic)
+            except CudnnCaptureUnsafeError:
+                raise
             except Exception as exc:
                 warnings.warn(
                     "cuDNN bf16 GEMM tactic failed; falling back to default "
@@ -5038,6 +5137,7 @@ def _cute_dsl_gemm_mxfp8_requirement(
             "cute_dsl mm_mxfp8 requires swizzled 1D scale tensors for a_descale and b_descale."
         )
     _check_cute_dsl_availability()
+    _check_cute_dsl_arch(a.device)
     return True
 
 
@@ -5150,6 +5250,31 @@ def _get_sm100_block_scaled_tactics(
 
 
 _CUTE_DSL_MM_MXFP8_KERNEL_CACHE: dict[tuple, tuple] = {}
+
+
+def _check_cute_dsl_arch(device: torch.device) -> None:
+    """Reject the CuTe-DSL backend when the installed DSL cannot emit for ``device``.
+
+    Availability, not capability: the kernels exist for sm_107, so the static
+    ``@supported_compute_capability`` list rightly still contains it. What
+    varies is whether the installed DSL can generate code for that arch. Same
+    axis as ``CUDNN_AVAILABLE`` / ``_is_cudnn_override_shape_available``.
+
+    Delegates to :func:`require_cute_dsl_arch`, which owns the predicate and the
+    message (including the exact ``CUTE_DSL_ARCH`` value to export). Only the
+    exception type is adapted: ``suitable_auto_backends`` treats ``ValueError``
+    as "backend not suitable" and keeps searching, whereas the
+    ``NotImplementedError`` it raises would propagate and fail the call.
+    """
+    try:
+        from flashinfer.cute_dsl.utils import require_cute_dsl_arch
+    except Exception:
+        # Probe unavailable; never deselect an otherwise working backend.
+        return
+    try:
+        require_cute_dsl_arch(device)
+    except NotImplementedError as err:
+        raise ValueError(str(err)) from err
 
 
 def _check_cute_dsl_availability():
@@ -5496,6 +5621,8 @@ def _cudnn_mm_mxfp8_runner():
                         workspace_buffer=workspace_buffer,
                         tactic=tactic,
                     )
+            except CudnnCaptureUnsafeError:
+                raise
             except Exception as exc:
                 warnings.warn(
                     "cuDNN mxfp8 GEMM tactic failed; falling back to default "
@@ -5970,6 +6097,8 @@ def _cudnn_gemm_fp4_runner(tuning_config):
                         workspace_buffer,
                         tactic=tactic,
                     )
+            except CudnnCaptureUnsafeError:
+                raise
             except Exception as exc:
                 warnings.warn(
                     "cuDNN fp4 GEMM tactic failed; falling back to default "
@@ -6178,6 +6307,7 @@ def _cute_dsl_gemm_fp4_requirement(
             return False
         raise ValueError(f"CuTe-DSL FP4 GEMM requires N % 8 == 0, got n={b.shape[1]}")
     _check_cute_dsl_availability()
+    _check_cute_dsl_arch(a.device)
     return True
 
 
@@ -7281,6 +7411,7 @@ def _cute_dsl_bmm_fp8_requirement(
         raise ValueError(
             "CuTe-DSL is not available. Please install cutlass with cute support."
         )
+    _check_cute_dsl_arch(A.device)
 
     # Check dimensions are 3D (batch, m, k) and (batch, k, n)
     if A.dim() != 3 or B.dim() != 3:
@@ -9588,6 +9719,8 @@ def _cudnn_gemm_mxfp8_runner():
                         workspace_buffer=workspace_buffer,
                         tactic=tactic,
                     )
+            except CudnnCaptureUnsafeError:
+                raise
             except Exception as exc:
                 warnings.warn(
                     "cuDNN mxfp8 GEMM tactic failed; falling back to default "

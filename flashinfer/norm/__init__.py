@@ -389,6 +389,76 @@ def _fused_add_rmsnorm_quant_fake(
     pass
 
 
+@flashinfer_api
+@register_custom_op(
+    "flashinfer::fused_add_rmsnorm_fp8_block_quant",
+    mutates_args=("out", "block_scale", "normed_out", "residual"),
+)
+def fused_add_rmsnorm_fp8_block_quant(
+    out: torch.Tensor,
+    block_scale: torch.Tensor,
+    normed_out: torch.Tensor,
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    enable_pdl: Optional[bool] = None,
+) -> None:
+    r"""Fused add-residual + RMSNorm + 1x128 fp8 block quantization, in one pass.
+
+    Replaces the two-kernel producer (:func:`fused_add_rmsnorm` then a per-token-group 1x128 fp8
+    quant) used before fp8 block-scaled GEMMs. Unlike :func:`fused_add_rmsnorm_quant` (scalar
+    per-tensor scale) this emits a **dynamic per-1x128-block** fp32 scale in the column-major
+    TMA-aligned layout that :mod:`flashinfer.deep_gemm` consumes.
+
+    Step 1: ``residual = input + residual`` (pre-norm, written in place).
+    Step 2: ``normed = RMSNorm(residual) * weight`` (bf16, written to ``normed_out``).
+    Step 3: ``out, block_scale = quant_1x128_fp8(normed)`` (fp8 from the bf16-rounded normed, so
+    ``out`` matches re-quantizing ``normed_out``).
+
+    Parameters
+    ----------
+    out : torch.Tensor
+        fp8 output, shape ``(batch_size, hidden_size)``, dtype float8_e4m3fn (the activation
+        dtype the fp8 block-scaled GEMMs consume).
+    block_scale : torch.Tensor
+        fp32 block scales, shape ``(hidden_size // 128, round_up(batch_size, 4))``, contiguous.
+        This is the column-major (MN-major, TMA-aligned) buffer deep_gemm expects: the logical
+        ``(batch_size, hidden_size // 128)`` scale is ``block_scale.transpose(0, 1)[:batch_size]``.
+    normed_out : torch.Tensor
+        bf16/fp16 normed output, shape ``(batch_size, hidden_size)`` (for consumers that need the
+        pre-quant activation, e.g. an MoE router).
+    input, residual : torch.Tensor
+        Shape ``(batch_size, hidden_size)``. ``residual`` is updated in place with ``input+residual``.
+    weight : torch.Tensor
+        RMSNorm weight, shape ``(hidden_size,)``. ``hidden_size`` must be a multiple of 128
+        (and of 256 for hidden_size<=8192, 512 for 8192<hidden_size<=16384).
+    eps : float
+        Epsilon for numerical stability.
+    enable_pdl : bool
+        Whether to enable programmatic dependent launch.
+    """
+    if enable_pdl is None or enable_pdl:
+        enable_pdl = device_support_pdl(input.device)
+    get_norm_module().fused_add_rmsnorm_fp8_block_quant(
+        out, block_scale, normed_out, input, residual, weight, eps, enable_pdl
+    )
+
+
+@register_fake_op("flashinfer::fused_add_rmsnorm_fp8_block_quant")
+def _fused_add_rmsnorm_fp8_block_quant_fake(
+    out: torch.Tensor,
+    block_scale: torch.Tensor,
+    normed_out: torch.Tensor,
+    input: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+    enable_pdl: Optional[bool] = None,
+) -> None:
+    pass
+
+
 @flashinfer_api(trace=gemma_rmsnorm_trace)
 def gemma_rmsnorm(
     input: torch.Tensor,

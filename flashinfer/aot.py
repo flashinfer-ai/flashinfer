@@ -41,8 +41,6 @@ from .jit.attention import (
     gen_batch_prefill_module,
     gen_cudnn_fmha_module,
     gen_fmha_cutlass_sm100a_module,
-    gen_single_decode_module,
-    gen_single_prefill_module,
     gen_trtllm_gen_fmha_module,
     gen_trtllm_fmha_v2_sm120_module,
 )
@@ -82,6 +80,7 @@ from .jit.flash_kda import (
     gen_flash_kda_m128_n16_checkpoint_module,
     gen_flash_kda_m128_n16_module,
     gen_flash_kda_m128_n16_short_module,
+    gen_flash_kda_piece_persistent_m128_module,
     gen_flash_kda_persistent_m128_module,
     gen_flash_kda_small_bh_m128_module,
 )
@@ -111,6 +110,11 @@ from .jit.fused_moe import (
     gen_trtllm_gen_routing_module,
 )
 from .jit.bgmv_moe import gen_bgmv_moe_module
+from .jit.blackwell_bgmv_moe import (
+    BLACKWELL_BGMV_MOE_DTYPES,
+    BLACKWELL_BGMV_MOE_HIDDEN_SIZES,
+    gen_blackwell_bgmv_moe_module,
+)
 from .jit.monomoe import gen_monomoe_module
 from .jit.cute_sm120_mxfp8_groupwise import gen_gemm_sm120_module_cute_mxfp8
 from .jit.gemm import (
@@ -172,19 +176,6 @@ def gen_fa2(
     if dtype_qo.itemsize == 1:
         return  # fp8 tensor cores not supported in fa2
 
-    yield gen_single_prefill_module(
-        backend="fa2",
-        dtype_q=dtype_qo,
-        dtype_kv=dtype_kv,
-        dtype_o=dtype_qo,
-        head_dim_qk=head_dim_qk,
-        head_dim_vo=head_dim_vo,
-        pos_encoding_mode=0,
-        use_sliding_window=use_sliding_window,
-        use_logits_soft_cap=use_logits_soft_cap,
-        use_fp16_qk_reduction=False,
-    )
-
     yield gen_batch_prefill_module(
         backend="fa2",
         dtype_q=dtype_qo,
@@ -200,17 +191,6 @@ def gen_fa2(
     )
 
     if not prefill_only:
-        yield gen_single_decode_module(
-            dtype_q=dtype_qo,
-            dtype_kv=dtype_kv,
-            dtype_o=dtype_qo,
-            head_dim_qk=head_dim_qk,
-            head_dim_vo=head_dim_vo,
-            pos_encoding_mode=0,
-            use_sliding_window=use_sliding_window,
-            use_logits_soft_cap=use_logits_soft_cap,
-        )
-
         yield gen_batch_decode_module(
             dtype_q=dtype_qo,
             dtype_kv=dtype_kv,
@@ -619,6 +599,7 @@ def gen_all_modules(
                     gen_flash_kda_m128_n16_module(flash_kda_target),
                     gen_flash_kda_m128_n16_checkpoint_module(flash_kda_target),
                     gen_flash_kda_m128_n16_short_module(flash_kda_target),
+                    gen_flash_kda_piece_persistent_m128_module(flash_kda_target),
                     gen_flash_kda_small_bh_m128_module(flash_kda_target),
                     gen_flash_kda_bt16_prepare_module(flash_kda_target),
                     gen_flash_kda_bt16_prepare_beta_tma_module(flash_kda_target),
@@ -695,6 +676,12 @@ def gen_all_modules(
         jit_specs.append(gen_gemm_module())
         # Multi-LoRA MoE BGMV kernel
         jit_specs.append(gen_bgmv_moe_module())
+        if sm_capabilities.get("sm100a_exact", False):
+            jit_specs.extend(
+                gen_blackwell_bgmv_moe_module(hidden_size, dtype)
+                for hidden_size in BLACKWELL_BGMV_MOE_HIDDEN_SIZES
+                for dtype in BLACKWELL_BGMV_MOE_DTYPES
+            )
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
         if has_sm90:
