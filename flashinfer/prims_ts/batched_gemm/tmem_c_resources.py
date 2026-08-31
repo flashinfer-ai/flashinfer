@@ -87,6 +87,29 @@ def _mx_dtype_from_format(format_id: int) -> type:
     raise ValueError(f"Unsupported MX MMA dtype format: {format_id}")
 
 
+def _build_nvfp4_instr_desc(*, n_dim: int, m_dim: int):
+    """Build an SM100 ``kind::mxf4nvf4`` instruction descriptor.
+
+    ``Tcgen05MxInstrDesc.build`` currently applies the ``kind::mxf8f6f4``
+    input-format table, where E2M1 is encoded as 5.  Packed E2M1 used by
+    ``kind::mxf4nvf4`` has a distinct encoding of 1, so replace only the A/B
+    format fields while retaining the builder's remaining validation and
+    bitfield packing.
+    """
+    desc = prims.Tcgen05MxInstrDesc.build(
+        a_dtype=cutlass.Float4E2M1FN,
+        b_dtype=cutlass.Float4E2M1FN,
+        scale_format=0,  # UE4M3
+        n_dim=n_dim,
+        m_dim=m_dim,
+    )
+    input_format_mask = (0x7 << 7) | (0x7 << 10)
+    mxf4_e2m1_formats = (0x1 << 7) | (0x1 << 10)
+    return prims.Tcgen05MxInstrDesc(
+        (desc & Int32(~input_format_mask)) | Int32(mxf4_e2m1_formats)
+    )
+
+
 @dataclass(kw_only=True)
 class TmemCResource(MemoryResource):
     """TMEM accumulator written by MMA and read by epilogue T2R.
@@ -259,10 +282,7 @@ class TmemCResource(MemoryResource):
             # FP4 NVF4: block-scaled MMA descriptor (tcgen05_mma_block_scale
             # MXF4NVF4). NVF4 uses E4M3 scale factors (scale_format=0, UE4M3);
             # MXF4 (OCP MX) would use E8M0 (scale_format=1).
-            self.idesc = prims.Tcgen05MxInstrDesc.build(
-                a_dtype=cutlass.Float4E2M1FN,
-                b_dtype=cutlass.Float4E2M1FN,
-                scale_format=0,  # UE4M3
+            self.idesc = _build_nvfp4_instr_desc(
                 n_dim=self.cfg.mma_n,
                 m_dim=self.cfg.mma_m,
             )

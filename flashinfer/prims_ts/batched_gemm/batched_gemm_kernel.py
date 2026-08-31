@@ -146,6 +146,37 @@ def _pdl_wait_completed_before_tasks(cfg: BatchedGemmConfig) -> bool:
     return bool(cfg.do_pdl_wait_for_num_non_exiting_ctas)
 
 
+def _register_pipeline_smem_resources(smem_allocator, *resources) -> None:
+    """Register SMEM barriers owned by resources whose data lives elsewhere.
+
+    TMEM and virtual barrier resources have no SMEM data requirements, but their
+    TaskManager pipelines still allocate two 8-byte mbarriers per stage.  They
+    must therefore be registered with the SMEM allocator as well as with their
+    data allocator so the unified allocation and capacity report include those
+    barriers.
+    """
+    for resource in resources:
+        if resource is not None:
+            smem_allocator.add_resource(resource)
+
+
+def _make_tmem_ptr_smem_allocation() -> SmemAllocation:
+    """Create the typed TMEM-pointer slot with explicit barrier alignment.
+
+    Only the first four bytes hold the Int32 TMEM pointer.  The unified SMEM
+    allocator starts its mbarrier region at the next 8-byte boundary, so reserve
+    that padding explicitly.  This keeps TaskManager's reported data size equal
+    to the number of data bytes actually allocated before the barriers.
+    """
+    return SmemAllocation(
+        "tmem_ptr_i32",
+        size_bytes=8,
+        dtype=cutlass.Int32,
+        count=1,
+        alignment=8,
+    )
+
+
 class _ProductionTaskManager(TaskManager):
     def print_and_verify(self) -> None:
         return None
@@ -1264,6 +1295,16 @@ def _build_schedule_validate(cfg, num_k_tiles=4):
     smem_resources = smem_resources + (gmem_c,)
     for r in smem_resources:
         smem_allocator.add_resource(r)
+    _register_pipeline_smem_resources(
+        smem_allocator,
+        tmem_c,
+        tmem_cast_a,
+        tmem_sfa,
+        tmem_sfb,
+        tmem_sfab,
+        proxy_cluster,
+        work_throttle,
+    )
     if cutlass.const_expr(cfg.aliases_c_scratch_with_ab):
         # Alias SmemA/B with GmemC scratch to save SMEM when the generated
         # schedule does not require a disjoint epilogue staging window.
@@ -1827,6 +1868,11 @@ def _batched_gemm_kernel_bf16_body(
             name="WorkThrottle",
         )
 
+    # ProxyCluster is constructed with the tasks below. Initialize the local
+    # before building the allocator, then register its pipeline barriers once
+    # the resource exists.
+    proxy_cluster = None
+
     # SMEM allocator
     smem_allocator = SmemAllocator()
     smem_resources: tuple[Any, ...] = (smem_a, smem_b)
@@ -1841,6 +1887,15 @@ def _batched_gemm_kernel_bf16_body(
     smem_resources = smem_resources + (gmem_c,)
     for r in smem_resources:
         smem_allocator.add_resource(r)
+    _register_pipeline_smem_resources(
+        smem_allocator,
+        tmem_c,
+        tmem_cast_a,
+        tmem_sfa,
+        tmem_sfb,
+        tmem_sfab,
+        work_throttle,
+    )
     if cutlass.const_expr(cfg.aliases_c_scratch_with_ab):
         alloc_a = smem_a._alloc if hasattr(smem_a, "_alloc") else smem_a._alloc_a
         alloc_b = smem_b._alloc if hasattr(smem_b, "_alloc") else smem_b._alloc_b
@@ -1851,7 +1906,7 @@ def _batched_gemm_kernel_bf16_body(
             ]
         )
     tmem_ptr_alloc = smem_allocator.add_tmem_ptr(
-        SmemAllocation("tmem_ptr_i32", dtype=cutlass.Int32, alignment=4)
+        _make_tmem_ptr_smem_allocation()
     )
     tmem_dealloc_mbar_alloc = None
     if cutlass.const_expr(cfg.has_cluster):
@@ -1887,7 +1942,6 @@ def _batched_gemm_kernel_bf16_body(
     )
 
     # Tasks
-    proxy_cluster = None
     if cutlass.const_expr(cfg.has_gather):
         if cutlass.const_expr(cfg.is_swap_ab):
             if cutlass.const_expr(cfg.fuse_operand_sf_loads):
@@ -1962,6 +2016,8 @@ def _batched_gemm_kernel_bf16_body(
                 pipeline_config=pcfgs.get("proxy"),
                 name="ProxyCluster",
             )
+            smem_allocator.add_resource(proxy_cluster)
+            smem_allocator.compute_layout()
             sync = create_sync_task(
                 cfg,
                 proxy_cluster,

@@ -64,6 +64,125 @@ def _fused_operand_sf_config(**overrides):
     return cfg
 
 
+def test_nvfp4_instruction_descriptor_uses_mxf4_element_encoding():
+    from cutlass.experimental import primitives as prims
+
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        MX_MMA_FORMAT_E2M1,
+    )
+    from flashinfer.prims_ts.batched_gemm.tmem_c_resources import (
+        _build_nvfp4_instr_desc,
+        _mx_dtype_from_format,
+    )
+
+    nvfp4_desc = _build_nvfp4_instr_desc(n_dim=256, m_dim=256)
+    assert int(nvfp4_desc.a_format) == 1
+    assert int(nvfp4_desc.b_format) == 1
+    assert int(nvfp4_desc) & 0xFFFFFFFF == 0x10400480
+
+    # OCP MXFP4 uses kind::mxf8f6f4, whose E2M1 encoding remains 5.
+    mx_e2m1 = _mx_dtype_from_format(MX_MMA_FORMAT_E2M1)
+    mx_desc = prims.Tcgen05MxInstrDesc.build(
+        a_dtype=mx_e2m1,
+        b_dtype=mx_e2m1,
+        scale_format=1,
+        n_dim=256,
+        m_dim=256,
+    )
+    assert int(mx_desc.a_format) == 5
+    assert int(mx_desc.b_format) == 5
+
+
+@pytest.mark.timeout(180)
+def test_trtllm_equiv_task_manager_smem_matches_kernel_allocation():
+    """Cover the configuration in run_prims_ts_fp4_fc2_trtllm_equiv.sh."""
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+        BatchMode,
+        BiasType,
+        DType,
+        SfLayout,
+        TileScheduler,
+        make_config,
+    )
+    from flashinfer.prims_ts.batched_gemm.batched_gemm_kernel import (
+        _build_schedule_validate,
+        _make_tmem_ptr_smem_allocation,
+    )
+
+    cfg = make_config(
+        route_act=0,
+        act_kind=0,
+        dtype_a=int(DType.E2M1),
+        dtype_b=int(DType.E2M1),
+        dtype_c=int(DType.BF16),
+        sf_layout_a=int(SfLayout.R128c4),
+        sf_layout_b=int(SfLayout.R128c4),
+        sf_layout_c=int(SfLayout.R128c4),
+        cluster_m=2,
+        tile_m=128,
+        tile_n=256,
+        tile_k=256,
+        mma_m=256,
+        mma_n=256,
+        mma_k=64,
+        epi_tile_n=64,
+        tile_scheduler=int(TileScheduler.PERSISTENT),
+        batch_mode=int(BatchMode.BATCH_M),
+        transpose_mma_output=0,
+        num_stages_a=5,
+        num_stages_b=5,
+        num_stages_smem_sfa=6,
+        num_stages_smem_sfb=6,
+        num_stages_tmem_acc=1,
+        num_stages_tmem_sfa=5,
+        num_stages_tmem_sfb=1,
+        num_stages_c_smem=1,
+        use_tma_oob_opt=1,
+        use_tma_store=1,
+        use_unroll_loop_2x_for_mma=0,
+        use_max_tmem_overlap=1,
+        use_early_exit=1,
+        use_pdl=0,
+        use_per_token_sf_b=0,
+        per_token_sf_dtype=int(DType.FP32),
+        bias_type=int(BiasType.NONE),
+        epilogue_regs=176,
+        mma_regs=80,
+        load_regs=80,
+        load_sf_regs=80,
+        copy_sf_regs=80,
+        workid_regs=80,
+        padding_regs=80,
+    )
+    _, _, smem_allocator, _ = _build_schedule_validate(cfg, num_k_tiles=16)
+
+    assert smem_allocator.total_smem_bytes == 217088
+    assert smem_allocator.barrier_smem_bytes == 368
+    assert [
+        (r.name, r.pipeline_config.num_stages)
+        for r in smem_allocator._barrier_resources
+    ] == [
+        ("SmemA", 5),
+        ("SmemB", 5),
+        ("SmemSfA", 6),
+        ("SmemSfB", 6),
+        ("TmemC", 1),
+    ]
+
+    tmem_ptr = _make_tmem_ptr_smem_allocation()
+    assert (tmem_ptr.size_bytes, tmem_ptr.alignment, tmem_ptr.count) == (8, 8, 1)
+
+    # GPU assembly adds the aligned TMEM pointer, the cluster deallocation
+    # mbarrier, the CLC response, and two 3-stage scheduler barrier pairs.
+    scheduler_data_bytes = 8 + 8 + 48 + 48 + 48
+    assert (
+        smem_allocator.total_smem_bytes
+        + scheduler_data_bytes
+        + smem_allocator.barrier_smem_bytes
+        == 217616
+    )
+
+
 @pytest.mark.timeout(240)
 def test_schedule_checker_reports_no_persistent_c_scratch_ab_alias_race():
     """Persistent multi-stage work IDs keep C scratch separate from A/B.
