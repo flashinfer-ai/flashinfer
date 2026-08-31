@@ -226,6 +226,7 @@ from flashinfer.fused_moe.capabilities import get_moe_backend_capabilities
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe.runners import _TrtllmRunnerBase
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
+from flashinfer.jit.cpp_ext import get_cuda_version
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
 from flashinfer.quantization.fp8_quantization import mxfp8_quantize
 from flashinfer.tllm_enums import RoutingMethodType
@@ -2481,6 +2482,12 @@ def _is_contract_environment_unavailable(e: Exception) -> bool:
     return any(reason in msg for reason in _CONTRACT_ENVIRONMENT_ERRORS)
 
 
+def _contract_preflight_skip_reason(cfg: Cfg, cuda_major: int) -> str | None:
+    if cfg.variant in _B12X_BACKEND_KEYS and cuda_major < 13:
+        return "b12x unified MoE requires CUDA 13 or later"
+    return None
+
+
 @pytest.mark.parametrize(
     "exc,expected",
     (
@@ -2516,6 +2523,14 @@ def test_is_unsupported_classification(exc, expected):
 )
 def test_contract_environment_classification(exc, expected):
     assert _is_contract_environment_unavailable(exc) is expected
+
+
+def test_b12x_contract_preflight_requires_cuda_13():
+    b12x = _CURATED_BY_SEED[900_094]
+    cutlass = _CURATED_BY_SEED[900_080]
+    assert _contract_preflight_skip_reason(b12x, 12) is not None
+    assert _contract_preflight_skip_reason(b12x, 13) is None
+    assert _contract_preflight_skip_reason(cutlass, 12) is None
 
 
 # ---------------------------------------------------------------------------
@@ -2619,6 +2634,8 @@ def test_unified_moe_fuzz(cfg):
 
     handler = _handler_for(cfg)
     dev = torch.device("cuda")
+    if reason := _contract_preflight_skip_reason(cfg, get_cuda_version().major):
+        pytest.skip(reason)
     if handler.variant is QuantVariant.W4A16 and sm == 103:
         pytest.skip("TRTLLM MXFP4×BF16 is disabled on SM103")
     if handler.variant is QuantVariant.MxInt4 and (
