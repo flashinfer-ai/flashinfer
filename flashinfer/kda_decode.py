@@ -110,10 +110,8 @@ def recurrent_kda(
             Scale factor for queries. If ``None``, defaults to ``1 / sqrt(K)``.
         initial_state (Optional[torch.Tensor]):
             Initial state of shape ``[N, HV, V, K]``. Must be bfloat16.
-            If ``None``, zero-initialized. Updated in-place. For batched spec
-            decode without ``cu_seqlens``, ``N`` is the packed checkpoint-slot
-            count ``B * (1 + num_spec_tokens)`` when ``ssm_state_indices`` is
-            omitted.
+            If ``None``, zero-initialized. Updated in-place. ``N`` is the
+            writable cache-slot count and may exceed the active batch size.
         output_final_state (bool):
             Whether to return the final state. Default: ``False``.
         use_qk_l2norm_in_kernel (bool):
@@ -127,9 +125,11 @@ def recurrent_kda(
         cu_seqlens (Optional[torch.Tensor]):
             Cumulative sequence lengths of shape ``[N+1]``. Must be int32.
         ssm_state_indices (Optional[torch.Tensor]):
-            State cache indices. Shape ``[N]`` int32 for standard decode, or
-            ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also
-            be set).
+            State cache indices. Shape ``[B]`` int32 for standard decode, or
+            ``[N, 1+S]`` int32 for packed speculative decode. Indexed standard
+            decode updates the selected slots directly; when omitted, standard
+            decode uses a dense identity mapping. ``-1`` is reserved for
+            padded packed rows.
         num_spec_tokens (Optional[int]):
             Number of speculative tokens (S). When set, processes 1+S tokens in
             a single fused kernel launch. Must be >= 1.
@@ -174,6 +174,7 @@ def recurrent_kda(
         v=v,
         g=g,
         beta=beta,
+        ssm_state_indices=ssm_state_indices,
         A_log=A_log,
         dt_bias=dt_bias,
         scale=scale,
@@ -183,7 +184,6 @@ def recurrent_kda(
         use_gate_in_kernel=use_gate_in_kernel,
         lower_bound=lower_bound,
         cu_seqlens=cu_seqlens,
-        ssm_state_indices=ssm_state_indices,
         num_spec_tokens=num_spec_tokens,
         num_accepted_tokens=num_accepted_tokens,
         output=output,

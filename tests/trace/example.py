@@ -814,12 +814,14 @@ rk_source = torch.randn(
     rk_B + 2, rk_HV, rk_D, rk_D, dtype=torch.bfloat16, device=device
 )
 rk_source_indices = torch.arange(rk_B, dtype=torch.int32, device=device)
+rk_state_indices = torch.arange(rk_B, dtype=torch.int32, device=device)
 flashinfer.kda_decode.recurrent_kda(
     rk_q,
     rk_k,
     rk_v,
     rk_g,
     rk_beta,
+    ssm_state_indices=rk_state_indices,
     initial_state=rk_state,
     initial_state_source=rk_source,
     initial_state_indices=rk_source_indices,
