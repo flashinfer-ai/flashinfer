@@ -343,10 +343,16 @@ def main():
     for bst in dtypes:
         print(f"\n{'#' * 74}\n# block_scale_type = {bst}\n{'#' * 74}")
         print("Correctness (cuTile vs dequant per-segment torch.mm, 3x512x2048x1024):")
-        ok, cos = verify_cutile(bst, out_dtype)
-        print(
-            f"  cutile: {'OK' if ok else 'FAIL'}" + (f" cos={cos:.4f}" if cos else "")
-        )
+        try:
+            ok, cos = verify_cutile(bst, out_dtype)
+            print(
+                f"  cutile: {'OK' if ok else 'FAIL'}" + (f" cos={cos:.4f}" if cos else "")
+            )
+        except Exception as e:
+            # A cuTile failure on the tiny check must not abort the whole sweep;
+            # degrade to FAIL and continue to the perf table (bench_one is guarded too).
+            msg = (str(e).splitlines() or [""])[0][:120]
+            print(f"  cutile: FAIL ({type(e).__name__}: {msg})")
         if bst == "mxfp8":
             print(
                 "  sota  : perf-only (independent scales; not correctness-comparable)"
