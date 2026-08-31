@@ -717,19 +717,24 @@ def masked_scaled_bmm(
     # The kernel does in-register reshape/permute/reshape (same as Triton).
     # This avoids extra memory copies that were a major source of overhead.
 
-    # Compute max(masked_m) on GPU — avoids GPU->CPU sync.
-    # The kernel uses max_m to dynamically reduce tile scheduling.
+    # max_m_device is the graph-safe device-side copy of max_m; the kernel uses
+    # it to dynamically reduce tile scheduling. When provided it must be a CUDA
+    # tensor on a.device: a tensor on another GPU would be read by the kernel on
+    # the wrong device, and a scalar/CPU tensor would force a host-side .item()
+    # sync that is illegal under CUDA-graph capture. Reject those explicitly
+    # rather than silently degrading. When absent, derive it on-device from
+    # masked_m (no GPU->CPU sync).
     if max_m_device is not None:
-        if isinstance(max_m_device, torch.Tensor) and max_m_device.is_cuda:
-            max_m = max_m_device.to(torch.int32).reshape(1)
-        else:
-            # Scalar or CPU tensor — put it on GPU
-            val = (
-                max_m_device
-                if isinstance(max_m_device, int)
-                else int(max_m_device.item())
+        if not isinstance(max_m_device, torch.Tensor) or not max_m_device.is_cuda:
+            raise ValueError(
+                "max_m_device must be a CUDA tensor (a device-side copy of max_m); "
+                f"got {type(max_m_device).__name__}. Pass a CUDA int32 tensor or None."
             )
-            max_m = torch.tensor([min(val, M)], device=a.device, dtype=torch.int32)
+        if max_m_device.device != a.device:
+            raise ValueError(
+                f"max_m_device must be on {a.device}; got {max_m_device.device}."
+            )
+        max_m = max_m_device.to(torch.int32).reshape(1)
     else:
         max_m = _masked_m_max_device_cutile(masked_m)
 
