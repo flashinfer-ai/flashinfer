@@ -1322,11 +1322,16 @@ _CONTRACT_HANDLERS = {
         reference=_b12x_post_reference,
         weight_snap=_snap_to_nvfp4,
         prepare_weights=_prepare_b12x_w4a16,
+        # TODO: weight_snap removes the weight quantization error, so the
+        # remaining tolerance covers kernel accumulation plus the
+        # intermediate/epilogue rounding this FP32 oracle does not model.
+        # Tighten once SM120/121 CI can calibrate it.
         atol_frac=0.05,
         rtol=0.3,
     ),
 }
 _B12X_BACKEND_KEYS = frozenset(("b12x_nvfp4", "b12x_w4a16"))
+_FP8_BLOCK_BACKEND_KEY = "cutlass_fp8_block"
 
 # Cfg.variant string <-> handler lookup (random-generation ids stay unchanged).
 _HANDLER_BY_ID = {
@@ -2215,6 +2220,11 @@ def test_contract_handler_inventory_is_single_backend_and_non_deterministic():
         config_type = handler.candidate_configs[0]
         assert _BACKEND_RUNNERS[config_type].backend_key == backend_key
         assert backend_key not in _DETERMINISTIC
+
+
+def test_b12x_w4a16_uses_nvfp4_weight_snap():
+    # Its reference treats the canonical BF16 weights as the authority, so they
+    # must already sit on the grid _quantize_b12x_expert_weights will use.
     assert _HANDLER_BY_ID["b12x_w4a16"].weight_snap is _snap_to_nvfp4
 
 
@@ -2478,10 +2488,16 @@ def _is_unsupported(e):
     return any(s in msg for s in _SKIP_SUBSTR)
 
 
-_CONTRACT_ENVIRONMENT_ERRORS = (
-    "requires cuda 13 or later",
-    "requires the cute dsl package",
-    "fp8 block scaling requires cuda 12.8 or newer",
+# Fragments, not full messages: the classifier must also match what a runner
+# raises on its own, whose prefix need not match the preflight wording. Keeping
+# the fragment primitive makes it a substring of the preflight reason by
+# construction, so the two cannot drift apart.
+_ENV_NEEDS_CUDA13 = "requires CUDA 13 or later"
+_ENV_NEEDS_CUTE_DSL = "requires the CuTe DSL package"
+_ENV_NEEDS_CUDA128 = "FP8 block scaling requires CUDA 12.8 or newer"
+_CONTRACT_ENVIRONMENT_ERRORS = tuple(
+    fragment.lower()
+    for fragment in (_ENV_NEEDS_CUDA13, _ENV_NEEDS_CUTE_DSL, _ENV_NEEDS_CUDA128)
 )
 
 
@@ -2506,17 +2522,19 @@ def _contract_preflight_skip_reason(
     cute_dsl_available: bool | None = None,
 ) -> str | None:
     if cfg.variant in _B12X_BACKEND_KEYS:
-        cuda_version = cuda_version or _cuda_toolkit_version()
+        if cuda_version is None:
+            cuda_version = _cuda_toolkit_version()
         if cuda_version < (13, 0):
-            return "b12x unified MoE requires CUDA 13 or later"
+            return f"b12x unified MoE {_ENV_NEEDS_CUDA13}"
         if cute_dsl_available is None:
             cute_dsl_available = is_cute_dsl_available()
         if not cute_dsl_available:
-            return "b12x unified MoE requires the CuTe DSL package"
-    elif cfg.variant == "cutlass_fp8_block":
-        cuda_version = cuda_version or _cuda_toolkit_version()
+            return f"b12x unified MoE {_ENV_NEEDS_CUTE_DSL}"
+    elif cfg.variant == _FP8_BLOCK_BACKEND_KEY:
+        if cuda_version is None:
+            cuda_version = _cuda_toolkit_version()
         if cuda_version < (12, 8):
-            return "FP8 block scaling requires CUDA 12.8 or newer"
+            return _ENV_NEEDS_CUDA128
     return None
 
 
