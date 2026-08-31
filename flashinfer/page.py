@@ -32,6 +32,7 @@ from .utils import (
     TensorLayout,
     _check_kv_layout,
     check_shape_dtype_device,
+    is_current_stream_capturing,
     _unpack_paged_kv_cache,
     register_custom_op,
     register_fake_op,
@@ -731,12 +732,10 @@ def _as_float32_scalar_tensors(
 
 
 def _is_stream_capturing_on_device(device: torch.device) -> bool:
-    if not hasattr(torch.cuda, "is_current_stream_capturing"):
-        return False
     if device.type != "cuda":
         return False
     with torch.cuda.device(device):
-        return torch.cuda.is_current_stream_capturing()
+        return is_current_stream_capturing()
 
 
 @flashinfer_api(trace=nvfp4_quantize_append_paged_kv_cache_with_slot_mapping_trace)
