@@ -6,8 +6,9 @@ behind those numbers, the knob surface as it exists today, and the open
 perf levers.  It is the companion to `SKILL.md` (drop-update workflow) and
 mirrors the structure of the SM100 tree's `TUNING.md`.
 
-Unless noted otherwise, all measurements were taken 2026-08-23 on a single
-H200 node (4x NVIDIA H200 141GB, EP=4) at the kernel drop's DSV4-Pro P03
+Unless noted otherwise, all measurements were taken 2026-08-30 on a single
+H200 node (4x NVIDIA H200 141GB, SM clock locked at 1830 MHz, EP=4) at the
+kernel drop's DSV4-Pro P03
 geometry: **384 experts, top-6, hidden 7168, intermediate 3072
 (post-SwiGLU; gate+up 6144), gate_up_clamp 10.0**, tokens-per-rank swept
 8..32768 in powers of two (13 points) — the same geometry and knobs as the
@@ -17,9 +18,9 @@ config per point is the drop's token-bucket heuristic table
 team's 2026-08-19 four-rank H200 sweep at the same vendored kernel
 sources, plus the locally added per-bucket `token_back_mode` column from
 the 2026-08-23 epi-vs-reuse sweep — see the knob list below).
-Raw rows: `benchmark_data/20260823/20260823_090730_mega_sm90_heuristic_both.csv`.
+Raw rows: `benchmark_data/20260830/20260830_224758_mega_sm90_heuristic_both.csv`.
 
-## Microbenchmark results (2026-08-23, heuristic launch configs, max-rank µs)
+## Microbenchmark results (2026-08-30, heuristic launch configs, max-rank µs)
 
 Two timed series per point — the difference is WHAT each call includes:
 
@@ -43,47 +44,50 @@ the drop's per-rank formula (`routed = tok/rank × topk`,
 
 The `token back` column is the per-bucket `token_back_mode` the heuristic
 table now selects (`epi` = `epi_warps`, `reuse` = `reuse_dispatch_warps`).
+All other knobs are at their config defaults — notably
+`active_dispatch_warps=1` (see "The knob surface"), which lifts the
+large-token buckets by up to ~7% over the previous 4-warp fixed layout.
 
-**per_tensor** — peak 841 TFLOPS/rank:
-
-| tok/rank | heuristic config                   | token back | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
-|---------:|------------------------------------|:----------:|-----------:|-------:|---------:|-----------:|
-|        8 | swap-AB ping-pong M128N16 CGA2x1   |    epi     |      830.8 |    7.6 |    954.6 |        6.6 |
-|       16 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1248.4 |   10.2 |   1402.7 |        9.0 |
-|       32 | non-swap M64N256 CGA1x1            |    epi     |     1664.4 |   15.2 |   1784.3 |       14.2 |
-|       64 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     1974.6 |   25.7 |   2136.9 |       23.7 |
-|      128 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |     1824.5 |   55.6 |   1986.0 |       51.1 |
-|      256 | swap-AB M256N32 CGA2x1             |    epi     |     2029.5 |  100.0 |   2019.1 |      100.5 |
-|      512 | swap-AB M256N64 CGA1x1             |    epi     |     2096.0 |  193.6 |   2283.9 |      177.7 |
-|     1024 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     2151.0 |  377.4 |   2323.7 |      349.3 |
-|     2048 | non-swap ping-pong M64N128 CGA2x1  |    epi     |     3043.2 |  533.5 |   3191.9 |      508.6 |
-|     4096 | non-swap ping-pong M64N128 CGA2x2  |    epi     |     5081.8 |  638.9 |   5279.4 |      615.0 |
-|     8192 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     8569.0 |  757.9 |   8862.6 |      732.7 |
-|    16384 | non-swap M64N256 CGA2x1            |   reuse    |    15895.2 |  817.1 |  16718.2 |      776.9 |
-|    32768 | non-swap ping-pong M64N128 CGA2x2  |   reuse    |    30902.9 |  840.6 |  32565.7 |      797.6 |
-
-**blockwise** — peak 568 TFLOPS/rank:
+**per_tensor** — peak 896 TFLOPS/rank:
 
 | tok/rank | heuristic config                   | token back | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
 |---------:|------------------------------------|:----------:|-----------:|-------:|---------:|-----------:|
-|        8 | swap-AB M256N16 CGA2x1             |    epi     |      850.6 |    7.5 |   1077.8 |        5.9 |
-|       16 | swap-AB M256N16 CGA1x1             |    epi     |     1251.2 |   10.1 |   1526.0 |        8.3 |
-|       32 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1673.3 |   15.2 |   1924.9 |       13.2 |
-|       64 | swap-AB M256N32 CGA2x1             |    epi     |     1804.0 |   28.1 |   2069.7 |       24.5 |
-|      128 | swap-AB M256N16 CGA2x1             |    epi     |     1803.6 |   56.3 |   2086.1 |       48.6 |
-|      256 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |     2122.8 |   95.6 |   2372.5 |       85.5 |
-|      512 | non-swap M64N128 CGA1x1            |    epi     |     2507.8 |  161.8 |   2712.4 |      149.6 |
-|     1024 | non-swap M64N128 CGA2x2            |   reuse    |     3055.7 |  265.6 |   3223.7 |      251.8 |
-|     2048 | non-swap M64N128 CGA2x2            |   reuse    |     4337.2 |  374.3 |   4488.9 |      361.7 |
-|     4096 | non-swap M64N128 CGA1x1            |   reuse    |     6932.5 |  468.4 |   7256.4 |      447.5 |
-|     8192 | non-swap M64N128 CGA2x1            |   reuse    |    11824.6 |  549.2 |  12405.7 |      523.5 |
-|    16384 | non-swap M64N128 CGA1x2            |   reuse    |    22854.6 |  568.3 |  24392.3 |      532.5 |
-|    32768 | non-swap M64N128 CGA2x1            |   reuse    |    45875.4 |  566.2 |  48830.3 |      532.0 |
+|        8 | swap-AB ping-pong M128N16 CGA2x1   |    epi     |      826.8 |    7.7 |    980.9 |        6.5 |
+|       16 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1249.4 |   10.2 |   1440.0 |        8.8 |
+|       32 | non-swap M64N256 CGA1x1            |    epi     |     1679.6 |   15.1 |   1840.8 |       13.8 |
+|       64 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     1986.1 |   25.6 |   2169.0 |       23.4 |
+|      128 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |     1823.2 |   55.7 |   1980.7 |       51.2 |
+|      256 | swap-AB M256N32 CGA2x1             |    epi     |     1929.5 |  105.2 |   2011.9 |      100.9 |
+|      512 | swap-AB M256N64 CGA1x1             |    epi     |     2082.1 |  194.9 |   2249.4 |      180.4 |
+|     1024 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     2131.8 |  380.8 |   2289.9 |      354.5 |
+|     2048 | non-swap ping-pong M64N128 CGA2x1  |    epi     |     2976.8 |  545.4 |   3117.2 |      520.8 |
+|     4096 | non-swap ping-pong M64N128 CGA2x2  |    epi     |     4954.2 |  655.4 |   5167.6 |      628.3 |
+|     8192 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |     8612.2 |  754.0 |   8721.2 |      744.6 |
+|    16384 | non-swap M64N256 CGA2x1            |   reuse    |    14491.1 |  896.3 |  15349.3 |      846.2 |
+|    32768 | non-swap ping-pong M64N128 CGA2x2  |   reuse    |    29241.8 |  888.3 |  30919.4 |      840.1 |
+
+**blockwise** — peak 589 TFLOPS/rank:
+
+| tok/rank | heuristic config                   | token back | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
+|---------:|------------------------------------|:----------:|-----------:|-------:|---------:|-----------:|
+|        8 | swap-AB M256N16 CGA2x1             |    epi     |      837.9 |    7.6 |   1078.7 |        5.9 |
+|       16 | swap-AB M256N16 CGA1x1             |    epi     |     1240.4 |   10.2 |   1523.0 |        8.3 |
+|       32 | swap-AB ping-pong M128N16 CGA1x2   |    epi     |     1683.5 |   15.1 |   1922.8 |       13.2 |
+|       64 | swap-AB M256N32 CGA2x1             |    epi     |     1807.0 |   28.1 |   2085.4 |       24.3 |
+|      128 | swap-AB M256N16 CGA2x1             |    epi     |     1783.1 |   56.9 |   2109.8 |       48.1 |
+|      256 | swap-AB ping-pong M128N32 CGA1x2   |    epi     |     2113.4 |   96.0 |   2376.8 |       85.4 |
+|      512 | non-swap M64N128 CGA1x1            |    epi     |     2448.5 |  165.8 |   2654.5 |      152.9 |
+|     1024 | non-swap M64N128 CGA2x2            |   reuse    |     3033.7 |  267.6 |   3206.0 |      253.2 |
+|     2048 | non-swap M64N128 CGA2x2            |   reuse    |     4229.2 |  383.9 |   4404.9 |      368.6 |
+|     4096 | non-swap M64N128 CGA1x1            |   reuse    |     6910.6 |  469.9 |   7210.6 |      450.3 |
+|     8192 | non-swap M64N128 CGA2x1            |   reuse    |    11497.5 |  564.8 |  11993.1 |      541.5 |
+|    16384 | non-swap M64N128 CGA1x2            |   reuse    |    22066.7 |  588.6 |  23404.0 |      555.0 |
+|    32768 | non-swap M64N128 CGA2x1            |   reuse    |    44415.3 |  584.8 |  47416.1 |      547.8 |
 
 ### e2e overhead (the production path)
 
-`e2e` minus `compute` is ~150-250 µs at small token counts growing to
-~1.7-2.8 ms at 32768 — dominated by the torch-composed staging quant plus
+`e2e` minus `compute` is ~150-280 µs at small token counts growing to
+~1.7-3.0 ms at 32768 — dominated by the torch-composed staging quant plus
 the output copy.  The SM100 tree eliminated the analogous cost with a
 fused single-launch quant+repack kernel (`FLASHINFER_MEGA_FUSED_STAGE`);
 the SM90 tree has no counterpart yet — this is the top e2e lever (see
