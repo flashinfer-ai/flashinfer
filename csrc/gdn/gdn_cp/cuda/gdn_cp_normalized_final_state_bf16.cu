@@ -114,6 +114,11 @@ kernel_flashinfer_blackwell_gdn_cp_prefill_final_state_bf16_v1(__nv_bfloat16* __
         long long v_base = ((long long)token * (long long)num_v_heads + (long long)value_head) * 128;
         float input_value = (float)v[v_base + (long long)value_dim];
         float residual = (input_value - old_value) * beta_value;
+        {
+            __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(residual);
+            float _cvt_f32_0 = __bfloat162float(_cvt_bf16_0);
+            residual = _cvt_f32_0;
+        }
         #pragma unroll
         for (int key_dim_update = 0; key_dim_update < 128; key_dim_update++) {
             float _fma_1 = __fmaf_rn(shared_k[key_dim_update], residual, state_values[key_dim_update]);
