@@ -103,8 +103,7 @@ inline CUtensorMap EncodeTensorMap(const void* address, CUtensorMapDataType data
 }
 
 inline CUtensorMap EncodeNHD(const TensorView& tensor, uint32_t rows_per_box, const char* name) {
-  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(tensor.data_ptr()) %
-                        kTensorMapGlobalBaseAlignment,
+  TVM_FFI_ICHECK_EQ(reinterpret_cast<uintptr_t>(tensor.data_ptr()) % kTensorMapGlobalBaseAlignment,
                     0)
       << name << " global address must be 16-byte aligned";
   constexpr uint64_t global_dims[5] = {64, kSequence, kHeads, kBatch, 2};
