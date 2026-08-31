@@ -165,6 +165,7 @@ POINTERS for future agents (point me at this file and I know the rest):
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import os
 import random
@@ -176,6 +177,7 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer.autotuner import autotune
+from flashinfer.cute_dsl import is_cute_dsl_available
 from flashinfer.fp4_quantization import fp4_quantize
 from flashinfer.fused_moe import (
     MoEActivationPack,
@@ -350,6 +352,7 @@ class DTypeHandler:
     # therefore need a reference derived after the prepared view exists.
     post_prepare_reference: Callable | None = None
     prepare_weights: Callable | None = None
+    weight_snap: Callable | None = None
 
 
 def _poison_bf16_out(buf, gen):
@@ -1223,6 +1226,7 @@ def _contract_handler(
     activation_pack,
     reference,
     snap=_block_fp8_snap,
+    weight_snap=None,
     prepare_weights=None,
     atol_frac=0.2,
     rtol=0.2,
@@ -1240,6 +1244,7 @@ def _contract_handler(
         rtol=rtol,
         post_prepare_reference=reference,
         prepare_weights=prepare_weights,
+        weight_snap=weight_snap,
     )
 
 
@@ -1316,6 +1321,7 @@ _CONTRACT_HANDLERS = {
         QuantVariant.W4A16,
         activation_pack=_contract_bf16_act_pack,
         reference=_b12x_post_reference,
+        weight_snap=_snap_to_nvfp4,
         prepare_weights=_prepare_b12x_w4a16,
         atol_frac=0.05,
         rtol=0.3,
@@ -2210,6 +2216,7 @@ def test_contract_handler_inventory_is_single_backend_and_non_deterministic():
         config_type = handler.candidate_configs[0]
         assert _BACKEND_RUNNERS[config_type].backend_key == backend_key
         assert backend_key not in _DETERMINISTIC
+    assert _HANDLER_BY_ID["b12x_w4a16"].weight_snap is _snap_to_nvfp4
 
 
 def test_contract_curated_seeds_match_declared_capabilities():
@@ -2371,16 +2378,19 @@ def _master(cfg, handler):
     g = torch.Generator(device="cuda").manual_seed(cfg.seed)
     E_local, H, I, T = cfg.n_local, cfg.hidden, cfg.intermediate, cfg.num_tokens
 
-    def sparse(*shape):
+    def sparse(*shape, snap=handler.snap):
         dense = torch.randn(*shape, device="cuda", generator=g)
         keep = torch.rand(shape, device="cuda", generator=g) >= 0.75  # ~75% zeros
-        return handler.snap(dense * keep)
+        return snap(dense * keep)
 
     # Expert-major tensors carry the SHARED rows too (routed first, shared
     # appended); E_local stays routed-only, matching the API contract.
     rows = cfg.n_weight_rows
     gemm1_rows = 2 * I if _activation_for(cfg).is_gated else I
-    x, w1, w2 = sparse(T, H), sparse(rows, gemm1_rows, H), sparse(rows, H, I)
+    x = sparse(T, H)
+    weight_snap = handler.weight_snap or handler.snap
+    w1 = sparse(rows, gemm1_rows, H, snap=weight_snap)
+    w2 = sparse(rows, H, I, snap=weight_snap)
 
     logits = torch.randn(T, E_local, device="cuda", generator=g)  # over the local shard
     if cfg.route in ("hot1", "all_to_one"):  # pile every token onto one expert
@@ -2482,9 +2492,30 @@ def _is_contract_environment_unavailable(e: Exception) -> bool:
     return any(reason in msg for reason in _CONTRACT_ENVIRONMENT_ERRORS)
 
 
-def _contract_preflight_skip_reason(cfg: Cfg, cuda_major: int) -> str | None:
-    if cfg.variant in _B12X_BACKEND_KEYS and cuda_major < 13:
-        return "b12x unified MoE requires CUDA 13 or later"
+@functools.cache
+def _cuda_toolkit_version() -> tuple[int, int]:
+    version = get_cuda_version()
+    return version.major, version.minor
+
+
+def _contract_preflight_skip_reason(
+    cfg: Cfg,
+    *,
+    cuda_version: tuple[int, int] | None = None,
+    cute_dsl_available: bool | None = None,
+) -> str | None:
+    if cfg.variant in _B12X_BACKEND_KEYS:
+        cuda_version = cuda_version or _cuda_toolkit_version()
+        if cuda_version < (13, 0):
+            return "b12x unified MoE requires CUDA 13 or later"
+        if cute_dsl_available is None:
+            cute_dsl_available = is_cute_dsl_available()
+        if not cute_dsl_available:
+            return "b12x unified MoE requires the CuTe DSL package"
+    elif cfg.variant == "cutlass_fp8_block":
+        cuda_version = cuda_version or _cuda_toolkit_version()
+        if cuda_version < (12, 8):
+            return "FP8 block scaling requires CUDA 12.8 or newer"
     return None
 
 
@@ -2528,9 +2559,32 @@ def test_contract_environment_classification(exc, expected):
 def test_b12x_contract_preflight_requires_cuda_13():
     b12x = _CURATED_BY_SEED[900_094]
     cutlass = _CURATED_BY_SEED[900_080]
-    assert _contract_preflight_skip_reason(b12x, 12) is not None
-    assert _contract_preflight_skip_reason(b12x, 13) is None
-    assert _contract_preflight_skip_reason(cutlass, 12) is None
+    assert (
+        _contract_preflight_skip_reason(
+            b12x, cuda_version=(12, 9), cute_dsl_available=True
+        )
+        is not None
+    )
+    assert (
+        _contract_preflight_skip_reason(
+            b12x, cuda_version=(13, 0), cute_dsl_available=True
+        )
+        is None
+    )
+    assert _contract_preflight_skip_reason(cutlass, cuda_version=(12, 7)) is None
+
+
+def test_contract_preflight_checks_backend_environment():
+    b12x = _CURATED_BY_SEED[900_094]
+    fp8_block = _CURATED_BY_SEED[900_084]
+    assert (
+        _contract_preflight_skip_reason(
+            b12x, cuda_version=(13, 0), cute_dsl_available=False
+        )
+        is not None
+    )
+    assert _contract_preflight_skip_reason(fp8_block, cuda_version=(12, 7)) is not None
+    assert _contract_preflight_skip_reason(fp8_block, cuda_version=(12, 8)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -2634,7 +2688,7 @@ def test_unified_moe_fuzz(cfg):
 
     handler = _handler_for(cfg)
     dev = torch.device("cuda")
-    if reason := _contract_preflight_skip_reason(cfg, get_cuda_version().major):
+    if reason := _contract_preflight_skip_reason(cfg):
         pytest.skip(reason)
     if handler.variant is QuantVariant.W4A16 and sm == 103:
         pytest.skip("TRTLLM MXFP4×BF16 is disabled on SM103")
@@ -3023,6 +3077,8 @@ def test_unified_moe_fuzz(cfg):
         try:
             tactics = runner.get_valid_tactics(inputs, None)
         except Exception:
+            if cfg.variant in _CONTRACT_HANDLERS:
+                raise
             tactics = []  # backend needs a profile object -> skip the sweep (default tactic stands)
         for tactic in tactics:
             o = runner.forward(inputs, tactic=tactic)
