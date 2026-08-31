@@ -16,33 +16,29 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
     """Correctness tests for ragged_block_scaled_bmm on the cuTile backend."""
 
     @staticmethod
-    def create_ragged_m_segments(num_groups, m, ELEM_PER_BYTE_A, alignment=16):
-        """Create non-even M segments for ragged BMM.
+    def create_ragged_aligned_m_segments(num_groups, m, block_m=128):
+        """Create non-uniform M segments, each a positive multiple of BLOCK_M.
+
+        CuTile indexes rows as ``m_start // BLOCK_M`` (ragged kernel), so every
+        segment offset must be BLOCK_M-aligned. Unlike ``create_aligned_m_segments``
+        the sizes here differ across groups, exercising the uneven-segment path
+        that equal-size offsets never reach. Deterministic and strictly positive:
+        a fixed spread over a ``m//block_m`` base guarantees >= 2 distinct sizes
+        and every segment >= 1 tile.
 
         Args:
             num_groups: Number of groups/batches
-            m: Average segment size
-            ELEM_PER_BYTE_A: Elements per byte for A matrix
-            alignment: Segment size alignment (default 16, use 128 for CuTile)
+            m: Nominal per-group segment size (drives the tile-count base)
+            block_m: Block size for M dimension (default 128)
         """
-        # Create random segment sizes that sum to approximately total_m
-        total_m = num_groups * m
-        segment_sizes = []
-        num_items = alignment * ELEM_PER_BYTE_A
+        base = max(1, m // block_m)
+        # Fixed spread pattern -> guaranteed non-uniform, all tile counts >= 1.
+        spread = [0, 1, -1, 2]
+        tile_counts = [
+            max(1, base + spread[i % len(spread)]) for i in range(num_groups)
+        ]
+        segment_sizes = [t * block_m for t in tile_counts]
 
-        # Generate random segment sizes
-        for _ in range(num_groups - 1):
-            # Random size between 0.5x and 1.5x expected size
-            size = int(m * random.uniform(0.5, 1.5))
-            size = (size // num_items) * num_items
-            segment_sizes.append(size)
-
-        # Last segment gets the remaining size
-        remaining = total_m - sum(segment_sizes)
-        assert remaining > 0 and remaining % num_items == 0
-        segment_sizes.append(remaining)
-
-        # Create segment offsets
         segment_offsets = torch.zeros(num_groups + 1, dtype=torch.int32, device="cuda")
         for i in range(num_groups):
             segment_offsets[i + 1] = segment_offsets[i] + segment_sizes[i]
@@ -176,7 +172,7 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
         trans_a=False,
         trans_b=True,
         out_dtype=torch.bfloat16,
-        use_aligned_segments=False,
+        segment_mode="uniform",
     ):
         """Build the ragged FP8 A/B, their block scales and the segment offsets."""
         Q = num_groups
@@ -188,8 +184,17 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
         fp8_info = torch.finfo(torch.float8_e4m3fn)
         fp8_max, fp8_min = fp8_info.max, fp8_info.min
 
-        if use_aligned_segments:
-            # CuTile requires segment offsets aligned to BLOCK_M (128)
+        if segment_mode == "ragged":
+            # Non-uniform segments, still BLOCK_M(128)-aligned as CuTile requires.
+            max_m, segment_offsets = (
+                Test_FlashInfer_RaggedBlockScaledBMM.create_ragged_aligned_m_segments(
+                    num_groups=num_groups,
+                    m=M,
+                    block_m=128,  # BLOCK_M for CuTile
+                )
+            )
+        else:
+            # Uniform (equal-size) segments aligned to BLOCK_M (128).
             max_m, segment_offsets, aligned_m = (
                 Test_FlashInfer_RaggedBlockScaledBMM.create_aligned_m_segments(
                     num_groups=num_groups,
@@ -197,19 +202,7 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
                     block_m=128,  # BLOCK_M for CuTile
                 )
             )
-            total_m = segment_offsets[-1].item()
-        else:
-            # Supports non-aligned segments
-            max_m, segment_offsets = (
-                Test_FlashInfer_RaggedBlockScaledBMM.create_ragged_m_segments(
-                    num_groups=num_groups,
-                    m=M,
-                    ELEM_PER_BYTE_A=1,
-                    alignment=16,
-                )
-            )
-            total_m = segment_offsets[-1].item()
-            assert total_m == num_groups * M
+        total_m = segment_offsets[-1].item()
 
         A_fp32 = (
             (
@@ -269,8 +262,21 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
         "dtype, out_dtype", [(torch.float8_e4m3fn, torch.bfloat16)]
     )
     @pytest.mark.parametrize("trans_a, trans_b", [(False, True)])
+    @pytest.mark.parametrize("segment_mode", ["uniform", "ragged"])
     @pytest.mark.parametrize("backend", ["cutile"])
-    def test_op(self, num_groups, m, n, k, dtype, out_dtype, trans_a, trans_b, backend):
+    def test_op(
+        self,
+        num_groups,
+        m,
+        n,
+        k,
+        dtype,
+        out_dtype,
+        trans_a,
+        trans_b,
+        segment_mode,
+        backend,
+    ):
         """cuTile ragged_block_scaled_bmm must match the native groupwise FP8 GEMM."""
         if (
             get_compute_capability(torch.device("cuda:0"))[0] == 8
@@ -306,7 +312,7 @@ class Test_FlashInfer_RaggedBlockScaledBMM:
             trans_a,
             trans_b,
             out_dtype,
-            use_aligned_segments=True,
+            segment_mode=segment_mode,
         )
 
         c = ragged_block_scaled_bmm(
