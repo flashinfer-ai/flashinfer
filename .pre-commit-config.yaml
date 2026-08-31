@@ -23,7 +23,7 @@
 # The Cake selective-state and Mamba CUDA/host trees, along with frozen KDA
 # fallback sources, are byte-faithful generated exports; their SHA-256 digests
 # are checked by JIT manifests and must not be rewritten.
-exclude: ^(?:csrc/(?:blackwell_msa/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|kda/training_fallback_pointer_sm_(?:100a|103a)\.cu)|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/)
+exclude: ^(?:csrc/(?:blackwell_msa/|cake_all_gather_matmul/|cake_selective_state_update/(?:cuda|host)/|cake_mamba_ssd_combined/generated/|kda/training_(?:fallback|grouped_row_wg8)_pointer_sm_(?:100a|103a)\.cu)|flashinfer/moe_ep/kernel_src/(?:cutedsl_megamoe|sm90/pull_style_cutedsl_megakernel)/src/)
 
 repos:
   # Standard hooks
@@ -55,7 +55,7 @@ repos:
         # Source-export directories are checksum-attested generated artifacts;
         # formatting them would break parity with their producer manifests.
         exclude: |
-          (?x)^(3rdparty/.*|flashinfer/jit/aot_config.py|csrc/cake_vsa/.*|csrc/dcp/.*)$
+          (?x)^(3rdparty/.*|flashinfer/jit/aot_config.py|csrc/cake_vsa/.*|csrc/cake_grouped_mxfp8_quantize/.*|csrc/dcp/.*)$
 
   -   repo: https://github.com/pre-commit/mirrors-mypy
       rev: 'v1.17.1'  # Use the sha / tag you want to point at
