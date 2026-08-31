@@ -1881,7 +1881,6 @@ class CutlassHummingRunner(_CutlassRunnerBase):
 # ---------------------------------------------------------------------------
 
 
-_CUTILE_BF16_GEMM_HEURISTIC_VERSION = 8
 _CUTILE_BF16_DEFAULT_GEMM_CONFIGS = {
     89: (128, 32, 4),
     90: (128, 64, 1),
@@ -2099,7 +2098,6 @@ class CuTileBf16Runner(MoERunner):
     _num_top_tactics_per_stage: ClassVar[int] = 2
     _supported_archs: ClassVar[tuple[int, ...]] = _CUTILE_BF16_ARCHS
     _precision_name: ClassVar[str] = "BF16"
-    _gemm_heuristic_version: ClassVar[int] = _CUTILE_BF16_GEMM_HEURISTIC_VERSION
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -2302,7 +2300,6 @@ class CuTileBf16Runner(MoERunner):
         del inputs
         return (
             "cutile_bf16_stage",
-            _CUTILE_BF16_GEMM_HEURISTIC_VERSION,
             self._device_arch,
             self._num_sms,
             stage,
@@ -2478,7 +2475,6 @@ class CuTileBf16Runner(MoERunner):
             self._device_arch,
             self._num_sms,
             self._block_sizes,
-            self._gemm_heuristic_version,
         )
 
 
@@ -2487,7 +2483,6 @@ class CuTileBf16Runner(MoERunner):
 # ---------------------------------------------------------------------------
 
 
-_CUTILE_W4A4_GEMM_HEURISTIC_VERSION = 7
 _CUTILE_W4A4_GATED_FUSION_MIN_ASSIGNMENTS = 64
 _CUTILE_W4A4_GEMM_CONFIGS = (
     (128, 128, 2),
@@ -2555,7 +2550,6 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
     _block_sizes = (16, 32, 64, 128)
     _supported_archs = _CUTILE_NVFP4_ARCHS
     _precision_name = "NVFP4"
-    _gemm_heuristic_version = _CUTILE_W4A4_GEMM_HEURISTIC_VERSION
 
     def _build(self) -> None:
         from .cutile import fp4
@@ -2679,7 +2673,6 @@ class CuTileNvfp4Runner(CuTileBf16Runner):
         )
         return (
             "cutile_w4a4_stage",
-            _CUTILE_W4A4_GEMM_HEURISTIC_VERSION,
             self._device_arch,
             self._num_sms,
             stage,
