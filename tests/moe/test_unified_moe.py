@@ -112,7 +112,10 @@ from tests.moe.test_cute_dsl_fused_moe import (  # noqa: E402
     compute_reference_moe_fp4,
     create_moe_tensors,
 )
-from tests.moe.utils import create_relu2_moe_tensors  # noqa: E402
+from tests.moe.utils import (  # noqa: E402
+    assert_trtllm_packed_call_contract,
+    create_relu2_moe_tensors,
+)
 
 
 def test_noaux_tc_ref_excludes_unselected_groups_with_negative_scores():
@@ -217,8 +220,8 @@ class TestTrtllmFakeOutputContract:
         assert result[2].shape == (17, 64)
 
 
-def test_trtllm_interleaved_packed_calls_keep_their_launch_state():
-    """A later pack must not replace the kwargs paired with an earlier call."""
+def test_trtllm_synthetic_packed_calls_keep_their_launch_state():
+    """Exercise launch-state isolation without requiring a TRTLLM GPU."""
 
     class RecordingInner:
         def __init__(self):
@@ -245,6 +248,9 @@ def test_trtllm_interleaved_packed_calls_keep_their_launch_state():
 
     first = pack(1)
     second = pack(2)
+    assert_trtllm_packed_call_contract(runner, first)
+    assert_trtllm_packed_call_contract(runner, second)
+
     runner.forward(first)
     runner.forward(second)
     runner.forward(first)
@@ -253,8 +259,6 @@ def test_trtllm_interleaved_packed_calls_keep_their_launch_state():
     assert isinstance(hash(first.launch_state), int)
     with pytest.raises(TypeError):
         first.launch_state.static_kwargs["call_id"] = 3
-    with pytest.raises(RuntimeError, match="pack_inputs must return"):
-        runner.tuning_config_for(list(first))
 
 
 # ---------------------------------------------------------------------------
@@ -2301,6 +2305,66 @@ def _make_bf16_packs_and_config(
     return act_pack, weight_pack, config, {"x": x, "w1": w1, "w2": w2}
 
 
+@sm100_required
+def test_trtllm_interleaved_real_packs_keep_their_launch_state():
+    """A real later pack must not replace the kwargs paired with an earlier call."""
+
+    class RecordingInner:
+        def __init__(self):
+            self.gemm1_weights = []
+
+        def forward(self, inputs, **kwargs):
+            self.gemm1_weights.append(kwargs["gemm1_weights"])
+            return inputs[0]
+
+    first_act, first_weights, config, _ = _make_bf16_packs_and_config(
+        4,
+        hidden_size=256,
+        intermediate_size=256,
+        num_experts=4,
+        top_k=2,
+        max_tokens=8,
+        seed=1,
+    )
+    second_act, second_weights, _, _ = _make_bf16_packs_and_config(
+        4,
+        hidden_size=256,
+        intermediate_size=256,
+        num_experts=4,
+        top_k=2,
+        max_tokens=8,
+        seed=2,
+    )
+    runner = _build_direct_runner(
+        TrtllmBf16RoutedRunner, config, first_act.hidden_states_q.device
+    )
+
+    first = runner.pack_inputs(first_act, first_weights)
+    second = runner.pack_inputs(second_act, second_weights)
+    first_gemm1 = first_weights.get_view(runner.backend_key)["gemm1_weights"]
+    second_gemm1 = second_weights.get_view(runner.backend_key)["gemm1_weights"]
+
+    assert_trtllm_packed_call_contract(runner, first)
+    assert_trtllm_packed_call_contract(runner, second)
+    assert first.launch_state.static_kwargs["gemm1_weights"] is first_gemm1
+    assert second.launch_state.static_kwargs["gemm1_weights"] is second_gemm1
+    assert first.tuning_config is not second.tuning_config
+
+    recording_inner = RecordingInner()
+    runner._inner = recording_inner
+    runner.forward(first)
+    runner.forward(second)
+    runner.forward(first)
+
+    assert len(recording_inner.gemm1_weights) == 3
+    assert recording_inner.gemm1_weights[0] is first_gemm1
+    assert recording_inner.gemm1_weights[1] is second_gemm1
+    assert recording_inner.gemm1_weights[2] is first_gemm1
+    assert isinstance(hash(first.launch_state), int)
+    with pytest.raises(TypeError):
+        first.launch_state.static_kwargs["gemm1_weights"] = second_gemm1
+
+
 # ---------------------------------------------------------------------------
 # 5. Variant-parametrized conformance + packing contract
 # ---------------------------------------------------------------------------
@@ -2682,6 +2746,7 @@ class TestTrtllmRoutedPackingContract:
         from flashinfer.fused_moe.core import MoeRunnerInputs
 
         inputs = runner.pack_inputs(act_pack, weight_pack)
+        assert_trtllm_packed_call_contract(runner, inputs)
         topk_ids = MoeRunnerInputs.from_list(inputs).topk_ids
 
         # Upper 16 bits hold the GLOBAL expert id — NOT offset-shifted.

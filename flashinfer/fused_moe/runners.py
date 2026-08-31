@@ -413,6 +413,14 @@ class MoERunner(TunableRunner):
     Concrete runners implement ``_check_support()`` and ``_build()``. Keeping
     the public methods here ensures a failed support check cannot authorize a
     build and execution cannot silently initialize backend resources.
+
+    Preserve the exact object returned by ``pack_inputs()`` until ``forward()``:
+    a runner may attach per-call tuning and launch metadata to a ``list``
+    subclass. Direct ``forward(packed_inputs)`` recovers that metadata from the
+    object. Callers invoking ``AutoTuner.choose_one()`` directly must pass
+    ``tuning_config_for(packed_inputs)`` and
+    ``**launch_kwargs_for(packed_inputs)`` because profiling synthesizes plain
+    tensor lists without the attached Python attributes.
     """
 
     backend_key: ClassVar[str] = ""
