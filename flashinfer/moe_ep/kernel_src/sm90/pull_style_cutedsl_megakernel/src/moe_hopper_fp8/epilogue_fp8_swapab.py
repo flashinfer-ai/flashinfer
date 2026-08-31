@@ -11,7 +11,6 @@ try:
     from cutlass.cute import iket  # type: ignore
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from src.iket_compat import iket
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.hopper_helpers as sm90_utils
 
@@ -63,7 +62,7 @@ class SwapABFp8GluEpilogue:
         use_2cta_instrs: bool,
         sf_vec_size: int,
         fc1_output_dtype: Type[cutlass.Numeric],
-        fc1_output_layout: utils.LayoutEnum,
+        fc1_output_layout: cutlass.tensor_utils.LayoutEnum,
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E8M0FNU,
         fp8_scale_mode: str = "per_tensor",

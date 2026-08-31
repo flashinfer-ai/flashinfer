@@ -46,7 +46,7 @@ import torch
 from cutlass._mlir.dialects import arith as mlir_arith
 from cutlass._mlir.dialects import math as mlir_math
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
-from cutlass.utils import SmemAllocator
+from cutlass.memory import SmemAllocator
 import tvm_ffi  # noqa: F401 -- TVM FFI required for zero-overhead kernel dispatch
 
 from ..jit.flash_kda_decode import (

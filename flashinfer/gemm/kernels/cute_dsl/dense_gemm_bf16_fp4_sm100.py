@@ -565,12 +565,16 @@ class Sm100DenseGemmBf16Fp4Kernel:
         self.c_dtype: type[cutlass.Numeric] = c.element_type
         self.mma_dtype = self.b_dtype
 
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
+        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            a
+        ).mma_major_mode()
+        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            b
+        ).mma_major_mode()
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
 
         if cutlass.const_expr(
-            utils.LayoutEnum.from_tensor(a_scale).mma_major_mode()
+            cutlass.tensor_utils.LayoutEnum.from_tensor(a_scale).mma_major_mode()
             != cute.nvgpu.OperandMajorMode.K
         ):
             raise ValueError("scale_major_mode must be K-major")
@@ -779,7 +783,7 @@ class Sm100DenseGemmBf16Fp4Kernel:
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
             cta_rank_in_cluster
         )
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         clc_response_ptr = storage.clc_response.data_ptr()
 
@@ -871,7 +875,7 @@ class Sm100DenseGemmBf16Fp4Kernel:
             )
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -2158,7 +2162,7 @@ class Sm100DenseGemmBf16Fp4Kernel:
         a_dtype: type[cutlass.Numeric],
         b_dtype: type[cutlass.Numeric],
         c_dtype: type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: cutlass.tensor_utils.LayoutEnum,
         transform_a_source: tcgen05.OperandSource,
         smem_buffer_align_bytes: int,
         use_fused_finalize: bool,
@@ -2168,7 +2172,9 @@ class Sm100DenseGemmBf16Fp4Kernel:
         # Compute tmem columns required for accumulator
         acc_shape = tiled_mma.partition_shape_C(mma_tiler_mnk[:2])
         tCtAcc_stage1 = tiled_mma.make_fragment_C(cute.append(acc_shape, 1))
-        num_tmem_acc_col_per_stage = utils.get_num_tmem_alloc_cols(tCtAcc_stage1, True)
+        num_tmem_acc_col_per_stage = cutlass.memory.get_num_tmem_alloc_cols(
+            tCtAcc_stage1, True
+        )
         # Heuristic to decide the number of stages for accumulator
         sm100_tmem_columns = cute.arch.get_max_tmem_alloc_cols("sm_100")
         accumulator_stage_count = sm100_tmem_columns // num_tmem_acc_col_per_stage
@@ -2214,7 +2220,7 @@ class Sm100DenseGemmBf16Fp4Kernel:
             else 0
         )
 
-        smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
         a_scale_k_mode = max(cta_tile_shape_mnk[2] // _NVFP4_SCALE_GRANULARITY_K, 1)
         a_scale_m_mode = max(cta_tile_shape_mnk[0] // _NVFP4_SCALE_GRANULARITY_M, 1)
         a_scale_bytes_per_stage = cute.round_up(

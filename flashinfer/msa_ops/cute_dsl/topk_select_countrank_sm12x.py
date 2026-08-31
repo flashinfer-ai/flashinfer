@@ -85,7 +85,7 @@ class TopKSelectCountRankSm12x:
             sel: cute.struct.MemRange[cutlass.Int32, 16]
             cnt: cute.struct.MemRange[cutlass.Int32, 1]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         st = smem.allocate(SharedStorage)
         score = st.score.get_tensor(cute.make_layout(_MAX_BLOCKS))
         sel = st.sel.get_tensor(cute.make_layout(16))

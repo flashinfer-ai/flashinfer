@@ -176,7 +176,7 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.use_2cta_instrs = mma_inst_shape[0] == 256
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         self.arch = "sm_107"
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(self.arch)
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
 
         self.occupancy = 1
@@ -605,9 +605,9 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
         self.sf_dtype: Type[cutlass.Numeric] = sfa.element_type
         self.final_scale_dtype = cutlass.Float32
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.ROW_MAJOR  # Always N-major for GEMM output
+        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
+        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(b).mma_major_mode()
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR  # Always N-major for GEMM output
 
         # Check data types
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -932,7 +932,7 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         tidx, _, _ = cute.arch.thread_idx()
 
         # Allocate shared memory
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # Initialize pipelines
@@ -982,7 +982,7 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         )
 
         # Initialize tensor memory allocator
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],

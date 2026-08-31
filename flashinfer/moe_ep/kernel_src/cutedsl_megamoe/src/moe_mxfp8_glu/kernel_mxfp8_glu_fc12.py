@@ -16,7 +16,6 @@ try:
 except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync, tcgen05
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -212,7 +211,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
         self.token_back_warp_id: Optional[Tuple[int, int, int, int]] = None
         self.token_back_standalone: bool = False
 
-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
 
     def _validate_mma_tiler_and_cluster_shape(self) -> None:
@@ -990,13 +989,13 @@ class Sm100SwigluMxfp8Fc12Kernel:
         self.b_dtype: Type[cutlass.Numeric] = fc1_weight_gemm.element_type
         self.fc1_output_dtype: Type[cutlass.Numeric] = fc1_output_gemm.element_type
         self.sf_dtype: Type[cutlass.Numeric] = activation_sf_gemm.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(
+        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
             activation_gemm
         ).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(
+        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
             fc1_weight_gemm
         ).mma_major_mode()
-        self.fc1_output_layout = utils.LayoutEnum.from_tensor(fc1_output_gemm)
+        self.fc1_output_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(fc1_output_gemm)
 
         self._setup_attributes()
         tiled_mma, tiled_mma_sfb = self._create_tiled_mmas()
@@ -1406,7 +1405,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # MegaMoE-only dispatch-warp SMEM (pull_buffer, mbarriers, etc.).
@@ -1467,7 +1466,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
             barrier_id=self.tmem_alloc_sync_bar_id,
             num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_id)),
         )
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_id[0],

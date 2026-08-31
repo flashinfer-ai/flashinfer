@@ -464,7 +464,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
         # Resolve SMEM from the active cuTeDSL target (e.g. SM100 vs SM107).
         self.arch = get_cutedsl_target_arch()
-        self.smem_capacity = utils.get_smem_capacity_in_bytes()
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols(self.arch)
 
     def _setup_attributes(self):
@@ -644,7 +644,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfb_tensor: cute.Tensor,
         c_tensor: cute.Tensor,
         layouts: cutlass.Constexpr[
-            Tuple[OperandMajorMode, OperandMajorMode, utils.LayoutEnum]
+            Tuple[OperandMajorMode, OperandMajorMode, cutlass.tensor_utils.LayoutEnum]
         ],
         problem_mnkl: Tuple[int, int, int, int],
         max_active_clusters: cutlass.Constexpr,
@@ -710,7 +710,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 (cute.assume(n, 32), k, l), order=(1, 0, 2)
             )
         c_layout = cute.make_ordered_layout((cute.assume(m, 32), n, l), order=(0, 1, 2))
-        if cutlass.const_expr(self.c_layout == utils.LayoutEnum.ROW_MAJOR):
+        if cutlass.const_expr(self.c_layout == cutlass.tensor_utils.LayoutEnum.ROW_MAJOR):
             c_layout = cute.make_ordered_layout(
                 (m, cute.assume(n, 32), l), order=(1, 0, 2)
             )
@@ -1022,7 +1022,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         #
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         # Initialize mainloop ab_pipeline (barrier) and states
@@ -1061,7 +1061,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
@@ -1965,7 +1965,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         b_dtype: Type[cutlass.Numeric],
         epi_tile: cute.Tile,
         c_dtype: Type[cutlass.Numeric],
-        c_layout: utils.LayoutEnum,
+        c_layout: cutlass.tensor_utils.LayoutEnum,
         sf_dtype: Type[cutlass.Numeric],
         sf_vec_size: int,
         smem_capacity: int,
@@ -1986,7 +1986,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         :param c_dtype: Data type of operand C (output).
         :type c_dtype: type[cutlass.Numeric]
         :param c_layout: Layout enum of operand C.
-        :type c_layout: utils.LayoutEnum
+        :type c_layout: cutlass.tensor_utils.LayoutEnum
         :param sf_dtype: Data type of Scale factor.
         :type sf_dtype: type[cutlass.Numeric]
         :param sf_vec_size: Scale factor vector size.
@@ -2510,7 +2510,7 @@ class _BlockScaledGemmReferenceLauncher:
         self.layouts = (
             OperandMajorMode.K,
             OperandMajorMode.K,
-            utils.LayoutEnum.ROW_MAJOR,
+            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
         )
         cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1]
         self.max_active_clusters = utils.HardwareInfo().get_max_active_clusters(

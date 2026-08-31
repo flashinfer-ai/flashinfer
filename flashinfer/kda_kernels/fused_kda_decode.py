@@ -28,7 +28,7 @@ import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 import torch
-from cutlass.utils import SmemAllocator
+from cutlass.memory import SmemAllocator
 import tvm_ffi  # noqa: F401 -- TVM FFI is required for kernel dispatch
 
 from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel

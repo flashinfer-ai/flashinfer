@@ -112,7 +112,7 @@ class SM107PersistentDenseGemmKernel(BlackwellPersistentDenseGemmKernel):
             raster_along,
         )
         self.arch = "sm_107"
-        self.smem_capacity = utils.get_smem_capacity_in_bytes(self.arch)
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes(self.arch)
         self.mma_tiler = mma_tiler
         self.mma_inst_shape = mma_inst_shape
         # Bkeep-Breuse pattern is controlled by mma_inst_shape and mma_tiler
@@ -315,7 +315,7 @@ class SM107PersistentDenseGemmKernel(BlackwellPersistentDenseGemmKernel):
             tmem_dealloc_mbar_ptr: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Initialize mainloop ab_pipeline (barrier) and states
@@ -362,7 +362,7 @@ class SM107PersistentDenseGemmKernel(BlackwellPersistentDenseGemmKernel):
                 num_threads=32 * len(self.epilogue_warp_id),
             )
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_id[0],
@@ -731,9 +731,13 @@ class SM107PersistentDenseGemmKernel(BlackwellPersistentDenseGemmKernel):
         self.a_dtype: Type[cutlass.Numeric] = a.element_type
         self.b_dtype: Type[cutlass.Numeric] = b.element_type
         self.c_dtype: Type[cutlass.Numeric] = c.element_type
-        self.a_major_mode = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        self.b_major_mode = utils.LayoutEnum.from_tensor(b).mma_major_mode()
-        self.c_layout = utils.LayoutEnum.from_tensor(c)
+        self.a_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            a
+        ).mma_major_mode()
+        self.b_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(
+            b
+        ).mma_major_mode()
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(c)
 
         tiled_mma = self._create_tiled_mma()
         # Create Bkeep-Breuse tiled_mma variants if enabled

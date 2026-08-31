@@ -10,7 +10,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import tcgen05, OperandMajorMode
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import (
     Agent,
@@ -310,7 +309,7 @@ class GroupedQueryAttentionDecodePaged:
         smem_alloc_bits += o_stages * pipe_stage_bits  # o in tmem
         alignment_bits = 1024 - (smem_alloc_bits % 1024)
         # K, V
-        smem_capacity_bits = utils.get_smem_capacity_in_bytes("sm_100") * 8
+        smem_capacity_bits = cutlass.memory.get_smem_capacity_in_bytes("sm_100") * 8
         remaining_bits = smem_capacity_bits - smem_alloc_bits - alignment_bits
         kv_stages = remaining_bits // mk_stage_bits
         kv_stages -= 1 if kv_stages * pipe_stage_bits > alignment_bits else 0
@@ -569,7 +568,7 @@ class GroupedQueryAttentionDecodePaged:
         # Smem alloc helper
         svector_align = 16
         stensor_align = 128
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
 
         # No multicast
         mcast_coord = 0

@@ -130,7 +130,7 @@ def ublkcp_bench_kernel(
     warp_idx = cute.arch.make_warp_uniform(tidx // Int32(32))
     lane_idx = cute.arch.lane_idx()
 
-    smem = cutlass.utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
     pull_mbar = smem.allocate_array(Int64, NUM_WARPS)
     payload = smem.allocate_array(Uint8, NUM_WARPS * y_copy_per_iter * z_bytes_per_inst)
 
@@ -373,7 +373,7 @@ def smem_capacity_bytes() -> int:
     major, minor = torch.cuda.get_device_capability(0)
     arch = f"sm_{major}{minor}"
     try:
-        return int(cutlass.utils.get_smem_capacity_in_bytes(arch))
+        return int(cutlass.memory.get_smem_capacity_in_bytes(arch))
     except Exception:
         if major >= 10:
             return 227 * 1024

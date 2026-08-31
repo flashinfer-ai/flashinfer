@@ -3272,7 +3272,7 @@ def prepare_kernel(
     lane = tidx % 32
     head = bidy
 
-    alloc = cutlass.utils.SmemAllocator()
+    alloc = cutlass.memory.SmemAllocator()
     p_kd = alloc.allocate_array(cutlass.BFloat16, BT * DK)
     # Four resident CTAs are reachable and were measured: at CPC == 1 the raw
     # Q and K stages are dead after the Kd/Ki/Qd loop, so Qd can overwrite Q
@@ -4211,7 +4211,7 @@ def recurrence_kernel(
     # --- fixed arena ------------------------------------
     # One allocation of exactly SMEM_DYNAMIC_BYTES, so the launch parameter is
     # the plan's number and every address is a compile-time constant offset.
-    alloc = cutlass.utils.SmemAllocator()
+    alloc = cutlass.memory.SmemAllocator()
     p_base = alloc.allocate(SMEM_DYNAMIC_BYTES, 1024)
     p16 = cute.recast_ptr(p_base, dtype=cutlass.BFloat16)
     p32 = cute.recast_ptr(p_base, dtype=cutlass.Float32)

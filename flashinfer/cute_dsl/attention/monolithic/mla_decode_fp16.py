@@ -67,7 +67,6 @@ def _get_max_tmem_alloc_cols(compute_capability: str) -> int:
 
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 import cutlass.cute.nvgpu.cpasync as cpasync
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -1102,11 +1101,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
             cpasync.prefetch_descriptor(tma_atom_c_latent_transpose)
 
         # Alloc
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_ptr_sync_bar,
             allocator_warp_id=self.mma_warp_id,
@@ -1710,7 +1709,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
 
         # In the variable-Q specialization, inactive CTAs still execute the
         # balanced PDL protocol but do not touch workspace or outputs.
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.reducer_max_splits * self.acc_dtype.width // 8, 16)
         lse_scale_ptr = cute.recast_ptr(storage, dtype=self.acc_dtype)
         smem_lse_scale = cute.make_tensor(

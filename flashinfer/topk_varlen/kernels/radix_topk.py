@@ -25,7 +25,7 @@ from cutlass.cute.typing import Int32 as CuteInt32
 from cutlass.cute.typing import Pointer as CutePointer
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils.distributed import atomicAdd
-from cutlass.utils.smem_allocator import SmemAllocator
+from cutlass.memory import SmemAllocator
 
 from .block_scan import block_prefix_sum_kernel
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait

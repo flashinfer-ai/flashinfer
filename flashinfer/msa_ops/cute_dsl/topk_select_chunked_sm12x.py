@@ -139,7 +139,7 @@ class TopKSelectChunkedSm12x:
         class SharedStorage:
             score: cute.struct.MemRange[cutlass.Uint32, _MAX_CHUNK_BLOCKS]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         st = smem.allocate(SharedStorage)
         score = st.score.get_tensor(cute.make_layout(_MAX_CHUNK_BLOCKS))
 
@@ -221,7 +221,7 @@ class TopKSelectChunkedSm12x:
         class SharedStorage:
             score: cute.struct.MemRange[cutlass.Uint32, _MAX_CHUNK_BLOCKS * _QTILE]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         st = smem.allocate(SharedStorage)
         score = st.score.get_tensor(cute.make_layout(_MAX_CHUNK_BLOCKS * _QTILE))
 
@@ -308,7 +308,7 @@ class TopKSelectChunkedSm12x:
             idx: cute.struct.MemRange[cutlass.Int32, _MAX_CHUNKS * 16]
             sel: cute.struct.MemRange[cutlass.Int32, 16]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         st = smem.allocate(SharedStorage)
         key = st.key.get_tensor(cute.make_layout(_MAX_CHUNKS * 16))
         idx = st.idx.get_tensor(cute.make_layout(_MAX_CHUNKS * 16))

@@ -20,7 +20,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.utils as utils
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32
 
 from ..cute_dsl_primitives import (
@@ -308,7 +307,7 @@ class _MoeFinalizeAllReduceRMSNormHTDeviceKernel:
         cta_slot = block % self.tp
         wave = Int64(cta_group)
         token = wave * self.tp + cta_slot
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         rows = storage.rows.get_tensor(smem_layout)
         barrier_storage = storage.barriers.data_ptr()

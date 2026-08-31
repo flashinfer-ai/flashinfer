@@ -349,7 +349,7 @@ class SparseDecodeForwardSm12x:
                     1024,
                 ]
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             storage = smem.allocate(SharedStorage)
             sK_all = storage.sK.get_tensor(sKV_all_layout)
             sV_all = storage.sV.get_tensor(sKV_all_layout)
@@ -908,7 +908,7 @@ class SparseDecodeForwardSm12x:
                 1024,
             ]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sK = storage.sK.get_tensor(sKV_layout)
         sV = storage.sV.get_tensor(sKV_layout)
@@ -1335,7 +1335,7 @@ class SparseCombineSm12x:
             s_lse: cute.struct.MemRange[cutlass.Float32, self._topk]
             s_lse_t: cute.struct.MemRange[cutlass.Float32, lse_t_slots]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         s_lse = storage.s_lse.get_tensor(cute.make_layout(self._topk))
         s_lse_t = storage.s_lse_t.get_tensor(cute.make_layout(lse_t_slots))

@@ -66,7 +66,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass import BFloat16, Float4E2M1FN, Float8E8M0FNU, Float16, Int32
@@ -538,7 +537,7 @@ class FP4MQALogitsKernel:
         # acc TMEM (per math WG, per UMMA stage)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
         tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
-        self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(
+        self.num_tmem_alloc_cols = cutlass.memory.get_num_tmem_alloc_cols(
             tCtAcc_fake, rounding=False
         )
 
@@ -615,7 +614,7 @@ class FP4MQALogitsKernel:
         )
         # TMEM allocator requires num_columns to be a power of two AND a
         # multiple of 32, between 32 and 512. Round up to next valid value.
-        # Equivalent to utils.get_num_tmem_alloc_cols(..., rounding=True) but
+        # Equivalent to cutlass.memory.get_num_tmem_alloc_cols(..., rounding=True) but
         # without needing a tmem tensor handle (we already have raw_total).
         self.num_tmem_alloc_cols_total = max(1 << math.ceil(math.log2(raw_total)), 32)
         assert self.num_tmem_alloc_cols_total <= 512, (
@@ -711,8 +710,8 @@ class FP4MQALogitsKernel:
 
         a_dtype = a.element_type
         b_dtype = b.element_type
-        a_major = utils.LayoutEnum.from_tensor(a).mma_major_mode()
-        b_major = utils.LayoutEnum.ROW_MAJOR.mma_major_mode()
+        a_major = cutlass.tensor_utils.LayoutEnum.from_tensor(a).mma_major_mode()
+        b_major = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR.mma_major_mode()
 
         tiled_mma = self._setup_mma(a_dtype, b_dtype, a_major, b_major)
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
@@ -978,7 +977,7 @@ class FP4MQALogitsKernel:
             cpasync.prefetch_descriptor(tma_atom_sf_kv)
             cpasync.prefetch_descriptor(tma_atom_sf_q)
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         block_kv_val = self.block_kv
@@ -1117,7 +1116,7 @@ class FP4MQALogitsKernel:
         # 64 threads = 32 (umma_warp_0) + 32 (umma_warp_1). DeepGEMM avoids this
         # entirely by issuing both groups' UMMAs from a single UMMA warp.
         sfb_sync_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=64)
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=0,  # math warp 0 does alloc+free (last TMEM consumer)
@@ -1300,7 +1299,7 @@ class FP4MQALogitsKernel:
         num_tmem_alloc_cols_total = self.num_tmem_alloc_cols_total
 
         # Epilogue setup
-        c_layout = utils.LayoutEnum.ROW_MAJOR
+        c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
         epi_sub_mn = (epi_tile[0], num_heads // num_epi_subtiles)
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             self.cta_tile_shape_mnk,

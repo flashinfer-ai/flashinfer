@@ -77,7 +77,7 @@ def dispatch_kernel(
         flag_batch=flag_batch,
         is_swap_ab=True,
     )
-    smem = cutlass.utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
     storage = smem.allocate(token_comm.extra_smem_storage_class())
 
     sm_idx = cute.arch.block_idx()[0]

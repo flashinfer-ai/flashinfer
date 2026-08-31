@@ -19,7 +19,6 @@ except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
     from src.iket_compat import iket
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.typing import AddressSpace
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 
@@ -1988,7 +1987,7 @@ class SwapABSwigluFp4Epilogue:
         use_2cta_instrs: bool,
         sf_vec_size: int,
         fc1_output_dtype: Type[cutlass.Numeric],
-        fc1_output_layout: utils.LayoutEnum,
+        fc1_output_layout: cutlass.tensor_utils.LayoutEnum,
         fc2_output_dtype: Type[cutlass.Numeric],
         non_ubulk_fc2_store: bool,
         in_kernel_fc2_reduce: bool,

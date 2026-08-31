@@ -52,7 +52,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
-from cutlass.utils import TensorMapManager, TensorMapUpdateMode
+from cutlass.tensor_utils import TensorMapManager, TensorMapUpdateMode
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.cute.nvgpu import cpasync, tcgen05, OperandMajorMode
@@ -677,7 +677,7 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
 
         o_smem_layout_staged = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
-            cutlass.utils.LayoutEnum.from_tensor(o),
+            cutlass.tensor_utils.LayoutEnum.from_tensor(o),
             self.mma_tiler_qkv[:2],
             self.smem_o_stages,
         )
@@ -1049,7 +1049,7 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         # ------------------------------------------------------------------
         # 1. Allocate SMEM / TMEM, prefetch TMA descriptors
         # ------------------------------------------------------------------
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         sQ = storage.sQ.get_tensor(
@@ -1090,7 +1090,7 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             cpasync.prefetch_descriptor(tma_o.atom)
 
         # TMEM allocator object - CG1 will issue the actual allocation
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             # CG1 owns allocation and is the last group to release TMEM state.

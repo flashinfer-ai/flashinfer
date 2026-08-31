@@ -246,7 +246,7 @@ class MsaProxyScoreSm12x:
                     1024,
                 ]
 
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             storage = smem.allocate(SharedStorage)
             sQ = storage.sQ.get_tensor(sQ_layout)
             sK = storage.sK.get_tensor(sK_layout)
@@ -652,7 +652,7 @@ class MsaProxyScoreDecodePackedSm12x(MsaProxyScoreSm12x):
                 1024,
             ]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sQ = storage.sQ.get_tensor(sQ_layout)
         sK = storage.sK.get_tensor(sK_layout)
@@ -928,7 +928,7 @@ class MsaProxyScoreDecodePackedFp8Sm12x(MsaProxyScoreDecodePackedSm12x):
                 16,
             ]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sQ = storage.sQ.get_tensor(sQ_layout)
         sK0 = storage.sK0.get_tensor(sK_layout)
@@ -1548,7 +1548,7 @@ class MsaProxyScoreDecodeKeyMajorSm12x:
         kw = hd // 2 if self._kv_fp8 else hd
         qw = hd // 2 if self._q_fp8 else hd
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sK_full = smem.allocate_tensor(
             dtype,
             k_tma.smem_layout.outer,
@@ -2106,7 +2106,7 @@ class MsaProxyScoreDecodeStreamSm12x:
         class SharedStorage:
             s_max: cute.struct.MemRange[cutlass.Float32, self._NUM_WARPS * G]
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         s_max = storage.s_max.get_tensor(
             cute.make_layout((self._NUM_WARPS, G), stride=(G, 1))

@@ -33,7 +33,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.pipeline as pipeline
-import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
@@ -127,7 +126,7 @@ class SSDKernel:
                 *self.epilog_warp_id,
             )
         )
-        self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
+        self.smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
 
         # Named barriers
         self.pre_inter_sync_bar_id = 1
@@ -201,7 +200,7 @@ class SSDKernel:
         # the transposed view (L, D) needs ROW_MAJOR to keep D contiguous in mode 1.
         self.xt_smem_layout = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
-            utils.LayoutEnum.ROW_MAJOR,
+            cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
             self.tile_shape_mnk_intra2[:2],
             self.input_stages,
         )
@@ -231,7 +230,7 @@ class SSDKernel:
         self.bt_smem_layout = cute.coalesce(
             sm100_utils.make_smem_layout_epi(
                 self.io_dtype,
-                utils.LayoutEnum.COL_MAJOR,
+                cutlass.tensor_utils.LayoutEnum.COL_MAJOR,
                 (self.tile_shape_mnk_inter1[0], self.tile_shape_mnk_inter1[2]),
                 self.input_stages,
             ),
@@ -244,7 +243,7 @@ class SSDKernel:
         self.bt_store_smem_layout = cute.coalesce(
             sm100_utils.make_smem_layout_epi(
                 self.io_dtype,
-                utils.LayoutEnum.ROW_MAJOR,
+                cutlass.tensor_utils.LayoutEnum.ROW_MAJOR,
                 (self.tile_shape_mnk_inter1[0], self.tile_shape_mnk_inter1[2]),
                 self.internal_stages,
             ),
@@ -273,7 +272,7 @@ class SSDKernel:
         # PT is ACC operand (from tmem) of INTER1_MMA, after postprocessed by PRE_INTER
         self.pt_smem_layout = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
-            utils.LayoutEnum.COL_MAJOR,
+            cutlass.tensor_utils.LayoutEnum.COL_MAJOR,
             self.tile_shape_mnk_inter1[:2],
             self.internal_stages,
         )
@@ -289,7 +288,7 @@ class SSDKernel:
         # P is ACC operand (from tmem) of INTER1_MMA, to be TMA stored by PRE_INTER
         self.p_smem_layout_store = sm100_utils.make_smem_layout_epi(
             self.state_dtype,
-            utils.LayoutEnum.COL_MAJOR,
+            cutlass.tensor_utils.LayoutEnum.COL_MAJOR,
             (self.tile_shape_mnk_inter2[2], self.tile_shape_mnk_inter2[1]),
             self.internal_stages,
         )
@@ -303,7 +302,7 @@ class SSDKernel:
         self.p_smem_layout_load = (
             sm100_utils.make_smem_layout_epi(
                 self.state_dtype,
-                utils.LayoutEnum.COL_MAJOR,
+                cutlass.tensor_utils.LayoutEnum.COL_MAJOR,
                 (
                     self.tile_shape_mnk_inter2[2],
                     self.tile_shape_mnk_inter2[1],
@@ -325,7 +324,7 @@ class SSDKernel:
         # Y is ACC operand (from smem) of INTER2_MMA and INTRA2_MMA, after postprocessed and TMA stored by EPILOG
         self.y_smem_layout = sm100_utils.make_smem_layout_epi(
             self.io_dtype,
-            utils.LayoutEnum.COL_MAJOR,
+            cutlass.tensor_utils.LayoutEnum.COL_MAJOR,
             self.epi_tile,
             self.output_stages,
         )
@@ -840,7 +839,7 @@ class SSDKernel:
         local_warp_idx = cute.arch.make_warp_uniform(local_tidx // 32)
 
         # Alloc and init smem tensors and pipelines
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         smem_storage = smem.allocate(self.shared_storage)
 
         # Setup smem tensors
