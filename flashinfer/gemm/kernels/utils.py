@@ -34,9 +34,17 @@ _SM100_MMA_TILER_MN_CANDIDATES = [
 # Bounded by the number of unique (N, K) pairs in the model (typically < 50).
 _SM100_MM_FP4_TACTIC_CACHE: dict[tuple, dict] = {}
 
-# M bucket boundaries — powers of 2 for fast bucketing via
-# next_positive_power_of_2 (imported from flashinfer.utils).
+# Eager M bucket boundaries — powers of 2 for fast bucketing via
+# next_positive_power_of_2 (imported from flashinfer.utils). Larger buckets are
+# added lazily: capping the fallback at 4096 made all large prefill shapes use
+# the M=4096 decision even though their preferred orientation can change.
 _M_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096)
+
+# The matched SM100/SM107 microbenchmarks show that the old narrow-M
+# orientation rule is no longer predictive above M=8192. Large-M preference
+# also varies with N and cache state, so leave both orientations unpenalized
+# there instead of imposing a new swap_ab=True rule.
+_MM_FP4_SWAP_PENALTY_MAX_M = 8192
 
 
 _SM100_CLUSTER_SHAPE_MN_CANDIDATES = [
@@ -156,11 +164,47 @@ def _score_sm100_mm_fp4_tactic(
     if tile_n < 64 and prob_n > tile_n:
         score *= 1e-6
 
-    # 6. Penalize deviations from the swap rule mildly, so both swap variants stay in the top-N.
+    # 6. Penalize deviations from the established narrow-M orientation rule
+    # mildly. At large M, N-dependent launch geometry and cache state can flip
+    # the preferred orientation, so neither orientation receives a score
+    # offset.
     rule_swap = (n % 8 == 0) and (1 <= m <= 32) and n > m
-    if swap_ab != rule_swap:
+    if m <= _MM_FP4_SWAP_PENALTY_MAX_M and swap_ab != rule_swap:
         score *= 0.95
     return score
+
+
+def _score_mm_fp4_autotune_tactic(
+    m, n, real_k, sm_count, mma_tiler_mn, cluster_shape_mn, swap_ab
+):
+    """Score an FP4 tactic for measured autotune candidate pre-ranking.
+
+    At large M, the shared analytical scorer leaves both orientations neutral,
+    allowing measured autotuning to benchmark them without an orientation
+    pre-ranking bias.
+    """
+    return _score_sm100_mm_fp4_tactic(
+        m, n, real_k, sm_count, mma_tiler_mn, cluster_shape_mn, swap_ab
+    )
+
+
+def _rank_mm_fp4_autotune_tactics(valid_tactics, m, n, real_k, sm_count, max_tactics):
+    """Rank and return at most ``max_tactics`` actual mm_fp4 tactics.
+
+    SM100 has two tactics per structural configuration because
+    ``use_prefetch`` is a Boolean. SM103 and SM107 encode their architecture
+    knobs in the final tuple field and usually have one tactic per grouping
+    key. Counting actual tactics avoids assuming every ranked group expands
+    to two benchmark candidates.
+    """
+
+    def score(tactic):
+        tile, cluster, swap_ab, _, _, _ = tactic
+        return _score_mm_fp4_autotune_tactic(
+            m, n, real_k, sm_count, tile, cluster, swap_ab
+        )
+
+    return sorted(valid_tactics, key=score, reverse=True)[:max_tactics]
 
 
 def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
@@ -191,7 +235,11 @@ def _select_sm100_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
             )
         _SM100_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
 
-    bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
+    bucket = next_positive_power_of_2(m)
+    if bucket not in bucket_tactics:
+        bucket_tactics[bucket] = _compute_tactic_for_m(
+            bucket, n, real_k, sm_count, sf_vec_size
+        )
     return bucket_tactics[bucket]
 
 
@@ -375,5 +423,9 @@ def _select_sm107_mm_fp4_cute_dsl_tactic(m, n, real_k, sm_count, sf_vec_size):
             )
         _SM107_MM_FP4_TACTIC_CACHE[cache_key] = bucket_tactics
 
-    bucket = min(next_positive_power_of_2(m), _M_BUCKETS[-1])
+    bucket = next_positive_power_of_2(m)
+    if bucket not in bucket_tactics:
+        bucket_tactics[bucket] = _compute_sm107_tactic_for_m(
+            bucket, n, real_k, sm_count, sf_vec_size
+        )
     return bucket_tactics[bucket]
