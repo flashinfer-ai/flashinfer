@@ -9,15 +9,23 @@ to the natural device/shape dispatcher and records its resolved module; use
 `--candidate-route nonpersistent` for a B200 direct-family route A/B.
 `bench_recurrent_kda_prefill.py --case-set small_bh` runs the four fixed-layout
 small-BH cases through the same cold-L2 CUPTI path.
+`bench_recurrent_kda_prefill.py --case-set production --backend cake` runs the
+complete 29-shape fixed/packed inference portfolio. Its JSON records the logical
+route, every physical Cake module used (including BT16 prepare plus chain), and
+the explicit per-shape dry/repeat iteration budget. Large state shapes reduce
+the sample count to stay within the rotating-state capacity and set
+`timing_iteration_budget.low_sample_count` when fewer than ten measured
+iterations fit. `--dry-run-iters` and `--repeat-iters` request fixed iteration
+counts; they are not duration targets.
 
 ## Overview
 
 This framework provides tools to:
-- Benchmark FlashInfer's Attention, GEMM, MOE, Norm, Quantization, Sampling, RoPE, Mamba, and GDN API performance from different kernel backends such as FlashAttention2/3, cuDNN, cuBLAS, CUTLASS, PrimTS, CuTe-DSL, TensorRT-LLM, and Triton
+- Benchmark FlashInfer's Attention, GEMM, MOE, Norm, Quantization, Sampling, RoPE, Mamba, GDN, and KDA API performance from different kernel backends such as FlashAttention2/3, cuDNN, cuBLAS, CUTLASS, PrimTS, CuTe-DSL, TensorRT-LLM, and Triton
 - Compare performance across different configurations
 - Batch performance test multiple test cases
 
-Currently supports testing attention, gemm, fused MOE, normalization, quantization, sampling, RoPE, Mamba, and GDN (Gated Delta Net) APIs:
+Currently supports testing attention, gemm, fused MOE, normalization, quantization, sampling, RoPE, Mamba, GDN (Gated Delta Net), and KDA APIs:
 - Attention:
     - `BatchDecodeWithPagedKVCacheWrapper` - Decode attention with paged KV cache.
         - Also supports computationally similar `cudnn_batch_decode_with_kv_cache` and `trtllm_batch_decode_with_kv_cache`.
@@ -92,6 +100,8 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `gated_delta_rule_decode` - Single-token (T=1) gated delta rule decode. `--state_layout` selects between `gated_delta_rule_decode_pretranspose` ([B, HV, V, K] state, default) and `gated_delta_rule_decode` ([B, HV, K, V] state). `--state_dtype bfloat16` selects the BF16 state kernels (head_size=128, pretranspose only). Backends: `flashinfer` (CuTe-DSL) and `triton` (reference).
     - `gated_delta_rule_mtp` - Multi-token (T>=2) gated delta rule for speculative-decoding verification, with a state pool + indices. `--state_dtype float32` uses `gated_delta_rule_mtp`; `--state_dtype bfloat16` uses the BF16 MTP kernel via `gated_delta_rule_decode_pretranspose`. Backends: `flashinfer`, `triton`.
     - `chunk_gated_delta_rule` - Chunked GDN prefill over varlen sequences (uniform per-sequence length `--s_qo`). Backends: `flashinfer` (SM90 C++ / SM100 CuTe-DSL) and `fla` (flash-linear-attention Triton baseline, perf-only).
+- KDA (SM120a):
+    - `recurrent_kda_prefill` - Ordinary multi-token recurrent KDA prefill with fixed or packed inputs. Backends: `flashinfer` (automatic variant policy), `flashinfer-decomp`, `flashinfer-fused`, and optional external `cutekda` / `flash-kda` baselines.
 
 ## Quick Start
 ### Single Test Run
@@ -568,6 +578,7 @@ Legend:
 | **gated_delta_rule_decode** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
 | **gated_delta_rule_mtp** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
 | **chunk_gated_delta_rule** |  |  |  |  | flashinfer, fla | flashinfer, fla | flashinfer, fla |  |
+| **recurrent_kda_prefill** |  |  |  |  |  |  |  | flashinfer, flashinfer-decomp, flashinfer-fused, cutekda, flash-kda |
 
 Backend Legend:
 - fa2: FlashAttention2
@@ -588,3 +599,5 @@ Backend Legend:
 - allreduce: AllReduce fusion communication (requires mpirun, Blackwell SM10.0+ with MNNVL)
 - triton: Triton reference kernels (used for Mamba selective_state_update and GDN decode/MTP)
 - fla: flash-linear-attention Triton kernels (GDN prefill baseline)
+- flashinfer-decomp / flashinfer-fused: pinned SM120 KDA prefill variants
+- cutekda / flash-kda: optional external SM120 KDA prefill baselines
