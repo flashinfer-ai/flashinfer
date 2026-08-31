@@ -465,9 +465,9 @@ def get_tinygemm2_module():
 
 # tinygemm2_sm100: generated SM100-family variants of the same kernel. Loom
 # schedules exactly porting csrc/tinygemm2.cu with bit-identical outputs;
-# selected automatically for the bias path on B200/B300/Rubin-class devices.
-# Ring depth (stage 4/8/16) is selected inside the binding, mirroring the
-# reference launcher convention.
+# selected automatically for the bias path on SM100/SM103/SM107. Ring depth
+# (stage 4/8/16) is selected inside the binding, mirroring the reference
+# launcher convention.
 
 
 @functools.cache
@@ -490,12 +490,11 @@ def get_tinygemm2_sm100_module():
     return SimpleNamespace(tinygemm2_sm100_op=tinygemm2_sm100_op_impl)
 
 
-# The generated kernels use no SM100-exclusive ISA, so they are family-portable
-# across the SM100 line: SM100 (B200), SM103 (B300/GB300) and SM107 (Rubin).
-# SM107 builds target sm_100f (see gen_tinygemm2_sm100_module) until the bundled
-# CUTLASS gains native compute_107a. Any other 10.x device passes
-# is_sm100a_supported's major==10 predicate but must keep using the reference
-# kernel, so the tuple stays explicit rather than testing major alone.
+# The generated kernels use no SM100-exclusive ISA, so they are portable across
+# SM100, SM103 and SM107 (SM107 builds target sm_100f; see
+# gen_tinygemm2_sm100_module). Other 10.x devices pass is_sm100a_supported's
+# major==10 predicate but must keep using the reference kernel, so the tuple
+# stays explicit rather than testing major alone.
 _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 
@@ -556,7 +555,7 @@ def tinygemm_bf16(
     Requires SM90+ (Hopper or newer).  Raises ``ValueError`` if tensor
     dimensions, dtypes, or alignment constraints are violated.
 
-    On SM100/SM103/SM107 (B200/B300/Rubin class) devices the bias path
+    On SM100/SM103/SM107 devices the bias path
     dispatches to ``tinygemm2_sm100`` — generated variants of the same kernel
     with bit-identical outputs and lower latency (see
     ``csrc/tinygemm2_sm100.cu``).  Set ``FLASHINFER_DISABLE_TINYGEMM2_SM100=1``

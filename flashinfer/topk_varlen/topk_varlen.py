@@ -874,14 +874,8 @@ def _radix_top_k_varlen_check(
     """CuTe DSL multi-CTA radix: Blackwell only, no pre_idx required."""
     if not _CUTE_DSL_AVAILABLE:
         return False
-    # Having the package is not enough: the installed DSL must also be able to
-    # emit for this device. DSL releases before 4.8 have no ``sm_107a`` member
-    # in ``cutlass.base_dsl.arch.Arch``, so compiling this kernel on Rubin dies
-    # with ``KeyError: 'sm_107a'`` deep inside the DSL unless the user exported
-    # ``CUTE_DSL_ARCH=sm_100f`` before ``cutlass`` was first imported. Returning
-    # False here makes backend="auto" fall back to radix_cutlass instead.
-    # Imported lazily: cute_dsl/utils.py has a top-level ``import cutlass``,
-    # which this module deliberately avoids at import time.
+    # Imported lazily: cute_dsl/utils.py imports cutlass at module scope, which
+    # this module deliberately avoids at import time.
     try:
         from ..cute_dsl.utils import is_cute_dsl_arch_supported
     except Exception:
