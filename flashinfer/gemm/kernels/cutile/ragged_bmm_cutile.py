@@ -712,13 +712,15 @@ def ragged_bmm(
         a: Input matrix A, flattened [total_m, K] or [K, total_m] if transpose_a
         b: Input matrix B, batched [Q, N, K] or [Q, K, N] if not transpose_b
         m_indptr: Segment offsets tensor [Q+1]
-        max_m: Host-side maximum segment size hint (used for grid sizing and
-            autotune cache key). Should be >= max per-batch valid_m.
+        max_m: Host-side maximum segment size hint (used for the autotune
+            cache key and the swap_ab heuristic). Grid is sized from total_m
+            and the kernel's loop bound comes from max_m_device, so an
+            understated hint no longer truncates output.
         max_m_device: Optional [1]-shape int tensor with the device-side ground
             truth for max(valid_m). When provided, the kernel uses this value
             for its persistent-loop bound — making the kernel robust to a
-            host-side max_m underestimate. When None, a fallback tensor is
-            materialized from `max_m`.
+            host-side max_m underestimate. When None, it is derived on-device
+            from m_indptr (not from `max_m`, which would be circular).
         transpose_a: Whether A is transposed
         transpose_b: Whether B is transposed
         out_dtype: Output dtype
@@ -758,13 +760,22 @@ def ragged_bmm(
         out_dtype = a.dtype
     c = torch.empty((total_m, N), device=a.device, dtype=out_dtype)
 
+    # Nothing to compute for an empty stack; also makes the m_indptr-derived
+    # amax below well-defined (an empty seg_lens has no max) and avoids a
+    # degenerate launch grid.
+    if Q == 0 or total_m == 0:
+        return c
+
     # Materialize fallback max_m_device if the caller didn't pass one. The
-    # kernel always reads its grid bound from a device tensor (defense-in-depth),
-    # so we keep the call sites uniform.
-    # Note: this mirrors the NVT triton kernel, which always reads its grid
-    # bound from a device tensor.
+    # kernel always reads its persistent-loop bound from a device tensor
+    # (defense-in-depth), so we keep the call sites uniform.
+    # Derive it from m_indptr rather than the host `max_m` hint: synthesizing
+    # it from `max_m` would be circular — an understated hint would still
+    # truncate tiles and leave output rows uninitialized. Computed on-device
+    # (async, no GPU->CPU sync) so it stays CUDA-graph safe.
     if max_m_device is None:
-        max_m_device = torch.tensor([max_m], dtype=torch.int32, device=a.device)
+        seg_lens = (m_indptr[1:] - m_indptr[:-1]).to(torch.int32)
+        max_m_device = torch.amax(seg_lens, dim=0, keepdim=True)
 
     # Check if autotune is enabled
     enable_autotune = not _AUTOTUNE_DISABLED
