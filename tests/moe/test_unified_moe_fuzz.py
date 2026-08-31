@@ -224,7 +224,6 @@ from flashinfer.fused_moe.api import (
     TrtllmFp8PerTensorConfig,
     TrtllmMxInt4Config,
 )
-from flashinfer.fused_moe.capabilities import get_moe_backend_capabilities
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
 from flashinfer.fused_moe.runners import _TrtllmRunnerBase
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
@@ -2220,22 +2219,24 @@ def test_contract_handler_inventory_is_single_backend_and_non_deterministic():
 
 
 def test_contract_curated_seeds_match_declared_capabilities():
-    rows = {
-        (row.backend_key, row.quant_variant): row
-        for row in get_moe_backend_capabilities()
-    }
     contract_cases = [cfg for cfg in _CURATED if cfg.variant in _CONTRACT_HANDLERS]
     assert {cfg.seed for cfg in contract_cases} == set(range(900_080, 900_102))
     for cfg in contract_cases:
         handler = _handler_for(cfg)
         config_type = handler.candidate_configs[0]
-        row = rows[(cfg.expected_backend, handler.variant)]
-        assert row.config_type is config_type
-        assert type(_activation_for(cfg)) in row.activation_classes
+        runner_type = _BACKEND_RUNNERS[config_type]
+        assert handler.variant in runner_type.supported_quant_variants
+        by_quant = runner_type.supported_activation_classes_by_quant
+        activations = (
+            by_quant[handler.variant]
+            if by_quant
+            else runner_type.supported_activation_classes
+        )
+        assert type(_activation_for(cfg)) in activations
         assert cfg.routing_input_mode == "prerouted"
         assert cfg.do_finalize and not cfg.is_ep
         assert cfg.num_fused_shared_experts == 0
-        assert _BACKEND_RUNNERS[config_type].backend_key == cfg.expected_backend
+        assert runner_type.backend_key == cfg.expected_backend
 
 
 def test_semantic_reference_applies_situ_clamp():

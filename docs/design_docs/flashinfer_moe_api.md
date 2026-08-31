@@ -722,7 +722,7 @@ The class-level matrix below is generated from the registered runner classes.
 Regenerate its contents with:
 
 ```bash
-python -c "from flashinfer.fused_moe.capabilities import render_moe_activation_matrix as r; print(r())"
+python scripts/generate_moe_activation_matrix.py --write
 ```
 
 <!-- BEGIN GENERATED MOE ACTIVATION MATRIX -->

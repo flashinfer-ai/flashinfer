@@ -1,35 +1,39 @@
-"""CPU-only consistency checks for Unified MoE capability metadata."""
+"""CPU-only consistency checks for the generated Unified MoE activation matrix."""
 
-from pathlib import Path
+import pytest
 
-from flashinfer.fused_moe.capabilities import (
-    get_moe_backend_capabilities,
-    render_moe_activation_matrix,
+from flashinfer.fused_moe.api import QuantVariant, SwiGLU
+from scripts import generate_moe_activation_matrix as matrix
+from scripts.generate_moe_activation_matrix import (
+    check_activation_matrix,
+    get_activation_matrix_rows,
 )
 
 
-def test_registered_capability_records_are_unique_and_complete():
-    rows = get_moe_backend_capabilities()
-    keys = [(row.backend_key, row.quant_variant) for row in rows]
+def test_activation_matrix_rows_are_unique_and_complete():
+    rows = get_activation_matrix_rows()
+    keys = [(backend_key, variant) for backend_key, _, variant, _ in rows]
 
     assert rows
     assert len(keys) == len(set(keys))
-    assert all(row.activation_classes for row in rows)
+    assert all(activations for _, _, _, activations in rows)
 
 
 def test_documented_activation_matrix_matches_runner_registry():
-    doc_path = (
-        Path(__file__).resolve().parents[2]
-        / "docs"
-        / "design_docs"
-        / "flashinfer_moe_api.md"
-    )
-    text = doc_path.read_text()
-    begin = "<!-- BEGIN GENERATED MOE ACTIVATION MATRIX -->"
-    end = "<!-- END GENERATED MOE ACTIVATION MATRIX -->"
+    check_activation_matrix()
 
-    documented = text.split(begin, 1)[1].split(end, 1)[0].strip()
-    assert documented == render_moe_activation_matrix(), (
-        'regenerate with: python -c "from flashinfer.fused_moe.capabilities '
-        'import render_moe_activation_matrix as r; print(r())"'
-    )
+
+def test_quant_specific_activation_mapping_must_cover_exact_variants(monkeypatch):
+    class Config:
+        pass
+
+    class Runner:
+        backend_key = "incomplete"
+        supported_quant_variants = (QuantVariant.BF16, QuantVariant.NVFP4)
+        supported_activation_classes_by_quant = {
+            QuantVariant.BF16: (SwiGLU,),
+        }
+
+    monkeypatch.setattr(matrix, "_BACKEND_RUNNERS", {Config: Runner})
+    with pytest.raises(ValueError, match="must cover exactly"):
+        get_activation_matrix_rows()
