@@ -327,3 +327,17 @@ def test_routed_fused_moe(
     torch.cuda.synchronize()
 
     check_accuracy(reference, result, atol=0.1, rtol=0.85, percent=0.9)
+
+
+def test_routed_fused_moe_fallback_large_batch():
+    """The untuned fallback tactic must stay finite and accurate with
+    per-token NVFP4 at large num_tokens (#4588)."""
+    test_routed_fused_moe(
+        num_tokens=8064,
+        hidden_size=6144,
+        intermediate_size=768,
+        num_experts=256,
+        top_k=6,
+        use_4over6=False,
+        weights_use_4over6=False,
+    )

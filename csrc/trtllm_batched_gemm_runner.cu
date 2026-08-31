@@ -549,6 +549,29 @@ int64_t TrtllmGenBatchedGemmRunner::getDefaultValidConfigIndex(
   auto const validConfigIndices =
       getValidConfigIndices(m, n, k, batchedTokens, numTokens, numBatches, maxNumCtasInBatchDim);
 
+  if (mOptions.usePerTokenScaling) {
+    // The sort order produced by getValidConfigIndices is a pure performance
+    // heuristic; its first entry can be an exported per-token NVFP4 cubin that
+    // returns non-finite outputs in the large-batch routed-MoE regime on
+    // SM100f/SM103 (#4588, same kernel family as #4486). The untuned fallback
+    // must be conservative rather than fast: for the routed FC1 prefer kernels
+    // that gather activations with TMA over the LDGSTS scale-factor-gather
+    // variants, and for the unrouted FC2 prefer single-CTA-cluster kernels over
+    // multi-CTA-cluster ones. Both preferred variants sort immediately behind
+    // the heuristic default, so this only ever swaps in an equally-ranked
+    // sibling config. The autotuner tactic space is unchanged.
+    auto const configs = BatchedGemmInterface().getBatchedGemmConfigs();
+    for (auto const configIndex : validConfigIndices) {
+      auto const& options = configs[configIndex].mOptions;
+      if (mOptions.routeAct) {
+        if (!doesRouteImplUseTma(options.mRouteImpl)) continue;
+      } else if (options.mClusterDimX * options.mClusterDimY * options.mClusterDimZ > 1) {
+        continue;
+      }
+      return configIndex;
+    }
+  }
+
   return validConfigIndices[0];
 }
 
