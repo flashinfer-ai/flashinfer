@@ -256,6 +256,12 @@ class B12xMoEWrapper:
             When set, this selects the backend and internal workspace family.
         source_format: Source weight format for quant_mode="w4a16".
             Supports "modelopt" and "compressed_tensors". Default: "modelopt".
+        shared_static_workspace, shared_dynamic_workspace, shared_output:
+            Optional externally-allocated buffers reused instead of fresh
+            allocations. Callers running many identically-shaped wrappers
+            (e.g. one per MoE layer) can share a single set, since layers
+            execute sequentially. Shapes must match this wrapper's config.
+            Only valid with ``use_cuda_graph=True``.
 
     Example:
         >>> moe = B12xMoEWrapper(num_experts=256, top_k=8, ...)
@@ -283,6 +289,9 @@ class B12xMoEWrapper:
         activation_precision: str = "fp4",
         quant_mode: Optional[str] = None,
         source_format: str = "modelopt",
+        shared_static_workspace: Optional[object] = None,
+        shared_dynamic_workspace: Optional[object] = None,
+        shared_output: Optional[torch.Tensor] = None,
     ):
         r"""Configure the b12x fused-MoE wrapper.
 
@@ -328,6 +337,17 @@ class B12xMoEWrapper:
         source_format : str
             Source weight format for ``quant_mode="w4a16"`` —
             ``"modelopt"`` (default) or ``"compressed_tensors"``.
+        shared_static_workspace, shared_dynamic_workspace : Optional[object]
+            Externally allocated workspaces reused instead of fresh
+            allocations.  Callers running many identically-shaped wrappers
+            (e.g. one per MoE layer) can share a single set, since layers
+            execute sequentially.  Shapes must match this wrapper's config.
+            Only valid with ``use_cuda_graph=True``.
+        shared_output : Optional[torch.Tensor]
+            Externally allocated output buffer, reused like the workspaces.
+            Must be 2-D with shape ``(>= max_num_tokens, hidden_size)``,
+            ``output_dtype``, and the same device as this wrapper.
+            Only valid with ``use_cuda_graph=True``.
         """
         from ...jit.cpp_ext import get_cuda_version
         from .blackwell_sm12x.moe_dispatch import (
@@ -378,6 +398,9 @@ class B12xMoEWrapper:
         # Pre-allocated objects. Both workspace slots may be populated so
         # run() can pick per-call; without this, the backend would be locked
         # to whichever workspace was allocated at init time.
+        self._shared_static_workspace = shared_static_workspace
+        self._shared_dynamic_workspace = shared_dynamic_workspace
+        self._shared_output = shared_output
         self._static_workspace: object = None
         self._dynamic_workspace: object = None
         self._weight_views: object = None
@@ -388,35 +411,85 @@ class B12xMoEWrapper:
         self._folded_w1_alpha: Optional[torch.Tensor] = None
         self._folded_w1_alpha_key: Optional[Tuple] = None
 
+        if not use_cuda_graph and any(
+            resource is not None
+            for resource in (
+                shared_static_workspace,
+                shared_dynamic_workspace,
+                shared_output,
+            )
+        ):
+            raise ValueError(
+                "shared_static_workspace / shared_dynamic_workspace / "
+                "shared_output require use_cuda_graph=True; without "
+                "pre-allocated buffers, run() ignores shared resources."
+            )
+
+        if shared_output is not None:
+            expected_device = torch.device(self.device)
+            if expected_device.type == "cuda" and expected_device.index is None:
+                # An index-less "cuda" means the current device; resolve it so
+                # the comparison covers the device index, not just the type.
+                expected_device = torch.device("cuda", torch.cuda.current_device())
+            if (
+                shared_output.dim() != 2
+                or shared_output.shape[0] < self.max_num_tokens
+                or shared_output.shape[1] != self.hidden_size
+                or shared_output.dtype != self.output_dtype
+                or shared_output.device != expected_device
+            ):
+                raise ValueError(
+                    "shared_output must have shape (>=max_num_tokens, "
+                    f"hidden_size)=({self.max_num_tokens}, {self.hidden_size}), "
+                    f"dtype {self.output_dtype}, and device "
+                    f"{expected_device}; got shape "
+                    f"{tuple(shared_output.shape)}, dtype {shared_output.dtype}, "
+                    f"device {shared_output.device}."
+                )
+
         if use_cuda_graph:
             self._allocate_buffers()
 
     def _allocate_buffers(self) -> None:
-        """Pre-allocate buffers for CUDA graph compatibility."""
+        """Pre-allocate buffers for CUDA graph compatibility.
+
+        When shared buffers are injected (``shared_static_workspace`` /
+        ``shared_dynamic_workspace`` / ``shared_output``), they are used
+        instead of fresh allocations. MoE layers execute strictly
+        sequentially, so identically-shaped wrappers (e.g. one per layer in
+        vLLM) can safely share a single set of workspaces instead of paying
+        the memory cost per wrapper.
+        """
         from .blackwell_sm12x.moe_dispatch import (
             allocate_sm120_moe_workspace,
             select_sm120_moe_backend,
             _get_static_compact_cutover_pairs,
         )
 
+        self._static_workspace = self._shared_static_workspace
+        self._dynamic_workspace = self._shared_dynamic_workspace
+        self._moe_output = self._shared_output
+
         max_routed_rows = self.max_num_tokens * self.top_k
         if self.quant_mode == "w4a16":
-            self._static_workspace = allocate_sm120_moe_workspace(
-                state_E=self.num_local_experts,
-                weight_E=self.num_experts,
-                routed_rows=max_routed_rows,
-                k=self.hidden_size,
-                n=self.intermediate_size,
-                num_topk=self.top_k,
-                device=torch.device(self.device),
-                quant_mode=self.quant_mode,
-                activation=self.activation,
-            )
-            self._moe_output = torch.empty(
-                (self.max_num_tokens, self.hidden_size),
-                dtype=self.output_dtype,
-                device=self.device,
-            )
+            if self._static_workspace is None:
+                self._static_workspace = allocate_sm120_moe_workspace(
+                    state_E=self.num_local_experts,
+                    weight_E=self.num_experts,
+                    routed_rows=max_routed_rows,
+                    k=self.hidden_size,
+                    n=self.intermediate_size,
+                    num_topk=self.top_k,
+                    device=torch.device(self.device),
+                    quant_mode=self.quant_mode,
+                    activation=self.activation,
+                )
+            if self._moe_output is None:
+                self._moe_output = torch.empty(
+                    (self.max_num_tokens, self.hidden_size),
+                    dtype=self.output_dtype,
+                    device=self.device,
+                )
             return
 
         # Allocate a dynamic workspace alongside the static one when
@@ -446,20 +519,21 @@ class B12xMoEWrapper:
             if needs_dynamic
             else max_routed_rows
         )
-        self._static_workspace = allocate_sm120_moe_workspace(
-            state_E=self.num_local_experts,
-            weight_E=self.num_experts,
-            max_rows=max(1, static_max_rows),
-            k=self.hidden_size,
-            n=self.intermediate_size,
-            num_topk=self.top_k,
-            device=torch.device(self.device),
-            quant_mode=self.quant_mode,
-            backend="static",
-            activation=self.activation,
-        )
+        if self._static_workspace is None:
+            self._static_workspace = allocate_sm120_moe_workspace(
+                state_E=self.num_local_experts,
+                weight_E=self.num_experts,
+                max_rows=max(1, static_max_rows),
+                k=self.hidden_size,
+                n=self.intermediate_size,
+                num_topk=self.top_k,
+                device=torch.device(self.device),
+                quant_mode=self.quant_mode,
+                backend="static",
+                activation=self.activation,
+            )
 
-        if needs_dynamic:
+        if needs_dynamic and self._dynamic_workspace is None:
             self._dynamic_workspace = allocate_sm120_moe_workspace(
                 state_E=self.num_local_experts,
                 weight_E=self.num_experts,
@@ -475,11 +549,12 @@ class B12xMoEWrapper:
 
         # Allocated after arch-specific buffers to preserve memory layout
         # that the autotuner's CUDA graph profiling is sensitive to.
-        self._moe_output = torch.empty(
-            (self.max_num_tokens, self.hidden_size),
-            dtype=self.output_dtype,
-            device=self.device,
-        )
+        if self._moe_output is None:
+            self._moe_output = torch.empty(
+                (self.max_num_tokens, self.hidden_size),
+                dtype=self.output_dtype,
+                device=self.device,
+            )
 
     @flashinfer_api(trace=b12x_moe_wrapper_run_trace)
     def run(

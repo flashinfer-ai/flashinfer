@@ -67,16 +67,17 @@ struct QLoader {
   template <typename MainloopParams, typename SharedStorage>
   __device__ __forceinline__ static auto prepare_tma_tensors(const MainloopParams& mainloop_params,
                                                              SharedStorage& shared_storage,
-                                                             int m_block, int bidh, int bidb) {
+                                                             int m_block, int query_head,
+                                                             int bidb) {
     auto sQ = make_tensor(make_smem_ptr(shared_storage.smem_q.begin()), SmemLayoutQ{});
     auto sSFQ = make_tensor(make_smem_ptr(shared_storage.smem_SFQ.begin()), SmemLayoutSFQ{});
 
     auto mQ = mainloop_params.tma_load_Q.get_tma_tensor(mainloop_params.shape_Q);
     auto mSFQ = mainloop_params.tma_load_SFQ.get_tma_tensor(shape(mainloop_params.layout_SFQ));
 
-    auto gQ =
-        local_tile(mQ(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}), make_coord(m_block, _0{}));
-    auto gSFQ = local_tile(mSFQ(_, _, bidh, bidb), select<0, 2>(TileShape_MNK{}),
+    auto gQ = local_tile(mQ(_, _, query_head, bidb), select<0, 2>(TileShape_MNK{}),
+                         make_coord(m_block, _0{}));
+    auto gSFQ = local_tile(mSFQ(_, _, query_head, bidb), select<0, 2>(TileShape_MNK{}),
                            make_coord(m_block, _0{}));
 
     auto block_tma_q = mainloop_params.tma_load_Q.get_slice(_0{});
