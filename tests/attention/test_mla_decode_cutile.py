@@ -3,6 +3,7 @@
 """Tests for the cuTile MLA paged decode backend of BatchMLAPagedAttentionWrapper."""
 
 import math
+import warnings
 
 import pytest
 import torch
@@ -17,10 +18,10 @@ if not is_cuda_tile_available():
 
 @pytest.fixture(autouse=True)
 def _require_blackwell():
-    """Skip the test unless running on datacenter Blackwell (sm100+)."""
-    major, _ = get_compute_capability(torch.device("cuda"))
-    if major < 10:
-        pytest.skip("cuTile MLA decode requires SM100+ (Blackwell)")
+    """Skip unless this is a cuTile MLA-validated Blackwell target."""
+    capability = get_compute_capability(torch.device("cuda"))
+    if capability not in {(10, 0), (10, 3), (12, 0), (12, 1)}:
+        pytest.skip("cuTile MLA decode requires SM100, SM103, SM120, or SM121")
 
 
 def _torch_mla_decode_ref(
@@ -51,15 +52,18 @@ def _torch_mla_decode_ref(
     return out
 
 
-@pytest.mark.parametrize("batch_size", [1, 4])
-@pytest.mark.parametrize("max_seq_len", [256, 1024])
-@pytest.mark.parametrize("page_size", [16, 64])
-@pytest.mark.parametrize("num_heads", [16, 32])
-def test_mla_decode_cutile_vs_torch(batch_size, max_seq_len, page_size, num_heads):
-    """cuTile paged MLA decode must match the torch reference across the shape sweep."""
+def _run_mla_decode_case(
+    *,
+    batch_size,
+    max_seq_len,
+    page_size,
+    num_heads,
+    dtype=torch.bfloat16,
+    packed=False,
+    legacy_api=False,
+):
     device = torch.device("cuda")
-    torch.manual_seed(42)
-    dtype = torch.bfloat16
+    torch.manual_seed(42 + page_size + num_heads)
     head_dim_ckv = 512
     head_dim_kpe = 64
     total_page_num = 512
@@ -80,46 +84,75 @@ def test_mla_decode_cutile_vs_torch(batch_size, max_seq_len, page_size, num_head
         1, max_seq_len + 1, (batch_size,), dtype=torch.int32, device=device
     )
     kv_lens[0] = max_seq_len  # ensure the long case is covered
+    if batch_size > 1:
+        kv_lens[1] = max_seq_len - 1  # guarantee a non-page-aligned tail
     pages_per_batch = math.ceil(max_seq_len / page_size)
-    page_table = torch.randint(
-        0,
-        total_page_num,
-        (batch_size, pages_per_batch),
-        dtype=torch.int32,
-        device=device,
-    )
+    page_table = torch.randperm(total_page_num, dtype=torch.int32, device=device)[
+        : batch_size * pages_per_batch
+    ].reshape(batch_size, pages_per_batch)
+    identity_pages = torch.arange(
+        batch_size * pages_per_batch, dtype=torch.int32, device=device
+    ).reshape_as(page_table)
+    assert not torch.equal(page_table, identity_pages)
 
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="cutile")
 
-    # plan() only needs to stash sm_scale/page_size/dtypes for cutile; the
-    # indptr args are unused by the cutile path but required by the signature.
-    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
-    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    kv_indices = torch.zeros(1, dtype=torch.int32, device=device)
-    wrapper.plan(
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_lens,
-        num_heads,
-        head_dim_ckv,
-        head_dim_kpe,
-        page_size,
-        False,  # causal (ignored for single-token decode)
-        sm_scale,
-        dtype,
-        dtype,
-    )
-
-    out = wrapper.run(
-        q_nope,
-        q_pe,
-        ckv_cache,
-        kpe_cache,
-        kv_len=kv_lens,
-        page_table=page_table,
-    )
+    if legacy_api:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", DeprecationWarning)
+            wrapper.plan(
+                torch.arange(batch_size + 1, dtype=torch.int32, device=device),
+                torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+                * pages_per_batch,
+                page_table.reshape(-1),
+                kv_lens,
+                num_heads,
+                head_dim_ckv,
+                head_dim_kpe,
+                page_size,
+                False,
+                sm_scale,
+                dtype,
+                dtype,
+            )
+            out = wrapper.run(
+                q_nope,
+                q_pe,
+                ckv_cache,
+                kpe_cache,
+                kv_len=kv_lens,
+                page_table=page_table,
+            )
+    else:
+        metadata = flashinfer.mla.MLAPlanMetadata.dense(
+            cum_seq_lens_q=torch.arange(
+                batch_size + 1, dtype=torch.int32, device=device
+            ),
+            block_tables=page_table,
+            seq_lens=kv_lens,
+        )
+        layout = "packed" if packed else "split"
+        wrapper.plan(
+            metadata=metadata,
+            num_heads=num_heads,
+            head_dim_ckv=head_dim_ckv,
+            head_dim_kpe=head_dim_kpe,
+            page_size=page_size,
+            causal=False,
+            sm_scale=sm_scale,
+            q_data_type=dtype,
+            kv_data_type=dtype,
+            query_layout=layout,
+            kv_cache_layout=layout,
+        )
+        query = torch.cat((q_nope, q_pe), dim=-1) if packed else (q_nope, q_pe)
+        kv_cache = (
+            torch.cat((ckv_cache, kpe_cache), dim=-1)
+            if packed
+            else (ckv_cache, kpe_cache)
+        )
+        out = wrapper.run(query=query, kv_cache=kv_cache)
 
     ref = _torch_mla_decode_ref(
         q_nope, q_pe, ckv_cache, kpe_cache, kv_lens, page_table, page_size, sm_scale
@@ -128,6 +161,141 @@ def test_mla_decode_cutile_vs_torch(batch_size, max_seq_len, page_size, num_head
     assert out.shape == (batch_size, num_heads, head_dim_ckv)
     assert not out.isnan().any()
     torch.testing.assert_close(out.float(), ref, rtol=2e-1, atol=1e-2)
+
+
+@pytest.mark.parametrize("batch_size", [1, 4])
+@pytest.mark.parametrize("max_seq_len", [256, 1024])
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+@pytest.mark.parametrize("num_heads", [16, 32])
+def test_mla_decode_cutile_vs_torch(batch_size, max_seq_len, page_size, num_heads):
+    """cuTile paged MLA decode must match the torch reference across the shape sweep."""
+    _run_mla_decode_case(
+        batch_size=batch_size,
+        max_seq_len=max_seq_len,
+        page_size=page_size,
+        num_heads=num_heads,
+    )
+
+
+@pytest.mark.parametrize(
+    ("dtype", "num_heads"),
+    [
+        (torch.float16, 32),
+        (torch.bfloat16, 8),
+        (torch.bfloat16, 48),
+        (torch.bfloat16, 64),
+        (torch.bfloat16, 96),
+        (torch.bfloat16, 128),
+    ],
+)
+def test_mla_decode_cutile_supported_dtype_and_head_contract(dtype, num_heads):
+    """Persistent coverage for the restored dtype and head-count support."""
+    _run_mla_decode_case(
+        batch_size=1,
+        max_seq_len=127,
+        page_size=64,
+        num_heads=num_heads,
+        dtype=dtype,
+    )
+
+
+def test_mla_decode_cutile_packed_inputs():
+    """Packed canonical inputs must lower to the unchanged split kernel."""
+    _run_mla_decode_case(
+        batch_size=2,
+        max_seq_len=255,
+        page_size=16,
+        num_heads=32,
+        packed=True,
+    )
+
+
+def test_mla_decode_cutile_legacy_flat_api():
+    """The original flat-plan and positional-run compatibility path still works."""
+    _run_mla_decode_case(
+        batch_size=2,
+        max_seq_len=127,
+        page_size=64,
+        num_heads=32,
+        legacy_api=True,
+    )
+
+
+@pytest.mark.parametrize(
+    "pages_per_batch",
+    [2, 8],
+    ids=["no_split", "split_kv"],
+)
+def test_mla_decode_cutile_zero_length_rows(pages_per_batch):
+    """Empty KV rows must be zero for auto- and caller-allocated outputs."""
+    device = torch.device("cuda")
+    torch.manual_seed(73 + pages_per_batch)
+    dtype = torch.bfloat16
+    batch_size, num_heads, page_size = 2, 16, 64
+    head_dim_ckv, head_dim_kpe = 512, 64
+    max_seq_len = pages_per_batch * page_size
+    total_page_num = batch_size * pages_per_batch
+    sm_scale = 1.0 / math.sqrt(head_dim_ckv + head_dim_kpe)
+
+    q_nope = torch.randn(
+        batch_size, num_heads, head_dim_ckv, dtype=dtype, device=device
+    )
+    q_pe = torch.randn(batch_size, num_heads, head_dim_kpe, dtype=dtype, device=device)
+    ckv_cache = torch.randn(
+        total_page_num, page_size, head_dim_ckv, dtype=dtype, device=device
+    )
+    kpe_cache = torch.randn(
+        total_page_num, page_size, head_dim_kpe, dtype=dtype, device=device
+    )
+    kv_lens = torch.tensor([0, max_seq_len - 1], dtype=torch.int32, device=device)
+    page_table = torch.arange(total_page_num, dtype=torch.int32, device=device).reshape(
+        batch_size, pages_per_batch
+    )
+
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="cutile")
+    wrapper.plan(
+        metadata=flashinfer.mla.MLAPlanMetadata.dense(
+            cum_seq_lens_q=torch.arange(
+                batch_size + 1, dtype=torch.int32, device=device
+            ),
+            block_tables=page_table,
+            seq_lens=kv_lens,
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=False,
+        sm_scale=sm_scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        query_layout="split",
+        kv_cache_layout="split",
+    )
+
+    query = (q_nope, q_pe)
+    kv_cache = (ckv_cache, kpe_cache)
+    auto_out = wrapper.run(query=query, kv_cache=kv_cache)
+    caller_out = torch.full_like(auto_out, 7.0)
+    actual = wrapper.run(query=query, kv_cache=kv_cache, out=caller_out)
+
+    assert actual is caller_out
+    expected_empty = torch.zeros_like(auto_out[0])
+    torch.testing.assert_close(auto_out[0], expected_empty, rtol=0, atol=0)
+    torch.testing.assert_close(caller_out[0], expected_empty, rtol=0, atol=0)
+    ref = _torch_mla_decode_ref(
+        q_nope,
+        q_pe,
+        ckv_cache,
+        kpe_cache,
+        kv_lens,
+        page_table,
+        page_size,
+        sm_scale,
+    )
+    torch.testing.assert_close(auto_out.float(), ref, rtol=2e-1, atol=1e-2)
+    torch.testing.assert_close(caller_out.float(), ref, rtol=2e-1, atol=1e-2)
 
 
 def test_mla_decode_cutile_preallocated_out():
@@ -162,66 +330,126 @@ def test_mla_decode_cutile_preallocated_out():
 
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
     wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="cutile")
-    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
-    kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
-    kv_indices = torch.zeros(1, dtype=torch.int32, device=device)
+    metadata = flashinfer.mla.MLAPlanMetadata.dense(
+        cum_seq_lens_q=torch.arange(batch_size + 1, dtype=torch.int32, device=device),
+        block_tables=page_table,
+        seq_lens=kv_lens,
+    )
     wrapper.plan(
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        kv_lens,
-        num_heads,
-        head_dim_ckv,
-        head_dim_kpe,
-        page_size,
-        False,
-        sm_scale,
-        dtype,
-        dtype,
+        metadata=metadata,
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=False,
+        sm_scale=sm_scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        query_layout="split",
+        kv_cache_layout="split",
     )
 
-    o_auto = wrapper.run(
-        q_nope, q_pe, ckv_cache, kpe_cache, kv_len=kv_lens, page_table=page_table
-    )
+    o_auto = wrapper.run(query=(q_nope, q_pe), kv_cache=(ckv_cache, kpe_cache))
     o_pre = torch.empty_like(o_auto)
-    wrapper.run(
+    actual = wrapper.run(
+        query=(q_nope, q_pe),
+        kv_cache=(ckv_cache, kpe_cache),
+        out=o_pre,
+    )
+    assert actual is o_pre
+    torch.testing.assert_close(o_auto, o_pre)
+
+
+def test_mla_decode_cutile_cuda_graph_replays_mutated_plan_metadata():
+    """Captured runs must read updated values through stable metadata pointers."""
+    device = torch.device("cuda")
+    torch.manual_seed(11)
+    dtype = torch.bfloat16
+    batch_size, num_heads, page_size = 2, 16, 64
+    head_dim_ckv, head_dim_kpe = 512, 64
+    total_page_num = 8
+    sm_scale = 1.0 / math.sqrt(head_dim_ckv + head_dim_kpe)
+
+    q_nope = torch.randn(
+        batch_size, num_heads, head_dim_ckv, dtype=dtype, device=device
+    )
+    q_pe = torch.randn(batch_size, num_heads, head_dim_kpe, dtype=dtype, device=device)
+    ckv_cache = torch.randn(
+        total_page_num, page_size, head_dim_ckv, dtype=dtype, device=device
+    )
+    kpe_cache = torch.randn(
+        total_page_num, page_size, head_dim_kpe, dtype=dtype, device=device
+    )
+    kv_lens = torch.tensor([96, 64], dtype=torch.int32, device=device)
+    page_table = torch.tensor([[3, 1], [6, 2]], dtype=torch.int32, device=device)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    out = torch.empty(batch_size, num_heads, head_dim_ckv, dtype=dtype, device=device)
+    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(
+        workspace,
+        use_cuda_graph=True,
+        backend="cutile",
+    )
+    wrapper.plan(
+        metadata=flashinfer.mla.MLAPlanMetadata.dense(
+            cum_seq_lens_q=torch.arange(
+                batch_size + 1, dtype=torch.int32, device=device
+            ),
+            block_tables=page_table,
+            seq_lens=kv_lens,
+        ),
+        num_heads=num_heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=head_dim_kpe,
+        page_size=page_size,
+        causal=False,
+        sm_scale=sm_scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        query_layout="split",
+        kv_cache_layout="split",
+    )
+
+    # Compile and warm the exact launch before capture.
+    assert (
+        wrapper.run(query=(q_nope, q_pe), kv_cache=(ckv_cache, kpe_cache), out=out)
+        is out
+    )
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured_out = wrapper.run(
+            query=(q_nope, q_pe), kv_cache=(ckv_cache, kpe_cache), out=out
+        )
+    assert captured_out is out
+    graph.replay()
+    torch.cuda.synchronize()
+    initial = out.clone()
+
+    updated_kv_lens = torch.tensor([0, 95], dtype=torch.int32, device=device)
+    updated_page_table = torch.tensor(
+        [[0, 5], [4, 7]], dtype=torch.int32, device=device
+    )
+    kv_lens.copy_(updated_kv_lens)
+    page_table.copy_(updated_page_table)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    ref = _torch_mla_decode_ref(
         q_nope,
         q_pe,
         ckv_cache,
         kpe_cache,
-        out=o_pre,
-        kv_len=kv_lens,
-        page_table=page_table,
+        updated_kv_lens,
+        updated_page_table,
+        page_size,
+        sm_scale,
     )
-    torch.testing.assert_close(o_auto, o_pre)
-
-
-def test_mla_decode_cutile_rejects_unsupported():
-    """cutile MLA backend must reject kv_len/page_table omission and fp8 scales."""
-    device = torch.device("cuda")
-    dtype = torch.bfloat16
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
-    wrapper = flashinfer.mla.BatchMLAPagedAttentionWrapper(workspace, backend="cutile")
-    wrapper._backend = "cutile"
-    wrapper._sm_scale = 1.0 / math.sqrt(576)
-
-    q_nope = torch.randn(1, 32, 512, dtype=dtype, device=device)
-    q_pe = torch.randn(1, 32, 64, dtype=dtype, device=device)
-    ckv = torch.randn(8, 64, 512, dtype=dtype, device=device)
-    kpe = torch.randn(8, 64, 64, dtype=dtype, device=device)
-
-    with pytest.raises(ValueError, match="requires kv_len and page_table"):
-        wrapper.run(q_nope, q_pe, ckv, kpe)
-
-    kv_lens = torch.full((1,), 128, dtype=torch.int32, device=device)
-    page_table = torch.zeros(1, 2, dtype=torch.int32, device=device)
-    with pytest.raises(ValueError, match="not supported"):
-        wrapper.run(
-            q_nope, q_pe, ckv, kpe, kv_len=kv_lens, page_table=page_table, o_scale=0.1
-        )
+    assert not torch.equal(initial, out)
+    torch.testing.assert_close(out[0], torch.zeros_like(out[0]), rtol=0, atol=0)
+    torch.testing.assert_close(out.float(), ref, rtol=2e-1, atol=1e-2)
 
 
 if __name__ == "__main__":
     test_mla_decode_cutile_vs_torch(4, 1024, 64, 32)
     test_mla_decode_cutile_preallocated_out()
-    test_mla_decode_cutile_rejects_unsupported()

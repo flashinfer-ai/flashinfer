@@ -143,46 +143,38 @@ def _make_execute(provider: str, inp: _MLAInputs) -> Callable[[], torch.Tensor]:
     device = inp.q_nope.device
 
     if provider == "cutile":
-        # This checkout's BatchMLAPagedAttentionWrapper(..., backend="cutile").
-        # cuTile MLA plan() only stashes metadata; run() consumes kv_len + page_table
-        # directly (the cutile branch of the MLA paged-attention wrapper).
-        from flashinfer.mla import BatchMLAPagedAttentionWrapper
+        # This checkout's planned cuTile MLA wrapper backend.
+        from flashinfer.mla import BatchMLAPagedAttentionWrapper, MLAPlanMetadata
 
         workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
         wrapper = BatchMLAPagedAttentionWrapper(workspace, backend="cutile")
 
-        # plan()'s kv_indptr/kv_indices are unused by the cutile path but the
-        # signature is shared; build consistent CSR to be safe.
-        qo_indptr = torch.arange(inp.batch + 1, dtype=torch.int32, device=device)
-        kv_indptr = (
-            torch.arange(inp.batch + 1, dtype=torch.int32, device=device)
-            * inp.pages_per_batch
+        metadata = MLAPlanMetadata.dense(
+            cum_seq_lens_q=torch.arange(
+                inp.batch + 1, dtype=torch.int32, device=device
+            ),
+            block_tables=inp.page_table,
+            seq_lens=inp.kv_lens,
         )
-        kv_indices = inp.page_table.reshape(-1).to(torch.int32)
         wrapper.plan(
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            inp.kv_lens,
-            inp.num_heads,
-            HEAD_DIM_CKV,
-            HEAD_DIM_KPE,
-            inp.page_size,
-            False,  # causal (decode: single query token)
-            inp.sm_scale,
-            inp.q_nope.dtype,
-            inp.ckv.dtype,
+            metadata=metadata,
+            num_heads=inp.num_heads,
+            head_dim_ckv=HEAD_DIM_CKV,
+            head_dim_kpe=HEAD_DIM_KPE,
+            page_size=inp.page_size,
+            causal=False,
+            sm_scale=inp.sm_scale,
+            q_data_type=inp.q_nope.dtype,
+            kv_data_type=inp.ckv.dtype,
+            query_layout="split",
+            kv_cache_layout="split",
         )
 
         def run():
             """Run cuTile paged MLA decode through the planned wrapper."""
             return wrapper.run(
-                inp.q_nope,
-                inp.q_pe,
-                inp.ckv,
-                inp.kpe,
-                kv_len=inp.kv_lens,
-                page_table=inp.page_table,
+                query=(inp.q_nope, inp.q_pe),
+                kv_cache=(inp.ckv, inp.kpe),
             )
 
     elif provider == "trtllm":

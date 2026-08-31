@@ -867,6 +867,18 @@ def _decode_mla_kv_paged_kernel(
         end_n = seq_len
 
     if start_n >= end_n:
+        # Split-KV scratch is zero-initialized by the host. A no-split launch,
+        # however, writes directly into a caller-owned (or empty-allocated)
+        # output, so an empty request must overwrite that row explicitly.
+        if not HAS_LSE_OUT:
+            ct.store(
+                output,
+                index=(kv_split_id, batch_id, head_block_id, 0),
+                tile=ct.zeros((1, 1, BLOCK_H, BLOCK_D), dtype=output.dtype),
+                order=(0, 1, 2, 3),
+                allow_tma=True,
+                latency=2,
+            )
         return
 
     num_iters = (end_n - start_n + BLOCK_N - 1) // BLOCK_N
