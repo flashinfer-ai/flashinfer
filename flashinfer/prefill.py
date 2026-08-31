@@ -354,6 +354,7 @@ def get_single_prefill_module(backend, *args):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         maybe_packed_custom_mask: Optional[torch.Tensor],
         maybe_alibi_slopes: Optional[torch.Tensor],
         logits_soft_cap: float,
@@ -417,6 +418,7 @@ def get_single_prefill_module(backend, *args):
                 mask_mode,
                 layout,
                 window_left,
+                window_right,
                 maybe_packed_custom_mask,
                 maybe_alibi_slopes,
                 maybe_k_cache_sf,
@@ -439,6 +441,7 @@ def get_single_prefill_module(backend, *args):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         maybe_packed_custom_mask: Optional[torch.Tensor],
         maybe_alibi_slopes: Optional[torch.Tensor],
         logits_soft_cap: float,
@@ -496,6 +499,7 @@ def get_batch_prefill_module(backend, *args):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         enable_pdl: bool,
         maybe_custom_mask: Optional[torch.Tensor],
         maybe_mask_indptr: Optional[torch.Tensor],
@@ -532,6 +536,7 @@ def get_batch_prefill_module(backend, *args):
                 mask_mode,
                 layout,
                 window_left,
+                window_right,
                 enable_pdl,
                 maybe_custom_mask,
                 maybe_mask_indptr,
@@ -621,6 +626,7 @@ def get_batch_prefill_module(backend, *args):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         enable_pdl: bool,
         maybe_custom_mask: Optional[torch.Tensor],
         maybe_mask_indptr: Optional[torch.Tensor],
@@ -668,6 +674,7 @@ def get_batch_prefill_module(backend, *args):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         enable_pdl: bool,
         maybe_custom_mask: Optional[torch.Tensor],
         maybe_mask_indptr: Optional[torch.Tensor],
@@ -763,6 +770,7 @@ def get_batch_prefill_module(backend, *args):
                 mask_mode,
                 layout,
                 window_left,
+                window_right,
                 enable_pdl,
                 maybe_custom_mask,
                 maybe_mask_indptr,
@@ -854,6 +862,7 @@ def get_batch_prefill_module(backend, *args):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         enable_pdl: bool,
         maybe_custom_mask: Optional[torch.Tensor],
         maybe_mask_indptr: Optional[torch.Tensor],
@@ -934,6 +943,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         *args,
     ) -> None:
         ragged_run_func(
@@ -950,6 +960,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
             mask_mode,
             layout,
             window_left,
+            window_right,
             *args,
         )
 
@@ -968,6 +979,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         *args,
     ) -> None:
         pass
@@ -1000,6 +1012,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         *args,
     ) -> None:
         paged_run_func(
@@ -1018,6 +1031,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
             mask_mode,
             layout,
             window_left,
+            window_right,
             *args,
         )
 
@@ -1038,6 +1052,7 @@ def get_batch_prefill_jit_module(module_name: str, jit_module: Any):
         mask_mode: int,
         layout: int,
         window_left: int,
+        window_right: int,
         *args,
     ) -> None:
         pass
@@ -1064,6 +1079,7 @@ def single_prefill_with_kv_cache_with_jit_module(
     kv_layout: str = "NHD",
     mask_mode: int = MaskMode.NON_CAUSAL.value,
     window_left: int = -1,
+    window_right: int = -1,
     return_lse: bool = False,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     r"""Single-request prefill / append attention using a pre-compiled JIT module.
@@ -1121,6 +1137,7 @@ def single_prefill_with_kv_cache_with_jit_module(
         mask_mode,
         TensorLayout[kv_layout].value,
         window_left,
+        window_right,
         *args,
     )
     return (o, lse) if return_lse else o
@@ -1143,6 +1160,7 @@ def single_prefill_with_kv_cache(
     use_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
     window_left: int = -1,
+    window_right: int = -1,
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -1171,6 +1189,7 @@ def single_prefill_with_kv_cache(
     use_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
     window_left: int = -1,
+    window_right: int = -1,
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -1199,6 +1218,7 @@ def single_prefill_with_kv_cache(
     use_fp16_qk_reduction: bool = False,
     sm_scale: Optional[float] = None,
     window_left: int = -1,
+    window_right: int = -1,
     logits_soft_cap: Optional[float] = None,
     rope_scale: Optional[float] = None,
     rope_theta: Optional[float] = None,
@@ -1442,6 +1462,7 @@ def single_prefill_with_kv_cache(
         mask_mode,
         TensorLayout[kv_layout].value,
         window_left,
+        window_right,
         packed_custom_mask,
         get_alibi_slopes(q.shape[1], device=q.device)
         if pos_encoding_mode == "ALIBI"
@@ -2164,6 +2185,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         use_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         window_left: int = -1,
+        window_right: int = -1,
         logits_soft_cap: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -2648,6 +2670,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -2677,6 +2700,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -3063,6 +3087,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 mask_mode,
                 TensorLayout[self._kv_layout].value,
                 window_left,
+                self._window_right,
                 enable_pdl,
             ]
             if self._jit_module is not None:
@@ -3200,6 +3225,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -3517,6 +3543,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         pos_encoding_mode: str = "NONE",
         use_fp16_qk_reduction: bool = False,
         window_left: int = -1,
+        window_right: int = -1,
         logits_soft_cap: Optional[float] = None,
         sm_scale: Optional[float] = None,
         rope_scale: Optional[float] = None,
@@ -4008,6 +4035,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -4034,6 +4062,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -4427,6 +4456,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             mask_mode,
             TensorLayout[self._kv_layout].value,
             window_left,
+            self._window_right,
             enable_pdl,
         ]
         if self._jit_module is not None:
@@ -4494,6 +4524,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._pos_encoding_mode = pos_encoding_mode
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
+        self._window_right = window_right
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale

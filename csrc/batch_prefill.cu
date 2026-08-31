@@ -110,7 +110,7 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
                                       TensorView q, TensorView k, TensorView v,
                                       TensorView qo_indptr, TensorView kv_indptr, TensorView o,
                                       Optional<TensorView> maybe_lse, int64_t mask_mode_code,
-                                      int64_t layout, int64_t window_left,
+                                      int64_t layout, int64_t window_left, int64_t window_right,
                                       bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
@@ -171,6 +171,7 @@ void BatchPrefillWithRaggedKVCacheRun(TensorView float_workspace_buffer,
         params.v_stride_n = v_stride_n;
         params.v_stride_h = v_stride_h;
         params.window_left = window_left;
+        params.window_right = window_right;
 
         params.request_indices = nullptr;
         params.qo_tile_indices = nullptr;
@@ -243,7 +244,7 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
                                      TensorView paged_kv_indptr, TensorView paged_kv_indices,
                                      TensorView paged_kv_last_page_len, TensorView o,
                                      Optional<TensorView> maybe_lse, int64_t mask_mode_code,
-                                     int64_t layout, int64_t window_left,
+                                     int64_t layout, int64_t window_left, int64_t window_right,
                                      bool enable_pdl ADDITIONAL_FUNC_PARAMS) {
   PrefillPlanInfo plan_info;
   plan_info.FromVector(std::vector<int64_t>(plan_info_vec.begin(), plan_info_vec.end()));
@@ -307,6 +308,7 @@ void BatchPrefillWithPagedKVCacheRun(TensorView float_workspace_buffer,
         params.q_stride_n = q_stride_n;
         params.q_stride_h = q_stride_h;
         params.window_left = window_left;
+        params.window_right = window_right;
 
         params.request_indices = nullptr;
         params.qo_tile_indices = nullptr;

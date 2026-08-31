@@ -51,6 +51,7 @@ struct SinglePrefillParams {
   uint32_t v_stride_h;
   uint32_t head_dim;
   int32_t window_left;
+  int32_t window_right;
   float logits_soft_cap;
   float sm_scale;
   float rope_rcp_scale;
@@ -79,6 +80,7 @@ struct SinglePrefillParams {
         v_stride_h(0),
         head_dim(0),
         window_left(0),
+        window_right(-1),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
         rope_rcp_scale(0.0f),
@@ -112,6 +114,7 @@ struct SinglePrefillParams {
         v_stride_h(kv_stride_h),
         head_dim(head_dim),
         window_left(window_left),
+        window_right(-1),  # TODO: this might need a revisit, one might want to change the signature of SinglePrefillParams
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
         rope_rcp_scale(1. / rope_scale),
@@ -162,6 +165,7 @@ struct BatchPrefillRaggedParams {
   uint32_t v_sf_stride_n;
   uint32_t v_sf_stride_h;
   int32_t window_left;
+  int32_t window_right;
   float logits_soft_cap;
   float sm_scale;
   float rope_rcp_scale;
@@ -212,6 +216,7 @@ struct BatchPrefillRaggedParams {
         v_sf_stride_n(0),
         v_sf_stride_h(0),
         window_left(0),
+        window_right(-1),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
         rope_rcp_scale(0.0f),
@@ -269,6 +274,7 @@ struct BatchPrefillRaggedParams {
         v_sf_stride_n(0),
         v_sf_stride_h(0),
         window_left(window_left),
+        window_right(-1),  # TODO: this might need a revisit, one might want to change the signature of BatchPrefillRaggedParams
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
         rope_rcp_scale(1.f / rope_scale),
@@ -325,6 +331,7 @@ struct BatchPrefillPagedParams {
   uint32_t v_sf_stride_n;
   uint32_t v_sf_stride_h;
   int32_t window_left;
+  int32_t window_right;
   float logits_soft_cap;
   float sm_scale;
   float rope_rcp_scale;
@@ -367,6 +374,7 @@ struct BatchPrefillPagedParams {
         v_sf_stride_n(0),
         v_sf_stride_h(0),
         window_left(0),
+        window_right(-1),
         logits_soft_cap(0.0f),
         sm_scale(0.0f),
         rope_rcp_scale(0.0f),
@@ -414,6 +422,7 @@ struct BatchPrefillPagedParams {
         v_sf_stride_n(0),
         v_sf_stride_h(0),
         window_left(window_left),
+        window_right(-1),  # TODO: this might need a revisit, one might want to change the signature of BatchPrefillPagedParams
         logits_soft_cap(logits_soft_cap),
         sm_scale(sm_scale),
         rope_rcp_scale(1.f / rope_scale),
