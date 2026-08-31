@@ -2317,6 +2317,30 @@ def test_single_prefill_torch_compile_cuda_graph():
     )
 
 
+def test_batch_prefill_with_paged_kv_cache_nvfp4_repack_boundary():
+    """Deterministic boundary test for the NVFP4 repack path.
+
+    Exercises the repack_fp4_tile_to_bf16 code path with small dimensions
+    where CTA_TILE_Q > 16 triggers the repack. Verifies correctness against
+    reference dequantized KV cache.
+    """
+    # Conditions that trigger repack path:
+    # - is_fp4_type_v<DTypeKV>: NVFP4 KV cache
+    # - HEAD_DIM_VO != 64 and HEAD_DIM_VO <= 256: head_dim=128
+    # - CTA_TILE_Q > 16: qo_len=64 ensures large enough tiles
+    test_batch_prefill_with_paged_kv_cache_nvfp4(
+        batch_size=2,
+        kv_len=64,
+        qo_len=64,
+        page_size=16,
+        num_kv_heads=4,
+        num_qo_heads=4,
+        head_dim=128,
+        causal=False,
+        q_dtype=torch.bfloat16,
+    )
+
+
 # Regression tests for the finite mask sentinel bugs #4267/#4450/#4451/#4452:
 # masked logits are IEEE -inf, so any finite logit must win over masked positions
 # and fully masked rows must yield zero output with LSE = -inf.
