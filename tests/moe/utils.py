@@ -64,10 +64,10 @@ def compute_reference_moe(
     result = torch.zeros(
         num_tokens, hidden_size, dtype=torch.float32, device=hidden_states.device
     )
-    for expert_id in range(w1.shape[0]):
+    # Large-model tests may configure hundreds of experts while routing only a
+    # few; avoid launching one ``where`` kernel per inactive expert.
+    for expert_id in torch.unique(topk_ids).tolist():
         token_ids, slots = torch.where(topk_ids == expert_id)
-        if token_ids.numel() == 0:
-            continue
         gemm1 = (hidden_states[token_ids].float() @ w1[expert_id].float().T).to(
             torch.bfloat16
         )

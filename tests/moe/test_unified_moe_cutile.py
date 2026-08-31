@@ -639,27 +639,54 @@ def test_prepare_cutile_nvfp4_weights_pads_only_scale_layout():
         assert torch.count_nonzero(unswizzled[:, 192:].view(torch.uint8)) == 0
 
 
+@torch.no_grad()
 def _quantize_weights(weight: torch.Tensor):
     shape = weight.shape
-    groups = weight.float().reshape(*shape[:-1], shape[-1] // 16, 16)
-    scale = (groups.abs().amax(dim=-1) / 6.0).to(torch.float8_e4m3fn)
-    safe_scale = scale.float().clamp_min(2.0**-9)
-    values = groups / safe_scale.unsqueeze(-1)
+    columns = shape[-1]
+    rows = weight.numel() // columns
+    flat_weight = weight.reshape(rows, columns)
+    packed = torch.empty(rows, columns // 2, dtype=torch.uint8, device=weight.device)
+    scales = torch.empty(
+        rows, columns // 16, dtype=torch.float8_e4m3fn, device=weight.device
+    )
+    dequantized = torch.empty_like(flat_weight)
     boundaries = torch.tensor(
         [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
         device=weight.device,
     )
-    codes = torch.bucketize(values.abs(), boundaries, right=False)
-    codes = codes | ((values < 0).to(torch.int64) << 3)
-    codes = codes.reshape(*shape)
-    packed = (codes[..., 0::2] | (codes[..., 1::2] << 4)).to(torch.uint8)
-    dequantized = values.new_tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])[codes & 7]
-    dequantized = torch.where((codes & 8).bool(), -dequantized, dequantized)
-    dequantized = (
-        dequantized.reshape(*shape[:-1], shape[-1] // 16, 16)
-        * scale.float().unsqueeze(-1)
-    ).reshape(shape)
-    return packed.contiguous(), scale.contiguous(), dequantized.to(torch.bfloat16)
+    code_points = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        device=weight.device,
+    )
+    # Bound the FP32 and int64 quantization temporaries for model-sized expert
+    # banks; the unchunked reference path peaks at tens of GiB.
+    max_chunk_elements = 8 * 1024 * 1024
+    chunk_rows = max(1, max_chunk_elements // columns)
+    for begin in range(0, rows, chunk_rows):
+        end = min(begin + chunk_rows, rows)
+        groups = flat_weight[begin:end].float().reshape(-1, columns // 16, 16)
+        scale = (groups.abs().amax(dim=-1) / 6.0).to(torch.float8_e4m3fn)
+        scales[begin:end].copy_(scale)
+        values = groups / scale.float().clamp_min(2.0**-9).unsqueeze(-1)
+        codes = torch.bucketize(values.abs(), boundaries, right=False)
+        codes |= (values < 0).to(torch.int64) << 3
+        codes = codes.reshape(end - begin, columns)
+        packed[begin:end].copy_(
+            (codes[:, 0::2] | (codes[:, 1::2] << 4)).to(torch.uint8)
+        )
+        decoded = code_points[codes & 7]
+        decoded = torch.where((codes & 8).bool(), -decoded, decoded)
+        dequantized[begin:end].copy_(
+            (
+                decoded.reshape(end - begin, columns // 16, 16)
+                * scale.float().unsqueeze(-1)
+            ).reshape(end - begin, columns)
+        )
+    return (
+        packed.reshape(*shape[:-1], columns // 2),
+        scales.reshape(*shape[:-1], columns // 16),
+        dequantized.reshape(shape),
+    )
 
 
 def _cutile_nvfp4_is_supported() -> bool:
@@ -773,6 +800,8 @@ def _make_nvfp4_case(
         )
         / hidden_size**0.5
     )
+    w1_q, w1_scale, w1_dequant = _quantize_weights(w1)
+    del w1
     w2 = (
         torch.randn(
             num_experts,
@@ -783,8 +812,8 @@ def _make_nvfp4_case(
         )
         / intermediate_size**0.5
     )
-    w1_q, w1_scale, w1_dequant = _quantize_weights(w1)
     w2_q, w2_scale, w2_dequant = _quantize_weights(w2)
+    del w2
     ids = (
         torch.arange(num_tokens * top_k, dtype=torch.int32, device=device)
         .reshape(num_tokens, top_k)
