@@ -29,7 +29,7 @@ import dataclasses
 import math
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import ClassVar, Dict, Optional, Tuple, Union
+from typing import ClassVar, Dict, Literal, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -500,6 +500,102 @@ class TrtllmFp4Config:
 
     def __repr__(self) -> str:
         return "TrtllmFp4Config()"
+
+
+@dataclass(frozen=True)
+class CakeWarpDecodeConfig:
+    """Explicit Cake NVFP4 warp-decode backend for exact SM103.
+
+    This backend is intentionally narrow: it accepts only the two calibrated
+    expert geometries documented by :class:`CakeWarpDecodeRunner`, 1--32
+    tokens, unpacked precomputed routing, and the default SwiGLU semantics.
+    It is never part of the default backend list; users opt in with
+    ``CakeWarpDecodeConfig(backend="cake")``.
+
+    The physical weight and activation layouts are exactly those produced by
+    :class:`TrtllmFp4Config` for ``QuantVariant.NVFP4``. This keeps one
+    quantized representation usable by both runners.
+    """
+
+    backend: Literal["cake"] = "cake"
+
+    def __post_init__(self) -> None:
+        if self.backend != "cake":
+            raise ValueError(
+                "CakeWarpDecodeConfig backend must be 'cake', "
+                f"got {self.backend!r}."
+            )
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch == 103
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        variant: QuantVariant = QuantVariant.NVFP4,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+        permute_cache=None,
+    ):
+        """Build the shared TRTLLM NVFP4 physical weight view.
+
+        Register the returned dictionary with
+        ``MoEWeightPack.prepare_for("cake", view)``. The same dictionary may
+        also be registered for ``"trtllm_fp4_routed"`` without copying.
+        """
+        if variant is not QuantVariant.NVFP4:
+            raise ValueError(
+                "Cake warp decode weight preparation requires "
+                f"QuantVariant.NVFP4, got {variant!r}."
+            )
+        if activation is not None and activation != SwiGLU():
+            raise ValueError(
+                "Cake warp decode weight preparation supports only default SwiGLU()."
+            )
+        geometry = (hidden_size, intermediate_size, num_local_experts)
+        if geometry not in ((2048, 512, 512), (2048, 1536, 60)):
+            raise ValueError(
+                "Cake warp decode supports only (hidden_size, intermediate_size, "
+                "num_local_experts) = (2048, 512, 512) or (2048, 1536, 60); "
+                f"got {geometry}."
+            )
+        return TrtllmFp4Config.prepare_weights(
+            w1_bf16,
+            w2_bf16,
+            variant=QuantVariant.NVFP4,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation=SwiGLU(),
+            device=device,
+            permute_cache=permute_cache,
+        )
+
+    @staticmethod
+    def prepare_activations(
+        hidden_states_bf16,
+        *,
+        variant: QuantVariant = QuantVariant.NVFP4,
+    ):
+        """Build the shared TRTLLM NVFP4 packed activation view."""
+        if variant is not QuantVariant.NVFP4:
+            raise ValueError(
+                "Cake warp decode activation preparation requires "
+                f"QuantVariant.NVFP4, got {variant!r}."
+            )
+        return TrtllmFp4Config.prepare_activations(
+            hidden_states_bf16,
+            variant=QuantVariant.NVFP4,
+        )
+
+    def __repr__(self) -> str:
+        return "CakeWarpDecodeConfig(backend='cake')"
 
 
 @dataclass(frozen=True)
@@ -1241,6 +1337,7 @@ class B12xW4A16Config:
 
 # Union type for backend config
 BackendConfigType = Union[
+    CakeWarpDecodeConfig,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,
@@ -1261,6 +1358,7 @@ BackendConfigType = Union[
 ]
 
 ALL_BACKEND_CONFIGS = (
+    CakeWarpDecodeConfig,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
     TrtllmFp8PerTensorConfig,

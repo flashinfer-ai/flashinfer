@@ -120,6 +120,9 @@ from .jit.fused_moe import (
     gen_trtllm_gen_fused_moe_sm100_module,
     gen_trtllm_gen_routing_module,
 )
+from .jit.cake_fused_moe_warp_decode import (
+    gen_cake_fused_moe_warp_decode_module,
+)
 from .jit.bgmv_moe import gen_bgmv_moe_module
 from .jit.blackwell_bgmv_moe import (
     BLACKWELL_BGMV_MOE_DTYPES,
@@ -781,6 +784,7 @@ def gen_all_modules(
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
+            jit_specs.append(gen_cake_fused_moe_warp_decode_module())
         if has_sm107:
             jit_specs.append(gen_fp4_quantization_sm107_module())
             jit_specs.append(gen_trtllm_gen_gemm_module(enable_rubin=True))
