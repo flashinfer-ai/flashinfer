@@ -861,7 +861,7 @@ def gated_delta_rule_mtp(
         )
     else:
         cache_steps = T
-        intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device=q.device)
+        intermediate_states = torch.empty(1, 1, 1, dtype=torch.float32, device=q.device)
 
     # FLA-style per-token pool scatter. When provided, the kernel writes each
     # h_{t+1} directly to initial_state[ssm_state_indices[i, t]] instead of
