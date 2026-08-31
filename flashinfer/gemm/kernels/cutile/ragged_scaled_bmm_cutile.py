@@ -111,7 +111,8 @@ def _ragged_scaled_bmm_kernel(
     m_indptr,
     c,
     q,
-    max_m,
+    max_m,  # host-side max segment size hint (kept for autotune cache key; no longer drives the loop bound)
+    max_m_device,  # 1-element int32 tensor (shape (1,)) — device-side ground truth for max(valid_m)
     n,
     ELEM_PER_BYTE_A: ct.Constant[int],
     ELEM_PER_BYTE_B: ct.Constant[int],
@@ -131,7 +132,12 @@ def _ragged_scaled_bmm_kernel(
         num_k_tiles = ct.num_tiles(a, axis=1, shape=(BLOCK_M, BLOCK_K // 2))
     else:
         num_k_tiles = ct.num_tiles(a, axis=1, shape=(BLOCK_M, BLOCK_K))
-    num_pid_m = ct.cdiv(max_m, BLOCK_M)
+    # Defense-in-depth: derive the persistent-loop bound from the device-side
+    # max segment length rather than the host `max_m` hint. An understated host
+    # max_m would otherwise truncate tiles and leave output rows uninitialized
+    # (the per-tile `pid_m*BLOCK_M < valid_m` guard only catches over-estimates).
+    max_m_runtime = ct.load(max_m_device, index=(0,), shape=(1,)).item()
+    num_pid_m = ct.cdiv(max_m_runtime, BLOCK_M)
     num_pid_n = ct.cdiv(n, BLOCK_N)
     tiles_per_batch = num_pid_m * num_pid_n
     total_tiles = tiles_per_batch * q
@@ -285,6 +291,7 @@ def _ragged_scaled_bmm_launch(
     c,
     Q,
     max_m,
+    max_m_device,
     N,
     K_A,
     K_B,
@@ -325,6 +332,7 @@ def _ragged_scaled_bmm_launch(
             c,
             Q,
             max_m,
+            max_m_device,
             N,
             ELEM_PER_BYTE_A,
             ELEM_PER_BYTE_B,
@@ -343,7 +351,7 @@ def _ragged_scaled_bmm_launch(
     def grid_fn(cfg):
         BM = cfg.BLOCK_M
         BN = cfg.BLOCK_N
-        num_pid_m = ct.cdiv(max_m, BM)
+        num_pid_m = ct.cdiv(a.shape[0], BM)  # size grid from total_m (safe over-estimate); kernel loop bound comes from max_m_device
         num_pid_n = ct.cdiv(N, BN)
         tiles_per_batch = num_pid_m * num_pid_n
         total_tiles = tiles_per_batch * Q
@@ -398,6 +406,7 @@ def _ragged_scaled_bmm_default_launch(
     c,
     Q,
     max_m,
+    max_m_device,
     N,
     ELEM_PER_BYTE_A,
     ELEM_PER_BYTE_B,
@@ -424,7 +433,7 @@ def _ragged_scaled_bmm_default_launch(
     SCALE_REP_K = BK // VEC_SIZE // 4
 
     NUM_SMS = torch.cuda.get_device_properties(a.device).multi_processor_count
-    num_pid_m = ct.cdiv(max_m, BM)
+    num_pid_m = ct.cdiv(a.shape[0], BM)  # size grid from total_m (safe over-estimate); kernel loop bound comes from max_m_device
     num_pid_n = ct.cdiv(N, BN)
     total_tiles = num_pid_m * num_pid_n * Q
     num_programs = min(NUM_SMS // num_ctas, total_tiles) * occupancy
@@ -456,6 +465,7 @@ def _ragged_scaled_bmm_default_launch(
             c,
             Q,
             max_m,
+            max_m_device,
             N,
             ELEM_PER_BYTE_A,
             ELEM_PER_BYTE_B,
@@ -503,7 +513,10 @@ def ragged_scaled_bmm(
         a_scale: Swizzled A scale [total_m // 128, rka, 2, 256]
         b_scale: Swizzled B scale [Q, N // 128, rkb, 2, 256]
         m_indptr: Segment offsets [Q+1] (each entry must be a multiple of 128)
-        max_m: Upper bound on any single segment length (used for grid sizing)
+        max_m: Host-side max segment length hint. Kept only as an autotune
+            cache key / passthrough — the grid is sized from total_m and the
+            kernel's loop bound comes from the device-derived max_m_device, so
+            an understated hint no longer truncates output.
         block_scale_type: One of "mxfp8", "mxfp4", "nvfp4", "mixed"
         transpose_a: Whether A is transposed (must be False)
         transpose_b: Whether B is transposed (must be True)
@@ -607,6 +620,18 @@ def ragged_scaled_bmm(
 
     c = torch.empty((total_m, N), device=a.device, dtype=torch.float32)
 
+    # Nothing to compute for an empty stack; also makes the amax below well-defined
+    # (an empty seg_lens has no max) and avoids a degenerate (0,1,1) launch grid.
+    if Q == 0 or total_m == 0:
+        return c
+
+    # Device-side ground truth for max(valid_m), derived from m_indptr rather than
+    # trusting the host `max_m` hint. The kernel reads its persistent-loop bound
+    # from this, so an understated host max_m can't leave output rows uninitialized.
+    # Computed on-device (async, no GPU->CPU sync) so it stays CUDA-graph safe.
+    seg_lens = (m_indptr[1:] - m_indptr[:-1]).to(torch.int32)
+    max_m_device = torch.amax(seg_lens, dim=0, keepdim=True)
+
     # Handle optional global scales
     has_a_global_scale = 1 if a_global_scale is not None else 0
     has_b_global_scale = 1 if b_global_scale is not None else 0
@@ -642,6 +667,7 @@ def ragged_scaled_bmm(
             c,
             Q,
             max_m,
+            max_m_device,
             N,
             K_A,
             K_B,
@@ -667,6 +693,7 @@ def ragged_scaled_bmm(
             c,
             Q,
             max_m,
+            max_m_device,
             N,
             ELEM_PER_BYTE_A,
             ELEM_PER_BYTE_B,
