@@ -26,6 +26,7 @@ from __future__ import annotations
 import functools
 import weakref
 from collections import OrderedDict
+from contextlib import suppress
 from typing import Any, ClassVar, List, Optional
 
 import torch
@@ -88,9 +89,7 @@ _CUTLASS_SEMANTIC_ACTIVATIONS: tuple[type[ActivationConfig], ...] = (
 )
 
 
-_CAKE_QUARANTINED_WORKSPACES: dict[
-    tuple[int, int], tuple[Any, torch.Tensor, str]
-] = {}
+_CAKE_QUARANTINED_WORKSPACES: dict[tuple[int, int], tuple[Any, torch.Tensor, str]] = {}
 
 
 def _retire_cake_workspace_receipt(
@@ -116,12 +115,10 @@ def _finalize_cake_workspace_receipt(
 ) -> None:
     """Retire at runner teardown; quarantine storage instead of freeing it."""
 
-    try:
+    with suppress(Exception):
         _retire_cake_workspace_receipt(module, workspace, receipt)
-    except Exception:
         # The strict helper has retained the allocation. Finalizers cannot
         # surface an exception usefully, but they must never permit reuse.
-        pass
 
 
 def _validate_pack_devices(act: MoEActivationPack, runner: str) -> None:
@@ -611,9 +608,7 @@ class CakeWarpDecodeRunner(MoERunner):
     supported_activation_classes = (SwiGLU,)
     supports_expert_parallelism = False
 
-    _SUPPORTED_GEOMETRIES: ClassVar[
-        set[tuple[int, int, int, int]]
-    ] = {
+    _SUPPORTED_GEOMETRIES: ClassVar[set[tuple[int, int, int, int]]] = {
         # hidden_size, intermediate_size, num_experts, top_k
         (2048, 512, 512, 10),
         (2048, 1536, 60, 4),
@@ -670,8 +665,7 @@ class CakeWarpDecodeRunner(MoERunner):
         super()._check_support()
         if self._device_arch != 103:
             raise NotImplementedError(
-                "CakeWarpDecodeRunner requires exact SM103, "
-                f"got SM{self._device_arch}."
+                f"CakeWarpDecodeRunner requires exact SM103, got SM{self._device_arch}."
             )
         if self.config.activation != SwiGLU():
             raise NotImplementedError(
@@ -679,9 +673,7 @@ class CakeWarpDecodeRunner(MoERunner):
                 "(alpha=1, beta=0, default clamp)."
             )
         if not self.config.finalize.do_finalize:
-            raise NotImplementedError(
-                "CakeWarpDecodeRunner requires do_finalize=True."
-            )
+            raise NotImplementedError("CakeWarpDecodeRunner requires do_finalize=True.")
         if self.config.execution.enable_pdl is not True:
             raise NotImplementedError(
                 "CakeWarpDecodeRunner requires ExecutionConfig(enable_pdl=True)."
@@ -702,10 +694,7 @@ class CakeWarpDecodeRunner(MoERunner):
             if experts.local_num_experts is None
             else experts.local_num_experts
         )
-        if (
-            experts.local_expert_offset != 0
-            or local_num_experts != routing.num_experts
-        ):
+        if experts.local_expert_offset != 0 or local_num_experts != routing.num_experts:
             raise NotImplementedError(
                 "CakeWarpDecodeRunner requires local_expert_offset=0 and "
                 "local_num_experts=num_experts."
@@ -734,9 +723,7 @@ class CakeWarpDecodeRunner(MoERunner):
 
         self._module = get_cake_fused_moe_warp_decode_module(device=self.device)
 
-    def get_valid_tactics(
-        self, inputs: List[torch.Tensor], profile: Any
-    ) -> List[Any]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         self._require_built()
         return [-1]
 
@@ -770,9 +757,7 @@ class CakeWarpDecodeRunner(MoERunner):
             finalizer = self._workspace_receipt_finalizers.pop(identity, None)
             if finalizer is not None and finalizer.alive:
                 finalizer.detach()
-            _retire_cake_workspace_receipt(
-                self._module, prepared[0], prepared[1]
-            )
+            _retire_cake_workspace_receipt(self._module, prepared[0], prepared[1])
             self._prepared_workspaces.pop(identity, None)
             self._workspace_stream_claims.pop(identity, None)
         receipt = int(
@@ -932,9 +917,7 @@ class CakeWarpDecodeRunner(MoERunner):
                 "cake_fused_moe_warp_decode_workspace_size returned a "
                 "non-positive size."
             )
-        workspace = torch.empty(
-            workspace_size, dtype=torch.uint8, device=self.device
-        )
+        workspace = torch.empty(workspace_size, dtype=torch.uint8, device=self.device)
         if prepare:
             self._ensure_workspace_prepared(workspace, geometry)
         self._cache_workspace_for_stream(stream, geometry, workspace)
@@ -950,9 +933,7 @@ class CakeWarpDecodeRunner(MoERunner):
         # already-prepared workspace for this exact geometry to the capture
         # stream. forward records the stream claim and C++ inserts the external
         # completion-event dependency on any prior warmup submission.
-        for cached_key, (_, workspace) in reversed(
-            self._workspace_cache.items()
-        ):
+        for cached_key, (_, workspace) in reversed(self._workspace_cache.items()):
             if cached_key[1] != geometry:
                 continue
             identity = self._workspace_identity(workspace, geometry)
@@ -1132,9 +1113,7 @@ class CakeWarpDecodeRunner(MoERunner):
             device=device,
         )
         if act.per_token_scale is not None:
-            raise ValueError(
-                "CakeWarpDecodeRunner does not consume per_token_scale."
-            )
+            raise ValueError("CakeWarpDecodeRunner does not consume per_token_scale.")
 
         view = weights.get_view(self.backend_key)
         missing = [key for key in self._REQUIRED_WEIGHT_KEYS if key not in view]
@@ -1284,17 +1263,13 @@ class CakeWarpDecodeRunner(MoERunner):
             self._stream_token(stream),
         )
         try:
-            self._module.cake_fused_moe_warp_decode(
-                *launch_inputs, prepared[1], True
-            )
+            self._module.cake_fused_moe_warp_decode(*launch_inputs, prepared[1], True)
         except Exception:
             finalizer = self._workspace_receipt_finalizers.pop(identity, None)
             if finalizer is not None and finalizer.alive:
                 finalizer.detach()
             try:
-                _retire_cake_workspace_receipt(
-                    self._module, workspace, prepared[1]
-                )
+                _retire_cake_workspace_receipt(self._module, workspace, prepared[1])
             except Exception:
                 # Preserve the launch diagnostic. The strict retirement helper
                 # has already retained unsafe storage in the quarantine.

@@ -522,8 +522,7 @@ class CakeWarpDecodeConfig:
     def __post_init__(self) -> None:
         if self.backend != "cake":
             raise ValueError(
-                "CakeWarpDecodeConfig backend must be 'cake', "
-                f"got {self.backend!r}."
+                f"CakeWarpDecodeConfig backend must be 'cake', got {self.backend!r}."
             )
 
     @classmethod

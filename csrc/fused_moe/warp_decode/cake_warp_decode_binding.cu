@@ -30,7 +30,8 @@
 #include "tvm_ffi_utils.h"
 
 #if !__has_include("generated/cake_warp_decode_generated_manifest.cuh")
-#error "generated/cake_warp_decode_generated_manifest.cuh is required; generate the kernel manifest before building this module"
+#error \
+    "generated/cake_warp_decode_generated_manifest.cuh is required; generate the kernel manifest before building this module"
 #endif
 #include "generated/cake_warp_decode_generated_manifest.cuh"
 
@@ -62,16 +63,15 @@ struct AddressRange {
 };
 
 void CheckCuda(cudaError_t status, const char* operation) {
-  TVM_FFI_ICHECK(status == cudaSuccess)
-      << operation << " failed: " << cudaGetErrorString(status);
+  TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
 }
 
 void CheckManifestStatus(const ManifestStatus& status) {
   if (status.Ok()) {
     return;
   }
-  const char* operation = status.operation == nullptr ? "generated manifest operation"
-                                                       : status.operation;
+  const char* operation =
+      status.operation == nullptr ? "generated manifest operation" : status.operation;
   if (status.domain == StatusDomain::kCudaRuntime) {
     const auto error = static_cast<cudaError_t>(status.code);
     TVM_FFI_ICHECK(false) << operation << " failed: " << cudaGetErrorString(error);
@@ -82,8 +82,8 @@ void CheckManifestStatus(const ManifestStatus& status) {
     TVM_FFI_ICHECK(false) << operation << " failed: "
                           << (description == nullptr ? "unknown CUDA driver error" : description);
   }
-  TVM_FFI_ICHECK(false) << operation << " rejected the generated kernel manifest, code="
-                        << status.code;
+  TVM_FFI_ICHECK(false) << operation
+                        << " rejected the generated kernel manifest, code=" << status.code;
 }
 
 void CheckSm103a(int32_t device_id) {
@@ -94,8 +94,7 @@ void CheckSm103a(int32_t device_id) {
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(computeCapabilityMinor)");
   TVM_FFI_ICHECK(major == 10 && minor == 3)
-      << "cake warp decode requires exact compute capability 10.3, got " << major << "."
-      << minor;
+      << "cake warp decode requires exact compute capability 10.3, got " << major << "." << minor;
 }
 
 void CheckDtype(const TensorView& tensor, const char* name, DLDataType expected) {
@@ -104,17 +103,16 @@ void CheckDtype(const TensorView& tensor, const char* name, DLDataType expected)
                  actual.lanes == expected.lanes)
       << name << " dtype mismatch: expected (code=" << static_cast<int>(expected.code)
       << ", bits=" << static_cast<int>(expected.bits)
-      << ", lanes=" << static_cast<int>(expected.lanes) << "), got (code="
-      << static_cast<int>(actual.code) << ", bits=" << static_cast<int>(actual.bits)
-      << ", lanes=" << static_cast<int>(actual.lanes) << ")";
+      << ", lanes=" << static_cast<int>(expected.lanes)
+      << "), got (code=" << static_cast<int>(actual.code)
+      << ", bits=" << static_cast<int>(actual.bits) << ", lanes=" << static_cast<int>(actual.lanes)
+      << ")";
 }
 
-void CheckTensor(const TensorView& tensor, const char* name, int32_t device_id,
-                 DLDataType dtype) {
+void CheckTensor(const TensorView& tensor, const char* name, int32_t device_id, DLDataType dtype) {
   TVM_FFI_ICHECK(tensor.device().device_type == kDLCUDA) << name << " must be a CUDA tensor";
   TVM_FFI_ICHECK(tensor.device().device_id == device_id)
-      << name << " must be on cuda:" << device_id << ", got cuda:"
-      << tensor.device().device_id;
+      << name << " must be on cuda:" << device_id << ", got cuda:" << tensor.device().device_id;
   TVM_FFI_ICHECK(tensor.IsContiguous()) << name << " must be contiguous";
   CheckDtype(tensor, name, dtype);
 }
@@ -122,12 +120,10 @@ void CheckTensor(const TensorView& tensor, const char* name, int32_t device_id,
 void CheckE4m3Storage(const TensorView& tensor, const char* name, int32_t device_id) {
   TVM_FFI_ICHECK(tensor.device().device_type == kDLCUDA) << name << " must be a CUDA tensor";
   TVM_FFI_ICHECK(tensor.device().device_id == device_id)
-      << name << " must be on cuda:" << device_id << ", got cuda:"
-      << tensor.device().device_id;
+      << name << " must be on cuda:" << device_id << ", got cuda:" << tensor.device().device_id;
   TVM_FFI_ICHECK(tensor.IsContiguous()) << name << " must be contiguous";
   const DLDataType actual = tensor.dtype();
-  const bool e4m3 = actual.code == dl_float8_e4m3fn.code &&
-                    actual.bits == dl_float8_e4m3fn.bits &&
+  const bool e4m3 = actual.code == dl_float8_e4m3fn.code && actual.bits == dl_float8_e4m3fn.bits &&
                     actual.lanes == dl_float8_e4m3fn.lanes;
   const bool raw_bytes = actual.code == dl_uint8.code && actual.bits == dl_uint8.bits &&
                          actual.lanes == dl_uint8.lanes;
@@ -141,9 +137,8 @@ void CheckShape(const TensorView& tensor, const char* name,
       << name << " rank mismatch: expected " << expected.size() << ", got " << tensor.ndim();
   int32_t axis = 0;
   for (int64_t extent : expected) {
-    TVM_FFI_ICHECK(tensor.size(axis) == extent)
-        << name << " dimension " << axis << " must equal " << extent << ", got "
-        << tensor.size(axis);
+    TVM_FFI_ICHECK(tensor.size(axis) == extent) << name << " dimension " << axis << " must equal "
+                                                << extent << ", got " << tensor.size(axis);
     ++axis;
   }
 }
@@ -188,18 +183,17 @@ void CheckAlignment(const TensorView& tensor, const char* name, size_t alignment
 
 Shape CheckedShape(int64_t num_tokens, int64_t hidden_size, int64_t intermediate_size,
                    int64_t num_experts, int64_t top_k) {
-  for (const auto& value :
-       {std::pair<int64_t, const char*>{num_tokens, "num_tokens"},
-        {hidden_size, "hidden_size"},
-        {intermediate_size, "intermediate_size"},
-        {num_experts, "num_experts"},
-        {top_k, "top_k"}}) {
+  for (const auto& value : {std::pair<int64_t, const char*>{num_tokens, "num_tokens"},
+                            {hidden_size, "hidden_size"},
+                            {intermediate_size, "intermediate_size"},
+                            {num_experts, "num_experts"},
+                            {top_k, "top_k"}}) {
     TVM_FFI_ICHECK(value.first >= 1 && value.first <= std::numeric_limits<int32_t>::max())
         << value.second << " must fit a positive int32, got " << value.first;
   }
-  Shape shape{static_cast<int32_t>(num_tokens), static_cast<int32_t>(hidden_size),
+  Shape shape{static_cast<int32_t>(num_tokens),        static_cast<int32_t>(hidden_size),
               static_cast<int32_t>(intermediate_size), static_cast<int32_t>(num_experts),
-              static_cast<int32_t>(num_experts), static_cast<int32_t>(top_k)};
+              static_cast<int32_t>(num_experts),       static_cast<int32_t>(top_k)};
   TVM_FFI_ICHECK(SelectSchedule(shape).supported)
       << "cake warp decode supports only (H=2048, I=512, E=512, top_k=10) or "
          "(H=2048, I=1536, E=60, top_k=4), with 1 <= num_tokens <= 32";
@@ -218,8 +212,7 @@ void CheckWorkspace(const TensorView& workspace, int32_t device_id, int64_t requ
   CheckTensor(workspace, "workspace_u8", device_id, dl_uint8);
   TVM_FFI_ICHECK(workspace.ndim() == 1) << "workspace_u8 must be a one-dimensional byte buffer";
   TVM_FFI_ICHECK(workspace.numel() >= required_bytes)
-      << "workspace_u8 requires at least " << required_bytes << " bytes, got "
-      << workspace.numel();
+      << "workspace_u8 requires at least " << required_bytes << " bytes, got " << workspace.numel();
   CheckAlignment(workspace, "workspace_u8", generated::kWorkspaceAlignment);
 }
 
@@ -245,8 +238,8 @@ struct WorkspaceKey {
            shape.top_k == other.shape.top_k && schedule.supported == other.schedule.supported &&
            schedule.geometry == other.schedule.geometry &&
            schedule.route_layout == other.schedule.route_layout &&
-           schedule.route_packer == other.schedule.route_packer && schedule.fc1 == other.schedule.fc1 &&
-           schedule.fc2 == other.schedule.fc2 &&
+           schedule.route_packer == other.schedule.route_packer &&
+           schedule.fc1 == other.schedule.fc1 && schedule.fc2 == other.schedule.fc2 &&
            schedule.finalize_threads == other.schedule.finalize_threads &&
            schedule.finalize_unroll == other.schedule.finalize_unroll &&
            schedule.workfeed_ctas == other.schedule.workfeed_ctas;
@@ -292,21 +285,17 @@ struct WorkspaceAddressKey {
 struct WorkspaceAddressKeyHash {
   size_t operator()(const WorkspaceAddressKey& key) const {
     size_t seed = 0xcbf29ce484222325ULL;
-    seed ^= static_cast<size_t>(static_cast<uint32_t>(key.device_id)) +
-            0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-    seed ^= static_cast<size_t>(key.pointer) + 0x9e3779b97f4a7c15ULL +
+    seed ^= static_cast<size_t>(static_cast<uint32_t>(key.device_id)) + 0x9e3779b97f4a7c15ULL +
             (seed << 6) + (seed >> 2);
+    seed ^= static_cast<size_t>(key.pointer) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
     return seed;
   }
 };
 
 WorkspaceKey MakeWorkspaceKey(const Invocation& invocation, const Schedule& schedule,
                               int32_t device_id) {
-  return {device_id,
-          reinterpret_cast<uintptr_t>(invocation.workspace),
-          invocation.workspace_bytes,
-          invocation.shape,
-          schedule};
+  return {device_id, reinterpret_cast<uintptr_t>(invocation.workspace), invocation.workspace_bytes,
+          invocation.shape, schedule};
 }
 
 std::mutex prepared_workspaces_mutex;
@@ -317,8 +306,7 @@ struct PreparedWorkspaceState {
   bool poisoned;
 };
 
-std::unordered_map<WorkspaceKey, PreparedWorkspaceState, WorkspaceKeyHash>
-    prepared_workspaces;
+std::unordered_map<WorkspaceKey, PreparedWorkspaceState, WorkspaceKeyHash> prepared_workspaces;
 // External event nodes captured by CUDA Graphs retain the event handle, not a
 // C++ owner. Keep one stable handle per device/address for process lifetime so
 // releasing a receipt cannot leave a still-live GraphExec with a dangling
@@ -334,8 +322,7 @@ cudaEvent_t GetWorkspaceCompletionEvent(int32_t device_id, uintptr_t pointer) {
     return existing->second;
   }
   constexpr size_t kMaximumWorkspaceCompletionEvents = 4096;
-  TVM_FFI_ICHECK(workspace_completion_events.size() <
-                 kMaximumWorkspaceCompletionEvents)
+  TVM_FFI_ICHECK(workspace_completion_events.size() < kMaximumWorkspaceCompletionEvents)
       << "warp-decode workspace completion-event address capacity is exhausted";
   cudaEvent_t completion = nullptr;
   CheckCuda(cudaEventCreateWithFlags(&completion, cudaEventDisableTiming),
@@ -344,8 +331,7 @@ cudaEvent_t GetWorkspaceCompletionEvent(int32_t device_id, uintptr_t pointer) {
   return completion;
 }
 
-void SynchronizeWorkspaceSubmissions(const PreparedWorkspaceState& state,
-                                     const char* operation) {
+void SynchronizeWorkspaceSubmissions(const PreparedWorkspaceState& state, const char* operation) {
   TVM_FFI_ICHECK(!state.poisoned)
       << "warp-decode workspace is quarantined because accepted GPU work could not "
          "be covered by a completion event; refusing to release or re-prepare it";
@@ -367,12 +353,10 @@ int64_t PrepareWorkspaceAlways(const Invocation& invocation, const Schedule& sch
   // every prior shape/schedule for the address before initialization begins;
   // a failed re-prepare therefore cannot leave an older receipt usable for a
   // workspace whose contents may already have been partially overwritten.
-  for (auto existing = prepared_workspaces.begin();
-       existing != prepared_workspaces.end();) {
-    if (existing->first.device_id == device_id &&
-        existing->first.pointer == key.pointer) {
-      SynchronizeWorkspaceSubmissions(
-          existing->second, "cudaEventSynchronize(previous workspace submissions)");
+  for (auto existing = prepared_workspaces.begin(); existing != prepared_workspaces.end();) {
+    if (existing->first.device_id == device_id && existing->first.pointer == key.pointer) {
+      SynchronizeWorkspaceSubmissions(existing->second,
+                                      "cudaEventSynchronize(previous workspace submissions)");
       existing = prepared_workspaces.erase(existing);
     } else {
       ++existing;
@@ -396,21 +380,19 @@ int64_t PrepareWorkspaceAlways(const Invocation& invocation, const Schedule& sch
   TVM_FFI_ICHECK(next_workspace_receipt > 0 &&
                  next_workspace_receipt < std::numeric_limits<int64_t>::max())
       << "warp-decode workspace receipt counter is exhausted";
-  const cudaEvent_t completion =
-      GetWorkspaceCompletionEvent(device_id, key.pointer);
+  const cudaEvent_t completion = GetWorkspaceCompletionEvent(device_id, key.pointer);
   const int64_t receipt = next_workspace_receipt++;
-  prepared_workspaces.insert_or_assign(
-      key, PreparedWorkspaceState{receipt, completion, false, false});
+  prepared_workspaces.insert_or_assign(key,
+                                       PreparedWorkspaceState{receipt, completion, false, false});
   return receipt;
 }
 
-PreparedWorkspaceState& RequirePreparedWorkspace(
-    const Invocation& invocation, const Schedule& schedule, int32_t device_id,
-    int64_t receipt) {
+PreparedWorkspaceState& RequirePreparedWorkspace(const Invocation& invocation,
+                                                 const Schedule& schedule, int32_t device_id,
+                                                 int64_t receipt) {
   const WorkspaceKey key = MakeWorkspaceKey(invocation, schedule, device_id);
   auto existing = prepared_workspaces.find(key);
-  TVM_FFI_ICHECK(existing != prepared_workspaces.end() &&
-                 existing->second.receipt == receipt)
+  TVM_FFI_ICHECK(existing != prepared_workspaces.end() && existing->second.receipt == receipt)
       << "workspace_u8 does not have the current preparation receipt for this warp-decode "
          "shape; prepare this exact workspace outside CUDA Graph capture";
   TVM_FFI_ICHECK(!existing->second.poisoned)
@@ -423,12 +405,12 @@ void ReleaseWorkspaceReceipt(int64_t receipt) {
   TVM_FFI_ICHECK(receipt > 0)
       << "warp-decode workspace release requires a positive preparation receipt";
   std::lock_guard<std::mutex> lock(prepared_workspaces_mutex);
-  for (auto existing = prepared_workspaces.begin();
-       existing != prepared_workspaces.end(); ++existing) {
+  for (auto existing = prepared_workspaces.begin(); existing != prepared_workspaces.end();
+       ++existing) {
     if (existing->second.receipt == receipt) {
       ffi::CUDADeviceGuard device_guard(existing->first.device_id);
-      SynchronizeWorkspaceSubmissions(
-          existing->second, "cudaEventSynchronize(released workspace submissions)");
+      SynchronizeWorkspaceSubmissions(existing->second,
+                                      "cudaEventSynchronize(released workspace submissions)");
       prepared_workspaces.erase(existing);
       return;
     }
@@ -488,8 +470,7 @@ void LaunchOne(const KernelLaunch& launch, void* opaque_context) {
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 13020
   if (launch.allow_oversized_smem) {
     attributes[attribute_count].id = cudaLaunchAttributeSharedMemoryMode;
-    attributes[attribute_count].val.sharedMemoryMode =
-        cudaSharedMemoryModeAllowNonPortable;
+    attributes[attribute_count].val.sharedMemoryMode = cudaSharedMemoryModeAllowNonPortable;
     ++attribute_count;
   }
 #else
@@ -517,8 +498,7 @@ void CheckAllTensorArguments(
     const TensorView& topk_ids_i32, const TensorView& topk_weights_bf16,
     const TensorView& gemm1_weights_u8, const TensorView& gemm1_weights_scale_e4m3,
     const TensorView& gemm2_weights_u8, const TensorView& gemm2_weights_scale_e4m3,
-    const TensorView& output1_scale_scalar_f32,
-    const TensorView& output1_scale_gate_scalar_f32,
+    const TensorView& output1_scale_scalar_f32, const TensorView& output1_scale_gate_scalar_f32,
     const TensorView& output2_scale_scalar_f32, const Shape& shape, int64_t workspace_bytes) {
   const int32_t device_id = output_bf16.device().device_id;
   const int64_t tokens = shape.num_tokens;
@@ -544,12 +524,10 @@ void CheckAllTensorArguments(
 
   CheckShape(output_bf16, "output_bf16", {tokens, hidden});
   CheckShape(hidden_states_q_u8, "hidden_states_q_u8", {tokens, hidden / 2});
-  CheckShape(hidden_states_scale_e4m3, "hidden_states_scale_e4m3",
-             {tokens, hidden / 16});
+  CheckShape(hidden_states_scale_e4m3, "hidden_states_scale_e4m3", {tokens, hidden / 16});
   CheckShape(topk_ids_i32, "topk_ids_i32", {tokens, top_k});
   CheckShape(topk_weights_bf16, "topk_weights_bf16", {tokens, top_k});
-  CheckShape(gemm1_weights_u8, "gemm1_weights_u8",
-             {experts, 2 * intermediate, hidden / 2});
+  CheckShape(gemm1_weights_u8, "gemm1_weights_u8", {experts, 2 * intermediate, hidden / 2});
   CheckShape(gemm1_weights_scale_e4m3, "gemm1_weights_scale_e4m3",
              {experts, 2 * intermediate, hidden / 16});
   CheckShape(gemm2_weights_u8, "gemm2_weights_u8", {experts, hidden, intermediate / 2});
@@ -593,8 +571,7 @@ Invocation MakeInvocation(
     const TensorView& topk_ids_i32, const TensorView& topk_weights_bf16,
     const TensorView& gemm1_weights_u8, const TensorView& gemm1_weights_scale_e4m3,
     const TensorView& gemm2_weights_u8, const TensorView& gemm2_weights_scale_e4m3,
-    const TensorView& output1_scale_scalar_f32,
-    const TensorView& output1_scale_gate_scalar_f32,
+    const TensorView& output1_scale_scalar_f32, const TensorView& output1_scale_gate_scalar_f32,
     const TensorView& output2_scale_scalar_f32, const Shape& shape) {
   return {shape,
           output_bf16.data_ptr(),
@@ -617,8 +594,7 @@ Invocation MakeInvocation(
 
 int64_t WorkspaceSize(int64_t num_tokens, int64_t hidden_size, int64_t intermediate_size,
                       int64_t num_experts, int64_t top_k) {
-  const Shape shape =
-      CheckedShape(num_tokens, hidden_size, intermediate_size, num_experts, top_k);
+  const Shape shape = CheckedShape(num_tokens, hidden_size, intermediate_size, num_experts, top_k);
   return CheckedWorkspaceSize(shape, SelectSchedule(shape));
 }
 
@@ -626,8 +602,7 @@ int64_t PrepareWorkspace(TensorView workspace_u8, int64_t num_tokens, int64_t hi
                          int64_t intermediate_size, int64_t num_experts, int64_t top_k) {
   TVM_FFI_ICHECK(workspace_u8.device().device_type == kDLCUDA)
       << "workspace_u8 must be a CUDA tensor";
-  const Shape shape =
-      CheckedShape(num_tokens, hidden_size, intermediate_size, num_experts, top_k);
+  const Shape shape = CheckedShape(num_tokens, hidden_size, intermediate_size, num_experts, top_k);
   const Schedule schedule = SelectSchedule(shape);
   const int64_t workspace_bytes = CheckedWorkspaceSize(shape, schedule);
   const int32_t device_id = workspace_u8.device().device_id;
@@ -642,31 +617,20 @@ int64_t PrepareWorkspace(TensorView workspace_u8, int64_t num_tokens, int64_t hi
       << "cake warp-decode workspace preparation must run outside CUDA Graph capture";
   CheckManifestStatus(generated::EnsureDeviceReady(device_id, true));
 
-  const Invocation invocation{shape,
-                              nullptr,
-                              workspace_u8.data_ptr(),
-                              nullptr,
-                              nullptr,
-                              nullptr,
-                              nullptr,
-                              nullptr,
-                              nullptr,
-                              nullptr,
-                              nullptr,
-                              nullptr,
-                              nullptr,
-                              nullptr,
-                              TensorStorageBytes(workspace_u8, "workspace_u8")};
+  const Invocation invocation{shape,   nullptr, workspace_u8.data_ptr(),
+                              nullptr, nullptr, nullptr,
+                              nullptr, nullptr, nullptr,
+                              nullptr, nullptr, nullptr,
+                              nullptr, nullptr, TensorStorageBytes(workspace_u8, "workspace_u8")};
   return PrepareWorkspaceAlways(invocation, schedule, device_id, stream);
 }
 
 void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_states_q_u8,
-         TensorView hidden_states_scale_e4m3, TensorView topk_ids_i32,
-         TensorView topk_weights_bf16, TensorView gemm1_weights_u8,
-         TensorView gemm1_weights_scale_e4m3, TensorView gemm2_weights_u8,
-         TensorView gemm2_weights_scale_e4m3, TensorView output1_scale_scalar_f32,
-         TensorView output1_scale_gate_scalar_f32, TensorView output2_scale_scalar_f32,
-         int64_t workspace_receipt, bool enable_pdl) {
+         TensorView hidden_states_scale_e4m3, TensorView topk_ids_i32, TensorView topk_weights_bf16,
+         TensorView gemm1_weights_u8, TensorView gemm1_weights_scale_e4m3,
+         TensorView gemm2_weights_u8, TensorView gemm2_weights_scale_e4m3,
+         TensorView output1_scale_scalar_f32, TensorView output1_scale_gate_scalar_f32,
+         TensorView output2_scale_scalar_f32, int64_t workspace_receipt, bool enable_pdl) {
   TVM_FFI_ICHECK(enable_pdl)
       << "cake warp decode requires programmatic dependent launch; enable_pdl must be true";
   TVM_FFI_ICHECK(output_bf16.device().device_type == kDLCUDA)
@@ -676,20 +640,19 @@ void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_stat
   TVM_FFI_ICHECK(topk_ids_i32.ndim() == 2) << "topk_ids_i32 must have rank 2";
 
   const int64_t intermediate_size = gemm2_weights_u8.size(2) * 2;
-  const Shape shape = CheckedShape(output_bf16.size(0), output_bf16.size(1),
-                                   intermediate_size, gemm2_weights_u8.size(0),
-                                   topk_ids_i32.size(1));
+  const Shape shape = CheckedShape(output_bf16.size(0), output_bf16.size(1), intermediate_size,
+                                   gemm2_weights_u8.size(0), topk_ids_i32.size(1));
   const Schedule schedule = SelectSchedule(shape);
   const int64_t workspace_bytes = CheckedWorkspaceSize(shape, schedule);
 
   const int32_t device_id = output_bf16.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
   CheckSm103a(device_id);
-  CheckAllTensorArguments(
-      output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3, topk_ids_i32,
-      topk_weights_bf16, gemm1_weights_u8, gemm1_weights_scale_e4m3, gemm2_weights_u8,
-      gemm2_weights_scale_e4m3, output1_scale_scalar_f32, output1_scale_gate_scalar_f32,
-      output2_scale_scalar_f32, shape, workspace_bytes);
+  CheckAllTensorArguments(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3,
+                          topk_ids_i32, topk_weights_bf16, gemm1_weights_u8,
+                          gemm1_weights_scale_e4m3, gemm2_weights_u8, gemm2_weights_scale_e4m3,
+                          output1_scale_scalar_f32, output1_scale_gate_scalar_f32,
+                          output2_scale_scalar_f32, shape, workspace_bytes);
 
   const cudaStream_t stream = get_current_stream();
   cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
@@ -698,24 +661,23 @@ void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_stat
   const bool is_capturing = capture_status != cudaStreamCaptureStatusNone;
   CheckManifestStatus(generated::EnsureDeviceReady(device_id, false));
 
-  const Invocation invocation = MakeInvocation(
-      output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3, topk_ids_i32,
-      topk_weights_bf16, gemm1_weights_u8, gemm1_weights_scale_e4m3, gemm2_weights_u8,
-      gemm2_weights_scale_e4m3, output1_scale_scalar_f32, output1_scale_gate_scalar_f32,
-      output2_scale_scalar_f32, shape);
+  const Invocation invocation =
+      MakeInvocation(output_bf16, workspace_u8, hidden_states_q_u8, hidden_states_scale_e4m3,
+                     topk_ids_i32, topk_weights_bf16, gemm1_weights_u8, gemm1_weights_scale_e4m3,
+                     gemm2_weights_u8, gemm2_weights_scale_e4m3, output1_scale_scalar_f32,
+                     output1_scale_gate_scalar_f32, output2_scale_scalar_f32, shape);
   // Keep the registry lock across the complete host-side submission transaction:
   // receipt validation, dependency insertion, kernel submission, and completion
   // recording. GPU execution stays asynchronous. External event nodes make the
   // dependency observable across CUDA Graph capture and replay without retaining
   // a borrowed raw stream handle.
   std::lock_guard<std::mutex> lock(prepared_workspaces_mutex);
-  PreparedWorkspaceState& workspace = RequirePreparedWorkspace(
-      invocation, schedule, device_id, workspace_receipt);
+  PreparedWorkspaceState& workspace =
+      RequirePreparedWorkspace(invocation, schedule, device_id, workspace_receipt);
   if (workspace.has_submission) {
-    CheckCuda(cudaStreamWaitEvent(
-                  stream, workspace.completion,
-                  is_capturing ? cudaEventWaitExternal : 0),
-              "cudaStreamWaitEvent(previous workspace submission)");
+    CheckCuda(
+        cudaStreamWaitEvent(stream, workspace.completion, is_capturing ? cudaEventWaitExternal : 0),
+        "cudaStreamWaitEvent(previous workspace submission)");
   }
   LaunchContext context{stream, 0};
   try {
@@ -728,8 +690,7 @@ void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_stat
       workspace.poisoned = true;
       const cudaError_t status =
           is_capturing
-              ? cudaEventRecordWithFlags(workspace.completion, stream,
-                                         cudaEventRecordExternal)
+              ? cudaEventRecordWithFlags(workspace.completion, stream, cudaEventRecordExternal)
               : cudaEventRecord(workspace.completion, stream);
       if (status == cudaSuccess) {
         workspace.has_submission = true;
@@ -743,17 +704,14 @@ void Run(TensorView output_bf16, TensorView workspace_u8, TensorView hidden_stat
   // only after the external event is known to cover the complete submission.
   workspace.poisoned = true;
   const cudaError_t completion_status =
-      is_capturing
-          ? cudaEventRecordWithFlags(workspace.completion, stream,
-                                     cudaEventRecordExternal)
-          : cudaEventRecord(workspace.completion, stream);
+      is_capturing ? cudaEventRecordWithFlags(workspace.completion, stream, cudaEventRecordExternal)
+                   : cudaEventRecord(workspace.completion, stream);
   if (completion_status == cudaSuccess) {
     workspace.has_submission = true;
     workspace.poisoned = false;
   }
   CheckCuda(completion_status, "cudaEventRecord(workspace completion)");
-  const int32_t expected_launches =
-      schedule.route_layout == RouteLayout::kDirect ? 3 : 4;
+  const int32_t expected_launches = schedule.route_layout == RouteLayout::kDirect ? 3 : 4;
   TVM_FFI_ICHECK(context.launch_count == expected_launches)
       << "generated manifest emitted " << context.launch_count
       << " launches for a schedule that requires " << expected_launches;

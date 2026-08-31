@@ -64,9 +64,7 @@ class _Module:
         self.size_calls.append(geometry)
         return 64
 
-    def cake_fused_moe_warp_decode_prepare_workspace(
-        self, workspace, *geometry
-    ) -> int:
+    def cake_fused_moe_warp_decode_prepare_workspace(self, workspace, *geometry) -> int:
         self.prepare_calls.append((workspace, geometry))
         receipt = self.next_receipt
         self.next_receipt += 1
@@ -235,9 +233,7 @@ def test_support_rejects_semantic_and_geometry_expansion():
     with pytest.raises(NotImplementedError, match="default SwiGLU"):
         runner._check_support()
 
-    runner.config = replace(
-        _config(), finalize=MoEFinalizeConfig(do_finalize=False)
-    )
+    runner.config = replace(_config(), finalize=MoEFinalizeConfig(do_finalize=False))
     with pytest.raises(NotImplementedError, match="do_finalize=True"):
         runner._check_support()
 
@@ -261,9 +257,7 @@ def test_support_rejects_semantic_and_geometry_expansion():
         routing=RoutingConfig(
             num_experts=60, top_k=4, method=RoutingMethodType.DeepSeekV3
         ),
-        experts=ExpertConfig(
-            intermediate_size=1536, num_fused_shared_experts=1
-        ),
+        experts=ExpertConfig(intermediate_size=1536, num_fused_shared_experts=1),
     )
     with pytest.raises(NotImplementedError, match="fused shared experts"):
         runner._check_support()
@@ -308,9 +302,7 @@ def test_pack_uses_a_distinct_workspace_per_cuda_stream(monkeypatch):
     runner, module = _runner()
     act = _activation_pack()
     weights, _ = _weight_pack()
-    streams = iter(
-        (SimpleNamespace(cuda_stream=101), SimpleNamespace(cuda_stream=202))
-    )
+    streams = iter((SimpleNamespace(cuda_stream=101), SimpleNamespace(cuda_stream=202)))
     monkeypatch.setattr(runner, "_current_stream", lambda: next(streams))
 
     first = runner.pack_inputs(act, weights)
@@ -367,9 +359,7 @@ def test_capture_rejects_unvalidated_topk_ids(monkeypatch):
 
     with pytest.raises(RuntimeError, match="exact tensor version"):
         runner.pack_inputs(
-            _activation_pack(
-                topk_ids=torch.zeros((7, 4), dtype=torch.int32)
-            ),
+            _activation_pack(topk_ids=torch.zeros((7, 4), dtype=torch.int32)),
             _weight_pack()[0],
         )
 
@@ -459,9 +449,7 @@ def test_capture_stream_reuses_packed_workspace_claimed_by_warmup(monkeypatch):
     current_stream = stream_a
     capturing = False
     monkeypatch.setattr(runner, "_current_stream", lambda: current_stream)
-    monkeypatch.setattr(
-        runner, "_is_current_stream_capturing", lambda: capturing
-    )
+    monkeypatch.setattr(runner, "_is_current_stream_capturing", lambda: capturing)
 
     inputs = runner.pack_inputs(_activation_pack(), _weight_pack()[0])
     runner.forward(inputs)
@@ -471,9 +459,7 @@ def test_capture_stream_reuses_packed_workspace_claimed_by_warmup(monkeypatch):
 
     assert len(module.run_calls) == 2
     assert module.run_calls[-1][1] is inputs[1]
-    assert list(runner._workspace_cache) == [
-        (202, (7, 2048, 1536, 60, 4))
-    ]
+    assert list(runner._workspace_cache) == [(202, (7, 2048, 1536, 60, 4))]
 
 
 def test_capture_pack_and_forward_reuse_warmed_geometry(monkeypatch):
@@ -483,9 +469,7 @@ def test_capture_pack_and_forward_reuse_warmed_geometry(monkeypatch):
     current_stream = stream_a
     capturing = False
     monkeypatch.setattr(runner, "_current_stream", lambda: current_stream)
-    monkeypatch.setattr(
-        runner, "_is_current_stream_capturing", lambda: capturing
-    )
+    monkeypatch.setattr(runner, "_is_current_stream_capturing", lambda: capturing)
     activations = _activation_pack()
     weights = _weight_pack()[0]
 
@@ -499,9 +483,7 @@ def test_capture_pack_and_forward_reuse_warmed_geometry(monkeypatch):
     assert capture_inputs[1] is warm_inputs[1]
     assert len(module.prepare_calls) == 1
     assert len(module.run_calls) == 2
-    assert list(runner._workspace_cache) == [
-        (202, (7, 2048, 1536, 60, 4))
-    ]
+    assert list(runner._workspace_cache) == [(202, (7, 2048, 1536, 60, 4))]
 
 
 def test_forward_fails_closed_until_workspace_is_prepared():
@@ -592,8 +574,9 @@ def test_failed_finalizer_release_quarantines_workspace():
     try:
         assert module.release_calls == [1]
         assert workspace_ref() is not None
-        assert "injected release failure" in (
-            moe_runners._CAKE_QUARANTINED_WORKSPACES[key][2]
+        assert (
+            "injected release failure"
+            in (moe_runners._CAKE_QUARANTINED_WORKSPACES[key][2])
         )
     finally:
         moe_runners._CAKE_QUARANTINED_WORKSPACES.pop(key, None)
@@ -639,9 +622,7 @@ def test_forced_workspace_prepare_release_failure_keeps_old_state_quarantined():
 def test_launch_failure_retires_workspace_and_preserves_launch_error():
     runner, module = _runner()
     inputs = runner.pack_inputs(_activation_pack(), _weight_pack()[0])
-    identity = runner._workspace_identity(
-        inputs[1], (7, 2048, 1536, 60, 4)
-    )
+    identity = runner._workspace_identity(inputs[1], (7, 2048, 1536, 60, 4))
     module.run_error = RuntimeError("injected launch failure")
 
     with pytest.raises(RuntimeError, match="injected launch failure"):
@@ -658,9 +639,7 @@ def test_launch_and_release_failure_preserves_launch_error_and_quarantines():
     runner, module = _runner()
     inputs = runner.pack_inputs(_activation_pack(), _weight_pack()[0])
     workspace = inputs[1]
-    identity = runner._workspace_identity(
-        workspace, (7, 2048, 1536, 60, 4)
-    )
+    identity = runner._workspace_identity(workspace, (7, 2048, 1536, 60, 4))
     quarantine_key = (id(module), 1)
     module.run_error = RuntimeError("injected launch failure")
     module.release_error = RuntimeError("injected launch cleanup failure")
@@ -691,9 +670,7 @@ def test_pack_rejects_mode_tokens_weights_and_extra_fields():
     with pytest.raises(ValueError, match="1 <= num_tokens <= 32"):
         runner.pack_inputs(_activation_pack(num_tokens=33), weights)
     with pytest.raises(TypeError, match="topk_weights"):
-        runner.pack_inputs(
-            _activation_pack(weights_dtype=torch.float32), weights
-        )
+        runner.pack_inputs(_activation_pack(weights_dtype=torch.float32), weights)
 
     weights_with_bias, _ = _weight_pack(
         extra={"gemm1_bias": _TensorSpec((60, 3072), torch.bfloat16)}

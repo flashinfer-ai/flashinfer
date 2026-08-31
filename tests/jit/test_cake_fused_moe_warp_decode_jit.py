@@ -21,9 +21,7 @@ def test_cake_warp_decode_jit_spec_is_exact_sm103a() -> None:
     assert (
         spec.sources[0].parent / "cake_warp_decode_generated_manifest.cuh"
     ).is_file()
-    assert (
-        spec.sources[1].parent / "cake_warp_decode_contract.cuh"
-    ).is_file()
+    assert (spec.sources[1].parent / "cake_warp_decode_contract.cuh").is_file()
     assert spec.sources[0].parent.name == "generated"
     assert spec.sources[1].parent == spec.sources[0].parent.parent
     assert spec.sources[1].parent in spec.extra_include_dirs
@@ -35,8 +33,7 @@ def test_cake_warp_decode_jit_spec_is_exact_sm103a() -> None:
     assert spec.needs_device_linking is False
     assert (
         sum(
-            flag.startswith("-gencode=arch=compute_")
-            for flag in spec.extra_cuda_cflags
+            flag.startswith("-gencode=arch=compute_") for flag in spec.extra_cuda_cflags
         )
         == 1
     )

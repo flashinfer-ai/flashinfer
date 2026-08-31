@@ -82,16 +82,23 @@ struct Schedule {
   int32_t workfeed_ctas;
 };
 
-constexpr bool IsGeometry(const Shape& shape, int32_t intermediate_size,
-                          int32_t num_experts, int32_t top_k) {
+constexpr bool IsGeometry(const Shape& shape, int32_t intermediate_size, int32_t num_experts,
+                          int32_t top_k) {
   return shape.hidden_size == 2048 && shape.intermediate_size == intermediate_size &&
          shape.num_experts == num_experts && shape.local_num_experts == num_experts &&
          shape.top_k == top_k;
 }
 
 constexpr Schedule UnsupportedSchedule() {
-  return {false, Geometry::kUnsupported, RouteLayout::kDirect, RoutePacker::kNone,
-          Fc1Schedule::kStatic, Fc2Schedule::kRouteParallelK256, 0, 0, 0};
+  return {false,
+          Geometry::kUnsupported,
+          RouteLayout::kDirect,
+          RoutePacker::kNone,
+          Fc1Schedule::kStatic,
+          Fc2Schedule::kRouteParallelK256,
+          0,
+          0,
+          0};
 }
 
 // This selector is the public calibration boundary. The generated manifest
@@ -183,12 +190,10 @@ static_assert(SelectSchedule(E512Shape(1)).fc1 == Fc1Schedule::kStatic);
 static_assert(SelectSchedule(E512Shape(2)).fc1 == Fc1Schedule::kPersistent);
 static_assert(SelectSchedule(E512Shape(23)).route_layout == RouteLayout::kDirect);
 static_assert(SelectSchedule(E512Shape(24)).route_packer == RoutePacker::kGeneral);
-static_assert(SelectSchedule(E512Shape(32)).fc2 ==
-              Fc2Schedule::kRouteParallelK512DeviceWorkfeed);
+static_assert(SelectSchedule(E512Shape(32)).fc2 == Fc2Schedule::kRouteParallelK512DeviceWorkfeed);
 static_assert(!SelectSchedule(E512Shape(33)).supported);
 static_assert(SelectSchedule(E60Shape(7)).fc2 == Fc2Schedule::kRouteParallelK768K96);
-static_assert(SelectSchedule(E60Shape(8)).fc2 ==
-              Fc2Schedule::kRouteParallelK768K96PaddedScale);
+static_assert(SelectSchedule(E60Shape(8)).fc2 == Fc2Schedule::kRouteParallelK768K96PaddedScale);
 static_assert(SelectSchedule(E60Shape(10)).route_layout == RouteLayout::kDirect);
 static_assert(SelectSchedule(E60Shape(11)).route_packer == RoutePacker::kE64Scan1);
 static_assert(SelectSchedule(E60Shape(12)).route_packer == RoutePacker::kE64Scan2);

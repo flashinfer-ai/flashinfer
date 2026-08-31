@@ -15,6 +15,7 @@ import math
 import statistics
 import time
 import weakref
+from contextlib import suppress
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
@@ -94,12 +95,10 @@ def _release_workspace_receipt_fail_closed(
 def _finalize_workspace_receipt(
     module: Any, workspace: torch.Tensor, receipt: int
 ) -> None:
-    try:
+    with suppress(Exception):
         _release_workspace_receipt_fail_closed(module, workspace, receipt)
-    except Exception:
         # Finalizers cannot report errors usefully. The helper has retained the
         # allocation so its address cannot be recycled beneath uncertain work.
-        pass
 
 
 def _detach_and_release_workspace_receipt(releaser: weakref.finalize) -> None:
@@ -169,9 +168,7 @@ class PhysicalFixture:
             raise ValueError(f"num_tokens must be in [1, {MAX_TOKENS}]")
         ids = self.mutated_topk_ids if mutated_routes else self.initial_topk_ids
         weights = (
-            self.mutated_topk_weights
-            if mutated_routes
-            else self.initial_topk_weights
+            self.mutated_topk_weights if mutated_routes else self.initial_topk_weights
         )
         return PhysicalCase(
             geometry=self.geometry,
@@ -186,9 +183,7 @@ class PhysicalFixture:
     def stage_routes(self, num_tokens: int, *, mutated: bool) -> "PhysicalCase":
         """Copy routing into stable initial slots used by an already-captured graph."""
         if mutated:
-            self.initial_topk_ids[:num_tokens].copy_(
-                self.mutated_topk_ids[:num_tokens]
-            )
+            self.initial_topk_ids[:num_tokens].copy_(self.mutated_topk_ids[:num_tokens])
             self.initial_topk_weights[:num_tokens].copy_(
                 self.mutated_topk_weights[:num_tokens]
             )
@@ -197,6 +192,7 @@ class PhysicalFixture:
             self.initial_topk_ids[:num_tokens].copy_(ids[:num_tokens])
             self.initial_topk_weights[:num_tokens].copy_(weights[:num_tokens])
         return self.case(num_tokens)
+
 
 @dataclass(frozen=True)
 class PhysicalCase:
@@ -256,9 +252,7 @@ def _make_routing(
     device = torch.device("cuda")
     tokens = torch.arange(MAX_TOKENS, device=device, dtype=torch.int64)[:, None]
     ranks = torch.arange(geometry.top_k, device=device, dtype=torch.int64)[None, :]
-    ids = ((tokens * 17 + ranks * 29) % (geometry.num_experts - 1) + 1).to(
-        torch.int32
-    )
+    ids = ((tokens * 17 + ranks * 29) % (geometry.num_experts - 1) + 1).to(torch.int32)
     ids[:, 0] = 0
     raw_weights = (geometry.top_k + 1 - ranks).expand(MAX_TOKENS, -1).float()
     raw_weights = raw_weights + (tokens % 5).float() * 0.03125
@@ -276,9 +270,9 @@ def _prepare_fixture(geometry: Geometry, seed: int) -> PhysicalFixture:
     """Use the public TRTLLM preparation API to produce one physical fixture."""
     torch.manual_seed(seed)
     device = torch.device("cuda")
-    hidden = (
-        torch.randn(MAX_TOKENS, geometry.hidden_size, device=device) * 0.02
-    ).to(torch.bfloat16)
+    hidden = torch.randn(
+        MAX_TOKENS, geometry.hidden_size, device=device, dtype=torch.bfloat16
+    )
     w1 = (
         torch.randn(
             geometry.num_experts,
@@ -329,7 +323,9 @@ def _normalize_result(result: Any) -> torch.Tensor:
             raise RuntimeError("MoE implementation returned an empty result sequence")
         result = result[0]
     if not isinstance(result, torch.Tensor):
-        raise TypeError(f"MoE implementation returned {type(result).__name__}, not Tensor")
+        raise TypeError(
+            f"MoE implementation returned {type(result).__name__}, not Tensor"
+        )
     return result
 
 
@@ -428,9 +424,7 @@ def _prepare_cake(case: PhysicalCase) -> PreparedCall:
     geometry = case.geometry
     module = get_cake_fused_moe_warp_decode_module(device=case.device)
     shape = _cake_shape(case)
-    workspace_size = int(
-        module.cake_fused_moe_warp_decode_workspace_size(*shape)
-    )
+    workspace_size = int(module.cake_fused_moe_warp_decode_workspace_size(*shape))
     if workspace_size <= 0:
         raise RuntimeError("Cake workspace query returned a non-positive byte count")
     workspace = torch.empty(workspace_size, dtype=torch.uint8, device=case.device)
@@ -597,9 +591,7 @@ def _same_address_receipt_case(fixture: PhysicalFixture) -> dict[str, Any]:
     prepare_stream, run_stream = _distinct_nondefault_streams(case.device)
     with torch.cuda.stream(prepare_stream):
         module = get_cake_fused_moe_warp_decode_module(device=case.device)
-        workspace_size = int(
-            module.cake_fused_moe_warp_decode_workspace_size(*shape)
-        )
+        workspace_size = int(module.cake_fused_moe_warp_decode_workspace_size(*shape))
         workspace_owner = torch.empty(
             workspace_size, dtype=torch.uint8, device=case.device
         )
@@ -615,9 +607,7 @@ def _same_address_receipt_case(fixture: PhysicalFixture) -> dict[str, Any]:
             device=case.device,
         )
         first_receipt = int(
-            module.cake_fused_moe_warp_decode_prepare_workspace(
-                workspace_owner, *shape
-            )
+            module.cake_fused_moe_warp_decode_prepare_workspace(workspace_owner, *shape)
         )
         first_releaser = weakref.finalize(
             output,
@@ -735,12 +725,8 @@ def _workspace_retirement_case(
         raise RuntimeError("failed to create a third distinct CUDA stream")
     second_stream.wait_stream(torch.cuda.current_stream(case.device))
     module = get_cake_fused_moe_warp_decode_module(device=case.device)
-    workspace_size = int(
-        module.cake_fused_moe_warp_decode_workspace_size(*shape)
-    )
-    workspace = torch.empty(
-        workspace_size, dtype=torch.uint8, device=case.device
-    )
+    workspace_size = int(module.cake_fused_moe_warp_decode_workspace_size(*shape))
+    workspace = torch.empty(workspace_size, dtype=torch.uint8, device=case.device)
     output = torch.empty(
         case.num_tokens,
         fixture.geometry.hidden_size,
@@ -750,9 +736,7 @@ def _workspace_retirement_case(
     first_receipt: Optional[int] = None
     with torch.cuda.stream(prepare_stream):
         first_receipt = int(
-            module.cake_fused_moe_warp_decode_prepare_workspace(
-                workspace, *shape
-            )
+            module.cake_fused_moe_warp_decode_prepare_workspace(workspace, *shape)
         )
     replacement_receipt: Optional[int] = None
     try:
@@ -770,9 +754,7 @@ def _workspace_retirement_case(
             quarantine_identity = _quarantine_workspace(workspace)
             first_receipt = None
             replacement_receipt = int(
-                module.cake_fused_moe_warp_decode_prepare_workspace(
-                    workspace, *shape
-                )
+                module.cake_fused_moe_warp_decode_prepare_workspace(workspace, *shape)
             )
             if replacement_receipt <= 0 or replacement_receipt == previous_receipt:
                 raise AssertionError(
@@ -787,9 +769,7 @@ def _workspace_retirement_case(
         # binding must wait for its completion event before retiring the state.
         retiring_receipt = replacement_receipt
         replacement_receipt = None
-        _release_workspace_receipt_fail_closed(
-            module, workspace, retiring_receipt
-        )
+        _release_workspace_receipt_fail_closed(module, workspace, retiring_receipt)
         with torch.cuda.stream(second_stream):
             expected = _prepare_baseline(case).invoke().clone()
         second_stream.synchronize()
@@ -808,15 +788,11 @@ def _workspace_retirement_case(
         if first_receipt is not None:
             retiring_receipt = first_receipt
             first_receipt = None
-            _release_workspace_receipt_fail_closed(
-                module, workspace, retiring_receipt
-            )
+            _release_workspace_receipt_fail_closed(module, workspace, retiring_receipt)
         if replacement_receipt is not None:
             retiring_receipt = replacement_receipt
             replacement_receipt = None
-            _release_workspace_receipt_fail_closed(
-                module, workspace, retiring_receipt
-            )
+            _release_workspace_receipt_fail_closed(module, workspace, retiring_receipt)
 
 
 def _layer_graph_case(fixture: PhysicalFixture) -> dict[str, Any]:
@@ -863,14 +839,13 @@ def _layer_graph_case(fixture: PhysicalFixture) -> dict[str, Any]:
     # The first public call runs the real one-backend winner-selection path.
     # Its timing helper uses its own warmup/capture streams, which is the exact
     # framework path that a permanently stream-claimed workspace cannot serve.
-    with autotune(True, tuning_buckets=(num_tokens,)):
-        with torch.cuda.stream(warmup_stream):
-            eager = layer(activations, weights).clone()
-            expected_eager = _prepare_baseline(case).invoke().clone()
+    with autotune(True, tuning_buckets=(num_tokens,)), torch.cuda.stream(
+        warmup_stream
+    ):
+        eager = layer(activations, weights).clone()
+        expected_eager = _prepare_baseline(case).invoke().clone()
     tuned_total = layer.tuner.stats.tuned_op_total_configs.get("moe_cake", 0)
-    tuned_successful = layer.tuner.stats.tuned_op_successful_configs.get(
-        "moe_cake", 0
-    )
+    tuned_successful = layer.tuner.stats.tuned_op_successful_configs.get("moe_cake", 0)
     if tuned_total < 1 or tuned_successful < 1:
         raise AssertionError(
             "Cake MoELayer validation did not execute successful autotune profiling"
@@ -1045,9 +1020,7 @@ def _graph_mutation_case(
             ).clone()
         retiring_receipt = replacement_receipt
         replacement_receipt = None
-        _release_workspace_receipt_fail_closed(
-            module, cake.workspace, retiring_receipt
-        )
+        _release_workspace_receipt_fail_closed(module, cake.workspace, retiring_receipt)
     finally:
         if replacement_receipt is not None:
             retiring_receipt = replacement_receipt
@@ -1119,9 +1092,7 @@ def run_correctness(geometries: Sequence[Geometry], seed: int) -> dict[str, Any]
         workspace_retirement_rows.append(_workspace_retirement_case(fixture))
         layer_graph_rows.append(_layer_graph_case(fixture))
         for mutation_index, num_tokens in enumerate(geometry.selector_boundaries):
-            graph_rows.append(
-                _graph_mutation_case(fixture, num_tokens, mutation_index)
-            )
+            graph_rows.append(_graph_mutation_case(fixture, num_tokens, mutation_index))
     return {
         "mode": "correctness",
         "tolerance": {"atol": ATOL, "rtol": RTOL, "comparison_dtype": "bfloat16"},
@@ -1187,10 +1158,11 @@ def _benchmark_call(
         repeat_iters=repetitions,
     )
     if not samples or any(
-        not math.isfinite(float(sample)) or float(sample) <= 0.0
-        for sample in samples
+        not math.isfinite(float(sample)) or float(sample) <= 0.0 for sample in samples
     ):
-        raise RuntimeError(f"{call.name} returned non-positive or non-finite CUPTI samples")
+        raise RuntimeError(
+            f"{call.name} returned non-positive or non-finite CUPTI samples"
+        )
     return {
         "name": call.name,
         "median_ms": float(statistics.median(samples)),
@@ -1280,9 +1252,7 @@ def run_benchmark(
         )
         for num_tokens in tokens:
             case = fixture.stage_routes(num_tokens, mutated=False)
-            prepare_stream, benchmark_stream = _distinct_nondefault_streams(
-                case.device
-            )
+            prepare_stream, benchmark_stream = _distinct_nondefault_streams(case.device)
             with torch.cuda.stream(prepare_stream):
                 exported = _prepare_cake(case)
             output_ptr = exported.output.data_ptr()
