@@ -22,6 +22,7 @@
 #include "kernel_checkpointing_ssu.cuh"
 #include "kernel_checkpointing_ssu_8bit.cuh"
 #include "kernel_checkpointing_ssu_main.cuh"
+#include "kernel_checkpointing_ssu_main_8bit.cuh"
 #include "kernel_checkpointing_ssu_precompute.cuh"
 
 namespace flashinfer::mamba::checkpointing {
@@ -116,9 +117,8 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
 
   // ── Two-kernel split: precompute → main, when the caller provides scratch ──
   // (cb_scaled/cb_old/cumAdt_vec).  Requires 2-byte input (bf16/fp16
-  // activations); state may be 2-byte (LDSM path) or 4-byte f32 (LDS.64 +
-  // in-register narrow — see make_a_s2r).  8-bit state has no two-kernel
-  // split (the monolithic checkpointing_ssu_kernel_8bit handles it).
+  // activations).  State may be 1-byte quantized (dedicated single-stage
+  // main), 2-byte (LDSM path), or 4-byte f32 (LDS.64 + in-register narrow).
   //
   // INTERNAL PDL (precompute → main) is ALWAYS on — it is the split's mechanism,
   // not a user knob: the main co-launches with the precompute (its attr below is
@@ -132,7 +132,8 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
   // The precompute fires cudaTriggerProgrammaticLaunchCompletion() at its TOP
   // (unconditional) so the main becomes eligible to launch immediately.
   if (params.cb_scaled != nullptr) {
-    if constexpr ((sizeof(state_t) == 2 || sizeof(state_t) == 4) && sizeof(input_t) == 2) {
+    if constexpr (sizeof(input_t) == 2 &&
+                  (sizeof(state_t) == 1 || sizeof(state_t) == 2 || sizeof(state_t) == 4)) {
       // Precompute: grid (batch, ngroups, ceil(HEADS_PER_GROUP/HEADS_PER_CTA)).
       // Heads are tiled across grid.z to fill the GPU at small batch (heuristic
       // below).  HEADS_PER_CTA is picked at runtime, dispatched to a template arg;
@@ -216,7 +217,7 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
         });
       });
 
-      // ── Persistent main: 1D grid-stride loop over single-head work-units ──
+      // ── Main: 1D grid-stride loop over single-head work-units ──
       // One work-unit = one head; the grid-stride loop is the head-tiling (no host knob).
       // Launch min(cta_per_sm·NUM_SMS, total_work) CTAs; each grid-strides over work-units.
       // Fewer CTAs leave SM room to co-reside with conv1d (closing the no-write gap to
@@ -295,35 +296,50 @@ void launchCheckpointingSsuImpl(CheckpointingSsuParams& params, int precompute_h
       mcfg.attrs = main_attrs;
       mcfg.numAttrs = 1;
 
-      // NGROUPS is the jinja-stamped compile-time group count → the kernel's unflatten divides only
-      // by compile-time constants (no runtime div/mod).
-      auto launch_main = [&](auto stages_tag) {
-        constexpr int MAIN_STAGES = decltype(stages_tag)::value;
-        auto mfunc =
-            checkpointing_ssu_main_kernel<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t,
-                                          state_scale_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE,
-                                          HEADS_PER_GROUP, PHILOX_ROUNDS, MAIN_NUM_WARPS, D_SPLIT,
-                                          VARLEN, NGROUPS, MAIN_STAGES>;
-        constexpr size_t msmem =
-            sizeof(CheckpointingSsuMainStorage<input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA,
-                                               DSTATE, MAIN_STAGES, VARLEN>);
+      // NGROUPS is the jinja-stamped compile-time group count → the kernel's
+      // unflatten divides only by compile-time constants (no runtime div/mod).
+      if constexpr (sizeof(state_t) == 1) {
+        // The quantized chain has its own single-stage main.  CTAs/SM and
+        // precompute heads/CTA remain real tuning dimensions; pipeline stages
+        // are intentionally not exposed because they do not change this launch.
+        auto mfunc = checkpointing_ssu_main_kernel_8bit<
+            input_t, weight_t, matrixA_t, state_t, stateIndex_t, NPREDICTED, MAX_WINDOW, DIM,
+            DSTATE, HEADS_PER_GROUP, PHILOX_ROUNDS, VARLEN, NGROUPS>;
+        constexpr size_t msmem = sizeof(
+            CheckpointingSsuStorage8bit<input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE>);
         if constexpr (msmem > 0) {
           FLASHINFER_CUDA_CHECK(
               cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));
         }
         mcfg.dynamicSmemBytes = msmem;
         FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&mcfg, mfunc, params));
-      };
-      if (main_stages == 2) {
-        launch_main(std::integral_constant<int, 2>{});
       } else {
-        launch_main(std::integral_constant<int, 1>{});
+        auto launch_main = [&](auto stages_tag) {
+          constexpr int MAIN_STAGES = decltype(stages_tag)::value;
+          auto mfunc = checkpointing_ssu_main_kernel<
+              input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t, NPREDICTED,
+              MAX_WINDOW, DIM, DSTATE, HEADS_PER_GROUP, PHILOX_ROUNDS, MAIN_NUM_WARPS, D_SPLIT,
+              VARLEN, NGROUPS, MAIN_STAGES>;
+          constexpr size_t msmem = sizeof(CheckpointingSsuMainStorage<
+              input_t, state_t, NPREDICTED, MAX_WINDOW, D_PER_CTA, DSTATE, MAIN_STAGES, VARLEN>);
+          if constexpr (msmem > 0) {
+            FLASHINFER_CUDA_CHECK(
+                cudaFuncSetAttribute(mfunc, cudaFuncAttributeMaxDynamicSharedMemorySize, msmem));
+          }
+          mcfg.dynamicSmemBytes = msmem;
+          FLASHINFER_CUDA_CHECK(cudaLaunchKernelEx(&mcfg, mfunc, params));
+        };
+        if (main_stages == 2) {
+          launch_main(std::integral_constant<int, 2>{});
+        } else {
+          launch_main(std::integral_constant<int, 1>{});
+        }
       }
       return;
     } else {
       FLASHINFER_CHECK(false,
                        "two-kernel SSU split (cb_scaled provided) requires 2-byte input "
-                       "(bf16/fp16) and 2- or 4-byte state (bf16/fp16/fp32); got "
+                       "(bf16/fp16) and 1-, 2-, or 4-byte state; got "
                        "sizeof(input_t)=",
                        sizeof(input_t), ", sizeof(state_t)=", sizeof(state_t));
     }

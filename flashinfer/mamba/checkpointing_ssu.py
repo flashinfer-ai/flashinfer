@@ -28,6 +28,7 @@ from ..autotuner import (
     TunableRunner,
     TuningConfig,
     autotuner_initializer_empty,
+    autotuner_initializer_ones,
 )
 from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
@@ -97,6 +98,7 @@ def _make_tactics(
     num_sms: int,
     monolith_d_split: int,
     two_kernel_d_split: int,
+    main_pipeline_stages: tuple[int, ...] = (1, 2),
 ) -> tuple[_CheckpointingSSUTactic, ...]:
     """Build distinct ReplaySSM launches for one optimization profile."""
     heads_per_cta_candidates = tuple(
@@ -107,7 +109,7 @@ def _make_tactics(
     tactics = [(0, 0, 0, monolith_d_split)]
     total_work = two_kernel_d_split * batch * num_heads
     seen_launches: set[tuple[int, int, int]] = set()
-    for stages in (1, 2):
+    for stages in main_pipeline_stages:
         for ctas_per_sm in _CTA_PER_SM_CANDIDATES:
             grid = min(ctas_per_sm * num_sms, total_work)
             for heads_per_cta in heads_per_cta_candidates:
@@ -265,13 +267,17 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
             map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
         ),
     )
-    tensor_initializers = (
+    tensor_initializers = [
         (2, initialize_broadcast_dt),  # dt: preserve stride-zero broadcast
         (6, autotuner_initializer_empty),  # out: fully overwritten
         (19, autotuner_initializer_empty),  # cb_scaled: scratch
         (20, autotuner_initializer_empty),  # cumAdt_vec: scratch
         (21, autotuner_initializer_empty),  # cb_old: scratch
-    )
+    ]
+    if inputs[16] is not None:  # state_scale
+        # Quantized replay divides by this mutable decode scale.  Random data
+        # may contain zeros or negatives, so synthesize a valid positive state.
+        tensor_initializers.append((16, autotuner_initializer_ones))
 
     profile_arena_candidates = (
         0,  # state
@@ -299,9 +305,10 @@ def _checkpointing_ssu_tuning_config(inputs: list[Any]) -> TuningConfig:
     return TuningConfig(
         dynamic_tensor_specs=dynamic_specs,
         constraint_specs=tuple(constraints),
-        tensor_initializers=tensor_initializers,
+        tensor_initializers=tuple(tensor_initializers),
         use_cold_l2_cache=True,
         use_cuda_graph=True,
+        profiling_repeat=100,
         profile_arena_input_indices=profile_arena_inputs,
         inputs_pre_hook=_prepare_checkpointing_ssu_profile_inputs,
     )
@@ -363,7 +370,10 @@ class CheckpointingSSURunner(TunableRunner):
             cb_scaled is not None
             and cumAdt_vec is not None
             and cb_old is not None
-            and state.element_size() in (2, 4)
+            and (
+                state.element_size() in (2, 4)
+                or state.dtype in (torch.int8, torch.float8_e4m3fn)
+            )
             and x.element_size() == 2
         )
 
@@ -377,6 +387,7 @@ class CheckpointingSSURunner(TunableRunner):
         two_kernel_d_split = self._resolve_d_split(inputs, _ALGORITHM_TWO_KERNEL)
         state = inputs[0]  # state
         x = inputs[1]  # x
+        main_pipeline_stages = (1,) if state.element_size() == 1 else (1, 2)
         return list(
             _make_tactics(
                 self._heads_per_group,
@@ -385,6 +396,7 @@ class CheckpointingSSURunner(TunableRunner):
                 _sm_count(x.device),
                 monolith_d_split,
                 two_kernel_d_split,
+                main_pipeline_stages,
             )
         )
 
@@ -397,6 +409,7 @@ class CheckpointingSSURunner(TunableRunner):
             self._requested_d_split,
             self._optional_tensor_presence,
             _CTA_PER_SM_CANDIDATES,
+            (1,) if inputs[0].element_size() == 1 else (1, 2),  # main stages
             _device_tuning_signature(device),
         )
 
@@ -470,7 +483,16 @@ class CheckpointingSSURunner(TunableRunner):
         if two_kernel and not self._two_kernel_supported(inputs):
             raise ValueError(
                 "two-kernel checkpointing SSU requires its scratch trio, "
-                "2-byte input, and 2- or 4-byte state"
+                "2-byte input, and 1-, 2-, or 4-byte state"
+            )
+        if (
+            two_kernel
+            and inputs[0].element_size() == 1
+            and main_pipeline_stages not in (0, 1)
+        ):
+            raise ValueError(
+                "quantized two-kernel checkpointing SSU supports only "
+                "main_pipeline_stages=1 (or 0 for the heuristic launch)"
             )
         module = _get_module(*self._module_base_args)
         module.checkpointing_ssu(
@@ -645,6 +667,7 @@ def _checkpointing_ssu(
         and main_pipeline_stages == 0
         and main_ctas_per_sm == 0
         and cu_seqlens is None
+        and runner._two_kernel_supported(inputs)
     )
     if tune:
         runner, tactic = AutoTuner.get().choose_one(
@@ -816,10 +839,12 @@ def checkpointing_ssu(
         With the scratch trio and no explicit tuning knobs, ``"auto"`` uses
         FlashInfer's cached autotuner tactic, which may be monolithic or
         two-kernel. Inside an ``autotune(True)`` context, it profiles monolithic
-        against every supported combination of
-        precompute heads/CTA, main pipeline stages, and main CTAs/SM.  Without a
-        cached tactic it retains the production fallback: use the split when
-        ``batch * nheads >= sm_count`` and otherwise use monolithic.
+        against every supported combination of precompute heads/CTA, main
+        CTAs/SM, and (for 2-/4-byte state) main pipeline stages. The dedicated
+        int8/fp8 two-kernel main is single-stage, so it does not profile a
+        duplicate stage knob. Without a cached tactic the production fallback
+        uses the split when
+        ``batch * nheads >= sm_count`` and otherwise uses monolithic.
         ``"two-kernel"`` forces the split (scratch trio required), while
         ``"monolith"`` forces the monolithic kernel (scratch ignored).
         Benches and tests that must pin a path should force it.
@@ -834,7 +859,7 @@ def checkpointing_ssu(
         Pre-allocated input-dtype (same as ``x``) scratch for the precomputed
         new-token CB matrix, fragment-native layout
         (batch, nheads, WARP_SIZE, MMA_FRAG_SIZE) — each (batch, head)'s CB is
-        one m16n8k16 MMA A-fragment stored as [warp lane, register].  Providing
+        one m16n8k16 MMA B-fragment stored as [warp lane, register].  Providing
         it (together with ``cumAdt_vec`` / ``cb_old``) makes the
         **two-kernel** (precompute + main) path available — ``algorithm`` decides
         whether it runs; leaving all four ``None`` always runs the monolithic
@@ -849,7 +874,7 @@ def checkpointing_ssu(
         old-token CB matrix, fragment-native layout
         (batch, nheads, WARP_SIZE, K_old // 2) where
         K_old = next_multiple_of_8(max_window) — the m16n8k{K_old} MMA
-        A-fragment consumed on the no-write (replay) path, stored as
+        B-fragment consumed on the no-write (replay) path, stored as
         [warp lane, register].  Must be provided iff ``cb_scaled`` is.
 
     Returns

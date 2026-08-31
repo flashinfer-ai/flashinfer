@@ -426,6 +426,13 @@ void checkpointing_ssu(
         FLASHINFER_CHECK(state_scale.has_value(),
                          "Quantized state.dtype (int8/fp8_e4m3fn) requires a state_scale tensor "
                          "of shape (state_cache_size, nheads, dim) and dtype float32");
+        if (cb_scaled.has_value()) {
+          FLASHINFER_CHECK(
+              main_pipeline_stages != 2,
+              "Quantized two-kernel state supports only main_pipeline_stages=1 (or 0 for the "
+              "heuristic launch); got main_pipeline_stages=",
+              main_pipeline_stages);
+        }
         // The 8-bit replay path uses Layout<_4, _1> (M-shard per warp) which
         // needs per-warp M = D_PER_CTA / 4 >= 16 (m16n8 atom M).  This forces
         // D_PER_CTA >= 64, i.e. d_split == 1.
@@ -523,13 +530,13 @@ void checkpointing_ssu(
   // trio; shape/device/contiguity/dtype are validated here so a bad scratch
   // fails loudly instead of corrupting memory or faulting inside the kernel.
   // Expected layouts (see the wrapper / bench allocator): cb_scaled/cb_old are
-  // input-dtype fragA-native (., ., 32, regs); cumAdt_vec is f32 (., ., T_pad).
-  // fragA-native scratch: each (batch, head)'s CB is one MMA A-fragment stored
+  // input-dtype fragB-native (., ., 32, regs); cumAdt_vec is f32 (., ., T_pad).
+  // fragB-native scratch: each (batch, head)'s CB is one MMA B-fragment stored
   // as [warp lane, register].  The lane axis is a full warp; the register axis
-  // is the A-operand size — kCbScaledRegs for the new-token m16n8k16 CB,
-  // k_old_half (= K_old/2) for the old-token m16n8k{K_old} CB.
+  // is sized for the maximum packed B-fragment footprint — kCbScaledRegs for
+  // the new-token CB, k_old_half (= K_old/2) for the old-token CB.
   constexpr int64_t kWarpSize = 32;
-  constexpr int64_t kCbScaledRegs = 8;                          // m16n8k16 A-operand regs/lane
+  constexpr int64_t kCbScaledRegs = 8;                          // max packed B-fragment regs/lane
   int64_t const t_pad = ((npredicted + 15) / 16) * 16;          // cumAdt_vec: next_multiple_of<16>
   int64_t const k_old_half = (((max_window + 7) / 8) * 8) / 2;  // K_old/2, K_old=next_mult<8>
   if (cb_scaled.has_value()) {

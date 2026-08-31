@@ -56,6 +56,17 @@ struct CheckpointingSsuStorage8bit {
       next_multiple_of<SmemSwizzle<input_t>::ATOM_ROWS>(NPREDICTED);
   static constexpr int CB_ROW_STRIDE = SmemSwizzle<input_t>::ATOM_COLS;
 
+  // Single-buffer aliases used by the dedicated two-kernel main.  Keeping the
+  // storage byte-identical to the monolithic path lets both paths share the
+  // quantized replay/output helpers; the split main always passes tile_buf=0.
+  static constexpr int C_ELEMS = NPREDICTED_SWIZZLE_R * DSTATE;
+  static constexpr int OLD_B_ELEMS = MAX_WINDOW_PAD_MMA_K * DSTATE;
+  static constexpr int Z_ELEMS = NPREDICTED_SWIZZLE_R * D_SMEM_COLS;
+  static constexpr int OLD_X_ELEMS = MAX_WINDOW_PAD_MMA_K * D_SMEM_COLS;
+  static constexpr int X_ELEMS = NPREDICTED_PAD_MMA_M * D_SMEM_COLS;
+  static constexpr int STATE_ELEMS = D_PER_CTA * DSTATE;
+  static constexpr int CUMADT_ELEMS = NPREDICTED_PAD_MMA_M;
+
   // Shared Phase 0/1 buffers (same shape/swizzle as `CheckpointingSsuStorage`).
   alignas(16) input_t CB_scaled[NPREDICTED_PAD_MMA_M * CB_ROW_STRIDE];
   alignas(16) input_t B[NPREDICTED_PAD_MMA_N * DSTATE];
