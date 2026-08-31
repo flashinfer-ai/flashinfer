@@ -132,7 +132,8 @@ _DECODE_DSV3_2_DISPATCH = frozenset(
         (128, 2048),
     }
 )
-_DECODE_GLM53_NOPE_DISPATCH = frozenset({(32, 2176)})
+# GLM-5.3-Flash has 64 attention heads: H=32 is TP2 and H=64 is TP1.
+_DECODE_GLM53_NOPE_DISPATCH = frozenset({(32, 2176), (64, 2176)})
 _DECODE_DSV3_2_PAGE_BLOCK_SIZE = 64
 
 _MODEL_TYPE_DSV3_2 = 0
@@ -239,17 +240,20 @@ def _decode_dsv3_2_dispatchable(
     model_type: int,
 ) -> bool:
     """True iff decode-dsv3_2 supports this shape configuration."""
+    if model_type == _MODEL_TYPE_GLM53_NOPE:
+        model_shape_supported = (
+            d_qk == 512 and (num_heads, topk) in _DECODE_GLM53_NOPE_DISPATCH
+        )
+    elif model_type in (_MODEL_TYPE_DSV3_2, _MODEL_TYPE_GLM_NSA):
+        model_shape_supported = (
+            d_qk == 576 and (num_heads, topk) in _DECODE_DSV3_2_DISPATCH
+        )
+    else:
+        model_shape_supported = False
     return (
         num_tokens <= _DECODE_MAX_TOKENS
-        and d_qk in (512, 576)
         and page_block_size == _DECODE_DSV3_2_PAGE_BLOCK_SIZE
-        and (
-            (num_heads, topk) in _DECODE_DSV3_2_DISPATCH
-            or (
-                model_type == _MODEL_TYPE_GLM53_NOPE
-                and (num_heads, topk) in _DECODE_GLM53_NOPE_DISPATCH
-            )
-        )
+        and model_shape_supported
     )
 
 

@@ -10,7 +10,7 @@
 //   num_heads ∈ {8, 16, 32, 64, 128}
 //   topk      ∈ {128, 512, 1024, 2048}
 //   pbs       = 64
-// plus the GLM53_NOPE (num_heads=32, topk=2176) specialization.
+// plus the GLM53_NOPE (num_heads in {32, 64}, topk=2176) specializations.
 
 #include <cuda_runtime.h>
 
@@ -139,15 +139,13 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
         Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, attn_sink,       \
         num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, stream); \
   }
-#define DSV3_2_DISPATCH(H, K)                         \
-  do {                                                \
-    if (mt == ModelType::DSV3_2) {                    \
-      DSV3_2_DISPATCH_MT(ModelType::DSV3_2, H, K)     \
-    } else if (mt == ModelType::GLM_NSA) {            \
-      DSV3_2_DISPATCH_MT(ModelType::GLM_NSA, H, K)    \
-    } else if (mt == ModelType::GLM53_NOPE) {         \
-      DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, H, K) \
-    }                                                 \
+#define DSV3_2_DISPATCH(H, K)                      \
+  do {                                             \
+    if (mt == ModelType::DSV3_2) {                 \
+      DSV3_2_DISPATCH_MT(ModelType::DSV3_2, H, K)  \
+    } else if (mt == ModelType::GLM_NSA) {         \
+      DSV3_2_DISPATCH_MT(ModelType::GLM_NSA, H, K) \
+    }                                              \
   } while (0);
   DSV3_2_DISPATCH(8, 128)
   DSV3_2_DISPATCH(8, 512)
@@ -169,10 +167,12 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
   DSV3_2_DISPATCH(128, 512)
   DSV3_2_DISPATCH(128, 1024)
   DSV3_2_DISPATCH(128, 2048)
-  // GLM-5.3 combines its 2048 sparse selection with the 128-token
-  // indexer window. Keep this instantiation model-specific.
+  // GLM-5.3 combines its 2048 sparse selection with the 128-token indexer
+  // window. Keep these instantiations model-specific instead of compiling
+  // the legacy DSV3.2 top-k grid for this family.
   if (mt == ModelType::GLM53_NOPE) {
     DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, 32, 2176)
+    DSV3_2_DISPATCH_MT(ModelType::GLM53_NOPE, 64, 2176)
   }
 #undef DSV3_2_DISPATCH
 #undef DSV3_2_DISPATCH_MT
