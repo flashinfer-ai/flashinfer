@@ -3416,14 +3416,14 @@ def testBatchMLAPagedAttentionWrapper(args):
         """
         if backend in ["fa2", "fa3"]:
             # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl;
-            # the fa2/fa3 MLA wrapper has no PDL support. trtllm-native/auto/
-            # cute-dsl branches below pass args.enable_pdl to the direct API.
+            # FA2/FA3 use their planned CSR metadata and do not accept the
+            # CUTLASS-only page_table argument. trtllm-native/auto/cute-dsl
+            # branches below pass args.enable_pdl to the direct API.
             return backend_wrappers[backend].run(
                 q_nope,
                 q_pe,
                 ckv_cache,
                 kpe_cache,
-                page_table=block_tables,
                 return_lse=False,
             )
         elif backend == "cutlass":

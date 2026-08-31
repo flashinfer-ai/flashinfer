@@ -604,11 +604,13 @@ def test_mla_benchmark_passes_rank_one_kv_len_arr(monkeypatch):
         def __init__(self, **kwargs):
             self.constructor_kwargs = kwargs
             self.plan_kwargs = None
+            self.run_kwargs = None
 
         def plan(self, **kwargs):
             self.plan_kwargs = kwargs
 
-        def run(self, q_nope, *_args, **_kwargs):
+        def run(self, q_nope, *_args, **kwargs):
+            self.run_kwargs = kwargs
             return torch.zeros_like(q_nope)
 
     wrappers = []
@@ -652,8 +654,9 @@ def test_mla_benchmark_passes_rank_one_kv_len_arr(monkeypatch):
             "BatchMLAPagedAttentionWrapper",
             "--backends",
             "fa2",
+            "cutlass",
             "--page_size",
-            "16",
+            "32",
             "--batch_size",
             "2",
             "--s_qo",
@@ -678,9 +681,12 @@ def test_mla_benchmark_passes_rank_one_kv_len_arr(monkeypatch):
 
     attention_routine.testBatchMLAPagedAttentionWrapper(args)
 
-    assert len(wrappers) == 1
-    assert wrappers[0].constructor_kwargs["kv_len_arr"].shape == (2,)
-    assert wrappers[0].plan_kwargs["kv_len_arr"].shape == (2,)
+    assert len(wrappers) == 2
+    fa2_wrapper, cutlass_wrapper = wrappers
+    assert fa2_wrapper.constructor_kwargs["kv_len_arr"].shape == (2,)
+    assert fa2_wrapper.plan_kwargs["kv_len_arr"].shape == (2,)
+    assert "page_table" not in fa2_wrapper.run_kwargs
+    assert cutlass_wrapper.run_kwargs["page_table"].shape == (2, 1)
 
 
 @pytest.mark.parametrize("batch_size", [16, 32])
