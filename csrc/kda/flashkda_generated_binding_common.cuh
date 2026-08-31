@@ -335,8 +335,9 @@ constexpr void CheckArgumentCount(void* (&)[Actual]) {
   static_assert(Expected == Actual, "generated kernel ABI argument count changed");
 }
 
-inline void ConfigureAndLaunch(const void* kernel, dim3 grid, cudaStream_t stream,
-                               void** args, const char* launch_name) {
+static inline void ConfigureAndLaunch(const void* kernel, dim3 grid,
+                                      cudaStream_t stream, void** args,
+                                      const char* launch_name) {
   TVM_FFI_ICHECK(grid.x > 0 && grid.y > 0 && grid.z > 0)
       << "generated kernel grid dimensions must be positive";
   int32_t device_id = 0;

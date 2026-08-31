@@ -288,6 +288,7 @@ def test_generated_prefill_registry_is_receipt_closed_and_exact_targeted():
             assert gencode in spec.extra_cuda_cflags
             assert target_define in spec.extra_cuda_cflags
             assert "-DFLASHKDA_GENERATED_EMBEDDED_CUBIN=1" in spec.extra_cuda_cflags
+            assert "-DTVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API=1" in spec.extra_cuda_cflags
             assert (
                 f"-DFLASHKDA_GENERATED_CUBIN_IDENT={module.module_ident}"
                 in spec.extra_cuda_cflags
@@ -295,6 +296,13 @@ def test_generated_prefill_registry_is_receipt_closed_and_exact_targeted():
             assert spec.embedded_cubin_factory is not None
             assert all("sm100f" not in flag for flag in spec.extra_cuda_cflags)
             assert all("_o1" not in flag.lower() for flag in spec.extra_cuda_cflags)
+
+
+def test_generated_embedded_kernel_cache_is_translation_unit_local():
+    common_header = (
+        flash_kda._get_flash_kda_csrc_dir() / "flashkda_generated_binding_common.cuh"
+    ).read_text()
+    assert "static inline void ConfigureAndLaunch(" in common_header
 
 
 def test_generated_prefill_selector_parser_rejects_unknown_and_incomplete_keys():

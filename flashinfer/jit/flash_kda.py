@@ -792,6 +792,7 @@ def gen_flash_kda_generated_module(variant_id: str) -> JitSpec:
             *_FLASH_KDA_GENERATED_NVCC_FLAGS[module.target],
             _FLASH_KDA_GENERATED_TARGET_DEFINE[module.target],
             "-DFLASHKDA_GENERATED_EMBEDDED_CUBIN=1",
+            "-DTVM_FFI_CUBIN_LAUNCHER_USE_DRIVER_API=1",
             f"-DFLASHKDA_GENERATED_CUBIN_IDENT={module.module_ident}",
         ],
         extra_include_paths=[
@@ -801,9 +802,7 @@ def gen_flash_kda_generated_module(variant_id: str) -> JitSpec:
         ],
         embedded_cubin_factory=functools.partial(
             prepare_generated_flash_kda_cubin,
-            selector_path=_resolve_generated_source(
-                csrc_dir, module.binding_relpath
-            ),
+            selector_path=_resolve_generated_source(csrc_dir, module.binding_relpath),
             body_path=_resolve_generated_source(csrc_dir, module.body_relpath),
             module_ident=module.module_ident,
             target=module.target,

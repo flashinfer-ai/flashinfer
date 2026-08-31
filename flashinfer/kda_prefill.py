@@ -6276,9 +6276,7 @@ def _run_flash_kda_prefill(
                 cu_seqlens=cu_seqlens_i64,
                 seq_order=seq_order_i32,
                 state_indices=(
-                    state_indices
-                    if state_indices is not None
-                    else _dummy_i32(q.device)
+                    state_indices if state_indices is not None else _dummy_i32(q.device)
                 ),
                 initial_state=initial_state_arg,
                 out=out_buf,
