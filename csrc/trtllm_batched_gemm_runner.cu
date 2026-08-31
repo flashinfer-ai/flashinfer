@@ -239,6 +239,13 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(
   FLASHINFER_CHECK(!mPassingConfigIndices.empty(), error_msg.str());
 }
 
+batchedGemm::trtllm::gen::SfLayout TrtllmGenBatchedGemmRunner::getSfLayoutB(
+    int32_t configIndex) const {
+  checkPassingConfigIndex(mPassingConfigIndices, configIndex);
+  auto const configs = BatchedGemmInterface().getBatchedGemmConfigs();
+  return configs[configIndex].mOptions.mSfLayoutB;
+}
+
 size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(
     int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
     int32_t numBatches, int32_t maxNumCtasInBatchDim, int32_t configIndex) const {
