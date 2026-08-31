@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
+import warnings
 import weakref
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -31,11 +31,16 @@ if TYPE_CHECKING:
 
 
 class MoEEpMegaWorkspace:
-    """Capacity-specific, reusable workspace owned by one MegaMoE layer.
+    """Capacity-profile handle owned by one MegaMoE layer.
 
     Create handles with :meth:`MoEEpMegaLayer.create_workspace`; do not
-    construct them directly.  The backing symmetric workspace and output
-    buffer keep stable addresses until :meth:`destroy` or layer destruction.
+    construct them directly. The selected workspace keeps stable addresses
+    until :meth:`destroy` or layer destruction. A stable returned-output
+    address additionally requires ``return_workspace_view=True`` on a backend
+    that supports output views.
+
+    Creation and destruction are EP collectives. Before destroying a handle,
+    callers must synchronize all work and retire every CUDA graph that uses it.
     """
 
     def __init__(
@@ -62,26 +67,17 @@ class MoEEpMegaWorkspace:
         return self._destroyed
 
     def destroy(self) -> None:
-        """Release this handle's pool reference; idempotent."""
+        """Collectively release this profile; idempotent on every rank."""
 
         if self._destroyed:
             return
         layer = self._layer_ref()
-        if layer is not None:
-            layer._destroy_workspace_handle(self)
-        else:
-            self._destroyed = True
-            self._backend_workspace = None
-
-    close = destroy
-
-    def __enter__(self) -> "MoEEpMegaWorkspace":
-        if self._destroyed:
-            raise MoEEpConfigError("MegaMoE workspace has been destroyed")
-        return self
-
-    def __exit__(self, *exc_info: object) -> None:
-        self.destroy()
+        if layer is None:
+            raise MoEEpConfigError(
+                "owning MegaMoE layer no longer exists; collective workspace "
+                "destruction cannot be completed"
+            )
+        layer._destroy_workspace_handle(self)
 
 
 class MoEEpMegaLayer(nn.Module):
@@ -136,9 +132,13 @@ class MoEEpMegaLayer(nn.Module):
         )
         self._transformed: Optional[Any] = None
         self._workspace: Any = None
+        self._default_workspace_handle: MoEEpMegaWorkspace | None = None
         # Strong tracking is intentional: workspace create/destroy is an EP
         # collective and therefore must never be triggered by rank-local GC.
-        self._workspaces: set[MoEEpMegaWorkspace] = set()
+        # Dict insertion order gives every EP rank the same reverse-allocation
+        # collective teardown order. One live profile per capacity also avoids
+        # presenting pooled aliases as independent concurrency lanes.
+        self._workspaces: dict[int, MoEEpMegaWorkspace] = {}
         self._preprocessing_count = 0
         self._destroyed = False
 
@@ -165,6 +165,8 @@ class MoEEpMegaLayer(nn.Module):
         self._weights = None
 
     def _ensure_workspace(self) -> Any:
+        if self._default_workspace_handle is not None:
+            return self._default_workspace_handle._backend_workspace
         if self._workspace is None:
             if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
                 raise MoEEpConfigError(
@@ -178,10 +180,11 @@ class MoEEpMegaLayer(nn.Module):
         return self._workspace
 
     def create_workspace(self, max_tokens_per_rank: int) -> MoEEpMegaWorkspace:
-        """Allocate a reusable capacity-specific workspace for this layer.
+        """Allocate one reusable capacity profile for this layer.
 
         The handle reuses this layer's transformed weights and backend.  Call
-        it collectively on all EP ranks, before CUDA graph capture.
+        it collectively and in the same order on all EP ranks, before CUDA
+        graph capture. Only one live handle per capacity is allowed.
         """
 
         if isinstance(max_tokens_per_rank, bool) or not isinstance(
@@ -201,17 +204,33 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError(
                 "MegaMoE workspace allocation cannot run during CUDA graph capture"
             )
+        if max_tokens_per_rank in self._workspaces:
+            raise MoEEpConfigError(
+                "a MegaMoE workspace profile for max_tokens_per_rank="
+                f"{max_tokens_per_rank} already exists on this layer"
+            )
         fleet_params = dataclasses.replace(
             self._fleet_params,
             max_tokens_per_rank=max_tokens_per_rank,
         )
         self._kernel.validate_init(self._bootstrap, fleet_params)
-        backend_workspace = self._kernel.prepare_workspace(
-            self._bootstrap,
-            fleet_params,
+        is_default_capacity = (
+            max_tokens_per_rank == self._fleet_params.max_tokens_per_rank
         )
+        if is_default_capacity and self._workspace is not None:
+            # Transfer the already-lazy-allocated default profile into the
+            # explicit handle without acquiring a second pooled reference.
+            backend_workspace = self._workspace
+            self._workspace = None
+        else:
+            backend_workspace = self._kernel.prepare_workspace(
+                self._bootstrap,
+                fleet_params,
+            )
         handle = MoEEpMegaWorkspace(self, fleet_params, backend_workspace)
-        self._workspaces.add(handle)
+        self._workspaces[max_tokens_per_rank] = handle
+        if is_default_capacity:
+            self._default_workspace_handle = handle
         return handle
 
     def _resolve_workspace(
@@ -230,11 +249,19 @@ class MoEEpMegaLayer(nn.Module):
             raise MoEEpConfigError("MegaMoE workspace belongs to a different layer")
         if workspace._destroyed or workspace._backend_workspace is None:
             raise MoEEpConfigError("MegaMoE workspace has been destroyed")
+        if self._workspaces.get(workspace.max_tokens_per_rank) is not workspace:
+            raise MoEEpConfigError(
+                "MegaMoE workspace was not created by this layer or is no longer active"
+            )
         return workspace._fleet_params, workspace._backend_workspace
 
     def _destroy_workspace_handle(self, workspace: MoEEpMegaWorkspace) -> None:
         if workspace._destroyed:
             return
+        if self._workspaces.get(workspace.max_tokens_per_rank) is not workspace:
+            raise MoEEpConfigError(
+                "MegaMoE workspace was not created by this layer or is no longer active"
+            )
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise MoEEpConfigError(
                 "MegaMoE workspace destruction cannot run during CUDA graph capture"
@@ -246,30 +273,18 @@ class MoEEpMegaLayer(nn.Module):
         # succeeds.  A failed release remains retryable on every rank.
         workspace._destroyed = True
         workspace._backend_workspace = None
-        self._workspaces.discard(workspace)
+        if self._default_workspace_handle is workspace:
+            self._default_workspace_handle = None
+        if self._workspaces.get(workspace.max_tokens_per_rank) is workspace:
+            del self._workspaces[workspace.max_tokens_per_rank]
 
     @property
     def supports_output_view(self) -> bool:
         """Whether ``forward(return_workspace_view=True)`` is supported."""
         return self._kernel.supports_output_view
 
-    @property
-    def preprocessing_count(self) -> int:
-        """Number of successful weight transformations owned by this layer."""
-        return self._preprocessing_count
-
-    @property
-    def workspace_pool_refcount(self) -> int:
-        """Actual shared-workspace refcount, or zero before/after ownership."""
-        if self._workspace is None:
-            return 0
-        from ..core.kernel.workspace_pool import pooled_workspace_refcount
-
-        return pooled_workspace_refcount(self._workspace)
-
-    @property
-    def transformed_weights(self) -> Any:
-        """Return the one-time transformed weights for sibling capacity layers."""
+    def _get_transformed_weights(self) -> Any:
+        """Return this layer's one-time backend weight transformation."""
         if self._transformed is None:
             if not self._mega_config.preprocess_weights:
                 raise MoEEpConfigError(
@@ -362,12 +377,11 @@ class MoEEpMegaLayer(nn.Module):
     ) -> torch.Tensor:
         """Run MegaMoE and return either an owned tensor or a workspace view.
 
-        Without an explicit handle, the default allocates an owned output and
-        preserves the existing API.  A reusable ``workspace`` returns its
-        stable output view when the backend supports views.  The explicit
-        ``return_workspace_view=True`` opt-in does the same for the default
-        workspace.  A view remains valid under stream ordering until the next
-        launch reuses that workspace.
+        Passing ``workspace`` selects only the capacity profile; it does not
+        change output ownership. The default always returns an owned output.
+        ``return_workspace_view=True`` explicitly opts into a borrowed view on
+        backends that support one. A view remains valid under stream ordering
+        until the next launch reuses the pooled physical workspace.
         """
         ensure_bootstrap_dist_validated(self._bootstrap)
         quantize_input = self._resolve_quantize_input(t)
@@ -390,7 +404,7 @@ class MoEEpMegaLayer(nn.Module):
             quantize_input=quantize_input,
         )
 
-        transformed_weights = self.transformed_weights
+        transformed_weights = self._get_transformed_weights()
         if backend_workspace is None:
             backend_workspace = self._ensure_workspace()
 
@@ -401,9 +415,7 @@ class MoEEpMegaLayer(nn.Module):
             )
 
         y = None
-        use_workspace_view = (
-            return_workspace_view or workspace is not None
-        ) and self.supports_output_view
+        use_workspace_view = return_workspace_view
         if not use_workspace_view:
             # Owned-output allocation must stay ahead of the staging round
             # (allocator work between stage and compute can sync the device
@@ -426,13 +438,19 @@ class MoEEpMegaLayer(nn.Module):
         )
 
     def destroy(self) -> None:
+        """Collectively release all profiles and runtime resources.
+
+        Call this explicitly, in the same order on every EP rank, after all
+        CUDA work and captured graphs that reference the layer have retired.
+        """
+
         if self._destroyed:
             return
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             raise MoEEpConfigError(
                 "MegaMoE layer destruction cannot run during CUDA graph capture"
             )
-        for workspace in list(self._workspaces):
+        for workspace in reversed(tuple(self._workspaces.values())):
             self._destroy_workspace_handle(workspace)
         if self._workspace is not None:
             self._kernel.destroy(self._workspace)
@@ -443,5 +461,10 @@ class MoEEpMegaLayer(nn.Module):
         self._destroyed = True
 
     def __del__(self) -> None:
-        with contextlib.suppress(Exception):
-            self.destroy()
+        if not getattr(self, "_destroyed", True):
+            warnings.warn(
+                "MoEEpMegaLayer owns collective resources and was not explicitly "
+                "destroyed; call layer.destroy() collectively on all EP ranks",
+                ResourceWarning,
+                stacklevel=2,
+            )

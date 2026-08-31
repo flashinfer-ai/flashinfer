@@ -262,7 +262,7 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
             ),
         )
         assert isinstance(layer, MoEEpMegaLayer)
-        assert layer.preprocessing_count == 1
+        assert layer._preprocessing_count == 1
         del problem["w13"], problem["w2"]
 
         # Workspace creation is collective; every rank performs it in the
@@ -280,7 +280,7 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         assert large_raw._frontend.config.defer_topk_reduce
         assert pooled_workspace_refcount(small_raw) == 1
         assert pooled_workspace_refcount(large_raw) == 1
-        assert layer.preprocessing_count == 1
+        assert layer._preprocessing_count == 1
 
         small_public_ptrs = _public_pointer_snapshot(small_raw)
         large_public_ptrs = _public_pointer_snapshot(large_raw)
@@ -290,8 +290,9 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         # layer's already-transformed weights.
         reference_small = _allocate_reference_workspace(problem, 256, rank, world_size)
         reference_large = _allocate_reference_workspace(problem, 4096, rank, world_size)
-        transformed_weights = layer.transformed_weights
-        assert layer.preprocessing_count == 1
+        transformed_weights = layer._transformed
+        assert transformed_weights is not None
+        assert layer._preprocessing_count == 1
 
         batches = {
             (num_tokens, capacity): _batch(rank, num_tokens)
@@ -306,7 +307,11 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
             )
             t = batches[(num_tokens, capacity)]
 
-            native_view = layer.forward(t, workspace=handle)
+            native_view = layer.forward(
+                t,
+                workspace=handle,
+                return_workspace_view=True,
+            )
             assert native_view.data_ptr() == raw.output_activation.data_ptr()
             native = native_view.clone()
             reference = _reference_forward(
@@ -372,12 +377,20 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         graph_small = torch.cuda.CUDAGraph()
         dist.barrier()
         with torch.cuda.graph(graph_small, stream=small_capture_stream):
-            graph_small_output = layer.forward(batches[(64, 256)], workspace=small)
+            graph_small_output = layer.forward(
+                batches[(64, 256)],
+                workspace=small,
+                return_workspace_view=True,
+            )
         dist.barrier()
 
         graph_large = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph_large, stream=large_capture_stream):
-            graph_large_output = layer.forward(batches[(4096, 4096)], workspace=large)
+            graph_large_output = layer.forward(
+                batches[(4096, 4096)],
+                workspace=large,
+                return_workspace_view=True,
+            )
         dist.barrier()
 
         assert graph_small_output.data_ptr() == small_raw.output_activation.data_ptr()
@@ -415,7 +428,7 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         assert _public_pointer_snapshot(large_raw) == large_public_ptrs
         assert _deferred_pointer_snapshot(small_raw) == small_deferred_ptrs
         assert _deferred_pointer_snapshot(large_raw) == large_deferred_ptrs
-        assert layer.preprocessing_count == 1
+        assert layer._preprocessing_count == 1
 
         # Drop graphs before releasing their borrowed workspace addresses.
         graph_small = graph_large = None
@@ -423,24 +436,23 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         torch.cuda.synchronize()
         dist.barrier()
 
-        # Free symmetric allocations in reverse collective allocation order.
+        # Layer destruction releases explicit profiles in deterministic reverse
+        # allocation order on every rank.
         reference_large.destroy()
         reference_large = None
         reference_small.destroy()
         reference_small = None
-        large.destroy()
+        layer.destroy()
         assert large.is_destroyed
         assert large_raw._destroyed
         assert pooled_workspace_refcount(large_raw) == 0
-        large = None
-        small.destroy()
         assert small.is_destroyed
         assert small_raw._destroyed
         assert pooled_workspace_refcount(small_raw) == 0
-        small = None
         assert not layer._workspaces
-        layer.destroy()
         assert layer._destroyed
+        large = None
+        small = None
         layer = None
         dist.barrier()
     finally:

@@ -132,9 +132,10 @@ def test_create_workspace_derives_only_capacity_from_layer_fleet_params():
     layer.destroy()
 
 
-def test_same_capacity_shares_pool_entry_and_different_capacity_does_not(
+def test_duplicate_capacity_is_rejected_and_different_capacity_does_not_alias(
     monkeypatch,
 ):
+    from flashinfer.moe_ep import MoEEpConfigError
     from flashinfer.moe_ep.core.kernel import workspace_pool
 
     monkeypatch.setattr(workspace_pool, "_POOL", {})
@@ -161,16 +162,19 @@ def test_same_capacity_shares_pool_entry_and_different_capacity_does_not(
         ),
     ):
         first = layer.create_workspace(128)
-        second = layer.create_workspace(128)
+        with pytest.raises(
+            MoEEpConfigError,
+            match="workspace profile.*already exists",
+        ):
+            layer.create_workspace(128)
         large = layer.create_workspace(256)
 
-    assert first._backend_workspace is second._backend_workspace
     assert first._backend_workspace is not large._backend_workspace
     assert [capacity for capacity, _ in allocated] == [128, 256]
-    assert workspace_pool.pooled_workspace_refcount(first._backend_workspace) == 2
+    assert workspace_pool.pooled_workspace_refcount(first._backend_workspace) == 1
     assert workspace_pool.pooled_workspace_refcount(large._backend_workspace) == 1
 
-    shared_raw = first._backend_workspace
+    first_raw = first._backend_workspace
     large_raw = large._backend_workspace
     with (
         mock.patch.object(
@@ -185,20 +189,38 @@ def test_same_capacity_shares_pool_entry_and_different_capacity_does_not(
         ) as forget_global,
     ):
         first.destroy()
-        forget_local.assert_called_once_with(shared_raw)
-        forget_global.assert_not_called()
-        shared_raw.destroy.assert_not_called()
-        assert workspace_pool.pooled_workspace_refcount(shared_raw) == 1
-        second.destroy()
-        assert forget_local.call_count == 2
-        forget_global.assert_called_once_with(shared_raw)
-        shared_raw.destroy.assert_called_once()
+        forget_local.assert_called_once_with(first_raw)
+        forget_global.assert_called_once_with(first_raw)
+        first_raw.destroy.assert_called_once()
         large.destroy()
-        assert forget_local.call_count == 3
+        assert forget_local.call_count == 2
         assert forget_global.call_count == 2
         forget_global.assert_called_with(large_raw)
         large_raw.destroy.assert_called_once()
     assert workspace_pool.pooled_workspace_count() == 0
+    layer.destroy()
+
+
+def test_default_capacity_handle_adopts_the_lazy_default_workspace():
+    layer, _, _ = _make_layer()
+    default_workspace = mock.MagicMock(name="default_workspace")
+    layer._workspace = default_workspace
+    with (
+        mock.patch.object(layer._kernel, "validate_init"),
+        mock.patch.object(layer._kernel, "prepare_workspace") as prepare_workspace,
+    ):
+        handle = layer.create_workspace(layer._fleet_params.max_tokens_per_rank)
+
+    prepare_workspace.assert_not_called()
+    assert handle._backend_workspace is default_workspace
+    assert layer._workspace is None
+    assert layer._default_workspace_handle is handle
+    assert layer._ensure_workspace() is default_workspace
+
+    with mock.patch.object(layer._kernel, "destroy") as destroy:
+        handle.destroy()
+    destroy.assert_called_once_with(default_workspace)
+    assert layer._default_workspace_handle is None
     layer.destroy()
 
 
@@ -280,7 +302,7 @@ def test_forward_rejects_cross_layer_and_closed_workspace_before_staging():
     other_compute.assert_not_called()
 
     with mock.patch.object(first_layer._kernel, "destroy") as destroy:
-        handle.close()
+        handle.destroy()
         destroy.assert_called_once()
     with (
         mock.patch.object(first_layer._kernel, "stage_inputs") as first_stage,
@@ -331,9 +353,134 @@ def test_workspace_destroy_is_idempotent_and_layer_destroy_cleans_all_handles():
         assert destroy.call_count == 3
 
 
+def test_layer_destroy_releases_profiles_in_reverse_creation_order():
+    layer, _, _ = _make_layer()
+    first_raw = mock.MagicMock(name="first_raw")
+    second_raw = mock.MagicMock(name="second_raw")
+    with (
+        mock.patch.object(layer._kernel, "validate_init"),
+        mock.patch.object(
+            layer._kernel,
+            "prepare_workspace",
+            side_effect=[first_raw, second_raw],
+        ),
+        mock.patch.object(layer._kernel, "destroy") as destroy,
+    ):
+        first = layer.create_workspace(128)
+        second = layer.create_workspace(256)
+        layer.destroy()
+
+    assert first.is_destroyed
+    assert second.is_destroyed
+    assert [call.args[0] for call in destroy.call_args_list] == [
+        second_raw,
+        first_raw,
+    ]
+
+
+def test_workspace_handle_is_not_a_context_manager():
+    layer, _, _ = _make_layer()
+    handle, _, _, _ = _create_workspace(layer, 128)
+
+    assert not hasattr(handle, "__enter__")
+    assert not hasattr(handle, "__exit__")
+
+    handle.destroy()
+    layer.destroy()
+
+
+def test_workspace_destroy_fails_loudly_if_owning_layer_is_gone():
+    from flashinfer.moe_ep import MoEEpConfigError
+
+    layer, _, _ = _make_layer()
+    handle, raw_workspace, _, _ = _create_workspace(layer, 128)
+    handle._layer_ref = lambda: None
+
+    with pytest.raises(MoEEpConfigError, match="owning MegaMoE layer no longer exists"):
+        handle.destroy()
+
+    assert not handle.is_destroyed
+    assert handle._backend_workspace is raw_workspace
+    layer.destroy()
+
+
+def test_layer_finalizer_does_not_run_collective_cleanup():
+    layer, _, _ = _make_layer()
+    workspace = mock.MagicMock(name="default_workspace")
+    layer._workspace = workspace
+
+    with (
+        mock.patch.object(layer._kernel, "destroy") as destroy,
+        pytest.warns(ResourceWarning, match="collective resources"),
+    ):
+        layer.__del__()
+
+    destroy.assert_not_called()
+    assert layer._workspace is workspace
+    layer.destroy()
+
+
+def test_forward_rejects_unregistered_workspace_handle():
+    from flashinfer.moe_ep import MoEEpConfigError, MoEEpMegaWorkspace
+
+    layer, _, _ = _make_layer()
+    fleet_params = dataclasses.replace(layer._fleet_params, max_tokens_per_rank=128)
+    forged_raw = mock.MagicMock()
+    forged = MoEEpMegaWorkspace(layer, fleet_params, forged_raw)
+
+    with (
+        mock.patch.object(layer._kernel, "stage_inputs") as stage_inputs,
+        mock.patch.object(layer._kernel, "compute") as compute,
+        pytest.raises(MoEEpConfigError, match="not created by this layer"),
+    ):
+        layer.forward(_inputs(8), workspace=forged)
+
+    stage_inputs.assert_not_called()
+    compute.assert_not_called()
+    with pytest.raises(MoEEpConfigError, match="not created by this layer"):
+        forged.destroy()
+    forged_raw.destroy.assert_not_called()
+    layer.destroy()
+
+
+def test_explicit_workspace_preserves_owned_output_by_default():
+    layer, _, _ = _make_layer()
+    handle, raw_workspace, _, _ = _create_workspace(layer, 128)
+    tensors = _inputs(8)
+    borrowed = mock.MagicMock(name="borrowed")
+    layer._kernel.supports_output_view = True
+
+    with (
+        mock.patch.object(layer._kernel, "validate_forward"),
+        mock.patch.object(layer._kernel, "stage_inputs"),
+        mock.patch.object(
+            layer._kernel,
+            "compute",
+            side_effect=lambda workspace, weights, *, output: (
+                borrowed if output is None else output
+            ),
+        ) as compute,
+    ):
+        owned = layer.forward(tensors, workspace=handle)
+        view = layer.forward(
+            tensors,
+            workspace=handle,
+            return_workspace_view=True,
+        )
+
+    assert owned.shape == (8, 128)
+    assert compute.call_args_list[0].kwargs["output"] is owned
+    assert compute.call_args_list[1].kwargs["output"] is None
+    assert view is borrowed
+    assert all(call.args[0] is raw_workspace for call in compute.call_args_list)
+
+    handle.destroy()
+    layer.destroy()
+
+
 def test_creating_workspaces_does_not_repeat_weight_preprocessing():
     layer, transformed, preprocess_weights = _make_layer(preprocess_weights=True)
-    assert layer.preprocessing_count == 1
+    assert layer._preprocessing_count == 1
     preprocess_weights.assert_called_once()
 
     with (
@@ -350,8 +497,8 @@ def test_creating_workspaces_does_not_repeat_weight_preprocessing():
         small = layer.create_workspace(128)
         large = layer.create_workspace(256)
 
-    assert layer.transformed_weights is transformed
-    assert layer.preprocessing_count == 1
+    assert layer._transformed is transformed
+    assert layer._preprocessing_count == 1
     preprocess_weights.assert_called_once()
     small.destroy()
     large.destroy()

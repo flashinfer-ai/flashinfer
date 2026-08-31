@@ -1,17 +1,21 @@
 """CUPTI benchmark for the frozen MegaMoE workspace TopK reducer.
 
-The default baseline is an eager PyTorch implementation that performs the six
-BF16-to-FP32 additions in strict K=0..5 order and converts the result to BF16.
-It is a semantic reference made of several GPU kernels, not the MegaMoE CuTeDSL
+``--baseline ordered-pytorch`` provides an eager semantic reference that
+performs the six BF16-to-FP32 additions in strict K=0..5 order and converts the
+result to BF16. It is made of several GPU kernels, not the MegaMoE CuTeDSL
 kernel and not a claimed historical FlashInfer performance baseline.
 
-``--baseline vendored-cutedsl`` selects the exact vendored implementation at
+``--baseline vendored-cutedsl-matched`` (the default) selects the exact vendored
+implementation at
 ``flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/moe_nvfp4_swapab/topk_reduce.py``.
-It preserves the issue denominator's fixed C=4096 workspace for every live-token
-shape; preparation, zero-fill, and compilation remain outside timing. That module
-is not a stable public API. Source drift, import failure, or compilation failure
-is fatal; the benchmark never substitutes the PyTorch path while labelling it
-CuTeDSL.
+Both kernels process the same live ``T x 6 x 4096`` elements in this primary
+comparison. ``--baseline vendored-cutedsl-fixed-capacity`` separately measures
+the serving scenario where the old reducer processes a prefill-sized ``C=4096``
+workspace for a smaller live batch. That fixed-capacity result measures avoided
+workspace work, not an apples-to-apples kernel speedup. Preparation, zero-fill,
+and compilation remain outside timing. The vendored module is not a stable
+public API. Source drift, import failure, or compilation failure is fatal; the
+benchmark never substitutes the PyTorch path while labelling it CuTeDSL.
 """
 
 from __future__ import annotations
@@ -46,7 +50,8 @@ _SHAPES = (
 )
 _HIDDEN_SIZE = 4096
 _TOP_K = 6
-_BASELINE_CAPACITY = 4096
+_GRID_CTAS_PER_TOKEN = 4
+_LEGACY_BASELINE_CAPACITY = 4096
 _ATOL = 1e-2
 _RTOL = 1e-2
 _CUTEDSL_SOURCE = (
@@ -113,10 +118,26 @@ def _make_ordered_pytorch_runner(
     return run
 
 
+def _matched_cutedsl_views(
+    partials: torch.Tensor,
+    out: torch.Tensor,
+    comparison_plan: dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select the exact tensor extent declared by a matched-work plan."""
+
+    assert comparison_plan["comparison_kind"] == "matched_work_kernel"
+    tensor_extent = comparison_plan["baseline_tensor_extent"]
+    assert isinstance(tensor_extent, int)
+    return partials[:tensor_extent], out[:tensor_extent]
+
+
 def _make_vendored_cutedsl_runner(
     partials: torch.Tensor,
+    out: torch.Tensor,
+    num_tokens: int,
+    comparison_plan: dict[str, Any],
 ) -> tuple[Callable[[torch.Tensor, torch.Tensor], None], torch.Tensor]:
-    """Prepare the pinned fixed-C=4096 CuTeDSL denominator."""
+    """Prepare the pinned CuTeDSL reducer with explicit physical work."""
 
     try:
         import cuda.bindings.driver as cuda_driver
@@ -147,20 +168,35 @@ def _make_vendored_cutedsl_runner(
             f"{_CUTEDSL_SOURCE_SHA256}, got {actual_source_sha256}"
         )
 
-    # The production denominator owns a fixed full-capacity workspace. Keeping
-    # this physical shape is essential: slicing to num_tokens asks CuTeDSL to
-    # compile a smaller shape-specialized kernel and is not the issue baseline.
-    baseline_partials = torch.zeros(
-        (_BASELINE_CAPACITY, _TOP_K, _HIDDEN_SIZE),
-        dtype=torch.bfloat16,
-        device=partials.device,
-    )
-    baseline_partials[: partials.shape[0]].copy_(partials)
-    baseline_out = torch.empty(
-        (_BASELINE_CAPACITY, _HIDDEN_SIZE),
-        dtype=torch.bfloat16,
-        device=partials.device,
-    )
+    if comparison_plan["comparison_kind"] == "matched_work_kernel":
+        # Primary kernel comparison: CuTeDSL sees exactly the same live rows
+        # that the native reducer launches for. The surrounding native
+        # workspace may have more capacity, but neither timed kernel touches it.
+        assert comparison_plan["baseline_tensor_extent"] == num_tokens
+        baseline_partials, baseline_out = _matched_cutedsl_views(
+            partials,
+            out,
+            comparison_plan,
+        )
+    else:
+        fixed_capacity = comparison_plan["baseline_tensor_extent"]
+        assert isinstance(fixed_capacity, int)
+        if fixed_capacity < partials.shape[0]:
+            raise ValueError("fixed baseline capacity cannot truncate input")
+        # Serving scenario only: reproduce the legacy prefill-sized physical
+        # workspace. The CuTeDSL grid is shape-derived and therefore processes
+        # all fixed_capacity rows even when only num_tokens rows are live.
+        baseline_partials = torch.zeros(
+            (fixed_capacity, _TOP_K, _HIDDEN_SIZE),
+            dtype=torch.bfloat16,
+            device=partials.device,
+        )
+        baseline_partials[: partials.shape[0]].copy_(partials)
+        baseline_out = torch.empty(
+            (fixed_capacity, _HIDDEN_SIZE),
+            dtype=torch.bfloat16,
+            device=partials.device,
+        )
     partials_cute = cutlass_torch.from_dlpack(baseline_partials, assumed_align=16)
     out_cute = cutlass_torch.from_dlpack(baseline_out, assumed_align=16)
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -223,6 +259,50 @@ def _geomean(values: list[float]) -> float:
     return math.exp(sum(math.log(value) for value in values) / len(values))
 
 
+def _comparison_plan(num_tokens: int, baseline: str) -> dict[str, Any]:
+    """Define timed work once for both runner construction and JSON output."""
+
+    native_io_bytes = num_tokens * (_TOP_K + 1) * _HIDDEN_SIZE * 2
+    if baseline == "vendored-cutedsl-fixed-capacity":
+        baseline_work_tokens = _LEGACY_BASELINE_CAPACITY
+        comparison_kind = "legacy_fixed_capacity_serving_scenario"
+        same_token_extent = num_tokens == baseline_work_tokens
+        same_reduction_work: bool | None = same_token_extent
+        baseline_tensor_extent: int | None = baseline_work_tokens
+    elif baseline == "vendored-cutedsl-matched":
+        baseline_work_tokens = num_tokens
+        comparison_kind = "matched_work_kernel"
+        same_token_extent = True
+        same_reduction_work = True
+        baseline_tensor_extent = num_tokens
+    else:
+        baseline_work_tokens = None
+        comparison_kind = "matched_live_tokens_semantic_reference"
+        same_token_extent = True
+        same_reduction_work = None
+        baseline_tensor_extent = None
+    return {
+        "comparison_kind": comparison_kind,
+        "native_work_tokens": num_tokens,
+        "baseline_work_tokens": baseline_work_tokens,
+        "baseline_tensor_extent": baseline_tensor_extent,
+        "same_token_extent": same_token_extent,
+        "same_reduction_work": same_reduction_work,
+        "native_grid_ctas": _GRID_CTAS_PER_TOKEN * num_tokens,
+        "baseline_grid_ctas": (
+            _GRID_CTAS_PER_TOKEN * baseline_work_tokens
+            if baseline_work_tokens is not None
+            else None
+        ),
+        "native_io_bytes": native_io_bytes,
+        "baseline_io_bytes": (
+            baseline_work_tokens * (_TOP_K + 1) * _HIDDEN_SIZE * 2
+            if baseline_work_tokens is not None
+            else None
+        ),
+    }
+
+
 def _run_shape(
     num_tokens: int,
     capacity: int,
@@ -252,16 +332,29 @@ def _run_shape(
     native_ms = _median_cupti_ms(
         native_runner, partials, out, dry_run_iters, repeat_iters
     )
+    comparison_plan = _comparison_plan(num_tokens, baseline)
 
     if baseline == "ordered-pytorch":
         baseline_label = "ordered_pytorch_fp32_k0_to_k5"
         baseline_runner = _make_ordered_pytorch_runner(num_tokens)
         baseline_validation_out = out
         baseline_source = "PyTorch eager: six ordered FP32 accumulations + BF16 store"
+    elif baseline == "vendored-cutedsl-matched":
+        baseline_label = "vendored_cutedsl_topk_reduce_matched_live_t"
+        baseline_runner, baseline_validation_out = _make_vendored_cutedsl_runner(
+            partials,
+            out,
+            num_tokens,
+            comparison_plan,
+        )
+        baseline_source = _CUTEDSL_SOURCE
     else:
         baseline_label = "vendored_cutedsl_topk_reduce_fixed_c4096"
         baseline_runner, baseline_validation_out = _make_vendored_cutedsl_runner(
-            partials
+            partials,
+            out,
+            num_tokens,
+            comparison_plan,
         )
         baseline_source = _CUTEDSL_SOURCE
 
@@ -273,6 +366,8 @@ def _run_shape(
     baseline_ms = _median_cupti_ms(
         baseline_runner, partials, out, dry_run_iters, repeat_iters
     )
+    if baseline == "vendored-cutedsl-matched":
+        assert comparison_plan["same_reduction_work"]
     return {
         "num_tokens": num_tokens,
         "capacity": capacity,
@@ -280,13 +375,11 @@ def _run_shape(
         "baseline_label": baseline_label,
         "baseline_source": baseline_source,
         "baseline_source_sha256": (
-            _CUTEDSL_SOURCE_SHA256 if baseline == "vendored-cutedsl" else None
-        ),
-        "baseline_capacity": (
-            _BASELINE_CAPACITY if baseline == "vendored-cutedsl" else num_tokens
+            _CUTEDSL_SOURCE_SHA256 if baseline.startswith("vendored-cutedsl") else None
         ),
         "baseline_median_ms": baseline_ms,
-        "native_speedup_vs_baseline": baseline_ms / native_ms,
+        "baseline_over_native_latency_ratio": baseline_ms / native_ms,
+        **comparison_plan,
     }
 
 
@@ -294,11 +387,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--baseline",
-        choices=("ordered-pytorch", "vendored-cutedsl"),
-        default="ordered-pytorch",
+        choices=(
+            "vendored-cutedsl-matched",
+            "vendored-cutedsl-fixed-capacity",
+            "ordered-pytorch",
+        ),
+        default="vendored-cutedsl-matched",
         help=(
-            "comparison path; vendored-cutedsl is a fixed non-public module path "
-            "and fails closed if unavailable"
+            "comparison path; vendored CuTeDSL modes use a fixed non-public "
+            "module path and fail closed if unavailable"
         ),
     )
     parser.add_argument("--dry-run-iters", type=int, default=20)
@@ -325,37 +422,46 @@ def main() -> None:
             args.seed + shape_idx,
         )
         results.append(result)
+        baseline_work = result["baseline_work_tokens"]
+        baseline_work_label = (
+            str(baseline_work) if baseline_work is not None else "multi-kernel"
+        )
         print(
             f"T={num_tokens:4d} C={capacity:4d} "
+            "work_tokens(native:baseline)="
+            f"{result['native_work_tokens']}:"
+            f"{baseline_work_label} tokens "
             f"native_reducer={result['native_reducer_median_ms']:.6f} ms "
             f"baseline[{result['baseline_label']}]="
             f"{result['baseline_median_ms']:.6f} ms "
-            f"speedup={result['native_speedup_vs_baseline']:.6f}x"
+            "baseline/native latency ratio="
+            f"{result['baseline_over_native_latency_ratio']:.6f}x"
         )
 
     native_geomean_ms = _geomean(
         [result["native_reducer_median_ms"] for result in results]
     )
     baseline_geomean_ms = _geomean([result["baseline_median_ms"] for result in results])
-    speedup_geomean = _geomean(
-        [result["native_speedup_vs_baseline"] for result in results]
+    latency_ratio_geomean = _geomean(
+        [result["baseline_over_native_latency_ratio"] for result in results]
     )
     summary = {
         "architecture": "sm_100a",
         "dtype": "bfloat16",
+        "comparison_kind": results[0]["comparison_kind"],
         "atol": _ATOL,
         "rtol": _RTOL,
         "timing": "CUPTI activity, cold L2",
         "native_reducer_geomean_ms": native_geomean_ms,
         "baseline_geomean_ms": baseline_geomean_ms,
-        "native_speedup_geomean_vs_baseline": speedup_geomean,
+        "baseline_over_native_latency_ratio_geomean": latency_ratio_geomean,
         "results": results,
     }
     print(
         f"geomean native_reducer={native_geomean_ms:.6f} ms "
         f"baseline[{results[0]['baseline_label']}]="
         f"{baseline_geomean_ms:.6f} ms "
-        f"speedup={speedup_geomean:.6f}x"
+        f"baseline/native latency ratio={latency_ratio_geomean:.6f}x"
     )
     if args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))
