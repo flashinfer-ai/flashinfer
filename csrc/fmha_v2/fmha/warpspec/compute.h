@@ -93,7 +93,9 @@ struct Compute {
   enum { SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION };
 
   // Whether use the bidirectional sliding window attention or not.
-  enum { BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION };
+  enum {
+    BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
+  };
 
   // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
   enum { APPLY_ALIBI = Kernel_traits::APPLY_ALIBI };
@@ -214,8 +216,8 @@ struct Compute {
     // Handle sliding window or chunked attention masking
     if constexpr (SLIDING_OR_CHUNKED_ATTENTION) {
       if constexpr (BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION) {
-        kv_left_mask_end = div_up(
-            max(0, tile_offset_end - params.sliding_window_size / 2), STEP_KV);
+        kv_left_mask_end =
+            div_up(max(0, tile_offset_end - params.sliding_window_size / 2), STEP_KV);
         kv_right_mask_start =
             min(kv_idx_end - 1, (tile_offset_start + params.sliding_window_size / 2 + 1) / STEP_KV);
       } else if (is_chunked_attention) {

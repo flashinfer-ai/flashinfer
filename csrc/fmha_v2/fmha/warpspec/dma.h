@@ -71,7 +71,9 @@ struct DMA {
   enum { SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION };
 
   // Whether use the bidirectional sliding window attention or not.
-  enum { BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION };
+  enum {
+    BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
+  };
 
   // Is heads interleaved ?
   enum { HEADS_INTERLEAVED = Kernel_traits::HEADS_INTERLEAVED };

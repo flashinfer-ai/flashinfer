@@ -59,7 +59,9 @@ struct Softmax_base {
   enum { SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION };
 
   // Whether use the bidirectional sliding window attention or not.
-  enum { BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION };
+  enum {
+    BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
+  };
 
   // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
   enum { APPLY_ALIBI = Kernel_traits::APPLY_ALIBI };

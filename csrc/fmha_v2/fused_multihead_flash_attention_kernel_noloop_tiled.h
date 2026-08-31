@@ -154,7 +154,8 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
   // The start/end step of kv loops.
   // Do we need to mask out the tokens that is not in the sliding window.
   bool const mask_sliding_window =
-      (Kernel_traits::SLIDING_WINDOW_ATTENTION && binfo.actual_kv_seqlen > params.sliding_window_size) ||
+      (Kernel_traits::SLIDING_WINDOW_ATTENTION &&
+       binfo.actual_kv_seqlen > params.sliding_window_size) ||
       (Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION &&
        binfo.actual_kv_seqlen > params.sliding_window_size / 2 + 1);  // +1 to include self token
   int const valid_seqlen = Kernel_traits::CAUSAL_MASK
@@ -167,22 +168,25 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params) {
   int sliding_window_mask_right = kv_loop_end;
   if (mask_sliding_window) {
     if constexpr (Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION) {
-      kv_loop_start =
-          (max(0, q_sequence_start - params.sliding_window_size / 2) / Cta_tile_p::N) * Cta_tile_p::N;
+      kv_loop_start = (max(0, q_sequence_start - params.sliding_window_size / 2) / Cta_tile_p::N) *
+                      Cta_tile_p::N;
       sliding_window_mask_left =
-          (max(0, q_sequence_start + Cta_tile_p::M - params.sliding_window_size / 2) / Cta_tile_p::N) *
+          (max(0, q_sequence_start + Cta_tile_p::M - params.sliding_window_size / 2) /
+           Cta_tile_p::N) *
           Cta_tile_p::N;
 
       kv_loop_end =
-          min(kv_loop_end, (fmha::div_up(q_sequence_start + Cta_tile_p::M + params.sliding_window_size / 2,
-                                         int(Cta_tile_p::N)) *
-                            Cta_tile_p::N));
+          min(kv_loop_end,
+              (fmha::div_up(q_sequence_start + Cta_tile_p::M + params.sliding_window_size / 2,
+                            int(Cta_tile_p::N)) *
+               Cta_tile_p::N));
       sliding_window_mask_right =
           min(sliding_window_mask_right,
-              ((q_sequence_start + params.sliding_window_size / 2) / int(Cta_tile_p::N)) * Cta_tile_p::N);
+              ((q_sequence_start + params.sliding_window_size / 2) / int(Cta_tile_p::N)) *
+                  Cta_tile_p::N);
     } else {
-      kv_loop_start =
-          (max(0, q_sequence_start + 1 - params.sliding_window_size) / Cta_tile_p::N) * Cta_tile_p::N;
+      kv_loop_start = (max(0, q_sequence_start + 1 - params.sliding_window_size) / Cta_tile_p::N) *
+                      Cta_tile_p::N;
       sliding_window_mask_left =
           (max(0, q_sequence_start + Cta_tile_p::M - params.sliding_window_size) / Cta_tile_p::N) *
           Cta_tile_p::N;

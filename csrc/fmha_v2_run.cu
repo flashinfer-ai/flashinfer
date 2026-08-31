@@ -324,8 +324,7 @@ static inline Attention_mask_type string_to_mask_type(const std::string& s) {
   if (s == "causal") return Attention_mask_type::CAUSAL;
   if (s == "sliding_window" || s == "chunked")
     return Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
-  if (s == "bidirectional_sliding_window")
-    return Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW;
+  if (s == "bidirectional_sliding_window") return Attention_mask_type::BIDIRECTIONAL_SLIDING_WINDOW;
   if (s == "custom") return Attention_mask_type::CUSTOM_MASK;
   return Attention_mask_type::CAUSAL;  // default
 }
