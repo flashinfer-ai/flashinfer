@@ -349,7 +349,7 @@ __device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint
 extern "C" {
 
 __global__ __launch_bounds__(32) void
-kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __restrict__ topk_ids, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags)
+kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __restrict__ topk_ids, int active_tokens_per_rank, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -361,7 +361,7 @@ kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __re
 
     // === Task calls (dependency order) ===
     #pragma unroll 1
-    for (int route = tid; route < 1024; route += 32) {
+    for (int route = tid; route < active_tokens_per_rank * 8; route += 32) {
         topk_ids[route] = (int)expert_ids[route];
     }
     if (warp == 0) {
@@ -432,7 +432,7 @@ kernel_rank_major_input_barrier_v1(long long* __restrict__ expert_ids, int* __re
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_rank_major_dispatch_v1(__nv_bfloat16* __restrict__ recv_hidden, int* __restrict__ recv_local_ids, float* __restrict__ recv_weights, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags, __nv_bfloat16* __restrict__ hidden_states, __nv_bfloat16* const* __restrict__ hidden_states_peers, int* __restrict__ topk_ids, int* const* __restrict__ topk_ids_peers, float* __restrict__ topk_weights, float* const* __restrict__ topk_weights_peers)
+kernel_rank_major_dispatch_v1(__nv_bfloat16* __restrict__ recv_hidden, int* __restrict__ recv_local_ids, float* __restrict__ recv_weights, int active_tokens_per_rank, int32_t pg_world, int32_t pg_rank, unsigned* const* __restrict__ pg_flags, __nv_bfloat16* __restrict__ hidden_states, __nv_bfloat16* const* __restrict__ hidden_states_peers, int* __restrict__ topk_ids, int* const* __restrict__ topk_ids_peers, float* __restrict__ topk_weights, float* const* __restrict__ topk_weights_peers)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -471,9 +471,10 @@ kernel_rank_major_dispatch_v1(__nv_bfloat16* __restrict__ recv_hidden, int* __re
     #define row_full_addr (mbar_base + 0)
 
     // === Task calls (dependency order) ===
-    int recv_token = bid;
-    int src_rank = recv_token / 128;
-    int src_token = recv_token - src_rank * 128;
+    int active_token = bid;
+    int src_rank = active_token / active_tokens_per_rank;
+    int src_token = active_token - src_rank * active_tokens_per_rank;
+    int recv_token = src_rank * 128 + src_token;
     unsigned long long hidden_src_offset = (unsigned long long)src_token * 14336;
     unsigned long long routing_src_offset = (unsigned long long)src_token * 8 * 4;
     if (warp == 0) {
@@ -598,7 +599,7 @@ kernel_rank_major_route_reset_exact_v1(int* __restrict__ expert_scatter_offsets,
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_rank_major_route_count_exact_v1(int* __restrict__ recv_local_ids, int* __restrict__ expert_scatter_offsets, int* __restrict__ token_to_permuted)
+kernel_rank_major_route_count_exact_v1(int* __restrict__ recv_local_ids, int* __restrict__ expert_scatter_offsets, int* __restrict__ token_to_permuted, int active_tokens_per_rank)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -609,13 +610,20 @@ kernel_rank_major_route_count_exact_v1(int* __restrict__ recv_local_ids, int* __
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
-    int route = bid * 256 + tid;
-    int local_expert = recv_local_ids[route];
-    token_to_permuted[route] = 32768;
-    if (local_expert >= 0) {
-        int _atomic_old_0 = atomicAdd(&expert_scatter_offsets[local_expert], 1);
-        int local_row = _atomic_old_0;
-        token_to_permuted[route] = local_row;
+    int active_route = bid * 256 + tid;
+    int routes_per_rank = active_tokens_per_rank * 8;
+    int active_routes = 8 * routes_per_rank;
+    if (active_route < active_routes) {
+        int src_rank = active_route / routes_per_rank;
+        int src_route = active_route - src_rank * routes_per_rank;
+        int route = src_rank * 128 * 8 + src_route;
+        int local_expert = recv_local_ids[route];
+        token_to_permuted[route] = 32768;
+        if (local_expert >= 0) {
+            int _atomic_old_0 = atomicAdd(&expert_scatter_offsets[local_expert], 1);
+            int local_row = _atomic_old_0;
+            token_to_permuted[route] = local_row;
+        }
     }
 }
 
@@ -713,7 +721,7 @@ kernel_rank_major_route_finalize_exact_v1(int* __restrict__ expert_scatter_offse
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_rank_major_route_scatter_exact_v1(int* __restrict__ recv_local_ids, int* __restrict__ expert_padded_row_offsets, int* __restrict__ route_map, int* __restrict__ token_to_permuted)
+kernel_rank_major_route_scatter_exact_v1(int* __restrict__ recv_local_ids, int* __restrict__ expert_padded_row_offsets, int* __restrict__ route_map, int* __restrict__ token_to_permuted, int active_tokens_per_rank)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -724,15 +732,22 @@ kernel_rank_major_route_scatter_exact_v1(int* __restrict__ recv_local_ids, int* 
     const int num_bids = gridDim.x;
 
     // === Task calls (dependency order) ===
-    int route = bid * 256 + tid;
-    int local_expert = recv_local_ids[route];
-    int local_row = token_to_permuted[route];
-    if (local_expert >= 0) {
-        int compact_row = expert_padded_row_offsets[local_expert] + local_row;
-        route_map[compact_row] = route / 8;
-        token_to_permuted[route] = compact_row;
-    } else {
-        token_to_permuted[route] = 32768;
+    int active_route = bid * 256 + tid;
+    int routes_per_rank = active_tokens_per_rank * 8;
+    int active_routes = 8 * routes_per_rank;
+    if (active_route < active_routes) {
+        int src_rank = active_route / routes_per_rank;
+        int src_route = active_route - src_rank * routes_per_rank;
+        int route = src_rank * 128 * 8 + src_route;
+        int local_expert = recv_local_ids[route];
+        int local_row = token_to_permuted[route];
+        if (local_expert >= 0) {
+            int compact_row = expert_padded_row_offsets[local_expert] + local_row;
+            route_map[compact_row] = route / 8;
+            token_to_permuted[route] = compact_row;
+        } else {
+            token_to_permuted[route] = 32768;
+        }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 }
@@ -3275,7 +3290,7 @@ kernel_trtllm_moe_bmm_tile_n64_fc2_bf16(FlashInferTensorMap const* A, FlashInfer
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_rank_major_exact_unpermute_v1(__nv_bfloat16* __restrict__ expert_output, float* __restrict__ topk_weights, int* __restrict__ token_to_permuted, __nv_bfloat16* __restrict__ final_output, unsigned int hidden_size)
+kernel_rank_major_exact_unpermute_v1(__nv_bfloat16* __restrict__ expert_output, float* __restrict__ topk_weights, int* __restrict__ token_to_permuted, __nv_bfloat16* __restrict__ final_output, unsigned int hidden_size, int active_tokens_per_rank)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -3295,7 +3310,10 @@ kernel_rank_major_exact_unpermute_v1(__nv_bfloat16* __restrict__ expert_output, 
     const int inverse_stage_addr = smem + 32;
 
     // === Task calls (dependency order) ===
-    unsigned int token = bid;
+    int active_token = bid;
+    int src_rank = active_token / active_tokens_per_rank;
+    int src_token = active_token - src_rank * active_tokens_per_rank;
+    unsigned int token = (unsigned int)(src_rank * 128 + src_token);
     unsigned int route_base = token * 8;
     if (tid < 8) {
         weights_stage[tid] = topk_weights[route_base + (unsigned int)tid];

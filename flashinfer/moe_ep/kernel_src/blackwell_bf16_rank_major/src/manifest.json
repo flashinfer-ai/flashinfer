@@ -30,12 +30,13 @@
     "kernel_rank_major_combine_v1"
   ],
   "schema_version": 1,
-  "source_sha256": "ebfe0f290f5d3ec55ce85edfb27b8dbbe853ac6ca6f2b5f92eb6b4fe57366283",
+  "source_sha256": "fc521b0014019025d30dbdbba83c097ca66000f66d561c9d609fc258d75e68ca",
   "stages": [
     {
       "bindings": [
         "expert_ids",
         "topk_ids",
+        "active_tokens_per_rank",
         "pg_world",
         "pg_rank",
         "pg_flags"
@@ -59,7 +60,12 @@
       "name": "input_barrier",
       "pdl_launch": false,
       "pdl_sync": false,
-      "scalar_bindings": [],
+      "scalar_bindings": [
+        [
+          "active_tokens_per_rank",
+          128
+        ]
+      ],
       "symbol": "kernel_rank_major_input_barrier_v1",
       "use_pdl": false
     },
@@ -68,6 +74,7 @@
         "recv_hidden",
         "recv_local_ids",
         "recv_weights",
+        "active_tokens_per_rank",
         "pg_world",
         "pg_rank",
         "pg_flags",
@@ -97,7 +104,12 @@
       "name": "dispatch",
       "pdl_launch": false,
       "pdl_sync": false,
-      "scalar_bindings": [],
+      "scalar_bindings": [
+        [
+          "active_tokens_per_rank",
+          128
+        ]
+      ],
       "symbol": "kernel_rank_major_dispatch_v1",
       "use_pdl": false
     },
@@ -133,7 +145,8 @@
       "bindings": [
         "recv_local_ids",
         "expert_scatter_offsets",
-        "token_to_permuted"
+        "token_to_permuted",
+        "active_tokens_per_rank"
       ],
       "block": [
         256,
@@ -154,7 +167,12 @@
       "name": "route_count",
       "pdl_launch": false,
       "pdl_sync": false,
-      "scalar_bindings": [],
+      "scalar_bindings": [
+        [
+          "active_tokens_per_rank",
+          128
+        ]
+      ],
       "symbol": "kernel_rank_major_route_count_exact_v1",
       "use_pdl": false
     },
@@ -196,7 +214,8 @@
         "recv_local_ids",
         "expert_padded_row_offsets",
         "route_map",
-        "token_to_permuted"
+        "token_to_permuted",
+        "active_tokens_per_rank"
       ],
       "block": [
         256,
@@ -217,7 +236,12 @@
       "name": "route_scatter",
       "pdl_launch": true,
       "pdl_sync": false,
-      "scalar_bindings": [],
+      "scalar_bindings": [
+        [
+          "active_tokens_per_rank",
+          128
+        ]
+      ],
       "symbol": "kernel_rank_major_route_scatter_exact_v1",
       "use_pdl": false
     },
@@ -304,7 +328,8 @@
         "topk_weights",
         "token_to_permuted",
         "final_output",
-        "hidden_size"
+        "hidden_size",
+        "active_tokens_per_rank"
       ],
       "block": [
         128,
@@ -329,6 +354,10 @@
         [
           "hidden_size",
           7168
+        ],
+        [
+          "active_tokens_per_rank",
+          128
         ]
       ],
       "symbol": "kernel_rank_major_exact_unpermute_v1",
