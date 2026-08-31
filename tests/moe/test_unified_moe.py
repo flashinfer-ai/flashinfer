@@ -3130,7 +3130,7 @@ class TestTrtllmFromLogitsPackingContract:
 
     @pytest.mark.parametrize("logits_dtype", [torch.float32, torch.bfloat16])
     def test_bf16_expert_weights_buffer_is_bf16(self, logits_dtype):
-        runner, inputs, moe_inputs, logits = self._make_bf16_from_logits_inputs(
+        _runner, inputs, moe_inputs, logits = self._make_bf16_from_logits_inputs(
             logits_dtype
         )
         assert moe_inputs.routing_logits is logits
