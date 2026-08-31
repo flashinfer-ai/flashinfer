@@ -1078,12 +1078,19 @@ def _radix_filter_top_k_varlen_check(
 
     Upstream's decode wrapper has no ``compress_ratio`` and no ``pre_idx``
     parameter at all, so those are hard exclusions rather than tuning knobs --
-    returning False here makes ``backend="auto"`` fall through to a backend that
-    does implement them instead of silently ignoring the argument.
+    returning False here makes an explicit ``backend="radix_filter"`` call fail
+    at backend validation instead of silently ignoring the argument or failing
+    deep inside the kernel constructor.
     """
     if not _cute_dsl_ready(logits.device):
         return False
     if not _radix_filter_kernel_dsl_ok():
+        return False
+    if pre_idx is not None:
+        return False
+    # Vendored kernel bound: FilteredTopKKernelVarlen rejects top_k outside
+    # [1, 16384]; enforce it here so the failure is a backend-validation error.
+    if not 1 <= top_k <= 16384:
         return False
     if compress_ratio != 1:
         return False

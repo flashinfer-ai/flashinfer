@@ -384,6 +384,34 @@ def test_out_buffers_written_in_place():
         assert bool((logits[b][sel.long()] >= kth - 1e-4).all())
 
 
+def test_checker_rejects_pre_idx_and_oob_top_k():
+    """Explicit radix_filter calls must fail backend validation, not deeper.
+
+    The checker docstring advertises pre_idx as a hard exclusion and the
+    vendored kernel only supports top_k in [1, 16384], but neither was
+    enforced: a non-None pre_idx was silently ignored (the kernel ran without
+    the hint) and an oversized top_k surfaced as the kernel constructor's
+    ValueError instead of a backend-validation error. Message-matched to the
+    @backend_requirement rejection so the pre-fix behaviors cannot pass.
+
+    Regression for PR #4621 review round 2 (checker constraints).
+    """
+    device = torch.device("cuda")
+    _skip_unless_radix_filter(device)
+
+    torch.manual_seed(21)
+    logits = torch.randn(8, 32768, dtype=torch.float32, device=device)
+    seq_lens = torch.full((8,), 32768, dtype=torch.int32, device=device)
+
+    pre = torch.zeros(8, 4096, dtype=torch.int32, device=device)
+    with pytest.raises(ValueError, match=r"Problem size is not supported"):
+        flashinfer.top_k_varlen(
+            logits, seq_lens, 1024, pre_idx=pre, backend="radix_filter"
+        )
+    with pytest.raises(ValueError, match=r"Problem size is not supported"):
+        flashinfer.top_k_varlen(logits, seq_lens, 16385, backend="radix_filter")
+
+
 def test_tma_forced_on_misaligned_stride_fails_fast():
     """Forced TMA with a 16-byte-misaligned leading stride must fail fast.
 
