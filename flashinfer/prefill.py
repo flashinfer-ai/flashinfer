@@ -3950,9 +3950,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._fmha_v2_qo_indptr = self._qo_indptr_buf.to(torch.int32)
                 self._fmha_v2_kv_indptr = self._kv_indptr_buf.to(torch.int32)
             elif self._backend == "cutlass":
-                # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
+                # insert self.device to 9th position (0-indexed) of get_module_args;
+                # qo_indptr may be a host tensor, so its device is not reliable here
                 new_get_module_args = (
-                    get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
+                    get_module_args[:9] + (self.device,) + get_module_args[9:]
                 )
                 self._cached_module = get_fmha_module(*new_get_module_args)
             elif self._backend != "cudnn":
@@ -3961,8 +3962,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 )
 
         if self._backend == "cutlass":
+            # Use the device-side indptr buffers: qo_indptr/kv_indptr may live
+            # on the host while fmha_varlen_plan requires CUDA tensors.
             self._plan_info = fmha_varlen_plan(
-                self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
+                self._cached_module,
+                self._qo_indptr_buf,
+                self._kv_indptr_buf,
+                num_qo_heads,
+                causal,
             )
             self._max_qo_len = torch.max(qo_indptr[1:] - qo_indptr[:-1]).item()
         elif self._backend == "fmha_v2":
