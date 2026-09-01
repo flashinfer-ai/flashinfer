@@ -86,7 +86,7 @@ def _reference_output(a, b, sfa, sfb, sf_vec_size, mnkl, alpha, bias):
 
 
 def _make_runner():
-    return _cute_dsl_low_latency_blockscaled_gemm_runner(100, False)
+    return _cutedsl_low_latency_blockscaled_gemm_runner(100, False)
 
 
 def _run_all_tactics_and_check(runner, mnkl, fmt, workspace, alpha):
@@ -281,6 +281,10 @@ def test_low_latency_blockscaled_gemm_all_tactics_correctness(fmt):
     reference = _reference_output(
         a, b, sfa_simple, sfb_simple, sf_vec_size, mnkl, alpha, bias
     )
+    gemm_only = _reference_output(
+        a, b, sfa_simple, sfb_simple, sf_vec_size, mnkl, alpha, torch.zeros_like(bias)
+    )
+    assert gemm_only.abs().max() > 1.0
     for tactic in tactics:
         out.zero_()
         runner.forward(inputs, tactic=tactic)

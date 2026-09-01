@@ -1816,8 +1816,6 @@ class LowLatencyBlockscaledGemmKernel:
             # Complete tensor memory loads before the distributed scatter
             cute.arch.barrier(barrier_id=15, number_of_threads=128)
 
-            dsmem_payload = cute.dsmem.B32PayloadCodec([("value", cutlass.Float32)])
-            scatter_val = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Float32)
             for peer in range(self.split_k):
                 if peer != split_rank:
                     # Elements in peer's shard: [peer*shard_ept, (peer+1)*shard_ept)
@@ -1828,11 +1826,9 @@ class LowLatencyBlockscaledGemmKernel:
                     )
                     mailbox_base = sender_idx * 128 * shard_ept
                     for i in range(shard_ept):
-                        scatter_val[0] = tDrAcc[shard_start + i]
-                        cute.dsmem.store_to_peer(
+                        cute.arch.store_async_dsmem(
                             dsmem_mailbox_ptr + mailbox_base + i * 128 + epi_tid,
-                            scatter_val,
-                            dsmem_payload,
+                            tDrAcc[shard_start + i].bitcast(cutlass.Int32),
                             mailbox_mbar,
                             cutlass.Int32(peer),
                         )
@@ -2005,12 +2001,12 @@ def make_blockscaled_tensors(
             operand.copy_(
                 torch.randint(-2, 2, operand.shape, dtype=torch.int8, device="cuda")
             )
-        else:
-            # Small bit patterns avoid NaNs in E4M3FN
-            operand = torch.randint(
-                0, 4, (l, mn, k), dtype=torch.uint8, device="cuda"
-            ).permute(1, 2, 0)
-        return operand.view(dtype=torch_dtype)
+            return operand.view(dtype=torch_dtype)
+        return (
+            torch.randint(-2, 3, (l, mn, k), dtype=torch.int8, device="cuda")
+            .to(dtype=torch_dtype)
+            .permute(1, 2, 0)
+        )
 
     a = make_operand(m, cutlass_torch.dtype(a_dtype))
     b = make_operand(n, cutlass_torch.dtype(b_dtype))

@@ -5284,7 +5284,6 @@ def _cutedsl_low_latency_gemm_mxfp8_requirement(
         raise ValueError(
             "cutedsl_low_latency mm_mxfp8 requires M <= 8 and K divisible by 128"
         )
-    _check_cute_dsl_availability()
     return True
 
 
@@ -5403,10 +5402,10 @@ def _check_cute_dsl_availability():
     try:
         from flashinfer.cute_dsl.utils import is_cute_dsl_available
     except ImportError as err:
-        raise RuntimeError("CuTe DSL is not available.") from err
+        raise ValueError("CuTe DSL is not available.") from err
 
     if not is_cute_dsl_available():
-        raise RuntimeError("CuTe DSL is not available.")
+        raise ValueError("CuTe DSL is not available.")
 
 
 def _cute_dsl_gemm_mxfp8_runner(
@@ -6472,7 +6471,6 @@ def _cutedsl_low_latency_gemm_fp4_requirement(
         raise ValueError(
             f"cutedsl_low_latency FP4 GEMM requires M <= 8 and K divisible by {k_alignment}"
         )
-    _check_cute_dsl_availability()
     return True
 
 
@@ -7527,7 +7525,7 @@ def _heuristic_func_mm_fp4(
         candidate_backends = ("cutlass", "cudnn", "cute-dsl")
     else:
         candidate_backends = ("cutlass", "cudnn")
-    if "cutedsl_low_latency" in suitable_backends:
+    if CUTE_DSL_AVAILABLE and "cutedsl_low_latency" in suitable_backends:
         candidate_backends = (*candidate_backends, "cutedsl_low_latency")
     # Filter and return only supported backends
     return [c for c in candidate_backends if c in suitable_backends]

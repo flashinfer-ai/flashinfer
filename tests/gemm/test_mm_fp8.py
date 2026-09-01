@@ -30,8 +30,11 @@ def test_mm_fp8(
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("mm_fp8 is only supported on Blackwell GPUs.")
-    if backend == "cutedsl_low_latency" and (compute_capability[1] not in (0, 3)):
-        pytest.skip("cutedsl_low_latency mm_fp8 requires SM100/SM103")
+    if backend == "cutedsl_low_latency":
+        if compute_capability[1] not in (0, 3):
+            pytest.skip("cutedsl_low_latency mm_fp8 requires SM100/SM103")
+        if m > 8:
+            pytest.skip("cutedsl_low_latency mm_fp8 requires M <= 8")
 
     torch.manual_seed(123)
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
