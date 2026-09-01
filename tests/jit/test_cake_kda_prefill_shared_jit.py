@@ -21,9 +21,7 @@ def test_shared_prefill_manifest_is_complete_and_hash_verified():
     assert len({spec.device_path for spec in specs}) == 8
     assert len({spec.binding_path for spec in specs}) == 8
     assert all(spec.device_path.name.startswith("cake_kda_prefill_") for spec in specs)
-    assert all(
-        spec.binding_path.name.endswith("_binding.cu") for spec in specs
-    )
+    assert all(spec.binding_path.name.endswith("_binding.cu") for spec in specs)
 
 
 @pytest.mark.parametrize(
@@ -40,9 +38,7 @@ def test_shared_prefill_jit_compiles_device_and_binding_separately(
     module_spec = shared.get_cake_kda_prefill_shared_module_spec(
         target, "direct_m128_generic"
     )
-    jit_spec = shared.gen_cake_kda_prefill_shared_module(
-        target, "direct_m128_generic"
-    )
+    jit_spec = shared.gen_cake_kda_prefill_shared_module(target, "direct_m128_generic")
 
     assert jit_spec.name == (
         f"{module_spec.module_ident}_{target}_{module_spec.closure_sha256}"
@@ -51,7 +47,10 @@ def test_shared_prefill_jit_compiles_device_and_binding_separately(
     assert target_define in jit_spec.extra_cuda_cflags
     assert "--use_fast_math" in jit_spec.extra_cuda_cflags
     assert "--ptxas-options=-O1" in jit_spec.extra_cuda_cflags
-    assert sum("-gencode=arch=compute_" in flag for flag in jit_spec.extra_cuda_cflags) == 1
+    assert (
+        sum("-gencode=arch=compute_" in flag for flag in jit_spec.extra_cuda_cflags)
+        == 1
+    )
 
 
 def test_shared_prefill_binding_uses_flashinfer_tvm_ffi_runtime():

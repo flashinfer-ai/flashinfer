@@ -36,6 +36,10 @@ from .utils import get_compute_capability
 
 if TYPE_CHECKING:
     from .jit.cake_kda import CakeKDATarget, CakeKDAVariant
+    from .jit.cake_kda_prefill_shared import (
+        CakeKDAPrefillSharedPolicy,
+        CakeKDAPrefillSharedTarget,
+    )
     from .jit.flash_kda import FlashKDATarget, FlashKDAVariant
 
 _FLASH_KDA_HEAD_DIM = 128
@@ -85,6 +89,8 @@ _FLASH_KDA_ROUTE_M64 = "independent_dvsplit_m64"
 _FLASH_KDA_ROUTE_SMALL_BH_M128 = "small_bh_owner_helper_m128"
 _FLASH_KDA_ROUTE_BT16_M64 = "bt16_prepare_chain_m64"
 _CAKE_KDA_ROUTE_AFFINE_M128 = "cake_affine_split_m128"
+_CAKE_KDA_SHARED_SUPPORTED_HEADS = frozenset((1, 4, 8, 16, 32, 64, 96))
+_CAKE_KDA_SHARED_PERSISTENT_MAX_CTAS = 152
 
 # Physical contract for the frozen persistent-M128 schedule. The generated
 # launch reserves an additional aligned control prefix; the roofline uses the
@@ -145,6 +151,22 @@ class _CakeKDAAffinePlan:
     @property
     def num_parts(self) -> int:
         return len(self.token_offsets) - 1
+
+
+@dataclass(frozen=True)
+class _CakeKDAPrefillSharedRoute:
+    """One selected exported physical schedule and its kernel inputs."""
+
+    target: "CakeKDAPrefillSharedTarget"
+    policy: "CakeKDAPrefillSharedPolicy"
+    sequence_order: tuple[int, ...]
+    grid_x: int
+    uniform_sequence_length: int = 0
+    persistent_tasks: int = 1
+    persistent_stride: int = 0
+    tile_schedule: tuple[int, ...] = ()
+    tile_schedule_counts: tuple[int, ...] = ()
+    schedule_stride: int = 1
 
 
 class _CakeKDAAffineModule(Protocol):
@@ -592,6 +614,306 @@ def _cake_kda_affine_export_is_available() -> bool:
     from .jit.cake_kda import cake_kda_affine_is_available
 
     return cake_kda_affine_is_available()
+
+
+def _cake_kda_prefill_shared_export_is_available() -> bool:
+    """Query the manifest-verified shared prefill closure without building it."""
+
+    from .jit.cake_kda_prefill_shared import cake_kda_prefill_shared_is_available
+
+    return cake_kda_prefill_shared_is_available()
+
+
+def _build_cake_kda_shared_scalar_schedule(
+    sequence_lengths: tuple[int, ...], num_heads: int, num_ctas: int
+) -> tuple[tuple[int, ...], tuple[int, ...], int]:
+    """Encode recurrent chunks after deterministic LPT load balancing."""
+
+    bins: list[tuple[int, int, list[tuple[int, int]]]] = [
+        (0, cta, []) for cta in range(num_ctas)
+    ]
+    heapq.heapify(bins)
+    ordered_sequences = sorted(
+        range(len(sequence_lengths)),
+        key=lambda sequence: (sequence_lengths[sequence] + 31) // 32,
+        reverse=True,
+    )
+    for sequence in ordered_sequences:
+        chunks = (sequence_lengths[sequence] + 31) // 32
+        for head in range(num_heads):
+            load, cta, tasks = heapq.heappop(bins)
+            tasks.append((sequence * num_heads + head, chunks))
+            heapq.heappush(bins, (load + chunks, cta, tasks))
+
+    # Repartition the lightest/heaviest pair while preserving every task's
+    # recurrent chunk order. This closes common equal-size LPT residues.
+    while True:
+        light_index = min(
+            range(num_ctas), key=lambda index: (bins[index][0], bins[index][1])
+        )
+        heavy_index = max(
+            range(num_ctas), key=lambda index: (bins[index][0], -bins[index][1])
+        )
+        light_load, light_cta, light_tasks = bins[light_index]
+        heavy_load, heavy_cta, heavy_tasks = bins[heavy_index]
+        pair_tasks = light_tasks + heavy_tasks
+        pair_load = light_load + heavy_load
+        reachable = {0: 0}
+        for task_index, (_task, chunks) in enumerate(pair_tasks):
+            for load, mask in list(reachable.items()):
+                reachable.setdefault(load + chunks, mask | (1 << task_index))
+        split_load = min(
+            reachable,
+            key=lambda load: (
+                max(load, pair_load - load),
+                abs(pair_load - 2 * load),
+            ),
+        )
+        if max(split_load, pair_load - split_load) >= heavy_load:
+            break
+        split_mask = reachable[split_load]
+        light_tasks = [
+            task for index, task in enumerate(pair_tasks) if split_mask & (1 << index)
+        ]
+        heavy_tasks = [
+            task
+            for index, task in enumerate(pair_tasks)
+            if not split_mask & (1 << index)
+        ]
+        bins[light_index] = (split_load, light_cta, light_tasks)
+        bins[heavy_index] = (pair_load - split_load, heavy_cta, heavy_tasks)
+
+    # A bounded three-bin exchange handles the remaining benchmark-scale
+    # residue without making planning cost grow without limit.
+    while num_ctas >= 3:
+        ordered_bins = sorted(
+            range(num_ctas), key=lambda index: (bins[index][0], bins[index][1])
+        )
+        light_index = ordered_bins[0]
+        heavy_index = ordered_bins[-1]
+        average_load = sum(load for load, _cta, _tasks in bins) / num_ctas
+        middle_index = min(
+            ordered_bins[1:-1],
+            key=lambda index: (
+                abs(bins[index][0] - average_load),
+                -max(chunks for _task, chunks in bins[index][2]),
+                bins[index][1],
+            ),
+        )
+        selected_indices = (light_index, middle_index, heavy_index)
+        selected_tasks = [task for index in selected_indices for task in bins[index][2]]
+        selected_load = sum(chunks for _task, chunks in selected_tasks)
+        heavy_load = bins[heavy_index][0]
+        if selected_load > 1024:
+            break
+        reachable_pairs = {(0, 0): 0}
+        processed_load = 0
+        for task_index, (_task, chunks) in enumerate(selected_tasks):
+            next_pairs = dict(reachable_pairs)
+            for (first_load, second_load), assignment in reachable_pairs.items():
+                third_load = processed_load - first_load - second_load
+                if first_load + chunks < heavy_load:
+                    next_pairs.setdefault(
+                        (first_load + chunks, second_load),
+                        assignment | (1 << (2 * task_index)),
+                    )
+                if second_load + chunks < heavy_load:
+                    next_pairs.setdefault(
+                        (first_load, second_load + chunks),
+                        assignment | (2 << (2 * task_index)),
+                    )
+                if third_load + chunks >= heavy_load:
+                    next_pairs.pop((first_load, second_load), None)
+            reachable_pairs = next_pairs
+            processed_load += chunks
+        if not reachable_pairs:
+            break
+        (first_load, second_load), assignment = min(
+            reachable_pairs.items(),
+            key=lambda item: max(item[0][0], item[0][1], selected_load - sum(item[0])),
+        )
+        split_loads = (
+            first_load,
+            second_load,
+            selected_load - first_load - second_load,
+        )
+        if max(split_loads) >= heavy_load:
+            break
+        split_tasks: list[list[tuple[int, int]]] = [[], [], []]
+        for task_index, task in enumerate(selected_tasks):
+            encoded_group = (assignment >> (2 * task_index)) & 3
+            group = 0 if encoded_group == 1 else 1 if encoded_group == 2 else 2
+            split_tasks[group].append(task)
+        for index, load, tasks in zip(
+            selected_indices, split_loads, split_tasks, strict=True
+        ):
+            _old_load, cta, _old_tasks = bins[index]
+            bins[index] = (load, cta, tasks)
+
+    bins.sort(key=lambda item: item[1])
+    counts = tuple(load for load, _cta, _tasks in bins)
+    stride = max(counts)
+    schedule = [0] * (num_ctas * stride)
+    for _load, cta, tasks in bins:
+        slot = 0
+        for task, chunks in tasks:
+            for local_chunk in range(chunks):
+                schedule[cta * stride + slot] = (
+                    task | (local_chunk << 10) | (chunks << 18)
+                )
+                slot += 1
+    return tuple(schedule), counts, stride
+
+
+def _select_cake_kda_prefill_shared_route(
+    *,
+    requested: bool,
+    export_available: bool,
+    target: Optional["CakeKDAPrefillSharedTarget"],
+    sm_count: int,
+    fixed_layout: bool,
+    sequence_lengths: tuple[int, ...],
+    num_heads: int,
+    head_dim: int,
+    qkv_shapes_equal: bool,
+    qkv_dtype: torch.dtype,
+    beta_contiguous: bool,
+    beta_dtype: torch.dtype,
+    initial_state_shape: Optional[tuple[int, ...]],
+    initial_state_dtype: Optional[torch.dtype],
+    initial_state_contiguous: bool,
+    has_explicit_seq_order: bool,
+    has_state_indices: bool,
+    has_checkpoints: bool,
+    scale: float,
+    lower_bound: Optional[float],
+) -> Optional[_CakeKDAPrefillSharedRoute]:
+    """Select only semantics represented by the sealed shared export."""
+
+    num_sequences = len(sequence_lengths)
+    expected_state_shape = (
+        num_sequences,
+        num_heads,
+        _FLASH_KDA_HEAD_DIM,
+        _FLASH_KDA_HEAD_DIM,
+    )
+    if (
+        not requested
+        or not export_available
+        or target is None
+        or sm_count <= 0
+        or num_sequences <= 0
+        or any(length <= 0 for length in sequence_lengths)
+        or num_heads not in _CAKE_KDA_SHARED_SUPPORTED_HEADS
+        or head_dim != _FLASH_KDA_HEAD_DIM
+        or not qkv_shapes_equal
+        or qkv_dtype != torch.bfloat16
+        or not beta_contiguous
+        or beta_dtype != torch.bfloat16
+        or initial_state_shape != expected_state_shape
+        or initial_state_dtype != torch.bfloat16
+        or not initial_state_contiguous
+        or has_explicit_seq_order
+        or has_state_indices
+        or has_checkpoints
+        or lower_bound != -5.0
+        or not math.isclose(
+            scale,
+            1.0 / math.sqrt(_FLASH_KDA_HEAD_DIM),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+    ):
+        return None
+
+    sequence_order = tuple(
+        sorted(
+            range(num_sequences),
+            key=lambda index: sequence_lengths[index],
+            reverse=True,
+        )
+    )
+    uniform_sequences = len(set(sequence_lengths)) == 1
+    full_chunks = all(
+        length % _FLASH_KDA_M128_CHUNK == 0 for length in sequence_lengths
+    )
+
+    if fixed_layout and num_sequences == 1 and num_heads == 64:
+        return _CakeKDAPrefillSharedRoute(
+            target=target,
+            policy="direct_m64_independent_value_split",
+            sequence_order=sequence_order,
+            grid_x=2 * num_heads,
+        )
+
+    if fixed_layout or uniform_sequences:
+        persistent_tasks = 1
+        persistent_stride = num_sequences * num_heads
+        if (
+            full_chunks
+            and num_sequences == 8
+            and sequence_lengths[0] == 1024
+            and num_heads in (64, 96)
+        ):
+            persistent_stride = 128
+            persistent_tasks = (num_sequences * num_heads) // persistent_stride
+        if persistent_tasks == 6:
+            policy = "persistent_vtile_m128_h96_six_task"
+        elif persistent_tasks == 4:
+            policy = "persistent_vtile_m128_h64"
+        elif num_heads == 64:
+            policy = "direct_vtile_m128_h64_gate_order"
+        else:
+            policy = "direct_vtile_m128_generic"
+        return _CakeKDAPrefillSharedRoute(
+            target=target,
+            policy=policy,
+            sequence_order=sequence_order,
+            grid_x=persistent_stride,
+            uniform_sequence_length=sequence_lengths[0],
+            persistent_tasks=persistent_tasks,
+            persistent_stride=persistent_stride,
+        )
+
+    persistent_ctas = min(_CAKE_KDA_SHARED_PERSISTENT_MAX_CTAS, sm_count)
+    use_persistent_scalar = (
+        num_heads in (64, 96)
+        and num_sequences * num_heads >= 2 * persistent_ctas
+        and num_sequences * num_heads < 1024
+        and max(
+            (length + _FLASH_KDA_M128_CHUNK - 1) // _FLASH_KDA_M128_CHUNK
+            for length in sequence_lengths
+        )
+        < 256
+    )
+    if use_persistent_scalar:
+        # The exported closure contains the measured H64 persistent policy.
+        # Other persistent-policy combinations fail closed to the incumbent.
+        if num_heads != 64:
+            return None
+        schedule, counts, stride = _build_cake_kda_shared_scalar_schedule(
+            sequence_lengths, num_heads, persistent_ctas
+        )
+        return _CakeKDAPrefillSharedRoute(
+            target=target,
+            policy="persistent_m128_h64_lpt",
+            sequence_order=sequence_order,
+            grid_x=persistent_ctas,
+            tile_schedule=schedule,
+            tile_schedule_counts=counts,
+            schedule_stride=stride,
+        )
+
+    if num_heads == 64:
+        return None
+    return _CakeKDAPrefillSharedRoute(
+        target=target,
+        policy=(
+            "direct_m128_h96_commit_order" if num_heads == 96 else "direct_m128_generic"
+        ),
+        sequence_order=sequence_order,
+        grid_x=num_sequences * num_heads,
+    )
 
 
 @functools.cache
@@ -1921,6 +2243,18 @@ def _dummy_i32(device: torch.device) -> torch.Tensor:
     )
 
 
+def _dummy_f32(device: torch.device) -> torch.Tensor:
+    key = ("dummy_f32", *_stream_cache_key(device))
+    return _cached_tensor(
+        key,
+        lambda: torch.empty(1, dtype=torch.float32, device=device),
+        capture_error=(
+            "recurrent_kda prefill dummy float32 state is not warmed for "
+            "CUDA graph capture; invoke the same device once before capture"
+        ),
+    )
+
+
 def _dummy_i64(device: torch.device) -> torch.Tensor:
     key = ("dummy_i64", *_stream_cache_key(device))
     return _cached_tensor(
@@ -2793,6 +3127,130 @@ def _get_cake_kda_prefill_module(variant: "CakeKDAVariant", target: "CakeKDATarg
     return get_cake_kda_prefill_module(variant, target)
 
 
+def _run_cake_kda_prefill_shared(
+    *,
+    route: _CakeKDAPrefillSharedRoute,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+    lower_bound: float,
+) -> None:
+    """Launch one manifest-verified shared policy through its exported ABI."""
+
+    from .jit.cake_kda_prefill_shared import get_cake_kda_prefill_shared_module
+
+    total_tokens = q.shape[0] * q.shape[1]
+    num_heads = q.shape[2]
+    q_flat = q.reshape(total_tokens, num_heads, _FLASH_KDA_HEAD_DIM)
+    k_flat = k.reshape(total_tokens, num_heads, _FLASH_KDA_HEAD_DIM)
+    v_flat = v.reshape(total_tokens, num_heads, _FLASH_KDA_HEAD_DIM)
+    g_flat = g.reshape(total_tokens, num_heads, _FLASH_KDA_HEAD_DIM)
+    out_flat = out.reshape(total_tokens, num_heads, _FLASH_KDA_HEAD_DIM)
+    beta_flat = beta.reshape(total_tokens, num_heads)
+    beta_tma = _beta_tma_source(beta, workspace, chunk_tokens=32)
+    if beta_tma.data_ptr() != beta_flat.data_ptr():
+        beta_tma[:total_tokens, :num_heads].copy_(beta_flat)
+
+    sequence_order = _cached_int32_metadata(
+        device=q.device,
+        kind=f"cake_shared_{route.policy}_sequence_order",
+        values=route.sequence_order,
+    )
+    dummy_i32 = _dummy_i32(q.device)
+    dummy_f32 = _dummy_f32(q.device)
+    state_slot_stride = num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
+    module = get_cake_kda_prefill_shared_module(route.target, route.policy)
+    common_prefix = (
+        q_flat,
+        q_flat,
+        k_flat,
+        k_flat,
+        v_flat,
+        v_flat,
+        g_flat,
+        g_flat,
+        beta_flat,
+        beta_tma,
+        A_log,
+        dt_bias,
+        cu_seqlens,
+        sequence_order,
+    )
+    common_state = (
+        initial_state,
+        out_flat,
+        out_flat,
+        initial_state,
+        dummy_i32.data_ptr(),
+        state_slot_stride,
+        0,
+        dummy_f32,
+        dummy_f32,
+    )
+    common_tail = (
+        num_heads,
+        1,
+        1,
+        scale,
+        lower_bound,
+        route.grid_x,
+        1,
+        1,
+    )
+    if route.policy in (
+        "direct_m128_generic",
+        "direct_m128_h96_commit_order",
+        "persistent_m128_h64_lpt",
+    ):
+        tile_schedule = (
+            _cached_int32_metadata(
+                device=q.device,
+                kind="cake_shared_scalar_tile_schedule",
+                values=route.tile_schedule,
+            )
+            if route.tile_schedule
+            else dummy_i32
+        )
+        tile_schedule_counts = (
+            _cached_int32_metadata(
+                device=q.device,
+                kind="cake_shared_scalar_tile_schedule_counts",
+                values=route.tile_schedule_counts,
+            )
+            if route.tile_schedule_counts
+            else dummy_i32
+        )
+        module.run(
+            *common_prefix,
+            tile_schedule,
+            tile_schedule_counts,
+            route.schedule_stride,
+            *common_state,
+            *common_tail,
+        )
+        return
+    if route.policy == "direct_m64_independent_value_split":
+        module.run(*common_prefix, *common_state, *common_tail)
+        return
+    module.run(
+        *common_prefix,
+        *common_state,
+        route.uniform_sequence_length,
+        route.persistent_tasks,
+        route.persistent_stride,
+        *common_tail,
+    )
+
+
 def _run_flash_kda_prefill(
     *,
     q: torch.Tensor,
@@ -2814,6 +3272,7 @@ def _run_flash_kda_prefill(
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
+    use_cake_shared: bool = False,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -2916,6 +3375,100 @@ def _run_flash_kda_prefill(
             sm_count=sm_count,
         )
     max_sequence_length = max(sequence_lengths)
+    scale_value = (
+        1.0 / math.sqrt(_FLASH_KDA_HEAD_DIM) if scale is None else float(scale)
+    )
+    if not math.isfinite(scale_value):
+        raise ValueError(f"scale must be finite, got {scale_value}")
+    shared_target: Optional[CakeKDAPrefillSharedTarget] = None
+    shared_export_available = False
+    if use_cake_shared:
+        shared_export_available = _cake_kda_prefill_shared_export_is_available()
+        if compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES:
+            shared_target = _select_cake_kda_prefill_target(q.device)
+    shared_route = _select_cake_kda_prefill_shared_route(
+        requested=use_cake_shared,
+        export_available=shared_export_available,
+        target=shared_target,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        sequence_lengths=sequence_lengths,
+        num_heads=num_heads,
+        head_dim=q.shape[-1],
+        qkv_shapes_equal=q.shape == k.shape == v.shape == g.shape,
+        qkv_dtype=q.dtype,
+        beta_contiguous=beta.is_contiguous(),
+        beta_dtype=beta.dtype,
+        initial_state_shape=(
+            tuple(initial_state.shape) if initial_state is not None else None
+        ),
+        initial_state_dtype=(
+            initial_state.dtype if initial_state is not None else None
+        ),
+        initial_state_contiguous=(
+            initial_state is not None and initial_state.is_contiguous()
+        ),
+        has_explicit_seq_order=seq_order is not None,
+        has_state_indices=state_indices is not None,
+        has_checkpoints=(
+            checkpoint_every_n_tokens != 0
+            or state_checkpoints is not None
+            or checkpoint_cu_starts is not None
+        ),
+        scale=scale_value,
+        lower_bound=lower_bound,
+    )
+    if shared_route is not None:
+        if output is None:
+            if capturing:
+                raise RuntimeError(
+                    "CUDA graph capture requires a preallocated output tensor for "
+                    "recurrent_kda prefill"
+                )
+            out_buf = torch.empty_like(q)
+        else:
+            out_buf = output
+        _check_output_does_not_overlap_inputs(
+            out_buf,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+        )
+        assert initial_state is not None
+        assert lower_bound is not None
+        stream_ptr = int(torch.cuda.current_stream(q.device).cuda_stream)
+        explicit_workspace = prefill_workspace is not None
+        workspace = metadata_workspace
+        with workspace._lock:
+            _bind_workspace(
+                workspace,
+                device=q.device,
+                stream_ptr=stream_ptr,
+                capturing=capturing,
+                explicit=explicit_workspace,
+            )
+            _run_cake_kda_prefill_shared(
+                route=shared_route,
+                workspace=workspace,
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                cu_seqlens=cu_seqlens_i64,
+                initial_state=initial_state,
+                out=out_buf,
+                scale=scale_value,
+                lower_bound=float(lower_bound),
+            )
+            if capturing and explicit_workspace:
+                workspace._captured = True
+        return (out_buf, initial_state if output_final_state else None)
     affine_plan = None
     if seq_order is None:
         affine_plan = _select_cake_kda_affine_plan(
@@ -3226,11 +3779,6 @@ def _run_flash_kda_prefill(
         else num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
     )
 
-    scale_value = (
-        1.0 / math.sqrt(_FLASH_KDA_HEAD_DIM) if scale is None else float(scale)
-    )
-    if not math.isfinite(scale_value):
-        raise ValueError(f"scale must be finite, got {scale_value}")
     stream_ptr = int(torch.cuda.current_stream(q.device).cuda_stream)
     explicit_workspace = prefill_workspace is not None
     workspace: _RecurrentKDAPrefillWorkspaceBase

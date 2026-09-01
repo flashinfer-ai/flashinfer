@@ -113,11 +113,12 @@ def get_cake_kda_prefill_shared_module_specs() -> tuple[
     build_contract = payload.get("build_contract")
     _require(isinstance(build_contract, dict), "build_contract must be an object")
     _require(
-        build_contract.get("translation_unit_model")
-        == "separate_device_and_binding",
+        build_contract.get("translation_unit_model") == "separate_device_and_binding",
         "device and binding translation units must compile separately",
     )
-    _require(build_contract.get("binary_payloads") is False, "binary payloads forbidden")
+    _require(
+        build_contract.get("binary_payloads") is False, "binary payloads forbidden"
+    )
     infrastructure = build_contract.get("target_infrastructure")
     _require(isinstance(infrastructure, dict), "target infrastructure missing")
     _require(
@@ -158,7 +159,9 @@ def get_cake_kda_prefill_shared_module_specs() -> tuple[
         file_sha256[raw_path] = digest
 
     modules = payload.get("modules")
-    _require(isinstance(modules, list) and len(modules) == 16, "module inventory mismatch")
+    _require(
+        isinstance(modules, list) and len(modules) == 16, "module inventory mismatch"
+    )
     expected = {
         (arch, policy)
         for arch in _TARGET_ARCH.values()
@@ -181,7 +184,9 @@ def get_cake_kda_prefill_shared_module_specs() -> tuple[
         observed.add(key)
 
         translation_units = item.get("translation_units")
-        _require(isinstance(translation_units, dict), f"{label}.translation_units missing")
+        _require(
+            isinstance(translation_units, dict), f"{label}.translation_units missing"
+        )
         _require(
             translation_units.get("compile_separately") is True,
             f"{label} must compile translation units separately",
@@ -190,8 +195,12 @@ def get_cake_kda_prefill_shared_module_specs() -> tuple[
         binding_raw = translation_units.get("binding")
         device_path = _resolve_source(csrc_dir, device_raw, f"{label}.device")
         binding_path = _resolve_source(csrc_dir, binding_raw, f"{label}.binding")
-        _require(device_raw in file_sha256, f"{label}.device absent from file inventory")
-        _require(binding_raw in file_sha256, f"{label}.binding absent from file inventory")
+        _require(
+            device_raw in file_sha256, f"{label}.device absent from file inventory"
+        )
+        _require(
+            binding_raw in file_sha256, f"{label}.binding absent from file inventory"
+        )
 
         closure = item.get("closure")
         _require(isinstance(closure, list) and len(closure) == 2, f"{label}.closure")
@@ -220,7 +229,8 @@ def get_cake_kda_prefill_shared_module_specs() -> tuple[
             f"{label}.name invalid",
         )
         _require(
-            isinstance(module_ident, str) and module_ident.startswith("cake_kda_prefill_"),
+            isinstance(module_ident, str)
+            and module_ident.startswith("cake_kda_prefill_"),
             f"{label}.module_ident invalid",
         )
         _require(
@@ -258,6 +268,14 @@ def get_cake_kda_prefill_shared_module_spec(
         if spec.target == target and spec.policy == policy:
             return spec
     raise ValueError(f"unsupported Cake KDA prefill module: {target}/{policy}")
+
+
+def cake_kda_prefill_shared_is_available() -> bool:
+    """Return whether the complete shared source-only export is installed."""
+
+    return len(get_cake_kda_prefill_shared_module_specs()) == (
+        len(_TARGET_ARCH) * len(_EXPECTED_POLICIES)
+    )
 
 
 @functools.cache
@@ -299,6 +317,7 @@ __all__ = [
     "CakeKDAPrefillSharedModuleSpec",
     "CakeKDAPrefillSharedPolicy",
     "CakeKDAPrefillSharedTarget",
+    "cake_kda_prefill_shared_is_available",
     "gen_cake_kda_prefill_shared_module",
     "get_cake_kda_prefill_shared_module",
     "get_cake_kda_prefill_shared_module_spec",

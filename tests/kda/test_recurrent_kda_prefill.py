@@ -171,6 +171,116 @@ def test_cake_kda_affine_selector_rejects_out_of_contract_calls(override, value)
     assert kda_prefill_api._select_cake_kda_affine_plan(**kwargs) is None
 
 
+def _valid_cake_kda_shared_selector_kwargs(
+    *,
+    sequence_lengths=(8192,),
+    num_heads=96,
+    fixed_layout=True,
+):
+    return {
+        "requested": True,
+        "export_available": True,
+        "target": "sm100a",
+        "sm_count": 152,
+        "fixed_layout": fixed_layout,
+        "sequence_lengths": tuple(sequence_lengths),
+        "num_heads": num_heads,
+        "head_dim": 128,
+        "qkv_shapes_equal": True,
+        "qkv_dtype": torch.bfloat16,
+        "beta_contiguous": True,
+        "beta_dtype": torch.bfloat16,
+        "initial_state_shape": (len(sequence_lengths), num_heads, 128, 128),
+        "initial_state_dtype": torch.bfloat16,
+        "initial_state_contiguous": True,
+        "has_explicit_seq_order": False,
+        "has_state_indices": False,
+        "has_checkpoints": False,
+        "scale": 1.0 / math.sqrt(128),
+        "lower_bound": -5.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("sequence_lengths", "num_heads", "fixed_layout", "expected_policy", "grid_x"),
+    (
+        ((8192,), 96, True, "direct_vtile_m128_generic", 96),
+        ((8192,), 64, True, "direct_m64_independent_value_split", 128),
+        ((1024,) * 8, 96, False, "persistent_vtile_m128_h96_six_task", 128),
+        ((1024,) * 8, 64, False, "persistent_vtile_m128_h64", 128),
+        ((1024,) * 8, 32, False, "direct_vtile_m128_generic", 256),
+        ((1024,) * 2, 64, True, "direct_vtile_m128_h64_gate_order", 128),
+        (
+            (4096, 3072, 2048, 1536, 1024, 512),
+            64,
+            False,
+            "persistent_m128_h64_lpt",
+            152,
+        ),
+        (
+            (8192, 4096, 2048, 1024, 512, 256),
+            96,
+            False,
+            "direct_m128_h96_commit_order",
+            576,
+        ),
+        ((15, 14, 13, 12), 4, False, "direct_m128_generic", 16),
+    ),
+)
+def test_cake_kda_shared_selector_reuses_eight_physical_policies(
+    sequence_lengths, num_heads, fixed_layout, expected_policy, grid_x
+):
+    kwargs = _valid_cake_kda_shared_selector_kwargs(
+        sequence_lengths=sequence_lengths,
+        num_heads=num_heads,
+        fixed_layout=fixed_layout,
+    )
+    route = kda_prefill_api._select_cake_kda_prefill_shared_route(**kwargs)
+    assert route is not None
+    assert route.policy == expected_policy
+    assert route.grid_x == grid_x
+    assert sorted(route.sequence_order) == list(range(len(sequence_lengths)))
+    if expected_policy == "persistent_m128_h64_lpt":
+        expected_chunks = sum((length + 31) // 32 for length in sequence_lengths) * 64
+        assert len(route.tile_schedule_counts) == grid_x
+        assert sum(route.tile_schedule_counts) == expected_chunks
+        assert len(route.tile_schedule) == grid_x * route.schedule_stride
+    else:
+        assert route.tile_schedule == ()
+        assert route.tile_schedule_counts == ()
+
+
+@pytest.mark.parametrize(
+    ("override", "value"),
+    (
+        ("requested", False),
+        ("export_available", False),
+        ("target", None),
+        ("sm_count", 0),
+        ("sequence_lengths", ()),
+        ("sequence_lengths", (0,)),
+        ("num_heads", 12),
+        ("head_dim", 64),
+        ("qkv_shapes_equal", False),
+        ("qkv_dtype", torch.float16),
+        ("beta_contiguous", False),
+        ("beta_dtype", torch.float32),
+        ("initial_state_shape", None),
+        ("initial_state_dtype", torch.float32),
+        ("initial_state_contiguous", False),
+        ("has_explicit_seq_order", True),
+        ("has_state_indices", True),
+        ("has_checkpoints", True),
+        ("scale", 1.0),
+        ("lower_bound", -4.0),
+    ),
+)
+def test_cake_kda_shared_selector_rejects_out_of_contract_calls(override, value):
+    kwargs = _valid_cake_kda_shared_selector_kwargs()
+    kwargs[override] = value
+    assert kda_prefill_api._select_cake_kda_prefill_shared_route(**kwargs) is None
+
+
 def test_cake_kda_affine_workspace_buffer_is_grow_only(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     workspace = SimpleNamespace(_cake_kda_affine_buffers={})
@@ -345,6 +455,7 @@ def test_public_prefill_forwards_sequence_order_to_cute_dsl(monkeypatch):
 
 def test_public_prefill_auto_falls_back_to_cake(monkeypatch):
     sentinel = (object(), object())
+    calls = []
     monkeypatch.setattr(
         kda_prefill_cute_api,
         "_is_cute_dsl_kda_prefill_eligible",
@@ -358,16 +469,18 @@ def test_public_prefill_auto_falls_back_to_cake(monkeypatch):
     monkeypatch.setattr(
         kda_prefill_api,
         "_run_flash_kda_prefill",
-        lambda **kwargs: sentinel,
+        lambda **kwargs: calls.append(kwargs) or sentinel,
     )
 
     assert recurrent_kda(**_cpu_route_tensors()) is sentinel
+    assert calls[0]["use_cake_shared"] is False
 
 
 def test_public_prefill_explicit_cake_skips_cute_dsl_probe_with_checkpoints(
     monkeypatch,
 ):
     sentinel = (object(), object(), object())
+    calls = []
     monkeypatch.setattr(
         kda_prefill_cute_api,
         "_is_cute_dsl_kda_prefill_eligible",
@@ -381,7 +494,7 @@ def test_public_prefill_explicit_cake_skips_cute_dsl_probe_with_checkpoints(
     monkeypatch.setattr(
         kda_prefill_api,
         "_run_flash_kda_prefill",
-        lambda **kwargs: sentinel,
+        lambda **kwargs: calls.append(kwargs) or sentinel,
     )
 
     checkpoint_state = torch.empty((1, 1, 128, 128), dtype=torch.bfloat16)
@@ -396,6 +509,7 @@ def test_public_prefill_explicit_cake_skips_cute_dsl_probe_with_checkpoints(
         )
         is sentinel
     )
+    assert calls[0]["use_cake_shared"] is True
 
 
 def test_public_prefill_auto_routes_supported_checkpoints_to_cute_dsl(monkeypatch):
