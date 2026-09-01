@@ -2352,6 +2352,63 @@ def _pcie_dtype_body(rank, world_size, group, dtype_name):
     return ("ok", dtype_name)
 
 
+def _pcie_p2p_fail_stop_body(rank, world_size, group, bad_kind):
+    """A validation failure on the all-P2P route must fail stop, group-wide.
+
+    The p2p barrier has no abort protocol, so a rank that fails before or
+    during enqueue poisons teardown rather than risking a peer spinning
+    forever. Every rank feeds the same bad operand, so no rank enqueues and
+    process exit stays safe: the operand is rejected in Python, the
+    communicator goes BROKEN, later collectives are refused, and close()
+    demands process termination.
+    """
+    device = torch.device("cuda", rank)
+    missing = missing_ulysses_pcie_dependencies()
+    if missing:
+        raise UlyssesBackendError(
+            f"PCIe transport needs {', '.join(missing)}, missing on this machine"
+        )
+    os.environ["FLASHINFER_ULYSSES_PCIE_ROUTE"] = "p2p"
+    torch.manual_seed(4500 + rank)
+    good = torch.randn((1, 8, world_size * 2, 16), dtype=torch.bfloat16, device=device)
+    comm = UlyssesCommunicator(
+        max_elems=good.numel(), dtype=torch.bfloat16, backend="pcie", device=device
+    )
+    assert comm.transport == "p2p"
+    out = comm.allocate_output(good, "scatter_heads")
+    comm.scatter_heads(good, out=out)
+    torch.cuda.synchronize(device)
+
+    if bad_kind == "noncontiguous":
+        bad = good.transpose(1, 2)
+        expected = "contiguous"
+    else:
+        # Fewer rows than `good` so the capacity check cannot fire first.
+        bad = torch.randn(
+            (1, 4, world_size * 2 + 1, 16), dtype=torch.bfloat16, device=device
+        )
+        expected = "divisible"
+    try:
+        comm.scatter_heads(bad, out=out)
+        raise AssertionError(f"pcie scatter_heads must reject a {bad_kind} operand")
+    except RuntimeError as e:
+        assert "BROKEN" in str(e) and expected in str(e), e
+
+    try:
+        comm.scatter_heads(good, out=out)
+        raise AssertionError("a BROKEN communicator must refuse further collectives")
+    except RuntimeError as e:
+        assert "BROKEN" in str(e), e
+
+    try:
+        comm.close()
+        raise AssertionError("close() after a p2p Python-side failure must refuse")
+    except RuntimeError as e:
+        assert "process termination required" in str(e), e
+    # By design nothing is released here; spawn process exit reclaims the GPU.
+    return ("ok", bad_kind)
+
+
 def _pcie_input_landing_body(rank, world_size, group, _arg):
     """Producing the operand in the landing buffer must change nothing but the copy.
 
@@ -2368,6 +2425,10 @@ def _pcie_input_landing_body(rank, world_size, group, _arg):
         raise UlyssesBackendError(
             f"PCIe transport needs {', '.join(missing)}, missing on this machine"
         )
+    # Force the all-RDMA route: auto never selects it below
+    # PCIE_AUTO_RDMA_WORLD_SIZES, so the two-rank case would otherwise plan
+    # p2p and skip forever on any machine.
+    os.environ["FLASHINFER_ULYSSES_PCIE_ROUTE"] = "rdma"
     torch.manual_seed(4000 + rank)
     shape = (1, 16, world_size * 2, 16)
     x = torch.randn(shape, dtype=torch.bfloat16, device=device)
@@ -2419,6 +2480,14 @@ def test_correctness_forced_pcie_input_landing(world_size):
     )
 
 
+@pytest.mark.parametrize("bad_kind", ["noncontiguous", "indivisible_heads"])
+def test_pcie_p2p_validation_fail_stop_two_ranks(bad_kind):
+    """The shared validators reject bad operands on the pcie path too, and the
+    rejection lands as the all-P2P fail-stop contract (BROKEN, close refused),
+    not as a recoverable error."""
+    _run_multi_rank("_pcie_p2p_fail_stop_body", 2, bad_kind, allow_skip=True)
+
+
 def _pcie_mixed_dtype_body(rank, world_size, group, _arg):
     """One communicator, two element types, both registrations live at once.
 
@@ -2441,9 +2510,7 @@ def _pcie_mixed_dtype_body(rank, world_size, group, _arg):
     torch.manual_seed(3000 + rank)
     heads = world_size * 2
     wide = torch.randn((1, 16, heads, 16), dtype=torch.bfloat16, device=device)
-    packed = torch.randint(
-        0, 256, (1, 16, heads, 25), dtype=torch.uint8, device=device
-    )
+    packed = torch.randint(0, 256, (1, 16, heads, 25), dtype=torch.uint8, device=device)
     with UlyssesCommunicator(
         max_elems=wide.numel(), dtype=torch.bfloat16, backend="pcie", device=device
     ) as comm:

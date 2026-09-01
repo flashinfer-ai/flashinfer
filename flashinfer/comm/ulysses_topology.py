@@ -123,12 +123,12 @@ class UlyssesBackendDecision:
     pcie_plan: Optional[UlyssesPciePlan] = None
 
 
-def _canonical_pci_path(pci_bus_id: str) -> Path:
+def _canonical_pci_path(pci_bus_id: str, *, sysfs_root: Path = Path("/sys")) -> Path:
     bus_id = pci_bus_id.lower()
     parts = bus_id.split(":")
     if len(parts) == 3 and len(parts[0]) > 4:
         bus_id = f"{parts[0][-4:]}:{parts[1]}:{parts[2]}"
-    return (Path("/sys/bus/pci/devices") / bus_id).resolve(strict=True)
+    return (sysfs_root / "bus" / "pci" / "devices" / bus_id).resolve(strict=True)
 
 
 def _path_distance(left: Path, right: Path) -> int:
@@ -209,8 +209,10 @@ def _probe_rocev2_ipv4_gid(
     return candidates[0]
 
 
-def _probe_pcie_route(pci_bus_id: str, rank: int) -> Tuple[int, str]:
-    gpu_path = _canonical_pci_path(pci_bus_id)
+def _probe_pcie_route(
+    pci_bus_id: str, rank: int, *, sysfs_root: Path = Path("/sys")
+) -> Tuple[int, str]:
+    gpu_path = _canonical_pci_path(pci_bus_id, sysfs_root=sysfs_root)
     numa_node = int((gpu_path / "numa_node").read_text().strip())
     if numa_node < 0:
         raise RuntimeError(f"NUMA node is unknown for GPU {pci_bus_id}")
@@ -229,12 +231,12 @@ def _probe_pcie_route(pci_bus_id: str, rank: int) -> Tuple[int, str]:
                 f"this is rank {rank}"
             )
         selected = names[rank]
-        if not (Path("/sys/class/infiniband") / selected / "device").exists():
+        if not (sysfs_root / "class" / "infiniband" / selected / "device").exists():
             raise RuntimeError(f"configured RDMA device {selected!r} does not exist")
         return numa_node, selected
 
     candidates = []
-    for entry in Path("/sys/class/infiniband").glob("mlx5_*"):
+    for entry in (sysfs_root / "class" / "infiniband").glob("mlx5_*"):
         try:
             nic_path = (entry / "device").resolve(strict=True)
         except OSError:
