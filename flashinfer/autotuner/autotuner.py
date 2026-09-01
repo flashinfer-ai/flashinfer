@@ -1741,6 +1741,39 @@ class AutoTuner:
                         tuning_config,
                         inputs=inputs,
                     )
+                    # A cache hit skips the tactic loop and its per-tactic
+                    # all-reduces, so if ranks disagree on the hit the next
+                    # reduce hangs. All-reduce the hit flag and raise on a
+                    # split instead of deadlocking.
+                    if _tune_process_group is not None:
+                        import torch.distributed as dist
+
+                        backend = str(dist.get_backend(_tune_process_group)).lower()
+                        device = "cuda" if backend == "nccl" else "cpu"
+                        world_size = dist.get_world_size(_tune_process_group)
+                        hit_tensor = torch.tensor(
+                            [1 if is_cache_hit else 0],
+                            dtype=torch.int64,
+                            device=device,
+                        )
+                        dist.all_reduce(
+                            hit_tensor,
+                            op=dist.ReduceOp.SUM,
+                            group=_tune_process_group,
+                        )
+                        hits = int(hit_tensor.item())
+                        if hits not in (0, world_size):
+                            raise ValueError(
+                                f"[AutoTuner]: distributed autotune cache "
+                                f"divergence for '{custom_op}': {hits} of "
+                                f"{world_size} ranks hit the profiling cache "
+                                f"for shapes {p.get_opt_shapes()} while the "
+                                f"rest missed. When a tune process group is "
+                                f"set, all ranks must share identical caches at "
+                                f"entry or the per-tactic all-reduce deadlocks. "
+                                f"Set the group from the first choose_one with "
+                                f"matching (ideally empty) caches on every rank."
+                            )
                     if not is_cache_hit:
                         # Active capture is safe for skipped operations and warm cache hits, but
                         # input synthesis or profiling would mutate the caller's outer graph.
