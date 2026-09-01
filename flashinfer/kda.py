@@ -137,8 +137,10 @@ def recurrent_kda(
         scale (Optional[float]):
             Scale factor for queries. If ``None``, defaults to ``1 / sqrt(K)``.
         initial_state (Optional[torch.Tensor]):
-            Initial state of shape ``[N, HV, V, K]``. Must be bfloat16.
-            If ``None``, zero-initialized. Updated in-place. For batched spec
+            Initial state of shape ``[N, HV, V, K]``. The ordinary path uses
+            bfloat16; explicit ``backend="cake"`` also accepts a float32
+            indexed state pool for the exported serving portfolio. If
+            ``None``, zero-initialized. Updated in-place. For batched spec
             decode without ``cu_seqlens``, ``N`` is the packed checkpoint-slot
             count ``B * (1 + num_spec_tokens)`` when ``ssm_state_indices`` is
             omitted. For eligible frozen prefill with ``ssm_state_indices``,

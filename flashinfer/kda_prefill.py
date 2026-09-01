@@ -87,6 +87,7 @@ _FLASH_KDA_ROUTE_BT16_M64 = "bt16_prepare_chain_m64"
 _CAKE_KDA_ROUTE_AFFINE_M128 = "cake_affine_split_m128"
 _CAKE_KDA_SHARED_SUPPORTED_HEADS = frozenset((1, 4, 8, 16, 32, 64, 96))
 _CAKE_KDA_SHARED_PERSISTENT_MAX_CTAS = 152
+_CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS = 128
 
 # Physical contract for the frozen persistent-M128 schedule. The generated
 # launch reserves an additional aligned control prefix; the roofline uses the
@@ -160,6 +161,19 @@ class _CakeKDABoundedEvolutionRoute:
     uniform_sequence_length: int = 0
     persistent_tasks: int = 1
     persistent_stride: int = 0
+    tile_schedule: tuple[int, ...] = ()
+    tile_schedule_counts: tuple[int, ...] = ()
+    schedule_stride: int = 1
+
+
+@dataclass(frozen=True)
+class _CakeKDAFP32ServingRoute:
+    target: "CakeKDATarget"
+    policy: str
+    grid_x: int
+    uniform_sequence_length: int = 0
+    persistent_tasks: int = 1
+    persistent_stride: int = 1
     tile_schedule: tuple[int, ...] = ()
     tile_schedule_counts: tuple[int, ...] = ()
     schedule_stride: int = 1
@@ -906,6 +920,93 @@ def _select_cake_kda_bounded_evolution_route(
         sequence_order=sequence_order,
         grid_x=num_sequences * num_heads,
     )
+
+
+def _select_cake_kda_fp32_serving_route(
+    *,
+    requested: bool,
+    target: Optional["CakeKDATarget"],
+    sm_count: int,
+    fixed_layout: bool,
+    sequence_lengths: tuple[int, ...],
+    num_heads: int,
+    initial_state_dtype: Optional[torch.dtype],
+    has_state_indices: bool,
+    has_checkpoints: bool,
+) -> Optional[_CakeKDAFP32ServingRoute]:
+    """Select current Cake FP32-state policies absent from the legacy facade."""
+
+    num_sequences = len(sequence_lengths)
+    if (
+        not requested
+        or target is None
+        or sm_count <= 0
+        or num_sequences <= 0
+        or any(length <= 0 for length in sequence_lengths)
+        or initial_state_dtype != torch.float32
+        or not has_state_indices
+        or has_checkpoints
+    ):
+        return None
+
+    uniform_sequences = len(set(sequence_lengths)) == 1
+    max_sequence_length = max(sequence_lengths)
+    total_tasks = num_sequences * num_heads
+    if (
+        target == "sm103a"
+        and fixed_layout
+        and uniform_sequences
+        and num_heads == 96
+        and total_tasks <= sm_count
+        and max_sequence_length >= 4096
+    ):
+        return _CakeKDAFP32ServingRoute(
+            target=target,
+            policy="source_vtile_m128_direct",
+            grid_x=total_tasks,
+            uniform_sequence_length=max_sequence_length,
+            persistent_tasks=1,
+            persistent_stride=total_tasks,
+        )
+
+    if (
+        target == "sm103a"
+        and not fixed_layout
+        and uniform_sequences
+        and num_heads == 96
+        and total_tasks == 6 * _CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS
+        and max_sequence_length >= 512
+    ):
+        return _CakeKDAFP32ServingRoute(
+            target=target,
+            policy="source_vtile_m128_persistent_six_task",
+            grid_x=_CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS,
+            uniform_sequence_length=max_sequence_length,
+            persistent_tasks=6,
+            persistent_stride=_CAKE_KDA_SOURCE_VTILE_PERSISTENT_WORKERS,
+        )
+
+    if (
+        not uniform_sequences
+        and num_heads == 96
+        and 2 * sm_count <= total_tasks < 1024
+        and (max_sequence_length + _FLASH_KDA_M128_CHUNK - 1) // _FLASH_KDA_M128_CHUNK
+        < 256
+    ):
+        schedule, counts, stride = _build_cake_kda_shared_scalar_schedule(
+            sequence_lengths,
+            num_heads,
+            sm_count,
+        )
+        return _CakeKDAFP32ServingRoute(
+            target=target,
+            policy="scalar_chunk_lpt_m128_h96",
+            grid_x=sm_count,
+            tile_schedule=schedule,
+            tile_schedule_counts=counts,
+            schedule_stride=stride,
+        )
+    return None
 
 
 @functools.cache
@@ -3398,6 +3499,104 @@ def _cake_kda_serving_policy(
     return policy
 
 
+def _run_cake_kda_fp32_source_route(
+    *,
+    route: _CakeKDAFP32ServingRoute,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta_source: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_order: torch.Tensor,
+    state_indices: torch.Tensor,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    final_state: torch.Tensor,
+    empty_bf16: torch.Tensor,
+    num_heads: int,
+    use_initial_state: bool,
+    store_final_state: bool,
+    state_slot_stride: int,
+    scale: float,
+    lower_bound: float,
+) -> None:
+    """Launch one current-source FP32 policy through its standard binding."""
+
+    module = _get_cake_kda_export_module(
+        route.target,
+        "bounded_fp32_serving",
+        route.policy,
+    )
+    common = (
+        q,
+        q,
+        k,
+        k,
+        v,
+        v,
+        g,
+        g,
+        beta_source,
+        beta_source,
+        A_log,
+        dt_bias,
+        cu_seqlens,
+        seq_order,
+    )
+    state = (
+        empty_bf16,
+        out,
+        out,
+        empty_bf16,
+        state_indices.data_ptr(),
+        state_slot_stride,
+        1,
+        initial_state,
+        final_state,
+    )
+    tail = (
+        num_heads,
+        int(use_initial_state),
+        int(store_final_state),
+        scale,
+        lower_bound,
+        route.grid_x,
+        1,
+        1,
+    )
+    if route.policy == "scalar_chunk_lpt_m128_h96":
+        tile_schedule = _cached_int32_metadata(
+            device=q.device,
+            kind="cake_fp32_scalar_tile_schedule",
+            values=route.tile_schedule,
+        )
+        tile_schedule_counts = _cached_int32_metadata(
+            device=q.device,
+            kind="cake_fp32_scalar_tile_schedule_counts",
+            values=route.tile_schedule_counts,
+        )
+        module.run(
+            *common,
+            tile_schedule,
+            tile_schedule_counts,
+            route.schedule_stride,
+            *state,
+            *tail,
+        )
+        return
+    module.run(
+        *common,
+        *state,
+        route.uniform_sequence_length,
+        route.persistent_tasks,
+        route.persistent_stride,
+        *tail,
+    )
+
+
 def _run_cake_kda_fp32_serving_export(
     *,
     target: "CakeKDATarget",
@@ -3948,6 +4147,23 @@ def _run_flash_kda_prefill(
             if capturing and explicit_workspace:
                 workspace._captured = True
         return (out_buf, initial_state if output_final_state else None)
+    fp32_serving_route = _select_cake_kda_fp32_serving_route(
+        requested=use_cake_export and lower_bound is not None,
+        target=shared_target,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        sequence_lengths=sequence_lengths,
+        num_heads=num_heads,
+        initial_state_dtype=(
+            initial_state.dtype if initial_state is not None else None
+        ),
+        has_state_indices=state_indices is not None,
+        has_checkpoints=(
+            checkpoint_every_n_tokens != 0
+            or state_checkpoints is not None
+            or checkpoint_cu_starts is not None
+        ),
+    )
     affine_route = None
     if seq_order is None:
         affine_route = _select_cake_kda_affine_route(
@@ -4321,6 +4537,40 @@ def _run_flash_kda_prefill(
                     else 32
                 ),
             )
+        if fp32_serving_route is not None:
+            assert state_indices is not None
+            assert initial_state_arg.dtype == torch.float32
+            cake_beta_source = _cake_kda_beta_source(
+                beta,
+                workspace,
+                chunk_tokens=32,
+            )
+            _run_cake_kda_fp32_source_route(
+                route=fp32_serving_route,
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta_source=cake_beta_source,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                cu_seqlens=cu_seqlens_i64,
+                seq_order=seq_order_i32,
+                state_indices=state_indices,
+                initial_state=initial_state_arg,
+                out=out_buf,
+                final_state=final_state_arg,
+                empty_bf16=dummy_state,
+                num_heads=num_heads,
+                use_initial_state=use_initial_state,
+                store_final_state=store_final_state,
+                state_slot_stride=state_slot_stride,
+                scale=scale_value,
+                lower_bound=float(lower_bound),
+            )
+            if capturing and explicit_workspace:
+                workspace._captured = True
+            return (out_buf, returned_state if output_final_state else None)
         packet_workspace = None
         packet_ready = None
         packet_consumed = None
