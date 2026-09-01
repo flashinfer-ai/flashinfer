@@ -20,7 +20,7 @@ Pre-compiled FMHA kernels loaded via ExternalBinaryModule.
 
 from flashinfer.cute_dsl.availability import (
     is_cute_dsl_available,
-    is_cute_dsl_experimental_available as is_sm120_dsl_available,
+    is_cute_dsl_experimental_available,
 )
 
 if is_cute_dsl_available():
@@ -32,13 +32,13 @@ if is_cute_dsl_available():
 
     __all__ = [
         "is_cute_dsl_available",
-        "is_sm120_dsl_available",
+        "is_cute_dsl_experimental_available",
         "get_cute_dsl_fmha_kernel",
         "cute_dsl_fmha_ragged_prefill",
         "cute_dsl_fmha_blockscaled_prefill",
     ]
 
-    if is_sm120_dsl_available():
+    if is_cute_dsl_experimental_available():
         from .sm120_fmha import (
             sm120_fmha_fp8_paged_prefill,
             sm120_fmha_fp8_ragged_prefill,
@@ -51,5 +51,5 @@ if is_cute_dsl_available():
 else:
     __all__ = [
         "is_cute_dsl_available",
-        "is_sm120_dsl_available",
+        "is_cute_dsl_experimental_available",
     ]

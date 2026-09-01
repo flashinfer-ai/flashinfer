@@ -14,10 +14,10 @@ import math
 import pytest
 import torch
 
-from flashinfer.cute_dsl.utils import is_sm120_dsl_available
+from flashinfer.cute_dsl.availability import is_cute_dsl_experimental_available
 from flashinfer.utils import get_compute_capability
 
-if not is_sm120_dsl_available():
+if not is_cute_dsl_experimental_available():
     pytest.skip("SM120 CuTe DSL dependencies are unavailable", allow_module_level=True)
 
 _device = torch.device("cuda") if torch.cuda.is_available() else None
