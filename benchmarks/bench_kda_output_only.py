@@ -1,7 +1,9 @@
 # Copyright (c) 2026 by FlashInfer team.
 """Benchmark the output-only KDA decode kernel vs the recurrent baseline.
 
-Compares at Kimi K3 per-GPU shapes (H = HV = 12, K = V = 128):
+Compares at Kimi K3 per-GPU shapes: H = HV = 12 heads (the 96 total KDA
+heads sharded at TP=8, the deployment configuration), K = V = 128.
+Override with --heads (e.g. 96 for TP=1):
 
   wy        - the WY-parallel tensor-core output-only kernel
   rec_oo    - the grouped register-recurrent output-only fork
