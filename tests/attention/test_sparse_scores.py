@@ -235,3 +235,37 @@ def test_scores_reject_a_logits_width_that_contradicts_num_columns():
             num_columns=8,
             logits=logits,
         )
+
+
+@requires_cuda_sm80
+def test_scores_leave_the_columns_past_a_row_alone():
+    """Only what a row can see is written.
+
+    The count says how far to read, so the columns past it have to keep
+    whatever the caller left there -- a top-k bounded by the count never looks
+    at them, and a caller reusing the buffer would otherwise read this row's
+    logits as the next row's.
+    """
+    q, k_cache, table, t2r, pos, lens = _scores_case(rows=8, pages=6, page_size=8)
+    divisor = q.shape[2] ** 0.5
+    columns = table.shape[1] * k_cache.shape[1]
+    # Row i sees i entries, so every row but the last has untouched columns.
+    pos = torch.arange(q.shape[0], dtype=pos.dtype, device=DEV)
+    sentinel = -12345.0
+    logits = torch.full(
+        (q.shape[0], columns), sentinel, dtype=torch.float32, device=DEV
+    )
+    got, got_visible = flashinfer.sparse_paged_scores(
+        q, k_cache, table, t2r, pos, lens, 1, divisor, logits=logits
+    )
+    want, want_visible = _reference(
+        q, k_cache, table, t2r, pos, lens, 1, divisor, columns
+    )
+    torch.testing.assert_close(got_visible, want_visible)
+    assert int(got_visible.min()) < columns, "a row must have untouched columns"
+    for row in range(q.shape[0]):
+        seen = int(got_visible[row])
+        assert (got[row, seen:] == sentinel).all(), f"row {row} wrote past its count"
+        torch.testing.assert_close(
+            got[row, :seen], want[row, :seen], rtol=2e-2, atol=2e-2
+        )
