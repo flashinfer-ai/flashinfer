@@ -860,7 +860,13 @@ def gen_all_modules(
         ]
         # The scorer multiplies with m16n8k16, so it is only built where that
         # exists; without it here an AOT-only install has no artifact to load.
-        if has_sm80:
+        # has_sm80 means "an 8.x target is in the build", which is narrower than
+        # what the kernel needs: every 9.x/10.x/12.x target has m16n8k16 too.
+        from .jit.core import current_compilation_context
+
+        if any(
+            major >= 8 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+        ):
             jit_specs.append(gen_sparse_scores_module())
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
         if has_sm100:
