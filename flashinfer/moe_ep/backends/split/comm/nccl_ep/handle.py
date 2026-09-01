@@ -184,6 +184,17 @@ class NcclEpHandle(Handle):
         )
         _t = _hp("hinit.create_handle_c", _t)
 
+        # InitHandle ran on self._stream. A caller that later drives this
+        # handle from another stream (the CUDA-graph recipe does exactly that:
+        # create outside, update inside a capture on the capture stream) needs
+        # an explicit dependency, or its first update races creation. Record
+        # here and consume it on the first cross-stream update.
+        import torch
+
+        self._init_event = torch.cuda.Event()
+        self._init_event.record(torch.cuda.ExternalStream(self._stream))
+        self._init_synced = False
+
     def _knob_stream(self) -> int:
         k = self._handle_knobs.get(HandleAlgoKnobUserStream)
         return int(k.stream) if k is not None else self._fleet.stream  # type: ignore[attr-defined]
@@ -249,9 +260,13 @@ class NcclEpHandle(Handle):
         inside it. Without it a handle is created and destroyed per forward,
         so a captured graph replays against freed device memory.
 
-        ``top_k`` is bound at handle creation (LL passes ``num_topk`` to
-        InitHandle), so only the token count may vary, and only downward --
-        the recv buffers were sized for the creating shape.
+        The routing SHAPE is fixed at creation: ``top_k`` because LL passes
+        ``num_topk`` to InitHandle, and the token count because the per-token
+        weights supplied via ``HandleAlgoKnobTopKWeights`` are bound then and
+        are not re-bindable here -- a shorter ``topk_ids`` would leave combine
+        reading weights for rows that no longer exist. Only the routing VALUES
+        may change. That is also all a CUDA graph can express, since it bakes
+        shapes at capture.
         """
         import torch
 
@@ -264,12 +279,42 @@ class NcclEpHandle(Handle):
                 f"top_k={self._top_k}, got {topk_idx.shape[1]}. Create a new "
                 "handle instead."
             )
-        if topk_idx.shape[0] > self._max_num_tokens_in:
+        if topk_idx.shape[0] != self._num_tokens_in:
             raise ValueError(
-                f"Handle.update: {topk_idx.shape[0]} tokens exceeds the "
-                f"{self._max_num_tokens_in} this handle's buffers were sized "
-                "for. Create the handle at the largest shape you will use."
+                f"Handle.update cannot change the token count: handle was "
+                f"created with {self._num_tokens_in} tokens, got "
+                f"{topk_idx.shape[0]}. The topk_weights bound at creation "
+                "(HandleAlgoKnobTopKWeights) still describe the original "
+                "rows, so a different count would desynchronize combine. "
+                "Create a new handle instead."
             )
+        if not topk_idx.is_cuda:
+            raise ValueError(
+                f"Handle.update: topk_ids must be on the GPU, got {topk_idx.device}."
+            )
+        if self._topk_idx.is_cuda and topk_idx.device != self._topk_idx.device:
+            raise ValueError(
+                f"Handle.update: topk_ids moved device, {self._topk_idx.device}"
+                f" -> {topk_idx.device}."
+            )
+        if not topk_idx.is_contiguous():
+            raise ValueError("Handle.update: topk_ids must be contiguous.")
+
+        # Order this stream after InitHandle the first time we run somewhere
+        # other than the creation stream (see _init_event).
+        op_stream = self._op_stream()
+        if not self._init_synced:
+            if op_stream != self._stream:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "Handle.update: first cross-stream update cannot be "
+                        "the captured one -- the dependency on InitHandle "
+                        "would not be recorded. Run one update outside the "
+                        "capture first (the standard warmup does this)."
+                    )
+                torch.cuda.current_stream().wait_event(self._init_event)
+            self._init_synced = True
+
         self._topk_idx = topk_idx
         self._num_tokens_in = topk_idx.shape[0]
         self._topk_idx_t = self._wrap(topk_idx)
@@ -279,11 +324,21 @@ class NcclEpHandle(Handle):
         self._handle.update(
             self._topk_idx_t,
             layout_info=self._create_layout_info,
-            stream=self._op_stream(),
+            stream=op_stream,
         )
 
     def dispatch(self, params: DispatchInputParams) -> DispatchOutput:
         x = params.x[0]
+        # The activation count must match the routing the handle currently
+        # holds. A mismatch passes the per-path capacity guards and reaches
+        # NCCL-EP, which indexes routing by row.
+        if x.shape[0] != self._num_tokens_in:
+            raise MoEEpConfigError(
+                f"dispatch received {x.shape[0]} activation rows but the "
+                f"handle's routing has {self._num_tokens_in}. Pass the same "
+                "token count as the topk_ids this handle was created with or "
+                "last updated to."
+            )
         if self._is_ht:
             return self._dispatch_ht(x)
         if self._is_rank_major:

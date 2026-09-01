@@ -111,12 +111,20 @@ class _Rig:
         )
         return self.handle
 
+    # Scale applied to the expert tensors between dispatch and combine. Any
+    # value but 1.0 works; the point is that the "compute" is NOT the identity,
+    # so a combine that failed to replay cannot be mistaken for a correct pass
+    # through. With weights summing to 1 the round trip returns GAIN * x.
+    GAIN = 2.0
+
     def step(self):
         """One update+dispatch+combine -- the sequence placed under capture.
 
-        Mirrors ``SplitLayer.forward`` with the identity kernel (expert tensors
-        passed through untouched), minus the per-forward create/destroy that
-        makes that path uncapturable.
+        Mirrors ``SplitLayer.forward``, minus the per-forward create/destroy
+        that makes that path uncapturable. The expert "compute" is a constant
+        scale rather than the identity: an identity round trip returns x, which
+        a stale output buffer could also do, so it cannot witness combine
+        actually re-running.
         """
         from flashinfer.moe_ep import (
             CombineInputParams,
@@ -132,6 +140,7 @@ class _Rig:
         self._sig = d.expert_counts
         if self._sig is None:
             self._sig = d.recv_topk_idx
+        d.expert_tensors.mul_(self.GAIN)
         c = self.handle.combine(CombineInputParams(x=[d.expert_tensors], out=self.out))
         self.handle.complete()
         return c.x
@@ -222,6 +231,16 @@ def test_round_trip_is_capturable_with_a_persistent_handle(algo_name):
     sig_new = rig.routing_signature()
     dist.barrier()
 
+    # (4) Rewrite the ACTIVATIONS in place and replay. The routing signature
+    # in (3) witnesses update+dispatch, but a combine that never replayed
+    # would leave the previous contents in the output buffer and still satisfy
+    # it. Only a replayed combine tracks a changed x.
+    rig.x.mul_(-3.0)
+    graph.replay()
+    torch.cuda.synchronize()
+    replay_newx = captured.clone()
+    dist.barrier()
+
     rig.destroy()
     dist.barrier()
 
@@ -232,11 +251,18 @@ def test_round_trip_is_capturable_with_a_persistent_handle(algo_name):
 
     if algorithm is EpAlgorithm.LOW_LATENCY:
         # LL writes every slot of its [local_expert, max_tokens, hidden] recv
-        # buffer, so an identity pass-through plus weights summing to 1 gives
-        # back x exactly -- under any routing, which is why (3) below has to
-        # interrogate the transport rather than the output.
-        torch.testing.assert_close(eager, rig.x, atol=5e-2, rtol=5e-2)
-        torch.testing.assert_close(replay_new, rig.x, atol=5e-2, rtol=5e-2)
+        # buffer, so the round trip is GAIN * x exactly (weights sum to 1),
+        # under any routing -- which is why (3) has to interrogate the
+        # transport rather than the output. rig.x was scaled by -3 in (4), so
+        # compare the pre-(4) results against the ORIGINAL activations.
+        x_before = rig.x / -3.0
+        torch.testing.assert_close(eager, x_before * _Rig.GAIN, atol=5e-2, rtol=5e-2)
+        torch.testing.assert_close(
+            replay_new, x_before * _Rig.GAIN, atol=5e-2, rtol=5e-2
+        )
+        # The activation change must show up: this is what proves combine
+        # replayed rather than the buffer merely holding a stale result.
+        torch.testing.assert_close(replay_newx, rig.x * _Rig.GAIN, atol=5e-2, rtol=5e-2)
     else:
         # HT sizes its recv buffer to the static max (max_tokens_per_rank *
         # world) and dispatch only writes the slots that actually received
@@ -246,6 +272,10 @@ def test_round_trip_is_capturable_with_a_persistent_handle(algo_name):
         # or trim to recv_total_counter. Capture correctness is still fully
         # covered: replay must match eager above, and routing must track below.
         assert torch.isfinite(replay_same.float()).all()
+        assert not torch.allclose(replay_newx, replay_new, atol=1e-3), (
+            "output did not change when the activations did -- combine was "
+            "not replayed inside the graph"
+        )
 
     assert sig_same is not None, (
         "transport reported no routing signature (expert_counts and "

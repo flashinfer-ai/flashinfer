@@ -356,10 +356,17 @@ def test_update_rejects_a_different_top_k(fake_nccl_ep, bypass_build_checks):
         )
 
 
-def test_update_rejects_growing_past_the_creating_token_count(
-    fake_nccl_ep, bypass_build_checks
+@pytest.mark.parametrize("tokens", [8, 32])
+def test_update_rejects_a_different_token_count(
+    fake_nccl_ep, bypass_build_checks, tokens
 ):
-    """Buffers were sized at creation; a larger step would overrun them."""
+    """Neither growing nor shrinking is allowed.
+
+    Growing would overrun buffers sized at creation. Shrinking is subtler and
+    was allowed at first: the per-token weights bound via
+    HandleAlgoKnobTopKWeights stay at the creating shape, so a shorter
+    topk_ids leaves combine reading weights for rows that no longer exist.
+    """
     import torch
 
     from flashinfer.moe_ep.config import HandleParams
@@ -368,12 +375,44 @@ def test_update_rejects_growing_past_the_creating_token_count(
         pytest.skip("needs CUDA")
 
     h = _make_handle(_make_fleet(fake_nccl_ep), num_tokens=16, top_k=2)
-    with pytest.raises(ValueError, match="exceeds"):
+    with pytest.raises(ValueError, match="cannot change the token count"):
         h.update(
-            HandleParams(topk_ids=torch.zeros(32, 2, dtype=torch.int64, device="cuda"))
+            HandleParams(
+                topk_ids=torch.zeros(tokens, 2, dtype=torch.int64, device="cuda")
+            )
         )
-    # Shrinking is fine -- decode steps are smaller than the capture shape.
-    h.update(HandleParams(topk_ids=torch.zeros(8, 2, dtype=torch.int64, device="cuda")))
+
+
+def test_update_rejects_non_contiguous_routing(fake_nccl_ep, bypass_build_checks):
+    """A strided view would be read as if it were packed."""
+    import torch
+
+    from flashinfer.moe_ep.config import HandleParams
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    h = _make_handle(_make_fleet(fake_nccl_ep), num_tokens=16, top_k=2)
+    strided = torch.zeros(16, 4, dtype=torch.int64, device="cuda")[:, ::2]
+    assert not strided.is_contiguous()
+    with pytest.raises(ValueError, match="contiguous"):
+        h.update(HandleParams(topk_ids=strided))
+
+
+def test_dispatch_rejects_activation_count_mismatch(fake_nccl_ep, bypass_build_checks):
+    """Activations must agree with the routing the handle currently holds."""
+    import torch
+
+    from flashinfer.moe_ep.config import DispatchInputParams
+    from flashinfer.moe_ep.core.validation.common import MoEEpConfigError
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    h = _make_handle(_make_fleet(fake_nccl_ep), num_tokens=16, top_k=2)
+    wrong = torch.zeros(8, 2048, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(MoEEpConfigError, match="activation rows"):
+        h.dispatch(DispatchInputParams(x=[wrong]))
 
 
 def test_update_is_optional_on_the_base_handle():
@@ -569,8 +608,11 @@ def test_ll_dispatch_rejects_more_tokens_than_the_fleet_was_sized_for(
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
 
+    # Create the handle at 222 rows on a fleet sized for 128, so the
+    # activation count matches the routing and the capacity guard -- not the
+    # equality guard -- is what rejects it.
     fleet = _make_fleet(fake_nccl_ep, max_tokens=128)
-    h = _make_handle(fleet, num_tokens=128, top_k=2)
+    h = _make_handle(fleet, num_tokens=222, top_k=2)
     too_many = torch.zeros(222, 2048, dtype=torch.bfloat16, device="cuda")
 
     with pytest.raises(MoEEpConfigError, match="exceeding max_tokens_per_rank"):
