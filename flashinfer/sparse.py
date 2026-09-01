@@ -1147,7 +1147,7 @@ class BlockSparseAttentionWrapper:
         qo_indptr_host = R * torch.arange(num_blocks_row + 1, dtype=torch.int32)
         qo_indptr_host[-1] = M
         qo_indptr = qo_indptr_host.to(indptr.device, non_blocking=non_blocking)
-        if indices.max().item() * C > N:
+        if indices.numel() > 0 and indices.max().item() * C > N:
             raise ValueError("indices out of bound")
         last_block_len = torch.full(
             (num_blocks_row,), C, dtype=torch.int32, device=indptr.device
