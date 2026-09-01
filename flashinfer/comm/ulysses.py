@@ -38,7 +38,7 @@ from ..trace.templates.comm import (
 )
 from ..utils import register_custom_op
 from .ulysses_topology import (
-    PCIE_HYBRID_WORLD_SIZE,
+    PCIE_AUTO_RDMA_WORLD_SIZES,
     SUPPORTED_WORLD_SIZES,
     UlyssesBackendDecision,
     resolve_ulysses_backend,
@@ -93,9 +93,9 @@ class UlyssesCommunicator:
     - ``backend="nvlink"``: force the fused kernel; raises on every rank
       (before any IPC/JIT for topology failures) when it cannot be used.
     - ``backend="pcie"``: explicitly enable the experimental single-node PCIe
-      transport at world size 1/2/4/8. One rank is an identity path, two/four
-      ranks use CUDA P2P, and eight ranks prefer an all-RDMA route (every
-      peer's payload over the rank's mlx5 QP) with all-P2P fallback;
+      transport at world size 1/2/4/8. One rank is an identity path, two
+      ranks use CUDA P2P, and four/eight ranks prefer an all-RDMA route
+      (every peer's payload over the rank's mlx5 QP) with all-P2P fallback;
       ``FLASHINFER_ULYSSES_PCIE_ROUTE`` (``auto``/``p2p``/``rdma``/``hybrid``)
       forces all-P2P, all-RDMA at any multi-rank world size, or the
       eight-rank 4+4 NUMA hybrid (same-NUMA CUDA P2P plus cross-NUMA mlx5).
@@ -308,7 +308,7 @@ class UlyssesCommunicator:
                     plan.requested_route in ("rdma", "hybrid")
                     or (
                         plan.requested_route == "auto"
-                        and self.world_size == PCIE_HYBRID_WORLD_SIZE
+                        and self.world_size in PCIE_AUTO_RDMA_WORLD_SIZES
                     )
                 )
             )

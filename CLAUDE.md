@@ -602,7 +602,7 @@ Read only for an explicit `UlyssesCommunicator(backend="pcie")`; every rank must
 |----------|---------|---------|--------|
 | `FLASHINFER_ULYSSES_PCIE_NICS` | unset (auto) | `flashinfer/comm/ulysses_topology.py` | Override automatic PCI-distance NIC routing for the RDMA routes: mlx5 device names, one per rank in rank order. |
 | `FLASHINFER_ULYSSES_PCIE_GID_INDICES` | unset (auto) | `flashinfer/comm/ulysses_topology.py` | Pick one GID table index per rank when a chosen NIC has several usable IPv4 RoCE v2 entries. |
-| `FLASHINFER_ULYSSES_PCIE_ROUTE` | `auto` | `flashinfer/comm/ulysses_topology.py` | `p2p` forces the all-P2P route; `rdma` forces all-RDMA (per-rank mlx5 to every peer) at world size 2/4/8; `hybrid` forces the eight-rank 4+4 NUMA hybrid; forced RDMA routes fall back to all-P2P with a `RuntimeWarning` when their requirements are unmet; `auto` prefers the all-RDMA route at world size 8. |
+| `FLASHINFER_ULYSSES_PCIE_ROUTE` | `auto` | `flashinfer/comm/ulysses_topology.py` | `p2p` forces the all-P2P route; `rdma` forces all-RDMA (per-rank mlx5 to every peer) at world size 2/4/8; `hybrid` forces the eight-rank 4+4 NUMA hybrid; forced RDMA routes fall back to all-P2P with a `RuntimeWarning` when their requirements are unmet; `auto` prefers the all-RDMA route at world sizes 4 and 8. |
 
 ##### Experimental Packed-KDA Decode Tuning
 
