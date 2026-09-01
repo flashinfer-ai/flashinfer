@@ -190,6 +190,7 @@ from .jit.spdlog import gen_spdlog_module
 from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
+from .jit.sparse_scores import gen_sparse_scores_module
 from .jit.topk import gen_topk_module
 from .jit.cake_sampling import gen_cake_sampling_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
@@ -958,6 +959,10 @@ def gen_all_modules(
             (has_sm90, has_sm100, has_sm103, has_sm107, has_sm110, has_sm120, has_sm121)
         ):
             jit_specs.append(gen_cake_sampling_module())
+        # The scorer multiplies with m16n8k16, so it is only built where that
+        # exists; without it here an AOT-only install has no artifact to load.
+        if has_sm80:
+            jit_specs.append(gen_sparse_scores_module())
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
         if has_sm100:
             for C in _SUPPORTED_C:
