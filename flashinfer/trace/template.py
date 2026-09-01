@@ -434,6 +434,10 @@ class Tensor:
     dtype_from:
         For *outputs*: name of an input ``param`` whose dtype to copy.
         Takes precedence over ``dtype`` when both are set.
+    dtype_from_scalar:
+        For *outputs*: name of an optional dtype-valued scalar to use when the
+        tensor named by ``dtype_from`` is absent. Takes precedence over
+        ``dtype`` but not over ``dtype_from``.
     optional:
         Whether the tensor may be absent.
     description:
@@ -448,6 +452,7 @@ class Tensor:
         tuple_idx: Optional[int] = None,
         dtype: Optional[str] = None,
         dtype_from: Optional[str] = None,
+        dtype_from_scalar: Optional[str] = None,
         optional: bool = False,
         description: str = "",
     ) -> None:
@@ -456,6 +461,7 @@ class Tensor:
         self.tuple_idx = tuple_idx
         self.dtype = dtype
         self.dtype_from = dtype_from
+        self.dtype_from_scalar = dtype_from_scalar
         self.optional = optional
         self.description = description
 
@@ -788,6 +794,11 @@ class TraceTemplate:
                         ref_t = _get_tensor(kwargs, ref_param)
                         if ref_t is not None:
                             dtype = _dtype_str(ref_t.dtype)
+                        elif (
+                            descriptor.dtype_from_scalar is not None
+                            and kwargs.get(descriptor.dtype_from_scalar) is not None
+                        ):
+                            dtype = _dtype_str(kwargs[descriptor.dtype_from_scalar])
                         else:
                             # dtype_from may reference an output param that is
                             # absent when tracing symbolically; fall back to the

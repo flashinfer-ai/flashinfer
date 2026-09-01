@@ -103,6 +103,24 @@ from .fp4_kv_dequantization import (
 from .fp4_kv_quantization import (
     gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
 )
+from .cake_kda import (
+    cake_kda_affine_is_available as cake_kda_affine_is_available,
+)
+from .cake_kda import (
+    gen_cake_kda_affine_module as gen_cake_kda_affine_module,
+)
+from .cake_kda import (
+    gen_cake_kda_m128_unbounded_softplus_module as gen_cake_kda_m128_unbounded_softplus_module,
+)
+from .cake_kda import (
+    get_cake_kda_affine_module as get_cake_kda_affine_module,
+)
+from .cake_kda import (
+    get_cake_kda_prefill_module as get_cake_kda_prefill_module,
+)
+from .cake_kda import (
+    load_cake_kda_m128_unbounded_softplus_module as load_cake_kda_m128_unbounded_softplus_module,
+)
 from .flash_kda import (
     gen_flash_kda_m64_module as gen_flash_kda_m64_module,
 )
@@ -124,11 +142,25 @@ from .flash_kda import (
 from .flash_kda import (
     load_flash_kda_m128_n16_module as load_flash_kda_m128_n16_module,
 )
+from .blackwell_msa import BLACKWELL_MSA_VARIANTS as BLACKWELL_MSA_VARIANTS
+from .blackwell_msa import (
+    BLACKWELL_MSA_VARIANTS_BY_TARGET as BLACKWELL_MSA_VARIANTS_BY_TARGET,
+)
+from .blackwell_msa import gen_blackwell_msa_module as gen_blackwell_msa_module
+from .blackwell_msa import get_blackwell_msa_module as get_blackwell_msa_module
+from .blackwell_msa import get_blackwell_msa_uri as get_blackwell_msa_uri
+from .blackwell_msa import load_blackwell_msa_module as load_blackwell_msa_module
 from .nvfp4_attention_sm120 import (
     gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,
 )
 from .bgmv_moe import gen_bgmv_moe_module as gen_bgmv_moe_module
 from .bgmv_moe import load_bgmv_moe_module as load_bgmv_moe_module
+from .blackwell_bgmv_moe import (
+    gen_blackwell_bgmv_moe_module as gen_blackwell_bgmv_moe_module,
+)
+from .blackwell_bgmv_moe import (
+    load_blackwell_bgmv_moe_module as load_blackwell_bgmv_moe_module,
+)
 from .monomoe import gen_monomoe_module as gen_monomoe_module
 from .monomoe import load_monomoe_module as load_monomoe_module
 

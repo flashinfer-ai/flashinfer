@@ -1580,9 +1580,10 @@ template <typename IdType>
 inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_bytes,
                            void* int_buffer, void* page_locked_int_buffer,
                            size_t int_workspace_size_in_bytes, MLAPlanInfo& plan_info,
-                           IdType* qo_indptr_h, IdType* kv_indptr_h, IdType* kv_len_arr_h,
-                           uint32_t batch_size, uint32_t num_heads, uint32_t head_dim_o,
-                           bool causal, cudaStream_t stream) {
+                           size_t& staged_int_workspace_bytes, IdType* qo_indptr_h,
+                           IdType* kv_indptr_h, IdType* kv_len_arr_h, uint32_t batch_size,
+                           uint32_t num_heads, uint32_t head_dim_o, bool causal,
+                           cudaStream_t stream) {
   int num_sm = 0;
   int dev_id = 0;
   FLASHINFER_CUDA_CALL(cudaGetDevice(&dev_id));
@@ -1832,9 +1833,7 @@ inline cudaError_t MLAPlan(void* float_buffer, size_t float_workspace_size_in_by
   std::copy(kv_end_vec.begin(), kv_end_vec.end(), cluster_kv_end_h);
   std::copy(work_indptr_vec.begin(), work_indptr_vec.end(), cluster_work_indptr_h);
 
-  size_t num_bytes_to_copy = int_allocator.num_allocated_bytes();
-  FLASHINFER_CUDA_CALL(cudaMemcpyAsync(int_buffer, page_locked_int_buffer, num_bytes_to_copy,
-                                       cudaMemcpyHostToDevice, stream));
+  staged_int_workspace_bytes = int_allocator.num_allocated_bytes();
 
   constexpr size_t sizeof_dtype_o = 2;
   AlignedAllocator float_allocator(float_buffer, float_workspace_size_in_bytes);

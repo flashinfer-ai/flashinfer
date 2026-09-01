@@ -25,6 +25,8 @@ from flashinfer.fused_moe import QuantVariant  # noqa: E402
 from flashinfer.moe_ep.backends.split.kernel.fused_moe.bridge import (  # noqa: E402
     build_activation_pack,
     build_activation_pack_rank_major,
+    pack_mxfp8_dispatch_payload,
+    packed_mxfp8_dispatch_width,
     reshape_for_combine,
 )
 
@@ -164,6 +166,42 @@ def test_build_activation_pack_rejects_2d():
     bad = torch.zeros(8, 128, dtype=torch.bfloat16)
     with pytest.raises(ValueError):
         build_activation_pack(bad, quant_variant=QuantVariant.BF16)
+
+
+def test_packed_mxfp8_dispatch_width_uses_supported_transport_rows():
+    assert packed_mxfp8_dispatch_width(256) == 2048
+    assert packed_mxfp8_dispatch_width(4096) == 2560
+    with pytest.raises(ValueError, match="hidden % 64"):
+        packed_mxfp8_dispatch_width(255)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="MXFP8 quantization needs SM100/SM103",
+)
+def test_mxfp8_pre_dispatch_payload_matches_post_dispatch_quantization():
+    num_local_experts, cap, hidden = 2, 3, 256
+    expert_tensors = _dispatch_tensor(num_local_experts, cap, hidden, "cuda")
+    direct = build_activation_pack(
+        expert_tensors,
+        quant_variant=QuantVariant.MXFP4,
+    )
+
+    flat = expert_tensors.reshape(num_local_experts * cap, hidden)
+    payload = pack_mxfp8_dispatch_payload(flat)
+    packed = build_activation_pack(
+        payload.reshape(num_local_experts, cap, -1),
+        quant_variant=QuantVariant.MXFP4,
+        mxfp8_dispatch=True,
+        hidden_size=hidden,
+    )
+
+    assert packed.hidden_states_q.dtype is torch.float8_e4m3fn
+    assert packed.hidden_states_scale.dtype is torch.uint8
+    assert torch.equal(packed.hidden_states_q, direct.hidden_states_q)
+    assert torch.equal(packed.hidden_states_scale, direct.hidden_states_scale)
+    assert torch.equal(packed.topk_ids, direct.topk_ids)
 
 
 @pytest.mark.skipif(

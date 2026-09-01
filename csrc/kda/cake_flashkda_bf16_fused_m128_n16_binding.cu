@@ -18,6 +18,7 @@
 
 // Keep standalone generated typedefs and tensor-map wrappers out of the
 // binding translation unit's CUDA/standard-library namespaces.
+#define int8_t flashkda_generated_int8_t
 #define uint8_t flashkda_generated_uint8_t
 #define uint16_t flashkda_generated_uint16_t
 #define uint32_t flashkda_generated_uint32_t
@@ -26,11 +27,20 @@
 #define int16_t flashkda_generated_int16_t
 #define FlashKDATensorMap flashkda_generated_FlashKDATensorMap
 #define FlashKDATensorMapPack flashkda_generated_FlashKDATensorMapPack
+#define CakeTensorMap flashkda_generated_CakeTensorMap
+#define CakeTensorMapPack flashkda_generated_CakeTensorMapPack
 #define CUtensorMap flashkda_generated_CUtensorMap
+#if defined(FLASHINFER_FLASH_KDA_N16_SHORT)
+#include "cake_flashkda_bf16_fused_m128_n16_short.cu"
+#else
 #include "cake_flashkda_bf16_fused_m128_n16.cu"
+#endif
 #undef CUtensorMap
+#undef CakeTensorMapPack
+#undef CakeTensorMap
 #undef FlashKDATensorMapPack
 #undef FlashKDATensorMap
+#undef int8_t
 #undef uint8_t
 #undef uint16_t
 #undef uint32_t
@@ -41,8 +51,26 @@
 namespace flashinfer {
 namespace flash_kda {
 
-static_assert(THREADS == 1024);
-static_assert(SMEM_TOTAL == 219136);
+#if defined(FLASHINFER_FLASH_KDA_N16_SHORT)
+using GeneratedTensorMap = flashkda_generated_CakeTensorMap;
+#else
+using GeneratedTensorMap = flashkda_generated_FlashKDATensorMap;
+#endif
+
+#if defined(FLASHINFER_FLASH_KDA_N16_SHORT)
+constexpr int kThreads = 512;
+#else
+// The frozen source declares __launch_bounds__(1024) but no longer emits a
+// duplicate THREADS macro for its host binding.
+constexpr int kThreads = 1024;
+#endif
+static_assert(STORE_BACKWARD_TAPE == 0);
+static_assert(SPLIT_WORK_ITEMS == 0);
+#if defined(FLASHINFER_FLASH_KDA_N16_SHORT)
+static_assert(SMEM_TOTAL == 112256);
+#else
+static_assert(SMEM_TOTAL == 117376);
+#endif
 
 void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorView beta,
                 TensorView beta_tma, TensorView A_log, TensorView dt_bias, TensorView cu_seqlens,
@@ -87,7 +115,7 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
   TVM_FFI_ICHECK(grid_x_i64 > 0 && grid_x_i64 <= std::numeric_limits<uint32_t>::max())
       << "M128 N16 FlashKDA grid.x is out of range: " << grid_x_i64;
   const dim3 grid(static_cast<uint32_t>(grid_x_i64), 1, 1);
-  const dim3 block(THREADS, 1, 1);
+  const dim3 block(kThreads, 1, 1);
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
   const TmaPointers tma = EncodeTmaPointers<128, 16>(q, k, v, g, beta_tma, out, descriptor_storage,
                                                      prepare_descriptors, stream);
@@ -95,21 +123,21 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
 
   kernel_flashkda_bf16_fused_m128<<<grid, block, kSmemBytes, stream>>>(
       reinterpret_cast<__nv_bfloat16*>(q.data_ptr()),
-      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.q),
+      reinterpret_cast<GeneratedTensorMap const*>(tma.q),
       reinterpret_cast<__nv_bfloat16*>(k.data_ptr()),
-      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.k),
+      reinterpret_cast<GeneratedTensorMap const*>(tma.k),
       reinterpret_cast<__nv_bfloat16*>(v.data_ptr()),
-      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.v),
+      reinterpret_cast<GeneratedTensorMap const*>(tma.v),
       reinterpret_cast<__nv_bfloat16*>(g.data_ptr()),
-      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.g),
+      reinterpret_cast<GeneratedTensorMap const*>(tma.g),
       reinterpret_cast<__nv_bfloat16*>(beta.data_ptr()),
-      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.beta),
+      reinterpret_cast<GeneratedTensorMap const*>(tma.beta),
       reinterpret_cast<float*>(A_log.data_ptr()), reinterpret_cast<float*>(dt_bias.data_ptr()),
       reinterpret_cast<long long*>(cu_seqlens.data_ptr()),
       reinterpret_cast<int*>(seq_order.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(initial_state.data_ptr()),
       reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-      reinterpret_cast<flashkda_generated_FlashKDATensorMap const*>(tma.out),
+      reinterpret_cast<GeneratedTensorMap const*>(tma.out),
       reinterpret_cast<__nv_bfloat16*>(final_state.data_ptr()), static_cast<int32_t>(num_heads),
       static_cast<int32_t>(use_initial_state), static_cast<int32_t>(store_final_state),
       static_cast<float>(scale), static_cast<float>(lower_bound),
@@ -117,7 +145,15 @@ void RunM128N16(TensorView q, TensorView k, TensorView v, TensorView g, TensorVi
       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(state_checkpoints.data_ptr())),
       static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(checkpoint_cu_starts.data_ptr())),
       static_cast<int64_t>(beta_token_stride), static_cast<int64_t>(state_slot_stride),
-      static_cast<int32_t>(use_state_indices), static_cast<int32_t>(checkpoint_every_n_tokens));
+      static_cast<int32_t>(use_state_indices), static_cast<int32_t>(checkpoint_every_n_tokens),
+      // The frozen forward/training source retains a private training-only ABI tail even though
+      // STORE_BACKWARD_TAPE and SPLIT_WORK_ITEMS are both fixed to zero in this serving export.
+      // Keep those data pointers null so an accidental use fails validation instead of silently
+      // corrupting a public tensor. TensorMap acquire is emitted for every descriptor argument,
+      // so the final disabled slot deliberately aliases the already valid q descriptor.
+      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+      nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, static_cast<int32_t>(0),
+      static_cast<int32_t>(0), reinterpret_cast<GeneratedTensorMap const*>(tma.q));
   CheckCuda(cudaGetLastError(), "kernel_flashkda_bf16_fused_m128 N16 launch");
 }
 

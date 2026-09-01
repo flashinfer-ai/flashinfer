@@ -81,6 +81,67 @@ def test_trace_default_check():
     assert standard_check([ref], [actual])
 
 
+def test_nvfp4_attention_sm120_trace_output_dtype_precedence():
+    batch, num_qo_heads, num_kv_heads = 1, 8, 2
+    seq_len_q, seq_len_k, head_dim = 256, 384, 128
+    kwargs = {
+        "q_fp4": torch.empty(
+            batch, num_qo_heads, seq_len_q, head_dim // 2, dtype=torch.uint8
+        ),
+        "k_fp4": torch.empty(
+            batch, num_kv_heads, seq_len_k, head_dim // 2, dtype=torch.uint8
+        ),
+        "v_fp4_t": torch.empty(
+            batch, num_kv_heads, head_dim, seq_len_k // 2, dtype=torch.uint8
+        ),
+        "q_scale": torch.empty(
+            batch,
+            num_qo_heads,
+            seq_len_q,
+            head_dim // 16,
+            dtype=torch.float8_e4m3fn,
+        ),
+        "k_scale": torch.empty(
+            batch,
+            num_kv_heads,
+            seq_len_k,
+            head_dim // 16,
+            dtype=torch.float8_e4m3fn,
+        ),
+        "v_scale_t": torch.empty(
+            batch,
+            num_kv_heads,
+            head_dim,
+            seq_len_k // 16,
+            dtype=torch.float8_e4m3fn,
+        ),
+        "qk_correction": torch.empty(
+            batch,
+            num_qo_heads,
+            seq_len_q // 128,
+            seq_len_k,
+            dtype=torch.float32,
+        ),
+        "sm_scale": head_dim**-0.5,
+        "causal": False,
+        "per_block_mean": True,
+    }
+
+    default_defn = flashinfer.nvfp4_attention_sm120_fwd.fi_trace(**kwargs)
+    assert default_defn["outputs"]["out"]["dtype"] == "bfloat16"
+
+    dtype_defn = flashinfer.nvfp4_attention_sm120_fwd.fi_trace(
+        **kwargs, out_dtype=torch.float16
+    )
+    assert dtype_defn["outputs"]["out"]["dtype"] == "float16"
+
+    out = torch.empty(batch, num_qo_heads, seq_len_q, head_dim, dtype=torch.bfloat16)
+    out_defn = flashinfer.nvfp4_attention_sm120_fwd.fi_trace(
+        **kwargs, out=out, out_dtype=torch.float16
+    )
+    assert out_defn["outputs"]["out"]["dtype"] == "bfloat16"
+
+
 def test_all_registered_trace_templates_have_check():
     from flashinfer.api_logging import _TRACE_REGISTRY
 
@@ -824,7 +885,9 @@ def test_mla_paged_fi_trace():
         ckv_scale_arr=ckv_scale_arr,
         kpe_scale=1.0,
     )
-    _check_defn(defn, "mla_paged", "BatchMLAPagedAttentionWrapper")
+    expected_fi_api = "flashinfer.mla._core.BatchMLAPagedAttentionWrapper.run"
+    assert f"fi_api:{expected_fi_api}" in defn["tags"]
+    _check_defn(defn, "mla_paged", expected_fi_api)
     axes = defn["axes"]
     assert axes["num_qo_heads"]["value"] == num_qo_heads
     assert axes["head_dim_ckv"]["value"] == head_dim_ckv
@@ -839,6 +902,76 @@ def test_mla_paged_fi_trace():
     ]
     assert ckv_scale_arr_defn["dtype"] == "float32"
     assert ckv_scale_arr_defn["optional"] is True
+    assert defn["inputs"]["q_nope"]["shape"] == [
+        "batch_size",
+        "num_qo_heads",
+        "head_dim_ckv",
+    ]
+    assert defn["inputs"]["q_pe"]["shape"] == [
+        "batch_size",
+        "num_qo_heads",
+        "head_dim_kpe",
+    ]
+    assert defn["inputs"]["ckv_cache"]["shape"] == [
+        "num_pages",
+        "page_size",
+        "head_dim_ckv",
+    ]
+    assert defn["inputs"]["kpe_cache"]["shape"] == [
+        "num_pages",
+        "page_size",
+        "head_dim_kpe",
+    ]
+    assert defn["outputs"]["output"]["shape"] == [
+        "batch_size",
+        "num_qo_heads",
+        "head_dim_ckv",
+    ]
+    assert defn["outputs"]["lse"]["shape"] == ["batch_size", "num_qo_heads"]
+
+
+def test_mla_paged_fi_trace_accepts_packed_structural_inputs():
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
+
+    packed_query = torch.empty(2, 4, 11, dtype=torch.bfloat16)
+    packed_kv = torch.empty(5, 7, 11, dtype=torch.bfloat16)
+    definition = BatchMLAPagedAttentionWrapper.run.fi_trace(
+        query=packed_query,
+        kv_cache=packed_kv,
+        head_dim_ckv=8,
+        head_dim_kpe=3,
+    )
+
+    assert definition["axes"]["num_qo_heads"]["value"] == 4
+    assert definition["axes"]["head_dim_ckv"]["value"] == 8
+    assert definition["axes"]["head_dim_kpe"]["value"] == 3
+    assert definition["axes"]["page_size"]["value"] == 7
+    assert definition["inputs"]["q_nope"]["dtype"] == "bfloat16"
+    assert definition["inputs"]["q_pe"]["dtype"] == "bfloat16"
+
+
+def test_mla_paged_fi_trace_uses_planned_contract_widths():
+    from flashinfer.mla import BatchMLAPagedAttentionWrapper
+    from flashinfer.mla._batch_mla._contracts import MLAInputContract
+
+    class _PlannedWrapper:
+        _input_contract = MLAInputContract(
+            lse_mode="none",
+            output_dtype=torch.bfloat16,
+            output_scale="none",
+            scale_mode="default",
+            head_dim_ckv=8,
+            head_dim_kpe=3,
+        )
+
+    definition = BatchMLAPagedAttentionWrapper.run.fi_trace(
+        self=_PlannedWrapper(),
+        query=torch.empty(2, 4, 11, dtype=torch.bfloat16),
+        kv_cache=torch.empty(5, 7, 11, dtype=torch.bfloat16),
+    )
+
+    assert definition["axes"]["head_dim_ckv"]["value"] == 8
+    assert definition["axes"]["head_dim_kpe"]["value"] == 3
 
 
 # ---------------------------------------------------------------------------

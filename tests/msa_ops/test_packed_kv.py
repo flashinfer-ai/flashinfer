@@ -108,10 +108,17 @@ def test_packed_kv_prefill_matches_contiguous(layout, dtype, hkv):
     torch.testing.assert_close(out, ref, rtol=0.0, atol=0.0)
 
 
-def test_packed_kv_flag_exported():
+@pytest.mark.parametrize(
+    ("capability", "expected"),
+    [((10, 0), False), ((10, 3), False), ((12, 0), True), ((12, 1), True)],
+)
+def test_packed_kv_capability_is_architecture_aware(monkeypatch, capability, expected):
     import flashinfer.msa_ops as msa_ops
 
     assert msa_ops.SUPPORTS_PACKED_KV is True
+    monkeypatch.setattr(msa_ops, "get_compute_capability", lambda _device: capability)
+    assert msa_ops.supports_packed_kv("cuda:0") is expected
+    assert msa_ops.supports_packed_kv("cpu") is False
 
 
 def test_unrelated_strided_views_rejected():
