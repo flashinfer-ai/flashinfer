@@ -584,7 +584,7 @@ def _build_decode_gen_schedule(
     )
     smem_k0_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=split_k0_stages,
-        num_bytes=cfg.smem_kv_tile_bytes,
+        num_bytes=cfg.smem_k_tile_bytes,
         producer_group=tma_producer,
         consumer_group=umma_hw,
         cta_layout_vmnk=cta_layout,
@@ -592,7 +592,7 @@ def _build_decode_gen_schedule(
     )
     smem_k1_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=split_k1_stages,
-        num_bytes=cfg.smem_kv_tile_bytes,
+        num_bytes=cfg.smem_k_tile_bytes,
         producer_group=tma_producer,
         consumer_group=umma_hw,
         cta_layout_vmnk=cta_layout,
@@ -600,7 +600,7 @@ def _build_decode_gen_schedule(
     )
     smem_v0_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=split_v0_stages,
-        num_bytes=cfg.smem_kv_tile_bytes,
+        num_bytes=cfg.smem_v_tile_bytes,
         producer_group=tma_producer,
         consumer_group=umma_hw,
         cta_layout_vmnk=cta_layout,
@@ -608,7 +608,7 @@ def _build_decode_gen_schedule(
     )
     smem_v1_cfg = PipelineConfig.create_tma_umma_pipeline_cfg(
         num_stages=split_v1_stages,
-        num_bytes=cfg.smem_kv_tile_bytes,
+        num_bytes=cfg.smem_v_tile_bytes,
         producer_group=tma_producer,
         consumer_group=umma_hw,
         cta_layout_vmnk=cta_layout,
@@ -2705,7 +2705,8 @@ def fmha_decode_launch(
     # Keep the TMA inner box at 128B when possible, but never exceed headDim.
     # box_dim is expressed in elements of the source dtype, not bytes.
     tma_box0_q = min(128 // cfg.q_dtype_bytes, cfg.headdim)
-    tma_box0_kv = min(128 // cfg.kv_dtype_bytes, cfg.headdim)
+    tma_box0_k = min(128 // cfg.k_dtype_bytes, cfg.headdim)
+    tma_box0_v = min(128 // cfg.v_dtype_bytes, cfg.headdim)
     tma_swizzle = cuda.TensorMapSwizzle.s128b
     if cutlass.const_expr(cfg.use_fp8_qkv and cfg.headdim == 64):
         tma_swizzle = cuda.TensorMapSwizzle.s64b
@@ -2790,13 +2791,13 @@ def fmha_decode_launch(
         )
     tma_desc_k = create_tensor_map_tiled_from_view(
         k_tma,
-        box_dims=(tma_box0_kv, tma_kv_tokens, 1, 1),
+        box_dims=(tma_box0_k, tma_kv_tokens, 1, 1),
         stride_order=(0, 1, 2, 3),
         swizzle=tma_swizzle,
     )
     tma_desc_v = create_tensor_map_tiled_from_view(
         v_tma,
-        box_dims=(tma_box0_kv, tma_kv_tokens, 1, 1),
+        box_dims=(tma_box0_v, tma_kv_tokens, 1, 1),
         stride_order=(0, 1, 2, 3),
         swizzle=tma_swizzle,
     )
