@@ -824,6 +824,26 @@ def _device_key(device: torch.device) -> str:
     return key
 
 
+def _parse_payload_devices(devices: dict) -> tuple[dict, dict]:
+    """Parse a cache document's ``devices`` mapping into process-cache entries.
+
+    Raises on malformed entries; callers must publish the returned dicts
+    atomically (a mid-document failure must not publish a prefix).
+    """
+    new_constants: dict = {}
+    new_crossover: dict = {}
+    for dev_key, families in devices.items():
+        if not isinstance(families, dict):
+            continue
+        for family, raw in families.items():
+            if family == _DECODE_MAX_TOKENS_KEY:
+                if isinstance(raw, dict):
+                    new_crossover[dev_key] = {str(k): int(v) for k, v in raw.items()}
+                continue
+            new_constants[(dev_key, family)] = CpbConstants(**raw)
+    return new_constants, new_crossover
+
+
 def _maybe_load_disk() -> None:
     """Mtime-gated lazy load; corrupt or mismatched files count as absent."""
     global _cache_mtime, _constants_version
@@ -846,19 +866,7 @@ def _maybe_load_disk() -> None:
             return
         # Parse fully into locals first: a mid-document failure must not
         # publish a prefix of the entries while leaving mtime/version stale.
-        new_constants: dict = {}
-        new_crossover: dict = {}
-        for dev_key, families in devices.items():
-            if not isinstance(families, dict):
-                continue
-            for family, raw in families.items():
-                if family == _DECODE_MAX_TOKENS_KEY:
-                    if isinstance(raw, dict):
-                        new_crossover[dev_key] = {
-                            str(k): int(v) for k, v in raw.items()
-                        }
-                    continue
-                new_constants[(dev_key, family)] = CpbConstants(**raw)
+        new_constants, new_crossover = _parse_payload_devices(devices)
     except (OSError, ValueError, TypeError, KeyError):
         # Keep mtime unchanged so the next cold call retries.
         return
@@ -918,6 +926,15 @@ def save_constants(device: torch.device, family: str, c: CpbConstants) -> None:
             path,
             e,
         )
+    # Publish the whole merged document, not only the family just saved: the
+    # merge may have carried on-disk sibling entries written by other
+    # processes, and _cache_mtime now asserts we hold the file's content.
+    try:
+        new_constants, new_crossover = _parse_payload_devices(payload["devices"])
+    except (ValueError, TypeError, KeyError):
+        new_constants, new_crossover = {}, {}
+    _constants.update(new_constants)
+    _crossover.update(new_crossover)
     _constants[key] = c
     _constants_version += 1
     with contextlib.suppress(OSError):
@@ -963,6 +980,13 @@ def save_crossover(device: torch.device, table: dict[str, int]) -> None:
             path,
             e,
         )
+    # Same sibling-entry reasoning as save_constants.
+    try:
+        new_constants, new_crossover = _parse_payload_devices(payload["devices"])
+    except (ValueError, TypeError, KeyError):
+        new_constants, new_crossover = {}, {}
+    _constants.update(new_constants)
+    _crossover.update(new_crossover)
     _crossover.setdefault(dev_key, {}).update(table)
     _constants_version += 1
     with contextlib.suppress(OSError):

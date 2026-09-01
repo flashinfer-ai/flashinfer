@@ -189,6 +189,28 @@ def test_persistence_round_trip(clean_cpb_state, monkeypatch) -> None:
     assert cpb_mod.get_constants(device, "dsv3_2") == other
 
 
+def test_save_publishes_on_disk_sibling_entries(clean_cpb_state) -> None:
+    """A targeted save as the process's first cpb activity must not hide
+    on-disk families written by other processes for the process lifetime."""
+    device = torch.device("cpu")
+    sibling = CpbConstants(**{**_C.__dict__, "bytes_per_chunk": 41984})
+    path = cpb_mod.default_cache_path()
+    path.write_text(
+        cpb_mod.json.dumps(
+            {
+                "schema_version": cpb_mod._SCHEMA_VERSION,
+                "devices": {
+                    cpb_mod._device_key(device): {"dsv3_2": cpb_mod.asdict(sibling)}
+                },
+            }
+        )
+        + "\n"
+    )
+    cpb_mod.save_constants(device, "dsv4", _C)
+    assert cpb_mod.get_constants(device, "dsv4") == _C
+    assert cpb_mod.get_constants(device, "dsv3_2") == sibling
+
+
 def test_missing_or_corrupt_cache_falls_back(clean_cpb_state, tmp_path) -> None:
     from flashinfer.mla._sparse_mla_sm120 import _resolve_cpb
 
