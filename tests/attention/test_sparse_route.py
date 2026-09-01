@@ -249,6 +249,42 @@ def test_qsa_route_never_points_outside_the_cache():
     assert int(route.max()) < num_slots
 
 
+def test_qsa_route_rejects_a_mapped_page_past_the_cache():
+    """An unmapped page is not the only way out of range.
+
+    A page the table maps is trusted for its id but not for where that id
+    lands: a mapping whose first slot is already at the end of the cache has
+    to clear as well, or the route walks past it holding a legal-looking id.
+    """
+    rows, block_topk, compress_ratio, page_size = 32, 16, 4, 16
+    blocks, positions, lengths, token_to_req, table, num_slots = _make_case(
+        rows, block_topk, compress_ratio, 256, 2, page_size, seed=7
+    )
+    # Mapped, and one page past the last the cache holds.
+    table.fill_(num_slots // page_size)
+    width = block_topk * compress_ratio + compress_ratio - 1
+    nbytes = -(-width // 8)
+    logical = torch.empty(rows, width, dtype=torch.int32, device=DEV)
+    route = torch.empty(rows, width, dtype=torch.int32, device=DEV)
+    mask = torch.empty(rows * nbytes, dtype=torch.uint8, device=DEV)
+    flashinfer.qsa_route_from_blocks(
+        blocks,
+        positions,
+        lengths,
+        token_to_req,
+        table,
+        logical,
+        route,
+        mask,
+        compress_ratio,
+        page_size,
+        num_slots,
+    )
+    assert int(mask.sum()) == 0
+    assert int(route.min()) >= 0
+    assert int(route.max()) < num_slots
+
+
 def test_route_ops_reject_bad_arguments():
     blocks = torch.zeros(4, 8, dtype=torch.int32, device=DEV)
     positions = torch.zeros(4, dtype=torch.int32, device=DEV)
