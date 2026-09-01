@@ -27,7 +27,7 @@ device = torch.device("cuda", local_rank)
 dist.init_process_group("nccl", device_id=device)
 
 with UlyssesCommunicator(
-    max_elems=q.numel(), dtype=q.dtype, backend="pcie", device=device
+    max_bytes=q.nbytes, dtype=q.dtype, backend="pcie", device=device
 ) as comm:
     q_out = comm.allocate_output(q, op="scatter_heads")
     comm.scatter_heads(q, out=q_out)

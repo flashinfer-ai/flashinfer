@@ -145,10 +145,10 @@ def _patch_probe_mesh(monkeypatch, world_size):
     )
 
 
-def _make_w1(gloo_pg, monkeypatch, backend="auto", max_elems=1 << 20):
+def _make_w1(gloo_pg, monkeypatch, backend="auto", max_bytes=1 << 21):
     _patch_probe_mesh(monkeypatch, 1)
     return UlyssesCommunicator(
-        gloo_pg, max_elems=max_elems, dtype=torch.float16, backend=backend
+        gloo_pg, max_bytes=max_bytes, dtype=torch.float16, backend=backend
     )
 
 
@@ -177,7 +177,7 @@ def _make_mock_pcie_comm():
     comm._fa = None
     comm.device = torch.device("cpu")
     comm.dtype = torch.float16
-    comm.max_elems = 1 << 20
+    comm.max_bytes = 1 << 21
     comm.backend = "pcie"
     comm.transport = "hybrid"
     comm.rank = 0
@@ -221,7 +221,7 @@ def test_pcie_explicit_output_uses_native_owned_allocation(monkeypatch):
     comm = _make_mock_pcie_comm()
     calls = []
     x = torch.empty((1, 2, 4, 2), dtype=torch.float16)
-    # The native slot is allocated flat at max_elems; the caller gets a view.
+    # The native slot is allocated flat at max_bytes; the caller gets a view.
     storage = torch.empty(1 << 20, dtype=torch.float16)
     module = SimpleNamespace(
         allocate_output=lambda *_args: (calls.append("allocate"), (storage, [1, 2, 3]))[
@@ -310,7 +310,7 @@ def test_pcie_registration_failure_poisons_and_defers_cleanup(
     ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
     comm = _make_mock_pcie_comm()
     calls = []
-    block = torch.empty(comm.max_elems, dtype=torch.float16)
+    block = torch.empty(comm.max_bytes // 2, dtype=torch.float16)
 
     def boom(name):
         def fail(*_args):
@@ -716,7 +716,7 @@ def test_ctor_pcie_world_size_one_is_identity_without_native(gloo_pg, monkeypatc
     monkeypatch.setattr(ulysses_mod, "gen_ulysses_pcie_module", forbid_native)
     comm = UlyssesCommunicator(
         gloo_pg,
-        max_elems=1 << 16,
+        max_bytes=1 << 17,
         dtype=torch.float16,
         backend="pcie",
         device=torch.device("cuda", torch.cuda.current_device()),
@@ -759,7 +759,8 @@ def test_ctor_pcie_dtype_gate(gloo_pg, monkeypatch):
         torch.float8_e5m2,
     ):
         comm = UlyssesCommunicator(
-            gloo_pg, max_elems=1 << 10, dtype=dtype, backend="pcie", device=device
+            gloo_pg, max_bytes=(1 << 10) * dtype.itemsize, dtype=dtype,
+            backend="pcie", device=device
         )
         x = torch.zeros((1, 2, 4, 2), dtype=dtype, device=device)
         assert comm.scatter_heads(x) is x
@@ -767,14 +768,14 @@ def test_ctor_pcie_dtype_gate(gloo_pg, monkeypatch):
     with pytest.raises(ValueError, match="dtype must be one of"):
         UlyssesCommunicator(
             gloo_pg,
-            max_elems=1 << 10,
+            max_bytes=1 << 11,
             dtype=torch.float64,
             backend="pcie",
             device=device,
         )
     with pytest.raises(ValueError, match="dtype must be one of"):
         UlyssesCommunicator(
-            gloo_pg, max_elems=1 << 10, dtype=torch.int8, backend="nccl", device=device
+            gloo_pg, max_bytes=1 << 10, dtype=torch.int8, backend="nccl", device=device
         )
 
 
@@ -808,7 +809,7 @@ def test_input_buffer_is_gated_to_routes_that_stage(gloo_pg, monkeypatch):
 
 @requires_cuda
 def test_per_call_dtype_reprices_capacity_in_bytes(gloo_pg, monkeypatch):
-    """``max_elems`` is a byte budget, priced in the construction dtype.
+    """``max_bytes`` is exactly that: a byte budget, whatever the dtype.
 
     A narrower per-call dtype therefore fits proportionally more elements in the
     same bytes. This is the only thing holding ``allocate_output``'s capacity
@@ -821,17 +822,17 @@ def test_per_call_dtype_reprices_capacity_in_bytes(gloo_pg, monkeypatch):
     device = torch.device("cuda", torch.cuda.current_device())
     # 12 BF16 elements = 24 bytes.
     comm = UlyssesCommunicator(
-        gloo_pg, max_elems=12, dtype=torch.bfloat16, backend="pcie", device=device
+        gloo_pg, max_bytes=24, dtype=torch.bfloat16, backend="pcie", device=device
     )
     try:
         fits = torch.zeros((1, 2, 3, 4), dtype=torch.uint8, device=device)  # 24 B
         assert comm.scatter_heads(fits, dtype=torch.uint8) is fits
         over = torch.zeros((1, 1, 5, 5), dtype=torch.uint8, device=device)  # 25 B
-        with pytest.raises(ValueError, match="capacity max_elems"):
+        with pytest.raises(ValueError, match="capacity max_bytes"):
             comm.scatter_heads(over, dtype=torch.uint8)
         # 24 elements of uint8 pass; 24 of the construction dtype are 48 bytes
         # and must not. The budget did not grow, only its unit changed.
-        with pytest.raises(ValueError, match="capacity max_elems"):
+        with pytest.raises(ValueError, match="capacity max_bytes"):
             comm.scatter_heads(
                 torch.zeros((1, 2, 3, 4), dtype=torch.bfloat16, device=device)
             )
@@ -850,7 +851,7 @@ def test_per_call_dtype_is_pcie_only_and_whitelisted(gloo_pg, monkeypatch):
     x = torch.zeros((1, 2, 4, 2), dtype=torch.float16, device=device)
 
     nccl = UlyssesCommunicator(
-        gloo_pg, max_elems=1 << 10, dtype=torch.float16, backend="nccl", device=device
+        gloo_pg, max_bytes=1 << 11, dtype=torch.float16, backend="nccl", device=device
     )
     try:
         with pytest.raises(ValueError, match="only supported on the pcie"):
@@ -861,7 +862,7 @@ def test_per_call_dtype_is_pcie_only_and_whitelisted(gloo_pg, monkeypatch):
         nccl.close()
 
     pcie = UlyssesCommunicator(
-        gloo_pg, max_elems=1 << 10, dtype=torch.float16, backend="pcie", device=device
+        gloo_pg, max_bytes=1 << 11, dtype=torch.float16, backend="pcie", device=device
     )
     try:
         with pytest.raises(ValueError, match="is not one of"):
@@ -891,7 +892,7 @@ def test_joint_config_validation_uses_gathered_backends():
 def test_ctor_nccl_backend_never_touches_ipc_jit(gloo_pg, monkeypatch):
     _forbid_ipc_and_jit(monkeypatch)
     comm = UlyssesCommunicator(
-        gloo_pg, max_elems=1024, dtype=torch.float16, backend="nccl"
+        gloo_pg, max_bytes=2048, dtype=torch.float16, backend="nccl"
     )
     assert comm.backend == "nccl"
     assert comm.fallback_reason is None  # explicitly requested, not a fallback
@@ -903,7 +904,7 @@ def test_ctor_auto_fallback_never_touches_ipc_jit(gloo_pg, monkeypatch):
     _forbid_ipc_and_jit(monkeypatch)
     _patch_probe_mesh(monkeypatch, 1)
     comm = UlyssesCommunicator(
-        gloo_pg, max_elems=1024, dtype=torch.float16, backend="auto"
+        gloo_pg, max_bytes=2048, dtype=torch.float16, backend="auto"
     )
     assert comm.backend == "nccl"
     assert comm.fallback_reason is not None and "world size 1" in comm.fallback_reason
@@ -916,7 +917,7 @@ def test_ctor_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
     _patch_probe_mesh(monkeypatch, 1)
     with pytest.raises(UlyssesBackendError, match="world size 1"):
         UlyssesCommunicator(
-            gloo_pg, max_elems=1024, dtype=torch.float16, backend="nvlink"
+            gloo_pg, max_bytes=2048, dtype=torch.float16, backend="nvlink"
         )
 
 
@@ -927,19 +928,19 @@ def test_ctor_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
 @pytest.mark.parametrize(
     "kwargs, match",
     [
-        (dict(max_elems=0, dtype=torch.float16), "max_elems"),
-        (dict(max_elems=-4, dtype=torch.float16), "max_elems"),
-        (dict(max_elems="big", dtype=torch.float16), "max_elems"),
-        (dict(max_elems=True, dtype=torch.float16), "max_elems"),
-        (dict(max_elems=2**31, dtype=torch.float16), "int32"),
-        (dict(max_elems=1024, dtype=torch.int32), "dtype"),
-        (dict(max_elems=1024, dtype="float16"), "dtype"),
-        (dict(max_elems=1024, dtype=torch.float16, device="cpu"), "CUDA device"),
-        (dict(max_elems=1024, dtype=torch.float16, device="cuda:999"), "device count"),
+        (dict(max_bytes=0, dtype=torch.float16), "max_bytes"),
+        (dict(max_bytes=-4, dtype=torch.float16), "max_bytes"),
+        (dict(max_bytes="big", dtype=torch.float16), "max_bytes"),
+        (dict(max_bytes=True, dtype=torch.float16), "max_bytes"),
+        (dict(max_bytes=2**33, dtype=torch.float16), "int32"),
+        (dict(max_bytes=2048, dtype=torch.int32), "dtype"),
+        (dict(max_bytes=2048, dtype="float16"), "dtype"),
+        (dict(max_bytes=2048, dtype=torch.float16, device="cpu"), "CUDA device"),
+        (dict(max_bytes=2048, dtype=torch.float16, device="cuda:999"), "device count"),
         # torch.device would silently wrap these into valid ordinals
         # (cuda:256 == cuda:0); the raw string/int must be validated first
-        (dict(max_elems=1024, dtype=torch.float16, device="cuda:256"), "device count"),
-        (dict(max_elems=1024, dtype=torch.float16, device=256), "device count"),
+        (dict(max_bytes=2048, dtype=torch.float16, device="cuda:256"), "device count"),
+        (dict(max_bytes=2048, dtype=torch.float16, device=256), "device count"),
     ],
 )
 def test_ctor_invalid_config(gloo_pg, monkeypatch, kwargs, match):
@@ -953,7 +954,7 @@ def test_ctor_invalid_backend(gloo_pg, monkeypatch):
     _forbid_ipc_and_jit(monkeypatch)
     with pytest.raises(ValueError, match="backend must be one of"):
         UlyssesCommunicator(
-            gloo_pg, max_elems=1024, dtype=torch.float16, backend="magic"
+            gloo_pg, max_bytes=2048, dtype=torch.float16, backend="magic"
         )
 
 
@@ -961,7 +962,7 @@ def test_ctor_invalid_backend(gloo_pg, monkeypatch):
 def test_ctor_bare_cuda_device_normalized(gloo_pg, monkeypatch):
     _forbid_ipc_and_jit(monkeypatch)
     comm = UlyssesCommunicator(
-        gloo_pg, max_elems=1024, dtype=torch.float16, backend="nccl", device="cuda"
+        gloo_pg, max_bytes=2048, dtype=torch.float16, backend="nccl", device="cuda"
     )
     # bare "cuda" must be bound to the *current indexed* device so legitimate
     # cuda:<current> tensors are accepted
@@ -1004,7 +1005,7 @@ def test_op_validation_negatives(gloo_pg, monkeypatch):
         comm.scatter_heads(ok.transpose(1, 2))
     with pytest.raises(ValueError, match="positive"):
         comm.scatter_heads(torch.empty(1, 0, 4, 8, dtype=torch.float16, device="cuda"))
-    with pytest.raises(ValueError, match="capacity max_elems"):
+    with pytest.raises(ValueError, match="capacity max_bytes"):
         comm.scatter_heads(
             torch.randn(2, 1 << 15, 4, 8, dtype=torch.float16, device="cuda")
         )
@@ -1228,10 +1229,13 @@ def _worker_main(rank, world_size, rendezvous, body_name, arg, allow_skip, q):
 
 
 def _correctness_body(rank, world_size, group, backend):
-    max_elems = max(B * S * H * D for (B, S, H, D) in CORRECTNESS_SHAPES)
+    peak_elems = max(B * S * H * D for (B, S, H, D) in CORRECTNESS_SHAPES)
     for dtype in DTYPES:
         comm = UlyssesCommunicator(
-            group, max_elems=max_elems, dtype=dtype, backend=backend
+            group,
+            max_bytes=peak_elems * dtype.itemsize,
+            dtype=dtype,
+            backend=backend,
         )
         # no fake coverage: the requested backend must actually be in use
         assert comm.backend == backend, (
@@ -1271,7 +1275,7 @@ def _correctness_body(rank, world_size, group, backend):
 
 def _api_body(rank, world_size, group, backend):
     comm = UlyssesCommunicator(
-        group, max_elems=1 << 16, dtype=torch.bfloat16, backend=backend
+        group, max_bytes=1 << 17, dtype=torch.bfloat16, backend=backend
     )
     x = torch.randn(1, 4, 6, 8, dtype=torch.bfloat16, device="cuda")
     out = comm.scatter_heads(x)
@@ -1291,7 +1295,7 @@ def _api_body(rank, world_size, group, backend):
 
 def _stream_body(rank, world_size, group, backend):
     comm = UlyssesCommunicator(
-        group, max_elems=1 << 16, dtype=torch.float16, backend=backend
+        group, max_bytes=1 << 17, dtype=torch.float16, backend=backend
     )
     assert comm.backend == backend
     x = torch.randn(1, 8, 24, 32, dtype=torch.float16, device="cuda")
@@ -1335,7 +1339,7 @@ def _pcie_layer_shape_body(rank, world_size, group, seq):
     packed_heads = 3 * _LAYER_HEADS
     # Both ops keep numel across the exchange, and the fused-QKV scatter is the
     # larger of the two, so it alone sizes every registration.
-    capacity = local_seq * packed_heads * _LAYER_HEAD_DIM
+    capacity = local_seq * packed_heads * _LAYER_HEAD_DIM * dtype.itemsize
 
     qkv = torch.randn(
         (1, local_seq, packed_heads, _LAYER_HEAD_DIM), dtype=dtype, device=device
@@ -1346,7 +1350,7 @@ def _pcie_layer_shape_body(rank, world_size, group, seq):
     reference_qkv = _ref_scatter_heads(qkv, world_size, rank, group)
 
     with UlyssesCommunicator(
-        group, max_elems=capacity, dtype=dtype, backend="pcie", device=device
+        group, max_bytes=capacity, dtype=dtype, backend="pcie", device=device
     ) as comm:
         assert comm.backend == "pcie"
         if world_size == 8 and comm.transport != "rdma":
@@ -1419,16 +1423,16 @@ def _pcie_correctness_body(rank, world_size, group, test_case):
     shape = (1, 4, world_size * 2, 16)
     q, k, v = (torch.randn(shape, dtype=dtype, device=device) for _ in range(3))
     # The varying-shape sweep below goes up to 8x the base sequence length, and
-    # max_elems is the capacity every registration is sized from.
+    # max_bytes is the capacity every registration is sized from.
     varying_steps = 8
-    capacity = varying_steps * 4 * world_size * 2 * 16
+    capacity = varying_steps * 4 * world_size * 2 * 16 * dtype.itemsize
     reference_q = _ref_scatter_heads(q, world_size, rank, group)
     reference_k = _ref_scatter_heads(k, world_size, rank, group)
     reference_v = _ref_scatter_heads(v, world_size, rank, group)
 
     with UlyssesCommunicator(
         group,
-        max_elems=capacity,
+        max_bytes=capacity,
         dtype=q.dtype,
         backend="pcie",
         device=device,
@@ -1635,7 +1639,7 @@ def _pcie_correctness_body(rank, world_size, group, test_case):
 
 def _divisibility_body(rank, world_size, group, _arg):
     comm = UlyssesCommunicator(
-        group, max_elems=1 << 16, dtype=torch.float16, backend="nccl"
+        group, max_bytes=1 << 17, dtype=torch.float16, backend="nccl"
     )
     bad_h = torch.randn(1, 4, 5, 8, dtype=torch.float16, device="cuda")  # 5 % 2 != 0
     try:
@@ -1663,7 +1667,7 @@ def _none_backend_body(rank, world_size, group, _arg):
     # process group created with backend=None (multi-backend); the capability
     # check must detect the CUDA-bound ProcessGroupNCCL behind "undefined"
     comm = UlyssesCommunicator(
-        group, max_elems=1 << 16, dtype=torch.float16, backend="nccl"
+        group, max_bytes=1 << 17, dtype=torch.float16, backend="nccl"
     )
     assert comm.backend == "nccl"
     x = torch.randn(1, 4, 6, 8, dtype=torch.float16, device="cuda")
@@ -1700,7 +1704,7 @@ def _topology_fallback_body(rank, world_size, group, kind):
     ulysses_mod.gen_ulysses_a2a_module = _boom
 
     comm = UlyssesCommunicator(
-        group, max_elems=1 << 16, dtype=torch.float16, backend="auto"
+        group, max_bytes=1 << 17, dtype=torch.float16, backend="auto"
     )
     assert comm.backend == "nccl", comm.backend
     assert comm.decision.backend == "nccl", comm.decision
@@ -1810,7 +1814,7 @@ def _init_fault_body(rank, world_size, group, arg):
     if requested == "nvlink":
         try:
             UlyssesCommunicator(
-                group, max_elems=1 << 12, dtype=torch.float16, backend="nvlink"
+                group, max_bytes=1 << 13, dtype=torch.float16, backend="nvlink"
             )
             raise AssertionError("forced nvlink must fail when init faults")
         except RuntimeError as e:
@@ -1824,7 +1828,7 @@ def _init_fault_body(rank, world_size, group, arg):
         return ("ok", ("raised", ledger.counts["malloc"], ledger.counts["free"]))
 
     comm = UlyssesCommunicator(
-        group, max_elems=1 << 12, dtype=torch.float16, backend="auto"
+        group, max_bytes=1 << 13, dtype=torch.float16, backend="auto"
     )
     assert comm.backend == "nccl", comm.backend
     assert comm.decision.backend == "nccl", comm.decision  # effective decision
@@ -1854,7 +1858,7 @@ def _init_cleanup_fault_body(rank, world_size, group, arg):
         ledger = _ResourceLedger(faults=faults)
         try:
             UlyssesCommunicator(
-                group, max_elems=1 << 12, dtype=torch.float16, backend=requested
+                group, max_bytes=1 << 13, dtype=torch.float16, backend=requested
             )
             if requested == "nvlink":
                 raise AssertionError("forced nvlink must fail")
@@ -1873,7 +1877,7 @@ def _init_cleanup_fault_body(rank, world_size, group, arg):
         _ResourceLedger(faults=faults)
         try:
             UlyssesCommunicator(
-                group, max_elems=1 << 12, dtype=torch.float16, backend=requested
+                group, max_bytes=1 << 13, dtype=torch.float16, backend=requested
             )
             raise AssertionError("constructor must fail jointly")
         except RuntimeError as e:
@@ -1885,7 +1889,7 @@ def _close_fault_body(rank, world_size, group, scenario):
     # real probe (forced nvlink -> genuine topology skip on non-NVLink boxes)
     ledger = _ResourceLedger()
     comm = UlyssesCommunicator(
-        group, max_elems=1 << 12, dtype=torch.float16, backend="nvlink"
+        group, max_bytes=1 << 13, dtype=torch.float16, backend="nvlink"
     )
     x = torch.randn(1, 4, 6, 8, dtype=torch.float16, device="cuda")
     comm.scatter_heads(x)
@@ -2055,7 +2059,7 @@ def _close_fault_body(rank, world_size, group, scenario):
 def _lifecycle_nvlink_body(rank, world_size, group, scenario):
     # real probe: forced nvlink -> topology skip on non-NVLink machines
     mk = lambda: UlyssesCommunicator(  # noqa: E731
-        group, max_elems=1 << 12, dtype=torch.float16, backend="nvlink"
+        group, max_bytes=1 << 13, dtype=torch.float16, backend="nvlink"
     )
     x = torch.randn(1, 4, 6, 8, dtype=torch.float16, device="cuda")
 
@@ -2119,14 +2123,14 @@ def _lifecycle_nvlink_body(rank, world_size, group, scenario):
 
 def _config_fault_body(rank, world_size, group, kind):
     if kind == "invalid_one_rank":
-        max_elems = -1 if rank == 0 else 1024
+        max_bytes = -1 if rank == 0 else 2048
         expect = "invalid UlyssesCommunicator config"
     else:  # inconsistent
-        max_elems = 1024 if rank == 0 else 2048
+        max_bytes = 2048 if rank == 0 else 4096
         expect = "inconsistent UlyssesCommunicator config"
     try:
         UlyssesCommunicator(
-            group, max_elems=max_elems, dtype=torch.float16, backend="nccl"
+            group, max_bytes=max_bytes, dtype=torch.float16, backend="nccl"
         )
         raise AssertionError("constructor must reject the config")
     except ValueError as e:
@@ -2138,7 +2142,7 @@ def _device_contract_body(rank, world_size, group, mode):
     if mode == "explicit":
         comm = UlyssesCommunicator(
             group,
-            max_elems=1 << 16,
+            max_bytes=1 << 17,
             dtype=torch.float16,
             backend="nccl",
             device=f"cuda:{rank}",
@@ -2147,7 +2151,7 @@ def _device_contract_body(rank, world_size, group, mode):
     elif mode == "bare":
         comm = UlyssesCommunicator(
             group,
-            max_elems=1 << 16,
+            max_bytes=1 << 17,
             dtype=torch.float16,
             backend="nccl",
             device="cuda",
@@ -2161,7 +2165,7 @@ def _device_contract_body(rank, world_size, group, mode):
         torch.cuda.set_device(0)
         comm = UlyssesCommunicator(
             group,
-            max_elems=1 << 16,
+            max_bytes=1 << 17,
             dtype=torch.float16,
             backend="nvlink",
             device=f"cuda:{rank}",
@@ -2172,7 +2176,7 @@ def _device_contract_body(rank, world_size, group, mode):
         # real probe: forced nvlink -> topology skip on non-NVLink machines
         comm = UlyssesCommunicator(
             group,
-            max_elems=1 << 16,
+            max_bytes=1 << 17,
             dtype=torch.float16,
             backend="nvlink",
             device=f"cuda:{rank}",
@@ -2336,7 +2340,7 @@ def _pcie_dtype_body(rank, world_size, group, dtype_name):
     )
     x = raw.view(dtype)
     with UlyssesCommunicator(
-        max_elems=x.numel(), dtype=dtype, backend="pcie", device=device
+        max_bytes=x.nbytes, dtype=dtype, backend="pcie", device=device
     ) as comm:
         scatter_out = comm.allocate_output(x, "scatter_heads")
         gather_out = comm.allocate_output(scatter_out, "gather_heads")
@@ -2372,7 +2376,7 @@ def _pcie_p2p_fail_stop_body(rank, world_size, group, bad_kind):
     torch.manual_seed(4500 + rank)
     good = torch.randn((1, 8, world_size * 2, 16), dtype=torch.bfloat16, device=device)
     comm = UlyssesCommunicator(
-        max_elems=good.numel(), dtype=torch.bfloat16, backend="pcie", device=device
+        max_bytes=good.nbytes, dtype=torch.bfloat16, backend="pcie", device=device
     )
     assert comm.transport == "p2p"
     out = comm.allocate_output(good, "scatter_heads")
@@ -2434,7 +2438,7 @@ def _pcie_input_landing_body(rank, world_size, group, _arg):
     x = torch.randn(shape, dtype=torch.bfloat16, device=device)
     y = torch.randn(shape, dtype=torch.bfloat16, device=device)
     with UlyssesCommunicator(
-        max_elems=x.numel(), dtype=torch.bfloat16, backend="pcie", device=device
+        max_bytes=x.nbytes, dtype=torch.bfloat16, backend="pcie", device=device
     ) as comm:
         if comm.transport not in ("hybrid", "rdma"):
             raise UlyssesBackendError(
@@ -2512,7 +2516,7 @@ def _pcie_mixed_dtype_body(rank, world_size, group, _arg):
     wide = torch.randn((1, 16, heads, 16), dtype=torch.bfloat16, device=device)
     packed = torch.randint(0, 256, (1, 16, heads, 25), dtype=torch.uint8, device=device)
     with UlyssesCommunicator(
-        max_elems=wide.numel(), dtype=torch.bfloat16, backend="pcie", device=device
+        max_bytes=wide.nbytes, dtype=torch.bfloat16, backend="pcie", device=device
     ) as comm:
         wide_out = comm.allocate_output(wide, "scatter_heads")
         packed_out = comm.allocate_output(packed, "scatter_heads", dtype=torch.uint8)

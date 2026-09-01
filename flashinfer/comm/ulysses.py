@@ -45,6 +45,13 @@ from .ulysses_topology import (
 )
 
 _INT32_MAX = 2**31 - 1
+# Loosest sound bound on the declared capacity. The kernels index elements with
+# int32, which bounds an operand's element count, not its byte count -- and the
+# byte count is what a communicator declares, because the element type is now a
+# property of the call. Four is the widest supported element, so this is the
+# largest capacity that could still be spent by a legal operand; the binding
+# check is per operand in _validate.
+_MAX_CAPACITY_BYTES = _INT32_MAX * 4
 _PCIE_MLX5_MAX_INTERLEAVED_STRIDE = 65_535
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # The PCIe transport moves bytes (copy engines and RDMA writes, no arithmetic),
@@ -99,7 +106,7 @@ class UlyssesCommunicator:
       ``FLASHINFER_ULYSSES_PCIE_ROUTE`` (``auto``/``p2p``/``rdma``/``hybrid``)
       forces all-P2P, all-RDMA at any multi-rank world size, or the
       eight-rank 4+4 NUMA hybrid (same-NUMA CUDA P2P plus cross-NUMA mlx5).
-      It uses explicitly allocated outputs registered at ``max_elems``, and
+      It uses explicitly allocated outputs registered at ``max_bytes``, and
       is never selected by ``"auto"``.
     - ``backend="nccl"``: force the ``dist.all_to_all_single`` path; skips
       the topology/NVML probe and all IPC/JIT entirely (the constructor
@@ -137,7 +144,7 @@ class UlyssesCommunicator:
       are bound to the stream of their first call.
     - Operand tensors must be contiguous 4-D CUDA tensors of the construction
       ``dtype`` (float16 / bfloat16 / float32) on the construction device,
-      with every dim positive and total elements at most ``max_elems``;
+      with every dim positive and ``nbytes`` at most ``max_bytes``;
       :meth:`scatter_heads` additionally requires ``H % world_size == 0`` and
       :meth:`gather_heads` requires ``S_global % world_size == 0``.
       PCIe additionally accepts int8/uint8 and the float8 storage types
@@ -152,22 +159,23 @@ class UlyssesCommunicator:
       communicator enters a BROKEN state that rejects further collectives and
       permits only a collective :meth:`close`.
     - Each rank may use a different CUDA device (e.g. ``cuda:rank``); ranks
-      must agree on ``max_elems``, ``dtype`` and ``backend``.
+      must agree on ``max_bytes``, ``dtype`` and ``backend``.
 
     Parameters
     ----------
     group : torch.distributed.ProcessGroup, optional
         Process group of the Ulysses ranks. Defaults to ``dist.group.WORLD``.
-    max_elems : int
-        Capacity: the largest element count of any single all-to-all operand
-        (input and output have equal ``numel``, so this is ``B*S_local*H*D``
-        for the largest call). Must be at most ``2**31 - 1`` (the kernel's
-        int32 index range). Sizes the NVLink staging buffer once at
-        construction.
+    max_bytes : int
+        Capacity: the size in bytes of the largest single all-to-all operand
+        (input and output have equal ``nbytes``, so this is
+        ``B*S_local*H*D*element_size`` for the largest call). Bytes rather than
+        elements because ``backend="pcie"`` lets each call name its own element
+        type, so a fixed capacity has to be denominated in something they share.
+        Sizes the NVLink staging buffer once at construction.
     dtype : torch.dtype
-        Element type of all operands (float16 / bfloat16 / float32; PCIe
+        Default element type of operands (float16 / bfloat16 / float32; PCIe
         additionally int8 / uint8 / float8_e4m3fn / float8_e5m2); enforced on
-        every call.
+        every call that does not name its own.
     backend : str
         ``"auto"`` | ``"nvlink"`` | ``"pcie"`` | ``"nccl"`` (see above).
     device : torch.device or str or int, optional
@@ -177,7 +185,7 @@ class UlyssesCommunicator:
 
     Examples
     --------
-    >>> with UlyssesCommunicator(group, max_elems=B*S*H*D, dtype=torch.bfloat16) as comm:
+    >>> with UlyssesCommunicator(group, max_bytes=q.nbytes, dtype=torch.bfloat16) as comm:
     ...     q_ = comm.scatter_heads(q)   # [B,S_local,H,D] -> [B,S_global,H_local,D]
     ...     ...
     ...     o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
@@ -188,7 +196,7 @@ class UlyssesCommunicator:
         self,
         group: Optional[ProcessGroup] = None,
         *,
-        max_elems: int,
+        max_bytes: int,
         dtype: torch.dtype,
         backend: str = "auto",
         device: Optional[Union[torch.device, str, int]] = None,
@@ -200,11 +208,11 @@ class UlyssesCommunicator:
         group : Optional[ProcessGroup], optional
             Process group spanning the participating ranks. ``None`` uses
             ``torch.distributed.group.WORLD``.
-        max_elems : int
-            Per-rank upper bound on the number of elements communicated by a
-            single collective call. Used to size the backend workspace.
+        max_bytes : int
+            Per-rank upper bound on the size in bytes of a single collective
+            operand. Used to size the backend workspace.
         dtype : torch.dtype
-            Element dtype for collective operands. Must be one of
+            Default element dtype for collective operands. Must be one of
             ``torch.float16``, ``torch.bfloat16``, or ``torch.float32``;
             ``backend="pcie"`` additionally accepts ``torch.int8``,
             ``torch.uint8``, ``torch.float8_e4m3fn`` and
@@ -263,12 +271,12 @@ class UlyssesCommunicator:
         # identical list jointly so an invalid single-rank config raises the
         # same error on every rank instead of hanging peers in a later gather.
         # Devices are validated per rank but may legitimately differ across
-        # ranks (cuda:rank); only max_elems and dtype must match.
-        config = self._encode_config(max_elems, dtype, device, backend)
+        # ranks (cuda:rank); only max_bytes and dtype must match.
+        config = self._encode_config(max_bytes, dtype, device, backend)
         configs = self._gather(config)
         self._validate_configs_jointly(configs)
 
-        self.max_elems = max_elems
+        self.max_bytes = max_bytes
         self.dtype = dtype
 
         # ---- backend selection: strictly before any IPC/JIT -----------------
@@ -441,11 +449,11 @@ class UlyssesCommunicator:
             return torch.device("cuda", 0)
 
     @classmethod
-    def _encode_config(cls, max_elems, dtype, device, backend) -> Tuple[str, ...]:
-        if type(max_elems) is not int:  # bool is an int subclass: reject it too
-            elems = f"<invalid type: {type(max_elems).__name__}>"
+    def _encode_config(cls, max_bytes, dtype, device, backend) -> Tuple[str, ...]:
+        if type(max_bytes) is not int:  # bool is an int subclass: reject it too
+            nbytes = f"<invalid type: {type(max_bytes).__name__}>"
         else:
-            elems = str(max_elems)
+            nbytes = str(max_bytes)
         if isinstance(dtype, torch.dtype):
             dt = str(dtype)
         else:
@@ -465,11 +473,11 @@ class UlyssesCommunicator:
             dev = "cuda"
         else:
             dev = f"cuda:{index}"
-        return (elems, dt, dev, bk)
+        return (nbytes, dt, dev, bk)
 
     def _validate_configs_jointly(self, configs) -> None:
         problems = {}
-        for r, (elems, dt, dev, bk) in enumerate(configs):
+        for r, (nbytes, dt, dev, bk) in enumerate(configs):
             # The whitelist comes from the GATHERED backend, never from a
             # local argument: every rank must compute the same verdict from
             # the same list, or one rank raises while its peers hang in the
@@ -477,12 +485,13 @@ class UlyssesCommunicator:
             dtypes = _PCIE_SUPPORTED_DTYPES if bk == "pcie" else _SUPPORTED_DTYPES
             supported = tuple(str(d) for d in dtypes)
             errs = []
-            if not elems.isdigit() or int(elems) <= 0:
-                errs.append(f"max_elems must be a positive int, got {elems}")
-            elif int(elems) > _INT32_MAX:
+            if not nbytes.isdigit() or int(nbytes) <= 0:
+                errs.append(f"max_bytes must be a positive int, got {nbytes}")
+            elif int(nbytes) > _MAX_CAPACITY_BYTES:
                 errs.append(
-                    f"max_elems must be at most {_INT32_MAX} (int32 kernel "
-                    f"index range), got {elems}"
+                    f"max_bytes must be at most {_MAX_CAPACITY_BYTES} (int32 "
+                    f"kernel index range at the widest supported element), got "
+                    f"{nbytes}"
                 )
             if dt not in supported:
                 errs.append(f"dtype must be one of {supported}, got {dt}")
@@ -492,11 +501,11 @@ class UlyssesCommunicator:
                 problems[r] = "; ".join(errs)
         if problems:
             raise ValueError(f"invalid UlyssesCommunicator config by rank: {problems}")
-        shared = {(elems, dt) for (elems, dt, _dev, _bk) in configs}
+        shared = {(nbytes, dt) for (nbytes, dt, _dev, _bk) in configs}
         if len(shared) > 1:
             raise ValueError(
                 f"inconsistent UlyssesCommunicator configs across ranks: "
-                f"(max_elems, dtype) = {sorted(shared)}; all ranks must agree"
+                f"(max_bytes, dtype) = {sorted(shared)}; all ranks must agree"
             )
 
     # ---- experimental PCIe/mlx5 backend ------------------------------------
@@ -628,11 +637,11 @@ class UlyssesCommunicator:
             # Flat at capacity; callers view it per call. The base pointer is
             # the registration key, so record it before anything can fail.
             # native sizes the allocation as capacity_elements * itemsize(x),
-            # so the element count has to be rescaled into x's dtype to keep
-            # the byte budget fixed. Without this a narrower x would allocate
-            # proportionally fewer bytes than _validate just admitted, and the
-            # ICHECK_GE inside allocate_output would fire mid-collective.
-            capacity_elems = (self.max_elems * self.dtype.itemsize) // x.dtype.itemsize
+            # so the byte budget has to be converted into x's own elements.
+            # Without this a narrower x would allocate proportionally fewer
+            # bytes than _validate just admitted, and the ICHECK_GE inside
+            # allocate_output would fire mid-collective.
+            capacity_elems = self.max_bytes // x.dtype.itemsize
             tensor, info = module.allocate_output(self._pcie, x, mode, capacity_elems)
             pointer = tensor.data_ptr()
             self._pcie_outputs[pointer] = mode
@@ -680,7 +689,7 @@ class UlyssesCommunicator:
         if err is not None:
             self._raise_pcie_broken(err)
 
-        # Native storage is sized at max_elems; hand back the view this call
+        # Native storage is sized at max_bytes; hand back the view this call
         # requested.
         return tensor.narrow(0, 0, int(torch.Size(shape).numel())).view(shape)
 
@@ -926,7 +935,7 @@ class UlyssesCommunicator:
             return err  # nothing allocated anywhere yet
 
         # stage A: allocate this rank's export buffers and IPC handles
-        out_bytes = self.max_elems * self.dtype.itemsize
+        out_bytes = self.max_bytes
         handles: Optional[Tuple[Any, Any]] = None
         try:
             from .cuda_ipc import cudart
@@ -1300,9 +1309,9 @@ class UlyssesCommunicator:
             requires an output returned by :meth:`allocate_output`.
         dtype : torch.dtype, optional
             Element type for this call, overriding the communicator dtype.
-            pcie backend only. The communicator dtype stays the unit its
-            ``max_elems`` capacity is counted in, so a narrower dtype here
-            fits proportionally more elements in the same bytes.
+            pcie backend only. ``max_bytes`` is denominated in bytes, so a
+            narrower dtype here simply fits more elements in the same
+            capacity.
 
         Returns
         -------
@@ -1360,9 +1369,9 @@ class UlyssesCommunicator:
             requires an output returned by :meth:`allocate_output`.
         dtype : torch.dtype, optional
             Element type for this call, overriding the communicator dtype.
-            pcie backend only. The communicator dtype stays the unit its
-            ``max_elems`` capacity is counted in, so a narrower dtype here
-            fits proportionally more elements in the same bytes.
+            pcie backend only. ``max_bytes`` is denominated in bytes, so a
+            narrower dtype here simply fits more elements in the same
+            capacity.
 
         Returns
         -------
@@ -1488,16 +1497,11 @@ class UlyssesCommunicator:
             raise ValueError(
                 f"{op} tensor dims must all be positive, got shape {tuple(x.shape)}"
             )
-        # Capacity is a byte budget: max_elems counts elements of the
-        # communicator dtype, so a narrower per-call dtype fits proportionally
-        # more of them. Same dtype reduces to the old element comparison.
-        capacity_bytes = self.max_elems * self.dtype.itemsize
-        if x.numel() * x.element_size() > capacity_bytes:
+        if x.nbytes > self.max_bytes:
             raise ValueError(
-                f"{op} tensor has {x.numel()} elements of {x.element_size()} "
-                f"bytes ({x.numel() * x.element_size()} bytes), exceeding the "
-                f"communicator capacity max_elems={self.max_elems} x "
-                f"{self.dtype.itemsize} bytes = {capacity_bytes} bytes"
+                f"{op} tensor is {x.nbytes} bytes ({x.numel()} elements of "
+                f"{x.element_size()}), exceeding the communicator capacity "
+                f"max_bytes={self.max_bytes}"
             )
         if x.numel() > _INT32_MAX:
             # The byte budget above can admit more elements than the kernels
