@@ -25,7 +25,10 @@ import torch
 import flashinfer
 from flashinfer.sparse import BlockSparseAttentionWrapper
 from flashinfer.testing import bench_gpu_time
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.utils import (
+    get_compute_capability,
+    is_sm100a_supported,
+)
 
 # ---------------------------------------------------------------------------
 # Hardware / dependency gates
@@ -33,17 +36,31 @@ from flashinfer.utils import is_sm100a_supported
 
 _HAS_QUACK = importlib.util.find_spec("quack") is not None
 
+
+def _is_vsa_sm100_or_sm103_supported(device: torch.device) -> bool:
+    return get_compute_capability(device) in ((10, 0), (10, 3)) and is_sm100a_supported(
+        device
+    )
+
+
+_requires_sm100_or_sm103 = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not _is_vsa_sm100_or_sm103_supported(torch.device("cuda")),
+    reason="vsa_sm100_blk64 requires SM100 or SM103",
+)
+
 from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
 
 pytestmark = [
     pytest.mark.skipif(
-        not torch.cuda.is_available() or not is_sm100a_supported(torch.device("cuda")),
-        reason="VSA Blackwell backend requires sm100a (Blackwell GPU)",
+        not torch.cuda.is_available()
+        or not _is_vsa_sm100_or_sm103_supported(torch.device("cuda")),
+        reason="VSA blk128 backend requires SM100 or SM103",
     ),
     pytest.mark.skipif(
         not _HAS_QUACK,
-        reason="VSA Blackwell backend requires the quack package "
-        "(pip install git+https://github.com/Dao-AILab/quack.git)",
+        reason="VSA SM100 backend requires the quack package "
+        "(pip install --no-deps quack-kernels==0.6.4)",
     ),
     pytest.mark.skipif(
         torch.cuda.is_available()
@@ -139,7 +156,7 @@ def workspace():
 
 
 def _make_wrapper(workspace):
-    return BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
+    return BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk128")
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +275,7 @@ def test_vsa_vs_auto_80k(workspace):
     )
     o_ref = ref_w.run(q, k, v)
 
-    vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
+    vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk128")
     vsa_w.plan(
         indptr,
         indices,
@@ -509,7 +526,7 @@ def test_vsa_accuracy_vs_dense(seqlen, topk_frac, workspace):
 
     Stage 1: compress attention on mean-pooled tokens → output_compress [M, H, D]
              + per-head block_mask [H, MB, NB] from softmax block scores.
-    Stage 2: BlockSparseAttentionWrapper vsa_blackwell → output_select [M, H, D].
+    Stage 2: BlockSparseAttentionWrapper vsa_sm100_blk128 → output_select [M, H, D].
     Final:   output_compress + output_select  (mirrors fastvideo final_output).
     Dense:   flashinfer.single_prefill_with_kv_cache(backend="auto").
 
@@ -542,7 +559,7 @@ def test_vsa_accuracy_vs_dense(seqlen, topk_frac, workspace):
     )
 
     # Stage 2: block-sparse attention (select branch)
-    vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
+    vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk128")
     vsa_w.plan(
         None,
         None,
@@ -586,7 +603,7 @@ def test_vsa_performance_vs_dense(workspace):
       compress_ms – Stage 1: compress attention (pool Q/K/V, dense attn on pooled tokens,
                              softmax top-K → block_mask).  This is the "free" byproduct:
                              output_compress is also produced here.
-      attn_ms     – Stage 2: BlockSparseAttentionWrapper vsa_blackwell (output_select).
+      attn_ms     – Stage 2: BlockSparseAttentionWrapper vsa_sm100_blk128 (output_select).
       total_ms    – compress_ms + attn_ms  (output_compress + output_select = final output)
     Dense:
       dense_ms    – flashinfer.single_prefill_with_kv_cache (auto backend)
@@ -623,7 +640,7 @@ def test_vsa_performance_vs_dense(workspace):
             C,
             topk,
         )
-        vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell")
+        vsa_w = BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk128")
         vsa_w.plan(
             None,
             None,
@@ -667,7 +684,7 @@ def test_vsa_performance_vs_dense(workspace):
 
 
 # ===========================================================================
-# blk64 tests — BSA blk64 C++ kernel (kSparseBlockSize=64, kRows=64)
+# blk64 tests — BSA blk64 CuTe-DSL kernel (kSparseBlockSize=64, kRows=64)
 # ===========================================================================
 
 R64 = C64 = 64  # blk64 block granularity
@@ -675,9 +692,57 @@ HEAD_DIM_BLK64 = 128  # blk64 kernel requires head_dim=128
 
 
 def _make_wrapper_blk64(workspace):
-    return BlockSparseAttentionWrapper(workspace, backend="vsa_blackwell_blk64")
+    return BlockSparseAttentionWrapper(workspace, backend="vsa_sm100_blk64")
 
 
+@_requires_sm100_or_sm103
+def test_vsa_blk64_rejects_empty_rows(workspace):
+    """plan() must raise ValueError when any Q-block has zero KV blocks (BSR and block_mask)."""
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    MB = NB = 4
+    M = N = MB * R64
+    num_heads = 8
+
+    # BSR path: first Q-block has no KV blocks (indptr[1] == indptr[0])
+    indptr = torch.tensor([0, 0, 2, 3, 4], dtype=torch.int32, device=device)
+    indices = torch.tensor([0, 1, 2, 3], dtype=torch.int32, device=device)
+    wrapper = _make_wrapper_blk64(workspace)
+    with pytest.raises(ValueError, match="empty sparse rows"):
+        wrapper.plan(
+            indptr,
+            indices,
+            M,
+            N,
+            R64,
+            C64,
+            num_heads,
+            num_heads,
+            HEAD_DIM_BLK64,
+            q_data_type=dtype,
+        )
+
+    # block_mask path: second Q-block is all False
+    block_mask = torch.ones(num_heads, MB, NB, dtype=torch.bool, device=device)
+    block_mask[:, 1, :] = False
+    wrapper2 = _make_wrapper_blk64(workspace)
+    with pytest.raises(ValueError, match="empty sparse rows"):
+        wrapper2.plan(
+            None,
+            None,
+            M,
+            N,
+            R64,
+            C64,
+            num_heads,
+            num_heads,
+            HEAD_DIM_BLK64,
+            q_data_type=dtype,
+            block_mask=block_mask,
+        )
+
+
+@_requires_sm100_or_sm103
 @pytest.mark.parametrize(
     "density,num_blocks,num_heads",
     [
@@ -718,6 +783,7 @@ def test_vsa_blk64_accuracy(density, num_blocks, num_heads, workspace):
     torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
 
 
+@_requires_sm100_or_sm103
 @pytest.mark.parametrize(
     "seqlen,topk_frac",
     [
@@ -761,11 +827,452 @@ def test_vsa_blk64_accuracy_vs_dense(seqlen, topk_frac, workspace):
     torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
 
 
+@_requires_sm100_or_sm103
+@pytest.mark.parametrize("kv_splits", [1, 2, 4, "auto"])
+def test_vsa_blk64_kv_splits(kv_splits, workspace):
+    """blk64 output must match the dense reference across kv_splits values."""
+    device = torch.device("cuda")
+    torch.manual_seed(0)
+    dtype = torch.bfloat16
+    num_heads = 8
+    num_blocks = 8
+    M = N = num_blocks * R64
+
+    q = torch.randn(M, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+
+    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
+    o_ref = _pytorch_ref(q, k, v, indptr, indices, R64, C64)
+
+    wrapper = _make_wrapper_blk64(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
+        q_data_type=dtype,
+        kv_splits=kv_splits,
+    )
+    o = wrapper.run(q, k, v)
+
+    torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
+
+
+def test_sm100_blk64_kv_splits_from_count_thresholds():
+    """Lock the auto-kv_splits heuristic's active-KV-block threshold (3500).
+
+    Retuned from the original 256/450/900 tiers after measuring on B200
+    that those tiers regressed vs. kv_splits=1 (see
+    sm100_blk64_kv_splits_from_count's docstring). Pure Python logic, no
+    GPU/quack dependency -- documents the boundary that
+    test_vsa_blk64_auto_kv_splits_large_topk below exercises end-to-end.
+    """
+    from flashinfer.cute_dsl.sparse.sm100_blk64.dispatch_helpers import (
+        sm100_blk64_kv_splits_from_count,
+    )
+
+    assert sm100_blk64_kv_splits_from_count(3499) == 1
+    assert sm100_blk64_kv_splits_from_count(3500) == 8
+
+
+@_requires_sm100_or_sm103
+def test_vsa_blk64_auto_kv_splits_large_topk(workspace):
+    """kv_splits="auto" must actually resolve to >1 once top-k reaches the
+    sm100_blk64_kv_splits_from_count threshold (3500), not just accuracy-pass
+    at the small top-k used by test_vsa_blk64_kv_splits (where "auto"
+    trivially resolves to 1 and never exercises the split-KV/combine path).
+
+    The threshold was retuned from 256 to 3500 after B200 measurements
+    showed splitting at 256 active blocks regressed ~2.2x vs. kv_splits=1
+    for this exact (MB=1, num_heads=4) shape -- see
+    sm100_blk64_kv_splits_from_count's docstring. This test's shape (NB=4096,
+    density=0.9 -> 3686 active blocks) sits solidly inside the range
+    measured to give a consistent 4-6x speedup, and total_q_tiles=4 stays
+    well under the separate total_q_tiles>=512 gate in
+    sm100_blk64_auto_kv_splits, so it still exercises the
+    sm100_blk64_kv_splits_from_count path (not the large-Q gate).
+    """
+    from unittest.mock import patch
+
+    from flashinfer.cute_dsl.sparse import bsa_attn_sm100_blk64 as _blk64_mod
+
+    device = torch.device("cuda")
+    torch.manual_seed(15)
+    dtype = torch.bfloat16
+    num_heads = 4
+    # MB=1, NB=4096 at density=0.9 -> exactly 3686 active KV blocks for the
+    # single Q-block row, comfortably past the >= 3500 auto-split threshold.
+    MB64, NB64 = 1, 4096
+    M, N = MB64 * R64, NB64 * R64
+    density = 0.9
+
+    q = torch.randn(M, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+
+    indptr, indices = _build_random_bsr(MB64, NB64, density, device)
+    active_blocks = int(indptr[1].item())
+    assert active_blocks == 3686, (
+        f"expected exactly 3686 active KV blocks for the single Q row, got {active_blocks}"
+    )
+    o_ref = _pytorch_ref(q, k, v, indptr, indices, R64, C64)
+
+    wrapper = _make_wrapper_blk64(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
+        q_data_type=dtype,
+        kv_splits="auto",
+    )
+
+    original_resolve = _blk64_mod.resolve_sm100_blk64_split_workspace
+    resolved = {}
+
+    def _spy(q_bhsd, value_dim, kv_splits_i, allow_fallback, output_dtype):
+        result = original_resolve(
+            q_bhsd, value_dim, kv_splits_i, allow_fallback, output_dtype
+        )
+        resolved["kv_splits_i"] = result
+        return result
+
+    with patch.object(
+        _blk64_mod, "resolve_sm100_blk64_split_workspace", side_effect=_spy
+    ):
+        o = wrapper.run(q, k, v)
+
+    assert resolved.get("kv_splits_i", 1) > 1, (
+        "expected kv_splits='auto' to resolve to >1 at top-k=3686 "
+        f"(sm100_blk64_kv_splits_from_count threshold), got {resolved}"
+    )
+    torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
+
+
+def _quantize_fp8_sage(q, k, v, num_heads, seqlen_q, seqlen_k, head_dim):
+    """Per-(head,token) scale for q/k, per-(head,dim) scale for v; symmetric e4m3 quant."""
+    E4M3_MAX = 448.0
+
+    q_scale_hs = q.float().abs().amax(dim=-1).clamp_min(1e-6) / E4M3_MAX  # [Sq, H]
+    q_scale = q_scale_hs.permute(1, 0).unsqueeze(0).contiguous()  # [1, H, Sq]
+    q_fp8 = (
+        (q.float() / q_scale_hs.unsqueeze(-1))
+        .clamp(-E4M3_MAX, E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+
+    n_buckets = (seqlen_k + 15) // 16
+    k_amax = (
+        k.float().abs().reshape(n_buckets, 16, num_heads, head_dim).amax(dim=(1, 3))
+    )
+    k_scale = (
+        (k_amax.clamp_min(1e-6) / E4M3_MAX).permute(1, 0).unsqueeze(0).contiguous()
+    )  # [1, H, n_buckets]
+    k_scale_bcast = (
+        k_scale.squeeze(0).permute(1, 0).repeat_interleave(16, dim=0)[:seqlen_k]
+    )  # [N, H]
+    k_fp8 = (
+        (k.float() / k_scale_bcast.unsqueeze(-1))
+        .clamp(-E4M3_MAX, E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+
+    v_amax = v.float().abs().amax(dim=0)  # [H, D]
+    v_scale = (v_amax.clamp_min(1e-6) / E4M3_MAX).contiguous()  # [H, D]
+    v_fp8 = (
+        (v.float() / v_scale.unsqueeze(0))
+        .clamp(-E4M3_MAX, E4M3_MAX)
+        .to(torch.float8_e4m3fn)
+    )
+
+    return q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale
+
+
+@_requires_sm100_or_sm103
+@pytest.mark.parametrize("num_heads", [4, 8])
+def test_vsa_blk64_sage_fp8(num_heads, workspace):
+    """Sage-FP8 blk64 path must be close to the bf16 dense reference (loose tol for fp8 noise)."""
+    device = torch.device("cuda")
+    torch.manual_seed(2)
+    num_blocks = 8
+    M = N = num_blocks * R64
+
+    q_bf16 = torch.randn(
+        M, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+    k_bf16 = torch.randn(
+        N, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+    v_bf16 = torch.randn(
+        N, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+
+    q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale = _quantize_fp8_sage(
+        q_bf16, k_bf16, v_bf16, num_heads, M, N, HEAD_DIM_BLK64
+    )
+
+    # Uniform-density BSR gives every row the same nnz count, satisfying the
+    # Sage-FP8 kernel's "no variable q2k_block_nums" requirement.
+    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
+
+    # Reference uses the dequantized values (fp8 round-trip noise expected).
+    q_deq = (q_fp8.float() * q_scale.squeeze(0).permute(1, 0).unsqueeze(-1)).to(
+        torch.bfloat16
+    )
+    k_deq = (
+        k_fp8.float()
+        * k_scale.squeeze(0)
+        .permute(1, 0)
+        .repeat_interleave(16, dim=0)[:N]
+        .unsqueeze(-1)
+    ).to(torch.bfloat16)
+    v_deq = (v_fp8.float() * v_scale.unsqueeze(0)).to(torch.bfloat16)
+    o_ref = _pytorch_ref(q_deq, k_deq, v_deq, indptr, indices, R64, C64)
+
+    wrapper = _make_wrapper_blk64(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
+        q_data_type=torch.float8_e4m3fn,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    o = wrapper.run(q_fp8, k_fp8, v_fp8)
+
+    torch.testing.assert_close(o_ref.float(), o.float(), atol=6e-2, rtol=6e-2)
+
+
+@_requires_sm100_or_sm103
+@pytest.mark.parametrize("use_clc", [True, False])
+def test_vsa_blk64_use_clc_explicit(use_clc, workspace):
+    """Explicit use_clc=True/False override must produce correct output."""
+    device = torch.device("cuda")
+    torch.manual_seed(3)
+    dtype = torch.bfloat16
+    num_heads = 8
+    num_blocks = 8
+    M = N = num_blocks * R64
+
+    q = torch.randn(M, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    k = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+    v = torch.randn(N, num_heads, HEAD_DIM_BLK64, dtype=dtype, device=device)
+
+    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
+    o_ref = _pytorch_ref(q, k, v, indptr, indices, R64, C64)
+
+    wrapper = _make_wrapper_blk64(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
+        q_data_type=dtype,
+        use_clc=use_clc,
+    )
+    o = wrapper.run(q, k, v)
+    torch.testing.assert_close(o_ref.float(), o.float(), atol=1e-2, rtol=1e-2)
+
+
+@_requires_sm100_or_sm103
+@pytest.mark.parametrize("num_heads", [4, 8])
+@pytest.mark.parametrize("kv_splits", [2, 16])
+def test_vsa_blk64_sage_fp8_kv_splits(num_heads, kv_splits, workspace):
+    """Sage-FP8 blk64 with kv_splits>1; kv_splits=16 additionally hits use_fast_16_split.
+
+    _build_random_bsr with NB=32 and density=0.5 gives int(round(0.5*32))=16
+    blocks per row for every row — uniform by construction, satisfying both the
+    Sage-FP8 uniform-topk constraint and use_fast_16_split's
+    uniform_block_sparse_num >= kv_splits=16 requirement.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(4)
+    num_blocks = 32
+    M = N = num_blocks * R64
+
+    q_bf16 = torch.randn(
+        M, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+    k_bf16 = torch.randn(
+        N, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+    v_bf16 = torch.randn(
+        N, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+
+    q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale = _quantize_fp8_sage(
+        q_bf16, k_bf16, v_bf16, num_heads, M, N, HEAD_DIM_BLK64
+    )
+
+    indptr, indices = _build_random_bsr(num_blocks, num_blocks, 0.5, device)
+
+    q_deq = (q_fp8.float() * q_scale.squeeze(0).permute(1, 0).unsqueeze(-1)).to(
+        torch.bfloat16
+    )
+    k_deq = (
+        k_fp8.float()
+        * k_scale.squeeze(0)
+        .permute(1, 0)
+        .repeat_interleave(16, dim=0)[:N]
+        .unsqueeze(-1)
+    ).to(torch.bfloat16)
+    v_deq = (v_fp8.float() * v_scale.unsqueeze(0)).to(torch.bfloat16)
+    o_ref = _pytorch_ref(q_deq, k_deq, v_deq, indptr, indices, R64, C64)
+
+    wrapper = _make_wrapper_blk64(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
+        q_data_type=torch.float8_e4m3fn,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_splits=kv_splits,
+    )
+    o = wrapper.run(q_fp8, k_fp8, v_fp8)
+    torch.testing.assert_close(o_ref.float(), o.float(), atol=6e-2, rtol=6e-2)
+
+
+@_requires_sm100_or_sm103
+@pytest.mark.parametrize("num_heads", [4, 8])
+def test_vsa_blk64_sage_fp8_auto_kv_splits(num_heads, workspace):
+    """Sage-FP8 blk64 with kv_splits="auto" must use the FP8-specific heuristic
+    (sm100_blk64_auto_fp8_kv_splits), not silently fall back to the BF16-tuned
+    sm100_blk64_auto_kv_splits/sm100_blk64_kv_splits_from_count -- previously
+    untested (and previously unimplemented: the port had no FP8-specific
+    heuristic at all).
+
+    MB=8, NB=512 at density=0.5 -> exactly 256 active KV blocks per row,
+    with q_tiles = num_heads * MB well under the 512 large-Q gate for both
+    num_heads=4 and 8, so this exercises sm100_blk64_auto_fp8_kv_splits'
+    topk-tiered branches (not its own large-Q gate).
+    """
+    from unittest.mock import patch
+
+    from flashinfer.cute_dsl.sparse import bsa_attn_sm100_blk64 as _blk64_mod
+    from flashinfer.cute_dsl.sparse.sm100_blk64.dispatch_helpers import (
+        sm100_blk64_auto_fp8_kv_splits,
+    )
+
+    device = torch.device("cuda")
+    torch.manual_seed(6)
+    MB, NB = 8, 512
+    M, N = MB * R64, NB * R64
+    density = 0.5
+
+    q_bf16 = torch.randn(
+        M, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+    k_bf16 = torch.randn(
+        N, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+    v_bf16 = torch.randn(
+        N, num_heads, HEAD_DIM_BLK64, dtype=torch.bfloat16, device=device
+    )
+
+    q_fp8, k_fp8, v_fp8, q_scale, k_scale, v_scale = _quantize_fp8_sage(
+        q_bf16, k_bf16, v_bf16, num_heads, M, N, HEAD_DIM_BLK64
+    )
+
+    indptr, indices = _build_random_bsr(MB, NB, density, device)
+    active_blocks = int(indptr[1].item())
+    assert active_blocks == 256, (
+        f"expected exactly 256 active KV blocks per row, got {active_blocks}"
+    )
+    expected_kv_splits = sm100_blk64_auto_fp8_kv_splits(active_blocks, num_heads, M)
+    assert expected_kv_splits > 1, (
+        f"test shape should exercise the split-KV path, got kv_splits={expected_kv_splits}"
+    )
+
+    q_deq = (q_fp8.float() * q_scale.squeeze(0).permute(1, 0).unsqueeze(-1)).to(
+        torch.bfloat16
+    )
+    k_deq = (
+        k_fp8.float()
+        * k_scale.squeeze(0)
+        .permute(1, 0)
+        .repeat_interleave(16, dim=0)[:N]
+        .unsqueeze(-1)
+    ).to(torch.bfloat16)
+    v_deq = (v_fp8.float() * v_scale.unsqueeze(0)).to(torch.bfloat16)
+    o_ref = _pytorch_ref(q_deq, k_deq, v_deq, indptr, indices, R64, C64)
+
+    wrapper = _make_wrapper_blk64(workspace)
+    wrapper.plan(
+        indptr,
+        indices,
+        M,
+        N,
+        R64,
+        C64,
+        num_heads,
+        num_heads,
+        HEAD_DIM_BLK64,
+        q_data_type=torch.float8_e4m3fn,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kv_splits="auto",
+    )
+
+    original_resolve = _blk64_mod.resolve_sm100_blk64_split_workspace
+    resolved = {}
+
+    def _spy(q_bhsd, value_dim, kv_splits_i, allow_fallback, output_dtype):
+        result = original_resolve(
+            q_bhsd, value_dim, kv_splits_i, allow_fallback, output_dtype
+        )
+        resolved["kv_splits_i"] = result
+        return result
+
+    with patch.object(
+        _blk64_mod, "resolve_sm100_blk64_split_workspace", side_effect=_spy
+    ):
+        o = wrapper.run(q_fp8, k_fp8, v_fp8)
+
+    assert resolved.get("kv_splits_i") == expected_kv_splits, (
+        f"expected kv_splits='auto' to resolve via sm100_blk64_auto_fp8_kv_splits "
+        f"to {expected_kv_splits}, got {resolved}"
+    )
+    torch.testing.assert_close(o_ref.float(), o.float(), atol=6e-2, rtol=6e-2)
+
+
 # ---------------------------------------------------------------------------
 # blk64 performance: seqlen × density sweep
 # ---------------------------------------------------------------------------
 
 
+@_requires_sm100_or_sm103
 @pytest.mark.skipif(
     not os.environ.get("FLASHINFER_TEST_PERF"),
     reason="performance benchmark, set FLASHINFER_TEST_PERF=1 to run",
@@ -1099,6 +1606,7 @@ def test_vsa_asymmetric_seqlen(MB, NB, num_heads, density, workspace):
 # ---------------------------------------------------------------------------
 
 
+@_requires_sm100_or_sm103
 @pytest.mark.parametrize(
     "MB64,NB64,density",
     [
@@ -1199,6 +1707,7 @@ def test_vsa_return_lse(dtype, num_blocks, num_heads, workspace):
 # ---------------------------------------------------------------------------
 
 
+@_requires_sm100_or_sm103
 def test_vsa_blk64_return_lse(workspace):
     """blk64 return_lse=True must produce finite LSE values matching PyTorch reference."""
     device = torch.device("cuda")

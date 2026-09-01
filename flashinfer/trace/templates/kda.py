@@ -35,6 +35,10 @@ recurrent_kda_trace = TraceTemplate(
         "state_pool_size": Var(description="Number of writable state slots."),
         "source_pool_size": Var(description="Number of committed-state slots."),
         "num_sequences": Var(description="Number of state-source indices."),
+        "num_checkpoints": Var(description="Number of packed prefill checkpoints."),
+        "num_checkpoint_offsets": Var(
+            description="Number of packed checkpoint cumulative offsets."
+        ),
     },
     inputs={
         "q": Tensor(["batch_size", "seq_len", "num_q_heads", "head_dim"]),
@@ -56,6 +60,21 @@ recurrent_kda_trace = TraceTemplate(
             optional=True,
             description="Committed-state slot selected for each sequence.",
         ),
+        "ssm_state_indices": Tensor(
+            ["num_sequences"],
+            optional=True,
+            description="Writable state-pool slot selected for each prefill sequence.",
+        ),
+        "state_checkpoints": Tensor(
+            ["num_checkpoints", "num_v_heads", "head_dim", "head_dim"],
+            optional=True,
+            description="Caller-owned packed KDA pre-block state output.",
+        ),
+        "checkpoint_cu_starts": Tensor(
+            ["num_checkpoint_offsets"],
+            optional=True,
+            description="Per-sequence cumulative packed checkpoint counts.",
+        ),
         "scale": Scalar("float32", optional=True),
         "output_final_state": Scalar("int32", optional=True),
         "use_qk_l2norm_in_kernel": Scalar("int32", optional=True),
@@ -63,6 +82,7 @@ recurrent_kda_trace = TraceTemplate(
         "lower_bound": Scalar("float32", optional=True),
         "num_spec_tokens": Scalar("int32", optional=True),
         "beta_is_logit": Scalar("int32", optional=True),
+        "checkpoint_every_n_tokens": Scalar("int32", optional=True),
     },
     outputs={
         "output": Tensor(
@@ -74,10 +94,76 @@ recurrent_kda_trace = TraceTemplate(
             dtype="bfloat16",
             optional=True,
         ),
+        "state_checkpoints": Tensor(
+            ["num_checkpoints", "num_v_heads", "head_dim", "head_dim"],
+            dtype="bfloat16",
+            optional=True,
+            param="state_checkpoints",
+        ),
     },
     constraints=[
         "num_v_heads % num_q_heads == 0",
         "head_dim in (64, 128)",
+        "num_checkpoint_offsets == num_sequences + 1",
+    ],
+    tags=["stage:decode", "status:verified"],
+)
+
+
+packed_kda_decode_trace = TraceTemplate(
+    op_type="kda",
+    name_prefix="packed_kda_decode",
+    description=(
+        "Serving-native Kimi K3 T=1 recurrent decode from a packed, "
+        "post-convolution QKV row. The recurrent state pool is mutated in place."
+    ),
+    axes={
+        "batch_size": Var(description="Number of one-token decode rows."),
+        # The public output is rank four, but its optional caller-owned buffer
+        # is the only tensor that carries this dimension.
+        "singleton": Const(
+            description="Fixed single-token output dimension.", abbrev="", value=1
+        ),
+        "num_heads": Const(description="Number of KDA heads.", abbrev="h"),
+        "head_dim": Const(description="KDA head dimension.", abbrev="d"),
+        "mixed_width": Const(description="Width of the packed QKV row.", abbrev=""),
+        "gate_width": Const(
+            description="Width of the raw per-channel gate.", abbrev=""
+        ),
+        "state_pool_size": Var(description="Number of writable recurrent-state slots."),
+    },
+    inputs={
+        "mixed_qkv": Tensor(["batch_size", "mixed_width"]),
+        "raw_gate": Tensor(["batch_size", "gate_width"]),
+        "raw_beta": Tensor(["batch_size", "num_heads"]),
+        "A_log": Tensor(["num_heads"]),
+        "dt_bias": Tensor(["gate_width"]),
+        "state": Tensor(["state_pool_size", "num_heads", "head_dim", "head_dim"]),
+        "state_indices": Tensor(["batch_size"]),
+        "output": Tensor(
+            ["batch_size", "singleton", "num_heads", "head_dim"],
+            optional=True,
+            description="Optional caller-owned output allocation.",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "singleton", "num_heads", "head_dim"],
+            dtype_from="mixed_qkv",
+        ),
+        "state": Tensor(
+            ["state_pool_size", "num_heads", "head_dim", "head_dim"],
+            dtype_from="state",
+            param="state",
+            description="Updated recurrent-state pool (in place).",
+        ),
+    },
+    constraints=[
+        "num_heads == 12",
+        "head_dim == 128",
+        "singleton == 1",
+        "mixed_width == 3 * num_heads * head_dim",
+        "gate_width == num_heads * head_dim",
     ],
     tags=["stage:decode", "status:verified"],
 )

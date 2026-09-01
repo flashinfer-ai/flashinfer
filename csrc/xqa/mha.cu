@@ -89,7 +89,11 @@ constexpr uint32_t nbValidRows = headGrpSize * beamWidth;
 constexpr uint2 warpTile = {64, roundUp(nbValidRows, 16U)};
 static_assert(nbValidRows <= warpTile.y);
 
-constexpr uint32_t gemm1WarpsPerGrp = exactDiv(headElems, warpTile.x);
+// For headElems > warpTile.x * ctaShapeInWarps.x (i.e. 512), each gemm1 warp owns
+// nbHeadSplits head-dim slices of warpTile.x elems each (slice idx = warpIdxInGrp +
+// gemm1WarpsPerGrp * split), instead of requiring more warps than the CTA has.
+constexpr uint32_t gemm1WarpsPerGrp = mha::min(exactDiv(headElems, warpTile.x), ctaShapeInWarps.x);
+constexpr uint32_t nbHeadSplits = exactDiv(headElems, warpTile.x* gemm1WarpsPerGrp);
 constexpr uint32_t gemm1NbWarpGrps =
     exactDiv(ctaShapeInWarps.x, gemm1WarpsPerGrp);  // warp groups split along seqLen dim.
 
@@ -99,17 +103,22 @@ constexpr uint2 ctaTile = {
 
 constexpr uint32_t cvtExpansion = exactDiv(inputElemSize, cacheElemSize);
 
+// At HEAD_ELEMS > 256 the group-shared V buffer holds full heads (grpLoadV), so shrink
+// the V tile sequence length to keep smem within budget: on 99KB archs (SM86/89/120/121)
+// 16-bit KV needs 16 tokens per tile (fp8 fits at 32); 227KB archs fit 32 for both.
 #ifndef __CUDA_ARCH__
 constexpr uint32_t preferedKHeadPartBytes = 64;
-__constant__ constexpr uint32_t cacheVTileSeqLen = 32;
+__constant__ constexpr uint32_t cacheVTileSeqLen =
+    (HEAD_ELEMS > 256 && CACHE_ELEM_ENUM == 0 ? 16 : 32);
 #else
 #if __CUDA_ARCH__ == 860 || __CUDA_ARCH__ == 890 || __CUDA_ARCH__ == 1200 || __CUDA_ARCH__ == 1210
 constexpr uint32_t preferedKHeadPartBytes = 64;
-__constant__ constexpr uint32_t cacheVTileSeqLen = 32;
+__constant__ constexpr uint32_t cacheVTileSeqLen =
+    (HEAD_ELEMS > 256 && CACHE_ELEM_ENUM == 0 ? 16 : 32);
 #elif __CUDA_ARCH__ == 800 || __CUDA_ARCH__ == 870 || __CUDA_ARCH__ == 900 || \
     __CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1100
 constexpr uint32_t preferedKHeadPartBytes = 128;
-__constant__ constexpr uint32_t cacheVTileSeqLen = 64;
+__constant__ constexpr uint32_t cacheVTileSeqLen = (HEAD_ELEMS > 256 ? 32 : 64);
 #else
 #error "perferedKHeadPartBytes not defined"
 #endif
@@ -131,6 +140,8 @@ constexpr uint32_t nbPartsPerInputQHead = exactDiv(paddedInputHeadBytes, qHeadPa
 // @fixme: when true, and nbVBuffers is only 2, we need to sync all warps in a group after finishing
 // using a buffer and before refill it with prefetch data. We may need at least 3.
 constexpr bool grpLoadV = GRP_LOAD_V;
+// Multiple head-dim slices per warp require the group-shared full-head V buffer.
+static_assert(nbHeadSplits == 1 || grpLoadV);
 
 // number of shared memory buffers for latency hiding
 constexpr uint32_t nbQBuffers = mha::min(nbPartsPerInputQHead, 2u);  // for latency hiding
@@ -848,7 +859,7 @@ __device__ inline void copyOutputToGlobalMem(Warp const& warp, OutputHead* dst, 
 #endif
                                              uint2 dstOffset, SharedMem::XSmemBuffer const& src) {
   static_assert(sizeof(PaddedInputHead) ==
-                grainBytes * SharedMem::XSmemBuffer::cols * gemm1WarpsPerGrp);
+                grainBytes * SharedMem::XSmemBuffer::cols * gemm1WarpsPerGrp * nbHeadSplits);
 #if SPEC_DEC
   static_assert(warpTile.y <= SharedMem::XSmemBuffer::rows);
 #else
@@ -1161,7 +1172,7 @@ __device__ inline void smemXVPartGemm(Warp const& warp, WarpAcc& acc, bool skipX
                                      SharedMem::VSmemBuffer::cols ==
                                  headElems);
   if (grpLoadV) {
-    assert(idxNSplit < gemm1WarpsPerGrp);
+    assert(idxNSplit < gemm1WarpsPerGrp * nbHeadSplits);
   } else {
     assert(idxNSplit == 0);
   }
@@ -2308,6 +2319,20 @@ CUBIN_EXPORT __global__
                      "todo: need to substrate from idxPageBeg for beam switching");
           loadPages(idxPageBeg);
         }
+      } else if constexpr (cacheVTileSeqStride % tokensPerPage != 0) {
+        // Neither "an xIter fits in one page" nor "a vIter advances whole pages" holds
+        // (e.g. cacheVTileSeqLen 16 with page size 32). Incremental stepping cannot be
+        // exact here, so derive the next tile's first page directly from its absolute
+        // sequence offset (nextStep already accounts for the multi-block sub-sequence
+        // stride via seqIter).
+        uint32_t seqIterN, xIterN, vIterN, idxBeamN;
+        mha::tie(seqIterN, xIterN, vIterN, idxBeamN) = nextStep(seqIter, xIter, vIter, idxBeam);
+        unused(idxBeamN);
+        uint32_t const seqOffsetNext = ctaTile.x * seqIterN +
+                                       warpTile.x * nbXTilesPerXIter * xIterN +
+                                       cacheVTileSeqStride * vIterN + cacheVTileSeqLen * warpGrpIdx;
+        idxPageBeg = seqOffsetNext / tokensPerPage;
+        loadPages(idxPageBeg);
       } else {
         constexpr auto step_per_viter = exactDiv(cacheVTileSeqStride, tokensPerPage);
         bool const isLastVIter = (vIter == nbVItersPerXIter - 1);
@@ -2375,8 +2400,8 @@ CUBIN_EXPORT __global__
     globalRowMax.fill(safeInitRowMax);
     ThrdRegRowMax globalRowSum;
     globalRowSum.fill(0);
-    // the accumulator
-    WarpAcc acc{};
+    // the accumulators, one per head-dim slice owned by this warp
+    Vec<WarpAcc, nbHeadSplits> accs{};
     if (grpLoadV) {
       unused(pWarpGrpBar->arrive());
     }
@@ -2489,7 +2514,10 @@ CUBIN_EXPORT __global__
                   ThrdRegRowMax const accRowScales = expf(globalRowMaxOld - globalRowMax);
                   globalRowSum = globalRowSum * accRowScales;
                   // @fixme: when tmpAcc is used, this can be delayed.
-                  rescaleAcc(warp, acc, accRowNeedRescaleMask, accRowScales);
+#pragma unroll
+                  for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+                    rescaleAcc(warp, accs[hs], accRowNeedRescaleMask, accRowScales);
+                  }
                 }
                 if (!enableMicroFastPath || !skipXRowRescale) {
                   xRowScales = skipXRowRescale ? xRowScales : expf(xTileRowMax - globalRowMax);
@@ -2509,25 +2537,31 @@ CUBIN_EXPORT __global__
             auto const& smemVSfPart = getSmemVSfTile(idxCurrSMemVBuf);
 #endif
 
-            // do computation from shared memory X and V tiles
+            // do computation from shared memory X and V tiles. With nbHeadSplits > 1
+            // (headElems > 256), each warp computes multiple head-dim slices from the
+            // group-shared full-head V tile.
+#pragma unroll
+            for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+              uint32_t const idxNSplit = grpLoadV ? (warpIdxInGrp + gemm1WarpsPerGrp * hs) : 0;
 #if BEAM_WIDTH == 1
-            smemXVPartGemm<CacheElem>(warp, acc, skipXRowRescale, xRowNeedRescaleMask, xRowScales,
-                                      smemXTile, idxVTile, smemVTile,
+              smemXVPartGemm<CacheElem>(warp, accs[hs], skipXRowRescale, xRowNeedRescaleMask,
+                                        xRowScales, smemXTile, idxVTile, smemVTile,
 #if ENABLE_4BIT_KV_CACHE
-                                      smemVSfPart,
+                                        smemVSfPart,
 #endif
-                                      grpLoadV ? warpIdxInGrp : 0);
+                                        idxNSplit);
 #else
-            WarpAcc tmpAcc{};
-            smemXVPartGemm<CacheElem>(warp, tmpAcc, skipXRowRescale, xRowNeedRescaleMask,
-                                      xRowScales, smemXTile, idxVTile, smemVTile,
+              WarpAcc tmpAcc{};
+              smemXVPartGemm<CacheElem>(warp, tmpAcc, skipXRowRescale, xRowNeedRescaleMask,
+                                        xRowScales, smemXTile, idxVTile, smemVTile,
 #if ENABLE_4BIT_KV_CACHE
-                                      smemVSfPart,
+                                        smemVSfPart,
 #endif
-                                      grpLoadV ? warpIdxInGrp : 0);
-            pickAccRowsForBeamSearch(warp, acc, tmpAcc, isConvergedTile(seqIter), idxBeam,
-                                     [](float& d, float s) { d += s; });
+                                        idxNSplit);
+              pickAccRowsForBeamSearch(warp, accs[hs], tmpAcc, isConvergedTile(seqIter), idxBeam,
+                                       [](float& d, float s) { d += s; });
 #endif
+            }
             if (grpLoadV) {
               unused(pWarpGrpBar->arrive());
             }
@@ -2568,7 +2602,10 @@ CUBIN_EXPORT __global__
         auto const globalRowMaxNew = fmaxf(globalRowMax, otherRowMax);
         auto const scaleForThis = expf(globalRowMax - globalRowMaxNew);
         auto const scaleForOther = expf(otherRowMax - globalRowMaxNew);
-        rescaleAcc(warp, acc, fullRescaleMask, scaleForThis);
+#pragma unroll
+        for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+          rescaleAcc(warp, accs[hs], fullRescaleMask, scaleForThis);
+        }
         globalRowSum = globalRowSum * scaleForThis + otherRowSum * scaleForOther;
         globalRowMax = globalRowMaxNew;
       }
@@ -2591,9 +2628,11 @@ CUBIN_EXPORT __global__
 #if LOW_PREC_OUTPUT
       voScale *= rcpOutScale;
 #endif
-      rescaleAcc(warp, acc, fullRescaleMask, rcpRowSum * ThrdRegRowMax::filled(voScale));
+#pragma unroll
+      for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+        rescaleAcc(warp, accs[hs], fullRescaleMask, rcpRowSum * ThrdRegRowMax::filled(voScale));
+      }
     }
-    GemmOutRegTile const outTile = toFp16(acc);
 
     auto mergeAndSaveOutTile = [&](GemmOutRegTile const& tile, bool reorder) {
       if constexpr (gemm1NbWarpGrps == 1) {
@@ -2626,11 +2665,30 @@ CUBIN_EXPORT __global__
 #else
     bool reorderOutRows = inputElemSize == 2 && cacheElemSize == 1;
 #endif
-    SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(outTile, reorderOutRows);
-    // In multi-block mode only the last CTA writes the merged output; the other
-    // sub-sequences only contribute their partials via global scratch below.
-    bool ctaShouldWriteOut = !isMultiBlock;
-    if (isMultiBlock) {
+    // Writes one head-dim slice (warpTile.x elems) of the output from the swizzled smem tile.
+    auto writeOutSlice = [&](SharedMem::XSmemBuffer const& smemOutTile, uint32_t hs) {
+      uint32_t const dstColOffset = warpTile.x * (warpIdxInGrp + gemm1WarpsPerGrp * hs);
+#if SPEC_DEC
+      copyOutputToGlobalMem(warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize,
+                            (idxHeadGrp * headGrpSize), nbValidHeadTokens,
+                            uint2{dstColOffset, nbValidRows * warpIdx.y + idxHeadTokenInGrp},
+                            smemOutTile);
+#else
+      copyOutputToGlobalMem(warp, &output[nbQHeads * beamWidth * idxReq], nbQHeads, idxHeadGrp,
+                            uint2{dstColOffset, nbValidRows * warpIdx.y}, smemOutTile);
+#endif
+    };
+    if (!isMultiBlock) {
+      // The swizzle buffer is reused across splits; the __syncthreads() at the start of
+      // mergeAndSaveOutTile separates one split's global write from the next split's store.
+#pragma unroll
+      for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+        SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(toFp16(accs[hs]), reorderOutRows);
+        if (warpGrpIdx == 0) {
+          writeOutSlice(*smemOutTile, hs);
+        }
+      }
+    } else {
       static_assert(ctaShapeInWarps.y == 1, "not implemented");
 #if SPEC_DEC
       // Includes both kHeads and qTokens.
@@ -2658,12 +2716,18 @@ CUBIN_EXPORT __global__
         rowSumBuffers[idxBuf].storeFromReg<false>(warp, globalRowSum);
       }
       using ScratchBuf = Array2D<LdGrain, nbValidRows, SharedMem::XSmemBuffer::cols>;
-      TinyPtr<Vec<ScratchBuf, gemm1WarpsPerGrp>> const scratchBuffers =
-          segmenter.newSeg<Vec<ScratchBuf, gemm1WarpsPerGrp>>(nbSubSeq);
-      // copy output to scratch
-      copyGrains<false, nbValidRows * ScratchBuf::cols, gemm1NbWarpGrps>(
-          warpGrpIdx, &scratchBuffers[idxBuf][warpIdxInGrp](0, 0), &(*smemOutTile)(0, 0));
-      __syncthreads();
+      constexpr uint32_t nbHeadSlices = gemm1WarpsPerGrp * nbHeadSplits;
+      TinyPtr<Vec<ScratchBuf, nbHeadSlices>> const scratchBuffers =
+          segmenter.newSeg<Vec<ScratchBuf, nbHeadSlices>>(nbSubSeq);
+      // copy output to scratch, one head-dim slice at a time
+#pragma unroll
+      for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+        SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(toFp16(accs[hs]), reorderOutRows);
+        copyGrains<false, nbValidRows * ScratchBuf::cols, gemm1NbWarpGrps>(
+            warpGrpIdx, &scratchBuffers[idxBuf][warpIdxInGrp + gemm1WarpsPerGrp * hs](0, 0),
+            &(*smemOutTile)(0, 0));
+        __syncthreads();
+      }
 #if __CUDA_ARCH__ == 1210
       // GB10 (sm121): device-scope release so the partials just written to global
       // scratch are visible to the last CTA (a different block) before the
@@ -2703,7 +2767,6 @@ CUBIN_EXPORT __global__
 
       // merge if we are the last CTA.
       bool const isLastCta = mbsmem.isLastCta;
-      ctaShouldWriteOut = isLastCta;
       if (isLastCta) {
         MultiBlockSMem::MBBuf& mbbuf = mbsmem.storage[warpIdx.y];
         SMemWarpRowMax& smemRowMax = reinterpret_cast<SMemWarpRowMax&>(smem);
@@ -2720,13 +2783,14 @@ CUBIN_EXPORT __global__
         auto getTileBuf = [&](auto& buffers, uint32_t d) -> decltype(buffers[0][0][0])& {
           return buffers[warpGrpIdx][warpIdxInGrp][d];
         };
-        auto loadBufAsync = [&](uint32_t n) {
+        auto loadBufAsync = [&](uint32_t n, uint32_t hs) {
           uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
           SharedMem::XSmemBuffer& dstTile = getTileBuf(mbbuf.tiles, d);
           SMemWarpRowMax& dstRowSum = getTileBuf(mbbuf.tileRowSums, d);
           SMemWarpRowMax& dstRowMax = getTileBuf(mbbuf.tileRowMax, d);
           copyGrains<true, sizeof(ScratchBuf) / grainBytes, 1, true>(
-              0, &dstTile(0, 0), &scratchBuffers[idxBufBase + n][warpIdxInGrp](0, 0));
+              0, &dstTile(0, 0),
+              &scratchBuffers[idxBufBase + n][warpIdxInGrp + gemm1WarpsPerGrp * hs](0, 0));
           constexpr uint32_t nbGrainsPerRowMaxBuf = exactDiv(sizeof(SMemWarpRowMax), grainBytes);
           copyGrains<true, roundUp(nbGrainsPerRowMaxBuf, 32u), 1, nbGrainsPerRowMaxBuf % 32 == 0>(
               0, reinterpret_cast<LdGrain*>(&dstRowSum),
@@ -2737,73 +2801,74 @@ CUBIN_EXPORT __global__
               reinterpret_cast<LdGrain const*>(&rowMaxBuffers[idxBufBase + n]),
               nbGrainsPerRowMaxBuf);
         };
-        loadBufAsync(warpGrpIdx);
-        ldgsts::commitGroup();
-        WarpAcc sumAcc{};
-        ThrdRegRowMax partialMergedRowSum{};
-        for (uint32_t n = warpGrpIdx; n < nbSubSeqPerSeq; n += gemm1NbWarpGrps) {
-          if (n + gemm1NbWarpGrps < nbSubSeqPerSeq) {
-            loadBufAsync(n + gemm1NbWarpGrps);
-          }
+        // Merge one head-dim slice at a time. mergedRowSum is recomputed per slice from
+        // per-subseq scalars; the value is identical across slices. The smem regions used
+        // by mbbuf tiles and the mergeAndSaveOutTile swizzle buffer are ordered by the
+        // __syncthreads() calls inside this loop and in mergeAndSaveOutTile.
+        for (uint32_t hs = 0; hs < nbHeadSplits; hs++) {
+          loadBufAsync(warpGrpIdx, hs);
           ldgsts::commitGroup();
-          ldgsts::waitGroup<1>();
-          uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
-          WarpAcc tile = toWarpAcc(loadGemmOutTile(warp, mbbuf.tiles[warpGrpIdx][warpIdxInGrp][d]));
-          ThrdRegRowMax const tileRowMax = getTileBuf(mbbuf.tileRowMax, d).loadToReg<false>(warp);
-          ThrdRegRowMax const tileRowSum = getTileBuf(mbbuf.tileRowSums, d).loadToReg<false>(warp);
-          ThrdRegRowMax const tileRowScales = expf(tileRowMax - mergedRowMax);
-          ThrdRegRowMax const scaledTileRowSum = tileRowSum * tileRowScales;
-          partialMergedRowSum = partialMergedRowSum + scaledTileRowSum;
-          assert(std::isfinite(partialMergedRowSum[0]));
-          rescaleAcc(warp, tile, fullRescaleMask, scaledTileRowSum);
-          sumAcc = sumAcc + tile;
-        }
-
-        ThrdRegRowMax mergedRowSum{};
-        if (gemm1NbWarpGrps == 1) {
-          mergedRowSum = partialMergedRowSum;
-        } else {
-          if (warpIdxInGrp == 0) {
-            mbbuf.mergedRowSum[warpGrpIdx].storeFromReg<false>(warp, partialMergedRowSum);
+          WarpAcc sumAcc{};
+          ThrdRegRowMax partialMergedRowSum{};
+          for (uint32_t n = warpGrpIdx; n < nbSubSeqPerSeq; n += gemm1NbWarpGrps) {
+            if (n + gemm1NbWarpGrps < nbSubSeqPerSeq) {
+              loadBufAsync(n + gemm1NbWarpGrps, hs);
+            }
+            ldgsts::commitGroup();
+            ldgsts::waitGroup<1>();
+            uint32_t const d = n / gemm1NbWarpGrps % nbTileBuffers;
+            WarpAcc tile =
+                toWarpAcc(loadGemmOutTile(warp, mbbuf.tiles[warpGrpIdx][warpIdxInGrp][d]));
+            ThrdRegRowMax const tileRowMax = getTileBuf(mbbuf.tileRowMax, d).loadToReg<false>(warp);
+            ThrdRegRowMax const tileRowSum =
+                getTileBuf(mbbuf.tileRowSums, d).loadToReg<false>(warp);
+            ThrdRegRowMax const tileRowScales = expf(tileRowMax - mergedRowMax);
+            ThrdRegRowMax const scaledTileRowSum = tileRowSum * tileRowScales;
+            partialMergedRowSum = partialMergedRowSum + scaledTileRowSum;
+            assert(std::isfinite(partialMergedRowSum[0]));
+            rescaleAcc(warp, tile, fullRescaleMask, scaledTileRowSum);
+            sumAcc = sumAcc + tile;
           }
-          __syncthreads();
+
+          ThrdRegRowMax mergedRowSum{};
+          if (gemm1NbWarpGrps == 1) {
+            mergedRowSum = partialMergedRowSum;
+          } else {
+            if (warpIdxInGrp == 0) {
+              mbbuf.mergedRowSum[warpGrpIdx].storeFromReg<false>(warp, partialMergedRowSum);
+            }
+            __syncthreads();
 #ifndef NDEBUG
-          assert((mbbuf.mergedRowSum[warpGrpIdx].loadToReg<false>(warp) == partialMergedRowSum)[0]);
-          __syncthreads();
+            assert(
+                (mbbuf.mergedRowSum[warpGrpIdx].loadToReg<false>(warp) == partialMergedRowSum)[0]);
+            __syncthreads();
 #endif
 #pragma unroll
-          for (uint32_t i = 0; i < gemm1NbWarpGrps; i++) {
-            mergedRowSum = mergedRowSum + mbbuf.mergedRowSum[i].loadToReg<false>(warp);
-            assert(std::isfinite(mergedRowSum[0]));
+            for (uint32_t i = 0; i < gemm1NbWarpGrps; i++) {
+              mergedRowSum = mergedRowSum + mbbuf.mergedRowSum[i].loadToReg<false>(warp);
+              assert(std::isfinite(mergedRowSum[0]));
+            }
           }
-        }
-        if (attentionSinks != nullptr) {
-          // Attention sinks are per head.
+          if (attentionSinks != nullptr) {
+            // Attention sinks are per head.
 #if SPEC_DEC
-          addAttentionSinksSpecDec(mergedRowSum, mergedRowMax,
-                                   attentionSinks + headGrpSize * idxHeadGrp, headGrpSize);
+            addAttentionSinksSpecDec(mergedRowSum, mergedRowMax,
+                                     attentionSinks + headGrpSize * idxHeadGrp, headGrpSize);
 #else
-          addAttentionSinks(mergedRowSum, mergedRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+            addAttentionSinks(mergedRowSum, mergedRowMax,
+                              attentionSinks + headGrpSize * idxHeadGrp);
 #endif
+          }
+          __syncthreads();
+          rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
+          GemmOutRegTile const mergedOutTile = toFp16(sumAcc);
+          SharedMem::XSmemBuffer* smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
+          if (warpGrpIdx == 0) {
+            writeOutSlice(*smemOutTile, hs);
+          }
+          __syncthreads();
         }
-        __syncthreads();
-        rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
-        GemmOutRegTile const mergedOutTile = toFp16(sumAcc);
-        smemOutTile = mergeAndSaveOutTile(mergedOutTile, false);
       }
-    }
-    if (ctaShouldWriteOut && warpGrpIdx == 0) {
-#if SPEC_DEC
-      copyOutputToGlobalMem(
-          warp, &output[reqSeqOffset * nbQHeads], nbQHeads, headGrpSize, (idxHeadGrp * headGrpSize),
-          nbValidHeadTokens,
-          uint2{warpTile.x * warpIdxInGrp, nbValidRows * warpIdx.y + idxHeadTokenInGrp},
-          *smemOutTile);
-#else
-      copyOutputToGlobalMem(warp, &output[nbQHeads * beamWidth * idxReq], nbQHeads, idxHeadGrp,
-                            uint2{warpTile.x * warpIdxInGrp, nbValidRows * warpIdx.y},
-                            *smemOutTile);
-#endif
     }
   }
 }

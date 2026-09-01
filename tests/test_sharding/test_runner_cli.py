@@ -147,7 +147,7 @@ def test_empty_test_path_environment_uses_default_suite(
 
     args = unit_test_runner._parser().parse_args(["run"])
 
-    assert args.test_path == Path("tests/")
+    assert args.test_path == [Path("tests/")]
 
 
 @pytest.mark.parametrize(
@@ -565,6 +565,36 @@ def test_sm90():
     assert [node["order"] for node in isolated_nodes] == [0]
 
 
+def test_pytest_root_is_stable_for_repository_and_external_scopes(
+    tmp_path: Path,
+) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    test_file = suite / "test_sample.py"
+    test_file.write_text("def test_case(): pass\n", encoding="utf-8")
+
+    assert runner._pytest_root(REPO_ROOT, REPO_ROOT / "tests") == REPO_ROOT.resolve()
+    assert runner._pytest_root(REPO_ROOT, suite) == suite.resolve()
+    assert runner._pytest_root(REPO_ROOT, test_file) == suite.resolve()
+
+
+def test_collection_preserves_external_pytest_config(tmp_path: Path) -> None:
+    suite = tmp_path / "suite"
+    suite.mkdir()
+    (suite / "pytest.ini").write_text(
+        "[pytest]\npython_files = check_*.py\n",
+        encoding="utf-8",
+    )
+    (suite / "check_sample.py").write_text(
+        "def test_case(): pass\n",
+        encoding="utf-8",
+    )
+
+    nodes = runner._collect_nodes(REPO_ROOT, suite, 15, 0)
+
+    assert [node["nodeid"] for node in nodes] == ["check_sample.py::test_case"]
+
+
 def test_collection_termination_uses_configured_grace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -670,6 +700,7 @@ def test_worker_exception_is_reported_as_infrastructure_error(
         plan=plan,
         execution=execution,
         operation_started_at=time.time(),
+        test_path=REPO_ROOT / "tests",
     )
 
     assert result == 3
@@ -760,6 +791,7 @@ def test_setup_error_is_not_masked_when_lease_cleanup_also_fails(
             plan=plan,
             execution=execution,
             operation_started_at=time.time(),
+            test_path=REPO_ROOT / "tests",
         )
 
     assert "cannot close shard leases" in capsys.readouterr().out
@@ -820,6 +852,7 @@ def test_partial_shard_lease_claim_is_rolled_back(
             plan=plan,
             execution=execution,
             operation_started_at=time.time(),
+            test_path=REPO_ROOT / "tests",
         )
 
     leases = tmp_path / "junit" / "attempts" / "attempt-0001" / "leases"
@@ -966,6 +999,7 @@ def test_lease_heartbeat_failure_aborts_work_and_is_reported(
         plan=plan,
         execution=execution,
         operation_started_at=time.time(),
+        test_path=REPO_ROOT / "tests",
     )
 
     assert result == 3
@@ -1005,7 +1039,11 @@ def test_collection_deadline_reports_that_pytest_was_killed(tmp_path: Path) -> N
 
 def test_plan_run_and_completed_reuse_publish_resumable_artifacts(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Pytest 9 may otherwise inherit the repository root for this external
+    # temporary suite, which used to leak pytest-of-*/... prefixes into node IDs.
+    monkeypatch.setenv("PYTEST_ADDOPTS", f"--rootdir={REPO_ROOT}")
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "conftest.py").write_text(
@@ -1681,3 +1719,75 @@ def test_finalize_fan_in_closes_an_attempt_after_all_leases_are_gone(
     )
     assert summary["complete"] is True
     assert summary["synthetic"] == 1
+
+
+def test_test_path_environment_splits_multiple_scopes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TEST_PATH", "tests/moe tests/gdn")
+
+    args = unit_test_runner._parser().parse_args(["run"])
+
+    assert args.test_path == [Path("tests/moe"), Path("tests/gdn")]
+
+
+def test_shell_settings_prints_space_separated_paths(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("TEST_PATH", "tests/moe tests/gdn")
+
+    assert unit_test_runner._shell_settings([]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[:2] == ["run", "tests/moe tests/gdn"]
+
+
+def test_cli_test_path_accepts_multiple_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("TEST_PATH", raising=False)
+
+    args = unit_test_runner._parser().parse_args(
+        ["run", "--test-path", "tests/moe", "tests/gdn"]
+    )
+
+    assert args.test_path == [Path("tests/moe"), Path("tests/gdn")]
+
+
+def test_collapse_drops_nested_file(tmp_path: Path) -> None:
+    parent = tmp_path / "suite"
+    parent.mkdir()
+    child = parent / "test_sample.py"
+    child.write_text("def test_case(): pass\n", encoding="utf-8")
+
+    assert runner.collapse_test_paths([parent, child]) == (parent.resolve(),)
+    assert runner.collapse_test_paths([child, parent]) == (parent.resolve(),)
+
+
+def test_missing_test_path_fails_closed(tmp_path: Path) -> None:
+    present = tmp_path / "suite"
+    present.mkdir()
+    missing = tmp_path / "missing"
+    selection = runner.SelectionSettings(
+        test_paths=(present, missing),
+        sanity_test=False,
+        sample_rate=5,
+        sample_offset=0,
+    )
+
+    with pytest.raises(runner.RunnerStateError, match="missing"):
+        runner._validate_selection(selection)
+
+
+def test_collect_nodes_unions_multiple_directories(tmp_path: Path) -> None:
+    first = tmp_path / "a"
+    second = tmp_path / "b"
+    first.mkdir()
+    second.mkdir()
+    (first / "test_a.py").write_text("def test_a(): pass\n", encoding="utf-8")
+    (second / "test_b.py").write_text("def test_b(): pass\n", encoding="utf-8")
+
+    nodes = runner._collect_nodes(REPO_ROOT, (first, second), 15, 0)
+    nodeids = {node["nodeid"] for node in nodes}
+
+    assert "test_a.py::test_a" in nodeids
+    assert "test_b.py::test_b" in nodeids

@@ -6,7 +6,7 @@ import os
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Union, Hashable
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union, Hashable
 
 import tvm_ffi
 from filelock import FileLock
@@ -331,6 +331,7 @@ class JitSpecNvcc(JitSpec):
     extra_include_dirs: Optional[List[Path]]
     is_class: bool = False
     needs_device_linking: bool = False
+    post_load_adapter: Optional[Callable[[Any], Any]] = None
 
     @property
     def ninja_path(self) -> Path:
@@ -427,7 +428,10 @@ class JitSpecNvcc(JitSpec):
             run_ninja(self.build_dir, self.ninja_path, verbose)
 
     def load(self, so_path: Optional[Path] = None):
-        return tvm_ffi.load_module(str(so_path or self.jit_library_path))
+        module = tvm_ffi.load_module(str(so_path or self.jit_library_path))
+        if self.post_load_adapter is not None:
+            return self.post_load_adapter(module)
+        return module
 
     def get_compile_commands(self) -> List[dict]:
         """
@@ -520,6 +524,7 @@ def gen_jit_spec(
     extra_ldflags: Optional[List[str]] = None,
     extra_include_paths: Optional[List[Union[str, Path]]] = None,
     needs_device_linking: bool = False,
+    post_load_adapter: Optional[Callable[[Any], Any]] = None,
 ) -> JitSpec:
     check_cuda_arch()
     # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
@@ -543,6 +548,7 @@ def gen_jit_spec(
         *get_nvcc_parallelism_flags(),
         "-use_fast_math",
         "-Xfatbin=-compress-all",  # Ensure all device binaries are compressed
+        "--compress-mode=size",
         "-DFLASHINFER_ENABLE_F16",
         "-DFLASHINFER_ENABLE_BF16",
         "-DFLASHINFER_ENABLE_FP8_E4M3",
@@ -587,6 +593,7 @@ def gen_jit_spec(
             else None
         ),
         needs_device_linking=needs_device_linking,
+        post_load_adapter=post_load_adapter,
     )
 
     # Register the spec in the global registry

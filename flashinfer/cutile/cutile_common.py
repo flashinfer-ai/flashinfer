@@ -6,8 +6,8 @@
 
 This module intentionally has *no* ``cuda.tile`` imports so it stays
 importable on environments where the cuTile compile chain isn't present
-(e.g. ``flashinfer-ci-cu126/cu128/cu129`` docker images, which target CUDA
-12.x ecosystems and don't ship the ``nvidia-cuda-tileiras`` cu13 toolchain).
+(e.g. the ``flashinfer-ci-cu129/cu130`` docker images, which don't ship the
+``nvidia-cuda-tileiras`` compile toolchain).
 Callers — including pytest skip-guards — can use
 :func:`is_cuda_tile_available` to gate ``backend="cutile"`` paths without
 triggering a hard ``ImportError`` at module import time.

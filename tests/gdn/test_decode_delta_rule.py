@@ -268,7 +268,8 @@ def _test_decode_kernel_pretranspose(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
+# B is absent from the compile key; these span small/threshold/large grids.
+@pytest.mark.parametrize("batch_size", [1, 32, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_basic_pretranspose(
     dtype: str,
@@ -433,7 +434,8 @@ def _test_decode_kernel_nontranspose(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
+# use_small_batch = B < 32 is the only batch term in the compile key.
+@pytest.mark.parametrize("batch_size", [1, 16, 32, 512])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_decode_kernel_basic_nontranspose(
     dtype: str,
@@ -1229,7 +1231,8 @@ def _test_verify_kernel_mtp(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
+# One B per get_mtp_config bucket.
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 16])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_verify_kernel_mtp(
     dtype: str,
@@ -1262,14 +1265,57 @@ def test_verify_kernel_mtp(
     )
 
 
+@pytest.mark.parametrize(
+    "batch_size",
+    [1, 5],
+    ids=["inline", "warp_specialized"],
+)
+def test_verify_kernel_mtp_reuses_compile_across_cache_modes(monkeypatch, batch_size):
+    import cutlass.cute as cute
+    import flashinfer.gdn_kernels.gdn_decode_mtp as gdn_decode_mtp
+
+    original_compile = cute.compile
+    compile_count = 0
+
+    def counted_compile(*args, **kwargs):
+        nonlocal compile_count
+        compile_count += 1
+        return original_compile(*args, **kwargs)
+
+    gdn_decode_mtp._get_compiled_mtp_kernel.cache_clear()
+    gdn_decode_mtp._get_compiled_mtp_kernel_inline.cache_clear()
+    monkeypatch.setattr(cute, "compile", counted_compile)
+    try:
+        for cache_intermediate_states in (True, False):
+            _test_verify_kernel_mtp(
+                dtype="bfloat16",
+                batch_size=batch_size,
+                num_q_heads=16,
+                num_k_heads=16,
+                num_v_heads=32,
+                head_size=128,
+                seq_len=2,
+                scale=1.0,
+                alpha=True,
+                beta=True,
+                cache_intermediate_states=cache_intermediate_states,
+            )
+        assert compile_count == 1
+    finally:
+        gdn_decode_mtp._get_compiled_mtp_kernel.cache_clear()
+        gdn_decode_mtp._get_compiled_mtp_kernel_inline.cache_clear()
+
+
 # ============================================================================
 # Test MTP kernel with FP32 state, cache ON, state update ON (comprehensive)
 # This tests the full production configuration: all BS and T values
 # ============================================================================
 
 
-@pytest.mark.parametrize("seq_len", [2, 3, 4, 5, 6, 7, 8])
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
+# T >= 3 all select the same tile config, so 3/5/6/7 only re-specialize on T.
+@pytest.mark.parametrize("seq_len", [2, 4, 8])
+# One B per get_mtp_config bucket.
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 64])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_mtp_fp32_state_with_cache_and_state_update(
     dtype: str,
@@ -1284,8 +1330,8 @@ def test_mtp_fp32_state_with_cache_and_state_update(
     - FP32 h state (not bf16)
     - cache_intermediate_states=True
     - disable_state_update=False (h is updated)
-    - All batch sizes: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512
-    - All sequence lengths: 2, 3, 4, 5, 6, 7, 8
+    - One batch size per get_mtp_config bucket: 1, 4, 8, 16, 64
+    - Sequence lengths 2, 4, 8 (T>=3 shares one tile config)
     """
     scale_val = 1.0 / math.sqrt(128)  # head_size=128
     _test_verify_kernel_mtp(
@@ -2077,7 +2123,8 @@ def _test_gdn_decode_bf16_state_t1_kernel(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32), (16, 16, 64)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256, 512])
+# One B per _get_bf16_mtp_config bucket, at both HV=32 and HV=64.
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_t1_kernel(
     dtype: str,
@@ -2341,13 +2388,15 @@ except ImportError:
 
 @pytest.mark.parametrize("tile_v", [32, 64, 128])
 @pytest.mark.parametrize("cache_intermediate_states", [True, False])
-@pytest.mark.parametrize("seq_len", [2, 3, 4, 5, 6, 7, 8])
+# T >= 3 all select the same tile config, so 3/5/6/7 only re-specialize on T.
+@pytest.mark.parametrize("seq_len", [2, 4, 8])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 64)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128, 256])
+# tile_v is an explicit axis here, so B adds no specialization.
+@pytest.mark.parametrize("batch_size", [1, 16, 256])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_wide_vec_mtp_kernel(
     monkeypatch,

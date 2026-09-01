@@ -185,6 +185,9 @@ files when ``FLASHINFER_TRACE_DUMP=1``:
    * - ``flashinfer.gdn_decode``
      - ``gated_delta_rule_decode``, ``gated_delta_rule_mtp``
      - ``gdn``
+   * - ``flashinfer``
+     - ``gdn_fused_decode_step``
+     - ``gdn``
    * - ``flashinfer.gdn_prefill``
      - ``chunk_gated_delta_rule``
      - ``gdn``

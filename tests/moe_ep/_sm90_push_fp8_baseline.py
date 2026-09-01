@@ -69,7 +69,13 @@ def quant_weights(w13: torch.Tensor, w2: torch.Tensor) -> tuple[torch.Tensor, ..
         w2_fp8[expert].copy_(quantized)
         w2_scales[expert].copy_(scales)
     result = (w13_fp8, w13_scales, w2_fp8, w2_scales)
-    _weight_cache[key] = (weakref.ref(w13), weakref.ref(w2), result)
+
+    # Evict the entry as soon as either source tensor dies, so the cache does
+    # not pin four dead GPU tensors per (w13, w2) pair across test cases.
+    def _evict(_ref: weakref.ReferenceType, key: tuple[int, int] = key) -> None:
+        _weight_cache.pop(key, None)
+
+    _weight_cache[key] = (weakref.ref(w13, _evict), weakref.ref(w2, _evict), result)
     return result
 
 

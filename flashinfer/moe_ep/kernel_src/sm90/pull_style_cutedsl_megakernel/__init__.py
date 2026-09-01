@@ -4,7 +4,7 @@
 
 Public API for the ``moe_ep`` backends over the SM90 FP8 mega kernel
 (``Sm90MegaMoEFp8Kernel`` / ``Sm90MegaMoESwapABFp8Kernel``).  This tree is a
-FORK of the SM100 package (``kernel_src/sm100/cutedsl_megamoe``): the kernel
+FORK of the SM100 package (``kernel_src/cutedsl_megamoe``): the kernel
 team's SM90 work branched from the same repo, so ``src/`` duplicates the
 shared runtime (``common``, ``src``, ``moe_nvfp4_swapab``) at the SM90 drop's
 revision.  The two trees are separate backends and are mutually exclusive per

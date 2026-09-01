@@ -392,11 +392,22 @@ class Const:
         * ``""`` — omit this axis from the file name entirely.
         * Any other string — use that as the prefix, e.g. ``"h"`` produces
           ``h32`` for ``num_qo_heads=32``.
+    value:
+        Optional fixed integer value. When provided, tracing resolves this
+        axis without requiring a tensor or scalar argument to carry it.
     """
 
-    def __init__(self, description: str = "", abbrev: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        description: str = "",
+        abbrev: Optional[str] = None,
+        value: Optional[int] = None,
+    ) -> None:
+        if value is not None and type(value) is not int:
+            raise TypeError("Const value must be an integer or None")
         self.description = description
         self.abbrev = abbrev
+        self.value = value
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +434,10 @@ class Tensor:
     dtype_from:
         For *outputs*: name of an input ``param`` whose dtype to copy.
         Takes precedence over ``dtype`` when both are set.
+    dtype_from_scalar:
+        For *outputs*: name of an optional dtype-valued scalar to use when the
+        tensor named by ``dtype_from`` is absent. Takes precedence over
+        ``dtype`` but not over ``dtype_from``.
     optional:
         Whether the tensor may be absent.
     description:
@@ -437,6 +452,7 @@ class Tensor:
         tuple_idx: Optional[int] = None,
         dtype: Optional[str] = None,
         dtype_from: Optional[str] = None,
+        dtype_from_scalar: Optional[str] = None,
         optional: bool = False,
         description: str = "",
     ) -> None:
@@ -445,6 +461,7 @@ class Tensor:
         self.tuple_idx = tuple_idx
         self.dtype = dtype
         self.dtype_from = dtype_from
+        self.dtype_from_scalar = dtype_from_scalar
         self.optional = optional
         self.description = description
 
@@ -582,6 +599,7 @@ class TraceTemplate:
         For each axis, pick a source that is *always present* in a generated
         trace sample, in priority order:
 
+          0. an explicit ``Const(value=...)``;
           1. a required (non-optional) ``Tensor`` whose ``dim_names`` include
              the axis — read ``shape[dim_idx]``;
           2. a ``Scalar`` input named after the axis — read the kwarg value;
@@ -620,6 +638,14 @@ class TraceTemplate:
 
             return extractor
 
+        def _make_fixed_extractor(
+            value: int,
+        ) -> Callable[[Dict[str, Any]], Optional[int]]:
+            def extractor(_kw: Dict[str, Any]) -> Optional[int]:
+                return value
+
+            return extractor
+
         def _tensor_source(
             axis_name: str, allow_optional: bool
         ) -> Optional[Callable[[Dict[str, Any]], Optional[int]]]:
@@ -637,8 +663,16 @@ class TraceTemplate:
             return None
 
         for axis_name in self.axes:
+            marker = self.axes[axis_name]
+            extractor: Optional[Callable[[Dict[str, Any]], Optional[int]]]
+            # 0. Explicitly fixed Const, independent of runtime arguments.
+            if isinstance(marker, Const) and marker.value is not None:
+                extractor = _make_fixed_extractor(marker.value)
+            else:
+                extractor = None
             # 1. Required tensor whose shape carries the axis.
-            extractor = _tensor_source(axis_name, allow_optional=False)
+            if extractor is None:
+                extractor = _tensor_source(axis_name, allow_optional=False)
             # 2. Scalar input named after the axis (always present).
             if extractor is None:
                 scalar_desc = self.inputs.get(axis_name)
@@ -760,6 +794,11 @@ class TraceTemplate:
                         ref_t = _get_tensor(kwargs, ref_param)
                         if ref_t is not None:
                             dtype = _dtype_str(ref_t.dtype)
+                        elif (
+                            descriptor.dtype_from_scalar is not None
+                            and kwargs.get(descriptor.dtype_from_scalar) is not None
+                        ):
+                            dtype = _dtype_str(kwargs[descriptor.dtype_from_scalar])
                         else:
                             # dtype_from may reference an output param that is
                             # absent when tracing symbolically; fall back to the

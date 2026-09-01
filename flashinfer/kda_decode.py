@@ -20,7 +20,7 @@ Kimi Delta Attention Decode - API Layer
 
 This file provides the public API for recurrent KDA decode operations.
 Kernel implementations are in ``flashinfer.kda_kernels``; callers may
-explicitly select the exported Cake backend.
+explicitly select Cake or use its narrow native auto-dispatch contract.
 """
 
 from typing import Literal, Optional
@@ -28,7 +28,11 @@ from typing import Literal, Optional
 import torch
 
 from .api_logging import flashinfer_api
-from .trace.templates.kda import fused_kda_decode_trace, recurrent_kda_trace
+from .trace.templates.kda import (
+    fused_kda_decode_trace,
+    packed_kda_decode_trace,
+    recurrent_kda_trace,
+)
 
 try:
     from .kda_kernels.fused_kda_decode import (
@@ -40,6 +44,7 @@ except (ImportError, RuntimeError):
     _run_fused_kda_decode = None
     _FUSED_KDA_DECODE_AVAILABLE = False
 
+from .kda_kernels import run_packed_kda_decode as _run_packed_kda_decode
 from .kda_kernels import run_recurrent_kda as _run_recurrent_kda
 
 # None when the CuTe DSL is missing or cannot target this device
@@ -71,7 +76,7 @@ def recurrent_kda(
     initial_state_indices: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
     *,
-    backend: Literal["cute-dsl", "cake"] = "cute-dsl",
+    backend: Literal["cute-dsl", "cake", "auto"] = "cute-dsl",
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Recurrent KDA (Kimi Delta Attention) decode kernel.
 
@@ -118,7 +123,9 @@ def recurrent_kda(
             ``g``. Default: ``False``.
         lower_bound (Optional[float]):
             If set, uses ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
-            gate formula instead of softplus. Must be negative.
+            gate formula. If ``None``, uses
+            ``-exp(A_log) * softplus(g + dt_bias)``. A supplied bound must be
+            negative.
         cu_seqlens (Optional[torch.Tensor]):
             Cumulative sequence lengths of shape ``[N+1]``. Must be int32.
         ssm_state_indices (Optional[torch.Tensor]):
@@ -146,11 +153,13 @@ def recurrent_kda(
             with ``initial_state_source``.
         beta_is_logit (bool):
             If ``True``, apply sigmoid to ``beta`` inside the recurrent kernel.
-        backend (Literal["cute-dsl", "cake"]):
+        backend (Literal["cute-dsl", "cake", "auto"]):
             Implementation backend. ``"cute-dsl"`` preserves the existing
             FlashInfer implementation. ``"cake"`` strictly selects an
             exported Cake kernel and raises when the call does not match one
-            of its supported contracts. Default: ``"cute-dsl"``.
+            of its supported contracts. ``"auto"`` selects Cake only for its
+            equal-head/D128/T1 unbounded-softplus contract, preserving CuTe
+            DSL for every other decode surface. Default: ``"cute-dsl"``.
 
     Returns:
         Tuple of ``(output, final_state)`` where ``final_state`` is ``None``
@@ -158,12 +167,14 @@ def recurrent_kda(
         :func:`flashinfer.kda_kernels.recurrent_kda.run_recurrent_kda` for the
         backend implementation.
     """
-    if backend not in ("cute-dsl", "cake"):
-        raise ValueError(f"backend must be 'cute-dsl' or 'cake', got {backend!r}")
+    if backend not in ("cute-dsl", "cake", "auto"):
+        raise ValueError(
+            f"backend must be 'cute-dsl', 'cake', or 'auto', got {backend!r}"
+        )
     if _run_recurrent_kda is None:
         raise NotImplementedError("recurrent KDA backend is unavailable")
 
-    return _run_recurrent_kda(
+    run_kwargs = dict(
         q=q,
         k=k,
         v=v,
@@ -185,7 +196,78 @@ def recurrent_kda(
         initial_state_source=initial_state_source,
         initial_state_indices=initial_state_indices,
         beta_is_logit=beta_is_logit,
-        backend=backend,
+    )
+    return _run_recurrent_kda(**run_kwargs, backend=backend)
+
+
+@flashinfer_api(trace=packed_kda_decode_trace)
+def packed_kda_decode(
+    mixed_qkv: torch.Tensor,
+    raw_gate: torch.Tensor,
+    raw_beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state: torch.Tensor,
+    state_indices: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    r"""Run serving-native packed Kimi K3 recurrent decode.
+
+    This operator consumes the post-convolution packed QKV row and raw gate
+    and beta logits directly. It fuses Q/K extraction and L2 normalization,
+    the Kimi K3 lower-bound gate transform, beta sigmoid, and one recurrent
+    state update into a single exported Cake kernel. It is specialized for
+    ``T=1``, ``H=12``, and ``K=V=128`` on exact SM100a and SM103a devices.
+
+    The fixed numerical contract uses ``scale=1/sqrt(128)``, L2 epsilon
+    ``1e-6``, and ``lower_bound=-5``. ``state`` is updated in place on the
+    caller's current PyTorch CUDA stream. Batches below 32 use the eight-row
+    value tile; batches of 32 or more use the sixteen-row value tile.
+
+    Args:
+        mixed_qkv:
+            Post-convolution packed QKV with shape ``[B, 3 * 12 * 128]`` and
+            dtype bfloat16. The last dimension must be contiguous; positive
+            padding between batch rows is allowed.
+        raw_gate:
+            Raw per-channel recurrence gate with shape ``[B, 12 * 128]`` and
+            dtype bfloat16. The last dimension must be contiguous.
+        raw_beta:
+            Raw delta-rule learning-rate logits with shape ``[B, 12]`` and
+            dtype bfloat16. The last dimension must be contiguous.
+        A_log:
+            Contiguous float32 log-decay parameter with shape ``[12]``.
+        dt_bias:
+            Contiguous float32 per-channel decay bias with shape ``[12 * 128]``.
+        state:
+            Caller-owned bfloat16 recurrent-state pool with shape
+            ``[N, 12, 128, 128]``. Its inner three dimensions must be compact;
+            the outer slot stride may contain arbitrary positive padding.
+        state_indices:
+            Contiguous CUDA int32 cache slot for each row, with shape ``[B]``.
+            Active indices must be unique and in bounds. ``-1`` marks an
+            inactive CUDA-graph padding row, which produces zero output and
+            does not access or update ``state``. These value constraints are
+            not host-validated, avoiding a device synchronization.
+        output:
+            Optional caller-owned contiguous bfloat16 output with shape
+            ``[B, 1, 12, 128]``. Supplying it avoids allocation and is required
+            for an allocation-free CUDA-graph replay path.
+
+    Returns:
+        The bfloat16 output with shape ``[B, 1, 12, 128]`` by default. When
+        ``output`` is supplied, the returned tensor is that exact allocation.
+    """
+    return _run_packed_kda_decode(
+        mixed_qkv=mixed_qkv,
+        raw_gate=raw_gate,
+        raw_beta=raw_beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state=state,
+        state_indices=state_indices,
+        output=output,
+        backend="cake",
     )
 
 

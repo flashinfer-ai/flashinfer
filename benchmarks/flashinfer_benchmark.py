@@ -31,6 +31,10 @@ def run_test(args):
         from routines.moe import run_moe_test
 
         res = run_moe_test(args)
+    elif args.routine in benchmark_apis["unified_moe"]:
+        from routines.unified_moe import run_unified_moe_test
+
+        res = run_unified_moe_test(args)
     elif args.routine in benchmark_apis["moe_comm"]:
         from routines.moe_comm import run_moe_comm_test
 
@@ -71,6 +75,11 @@ def run_test(args):
         from routines.gdn import run_gdn_test
 
         res = run_gdn_test(args)
+
+    elif args.routine in benchmark_apis["kda"]:
+        from routines.kda import run_kda_test
+
+        res = run_kda_test(args)
     elif args.routine in benchmark_apis["sparse_attention"]:
         from routines.sparse_attention import run_sparse_attention_test
 
@@ -120,6 +129,7 @@ def parse_args(line=sys.argv[1:]):
         choices=list(benchmark_apis["attention"])
         + list(benchmark_apis["gemm"])
         + list(benchmark_apis["moe"])
+        + list(benchmark_apis["unified_moe"])
         + list(benchmark_apis["moe_comm"])
         + list(benchmark_apis["allreduce_comm"])
         + list(benchmark_apis["mixed_comm"])
@@ -129,6 +139,7 @@ def parse_args(line=sys.argv[1:]):
         + list(benchmark_apis["rope"])
         + list(benchmark_apis["mamba"])
         + list(benchmark_apis["gdn"])
+        + list(benchmark_apis["kda"])
         + list(benchmark_apis["sparse_attention"])
         + list(benchmark_apis["topk_varlen"]),
     )
@@ -251,6 +262,10 @@ def parse_args(line=sys.argv[1:]):
         from routines.moe import parse_moe_args
 
         args = parse_moe_args(line, parser)
+    elif args.routine in benchmark_apis["unified_moe"]:
+        from routines.unified_moe import parse_unified_moe_args
+
+        args = parse_unified_moe_args(line, parser)
     elif args.routine in benchmark_apis["moe_comm"]:
         from routines.moe_comm import parse_moe_comm_args
 
@@ -291,6 +306,11 @@ def parse_args(line=sys.argv[1:]):
         from routines.gdn import parse_gdn_args
 
         args = parse_gdn_args(line, parser)
+
+    elif args.routine in benchmark_apis["kda"]:
+        from routines.kda import parse_kda_args
+
+        args = parse_kda_args(line, parser)
     elif args.routine in benchmark_apis["sparse_attention"]:
         from routines.sparse_attention import parse_sparse_attention_args
 

@@ -20,16 +20,23 @@ import torch
 import torch.nn.functional as F
 import pytest
 
-from flashinfer.utils import is_sm100a_supported
+from flashinfer.utils import get_compute_capability, is_sm100a_supported
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 
 
-def _skip_if_not_sm100():
+INTEGER_DTYPES = (
+    torch.int32,
+    torch.int64,
+)
+
+
+def _skip_if_not_supported():
     device = torch.device("cuda")
-    if not is_sm100a_supported(device):
-        pytest.skip("state_indices GDN prefill path requires SM100/SM103 (Blackwell)")
+    major, _ = get_compute_capability(device)
+    if major not in (9, 10, 12):
+        pytest.skip("state_indices GDN prefill path requires SM90, SM100, or SM120")
     cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
-    if cuda_major < 13:
+    if is_sm100a_supported(device) and cuda_major < 13:
         pytest.skip(f"SM100 GDN prefill requires CUDA 13+, got {torch.version.cuda}")
 
 
@@ -63,7 +70,12 @@ def _make_inputs(seq_lens, H, D, dtype, device, seed):
     )
     g = torch.exp(g_log).contiguous()
     beta = torch.rand(total, H, dtype=torch.float32, device=device).contiguous()
-    init_state = torch.randn(num_seqs, H, D, D, dtype=dtype, device=device).contiguous()
+    state_dtype = (
+        torch.float32 if get_compute_capability(device)[0] in (9, 12) else dtype
+    )
+    init_state = torch.randn(
+        num_seqs, H, D, D, dtype=state_dtype, device=device
+    ).contiguous()
     return q, k, v, g, beta, cu_seqlens, init_state
 
 
@@ -100,24 +112,29 @@ def _run(
     return output, final
 
 
-def _make_pool(init_state, perm, n_pool, pad, dtype, device):
+def _make_pool(init_state, perm, n_pool, pad, dtype, device, inner_stride=1):
     """Build a state pool holding init_state[i] at row perm[i].
 
-    ``pad > 0`` gives the pool a padded (non-compact) *first-dimension* stride
-    while keeping the inner ``[H, V, K]`` block fully contiguous -- exactly
-    TRT-LLM's mamba cache layout, where conv+ssm are packed per slot so only the
-    per-slot (dim-0) stride is padded. Built via ``as_strided`` over flat storage
-    so the padding lands only between slots, not inside the state block.
+    ``pad > 0`` gives the pool a padded first-dimension stride, matching a state
+    pool packed with other per-slot data. ``inner_stride > 1`` additionally
+    exercises a fully strided ``[H, V, K]`` view.
     """
     _, H, D, _ = init_state.shape
-    if pad == 0:
+    if pad == 0 and inner_stride == 1:
         pool = torch.zeros(n_pool, H, D, D, dtype=dtype, device=device)
     else:
-        slot_stride = H * D * D + pad  # usable state block + inter-slot padding
+        slot_stride = H * D * D * inner_stride + pad
         storage = torch.zeros(n_pool * slot_stride, dtype=dtype, device=device)
-        pool = storage.as_strided((n_pool, H, D, D), (slot_stride, D * D, D, 1))
-        assert not pool.is_contiguous()  # dim-0 stride padded
-        assert pool.stride()[1:] == (D * D, D, 1)  # inner [H, V, K] contiguous
+        pool = storage.as_strided(
+            (n_pool, H, D, D),
+            (
+                slot_stride,
+                D * D * inner_stride,
+                D * inner_stride,
+                inner_stride,
+            ),
+        )
+        assert not pool.is_contiguous()
     for i, r in enumerate(perm):
         pool[r] = init_state[i]
     return pool
@@ -128,14 +145,14 @@ def _make_pool(init_state, perm, n_pool, pad, dtype, device):
     "seq_lens",
     [[128], [256], [128, 192, 64], [64, 512]],
 )
-@pytest.mark.parametrize("H", [16, 32])
+@pytest.mark.parametrize("H", [8, 16, 32])
 @pytest.mark.parametrize("pad", [0, 96])  # 0 = compact pool, 96 = non-compact
 @pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, use_cp):
     """A pool + state_indices in-place update must match the packed,
     sequence-ordered baseline bitwise (the kernel math is identical; only the
     addressed gmem row differs)."""
-    _skip_if_not_sm100()
+    _skip_if_not_supported()
     device = torch.device("cuda")
     D = 128
     num_seqs = len(seq_lens)
@@ -144,7 +161,8 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, use_cp):
     )
 
     # (a) packed baseline, no state_indices
-    out_state_a = torch.empty(num_seqs, H, D, D, dtype=dtype, device=device)
+    state_dtype = init_state.dtype
+    out_state_a = torch.empty(num_seqs, H, D, D, dtype=state_dtype, device=device)
     output_a, final_a = _run(
         q,
         k,
@@ -163,7 +181,7 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, use_cp):
     n_pool = num_seqs + 5
     perm = [(i * 3 + 2) % n_pool for i in range(num_seqs)]
     assert len(set(perm)) == num_seqs  # distinct slots
-    pool = _make_pool(init_state, perm, n_pool, pad, dtype, device)
+    pool = _make_pool(init_state, perm, n_pool, pad, state_dtype, device)
     idx = torch.tensor(perm, dtype=torch.int32, device=device)
     output_b, _ = _run(q, k, v, g, beta, cu_seqlens, pool, pool, idx, use_cp)
     torch.cuda.synchronize()
@@ -178,11 +196,129 @@ def test_prefill_state_indices_matches_packed(dtype, seq_lens, H, pad, use_cp):
     assert torch.equal(pool[untouched], torch.zeros_like(pool[untouched]))
 
 
+@pytest.mark.parametrize("index_dtype", INTEGER_DTYPES)
+@pytest.mark.parametrize("use_cp", [False, True])
+def test_prefill_integer_index_dtypes(index_dtype, use_cp):
+    """Sequence and state indices retain their integer dtype across dispatch."""
+    _skip_if_not_supported()
+    device = torch.device("cuda")
+    H, D = 8, 128
+    seq_lens = [64]
+    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        seq_lens, H, D, torch.bfloat16, device, seed=5
+    )
+    cu_seqlens = cu_seqlens.to(index_dtype)
+
+    packed_state = torch.empty_like(init_state)
+    packed_output, packed_final = _run(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        init_state.clone(),
+        packed_state,
+        None,
+        use_cp,
+    )
+
+    slots = [2]
+    pool = _make_pool(init_state, slots, 4, 96, init_state.dtype, device)
+    state_indices = torch.tensor(slots, dtype=index_dtype, device=device)
+    indexed_output, indexed_final = _run(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        pool,
+        pool,
+        state_indices,
+        use_cp,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(packed_output, indexed_output)
+    assert torch.equal(packed_final, indexed_final[slots])
+
+
+@pytest.mark.parametrize("use_cp", [False, True])
+def test_prefill_state_indices_preserves_inner_strides(use_cp):
+    """Indexed state views use the tensor's actual shape and strides."""
+    _skip_if_not_supported()
+    device = torch.device("cuda")
+    H, D = 8, 128
+    seq_lens = [64]
+    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        seq_lens, H, D, torch.bfloat16, device, seed=6
+    )
+
+    packed_state = torch.empty_like(init_state)
+    packed_output, packed_final = _run(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        init_state.clone(),
+        packed_state,
+        None,
+        use_cp,
+    )
+
+    slots = [2]
+    state_indices = torch.tensor(slots, dtype=torch.int32, device=device)
+    contiguous_pool = _make_pool(init_state, slots, 4, 96, init_state.dtype, device)
+    contiguous_output, contiguous_final = _run(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        contiguous_pool,
+        contiguous_pool,
+        state_indices,
+        use_cp,
+    )
+    assert torch.equal(packed_output, contiguous_output)
+    assert torch.equal(packed_final, contiguous_final[slots])
+
+    pool = _make_pool(
+        init_state,
+        slots,
+        4,
+        96,
+        init_state.dtype,
+        device,
+        inner_stride=2,
+    )
+    indexed_output, indexed_final = _run(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu_seqlens,
+        pool,
+        pool,
+        state_indices,
+        use_cp,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(packed_output, indexed_output)
+    assert torch.equal(packed_final, indexed_final[slots])
+
+
 def test_prefill_state_indices_requires_output_state_pool():
     """With state_indices set, output_state must be a caller-provided pool: an
     auto-allocated compact [num_seqs, ...] tensor would be indexed out of bounds
     by the pool slot ids, so output_state=None must be rejected."""
-    _skip_if_not_sm100()
+    _skip_if_not_supported()
     device = torch.device("cuda")
     H, D = 16, 128
     seq_lens = [128, 64]
@@ -192,10 +328,10 @@ def test_prefill_state_indices_requires_output_state_pool():
     )
     n_pool = num_seqs + 3
     perm = list(range(num_seqs))
-    pool = _make_pool(init_state, perm, n_pool, 0, torch.bfloat16, device)
+    pool = _make_pool(init_state, perm, n_pool, 0, init_state.dtype, device)
     idx = torch.tensor(perm, dtype=torch.int32, device=device)
     out = torch.empty(sum(seq_lens), H, D, dtype=torch.bfloat16, device=device)
-    # On the supported SM100/SM103 path this must be the output_state ValueError,
+    # On supported SM90/SM100 paths this must be the output_state ValueError,
     # not NotImplementedError (which would mean the kernel was wrongly rejected).
     with pytest.raises(ValueError, match="explicit output_state pool"):
         chunk_gated_delta_rule(
@@ -216,9 +352,52 @@ def test_prefill_state_indices_requires_output_state_pool():
 
 
 @pytest.mark.parametrize("use_cp", [False, True])
+def test_prefill_state_indices_without_final_state(use_cp):
+    """A state pool can supply initial state without requesting a final state."""
+    _skip_if_not_supported()
+    device = torch.device("cuda")
+    H, D = 16, 128
+    seq_lens = [64, 512]
+    q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
+        seq_lens, H, D, torch.bfloat16, device, seed=4
+    )
+
+    packed_output = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=init_state,
+        output_final_state=False,
+        cu_seqlens=cu_seqlens,
+        use_cp=use_cp,
+    )
+
+    slots = [3, 0]
+    pool = _make_pool(init_state, slots, 5, 96, init_state.dtype, device)
+    state_indices = torch.tensor(slots, dtype=torch.int32, device=device)
+    indexed_output = chunk_gated_delta_rule(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        initial_state=pool,
+        output_final_state=False,
+        cu_seqlens=cu_seqlens,
+        state_indices=state_indices,
+        use_cp=use_cp,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(packed_output, indexed_output)
+
+
+@pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_state_indices_none_is_default(use_cp):
     """state_indices=None must reproduce the packed path exactly (default)."""
-    _skip_if_not_sm100()
+    _skip_if_not_supported()
     device = torch.device("cuda")
     H, D = 16, 128
     seq_lens = [128, 192]
@@ -226,9 +405,9 @@ def test_prefill_state_indices_none_is_default(use_cp):
     q, k, v, g, beta, cu_seqlens, init_state = _make_inputs(
         seq_lens, H, D, torch.bfloat16, device, seed=1
     )
-    s1 = torch.empty(num_seqs, H, D, D, dtype=torch.bfloat16, device=device)
+    s1 = torch.empty(num_seqs, H, D, D, dtype=init_state.dtype, device=device)
     o1, f1 = _run(q, k, v, g, beta, cu_seqlens, init_state.clone(), s1, None, use_cp)
-    s2 = torch.empty(num_seqs, H, D, D, dtype=torch.bfloat16, device=device)
+    s2 = torch.empty(num_seqs, H, D, D, dtype=init_state.dtype, device=device)
     o2, f2 = _run(q, k, v, g, beta, cu_seqlens, init_state.clone(), s2, None, use_cp)
     torch.cuda.synchronize()
     assert torch.equal(o1, o2)

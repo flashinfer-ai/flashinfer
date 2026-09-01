@@ -19,6 +19,26 @@ CP_GDDR_PARALLELISM_THRESHOLD_NUMERATOR = 1
 CP_GDDR_PARALLELISM_THRESHOLD_DENOMINATOR = 3
 
 
+_INTEGER_DTYPES = (
+    torch.int32,
+    torch.int64,
+)
+
+
+def is_integer_dtype(dtype: torch.dtype) -> bool:
+    return dtype in _INTEGER_DTYPES
+
+
+def integer_dtype_to_cutlass(dtype: torch.dtype) -> type[cutlass.Numeric]:
+    try:
+        return {
+            torch.int32: cutlass.Int32,
+            torch.int64: cutlass.Int64,
+        }[dtype]
+    except KeyError as err:
+        raise RuntimeError(f"expected an integer dtype, got {dtype}") from err
+
+
 def _ceil_div(a, b):
     return (a + b - 1) // b
 
@@ -171,12 +191,12 @@ def choose_cp_chunk_len_host(
 
 @cute.jit
 def chunk_bound(
-    seq_idx: cutlass.Int32, total: cutlass.Int32, chunk_size: cutlass.Int32
+    seq_idx: cutlass.Int32, total, chunk_size: cutlass.Int32
 ) -> cutlass.Int32:
     m = seq_idx
     if total < m:
-        m = total
-    return m + (total - m) // chunk_size
+        m = cutlass.Int32(total)
+    return cutlass.Int32(m + (total - m) // chunk_size)
 
 
 @cute.jit
@@ -195,9 +215,11 @@ def logical_chunk_to_work_desc(
     chunk_idx_in_seq = logical_chunk_idx
     running = cutlass.Int32(0)
     for candidate_seq in cutlass.range(num_seqs, unroll=1):
-        seq_start = cutlass.Int32(cu_seqlens[candidate_seq])
-        seq_end = cutlass.Int32(cu_seqlens[candidate_seq + cutlass.Int32(1)])
-        seq_chunks = chunks_for_len(seq_end - seq_start, chunk_size)
+        seq_start = cu_seqlens[candidate_seq]
+        seq_len = cutlass.Int32(
+            cu_seqlens[candidate_seq + cutlass.Int32(1)] - seq_start
+        )
+        seq_chunks = chunks_for_len(seq_len, chunk_size)
         next_running = running + seq_chunks
         if logical_chunk_idx >= running and logical_chunk_idx < next_running:
             seq_idx = candidate_seq
@@ -209,7 +231,7 @@ def logical_chunk_to_work_desc(
 @cute.jit
 def varlen_chunk_idx(
     seq_idx: cutlass.Int32,
-    tok_idx_start: cutlass.Int32,
+    tok_idx_start,
     chunk_idx_in_seq: cutlass.Int32,
     chunk_size: cutlass.Int32,
 ) -> cutlass.Int32:

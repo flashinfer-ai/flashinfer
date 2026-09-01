@@ -69,6 +69,42 @@ constexpr uint32_t WARP_SIZE = 32;
 // Number of NVFP4 elements sharing one scale factor (UE4M3 byte).
 constexpr uint32_t NVFP4_SF_VEC_SIZE = 16;
 
+/*!
+ * \brief Convert four NVFP4 scale-factor bytes into two packed 16-bit pairs.
+ *
+ * Writes {pack(b0,b1), pack(b2,b3)} -- the two `half2`/`nv_bfloat162` operands that the
+ * per-fragment scale multiply consumes.
+ *
+ * Without a hardware e4m3->f16 convert, `static_cast<T>(__nv_fp8_e4m3)` expands to a software
+ * conversion whose denormal path is a data-dependent `while` loop: a divergent branch per scale
+ * byte, in the innermost loop. Packing the four bytes into one word lets the prmt/lop3 converter
+ * handle them together, branch-free.
+ *
+ * Where the hardware instruction exists we keep `static_cast` so it still lowers to it. The gate is
+ * FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED -- the same one vec_cast<*, __nv_fp8_e4m3> uses -- so
+ * this does not introduce a second, divergent notion of "has FP8 conversion".
+ */
+template <typename DTypeQ>
+__device__ __forceinline__ void nvfp4_sf4_to_packed2x2(uint8_t b0, uint8_t b1, uint8_t b2,
+                                                       uint8_t b3, uint2* out) {
+#if !defined(FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED)
+  uint32_t packed =
+      uint32_t(b0) | (uint32_t(b1) << 8) | (uint32_t(b2) << 16) | (uint32_t(b3) << 24);
+  fast_dequant_f8f16x4<__nv_fp8_e4m3, DTypeQ>(&packed, out);
+#else
+  using packed2 = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, __nv_bfloat162>;
+  __nv_fp8_e4m3 f0, f1, f2, f3;
+  f0.__x = b0;
+  f1.__x = b1;
+  f2.__x = b2;
+  f3.__x = b3;
+  packed2 lo{static_cast<DTypeQ>(f0), static_cast<DTypeQ>(f1)};
+  packed2 hi{static_cast<DTypeQ>(f2), static_cast<DTypeQ>(f3)};
+  out->x = *reinterpret_cast<uint32_t*>(&lo);
+  out->y = *reinterpret_cast<uint32_t*>(&hi);
+#endif
+}
+
 constexpr uint32_t get_num_warps_q(const uint32_t cta_tile_q) {
   if (cta_tile_q == 32) {
     return 1;  // HEAD_DIM_VO >= 512
@@ -1228,11 +1264,14 @@ __device__ __forceinline__ void compute_qk(
           using packed2_ = std::conditional_t<std::is_same_v<DTypeQ_, half>, half2, __nv_bfloat162>;
           constexpr uint32_t SF_COLS_K = KTraits::NUM_MMA_D_QK;  // HEAD_DIM_QK / 16
           uint32_t sf_base = (mma_kv * 16 + lane_idx / 4) * SF_COLS_K + mma_d;
-          __nv_fp8_e4m3 sf_a_fp8, sf_b_fp8;
-          sf_a_fp8.__x = k_sf_smem[sf_base];
-          sf_b_fp8.__x = k_sf_smem[sf_base + 8 * SF_COLS_K];
-          packed2_ scale_a{static_cast<DTypeQ_>(sf_a_fp8), static_cast<DTypeQ_>(sf_a_fp8)};
-          packed2_ scale_b{static_cast<DTypeQ_>(sf_b_fp8), static_cast<DTypeQ_>(sf_b_fp8)};
+          // b_frag[0,1] share KV row t/4 and b_frag[2,3] share row t/4+8, so each row's scale is
+          // duplicated across its half2: {a,a,b,b} -> {scale_a, scale_b}.
+          const uint8_t sf_a = k_sf_smem[sf_base];
+          const uint8_t sf_b = k_sf_smem[sf_base + 8 * SF_COLS_K];
+          uint2 sf_pair;
+          nvfp4_sf4_to_packed2x2<DTypeQ_>(sf_a, sf_a, sf_b, sf_b, &sf_pair);
+          const packed2_ scale_a = *(packed2_*)&sf_pair.x;
+          const packed2_ scale_b = *(packed2_*)&sf_pair.y;
           *(packed2_*)&b_frag[0] = __hmul2(*(packed2_*)&b_frag[0], scale_a);
           *(packed2_*)&b_frag[1] = __hmul2(*(packed2_*)&b_frag[1], scale_a);
           *(packed2_*)&b_frag[2] = __hmul2(*(packed2_*)&b_frag[2], scale_b);
@@ -1302,11 +1341,12 @@ __device__ __forceinline__ void load_fp4_k_frag_scaled(smem_t<KTraits::SWIZZLE_M
   using packed2 = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, __nv_bfloat162>;
   constexpr uint32_t SF_COLS_K = KTraits::NUM_MMA_D_QK;
   const uint32_t sf_base = (mma_kv * 16 + lane_idx / 4) * SF_COLS_K + mma_d;
-  __nv_fp8_e4m3 sf_a_fp8, sf_b_fp8;
-  sf_a_fp8.__x = k_sf_smem[sf_base];
-  sf_b_fp8.__x = k_sf_smem[sf_base + 8 * SF_COLS_K];
-  packed2 scale_a{static_cast<DTypeQ>(sf_a_fp8), static_cast<DTypeQ>(sf_a_fp8)};
-  packed2 scale_b{static_cast<DTypeQ>(sf_b_fp8), static_cast<DTypeQ>(sf_b_fp8)};
+  const uint8_t sf_a = k_sf_smem[sf_base];
+  const uint8_t sf_b = k_sf_smem[sf_base + 8 * SF_COLS_K];
+  uint2 sf_pair;
+  nvfp4_sf4_to_packed2x2<DTypeQ>(sf_a, sf_a, sf_b, sf_b, &sf_pair);
+  const packed2 scale_a = *(packed2*)&sf_pair.x;
+  const packed2 scale_b = *(packed2*)&sf_pair.y;
   *(packed2*)&b_frag[0] = __hmul2(*(packed2*)&b_frag[0], scale_a);
   *(packed2*)&b_frag[1] = __hmul2(*(packed2*)&b_frag[1], scale_a);
   *(packed2*)&b_frag[2] = __hmul2(*(packed2*)&b_frag[2], scale_b);
@@ -1619,7 +1659,10 @@ __device__ __forceinline__ void update_mdo_states(
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x2));
           m[mma_q][j] = max(m[mma_q][j], math::shfl_xor_sync(m[mma_q][j], 0x1));
 
-          float o_scale = math::ptx_exp2(m_prev * sm_scale - m[mma_q][j] * sm_scale);
+          // Per-row clamp: fully masked rows (m == -inf) yield exp2(-inf) = 0, not NaN.
+          const float m_scaled =
+              max(m[mma_q][j] * sm_scale, -cuda::std::numeric_limits<float>::max());
+          float o_scale = math::ptx_exp2(m_prev * sm_scale - m_scaled);
           d[mma_q][j] *= o_scale;
 #pragma unroll
           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
@@ -1630,14 +1673,14 @@ __device__ __forceinline__ void update_mdo_states(
           }
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
-            s_frag[mma_q][mma_kv][j * 2 + 0] = math::ptx_exp2(
-                s_frag[mma_q][mma_kv][j * 2 + 0] * sm_scale - m[mma_q][j] * sm_scale);
-            s_frag[mma_q][mma_kv][j * 2 + 1] = math::ptx_exp2(
-                s_frag[mma_q][mma_kv][j * 2 + 1] * sm_scale - m[mma_q][j] * sm_scale);
-            s_frag[mma_q][mma_kv][j * 2 + 4] = math::ptx_exp2(
-                s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m[mma_q][j] * sm_scale);
-            s_frag[mma_q][mma_kv][j * 2 + 5] = math::ptx_exp2(
-                s_frag[mma_q][mma_kv][j * 2 + 5] * sm_scale - m[mma_q][j] * sm_scale);
+            s_frag[mma_q][mma_kv][j * 2 + 0] =
+                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 0] * sm_scale - m_scaled);
+            s_frag[mma_q][mma_kv][j * 2 + 1] =
+                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 1] * sm_scale - m_scaled);
+            s_frag[mma_q][mma_kv][j * 2 + 4] =
+                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m_scaled);
+            s_frag[mma_q][mma_kv][j * 2 + 5] =
+                math::ptx_exp2(s_frag[mma_q][mma_kv][j * 2 + 5] * sm_scale - m_scaled);
           }
         }
       }
@@ -1662,7 +1705,9 @@ __device__ __forceinline__ void update_mdo_states(
             __hmax2(*(half2*)&m[mma_q], math::shfl_xor_sync(*(half2*)&m[mma_q], 0x1));
 #pragma unroll
         for (uint32_t j = 0; j < 2; ++j) {
-          float o_scale = math::ptx_exp2(float(m_prev[j] * sm_scale.x - m[mma_q][j] * sm_scale.x));
+          // Per-row clamp to the lowest finite half (see the float path above).
+          const half m_scaled_h = __hmax(__hmul(m[mma_q][j], sm_scale.x), __float2half(-65504.f));
+          float o_scale = math::ptx_exp2(float(m_prev[j] * sm_scale.x) - float(m_scaled_h));
           d[mma_q][j] *= o_scale;
 #pragma unroll
           for (uint32_t mma_d = 0; mma_d < KTraits::NUM_MMA_D_VO_TILE; ++mma_d) {
@@ -1671,13 +1716,13 @@ __device__ __forceinline__ void update_mdo_states(
             o_frag[mma_q][mma_d][j * 2 + 4] *= o_scale;
             o_frag[mma_q][mma_d][j * 2 + 5] *= o_scale;
           }
-          half2 m2 = make_half2(m[mma_q][j], m[mma_q][j]);
+          half2 m2s = make_half2(m_scaled_h, m_scaled_h);
 #pragma unroll
           for (uint32_t mma_kv = 0; mma_kv < KTraits::NUM_MMA_KV; ++mma_kv) {
             *(half2*)&s_frag[mma_q][mma_kv][j * 2] =
-                math::ptx_exp2(*(half2*)&s_frag[mma_q][mma_kv][j * 2] * sm_scale - m2 * sm_scale);
-            *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] = math::ptx_exp2(
-                *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m2 * sm_scale);
+                math::ptx_exp2(*(half2*)&s_frag[mma_q][mma_kv][j * 2] * sm_scale - m2s);
+            *(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] =
+                math::ptx_exp2(*(half2*)&s_frag[mma_q][mma_kv][j * 2 + 4] * sm_scale - m2s);
           }
         }
       }
@@ -1757,13 +1802,12 @@ __device__ __forceinline__ void compute_sfm_v(
                 std::conditional_t<std::is_same_v<DTypeQ_, half>, half2, __nv_bfloat162>;
             constexpr uint32_t SF_COLS_V = KTraits::NUM_MMA_D_VO;  // HEAD_DIM_VO / 16
             uint32_t sf_base = (mma_kv * 16 + 2 * (lane_idx % 4)) * SF_COLS_V + mma_d;
-            __nv_fp8_e4m3 sf0_fp8, sf1_fp8, sf2_fp8, sf3_fp8;
-            sf0_fp8.__x = v_sf_smem[sf_base];
-            sf1_fp8.__x = v_sf_smem[sf_base + SF_COLS_V];
-            sf2_fp8.__x = v_sf_smem[sf_base + 8 * SF_COLS_V];
-            sf3_fp8.__x = v_sf_smem[sf_base + 9 * SF_COLS_V];
-            packed2_ scale_lo{static_cast<DTypeQ_>(sf0_fp8), static_cast<DTypeQ_>(sf1_fp8)};
-            packed2_ scale_hi{static_cast<DTypeQ_>(sf2_fp8), static_cast<DTypeQ_>(sf3_fp8)};
+            uint2 sf_pair;
+            nvfp4_sf4_to_packed2x2<DTypeQ_>(v_sf_smem[sf_base], v_sf_smem[sf_base + SF_COLS_V],
+                                            v_sf_smem[sf_base + 8 * SF_COLS_V],
+                                            v_sf_smem[sf_base + 9 * SF_COLS_V], &sf_pair);
+            const packed2_ scale_lo = *(packed2_*)&sf_pair.x;
+            const packed2_ scale_hi = *(packed2_*)&sf_pair.y;
             *(packed2_*)&b_frag[0] = __hmul2(*(packed2_*)&b_frag[0], scale_lo);
             *(packed2_*)&b_frag[1] = __hmul2(*(packed2_*)&b_frag[1], scale_hi);
             *(packed2_*)&b_frag[2] = __hmul2(*(packed2_*)&b_frag[2], scale_lo);
@@ -1912,7 +1956,9 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
                                 lane_idx / 4];
             float m_prev = m_new, d_prev = d_new;
             m_new = max(m_new, md.x);
-            d_new = d_prev * math::ptx_exp2(m_prev - m_new) + md.y * math::ptx_exp2(md.x - m_new);
+            // max() drops the NaN from merging two -inf maxima (fully masked rows).
+            d_new = d_prev * math::ptx_exp2(max(m_prev - m_new, -math::inf)) +
+                    md.y * math::ptx_exp2(max(md.x - m_new, -math::inf));
           }
 
 #pragma unroll
@@ -1925,7 +1971,7 @@ __device__ __forceinline__ void threadblock_sync_mdo_states(
                                     8 +
                                 lane_idx / 4];
             float mi = md.x;
-            o_scale[j][i] = math::ptx_exp2(float(mi - m_new));
+            o_scale[j][i] = math::ptx_exp2(max(float(mi - m_new), -math::inf));
           }
           m[mma_q][j] = typename KTraits::DTypeQKAccum(m_new);
           d[mma_q][j] = d_new;
@@ -3264,7 +3310,9 @@ __device__ __forceinline__ void vosplit_softmax_store_p(
       }
       float m_prev = float(m[mma_q][j]);
       float m_new = max(m_prev, mt);
-      o_scale[mma_q][j] = math::ptx_exp2(m_prev * sm_scale - m_new * sm_scale);
+      // Per-row clamp for fully masked rows (see update_mdo_states).
+      const float m_new_scaled = max(m_new * sm_scale, -cuda::std::numeric_limits<float>::max());
+      o_scale[mma_q][j] = math::ptx_exp2(m_prev * sm_scale - m_new_scaled);
       d[mma_q][j] *= o_scale[mma_q][j];
       m[mma_q][j] = typename KTraits::DTypeQKAccum(m_new);
     }
@@ -3277,7 +3325,9 @@ __device__ __forceinline__ void vosplit_softmax_store_p(
   for (uint32_t mma_q = 0; mma_q < NUM_MMA_Q; ++mma_q) {
 #pragma unroll
     for (uint32_t j = 0; j < 2; ++j) {
-      const float m_new = float(m[mma_q][j]) * sm_scale;
+      // Per-row clamp for fully masked rows (see update_mdo_states).
+      const float m_new =
+          max(float(m[mma_q][j]) * sm_scale, -cuda::std::numeric_limits<float>::max());
       float dsum = 0.f;
 #pragma unroll
       for (uint32_t mma_kv = 0; mma_kv < NUM_MMA_KV; ++mma_kv) {
@@ -3430,13 +3480,13 @@ __device__ __forceinline__ void vosplit_compute_pv(
             } else {
               constexpr uint32_t SF_COLS_V = KTraits::NUM_MMA_D_VO;
               const uint32_t sf_base = (mma_kv * 16 + 2 * (lane_idx % 4)) * SF_COLS_V + global_d;
-              __nv_fp8_e4m3 sf0_fp8, sf1_fp8, sf2_fp8, sf3_fp8;
-              sf0_fp8.__x = smem_storage->v_sf_smem_ptr()[sf_base];
-              sf1_fp8.__x = smem_storage->v_sf_smem_ptr()[sf_base + SF_COLS_V];
-              sf2_fp8.__x = smem_storage->v_sf_smem_ptr()[sf_base + 8 * SF_COLS_V];
-              sf3_fp8.__x = smem_storage->v_sf_smem_ptr()[sf_base + 9 * SF_COLS_V];
-              packed2 scale_lo{static_cast<DTypeQ>(sf0_fp8), static_cast<DTypeQ>(sf1_fp8)};
-              packed2 scale_hi{static_cast<DTypeQ>(sf2_fp8), static_cast<DTypeQ>(sf3_fp8)};
+              const uint8_t* vsf = smem_storage->v_sf_smem_ptr();
+              uint2 sf_pair;
+              nvfp4_sf4_to_packed2x2<DTypeQ>(vsf[sf_base], vsf[sf_base + SF_COLS_V],
+                                             vsf[sf_base + 8 * SF_COLS_V],
+                                             vsf[sf_base + 9 * SF_COLS_V], &sf_pair);
+              const packed2 scale_lo = *(packed2*)&sf_pair.x;
+              const packed2 scale_hi = *(packed2*)&sf_pair.y;
               *(packed2*)&b_frag[0] = __hmul2(*(packed2*)&b_frag[0], scale_lo);
               *(packed2*)&b_frag[1] = __hmul2(*(packed2*)&b_frag[1], scale_hi);
               *(packed2*)&b_frag[2] = __hmul2(*(packed2*)&b_frag[2], scale_lo);

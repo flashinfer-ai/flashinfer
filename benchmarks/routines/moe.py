@@ -21,7 +21,7 @@ from flashinfer.fused_moe import (
     cutlass_fused_moe,
     fused_topk_deepseek,
 )
-from flashinfer.tllm_enums import RoutingMethodType
+from flashinfer.tllm_enums import RoutingMethodType, is_gated_activation
 from flashinfer import fp4_quantize, mxfp8_quantize
 from flashinfer.testing.utils import (
     bench_gpu_time,
@@ -74,19 +74,6 @@ def _activation_kwarg(fn, activation_type: ActivationType) -> dict:
             )
         return {"gated_act_type": _ACTIVATION_TO_GATED_ACT[activation_type]}
     return {}
-
-
-def is_gated_activation(activation_type: ActivationType) -> bool:
-    """Whether the activation splits FC1 output into gate/up halves (FC1 weight has 2*intermediate
-    rows). SwigluStep's clamp limit defaults to 7.0 (the Step-3 model value) in the kernel, so no
-    swiglu_limit tensor needs to be passed.
-    """
-    return activation_type in (
-        ActivationType.Swiglu,
-        ActivationType.Geglu,
-        ActivationType.SwigluBias,
-        ActivationType.SwigluStep,
-    )
 
 
 def run_moe_test(args):
@@ -262,7 +249,7 @@ def parse_moe_args(line, parser):
         default=False,
         help=(
             "Use the functional MoE API instead of the wrapper class: "
-            "cute_dsl_fused_moe_nvfp4 vs CuteDslMoEWrapper for "
+            "cute_dsl_fused_moe vs CuteDslMoEWrapper for "
             "cute_dsl_fp4_block_scale_moe, and b12x_fused_moe vs B12xMoEWrapper for "
             "b12x_fused_moe. Useful for verifying that the wrapper's workspace cache "
             "eliminates per-call allocation overhead."
@@ -1393,7 +1380,7 @@ def testCuteDslFp4BlockScaleMoe(args):
 
     This test:
     1. Creates NVFP4-quantized weights and fp4-quantized inputs for CuTe DSL kernels
-    2. Runs MoE via CuteDslMoEWrapper (or cute_dsl_fused_moe_nvfp4 when
+    2. Runs MoE via CuteDslMoEWrapper (or cute_dsl_fused_moe when
        ``--use_functional_api`` is set). SwiGLU only.
     3. Measures performance metrics (TFLOPS, TB/sec)
 
@@ -1473,7 +1460,7 @@ def testCuteDslFp4BlockScaleMoe(args):
 
     if use_functional:
         from functools import partial
-        from flashinfer import cute_dsl_fused_moe_nvfp4
+        from flashinfer import cute_dsl_fused_moe
 
         # Pre-allocate output buffer to avoid per-call allocation
         moe_output = torch.empty(
@@ -1481,9 +1468,9 @@ def testCuteDslFp4BlockScaleMoe(args):
         )
 
         if args.verbose >= 1:
-            print("[INFO] Using CuTe DSL functional API (cute_dsl_fused_moe_nvfp4)")
+            print("[INFO] Using CuTe DSL functional API (cute_dsl_fused_moe)")
         runner = partial(
-            cute_dsl_fused_moe_nvfp4,
+            cute_dsl_fused_moe,
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=local_num_experts,
@@ -2457,7 +2444,6 @@ def testUnifiedNvfp4Moe(args):
     """
     from flashinfer.autotuner import AutoTuner
     from flashinfer.fused_moe import (
-        ActivationConfig,
         CuteDslConfig,
         ExecutionConfig,
         ExpertConfig,
@@ -2467,6 +2453,7 @@ def testUnifiedNvfp4Moe(args):
         MoEWeightPack,
         QuantConfig,
         QuantVariant,
+        SwiGLU,
         RoutingConfig,
         TrtllmFp4Config,
     )
@@ -2604,7 +2591,7 @@ def testUnifiedNvfp4Moe(args):
     num_active_experts = int(local_topk_ids.unique().numel())
 
     weight_pack = MoEWeightPack()
-    weight_pack.prepare_for("cute_dsl_nvfp4", cute_dsl_view)
+    weight_pack.prepare_for("cute_dsl", cute_dsl_view)
     weight_pack.prepare_for("trtllm_fp4_routed", trtllm_view)
 
     # ---- MoELayer config --------------------------------------------------
@@ -2625,7 +2612,7 @@ def testUnifiedNvfp4Moe(args):
             local_expert_offset=local_expert_offset,
             local_num_experts=local_num_experts,
         ),
-        activation=ActivationConfig(),
+        activation=SwiGLU(),
         backend=BackendOptions(candidates=(CuteDslConfig(), TrtllmFp4Config())),
         execution=ExecutionConfig(tune_max_num_tokens=max(num_tokens, 8192)),
     )

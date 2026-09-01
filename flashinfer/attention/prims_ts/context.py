@@ -65,6 +65,7 @@ _SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
 _INT32_MAX = 2**31 - 1
 _CUDA_GRID_YZ_MAX = 65_535
 _CONTEXT_KV_TILE_N = 128
+_CONTEXT_TILE_SIZE_Q = 128
 # Query-paired D128 represents two 128-row Q tiles in one work tile.  Kernel
 # coordinates include the padded tail of that 256-row span and, for masking,
 # its exclusive right boundary.  Reserve the maximum 255-row tail padding in
@@ -137,6 +138,131 @@ class _PagedContextMetadata:
     kv_indptr: tuple[int, ...]
     seq_lens: tuple[int, ...]
     dense_page_indices: tuple[int, ...]
+
+
+_ContextScheduler = Literal[
+    "nonpersistent",
+    "static_persistent",
+    "clc_dynamic_persistent",
+]
+
+
+@dataclass(frozen=True)
+class _ContextSchedulerProbe:
+    """Static kernel traits and device capacity used by scheduler policy."""
+
+    single_qkv_instance: bool
+    logical_work_tiles: int
+    max_active_clusters: int
+
+
+@dataclass(frozen=True)
+class _ContextCompileSpec:
+    """Batch-independent identity for one contiguous context compile."""
+
+    device_index: int
+    max_seq_len_q: int
+    max_seq_len_k: int
+    num_qo_heads: int
+    num_kv_heads: int
+    head_dim: int
+    q_dtype_key: str
+    output_dtype_key: str
+    mask_type: str
+    window_left: int
+    packed: bool
+    head_paired: bool
+    uniform_packed_lengths: bool
+    has_q_offset: bool
+    causal_single_kv_tile: bool
+    packed_dense_k_mask: bool
+    scheduler: _ContextScheduler
+
+
+@dataclass(frozen=True)
+class _PagedContextCompileSpec:
+    """Batch-independent identity for one paged context compile."""
+
+    device_index: int
+    max_seq_len_q: int
+    max_seq_len_k: int
+    page_size: int
+    max_num_pages_per_seq_kv: int
+    num_qo_heads: int
+    num_kv_heads: int
+    head_dim: int
+    q_dtype_key: str
+    output_dtype_key: str
+    mask_type: str
+    window_left: int
+    head_paired: bool
+    uniform_packed_lengths: bool
+    has_q_offset: bool
+    packed_dense_k_mask: bool
+    scheduler: _ContextScheduler
+
+
+def _make_context_kernel(
+    *,
+    input_dtype,
+    output_dtype,
+    head_dim: int,
+    mask_type: str,
+    window_left: int,
+    head_paired: bool,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    has_q_offset: bool,
+    causal_single_kv_tile: bool,
+    scheduler: _ContextScheduler,
+    page_size: int | None = None,
+    max_num_pages_per_seq_kv: int | None = None,
+):
+    """Build one context kernel from its batch-independent static topology."""
+
+    import cutlass
+
+    from .kernels.fmha_context.fmha_kernel import FmhaTs
+
+    use_paged_kv = page_size is not None
+    if use_paged_kv != (max_num_pages_per_seq_kv is not None):
+        raise ValueError("paged context requires both page geometry values")
+    is_persistent = scheduler != "nonpersistent"
+    is_clc_dynamic = scheduler == "clc_dynamic_persistent"
+    paged_kwargs = (
+        {
+            "use_paged_kv": True,
+            "num_tokens_per_page": page_size,
+            "max_num_pages_per_seq_kv": max_num_pages_per_seq_kv,
+        }
+        if use_paged_kv
+        else {}
+    )
+    return FmhaTs(
+        qk_acc_dtype=cutlass.Float32,
+        pv_acc_dtype=cutlass.Float32,
+        in_dtype=input_dtype,
+        out_dtype=output_dtype,
+        d=head_dim,
+        is_persistent=is_persistent,
+        is_causal=mask_type == "causal",
+        has_variable_window=mask_type == "variable_window",
+        balance_causal_workload=(
+            scheduler == "static_persistent"
+            and _uses_heavy_first_static_causal_raster(
+                mask_type=mask_type,
+                window_left=window_left,
+                has_q_offset=has_q_offset,
+            )
+        ),
+        is_clc_dynamic=is_clc_dynamic,
+        head_paired=head_paired,
+        window_size_left=window_left if window_left > 0 else 0,
+        h_r=num_qo_heads // num_kv_heads,
+        enable_skip_correction=True,
+        causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
+        **paged_kwargs,
+    )
 
 
 def _validate_tensor(tensor: torch.Tensor, name: str) -> None:
@@ -220,9 +346,10 @@ def _validate_device(device: torch.device) -> int:
 def _validate_mask(mask_type: str) -> None:
     if not isinstance(mask_type, str):
         raise TypeError("mask_type must be a string")
-    if mask_type not in ("dense", "causal"):
+    if mask_type not in ("dense", "causal", "variable_window"):
         raise ValueError(
-            f"mask_type must be exactly 'dense' or 'causal', got {mask_type!r}"
+            "mask_type must be exactly 'dense', 'causal', or "
+            f"'variable_window', got {mask_type!r}"
         )
 
 
@@ -238,6 +365,70 @@ def _validate_window_left(window_left: int, mask_type: str) -> int:
     if window_left > 0 and mask_type != "causal":
         raise ValueError("a positive window_left requires mask_type='causal'")
     return window_left
+
+
+def _validate_variable_window_bounds(
+    starts: Optional[torch.Tensor],
+    ends: Optional[torch.Tensor],
+    *,
+    geometry: _ContextGeometry,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Validate inclusive per-query K bounds for contiguous attention."""
+    if starts is None or ends is None:
+        raise ValueError(
+            "variable_window_token_starts and variable_window_token_ends are "
+            "required for mask_type='variable_window'"
+        )
+    if geometry.packed:
+        raise NotImplementedError(
+            "variable_window currently requires fixed [B, S, H, D] tensors"
+        )
+    expected_shape = (geometry.batch_size, geometry.max_seq_len_q)
+    for tensor, name in (
+        (starts, "variable_window_token_starts"),
+        (ends, "variable_window_token_ends"),
+    ):
+        _validate_tensor(tensor, name)
+        if tensor.device != geometry.device:
+            raise ValueError(
+                f"{name} must be on {geometry.device}, got {tensor.device}"
+            )
+        if tensor.dtype != torch.int32:
+            raise ValueError(f"{name} must have dtype torch.int32, got {tensor.dtype}")
+        if tuple(tensor.shape) != expected_shape:
+            raise ValueError(
+                f"{name} must have shape {expected_shape}, got {tuple(tensor.shape)}"
+            )
+        _validate_compact(tensor, name, "[B, Sq]")
+    return starts.flatten(), ends.flatten()
+
+
+def _build_variable_window_cta_starts(
+    starts: torch.Tensor, *, geometry: _ContextGeometry
+) -> torch.Tensor:
+    """Reduce fixed per-row starts into one minimum for each kernel Q CTA."""
+    tile_size_q = (
+        _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE
+        if geometry.head_dim == _CONTEXT_TILE_SIZE_Q
+        else _CONTEXT_TILE_SIZE_Q
+    )
+    num_seq_tiles = (geometry.max_seq_len_q + tile_size_q - 1) // tile_size_q
+    padded_rows = num_seq_tiles * tile_size_q
+    starts_2d = starts.view(geometry.batch_size, geometry.max_seq_len_q)
+    if padded_rows != geometry.max_seq_len_q:
+        padded = torch.full(
+            (geometry.batch_size, padded_rows),
+            _INT32_MAX,
+            dtype=torch.int32,
+            device=geometry.device,
+        )
+        padded[:, : geometry.max_seq_len_q] = starts_2d
+        starts_2d = padded
+    return (
+        starts_2d.view(geometry.batch_size, num_seq_tiles, tile_size_q)
+        .amin(dim=-1)
+        .flatten()
+    )
 
 
 def _validate_scale(value: object, name: str) -> float:
@@ -595,7 +786,7 @@ def _resolve_geometry(
     window_left: int,
     output_dtype: torch.dtype,
 ) -> _ContextGeometry:
-    """Validate a plan and derive its semantic compile key.
+    """Validate a plan and derive its semantic and storage geometry.
 
     Packed cumulative offsets are copied to the host only here.  A successful
     plan owns their tensor storage and never synchronizes on the run path.
@@ -745,9 +936,13 @@ def _resolve_paged_geometry(
 ) -> tuple[_PagedContextGeometry, _PagedContextMetadata]:
     """Validate packed-Q paged-KV inputs and materialize their static ABI."""
 
+    _validate_mask(mask_type)
+    if mask_type == "variable_window":
+        raise NotImplementedError(
+            "mask_type='variable_window' is not supported for paged context"
+        )
     _validate_base_tensors(q, k_cache, v_cache)
     _validate_output_dtype(output_dtype)
-    _validate_mask(mask_type)
     window_left = _validate_window_left(window_left, mask_type)
     page_size = _validate_page_size(page_size)
     device_index = _validate_device(q.device)
@@ -927,80 +1122,190 @@ def _resolve_paged_geometry(
     return geometry, metadata
 
 
-def _semantic_key(geometry: _ContextGeometry) -> tuple[object, ...]:
-    return (
-        geometry.device_index,
-        geometry.batch_size,
-        geometry.max_seq_len_q,
-        geometry.max_seq_len_k,
-        geometry.num_qo_heads,
-        geometry.num_kv_heads,
-        geometry.head_dim,
-        _dtype_key(geometry.q_dtype),
-        _dtype_key(geometry.output_dtype),
-        geometry.mask_type,
-        geometry.window_left,
-        geometry.packed,
-        geometry.head_paired,
-        geometry.uniform_packed_lengths,
-        geometry.has_q_offset,
-        geometry.causal_single_kv_tile,
-        geometry.packed_dense_k_mask,
+def _make_context_scheduler_probe(
+    geometry: _ContextGeometry | _PagedContextGeometry,
+    *,
+    causal_single_kv_tile: bool,
+    page_size: int | None = None,
+    max_num_pages_per_seq_kv: int | None = None,
+) -> _ContextSchedulerProbe:
+    """Build the common static probe and logical work count for policy."""
+
+    import cutlass
+    import cutlass.utils as utils
+
+    dtype_map = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    }
+    probe = _make_context_kernel(
+        input_dtype=dtype_map[geometry.q_dtype],
+        output_dtype=dtype_map[geometry.output_dtype],
+        head_dim=geometry.head_dim,
+        mask_type=geometry.mask_type,
+        window_left=geometry.window_left,
+        head_paired=geometry.head_paired,
+        num_qo_heads=geometry.num_qo_heads,
+        num_kv_heads=geometry.num_kv_heads,
+        has_q_offset=geometry.has_q_offset,
+        causal_single_kv_tile=causal_single_kv_tile,
+        scheduler="static_persistent",
+        page_size=page_size,
+        max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
+    )
+    with torch.cuda.device(geometry.device_index):
+        max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
+    num_seq_tiles = (
+        geometry.max_seq_len_q + probe.cfg.cta_tiler[0] - 1
+    ) // probe.cfg.cta_tiler[0]
+    num_head_tiles = geometry.num_qo_heads // probe.cfg.work_tile_q_heads
+    logical_work_tiles = geometry.batch_size * num_seq_tiles * num_head_tiles
+    return _ContextSchedulerProbe(
+        single_qkv_instance=bool(probe.cfg.single_qkv_instance),
+        logical_work_tiles=int(logical_work_tiles),
+        max_active_clusters=max_active_clusters,
     )
 
 
-def _paged_semantic_key(
+def _resolve_context_scheduler(geometry: _ContextGeometry) -> _ContextScheduler:
+    """Select a scheduler from plan-time work while keeping batch out of JIT."""
+
+    probe = _make_context_scheduler_probe(
+        geometry,
+        causal_single_kv_tile=geometry.causal_single_kv_tile,
+    )
+    is_persistent = _contiguous_context_uses_persistent_scheduler(
+        single_qkv_instance=probe.single_qkv_instance,
+        head_paired=geometry.head_paired,
+        packed=geometry.packed,
+        uniform_packed_lengths=geometry.uniform_packed_lengths,
+        logical_work_tiles=probe.logical_work_tiles,
+        max_active_clusters=probe.max_active_clusters,
+        batch_size=geometry.batch_size,
+        num_qo_heads=geometry.num_qo_heads,
+        is_causal=geometry.mask_type == "causal",
+        has_q_offset=geometry.has_q_offset,
+    )
+    if not is_persistent:
+        return "nonpersistent"
+    if _contiguous_context_uses_clc_scheduler(
+        single_qkv_instance=probe.single_qkv_instance,
+        head_paired=geometry.head_paired,
+        packed=geometry.packed,
+        uniform_packed_lengths=geometry.uniform_packed_lengths,
+        is_causal=geometry.mask_type == "causal",
+        has_q_offset=geometry.has_q_offset,
+    ):
+        return "clc_dynamic_persistent"
+    return "static_persistent"
+
+
+def _resolve_paged_context_scheduler(
     geometry: _PagedContextGeometry,
-) -> tuple[object, ...]:
-    return (
-        geometry.device_index,
-        geometry.batch_size,
-        geometry.max_seq_len_q,
-        geometry.max_seq_len_k,
-        geometry.page_size,
-        geometry.max_num_pages_per_seq_kv,
-        geometry.num_qo_heads,
-        geometry.num_kv_heads,
-        geometry.head_dim,
-        _dtype_key(geometry.q_dtype),
-        _dtype_key(geometry.output_dtype),
-        geometry.mask_type,
-        geometry.window_left,
-        geometry.head_paired,
-        geometry.uniform_packed_lengths,
-        geometry.has_q_offset,
-        geometry.packed_dense_k_mask,
+) -> _ContextScheduler:
+    """Select paged-context scheduling from plan work, not JIT identity."""
+
+    probe = _make_context_scheduler_probe(
+        geometry,
+        causal_single_kv_tile=False,
+        page_size=geometry.page_size,
+        max_num_pages_per_seq_kv=geometry.max_num_pages_per_seq_kv,
+    )
+    is_persistent = _paged_context_uses_persistent_scheduler(
+        mask_type=geometry.mask_type,
+        head_paired=geometry.head_paired,
+        logical_work_tiles=probe.logical_work_tiles,
+        max_active_clusters=probe.max_active_clusters,
+        batch_size=geometry.batch_size,
+        num_qo_heads=geometry.num_qo_heads,
+    )
+    if not is_persistent:
+        return "nonpersistent"
+    if _paged_context_uses_clc_scheduler(
+        is_persistent=True,
+        single_qkv_instance=probe.single_qkv_instance,
+        is_causal=geometry.mask_type == "causal",
+        uniform_packed_lengths=geometry.uniform_packed_lengths,
+    ):
+        return "clc_dynamic_persistent"
+    return "static_persistent"
+
+
+def _context_compile_spec(geometry: _ContextGeometry) -> _ContextCompileSpec:
+    return _ContextCompileSpec(
+        device_index=geometry.device_index,
+        max_seq_len_q=geometry.max_seq_len_q,
+        max_seq_len_k=geometry.max_seq_len_k,
+        num_qo_heads=geometry.num_qo_heads,
+        num_kv_heads=geometry.num_kv_heads,
+        head_dim=geometry.head_dim,
+        q_dtype_key=_dtype_key(geometry.q_dtype),
+        output_dtype_key=_dtype_key(geometry.output_dtype),
+        mask_type=geometry.mask_type,
+        window_left=geometry.window_left,
+        packed=geometry.packed,
+        head_paired=geometry.head_paired,
+        uniform_packed_lengths=geometry.uniform_packed_lengths,
+        has_q_offset=geometry.has_q_offset,
+        causal_single_kv_tile=geometry.causal_single_kv_tile,
+        packed_dense_k_mask=geometry.packed_dense_k_mask,
+        scheduler=_resolve_context_scheduler(geometry),
+    )
+
+
+def _paged_context_compile_spec(
+    geometry: _PagedContextGeometry,
+) -> _PagedContextCompileSpec:
+    return _PagedContextCompileSpec(
+        device_index=geometry.device_index,
+        max_seq_len_q=geometry.max_seq_len_q,
+        max_seq_len_k=geometry.max_seq_len_k,
+        page_size=geometry.page_size,
+        max_num_pages_per_seq_kv=geometry.max_num_pages_per_seq_kv,
+        num_qo_heads=geometry.num_qo_heads,
+        num_kv_heads=geometry.num_kv_heads,
+        head_dim=geometry.head_dim,
+        q_dtype_key=_dtype_key(geometry.q_dtype),
+        output_dtype_key=_dtype_key(geometry.output_dtype),
+        mask_type=geometry.mask_type,
+        window_left=geometry.window_left,
+        head_paired=geometry.head_paired,
+        uniform_packed_lengths=geometry.uniform_packed_lengths,
+        has_q_offset=geometry.has_q_offset,
+        packed_dense_k_mask=geometry.packed_dense_k_mask,
+        scheduler=_resolve_paged_context_scheduler(geometry),
     )
 
 
 @functools.cache
 def _get_compiled_context(
-    device_index: int,
-    batch_size: int,
-    max_seq_len_q: int,
-    max_seq_len_k: int,
-    num_qo_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    q_dtype_key: str,
-    output_dtype_key: str,
-    mask_type: str,
-    window_left: int,
-    packed: bool,
-    head_paired: bool,
-    uniform_packed_lengths: bool,
-    has_q_offset: bool,
-    causal_single_kv_tile: bool,
-    packed_dense_k_mask: bool,
+    compile_spec: _ContextCompileSpec,
 ):
-    """Compile and cache one exact semantic context-attention specialization."""
+    """Compile one batch-dynamic context specialization and cache by topology."""
+
+    device_index = compile_spec.device_index
+    max_seq_len_q = compile_spec.max_seq_len_q
+    max_seq_len_k = compile_spec.max_seq_len_k
+    num_qo_heads = compile_spec.num_qo_heads
+    num_kv_heads = compile_spec.num_kv_heads
+    head_dim = compile_spec.head_dim
+    q_dtype_key = compile_spec.q_dtype_key
+    output_dtype_key = compile_spec.output_dtype_key
+    mask_type = compile_spec.mask_type
+    window_left = compile_spec.window_left
+    packed = compile_spec.packed
+    head_paired = compile_spec.head_paired
+    uniform_packed_lengths = compile_spec.uniform_packed_lengths
+    has_q_offset = compile_spec.has_q_offset
+    causal_single_kv_tile = compile_spec.causal_single_kv_tile
+    packed_dense_k_mask = compile_spec.packed_dense_k_mask
+    scheduler = compile_spec.scheduler
 
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
     import cutlass.utils as utils
-
-    from .kernels.fmha_context.fmha_kernel import FmhaTs
 
     dtype_map = {
         "float16": cutlass.Float16,
@@ -1009,87 +1314,22 @@ def _get_compiled_context(
     }
     input_dtype = dtype_map[q_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
-    is_causal = mask_type == "causal"
-    # Construct the scheduler-independent topology first. Immutable
-    # single-instance domains can use the lower-overhead static persistent
-    # queue; paired or live-ragged domains are reconstructed with CLC.
-    fmha = FmhaTs(
-        qk_acc_dtype=cutlass.Float32,
-        pv_acc_dtype=cutlass.Float32,
-        in_dtype=input_dtype,
-        out_dtype=output_dtype,
-        d=head_dim,
-        is_persistent=True,
-        is_causal=is_causal,
-        balance_causal_workload=_uses_heavy_first_static_causal_raster(
-            mask_type=mask_type,
-            window_left=window_left,
-            has_q_offset=has_q_offset,
-        ),
-        is_clc_dynamic=False,
-        head_paired=head_paired,
-        window_size_left=window_left if window_left > 0 else 0,
-        h_r=num_qo_heads // num_kv_heads,
-        enable_skip_correction=True,
-        causal_single_kv_tile=causal_single_kv_tile,
-    )
+    has_variable_window = mask_type == "variable_window"
     with torch.cuda.device(device_index):
         max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
-    num_seq_tiles = (max_seq_len_q + fmha.cfg.cta_tiler[0] - 1) // fmha.cfg.cta_tiler[0]
-    num_head_tiles = num_qo_heads // fmha.cfg.work_tile_q_heads
-    logical_work_tiles = batch_size * num_seq_tiles * num_head_tiles
-    is_persistent = _contiguous_context_uses_persistent_scheduler(
-        single_qkv_instance=fmha.cfg.single_qkv_instance,
+    fmha = _make_context_kernel(
+        input_dtype=input_dtype,
+        output_dtype=output_dtype,
+        head_dim=head_dim,
+        mask_type=mask_type,
+        window_left=window_left,
         head_paired=head_paired,
-        packed=packed,
-        uniform_packed_lengths=uniform_packed_lengths,
-        logical_work_tiles=logical_work_tiles,
-        max_active_clusters=max_active_clusters,
-        batch_size=batch_size,
         num_qo_heads=num_qo_heads,
-        is_causal=is_causal,
+        num_kv_heads=num_kv_heads,
         has_q_offset=has_q_offset,
+        causal_single_kv_tile=causal_single_kv_tile,
+        scheduler=scheduler,
     )
-    uses_clc = is_persistent and _contiguous_context_uses_clc_scheduler(
-        single_qkv_instance=fmha.cfg.single_qkv_instance,
-        head_paired=head_paired,
-        packed=packed,
-        uniform_packed_lengths=uniform_packed_lengths,
-        is_causal=is_causal,
-        has_q_offset=has_q_offset,
-    )
-    if uses_clc:
-        fmha = FmhaTs(
-            qk_acc_dtype=cutlass.Float32,
-            pv_acc_dtype=cutlass.Float32,
-            in_dtype=input_dtype,
-            out_dtype=output_dtype,
-            d=head_dim,
-            is_persistent=True,
-            is_causal=is_causal,
-            is_clc_dynamic=True,
-            head_paired=head_paired,
-            window_size_left=window_left if window_left > 0 else 0,
-            h_r=num_qo_heads // num_kv_heads,
-            enable_skip_correction=True,
-            causal_single_kv_tile=causal_single_kv_tile,
-        )
-    elif not is_persistent:
-        fmha = FmhaTs(
-            qk_acc_dtype=cutlass.Float32,
-            pv_acc_dtype=cutlass.Float32,
-            in_dtype=input_dtype,
-            out_dtype=output_dtype,
-            d=head_dim,
-            is_persistent=False,
-            is_causal=is_causal,
-            is_clc_dynamic=False,
-            head_paired=head_paired,
-            window_size_left=window_left if window_left > 0 else 0,
-            h_r=num_qo_heads // num_kv_heads,
-            enable_skip_correction=True,
-            causal_single_kv_tile=causal_single_kv_tile,
-        )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
     if uniform_packed_lengths:
@@ -1103,7 +1343,7 @@ def _get_compiled_context(
         )
     _validate_query_work_tile_span(fmha.cfg)
     fmha.cfg.packed_dense_k_mask = packed_dense_k_mask
-    if not is_causal and not packed:
+    if mask_type != "causal" and not packed:
         fmha.cfg.fixed_dense_k_tail = max_seq_len_k % fmha.cfg.kv_tile_n
 
     @cute.jit
@@ -1116,6 +1356,9 @@ def _get_compiled_context(
         output_scale: cute.Tensor,
         qo_indptr: cute.Tensor,
         kv_indptr: cute.Tensor,
+        variable_window_token_starts: cute.Tensor,
+        variable_window_token_ends: cute.Tensor,
+        variable_window_cta_starts: cute.Tensor,
         stream: cuda_drv.CUstream,
         static_max_active_clusters: cutlass.Constexpr[int],
         static_packed: cutlass.Constexpr[bool],
@@ -1138,6 +1381,9 @@ def _get_compiled_context(
                 kv_indptr,
                 cutlass.Int32(static_max_seq_len_q),
                 cutlass.Int32(static_max_seq_len_k),
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
+                variable_window_cta_starts=variable_window_cta_starts,
             )
         else:
             fmha(
@@ -1149,6 +1395,9 @@ def _get_compiled_context(
                 output_scale,
                 static_max_active_clusters,
                 stream,
+                variable_window_token_starts=variable_window_token_starts,
+                variable_window_token_ends=variable_window_token_ends,
+                variable_window_cta_starts=variable_window_cta_starts,
             )
 
     def fake_compact(dtype, shape, assumed_align):
@@ -1165,23 +1414,48 @@ def _get_compiled_context(
     if packed:
         runtime_total_q = cute.sym_int()
         runtime_total_k = cute.sym_int()
+        runtime_num_q_offsets = cute.sym_int()
+        runtime_num_k_offsets = cute.sym_int()
         q_shape = (runtime_total_q, num_qo_heads, head_dim)
         kv_shape = (runtime_total_k, num_kv_heads, head_dim)
         out_shape = (runtime_total_q, num_qo_heads, head_dim)
-        indptr_shape = (batch_size + 1,)
+        qo_indptr_shape = (runtime_num_q_offsets,)
+        kv_indptr_shape = (runtime_num_k_offsets,)
     else:
+        batch_size = cute.sym_int()
         q_shape = (batch_size, max_seq_len_q, num_qo_heads, head_dim)
         kv_shape = (batch_size, max_seq_len_k, num_kv_heads, head_dim)
         out_shape = q_shape
-        indptr_shape = (1,)
+        qo_indptr_shape = (1,)
+        kv_indptr_shape = (1,)
     q_fake = fake_compact(input_dtype, q_shape, 16)
     k_fake = fake_compact(input_dtype, kv_shape, 16)
     v_fake = fake_compact(input_dtype, kv_shape, 16)
     out_fake = fake_compact(output_dtype, out_shape, 16)
     scale_fake = fake_compact(cutlass.Float32, (1,), 4)
     output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
-    qo_indptr_fake = fake_compact(cutlass.Int32, indptr_shape, 4)
-    kv_indptr_fake = fake_compact(cutlass.Int32, indptr_shape, 4)
+    qo_indptr_fake = fake_compact(cutlass.Int32, qo_indptr_shape, 4)
+    kv_indptr_fake = fake_compact(cutlass.Int32, kv_indptr_shape, 4)
+    if has_variable_window:
+        if packed:
+            raise RuntimeError("variable-window context requires fixed tensors")
+        variable_window_shape = (batch_size * max_seq_len_q,)
+        variable_window_tile_size_q = (
+            _CONTEXT_MAX_Q_ROWS_PER_WORK_TILE
+            if head_dim == _CONTEXT_TILE_SIZE_Q
+            else _CONTEXT_TILE_SIZE_Q
+        )
+        variable_window_cta_shape = (
+            batch_size * cute.ceil_div(max_seq_len_q, variable_window_tile_size_q),
+        )
+    else:
+        variable_window_shape = (1,)
+        variable_window_cta_shape = (1,)
+    variable_window_starts_fake = fake_compact(cutlass.Int32, variable_window_shape, 4)
+    variable_window_ends_fake = fake_compact(cutlass.Int32, variable_window_shape, 4)
+    variable_window_cta_starts_fake = fake_compact(
+        cutlass.Int32, variable_window_cta_shape, 4
+    )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # Task objects carry loop-local state through generated control flow, so
@@ -1197,6 +1471,9 @@ def _get_compiled_context(
             output_scale_fake,
             qo_indptr_fake,
             kv_indptr_fake,
+            variable_window_starts_fake,
+            variable_window_ends_fake,
+            variable_window_cta_starts_fake,
             stream_fake,
             max_active_clusters,
             packed,
@@ -1205,10 +1482,7 @@ def _get_compiled_context(
             options=_COMPILE_OPTIONS,
         )
     policy = (
-        (
-            "scheduler",
-            ("clc_dynamic_persistent" if fmha.is_clc_dynamic else "static_persistent"),
-        ),
+        ("scheduler", scheduler),
         ("pairing", "head" if head_paired else "query"),
         ("uniform_packed_lengths", uniform_packed_lengths),
         ("causal_single_kv_tile", causal_single_kv_tile),
@@ -1219,32 +1493,32 @@ def _get_compiled_context(
 
 @functools.cache
 def _get_compiled_paged_context(
-    device_index: int,
-    batch_size: int,
-    max_seq_len_q: int,
-    max_seq_len_k: int,
-    page_size: int,
-    max_num_pages_per_seq_kv: int,
-    num_qo_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    q_dtype_key: str,
-    output_dtype_key: str,
-    mask_type: str,
-    window_left: int,
-    head_paired: bool,
-    uniform_packed_lengths: bool,
-    has_q_offset: bool,
-    packed_dense_k_mask: bool,
+    compile_spec: _PagedContextCompileSpec,
 ):
-    """Compile one packed-Q, paged-K/V context specialization."""
+    """Compile one batch-dynamic packed-Q, paged-K/V specialization."""
+
+    device_index = compile_spec.device_index
+    max_seq_len_q = compile_spec.max_seq_len_q
+    max_seq_len_k = compile_spec.max_seq_len_k
+    page_size = compile_spec.page_size
+    max_num_pages_per_seq_kv = compile_spec.max_num_pages_per_seq_kv
+    num_qo_heads = compile_spec.num_qo_heads
+    num_kv_heads = compile_spec.num_kv_heads
+    head_dim = compile_spec.head_dim
+    q_dtype_key = compile_spec.q_dtype_key
+    output_dtype_key = compile_spec.output_dtype_key
+    mask_type = compile_spec.mask_type
+    window_left = compile_spec.window_left
+    head_paired = compile_spec.head_paired
+    uniform_packed_lengths = compile_spec.uniform_packed_lengths
+    has_q_offset = compile_spec.has_q_offset
+    packed_dense_k_mask = compile_spec.packed_dense_k_mask
+    scheduler = compile_spec.scheduler
 
     import cutlass
     import cutlass.cute as cute
     from cuda.bindings import driver as cuda_drv
     import cutlass.utils as utils
-
-    from .kernels.fmha_context.fmha_kernel import FmhaTs
 
     dtype_map = {
         "float16": cutlass.Float16,
@@ -1253,102 +1527,23 @@ def _get_compiled_paged_context(
     }
     input_dtype = dtype_map[q_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
-    is_causal = mask_type == "causal"
     with torch.cuda.device(device_index):
         max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
-
-    # Build the persistent topology first to obtain its actual work-tile shape.
-    # Scheduler selection then follows the logical CTA wave count rather than a
-    # head-dimension or sequence-length performance threshold.  The tiler is
-    # scheduler-independent; reconstruct only the one-wave nonpersistent case.
-    fmha = FmhaTs(
-        qk_acc_dtype=cutlass.Float32,
-        pv_acc_dtype=cutlass.Float32,
-        in_dtype=input_dtype,
-        out_dtype=output_dtype,
-        d=head_dim,
-        is_persistent=True,
-        is_causal=is_causal,
-        # This topology probe is scheduler-independent. Persistent paired
-        # plans are reconstructed below with CLC after their logical wave
-        # count is known; single-instance plans retain the staged page-offset
-        # producer and static scheduling.
-        balance_causal_workload=_uses_heavy_first_static_causal_raster(
-            mask_type=mask_type,
-            window_left=window_left,
-            has_q_offset=has_q_offset,
-        ),
-        is_clc_dynamic=False,
-        head_paired=head_paired,
-        window_size_left=window_left if window_left > 0 else 0,
-        h_r=num_qo_heads // num_kv_heads,
-        enable_skip_correction=True,
-        use_paged_kv=True,
-        num_tokens_per_page=page_size,
-        max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
-        # The fixed one-tile shortcut assumes contiguous fixed-shape K/V and
-        # is intentionally disabled for the page-table path.
-        causal_single_kv_tile=False,
-    )
-    num_seq_tiles = (max_seq_len_q + fmha.cfg.cta_tiler[0] - 1) // fmha.cfg.cta_tiler[0]
-    num_head_tiles = num_qo_heads // fmha.cfg.work_tile_q_heads
-    logical_work_tiles = batch_size * num_seq_tiles * num_head_tiles
-    paged_is_persistent = _paged_context_uses_persistent_scheduler(
+    fmha = _make_context_kernel(
+        input_dtype=input_dtype,
+        output_dtype=output_dtype,
+        head_dim=head_dim,
         mask_type=mask_type,
+        window_left=window_left,
         head_paired=head_paired,
-        logical_work_tiles=logical_work_tiles,
-        max_active_clusters=max_active_clusters,
-        batch_size=batch_size,
         num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        has_q_offset=has_q_offset,
+        causal_single_kv_tile=False,
+        scheduler=scheduler,
+        page_size=page_size,
+        max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
     )
-    # A fixed/uniform causal plan has an immutable task domain. Its static
-    # queue avoids CLC response overhead; causal live-ragged plans retain CLC
-    # so request-local work changes are redistributed at runtime. Dense work
-    # does not have the causal request-dependent K-tile domain and stays static.
-    paged_uses_clc = _paged_context_uses_clc_scheduler(
-        is_persistent=paged_is_persistent,
-        single_qkv_instance=fmha.cfg.single_qkv_instance,
-        is_causal=is_causal,
-        uniform_packed_lengths=uniform_packed_lengths,
-    )
-    if paged_uses_clc:
-        fmha = FmhaTs(
-            qk_acc_dtype=cutlass.Float32,
-            pv_acc_dtype=cutlass.Float32,
-            in_dtype=input_dtype,
-            out_dtype=output_dtype,
-            d=head_dim,
-            is_persistent=True,
-            is_causal=is_causal,
-            is_clc_dynamic=True,
-            head_paired=head_paired,
-            window_size_left=window_left if window_left > 0 else 0,
-            h_r=num_qo_heads // num_kv_heads,
-            enable_skip_correction=True,
-            use_paged_kv=True,
-            num_tokens_per_page=page_size,
-            max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
-            causal_single_kv_tile=False,
-        )
-    elif not paged_is_persistent:
-        fmha = FmhaTs(
-            qk_acc_dtype=cutlass.Float32,
-            pv_acc_dtype=cutlass.Float32,
-            in_dtype=input_dtype,
-            out_dtype=output_dtype,
-            d=head_dim,
-            is_persistent=False,
-            is_causal=is_causal,
-            is_clc_dynamic=False,
-            head_paired=head_paired,
-            window_size_left=window_left if window_left > 0 else 0,
-            h_r=num_qo_heads // num_kv_heads,
-            enable_skip_correction=True,
-            use_paged_kv=True,
-            num_tokens_per_page=page_size,
-            max_num_pages_per_seq_kv=max_num_pages_per_seq_kv,
-            causal_single_kv_tile=False,
-        )
     fmha.cfg.has_varlen = True
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
     if uniform_packed_lengths:
@@ -1407,6 +1602,9 @@ def _get_compiled_paged_context(
 
     runtime_total_q = cute.sym_int()
     runtime_num_pages = cute.sym_int()
+    batch_size = cute.sym_int()
+    runtime_num_q_offsets = cute.sym_int()
+    runtime_num_k_offsets = cute.sym_int()
     q_fake = fake_compact(input_dtype, (runtime_total_q, num_qo_heads, head_dim), 16)
     kv_shape = (
         runtime_num_pages,
@@ -1419,8 +1617,8 @@ def _get_compiled_paged_context(
     out_fake = fake_compact(output_dtype, (runtime_total_q, num_qo_heads, head_dim), 16)
     scale_fake = fake_compact(cutlass.Float32, (1,), 4)
     output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
-    qo_indptr_fake = fake_compact(cutlass.Int32, (batch_size + 1,), 4)
-    kv_indptr_fake = fake_compact(cutlass.Int32, (batch_size + 1,), 4)
+    qo_indptr_fake = fake_compact(cutlass.Int32, (runtime_num_q_offsets,), 4)
+    kv_indptr_fake = fake_compact(cutlass.Int32, (runtime_num_k_offsets,), 4)
     page_idx_fake = fake_compact(
         cutlass.Int32,
         (batch_size, 2, max_num_pages_per_seq_kv),
@@ -1449,16 +1647,7 @@ def _get_compiled_paged_context(
             options=_COMPILE_OPTIONS,
         )
     policy = (
-        (
-            "scheduler",
-            (
-                "clc_dynamic_persistent"
-                if paged_uses_clc
-                else "static_persistent"
-                if paged_is_persistent
-                else "nonpersistent"
-            ),
-        ),
+        ("scheduler", scheduler),
         ("pairing", "head" if head_paired else "query"),
         ("kv_layout", "paged_hnd"),
         ("page_size", page_size),
@@ -1568,6 +1757,7 @@ class BatchPrefillTSWrapper:
 
     @flashinfer_api
     def __init__(self) -> None:
+        """Initialize an unplanned task-scheduled context-attention wrapper."""
         self._planned = False
 
     @flashinfer_api
@@ -1579,8 +1769,10 @@ class BatchPrefillTSWrapper:
         *,
         qo_indptr: Optional[torch.Tensor] = None,
         kv_indptr: Optional[torch.Tensor] = None,
-        mask_type: Literal["dense", "causal"] = "dense",
+        mask_type: Literal["dense", "causal", "variable_window"] = "dense",
         window_left: int = -1,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
         sm_scale: Optional[float] = None,
         output_scale: float = 1.0,
         out_dtype: Optional[torch.dtype] = None,
@@ -1589,6 +1781,28 @@ class BatchPrefillTSWrapper:
 
         Packed cumulative offsets remain live device inputs. Their runtime
         values must follow the replay contract documented on this wrapper.
+
+        Parameters
+        ----------
+        q, k, v : torch.Tensor
+            Fixed or packed query, key, and value tensors.
+        qo_indptr, kv_indptr : torch.Tensor, optional
+            Cumulative query and K/V offsets for packed-ragged input.
+        mask_type : {"dense", "causal", "variable_window"}
+            Attention mask mode. ``variable_window`` is supported only for
+            fixed-shape inputs.
+        window_left : int
+            Left sliding-window extent, or ``-1`` to disable the window.
+        variable_window_token_starts, variable_window_token_ends : torch.Tensor, optional
+            Inclusive per-query K bounds required for ``variable_window``.
+            Both must be CUDA int32 tensors shaped ``[B, Sq]`` and satisfy
+            ``0 <= starts[b, q] <= ends[b, q] < Sk``.
+        sm_scale : float, optional
+            Softmax scale; defaults to the inverse square root of head size.
+        output_scale : float
+            Scale applied to the attention output.
+        out_dtype : torch.dtype, optional
+            Output dtype; defaults to the query dtype.
         """
 
         if out_dtype is None:
@@ -1607,6 +1821,39 @@ class BatchPrefillTSWrapper:
             window_left=window_left,
             output_dtype=resolved_out_dtype,
         )
+        if mask_type == "variable_window":
+            validated_window_starts, validated_window_ends = (
+                _validate_variable_window_bounds(
+                    variable_window_token_starts,
+                    variable_window_token_ends,
+                    geometry=geometry,
+                )
+            )
+            # Variable-window bounds are plan metadata. Keep one internal
+            # snapshot so row masks and the reduced CTA origins cannot diverge
+            # if the caller later modifies its tensors.
+            planned_window_starts = validated_window_starts.clone()
+            planned_window_ends = validated_window_ends.clone()
+            planned_window_cta_starts = _build_variable_window_cta_starts(
+                planned_window_starts, geometry=geometry
+            )
+        else:
+            if (
+                variable_window_token_starts is not None
+                or variable_window_token_ends is not None
+            ):
+                raise ValueError(
+                    "variable-window bounds require mask_type='variable_window'"
+                )
+            planned_window_starts = torch.empty(
+                1, dtype=torch.int32, device=geometry.device
+            )
+            planned_window_ends = torch.empty(
+                1, dtype=torch.int32, device=geometry.device
+            )
+            planned_window_cta_starts = torch.empty(
+                1, dtype=torch.int32, device=geometry.device
+            )
         if sm_scale is None:
             sm_scale = 1.0 / math.sqrt(geometry.head_dim)
         sm_scale = _validate_scale(sm_scale, "sm_scale")
@@ -1637,7 +1884,7 @@ class BatchPrefillTSWrapper:
         # making plan publication atomic, this lets compute-sanitizer patch the
         # generated attention kernel without interleaving later PyTorch setup
         # launches with the DSL compiler/runtime callbacks.
-        compiled, policy = _get_compiled_context(*_semantic_key(geometry))
+        compiled, policy = _get_compiled_context(_context_compile_spec(geometry))
 
         # Publish only after validation, compilation, and allocation succeed.
         self._geometry = geometry
@@ -1645,6 +1892,9 @@ class BatchPrefillTSWrapper:
         self._kv_indptr = planned_kv_indptr
         self._scale_softmax_log2 = scale_tensor
         self._output_scale = output_scale_tensor
+        self._variable_window_token_starts = planned_window_starts
+        self._variable_window_token_ends = planned_window_ends
+        self._variable_window_cta_starts = planned_window_cta_starts
         self._compiled = compiled
         self._policy = policy
         self._planned = True
@@ -1658,7 +1908,15 @@ class BatchPrefillTSWrapper:
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Launch on the current stream into output disjoint from Q, K, and V."""
+        """Launch on the current stream into output disjoint from Q, K, and V.
+
+        Parameters
+        ----------
+        q, k, v : torch.Tensor
+            Runtime query, key, and value tensors matching the plan.
+        out : torch.Tensor, optional
+            Caller-owned output tensor. A new tensor is allocated when omitted.
+        """
 
         if not self._planned:
             raise RuntimeError("plan() must be called before run()")
@@ -1675,6 +1933,9 @@ class BatchPrefillTSWrapper:
                 ("kv_indptr", self._kv_indptr),
                 ("scale_softmax_log2", self._scale_softmax_log2),
                 ("output_scale", self._output_scale),
+                ("variable_window_token_starts", self._variable_window_token_starts),
+                ("variable_window_token_ends", self._variable_window_token_ends),
+                ("variable_window_cta_starts", self._variable_window_cta_starts),
             )
         self._compiled(
             q,
@@ -1685,6 +1946,9 @@ class BatchPrefillTSWrapper:
             self._output_scale,
             self._qo_indptr,
             self._kv_indptr,
+            self._variable_window_token_starts,
+            self._variable_window_token_ends,
+            self._variable_window_cta_starts,
         )
         return out
 
@@ -1720,6 +1984,13 @@ class BatchPrefillPagedTSWrapper:
 
     @flashinfer_api
     def __init__(self, kv_layout: Literal["HND"] = "HND") -> None:
+        """Initialize an unplanned paged context-attention wrapper.
+
+        Parameters
+        ----------
+        kv_layout : {"HND"}
+            Layout of the separate K and V page pools.
+        """
         _validate_kv_layout(kv_layout)
         self._kv_layout = kv_layout
         self._planned = False
@@ -1746,6 +2017,29 @@ class BatchPrefillPagedTSWrapper:
 
         Runtime Q lengths may vary within the planned maximum-Q capacity and
         must remain no greater than the snapshotted K length for causal plans.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Packed query tensor.
+        k_cache, v_cache : torch.Tensor
+            Separate HND key and value page pools.
+        qo_indptr : torch.Tensor
+            Cumulative packed-query offsets.
+        paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len : torch.Tensor
+            FlashInfer CSR page metadata.
+        page_size : int
+            Number of K/V tokens stored in each page.
+        mask_type : {"dense", "causal"}
+            Attention mask mode.
+        window_left : int
+            Left sliding-window extent, or ``-1`` to disable the window.
+        sm_scale : float, optional
+            Softmax scale; defaults to the inverse square root of head size.
+        output_scale : float
+            Scale applied to the attention output.
+        out_dtype : torch.dtype, optional
+            Output dtype; defaults to the query dtype.
         """
 
         if out_dtype is None:
@@ -1798,7 +2092,9 @@ class BatchPrefillPagedTSWrapper:
 
         # Keep all runtime tensor allocation ahead of CUTLASS JIT, matching
         # BatchPrefillTSWrapper.plan and its compute-sanitizer ordering.
-        compiled, policy = _get_compiled_paged_context(*_paged_semantic_key(geometry))
+        compiled, policy = _get_compiled_paged_context(
+            _paged_context_compile_spec(geometry)
+        )
 
         # Publish only after validation, compilation, and allocation succeed.
         self._geometry = geometry
@@ -1824,7 +2120,17 @@ class BatchPrefillPagedTSWrapper:
         *,
         out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Launch the planned page-table specialization on the current stream."""
+        """Launch the planned page-table specialization on the current stream.
+
+        Parameters
+        ----------
+        q : torch.Tensor
+            Runtime packed query tensor matching the plan.
+        k_cache, v_cache : torch.Tensor
+            Runtime HND key and value page pools matching the plan.
+        out : torch.Tensor, optional
+            Caller-owned output tensor. A new tensor is allocated when omitted.
+        """
 
         if not self._planned:
             raise RuntimeError("plan() must be called before run()")
@@ -1870,8 +2176,10 @@ def batch_prefill(
     *,
     qo_indptr: Optional[torch.Tensor] = None,
     kv_indptr: Optional[torch.Tensor] = None,
-    mask_type: Literal["dense", "causal"] = "dense",
+    mask_type: Literal["dense", "causal", "variable_window"] = "dense",
     window_left: int = -1,
+    variable_window_token_starts: Optional[torch.Tensor] = None,
+    variable_window_token_ends: Optional[torch.Tensor] = None,
     sm_scale: Optional[float] = None,
     output_scale: float = 1.0,
     out_dtype: Optional[torch.dtype] = None,
@@ -1886,6 +2194,30 @@ def batch_prefill(
     left window; a positive value selects the private head-paired GQA policy
     and retains at most ``window_left + 1`` keys at each causal row, including
     when ``S_q < S_kv``.
+
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        Fixed or packed query, key, and value tensors.
+    qo_indptr, kv_indptr : torch.Tensor, optional
+        Cumulative query and K/V offsets for packed-ragged input.
+    mask_type : {"dense", "causal", "variable_window"}
+        Attention mask mode. ``variable_window`` is supported only for
+        fixed-shape inputs.
+    window_left : int
+        Left sliding-window extent, or ``-1`` to disable the window.
+    variable_window_token_starts, variable_window_token_ends : torch.Tensor, optional
+        Inclusive per-query K bounds required for ``variable_window``. Both
+        must be CUDA int32 tensors shaped ``[B, Sq]`` and satisfy
+        ``0 <= starts[b, q] <= ends[b, q] < Sk``.
+    sm_scale : float, optional
+        Softmax scale; defaults to the inverse square root of head size.
+    output_scale : float
+        Scale applied to the attention output.
+    out_dtype : torch.dtype, optional
+        Requested output dtype.
+    out : torch.Tensor, optional
+        Caller-owned output tensor.
     """
 
     resolved_out_dtype = (
@@ -1900,6 +2232,8 @@ def batch_prefill(
         kv_indptr=kv_indptr,
         mask_type=mask_type,
         window_left=window_left,
+        variable_window_token_starts=variable_window_token_starts,
+        variable_window_token_ends=variable_window_token_ends,
         sm_scale=sm_scale,
         output_scale=output_scale,
         out_dtype=resolved_out_dtype,
@@ -1934,6 +2268,33 @@ def batch_prefill_with_paged_kv_cache(
     use FlashInfer's CSR representation.
     Physical page indices need not be identity ordered. ``D`` may be 128 or
     256; Q, K, and V must share one supported dtype.
+
+    Parameters
+    ----------
+    q : torch.Tensor
+        Packed query tensor.
+    k_cache, v_cache : torch.Tensor
+        Separate HND key and value page pools.
+    qo_indptr : torch.Tensor
+        Cumulative packed-query offsets.
+    paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len : torch.Tensor
+        FlashInfer CSR page metadata.
+    page_size : int
+        Number of K/V tokens stored in each page.
+    kv_layout : {"HND"}
+        Layout of the separate K and V page pools.
+    mask_type : {"dense", "causal"}
+        Attention mask mode.
+    window_left : int
+        Left sliding-window extent, or ``-1`` to disable the window.
+    sm_scale : float, optional
+        Softmax scale; defaults to the inverse square root of head size.
+    output_scale : float
+        Scale applied to the attention output.
+    out_dtype : torch.dtype, optional
+        Requested output dtype.
+    out : torch.Tensor, optional
+        Caller-owned output tensor.
     """
 
     resolved_out_dtype = (
