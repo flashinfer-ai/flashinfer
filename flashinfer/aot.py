@@ -197,6 +197,7 @@ def gen_fa2(
         head_dim_vo=head_dim_vo,
         pos_encoding_mode=0,
         use_sliding_window=use_sliding_window,
+        use_variable_window=False,
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=False,
     )
@@ -244,6 +245,7 @@ def gen_fa3(
         head_dim_vo=head_dim_vo,
         pos_encoding_mode=0,
         use_sliding_window=use_sliding_window,
+        use_variable_window=False,
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=False,
     )

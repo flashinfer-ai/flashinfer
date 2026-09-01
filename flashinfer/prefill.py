@@ -272,6 +272,7 @@ def get_customize_batch_prefill_module(
     variant_decl: str,
     pos_encoding_mode: int = 0,
     use_sliding_window: bool = False,
+    use_variable_window: bool = False,
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
@@ -291,11 +292,12 @@ def get_customize_batch_prefill_module(
         additional_scalar_dtypes,
         variant_name,
         variant_decl,
-        pos_encoding_mode,
-        use_sliding_window,
-        use_logits_soft_cap,
-        use_fp16_qk_reduction,
-        fp8_enabled,
+        pos_encoding_mode=pos_encoding_mode,
+        use_sliding_window=use_sliding_window,
+        use_variable_window=use_variable_window,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_fp16_qk_reduction=use_fp16_qk_reduction,
+        fp8_enabled=fp8_enabled,
     ).build_and_load()
 
 
@@ -535,18 +537,44 @@ def get_single_prefill_module(backend, *args):
 
 
 @functools.cache
-def get_batch_prefill_module(backend, *args):
-    use_variable_window = bool(args[10]) if len(args) > 10 else False
+def get_batch_prefill_module(
+    backend: str,
+    dtype_q: torch.dtype,
+    dtype_kv: torch.dtype,
+    dtype_o: torch.dtype,
+    dtype_idx: torch.dtype,
+    head_dim_qk: int,
+    head_dim_vo: int,
+    pos_encoding_mode: int,
+    use_sliding_window: bool,
+    use_variable_window: bool,
+    use_logits_soft_cap: bool,
+    use_fp16_qk_reduction: bool,
+):
     if backend == "trtllm-gen":
         uri = "trtllm_gen_context"
+        use_variable_window = False
         module = get_trtllm_gen_prefill_module()
         plan_func = module.plan
         workspace_size_func = None
         ragged_run_func = module.ragged_run
         paged_run_func = module.paged_run
     else:
-        uri = get_batch_prefill_uri(backend, *args)
-        module = gen_batch_prefill_module(backend, *args).build_and_load()
+        module_args = (
+            dtype_q,
+            dtype_kv,
+            dtype_o,
+            dtype_idx,
+            head_dim_qk,
+            head_dim_vo,
+            pos_encoding_mode,
+            use_sliding_window,
+            use_variable_window,
+            use_logits_soft_cap,
+            use_fp16_qk_reduction,
+        )
+        uri = get_batch_prefill_uri(backend, *module_args)
+        module = gen_batch_prefill_module(backend, *module_args).build_and_load()
         plan_func = module.plan
         workspace_size_func = getattr(module, "workspace_size", None)
         ragged_run_func = module.ragged_run
@@ -2024,6 +2052,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        variable_window_token_starts: Optional[torch.Tensor] = None,
+        variable_window_token_ends: Optional[torch.Tensor] = None,
     ) -> Tuple[int, int]:
         r"""Return the caller-owned workspace size required by :meth:`plan`.
 
@@ -2033,6 +2063,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         way as :meth:`plan`.  The wrapper's float workspace buffer is only used
         as the device/stream selector for the underlying module query.  This
         method does not allocate buffers and does not mutate cached plan state.
+
+        Sizing is currently implemented for the ``fa2`` backend.  ``fa3``
+        (including ``backend="auto"`` when it resolves to FA3) and
+        ``cudnn`` raise :class:`NotImplementedError` without compiling a
+        module.  ``variable_window`` requires FA3, so it is rejected the same
+        way.
 
         Parameters
         ----------
@@ -2113,6 +2149,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The fixed split size for split-kv prefill, in pages.
         disable_split_kv : bool
             Whether to disable the split-kv. Defaults to ``False``.
+        variable_window_token_starts, variable_window_token_ends : Optional[torch.Tensor]
+            Packed ``[nnz_qo]`` bounds as in :meth:`plan`. Not supported here:
+            ``variable_window`` requires the fa3 backend, which does not export
+            ``workspace_size``. Providing either tensor raises
+            :class:`NotImplementedError`.
 
         Returns
         -------
@@ -2131,6 +2172,18 @@ class BatchPrefillWithPagedKVCacheWrapper:
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
+        if (
+            variable_window_token_starts is not None
+            or variable_window_token_ends is not None
+        ):
+            raise NotImplementedError(
+                "workspace_size is not available for variable_window; "
+                "the fa3 backend does not export workspace_size"
+            )
+        if self._backend in ("fa3", "cudnn"):
+            raise NotImplementedError(
+                f"workspace_size is not available for prefill backend {self._backend!r}"
+            )
         del (
             block_tables,
             max_item_len_ptr,
@@ -2207,10 +2260,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     use_custom_mask,
                     q_data_type,
                     kv_data_type,
+                    head_dim_qk=head_dim_qk,
+                    head_dim_vo=head_dim_vo,
                 )
-            if backend == "cudnn":
+            if backend in ("fa3", "cudnn"):
                 raise NotImplementedError(
-                    "workspace_size is not available for cudnn prefill backend"
+                    f"workspace_size is not available for prefill backend {backend!r}"
                 )
             module = get_batch_prefill_module(
                 backend,
@@ -2222,6 +2277,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 head_dim_vo,
                 PosEncodingMode[pos_encoding_mode].value,
                 window_left >= 0,
+                False,  # use_variable_window
                 logits_soft_cap > 0,
                 use_fp16_qk_reduction,
             )
@@ -2703,11 +2759,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     head_dim_vo,
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left >= 0,  # use_sliding_window
+                    self._use_variable_window,
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     use_fp16_qk_reduction,
-                    self._use_variable_window,
                 )
-
                 self._cached_module = get_batch_prefill_module(
                     self._backend, *get_module_args
                 )
@@ -4122,19 +4177,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     f"(resolved backend={self._backend!r})"
                 )
 
-            get_module_args = (
-                q_data_type,
-                kv_data_type,
-                o_data_type,
-                kv_indptr.dtype,
-                head_dim_qk,
-                head_dim_vo,
-                PosEncodingMode[pos_encoding_mode].value,
-                window_left >= 0,  # use_sliding_window
-                logits_soft_cap > 0,  # use_logits_soft_cap
-                use_fp16_qk_reduction,
-                self._use_variable_window,
-            )
             if self._backend == "fmha_v2":
                 # Cache plan data for run() — avoid GPU-CPU sync in hot path
                 self._fmha_v2_seq_lens = kv_len_arr.to(torch.int32).to(
@@ -4146,14 +4188,33 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._fmha_v2_qo_indptr = self._qo_indptr_buf.to(torch.int32)
                 self._fmha_v2_kv_indptr = self._kv_indptr_buf.to(torch.int32)
             elif self._backend == "cutlass":
-                # insert qo_indptr.device to 9th position (0-indexed) of get_module_args
-                new_get_module_args = (
-                    get_module_args[:9] + (qo_indptr.device,) + get_module_args[9:]
+                self._cached_module = get_fmha_module(
+                    q_data_type,
+                    kv_data_type,
+                    o_data_type,
+                    kv_indptr.dtype,
+                    head_dim_qk,
+                    head_dim_vo,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    window_left >= 0,  # use_sliding_window
+                    logits_soft_cap > 0,  # use_logits_soft_cap
+                    qo_indptr.device,
+                    use_fp16_qk_reduction,
                 )
-                self._cached_module = get_fmha_module(*new_get_module_args)
             elif self._backend != "cudnn":
                 self._cached_module = get_batch_prefill_module(
-                    self._backend, *get_module_args
+                    self._backend,
+                    q_data_type,
+                    kv_data_type,
+                    o_data_type,
+                    kv_indptr.dtype,
+                    head_dim_qk,
+                    head_dim_vo,
+                    PosEncodingMode[pos_encoding_mode].value,
+                    window_left >= 0,
+                    self._use_variable_window,
+                    logits_soft_cap > 0,
+                    use_fp16_qk_reduction,
                 )
 
         if self._backend == "cutlass":
@@ -4827,6 +4888,7 @@ def fmha_varlen(
         False,  # use_sliding_window
         False,  # use_logits_soft_cap
         q.device,
+        False,  # use_fp16_qk_reduction
     )
 
     nnz_qo, num_qo_heads, head_dim_qk = q.shape

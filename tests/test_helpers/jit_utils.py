@@ -131,6 +131,7 @@ def gen_prefill_attention_modules(
     head_dims,
     pos_encoding_modes,
     use_sliding_window_options,
+    use_variable_window_options,
     use_logits_soft_cap_options,
     use_fp16_qk_reduction_options,
 ) -> list[JitSpec]:
@@ -142,6 +143,7 @@ def gen_prefill_attention_modules(
         head_dim,
         pos_encoding_mode,
         use_sliding_window,
+        use_variable_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
     ) in itertools.product(
@@ -150,6 +152,7 @@ def gen_prefill_attention_modules(
         head_dims,
         pos_encoding_modes,
         use_sliding_window_options,
+        use_variable_window_options,
         use_logits_soft_cap_options,
         use_fp16_qk_reduction_options,
     ):
@@ -197,6 +200,7 @@ def gen_prefill_attention_modules(
                     head_dim,  # head_dim_vo
                     pos_encoding_mode,
                     use_sliding_window,
+                    use_variable_window,
                     use_logits_soft_cap,
                     use_fp16_qk_reduction,
                 )
@@ -215,21 +219,23 @@ def gen_prefill_attention_modules(
                 use_fp16_qk_reduction,
             )
         )
-        jit_specs.append(
-            flashinfer.prefill.gen_batch_prefill_module(
-                "fa2",
-                q_dtype,
-                kv_dtype,
-                q_dtype,
-                torch.int32,
-                head_dim,  # head_dim_qk
-                head_dim,  # head_dim_vo
-                pos_encoding_mode,
-                use_sliding_window,
-                use_logits_soft_cap,
-                use_fp16_qk_reduction,
+        if not use_variable_window:
+            jit_specs.append(
+                flashinfer.prefill.gen_batch_prefill_module(
+                    "fa2",
+                    q_dtype,
+                    kv_dtype,
+                    q_dtype,
+                    torch.int32,
+                    head_dim,  # head_dim_qk
+                    head_dim,  # head_dim_vo
+                    pos_encoding_mode,
+                    use_sliding_window,
+                    use_variable_window,
+                    use_logits_soft_cap,
+                    use_fp16_qk_reduction,
+                )
             )
-        )
 
     # required for attention with custom mask
     jit_specs.append(flashinfer.quantization.gen_quantization_module())

@@ -443,9 +443,9 @@ def get_batch_prefill_uri(
     head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
+    use_variable_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
-    use_variable_window: bool = False,
 ) -> str:
     return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
@@ -1035,9 +1035,9 @@ def gen_batch_prefill_module(
     head_dim_vo: int,
     pos_encoding_mode: int,
     use_sliding_window: bool,
+    use_variable_window: bool,
     use_logits_soft_cap: bool,
     use_fp16_qk_reduction: bool,
-    use_variable_window: bool = False,
 ) -> JitSpec:
     uri = get_batch_prefill_uri(
         backend,
@@ -1049,9 +1049,9 @@ def gen_batch_prefill_module(
         head_dim_vo,
         pos_encoding_mode,
         use_sliding_window,
+        use_variable_window,
         use_logits_soft_cap,
         use_fp16_qk_reduction,
-        use_variable_window,
     )
 
     # use `fp8_enabled` flag to use separate kernel template
@@ -1164,10 +1164,10 @@ def gen_batch_prefill_module(
         variant_decl,
         pos_encoding_mode=pos_encoding_mode,
         use_sliding_window=use_sliding_window,
+        use_variable_window=use_variable_window,
         use_logits_soft_cap=use_logits_soft_cap,
         use_fp16_qk_reduction=use_fp16_qk_reduction,
         fp8_enabled=fp8_enabled,
-        use_variable_window=use_variable_window,
     )
 
 
@@ -1696,10 +1696,10 @@ def gen_customize_batch_prefill_module(
     variant_decl: str,
     pos_encoding_mode: int = 0,
     use_sliding_window: bool = False,
+    use_variable_window: bool = False,
     use_logits_soft_cap: bool = False,
     use_fp16_qk_reduction: bool = False,
     fp8_enabled: bool = False,
-    use_variable_window: bool = False,
 ) -> JitSpec:
     require_fp4_kv_cache = dtype_map_kv[dtype_kv] == "__nv_fp4x2_e2m1"
     if require_fp4_kv_cache:
@@ -1727,9 +1727,9 @@ def gen_customize_batch_prefill_module(
         "head_dim_vo": head_dim_vo,
         "pos_encoding_mode": pos_encoding_mode_literal[pos_encoding_mode],
         "use_sliding_window": str(use_sliding_window).lower(),
+        "use_variable_window": str(use_variable_window).lower(),
         "use_logits_soft_cap": str(use_logits_soft_cap).lower(),
         "use_fp16_qk_reduction": str(use_fp16_qk_reduction).lower(),
-        "use_variable_window": str(use_variable_window).lower(),
     }
     if backend == "auto":
         raise ValueError("backend should not be auto when jit_args is provided")

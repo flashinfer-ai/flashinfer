@@ -313,6 +313,7 @@ def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
         head_dims=[512],
         pos_encoding_modes=[PosEncodingMode.NONE.value],
         use_sliding_window_options=[False],
+        use_variable_window_options=[False],
         use_logits_soft_cap_options=[False],
         use_fp16_qk_reduction_options=[False],
     )
@@ -321,3 +322,57 @@ def test_prefill_jit_helper_skips_fa3_unsupported_large_head(monkeypatch):
     assert ("batch", "fa3", 512, 512) not in calls
     assert ("single", "fa2", 512, 512) in calls
     assert ("batch", "fa2", 512, 512) in calls
+
+
+def test_prefill_jit_helper_skips_fa2_for_variable_window(monkeypatch):
+    batch_calls = []
+
+    def fake_batch_prefill_module(
+        backend,
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        idtype,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_variable_window,
+        use_logits_soft_cap,
+        use_fp16_qk_reduction,
+    ):
+        batch_calls.append((backend, use_variable_window))
+        return SimpleNamespace(name=f"{backend}_batch_{head_dim_qk}_{head_dim_vo}")
+
+    monkeypatch.setattr(jit_utils, "is_sm90a_supported", lambda device: True)
+    monkeypatch.setattr(
+        flashinfer.prefill,
+        "gen_single_prefill_module",
+        lambda backend, *_args: SimpleNamespace(name=f"{backend}_single"),
+    )
+    monkeypatch.setattr(
+        flashinfer.prefill, "gen_batch_prefill_module", fake_batch_prefill_module
+    )
+    monkeypatch.setattr(
+        flashinfer.quantization,
+        "gen_quantization_module",
+        lambda: SimpleNamespace(name="quantization"),
+    )
+    monkeypatch.setattr(
+        flashinfer.page,
+        "gen_page_module",
+        lambda: SimpleNamespace(name="page"),
+    )
+
+    jit_utils.gen_prefill_attention_modules(
+        q_dtypes=[torch.float16],
+        kv_dtypes=[torch.float16],
+        head_dims=[128],
+        pos_encoding_modes=[PosEncodingMode.NONE.value],
+        use_sliding_window_options=[False],
+        use_variable_window_options=[True],
+        use_logits_soft_cap_options=[False],
+        use_fp16_qk_reduction_options=[False],
+    )
+
+    assert batch_calls == [("fa3", True)]

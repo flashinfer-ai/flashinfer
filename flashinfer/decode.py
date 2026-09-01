@@ -1235,8 +1235,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     head_dim,
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left != -1,
+                    False,  # use_variable_window
                     logits_soft_cap > 0,
-                    False,
+                    False,  # use_fp16_qk_reduction
                 )
             qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
             # Multi-token requests are causal within each request's block;
@@ -1787,6 +1788,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     head_dim,  # head_dim_vo
                     PosEncodingMode[pos_encoding_mode].value,
                     window_left != -1,  # use_sliding_window
+                    False,  # use_variable_window
                     logits_soft_cap > 0,  # use_logits_soft_cap
                     False,  # use_fp16_qk_reduction
                 )
@@ -3036,8 +3038,32 @@ class TrtllmGenDecodeModule:
 
 
 @functools.cache
-def get_trtllm_gen_decode_module(*args):
-    uri = get_batch_prefill_uri("trtllm-gen", *args)
+def get_trtllm_gen_decode_module(
+    dtype_q,
+    dtype_kv,
+    dtype_o,
+    dtype_idx,
+    head_dim_qk,
+    head_dim_vo,
+    pos_encoding_mode,
+    use_sliding_window,
+    use_logits_soft_cap,
+    use_fp16_qk_reduction,
+):
+    uri = get_batch_prefill_uri(
+        "trtllm-gen",
+        dtype_q,
+        dtype_kv,
+        dtype_o,
+        dtype_idx,
+        head_dim_qk,
+        head_dim_vo,
+        pos_encoding_mode,
+        use_sliding_window,
+        use_variable_window=False,
+        use_logits_soft_cap=use_logits_soft_cap,
+        use_fp16_qk_reduction=use_fp16_qk_reduction,
+    )
     module = TrtllmGenDecodeModule()
 
     @register_custom_op(

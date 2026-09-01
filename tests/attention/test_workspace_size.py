@@ -51,6 +51,27 @@ def _unaligned_byte_workspace(num_bytes: int, device: str = "cuda"):
     return workspace
 
 
+def _prefill_workspace_size_args():
+    batch_size = 3
+    qo_len = 64
+    kv_len = 1024
+    page_size = 16
+    qo_indptr = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda") * qo_len
+    paged_kv_indptr, paged_kv_indices, paged_kv_last_page_len = _paged_kv_inputs(
+        batch_size, kv_len, page_size
+    )
+    return (
+        qo_indptr,
+        paged_kv_indptr,
+        paged_kv_indices,
+        paged_kv_last_page_len,
+        16,  # num_qo_heads
+        4,  # num_kv_heads
+        128,  # head_dim
+        page_size,
+    )
+
+
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 def test_batch_decode_workspace_size_plans_with_exact_buffers(use_cuda_graph):
     batch_size = 4
@@ -218,6 +239,40 @@ def test_batch_decode_workspace_size_rejects_unaligned_workspace_buffer():
             _byte_workspace(1024),
             _unaligned_byte_workspace(1024),
         )
+
+
+def test_batch_prefill_workspace_size_rejects_fa3():
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        _byte_workspace(32 * 1024 * 1024), backend="fa3"
+    )
+    with pytest.raises(NotImplementedError, match="prefill backend 'fa3'"):
+        wrapper.workspace_size(*_prefill_workspace_size_args())
+
+
+def test_batch_prefill_workspace_size_rejects_variable_window():
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        _byte_workspace(32 * 1024 * 1024), backend="fa2"
+    )
+    dummy = torch.zeros(1, dtype=torch.int32, device="cuda")
+    with pytest.raises(NotImplementedError, match="variable_window"):
+        wrapper.workspace_size(
+            *_prefill_workspace_size_args(),
+            variable_window_token_starts=dummy,
+            variable_window_token_ends=dummy,
+        )
+
+
+def test_batch_prefill_workspace_size_rejects_auto_fa3():
+    from flashinfer.utils import is_sm90a_supported
+
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("auto backend resolves to fa3 only on SM90")
+
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        _byte_workspace(32 * 1024 * 1024), backend="auto"
+    )
+    with pytest.raises(NotImplementedError, match="prefill backend 'fa3'"):
+        wrapper.workspace_size(*_prefill_workspace_size_args())
 
 
 def test_batch_prefill_workspace_size_rejects_unaligned_workspace_buffer():

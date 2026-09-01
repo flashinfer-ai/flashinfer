@@ -50,6 +50,7 @@ def test_warmpup_llama():
                 128,  # head_dim_vo
                 PosEncodingMode.NONE.value,
                 False,  # use_sliding_window
+                False,  # use_variable_window
                 False,  # use_logits_soft_cap
                 False,  # use_fp16_qk_reduction
             ),
@@ -91,6 +92,7 @@ def test_warmpup_llama_sm90():
                 128,  # head_dim_vo
                 PosEncodingMode.NONE.value,
                 False,  # use_sliding_window
+                False,  # use_variable_window
                 False,  # use_logits_soft_cap
                 False,  # use_fp16_qk_reduction
             ),
@@ -104,6 +106,7 @@ def test_warmpup_llama_sm90():
                 128,  # head_dim_vo
                 PosEncodingMode.NONE.value,
                 False,  # use_sliding_window
+                False,  # use_variable_window
                 False,  # use_logits_soft_cap
                 False,  # use_fp16_qk_reduction
             ),
