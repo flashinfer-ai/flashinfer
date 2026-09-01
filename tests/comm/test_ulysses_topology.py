@@ -18,6 +18,7 @@ from flashinfer.comm.ulysses_topology import (
     UlyssesBackendError,
     UlyssesRankTopology,
     _parse_pcie_gid_indices_override,
+    _probe_pcie_route,
     _probe_rocev2_ipv4_gid,
     decide_ulysses_backend,
     probe_ulysses_rank_topology,
@@ -153,6 +154,86 @@ def test_gid_probe_override_cannot_force_invalid_entry(tmp_path, requested_index
         _probe_rocev2_ipv4_gid(
             "mlx5_0", requested_index=requested_index, sysfs_root=tmp_path
         )
+
+
+# ---- PCIe NIC routing (FLASHINFER_ULYSSES_PCIE_NICS) ------------------------
+
+
+def _write_pcie_device_tree(sysfs_root):
+    """GPU and mlx5_0 behind one switch; mlx5_1 behind another.
+
+    Leaf directories carry PCI-address names like the real devices tree: the
+    tie-break in _probe_pcie_route parses the resolved GPU leaf name.
+    """
+    gpu = sysfs_root / "devices" / "pci0000:00" / "switch_a" / "0000:06:00.0"
+    near = sysfs_root / "devices" / "pci0000:00" / "switch_a" / "0000:07:00.0"
+    far = sysfs_root / "devices" / "pci0000:00" / "switch_b" / "0000:17:00.0"
+    for node in (gpu, near, far):
+        node.mkdir(parents=True)
+    (gpu / "numa_node").write_text("0\n")
+    (sysfs_root / "bus" / "pci" / "devices").mkdir(parents=True)
+    (sysfs_root / "bus" / "pci" / "devices" / "0000:06:00.0").symlink_to(gpu)
+    for name, target in (("mlx5_0", near), ("mlx5_1", far)):
+        entry = sysfs_root / "class" / "infiniband" / name
+        entry.mkdir(parents=True)
+        (entry / "device").symlink_to(target)
+    return "0000:06:00.0"
+
+
+def test_pcie_nics_unset_or_empty_routes_by_distance(tmp_path, monkeypatch):
+    bus = _write_pcie_device_tree(tmp_path)
+    monkeypatch.delenv("FLASHINFER_ULYSSES_PCIE_NICS", raising=False)
+    assert _probe_pcie_route(bus, 0, sysfs_root=tmp_path) == (0, "mlx5_0")
+    monkeypatch.setenv("FLASHINFER_ULYSSES_PCIE_NICS", "")
+    assert _probe_pcie_route(bus, 0, sysfs_root=tmp_path) == (0, "mlx5_0")
+
+
+def test_pcie_nics_override_is_rank_ordered_and_stripped(tmp_path, monkeypatch):
+    bus = _write_pcie_device_tree(tmp_path)
+    monkeypatch.setenv("FLASHINFER_ULYSSES_PCIE_NICS", " mlx5_1 , mlx5_0 ")
+    assert _probe_pcie_route(bus, 0, sysfs_root=tmp_path)[1] == "mlx5_1"
+    assert _probe_pcie_route(bus, 1, sysfs_root=tmp_path)[1] == "mlx5_0"
+
+
+@pytest.mark.parametrize("value", ["mlx5_0,,mlx5_1", ",", "   "])
+def test_pcie_nics_override_rejects_empty_entries(tmp_path, monkeypatch, value):
+    bus = _write_pcie_device_tree(tmp_path)
+    monkeypatch.setenv("FLASHINFER_ULYSSES_PCIE_NICS", value)
+    with pytest.raises(ValueError, match="FLASHINFER_ULYSSES_PCIE_NICS"):
+        _probe_pcie_route(bus, 0, sysfs_root=tmp_path)
+
+
+def test_pcie_nics_override_rejects_rank_past_entries(tmp_path, monkeypatch):
+    bus = _write_pcie_device_tree(tmp_path)
+    monkeypatch.setenv("FLASHINFER_ULYSSES_PCIE_NICS", "mlx5_0,mlx5_1")
+    with pytest.raises(ValueError, match="2 entries but this is rank 2"):
+        _probe_pcie_route(bus, 2, sysfs_root=tmp_path)
+
+
+def test_pcie_nics_override_rejects_unknown_device(tmp_path, monkeypatch):
+    bus = _write_pcie_device_tree(tmp_path)
+    monkeypatch.setenv("FLASHINFER_ULYSSES_PCIE_NICS", "mlx5_99")
+    with pytest.raises(RuntimeError, match="'mlx5_99' does not exist"):
+        _probe_pcie_route(bus, 0, sysfs_root=tmp_path)
+
+
+def test_pcie_nics_probe_raises_without_any_mlx5(tmp_path, monkeypatch):
+    bus = _write_pcie_device_tree(tmp_path)
+    monkeypatch.delenv("FLASHINFER_ULYSSES_PCIE_NICS", raising=False)
+    for name in ("mlx5_0", "mlx5_1"):
+        (tmp_path / "class" / "infiniband" / name / "device").unlink()
+        (tmp_path / "class" / "infiniband" / name).rmdir()
+    with pytest.raises(RuntimeError, match="no mlx5 RDMA devices found"):
+        _probe_pcie_route(bus, 0, sysfs_root=tmp_path)
+
+
+def test_pcie_probe_rejects_unknown_numa_node(tmp_path, monkeypatch):
+    bus = _write_pcie_device_tree(tmp_path)
+    gpu = (tmp_path / "bus" / "pci" / "devices" / bus).resolve()
+    (gpu / "numa_node").write_text("-1\n")
+    monkeypatch.delenv("FLASHINFER_ULYSSES_PCIE_NICS", raising=False)
+    with pytest.raises(RuntimeError, match="NUMA node is unknown"):
+        _probe_pcie_route(bus, 0, sysfs_root=tmp_path)
 
 
 # ---- pure decision layer ---------------------------------------------------
