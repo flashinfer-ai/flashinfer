@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import importlib
-import json
 import math
 import threading
 from types import SimpleNamespace
@@ -44,50 +43,30 @@ def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
     assert flashinfer.RecurrentKDAPrefillWrapper is RecurrentKDAPrefillWrapper
 
 
-def test_cake_kda_prefill_jit_surface_includes_checkpoint_aligned_bt64():
-    assert cake_kda_jit_api.CAKE_KDA_VARIANTS == (
-        "m128_unbounded_softplus",
-        "m128_bt64_unbounded_softplus",
-    )
-    for target in ("sm100a", "sm103a"):
-        n32_uri = cake_kda_jit_api.get_cake_kda_uri("m128_unbounded_softplus", target)
-        bt64_uri = cake_kda_jit_api.get_cake_kda_uri(
-            "m128_bt64_unbounded_softplus", target
-        )
-        assert n32_uri != bt64_uri
-        assert bt64_uri.endswith(f"_8f5147c17f_{target}")
-    csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
-    assert (csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus.cu").is_file()
-    assert (
-        csrc_dir / "cake_kda_bf16_fused_m128_bt64_unbounded_softplus_binding.cu"
-    ).is_file()
+def test_cake_kda_portfolio_uses_one_variable_unbounded_policy():
+    specs = cake_kda_jit_api.get_cake_kda_module_specs()
+    unbounded = [spec for spec in specs if spec.family == "unbounded_bf16_serving"]
+    assert {(spec.target, spec.policy) for spec in unbounded} == {
+        ("sm100a", "direct_m128_unbounded_softplus"),
+        ("sm103a", "direct_m128_unbounded_softplus"),
+    }
+    assert cake_kda_jit_api.cake_kda_is_available()
 
 
-def test_cake_kda_affine_manifest_controls_export_availability():
-    csrc_dir = cake_kda_jit_api._get_cake_kda_csrc_dir()
-    manifest = json.loads(
-        (
-            csrc_dir / "cake_kda_bf16_affine_unbounded_softplus_import_manifest.json"
-        ).read_text()
-    )
-    cake_kda_jit_api.get_cake_kda_affine_module_specs.cache_clear()
-    specs = cake_kda_jit_api.get_cake_kda_affine_module_specs()
-    if manifest["status"] == "pending_generated_sources":
-        assert manifest["modules"] == []
-        assert manifest["remaining_generated_inputs"]
-        assert specs == ()
-        assert not cake_kda_jit_api.cake_kda_affine_is_available()
-    else:
-        assert manifest["status"] == "complete"
-        assert len(specs) == 8
-        assert cake_kda_jit_api.cake_kda_affine_is_available()
-        assert {spec.target for spec in specs} == {"sm100a", "sm103a"}
-        assert {spec.role for spec in specs} == {
-            "main",
-            "map",
-            "scan",
-            "correction",
-        }
+def test_cake_kda_portfolio_includes_all_affine_roles():
+    specs = [
+        spec
+        for spec in cake_kda_jit_api.get_cake_kda_module_specs()
+        if spec.family == "unbounded_affine_prefix"
+    ]
+    assert len(specs) == 8
+    assert {spec.target for spec in specs} == {"sm100a", "sm103a"}
+    assert {spec.role for spec in specs} == {
+        "main",
+        "map",
+        "scan",
+        "correction",
+    }
 
 
 def _valid_cake_kda_affine_selector_kwargs():
@@ -125,20 +104,20 @@ def test_cake_kda_affine_selector_builds_exact_blackwell_partition(
     kwargs = _valid_cake_kda_affine_selector_kwargs()
     kwargs["num_heads"] = num_heads
     kwargs["compute_capability"] = compute_capability
-    plan = kda_prefill_api._select_cake_kda_affine_plan(**kwargs)
+    route = kda_prefill_api._select_cake_kda_affine_route(**kwargs)
     if not expected_affine:
-        assert plan is None
+        assert route is None
         return
-    assert plan is not None
-    assert plan.target == expected_target
-    assert plan.num_parts >= 2
-    assert plan.token_offsets[0] == 0
-    assert plan.token_offsets[-1] == kwargs["total_tokens"]
-    assert all(offset % 32 == 0 for offset in plan.token_offsets)
+    assert route is not None
+    assert route.target == expected_target
+    assert route.num_parts >= 2
+    assert route.token_offsets[0] == 0
+    assert route.token_offsets[-1] == kwargs["total_tokens"]
+    assert all(offset % 32 == 0 for offset in route.token_offsets)
     assert all(
         left < right
         for left, right in zip(
-            plan.token_offsets[:-1], plan.token_offsets[1:], strict=True
+            route.token_offsets[:-1], route.token_offsets[1:], strict=True
         )
     )
 
@@ -168,7 +147,7 @@ def test_cake_kda_affine_selector_builds_exact_blackwell_partition(
 def test_cake_kda_affine_selector_rejects_out_of_contract_calls(override, value):
     kwargs = _valid_cake_kda_affine_selector_kwargs()
     kwargs[override] = value
-    assert kda_prefill_api._select_cake_kda_affine_plan(**kwargs) is None
+    assert kda_prefill_api._select_cake_kda_affine_route(**kwargs) is None
 
 
 def _valid_cake_kda_shared_selector_kwargs(
@@ -235,7 +214,7 @@ def test_cake_kda_shared_selector_reuses_eight_physical_policies(
         num_heads=num_heads,
         fixed_layout=fixed_layout,
     )
-    route = kda_prefill_api._select_cake_kda_prefill_shared_route(**kwargs)
+    route = kda_prefill_api._select_cake_kda_bounded_evolution_route(**kwargs)
     assert route is not None
     assert route.policy == expected_policy
     assert route.grid_x == grid_x
@@ -278,7 +257,7 @@ def test_cake_kda_shared_selector_reuses_eight_physical_policies(
 def test_cake_kda_shared_selector_rejects_out_of_contract_calls(override, value):
     kwargs = _valid_cake_kda_shared_selector_kwargs()
     kwargs[override] = value
-    assert kda_prefill_api._select_cake_kda_prefill_shared_route(**kwargs) is None
+    assert kda_prefill_api._select_cake_kda_bounded_evolution_route(**kwargs) is None
 
 
 def test_cake_kda_affine_workspace_buffer_is_grow_only(monkeypatch):
@@ -473,7 +452,7 @@ def test_public_prefill_auto_falls_back_to_cake(monkeypatch):
     )
 
     assert recurrent_kda(**_cpu_route_tensors()) is sentinel
-    assert calls[0]["use_cake_shared"] is False
+    assert calls[0]["use_cake_export"] is False
 
 
 def test_public_prefill_explicit_cake_skips_cute_dsl_probe_with_checkpoints(
@@ -509,7 +488,7 @@ def test_public_prefill_explicit_cake_skips_cute_dsl_probe_with_checkpoints(
         )
         is sentinel
     )
-    assert calls[0]["use_cake_shared"] is True
+    assert calls[0]["use_cake_export"] is True
 
 
 def test_public_prefill_auto_routes_supported_checkpoints_to_cute_dsl(monkeypatch):
@@ -2140,6 +2119,14 @@ def test_frozen_sm103_tensor_state_decay_matches_scalar_control(
         seed=25696,
     )
     initial_state_seed = inputs["initial_state"].clone()
+    # This regression compares the two legacy tensor-state-decay implementations
+    # directly.  Keep the generated portfolio out of the comparison; its public
+    # numerical contract is covered by the reference-based Cake tests below.
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_cake_kda_bounded_evolution_route",
+        lambda **kwargs: None,
+    )
     routes = []
     get_module = kda_prefill_api._get_flash_kda_prefill_module
 
@@ -2349,13 +2336,11 @@ def test_unbounded_softplus_prefill_routes_to_cake_runtime_head_module(
     module = _RecorderModule()
     routes = []
 
-    def get_cake_module(variant, target):
-        routes.append((variant, target))
+    def get_cake_module(target, family, policy, role="main"):
+        routes.append((target, family, policy, role))
         return module
 
-    monkeypatch.setattr(
-        kda_prefill_api, "_get_cake_kda_prefill_module", get_cake_module
-    )
+    monkeypatch.setattr(kda_prefill_api, "_get_cake_kda_export_module", get_cake_module)
     monkeypatch.setattr(
         kda_prefill_api,
         "_get_flash_kda_prefill_module",
@@ -2375,28 +2360,34 @@ def test_unbounded_softplus_prefill_routes_to_cake_runtime_head_module(
 
     assert output.shape == inputs["q"].shape
     assert state is None
-    assert routes == [("m128_unbounded_softplus", expected_target)]
+    assert routes == [
+        (
+            expected_target,
+            "unbounded_bf16_serving",
+            "direct_m128_unbounded_softplus",
+            "main",
+        )
+    ]
     (args,) = module.calls
-    assert len(args) == 28
+    assert len(args) == 53
     assert args[18] == num_heads
-    assert args[26] == 0.0
+    assert args[22] == 0.0
 
 
 @pytest.mark.parametrize(
-    ("num_heads", "checkpoint_every_n_tokens", "checkpoint_cu_starts", "expected"),
+    ("num_heads", "checkpoint_every_n_tokens", "checkpoint_cu_starts"),
     [
-        (4, 64, [0, 2, 5], "m128_bt64_unbounded_softplus"),
-        (4, 32, [0, 3, 8], "m128_unbounded_softplus"),
-        (8, 64, [0, 2, 5], "m128_unbounded_softplus"),
+        (4, 64, [0, 2, 5]),
+        (4, 32, [0, 3, 8]),
+        (8, 64, [0, 2, 5]),
     ],
 )
-def test_unbounded_softplus_bt64_route_is_checkpoint_and_head_specific(
+def test_unbounded_softplus_uses_one_variable_checkpoint_policy(
     cuda_device,
     monkeypatch,
     num_heads,
     checkpoint_every_n_tokens,
     checkpoint_cu_starts,
-    expected,
 ):
     monkeypatch.setattr(
         kda_prefill_api, "get_compute_capability", lambda device: (10, 0)
@@ -2408,13 +2399,11 @@ def test_unbounded_softplus_bt64_route_is_checkpoint_and_head_specific(
     module = _RecorderModule()
     routes = []
 
-    def get_cake_module(variant, target):
-        routes.append((variant, target))
+    def get_cake_module(target, family, policy, role="main"):
+        routes.append((target, family, policy, role))
         return module
 
-    monkeypatch.setattr(
-        kda_prefill_api, "_get_cake_kda_prefill_module", get_cake_module
-    )
+    monkeypatch.setattr(kda_prefill_api, "_get_cake_kda_export_module", get_cake_module)
     inputs = _make_inputs(
         seq_lens=[65, 131],
         num_heads=num_heads,
@@ -2441,14 +2430,22 @@ def test_unbounded_softplus_bt64_route_is_checkpoint_and_head_specific(
     assert output.shape == inputs["q"].shape
     assert state is None
     assert returned_checkpoints is state_checkpoints
-    assert routes == [(expected, "sm100a")]
+    assert routes == [
+        (
+            "sm100a",
+            "unbounded_bf16_serving",
+            "direct_m128_unbounded_softplus",
+            "main",
+        )
+    ]
     (args,) = module.calls
-    assert len(args) == 28
-    assert args[14].data_ptr() == state_checkpoints.data_ptr()
-    assert args[15].data_ptr() == checkpoint_cu_starts_tensor.data_ptr()
+    assert len(args) == 53
+    assert args[24] == state_checkpoints.data_ptr()
+    assert args[25] == checkpoint_cu_starts_tensor.data_ptr()
     assert args[18] == num_heads
-    assert args[24] == checkpoint_every_n_tokens
-    assert args[26] == 0.0
+    assert args[29] == checkpoint_every_n_tokens
+    assert args[22] == 0.0
+    assert args[48].data_ptr() == state_checkpoints.data_ptr()
 
 
 @pytest.mark.parametrize("sm_count", [148, 152])
@@ -2473,6 +2470,11 @@ def test_sm100_uniform_prefill_reaches_persistent_worker_abi(
         lambda device: sm_count,
     )
     monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_cake_kda_bounded_evolution_route",
+        lambda **kwargs: None,
+    )
     module = _RecorderModule()
     routes = []
 
@@ -2528,6 +2530,11 @@ def test_uniform_piece_prefill_reaches_extended_worker_abi(
         lambda device: 152,
     )
     monkeypatch.setattr(kda_prefill_api, "_flash_kda_stream_workspaces", {})
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_cake_kda_bounded_evolution_route",
+        lambda **kwargs: None,
+    )
     monkeypatch.setattr(
         kda_prefill_api,
         "_should_use_uniform_piece_persistent",
@@ -2605,6 +2612,11 @@ def test_explicit_workspace_keeps_uniform_piece_candidate_on_direct_abi(
         "_should_use_uniform_piece_persistent",
         lambda **kwargs: True,
     )
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_cake_kda_bounded_evolution_route",
+        lambda **kwargs: None,
+    )
     module = _RecorderModule()
     routes = []
 
@@ -2645,6 +2657,11 @@ def test_frozen_uniform_piece_prefill_repeats_and_matches_direct_control(
         seed=102400 + num_heads,
     )
     initial_state_seed = inputs["initial_state"].clone()
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_cake_kda_bounded_evolution_route",
+        lambda **kwargs: None,
+    )
     routes = []
     get_module = kda_prefill_api._get_flash_kda_prefill_module
 
@@ -3448,6 +3465,11 @@ def test_frozen_small_bh_prefill_matches_direct_control(
     }
     small_output = torch.empty_like(inputs["q"])
     direct_output = torch.empty_like(inputs["q"])
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_cake_kda_bounded_evolution_route",
+        lambda **kwargs: None,
+    )
     routes = []
     get_module = kda_prefill_api._get_flash_kda_prefill_module
 
@@ -3597,6 +3619,11 @@ def test_frozen_bt16_scalar_prepare_subgroup_heads_matches_direct_control(
         seed=2050,
     )
     initial_state_seed = inputs["initial_state"].clone()
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_select_cake_kda_bounded_evolution_route",
+        lambda **kwargs: None,
+    )
     routes = []
     get_module = kda_prefill_api._get_flash_kda_prefill_module
 

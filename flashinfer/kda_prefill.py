@@ -35,11 +35,7 @@ import torch
 from .utils import get_compute_capability
 
 if TYPE_CHECKING:
-    from .jit.cake_kda import CakeKDATarget, CakeKDAVariant
-    from .jit.cake_kda_prefill_shared import (
-        CakeKDAPrefillSharedPolicy,
-        CakeKDAPrefillSharedTarget,
-    )
+    from .jit.cake_kda import CakeKDATarget
     from .jit.flash_kda import FlashKDATarget, FlashKDAVariant
 
 _FLASH_KDA_HEAD_DIM = 128
@@ -142,7 +138,7 @@ class _PersistentM128Roofline:
 
 
 @dataclass(frozen=True)
-class _CakeKDAAffinePlan:
+class _CakeKDAAffineRoute:
     """Exact target and token partition for the sealed affine composite."""
 
     target: Literal["sm100a", "sm103a"]
@@ -154,11 +150,11 @@ class _CakeKDAAffinePlan:
 
 
 @dataclass(frozen=True)
-class _CakeKDAPrefillSharedRoute:
+class _CakeKDABoundedEvolutionRoute:
     """One selected exported physical schedule and its kernel inputs."""
 
-    target: "CakeKDAPrefillSharedTarget"
-    policy: "CakeKDAPrefillSharedPolicy"
+    target: "CakeKDATarget"
+    policy: str
     sequence_order: tuple[int, ...]
     grid_x: int
     uniform_sequence_length: int = 0
@@ -182,15 +178,15 @@ class _CakeKDAAffineModuleBundle:
 
 
 @dataclass(frozen=True)
-class _CakeKDAAffineLaunchPlanKey:
+class _CakeKDAAffineResourcesKey:
     target: Literal["sm100a", "sm103a"]
     token_offsets: tuple[int, ...]
     num_heads: int
 
 
 @dataclass(frozen=True)
-class _CakeKDAAffineLaunchPlan:
-    key: _CakeKDAAffineLaunchPlanKey
+class _CakeKDAAffineResources:
+    key: _CakeKDAAffineResourcesKey
     num_parts: int
     tail_start: int
     main_lengths: tuple[int, ...]
@@ -210,12 +206,11 @@ class _CakeKDAAffineLaunchPlan:
     tail_cu_seqlens: torch.Tensor
     main_seq_order: torch.Tensor
     tail_seq_order: torch.Tensor
-    main_descriptor_storage: torch.Tensor
-    map_descriptor_storage: torch.Tensor
-    correction_descriptor_storage: torch.Tensor
     empty_bf16: torch.Tensor
     empty_f32: torch.Tensor
     empty_i32: torch.Tensor
+    empty_i64: torch.Tensor
+    empty_u32: torch.Tensor
     modules: _CakeKDAAffineModuleBundle
 
 
@@ -230,6 +225,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._lock = threading.Lock()
         self._state_scratch: Optional[torch.Tensor] = None
         self._beta_padding: Optional[torch.Tensor] = None
+        self._cake_export_beta_padding: Optional[torch.Tensor] = None
         self._small_bh_packet_workspace: Optional[torch.Tensor] = None
         self._small_bh_packet_ready: Optional[torch.Tensor] = None
         self._small_bh_packet_consumed: Optional[torch.Tensor] = None
@@ -246,7 +242,7 @@ class _RecurrentKDAPrefillWorkspaceBase:
         self._bt16_metadata_signature: Optional[tuple] = None
         self._cake_kda_affine_buffers: dict[str, torch.Tensor] = {}
         self._cake_kda_affine_map_identity_data_ptr: Optional[int] = None
-        self._cake_kda_affine_launch_plan: Optional[_CakeKDAAffineLaunchPlan] = None
+        self._cake_kda_affine_resources: Optional[_CakeKDAAffineResources] = None
         self._cute_dsl_workspace: Optional[torch.Tensor] = None
         self._descriptor_storages = {
             variant: torch.empty(
@@ -393,12 +389,14 @@ def _is_state_pool_tensor(
     *,
     device: torch.device,
     num_heads: int,
+    allow_float32: bool = False,
 ) -> bool:
     return (
         isinstance(tensor, torch.Tensor)
         and tensor.is_cuda
         and tensor.device == device
-        and tensor.dtype == torch.bfloat16
+        and tensor.dtype
+        in ((torch.bfloat16, torch.float32) if allow_float32 else (torch.bfloat16,))
         and tensor.ndim == 4
         and tensor.shape[0] > 0
         and tensor.data_ptr() % 16 == 0
@@ -436,6 +434,7 @@ def _flash_kda_prefill_is_eligible(
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
+    allow_float32_state: bool = False,
 ) -> bool:
     """Return whether the call exactly matches the frozen FlashKDA contract."""
 
@@ -531,6 +530,7 @@ def _flash_kda_prefill_is_eligible(
             initial_state,
             device=q.device,
             num_heads=num_heads,
+            allow_float32=allow_float32_state,
         ):
             return False
         if ssm_state_indices is None and initial_state.shape[0] != num_sequences:
@@ -580,7 +580,7 @@ def _select_flash_kda_prefill_variant(
     use_exact_n16: bool = False,
     unbounded_softplus: bool = False,
     use_bt64_unbounded_softplus: bool = False,
-) -> "FlashKDAVariant | CakeKDAVariant":
+) -> "FlashKDAVariant":
     if unbounded_softplus:
         if use_bt64_unbounded_softplus:
             return "m128_bt64_unbounded_softplus"
@@ -608,20 +608,12 @@ def _flash_kda_device_sm_count(device: torch.device) -> int:
     return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
-def _cake_kda_affine_export_is_available() -> bool:
-    """Query the sealed affine bundle without importing JIT eagerly."""
+def _cake_kda_export_is_available() -> bool:
+    """Query the complete standard portfolio without building any module."""
 
-    from .jit.cake_kda import cake_kda_affine_is_available
+    from .jit.cake_kda import cake_kda_is_available
 
-    return cake_kda_affine_is_available()
-
-
-def _cake_kda_prefill_shared_export_is_available() -> bool:
-    """Query the manifest-verified shared prefill closure without building it."""
-
-    from .jit.cake_kda_prefill_shared import cake_kda_prefill_shared_is_available
-
-    return cake_kda_prefill_shared_is_available()
+    return cake_kda_is_available()
 
 
 def _build_cake_kda_shared_scalar_schedule(
@@ -765,11 +757,11 @@ def _build_cake_kda_shared_scalar_schedule(
     return tuple(schedule), counts, stride
 
 
-def _select_cake_kda_prefill_shared_route(
+def _select_cake_kda_bounded_evolution_route(
     *,
     requested: bool,
     export_available: bool,
-    target: Optional["CakeKDAPrefillSharedTarget"],
+    target: Optional["CakeKDATarget"],
     sm_count: int,
     fixed_layout: bool,
     sequence_lengths: tuple[int, ...],
@@ -787,7 +779,7 @@ def _select_cake_kda_prefill_shared_route(
     has_checkpoints: bool,
     scale: float,
     lower_bound: Optional[float],
-) -> Optional[_CakeKDAPrefillSharedRoute]:
+) -> Optional[_CakeKDABoundedEvolutionRoute]:
     """Select only semantics represented by the sealed shared export."""
 
     num_sequences = len(sequence_lengths)
@@ -839,7 +831,7 @@ def _select_cake_kda_prefill_shared_route(
     )
 
     if fixed_layout and num_sequences == 1 and num_heads == 64:
-        return _CakeKDAPrefillSharedRoute(
+        return _CakeKDABoundedEvolutionRoute(
             target=target,
             policy="direct_m64_independent_value_split",
             sequence_order=sequence_order,
@@ -865,7 +857,7 @@ def _select_cake_kda_prefill_shared_route(
             policy = "direct_vtile_m128_h64_gate_order"
         else:
             policy = "direct_vtile_m128_generic"
-        return _CakeKDAPrefillSharedRoute(
+        return _CakeKDABoundedEvolutionRoute(
             target=target,
             policy=policy,
             sequence_order=sequence_order,
@@ -894,7 +886,7 @@ def _select_cake_kda_prefill_shared_route(
         schedule, counts, stride = _build_cake_kda_shared_scalar_schedule(
             sequence_lengths, num_heads, persistent_ctas
         )
-        return _CakeKDAPrefillSharedRoute(
+        return _CakeKDABoundedEvolutionRoute(
             target=target,
             policy="persistent_m128_h64_lpt",
             sequence_order=sequence_order,
@@ -906,7 +898,7 @@ def _select_cake_kda_prefill_shared_route(
 
     if num_heads == 64:
         return None
-    return _CakeKDAPrefillSharedRoute(
+    return _CakeKDABoundedEvolutionRoute(
         target=target,
         policy=(
             "direct_m128_h96_commit_order" if num_heads == 96 else "direct_m128_generic"
@@ -917,7 +909,7 @@ def _select_cake_kda_prefill_shared_route(
 
 
 @functools.cache
-def _select_cake_kda_affine_plan(
+def _select_cake_kda_affine_route(
     *,
     export_available: bool,
     compute_capability: tuple[int, int],
@@ -935,7 +927,7 @@ def _select_cake_kda_affine_plan(
     initial_state_dtype: Optional[torch.dtype],
     has_checkpoints: bool,
     lower_bound: Optional[float],
-) -> Optional[_CakeKDAAffinePlan]:
+) -> Optional[_CakeKDAAffineRoute]:
     """Select only the exact contract covered by the sealed affine export."""
 
     if (
@@ -981,7 +973,7 @@ def _select_cake_kda_affine_plan(
     target: Literal["sm100a", "sm103a"] = (
         "sm100a" if compute_capability == (10, 0) else "sm103a"
     )
-    return _CakeKDAAffinePlan(
+    return _CakeKDAAffineRoute(
         target=target,
         token_offsets=tuple(
             chunk_offset * _FLASH_KDA_M128_CHUNK for chunk_offset in chunk_offsets
@@ -1029,41 +1021,52 @@ def _get_cake_kda_affine_module_bundle(
 ) -> _CakeKDAAffineModuleBundle:
     """Load the four sealed role modules for one exact Blackwell target."""
 
-    from .jit.cake_kda import get_cake_kda_affine_module
+    from .jit.cake_kda import get_cake_kda_module
 
     return _CakeKDAAffineModuleBundle(
-        main=get_cake_kda_affine_module(target, "main"),
-        map=get_cake_kda_affine_module(target, "map"),
-        scan=get_cake_kda_affine_module(target, "scan"),
-        correction=get_cake_kda_affine_module(target, "correction"),
+        main=get_cake_kda_module(
+            target, "unbounded_affine_prefix", "affine_split_main", "main"
+        ),
+        map=get_cake_kda_module(
+            target, "unbounded_affine_prefix", "affine_split_map", "map"
+        ),
+        scan=get_cake_kda_module(
+            target, "unbounded_affine_prefix", "affine_prefix_scan", "scan"
+        ),
+        correction=get_cake_kda_module(
+            target,
+            "unbounded_affine_prefix",
+            "affine_split_correction",
+            "correction",
+        ),
     )
 
 
-def _cake_kda_affine_launch_plan(
+def _cake_kda_affine_resources(
     *,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
-    affine_plan: _CakeKDAAffinePlan,
+    affine_route: _CakeKDAAffineRoute,
     device: torch.device,
     num_heads: int,
     capturing: bool,
-) -> _CakeKDAAffineLaunchPlan:
+) -> _CakeKDAAffineResources:
     """Resolve stable metadata and scratch for the four-stage composite."""
 
-    key = _CakeKDAAffineLaunchPlanKey(
-        target=affine_plan.target,
-        token_offsets=affine_plan.token_offsets,
+    key = _CakeKDAAffineResourcesKey(
+        target=affine_route.target,
+        token_offsets=affine_route.token_offsets,
         num_heads=num_heads,
     )
-    cached = workspace._cake_kda_affine_launch_plan
+    cached = workspace._cake_kda_affine_resources
     if cached is not None and cached.key == key:
         return cached
     if capturing:
         raise RuntimeError(
-            "Cake KDA affine launch plan is not warmed for CUDA graph capture"
+            "Cake KDA affine resources are not warmed for CUDA graph capture"
         )
 
-    token_offsets = affine_plan.token_offsets
-    num_parts = affine_plan.num_parts
+    token_offsets = affine_route.token_offsets
+    num_parts = affine_route.num_parts
     tail_start = token_offsets[1]
     total_tokens = token_offsets[-1]
     tail_tokens = total_tokens - tail_start
@@ -1132,9 +1135,11 @@ def _cake_kda_affine_launch_plan(
         "affine_correction_out_bf16", tail_value_shape, torch.bfloat16
     )
     state_indices_i64 = buffer("affine_state_indices_i64", (1,), torch.int64)
-    empty_bf16 = buffer("affine_empty_bf16", (1,), torch.bfloat16)[:0]
-    empty_f32 = buffer("affine_empty_f32", (1,), torch.float32)[:0]
-    empty_i32 = buffer("affine_empty_i32", (1,), torch.int32)[:0]
+    empty_bf16 = buffer("affine_empty_bf16", (1,), torch.bfloat16)
+    empty_f32 = buffer("affine_empty_f32", (1,), torch.float32)
+    empty_i32 = buffer("affine_empty_i32", (1,), torch.int32)
+    empty_i64 = buffer("affine_empty_i64", (1,), torch.int64)
+    empty_u32 = buffer("affine_empty_u32", (1,), torch.uint32)
 
     split_cu_seqlens = _cached_tensor(
         ("cake_affine_split_cu", *_stream_cache_key(device), token_offsets),
@@ -1150,8 +1155,8 @@ def _cake_kda_affine_launch_plan(
             "Cake KDA affine tail offsets are not warmed for CUDA graph capture"
         ),
     )
-    modules = _get_cake_kda_affine_module_bundle(affine_plan.target)
-    resolved = _CakeKDAAffineLaunchPlan(
+    modules = _get_cake_kda_affine_module_bundle(affine_route.target)
+    resolved = _CakeKDAAffineResources(
         key=key,
         num_parts=num_parts,
         tail_start=tail_start,
@@ -1172,35 +1177,20 @@ def _cake_kda_affine_launch_plan(
         tail_cu_seqlens=tail_cu_seqlens,
         main_seq_order=_identity_seq_order(device=device, num_sequences=num_parts),
         tail_seq_order=_identity_seq_order(device=device, num_sequences=num_parts - 1),
-        main_descriptor_storage=buffer(
-            "affine_main_descriptors",
-            (_FLASH_KDA_DESCRIPTOR_STORAGE_BYTES,),
-            torch.uint8,
-        ),
-        map_descriptor_storage=buffer(
-            "affine_map_descriptors",
-            (_FLASH_KDA_DESCRIPTOR_STORAGE_BYTES,),
-            torch.uint8,
-        ),
-        correction_descriptor_storage=buffer(
-            "affine_correction_descriptors",
-            (_FLASH_KDA_DESCRIPTOR_STORAGE_BYTES,),
-            torch.uint8,
-        ),
         empty_bf16=empty_bf16,
         empty_f32=empty_f32,
         empty_i32=empty_i32,
+        empty_i64=empty_i64,
+        empty_u32=empty_u32,
         modules=modules,
     )
-    workspace._cake_kda_affine_launch_plan = resolved
+    workspace._cake_kda_affine_resources = resolved
     return resolved
 
 
-def _run_cake_kda_affine_direct_role(
+def _run_cake_kda_direct_export(
     *,
-    workspace: _RecurrentKDAPrefillWorkspaceBase,
     module: _CakeKDAAffineModule,
-    role: Literal["main", "map", "correction"],
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1212,69 +1202,94 @@ def _run_cake_kda_affine_direct_role(
     cu_seqlens: torch.Tensor,
     seq_order: torch.Tensor,
     state_indices: torch.Tensor,
+    state_checkpoints: torch.Tensor,
+    checkpoint_cu_starts: torch.Tensor,
+    checkpoint_every_n_tokens: int,
     initial_state_bf16: torch.Tensor,
     out: torch.Tensor,
     final_state_bf16: torch.Tensor,
     initial_state_f32: torch.Tensor,
     final_state_f32: torch.Tensor,
-    descriptor_storage: torch.Tensor,
+    empty_bf16: torch.Tensor,
+    empty_f32: torch.Tensor,
+    empty_i32: torch.Tensor,
+    empty_i64: torch.Tensor,
+    empty_u32: torch.Tensor,
     num_heads: int,
+    num_sequences: int,
+    use_state_indices: bool,
+    use_initial_state: bool,
+    store_final_state: bool,
     state_slot_stride: int,
     scale: float,
+    lower_bound: float,
     grid_x: int,
-    stream_ptr: int,
-    capturing: bool,
 ) -> None:
-    signature = _descriptor_signature(q=q, k=k, v=v, g=g, beta_tma=beta_tma, out=out)
-    signature_key = f"cake_affine:{role}"
-    warmed_signature = workspace._descriptor_signatures.get(signature_key)
-    if capturing and warmed_signature != signature:
-        raise RuntimeError(
-            f"Cake KDA affine {role} descriptors are not warmed for capture"
-        )
-    prepare_descriptors = 0 if capturing else int(warmed_signature != signature)
-    try:
-        module.run(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            beta_tma,
-            A_log,
-            dt_bias,
-            cu_seqlens,
-            seq_order,
-            state_indices,
-            initial_state_bf16,
-            out,
-            final_state_bf16,
-            initial_state_f32,
-            final_state_f32,
-            descriptor_storage,
-            prepare_descriptors,
-            num_heads,
-            beta.stride(-2),
-            state_slot_stride,
-            scale,
-            0.0,
-            grid_x,
-            1,
-            1,
-            stream_ptr,
-        )
-    except Exception:
-        if prepare_descriptors:
-            workspace._descriptor_signatures.pop(signature_key, None)
-        raise
-    if prepare_descriptors:
-        workspace._descriptor_signatures[signature_key] = signature
+    use_checkpoints = checkpoint_every_n_tokens > 0
+    state_checkpoints_tma = (
+        state_checkpoints if use_checkpoints else _dummy_state_tma(q.device)
+    )
+    module.run(
+        q,
+        q,
+        k,
+        k,
+        v,
+        v,
+        g,
+        g,
+        beta,
+        beta_tma,
+        A_log,
+        dt_bias,
+        cu_seqlens,
+        seq_order,
+        initial_state_bf16,
+        out,
+        out,
+        final_state_bf16,
+        num_heads,
+        int(use_initial_state),
+        int(store_final_state),
+        scale,
+        lower_bound,
+        state_indices.data_ptr() if use_state_indices else empty_i32.data_ptr(),
+        (state_checkpoints.data_ptr() if use_checkpoints else empty_bf16.data_ptr()),
+        (checkpoint_cu_starts.data_ptr() if use_checkpoints else empty_i64.data_ptr()),
+        beta.stride(-2),
+        state_slot_stride,
+        int(use_state_indices),
+        checkpoint_every_n_tokens,
+        empty_i64,
+        empty_bf16,
+        empty_u32,
+        empty_bf16,
+        empty_bf16,
+        empty_bf16,
+        empty_bf16,
+        empty_f32,
+        empty_bf16,
+        empty_bf16,
+        empty_bf16,
+        empty_f32,
+        empty_bf16,
+        empty_f32,
+        initial_state_f32,
+        empty_u32,
+        0,
+        num_sequences,
+        state_checkpoints_tma,
+        final_state_f32,
+        grid_x,
+        1,
+        1,
+    )
 
 
 def _run_cake_kda_affine_route(
     *,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
-    affine_plan: _CakeKDAAffinePlan,
+    affine_route: _CakeKDAAffineRoute,
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1288,144 +1303,168 @@ def _run_cake_kda_affine_route(
     out: torch.Tensor,
     num_heads: int,
     scale: float,
-    stream_ptr: int,
     capturing: bool,
 ) -> None:
     """Launch main -> map -> scan -> correction and publish indexed state."""
 
-    plan = _cake_kda_affine_launch_plan(
+    resources = _cake_kda_affine_resources(
         workspace=workspace,
-        affine_plan=affine_plan,
+        affine_route=affine_route,
         device=q.device,
         num_heads=num_heads,
         capturing=capturing,
     )
-    empty_bf16 = plan.empty_bf16
-    empty_f32 = plan.empty_f32
-    empty_i32 = plan.empty_i32
+    empty_bf16 = resources.empty_bf16
+    empty_f32 = resources.empty_f32
+    empty_i32 = resources.empty_i32
     total_tokens = q.numel() // (num_heads * _FLASH_KDA_HEAD_DIM)
     q_flat = q.reshape(total_tokens, num_heads, _FLASH_KDA_HEAD_DIM)
     k_flat = k.reshape_as(q_flat)
     g_flat = g.reshape_as(q_flat)
     out_flat = out.reshape_as(q_flat)
     beta_flat = beta.reshape(total_tokens, num_heads)
-    tail_tokens = total_tokens - plan.tail_start
-    q_tail = q_flat[plan.tail_start :].view(
+    tail_tokens = total_tokens - resources.tail_start
+    q_tail = q_flat[resources.tail_start :].view(
         1, tail_tokens, num_heads, _FLASH_KDA_HEAD_DIM
     )
-    k_tail = k_flat[plan.tail_start :].view_as(q_tail)
-    g_tail = g_flat[plan.tail_start :].view_as(q_tail)
-    beta_tail = beta_flat[plan.tail_start :].view(1, tail_tokens, num_heads)
-    main_beta_tma = _beta_tma_source(beta, workspace, chunk_tokens=32)
-    tail_beta_tma = _beta_tma_source(beta_tail, workspace, chunk_tokens=32)
+    k_tail = k_flat[resources.tail_start :].view_as(q_tail)
+    g_tail = g_flat[resources.tail_start :].view_as(q_tail)
+    beta_tail = beta_flat[resources.tail_start :].view(1, tail_tokens, num_heads)
+    main_beta_source = _cake_kda_beta_source(beta, workspace, chunk_tokens=32)
     compact_stride = num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
 
-    _run_cake_kda_affine_direct_role(
-        workspace=workspace,
-        module=plan.modules.main,
-        role="main",
+    _run_cake_kda_direct_export(
+        module=resources.modules.main,
         q=q,
         k=k,
         v=v,
         g=g,
-        beta=beta,
-        beta_tma=main_beta_tma,
+        beta=main_beta_source,
+        beta_tma=main_beta_source,
         A_log=A_log,
         dt_bias=dt_bias,
-        cu_seqlens=plan.split_cu_seqlens,
-        seq_order=plan.main_seq_order,
+        cu_seqlens=resources.split_cu_seqlens,
+        seq_order=resources.main_seq_order,
         state_indices=state_indices,
+        state_checkpoints=empty_bf16,
+        checkpoint_cu_starts=resources.empty_i64,
+        checkpoint_every_n_tokens=0,
         initial_state_bf16=initial_state,
         out=out,
         final_state_bf16=empty_bf16,
         initial_state_f32=empty_f32,
-        final_state_f32=plan.main_final,
-        descriptor_storage=plan.main_descriptor_storage,
+        final_state_f32=resources.main_final,
+        empty_bf16=resources.empty_bf16,
+        empty_f32=resources.empty_f32,
+        empty_i32=resources.empty_i32,
+        empty_i64=resources.empty_i64,
+        empty_u32=resources.empty_u32,
         num_heads=num_heads,
+        num_sequences=resources.num_parts,
+        use_state_indices=True,
+        use_initial_state=True,
+        store_final_state=True,
         state_slot_stride=initial_state.stride(0),
         scale=scale,
-        grid_x=plan.num_parts * num_heads,
-        stream_ptr=stream_ptr,
-        capturing=capturing,
+        lower_bound=0.0,
+        grid_x=resources.num_parts * num_heads,
     )
-    _run_cake_kda_affine_direct_role(
-        workspace=workspace,
-        module=plan.modules.map,
-        role="map",
+    # The main and tail carriers can share workspace. Queue the tail refresh
+    # only after the main launch so stream ordering preserves the main input.
+    tail_beta_source = _cake_kda_beta_source(beta_tail, workspace, chunk_tokens=32)
+    _run_cake_kda_direct_export(
+        module=resources.modules.map,
         q=q_tail,
         k=k_tail,
-        v=plan.zero_v,
+        v=resources.zero_v,
         g=g_tail,
-        beta=beta_tail,
-        beta_tma=tail_beta_tma,
+        beta=tail_beta_source,
+        beta_tma=tail_beta_source,
         A_log=A_log,
         dt_bias=dt_bias,
-        cu_seqlens=plan.tail_cu_seqlens,
-        seq_order=plan.tail_seq_order,
+        cu_seqlens=resources.tail_cu_seqlens,
+        seq_order=resources.tail_seq_order,
         state_indices=empty_i32,
-        initial_state_bf16=plan.map_identity,
-        out=plan.map_out,
-        final_state_bf16=plan.map_state,
-        initial_state_f32=plan.main_final,
+        state_checkpoints=empty_bf16,
+        checkpoint_cu_starts=resources.empty_i64,
+        checkpoint_every_n_tokens=0,
+        initial_state_bf16=resources.map_identity,
+        out=resources.map_out,
+        final_state_bf16=resources.map_state,
+        initial_state_f32=resources.main_final,
         final_state_f32=empty_f32,
-        descriptor_storage=plan.map_descriptor_storage,
+        empty_bf16=resources.empty_bf16,
+        empty_f32=resources.empty_f32,
+        empty_i32=resources.empty_i32,
+        empty_i64=resources.empty_i64,
+        empty_u32=resources.empty_u32,
         num_heads=num_heads,
+        num_sequences=resources.num_parts - 1,
+        use_state_indices=False,
+        use_initial_state=True,
+        store_final_state=True,
         state_slot_stride=compact_stride,
         scale=scale,
-        grid_x=(plan.num_parts - 1) * num_heads,
-        stream_ptr=stream_ptr,
-        capturing=capturing,
+        lower_bound=0.0,
+        grid_x=(resources.num_parts - 1) * num_heads,
     )
-    plan.modules.scan.run(
-        plan.main_final,
-        plan.map_state,
-        plan.carry,
+    resources.modules.scan.run(
+        resources.main_final,
+        resources.map_state,
+        resources.carry,
         num_heads,
-        plan.num_parts,
+        resources.num_parts,
         32 * num_heads,
         1,
         1,
-        stream_ptr,
     )
-    _run_cake_kda_affine_direct_role(
-        workspace=workspace,
-        module=plan.modules.correction,
-        role="correction",
+    _run_cake_kda_direct_export(
+        module=resources.modules.correction,
         q=q_tail,
         k=k_tail,
-        v=plan.zero_v,
+        v=resources.zero_v,
         g=g_tail,
-        beta=beta_tail,
-        beta_tma=tail_beta_tma,
+        beta=tail_beta_source,
+        beta_tma=tail_beta_source,
         A_log=A_log,
         dt_bias=dt_bias,
-        cu_seqlens=plan.tail_cu_seqlens,
-        seq_order=plan.tail_seq_order,
+        cu_seqlens=resources.tail_cu_seqlens,
+        seq_order=resources.tail_seq_order,
         state_indices=empty_i32,
+        state_checkpoints=empty_bf16,
+        checkpoint_cu_starts=resources.empty_i64,
+        checkpoint_every_n_tokens=0,
         initial_state_bf16=empty_bf16,
-        out=plan.correction_out,
+        out=resources.correction_out,
         final_state_bf16=empty_bf16,
-        initial_state_f32=plan.carry,
-        final_state_f32=plan.correction_final,
-        descriptor_storage=plan.correction_descriptor_storage,
+        initial_state_f32=resources.carry,
+        final_state_f32=resources.correction_final,
+        empty_bf16=resources.empty_bf16,
+        empty_f32=resources.empty_f32,
+        empty_i32=resources.empty_i32,
+        empty_i64=resources.empty_i64,
+        empty_u32=resources.empty_u32,
         num_heads=num_heads,
+        num_sequences=resources.num_parts - 1,
+        use_state_indices=False,
+        use_initial_state=True,
+        store_final_state=True,
         state_slot_stride=compact_stride,
         scale=scale,
-        grid_x=(plan.num_parts - 1) * num_heads,
-        stream_ptr=stream_ptr,
-        capturing=capturing,
+        lower_bound=0.0,
+        grid_x=(resources.num_parts - 1) * num_heads,
     )
-    out_flat[plan.tail_start :].add_(
-        plan.correction_out.reshape_as(out_flat[plan.tail_start :])
+    out_flat[resources.tail_start :].add_(
+        resources.correction_out.reshape_as(out_flat[resources.tail_start :])
     )
     torch.add(
-        plan.main_final[-1:],
-        plan.correction_final[-1:],
-        out=plan.final_compact,
+        resources.main_final[-1:],
+        resources.correction_final[-1:],
+        out=resources.final_compact,
     )
-    plan.final_external.copy_(plan.final_compact)
-    plan.state_indices_i64.copy_(state_indices)
-    final_state.index_copy_(0, plan.state_indices_i64, plan.final_external)
+    resources.final_external.copy_(resources.final_compact)
+    resources.state_indices_i64.copy_(state_indices)
+    final_state.index_copy_(0, resources.state_indices_i64, resources.final_external)
 
 
 def _uses_measured_sm100_persistent_policy(
@@ -2231,6 +2270,22 @@ def _dummy_bf16(device: torch.device) -> torch.Tensor:
     )
 
 
+def _dummy_state_tma(device: torch.device) -> torch.Tensor:
+    key = ("dummy_state_tma", *_stream_cache_key(device))
+    return _cached_tensor(
+        key,
+        lambda: torch.empty(
+            (1, 1, _FLASH_KDA_HEAD_DIM, _FLASH_KDA_HEAD_DIM),
+            dtype=torch.bfloat16,
+            device=device,
+        ),
+        capture_error=(
+            "recurrent_kda prefill dummy state TMA carrier is not warmed for "
+            "CUDA graph capture; invoke the same device once before capture"
+        ),
+    )
+
+
 def _dummy_i32(device: torch.device) -> torch.Tensor:
     key = ("dummy_i32", *_stream_cache_key(device))
     return _cached_tensor(
@@ -2262,6 +2317,18 @@ def _dummy_i64(device: torch.device) -> torch.Tensor:
         lambda: torch.empty(1, dtype=torch.int64, device=device),
         capture_error=(
             "recurrent_kda prefill dummy int64 metadata is not warmed for "
+            "CUDA graph capture; invoke the same device once before capture"
+        ),
+    )
+
+
+def _dummy_u32(device: torch.device) -> torch.Tensor:
+    key = ("dummy_u32", *_stream_cache_key(device))
+    return _cached_tensor(
+        key,
+        lambda: torch.empty(1, dtype=torch.uint32, device=device),
+        capture_error=(
+            "recurrent_kda prefill dummy uint32 metadata is not warmed for "
             "CUDA graph capture; invoke the same device once before capture"
         ),
     )
@@ -2408,12 +2475,7 @@ def _state_scratch(
     ).view(shape)
 
 
-def _beta_tma_source(
-    beta: torch.Tensor,
-    workspace: _RecurrentKDAPrefillWorkspaceBase,
-    *,
-    chunk_tokens: int,
-) -> torch.Tensor:
+def _flatten_beta_source(beta: torch.Tensor) -> torch.Tensor:
     batch_size, seq_len, num_heads = beta.shape
     total_tokens = batch_size * seq_len
     if beta.stride(-1) != 1:
@@ -2427,6 +2489,17 @@ def _beta_tma_source(
             (total_tokens, num_heads),
             (beta.stride(1), beta.stride(2)),
         )
+    return beta_flat
+
+
+def _beta_tma_source(
+    beta: torch.Tensor,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    *,
+    chunk_tokens: int,
+) -> torch.Tensor:
+    beta_flat = _flatten_beta_source(beta)
+    total_tokens, num_heads = beta_flat.shape
     if (
         total_tokens >= chunk_tokens
         and num_heads >= _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
@@ -2457,6 +2530,40 @@ def _beta_tma_source(
     # in one FFI call avoids two Python-dispatched activities and their host gap,
     # while retaining stable storage for the TMA descriptor and CUDA graphs.
     return padded
+
+
+def _cake_kda_beta_source(
+    beta: torch.Tensor,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    *,
+    chunk_tokens: int,
+) -> torch.Tensor:
+    """Return one contiguous beta carrier for a standard exported binding."""
+
+    beta_flat = _flatten_beta_source(beta)
+    total_tokens, num_heads = beta_flat.shape
+    source = _beta_tma_source(beta, workspace, chunk_tokens=chunk_tokens)
+    if not source.is_contiguous():
+        padded_tokens = max(total_tokens, chunk_tokens)
+        padded_heads = (
+            (num_heads + _FLASH_KDA_BETA_TMA_HEADS_PER_BOX - 1)
+            // _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
+            * _FLASH_KDA_BETA_TMA_HEADS_PER_BOX
+        )
+        source = _workspace_buffer(
+            workspace=workspace,
+            attribute="_cake_export_beta_padding",
+            device=beta.device,
+            numel=padded_tokens * padded_heads,
+            capture_error=(
+                "recurrent_kda prefill Cake export beta workspace is not large "
+                "enough for CUDA graph capture; warm the largest token/head "
+                "shape on this stream before capture"
+            ),
+        ).view(padded_tokens, padded_heads)
+    if source.data_ptr() != beta_flat.data_ptr():
+        source[:total_tokens, :num_heads].copy_(beta_flat)
+    return source
 
 
 def _pair_packed_beta_tma_source(beta: torch.Tensor) -> Optional[torch.Tensor]:
@@ -3121,15 +3228,390 @@ def _run_bt16_prepare_chain(
             workspace._descriptor_signatures[variant] = signatures[variant]
 
 
-def _get_cake_kda_prefill_module(variant: "CakeKDAVariant", target: "CakeKDATarget"):
-    from .jit.cake_kda import get_cake_kda_prefill_module
-
-    return get_cake_kda_prefill_module(variant, target)
-
-
-def _run_cake_kda_prefill_shared(
+def _run_cake_kda_bt16_prepare_chain(
     *,
-    route: _CakeKDAPrefillSharedRoute,
+    workspace: _RecurrentKDAPrefillWorkspaceBase,
+    target: "CakeKDATarget",
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_order: torch.Tensor,
+    state_indices: torch.Tensor,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    final_state: torch.Tensor,
+    offsets: tuple[int, ...],
+    num_heads: int,
+    sm_count: int,
+    compute_capability: tuple[int, int],
+    fixed_layout: bool,
+    max_sequence_length: int,
+    scale: float,
+    lower_bound: float,
+) -> bool:
+    """Launch the exported scalar-beta BT16 prepare/chain pair."""
+
+    prepare_variant, chain_variant, dense_wavefront = _select_bt16_physical_variants(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=len(offsets) - 1,
+        num_heads=num_heads,
+        max_sequence_length=max_sequence_length,
+    )
+    if chain_variant not in {"bt16_chain_m64_s8", "bt16_chain_m64_s9"}:
+        return False
+    (
+        cu_chunks,
+        chunk_to_seq,
+        qd,
+        kd,
+        w,
+        qk,
+        diag,
+        total_chunks,
+        prepare_ctas,
+    ) = _bt16_workspace(
+        workspace=workspace,
+        device=q.device,
+        offsets=offsets,
+        num_heads=num_heads,
+        sm_count=sm_count,
+        dense_wavefront=dense_wavefront,
+    )
+    prepare_module = _get_cake_kda_export_module(
+        target, "bounded_fp32_serving", "bt16_prepare", "prepare"
+    )
+    chain_module = _get_cake_kda_export_module(
+        target, "bounded_fp32_serving", chain_variant, "chain"
+    )
+    beta_source = _cake_kda_beta_source(beta, workspace, chunk_tokens=16)
+    total_tasks = (len(offsets) - 1) * num_heads
+    prepare_module.run(
+        q,
+        q,
+        k,
+        k,
+        g,
+        g,
+        beta_source,
+        beta_source,
+        A_log,
+        dt_bias,
+        cu_seqlens,
+        cu_chunks,
+        chunk_to_seq,
+        qd,
+        qd,
+        kd,
+        kd,
+        w,
+        w,
+        qk,
+        diag,
+        total_chunks,
+        num_heads,
+        lower_bound,
+        prepare_ctas,
+        1,
+        1,
+    )
+    empty_bf16 = _dummy_bf16(q.device)
+    chain_module.run(
+        qd,
+        qd,
+        kd,
+        kd,
+        w,
+        w,
+        qk,
+        qk,
+        diag,
+        diag,
+        v,
+        v,
+        cu_seqlens,
+        cu_chunks,
+        seq_order,
+        empty_bf16,
+        out,
+        out,
+        empty_bf16,
+        num_heads,
+        1,
+        1,
+        scale,
+        state_indices.data_ptr(),
+        initial_state.stride(0),
+        1,
+        initial_state,
+        final_state,
+        _FLASH_KDA_BT16_VALUE_SPLITS * total_tasks,
+        1,
+        1,
+    )
+    return prepare_variant in {"bt16_prepare", "bt16_prepare_beta_tma"}
+
+
+def _get_cake_kda_export_module(
+    target: "CakeKDATarget", family: str, policy: str, role: str = "main"
+):
+    from .jit.cake_kda import get_cake_kda_module
+
+    return get_cake_kda_module(target, family, policy, role)
+
+
+def _cake_kda_serving_policy(
+    *,
+    variant: str,
+    target: "CakeKDATarget",
+    max_sequence_length: int,
+) -> Optional[str]:
+    """Map a material host route to one exported FP32-state policy."""
+
+    fixed = {
+        "m64": "independent_dvsplit_m64",
+        "m128_tensor_state_decay": "direct_m128_prediction_first_tensor_decay",
+        "m128_h12_short": "direct_m128_h12_scalar_early_pack",
+        "m128_h12_long": "direct_m128_h12_pair_packed_beta",
+        "m128_n16": "direct_m128_n16_h12_scalar",
+        "persistent_m128": "persistent_m128_whole_chain",
+        "piece_persistent_m128": "persistent_m128_recurrence_pieces",
+        "small_bh_m128": "small_bh_owner_helper_m128",
+    }
+    if variant == "m128":
+        return (
+            "direct_m128_register_inverse"
+            if max_sequence_length >= 256
+            else "direct_m128_legacy_inverse"
+        )
+    policy = fixed.get(variant)
+    if policy == "persistent_m128_whole_chain" and target == "sm103a":
+        return None
+    if policy == "direct_m128_prediction_first_tensor_decay" and target != "sm103a":
+        return None
+    return policy
+
+
+def _run_cake_kda_fp32_serving_export(
+    *,
+    target: "CakeKDATarget",
+    variant: str,
+    max_sequence_length: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    beta_tma: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seq_order: torch.Tensor,
+    state_indices: torch.Tensor,
+    initial_state: torch.Tensor,
+    out: torch.Tensor,
+    final_state: torch.Tensor,
+    task_ids: Optional[torch.Tensor],
+    task_offsets: Optional[torch.Tensor],
+    task_token_starts: Optional[torch.Tensor],
+    task_token_counts: Optional[torch.Tensor],
+    task_state_sources: Optional[torch.Tensor],
+    task_state_destinations: Optional[torch.Tensor],
+    mid_state: Optional[torch.Tensor],
+    mid_state_ready: Optional[torch.Tensor],
+    packet_workspace: Optional[torch.Tensor],
+    packet_ready: Optional[torch.Tensor],
+    packet_consumed: Optional[torch.Tensor],
+    helper_done: Optional[torch.Tensor],
+    empty_bf16: torch.Tensor,
+    empty_f32: torch.Tensor,
+    empty_i32: torch.Tensor,
+    empty_i64: torch.Tensor,
+    empty_u32: torch.Tensor,
+    num_heads: int,
+    num_sequences: int,
+    use_initial_state: bool,
+    store_final_state: bool,
+    state_slot_stride: int,
+    scale: float,
+    lower_bound: float,
+) -> bool:
+    """Launch one bounded FP32-state serving policy from the sealed export."""
+
+    policy = _cake_kda_serving_policy(
+        variant=variant,
+        target=target,
+        max_sequence_length=max_sequence_length,
+    )
+    if policy is None:
+        return False
+    module = _get_cake_kda_export_module(target, "bounded_fp32_serving", policy)
+    total_tasks = num_sequences * num_heads
+    initial_f32 = initial_state if use_initial_state else empty_f32
+    final_f32 = final_state if store_final_state else empty_f32
+
+    if variant in {
+        "m128",
+        "m128_tensor_state_decay",
+        "m128_h12_short",
+        "m128_h12_long",
+        "m128_n16",
+    }:
+        _run_cake_kda_direct_export(
+            module=module,
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            beta_tma=beta_tma,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            cu_seqlens=cu_seqlens,
+            seq_order=seq_order,
+            state_indices=state_indices,
+            state_checkpoints=empty_bf16,
+            checkpoint_cu_starts=empty_i64,
+            checkpoint_every_n_tokens=0,
+            initial_state_bf16=empty_bf16,
+            out=out,
+            final_state_bf16=empty_bf16,
+            initial_state_f32=initial_f32,
+            final_state_f32=final_f32,
+            empty_bf16=empty_bf16,
+            empty_f32=empty_f32,
+            empty_i32=empty_i32,
+            empty_i64=empty_i64,
+            empty_u32=empty_u32,
+            num_heads=num_heads,
+            num_sequences=num_sequences,
+            use_state_indices=True,
+            use_initial_state=use_initial_state,
+            store_final_state=store_final_state,
+            state_slot_stride=state_slot_stride,
+            scale=scale,
+            lower_bound=lower_bound,
+            grid_x=total_tasks,
+        )
+        return True
+
+    common = (
+        q,
+        q,
+        k,
+        k,
+        v,
+        v,
+        g,
+        g,
+        beta,
+        beta_tma,
+        A_log,
+        dt_bias,
+        cu_seqlens,
+        seq_order,
+    )
+    state_tail = (
+        empty_bf16,
+        out,
+        out,
+        empty_bf16,
+        state_indices.data_ptr(),
+        state_slot_stride,
+        1,
+        initial_f32,
+        final_f32,
+        num_heads,
+        int(use_initial_state),
+        int(store_final_state),
+        scale,
+        lower_bound,
+    )
+    if variant == "m64":
+        module.run(*common, *state_tail, 2 * total_tasks, 1, 1)
+        return True
+    if variant == "small_bh_m128":
+        assert packet_workspace is not None
+        assert packet_ready is not None
+        assert packet_consumed is not None
+        assert helper_done is not None
+        module.run(
+            *common,
+            empty_bf16,
+            out,
+            out,
+            empty_bf16,
+            num_heads,
+            int(use_initial_state),
+            int(store_final_state),
+            scale,
+            lower_bound,
+            state_indices.data_ptr(),
+            empty_bf16.data_ptr(),
+            empty_i64.data_ptr(),
+            beta.stride(-2),
+            state_slot_stride,
+            1,
+            0,
+            packet_workspace,
+            packet_ready,
+            packet_consumed,
+            helper_done,
+            initial_f32,
+            final_f32,
+            8 * total_tasks,
+            1,
+            1,
+        )
+        return True
+    if variant in {"persistent_m128", "piece_persistent_m128"}:
+        assert task_ids is not None and task_offsets is not None
+        worker_count = task_offsets.numel() - 1
+        module.run(
+            *common,
+            task_ids,
+            task_offsets,
+            task_token_starts if task_token_starts is not None else empty_i32,
+            task_token_counts if task_token_counts is not None else empty_i32,
+            task_state_sources if task_state_sources is not None else empty_i32,
+            (
+                task_state_destinations
+                if task_state_destinations is not None
+                else empty_i32
+            ),
+            mid_state if mid_state is not None else empty_bf16,
+            mid_state_ready if mid_state_ready is not None else empty_u32,
+            empty_bf16,
+            out,
+            out,
+            empty_bf16,
+            state_indices.data_ptr(),
+            state_slot_stride,
+            1,
+            initial_f32,
+            final_f32,
+            num_heads,
+            int(use_initial_state),
+            int(store_final_state),
+            scale,
+            lower_bound,
+            worker_count,
+            1,
+            1,
+        )
+        return True
+    return False
+
+
+def _run_cake_kda_bounded_evolution(
+    *,
+    route: _CakeKDABoundedEvolutionRoute,
     workspace: _RecurrentKDAPrefillWorkspaceBase,
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3146,7 +3628,7 @@ def _run_cake_kda_prefill_shared(
 ) -> None:
     """Launch one manifest-verified shared policy through its exported ABI."""
 
-    from .jit.cake_kda_prefill_shared import get_cake_kda_prefill_shared_module
+    from .jit.cake_kda import get_cake_kda_module
 
     total_tokens = q.shape[0] * q.shape[1]
     num_heads = q.shape[2]
@@ -3155,10 +3637,7 @@ def _run_cake_kda_prefill_shared(
     v_flat = v.reshape(total_tokens, num_heads, _FLASH_KDA_HEAD_DIM)
     g_flat = g.reshape(total_tokens, num_heads, _FLASH_KDA_HEAD_DIM)
     out_flat = out.reshape(total_tokens, num_heads, _FLASH_KDA_HEAD_DIM)
-    beta_flat = beta.reshape(total_tokens, num_heads)
-    beta_tma = _beta_tma_source(beta, workspace, chunk_tokens=32)
-    if beta_tma.data_ptr() != beta_flat.data_ptr():
-        beta_tma[:total_tokens, :num_heads].copy_(beta_flat)
+    beta_source = _cake_kda_beta_source(beta, workspace, chunk_tokens=32)
 
     sequence_order = _cached_int32_metadata(
         device=q.device,
@@ -3168,7 +3647,7 @@ def _run_cake_kda_prefill_shared(
     dummy_i32 = _dummy_i32(q.device)
     dummy_f32 = _dummy_f32(q.device)
     state_slot_stride = num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
-    module = get_cake_kda_prefill_shared_module(route.target, route.policy)
+    module = get_cake_kda_module(route.target, "bounded_bf16_evolution", route.policy)
     common_prefix = (
         q_flat,
         q_flat,
@@ -3178,8 +3657,8 @@ def _run_cake_kda_prefill_shared(
         v_flat,
         g_flat,
         g_flat,
-        beta_flat,
-        beta_tma,
+        beta_source,
+        beta_source,
         A_log,
         dt_bias,
         cu_seqlens,
@@ -3272,7 +3751,7 @@ def _run_flash_kda_prefill(
     state_checkpoints: Optional[torch.Tensor],
     checkpoint_cu_starts: Optional[torch.Tensor],
     checkpoint_every_n_tokens: int,
-    use_cake_shared: bool = False,
+    use_cake_export: bool = False,
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -3380,15 +3859,15 @@ def _run_flash_kda_prefill(
     )
     if not math.isfinite(scale_value):
         raise ValueError(f"scale must be finite, got {scale_value}")
-    shared_target: Optional[CakeKDAPrefillSharedTarget] = None
-    shared_export_available = False
-    if use_cake_shared:
-        shared_export_available = _cake_kda_prefill_shared_export_is_available()
+    shared_target: Optional[CakeKDATarget] = None
+    cake_export_available = False
+    if use_cake_export or lower_bound is None:
+        cake_export_available = _cake_kda_export_is_available()
         if compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES:
             shared_target = _select_cake_kda_prefill_target(q.device)
-    shared_route = _select_cake_kda_prefill_shared_route(
-        requested=use_cake_shared,
-        export_available=shared_export_available,
+    evolution_route = _select_cake_kda_bounded_evolution_route(
+        requested=use_cake_export,
+        export_available=cake_export_available,
         target=shared_target,
         sm_count=sm_count,
         fixed_layout=fixed_layout,
@@ -3418,7 +3897,7 @@ def _run_flash_kda_prefill(
         scale=scale_value,
         lower_bound=lower_bound,
     )
-    if shared_route is not None:
+    if evolution_route is not None:
         if output is None:
             if capturing:
                 raise RuntimeError(
@@ -3450,8 +3929,8 @@ def _run_flash_kda_prefill(
                 capturing=capturing,
                 explicit=explicit_workspace,
             )
-            _run_cake_kda_prefill_shared(
-                route=shared_route,
+            _run_cake_kda_bounded_evolution(
+                route=evolution_route,
                 workspace=workspace,
                 q=q,
                 k=k,
@@ -3469,10 +3948,10 @@ def _run_flash_kda_prefill(
             if capturing and explicit_workspace:
                 workspace._captured = True
         return (out_buf, initial_state if output_final_state else None)
-    affine_plan = None
+    affine_route = None
     if seq_order is None:
-        affine_plan = _select_cake_kda_affine_plan(
-            export_available=_cake_kda_affine_export_is_available(),
+        affine_route = _select_cake_kda_affine_route(
+            export_available=cake_export_available,
             compute_capability=compute_capability,
             sm_count=sm_count,
             fixed_layout=fixed_layout,
@@ -3505,7 +3984,7 @@ def _run_flash_kda_prefill(
         num_heads=num_heads,
         uniform_sequences=uniform_sequences,
     )
-    if affine_plan is not None:
+    if affine_route is not None:
         route = _CAKE_KDA_ROUTE_AFFINE_M128
     elif needs_direct_m128:
         route = (
@@ -3573,7 +4052,7 @@ def _run_flash_kda_prefill(
         "m128_unbounded_softplus",
         "m128_bt64_unbounded_softplus",
     ]
-    if affine_plan is not None:
+    if affine_route is not None:
         variant = "cake_affine_m128"
     elif use_bt16:
         variant = "bt16"
@@ -3604,7 +4083,7 @@ def _run_flash_kda_prefill(
         )
     else:
         variant = "m128"
-    if lower_bound is None and affine_plan is None:
+    if lower_bound is None and affine_route is None:
         variant = (
             "m128_bt64_unbounded_softplus"
             if num_heads == 4
@@ -3798,12 +4277,12 @@ def _run_flash_kda_prefill(
             capturing=capturing,
             explicit=explicit_workspace,
         )
-        if affine_plan is not None:
+        if affine_route is not None:
             assert initial_state is not None
             assert state_indices is not None
             _run_cake_kda_affine_route(
                 workspace=workspace,
-                affine_plan=affine_plan,
+                affine_route=affine_route,
                 q=q,
                 k=k,
                 v=v,
@@ -3817,7 +4296,6 @@ def _run_flash_kda_prefill(
                 out=out_buf,
                 num_heads=num_heads,
                 scale=scale_value,
-                stream_ptr=stream_ptr,
                 capturing=capturing,
             )
             if capturing and explicit_workspace:
@@ -3875,38 +4353,209 @@ def _run_flash_kda_prefill(
             if initial_state is None:
                 returned_state = final_state_arg
         if variant == "bt16":
-            assert flash_target is not None
-            _run_bt16_prepare_chain(
-                workspace=workspace,
-                target=flash_target,
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                cu_seqlens=cu_seqlens_i64,
-                seq_order=seq_order_i32,
-                initial_state=initial_state_arg,
-                out=out_buf,
-                final_state=final_state_arg,
-                offsets=offsets,
-                num_heads=num_heads,
-                sm_count=sm_count,
-                compute_capability=compute_capability,
-                fixed_layout=fixed_layout,
-                max_sequence_length=max_sequence_length,
-                use_initial_state=use_initial_state,
-                store_final_state=store_final_state,
-                scale=scale_value,
-                lower_bound=float(lower_bound),
-                stream_ptr=stream_ptr,
-                capturing=capturing,
-            )
+            if use_cake_export and initial_state_arg.dtype == torch.float32:
+                assert shared_target is not None
+                assert state_indices is not None
+                if initial_state_arg.dtype != torch.float32:
+                    raise ValueError(
+                        "the exported Cake BT16 route requires FP32 indexed state"
+                    )
+                launched = _run_cake_kda_bt16_prepare_chain(
+                    workspace=workspace,
+                    target=shared_target,
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    cu_seqlens=cu_seqlens_i64,
+                    seq_order=seq_order_i32,
+                    state_indices=state_indices,
+                    initial_state=initial_state_arg,
+                    out=out_buf,
+                    final_state=final_state_arg,
+                    offsets=offsets,
+                    num_heads=num_heads,
+                    sm_count=sm_count,
+                    compute_capability=compute_capability,
+                    fixed_layout=fixed_layout,
+                    max_sequence_length=max_sequence_length,
+                    scale=scale_value,
+                    lower_bound=float(lower_bound),
+                )
+                if not launched:
+                    raise ValueError(
+                        "backend='cake' has no exported BT16 policy for this route"
+                    )
+            else:
+                assert flash_target is not None
+                _run_bt16_prepare_chain(
+                    workspace=workspace,
+                    target=flash_target,
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=beta,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    cu_seqlens=cu_seqlens_i64,
+                    seq_order=seq_order_i32,
+                    initial_state=initial_state_arg,
+                    out=out_buf,
+                    final_state=final_state_arg,
+                    offsets=offsets,
+                    num_heads=num_heads,
+                    sm_count=sm_count,
+                    compute_capability=compute_capability,
+                    fixed_layout=fixed_layout,
+                    max_sequence_length=max_sequence_length,
+                    use_initial_state=use_initial_state,
+                    store_final_state=store_final_state,
+                    scale=scale_value,
+                    lower_bound=float(lower_bound),
+                    stream_ptr=stream_ptr,
+                    capturing=capturing,
+                )
             if capturing and explicit_workspace:
                 workspace._captured = True
             return (out_buf, returned_state if output_final_state else None)
+        if lower_bound is None or (
+            use_cake_export and initial_state_arg.dtype == torch.float32
+        ):
+            assert shared_target is not None
+            cake_i32 = (
+                state_indices if state_indices is not None else _dummy_i32(q.device)
+            )
+            cake_i64 = _dummy_i64(q.device)
+            cake_f32 = _dummy_f32(q.device)
+            cake_u32 = _dummy_u32(q.device)
+            if lower_bound is None:
+                cake_beta_source = _cake_kda_beta_source(
+                    beta, workspace, chunk_tokens=32
+                )
+                module = _get_cake_kda_export_module(
+                    shared_target,
+                    "unbounded_bf16_serving",
+                    "direct_m128_unbounded_softplus",
+                )
+                if initial_state_arg.dtype != torch.bfloat16:
+                    raise ValueError(
+                        "the exported unbounded Cake route requires BF16 state"
+                    )
+                _run_cake_kda_direct_export(
+                    module=module,
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=cake_beta_source,
+                    beta_tma=cake_beta_source,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    cu_seqlens=cu_seqlens_i64,
+                    seq_order=seq_order_i32,
+                    state_indices=cake_i32,
+                    state_checkpoints=(
+                        state_checkpoints
+                        if state_checkpoints is not None
+                        else dummy_state
+                    ),
+                    checkpoint_cu_starts=(
+                        checkpoint_cu_starts
+                        if checkpoint_cu_starts is not None
+                        else cake_i64
+                    ),
+                    checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+                    initial_state_bf16=initial_state_arg,
+                    out=out_buf,
+                    final_state_bf16=final_state_arg,
+                    initial_state_f32=cake_f32,
+                    final_state_f32=cake_f32,
+                    empty_bf16=dummy_state,
+                    empty_f32=cake_f32,
+                    empty_i32=_dummy_i32(q.device),
+                    empty_i64=cake_i64,
+                    empty_u32=cake_u32,
+                    num_heads=num_heads,
+                    num_sequences=num_sequences,
+                    use_state_indices=use_state_indices,
+                    use_initial_state=use_initial_state,
+                    store_final_state=store_final_state,
+                    state_slot_stride=state_slot_stride,
+                    scale=scale_value,
+                    lower_bound=0.0,
+                    grid_x=num_sequences * num_heads,
+                )
+            else:
+                if (
+                    initial_state_arg.dtype != torch.float32
+                    or state_indices is None
+                    or checkpoint_every_n_tokens
+                ):
+                    raise ValueError(
+                        "the exported bounded Cake serving portfolio requires "
+                        "FP32 indexed state without checkpoints"
+                    )
+                cake_beta_source = _cake_kda_beta_source(
+                    beta, workspace, chunk_tokens=32
+                )
+                launched = _run_cake_kda_fp32_serving_export(
+                    target=shared_target,
+                    variant=variant,
+                    max_sequence_length=max_sequence_length,
+                    q=q,
+                    k=k,
+                    v=v,
+                    g=g,
+                    beta=cake_beta_source,
+                    beta_tma=cake_beta_source,
+                    A_log=A_log,
+                    dt_bias=dt_bias,
+                    cu_seqlens=cu_seqlens_i64,
+                    seq_order=seq_order_i32,
+                    state_indices=state_indices,
+                    initial_state=initial_state_arg,
+                    out=out_buf,
+                    final_state=final_state_arg,
+                    task_ids=persistent_task_ids,
+                    task_offsets=persistent_task_offsets,
+                    task_token_starts=piece_task_token_starts,
+                    task_token_counts=piece_task_token_counts,
+                    task_state_sources=piece_task_state_sources,
+                    task_state_destinations=piece_task_state_destinations,
+                    mid_state=piece_mid_state,
+                    mid_state_ready=piece_mid_state_ready,
+                    packet_workspace=packet_workspace,
+                    packet_ready=packet_ready,
+                    packet_consumed=packet_consumed,
+                    helper_done=helper_done,
+                    empty_bf16=dummy_state,
+                    empty_f32=cake_f32,
+                    empty_i32=_dummy_i32(q.device),
+                    empty_i64=cake_i64,
+                    empty_u32=cake_u32,
+                    num_heads=num_heads,
+                    num_sequences=num_sequences,
+                    use_initial_state=use_initial_state,
+                    store_final_state=store_final_state,
+                    state_slot_stride=state_slot_stride,
+                    scale=scale_value,
+                    lower_bound=float(lower_bound),
+                )
+                if not launched:
+                    raise ValueError(
+                        "backend='cake' has no exported policy for the selected route"
+                    )
+            if capturing and explicit_workspace:
+                workspace._captured = True
+            result = (out_buf, returned_state if output_final_state else None)
+            if checkpoint_every_n_tokens:
+                assert state_checkpoints is not None
+                return (*result, state_checkpoints)
+            return result
         signature = _descriptor_signature(
             q=q,
             k=k,
@@ -3931,16 +4580,8 @@ def _run_flash_kda_prefill(
         else:
             prepare_descriptors = int(warmed_signature != signature)
         descriptor_storage = workspace._descriptor_storages[variant]
-        if (
-            variant == "m128_unbounded_softplus"
-            or variant == "m128_bt64_unbounded_softplus"
-        ):
-            module = _get_cake_kda_prefill_module(
-                variant, _select_cake_kda_prefill_target(q.device)
-            )
-        else:
-            assert flash_target is not None
-            module = _get_flash_kda_prefill_module(variant, flash_target)
+        assert flash_target is not None
+        module = _get_flash_kda_prefill_module(variant, flash_target)
         try:
             if variant == "m64":
                 module.run(

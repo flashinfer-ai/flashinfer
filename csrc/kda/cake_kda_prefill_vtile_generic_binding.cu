@@ -478,7 +478,6 @@ void Run(TensorView arg_q, TensorView arg_q_tma, TensorView arg_k, TensorView ar
   CheckContiguous(arg_seq_order, "seq_order");
   CheckCudaTensor(arg_initial_state, "initial_state");
   CheckDtype(arg_initial_state, "initial_state", 4, 16, 1);
-  CheckContiguous(arg_initial_state, "initial_state");
   CheckCudaTensor(arg_out, "out");
   CheckDtype(arg_out, "out", 4, 16, 1);
   CheckContiguous(arg_out, "out");
@@ -487,7 +486,6 @@ void Run(TensorView arg_q, TensorView arg_q_tma, TensorView arg_k, TensorView ar
   CheckContiguous(arg_out_tma, "out_tma");
   CheckCudaTensor(arg_final_state, "final_state");
   CheckDtype(arg_final_state, "final_state", 4, 16, 1);
-  CheckContiguous(arg_final_state, "final_state");
   TVM_FFI_CHECK(arg_state_indices_addr >= 0LL && arg_state_indices_addr <= 9223372036854775807LL, ValueError)
       << "scalar 'state_indices_addr' value " << arg_state_indices_addr
       << " is outside u64 range [0, 9223372036854775807]";
@@ -496,10 +494,8 @@ void Run(TensorView arg_q, TensorView arg_q_tma, TensorView arg_k, TensorView ar
       << " is outside i32 range [-2147483648, 2147483647]";
   CheckCudaTensor(arg_initial_state_f32, "initial_state_f32");
   CheckDtype(arg_initial_state_f32, "initial_state_f32", 2, 32, 1);
-  CheckContiguous(arg_initial_state_f32, "initial_state_f32");
   CheckCudaTensor(arg_final_state_f32, "final_state_f32");
   CheckDtype(arg_final_state_f32, "final_state_f32", 2, 32, 1);
-  CheckContiguous(arg_final_state_f32, "final_state_f32");
   TVM_FFI_CHECK(arg_uniform_seq_len >= -2147483648LL && arg_uniform_seq_len <= 2147483647LL, ValueError)
       << "scalar 'uniform_seq_len' value " << arg_uniform_seq_len
       << " is outside i32 range [-2147483648, 2147483647]";

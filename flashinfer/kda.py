@@ -428,6 +428,7 @@ def recurrent_kda(
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
+            allow_float32_state=backend == "cake",
         )
     )
     if use_flash_kda_prefill:
@@ -453,7 +454,7 @@ def recurrent_kda(
             state_checkpoints=state_checkpoints,
             checkpoint_cu_starts=checkpoint_cu_starts,
             checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-            use_cake_shared=backend == "cake",
+            use_cake_export=backend == "cake",
         )
 
     if backend == "cake" and is_plain_prefill:

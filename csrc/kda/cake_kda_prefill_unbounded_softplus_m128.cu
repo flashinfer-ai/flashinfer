@@ -593,7 +593,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(1024) void
-kernel_cake_kda_affine_unbounded_softplus_main(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, CakeTensorMap const* k_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, __nv_bfloat16* __restrict__ g, CakeTensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, CakeTensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, CakeTensorMap const* state_checkpoints_tma, float* __restrict__ final_state_f32)
+kernel_cake_kda_prefill_unbounded_softplus_m128(__nv_bfloat16* __restrict__ q, CakeTensorMap const* q_tma, __nv_bfloat16* __restrict__ k, CakeTensorMap const* k_tma, __nv_bfloat16* __restrict__ v, CakeTensorMap const* v_tma, __nv_bfloat16* __restrict__ g, CakeTensorMap const* g_tma, __nv_bfloat16* __restrict__ beta, CakeTensorMap const* beta_tma, float* __restrict__ A_log, float* __restrict__ dt_bias, long long* __restrict__ cu_seqlens, int* __restrict__ seq_order, __nv_bfloat16* __restrict__ initial_state, __nv_bfloat16* __restrict__ out, CakeTensorMap const* out_tma, __nv_bfloat16* __restrict__ final_state, int num_heads, int use_initial_state, int store_final_state, float scale, float lower_bound, unsigned long long state_indices_addr, unsigned long long state_checkpoints_addr, unsigned long long checkpoint_cu_starts_addr, long long beta_token_stride, long long state_slot_stride, int use_state_indices, int checkpoint_every_n_tokens, long long* __restrict__ cu_chunk_offsets, __nv_bfloat16* __restrict__ chunk_state, unsigned int* __restrict__ state_checkpoint_needed, __nv_bfloat16* __restrict__ tape_qd, __nv_bfloat16* __restrict__ tape_kd, __nv_bfloat16* __restrict__ tape_kr, __nv_bfloat16* __restrict__ tape_j, float* __restrict__ tape_restore_factor, __nv_bfloat16* __restrict__ tape_e, __nv_bfloat16* __restrict__ tape_x, __nv_bfloat16* __restrict__ tape_r, float* __restrict__ norm_inv_out, __nv_bfloat16* __restrict__ decay_out, float* __restrict__ beta_active_out, float* __restrict__ initial_state_f32, unsigned int* __restrict__ zero_workspace, int zero_words, int num_sequences, CakeTensorMap const* state_checkpoints_tma, float* __restrict__ final_state_f32)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -872,11 +872,6 @@ kernel_cake_kda_affine_unbounded_softplus_main(__nv_bfloat16* __restrict__ q, Ca
             state_base = (long long)state_slot * state_slot_stride + ((long long)head_idx * 128 + (long long)state_row) * 128;
             long long initial_state_base = state_base;
             int initial_state_enabled = (int)(use_initial_state != 0);
-            {
-                initial_state_enabled = (int)(initial_state_enabled != 0 && seq_idx == 0);
-                int affine_initial_slot = *reinterpret_cast<int*>(state_indices_addr);
-                initial_state_base = (long long)affine_initial_slot * state_slot_stride + ((long long)head_idx * 128 + (long long)state_row) * 128;
-            }
             #pragma unroll
             for (int state_col_block = 0; state_col_block < 4; state_col_block++) {
                 float state_frag[32];
@@ -915,127 +910,129 @@ kernel_cake_kda_affine_unbounded_softplus_main(__nv_bfloat16* __restrict__ q, Ca
                 if (initial_state_enabled != 0) {
                     {
                         {
-                            const void* _v8p_0 = (const void*)(initial_state + (initial_state_base + (long long)(state_col_block * 32)));
-                            uint32_t _v8_0_0[8];
-                            asm volatile(
-                                "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]), "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7]) : "l"((const char*)_v8p_0 + 0) : "memory");
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 0])[0]), "=f"((&state_frag[0 + 0])[1])
-                                : "r"(_v8_0_0[0]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 2])[0]), "=f"((&state_frag[0 + 2])[1])
-                                : "r"(_v8_0_0[1]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 4])[0]), "=f"((&state_frag[0 + 4])[1])
-                                : "r"(_v8_0_0[2]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 6])[0]), "=f"((&state_frag[0 + 6])[1])
-                                : "r"(_v8_0_0[3]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 8])[0]), "=f"((&state_frag[0 + 8])[1])
-                                : "r"(_v8_0_0[4]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 10])[0]), "=f"((&state_frag[0 + 10])[1])
-                                : "r"(_v8_0_0[5]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 12])[0]), "=f"((&state_frag[0 + 12])[1])
-                                : "r"(_v8_0_0[6]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 14])[0]), "=f"((&state_frag[0 + 14])[1])
-                                : "r"(_v8_0_0[7]));
-                            uint32_t _v8_0_1[8];
-                            asm volatile(
-                                "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                                : "=r"(_v8_0_1[0]), "=r"(_v8_0_1[1]), "=r"(_v8_0_1[2]), "=r"(_v8_0_1[3]), "=r"(_v8_0_1[4]), "=r"(_v8_0_1[5]), "=r"(_v8_0_1[6]), "=r"(_v8_0_1[7]) : "l"((const char*)_v8p_0 + 32) : "memory");
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 16])[0]), "=f"((&state_frag[0 + 16])[1])
-                                : "r"(_v8_0_1[0]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 18])[0]), "=f"((&state_frag[0 + 18])[1])
-                                : "r"(_v8_0_1[1]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 20])[0]), "=f"((&state_frag[0 + 20])[1])
-                                : "r"(_v8_0_1[2]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 22])[0]), "=f"((&state_frag[0 + 22])[1])
-                                : "r"(_v8_0_1[3]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 24])[0]), "=f"((&state_frag[0 + 24])[1])
-                                : "r"(_v8_0_1[4]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 26])[0]), "=f"((&state_frag[0 + 26])[1])
-                                : "r"(_v8_0_1[5]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 28])[0]), "=f"((&state_frag[0 + 28])[1])
-                                : "r"(_v8_0_1[6]));
-                            asm volatile(
-                                "{\n\t"
-                                "shl.b32 %0, %2, 16;\n\t"
-                                "and.b32 %1, %2, 0xffff0000;\n\t"
-                                "}\n"
-                                : "=f"((&state_frag[0 + 30])[0]), "=f"((&state_frag[0 + 30])[1])
-                                : "r"(_v8_0_1[7]));
+                            {
+                                const void* _v8p_0 = (const void*)(initial_state + (initial_state_base + (long long)(state_col_block * 32)));
+                                uint32_t _v8_0_0[8];
+                                asm volatile(
+                                    "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                    : "=r"(_v8_0_0[0]), "=r"(_v8_0_0[1]), "=r"(_v8_0_0[2]), "=r"(_v8_0_0[3]), "=r"(_v8_0_0[4]), "=r"(_v8_0_0[5]), "=r"(_v8_0_0[6]), "=r"(_v8_0_0[7]) : "l"((const char*)_v8p_0 + 0) : "memory");
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 0])[0]), "=f"((&state_frag[0 + 0])[1])
+                                    : "r"(_v8_0_0[0]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 2])[0]), "=f"((&state_frag[0 + 2])[1])
+                                    : "r"(_v8_0_0[1]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 4])[0]), "=f"((&state_frag[0 + 4])[1])
+                                    : "r"(_v8_0_0[2]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 6])[0]), "=f"((&state_frag[0 + 6])[1])
+                                    : "r"(_v8_0_0[3]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 8])[0]), "=f"((&state_frag[0 + 8])[1])
+                                    : "r"(_v8_0_0[4]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 10])[0]), "=f"((&state_frag[0 + 10])[1])
+                                    : "r"(_v8_0_0[5]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 12])[0]), "=f"((&state_frag[0 + 12])[1])
+                                    : "r"(_v8_0_0[6]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 14])[0]), "=f"((&state_frag[0 + 14])[1])
+                                    : "r"(_v8_0_0[7]));
+                                uint32_t _v8_0_1[8];
+                                asm volatile(
+                                    "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+                                    : "=r"(_v8_0_1[0]), "=r"(_v8_0_1[1]), "=r"(_v8_0_1[2]), "=r"(_v8_0_1[3]), "=r"(_v8_0_1[4]), "=r"(_v8_0_1[5]), "=r"(_v8_0_1[6]), "=r"(_v8_0_1[7]) : "l"((const char*)_v8p_0 + 32) : "memory");
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 16])[0]), "=f"((&state_frag[0 + 16])[1])
+                                    : "r"(_v8_0_1[0]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 18])[0]), "=f"((&state_frag[0 + 18])[1])
+                                    : "r"(_v8_0_1[1]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 20])[0]), "=f"((&state_frag[0 + 20])[1])
+                                    : "r"(_v8_0_1[2]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 22])[0]), "=f"((&state_frag[0 + 22])[1])
+                                    : "r"(_v8_0_1[3]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 24])[0]), "=f"((&state_frag[0 + 24])[1])
+                                    : "r"(_v8_0_1[4]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 26])[0]), "=f"((&state_frag[0 + 26])[1])
+                                    : "r"(_v8_0_1[5]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 28])[0]), "=f"((&state_frag[0 + 28])[1])
+                                    : "r"(_v8_0_1[6]));
+                                asm volatile(
+                                    "{\n\t"
+                                    "shl.b32 %0, %2, 16;\n\t"
+                                    "and.b32 %1, %2, 0xffff0000;\n\t"
+                                    "}\n"
+                                    : "=f"((&state_frag[0 + 30])[0]), "=f"((&state_frag[0 + 30])[1])
+                                    : "r"(_v8_0_1[7]));
+                            }
                         }
                     }
                 }
@@ -1374,28 +1371,36 @@ kernel_cake_kda_affine_unbounded_softplus_main(__nv_bfloat16* __restrict__ q, Ca
                         : "=f"(_tmem_load_6[0]), "=f"(_tmem_load_6[1]), "=f"(_tmem_load_6[2]), "=f"(_tmem_load_6[3]), "=f"(_tmem_load_6[4]), "=f"(_tmem_load_6[5]), "=f"(_tmem_load_6[6]), "=f"(_tmem_load_6[7]), "=f"(_tmem_load_6[8]), "=f"(_tmem_load_6[9]), "=f"(_tmem_load_6[10]), "=f"(_tmem_load_6[11]), "=f"(_tmem_load_6[12]), "=f"(_tmem_load_6[13]), "=f"(_tmem_load_6[14]), "=f"(_tmem_load_6[15]), "=f"(_tmem_load_6[16]), "=f"(_tmem_load_6[17]), "=f"(_tmem_load_6[18]), "=f"(_tmem_load_6[19]), "=f"(_tmem_load_6[20]), "=f"(_tmem_load_6[21]), "=f"(_tmem_load_6[22]), "=f"(_tmem_load_6[23]), "=f"(_tmem_load_6[24]), "=f"(_tmem_load_6[25]), "=f"(_tmem_load_6[26]), "=f"(_tmem_load_6[27]), "=f"(_tmem_load_6[28]), "=f"(_tmem_load_6[29]), "=f"(_tmem_load_6[30]), "=f"(_tmem_load_6[31])
                         : "r"(taddr + 64 + (unsigned int)tmem_row_base + (unsigned int)(state_col_block_4 * 32)));
                     {
-                        #pragma unroll
-                        for (int state_vec = 0; state_vec < 4; state_vec++) {
-                            {
-                                unsigned _stv8_1_0 = __float_as_uint(_tmem_load_6[state_vec * 8 + 0]);
-                                unsigned _stv8_1_1 = __float_as_uint(_tmem_load_6[state_vec * 8 + 1]);
-                                unsigned _stv8_1_2 = __float_as_uint(_tmem_load_6[state_vec * 8 + 2]);
-                                unsigned _stv8_1_3 = __float_as_uint(_tmem_load_6[state_vec * 8 + 3]);
-                                unsigned _stv8_1_4 = __float_as_uint(_tmem_load_6[state_vec * 8 + 4]);
-                                unsigned _stv8_1_5 = __float_as_uint(_tmem_load_6[state_vec * 8 + 5]);
-                                unsigned _stv8_1_6 = __float_as_uint(_tmem_load_6[state_vec * 8 + 6]);
-                                unsigned _stv8_1_7 = __float_as_uint(_tmem_load_6[state_vec * 8 + 7]);
-                                asm volatile(
-                                    "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                    :: "l"((void*)(final_state_f32 + (state_base + (long long)(state_col_block_4 * 32) + (long long)(state_vec * 8)) + (0))), "r"(_stv8_1_0), "r"(_stv8_1_1), "r"(_stv8_1_2), "r"(_stv8_1_3), "r"(_stv8_1_4), "r"(_stv8_1_5), "r"(_stv8_1_6), "r"(_stv8_1_7) : "memory");
-                            }
+                        {
+                            __nv_bfloat162 _pk[8];
+                            _pk[0] = __floats2bfloat162_rn(_tmem_load_6[0 + 0], _tmem_load_6[0 + 1]);
+                            _pk[1] = __floats2bfloat162_rn(_tmem_load_6[0 + 2], _tmem_load_6[0 + 3]);
+                            _pk[2] = __floats2bfloat162_rn(_tmem_load_6[0 + 4], _tmem_load_6[0 + 5]);
+                            _pk[3] = __floats2bfloat162_rn(_tmem_load_6[0 + 6], _tmem_load_6[0 + 7]);
+                            _pk[4] = __floats2bfloat162_rn(_tmem_load_6[0 + 8], _tmem_load_6[0 + 9]);
+                            _pk[5] = __floats2bfloat162_rn(_tmem_load_6[0 + 10], _tmem_load_6[0 + 11]);
+                            _pk[6] = __floats2bfloat162_rn(_tmem_load_6[0 + 12], _tmem_load_6[0 + 13]);
+                            _pk[7] = __floats2bfloat162_rn(_tmem_load_6[0 + 14], _tmem_load_6[0 + 15]);
+                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(final_state + (state_base + (long long)(state_col_block_4 * 32))))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(final_state + (state_base + (long long)(state_col_block_4 * 32))))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
+                        }
+                        {
+                            __nv_bfloat162 _pk[8];
+                            _pk[0] = __floats2bfloat162_rn(_tmem_load_6[16 + 0], _tmem_load_6[16 + 1]);
+                            _pk[1] = __floats2bfloat162_rn(_tmem_load_6[16 + 2], _tmem_load_6[16 + 3]);
+                            _pk[2] = __floats2bfloat162_rn(_tmem_load_6[16 + 4], _tmem_load_6[16 + 5]);
+                            _pk[3] = __floats2bfloat162_rn(_tmem_load_6[16 + 6], _tmem_load_6[16 + 7]);
+                            _pk[4] = __floats2bfloat162_rn(_tmem_load_6[16 + 8], _tmem_load_6[16 + 9]);
+                            _pk[5] = __floats2bfloat162_rn(_tmem_load_6[16 + 10], _tmem_load_6[16 + 11]);
+                            _pk[6] = __floats2bfloat162_rn(_tmem_load_6[16 + 12], _tmem_load_6[16 + 13]);
+                            _pk[7] = __floats2bfloat162_rn(_tmem_load_6[16 + 14], _tmem_load_6[16 + 15]);
+                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(final_state + (state_base + (long long)(state_col_block_4 * 32) + 16)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                            *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(final_state + (state_base + (long long)(state_col_block_4 * 32) + 16)))[8]) = *reinterpret_cast<uint4*>(&_pk[4]);
                         }
                     }
                 }
             }
             asm volatile("barrier.sync 9, 128;" ::: "memory");
-            __threadfence();
-            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             if (compute_local_warp == 0) {
                 if (elect_sync()) {
                     mbarrier_arrive(tmem_dealloc_ready_addr);
@@ -1707,7 +1712,7 @@ kernel_cake_kda_affine_unbounded_softplus_main(__nv_bfloat16* __restrict__ q, Ca
                     :: "r"(tmem_tmem_u2_acc), "r"(_mma_b_lo_7), "r"(tmem_tmem_u2_inp), "r"(0));
                 elect_commit(u2_acc_ready_addr + (mma_stage) * 8);
                 mbarrier_wait(u2_inp_ready_addr + (mma_stage) * 8, _phase_u2_inp_ready);
-                int _mma_b_lo_8 = make_warp_uniform(((((smem_kr_trans_addr) >> 4) & 0x3FFF) | 0x1000000) + (mma_stage) * 2624);
+                int _mma_b_lo_8 = make_warp_uniform(((((smem_final_trans_addr) >> 4) & 0x3FFF) | 0x1000000) + (mma_stage) * 2624);
                 asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -1718,7 +1723,7 @@ kernel_cake_kda_affine_unbounded_softplus_main(__nv_bfloat16* __restrict__ q, Ca
                     "setp.ne.b32 p1, 1, 0;\n\t"
                     ""
                     "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 136381584;\n\t"
+                    "mov.b32 id, 136905872;\n\t"
                     "mov.b32 ta, %2;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 db, {blo, dhi};\n\t"
@@ -1728,29 +1733,7 @@ kernel_cake_kda_affine_unbounded_softplus_main(__nv_bfloat16* __restrict__ q, Ca
                     "mov.b64 db, {blo, dhi};\n\t"
                     "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
                     "}\n"
-                    :: "r"(tmem_tmem_state), "r"(_mma_b_lo_8), "r"(tmem_tmem_u2_inp), "r"(1));
-                int _mma_b_lo_9 = make_warp_uniform(((((smem_final_mqk_slab_addr) >> 4) & 0x3FFF) | 0x1000000) + (mma_stage) * 2624);
-                asm volatile(
-                    "{\n\t"
-                    ".reg .pred leader, p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, ta, id;\n\t"
-                    ".reg .b64 db;\n\t"
-                    "elect.sync _|leader, 0xFFFFFFFF;\n\t"
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 134808720;\n\t"
-                    "mov.b32 ta, %2;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p0;\n\t"
-                    "add.u32 ta, ta, 8;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "@leader tcgen05.mma.cta_group::1.kind::f16 [%0], [ta], db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"(tmem_tmem_out), "r"(_mma_b_lo_9), "r"(tmem_tmem_u2_inp), "r"(1));
+                    :: "r"(tmem_tmem_state_out), "r"(_mma_b_lo_8), "r"(tmem_tmem_u2_inp), "r"(1));
                 elect_commit2(final_ready_addr + (mma_stage) * 8, smem_free_addr + (mma_stage) * 8);
                 mma_stage += 1;
                 if (mma_stage == 5) { mma_stage = 0; _phase_qk_full_1 ^= 1; _phase_state_inp_ready ^= 1; _phase_u_inp_ready ^= 1; _phase_u2_inp_ready ^= 1; _phase_final_ready_2 ^= 1; }
