@@ -75,6 +75,7 @@ from .utils import (
     get_alibi_slopes,
     get_compute_capability,
     get_device_sm_count,
+    is_fa3_prefill_head_dim_supported,
     is_float8,
     is_sm12x_supported,
     is_sm100a_supported,
@@ -127,6 +128,7 @@ def _validate_variable_window_bounds(
 
     Returns the caller tensors by reference (same contract as ``prefix_len_ptr``).
     They must stay alive and unchanged from ``plan()`` through ``run()``.
+    Checks are host metadata only (no copy, no device sync on the arrays).
     """
     has_starts = variable_window_token_starts is not None
     has_ends = variable_window_token_ends is not None
@@ -154,15 +156,11 @@ def _validate_variable_window_bounds(
             "variable_window is only supported for the fa3 backend "
             f"(got backend={backend!r})"
         )
-    if head_dim_qk != head_dim_vo:
+    if not is_fa3_prefill_head_dim_supported(head_dim_qk, head_dim_vo):
         raise ValueError(
-            "variable_window requires equal QK and VO head dimensions "
+            "variable_window requires an FA3-supported head-dim pair: equal "
+            "{64, 128, 256} or (head_dim_qk, head_dim_vo)=(192, 128) "
             f"(got head_dim_qk={head_dim_qk}, head_dim_vo={head_dim_vo})"
-        )
-    if head_dim_qk not in (64, 128, 256):
-        raise ValueError(
-            "variable_window requires head_dim in {64, 128, 256} "
-            f"(got head_dim_qk={head_dim_qk})"
         )
     starts = variable_window_token_starts
     ends = variable_window_token_ends
@@ -2411,8 +2409,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Packed int32 ``[nnz_qo]`` inclusive KV start index per query token (ragged
             ``qo_indptr`` order). Must be paired with ``variable_window_token_ends``.
             FA3 only; mutually exclusive with sliding window, custom mask, causal, and
-            multi-item scoring. Held by reference like ``prefix_len_ptr`` and reused
-            at ``run()``; keep the tensors alive and unchanged until then.
+            multi-item scoring. Bake causal / SWA into the arrays. Held by reference
+            like ``prefix_len_ptr`` and reused at ``run()``; keep the tensors alive
+            and unchanged until then.
         variable_window_token_ends : Optional[torch.Tensor]
             Packed int32 ``[nnz_qo]`` inclusive KV end index per query token.
         Note
@@ -3810,8 +3809,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Packed int32 ``[nnz_qo]`` inclusive KV start index per query token (ragged
             ``qo_indptr`` order). Must be paired with ``variable_window_token_ends``.
             FA3 only; mutually exclusive with sliding window, custom mask, causal, and
-            multi-item scoring. Held by reference like ``prefix_len_ptr`` and reused
-            at ``run()``; keep the tensors alive and unchanged until then.
+            multi-item scoring. Bake causal / SWA into the arrays. Held by reference
+            like ``prefix_len_ptr`` and reused at ``run()``; keep the tensors alive
+            and unchanged until then.
         variable_window_token_ends : Optional[torch.Tensor]
             Packed int32 ``[nnz_qo]`` inclusive KV end index per query token.
         Note

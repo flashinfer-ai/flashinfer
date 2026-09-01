@@ -496,3 +496,24 @@ def test_rejects_custom_mask_combo():
             variable_window_token_starts=starts,
             variable_window_token_ends=ends,
         )
+
+
+def test_rejects_prefix_len_combo():
+    _require_sm90()
+    seq_len = 32
+    starts, ends = causal_swa_bounds(seq_len, seq_len, 8, "cuda")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        _ws(), "NHD", backend="fa3"
+    )
+    with pytest.raises(ValueError, match="prefix_len_ptr"):
+        wrapper.plan(
+            torch.tensor([0, seq_len], dtype=torch.int32, device="cuda"),
+            torch.tensor([0, seq_len], dtype=torch.int32, device="cuda"),
+            8,
+            2,
+            128,
+            causal=False,
+            prefix_len_ptr=torch.zeros(1, dtype=torch.uint32, device="cuda"),
+            variable_window_token_starts=starts,
+            variable_window_token_ends=ends,
+        )
