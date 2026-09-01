@@ -34,10 +34,14 @@ void RunM64(const void* q_ptr, const void* k_ptr, const void* v_ptr, const void*
     throw std::runtime_error("kda_flash: the M64 FlashKDA variant requires H % 8 == 0");
   }
   constexpr int32_t kSmemBytes = SMEM_TOTAL;
-  kda_flash::CheckCuda(
-      cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m64,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes),
-      "cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m64)");
+  static const bool kSmemAttrOnce = [] {
+    kda_flash::CheckCuda(
+        cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m64,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes),
+        "cudaFuncSetAttribute(kernel_flashkda_bf16_fused_m64)");
+    return true;
+  }();
+  (void)kSmemAttrOnce;
 
   const dim3 grid(static_cast<uint32_t>(2 * num_seqs * num_heads), 1, 1);
   const dim3 block(THREADS, 1, 1);

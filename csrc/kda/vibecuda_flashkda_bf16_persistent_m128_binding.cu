@@ -134,10 +134,14 @@ void RunPersistentM128(const void* q_ptr, const void* k_ptr, const void* v_ptr, 
                        double lower_bound, int64_t beta_tma_rows, int64_t beta_tma_dim1,
                        int64_t sm_count, int64_t cuda_stream) {
   constexpr int32_t kSmemBytes = SMEM_TOTAL;
-  kda_flash::CheckCuda(
-      cudaFuncSetAttribute(kernel_flashkda_bf16_persistent_m128,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes),
-      "cudaFuncSetAttribute(kernel_flashkda_bf16_persistent_m128)");
+  static const bool kSmemAttrOnce = [] {
+    kda_flash::CheckCuda(
+        cudaFuncSetAttribute(kernel_flashkda_bf16_persistent_m128,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes),
+        "cudaFuncSetAttribute(kernel_flashkda_bf16_persistent_m128)");
+    return true;
+  }();
+  (void)kSmemAttrOnce;
 
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(static_cast<uintptr_t>(cuda_stream));
   const TmaPointers tma = EncodeTmaPointersAll<128>(

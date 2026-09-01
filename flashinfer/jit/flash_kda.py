@@ -353,7 +353,7 @@ def load_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget):
 # run_persistent_m128 / sort_seqs_into). The four binding TUs define
 # distinct raw-pointer launchers in the kda_flash / kda_flash_slab
 # namespaces, so they link together in a single module.
-_VIBECUDA_FLASH_KDA_MODULE_IDENT = "3db5a6ddce"
+_VIBECUDA_FLASH_KDA_MODULE_IDENT = "35f07079a1"
 
 
 def get_vibecuda_flash_kda_uri(target: FlashKDATarget) -> str:
@@ -372,8 +372,9 @@ def gen_vibecuda_flash_kda_module(target: FlashKDATarget) -> JitSpec:
     schedules, so the module builds with the same SM100-family NVCC flags.
     The defines reproduce the measured default build: ``KDA_DTB_HOIST``
     (dt_bias register hoist) and ``KDA_F32X2`` (packed f32x2 prep math) are
-    the two measured-on generated-code switches; the half/bfloat conversion
-    undefs match the generated kernels' arithmetic expectations.
+    enabled on both targets, while ``KDA_PREP_NORM_ILP`` selects the retained
+    SM103 operand-preparation schedule. The half/bfloat conversion undefs
+    match the generated kernels' arithmetic expectations.
     """
 
     csrc_dir = _get_flash_kda_csrc_dir()
@@ -397,6 +398,7 @@ def gen_vibecuda_flash_kda_module(target: FlashKDATarget) -> JitSpec:
             *_FLASH_KDA_NVCC_FLAGS[target],
             _FLASH_KDA_TARGET_DEFINE[target],
             *(["-DKDA_SM103"] if target == "sm103a" else []),
+            *(["-DKDA_PREP_NORM_ILP"] if target == "sm103a" else []),
             "--extra-device-vectorization",
             "-DKDA_DTB_HOIST",
             "-DKDA_F32X2",

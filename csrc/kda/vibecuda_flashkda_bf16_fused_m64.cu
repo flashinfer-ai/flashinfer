@@ -26,8 +26,40 @@ typedef short int          int16_t;
 
 #include <cuda_bf16.h>
 
-#if defined(KDA_SM103) && !defined(KDA_M64_NORM_ILP)
+// Round-127 SM103-only prep ILP backstop (mirror of the slab TU's
+// KDA_PREP_NORM_ILP auto-ON): on the sm_103a build the q/k L2-norm
+// sum-of-squares chain in the m64 prep splits its 8-deep dependent packed
+// FMA chain into two independent 4-deep halves so the dependent FFMA2s no
+// longer issue back-to-back (same transformation the slab TU measured as
+// its SM103 issue-efficiency win; the m64 route never received it, which is
+// the carried SM103 H64-long 0.986/0.966 deficit inside the m64 kernel —
+// the R121 m64->m128 route flip already measured 0.891/0.870 and stays
+// REVERTED). SM100 builds get -UKDA_SM103 so this file stays byte-identical
+// on the sm_100a image.
+// Round-128: KDA_NO_M64_NORM_ILP (host flag, default -U) is the A/B
+// kill-switch mirroring the slab TU's KDA_NO_SCAN_ILP — a decision-rule
+// remote revert path for the c3/c4 rows that needs no source resync.
+#if defined(KDA_SM103) && !defined(KDA_NO_M64_NORM_ILP) && !defined(KDA_M64_NORM_ILP)
 #define KDA_M64_NORM_ILP
+#endif
+// Round-138 SM100 A/B (KDA_M64_NORM_ILP100 opt-in, now fully reverted):
+// WALL-NEUTRAL — c4 0.9505 vs 0.9506, c3 -0.0015, c2 -0.0012, c1 +0.0042.
+// The m64-route H64 deficit is NOT the norm sum chain.
+// Round-138 m64 gate-scan two-half ILP (port of the R127 slab SCAN_ILP):
+// BAKED SM100 DEFAULT after a same-window A/B sweep on the m64-route H64
+// fixed rows, all pass=True: c4 8192xH64 0.9506->0.9766, c3 4096xH64
+// 0.9751->1.0174, c2 2048xH64 0.9973->1.0209, c0 512xH64 1.0520->1.0886.
+// SM103 and SIG_EXP2 images keep the legacy serial loop (byte-identical);
+// KDA_NO_M64_SCAN_ILP is the revert switch.
+#if !defined(KDA_SM103) && !defined(KDA_SIG_EXP2) \
+    && !defined(KDA_NO_M64_SCAN_ILP) && !defined(KDA_M64_SCAN_ILP)
+#define KDA_M64_SCAN_ILP
+#endif
+// Round-139 four-way scan port (KDA_M64_SCAN_ILP4, opt-in _m4i .so) is
+// tanh-only like the two-half port; force it off under SIG_EXP2 so that
+// image keeps its legacy serial loop byte-identically.
+#if defined(KDA_M64_SCAN_ILP4) && defined(KDA_SIG_EXP2)
+#undef KDA_M64_SCAN_ILP4
 #endif
 
 #define LOOM_INF CUDART_INF_F
@@ -398,11 +430,34 @@ __device__ __forceinline__ void mbarrier_init_pred(int mbar_addr, uint32_t count
         "}\n" :: "r"(mbar_addr), "r"(count), "r"(pred));
 }
 
-
 __device__ __forceinline__ float approx_exp2(float x) {
     float y;
     asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
     return y;
+}
+
+
+// Round-112 (supervisor directive, SM103-only opt-in): exp2/rcp sigmoid
+// helper, extended from the m128slab R110 block into this variant.
+// sigmoid(x) = RCP(1 + EX2(-x*log2e)): two short MUFU ops issue on SM103's
+// doubled EX2 pipe instead of the dependent TANH chain (FMUL, MUFU.TANH,
+// FFMA). With KDA_SIG_EXP2 undefined this inlines to the exact original
+// tanh.approx sequence, so the sm_100a image is unchanged. For |x| large
+// the ftz approx path saturates identically to the tanh form (e->inf gives
+// 1+e=inf, rcp->0; e->0 gives rcp(1)=1), well inside the 1e-2/1e-2
+// benchmark tolerance.
+__device__ __forceinline__ float kda_sigmoid(float x) {
+#if defined(KDA_SIG_EXP2)
+    float e;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(-x * 1.4426950408889634f));
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(1.0f + e));
+    return r;
+#else
+    float t;
+    asm volatile("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(x * 0.5f));
+    return t * 0.5f + 0.5f;
+#endif
 }
 
 
@@ -2927,9 +2982,7 @@ kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, const void* __rest
                         if (head_idx_3 % 2 != 0) {
                             beta_logit = beta_raw_pair_fp32[1];
                         }
-                        float _tanh_approx_0;
-                        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_0) : "f"(beta_logit * 0.5f));
-                        early_beta_value = _tanh_approx_0 * 0.5f + 0.5f;
+                        early_beta_value = kda_sigmoid(beta_logit);
                     }
 #if !defined(KDA_F32X2)
                     if (prep_tid < 128) {
@@ -2942,9 +2995,7 @@ kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, const void* __rest
                         __nv_bfloat16 early_gate_raw = smem_g_raw_all[stage_bf16 + prep_tid];
                         float _cvt_f32_0 = __bfloat162float(early_gate_raw);
                         float early_gate_arg = early_gate_rate * (_cvt_f32_0 + early_gate_bias);
-                        float _tanh_approx_1;
-                        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_1) : "f"(early_gate_arg * 0.5f));
-                        float early_gate_sigmoid = _tanh_approx_1 * 0.5f + 0.5f;
+                        float early_gate_sigmoid = kda_sigmoid(early_gate_arg);
                         early_gate0 = lower_bound * 1.4426950408889634f * early_gate_sigmoid;
                     }
 #endif
@@ -2997,9 +3048,7 @@ kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, const void* __rest
                         long long beta_token = bos_4 + (long long)(chunk_idx_3 * 32 + lane);
                         if (beta_token < eos_4) {
                             float beta_logit_1 = (float)beta[beta_token * (long long)num_heads + (long long)head_idx_3];
-                            float _tanh_approx_2;
-                            asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_2) : "f"(beta_logit_1 * 0.5f));
-                            beta_value = _tanh_approx_2 * 0.5f + 0.5f;
+                            beta_value = kda_sigmoid(beta_logit_1);
                         }
                     }
                     smem_prep_beta_all[stage_f32 + lane] = beta_value;
@@ -3323,6 +3372,8 @@ kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, const void* __rest
                             }
 #endif
 #if defined(KDA_M64_NORM_ILP)
+                            // R127 (SM103 auto-ON): split the 8-deep packed-FMA
+                            // dependency into two independent 4-deep halves.
                             float2 qk_sum_a = {0.0f, 0.0f};
                             #pragma unroll
                             for (int elem_in_segment = 0; elem_in_segment < 4; elem_in_segment++) {
@@ -3443,6 +3494,137 @@ kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, const void* __rest
                         const float2 c0_r2 = {0.5f * gate_rate, 0.5f * gate_rate};
                         const float c1_r2s = 0.5f * gate_rate * gate_bias;
                         const float2 c1_r2 = {c1_r2s, c1_r2s};
+#if defined(KDA_SIG_EXP2)
+                        // R112 SM103 exp2/rcp schedule constants: the row
+                        // pair gl = k_log * sigmoid(x) where 1/sigmoid uses
+                        // EX2(arg2 * -2*log2e); the +1 add and the k_log
+                        // multiply stay on packed f32x2 ALU.
+                        const float2 n2l2v = {-2.8853900817779268f, -2.8853900817779268f};
+                        const float2 fone_r2 = {1.0f, 1.0f};
+                        const float2 klog_r2v = {k_log_r2, k_log_r2};
+#endif
+#if defined(KDA_M64_SCAN_ILP4)
+                        // R139 four-way interleaved prefix scan (supervisor
+                        // directive; opt-in _m4i A/B .so): octs A/B/C/D cover
+                        // rows 0-7/8-15/16-23/24-31, interleaved at pair
+                        // granularity; A stores directly, B/C/D buffer, then a
+                        // packed offset merge. Dependent FADD depth 16 -> 8 +
+                        // merge over the two-half form. tanh path only —
+                        // SIG_EXP2 builds keep the legacy serial loop.
+                        {
+                            float pa = 0.0f, pb = 0.0f, pcc = 0.0f, pd = 0.0f;
+                            float2 pbv[4], pcv[4], pdv[4];
+                            #pragma unroll
+                            for (int i = 0; i < 4; i++) {
+                                #pragma unroll
+                                for (int c = 0; c < 4; c++) {
+                                    const int gate_row = (c << 3) + (i << 1);
+                                    float& acc = (c == 0) ? pa : ((c == 1) ? pb : ((c == 2) ? pcc : pd));
+                                    float2 g2;
+                                    g2.x = __bfloat162float(smem_g_raw_all[stage_bf16 + gate_row * 128 + gate_col]);
+                                    g2.y = __bfloat162float(smem_g_raw_all[stage_bf16 + (gate_row + 1) * 128 + gate_col]);
+                                    float2 arg2 = g2;
+                                    fma_f32x2_inplace(&arg2, c0_r2, c1_r2);
+                                    float2 t2;
+                                    asm volatile("tanh.approx.f32 %0, %1;" : "=f"(t2.x) : "f"(arg2.x));
+                                    asm volatile("tanh.approx.f32 %0, %1;" : "=f"(t2.y) : "f"(arg2.y));
+                                    float2 gl2 = t2;
+                                    fma_f32x2_inplace(&gl2, hk_log2v, hk_log2v);
+                                    acc += gl2.x;
+                                    if (c == 0) {
+                                        smem_gate_all[stage_f32 + gate_row * 128 + gate_col_p] = acc;
+                                    } else if (c == 1) {
+                                        pbv[i].x = acc;
+                                    } else if (c == 2) {
+                                        pcv[i].x = acc;
+                                    } else {
+                                        pdv[i].x = acc;
+                                    }
+                                    acc += gl2.y;
+                                    if (c == 0) {
+                                        smem_gate_all[stage_f32 + (gate_row + 1) * 128 + gate_col_p] = acc;
+                                    } else if (c == 1) {
+                                        pbv[i].y = acc;
+                                    } else if (c == 2) {
+                                        pcv[i].y = acc;
+                                    } else {
+                                        pdv[i].y = acc;
+                                    }
+                                }
+                            }
+                            const float t_bc = pa + pb;
+                            const float t_bd = t_bc + pcc;
+                            const float2 off_b = {pa, pa};
+                            const float2 off_c = {t_bc, t_bc};
+                            const float2 off_d = {t_bd, t_bd};
+                            #pragma unroll
+                            for (int i = 0; i < 4; i++) {
+                                add_f32x2_inplace(&pbv[i], off_b);
+                                add_f32x2_inplace(&pcv[i], off_c);
+                                add_f32x2_inplace(&pdv[i], off_d);
+                                const int r_b = 8 + (i << 1);
+                                smem_gate_all[stage_f32 + r_b * 128 + gate_col_p] = pbv[i].x;
+                                smem_gate_all[stage_f32 + (r_b + 1) * 128 + gate_col_p] = pbv[i].y;
+                                const int r_c = 16 + (i << 1);
+                                smem_gate_all[stage_f32 + r_c * 128 + gate_col_p] = pcv[i].x;
+                                smem_gate_all[stage_f32 + (r_c + 1) * 128 + gate_col_p] = pcv[i].y;
+                                const int r_d = 24 + (i << 1);
+                                smem_gate_all[stage_f32 + r_d * 128 + gate_col_p] = pdv[i].x;
+                                smem_gate_all[stage_f32 + (r_d + 1) * 128 + gate_col_p] = pdv[i].y;
+                            }
+                            prefix_log2 = t_bd + pd;
+                        }
+#elif defined(KDA_M64_SCAN_ILP)
+                        // Round-138 port of the R127 slab two-half gate-prefix
+                        // scan ILP: same-window SM100 bake won +1.0/+1.6/+2.0%
+                        // on c12/c10/c9 there. Chain A covers rows 0-15
+                        // (stored directly), chain B covers rows 16-31 into
+                        // pbv registers; after chain A's total is known, half
+                        // B's prefixes are offset by pa and stored. Dependent
+                        // FADD depth 32 -> 16 + merge. tanh path only —
+                        // SIG_EXP2 builds keep the legacy serial loop.
+                        {
+                            float pa = 0.0f, pb = 0.0f;
+                            float2 pbv[8];
+                            #pragma unroll
+                            for (int i = 0; i < 16; i++) {
+                                const int half_b = (i >> 3);
+                                const int gate_row = ((i & 7) << 1) + (half_b << 4);
+                                float& acc = half_b ? pb : pa;
+                                float2 g2;
+                                g2.x = __bfloat162float(smem_g_raw_all[stage_bf16 + gate_row * 128 + gate_col]);
+                                g2.y = __bfloat162float(smem_g_raw_all[stage_bf16 + (gate_row + 1) * 128 + gate_col]);
+                                float2 arg2 = g2;
+                                fma_f32x2_inplace(&arg2, c0_r2, c1_r2);
+                                float2 t2;
+                                asm volatile("tanh.approx.f32 %0, %1;" : "=f"(t2.x) : "f"(arg2.x));
+                                asm volatile("tanh.approx.f32 %0, %1;" : "=f"(t2.y) : "f"(arg2.y));
+                                float2 gl2 = t2;
+                                fma_f32x2_inplace(&gl2, hk_log2v, hk_log2v);
+                                acc += gl2.x;
+                                if (half_b == 0) {
+                                    smem_gate_all[stage_f32 + gate_row * 128 + gate_col_p] = acc;
+                                } else {
+                                    pbv[i & 7].x = acc;
+                                }
+                                acc += gl2.y;
+                                if (half_b == 0) {
+                                    smem_gate_all[stage_f32 + (gate_row + 1) * 128 + gate_col_p] = acc;
+                                } else {
+                                    pbv[i & 7].y = acc;
+                                }
+                            }
+                            const float2 pa2 = {pa, pa};
+                            #pragma unroll
+                            for (int i = 0; i < 8; i++) {
+                                add_f32x2_inplace(&pbv[i], pa2);
+                                const int gate_row = 16 + (i << 1);
+                                smem_gate_all[stage_f32 + gate_row * 128 + gate_col_p] = pbv[i].x;
+                                smem_gate_all[stage_f32 + (gate_row + 1) * 128 + gate_col_p] = pbv[i].y;
+                            }
+                            prefix_log2 = pa + pb;
+                        }
+#else
                         #pragma unroll
                         for (int gate_row = 0; gate_row < 32; gate_row += 2) {
                             float2 g2;
@@ -3451,15 +3633,38 @@ kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, const void* __rest
                             float2 arg2 = g2;
                             fma_f32x2_inplace(&arg2, c0_r2, c1_r2);
                             float2 t2;
+                            float2 gl2;
+#if defined(KDA_SIG_EXP2)
+                            // R112 SM103 exp2/rcp schedule (mirrors the
+                            // m128slab R110 block): gl = k_log * rcp(1 +
+                            // 2^(-2*log2e*arg2)) for the row pair; EX2+RCP
+                            // ride SM103's doubled MUFU exp2 pipe in place of
+                            // the TANH chain; the +1 add and the k_log
+                            // multiply stay on packed f32x2 ALU.
+                            {
+                                float2 pow2 = arg2;
+                                mul_f32x2_inplace(&pow2, n2l2v);
+                                float2 e2;
+                                asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e2.x) : "f"(pow2.x));
+                                asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e2.y) : "f"(pow2.y));
+                                float2 d2 = add_f32x2(e2, fone_r2);
+                                float2 r2;
+                                asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r2.x) : "f"(d2.x));
+                                asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r2.y) : "f"(d2.y));
+                                gl2 = mul_f32x2(r2, klog_r2v);
+                            }
+#else
                             asm volatile("tanh.approx.f32 %0, %1;" : "=f"(t2.x) : "f"(arg2.x));
                             asm volatile("tanh.approx.f32 %0, %1;" : "=f"(t2.y) : "f"(arg2.y));
-                            float2 gl2 = t2;
+                            gl2 = t2;
                             fma_f32x2_inplace(&gl2, hk_log2v, hk_log2v);
+#endif
                             prefix_log2 += gl2.x;
                             smem_gate_all[stage_f32 + gate_row * 128 + gate_col_p] = prefix_log2;
                             prefix_log2 += gl2.y;
                             smem_gate_all[stage_f32 + (gate_row + 1) * 128 + gate_col_p] = prefix_log2;
                         }
+#endif  // KDA_M64_SCAN_ILP
                     } else
 #endif
                     for (int gate_row = 0; gate_row < 32; gate_row++) {
@@ -3477,9 +3682,7 @@ kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, const void* __rest
                                 __nv_bfloat16 gate_raw = smem_g_raw_all[stage_bf16 + gate_row * 128 + gate_col];
                                 float _cvt_f32_1 = __bfloat162float(gate_raw);
                                 float gate_arg = gate_rate * (_cvt_f32_1 + gate_bias);
-                                float _tanh_approx_3;
-                                asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_3) : "f"(gate_arg * 0.5f));
-                                float gate_sigmoid = _tanh_approx_3 * 0.5f + 0.5f;
+                                float gate_sigmoid = kda_sigmoid(gate_arg);
                                 gate_log2 = lower_bound * 1.4426950408889634f * gate_sigmoid;
                             }
                         }
@@ -3694,6 +3897,8 @@ kernel_flashkda_bf16_fused_m64(__nv_bfloat16* __restrict__ q, const void* __rest
 #endif
 #if defined(KDA_F32X2)
 #if defined(KDA_M64_NORM_ILP)
+                    // R127 (SM103 auto-ON): two independent 4-deep packed-FMA
+                    // halves instead of one 8-deep dependent chain.
                     float2 qk_sum_a = {0.0f, 0.0f};
                     #pragma unroll
                     for (int elem_in_segment = 0; elem_in_segment < 4; elem_in_segment++) {

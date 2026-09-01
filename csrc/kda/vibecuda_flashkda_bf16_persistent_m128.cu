@@ -330,6 +330,30 @@ __device__ __forceinline__ float approx_exp2(float x) {
 }
 
 
+// Round-112 (supervisor directive, SM103-only opt-in): exp2/rcp sigmoid
+// helper, extended from the m128slab R110 block into this variant.
+// sigmoid(x) = RCP(1 + EX2(-x*log2e)): two short MUFU ops issue on SM103's
+// doubled EX2 pipe instead of the dependent TANH chain (FMUL, MUFU.TANH,
+// FFMA). With KDA_SIG_EXP2 undefined this inlines to the exact original
+// tanh.approx sequence, so the sm_100a image is unchanged. For |x| large
+// the ftz approx path saturates identically to the tanh form (e->inf gives
+// 1+e=inf, rcp->0; e->0 gives rcp(1)=1), well inside the 1e-2/1e-2
+// benchmark tolerance.
+__device__ __forceinline__ float kda_sigmoid(float x) {
+#if defined(KDA_SIG_EXP2)
+    float e;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(-x * 1.4426950408889634f));
+    float r;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(1.0f + e));
+    return r;
+#else
+    float t;
+    asm volatile("tanh.approx.f32 %0, %1;" : "=f"(t) : "f"(x * 0.5f));
+    return t * 0.5f + 0.5f;
+#endif
+}
+
+
 __device__ __forceinline__ void fma_f32x2_inplace(float2* a, float2 b, float2 c) {
     unsigned long long r;
     asm("fma.rn.ftz.f32x2 %0, %1, %2, %3;"
@@ -1385,9 +1409,7 @@ kernel_flashkda_bf16_persistent_m128(__nv_bfloat16* __restrict__ q, const void* 
                                 if (head_idx_3 % 2 != 0) {
                                     beta_logit = beta_raw_pair_f32[1];
                                 }
-                                float _tanh_approx_0;
-                                asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_0) : "f"(beta_logit * 0.5f));
-                                early_beta_value = _tanh_approx_0 * 0.5f + 0.5f;
+                                early_beta_value = kda_sigmoid(beta_logit);
                             }
                             if (prep_tid < 128) {
                                 float early_gate_rate = smem_gate_rate_all[stage_f32];
@@ -1397,9 +1419,7 @@ kernel_flashkda_bf16_persistent_m128(__nv_bfloat16* __restrict__ q, const void* 
                                         __nv_bfloat16 early_gate_raw = smem_g_raw_all[stage_bf16 + early_gate_row * 128 + prep_tid];
                                         float _cvt_f32_0 = __bfloat162float(early_gate_raw);
                                         float early_gate_arg = early_gate_rate * (_cvt_f32_0 + early_gate_bias);
-                                        float _tanh_approx_1;
-                                        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_1) : "f"(early_gate_arg * 0.5f));
-                                        float early_gate_sigmoid = _tanh_approx_1 * 0.5f + 0.5f;
+                                        float early_gate_sigmoid = kda_sigmoid(early_gate_arg);
                                         float early_gate_log2 = lower_bound * 1.4426950408889634f * early_gate_sigmoid;
                                         early_gate_log2_values[early_gate_row] = early_gate_log2;
                                     }
@@ -1447,9 +1467,7 @@ kernel_flashkda_bf16_persistent_m128(__nv_bfloat16* __restrict__ q, const void* 
                                 long long beta_token = bos_4 + (long long)(chunk_idx_3 * 32 + lane);
                                 if (beta_token < eos_4) {
                                     float beta_logit_1 = (float)beta[beta_token * (long long)num_heads + (long long)head_idx_3];
-                                    float _tanh_approx_3;
-                                    asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_3) : "f"(beta_logit_1 * 0.5f));
-                                    beta_value = _tanh_approx_3 * 0.5f + 0.5f;
+                                    beta_value = kda_sigmoid(beta_logit_1);
                                 }
                             }
                             smem_prep_beta_all[stage_f32 + lane] = beta_value;
@@ -1476,9 +1494,7 @@ kernel_flashkda_bf16_persistent_m128(__nv_bfloat16* __restrict__ q, const void* 
                                         __nv_bfloat16 gate_raw = smem_g_raw_all[stage_bf16 + gate_row * 128 + gate_col];
                                         float _cvt_f32_2 = __bfloat162float(gate_raw);
                                         float gate_arg = gate_rate * (_cvt_f32_2 + gate_bias);
-                                        float _tanh_approx_4;
-                                        asm volatile("tanh.approx.f32 %0, %1;" : "=f"(_tanh_approx_4) : "f"(gate_arg * 0.5f));
-                                        float gate_sigmoid = _tanh_approx_4 * 0.5f + 0.5f;
+                                        float gate_sigmoid = kda_sigmoid(gate_arg);
                                         gate_log2 = lower_bound * 1.4426950408889634f * gate_sigmoid;
                                     }
                                 }

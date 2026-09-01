@@ -1,8 +1,8 @@
-// Host TMA descriptor helpers for the VibeCUDA FlashKDA prefill kernel
-// family. Raw-pointer C++ (the TVM-FFI tensor shell lives in
-// vibecuda_flashkda_binding.cu); the TMA descriptor shapes/swizzles match
-// the frozen FlashKDA prefill path so the kernels receive byte-identical
-// descriptor layouts.
+// Session-local adaptation of FlashInfer's flashkda_binding_common.cuh host
+// TMA descriptor helpers for the generated standalone FlashKDA prefill
+// kernels. TVM-FFI plumbing was replaced by plain ATen tensors; the TMA
+// descriptor shapes/swizzles are kept identical to the FlashInfer prefill
+// path so the frozen kernels receive byte-identical descriptor layouts.
 #pragma once
 
 #include <cuda.h>
@@ -38,7 +38,7 @@ inline void CheckCuda(cudaError_t status, const char* operation) {
 template <int ChunkTokens = 32>
 inline CUtensorMap EncodeQkTma(const void* base, int64_t numel, int64_t d2, int64_t d1,
                                const char* name) {
-  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64);
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64 || ChunkTokens == 96);
   KDA_FFI_CHECK(d1 > 0 && d2 > 0 && d1 % 64 == 0, "invalid trailing dims for q/k TMA");
   const int64_t outer2 = numel / (d1 * d2);
   uint64_t global_dim[4] = {64, static_cast<uint64_t>(outer2), static_cast<uint64_t>(d2),
@@ -63,7 +63,7 @@ inline CUtensorMap EncodeQkTma(const void* base, int64_t numel, int64_t d2, int6
 template <int ValueRows, int ChunkTokens = 32>
 inline CUtensorMap EncodeValueTma(const void* base, int64_t numel, int64_t d2, int64_t d1) {
   static_assert(ValueRows == 64 || ValueRows == 128);
-  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64);
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64 || ChunkTokens == 96);
   const int64_t outer2 = numel / (d1 * d2);
   uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2),
                             static_cast<uint64_t>(outer2)};
@@ -86,7 +86,7 @@ inline CUtensorMap EncodeValueTma(const void* base, int64_t numel, int64_t d2, i
 
 template <int ChunkTokens = 32>
 inline CUtensorMap EncodeGateTma(const void* base, int64_t numel, int64_t d2, int64_t d1) {
-  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64);
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64 || ChunkTokens == 96);
   const int64_t outer2 = numel / (d1 * d2);
   uint64_t global_dim[3] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(d2),
                             static_cast<uint64_t>(outer2)};
@@ -108,7 +108,7 @@ inline CUtensorMap EncodeGateTma(const void* base, int64_t numel, int64_t d2, in
 
 template <int ChunkTokens = 32>
 inline CUtensorMap EncodeBetaTma(const void* base, int64_t numel, int64_t d1) {
-  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64);
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64 || ChunkTokens == 96);
   const int64_t outer1 = numel / d1;
   uint64_t global_dim[2] = {static_cast<uint64_t>(d1), static_cast<uint64_t>(outer1)};
   KDA_FFI_CHECK(global_dim[0] >= 8 && global_dim[1] >= ChunkTokens,
@@ -129,7 +129,7 @@ inline CUtensorMap EncodeBetaTma(const void* base, int64_t numel, int64_t d1) {
 template <int ValueRows, int ChunkTokens = 32>
 inline CUtensorMap EncodeOutputTma(const void* base, int64_t numel, int64_t d2, int64_t d1) {
   static_assert(ValueRows == 64 || ValueRows == 128);
-  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64);
+  static_assert(ChunkTokens == 16 || ChunkTokens == 32 || ChunkTokens == 64 || ChunkTokens == 96);
   KDA_FFI_CHECK(d1 > 0 && d2 > 0 && d1 % 64 == 0, "out has invalid trailing dims");
   const int64_t outer2 = numel / (d1 * d2);
   uint64_t global_dim[4] = {64, static_cast<uint64_t>(outer2), static_cast<uint64_t>(d2),
