@@ -65,6 +65,7 @@ from .fmha_decode_constants import (
 )
 from .fmha_decode_resources.helpers_common import (
     ResourceVars,
+    _assume_nonnegative_i32,
     _q_group_token_base,
     _q_seq_bounds,
     _warp_broadcast_i32,
@@ -652,7 +653,7 @@ def _load_prepared_sparse_row_warp(
         loaded_row_route_begin = cutlass.Int32(row_route_offsets[row_address])
         loaded_route_count = cutlass.Int32(row_route_counts[row_address])
     row_route_begin = _warp_broadcast_i32(loaded_row_route_begin, 0)
-    route_count = _warp_broadcast_i32(loaded_route_count, 0)
+    route_count = _assume_nonnegative_i32(_warp_broadcast_i32(loaded_route_count, 0))
     return row_route_begin, route_count
 
 
@@ -1078,19 +1079,19 @@ def _resolve_and_store_sparse_route(
     if sparse_kv_metadata is None:
         return None
     (
-        resolved_origin0,
+        resolved_record_word,
         resolved_origin1,
         resolved_atom_validity,
         route_record_word_offset,
     ) = sparse_kv_metadata.resolve_route(section=section)
     sparse_kv_metadata.store_route(
-        resolved_origin0=resolved_origin0,
+        resolved_record_word=resolved_record_word,
         resolved_origin1=resolved_origin1,
         resolved_atom_validity=resolved_atom_validity,
         route_record_word_offset=route_record_word_offset,
     )
     return (
-        resolved_origin0,
+        resolved_record_word,
         resolved_origin1,
         resolved_atom_validity,
         route_record_word_offset,
@@ -1107,14 +1108,14 @@ def _publish_sparse_softmax_route(
         return
     assert route is not None
     (
-        resolved_origin0,
+        resolved_record_word,
         resolved_origin1,
         resolved_atom_validity,
         route_record_word_offset,
     ) = route
     sparse_softmax_metadata.acquire()
     sparse_softmax_metadata.store_route(
-        resolved_origin0=resolved_origin0,
+        resolved_record_word=resolved_record_word,
         resolved_origin1=resolved_origin1,
         resolved_atom_validity=resolved_atom_validity,
         route_record_word_offset=route_record_word_offset,
@@ -1234,8 +1235,9 @@ def create_load_task(
                 for label in loop_labels:
                     _kv_load(label, FmhaStage.Loop)
             else:
-                # Follow the dense KV256 stage order exactly. Each V consumes
-                # its retained route before the matching K label replaces it.
+                # Follow the dense stage order exactly. Generic V-first
+                # profiles consume their retained route before the matching K
+                # label replaces it.
                 loop_routes = []
                 for label in loop_labels:
                     route = None
@@ -2662,8 +2664,9 @@ def create_mma_task(
         )
 
         # LOOP: consume aliased TMEM P before the next same-instance QK
-        # overwrites its S columns. SMEM-P profiles retain their established
-        # K-before-V cadence because P no longer depends on S lifetime.
+        # overwrites its S columns. Full-SMEM P remains score-dependent during
+        # Softmax replay, but owns independent storage once the replay commits
+        # and releases S; that completed handoff enables the QK-before-PV cadence.
         with domain_loop(0, domain, 1, unroll=1):
             if cfg.uses_two_inst_tmem_p:
                 _consume_staged_pv_mma(
@@ -2935,11 +2938,21 @@ def create_softmax0_task(
                         fragment_idx=fragment_idx,
                         s_arr=s_arr,
                     )
-                    smem_p0.compute_p_fragment(
-                        fragment_idx=fragment_idx,
-                        new_max_arr=new_max_arr,
-                        s_arr=s_arr,
-                    )
+                    if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                        smem_p0.compute_proxy_route_p_fragment(
+                            fragment_idx=fragment_idx,
+                            new_max_arr=new_max_arr,
+                            s_arr=s_arr,
+                            route_flags=sparse_route_flags,
+                            route_origin0=sparse_origin0,
+                            route_origin1=sparse_origin1,
+                        )
+                    else:
+                        smem_p0.compute_p_fragment(
+                            fragment_idx=fragment_idx,
+                            new_max_arr=new_max_arr,
+                            s_arr=s_arr,
+                        )
             else:
                 # Wait for a free P stage before entering the ordered window so
                 # BMM2 backpressure on this group's P pipeline cannot extend the
@@ -2950,16 +2963,27 @@ def create_softmax0_task(
                 # ProdWork: compute P=exp(S-new_max), store it in the profile's
                 # SMEM or staged-TMEM operand, and record local sums for the
                 # running softmax sum update.
-                smem_p0.compute_p(
-                    new_max_arr=new_max_arr,
-                    s_arr=s_arr,
-                )  # publishes the local denominator through tmem_s0
+                if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                    smem_p0.compute_proxy_route_p(
+                        new_max_arr=new_max_arr,
+                        s_arr=s_arr,
+                        route_origin0=sparse_origin0,
+                        route_origin1=sparse_origin1,
+                        keeps_route_flags_or_swaps_origin2=sparse_route_flags,
+                        swaps_route_origin3_bits=sparse_token_word0,
+                        swaps_route_flags=sparse_token_word2,
+                    )
+                else:
+                    smem_p0.compute_p(
+                        new_max_arr=new_max_arr,
+                        s_arr=s_arr,
+                    )  # publishes the local denominator through tmem_s0
                 smem_p0.commit()
                 if tmem_softmax_order is not None:
                     tmem_softmax_order.release_softmax1()
             if cutlass.const_expr(cfg.use_keeps_mma_ab and cfg.uses_tmem_p):
-                # The TMEM-P store has consumed the aliased S columns, so the
-                # next QK wave can now overwrite them.
+                # TMEM-P has consumed the aliased S columns, so the next QK
+                # wave can now overwrite S.
                 tmem_s0.release()
             # ProdWork: FP8 path applies the cross-resource sum correction
             # before TmemS.reduce_sums publishes the new running sums.
@@ -3153,11 +3177,21 @@ def create_softmax1_task(
                         fragment_idx=fragment_idx,
                         s_arr=s_arr,
                     )
-                    smem_p1.compute_p_fragment(
-                        fragment_idx=fragment_idx,
-                        new_max_arr=new_max_arr,
-                        s_arr=s_arr,
-                    )
+                    if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                        smem_p1.compute_proxy_route_p_fragment(
+                            fragment_idx=fragment_idx,
+                            new_max_arr=new_max_arr,
+                            s_arr=s_arr,
+                            route_flags=sparse_route_flags,
+                            route_origin0=sparse_origin0,
+                            route_origin1=sparse_origin1,
+                        )
+                    else:
+                        smem_p1.compute_p_fragment(
+                            fragment_idx=fragment_idx,
+                            new_max_arr=new_max_arr,
+                            s_arr=s_arr,
+                        )
             else:
                 # Wait for a free P stage before entering the ordered window so
                 # BMM2 backpressure on this group's P pipeline cannot extend the
@@ -3166,7 +3200,18 @@ def create_softmax1_task(
                 if tmem_softmax_order is not None:
                     tmem_softmax_order.wait_softmax1()
                 # ProdWork: compute and publish P1 for BMM2.
-                smem_p1.compute_p(new_max_arr=new_max_arr, s_arr=s_arr)
+                if cutlass.const_expr(cfg.use_block_sparse_proxy_routes):
+                    smem_p1.compute_proxy_route_p(
+                        new_max_arr=new_max_arr,
+                        s_arr=s_arr,
+                        route_origin0=sparse_origin0,
+                        route_origin1=sparse_origin1,
+                        keeps_route_flags_or_swaps_origin2=sparse_route_flags,
+                        swaps_route_origin3_bits=sparse_token_word0,
+                        swaps_route_flags=sparse_token_word2,
+                    )
+                else:
+                    smem_p1.compute_p(new_max_arr=new_max_arr, s_arr=s_arr)
                 smem_p1.commit()
                 if tmem_softmax_order is not None:
                     tmem_softmax_order.release_softmax0()

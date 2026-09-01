@@ -25,6 +25,8 @@ from typing import ClassVar
 import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float16, Float32, Int32, Int64, Uint32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
 
 from cutlass.experimental.task_scheduling.resources import (
@@ -58,6 +60,22 @@ ResourceVarValue = (
     Int32 | Float32 | Uint32 | cutlass.Int64 | cutlass.Array | DescriptorValue
 )
 ResourceVars = dict[str, ResourceVarValue]
+
+
+@dsl_user_op
+def _assume_nonnegative_i32(value: Int32, *, loc=None, ip=None) -> Int32:
+    """Express a caller-guaranteed nonnegative Int32 contract to codegen."""
+
+    condition = cutlass.Boolean(value >= Int32(0))
+    llvm.intr_assume(
+        condition.ir_value(loc=loc, ip=ip),
+        [],
+        [],
+        loc=loc,
+        ip=ip,
+    )
+    return value
+
 
 # Offsets into DecodeGenTask.make_task_cache(). Keeping these symbolic makes
 # resource code explicit about which task-local lane or address value it needs.
