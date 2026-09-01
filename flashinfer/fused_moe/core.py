@@ -458,13 +458,17 @@ def get_w2_permute_indices_with_cache(
     dst_w2_weight: torch.Tensor,
     epilogue_tile_m: int,
     num_elts_per_sf: Union[None, int] = None,
+    is_gated_act_gemm: bool | None = None,
 ) -> torch.Tensor:
-    # Include every parameter that changes the generated permutation.
+    # Keep gated and non-gated preparation in separate cache namespaces. The
+    # row mapping is currently identical, but the cached tensor is device-resident
+    # and must not be shared across activation-specific preparation lifetimes.
     cache_key = (
         "w2",
         dst_w2_weight.shape,
         epilogue_tile_m,
         num_elts_per_sf,
+        is_gated_act_gemm,
     )
     if cache_key not in _cache_permute_indices:
         if num_elts_per_sf is None:
