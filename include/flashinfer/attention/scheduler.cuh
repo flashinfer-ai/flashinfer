@@ -633,13 +633,18 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
   // the existing window_left convention), so decoder-only / causal-only
   // callers that never pass window_right see identical behavior to before.
   std::vector<int64_t> effective_kv_len_arr(batch_size);
-  const bool has_window = (window_left >= 0) || (window_right >= 0);
+  // window_right introduced here for local attention in encoder layers
+  // original trigger preserved: cap only when window_left is set, so causal
+  // sliding-window models keep their existing split-KV sizing. window_right
+  // defaults to -1 (contributes 0), so every existing caller computes exactly
+  // window_left as before; only an explicit window_right changes window_span.
   const int64_t window_span =
-      std::max<int64_t>(window_left, 0) + std::max<int64_t>(window_right, 0);
+      (window_left >= 0 ? window_left : 0) + (window_right >= 0 ? window_right : 0);
   for (uint32_t i = 0; i < batch_size; ++i) {
-    // pad CTA_TILE_Q to consider the causal / windowed kv-len
-    effective_kv_len_arr[i] = std::min(
-        has_window ? ceil_div(window_span + cta_tile_q, page_size) : kv_len_arr[i], kv_len_arr[i]);
+    // pad CTA_TILE_Q to consider the causal / bidirectional windowed kv-len
+    effective_kv_len_arr[i] =
+        std::min(window_left >= 0 ? ceil_div(window_span + cta_tile_q, page_size) : kv_len_arr[i],
+                 kv_len_arr[i]);
   }
   bool split_kv = false;
   int64_t kv_chunk_size;
