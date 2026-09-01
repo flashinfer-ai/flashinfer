@@ -89,3 +89,149 @@ def test_scores_accept_a_cache_view_with_a_storage_offset():
     got, got_visible = _run_scores(q, offset_cache, table, t2r, pos, lens)
     torch.testing.assert_close(got, want)
     torch.testing.assert_close(got_visible, want_visible)
+
+
+def _reference(
+    q,
+    k_cache,
+    page_table,
+    token_to_req,
+    positions,
+    seq_lens,
+    compress_ratio,
+    divisor,
+    num_columns,
+):
+    """What the kernel should produce, in plain torch and float32.
+
+    Independent of the kernel: it walks the page table itself and never calls
+    into flashinfer, so a shared mistake cannot make both agree.
+    """
+    rows = q.shape[0]
+    pages, page_size = k_cache.shape[0], k_cache.shape[1]
+    logits = torch.full((rows, num_columns), float("-inf"), device=q.device)
+    visible = torch.zeros(rows, dtype=page_table.dtype, device=q.device)
+    keys = k_cache.float().reshape(pages, page_size, -1)
+    qf = q.float()
+    for row in range(rows):
+        req = int(token_to_req[row])
+        if req < 0 or req >= page_table.shape[0]:
+            continue
+        seen = min(
+            (int(positions[row]) + 1) // compress_ratio,
+            int(seq_lens[req]) // compress_ratio,
+        )
+        visible[row] = min(seen, num_columns)
+        for col in range(min(seen, num_columns)):
+            page = int(page_table[req, col // page_size])
+            if page < 0 or page >= pages:
+                continue  # unmapped: the kernel leaves -inf here
+            k = keys[page, col % page_size]
+            logits[row, col] = torch.clamp(qf[row] @ k, min=0).sum() / divisor
+    return logits, visible
+
+
+@requires_cuda_sm80
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("head_dim", [64, 128, 192, 256])
+@pytest.mark.parametrize("num_heads", [1, 4, 16])
+def test_scores_match_a_torch_reference(dtype, head_dim, num_heads):
+    q, k_cache, table, t2r, pos, lens = _scores_case(
+        head_dim=head_dim, num_heads=num_heads, dtype=dtype
+    )
+    divisor = head_dim**0.5
+    columns = table.shape[1] * k_cache.shape[1]
+    got, got_visible = flashinfer.sparse_paged_scores(
+        q, k_cache, table, t2r, pos, lens, 1, divisor
+    )
+    want, want_visible = _reference(
+        q, k_cache, table, t2r, pos, lens, 1, divisor, columns
+    )
+    torch.testing.assert_close(got_visible, want_visible)
+    torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+
+
+@requires_cuda_sm80
+@pytest.mark.parametrize("rows", [1, 96])
+def test_scores_match_a_torch_reference_across_launch_shapes(rows):
+    """One row does not fill the device and takes the deeper staging shape;
+    many rows take the wider one."""
+    q, k_cache, table, t2r, pos, lens = _scores_case(rows=rows, pages=8)
+    divisor = q.shape[2] ** 0.5
+    columns = table.shape[1] * k_cache.shape[1]
+    got, got_visible = flashinfer.sparse_paged_scores(
+        q, k_cache, table, t2r, pos, lens, 1, divisor
+    )
+    want, want_visible = _reference(
+        q, k_cache, table, t2r, pos, lens, 1, divisor, columns
+    )
+    torch.testing.assert_close(got_visible, want_visible)
+    torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+
+
+@requires_cuda_sm80
+def test_scores_leave_an_unmapped_page_unselectable():
+    q, k_cache, table, t2r, pos, lens = _scores_case()
+    table = table.clone()
+    table[0, 1] = -1
+    divisor = q.shape[2] ** 0.5
+    columns = table.shape[1] * k_cache.shape[1]
+    got, _ = flashinfer.sparse_paged_scores(
+        q, k_cache, table, t2r, pos, lens, 1, divisor
+    )
+    want, _ = _reference(q, k_cache, table, t2r, pos, lens, 1, divisor, columns)
+    torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+    page_size = k_cache.shape[1]
+    assert torch.isinf(got[:, page_size : 2 * page_size]).all()
+
+
+@requires_cuda_sm80
+def test_scores_empty_a_row_whose_request_is_invalid():
+    q, k_cache, table, t2r, pos, lens = _scores_case()
+    t2r = t2r.clone()
+    t2r[0] = -1
+    divisor = q.shape[2] ** 0.5
+    got, got_visible = flashinfer.sparse_paged_scores(
+        q, k_cache, table, t2r, pos, lens, 1, divisor
+    )
+    assert int(got_visible[0]) == 0
+
+
+@requires_cuda_sm80
+def test_scores_stop_at_num_columns():
+    """A width narrower than the query can see caps both the logits and the
+    count the caller bounds its top-k by."""
+    q, k_cache, table, t2r, pos, lens = _scores_case()
+    divisor = q.shape[2] ** 0.5
+    narrow = 8
+    got, got_visible = flashinfer.sparse_paged_scores(
+        q, k_cache, table, t2r, pos, lens, 1, divisor, num_columns=narrow
+    )
+    want, want_visible = _reference(
+        q, k_cache, table, t2r, pos, lens, 1, divisor, narrow
+    )
+    assert got.shape[1] == narrow
+    assert int(got_visible.max()) <= narrow
+    torch.testing.assert_close(got_visible, want_visible)
+    torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+
+
+@requires_cuda_sm80
+def test_scores_reject_a_logits_width_that_contradicts_num_columns():
+    """The kernel takes the width from the tensor it writes, so a wider logits
+    would score more than was asked for and report a count past it."""
+    q, k_cache, table, t2r, pos, lens = _scores_case()
+    logits = torch.empty(q.shape[0], 12, dtype=torch.float32, device=DEV)
+    with pytest.raises(ValueError, match="columns wide"):
+        flashinfer.sparse_paged_scores(
+            q,
+            k_cache,
+            table,
+            t2r,
+            pos,
+            lens,
+            1,
+            q.shape[2] ** 0.5,
+            num_columns=8,
+            logits=logits,
+        )
