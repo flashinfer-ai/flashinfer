@@ -424,7 +424,14 @@ class JitSpecNvcc(JitSpec):
             FileLock(self.lock_path, thread_local=False) if need_lock else nullcontext()
         )
         with lock:
+            is_cold_build = not self.jit_library_path.exists()
             self.write_ninja()
+            if is_cold_build:
+                logger.info_once(
+                    "Building JIT module %s; this can take several minutes on "
+                    "first use.",
+                    self.name,
+                )
             run_ninja(self.build_dir, self.ninja_path, verbose)
 
     def load(self, so_path: Optional[Path] = None):

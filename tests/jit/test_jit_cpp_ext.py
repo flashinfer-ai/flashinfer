@@ -139,11 +139,10 @@ def test_run_ninja_uses_max_jobs(monkeypatch, tmp_path):
     ]
 
 
-def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
-    writes = []
-    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
-
-    spec = core.JitSpecNvcc(
+@pytest.fixture
+def jit_spec_nvcc(monkeypatch, tmp_path):
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    return core.JitSpecNvcc(
         name="test_module",
         sources=[],
         extra_cflags=None,
@@ -152,12 +151,67 @@ def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
         extra_include_dirs=None,
     )
 
+
+def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch, jit_spec_nvcc):
+    writes = []
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+
+    spec = jit_spec_nvcc
     monkeypatch.setattr(spec, "write_ninja", lambda: writes.append(True))
     monkeypatch.setattr(core, "run_ninja", lambda *_args, **_kwargs: None)
 
     spec.build(verbose=False, need_lock=False)
 
     assert writes == [True]
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_jit_spec_build_logs_only_for_cold_cache(monkeypatch, jit_spec_nvcc, cached):
+    events = []
+    monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+
+    spec = jit_spec_nvcc
+    if cached:
+        spec.jit_library_path.parent.mkdir(parents=True)
+        spec.jit_library_path.touch()
+    monkeypatch.setattr(spec, "write_ninja", lambda: None)
+    monkeypatch.setattr(
+        core, "run_ninja", lambda *_args, **_kwargs: events.append("run_ninja")
+    )
+    monkeypatch.setattr(
+        core.logger,
+        "info_once",
+        lambda message, *args: events.append(message % args),
+    )
+
+    spec.build(verbose=False, need_lock=False)
+
+    expected = ["run_ninja"]
+    if not cached:
+        expected.insert(
+            0,
+            "Building JIT module test_module; this can take several minutes on "
+            "first use.",
+        )
+    assert events == expected
+
+
+def test_jit_spec_aot_cache_hit_does_not_log_jit_build(
+    monkeypatch, tmp_path, jit_spec_nvcc
+):
+    logs = []
+    cached_module = object()
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_AOT_DIR", tmp_path)
+
+    spec = jit_spec_nvcc
+    spec.aot_path.parent.mkdir(parents=True)
+    spec.aot_path.touch()
+
+    monkeypatch.setattr(spec, "load", lambda _path=None: cached_module)
+    monkeypatch.setattr(core.logger, "info_once", logs.append)
+
+    assert spec.build_and_load() is cached_module
+    assert logs == []
 
 
 @pytest.mark.parametrize("is_aot", [False, True])
