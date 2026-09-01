@@ -176,17 +176,23 @@ def test_scores_match_a_torch_reference_across_launch_shapes(rows):
 
 @requires_cuda_sm80
 def test_scores_agree_between_a_block_per_tile_and_a_block_per_eight():
-    """Enough blocks to fill the device switches the launch from one column
-    tile per block to eight, which stages a feature slice at a time and runs the
-    copies for the next tile while the current one multiplies. A single row can
-    never fill the device, so scoring the rows one at a time takes the other
-    shape; the two have to agree column for column.
+    """Several waves of blocks switch the launch from one column tile per block
+    to eight, which stages a feature slice at a time and runs the copies for the
+    next tile while the current one multiplies. A single row is one wave at
+    most, so scoring the rows one at a time takes the other shape; the two have
+    to agree column for column.
+
+    The row count is taken from the device so the two sides really do land on
+    opposite sides of the switch: the kernel turns over at four waves, and a
+    block never holds more than 32 warps, so eight rows per SM is past it on any
+    part.
 
     The reference the single-tile shape is checked against is the torch one
-    above; this pins the pipelined shape to it without paying for a 64x512
-    python loop.
+    above; this pins the pipelined shape to it without paying for a python loop
+    over every column of every row.
     """
-    rows, pages = 64, 64
+    pages = 64
+    rows = 8 * torch.cuda.get_device_properties(DEV).multi_processor_count
     q, k_cache, table, t2r, pos, lens = _scores_case(rows=rows, pages=pages)
     divisor = q.shape[2] ** 0.5
     columns = table.shape[1] * k_cache.shape[1]
