@@ -34,7 +34,7 @@ from .cpp_ext import get_cuda_path, get_nvcc_parallelism_flags
 GDNCPArch = Literal["sm_100a", "sm_103a"]
 
 _EXPORT_SCHEMA = "flashinfer-pr4078-sm100-cp-prefill-standalone-export-v3"
-_MANIFEST_SHA256 = "3a47563e0e998108c8259c911af134b451ebb97569133a14434c55da30d737a9"
+_MANIFEST_SHA256 = "e135528a76362c3189246195016284bd8df96f037e1a1f2bffa3eeecf594ad4b"
 _BASELINE_REVISION = "6cb2e70995d92edbc443b1bfc317ecacac907640"
 _FOCUS_CONTRACT = (
     150,
