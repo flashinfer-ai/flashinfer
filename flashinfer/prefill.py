@@ -4340,25 +4340,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     f"where total_tokens = qo_indptr[-1]."
                 )
 
-        if self._backend == "cute-dsl-prims":
-            if args:
-                raise NotImplementedError(
-                    "backend='cute-dsl-prims' does not accept custom run arguments"
-                )
-            if getattr(self, "_sinks", None) is not None:
-                raise NotImplementedError(
-                    "attention sinks were set on the wrapper (_sinks) but "
-                    "backend='cute-dsl-prims' does not support attention sinks"
-                )
-            if kv_cache_sf is not None:
-                raise NotImplementedError(
-                    "backend='cute-dsl-prims' does not support NVFP4 kv_cache_sf"
-                )
-            if o_scale is not None:
-                raise NotImplementedError(
-                    "backend='cute-dsl-prims' does not support o_scale"
-                )
-
         window_left = self._window_left
         logits_soft_cap = self._logits_soft_cap
         sm_scale = self._sm_scale
@@ -4425,6 +4406,23 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
         if self._backend == "cute-dsl-prims":
             assert self._prims_backend is not None
+            if args:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not accept custom run arguments"
+                )
+            if getattr(self, "_sinks", None) is not None:
+                raise NotImplementedError(
+                    "attention sinks were set on the wrapper (_sinks) but "
+                    "backend='cute-dsl-prims' does not support attention sinks"
+                )
+            if kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support NVFP4 kv_cache_sf"
+                )
+            if o_scale is not None:
+                raise NotImplementedError(
+                    "backend='cute-dsl-prims' does not support o_scale"
+                )
             self._prims_backend.run_ragged(
                 q,
                 k,
