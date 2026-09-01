@@ -336,6 +336,7 @@ from .sparse_route import qsa_route_from_logical as qsa_route_from_logical
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
 )
+from .sparse_scores import sparse_paged_scores as sparse_paged_scores
 from .trtllm_low_latency_gemm import (
     prepare_low_latency_gemm_weights as prepare_low_latency_gemm_weights,
 )
