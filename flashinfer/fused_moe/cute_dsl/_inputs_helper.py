@@ -35,7 +35,7 @@ Without this hook, fi's autotune profile uses random expert assignments
 Reference: ports trt-llm's GroupedGemmInputsHelper.generate_num_tokens_per_expert
 and generate_token_selected_experts from
 tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py (lines 31-167) and the
-``inputs_pre_hook`` mechanism from CuteDslFusedMoENvfp4InputsHelper in
+``inputs_pre_hook`` mechanism from the CuteDSL fused-MoE runner in
 tensorrt_llm/_torch/modules/fused_moe/fused_moe_cute_dsl.py.
 """
 
