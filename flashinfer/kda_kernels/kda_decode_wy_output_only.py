@@ -44,7 +44,8 @@ Math (per (batch, value-head); state S is [V, K], per-channel decay on K):
 
   verify caches (emit mode; the RecoverSSM commit-kernel inputs):
                U      = Tmat @ (V - khat @ S0^T)  # row t = beta_t (v_t - u_t)
-               kg_t   = (k_t | raw g_t)           # normalized key | raw gate
+               kg_t   = (k_t | raw g_t)           # RAW key | raw gate (vLLM
+                                                  # caches the unnormalized k)
 
 In emit mode the kernel additionally writes these per-token caches
 (slot-indexed; fp32 U, bf16 kg) for a downstream commit/recovery kernel: U
@@ -214,7 +215,9 @@ class KdaDecodeWyOutputOnlyKernel:
         self._null_min = int(null_min)
         if self._dropin:
             self._emit = True
-            self._beta_is_logit = True
+            # beta_is_logit is NOT forced here: the vLLM contract uses beta
+            # logits (wrapper default), but the unified recurrent_kda frozen
+            # mode also routes pre-sigmoided betas through this path.
             self._n_valid = 16  # runtime seq_len masks replace native-T
 
     @cute.jit

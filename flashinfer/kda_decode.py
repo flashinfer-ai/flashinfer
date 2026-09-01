@@ -188,8 +188,9 @@ def recurrent_kda(
             sequence's length and null slots are left untouched.
         kg_cache (Optional[torch.Tensor]):
             Only with ``disable_state_update=True``. Slot-indexed bf16 buffer
-            ``[num_slots, HV, T_max, 2*K]`` receiving the L2-normalized key in
-            ``[..., :K]`` and the raw gate in ``[..., K:]`` per token.
+            ``[num_slots, HV, T_max, 2*K]`` receiving the raw (unnormalized) key
+            in ``[..., :K]`` and the raw gate in ``[..., K:]`` per token,
+            matching the vLLM RecoverSSM cache convention.
         backend (Literal["cute-dsl", "cake", "auto"]):
             Implementation backend. ``"cute-dsl"`` preserves the existing
             FlashInfer implementation. ``"cake"`` strictly selects an
@@ -559,6 +560,13 @@ def _run_frozen_recurrent_kda(
 
     # Packed frozen verify (and every cache-requesting call): slot-indexed
     # caches, ragged lengths, null slots.
+    if q.shape[-2] != v.shape[-2]:
+        raise NotImplementedError(
+            "GQA (HV != H) is not supported by the packed frozen-verify path "
+            "(correction/kg caches or cu_seqlens inputs) yet — the underlying "
+            "vLLM RecoverSSM contract is equal-head (Kimi K3). Use the "
+            "batched [B, T, ...] form without caches for GQA."
+        )
     device = q.device
     if cu_seqlens is None:
         # Uniform batched form: build the trivial cu_seqlens and flatten to

@@ -213,7 +213,7 @@ def recurrent_kda(
             Frozen-verify only: slot-indexed float32 per-token delta-rule
             corrections ``[num_slots, HV, T_max, V]``.
         kg_cache (Optional[torch.Tensor]):
-            Frozen-verify only: slot-indexed bf16 (normalized key | raw gate)
+            Frozen-verify only: slot-indexed bf16 (raw key | raw gate)
             cache ``[num_slots, HV, T_max, 2*K]``.
         seq_order (Optional[torch.Tensor]):
             Optional packed-prefill sequence order, as a contiguous CUDA int32

@@ -640,3 +640,50 @@ def test_frozen_mode_shape_validation():
             initial_state_indices=idx[:1],
             disable_state_update=True,
         )
+
+
+def test_frozen_mode_caches_presigmoided_beta():
+    """Regression: the packed verify path must honor beta_is_logit=False
+    (a leftover vLLM-contract override used to force the in-kernel sigmoid,
+    double-sigmoiding pre-sigmoided betas)."""
+    from flashinfer import recurrent_kda
+
+    B, T, H, HV = 2, 4, 2, 2
+    q, k, v, _, _, h0, idx, _, _ = _make_inputs(B, T, H, HV, seed=11)
+    g_log = F.logsigmoid(
+        torch.randn(B, T, HV, 128, dtype=torch.float32, device=q.device)
+    ).to(torch.bfloat16)
+    beta = torch.rand(B, T, HV, device=q.device).to(torch.bfloat16)  # pre-sigmoided
+    corr = torch.full((B + 2, HV, T, 128), 7.0, dtype=torch.float32, device=q.device)
+    kg = torch.full((B + 2, HV, T, 256), 7.0, dtype=torch.bfloat16, device=q.device)
+    out, _ = recurrent_kda(
+        q,
+        k,
+        v,
+        g_log,
+        beta,
+        initial_state_source=h0,
+        initial_state_indices=idx,
+        disable_state_update=True,
+        correction_cache=corr,
+        kg_cache=kg,
+    )
+    scale = 128**-0.5
+    o_ref, U_ref = ref_corrections(
+        l2n(q).float(),
+        l2n(k).float(),
+        v,
+        g_log.float(),
+        beta.float(),
+        h0,
+        idx,
+        scale,
+    )
+    torch.testing.assert_close(out.float(), o_ref, atol=2e-2, rtol=1e-2)
+    got_U = corr[idx.long()].permute(0, 2, 1, 3)
+    torch.testing.assert_close(got_U, U_ref, atol=6e-2, rtol=2e-2)
+    # verify contract stores the RAW key (vLLM convention)
+    kraw = k.float().repeat_interleave(HV // H, dim=2)
+    torch.testing.assert_close(
+        kg[idx.long(), :, :, :128].permute(0, 2, 1, 3).float(), kraw
+    )

@@ -105,7 +105,7 @@ to 16 tokens per sequence from a read-only committed-state pool and never
 writes state back — the speculative-decode verify path, mirroring GDN's
 ``gated_delta_rule_mtp(disable_state_update=True)``. Optional slot-indexed
 ``correction_cache`` (float32 per-token delta-rule corrections,
-``[num_slots, HV, T_max, V]``) and ``kg_cache`` (normalized key | raw gate,
+``[num_slots, HV, T_max, V]``) and ``kg_cache`` (raw key | raw gate,
 ``[num_slots, HV, T_max, 2K]``) out-params feed a downstream commit/recovery
 kernel, paralleling GDN's slot-indexed ``intermediate_states_buffer``. The
 mode accepts the batched ``[B, T, ...]`` form and the packed ``cu_seqlens``
