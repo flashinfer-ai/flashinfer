@@ -104,6 +104,10 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
   TVM_FFI_ICHECK_EQ(state_slots.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(compressed_slots.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(logical_positions.size(0), num_tokens);
+  // Both are walked by a token stride, so a shorter axis is read past its end.
+  TVM_FFI_ICHECK_EQ(k.size(0), num_tokens) << "one raw key per token";
+  TVM_FFI_ICHECK_EQ(positions.size(positions.ndim() - 1), num_tokens)
+      << "one rotary position per token";
   // A work item names a request and the kernel reads that request's end, so the
   // table has to run one past the last of them.
   TVM_FFI_ICHECK_EQ(query_start_loc.size(0), state_block_table.size(0) + 1)
