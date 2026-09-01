@@ -235,6 +235,8 @@ class KdaDecodeWyOutputOnlyKernel:
         """Build the state TMA atom and launch one CTA per (batch, head)."""
         op = MmaF16BF16Op(cutlass.BFloat16, cutlass.Float32, (16, 8, 16))
         tiled_mma = cute.make_tiled_mma(op)
+        # Batch size (grid extent: one CTA column per sequence) — NOT the
+        # state-pool size; see the pool comment below.
         B_val = gH0idx.layout.shape[0]
         # State TMA: rebuild the pool layout with STATIC inner strides
         # (blocks are dense [HV, V, K]) and a RUNTIME block stride — real
@@ -244,6 +246,11 @@ class KdaDecodeWyOutputOnlyKernel:
         # (V, K, HV, pool) so the per-CTA tile is (V_DIM_C, K_HALF); the
         # trailing (HV, pool) modes survive tma_partition as outer coords.
         _h0_blk = cute.assume(s_h0_blk, divby=8)  # 16 B alignment (bf16)
+        # gH0.layout.shape[0] is the state-pool SLOT COUNT (the TMA
+        # descriptor's outer extent) — not B_val: slot indices >= B are legal,
+        # so substituting the batch size would shrink the TMA box and corrupt
+        # loads for high slots. Both extents are runtime-dynamic (mode-0
+        # shape-dynamic descriptors); no constexpr is at stake.
         gH0_dense = cute.make_tensor(
             gH0.iterator,
             cute.make_layout(
@@ -2066,19 +2073,56 @@ def kda_wy_output_only(
         Q/K L2 normalization is always applied in-kernel (eps 1e-6), matching
         ``recurrent_kda(use_qk_l2norm_in_kernel=True)``.
     """
-    assert q.dtype == torch.bfloat16, "q must be bf16"
-    assert initial_state_source.dtype == torch.bfloat16, (
-        "initial_state_source must be bf16 (pool, HV, V, K)"
-    )
+    if q.ndim != 4:
+        raise ValueError(f"q must be [B, T, H, K]; got {tuple(q.shape)}")
     B, T_in, H, K_dim = q.shape
+    if v.ndim != 4 or v.shape[:2] != (B, T_in):
+        raise ValueError(f"v must be [B={B}, T={T_in}, HV, V]; got {tuple(v.shape)}")
     HV = v.shape[2]
     V_dim = v.shape[3]
     device = q.device
+    # Cross-tensor agreement: wrong shapes here would flow into hand-computed
+    # cp.async offsets (out-of-bounds reads), so fail loudly instead.
+    if k.shape != q.shape:
+        raise ValueError(f"k must match q {tuple(q.shape)}; got {tuple(k.shape)}")
+    if g.shape != (B, T_in, HV, K_dim):
+        raise ValueError(
+            f"g must be [B={B}, T={T_in}, HV={HV}, K={K_dim}]; got {tuple(g.shape)}"
+        )
+    if beta.shape != (B, T_in, HV):
+        raise ValueError(
+            f"beta must be [B={B}, T={T_in}, HV={HV}]; got {tuple(beta.shape)}"
+        )
+    for name, t_ in (("q", q), ("k", k), ("v", v), ("g", g), ("beta", beta)):
+        if t_.dtype != torch.bfloat16:
+            raise ValueError(f"{name} must be bf16; got {t_.dtype}")
+        if t_.device != device:
+            raise ValueError(f"{name} must be on {device}; got {t_.device}")
+    if initial_state_source.dtype != torch.bfloat16:
+        raise ValueError("initial_state_source must be bf16 (pool, HV, V, K)")
+    if initial_state_source.ndim != 4 or initial_state_source.shape[1:] != (
+        HV,
+        V_dim,
+        K_dim,
+    ):
+        raise ValueError(
+            f"initial_state_source must be [pool, HV={HV}, V={V_dim}, "
+            f"K={K_dim}]; got {tuple(initial_state_source.shape)}"
+        )
+    if initial_state_source.device != device:
+        raise ValueError("initial_state_source must be on the inputs' device")
+    if initial_state_indices is not None and (
+        initial_state_indices.ndim != 1 or initial_state_indices.shape[0] != B
+    ):
+        raise ValueError(
+            f"initial_state_indices must be [B={B}]; "
+            f"got {tuple(initial_state_indices.shape)}"
+        )
     assert K_dim == K_DIM and V_dim == V_DIM_C, (
         f"this kernel requires K==V=={K_DIM}; got K={K_dim}, V={V_dim}"
     )
     assert 1 <= T_in <= T, f"T must be in [1, {T}]; got {T_in}"
-    assert HV % H == 0, f"HV ({HV}) must be a multiple of H ({H})"
+    assert H >= 1 and HV % H == 0, f"HV ({HV}) must be a multiple of H ({H})"
 
     if scale is None:
         scale = 1.0 / math.sqrt(K_dim)
@@ -2432,6 +2476,26 @@ def kda_recoverssm_verify(
         raise ValueError("KDA RecoverSSM output shape is incompatible")
     if out.stride()[2:] != (value_dim, 1):
         raise ValueError("KDA RecoverSSM output heads must be contiguous")
+    if out.dtype != v.dtype:
+        raise ValueError("KDA RecoverSSM output must match the activation dtype")
+    if any(t.dtype != torch.bfloat16 for t in (q, k, v, raw_g, raw_beta)):
+        raise ValueError("KDA RecoverSSM activations must be bf16")
+    if any(
+        t.device != q.device
+        for t in (
+            k,
+            v,
+            raw_g,
+            raw_beta,
+            checkpoint_state,
+            correction_cache,
+            kg_cache,
+            query_start_loc,
+            state_indices,
+            out,
+        )
+    ):
+        raise ValueError("KDA RecoverSSM tensors must share one device")
     if total_tokens == 0:
         return out
 

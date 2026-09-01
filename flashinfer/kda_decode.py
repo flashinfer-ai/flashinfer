@@ -584,6 +584,11 @@ def _run_frozen_recurrent_kda(
                 "correction_cache/kg_cache; for a plain frozen decode pass "
                 "batched [B, T, ...] tensors instead"
             )
+        if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
+            raise ValueError(
+                f"cu_seqlens must be 1-D with at least 2 entries; "
+                f"got {tuple(cu_seqlens.shape)}"
+            )
         B = cu_seqlens.shape[0] - 1
         qp, kp, vp, gp, bp, outp, qsl = q, k, v, g, beta, output, cu_seqlens
         if num_spec_tokens is not None:
@@ -598,6 +603,10 @@ def _run_frozen_recurrent_kda(
         reshape_out = None
     if slots is None:
         slots = _frozen_arange(device, B)
+    elif slots.ndim != 1 or slots.shape[0] != B:
+        raise ValueError(
+            f"state slot indices must be [B={B}]; got {tuple(slots.shape)}"
+        )
     if want_caches:
         corr_t, kg_t = correction_cache, kg_cache
     else:

@@ -598,3 +598,45 @@ def test_frozen_mode_public_api_errors():
         )
     with pytest.raises(ValueError):  # a state pool is required
         recurrent_kda(q, k, v, g_log, beta, disable_state_update=True)
+
+
+def test_frozen_mode_shape_validation():
+    """Mis-shaped cross-tensor inputs raise instead of reading out of bounds."""
+    from flashinfer import recurrent_kda
+
+    B, T, H, HV = 2, 4, 2, 2
+    q, k, v, _, beta, h0, idx, _, _ = _make_inputs(B, T, H, HV, seed=9)
+    g = torch.zeros(B, T, HV, 128, dtype=torch.bfloat16, device=q.device)
+    ok = dict(
+        initial_state_source=h0, initial_state_indices=idx, disable_state_update=True
+    )
+    with pytest.raises(ValueError):  # k shape mismatch
+        recurrent_kda(q, k[:, :, :, :64], v, g, beta, **ok)
+    with pytest.raises(ValueError):  # gate head-count mismatch
+        recurrent_kda(q, k, v, g[:, :, :1], beta, **ok)
+    with pytest.raises(ValueError):  # beta token-count mismatch
+        recurrent_kda(q, k, v, g, beta[:, :2], **ok)
+    with pytest.raises(ValueError):  # wrong dtype
+        recurrent_kda(q, k, v.float(), g, beta, **ok)
+    with pytest.raises(ValueError):  # state pool inner dims
+        recurrent_kda(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state_source=h0[:, :, :64],
+            initial_state_indices=idx,
+            disable_state_update=True,
+        )
+    with pytest.raises(ValueError):  # slot indices wrong length
+        recurrent_kda(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state_source=h0,
+            initial_state_indices=idx[:1],
+            disable_state_update=True,
+        )
