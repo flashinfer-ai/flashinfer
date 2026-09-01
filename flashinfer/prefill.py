@@ -1906,6 +1906,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         block_size: Optional[int] = None,
         q_offsets_buf: Optional[torch.Tensor] = None,
         kv_offsets_buf: Optional[torch.Tensor] = None,
+        variant_owns_mask: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -1987,11 +1988,30 @@ class BatchPrefillWithPagedKVCacheWrapper:
             offsets. Required when both CUDA Graph mode and
             :attr:`block_extend` are enabled; its dtype must match the indptr
             dtype.
+        variant_owns_mask : bool
+            If ``True``, the attention variant supplied through ``jit_args`` computes the
+            complete attention mask in its ``LogitsMask`` hook, and :attr:`MaskMode.CUSTOM`
+            is selected without a mask tensor: the kernel evaluates ``LogitsMask`` on every
+            KV tile instead of only on the causal/window boundary tiles, and no
+            ``custom_mask``/``packed_custom_mask`` needs to be passed to :meth:`plan`.
+            Requires ``jit_args``, because the default attention variant dereferences the
+            custom mask buffer under :attr:`MaskMode.CUSTOM`. Only supported with
+            ``backend="fa2"`` (the SM90 batch prefill kernels reject
+            :attr:`MaskMode.CUSTOM`), and incompatible with ``prefix_len_ptr``
+            (multi-item scoring), which selects a different mask mode.
+            Defaults to ``False``.
         """
         _check_workspace_buffer_alignment(
             float_workspace_buffer, "float_workspace_buffer"
         )
         _check_kv_layout(kv_layout)
+
+        if variant_owns_mask and backend != "fa2":
+            raise ValueError(
+                "variant_owns_mask is only supported on the fa2 backend: the "
+                "SM90 (fa3) batch prefill kernels return cudaErrorNotSupported "
+                "under MaskMode.CUSTOM."
+            )
 
         self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
@@ -2042,6 +2062,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._jit_module = None
             self._jit_additional_tensor_names = []
             self._jit_additional_scalar_names = []
+
+        if variant_owns_mask and self._jit_module is None:
+            raise ValueError(
+                "variant_owns_mask requires a custom JIT module (jit_args): the "
+                "default attention variant dereferences the custom mask buffer "
+                "under MaskMode.CUSTOM."
+            )
+        self._variant_owns_mask = variant_owns_mask
 
         self._kv_layout = kv_layout
         if backend == "cudnn":
@@ -2663,6 +2691,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 bitorder="little",
             )
 
+        if prefix_len_ptr is not None and self._variant_owns_mask:
+            raise ValueError(
+                "prefix_len_ptr (multi-item scoring) selects "
+                "MaskMode.MULTIITEMSCORING, which overrides the MaskMode.CUSTOM "
+                "required by variant_owns_mask; the two are incompatible."
+            )
         self._prefix_len_ptr = prefix_len_ptr
         self._token_pos_in_items_ptr = token_pos_in_items_ptr
         self._token_pos_in_items_len = token_pos_in_items_len
@@ -3430,7 +3464,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 key_block_scales = key_block_scales.transpose(-3, -2).contiguous()
                 value_block_scales = value_block_scales.transpose(-3, -2).contiguous()
 
-        if self._custom_mask_buf is not None:
+        if self._custom_mask_buf is not None or self._variant_owns_mask:
             mask_mode = MaskMode.CUSTOM.value
         elif self._block_extend:
             mask_mode = MaskMode.BLOCK_EXTEND.value
@@ -3764,6 +3798,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         block_size: Optional[int] = None,
         q_offsets_buf: Optional[torch.Tensor] = None,
         kv_offsets_buf: Optional[torch.Tensor] = None,
+        variant_owns_mask: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithRaggedKVCacheWrapper`.
 
@@ -3863,6 +3898,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "jit_args/jit_kwargs cannot be combined with block_extend=True"
                 )
 
+        if variant_owns_mask and backend != "fa2":
+            raise ValueError(
+                "variant_owns_mask is only supported on the fa2 backend: the "
+                "SM90 (fa3) batch prefill kernels return cudaErrorNotSupported "
+                "under MaskMode.CUSTOM."
+            )
         if jit_args is not None and backend != "cute-dsl":
             if jit_kwargs is None:
                 jit_kwargs = {}
@@ -3875,6 +3916,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         else:
             self._jit_module = None
             self._jit_additional_tensor_names = []
+
+        if variant_owns_mask and self._jit_module is None:
+            raise ValueError(
+                "variant_owns_mask requires a custom JIT module (jit_args): the "
+                "default attention variant dereferences the custom mask buffer "
+                "under MaskMode.CUSTOM."
+            )
+        self._variant_owns_mask = variant_owns_mask
 
         self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
@@ -4281,6 +4330,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     ),
                 )
 
+        if prefix_len_ptr is not None and self._variant_owns_mask:
+            raise ValueError(
+                "prefix_len_ptr (multi-item scoring) selects "
+                "MaskMode.MULTIITEMSCORING, which overrides the MaskMode.CUSTOM "
+                "required by variant_owns_mask; the two are incompatible."
+        )
         self._prefix_len_ptr = prefix_len_ptr
         self._token_pos_in_items_ptr = token_pos_in_items_ptr
         self._token_pos_in_items_len = token_pos_in_items_len
@@ -4397,10 +4452,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 # for CUDA-graph mode, single normalized copy otherwise.
                 q_lens = self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
                 k_lens = self._kv_indptr_buf[1:] - self._kv_indptr_buf[:-1]
+                # Snapshot host-side seq-lens at plan time so run() can pass
+                # them into trtllm_ragged_attention_deepseek without touching
+                # the device during CUDA graph capture (see issue #4609).
+                q_lens_cpu = q_lens.to(torch.int32).cpu()
+                k_lens_cpu = k_lens.to(torch.int32).cpu()
                 self._cute_dsl_fmha_plan = {
                     "qo_indptr": self._qo_indptr_buf,
                     "kv_indptr": self._kv_indptr_buf,
                     "seq_lens": k_lens.to(torch.int32),
+                    "q_seq_lens_cpu": q_lens_cpu,
+                    "kv_seq_lens_cpu": k_lens_cpu,
                     "batch_size": qo_indptr.shape[0] - 1,
                     "max_q_len": int(q_lens.max().item()),
                     "max_kv_len": int(k_lens.max().item()),
@@ -4921,6 +4983,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     out=out,
                     lse=lse,
                     backend="cute-dsl",
+                    q_seq_lens_cpu=p["q_seq_lens_cpu"],
+                    kv_seq_lens_cpu=p["kv_seq_lens_cpu"],
                 )
             # Modular CuTe DSL backend does not support scale parameters.
             if any(s is not None for s in (q_scale, k_scale, v_scale, o_scale)):
@@ -5000,7 +5064,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             k = k.to(torch.float16)
             v = v.to(torch.float16)
 
-        if self._custom_mask_buf is not None:
+        if self._custom_mask_buf is not None or self._variant_owns_mask:
             mask_mode = MaskMode.CUSTOM.value
         elif self._block_extend:
             mask_mode = MaskMode.BLOCK_EXTEND.value
@@ -5575,10 +5639,15 @@ def trtllm_ragged_attention_deepseek(
     q_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row query lengths. When provided
         together with ``kv_seq_lens_cpu``, the Python wrapper can keep the
-        all-active ragged fast path asynchronous while still compacting empty-KV
-        rows. If omitted, the wrapper derives lengths from the device indptrs
-        and may synchronize to preserve correctness for direct callers.
-        Currently only consulted by the ``trtllm-gen`` backend.
+        all-active ragged fast path asynchronous while still compacting empty
+        rows (either ``q_len == 0`` or ``kv_len == 0``). If omitted, the
+        wrapper derives lengths from the device indptrs and may synchronize
+        to preserve correctness for direct callers. Under CUDA graph capture,
+        this device-side detection would require an illegal ``.item()``
+        readback, so both mirrors must be provided; without them the wrapper
+        cannot tell whether any row has ``q_len == 0`` or ``kv_len == 0`` and
+        will refuse to launch. Currently only consulted by the ``trtllm-gen``
+        backend.
     kv_seq_lens_cpu : Optional[torch.Tensor]
         Optional trusted CPU mirror of the per-row KV lengths. Currently only
         consulted by the ``trtllm-gen`` backend.
@@ -5780,6 +5849,13 @@ def trtllm_ragged_attention_deepseek(
                 has_inactive_rows = True
                 has_active_rows = bool(active_rows_cpu.any().item())
         else:
+            # An active row requires q_len > 0 AND kv_len > 0; detecting
+            # either kind of empty row from device indptrs needs an
+            # ``.item()`` readback, which is illegal during CUDA graph
+            # capture. Callers who want compaction inside a captured region
+            # must pass q_seq_lens_cpu / kv_seq_lens_cpu; without them the
+            # wrapper cannot tell whether any row is empty and refuses to
+            # launch rather than risk an undefined empty-row kernel path.
             if (
                 query.is_cuda
                 and hasattr(torch.cuda, "is_current_stream_capturing")
@@ -5787,7 +5863,8 @@ def trtllm_ragged_attention_deepseek(
             ):
                 raise ValueError(
                     "q_seq_lens_cpu and kv_seq_lens_cpu must be provided during "
-                    "CUDA graph capture"
+                    "CUDA graph capture so empty rows (q_len == 0 or "
+                    "kv_len == 0) can be detected without a device sync"
                 )
             q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
             kv_lens = cum_seq_lens_kv[1:] - cum_seq_lens_kv[:-1]
