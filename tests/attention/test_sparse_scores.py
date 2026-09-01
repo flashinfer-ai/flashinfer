@@ -191,7 +191,7 @@ def test_scores_empty_a_row_whose_request_is_invalid():
     t2r = t2r.clone()
     t2r[0] = -1
     divisor = q.shape[2] ** 0.5
-    got, got_visible = flashinfer.sparse_paged_scores(
+    _, got_visible = flashinfer.sparse_paged_scores(
         q, k_cache, table, t2r, pos, lens, 1, divisor
     )
     assert int(got_visible[0]) == 0
