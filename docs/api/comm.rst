@@ -183,11 +183,47 @@ shape, dtype or call order hang rather than raise. One workspace serves one
 CUDA stream; use :meth:`~PcieIpcAllReduceWorkspace.rebind_stream` after
 ordering the two if a move is genuinely needed.
 
+Two data planes
+~~~~~~~~~~~~~~~
+
+Above roughly a megabyte the workspace can move the payload with the copy
+engines instead of with SM load/store. The reason is not that the copy engine
+is faster per hop — in isolation the two are comparable — but that it keeps
+its throughput when every rank transfers at once, where SM peer traffic loses
+bandwidth to the concurrency. So the gap widens with world size, which is what
+makes a second plane worth having at these payload sizes.
+
+It is a second protocol rather than a flag on the existing kernels. The SM path
+encodes readiness in the payload — ``+0.0`` means "not yet written" — which a
+copy engine can neither produce nor observe, so the ring synchronises through
+monotonic flags on side streams instead. Nothing about the SM kernels changes.
+
+Both planes are ordinary tuner candidates, so nothing needs to be declared at
+the call site and there is no notion of a prefill or decode "phase": the
+configuration follows the payload in bytes.
+:class:`PcieIpcVariant` gains ``COPY_ENGINE_RING``, a flat neighbour ring, and
+``COPY_ENGINE_ISLAND``, a 4+4 decomposition offered only at world size 8 and
+only on ``rootcplx-noswitch``, where a ring's two socket-crossing hops would
+otherwise set the pace. On that variant ``blocks`` carries the ring's sub-chunk
+depth rather than a grid size.
+
+.. warning::
+
+    Tuning covers the batch sizes it is given, and shapes above the largest one
+    are served by whatever was measured there. Leave ``tune_batches`` unset and
+    the ladder is derived from ``max_numel``, which covers everything the
+    workspace admits; pass it explicitly and the top of the range is yours to
+    get right. :meth:`~PcieIpcAllReduceWorkspace.tune` warns when an explicit
+    list leaves a gap, and refuses to persist results measured below the
+    default sample counts, since a table that is quietly wrong is worse than
+    one that is missing.
+
 .. autosummary::
     :toctree: ../generated
 
     PcieIpcAllReduceWorkspace
     PcieIpcLaunchConfig
+    PcieIpcVariant
     get_pcie_ipc_launch_config
     probe_pcie_ipc_rank_topology
     resolve_pcie_ipc_profile

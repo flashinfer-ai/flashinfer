@@ -52,6 +52,7 @@ from ..autotuner import (
     TuningConfig,
     make_bucket_mapper,
 )
+from .pcie_ipc_topology import PROFILE_ROOTCPLX
 from .pcie_ipc_policy import (
     MAX_BLOCKS,
     IpcLaunchConfig,
@@ -67,7 +68,7 @@ PCIE_IPC_CUSTOM_OP = "flashinfer::pcie_ipc_all_reduce"
 # candidate encoding changes. The autotuner's own metadata records library and
 # driver versions but nothing about this op, and a dev checkout does not move
 # the FlashInfer version.
-PCIE_IPC_TUNE_VERSION = 1
+PCIE_IPC_TUNE_VERSION = 3
 
 # Not all powers of two: the extra entries are block counts the search selected
 # on real hardware, and it cannot converge on a configuration its own grid
@@ -94,29 +95,76 @@ TABLE_TACTIC = -1
 INIT_MAX_VALUE = 16
 
 
+# Above this payload the grid is narrowed before profiling. The screen is a
+# *policy* -- "not worth measuring here" -- not a capability claim, so it lives
+# here and not in `_is_launchable`: an explicit `config=` naming a screened-out
+# configuration must still run. The grid was sized for decode, where measuring
+# every candidate is free; at prefill sizes the cost is dominated by candidates
+# orders of magnitude off the winner, each still paying full warmup and repeat.
+#
+# Only the thread count is screened. A block-count bound was tried and removed:
+# the block counts that win span the whole grid, so a bound fitted to one fabric
+# silently drops another fabric's winner -- tuning faster and running slower,
+# with no error. The thread floor stays because it sits below every winner a
+# search has picked, with margin rather than fitted to them; guarded by
+# `test_the_prefill_screen_keeps_every_measured_prefill_winner`.
+PREFILL_SCREEN_BYTES = 4 * 1024 * 1024
+PREFILL_MIN_THREADS = 256
+
+
 def candidate_tactics(
     world_size: int,
     max_blocks: int = MAX_BLOCKS,
     blocks: Tuple[int, ...] = TUNE_BLOCKS,
     threads: Tuple[int, ...] = TUNE_THREADS,
+    numel: Optional[int] = None,
+    elem_size: int = 2,
+    profile: Optional[str] = None,
 ) -> Tuple[Tuple[int, int, int], ...]:
-    """Every launch configuration the dispatch can reach, as tactics.
+    """Every launch configuration worth profiling for this shape, as tactics.
 
     A pure function of group-identical arguments, so every rank derives the
     same list in the same order -- which the autotuner's collective profiling
-    requires and cannot check.
+    requires and cannot check. `numel` is group-identical too: every rank
+    profiles the same shape.
+
+    `numel=None` means "which configurations can exist at all", not "which are
+    worth measuring here", and returns the unscreened grid.
     """
-    return _candidate_tactics_cached(world_size, max_blocks, blocks, threads)
+    return _candidate_tactics_cached(
+        world_size, max_blocks, blocks, threads, numel, elem_size, profile
+    )
 
 
 @lru_cache(maxsize=None)
-def _candidate_tactics_cached(world_size, max_blocks, blocks, threads):
+def _candidate_tactics_cached(
+    world_size, max_blocks, blocks, threads, numel, elem_size, profile
+):
+    screen = numel is not None and numel * elem_size >= PREFILL_SCREEN_BYTES
     out = []
     for variant in IpcVariant:
+        # The island schedule's 4+4 grouping describes one topology, and on
+        # fabrics it does not describe it measured worse than the flat ring and
+        # the SM path it competes with, so leaving it reachable is worse than
+        # not having it. `profile=None` means the caller is asking which
+        # configurations can exist rather than which to measure here, and does
+        # not filter.
+        if (
+            variant == IpcVariant.COPY_ENGINE_ISLAND
+            and profile is not None
+            and profile != PROFILE_ROOTCPLX
+        ):
+            continue
         for b in blocks:
             for t in threads:
+                if screen and t < PREFILL_MIN_THREADS:
+                    continue
                 if _is_launchable(
-                    world_size, IpcLaunchConfig(b, t, variant), max_blocks
+                    world_size,
+                    IpcLaunchConfig(b, t, variant),
+                    max_blocks,
+                    numel,
+                    elem_size,
                 ):
                     out.append((int(variant), b, t))
     return tuple(out)
@@ -308,6 +356,49 @@ def pack_config(config: IpcLaunchConfig) -> int:
     )
 
 
+# How many candidates the ranking pass keeps. A fixed count, not a "within Nx of
+# the best" rule: a threshold makes the number of survivors a function of
+# measured floats, and ranks whose lists come out different lengths do not pick
+# different kernels, they deadlock in the autotuner's per-tactic timing
+# reduction. The pass only has to cut the tail, and the count is generous
+# because the cost of being wrong is asymmetric -- too many survivors costs
+# tuning time, too few loses a configuration the search can then never choose.
+TUNE_SURVIVORS = 48
+
+# Rounds of the ranking pass. One round separates a hopeless candidate from a
+# contender but not the contenders from each other, and that matters: with a
+# single sample the *set* of survivors is itself a random variable, so the
+# fine-ranking sees a different candidate set each run and the final choice
+# moves with it. The extra rounds cost a small fraction of the launches the
+# survivors then get.
+#
+# The score is the minimum over the rounds, then MAX-reduced across ranks.
+# Minimum because what is estimated is how fast the configuration can go, and a
+# sample is only ever inflated -- by a neighbour, a clock excursion, a queued
+# launch -- never deflated. MAX because every rank has to truncate to the same
+# list: ranks returning different numbers of tactics deadlock in a kernel that
+# spins with no timeout. No number of rounds settles a choice between candidates
+# that differ by less than the capture domain resolves; those remedies -- pinned
+# clocks, a larger repeat, a longer capture window for small shapes -- live
+# outside get_valid_tactics.
+TUNE_RANK_ROUNDS = 3
+
+
+def reduce_timings(times: "torch.Tensor", group) -> "torch.Tensor":
+    """Make every rank rank the candidates identically.
+
+    ``MAX`` because a collective costs what its slowest rank costs; a mean would
+    also make the ranks agree, but it would agree on a number no rank observed.
+
+    Agreement is the load-bearing part, not the statistic: the truncated list
+    this feeds decides how many times each rank enters the profiler, and the
+    autotuner's timing reduction has no check for that. TUNE_SURVIVORS says
+    what a rank that truncates to a different length costs the group.
+    """
+    dist.all_reduce(times, op=dist.ReduceOp.MAX, group=group)
+    return times
+
+
 def reduce_verdict(wrong: "torch.Tensor", group) -> "torch.Tensor":
     """Make every rank agree on which candidates computed the wrong answer.
 
@@ -325,6 +416,62 @@ def reduce_verdict(wrong: "torch.Tensor", group) -> "torch.Tensor":
     """
     dist.all_reduce(wrong, op=dist.ReduceOp.MAX, group=group)
     return wrong
+
+
+MAX_GENERATED_BUCKETS = 14
+
+
+def generate_tune_batches(
+    hidden: int, max_numel: int, elem_size: int = 2
+) -> Tuple[int, ...]:
+    """A bucket ladder covering everything the workspace admits at this hidden.
+
+    The default ``TUNE_BATCHES`` stops far below the payload a prefill-sized
+    ``max_numel`` admits, so every large shape would be served by a measurement
+    taken at a much smaller one -- and the configuration does change with the
+    payload, the sub-chunk depth chosen at the bottom is not the one that wins
+    at the top. Nothing warned, because ``tune_batches`` and ``max_numel`` are
+    independent constructor arguments and only one of them is visible at the
+    ``tune()`` call.
+
+    So the ladder is derived from ``max_numel`` rather than fixed. Shape:
+
+    * dense at the bottom, where the winning kernel genuinely moves from bucket
+      to bucket;
+    * dense again through the crossover, where the decision is which *data
+      plane* to use and getting it wrong is the expensive mistake;
+    * sparse above it -- geometric, so the count stays bounded -- where the
+      bandwidth curve is flat, but not absent: the sub-chunk depth still moves
+      across the largest payloads.
+
+    ``MAX_GENERATED_BUCKETS`` caps the result, so an unexpectedly large
+    ``max_numel`` cannot turn tuning into an all-night job. The bottom is
+    thinned first: the decode end is the cheap end to measure, and the one with
+    the most redundancy once the winner has settled.
+    """
+    # No rounding of `top` itself: the whole-pack constraint is on
+    # ``batch * hidden``, not on the batch count, and it is already enforced by
+    # _admits. Rounding here to a multiple of the pack size sent every
+    # workspace whose largest batch is under eight to an empty ladder.
+    top = int(max_numel) // int(hidden)
+    if top < 1:
+        return ()
+
+    ladder = [1, 2, 4, 8, 16, 32, 64, 128]
+    b = 256
+    while b < top:
+        ladder.append(b)
+        b *= 4
+    ladder.append(top)
+
+    seen = sorted({b for b in ladder if 1 <= b <= top})
+    if len(seen) > MAX_GENERATED_BUCKETS:
+        head, tail = (
+            seen[: len(seen) - MAX_GENERATED_BUCKETS],
+            seen[-MAX_GENERATED_BUCKETS:],
+        )
+        seen = [head[0]] + tail if head else tail
+    return tuple(seen)
 
 
 def tuned_batches_for(
@@ -453,21 +600,55 @@ class PcieIpcAllReduceRunner(TunableRunner):
             warn_no_tune_group(stacklevel=3)
             return [TABLE_TACTIC]
 
-        tactics = candidate_tactics(ws.world_size, ws.max_blocks)
+        tactics = candidate_tactics(
+            ws.world_size,
+            ws.max_blocks,
+            numel=inp.numel(),
+            elem_size=inp.element_size(),
+            profile=ws.profile,
+        )
         configs = [table_config] + [tactic_to_config(t) for t in tactics]
 
         ref = inp.clone()
         dist.all_reduce(ref, group=ws.group)
         out = self._output_for(inp)
         wrong = torch.zeros(len(configs), dtype=torch.int32, device=inp.device)
+        # Allocated before the loop, like every other buffer here: the loop body
+        # must not allocate. Timing the launches costs nothing extra: this pass
+        # already runs every candidate once.
+        starts = [
+            [torch.cuda.Event(enable_timing=True) for _ in configs]
+            for _ in range(TUNE_RANK_ROUNDS)
+        ]
+        ends = [
+            [torch.cuda.Event(enable_timing=True) for _ in configs]
+            for _ in range(TUNE_RANK_ROUNDS)
+        ]
+
+        # One launch per distinct variant first. The first launch of a kernel
+        # loads its module, which shows up as an order-of-magnitude outlier and
+        # would demote whichever candidate happened to be that variant's first.
+        # Per variant, not per candidate: block and thread counts do not pull in
+        # a new module.
+        seen_variants = set()
+        for config in configs:
+            if config.variant not in seen_variants:
+                seen_variants.add(config.variant)
+                ws._launch(inp, out, config)
 
         dist.barrier(group=ws.group)
-        for i, config in enumerate(configs):
-            # A kernel that leaves part of the payload unwritten would
-            # otherwise show the previous candidate's correct result.
-            out.fill_(float("nan"))
-            ws._launch(inp, out, config)
-            wrong[i] = torch.ne(out, ref).any()
+        for r in range(TUNE_RANK_ROUNDS):
+            for i, config in enumerate(configs):
+                # A kernel that leaves part of the payload unwritten would
+                # otherwise show the previous candidate's correct result.
+                out.fill_(float("nan"))
+                starts[r][i].record()
+                ws._launch(inp, out, config)
+                ends[r][i].record()
+                if r == 0:
+                    # Enqueued after the closing event: inside the span, the
+                    # ranking would be timing a full-payload compare too.
+                    wrong[i] = torch.ne(out, ref).any()
         reduce_verdict(wrong, ws.group)
 
         verdict = wrong.tolist()
@@ -481,8 +662,35 @@ class PcieIpcAllReduceRunner(TunableRunner):
                 f"{tuple(inp.shape)} ({table_config}) does not match a "
                 "reference all-reduce; refusing to tune on top of it"
             )
-        survivors = zip(tactics, verdict[1:], strict=True)
-        return [TABLE_TACTIC] + [t for t, bad in survivors if not bad]
+        # Reading the events synchronises with the device, which is why it
+        # happens here and not in the loop above.
+        torch.cuda.synchronize(inp.device)
+        times = torch.tensor(
+            [
+                min(
+                    starts[r][i].elapsed_time(ends[r][i])
+                    for r in range(TUNE_RANK_ROUNDS)
+                )
+                for i in range(len(configs))
+            ],
+            dtype=torch.float64,
+            device=inp.device,
+        )
+        reduce_timings(times, ws.group)
+        scores = times.tolist()
+
+        survivors = [
+            (t, scores[i + 1])
+            for i, (t, bad) in enumerate(zip(tactics, verdict[1:], strict=True))
+            if not bad
+        ]
+        # Sorted by measured time, tie-broken on the tactic itself so the order
+        # is a function of group-identical inputs alone.
+        survivors.sort(key=lambda ts: (ts[1], ts[0]))
+        kept = [t for t, _ in survivors[:TUNE_SURVIVORS]]
+        # The seed stays first: the autotuner breaks ties toward the earlier
+        # element, so this is what makes an exact tie resolve to it.
+        return [TABLE_TACTIC] + kept
 
     def forward(
         self, inputs, tactic=TABLE_TACTIC, do_preparation: bool = False, **kwargs
