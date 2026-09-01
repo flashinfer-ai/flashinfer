@@ -2496,6 +2496,8 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
             m, n, k, l, ab_dtype, c_dtype, a_major, b_major, c_major
         ):
             can_implement = False
+        if c_major == "n" and not use_tma_store and n % 64 != 0:
+            can_implement = False
         return can_implement
 
     # Helper function for append and coalesce layout
@@ -2597,6 +2599,21 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
             c_tensor = cute.make_tensor(
                 mC.iterator,
                 layout=cute.make_ordered_layout((m, n, l), order=(0, 1, 2)),
+            )
+        elif cutlass.const_expr(not self.use_tma_store):
+            c_n = cute.assume(n, divby=64)
+            c_ptr = cute.make_ptr(
+                mC.element_type,
+                mC.iterator.toint(),
+                cute.AddressSpace.gmem,
+                assumed_align=32,
+            )
+            c_tensor = cute.make_tensor(
+                c_ptr,
+                layout=cute.make_ordered_layout(
+                    (m, c_n, l),
+                    order=(1, 0, 2),
+                ),
             )
         else:
             c_tensor = cute.make_tensor(
