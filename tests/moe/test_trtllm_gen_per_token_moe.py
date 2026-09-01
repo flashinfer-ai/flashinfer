@@ -276,6 +276,7 @@ def test_routed_fused_moe(
             cache_permute_indices,
             w2[i].view(torch.uint8),
             epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
         )
         w2_shuffled.append(
             w2[i].view(torch.uint8)[permute_indices.to(device)].contiguous()
@@ -285,6 +286,7 @@ def test_routed_fused_moe(
             w2_scale[i].view(torch.uint8),
             epilogue_tile_m,
             num_elts_per_sf=16,
+            is_gated_act_gemm=is_gated,
         )
         w2_scale_shuffled.append(
             block_scale_interleave(
