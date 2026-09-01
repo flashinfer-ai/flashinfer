@@ -3993,7 +3993,7 @@ def _validate_dsv4_sparse_mla_samples(
         max_abs_error = max(
             max_abs_error, float((actual - expected).abs().max().item())
         )
-        torch.testing.assert_close(actual, expected, rtol=1e-1, atol=1e-1)
+        torch.testing.assert_close(actual, expected, rtol=1e-2, atol=1e-2)
     return len(sample_rows), max_abs_error
 
 
