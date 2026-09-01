@@ -79,6 +79,26 @@ __device__ __forceinline__ void ldmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 }
 
 /*!
+ * \brief Wrapper of PTX ldmatrix m8n8.x2 instruction, loads data from shared memory
+ *   to fragment. This is the operand an m16n8k16 multiply takes, and the lanes
+ *   address it exactly as they do the first half of the x4 form.
+ * \tparam T data type of the fragment
+ * \param R pointer to the fragment
+ * \param smem_ptr pointer to the shared memory
+ */
+template <typename T>
+__device__ __forceinline__ void ldmatrix_m8n8x2(uint32_t* R, T* smem_ptr) {
+#ifdef FLASHINFER_LDMATRIX_M8N8X4_ENABLED
+  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+               : "=r"(R[0]), "=r"(R[1])
+               : "r"(smem_int_ptr));
+#else
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for ldmatrix instruction");
+#endif
+}
+
+/*!
  * \brief Wrapper of PTX ldmatrix m8n8.x4 instruction, loads data from shared memory
  *   to fragment
  * \tparam T data type of the fragment
@@ -302,6 +322,53 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_f8f8f32(float* C, uin
 #else
   FLASHINFER_RUNTIME_ASSERT(
       "fp8 mma instruction is only available for sm89, PTX 8.4+ and CUDA 12.4+");
+#endif
+}
+
+/*!
+ * \brief Wrapper of a single mma m16n8k16 instruction for row major and column major f16
+ *   matrix multiplication, accumulated in f32. Use this rather than the n16 form
+ *   when the operand really is eight columns wide: the n16 form is two of these,
+ *   and the second one would multiply padding.
+ * \tparam T data type of the fragment
+ * \tparam mma_mode whether we are initializing the accumulator or updating it
+ * \param C pointer to the accumulator
+ * \param A pointer to the fragment of matrix A
+ * \param B pointer to the fragment of matrix B
+ */
+template <typename T, MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m16n8k16_row_col_f16f16f32(float* C, uint32_t* A,
+                                                                    uint32_t* B) {
+#if defined(FLASHINFER_MMA_F16F16F32_M16N8K16_ENABLED)
+  if constexpr (std::is_same_v<T, half>) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5,  %6,  %7},"
+        "{%8,  %9},"
+        "{%10, %11, %12, %13};\n"
+        : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]),
+          "f"(mma_mode == MMAMode::kInit ? 0.f : C[0]),
+          "f"(mma_mode == MMAMode::kInit ? 0.f : C[1]),
+          "f"(mma_mode == MMAMode::kInit ? 0.f : C[2]),
+          "f"(mma_mode == MMAMode::kInit ? 0.f : C[3]));
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,  %1,  %2,  %3},"
+        "{%4,  %5,  %6,  %7},"
+        "{%8,  %9},"
+        "{%10, %11, %12, %13};\n"
+        : "=f"(C[0]), "=f"(C[1]), "=f"(C[2]), "=f"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]), "r"(B[0]), "r"(B[1]),
+          "f"(mma_mode == MMAMode::kInit ? 0.f : C[0]),
+          "f"(mma_mode == MMAMode::kInit ? 0.f : C[1]),
+          "f"(mma_mode == MMAMode::kInit ? 0.f : C[2]),
+          "f"(mma_mode == MMAMode::kInit ? 0.f : C[3]));
+  }
+#else
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
 #endif
 }
 
