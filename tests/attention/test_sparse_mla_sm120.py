@@ -1110,6 +1110,7 @@ _DSV4_PREFILL_DUAL_CONFIGS = [
     for extra_topk, extra_pbs in [(128, 64), (512, 64), (512, 2)]
 ] + [
     (32, 512, 512, 64),
+    (64, 512, 512, 64),
 ]
 
 

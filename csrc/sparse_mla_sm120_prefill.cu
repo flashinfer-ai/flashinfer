@@ -375,6 +375,10 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
     DISPATCH_DUAL_MG_CM(BF16, 32, 512, 64, 2);
     return true;
   }
+  if (num_heads == 64 && topk == 512 && topk_extra == 512 && extra_page_block_size == 64) {
+    DISPATCH_DUAL_MG_CM(BF16, 64, 512, 64, 2);
+    return true;
+  }
 
 #define DISPATCH_BY_NH_PBSX(PBSX)                     \
   do {                                                \
