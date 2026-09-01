@@ -24,7 +24,7 @@ import functools
 import re
 import warnings
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -664,6 +664,71 @@ class UlyssesCommunicator:
         # Native storage is sized at max_elems; hand back the view this call
         # requested.
         return tensor.narrow(0, 0, int(torch.Size(shape).numel())).view(shape)
+
+    @flashinfer_api
+    def input_buffer(self, out: torch.Tensor, shape: Sequence[int]) -> torch.Tensor:
+        r"""The transport's own input staging buffer behind a registered output.
+
+        The RDMA routes never let the NIC read caller memory: every operand is
+        copied into a landing buffer registered once alongside ``out``. Building
+        the operand directly in the buffer returned here removes that copy --
+        for a layer-scale scatter it is the largest device-to-device move on the
+        path -- and the caller's own source allocation with it.
+
+        The result must reach :meth:`scatter_heads` or :meth:`gather_heads`
+        unmodified: the fast path is exact pointer identity, and a slice or a
+        re-view that moves the base pointer is rejected rather than silently
+        staged, because on the scatter path the NIC reads the landing buffer
+        whatever the caller passes.
+
+        Parameters
+        ----------
+        out : torch.Tensor
+            An output returned by :meth:`allocate_output`.
+        shape : Sequence[int]
+            The ``[B, S, H, D]`` operand shape to view the buffer as.
+
+        Returns
+        -------
+        torch.Tensor
+            A view of transport-owned memory in the dtype ``out`` was registered
+            under. It stays alive as long as ``out`` does, and every exchange on
+            ``out`` overwrites it -- it is where the next operand is built, not
+            where one is kept.
+        """
+        self._require_open("input_buffer")
+        if self.backend != "pcie" or self.world_size == 1:
+            raise ValueError(
+                "input_buffer exists only on the multi-rank pcie backend; other "
+                "backends and the world-size-one identity read the operand in place"
+            )
+        if self.transport not in _PCIE_RDMA_TRANSPORTS:
+            raise ValueError(
+                f"the {self.transport} PCIe route has no landing buffer: it reads "
+                "the caller's operand in place, so there is no copy to remove"
+            )
+        if not isinstance(out, torch.Tensor):
+            raise TypeError(f"input_buffer expects a torch.Tensor, got {type(out).__name__}")
+        if out.data_ptr() not in self._pcie_outputs:
+            raise ValueError(
+                "input_buffer expects an output returned by allocate_output; the "
+                "landing buffer is registered per output, not per communicator"
+            )
+        shape = tuple(int(s) for s in shape)
+        if len(shape) != 4:
+            raise ValueError(f"input_buffer expects a 4-D [B, S, H, D] shape, got {shape}")
+        if any(s <= 0 for s in shape):
+            raise ValueError(f"input_buffer shape dims must all be positive, got {shape}")
+        module = get_ulysses_pcie_module()
+        landing = module.input_landing(self._pcie, out)
+        numel = int(torch.Size(shape).numel())
+        if numel > landing.numel():
+            raise ValueError(
+                f"input_buffer shape {shape} needs {numel} elements of "
+                f"{landing.element_size()} bytes, over the {landing.numel()} this "
+                f"slot was registered for"
+            )
+        return landing.narrow(0, 0, numel).view(shape)
 
     def _output_geometry(self, x: torch.Tensor, op: str) -> Tuple[Tuple[int, ...], int]:
         """Output shape and native mode for one layout transform.
@@ -1510,6 +1575,10 @@ def get_ulysses_pcie_module():
     def connect_output(handle: int, output: torch.Tensor, metadata: List[int]) -> None:
         module.connect_ulysses_pcie_output(handle, output, metadata)
 
+    @register_custom_op("flashinfer::ulysses_pcie_input_landing", mutates_args=[])
+    def input_landing(handle: int, output: torch.Tensor) -> torch.Tensor:
+        return module.ulysses_pcie_input_landing(handle, output)
+
     @register_custom_op("flashinfer::ulysses_pcie_exchange", mutates_args=["output"])
     def exchange(
         handle: int,
@@ -1548,6 +1617,7 @@ def get_ulysses_pcie_module():
         connect=connect,
         allocate_output=allocate_output,
         connect_output=connect_output,
+        input_landing=input_landing,
         exchange=exchange,
         teardown_safe=teardown_safe,
         disconnect_output_ptr=disconnect_output_ptr,

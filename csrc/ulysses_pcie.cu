@@ -242,6 +242,24 @@ void connect_ulysses_pcie_output(fptr_t handle, TensorView output, Array<int64_t
   buffer->imports_closed = false;
 }
 
+// The transport-owned input staging buffer behind one registered output.
+//
+// Handed out flat at capacity, like the output storage itself, so the caller
+// views it per call. It stays alive as long as the output is registered: the
+// buffer owns it through a refcounted Tensor, and this only adds a reference.
+Tensor ulysses_pcie_input_landing(fptr_t handle, TensorView output) {
+  auto* transport = fi::AsTransport(handle);
+  ffi::CUDADeviceGuard device_guard(transport->device);
+  transport->EnsureHealthy();
+  TVM_FFI_ICHECK(transport->use_rdma)
+      << "only the RDMA PCIe Ulysses routes stage input through a landing buffer; "
+         "the all-P2P route reads the caller's operand in place already";
+  auto* buffer = FindBuffer(transport, output);
+  TVM_FFI_ICHECK(buffer->landing_owner != nullptr && buffer->input_landing != nullptr)
+      << "this PCIe Ulysses output has no registered input landing buffer";
+  return *buffer->landing_owner;
+}
+
 void ulysses_pcie_exchange(fptr_t handle, TensorView input, TensorView output, int64_t mode,
                            int64_t batch, int64_t seq, int64_t heads, int64_t dim) {
   auto* transport = fi::AsTransport(handle);
@@ -434,6 +452,7 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(init_ulysses_pcie, init_ulysses_pcie);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(connect_ulysses_pcie, connect_ulysses_pcie);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(allocate_ulysses_pcie_output, allocate_ulysses_pcie_output);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(connect_ulysses_pcie_output, connect_ulysses_pcie_output);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_pcie_input_landing, ulysses_pcie_input_landing);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_pcie_exchange, ulysses_pcie_exchange);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(ulysses_pcie_teardown_safe, ulysses_pcie_teardown_safe);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(disconnect_ulysses_pcie_output_ptr,
