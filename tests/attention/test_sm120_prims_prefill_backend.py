@@ -212,6 +212,57 @@ def test_cuda_graph_reads_updated_caller_block_table():
     torch.testing.assert_close(eager, torch.full_like(eager, -1))
 
 
+def test_cuda_graph_rejects_uncompiled_specialization():
+    device, i32 = "cuda", torch.int32
+    workspace = torch.empty(16 << 20, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace,
+        "HND",
+        backend="cute-dsl-prims",
+        use_cuda_graph=True,
+        qo_indptr_buf=torch.empty(2, dtype=i32, device=device),
+        paged_kv_indptr_buf=torch.empty(2, dtype=i32, device=device),
+        paged_kv_indices_buf=torch.empty(1, dtype=i32, device=device),
+        paged_kv_last_page_len_buf=torch.empty(1, dtype=i32, device=device),
+    )
+
+    hq, hkv, head_dim, page_size = 2, 1, 32, 16
+    q = _fp8((1, hq, head_dim))
+    cache = _fp8((1, 2, hkv, page_size, head_dim))
+    indptr = torch.tensor([0, 1], dtype=i32, device=device)
+    page_indices = torch.tensor([0], dtype=i32, device=device)
+    last_page_len = torch.tensor([1], dtype=i32, device=device)
+    wrapper.plan(
+        indptr,
+        indptr,
+        page_indices,
+        last_page_len,
+        hq,
+        hkv,
+        head_dim,
+        page_size,
+        q_data_type=q.dtype,
+        kv_data_type=cache.dtype,
+        o_data_type=torch.float16,
+    )
+
+    out = torch.empty((1, hq, head_dim), dtype=torch.float16, device=device)
+    lse = torch.empty((1, hq), dtype=torch.float32, device=device)
+    graph = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="was not compiled before CUDA Graph capture"),
+        torch.cuda.graph(graph),
+    ):
+        out.zero_()
+        wrapper.run_return_lse(
+            q,
+            cache,
+            out=out,
+            lse=lse,
+            enable_pdl=False,
+        )
+
+
 def test_prims_fail_fast_for_unsupported_options():
     workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
     indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
