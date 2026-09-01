@@ -118,14 +118,17 @@ from .fused_moe import (
 # CuteDSL high-level APIs (conditionally if cute_dsl available)
 with contextlib.suppress(ImportError):
     from .fused_moe import (
+        cute_dsl_fused_moe as cute_dsl_fused_moe,
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
-        CuteDslMoEWrapper as CuteDslMoEWrapper,
         cute_dsl_fused_moe_mxfp8_mxfp4 as cute_dsl_fused_moe_mxfp8_mxfp4,
         CuteDslMxfp8Mxfp4MoEWrapper as CuteDslMxfp8Mxfp4MoEWrapper,
+        CuteDslMoEWrapper as CuteDslMoEWrapper,
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+
+
 # The fused GDN decode step is surfaced here like the other GDN APIs; the
 # code lives under flashinfer/gdn_kernels/experimental/ (see its README),
 # but "experimental" describes the file location, not the import path.

@@ -11,19 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-CuteDSL-based Fused MoE Kernels for NVFP4 and MXFP8 x MXFP4.
-"""
+"""CuteDSL-based Fused MoE Kernels for block-scaled FP4 compute."""
 
-from ...cute_dsl.utils import is_cute_dsl_available
+from ...cute_dsl.availability import is_cute_dsl_available
 
 # Conditionally import CuTe-DSL kernels
 if is_cute_dsl_available():
+    from . import fused_moe as _fused_moe
     from .fused_moe import (
-        cute_dsl_fused_moe_nvfp4,
+        cute_dsl_fused_moe,
         CuteDslMoEWrapper,
     )
-    from .fused_moe_mxfp8_mxfp4 import (
+    from .fused_moe import (
+        cute_dsl_fused_moe_nvfp4,
         cute_dsl_fused_moe_mxfp8_mxfp4,
         CuteDslMxfp8Mxfp4MoEWrapper,
     )
@@ -32,14 +32,16 @@ if is_cute_dsl_available():
         B12xMoEWrapper,
     )
 
+
 __all__ = [
     "is_cute_dsl_available",
 ]
 
 if is_cute_dsl_available():
     __all__ += [
-        "cute_dsl_fused_moe_nvfp4",
+        "cute_dsl_fused_moe",
         "CuteDslMoEWrapper",
+        "cute_dsl_fused_moe_nvfp4",
         "cute_dsl_fused_moe_mxfp8_mxfp4",
         "CuteDslMxfp8Mxfp4MoEWrapper",
         "b12x_fused_moe",
