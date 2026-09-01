@@ -51,6 +51,43 @@ class QuantMode(IntEnum):
     FP8_PER_CHANNEL = 9
 
 
+def compute_reference_moe(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    activation_type: ActivationType,
+) -> torch.Tensor:
+    """Torch reference for pre-routed BF16-activation MoE execution."""
+    num_tokens, hidden_size = hidden_states.shape
+    intermediate_size = w2.shape[2]
+    result = torch.zeros(
+        num_tokens, hidden_size, dtype=torch.float32, device=hidden_states.device
+    )
+    # Large-model tests may configure hundreds of experts while routing only a
+    # few; avoid launching one ``where`` kernel per inactive expert.
+    for expert_id in torch.unique(topk_ids).tolist():
+        token_ids, slots = torch.where(topk_ids == expert_id)
+        gemm1 = (hidden_states[token_ids].float() @ w1[expert_id].float().T).to(
+            torch.bfloat16
+        )
+        if activation_type is ActivationType.Swiglu:
+            up, gate = gemm1.split(intermediate_size, dim=-1)
+            intermediate = (F.silu(gate.float()) * up.float()).to(torch.bfloat16)
+        elif activation_type is ActivationType.Relu2:
+            intermediate = F.relu(gemm1.float()).square().to(torch.bfloat16)
+        else:
+            raise ValueError(f"unsupported reference activation {activation_type!r}")
+        expert_output = (intermediate @ w2[expert_id].T).float()
+        result.index_add_(
+            0,
+            token_ids,
+            expert_output * topk_weights[token_ids, slots, None],
+        )
+    return result.to(torch.bfloat16)
+
+
 @contextmanager
 def nvfp4_4over6_env(use_4over6: bool):
     original_value = os.environ.get("FLASHINFER_NVFP4_4OVER6", None)

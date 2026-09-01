@@ -71,6 +71,17 @@ CUTLASS Fused MoE
 
     cutlass_fused_moe
 
+cuTile Fused MoE
+----------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    CuTileBf16Config
+    CuTileBf16Runner
+    CuTileNvfp4Config
+    CuTileNvfp4Runner
+
 TensorRT-LLM Fused MoE
 ----------------------
 
@@ -110,6 +121,7 @@ The CuteDSL backends are conditionally available when the
 .. autosummary::
     :toctree: ../generated
 
+    cute_dsl_fused_moe
     cute_dsl_fused_moe_nvfp4
     cute_dsl_fused_moe_mxfp8_mxfp4
     b12x_fused_moe

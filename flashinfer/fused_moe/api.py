@@ -404,6 +404,10 @@ _CUTLASS_BF16_ARCHS = (89, 90, 100, 103, 107, 110, 120, 121)
 # W4A16 uses Hopper-specific mixed-input weight and scale layouts.
 _CUTLASS_W4A16_ARCHS = (90,)
 
+_CUTILE_BF16_ARCHS = (89, 90, 120, 121)
+_CUTILE_NVFP4_ARCHS = (120, 121)
+_CUTILE_SUPPORTED_ACTIVATIONS = (ActivationType.Swiglu, ActivationType.Relu2)
+
 # NVFP4 CUTLASS fused MoE matches the flat-API skip: SM100/SM110/SM12x.
 # Major 10/11/12 covers SM100/103/107, SM110, and SM120/121.
 _CUTLASS_NVFP4_ARCHS = (100, 103, 107, 110, 120, 121)
@@ -739,6 +743,94 @@ class CutlassBf16Config:
 
     def __repr__(self) -> str:
         return "CutlassBf16Config()"
+
+
+@dataclass(frozen=True)
+class CuTileBf16Config:
+    """cuTile BF16 backend.
+
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_BF16_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_bf16,
+        w2_bf16,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        device=None,
+    ):
+        """Build the ``cutile_bf16`` weight view from canonical BF16 weights."""
+        from .prepare import prepare_cutile_bf16_weights
+
+        return prepare_cutile_bf16_weights(
+            w1_bf16,
+            w2_bf16,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=(activation or SwiGLU()).type,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CuTileBf16Config()"
+
+
+@dataclass(frozen=True)
+class CuTileNvfp4Config:
+    """cuTile NVFP4-weight x NVFP4-activation backend.
+
+    Expert parallelism and fused shared experts are not supported.
+    """
+
+    @classmethod
+    def supported(cls, arch: int) -> bool:
+        return arch in _CUTILE_NVFP4_ARCHS
+
+    @staticmethod
+    def prepare_weights(
+        w1_fp4,
+        w1_block_scale,
+        w1_global_scale,
+        w2_fp4,
+        w2_block_scale,
+        w2_global_scale,
+        *,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        activation: Optional[ActivationConfig] = None,
+        source_format: str = "modelopt",
+        device=None,
+    ):
+        """Build the ``cutile_nvfp4`` view from checkpoint NVFP4 weights."""
+        from .prepare import prepare_cutile_nvfp4_weights
+
+        return prepare_cutile_nvfp4_weights(
+            w1_fp4,
+            w1_block_scale,
+            w1_global_scale,
+            w2_fp4,
+            w2_block_scale,
+            w2_global_scale,
+            num_local_experts=num_local_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            activation_type=(activation or SwiGLU()).type,
+            source_format=source_format,
+            device=device,
+        )
+
+    def __repr__(self) -> str:
+        return "CuTileNvfp4Config()"
 
 
 @dataclass(frozen=True)
@@ -1113,7 +1205,7 @@ class CutlassHummingConfig:
 
 @dataclass(frozen=True)
 class CuteDslConfig:
-    """CuteDSL NVFP4 backend — SM100 family only (Blackwell SM100, SM103).
+    """CuteDSL FP4 backend for W4A4, W4A8, and W4A16.
 
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
     """
@@ -1128,22 +1220,23 @@ class CuteDslConfig:
         w1_bf16,
         w2_bf16,
         *,
+        variant: QuantVariant = QuantVariant.NVFP4,
         num_local_experts: int,
         hidden_size: int,
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
         device=None,
     ):
-        """Build the ``cute_dsl_nvfp4`` weight view from canonical bf16 weights.
+        """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
-        Register the result with ``MoEWeightPack.prepare_for("cute_dsl_nvfp4", ...)``.
-        See :func:`flashinfer.fused_moe.prepare.prepare_cute_dsl_nvfp4_weights`.
+        Register the result with ``MoEWeightPack.prepare_for("cute_dsl", ...)``.
         """
-        from .prepare import prepare_cute_dsl_nvfp4_weights
+        from .prepare import prepare_cute_dsl_weights
 
-        return prepare_cute_dsl_nvfp4_weights(
+        return prepare_cute_dsl_weights(
             w1_bf16,
             w2_bf16,
+            variant=variant,
             num_local_experts=num_local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -1247,6 +1340,8 @@ BackendConfigType = Union[
     TrtllmBf16Config,
     TrtllmMxInt4Config,
     CutlassBf16Config,
+    CuTileBf16Config,
+    CuTileNvfp4Config,
     CutlassW4A16Config,
     CutlassNvfp4Config,
     CutlassFp8PerTensorConfig,
@@ -1267,6 +1362,8 @@ ALL_BACKEND_CONFIGS = (
     TrtllmBf16Config,
     TrtllmMxInt4Config,
     CutlassBf16Config,
+    CuTileBf16Config,
+    CuTileNvfp4Config,
     CutlassW4A16Config,
     CutlassNvfp4Config,
     CutlassFp8PerTensorConfig,
