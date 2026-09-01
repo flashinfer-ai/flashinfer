@@ -5,6 +5,7 @@ This benchmark compares different implementations of the concat_mla_k operation:
 - torch: Native PyTorch implementation
 - torch_compiled: torch.compile optimized version
 - flashinfer: FlashInfer CUDA kernel
+- flashinfer_cake: Source-only SM103a backend when running on GB300
 
 Usage:
 $ python bench_concat_mla.py
@@ -64,6 +65,11 @@ def fn_flashinfer(k, k_nope, k_rope):
     concat_mla_k_flashinfer(k, k_nope, k_rope)
 
 
+def fn_flashinfer_cake(k, k_nope, k_rope):
+    """FlashInfer source-only SM103a backend."""
+    concat_mla_k_flashinfer(k, k_nope, k_rope, backend="cake")
+
+
 def execute_and_get_output(f, data):
     """Execute function and return output for correctness checking."""
     data["k"].zero_()
@@ -89,6 +95,11 @@ def verify_correctness():
             f"num_mismatches={torch.sum(abs_delta != 0).item()}"
         )
 
+    if torch.cuda.get_device_capability() == (10, 3):
+        output_cake = execute_and_get_output(fn_flashinfer_cake, data)
+        if not torch.equal(output_ref.view(torch.uint8), output_cake.view(torch.uint8)):
+            raise AssertionError("FlashInfer Cake output is not byte-exact")
+
     print("All implementations produce correct results!")
 
 
@@ -100,6 +111,8 @@ def benchmark():
         ("torch_compiled", fn_torch_compiled),
         ("flashinfer", fn_flashinfer),
     ]
+    if torch.cuda.get_device_capability() == (10, 3):
+        providers.append(("flashinfer_cake", fn_flashinfer_cake))
 
     # Warmup torch_compiled
     print("Warming up torch.compile...")
