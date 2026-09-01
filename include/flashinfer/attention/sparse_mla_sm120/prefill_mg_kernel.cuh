@@ -137,7 +137,7 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
             sm.kv_bufs[(ti + 1) & 1], idx_base + (ti + 1) * Cfg::BI, KV_cache,
             sm.mbar_kv + ((ti + 1) & 1), io_tid, stride_kv_block, kv_l2_policy);
       }
-      bar_sync_t<1, Cfg::BLOCK_THREADS>();
+      bar_sync_alt<1, 5, Cfg::BLOCK_THREADS>(ti & 1);
     }
 
     // ── Math warps ──────────────────────────────────────────────────
@@ -542,7 +542,7 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
                                          stride_kv_block, reinterpret_cast<bf16*>(sm.w_fp8));
       }
 
-      bar_arrive_t<1, Cfg::BLOCK_THREADS>();
+      bar_arrive_alt<1, 5, Cfg::BLOCK_THREADS>(ti & 1);
       if (ti + 1 < actual_ni) {
         const int next_phase = ((ti + 1) >> 1) & 1;
         mbarrier_wait_parity(sm.mbar_kv + ((ti + 1) & 1), next_phase);
@@ -802,7 +802,7 @@ __device__ __forceinline__ void prefill_mg_impl(
                                                            io_tid, stride_kv_block, kv_l2_policy);
           }
         }
-        bar_sync_t<1, BLOCK_THREADS>();
+        bar_sync_alt<1, 5, BLOCK_THREADS>(ti & 1);
       }
     } else {
       auto issue_tile = [&](int logical_ti, int buf) {
@@ -843,7 +843,7 @@ __device__ __forceinline__ void prefill_mg_impl(
         if (ti + 1 < loop_bound) {
           issue_tile(ti + 1, (ti + 1) & 1);
         }
-        bar_sync_t<1, BLOCK_THREADS>();
+        bar_sync_alt<1, 5, BLOCK_THREADS>(ti & 1);
       }
     }
 
@@ -1534,7 +1534,7 @@ __device__ __forceinline__ void prefill_mg_impl(
                                                        reinterpret_cast<bf16*>(sm.w_fp8()));
         }
       }
-      bar_arrive_t<1, BLOCK_THREADS>();
+      bar_arrive_alt<1, 5, BLOCK_THREADS>(ti & 1);
       if (ti + 1 < loop_bound) {
         const int next_phase = ((ti + 1) >> 1) & 1;
         mbarrier_wait_parity(sm.mbar_kv((ti + 1) & 1), next_phase);
