@@ -14,9 +14,9 @@
 
 """CUPTI benchmark for recurrent-KDA prefill public API shapes.
 
-The default case set combines the original H64/H96 coverage, six H12 shapes
-representing Kimi-K3's per-rank head count under TP8, and four fixed-layout
-small-BH shapes. ``--case-set production`` selects the 29-shape inference
+The default case set combines a ten-shape Kimi-K3 serving-oriented fixed-layout
+sweep, four additional fixed/packed rows from PR 4262, and four fixed-layout
+small-BH rows from PR 4571. ``--case-set production`` selects the 29-shape inference
 portfolio used to qualify the BT16 prepare/chain route, including fixed,
 packed, irregular-tail, high-sequence-count, and long-context cases.
 
@@ -158,21 +158,35 @@ LEGACY_CASES = (
 )
 
 H12_CASES = _load_h12_cases()
+SERVING_SWEEP_CASES = (
+    Case(f"h64_fixed_{seq_len}", 64, (seq_len,), False, 12000 + index)
+    for index, seq_len in enumerate((512, 1024, 2048, 4096, 8192))
+)
+SERVING_SWEEP_CASES = tuple(SERVING_SWEEP_CASES) + tuple(
+    Case(f"h96_fixed_{seq_len}", 96, (seq_len,), False, 12005 + index)
+    for index, seq_len in enumerate((512, 1024, 2048, 4096, 8192))
+)
+PR4262_ADDITIONAL_CASES = (
+    LEGACY_CASES[1],
+    LEGACY_CASES[2],
+    LEGACY_CASES[4],
+    LEGACY_CASES[5],
+)
 SMALL_BH_CASES = (
     Case("h8_fixed_65536", 8, (65536,), False, 11000),
     Case("h4_fixed_65536_holdout", 4, (65536,), False, 11001),
     Case("h1_fixed_131072", 1, (131072,), False, 11002),
     Case("h1_fixed_1048576", 1, (1048576,), False, 11003),
 )
-CASES = LEGACY_CASES + H12_CASES + SMALL_BH_CASES
+CASES = SERVING_SWEEP_CASES + PR4262_ADDITIONAL_CASES + SMALL_BH_CASES
 
-# Exact source groups used by the public comparison table:
+# Source groups used by the public comparison table:
 # https://github.com/flashinfer-ai/flashinfer/pull/4262
-# https://github.com/flashinfer-ai/flashinfer/pull/4445
 # https://github.com/flashinfer-ai/flashinfer/pull/4571
+# https://github.com/sgl-project/sglang/blob/c8b56b1f44d5c5370f47470ee490da3b04375e1c/python/sglang/srt/models/kimi_k3.py
 WORKLOAD_SOURCE_GROUPS = {
-    "flashinfer_pr_4262": LEGACY_CASES,
-    "flashinfer_pr_4445": H12_CASES,
+    "kimi_k3_serving_fixed_layout": SERVING_SWEEP_CASES,
+    "flashinfer_pr_4262_additional": PR4262_ADDITIONAL_CASES,
     "flashinfer_pr_4571": SMALL_BH_CASES,
 }
 
@@ -757,12 +771,20 @@ def main() -> None:
     parser.add_argument("--repeat-iters", type=int, default=100)
     parser.add_argument(
         "--case-set",
-        choices=("all", "legacy", "h12", "small_bh", "production"),
+        choices=(
+            "all",
+            "serving_sweep",
+            "legacy",
+            "h12",
+            "small_bh",
+            "production",
+        ),
         default="all",
         help=(
-            "Run all cases, the original H64/H96 cases, the Kimi-K3 TP8 H12 "
-            "cases, the fixed-layout small-BH cases, or the complete 29-shape "
-            "production portfolio."
+            "Run the 18-row comparison contract, its serving-oriented fixed-layout "
+            "sweep, the original H64/H96 cases, the Kimi-K3 TP8 H12 cases, the "
+            "fixed-layout small-BH cases, or the complete 29-shape production "
+            "portfolio."
         ),
     )
     parser.add_argument(
@@ -874,6 +896,7 @@ def main() -> None:
 
     selected_cases = {
         "all": CASES,
+        "serving_sweep": SERVING_SWEEP_CASES,
         "legacy": LEGACY_CASES,
         "h12": H12_CASES,
         "small_bh": SMALL_BH_CASES,
