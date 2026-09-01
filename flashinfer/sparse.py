@@ -784,9 +784,9 @@ class BlockSparseAttentionWrapper:
         kv_cache_page_size : int, optional
             Page size of a paged KV cache passed to :meth:`run` as raw pages,
             rather than as the gathered blocks the wrapper otherwise expects.
-            Read by the FA2 planner, so it is only supported for the ``auto``,
-            ``fa2`` and ``fa3`` backends and must be ``None`` for the
-            block-sparse ones, which plan without it.
+            Read by the FA2 planner, so it is only supported for the ``auto``
+            and ``fa2`` backends and must be ``None`` for every other, which
+            plan without it.
 
         The :meth:`plan` method should be called before any :meth:`run` or
         :meth:`run_return_lse` calls, auxiliary data structures will be created
@@ -806,11 +806,7 @@ class BlockSparseAttentionWrapper:
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         self._o_dtype = canonicalize_torch_dtype(o_data_type)
 
-        if kv_cache_page_size is not None and self._backend not in (
-            "auto",
-            "fa2",
-            "fa3",
-        ):
+        if kv_cache_page_size is not None and self._backend not in ("auto", "fa2"):
             raise ValueError(
                 "kv_cache_page_size is read by the FA2 planner and is not "
                 f"supported for backend={self._backend!r}"
@@ -1834,10 +1830,18 @@ class BlockSparseAttentionWrapper:
             # query does not have to be FP8 for that to apply: reading an FP8
             # cache with a higher-precision query is the common paged case, and
             # leaving these unset there drops the scale entirely.
+            # Length is the KV-head count, which plan() recorded: by this point
+            # k has either kept its 4D cache shape or been reshaped to
+            # (-1, C, heads, dim), so its second axis is a page size or a block
+            # width, and a shorter tensor is indexed past its end by kv_head.
             if scale_k is None:
-                scale_k = torch.ones(k.shape[1], dtype=torch.float32, device=q.device)
+                scale_k = torch.ones(
+                    self._num_kv_heads, dtype=torch.float32, device=q.device
+                )
             if scale_v is None:
-                scale_v = torch.ones(v.shape[1], dtype=torch.float32, device=q.device)
+                scale_v = torch.ones(
+                    self._num_kv_heads, dtype=torch.float32, device=q.device
+                )
 
         # The scalar only exists on an NVFP4 module, and only that module can
         # read a route of physical slots.
