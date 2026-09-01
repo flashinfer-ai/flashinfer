@@ -27,6 +27,9 @@ Exported:
 - run_fused_kda_decode: Fused Kimi K3 conv, recurrent KDA, and RMSNorm backend
 - run_packed_kda_decode: Packed Kimi K3 T=1 recurrent decode backend
 - run_kda_prefill_sm120: SM120a ordinary multi-token prefill backend
+- kda_delta_rule_mtp_ucache_flush: ReplaySSM spec-decode verify + ring append +
+  per-request state flush kernel (32-slot ring, caller-owned cursor commits;
+  the KDA analogue of gdn_kernels.gated_delta_rule_mtp_ucache_flush)
 """
 
 from typing import Optional
@@ -100,8 +103,16 @@ except (ImportError, RuntimeError) as _kda_sm120_error:  # pragma: no cover
     clear_kda_prefill_sm120_caches = None  # type: ignore
     run_kda_prefill_sm120 = None  # type: ignore
 
+# ReplaySSM ucache verify+flush kernel (CuTe DSL, SM90+, bf16-only). Optional
+# in the same way as the CuTe DSL decode backend above.
+try:
+    from .kda_decode_bf16_wy_ucache_flush import kda_delta_rule_mtp_ucache_flush
+except (ImportError, RuntimeError):
+    kda_delta_rule_mtp_ucache_flush = None  # type: ignore
+
 __all__ = [
     "can_implement_kda_prefill_sm120",
+    "kda_delta_rule_mtp_ucache_flush",
     "clear_kda_prefill_sm120_caches",
     "fused_kda_decode",
     "packed_kda_decode",
