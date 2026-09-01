@@ -1,14 +1,26 @@
 import math
+from importlib.metadata import PackageNotFoundError, version
 
 import pytest
 import torch
+from packaging.version import Version
 
 import flashinfer
 
 
+def _has_required_cutlass_dsl() -> bool:
+    try:
+        installed_version = version("nvidia-cutlass-dsl")
+    except PackageNotFoundError:
+        return False
+    return Version(installed_version) >= Version("4.7.0")
+
+
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
-    reason="requires SM120",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() != (12, 0)
+    or not _has_required_cutlass_dsl(),
+    reason="requires SM120 and nvidia-cutlass-dsl>=4.7.0",
 )
 
 
