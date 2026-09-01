@@ -2231,15 +2231,25 @@ def kda_wy_output_only(
         )
 
     # Batch-size dispatch: at small B * HV * T the WY kernel's fixed pipeline
-    # latency (~3.8 us) dominates and its grid (B * HV CTAs) cannot fill the
+    # latency (~4.8 us) dominates and its grid (B * HV CTAs) cannot fill the
     # GPU; the grouped register recurrence (sans state writeback) is faster
-    # there. Measured crossover on B200 (HV=12): rec wins at T<=2 up to
-    # B*HV ~192 and at T in (2, 4] up to B*HV ~48; the WY kernel wins
-    # everywhere at T>=5.
-    _auto_rec = (T_in <= 2 and B * HV <= _REC_DISPATCH_MAX_BH) or (
-        T_in <= 4 and B * HV <= _REC_DISPATCH_MAX_BH // 4
-    )
-    use_rec = backend == "recurrent" or (backend == "auto" and _auto_rec)
+    # there. Thresholds from a full T x B crossover sweep on B200 (HV=12,
+    # precomputed gate): rec wins up to B*HV ~192 at T=1, ~48 at T in [2,4],
+    # ~24 at T in [5,7]; the WY kernel wins everywhere at T>=8. With the
+    # in-kernel gate the recurrence pays per-element transform cost, shifting
+    # every crossover toward WY — thresholds are halved there (measured at
+    # T=8 where WY already wins at every batch; interior points estimated).
+    _bh = B * HV
+    _scale = 1 if gate_mode == GATE_PRECOMPUTED else 2
+    if T_in == 1:
+        _rec_max = _REC_DISPATCH_MAX_BH // _scale
+    elif T_in <= 4:
+        _rec_max = _REC_DISPATCH_MAX_BH // (4 * _scale)
+    elif T_in <= 7:
+        _rec_max = _REC_DISPATCH_MAX_BH // (8 * _scale)
+    else:
+        _rec_max = 0
+    use_rec = backend == "recurrent" or (backend == "auto" and _bh <= _rec_max)
     if use_rec:
         rec_args = [
             mk_dyn(q),
