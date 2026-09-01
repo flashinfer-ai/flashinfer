@@ -112,6 +112,8 @@ Wheel installs prefer ``uv pip`` when ``pyvenv.cfg`` identifies a uv-created
 environment, or when pip is unavailable, provided uv is on ``PATH``. Otherwise,
 they use ``python -m pip``. Both target the interpreter running FlashInfer;
 uv receives an explicit ``--python`` argument.
+Run this after upgrading ``flashinfer-python`` if a stale
+``flashinfer-cubin`` install triggers a version mismatch at import time.
 
 Install JIT Cache Wheel
 -----------------------
