@@ -41,8 +41,9 @@ def _full_mesh(world_size, hostname="hostA"):
     ]
 
 
-def _pcie_mesh(rank_order=None):
-    rank_order = list(range(8)) if rank_order is None else rank_order
+def _pcie_mesh(rank_order=None, world_size=8):
+    rank_order = list(range(world_size)) if rank_order is None else rank_order
+    world_size = len(rank_order)
     uuids = [f"GPU-fake-{physical}" for physical in rank_order]
     numa = [physical // 4 for physical in rank_order]
     return [
@@ -55,10 +56,12 @@ def _pcie_mesh(rank_order=None):
             numa_node=numa[rank],
             nic_name=f"mlx5_{rank_order[rank]}",
             gid_index=rank_order[rank] + 2,
-            peer_p2p={uuids[peer]: True for peer in range(8) if peer != rank},
-            peer_nvlink={uuids[peer]: False for peer in range(8) if peer != rank},
+            peer_p2p={uuids[peer]: True for peer in range(world_size) if peer != rank},
+            peer_nvlink={
+                uuids[peer]: False for peer in range(world_size) if peer != rank
+            },
         )
-        for rank in range(8)
+        for rank in range(world_size)
     ]
 
 
@@ -290,7 +293,7 @@ def test_explicit_pcie_builds_rank_order_independent_plan():
     assert decision.pcie_plan.gid_indices == tuple(t.gid_index for t in topos)
 
 
-@pytest.mark.parametrize("world_size", [1, 2, 4])
+@pytest.mark.parametrize("world_size", [1, 2])
 def test_explicit_pcie_selects_p2p_for_small_world_sizes(world_size):
     decision = decide_ulysses_backend("pcie", _full_mesh(world_size))
     assert decision.backend == "pcie"
@@ -298,6 +301,8 @@ def test_explicit_pcie_selects_p2p_for_small_world_sizes(world_size):
     assert decision.pcie_plan.transport == "p2p"
     assert decision.pcie_plan.gid_indices == ()
     assert "CUDA P2P route planned" in decision.reason
+    # Below PCIE_AUTO_RDMA_WORLD_SIZES the plan is P2P by choice, not fallback.
+    assert "unavailable" not in decision.reason
 
 
 @pytest.mark.parametrize("world_size", [2, 4])
@@ -308,8 +313,9 @@ def test_explicit_pcie_small_world_rejects_missing_p2p_pair(world_size):
         decide_ulysses_backend("pcie", topos)
 
 
-def test_explicit_pcie_falls_back_to_all_p2p_when_rdma_is_unavailable():
-    decision = decide_ulysses_backend("pcie", _full_mesh(8))
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_explicit_pcie_falls_back_to_all_p2p_when_rdma_is_unavailable(world_size):
+    decision = decide_ulysses_backend("pcie", _full_mesh(world_size))
     assert decision.backend == "pcie"
     assert decision.pcie_plan is not None
     assert decision.pcie_plan.transport == "p2p"
@@ -332,13 +338,14 @@ def test_explicit_pcie_falls_back_when_two_ranks_share_one_nic():
     assert "FLASHINFER_ULYSSES_PCIE_NICS" in decision.reason
 
 
-def test_explicit_pcie_auto_eight_ranks_prefers_rdma():
-    decision = decide_ulysses_backend("pcie", _pcie_mesh())
+@pytest.mark.parametrize("world_size", [4, 8])
+def test_explicit_pcie_auto_prefers_rdma_from_four_ranks(world_size):
+    decision = decide_ulysses_backend("pcie", _pcie_mesh(world_size=world_size))
     assert decision.pcie_plan is not None
     assert decision.pcie_plan.transport == "rdma"
     assert "all-RDMA route planned" in decision.reason
-    assert len(set(decision.pcie_plan.nic_names)) == 8
-    assert decision.pcie_plan.gid_indices == tuple(range(2, 10))
+    assert len(set(decision.pcie_plan.nic_names)) == world_size
+    assert decision.pcie_plan.gid_indices == tuple(range(2, 2 + world_size))
 
 
 def test_explicit_pcie_falls_back_when_gid_probe_fails():

@@ -255,8 +255,8 @@ constructor, strictly before any IPC allocation or JIT compilation:
                topology failures) when it cannot be used.
 ``"pcie"``     force the experimental single-node PCIe transport at world size
                1/2/4/8. Size 1 is an identity path and does not JIT-compile or
-               arm a native transport. Sizes 2/4 use CUDA P2P. Size 8 prefers
-               an all-RDMA route (per-rank mlx5 to every peer) and falls
+               arm a native transport. Size 2 uses CUDA P2P. Sizes 4/8 prefer
+               an all-RDMA route (per-rank mlx5 to every peer) and fall
                back to all-P2P; ``FLASHINFER_ULYSSES_PCIE_ROUTE`` can force
                all-P2P, all-RDMA at any multi-rank world size, or the
                eight-rank 4+4 NUMA P2P/mlx5 hybrid. Every route requires

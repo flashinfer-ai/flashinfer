@@ -29,10 +29,19 @@ import torch.distributed as dist
 # lives here (the policy layer) so the dependency direction stays
 # ulysses.py -> ulysses_topology.py with no cycle
 SUPPORTED_WORLD_SIZES = (2, 4, 6, 8)
+# Powers of two only (no 6, unlike NVLink): the PCIe copy scheduler walks
+# peers in rank ^ step order, which is a bijection onto the peer set only for
+# power-of-two world sizes (see EnqueueCopies in csrc/ulysses_pcie_transport.cuh).
 PCIE_SUPPORTED_WORLD_SIZES = (1, 2, 4, 8)
 # The 4+4 NUMA hybrid route (same-NUMA CUDA P2P plus cross-NUMA mlx5) exists
 # only at this world size; every other supported size is pure CUDA P2P.
 PCIE_HYBRID_WORLD_SIZE = 8
+# route="auto" prefers all-RDMA at these sizes and all-P2P below them. On the
+# 8-GPU dual-NUMA reference node (Gen5 x16, one 400G mlx5 per GPU) measured
+# 2026-09: 2 ranks share one PCIe switch, so P2P wins (50.5 vs 40 GB/s per
+# rank); at 4 ranks P2P crosses host bridges and RDMA wins (42.3 vs 29 GB/s);
+# at 8 ranks P2P collapses (~9 GB/s) and RDMA holds ~42 GB/s.
+PCIE_AUTO_RDMA_WORLD_SIZES = (4, 8)
 _PCIE_RDMA_PORT = 1
 _PCIE_GID_INDICES_ENV = "FLASHINFER_ULYSSES_PCIE_GID_INDICES"
 
@@ -557,7 +566,7 @@ def decide_ulysses_backend(
             return p2p_plan("single-node 1-rank CUDA P2P route planned")
 
         if route == "rdma" or (
-            route == "auto" and world_size == PCIE_HYBRID_WORLD_SIZE
+            route == "auto" and world_size in PCIE_AUTO_RDMA_WORLD_SIZES
         ):
             rdma_error = _rdma_route_error(
                 by_rank, gid_indices, all_p2p_error, require_numa_split=False

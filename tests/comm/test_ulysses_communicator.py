@@ -1446,16 +1446,16 @@ def _pcie_correctness_body(rank, world_size, group, test_case):
                 raise UlyssesBackendError(
                     f"hybrid route unavailable: {comm.decision.reason}"
                 )
-        elif world_size < 8 or scenario == "p2p":
+        elif world_size == 2 or scenario == "p2p":
             # These routes are pure CUDA P2P by construction, so the transport
             # is fully determined by the requested configuration.
             assert comm.transport == "p2p", (comm.transport, comm.decision.reason)
         elif comm.transport != "rdma":
-            # auto at eight ranks prefers all-RDMA. The toolchain probe does
-            # not prove a usable NIC or RoCE v2 GID exists; planning all-P2P
-            # there is correct, so skip.
+            # auto from four ranks up prefers all-RDMA. The toolchain probe
+            # does not prove a usable NIC or RoCE v2 GID exists; planning
+            # all-P2P there is correct, so skip.
             raise UlyssesBackendError(
-                f"eight-rank all-RDMA route unavailable: {comm.decision.reason}"
+                f"{world_size}-rank all-RDMA route unavailable: {comm.decision.reason}"
             )
         assert torch.cuda.current_device() == caller_device
 
