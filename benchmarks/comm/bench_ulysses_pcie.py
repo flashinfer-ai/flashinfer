@@ -180,6 +180,11 @@ def main():
             rows.append(
                 {
                     "case": name,
+                    # A forced RDMA route can silently fall back to all-P2P
+                    # (RuntimeWarning only), so the dump must state what it
+                    # actually measured.
+                    "transport": comm.transport,
+                    "route": comm.decision.reason,
                     "pcie_ms": pcie_ms,
                     "pcie_sd_pct": pcie_sd,
                     "nccl_ms": nccl_ms,
