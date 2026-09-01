@@ -779,6 +779,34 @@ def test_ctor_pcie_dtype_gate(gloo_pg, monkeypatch):
 
 
 @requires_cuda
+def test_input_buffer_is_gated_to_routes_that_stage(gloo_pg, monkeypatch):
+    """Only a multi-rank RDMA PCIe route copies input into a landing buffer.
+
+    Everything else reads the caller's operand in place, so there is no buffer
+    to hand out and nothing to save; saying so beats returning a tensor whose
+    only property -- being the thing the NIC reads -- does not hold.
+    """
+    device = torch.device("cuda", torch.cuda.current_device())
+    shape = (1, 2, 4, 2)
+
+    pcie_w1 = _make_w1(gloo_pg, monkeypatch, backend="pcie")
+    try:
+        out = torch.zeros(shape, dtype=torch.float16, device=device)
+        with pytest.raises(ValueError, match="multi-rank pcie backend"):
+            pcie_w1.input_buffer(out, shape)
+    finally:
+        pcie_w1.close()
+
+    nccl_w1 = _make_w1(gloo_pg, monkeypatch, backend="nccl")
+    try:
+        out = torch.zeros(shape, dtype=torch.float16, device=device)
+        with pytest.raises(ValueError, match="multi-rank pcie backend"):
+            nccl_w1.input_buffer(out, shape)
+    finally:
+        nccl_w1.close()
+
+
+@requires_cuda
 def test_per_call_dtype_reprices_capacity_in_bytes(gloo_pg, monkeypatch):
     """``max_elems`` is a byte budget, priced in the construction dtype.
 
@@ -2322,6 +2350,73 @@ def _pcie_dtype_body(rank, world_size, group, dtype_name):
         torch.cuda.synchronize(device)
         assert torch.equal(gather_out.view(torch.uint8), raw)
     return ("ok", dtype_name)
+
+
+def _pcie_input_landing_body(rank, world_size, group, _arg):
+    """Producing the operand in the landing buffer must change nothing but the copy.
+
+    The RDMA routes stage every input into a transport-owned landing buffer
+    because the NIC will not read caller memory. ``input_buffer`` hands that
+    buffer out so the producer can write it directly; the wire format, the
+    barrier and the MKeys are untouched, so the result has to be bit-identical
+    to the staged one -- and the staged path has to keep working on the same
+    slot afterwards.
+    """
+    device = torch.device("cuda", rank)
+    missing = missing_ulysses_pcie_dependencies()
+    if missing:
+        raise UlyssesBackendError(
+            f"PCIe transport needs {', '.join(missing)}, missing on this machine"
+        )
+    torch.manual_seed(4000 + rank)
+    shape = (1, 16, world_size * 2, 16)
+    x = torch.randn(shape, dtype=torch.bfloat16, device=device)
+    y = torch.randn(shape, dtype=torch.bfloat16, device=device)
+    with UlyssesCommunicator(
+        max_elems=x.numel(), dtype=torch.bfloat16, backend="pcie", device=device
+    ) as comm:
+        if comm.transport not in ("hybrid", "rdma"):
+            raise UlyssesBackendError(
+                f"the {comm.transport} route reads the operand in place and has "
+                "no landing buffer"
+            )
+        out = comm.allocate_output(x, "scatter_heads")
+        comm.scatter_heads(x, out=out)
+        torch.cuda.synchronize(device)
+        staged_x = out.clone()
+        assert torch.equal(staged_x, _ref_scatter_heads(x, world_size, rank, group))
+
+        direct = comm.input_buffer(out, shape)
+        assert direct.dtype == x.dtype and tuple(direct.shape) == shape
+        assert direct.data_ptr() not in (x.data_ptr(), out.data_ptr())
+        assert direct.data_ptr() == comm.input_buffer(out, shape).data_ptr()
+
+        # The landing holds x from the staged run above. Write y over it, so a
+        # fast path that skipped the copy *and* the caller's write -- or that
+        # re-sent whatever was already there -- fails here rather than passing
+        # on a coincidence.
+        direct.copy_(y)
+        comm.scatter_heads(direct, out=out)
+        torch.cuda.synchronize(device)
+        assert torch.equal(out, _ref_scatter_heads(y, world_size, rank, group))
+
+        # The staging copy is still there for operands built anywhere else.
+        comm.scatter_heads(x, out=out)
+        torch.cuda.synchronize(device)
+        assert torch.equal(out, staged_x)
+    return ("ok", world_size)
+
+
+@pytest.mark.parametrize("world_size", [2, 8])
+def test_correctness_forced_pcie_input_landing(world_size):
+    """Direct-written input is bit-identical to the staged path it replaces."""
+    _run_multi_rank(
+        "_pcie_input_landing_body",
+        world_size,
+        None,
+        timeout=600,
+        allow_skip=True,
+    )
 
 
 def _pcie_mixed_dtype_body(rank, world_size, group, _arg):
