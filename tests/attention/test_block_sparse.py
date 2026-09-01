@@ -591,7 +591,7 @@ if __name__ == "__main__":
 DEV = "cuda:0"
 
 requires_cuda_sm80 = pytest.mark.skipif(
-    torch.cuda.get_device_capability()[0] < 8,
+    not torch.cuda.is_available() or torch.cuda.get_device_capability(DEV)[0] < 8,
     reason="the FA2 large-head path starts at sm_80",
 )
 
