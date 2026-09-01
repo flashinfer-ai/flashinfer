@@ -1746,6 +1746,11 @@ class AutoTuner:
                     # reduce hangs. All-reduce the hit flag and raise on a
                     # split instead of deadlocking.
                     if _tune_process_group is not None:
+                        if torch.cuda.is_current_stream_capturing():
+                            raise RuntimeError(
+                                "AutoTuner distributed cache-hit agreement check cannot run "
+                                "during an active outer CUDA Graph capture"
+                            )
                         import torch.distributed as dist
 
                         backend = str(dist.get_backend(_tune_process_group)).lower()
