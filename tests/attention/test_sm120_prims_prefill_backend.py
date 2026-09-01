@@ -250,10 +250,16 @@ def test_cuda_graph_rejects_uncompiled_specialization():
     lse = torch.empty((1, hq), dtype=torch.float32, device=device)
     graph = torch.cuda.CUDAGraph()
     with (
-        pytest.raises(RuntimeError, match="was not compiled before CUDA Graph capture"),
+        pytest.raises(
+            RuntimeError,
+            match=r"\(return_lse=True\) was not compiled before CUDA Graph capture",
+        ),
         torch.cuda.graph(graph),
     ):
         out.zero_()
+        # PDL is runtime-dynamic, so the plan-compiled non-LSE artifact accepts
+        # the device-default PDL=True launch during capture without warm-up.
+        wrapper.run(q, cache, out=out)
         wrapper.run_return_lse(
             q,
             cache,
@@ -341,6 +347,11 @@ def test_prims_fail_fast_for_unsupported_options():
 
 
 def test_prims_accepts_combined_hnd_cache_and_pdl():
+    from flashinfer.cute_dsl.attention.fmha.sm120 import (
+        compile_sm120_fmha_fp8_paged_kernel,
+    )
+
+    compile_sm120_fmha_fp8_paged_kernel.cache_clear()
     workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
     qo = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
     indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
@@ -364,5 +375,10 @@ def test_prims_accepts_combined_hnd_cache_and_pdl():
     )
     q = _fp8((1, 2, 32))
     combined = _fp8((1, 2, 1, 16, 32))
+    cache_after_plan = compile_sm120_fmha_fp8_paged_kernel.cache_info()
     assert wrapper.run(q, combined, enable_pdl=False).shape == q.shape
     assert wrapper.run(q, combined, enable_pdl=True).shape == q.shape
+    cache_after_runs = compile_sm120_fmha_fp8_paged_kernel.cache_info()
+    assert cache_after_runs.misses == cache_after_plan.misses
+    assert cache_after_runs.currsize == cache_after_plan.currsize
+    assert cache_after_runs.hits == cache_after_plan.hits + 2
