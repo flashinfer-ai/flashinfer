@@ -2392,6 +2392,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 "required by variant_owns_mask; the two are incompatible."
             )
         self._prefix_len_ptr = prefix_len_ptr
+        if window_right >= 0 and prefix_len_ptr is not None:
+            raise NotImplementedError(
+                "window_right combined with prefix_len_ptr (multi-item scoring) is "
+                "not implemented: the window is measured in packed-buffer position, "
+                "which under MIS packing does not equal per-item token distance, so "
+                "the result would be incorrect. A correct implementation would apply "
+                "the window in item-local coordinates plus the shared prefix."
+            )
         self._token_pos_in_items_ptr = token_pos_in_items_ptr
         self._token_pos_in_items_len = token_pos_in_items_len
         self._max_item_len_ptr = max_item_len_ptr
@@ -3821,6 +3829,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 "required by variant_owns_mask; the two are incompatible."
             )
         self._prefix_len_ptr = prefix_len_ptr
+        if window_right >= 0 and prefix_len_ptr is not None:
+            raise NotImplementedError(
+                "window_right combined with prefix_len_ptr (multi-item scoring) is "
+                "not implemented: the window is measured in packed-buffer position, "
+                "which under MIS packing does not equal per-item token distance, so "
+                "the result would be incorrect. A correct implementation would apply "
+                "the window in item-local coordinates plus the shared prefix."
+            )
         self._token_pos_in_items_ptr = token_pos_in_items_ptr
         self._token_pos_in_items_len = token_pos_in_items_len
         self._max_item_len_ptr = max_item_len_ptr
