@@ -7,17 +7,23 @@ import torch.nn.functional as F
 
 from flashinfer.utils import is_sm100a_supported
 
-try:
+# Public module under test: must always import — flashinfer.kda_decode is
+# designed to import without the CuTe DSL (its internal imports are guarded
+# and it exposes the availability flag), so any ImportError here is a real
+# regression and should fail collection rather than skip.
+from flashinfer.kda_decode import _KDA_OUTPUT_ONLY_AVAILABLE
+
+if _KDA_OUTPUT_ONLY_AVAILABLE:
     # Internal dispatcher (module path, not public API): same signature the
     # public op had; used here to force individual backends. The public
     # surface is recurrent_kda(disable_state_update=True), tested below.
-    from flashinfer.kda_decode import _KDA_OUTPUT_ONLY_AVAILABLE
+    # Gated on the availability flag instead of try/except so that an import
+    # failure when the flag says "available" is also a loud failure.
     from flashinfer.kda_kernels.kda_decode_wy_output_only import (
         kda_wy_output_only as kda_output_only_decode,
     )
-except ImportError:
+else:
     kda_output_only_decode = None
-    _KDA_OUTPUT_ONLY_AVAILABLE = False
 
 
 @pytest.fixture(autouse=True)
