@@ -992,7 +992,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             # cannot back a captured run() that must follow later plan() calls.
             # Under CUDA graph the wrapper drives the functional entry point
             # with a static kv-length bound and wrapper-owned scratch instead.
-            self._prims_ts_graph_key = None
+            self._prims_ts_graph_key: Optional[Tuple[Any, ...]] = None
             self._prims_ts_workspace: Optional[torch.Tensor] = None
             self._prims_ts_max_kv_len: Optional[int] = None
             if not use_cuda_graph:
@@ -1686,7 +1686,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         "(indptr, last_page_len, page_size); seq_lens must match them"
                     )
             self._max_kv_len = int(max(kv_lens_arr_host).item())
-            mask_type = "causal" if is_causal else "dense"
+            mask_type: Literal["dense", "causal"] = "causal" if is_causal else "dense"
             if self._use_cuda_graph:
                 self._plan_prims_ts_graph(
                     kv_lens_arr_host,
@@ -1896,7 +1896,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_data_type: torch.dtype,
         kv_data_type: torch.dtype,
         o_data_type: torch.dtype,
-        mask_type: str,
+        mask_type: Literal["dense", "causal"],
         window_left: int,
         non_blocking: bool,
     ) -> None:
