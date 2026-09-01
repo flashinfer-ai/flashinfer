@@ -2564,6 +2564,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 q_data_type=q_data_type,
                 kv_data_type=kv_data_type if kv_data_type is not None else q_data_type,
                 window_left=window_left,
+                window_right=window_right,
                 variant=cute_variant,
                 page_size=page_size,
                 paged_kv_indptr=self._paged_kv_indptr_buf,
@@ -2687,6 +2688,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
         self._window_right = window_right
+        if window_right >= 0 and getattr(self, "_backend", None) not in ("fa2", "cute-dsl"):
+            raise NotImplementedError(
+                f"window_right is not supported on backend "
+                f"{getattr(self, '_backend', None)!r} (kernel cannot express a "
+                f"right window); supported backends are 'fa2' and 'cute-dsl'. "
+                f"Pass window_right=-1 on other backends."
+            )
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -3921,6 +3929,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     if kv_data_type is not None
                     else q_data_type,
                     window_left=window_left,
+                    window_right=window_right,
                     variant=variant,
                 )
         elif self._jit_module is not None:
@@ -4059,6 +4068,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
         self._window_right = window_right
+        if window_right >= 0 and getattr(self, "_backend", None) not in ("fa2", "cute-dsl"):
+            raise NotImplementedError(
+                f"window_right is not supported on backend "
+                f"{getattr(self, '_backend', None)!r} (kernel cannot express a "
+                f"right window); supported backends are 'fa2' and 'cute-dsl'. "
+                f"Pass window_right=-1 on other backends."
+            )
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
