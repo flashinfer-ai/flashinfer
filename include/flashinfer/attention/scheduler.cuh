@@ -920,8 +920,8 @@ inline cudaError_t PrefillPlan(
                                int_workspace_size_in_bytes, plan_info, qo_indptr_h, kv_indptr_h,
                                total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk,
                                head_dim_vo, page_size, enable_cuda_graph, sizeof_dtype_o,
-                               window_left, window_right, fixed_split_size, disable_split_kv, num_colocated_ctas,
-                               uniform_q_len, stream, kv_dtype_bytes);
+                               window_left, window_right, fixed_split_size, disable_split_kv,
+                               num_colocated_ctas, uniform_q_len, stream, kv_dtype_bytes);
 }
 
 template <typename IdType>
@@ -933,14 +933,14 @@ inline cudaError_t PrefillPlanWorkspaceSize(
     int32_t fixed_split_size, bool disable_split_kv, int64_t num_colocated_ctas,
     int64_t uniform_q_len, cudaStream_t stream, uint32_t kv_dtype_bytes = 2) {
   PrefillPlanInfo plan_info;
-  return PrefillPlanImpl<false>(float_workspace_size_in_bytes, int_workspace_size_in_bytes,
-                                /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
-                                /*int_buffer=*/nullptr, /*page_locked_int_buffer=*/nullptr,
-                                /*int_workspace_size_in_bytes=*/0, plan_info, qo_indptr_h,
-                                kv_indptr_h, total_num_rows, batch_size, num_qo_heads, num_kv_heads,
-                                head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
-                                sizeof_dtype_o, window_left, window_right, fixed_split_size, disable_split_kv,
-                                num_colocated_ctas, uniform_q_len, stream, kv_dtype_bytes);
+  return PrefillPlanImpl<false>(
+      float_workspace_size_in_bytes, int_workspace_size_in_bytes,
+      /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
+      /*int_buffer=*/nullptr, /*page_locked_int_buffer=*/nullptr,
+      /*int_workspace_size_in_bytes=*/0, plan_info, qo_indptr_h, kv_indptr_h, total_num_rows,
+      batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
+      enable_cuda_graph, sizeof_dtype_o, window_left, window_right, fixed_split_size,
+      disable_split_kv, num_colocated_ctas, uniform_q_len, stream, kv_dtype_bytes);
 }
 
 inline float cost_function(int qo_len, int kv_len) { return 2 * float(qo_len) + kv_len; }
