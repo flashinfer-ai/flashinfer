@@ -74,6 +74,8 @@ _FLASH_KDA_BT16_N16_MAX_DIRECT_WAVES = 3
 _FLASH_KDA_BT16_MID_MIN_SEQUENCE_LENGTH = 4096
 _FLASH_KDA_BT16_LONG_MIN_SEQUENCE_LENGTH = 65_536
 _FLASH_KDA_BT16_MID_MAX_TASKS = 32
+_FLASH_KDA_INDEPENDENT_DVSPLIT_CTAS = 2
+_FLASH_KDA_INDEPENDENT_DVSPLIT_MIN_SEQUENCE_LENGTH = 512
 _FLASH_KDA_H12_DIRECT_N32_MIN_SEQUENCE_LENGTH = 64
 _FLASH_KDA_H12_DIRECT_N32_MAX_SEQUENCE_LENGTH = 256
 _FLASH_KDA_H12_DIRECT_N32_EARLY_STATE_PACK_MAX_SEQUENCE_LENGTH = 128
@@ -1576,6 +1578,27 @@ def _uses_measured_sm100_persistent_policy(
     return compute_capability == (10, 0) and sm_count in (148, 152)
 
 
+def _should_use_independent_dvsplit(
+    *,
+    compute_capability: tuple[int, int],
+    sm_count: int,
+    fixed_layout: bool,
+    num_sequences: int,
+    num_heads: int,
+    max_sequence_length: int,
+) -> bool:
+    """Select M64 when its doubled fixed-layout grid fits one resident wave."""
+
+    return (
+        compute_capability in _FLASH_KDA_SUPPORTED_COMPUTE_CAPABILITIES
+        and fixed_layout
+        and num_sequences == 1
+        and max_sequence_length
+        >= _FLASH_KDA_INDEPENDENT_DVSPLIT_MIN_SEQUENCE_LENGTH
+        and _FLASH_KDA_INDEPENDENT_DVSPLIT_CTAS * num_heads <= sm_count
+    )
+
+
 def _should_use_small_bh_owner_helper(
     *,
     compute_capability: tuple[int, int],
@@ -1724,6 +1747,15 @@ def _select_flash_kda_bf16_route(
     direct_route = _direct_m128_route(
         num_heads=num_heads, max_sequence_length=max_sequence_length
     )
+    if num_heads == 64 and _should_use_independent_dvsplit(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        max_sequence_length=max_sequence_length,
+    ):
+        return _FLASH_KDA_ROUTE_M64
     if _should_use_bt16_dense_wavefront(
         compute_capability=compute_capability,
         sm_count=sm_count,
@@ -1790,12 +1822,13 @@ def _select_flash_kda_bf16_route(
         uniform_sequences=uniform_sequences,
     ):
         return _FLASH_KDA_ROUTE_DIRECT_M128_N16
-    if (
-        fixed_layout
-        and num_sequences == 1
-        and num_heads == 64
-        and max_sequence_length >= 512
-        and 2 * num_heads <= sm_count
+    if _should_use_independent_dvsplit(
+        compute_capability=compute_capability,
+        sm_count=sm_count,
+        fixed_layout=fixed_layout,
+        num_sequences=num_sequences,
+        num_heads=num_heads,
+        max_sequence_length=max_sequence_length,
     ):
         return _FLASH_KDA_ROUTE_M64
     if _should_use_uniform_piece_persistent(
