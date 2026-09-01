@@ -641,3 +641,34 @@ def test_replays_inside_a_cuda_graph():
     torch.cuda.synchronize()
     want_q, _, _ = _reference(**case)
     torch.testing.assert_close(q_out.float(), want_q.float(), rtol=2e-2, atol=2e-2)
+
+
+def test_a_request_with_no_tokens_is_skipped():
+    """A work item may name a request the step gave nothing to.
+
+    Its end is also its start, so there is no last token to read the chunk's
+    end from; the group loop has to stop before that read rather than index
+    behind the tensor.
+    """
+    _skip_unless_cuda()
+    case = _case(num_tokens=16, num_requests=2)
+    # Collapse the first request: same start and end, all tokens in the second.
+    case["query_start_loc"] = torch.tensor(
+        [0, 0, case["q"].shape[0]], dtype=torch.int32, device=case["q"].device
+    )
+    q_out, state, compressed = _run(case)
+    assert torch.isfinite(q_out.float()).all()
+    assert torch.isfinite(compressed.float()).all()
+
+
+@pytest.mark.parametrize("short", ["k", "positions"])
+def test_rejects_a_short_token_axis(short):
+    """Both are walked by a token stride, so a short axis reads past its end."""
+    _skip_unless_cuda()
+    case = _case(num_tokens=16)
+    if short == "k":
+        case["k"] = case["k"][:-1].contiguous()
+    else:
+        case["positions"] = case["positions"][:-1].contiguous()
+    with pytest.raises(Exception, match="per token"):
+        _run(case)
