@@ -10,16 +10,10 @@ import pytest
 import torch
 
 flashinfer = pytest.importorskip("flashinfer")
+cutile_common = pytest.importorskip("flashinfer.cutile.cutile_common")
 
-
-def _cutile_available():
-    """True if the cuTile toolchain is importable in this environment."""
-    try:
-        from flashinfer.cutile.cutile_common import is_cuda_tile_available
-
-        return is_cuda_tile_available()
-    except Exception:
-        return False
+if not cutile_common.is_cuda_tile_available():
+    pytest.skip("cuda.tile not available", allow_module_level=True)
 
 
 def _is_blackwell():
@@ -31,8 +25,8 @@ def _is_blackwell():
 
 
 pytestmark = pytest.mark.skipif(
-    not (_cutile_available() and _is_blackwell()),
-    reason="cuTile ragged prefill requires cuda.tile and a Blackwell (SM100+) GPU",
+    not _is_blackwell(),
+    reason="cuTile ragged prefill requires a Blackwell (SM100+) GPU",
 )
 
 

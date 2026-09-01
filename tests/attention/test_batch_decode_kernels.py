@@ -25,6 +25,7 @@ from tests.test_helpers.jit_utils import (
 from tests.test_helpers.utils_fp4 import create_nvfp4_kv, nvfp4_to_float
 from functools import partial
 import flashinfer
+from flashinfer.cutile.cutile_common import is_cuda_tile_available
 from flashinfer.utils import get_compute_capability, has_flashinfer_jit_cache
 
 
@@ -96,21 +97,8 @@ def warmup_jit():
     yield
 
 
-@pytest.mark.parametrize("backend", ["fa2", "cutile"])
-@pytest.mark.parametrize("batch_size", [12, 17, 128])
-@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048, 16384])
-@pytest.mark.parametrize("page_size", [1, 8, 16])
-@pytest.mark.parametrize("num_kv_heads", [4])
-@pytest.mark.parametrize("num_qo_heads", [4, 32])
-@pytest.mark.parametrize("head_dim", [128, 256, 512])
-@pytest.mark.parametrize("kv_layout", ["NHD"])
-@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
-@pytest.mark.parametrize("logits_soft_cap", [0.0])
-@pytest.mark.parametrize("return_lse", [True])
-@pytest.mark.parametrize("q_dtype", [torch.float16])
-@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("contiguous_kv", [True])
-def test_batch_decode_with_paged_kv_cache(
+# Shared with test_batch_decode_cutile.py so both backends use the same oracle.
+def _run_batch_decode_with_paged_kv_cache_case(
     backend,
     batch_size,
     kv_len,
@@ -126,10 +114,12 @@ def test_batch_decode_with_paged_kv_cache(
     kv_dtype,
     contiguous_kv,
 ):
+    """Run one paged-decode backend case against the single-decode reference."""
     # cuTile decode backend capability bounds (mirror the NotImplemented guards
     # in BatchDecodeWithPagedKVCacheWrapper.run for backend=="cutile").
-    """Paged decode must match the reference across backends, layouts and dtypes."""
     if backend == "cutile":
+        if not is_cuda_tile_available():
+            pytest.skip("cuda-tile / tileiras compiler not available")
         if kv_layout != "NHD":
             pytest.skip("cuTile decode requires kv_layout='NHD'.")
         if pos_encoding_mode != "NONE":
@@ -247,6 +237,53 @@ def test_batch_decode_with_paged_kv_cache(
     o_buffer = torch.empty_like(o)
     wrapper.run(q, kv_data, out=o_buffer)
     torch.testing.assert_close(o, o_buffer, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.parametrize("batch_size", [12, 17, 128])
+@pytest.mark.parametrize("kv_len", [54, 97, 512, 2048, 16384])
+@pytest.mark.parametrize("page_size", [1, 8, 16])
+@pytest.mark.parametrize("num_kv_heads", [4])
+@pytest.mark.parametrize("num_qo_heads", [4, 32])
+@pytest.mark.parametrize("head_dim", [128, 256, 512])
+@pytest.mark.parametrize("kv_layout", ["NHD"])
+@pytest.mark.parametrize("pos_encoding_mode", ["NONE", "ROPE_LLAMA"])
+@pytest.mark.parametrize("logits_soft_cap", [0.0])
+@pytest.mark.parametrize("return_lse", [True])
+@pytest.mark.parametrize("q_dtype", [torch.float16])
+@pytest.mark.parametrize("kv_dtype", [torch.float16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("contiguous_kv", [True])
+def test_batch_decode_with_paged_kv_cache(
+    batch_size,
+    kv_len,
+    page_size,
+    num_kv_heads,
+    num_qo_heads,
+    head_dim,
+    kv_layout,
+    pos_encoding_mode,
+    logits_soft_cap,
+    return_lse,
+    q_dtype,
+    kv_dtype,
+    contiguous_kv,
+):
+    """Paged FA2 decode must match the single-decode reference."""
+    _run_batch_decode_with_paged_kv_cache_case(
+        "fa2",
+        batch_size,
+        kv_len,
+        page_size,
+        num_kv_heads,
+        num_qo_heads,
+        head_dim,
+        kv_layout,
+        pos_encoding_mode,
+        logits_soft_cap,
+        return_lse,
+        q_dtype,
+        kv_dtype,
+        contiguous_kv,
+    )
 
 
 global_override_indptr_cpu = None

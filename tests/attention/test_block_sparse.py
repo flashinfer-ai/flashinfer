@@ -32,6 +32,7 @@ from tests.test_helpers.jit_utils import (
 )
 
 import flashinfer
+from flashinfer.cutile.cutile_common import is_cuda_tile_available
 from flashinfer.utils import has_flashinfer_jit_cache, is_sm100a_supported
 
 
@@ -112,21 +113,15 @@ def _bsr_to_dense_torch(
     return dense
 
 
-@pytest.mark.parametrize("backend", ["auto", "vsa_blackwell", "cutile"])
-@pytest.mark.parametrize("R", [1, 4, 16, 128])
-@pytest.mark.parametrize("C", [1, 4, 16, 128])
-@pytest.mark.parametrize("M", [64, 128, 256])
-@pytest.mark.parametrize("N", [64, 128, 256])
-@pytest.mark.parametrize("num_qo_heads", [1, 4, 16])
-@pytest.mark.parametrize("num_kv_heads", [1, 4, 16])
-@pytest.mark.parametrize("head_dim", [128, 256])
-@pytest.mark.parametrize("mask_inside_block", [True, False])
-def test_block_sparse_attention(
+# Shared with test_block_sparse_cutile.py so both matrices use the same oracle.
+def _run_block_sparse_attention_case(
     backend, R, C, M, N, num_qo_heads, num_kv_heads, head_dim, mask_inside_block
 ):
-    """Block-sparse attention must match the dense reference for each backend."""
+    """Run one block-sparse backend case against the dense reference."""
     if num_qo_heads % num_kv_heads != 0:
         pytest.skip("num_qo_heads must be divisible by num_kv_heads")
+    if M % R != 0 or N % C != 0:
+        pytest.skip("BSR test dimensions require M % R == 0 and N % C == 0")
 
     if backend == "vsa_blackwell":
         if not is_sm100a_supported(torch.device(0)):
@@ -143,14 +138,14 @@ def test_block_sparse_attention(
             )
 
     if backend == "cutile":
+        if not is_cuda_tile_available():
+            pytest.skip("cuda-tile / tileiras compiler not available")
         # cuTile block-sparse maps each block-row onto a paged prefill batch with
         # page_size == C; it expresses sparsity at block granularity only.
         if mask_inside_block:
             pytest.skip(
                 "cuTile block-sparse does not support per-element intra-block masks."
             )
-        if M % R != 0 or N % C != 0:
-            pytest.skip("cuTile block-sparse requires M % R == 0 and N % C == 0.")
         if C < 16:
             # The BSR column-block size C maps to the paged-KV page_size; the
             # prefill autotune (_get_prefill_autotune_configs) only yields configs
@@ -159,7 +154,7 @@ def test_block_sparse_attention(
             pytest.skip("cuTile block-sparse requires C >= 16 (min prefill BLOCK_N).")
 
     set_seed(33)
-    rng = np.random.default_rng()
+    rng = np.random.default_rng(33)
 
     MB = M // R
     NB = N // C
@@ -214,6 +209,32 @@ def test_block_sparse_attention(
     o_buffer = torch.empty_like(o)
     sparse_attention_wrapper.run(q, k, v, out=o_buffer)
     torch.testing.assert_close(o_ref, o_buffer, atol=1e-2, rtol=1e-3)
+
+
+@pytest.mark.parametrize("backend", ["auto", "vsa_blackwell"])
+@pytest.mark.parametrize("R", [1, 4, 16, 128])
+@pytest.mark.parametrize("C", [1, 4, 16, 128])
+@pytest.mark.parametrize("M", [64, 128, 256])
+@pytest.mark.parametrize("N", [64, 128, 256])
+@pytest.mark.parametrize("num_qo_heads", [1, 4, 16])
+@pytest.mark.parametrize("num_kv_heads", [1, 4, 16])
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("mask_inside_block", [True, False])
+def test_block_sparse_attention(
+    backend, R, C, M, N, num_qo_heads, num_kv_heads, head_dim, mask_inside_block
+):
+    """Block-sparse attention must match the dense reference for each backend."""
+    _run_block_sparse_attention_case(
+        backend,
+        R,
+        C,
+        M,
+        N,
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        mask_inside_block,
+    )
 
 
 def _ref_attention(
