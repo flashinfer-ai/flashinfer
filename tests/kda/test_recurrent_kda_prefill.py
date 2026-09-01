@@ -35,6 +35,32 @@ kda_prefill_cute_api = importlib.import_module("flashinfer.kda_prefill_cute")
 cake_kda_jit_api = importlib.import_module("flashinfer.jit.cake_kda")
 
 
+@pytest.fixture(autouse=True)
+def _legacy_module_stubs_select_the_legacy_fallback(monkeypatch):
+    """Keep legacy ABI stubs on the selector-miss fallback they exercise."""
+
+    from flashinfer.jit.flash_kda import _GeneratedFlashKDASelectorNotFoundError
+
+    original_legacy_resolver = kda_prefill_api._get_flash_kda_prefill_module
+    original_generated_resolver = kda_prefill_api._get_flash_kda_generated_module
+
+    def resolve_generated(selector_key):
+        if (
+            kda_prefill_api._get_flash_kda_prefill_module
+            is not original_legacy_resolver
+        ):
+            raise _GeneratedFlashKDASelectorNotFoundError(
+                "legacy test module stub requests the selector-miss fallback"
+            )
+        return original_generated_resolver(selector_key)
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "_get_flash_kda_generated_module",
+        resolve_generated,
+    )
+
+
 def test_public_api_uses_phase_neutral_facade_and_prefill_workspace():
     assert flashinfer.recurrent_kda is kda_api.recurrent_kda
     assert (
@@ -2326,7 +2352,7 @@ def test_generated_prefill_runtime_specialization_helpers():
     ):
         kda_prefill_api._flash_kda_generated_direct_specialization(
             target="sm103a",
-            route="affine_m128",
+            route="affine_split_m128",
             num_heads=96,
             num_sequences=1,
             uniform_sequences=True,

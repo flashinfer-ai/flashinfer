@@ -2149,7 +2149,7 @@ def _should_use_uniform_piece_persistent(
 ) -> bool:
     """Select recurrence pieces when their occupancy-aware roofline wins."""
 
-    if not uniform_sequences or max_sequence_length <= 0:
+    if sm_count not in (148, 152) or not uniform_sequences or max_sequence_length <= 0:
         return False
     estimate = _persistent_m128_roofline(
         compute_capability=compute_capability,
