@@ -524,7 +524,12 @@ class SmemKvTileResource(DecodeGenResourceBase):
         )
         self._smem_base_kv = _placeholder_smem_array(
             self.cfg.v_dtype if self.kv_kind == KV_KIND_V else self.cfg.k_dtype,
-            self.cfg.smem_kv_tile_elements * num_stages,
+            (
+                self.cfg.smem_v_tile_elements
+                if self.kv_kind == KV_KIND_V
+                else self.cfg.smem_k_tile_elements
+            )
+            * num_stages,
         )
         self._desc_base = prims.Tcgen05SmemDesc(0)
 
@@ -534,9 +539,14 @@ class SmemKvTileResource(DecodeGenResourceBase):
             self.pipeline_config.num_stages if self.pipeline_config is not None else 1
         )
         if self._alloc is None:
+            tile_bytes = (
+                self.cfg.smem_v_tile_bytes
+                if self.kv_kind == KV_KIND_V
+                else self.cfg.smem_k_tile_bytes
+            )
             self._alloc = SmemAllocation(
                 name=f"{self.name}",
-                size_bytes=self.cfg.smem_kv_tile_bytes * num_stages,
+                size_bytes=tile_bytes * num_stages,
                 alignment=self.cfg.stensor_align,
             )
         return [self._alloc]
@@ -556,29 +566,37 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 if self.pipeline_config is not None
                 else 1
             )
+            inst_dtype_bytes = (
+                self.cfg.v_dtype_bytes
+                if self.kv_kind == KV_KIND_V
+                else self.cfg.k_dtype_bytes
+            )
             self._smem_base_kv = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc.offset,
                 dtype=self.cfg.v_dtype if self.kv_kind == KV_KIND_V else self.cfg.k_dtype,
-                shape=(self.cfg.smem_kv_tile_elements * num_stages,),
+                shape=(
+                    (
+                        self.cfg.smem_v_tile_elements
+                        if self.kv_kind == KV_KIND_V
+                        else self.cfg.smem_k_tile_elements
+                    )
+                    * num_stages,
+                ),
                 addrspace=3,
             )
             kv_tile_bytes = Int32(
-                self.cfg.tile_size_kv
-                * self.cfg.head_dim_kv_stage
-                * self.cfg.kv_dtype_bytes
+                self.cfg.tile_size_kv * self.cfg.head_dim_kv_stage * inst_dtype_bytes
             )
             leading_byte_offset = Int32(
                 self.cfg.tile_size_kv
                 * min(self.cfg.head_dim_kv_stage, 64)
-                * self.cfg.kv_dtype_bytes
+                * inst_dtype_bytes
             )
             stride_byte_offset = Int32(1024)
             if cutlass.const_expr(self.cfg.use_fp8_qkv):
                 leading_byte_offset = kv_tile_bytes
                 stride_byte_offset = Int32(
-                    _major_k_stride_bytes(
-                        self.cfg.kv_dtype_bytes, self.cfg.head_dim_kv_stage
-                    )
+                    _major_k_stride_bytes(inst_dtype_bytes, self.cfg.head_dim_kv_stage)
                 )
             if cutlass.const_expr(
                 self.kv_kind == KV_KIND_V
@@ -620,7 +638,11 @@ class SmemKvTileResource(DecodeGenResourceBase):
     @cute.jit
     def _stage_base(self, stage_info: StageInfo) -> cutlass.Array:
         """Return the SMEM base for the current split K/V pipeline stage."""
-        stage_elems = self.cfg.smem_kv_tile_bytes // self.cfg.kv_dtype_bytes
+        stage_elems = (
+            self.cfg.smem_v_tile_elements
+            if self.kv_kind == KV_KIND_V
+            else self.cfg.smem_k_tile_elements
+        )
         return self._smem_base_kv.subview(stage_info.stage_idx * stage_elems)
 
     @cute.jit
@@ -1117,7 +1139,12 @@ class SmemKvTileResource(DecodeGenResourceBase):
     @cute.jit
     def _build_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
         """Advance the split K/V base descriptor to the committed stage."""
-        stage_offset_bytes = stage_info.stage_idx * Int32(self.cfg.smem_kv_tile_bytes)
+        tile_bytes = (
+            self.cfg.smem_v_tile_bytes
+            if self.kv_kind == KV_KIND_V
+            else self.cfg.smem_k_tile_bytes
+        )
+        stage_offset_bytes = stage_info.stage_idx * Int32(tile_bytes)
         return self._desc_base.advance_start_address(stage_offset_bytes)
 
     @consumer_work(returns=kv_desc_slot)
@@ -1576,7 +1603,7 @@ class SmemKvResource(DecodeGenResourceBase):
             # Bind the shared K/V SMEM ring. K and V descriptors use the same
             # allocation but may differ in leading-byte offset. The ring
             # cannot yet express differing K/V byte-widths; this assumes
-            # k_dtype == v_dtype (enforced by validate_dtypes).
+            # k_dtype == v_dtype.
             assert self.cfg.k_dtype == self.cfg.v_dtype
             num_stages = (
                 self.pipeline_config.num_stages

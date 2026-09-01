@@ -736,8 +736,22 @@ class FmhaDecodeConfig:
 
     @property
     def smem_kv_tile_bytes(self) -> int:
-        """SMEM bytes for one staged K or V tile."""
+        """SMEM bytes for one staged K or V tile.
+
+        Requires ``k_dtype == v_dtype``; use ``smem_k_tile_bytes``/
+        ``smem_v_tile_bytes`` for resources that stage K and V independently.
+        """
         return self.tile_size_kv * self.head_dim_kv_stage * self.kv_dtype_bytes
+
+    @property
+    def smem_k_tile_bytes(self) -> int:
+        """SMEM bytes for one staged K tile."""
+        return self.tile_size_kv * self.head_dim_kv_stage * self.k_dtype_bytes
+
+    @property
+    def smem_v_tile_bytes(self) -> int:
+        """SMEM bytes for one staged V tile."""
+        return self.tile_size_kv * self.head_dim_kv_stage * self.v_dtype_bytes
 
     @property
     def head_dim_kv_stage(self) -> int:
@@ -1071,8 +1085,23 @@ class FmhaDecodeConfig:
 
     @property
     def smem_kv_tile_elements(self) -> int:
-        """Return K or V elements in one staged SMEM tile."""
+        """Return K or V elements in one staged SMEM tile.
+
+        Requires ``k_dtype == v_dtype``. Use ``smem_k_tile_elements``/
+        ``smem_v_tile_elements`` for resources that stage K and V
+        independently.
+        """
         return self.smem_kv_tile_bytes // self.kv_dtype_bytes
+
+    @property
+    def smem_k_tile_elements(self) -> int:
+        """Return K elements in one staged SMEM tile."""
+        return self.smem_k_tile_bytes // self.k_dtype_bytes
+
+    @property
+    def smem_v_tile_elements(self) -> int:
+        """Return V elements in one staged SMEM tile."""
+        return self.smem_v_tile_bytes // self.v_dtype_bytes
 
     @property
     def num_softmax_scale_groups(self) -> int:
@@ -1239,11 +1268,10 @@ class FmhaDecodeConfig:
         ):
             if dtype not in supported:
                 raise ValueError(f"Unsupported {name}: {dtype}")
-        if self.q_dtype != self.k_dtype or self.k_dtype != self.v_dtype:
+        if self.q_dtype != self.k_dtype:
             raise ValueError(
-                f"q_dtype ({self.q_dtype}), k_dtype ({self.k_dtype}), "
-                f"v_dtype ({self.v_dtype}) must all match: "
-                "mixed Q/K/V element types are not supported"
+                f"q_dtype ({self.q_dtype}) must match k_dtype ({self.k_dtype}); "
+                "mixed Q/K element types are not supported"
             )
 
     def validate_boolean_fields(self) -> None:
