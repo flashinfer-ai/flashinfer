@@ -93,7 +93,7 @@ def wait_signal_matmul_kernel(
                 real_chunk_size_m, N, tile_m, tile_n, group_size_m, bid
             )
             if m_tile_idx * tile_m >= real_chunk_size_m:
-                break
+                continue
 
             # Wait for input ready signal
             if shift > 0:
