@@ -730,6 +730,15 @@ def _validate_and_convert_seed_offset(
         if maybe_offset_arr.size(0) not in [1, batch_size]:
             raise ValueError(f"offset tensor length must be 1 or {batch_size}")
 
+    # Both are indexed by the same row index in the kernel, so a length-1 seed paired with a
+    # per-row offset (or vice versa) would silently mean two different things per row.
+    if maybe_seed_arr is not None and maybe_offset_arr is not None:
+        if maybe_seed_arr.size(0) != maybe_offset_arr.size(0):
+            raise ValueError(
+                "seed and offset tensors must have the same length, got "
+                f"{maybe_seed_arr.size(0)} and {maybe_offset_arr.size(0)}"
+            )
+
     return maybe_seed_arr, seed_val, maybe_offset_arr, offset_val
 
 
@@ -827,6 +836,8 @@ def sampling_from_logits(
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -836,6 +847,8 @@ def sampling_from_logits(
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -907,6 +920,8 @@ def sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -916,6 +931,8 @@ def sampling_from_probs(
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1018,6 +1035,8 @@ def top_p_sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1027,6 +1046,8 @@ def top_p_sampling_from_probs(
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1138,6 +1159,8 @@ def top_k_sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1147,6 +1170,8 @@ def top_k_sampling_from_probs(
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1259,6 +1284,8 @@ def min_p_sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1268,6 +1295,8 @@ def min_p_sampling_from_probs(
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1473,6 +1502,8 @@ def top_k_top_p_sampling_from_logits(
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1482,6 +1513,8 @@ def top_k_top_p_sampling_from_logits(
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1632,6 +1665,8 @@ def top_k_top_p_sampling_from_probs(
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -1641,6 +1676,8 @@ def top_k_top_p_sampling_from_probs(
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -2025,6 +2062,8 @@ def chain_speculative_sampling(
     seed: Optional[Union[int, torch.Tensor]]
         Random seed value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating
@@ -2034,6 +2073,8 @@ def chain_speculative_sampling(
     offset: Optional[Union[int, torch.Tensor]]
         Random offset value for the sampling operation. Can be either an integer or a torch.Tensor.
         When provided as a torch.Tensor, it must be int64 or uint64 dtype, 1D, and length 1 or batch_size.
+        A length-``batch_size`` tensor gives each request its own value; a length-1 tensor is
+        broadcast to the whole batch. seed and offset must have the same length.
         Using torch.Tensor is required for CUDA graph compatibility.
 
         Warning: If you provide seed and offset explicitly, you are responsible for updating

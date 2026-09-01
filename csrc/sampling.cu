@@ -22,10 +22,14 @@ using namespace flashinfer;
 
 using tvm::ffi::Optional;
 
-// Helper function to validate seed/offset tensors for sampling operations
-inline void validate_seed_offset_tensors(const Optional<TensorView>& maybe_seed_arr,
+// Helper function to validate seed/offset tensors for sampling operations.
+// Returns whether the seed/offset tensors broadcast to the whole batch, i.e. whether they hold a
+// single entry rather than one per request. The kernels index them by blockIdx.x otherwise, so a
+// wrong length here would be an out-of-bounds read.
+inline bool validate_seed_offset_tensors(const Optional<TensorView>& maybe_seed_arr,
                                          const Optional<TensorView>& maybe_offset_arr,
-                                         const TensorView& reference_tensor) {
+                                         const TensorView& reference_tensor, int64_t batch_size) {
+  bool broadcast_seed_offset = true;
   if (maybe_seed_arr.has_value()) {
     CHECK_INPUT(maybe_seed_arr.value());
     CHECK_DIM(1, maybe_seed_arr.value());
@@ -33,6 +37,10 @@ inline void validate_seed_offset_tensors(const Optional<TensorView>& maybe_seed_
                    maybe_seed_arr.value().dtype() == dl_uint64)
         << "seed tensor must be int64 or uint64";
     CHECK_DEVICE(maybe_seed_arr.value(), reference_tensor);
+    const int64_t seed_size = maybe_seed_arr.value().size(0);
+    TVM_FFI_ICHECK(seed_size == 1 || seed_size == batch_size)
+        << "seed tensor length must be 1 or " << batch_size << ", got " << seed_size;
+    broadcast_seed_offset = seed_size == 1;
   }
   if (maybe_offset_arr.has_value()) {
     CHECK_INPUT(maybe_offset_arr.value());
@@ -41,7 +49,15 @@ inline void validate_seed_offset_tensors(const Optional<TensorView>& maybe_seed_
                    maybe_offset_arr.value().dtype() == dl_uint64)
         << "offset tensor must be int64 or uint64";
     CHECK_DEVICE(maybe_offset_arr.value(), reference_tensor);
+    const int64_t offset_size = maybe_offset_arr.value().size(0);
+    TVM_FFI_ICHECK(offset_size == 1 || offset_size == batch_size)
+        << "offset tensor length must be 1 or " << batch_size << ", got " << offset_size;
+    // seed and offset are supplied together, so they must agree on the layout.
+    TVM_FFI_ICHECK(!maybe_seed_arr.has_value() || offset_size == maybe_seed_arr.value().size(0))
+        << "seed and offset tensors must have the same length";
+    broadcast_seed_offset = offset_size == 1;
   }
+  return broadcast_seed_offset;
 }
 
 void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
@@ -75,10 +91,11 @@ void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorV
   CHECK_DIM(2, logits);  // logits: (batch_size, vocab_size)
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
   CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
-  validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, logits);
-
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = logits.size(1);
+
+  const bool broadcast_seed_offset =
+      validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, logits, batch_size);
 
   ffi::CUDADeviceGuard device_guard(logits.device().device_id);
   auto stream = get_stream(logits.device());
@@ -94,7 +111,7 @@ void sampling_from_logits(TensorView logits, TensorView output, Optional<TensorV
         seed_val,
         maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
                                      : nullptr,
-        offset_val, stream);
+        offset_val, broadcast_seed_offset, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "SamplingFromLogits failed with error code " << cudaGetErrorString(status);
     return true;
@@ -112,10 +129,11 @@ void sampling_from_probs(TensorView probs, TensorView output, TensorView valid,
   CHECK_DEVICE(valid, probs);
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
   CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
-  validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs);
-
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+
+  const bool broadcast_seed_offset =
+      validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs, batch_size);
 
   ffi::CUDADeviceGuard device_guard(probs.device().device_id);
   auto stream = get_stream(probs.device());
@@ -132,7 +150,7 @@ void sampling_from_probs(TensorView probs, TensorView output, TensorView valid,
         seed_val,
         maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
                                      : nullptr,
-        offset_val, stream);
+        offset_val, broadcast_seed_offset, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "SamplingFromProbs failed with error code " << cudaGetErrorString(status);
     return true;
@@ -152,10 +170,11 @@ void top_p_sampling_from_probs(TensorView probs, TensorView output, TensorView v
   CHECK_DEVICE(valid, probs);
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
   CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
-  validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs);
-
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+
+  const bool broadcast_seed_offset =
+      validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs, batch_size);
   check_tensor_param(maybe_top_p_arr, probs);
   bool has_top_p_arr = maybe_top_p_arr.has_value();
 
@@ -175,7 +194,7 @@ void top_p_sampling_from_probs(TensorView probs, TensorView output, TensorView v
         seed_val,
         maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
                                      : nullptr,
-        offset_val, stream);
+        offset_val, broadcast_seed_offset, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "TopPSamplingFromProbs failed with error code " << cudaGetErrorString(status);
     return true;
@@ -198,10 +217,11 @@ void top_k_sampling_from_probs(TensorView probs, TensorView output, TensorView v
   CHECK_DEVICE(valid, probs);
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
   CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
-  validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs);
-
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+
+  const bool broadcast_seed_offset =
+      validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs, batch_size);
   check_tensor_param(maybe_top_k_arr, probs);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
 
@@ -221,7 +241,7 @@ void top_k_sampling_from_probs(TensorView probs, TensorView output, TensorView v
         seed_val,
         maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
                                      : nullptr,
-        offset_val, stream);
+        offset_val, broadcast_seed_offset, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "TopKSamplingFromProbs failed with error code " << cudaGetErrorString(status);
     return true;
@@ -244,10 +264,11 @@ void min_p_sampling_from_probs(TensorView probs, TensorView output, TensorView v
   CHECK_DEVICE(valid, probs);
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
   CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
-  validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs);
-
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+
+  const bool broadcast_seed_offset =
+      validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs, batch_size);
   check_tensor_param(maybe_min_p_arr, probs);
   bool has_min_p_arr = maybe_min_p_arr.has_value();
 
@@ -267,7 +288,7 @@ void min_p_sampling_from_probs(TensorView probs, TensorView output, TensorView v
         seed_val,
         maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
                                      : nullptr,
-        offset_val, stream);
+        offset_val, broadcast_seed_offset, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "MinPSamplingFromProb failed with error code " << cudaGetErrorString(status);
     return true;
@@ -291,10 +312,11 @@ void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output, Tensor
   CHECK_DEVICE(valid, probs);
   CHECK_MAYBE_INPUT_TYPES(maybe_indices, dl_int32, dl_int64);
   CHECK_MAYBE_SAME_DTYPE(maybe_indices, output);
-  validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs);
-
   unsigned int batch_size = output.size(0);
   unsigned int vocab_size = probs.size(1);
+
+  const bool broadcast_seed_offset =
+      validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, probs, batch_size);
   check_tensor_param(maybe_top_k_arr, probs);
   check_tensor_param(maybe_top_p_arr, probs);
   bool has_top_k_arr = maybe_top_k_arr.has_value();
@@ -317,7 +339,7 @@ void top_k_top_p_sampling_from_probs(TensorView probs, TensorView output, Tensor
         seed_val,
         maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
                                      : nullptr,
-        offset_val, stream);
+        offset_val, broadcast_seed_offset, stream);
     TVM_FFI_ICHECK(status == cudaSuccess)
         << "TopKTopPSamplingFromProbs failed with error code " << cudaGetErrorString(status);
     return true;
@@ -335,8 +357,6 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
   CHECK_INPUT(target_probs);
   CHECK_DEVICE(draft_token_ids, draft_probs);
   CHECK_DEVICE(target_probs, draft_probs);
-  validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, draft_probs);
-
   CHECK_DIM(3, draft_probs);      // draft_probs: (batch_size, num_speculate_tokens, vocab_size)
   CHECK_DIM(2, draft_token_ids);  // draft_token_ids: (batch_size, num_speculate_tokens)
   CHECK_DIM(3, target_probs);  // target_probs: (batch_size, num_speculate_tokens + 1, vocab_size)
@@ -349,6 +369,9 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
   TVM_FFI_ICHECK_EQ(vocab_size, target_probs.size(2));
   TVM_FFI_ICHECK_EQ(batch_size, output_accepted_token_num.size(0));
   TVM_FFI_ICHECK_EQ(batch_size, output_emitted_draft_token_num.size(0));
+
+  const bool broadcast_seed_offset =
+      validate_seed_offset_tensors(maybe_seed_arr, maybe_offset_arr, draft_probs, batch_size);
 
   ffi::CUDADeviceGuard device_guard(draft_probs.device().device_id);
   auto stream = get_stream(draft_probs.device());
@@ -363,7 +386,7 @@ void chain_speculative_sampling(TensorView draft_probs, TensorView draft_token_i
       seed_val,
       maybe_offset_arr.has_value() ? static_cast<uint64_t*>(maybe_offset_arr.value().data_ptr())
                                    : nullptr,
-      offset_val, stream);
+      offset_val, broadcast_seed_offset, stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "ChainSpeculativeSampling failed with error code " << cudaGetErrorString(status);
