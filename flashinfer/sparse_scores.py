@@ -126,8 +126,9 @@ def sparse_paged_scores(
 
     Entries on a page the block table does not map come out as ``-inf`` so a
     top-k never selects them. Columns past what the query can see are left
-    untouched instead, and the count of what it can see is returned, so a top-k
-    has to bound itself by that count rather than by the column width.
+    untouched instead, and the number of entries actually scored is returned --
+    what the query can see, capped by the column width -- so a top-k bounds
+    itself by that count rather than by the width.
 
     Parameters
     ----------
@@ -151,18 +152,21 @@ def sparse_paged_scores(
     divisor : float
         Scale applied to the summed score, typically ``sqrt(head_dim)``.
     num_columns : Optional[int]
-        Entries to score. Defaults to what the page table can address.
+        Entries to score. Defaults to what the page table can address. When
+        ``logits`` is given as well its width has to match, since the kernel
+        takes the width from the tensor it writes.
     logits : Optional[torch.Tensor]
         Output scores, shape ``[rows, num_columns]``, float32. Allocated when omitted.
         Columns past a row's visible count are left untouched.
     visible_blocks : Optional[torch.Tensor]
-        Receives the visible entry count per row, shape ``[rows]``. Allocated when
-        omitted.
+        Receives the number of entries actually scored for each row, shape
+        ``[rows]`` -- what the query can see, capped by the column width.
+        Allocated when omitted.
 
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor]
-        The scores and the per-row visible count.
+        The scores, and the per-row count of entries scored.
     """
     if q.ndim != 3:
         raise ValueError(f"q must be [rows, heads, head_dim], got {q.ndim}D")
@@ -184,6 +188,14 @@ def sparse_paged_scores(
     )
     if logits is None:
         logits = torch.empty((rows, columns), dtype=torch.float32, device=q.device)
+    elif logits.shape[1] != columns:
+        # The kernel takes the width from the tensor it writes, so a narrower
+        # num_columns alongside a wider logits would silently score the wider
+        # one and report a count past what the caller asked for.
+        raise ValueError(
+            f"logits is {logits.shape[1]} columns wide but {columns} were "
+            "asked for; pass a view of the width you want scored"
+        )
     if visible_blocks is None:
         visible_blocks = torch.empty(rows, dtype=page_table.dtype, device=q.device)
     if rows and not columns:
