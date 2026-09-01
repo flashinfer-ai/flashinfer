@@ -417,7 +417,8 @@ def gen_rmsnorm_silu_module(
     sources = []
     for fname in ["rmsnorm_silu.cu", "flashinfer_rmsnorm_silu_binding.cu"]:
         dst = gen_directory / fname
-        shutil.copy(jit_env.FLASHINFER_CSRC_DIR / fname, dst)
+        # copy2 keeps source mtimes; a fresh mtime forces a full ninja rebuild (#4782)
+        shutil.copy2(jit_env.FLASHINFER_CSRC_DIR / fname, dst)
         sources.append(dst)
 
     return gen_jit_spec(

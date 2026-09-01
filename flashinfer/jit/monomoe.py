@@ -107,7 +107,8 @@ def gen_monomoe_module():
             raise FileNotFoundError(f"monomoe source file not found: {src_path}")
         dest_path = gen_directory / rel_name
         os.makedirs(dest_path.parent, exist_ok=True)
-        shutil.copy(src_path, dest_path)
+        # copy2 keeps source mtimes; a fresh mtime forces a full ninja rebuild (#4782)
+        shutil.copy2(src_path, dest_path)
         return dest_path
 
     sources = [_copy(fname) for fname in _SOURCE_FILES]
