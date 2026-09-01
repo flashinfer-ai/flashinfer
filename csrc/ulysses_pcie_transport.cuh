@@ -1157,6 +1157,21 @@ inline const void* BindInput(Transport* transport, Buffer* buffer, TensorView in
       << "input exceeds the capacity this PCIe Ulysses slot was registered for";
   TVM_FFI_ICHECK(buffer->landing_mr != nullptr && buffer->input_landing != nullptr)
       << "missing PCIe Ulysses input registration";
+  // A caller that produced its operand straight into the landing buffer has
+  // nothing to stage. The test is exact pointer equality and cannot be relaxed
+  // to "somewhere inside the landing region": on the scatter path the NIC reads
+  // through the landing MKeys no matter what this returns (local_addresses is
+  // never filled in), while the copy engine reads whatever comes back here. A
+  // source that merely overlapped would send the NIC's peers stale bytes and
+  // the copy engine's fresh ones, with nothing to report it.
+  if (input.data_ptr() == buffer->input_landing) return buffer->input_landing;
+  const auto* landing_begin = static_cast<const char*>(buffer->input_landing);
+  const auto* source_begin = static_cast<const char*>(input.data_ptr());
+  TVM_FFI_ICHECK(source_begin + input_bytes <= landing_begin ||
+                 source_begin >= landing_begin + buffer->capacity_bytes)
+      << "PCIe Ulysses input overlaps this slot's landing buffer without being "
+         "it; pass the tensor returned by input_buffer() unmodified, or an "
+         "operand allocated elsewhere";
   CheckCuda(cudaMemcpyAsync(buffer->input_landing, input.data_ptr(),
                             static_cast<size_t>(input_bytes), cudaMemcpyDeviceToDevice, current),
             "cudaMemcpyAsync(PCIe Ulysses input staging)");
