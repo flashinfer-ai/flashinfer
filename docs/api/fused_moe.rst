@@ -110,6 +110,7 @@ The CuteDSL backends are conditionally available when the
 .. autosummary::
     :toctree: ../generated
 
+    cute_dsl_fused_moe
     cute_dsl_fused_moe_nvfp4
     cute_dsl_fused_moe_mxfp8_mxfp4
     b12x_fused_moe
