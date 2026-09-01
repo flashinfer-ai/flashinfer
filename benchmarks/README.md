@@ -9,6 +9,14 @@ to the natural device/shape dispatcher and records its resolved module; use
 `--candidate-route nonpersistent` for a B200 direct-family route A/B.
 `bench_recurrent_kda_prefill.py --case-set small_bh` runs the four fixed-layout
 small-BH cases through the same cold-L2 CUPTI path.
+`bench_recurrent_kda_prefill.py --case-set production --backend cake` runs the
+complete 29-shape fixed/packed inference portfolio. Its JSON records the logical
+route, every physical Cake module used (including BT16 prepare plus chain), and
+the explicit per-shape dry/repeat iteration budget. Large state shapes reduce
+the sample count to stay within the rotating-state capacity and set
+`timing_iteration_budget.low_sample_count` when fewer than ten measured
+iterations fit. `--dry-run-iters` and `--repeat-iters` request fixed iteration
+counts; they are not duration targets.
 
 ## Overview
 
@@ -43,6 +51,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `trtllm_fp8_block_scale_moe` - MOE with FP8 quantized weights and block-wise scaling.
     - `trtllm_fp8_per_tensor_scale_moe` - MOE with FP8 quantized weights and per-tensor scaling.
     - `cutlass_fused_moe` - CUTLASS fused MoE (base/fp8/nvfp4 variants with optional TP/EP)
+    - `unified_moe` - Unified MoE API comparison between the CUTLASS and cuTile backends. It supports BF16 and NVFP4 W4A4 with SwiGLU or ReLU2, filters unsupported backends at runtime, and can autotune each backend independently.
 - MOE Communication:
     - `moe_a2a_dispatch_combine` - MoE All-to-All dispatch + combine benchmark for multi-GPU expert-parallel inference. Requires `mpirun` for multi-GPU execution. Supports optional quantization (FP8, NVFP4, FP8 block-scale) and real MoE kernel computation.
 - AllReduce Communication:
@@ -98,6 +107,20 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
 ## Quick Start
 ### Single Test Run
 A test case is generally invoked as `python3 flashinfer_benchmark.py --routine <routine_name> <flags>`.
+
+The unified MoE comparison runs both backends from the same routing, activation,
+and weight inputs. This example uses the Nemotron-3.5-Lightning MoE shape:
+
+```bash
+python3 flashinfer_benchmark.py --routine unified_moe --backends cutlass cutile --quant-variant bf16 --num_tokens 128 --hidden_size 2688 --intermediate_size 1856 --num_experts 128 --top_k 6 --activation-type Relu2 --input_dtype bfloat16 --autotune
+```
+
+CUDA graph timing is enabled by default and captures one MoE invocation per
+graph replay with cold-L2 benchmarking enabled; pass `--no_cuda_graph` for eager
+timing. Without `--autotune`, results are named `cutlass` and `cutile`; autotuned
+results use `cutlass_autotune` and `cutile_autotune`.
+
+Representative Qwen3.6 and Nemotron cases are in `samples/sample_testlist.txt`.
 
 *See samples in samples/sample_testlist.txt for various example test flags.*
 Example commands and outputs areas follows
@@ -529,6 +552,7 @@ Legend:
 | **trtllm_fp8_block_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **trtllm_fp8_per_tensor_scale_moe** |  |  |  |  |  | trtllm | trtllm |  |
 | **cutlass_fused_moe** |  |  |  |  |  | cutlass | cutlass |  |
+| **unified_moe** |  |  |  | cutlass, cutile (BF16) | cutlass, cutile (BF16) | cutlass | cutlass | cutlass, cutile |
 | **moe_a2a_dispatch_combine** |  |  |  |  |  | moe_a2a | moe_a2a |  |
 | **allreduce_fusion** |  |  |  |  |  | allreduce | allreduce |  |
 | **rmsnorm** | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl | cute-dsl |

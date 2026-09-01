@@ -29,7 +29,7 @@ Supported architectures:
 - SM107 (Rubin): bmm_fp8_rubin.py
 """
 
-from flashinfer.cute_dsl.utils import (
+from flashinfer.cute_dsl.availability import (
     is_cute_dsl_available,
     is_rubin_cute_dsl_available,
 )

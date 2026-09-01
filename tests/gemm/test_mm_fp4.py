@@ -49,8 +49,12 @@ def _test_mm_fp4(
             pytest.skip("b12x backend only supports 128x4 SF layout")
         if compute_capability[0] != 12:
             pytest.skip("b12x backend only supports SM120/SM121 GPUs.")
-        if torch.version.cuda and int(torch.version.cuda.split(".")[0]) < 13:
-            pytest.skip("b12x backend requires CUDA 13+.")
+        min_cuda_version = "12.9" if use_nvfp4 else "13.0"
+        if not version_at_least(torch.version.cuda, min_cuda_version):
+            pytest.skip(
+                f"b12x {'NVFP4' if use_nvfp4 else 'MXFP4'} backend requires "
+                f"CUDA {min_cuda_version}+."
+            )
     if not use_128x4_sf_layout and backend != "trtllm":
         pytest.skip("Skipping test for non-trtllm fp4 with use_128x4_sf_layout=False")
     if not use_nvfp4 and backend not in ["cudnn", "auto", "cute-dsl", "b12x"]:
@@ -195,9 +199,9 @@ def test_mm_fp4_b12x_ragged_k(k, auto_tuning):
 def test_mm_fp4_b12x_misaligned_k_raises():
     device = torch.device("cuda")
     if not (
-        is_sm12x_supported(device) and version_at_least(torch.version.cuda, "13.0")
+        is_sm12x_supported(device) and version_at_least(torch.version.cuda, "12.9")
     ):
-        pytest.skip("b12x backend requires SM120/SM121 + CUDA 13+.")
+        pytest.skip("b12x backend requires SM120/SM121 + CUDA 12.9+.")
     m, n, k = 64, 512, 112  # k % 32 == 16
     _, _, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
     res = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)

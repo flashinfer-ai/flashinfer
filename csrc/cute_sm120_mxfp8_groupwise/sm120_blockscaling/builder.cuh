@@ -90,9 +90,7 @@ struct SM120BlockScalingBuilder {
                                        GemmType_ == sm120_common::GemmType::MGroupedMasked);
   static constexpr bool kUseTmaStore =
       sm120_common::utils::EnableTmaStore<kFlat, kSwapAB, TileN_, kPerBatchAB>();
-  static constexpr bool kUseStagedR2G =
-      GemmType_ == sm120_common::GemmType::MGroupedContiguousWithZeroPadding && !SwapAB_ &&
-      TileM_ >= 64;
+  static constexpr bool kUseStagedR2G = false;
   static constexpr bool kUnionSmem = !kUseTmaStore && !kUseStagedR2G;
   static constexpr int AB_Stages = Stages_;
   static constexpr uint32_t LoadRegisterRequirement = kUseStagedR2G ? 88 : 40;

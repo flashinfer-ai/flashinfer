@@ -39,6 +39,13 @@ import pytest
 
 pytest.importorskip("cutlass")
 
+from flashinfer.gemm.gemm_svdquant import (  # noqa: E402
+    _sm120_nvfp4_svdquant_runner,
+    _sm120_nvfp4_svdquant_unfused_runner,
+    _sm120_svdquant_kernel_name,
+    _svdquant_kernel_source_files,
+)
+
 from flashinfer.quantization.kernels.nvfp4_quantize import (  # noqa: E402
     SF_LAYOUT_8x4,
     SF_LAYOUT_128x4,
@@ -62,7 +69,7 @@ NVFP4_KERNEL_GETTERS = [
 # ever introduced.
 NVFP4_NON_CODEGEN_PARAMS: set = set()
 
-# A baseline argument set and, for each argument, a distinct alternative.
+# Baseline argument sets shared by the individual one-at-a-time perturbation tests.
 NVFP4_NAME_BASELINE = {
     "variant": "swizzled",
     "dtype_key": "bfloat16",
@@ -73,17 +80,18 @@ NVFP4_NAME_BASELINE = {
     "silu_and_mul": False,
     "nvfp4_4over6_config": None,
     "global_scale_is_tensor": True,
+    "smooth_quant": False,
 }
-NVFP4_NAME_PERTURBED = {
-    "variant": "linear",
-    "dtype_key": "float16",
-    "K": 2048,
-    "sf_layout": SF_LAYOUT_8x4,
+
+SVDQUANT_NAME_BASELINE = {
+    "rank": 32,
+    "with_bias": False,
+    "mma_tiler_mn": (64, 64),
+    "tile_k": 128,
+    "swap_ab": False,
+    "max_active_clusters": 1,
     "enable_pdl": False,
-    "disable_fp4_quant_fast_math": True,
-    "silu_and_mul": True,
-    "nvfp4_4over6_config": NVFP44Over6Config(),
-    "global_scale_is_tensor": False,
+    "enable_iket": False,
 }
 
 
@@ -105,19 +113,101 @@ def test_nvfp4_kernel_name_signature_covers_codegen_params(getter):
     )
 
 
-@pytest.mark.parametrize("param", sorted(NVFP4_NAME_BASELINE))
-def test_nvfp4_kernel_name_varies_with_every_argument(param):
+@pytest.mark.parametrize(
+    "param,alternate",
+    [
+        pytest.param("variant", "linear", id="variant"),
+        pytest.param("dtype_key", "float16", id="dtype_key"),
+        pytest.param("K", 2048, id="K"),
+        pytest.param("sf_layout", SF_LAYOUT_8x4, id="sf_layout"),
+        pytest.param("enable_pdl", False, id="enable_pdl"),
+        pytest.param(
+            "disable_fp4_quant_fast_math",
+            True,
+            id="disable_fp4_quant_fast_math",
+        ),
+        pytest.param("silu_and_mul", True, id="silu_and_mul"),
+        pytest.param(
+            "nvfp4_4over6_config",
+            NVFP44Over6Config(),
+            id="nvfp4_4over6_config",
+        ),
+        pytest.param("global_scale_is_tensor", False, id="global_scale_is_tensor"),
+        pytest.param("smooth_quant", True, id="smooth_quant"),
+    ],
+)
+def test_nvfp4_kernel_name_varies_with_every_argument(param, alternate):
     """Changing any single argument must change the kernel name.
 
     Catches arguments that the name function accepts but ignores.
     """
     baseline_name = _nvfp4_kernel_name(**NVFP4_NAME_BASELINE)
     kwargs = dict(NVFP4_NAME_BASELINE)
-    kwargs[param] = NVFP4_NAME_PERTURBED[param]
+    kwargs[param] = alternate
     assert _nvfp4_kernel_name(**kwargs) != baseline_name, (
         f"_nvfp4_kernel_name ignores argument {param!r}: two different "
         "kernel specializations would collide on one cache artifact."
     )
+
+
+@pytest.mark.parametrize(
+    "param,alternate",
+    [
+        pytest.param("rank", 64, id="rank"),
+        pytest.param("with_bias", True, id="with_bias"),
+        pytest.param("mma_tiler_mn", (128, 64), id="mma_tiler_mn"),
+        pytest.param("tile_k", 256, id="tile_k"),
+        pytest.param("swap_ab", True, id="swap_ab"),
+        pytest.param("max_active_clusters", 2, id="max_active_clusters"),
+        pytest.param("enable_pdl", True, id="enable_pdl"),
+        pytest.param("enable_iket", True, id="enable_iket"),
+    ],
+)
+def test_sm120_svdquant_kernel_name_varies_with_every_argument(param, alternate):
+    baseline_name = _sm120_svdquant_kernel_name(**SVDQUANT_NAME_BASELINE)
+    kwargs = dict(SVDQUANT_NAME_BASELINE)
+    kwargs[param] = alternate
+    assert _sm120_svdquant_kernel_name(**kwargs) != baseline_name
+
+
+def test_sm120_svdquant_kernel_name_is_symbol_safe():
+    name = _sm120_svdquant_kernel_name(
+        **{**SVDQUANT_NAME_BASELINE, "mma_tiler_mn": (128, 64), "enable_iket": True}
+    )
+    assert re.fullmatch(r"[A-Za-z0-9_]+", name), name
+
+
+def test_sm120_svdquant_source_fingerprint_covers_layout_helpers():
+    from flashinfer.cute_dsl import utils as cute_dsl_utils
+    from flashinfer.gemm.kernels import dense_blockscaled_gemm_sm120_b12x
+
+    sources = _svdquant_kernel_source_files()
+    assert cute_dsl_utils.__file__ in sources
+    assert dense_blockscaled_gemm_sm120_b12x.__file__ in sources
+
+
+@pytest.mark.parametrize(
+    "runner_factory",
+    [
+        _sm120_nvfp4_svdquant_runner,
+        _sm120_nvfp4_svdquant_unfused_runner,
+    ],
+)
+def test_svdquant_autotune_cache_distinguishes_pdl(runner_factory):
+    disabled = runner_factory(False)
+    enabled = runner_factory(True)
+    assert disabled.get_cache_key_extras([]) == (False,)
+    assert enabled.get_cache_key_extras([]) == (True,)
+
+
+def test_sm100_svdquant_autotune_cache_distinguishes_pdl(monkeypatch):
+    from flashinfer.gemm import gemm_svdquant
+
+    monkeypatch.setattr(gemm_svdquant, "get_nvfp4_svdquant_module", object)
+    disabled = gemm_svdquant._nvfp4_svdquant_gemm_runner(False)
+    enabled = gemm_svdquant._nvfp4_svdquant_gemm_runner(True)
+    assert disabled.get_cache_key_extras([]) == (False,)
+    assert enabled.get_cache_key_extras([]) == (True,)
 
 
 @pytest.mark.parametrize(

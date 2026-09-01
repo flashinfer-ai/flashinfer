@@ -6036,13 +6036,22 @@ def host(
     # Token-major activations: memory order [T, H, D] (token stride = D*heads),
     # so packed [1, T_total, H, D] / batched [B, T, H, D] callers are read
     # directly with no transpose.
+    # Keep the unused outer stride representable by CuTe IR for packed inputs.
+    # CuTe layouts currently lower strides through signed Int32, so the natural
+    # D*T*H batch stride overflows once a singleton packed token buffer exceeds
+    # that range even though the batch coordinate is always zero.
+    qk_batch_stride = DK
+    v_batch_stride = DV
+    if packed_batch != cutlass.Int32(1):
+        qk_batch_stride = DK * seqlen * heads
+        v_batch_stride = DV * seqlen * heads
     qk_layout = cute.make_layout(
         (DK, seqlen, heads, packed_batch),
-        stride=(1, DK * heads, DK, DK * seqlen * heads),
+        stride=(1, DK * heads, DK, qk_batch_stride),
     )
     v_layout = cute.make_layout(
         (DV, seqlen, heads, packed_batch),
-        stride=(1, DV * heads, DV, DV * seqlen * heads),
+        stride=(1, DV * heads, DV, v_batch_stride),
     )
     q_tma = cute.make_tensor(q.iterator, qk_layout)
     k_tma = cute.make_tensor(k.iterator, qk_layout)

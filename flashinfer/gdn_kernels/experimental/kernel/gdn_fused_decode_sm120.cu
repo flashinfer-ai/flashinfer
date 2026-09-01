@@ -24,23 +24,54 @@
 
 namespace {
 
-// Fused GDN decode step for a fixed traced layer geometry: one persistent
-// kernel covering the in_proj_ba GEMV, the depthwise causal conv1d update
-// (width 4, silu), the q/k/v head split, and the gated delta-rule state
-// update with qk-L2-norm, replacing the multi-launch serving chain.
-constexpr int HIDDEN = 5120;
-constexpr int N_BA = 96;
-constexpr int QKV_DIM = 10240;
-constexpr int H_Q = 16;
-constexpr int HV = 48;
-constexpr int D = 128;
-constexpr int CONV_WIDTH = 4;
-constexpr int CONV_STATE_LEN = 3;
-constexpr int HEADS_PER_QK = 3;
+// Fused GDN decode step for one layer geometry: a single persistent kernel
+// covering the in_proj_ba GEMV, the depthwise causal conv1d update (width 4,
+// silu), the q/k/v head split, and the gated delta-rule state update with
+// qk-L2-norm, replacing the multi-launch serving chain.
+//
+// The layer geometry is a compile-time parameter of this translation unit,
+// supplied by flashinfer/jit/gdn_fused_decode.py as -D defines (one JIT
+// module per geometry; a serving process runs one model, hence one module).
+// Only the sizes change: the block shape, warp->row mapping and reduction
+// trees below are geometry-independent, and the static_asserts state exactly
+// which divisibility relations the code relies on.
+#if !defined(FI_GDN_HIDDEN) || !defined(FI_GDN_N_BA) || !defined(FI_GDN_QKV_DIM) || \
+    !defined(FI_GDN_H_Q) || !defined(FI_GDN_HV) || !defined(FI_GDN_D) ||            \
+    !defined(FI_GDN_CONV_WIDTH) || !defined(FI_GDN_CONV_STATE_LEN)
+#error "gdn_fused_decode_sm120.cu requires the FI_GDN_* geometry defines"
+#endif
+constexpr int HIDDEN = FI_GDN_HIDDEN;
+constexpr int N_BA = FI_GDN_N_BA;
+constexpr int QKV_DIM = FI_GDN_QKV_DIM;
+constexpr int H_Q = FI_GDN_H_Q;
+constexpr int HV = FI_GDN_HV;
+constexpr int D = FI_GDN_D;
+constexpr int CONV_WIDTH = FI_GDN_CONV_WIDTH;
+constexpr int CONV_STATE_LEN = FI_GDN_CONV_STATE_LEN;
+// v-heads per qk-head: the delta phase maps v-head h to qk-head h/HEADS_PER_QK.
+constexpr int HEADS_PER_QK = HV / H_Q;
 constexpr int ROWS_PER_WARP = 8;
 constexpr int GEMV_NSPLIT = 160;
 // The gate reduction below unrolls the GEMV partials as 5 warp-wide loads.
 static_assert(GEMV_NSPLIT == 5 * 32, "gate reduction assumes 5 warp-strided loads");
+// The b/a projection produces HV gate values and HV decay values, stored as
+// the low and high halves of the N_BA columns (see the delta phase's
+// base_b/base_a offsets).
+static_assert(N_BA == 2 * HV, "w_ba columns are [b gates | a decays], HV each");
+static_assert(HV % H_Q == 0, "each qk-head must serve a whole number of v-heads");
+// The delta phase gives each lane 4 consecutive channels of a D-wide row and
+// reduces across the warp; the B=1 fast path indexes rows with shifts/masks.
+static_assert(D == 4 * 32, "delta phase maps one D-wide row onto a warp, 4 per lane");
+static_assert((D & (D - 1)) == 0, "B=1 row index math uses D as a power of two");
+static_assert(D % ROWS_PER_WARP == 0, "warps own whole groups of state rows");
+// mixed_qkv is [q | k | v] with H_Q q-heads, H_Q k-heads and HV v-heads.
+static_assert(QKV_DIM == (2 * H_Q + HV) * D, "qkv_dim must match the head split");
+// The conv phase is unrolled over the width-4 / 3-step shift register below.
+static_assert(CONV_WIDTH == 4 && CONV_STATE_LEN == 3, "conv taps are unrolled as width 4");
+
+// log2(D), for the B=1 fast path's shift/mask row indexing.
+constexpr int ilog2_ce(int v) { return v <= 1 ? 0 : 1 + ilog2_ce(v >> 1); }
+constexpr int D_LOG2 = ilog2_ce(D);
 
 typedef __nv_bfloat16 bf16;
 
@@ -148,8 +179,8 @@ __global__ void gdn_fused_decode_kernel(
   const int Beff = kB1 ? 1 : B;
 
   // ---- Phase A1: GEMV partials ----
-  // tasks: (split in 0..GEMV_NSPLIT-1) x (b) x (col in 0..95). Partials are
-  // stored split-major per (col, b) so the gate reduction reads them with
+  // tasks: (split in 0..GEMV_NSPLIT-1) x (b) x (col in 0..N_BA-1). Partials
+  // are stored split-major per (col, b) so the gate reduction reads them with
   // warp-coalesced loads.
   long gemv_tasks = (long)GEMV_NSPLIT * Beff * N_BA;
   for (long t = tid; t < gemv_tasks; t += nthreads) {
@@ -237,7 +268,7 @@ __global__ void gdn_fused_decode_kernel(
     int b;
     if constexpr (kB1) {
       v0 = (int)(first_row & (D - 1));
-      h = (int)(first_row >> 7);
+      h = (int)(first_row >> D_LOG2);
       b = 0;
     } else {
       v0 = first_row % D;
@@ -267,7 +298,7 @@ __global__ void gdn_fused_decode_kernel(
     int b;
     if constexpr (kB1) {
       v0 = (int)(first_row & (D - 1));
-      h = (int)(first_row >> 7);
+      h = (int)(first_row >> D_LOG2);
       b = 0;
     } else {
       v0 = first_row % D;
