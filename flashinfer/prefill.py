@@ -1917,6 +1917,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         use_fp16_qk_reduction: bool = False,
         sm_scale: Optional[float] = None,
         window_left: int = -1,
+        window_right: int = -1,
         logits_soft_cap: Optional[float] = None,
         rope_scale: Optional[float] = None,
         rope_theta: Optional[float] = None,
@@ -1984,6 +1985,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
+        window_right : int
+            The right (inclusive) window size for the attention window when set to ``-1``,
+            the window size will be set to the full length of the sequence. Defaults to ``-1``.
+            (only meaningful for non-causal/ bidirectional attention)
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.),
             if not provided, will be set to ``0``.
@@ -2157,6 +2162,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             head_dim_vo,
             causal,
             window_left,
+            window_right,
         ]
         if backend == "fa2":
             args.append(fixed_split_size)
@@ -2258,6 +2264,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
+        window_right : int
+            The right (inclusive) window size for the attention window when set to ``-1``,
+            the window size will be set to the full length of the sequence. Defaults to ``-1``.
+            (only meaningful for non-causal/ bidirectional attention)
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -2649,6 +2659,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 head_dim_vo,
                 causal,
                 window_left,
+                window_right,
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size
@@ -3613,6 +3624,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         window_left : int
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
+        window_right : int
+            The right (inclusive) window size for the attention window when set to ``-1``,
+            the window size will be set to the full length of the sequence. Defaults to ``-1``.
+            (only meaningful for non-causal/ bidirectional attention)
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
             provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -4014,6 +4029,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 head_dim_vo,
                 causal,
                 window_left,
+                window_right,
             ]
             if self._backend == "fa2":
                 args.append(fixed_split_size or -1)  # fixed_split_size

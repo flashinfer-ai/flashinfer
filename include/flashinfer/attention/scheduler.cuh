@@ -547,9 +547,9 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    uint32_t num_qo_heads, uint32_t num_kv_heads, uint32_t head_dim,
                                    uint32_t page_size, uint32_t max_batch_size_if_split,
                                    bool enable_cuda_graph, int32_t window_left,
-                                   int32_t fixed_split_size, bool disable_split_kv,
-                                   int64_t uniform_q_len, uint32_t head_dim_qk = 0,
-                                   uint32_t kv_dtype_bytes = 2) {
+                                   int32_t window_right, int32_t fixed_split_size,
+                                   bool disable_split_kv, int64_t uniform_q_len,
+                                   uint32_t head_dim_qk = 0, uint32_t kv_dtype_bytes = 2) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
@@ -624,12 +624,22 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
     }
   }
 
-  // Calculate the actual needed CTA when considering sliding window
+  // Calculate the actual needed CTA when considering sliding window.
+  // For bidirectional local attention (e.g. ModernBERT-style alternating
+  // global/local layers), the busiest tile's KV span is bounded by both
+  // window_left (reach of the tile's earliest row) and window_right
+  // (reach of the tile's last row), plus the tile's own width. Each side
+  // is independently optional (`-1` = unbounded on that side, matching
+  // the existing window_left convention), so decoder-only / causal-only
+  // callers that never pass window_right see identical behavior to before.
   std::vector<int64_t> effective_kv_len_arr(batch_size);
+  const bool has_window = (window_left >= 0) || (window_right >= 0);
+  const int64_t window_span =
+      std::max<int64_t>(window_left, 0) + std::max<int64_t>(window_right, 0);
   for (uint32_t i = 0; i < batch_size; ++i) {
-    // pad CTA_TILE_Q to consider the causal kv-len
+    // pad CTA_TILE_Q to consider the causal / windowed kv-len
     effective_kv_len_arr[i] =
-        std::min(window_left >= 0 ? ceil_div(window_left + cta_tile_q, page_size) : kv_len_arr[i],
+        std::min(has_window ? ceil_div(window_span + cta_tile_q, page_size) : kv_len_arr[i],
                  kv_len_arr[i]);
   }
   bool split_kv = false;
@@ -767,8 +777,8 @@ inline cudaError_t PrefillPlanImpl(
     size_t int_workspace_size_in_bytes, PrefillPlanInfo& plan_info, IdType* qo_indptr_h,
     IdType* kv_indptr_h, uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads,
     uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
-    bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
-    bool disable_split_kv,
+    bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t window_right,
+    int32_t fixed_split_size, bool disable_split_kv,
     int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                  // splits by #colocated decode CTAs
     int64_t uniform_q_len, cudaStream_t stream, uint32_t kv_dtype_bytes = 2) {
@@ -795,8 +805,8 @@ inline cudaError_t PrefillPlanImpl(
         qo_tile_indices_vec, kv_tile_indices_vec, merge_indptr_vec, o_indptr_vec] =
       PrefillSplitQOKVIndptr(qo_indptr_h, kv_indptr_h, total_num_rows, batch_size, num_qo_heads,
                              num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
-                             enable_cuda_graph, window_left, fixed_split_size, disable_split_kv,
-                             uniform_q_len, head_dim_qk, kv_dtype_bytes);
+                             enable_cuda_graph, window_left, window_right, fixed_split_size,
+                             disable_split_kv, uniform_q_len, head_dim_qk, kv_dtype_bytes);
 
   plan_info.cta_tile_q = cta_tile_q;
   plan_info.total_num_rows = total_num_rows;
@@ -901,7 +911,8 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                uint32_t batch_size, uint32_t num_qo_heads, uint32_t num_kv_heads,
                                uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
                                bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left,
-                               int32_t fixed_split_size, bool disable_split_kv,
+                               int32_t window_right, int32_t fixed_split_size,
+                               bool disable_split_kv,
                                int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                                             // splits by #colocated decode CTAs
                                int64_t uniform_q_len, cudaStream_t stream,
@@ -922,9 +933,9 @@ inline cudaError_t PrefillPlanWorkspaceSize(
     size_t& float_workspace_size_in_bytes, size_t& int_workspace_size_in_bytes, IdType* qo_indptr_h,
     IdType* kv_indptr_h, uint32_t total_num_rows, uint32_t batch_size, uint32_t num_qo_heads,
     uint32_t num_kv_heads, uint32_t head_dim_qk, uint32_t head_dim_vo, uint32_t page_size,
-    bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
-    bool disable_split_kv, int64_t num_colocated_ctas, int64_t uniform_q_len, cudaStream_t stream,
-    uint32_t kv_dtype_bytes = 2) {
+    bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t window_right,
+    int32_t fixed_split_size, bool disable_split_kv, int64_t num_colocated_ctas,
+    int64_t uniform_q_len, cudaStream_t stream, uint32_t kv_dtype_bytes = 2) {
   PrefillPlanInfo plan_info;
   return PrefillPlanImpl<false>(float_workspace_size_in_bytes, int_workspace_size_in_bytes,
                                 /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
