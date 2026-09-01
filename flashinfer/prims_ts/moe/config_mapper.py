@@ -134,6 +134,7 @@ class _JsonBatchedGemmConfig:
     comment: str
     combo_index: int
     options: dict[str, object]
+    is_scheduler_union_variant: bool = False
 
 
 _SUPPORTED_JSON_OPTION_KEYS = frozenset(
@@ -582,6 +583,39 @@ def _expanded_prims_ts_json_configs() -> tuple[_JsonBatchedGemmConfig, ...]:
             )
             _validate_json_options(cfg, options)
             expanded.append(cfg)
+
+    # Keep every existing config and append the persistent fast-drain plus
+    # work-throttled counterpart when that exact scheduler variant is absent.
+    # Appending after the original expansion preserves every original global
+    # config index while making the scheduler-policy configurations available
+    # to fresh autotuning.
+    seen_options = {
+        json.dumps(cfg.options, sort_keys=True, separators=(",", ":"))
+        for cfg in expanded
+    }
+    original_configs = tuple(expanded)
+    for cfg in original_configs:
+        if str(cfg.options.get("tile_scheduler", "static")).lower() != "persistent":
+            continue
+        options = {
+            **cfg.options,
+            "use_clc_fast_drain": True,
+            "use_work_throttle": True,
+        }
+        options_key = json.dumps(options, sort_keys=True, separators=(",", ":"))
+        if options_key in seen_options:
+            continue
+        seen_options.add(options_key)
+        variant = _JsonBatchedGemmConfig(
+            global_index=len(expanded),
+            raw_index=cfg.raw_index,
+            comment=f"{cfg.comment} [fast-drain+work-throttle]",
+            combo_index=cfg.combo_index,
+            options=options,
+            is_scheduler_union_variant=True,
+        )
+        _validate_json_options(variant, options)
+        expanded.append(variant)
     return tuple(expanded)
 
 
@@ -819,6 +853,16 @@ def _resolve_moe_json_config_pair(
                         )
                     )
                 ),
+            )
+        )
+    else:
+        # Appended union variants must not reinterpret any persisted baseline
+        # pair index. Keep the complete original FC1 x FC2 product first and
+        # place every pair involving a new scheduler variant afterward.
+        config_pairs.sort(
+            key=lambda pair: int(
+                _json_config_by_global_index(pair[0]).is_scheduler_union_variant
+                or _json_config_by_global_index(pair[1]).is_scheduler_union_variant
             )
         )
     total = len(config_pairs)
