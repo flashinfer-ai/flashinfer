@@ -2688,7 +2688,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
         self._window_right = window_right
-        if window_right >= 0 and getattr(self, "_backend", None) not in ("fa2", "cute-dsl"):
+        if window_right >= 0 and getattr(self, "_backend", None) not in (
+            "fa2",
+            "cute-dsl",
+        ):
             raise NotImplementedError(
                 f"window_right is not supported on backend "
                 f"{getattr(self, '_backend', None)!r} (kernel cannot express a "
@@ -4068,7 +4071,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
         self._window_right = window_right
-        if window_right >= 0 and getattr(self, "_backend", None) not in ("fa2", "cute-dsl"):
+        if window_right >= 0 and getattr(self, "_backend", None) not in (
+            "fa2",
+            "cute-dsl",
+        ):
             raise NotImplementedError(
                 f"window_right is not supported on backend "
                 f"{getattr(self, '_backend', None)!r} (kernel cannot express a "
