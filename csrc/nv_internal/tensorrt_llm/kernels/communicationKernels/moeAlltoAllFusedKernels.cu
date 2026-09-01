@@ -182,11 +182,11 @@ int dtypeCode(nvinfer1::DataType dtype) {
 }
 
 void preloadCombineKernel(int top_k) {
-#define PRELOAD_COMBINE_TOP_K(TOP_K)                                                \
-  case TOP_K:                                                                       \
-    preloadKernel<PreloadKernelSlot::kCombineTopK##TOP_K>(                          \
-        "mnnvl_moe_alltoall_combine_top_k_" #TOP_K,                                \
-        kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_##TOP_K);                \
+#define PRELOAD_COMBINE_TOP_K(TOP_K)                                 \
+  case TOP_K:                                                        \
+    preloadKernel<PreloadKernelSlot::kCombineTopK##TOP_K>(           \
+        "mnnvl_moe_alltoall_combine_top_k_" #TOP_K,                  \
+        kernel_flashinfer_mnnvl_moe_alltoall_combine_top_k_##TOP_K); \
     return
   switch (top_k) {
     PRELOAD_COMBINE_TOP_K(1);
@@ -289,12 +289,10 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params) {
   // CUDA lazy module loading may synchronize the device. Load every downstream
   // function before publication can enter its cross-rank wait.
   preloadKernel<PreloadKernelSlot::kStageCombine>(
-      "mnnvl_moe_alltoall_stage_combine",
-      kernel_flashinfer_mnnvl_moe_alltoall_stage_combine);
+      "mnnvl_moe_alltoall_stage_combine", kernel_flashinfer_mnnvl_moe_alltoall_stage_combine);
   if (!fuse_topk6_publication) {
     preloadKernel<PreloadKernelSlot::kPublishCombine>(
-        "mnnvl_moe_alltoall_publish_combine",
-        kernel_flashinfer_mnnvl_moe_alltoall_publish_combine);
+        "mnnvl_moe_alltoall_publish_combine", kernel_flashinfer_mnnvl_moe_alltoall_publish_combine);
   }
   if (useBf16TopK6Combine(params)) {
     preloadKernel<PreloadKernelSlot::kCombineBf16TopK6>(
