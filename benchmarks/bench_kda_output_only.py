@@ -14,6 +14,15 @@ Override with --heads (e.g. 96 for TP=1):
               cake`` selects the exported Cake CUDA kernels instead of the
               CuTe-DSL kernel (supported for T in {1, 2, 4, 5, 6} only).
 
+``--emit-corrections`` switches to the FULL production verify contract:
+raw gates with the in-kernel Kimi K3 lower-bound transform, beta logits
+with the in-kernel sigmoid, and the slot-indexed float32 correction /
+bf16 kg caches, timed through the public
+``recurrent_kda(disable_state_update=True, ...)`` path (the packed
+frozen-verify kernel). The baseline is given the same gate semantics.
+Without the flag, the default mode measures the plain frozen decode
+(precomputed log-space gate, outputs only) per backend.
+
 Timing uses ``flashinfer.testing.bench_gpu_time`` with CUPTI and cold L2
 (flushed before every iteration) — the same methodology as
 ``bench_gdn_decode.py`` — so numbers are directly comparable with the GDN
@@ -55,26 +64,60 @@ def run(B, T, H, HV, baseline_backend, emit=False, dev="cuda"):
     q = torch.randn(B, T, H, K, dtype=torch.bfloat16, device=dev)
     k = torch.randn_like(q)
     v = torch.randn(B, T, HV, V, dtype=torch.bfloat16, device=dev)
-    g = F.logsigmoid(torch.randn(B, T, HV, K, dtype=torch.float32, device=dev)).to(
-        torch.bfloat16
-    )
-    beta = (
-        torch.randn(B, T, HV, dtype=torch.bfloat16, device=dev)
-        .sigmoid()
-        .to(torch.bfloat16)
-    )
-    h0 = torch.randn(max(B, 2), HV, V, K, dtype=torch.bfloat16, device=dev) * 0.1
+    if emit:
+        # Full production verify contract: raw gate + beta logits, both
+        # transformed in-kernel (lower_bound=-5 sigmoid gate, beta sigmoid).
+        g = torch.randn(B, T, HV, K, dtype=torch.bfloat16, device=dev)
+        beta = torch.randn(B, T, HV, dtype=torch.bfloat16, device=dev)
+        A_log = torch.randn(H, dtype=torch.float32, device=dev) * 0.3
+        dt_bias = torch.randn(H * K, dtype=torch.float32, device=dev) * 0.1
+        gate_kwargs = dict(
+            A_log=A_log,
+            dt_bias=dt_bias,
+            use_gate_in_kernel=True,
+            lower_bound=-5.0,
+            beta_is_logit=True,
+        )
+    else:
+        g = F.logsigmoid(torch.randn(B, T, HV, K, dtype=torch.float32, device=dev)).to(
+            torch.bfloat16
+        )
+        beta = (
+            torch.randn(B, T, HV, dtype=torch.bfloat16, device=dev)
+            .sigmoid()
+            .to(torch.bfloat16)
+        )
+        gate_kwargs = {}
+    pool = max(B, 2)
+    h0 = torch.randn(pool, HV, V, K, dtype=torch.bfloat16, device=dev) * 0.1
     idx = torch.arange(B, dtype=torch.int32, device=dev)
     outb = torch.empty(B, T, HV, V, dtype=torch.bfloat16, device=dev)
     scale = K**-0.5
 
-    corrb = torch.empty(B, T, HV, V, dtype=torch.bfloat16, device=dev)
-    kgb = torch.empty(B, T, HV, 2 * K, dtype=torch.bfloat16, device=dev)
+    # Production cache layout: slot-indexed, fp32 corrections / bf16 kg.
+    corrb = torch.empty(pool, HV, T, V, dtype=torch.float32, device=dev)
+    kgb = torch.empty(pool, HV, T, 2 * K, dtype=torch.bfloat16, device=dev)
+
+    def run_full():
+        """Full-contract frozen verify via the public recurrent_kda mode."""
+        return recurrent_kda(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=scale,
+            initial_state_source=h0,
+            initial_state_indices=idx,
+            disable_state_update=True,
+            correction_cache=corrb,
+            kg_cache=kgb,
+            output=outb,
+            **gate_kwargs,
+        )
 
     def run_oo(be):
-        """Run the output-only op with the selected backend."""
-        # emit=True benchmarks the full RecoverSSM verify contract
-        # (out + corrections U + kg cache).
+        """Plain frozen decode (outputs only) with the selected backend."""
         return kda_output_only_decode(
             q,
             k,
@@ -86,9 +129,6 @@ def run(B, T, H, HV, baseline_backend, emit=False, dev="cuda"):
             scale=scale,
             output=outb,
             backend=be,
-            emit_corrections=emit,
-            corrections_out=corrb if emit else None,
-            kg_cache_out=kgb if emit else None,
         )
 
     # Baseline: fused spec-decode verify (per-token outputs + checkpoints).
@@ -109,6 +149,7 @@ def run(B, T, H, HV, baseline_backend, emit=False, dev="cuda"):
     def run_base():
         """Run the fused spec-decode verify baseline (recurrent_kda)."""
         kw = {"num_spec_tokens": T - 1} if T > 1 else {}
+        kw.update(gate_kwargs)
         return recurrent_kda(
             qp,
             kp,
@@ -129,9 +170,13 @@ def run(B, T, H, HV, baseline_backend, emit=False, dev="cuda"):
 
     # ---- refcheck: all implementations must agree before timing ----
     out_base = run_base()[0].reshape(B, T, HV, V).clone()
+    if emit:
+        o = run_full()[0]
+        d = (o.float() - out_base.float()).abs().max().item()
+        assert d < 2e-2, f"B={B} T={T} full contract: max|d|={d:.3e} vs baseline"
+        return {"full": t_us(run_full), "baseline": t_us(run_base)}
     for be in ["wy", "recurrent", "auto"]:
-        r = run_oo(be)
-        o = r[0] if emit else r
+        o = run_oo(be)
         d = (o.float() - out_base.float()).abs().max().item()
         assert d < 2e-2, f"B={B} T={T} backend={be}: max|d|={d:.3e} vs baseline"
 
@@ -169,22 +214,37 @@ def main():
             )
     H = HV = args.heads
 
-    print(
-        f"KDA output-only decode benchmark (H=HV={H}, K=V=128, "
-        f"baseline={args.baseline_backend}, CUPTI cold-L2)"
+    mode = (
+        "FULL verify contract (in-kernel gate+beta, fp32 slot caches)"
+        if args.emit_corrections
+        else "plain frozen decode (precomputed gate, outputs only)"
     )
     print(
-        f"{'B':>4} {'T':>3} | {'wy(us)':>8} {'rec_oo':>8} {'auto':>8} "
-        f"{'baseline':>8} {'auto_spdup':>10}"
+        f"KDA frozen-decode benchmark (H=HV={H} = Kimi K3 96 heads / TP=8, "
+        f"K=V=128, baseline={args.baseline_backend}, CUPTI cold-L2)"
     )
+    print(f"mode: {mode}")
+    if args.emit_corrections:
+        print(f"{'B':>4} {'T':>3} | {'full(us)':>9} {'baseline':>9} {'speedup':>8}")
+    else:
+        print(
+            f"{'B':>4} {'T':>3} | {'wy(us)':>8} {'rec_oo':>8} {'auto':>8} "
+            f"{'baseline':>8} {'auto_spdup':>10}"
+        )
     for T in args.tokens:
         for B in args.batches:
             t = run(B, T, H, HV, args.baseline_backend, emit=args.emit_corrections)
-            print(
-                f"{B:>4} {T:>3} | {t['wy']:>8.2f} {t['recurrent']:>8.2f} "
-                f"{t['auto']:>8.2f} {t['baseline']:>8.2f} "
-                f"{t['baseline'] / t['auto']:>9.2f}x"
-            )
+            if args.emit_corrections:
+                print(
+                    f"{B:>4} {T:>3} | {t['full']:>9.2f} {t['baseline']:>9.2f} "
+                    f"{t['baseline'] / t['full']:>7.2f}x"
+                )
+            else:
+                print(
+                    f"{B:>4} {T:>3} | {t['wy']:>8.2f} {t['recurrent']:>8.2f} "
+                    f"{t['auto']:>8.2f} {t['baseline']:>8.2f} "
+                    f"{t['baseline'] / t['auto']:>9.2f}x"
+                )
 
 
 if __name__ == "__main__":

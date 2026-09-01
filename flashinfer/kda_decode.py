@@ -452,6 +452,23 @@ def fused_kda_decode(
     )
 
 
+# Cached trivial metadata for the frozen mode's uniform batched form: the
+# arange cu_seqlens / slot indices are content-stable per (device, B, T), so
+# building them once keeps the hot path allocation- and launch-free (required
+# for CUDA-graph capture and honest kernel-time benchmarking).
+_FROZEN_META: dict = {}
+
+
+def _frozen_arange(device, n, step=1):
+    key = (str(device), int(n), int(step))
+    t = _FROZEN_META.get(key)
+    if t is None:
+        with torch.inference_mode(False):
+            t = torch.arange(0, n * step, step, dtype=torch.int32, device=device)
+        _FROZEN_META[key] = t
+    return t
+
+
 def _run_frozen_recurrent_kda(
     q,
     k,
@@ -549,7 +566,7 @@ def _run_frozen_recurrent_kda(
         # tensors; .reshape falls back to a copy for non-contiguous inputs).
         B, T_in = q.shape[0], q.shape[1]
         H, HV = q.shape[2], v.shape[2]
-        qsl = torch.arange(0, (B + 1) * T_in, T_in, dtype=torch.int32, device=device)
+        qsl = _frozen_arange(device, B + 1, T_in)
         qp = q.reshape(1, B * T_in, H, q.shape[3])
         kp = k.reshape(1, B * T_in, H, k.shape[3])
         vp = v.reshape(1, B * T_in, HV, v.shape[3])
@@ -580,7 +597,7 @@ def _run_frozen_recurrent_kda(
             )
         reshape_out = None
     if slots is None:
-        slots = torch.arange(B, dtype=torch.int32, device=device)
+        slots = _frozen_arange(device, B)
     if want_caches:
         corr_t, kg_t = correction_cache, kg_cache
     else:
@@ -610,6 +627,9 @@ def _run_frozen_recurrent_kda(
         use_gate_in_kernel=use_gate_in_kernel,
         beta_is_logit=beta_is_logit,
         scale=scale,
+        # recurrent_kda slot convention: 0 is a valid slot; only negative
+        # slots are padding (the vLLM drop-in reserves slot 0 as null).
+        null_min=0,
     )
     if reshape_out is not None:
         out = out.reshape(reshape_out[0], reshape_out[1], out.shape[2], out.shape[3])

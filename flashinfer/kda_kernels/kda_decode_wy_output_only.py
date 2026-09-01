@@ -130,6 +130,7 @@ class KdaDecodeWyOutputOnlyKernel:
         n_valid=16,
         emit_corrections=False,
         vllm_dropin=False,
+        null_min=1,
     ):
         """Bind the compile-time specialization knobs (see class docstring)."""
         self._min_blocks_per_mp = min_blocks_per_mp
@@ -156,6 +157,10 @@ class KdaDecodeWyOutputOnlyKernel:
         # [blocks, H, spec_len, V], and a raw-k | raw-g kg cache
         # [blocks, H, spec_len, 2K]. Implies emit machinery and beta logits.
         self._dropin = bool(vllm_dropin)
+        # Smallest valid state slot in dropin mode: slots below it are null
+        # (zero outputs, untouched caches). 1 = vLLM (slot 0 reserved),
+        # 0 = flashinfer recurrent_kda (only negative slots are padding).
+        self._null_min = int(null_min)
         if self._dropin:
             self._emit = True
             self._beta_is_logit = True
@@ -354,7 +359,7 @@ class KdaDecodeWyOutputOnlyKernel:
             _bos = gQsl.iterator[pid_b].to(cutlass.Int32)
             _seq_len = gQsl.iterator[pid_b + 1].to(cutlass.Int32) - _bos
             _state_idx = cache_idx
-            _is_null = _state_idx <= 0
+            _is_null = _state_idx < cutlass.Int32(self._null_min)
             if cache_idx < 0:
                 cache_idx = cutlass.Int32(0)
 
@@ -606,7 +611,8 @@ class KdaDecodeWyOutputOnlyKernel:
         # Triton kernel's token_valid masking. The extra sync publishes the
         # reads before the L2-norm warps overwrite sK in place.
         if const_expr(self._dropin):
-            if _state_idx > 0:  # skip null slots (avoid DSL `not` on runtime bool)
+            # skip null slots (avoid DSL `not` on runtime bool)
+            if _state_idx >= cutlass.Int32(self._null_min):
                 _kg_cta = _state_idx * s_kg_blk + pid_hv * s_kg_head
                 for _kt in cutlass.range_constexpr(T):
                     if cutlass.Int32(_kt) < _seq_len:
@@ -1565,7 +1571,7 @@ class KdaDecodeWyOutputOnlyKernel:
                     _fl_lds = _sW_base + _fl_row * Int32(V_PADDED * 4) + _fl_pos * 16
                     _fl_off = (_corr_cta + _fl_row * s_c_pos + _fl_pos * 4) * 2
                     _v0, _v1, _v2, _v3 = _lds_v4_b32(_fl_lds)
-                    if _state_idx > 0:
+                    if _state_idx >= cutlass.Int32(self._null_min):
                         if _fl_row < _seq_len:
                             _st_global_v4_b32(_gCorr_base, _fl_off, _v0, _v1, _v2, _v3)
             else:
@@ -2318,6 +2324,7 @@ def kda_recoverssm_verify(
     use_gate_in_kernel: bool = True,
     beta_is_logit: bool = True,
     scale: Optional[float] = None,
+    null_min: int = 1,
 ) -> torch.Tensor:
     """Drop-in replacement for vLLM's ``kda_recoverssm_verify`` (Kimi K3).
 
@@ -2424,6 +2431,7 @@ def kda_recoverssm_verify(
         t_disc,
         gate_mode,
         bool(beta_is_logit),
+        int(null_min),
         HV,
         H,
     )
@@ -2485,6 +2493,7 @@ def kda_recoverssm_verify(
             n_valid=16,
             emit_corrections=True,
             vllm_dropin=True,
+            null_min=null_min,
         )
         options = _compile_options(device)
         _CACHE[cache_key] = (

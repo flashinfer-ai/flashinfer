@@ -524,6 +524,9 @@ def test_frozen_mode_public_api_caches():
     corr_r = torch.full_like(corr, 7.0)
     kg_r = torch.full_like(kg, 7.0)
     qsl = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=q.device)
+    # null_min=0: the recurrent_kda mode treats slot 0 as valid (only
+    # negative slots are padding), unlike the vLLM drop-in default where
+    # slot 0 is the reserved null block.
     out_r = kda_recoverssm_verify(
         q.view(1, B * T, H, 128),
         k.view(1, B * T, H, 128),
@@ -539,6 +542,7 @@ def test_frozen_mode_public_api_caches():
         qsl,
         idx,
         T,
+        null_min=0,
     )
     assert torch.equal(out.reshape(1, B * T, HV, 128), out_r)
     assert torch.equal(corr, corr_r) and torch.equal(kg, kg_r)
