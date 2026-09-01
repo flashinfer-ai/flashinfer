@@ -62,6 +62,7 @@
           - "tests/jit/test_flash_kda*"
           - "tests/jit/test_cake_kda*"
           - "docs/api/kda*"
+          - "benchmarks/routines/kda.py"
           - "benchmarks/bench_recurrent_kda*"
           - "benchmarks/bench_packed_kda*"
           - "benchmarks/reduce_kda*"
