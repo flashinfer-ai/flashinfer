@@ -1111,6 +1111,8 @@ def single_prefill_with_kv_cache_with_jit_module(
         Defaults to ``MaskMode.NON_CAUSAL.value``.
     window_left : int
         Left window size for sliding-window attention; ``-1`` disables it.
+    window_right : int
+        Right window size for sliding-window attention in bidirectional models; ``-1`` disables it.
     return_lse : bool
         Whether to allocate and return the log-sum-exp tensor.  Defaults to ``False``.
 
@@ -1282,6 +1284,9 @@ def single_prefill_with_kv_cache(
     window_left : int
         The left (inclusive) window size for the attention window, when set to ``-1``, the window
         size will be set to the full length of the sequence. Defaults to ``-1``.
+    window_right : int
+        The right (inclusive) window size for a bidirectional attention window, when set to ``-1``,
+        the window size will be unbounded for lookahead. Defaults to ``-1``.
     logits_soft_cap : Optional[float]
         The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.), if not
         provided, will be set to ``0``. If greater than 0, the logits will be capped according to
@@ -1986,8 +1991,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The left (inclusive) window size for the attention window, when set to ``-1``, the window
             size will be set to the full length of the sequence. Defaults to ``-1``.
         window_right : int
-            The right (inclusive) window size for the attention window when set to ``-1``,
-            the window size will be set to the full length of the sequence. Defaults to ``-1``.
+            The right (inclusive) window size for the attention window, when set to ``-1``, the window
+            size will be unbounded for lookahead. Defaults to ``-1``.
             (only meaningful for non-causal/ bidirectional attention)
         logits_soft_cap : Optional[float]
             The attention logits soft capping value (used in Gemini, Grok and Gemma-2, etc.),
