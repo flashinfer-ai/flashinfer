@@ -106,24 +106,28 @@ def bind_namespace(
     return dict(bound.arguments)
 
 
-def build_extractor_maps(templates: list) -> list[dict[str, Callable]]:
-    """Pre-build each template's per-axis extractor callables (once, at install)."""
-    maps: list[dict[str, Callable]] = []
+def build_extractor_maps(
+    templates: list,
+) -> list[dict[str, Callable] | None]:
+    """Pre-build each template's axis extractors, preserving failed entries."""
+    maps: list[dict[str, Callable] | None] = []
     for tmpl in templates:
         try:
             maps.append(tmpl._build_axis_extractors())
         except Exception:  # noqa: BLE001 — a malformed template must not break others
-            continue
+            maps.append(None)
     return maps
 
 
 def extract_axes(
-    extractor_maps: list[dict[str, Callable]], namespace: dict[str, Any]
+    extractor_maps: list[dict[str, Callable] | None], namespace: dict[str, Any]
 ) -> dict[str, int]:
     """Run extractors over a (param → value) namespace → full concrete axis vector.
     Multiple templates merge: each axis is filled by the first that resolves it."""
     axes: dict[str, int] = {}
     for emap in extractor_maps:
+        if emap is None:
+            continue
         for axis_name, fn in emap.items():
             if axis_name in axes:
                 continue
@@ -236,27 +240,52 @@ def _make_wrapper(
     original: Callable,
     build_namespace: Callable[[tuple, dict], dict[str, Any]],
     extractor_maps: list,
-    template: Any,
-    dests: dict,
+    templates: list,
+    template_dispatch: Callable | None,
+    dests_by_template: list[dict],
     is_inplace: bool,
+    stateful_adapter: Any | None,
     solutions_by_name: dict[str, Any],
 ) -> Callable:
     """Wrapper that routes a call to a registered solution by *definition name*.
 
-    Per call: build the namespace, extract the const axes, compute this
-    template's definition name (``name_prefix`` + const-axis abbrevs — the same
-    logic the trace collector uses), and look it up in ``solutions_by_name``. The
-    per-name decision (resolved entry or miss) is cached, so later calls for the
-    same shape are a dict lookup. Inside CUDA-graph capture only the cached path
-    runs (eager warmup populates the cache before capture)."""
+    Per call: build the namespace, resolve the same template selected by
+    ``fi_trace``, extract its const axes, compute its definition name, and look
+    it up in ``solutions_by_name``.  The per-name decision (resolved entry or
+    miss) is cached, so later calls for the same shape are a dict lookup. Inside
+    CUDA-graph capture only the cached path runs (eager warmup populates the
+    cache before capture)."""
     cache_lock = Lock()
     by_name: dict[str, _Entry | None] = {}
+    template_indices = {id(template): idx for idx, template in enumerate(templates)}
 
     @functools.wraps(original)
     def wrapper(*args, **kwargs):
         try:
             namespace = build_namespace(args, kwargs)
-            axes = extract_axes(extractor_maps, namespace)
+            template = (
+                templates[0]
+                if template_dispatch is None
+                else template_dispatch(save_dir=None, name=None, **namespace)
+            )
+            # Apply only a canonical template published by this dispatcher.
+            # A dynamic or unknown template remains traceable but has no
+            # registered Apply binding, so preserve the original API call.
+            template_idx = template_indices.get(id(template))
+            if template_idx is None:
+                return original(*args, **kwargs)
+            extractor_map = extractor_maps[template_idx]
+            if extractor_map is None:
+                return original(*args, **kwargs)
+            if stateful_adapter is not None:
+                self_obj = args[0] if args else None
+                namespace = plan_capture.augment_namespace(
+                    stateful_adapter, template, namespace, self_obj
+                )
+            dests = dests_by_template[template_idx]
+            if is_inplace and not dests:
+                return original(*args, **kwargs)
+            axes = extract_axes([extractor_map], namespace)
             name = template.definition_name(axes)
         except Exception:  # noqa: BLE001 — never let extraction break the engine
             return original(*args, **kwargs)
@@ -505,6 +534,15 @@ def _registry_by_fi_api() -> dict[str, tuple[Callable, list]]:
     return out
 
 
+def _trace_dispatcher_for(original: Callable) -> Callable | None:
+    """Return the trace-time runtime selector registered for ``original``."""
+    try:
+        from flashinfer.api_logging import _TRACE_DISPATCHERS  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    return _TRACE_DISPATCHERS.get(original)
+
+
 # ---------------------------------------------------------------------------
 # Install / state
 # ---------------------------------------------------------------------------
@@ -602,10 +640,11 @@ def enable_apply(solutions: dict[str, Any] | None = None) -> int:
         wrapped = 0
         matched_apis = 0
         for fi_api, (original, templates) in registry.items():
-            template0 = templates[0] if templates else None
-            if template0 is None:
+            if not templates:
                 continue
-            if not _template_matches_any(template0, sol_map):
+            if not any(
+                _template_matches_any(template, sol_map) for template in templates
+            ):
                 continue  # skip-wrap: no registered solution can target this API
             resolved = _resolve_target(fi_api)
             if resolved is None:
@@ -618,43 +657,40 @@ def enable_apply(solutions: dict[str, Any] | None = None) -> int:
 
             matched_apis += 1
             extractor_maps = build_extractor_maps(templates)
-            dests = _derive_output_dests(template0, original)
+            dests_by_template = [
+                _derive_output_dests(template, original) for template in templates
+            ]
             is_inplace = _is_inplace_api(original)
-            if is_inplace and not dests:
-                _log.warning(
-                    "Trace Apply: %s is in-place but has no output destination map; "
-                    "skipping to avoid silent corruption.",
-                    fi_api,
-                )
-                continue
-
+            stateful_adapter = None
+            build_ns = _stateless_namespace_builder(original)
             if plan_capture.is_stateful(fi_api):
-                adapter = plan_capture.adapter_for(fi_api)
-                build_ns = _stateful_namespace_builder(original, template0, adapter)
-                if hasattr(owner, adapter.plan_attr):
-                    plan_current = getattr(owner, adapter.plan_attr)
+                stateful_adapter = plan_capture.adapter_for(fi_api)
+                if hasattr(owner, stateful_adapter.plan_attr):
+                    plan_current = getattr(owner, stateful_adapter.plan_attr)
                     if not getattr(plan_current, "_trace_apply", False):
                         setattr(
-                            owner, adapter.plan_attr, _make_plan_wrapper(plan_current)
+                            owner,
+                            stateful_adapter.plan_attr,
+                            _make_plan_wrapper(plan_current),
                         )
                         _patches.append(
                             _Patch(
                                 owner=owner,
-                                attr=adapter.plan_attr,
+                                attr=stateful_adapter.plan_attr,
                                 original=plan_current,
                             )
                         )
-            else:
-                build_ns = _stateless_namespace_builder(original)
 
             wrapper = _make_wrapper(
                 fi_api=fi_api,
                 original=current,
                 build_namespace=build_ns,
                 extractor_maps=extractor_maps,
-                template=template0,
-                dests=dests,
+                templates=templates,
+                template_dispatch=_trace_dispatcher_for(original),
+                dests_by_template=dests_by_template,
                 is_inplace=is_inplace,
+                stateful_adapter=stateful_adapter,
                 solutions_by_name=sol_map,
             )
             # Patch the canonical target + module-level aliases for the same
