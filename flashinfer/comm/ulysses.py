@@ -611,9 +611,7 @@ class UlyssesCommunicator:
             # the byte budget fixed. Without this a narrower x would allocate
             # proportionally fewer bytes than _validate just admitted, and the
             # ICHECK_GE inside allocate_output would fire mid-collective.
-            capacity_elems = (
-                self.max_elems * self.dtype.itemsize
-            ) // x.dtype.itemsize
+            capacity_elems = (self.max_elems * self.dtype.itemsize) // x.dtype.itemsize
             tensor, info = module.allocate_output(self._pcie, x, mode, capacity_elems)
             pointer = tensor.data_ptr()
             self._pcie_outputs[pointer] = mode
@@ -708,7 +706,9 @@ class UlyssesCommunicator:
                 "the caller's operand in place, so there is no copy to remove"
             )
         if not isinstance(out, torch.Tensor):
-            raise TypeError(f"input_buffer expects a torch.Tensor, got {type(out).__name__}")
+            raise TypeError(
+                f"input_buffer expects a torch.Tensor, got {type(out).__name__}"
+            )
         if out.data_ptr() not in self._pcie_outputs:
             raise ValueError(
                 "input_buffer expects an output returned by allocate_output; the "
@@ -716,9 +716,13 @@ class UlyssesCommunicator:
             )
         shape = tuple(int(s) for s in shape)
         if len(shape) != 4:
-            raise ValueError(f"input_buffer expects a 4-D [B, S, H, D] shape, got {shape}")
+            raise ValueError(
+                f"input_buffer expects a 4-D [B, S, H, D] shape, got {shape}"
+            )
         if any(s <= 0 for s in shape):
-            raise ValueError(f"input_buffer shape dims must all be positive, got {shape}")
+            raise ValueError(
+                f"input_buffer shape dims must all be positive, got {shape}"
+            )
         module = get_ulysses_pcie_module()
         landing = module.input_landing(self._pcie, out)
         numel = int(torch.Size(shape).numel())
