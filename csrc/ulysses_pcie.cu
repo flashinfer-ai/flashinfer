@@ -141,7 +141,7 @@ Tuple<Tensor, Array<int64_t>> allocate_ulysses_pcie_output(fptr_t handle, Tensor
   const int64_t element_size = get_element_size(input);
   const int64_t elements = batch * out_seq * out_heads * dim;
   TVM_FFI_ICHECK_GE(capacity_elements, elements)
-      << "max_elems is smaller than the operand this call would produce";
+      << "declared capacity is smaller than the operand this call would produce";
   const int64_t capacity_bytes = capacity_elements * element_size;
 
   Tensor storage =

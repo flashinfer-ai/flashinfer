@@ -126,7 +126,7 @@ def main():
 
     rows = []
     with UlyssesCommunicator(
-        max_elems=q.numel(), dtype=dtype, backend="pcie", device=device
+        max_bytes=q.nbytes, dtype=dtype, backend="pcie", device=device
     ) as comm:
         q_out = comm.allocate_output(q, "scatter_heads")
         k_out = comm.allocate_output(k, "scatter_heads")
