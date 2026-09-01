@@ -920,7 +920,7 @@ inline cudaError_t PrefillPlan(
                                int_workspace_size_in_bytes, plan_info, qo_indptr_h, kv_indptr_h,
                                total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk,
                                head_dim_vo, page_size, enable_cuda_graph, sizeof_dtype_o,
-                               window_left, fixed_split_size, disable_split_kv, num_colocated_ctas,
+                               window_left, window_right, fixed_split_size, disable_split_kv, num_colocated_ctas,
                                uniform_q_len, stream, kv_dtype_bytes);
 }
 
@@ -939,7 +939,7 @@ inline cudaError_t PrefillPlanWorkspaceSize(
                                 /*int_workspace_size_in_bytes=*/0, plan_info, qo_indptr_h,
                                 kv_indptr_h, total_num_rows, batch_size, num_qo_heads, num_kv_heads,
                                 head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
-                                sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv,
+                                sizeof_dtype_o, window_left, window_right, fixed_split_size, disable_split_kv,
                                 num_colocated_ctas, uniform_q_len, stream, kv_dtype_bytes);
 }
 
