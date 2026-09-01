@@ -30,7 +30,6 @@ def gen_tinygemm2_sm100_module() -> JitSpec:
         [jit_env.FLASHINFER_CSRC_DIR / "tinygemm2_sm100.cu"],
         extra_cuda_cflags=sm100a_nvcc_flags
         + ["-gencode=arch=compute_103a,code=sm_103a"]
-        # SM107 (Rubin) needs CUDA 13.4; older toolkits reject compute_107a.
         + (
             ["-gencode=arch=compute_107a,code=sm_107a"]
             if is_cuda_version_at_least("13.4")
