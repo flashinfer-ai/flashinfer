@@ -384,9 +384,11 @@ __global__ void __launch_bounds__(kBlock) QSAPreIndexerKernel(QSAPreIndexerParam
   const int32_t query_start = a.query_start_loc[request];
   const int32_t query_end = a.query_start_loc[request + 1];
   const int32_t query_len = query_end - query_start;
-  // A request with no tokens has nothing to pool and no last token to read the
-  // chunk's end from; query_end - 1 would index behind the tensor.
-  if (query_len <= 0) return;
+  // The offsets are the caller's too, and only their length was checked. A
+  // request with no tokens has nothing to pool and no last token to read the
+  // chunk's end from, and a range that runs off either end of the token axis
+  // would make the read below land outside logical_positions.
+  if (query_len <= 0 || query_start < 0 || query_end > a.num_tokens) return;
   const int64_t chunk_end = a.logical_positions[query_end - 1];
   const int64_t chunk_start = chunk_end - query_len + 1;
   const int32_t ratio = a.compress_ratio;

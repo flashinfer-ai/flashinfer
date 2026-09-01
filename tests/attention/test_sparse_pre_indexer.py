@@ -113,6 +113,8 @@ def _reference(
         start = int(query_start_loc[request])
         end = int(query_start_loc[request + 1])
         query_len = end - start
+        if query_len <= 0 or start < 0 or end > num_tokens:
+            continue
         chunk_end = int(logical_positions[end - 1])
         chunk_start = chunk_end - query_len + 1
         num_groups = (chunk_end + 1) // compress_ratio - chunk_start // compress_ratio
@@ -197,6 +199,7 @@ def _case(
     num_requests=1,
     seed=0,
     history=False,
+    starts=None,
 ):
     device = torch.device("cuda")
     torch.manual_seed(seed)
@@ -211,8 +214,15 @@ def _case(
     k_weight = torch.randn(head_dim, dtype=dtype, device=device) * 0.2
     table = _pair_major_table(max_pos, head_dim, device, dtype, seed)
 
-    per = num_tokens // num_requests
-    starts = [i * per for i in range(num_requests)] + [num_tokens]
+    # An even split unless the caller wants a specific one; every tensor below
+    # is derived from these offsets, so a caller-supplied split stays consistent
+    # with the slots and the work list rather than only moving the boundaries.
+    if starts is None:
+        per = num_tokens // num_requests
+        starts = [i * per for i in range(num_requests)] + [num_tokens]
+    else:
+        assert len(starts) == num_requests + 1 and starts[-1] == num_tokens
+    per = max(starts[i + 1] - starts[i] for i in range(num_requests))
     query_start_loc = torch.tensor(starts, dtype=torch.int32, device=device)
 
     # A prior chunk sits behind this one whenever history is asked for, which is
@@ -268,6 +278,11 @@ def _case(
     work = []
     for r in range(num_requests):
         length = starts[r + 1] - starts[r]
+        if length == 0:
+            # The scheduler still emits a group for a request it gave nothing
+            # to; there is no last token to read the chunk's end from.
+            work.append([r, 0])
+            continue
         chunk_end = int(logical[starts[r + 1] - 1])
         chunk_start = chunk_end - length + 1
         groups = (chunk_end + 1) // compress_ratio - chunk_start // compress_ratio
@@ -651,14 +666,31 @@ def test_a_request_with_no_tokens_is_skipped():
     behind the tensor.
     """
     _skip_unless_cuda()
-    case = _case(num_tokens=16, num_requests=2)
-    # Collapse the first request: same start and end, all tokens in the second.
-    case["query_start_loc"] = torch.tensor(
-        [0, 0, case["q"].shape[0]], dtype=torch.int32, device=case["q"].device
-    )
-    q_out, state, compressed = _run(case)
-    assert torch.isfinite(q_out.float()).all()
-    assert torch.isfinite(compressed.float()).all()
+    # The whole case is built from this split, so the slots and the work list
+    # describe the collapsed request rather than an even one; the work list
+    # still names it, which is what reaches the guard.
+    case = _case(num_tokens=16, num_requests=2, starts=[0, 0, 16])
+    assert (case["work_metadata"][:, 0] == 0).any()
+    _assert_matches(case)
+
+
+@pytest.mark.parametrize("bad", ["past_the_end", "reversed", "negative"])
+def test_a_request_whose_offsets_leave_the_token_axis_is_skipped(bad):
+    """Only the length of query_start_loc is checked on the host, so a value
+    that runs off the token axis would put logical_positions[end - 1] outside
+    the tensor."""
+    _skip_unless_cuda()
+    case = _case(num_tokens=16, num_requests=1)
+    offsets = case["query_start_loc"].clone()
+    if bad == "past_the_end":
+        offsets[1] = 64
+    elif bad == "reversed":
+        offsets[0] = 8
+        offsets[1] = 4
+    else:
+        offsets[0] = -8
+    case["query_start_loc"] = offsets
+    _assert_matches(case)
 
 
 @pytest.mark.parametrize("short", ["k", "positions"])
