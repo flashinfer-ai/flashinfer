@@ -99,7 +99,7 @@ class WorkTileInfo(NamedTuple):
 
 _MAX_AB_STAGES = 12
 _SUPPORTED_SPLIT_K = (1, 2, 4, 8)
-_SMEM_CAPACITY_BYTES = cutlass.memory.get_smem_capacity_in_bytes("sm_100")
+_SMEM_CAPACITY_BYTES = cutlass.utils.get_smem_capacity_in_bytes("sm_100")
 
 
 def _align_up(value: int, alignment: int) -> int:
