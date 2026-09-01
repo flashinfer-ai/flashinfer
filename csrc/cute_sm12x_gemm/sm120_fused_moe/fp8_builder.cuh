@@ -47,8 +47,12 @@ struct SM120BlockScalingFusedMoeBuilder
   using StagedR2GStoreConfig = typename Base::StagedR2GStoreConfig;
 
   static constexpr bool kUnionSmem = SwapAB_;
-  static constexpr uint32_t LoadRegisterRequirement = Base::kUseStagedR2G ? 120 : 40;
-  static constexpr uint32_t MmaRegisterRequirement = Base::kUseStagedR2G ? 192 : 232;
+  static constexpr bool kUseM128N64RegisterReallocation =
+      !SwapAB_ && TileM_ == 128 && TileN_ == 64 && TileK_ == 128 && Stages_ == 2;
+  static constexpr uint32_t LoadRegisterRequirement =
+      kUseM128N64RegisterReallocation ? 24 : (Base::kUseStagedR2G ? 120 : 40);
+  static constexpr uint32_t MmaRegisterRequirement =
+      kUseM128N64RegisterReallocation ? 240 : (Base::kUseStagedR2G ? 192 : 232);
 
   struct SharedStorageLoadDefault : cute::aligned_struct<128, _0> {
     alignas(1024)
