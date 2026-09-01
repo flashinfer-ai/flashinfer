@@ -8127,6 +8127,10 @@
           "type": "ffi.std.PrimTy(dtype=int32)"
         },
         {
+          "name": "use_block64_final_state",
+          "type": "ffi.std.PrimTy(dtype=int32)"
+        },
+        {
           "name": "num_q_heads",
           "type": "ffi.std.PrimTy(dtype=int32)"
         },
@@ -8201,6 +8205,10 @@
           ],
           [
             "parameter",
+            "use_block64_final_state"
+          ],
+          [
+            "parameter",
             "num_q_heads"
           ],
           [
@@ -8229,10 +8237,10 @@
           ]
         ],
         "entry": "run_normalized_final_state",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_state_v1_4c642fe7ad",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_state_v1_dd2f99b0e5",
         "path": "host/gdn_cp_normalized_final_state.cc",
-        "sha256": "c9d76f6815281712216a5850f7f1718b81b579ba49b45c7d51861a06e45181cb",
-        "size_bytes": 12485
+        "sha256": "07adf9637572d0bf8b57c00cab6dab39276a918398bcd7cecf71af1970b2030f",
+        "size_bytes": 12889
       },
       "name": "normalized_final_state",
       "outputs": [
@@ -8242,8 +8250,8 @@
             "sm_103a"
           ],
           "path": "cuda/gdn_cp_normalized_final_state.cu",
-          "sha256": "8ef5642f28c40ffb2884ab71d4ab01193c6664796a0c810a477b912b87888d58",
-          "size_bytes": 8096
+          "sha256": "35aa89bdf0598ae0e60951f87be4c4c2880789de02e2539f0ad5b3d83439ad63",
+          "size_bytes": 8125
         }
       ],
       "schedule_symbol": "flashinfer_blackwell_gdn_cp_prefill_final_state_v1",
@@ -8305,6 +8313,10 @@
           "type": "ffi.std.PrimTy(dtype=int32)"
         },
         {
+          "name": "use_block64_final_state",
+          "type": "ffi.std.PrimTy(dtype=int32)"
+        },
+        {
           "name": "num_q_heads",
           "type": "ffi.std.PrimTy(dtype=int32)"
         },
@@ -8322,7 +8334,7 @@
         }
       ],
       "cuda_symbol": "kernel_flashinfer_blackwell_gdn_cp_prefill_final_state_bf16_v1",
-      "dynamic_smem_bytes": 640,
+      "dynamic_smem_bytes": 82560,
       "host_binding": {
         "arg_plan": [
           [
@@ -8379,6 +8391,10 @@
           ],
           [
             "parameter",
+            "use_block64_final_state"
+          ],
+          [
+            "parameter",
             "num_q_heads"
           ],
           [
@@ -8407,10 +8423,10 @@
           ]
         ],
         "entry": "run_normalized_final_state_bf16",
-        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_state_bf16_v1_4ae3df7e31",
+        "module_ident": "flashinfer_blackwell_gdn_cp_prefill_final_state_bf16_v1_38c26a221e",
         "path": "host/gdn_cp_normalized_final_state_bf16.cc",
-        "sha256": "a45a33f2d604b4eb1e6cdd22e910fc329b9d103abd346d19e6cc6ff56a4e4b21",
-        "size_bytes": 12510
+        "sha256": "ef1c723d2503c20a9b2c5c62952b086ec1c8c3a01980fc9911532363dd64a12c",
+        "size_bytes": 12959
       },
       "name": "normalized_final_state_bf16",
       "outputs": [
@@ -8420,8 +8436,8 @@
             "sm_103a"
           ],
           "path": "cuda/gdn_cp_normalized_final_state_bf16.cu",
-          "sha256": "afb37981ad7e3f8f2b2a8b0d71ff3a4fcd3cd2c6b434433b6c6c7a7d1aa73d04",
-          "size_bytes": 8314
+          "sha256": "71da518b688ef8d4d0f6332bcbedf4e28dfa030cb228db8dc4def4739b7b678f",
+          "size_bytes": 26103
         }
       ],
       "schedule_symbol": "flashinfer_blackwell_gdn_cp_prefill_final_state_bf16_v1",
@@ -11804,21 +11820,37 @@
         "t_precompute_min_blocks": 6
       }
     ],
-    "checkpoint_copy_order": "state fixup, optional normalized semantic final-state recurrence, then sequence-major fixed-state boundary copy, then optional final-state scatter, then CP prefill",
+    "bf16_fixed64_final_state": {
+      "abi_parameter": "use_block64_final_state (int32)",
+      "block_tokens": 64,
+      "partial_tail": "the final block retains the fixed-64 carrier with invalid rows masked",
+      "publication_boundaries": [
+        "BF16 A",
+        "BF16 V*beta",
+        "BF16 U",
+        "BF16 K*beta*exp(G)",
+        "BF16 W",
+        "BF16 chunk-start H snapshot",
+        "BF16 gated residual",
+        "FP32 triangular solve and H accumulation"
+      ],
+      "selector": "bfloat16 qkv with requested final state, explicit alpha, and use_qk_l2norm_in_kernel false"
+    },
+    "checkpoint_copy_order": "state fixup, optional semantic final-state recurrence, then sequence-major fixed-state boundary copy, then optional final-state scatter, then CP prefill",
     "default_cp_chunk_len": "checkpoint interval when enabled; otherwise pinned PR4078 choose_cp_chunk_len_host arithmetic",
     "dtype_dispatch": {
       "bfloat16": [
         "qk_norm_bf16 when use_qk_l2norm_in_kernel is true",
         "t_precompute_bf16",
         "mn_precompute_bf16",
-        "normalized_final_state_bf16 when use_qk_l2norm_in_kernel and output_final_state are true",
+        "normalized_final_state_bf16 whenever output_final_state is true; use_block64_final_state is one exactly when alpha is present and use_qk_l2norm_in_kernel is false",
         "cp_prefill_bf16 or cp_prefill_generic_bf16"
       ],
       "float16": [
         "qk_norm when use_qk_l2norm_in_kernel is true",
         "t_precompute",
         "mn_precompute",
-        "normalized_final_state when use_qk_l2norm_in_kernel and output_final_state are true",
+        "normalized_final_state when output_final_state is true and either use_qk_l2norm_in_kernel is true or alpha is absent",
         "cp_prefill_equal_head_h32 (sm_103a only), cp_prefill_equal_head, cp_prefill, cp_prefill_generic, or the sm_100a checkpoint variants"
       ],
       "state_io": "typed gather/scatter selected independently by state dtype and indexed-pool int32/int64 dtype; unindexed state and FP32 checkpoint copy use int32 variants"

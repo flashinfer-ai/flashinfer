@@ -31,7 +31,7 @@
 extern "C" {
 
 __global__ __launch_bounds__(128, 1) void
-kernel_flashinfer_blackwell_gdn_cp_prefill_final_state_v1(__half* __restrict__ q, __half* __restrict__ k, __half* __restrict__ v, float* __restrict__ alpha, float* __restrict__ beta, long long* __restrict__ cu_seqlens, float* __restrict__ initial_state, float* __restrict__ final_state, __half* __restrict__ output, float scale, int normalize_qk, int write_output, int write_final_state, int num_q_heads, int num_k_heads, int num_v_heads, int num_state_heads)
+kernel_flashinfer_blackwell_gdn_cp_prefill_final_state_v1(__half* __restrict__ q, __half* __restrict__ k, __half* __restrict__ v, float* __restrict__ alpha, float* __restrict__ beta, long long* __restrict__ cu_seqlens, float* __restrict__ initial_state, float* __restrict__ final_state, __half* __restrict__ output, float scale, int normalize_qk, int write_output, int write_final_state, int use_block64_final_state, int num_q_heads, int num_k_heads, int num_v_heads, int num_state_heads)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

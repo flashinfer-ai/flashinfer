@@ -29,7 +29,7 @@
 #include <unordered_map>
 #include <vector>
 
-TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_final_state_v1_4c642fe7ad);
+TVM_FFI_EMBED_CUBIN(flashinfer_blackwell_gdn_cp_prefill_final_state_v1_dd2f99b0e5);
 
 namespace gdn_cp_host_shim {
 
@@ -171,7 +171,7 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
   }
 }
 
-void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_alpha, TensorView arg_beta, TensorView arg_cu_seqlens, TensorView arg_initial_state, TensorView arg_final_state, TensorView arg_output, double arg_scale, int64_t arg_normalize_qk, int64_t arg_write_output, int64_t arg_write_final_state, int64_t arg_num_q_heads, int64_t arg_num_k_heads, int64_t arg_num_v_heads, int64_t arg_num_state_heads, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_alpha, TensorView arg_beta, TensorView arg_cu_seqlens, TensorView arg_initial_state, TensorView arg_final_state, TensorView arg_output, double arg_scale, int64_t arg_normalize_qk, int64_t arg_write_output, int64_t arg_write_final_state, int64_t arg_use_block64_final_state, int64_t arg_num_q_heads, int64_t arg_num_k_heads, int64_t arg_num_v_heads, int64_t arg_num_state_heads, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   CheckCudaTensor(arg_q, "q");
   CheckDtype(arg_q, "q", 2, 16, 1);
   CheckContiguous(arg_q, "q");
@@ -207,6 +207,9 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_al
       << " is outside i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(arg_write_final_state >= -2147483648LL && arg_write_final_state <= 2147483647LL, ValueError)
       << "scalar 'write_final_state' value " << arg_write_final_state
+      << " is outside i32 range [-2147483648, 2147483647]";
+  TVM_FFI_CHECK(arg_use_block64_final_state >= -2147483648LL && arg_use_block64_final_state <= 2147483647LL, ValueError)
+      << "scalar 'use_block64_final_state' value " << arg_use_block64_final_state
       << " is outside i32 range [-2147483648, 2147483647]";
   TVM_FFI_CHECK(arg_num_q_heads >= -2147483648LL && arg_num_q_heads <= 2147483647LL, ValueError)
       << "scalar 'num_q_heads' value " << arg_num_q_heads
@@ -247,13 +250,14 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_al
   int32_t v_normalize_qk = (int32_t)arg_normalize_qk;
   int32_t v_write_output = (int32_t)arg_write_output;
   int32_t v_write_final_state = (int32_t)arg_write_final_state;
+  int32_t v_use_block64_final_state = (int32_t)arg_use_block64_final_state;
   int32_t v_num_q_heads = (int32_t)arg_num_q_heads;
   int32_t v_num_k_heads = (int32_t)arg_num_k_heads;
   int32_t v_num_v_heads = (int32_t)arg_num_v_heads;
   int32_t v_num_state_heads = (int32_t)arg_num_state_heads;
-  void* kargs[] = {&p_q, &p_k, &p_v, &p_alpha, &p_beta, &p_cu_seqlens, &p_initial_state, &p_final_state, &p_output, &v_scale, &v_normalize_qk, &v_write_output, &v_write_final_state, &v_num_q_heads, &v_num_k_heads, &v_num_v_heads, &v_num_state_heads};
+  void* kargs[] = {&p_q, &p_k, &p_v, &p_alpha, &p_beta, &p_cu_seqlens, &p_initial_state, &p_final_state, &p_output, &v_scale, &v_normalize_qk, &v_write_output, &v_write_final_state, &v_use_block64_final_state, &v_num_q_heads, &v_num_k_heads, &v_num_v_heads, &v_num_state_heads};
 
-  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(flashinfer_blackwell_gdn_cp_prefill_final_state_v1_4c642fe7ad, "kernel_flashinfer_blackwell_gdn_cp_prefill_final_state_v1");
+  static auto kernel = TVM_FFI_EMBED_CUBIN_GET_KERNEL(flashinfer_blackwell_gdn_cp_prefill_final_state_v1_dd2f99b0e5, "kernel_flashinfer_blackwell_gdn_cp_prefill_final_state_v1");
   tvm::ffi::dim3 grid((uint32_t)grid_x, (uint32_t)grid_y, (uint32_t)grid_z);
   tvm::ffi::dim3 block(128u, 1u, 1u);
 
