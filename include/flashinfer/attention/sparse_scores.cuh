@@ -532,11 +532,25 @@ cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType
     return cudaGetLastError();
   };
 
-  // One tile per block re-stages the query for every 64 columns, which only pays
-  // when there are so few blocks otherwise that the device would sit idle. The
-  // crossover is a full wave of the narrow launch.
+  // One tile per block re-stages the query for every column tile, which only
+  // pays while the extra blocks still buy something. It buys more than one wave
+  // of them: the single-tile block stages the whole head in one step and has
+  // nothing to overlap inside itself, so what hides its latency is other blocks
+  // on the same SM, and it keeps winning until the query re-staging outweighs
+  // the pipelining the eight-tile shape does instead.
+  //
+  // Measured on SM80, the turn is at four waves and not at one. Sweeping rows
+  // at three shapes, the last row count the single-tile shape wins and the
+  // first the eight-tile shape does, in blocks: 1536 then 2048 at sixteen heads
+  // and head dim 128, 2048 then 4096 at four heads, and already lost by 2048 at
+  // eight heads and head dim 256. Those blocks per SM are 7, 8 and 4, so one
+  // wave would be 490, 560 and 280 -- and four waves splits every one of them
+  // correctly where one wave puts the whole 8-to-24 row range on the wrong side
+  // and costs up to 1.64x there.
+  //
   // The answer depends on the tile width too, since that is part of the block's
   // shared memory.
+  constexpr uint32_t kWavesBeforeWide = 4;
   static thread_local int blocks_per_sm = 0;
   static thread_local int occupancy_dev = -1;
   static thread_local uint32_t occupancy_tile_n = 0;
@@ -552,9 +566,9 @@ cudaError_t SparsePagedScores(const DType* q, const DType* k_cache, const IdType
     occupancy_tile_n = tile_n;
   }
   const uint32_t narrow_blocks = rows * ceil_div(num_columns, kBlockN);
-  const bool narrow = blocks_per_sm == 0 || narrow_blocks <= static_cast<uint32_t>(num_sms) *
-                                                                  static_cast<uint32_t>(
-                                                                      blocks_per_sm);
+  const bool narrow = blocks_per_sm == 0 ||
+                      narrow_blocks <= kWavesBeforeWide * static_cast<uint32_t>(num_sms) *
+                                           static_cast<uint32_t>(blocks_per_sm);
   if (tile_n == kNarrowTileN) {
     constexpr std::integral_constant<uint32_t, kNarrowTileN> n{};
     return narrow ? launch(std::integral_constant<uint32_t, 1>{}, n)
