@@ -4627,7 +4627,8 @@ def test_runtime_routes_cuda_graph_replays_routes_and_token_mask() -> None:
     torch.cuda.synchronize()
     torch.testing.assert_close(graph_out, initial_expected, rtol=1e-2, atol=1e-2)
     state = wrapper._published_state()
-    assert state.route_workspace[0].item() == 1
+    # Two KV192 blocks contain six KV64 atoms, which require two KV256 routes.
+    assert state.route_workspace[0].item() == 2
 
     block_indices.copy_(torch.tensor([0, 1], device="cuda", dtype=torch.int32))
     valid_bits.copy_(replay_valid_bits)
@@ -4646,7 +4647,7 @@ def test_runtime_routes_cuda_graph_replays_routes_and_token_mask() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(graph_out, initial_expected, rtol=1e-2, atol=1e-2)
-    assert state.route_workspace[0].item() == 1
+    assert state.route_workspace[0].item() == 2
 
 
 @_REQUIRES_PRIMTS_GPU
