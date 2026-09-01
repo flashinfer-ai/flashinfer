@@ -2277,24 +2277,26 @@ with contextlib.suppress(Exception):
 # flashinfer-bench reference function.
 _ulysses_owns_process_group = False
 try:
-    with contextlib.suppress(Exception):
-        if not dist.is_initialized():
+    # Only the process-group bring-up is allowed to fail quietly: it is the one
+    # step this script cannot assume (no NCCL, no CUDA). A communicator or
+    # collective that fails after that is a real defect, and suppressing it
+    # would let this script exit 0 having silently skipped the Ulysses traces.
+    if not dist.is_initialized():
+        with contextlib.suppress(Exception):
             dist.init_process_group(
                 "nccl", store=dist.HashStore(), rank=0, world_size=1
             )
             _ulysses_owns_process_group = True
-        if dist.get_world_size() == 1:
-            _ulysses_x = torch.randn(
-                1, 128, 8, 128, dtype=torch.bfloat16, device=device
-            )
-            with flashinfer.comm.UlyssesCommunicator(
-                max_elems=_ulysses_x.numel(),
-                dtype=_ulysses_x.dtype,
-                backend="nccl",
-                device=_ulysses_x.device,
-            ) as _ulysses_comm:
-                _ulysses_comm.scatter_heads(_ulysses_x)
-                _ulysses_comm.gather_heads(_ulysses_x)
+    if dist.is_initialized() and dist.get_world_size() == 1:
+        _ulysses_x = torch.randn(1, 128, 8, 128, dtype=torch.bfloat16, device=device)
+        with flashinfer.comm.UlyssesCommunicator(
+            max_elems=_ulysses_x.numel(),
+            dtype=_ulysses_x.dtype,
+            backend="nccl",
+            device=_ulysses_x.device,
+        ) as _ulysses_comm:
+            _ulysses_comm.scatter_heads(_ulysses_x)
+            _ulysses_comm.gather_heads(_ulysses_x)
 finally:
     if _ulysses_owns_process_group:
         dist.destroy_process_group()

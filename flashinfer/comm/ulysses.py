@@ -584,6 +584,27 @@ class UlyssesCommunicator:
         gives the caller a handle it owns for the communicator's lifetime.
         Multi-rank PCIe calls require such an output; allocate every geometry
         during setup and pass it through ``out=`` on the exchange.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Operand the output is sized for: a contiguous 4-D CUDA tensor with
+            the shape ``op`` consumes.
+        op : str
+            ``"scatter_heads"`` or ``"gather_heads"``. Outputs are registered
+            per transform and are not interchangeable between the two.
+        dtype : torch.dtype, optional
+            Element type for the calls this output serves, overriding the
+            communicator dtype. pcie backend only. The allocation keeps the
+            communicator's byte budget, so a narrower dtype holds
+            proportionally more elements.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor with the shape ``op`` produces from ``x``, on the same
+            device and dtype as ``x``. On multi-rank pcie it stays registered
+            with the transport until :meth:`close`.
         """
         if op not in ("scatter_heads", "gather_heads"):
             raise ValueError("op must be 'scatter_heads' or 'gather_heads'")
