@@ -672,3 +672,49 @@ def test_rejects_a_short_token_axis(short):
         case["positions"] = case["positions"][:-1].contiguous()
     with pytest.raises(Exception, match="per token"):
         _run(case)
+
+
+def test_a_work_item_naming_a_request_that_does_not_exist_is_skipped():
+    """The work list is the caller's, and the request it names indexes both
+    ends of a prefix-sum entry. One past the last request reads off the table."""
+    _skip_unless_cuda()
+    case = _case(num_tokens=16, num_requests=1)
+    case["work_metadata"] = case["work_metadata"].clone()
+    case["work_metadata"][0, 0] = 1  # only request 0 exists
+    q_out, _, _ = _run(case)
+    torch.cuda.synchronize()
+    assert torch.isfinite(q_out.float()).all()
+
+
+def test_rejects_an_empty_ring():
+    """The ring is indexed modulo its size, so an empty one addresses off the
+    front of the cache rather than reading nothing."""
+    _skip_unless_cuda()
+    case = _case(num_tokens=16)
+    case["state_cache"] = case["state_cache"][:, :0].contiguous()
+    with pytest.raises(Exception, match="at least one row"):
+        _run(case)
+
+
+def test_rejects_an_empty_compressed_page():
+    _skip_unless_cuda()
+    case = _case(num_tokens=16)
+    case["compressed_cache"] = case["compressed_cache"][:, :0].contiguous()
+    with pytest.raises(Exception, match="at least one row"):
+        _run(case)
+
+
+@pytest.mark.parametrize("state_size,compress_ratio", [(7, 4), (6, 4), (5, 2)])
+def test_a_group_reaching_into_an_unaligned_ring(state_size, compress_ratio):
+    """A ring whose size is not a multiple of the ratio makes the wrap land
+    inside a group, which is the case the aligned sizes never produce."""
+    _skip_unless_cuda()
+    _assert_matches(
+        _case(
+            num_tokens=32,
+            state_size=state_size,
+            compress_ratio=compress_ratio,
+            history=True,
+            cache_pos=True,
+        )
+    )
