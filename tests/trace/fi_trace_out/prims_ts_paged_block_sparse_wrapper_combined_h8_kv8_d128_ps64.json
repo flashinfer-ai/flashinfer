@@ -1,9 +1,9 @@
 {
-  "name": "prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64",
-  "description": "One-shot PrimTS block-sparse MHA/GQA/MQA attention over compact fixed-length BSHD Q, the combined HND paged KV cache form, and live request page tables, K/V lengths, and per-KV-head BSR metadata.",
+  "name": "prims_ts_paged_block_sparse_wrapper_combined_h8_kv8_d128_ps64",
+  "description": "Reusable PrimTS block-sparse MHA/GQA/MQA attention over compact fixed-length BSHD Q, the combined HND paged KV cache form, and live page tables, K/V lengths, and per-KV-head BSR metadata. Static K/V capacity, block geometry, and mask type are retained by plan() and represented as optional trace context.",
   "op_type": "block_sparse",
   "tags": [
-    "fi_api:flashinfer.attention.prims_ts.block_sparse.block_sparse_attention_with_paged_kv_cache",
+    "fi_api:flashinfer.attention.prims_ts.block_sparse.BlockSparsePagedTSWrapper.run",
     "backend:prims-ts",
     "sparse:block",
     "status:experimental",
@@ -41,14 +41,6 @@
     "num_kv_valid_words": {
       "type": "var",
       "description": "Number of optional token-validity words per batch."
-    },
-    "q_block_size": {
-      "type": "const",
-      "value": 64
-    },
-    "kv_block_size": {
-      "type": "const",
-      "value": 64
     },
     "max_seq_len_kv": {
       "type": "var",
@@ -115,7 +107,7 @@
         "num_q_block_offsets"
       ],
       "dtype": "int32",
-      "description": "Absolute offsets into block_indices, consumed by the one-shot call."
+      "description": "Absolute offsets into live block_indices for this wrapper run."
     },
     "block_indices": {
       "shape": [
@@ -131,15 +123,17 @@
       ],
       "dtype": "uint32",
       "optional": true,
-      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond Skv are ignored; consumed by the one-shot call."
+      "description": "Batch-only token validity bits: token t uses bit t % 32 of word t // 32 (LSB-first); one means valid. Padding bits beyond the planned K/V capacity are ignored."
     },
     "q_block_size": {
       "shape": null,
-      "dtype": "int32"
+      "dtype": "int32",
+      "optional": true
     },
     "kv_block_size": {
       "shape": null,
-      "dtype": "int32"
+      "dtype": "int32",
+      "optional": true
     },
     "mask_type": {
       "shape": null,
@@ -179,6 +173,7 @@
     "max_seq_len_kv": {
       "shape": null,
       "dtype": "int32",
+      "optional": true,
       "description": "Static maximum logical K/V length used for planning."
     },
     "seq_lens_kv": {
