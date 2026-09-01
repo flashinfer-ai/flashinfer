@@ -1,0 +1,3321 @@
+{
+  "artifact_kind": "source_only",
+  "build_contract": {
+    "architecture_source": "modules[].arch",
+    "binary_payloads": false,
+    "target_infrastructure": {
+      "binding_runtime": "flashinfer_tvm_ffi_utils",
+      "headers_owned_by_target": true,
+      "required_headers": [
+        "tvm_ffi_utils.h"
+      ]
+    },
+    "translation_unit_model": "separate_device_and_binding"
+  },
+  "contract": {
+    "architectures": [
+      "sm_100a",
+      "sm_103a"
+    ],
+    "dtype": "bfloat16",
+    "gate": "bounded_sigmoid",
+    "head_dim": 128,
+    "input_layouts": [
+      "fixed",
+      "packed"
+    ],
+    "shape_count": 29,
+    "shape_denominator": [
+      "h96_fixed_8192",
+      "h96_mixed_varlen",
+      "h96_uniform_varlen",
+      "h64_fixed_8192",
+      "h64_mixed_varlen",
+      "h64_uniform_varlen",
+      "h32_fixed_8192",
+      "h32_mixed_varlen",
+      "h96_uniform_n16",
+      "h96_uniform_n32_holdout",
+      "h96_uniform_n64",
+      "h96_uniform_n128_holdout",
+      "h96_uniform_n256",
+      "h96_short_varlen",
+      "h96_irregular_tail_varlen",
+      "h16_fixed_16384",
+      "h16_fixed_32768_holdout",
+      "h16_fixed_65536",
+      "h8_fixed_65536",
+      "h4_fixed_65536_holdout",
+      "h4_tail_seq1_to_15",
+      "h1_fixed_1048576",
+      "h96_fixed_37",
+      "h96_fixed_97",
+      "h96_packed_n1_16",
+      "h96_packed_uniform_n2_t16",
+      "h1_fixed_131072",
+      "h1_packed_n1_131072",
+      "h1_packed_524288_524288"
+    ],
+    "state_io": "initial_and_final_bfloat16",
+    "timing_boundary": "single_recurrence_kernel"
+  },
+  "files": [
+    {
+      "bytes": 211867,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_prefill_m128_generic.cu",
+      "sha256": "eccaf53f1790ed69e1107b511a79a45f93bddfe7cb7d6a2756ce22319b7163bd"
+    },
+    {
+      "bytes": 31808,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_prefill_m128_generic_binding.cu",
+      "sha256": "cf53158123e8883209b9613bfe989ee6293be045ec26472963590326148bcf49"
+    },
+    {
+      "bytes": 215140,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_prefill_m128_h64_persistent.cu",
+      "sha256": "b0474942230dfde5171a79fa9dceceb9dfb26e208b0ec507a7d50336be4dbf62"
+    },
+    {
+      "bytes": 31850,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_prefill_m128_h64_persistent_binding.cu",
+      "sha256": "421773628bf7f916c91f89ce0ef8e663e5d2431f4b7a1ca9f5f8ba5ac20bcd9b"
+    },
+    {
+      "bytes": 211901,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_prefill_m128_h96.cu",
+      "sha256": "cd34415dd1a8d33c79f4918d7c1679bc31efee3b37c2351e8ae6a1fff997d041"
+    },
+    {
+      "bytes": 31784,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_prefill_m128_h96_binding.cu",
+      "sha256": "c5623796b81ec7e8f30f781acbbdcc732b69f07bf70d9c24e89df1f6c7971300"
+    },
+    {
+      "bytes": 182050,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_prefill_m64_independent_value.cu",
+      "sha256": "22edade78eafeee3854f0a590063daa8c7eec0950d675a1a4770b87283c17a8c"
+    },
+    {
+      "bytes": 30508,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_prefill_m64_independent_value_binding.cu",
+      "sha256": "b2e49d5154229eca24060ee43cf174107f97271bfb57b6877245895fca4f912c"
+    },
+    {
+      "bytes": 216773,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_prefill_vtile_generic.cu",
+      "sha256": "757044c2598704ffd568da0d5baaf56336de351d832ede1f1220f01173361bf6"
+    },
+    {
+      "bytes": 31744,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_prefill_vtile_generic_binding.cu",
+      "sha256": "b70c61d562ee6342be80fe5f23471af61dbec308318b5a94bc4d84a251ddc916"
+    },
+    {
+      "bytes": 216778,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_prefill_vtile_h64.cu",
+      "sha256": "8b67f25d521cdf443e2b5711223081b92e59b91d44a1cb5aab08f69c0a5131ab"
+    },
+    {
+      "bytes": 31720,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_prefill_vtile_h64_binding.cu",
+      "sha256": "a8d067f1c2b3f81fec56d465cdb545a7344f90a4e01b26985e6484792c365768"
+    },
+    {
+      "bytes": 219054,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_prefill_vtile_h64_persistent.cu",
+      "sha256": "a25671279b4b88c2c755c26d8fa628542e5331392f1e10589f47a704a35946b5"
+    },
+    {
+      "bytes": 31786,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_prefill_vtile_h64_persistent_binding.cu",
+      "sha256": "35d3f16deb7e6cb67a437b5d76695c7ad3befd2dda01fc4d1e3afd8474cf08d8"
+    },
+    {
+      "bytes": 219330,
+      "kind": "device_source",
+      "path": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six.cu",
+      "sha256": "43839bc288520ca81d9dd1c2d9b56bc6296075f96fd7840e2767a2df0feb6782"
+    },
+    {
+      "bytes": 31810,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six_binding.cu",
+      "sha256": "b3caf8a6c6c8b90f1072798511d1ac58aaeed09456e3235112d81965c2a7cd15"
+    }
+  ],
+  "library": "flashinfer",
+  "modules": [
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "tile_schedule"
+        ],
+        [
+          "buffer",
+          "tile_schedule_counts"
+        ],
+        [
+          "parameter",
+          "schedule_stride"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9eb88ca010d5ae0c9e8ac067d2cc9f6682bc5ecc5c6d44fa4bcc95475549cf67",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 211867,
+          "path": "csrc/kda/cake_kda_prefill_m128_generic.cu",
+          "sha256": "eccaf53f1790ed69e1107b511a79a45f93bddfe7cb7d6a2756ce22319b7163bd"
+        },
+        {
+          "bytes": 31808,
+          "path": "csrc/kda/cake_kda_prefill_m128_generic_binding.cu",
+          "sha256": "cf53158123e8883209b9613bfe989ee6293be045ec26472963590326148bcf49"
+        }
+      ],
+      "closure_sha256": "52bbf1678b40d7605e0a17a52248445b45bdd57148de4bcc1cfb3d7b1e152bd1",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_m128_generic",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 231424,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_m128_generic_ffi",
+      "name": "cake_kda_prefill_m128_generic",
+      "role": "prefill",
+      "route": {
+        "policy": "direct_m128_generic",
+        "trace_globals": {
+          "HEAD_POLICY": 0,
+          "PERSISTENT_SCHEDULE": 0
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_m128_generic_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_m128_generic.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "tile_schedule"
+        ],
+        [
+          "buffer",
+          "tile_schedule_counts"
+        ],
+        [
+          "parameter",
+          "schedule_stride"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9eb88ca010d5ae0c9e8ac067d2cc9f6682bc5ecc5c6d44fa4bcc95475549cf67",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 215140,
+          "path": "csrc/kda/cake_kda_prefill_m128_h64_persistent.cu",
+          "sha256": "b0474942230dfde5171a79fa9dceceb9dfb26e208b0ec507a7d50336be4dbf62"
+        },
+        {
+          "bytes": 31850,
+          "path": "csrc/kda/cake_kda_prefill_m128_h64_persistent_binding.cu",
+          "sha256": "421773628bf7f916c91f89ce0ef8e663e5d2431f4b7a1ca9f5f8ba5ac20bcd9b"
+        }
+      ],
+      "closure_sha256": "e00a68eead44603d7bc5640a4c87df0ca80c751dc6239d9d5669759335f03c04",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_m128_h64_persistent",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 231424,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_m128_h64_persistent_ffi",
+      "name": "cake_kda_prefill_m128_h64_persistent",
+      "role": "prefill",
+      "route": {
+        "policy": "persistent_m128_h64_lpt",
+        "trace_globals": {
+          "HEAD_POLICY": 64,
+          "PERSISTENT_SCHEDULE": 1
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_m128_h64_persistent_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_m128_h64_persistent.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "tile_schedule"
+        ],
+        [
+          "buffer",
+          "tile_schedule_counts"
+        ],
+        [
+          "parameter",
+          "schedule_stride"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9eb88ca010d5ae0c9e8ac067d2cc9f6682bc5ecc5c6d44fa4bcc95475549cf67",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 211901,
+          "path": "csrc/kda/cake_kda_prefill_m128_h96.cu",
+          "sha256": "cd34415dd1a8d33c79f4918d7c1679bc31efee3b37c2351e8ae6a1fff997d041"
+        },
+        {
+          "bytes": 31784,
+          "path": "csrc/kda/cake_kda_prefill_m128_h96_binding.cu",
+          "sha256": "c5623796b81ec7e8f30f781acbbdcc732b69f07bf70d9c24e89df1f6c7971300"
+        }
+      ],
+      "closure_sha256": "f326b02f4429a720ff265cf9a3d0390736c892f535324d4d76b0a5abb0ff3c19",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_m128_h96",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 231424,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_m128_h96_ffi",
+      "name": "cake_kda_prefill_m128_h96",
+      "role": "prefill",
+      "route": {
+        "policy": "direct_m128_h96_commit_order",
+        "trace_globals": {
+          "HEAD_POLICY": 96,
+          "PERSISTENT_SCHEDULE": 0
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_m128_h96_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_m128_h96.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "956a48e483adc5a42ba8ea1b30c9b4538d96218cb190c1a572d3c9bdfcc4efe9",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 182050,
+          "path": "csrc/kda/cake_kda_prefill_m64_independent_value.cu",
+          "sha256": "22edade78eafeee3854f0a590063daa8c7eec0950d675a1a4770b87283c17a8c"
+        },
+        {
+          "bytes": 30508,
+          "path": "csrc/kda/cake_kda_prefill_m64_independent_value_binding.cu",
+          "sha256": "b2e49d5154229eca24060ee43cf174107f97271bfb57b6877245895fca4f912c"
+        }
+      ],
+      "closure_sha256": "0dd50467d625a2691f5c69eb76725a2d78e5451e46e4ecaf709710b848899a3b",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_m64_independent_value",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227328,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_m64_independent_value_ffi",
+      "name": "cake_kda_prefill_m64_independent_value",
+      "role": "prefill",
+      "route": {
+        "policy": "direct_m64_independent_value_split",
+        "trace_globals": {}
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_m64_independent_value_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_m64_independent_value.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "uniform_seq_len"
+        ],
+        [
+          "parameter",
+          "persistent_tasks"
+        ],
+        [
+          "parameter",
+          "persistent_stride"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9a8979215919f190e54f3b2536891622a141564c4c2102c9575c8420711edaa5",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 216773,
+          "path": "csrc/kda/cake_kda_prefill_vtile_generic.cu",
+          "sha256": "757044c2598704ffd568da0d5baaf56336de351d832ede1f1220f01173361bf6"
+        },
+        {
+          "bytes": 31744,
+          "path": "csrc/kda/cake_kda_prefill_vtile_generic_binding.cu",
+          "sha256": "b70c61d562ee6342be80fe5f23471af61dbec308318b5a94bc4d84a251ddc916"
+        }
+      ],
+      "closure_sha256": "185ccbd3cbd07a7effa7d49be93f1156df836374cbd6f18eacb3abd79effc26d",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_vtile_generic",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 226304,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_vtile_generic_ffi",
+      "name": "cake_kda_prefill_vtile_generic",
+      "role": "prefill",
+      "route": {
+        "policy": "direct_vtile_m128_generic",
+        "trace_globals": {
+          "HEAD_POLICY": 0,
+          "PERSISTENT_MODE": 0,
+          "PERSISTENT_SIX_TASK_SCHEDULE": 0,
+          "PERSISTENT_STRIDE_HEAD_ALIGNED": 1
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_vtile_generic_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_vtile_generic.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "uniform_seq_len"
+        ],
+        [
+          "parameter",
+          "persistent_tasks"
+        ],
+        [
+          "parameter",
+          "persistent_stride"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9a8979215919f190e54f3b2536891622a141564c4c2102c9575c8420711edaa5",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 216778,
+          "path": "csrc/kda/cake_kda_prefill_vtile_h64.cu",
+          "sha256": "8b67f25d521cdf443e2b5711223081b92e59b91d44a1cb5aab08f69c0a5131ab"
+        },
+        {
+          "bytes": 31720,
+          "path": "csrc/kda/cake_kda_prefill_vtile_h64_binding.cu",
+          "sha256": "a8d067f1c2b3f81fec56d465cdb545a7344f90a4e01b26985e6484792c365768"
+        }
+      ],
+      "closure_sha256": "207b95450b19166b0fc41e771f035430790bc2b52d970ac99a0ef85de4916599",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_vtile_h64",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 226304,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_vtile_h64_ffi",
+      "name": "cake_kda_prefill_vtile_h64",
+      "role": "prefill",
+      "route": {
+        "policy": "direct_vtile_m128_h64_gate_order",
+        "trace_globals": {
+          "HEAD_POLICY": 64,
+          "PERSISTENT_MODE": 0,
+          "PERSISTENT_SIX_TASK_SCHEDULE": 0,
+          "PERSISTENT_STRIDE_HEAD_ALIGNED": 1
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_vtile_h64_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_vtile_h64.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "uniform_seq_len"
+        ],
+        [
+          "parameter",
+          "persistent_tasks"
+        ],
+        [
+          "parameter",
+          "persistent_stride"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9a8979215919f190e54f3b2536891622a141564c4c2102c9575c8420711edaa5",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 219054,
+          "path": "csrc/kda/cake_kda_prefill_vtile_h64_persistent.cu",
+          "sha256": "a25671279b4b88c2c755c26d8fa628542e5331392f1e10589f47a704a35946b5"
+        },
+        {
+          "bytes": 31786,
+          "path": "csrc/kda/cake_kda_prefill_vtile_h64_persistent_binding.cu",
+          "sha256": "35d3f16deb7e6cb67a437b5d76695c7ad3befd2dda01fc4d1e3afd8474cf08d8"
+        }
+      ],
+      "closure_sha256": "43524ebccb8dad8528809ad0975324acb1da40714cab87c981404bbd8925ae64",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_vtile_h64_persistent",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 226304,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_vtile_h64_persistent_ffi",
+      "name": "cake_kda_prefill_vtile_h64_persistent",
+      "role": "prefill",
+      "route": {
+        "policy": "persistent_vtile_m128_h64",
+        "trace_globals": {
+          "HEAD_POLICY": 64,
+          "PERSISTENT_MODE": 1,
+          "PERSISTENT_SIX_TASK_SCHEDULE": 0,
+          "PERSISTENT_STRIDE_HEAD_ALIGNED": 1
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_vtile_h64_persistent_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_vtile_h64_persistent.cu"
+      }
+    },
+    {
+      "arch": "sm_100a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "uniform_seq_len"
+        ],
+        [
+          "parameter",
+          "persistent_tasks"
+        ],
+        [
+          "parameter",
+          "persistent_stride"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9a8979215919f190e54f3b2536891622a141564c4c2102c9575c8420711edaa5",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 219330,
+          "path": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six.cu",
+          "sha256": "43839bc288520ca81d9dd1c2d9b56bc6296075f96fd7840e2767a2df0feb6782"
+        },
+        {
+          "bytes": 31810,
+          "path": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six_binding.cu",
+          "sha256": "b3caf8a6c6c8b90f1072798511d1ac58aaeed09456e3235112d81965c2a7cd15"
+        }
+      ],
+      "closure_sha256": "df0b35a245188b098d586a9fa85c0a5d95ce107ad9b9d4693b064fb3f9d76090",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_vtile_h96_persistent_six",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 226304,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_vtile_h96_persistent_six_ffi",
+      "name": "cake_kda_prefill_vtile_h96_persistent_six",
+      "role": "prefill",
+      "route": {
+        "policy": "persistent_vtile_m128_h96_six_task",
+        "trace_globals": {
+          "HEAD_POLICY": 0,
+          "PERSISTENT_MODE": 1,
+          "PERSISTENT_SIX_TASK_SCHEDULE": 1,
+          "PERSISTENT_STRIDE_HEAD_ALIGNED": 0
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "tile_schedule"
+        ],
+        [
+          "buffer",
+          "tile_schedule_counts"
+        ],
+        [
+          "parameter",
+          "schedule_stride"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9eb88ca010d5ae0c9e8ac067d2cc9f6682bc5ecc5c6d44fa4bcc95475549cf67",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 211867,
+          "path": "csrc/kda/cake_kda_prefill_m128_generic.cu",
+          "sha256": "eccaf53f1790ed69e1107b511a79a45f93bddfe7cb7d6a2756ce22319b7163bd"
+        },
+        {
+          "bytes": 31808,
+          "path": "csrc/kda/cake_kda_prefill_m128_generic_binding.cu",
+          "sha256": "cf53158123e8883209b9613bfe989ee6293be045ec26472963590326148bcf49"
+        }
+      ],
+      "closure_sha256": "366eaee0fed9d74de7288cd45473c8b8a6a50ad7f766eafec10e9118d9aa93e2",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_m128_generic",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 231424,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_m128_generic_ffi",
+      "name": "cake_kda_prefill_m128_generic",
+      "role": "prefill",
+      "route": {
+        "policy": "direct_m128_generic",
+        "trace_globals": {
+          "HEAD_POLICY": 0,
+          "PERSISTENT_SCHEDULE": 0
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_m128_generic_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_m128_generic.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "tile_schedule"
+        ],
+        [
+          "buffer",
+          "tile_schedule_counts"
+        ],
+        [
+          "parameter",
+          "schedule_stride"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9eb88ca010d5ae0c9e8ac067d2cc9f6682bc5ecc5c6d44fa4bcc95475549cf67",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 215140,
+          "path": "csrc/kda/cake_kda_prefill_m128_h64_persistent.cu",
+          "sha256": "b0474942230dfde5171a79fa9dceceb9dfb26e208b0ec507a7d50336be4dbf62"
+        },
+        {
+          "bytes": 31850,
+          "path": "csrc/kda/cake_kda_prefill_m128_h64_persistent_binding.cu",
+          "sha256": "421773628bf7f916c91f89ce0ef8e663e5d2431f4b7a1ca9f5f8ba5ac20bcd9b"
+        }
+      ],
+      "closure_sha256": "875367736fd82c3b8f65843d61bd1eea5e723a96b78246f581d6148d1003334d",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_m128_h64_persistent",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 231424,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_m128_h64_persistent_ffi",
+      "name": "cake_kda_prefill_m128_h64_persistent",
+      "role": "prefill",
+      "route": {
+        "policy": "persistent_m128_h64_lpt",
+        "trace_globals": {
+          "HEAD_POLICY": 64,
+          "PERSISTENT_SCHEDULE": 1
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_m128_h64_persistent_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_m128_h64_persistent.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "tile_schedule"
+        ],
+        [
+          "buffer",
+          "tile_schedule_counts"
+        ],
+        [
+          "parameter",
+          "schedule_stride"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9eb88ca010d5ae0c9e8ac067d2cc9f6682bc5ecc5c6d44fa4bcc95475549cf67",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 211901,
+          "path": "csrc/kda/cake_kda_prefill_m128_h96.cu",
+          "sha256": "cd34415dd1a8d33c79f4918d7c1679bc31efee3b37c2351e8ae6a1fff997d041"
+        },
+        {
+          "bytes": 31784,
+          "path": "csrc/kda/cake_kda_prefill_m128_h96_binding.cu",
+          "sha256": "c5623796b81ec7e8f30f781acbbdcc732b69f07bf70d9c24e89df1f6c7971300"
+        }
+      ],
+      "closure_sha256": "6b0cbfcfc1fd29e5ffd535ced0300086634618c61693911b6036129f3d43495c",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_m128_h96",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 231424,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_m128_h96_ffi",
+      "name": "cake_kda_prefill_m128_h96",
+      "role": "prefill",
+      "route": {
+        "policy": "direct_m128_h96_commit_order",
+        "trace_globals": {
+          "HEAD_POLICY": 96,
+          "PERSISTENT_SCHEDULE": 0
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_m128_h96_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_m128_h96.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "956a48e483adc5a42ba8ea1b30c9b4538d96218cb190c1a572d3c9bdfcc4efe9",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 182050,
+          "path": "csrc/kda/cake_kda_prefill_m64_independent_value.cu",
+          "sha256": "22edade78eafeee3854f0a590063daa8c7eec0950d675a1a4770b87283c17a8c"
+        },
+        {
+          "bytes": 30508,
+          "path": "csrc/kda/cake_kda_prefill_m64_independent_value_binding.cu",
+          "sha256": "b2e49d5154229eca24060ee43cf174107f97271bfb57b6877245895fca4f912c"
+        }
+      ],
+      "closure_sha256": "16913b1a8fd9c261b35e375b5966060fba221d0153f6832be98b54facb632706",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_m64_independent_value",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 227328,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_m64_independent_value_ffi",
+      "name": "cake_kda_prefill_m64_independent_value",
+      "role": "prefill",
+      "route": {
+        "policy": "direct_m64_independent_value_split",
+        "trace_globals": {}
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_m64_independent_value_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_m64_independent_value.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "uniform_seq_len"
+        ],
+        [
+          "parameter",
+          "persistent_tasks"
+        ],
+        [
+          "parameter",
+          "persistent_stride"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9a8979215919f190e54f3b2536891622a141564c4c2102c9575c8420711edaa5",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 216773,
+          "path": "csrc/kda/cake_kda_prefill_vtile_generic.cu",
+          "sha256": "757044c2598704ffd568da0d5baaf56336de351d832ede1f1220f01173361bf6"
+        },
+        {
+          "bytes": 31744,
+          "path": "csrc/kda/cake_kda_prefill_vtile_generic_binding.cu",
+          "sha256": "b70c61d562ee6342be80fe5f23471af61dbec308318b5a94bc4d84a251ddc916"
+        }
+      ],
+      "closure_sha256": "70d656b92d59b455e3956e7264831f335204f1d5c2c08eefed2048bad84a75b7",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_vtile_generic",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 226304,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_vtile_generic_ffi",
+      "name": "cake_kda_prefill_vtile_generic",
+      "role": "prefill",
+      "route": {
+        "policy": "direct_vtile_m128_generic",
+        "trace_globals": {
+          "HEAD_POLICY": 0,
+          "PERSISTENT_MODE": 0,
+          "PERSISTENT_SIX_TASK_SCHEDULE": 0,
+          "PERSISTENT_STRIDE_HEAD_ALIGNED": 1
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_vtile_generic_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_vtile_generic.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "uniform_seq_len"
+        ],
+        [
+          "parameter",
+          "persistent_tasks"
+        ],
+        [
+          "parameter",
+          "persistent_stride"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9a8979215919f190e54f3b2536891622a141564c4c2102c9575c8420711edaa5",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 216778,
+          "path": "csrc/kda/cake_kda_prefill_vtile_h64.cu",
+          "sha256": "8b67f25d521cdf443e2b5711223081b92e59b91d44a1cb5aab08f69c0a5131ab"
+        },
+        {
+          "bytes": 31720,
+          "path": "csrc/kda/cake_kda_prefill_vtile_h64_binding.cu",
+          "sha256": "a8d067f1c2b3f81fec56d465cdb545a7344f90a4e01b26985e6484792c365768"
+        }
+      ],
+      "closure_sha256": "f51e70fc981b94a65f62549d80bd61f000897db4ae8dfd2b4443a5533bcfe6ed",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_vtile_h64",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 226304,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_vtile_h64_ffi",
+      "name": "cake_kda_prefill_vtile_h64",
+      "role": "prefill",
+      "route": {
+        "policy": "direct_vtile_m128_h64_gate_order",
+        "trace_globals": {
+          "HEAD_POLICY": 64,
+          "PERSISTENT_MODE": 0,
+          "PERSISTENT_SIX_TASK_SCHEDULE": 0,
+          "PERSISTENT_STRIDE_HEAD_ALIGNED": 1
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_vtile_h64_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_vtile_h64.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "uniform_seq_len"
+        ],
+        [
+          "parameter",
+          "persistent_tasks"
+        ],
+        [
+          "parameter",
+          "persistent_stride"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9a8979215919f190e54f3b2536891622a141564c4c2102c9575c8420711edaa5",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 219054,
+          "path": "csrc/kda/cake_kda_prefill_vtile_h64_persistent.cu",
+          "sha256": "a25671279b4b88c2c755c26d8fa628542e5331392f1e10589f47a704a35946b5"
+        },
+        {
+          "bytes": 31786,
+          "path": "csrc/kda/cake_kda_prefill_vtile_h64_persistent_binding.cu",
+          "sha256": "35d3f16deb7e6cb67a437b5d76695c7ad3befd2dda01fc4d1e3afd8474cf08d8"
+        }
+      ],
+      "closure_sha256": "3b9f177259ed56cb855f4db016502dcc033316e4d82ad81212bed3687b0bc167",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_vtile_h64_persistent",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 226304,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_vtile_h64_persistent_ffi",
+      "name": "cake_kda_prefill_vtile_h64_persistent",
+      "role": "prefill",
+      "route": {
+        "policy": "persistent_vtile_m128_h64",
+        "trace_globals": {
+          "HEAD_POLICY": 64,
+          "PERSISTENT_MODE": 1,
+          "PERSISTENT_SIX_TASK_SCHEDULE": 0,
+          "PERSISTENT_STRIDE_HEAD_ALIGNED": 1
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_vtile_h64_persistent_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_vtile_h64_persistent.cu"
+      }
+    },
+    {
+      "arch": "sm_103a",
+      "arg_plan": [
+        [
+          "buffer",
+          "q"
+        ],
+        [
+          "tma_buffer",
+          "q_tma"
+        ],
+        [
+          "buffer",
+          "k"
+        ],
+        [
+          "tma_buffer",
+          "k_tma"
+        ],
+        [
+          "buffer",
+          "v"
+        ],
+        [
+          "tma_buffer",
+          "v_tma"
+        ],
+        [
+          "buffer",
+          "g"
+        ],
+        [
+          "tma_buffer",
+          "g_tma"
+        ],
+        [
+          "buffer",
+          "beta"
+        ],
+        [
+          "tma_buffer",
+          "beta_tma"
+        ],
+        [
+          "buffer",
+          "A_log"
+        ],
+        [
+          "buffer",
+          "dt_bias"
+        ],
+        [
+          "buffer",
+          "cu_seqlens"
+        ],
+        [
+          "buffer",
+          "seq_order"
+        ],
+        [
+          "buffer",
+          "initial_state"
+        ],
+        [
+          "buffer",
+          "out"
+        ],
+        [
+          "tma_buffer",
+          "out_tma"
+        ],
+        [
+          "buffer",
+          "final_state"
+        ],
+        [
+          "parameter",
+          "state_indices_addr"
+        ],
+        [
+          "parameter",
+          "state_slot_stride"
+        ],
+        [
+          "parameter",
+          "use_state_indices"
+        ],
+        [
+          "buffer",
+          "initial_state_f32"
+        ],
+        [
+          "buffer",
+          "final_state_f32"
+        ],
+        [
+          "parameter",
+          "uniform_seq_len"
+        ],
+        [
+          "parameter",
+          "persistent_tasks"
+        ],
+        [
+          "parameter",
+          "persistent_stride"
+        ],
+        [
+          "parameter",
+          "num_heads"
+        ],
+        [
+          "parameter",
+          "use_initial_state"
+        ],
+        [
+          "parameter",
+          "store_final_state"
+        ],
+        [
+          "parameter",
+          "scale"
+        ],
+        [
+          "parameter",
+          "lower_bound"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "9a8979215919f190e54f3b2536891622a141564c4c2102c9575c8420711edaa5",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 219330,
+          "path": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six.cu",
+          "sha256": "43839bc288520ca81d9dd1c2d9b56bc6296075f96fd7840e2767a2df0feb6782"
+        },
+        {
+          "bytes": 31810,
+          "path": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six_binding.cu",
+          "sha256": "b3caf8a6c6c8b90f1072798511d1ac58aaeed09456e3235112d81965c2a7cd15"
+        }
+      ],
+      "closure_sha256": "f2a79c72109b50b48a0972568e88cd7852b6b03145bc600257191683ac236f50",
+      "compile_flags": [
+        "--use_fast_math",
+        "--ptxas-options=-O1"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_kda_prefill_vtile_h96_persistent_six",
+      "launch": {
+        "block": [
+          1024,
+          1,
+          1
+        ],
+        "cluster": [
+          1,
+          1,
+          1
+        ],
+        "cooperative": false,
+        "dynamic_smem_bytes": 226304,
+        "use_pdl": false
+      },
+      "module_ident": "cake_kda_prefill_vtile_h96_persistent_six_ffi",
+      "name": "cake_kda_prefill_vtile_h96_persistent_six",
+      "role": "prefill",
+      "route": {
+        "policy": "persistent_vtile_m128_h96_six_task",
+        "trace_globals": {
+          "HEAD_POLICY": 0,
+          "PERSISTENT_MODE": 1,
+          "PERSISTENT_SIX_TASK_SCHEDULE": 1,
+          "PERSISTENT_STRIDE_HEAD_ALIGNED": 0
+        }
+      },
+      "tma_abi": "pointer",
+      "translation_units": {
+        "binding": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/kda/cake_kda_prefill_vtile_h96_persistent_six.cu"
+      }
+    }
+  ],
+  "name": "cake_kda_prefill_shared",
+  "producer": "cake",
+  "producer_revision": "20fd4872ac9c8904a79da27a4178fd922331238f",
+  "schema": "cake.library_export.v1"
+}
