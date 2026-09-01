@@ -212,9 +212,14 @@ def test_cuda_graph_reads_updated_caller_block_table():
     torch.testing.assert_close(eager, torch.full_like(eager, -1))
 
 
-def test_prims_rejects_cudnn_max_sequence_kv():
+def test_prims_fail_fast_for_unsupported_options():
     workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
-    qo = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    indptr = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    hq, hkv, d, page_size = 2, 1, 32, 16
+    q = _fp8((1, hq, d))
+    k = _fp8((1, hkv, d))
+    v = _fp8((1, hkv, d))
+    cache = _fp8((1, 2, hkv, page_size, d))
 
     paged_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
         workspace, "HND", backend="cute-dsl-prims"
@@ -224,35 +229,64 @@ def test_prims_rejects_cudnn_max_sequence_kv():
     last_page_len = torch.tensor([1], dtype=torch.int32, device="cuda")
     with pytest.raises(NotImplementedError, match="max_sequence_kv"):
         paged_wrapper.plan(
-            qo,
+            indptr,
             page_indptr,
             page_indices,
             last_page_len,
-            2,
-            1,
-            32,
-            16,
+            hq,
+            hkv,
+            d,
+            page_size,
             q_data_type=torch.float8_e4m3fn,
             kv_data_type=torch.float8_e4m3fn,
             o_data_type=torch.float16,
             max_sequence_kv=1,
         )
+    paged_wrapper.plan(
+        indptr,
+        page_indptr,
+        page_indices,
+        last_page_len,
+        hq,
+        hkv,
+        d,
+        page_size,
+        q_data_type=q.dtype,
+        kv_data_type=cache.dtype,
+        o_data_type=torch.float16,
+    )
+    sinks = torch.zeros(hq, dtype=torch.float32, device="cuda")
+    with pytest.raises(NotImplementedError, match="does not support attention sinks"):
+        paged_wrapper.run(q, cache, sinks=sinks)
 
     ragged_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
         workspace, "NHD", backend="cute-dsl-prims"
     )
     with pytest.raises(NotImplementedError, match="max_sequence_kv"):
         ragged_wrapper.plan(
-            qo,
-            qo,
-            2,
-            1,
-            32,
+            indptr,
+            indptr,
+            hq,
+            hkv,
+            d,
             q_data_type=torch.float8_e4m3fn,
             kv_data_type=torch.float8_e4m3fn,
             o_data_type=torch.float16,
             max_sequence_kv=1,
         )
+    ragged_wrapper.plan(
+        indptr,
+        indptr,
+        hq,
+        hkv,
+        d,
+        q_data_type=q.dtype,
+        kv_data_type=k.dtype,
+        o_data_type=torch.float16,
+    )
+    ragged_wrapper._sinks = sinks
+    with pytest.raises(NotImplementedError, match="does not support attention sinks"):
+        ragged_wrapper.run(q, k, v)
 
 
 def test_prims_accepts_combined_hnd_cache_and_pdl():

@@ -4345,6 +4345,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not accept custom run arguments"
                 )
+            if getattr(self, "_sinks", None) is not None:
+                raise NotImplementedError(
+                    "attention sinks were set on the wrapper (_sinks) but "
+                    "backend='cute-dsl-prims' does not support attention sinks"
+                )
             if kv_cache_sf is not None:
                 raise NotImplementedError(
                     "backend='cute-dsl-prims' does not support NVFP4 kv_cache_sf"
