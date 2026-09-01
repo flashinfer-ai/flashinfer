@@ -2137,6 +2137,64 @@ def test_sparse_mla_sm120_runner_rejects_unknown_d_v() -> None:
         _SparseMLAPagedAttentionRunner(d_v=768, device=device)
 
 
+def test_sparse_mla_sm120_runner_wide_lse_buffer() -> None:
+    """An LSE buffer wider than the call's head count must stay correct.
+
+    The runner hands the kernels a non-contiguous column slice of a wider
+    buffer, which the kernels honor through the out_lse row stride.
+    Previously the decode path silently corrupted every row past the first
+    while prefill raised on the same call shape. Covers both the
+    constructor-pre-allocated buffer and a caller-passed one.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk = d_v = 512
+    num_tokens, num_heads, topk = 8, 64, 640
+    page_block_size, num_blocks = 64, 64
+    s_kv = num_blocks * page_block_size
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    kv_dequant = dequantize_kv_dsv4(kv_packed)
+
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0, s_kv, (num_tokens, topk), device=device, dtype=torch.int32
+    )
+    indices[:, topk // 2 :] = -1
+    sm_scale = d_qk**-0.5
+    ref_out, ref_lse = _ref_sparse_attn(q, kv_dequant, indices, sm_scale, d_v)
+
+    def run(runner, out_lse=None):
+        output = torch.zeros(
+            (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+        )
+        lse = runner.run(
+            q, kv_packed, indices, output, sm_scale, out_lse=out_lse, return_lse=True
+        )
+        torch.testing.assert_close(output, ref_out, atol=5e-2, rtol=5e-2)
+        assert lse is not None
+        torch.testing.assert_close(lse, ref_lse, atol=5e-2, rtol=5e-2)
+
+    # Constructor-pre-allocated buffer wider than the call's head count.
+    run(
+        _SparseMLAPagedAttentionRunner(
+            max_num_tokens=num_tokens, max_num_heads=128, device=device
+        )
+    )
+    # Caller-passed wide buffer.
+    wide = torch.full((num_tokens, 128), float("nan"), device=device)
+    run(_SparseMLAPagedAttentionRunner(device=device), out_lse=wide)
+
+
 _DSV4_PREFILL_DUAL_CONFIGS = [
     (128, 64),
     (512, 64),

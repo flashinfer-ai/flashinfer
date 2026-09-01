@@ -30,7 +30,7 @@ bool launch_sparse_mla_decode_dsv4(
     const uint8_t* extra_KV_cache, const int32_t* extra_indices, const int* extra_topk_length,
     int extra_topk, int pbs_extra, size_t stride_extra_kv_block, int chunks_per_block_override,
     float sm_scale, size_t stride_kv_block, size_t stride_indices_token,
-    size_t stride_extra_indices_token, cudaStream_t stream);
+    size_t stride_extra_indices_token, size_t stride_out_lse, cudaStream_t stream);
 
 bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int num_tokens,
                                      int num_splits, const bf16* Q, const uint8_t* KV_cache,
@@ -39,7 +39,7 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
                                      const float* attn_sink, int chunks_per_block_override,
                                      float sm_scale, size_t stride_kv_block,
                                      size_t stride_indices_token, int stride_kv_row,
-                                     cudaStream_t stream);
+                                     size_t stride_out_lse, cudaStream_t stream);
 
 namespace {
 
@@ -127,6 +127,13 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   CHECK_INPUT_TYPE(indices, dl_int32);
   TVM_FFI_ICHECK_EQ(indices.stride(-1), 1) << "indices last dimension must be contiguous";
   const size_t stride_indices_token = static_cast<size_t>(indices.stride(0));
+  // out_lse rows may be strided views into a wider buffer, same slicing
+  // pattern as indices; the head dim must stay contiguous.
+  CHECK_CUDA(out_lse);
+  CHECK_INPUT_TYPE(out_lse, dl_float32);
+  TVM_FFI_ICHECK_EQ(out_lse.ndim(), 2) << "out_lse must be [T, H]";
+  TVM_FFI_ICHECK_EQ(out_lse.stride(-1), 1) << "out_lse last dimension must be contiguous";
+  const size_t stride_out_lse = static_cast<size_t>(out_lse.stride(0));
 
   const int num_tokens = static_cast<int>(q.size(0));
   const int num_heads = static_cast<int>(q.size(1));
@@ -205,7 +212,8 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
       static_cast<float*>(out_lse.data_ptr()), topk_len_ptr, attn_sink_ptr, extra_kv_ptr,
       extra_indices_ptr, extra_topk_len_ptr, extra_topk_arg, pbs_extra_arg, stride_extra_kv_block,
       static_cast<int>(chunks_per_block_override), static_cast<float>(sm_scale),
-      kv_layout.stride_kv_block, stride_indices_token, stride_extra_indices_token, stream);
+      kv_layout.stride_kv_block, stride_indices_token, stride_extra_indices_token, stride_out_lse,
+      stream);
   TVM_FFI_ICHECK(ok) << "decode-dsv4 launch failed (unsupported shape or kernel error)";
 }
 
@@ -228,6 +236,13 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
   CHECK_INPUT_TYPE(indices, dl_int32);
   TVM_FFI_ICHECK_EQ(indices.stride(-1), 1) << "indices last dimension must be contiguous";
   const size_t stride_indices_token = static_cast<size_t>(indices.stride(0));
+  // out_lse rows may be strided views into a wider buffer, same slicing
+  // pattern as indices; the head dim must stay contiguous.
+  CHECK_CUDA(out_lse);
+  CHECK_INPUT_TYPE(out_lse, dl_float32);
+  TVM_FFI_ICHECK_EQ(out_lse.ndim(), 2) << "out_lse must be [T, H]";
+  TVM_FFI_ICHECK_EQ(out_lse.stride(-1), 1) << "out_lse last dimension must be contiguous";
+  const size_t stride_out_lse = static_cast<size_t>(out_lse.stride(0));
 
   const int num_tokens = static_cast<int>(q.size(0));
   const int num_heads = static_cast<int>(q.size(1));
@@ -254,7 +269,8 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
       static_cast<float*>(mid_lse.data_ptr()), static_cast<bf16*>(output.data_ptr()),
       static_cast<float*>(out_lse.data_ptr()), topk_len_ptr, attn_sink_ptr,
       static_cast<int>(chunks_per_block_override), static_cast<float>(sm_scale),
-      kv_layout.stride_kv_block, stride_indices_token, kv_layout.stride_kv_row, stream);
+      kv_layout.stride_kv_block, stride_indices_token, kv_layout.stride_kv_row, stride_out_lse,
+      stream);
   TVM_FFI_ICHECK(ok) << "decode-dsv3_2 launch failed (unsupported shape or kernel error)";
 }
 

@@ -919,9 +919,12 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge
     const float* __restrict__ attn_sink,  // [num_heads], nullable. natural-log domain.
     int num_tokens, int num_splits,
     // Runtime head counts, used when NUM_HEADS == 0 (the runtime-H
-    // instantiation): num_heads strides output/out_lse; mid_heads strides the
+    // instantiation): num_heads strides output; mid_heads strides the
     // HPB-aligned split-K scratch (gridDim.y * HPB of the stage-1 launch).
-    int num_heads, int mid_heads) {
+    int num_heads, int mid_heads,
+    // out_lse row stride in elements; a column slice of a wider buffer is
+    // legal.
+    size_t stride_out_lse) {
   static_assert(BLOCK_THREADS % 32 == 0, "BLOCK_THREADS must be multiple of 32");
   static_assert(DIMS_PER_THREAD % 8 == 0, "DIMS_PER_THREAD must be multiple of 8 (uint4)");
   static_assert(BLOCK_THREADS * DIMS_PER_THREAD == D_V_VAL, "block must cover the full D_V row");
@@ -1033,7 +1036,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 8) sparse_mla_decode_dsv4_merge
     *reinterpret_cast<uint4*>(out_ptr + dim_base + v * 8) = packed;
   }
   if (out_lse != nullptr && tid == 0) {
-    out_lse[(size_t)t_idx * q_heads + h] = sm_glse;
+    out_lse[(size_t)t_idx * stride_out_lse + h] = sm_glse;
   }
 }
 

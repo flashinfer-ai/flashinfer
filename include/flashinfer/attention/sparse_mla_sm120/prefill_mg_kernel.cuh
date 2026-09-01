@@ -650,7 +650,7 @@ __global__ void __launch_bounds__(PrefillTileCfg<MT>::BLOCK_THREADS, 1)
         else
           lse = sink_log2;
       }
-      size_t lse_idx = (size_t)s_i * NUM_HEADS + h_start + h;
+      size_t lse_idx = (size_t)s_i * cold.stride_out_lse + h_start + h;
       out_lse[lse_idx] = lse;
     }
   }
@@ -1650,7 +1650,7 @@ __device__ __forceinline__ void prefill_mg_impl(
           else
             lse = sink_log2;
         }
-        size_t lse_idx = (size_t)s_i * NUM_HEADS + (h_start + g * HPB + h);
+        size_t lse_idx = (size_t)s_i * cold.stride_out_lse + (h_start + g * HPB + h);
         out_lse[lse_idx] = lse;
       }
 

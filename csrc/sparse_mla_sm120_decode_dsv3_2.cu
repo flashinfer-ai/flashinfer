@@ -38,7 +38,7 @@ static bool launch_decode_dsv3_2_impl(int num_heads, int topk, const bf16* Q,
                                       int num_tokens, int num_splits, int chunks_per_block_override,
                                       float sm_scale, size_t stride_kv_block,
                                       size_t stride_indices_token, int stride_kv_row,
-                                      cudaStream_t stream) {
+                                      size_t stride_out_lse, cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
   static_assert(KV::D_QK == 576 || (MT == ModelType::GLM53_NOPE && KV::D_QK == 512));
   // NUM_HEADS == 0 is the runtime-head-count instantiation: num_heads (<= 128)
@@ -128,9 +128,9 @@ static bool launch_decode_dsv3_2_impl(int num_heads, int topk, const bf16* Q,
   dim3 grid2(num_tokens, q_heads);
   dim3 block2(MERGE_BLOCK_THREADS);
   const size_t merge_smem_bytes = (size_t)num_splits * sizeof(float);
-  merge_kernel<<<grid2, block2, merge_smem_bytes, stream>>>(mid_out, mid_lse, output, out_lse,
-                                                            attn_sink, num_tokens, num_splits,
-                                                            q_heads, h_blocks * HPB);
+  merge_kernel<<<grid2, block2, merge_smem_bytes, stream>>>(
+      mid_out, mid_lse, output, out_lse, attn_sink, num_tokens, num_splits, q_heads, h_blocks * HPB,
+      stride_out_lse);
   DSV3_2_CUDA_CHECK(cudaGetLastError());
   return true;
 }
@@ -149,7 +149,7 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
                                      const float* attn_sink, int chunks_per_block_override,
                                      float sm_scale, size_t stride_kv_block,
                                      size_t stride_indices_token, int stride_kv_row,
-                                     cudaStream_t stream) {
+                                     size_t stride_out_lse, cudaStream_t stream) {
   if (num_splits <= 0) return false;
   if (num_heads < 1 || num_heads > 128) return false;
   if (topk < 1) return false;
@@ -158,14 +158,14 @@ bool launch_sparse_mla_decode_dsv3_2(ModelType mt, int num_heads, int topk, int 
     return launch_decode_dsv3_2_impl<MT_VALUE, (H)>(                                             \
         num_heads, topk, Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse,   \
         attn_sink, num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, \
-        stride_indices_token, stride_kv_row, stream);                                            \
+        stride_indices_token, stride_kv_row, stride_out_lse, stream);                            \
   }
 #define DSV3_2_DISPATCH_RT_MT(MT_VALUE)                                                          \
   {                                                                                              \
     return launch_decode_dsv3_2_impl<MT_VALUE, 0>(                                               \
         num_heads, topk, Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse,   \
         attn_sink, num_tokens, num_splits, chunks_per_block_override, sm_scale, stride_kv_block, \
-        stride_indices_token, stride_kv_row, stream);                                            \
+        stride_indices_token, stride_kv_row, stride_out_lse, stream);                            \
   }
 #define DSV3_2_DISPATCH(H)                      \
   do {                                          \

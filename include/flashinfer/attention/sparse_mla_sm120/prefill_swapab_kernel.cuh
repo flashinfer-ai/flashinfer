@@ -421,7 +421,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS, 1)
     if (gid == 0) {
 #pragma unroll
       for (int ih = 0; ih < 2; ih++)
-        out_lse[(size_t)s_i * NUM_HEADS + h_base + 2 * tid + ih] = lse[ih];
+        out_lse[(size_t)s_i * cold.stride_out_lse + h_base + 2 * tid + ih] = lse[ih];
     }
 
     const size_t out_base = ((size_t)s_i * NUM_HEADS + h_base) * D_V;

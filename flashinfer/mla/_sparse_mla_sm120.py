@@ -842,6 +842,10 @@ class _SparseMLAPagedAttentionRunner:
         if device is None:
             device = torch.device("cuda", torch.cuda.current_device())
         self._device = torch.device(device)
+        if self._device.type == "cuda" and self._device.index is None:
+            # Allocated tensors always carry a device index; pin it so
+            # caller-passed buffers compare equal on the same device.
+            self._device = torch.device("cuda", torch.cuda.current_device())
         self._max_num_tokens = max_num_tokens
         self._max_num_heads = max_num_heads
         self._d_v = d_v

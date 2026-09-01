@@ -51,8 +51,9 @@ bool sparse_mla_prefill_dispatch(ModelType mt, PrefillVariant variant, int num_h
                                  const uint8_t* extra_KV_cache, const int32_t* extra_indices,
                                  bf16* output, float* out_lse, float sm_scale, int num_tokens,
                                  size_t stride_kv_block, size_t extra_stride_kv_block,
-                                 const float* attn_sink, const int* topk_length,
-                                 const int* extra_topk_length, cudaStream_t stream);
+                                 size_t stride_out_lse, const float* attn_sink,
+                                 const int* topk_length, const int* extra_topk_length,
+                                 cudaStream_t stream);
 
 namespace {
 
@@ -147,8 +148,9 @@ void SparseMlaSm120PagedAttention(
     TensorView kv_cache,  // packed paged FP8; HND/NHD/3D/2D forms accepted
     TensorView indices,   // [num_tokens, topk] or [num_tokens, 1, topk] int32 (-1 = skip)
     TensorView output,    // [num_tokens, num_heads, d_v] bf16 — in-place
-    TensorView out_lse,   // [num_tokens, num_heads] f32 — in-place
-    double sm_scale, int64_t model_type,
+    // [num_tokens, num_heads] f32 — in-place; row-strided views (a column
+    // slice of a wider buffer) are supported, the head dim stays contiguous.
+    TensorView out_lse, double sm_scale, int64_t model_type,
     int64_t variant,                         // PrefillVariant; planner-selected
     Optional<TensorView> topk_length,        // [num_tokens] int32, optional
     Optional<TensorView> attn_sink,          // [num_heads] f32, optional
@@ -164,7 +166,10 @@ void SparseMlaSm120PagedAttention(
   CHECK_INPUT_TYPE(kv_cache, dl_uint8);
   CHECK_INPUT_AND_TYPE(indices, dl_int32);
   CHECK_INPUT_AND_TYPE(output, dl_bfloat16);
-  CHECK_INPUT_AND_TYPE(out_lse, dl_float32);
+  // out_lse may be a row-strided column slice of a wider buffer; checked
+  // against its real strides below instead of requiring full contiguity.
+  CHECK_CUDA(out_lse);
+  CHECK_INPUT_TYPE(out_lse, dl_float32);
 
   CHECK_DIM(3, q);
 
@@ -189,6 +194,8 @@ void SparseMlaSm120PagedAttention(
   TVM_FFI_ICHECK_EQ(out_lse.ndim(), 2) << "out_lse must be [num_tokens, num_heads]";
   TVM_FFI_ICHECK_EQ(out_lse.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(out_lse.size(1), num_heads);
+  TVM_FFI_ICHECK_EQ(out_lse.stride(-1), 1) << "out_lse last dimension must be contiguous";
+  const size_t stride_out_lse = static_cast<size_t>(out_lse.stride(0));
 
   if (topk_length.has_value()) {
     const auto& tl = topk_length.value();
@@ -273,7 +280,7 @@ void SparseMlaSm120PagedAttention(
       mt, static_cast<PrefillVariant>(variant), num_heads, topk, page_block_size, extra_topk,
       extra_page_block_size, Q_ptr, KV_ptr, idx_ptr, extra_kv_ptr, extra_idx_ptr, O_ptr, LSE_ptr,
       static_cast<float>(sm_scale), num_tokens, kv_layout.stride_kv_block, extra_stride_kv_block,
-      attn_sink_ptr, tl_ptr, etl_ptr, stream);
+      stride_out_lse, attn_sink_ptr, tl_ptr, etl_ptr, stream);
   const char* mt_name = "DSV4";
   switch (mt) {
     case ModelType::DSV3_2:

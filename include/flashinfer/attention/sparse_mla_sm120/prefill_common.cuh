@@ -54,6 +54,8 @@ struct PrefillColdParams {
   size_t stride_kv_block;
   // Dual-cache only (sparse_mla_prefill_mg_dual_kernel); ignored elsewhere.
   size_t stride_kv_block_extra;
+  // out_lse row stride in elements; a column slice of a wider buffer is legal.
+  size_t stride_out_lse;
   int topk_extra;          // dual-cache only. Runtime topk_extra so callers can
                            // pass any cdiv(max_model_len, compress_ratio) value
                            // without per-bound template instantiations.

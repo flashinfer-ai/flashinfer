@@ -28,7 +28,7 @@ static bool launch_decode_dsv4_impl(int num_heads, int topk, const bf16* Q, cons
                                     int num_tokens, int num_splits, int chunks_per_block_override,
                                     float sm_scale, size_t stride_kv_block,
                                     size_t stride_indices_token, size_t stride_extra_indices_token,
-                                    cudaStream_t stream) {
+                                    size_t stride_out_lse, cudaStream_t stream) {
   using KV = KVCacheTraits<MT>;
   using Cfg = DecodeTileCfg<MT>;
   // Ceiling div so NUM_HEADS < HPB (small-TP configs, e.g. h=8) still get a
@@ -142,9 +142,9 @@ static bool launch_decode_dsv4_impl(int num_heads, int topk, const bf16* Q, cons
   dim3 grid2(num_tokens, q_heads);
   dim3 block2(MERGE_BLOCK_THREADS);
   const size_t merge_smem_bytes = (size_t)num_splits * sizeof(float);
-  merge_kernel<<<grid2, block2, merge_smem_bytes, stream>>>(mid_out, mid_lse, output, out_lse,
-                                                            attn_sink, num_tokens, num_splits,
-                                                            q_heads, h_blocks * HPB);
+  merge_kernel<<<grid2, block2, merge_smem_bytes, stream>>>(
+      mid_out, mid_lse, output, out_lse, attn_sink, num_tokens, num_splits, q_heads, h_blocks * HPB,
+      stride_out_lse);
   CUDA_CHECK_BOOL(cudaGetLastError());
   return true;
 }
@@ -164,7 +164,7 @@ bool launch_sparse_mla_decode_dsv4(
     const uint8_t* extra_KV_cache, const int32_t* extra_indices, const int* extra_topk_length,
     int extra_topk, int pbs_extra, size_t stride_extra_kv_block, int chunks_per_block_override,
     float sm_scale, size_t stride_kv_block, size_t stride_indices_token,
-    size_t stride_extra_indices_token, cudaStream_t stream) {
+    size_t stride_extra_indices_token, size_t stride_out_lse, cudaStream_t stream) {
   if (mt != ModelType::DSV4 && mt != ModelType::DOTS3_SWA) return false;
   if (page_block_size != 64) return false;
   if (num_splits <= 0) return false;
@@ -181,7 +181,8 @@ bool launch_sparse_mla_decode_dsv4(
         num_heads, topk, Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, \
         attn_sink, extra_KV_cache, extra_indices, extra_topk_length, extra_topk, pbs_extra,    \
         stride_extra_kv_block, num_tokens, num_splits, chunks_per_block_override, sm_scale,    \
-        stride_kv_block, stride_indices_token, stride_extra_indices_token, stream);            \
+        stride_kv_block, stride_indices_token, stride_extra_indices_token, stride_out_lse,     \
+        stream);                                                                               \
   }
 // Runtime-H fallback: any num_heads in [1, 128] whose exact count no
 // dedicated instantiation above claimed (they return first).
@@ -191,7 +192,8 @@ bool launch_sparse_mla_decode_dsv4(
         num_heads, topk, Q, KV_cache, indices, mid_out, mid_lse, topk_length, output, out_lse, \
         attn_sink, extra_KV_cache, extra_indices, extra_topk_length, extra_topk, pbs_extra,    \
         stride_extra_kv_block, num_tokens, num_splits, chunks_per_block_override, sm_scale,    \
-        stride_kv_block, stride_indices_token, stride_extra_indices_token, stream);            \
+        stride_kv_block, stride_indices_token, stride_extra_indices_token, stride_out_lse,     \
+        stream);                                                                               \
   }
 #define DSV4_DISPATCH(H) DECODE_DISPATCH(ModelType::DSV4, (H))
   DSV4_DISPATCH(8)
