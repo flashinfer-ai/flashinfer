@@ -285,7 +285,7 @@ def _recurrence_requirements(
     alpha_was_none: bool,
     use_qk_l2norm_in_kernel: bool,
     output_final_state: bool,
-) -> tuple[bool, bool, int]:
+) -> tuple[bool, bool, int, int]:
     """Resolve semantic recurrence launches, including BF16 state repair."""
 
     needs_final_state = output_final_state and (
@@ -296,7 +296,17 @@ def _recurrence_requirements(
     needs_output = alpha_was_none or (
         io_dtype == torch.bfloat16 and not use_qk_l2norm_in_kernel
     )
-    return needs_final_state, needs_output, int(use_qk_l2norm_in_kernel)
+    use_block64_final_state = (
+        io_dtype == torch.bfloat16
+        and not alpha_was_none
+        and not use_qk_l2norm_in_kernel
+    )
+    return (
+        needs_final_state,
+        needs_output,
+        int(use_qk_l2norm_in_kernel),
+        int(use_block64_final_state),
+    )
 
 
 def _build_plan(
@@ -673,6 +683,7 @@ class GDNCPPrefill:
             needs_final_state_recurrence,
             needs_output_recurrence,
             self._recurrence_normalize_qk,
+            self._recurrence_use_block64_final_state,
         ) = _recurrence_requirements(
             io_dtype=q.dtype,
             alpha_was_none=alpha_was_none,
@@ -894,6 +905,7 @@ class GDNCPPrefill:
                 self._recurrence_normalize_qk,
                 0,
                 1,
+                self._recurrence_use_block64_final_state,
                 p.num_q_heads,
                 p.num_k_heads,
                 p.num_v_heads,
@@ -973,6 +985,7 @@ class GDNCPPrefill:
                     self.scale,
                     self._recurrence_normalize_qk,
                     1,
+                    0,
                     0,
                     p.num_q_heads,
                     p.num_k_heads,

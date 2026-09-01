@@ -408,16 +408,19 @@ def test_alpha_absent_requires_output_and_requested_final_state_recurrences(
     use_qk_l2norm_in_kernel: bool,
     output_final_state: bool,
 ) -> None:
-    needs_final_state, needs_output, normalize_qk = gdn_cp._recurrence_requirements(
-        io_dtype=io_dtype,
-        alpha_was_none=True,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        output_final_state=output_final_state,
+    needs_final_state, needs_output, normalize_qk, use_block64 = (
+        gdn_cp._recurrence_requirements(
+            io_dtype=io_dtype,
+            alpha_was_none=True,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output_final_state=output_final_state,
+        )
     )
 
     assert needs_final_state is output_final_state
     assert needs_output is True
     assert normalize_qk == int(use_qk_l2norm_in_kernel)
+    assert use_block64 == 0
 
 
 @pytest.mark.parametrize("io_dtype", [torch.float16, torch.bfloat16])
@@ -428,11 +431,13 @@ def test_explicit_alpha_recomputes_requested_bf16_final_state(
     use_qk_l2norm_in_kernel: bool,
     output_final_state: bool,
 ) -> None:
-    needs_final_state, needs_output, normalize_qk = gdn_cp._recurrence_requirements(
-        io_dtype=io_dtype,
-        alpha_was_none=False,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        output_final_state=output_final_state,
+    needs_final_state, needs_output, normalize_qk, use_block64 = (
+        gdn_cp._recurrence_requirements(
+            io_dtype=io_dtype,
+            alpha_was_none=False,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            output_final_state=output_final_state,
+        )
     )
 
     assert needs_final_state is (
@@ -443,6 +448,9 @@ def test_explicit_alpha_recomputes_requested_bf16_final_state(
         io_dtype == torch.bfloat16 and not use_qk_l2norm_in_kernel
     )
     assert normalize_qk == int(use_qk_l2norm_in_kernel)
+    assert use_block64 == int(
+        io_dtype == torch.bfloat16 and not use_qk_l2norm_in_kernel
+    )
 
 
 def test_public_gdn_cp_cache_reuses_equal_metadata_and_rebinds_tensor_addresses(
