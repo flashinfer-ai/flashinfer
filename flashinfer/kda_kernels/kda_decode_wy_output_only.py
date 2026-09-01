@@ -95,6 +95,8 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.nvgpu.warp import MmaF16BF16Op
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.typing import Int32, Int64
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T as mlir_T
 
 # Reuse the validated PTX / layout helpers from the GDN WY kernel — the tile
 # geometry (T=16, K=V=128, K_PADDED=136, BF_PAD=24, SW128 sH) is identical, so
@@ -120,6 +122,25 @@ from ..gdn_kernels.gdn_decode_bf16_wy_output_only import (
     _sts_bf16x2_f32,
     _sw128_xor,
 )
+
+
+def _sts_f32x2(smem_addr_i32, lo_f32, hi_f32):
+    """st.shared.v2.f32: store an adjacent f32 pair (address 8 B aligned).
+
+    Used to stage fp32 correction fragments into the h_buf-aliased W tile
+    without a bf16 round-trip (the fp32 sibling of _sts_bf16x2_f32).
+    """
+    r = llvm.inline_asm(
+        mlir_T.i32(),
+        [smem_addr_i32.ir_value(), lo_f32.ir_value(), hi_f32.ir_value()],
+        "{ st.shared.v2.f32 [$1], {$2, $3}; mov.u32 $0, 0; }",
+        "=r,r,f,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return Int32(r)
+
 
 # Fixed dims (must match the imported helpers' module constants)
 T = 16
@@ -421,7 +442,12 @@ class KdaDecodeWyOutputOnlyKernel:
 
         smem = utils.SmemAllocator()
 
-        _WSTAGE_N = (T * V_PADDED) if self._dropin else 8
+        # The fp32 W (corrections) stage lives inside h_buf (see the emit
+        # epilogue): out-stage region [0, 8704) is dead after the output
+        # flush and the D tile sits at [8704, 13056). Reusing it reclaims
+        # ~8.7 KB/CTA of SMEM (one occupancy step at large batch); this
+        # placeholder stays only to avoid struct churn.
+        _WSTAGE_N = 8
 
         @cute.struct
         class SS:
@@ -469,7 +495,6 @@ class KdaDecodeWyOutputOnlyKernel:
         sMat = st.mat_fp32.get_tensor(cute.make_layout((T, T), stride=(T, 1)))
         sNegL = st.scratch_bf.get_tensor(cute.make_layout((T, T), stride=(BF_PAD, 1)))
         sPowk = st.scratch2_bf.get_tensor(cute.make_layout((T, T), stride=(BF_PAD, 1)))
-        sWf32 = st.wstage_f32.get_tensor(cute.make_layout((_WSTAGE_N,)))
 
         # mbarrier init for the state TMA load (single arriver + TX bytes).
         mbar_h_ptr = st.h_load_mbar.data_ptr()
@@ -1448,9 +1473,12 @@ class KdaDecodeWyOutputOnlyKernel:
             _so_tok = s_o_tok
         _v_off_base = Int32(0)
         _sOutStage_base = sH.iterator.toint()
-        # EMIT: D = (V - U_hat) staging tile in the upper half of h_buf
-        # (out tile needs 4352 B at offset 0; 8192 + 4352 <= 16384).
-        _sUStage_base = _sOutStage_base + Int32(8192)
+        # EMIT: D = (V - U_hat) staging tile in the upper part of h_buf at
+        # byte 8704 (8704 + 4352 <= 16384). The fp32 W tile later reuses
+        # bytes [0, 8704) — the out-stage region, dead after the output
+        # flush (ordered by the pre-W-MMA sync) — so W stores and D reads
+        # never overlap and need no extra barrier.
+        _sUStage_base = _sOutStage_base + Int32(8704)
 
         _qtv_base = _sV_base + _ldm_row * Int32(V_PADDED * 2) + warp_id * Int32(64)
         _cp_async_wait_group_0()
@@ -1583,20 +1611,20 @@ class KdaDecodeWyOutputOnlyKernel:
                     _out_r0 = lane_id // 4
                     _out_c0 = (lane_id & 3) * 2
                     _stg_col = h * 8 + _out_c0
-                    sWf32.iterator[_out_r0 * V_PADDED + _stg_col] = _wr[h_iter * 4]
-                    sWf32.iterator[_out_r0 * V_PADDED + _stg_col + 1] = _wr[
-                        h_iter * 4 + 1
-                    ]
+                    _sts_f32x2(
+                        _sOutStage_base + (_out_r0 * V_PADDED + _stg_col) * 4,
+                        _wr[h_iter * 4],
+                        _wr[h_iter * 4 + 1],
+                    )
                     if const_expr(self._t_input > 8):
-                        sWf32.iterator[(_out_r0 + 8) * V_PADDED + _stg_col] = _wr[
-                            h_iter * 4 + 2
-                        ]
-                        sWf32.iterator[(_out_r0 + 8) * V_PADDED + _stg_col + 1] = _wr[
-                            h_iter * 4 + 3
-                        ]
+                        _sts_f32x2(
+                            _sOutStage_base + ((_out_r0 + 8) * V_PADDED + _stg_col) * 4,
+                            _wr[h_iter * 4 + 2],
+                            _wr[h_iter * 4 + 3],
+                        )
                 sync_threads()
                 _gCorr_base = gCorr.iterator.toint()
-                _sW_base = sWf32.iterator.toint()
+                _sW_base = _sOutStage_base
                 # slot-indexed base in f32 elements; the 16 B store helper
                 # offsets in 2-byte units, so f32 element index * 2.
                 _corr_cta = _state_idx * s_c_blk + pid_hv * s_c_head
