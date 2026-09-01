@@ -1520,7 +1520,14 @@ def build_fp8_block_scale_launch_io(
     data_dtype = cutlass.Float8E4M3FN
     sf_dtype = cutlass.Float32 if is_deepseek else cutlass.Float8E8M0FNU
     dummy_data_ptr = output_buf.data_ptr()
-    global_scale = _get_expert_scale_ones(num_experts, hidden_states.device)
+    global_scale = (
+        _get_expert_scale_ones(num_experts, hidden_states.device)
+        if cfg.uses_global_scales
+        else None
+    )
+    global_scale_ptr = (
+        global_scale.data_ptr() if global_scale is not None else dummy_data_ptr
+    )
     selected_bias = _select_bias(
         fc=fc,
         cfg=cfg,
@@ -1611,13 +1618,13 @@ def build_fp8_block_scale_launch_io(
     )
     scale_c_dp = make_ptr(
         cutlass.Float32,
-        global_scale.data_ptr(),
+        global_scale_ptr,
         cutlass.AddressSpace.gmem,
         assumed_align=16,
     )
     scale_gate_dp = make_ptr(
         cutlass.Float32,
-        global_scale.data_ptr(),
+        global_scale_ptr,
         cutlass.AddressSpace.gmem,
         assumed_align=16,
     )
@@ -1663,7 +1670,7 @@ def build_fp8_block_scale_launch_io(
         tile_idx,
         mn_limit,
         route_map,
-        global_scale,
+        *(() if global_scale is None else (global_scale,)),
         selected_bias,
         selected_gemm1_alpha,
         selected_gemm1_beta,
