@@ -69,6 +69,42 @@ constexpr uint32_t WARP_SIZE = 32;
 // Number of NVFP4 elements sharing one scale factor (UE4M3 byte).
 constexpr uint32_t NVFP4_SF_VEC_SIZE = 16;
 
+/*!
+ * \brief Convert four NVFP4 scale-factor bytes into two packed 16-bit pairs.
+ *
+ * Writes {pack(b0,b1), pack(b2,b3)} -- the two `half2`/`nv_bfloat162` operands that the
+ * per-fragment scale multiply consumes.
+ *
+ * Without a hardware e4m3->f16 convert, `static_cast<T>(__nv_fp8_e4m3)` expands to a software
+ * conversion whose denormal path is a data-dependent `while` loop: a divergent branch per scale
+ * byte, in the innermost loop. Packing the four bytes into one word lets the prmt/lop3 converter
+ * handle them together, branch-free.
+ *
+ * Where the hardware instruction exists we keep `static_cast` so it still lowers to it. The gate is
+ * FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED -- the same one vec_cast<*, __nv_fp8_e4m3> uses -- so
+ * this does not introduce a second, divergent notion of "has FP8 conversion".
+ */
+template <typename DTypeQ>
+__device__ __forceinline__ void nvfp4_sf4_to_packed2x2(uint8_t b0, uint8_t b1, uint8_t b2,
+                                                       uint8_t b3, uint2* out) {
+#if !defined(FLASHINFER_HARDWARE_FP8_CONVERSION_ENABLED)
+  uint32_t packed =
+      uint32_t(b0) | (uint32_t(b1) << 8) | (uint32_t(b2) << 16) | (uint32_t(b3) << 24);
+  fast_dequant_f8f16x4<__nv_fp8_e4m3, DTypeQ>(&packed, out);
+#else
+  using packed2 = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, __nv_bfloat162>;
+  __nv_fp8_e4m3 f0, f1, f2, f3;
+  f0.__x = b0;
+  f1.__x = b1;
+  f2.__x = b2;
+  f3.__x = b3;
+  packed2 lo{static_cast<DTypeQ>(f0), static_cast<DTypeQ>(f1)};
+  packed2 hi{static_cast<DTypeQ>(f2), static_cast<DTypeQ>(f3)};
+  out->x = *reinterpret_cast<uint32_t*>(&lo);
+  out->y = *reinterpret_cast<uint32_t*>(&hi);
+#endif
+}
+
 constexpr uint32_t get_num_warps_q(const uint32_t cta_tile_q) {
   if (cta_tile_q == 32) {
     return 1;  // HEAD_DIM_VO >= 512
@@ -1228,11 +1264,14 @@ __device__ __forceinline__ void compute_qk(
           using packed2_ = std::conditional_t<std::is_same_v<DTypeQ_, half>, half2, __nv_bfloat162>;
           constexpr uint32_t SF_COLS_K = KTraits::NUM_MMA_D_QK;  // HEAD_DIM_QK / 16
           uint32_t sf_base = (mma_kv * 16 + lane_idx / 4) * SF_COLS_K + mma_d;
-          __nv_fp8_e4m3 sf_a_fp8, sf_b_fp8;
-          sf_a_fp8.__x = k_sf_smem[sf_base];
-          sf_b_fp8.__x = k_sf_smem[sf_base + 8 * SF_COLS_K];
-          packed2_ scale_a{static_cast<DTypeQ_>(sf_a_fp8), static_cast<DTypeQ_>(sf_a_fp8)};
-          packed2_ scale_b{static_cast<DTypeQ_>(sf_b_fp8), static_cast<DTypeQ_>(sf_b_fp8)};
+          // b_frag[0,1] share KV row t/4 and b_frag[2,3] share row t/4+8, so each row's scale is
+          // duplicated across its half2: {a,a,b,b} -> {scale_a, scale_b}.
+          const uint8_t sf_a = k_sf_smem[sf_base];
+          const uint8_t sf_b = k_sf_smem[sf_base + 8 * SF_COLS_K];
+          uint2 sf_pair;
+          nvfp4_sf4_to_packed2x2<DTypeQ_>(sf_a, sf_a, sf_b, sf_b, &sf_pair);
+          const packed2_ scale_a = *(packed2_*)&sf_pair.x;
+          const packed2_ scale_b = *(packed2_*)&sf_pair.y;
           *(packed2_*)&b_frag[0] = __hmul2(*(packed2_*)&b_frag[0], scale_a);
           *(packed2_*)&b_frag[1] = __hmul2(*(packed2_*)&b_frag[1], scale_a);
           *(packed2_*)&b_frag[2] = __hmul2(*(packed2_*)&b_frag[2], scale_b);
@@ -1302,11 +1341,12 @@ __device__ __forceinline__ void load_fp4_k_frag_scaled(smem_t<KTraits::SWIZZLE_M
   using packed2 = std::conditional_t<std::is_same_v<DTypeQ, half>, half2, __nv_bfloat162>;
   constexpr uint32_t SF_COLS_K = KTraits::NUM_MMA_D_QK;
   const uint32_t sf_base = (mma_kv * 16 + lane_idx / 4) * SF_COLS_K + mma_d;
-  __nv_fp8_e4m3 sf_a_fp8, sf_b_fp8;
-  sf_a_fp8.__x = k_sf_smem[sf_base];
-  sf_b_fp8.__x = k_sf_smem[sf_base + 8 * SF_COLS_K];
-  packed2 scale_a{static_cast<DTypeQ>(sf_a_fp8), static_cast<DTypeQ>(sf_a_fp8)};
-  packed2 scale_b{static_cast<DTypeQ>(sf_b_fp8), static_cast<DTypeQ>(sf_b_fp8)};
+  const uint8_t sf_a = k_sf_smem[sf_base];
+  const uint8_t sf_b = k_sf_smem[sf_base + 8 * SF_COLS_K];
+  uint2 sf_pair;
+  nvfp4_sf4_to_packed2x2<DTypeQ>(sf_a, sf_a, sf_b, sf_b, &sf_pair);
+  const packed2 scale_a = *(packed2*)&sf_pair.x;
+  const packed2 scale_b = *(packed2*)&sf_pair.y;
   *(packed2*)&b_frag[0] = __hmul2(*(packed2*)&b_frag[0], scale_a);
   *(packed2*)&b_frag[1] = __hmul2(*(packed2*)&b_frag[1], scale_a);
   *(packed2*)&b_frag[2] = __hmul2(*(packed2*)&b_frag[2], scale_b);
@@ -1762,13 +1802,12 @@ __device__ __forceinline__ void compute_sfm_v(
                 std::conditional_t<std::is_same_v<DTypeQ_, half>, half2, __nv_bfloat162>;
             constexpr uint32_t SF_COLS_V = KTraits::NUM_MMA_D_VO;  // HEAD_DIM_VO / 16
             uint32_t sf_base = (mma_kv * 16 + 2 * (lane_idx % 4)) * SF_COLS_V + mma_d;
-            __nv_fp8_e4m3 sf0_fp8, sf1_fp8, sf2_fp8, sf3_fp8;
-            sf0_fp8.__x = v_sf_smem[sf_base];
-            sf1_fp8.__x = v_sf_smem[sf_base + SF_COLS_V];
-            sf2_fp8.__x = v_sf_smem[sf_base + 8 * SF_COLS_V];
-            sf3_fp8.__x = v_sf_smem[sf_base + 9 * SF_COLS_V];
-            packed2_ scale_lo{static_cast<DTypeQ_>(sf0_fp8), static_cast<DTypeQ_>(sf1_fp8)};
-            packed2_ scale_hi{static_cast<DTypeQ_>(sf2_fp8), static_cast<DTypeQ_>(sf3_fp8)};
+            uint2 sf_pair;
+            nvfp4_sf4_to_packed2x2<DTypeQ_>(v_sf_smem[sf_base], v_sf_smem[sf_base + SF_COLS_V],
+                                            v_sf_smem[sf_base + 8 * SF_COLS_V],
+                                            v_sf_smem[sf_base + 9 * SF_COLS_V], &sf_pair);
+            const packed2_ scale_lo = *(packed2_*)&sf_pair.x;
+            const packed2_ scale_hi = *(packed2_*)&sf_pair.y;
             *(packed2_*)&b_frag[0] = __hmul2(*(packed2_*)&b_frag[0], scale_lo);
             *(packed2_*)&b_frag[1] = __hmul2(*(packed2_*)&b_frag[1], scale_hi);
             *(packed2_*)&b_frag[2] = __hmul2(*(packed2_*)&b_frag[2], scale_lo);
@@ -3441,13 +3480,13 @@ __device__ __forceinline__ void vosplit_compute_pv(
             } else {
               constexpr uint32_t SF_COLS_V = KTraits::NUM_MMA_D_VO;
               const uint32_t sf_base = (mma_kv * 16 + 2 * (lane_idx % 4)) * SF_COLS_V + global_d;
-              __nv_fp8_e4m3 sf0_fp8, sf1_fp8, sf2_fp8, sf3_fp8;
-              sf0_fp8.__x = smem_storage->v_sf_smem_ptr()[sf_base];
-              sf1_fp8.__x = smem_storage->v_sf_smem_ptr()[sf_base + SF_COLS_V];
-              sf2_fp8.__x = smem_storage->v_sf_smem_ptr()[sf_base + 8 * SF_COLS_V];
-              sf3_fp8.__x = smem_storage->v_sf_smem_ptr()[sf_base + 9 * SF_COLS_V];
-              packed2 scale_lo{static_cast<DTypeQ>(sf0_fp8), static_cast<DTypeQ>(sf1_fp8)};
-              packed2 scale_hi{static_cast<DTypeQ>(sf2_fp8), static_cast<DTypeQ>(sf3_fp8)};
+              const uint8_t* vsf = smem_storage->v_sf_smem_ptr();
+              uint2 sf_pair;
+              nvfp4_sf4_to_packed2x2<DTypeQ>(vsf[sf_base], vsf[sf_base + SF_COLS_V],
+                                             vsf[sf_base + 8 * SF_COLS_V],
+                                             vsf[sf_base + 9 * SF_COLS_V], &sf_pair);
+              const packed2 scale_lo = *(packed2*)&sf_pair.x;
+              const packed2 scale_hi = *(packed2*)&sf_pair.y;
               *(packed2*)&b_frag[0] = __hmul2(*(packed2*)&b_frag[0], scale_lo);
               *(packed2*)&b_frag[1] = __hmul2(*(packed2*)&b_frag[1], scale_hi);
               *(packed2*)&b_frag[2] = __hmul2(*(packed2*)&b_frag[2], scale_lo);
