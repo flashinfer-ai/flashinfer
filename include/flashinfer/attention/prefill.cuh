@@ -2385,7 +2385,8 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
                                   qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
 
         // apply mask
-        if (MASK_MODE == MaskMode::kCustom || has_window_right || (iter >= mask_iteration || iter < window_iteration)) {
+        if (MASK_MODE == MaskMode::kCustom || has_window_right ||
+            (iter >= mask_iteration || iter < window_iteration)) {
           logits_mask<KTraits>(params, variant, /*batch_idx=*/0, qo_packed_idx_base, kv_idx_base,
                                qo_len, kv_len, chunk_end, group_size, s_frag, tid, kv_head_idx);
         }
@@ -3082,7 +3083,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                                   kv_head_idx);
 
         // apply mask
-        if (MASK_MODE == MaskMode::kCustom || has_window_right || (iter >= mask_iteration || iter < window_iteration)) {
+        if (MASK_MODE == MaskMode::kCustom || has_window_right ||
+            (iter >= mask_iteration || iter < window_iteration)) {
           logits_mask<KTraits>(params, variant, /*batch_idx=*/request_idx, qo_packed_idx_base,
                                kv_idx_base, qo_len, kv_len, chunk_end, group_size, s_frag, tid,
                                kv_head_idx);

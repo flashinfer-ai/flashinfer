@@ -94,7 +94,8 @@ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
       static_cast<IdType*>(qo_indptr.data_ptr()), static_cast<IdType*>(kv_indptr.data_ptr()),
       total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
       enable_cuda_graph, /*sizeof_dtype_o=*/2, window_left, window_right, fixed_split_size,
-      disable_split_kv, num_colocated_ctas, uniform_q_len, stream, /*kv_dtype_bytes=*/sizeof(DTypeKV));
+      disable_split_kv, num_colocated_ctas, uniform_q_len, stream,
+      /*kv_dtype_bytes=*/sizeof(DTypeKV));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to calculate prefill workspace size with error: " << cudaGetErrorString(status);

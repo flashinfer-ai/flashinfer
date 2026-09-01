@@ -90,10 +90,9 @@ struct DefaultAttention : AttentionVariantBase {
     if constexpr (use_sliding_window) {
       mask &= (kv_idx + qo_len + window_left >= kv_len + qo_idx);
       if (window_right >= 0) {
-        const int64_t q_abs = static_cast<int64_t>(qo_idx) +
-            static_cast<int64_t>(kv_len) - static_cast<int64_t>(qo_len);
-        mask &= (static_cast<int64_t>(kv_idx) <=
-                 q_abs + static_cast<int64_t>(window_right));
+        const int64_t q_abs = static_cast<int64_t>(qo_idx) + static_cast<int64_t>(kv_len) -
+                              static_cast<int64_t>(qo_len);
+        mask &= (static_cast<int64_t>(kv_idx) <= q_abs + static_cast<int64_t>(window_right));
       }
     }
     return mask;
