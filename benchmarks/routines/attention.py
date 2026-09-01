@@ -2463,6 +2463,14 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     ## The following are for BatchPrefillWithRaggedKVCacheWrapper
     actual_seq_lens_q_device = actual_seq_lens_q.to(device)
     actual_seq_lens_kv_device = actual_seq_lens_kv.to(device)
+    # CPU mirrors for trtllm_ragged_attention_deepseek CUDA graph capture:
+    # its capture path requires per-row lengths without a device sync.
+    actual_seq_lens_q_cpu_flat = (
+        actual_seq_lens_q.reshape(-1).to(torch.int32).cpu().contiguous()
+    )
+    actual_seq_lens_kv_cpu_flat = (
+        actual_seq_lens_kv.reshape(-1).to(torch.int32).cpu().contiguous()
+    )
 
     q_indptr = (
         torch.cat(
@@ -2715,6 +2723,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 return_lse=True,
                 out=out,
                 backend="cute-dsl",
+                q_seq_lens_cpu=actual_seq_lens_q_cpu_flat,
+                kv_seq_lens_cpu=actual_seq_lens_kv_cpu_flat,
             )[0]
         elif backend == "cudnn":
             # cuDNN uses wrapper API
@@ -2768,6 +2778,8 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
                 is_causal=causal,
                 return_lse=True,
                 out=out,
+                q_seq_lens_cpu=actual_seq_lens_q_cpu_flat,
+                kv_seq_lens_cpu=actual_seq_lens_kv_cpu_flat,
             )[0]
         elif backend == "trtllm-fmha-v2":
             _q_scale = q_scale if q_scale is not None else 1.0
@@ -3157,13 +3169,6 @@ def testBatchMLAPagedAttentionWrapper(args):
             remove_trtllm_native = True
         if remove_trtllm_native:
             backends.remove("trtllm-native")
-    if "cute-dsl" in backends:
-        remove_cute_dsl = False
-        if num_qo_heads < 128:
-            print("[INFO] cute-dsl MLA backend requires num_heads >= 128. Skipping.")
-            remove_cute_dsl = True
-        if remove_cute_dsl:
-            backends.remove("cute-dsl")
     if s_qo > 1:
         for backend in ("fa2", "fa3", "cutlass"):
             _drop_backend(
@@ -3309,6 +3314,9 @@ def testBatchMLAPagedAttentionWrapper(args):
         print(f"[VVERBOSE] {workspace_buffer.shape = }")
 
     # Create wrapper
+    # The shared sampler retains singleton dimensions for other attention
+    # routines, but MLA CSR metadata requires one KV length per request.
+    mla_kv_len_arr = actual_seq_lens_kv.flatten()
     backend_wrappers = {}
     for backend in backends:
         if backend in ["fa2", "fa3", "cutlass"]:
@@ -3318,7 +3326,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
-                kv_len_arr=actual_seq_lens_kv,
+                kv_len_arr=mla_kv_len_arr,
                 backend=backend,
             )
             if backend != "cutlass":
@@ -3326,7 +3334,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                     qo_indptr=qo_indptr,
                     kv_indptr=kv_indptr,
                     kv_indices=kv_indices,
-                    kv_len_arr=actual_seq_lens_kv,
+                    kv_len_arr=mla_kv_len_arr,
                     num_heads=num_qo_heads,
                     head_dim_ckv=head_dim_ckv,
                     head_dim_kpe=head_dim_kpe,
@@ -3408,14 +3416,14 @@ def testBatchMLAPagedAttentionWrapper(args):
         """
         if backend in ["fa2", "fa3"]:
             # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl;
-            # the fa2/fa3 MLA wrapper has no PDL support. trtllm-native/auto/
-            # cute-dsl branches below pass args.enable_pdl to the direct API.
+            # FA2/FA3 use their planned CSR metadata and do not accept the
+            # CUTLASS-only page_table argument. trtllm-native/auto/cute-dsl
+            # branches below pass args.enable_pdl to the direct API.
             return backend_wrappers[backend].run(
                 q_nope,
                 q_pe,
                 ckv_cache,
                 kpe_cache,
-                page_table=block_tables,
                 return_lse=False,
             )
         elif backend == "cutlass":

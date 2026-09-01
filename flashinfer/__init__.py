@@ -29,6 +29,12 @@ from .activation import silu_and_mul as silu_and_mul
 from .activation import (
     silu_and_mul_scaled_nvfp4_experts_quantize as silu_and_mul_scaled_nvfp4_experts_quantize,
 )
+from .gated_act_mxfp8 import (
+    silu_and_mul_mxfp8_quantize as silu_and_mul_mxfp8_quantize,
+)
+from .gated_act_mxfp8 import (
+    silu_and_mul_mxfp8_quantize_backward as silu_and_mul_mxfp8_quantize_backward,
+)
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
@@ -60,6 +66,10 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
+from .cake_dcp import get_dcp_spec_counter_bytes as get_dcp_spec_counter_bytes
+from .cake_dcp import (
+    get_dcp_spec_workspace_size_bytes as get_dcp_spec_workspace_size_bytes,
+)
 from .quantization.fp4_quantization import (
     block_scale_interleave,
     nvfp4_block_scale_interleave,
@@ -85,6 +95,13 @@ from .quantization.fp8_quantization import (
     mxfp8_grouped_quantize,
     mxfp8_quantize,
 )
+from .attn_scores import padded_context_len as padded_context_len
+from .attn_scores import (
+    compute_paged_mqa_logits_schedule as compute_paged_mqa_logits_schedule,
+)
+from .attn_scores import fp4_paged_mqa_logits as fp4_paged_mqa_logits
+from .attn_scores import fp8_paged_mqa_logits as fp8_paged_mqa_logits
+from .attn_scores import precompile_paged_mqa_logits as precompile_paged_mqa_logits
 from .fused_moe import (
     cutlass_fused_moe,
     reorder_rows_for_gated_act_gemm,
@@ -101,14 +118,17 @@ from .fused_moe import (
 # CuteDSL high-level APIs (conditionally if cute_dsl available)
 with contextlib.suppress(ImportError):
     from .fused_moe import (
+        cute_dsl_fused_moe as cute_dsl_fused_moe,
         cute_dsl_fused_moe_nvfp4 as cute_dsl_fused_moe_nvfp4,
-        CuteDslMoEWrapper as CuteDslMoEWrapper,
         cute_dsl_fused_moe_mxfp8_mxfp4 as cute_dsl_fused_moe_mxfp8_mxfp4,
         CuteDslMxfp8Mxfp4MoEWrapper as CuteDslMxfp8Mxfp4MoEWrapper,
+        CuteDslMoEWrapper as CuteDslMoEWrapper,
         b12x_fused_moe as b12x_fused_moe,
         B12xMoEWrapper as B12xMoEWrapper,
     )
     from .gdn_prefill import chunk_gated_delta_rule as chunk_gated_delta_rule
+
+
 # The fused GDN decode step is surfaced here like the other GDN APIs; the
 # code lives under flashinfer/gdn_kernels/experimental/ (see its README),
 # but "experimental" describes the file location, not the import path.
@@ -165,6 +185,9 @@ from . import mhc as mhc
 from . import msa_ops as msa_ops
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
+from .norm import (
+    fused_add_rmsnorm_fp8_block_quant as fused_add_rmsnorm_fp8_block_quant,
+)
 from .norm import layernorm as layernorm
 from .norm import layernorm_quant as layernorm_quant
 from .norm import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm

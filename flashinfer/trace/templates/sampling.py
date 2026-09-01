@@ -891,6 +891,7 @@ top_k_ragged_transform_trace = TraceTemplate(
 )
 
 
+@torch.no_grad()
 # ── DeepSeek-V3 fused expert routing (top-k) ─────────────────────────────────
 
 
