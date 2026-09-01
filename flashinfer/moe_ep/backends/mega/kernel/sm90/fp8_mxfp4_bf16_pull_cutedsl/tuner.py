@@ -245,16 +245,14 @@ def _create_canonical_inputs(
 def _candidate_union(
     pkg: Any, *, execution_mode: str, routing_profile: str
 ) -> list[dict[str, Any]]:
-    """Read the only candidate source accepted by the MXFP4 CLI."""
+    """Read the bounded live-tuning union accepted by the MXFP4 CLI."""
     profile = normalize_sm90_routing_profile(routing_profile)
-    candidates = pkg.hopper_mxfp4_candidates(
+    candidates = pkg.hopper_mxfp4_runtime_candidates(
         execution_mode=execution_mode,
         routing_profile=profile,
     )
     if not candidates:
-        raise RuntimeError(
-            f"empty manifest-derived MXFP4 {execution_mode} candidate union"
-        )
+        raise RuntimeError(f"empty runtime MXFP4 {execution_mode} candidate union")
     return candidates
 
 
@@ -295,7 +293,7 @@ def _ordered_candidates(
     ]
     if not legal:
         raise RuntimeError(
-            f"no manifest-derived MXFP4 {execution_mode} candidate supports "
+            f"no runtime MXFP4 {execution_mode} candidate supports "
             f"hidden={hidden}, intermediate={intermediate}"
         )
     if default not in legal:
@@ -306,12 +304,18 @@ def _ordered_candidates(
 def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
     from ......kernel_src.sm90 import pull_style_cutedsl_megakernel as pkg
     from ......kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_tuner import (
+        require_hopper_mxfp4_fused_tuning_device,
         require_hopper_mxfp4_tuning_device,
     )
 
-    # Embedded winners/unions are certified on standard 132-SM H200 only.
-    # Explicit user tactics remain a separate production path.
-    require_hopper_mxfp4_tuning_device()
+    mode = args.execution_mode
+    if mode == "fused":
+        require_hopper_mxfp4_fused_tuning_device()
+    elif mode == "split":
+        # Split tactics embed a certified 132-SM partition.
+        require_hopper_mxfp4_tuning_device()
+    else:
+        raise ValueError(f"unsupported MXFP4 execution mode {mode!r}")
 
     if args.seed != 0:
         raise SystemExit("SM90 MXFP4 tuning requires the canonical --seed 0")
@@ -321,7 +325,6 @@ def tune_one(args, rank: int, world_size: int, max_tokens: int) -> dict:
     if live_tokens > max_tokens:
         raise SystemExit("--live-tokens must be <= --max-tokens")
 
-    mode = args.execution_mode
     candidates = _ordered_candidates(
         pkg,
         execution_mode=mode,

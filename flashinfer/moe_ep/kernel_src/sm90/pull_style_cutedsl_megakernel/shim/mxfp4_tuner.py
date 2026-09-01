@@ -1,13 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""H200 MXFP4 offline winners and compact online-autotune candidates.
+"""Hopper MXFP4 offline winners and compact online-autotune candidates.
 
 This module is deliberately data-only: it does not import torch, initialize a
 process group, compile kernels, or touch the persistent knob cache.  The tables
 are the exact result of the formal, fresh-process offline sweeps documented by
-``MXFP4_TUNING_PROVENANCE``.  Backend integration can therefore share one
-strict source of truth for both the no-autotune heuristic and the bounded
-collective-autotune candidate set.
+``MXFP4_TUNING_PROVENANCE``. Backend integration therefore keeps the frozen
+profile-specific heuristic/manifest data distinct from the bounded live
+candidate union assembled below.
+
+The per-token heuristic tables remain the H200 formal-sweep result. Fused
+online autotuning additionally carries a very small set of cross-device
+anchors that won a formal H20 workload. Those anchors are candidates only:
+they never replace an H200-derived heuristic without being timed on the live
+device. Split candidates remain tied to their certified 132-SM partition.
 """
 
 from __future__ import annotations
@@ -42,9 +48,42 @@ MXFP4_TUNING_ROUTING_PROFILES = (
 
 MXFP4_TUNING_TOKEN_BUCKETS = (8, 32, 64, 128, 256, 512, 1024, 2048)
 
+# These two tactics are supplemental runtime candidates, not an H20 heuristic
+# table. They were the two close formal finalists for the one measured H20
+# workload. Keeping their provenance separate preserves both frozen H200
+# routing-profile manifests byte-for-byte while allowing live autotune to
+# decide whether either tactic helps its actual device and shape.
+MXFP4_FUSED_RUNTIME_ANCHOR_PROVENANCE = MappingProxyType(
+    {
+        "device": "NVIDIA H20-3e",
+        "compute_capability": (9, 0),
+        "sm_count": 78,
+        "world_size": 8,
+        "tokens_per_rank": 1,
+        "hidden": 3072,
+        "intermediate": 1280,
+        "num_experts": 384,
+        "topk": 8,
+        "routing_profile": MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE,
+        "routing_seed": 1234,
+        "route_ids_sha256": (
+            "d95ea5e18e4bb5010dd9cdadf928c6a43e085537615c5dbd166027a64de844eb"
+        ),
+        "winner_manifest_sha256": (
+            "ffb3f8df0edef5e6a07d8685b35e9759e4da691e6010d4251c0df9b37ca40ce7"
+        ),
+        "formal_manifest_sha256": (
+            "fe5cca19a9bc8e30a74f28a47561fd08755ba3f5ab22f90e50b63ebaceabafd6"
+        ),
+        "artifact_files_sha256": (
+            "ae23042d2d4505794867cbdd3523e5469be785506211d38a6266821fe45514f7"
+        ),
+    }
+)
 
-def require_hopper_mxfp4_tuning_device() -> None:
-    """Fail closed unless the manifest H200 tuning domain is exact."""
+
+def _current_hopper_device_identity() -> tuple[str, tuple[int, int], int]:
+    """Return ``(product name, compute capability, SM count)`` for CUDA."""
 
     import torch
 
@@ -54,15 +93,45 @@ def require_hopper_mxfp4_tuning_device() -> None:
         )
     device = torch.cuda.current_device()
     name = str(torch.cuda.get_device_name(device))
-    capability = tuple(int(v) for v in torch.cuda.get_device_capability(device))
+    raw_capability = torch.cuda.get_device_capability(device)
+    capability = (int(raw_capability[0]), int(raw_capability[1]))
     properties = torch.cuda.get_device_properties(device)
     sm_count = int(properties.multi_processor_count)
+    return name, capability, sm_count
+
+
+def require_hopper_mxfp4_fused_tuning_device() -> None:
+    """Require a live SM90 device for fused cache/heuristic/autotune.
+
+    Fused tactics have no fixed SM partition. Their residency is resolved
+    from the live device, while ``group_hint`` remains a performance hint, so
+    a product-name or SM-count restriction would reject otherwise legal
+    Hopper configurations such as H20.
+    """
+
+    actual = _current_hopper_device_identity()
+    if actual[1] != (9, 0):
+        raise RuntimeError(
+            "Hopper MXFP4 fused cache/heuristic/autotune requires SM90 "
+            f"(CC 9.0); got {actual!r}"
+        )
+
+
+def require_hopper_mxfp4_tuning_device() -> None:
+    """Fail closed unless the split manifest's H200 domain is exact.
+
+    This legacy public name is intentionally retained for compatibility. It
+    now guards only paths that consume the frozen 132-SM split partition;
+    fused paths use :func:`require_hopper_mxfp4_fused_tuning_device`.
+    """
+
+    actual = _current_hopper_device_identity()
     expected = ("NVIDIA H200", (9, 0), 132)
-    actual = (name, capability, sm_count)
     if actual != expected:
         raise RuntimeError(
-            "Hopper MXFP4 cache/heuristic/autotune candidates are certified "
-            f"only for standard NVIDIA H200, CC 9.0, 132 SM; got {actual!r}"
+            "Hopper MXFP4 split cache/heuristic/autotune candidates are "
+            "certified only for standard NVIDIA H200, CC 9.0, 132 SM; "
+            f"got {actual!r}"
         )
 
 
@@ -154,6 +223,7 @@ def _fused_tactic(
     cluster: tuple[int, int, int] = (2, 1, 1),
     group_hint: int,
     stages: int,
+    pingpong: bool = False,
     load_balance: str = "atomic_counter",
     token_back: str = "epi_warps",
 ) -> dict[str, Any]:
@@ -165,10 +235,44 @@ def _fused_tactic(
         "load_balance_mode": load_balance,
         "mma_tiler_mnk": tile,
         "num_sched_stages": stages,
-        "pingpong": False,
+        "pingpong": pingpong,
         "swap_ab": True,
         "token_back_mode": token_back,
     }
+
+
+_FUSED_RUNTIME_ANCHORS: tuple[dict[str, Any], ...] = (
+    {
+        "candidate_id": (
+            "26f9703c730e6cf11527e73f8bb8fd4c9adc2e811d8d406c17ad5aa3f79101bd"
+        ),
+        "tactic": _fused_tactic(
+            tile=(128, 16, 256),
+            cluster=(2, 1, 1),
+            group_hint=78,
+            stages=2,
+            pingpong=True,
+            load_balance="static",
+            token_back="epi_warps",
+        ),
+        "source": "h20_ws8_t1_formal_f2",
+    },
+    {
+        "candidate_id": (
+            "d46673da5f8606544a3cfe83b9a150b9e2254ce5cd3173a0c079702b20ae773b"
+        ),
+        "tactic": _fused_tactic(
+            tile=(128, 16, 256),
+            cluster=(2, 1, 1),
+            group_hint=78,
+            stages=1,
+            pingpong=True,
+            load_balance="static",
+            token_back="epi_warps",
+        ),
+        "source": "h20_ws8_t1_formal_f1",
+    },
+)
 
 
 def _split_tactic(
@@ -1031,7 +1135,7 @@ def _require_exact_fields(
 def validate_hopper_mxfp4_tactic(
     tactic: Mapping[str, Any], *, execution_mode: str, total_sms: int = 132
 ) -> dict[str, Any]:
-    """Validate and normalize one tactic from the frozen H200 search domain.
+    """Validate and normalize one tactic from the bounded Hopper search domain.
 
     The returned mapping is a fresh copy whose tile and cluster fields are
     tuples.  No defaults are inserted: callers must preserve the complete
@@ -1175,6 +1279,62 @@ def _candidate_id(implementation: str, tactic: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
+def _fused_runtime_candidate_records() -> tuple[dict[str, Any], ...]:
+    """Merge both frozen H200 routing unions and the H20 anchors by tactic."""
+
+    by_id: dict[str, dict[str, Any]] = {}
+    sources = (
+        _CANDIDATES["fused"],
+        _EXACT_CANDIDATES["fused"],
+        _FUSED_RUNTIME_ANCHORS,
+    )
+    for records in sources:
+        for record in records:
+            tactic = validate_hopper_mxfp4_tactic(
+                record["tactic"], execution_mode="fused"
+            )
+            candidate_id = str(record["candidate_id"])
+            expected_id = _candidate_id(_IMPLEMENTATION["fused"], tactic)
+            if candidate_id != expected_id:
+                raise RuntimeError(
+                    f"corrupt fused runtime candidate id {candidate_id}; "
+                    f"expected {expected_id}"
+                )
+            previous = by_id.get(candidate_id)
+            if previous is not None:
+                if previous["tactic"] != tactic:
+                    raise RuntimeError(
+                        f"fused runtime candidate id collision {candidate_id}"
+                    )
+                continue
+            by_id[candidate_id] = {
+                "candidate_id": candidate_id,
+                "tactic": tactic,
+            }
+    return tuple(by_id[candidate_id] for candidate_id in sorted(by_id))
+
+
+def _candidate_union_sha256(records: tuple[dict[str, Any], ...]) -> str:
+    canonical = json.dumps(
+        [
+            {
+                "candidate_id": record["candidate_id"],
+                "tactic": record["tactic"],
+            }
+            for record in records
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256 = _candidate_union_sha256(
+    _fused_runtime_candidate_records()
+)
+
+
 def _candidate_by_id(
     mode: Mxfp4ExecutionMode, routing_profile: Mxfp4RoutingProfile
 ) -> dict[str, dict[str, Any]]:
@@ -1221,13 +1381,41 @@ def hopper_mxfp4_candidates(
     execution_mode: str,
     routing_profile: str = MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
 ) -> list[dict[str, Any]]:
-    """Return fresh tactic dictionaries for bounded online autotuning."""
+    """Return fresh tactics from one frozen routing-profile manifest."""
 
     mode = _mode(execution_mode)
     profile = normalize_hopper_mxfp4_routing_profile(routing_profile)
     return [
         validate_hopper_mxfp4_tactic(record["tactic"], execution_mode=mode)
         for record in _PROFILE_CANDIDATES[profile][mode]
+    ]
+
+
+def hopper_mxfp4_runtime_candidates(
+    *,
+    execution_mode: str,
+    routing_profile: str = MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
+) -> list[dict[str, Any]]:
+    """Return fresh tactics for live online/offline tuning.
+
+    Fused follows the ordinary FP8 tuner model: every routing profile sees
+    the same compact, deduplicated union of winners from both frozen H200
+    routing domains plus the two measured H20 anchors. The routing-specific
+    default remains only an ordering hint and is never replaced without live
+    timing. Split remains profile-specific because each tactic embeds its
+    certified 132-SM partition.
+    """
+
+    mode = _mode(execution_mode)
+    profile = normalize_hopper_mxfp4_routing_profile(routing_profile)
+    if mode == "split":
+        return hopper_mxfp4_candidates(
+            execution_mode=mode,
+            routing_profile=profile,
+        )
+    return [
+        validate_hopper_mxfp4_tactic(record["tactic"], execution_mode="fused")
+        for record in _fused_runtime_candidate_records()
     ]
 
 
@@ -1283,6 +1471,38 @@ def hopper_mxfp4_candidates_for_shape(
     return legal
 
 
+def hopper_mxfp4_runtime_candidates_for_shape(
+    *,
+    execution_mode: str,
+    hidden: int,
+    intermediate: int,
+    routing_profile: str = MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
+) -> list[dict[str, Any]]:
+    """Return the live-tuning union filtered to tactics legal for a shape."""
+
+    mode = _mode(execution_mode)
+    profile = normalize_hopper_mxfp4_routing_profile(routing_profile)
+    legal = [
+        tactic
+        for tactic in hopper_mxfp4_runtime_candidates(
+            execution_mode=mode,
+            routing_profile=profile,
+        )
+        if is_hopper_mxfp4_tactic_shape_compatible(
+            tactic,
+            execution_mode=mode,
+            hidden=hidden,
+            intermediate=intermediate,
+        )
+    ]
+    if not legal:
+        raise ValueError(
+            f"no runtime MXFP4 {mode} tactic supports "
+            f"hidden={hidden}, intermediate={intermediate}"
+        )
+    return legal
+
+
 def _token_bucket(max_tokens: int) -> int:
     _positive_int(max_tokens, "max_tokens")
     for bucket in MXFP4_TUNING_TOKEN_BUCKETS:
@@ -1319,7 +1539,7 @@ def hopper_mxfp4_ordered_candidates(
 
     mode = _mode(execution_mode)
     profile = normalize_hopper_mxfp4_routing_profile(routing_profile)
-    legal = hopper_mxfp4_candidates_for_shape(
+    legal = hopper_mxfp4_runtime_candidates_for_shape(
         execution_mode=mode,
         hidden=hidden,
         intermediate=intermediate,
@@ -1438,6 +1658,8 @@ _validate_embedded_tables()
 
 __all__ = [
     "MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE",
+    "MXFP4_FUSED_RUNTIME_ANCHOR_PROVENANCE",
+    "MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256",
     "MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE",
     "MXFP4_TUNING_PROVENANCE",
     "MXFP4_TUNING_PROVENANCE_BY_ROUTING_PROFILE",
@@ -1450,11 +1672,14 @@ __all__ = [
     "hopper_mxfp4_candidates_for_shape",
     "hopper_mxfp4_default_tactic",
     "hopper_mxfp4_ordered_candidates",
+    "hopper_mxfp4_runtime_candidates",
+    "hopper_mxfp4_runtime_candidates_for_shape",
     "hopper_mxfp4_tuning_manifest",
     "hopper_mxfp4_tuning_provenance",
     "is_hopper_mxfp4_tactic_shape_compatible",
     "is_valid_hopper_mxfp4_tactic",
     "normalize_hopper_mxfp4_routing_profile",
+    "require_hopper_mxfp4_fused_tuning_device",
     "require_hopper_mxfp4_tuning_device",
     "validate_hopper_mxfp4_tactic",
 ]

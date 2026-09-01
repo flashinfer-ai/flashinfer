@@ -154,7 +154,9 @@ def test_candidate_union_uses_only_mode_specific_shim_api() -> None:
 
     class FakePackage:
         @staticmethod
-        def hopper_mxfp4_candidates(*, execution_mode: str, routing_profile: str):
+        def hopper_mxfp4_runtime_candidates(
+            *, execution_mode: str, routing_profile: str
+        ):
             calls.append((execution_mode, routing_profile))
             return [
                 {
@@ -191,9 +193,9 @@ def test_candidate_union_uses_only_mode_specific_shim_api() -> None:
 
 def test_empty_candidate_union_fails_closed() -> None:
     package = SimpleNamespace(
-        hopper_mxfp4_candidates=lambda *, execution_mode, routing_profile: []
+        hopper_mxfp4_runtime_candidates=(lambda *, execution_mode, routing_profile: [])
     )
-    with pytest.raises(RuntimeError, match="empty manifest-derived"):
+    with pytest.raises(RuntimeError, match="empty runtime"):
         tuner._candidate_union(
             package,
             execution_mode="fused",
@@ -205,10 +207,9 @@ def test_bucket_default_is_reordered_from_but_not_added_to_union() -> None:
     first = {"candidate": "first"}
     default = {"candidate": "default"}
     package = SimpleNamespace(
-        hopper_mxfp4_candidates=lambda *, execution_mode, routing_profile: [
-            first,
-            default,
-        ],
+        hopper_mxfp4_runtime_candidates=(
+            lambda *, execution_mode, routing_profile: [first, default]
+        ),
         hopper_mxfp4_default_tactic=(
             lambda max_tokens, *, execution_mode, routing_profile: default
         ),
@@ -226,9 +227,9 @@ def test_bucket_default_is_reordered_from_but_not_added_to_union() -> None:
 
 def test_bucket_default_absent_from_union_fails_closed() -> None:
     package = SimpleNamespace(
-        hopper_mxfp4_candidates=lambda *, execution_mode, routing_profile: [
-            {"candidate": "union"}
-        ],
+        hopper_mxfp4_runtime_candidates=(
+            lambda *, execution_mode, routing_profile: [{"candidate": "union"}]
+        ),
         hopper_mxfp4_default_tactic=(
             lambda max_tokens, *, execution_mode, routing_profile: {
                 "candidate": "missing"
@@ -321,6 +322,11 @@ def test_tune_one_routes_each_mode_to_its_dedicated_wrapper(
         )
         return {"winner": mode}
 
+    monkeypatch.setattr(
+        "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel."
+        "shim.mxfp4_tuner.require_hopper_mxfp4_fused_tuning_device",
+        lambda: None,
+    )
     monkeypatch.setattr(
         "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel."
         "shim.mxfp4_tuner.require_hopper_mxfp4_tuning_device",

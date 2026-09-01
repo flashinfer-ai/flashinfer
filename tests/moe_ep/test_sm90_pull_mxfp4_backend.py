@@ -39,6 +39,11 @@ def _allow_unit_test_device(monkeypatch):
         "require_hopper_mxfp4_tuning_device",
         lambda: None,
     )
+    monkeypatch.setattr(
+        mxfp4_tuner,
+        "require_hopper_mxfp4_fused_tuning_device",
+        lambda: None,
+    )
 
 
 _SHIM_PACKAGE = "flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel"

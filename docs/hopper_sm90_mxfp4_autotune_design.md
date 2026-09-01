@@ -19,9 +19,13 @@ MXFP4 tuning is partitioned by an explicit routing-workload identity:
   selected by the official benchmark's
   `--routing-mode published_exact_balanced` spelling.
 
-Candidate, heuristic, online-autotune, cache, session, and workspace-pool
-resolution are all profile-scoped.  An exact request never consumes a legacy
-candidate or a profile-less historical MXFP4 cache entry.  The legacy public
+Heuristic, cache, session, and workspace-pool resolution remain
+profile-scoped.  An exact request never consumes a legacy heuristic or a
+profile-less historical MXFP4 cache entry.  The fused live-tuning candidate
+union is deliberately routing-independent: like the SM90 FP8 tuner, it
+deduplicates useful geometries across workload profiles and then times them on
+the live request.  Split candidates remain profile-scoped because their
+tactics embed the certified SM partition.  The legacy public
 `MXFP4_TUNING_PROVENANCE[execution_mode]` mapping is unchanged; profile-aware
 callers use `hopper_mxfp4_tuning_provenance(...)` or
 `MXFP4_TUNING_PROVENANCE_BY_ROUTING_PROFILE`.
@@ -57,9 +61,29 @@ The published-exact profile is a separate table in the same module:
 
 The module validates every tactic and reconstructs/hash-checks compact runtime
 manifests at import time.  Returned tactics are fresh dictionaries, so callers
-cannot mutate the frozen source of truth.The historical 1024/2048 winners retain their telemetry warnings; clock
+cannot mutate the frozen source of truth.  The historical 1024/2048 winners
+retain their telemetry warnings; clock
 locking is only a target and the manifest telemetry remains authoritative when
 a run observes `sw_power_cap`.
+
+Fused live tuning adds two supplemental H20 tactics to the deduplicated union
+of both frozen H200 fused unions.  Both use tile `(128,16,256)`, cluster
+`(2,1,1)`, ping-pong, static scheduling, group hint 78, and epilogue-warp token
+return; their stage counts are one and two.  They came from one formal
+`NVIDIA H20-3e` workload only: world size 8, tokens/rank 1, hidden 3072,
+intermediate 1280, 384 experts, and top-k 8.  They are therefore candidates,
+not an H20 per-token heuristic table.  The complete source artifact-file-set
+SHA-256 is
+`ae23042d2d4505794867cbdd3523e5469be785506211d38a6266821fe45514f7`, and
+the source formal-manifest SHA-256 is
+`fe5cca19a9bc8e30a74f28a47561fd08755ba3f5ab22f90e50b63ebaceabafd6`;
+the two tactic IDs are
+`d46673da5f8606544a3cfe83b9a150b9e2254ce5cd3173a0c079702b20ae773b`
+and `26f9703c730e6cf11527e73f8bb8fd4c9adc2e811d8d406c17ad5aa3f79101bd`.
+`MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256` identifies the complete
+14-tactic runtime union as
+`dcf6051ca77c08f2b150abb1291466c7721bb16ae23c65bb70e685312d61a93d`
+without changing either frozen manifest hash.
 
 ## Runtime behavior
 
@@ -72,9 +96,12 @@ the config's selected `routing_profile`:
 - `None` performs only a persistent-cache lookup, then falls back to the
   manifest's ceil-token-bucket heuristic.
 
-For the formal shape, online tuning tests the complete profile/mode-specific
-offline union (legacy fused/split: eight/eight; published exact: seven/eight).
-Custom shapes first filter that union for compatible MMA-K divisibility.
+Fused online and offline tuning test the same routing-independent 14-tactic
+runtime union: the deduplicated union of both H200 routing-profile winners plus
+the two H20 anchors.  The selected routing profile contributes only the first
+candidate ordering hint.  Split tuning continues to test its frozen
+profile-specific eight-tactic H200 union.  Custom shapes first filter the
+applicable union for compatible MMA-K divisibility.
 Online tuning does not sleep, spawn fresh
 processes per candidate, or expand the legal search domain.  For each candidate
 all ranks in the backend's exact EP process group synchronize, run three
@@ -88,10 +115,16 @@ cache.
 
 The EP process group remains the authority when EP size is one inside a larger
 distributed job; online tuning does not silently switch to the global default
-group.  Cache lookup, manifest fallback, and online/offline tuning also fail
-closed unless the active device is exactly a standard `NVIDIA H200`, compute
-capability 9.0, with 132 SMs.  In particular, an H200 NVL or a different SM90
-GPU cannot consume these frozen H200 tactics merely because it is Hopper.
+group.  Fused cache lookup, heuristic fallback, and online/offline tuning are
+legal on any live compute-capability 9.0 device.  Fused has no fixed SM
+partition: residency is queried from the live device and `group_hint` remains
+a performance hint.  On a cache miss outside H200, `knobs=None` uses the
+routing-specific H200-derived heuristic as a legal starting point; it is not
+claimed to be optimal for that device.  `knobs="auto"` instead times all 14
+runtime candidates locally before selecting one.  Split cache, heuristic, and
+autotune remain restricted to the exact standard `NVIDIA H200`, CC 9.0,
+132-SM domain until a device-specific split candidate union supplies a valid
+K1/K2 partition.
 
 Fused applies candidate fields through its lazy-compile frontend.  Split
 cannot mutate a captured fixed-pointer session: every candidate therefore
@@ -159,6 +192,12 @@ cross-mode fallback.  Lookup requires every problem field above to match, then
 uses the exact token bucket when present, the smallest recorded bucket above it
 otherwise, or the largest recorded bucket below it.  Rank 0 upserts the exact
 `max_tokens` entry.
+
+Consequently an H20 cache entry cannot match an H200 request (or vice versa),
+even though both execute SM90 fused kernels.  Fused autotune cache provenance
+records the deterministic runtime-candidate-union SHA together with the
+routing-specific frozen heuristic-manifest SHA; this distinguishes the set
+that was actually timed from the table used only to order it.
 
 The JSON schema version remains 1 and the routing field is append-only.  A
 profile-less historical MXFP4 entry denotes `block_permutation_v1` and can

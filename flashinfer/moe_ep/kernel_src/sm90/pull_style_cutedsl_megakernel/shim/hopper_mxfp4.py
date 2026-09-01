@@ -707,11 +707,11 @@ def _resolve_mxfp4_knobs(
     from .mxfp4_tuner import (
         hopper_mxfp4_ordered_candidates,
         is_hopper_mxfp4_tactic_shape_compatible,
-        require_hopper_mxfp4_tuning_device,
+        require_hopper_mxfp4_fused_tuning_device,
         validate_hopper_mxfp4_tactic,
     )
 
-    require_hopper_mxfp4_tuning_device()
+    require_hopper_mxfp4_fused_tuning_device()
     cached = lookup_knobs(
         dtype=_MXFP4_TUNING_DTYPE_ID,
         fp8_scale_mode="mxfp4_hybrid",

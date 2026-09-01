@@ -388,7 +388,10 @@ def autotune_hopper_mxfp4_mega_moe(
 ) -> Dict[str, Any]:
     """Collectively autotune one fused Hopper MXFP4 x FP8 session.
 
-    Only the compact, manifest-derived MXFP4 fused candidate union is timed.
+    Only the compact MXFP4 fused runtime candidate union is timed. It is the
+    deduplicated union of both frozen H200 routing domains plus the two formal
+    H20 anchors; the routing-specific heuristic remains only the first
+    candidate ordering hint.
     Every rank first takes the median of its own synchronized launch times;
     :func:`autotune_knobs` then all-reduces those medians with ``MAX``. Rank
     zero persists the agreed winner under the versioned MXFP4 fused identity.
@@ -401,11 +404,12 @@ def autotune_hopper_mxfp4_mega_moe(
         hopper_mxfp4_mega_moe,
     )
     from .mxfp4_tuner import (
-        hopper_mxfp4_candidates,
+        MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256,
         hopper_mxfp4_ordered_candidates,
+        hopper_mxfp4_runtime_candidates,
         hopper_mxfp4_tuning_provenance,
         is_hopper_mxfp4_tactic_shape_compatible,
-        require_hopper_mxfp4_tuning_device,
+        require_hopper_mxfp4_fused_tuning_device,
         validate_hopper_mxfp4_tactic,
     )
 
@@ -424,7 +428,7 @@ def autotune_hopper_mxfp4_mega_moe(
         )
 
     cfg = symm_buffer._frontend.config
-    require_hopper_mxfp4_tuning_device()
+    require_hopper_mxfp4_fused_tuning_device()
     if candidates is None:
         candidates = hopper_mxfp4_ordered_candidates(
             cfg.num_tokens_per_rank,
@@ -438,17 +442,17 @@ def autotune_hopper_mxfp4_mega_moe(
             validate_hopper_mxfp4_tactic(candidate, execution_mode="fused")
             for candidate in candidates
         ]
-        frozen_candidates = hopper_mxfp4_candidates(
+        runtime_candidates = hopper_mxfp4_runtime_candidates(
             execution_mode="fused",
             routing_profile=cfg.routing_profile,
         )
         outside_union = [
-            candidate for candidate in candidates if candidate not in frozen_candidates
+            candidate for candidate in candidates if candidate not in runtime_candidates
         ]
         if outside_union:
             raise ValueError(
                 "supplied MXFP4 fused autotune candidate is outside the "
-                "frozen manifest candidate union"
+                "runtime candidate union"
             )
         if any(
             candidate in candidates[:index]
@@ -497,7 +501,11 @@ def autotune_hopper_mxfp4_mega_moe(
                 gate_up_clamp=record_cfg.gate_up_clamp,
                 routing_profile=record_cfg.routing_profile,
                 p50_us=p50_s * 1e6,
-                source=(f"autotune:sm90_mxfp4_fused:{manifest_sha256}"),
+                source=(
+                    "autotune:sm90_mxfp4_fused:runtime_union:"
+                    f"{MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256}:"
+                    f"heuristic_manifest:{manifest_sha256}"
+                ),
             )
 
     return autotune_knobs(

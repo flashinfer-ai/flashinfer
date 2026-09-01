@@ -49,6 +49,8 @@ from .tuner import (
 )
 from .mxfp4_tuner import (
     MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE,
+    MXFP4_FUSED_RUNTIME_ANCHOR_PROVENANCE,
+    MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256,
     MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE,
     MXFP4_TUNING_PROVENANCE,
     MXFP4_TUNING_PROVENANCE_BY_ROUTING_PROFILE,
@@ -61,11 +63,15 @@ from .mxfp4_tuner import (
     hopper_mxfp4_candidates_for_shape,
     hopper_mxfp4_default_tactic,
     hopper_mxfp4_ordered_candidates,
+    hopper_mxfp4_runtime_candidates,
+    hopper_mxfp4_runtime_candidates_for_shape,
     hopper_mxfp4_tuning_manifest,
     hopper_mxfp4_tuning_provenance,
     is_hopper_mxfp4_tactic_shape_compatible,
     is_valid_hopper_mxfp4_tactic,
     normalize_hopper_mxfp4_routing_profile,
+    require_hopper_mxfp4_fused_tuning_device,
+    require_hopper_mxfp4_tuning_device,
     validate_hopper_mxfp4_tactic,
 )
 from .hopper_fp8 import (
@@ -223,6 +229,8 @@ __all__ = [
     "with_knobs",
     # MXFP4 offline winners / bounded online candidates
     "MXFP4_BLOCK_PERMUTATION_ROUTING_PROFILE",
+    "MXFP4_FUSED_RUNTIME_ANCHOR_PROVENANCE",
+    "MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256",
     "MXFP4_PUBLISHED_EXACT_ROUTING_PROFILE",
     "MXFP4_TUNING_PROVENANCE",
     "MXFP4_TUNING_PROVENANCE_BY_ROUTING_PROFILE",
@@ -235,11 +243,15 @@ __all__ = [
     "hopper_mxfp4_candidates_for_shape",
     "hopper_mxfp4_default_tactic",
     "hopper_mxfp4_ordered_candidates",
+    "hopper_mxfp4_runtime_candidates",
+    "hopper_mxfp4_runtime_candidates_for_shape",
     "hopper_mxfp4_tuning_manifest",
     "hopper_mxfp4_tuning_provenance",
     "is_hopper_mxfp4_tactic_shape_compatible",
     "is_valid_hopper_mxfp4_tactic",
     "normalize_hopper_mxfp4_routing_profile",
+    "require_hopper_mxfp4_fused_tuning_device",
+    "require_hopper_mxfp4_tuning_device",
     "validate_hopper_mxfp4_tactic",
     # hopper_fp8
     "MegaMoEHopperFp8Config",

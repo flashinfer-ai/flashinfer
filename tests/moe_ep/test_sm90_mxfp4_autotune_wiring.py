@@ -22,8 +22,10 @@ from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim import
     mxfp4_tuner,
 )
 from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel.shim.mxfp4_tuner import (
+    MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256,
     hopper_mxfp4_candidates,
     hopper_mxfp4_default_tactic,
+    hopper_mxfp4_runtime_candidates,
     hopper_mxfp4_tuning_provenance,
 )
 from flashinfer.moe_ep.sm90_routing import (
@@ -34,6 +36,11 @@ from flashinfer.moe_ep.sm90_routing import (
 
 @pytest.fixture(autouse=True)
 def _allow_unit_test_device(monkeypatch):
+    monkeypatch.setattr(
+        mxfp4_tuner,
+        "require_hopper_mxfp4_fused_tuning_device",
+        lambda: None,
+    )
     monkeypatch.setattr(
         mxfp4_tuner,
         "require_hopper_mxfp4_tuning_device",
@@ -318,6 +325,7 @@ def test_fused_autotune_records_only_fused_identity_and_manifest(monkeypatch):
         routing_profile=cfg.routing_profile,
     )
     assert provenance["runtime_manifest_sha256"] in kwargs["source"]
+    assert MXFP4_FUSED_RUNTIME_CANDIDATE_UNION_SHA256 in kwargs["source"]
 
 
 def test_fused_supplied_candidates_must_be_frozen_union_subset(monkeypatch):
@@ -333,7 +341,7 @@ def test_fused_supplied_candidates_must_be_frozen_union_subset(monkeypatch):
         routing_profile=SM90_ROUTING_PROFILE_BLOCK_PERMUTATION,
     )
     buffer = SimpleNamespace(_frontend=SimpleNamespace(config=cfg))
-    union = hopper_mxfp4_candidates(
+    union = hopper_mxfp4_runtime_candidates(
         execution_mode="fused",
         routing_profile=cfg.routing_profile,
     )
@@ -361,8 +369,23 @@ def test_fused_supplied_candidates_must_be_frozen_union_subset(monkeypatch):
     )
     assert captured["candidates"] == subset
 
+    h20_anchor = next(
+        candidate
+        for candidate in union
+        if candidate["pingpong"]
+        and candidate["mma_tiler_mnk"] == (128, 16, 256)
+        and candidate["group_hint"] == 78
+    )
+    assert (
+        autotune_module.autotune_hopper_mxfp4_mega_moe(
+            object(), object(), object(), buffer, candidates=[h20_anchor]
+        )
+        == h20_anchor
+    )
+    assert captured["candidates"] == [h20_anchor]
+
     outside = {**union[0], "group_hint": 999999}
-    with pytest.raises(ValueError, match="outside the frozen manifest candidate union"):
+    with pytest.raises(ValueError, match="outside the runtime candidate union"):
         autotune_module.autotune_hopper_mxfp4_mega_moe(
             object(), object(), object(), buffer, candidates=[outside]
         )
