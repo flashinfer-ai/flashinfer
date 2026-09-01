@@ -48,6 +48,10 @@ rule. Initial support requires homogeneous `H`, `G`, `D`, `S`, `R`, and dtype
 specialization. Outer slot spacing need not be compact. Within a slot, each
 family uses the existing checkpointing-SSU packed layout: state is
 `[head, D, S]`, x and dt are `[head, R, ...]`, and B is `[group, R, S]`.
+Because the actual addresses are GPU-resident pointer-table values, the op
+does not synchronously inspect them. The caller must ensure every active
+pointer and slot offset preserves the 16-byte alignment required by the
+`cp.async` loads and vectorized state stores.
 
 ## Metadata ownership
 

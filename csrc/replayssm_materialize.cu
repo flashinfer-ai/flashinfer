@@ -10,6 +10,8 @@
 #include <cuda_runtime.h>
 #include <flashinfer/exception.h>
 
+#include <limits>
+
 #include "tvm_ffi_utils.h"
 
 namespace flashinfer::mamba {
@@ -179,6 +181,24 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
   CHECK_CUDA(dst_slots);
   CHECK_CUDA(ring_start);
   CHECK_CUDA(flush_count);
+  auto check_same_device = [&state_ptrs](TensorView const& table, char const* name) {
+    FLASHINFER_CHECK(table.device().device_id == state_ptrs.device().device_id, name,
+                     " must be on the same CUDA device as state_ptrs");
+  };
+  check_same_device(state_slot_strides, "state_slot_strides");
+  check_same_device(x_ptrs, "x_ptrs");
+  check_same_device(x_slot_strides, "x_slot_strides");
+  check_same_device(b_ptrs, "b_ptrs");
+  check_same_device(b_slot_strides, "b_slot_strides");
+  check_same_device(dt_ptrs, "dt_ptrs");
+  check_same_device(dt_slot_strides, "dt_slot_strides");
+  check_same_device(a_ptrs, "a_ptrs");
+  check_same_device(scale_ptrs, "scale_ptrs");
+  check_same_device(scale_slot_strides, "scale_slot_strides");
+  check_same_device(src_slots, "src_slots");
+  check_same_device(dst_slots, "dst_slots");
+  check_same_device(ring_start, "ring_start");
+  check_same_device(flush_count, "flush_count");
   CHECK_DIM(1, state_ptrs);
   CHECK_DIM(1, state_slot_strides);
   CHECK_DIM(1, x_ptrs);
@@ -234,6 +254,11 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
                    "flush_count must be int32");
   FLASHINFER_CHECK(num_layers > 0, "num_layers must be positive");
   FLASHINFER_CHECK(num_heads > 0, "num_heads must be positive");
+  constexpr int64_t kIntMax = std::numeric_limits<int>::max();
+  FLASHINFER_CHECK(flush_count.size(0) <= kIntMax, "batch must fit in int");
+  FLASHINFER_CHECK(num_layers <= kIntMax, "num_layers must fit in int");
+  FLASHINFER_CHECK(ring_buffer_len <= kIntMax, "ring_buffer_len must fit in int");
+  FLASHINFER_CHECK(num_heads <= 65535, "num_heads exceeds CUDA grid.z limit (65535)");
   auto check_layer_table = [num_layers](TensorView const& table, char const* name) {
     FLASHINFER_CHECK(table.size(0) == num_layers, name, " size must equal num_layers");
   };
@@ -258,6 +283,7 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
     FLASHINFER_CHECK(rand_seed.has_value(), "rand_seed is required when PHILOX_ROUNDS > 0");
     auto const& seed = rand_seed.value();
     CHECK_CUDA(seed);
+    check_same_device(seed, "rand_seed");
     CHECK_DIM(1, seed);
     CHECK_CONTIGUOUS(seed);
     FLASHINFER_CHECK(seed.numel() == 1 && seed.dtype().code == kDLInt && seed.dtype().bits == 64,
@@ -284,6 +310,8 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
       int(num_layers),
       int(num_heads),
       int(ring_buffer_len)};
+  ffi::CUDADeviceGuard device_guard(state_ptrs.device().device_id);
+  const cudaStream_t stream = get_stream(state_ptrs.device());
   dim3 grid(p.batch, p.layers, p.heads);
   constexpr size_t smem =
       sizeof(std::conditional_t < sizeof(state_t) == 1,
@@ -291,6 +319,7 @@ void replayssm_materialize(TensorView state_ptrs, TensorView state_slot_strides,
              CheckpointingSsuStorage < input_t, state_t, NPREDICTED, MAX_WINDOW, DIM, DSTATE >>);
   FLASHINFER_CUDA_CHECK(cudaFuncSetAttribute(materialize_replay_kernel<state_t>,
                                              cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-  materialize_replay_kernel<state_t><<<grid, dim3(warpSize, 4), smem>>>(p);
+  materialize_replay_kernel<state_t><<<grid, dim3(warpSize, 4), smem, stream>>>(p);
+  FLASHINFER_CUDA_CHECK(cudaGetLastError());
 }
 }  // namespace flashinfer::mamba
