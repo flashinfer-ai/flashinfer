@@ -573,7 +573,9 @@ class UlyssesCommunicator:
         return original
 
     @flashinfer_api
-    def allocate_output(self, x: torch.Tensor, op: str) -> torch.Tensor:
+    def allocate_output(
+        self, x: torch.Tensor, op: str, *, dtype: Optional[torch.dtype] = None
+    ) -> torch.Tensor:
         r"""Allocate a registered output for one Ulysses layout transform.
 
         For ``backend="pcie"`` this is a collective cold-path operation: the
@@ -585,7 +587,7 @@ class UlyssesCommunicator:
         """
         if op not in ("scatter_heads", "gather_heads"):
             raise ValueError("op must be 'scatter_heads' or 'gather_heads'")
-        self._validate(x, op)
+        self._validate(x, op, dtype)
         shape, mode = self._output_geometry(x, op)
         if self.backend != "pcie" or self.world_size == 1:
             return torch.empty(shape, dtype=x.dtype, device=x.device)
@@ -604,7 +606,15 @@ class UlyssesCommunicator:
         try:
             # Flat at capacity; callers view it per call. The base pointer is
             # the registration key, so record it before anything can fail.
-            tensor, info = module.allocate_output(self._pcie, x, mode, self.max_elems)
+            # native sizes the allocation as capacity_elements * itemsize(x),
+            # so the element count has to be rescaled into x's dtype to keep
+            # the byte budget fixed. Without this a narrower x would allocate
+            # proportionally fewer bytes than _validate just admitted, and the
+            # ICHECK_GE inside allocate_output would fire mid-collective.
+            capacity_elems = (
+                self.max_elems * self.dtype.itemsize
+            ) // x.dtype.itemsize
+            tensor, info = module.allocate_output(self._pcie, x, mode, capacity_elems)
             pointer = tensor.data_ptr()
             self._pcie_outputs[pointer] = mode
             info = list(info)
@@ -679,11 +689,22 @@ class UlyssesCommunicator:
             )
         return (B, S // self.world_size, H * self.world_size, D), 1
 
-    def _validate_out(self, out, shape, op: str) -> None:
+    def _validate_out(
+        self, out, shape, op: str, dtype: Optional[torch.dtype] = None
+    ) -> None:
         if not isinstance(out, torch.Tensor):
             raise TypeError(f"{op} out must be a torch.Tensor")
-        if out.device != self.device or out.dtype != self.dtype:
-            raise ValueError(f"{op} out device/dtype does not match the communicator")
+        if out.device != self.device:
+            raise ValueError(
+                f"{op} out is on {out.device}, but this communicator is bound "
+                f"to {self.device}"
+            )
+        expected_dtype = self.dtype if dtype is None else dtype
+        if out.dtype != expected_dtype:
+            raise ValueError(
+                f"{op} out dtype {out.dtype} does not match the expected "
+                f"dtype {expected_dtype}"
+            )
         if not out.is_contiguous() or tuple(out.shape) != tuple(shape):
             raise ValueError(f"{op} out must be contiguous with shape {tuple(shape)}")
 
@@ -713,7 +734,9 @@ class UlyssesCommunicator:
             self._raise_pcie_broken(reason)
         return out
 
-    def _pcie_collective(self, x, out, op: str) -> torch.Tensor:
+    def _pcie_collective(
+        self, x, out, op: str, dtype: Optional[torch.dtype] = None
+    ) -> torch.Tensor:
         """Run one multi-rank PCIe collective under its failure envelope.
 
         The all-P2P barrier has no bounded abort protocol. A peer may enqueue
@@ -723,7 +746,7 @@ class UlyssesCommunicator:
         """
         was_open = self._state == _OPEN
         try:
-            self._validate(x, op)
+            self._validate(x, op, dtype)
             shape, mode = self._output_geometry(x, op)
             if out is None:
                 raise ValueError(
@@ -752,7 +775,7 @@ class UlyssesCommunicator:
                         "PCIe Ulysses collectives are bound to the stream of "
                         "their first call; use one stream per communicator"
                     )
-            self._validate_out(out, shape, op)
+            self._validate_out(out, shape, op, dtype)
             self._validate_no_overlap(x, out, op)
             return self._pcie_exchange(x, out, mode)
         except Exception as e:  # noqa: BLE001
@@ -1164,7 +1187,11 @@ class UlyssesCommunicator:
 
     @flashinfer_api(trace=ulysses_scatter_heads_trace)
     def scatter_heads(
-        self, x: torch.Tensor, out: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        *,
+        dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         r"""``[B, S_local, H, D] -> [B, S_global, H_local, D]``.
 
@@ -1181,6 +1208,11 @@ class UlyssesCommunicator:
         out : torch.Tensor, optional
             Preallocated output. It must not overlap ``x``. Multi-rank PCIe
             requires an output returned by :meth:`allocate_output`.
+        dtype : torch.dtype, optional
+            Element type for this call, overriding the communicator dtype.
+            pcie backend only. The communicator dtype stays the unit its
+            ``max_elems`` capacity is counted in, so a narrower dtype here
+            fits proportionally more elements in the same bytes.
 
         Returns
         -------
@@ -1189,8 +1221,8 @@ class UlyssesCommunicator:
             and dtype as ``x``.
         """
         if self.backend == "pcie" and self.world_size > 1:
-            return self._pcie_collective(x, out, "scatter_heads")
-        self._validate(x, "scatter_heads")
+            return self._pcie_collective(x, out, "scatter_heads", dtype)
+        self._validate(x, "scatter_heads", dtype)
         shape, _mode = self._output_geometry(x, "scatter_heads")
         # ulysses_a2a is parameterized by the [B, S_local, H, D] layout, which
         # is this operand's own shape for scatter_heads.
@@ -1198,7 +1230,7 @@ class UlyssesCommunicator:
         if self.world_size == 1:
             if out is None:
                 return x
-            self._validate_out(out, shape, "scatter_heads")
+            self._validate_out(out, shape, "scatter_heads", dtype)
             self._validate_no_overlap(x, out, "scatter_heads")
             out.copy_(x)
             return out
@@ -1217,7 +1249,11 @@ class UlyssesCommunicator:
 
     @flashinfer_api(trace=ulysses_gather_heads_trace)
     def gather_heads(
-        self, x: torch.Tensor, out: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        out: Optional[torch.Tensor] = None,
+        *,
+        dtype: Optional[torch.dtype] = None,
     ) -> torch.Tensor:
         r"""``[B, S_global, H_local, D] -> [B, S_local, H, D]``.
 
@@ -1232,6 +1268,11 @@ class UlyssesCommunicator:
         out : torch.Tensor, optional
             Preallocated output. It must not overlap ``x``. Multi-rank PCIe
             requires an output returned by :meth:`allocate_output`.
+        dtype : torch.dtype, optional
+            Element type for this call, overriding the communicator dtype.
+            pcie backend only. The communicator dtype stays the unit its
+            ``max_elems`` capacity is counted in, so a narrower dtype here
+            fits proportionally more elements in the same bytes.
 
         Returns
         -------
@@ -1240,8 +1281,8 @@ class UlyssesCommunicator:
             dtype as ``x``.
         """
         if self.backend == "pcie" and self.world_size > 1:
-            return self._pcie_collective(x, out, "gather_heads")
-        self._validate(x, "gather_heads")
+            return self._pcie_collective(x, out, "gather_heads", dtype)
+        self._validate(x, "gather_heads", dtype)
         shape, _mode = self._output_geometry(x, "gather_heads")
         # ulysses_a2a is parameterized by the [B, S_local, H, D] layout, which
         # for gather_heads is the *output* shape.
@@ -1249,7 +1290,7 @@ class UlyssesCommunicator:
         if self.world_size == 1:
             if out is None:
                 return x
-            self._validate_out(out, shape, "gather_heads")
+            self._validate_out(out, shape, "gather_heads", dtype)
             self._validate_no_overlap(x, out, "gather_heads")
             out.copy_(x)
             return out
@@ -1306,7 +1347,7 @@ class UlyssesCommunicator:
                 f"{op} called on a {self._state} UlyssesCommunicator (use-after-close)"
             )
 
-    def _validate(self, x, op: str) -> None:
+    def _validate(self, x, op: str, dtype: Optional[torch.dtype] = None) -> None:
         self._require_open(op)
         if not isinstance(x, torch.Tensor):
             raise TypeError(f"{op} expects a torch.Tensor, got {type(x).__name__}")
@@ -1330,22 +1371,51 @@ class UlyssesCommunicator:
                 f"{op} tensor is on {x.device}, but this communicator is bound "
                 f"to {self.device}"
             )
-        if x.dtype != self.dtype:
+        expected_dtype = self.dtype if dtype is None else dtype
+        if x.dtype != expected_dtype:
             raise ValueError(
-                f"{op} tensor dtype {x.dtype} does not match the communicator "
-                f"dtype {self.dtype}"
+                f"{op} tensor dtype {x.dtype} does not match the expected "
+                f"dtype {expected_dtype}"
             )
+        if dtype is not None:
+            # A per-call dtype bypasses the joint check the constructor runs
+            # across ranks, so re-check locally what that check would have
+            # caught. Local only, and only on rank-invariant values: adding a
+            # collective here would tear the group apart on a bad argument.
+            if self.backend != "pcie":
+                raise ValueError(
+                    f"{op} per-call dtype is only supported on the pcie "
+                    f"backend, not {self.backend}"
+                )
+            allowed = _PCIE_SUPPORTED_DTYPES
+            if dtype not in allowed:
+                raise ValueError(
+                    f"{op} per-call dtype {dtype} is not one of {sorted(allowed, key=str)}"
+                )
         if not x.is_contiguous():
             raise ValueError(f"{op} tensor must be contiguous")
         if any(s <= 0 for s in x.shape):
             raise ValueError(
                 f"{op} tensor dims must all be positive, got shape {tuple(x.shape)}"
             )
-        if x.numel() > self.max_elems:
+        # Capacity is a byte budget: max_elems counts elements of the
+        # communicator dtype, so a narrower per-call dtype fits proportionally
+        # more of them. Same dtype reduces to the old element comparison.
+        capacity_bytes = self.max_elems * self.dtype.itemsize
+        if x.numel() * x.element_size() > capacity_bytes:
             raise ValueError(
-                f"{op} tensor has {x.numel()} elements, exceeding the "
-                f"communicator capacity max_elems={self.max_elems} "
-                f"(which is capped at the int32 index range {_INT32_MAX})"
+                f"{op} tensor has {x.numel()} elements of {x.element_size()} "
+                f"bytes ({x.numel() * x.element_size()} bytes), exceeding the "
+                f"communicator capacity max_elems={self.max_elems} x "
+                f"{self.dtype.itemsize} bytes = {capacity_bytes} bytes"
+            )
+        if x.numel() > _INT32_MAX:
+            # The byte budget above can admit more elements than the kernels
+            # can index once the per-call dtype is narrower than the
+            # communicator dtype.
+            raise ValueError(
+                f"{op} tensor has {x.numel()} elements, over the int32 index "
+                f"range {_INT32_MAX}"
             )
         if self.backend == "pcie" and self.transport in _PCIE_RDMA_TRANSPORTS:
             global_heads = (

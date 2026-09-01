@@ -778,6 +778,73 @@ def test_ctor_pcie_dtype_gate(gloo_pg, monkeypatch):
         )
 
 
+@requires_cuda
+def test_per_call_dtype_reprices_capacity_in_bytes(gloo_pg, monkeypatch):
+    """``max_elems`` is a byte budget, priced in the construction dtype.
+
+    A narrower per-call dtype therefore fits proportionally more elements in the
+    same bytes. This is the only thing holding ``allocate_output``'s capacity
+    rescale honest: native sizes its allocation from the operand's own element
+    size, so if Python admitted an operand in elements while native allocated
+    for it in bytes, the mismatch would surface as an ICHECK part-way through a
+    collective rather than as a rejected argument here.
+    """
+    _patch_probe_mesh(monkeypatch, 1)
+    device = torch.device("cuda", torch.cuda.current_device())
+    # 12 BF16 elements = 24 bytes.
+    comm = UlyssesCommunicator(
+        gloo_pg, max_elems=12, dtype=torch.bfloat16, backend="pcie", device=device
+    )
+    try:
+        fits = torch.zeros((1, 2, 3, 4), dtype=torch.uint8, device=device)  # 24 B
+        assert comm.scatter_heads(fits, dtype=torch.uint8) is fits
+        over = torch.zeros((1, 1, 5, 5), dtype=torch.uint8, device=device)  # 25 B
+        with pytest.raises(ValueError, match="capacity max_elems"):
+            comm.scatter_heads(over, dtype=torch.uint8)
+        # 24 elements of uint8 pass; 24 of the construction dtype are 48 bytes
+        # and must not. The budget did not grow, only its unit changed.
+        with pytest.raises(ValueError, match="capacity max_elems"):
+            comm.scatter_heads(
+                torch.zeros((1, 2, 3, 4), dtype=torch.bfloat16, device=device)
+            )
+    finally:
+        comm.close()
+
+
+@requires_cuda
+def test_per_call_dtype_is_pcie_only_and_whitelisted(gloo_pg, monkeypatch):
+    """A per-call dtype skips the constructor's cross-rank config check, so the
+    checks that check would have made are re-run locally: the PCIe transport is
+    the only one that moves opaque bytes, and its element-size whitelist still
+    applies."""
+    _patch_probe_mesh(monkeypatch, 1)
+    device = torch.device("cuda", torch.cuda.current_device())
+    x = torch.zeros((1, 2, 4, 2), dtype=torch.float16, device=device)
+
+    nccl = UlyssesCommunicator(
+        gloo_pg, max_elems=1 << 10, dtype=torch.float16, backend="nccl", device=device
+    )
+    try:
+        with pytest.raises(ValueError, match="only supported on the pcie"):
+            nccl.scatter_heads(x, dtype=torch.float16)
+        with pytest.raises(ValueError, match="only supported on the pcie"):
+            nccl.gather_heads(x, dtype=torch.float16)
+    finally:
+        nccl.close()
+
+    pcie = UlyssesCommunicator(
+        gloo_pg, max_elems=1 << 10, dtype=torch.float16, backend="pcie", device=device
+    )
+    try:
+        with pytest.raises(ValueError, match="is not one of"):
+            pcie.scatter_heads(x.double(), dtype=torch.float64)
+        # The operand still has to be what the call says it is.
+        with pytest.raises(ValueError, match="does not match the expected"):
+            pcie.scatter_heads(x, dtype=torch.uint8)
+    finally:
+        pcie.close()
+
+
 def test_joint_config_validation_uses_gathered_backends():
     """The verdict must be a pure function of the gathered configs, so every
     rank raises (or passes) together whatever backend it requested locally."""
@@ -2255,6 +2322,66 @@ def _pcie_dtype_body(rank, world_size, group, dtype_name):
         torch.cuda.synchronize(device)
         assert torch.equal(gather_out.view(torch.uint8), raw)
     return ("ok", dtype_name)
+
+
+def _pcie_mixed_dtype_body(rank, world_size, group, _arg):
+    """One communicator, two element types, both registrations live at once.
+
+    This is the case the transport is actually asked for: a layer builds its
+    communicator for BF16 QKV, then sends a quantized payload of unrelated
+    element size over the same buffers. The construction dtype stays the unit
+    capacity is priced in; a per-call dtype only says what this operand is.
+    Nothing here may re-enter the constructor.
+
+    The packed record is 25 bytes on purpose -- odd, so it is not a whole
+    number of BF16 elements. The old reinterpret-as-communicator-dtype route
+    could not express it at all.
+    """
+    device = torch.device("cuda", rank)
+    missing = missing_ulysses_pcie_dependencies()
+    if missing:
+        raise UlyssesBackendError(
+            f"PCIe transport needs {', '.join(missing)}, missing on this machine"
+        )
+    torch.manual_seed(3000 + rank)
+    heads = world_size * 2
+    wide = torch.randn((1, 16, heads, 16), dtype=torch.bfloat16, device=device)
+    packed = torch.randint(
+        0, 256, (1, 16, heads, 25), dtype=torch.uint8, device=device
+    )
+    with UlyssesCommunicator(
+        max_elems=wide.numel(), dtype=torch.bfloat16, backend="pcie", device=device
+    ) as comm:
+        wide_out = comm.allocate_output(wide, "scatter_heads")
+        packed_out = comm.allocate_output(packed, "scatter_heads", dtype=torch.uint8)
+        assert wide_out.data_ptr() != packed_out.data_ptr()
+
+        comm.scatter_heads(wide, out=wide_out)
+        comm.scatter_heads(packed, out=packed_out, dtype=torch.uint8)
+        torch.cuda.synchronize(device)
+        assert torch.equal(wide_out, _ref_scatter_heads(wide, world_size, rank, group))
+        assert torch.equal(
+            packed_out, _ref_scatter_heads(packed, world_size, rank, group)
+        )
+
+        # Interleave once more: neither registration may have been disturbed by
+        # the other's geometry rebind.
+        comm.scatter_heads(wide, out=wide_out)
+        torch.cuda.synchronize(device)
+        assert torch.equal(wide_out, _ref_scatter_heads(wide, world_size, rank, group))
+    return ("ok", world_size)
+
+
+@pytest.mark.parametrize("world_size", [2, 8])
+def test_correctness_forced_pcie_mixed_dtypes(world_size):
+    """A BF16 communicator carrying a uint8 payload alongside its BF16 one."""
+    _run_multi_rank(
+        "_pcie_mixed_dtype_body",
+        world_size,
+        None,
+        timeout=600,
+        allow_skip=True,
+    )
 
 
 @pytest.mark.parametrize(
