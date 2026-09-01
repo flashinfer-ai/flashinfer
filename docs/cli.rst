@@ -108,6 +108,9 @@ environment:
 
 This command installs from the flat FlashInfer wheel index.
 
+Run this after upgrading ``flashinfer-python`` if a stale
+``flashinfer-cubin`` install triggers a version mismatch at import time.
+
 Install JIT Cache Wheel
 -----------------------
 
