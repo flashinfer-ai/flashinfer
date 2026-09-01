@@ -111,7 +111,7 @@ def _reference(
     pages, page_size = k_cache.shape[0], k_cache.shape[1]
     logits = torch.full((rows, num_columns), float("-inf"), device=q.device)
     visible = torch.zeros(rows, dtype=page_table.dtype, device=q.device)
-    keys = k_cache.float().reshape(pages, page_size, -1)
+    keys = k_cache.float()
     qf = q.float()
     for row in range(rows):
         req = int(token_to_req[row])
@@ -134,8 +134,13 @@ def _reference(
 @requires_cuda_sm80
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("head_dim", [64, 128, 192, 256])
-@pytest.mark.parametrize("num_heads", [1, 4, 16])
+@pytest.mark.parametrize("num_heads", [1, 4, 8, 9, 16])
 def test_scores_match_a_torch_reference(dtype, head_dim, num_heads):
+    """Eight heads and nine straddle the two multiply widths: up to eight the
+    tile is m16n8k16 fed by an ldmatrix.x2, above it m16n16k16 fed by an x4 with
+    the unused heads zeroed. Sixteen heads at head_dim 256 is also the one shape
+    whose query fragments do not fit in registers, so it reloads them per
+    multiply instead of holding them across the column tiles."""
     q, k_cache, table, t2r, pos, lens = _scores_case(
         head_dim=head_dim, num_heads=num_heads, dtype=dtype
     )
@@ -167,6 +172,61 @@ def test_scores_match_a_torch_reference_across_launch_shapes(rows):
     )
     torch.testing.assert_close(got_visible, want_visible)
     torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
+
+
+@requires_cuda_sm80
+def test_scores_agree_between_a_block_per_tile_and_a_block_per_eight():
+    """Enough blocks to fill the device switches the launch from one column
+    tile per block to eight, which stages a feature slice at a time and runs the
+    copies for the next tile while the current one multiplies. A single row can
+    never fill the device, so scoring the rows one at a time takes the other
+    shape; the two have to agree column for column.
+
+    The reference the single-tile shape is checked against is the torch one
+    above; this pins the pipelined shape to it without paying for a 64x512
+    python loop.
+    """
+    rows, pages = 64, 64
+    q, k_cache, table, t2r, pos, lens = _scores_case(rows=rows, pages=pages)
+    divisor = q.shape[2] ** 0.5
+    columns = table.shape[1] * k_cache.shape[1]
+    got, got_visible = flashinfer.sparse_paged_scores(
+        q, k_cache, table, t2r, pos, lens, 1, divisor
+    )
+    assert got.shape == (rows, columns)
+    for row in range(rows):
+        one, one_visible = flashinfer.sparse_paged_scores(
+            q[row : row + 1],
+            k_cache,
+            table,
+            t2r[row : row + 1],
+            pos[row : row + 1],
+            lens,
+            1,
+            divisor,
+        )
+        torch.testing.assert_close(got_visible[row : row + 1], one_visible)
+        torch.testing.assert_close(got[row : row + 1], one)
+
+
+@requires_cuda_sm80
+def test_scores_read_a_cache_with_no_pages_at_all():
+    """A column with no page carries the first page's address so the staging
+    loop needs no predicate. With no page there is no first one to carry, so the
+    staging has to be skipped outright rather than read the empty tensor."""
+    q, k_cache, table, t2r, pos, lens = _scores_case()
+    empty = k_cache[:0]
+    divisor = q.shape[2] ** 0.5
+    columns = table.shape[1] * k_cache.shape[1]
+    got, got_visible = flashinfer.sparse_paged_scores(
+        q, empty, table, t2r, pos, lens, 1, divisor, num_columns=columns
+    )
+    want, want_visible = _reference(
+        q, empty, table, t2r, pos, lens, 1, divisor, columns
+    )
+    torch.testing.assert_close(got_visible, want_visible)
+    torch.testing.assert_close(got, want)
+    assert torch.isinf(got).all()
 
 
 @requires_cuda_sm80
