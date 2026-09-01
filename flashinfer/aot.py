@@ -169,6 +169,7 @@ from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
+from .jit.sparse_route import gen_sparse_route_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
 
@@ -526,6 +527,9 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
+    # The route kernels are plain CUDA and build everywhere; without this an
+    # install with JIT disabled has no artifact to load.
+    jit_specs.append(gen_sparse_route_module())
     has_bgmv_moe = sm_capabilities.get("bgmv_moe", False)
     has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
