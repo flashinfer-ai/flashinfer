@@ -86,10 +86,10 @@ def recurrent_kda(
     initial_state_source: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
+    *,
     disable_state_update: bool = False,
     correction_cache: Optional[torch.Tensor] = None,
     kg_cache: Optional[torch.Tensor] = None,
-    *,
     backend: Literal["cute-dsl", "cake", "auto"] = "cute-dsl",
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Recurrent KDA (Kimi Delta Attention) decode kernel.

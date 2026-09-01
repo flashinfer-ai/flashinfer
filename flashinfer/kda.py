@@ -73,15 +73,15 @@ def recurrent_kda(
     initial_state_source: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
-    disable_state_update: bool = False,
-    correction_cache: Optional[torch.Tensor] = None,
-    kg_cache: Optional[torch.Tensor] = None,
     seq_order: Optional[torch.Tensor] = None,
     prefill_workspace: Optional[_kda_prefill.RecurrentKDAPrefillWorkspace] = None,
     state_checkpoints: Optional[torch.Tensor] = None,
     checkpoint_cu_starts: Optional[torch.Tensor] = None,
     checkpoint_every_n_tokens: int = 0,
     *,
+    disable_state_update: bool = False,
+    correction_cache: Optional[torch.Tensor] = None,
+    kg_cache: Optional[torch.Tensor] = None,
     backend: Literal["auto", "cute-dsl", "cake"] = "auto",
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
