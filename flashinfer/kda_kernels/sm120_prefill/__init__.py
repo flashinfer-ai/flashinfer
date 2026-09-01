@@ -42,9 +42,9 @@ Two variants implement the same contract:
 ``fused``
     one kernel that does both.
 
-They agree numerically -- on the 67-shape suite they match to the last bit on
-20 of 24 tail cells -- so the choice between them is a performance one, and
-:func:`choose_variant` makes it from a measured table rather than a formula.
+They agree numerically within the tolerances the test suite asserts, so the
+choice between them is a performance one, and :func:`choose_variant` makes it
+from a measured table rather than a formula.
 """
 
 from __future__ import annotations
@@ -53,18 +53,15 @@ import functools
 import threading
 import weakref
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional
+from typing import Any, NamedTuple, Optional
 
 import torch
 
 from .runtime import (
     DK,
     DV,
-    LOWER_BOUND_RANGE,
-    SM120_CAPABILITY,
     KDAPrefillValidationError,
     SM120PrefillResources,
-    UnsupportedArchitectureError,
     canonical_offsets,
     current_stream_ptr,
     resource_cache_token,
@@ -73,9 +70,6 @@ from .runtime import (
     tensor_layout_identity,
     validate_inputs,
 )
-
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from .runtime import CanonicalInputs
 
 __all__ = [
     "can_implement_kda_prefill_sm120",
@@ -93,15 +87,20 @@ DEFAULT_VARIANT = "auto"
 # ---------------------------------------------------------------------------
 # Variant choice.
 #
-# Deliberately a table rather than a formula.  The obvious formula -- scale the
-# CTA term by SM count -- is an untested assumption: it presumes the crossover
-# is set purely by how many waves the grid takes, when the measured data also
-# turns on H and T, which have nothing to do with SM count.
+# A table keyed on SM count rather than a formula: the crossover between the
+# two variants depends on H and T as well as on how many waves the grid takes,
+# and a device name is not a stable unique selector.  Each row was fitted on
+# one device from timings of both pinned variants; any other CC 12.0 device
+# uses ``FALLBACK_AUTO_PROFILE`` and :func:`describe_variant_policy` says so.
 #
-# **Keyed on SM count, not on the device name.**  A name is not a stable unique
-# selector and can collide across devices.  SM count is also the better key on
-# the merits -- the CTA term is a statement about a grid against the machine's
-# width.
+# A threshold is a fit, not a property of the kernel, and it goes stale when
+# either kernel changes.  To re-fit a row, time all three benchmark backends
+# over the shapes of interest and move the boundary to where the pinned
+# variants cross:
+#
+#   python benchmarks/flashinfer_benchmark.py --routine recurrent_kda_prefill \
+#       --backends flashinfer flashinfer-decomp flashinfer-fused \
+#       --batch_size B --s_qo T --num_q_heads H --refcheck
 # ---------------------------------------------------------------------------
 
 
@@ -109,9 +108,7 @@ class AutoProfile(NamedTuple):
     """Thresholds for one device.  See :data:`AUTO_PROFILES`."""
 
     #: Heads at or above which the fused variant wins regardless of T, or
-    #: ``None`` where the measured data needs no such term.  ``None`` means
-    #: "not used", where a large int would read as a threshold someone
-    #: measured.
+    #: ``None`` when the fit needed no such term.
     heads: Optional[int]
     #: Per-sequence length at or below which it wins regardless of H.
     tokens: Optional[int]
@@ -121,42 +118,50 @@ class AutoProfile(NamedTuple):
     device: str
     #: Where the numbers came from, printed by :func:`describe_variant_policy`.
     source: str
+    #: Lower CTA threshold when all sequences have the same length. Ragged
+    #: batches retain ``ctas``: short sequences do not fill the long tail.
+    uniform_ctas: Optional[int] = None
+    #: Optional length cap on the lower uniform CTA threshold, not on ``ctas``.
+    uniform_max_tokens: Optional[int] = None
 
 
 AUTO_PROFILES: dict[int, AutoProfile] = {
-    # Each row is fitted independently. The 156-SM and 188-SM sweeps both place
-    # the crossover at T <= 32 or CTA >= 144; keeping two rows records that both
-    # devices were measured rather than treating one as an inferred fallback.
+    # Short sequences always take the fused kernel; above that the decomposed
+    # kernel keeps narrow grids and the fused one takes wide grids. Re-fitting
+    # the optimized kernels on 156/188 SMs admits uniform grids at 96 CTAs;
+    # use a 128-CTA line for ragged batches, where lowering it loses
+    # on long-tail shapes such as H=12, lengths=(4096, 1024, 65, 17).
+    # On 156 SMs the new line is limited to T <= 8192: the 16K/32K H=48
+    # validation points cross back to decomp. The 188-SM points stay fused.
     156: AutoProfile(
         heads=None,
-        tokens=32,
-        ctas=144,
+        tokens=130,
+        ctas=128,
         device="156-SM SM120 part",
-        source="147-shape fit, 156 SMs",
+        source="fitted from decomp/fused timings on a 156-SM CC 12.0 device",
+        uniform_ctas=96,
+        uniform_max_tokens=8192,
     ),
     188: AutoProfile(
         heads=None,
-        tokens=32,
-        ctas=144,
+        tokens=130,
+        ctas=128,
         device="188-SM SM120 part",
-        source="147-shape fit, 188 SMs",
+        source="fitted from decomp/fused timings on a 188-SM CC 12.0 device",
+        uniform_ctas=96,
     ),
-    # The 110-SM fit crosses one measured CTA step earlier.
     110: AutoProfile(
         heads=None,
-        tokens=32,
-        ctas=128,
+        tokens=130,
+        ctas=96,
         device="110-SM SM120 part",
-        source="67-shape sweep + FlashInfer's twelve, 74 shapes, 110 SMs",
+        source="fitted from decomp/fused timings on a 110-SM CC 12.0 device",
     ),
 }
 
-#: Used for any CC 12.0 device without a row above.
-#:
-#: A fallback, not a claim.  These are the only thresholds anyone has measured,
-#: so they are better than a guess and worse than a measurement;
-#: :func:`describe_variant_policy` says which case a given machine is in, so a
-#: number taken on an unprofiled card cannot quietly be read as tuned.
+#: Used for any CC 12.0 device without a row above.  A fallback, not a claim:
+#: :func:`describe_variant_policy` reports which case a machine is in so a
+#: number taken on an unprofiled card cannot be read as tuned.
 FALLBACK_AUTO_PROFILE = 156
 
 
@@ -245,6 +250,11 @@ def describe_variant_policy(sm_count: Optional[int] = None, device=None) -> str:
         terms.append(f"T<={profile.tokens}")
     if profile.ctas is not None:
         terms.append(f"CTA>={profile.ctas}")
+    if profile.uniform_ctas is not None:
+        uniform_term = f"equal lengths and CTA>={profile.uniform_ctas}"
+        if profile.uniform_max_tokens is not None:
+            uniform_term += f" and T<={profile.uniform_max_tokens}"
+        terms.append(f"({uniform_term})")
     provenance = (
         "measured on this device"
         if tuned
@@ -262,6 +272,8 @@ def choose_variant(
     tokens: int,
     sm_count: Optional[int] = None,
     device=None,
+    *,
+    uniform: bool = True,
 ) -> str:
     """Which variant the measured table says is faster for this shape.
 
@@ -271,6 +283,9 @@ def choose_variant(
     the recurrence is serial within a sequence, so the longest one sets the
     critical path, and a batch containing a 130 behaves like a 130 rather than
     like the 27 its lengths average to.
+
+    ``uniform`` must be false for unequal lengths (including empty sequences)
+    so the lower, equal-length CTA threshold cannot select a slower long tail.
 
     Returns ``"decomp"`` or ``"fused"``, never ``"auto"``.
     """
@@ -287,6 +302,13 @@ def choose_variant(
     if profile.tokens is not None and tokens <= profile.tokens:
         return "fused"
     if profile.ctas is not None and ctas >= profile.ctas:
+        return "fused"
+    if (
+        uniform
+        and profile.uniform_ctas is not None
+        and ctas >= profile.uniform_ctas
+        and (profile.uniform_max_tokens is None or tokens <= profile.uniform_max_tokens)
+    ):
         return "fused"
     return "decomp"
 
@@ -369,6 +391,7 @@ def run_kda_prefill_sm120(
     output: Optional[torch.Tensor] = None,
     variant: str = DEFAULT_VARIANT,
     safe_gate: bool = True,
+    final_state_is_private: bool = False,
     resources: Optional[SM120PrefillResources] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Run SM120 KDA prefill and return ``(output, final_state)``.
@@ -382,10 +405,17 @@ def run_kda_prefill_sm120(
 
     The public contract -- where a supplied ``initial_state`` is updated in
     place whether or not the caller asked for a final state -- is one level up,
-    in ``flashinfer/kda_prefill.py``.  Keeping the split here is what lets a
-    cross-implementation A/B compare like with like: the comparison path has
-    exactly this ABI, so a harness can hand both paths the same two tensors and
-    a difference in the result is a difference in the kernels.
+    in ``flashinfer/kda_prefill.py``.  Keeping that adaptation out of the
+    backend ABI lets tests and benchmarks drive the kernels directly.
+
+    ``final_state_is_private`` says the caller allocated ``final_state`` for
+    this call alone -- it is written, never read, and nothing outside the call
+    held it when the call began.  That licenses the call memo to verify the slot
+    by address and layout instead of by object identity, which is the difference
+    between a warm call and a full plan rebuild when the buffer is a fresh
+    ``torch.empty`` each time.  Leave it false for a caller-supplied buffer:
+    there the object check is what stops a recycled address from turning someone
+    else's tensor into a plan hit.
 
     ``resources`` is the SM120 half of a caller-owned
     :class:`~flashinfer.kda_prefill.RecurrentKDAPrefillWorkspace`.  Passing one
@@ -413,14 +443,14 @@ def run_kda_prefill_sm120(
         cu_seqlens,
     )
     scalars = (resolved_scale, float(lower_bound), variant, bool(safe_gate))
+    private = _PRIVATE_FINAL_STATE if final_state_is_private else _NO_PRIVATE_SLOTS
 
     resolved = _resolved_call(q.device, tensors, scalars, resources)
     if resolved is not None:
         # The whole host path already ran for these exact tensors: replay the
         # plan it produced rather than walking eleven tensors again to find it.
         # The executor is stored already bound, so this is one call rather than
-        # a dict lookup and an attribute fetch -- which is measurable when the
-        # kernel it precedes is nine microseconds long.
+        # a dict lookup and an attribute fetch.
         # `bind` is not repeated here: the memo key already carries the
         # variant, the stream and every tensor's identity, so the only state
         # that can have changed since it was bound is capture -- which happens
@@ -462,12 +492,9 @@ def run_kda_prefill_sm120(
 
     if resources is not None:
         # Pin the workspace to this variant, stream and shape before anything
-        # writes to it.  The state machine has been here since the backend
-        # landed and nothing called it, so every constraint it encodes was
-        # unenforced: a workspace already spent on a capture could be driven
-        # again from eager Python, and one workspace could be shared across two
-        # streams or two variants with the second silently overwriting scratch
-        # the first had not finished reading.
+        # writes to it.  ``bind`` refuses a workspace already spent on a
+        # capture, and one shared across streams or variants, where a second
+        # caller could overwrite scratch the first has not finished reading.
         resources.bind(
             variant=chosen,
             stream_ptr=current_stream_ptr(q.device),
@@ -497,7 +524,9 @@ def run_kda_prefill_sm120(
         resources=resources,
         safe_gate=safe_gate,
     )
-    _remember_call(q.device, tensors, scalars, resources, (module.execute, plan))
+    _remember_call(
+        q.device, tensors, scalars, resources, (module.execute, plan), private
+    )
     return out, final_state
 
 
@@ -506,11 +535,9 @@ def run_kda_prefill_sm120(
 #
 # Validation, offset canonicalization and the variant choice are all pure
 # functions of the tensors' addresses, shapes, dtypes and versions plus the
-# scalars -- and all three are expensive enough to matter. Measured on this
-# backend before this memo existed: +0.11 ms of host time on *every* call,
-# which is invisible next to a 1 ms kernel and 12x the whole call at
-# B=1 T=16 H=4. The variants' own plan caches did not help, because this work
-# happens before they are reached.
+# scalars -- and together they dominate the host time of a small call.  The
+# variants' own plan caches cannot help, because this work happens before they
+# are reached.
 #
 # The three costs, in order of size:
 #
@@ -518,8 +545,7 @@ def run_kda_prefill_sm120(
 # * ``canonical_offsets`` goes through a per-device cache whose *hit* path
 #   issues ``wait_event`` and ``record_stream`` -- driver calls, not dict
 #   lookups;
-# * ``choose_variant`` asked the driver for the device's SM count once per
-#   call, which is a property that cannot change under a live process.
+# * ``choose_variant`` resolves the device and its SM count.
 #
 # The stream is in the key even though none of the three results depend on it.
 # That is deliberate: the offsets cache's ``wait_event`` is what orders a
@@ -527,11 +553,45 @@ def run_kda_prefill_sm120(
 # would skip that edge the first time a second stream appeared.
 # ---------------------------------------------------------------------------
 
+#: Stored in place of a weak reference for a slot the immediate caller
+#: allocated for this call alone -- an output buffer that exists only to be
+#: written, whose lifetime ends when the caller drops it.
+#:
+#: Such a slot must be verified by address and layout, not by object identity.
+#: The weak reference exists to catch an address the allocator recycled into a
+#: *different* tensor; a buffer allocated for this call cannot be that, because
+#: whatever now lives at the address is, by construction, this call's own
+#: output. Checking object identity there is not conservative, it is simply
+#: wrong for the case, and it costs a full plan rebuild on every call: a fresh
+#: ``torch.empty`` is a new Python object even when the caching allocator hands
+#: back the same block, so ``ref() is not tensor`` fires on a hit, and the
+#: object's death then purges the LRU entry as well.
+_BY_ADDRESS = object()
+
+#: Position of ``final_state`` in the memo's ``tensors`` tuple. Named rather
+#: than written inline because the tuple is built in one place and read in
+#: another, and an index that drifts would silently license the wrong slot.
+_FINAL_STATE_SLOT = 9
+
+#: Both answers, precomputed.  Indices rather than a parallel mask, so a caller
+#: passing a shorter tensor tuple needs no matching mask, and built once
+#: because this runs before every launch.
+_NO_PRIVATE_SLOTS: tuple = ()
+_PRIVATE_FINAL_STATE: tuple = (_FINAL_STATE_SLOT,)
+
+# ``out`` is deliberately not on this list even though a call that allocates it
+# owns it just as exclusively.  Marking it would buy nothing: a live plan
+# retains the buffer its descriptors address, at the C level, so the previous
+# output is still allocated when the next call asks for one and the allocator
+# hands back a *different* block every time.  An address-keyed slot whose
+# address always changes is a relaxed check that never turns a miss into a
+# hit, which is the worst of both.  Callers who want a warm memo should pass
+# ``output``.
+
 #: One entry per distinct buffer set and workspace; a serving loop needs one.
 #: Each value carries weak references to the key tensors so an allocator-reused
 #: address cannot turn a different tensor object into a stale plan hit.
-#: Its values carry the variants' plan objects, so it retains what they retain;
-#: see ``CALL_PLAN_MAX_ENTRIES`` for the measurements behind the number.
+#: Its values carry the variants' plan objects, so it retains what they retain.
 RESOLVED_CALL_MAX_ENTRIES = 16
 
 #: Serializes the two mutating paths through ``_RESOLVED``.  Reentrant on
@@ -540,7 +600,7 @@ RESOLVED_CALL_MAX_ENTRIES = 16
 #:
 #: The ``_RESOLVED_LAST`` fast path deliberately stays outside it.  That global
 #: holds an immutable tuple, so reading it is one atomic load, and it is the
-#: path a warm serving loop takes before a nine-microsecond kernel.
+#: path a warm serving loop takes on every call.
 _RESOLVED_LOCK = threading.RLock()
 _RESOLVED: "OrderedDict[tuple, tuple]" = OrderedDict()
 
@@ -571,9 +631,8 @@ def _resolved_call(device, tensors, scalars, resources):
 
     Written with explicit loops and early returns rather than ``all(...)`` over
     generator expressions.  That reads worse and costs less: this runs before
-    every launch, and at the smallest supported shape the kernel it precedes is
-    nine microseconds long, so two generator frames per call are visible in a
-    paired benchmark.
+    every launch, and at the smallest supported shapes the extra generator
+    frames are a visible fraction of the call.
     """
     last = _RESOLVED_LAST
     if last is not None:
@@ -599,7 +658,7 @@ def _resolved_call(device, tensors, scalars, resources):
                 if ref is None:
                     if tensor is not None:
                         break
-                elif ref() is not tensor:
+                elif ref is not _BY_ADDRESS and ref() is not tensor:
                     break
                 if tensor_identity(tensor) != last_identities[index]:
                     break
@@ -617,7 +676,7 @@ def _resolved_call(device, tensors, scalars, resources):
             if ref is None:
                 if tensor is not None:
                     break
-            elif ref() is not tensor:
+            elif ref is not _BY_ADDRESS and ref() is not tensor:
                 break
         else:
             _RESOLVED.move_to_end(key)
@@ -629,10 +688,21 @@ def _resolved_call(device, tensors, scalars, resources):
     return None
 
 
-def _remember_call(device, tensors, scalars, resources, value) -> None:
+def _remember_call(device, tensors, scalars, resources, value, private=()) -> None:
+    def _hold(index, tensor, callback=None):
+        if tensor is None:
+            return None
+        if index in private:
+            # No callback either: this buffer dies at the end of every call, and
+            # a purge on its death would drop the entry the next call wants.
+            return _BY_ADDRESS
+        if callback is None:
+            return weakref.ref(tensor)
+        return weakref.ref(tensor, callback)
+
     global _RESOLVED_LAST
     _RESOLVED_LAST = (
-        tuple(None if t is None else weakref.ref(t) for t in tensors),
+        tuple(_hold(i, t) for i, t in enumerate(tensors)),
         tuple(tensor_identity(t) for t in tensors),
         scalars,
         resource_cache_token(resources),
@@ -648,9 +718,7 @@ def _remember_call(device, tensors, scalars, resources, value) -> None:
             if entry is not None and entry[0] is _token:
                 _RESOLVED.pop(_key, None)
 
-    refs = tuple(
-        None if tensor is None else weakref.ref(tensor, _purge) for tensor in tensors
-    )
+    refs = tuple(_hold(i, tensor, _purge) for i, tensor in enumerate(tensors))
     with _RESOLVED_LOCK:
         _RESOLVED[key] = (token, refs, value)
         while len(_RESOLVED) > RESOLVED_CALL_MAX_ENTRIES:
@@ -682,11 +750,17 @@ def _resolve_variant(variant, info, offsets, safe_gate, resources, device=None) 
         # produce a confusing refusal from the decomp branch.
         chosen = "fused"
     else:
+        longest = (
+            offsets.longest_sequence if offsets.lengths else info.tokens_per_sequence
+        )
         chosen = choose_variant(
             offsets.sequences or info.batch,
             info.heads,
-            offsets.longest_sequence if offsets.lengths else info.tokens_per_sequence,
+            longest,
             device=device,
+            # Canonical offsets already hold validated host metadata; no new
+            # device synchronization is needed, including during graph capture.
+            uniform=offsets.total_tokens == offsets.sequences * longest,
         )
 
     if not safe_gate and chosen == "decomp":

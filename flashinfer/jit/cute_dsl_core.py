@@ -102,19 +102,25 @@ class JitSpecCuteDsl(JitSpec):
         kernel_name: str,
         compile_fn: Callable[[], Any],
         source_sha256: str,
+        arch: Optional[str] = None,
     ):
         self.module_name = module_name
         self.kernel_name = sanitize_symbol_name(kernel_name)
         self.compile_fn = compile_fn
+        # An explicit target labels the artifact for what compile_fn actually
+        # builds; otherwise follow the DSL's own resolution.
+        compile_arch = (
+            sanitize_symbol_name(arch.replace("_", "")) if arch else _get_compile_arch()
+        )
         self.module_dir_name = sanitize_symbol_name(
-            f"{module_name}_{_get_compile_arch()}_cute_dsl"
+            f"{module_name}_{compile_arch}_cute_dsl"
         )
         self.name = f"{self.module_dir_name}/{self.kernel_name}"
         self.module_dir = jit_env.FLASHINFER_JIT_DIR / self.module_dir_name
         self.object_path = self.module_dir / f"{self.kernel_name}.o"
         self.symbol = f"{module_name}_{self.kernel_name}"
         self.expected_meta = {
-            "arch": _get_compile_arch(),
+            "arch": compile_arch,
             "cute_dsl_version": _get_cute_dsl_version(),
             "source_sha256": source_sha256,
         }
@@ -283,6 +289,7 @@ def build_and_load_cute_dsl_kernel(
     kernel_name: str,
     compile_fn: Callable[[], Any],
     extra_key_files: Sequence[str] = (),
+    arch: Optional[str] = None,
 ) -> Any:
     """Compile a CuTe-DSL kernel with a persistent on-disk cache.
 
@@ -304,6 +311,12 @@ def build_and_load_cute_dsl_kernel(
         Source files whose content participates in cache invalidation.
         Shared by all kernels of the module; a change wipes and lazily
         rebuilds the whole module directory.
+    arch : Optional[str]
+        Compile target the kernel is built for (e.g. ``"sm_120a"``) when
+        ``compile_fn`` fixes one explicitly. Names the module directory and
+        ``meta.json`` so the artifact is labelled for the target it holds.
+        Defaults to the DSL's own resolution (``CUTE_DSL_ARCH`` or the
+        current device).
 
     Returns
     -------
@@ -325,5 +338,7 @@ def build_and_load_cute_dsl_kernel(
         )
         return compile_fn()
 
-    spec = JitSpecCuteDsl(module_name, kernel_name, compile_fn, source_sha256)
+    spec = JitSpecCuteDsl(
+        module_name, kernel_name, compile_fn, source_sha256, arch=arch
+    )
     return spec.build_and_load()

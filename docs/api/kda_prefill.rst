@@ -305,12 +305,42 @@ table keyed on the device's SM count — not on its name, which is not a stable
 unique selector.
 
 Thresholds exist for the 110-SM, 156-SM and 188-SM parts, measured on each.
-They do not agree: the 110-SM part switches to the fused kernel at CTA 128 and
-the other two at 144, because at CTA 128 with short sequences the larger parts
-still prefer the decomposed kernel and the smallest one does not. Any other
-CC 12.0 device uses the 156-SM thresholds as a labelled fallback. A benchmark
-run reports which case applies, so a number taken on an unprofiled card cannot
-be read as tuned.
+Every row takes short sequences (T <= 130) fused. After re-fitting the optimized
+kernels, equal-length sequences (including equal-length packed batches) take
+CTA >= 96 fused, except that the 156-SM row uses CTA >= 128 for T > 8192:
+longer sequences can cross back to decomp on that part. Unequal-length
+batches use CTA >= 128 on those two parts: short sequences do not occupy
+the machine throughout a long sequence's recurrence. The 110-SM row uses
+CTA >= 96 for both layouts. Any other CC 12.0 device uses the
+156-SM thresholds as a labelled fallback, and a benchmark run reports which
+case applies, so a number taken on an unprofiled card cannot be read as tuned.
+
+A threshold is a fit keyed on the SM count, not a constant of the kernel, and
+it goes stale when either kernel changes. The benchmark's ``flashinfer-decomp``
+and ``flashinfer-fused`` backends pin one variant each so a re-fit can be
+checked rather than assumed: a row where ``flashinfer`` tracks the slower pin
+shows a threshold to re-fit.
+
+The decomposed variant can optionally overlap its two kernels. With
+``FLASHINFER_KDA_PIPE=dual`` set before import, prepare publishes each chunk's
+factor slab through a per-chunk flag in global memory and the recurrence,
+launched on a high-priority side stream, consumes chunks as they land. The
+consumer acquires each published flag before reading its factors, either
+through an acquire load or an acquire fence following a successful relaxed
+lookahead read.
+
+The consumer CTAs spin on flags that a concurrently running kernel publishes, so
+forward progress depends on the producer staying resident. A shape-based
+predicate filters candidates using measured crossover regions and a residency
+margin. It guarantees neither a speedup nor hardware forward progress:
+admitted shapes can still run slower. The overlap is therefore off by default.
+``FLASHINFER_KDA_PIPE=serial`` keeps the flag machinery on one stream so the
+cost of the flags can be measured apart from the benefit of the overlap. Both
+flag modes fall back to the ordinary two-launch path if prepare's swapped
+chunk-group axis exceeds the device's grid-y limit. An
+overlapped plan that was warmed eagerly can be captured into a CUDA graph; the
+capture records a reset of the flag buffer ahead of both kernels so every
+replay orders the recurrence behind prepare again.
 
 State and graph semantics
 ~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -357,14 +387,28 @@ makes reusing the entry safe — an allocator that had recycled the address woul
 otherwise hand the kernel someone else's memory.
 
 The retention scales with the number of *distinct buffer sets* a process
-rotates through, not with the number of calls. On a 110-SM part at
-``[1, 1024, 8, 128]`` one set holds about 14.5 MiB, and eight rotating sets
-about 73 MiB. Reuse one set and it stays at one set's worth forever.
+rotates through, not with the number of calls. Reuse one set and it stays at
+one set's worth.
+
+A warm call needs the memo to recognise the buffers it is handed, and it
+recognises a caller's tensor by object identity -- which is what stops an
+address the allocator recycled into a different tensor from becoming a stale
+plan hit. A buffer the call allocates for itself is exempt: it is verified by
+address and layout instead, because whatever lives at that address is by
+construction this call's own output. That exemption covers the final state a
+call without an ``initial_state`` allocates, which is otherwise a new object
+every call and would rebuild the plan every call.
+
+It does not cover ``output``. A live plan retains the buffer its descriptors
+address, so an ``output`` this backend allocated is still alive when the next
+call asks for one, and the allocator hands back a different block; an
+address-keyed check on a moving address can never hit. **Pass ``output`` to
+keep the memo warm.** Reusing one ``output`` buffer, or capturing the call in a
+CUDA graph, both avoid this; allocating a fresh one per call does not.
 
 The entry ceilings are not a memory budget and lowering them does not trade
 speed for memory: below the ceiling the retention is the same whatever the
-ceiling is, and above it every call rebuilds its plan — about 7.3 ms against a
-100 microsecond hit on that part. A deployment that needs the memory back
-should rotate fewer buffer sets, or call
+ceiling is, and above it every call rebuilds its plan. A deployment that needs
+the memory back should rotate fewer buffer sets, or call
 ``flashinfer.kda_kernels.sm120_prefill.clear_kda_prefill_sm120_caches()``,
 which releases all of it.

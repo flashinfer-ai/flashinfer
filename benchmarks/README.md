@@ -103,7 +103,7 @@ Currently supports testing attention, gemm, fused MOE, normalization, quantizati
     - `gated_delta_rule_mtp` - Multi-token (T>=2) gated delta rule for speculative-decoding verification, with a state pool + indices. `--state_dtype float32` uses `gated_delta_rule_mtp`; `--state_dtype bfloat16` uses the BF16 MTP kernel via `gated_delta_rule_decode_pretranspose`. Backends: `flashinfer`, `triton`.
     - `chunk_gated_delta_rule` - Chunked GDN prefill over varlen sequences (uniform per-sequence length `--s_qo`). Backends: `flashinfer` (SM90 C++ / SM100 CuTe-DSL) and `fla` (flash-linear-attention Triton baseline, perf-only).
 - KDA (SM120a):
-    - `recurrent_kda_prefill` - Ordinary multi-token recurrent KDA prefill with fixed or packed inputs. Backends: `flashinfer` (automatic variant policy), `flashinfer-decomp`, `flashinfer-fused`, and optional external `cutekda` / `flash-kda` baselines.
+    - `recurrent_kda_prefill` - Ordinary multi-token recurrent KDA prefill with fixed or packed inputs. Backends: `flashinfer` (automatic variant policy), `flashinfer-decomp`, `flashinfer-fused`, and the optional external `flash-kda` baseline.
 
 ## Quick Start
 ### Single Test Run
@@ -601,7 +601,7 @@ Legend:
 | **gated_delta_rule_decode** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
 | **gated_delta_rule_mtp** |  |  |  |  | flashinfer, triton | flashinfer, triton | flashinfer, triton | triton |
 | **chunk_gated_delta_rule** |  |  |  |  | flashinfer, fla | flashinfer, fla | flashinfer, fla |  |
-| **recurrent_kda_prefill** |  |  |  |  |  |  |  | flashinfer, flashinfer-decomp, flashinfer-fused, cutekda, flash-kda |
+| **recurrent_kda_prefill** |  |  |  |  |  |  |  | flashinfer, flashinfer-decomp, flashinfer-fused, flash-kda |
 
 Backend Legend:
 - fa2: FlashAttention2
@@ -648,4 +648,4 @@ python benchmarks/flashinfer_benchmark.py \
 - triton: Triton reference kernels (used for Mamba selective_state_update and GDN decode/MTP)
 - fla: flash-linear-attention Triton kernels (GDN prefill baseline)
 - flashinfer-decomp / flashinfer-fused: pinned SM120 KDA prefill variants
-- cutekda / flash-kda: optional external SM120 KDA prefill baselines
+- flash-kda: optional external SM120 KDA prefill baseline (MoonshotAI/FlashKDA, built from source)
