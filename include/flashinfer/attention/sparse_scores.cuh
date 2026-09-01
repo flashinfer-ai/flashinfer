@@ -131,7 +131,9 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
   compress_ratio.divmod(static_cast<uint32_t>(max(sequence_length, 0)), k_blocks, ignored);
   const uint32_t visible = min(min(q_blocks, k_blocks), num_columns);
   if (blockIdx.y == 0 && threadIdx.x == 0) {
-    visible_out[row] = static_cast<IdType>(min(q_blocks, k_blocks));
+    // Bounded by what was scored, not by what the query could see: a top-k
+    // takes this as its width, and anything past num_columns has no logit.
+    visible_out[row] = static_cast<IdType>(visible);
   }
 
   const uint32_t first_column = blockIdx.y * (kBlockN * TILES_PER_BLOCK);

@@ -28,15 +28,31 @@ _SPARSE_SCORES_MIN_CAPABILITY = (8, 0)
 
 
 @functools.cache
-def get_sparse_scores_module():
-    major, minor = torch.cuda.get_device_capability()
+def _check_sparse_scores_capability(device: torch.device) -> None:
+    """Keyed on the device, because the gate is a property of the device.
+
+    Caching the module alone would run this once, against whichever device
+    happened to be current then, and let every later call through.
+    """
+    major, minor = torch.cuda.get_device_capability(device)
     if (major, minor) < _SPARSE_SCORES_MIN_CAPABILITY:
         raise RuntimeError(
             "sparse_paged_scores needs compute capability "
             f"{_SPARSE_SCORES_MIN_CAPABILITY[0]}.{_SPARSE_SCORES_MIN_CAPABILITY[1]} "
             f"or newer for its tensor-core path, got {major}.{minor}"
         )
+
+
+@functools.cache
+def _load_sparse_scores_module():
     return gen_sparse_scores_module().build_and_load()
+
+
+def get_sparse_scores_module(device: Optional[torch.device] = None):
+    _check_sparse_scores_capability(
+        torch.device(device) if device is not None else torch.device("cuda")
+    )
+    return _load_sparse_scores_module()
 
 
 @register_custom_op(
@@ -54,7 +70,7 @@ def _sparse_paged_scores(
     compress_ratio: int,
     divisor: float,
 ) -> None:
-    get_sparse_scores_module().sparse_paged_scores(
+    get_sparse_scores_module(q.device).sparse_paged_scores(
         q,
         k_cache,
         page_table,
