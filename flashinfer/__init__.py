@@ -203,6 +203,15 @@ from .nvfp4_attention_sm120 import (
 from .nvfp4_attention_sm120 import (
     nvfp4_attention_sm120_quantize_qkv as nvfp4_attention_sm120_quantize_qkv,
 )
+from . import (
+    qk_mxfp8_pv_nvfp4_attention_sm120 as qk_mxfp8_pv_nvfp4_attention_sm120,
+)
+from .qk_mxfp8_pv_nvfp4_attention_sm120 import (
+    qk_mxfp8_pv_nvfp4_attention_sm120_fwd as qk_mxfp8_pv_nvfp4_attention_sm120_fwd,
+)
+from .qk_mxfp8_pv_nvfp4_attention_sm120 import (
+    qk_mxfp8_pv_nvfp4_attention_sm120_quantize_qkv as qk_mxfp8_pv_nvfp4_attention_sm120_quantize_qkv,
+)
 from .norm import (
     fused_dit_residual_layernorm_scale_shift as fused_dit_residual_layernorm_scale_shift,
 )
