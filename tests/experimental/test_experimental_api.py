@@ -107,3 +107,13 @@ def test_experimental_namespace_reexports():
     assert fe.require_experimental is require_experimental
     assert fe.is_experimental_enabled is is_experimental_enabled
     assert fe.ExperimentalWarning is ExperimentalWarning
+
+
+def test_original_function_is_marked_for_registry_filtering():
+    def raw(x):
+        return x
+
+    decorated = flashinfer_experimental_api(raw)
+    # The trace registry stores the original, so the flag must live there too.
+    assert raw.is_experimental is True
+    assert decorated.is_experimental is True

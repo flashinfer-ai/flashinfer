@@ -232,6 +232,20 @@ Relative to the "Adding a New Operation" checklist in the root `CLAUDE.md`:
   experimental tactics must be safely skippable by loaders — falling back to
   stable tactics — when the gate is off or the feature has been removed.
 
+### Isolation from stable tests and checks
+
+Stable CI lanes and PR checks must never fail because of experimental code:
+
+- `tests/experimental/` is excluded from `pytest tests/` via `norecursedirs`
+  in `pytest.ini`; experimental tests run only in their own lane, invoked
+  explicitly as `pytest tests/experimental/`.
+- Trace-registry tooling (`tests/trace/`) and `scripts/pr_checks/` match
+  `@flashinfer_api` by literal name on purpose; `@flashinfer_experimental_api`
+  functions are excluded from the stable trace-consistency tests and from the
+  docstring and API/RST coverage checks.
+- Experimental APIs are not listed in `docs/api/*.rst` before graduation
+  (the API/RST check would report them as stale).
+
 ## User contract
 
 Experimental APIs and backends provide no compatibility or long-term support

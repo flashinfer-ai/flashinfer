@@ -2655,6 +2655,9 @@ def flashinfer_experimental_api(
     """
 
     def decorator(f: Callable) -> Callable:
+        # Mark the original too: flashinfer_api registers `f` (not the wrapper)
+        # in _TRACE_REGISTRY, and the stable trace tests filter on this flag.
+        f.is_experimental = True  # type: ignore[attr-defined]
         logged = flashinfer_api(f, trace=trace)
         feature_name = feature if feature is not None else f.__qualname__
         warned = False

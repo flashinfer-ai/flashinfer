@@ -8,7 +8,7 @@ FlashInfer currently applies the same review and support expectations to most us
 
 This works well for functionality intended for long-term support, especially on datacenter architectures where stability is critical. It works less well for fast-moving client-GPU support, where users often value functional availability over API or implementation stability.
 
-The proposal was motivated by expedited SM12x kernel delivery, but the problem is broader. FlashInfer needs to distinguish and accommodate:
+The initial proposal was motivated by expedited SM12x kernel delivery, but the problem is broader. FlashInfer needs to distinguish and accommodate:
 
 * an **experimental API**, whose interface may change or disappear (e.g. new op from a new model); and
 
@@ -89,8 +89,6 @@ The admitted use cases are the fast-moving work this policy exists for:
 * client-GPU kernels and backends (e.g. SM12x);
 * new operations from the latest models, where functional support can land ahead of a finalized stable API;
 * highly specialized kernels for specific problem sizes, which enter as experimental backends behind an existing stable API rather than as new APIs.
-
-Other categories, such as CTM or Kernel Factory kernels, may be admitted with maintainer approval.
 
 A feature requires documented justification, such as:
 
