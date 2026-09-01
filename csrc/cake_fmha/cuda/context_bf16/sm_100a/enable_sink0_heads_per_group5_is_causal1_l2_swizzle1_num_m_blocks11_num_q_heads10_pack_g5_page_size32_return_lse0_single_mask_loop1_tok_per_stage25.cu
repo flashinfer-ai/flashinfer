@@ -652,6 +652,9 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
     const int smem_pages_addr = smem + 167936;
     unsigned int* work_id_slot = reinterpret_cast<unsigned int*>(smem_raw + 168320);
     const int work_id_slot_addr = smem + 168320;
+    if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(Q)) : "memory"); }
+    if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(K)) : "memory"); }
+    if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(V)) : "memory"); }
 
     // Mbarrier init (16 groups, 37 barriers)
     // Mbarriers at smem_raw[0..296)

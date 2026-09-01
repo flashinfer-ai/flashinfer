@@ -79,7 +79,7 @@ typedef struct __align__(64) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 #define STATIC_ONE_TILE 0
 #define RETURN_LSE 0
-#define ENABLE_SINK 0
+#define ENABLE_SINK 1
 #define UNIFORM_Q_LEN -1
 #define UNIFORM_KV_LEN -1
 #define SINGLE_MASK_LOOP 0
@@ -666,6 +666,9 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
     const int smem_pages_addr = smem + 167936;
     unsigned int* work_id_slot = reinterpret_cast<unsigned int*>(smem_raw + 168320);
     const int work_id_slot_addr = smem + 168320;
+    if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(Q)) : "memory"); }
+    if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(K)) : "memory"); }
+    if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(V)) : "memory"); }
 
     // Mbarrier init (16 groups, 37 barriers)
     // Mbarriers at smem_raw[0..296)
@@ -1586,6 +1589,13 @@ kernel_cake_fmha_context_bf16(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap cons
                     int s_off = stage_1 * BLOCK_M;
                     float final_sum = sScale[warp % 4 * 32 + lane + s_off + 2 * BLOCK_M];
                     float final_max = sScale[warp % 4 * 32 + lane + s_off + 4 * BLOCK_M];
+                    {
+                        float sink_val = sinks[row_head];
+                        float neg_max_scaled = -(final_max * softmax_scale_log2);
+                        float _fma_2 = __fmaf_rn(sink_val, 1.4426950408889634f, neg_max_scaled);
+                        float _exp2_2 = approx_exp2(_fma_2);
+                        final_sum = final_sum + _exp2_2;
+                    }
                     float final_scale;
                     if (final_sum != 0.0f && final_sum == final_sum) {
                         float _rcp_0 = approx_rcp(final_sum);
