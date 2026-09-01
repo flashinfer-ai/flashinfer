@@ -86,6 +86,28 @@ def _get_prims_ts_module():
     return prims_ts
 
 
+def _make_prims_ts_context_page_table(
+    block_tables: torch.Tensor, page_size: int
+) -> torch.Tensor:
+    """Build the dense, fragment-aligned page-table ABI used by PrimTS context."""
+    from flashinfer.attention.prims_ts.context import _CONTEXT_KV_TILE_N
+
+    if page_size not in (16, 32, 64, 128):
+        raise ValueError(
+            "PrimTS context requires page_size to be one of 16, 32, 64, or 128"
+        )
+    pages_per_kv_tile = _CONTEXT_KV_TILE_N // page_size
+    column_capacity = (
+        (block_tables.shape[1] + pages_per_kv_tile - 1) // pages_per_kv_tile
+    ) * pages_per_kv_tile
+    if column_capacity > block_tables.shape[1]:
+        padding = block_tables[:, -1:].expand(
+            -1, column_capacity - block_tables.shape[1]
+        )
+        block_tables = torch.cat((block_tables, padding), dim=1)
+    return torch.stack((block_tables, block_tables), dim=1).contiguous()
+
+
 def _select_reference_output(outputs, priority):
     """Return the first available reference backend and output."""
     for backend in priority:
@@ -1033,19 +1055,21 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
         prims_ts_out = torch.empty(prims_ts_q_shape, device=device, dtype=o_data_type)
         backend_wrappers["prims-ts"] = prims_ts.BatchDecodePagedTSWrapper("HND")
         backend_wrappers["prims-ts"].plan(
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
+            device,
+            batch_size,
             num_qo_heads,
             num_kv_heads,
             head_dim_qk,
             page_size,
-            seq_len_q=s_qo,
+            s_kv,
+            max_seq_len_q=s_qo,
+            packed_query=False,
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
             o_data_type=o_data_type,
             mask_type=prims_ts_mask_type,
-            max_kv_len=s_kv,
+            seq_lens=actual_seq_lens_kv.flatten().tolist(),
+            workspace_buffer=workspace_buffer,
         )
 
     backend_outputs = {}
@@ -1131,9 +1155,13 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             result = backend_wrappers[backend].run(
                 runtime_q,
                 kv_cache,
+                actual_seq_lens_kv.flatten(),
+                kv_indptr,
+                kv_indices,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=1.0 if v_scale is None else v_scale,
                 out=out,
+                validate=False,
             )
             return result.view_as(q)
         else:
@@ -1184,7 +1212,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 v_arg,
                 workspace_buffer,
                 block_tables,
-                actual_seq_lens_kv,
+                actual_seq_lens_kv.flatten(),
                 ragged_q,
                 speculative_mask,
                 out_arg,
@@ -1220,9 +1248,13 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
             lambda: backend_wrappers["prims-ts"].run(
                 prims_ts_runtime_q,
                 prims_ts_kv_cache,
+                actual_seq_lens_kv.flatten(),
+                kv_indptr,
+                kv_indices,
                 bmm1_scale=scale if k_scale is None else k_scale * scale,
                 bmm2_scale=1.0 if v_scale is None else v_scale,
                 out=prims_ts_out,
+                validate=False,
             ),
             prims_ts_out,
         )
@@ -1738,11 +1770,15 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
     prims_ts_out = None
     prims_ts_sm_scale = None
     prims_ts_output_scale = None
+    prims_ts_dense_page_idx_kv = None
     if "prims-ts" in backends:
         prims_ts = _get_prims_ts_module()
         prims_ts_k_cache = kv_cache[:, 0].contiguous()
         prims_ts_v_cache = kv_cache[:, 1].contiguous()
         prims_ts_out = torch.empty_like(q, dtype=o_data_type)
+        prims_ts_dense_page_idx_kv = _make_prims_ts_context_page_table(
+            block_tables, page_size
+        )
         backend_wrappers_prims_ts = prims_ts.BatchPrefillPagedTSWrapper("HND")
         _q_scale = q_scale if q_scale is not None else 1.0
         _k_scale = k_scale if k_scale is not None else 1.0
@@ -1750,18 +1786,21 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
         prims_ts_sm_scale = _q_scale * _k_scale * scale
         prims_ts_output_scale = _v_scale
         backend_wrappers_prims_ts.plan(
-            q,
-            prims_ts_k_cache,
-            prims_ts_v_cache,
-            qo_indptr,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_len,
+            device=device,
+            batch_size=batch_size,
+            max_seq_len_q=s_qo,
+            max_seq_len_k=s_kv,
+            max_num_pages_per_seq_kv=int(prims_ts_dense_page_idx_kv.shape[-1]),
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim_qk,
+            q_dtype=q_dtype,
+            kv_dtype=kv_dtype,
+            out_dtype=o_data_type,
             page_size=page_size,
             mask_type="causal" if causal else "dense",
             sm_scale=prims_ts_sm_scale,
             output_scale=prims_ts_output_scale,
-            out_dtype=o_data_type,
         )
 
     # Prepare wrappers (after FP8 conversion so we have correct dtypes)
@@ -1973,7 +2012,12 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 q,
                 k_cache,
                 v_cache,
+                qo_indptr,
+                kv_token_indptr,
+                prims_ts_dense_page_idx_kv,
+                actual_seq_lens_kv_device.flatten(),
                 out=out,
+                validate=False,
             )
         else:
             print(f"[ERROR] Backend {backend} not supported")
@@ -2095,7 +2139,12 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                     q,
                     prims_ts_k_cache,
                     prims_ts_v_cache,
+                    qo_indptr,
+                    kv_token_indptr,
+                    prims_ts_dense_page_idx_kv,
+                    actual_seq_lens_kv_device.flatten(),
                     out=prims_ts_out,
+                    validate=False,
                 ),
                 prims_ts_out,
             )
@@ -3441,18 +3490,20 @@ def testBatchMLAPagedAttentionWrapper(args):
         )
         backend_wrappers["prims-ts"] = prims_ts.BatchMLADecodePagedTSWrapper()
         backend_wrappers["prims-ts"].plan(
-            block_tables,
-            actual_seq_lens_kv.flatten(),
+            device,
+            batch_size,
             num_qo_heads,
             head_dim_ckv,
             head_dim_kpe,
             page_size,
-            seq_len_q=s_qo,
+            s_kv,
+            max_seq_len_q=s_qo,
+            packed_query=False,
             q_data_type=q_dtype,
             kv_data_type=kv_dtype,
             o_data_type=torch.bfloat16,
             mask_type="causal",
-            max_kv_len=s_kv,
+            workspace_buffer=workspace_buffer,
         )
 
     direct_out = None
@@ -3595,9 +3646,12 @@ def testBatchMLAPagedAttentionWrapper(args):
                         head_dim_ckv + head_dim_kpe,
                     ),
                     kv_cache,
+                    block_tables,
+                    actual_seq_lens_kv.flatten(),
                     bmm1_scale=sm_scale,
                     bmm2_scale=1.0,
                     out=out,
+                    validate=False,
                 )
                 .reshape(-1, num_qo_heads, head_dim_ckv)
             )
@@ -3744,9 +3798,12 @@ def testBatchMLAPagedAttentionWrapper(args):
                     head_dim_ckv + head_dim_kpe,
                 ),
                 kv_cache,
+                block_tables,
+                actual_seq_lens_kv.flatten(),
                 bmm1_scale=sm_scale,
                 bmm2_scale=1.0,
                 out=prims_ts_out,
+                validate=False,
             ),
             prims_ts_out,
         )

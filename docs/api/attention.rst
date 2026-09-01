@@ -13,6 +13,11 @@ block-sparse FMHA, and MLA decode APIs are imported from
 reduction are automatic implementation details; there are no public tuning
 knobs.
 
+.. warning::
+
+    All PrimTS wrappers are experimental. Their signatures and plan/run
+    lifecycle may change incompatibly while this API family is stabilized.
+
 See the `PrimTS guide index <https://github.com/flashinfer-ai/flashinfer/blob/main/flashinfer/attention/prims_ts/README.md>`_
 for the public entry points, supported contracts, and examples. Current accuracy
 and performance signoff is on SM100a/B200; SM103a/B300 is architecture-gated

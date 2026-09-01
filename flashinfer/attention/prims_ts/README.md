@@ -5,6 +5,9 @@ kernels for NVIDIA Blackwell GPUs. Scheduling, tile selection, and split-KV
 reduction are implementation details; the public interfaces expose attention
 and cache semantics without tuning knobs.
 
+All PrimTS wrappers are experimental. Their signatures and lifecycle may
+change incompatibly while the APIs are being stabilized.
+
 Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
 admitted by the runtime architecture guard but is not yet signoff-qualified.
 
@@ -21,6 +24,15 @@ Import all entries below from `flashinfer.attention.prims_ts`.
 
 The component guides define supported shapes, layouts, metadata lifetime,
 output/workspace ownership, examples, limitations, and validation commands.
+
+The paged context, FMHA decode, and MLA decode wrappers separate reusable
+static state from per-run request state. `plan()` compiles a static shape and
+dtype specialization. Decode and MLA plans also bind caller-provided scratch
+or allocate private scratch; paged context needs no workspace. `run()` receives
+the current sequence and cache metadata. Runtime validation is enabled by
+default; callers that have already validated their metadata may use
+`validate=False` for steady-state timing or CUDA Graph capture and then own all
+metadata value and lifetime guarantees.
 
 For `BlockSparsePagedTSWrapper`, `plan` freezes only the compact fixed-Q
 geometry, dtypes, sparse-route capacity, and `max_seq_len_kv`; it retains no
