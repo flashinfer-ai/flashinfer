@@ -7,6 +7,25 @@ initial recurrent state and never writes state back. This is the KDA analog of
 the serial per-token delta-rule recurrence is replaced by a chunk-parallel
 (WY-representation) formulation evaluated with tensor-core MMAs.
 
+This module contains the full frozen-decode surface, not just the WY kernel:
+
+- the WY-parallel tensor-core kernel described below (the default for large
+  problems), including its packed varlen / RecoverSSM-verify variant
+  (``vllm_dropin``: ragged ``query_start_loc`` lengths, null slots,
+  slot-indexed fp32 correction + kg caches);
+- a grouped register-recurrent OUTPUT-ONLY kernel
+  (``_kda_oo_grouped_kernel``) — an output-only fork of
+  ``recurrent_kda._grouped_kda_kernel`` (#4001) with the per-token
+  state-checkpoint writes and spec-decode bookkeeping removed — used as the
+  fallback when both the batch (``B * HV``) and the window (``T``) are too
+  small to fill the GPU (the WY kernel's fixed pipeline latency dominates
+  there);
+- the batch-size dispatcher and host wrappers that select between them.
+
+Being a fork, fixes to the upstream grouped kernel do not propagate here
+automatically. This docstring is canonical for the math; the host wrappers'
+docstrings are canonical for tensor shapes, dtypes, and cache layouts.
+
 Math (per (batch, value-head); state S is [V, K], per-channel decay on K):
 
   recurrence:  S_t = S_{t-1} ⊙ a_t  (a_t[k] = exp(g_t[k]), broadcast over V)
@@ -22,6 +41,16 @@ Math (per (batch, value-head); state S is [V, K], per-channel decay on K):
                QT     = tril(qhat @ ktil^T) @ Tmat       # incl. diagonal
                A_full = qhat - QT @ khat
                O      = A_full @ S0^T + QT @ V
+
+  verify caches (emit mode; the RecoverSSM commit-kernel inputs):
+               U      = Tmat @ (V - khat @ S0^T)  # row t = beta_t (v_t - u_t)
+               kg_t   = (k_t | raw g_t)           # normalized key | raw gate
+
+In emit mode the kernel additionally writes these per-token caches
+(slot-indexed; fp32 U, bf16 kg) for a downstream commit/recovery kernel: U
+falls out of one extra state GEMM sharing the TMA-resident state tile plus a
+single T x T MMA, and kg is captured in the gate stage before khat overwrites
+the normalized key in SMEM.
 
 The only structural differences from the GDN kernel are (1) the per-channel
 gate cumsum + khat/ktil/qhat elementwise scaling stage (which replaces GDN's
@@ -44,7 +73,8 @@ exp(80) * |k| (k L2-normalized) is representable in bf16/f32 with adequate
 relative precision (each causal product khat_s[c]*ktil_r[c] is individually
 bounded by |k_s[c] k_r[c]|, so there is no cancellation). The unbounded
 softplus gate can overflow for pathologically strong decay (roughly
-sum_t |g_log_t[k]| > ~85); the recurrent kernel remains the fallback there.
+sum_t |g_log_t[k]| > ~85); the grouped recurrent kernel below remains the
+fallback there.
 
 Requires SM90+ (TMA + mbarrier), validated on SM100a (B200); K == V == 128; bf16 I/O and state.
 """
@@ -1612,9 +1642,11 @@ class KdaDecodeWyOutputOnlyKernel:
 
 
 # ============================================================================
-# Small-batch grouped OUTPUT-ONLY kernel.
+# Small-problem (small B * HV AND small T) grouped OUTPUT-ONLY kernel.
 #
-# At small batches the WY kernel's per-CTA pipeline latency (~4 us: barrier
+# At small B * HV * T (few sequences AND short windows; at T >= 5 the WY
+# kernel wins at every batch size) the WY kernel's per-CTA pipeline latency
+# (~4 us: barrier
 # chain + TMA + MMA phases) exceeds the serial recurrence cost and its grid
 # (B * HV CTAs) cannot fill the GPU. This path is an output-only fork of
 # ``recurrent_kda._grouped_kda_kernel``: token data is staged to SMEM once
