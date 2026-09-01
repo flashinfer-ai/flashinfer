@@ -484,8 +484,6 @@ def sm120_fmha_fp8_paged_prefill(
     scale_log2 = Float32(sm_scale * math.log2(math.e))
     output_scale = Float32(1.0 if v_scale is None else float(v_scale))
 
-    block_tables_i32 = block_tables.to(torch.int32).contiguous()
-
     # TVM-FFI ABI (env stream):
     # kernel_fn(
     #     q, k_pool, v_pool, o, lse, scale_log2, output_scale,
@@ -501,7 +499,7 @@ def sm120_fmha_fp8_paged_prefill(
         output_scale,
         seqlens_kv_i32,
         cu_seqlens_q_i32,
-        block_tables_i32,
+        block_tables,
         None,
         Int32(max_seqlen_q),
         enable_pdl,

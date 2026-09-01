@@ -2610,10 +2610,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     batch_size,
                     self.device,
                 )
-            else:
-                block_tables = block_tables.to(
-                    device=self.device, dtype=torch.int32, non_blocking=non_blocking
-                ).contiguous()
             self._block_tables = block_tables
             assert self._prims_backend is not None
             self._prims_backend.plan_paged(

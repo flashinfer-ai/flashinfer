@@ -152,6 +152,66 @@ def test_paged_public_wrapper(page_size):
     torch.testing.assert_close(actual_lse, torch.cat(lses), atol=0.2, rtol=0.2)
 
 
+def test_cuda_graph_reads_updated_caller_block_table():
+    device, i32 = "cuda", torch.int32
+    workspace = torch.empty(16 << 20, dtype=torch.uint8, device=device)
+    wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        workspace,
+        "HND",
+        backend="cute-dsl-prims",
+        use_cuda_graph=True,
+        qo_indptr_buf=torch.empty(2, dtype=i32, device=device),
+        paged_kv_indptr_buf=torch.empty(2, dtype=i32, device=device),
+        paged_kv_indices_buf=torch.empty(1, dtype=i32, device=device),
+        paged_kv_last_page_len_buf=torch.empty(1, dtype=i32, device=device),
+    )
+
+    hq, hkv, head_dim, page_size = 2, 1, 32, 16
+    q = torch.ones((1, hq, head_dim), device=device).to(torch.float8_e4m3fn)
+    cache = torch.zeros(
+        (2, 2, hkv, page_size, head_dim),
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    cache[0, 1].fill_(1)
+    cache[1, 1].fill_(-1)
+    indptr = torch.tensor([0, 1], dtype=i32, device=device)
+    page_indices = torch.tensor([0], dtype=i32, device=device)
+    last_page_len = torch.tensor([page_size], dtype=i32, device=device)
+    block_tables = torch.tensor([[0]], dtype=i32, device=device)
+    wrapper.plan(
+        indptr,
+        indptr,
+        page_indices,
+        last_page_len,
+        hq,
+        hkv,
+        head_dim,
+        page_size,
+        block_tables=block_tables,
+        q_data_type=q.dtype,
+        kv_data_type=cache.dtype,
+        o_data_type=torch.float16,
+    )
+
+    captured = torch.empty((1, hq, head_dim), dtype=torch.float16, device=device)
+    for _ in range(3):
+        wrapper.run(q, cache, out=captured, enable_pdl=False)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, cache, out=captured, enable_pdl=False)
+
+    block_tables.fill_(1)
+    eager = torch.empty_like(captured)
+    wrapper.run(q, cache, out=eager, enable_pdl=False)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(captured, eager)
+    torch.testing.assert_close(eager, torch.full_like(eager, -1))
+
+
 def test_prims_rejects_cudnn_max_sequence_kv():
     workspace = torch.empty(16 << 20, dtype=torch.uint8, device="cuda")
     qo = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
