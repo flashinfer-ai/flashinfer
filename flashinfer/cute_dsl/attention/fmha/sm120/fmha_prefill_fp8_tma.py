@@ -37,9 +37,10 @@ Constraints:
   offsets; paged K/V uses HND ``[num_pages, Hkv, num_tokens_per_page, D]`` pools
   and a shared K/V block table in ``block_tables[B, max_pages]``
 * Q head count must be divisible by K/V head count
-* ``max(2 * kv_tile * head_dim * input_dtype_size,
-  q_tile * head_dim * output_dtype_size)`` plus mbarriers must fit within the
-  SM120 SMEM capacity
+* ``max(kv_pipeline_stages * kv_tile * head_dim * input_dtype_size,
+  q_tile * head_dim * output_dtype_size) + 16 * kv_pipeline_stages`` must fit
+  within the SM120 SMEM capacity. ``kv_pipeline_stages`` is 3 when
+  ``head_dim == 256`` and ``q_tile == kv_tile == 128``, and 2 otherwise
 """
 
 from functools import partial

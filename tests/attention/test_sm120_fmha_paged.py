@@ -131,9 +131,11 @@ def _tol():
 @pytest.mark.parametrize(
     "B,Sq,Skv,Hq,Hkv,D,page_size",
     [
+        (1, 128, 128, 4, 4, 32, 64),  # head_dim=32
         (1, 128, 128, 8, 8, 128, 64),  # MHA, 2 pages/seq
         (2, 64, 128, 8, 2, 128, 64),  # GQA 4:1
         (1, 128, 128, 4, 4, 64, 64),  # head_dim=64
+        (1, 129, 384, 2, 1, 256, 64),  # D=256 three-stage KV ring
     ],
 )
 @pytest.mark.parametrize("is_causal", [False, True])

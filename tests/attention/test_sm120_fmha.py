@@ -185,9 +185,17 @@ def test_sm120_ragged_sequence_lengths_are_runtime(is_causal):
 
 
 @pytest.mark.parametrize("is_causal", [False, True])
-def test_sm120_ragged_return_lse(is_causal):
-    Hq, Hkv, D = 4, 2, 64
-    q_lens, kv_lens = [17, 65], [33, 97]
+@pytest.mark.parametrize(
+    "D,q_lens,kv_lens",
+    [
+        pytest.param(32, [17, 65], [33, 97], id="d32"),
+        pytest.param(64, [17, 65], [33, 97], id="d64"),
+        pytest.param(128, [17, 65], [33, 97], id="d128"),
+        pytest.param(256, [129], [384], id="d256-three-stage"),
+    ],
+)
+def test_sm120_ragged_return_lse(is_causal, D, q_lens, kv_lens):
+    Hq, Hkv = 4, 2
     sm_scale = 1.0 / math.sqrt(D)
     q_parts = [_make_fp8((length, Hq, D)) for length in q_lens]
     k_parts = [_make_fp8((length, Hkv, D)) for length in kv_lens]
