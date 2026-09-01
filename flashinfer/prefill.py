@@ -2625,6 +2625,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._backend, *get_module_args
                 )
 
+        if window_right >= 0 and self._backend not in (
+            "fa2",
+            "cute-dsl",
+        ):
+            raise NotImplementedError(
+                f"window_right is not supported on backend "
+                f"{self._backend!r} (kernel cannot express a "
+                f"right window); supported backends are 'fa2' and 'cute-dsl'. "
+                f"Pass window_right=-1 on other backends."
+            )
+
         self._block_tables = block_tables
         if self._backend == "trtllm-gen":
             # Allocated once per plan and reused across run() launches; the
@@ -2709,16 +2720,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
         self._window_right = window_right
-        if window_right >= 0 and getattr(self, "_backend", None) not in (
-            "fa2",
-            "cute-dsl",
-        ):
-            raise NotImplementedError(
-                f"window_right is not supported on backend "
-                f"{getattr(self, '_backend', None)!r} (kernel cannot express a "
-                f"right window); supported backends are 'fa2' and 'cute-dsl'. "
-                f"Pass window_right=-1 on other backends."
-            )
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
@@ -4050,6 +4051,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self._backend, *get_module_args
                 )
 
+        if window_right >= 0 and self._backend not in (
+            "fa2",
+            "cute-dsl",
+        ):
+            raise NotImplementedError(
+                f"window_right is not supported on backend "
+                f"{self._backend!r} (kernel cannot express a "
+                f"right window); supported backends are 'fa2' and 'cute-dsl'. "
+                f"Pass window_right=-1 on other backends."
+            )
+
         if self._backend == "cutlass":
             self._plan_info = fmha_varlen_plan(
                 self._cached_module, qo_indptr, kv_indptr, num_qo_heads, causal
@@ -4100,16 +4112,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._use_fp16_qk_reduction = use_fp16_qk_reduction
         self._window_left = window_left
         self._window_right = window_right
-        if window_right >= 0 and getattr(self, "_backend", None) not in (
-            "fa2",
-            "cute-dsl",
-        ):
-            raise NotImplementedError(
-                f"window_right is not supported on backend "
-                f"{getattr(self, '_backend', None)!r} (kernel cannot express a "
-                f"right window); supported backends are 'fa2' and 'cute-dsl'. "
-                f"Pass window_right=-1 on other backends."
-            )
         self._logits_soft_cap = logits_soft_cap
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
