@@ -4012,14 +4012,20 @@ def _run_flash_kda_prefill(
         metadata_workspace = stream_workspace
     else:
         metadata_workspace = prefill_workspace
+    cake_fp32_serving_native_state = (
+        use_cake_export
+        and initial_state is not None
+        and initial_state.dtype == torch.float32
+    )
     needs_direct_m128 = (
-        state_indices is not None
+        (state_indices is not None and not cake_fp32_serving_native_state)
         or checkpoint_every_n_tokens != 0
         or not beta.is_contiguous()
         or (
             initial_state is not None
             and initial_state.stride(0)
             != num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
+            and not cake_fp32_serving_native_state
         )
     )
     legacy_persistent_candidate = (
