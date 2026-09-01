@@ -13,7 +13,7 @@
 # limitations under the License.
 """CuteDSL-based Fused MoE Kernels for block-scaled FP4 compute."""
 
-from ...cute_dsl.utils import is_cute_dsl_available
+from ...cute_dsl.availability import is_cute_dsl_available
 
 # Conditionally import CuTe-DSL kernels
 if is_cute_dsl_available():
