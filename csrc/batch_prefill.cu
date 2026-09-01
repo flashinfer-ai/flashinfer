@@ -16,6 +16,8 @@
 #include <flashinfer/attention/mask.cuh>
 #include <flashinfer/attention/scheduler.cuh>
 #include <flashinfer/pos_enc.cuh>
+#include <type_traits>
+#include <utility>
 
 #include "batch_prefill_config.inc"
 #include "tvm/ffi/container/array.h"
@@ -40,6 +42,12 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
 }  // namespace flashinfer
 
 using namespace flashinfer;
+
+// A block-sparse route may address one KV entry per index while the cache still
+// stores whole pages. Only the modules that declare the scalar carry the field,
+// so detect it here rather than in the shared attention headers -- the generated
+// translation unit does not include them.
+namespace {}  // namespace
 
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
