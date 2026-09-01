@@ -581,7 +581,7 @@
     "observed_checkout_revision": "654b4fe8829aca18f6e778b299719574d3e6eb39",
     "observed_tracked_tree_clean": true,
     "producer_revision": "654b4fe8829aca18f6e778b299719574d3e6eb39",
-    "recipe_sha256": "0f644727ec76ee25053ff86b7dc95514e5e076eddbda071d4fd891a20383a0ca",
+    "recipe_sha256": "5a387043e031ac09b326e04e54463528580bad410888e228262926275f4e90ad",
     "schema": "cake.library_export.generation_inputs.v1"
   },
   "library": "flashinfer",
@@ -1664,10 +1664,9 @@
           "sha256": "cfac16f42dc1b90b1698bd633b6a918f1451af63f2b5ae7e2678e5bffcf58513"
         }
       ],
-      "closure_sha256": "6aae58f22243eba80c59154412ceac9ff135b7c16bd3c78429747870522c31b3",
+      "closure_sha256": "fbed1842053b8e2c898c5d186f3a24d9ef56676c180d2f841fa66fd27322084d",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_m128_generic",
@@ -1865,10 +1864,9 @@
           "sha256": "4973203fb14dd6189fa31bcfe7eec3a2455434f346f9b8d5c7d2c47c8189eae8"
         }
       ],
-      "closure_sha256": "99ef19ec706c568ebe3116c34418ebea4946eed3df0981c41e9a15cb23de52b3",
+      "closure_sha256": "b5f3c9f26e7dd876040f6f3055bd704526e8e98d38ff7497c3818a152f5e3325",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_m128_h64_persistent",
@@ -2066,10 +2064,9 @@
           "sha256": "31d8f9b44b4a79c07d32f883c4ddaccaacdd3d822b74ce1530d6d4aafbbc18de"
         }
       ],
-      "closure_sha256": "594a2dc9939233e3530ac768e2bd3900ed1050ea94a39a7e86d7fe90c754eb24",
+      "closure_sha256": "8dca0095b66ac5e310b7ea8b6f3e2b1b0b035eed10456a603eee8959d1bb5f19",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_m128_h96",
@@ -2255,10 +2252,9 @@
           "sha256": "4d0dbb17cca09b15b442ec81db68b7d142a48882fbf8fbbcb36a5fa937e6ea90"
         }
       ],
-      "closure_sha256": "7a8fa78f0d09eab25333a7e9d149aae5a4aadaae6ec4c92c45698112226729c9",
+      "closure_sha256": "ae2954b99819631dd92f2cfbf474a07b39bf58b85defd2d5231db09d96e2d4c6",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_m64_independent_value",
@@ -2732,10 +2728,9 @@
           "sha256": "a85d0f55e42deefa4284445623a3dac42a2304ac5d9654ed0e6d0d97bb056ce6"
         }
       ],
-      "closure_sha256": "5aa030fa74cddf7b54ddb96b87246ccad30572ea65d0308cc54b5bf92c6c153d",
+      "closure_sha256": "d9d348cc20363bbd65eb9338f431641b65b694dcd0f5b4fc35e8adf314ef48c4",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_vtile_generic",
@@ -2933,10 +2928,9 @@
           "sha256": "34f44a41c8ece3c4f7b03bb36b2bb718ccdcc3076320ba226e3c2fc102c5762c"
         }
       ],
-      "closure_sha256": "dbdbb65f4f5f60602d377d17244d70cc8ba395a4b476b8356bbbf60081f2770a",
+      "closure_sha256": "fe034c2739dc290572791b087b13aea504c66a7b32fc94d9e8770bcdbf5fcbec",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_vtile_h64",
@@ -3134,10 +3128,9 @@
           "sha256": "5918246faeff15bbdef7afed3e25e36d8a545a034bc7f33eba8585f43a9470f4"
         }
       ],
-      "closure_sha256": "2eb0141bc63206d16bc43b96040e2676376d2de3a89b9cb1045b3a6815da98ce",
+      "closure_sha256": "d68ec7a1ed37227ace0df372b09a8d8cc645807391464fae32ca192f41a484fb",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_vtile_h64_persistent",
@@ -3335,10 +3328,9 @@
           "sha256": "ca68ebedd337f557cabafbf9935fcb54deb9380910a6f133138ba32abe16a226"
         }
       ],
-      "closure_sha256": "a204f8a440db1bcc9fc1c9845b9f83a7cdbe4808a41cd5fec91f3582dcc56e90",
+      "closure_sha256": "5d28dec47f5f78b20eb6656331cd2e1961eed065b2f62ba2efc12e4a54610c56",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_vtile_h96_persistent_six",
@@ -6087,10 +6079,9 @@
           "sha256": "be36f6194287d344cef528e3dc8bfaa46a64e34785df3629b356cb0ff887675f"
         }
       ],
-      "closure_sha256": "c4c98a51905ab357424481392a76be85acf8dabf3672f8353d5c8d370f2f027e",
+      "closure_sha256": "5f2f5dcd6554273d0f5c537972f784a03423f32c0b9d8f0aba5186d0f8e6e26f",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_serving_scalar_chunk_lpt_m128_fp32",
@@ -7427,10 +7418,9 @@
           "sha256": "cfac16f42dc1b90b1698bd633b6a918f1451af63f2b5ae7e2678e5bffcf58513"
         }
       ],
-      "closure_sha256": "3889c39c76a751a524e4f0aecfd01535afb2006a175b6177e1706e658fa39ac7",
+      "closure_sha256": "e5328fa6d6ec301f83f21598d43b5c1e39e6977daff6323c289e941c1f3ae3f8",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_m128_generic",
@@ -7628,10 +7618,9 @@
           "sha256": "4973203fb14dd6189fa31bcfe7eec3a2455434f346f9b8d5c7d2c47c8189eae8"
         }
       ],
-      "closure_sha256": "b6e8bc610de1f60343c944fa889be6de21eca8a794b994bfbd0f5f23926de7ae",
+      "closure_sha256": "1cde23a535581c671498774a372d7f41bf46053f894d29b634f09d7ed9d3e362",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_m128_h64_persistent",
@@ -7829,10 +7818,9 @@
           "sha256": "31d8f9b44b4a79c07d32f883c4ddaccaacdd3d822b74ce1530d6d4aafbbc18de"
         }
       ],
-      "closure_sha256": "8a6f682547025a1ea6a1845b5b1c7544cb4ce97638c5e37ce40dd8def223f549",
+      "closure_sha256": "58a1d9bbf9028be34d56cfdf83e4af394238c880e97b811f1f1936ae291f5afc",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_m128_h96",
@@ -8018,10 +8006,9 @@
           "sha256": "4d0dbb17cca09b15b442ec81db68b7d142a48882fbf8fbbcb36a5fa937e6ea90"
         }
       ],
-      "closure_sha256": "dac10e70a7434344854b24ec4143d3868ac3cbd4df253dcdd0550aa2f36da404",
+      "closure_sha256": "9ef18c60c33099f75dd65c059312633b2489a6cfe7b5e582b10f4423c57c0b80",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_m64_independent_value",
@@ -8495,10 +8482,9 @@
           "sha256": "a85d0f55e42deefa4284445623a3dac42a2304ac5d9654ed0e6d0d97bb056ce6"
         }
       ],
-      "closure_sha256": "84bf7a22d0d172c075c6e4339ac4514a5987bf155dc76a58c49c6bfc90ab46b1",
+      "closure_sha256": "3386e04bc52cdab3b9c6c4f2d8bbbdae6dea271dfdd1b8e8c95ac2b5c7176a5a",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_vtile_generic",
@@ -8696,10 +8682,9 @@
           "sha256": "34f44a41c8ece3c4f7b03bb36b2bb718ccdcc3076320ba226e3c2fc102c5762c"
         }
       ],
-      "closure_sha256": "b4ee5e70a6aab86ef944e310e39a71a00db7eee24171fe33a8ef643ebc442eef",
+      "closure_sha256": "4792a77fa63ab819ad76e703bf0c082259a92bb65240614db6282e1f14e1ae5b",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_vtile_h64",
@@ -8897,10 +8882,9 @@
           "sha256": "5918246faeff15bbdef7afed3e25e36d8a545a034bc7f33eba8585f43a9470f4"
         }
       ],
-      "closure_sha256": "c263acf67d601b09e57c61a1e4d987ef2e210d3e3fb543963e7ca774f5847967",
+      "closure_sha256": "48eca3893c9e2744c011b3cd81215f3be05ab88c9d351901496a18904b832936",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_vtile_h64_persistent",
@@ -9098,10 +9082,9 @@
           "sha256": "ca68ebedd337f557cabafbf9935fcb54deb9380910a6f133138ba32abe16a226"
         }
       ],
-      "closure_sha256": "799708f6b45a27cc7812a3194b089c722e89285e277300c3c97ef727f3b6654c",
+      "closure_sha256": "58f13011d5467a0bd54fbd1afd74b308a8018585fcbd3443710a9fa638b453a6",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_prefill_vtile_h96_persistent_six",
@@ -11906,10 +11889,9 @@
           "sha256": "be36f6194287d344cef528e3dc8bfaa46a64e34785df3629b356cb0ff887675f"
         }
       ],
-      "closure_sha256": "89fbddebe5141fb0b1f5915cb4993102e663ca9cbe17ad95cfe22c2de7257a83",
+      "closure_sha256": "de958d65be86ec51cbff1941c0938ab5c533eb72cceb0d30767acffb4003af2f",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_serving_scalar_chunk_lpt_m128_fp32",
@@ -12327,10 +12309,9 @@
           "sha256": "0b4ad4d0686c0d981a07e2c0dbc2cb0d9647e68927ff3c4fcc9c967cea325110"
         }
       ],
-      "closure_sha256": "d471af210ceacaa78b8e4af844d07099e4623c40881ce521efe27fe3a2b87b7e",
+      "closure_sha256": "81b6c6f02be041cb0f4e553d82eef3a1e5f0c1dad9885c5716adc2e9e927ebbb",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_serving_vtile_m128_fp32",
@@ -12528,10 +12509,9 @@
           "sha256": "8fc8ca44936b622eb65a06d77692644bc1ddaac012e62d5cc513cc35ac04dbbb"
         }
       ],
-      "closure_sha256": "1d6fc1befbd1f8a0074dd0ea28a02c2ed3ef2bef8a857343bd8ca39668adbc62",
+      "closure_sha256": "9ebdb7f967760a85688fc618963ef7c965a6dec48c483c899ed01a0b5759a14b",
       "compile_flags": [
-        "--use_fast_math",
-        "--ptxas-options=-O1"
+        "--use_fast_math"
       ],
       "ffi_entry": "run",
       "kernel_symbol": "kernel_cake_kda_serving_vtile_m128_persistent_six_fp32",
