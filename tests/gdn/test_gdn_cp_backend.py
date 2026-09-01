@@ -453,6 +453,73 @@ def test_explicit_alpha_recomputes_requested_bf16_final_state(
     )
 
 
+def test_direct_recurrence_launches_forward_the_full_fixed64_abi() -> None:
+    prepared = object.__new__(gdn_cp.GDNCPPrefill)
+    prepared.plan = SimpleNamespace(
+        total_tokens=1,
+        num_q_heads=32,
+        num_k_heads=16,
+        num_v_heads=32,
+        num_sab_heads=32,
+        total_t_blocks=1,
+        total_cp_chunks=1,
+        num_seqs=2,
+        cp_chunk_len=64,
+        source_cp_chunk_len=64,
+        t_grid=(1, 1, 1),
+        cp_grid=(1, 1, 1),
+        fixup_grid=(1, 1, 1),
+    )
+    for name in (
+        "q",
+        "k",
+        "v",
+        "alpha",
+        "beta",
+        "cu_seqlens",
+        "initial_state",
+        "output_state_workspace",
+        "output",
+        "q_normalized",
+        "k_normalized",
+        "t",
+        "local_transfer",
+        "local_state",
+        "fixed_state",
+        "initial_state_workspace",
+        "tensormap_workspace",
+    ):
+        setattr(prepared, name, object())
+    prepared.scale = 0.125
+    prepared._recurrence_normalize_qk = 0
+    prepared._recurrence_use_block64_final_state = 1
+    prepared._qk_norm = None
+    prepared._gather = None
+    prepared._checkpoint = None
+    prepared._scatter = None
+    prepared._t = lambda *_args: None
+    prepared._mn = lambda *_args: None
+    prepared._fixup = lambda *_args: None
+    prepared._prefill = lambda *_args: None
+    recurrence_calls: dict[str, tuple[object, ...]] = {}
+    prepared._final_state_recurrence = lambda *args: recurrence_calls.__setitem__(
+        "final", args
+    )
+    prepared._output_recurrence = lambda *args: recurrence_calls.__setitem__(
+        "output", args
+    )
+
+    prepared._launch_direct()
+
+    final = recurrence_calls["final"]
+    output = recurrence_calls["output"]
+    assert len(final) == len(output) == 21
+    assert final[10:14] == (0, 0, 1, 1)
+    assert output[10:14] == (0, 1, 0, 0)
+    assert final[14:18] == output[14:18] == (32, 16, 32, 32)
+    assert final[18:] == output[18:] == (32, 2, 1)
+
+
 def test_public_gdn_cp_cache_reuses_equal_metadata_and_rebinds_tensor_addresses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
