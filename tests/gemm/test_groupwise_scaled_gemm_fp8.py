@@ -49,7 +49,7 @@ def test_fp8_blockscale_gemm(
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10, 11, 12]:
         pytest.skip(
-            "gemm_fp8_nt_blockscaled is only supported on SM100/103, SM110, and SM120/121 GPUs."
+            "gemm_fp8_nt_blockscaled is only supported on SM100/103/107, SM110, and SM120/121 GPUs."
         )
     torch.random.manual_seed(0)
     tile_size = 128
@@ -95,7 +95,7 @@ def test_fp8_groupwise_gemm(
     if backend == "trtllm":
         if compute_capability[0] != 10:
             pytest.skip(
-                "gemm_fp8_nt_groupwise is only supported on SM100, SM103 in trtllm backend."
+                "gemm_fp8_nt_groupwise is only supported on SM100, SM103, SM107 in trtllm backend."
             )
         if scale_major_mode != "MN":
             pytest.skip("trtllm only supports MN scale_major_mode")
@@ -103,7 +103,7 @@ def test_fp8_groupwise_gemm(
             pytest.skip("k < 256")
     if backend == "cutlass" and compute_capability[0] not in [10, 11, 12]:
         pytest.skip(
-            "gemm_fp8_nt_groupwise with cutlass backend is only supported on SM100/103, SM110, and SM120/121 GPUs."
+            "gemm_fp8_nt_groupwise with cutlass backend is only supported on SM100/103/107, SM110, and SM120/121 GPUs."
         )
     if backend == "cutile":
         if compute_capability[0] not in [10, 11, 12]:
@@ -224,7 +224,7 @@ def test_fp8_groupwise_group_gemm(
         )
     if compute_capability[0] not in [10, 12]:
         pytest.skip(
-            "group_gemm_fp8_nt_groupwise is only supported on SM100/103, and SM120/121 GPUs."
+            "group_gemm_fp8_nt_groupwise is only supported on SM100/103/107, and SM120/121 GPUs."
         )
     torch.random.manual_seed(0)
     tile_size = 128
@@ -285,7 +285,7 @@ def test_fp8_groupwise_group_deepgemm(
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip(
-            "group_deepgemm_fp8_nt_groupwise is only supported on SM100, SM103 in trtllm backend."
+            "group_deepgemm_fp8_nt_groupwise is only supported on SM100, SM103, SM107 in trtllm backend."
         )
     torch.random.manual_seed(0)
     m_per_group = m // group_size
@@ -333,7 +333,7 @@ def test_fp8_groupwise_batch_deepgemm_masked(
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] != 10:
         pytest.skip(
-            "batch_deepgemm_fp8_nt_groupwise is only supported on SM100, SM103."
+            "batch_deepgemm_fp8_nt_groupwise is only supported on SM100, SM103, SM107."
         )
     torch.random.manual_seed(0)
     n, k = nk

@@ -23,11 +23,14 @@ namespace flashinfer {
 
 using trtllm::invokeSageQuant;
 using trtllm::SageQuantParams;
+using tvm::ffi::Optional;
 
 void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, TensorView v_quant,
                                     TensorView q_scale, TensorView k_scale, TensorView v_scale,
                                     TensorView query, TensorView key, TensorView value,
-                                    int64_t q_block_size, int64_t k_block_size, int64_t sm_count) {
+                                    TensorView cum_seq_lens_q, TensorView cum_seq_lens_kv,
+                                    int64_t q_block_size, int64_t k_block_size, int64_t sm_count,
+                                    Optional<TensorView> maybe_k_mean, bool smooth_k) {
   TVM_FFI_ICHECK_EQ(query.ndim(), 3) << "query must have shape [tokens, heads, head_dim]";
   TVM_FFI_ICHECK_EQ(key.ndim(), 3) << "key must have shape [tokens, heads, head_dim]";
   TVM_FFI_ICHECK_EQ(value.ndim(), 3) << "value must have shape [tokens, heads, head_dim]";
@@ -48,6 +51,18 @@ void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, Tens
   TVM_FFI_ICHECK(is_contiguous_3d(query)) << "query must be contiguous";
   TVM_FFI_ICHECK(is_contiguous_3d(key)) << "key must be contiguous";
   TVM_FFI_ICHECK(is_contiguous_3d(value)) << "value must be contiguous";
+
+  TVM_FFI_ICHECK_EQ(cum_seq_lens_q.ndim(), 1) << "cum_seq_lens_q must be 1D";
+  TVM_FFI_ICHECK_EQ(cum_seq_lens_kv.ndim(), 1) << "cum_seq_lens_kv must be 1D";
+  TVM_FFI_ICHECK_EQ(cum_seq_lens_q.dtype(), dl_int32) << "cum_seq_lens_q must be int32";
+  TVM_FFI_ICHECK_EQ(cum_seq_lens_kv.dtype(), dl_int32) << "cum_seq_lens_kv must be int32";
+  TVM_FFI_ICHECK_EQ(cum_seq_lens_q.stride(0), 1) << "cum_seq_lens_q must be contiguous";
+  TVM_FFI_ICHECK_EQ(cum_seq_lens_kv.stride(0), 1) << "cum_seq_lens_kv must be contiguous";
+  TVM_FFI_ICHECK_EQ(cum_seq_lens_q.size(0), cum_seq_lens_kv.size(0))
+      << "Q and KV cumulative sequence lengths must have the same size";
+  TVM_FFI_ICHECK_GT(cum_seq_lens_q.size(0), 1)
+      << "cumulative sequence lengths must contain at least one sequence";
+  int64_t const batch_size = cum_seq_lens_q.size(0) - 1;
 
   TVM_FFI_ICHECK_EQ(q_quant.ndim(), 3);
   TVM_FFI_ICHECK_EQ(k_quant.ndim(), 3);
@@ -71,11 +86,23 @@ void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, Tens
   TVM_FFI_ICHECK_EQ(q_scale.dtype(), dl_float32);
   TVM_FFI_ICHECK_EQ(k_scale.dtype(), dl_float32);
   TVM_FFI_ICHECK_EQ(v_scale.dtype(), dl_float32);
-  TVM_FFI_ICHECK_EQ(q_scale.numel(),
-                    query.size(1) * ((query.size(0) + q_block_size - 1) / q_block_size));
-  TVM_FFI_ICHECK_EQ(k_scale.numel(),
-                    key.size(1) * ((key.size(0) + k_block_size - 1) / k_block_size));
+  TVM_FFI_ICHECK_EQ(
+      q_scale.numel(),
+      query.size(1) * ((query.size(0) + q_block_size - 1) / q_block_size + batch_size - 1));
+  TVM_FFI_ICHECK_EQ(
+      k_scale.numel(),
+      key.size(1) * ((key.size(0) + k_block_size - 1) / k_block_size + batch_size - 1));
   TVM_FFI_ICHECK_EQ(v_scale.numel(), value.size(1) * value.size(2));
+  if (smooth_k) {
+    TVM_FFI_ICHECK(maybe_k_mean.has_value()) << "k_mean is required when smooth_k is enabled";
+    auto const& k_mean = *maybe_k_mean;
+    TVM_FFI_ICHECK_EQ(k_mean.ndim(), 2) << "k_mean must have shape [heads, head_dim]";
+    TVM_FFI_ICHECK_EQ(k_mean.size(0), key.size(1));
+    TVM_FFI_ICHECK_EQ(k_mean.size(1), key.size(2));
+    TVM_FFI_ICHECK_EQ(k_mean.dtype(), dl_float32);
+    TVM_FFI_ICHECK_EQ(k_mean.stride(1), 1) << "k_mean must be contiguous";
+    TVM_FFI_ICHECK_EQ(k_mean.stride(0), k_mean.size(1)) << "k_mean must be contiguous";
+  }
   TVM_FFI_ICHECK_GT(sm_count, 0);
 
   ffi::CUDADeviceGuard device_guard(query.device().device_id);
@@ -83,6 +110,12 @@ void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, Tens
   auto const memset_status =
       cudaMemsetAsync(v_scale.data_ptr(), 0, v_scale.numel() * sizeof(float), stream);
   TVM_FFI_ICHECK_EQ(memset_status, cudaSuccess) << cudaGetErrorString(memset_status);
+  if (smooth_k) {
+    auto const& k_mean = *maybe_k_mean;
+    auto const memset_status_2 =
+        cudaMemsetAsync(k_mean.data_ptr(), 0, k_mean.numel() * sizeof(float), stream);
+    TVM_FFI_ICHECK_EQ(memset_status_2, cudaSuccess) << cudaGetErrorString(memset_status_2);
+  }
 
   SageQuantParams params{};
   params.headDim = query.size(2);
@@ -93,10 +126,15 @@ void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, Tens
   params.ptrV = value.data_ptr();
   params.ptrVQuant = v_quant.data_ptr();
   params.ptrVScale = static_cast<float*>(v_scale.data_ptr());
+  params.kSmooth = smooth_k;
+  params.ptrKForMean = smooth_k ? key.data_ptr() : nullptr;
+  params.ptrKMean = smooth_k ? static_cast<float*>((*maybe_k_mean).data_ptr()) : nullptr;
   params.smCount = sm_count;
   params.stream = stream;
 
   params.sumSeqLensQk = query.size(0);
+  params.batchSize = batch_size;
+  params.ptrCuSeqLensQk = static_cast<int const*>(cum_seq_lens_q.data_ptr());
   params.numHeads = query.size(1);
   params.tokenBlockSize = q_block_size;
   params.ptrQk = query.data_ptr();
@@ -106,6 +144,7 @@ void trtllm_sage_attention_quantize(TensorView q_quant, TensorView k_quant, Tens
   invokeSageQuant(params);
 
   params.sumSeqLensQk = key.size(0);
+  params.ptrCuSeqLensQk = static_cast<int const*>(cum_seq_lens_kv.data_ptr());
   params.numHeads = key.size(1);
   params.tokenBlockSize = k_block_size;
   params.ptrQk = key.data_ptr();

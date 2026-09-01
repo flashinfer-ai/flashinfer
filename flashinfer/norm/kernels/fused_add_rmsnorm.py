@@ -30,14 +30,14 @@ import torch
 from cutlass import Float32, Int32, Int64
 
 from ..utils import (
-    FLOAT8_E4M3_MAX,
     COPY_BITS,
+    get_fp8_max,
     rcp_approx_ftz,
-    cvt_and_store_f32_to_e4m3_hw,
-    cvt_and_store_f32_to_e4m3_sw,
-    cvt_and_store_8xf32_to_e4m3_hw,
-    cvt_and_store_4xf32_to_e4m3_hw,
-    cvt_and_store_2xf32_to_e4m3_hw,
+    cvt_and_store_f32_to_fp8_hw,
+    cvt_and_store_f32_to_fp8_sw,
+    cvt_and_store_8xf32_to_fp8_hw,
+    cvt_and_store_4xf32_to_fp8_hw,
+    cvt_and_store_2xf32_to_fp8_hw,
     has_hw_fp8_cvt,
     get_ptr_as_int64,
     get_sm_version,
@@ -426,7 +426,8 @@ class FusedAddRMSNormQuantKernel:
 
     Computes:
     1. residual = input + residual (in-place update)
-    2. output = clamp(residual / sqrt(mean(residual^2) + eps) * weight / scale, -448, 448)
+    2. output = residual / sqrt(mean(residual^2) + eps) * weight / scale,
+       clamped to the finite range of the FP8 output dtype (E4M3 or E5M2)
 
     """
 
@@ -737,6 +738,7 @@ class FusedAddRMSNormQuantKernel:
         # against M or used in the address arithmetic below.
         actual_row = Int64(bidx) * rows_per_block + row_in_block
         col_offset = lane_in_row * vec_size
+        fp8_max = get_fp8_max(mY.element_type)
 
         if cutlass.const_expr(self.use_hw_fp8 and vec_size == 8):
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -744,7 +746,7 @@ class FusedAddRMSNormQuantKernel:
                 abs_col = cluster_y * cols_per_tile + local_col
                 if abs_col + 8 <= H and actual_row < M:
                     base = v * 8
-                    cvt_and_store_8xf32_to_e4m3_hw(
+                    cvt_and_store_8xf32_to_fp8_hw(
                         tYrY_f32[base],
                         tYrY_f32[base + 1],
                         tYrY_f32[base + 2],
@@ -759,15 +761,16 @@ class FusedAddRMSNormQuantKernel:
                                 (Int64(actual_row), Int32(abs_col)), mY.layout
                             ),
                         ),
+                        mY.element_type,
                     )
                 else:
                     for e in cutlass.range_constexpr(vec_size):
                         abs_col_e = cluster_y * cols_per_tile + local_col + e
                         if abs_col_e < H and actual_row < M:
                             flat_idx = v * vec_size + e
-                            clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
-                            clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
-                            cvt_and_store_f32_to_e4m3_hw(
+                            clamped = max(tYrY_f32[flat_idx], Float32(-fp8_max))
+                            clamped = min(clamped, Float32(fp8_max))
+                            cvt_and_store_f32_to_fp8_hw(
                                 clamped,
                                 get_ptr_as_int64(
                                     mY,
@@ -776,6 +779,7 @@ class FusedAddRMSNormQuantKernel:
                                         mY.layout,
                                     ),
                                 ),
+                                mY.element_type,
                             )
         elif cutlass.const_expr(self.use_hw_fp8 and vec_size == 4):
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -783,7 +787,7 @@ class FusedAddRMSNormQuantKernel:
                 abs_col = cluster_y * cols_per_tile + local_col
                 if abs_col + 4 <= H and actual_row < M:
                     base = v * 4
-                    cvt_and_store_4xf32_to_e4m3_hw(
+                    cvt_and_store_4xf32_to_fp8_hw(
                         tYrY_f32[base],
                         tYrY_f32[base + 1],
                         tYrY_f32[base + 2],
@@ -794,15 +798,16 @@ class FusedAddRMSNormQuantKernel:
                                 (Int64(actual_row), Int32(abs_col)), mY.layout
                             ),
                         ),
+                        mY.element_type,
                     )
                 else:
                     for e in cutlass.range_constexpr(vec_size):
                         abs_col_e = cluster_y * cols_per_tile + local_col + e
                         if abs_col_e < H and actual_row < M:
                             flat_idx = v * vec_size + e
-                            clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
-                            clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
-                            cvt_and_store_f32_to_e4m3_hw(
+                            clamped = max(tYrY_f32[flat_idx], Float32(-fp8_max))
+                            clamped = min(clamped, Float32(fp8_max))
+                            cvt_and_store_f32_to_fp8_hw(
                                 clamped,
                                 get_ptr_as_int64(
                                     mY,
@@ -811,6 +816,7 @@ class FusedAddRMSNormQuantKernel:
                                         mY.layout,
                                     ),
                                 ),
+                                mY.element_type,
                             )
         elif cutlass.const_expr(self.use_hw_fp8 and vec_size == 2):
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -818,7 +824,7 @@ class FusedAddRMSNormQuantKernel:
                 abs_col = cluster_y * cols_per_tile + local_col
                 if abs_col + 2 <= H and actual_row < M:
                     base = v * 2
-                    cvt_and_store_2xf32_to_e4m3_hw(
+                    cvt_and_store_2xf32_to_fp8_hw(
                         tYrY_f32[base],
                         tYrY_f32[base + 1],
                         get_ptr_as_int64(
@@ -827,15 +833,16 @@ class FusedAddRMSNormQuantKernel:
                                 (Int64(actual_row), Int32(abs_col)), mY.layout
                             ),
                         ),
+                        mY.element_type,
                     )
                 else:
                     for e in cutlass.range_constexpr(vec_size):
                         abs_col_e = cluster_y * cols_per_tile + local_col + e
                         if abs_col_e < H and actual_row < M:
                             flat_idx = v * vec_size + e
-                            clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
-                            clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
-                            cvt_and_store_f32_to_e4m3_hw(
+                            clamped = max(tYrY_f32[flat_idx], Float32(-fp8_max))
+                            clamped = min(clamped, Float32(fp8_max))
+                            cvt_and_store_f32_to_fp8_hw(
                                 clamped,
                                 get_ptr_as_int64(
                                     mY,
@@ -844,6 +851,7 @@ class FusedAddRMSNormQuantKernel:
                                         mY.layout,
                                     ),
                                 ),
+                                mY.element_type,
                             )
         else:
             for v in cutlass.range_constexpr(num_vec_blocks):
@@ -852,8 +860,8 @@ class FusedAddRMSNormQuantKernel:
                     abs_col = cluster_y * cols_per_tile + local_col
                     if abs_col < H and actual_row < M:
                         flat_idx = v * vec_size + e
-                        clamped = max(tYrY_f32[flat_idx], Float32(-FLOAT8_E4M3_MAX))
-                        clamped = min(clamped, Float32(FLOAT8_E4M3_MAX))
+                        clamped = max(tYrY_f32[flat_idx], Float32(-fp8_max))
+                        clamped = min(clamped, Float32(fp8_max))
                         out_ptr = get_ptr_as_int64(
                             mY,
                             cute.crd2idx(
@@ -861,9 +869,13 @@ class FusedAddRMSNormQuantKernel:
                             ),
                         )
                         if self.use_hw_fp8:
-                            cvt_and_store_f32_to_e4m3_hw(clamped, out_ptr)
+                            cvt_and_store_f32_to_fp8_hw(
+                                clamped, out_ptr, mY.element_type
+                            )
                         else:
-                            cvt_and_store_f32_to_e4m3_sw(clamped, out_ptr)
+                            cvt_and_store_f32_to_fp8_sw(
+                                clamped, out_ptr, mY.element_type
+                            )
 
         # PDL: Signal dependent kernels (SM90+ only)
         if enable_pdl:

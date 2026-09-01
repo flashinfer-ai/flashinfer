@@ -73,24 +73,33 @@ _BI = 64  # KV partition tile size in candidates (BLOCK_SIZE_N)
 # prefill orchestrator; otherwise to the standalone decode kernels.
 _DECODE_MAX_TOKENS = 64
 
-# decode-dsv4 instantiation set. Shapes outside this table fall through to
-# decode-dsv3_2 / prefill. NH=8 is the small-TP corner case; the kernel pads
-# the head tile to HPB=16 with zero-Q rows and gates writes by NUM_HEADS.
+# decode-dsv4 instantiation set. NH=8 is the small-TP corner case; the kernel
+# pads the head tile to HPB=16 with zero-Q rows and gates writes by NUM_HEADS.
 _DECODE_DSV4_DISPATCH = frozenset(
     {
         (8, 128),
+        (8, 192),
+        (8, 256),
         (8, 512),
         (8, 1024),
         (16, 128),
+        (16, 192),
+        (16, 256),
         (16, 512),
         (16, 1024),
         (32, 128),
+        (32, 192),
+        (32, 256),
         (32, 512),
         (32, 1024),
         (64, 128),
+        (64, 192),
+        (64, 256),
         (64, 512),
         (64, 1024),
         (128, 128),
+        (128, 192),
+        (128, 256),
         (128, 512),
         (128, 1024),
     }
@@ -376,6 +385,19 @@ def get_sparse_mla_sm120_module():
                 model_type=model_type,
             )
             return
+
+        # The paged orchestrator is prefill-only and asserts num_tokens > 64 in
+        # C++. Reaching it with a decode-sized request means that no standalone
+        # decode specialization matched, so fail in Python instead of aborting
+        # the process in the kernel.
+        if num_tokens <= _DECODE_MAX_TOKENS:
+            raise ValueError(
+                "SM120 sparse-MLA has no decode kernel for this shape: "
+                f"num_tokens={num_tokens}, num_heads={num_heads}, topk={topk}, "
+                f"d_qk={d_qk}, page_block_size={kv_pbs}, model_type={model_type}, "
+                f"extra_topk={extra_topk}. Supported decode shapes are enumerated "
+                "in _DECODE_DSV4_DISPATCH and _DECODE_DSV3_2_DISPATCH."
+            )
 
         module.sparse_mla_sm120_paged_attention(
             q,
@@ -949,14 +971,14 @@ def _decode_dsv4_tuning_config() -> TuningConfig:
                 dim_idx=(0, 0, 0, 0, 0),
                 gen_tuning_buckets=_decode_dsv4_num_token_buckets,
                 map_to_tuning_buckets=_decode_dsv4_map_to_token_bucket,
-                tensor_initializers=[
-                    _decode_dsv4_init_q,
-                    _decode_dsv4_init_indices,
-                    _decode_dsv4_init_topk_length,
-                    _decode_dsv4_init_indices,
-                    _decode_dsv4_init_topk_length,
-                ],
             ),
+        ),
+        tensor_initializers=(
+            (0, _decode_dsv4_init_q),
+            (1, _decode_dsv4_init_indices),
+            (6, _decode_dsv4_init_topk_length),
+            (8, _decode_dsv4_init_indices),
+            (9, _decode_dsv4_init_topk_length),
         ),
         inputs_pre_hook=_decode_dsv4_inputs_pre_hook,
         # Constrain T (dim 0) of all output/scratch tensors to q's T so the
@@ -981,12 +1003,12 @@ def _decode_dsv3_2_tuning_config() -> TuningConfig:
                 dim_idx=(0, 0, 0),
                 gen_tuning_buckets=_decode_dsv4_num_token_buckets,
                 map_to_tuning_buckets=_decode_dsv4_map_to_token_bucket,
-                tensor_initializers=[
-                    _decode_dsv4_init_q,
-                    _decode_dsv4_init_indices,
-                    _decode_dsv4_init_topk_length,
-                ],
             ),
+        ),
+        tensor_initializers=(
+            (0, _decode_dsv4_init_q),
+            (1, _decode_dsv4_init_indices),
+            (6, _decode_dsv4_init_topk_length),
         ),
         inputs_pre_hook=_decode_dsv4_inputs_pre_hook,
         # Constrain T (dim 0) of all output/scratch tensors to q's T so the
@@ -1228,8 +1250,8 @@ def sparse_mla_sm120_decode_dsv4(
     kv_cache : torch.Tensor
         Paged FP8 cache, shape ``[num_blocks, page_bytes]`` uint8.
     indices : torch.Tensor
-        ``[T, topk]`` int32. ``topk`` must be one of {128, 512, 1024}; ``-1``
-        marks invalid slots.
+        ``[T, topk]`` int32. ``topk`` must be one of
+        {128, 192, 256, 512, 1024}; ``-1`` marks invalid slots.
     mid_out : torch.Tensor
         Scratch, ``[T, num_heads, num_splits, d_v]`` bf16. ``num_splits =
         ceil(topk / 64) + ceil(extra_topk / 64)``.

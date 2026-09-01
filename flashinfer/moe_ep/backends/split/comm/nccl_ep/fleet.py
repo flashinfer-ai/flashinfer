@@ -10,10 +10,11 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import logging
+import warnings
 from typing import TYPE_CHECKING, Sequence
 
 from ..... import _require_built
-from .....errors import MoEEpNotBuiltError
+from .....errors import MoEEpFaultToleranceUnsupportedError, MoEEpNotBuiltError
 from .....core.validation.common import (
     validate_arch_for_backend,
     validate_bootstrap_world_size,
@@ -22,14 +23,23 @@ from .....core.validation.common import (
 from .....algo_knobs import (
     AlgoKnob,
     FleetAlgoKnobAllocator,
+    FleetAlgoKnobFaultTolerance,
     FleetAlgoKnobNumChannelsPerRank,
     FleetAlgoKnobNumQpsPerRank,
     FleetAlgoKnobQuantization,
     FleetAlgoKnobRdmaBufferSize,
     _index_knobs,
 )
-from .....config import EpAlgorithm, FleetParams
+from .....config import EpAlgorithm, EpLayout, FleetParams
+from .....core.bootstrap_utils import resolve_rendezvous_store
 from .....core.comm.fleet import Fleet, _BACKEND_REGISTRY
+from .....core.comm.fault_tolerance import (
+    ACTIVE,
+    MASKED,
+    FaultToleranceMixin,
+    reject_graph_capture as _reject_graph_capture_impl,
+)
+from ._mask_ffi import mask_ffi
 
 if TYPE_CHECKING:
     from .....config import BootstrapConfig
@@ -139,7 +149,7 @@ def _map_algorithm(algo: EpAlgorithm):
     }[algo]
 
 
-class NcclEpFleet(Fleet):
+class NcclEpFleet(FaultToleranceMixin, Fleet):
     """Owns the ``nccl.ep.Group`` lifecycle for one process."""
 
     def __init__(
@@ -158,16 +168,24 @@ class NcclEpFleet(Fleet):
         params = _clamp_ht_max_tokens(params)
         self._params = params
         self._fleet_knobs = _index_knobs(algo_knobs)
+        ft = self._fleet_knobs.get(FleetAlgoKnobFaultTolerance)
+        self._ft = ft if (ft is not None and ft.enabled) else None  # type: ignore[attr-defined]
         validate_fleet_params(
             params,
             backend="nccl_ep",
             world_size=bootstrap.world_size,
             quant=self._fleet_knobs.get(FleetAlgoKnobQuantization),  # type: ignore[arg-type]
+            fault_tolerance=self._ft,  # type: ignore[arg-type]
         )
         self._bootstrap = bootstrap
         self._stream = bootstrap.stream
         self._nccl_ep = _import_nccl_ep()
         self._comm = _resolve_comm(bootstrap)
+        self._ft_epoch = 0
+        self._ft_store_obj = None
+        self._any_handle_created = False
+        if self._ft is not None:
+            self._check_ft_supported()
 
         # Cross-handle host-path cache (recv buffers, counter tensors, FFI
         # descriptor memos), populated and consumed by NcclEpHandle. Anchored on
@@ -200,6 +218,12 @@ class NcclEpFleet(Fleet):
         alloc = self._build_alloc_config()
         if alloc is not None:
             kwargs["alloc"] = alloc
+        if self._ft is not None:
+            # Allocates the per-rank mask buffer + the pinned async-error flag
+            # inside ncclEpCreateGroup. Without it a peer timeout trap()s.
+            kwargs["enable_mask"] = True
+            if self._ft.timeout_ms:  # type: ignore[attr-defined]
+                kwargs["timeout_ns"] = int(self._ft.timeout_ms) * 1_000_000  # type: ignore[attr-defined]
         return self._nccl_ep.GroupConfig(**kwargs)
 
     def _build_alloc_config(self):
@@ -268,7 +292,172 @@ class NcclEpFleet(Fleet):
     ) -> "Handle":
         from .handle import NcclEpHandle
 
+        self._any_handle_created = True
         return NcclEpHandle(self, params, algo_knobs)
+
+    # ------------------------------------------------------- fault tolerance
+
+    def _check_ft_supported(self) -> None:
+        """Fail at construction, not at first fault, when FT can't work here."""
+        try:
+            names = {f.name for f in dataclasses.fields(self._nccl_ep.GroupConfig)}
+        except TypeError:
+            # Not introspectable (e.g. the test fake); nothing to assert, and
+            # an unknown kwarg would surface as a plain TypeError anyway.
+            names = None
+        if names is not None and "enable_mask" not in names:
+            raise MoEEpFaultToleranceUnsupportedError(
+                "nccl.ep.GroupConfig has no `enable_mask` field: the installed "
+                "nccl4py predates EP fault tolerance. Upgrade the nccl4py wheel, "
+                "or drop FleetAlgoKnobFaultTolerance."
+            )
+        ffi = mask_ffi()
+        if not ffi.available:
+            raise MoEEpFaultToleranceUnsupportedError(
+                "the loaded libnccl_ep does not export "
+                f"{', '.join(ffi.missing)}; fault tolerance needs an NCCL-EP "
+                "build carrying the ncclEpMask* API. Check "
+                "flashinfer.moe_ep.supports_fault_tolerance('nccl_ep') before "
+                "passing FleetAlgoKnobFaultTolerance."
+            )
+
+    def _require_ft(self, op: str):
+        if self._ft is None:
+            self._no_fault_tolerance(op)
+        return self._ft
+
+    @staticmethod
+    def _reject_graph_capture(op: str) -> None:
+        _reject_graph_capture_impl(op)
+
+    def _current_stream(self) -> int:
+        if self._stream:
+            return self._stream
+        import torch
+
+        return torch.cuda.current_stream().cuda_stream
+
+    def _ft_bufs(self):
+        """(device Query dst, pinned host Update src), Fleet-owned.
+
+        ncclEpMaskQuery writes to DEVICE memory while ncclEpMaskUpdate reads
+        from HOST memory, so the two directions need different staging. The
+        host side is PINNED because Update is stream-ordered: if the library
+        defers the H2D onto the stream, a pageable buffer we mutate on the
+        next call is a use-after-write race. Anchored on _hot_cache, which
+        update_topology already clears, so the buffers resize with the world.
+        """
+        import torch
+
+        n = self._bootstrap.world_size
+        bufs = self._hot_cache.get("ft_bufs")
+        if bufs is None or bufs[0].numel() != n:
+            bufs = (
+                torch.empty(n, dtype=torch.int32, device="cuda"),
+                torch.empty(n, dtype=torch.int32, pin_memory=True),
+            )
+            self._hot_cache["ft_bufs"] = bufs
+        return bufs
+
+    def _normalize_mask(self, mask) -> list[int]:
+        import torch
+
+        if isinstance(mask, torch.Tensor):
+            values = [int(v) for v in mask.detach().cpu().flatten().tolist()]
+        else:
+            values = [int(v) for v in mask]
+        n = self._bootstrap.world_size
+        if len(values) != n:
+            raise ValueError(f"mask has {len(values)} entries, expected {n}")
+        out = [ACTIVE if v == ACTIVE else MASKED for v in values]
+        if out[self._bootstrap.rank] != ACTIVE:
+            raise ValueError(
+                f"rank {self._bootstrap.rank} cannot mask itself (mask[rank] must be 1)"
+            )
+        return out
+
+    def _ft_store(self):
+        if self._ft_store_obj is None:
+            self._ft_store_obj = resolve_rendezvous_store(
+                self._bootstrap, subsystem="ft"
+            )
+        return self._ft_store_obj
+
+    def _ft_knob(self):
+        return self._ft
+
+    @property
+    def supports_fault_tolerance(self) -> bool:
+        return self._ft is not None
+
+    @property
+    def active_mask_epoch(self) -> int:
+        return self._ft_epoch
+
+    def query_active_mask(self, out=None):
+        self._require_ft("query_active_mask")
+        self._reject_graph_capture("query_active_mask")
+        dev, _ = self._ft_bufs()
+        # NCCL's polarity is already ours: 1 = active.
+        mask_ffi().mask_query(self._group, dev.data_ptr(), self._current_stream())
+        return dev if out is None else out.copy_(dev)
+
+    def query_fault(self) -> bool:
+        self._require_ft("query_fault")
+        # Pinned host flag: no stream, no sync, free to poll every step.
+        #
+        # Guarded against capture precisely BECAUSE it is a host read: it is
+        # not stream work, so it cannot be captured at all. Called inside a
+        # capture region it would return the capture-time value, and the
+        # branch taken on it would be baked into the graph's structure
+        # forever -- a graph that ignores faults because none existed when it
+        # was recorded. That is a quieter failure than the stream-ordered
+        # calls below, which is exactly why it needs the guard.
+        self._reject_graph_capture("query_fault")
+        return mask_ffi().get_async_error(self._group)
+
+    def set_active_mask(self, mask) -> None:
+        self._require_ft("set_active_mask")
+        self._reject_graph_capture("set_active_mask")
+        _, host = self._ft_bufs()
+        import torch
+
+        host.copy_(torch.tensor(self._normalize_mask(mask), dtype=torch.int32))
+        mask_ffi().mask_update(self._group, host.data_ptr(), self._current_stream())
+        self._ft_epoch += 1
+
+    def clear_faults(self, *, readmit: bool = False) -> None:
+        self._require_ft("clear_faults")
+        if readmit:
+            self._reject_graph_capture("clear_faults")
+            if not self._any_handle_created:
+                # ncclEpMaskClean asserts rdma_buffer != nullptr, which is only
+                # allocated by the first handle; calling it earlier aborts the
+                # process from C. Fail in Python instead.
+                raise RuntimeError(
+                    "clear_faults(readmit=True) requires at least one handle to "
+                    "have been created on this Fleet (ncclEpMaskClean asserts on "
+                    "the LL staging buffer, which the first create_handle "
+                    "allocates). Run a forward first, or use readmit=False."
+                )
+            if self._params.layout is EpLayout.EXPERT_MAJOR:
+                warnings.warn(
+                    "nccl_ep: ncclEpMaskClean computes its buffer-reset offsets "
+                    "assuming the RANK_MAJOR layout, but this Fleet is "
+                    "EXPERT_MAJOR, so re-admission may leave stale bytes in the "
+                    "LL staging buffer. Prefer degraded serving "
+                    "(readmit=False), or rebuild the group via "
+                    "update_topology().",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            # COLLECTIVE over survivors; internally cudaStreamSynchronize's.
+            mask_ffi().mask_clean(self._group, self._current_stream())
+            self._ft_epoch += 1
+        # MaskClean deliberately does NOT clear the async flag, so always pair
+        # them: that is why readmit is a flag rather than a separate method a
+        # caller could mis-sequence.
+        mask_ffi().error_clear(self._group)
 
     def update_topology(
         self,

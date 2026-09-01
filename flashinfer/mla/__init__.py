@@ -13,3 +13,27 @@
 # limitations under the License.
 
 from ._core import *  # noqa: F401,F403
+
+
+_PRIMS_TS_LAZY_EXPORTS = frozenset(
+    {
+        "get_prims_ts_batch_decode_mla_workspace_size",
+        "prims_ts_batch_decode_with_kv_cache_mla",
+    }
+)
+
+
+def __getattr__(name: str):
+    """Resolve PrimTS MLA APIs without loading their runtime at import."""
+
+    if name in _PRIMS_TS_LAZY_EXPORTS:
+        from ..attention.prims_ts import mla_decode as prims_ts_mla_decode
+
+        value = getattr(prims_ts_mla_decode, name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__():
+    return sorted(set(globals()) | _PRIMS_TS_LAZY_EXPORTS)

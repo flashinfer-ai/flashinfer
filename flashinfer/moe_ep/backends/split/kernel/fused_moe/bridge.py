@@ -32,15 +32,52 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 if TYPE_CHECKING:
-    from ......fused_moe.api import MoEActivationPack
+    from flashinfer.fused_moe.api import MoEActivationPack, QuantVariant
+
+
+_NCCL_EP_LL_BF16_WIDTHS = (2048, 2560, 4096, 5120, 6144, 7168, 8192)
+
+
+def packed_mxfp8_dispatch_width(hidden: int) -> int:
+    """Return the smallest supported BF16 row that holds MXFP8 data + scales."""
+    if hidden % 64:
+        raise ValueError(f"mxfp8_dispatch requires hidden % 64 == 0, got {hidden}")
+    need = (hidden + hidden // 32) // 2
+    for width in _NCCL_EP_LL_BF16_WIDTHS:
+        if width >= need:
+            return width
+    raise ValueError(f"packed MXFP8 row for hidden={hidden} is too large")
+
+
+def pack_mxfp8_dispatch_payload(x: torch.Tensor) -> torch.Tensor:
+    """Pack per-token MXFP8 values and linear scale bytes into BF16 rows."""
+    if x.dim() != 2 or x.dtype != torch.bfloat16:
+        raise ValueError(
+            "mxfp8_dispatch expects 2D BF16 [num_tokens, hidden] tokens, "
+            f"got {x.dtype} shape {tuple(x.shape)}"
+        )
+    from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+
+    m, hidden = x.shape
+    send_width = packed_mxfp8_dispatch_width(hidden)
+    q, sf = mxfp8_quantize(x.contiguous(), is_sf_swizzled_layout=False)
+    packed = torch.zeros(m, 2 * send_width, dtype=torch.uint8, device=x.device)
+    packed[:, :hidden] = q.view(torch.uint8)
+    packed[:, hidden : hidden + hidden // 32] = sf.view(torch.uint8).reshape(
+        m, hidden // 32
+    )
+    return packed.view(torch.bfloat16)
 
 
 def build_activation_pack(
     expert_tensors: torch.Tensor,
     *,
     local_expert_offset: int = 0,
-    is_nvfp4: bool,
+    quant_variant: "QuantVariant",
+    per_token_activation: bool = False,
     global_scale: Optional[torch.Tensor] = None,
+    mxfp8_dispatch: bool = False,
+    hidden_size: Optional[int] = None,
 ) -> "MoEActivationPack":
     """Translate the 3D expert-major dispatch output into a token-major pack.
 
@@ -52,11 +89,11 @@ def build_activation_pack(
         Global id of this rank's first local expert.  Synthesized expert ids are
         ``(row // cap) + local_expert_offset``; the compute runner subtracts the same
         offset, so the two must agree (they share one :class:`MoEConfig`).
-    is_nvfp4 : bool
-        When True, quantize the flattened activations to NVFP4 (``hidden_states_q`` +
-        ``hidden_states_scale``).  When False (bf16 path), the raw bf16 activations are
-        carried in ``hidden_states_q`` and ``hidden_states_scale`` is a 0-d placeholder
-        (the bf16 runner ignores it).
+    quant_variant : QuantVariant
+        Activation and weight quantization contract. NVFP4 quantizes the
+        dispatched BF16 activations; BF16 and W4A16 carry them unchanged.
+    per_token_activation : bool
+        Use per-token NVFP4 activation scaling when quantizing the input.
     global_scale : torch.Tensor, optional
         Per-tensor global scale for NVFP4 quantization (shape ``[1]``, float32).
     """
@@ -82,8 +119,11 @@ def build_activation_pack(
         flat,
         selected_experts,
         final_scales,
-        is_nvfp4=is_nvfp4,
+        quant_variant=quant_variant,
+        per_token_activation=per_token_activation,
         global_scale=global_scale,
+        mxfp8_dispatch=mxfp8_dispatch,
+        hidden_size=hidden_size,
     )
 
 
@@ -94,8 +134,11 @@ def build_activation_pack_rank_major(
     *,
     num_local_experts: int,
     local_expert_offset: int = 0,
-    is_nvfp4: bool,
+    quant_variant: "QuantVariant",
+    per_token_activation: bool = False,
     global_scale: Optional[torch.Tensor] = None,
+    mxfp8_dispatch: bool = False,
+    hidden_size: Optional[int] = None,
 ) -> "MoEActivationPack":
     """Translate the 3D RANK_MAJOR dispatch output into a token-major pack.
 
@@ -130,7 +173,7 @@ def build_activation_pack_rank_major(
         Number of experts this rank owns (carried for API symmetry / validation).
     local_expert_offset : int
         Global id of this rank's first local expert (see EXPERT_MAJOR builder).
-    is_nvfp4, global_scale :
+    quant_variant, per_token_activation, global_scale :
         Same semantics as :func:`build_activation_pack`.
     """
     if recv_tensors.dim() != 3:
@@ -175,8 +218,11 @@ def build_activation_pack_rank_major(
         flat,
         selected_experts,
         final_scales,
-        is_nvfp4=is_nvfp4,
+        quant_variant=quant_variant,
+        per_token_activation=per_token_activation,
         global_scale=global_scale,
+        mxfp8_dispatch=mxfp8_dispatch,
+        hidden_size=hidden_size,
     )
 
 
@@ -185,19 +231,28 @@ def _quantize_and_pack(
     selected_experts: torch.Tensor,
     final_scales: torch.Tensor,
     *,
-    is_nvfp4: bool,
+    quant_variant: "QuantVariant",
+    per_token_activation: bool,
     global_scale: Optional[torch.Tensor],
+    mxfp8_dispatch: bool,
+    hidden_size: Optional[int],
 ) -> "MoEActivationPack":
-    """Quantize ``flat`` (NVFP4) or pass it through (bf16) and assemble the pack.
+    """Prepare ``flat`` for the configured activation path and assemble the pack.
 
     Shared by the EXPERT_MAJOR and RANK_MAJOR builders, which differ only in how
     ``selected_experts`` / ``final_scales`` are synthesized.
     """
-    from ......fused_moe.api import MoEActivationPack
+    from flashinfer.fused_moe.api import MoEActivationPack, QuantVariant
 
     device = flat.device
-    if is_nvfp4:
-        from ......quantization.fp4_quantization import fp4_quantize
+    per_token_scale = None
+    if per_token_activation and quant_variant is not QuantVariant.NVFP4:
+        raise ValueError("per-token activation scaling requires QuantVariant.NVFP4")
+    if quant_variant is QuantVariant.NVFP4:
+        from flashinfer.quantization.fp4_quantization import (
+            fp4_quantize,
+            nvfp4_quantize,
+        )
 
         if global_scale is None:
             # NVFP4 requires a global scale (fp4Quantize asserts it is set when
@@ -210,25 +265,75 @@ def _quantize_and_pack(
         # False), matching the runners' expectation (see create_moe_tensors in
         # tests/moe/test_b12x_fused_moe.py).  The default swizzled layout makes
         # the kernel index the scale tensor out of bounds → illegal memory access.
-        hidden_states_q, hidden_states_scale = fp4_quantize(
-            flat,
-            global_scale=global_scale,
-            sf_vec_size=16,
-            is_sf_swizzled_layout=False,
-        )
+        if per_token_activation:
+            from flashinfer.quantization.nvfp4_quantization_utils import (
+                current_nvfp4_4over6_config,
+                make_nvfp4_global_scale,
+            )
+            from flashinfer.tllm_enums import SfLayout
+
+            global_scale = make_nvfp4_global_scale(
+                flat,
+                per_token_activation=True,
+                nvfp4_4over6_config=current_nvfp4_4over6_config(),
+            )
+            hidden_states_q, hidden_states_scale, per_token_scale = nvfp4_quantize(
+                flat,
+                global_scale,
+                sfLayout=SfLayout.layout_linear,
+                per_token_activation=True,
+                backend="cute-dsl",
+            )
+        else:
+            hidden_states_q, hidden_states_scale = fp4_quantize(
+                flat,
+                global_scale=global_scale,
+                sf_vec_size=16,
+                is_sf_swizzled_layout=False,
+                backend="cute-dsl",
+            )
         # Runners expect a 2D [M, H//16] scale; fp4_quantize may return a trailing dim.
         if hidden_states_scale.dim() > 2:
             hidden_states_scale = hidden_states_scale.squeeze(-1)
-    else:
-        # bf16 path: carry the raw activations; the bf16 runner reads them directly.
+    elif quant_variant is QuantVariant.MXFP4:
+        from flashinfer.quantization.fp8_quantization import mxfp8_quantize
+
+        if mxfp8_dispatch:
+            if hidden_size is None:
+                raise ValueError("mxfp8_dispatch requires the logical hidden size")
+            send_width = packed_mxfp8_dispatch_width(hidden_size)
+            if flat.dtype != torch.bfloat16 or flat.shape[1] != send_width:
+                raise ValueError(
+                    f"packed MXFP8 input must be BF16 width {send_width}, got "
+                    f"{flat.dtype} width {flat.shape[1]}"
+                )
+            packed = flat.contiguous().view(torch.uint8)
+            hidden_states_q = (
+                packed[:, :hidden_size].contiguous().view(torch.float8_e4m3fn)
+            )
+            hidden_states_scale = packed[
+                :, hidden_size : hidden_size + hidden_size // 32
+            ].contiguous()
+        else:
+            hidden_states_q, hidden_states_scale = mxfp8_quantize(
+                flat.contiguous(), is_sf_swizzled_layout=False
+            )
+            hidden_states_scale = hidden_states_scale.view(torch.uint8).reshape(
+                flat.shape[0], flat.shape[1] // 32
+            )
+    elif quant_variant in (QuantVariant.BF16, QuantVariant.W4A16):
+        # BF16 and W4A16 runners consume the dispatched activations directly.
         hidden_states_q = flat
-        hidden_states_scale = torch.empty(0, device=device)
+        hidden_states_scale = None
+    else:
+        raise ValueError(f"fused_moe split bridge does not support {quant_variant!r}")
 
     return MoEActivationPack(
         hidden_states_q=hidden_states_q,
         hidden_states_scale=hidden_states_scale,
         topk_ids=selected_experts,
         topk_weights=final_scales,
+        per_token_scale=per_token_scale,
     )
 
 

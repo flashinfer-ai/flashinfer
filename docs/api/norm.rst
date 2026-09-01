@@ -14,6 +14,7 @@ Kernels for normalization layers.
     rmsnorm_quant
     fused_add_rmsnorm
     fused_add_rmsnorm_quant
+    fused_add_rmsnorm_fp8_block_quant
     gemma_rmsnorm
     gemma_fused_add_rmsnorm
     layernorm

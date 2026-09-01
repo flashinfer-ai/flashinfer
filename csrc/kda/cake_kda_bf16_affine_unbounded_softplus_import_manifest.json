@@ -1,0 +1,257 @@
+{
+  "contract": {
+    "batch_size": 1,
+    "beta_layout": "contiguous",
+    "checkpoint_mode": "none",
+    "dtype": "bfloat16",
+    "gate_kind": "unbounded_softplus",
+    "head_dim": 128,
+    "head_relationship": "equal_q_kv",
+    "initial_state": "indexed_bfloat16_pool",
+    "max_local_heads": 32,
+    "min_parts": 2,
+    "min_tokens": 8192,
+    "state_publication": "final_only",
+    "targets": [
+      "sm100a",
+      "sm103a"
+    ],
+    "token_multiple": 32
+  },
+  "modules": [
+    {
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_path": "csrc/kda/cake_kda_affine_unbounded_softplus_main_binding.cu",
+      "binding_sha256": "823623fc770b4cdb8559dad9cf6fd9380c276fa67b6098f74c7af564a0e0029e",
+      "kernel_symbol": "kernel_cake_kda_affine_unbounded_softplus_main",
+      "module_ident": "cake_kda_affine_unbounded_softplus_main_c688902d93",
+      "role": "main",
+      "smem_bytes": 227968,
+      "source_exported_bytes": 240700,
+      "source_exported_sha256": "8eb08b00f4bd423abef81373d07c454a5467da34f666221a99940701f67143c1",
+      "source_raw_sha256": "fc27967552cfe46de38fb8fba092fa383e663fb8b72023e867b0518eb6ce8e16",
+      "sources": [
+        {
+          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_main.cu",
+          "sha256": "5759f558c615777e641d7aa70bc7eec2b619b24e2910d29f0f21d5e63a745def"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_direct_m128_binding.cuh",
+          "sha256": "7b3fbd7b654384d5647802a3a92b10b40e1be4a1985859507feb3590f4a912bc"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_binding_common.cuh",
+          "sha256": "5031de2fb488cb0ca7753c20f8ad9103d9840afd4c1bab731c9675f458fbb276"
+        }
+      ],
+      "target": "sm100a",
+      "threads": 1024,
+      "use_pdl": false
+    },
+    {
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_path": "csrc/kda/cake_kda_affine_unbounded_softplus_map_binding.cu",
+      "binding_sha256": "e6fa1b4389f9d04576c2ce5f642a73c10e7e5a2f6aaa141979784b6b96de707c",
+      "kernel_symbol": "kernel_cake_kda_affine_unbounded_softplus_map",
+      "module_ident": "cake_kda_affine_unbounded_softplus_map_28be59c65a",
+      "role": "map",
+      "smem_bytes": 227968,
+      "source_exported_bytes": 242083,
+      "source_exported_sha256": "311cb37965bdf741b842277415b5a9de443bd09a4780893959e11ab50006ec4a",
+      "source_raw_sha256": "f6673ef95a651670d0a95ab6f245d355404380a7b51f6686416bb6b68607e597",
+      "sources": [
+        {
+          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_map.cu",
+          "sha256": "86e76c845a5042a10ff50c4cea16ca22f5809817ebc9ebe28a2c0a5a4b2514f0"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_direct_m128_binding.cuh",
+          "sha256": "7b3fbd7b654384d5647802a3a92b10b40e1be4a1985859507feb3590f4a912bc"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_binding_common.cuh",
+          "sha256": "5031de2fb488cb0ca7753c20f8ad9103d9840afd4c1bab731c9675f458fbb276"
+        }
+      ],
+      "target": "sm100a",
+      "threads": 1024,
+      "use_pdl": true
+    },
+    {
+      "arg_plan_sha256": "a9a2d480c8bfe74cc155384a93039ad82c481c5e00f4f40b800b367aa388474b",
+      "binding_path": "csrc/kda/cake_kda_affine_unbounded_softplus_scan_binding.cu",
+      "binding_sha256": "b44fc516cd304ab8c25b37d75def961c842b0afa458d553746e76ef98f217929",
+      "kernel_symbol": "kernel_cake_kda_affine_unbounded_softplus_scan",
+      "module_ident": "cake_kda_affine_unbounded_softplus_scan_64d45a4187",
+      "role": "scan",
+      "smem_bytes": 66560,
+      "source_exported_bytes": 11493,
+      "source_exported_sha256": "3019a49c8942eff1997d52762ed72c2c789ef21039cdf2a6d1e3a03b1ca86b68",
+      "source_raw_sha256": "d9368c97d5492d187fb705973b15c63f8bbc803a0dbfafe05364f6471e3d8074",
+      "sources": [
+        {
+          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_scan.cu",
+          "sha256": "79ce0bdfabb9ae1563371a7cca1e0953a1e865d34cadd584b5a8defcfe292b17"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_scan_binding.cuh",
+          "sha256": "64a958845b3c0bc4e2dee26ec58c6bb7f7228065e4f8c1b0b6374976875fe751"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_binding_common.cuh",
+          "sha256": "5031de2fb488cb0ca7753c20f8ad9103d9840afd4c1bab731c9675f458fbb276"
+        }
+      ],
+      "target": "sm100a",
+      "threads": 128,
+      "use_pdl": true
+    },
+    {
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction_binding.cu",
+      "binding_sha256": "322e28c0de03bed017ac9ef3f88f9d302fbc3ed4a84392d86635b13e1aacf4c3",
+      "kernel_symbol": "kernel_cake_kda_affine_unbounded_softplus_correction",
+      "module_ident": "cake_kda_affine_unbounded_softplus_correction_8ffc49a86f",
+      "role": "correction",
+      "smem_bytes": 227968,
+      "source_exported_bytes": 235467,
+      "source_exported_sha256": "a64ea55b30914f070f88434c0165de86be4bb0dda8e168b9374e535cf36c2ee9",
+      "source_raw_sha256": "060411a0e31150bb8b029d23312e493acbc03bbe50739f125f16c37a418e36ed",
+      "sources": [
+        {
+          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction.cu",
+          "sha256": "f964193c56ca3f3dc5c07daa8e39b1072579015b7cada40dd9c53e307961315e"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_direct_m128_binding.cuh",
+          "sha256": "7b3fbd7b654384d5647802a3a92b10b40e1be4a1985859507feb3590f4a912bc"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_binding_common.cuh",
+          "sha256": "5031de2fb488cb0ca7753c20f8ad9103d9840afd4c1bab731c9675f458fbb276"
+        }
+      ],
+      "target": "sm100a",
+      "threads": 1024,
+      "use_pdl": true
+    },
+    {
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_path": "csrc/kda/cake_kda_affine_unbounded_softplus_main_binding.cu",
+      "binding_sha256": "823623fc770b4cdb8559dad9cf6fd9380c276fa67b6098f74c7af564a0e0029e",
+      "kernel_symbol": "kernel_cake_kda_affine_unbounded_softplus_main",
+      "module_ident": "cake_kda_affine_unbounded_softplus_main_7695f35082",
+      "role": "main",
+      "smem_bytes": 227968,
+      "source_exported_bytes": 240700,
+      "source_exported_sha256": "8eb08b00f4bd423abef81373d07c454a5467da34f666221a99940701f67143c1",
+      "source_raw_sha256": "fc27967552cfe46de38fb8fba092fa383e663fb8b72023e867b0518eb6ce8e16",
+      "sources": [
+        {
+          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_main.cu",
+          "sha256": "5759f558c615777e641d7aa70bc7eec2b619b24e2910d29f0f21d5e63a745def"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_direct_m128_binding.cuh",
+          "sha256": "7b3fbd7b654384d5647802a3a92b10b40e1be4a1985859507feb3590f4a912bc"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_binding_common.cuh",
+          "sha256": "5031de2fb488cb0ca7753c20f8ad9103d9840afd4c1bab731c9675f458fbb276"
+        }
+      ],
+      "target": "sm103a",
+      "threads": 1024,
+      "use_pdl": false
+    },
+    {
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_path": "csrc/kda/cake_kda_affine_unbounded_softplus_map_binding.cu",
+      "binding_sha256": "e6fa1b4389f9d04576c2ce5f642a73c10e7e5a2f6aaa141979784b6b96de707c",
+      "kernel_symbol": "kernel_cake_kda_affine_unbounded_softplus_map",
+      "module_ident": "cake_kda_affine_unbounded_softplus_map_e1f8f1be21",
+      "role": "map",
+      "smem_bytes": 227968,
+      "source_exported_bytes": 242083,
+      "source_exported_sha256": "311cb37965bdf741b842277415b5a9de443bd09a4780893959e11ab50006ec4a",
+      "source_raw_sha256": "f6673ef95a651670d0a95ab6f245d355404380a7b51f6686416bb6b68607e597",
+      "sources": [
+        {
+          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_map.cu",
+          "sha256": "86e76c845a5042a10ff50c4cea16ca22f5809817ebc9ebe28a2c0a5a4b2514f0"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_direct_m128_binding.cuh",
+          "sha256": "7b3fbd7b654384d5647802a3a92b10b40e1be4a1985859507feb3590f4a912bc"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_binding_common.cuh",
+          "sha256": "5031de2fb488cb0ca7753c20f8ad9103d9840afd4c1bab731c9675f458fbb276"
+        }
+      ],
+      "target": "sm103a",
+      "threads": 1024,
+      "use_pdl": true
+    },
+    {
+      "arg_plan_sha256": "a9a2d480c8bfe74cc155384a93039ad82c481c5e00f4f40b800b367aa388474b",
+      "binding_path": "csrc/kda/cake_kda_affine_unbounded_softplus_scan_binding.cu",
+      "binding_sha256": "b44fc516cd304ab8c25b37d75def961c842b0afa458d553746e76ef98f217929",
+      "kernel_symbol": "kernel_cake_kda_affine_unbounded_softplus_scan",
+      "module_ident": "cake_kda_affine_unbounded_softplus_scan_13861cd324",
+      "role": "scan",
+      "smem_bytes": 66560,
+      "source_exported_bytes": 11493,
+      "source_exported_sha256": "3019a49c8942eff1997d52762ed72c2c789ef21039cdf2a6d1e3a03b1ca86b68",
+      "source_raw_sha256": "d9368c97d5492d187fb705973b15c63f8bbc803a0dbfafe05364f6471e3d8074",
+      "sources": [
+        {
+          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_scan.cu",
+          "sha256": "79ce0bdfabb9ae1563371a7cca1e0953a1e865d34cadd584b5a8defcfe292b17"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_scan_binding.cuh",
+          "sha256": "64a958845b3c0bc4e2dee26ec58c6bb7f7228065e4f8c1b0b6374976875fe751"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_binding_common.cuh",
+          "sha256": "5031de2fb488cb0ca7753c20f8ad9103d9840afd4c1bab731c9675f458fbb276"
+        }
+      ],
+      "target": "sm103a",
+      "threads": 128,
+      "use_pdl": true
+    },
+    {
+      "arg_plan_sha256": "22022915599b937c578a5a511920e0b48fd693aa0f414df0c1eb1a0684ad97e2",
+      "binding_path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction_binding.cu",
+      "binding_sha256": "322e28c0de03bed017ac9ef3f88f9d302fbc3ed4a84392d86635b13e1aacf4c3",
+      "kernel_symbol": "kernel_cake_kda_affine_unbounded_softplus_correction",
+      "module_ident": "cake_kda_affine_unbounded_softplus_correction_5b62e7c09b",
+      "role": "correction",
+      "smem_bytes": 227968,
+      "source_exported_bytes": 235467,
+      "source_exported_sha256": "a64ea55b30914f070f88434c0165de86be4bb0dda8e168b9374e535cf36c2ee9",
+      "source_raw_sha256": "060411a0e31150bb8b029d23312e493acbc03bbe50739f125f16c37a418e36ed",
+      "sources": [
+        {
+          "path": "csrc/kda/cake_kda_affine_unbounded_softplus_correction.cu",
+          "sha256": "f964193c56ca3f3dc5c07daa8e39b1072579015b7cada40dd9c53e307961315e"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_direct_m128_binding.cuh",
+          "sha256": "7b3fbd7b654384d5647802a3a92b10b40e1be4a1985859507feb3590f4a912bc"
+        },
+        {
+          "path": "csrc/kda/cake_kda_affine_binding_common.cuh",
+          "sha256": "5031de2fb488cb0ca7753c20f8ad9103d9840afd4c1bab731c9675f458fbb276"
+        }
+      ],
+      "target": "sm103a",
+      "threads": 1024,
+      "use_pdl": true
+    }
+  ],
+  "schema_version": 1,
+  "status": "complete"
+}

@@ -1,6 +1,8 @@
 # Bot command handler for CI permissions
-# Authorized users (ci-users team) can comment to control CI:
-#   @flashinfer-bot run          - Add run-ci label to trigger CI
+# Authorized users - anyone who can apply the run-ci label to a PR, plus the
+# ci-users team - can comment to control CI:
+#   @flashinfer-bot run          - Apply run-ci label to start CI on the current
+#                                  commit; needed again after new commits
 #   @flashinfer-bot rerun        - Cancel and rerun all workflows
 #   @flashinfer-bot rerun failed - Rerun failed and cancelled jobs
 #   @flashinfer-bot stop         - Cancel all in-progress workflows
@@ -25,22 +27,46 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check team membership
+      - name: Check permission
         id: check-permission
         env:
           GH_TOKEN: ${{ secrets.FLASHINFER_GITHUB_TOKEN }}
           ORG: ${{ github.repository_owner }}
           TEAM: ci-users
           ACTOR: ${{ github.event.comment.user.login }}
+          REPO: ${{ github.repository }}
         run: |
-          echo "Checking if $ACTOR is a member of $ORG/$TEAM..."
-
           # Verify token is set
           if [[ -z "$GH_TOKEN" ]]; then
             echo "::error::FLASHINFER_GITHUB_TOKEN secret is not set"
             echo "authorized=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
+          ROLE_ERROR="$RUNNER_TEMP/role-error"
+          if ! ROLE=$(gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "/repos/${REPO}/collaborators/${ACTOR}/permission" \
+            --jq '.role_name' 2>"$ROLE_ERROR"); then
+            ROLE="none"
+
+            # 404 is the ordinary answer for someone who is not a collaborator.
+            # Anything else means the lookup is broken rather than the commenter
+            # unprivileged, and would otherwise deny a contributor who can label
+            # with nothing in the log to explain why.
+            if ! grep -q "HTTP 404" "$ROLE_ERROR"; then
+              echo "::warning::Could not read the repository role of $ACTOR, using team membership only: $(cat "$ROLE_ERROR")"
+            fi
+          fi
+
+          case "$ROLE" in
+            admin|maintain|write|triage)
+              echo "$ACTOR is authorized by repository role"
+              echo "authorized=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
 
           # List team members and check if commenter is in the list
           MEMBERS=$(gh api \
@@ -55,10 +81,10 @@ jobs:
           }
 
           if echo "$MEMBERS" | grep -qx "$ACTOR"; then
-            echo "$ACTOR is a member of $TEAM"
+            echo "$ACTOR is authorized by team membership"
             echo "authorized=true" >> "$GITHUB_OUTPUT"
           else
-            echo "$ACTOR is not a member of $TEAM"
+            echo "$ACTOR is not authorized"
             echo "authorized=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -85,6 +111,19 @@ jobs:
           GH_TOKEN: ${{ secrets.FLASHINFER_BOT_TOKEN }}
         run: |
           echo "Adding run-ci label to PR #${{ github.event.issue.number }}"
+
+          # Re-applying a label the PR already has emits no event, so remove it
+          # first. Removing an absent label errors, hence the check - and a failed
+          # removal must not be ignored, or the add below silently does nothing.
+          HAS_RUN_CI=$(gh pr view ${{ github.event.issue.number }} \
+            --repo ${{ github.repository }} \
+            --json labels -q '[.labels[].name] | index("run-ci") != null')
+
+          if [ "$HAS_RUN_CI" = "true" ]; then
+            gh pr edit ${{ github.event.issue.number }} \
+              --repo ${{ github.repository }} \
+              --remove-label "run-ci"
+          fi
 
           # Add run-ci label
           gh pr edit ${{ github.event.issue.number }} \
@@ -211,7 +250,8 @@ jobs:
           while read -r run_id; do
             if [ -n "$run_id" ]; then
               echo "Cancelling workflow $run_id..."
-              gh run cancel "$run_id" --repo ${{ github.repository }} || true
+              gh run cancel "$run_id" --repo ${{ github.repository }} \
+                || echo "::error::Cancel failed for $run_id"
               CANCEL_COUNT=$((CANCEL_COUNT + 1))
             fi
           done

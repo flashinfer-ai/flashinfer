@@ -8,8 +8,15 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
+from flashinfer.utils import get_compute_capability
 
 from flashinfer.comm.mnnvl import TorchDistBackend
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or get_compute_capability(torch.device("cuda:0"))[0] not in (9, 10, 12),
+    reason="trtllm_comm kernels support SM90/SM100/SM12x only",
+)
 
 
 # todo(Yingyi): add benchmark and quant test

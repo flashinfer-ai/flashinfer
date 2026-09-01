@@ -16,9 +16,67 @@ limitations under the License.
 
 """Shared build utilities for flashinfer packages."""
 
+import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Optional
+
+
+CI_CONFIG_FILE = Path(__file__).parent / "ci" / "cuda-versions.json"
+
+_DEPENDENCY_SCOPE_FIELDS = {
+    "provider_build": "provider_build_specifier",
+    "cuda_extra": "cuda_extra_specifier",
+    "ci_image": "ci_image_specifier",
+}
+
+
+def get_dependency_requirements(
+    scope: str,
+    cuda_major: Optional[str] = None,
+) -> list[str]:
+    """Return dependency requirements for a configured installation scope."""
+    try:
+        specifier_field = _DEPENDENCY_SCOPE_FIELDS[scope]
+    except KeyError as error:
+        raise ValueError(f"unknown dependency scope: {scope}") from error
+
+    if cuda_major is None:
+        cuda_major = os.environ.get("CUDA_MAJOR")
+
+    with CI_CONFIG_FILE.open() as config_file:
+        config = json.load(config_file)
+
+    requirements = []
+    for package, dependency in config["dependency_policy"].items():
+        extras = dependency.get("cuda_major_extras", {}).get(cuda_major, [])
+        package_spec = package
+        if extras:
+            package_spec += f"[{','.join(extras)}]"
+        requirements.append(f"{package_spec}{dependency[specifier_field]}")
+    return requirements
+
+
+def get_build_dependency_requirements(
+    cuda_major: Optional[str] = None,
+) -> list[str]:
+    """Return minimum dependencies needed by the provider-wheel backends."""
+    return get_dependency_requirements("provider_build", cuda_major)
+
+
+def get_cuda_extra_dependency_requirements(
+    cuda_major: Optional[str] = None,
+) -> list[str]:
+    """Return dependencies for the project's CUDA optional extras."""
+    return get_dependency_requirements("cuda_extra", cuda_major)
+
+
+def get_ci_image_dependency_requirements(
+    cuda_major: Optional[str] = None,
+) -> list[str]:
+    """Return exact dependency selections for reproducible CI images."""
+    return get_dependency_requirements("ci_image", cuda_major)
 
 
 def get_git_version(cwd: Optional[Path] = None) -> str:

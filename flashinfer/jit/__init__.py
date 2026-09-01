@@ -73,6 +73,7 @@ from .core import sm90a_nvcc_flags as sm90a_nvcc_flags
 from .core import sm100a_nvcc_flags as sm100a_nvcc_flags
 from .core import sm100f_nvcc_flags as sm100f_nvcc_flags
 from .core import sm103a_nvcc_flags as sm103a_nvcc_flags
+from .core import sm107a_nvcc_flags as sm107a_nvcc_flags
 from .core import sm110a_nvcc_flags as sm110a_nvcc_flags
 from .core import sm120a_nvcc_flags as sm120a_nvcc_flags
 from .core import sm120f_nvcc_flags as sm120f_nvcc_flags
@@ -83,6 +84,7 @@ from .comm import gen_comm_alltoall_module as gen_comm_alltoall_module
 from .comm import gen_trtllm_mnnvl_comm_module as gen_trtllm_mnnvl_comm_module
 from .comm import gen_trtllm_comm_module as gen_trtllm_comm_module
 from .comm import gen_vllm_comm_module as gen_vllm_comm_module
+from .comm import gen_pcie_ipc_comm_module as gen_pcie_ipc_comm_module
 from .comm import gen_moe_alltoall_module as gen_moe_alltoall_module
 from .comm import gen_dcp_alltoall_module as gen_dcp_alltoall_module
 from .dsv3_optimizations import (
@@ -92,6 +94,7 @@ from .dsv3_optimizations import (
     gen_dsv3_fused_routing_module as gen_dsv3_fused_routing_module,
 )
 from .tinygemm2 import gen_tinygemm2_module as gen_tinygemm2_module
+from .tinygemm2 import gen_tinygemm2_sm100_module as gen_tinygemm2_sm100_module
 from .moe_utils import gen_moe_utils_module as gen_moe_utils_module
 from .hash_topk import gen_hash_topk_module as gen_hash_topk_module
 from .fp4_kv_dequantization import (
@@ -100,11 +103,64 @@ from .fp4_kv_dequantization import (
 from .fp4_kv_quantization import (
     gen_fp4_kv_quantization_module as gen_fp4_kv_quantization_module,
 )
+from .cake_kda import (
+    cake_kda_affine_is_available as cake_kda_affine_is_available,
+)
+from .cake_kda import (
+    gen_cake_kda_affine_module as gen_cake_kda_affine_module,
+)
+from .cake_kda import (
+    gen_cake_kda_m128_unbounded_softplus_module as gen_cake_kda_m128_unbounded_softplus_module,
+)
+from .cake_kda import (
+    get_cake_kda_affine_module as get_cake_kda_affine_module,
+)
+from .cake_kda import (
+    get_cake_kda_prefill_module as get_cake_kda_prefill_module,
+)
+from .cake_kda import (
+    load_cake_kda_m128_unbounded_softplus_module as load_cake_kda_m128_unbounded_softplus_module,
+)
+from .flash_kda import (
+    gen_flash_kda_m64_module as gen_flash_kda_m64_module,
+)
+from .flash_kda import (
+    gen_flash_kda_m128_module as gen_flash_kda_m128_module,
+)
+from .flash_kda import (
+    gen_flash_kda_m128_n16_module as gen_flash_kda_m128_n16_module,
+)
+from .flash_kda import (
+    get_flash_kda_prefill_module as get_flash_kda_prefill_module,
+)
+from .flash_kda import (
+    load_flash_kda_m64_module as load_flash_kda_m64_module,
+)
+from .flash_kda import (
+    load_flash_kda_m128_module as load_flash_kda_m128_module,
+)
+from .flash_kda import (
+    load_flash_kda_m128_n16_module as load_flash_kda_m128_n16_module,
+)
+from .blackwell_msa import BLACKWELL_MSA_VARIANTS as BLACKWELL_MSA_VARIANTS
+from .blackwell_msa import (
+    BLACKWELL_MSA_VARIANTS_BY_TARGET as BLACKWELL_MSA_VARIANTS_BY_TARGET,
+)
+from .blackwell_msa import gen_blackwell_msa_module as gen_blackwell_msa_module
+from .blackwell_msa import get_blackwell_msa_module as get_blackwell_msa_module
+from .blackwell_msa import get_blackwell_msa_uri as get_blackwell_msa_uri
+from .blackwell_msa import load_blackwell_msa_module as load_blackwell_msa_module
 from .nvfp4_attention_sm120 import (
     gen_nvfp4_attention_sm120_module as gen_nvfp4_attention_sm120_module,
 )
 from .bgmv_moe import gen_bgmv_moe_module as gen_bgmv_moe_module
 from .bgmv_moe import load_bgmv_moe_module as load_bgmv_moe_module
+from .blackwell_bgmv_moe import (
+    gen_blackwell_bgmv_moe_module as gen_blackwell_bgmv_moe_module,
+)
+from .blackwell_bgmv_moe import (
+    load_blackwell_bgmv_moe_module as load_blackwell_bgmv_moe_module,
+)
 from .monomoe import gen_monomoe_module as gen_monomoe_module
 from .monomoe import load_monomoe_module as load_monomoe_module
 

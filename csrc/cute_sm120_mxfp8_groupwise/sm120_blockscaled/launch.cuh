@@ -24,6 +24,7 @@
 #include <cutlass/device_kernel.h>
 
 #include "kernel_impl.cuh"
+#include "moe_kernel_impl.cuh"
 // clang-format on
 
 namespace flashinfer::gemm::mxfp8_cute_sm120 {
@@ -90,7 +91,9 @@ void launch_moe_gemm(typename KT::ElementA* ptr_A, typename KT::ElementB* ptr_B,
                      typename KT::SFConfig::ElementSFLoad* ptr_SFB, typename KT::ElementD* ptr_D,
                      int M_padded, int N, int K, int num_experts, int32_t const* grouped_layout,
                      int num_sms, cudaStream_t stream = 0) {
-  using Kernel = SM120BlockScaledGemmKernel<KT>;
+  using Kernel =
+      std::conditional_t<KT::kGemmType == sm120_common::GemmType::MGroupedContiguousWithZeroPadding,
+                         SM120BlockScaledMoeGemmKernel<KT>, SM120BlockScaledGemmKernel<KT>>;
   auto args = make_launch_args<KT, Kernel>(ptr_A, ptr_B, ptr_SFA, ptr_SFB, ptr_D, M_padded, N, K,
                                            grouped_layout);
   auto problem_shape = make_shape(M_padded, N, K, num_experts);

@@ -9,8 +9,18 @@ import torch.nn.functional as F
 from flashinfer.utils import get_compute_capability
 
 
+@pytest.mark.parametrize("num_tokens", range(1, 17))
+@pytest.mark.parametrize("hidden_dim", [6144, 7168])
+def test_cake_router_gemm_source_matrix(num_tokens, hidden_dim):
+    from flashinfer.jit.cake_router_gemm import _program_source
+
+    source = _program_source(num_tokens, hidden_dim)
+    text = source.read_text(encoding="utf-8")
+    assert f"kernel_cake_blackwell_router_gemm_m{num_tokens}_k{hidden_dim}" in text
+
+
 # Positive tests
-@pytest.mark.parametrize("num_tokens", [1, 2, 3, 5, 8, 13, 16])
+@pytest.mark.parametrize("num_tokens", range(1, 17))
 @pytest.mark.parametrize(
     "num_experts,output_dtype,hidden_dim,fn_to_test",
     (
@@ -25,15 +35,16 @@ def test_dsv3_router_gemm_op(
 ):
     compute_capability = get_compute_capability(torch.device("cuda"))
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
-    if compute_capability_number != 100 and compute_capability_number != 103:
-        pytest.skip("DSv3 Router GEMM is only supported on SM100 and SM103")
+    if compute_capability_number not in [100, 103, 107]:
+        pytest.skip("DSv3 Router GEMM is only supported on SM100, SM103, and SM107")
 
     mat_a = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=torch.bfloat16)
     mat_b = torch.randn(
         num_experts, hidden_dim, device="cuda", dtype=torch.bfloat16
     ).t()  # column major
     out = torch.empty(num_tokens, num_experts, device="cuda", dtype=output_dtype)
-    fn_to_test(mat_a, mat_b, out, launch_with_pdl=launch_with_pdl)
+    result = fn_to_test(mat_a, mat_b, out, launch_with_pdl=launch_with_pdl)
+    assert result is None
     ref = mat_a @ mat_b
 
     cos_sim = F.cosine_similarity(ref.reshape(-1), out.reshape(-1), dim=0)
@@ -331,8 +342,8 @@ def test_dsv3_router_gemm_op_negative(
 ):
     compute_capability = get_compute_capability(torch.device("cuda"))
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]
-    if compute_capability_number != 100 and compute_capability_number != 103:
-        pytest.skip("DSv3 Router GEMM is only supported on SM100 and SM103")
+    if compute_capability_number not in [100, 103, 107]:
+        pytest.skip("DSv3 Router GEMM is only supported on SM100, SM103, and SM107")
 
     mat_a = torch.randn(num_tokens, hidden_dim, device="cuda", dtype=mat_a_dtype)
     mat_b = torch.randn(num_experts, hidden_dim, device="cuda", dtype=mat_b_dtype)

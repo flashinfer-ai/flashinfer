@@ -12,6 +12,7 @@ from .....weights import MoEWeightPack
 from .bridge import (
     build_activation_pack,
     build_activation_pack_rank_major,
+    pack_mxfp8_dispatch_payload,
     reshape_for_combine,
 )
 from .config import FusedMoeKernelConfig
@@ -32,6 +33,7 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 f"got {type(config).__name__}"
             )
         self._moe_config = config.moe_config
+        self._mxfp8_dispatch = config.mxfp8_dispatch
         self._compute: Optional["MoELayer"] = None
 
     @classmethod
@@ -44,6 +46,24 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
         fleet_params: FleetParams,
     ) -> None:
         validate_compute_consistency(fleet_params, bootstrap, self._moe_config)
+        if self._mxfp8_dispatch:
+            from ......fused_moe.api import CuteDslConfig, QuantVariant
+            from .....core.validation.common import MoEEpConfigError
+
+            if self._moe_config.quant.variant is not QuantVariant.MXFP4:
+                raise MoEEpConfigError(
+                    "mxfp8_dispatch requires MoEConfig quant variant MXFP4."
+                )
+            backends = tuple(self._moe_config.backend)
+            if len(backends) != 1 or not isinstance(backends[0], CuteDslConfig):
+                raise MoEEpConfigError(
+                    "mxfp8_dispatch requires exactly one CuteDslConfig backend."
+                )
+
+    def pack_dispatch_payload(self, x):
+        if not self._mxfp8_dispatch:
+            return x
+        return pack_mxfp8_dispatch_payload(x)
 
     def preprocess_weights(
         self,
@@ -74,10 +94,9 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
         return self._compute
 
     def compute(self, ctx: SplitKernelContext):
-        from ......fused_moe.api import QuantVariant
-
         expert_tensors = ctx.expert_tensors
-        is_nvfp4 = self._moe_config.quant.variant is QuantVariant.NVFP4
+        quant_variant = self._moe_config.quant.variant
+        per_token_activation = bool(self._moe_config.quant.per_token_scale)
         offset = self._moe_config.experts.local_expert_offset
         dim0, dim1, _ = expert_tensors.shape
 
@@ -95,13 +114,19 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
                 ctx.recv_topk_weights,
                 num_local_experts=self._moe_config.experts.local_num_experts,
                 local_expert_offset=offset,
-                is_nvfp4=is_nvfp4,
+                quant_variant=quant_variant,
+                per_token_activation=per_token_activation,
+                mxfp8_dispatch=self._mxfp8_dispatch,
+                hidden_size=fleet_params.token_hidden_size,
             )
         else:
             act_pack = build_activation_pack(
                 expert_tensors,
                 local_expert_offset=offset,
-                is_nvfp4=is_nvfp4,
+                quant_variant=quant_variant,
+                per_token_activation=per_token_activation,
+                mxfp8_dispatch=self._mxfp8_dispatch,
+                hidden_size=fleet_params.token_hidden_size,
             )
 
         out_2d = self._ensure_compute(fleet_params)(act_pack, self._transformed_weights)

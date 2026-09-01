@@ -1120,7 +1120,13 @@ cudaError_t moereduction_allreduce_fusion_kernel_launcher(
   // Total number of warp (within one cluster) that's need to handle one token
   // given that each thread handle kElemsPerAccess
   int warps_per_token = (threads_per_token + 31) / 32;
-  int cluster_size = 8;
+  // Clamp to the largest cluster the device can launch.
+  static const int max_cluster_size = GetMaxClusterSize(
+      reinterpret_cast<void const*>(
+          moereduce_allreduce_fusion_kernel_oneshot_lamport<T, NRanks, AllReduceOut, ResidualOut,
+                                                            NormOut, QuantOut>),
+      128);
+  int cluster_size = std::min(8, max_cluster_size);
   while (warps_per_token % cluster_size != 0) {
     cluster_size /= 2;
   }
@@ -1427,7 +1433,13 @@ cudaError_t moefinalize_allreduce_fusion_kernel_launcher(
   // Total number of warp (within one cluster) that's need to handle one token
   // given that each thread handle VEC_SIZE
   int warps_per_token = (threads_per_token + 31) / 32;
-  int cluster_size = 8;
+  // Clamp to the largest cluster the device can launch.
+  static const int max_cluster_size = GetMaxClusterSize(
+      reinterpret_cast<void const*>(
+          moefinalize_allreduce_fusion_kernel_oneshot_lamport<T, NRanks, ResidualOut, NormOut,
+                                                              QuantOut, ScaleType>),
+      128);
+  int cluster_size = std::min(8, max_cluster_size);
   while (warps_per_token % cluster_size != 0) {
     cluster_size /= 2;
   }

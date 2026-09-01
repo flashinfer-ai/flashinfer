@@ -1013,7 +1013,58 @@ _CHECKPOINTING_SSU_VARIANTS = [
 _PREWARM_MIN_TESTS = 8
 
 
+def _triton_supports_current_arch() -> bool:
+    """Whether the installed Triton's PTX toolchain can target this GPU.
+
+    The mamba references are Triton kernels; when Triton's bundled
+    nvptxcompiler predates the device (e.g. torch-pinned Triton on sm_107),
+    ``make_ptx`` calls ``abort()`` and takes the whole pytest process down —
+    unskippable at test time, so probe the matching ``ptxas`` binary in a
+    subprocess instead. Defaults to True on any probe uncertainty.
+    """
+    import glob
+    import os
+    import subprocess
+
+    try:
+        if not torch.cuda.is_available():
+            return True
+        major, minor = torch.cuda.get_device_capability()
+
+        import triton
+
+        troot = os.path.dirname(triton.__file__)
+        cands = glob.glob(os.path.join(troot, "backends", "nvidia", "bin", "ptxas"))
+        if not cands:
+            return True
+        for gpu_name in (f"sm_{major}{minor}a", f"sm_{major}{minor}"):
+            r = subprocess.run(
+                [cands[0], "--gpu-name", gpu_name, os.devnull, "-o", os.devnull],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            err = (r.stderr or "") + (r.stdout or "")
+            if "not defined for option 'gpu-name'" not in err:
+                return True
+        return False
+    except Exception:
+        return True
+
+
 def pytest_collection_modifyitems(config, items):
+    if items and not _triton_supports_current_arch():
+        import pytest
+
+        skip_triton = pytest.mark.skip(
+            reason="installed Triton cannot target this GPU architecture "
+            "(the mamba reference implementations are Triton kernels and "
+            "abort the process at compile time)"
+        )
+        for item in items:
+            item.add_marker(skip_triton)
+        return
+
     n_checkpointing = sum(
         1 for item in items if "test_checkpointing_ssu" in item.nodeid
     )

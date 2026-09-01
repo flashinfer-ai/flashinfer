@@ -768,18 +768,15 @@ class FlashInferLinear(nn.Module):
         if self._bmm_mxfp8_prepared:
             return
 
-        weight = self.weight.data  # (N, K)
-        # bmm_mxfp8 expects B in (batch, K, N) column-major format
-        weight_t = weight.t().contiguous()  # (K, N)
-
-        # Quantize weight to MXFP8 using FlashInfer
+        # Quantize (N, K) so scale blocks run along K; pass the transpose as a view.
+        weight = self.weight.data.contiguous()  # (N, K)
         weight_mxfp8, weight_scale = flashinfer.mxfp8_quantize(
-            weight_t, is_sf_swizzled_layout=True
+            weight, is_sf_swizzled_layout=True
         )
 
-        # Add batch dimension
-        self._weight_mxfp8_bmm = weight_mxfp8.unsqueeze(0)  # (1, K, N)
-        self._weight_scale_mxfp8_bmm = weight_scale.unsqueeze(0)  # (1, ...)
+        # (1, K, N) column-major view; scales stay 1D swizzled.
+        self._weight_mxfp8_bmm = weight_mxfp8.unsqueeze(0).transpose(-2, -1)
+        self._weight_scale_mxfp8_bmm = weight_scale
         self._bmm_mxfp8_prepared = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1298,7 +1295,6 @@ class FlashInferLinear(nn.Module):
 
         # bmm_mxfp8 expects (batch, M, K) input
         x_batch = x_mxfp8.unsqueeze(0)  # (1, M, K)
-        x_scale_batch = x_scale.unsqueeze(0)  # (1, ...)
 
         # Run bmm_mxfp8: (1, M, K) @ (1, K, N) -> (1, M, N)
         bmm_mxfp8_kwargs = {}
@@ -1307,7 +1303,7 @@ class FlashInferLinear(nn.Module):
         out = flashinfer.bmm_mxfp8(
             x_batch,
             self._weight_mxfp8_bmm,
-            x_scale_batch,
+            x_scale,
             self._weight_scale_mxfp8_bmm,
             dtype=torch.bfloat16,
             **bmm_mxfp8_kwargs,

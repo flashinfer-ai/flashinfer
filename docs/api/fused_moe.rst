@@ -56,6 +56,8 @@ top of a Mixture-of-Experts layer (shrink + expand).
     :toctree: ../generated
 
     bgmv_moe
+    prepare_bgmv_moe
+    BGMVMoEBlackwellPlan
     bgmv_moe_shrink
     bgmv_moe_expand
     bgmv_moe_gemm1_lora_delta
@@ -68,6 +70,17 @@ CUTLASS Fused MoE
     :toctree: ../generated
 
     cutlass_fused_moe
+
+cuTile Fused MoE
+----------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    CuTileBf16Config
+    CuTileBf16Runner
+    CuTileNvfp4Config
+    CuTileNvfp4Runner
 
 TensorRT-LLM Fused MoE
 ----------------------
@@ -82,8 +95,22 @@ TensorRT-LLM Fused MoE
     trtllm_fp8_block_scale_moe
     trtllm_fp8_block_scale_routed_moe
     trtllm_fp8_per_tensor_scale_moe
+    trtllm_fp8_per_tensor_scale_routed_moe
     trtllm_mxint4_block_scale_moe
     trtllm_mxint4_block_scale_routed_moe
+
+Standalone TRT-LLM Gen Routing
+------------------------------
+
+The routing stage the TRT-LLM Gen fused MoE launchers run before their GEMMs,
+exposed on its own so expert selection and the permutation/padding bookkeeping
+can be used (and tested) independently of quantization and GEMM configuration.
+
+.. autosummary::
+    :toctree: ../generated
+
+    trtllm_gen_routing
+    TrtllmGenRoutingResult
 
 CuteDSL Fused MoE
 -----------------
@@ -94,10 +121,19 @@ The CuteDSL backends are conditionally available when the
 .. autosummary::
     :toctree: ../generated
 
+    cute_dsl_fused_moe
     cute_dsl_fused_moe_nvfp4
+    cute_dsl_fused_moe_mxfp8_mxfp4
     b12x_fused_moe
 
 .. autoclass:: CuteDslMoEWrapper
+    :members:
+    :inherited-members:
+    :show-inheritance:
+
+    .. automethod:: __init__
+
+.. autoclass:: CuteDslMxfp8Mxfp4MoEWrapper
     :members:
     :inherited-members:
     :show-inheritance:

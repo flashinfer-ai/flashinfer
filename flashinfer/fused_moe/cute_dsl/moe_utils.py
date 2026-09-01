@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import functools
+import math
 from enum import IntEnum
 from typing import Dict, Optional, Tuple, Union
 
@@ -38,6 +39,7 @@ def _get_cuda_stream_ptr() -> int:
 
 SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
+    ActivationType.GegluTanh,
     ActivationType.Relu2,
 )
 
@@ -52,6 +54,26 @@ def normalize_cute_dsl_moe_activation_type(
             f"Unsupported activation_type {activation_type!r}; expected {expected}"
         )
     return activation_type, is_gated_activation(activation_type)
+
+
+def validate_cute_dsl_moe_situ_config(
+    activation_type: ActivationType,
+    situ_beta: Optional[float],
+    situ_linear_beta: Optional[float],
+) -> None:
+    """Validate the optional SiTU variant of the SwiGLU epilogue."""
+    if situ_beta is None:
+        if situ_linear_beta is not None:
+            raise ValueError("situ_linear_beta requires situ_beta")
+        return
+    if activation_type != ActivationType.Swiglu:
+        raise ValueError("SiTU parameters require ActivationType.Swiglu")
+    if not math.isfinite(situ_beta) or situ_beta <= 0:
+        raise ValueError("situ_beta must be positive and finite")
+    if situ_linear_beta is not None and (
+        not math.isfinite(situ_linear_beta) or situ_linear_beta <= 0
+    ):
+        raise ValueError("situ_linear_beta must be positive and finite when set")
 
 
 def get_max_num_tiles(
@@ -226,6 +248,7 @@ def moe_permute(
         top_k,
         tile_size,
         enable_pdl,
+        _get_cuda_stream_ptr(),
     )
 
 
@@ -629,15 +652,23 @@ def moe_sort(
     # Pre-allocation is required for CUDA graph compatibility
     if out_tile_idx_to_expert_idx is not None:
         tile_idx_to_expert_idx = out_tile_idx_to_expert_idx
+        # Zero-fill to ensure safe defaults for entries beyond num_non_exiting_tiles.
+        # This prevents out-of-bounds weight accesses when Rubin kernels round up
+        # the tile count to an even number for cluster synchronization.
+        tile_idx_to_expert_idx.zero_()
     else:
-        tile_idx_to_expert_idx = torch.empty(
+        tile_idx_to_expert_idx = torch.zeros(
             (max_num_tiles,), dtype=torch.int32, device=device
         )
 
     if out_tile_idx_to_mn_limit is not None:
         tile_idx_to_mn_limit = out_tile_idx_to_mn_limit
+        # Zero-fill for the same reason as tile_idx_to_expert_idx above: the Rubin
+        # even-tile rounding can read one mn_limit slot the routing kernel never
+        # wrote; a stale value there would corrupt row stores.
+        tile_idx_to_mn_limit.zero_()
     else:
-        tile_idx_to_mn_limit = torch.empty(
+        tile_idx_to_mn_limit = torch.zeros(
             (max_num_tiles,), dtype=torch.int32, device=device
         )
 

@@ -1,3 +1,8 @@
+# NOTE for future contributors (incl. AI agents): keep this file a SMALL curated
+# smoke set. New coverage (shapes, dtypes, backends, randomized breadth) belongs in
+# tests/gemm/test_unified_gemm_fuzz.py -- extend an adapter/axis there. Add cases
+# here only as deliberate regression anchors or for paths the fuzzer cannot express.
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -12,12 +17,24 @@ from flashinfer.gemm.kernels.cutile.bmm_bf16_cutile import (
 from flashinfer.utils import get_compute_capability
 
 
-@pytest.mark.parametrize("b", [1, 16])
-@pytest.mark.parametrize("m", [48, 128])
-@pytest.mark.parametrize("n", [80, 64])
-@pytest.mark.parametrize("k", [64, 256])
-@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16, torch.float32])
-@pytest.mark.parametrize("backend", ["cutlass", "cudnn", "cutile", "tgv", "auto"])
+# Curated smoke set. Randomized breadth over {b,m,n,k} x backends (tight elementwise
+# oracle, determinism, autotune-winner validation) lives in
+# tests/gemm/test_unified_gemm_fuzz.py's bmm_bf16 adapter; keep one deliberate case
+# per backend with each out dtype covered at least once.
+_SMOKE_CASES = [
+    # b, m, n, k, res_dtype, backend
+    (16, 48, 80, 256, torch.bfloat16, "cutlass"),
+    (1, 128, 64, 64, torch.float32, "cutlass"),
+    (16, 128, 64, 256, torch.float16, "cudnn"),
+    (1, 48, 80, 64, torch.bfloat16, "cudnn"),
+    (16, 48, 64, 64, torch.bfloat16, "cutile"),
+    (1, 128, 80, 256, torch.bfloat16, "tgv"),
+    (16, 128, 80, 64, torch.bfloat16, "auto"),
+    (1, 48, 64, 256, torch.float32, "auto"),
+]
+
+
+@pytest.mark.parametrize("b,m,n,k,res_dtype,backend", _SMOKE_CASES)
 def test_bmm_bf16(b, m, n, k, res_dtype, backend):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     compute_capability_number = compute_capability[0] * 10 + compute_capability[1]

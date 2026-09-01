@@ -179,8 +179,15 @@ class MsaProxyScoreFp4MmaSm12x:
 
         q_start = mCuQ[batch_idx]
         seqlen_q = mCuQ[batch_idx + 1] - q_start
-        k_start = mCuK[batch_idx]
-        seqlen_k = mCuK[batch_idx + 1] - k_start
+        if cutlass.const_expr(self._paged):
+            # mCuK holds per-request lengths on the paged path:
+            # page_table supplies every KV address, so there is
+            # no base offset to add.
+            k_start = cutlass.Int32(0)
+            seqlen_k = mCuK[batch_idx]
+        else:
+            k_start = mCuK[batch_idx]
+            seqlen_k = mCuK[batch_idx + 1] - k_start
         num_kv_blocks = cute.ceil_div(seqlen_k, self._N)
         group_size = mQ.shape[1] // mK.shape[1]
         kv_head = qo_head // group_size
@@ -644,6 +651,7 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
         paged: bool = False,
         qhead_per_kv: int = _QHEAD_PER_KV,
         pack_q_len: int = _PACK_Q_LEN,
+        qoff_default: bool = False,
     ):
         super().__init__(head_dim=head_dim, is_causal=is_causal, paged=paged)
         if qhead_per_kv * pack_q_len != self._M:
@@ -655,6 +663,8 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
         # gather/epilogue, so each factorization compiles to its own kernel.
         self._QHEAD_PER_KV = qhead_per_kv
         self._PACK_Q_LEN = pack_q_len
+        # True: right-aligned decode; the causal offset is computed in-kernel.
+        self._qoff_default = qoff_default
 
     @cute.jit
     def __call__(
@@ -724,10 +734,23 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
 
         q_start = mCuQ[batch_idx]
         seqlen_q = mCuQ[batch_idx + 1] - q_start
-        k_start = mCuK[batch_idx]
-        seqlen_k = mCuK[batch_idx + 1] - k_start
+        if cutlass.const_expr(self._paged):
+            # mCuK holds per-request lengths on the paged path:
+            # page_table supplies every KV address, so there is
+            # no base offset to add.
+            k_start = cutlass.Int32(0)
+            seqlen_k = mCuK[batch_idx]
+        else:
+            k_start = mCuK[batch_idx]
+            seqlen_k = mCuK[batch_idx + 1] - k_start
         num_kv_blocks = cute.ceil_div(seqlen_k, self._N)
         num_qo_heads = mQ.shape[1]
+        q_off = cutlass.Int32(0)
+        if cutlass.const_expr(self._is_causal):
+            if cutlass.const_expr(self._qoff_default):
+                q_off = seqlen_k - seqlen_q
+            else:
+                q_off = mQOffset[batch_idx]
 
         tiled_mma, mma_atom, sfa_layout, sfb_layout = self._build_mma()
         sA_layout = self._ab_layout(self._M)
@@ -915,9 +938,7 @@ class MsaProxyScoreFp4MmaDecodePackedSm12x(MsaProxyScoreFp4MmaSm12x):
                     row = tScS_mn[r, 0][0]
                     token = row % self._PACK_Q_LEN
                     if cutlass.const_expr(self._is_causal):
-                        col_limit = cutlass.min(
-                            token + mQOffset[batch_idx] + 1, seqlen_k
-                        )
+                        col_limit = cutlass.min(token + q_off + 1, seqlen_k)
                     else:
                         col_limit = seqlen_k
                     for c in cutlass.range_constexpr(cute.size(acc_mn.shape[1])):

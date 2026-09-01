@@ -97,8 +97,8 @@ void launch_prefill_sg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
   CUDA_CHECK(cudaLaunchKernelExC(&config, (const void*)kernel, args));
 }
 
-// Single-cache MG dispatcher. MG_N_HG_T: 1 lets NUM_HEADS=16 through MG
-// (HEADS_PER_CTA=16, same shape as SG); 2 is the default for NH >= 32.
+// Single-cache MG dispatcher. MG_N_HG_T: 1 lets NUM_HEADS=8/16 use a 16-head
+// CTA (NH=8 is internally padded); 2 is the default for NH >= 32.
 template <ModelType MT, ComputeMode CM, int NUM_HEADS, int TOPK, int PAGE_BLOCK_SIZE,
           int MG_N_HG_T = MG_N_HG_DEFAULT>
 void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* indices,
@@ -107,9 +107,9 @@ void launch_prefill_mg(const bf16* Q, const uint8_t* KV_cache, const int32_t* in
                        cudaStream_t stream) {
   constexpr size_t smem_bytes = SmemLayoutMG<MT, CM>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
-  static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0,
-                "NUM_HEADS must be a multiple of MG_N_HG_T * HPB");
-  constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA_LOCAL;
+  static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
+                "NUM_HEADS must fill the MG head tile, except a padded NH=8 tile");
+  constexpr int REPLICATE_H = (NUM_HEADS + MG_HEADS_PER_CTA_LOCAL - 1) / MG_HEADS_PER_CTA_LOCAL;
   dim3 grid(num_tokens * REPLICATE_H);
   dim3 block(BLOCK_THREADS);
 
@@ -143,9 +143,9 @@ void launch_prefill_mg_dual_fulltile(const bf16* Q, const uint8_t* KV_cache, con
                                      cudaStream_t stream) {
   constexpr size_t smem_bytes = SmemLayoutMG<MT, ComputeMode::BF16>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
-  static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0,
-                "NUM_HEADS must be a multiple of MG_N_HG_T * HPB");
-  constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA_LOCAL;
+  static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
+                "NUM_HEADS must fill the MG head tile, except a padded NH=8 tile");
+  constexpr int REPLICATE_H = (NUM_HEADS + MG_HEADS_PER_CTA_LOCAL - 1) / MG_HEADS_PER_CTA_LOCAL;
   dim3 grid(num_tokens * REPLICATE_H);
   dim3 block(BLOCK_THREADS);
 
@@ -185,9 +185,9 @@ void launch_prefill_mg_dual(const bf16* Q, const uint8_t* KV_cache, const int32_
                             const int* topk_length_extra_ptr, cudaStream_t stream) {
   constexpr size_t smem_bytes = SmemLayoutMG<MT, CM>::TOTAL;
   constexpr int MG_HEADS_PER_CTA_LOCAL = MG_N_HG_T * HPB;
-  static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0,
-                "NUM_HEADS must be a multiple of MG_N_HG_T * HPB");
-  constexpr int REPLICATE_H = NUM_HEADS / MG_HEADS_PER_CTA_LOCAL;
+  static_assert(NUM_HEADS % MG_HEADS_PER_CTA_LOCAL == 0 || (MG_N_HG_T == 1 && NUM_HEADS < HPB),
+                "NUM_HEADS must fill the MG head tile, except a padded NH=8 tile");
+  constexpr int REPLICATE_H = (NUM_HEADS + MG_HEADS_PER_CTA_LOCAL - 1) / MG_HEADS_PER_CTA_LOCAL;
   dim3 grid(num_tokens * REPLICATE_H);
   dim3 block(BLOCK_THREADS);
 
@@ -267,11 +267,14 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const u
       Q, KV, indices, attn_sink, output, out_lse, sm_scale, num_tokens, stride_kv_block, \
       topk_length_ptr, stream)
 
-// NH=16 routes through MG with MG_N_HG_T=1 to avoid SG BF16-QK smem aliasing
-// between Q staging and FP8 weight staging at multi-wave launches.
+// NH=8 and NH=16 share the MG_N_HG_T=1 kernel. NH=8 zero-pads the upper half
+// of the 16-head tile and gates all global Q/sink/output/LSE accesses.
 #define DISPATCH_BY_NH_CM(CM, TK)       \
   do {                                  \
     switch (num_heads) {                \
+      case 8:                           \
+        DISPATCH_MG_CM(CM, 8, TK, 1);   \
+        return true;                    \
       case 16:                          \
         DISPATCH_MG_CM(CM, 16, TK, 1);  \
         return true;                    \
@@ -293,6 +296,10 @@ inline bool dispatch_dsv4_single(int num_heads, int topk, const bf16* Q, const u
   // amortises FP8's higher Tensor-Core throughput.
   if (topk == 128)
     DISPATCH_BY_NH_CM(BF16, 128);
+  else if (topk == 192)
+    DISPATCH_BY_NH_CM(BF16, 192);
+  else if (topk == 256)
+    DISPATCH_BY_NH_CM(BF16, 256);
   else if (topk == 512)
     DISPATCH_BY_NH_CM(FP8, 512);
   else if (topk == 1024)
@@ -324,6 +331,9 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
 #define DISPATCH_FULLTILE_BY_NH_PBSX(PBSX)            \
   do {                                                \
     switch (num_heads) {                              \
+      case 8:                                         \
+        DISPATCH_DUAL_MG_FULLTILE(8, 128, PBSX, 1);   \
+        return true;                                  \
       case 16:                                        \
         DISPATCH_DUAL_MG_FULLTILE(16, 128, PBSX, 1);  \
         return true;                                  \
@@ -351,7 +361,7 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
   }
 
 // topk_extra is runtime; extra_page_block_size stays template because it
-// changes the KV stride. NH=16 uses MG_N_HG_T=1.
+// changes the KV stride. NH=8/16 use MG_N_HG_T=1; NH=8 is padded internally.
 #define DISPATCH_DUAL_MG_CM(CM, NH, TK, PBSX, NHG)                                                \
   launch_prefill_mg_dual<ModelType::DSV4, ComputeMode::CM, NH, TK, 64, PBSX, NHG>(                \
       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens,      \
@@ -361,6 +371,9 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
 #define DISPATCH_BY_NH_PBSX(PBSX)                     \
   do {                                                \
     switch (num_heads) {                              \
+      case 8:                                         \
+        DISPATCH_DUAL_MG_CM(BF16, 8, 128, PBSX, 1);   \
+        return true;                                  \
       case 16:                                        \
         DISPATCH_DUAL_MG_CM(BF16, 16, 128, PBSX, 1);  \
         return true;                                  \

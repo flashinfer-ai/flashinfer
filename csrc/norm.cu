@@ -186,6 +186,74 @@ void fused_add_rmsnorm_quant(TensorView output, TensorView input, TensorView res
   });
 }
 
+// Add-residual + RMSNorm + 1x128 fp8 block-quant. Emits fp8 `output` [M,d], fp32 `block_scale`
+// (d/128, round_up(M,4)) column-major TMA layout, bf16 `normed_out` [M,d], and updates `residual`
+// in place with (input+residual). See norm::FusedAddRMSNormFP8BlockQuant.
+void fused_add_rmsnorm_fp8_block_quant(TensorView output, TensorView block_scale,
+                                       TensorView normed_out, TensorView input, TensorView residual,
+                                       TensorView weight, double eps, bool enable_pdl) {
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(residual);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(weight);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(output);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(normed_out);
+  // The kernel indexes block_scale as [(d/128) * stride(0) + m], i.e. unit-stride along m.
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(block_scale);
+  CHECK_DEVICE(input, residual);
+  CHECK_DEVICE(input, weight);
+  CHECK_DEVICE(input, output);
+  CHECK_DEVICE(input, block_scale);
+  CHECK_DEVICE(input, normed_out);
+  CHECK_DIM(2, input);     // (batch_size, hidden_size)
+  CHECK_DIM(2, residual);  // (batch_size, hidden_size)
+  CHECK_DIM(1, weight);    // (hidden_size)
+  CHECK_DIM(2, output);    // fp8 (batch_size, hidden_size)
+  CHECK_DIM(2, normed_out);
+  CHECK_DIM(2, block_scale);  // (hidden_size/128, round_up(batch_size, 4))
+  // residual/weight/normed_out share the kernel's compute type with input; output is e4m3 and
+  // block_scale is fp32 (the dtypes the fp8 block-scaled GEMMs consume).
+  CHECK_SAME_DTYPE(residual, input);
+  CHECK_SAME_DTYPE(weight, input);
+  CHECK_SAME_DTYPE(normed_out, input);
+  CHECK_INPUT_TYPE(output, dl_float8_e4m3fn);
+  CHECK_INPUT_TYPE(block_scale, dl_float32);
+  unsigned int batch_size = input.size(0);
+  unsigned int hidden_size = input.size(1);
+  unsigned int m_pad = (batch_size + 3) & ~3u;
+  TVM_FFI_ICHECK_EQ(residual.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(residual.size(1), hidden_size);
+  TVM_FFI_ICHECK_EQ(weight.size(0), hidden_size);
+  TVM_FFI_ICHECK_EQ(output.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(output.size(1), hidden_size);
+  TVM_FFI_ICHECK_EQ(normed_out.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(normed_out.size(1), hidden_size);
+  TVM_FFI_ICHECK_EQ(block_scale.size(0), hidden_size / 128);
+  TVM_FFI_ICHECK_EQ(block_scale.size(1), m_pad);
+  // Kernel covers each row single-wave with no per-thread bounds guard: hidden_size must be a whole
+  // number of warps of vectors -> <= 16384 and a multiple of 32*vec_size (256 for <=8192, 512
+  // above).
+  unsigned int vec_size = hidden_size <= 8192 ? 8 : 16;
+  TVM_FFI_ICHECK(hidden_size <= 16384 && hidden_size % (32 * vec_size) == 0)
+      << "fused_add_rmsnorm_fp8_block_quant: hidden_size " << hidden_size
+      << " unsupported (must be <= 16384 and a multiple of " << (32 * vec_size) << ")";
+  ffi::CUDADeviceGuard device_guard(input.device().device_id);
+  const cudaStream_t stream = get_stream(input.device());
+
+  // 1x128 block-scale activations are e4m3 (the layout DeepGEMM/flashinfer fp8 block GEMMs
+  // consume).
+  DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(input.dtype(), c_type, [&] {
+    cudaError_t status = norm::FusedAddRMSNormFP8BlockQuant<c_type, __nv_fp8_e4m3>(
+        static_cast<c_type*>(input.data_ptr()), static_cast<c_type*>(residual.data_ptr()),
+        static_cast<c_type*>(weight.data_ptr()), static_cast<__nv_fp8_e4m3*>(output.data_ptr()),
+        static_cast<float*>(block_scale.data_ptr()), static_cast<c_type*>(normed_out.data_ptr()),
+        batch_size, hidden_size, input.stride(0), residual.stride(0), output.stride(0),
+        normed_out.stride(0), block_scale.stride(0), eps, enable_pdl, stream);
+    TVM_FFI_ICHECK(status == cudaSuccess)
+        << "FusedAddRMSNormFP8BlockQuant failed with error code " << cudaGetErrorString(status);
+    return true;
+  });
+}
+
 void gemma_rmsnorm(TensorView output, TensorView input, TensorView weight, double eps,
                    bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(input);

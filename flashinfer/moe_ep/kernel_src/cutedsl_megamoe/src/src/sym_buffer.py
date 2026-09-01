@@ -46,7 +46,7 @@ except ImportError:  # older wheels: value is fixed by the GEP encoding ABI
 _BYVAL_RANK_LIMIT = 16  # struct<(array<16 x i64>)> == exactly 128B
 
 
-# TODO: Fix this when compiler fixed. This is a shit WAR due to the cuda-to-llvm bug, it just treats any kernel arg to tma_desc as long as it's marked `grid_constant + byval`
+# TODO: Remove once the compiler is fixed. Workaround for the cuda-to-llvm bug, it just treats any kernel arg to tma_desc as long as it's marked `grid_constant + byval`
 def _byval_struct_ty() -> Any:
     """128B byval pointee shared by alloca / GEP / the ``llvm.byval`` attr."""
     return ir.Type.parse(f"!llvm.struct<(array<{_BYVAL_RANK_LIMIT} x i64>)>")

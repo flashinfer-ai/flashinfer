@@ -18,7 +18,7 @@ except Exception:
 
 
 @functools.cache
-def _cudnn_supports_direct_seqlens(dtype: torch.dtype) -> bool:
+def _cudnn_supports_direct_seqlens(dtype: torch.dtype, *, mixed: bool = False) -> bool:
     """True if cuDNN can consume token-unit indptr buffers directly for `dtype`.
 
     Requires cu_seq_len_q/kv SDPA inputs and per-tensor ragged-offset
@@ -26,13 +26,24 @@ def _cudnn_supports_direct_seqlens(dtype: torch.dtype) -> bool:
     - fp16/bf16: cuDNN backend 9.24+ with cudnn-frontend 1.25+
     - fp8 (e4m3/e5m2): cuDNN backend 9.25+ with cudnn-frontend 1.27+ (the first
       release whose sdpa_fp8 python binding exposes cu_seq_len_q/kv)
+
+    `mixed=True` additionally requires *mixed-form* sequence lengths (cu_seq_len
+    on one side, per-batch on the other). This is the paged path, which pairs a
+    token-unit cu_seq_len_q with an actual-length seq_len_kv (KV addressed via
+    the page table). It needs cuDNN backend 9.25+ and a cudnn-frontend carrying
+    the per-side relaxation (frontend PR #430; released in 1.27+).
+
+    Note: this is a pure version compare against the runtime backend and the FE
+    package version (the practical proxy for the FE's compiled-against cuDNN).
+    The FE exposes no compiled/effective-version query, so a feature-probe with
+    NOT_SUPPORTED fallback is left as a follow-up.
     """
     if not CUDNN_AVAILABLE:
         return False
-    if dtype in (torch.float16, torch.bfloat16):
-        min_backend, min_frontend = 92400, (1, 25)
-    elif dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+    if mixed or (dtype in (torch.float8_e4m3fn, torch.float8_e5m2)):
         min_backend, min_frontend = 92500, (1, 27)
+    elif dtype in (torch.float16, torch.bfloat16):
+        min_backend, min_frontend = 92400, (1, 25)
     else:
         return False
     try:
@@ -207,24 +218,32 @@ if CUDNN_AVAILABLE:
         # multipliers. Mutually exclusive with actual_seq_lens_q/kv for the
         # mask role; dtype/version support is the caller's responsibility
         # (_cudnn_supports_direct_seqlens).
-        assert (cu_seq_lens_q is None) == (cu_seq_lens_kv is None), (
-            "cu_seq_lens_q and cu_seq_lens_kv must both be set or both unset"
-        )
+        # cu_seq_lens_q selects the direct (token-unit) path for Q: the buffer
+        # feeds the padding mask and, via batch_offsets_q, the Q/O ragged
+        # offsets. The KV side chooses its form independently -- cumulative
+        # (cu_seq_lens_kv, non-paged) or per-batch (actual_seq_lens_kv, paged).
+        # The paged case is the *mixed* form (cu_seq_len_q + seq_len_kv); KV is
+        # addressed through block_tables and carries no ragged offset. Mixed
+        # forms need cuDNN 9.25+ (_cudnn_supports_direct_seqlens(mixed=True)).
         use_cu_seq_lens = cu_seq_lens_q is not None
         if use_cu_seq_lens:
-            # Non-paged only for now: this is a FlashInfer plumbing limitation,
-            # not a cuDNN one (the unified engine supports paged attention with
-            # cu_seq_lens). The direct path reuses the token-unit indptrs as
-            # both cu_seq_lens and ragged offsets, and no paged caller passes a
-            # token-unit KV prefix sum today.
-            assert (
-                batch_offsets_q is not None
-                and batch_offsets_k is not None
-                and block_tables is None
-            ), (
-                "the cu_seq_lens path currently requires non-paged KV with "
-                "token-unit q/k batch offsets"
+            assert batch_offsets_q is not None, (
+                "cu_seq_lens_q requires token-unit batch_offsets_q"
             )
+            if block_tables is None:
+                assert cu_seq_lens_kv is not None and batch_offsets_k is not None, (
+                    "non-paged cu_seq_lens requires cu_seq_lens_kv and token-unit "
+                    "batch_offsets_k"
+                )
+            else:
+                assert (
+                    actual_seq_lens_kv is not None
+                    and cu_seq_lens_kv is None
+                    and batch_offsets_k is None
+                ), (
+                    "paged cu_seq_lens requires actual_seq_lens_kv and no "
+                    "cu_seq_lens_kv / batch_offsets_k (KV is paged)"
+                )
 
         if actual_seq_lens_q is not None:
             graph_b = actual_seq_lens_q.shape[0]
@@ -414,17 +433,12 @@ if CUDNN_AVAILABLE:
                 cudnn_v_block_tables.set_uid(UIDs.BLOCK_TABLES_V_UID.value)
 
             if use_cu_seq_lens:
-                # The cumulative seq lens occupy the ACTUAL_SEQ_LENS UID slots
-                # -- mutually exclusive with per-batch seq lens, same role. On
-                # the ragged path the caller passes the token-unit indptrs
-                # here, i.e. the same buffers as the ragged offsets.
+                # cu_seq_len_q occupies the Q seq-len UID slot (mutually
+                # exclusive with a per-batch seq_len_q, same role). On the
+                # ragged path it is the same buffer as the Q ragged offset.
                 cudnn_cu_seq_lens_q = g.tensor_like(cu_seq_lens_q)
                 cudnn_cu_seq_lens_q.set_name("cu_seq_lens_q")
                 cudnn_cu_seq_lens_q.set_uid(UIDs.ACTUAL_SEQ_LENS_Q_UID.value)
-
-                cudnn_cu_seq_lens_kv = g.tensor_like(cu_seq_lens_kv)
-                cudnn_cu_seq_lens_kv.set_name("cu_seq_lens_kv")
-                cudnn_cu_seq_lens_kv.set_uid(UIDs.ACTUAL_SEQ_LENS_KV_UID.value)
 
                 padding_mask = True
                 # These kwargs need a newer cudnn-frontend than the declared
@@ -433,13 +447,28 @@ if CUDNN_AVAILABLE:
                 # on this path, which _cudnn_supports_direct_seqlens guards.
                 seq_len_kwargs = {
                     "cu_seq_len_q": cudnn_cu_seq_lens_q,
-                    "cu_seq_len_kv": cudnn_cu_seq_lens_kv,
                     # cu_seq_lens are unified-engine-only; pin the
                     # implementation so an unsupported config fails with the
                     # unified engine's specific error instead of
                     # auto-selection's generic failure.
                     "implementation": cudnn.attention_implementation.UNIFIED,
                 }
+                # KV side, independent form. Both tensors take the shared
+                # ACTUAL_SEQ_LENS_KV UID; the execute var_map binds cu_seq_lens_kv
+                # or actual_seq_lens_kv to it accordingly.
+                if cu_seq_lens_kv is not None:
+                    # Non-paged: both-cumulative (KV also token-unit ragged).
+                    cudnn_cu_seq_lens_kv = g.tensor_like(cu_seq_lens_kv)
+                    cudnn_cu_seq_lens_kv.set_name("cu_seq_lens_kv")
+                    cudnn_cu_seq_lens_kv.set_uid(UIDs.ACTUAL_SEQ_LENS_KV_UID.value)
+                    seq_len_kwargs["cu_seq_len_kv"] = cudnn_cu_seq_lens_kv
+                else:
+                    # Mixed (paged): per-batch KV lengths mask; KV addressed via
+                    # block_tables. This form requires cuDNN 9.25+.
+                    cudnn_seq_len_kv = g.tensor_like(actual_seq_lens_kv)
+                    cudnn_seq_len_kv.set_name("seq_len_kv")
+                    cudnn_seq_len_kv.set_uid(UIDs.ACTUAL_SEQ_LENS_KV_UID.value)
+                    seq_len_kwargs["seq_len_kv"] = cudnn_seq_len_kv
             else:
                 if actual_seq_lens_q is not None:
                     cudnn_actual_seq_lens_q = g.tensor_like(actual_seq_lens_q)
@@ -565,7 +594,13 @@ if CUDNN_AVAILABLE:
 
             if use_cu_seq_lens:
                 tensors_to_return.append(cudnn_cu_seq_lens_q)
-                tensors_to_return.append(cudnn_cu_seq_lens_kv)
+                # KV tensor is cu_seq_len_kv (both-cumulative) or seq_len_kv
+                # (mixed/paged), whichever the KV branch above created.
+                tensors_to_return.append(
+                    cudnn_cu_seq_lens_kv
+                    if cu_seq_lens_kv is not None
+                    else cudnn_seq_len_kv
+                )
             else:
                 if actual_seq_lens_q is not None:
                     tensors_to_return.append(cudnn_actual_seq_lens_q)
@@ -939,19 +974,32 @@ def cudnn_batch_prefill_with_kv_cache(
 
         if batch_offsets_units == "tokens":
             h_kv = k_cache.shape[1]
-            use_direct = (
-                _cudnn_supports_direct_seqlens(q.dtype)
-                and block_tables is None
-                # The direct path consumes the q/k indptrs as cu_seq_lens.
-                and batch_offsets_q is not None
-                and batch_offsets_k is not None
-            )
+            if block_tables is None:
+                # Non-paged: both-cumulative direct path (KV is ragged). The
+                # token-unit q/k indptrs double as cu_seq_lens.
+                use_direct = (
+                    _cudnn_supports_direct_seqlens(q.dtype)
+                    and batch_offsets_q is not None
+                    and batch_offsets_k is not None
+                )
+            else:
+                # Paged: mixed direct path -- cu_seq_len_q (token-unit q indptr)
+                # + per-batch actual_seq_lens_kv for the mask; KV addressed via
+                # block_tables (no k/v ragged offsets). Requires mixed-form
+                # support (cuDNN 9.25+).
+                use_direct = (
+                    _cudnn_supports_direct_seqlens(q.dtype, mixed=True)
+                    and batch_offsets_q is not None
+                    and actual_seq_lens_kv is not None
+                )
             if use_direct:
-                # On the ragged path the token-unit indptrs are also the
-                # cumulative seq lens; cuDNN consumes them and the offsets
-                # directly (scaling offsets by per-tensor multipliers).
+                # The token-unit q indptr is both cu_seq_len_q and the Q/O
+                # ragged offset (per-tensor multipliers applied in the builder).
                 run_kwargs["cu_seq_lens_q"] = batch_offsets_q
-                run_kwargs["cu_seq_lens_kv"] = batch_offsets_k
+                if block_tables is None:
+                    run_kwargs["cu_seq_lens_kv"] = batch_offsets_k
+                # Paged: KV masked by actual_seq_lens_kv (already in run_kwargs);
+                # batch_offsets_k/v stay None.
             else:
                 # Old cuDNN/frontend or paged: convert the token-unit indptrs
                 # to the element units the legacy graph expects. Names are
