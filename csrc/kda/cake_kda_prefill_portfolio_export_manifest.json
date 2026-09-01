@@ -577,6 +577,13 @@
       "sha256": "8fc8ca44936b622eb65a06d77692644bc1ddaac012e62d5cc513cc35ac04dbbb"
     }
   ],
+  "generation_inputs": {
+    "observed_checkout_revision": "654b4fe8829aca18f6e778b299719574d3e6eb39",
+    "observed_tracked_tree_clean": true,
+    "producer_revision": "654b4fe8829aca18f6e778b299719574d3e6eb39",
+    "recipe_sha256": "0f644727ec76ee25053ff86b7dc95514e5e076eddbda071d4fd891a20383a0ca",
+    "schema": "cake.library_export.generation_inputs.v1"
+  },
   "library": "flashinfer",
   "modules": [
     {
@@ -12566,6 +12573,6 @@
   ],
   "name": "cake_kda_prefill_portfolio",
   "producer": "cake",
-  "producer_revision": "7567633417336a5285c565d4e0e64bd0ea1d5b2b",
+  "producer_revision": "654b4fe8829aca18f6e778b299719574d3e6eb39",
   "schema": "cake.library_export.v1"
 }
