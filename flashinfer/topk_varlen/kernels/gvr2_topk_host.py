@@ -75,6 +75,23 @@ def _device():
     return _dev_mod
 
 
+def _arch_token() -> str:
+    """Compile-target token for the launcher caches (mirrors the device
+    module's _compile_arch_token without forcing its cutlass import): a
+    heterogeneous multi-GPU process must not reuse a launcher whose compiled
+    engine targets another architecture."""
+    import os
+
+    env = os.environ.get("CUTE_DSL_ARCH")
+    if env:
+        return env
+    try:
+        major, minor = torch.cuda.get_device_capability()
+        return f"sm{major}{minor}"
+    except Exception:  # noqa: BLE001 — no GPU context: single-arch fallback
+        return "unknown"
+
+
 # ===========================================================================
 # ==== dispatch =============================================================
 # ===========================================================================
@@ -692,7 +709,7 @@ def _varlen_launcher(num_rows, npad, k, n_env, next_n, cr):
     the universally correct fallback; specialist family tiers below.  Every
     choice here is a function of capture-stable quantities only — mirroring
     the in-tree runner's pick_tuning(graph_capture=...) discipline."""
-    key = (num_rows, npad, k, n_env, next_n, cr)
+    key = (num_rows, npad, k, n_env, next_n, cr, _arch_token())
     hit = _VARLEN_CACHE.get(key)
     if hit is not None:
         return hit
@@ -1175,7 +1192,7 @@ def _run_impl(logits, pre_idx, n_valid, indices, ws, values=None):
                 values[:, n:] = torch.finfo(_F32).min  # -FLT_MAX pad
         return
 
-    key = (b, n, npad, k)
+    key = (b, n, npad, k, _arch_token())
     lc = _LAUNCH_CACHE.get(key)
     if lc is None:
         lc = _build_launcher(b, n, npad, k)
@@ -1398,7 +1415,7 @@ def run_varlen(
             # R increment (bounded plans, bounded _VARLEN_CACHE)
             n_env = 1 << max(n_env - 1, 1).bit_length()
         n_env = min(max(n_env, 1), npad)
-        key = (num_rows, npad, k, n_env, nn, cr)
+        key = (num_rows, npad, k, n_env, nn, cr, _arch_token())
         lc = _VARLEN_CACHE.get(key)
         if lc is None:
             if _is_capturing():

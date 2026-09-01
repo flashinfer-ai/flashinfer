@@ -1408,7 +1408,13 @@ def top_k_varlen(
                               exactness) and fp32 logits;
                               ``top_k`` in {512, 1024, 2048}. ``load_balance``
                               is ignored (the kernel families load-balance
-                              internally). Upstream caveat (reproduced
+                              internally). CUDA graphs: warm up each
+                              (num_rows, N, top_k, next_n, compress_ratio)
+                              geometry with one eager call before capture
+                              (an uncompiled launcher raises loudly under
+                              capture); replays may change ``seq_lens``
+                              CONTENTS freely in either direction. Upstream
+                              caveat (reproduced
                               bit-identically by the TRT-LLM implementation):
                               literal ``+inf`` logits may not be selected;
                               all finite values and ``-inf`` are tie-aware

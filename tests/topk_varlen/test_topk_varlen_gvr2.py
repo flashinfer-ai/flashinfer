@@ -441,7 +441,7 @@ def test_gvr2_workspace_override():
 
 def _assert_family(rows, msl_c, top_k, next_n, cr, want):
     """The varlen launcher must admit the same family the free route picks."""
-    key = (rows, msl_c, top_k, msl_c, next_n, cr)
+    key = (rows, msl_c, top_k, msl_c, next_n, cr, _host._arch_token())
     lc = _host._VARLEN_CACHE.get(key)
     assert lc is not None, f"launcher not cached for {key}"
     assert lc[0] == want, f"family {lc[0]} != {want} for {key}"
@@ -510,8 +510,12 @@ def test_gvr2_cuda_graph():
     with torch.cuda.graph(g):
         _run_gvr2(logits, seq_lens, top_k, pre_idx, out_indices=out_i)
 
-    for step in range(5):
-        kv = [min(v + 517 * step, msl) for v in kv0]
+    # Replays must survive BOTH directions of in-place length change (a
+    # schedule valid only for growth is a classic replay hazard): grow for a
+    # few steps, then shrink back below the short-path boundary.
+    deltas = [0, 517, 1034, 1551, -400, -1200]
+    for d in deltas:
+        kv = [min(max(v + d, 0), msl) for v in kv0]
         seq_lens.copy_(torch.tensor(kv, dtype=torch.int32, device=_DEV))
         logits.copy_(torch.randn(batch, msl, generator=gen, device=_DEV) - 2.0)
         out_i.fill_(-7)
@@ -548,6 +552,36 @@ def test_gvr2_warmup_then_capture():
 # ---------------------------------------------------------------------------
 # backend registration / guards / cross-backend
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
+def test_next_n_row_relationship_validated_up_front():
+    """The grouped next_n ABI (rows == batch * next_n, next_n >= 1) must be
+    rejected by the public API's own validation for EVERY backend — kernels
+    index seq_lens[row // next_n], so a mismatch reads the wrong request's
+    length (or out of bounds) rather than failing loudly."""
+    logits = torch.randn(4, 4096, dtype=torch.float32, device=_DEV)
+    seq_lens = torch.full((4,), 4096, dtype=torch.int32, device=_DEV)  # != 4/2
+    with pytest.raises(ValueError, match="seq_lens.shape"):
+        flashinfer.top_k_varlen(logits, seq_lens, 512, next_n=2)
+    with pytest.raises(ValueError, match="next_n"):
+        flashinfer.top_k_varlen(logits, seq_lens, 512, next_n=0)
+
+
+@requires_gvr2
+def test_gvr2_empty_batch():
+    """B=0 must be a well-formed no-op through the public API (both the
+    explicit backend and auto), returning a (0, top_k) result — not a crash
+    in scheduling, compilation, or the heuristic."""
+    logits = torch.empty(0, 8192, dtype=torch.float32, device=_DEV)
+    seq_lens = torch.empty(0, dtype=torch.int32, device=_DEV)
+    pre_idx = torch.empty(0, 512, dtype=torch.int32, device=_DEV)
+    for backend in ("gvr_2", "auto"):
+        indices, values = flashinfer.top_k_varlen(
+            logits, seq_lens, 512, pre_idx=pre_idx, backend=backend
+        )
+        assert tuple(indices.shape) == (0, 512)
+        assert values is None
 
 
 @requires_gvr2

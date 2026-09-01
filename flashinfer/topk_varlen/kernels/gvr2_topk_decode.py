@@ -52,6 +52,28 @@ from cutlass.utils.smem_allocator import SmemAllocator
 C = sys.modules[__name__]
 
 
+def _compile_arch_token() -> str:
+    """Current compile target, mirroring the persistent cache's arch axis
+    (CUTE_DSL_ARCH env override, else the current device's capability).
+
+    Included in the in-process ``_COMPILE_CACHE*`` keys so a heterogeneous
+    multi-GPU process (e.g. SM100 + SM103) never serves a callable compiled
+    for another architecture — the on-disk cache is arch-namespaced, but
+    these dicts sit above it."""
+    import os
+
+    env = os.environ.get("CUTE_DSL_ARCH")
+    if env:
+        return env
+    try:
+        import torch  # lazy: module stays torch-free at import
+
+        major, minor = torch.cuda.get_device_capability()
+        return f"sm{major}{minor}"
+    except Exception:  # noqa: BLE001 — no GPU context: single-arch fallback
+        return "unknown"
+
+
 def _persist(kernel_name: str, compile_fn):
     """Route a ``cute.compile`` closure through FlashInfer's persistent
     CuTe-DSL kernel cache (one ``gvr2_topk`` module directory shared by all
@@ -2988,7 +3010,7 @@ def get_compiled(tpl, options_extra: str = ""):
     tpl = (BLK, U, MINB, NBS, KPT, SPLIT, TSHG, NEXT_N, CR_SHIFT, R_CONST)
     — per-row varlen mode (TSHG slot is ignored: varlen compiles the TSH
     machinery in whenever SPLIT and gates it per row at runtime)."""
-    key = (tuple(tpl), options_extra)
+    key = (tuple(tpl), options_extra, C._compile_arch_token())
     hit = _COMPILE_CACHE.get(key)
     if hit is not None:
         return hit
@@ -4239,7 +4261,7 @@ _COMPILE_CACHE__reg: dict = {}
 def get_compiled__reg(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0):
     """Compile (or fetch) the variant for constexpr tuple
     (BLK, VPT, MINB, KPT, CUR, DEG, IMG, NBH)."""
-    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift))
+    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift), C._compile_arch_token())
     compiled = _COMPILE_CACHE__reg.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
@@ -5604,7 +5626,16 @@ def get_compiled__clus(
     """Compile (or fetch) the gvr_clus variant for constexpr tuple
     tpl = (BLK, U, MINB, NBS, CS); scap/cmp are smem-extent keys (every
     reachable route has 8192/2048 — asserted by run__clus())."""
-    key = (tuple(tpl), scap, cmp_, options_extra, bool(varlen), int(next_n), int(cr_shift))
+    key = (
+        tuple(tpl),
+        scap,
+        cmp_,
+        options_extra,
+        bool(varlen),
+        int(next_n),
+        int(cr_shift),
+        C._compile_arch_token(),
+    )
     hit = _COMPILE_CACHE__clus.get(key)
     if hit is not None:
         return hit
@@ -6514,7 +6545,7 @@ _COMPILE_CACHE__regclus: dict = {}
 
 def get_compiled__regclus(tpl, dump_dir=None, pdl=False, varlen=False, next_n=1, cr_shift=0):
     """Compile (or fetch) the variant for constexpr tuple (BLK, VPT, CS)."""
-    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift))
+    key = (tuple(tpl), bool(pdl), bool(varlen), int(next_n), int(cr_shift), C._compile_arch_token())
     compiled = _COMPILE_CACHE__regclus.get(key)
     if compiled is None:
         from cutlass.cute import runtime as _crt
