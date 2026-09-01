@@ -189,12 +189,30 @@ def test_long_row_dispatch_is_exact(
 @pytest.mark.parametrize(
     ("arch", "seq_lens", "dtype", "heads", "expected_prefill"),
     [
-        ("sm_100a", (128,), torch.float16, (1, 1, 1), "cp_prefill_equal_head_checkpoint"),
-        ("sm_100a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head_checkpoint"),
+        (
+            "sm_100a",
+            (128,),
+            torch.float16,
+            (1, 1, 1),
+            "cp_prefill_equal_head_checkpoint",
+        ),
+        (
+            "sm_100a",
+            (128,),
+            torch.float16,
+            (32, 32, 32),
+            "cp_prefill_equal_head_checkpoint",
+        ),
         ("sm_103a", (128,), torch.float16, (32, 32, 32), "cp_prefill_equal_head_h32"),
         ("sm_100a", (128,), torch.bfloat16, (1, 1, 1), "cp_prefill_bf16"),
         ("sm_100a", (65,), torch.bfloat16, (1, 1, 2), "cp_prefill_generic_bf16"),
-        ("sm_100a", (128, 129), torch.float16, (4, 2, 2), "cp_prefill_generic_checkpoint"),
+        (
+            "sm_100a",
+            (128, 129),
+            torch.float16,
+            (4, 2, 2),
+            "cp_prefill_generic_checkpoint",
+        ),
     ],
 )
 def test_generic_plan_selects_head_dtype_and_tail_routes(
@@ -379,9 +397,7 @@ def test_zero_length_plans_keep_semantic_fixup_and_skip_empty_grids(
 
     def plan_for(seq_lens: tuple[int, ...]) -> gdn_cp.GDNCPPrefillPlan:
         total = sum(seq_lens)
-        q = SimpleNamespace(
-            shape=(total, 1, 128), device=device, dtype=torch.float16
-        )
+        q = SimpleNamespace(shape=(total, 1, 128), device=device, dtype=torch.float16)
         k = SimpleNamespace(shape=(total, 1, 128))
         v = SimpleNamespace(shape=(total, 1, 128))
         return gdn_cp._build_plan(q, k, v, seq_lens)
@@ -441,12 +457,9 @@ def test_explicit_alpha_recomputes_requested_bf16_final_state(
     )
 
     assert needs_final_state is (
-        output_final_state
-        and (use_qk_l2norm_in_kernel or io_dtype == torch.bfloat16)
+        output_final_state and (use_qk_l2norm_in_kernel or io_dtype == torch.bfloat16)
     )
-    assert needs_output is (
-        io_dtype == torch.bfloat16 and not use_qk_l2norm_in_kernel
-    )
+    assert needs_output is (io_dtype == torch.bfloat16 and not use_qk_l2norm_in_kernel)
     assert normalize_qk == int(use_qk_l2norm_in_kernel)
     assert use_block64 == int(
         io_dtype == torch.bfloat16 and not use_qk_l2norm_in_kernel
@@ -1311,13 +1324,9 @@ def test_public_checkpoint_matches_oracle_on_caller_stream_and_cuda_graph(
     )
 
     q_semantic = q.float()
-    q_semantic *= torch.rsqrt(
-        q_semantic.square().sum(dim=-1, keepdim=True) + 1.0e-6
-    )
+    q_semantic *= torch.rsqrt(q_semantic.square().sum(dim=-1, keepdim=True) + 1.0e-6)
     k_semantic = k.float()
-    k_semantic *= torch.rsqrt(
-        k_semantic.square().sum(dim=-1, keepdim=True) + 1.0e-6
-    )
+    k_semantic *= torch.rsqrt(k_semantic.square().sum(dim=-1, keepdim=True) + 1.0e-6)
     q_kernel = q_semantic.to(q.dtype)
     k_kernel = k_semantic.to(k.dtype)
     expected_output_fp32, _ = delta_rule(
@@ -1720,8 +1729,7 @@ def test_public_dispatcher_preserves_zero_length_sequences_and_state_pool(
             residual = v[token].float() - previous_value
             state_hkv += k[token].float().unsqueeze(-1) * residual.unsqueeze(-2)
             expected_output[token] = (
-                0.125
-                * torch.einsum("hk,hkv->hv", q[token].float(), state_hkv)
+                0.125 * torch.einsum("hk,hkv->hv", q[token].float(), state_hkv)
             ).to(expected_output.dtype)
         expected_state[pool_row].copy_(state_hkv.transpose(-1, -2))
         token_start += seq_len
@@ -1839,9 +1847,7 @@ def test_public_dispatcher_uses_only_gdn_cp_for_indexed_inplace_gqa(
         pool_row = int(state_indices[sequence_index])
         state_hkv = reference_state[pool_row].transpose(-1, -2).float()
         for token in range(token_start, token_start + seq_len):
-            previous_value = torch.einsum(
-                "hk,hkv->hv", k_reference[token], state_hkv
-            )
+            previous_value = torch.einsum("hk,hkv->hv", k_reference[token], state_hkv)
             residual = v_reference[token] - previous_value
             state_hkv += k_reference[token].unsqueeze(-1) * residual.unsqueeze(-2)
             expected_output_fp32[token] = 0.125 * torch.einsum(

@@ -77,14 +77,9 @@ def _use_gdn_cp_sm100(
             or cp_chunk_len not in (None, checkpoint_every_n_tokens)
         ):
             return False
-    elif (
-        state_checkpoints is not None
-        or checkpoint_cu_starts is not None
-    ):
+    elif state_checkpoints is not None or checkpoint_cu_starts is not None:
         return False
-    if cp_chunk_len is not None and (
-        cp_chunk_len <= 0 or cp_chunk_len % 64 != 0
-    ):
+    if cp_chunk_len is not None and (cp_chunk_len <= 0 or cp_chunk_len % 64 != 0):
         return False
     return all(
         tensor is None or tensor.dtype in _GDN_CP_STATE_DTYPES

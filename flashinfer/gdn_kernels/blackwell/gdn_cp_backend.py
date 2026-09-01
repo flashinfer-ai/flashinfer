@@ -137,8 +137,7 @@ def _require_positive_non_overlapping_state_layout(
         left0 = (
             0
             if reduced_right == 1
-            else (reduced_target * pow(reduced_left, -1, reduced_right))
-            % reduced_right
+            else (reduced_target * pow(reduced_left, -1, reduced_right)) % reduced_right
         )
         right0 = (target - left_stride * left0) // right_stride
 
@@ -289,9 +288,7 @@ def _recurrence_requirements(
     """Resolve semantic recurrence launches, including BF16 state repair."""
 
     needs_final_state = output_final_state and (
-        alpha_was_none
-        or use_qk_l2norm_in_kernel
-        or io_dtype == torch.bfloat16
+        alpha_was_none or use_qk_l2norm_in_kernel or io_dtype == torch.bfloat16
     )
     needs_output = alpha_was_none or (
         io_dtype == torch.bfloat16 and not use_qk_l2norm_in_kernel
@@ -604,12 +601,8 @@ class GDNCPPrefill:
             dtype=q.dtype,
             device=q.device,
         )
-        self.q_normalized = (
-            torch.empty_like(q) if use_qk_l2norm_in_kernel else q
-        )
-        self.k_normalized = (
-            torch.empty_like(k) if use_qk_l2norm_in_kernel else k
-        )
+        self.q_normalized = torch.empty_like(q) if use_qk_l2norm_in_kernel else q
+        self.k_normalized = torch.empty_like(k) if use_qk_l2norm_in_kernel else k
         self.local_transfer = torch.empty(
             matrix_shape, dtype=torch.float32, device=q.device
         )
@@ -695,9 +688,7 @@ class GDNCPPrefill:
                 recurrence_name, plan.arch
             )
         if needs_output_recurrence:
-            self._output_recurrence = load_gdn_cp_kernel(
-                recurrence_name, plan.arch
-            )
+            self._output_recurrence = load_gdn_cp_kernel(recurrence_name, plan.arch)
 
         self._inplace_state = (
             initial_state is not None and self.final_state is initial_state
@@ -1056,9 +1047,7 @@ def prepare_gdn_cp_prefill(
         raise ValueError(
             "checkpoint_every_n_tokens must be zero or a positive multiple of 64"
         )
-    if cp_chunk_len is not None and (
-        cp_chunk_len <= 0 or cp_chunk_len % _BLOCK
-    ):
+    if cp_chunk_len is not None and (cp_chunk_len <= 0 or cp_chunk_len % _BLOCK):
         raise ValueError("cp_chunk_len must be a positive multiple of 64")
     if not isinstance(use_qk_l2norm_in_kernel, bool):
         raise TypeError("use_qk_l2norm_in_kernel must be a bool")
