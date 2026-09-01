@@ -108,7 +108,7 @@ def _split_scale_param(scale):
         return None, float(scale)
 
 
-def _clone_variable_window_bounds(
+def _validate_variable_window_bounds(
     variable_window_token_starts,
     variable_window_token_ends,
     *,
@@ -123,7 +123,11 @@ def _clone_variable_window_bounds(
     head_dim_qk: int,
     head_dim_vo: int,
 ):
-    """Validate packed [nnz_qo] VariableWindow bounds and clone them at plan time."""
+    """Validate packed [nnz_qo] VariableWindow bounds.
+
+    Returns the caller tensors by reference (same contract as ``prefix_len_ptr``).
+    They must stay alive and unchanged from ``plan()`` through ``run()``.
+    """
     has_starts = variable_window_token_starts is not None
     has_ends = variable_window_token_ends is not None
     if has_starts != has_ends:
@@ -183,7 +187,7 @@ def _clone_variable_window_bounds(
             f"variable_window_token_starts/ends must have shape [{nnz_qo}] "
             f"(got {tuple(starts.shape)} and {tuple(ends.shape)})"
         )
-    return True, starts.clone(), ends.clone()
+    return True, starts, ends
 
 
 @functools.cache
@@ -2407,7 +2411,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Packed int32 ``[nnz_qo]`` inclusive KV start index per query token (ragged
             ``qo_indptr`` order). Must be paired with ``variable_window_token_ends``.
             FA3 only; mutually exclusive with sliding window, custom mask, causal, and
-            multi-item scoring. Cloned at ``plan()`` and reused at ``run()``.
+            multi-item scoring. Held by reference like ``prefix_len_ptr`` and reused
+            at ``run()``; keep the tensors alive and unchanged until then.
         variable_window_token_ends : Optional[torch.Tensor]
             Packed int32 ``[nnz_qo]`` inclusive KV end index per query token.
         Note
@@ -2485,7 +2490,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._use_variable_window,
             self._variable_window_token_starts,
             self._variable_window_token_ends,
-        ) = _clone_variable_window_bounds(
+        ) = _validate_variable_window_bounds(
             variable_window_token_starts,
             variable_window_token_ends,
             nnz_qo=total_num_rows,
@@ -3805,7 +3810,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Packed int32 ``[nnz_qo]`` inclusive KV start index per query token (ragged
             ``qo_indptr`` order). Must be paired with ``variable_window_token_ends``.
             FA3 only; mutually exclusive with sliding window, custom mask, causal, and
-            multi-item scoring. Cloned at ``plan()`` and reused at ``run()``.
+            multi-item scoring. Held by reference like ``prefix_len_ptr`` and reused
+            at ``run()``; keep the tensors alive and unchanged until then.
         variable_window_token_ends : Optional[torch.Tensor]
             Packed int32 ``[nnz_qo]`` inclusive KV end index per query token.
         Note
@@ -3863,7 +3869,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._use_variable_window,
             self._variable_window_token_starts,
             self._variable_window_token_ends,
-        ) = _clone_variable_window_bounds(
+        ) = _validate_variable_window_bounds(
             variable_window_token_starts,
             variable_window_token_ends,
             nnz_qo=total_num_rows,
