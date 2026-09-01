@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+
 import numpy as np
 import pytest
 import torch
@@ -396,7 +398,273 @@ def test_variable_block_sparse_attention_wrapper(
     )
 
 
+def _paged_reference(q, k_cache, v_cache, route, page_size, layout, num_kv_heads):
+    """Gather the routed KV entries and run dense attention on them."""
+    pages = k_cache.shape[0]
+    if layout == "HND":
+        flat_k = k_cache.permute(0, 2, 1, 3).reshape(
+            pages * page_size, num_kv_heads, -1
+        )
+        flat_v = v_cache.permute(0, 2, 1, 3).reshape(
+            pages * page_size, num_kv_heads, -1
+        )
+    else:
+        flat_k = k_cache.reshape(pages * page_size, num_kv_heads, -1)
+        flat_v = v_cache.reshape(pages * page_size, num_kv_heads, -1)
+    rows, width = route.shape
+    heads = q.shape[1]
+    group = heads // num_kv_heads
+    k = flat_k[route.reshape(-1)].reshape(rows, width, num_kv_heads, -1)
+    v = flat_v[route.reshape(-1)].reshape(rows, width, num_kv_heads, -1)
+    k = k.repeat_interleave(group, dim=2).float()
+    v = v.repeat_interleave(group, dim=2).float()
+    logits = torch.einsum("rhd,rwhd->rhw", q.float(), k) / math.sqrt(q.shape[-1])
+    return torch.einsum("rhw,rwhd->rhd", torch.softmax(logits, dim=-1), v).to(q.dtype)
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 2, 4])
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+@pytest.mark.parametrize("page_size", [1, 16])
+def test_block_sparse_paged_route(num_kv_heads, layout, page_size):
+    """A route of physical slots over a cache that still stores whole pages.
+
+    The wrapper must divide each index back into (page, entry); reading it as
+    a page id would address a different token, which the reference catches.
+    """
+    torch.manual_seed(42)
+    num_qo_heads, head_dim, pages, rows, width = 8, 128, 12, 6, 9
+    entries = pages * page_size
+    device = "cuda:0"
+    shape = (
+        (pages, page_size, num_kv_heads, head_dim)
+        if layout == "NHD"
+        else (pages, num_kv_heads, page_size, head_dim)
+    )
+    k_cache = torch.randn(*shape, dtype=torch.float16, device=device)
+    v_cache = torch.randn_like(k_cache)
+    q = torch.randn(rows, num_qo_heads, head_dim, dtype=torch.float16, device=device)
+    # scatter the route so consecutive entries land in different pages, and
+    # repeat one page so several entries share it
+    route = torch.randint(0, entries, (rows, width), dtype=torch.int32, device=device)
+
+    indptr = torch.arange(
+        0, (rows + 1) * width, width, dtype=torch.int32, device=device
+    )
+    wrapper = flashinfer.BlockSparseAttentionWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+        kv_layout=layout,
+    )
+    wrapper.plan(
+        indptr,
+        route.reshape(-1).contiguous(),
+        rows,
+        entries,
+        1,
+        1,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        mask=torch.ones(rows * width, 1, 1, dtype=torch.bool, device=device),
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+        o_data_type=torch.float16,
+        kv_cache_page_size=page_size,
+    )
+    out = wrapper.run(q, k_cache, v_cache)
+    ref = _paged_reference(q, k_cache, v_cache, route, page_size, layout, num_kv_heads)
+    torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
+
+
+def test_block_sparse_paged_route_rejects_bad_geometry():
+    """Every bound the kernel cannot check for itself has to raise here."""
+    device = "cuda:0"
+    num_qo_heads, num_kv_heads, head_dim, pages, page_size = 4, 2, 128, 8, 16
+    entries = pages * page_size
+    rows, width = 4, 5
+    k_cache = torch.randn(
+        pages, num_kv_heads, page_size, head_dim, dtype=torch.float16, device=device
+    )
+    v_cache = torch.randn_like(k_cache)
+    q = torch.randn(rows, num_qo_heads, head_dim, dtype=torch.float16, device=device)
+    route = torch.randint(0, entries, (rows, width), dtype=torch.int32, device=device)
+    indptr = torch.arange(
+        0, (rows + 1) * width, width, dtype=torch.int32, device=device
+    )
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+
+    def make_plan(**overrides):
+        wrapper = flashinfer.BlockSparseAttentionWrapper(
+            workspace, kv_layout=overrides.pop("kv_layout", "HND")
+        )
+        kwargs = dict(
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            mask=torch.ones(rows * width, 1, 1, dtype=torch.bool, device=device),
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+            o_data_type=torch.float16,
+            kv_cache_page_size=page_size,
+        )
+        kwargs.update(overrides)
+        indices = kwargs.pop("indices", route.reshape(-1).contiguous())
+        wrapper.plan(indptr, indices, rows, entries, 1, 1, **kwargs)
+        return wrapper
+
+    # a negative route element is loaded as a huge uint32
+    negative = route.clone()
+    negative[0, 0] = -1
+    with pytest.raises(ValueError, match="non-negative"):
+        make_plan(indices=negative.reshape(-1).contiguous())
+
+    # one past the last entry is still out of bounds
+    past_end = route.clone()
+    past_end[0, 0] = entries
+    with pytest.raises(ValueError, match="out of bound"):
+        make_plan(indices=past_end.reshape(-1).contiguous())
+
+    # HND describes a paged cache; without one there is no page axis
+    with pytest.raises(ValueError, match="HND"):
+        make_plan(kv_cache_page_size=None)
+
+    # a route of slots needs a logical block of one entry
+    with pytest.raises(ValueError, match="C must be 1"):
+        flashinfer.BlockSparseAttentionWrapper(workspace, kv_layout="HND").plan(
+            indptr,
+            route.reshape(-1).contiguous(),
+            rows,
+            entries,
+            1,
+            2,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_data_type=torch.float16,
+            kv_data_type=torch.float16,
+            o_data_type=torch.float16,
+            kv_cache_page_size=page_size,
+        )
+
+    # a value cache the route can read past
+    wrapper = make_plan()
+    with pytest.raises(ValueError, match="KV entries"):
+        wrapper.run(q, k_cache, v_cache[:-1])
+
+    # both caches are large enough on their own, but the route addresses one
+    # cache and the kernel takes its geometry from the other
+    wide_k = torch.cat([k_cache, k_cache], dim=0)
+    with pytest.raises(ValueError, match="pages"):
+        wrapper.run(q, wide_k, v_cache)
+
+    # the page size the tensor carries has to be the planned one
+    with pytest.raises(ValueError, match="entries per page"):
+        wrapper.run(q, k_cache[:, :, :-1], v_cache[:, :, :-1])
+
+    # a cache too small for the planned route would be read past the end
+    small = flashinfer.BlockSparseAttentionWrapper(workspace, kv_layout="HND")
+    small.plan(
+        indptr,
+        route.reshape(-1).contiguous(),
+        rows,
+        entries,
+        1,
+        1,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        mask=torch.ones(rows * width, 1, 1, dtype=torch.bool, device=device),
+        q_data_type=torch.float16,
+        kv_data_type=torch.float16,
+        o_data_type=torch.float16,
+        kv_cache_page_size=page_size,
+    )
+    with pytest.raises(ValueError, match="KV entries"):
+        small.run(q, k_cache[:-1], v_cache[:-1])
+
+
 if __name__ == "__main__":
     # This test verifies the INT32_T overflow issue.
     for seq_len in [16 * 1024, 32 * 1024, 40 * 1024, 48 * 1024, 64 * 1024]:
         test_block_sparse_attention(128, 128, seq_len, seq_len, 1, 1, 128, False)
+
+
+DEV = "cuda:0"
+
+requires_cuda_sm80 = pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 8,
+    reason="the FA2 large-head path starts at sm_80",
+)
+
+
+@requires_cuda_sm80
+@pytest.mark.parametrize("head_dim", [256, 512])
+@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+def test_paged_route_reads_a_wide_quantized_head(head_dim, kv_dtype):
+    """A one-byte cache of any supported width reads on this architecture.
+
+    The FA2 large-head path rebuilds a quantized cache from raw bytes before
+    the dots, which does not depend on the architecture the bytes were written
+    for. This pins that down for the widths the read paths claim.
+    """
+    num_qo_heads, num_kv_heads, page_size = 8, 1, 64
+    rows, width, pages = 4, 64, 8
+    g = torch.Generator(device=DEV).manual_seed(head_dim)
+
+    keys = (
+        torch.randn(
+            pages,
+            num_kv_heads,
+            page_size,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=DEV,
+            generator=g,
+        )
+        * 0.3
+    )
+    values = torch.randn_like(keys) * 0.3
+    scale = 0.5
+    if kv_dtype == torch.float8_e4m3fn:
+        keys = (keys.float() / scale).to(kv_dtype)
+        values = (values.float() / scale).to(kv_dtype)
+        run_kwargs = {"k_scale": scale, "v_scale": scale}
+        # The reference reads the same bytes, dequantized ahead of time.
+        ref_keys = (keys.float() * scale).to(torch.bfloat16)
+        ref_values = (values.float() * scale).to(torch.bfloat16)
+    else:
+        run_kwargs = {}
+        ref_keys, ref_values = keys, values
+
+    query = torch.randn(
+        rows, num_qo_heads, head_dim, dtype=torch.bfloat16, device=DEV, generator=g
+    )
+    route = torch.randint(
+        0, pages * page_size, (rows, width), dtype=torch.int32, device=DEV, generator=g
+    )
+    indptr = torch.arange(0, (rows + 1) * width, width, dtype=torch.int32, device=DEV)
+    mask = torch.ones(rows * width, 1, 1, dtype=torch.bool, device=DEV)
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=DEV)
+
+    def run(k, v, dtype, **kwargs):
+        wrapper = flashinfer.BlockSparseAttentionWrapper(workspace, kv_layout="HND")
+        wrapper.plan(
+            indptr,
+            route.reshape(-1).contiguous(),
+            rows,
+            pages * page_size,
+            1,
+            1,
+            num_qo_heads=num_qo_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            mask=mask,
+            q_data_type=torch.bfloat16,
+            kv_data_type=dtype,
+            o_data_type=torch.bfloat16,
+            kv_cache_page_size=page_size,
+        )
+        return wrapper.run(query, k, v, **kwargs)
+
+    out = run(keys, values, kv_dtype, **run_kwargs)
+    expected = run(ref_keys, ref_values, torch.bfloat16)
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
