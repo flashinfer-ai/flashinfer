@@ -437,13 +437,13 @@ class LowLatencyBlockscaledGemmKernel:
         """
         m, n, k, l = problem_mnkl
         a = cute.make_tensor(
-            a_ptr, cute.make_ordered_layout((cute.assume(m, 32), k, l), order=(1, 0, 2))
+            a_ptr, cute.make_ordered_layout((m, k, l), order=(1, 0, 2))
         )
         b = cute.make_tensor(
-            b_ptr, cute.make_ordered_layout((cute.assume(n, 32), k, l), order=(1, 0, 2))
+            b_ptr, cute.make_ordered_layout((n, k, l), order=(1, 0, 2))
         )
         c = cute.make_tensor(
-            c_ptr, cute.make_ordered_layout((cute.assume(m, 32), n, l), order=(0, 1, 2))
+            c_ptr, cute.make_ordered_layout((m, n, l), order=(0, 1, 2))
         )
         self.a_dtype = a_ptr.value_type
         self.b_dtype = b_ptr.value_type
@@ -458,7 +458,7 @@ class LowLatencyBlockscaledGemmKernel:
             assert bias_ptr is not None
             bias = cute.make_tensor(
                 bias_ptr,
-                cute.make_layout((cute.assume(m, 32), n, l), stride=(1, 0, 0)),
+                cute.make_layout((m, n, l), stride=(1, 0, 0)),
             )
             self.bias_dtype = bias_ptr.value_type
         else:
