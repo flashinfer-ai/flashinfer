@@ -188,20 +188,16 @@ def get_rubin_gemm1_valid_tactics(tile_size: int) -> List[Tuple]:
 
     # (mma_tiler_m, mma_inst_m) candidates — B-reuse when tiler_m = 2 * inst_m
     #
-    # NOTE: while tile_size is restricted to 128 (see get_rubin_moe_valid_tactics),
-    # the mma_tiler_m == tile_size and cluster_shape_m * mma_tiler_m <= tile_size
-    # constraints below force mma_tiler_m = 128 and cluster_shape_m = 1.  Every
-    # 2CTA and B-reuse entry here is therefore currently unreachable, and only
-    # the two 1CTA (128, 128) tactics are actually tuned.  The entries are kept
-    # because they become reachable again once tile_size=256 is re-enabled.
+    # The mma_tiler_m == tile_size and cluster_shape_m * mma_tiler_m <= tile_size
+    # constraints below decide which of these are reachable at a given tile_size;
+    # entries unreachable at one tile_size are reachable at another.
     mma_m_candidates = [
         (128, 128),  # no B-reuse, 1CTA
-        (256, 256),  # no B-reuse, 2CTA   (unreachable at tile_size=128)
-        (256, 128),  # B-reuse, 1CTA      (unreachable at tile_size=128)
-        (512, 256),  # B-reuse, 2CTA      (unreachable at tile_size=128)
+        (256, 256),  # no B-reuse, 2CTA
+        (256, 128),  # B-reuse, 1CTA
+        (512, 256),  # B-reuse, 2CTA
     ]
     mma_n_candidates = [128, 256]
-    # (2, 1) is unreachable at tile_size=128 for the same reason.
     cluster_shape_mn_candidates = [(1, 1), (2, 1)]
     raster_along_m_candidates = [False]
 
@@ -245,13 +241,13 @@ def get_rubin_gemm2_valid_tactics(tile_size: int) -> List[Tuple]:
     mma_inst_k = 128
 
     # As in get_rubin_gemm1_valid_tactics, the mma_tiler_m == tile_size and
-    # cluster_shape_m * mma_tiler_m <= tile_size constraints below make every
-    # 2CTA and B-reuse entry unreachable while tile_size is restricted to 128.
+    # cluster_shape_m * mma_tiler_m <= tile_size constraints below decide which
+    # of these are reachable at a given tile_size.
     mma_m_candidates = [
         (128, 128),
-        (256, 256),  # unreachable at tile_size=128
-        (256, 128),  # unreachable at tile_size=128
-        (512, 256),  # unreachable at tile_size=128
+        (256, 256),
+        (256, 128),
+        (512, 256),
     ]
     mma_n_candidates = [128, 256]
     # cluster_shape_n is pinned to 1: the Rubin finalize kernel triggers
@@ -297,11 +293,11 @@ def get_rubin_moe_valid_tactics() -> List[Tuple]:
     Returns: List of (tile_size, gemm1_tactic, gemm2_tactic)
     """
     tactics = []
-    # Only tile_size=128 is enabled. tile_size=256 with B-reuse causes
-    # illegal memory accesses for certain GEMM2 tactic configurations and
-    # is disabled until the kernel bug is fixed (mirrors the Blackwell
-    # restriction in get_blackwell_moe_valid_tactics).
-    for tile_size in [128]:
+    # tile_size=256 is enabled, mirroring get_blackwell_moe_valid_tactics: the
+    # gemm1(2CTA)/gemm2(1CTA) layout mismatch that motivated the restriction
+    # (#3067) was fixed by parameterizing the gemm2 candidates on tile_size
+    # (#3171), which get_rubin_gemm2_valid_tactics already does.
+    for tile_size in VALID_TILE_SIZES:
         gemm1_tactics = get_rubin_gemm1_valid_tactics(tile_size)
         gemm2_tactics = get_rubin_gemm2_valid_tactics(tile_size)
         for gemm1_tactic, gemm2_tactic in itertools.product(
