@@ -3205,7 +3205,7 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
       finalize_m<KTraits>(variant, m);
 
       const uint32_t num_kv_chunks =
-          ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+          ceil_div(min(kv_len_safe, window_left + (window_right >= 0 ? static_cast<uint32_t>(window_right) : 0u) + CTA_TILE_Q),
       if constexpr (KTraits::USE_SOFTMAX_VO_SPLIT) {
         vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
                                  partition_kv ? num_kv_chunks * o_stride_n : o_stride_n, o_stride_h,
@@ -4113,7 +4113,7 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       finalize_m<KTraits>(variant, m);
 
       const uint32_t num_kv_chunks =
-          ceil_div(min(kv_len_safe, window_left + CTA_TILE_Q), kv_chunk_size);
+          ceil_div(min(kv_len_safe, window_left + (window_right >= 0 ? static_cast<uint32_t>(window_right) : 0u) + CTA_TILE_Q),
 
       if constexpr (KTraits::USE_VO_SPLIT) {
         vosplit_write_o<KTraits>(o_frag, d, o_ptr_base, qo_packed_idx_base, qo_len,
