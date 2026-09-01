@@ -383,12 +383,14 @@ __global__ void __launch_bounds__(kBlock) QSAPreIndexerKernel(QSAPreIndexerParam
 
   const int32_t query_start = a.query_start_loc[request];
   const int32_t query_end = a.query_start_loc[request + 1];
-  const int32_t query_len = query_end - query_start;
   // The offsets are the caller's too, and only their length was checked. A
   // request with no tokens has nothing to pool and no last token to read the
   // chunk's end from, and a range that runs off either end of the token axis
-  // would make the read below land outside logical_positions.
-  if (query_len <= 0 || query_start < 0 || query_end > a.num_tokens) return;
+  // would make the read below land outside logical_positions. The bounds come
+  // before the subtraction: [INT32_MAX, INT32_MIN] wraps to a length of 1 and
+  // would walk straight past the guard.
+  if (query_start < 0 || query_end > a.num_tokens || query_end <= query_start) return;
+  const int32_t query_len = query_end - query_start;
   const int64_t chunk_end = a.logical_positions[query_end - 1];
   const int64_t chunk_start = chunk_end - query_len + 1;
   const int32_t ratio = a.compress_ratio;

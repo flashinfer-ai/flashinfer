@@ -112,9 +112,9 @@ def _reference(
             continue
         start = int(query_start_loc[request])
         end = int(query_start_loc[request + 1])
-        query_len = end - start
-        if query_len <= 0 or start < 0 or end > num_tokens:
+        if start < 0 or end > num_tokens or end <= start:
             continue
+        query_len = end - start
         chunk_end = int(logical_positions[end - 1])
         chunk_start = chunk_end - query_len + 1
         num_groups = (chunk_end + 1) // compress_ratio - chunk_start // compress_ratio
@@ -674,7 +674,7 @@ def test_a_request_with_no_tokens_is_skipped():
     _assert_matches(case)
 
 
-@pytest.mark.parametrize("bad", ["past_the_end", "reversed", "negative"])
+@pytest.mark.parametrize("bad", ["past_the_end", "reversed", "negative", "wraps"])
 def test_a_request_whose_offsets_leave_the_token_axis_is_skipped(bad):
     """Only the length of query_start_loc is checked on the host, so a value
     that runs off the token axis would put logical_positions[end - 1] outside
@@ -687,6 +687,11 @@ def test_a_request_whose_offsets_leave_the_token_axis_is_skipped(bad):
     elif bad == "reversed":
         offsets[0] = 8
         offsets[1] = 4
+    elif bad == "wraps":
+        # The difference of these two overflows int32 and comes out as 1, so a
+        # guard that subtracts before it bounds the ends lets them through.
+        offsets[0] = 2147483647
+        offsets[1] = -2147483648
     else:
         offsets[0] = -8
     case["query_start_loc"] = offsets
