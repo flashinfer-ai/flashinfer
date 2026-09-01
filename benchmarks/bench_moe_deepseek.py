@@ -458,7 +458,11 @@ def bench_cute_dsl(
 
     # Alpha sized for LOCAL experts only
     alpha = torch.ones(num_local_experts, device=dev)
-    fc2sc = None if activation_format is QuantVariant.BF16 else torch.tensor([1.0], device=dev)
+    fc2sc = (
+        None
+        if activation_format is QuantVariant.BF16
+        else torch.tensor([1.0], device=dev)
+    )
 
     # Pre-convert routing bias to float32
     routing_bias_f32 = inputs["routing_bias"].float()

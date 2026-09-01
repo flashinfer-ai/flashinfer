@@ -4270,8 +4270,7 @@ def _cute_dsl_fused_moe_reference(
         hs_deq = x.to(torch.float32)
     else:
         raise ValueError(
-            "unsupported format pair "
-            f"({activation_format!r}, {weight_format!r})"
+            f"unsupported format pair ({activation_format!r}, {weight_format!r})"
         )
     if weight_format is QuantVariant.MXFP4:
 
@@ -4289,8 +4288,12 @@ def _cute_dsl_fused_moe_reference(
         w2_weight_sf = mma_scales_to_logical(
             w2_weight_sf, w2_weight.shape[1], w2_weight.shape[2] * 2
         )
-    W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=weight_format is QuantVariant.MXFP4)
-    W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=weight_format is QuantVariant.MXFP4)
+    W1 = _dequantize_fp4_tensor(
+        w1_weight, w1_weight_sf, is_ue8m0_scales=weight_format is QuantVariant.MXFP4
+    )
+    W2 = _dequantize_fp4_tensor(
+        w2_weight, w2_weight_sf, is_ue8m0_scales=weight_format is QuantVariant.MXFP4
+    )
     if per_token_scale is not None:
         hs_deq = hs_deq * per_token_scale.to(torch.float32).view(-1, 1)
     W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
