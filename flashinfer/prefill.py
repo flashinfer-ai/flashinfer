@@ -1431,6 +1431,13 @@ def single_prefill_with_kv_cache(
             head_dim_vo=out_head_dim,
         )
 
+    if window_right >= 0 and backend not in ("fa2", "cute-dsl"):
+        raise NotImplementedError(
+            f"window_right is not supported on backend {backend!r} (kernel cannot "
+            "express a right window); supported backends are 'fa2' and 'cute-dsl'. "
+            "Pass window_right=-1 on other backends."
+        )
+
     # Unpack NVFP4 scale factors
     k_sf, v_sf = None, None
     if kv_cache_sf is not None:
@@ -2127,6 +2134,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     use_custom_mask,
                     q_data_type,
                     kv_data_type,
+                )
+            if window_right >= 0 and backend not in ("fa2", "cute-dsl"):
+                raise NotImplementedError(
+                    f"window_right is not supported on backend {backend!r} (kernel "
+                    "cannot express a right window); supported backends are 'fa2' "
+                    "and 'cute-dsl'. Pass window_right=-1 on other backends."
                 )
             if backend == "cudnn":
                 raise NotImplementedError(
