@@ -57,7 +57,7 @@ from flashinfer.fused_moe import (
     ActivationType,
     BackendOptions,
     CuteDslConfig,
-    CuteDslNvfp4Runner,
+    CuteDslRunner,
     CutlassBf16Config,
     CutlassBf16Runner,
     CutlassFp8BlockConfig,
@@ -1021,7 +1021,7 @@ class TestMoERunnerSupport:
         )
         assert CutlassBf16Runner.supported_activation_classes == cutlass
         assert CutlassW4A16Runner.supported_activation_classes == cutlass
-        assert CuteDslNvfp4Runner.supported_activation_classes == (
+        assert CuteDslRunner.supported_activation_classes == (
             SwiGLU,
             GeGLUTanh,
             ReLU2,
@@ -1085,11 +1085,34 @@ class TestMoERunnerSupport:
             with pytest.raises(NotImplementedError, match="SiTU on SM107"):
                 runner.check_support()
 
-    @pytest.mark.parametrize("variant", (QuantVariant.NVFP4, QuantVariant.W4A16))
+    @pytest.mark.parametrize(
+        "variant", (QuantVariant.NVFP4, QuantVariant.MXFP4, QuantVariant.W4A16)
+    )
     def test_cute_dsl_quant_variants_supported(self, variant):
-        runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)
+        runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
         assert runner.check_support() is None
+
+    def test_cute_dsl_w4a8_rejected_on_rubin(self, monkeypatch):
+        import flashinfer.utils as utils
+
+        runner = CuteDslRunner.__new__(CuteDslRunner)
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(variant=QuantVariant.MXFP4)
+        )
+        runner.device = torch.device("cuda")
+        monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 7))
+        with pytest.raises(NotImplementedError, match=r"W4A8.*SM107"):
+            runner.check_support()
+
+    def test_cute_dsl_w4a8_requires_fused_finalize(self):
+        runner = CuteDslRunner.__new__(CuteDslRunner)
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(variant=QuantVariant.MXFP4),
+            finalize=MoEFinalizeConfig(use_fused_finalize=False),
+        )
+        with pytest.raises(NotImplementedError, match="requires fused finalize"):
+            runner.check_support()
 
     def test_cute_dsl_rejects_gated_rows_for_non_gated_activation(self):
         """A ReLU2 config paired with a default-prepared (SwiGLU) view.
@@ -1098,7 +1121,7 @@ class TestMoERunnerSupport:
         the config wants I. The tuner infers intermediate_size from this tensor,
         so without a boundary check the mismatch surfaces deep in the kernel.
         """
-        runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)
+        runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(activation=ReLU2())
         runner._built = True
         runner._inner = SimpleNamespace(top_k=2)
@@ -1106,7 +1129,7 @@ class TestMoERunnerSupport:
         intermediate = runner.config.experts.intermediate_size
         weights = MoEWeightPack()
         weights.prepare_for(
-            "cute_dsl_nvfp4",
+            "cute_dsl",
             {"w1_weight": torch.empty(32, 2 * intermediate, 64, dtype=torch.uint8)},
         )
         act = MoEActivationPack(
@@ -1118,14 +1141,60 @@ class TestMoERunnerSupport:
         with pytest.raises(ValueError, match="GEMM1 rows"):
             runner.pack_inputs(act, weights)
 
+    def test_cute_dsl_mxfp4_pack_uses_unpacked_mxfp8_and_no_fc2_scale(self):
+        runner = CuteDslRunner.__new__(CuteDslRunner)
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(variant=QuantVariant.MXFP4)
+        )
+        runner._built = True
+        runner._inner = SimpleNamespace(top_k=2)
+        intermediate = runner.config.experts.intermediate_size
+        weights = MoEWeightPack()
+        weights.prepare_for(
+            "cute_dsl",
+            {
+                "w1_weight": torch.empty(32, 2 * intermediate, 64, dtype=torch.uint8),
+                "w1_weight_sf": torch.empty(1, dtype=torch.uint8),
+                "w1_alpha": torch.ones(32),
+                "w2_weight": torch.empty(32, 128, intermediate // 2, dtype=torch.uint8),
+                "w2_weight_sf": torch.empty(1, dtype=torch.uint8),
+                "w2_alpha": torch.ones(32),
+            },
+        )
+        act = MoEActivationPack(
+            hidden_states_q=torch.empty(4, 128, dtype=torch.float8_e4m3fn),
+            hidden_states_scale=torch.empty(4, 4, dtype=torch.uint8),
+            topk_ids=torch.zeros(4, 2, dtype=torch.int32),
+            topk_weights=torch.ones(4, 2, dtype=torch.float32),
+        )
+        packed = runner.pack_inputs(act, weights)
+        assert packed[0].shape == (4, 128)
+        assert packed[1].shape == (4, 4)
+        assert packed[7] is None
+        assert packed[-1].shape == (4, 128)
+
+    def test_cute_dsl_mxfp4_pack_rejects_unaligned_geometry(self):
+        w1 = torch.zeros(2, 2 * 96, 256, dtype=torch.bfloat16)
+        w2 = torch.zeros(2, 256, 96, dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match="divisible by 128"):
+            CuteDslConfig.prepare_weights(
+                w1,
+                w2,
+                variant=QuantVariant.MXFP4,
+                num_local_experts=2,
+                hidden_size=256,
+                intermediate_size=96,
+                device="cpu",
+            )
+
     def test_cute_dsl_rejects_unrepresentable_situ_clamp(self):
-        runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)
+        runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(activation=SiTU(clamp_limit=4.0))
         with pytest.raises(NotImplementedError, match="clamp_limit"):
             runner.check_support()
 
     def test_cute_dsl_accepts_unclamped_situ_linear_branch(self):
-        runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)
+        runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(activation=SiTU(linear_scale=None))
         assert runner.check_support() is None
 
@@ -1172,7 +1241,7 @@ class TestMoERunnerSupport:
     @pytest.mark.parametrize(
         "runner_type,variant",
         (
-            (CuteDslNvfp4Runner, QuantVariant.BF16),
+            (CuteDslRunner, QuantVariant.BF16),
             (TrtllmFp4RoutedRunner, QuantVariant.BF16),
             (TrtllmBf16RoutedRunner, QuantVariant.NVFP4),
             (TrtllmFp8BlockRunner, QuantVariant.BF16),
@@ -1192,7 +1261,7 @@ class TestMoERunnerSupport:
     @pytest.mark.parametrize(
         "runner_type,variant",
         (
-            (CuteDslNvfp4Runner, QuantVariant.NVFP4),
+            (CuteDslRunner, QuantVariant.NVFP4),
             (TrtllmFp4RoutedRunner, QuantVariant.NVFP4),
             (TrtllmBf16RoutedRunner, QuantVariant.BF16),
             (TrtllmFp8BlockRunner, QuantVariant.DeepSeekFp8),
@@ -1392,11 +1461,9 @@ class TestBuiltInRunnerLifecycle:
                 self.use_fused_finalize = kwargs["use_fused_finalize"]
                 self.enable_pdl = kwargs["enable_pdl"]
 
-        monkeypatch.setattr(tuner, "CuteDslFusedMoENvfp4Runner", Inner)
-        monkeypatch.setattr(fused_moe, "_cute_dsl_fused_moe_nvfp4_impl", object())
-        runner = CuteDslNvfp4Runner(
-            self._config(QuantVariant.NVFP4), torch.device("cuda:0")
-        )
+        monkeypatch.setattr(tuner, "CuteDslFusedMoERunner", Inner)
+        monkeypatch.setattr(fused_moe, "_cute_dsl_fused_moe_impl", object())
+        runner = CuteDslRunner(self._config(QuantVariant.NVFP4), torch.device("cuda:0"))
         runner._check_support = lambda: None
 
         assert runner._inner is None
@@ -1834,7 +1901,7 @@ def _make_packs_and_config(
 
     weight_pack = MoEWeightPack()
     weight_pack.prepare_for(
-        "cute_dsl_nvfp4",
+        "cute_dsl",
         {
             "w1_weight": tensors["w1_weight"],
             "w1_weight_sf": tensors["w1_weight_sf"],
@@ -2267,7 +2334,7 @@ class VariantSpec:
 _VARIANT_SPECS = (
     VariantSpec(
         id="nvfp4",
-        backend_keys=("cute_dsl_nvfp4", "trtllm_fp4_routed"),
+        backend_keys=("cute_dsl", "trtllm_fp4_routed"),
         make=_nvfp4_make,
         reference=_nvfp4_ref,
         check=_nvfp4_check,
@@ -3456,7 +3523,7 @@ def test_cute_dsl_cache_key_extends_unified_fields():
         use_fused_finalize = False
         enable_pdl = True
 
-    runner = CuteDslNvfp4Runner.__new__(CuteDslNvfp4Runner)
+    runner = CuteDslRunner.__new__(CuteDslRunner)
     runner.config = _cache_key_config(CuteDslConfig(), QuantVariant.NVFP4)
     runner._inner = Inner()
 
@@ -3482,14 +3549,14 @@ def test_cute_dsl_cache_key_extends_unified_fields():
             SwiGLUStep(limit=6.0),
         ),
         (
-            CuteDslNvfp4Runner,
+            CuteDslRunner,
             CuteDslConfig(),
             QuantVariant.NVFP4,
             SwiGLU(),
             SwiGLU(alpha=1.7, beta=1.0, limit=7.0),
         ),
         (
-            CuteDslNvfp4Runner,
+            CuteDslRunner,
             CuteDslConfig(),
             QuantVariant.NVFP4,
             SiTU(gate_scale=1.0, linear_scale=1.0),
@@ -3511,7 +3578,7 @@ def test_scalar_activation_values_separate_cache_identity(
     if issubclass(runner_cls, CutlassBf16Runner):
         first_runner._device_arch = second_runner._device_arch = 100
         first_runner._enable_pdl = second_runner._enable_pdl = False
-    elif runner_cls is CuteDslNvfp4Runner:
+    elif runner_cls is CuteDslRunner:
 
         class Inner:
             use_fused_finalize = True
