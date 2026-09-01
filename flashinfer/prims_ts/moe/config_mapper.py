@@ -241,10 +241,9 @@ def _selected_tile_ns(
     )
     center_idx = supported_tiles.index(center_tile)
     selected_tiles = {center_tile}
-    if center_idx + 1 < len(supported_tiles):
-        selected_tiles.add(supported_tiles[center_idx + 1])
-        if center_idx + 2 < len(supported_tiles):
-            selected_tiles.add(supported_tiles[center_idx + 2])
+    for offset in (1, 2, 3):
+        if center_idx + offset < len(supported_tiles):
+            selected_tiles.add(supported_tiles[center_idx + offset])
     if center_idx > 0:
         lower_tile = supported_tiles[center_idx - 1]
         selected_tiles.add(lower_tile)

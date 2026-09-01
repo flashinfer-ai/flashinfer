@@ -441,7 +441,7 @@ class _PrimsTsMoERunnerMixin:
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
         moe_inputs = MoeRunnerInputs.from_list(inputs)
         return (
-            ("prims_ts_moe_config_version", 3),
+            ("prims_ts_moe_config_version", 4),
             ("dtype_act", int(self.dtype_act)),
             ("dtype_weights", int(self.dtype_weights)),
             ("fp8_quantization_type", int(self.fp8_quantization_type)),
