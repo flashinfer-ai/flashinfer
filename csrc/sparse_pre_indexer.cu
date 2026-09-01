@@ -101,6 +101,10 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
   TVM_FFI_ICHECK_GE(state_cache.size(3), head_dim + coord_width)
       << "the ring holds a row of head_dim, and its coordinates after it";
   TVM_FFI_ICHECK_EQ(work_metadata.size(1), 2) << "a work item is a request and its index";
+  // Both are divided by, and the ring is also indexed modulo its size, so an
+  // empty one turns every history read into an address off the front.
+  TVM_FFI_ICHECK_GT(state_cache.size(1), 0) << "the ring holds at least one row";
+  TVM_FFI_ICHECK_GT(compressed_cache.size(1), 0) << "a compressed page holds at least one row";
   TVM_FFI_ICHECK_EQ(state_slots.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(compressed_slots.size(0), num_tokens);
   TVM_FFI_ICHECK_EQ(logical_positions.size(0), num_tokens);
@@ -170,6 +174,7 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
     p.num_state_blocks = static_cast<int32_t>(state_cache.size(0));
     p.num_compressed_blocks = static_cast<int32_t>(compressed_cache.size(0));
     p.num_k_work = static_cast<int32_t>(work_metadata.size(0));
+    p.num_requests = static_cast<int32_t>(state_block_table.size(0));
     p.num_q_heads = static_cast<int32_t>(num_q_heads);
     p.compress_ratio = static_cast<int32_t>(compress_ratio);
     p.state_size = static_cast<int32_t>(state_cache.size(1));
