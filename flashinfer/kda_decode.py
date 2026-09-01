@@ -30,7 +30,6 @@ import torch
 from .api_logging import flashinfer_api
 from .trace.templates.kda import (
     fused_kda_decode_trace,
-    kda_output_only_decode_trace,
     packed_kda_decode_trace,
     recurrent_kda_trace,
 )
@@ -52,25 +51,11 @@ try:
     from .kda_kernels.kda_decode_wy_output_only import (
         kda_wy_output_only as _run_kda_output_only,
     )
-    from .kda_kernels.kda_decode_wy_output_only import (
-        kda_recoverssm_verify as kda_recoverssm_verify,
-    )
 
     _KDA_OUTPUT_ONLY_AVAILABLE = True
 except (ImportError, RuntimeError):
     _run_kda_output_only = None
     _KDA_OUTPUT_ONLY_AVAILABLE = False
-
-    def _kda_recoverssm_verify_unavailable(*args, **kwargs):
-        """Unavailable stub (CuTe DSL missing); see the real docstring in
-        ``flashinfer.kda_kernels.kda_decode_wy_output_only``."""
-        raise NotImplementedError(
-            "kda_recoverssm_verify is unavailable (missing CuTe DSL deps)"
-        )
-
-    # Keep `import flashinfer` working without the CuTe DSL; calls fail
-    # with a clear NotImplementedError instead of an import-time crash.
-    kda_recoverssm_verify = _kda_recoverssm_verify_unavailable  # type: ignore[assignment]
 
 
 # None when the CuTe DSL is missing or cannot target this device
@@ -101,6 +86,9 @@ def recurrent_kda(
     initial_state_source: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     beta_is_logit: bool = False,
+    disable_state_update: bool = False,
+    correction_cache: Optional[torch.Tensor] = None,
+    kg_cache: Optional[torch.Tensor] = None,
     *,
     backend: Literal["cute-dsl", "cake", "auto"] = "cute-dsl",
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -179,6 +167,29 @@ def recurrent_kda(
             with ``initial_state_source``.
         beta_is_logit (bool):
             If ``True``, apply sigmoid to ``beta`` inside the recurrent kernel.
+        disable_state_update (bool):
+            Frozen / speculative-verify mode (mirrors GDN's
+            ``gated_delta_rule_mtp`` flag): compute the outputs for up to 16
+            tokens per sequence from the committed state and never write any
+            state back; ``final_state`` is always ``None``. Dispatches
+            internally to the WY-parallel tensor-core kernel or a grouped
+            register recurrence by problem size. Supports the batched
+            ``[B, T, ...]`` form directly and the packed ``cu_seqlens`` form
+            (ragged per-sequence lengths). ``backend="cake"`` raises in this
+            mode (no frozen-state Cake kernels; no silent fallback), and
+            ``output_final_state=True`` is rejected. Requires ``K == V ==
+            128`` and a bf16 state pool.
+        correction_cache (Optional[torch.Tensor]):
+            Only with ``disable_state_update=True``. Slot-indexed float32
+            buffer ``[num_slots, HV, T_max, V]`` receiving the per-token
+            delta-rule corrections ``sigmoid-or-raw(beta) * (v - u)`` for a
+            downstream commit/recovery kernel (the analog of GDN's
+            slot-indexed ``intermediate_states_buffer``). Rows past each
+            sequence's length and null slots are left untouched.
+        kg_cache (Optional[torch.Tensor]):
+            Only with ``disable_state_update=True``. Slot-indexed bf16 buffer
+            ``[num_slots, HV, T_max, 2*K]`` receiving the L2-normalized key in
+            ``[..., :K]`` and the raw gate in ``[..., K:]`` per token.
         backend (Literal["cute-dsl", "cake", "auto"]):
             Implementation backend. ``"cute-dsl"`` preserves the existing
             FlashInfer implementation. ``"cake"`` strictly selects an
@@ -196,6 +207,52 @@ def recurrent_kda(
     if backend not in ("cute-dsl", "cake", "auto"):
         raise ValueError(
             f"backend must be 'cute-dsl', 'cake', or 'auto', got {backend!r}"
+        )
+    if (correction_cache is not None or kg_cache is not None) and (
+        not disable_state_update
+    ):
+        raise ValueError(
+            "correction_cache/kg_cache are speculative-verify caches and "
+            "require disable_state_update=True"
+        )
+    if disable_state_update:
+        if backend == "cake":
+            raise ValueError(
+                "backend='cake' has no frozen-state kernels; "
+                "disable_state_update=True requires the CuTe-DSL backends"
+            )
+        if output_final_state:
+            raise ValueError(
+                "output_final_state=True is incompatible with "
+                "disable_state_update=True (no state is produced)"
+            )
+        if num_accepted_tokens is not None:
+            raise ValueError(
+                "num_accepted_tokens applies to the state-updating fused "
+                "spec path, not the frozen-verify mode"
+            )
+        return _run_frozen_recurrent_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            ssm_state_indices=ssm_state_indices,
+            num_spec_tokens=num_spec_tokens,
+            output=output,
+            initial_state=initial_state,
+            initial_state_source=initial_state_source,
+            initial_state_indices=initial_state_indices,
+            beta_is_logit=beta_is_logit,
+            correction_cache=correction_cache,
+            kg_cache=kg_cache,
         )
     if _run_recurrent_kda is None:
         raise NotImplementedError("recurrent KDA backend is unavailable")
@@ -395,115 +452,165 @@ def fused_kda_decode(
     )
 
 
-@flashinfer_api(trace=kda_output_only_decode_trace)
-def kda_output_only_decode(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state_source: torch.Tensor,
-    initial_state_indices: Optional[torch.Tensor] = None,
-    A_log: Optional[torch.Tensor] = None,
-    dt_bias: Optional[torch.Tensor] = None,
-    scale: Optional[float] = None,
-    use_gate_in_kernel: bool = False,
-    lower_bound: Optional[float] = None,
-    beta_is_logit: bool = False,
-    output: Optional[torch.Tensor] = None,
-    *,
-    backend: Literal["auto", "wy", "recurrent"] = "auto",
-    emit_corrections: bool = False,
-    corrections_out: Optional[torch.Tensor] = None,
-    kg_cache_out: Optional[torch.Tensor] = None,
+def _run_frozen_recurrent_kda(
+    q,
+    k,
+    v,
+    g,
+    beta,
+    A_log,
+    dt_bias,
+    scale,
+    use_qk_l2norm_in_kernel,
+    use_gate_in_kernel,
+    lower_bound,
+    cu_seqlens,
+    ssm_state_indices,
+    num_spec_tokens,
+    output,
+    initial_state,
+    initial_state_source,
+    initial_state_indices,
+    beta_is_logit,
+    correction_cache,
+    kg_cache,
 ):
-    r"""Output-only (frozen-state) KDA decode over 1..16 tokens per sequence.
+    """recurrent_kda's frozen / speculative-verify mode.
 
-    Computes the Kimi Delta Attention outputs for ``T`` speculative / MTP
-    tokens per sequence from a read-only committed-state pool, never writing
-    state back — the verify-path counterpart of :func:`recurrent_kda`. Two
-    implementations are dispatched by problem size:
+    Dispatch, mirroring the GDN precedent (mode on the op, kernels internal):
 
-    - ``"wy"``: a chunk-parallel WY-representation kernel that replaces the
-      serial recurrence with tensor-core GEMMs (per-channel decay is folded
-      into pre-scaled ``k * exp(±cumsum g)`` / ``q * exp(cumsum g)`` tiles,
-      followed by a T x T triangular inverse and two state GEMMs against the
-      TMA-loaded initial state).
-    - ``"recurrent"``: a grouped register recurrence for small ``B * HV * T``
-      (an output-only fork of the recurrent decode kernel without its
-      per-token state-checkpoint writes).
+    - batched ``[B, T, ...]`` without caches -> the output-only dispatcher
+      (WY-parallel tensor-core kernel or grouped register recurrence by
+      problem size);
+    - any call requesting ``correction_cache``/``kg_cache``, and packed
+      ``cu_seqlens`` calls, -> the packed frozen-verify kernel (WY, ragged
+      lengths and null slots supported), which writes the slot-indexed fp32
+      correction and bf16 kg caches.
 
-    ``"auto"`` picks by a measured crossover. Q/K L2 normalization is always
-    applied in-kernel (eps 1e-6), matching
-    ``recurrent_kda(use_qk_l2norm_in_kernel=True)``.
-
-    Args:
-        q: ``[B, T, H, 128]`` bf16 query, ``1 <= T <= 16``.
-        k: ``[B, T, H, 128]`` bf16 key.
-        v: ``[B, T, HV, 128]`` bf16 value. GQA is applied when ``HV != H``.
-        g: ``[B, T, HV, 128]`` bf16 per-K-channel gate. Log-space when
-            ``use_gate_in_kernel=False``, raw otherwise.
-        beta: ``[B, T, HV]`` bf16 delta-rule learning rate (pre-sigmoided
-            unless ``beta_is_logit=True``).
-        initial_state_source: ``[pool, HV, 128, 128]`` bf16 read-only
-            committed-state pool (``[V, K]`` layout per head). Never written.
-        initial_state_indices: ``[B]`` int32 slot per sequence. Defaults to
-            ``arange(B)``.
-        A_log: ``[H]`` float32 log-decay; required when
-            ``use_gate_in_kernel=True``.
-        dt_bias: ``[H*128]`` float32 per-channel decay bias (optional).
-        scale: Query scale; defaults to ``128**-0.5``.
-        use_gate_in_kernel: Compute the log-space gate in-kernel from raw
-            ``g``. The gate has three modes:
-
-            - ``use_gate_in_kernel=False``: ``g`` is already the log-space
-              gate and is used as-is (``A_log``, ``dt_bias`` and
-              ``lower_bound`` are ignored).
-            - ``use_gate_in_kernel=True, lower_bound=<negative float>``:
-              ``g_log = lower_bound * sigmoid(exp(A_log) * (g + dt_bias))``
-              (the Kimi K3 contract; ``lower_bound=-5.0``).
-            - ``use_gate_in_kernel=True, lower_bound=None``:
-              ``g_log = -exp(A_log) * softplus(g + dt_bias)``
-              (the original Kimi-Linear gate).
-        lower_bound: Selects the in-kernel gate formula; see
-            ``use_gate_in_kernel``. Must be negative when set.
-        beta_is_logit: Apply sigmoid to ``beta`` inside the kernel.
-        output: Optional preallocated contiguous ``[B, T, HV, 128]`` bf16
-            output (required for allocation-free CUDA-graph replay).
-        backend: ``"auto"`` (default), ``"wy"``, or ``"recurrent"``.
-        emit_corrections: Also emit the speculative-verify caches consumed by
-            a RecoverSSM-style commit kernel: per-token corrections
-            ``U_t = beta_t * (v_t - u_t)`` (with ``beta_t`` post-sigmoid when
-            ``beta_is_logit=True``) of shape ``[B, T, HV, 128]`` and a
-            kg cache ``[B, T, HV, 256]`` holding the L2-normalized key in
-            ``[..., :128]`` and the raw gate in ``[..., 128:]``.
-        corrections_out: Optional preallocated contiguous bf16 corrections
-            tensor (CUDA-graph replay).
-        kg_cache_out: Optional preallocated contiguous bf16 kg cache tensor.
-
-    Returns:
-        The bf16 output of shape ``[B, T, HV, 128]``, or the tuple
-        ``(output, corrections, kg_cache)`` when ``emit_corrections=True``.
+    Never writes any state pool; returns ``(output, None)``.
     """
     if _run_kda_output_only is None:
-        raise NotImplementedError("KDA output-only backend is unavailable")
-    return _run_kda_output_only(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        initial_state_source=initial_state_source,
-        initial_state_indices=initial_state_indices,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        scale=scale,
-        use_gate_in_kernel=use_gate_in_kernel,
-        lower_bound=lower_bound,
-        beta_is_logit=beta_is_logit,
-        output=output,
-        backend=backend,
-        emit_corrections=emit_corrections,
-        corrections_out=corrections_out,
-        kg_cache_out=kg_cache_out,
+        raise NotImplementedError(
+            "disable_state_update=True requires the CuTe-DSL frozen-state "
+            "kernels (missing cutlass DSL deps)"
+        )
+    if not use_qk_l2norm_in_kernel:
+        raise ValueError(
+            "disable_state_update=True always applies Q/K L2 normalization "
+            "(use_qk_l2norm_in_kernel=False is not supported)"
+        )
+    pool = initial_state_source if initial_state_source is not None else initial_state
+    if pool is None:
+        raise ValueError(
+            "disable_state_update=True requires a committed state pool via "
+            "initial_state_source (preferred) or initial_state (read-only)"
+        )
+    slots = (
+        initial_state_indices
+        if initial_state_indices is not None
+        else ssm_state_indices
     )
+    want_caches = correction_cache is not None or kg_cache is not None
+    if want_caches and (correction_cache is None or kg_cache is None):
+        raise ValueError("correction_cache and kg_cache must be provided together")
+
+    from .kda_kernels.kda_decode_wy_output_only import (
+        _dummy_f32,
+        kda_recoverssm_verify as _packed_frozen_verify,
+    )
+
+    if cu_seqlens is None and not want_caches:
+        # Batched [B, T, ...] frozen decode without verify caches.
+        out = _run_kda_output_only(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state_source=pool,
+            initial_state_indices=slots,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            use_gate_in_kernel=use_gate_in_kernel,
+            lower_bound=lower_bound if use_gate_in_kernel else None,
+            beta_is_logit=beta_is_logit,
+            output=output,
+            backend="auto",
+        )
+        return out, None
+
+    # Packed frozen verify (and every cache-requesting call): slot-indexed
+    # caches, ragged lengths, null slots.
+    device = q.device
+    if cu_seqlens is None:
+        # Uniform batched form: build the trivial cu_seqlens and flatten to
+        # the packed [1, total, ...] views (free reshapes of contiguous
+        # tensors; .reshape falls back to a copy for non-contiguous inputs).
+        B, T_in = q.shape[0], q.shape[1]
+        H, HV = q.shape[2], v.shape[2]
+        qsl = torch.arange(0, (B + 1) * T_in, T_in, dtype=torch.int32, device=device)
+        qp = q.reshape(1, B * T_in, H, q.shape[3])
+        kp = k.reshape(1, B * T_in, H, k.shape[3])
+        vp = v.reshape(1, B * T_in, HV, v.shape[3])
+        gp = g.reshape(1, B * T_in, HV, g.shape[3])
+        bp = beta.reshape(1, B * T_in, HV)
+        outp = (
+            output.reshape(1, B * T_in, HV, v.shape[3]) if output is not None else None
+        )
+        spec_len = T_in
+        reshape_out = (B, T_in)
+    else:
+        if not want_caches:
+            raise ValueError(
+                "packed (cu_seqlens) frozen-verify calls currently require "
+                "correction_cache/kg_cache; for a plain frozen decode pass "
+                "batched [B, T, ...] tensors instead"
+            )
+        B = cu_seqlens.shape[0] - 1
+        qp, kp, vp, gp, bp, outp, qsl = q, k, v, g, beta, output, cu_seqlens
+        if num_spec_tokens is not None:
+            spec_len = num_spec_tokens + 1
+        elif correction_cache is not None:
+            spec_len = correction_cache.shape[2]
+        else:
+            raise ValueError(
+                "packed frozen-verify calls need the window size via "
+                "num_spec_tokens or the caches' token dimension"
+            )
+        reshape_out = None
+    if slots is None:
+        slots = torch.arange(B, dtype=torch.int32, device=device)
+    if want_caches:
+        corr_t, kg_t = correction_cache, kg_cache
+    else:
+        # Batched call without caches but through the packed kernel is not
+        # reachable (handled above); guard for completeness.
+        raise AssertionError("unreachable: packed path without caches")
+    H = qp.shape[2]
+    K_dim = qp.shape[3]
+    A_log_eff = A_log if A_log is not None else _dummy_f32(device, H)
+    dt_bias_eff = dt_bias if dt_bias is not None else _dummy_f32(device, H * K_dim)
+    out = _packed_frozen_verify(
+        qp,
+        kp,
+        vp,
+        gp,
+        bp,
+        A_log_eff,
+        dt_bias_eff,
+        lower_bound if use_gate_in_kernel else None,
+        pool,
+        corr_t,
+        kg_t,
+        qsl,
+        slots,
+        spec_len,
+        outp,
+        use_gate_in_kernel=use_gate_in_kernel,
+        beta_is_logit=beta_is_logit,
+        scale=scale,
+    )
+    if reshape_out is not None:
+        out = out.reshape(reshape_out[0], reshape_out[1], out.shape[2], out.shape[3])
+    return out, None

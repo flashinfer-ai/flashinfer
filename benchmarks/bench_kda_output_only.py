@@ -5,7 +5,7 @@ Compares at Kimi K3 per-GPU shapes (H = HV = 12, K = V = 128):
 
   wy        - the WY-parallel tensor-core output-only kernel
   rec_oo    - the grouped register-recurrent output-only fork
-  auto      - the dispatched public op (flashinfer.kda_output_only_decode)
+  auto      - the dispatched frozen mode (recurrent_kda(disable_state_update=True))
   baseline  - flashinfer.recurrent_kda in fused spec-decode verify mode
               (per-token state checkpoints; the pre-existing way to obtain
               per-token outputs for T draft tokens). ``--baseline-backend
@@ -30,7 +30,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from flashinfer.kda_decode import kda_output_only_decode, recurrent_kda
+from flashinfer.kda_decode import recurrent_kda
+from flashinfer.kda_kernels.kda_decode_wy_output_only import (
+    kda_wy_output_only as kda_output_only_decode,
+)
 from flashinfer.testing import bench_gpu_time
 
 K = V = 128

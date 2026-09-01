@@ -8,9 +8,12 @@ import torch.nn.functional as F
 from flashinfer.utils import is_sm100a_supported
 
 try:
-    from flashinfer.kda_decode import (
-        _KDA_OUTPUT_ONLY_AVAILABLE,
-        kda_output_only_decode,
+    # Internal dispatcher (module path, not public API): same signature the
+    # public op had; used here to force individual backends. The public
+    # surface is recurrent_kda(disable_state_update=True), tested below.
+    from flashinfer.kda_decode import _KDA_OUTPUT_ONLY_AVAILABLE
+    from flashinfer.kda_kernels.kda_decode_wy_output_only import (
+        kda_wy_output_only as kda_output_only_decode,
     )
 except ImportError:
     kda_output_only_decode = None
@@ -451,3 +454,143 @@ def test_recoverssm_dropin_padding_is_runtime():
         assert torch.equal(o, outs[0][0]), f"pad={pad}: outputs differ"
         assert torch.equal(c, outs[0][1]), f"pad={pad}: corrections differ"
         assert torch.equal(kgc, outs[0][2]), f"pad={pad}: kg differs"
+
+
+# =============================================================================
+# Public API: recurrent_kda(disable_state_update=True)
+# =============================================================================
+
+
+def test_frozen_mode_public_api_matches_internal():
+    """recurrent_kda's frozen mode returns (out, None) and matches the
+    internal dispatcher on identical inputs; the state pool is untouched."""
+    from flashinfer import recurrent_kda
+
+    B, T, H, HV = 3, 8, 4, 4
+    q, k, v, _, beta, h0, idx, _, _ = _make_inputs(B, T, H, HV, seed=6)
+    g_log = F.logsigmoid(
+        torch.randn(B, T, HV, 128, dtype=torch.float32, device=q.device)
+    ).to(torch.bfloat16)
+    h0_before = h0.clone()
+    out, fs = recurrent_kda(
+        q,
+        k,
+        v,
+        g_log,
+        beta,
+        initial_state_source=h0,
+        initial_state_indices=idx,
+        disable_state_update=True,
+    )
+    assert fs is None
+    torch.cuda.synchronize()
+    assert torch.equal(h0, h0_before), "frozen mode modified the state pool"
+    ref = kda_output_only_decode(q, k, v, g_log, beta, h0, idx, backend="auto")
+    torch.testing.assert_close(out.float(), ref.float(), atol=1e-3, rtol=1e-3)
+
+
+def test_frozen_mode_public_api_caches():
+    """Frozen mode fills the slot-indexed fp32 correction / bf16 kg caches
+    (untouched rows keep their sentinel) for batched and packed inputs."""
+    from flashinfer import recurrent_kda
+    from flashinfer.kda_kernels.kda_decode_wy_output_only import (
+        kda_recoverssm_verify,
+    )
+
+    B, T, H, HV = 3, 8, 4, 4
+    q, k, v, graw, _, h0, idx, A_log, dt_bias = _make_inputs(B, T, H, HV, seed=7)
+    beta = torch.randn(B, T, HV, dtype=torch.bfloat16, device=q.device)
+    corr = torch.full((B + 2, HV, T, 128), 7.0, dtype=torch.float32, device=q.device)
+    kg = torch.full((B + 2, HV, T, 256), 7.0, dtype=torch.bfloat16, device=q.device)
+    out, fs = recurrent_kda(
+        q,
+        k,
+        v,
+        graw,
+        beta,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        use_gate_in_kernel=True,
+        lower_bound=-5.0,
+        beta_is_logit=True,
+        initial_state_source=h0,
+        initial_state_indices=idx,
+        disable_state_update=True,
+        correction_cache=corr,
+        kg_cache=kg,
+    )
+    assert fs is None
+    # Bit-identical to the (private) verify path on the packed views.
+    corr_r = torch.full_like(corr, 7.0)
+    kg_r = torch.full_like(kg, 7.0)
+    qsl = torch.arange(0, (B + 1) * T, T, dtype=torch.int32, device=q.device)
+    out_r = kda_recoverssm_verify(
+        q.view(1, B * T, H, 128),
+        k.view(1, B * T, H, 128),
+        v.view(1, B * T, HV, 128),
+        graw.view(1, B * T, HV, 128),
+        beta.view(1, B * T, HV),
+        A_log,
+        dt_bias,
+        -5.0,
+        h0,
+        corr_r,
+        kg_r,
+        qsl,
+        idx,
+        T,
+    )
+    assert torch.equal(out.reshape(1, B * T, HV, 128), out_r)
+    assert torch.equal(corr, corr_r) and torch.equal(kg, kg_r)
+    # Unused slots keep their sentinel (slot-indexed, only active slots hit).
+    used = set(idx.tolist())
+    for s in range(B + 2):
+        if s not in used:
+            assert torch.all(corr[s] == 7.0) and torch.all(kg[s] == 7.0)
+
+
+def test_frozen_mode_public_api_errors():
+    """Invalid frozen-mode combinations raise."""
+    from flashinfer import recurrent_kda
+
+    B, T, H, HV = 2, 4, 2, 2
+    q, k, v, _, beta, h0, idx, _, _ = _make_inputs(B, T, H, HV, seed=8)
+    g_log = torch.zeros(B, T, HV, 128, dtype=torch.bfloat16, device=q.device)
+    corr = torch.zeros(B, HV, T, 128, dtype=torch.float32, device=q.device)
+    with pytest.raises(ValueError):  # caches without the flag
+        recurrent_kda(
+            q,
+            k,
+            v,
+            g_log,
+            beta,
+            initial_state_source=h0,
+            initial_state_indices=idx,
+            correction_cache=corr,
+        )
+    with pytest.raises(ValueError):  # cake has no frozen kernels
+        recurrent_kda(
+            q,
+            k,
+            v,
+            g_log,
+            beta,
+            initial_state_source=h0,
+            initial_state_indices=idx,
+            disable_state_update=True,
+            backend="cake",
+        )
+    with pytest.raises(ValueError):  # no final state in frozen mode
+        recurrent_kda(
+            q,
+            k,
+            v,
+            g_log,
+            beta,
+            initial_state_source=h0,
+            initial_state_indices=idx,
+            disable_state_update=True,
+            output_final_state=True,
+        )
+    with pytest.raises(ValueError):  # a state pool is required
+        recurrent_kda(q, k, v, g_log, beta, disable_state_update=True)

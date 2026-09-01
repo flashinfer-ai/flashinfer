@@ -2314,6 +2314,10 @@ def kda_recoverssm_verify(
     state_indices: torch.Tensor,
     spec_query_len: int,
     out: torch.Tensor = None,
+    *,
+    use_gate_in_kernel: bool = True,
+    beta_is_logit: bool = True,
+    scale: Optional[float] = None,
 ) -> torch.Tensor:
     """Drop-in replacement for vLLM's ``kda_recoverssm_verify`` (Kimi K3).
 
@@ -2402,11 +2406,27 @@ def kda_recoverssm_verify(
     t_disc = 4 if spec_query_len <= 4 else (8 if spec_query_len <= 8 else 16)
     _num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     mbp = max(1, min(math.ceil(HV * batch / _num_sms) + 1, 8))
-    gate_mode = GATE_LOWER_BOUND if lower_bound is not None else GATE_SOFTPLUS
+    # Gate modes mirror recurrent_kda: precomputed log-space gate, the
+    # Kimi K3 lower-bound sigmoid gate, or the Kimi-Linear softplus gate.
+    if use_gate_in_kernel:
+        gate_mode = GATE_LOWER_BOUND if lower_bound is not None else GATE_SOFTPLUS
+    else:
+        gate_mode = GATE_PRECOMPUTED
     lb = float(lower_bound) if lower_bound is not None else 0.0
+    q_scale = float(scale) if scale is not None else float(key_dim**-0.5)
 
     cc = torch.cuda.get_device_capability(device)
-    cache_key = ("dropin", str(device), cc, mbp, t_disc, gate_mode, HV, H)
+    cache_key = (
+        "dropin",
+        str(device),
+        cc,
+        mbp,
+        t_disc,
+        gate_mode,
+        bool(beta_is_logit),
+        HV,
+        H,
+    )
     mk = from_dlpack
 
     def mk_any(t):
@@ -2435,7 +2455,7 @@ def kda_recoverssm_verify(
         mk_any(correction_cache),
         mk_any(kg_cache),
         mk_dyn(query_start_loc),
-        float(key_dim**-0.5),
+        q_scale,
         lb,
         int(q.stride(1)),
         int(k.stride(1)),
@@ -2460,8 +2480,8 @@ def kda_recoverssm_verify(
             min_blocks_per_mp=mbp,
             t_input=t_disc,
             gate_mode=gate_mode,
-            has_dt_bias=True,
-            beta_is_logit=True,
+            has_dt_bias=(gate_mode != GATE_PRECOMPUTED),
+            beta_is_logit=beta_is_logit,
             n_valid=16,
             emit_corrections=True,
             vllm_dropin=True,

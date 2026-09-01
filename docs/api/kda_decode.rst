@@ -97,19 +97,27 @@ CUDA 12.9 or newer uses one ``sm_100f`` module on CC 10.0 and CC 10.3.
 Unsupported devices or contracts raise an error without falling back to
 another KDA implementation.
 
-Output-only (frozen-state) speculative verify decode
-----------------------------------------------------
+Frozen / speculative-verify mode
+--------------------------------
 
-``kda_output_only_decode`` computes the KDA outputs for 1..16 tokens per
-sequence from a read-only committed-state pool and never writes state back —
-the speculative-decode verify path, analogous to the GDN WY output-only
-kernel. Two implementations are dispatched by problem size: a WY-parallel
+``recurrent_kda(disable_state_update=True)`` computes the KDA outputs for up
+to 16 tokens per sequence from a read-only committed-state pool and never
+writes state back — the speculative-decode verify path, mirroring GDN's
+``gated_delta_rule_mtp(disable_state_update=True)``. Optional slot-indexed
+``correction_cache`` (float32 per-token delta-rule corrections,
+``[num_slots, HV, T_max, V]``) and ``kg_cache`` (normalized key | raw gate,
+``[num_slots, HV, T_max, 2K]``) out-params feed a downstream commit/recovery
+kernel, paralleling GDN's slot-indexed ``intermediate_states_buffer``. The
+mode accepts the batched ``[B, T, ...]`` form and the packed ``cu_seqlens``
+form with ragged per-sequence lengths and null slots.
+
+Two implementations are dispatched internally by problem size: a WY-parallel
 tensor-core kernel that replaces the serial recurrence with T x T GEMMs, a
 log-depth triangular inverse, and TMA-loaded state GEMMs (per-K-channel decay
-is folded into ``k * exp(±cumsum g)`` / ``q * exp(cumsum g)`` operand tiles),
-and a grouped register-recurrent fork (without the baseline's per-token
-state-checkpoint writes) for small ``B * HV * T``. Requires SM90+ for the WY
-path and ``K = V = 128``.
+folded into ``k * exp(±cumsum g)`` / ``q * exp(cumsum g)`` operand tiles),
+and a grouped register recurrence (no per-token state-checkpoint writes) for
+small ``B * HV * T``. Requires SM90+ for the WY path and ``K = V = 128``;
+``backend="cake"`` raises in this mode.
 
 .. currentmodule:: flashinfer.kda_decode
 
@@ -117,6 +125,5 @@ path and ``K = V = 128``.
     :toctree: ../generated
 
     fused_kda_decode
-    kda_output_only_decode
     packed_kda_decode
     recurrent_kda
