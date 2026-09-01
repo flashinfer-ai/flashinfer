@@ -1,15 +1,15 @@
 # Experimental PCIe Ulysses backend
 
-`UlyssesCommunicator(backend="pcie")` is an explicit, single-node transport for PCIe-connected GPU groups; `backend="auto"` never selects it. One rank is an identity path; two or four ranks use CUDA peer copies; eight ranks prefer an all-RDMA route (every peer's payload over the rank-local mlx5 RC QP with an interleaved UMR) and fall back to all-P2P when the mlx5/GPUDirect requirements are not met; `FLASHINFER_ULYSSES_PCIE_ROUTE` forces the all-P2P route, the all-RDMA route at any multi-rank world size, or the eight-rank 4+4 NUMA hybrid (same-NUMA CUDA peer copies, cross-NUMA mlx5). Every route lands the Ulysses transforms directly in their final layouts, with no pack/unpack or staging output tensor.
+`UlyssesCommunicator(backend="pcie")` is an explicit, single-node transport for PCIe-connected GPU groups; `backend="auto"` never selects it. One rank is an identity path; two ranks use CUDA peer copies; four or eight ranks prefer an all-RDMA route (every peer's payload over the rank-local mlx5 RC QP with an interleaved UMR) and fall back to all-P2P when the mlx5/GPUDirect requirements are not met; `FLASHINFER_ULYSSES_PCIE_ROUTE` forces the all-P2P route, the all-RDMA route at any multi-rank world size, or the eight-rank 4+4 NUMA hybrid (same-NUMA CUDA peer copies, cross-NUMA mlx5). Every route lands the Ulysses transforms directly in their final layouts, with no pack/unpack or staging output tensor.
 
-Why copy engines rather than SM stores: the fused-transpose kernel behind `backend="nvlink"` (`include/flashinfer/comm/ulysses_all_to_all.cuh`) lets SM threads write into a peer-visible staging buffer, which is right for NVLink but degenerates into small transactions across a PCIe host bridge — 5-13x slower than this backend's all-P2P copy-engine route on the 8-GPU PCIe node it targets, at equal (bit-identical) outputs.
+Why copy engines rather than SM stores: the fused-transpose kernel behind `backend="nvlink"` (`include/flashinfer/comm/ulysses_all_to_all.cuh`) lets SM threads write into a peer-visible staging buffer, which is right for NVLink but degenerates into small transactions across a PCIe host bridge — 5-13x slower than this backend's all-P2P copy-engine route on the 8-GPU PCIe node it targets, at equal (bit-identical) outputs. (Measured 2026-08 during bring-up on the reference node — 8x RTX PRO 5000, dual-NUMA 4+4, PCIe Gen5 — with a one-off engine-comparison script that was not kept; only this conclusion survives.)
 
 ## Support matrix
 
 | Property | PCIe backend |
 |---|---|
 | Hosts / ranks | One host; world size 1, 2, 4, or 8 |
-| Routes | ws 1: identity (no JIT, no transport); ws 2/4: all-pairs CUDA P2P; ws 8: all-RDMA preferred, all-P2P fallback; `FLASHINFER_ULYSSES_PCIE_ROUTE` forces p2p or rdma at ws 2/4/8, or the 4+4 NUMA hybrid at ws 8; full-group CUDA P2P required on every route |
+| Routes | ws 1: identity (no JIT, no transport); ws 2: all-pairs CUDA P2P; ws 4/8: all-RDMA preferred, all-P2P fallback; `FLASHINFER_ULYSSES_PCIE_ROUTE` forces p2p or rdma at ws 2/4/8, or the 4+4 NUMA hybrid at ws 8; full-group CUDA P2P required on every route |
 | RDMA route requirements | One mlx5 device per rank with DEVX, RC QP, UMR, an active IPv4 RoCE v2 GID, GPUDirect RDMA; batch size 1 and head-row pitch `H * D * element_size <= 65,535` bytes; hybrid additionally needs the 4+4 NUMA split |
 | Input | Contiguous 4-D CUDA tensor with a 1-, 2- or 4-byte element type (FP16/BF16/FP32, FP8, INT8/UINT8); any batch size on the all-P2P route |
 | Execution | P2P enqueues asynchronously on the caller stream; the RDMA routes block the host until every rank reaches the barrier (unbounded) and until RDMA completes (fixed 10 s deadline); one in-flight operation per communicator, bound to the stream of the first call |
@@ -63,7 +63,7 @@ The all-P2P route replays correctly because the barrier advances its epoch in de
 
 ## Routing controls
 
-- `FLASHINFER_ULYSSES_PCIE_ROUTE`: `auto` (default: world size 8 prefers all-RDMA), `p2p` (force all-P2P), `rdma` (force all-RDMA at any multi-rank world size), or `hybrid` (force the eight-rank 4+4 NUMA hybrid). A forced RDMA route falls back to all-P2P with a `RuntimeWarning` when its requirements are not met.
+- `FLASHINFER_ULYSSES_PCIE_ROUTE`: `auto` (default: world sizes 4 and 8 prefer all-RDMA — from 4 ranks up, all-P2P crosses host bridges and measured well below the RDMA route on the reference node, while 2 ranks share a PCIe switch and P2P wins), `p2p` (force all-P2P), `rdma` (force all-RDMA at any multi-rank world size), or `hybrid` (force the eight-rank 4+4 NUMA hybrid). A forced RDMA route falls back to all-P2P with a `RuntimeWarning` when its requirements are not met.
 - `FLASHINFER_ULYSSES_PCIE_NICS`: comma-separated mlx5 device names, one per rank in rank order; overrides automatic PCI-distance NIC routing.
 - `FLASHINFER_ULYSSES_PCIE_GID_INDICES`: comma-separated GID table indices, one per rank in rank order; chooses among usable IPv4 RoCE v2 entries when a NIC has several.
 
