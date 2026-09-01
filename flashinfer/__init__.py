@@ -330,6 +330,9 @@ from .topk import TopKTieBreak as TopKTieBreak
 from .topk_varlen.topk_varlen import top_k_varlen as top_k_varlen
 from .sparse_pre_indexer import qsa_pre_indexer as qsa_pre_indexer
 from .sparse import BlockSparseAttentionWrapper as BlockSparseAttentionWrapper
+from .sparse_route import expand_block_route as expand_block_route
+from .sparse_route import qsa_route_from_blocks as qsa_route_from_blocks
+from .sparse_route import qsa_route_from_logical as qsa_route_from_logical
 from .sparse import (
     VariableBlockSparseAttentionWrapper as VariableBlockSparseAttentionWrapper,
 )
