@@ -504,7 +504,6 @@ def _use_tinygemm2_sm100(device: torch.device) -> bool:
     if compute_capability not in _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES:
         return False
     if compute_capability == (10, 7) and not is_cuda_version_at_least("13.4"):
-        # gen_tinygemm2_sm100_module only emits compute_107a on CUDA >= 13.4.
         return False
     return version_at_least(torch.version.cuda, "12.8")
 
