@@ -140,6 +140,13 @@ def get_cake_kda_prefill_shared_module_specs() -> tuple[
         _REQUIRED_PROBLEM_SHAPES.issubset(set(shapes)),
         "predecessor problem-shape continuity is incomplete",
     )
+    required_problem_shapes = contract.get("required_problem_shapes")
+    _require(
+        isinstance(required_problem_shapes, list)
+        and len(required_problem_shapes) == len(_REQUIRED_PROBLEM_SHAPES)
+        and set(required_problem_shapes) == _REQUIRED_PROBLEM_SHAPES,
+        "required problem-shape declaration mismatch",
+    )
 
     files = payload.get("files")
     _require(isinstance(files, list) and len(files) == 16, "file inventory mismatch")

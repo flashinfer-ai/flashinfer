@@ -24,6 +24,15 @@
       "fixed",
       "packed"
     ],
+    "required_problem_shapes": [
+      "h96_uniform_n32_holdout",
+      "h96_uniform_n64",
+      "h96_uniform_n128_holdout",
+      "h96_uniform_n256",
+      "h16_fixed_32768_holdout",
+      "h4_fixed_65536_holdout",
+      "h96_irregular_tail_varlen"
+    ],
     "shape_count": 29,
     "shape_denominator": [
       "h96_fixed_8192",
@@ -3316,6 +3325,6 @@
   ],
   "name": "cake_kda_prefill_shared",
   "producer": "cake",
-  "producer_revision": "20fd4872ac9c8904a79da27a4178fd922331238f",
+  "producer_revision": "6de5d12f26a49bcc11c7cec9e43e6e9bb1d05bff",
   "schema": "cake.library_export.v1"
 }
