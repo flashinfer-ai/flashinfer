@@ -19,6 +19,7 @@ is planned. The numerical tests need SM100a, where the kernel is qualified.
 """
 
 import math
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -178,14 +179,89 @@ def test_rejects_fast_decode_plan():
 
 
 @requires_cuda
-def test_rejects_mismatched_seq_lens():
+def test_uses_explicit_seq_lens_instead_of_page_derived_lengths():
     wrapper = _make_wrapper("prims-ts")
-    with pytest.raises(ValueError, match="seq_lens must match"):
+    delegate = Mock()
+    wrapper._prims_ts_wrapper = delegate
+    seq_lens = torch.tensor([32, 40], dtype=torch.int32, device="cuda")
+
+    wrapper.plan(
+        *_plan_args([32, 48], "cuda"),
+        q_data_type=torch.bfloat16,
+        seq_lens=seq_lens,
+    )
+
+    delegate.plan.assert_called_once()
+    torch.testing.assert_close(
+        delegate.plan.call_args.kwargs["seq_lens"], seq_lens.cpu().to(torch.int64)
+    )
+    torch.testing.assert_close(wrapper._kv_lens_buffer[:2], seq_lens)
+
+
+@requires_cuda
+def test_normalizes_uint32_seq_lens_for_plan_evidence():
+    wrapper = _make_wrapper("prims-ts")
+    delegate = Mock()
+    wrapper._prims_ts_wrapper = delegate
+    seq_lens = torch.tensor([32, 40], dtype=torch.uint32, device="cuda")
+
+    wrapper.plan(
+        *_plan_args([32, 48], "cuda"),
+        q_data_type=torch.bfloat16,
+        seq_lens=seq_lens,
+    )
+
+    plan_seq_lens = delegate.plan.call_args.kwargs["seq_lens"]
+    assert plan_seq_lens.device.type == "cpu"
+    assert plan_seq_lens.dtype == torch.int64
+    torch.testing.assert_close(plan_seq_lens, seq_lens.cpu().to(torch.int64))
+    assert wrapper._kv_lens_buffer.dtype == torch.int32
+    torch.testing.assert_close(
+        wrapper._kv_lens_buffer[:2], seq_lens.to(dtype=torch.int32)
+    )
+
+
+@requires_cuda
+def test_rejects_uint32_seq_lens_outside_decode_coordinate_range():
+    from flashinfer.attention.prims_ts.decode import _DECODE_MAX_KV_LEN
+
+    wrapper = _make_wrapper("prims-ts")
+    delegate = Mock()
+    wrapper._prims_ts_wrapper = delegate
+    wrapper._kv_lens_buffer[:2].fill_(7)
+    original_live_lengths = wrapper._kv_lens_buffer[:2].clone()
+    seq_lens = torch.tensor(
+        [32, _DECODE_MAX_KV_LEN + 1], dtype=torch.uint32, device="cuda"
+    )
+
+    with pytest.raises(ValueError, match=r"seq_lens values must be within \[1,"):
         wrapper.plan(
             *_plan_args([32, 48], "cuda"),
             q_data_type=torch.bfloat16,
-            seq_lens=torch.tensor([32, 40], dtype=torch.int32, device="cuda"),
+            seq_lens=seq_lens,
         )
+
+    delegate.plan.assert_not_called()
+    torch.testing.assert_close(wrapper._kv_lens_buffer[:2], original_live_lengths)
+
+
+@requires_cuda
+def test_failed_low_level_replan_preserves_live_seq_lens():
+    wrapper = _make_wrapper("prims-ts")
+    delegate = Mock()
+    delegate.plan.side_effect = RuntimeError("compile failed")
+    wrapper._prims_ts_wrapper = delegate
+    wrapper._kv_lens_buffer[:2].fill_(7)
+    original_live_lengths = wrapper._kv_lens_buffer[:2].clone()
+
+    with pytest.raises(RuntimeError, match="compile failed"):
+        wrapper.plan(
+            *_plan_args([32, 48], "cuda"),
+            q_data_type=torch.bfloat16,
+            seq_lens=torch.tensor([32, 40], dtype=torch.uint32, device="cuda"),
+        )
+
+    torch.testing.assert_close(wrapper._kv_lens_buffer[:2], original_live_lengths)
 
 
 def test_plan_trace_captures_explicit_causal_mode():

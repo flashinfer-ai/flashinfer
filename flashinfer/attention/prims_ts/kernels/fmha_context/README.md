@@ -28,17 +28,27 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 | `BatchPrefillPagedTSWrapper` | Reusable packed-Q, paged-K/V plan. |
 | `batch_prefill_with_paged_kv_cache` | One-shot packed-Q, paged-K/V attention. |
 
+Both wrappers are experimental and may change incompatibly while the PrimTS
+API family is stabilized.
+
 These experimental context entry points are not currently registered with
 `fi_trace`; tracing support is limited to the PrimTS decode APIs.
 
-Planning validates static geometry, reads cumulative metadata when needed, and
-may compile. The `run()` host path does not copy metadata values to the host or
-synchronize. Packed contiguous plans retain `qo_indptr` and `kv_indptr` as
-live inputs; general ragged kernels reload their values on every run, while a
-uniform packed plan may compile its fixed offsets into the specialization.
-General ragged paged kernels reload the retained `qo_indptr`; uniform paged
-plans may compile those fixed offsets into the specialization. Both execute
-against the K/V lengths and page table translated and snapshotted by `plan()`.
+`BatchPrefillTSWrapper` keeps the existing tensor-driven lifecycle: planning
+validates Q/K/V and reads cumulative metadata when needed. Packed contiguous
+plans retain `qo_indptr` and `kv_indptr` as live inputs; general ragged kernels
+reload their values on every run, while a uniform packed plan may compile its
+fixed offsets into the specialization.
+
+`BatchPrefillPagedTSWrapper` uses a static-spec lifecycle. `plan()` receives
+only device, capacity, head, dtype, page, mask, and scale information and may
+compile; it does not bind Q, cache, or request metadata and allocates no
+workspace. Every `run()` supplies Q, K/V cache, Q and K/V cumulative offsets,
+the dense K/V page table, and live K/V lengths. Runtime structural validation
+is enabled by default. `validate=False` skips those checks for a previously
+validated steady-state or CUDA Graph launch; the caller then owns every value,
+bounds, aliasing, and lifetime precondition. Neither mode copies metadata
+values to the host.
 
 ## Supported contract
 
@@ -71,9 +81,9 @@ values for the padded tail of the largest supported 256-row query work tile.
 Q, K, V, and `out` must be compact, 16-byte-aligned CUDA tensors on one
 device. Metadata must be compact CUDA `torch.int32` on that device and at
 least 4-byte aligned. A caller-provided `out` must not overlap Q, K, V, or any
-metadata retained by the plan. The launch conservatively rejects overlapping
-storage spans. The API returns O only; rowwise LSE and other softmax state
-remain internal to the kernel.
+metadata supplied to or retained by the wrapper. The launch conservatively
+rejects overlapping storage spans. The API returns O only; rowwise LSE and
+other softmax state remain internal to the kernel.
 
 ## Tensor and metadata layouts
 
@@ -90,15 +100,24 @@ Paged inputs:
 
 - Q/O: `[total_q, Hq, D]`.
 - Separate K and V pools: `[num_pages, Hkv, page_size, D]`.
-- FlashInfer CSR metadata: `qo_indptr[B + 1]`,
-  `paged_kv_indptr[B + 1]`, `paged_kv_indices[num_used_pages]`, and
-  `paged_kv_last_page_len[B]`, all compact CUDA `int32` tensors.
+- Reusable-wrapper metadata: `qo_indptr[B + 1]`, token-based
+  `logical_kv_indptr[B + 1]`, `seq_lens_kv[B]`, and a compact dense page table
+  `dense_page_idx_kv[B, 2, max_num_pages_per_seq_kv]`, all CUDA `int32`.
+- The two dense page-table planes address the separate K and V pools. When
+  those pools use the same physical page numbering, the planes contain the
+  same IDs. The column capacity is static, covers `max_seq_len_k`, and is a
+  multiple of `128 / page_size`; padded entries must still name valid pages.
+- The one-shot API continues to accept FlashInfer CSR metadata:
+  `qo_indptr[B + 1]`, `paged_kv_indptr[B + 1]`,
+  `paged_kv_indices[num_used_pages]`, and `paged_kv_last_page_len[B]`.
 - Physical page IDs may be arbitrary, repeated, and nonidentity ordered.
 
 Every cumulative-offset vector starts at zero and increases strictly.
-`qo_indptr[-1]` equals `total_q`, `paged_kv_indptr[-1]` equals the number of
-page-index entries, every page ID indexes the physical cache, and each last
-page length is in `[1, page_size]`.
+`qo_indptr[-1]` equals `total_q`; wrapper `logical_kv_indptr` deltas equal
+`seq_lens_kv`; every live length is positive and no greater than
+`max_seq_len_k`; and every page ID touched by a live or padded tile indexes the
+physical cache. For the one-shot CSR API, `paged_kv_indptr[-1]` equals the
+number of page-index entries and each last-page length is in `[1, page_size]`.
 
 For request `b`, bottom-right causal row `i` can see through
 `Sk[b] - Sq[b] + i`. With `window_left=W>0`, the row retains that key and at
@@ -106,9 +125,9 @@ most `W` preceding keys. `sm_scale` defaults to `1 / sqrt(D)` and
 `output_scale` defaults to 1; supplied scales must be finite, positive, and
 representable as positive `float32` values.
 
-The host reads cumulative metadata once during planning to establish the
-static geometry and maximum Q/K capacities. For packed contiguous attention,
-the plan keeps `qo_indptr` and `kv_indptr` as live device inputs; their storage
+For packed contiguous attention, the host reads cumulative metadata once
+during planning to establish the static geometry and maximum Q/K capacities.
+The plan keeps `qo_indptr` and `kv_indptr` as live device inputs; their storage
 must remain valid and stable. Their values may change between runs while
 preserving the planned batch, zero starting offsets, final packed extents,
 strictly positive deltas, and these per-request capacity bounds. Each capacity
@@ -129,17 +148,22 @@ dense plan compiles away request-local K-tail masking because every K length
 equals the same 128-row-aligned maximum, the replay conditions preserve that
 specialization.
 
-Paged planning keeps `qo_indptr` as a live device input, but snapshots and
-translates `paged_kv_indptr`, `paged_kv_indices`, and
-`paged_kv_last_page_len`. Live Q offsets may change while preserving the
-planned batch, a zero starting offset, the final packed-Q extent, strictly
-positive deltas, and `Sq[b] <= planned max_seq_len_q`. For a causal plan, every
-live `Sq[b]` must also be no greater than that request's snapshotted `Sk[b]`.
-The kernel derives the request-local causal offset from those live Q and
-snapshotted K lengths; there is no separate replay restriction on the maximum
-offset. Changing any paged K/V metadata value requires another `plan()` call.
-The `run()` host path trusts live offset values; violating this replay contract
-can produce incorrect results or out-of-bounds access.
+Paged wrapper planning fixes only static capacities and compile-time semantics.
+Each run may provide different valid Q offsets, K/V offsets and lengths, and
+physical page IDs without another plan. The batch remains exact; Q and K/V
+deltas stay positive and within `max_seq_len_q` and `max_seq_len_k`; the final
+Q offset matches the packed Q/O extent; and the dense page-table shape remains
+the planned shape. For causal attention, every live `Sq[b]` is no greater than
+`Sk[b]`. The kernel derives the request-local causal offset from the live
+metadata.
+
+With the default `validate=True`, `run()` checks tensor structure, shapes,
+dtypes, devices, scales, output, and aliasing, but deliberately does not read
+metadata values back to the host. `validate=False` skips those structural
+checks. In either mode, invalid offsets, lengths, or page IDs can produce
+incorrect results or out-of-bounds access. CUDA Graph replay also requires
+stable tensor shapes and addresses even though values may change between
+completed replays.
 
 ## Dataflow and source map
 
@@ -197,12 +221,12 @@ Packed Q with a paged K/V cache:
 
 ```python
 import torch
-from flashinfer.attention.prims_ts import batch_prefill_with_paged_kv_cache
+from flashinfer.attention.prims_ts import BatchPrefillPagedTSWrapper
 
 device = "cuda"
 B, Hq, Hkv, D, page_size = 2, 8, 2, 128, 32
-q_lens, kv_pages = (32, 48), (2, 3)
-num_pages = sum(kv_pages)
+q_lens, kv_lens = (32, 48), (64, 80)
+num_pages = 5
 
 q = torch.randn(sum(q_lens), Hq, D, device=device, dtype=torch.float16)
 k_cache = torch.randn(
@@ -210,29 +234,49 @@ k_cache = torch.randn(
 )
 v_cache = torch.randn_like(k_cache)
 qo_indptr = torch.tensor((0, 32, 80), device=device, dtype=torch.int32)
-paged_kv_indptr = torch.tensor((0, 2, 5), device=device, dtype=torch.int32)
-paged_kv_indices = torch.arange(num_pages, device=device, dtype=torch.int32)
-paged_kv_last_page_len = torch.tensor(
-    (32, 16), device=device, dtype=torch.int32
-)
+logical_kv_indptr = torch.tensor((0, 64, 144), device=device, dtype=torch.int32)
+seq_lens_kv = torch.tensor(kv_lens, device=device, dtype=torch.int32)
 
-out = batch_prefill_with_paged_kv_cache(
+# A 128-token K tile spans four 32-token pages. Pad each row to four
+# columns by repeating its final valid page ID, and provide one plane for
+# each of the separate K and V pools.
+page_rows = torch.tensor(
+    ((0, 1, 1, 1), (2, 3, 4, 4)), device=device, dtype=torch.int32
+)
+dense_page_idx_kv = torch.stack((page_rows, page_rows), dim=1)
+
+wrapper = BatchPrefillPagedTSWrapper(kv_layout="HND")
+wrapper.plan(
+    device=q.device,
+    batch_size=B,
+    max_seq_len_q=max(q_lens),
+    max_seq_len_k=max(kv_lens),
+    max_num_pages_per_seq_kv=dense_page_idx_kv.shape[-1],
+    num_qo_heads=Hq,
+    num_kv_heads=Hkv,
+    head_dim=D,
+    q_dtype=q.dtype,
+    kv_dtype=k_cache.dtype,
+    out_dtype=q.dtype,
+    page_size=page_size,
+    mask_type="causal",
+)
+out = wrapper.run(
     q,
     k_cache,
     v_cache,
     qo_indptr,
-    paged_kv_indptr,
-    paged_kv_indices,
-    paged_kv_last_page_len=paged_kv_last_page_len,
-    page_size=page_size,
-    mask_type="causal",
+    logical_kv_indptr,
+    dense_page_idx_kv,
+    seq_lens_kv,
 )
 assert out.shape == q.shape
 ```
 
-For CUDA graph capture, call `plan()` and perform a warm-up `run()` first, keep
-all planned tensors at stable addresses, and pass a preallocated,
-non-overlapping `out`.
+For CUDA graph capture, call `plan()` and perform one default-validating
+`run()` first. Capture subsequent calls with `validate=False`, keep every
+run-time tensor at a stable address, and pass a preallocated, non-overlapping
+`out`.
 
 ## Limitations
 
@@ -243,9 +287,9 @@ non-overlapping `out`.
 - Positive windows are restricted to even-ratio GQA because the kernel pairs
   query heads that share a K/V head.
 - Attention sinks, custom masks, and mixed Q/K/V dtypes are not exposed.
-- Re-plan after changing paged K/V metadata values. Live packed offsets may be
-  updated only within their plan-time Q/K capacities, packed extents, and
-  per-request causal contract.
+- Re-plan the paged wrapper after changing a static capacity, head or dtype
+  geometry, page size, mask, window, or default scale. Request metadata may
+  change between completed runs while remaining within the static plan.
 
 ## Validation
 

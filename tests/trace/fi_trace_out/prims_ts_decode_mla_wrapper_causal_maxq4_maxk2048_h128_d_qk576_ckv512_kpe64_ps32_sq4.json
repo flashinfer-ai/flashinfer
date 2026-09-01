@@ -1,18 +1,34 @@
 {
-  "name": "prims_ts_decode_mla_wrapper_h128_d_qk576_ps32_sq4",
-  "description": "Reusable PrimTS MLA decode wrapper. The plan fixes masks, static bounds, and exact batch size; page tables, sequence lengths, and Q offsets may be retained by the plan or supplied live to run().",
+  "name": "prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4",
+  "description": "Reusable PrimTS MLA decode wrapper. The plan fixes masks, static bounds, and exact batch size. Every run supplies page tables and sequence lengths; packed-Q runs also supply Q offsets.",
   "op_type": "mla_paged",
   "tags": [
     "fi_api:flashinfer.attention.prims_ts.mla_decode.BatchMLADecodePagedTSWrapper.run",
     "stage:decode",
     "backend:prims-ts",
     "status:experimental",
-    "mla"
+    "mla",
+    "mask:causal"
   ],
   "axes": {
     "batch_size": {
       "type": "var",
       "description": "Exact number of planned MLA requests."
+    },
+    "max_seq_len_q": {
+      "type": "const",
+      "value": 4,
+      "description": "Query-length capacity frozen by plan()."
+    },
+    "max_kv_len": {
+      "type": "const",
+      "value": 2048,
+      "description": "K/V-length capacity frozen by plan()."
+    },
+    "causal": {
+      "type": "const",
+      "value": 1,
+      "description": "One for a causal plan and zero for a dense plan."
     },
     "num_heads": {
       "type": "const",
@@ -23,8 +39,14 @@
       "value": 576
     },
     "kv_lora_rank": {
-      "type": "var",
-      "description": "Fixed MLA output dimension (512)."
+      "type": "const",
+      "value": 512,
+      "description": "Latent K/V rank frozen by plan()."
+    },
+    "qk_rope_head_dim": {
+      "type": "const",
+      "value": 64,
+      "description": "RoPE head dimension frozen by plan()."
     },
     "num_pages": {
       "type": "var",
@@ -52,7 +74,7 @@
     "head_dim_qk == 576",
     "kv_lora_rank == 512",
     "page_size in (16, 32, 64, 128)",
-    "block_tables is None or block_tables.shape[0] == batch_size",
+    "block_tables.shape[0] == batch_size",
     "seq_len_q >= 1"
   ],
   "inputs": {
@@ -79,16 +101,14 @@
         "max_pages_per_seq"
       ],
       "dtype": "int32",
-      "optional": true,
-      "description": "Physical page table supplied live to run()."
+      "description": "Required physical page table supplied live to run()."
     },
     "seq_lens": {
       "shape": [
         "batch_size"
       ],
       "dtype": "int32",
-      "optional": true,
-      "description": "Per-request KV lengths supplied live to run()."
+      "description": "Required per-request KV lengths supplied live to run()."
     },
     "qo_indptr": {
       "shape": [
@@ -96,17 +116,7 @@
       ],
       "dtype": "int32",
       "optional": true,
-      "description": "Cumulative Q offsets retained or supplied live."
-    },
-    "max_seq_len_q": {
-      "shape": null,
-      "dtype": "int32",
-      "optional": true
-    },
-    "mask_type": {
-      "shape": null,
-      "dtype": "string",
-      "optional": true
+      "description": "Cumulative Q offsets required by a packed-Q run."
     },
     "bmm1_scale": {
       "shape": null,
@@ -117,6 +127,12 @@
       "shape": null,
       "dtype": "float32",
       "optional": true
+    },
+    "validate": {
+      "shape": null,
+      "dtype": "bool",
+      "optional": true,
+      "description": "Whether to validate live tensors and metadata values."
     }
   },
   "outputs": {
