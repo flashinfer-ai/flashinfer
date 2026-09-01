@@ -8935,6 +8935,7 @@ def _check_group_deepgemm_fp8_nt_groupwise_cute_dsl(
 ) -> bool:
     if not CUTE_DSL_AVAILABLE:
         raise RuntimeError("The cute_dsl backend requires nvidia-cutlass-dsl")
+    _check_cute_dsl_arch(a.device)
     if scale_granularity_mnk != (1, 128, 128):
         raise ValueError(
             "The cute_dsl backend requires scale_granularity_mnk=(1, 128, 128), "
