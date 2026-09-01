@@ -66,6 +66,13 @@ cache_permute_indices: Dict[tuple, torch.Tensor] = {}
 @pytest.mark.parametrize("top_k", [4])
 @pytest.mark.parametrize("use_4over6", [False, True])
 @pytest.mark.parametrize("weights_use_4over6", [False, True])
+@pytest.mark.parametrize(
+    "activation_type",
+    [
+        pytest.param(ActivationType.Swiglu, id="Swiglu"),
+        pytest.param(ActivationType.Relu2, id="Relu2"),
+    ],
+)
 def test_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -74,12 +81,16 @@ def test_routed_fused_moe(
     top_k: int,
     use_4over6: bool,
     weights_use_4over6: bool,
+    activation_type: ActivationType,
 ):
     device = torch.device("cuda:0")
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
     enable_pdl = device_support_pdl(device)
+
+    is_gated = activation_type.is_gated
+    fc1_out_size = intermediate_size * (2 if is_gated else 1)
 
     # ======== Input Tensors ========
     hidden_states_bf16 = torch.randn(
@@ -91,7 +102,7 @@ def test_routed_fused_moe(
     w13_bf16 = (
         torch.randn(
             num_experts,
-            intermediate_size * 2,
+            fc1_out_size,
             hidden_size,
             device=device,
             dtype=torch.bfloat16,
@@ -158,7 +169,7 @@ def test_routed_fused_moe(
             sfLayout=SfLayout.layout_linear,
         )
     w13_scale = w13_scale.view(torch.float8_e4m3fn).reshape(
-        num_experts, intermediate_size * 2, -1
+        num_experts, fc1_out_size, -1
     )
     w2_scale = w2_scale.view(torch.float8_e4m3fn).reshape(num_experts, hidden_size, -1)
 
@@ -216,9 +227,12 @@ def test_routed_fused_moe(
     for e in range(num_experts):
         mask = flat_ids == e  # [num_tokens*top_k]
         e_hidden = flat_hidden[mask]  # [n_e, hidden_size]
-        up_gate_e = e_hidden @ w13_dequant[e].T  # [n_e, 2*intermediate_size]
-        up_e, gate_e = up_gate_e.chunk(2, dim=-1)
-        inter_e = F.silu(gate_e) * up_e  # [n_e, intermediate_size]
+        up_gate_e = e_hidden @ w13_dequant[e].T  # [n_e, fc1_out_size]
+        if is_gated:
+            up_e, gate_e = up_gate_e.chunk(2, dim=-1)
+            inter_e = F.silu(gate_e) * up_e  # [n_e, intermediate_size]
+        else:
+            inter_e = F.relu(up_gate_e) ** 2  # [n_e, intermediate_size]
         expert_out[mask] = inter_e @ w2_dequant[e].T  # [n_e, hidden_size]
     # Weighted sum back to [num_tokens, hidden_size]
     reference = (
@@ -239,6 +253,7 @@ def test_routed_fused_moe(
             cache_permute_indices,
             w13[i].view(torch.uint8),
             epilogue_tile_m,
+            is_gated_act_gemm=is_gated,
         )
         w13_shuffled.append(
             w13[i].view(torch.uint8)[permute_indices.to(device)].contiguous()
@@ -248,10 +263,11 @@ def test_routed_fused_moe(
             w13_scale[i].view(torch.uint8),
             epilogue_tile_m,
             num_elts_per_sf=16,
+            is_gated_act_gemm=is_gated,
         )
         w13_scale_shuffled.append(
             block_scale_interleave(
-                w13_scale.reshape(num_experts, intermediate_size * 2, -1)[i]
+                w13_scale.reshape(num_experts, fc1_out_size, -1)[i]
                 .view(torch.uint8)[permute_sf_indices.to(device)]
                 .contiguous()
             )
@@ -282,7 +298,16 @@ def test_routed_fused_moe(
     w2_shuffled = torch.stack(w2_shuffled)
     w2_scale_shuffled = torch.stack(w2_scale_shuffled).view(torch.float8_e4m3fn)
 
-    output1_scale_scalar = torch.stack([w13_global_scale_inv] * num_experts)
+    # For a non-linear elementwise activation (Relu2) the kernel applies the gate scalar
+    # *before* the activation and the c scalar *after*, so the dequantization factor must
+    # ride on the gate scalar only -- s * relu(x)^2 != relu(s * x)^2.  The c scalar then
+    # carries just the output quantization factor, which is 1 here because FC1 emits bf16
+    # under per-token scaling.  Gated activations take the dequant on both.
+    # Mirrors scale_c_fc1 / scale_gate_fc1 in tests/moe/trtllm_gen_fused_moe_utils.py.
+    output1_scale_scalar = torch.stack(
+        [w13_global_scale_inv if is_gated else torch.ones_like(w13_global_scale_inv)]
+        * num_experts
+    )
     output1_scale_gate_scalar = torch.stack([w13_global_scale_inv] * num_experts)
     output2_scale_scalar = torch.stack([w2_global_scale_inv] * num_experts)
 
@@ -322,7 +347,7 @@ def test_routed_fused_moe(
         RoutingMethodType.TopK.value,
         True,  # do_finalize
         enable_pdl,
-        ActivationType.Swiglu.value,  # act_type
+        activation_type.value,  # act_type
         per_token_scale_inv,
         None,
     )

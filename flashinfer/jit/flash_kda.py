@@ -15,18 +15,14 @@ limitations under the License.
 """
 
 import functools
-from pathlib import Path
 from typing import Literal
 
-from . import env as jit_env
-from .core import (
-    JitSpec,
-    gen_jit_spec,
-    logger,
-    sm100a_nvcc_flags,
-    sm100f_nvcc_flags,
-    sm103a_nvcc_flags,
+from ._kda_jit_common import (
+    gen_kda_jit_spec,
+    get_flashinfer_include_dir as _get_flash_kda_include_dir,
+    get_kda_csrc_dir as _get_flash_kda_csrc_dir,
 )
+from .core import JitSpec, logger
 
 FlashKDAVariant = Literal[
     "m64",
@@ -47,7 +43,8 @@ FlashKDAVariant = Literal[
     "bt16_chain_m64_s9",
     "bt16_prepare_chain_m64_s8",
 ]
-FlashKDATarget = Literal["sm100a", "sm100f", "sm103a"]
+FlashKDATarget = Literal["sm100a", "sm100f"]
+VibeCUDAFlashKDATarget = Literal["sm100a", "sm103a"]
 
 FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "m64",
@@ -69,11 +66,11 @@ FLASH_KDA_VARIANTS: tuple[FlashKDAVariant, ...] = (
     "bt16_prepare_chain_m64_s8",
 )
 
-_FLASH_KDA_NVCC_FLAGS = {
-    "sm100a": sm100a_nvcc_flags,
-    "sm100f": sm100f_nvcc_flags,
-    "sm103a": sm103a_nvcc_flags,
-}
+_FLASH_KDA_TARGETS: tuple[FlashKDATarget, ...] = ("sm100a", "sm100f")
+_VIBECUDA_FLASH_KDA_TARGETS: tuple[VibeCUDAFlashKDATarget, ...] = (
+    "sm100a",
+    "sm103a",
+)
 _FLASH_KDA_TARGET_DEFINE = {
     "sm100a": "-DFLASHINFER_FLASH_KDA_TARGET_MINOR=0",
     "sm100f": "-DFLASHINFER_FLASH_KDA_TARGET_FAMILY=100",
@@ -133,45 +130,12 @@ _FLASH_KDA_VARIANT_DEFINES = {
 }
 
 
-def _get_flash_kda_csrc_dir() -> Path:
-    """Locate frozen FlashKDA sources in installed and source checkouts."""
-
-    installed = jit_env.FLASHINFER_CSRC_DIR / "kda"
-    if installed.exists():
-        return installed
-
-    checkout = Path(__file__).resolve().parents[2] / "csrc" / "kda"
-    if checkout.exists():
-        return checkout
-
-    raise FileNotFoundError(
-        "FlashKDA CUDA sources were not found. Checked:\n"
-        f"  - {installed}\n"
-        f"  - {checkout}"
-    )
-
-
-def _get_flash_kda_include_dir() -> Path:
-    """Locate FlashInfer headers in installed and source checkouts."""
-
-    if jit_env.FLASHINFER_INCLUDE_DIR.exists():
-        return jit_env.FLASHINFER_INCLUDE_DIR
-    checkout = Path(__file__).resolve().parents[2] / "include"
-    if checkout.exists():
-        return checkout
-    raise FileNotFoundError(
-        "FlashInfer headers were not found. Checked:\n"
-        f"  - {jit_env.FLASHINFER_INCLUDE_DIR}\n"
-        f"  - {checkout}"
-    )
-
-
 def get_flash_kda_uri(variant: FlashKDAVariant, target: FlashKDATarget) -> str:
     """Return the target-specific JIT/AOT key for one schedule."""
 
     if variant not in FLASH_KDA_VARIANTS:
         raise ValueError(f"unsupported FlashKDA variant: {variant}")
-    if target not in _FLASH_KDA_NVCC_FLAGS:
+    if target not in _FLASH_KDA_TARGETS:
         raise ValueError(f"unsupported FlashKDA target: {target}")
     module_ident = _FLASH_KDA_MODULE_IDENTS[variant]
     return f"flash_kda_bf16_{variant}_{module_ident}_{target}"
@@ -205,28 +169,26 @@ def gen_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget) -> Ji
             f"FlashKDA binding source not found: {missing_sources[0]}"
         )
 
-    spec = gen_jit_spec(
+    extra_cuda_cflags = [
+        *(
+            [_FLASH_KDA_VARIANT_DEFINES[variant]]
+            if variant in _FLASH_KDA_VARIANT_DEFINES
+            else []
+        ),
+        *(
+            ["-DFLASHINFER_FLASH_KDA_COMBINED_BT16=1"]
+            if variant == "bt16_prepare_chain_m64_s8"
+            else []
+        ),
+    ]
+    spec = gen_kda_jit_spec(
         name=uri,
         sources=sources,
-        extra_cuda_cflags=[
-            *_FLASH_KDA_NVCC_FLAGS[target],
-            _FLASH_KDA_TARGET_DEFINE[target],
-            *(
-                [_FLASH_KDA_VARIANT_DEFINES[variant]]
-                if variant in _FLASH_KDA_VARIANT_DEFINES
-                else []
-            ),
-            *(
-                ["-DFLASHINFER_FLASH_KDA_COMBINED_BT16=1"]
-                if variant == "bt16_prepare_chain_m64_s8"
-                else []
-            ),
-        ],
-        extra_include_paths=[
-            csrc_dir,
-            csrc_dir.parent,
-            include_dir,
-        ],
+        target=target,
+        target_define=_FLASH_KDA_TARGET_DEFINE[target],
+        csrc_dir=csrc_dir,
+        include_dir=include_dir,
+        extra_cuda_cflags=extra_cuda_cflags,
     )
     logger.info(f"Generated FlashKDA {variant} {target} JIT spec: {spec.name}")
     return spec
@@ -356,16 +318,16 @@ def load_flash_kda_module(variant: FlashKDAVariant, target: FlashKDATarget):
 _VIBECUDA_FLASH_KDA_MODULE_IDENT = "35f07079a1"
 
 
-def get_vibecuda_flash_kda_uri(target: FlashKDATarget) -> str:
+def get_vibecuda_flash_kda_uri(target: VibeCUDAFlashKDATarget) -> str:
     """Return the target-specific JIT/AOT key for the VibeCUDA module."""
 
-    if target not in _FLASH_KDA_NVCC_FLAGS:
+    if target not in _VIBECUDA_FLASH_KDA_TARGETS:
         raise ValueError(f"unsupported FlashKDA target: {target}")
     return f"vibecuda_flash_kda_bf16_{_VIBECUDA_FLASH_KDA_MODULE_IDENT}_{target}"
 
 
 @functools.cache
-def gen_vibecuda_flash_kda_module(target: FlashKDATarget) -> JitSpec:
+def gen_vibecuda_flash_kda_module(target: VibeCUDAFlashKDATarget) -> JitSpec:
     """Generate the VibeCUDA FlashKDA prefill JIT module.
 
     The kernel sources keep the generated standalone structure of the frozen
@@ -391,12 +353,14 @@ def gen_vibecuda_flash_kda_module(target: FlashKDATarget) -> JitSpec:
         if not source.exists():
             raise FileNotFoundError(f"VibeCUDA FlashKDA source not found: {source}")
 
-    spec = gen_jit_spec(
+    spec = gen_kda_jit_spec(
         name=uri,
         sources=sources,
+        target=target,
+        target_define=_FLASH_KDA_TARGET_DEFINE[target],
+        csrc_dir=csrc_dir,
+        include_dir=include_dir,
         extra_cuda_cflags=[
-            *_FLASH_KDA_NVCC_FLAGS[target],
-            _FLASH_KDA_TARGET_DEFINE[target],
             *(["-DKDA_SM103"] if target == "sm103a" else []),
             *(["-DKDA_PREP_NORM_ILP"] if target == "sm103a" else []),
             "--extra-device-vectorization",
@@ -407,18 +371,13 @@ def gen_vibecuda_flash_kda_module(target: FlashKDATarget) -> JitSpec:
             "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
             "-U__CUDA_NO_HALF2_OPERATORS__",
         ],
-        extra_include_paths=[
-            csrc_dir,
-            csrc_dir.parent,
-            include_dir,
-        ],
     )
     logger.info(f"Generated VibeCUDA FlashKDA {target} JIT spec: {spec.name}")
     return spec
 
 
 @functools.cache
-def load_vibecuda_flash_kda_module(target: FlashKDATarget):
+def load_vibecuda_flash_kda_module(target: VibeCUDAFlashKDATarget):
     """Build or load the VibeCUDA FlashKDA prefill module."""
 
     module = gen_vibecuda_flash_kda_module(target).build_and_load()

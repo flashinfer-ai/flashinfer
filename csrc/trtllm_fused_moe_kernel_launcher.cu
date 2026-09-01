@@ -2929,10 +2929,11 @@ class FP4BlockScaleLauncher : public FusedMoeLauncher {
       tiles.push_back(128);
 #ifndef TLLM_RUBIN_FEATURES
       // Keep tactic enumeration aligned with the public BMM artifact. The
-      // pinned Rubin package (TRTLLM_GEN_BMM_RUBIN) has no 192-tile FP4
-      // kernels (its only 192-tile kernels are FP8), and launchers are built
-      // eagerly for every advertised tile, so advertising 192 there fails
-      // runner construction outright.
+      // previously separate Rubin BMM pin had no 192-tile FP4 kernels (its only
+      // 192-tile kernels were FP8), and launchers are built eagerly for every
+      // advertised tile, so advertising 192 there failed runner construction
+      // outright. The consolidated multi-arch BMM pin does ship sm107a 192-tile
+      // FP4 kernels, so this guard can be dropped once Rubin is re-verified.
       // The exported per-token NVFP4 tile-192 path produces non-finite outputs (#4486).
       if ((dtype_weights == btg::Dtype::E2m1 && dtype_act == btg::Dtype::E2m1 &&
            !use_per_token_scaling) ||

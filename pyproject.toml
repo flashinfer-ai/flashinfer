@@ -75,19 +75,8 @@ exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
 # runtime via importlib.resources.
 "flashinfer.gdn_kernels.experimental" = ["*.json"]
 # Their in-package JIT kernel source, compiled on demand by
-# flashinfer/jit/gdn_fused_decode.py, like the sm100_blk64 sources below.
+# flashinfer/jit/gdn_fused_decode.py.
 "flashinfer.gdn_kernels.experimental.kernel" = ["*.cu"]
-# JIT sources for the sm100_blk64 BSA kernel extension (compiled on-demand via
-# torch.utils.cpp_extension.load in flashinfer/cute_dsl/sparse/sm100_blk64/loader.py).
-# These live inside the package tree rather than csrc/, so they must be
-# registered explicitly or they won't be included in non-editable installs.
-"flashinfer.cute_dsl.sparse.sm100_blk64" = [
-  "*.cpp",
-  "*.cu",
-  "*.h",
-  "*.hpp",
-  "instantiations/*.cu",
-]
 # Raw CUDA sources for the SM90 push-style FP8 mega-MoE drop, JIT-compiled at
 # runtime; registered so non-editable installs ship them (PR #4069).
 "flashinfer.moe_ep.kernel_src.sm90.push_style_megamoe" = [

@@ -29,6 +29,12 @@ from .activation import silu_and_mul as silu_and_mul
 from .activation import (
     silu_and_mul_scaled_nvfp4_experts_quantize as silu_and_mul_scaled_nvfp4_experts_quantize,
 )
+from .gated_act_mxfp8 import (
+    silu_and_mul_mxfp8_quantize as silu_and_mul_mxfp8_quantize,
+)
+from .gated_act_mxfp8 import (
+    silu_and_mul_mxfp8_quantize_backward as silu_and_mul_mxfp8_quantize_backward,
+)
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
@@ -60,6 +66,10 @@ from .decode import (
 )
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
+from .cake_dcp import get_dcp_spec_counter_bytes as get_dcp_spec_counter_bytes
+from .cake_dcp import (
+    get_dcp_spec_workspace_size_bytes as get_dcp_spec_workspace_size_bytes,
+)
 from .quantization.fp4_quantization import (
     block_scale_interleave,
     nvfp4_block_scale_interleave,

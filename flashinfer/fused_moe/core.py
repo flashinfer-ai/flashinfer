@@ -6167,7 +6167,8 @@ def trtllm_fp4_block_scale_moe(
         ``[num_experts, M, hidden_size // (32 if mxfp4 else 16)]`` FC1 weight
         block scales, dtype float8, with the same ``M`` as ``gemm1_weights``.
     gemm1_bias : Optional[torch.Tensor]
-        ``[num_experts, 2 * intermediate_size]`` FC1 bias, ``float32``.
+        ``[num_experts, M]`` FC1 bias, ``float32``, with the same ``M`` as
+        ``gemm1_weights``.
     gemm1_alpha : Optional[torch.Tensor]
         ``[num_experts]`` swiglu alpha, ``float32``.
         For SiTU this is ``[local_num_experts]``, finite and positive;
