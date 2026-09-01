@@ -34,6 +34,7 @@ from .compilation_context import CompilationContext
 from .jit import JitSpec, build_jit_specs
 from .jit import env as jit_env
 from .jit.activation import act_func_def_str, gen_act_and_mul_module
+from .jit.sparse_route import gen_sparse_route_module
 from .jit.attention import (
     gen_batch_attention_module,
     gen_batch_decode_module,
@@ -530,6 +531,9 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
+    # The route kernels are plain CUDA and build everywhere; without this an
+    # install with JIT disabled has no artifact to load.
+    jit_specs.append(gen_sparse_route_module())
     has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
