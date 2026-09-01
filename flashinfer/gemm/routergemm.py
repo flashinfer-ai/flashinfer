@@ -492,29 +492,19 @@ def get_tinygemm2_sm100_module():
 
 
 # The generated kernels are validated on SM100 (B200), SM103 (B300/GB300) and
-# SM107 (Rubin) exactly -- the bitwise-parity suite in
-# tests/model_optimizations/test_tinygemm2_sm100.py passes on each. Any other
-# 10.x device passes is_sm100a_supported's major==10 predicate but has not been
-# validated, so it must keep using the reference kernel; hence an explicit
-# allowlist rather than a major-version check.
+# SM107 (Rubin) exactly; other 10.x devices pass is_sm100a_supported's
+# major==10 predicate but must keep using the reference kernel.
 _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 
 def _use_tinygemm2_sm100(device: torch.device) -> bool:
-    """Whether the generated tinygemm2_sm100 variants may serve ``device``."""
     if os.environ.get("FLASHINFER_DISABLE_TINYGEMM2_SM100", "0") == "1":
         return False
     compute_capability = get_compute_capability(device)
     if compute_capability not in _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES:
         return False
     if compute_capability == (10, 7) and not is_cuda_version_at_least("13.4"):
-        # gen_tinygemm2_sm100_module only emits compute_107a on CUDA >= 13.4, so on
-        # older toolkits the module contains no image for this device and dispatching
-        # here would fail at module load rather than fall back to the reference
-        # kernel. Ask the same question the build asks -- is_cuda_version_at_least
-        # reads the *toolkit* (nvcc) version, whereas torch.version.cuda below
-        # describes the torch build; the two can disagree, and it is the toolkit that
-        # decides whether the sm_107a image exists.
+        # gen_tinygemm2_sm100_module only emits compute_107a on CUDA >= 13.4.
         return False
     return version_at_least(torch.version.cuda, "12.8")
 

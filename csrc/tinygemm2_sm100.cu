@@ -2038,10 +2038,6 @@ inline void CheckSm100Family(int device_id) {
             "cudaDeviceGetAttribute(compute capability major)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(compute capability minor)");
-  // SM107 is only accepted when this file was compiled by a toolkit that can emit
-  // compute_107a (CUDA 13.4+). gen_tinygemm2_sm100_module gates the gencode the same
-  // way, so on older toolkits there is no sm_107a image here and admitting the device
-  // would trade this message for an opaque load failure.
 #if defined(__CUDACC_VER_MAJOR__) && \
     (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
   constexpr bool kSupportsSm107 = true;

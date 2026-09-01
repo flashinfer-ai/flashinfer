@@ -16,10 +16,7 @@ def gen_tinygemm2_module() -> JitSpec:
 
 
 def gen_tinygemm2_sm100_module() -> JitSpec:
-    """Generate the JIT spec for the generated tinygemm2 variants.
-
-    Targets SM100/SM103, and additionally SM107 (Rubin) when the toolkit is CUDA
-    13.4 or newer -- earlier toolkits reject ``compute_107a``.
+    """Generate the JIT spec for the SM100/SM103 generated tinygemm2 variants.
 
     ``csrc/tinygemm2_sm100.cu`` is a single translation unit
     holding all four frozen generated variants (deep/shallow pipeline ring x
