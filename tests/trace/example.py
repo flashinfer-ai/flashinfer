@@ -2290,7 +2290,7 @@ try:
     if dist.is_initialized() and dist.get_world_size() == 1:
         _ulysses_x = torch.randn(1, 128, 8, 128, dtype=torch.bfloat16, device=device)
         with flashinfer.comm.UlyssesCommunicator(
-            max_elems=_ulysses_x.numel(),
+            max_bytes=_ulysses_x.nbytes,
             dtype=_ulysses_x.dtype,
             backend="nccl",
             device=_ulysses_x.device,
