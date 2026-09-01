@@ -537,12 +537,20 @@ def autotune_v2_reload() -> None:
         tuner.profiling_cache.clear()
         tuner._winner_partitions.clear()
         tuner._managed_decoded.clear()
+        # Drop the hydration markers so every store re-hydrates on its next
+        # attach instead of silently degrading to lazy per-key disk reads.
+        tuner._preloaded_stores.clear()
         store = tuner._managed_cache
         if store is not None:
             store.clear_memo()
+            # Re-hydrate the ambient store right away: reload runs at a
+            # post-tuning barrier, which is exactly when a bulk read of the
+            # store's final published state is wanted -- serving afterwards
+            # is warm from memory rather than paying a disk read per key.
+            _hydrate_from_store(tuner, store)
     logger.info(
         "[Autotuner]: autotune_v2_reload(): in-memory winners dropped; "
-        "lookups now re-read the managed store."
+        "lookups now serve the managed store's current state."
     )
 
 

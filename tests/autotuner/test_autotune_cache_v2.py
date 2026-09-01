@@ -727,6 +727,40 @@ def test_reload_converges_ranks_on_store_state(cache_root, monkeypatch):
     assert calls == []  # reload never re-profiles
 
 
+def test_reload_rehydrates_store_into_memory(cache_root, monkeypatch):
+    """autotune_v2_reload() bulk re-hydrates the attached store's final
+    state at reload time, so post-reload serving is warm from memory (no
+    lazy per-key disk reads) and already reflects other ranks' publishes."""
+    from flashinfer.autotune_cache import autotune_v2_reload
+
+    _tune_once(monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0})
+    (entry_file,) = _entry_files(cache_root)
+    entry = json.loads(entry_file.read_text())
+    entry["tactic"] = 2  # another rank's publish landed last
+    entry_file.write_text(json.dumps(entry))
+
+    tuner = AutoTuner.get()
+    autotune_v2_reload()
+    # The fresh entry is in memory BEFORE any lookup, under the re-marked
+    # identity.
+    assert [hit[1] for hit in tuner._managed_decoded.values()] == [2]
+    assert len(tuner._preloaded_stores) == 1
+
+    # clear_cache also forgets the hydration marker, so a later attach
+    # re-preloads instead of skipping.
+    tuner.clear_cache()
+    assert not tuner._preloaded_stores and not tuner._managed_decoded
+
+
+def test_manifest_includes_cutlass_dsl_version():
+    """The env identity tracks the CuTe-DSL compiler stack: DSL runners'
+    tactic spaces are tile configs compiled by it, so entries must not
+    survive a DSL upgrade."""
+    from flashinfer.autotuner.autotuner import _collect_metadata
+
+    assert _collect_metadata().get("cutlass_dsl_version")
+
+
 class DummyRunnerB(DummyRunner):
     pass
 

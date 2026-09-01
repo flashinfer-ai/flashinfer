@@ -106,7 +106,9 @@ fast. Nesting a plain `autotune()` inside or around it stays supported.
 ### 2.3 Environment identity and invalidation
 
 The manifest reuses v1's `_collect_metadata()` — `flashinfer_version`, `cuda_version`,
-`cublas_version`, `cudnn_version`, `cudnn_frontend_version`, `gpu` — plus `cache_schema` and any
+`cublas_version`, `cudnn_version`, `cudnn_frontend_version`, `cutlass_dsl_version` (the CuTe-DSL
+compiler-stack fingerprint — DSL runners' tactic spaces are tile configs compiled by it), `gpu` —
+plus `cache_schema` and any
 non-default `MeasurementPolicy` fields. v1 compares those fields at load time and rejects a
 mismatched file wholesale; v2 *hashes* them into the directory name instead.
 
@@ -204,7 +206,8 @@ Persistence and orchestration stay separate responsibilities.
   unnecessary.
 - **In-session rank consistency**: ranks may still hold divergent locally-measured winners until
   `autotune_v2_reload()` runs — a finalize step (tune → barrier → reload) that drops in-process
-  winners so every rank re-reads the store's canonical entries and serves byte-identical tactics.
+  winners, bulk re-hydrates the attached store's final published state into memory, and thereby
+  makes every rank serve byte-identical tactics warm (no lazy per-key disk reads afterwards).
   Composes with [#3187](https://github.com/flashinfer-ai/flashinfer/pull/3187), which fixes the
   in-session window by all-reducing measured times before the argmin.
 - **No shared filesystem**: a small opaque boundary — `export()` produces bytes the framework

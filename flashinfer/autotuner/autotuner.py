@@ -321,6 +321,10 @@ def _collect_metadata() -> dict[str, str]:
                                         plan_index ordering can change
                                         when only the frontend is updated
                                         but the backend is not
+        * ``cutlass_dsl_version`` -- CuTe-DSL compiler-stack fingerprint
+                                     (incl. libs variants); DSL runners'
+                                     tactic spaces are tile configs
+                                     compiled by this stack
         * ``gpu``                 -- device name (different SM may have
                                      different available engines)
     """
@@ -340,6 +344,15 @@ def _collect_metadata() -> dict[str, str]:
         )
     except Exception:
         meta["cudnn_frontend_version"] = "unknown"
+    try:
+        # Reuse the JIT cache's fingerprint of the whole DSL stack (main
+        # package + libs variants); cached, so the site-packages scan runs
+        # once per process.
+        from ..jit.cute_dsl_core import _get_cute_dsl_version
+
+        meta["cutlass_dsl_version"] = _get_cute_dsl_version()
+    except Exception:
+        meta["cutlass_dsl_version"] = "unknown"
     try:
         meta["gpu"] = torch.cuda.get_device_name(torch.cuda.current_device())
     except Exception:
@@ -3613,6 +3626,10 @@ class AutoTuner:
             self._dirty_seq = 0
             self._winner_partitions.clear()
             self._managed_decoded.clear()
+            # Forget the hydration markers too, or the next attach would
+            # skip its bulk preload and every cleared key would pay a lazy
+            # disk read instead.
+            self._preloaded_stores.clear()
             # Forget the per-identity disk memos on every registered store so
             # cleared keys re-probe disk (the explicit invalidation point).
             for store in self._managed_stores.values():
