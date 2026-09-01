@@ -447,7 +447,7 @@ def get_batch_prefill_uri(
     use_fp16_qk_reduction: bool,
     use_variable_window: bool = False,
 ) -> str:
-    uri = (
+    return (
         f"batch_prefill_with_kv_cache_dtype_q_{filename_safe_dtype_map[dtype_q]}_"
         f"dtype_kv_{filename_safe_dtype_map_kv(dtype_kv)}_"
         f"dtype_o_{filename_safe_dtype_map[dtype_o]}_"
@@ -457,11 +457,10 @@ def get_batch_prefill_uri(
         f"posenc_{pos_encoding_mode}_"
         f"use_swa_{use_sliding_window}_"
         f"use_logits_cap_{use_logits_soft_cap}_"
-        f"f16qk_{use_fp16_qk_reduction}" + ("_sm90" if backend == "fa3" else "")
+        f"f16qk_{use_fp16_qk_reduction}"
+        + ("_sm90" if backend == "fa3" else "")
+        + ("_use_vw_True" if use_variable_window else "")
     )
-    if use_variable_window:
-        uri += "_use_vw_True"
-    return uri
 
 
 def get_batch_prefill_attention_sink_uri(
