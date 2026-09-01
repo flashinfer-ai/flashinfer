@@ -277,6 +277,7 @@ struct QSAPreIndexerParams {
   int32_t num_state_blocks;
   int32_t num_compressed_blocks;
   int32_t num_k_work;
+  int32_t num_requests;
   int32_t num_q_heads;
   int32_t compress_ratio;
   int32_t state_size;
@@ -376,7 +377,9 @@ __global__ void __launch_bounds__(kBlock) QSAPreIndexerKernel(QSAPreIndexerParam
   if (pid >= a.num_k_work) return;
   const int32_t request = a.work_metadata[2 * pid];
   const int32_t work_in_request = a.work_metadata[2 * pid + 1];
-  if (request < 0) return;
+  // The work list is the caller's, and the request it names indexes both ends
+  // of a prefix-sum entry; past the last request that reads off the table.
+  if (request < 0 || request >= a.num_requests) return;
 
   const int32_t query_start = a.query_start_loc[request];
   const int32_t query_end = a.query_start_loc[request + 1];
