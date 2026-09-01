@@ -108,10 +108,11 @@ flashinfer install-cubin-wheel
 flashinfer install-jit-cache-wheel
 ```
 
-> **Note:** Upgrading `flashinfer-python` while an old `flashinfer-cubin` remains installed
-> can fail at import with a version mismatch. Re-run `flashinfer install-cubin-wheel`, or
-> uninstall `flashinfer-cubin` to use runtime JIT. On DGX Spark / GB10, `flashinfer-cubin`
-> is optional. See the [installation guide](https://docs.flashinfer.ai/installation.html).
+> **Note:** Upgrading `flashinfer-python` while old `flashinfer-cubin` or
+> `flashinfer-jit-cache` remains installed can fail at import with a version mismatch.
+> Re-run `flashinfer install-cubin-wheel` and `flashinfer install-jit-cache-wheel`, or
+> uninstall both optional packages to use runtime JIT. On DGX Spark / GB10,
+> `flashinfer-cubin` is optional. See the [installation guide](https://docs.flashinfer.ai/installation.html).
 
 **For Blackwell (SM100+) CuTe DSL kernels**, install with the CUDA 13 extra to enable Blackwell-optimized kernels:
 
