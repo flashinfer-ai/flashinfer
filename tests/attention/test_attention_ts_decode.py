@@ -4284,6 +4284,47 @@ def test_attention_ts_decode_q64_kv256_boundaries(
         assert policy["use_split_kv"] is False
 
 
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+@pytest.mark.parametrize("packed_query", (False, True), ids=("fixed", "packed"))
+def test_attention_ts_decode_reuses_compiled_topology_across_batch_sizes(
+    packed_query: bool,
+):
+    """One resolved paged-decode topology accepts different batch extents."""
+
+    wrappers = []
+    for batch_size in (2, 3):
+        case = _make_decode_case(
+            kv_lens=(2049,) * batch_size,
+            num_qo_heads=16,
+            num_kv_heads=2,
+            head_dim=128,
+            seq_len_q=2 if packed_query else 1,
+            page_size=32,
+            qkv_dtype=torch.bfloat16,
+            output_dtype=torch.bfloat16,
+            cache_form="combined",
+            mask_type="dense",
+            device="cuda",
+            seed=32900 + batch_size,
+        )
+        qo_indptr = None
+        if packed_query:
+            case, qo_indptr = _pack_decode_case(case, (1,) * batch_size)
+        wrapper = _plan_case(
+            case,
+            max_kv_len=2049,
+            qo_indptr=qo_indptr,
+            max_seq_len_q=1 if packed_query else None,
+        )
+        output = _run_case(wrapper, case)
+        _assert_case_correct(output, case)
+        wrappers.append(wrapper)
+
+    assert wrappers[0]._compiled_main is wrappers[1]._compiled_main
+    assert wrappers[0]._compiled_reducer is wrappers[1]._compiled_reducer
+
+
 @pytest.mark.parametrize("head_dim", (64, 128, 256), ids=lambda value: f"d{value}")
 @pytest.mark.parametrize(
     "num_qo_heads_per_kv",

@@ -2134,7 +2134,7 @@ trtllm_ragged_attention_deepseek_trace = TraceTemplate(
 )
 
 
-# ── SVDQuant fused NVFP4 GEMM (SM100) ────────────────────────────────────────
+# ── SVDQuant fused NVFP4 GEMM (SM100 and SM120) ──────────────────────────────
 
 
 def _mm_nvfp4_svdquant_init(
@@ -2142,6 +2142,8 @@ def _mm_nvfp4_svdquant_init(
     M: int,
     N: int = 3072,
     K: int = 3072,
+    SF_A: int = 0,
+    SF_B: int = 0,
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -2154,6 +2156,8 @@ def _mm_nvfp4_svdquant_init(
     follow the host-side folding contract (``d = x_hat @ L2ᵀ``, ``l1 = L1 / alpha``).
     """
     from flashinfer import nvfp4_quantize_smooth  # noqa: PLC0415
+
+    del SF_A, SF_B  # derived axes
 
     torch.manual_seed(seed)
     rank = 32
@@ -2191,16 +2195,21 @@ def _mm_nvfp4_svdquant_init(
 mm_nvfp4_svdquant_trace = TraceTemplate(
     op_type="gemm_nvfp4_svdquant",
     description=(
-        "SVDQuant fused NVFP4 GEMM (SM100): out = alpha * (a @ bᵀ) + d @ l1ᵀ. "
-        "The block-scaled NVFP4 residual GEMM fused with a rank-r BF16 LoRA-up "
-        "correction in the same accumulator; 1/alpha is pre-folded into l1."
+        "SVDQuant NVFP4 GEMM: out = alpha * (a @ bᵀ + d @ l1ᵀ). "
+        "SM100/SM103 use fused CUTLASS; SM120/SM121 use fused CuTe DSL, with "
+        "an explicit cute-dsl-unfused oracle. 1/alpha is "
+        "pre-folded into l1."
     ),
     axes={
         "M": Var(),
         "N": Const(),
         "K_packed": Const(description="K / 2 (two e2m1 values per byte)."),
-        "SF_A": Const(description="128x4-swizzled activation scale buffer size."),
-        "SF_B": Const(description="128x4-swizzled weight scale buffer size."),
+        "SF_A": Var(
+            description="128x4-swizzled activation scale buffer size derived from M and K."
+        ),
+        "SF_B": Var(
+            description="128x4-swizzled weight scale buffer size derived from N and K."
+        ),
         "rank": Const(description="LoRA rank, a positive multiple of 32."),
     },
     inputs={
@@ -2243,6 +2252,10 @@ mm_nvfp4_svdquant_trace = TraceTemplate(
     outputs={
         "out": Tensor(["M", "N"], dtype="bfloat16"),
     },
+    constraints=[
+        "SF_A == ((M + 127) // 128) * 128 * (((K_packed * 2 // 16) + 3) // 4) * 4",
+        "SF_B == ((N + 127) // 128) * 128 * (((K_packed * 2 // 16) + 3) // 4) * 4",
+    ],
     tags=["quantization:fp4"],
     init=_mm_nvfp4_svdquant_init,
 )
@@ -2274,9 +2287,10 @@ def _nvfp4_quantize_smooth_init(
 nvfp4_quantize_smooth_trace = TraceTemplate(
     op_type="quantize_nvfp4_smooth",
     description=(
-        "Fused smooth + NVFP4 quantize: (xq, sf) = nvfp4-quantize(x * pre_quant_scale). "
-        "Byte-identical to smoothing followed by the stock NVFP4 quantizer "
-        "(ue4m3 block scales, 128x4 swizzled layout, SF vector size 16)."
+        "Smooth + NVFP4 quantize: (xq, sf) = nvfp4-quantize(x * pre_quant_scale). "
+        "SM100/SM103 and SM120/SM121 fuse smoothing into quantization; the "
+        "SM120/SM121 path uses CuTe DSL. Both use ue4m3 block "
+        "scales, 128x4 swizzled layout, and SF vector size 16."
     ),
     axes={
         "M": Var(),
@@ -2313,6 +2327,7 @@ nvfp4_quantize_smooth_trace = TraceTemplate(
 def _svdquant_linear_init(
     *,
     M: int,
+    SF_B: int = 0,
     N: int = 3072,
     K: int = 3072,
     device: str = "cuda",
@@ -2321,6 +2336,7 @@ def _svdquant_linear_init(
     """Build inputs for ``flashinfer.svdquant_linear`` (full SVDQuant linear chain)."""
     from flashinfer import nvfp4_quantize_smooth  # noqa: PLC0415
 
+    del SF_B  # derived axis
     torch.manual_seed(seed)
     rank = 32
     x = torch.randn(M, K, dtype=torch.bfloat16, device=device)
@@ -2359,14 +2375,16 @@ svdquant_linear_trace = TraceTemplate(
     description=(
         "Full SVDQuant linear: y = (x * pre_quant_scale) @ (R + L1 @ L2)ᵀ where R is the "
         "NVFP4-quantized residual weight — smooth-quantize, BF16 rank-r down-projection, "
-        "and the fused NVFP4 residual + LoRA-up GEMM."
+        "and the architecture-selected NVFP4 residual + LoRA-up GEMM."
     ),
     axes={
         "M": Var(),
         "N": Const(),
         "K": Const(),
         "K_packed": Const(description="K / 2 (two e2m1 values per byte)."),
-        "SF_B": Const(description="128x4-swizzled weight scale buffer size."),
+        "SF_B": Var(
+            description="128x4-swizzled weight scale buffer size derived from N and K."
+        ),
         "rank": Const(description="LoRA rank, a positive multiple of 32."),
     },
     inputs={
@@ -2410,6 +2428,9 @@ svdquant_linear_trace = TraceTemplate(
     outputs={
         "out": Tensor(["M", "N"], dtype="bfloat16"),
     },
+    constraints=[
+        "SF_B == ((N + 127) // 128) * 128 * (((K // 16) + 3) // 4) * 4",
+    ],
     tags=["quantization:fp4"],
     init=_svdquant_linear_init,
 )

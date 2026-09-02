@@ -38,6 +38,30 @@ void radix_topk_ragged_transform(TensorView input, TensorView output_indices, Te
 
 bool can_implement_filtered_topk();
 
+void cub_topk_page_table_transform(
+    TensorView input, TensorView output_page_table, TensorView src_page_table, TensorView lengths,
+    Optional<TensorView> maybe_output_raw_indices, Optional<TensorView> maybe_workspace_buffer,
+    int64_t top_k, int64_t tie_break, int64_t page_size, Optional<TensorView> maybe_row_to_batch,
+    Optional<TensorView> maybe_row_starts, Optional<TensorView> maybe_page_table_row_starts);
+
+int64_t cub_topk_page_table_transform_workspace_size(TensorView input, TensorView lengths,
+                                                     int64_t top_k, int64_t tie_break,
+                                                     bool with_raw_indices, bool with_row_starts);
+
+void cub_topk_ragged_transform(TensorView input, TensorView output_indices, TensorView offsets,
+                               TensorView lengths, Optional<TensorView> maybe_workspace_buffer,
+                               int64_t top_k, int64_t tie_break,
+                               Optional<TensorView> maybe_row_starts);
+
+int64_t cub_topk_ragged_transform_workspace_size(TensorView input, TensorView lengths,
+                                                 int64_t top_k, int64_t tie_break,
+                                                 bool with_row_starts);
+
+void cub_topk(TensorView input, TensorView output_indices, TensorView output_values,
+              Optional<TensorView> maybe_workspace_buffer, int64_t top_k, int64_t tie_break);
+
+int64_t cub_topk_workspace_size(TensorView input, int64_t top_k, int64_t tie_break);
+
 // Radix-based Top-K selection
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(radix_topk, radix_topk);
 
@@ -49,3 +73,13 @@ TVM_FFI_DLL_EXPORT_TYPED_FUNC(radix_topk_ragged_transform, radix_topk_ragged_tra
 
 // Check if GPU supports FilteredTopK algorithm
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(can_implement_filtered_topk, can_implement_filtered_topk);
+
+// CUB DeviceBatchedTopK-backed Top-K and its workspace size query
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_page_table_transform, cub_topk_page_table_transform);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_page_table_transform_workspace_size,
+                              cub_topk_page_table_transform_workspace_size);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_ragged_transform, cub_topk_ragged_transform);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_ragged_transform_workspace_size,
+                              cub_topk_ragged_transform_workspace_size);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk, cub_topk);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(cub_topk_workspace_size, cub_topk_workspace_size);

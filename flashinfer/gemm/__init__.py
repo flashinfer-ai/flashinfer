@@ -44,7 +44,7 @@ from .routergemm import (
 # Import CuTe-DSL kernels if available
 _cute_dsl_kernels = []
 try:
-    from flashinfer.cute_dsl.utils import (
+    from flashinfer.cute_dsl.availability import (
         is_cute_dsl_available,
         is_rubin_cute_dsl_available,
     )
@@ -78,7 +78,7 @@ except ImportError:
     pass
 
 try:
-    from flashinfer.cute_dsl.utils import is_cute_dsl_available
+    from flashinfer.cute_dsl.availability import is_cute_dsl_available
 
     if is_cute_dsl_available():
         from .kernels.dense_blockscaled_gemm_sm120_b12x import (

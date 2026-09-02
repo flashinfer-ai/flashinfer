@@ -215,6 +215,32 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
 
 
+@pytest.mark.parametrize(
+    ("backend", "compute_capability"),
+    (("cute-dsl", (10, 0)), ("sparse", (12, 0))),
+)
+@pytest.mark.parametrize(
+    "remap_arg",
+    ("remapped_sparse_indices_buffer", "sparse_indices_are_storage_offsets"),
+)
+def test_non_trtllm_dsv4_backends_reject_index_remapping_args(
+    monkeypatch, backend, compute_capability, remap_arg
+):
+    args = _cpu_hca_inputs()
+    args["backend"] = backend
+    args[remap_arg] = (
+        torch.empty((1, 128), dtype=torch.int32)
+        if remap_arg == "remapped_sparse_indices_buffer"
+        else False
+    )
+    monkeypatch.setattr(
+        mla_core, "get_compute_capability", lambda _device: compute_capability
+    )
+
+    with pytest.raises(ValueError, match=f"backend='{backend}' does not accept"):
+        trtllm_batch_decode_sparse_mla_dsv4(**args)
+
+
 def test_dsv4_backend_neutral_alias_is_backward_compatible():
     assert batch_decode_sparse_mla_dsv4 is trtllm_batch_decode_sparse_mla_dsv4
     assert (

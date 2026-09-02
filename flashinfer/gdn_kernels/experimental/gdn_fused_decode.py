@@ -98,6 +98,11 @@ def gdn_fused_decode_step_supported(
     composable fallback inside :func:`gdn_fused_decode_step` is a
     correctness path, not a fast one.  Host-side only (capture-safe).
 
+    The geometry arguments default to one shipped layer shape purely as a
+    convenience for tests and docs; more than one geometry is registered, so
+    a caller asking about a different model must pass all of them (the vLLM
+    consumer reads them off its own layer).
+
     This answers *support*, never *policy*: a framework that has decided not
     to use this operation must not call it, rather than expect this probe to
     say ``False``.
@@ -410,7 +415,8 @@ def gdn_fused_decode_step(
       latches that implementation off for the rest of the process, and the
       call is served by the composable path.
     - CUDA graphs: each specialized implementation compiles lazily on its
-      first eager dispatch of a (batch, scale, conv-state layout) variant;
+      first eager dispatch of a (layer geometry, batch, scale, conv-state
+      layout) variant;
       during capture one is recorded only when that variant is already warm,
       otherwise the (capture-safe) composable path is baked for that shape.
     """

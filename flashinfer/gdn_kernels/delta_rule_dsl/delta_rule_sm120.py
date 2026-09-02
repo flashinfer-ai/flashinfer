@@ -1,3 +1,4 @@
+import functools
 from enum import IntEnum
 
 import torch
@@ -11,12 +12,18 @@ from .collective_store_tma import CollectiveStoreTma
 from .custom_compile_cache import (
     KeyedCompileMixin,
     cached_compile,
+    get_cached_compile,
     sm12x_compile_options,
 )
 from .collective_inverse_hmma import CollectiveInverse
 from .helpers import SM80, round_down, state_dtype_to_cutlass
 from .schedule import WorkDesc
 from .varlen_helper import is_integer_dtype
+
+
+@functools.cache
+def _sm120_compile_options(device):
+    return (cute.EnableTVMFFI(True),) + sm12x_compile_options(device)
 
 
 # ─── Named-barrier IDs used by the compute kernel ────────────────────────────
@@ -1995,6 +2002,41 @@ class _FullyFusedDeltaRuleSm120(KeyedCompileMixin):
 # ─── Public API ──────────────────────────────────────────────────────────────
 
 
+@functools.cache
+def _get_prefill_kernel(
+    needs_alpha,
+    needs_beta,
+    needs_init_state,
+    needs_checkpointing,
+    kernel_dtype,
+    initial_state_dtype,
+    state_dtype,
+    checkpoint_state_dtype,
+    use_state_indices,
+    cu_seqlens_dtype,
+    state_indices_dtype,
+    checkpoint_cu_starts_dtype,
+    state_inner_strides,
+    init_state_inner_strides,
+):
+    return _FullyFusedDeltaRuleSm120(
+        needs_alpha,
+        needs_beta,
+        needs_init_state,
+        needs_checkpointing,
+        kernel_dtype,
+        initial_state_dtype=state_dtype_to_cutlass(initial_state_dtype),
+        state_dtype=state_dtype_to_cutlass(state_dtype),
+        checkpoint_state_dtype=state_dtype_to_cutlass(checkpoint_state_dtype),
+        use_state_indices=use_state_indices,
+        cu_seqlens_dtype=cu_seqlens_dtype,
+        state_indices_dtype=state_indices_dtype,
+        checkpoint_cu_starts_dtype=checkpoint_cu_starts_dtype,
+        state_inner_strides=state_inner_strides,
+        init_state_inner_strides=init_state_inner_strides,
+    )
+
+
 def delta_rule_prefill_dsl(
     o: torch.Tensor,  # (total_seqlen, num_o_heads, D) fp16/bf16, output
     state: torch.Tensor,  # (num_seqs, num_sab_heads, D, D) fp32, output
@@ -2011,9 +2053,9 @@ def delta_rule_prefill_dsl(
     checkpoint_every_n_tokens: int = 0,
     state_indices: torch.Tensor | None = None,
 ):
-    from cutlass.cute.runtime import from_dlpack
     import cuda.bindings.driver as cuda_driver
 
+    device = q.device
     D = q.shape[-1]
 
     num_seqs = cu_seqlens.shape[0] - 1
@@ -2120,70 +2162,19 @@ def delta_rule_prefill_dsl(
     )
     total_checkpoints = state_checkpoints.shape[0] if needs_checkpointing else 1
 
-    workspace_size = get_device_sm_count(q.device) * 128
-    tensormaps_t = _get_cache_buf("gdn_prefill_tensormaps", workspace_size, q.device)
+    workspace_size = get_device_sm_count(device) * 128
+    tensormaps_t = _get_cache_buf("gdn_prefill_tensormaps", workspace_size, device)
+    stream = cuda_driver.CUstream(torch.cuda.current_stream(device).cuda_stream)
 
-    stream_val = torch.cuda.current_stream().cuda_stream
-    stream = cuda_driver.CUstream(stream_val)
-
-    enable_tvm_ffi = True
-    if enable_tvm_ffi:
-        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
-            *args, **{**kwargs, "enable_tvm_ffi": True}
-        )
-
-    # Keep head counts and varlen extents runtime values across cached compiles.
-    q_cute = from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1)
-    k_cute = from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-    v_cute = from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-    o_cute = from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0)
-    alpha_cute = (
-        from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic()
-        if needs_alpha
-        else None
-    )
-    beta_cute = (
-        from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic()
-        if needs_beta
-        else None
-    )
-    state_cute = from_dlpack(state, assumed_align=16).mark_layout_dynamic()
-    init_state_cute = (
-        from_dlpack(init_state, assumed_align=16).mark_layout_dynamic()
-        if needs_init_state
-        else None
-    )
-    state_indices_cute = (
-        from_dlpack(state_indices, assumed_align=4).mark_layout_dynamic()
-        if use_state_indices
-        else None
-    )
-    state_checkpoints_cute = (
-        from_dlpack(
-            state_checkpoints.reshape(-1), assumed_align=16
-        ).mark_layout_dynamic()
-        if needs_checkpointing
-        else None
-    )
-    checkpoint_cu_cute = (
-        from_dlpack(checkpoint_cu_starts, assumed_align=8).mark_layout_dynamic()
-        if needs_checkpointing
-        else None
-    )
-    tensormaps_cute = from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic()
-    cu_cute = from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic()
-
-    delta_rule_kernel = _FullyFusedDeltaRuleSm120(
+    delta_rule_kernel = _get_prefill_kernel(
         needs_alpha,
         needs_beta,
         needs_init_state,
         needs_checkpointing,
         kernel_dtype,
-        initial_state_dtype=state_dtype_to_cutlass(
-            init_state.dtype if needs_init_state else torch.float32
-        ),
-        state_dtype=state_dtype_to_cutlass(state.dtype),
-        checkpoint_state_dtype=state_dtype_to_cutlass(
+        initial_state_dtype=(init_state.dtype if needs_init_state else torch.float32),
+        state_dtype=state.dtype,
+        checkpoint_state_dtype=(
             state_checkpoints.dtype if needs_checkpointing else torch.float32
         ),
         use_state_indices=use_state_indices,
@@ -2200,34 +2191,90 @@ def delta_rule_prefill_dsl(
         ),
     )
 
-    kernel_args = (
-        q_cute,
-        k_cute,
-        v_cute,
-        o_cute,
-        alpha_cute,
-        beta_cute,
-        state_cute,
-        init_state_cute,
-        state_indices_cute,
-        state_checkpoints_cute,
-        checkpoint_cu_cute,
-        tensormaps_cute,
-        cu_cute,
-        cutlass.Float32(scale),
-        cutlass.Int32(num_q_heads),
-        cutlass.Int32(num_k_heads),
-        cutlass.Int32(num_v_heads),
-        cutlass.Int32(num_sab_heads),
-        cutlass.Int32(num_seqs),
-        cutlass.Int32(total_checkpoints),
-        cutlass.Int32(checkpoint_every_n_tokens),
+    compile_options = _sm120_compile_options(device)
+    compiled_delta_rule_kernel = get_cached_compile(delta_rule_kernel, compile_options)
+    if compiled_delta_rule_kernel is None:
+        from_dlpack = lambda *args, **kwargs: cute.runtime.from_dlpack(
+            *args, **{**kwargs, "enable_tvm_ffi": True}
+        )
+        kernel_args = (
+            from_dlpack(q_tma, assumed_align=16).mark_layout_dynamic(leading_dim=1),
+            from_dlpack(k_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(v_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            from_dlpack(o_tma, assumed_align=16).mark_layout_dynamic(leading_dim=0),
+            (
+                from_dlpack(alpha.reshape(-1), assumed_align=16).mark_layout_dynamic()
+                if needs_alpha
+                else None
+            ),
+            (
+                from_dlpack(beta.reshape(-1), assumed_align=16).mark_layout_dynamic()
+                if needs_beta
+                else None
+            ),
+            from_dlpack(state, assumed_align=16).mark_layout_dynamic(),
+            (
+                from_dlpack(init_state, assumed_align=16).mark_layout_dynamic()
+                if needs_init_state
+                else None
+            ),
+            (
+                from_dlpack(state_indices, assumed_align=4).mark_layout_dynamic()
+                if use_state_indices
+                else None
+            ),
+            (
+                from_dlpack(
+                    state_checkpoints.reshape(-1), assumed_align=16
+                ).mark_layout_dynamic()
+                if needs_checkpointing
+                else None
+            ),
+            (
+                from_dlpack(checkpoint_cu_starts, assumed_align=8).mark_layout_dynamic()
+                if needs_checkpointing
+                else None
+            ),
+            from_dlpack(tensormaps_t, assumed_align=128).mark_layout_dynamic(),
+            from_dlpack(cu_seqlens, assumed_align=8).mark_layout_dynamic(),
+            cutlass.Float32(scale),
+            cutlass.Int32(num_q_heads),
+            cutlass.Int32(num_k_heads),
+            cutlass.Int32(num_v_heads),
+            cutlass.Int32(num_sab_heads),
+            cutlass.Int32(num_seqs),
+            cutlass.Int32(total_checkpoints),
+            cutlass.Int32(checkpoint_every_n_tokens),
+            num_seqs * num_sab_heads,
+            stream,
+        )
+        compiled_delta_rule_kernel = cached_compile(
+            delta_rule_kernel,
+            *kernel_args,
+            compile_options=compile_options,
+        )
+    compiled_delta_rule_kernel(
+        q_tma,
+        k_tma,
+        v_tma,
+        o_tma,
+        alpha.reshape(-1) if needs_alpha else None,
+        beta.reshape(-1) if needs_beta else None,
+        state,
+        init_state if needs_init_state else None,
+        state_indices if use_state_indices else None,
+        state_checkpoints.reshape(-1) if needs_checkpointing else None,
+        checkpoint_cu_starts if needs_checkpointing else None,
+        tensormaps_t,
+        cu_seqlens,
+        scale,
+        num_q_heads,
+        num_k_heads,
+        num_v_heads,
+        num_sab_heads,
+        num_seqs,
+        total_checkpoints,
+        checkpoint_every_n_tokens,
         num_seqs * num_sab_heads,
         stream,
     )
-    compiled_delta_rule_kernel = cached_compile(
-        delta_rule_kernel,
-        *kernel_args,
-        compile_options=sm12x_compile_options(q.device),
-    )
-    compiled_delta_rule_kernel(*kernel_args)
