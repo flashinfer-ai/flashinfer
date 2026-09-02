@@ -451,3 +451,111 @@ def test_qsa_route_from_logical_does_not_let_a_slot_wrap_into_range():
     assert int(mask[0]) == 0, (
         f"a slot past num_slots was accepted: route={route.tolist()} mask={mask.tolist()}"
     )
+
+
+def test_qsa_route_from_logical_refuses_a_slot_space_its_route_cannot_hold():
+    """A slot is written into the route's own dtype. An int32 route cannot hold
+    2^31, which would come back out as a negative index with its mask bit set,
+    so a slot space that large has to be refused rather than truncated."""
+    width = 8
+    logical = torch.arange(width, dtype=torch.int32, device=DEV).reshape(1, width)
+    token_to_req = torch.zeros(1, dtype=torch.int32, device=DEV)
+    table = torch.zeros(1, 1, dtype=torch.int32, device=DEV)
+    route = torch.empty(1, width, dtype=torch.int32, device=DEV)
+    mask = torch.empty(1, dtype=torch.uint8, device=DEV)
+    with pytest.raises(Exception, match="fit the route dtype"):
+        flashinfer.qsa_route_from_logical(
+            logical, token_to_req, table, route, mask, 1, 65536, 2147483648
+        )
+
+
+def test_qsa_route_from_blocks_bounds_the_ratio_before_it_derives_a_width():
+    """The route width is block_topk * compress_ratio + compress_ratio - 1. A
+    ratio near the top of int64 overflows that product before any check on the
+    ratio could reject it, so the bound has to come first."""
+    blocks = torch.zeros(1, 4, dtype=torch.int32, device=DEV)
+    positions = torch.zeros(1, dtype=torch.int32, device=DEV)
+    lengths = torch.tensor([16], dtype=torch.int32, device=DEV)
+    token_to_req = torch.zeros(1, dtype=torch.int32, device=DEV)
+    table = torch.zeros(1, 1, dtype=torch.int32, device=DEV)
+    logical = torch.empty(1, 8, dtype=torch.int32, device=DEV)
+    route = torch.empty(1, 8, dtype=torch.int32, device=DEV)
+    mask = torch.empty(1, dtype=torch.uint8, device=DEV)
+    with pytest.raises(Exception, match="compress_ratio must fit in 32 bits"):
+        flashinfer.qsa_route_from_blocks(
+            blocks,
+            positions,
+            lengths,
+            token_to_req,
+            table,
+            logical,
+            route,
+            mask,
+            9223372036854775807,
+            16,
+            256,
+        )
+
+
+@pytest.mark.parametrize("bad", _PAST_INT32)
+@pytest.mark.parametrize("field", ["token_to_req", "logical", "page_table"])
+def test_qsa_route_from_logical_does_not_wrap_an_index_that_is_not_an_int32(field, bad):
+    """The slot kernel narrows the request, the logical token and the page id
+    just as the expansion does, so the same values must not come back as
+    request, token or page zero."""
+    width, page_size, num_slots = 8, 16, 4096
+    logical = torch.arange(width, dtype=torch.int64, device=DEV).reshape(1, width)
+    token_to_req = torch.zeros(1, dtype=torch.int64, device=DEV)
+    table = torch.zeros(1, 4, dtype=torch.int64, device=DEV)
+    if field == "token_to_req":
+        token_to_req[0] = bad
+    elif field == "logical":
+        logical[0, 0] = bad
+    else:
+        table[0, 0] = bad
+
+    route = torch.empty(1, width, dtype=torch.int64, device=DEV)
+    mask = torch.empty(1, dtype=torch.uint8, device=DEV)
+    flashinfer.qsa_route_from_logical(
+        logical, token_to_req, table, route, mask, 1, page_size, num_slots
+    )
+    torch.cuda.synchronize()
+    live = [c for c in range(width) if (int(mask[0]) >> c) & 1]
+    if field == "logical":
+        # Only that column is unusable; the rest of the row still routes.
+        assert 0 not in live, f"a wrapped token was routed: {route[0].tolist()}"
+    else:
+        # No request, or no page under it, so the whole row is masked.
+        assert live == [], f"a wrapped index was routed: {route[0].tolist()}"
+
+
+@pytest.mark.parametrize("scalar", ["page_size", "num_slots", "compress_ratio"])
+def test_qsa_route_rejects_a_host_scalar_that_is_not_a_uint32(scalar):
+    """page_size, num_slots and compress_ratio are narrowed to uint32 for the
+    kernel, so 2^32 arrives as zero -- a page size or a compression ratio to
+    divide by."""
+    blocks = torch.zeros(1, 4, dtype=torch.int32, device=DEV)
+    positions = torch.zeros(1, dtype=torch.int32, device=DEV)
+    lengths = torch.tensor([16], dtype=torch.int32, device=DEV)
+    token_to_req = torch.zeros(1, dtype=torch.int32, device=DEV)
+    table = torch.zeros(1, 1, dtype=torch.int32, device=DEV)
+    args = dict(compress_ratio=1, page_size=16, num_slots=256)
+    args[scalar] = 4294967296
+    width = 4 * args["compress_ratio"] + args["compress_ratio"] - 1
+    logical = torch.empty(1, width, dtype=torch.int32, device=DEV)
+    route = torch.empty(1, width, dtype=torch.int32, device=DEV)
+    mask = torch.empty(-(-width // 8), dtype=torch.uint8, device=DEV)
+    with pytest.raises(Exception, match="must fit in 32 bits"):
+        flashinfer.qsa_route_from_blocks(
+            blocks,
+            positions,
+            lengths,
+            token_to_req,
+            table,
+            logical,
+            route,
+            mask,
+            args["compress_ratio"],
+            args["page_size"],
+            args["num_slots"],
+        )
