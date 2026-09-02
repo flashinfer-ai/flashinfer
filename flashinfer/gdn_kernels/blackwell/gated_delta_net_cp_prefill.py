@@ -121,7 +121,6 @@ def _wrap_tma(ret):
 
 
 from ..delta_rule_dsl.varlen_helper import (
-    chunks_for_len,
     varlen_chunk_idx,
     varlen_chunk_valid_len,
 )
@@ -854,7 +853,10 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         # ------------------------------------------------------------------
         # Launch
         # ------------------------------------------------------------------
-        grid_shape = (h_r * h_qv * max_cp_chunks_per_seq, num_seqs, 1)
+        num_sab_heads = h_r * h_qv
+        num_sab_heads_fdd = cute.fast_divmod_create_divisor_v2(num_sab_heads)
+        cp_chunk_len_fdd = cute.fast_divmod_create_divisor_v2(cp_chunk_len)
+        grid_shape = (num_sab_heads * max_cp_chunks_per_seq, num_seqs, 1)
 
         self.kernel(
             tiled_mma_qk,
@@ -875,8 +877,8 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             state_checkpoints,
             checkpoint_cu_starts,
             checkpoint_every_n_tokens,
-            cp_chunk_len,
-            h_r * h_qv,
+            cp_chunk_len_fdd,
+            num_sab_heads_fdd,
             scale,
             q_smem_layout_staged,
             k_smem_layout_staged,
@@ -908,21 +910,26 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         cu_seqlens: cute.Tensor,
         seq_idx: cutlass.Int32,
         flat_work_idx: cutlass.Int32,
-        num_sab_heads: cutlass.Int32,
-        cp_chunk_len: cutlass.Int32,
+        num_sab_heads_fdd: cute.FastDivmodDivisorV2,
+        cp_chunk_len_fdd: cute.FastDivmodDivisorV2,
     ):
-        head_idx = flat_work_idx % num_sab_heads
-        chunk_idx = flat_work_idx // num_sab_heads
+        chunk_idx, head_idx = divmod(flat_work_idx, num_sab_heads_fdd)
+        cp_chunk_len = cp_chunk_len_fdd.divisor
         seq_start = cutlass.Int32(cu_seqlens[seq_idx])
         seq_end = cutlass.Int32(cu_seqlens[seq_idx + 1])
         seq_len = seq_end - seq_start
-        num_cp_chunks = chunks_for_len(seq_len, cp_chunk_len)
+        num_cp_chunks = (seq_len + cp_chunk_len - cutlass.Int32(1)) // cp_chunk_len_fdd
         valid_chunk_len = cutlass.Int32(0)
         if chunk_idx < num_cp_chunks:
             valid_chunk_len = varlen_chunk_valid_len(seq_len, chunk_idx, cp_chunk_len)
         seq_token_offset = chunk_idx * cp_chunk_len
         tok_offset = seq_start + seq_token_offset
-        cp_chunk_idx = varlen_chunk_idx(seq_idx, seq_start, chunk_idx, cp_chunk_len)
+        prefix_items = seq_idx
+        if seq_start < prefix_items:
+            prefix_items = seq_start
+        cp_chunk_idx = (
+            prefix_items + (seq_start - prefix_items) // cp_chunk_len_fdd + chunk_idx
+        )
         t_blocks_per_cp_chunk = cute.ceil_div(cp_chunk_len, self.b_t)
         t_block_start = varlen_chunk_idx(
             seq_idx, seq_start, chunk_idx * t_blocks_per_cp_chunk, self.b_t
@@ -971,8 +978,8 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
         mStateCheckpoints: cute.Tensor,
         checkpoint_cu_starts: cute.Tensor,
         checkpoint_every_n_tokens: cutlass.Int32,
-        cp_chunk_len: cutlass.Int32,
-        num_sab_heads: cutlass.Int32,
+        cp_chunk_len_fdd: cute.FastDivmodDivisorV2,
+        num_sab_heads_fdd: cute.FastDivmodDivisorV2,
         scale: cutlass.Float32,
         # SMEM staged layouts (needed to view shared_storage tensor buffers)
         q_smem_layout_staged: cute.ComposedLayout,
@@ -1021,7 +1028,9 @@ class CPDeltaRulePrefillTcgen05Sm100(KeyedCompileMixin):
             t_block_start,
             seq_len,
             seq_token_offset,
-        ) = self.get_cp_work(cu_seqlens, bidy, bidx, num_sab_heads, cp_chunk_len)
+        ) = self.get_cp_work(
+            cu_seqlens, bidy, bidx, num_sab_heads_fdd, cp_chunk_len_fdd
+        )
         # ------------------------------------------------------------------
         # TMA descriptor GMEM workspace - one q/k/v/o descriptor set per CTA.
         # Slots: Q=0, K=1, V=2, T=3, O=4.
