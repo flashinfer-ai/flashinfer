@@ -34,10 +34,10 @@ enum class PrefetchMode {
   kPrefetch     // Fetch additional data from global memory to L2
 };
 
-// Which caches keep the line the copy reads. A streamed tile wants kBypassL1:
-// it is read once and L1 is small. A tile that concurrent blocks read the same
-// of wants kCacheAll, which answers the repeats out of L1 instead of sending
-// every one of them to L2.
+// Which caches keep the line the copy reads. A tile that is read once wants
+// kBypassL1, since L1 is small and holding it there displaces something else.
+// A tile that several concurrent blocks all read wants kCacheAll, which answers
+// the repeats out of L1 instead of sending every one of them to L2.
 enum class CacheMode {
   kBypassL1,  // cp.async.cg -- cache in L2 only
   kCacheAll   // cp.async.ca -- cache in L1 and L2
