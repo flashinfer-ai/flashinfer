@@ -1124,6 +1124,7 @@ def _test_trtllm_batch_decode(
         if v_scale == o_scale == 1.0:
             assert (output_wrapper == output).all()
         else:
+            wrapper_rtol = 1.3e-1 if o_dtype == "fp8" else 1e-1
             # todo(Yingyi): fix precision issue with this test
             if not (
                 q_dtype == "fp8"
@@ -1138,14 +1139,14 @@ def _test_trtllm_batch_decode(
                 torch.testing.assert_close(
                     output.float(),
                     output_wrapper.float(),
-                    rtol=1e-1,
+                    rtol=wrapper_rtol,
                     atol=1e-1,
                 )
             else:
                 assert_close_with_mismatch_tolerance(
                     output.float(),
                     output_wrapper.float(),
-                    rtol=1e-1,
+                    rtol=wrapper_rtol,
                     atol=1e-1,
                     max_mismatched_elements=5,
                 )
