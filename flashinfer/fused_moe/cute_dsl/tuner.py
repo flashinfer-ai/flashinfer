@@ -28,16 +28,14 @@ Tactic format follows TRT-LLM's style and is architecture-dependent:
 Reference: TensorRT-LLM/tensorrt_llm/_torch/custom_ops/cute_dsl_custom_ops.py
 """
 
-import contextlib
 import itertools
 import logging
 import warnings
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 
 from ...autotuner import (
-    AutoTuner,
     DynamicTensorSpec,
     OptimizationProfile,
     TunableRunner,
@@ -59,7 +57,6 @@ from ._inputs_helper import CuteDslMoEInputsHelper
 from .blackwell.moe_w4a16 import launch_w4a16_moe
 from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 from .moe_utils import (
-    get_max_num_permuted_tokens,
     normalize_cute_dsl_moe_activation_type,
     normalize_cute_dsl_moe_weight_interleave,
     validate_cute_dsl_moe_situ_config,
@@ -77,160 +74,6 @@ def _seeded_activation(shapes, dtype, device):
     )
 
 
-# pdl_count advances once per four K=64 MMA tiles.
-PDL_K_TILE_SIZE = 4 * 64
-AUTO_PDL_COUNT: Literal["auto"] = "auto"
-PdlCountConfig = Union[Optional[int], Literal["auto"]]
-PDL_BASELINE_COUNTS: Tuple[Optional[int], ...] = (None, -1, 0)
-
-
-def _num_pdl_k_tiles(k: int) -> int:
-    if k <= 0:
-        raise ValueError(f"K must be positive, got {k}")
-    return (k + PDL_K_TILE_SIZE - 1) // PDL_K_TILE_SIZE
-
-
-def get_coarse_pdl_count_candidates(
-    k: int,
-    num_persistent_work_tiles: int,
-    num_work_tile_samples: int = 8,
-) -> List[Optional[int]]:
-    """Sample PDL at evenly spaced persistent work-tile boundaries."""
-    num_k_tiles = _num_pdl_k_tiles(k)
-    if min(num_persistent_work_tiles, num_work_tile_samples) <= 0:
-        raise ValueError("PDL work-tile and sample counts must be positive")
-    num_samples = min(num_persistent_work_tiles, num_work_tile_samples)
-    last_work_tile = num_persistent_work_tiles - 1
-    sampled_work_tiles = (
-        round(sample * last_work_tile / max(num_samples - 1, 1))
-        for sample in range(num_samples)
-    )
-    return list(
-        dict.fromkeys(
-            (*PDL_BASELINE_COUNTS, *(tile * num_k_tiles for tile in sampled_work_tiles))
-        )
-    )
-
-
-def get_local_pdl_count_candidates(
-    k: int,
-    num_persistent_work_tiles: int,
-    center_count: Optional[int],
-    work_tile_radius: int = 1,
-) -> List[Optional[int]]:
-    """Search every K position in nearby persistent work tiles."""
-    num_k_tiles = _num_pdl_k_tiles(k)
-    if num_persistent_work_tiles <= 0 or work_tile_radius < 0:
-        raise ValueError("PDL work-tile count must be positive and radius non-negative")
-    center_work_tile = min(
-        max(center_count or 0, 0) // num_k_tiles,
-        num_persistent_work_tiles - 1,
-    )
-    first_work_tile = max(0, center_work_tile - work_tile_radius)
-    last_work_tile = min(
-        num_persistent_work_tiles, center_work_tile + work_tile_radius + 1
-    )
-    return list(
-        dict.fromkeys(
-            (
-                *PDL_BASELINE_COUNTS,
-                *range(first_work_tile * num_k_tiles, last_work_tile * num_k_tiles),
-            )
-        )
-    )
-
-
-def scale_pdl_count_to_work_tiles(
-    count: Optional[int],
-    source_num_k_tiles: int,
-    source_num_work_tiles: int,
-    target_num_k_tiles: int,
-    target_num_work_tiles: int,
-) -> int:
-    """Scale a previous bucket's release position into a new work range."""
-    if count is None or count < 0:
-        return 0
-    source_work_tile, source_k_tile = divmod(count, source_num_k_tiles)
-    target_work_tile = round(
-        min(source_work_tile, source_num_work_tiles - 1)
-        * (target_num_work_tiles - 1)
-        / max(source_num_work_tiles - 1, 1)
-    )
-    target_k_tile = round(
-        min(source_k_tile, source_num_k_tiles - 1)
-        * (target_num_k_tiles - 1)
-        / max(source_num_k_tiles - 1, 1)
-    )
-    return target_work_tile * target_num_k_tiles + target_k_tile
-
-
-def select_pdl_count(
-    timings: Dict[Optional[int], float],
-    min_speedup: float = 0.005,
-) -> Optional[int]:
-    """Select PDL only when it beats the best baseline beyond noise."""
-    finite_timings = {
-        count: time for count, time in timings.items() if time < float("inf")
-    }
-    if not finite_timings:
-        return None
-    best_count = min(finite_timings, key=finite_timings.__getitem__)
-    baselines = [count for count in PDL_BASELINE_COUNTS if count in finite_timings]
-    if best_count in PDL_BASELINE_COUNTS or not baselines:
-        return best_count
-    baseline = min(baselines, key=finite_timings.__getitem__)
-    return (
-        best_count
-        if finite_timings[best_count] <= finite_timings[baseline] * (1 - min_speedup)
-        else baseline
-    )
-
-
-def get_pdl_count_candidates(
-    k: Optional[int],
-    pdl_count: PdlCountConfig = AUTO_PDL_COUNT,
-    num_persistent_work_tiles: int = 1,
-) -> List[Optional[int]]:
-    """Return fixed or coarsely sampled dependent-launch counts."""
-    if pdl_count is None:
-        return [None]
-    if pdl_count != AUTO_PDL_COUNT:
-        if isinstance(pdl_count, bool) or not isinstance(pdl_count, int):
-            raise TypeError("pdl_count must be 'auto', None, or an integer")
-        if pdl_count < -1:
-            raise ValueError("pdl_count must be -1 or a non-negative K-tile index")
-        return [pdl_count]
-    if k is None:
-        return [*PDL_BASELINE_COUNTS, 1, 2]
-    return get_coarse_pdl_count_candidates(k, num_persistent_work_tiles)
-
-
-def get_persistent_work_tiles_per_cta(
-    m: int,
-    n: int,
-    mma_tiler_mn: Tuple[int, int],
-    cluster_shape_mn: Tuple[int, int],
-    max_active_clusters: int,
-    *,
-    gated: bool = False,
-) -> int:
-    """Return the maximum work-tile count assigned to a persistent cluster."""
-    if min(m, n, max_active_clusters) <= 0:
-        raise ValueError(
-            "m, n, and max_active_clusters must be positive, got "
-            f"m={m}, n={n}, max_active_clusters={max_active_clusters}"
-        )
-    token_tile, output_tile = mma_tiler_mn
-    if gated:
-        output_tile //= 2
-    output_tile *= cluster_shape_mn[1]
-    total_work_tiles = ((m + token_tile - 1) // token_tile) * (
-        (n + output_tile - 1) // output_tile
-    )
-    persistent_clusters = min(total_work_tiles, max_active_clusters)
-    return (total_work_tiles + persistent_clusters - 1) // persistent_clusters
-
-
 # =============================================================================
 # Blackwell (SM100) Tactics
 # =============================================================================
@@ -239,8 +82,7 @@ def get_persistent_work_tiles_per_cta(
 def get_blackwell_gemm1_valid_tactics(
     tile_size: int,
     swap_ab: bool = False,
-    pdl_count: PdlCountConfig = -1,
-    k: Optional[int] = None,
+    pdl_count: Optional[int] = 1,
     gated: bool = True,
     split_k: Optional[int] = 1,
     weight_interleave: Optional[int] = None,
@@ -291,16 +133,15 @@ def get_blackwell_gemm1_valid_tactics(
                 not swap_ab or (split_k_candidate > 4 and device_mma_n > 32)
             ):
                 continue
-            for pdl_count_candidate in get_pdl_count_candidates(k, pdl_count):
-                tactic = (
-                    mma_tiler_mn,
-                    cluster_shape_mn,
-                    raster_along_m,
-                    pdl_count_candidate,
-                )
-                tactics.append(
-                    tactic if split_k_candidate == 1 else (*tactic, split_k_candidate)
-                )
+            tactic = (
+                mma_tiler_mn,
+                cluster_shape_mn,
+                raster_along_m,
+                pdl_count,
+            )
+            tactics.append(
+                tactic if split_k_candidate == 1 else (*tactic, split_k_candidate)
+            )
 
     return tactics
 
@@ -308,8 +149,7 @@ def get_blackwell_gemm1_valid_tactics(
 def get_blackwell_gemm2_valid_tactics(
     tile_size: int,
     swap_ab: bool = False,
-    pdl_count: PdlCountConfig = -1,
-    k: Optional[int] = None,
+    pdl_count: Optional[int] = 1,
 ) -> List[Tuple]:
     """Get valid Blackwell tactics for GEMM2 (Finalize Fusion).
 
@@ -336,19 +176,15 @@ def get_blackwell_gemm2_valid_tactics(
             (tile_size // 128, 2),
         ]
     raster_along_m_candidates = [False, True]
-    pdl_count_candidates = get_pdl_count_candidates(k, pdl_count)
-
     tactics = []
     for (
         mma_tiler_mn,
         cluster_shape_mn,
         raster_along_m,
-        pdl_count_candidate,
     ) in itertools.product(
         mma_tiler_mn_candidates,
         cluster_shape_mn_candidates,
         raster_along_m_candidates,
-        pdl_count_candidates,
     ):
         if not Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.is_valid_mma_tiler_and_cluster_shape(
             mma_tiler_mn, cluster_shape_mn, swap_ab=swap_ab
@@ -359,7 +195,7 @@ def get_blackwell_gemm2_valid_tactics(
                 mma_tiler_mn,
                 cluster_shape_mn,
                 raster_along_m,
-                pdl_count_candidate,
+                pdl_count,
             )
         )
 
@@ -368,12 +204,10 @@ def get_blackwell_gemm2_valid_tactics(
 
 def get_blackwell_moe_valid_tactics(
     swap_ab: bool = False,
-    gemm1_pdl_count: PdlCountConfig = -1,
-    gemm2_pdl_count: PdlCountConfig = -1,
-    gemm1_k: Optional[int] = None,
-    gemm2_k: Optional[int] = None,
+    w1_pdl_count: Optional[int] = 1,
+    w2_pdl_count: Optional[int] = 1,
     gated: bool = True,
-    gemm1_split_k: Optional[int] = 1,
+    w1_split_k: Optional[int] = 1,
     weight_interleave: Optional[int] = None,
     autotune_swap_ab: bool = False,
 ) -> List[Tuple]:
@@ -387,12 +221,10 @@ def get_blackwell_moe_valid_tactics(
             for tactic_swap_ab in (False, True)
             for tactic in get_blackwell_moe_valid_tactics(
                 swap_ab=tactic_swap_ab,
-                gemm1_pdl_count=gemm1_pdl_count,
-                gemm2_pdl_count=gemm2_pdl_count,
-                gemm1_k=gemm1_k,
-                gemm2_k=gemm2_k,
+                w1_pdl_count=w1_pdl_count,
+                w2_pdl_count=w2_pdl_count,
                 gated=gated,
-                gemm1_split_k=gemm1_split_k,
+                w1_split_k=w1_split_k,
                 weight_interleave=weight_interleave,
             )
         ]
@@ -406,17 +238,15 @@ def get_blackwell_moe_valid_tactics(
         gemm1_tactics = get_blackwell_gemm1_valid_tactics(
             tile_size,
             swap_ab=swap_ab,
-            pdl_count=gemm1_pdl_count,
-            split_k=gemm1_split_k,
-            k=gemm1_k,
+            pdl_count=w1_pdl_count,
+            split_k=w1_split_k,
             gated=gated,
             weight_interleave=weight_interleave,
         )
         gemm2_tactics = get_blackwell_gemm2_valid_tactics(
             tile_size if swap_ab else max(tile_size, 128),
             swap_ab=swap_ab,
-            pdl_count=gemm2_pdl_count,
-            k=gemm2_k,
+            pdl_count=w2_pdl_count,
         )
 
         for gemm1_tactic, gemm2_tactic in itertools.product(
@@ -579,6 +409,7 @@ def get_rubin_moe_valid_tactics() -> List[Tuple]:
 # Pre-generated tactic sets
 # =============================================================================
 
+# Fix PDL release at K-tile 1; tuning it has negligible impact.
 ALL_BLACKWELL_MOE_TACTICS = get_blackwell_moe_valid_tactics()
 ALL_RUBIN_MOE_TACTICS = get_rubin_moe_valid_tactics()
 
@@ -589,8 +420,8 @@ ALL_MOE_TACTICS = ALL_BLACKWELL_MOE_TACTICS
 
 DEFAULT_BLACKWELL_MOE_TACTIC = (
     128,
-    ((128, 128), (1, 1), False, -1),
-    ((128, 128), (1, 1), False, -1),
+    ((128, 128), (1, 1), False, 1),
+    ((128, 128), (1, 1), False, 1),
 )
 DEFAULT_RUBIN_MOE_TACTIC = (
     128,
@@ -632,53 +463,49 @@ def _extract_tactic_params(tactic: Tuple) -> Dict[str, Any]:
             gemm1_mma_tiler,
             gemm1_mma_inst_shape,
             gemm1_cluster_shape_mn,
-            gemm1_raster_along_m,
+            w1_raster_along_m,
         ) = gemm1_tactic
         (
             gemm2_mma_tiler,
             gemm2_mma_inst_shape,
             gemm2_cluster_shape_mn,
-            gemm2_raster_along_m,
+            w2_raster_along_m,
         ) = gemm2_tactic
         return {
             "tile_size": tile_size,
             "is_rubin": True,
             "gemm1_mma_tiler_mn": (gemm1_mma_tiler[0], gemm1_mma_tiler[1]),
             "gemm1_cluster_shape_mn": gemm1_cluster_shape_mn,
-            "gemm1_raster_along_m": gemm1_raster_along_m,
-            "gemm1_pdl_count": -1,
-            "gemm1_split_k": 1,
+            "w1_raster_along_m": w1_raster_along_m,
+            "w1_pdl_count": -1,
+            "w1_split_k": 1,
             "gemm1_mma_tiler": gemm1_mma_tiler,
             "gemm1_mma_inst_shape": gemm1_mma_inst_shape,
             "gemm2_mma_tiler_mn": (gemm2_mma_tiler[0], gemm2_mma_tiler[1]),
             "gemm2_cluster_shape_mn": gemm2_cluster_shape_mn,
-            "gemm2_raster_along_m": gemm2_raster_along_m,
-            "gemm2_pdl_count": -1,
+            "w2_raster_along_m": w2_raster_along_m,
+            "w2_pdl_count": -1,
             "gemm2_mma_tiler": gemm2_mma_tiler,
             "gemm2_mma_inst_shape": gemm2_mma_inst_shape,
             "swap_ab": swap_ab,
         }
     else:
-        gemm1_mma_tiler_mn, gemm1_cluster_shape_mn, gemm1_raster_along_m = gemm1_tactic[
-            :3
-        ]
-        gemm2_mma_tiler_mn, gemm2_cluster_shape_mn, gemm2_raster_along_m = gemm2_tactic[
-            :3
-        ]
+        gemm1_mma_tiler_mn, gemm1_cluster_shape_mn, w1_raster_along_m = gemm1_tactic[:3]
+        gemm2_mma_tiler_mn, gemm2_cluster_shape_mn, w2_raster_along_m = gemm2_tactic[:3]
         return {
             "tile_size": tile_size,
             "is_rubin": False,
             "gemm1_mma_tiler_mn": gemm1_mma_tiler_mn,
             "gemm1_cluster_shape_mn": gemm1_cluster_shape_mn,
-            "gemm1_raster_along_m": gemm1_raster_along_m,
-            "gemm1_pdl_count": gemm1_tactic[3] if len(gemm1_tactic) >= 4 else -1,
-            "gemm1_split_k": gemm1_tactic[4] if len(gemm1_tactic) >= 5 else 1,
+            "w1_raster_along_m": w1_raster_along_m,
+            "w1_pdl_count": gemm1_tactic[3] if len(gemm1_tactic) >= 4 else 1,
+            "w1_split_k": gemm1_tactic[4] if len(gemm1_tactic) >= 5 else 1,
             "gemm1_mma_tiler": None,
             "gemm1_mma_inst_shape": None,
             "gemm2_mma_tiler_mn": gemm2_mma_tiler_mn,
             "gemm2_cluster_shape_mn": gemm2_cluster_shape_mn,
-            "gemm2_raster_along_m": gemm2_raster_along_m,
-            "gemm2_pdl_count": gemm2_tactic[3] if len(gemm2_tactic) >= 4 else -1,
+            "w2_raster_along_m": w2_raster_along_m,
+            "w2_pdl_count": gemm2_tactic[3] if len(gemm2_tactic) >= 4 else 1,
             "gemm2_mma_tiler": None,
             "gemm2_mma_inst_shape": None,
             "swap_ab": swap_ab,
@@ -731,9 +558,8 @@ class CuteDslFusedMoERunner(TunableRunner):
         1: x_sf (num_tokens, hidden_size//sf_vec_size) - input scale factors
         2: token_selected_experts (num_tokens, top_k) - expert assignments
         3: token_final_scales (num_tokens, top_k) - routing weights
-        4-10: weight tensors (fixed size, don't depend on num_tokens)
-        11: gemm1_bias
-        12: gemm2_bias
+        4-8: w1_weight, w1_weight_sf, w1_alpha, w1_bias, fc2_input_scale
+        9-12: w2_weight, w2_weight_sf, w2_alpha, w2_bias
         13: moe_output, or per_token_scale when per-token activation is enabled
         14: moe_output when per-token activation is enabled
 
@@ -756,16 +582,14 @@ class CuteDslFusedMoERunner(TunableRunner):
         swap_ab: Whether both GEMMs swap device A/B operands and M/N roles.
         weight_interleave: Physical GEMM1 up/gate weight interleave. The
             unswapped kernel accepts 16 or 64; the swapped kernel accepts 16.
-        gemm1_raster_along_m: Override GEMM1 rasterization, or None to let the
+        w1_raster_along_m: Override GEMM1 rasterization, or None to let the
             tactic decide.
-        gemm2_raster_along_m: Override GEMM2 rasterization, or None to let the
+        w2_raster_along_m: Override GEMM2 rasterization, or None to let the
             tactic decide.
         fixed_tile_size: Force the routing tile size, or None to tune it.
-        gemm1_pdl_count: "auto" to tune the GEMM1 dependent-launch count,
-            None to disable PDL, or an integer to use one fixed count.
-        gemm2_pdl_count: "auto" to tune the GEMM2 dependent-launch count,
-            None to disable PDL, or an integer to use one fixed count.
-        gemm1_split_k: None to tune GEMM1 split-K over 1, 2, and 4, or an
+        w1_pdl_count: Fixed GEMM1 dependent-launch count, or None to disable PDL.
+        w2_pdl_count: Fixed GEMM2 dependent-launch count, or None to disable PDL.
+        w1_split_k: None to tune GEMM1 split-K over 1, 2, and 4, or an
             integer to use one fixed factor.
         activation_format: Activation quantization format.
         weight_format: Weight quantization format.
@@ -792,12 +616,12 @@ class CuteDslFusedMoERunner(TunableRunner):
         use_per_token_activation: bool = False,
         swap_ab: bool = False,
         weight_interleave: Optional[int] = None,
-        gemm1_raster_along_m: Optional[bool] = None,
-        gemm2_raster_along_m: Optional[bool] = None,
+        w1_raster_along_m: Optional[bool] = None,
+        w2_raster_along_m: Optional[bool] = None,
         fixed_tile_size: Optional[int] = None,
-        gemm1_pdl_count: PdlCountConfig = AUTO_PDL_COUNT,
-        gemm2_pdl_count: PdlCountConfig = AUTO_PDL_COUNT,
-        gemm1_split_k: Optional[int] = None,
+        w1_pdl_count: Optional[int] = 1,
+        w2_pdl_count: Optional[int] = 1,
+        w1_split_k: Optional[int] = None,
         enable_pdl: Optional[bool] = None,
         activation_format: Optional[QuantVariant] = None,
         weight_format: Optional[QuantVariant] = None,
@@ -823,16 +647,16 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.weight_interleave = normalize_cute_dsl_moe_weight_interleave(
             weight_interleave, swap_ab
         )
-        self.gemm1_raster_along_m = gemm1_raster_along_m
-        self.gemm2_raster_along_m = gemm2_raster_along_m
+        self.w1_raster_along_m = w1_raster_along_m
+        self.w2_raster_along_m = w2_raster_along_m
         self.fixed_tile_size = fixed_tile_size
         if enable_pdl is False:
-            gemm1_pdl_count = None
-            gemm2_pdl_count = None
-        self.gemm1_pdl_count = gemm1_pdl_count
-        self.gemm2_pdl_count = gemm2_pdl_count
-        self.enable_pdl = gemm1_pdl_count is not None or gemm2_pdl_count is not None
-        self.gemm1_split_k = gemm1_split_k
+            w1_pdl_count = None
+            w2_pdl_count = None
+        self.w1_pdl_count = w1_pdl_count
+        self.w2_pdl_count = w2_pdl_count
+        self.enable_pdl = w1_pdl_count is not None or w2_pdl_count is not None
+        self.w1_split_k = w1_split_k
         if (activation_format is None) != (weight_format is None):
             raise ValueError(
                 "activation_format and weight_format must be specified together"
@@ -853,13 +677,6 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.activation_format = activation_format
         self.weight_format = weight_format
         self._base_callback_contract = activation_format is not None
-        self._pdl_history_cache: Dict[
-            Tuple[int, bool], Dict[int, Tuple[Optional[int], int, int]]
-        ] = {
-            (gemm_index, swapped): {}
-            for gemm_index in (1, 2)
-            for swapped in (False, True)
-        }
 
         # Helper that builds a deterministic balanced approx-max-load
         # assignment for token_selected_experts during autotune profiling.
@@ -992,12 +809,12 @@ class CuteDslFusedMoERunner(TunableRunner):
                 self.use_per_token_activation,
                 self.swap_ab,
                 self.weight_interleave,
-                self.gemm1_raster_along_m,
-                self.gemm2_raster_along_m,
+                self.w1_raster_along_m,
+                self.w2_raster_along_m,
                 self.fixed_tile_size,
-                self.gemm1_pdl_count,
-                self.gemm2_pdl_count,
-                self.gemm1_split_k,
+                self.w1_pdl_count,
+                self.w2_pdl_count,
+                self.w1_split_k,
                 self.activation_format,
                 self.weight_format,
             )
@@ -1025,12 +842,12 @@ class CuteDslFusedMoERunner(TunableRunner):
             str(self.output_dtype),
             self.use_per_token_activation,
             self.swap_ab,
-            self.gemm1_raster_along_m,
-            self.gemm2_raster_along_m,
+            self.w1_raster_along_m,
+            self.w2_raster_along_m,
             self.fixed_tile_size,
-            self.gemm1_pdl_count,
-            self.gemm2_pdl_count,
-            self.gemm1_split_k,
+            self.w1_pdl_count,
+            self.w2_pdl_count,
+            self.w1_split_k,
             self.weight_interleave,
             w1_alpha is not None,
             w2_alpha is not None,
@@ -1235,25 +1052,9 @@ class CuteDslFusedMoERunner(TunableRunner):
             candidate_tactics = get_blackwell_moe_valid_tactics(
                 swap_ab=self.swap_ab,
                 autotune_swap_ab=self.weight_interleave == 16,
-                gemm1_pdl_count=(
-                    -1
-                    if self._base_callback_contract
-                    else None
-                    if self.gemm1_pdl_count == AUTO_PDL_COUNT
-                    else self.gemm1_pdl_count
-                ),
-                gemm2_pdl_count=(
-                    -1
-                    if self._base_callback_contract
-                    else None
-                    if self.gemm2_pdl_count == AUTO_PDL_COUNT
-                    else self.gemm2_pdl_count
-                ),
-                gemm1_split_k=(
-                    1 if self._base_callback_contract else self.gemm1_split_k
-                ),
-                gemm1_k=hidden_size,
-                gemm2_k=intermediate_size,
+                w1_pdl_count=self.w1_pdl_count,
+                w2_pdl_count=self.w2_pdl_count,
+                w1_split_k=(1 if self._base_callback_contract else self.w1_split_k),
                 gated=gated,
                 weight_interleave=self.weight_interleave,
             )
@@ -1262,14 +1063,8 @@ class CuteDslFusedMoERunner(TunableRunner):
             t
             for t in candidate_tactics
             if (self.fixed_tile_size is None or t[0] == self.fixed_tile_size)
-            and (
-                self.gemm1_raster_along_m is None
-                or t[1][2] == self.gemm1_raster_along_m
-            )
-            and (
-                self.gemm2_raster_along_m is None
-                or t[2][2] == self.gemm2_raster_along_m
-            )
+            and (self.w1_raster_along_m is None or t[1][2] == self.w1_raster_along_m)
+            and (self.w2_raster_along_m is None or t[2][2] == self.w2_raster_along_m)
             and _tactic_ok(t)
         ]
 
@@ -1291,180 +1086,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                 self.top_k,
             )
 
-        autotuner = AutoTuner.get()
-        if (
-            valid_tactics
-            and not _is_rubin_tactic(valid_tactics[0])
-            and autotuner.is_tuning_mode
-            and AUTO_PDL_COUNT in (self.gemm1_pdl_count, self.gemm2_pdl_count)
-        ):
-            tuning_config, input_batches = autotuner.prepare_tactic_profile(
-                inputs,
-                self.tuning_config,
-            )
-
-            def profile_tactic(tactic: Tuple[Any, ...]) -> float:
-                try:
-                    return autotuner.profile_tactic(
-                        self,
-                        inputs,
-                        tactic,
-                        tuning_config,
-                        input_batches,
-                    )
-                except torch.cuda.OutOfMemoryError:
-                    raise
-                except Exception as error:
-                    logger.debug(
-                        "Skipping adaptive PDL tactic %s after profiling failure: %s",
-                        tactic,
-                        error,
-                    )
-                    for clear_error in (
-                        torch.cuda.synchronize,
-                        lambda: torch.cuda.cudart().cudaGetLastError(),
-                    ):
-                        with contextlib.suppress(Exception):
-                            clear_error()
-                    return float("inf")
-
-            selected_tactic, _ = self._tune_pdl_tactics(
-                inputs,
-                valid_tactics,
-                profile_tactic,
-            )
-            return [selected_tactic]
-
         return valid_tactics
-
-    def _pdl_search_shape(
-        self,
-        inputs: List[torch.Tensor],
-        tactic: Tuple[Any, ...],
-        gemm_index: int,
-        num_tokens: int,
-    ) -> Tuple[int, int, int]:
-        """Return K size, software K tiles, and persistent work tiles."""
-        from ...cute_dsl.utils import get_max_active_clusters
-
-        mma_tiler_mn, cluster_shape_mn = tactic[gemm_index][:2]
-        w1_weight = inputs[4]
-        hidden_size = w1_weight.shape[2] * 2
-        gemm1_n = w1_weight.shape[1]
-        intermediate_size = gemm1_n // 2 if self.gated else gemm1_n
-        permuted_m = get_max_num_permuted_tokens(
-            num_tokens,
-            self.top_k,
-            self.num_local_experts,
-            tactic[0],
-        )
-        k = hidden_size if gemm_index == 1 else intermediate_size
-        n = intermediate_size if gemm_index == 1 else hidden_size
-        split_k = tactic[1][4] if gemm_index == 1 and len(tactic[1]) >= 5 else 1
-        k = (k + split_k - 1) // split_k
-        cluster_size = cluster_shape_mn[0] * cluster_shape_mn[1] * split_k
-        num_work_tiles = get_persistent_work_tiles_per_cta(
-            permuted_m,
-            n,
-            mma_tiler_mn,
-            cluster_shape_mn,
-            get_max_active_clusters(cluster_size),
-            gated=self.gated and gemm_index == 1,
-        )
-        return k, _num_pdl_k_tiles(k), num_work_tiles
-
-    def _tune_pdl_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        valid_tactics: List[Any],
-        profile_tactic: Callable[[Any], float],
-    ) -> Tuple[Any, float]:
-        """Tune topology first, then refine each automatic PDL dimension."""
-        auto_gemm_indices = [
-            gemm_index + 1
-            for gemm_index, pdl_count in enumerate(
-                (self.gemm1_pdl_count, self.gemm2_pdl_count)
-            )
-            if pdl_count == AUTO_PDL_COUNT
-        ]
-        measured: Dict[Tuple[Any, ...], float] = {}
-
-        def measure(tactic: Tuple[Any, ...]) -> float:
-            if tactic not in measured:
-                measured[tactic] = profile_tactic(tactic)
-            return measured[tactic]
-
-        # Stage 1: choose all tile, cluster, raster, and split-K dimensions
-        # with automatic PDL dimensions disabled.
-        selected_tactic = min(valid_tactics, key=measure)
-        if measured[selected_tactic] == float("inf"):
-            return selected_tactic, float("inf")
-
-        num_tokens = inputs[0].shape[0]
-        for gemm_index in auto_gemm_indices:
-            k, num_k_tiles, num_work_tiles = self._pdl_search_shape(
-                inputs,
-                selected_tactic,
-                gemm_index,
-                num_tokens,
-            )
-            tactic_swap_ab = (
-                selected_tactic[3] if len(selected_tactic) > 3 else self.swap_ab
-            )
-            history = self._pdl_history_cache[(gemm_index, tactic_swap_ab)]
-            previous_token = max(
-                (token_count for token_count in history if token_count < num_tokens),
-                default=None,
-            )
-            previous = history.get(previous_token)
-            if previous is None:
-                initial_counts = get_coarse_pdl_count_candidates(k, num_work_tiles)
-            else:
-                previous_count, previous_num_k_tiles, previous_num_work_tiles = previous
-                initial_counts = get_local_pdl_count_candidates(
-                    k,
-                    num_work_tiles,
-                    scale_pdl_count_to_work_tiles(
-                        previous_count,
-                        previous_num_k_tiles,
-                        previous_num_work_tiles,
-                        num_k_tiles,
-                        num_work_tiles,
-                    ),
-                )
-
-            def with_pdl_count(count: Optional[int]) -> Tuple[Any, ...]:
-                gemm_tactic = (
-                    *selected_tactic[gemm_index][:3],
-                    count,
-                    *selected_tactic[gemm_index][4:],
-                )
-                return (
-                    *selected_tactic[:gemm_index],
-                    gemm_tactic,
-                    *selected_tactic[gemm_index + 1 :],
-                )
-
-            count_timings = {
-                count: measure(with_pdl_count(count)) for count in initial_counts
-            }
-
-            # The first bucket locates a work-tile region coarsely, then
-            # measures every K position in that region and its neighbors.
-            if previous is None:
-                coarse_center = min(count_timings, key=count_timings.__getitem__)
-                for count in get_local_pdl_count_candidates(
-                    k,
-                    num_work_tiles,
-                    coarse_center,
-                ):
-                    count_timings[count] = measure(with_pdl_count(count))
-
-            selected_count = select_pdl_count(count_timings)
-            history[num_tokens] = (selected_count, num_k_tiles, num_work_tiles)
-            selected_tactic = with_pdl_count(selected_count)
-
-        return selected_tactic, measured[selected_tactic]
 
     def forward(  # type: ignore[override]
         self,
@@ -1563,11 +1185,11 @@ class CuteDslFusedMoERunner(TunableRunner):
             common_kwargs["enable_pdl"] = self.enable_pdl
         else:
             common_kwargs.update(
-                gemm1_raster_along_m=params["gemm1_raster_along_m"],
-                gemm1_pdl_count=params["gemm1_pdl_count"],
-                gemm1_split_k=params["gemm1_split_k"],
-                gemm2_raster_along_m=params["gemm2_raster_along_m"],
-                gemm2_pdl_count=params["gemm2_pdl_count"],
+                w1_raster_along_m=params["w1_raster_along_m"],
+                w1_pdl_count=params["w1_pdl_count"],
+                w1_split_k=params["w1_split_k"],
+                w2_raster_along_m=params["w2_raster_along_m"],
+                w2_pdl_count=params["w2_pdl_count"],
                 swap_ab=(
                     params["swap_ab"] if params["swap_ab"] is not None else self.swap_ab
                 ),

@@ -2238,8 +2238,8 @@ def prepare_cute_dsl_weights(
     intermediate_size: int,
     activation=None,
     device: Optional[torch.device] = None,
-    gemm1_bias: Optional[torch.Tensor] = None,
-    gemm2_bias: Optional[torch.Tensor] = None,
+    w1_bias: Optional[torch.Tensor] = None,
+    w2_bias: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the CuteDSL FP4 ``cute_dsl`` weight view.
 
@@ -2267,9 +2267,7 @@ def prepare_cute_dsl_weights(
         raise ValueError(
             f"CuTe-DSL FP4 weight preparation does not support {variant!r}"
         )
-    if variant is QuantVariant.W4A16 and (
-        gemm1_bias is not None or gemm2_bias is not None
-    ):
+    if variant is QuantVariant.W4A16 and (w1_bias is not None or w2_bias is not None):
         raise ValueError("CuTe-DSL W4A16 does not support fused expert bias")
 
     if device is None:
@@ -2333,20 +2331,26 @@ def prepare_cute_dsl_weights(
         "w1_weight": w1_weight,
         "w1_weight_sf": w1_weight_sf,
         "w1_alpha": ones,
-        "w2_weight": w2_weight,
-        "w2_weight_sf": w2_weight_sf,
-        "w2_alpha": ones,
     }
+    if w1_bias is not None:
+        shape = (num_local_experts, gemm1_rows)
+        if tuple(w1_bias.shape) != shape:
+            raise ValueError(f"w1_bias must have shape {shape}")
+        view["w1_bias"] = w1_bias.to(device=device, dtype=torch.float32).contiguous()
     if not is_mxfp4:
         view["fc2_input_scale"] = gs
-    for name, bias, shape in (
-        ("gemm1_bias", gemm1_bias, (num_local_experts, gemm1_rows)),
-        ("gemm2_bias", gemm2_bias, (num_local_experts, hidden_size)),
-    ):
-        if bias is not None:
-            if tuple(bias.shape) != shape:
-                raise ValueError(f"{name} must have shape {shape}")
-            view[name] = bias.to(device=device, dtype=torch.float32).contiguous()
+    view.update(
+        {
+            "w2_weight": w2_weight,
+            "w2_weight_sf": w2_weight_sf,
+            "w2_alpha": ones,
+        }
+    )
+    if w2_bias is not None:
+        shape = (num_local_experts, hidden_size)
+        if tuple(w2_bias.shape) != shape:
+            raise ValueError(f"w2_bias must have shape {shape}")
+        view["w2_bias"] = w2_bias.to(device=device, dtype=torch.float32).contiguous()
     return view
 
 

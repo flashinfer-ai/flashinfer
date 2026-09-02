@@ -3213,9 +3213,8 @@ class CuteDslRunner(MoERunner):
     ) -> List[torch.Tensor]:
         """Translate packs into the selected CuTe DSL runner's input list.
 
-        Expected weight view keys: w1_weight, w1_weight_sf, w1_alpha,
-        fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha, with optional
-        gemm1_bias and gemm2_bias.
+        Expected weight view keys: w1_weight, w1_weight_sf, w1_alpha, w1_bias,
+        fc2_input_scale, w2_weight, w2_weight_sf, w2_alpha, and w2_bias.
         The W4A4 per-token path inserts ``per_token_scale`` before the trailing
         ``moe_output`` buffer. W4A16 uses its own compact input layout. Both
         tuning configurations include the output buffer so profiling can replace
@@ -3275,12 +3274,12 @@ class CuteDslRunner(MoERunner):
                 v["w1_weight"],
                 v["w1_weight_sf"],
                 v["w1_alpha"],
+                v.get("w1_bias"),
                 None if is_mxfp4 else v["fc2_input_scale"],
                 v["w2_weight"],
                 v["w2_weight_sf"],
                 v["w2_alpha"],
-                v.get("gemm1_bias"),
-                v.get("gemm2_bias"),
+                v.get("w2_bias"),
                 moe_output,
             ]
         elif (
@@ -3301,12 +3300,12 @@ class CuteDslRunner(MoERunner):
                 v["w1_weight"],
                 v["w1_weight_sf"],
                 v["w1_alpha"],
+                v.get("w1_bias"),
                 v["fc2_input_scale"],
                 v["w2_weight"],
                 v["w2_weight_sf"],
                 v["w2_alpha"],
-                v.get("gemm1_bias"),
-                v.get("gemm2_bias"),
+                v.get("w2_bias"),
                 act.per_token_scale,
                 moe_output,
             ]

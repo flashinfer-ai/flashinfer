@@ -478,14 +478,14 @@ def test_situ_changes_autotuner_cache_key(activation_format: QuantVariant):
 @pytest.mark.parametrize(
     "variant",
     [
-        {"gemm1_split_k": 2},
+        {"w1_split_k": 2},
         {"weight_interleave": 16},
         {"swap_ab": True},
-        {"gemm1_raster_along_m": True},
-        {"gemm2_raster_along_m": True},
+        {"w1_raster_along_m": True},
+        {"w2_raster_along_m": True},
         {"fixed_tile_size": 64},
-        {"gemm1_pdl_count": None},
-        {"gemm2_pdl_count": None},
+        {"w1_pdl_count": None},
+        {"w2_pdl_count": None},
     ],
 )
 def test_tactic_config_changes_autotuner_cache_key(variant):
@@ -641,121 +641,7 @@ class TestTacticEnumeration:
         tactics = get_blackwell_moe_valid_tactics()
         assert len(tactics) == 64
         assert {gemm2[0][1] for _, _, gemm2 in tactics} == {64, 128, 192, 256}
-
-    def test_pdl_adaptive_search_helpers(self):
-        from flashinfer.fused_moe.cute_dsl.tuner import (
-            PDL_BASELINE_COUNTS,
-            get_coarse_pdl_count_candidates,
-            get_local_pdl_count_candidates,
-            get_pdl_count_candidates,
-            scale_pdl_count_to_work_tiles,
-            select_pdl_count,
-        )
-
-        assert get_pdl_count_candidates(512) == [None, -1, 0]
-        assert get_pdl_count_candidates(512, None) == [None]
-        assert get_pdl_count_candidates(512, 4) == [4]
-
-        coarse_candidates = get_coarse_pdl_count_candidates(
-            k=2880,
-            num_persistent_work_tiles=58,
-        )
-        assert coarse_candidates[:3] == list(PDL_BASELINE_COUNTS)
-        assert len(coarse_candidates) == 10
-        assert coarse_candidates[-1] == 57 * 12
-
-        local_candidates = get_local_pdl_count_candidates(
-            k=2880,
-            num_persistent_work_tiles=58,
-            center_count=30 * 12 + 5,
-        )
-        assert local_candidates[:3] == list(PDL_BASELINE_COUNTS)
-        assert local_candidates[3:] == list(range(29 * 12, 32 * 12))
-
-        assert (
-            scale_pdl_count_to_work_tiles(
-                count=10 * 12 + 5,
-                source_num_k_tiles=12,
-                source_num_work_tiles=58,
-                target_num_k_tiles=12,
-                target_num_work_tiles=116,
-            )
-            == 20 * 12 + 5
-        )
-        assert select_pdl_count({None: 1.0, -1: 1.001, 0: 1.002, 7: 0.997}) is None
-        assert select_pdl_count({None: 1.0, -1: 1.001, 0: 1.002, 7: 0.994}) == 7
-
-    def test_pdl_adaptive_search_stages(self):
-        from flashinfer.fused_moe.cute_dsl.tuner import (
-            AUTO_PDL_COUNT,
-            CuteDslFusedMoERunner,
-            PDL_BASELINE_COUNTS,
-        )
-
-        runner = object.__new__(CuteDslFusedMoERunner)
-        runner.swap_ab = False
-        runner.gemm1_pdl_count = AUTO_PDL_COUNT
-        runner.gemm2_pdl_count = None
-        runner._pdl_history_cache = {
-            (gemm_index, swapped): {}
-            for gemm_index in (1, 2)
-            for swapped in (False, True)
-        }
-        runner._pdl_search_shape = lambda inputs, tactic, gemm_index, num_tokens: (
-            512,
-            2,
-            4,
-        )
-
-        gemm2_tactic = ((128, 128), (1, 1), False, None, False)
-        topologies = [
-            (
-                tile_size,
-                ((tile_size, 128), (1, 1), False, None, False),
-                gemm2_tactic,
-            )
-            for tile_size in (128, 256)
-        ]
-        profiled = []
-
-        def profile_first_bucket(tactic):
-            profiled.append(tactic)
-            if tactic == topologies[0]:
-                return 2.0
-            count = tactic[1][3]
-            return {None: 1.0, 4: 0.98, 5: 0.97}.get(count, 1.01)
-
-        first_tactic, _ = runner._tune_pdl_tactics(
-            [torch.empty(1)],
-            topologies,
-            profile_first_bucket,
-        )
-        assert profiled[:2] == topologies
-        assert first_tactic[0] == 256
-        assert first_tactic[1][3] == 5
-
-        runner._pdl_search_shape = lambda inputs, tactic, gemm_index, num_tokens: (
-            512,
-            2,
-            8,
-        )
-        profiled_counts = []
-
-        def profile_later_bucket(tactic):
-            count = tactic[1][3]
-            profiled_counts.append(count)
-            return 0.98 if count == 12 else 1.0
-
-        later_tactic, _ = runner._tune_pdl_tactics(
-            [torch.empty(2)],
-            [topologies[1]],
-            profile_later_bucket,
-        )
-        non_baseline_counts = {
-            count for count in profiled_counts if count not in PDL_BASELINE_COUNTS
-        }
-        assert non_baseline_counts == set(range(8, 14))
-        assert later_tactic[1][3] == 12
+        assert all(gemm1[3] == gemm2[3] == 1 for _, gemm1, gemm2 in tactics)
 
     @pytest.mark.parametrize(
         "swap_ab,tile_size",
@@ -871,9 +757,9 @@ class TestTacticEnumeration:
 
         tactics = get_blackwell_moe_valid_tactics(
             autotune_swap_ab=True,
-            gemm1_pdl_count=None,
-            gemm2_pdl_count=None,
-            gemm1_split_k=None,
+            w1_pdl_count=None,
+            w2_pdl_count=None,
+            w1_split_k=None,
             weight_interleave=16,
         )
         assert len(tactics) == len(set(tactics))
@@ -881,7 +767,7 @@ class TestTacticEnumeration:
         for swap_ab, expected_splits in ((False, {1}), (True, {1, 2, 4})):
             selected = [tactic for tactic in tactics if tactic[3] is swap_ab]
             assert {
-                _extract_tactic_params(tactic)["gemm1_split_k"] for tactic in selected
+                _extract_tactic_params(tactic)["w1_split_k"] for tactic in selected
             } == expected_splits
             assert all(
                 gemm1_tactic[3] is None and gemm2_tactic[3] is None
@@ -890,7 +776,7 @@ class TestTacticEnumeration:
 
         fixed_split_tactics = get_blackwell_moe_valid_tactics(
             autotune_swap_ab=True,
-            gemm1_split_k=4,
+            w1_split_k=4,
             weight_interleave=16,
         )
         assert {tactic[3] for tactic in fixed_split_tactics} == {True}
@@ -968,20 +854,18 @@ class TestInputsHelperContract:
                 num_local_experts, 2 * intermediate, hidden // sf_vec, dtype=torch.uint8
             ),  # 5: w1_weight_sf
             torch.zeros(num_local_experts, dtype=torch.float32),  # 6: w1_alpha
-            torch.zeros(num_local_experts, dtype=torch.float32),  # 7: fc2_input_scale
-            torch.zeros(
-                num_local_experts, hidden, intermediate // 2, dtype=torch.uint8
-            ),  # 8: w2_weight
-            torch.zeros(
-                num_local_experts, hidden, intermediate // sf_vec, dtype=torch.uint8
-            ),  # 9: w2_weight_sf
-            torch.zeros(num_local_experts, dtype=torch.float32),  # 10: w2_alpha
             torch.zeros(
                 num_local_experts, 2 * intermediate, dtype=torch.float32
-            ),  # 11: gemm1_bias
+            ),  # 7: w1_bias
+            torch.zeros(num_local_experts, dtype=torch.float32),  # 8: fc2_input_scale
             torch.zeros(
-                num_local_experts, hidden, dtype=torch.float32
-            ),  # 12: gemm2_bias
+                num_local_experts, hidden, intermediate // 2, dtype=torch.uint8
+            ),  # 9: w2_weight
+            torch.zeros(
+                num_local_experts, hidden, intermediate // sf_vec, dtype=torch.uint8
+            ),  # 10: w2_weight_sf
+            torch.zeros(num_local_experts, dtype=torch.float32),  # 11: w2_alpha
+            torch.zeros(num_local_experts, hidden, dtype=torch.float32),  # 12: w2_bias
         ]
         if use_per_token_activation:
             inputs.append(torch.ones(n, dtype=torch.float32))  # per_token_scale
@@ -4556,7 +4440,7 @@ def test_w4a8_fused_moe_tactics_and_apis(
         (num_experts, hidden_size),
     )
     if bias_values == "generated":
-        gemm1_bias, gemm2_bias = (
+        w1_bias, w2_bias = (
             torch.linspace(start, end, shape[0] * shape[1], device=device).reshape(
                 shape
             )
@@ -4565,13 +4449,13 @@ def test_w4a8_fused_moe_tactics_and_apis(
             )
         )
     elif bias_values is not None:
-        gemm1_bias, gemm2_bias = (
+        w1_bias, w2_bias = (
             torch.full(shape, value, device=device)
             for shape, value in zip(bias_shapes, bias_values, strict=True)
         )
     else:
-        gemm1_bias = gemm2_bias = None
-    bias_kwargs = dict(w1_bias=gemm1_bias, w2_bias=gemm2_bias)
+        w1_bias = w2_bias = None
+    bias_kwargs = dict(w1_bias=w1_bias, w2_bias=w2_bias)
     monkeypatch.setattr(
         AutoTuner,
         "choose_one",
@@ -4722,8 +4606,8 @@ def test_w4a8_fused_moe_tactics_and_apis(
             top_k=top_k,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
-            gemm1_bias=gemm1_bias,
-            gemm2_bias=gemm2_bias,
+            gemm1_bias=w1_bias,
+            gemm2_bias=w2_bias,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,

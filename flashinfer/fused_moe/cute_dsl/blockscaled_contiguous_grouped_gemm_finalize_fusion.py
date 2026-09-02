@@ -498,7 +498,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     assert a.device.type == "cuda", "Input tensors must be on CUDA device"
     assert b.device.type == "cuda", "Input tensors must be on CUDA device"
     if enable_pdl is not None:
-        pdl_count = -1 if enable_pdl else None
+        pdl_count = 1 if enable_pdl else None
 
     # Get dimensions
     permuted_m = a.shape[0]

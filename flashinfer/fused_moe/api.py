@@ -1226,8 +1226,8 @@ class CuteDslConfig:
         intermediate_size: int,
         activation: Optional[ActivationConfig] = None,
         device=None,
-        gemm1_bias=None,
-        gemm2_bias=None,
+        w1_bias=None,
+        w2_bias=None,
     ):
         """Build the ``cute_dsl`` weight view from canonical BF16 weights.
 
@@ -1244,8 +1244,8 @@ class CuteDslConfig:
             intermediate_size=intermediate_size,
             activation=activation,
             device=device,
-            gemm1_bias=gemm1_bias,
-            gemm2_bias=gemm2_bias,
+            w1_bias=w1_bias,
+            w2_bias=w2_bias,
         )
 
     def __repr__(self) -> str:

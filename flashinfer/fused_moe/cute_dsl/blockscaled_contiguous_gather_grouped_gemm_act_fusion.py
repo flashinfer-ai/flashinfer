@@ -639,7 +639,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         normalized_activation_type, situ_beta, situ_linear_beta
     )
     if enable_pdl is not None:
-        pdl_count = -1 if enable_pdl else None
+        pdl_count = 1 if enable_pdl else None
     weight_interleave = normalize_cute_dsl_moe_weight_interleave(
         weight_interleave, swap_ab
     )
