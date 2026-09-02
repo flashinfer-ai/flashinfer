@@ -174,6 +174,13 @@ def sparse_paged_scores(
         raise ValueError(
             f"k_cache must be [pages, page_size, head_dim], got {k_cache.ndim}D"
         )
+    if k_cache.shape[1] < 1:
+        # A column is divided by this to reach its page. With no pages the
+        # kernel has nothing to read and says so, but a page of no entries is
+        # a divisor of zero, which it cannot.
+        raise ValueError(
+            f"k_cache pages hold {k_cache.shape[1]} entries; a page holds at least one"
+        )
     if compress_ratio < 1:
         raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
     if divisor <= 0:
