@@ -125,13 +125,17 @@ __global__ void __launch_bounds__(THREADS)
   // One past the last block the query has entirely behind it. A selection is
   // only expandable while it names one of these: the block the query sits in
   // is partly ahead of it, and the tail below is what supplies its seen half.
-  const int32_t past_blocks = min((query_position + 1) / static_cast<int32_t>(COMPRESS_RATIO),
-                                  sequence_length / static_cast<int32_t>(COMPRESS_RATIO));
+  // query_position + 1 in its own width: INT32_MAX is inside the range the cast
+  // above accepts, and adding one to it in int32 is signed overflow.
+  const int64_t query_end = static_cast<int64_t>(query_position) + 1;
+  const int32_t past_blocks = static_cast<int32_t>(
+      min(query_end / static_cast<int64_t>(COMPRESS_RATIO),
+          static_cast<int64_t>(sequence_length) / static_cast<int64_t>(COMPRESS_RATIO)));
   const int32_t complete_blocks = min(past_blocks, static_cast<int32_t>(block_topk));
   const int32_t expanded_count = complete_blocks * static_cast<int32_t>(COMPRESS_RATIO);
-  const int32_t tail_start =
-      ((query_position + 1) / static_cast<int32_t>(COMPRESS_RATIO)) * COMPRESS_RATIO;
-  const int32_t tail_count = (query_position + 1) - tail_start;
+  const int32_t tail_start = static_cast<int32_t>(
+      (query_end / static_cast<int64_t>(COMPRESS_RATIO)) * static_cast<int64_t>(COMPRESS_RATIO));
+  const int32_t tail_count = static_cast<int32_t>(query_end - static_cast<int64_t>(tail_start));
 
   const IdType* row_blocks = block_indices + row * stride_blocks_row;
   IdType* row_out = out + row * stride_out_row;
@@ -149,13 +153,16 @@ __global__ void __launch_bounds__(THREADS)
     if (column < expanded_count) {
       const int32_t rank = column / static_cast<int32_t>(COMPRESS_RATIO);
       const int32_t offset = column - rank * static_cast<int32_t>(COMPRESS_RATIO);
-      const IdType block_raw = row_blocks[rank * blocks_stride];
-      const int32_t block =
-          (block_raw >= IdType(0) && block_raw <= kInt32Max) ? static_cast<int32_t>(block_raw) : -1;
-      token = block * static_cast<int32_t>(COMPRESS_RATIO) + offset;
       // The whole block, not the token: keeping only the seen half of a block
-      // the query sits in would repeat exactly what the tail appends.
-      valid = block >= 0 && block < past_blocks;
+      // the query sits in would repeat exactly what the tail appends. Decided
+      // before the multiply, so a block that is not one of ours is never
+      // scaled by the ratio at all.
+      const IdType block_raw = row_blocks[rank * blocks_stride];
+      valid = block_raw >= IdType(0) && block_raw <= kInt32Max &&
+              block_raw < static_cast<IdType>(past_blocks);
+      token = valid
+                  ? static_cast<int32_t>(block_raw) * static_cast<int32_t>(COMPRESS_RATIO) + offset
+                  : -1;
     } else {
       const int32_t tail_offset = column - expanded_count;
       token = tail_start + tail_offset;
@@ -231,13 +238,17 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
   // One past the last block the query has entirely behind it. A selection is
   // only expandable while it names one of these: the block the query sits in
   // is partly ahead of it, and the tail below is what supplies its seen half.
-  const int32_t past_blocks = min((query_position + 1) / static_cast<int32_t>(COMPRESS_RATIO),
-                                  sequence_length / static_cast<int32_t>(COMPRESS_RATIO));
+  // query_position + 1 in its own width: INT32_MAX is inside the range the cast
+  // above accepts, and adding one to it in int32 is signed overflow.
+  const int64_t query_end = static_cast<int64_t>(query_position) + 1;
+  const int32_t past_blocks = static_cast<int32_t>(
+      min(query_end / static_cast<int64_t>(COMPRESS_RATIO),
+          static_cast<int64_t>(sequence_length) / static_cast<int64_t>(COMPRESS_RATIO)));
   const int32_t complete_blocks = min(past_blocks, static_cast<int32_t>(block_topk));
   const int32_t expanded_count = complete_blocks * static_cast<int32_t>(COMPRESS_RATIO);
-  const int32_t tail_start =
-      ((query_position + 1) / static_cast<int32_t>(COMPRESS_RATIO)) * COMPRESS_RATIO;
-  const int32_t tail_count = (query_position + 1) - tail_start;
+  const int32_t tail_start = static_cast<int32_t>(
+      (query_end / static_cast<int64_t>(COMPRESS_RATIO)) * static_cast<int64_t>(COMPRESS_RATIO));
+  const int32_t tail_count = static_cast<int32_t>(query_end - static_cast<int64_t>(tail_start));
 
   const uint32_t blocks_stride = CONTIGUOUS_COLUMNS ? 1u : stride_blocks_col;
   const IdType* row_blocks = block_indices + row * stride_blocks_row;
@@ -262,13 +273,14 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
       if (column < expanded_count) {
         const int32_t rank = column / static_cast<int32_t>(COMPRESS_RATIO);
         const int32_t offset = column - rank * static_cast<int32_t>(COMPRESS_RATIO);
+        // Same whole-block rule as the standalone expansion above, decided
+        // before the multiply for the same reason.
         const IdType block_raw = row_blocks[rank * blocks_stride];
-        const int32_t block = (block_raw >= IdType(0) && block_raw <= kInt32Max)
-                                  ? static_cast<int32_t>(block_raw)
-                                  : -1;
-        token = block * static_cast<int32_t>(COMPRESS_RATIO) + offset;
-        // Same whole-block rule as the standalone expansion above.
-        valid = block >= 0 && block < past_blocks;
+        valid = block_raw >= IdType(0) && block_raw <= kInt32Max &&
+                block_raw < static_cast<IdType>(past_blocks);
+        token =
+            valid ? static_cast<int32_t>(block_raw) * static_cast<int32_t>(COMPRESS_RATIO) + offset
+                  : -1;
       } else {
         const int32_t tail_offset = column - expanded_count;
         token = tail_start + tail_offset;
@@ -287,12 +299,15 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
     if (valid) {
       const uint32_t logical_page = static_cast<uint32_t>(token) / page_size;
       if (logical_page < table_width && row_table != nullptr) {
-        const int32_t page = static_cast<int32_t>(row_table[logical_page]);
-        if (page >= 0) {
-          const uint32_t candidate =
-              static_cast<uint32_t>(page) * page_size + static_cast<uint32_t>(token) % page_size;
-          if (candidate < num_slots) {
-            slot = candidate;
+        // The page id keeps its own width until it is bounded, and the slot is
+        // formed in 64 bits: page * page_size overflows a uint32 long before
+        // either factor does, and a wrapped product can land under num_slots.
+        const IdType page = row_table[logical_page];
+        if (page >= IdType(0) && page <= kInt32Max) {
+          const uint64_t candidate =
+              static_cast<uint64_t>(page) * page_size + static_cast<uint32_t>(token) % page_size;
+          if (candidate < static_cast<uint64_t>(num_slots)) {
+            slot = static_cast<uint32_t>(candidate);
           } else {
             valid = false;
           }
@@ -347,9 +362,14 @@ __global__ void __launch_bounds__(THREADS)
 
   // Rows past the caller's token count are padding: they carry no request and must
   // come out fully masked.
+  // Same range contract as the expansion kernels: an index is bounded in its
+  // own width before it is narrowed, or a value of 2^32 becomes request zero.
+  constexpr IdType kInt32Max = static_cast<IdType>(2147483647);
   const bool row_live = row < valid_rows;
-  const int32_t request = row_live ? static_cast<int32_t>(token_to_req[row]) : -1;
-  const bool request_valid = request >= 0 && request < static_cast<int32_t>(num_requests);
+  const IdType request_raw = row_live ? token_to_req[row] : IdType(-1);
+  const bool request_valid = request_raw >= IdType(0) && request_raw <= kInt32Max &&
+                             request_raw < static_cast<IdType>(num_requests);
+  const int32_t request = request_valid ? static_cast<int32_t>(request_raw) : -1;
   const IdType* row_table = request_valid ? block_table + request * stride_table_row : nullptr;
   // Only a live row reads the logical route, so it needs to cover those rows and
   // no more -- a short step can hand over its own tensor instead of padding one.
@@ -367,17 +387,18 @@ __global__ void __launch_bounds__(THREADS)
     uint32_t slot = 0;
     bool valid = false;
     if (in_row && row_table != nullptr && row_logical != nullptr) {
-      const int32_t token = static_cast<int32_t>(row_logical[col]);
-      if (token >= 0) {
+      const IdType token_raw = row_logical[col];
+      if (token_raw >= IdType(0) && token_raw <= kInt32Max) {
+        const int32_t token = static_cast<int32_t>(token_raw);
         uint32_t logical_page, entry;
         page_size.divmod(static_cast<uint32_t>(token), logical_page, entry);
         if (logical_page < table_width) {
-          const int32_t page = static_cast<int32_t>(row_table[logical_page]);
-          if (page >= 0) {
-            const uint32_t candidate =
-                static_cast<uint32_t>(page) * static_cast<uint32_t>(page_size) + entry;
-            if (candidate < num_slots) {
-              slot = candidate;
+          const IdType page = row_table[logical_page];
+          if (page >= IdType(0) && page <= kInt32Max) {
+            const uint64_t candidate =
+                static_cast<uint64_t>(page) * static_cast<uint32_t>(page_size) + entry;
+            if (candidate < static_cast<uint64_t>(num_slots)) {
+              slot = static_cast<uint32_t>(candidate);
               valid = true;
             }
           }
