@@ -184,16 +184,12 @@ class NcclEpHandle(Handle):
         )
         _t = _hp("hinit.create_handle_c", _t)
 
-        # InitHandle ran on self._stream. A caller that later drives this
-        # handle from another stream (the CUDA-graph recipe does exactly that:
-        # create outside, update inside a capture on the capture stream) needs
-        # an explicit dependency, or its first update races creation. Record
-        # here and consume it on the first cross-stream update.
-        import torch
-
-        self._init_event = torch.cuda.Event()
-        self._init_event.record(torch.cuda.ExternalStream(self._stream))
-        self._init_synced = False
+        # InitHandle ran on self._stream. Every later op issued on that same
+        # stream is therefore ordered after it for free. A captured op is not:
+        # the capture stream is a different stream (see _op_stream), and the
+        # dependency cannot be created from inside the capture -- see the
+        # guard in update() for why, and for what the caller must do instead.
+        self._ran_outside_capture = False
 
     def _knob_stream(self) -> int:
         k = self._handle_knobs.get(HandleAlgoKnobUserStream)
@@ -267,6 +263,13 @@ class NcclEpHandle(Handle):
         reading weights for rows that no longer exist. Only the routing VALUES
         may change. That is also all a CUDA graph can express, since it bakes
         shapes at capture.
+
+        Capture contract: ``InitHandle`` must have completed before
+        ``cudaStreamBeginCapture``, because nothing inside the capture can
+        order the recorded work after it. ``torch.cuda.graph()`` satisfies
+        this -- it synchronizes the device in ``__enter__``. A caller driving
+        the raw capture API must synchronize itself. This method rejects the
+        one case it can see, a first update that is already captured.
         """
         import torch
 
@@ -300,20 +303,32 @@ class NcclEpHandle(Handle):
         if not topk_idx.is_contiguous():
             raise ValueError("Handle.update: topk_ids must be contiguous.")
 
-        # Order this stream after InitHandle the first time we run somewhere
-        # other than the creation stream (see _init_event).
+        # Ordering against InitHandle. Ops issued on self._stream are ordered
+        # after it by the stream itself, which covers every non-captured call
+        # (_op_stream returns self._stream whenever we are not capturing).
+        #
+        # A captured call is not covered, and cannot be fixed from here: the
+        # capture stream may not wait on an event recorded before the capture
+        # began, and cudaEventSynchronize during capture invalidates it
+        # outright (cudaErrorStreamCaptureInvalidated). The dependency has to
+        # exist before cudaStreamBeginCapture, which is the caller's job --
+        # torch.cuda.graph() does it, synchronizing the device in __enter__.
+        #
+        # So this cannot verify the ordering, only that the documented recipe
+        # was followed: one update outside the capture before the captured
+        # one. That is a cheap, loud stand-in for a race that is otherwise
+        # silent until replay.
         op_stream = self._op_stream()
-        if not self._init_synced:
-            if op_stream != self._stream:
-                if torch.cuda.is_current_stream_capturing():
-                    raise RuntimeError(
-                        "Handle.update: first cross-stream update cannot be "
-                        "the captured one -- the dependency on InitHandle "
-                        "would not be recorded. Run one update outside the "
-                        "capture first (the standard warmup does this)."
-                    )
-                torch.cuda.current_stream().wait_event(self._init_event)
-            self._init_synced = True
+        if op_stream == self._stream:
+            self._ran_outside_capture = True
+        elif not self._ran_outside_capture:
+            raise RuntimeError(
+                "Handle.update: the first update on this handle cannot be "
+                "the captured one -- nothing inside a capture can order it "
+                "after InitHandle. Run one update outside the capture first "
+                "(the standard warmup does this), having synchronized before "
+                "capture began (torch.cuda.graph does this for you)."
+            )
 
         self._topk_idx = topk_idx
         self._num_tokens_in = topk_idx.shape[0]

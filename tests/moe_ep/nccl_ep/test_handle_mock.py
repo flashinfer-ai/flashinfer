@@ -567,6 +567,98 @@ def test_ops_move_to_the_capture_stream_under_capture(
     assert stream == captured_stream != pinned.cuda_stream
 
 
+def test_a_first_update_that_is_already_captured_is_rejected(
+    fake_nccl_ep, bypass_build_checks
+):
+    """Capture-first has no way to be ordered after InitHandle, so refuse it.
+
+    InitHandle runs on the handle's own stream. Work recorded into a capture
+    runs on the capture stream, and the dependency between them cannot be
+    built from inside: the capture stream may not wait on an event recorded
+    before capture began, and cudaEventSynchronize during capture invalidates
+    the capture (cudaErrorStreamCaptureInvalidated -- verified on device).
+    The ordering has to come from a device sync before cudaStreamBeginCapture,
+    which torch.cuda.graph() does in __enter__.
+
+    This guard cannot see that sync, so it checks the one thing it can: that
+    the documented recipe -- one update outside the capture -- was followed.
+    The alternative is a race that stays silent until replay.
+    """
+    import torch
+
+    from flashinfer.moe_ep.config import HandleParams
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    h = _make_handle(_make_fleet(fake_nccl_ep), num_tokens=16, top_k=2)
+    topk = torch.zeros(16, 2, dtype=torch.int64, device="cuda")
+
+    g = torch.cuda.CUDAGraph()
+    with (
+        pytest.raises(RuntimeError, match="cannot be the captured one"),
+        torch.cuda.graph(g),
+    ):
+        h.update(HandleParams(topk_ids=topk))
+
+
+def test_an_update_outside_the_capture_unlocks_the_captured_one(
+    fake_nccl_ep, bypass_build_checks
+):
+    """The warmup is what satisfies the guard above -- nothing else.
+
+    Pins the pair: the same capture that raises on a fresh handle succeeds
+    once one update has run outside it. Without this, the guard could be
+    tightened into rejecting the working recipe and only the negative test
+    would still pass.
+    """
+    import torch
+
+    from flashinfer.moe_ep.config import HandleParams
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    h = _make_handle(_make_fleet(fake_nccl_ep), num_tokens=16, top_k=2)
+    topk = torch.zeros(16, 2, dtype=torch.int64, device="cuda")
+
+    h.update(HandleParams(topk_ids=topk))  # the warmup
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        h.update(HandleParams(topk_ids=topk))
+    g.replay()
+    torch.cuda.synchronize()
+
+
+def test_the_capture_guard_never_fires_outside_capture(
+    fake_nccl_ep, bypass_build_checks
+):
+    """Non-graph callers must not be able to trip the guard.
+
+    _op_stream() returns the handle's own stream whenever we are not
+    capturing, so an eager caller is ordered after InitHandle by the stream
+    itself and the guard has nothing to say -- including on a caller whose
+    current stream is not the handle's, which is the shape that would look
+    cross-stream if the guard tested the *current* stream rather than the one
+    ops are actually issued on.
+    """
+    import torch
+
+    from flashinfer.moe_ep.config import HandleParams
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+
+    h = _make_handle(_make_fleet(fake_nccl_ep), num_tokens=16, top_k=2)
+    topk = torch.zeros(16, 2, dtype=torch.int64, device="cuda")
+
+    side = torch.cuda.Stream()
+    with torch.cuda.stream(side):
+        h.update(HandleParams(topk_ids=topk))
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize("hidden", [256, 512, 1024, 3072])
 def test_ll_rejects_unsupported_hidden_size(fake_nccl_ep, bypass_build_checks, hidden):
     """Unsupported hidden must raise, not abort the process.
