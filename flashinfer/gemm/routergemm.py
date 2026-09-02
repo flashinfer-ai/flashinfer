@@ -4,6 +4,7 @@ from ..trace.templates.gemm import (
     mm_M1_16_K7168_N256_trace,
     tinygemm_bf16_trace,
 )
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.jit import (
     gen_dsv3_router_gemm_module,
     gen_tinygemm2_module,
@@ -463,11 +464,11 @@ def get_tinygemm2_module():
     )
 
 
-# tinygemm2_sm100: generated SM100-family variants of the same kernel. Loom
+# tinygemm2_sm100: generated SM100/SM103 variants of the same kernel. Loom
 # schedules exactly porting csrc/tinygemm2.cu with bit-identical outputs;
-# selected automatically for the bias path on SM100/SM103/SM107. Ring depth
-# (stage 4/8/16) is selected inside the binding, mirroring the reference
-# launcher convention.
+# selected automatically for the bias path on B200/B300-class devices. Ring
+# depth (stage 4/8/16) is selected inside the binding, mirroring the
+# reference launcher convention.
 
 
 @functools.cache
@@ -490,22 +491,21 @@ def get_tinygemm2_sm100_module():
     return SimpleNamespace(tinygemm2_sm100_op=tinygemm2_sm100_op_impl)
 
 
-# The generated kernels use no SM100-exclusive ISA, so they are portable across
-# SM100, SM103 and SM107 (SM107 builds target sm_100f; see
-# gen_tinygemm2_sm100_module). Other 10.x devices pass is_sm100a_supported's
-# major==10 predicate but must keep using the reference kernel, so the tuple
-# stays explicit rather than testing major alone.
+# The generated kernels are validated on SM100 (B200), SM103 (B300/GB300) and
+# SM107 (Rubin) exactly; other 10.x devices pass is_sm100a_supported's
+# major==10 predicate but must keep using the reference kernel.
 _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
 
 
 def _use_tinygemm2_sm100(device: torch.device) -> bool:
     if os.environ.get("FLASHINFER_DISABLE_TINYGEMM2_SM100", "0") == "1":
         return False
-    return get_compute_capability(
-        device
-    ) in _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES and version_at_least(
-        torch.version.cuda, "12.8"
-    )
+    compute_capability = get_compute_capability(device)
+    if compute_capability not in _TINYGEMM2_SM100_SUPPORTED_COMPUTE_CAPABILITIES:
+        return False
+    if compute_capability == (10, 7) and not is_cuda_version_at_least("13.4"):
+        return False
+    return version_at_least(torch.version.cuda, "12.8")
 
 
 @backend_requirement({}, common_check=_tinygemm_bf16_shape_checks)
@@ -555,9 +555,9 @@ def tinygemm_bf16(
     Requires SM90+ (Hopper or newer).  Raises ``ValueError`` if tensor
     dimensions, dtypes, or alignment constraints are violated.
 
-    On SM100/SM103/SM107 devices the bias path
-    dispatches to ``tinygemm2_sm100`` — generated variants of the same kernel
-    with bit-identical outputs and lower latency (see
+    On SM100/SM103 (B200/B300 class) devices the bias path dispatches to
+    ``tinygemm2_sm100`` — generated variants of the same kernel with
+    bit-identical outputs and lower latency (see
     ``csrc/tinygemm2_sm100.cu``).  Set ``FLASHINFER_DISABLE_TINYGEMM2_SM100=1``
     to force the reference implementation everywhere.
     """

@@ -318,6 +318,7 @@ def parse_attention_args(line, parser):
             "cute-dsl",
             "prims-ts",
             "prims_ts",  # Accepted alias for the Python module spelling.
+            "cute-dsl-prims",
         ],
         help="Kernel backends to test. Default: fa2. prims-ts selects the experimental task-scheduled Blackwell backend for all attention routines. backend=auto is supported for BatchDecodeWithPagedKVCacheWrapper, BatchPrefillWithPagedKVCacheWrapper, and BatchMLAPagedAttentionWrapper (where it pairs with --autotune to select between trtllm-gen and cute-dsl).",
     )
@@ -1721,7 +1722,7 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
             backend_wrappers[backend] = backend_wrappers_prims_ts
             resolved_backends[backend] = backend
             continue
-        if backend in ["fa2", "fa3", "auto", "trtllm-gen"]:
+        if backend in ["fa2", "fa3", "auto", "trtllm-gen", "cute-dsl-prims"]:
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
                     workspace_buffer,
@@ -1825,6 +1826,14 @@ def testBatchPrefillWithPagedKVCacheWrapper(args):
                 kv_cache_sf=kv_cache_sf,
                 enable_pdl=args.enable_pdl,
                 out=out,
+            )
+        elif backend == "cute-dsl-prims":
+            return backend_wrappers[backend].run(
+                q,
+                kv_cache,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
             )
         elif backend == "cudnn":
             # cuDNN uses wrapper API with tensor scales for FP8
@@ -2558,7 +2567,13 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
     # Prepare wrappers
     backend_wrappers = {}
     for backend in backends:
-        if backend in ["cutlass", "fa2", "fa3", "trtllm-gen"]:
+        if backend in [
+            "cutlass",
+            "fa2",
+            "fa3",
+            "trtllm-gen",
+            "cute-dsl-prims",
+        ]:
             backend_wrappers[backend] = (
                 flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper(
                     workspace_buffer,
@@ -2699,6 +2714,15 @@ def testBatchPrefillWithRaggedKVCacheWrapper(args):
             return backend_wrappers[backend].run_return_lse(
                 q, k, v, enable_pdl=args.enable_pdl, out=out
             )[0]
+        elif backend == "cute-dsl-prims":
+            return backend_wrappers[backend].run(
+                q,
+                k,
+                v,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
         elif backend == "cute-dsl":
             _q_scale = q_scale if q_scale is not None else 1.0
             _k_scale = k_scale if k_scale is not None else 1.0
@@ -3314,6 +3338,9 @@ def testBatchMLAPagedAttentionWrapper(args):
         print(f"[VVERBOSE] {workspace_buffer.shape = }")
 
     # Create wrapper
+    # The shared sampler retains singleton dimensions for other attention
+    # routines, but MLA CSR metadata requires one KV length per request.
+    mla_kv_len_arr = actual_seq_lens_kv.flatten()
     backend_wrappers = {}
     for backend in backends:
         if backend in ["fa2", "fa3", "cutlass"]:
@@ -3323,7 +3350,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
                 kv_indices=kv_indices,
-                kv_len_arr=actual_seq_lens_kv,
+                kv_len_arr=mla_kv_len_arr,
                 backend=backend,
             )
             if backend != "cutlass":
@@ -3331,7 +3358,7 @@ def testBatchMLAPagedAttentionWrapper(args):
                     qo_indptr=qo_indptr,
                     kv_indptr=kv_indptr,
                     kv_indices=kv_indices,
-                    kv_len_arr=actual_seq_lens_kv,
+                    kv_len_arr=mla_kv_len_arr,
                     num_heads=num_qo_heads,
                     head_dim_ckv=head_dim_ckv,
                     head_dim_kpe=head_dim_kpe,
@@ -3413,14 +3440,14 @@ def testBatchMLAPagedAttentionWrapper(args):
         """
         if backend in ["fa2", "fa3"]:
             # BatchMLAPagedAttentionWrapper.run() does not accept enable_pdl;
-            # the fa2/fa3 MLA wrapper has no PDL support. trtllm-native/auto/
-            # cute-dsl branches below pass args.enable_pdl to the direct API.
+            # FA2/FA3 use their planned CSR metadata and do not accept the
+            # CUTLASS-only page_table argument. trtllm-native/auto/cute-dsl
+            # branches below pass args.enable_pdl to the direct API.
             return backend_wrappers[backend].run(
                 q_nope,
                 q_pe,
                 ckv_cache,
                 kpe_cache,
-                page_table=block_tables,
                 return_lse=False,
             )
         elif backend == "cutlass":

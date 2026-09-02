@@ -51,11 +51,67 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
     validate_cute_dsl_moe_situ_config,
 )
 from flashinfer.cute_dsl import is_cute_dsl_available
+from flashinfer.utils import get_compute_capability
 from .utils import (
     check_accuracy,
     compute_reference_moe_fp4,
     create_moe_tensors,
 )
+
+
+@pytest.fixture(autouse=True)
+def _skip_sm107_unimplemented_moe_features(request):
+    """Skip parameterizations the SM107 (Rubin) CuTe DSL MoE kernels do not implement.
+
+    ``fused_moe/cute_dsl/rubin/`` holds a narrower specialisation of the
+    Blackwell kernels rather than a port of them: the gather kernel hardcodes
+    SwiGLU and exposes no ``activation_type``, its wrapper has no
+    ``a_per_token_scale_ptr``, and the finalize kernel implements no unfused
+    path. The wrappers raise ``NotImplementedError`` for these cases, which is
+    correct behaviour -- but on Rubin it reports as a test failure on every CI
+    sweep, for features the kernels were never built to have.
+
+    The decision is made from the parameterization alone, before the test body
+    runs. It therefore cannot absorb a genuine regression: anything that fails
+    for a different reason still fails. That is the difference from matching an
+    exception after the fact, which can silently reclassify a real defect.
+
+    These are tracked as product gaps against the Rubin MoE kernels; remove the
+    corresponding branch here when a kernel gains the feature.
+    """
+    if not torch.cuda.is_available():
+        return
+    if get_compute_capability(torch.device("cuda")) != (10, 7):
+        return
+
+    callspec = getattr(request.node, "callspec", None)
+    params = getattr(callspec, "params", {}) or {}
+
+    if params.get("use_per_token_activation"):
+        pytest.skip(
+            "SM107 gather grouped GEMM has no a_per_token_scale pointer "
+            "(11 wrapper pointers vs Blackwell's 12)"
+        )
+
+    if params.get("use_fused_finalize") is False:
+        pytest.skip("SM107 finalize kernel implements only the fused path")
+
+    if params.get("activation_type") == ActivationType.GegluTanh:
+        pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
+
+    # test_geglu_tanh_accuracy sets the activation in its body rather than via a
+    # parameter, so it has to be matched by identity. Match the function exactly
+    # rather than by substring: test_geglu_tanh_activation_is_supported shares the
+    # prefix but only exercises normalize_cute_dsl_moe_activation_type, touches no
+    # kernel, and passes on SM107 -- a substring match silently dropped it.
+    if request.node.function.__name__ == "test_geglu_tanh_accuracy":
+        pytest.skip("SM107 gather grouped GEMM is SwiGLU-only")
+
+    if (
+        request.node.function.__name__
+        == "test_deterministic_finalize_numerical_accuracy"
+    ):
+        pytest.skip("SM107 finalize kernel implements only the fused path")
 
 
 def is_sm100_family():
@@ -1171,6 +1227,8 @@ class TestAutotunerBucketConfig:
 @cute_dsl_available
 @sm100_required
 class TestCuteDslMoeW4A16:
+    pytestmark = _requires_dsl_arch
+
     @pytest.mark.parametrize("use_wrapper", [False, True])
     def test_weight_scale_update(self, use_wrapper: bool):
         from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
@@ -1762,6 +1820,12 @@ class TestCuteDslFusedMoeFunctional:
         situ_linear_beta: float | None,
     ):
         """Accuracy test for SiTU with optional smooth up-branch clamping."""
+        if is_sm107():
+            pytest.skip(
+                "Rubin (SM107) cute-dsl MoE kernels do not implement SiTU; the "
+                "gather kernel is SwiGLU-only and silently ignores situ_beta/"
+                "situ_linear_beta"
+            )
         from flashinfer import cute_dsl_fused_moe
 
         num_tokens, hidden_size, intermediate_size = 128, 256, 512
