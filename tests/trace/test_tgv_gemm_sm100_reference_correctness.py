@@ -3,10 +3,7 @@
 import torch
 import pytest
 
-from tests.trace.reference_utils import (
-    _cc,
-    _check,
-)
+from tests.trace.reference_utils import _check
 
 
 @pytest.mark.parametrize(
@@ -17,15 +14,11 @@ from tests.trace.reference_utils import (
     ],
 )
 def test_tgv_gemm_sm100_reference_correctness(shape_kwargs):
-    """tgv_gemm_sm100 kernel (SM100 only in practice) vs reference (a @ b + bias)."""
-    from flashinfer.utils import is_sm100f_supported
+    """TGV SM100-family kernel vs the a @ b + bias reference."""
+    from flashinfer.utils import get_compute_capability, is_sm100f_supported
 
-    # The kernel's Python gate accepts SM100 or SM103 (see
-    # gemm_base._match_sm_version) but the precompiled cubin only has an
-    # SM100 kernel image; calling on SM103 crashes with "no kernel image"
-    # inside CUDA (uncatchable via try/except). Restrict to SM100.
-    if _cc() != (10, 0):
-        pytest.skip("tgv_gemm_sm100 cubin is only built for SM100")
+    if get_compute_capability(torch.device("cuda")) not in [(10, 0), (10, 3)]:
+        pytest.skip("tgv_gemm_sm100 requires SM100 or SM103")
     if not is_sm100f_supported(torch.device("cuda")):
         pytest.skip("tgv_gemm_sm100 requires SM100f support (CUDA 12.9+)")
     from flashinfer import tgv_gemm_sm100
@@ -34,10 +27,7 @@ def test_tgv_gemm_sm100_reference_correctness(shape_kwargs):
     inputs = tgv_gemm_sm100_trace.init(**shape_kwargs)
     assert inputs["b"].shape == (shape_kwargs["K"], shape_kwargs["N"])
     assert inputs["b"].stride(0) == 1, "tgv_gemm_sm100 expects column-major b"
-    try:
-        api_out = tgv_gemm_sm100(inputs["a"], inputs["b"], inputs["bias"])
-    except Exception as exc:
-        pytest.skip(f"tgv_gemm_sm100 unavailable: {exc}")
+    api_out = tgv_gemm_sm100(inputs["a"], inputs["b"], inputs["bias"])
     torch.cuda.synchronize()
     ref_out = tgv_gemm_sm100_trace.reference(inputs["a"], inputs["b"], inputs["bias"])
     # Matches tests/gemm/test_tgv_gemm.py: bf16 * K=1024 accumulation makes
