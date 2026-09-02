@@ -4285,12 +4285,16 @@ def _run_cake_kda_bf16_direct_export(
     spec = get_cake_kda_module_spec(
         route.target, "bounded_bf16_evolution", route.policy
     )
-    tma_workspace = _cake_kda_workspace_buffer(
-        workspace=workspace,
-        name=f"tma_descriptor_{spec.target}_{spec.family}_{spec.policy}",
-        device=q.device,
-        shape=(spec.tma_workspace_bytes,),
-        dtype=torch.uint8,
+    tma_workspace = (
+        _cake_kda_workspace_buffer(
+            workspace=workspace,
+            name=f"tma_descriptor_{spec.target}_{spec.family}_{spec.policy}",
+            device=q.device,
+            shape=(spec.tma_workspace_bytes,),
+            dtype=torch.uint8,
+        )
+        if spec.tma_workspace_bytes
+        else None
     )
     seq_order = _cached_int32_metadata(
         device=q.device,

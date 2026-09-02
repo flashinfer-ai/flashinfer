@@ -100,8 +100,8 @@ def test_cake_kda_portfolio_declares_caller_owned_pointer_tma_workspace():
         "bounded_bf16_evolution",
         "direct_m128_n16",
     )
-    assert n16_spec.tma_abi == "pointer"
-    assert n16_spec.tma_workspace_bytes == 7 * 128
+    assert n16_spec.tma_abi == "grid_constant"
+    assert n16_spec.tma_workspace_bytes == 0
 
 
 def _valid_cake_kda_affine_selector_kwargs():
