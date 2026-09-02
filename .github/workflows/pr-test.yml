@@ -391,9 +391,14 @@ jobs:
               ;;
           esac
           if [ -n "${TEST_PATH_ARG:-}" ]; then
-            # shellcheck disable=SC2086 - TEST_PATH_ARG is a validated, space-separated
-            # list of targets and must word-split into separate arguments.
-            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" ${TEST_PATH_ARG}
+            # Read into an array and expand quoted, rather than relying on word
+            # splitting: this keeps the shell safe on its own terms instead of
+            # inheriting the validator's charset guarantee. Globbing is off for the
+            # same reason.
+            set -f
+            read -r -a TEST_TARGETS <<< "${TEST_PATH_ARG}"
+            set +f
+            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" "${TEST_TARGETS[@]}"
           else
             bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}"
           fi

