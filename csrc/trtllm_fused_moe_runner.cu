@@ -587,9 +587,19 @@ void Runner::run(MoERunnerArgs const& args, MoEWorkspace const& workspace, int d
     FLASHINFER_CHECK(
         workspace.token_scales_fc2 != nullptr,
         "workspace.token_scales_fc2 must be provided When using explicit quantization.");
-    // FIXME(siyuan): Detect from the kernel config. Currently only tile size >= 128 will use R128c4
-    auto sfLayout = mGemm2.mTileTokensDim >= 128 ? QuantizationSFLayout::SWIZZLED_128x4
-                                                 : QuantizationSFLayout::SWIZZLED_8x4;
+    auto const sfLayoutB = mGemm2.mRunner.getSfLayoutB(config.gemm2Config);
+    auto sfLayout = QuantizationSFLayout::LINEAR;
+    switch (sfLayoutB) {
+      case btg::SfLayout::R8c4:
+        sfLayout = QuantizationSFLayout::SWIZZLED_8x4;
+        break;
+      case btg::SfLayout::R128c4:
+        sfLayout = QuantizationSFLayout::SWIZZLED_128x4;
+        break;
+      default:
+        FLASHINFER_CHECK(false, "Unsupported FC2 block scale layout ",
+                         btg::sfLayoutToString(sfLayoutB));
+    }
 
     float globalScaleInv = 1.f / (448.f * 6.f);
     if (tensorrt_llm::common::getEnvNVFP4Use4Over6() &&
