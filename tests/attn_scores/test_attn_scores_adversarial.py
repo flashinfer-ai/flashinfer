@@ -720,26 +720,26 @@ def test_adv_interspersed_zero_row_uses_correct_q(variant):
         )
 
 
-@pytest.mark.parametrize("next_n_atom", [None, 2, 1])
-def test_adv_fp4_next_n4_split_zero_and_short_rows(next_n_atom):
+def test_adv_fp4_next_n4_split_zero_and_short_rows():
     """Interspersed zero-work ATOMS must not desync the FP4 split's prefetch.
 
     Under an atom split a "row" the task iterators traverse is a q_atom, and
     its context is ctx - (num_atoms-1-i)*atom -- which is zero or NEGATIVE for
-    a short-but-nonzero native row (here ctx=2 at next_n=4: the leading atom of
-    a 2-split sees 0, the 4-split sees -1..2). The producer lookahead must skip
-    exactly the atoms the consumers skip, on the per-atom length with a <= 0
-    test; a lookahead reading the native ctx (or testing == 0) stages the
-    skipped atom's Q/SF_Q/W and the atom after the gap consumes them -- wrong
-    logits, no hang, the same failure mode
+    a short-but-nonzero native row (here ctx=2 at next_n=4: the leading atom
+    of the 2-atom split sees 0). The producer lookahead must skip exactly the
+    atoms the consumers skip, on the per-atom length with a <= 0 test; a
+    lookahead reading the native ctx (or testing == 0) stages the skipped
+    atom's Q/SF_Q/W and the atom after the gap consumes them -- wrong logits,
+    no hang, the same failure mode
     test_adv_interspersed_zero_row_uses_correct_q pins for num_atoms == 1.
 
     The shape combines every skip trigger: a native zero row (all atoms
     skipped), a ctx=2 row (leading atoms skipped, trailing atom live), and a
     num_sms*256 row so one CTA's range spans the gaps. Trailing zeros cannot
     expose the bug. Weights are distinct per (b, t) so any row mixup is
-    unmissable. Runs every legal decomposition: None (direct on Rubin, 2-atom
-    split on Blackwell), 2-atom, and 4-atom.
+    unmissable. The decomposition is the fixed internal rule, so on Blackwell
+    this exercises the 2-atom split (the only split that can execute) and on
+    Rubin the direct path, where zero-work atoms coincide with zero rows.
     """
     _skip_if_not_sm100()
     from flashinfer import fp4_paged_mqa_logits
@@ -795,7 +795,6 @@ def test_adv_fp4_next_n4_split_zero_and_short_rows(next_n_atom):
         bt,
         max_ml,
         output_dtype=torch.float32,
-        next_n_atom=next_n_atom,
     )
     torch.cuda.synchronize()
 
@@ -814,7 +813,7 @@ def test_adv_fp4_next_n4_split_zero_and_short_rows(next_n_atom):
             scale = float(r[finite].abs().max()) or 1.0
             rel = float((a[finite] - r[finite]).abs().max()) / scale
             assert rel < 1e-3, (
-                f"next_n_atom={next_n_atom} row (b={b}, t={t}, ctx={n}) differs "
-                f"from the reference by {rel:.2e} relative: an atom after a "
-                "zero-work atom is consuming the skipped atom's Q/weights"
+                f"row (b={b}, t={t}, ctx={n}) differs from the reference by "
+                f"{rel:.2e} relative: an atom after a zero-work atom is "
+                "consuming the skipped atom's Q/weights"
             )

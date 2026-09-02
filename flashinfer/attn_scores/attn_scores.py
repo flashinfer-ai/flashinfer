@@ -583,55 +583,6 @@ def _fp4_max_atom_for_device(device: torch.device) -> int:
 _COMPUTE_BLOCK_KV = 128  # kernel's fixed compute tile (immutable)
 _NUM_MATH_WG = 2  # warp groups per CTA; kernel multiplies col-1 by this
 
-# One "atom" runs `atom` next-token positions per launched q-row. Splitting
-# next_n into next_n/atom pieces expands the effective batch, and each piece
-# re-reads the same KV -- so a split costs num_atoms x KV HBM traffic but
-# exposes more parallelism. _SPLIT_KV_TOKENS is the KV span of one scheduler
-# task (see _COMPUTE_BLOCK_KV * _NUM_MATH_WG).
-_SPLIT_KV_TOKENS = _COMPUTE_BLOCK_KV * _NUM_MATH_WG
-
-
-def _choose_atom_split(
-    batch: int,
-    ctx: int,
-    next_n: int,
-    num_sms: int,
-    kernel_atoms: Tuple[int, ...],
-    tie: str = "max_num_atoms",
-) -> int:
-    """Pick the atom size decomposing ``next_n`` to minimise the persistent
-    scheduler's wave count for a (batch, ctx) shape.
-
-    Wave count is estimated as ``ceil(tasks / num_sms)``, where a task is one
-    (expanded-batch-row, KV-chunk) tile and a ``ctx``-token sequence spans
-    ``ceil(ctx / _SPLIT_KV_TOKENS)`` chunks. Fewer waves means better SM
-    occupancy.
-
-    Ties -- the small-batch regime, where splitting fills otherwise idle SMs
-    within the same wave -- break toward the largest ``num_atoms`` (smallest
-    atom), i.e. most SMs busy per wave, accepting the extra KV re-reads because
-    SMs rather than HBM are the limiter there.
-
-    Purely analytical, no timing. Scored against the measured direct-vs-split
-    sweep in DKG MR !25506: it matches the empirical winner in 81% of cells,
-    and in 100% of the decisive large- and small-batch regions; every mismatch
-    sits in a narrow near-crossover band where the loss is <=7%.
-    """
-    cands = []
-    for atom in kernel_atoms:
-        if next_n % atom == 0:
-            num_atoms = next_n // atom
-            tasks = batch * num_atoms * -(-ctx // _SPLIT_KV_TOKENS)
-            cands.append((-(-tasks // num_sms), num_atoms, atom))
-    if not cands:
-        raise ValueError(f"no atom in {kernel_atoms} divides next_n={next_n}")
-    if tie == "max_num_atoms":
-        cands.sort(key=lambda c: (c[0], -c[1]))
-    else:
-        cands.sort(key=lambda c: (c[0], c[1]))
-    return cands[0][2]
-
-
 _ATOM_OFFSETS_CACHE: dict = {}
 
 
@@ -1401,7 +1352,6 @@ def _check_fp4_paged_mqa_logits_supported(
     epi_dtype: torch.dtype = torch.float32,
     num_epi_subtiles: int = 1,
     is_kv_sf_interleaved: bool = False,
-    next_n_atom: "int | str | None" = None,
     schedule_meta: torch.Tensor = None,
     out: torch.Tensor = None,
 ) -> bool:
@@ -1527,7 +1477,6 @@ def fp4_paged_mqa_logits(
     epi_dtype: torch.dtype = torch.float32,
     num_epi_subtiles: int = 1,
     is_kv_sf_interleaved: bool = False,
-    next_n_atom: "int | str | None" = None,
     schedule_meta: torch.Tensor = None,
     out: torch.Tensor = None,
 ) -> torch.Tensor:
@@ -1591,27 +1540,6 @@ def fp4_paged_mqa_logits(
                          pass in, so set it to match how that cache was
                          written; supplying the interleaved order can be
                          faster.
-        next_n_atom:     experimental execution-strategy override for how
-                         next_n decomposes into per-launch atoms.  The MMA/TMEM
-                         tile spans one atom, so the atom (not next_n) is what
-                         the per-arch TMEM cap gates: at most 3 on SM100/SM103,
-                         4 on Rubin (SM107+).  Legal values:
-                           None (default) -- run direct (one atom of next_n)
-                             whenever this device's cap holds it, splitting
-                             only when it cannot (next_n=4 on SM100/SM103 runs
-                             as two atoms of 2).  Never changes the execution
-                             of a configuration that fits directly.
-                           "auto" -- pick the atom by an analytical wave-count
-                             heuristic; may split even when direct fits (a
-                             split can win at small batch by filling idle SMs,
-                             at the cost of num_atoms x KV reads).
-                           "direct" -- force one atom of next_n; raises if the
-                             device cap cannot hold it.
-                           int -- force that atom size; must divide next_n and
-                             fit the device cap.
-                         Numerics are identical for every legal value; only
-                         performance and the schedule_meta contract (below)
-                         change.
         schedule_meta:   optional pre-computed [num_sms+1, 2] int32 CTA schedule
                          on CUDA.  If None, computed from context_lens each call.
                          Reusable only while the entire
@@ -1623,15 +1551,16 @@ def fp4_paged_mqa_logits(
                          the same buffer before launching.  A stale schedule can
                          hang the kernel.
                          Use compute_paged_mqa_logits_schedule() to generate it.
-                         Must be omitted (None) whenever an atom split is
-                         active (always the case for next_n=4 on SM100/SM103):
-                         the scheduler then describes batch_size*num_atoms rows
-                         while a caller-built schedule describes batch_size, a
-                         mismatch that can hang the persistent kernel, so it is
-                         rejected with ValueError.  The internally computed
-                         schedule is CUDA-graph-capturable and replays
-                         correctly, so under capture simply omit this argument
-                         on split configurations.
+                         Must be omitted (None) for next_n=4 on SM100/SM103:
+                         the TMEM there cannot hold four positions in one MMA
+                         tile, so the kernel runs an internal two-atom split
+                         (numerics unchanged) and the scheduler describes
+                         2*batch_size rows while a caller-built schedule
+                         describes batch_size -- a mismatch that can hang the
+                         persistent kernel, so it is rejected with ValueError.
+                         The internally computed schedule is
+                         CUDA-graph-capturable and replays correctly, so under
+                         capture simply omit this argument there.
         out:             optional pre-allocated output
                          [batch_size*next_n, padded_ctx_len].  Use
                          padded_context_len() to size it.  Required for CUDA
@@ -1651,11 +1580,9 @@ def fp4_paged_mqa_logits(
         num_heads        must equal _FP4_REQUIRED_NUM_HEADS.
         head_dim         must equal _FP4_REQUIRED_HEAD_DIM.
         next_n           must be in 1.._FP4_MAX_NEXT_N.
-        next_n_atom      (when an int) must divide next_n, and the resolved
-                         atom must fit the device cap: 3 on SM100/SM103, 4 on
-                         Rubin (SM107+).
-        schedule_meta    must be None when the resolved decomposition has more
-                         than one atom (see next_n_atom above).
+        schedule_meta    must be None for next_n=4 on SM100/SM103, where the
+                         kernel runs an internal two-atom split (see
+                         schedule_meta above).
         sf_vec_size      must equal _FP4_SF_VEC_SIZE, and head_dim/sf_vec_size
                          must equal _SF_PER_INT32.
         block_size       must divide _COMPUTE_BLOCK_KV, with the quotient at
@@ -1676,56 +1603,29 @@ def fp4_paged_mqa_logits(
     cutlass_epi = _to_cutlass(epi_dtype)
     cutlass_out = _to_cutlass(output_dtype)
 
-    # Resolve the atom (kernel-side next_n). atom == next_n runs direct, one
-    # launch; atom < next_n splits next_n into next_n/atom pieces that each
-    # re-read the KV. The arch cap is what makes this necessary: an atom of 4
-    # needs 544 TMEM columns and therefore Rubin, so Blackwell reaches next_n=4
-    # only via a split.
+    # Decomposition into per-launch atoms (the MMA/TMEM tile spans one atom):
+    # always direct, splitting minimally only when the arch cannot hold next_n
+    # in one atom -- an atom of 4 needs 544 TMEM columns and therefore Rubin,
+    # so next_n=4 on SM100/SM103 runs as two atoms of 2. Each atom re-reads
+    # the whole KV, so a split costs num_atoms x KV HBM traffic in exchange
+    # for num_atoms x more scheduler rows.
+    #
+    # Deliberately a fixed rule -- not a shape heuristic and not a user knob.
+    # A forced-decomposition sweep (batch 1..64, ctx {4K, 16K}, next_n {2, 4},
+    # graph-timed per the benchmarks/bench_paged_mqa_logits.py methodology)
+    # measured direct winning or tying every cell on both SM100 (B100) and
+    # Rubin: upstream DKG's wave-count heuristic would pick small-batch splits
+    # that run up to 1.26x slower than direct here (SM100, b=1, ctx=16K,
+    # next_n=2), and finer-than-minimal splits of the forced case are up to
+    # 1.37x slower at large batch (atoms of 1 vs 2, b=64, ctx=16K). The
+    # small-batch occupancy win that motivated upstream's heuristic does not
+    # materialise on this repo's kernels, so nothing here depends on shape.
     max_atom = _fp4_max_atom_for_device(q.device)
-    if next_n_atom is None:
-        # Default: direct whenever the arch can hold the whole next_n in one
-        # atom, splitting only when it cannot (next_n=4 on Blackwell). This is
-        # deliberately NOT the wave-count heuristic. Splitting is a change of
-        # execution strategy -- it multiplies KV traffic and, more importantly,
-        # changes the schedule the kernel expects, so a caller-supplied
-        # schedule_meta built from the native context_lens would no longer
-        # match. Making that the default would silently alter configurations
-        # that already work. Pass "auto" to opt into the heuristic.
-        atom = (
-            next_n
-            if next_n <= max_atom
-            else max(a for a in range(1, max_atom + 1) if next_n % a == 0)
-        )
-    elif next_n_atom == "auto":
-        atom = _choose_atom_split(
-            B, max_context_len, next_n, num_sms, tuple(range(1, max_atom + 1))
-        )
-    elif next_n_atom == "direct":
-        atom = next_n
-    else:
-        # Strict domain: bool is an int subclass, so next_n_atom=True (a
-        # plausible "enable" typo) would silently mean atom=1 -- a full split
-        # with num_atoms x KV traffic -- and an int() coercion would likewise
-        # accept floats and numeric strings. Reject anything but a real int so
-        # a malformed value fails loudly instead of silently changing the
-        # execution strategy.
-        if not isinstance(next_n_atom, int) or isinstance(next_n_atom, bool):
-            raise ValueError(
-                f"fp4_paged_mqa_logits: next_n_atom must be None, 'auto', "
-                f"'direct', or an int dividing next_n; got {next_n_atom!r}"
-            )
-        atom = next_n_atom
-    if not (1 <= atom <= next_n and next_n % atom == 0):
-        raise ValueError(
-            f"fp4_paged_mqa_logits: next_n_atom={atom} must divide next_n="
-            f"{next_n} and lie in [1, {next_n}]."
-        )
-    if atom > max_atom:
-        raise ValueError(
-            f"fp4_paged_mqa_logits: next_n_atom={atom} exceeds the maximum "
-            f"kernel next_n for this device ({max_atom}); an atom of 4 requires "
-            f"Rubin (SM107+). Pick a smaller atom that divides next_n={next_n}."
-        )
+    atom = (
+        next_n
+        if next_n <= max_atom
+        else max(a for a in range(1, max_atom + 1) if next_n % a == 0)
+    )
     num_atoms = next_n // atom
     exp_B = B * num_atoms
     N_atom = atom * H
@@ -1787,8 +1687,9 @@ def fp4_paged_mqa_logits(
                 f"SM107+), so the schedule must describe {exp_B} rows rather "
                 f"than {B}. A schedule_meta built from context_lens is silently "
                 f"wrong here and can hang the persistent kernel. Omit "
-                f"schedule_meta so it is computed correctly, or pass "
-                f"next_n_atom={next_n} on a device that supports it."
+                f"schedule_meta so it is computed correctly (this also holds "
+                f"under CUDA-graph capture), or run on a device whose TMEM "
+                f"holds next_n={next_n} in one atom (Rubin, SM107+)."
             )
         _validate_schedule_meta(schedule_meta, num_sms, q.device)
         _validate_schedule_meta_fresh(schedule_meta, sched_ctx, "fp4_paged_mqa_logits")
@@ -1933,11 +1834,10 @@ def precompile_paged_mqa_logits(
             # default; float32 is what a consumer binding logits as C float
             # needs, and without it that deployment still JITs on first request.
             fp4_outs = output_dtypes or (torch.bfloat16, torch.float32)
-            # next_n=4 compiles the decomposition the default policy would pick
-            # on this device: direct (one atom) where the TMEM holds it (Rubin),
-            # otherwise two atoms of 2 (Blackwell). Forced non-default splits
-            # (next_n_atom=...) are not warmed here; they are a benchmarking
-            # surface, not a deployment one.
+            # next_n=4 compiles the decomposition the fixed policy picks on
+            # this device: direct (one atom) where the TMEM holds it (Rubin),
+            # otherwise two atoms of 2 (Blackwell). No other decomposition is
+            # reachable through the API.
             _max_atom = _fp4_max_atom_for_device(device)
             for block_size in (32, 64, 128):
                 for nn in (1, 2, 3, 4):
