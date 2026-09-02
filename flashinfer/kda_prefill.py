@@ -215,6 +215,8 @@ class _CakeKDAAffineResources:
     map_out: torch.Tensor
     correction_out: torch.Tensor
     state_indices_i64: torch.Tensor
+    state_indices_source: torch.Tensor
+    state_indices_version: int
     split_cu_seqlens: torch.Tensor
     tail_cu_seqlens: torch.Tensor
     main_seq_order: torch.Tensor
@@ -1101,6 +1103,10 @@ def _select_cake_kda_affine_route(
         or beta_dtype != torch.bfloat16
         or not indexed_state
         or not (bounded_fp32 or unbounded_bf16)
+        # Cake's bounded affine source route uses the H12 scalar-beta physical
+        # schedule. Other bounded head counts retain their exact direct or
+        # persistent source route instead of sharing a mismatched cubin.
+        or (bounded_fp32 and num_heads != 12)
         or has_checkpoints
         or sm_count <= 0
     ):
@@ -1197,6 +1203,7 @@ def _cake_kda_affine_resources(
     affine_route: _CakeKDAAffineRoute,
     device: torch.device,
     num_heads: int,
+    state_indices: torch.Tensor,
     capturing: bool,
 ) -> _CakeKDAAffineResources:
     """Resolve stable metadata and scratch for the four-stage composite."""
@@ -1208,7 +1215,13 @@ def _cake_kda_affine_resources(
         num_heads=num_heads,
     )
     cached = workspace._cake_kda_affine_resources
-    if cached is not None and cached.key == key:
+    state_indices_version = state_indices._version
+    if (
+        cached is not None
+        and cached.key == key
+        and cached.state_indices_source is state_indices
+        and cached.state_indices_version == state_indices_version
+    ):
         return cached
     if capturing:
         raise RuntimeError(
@@ -1289,6 +1302,7 @@ def _cake_kda_affine_resources(
         "affine_correction_out_bf16", tail_value_shape, torch.bfloat16
     )
     state_indices_i64 = buffer("affine_state_indices_i64", (1,), torch.int64)
+    state_indices_i64.copy_(state_indices)
     empty_bf16 = buffer("affine_empty_bf16", (1,), torch.bfloat16)
     empty_f32 = buffer("affine_empty_f32", (1,), torch.float32)
     empty_i32 = buffer("affine_empty_i32", (1,), torch.int32)
@@ -1330,6 +1344,8 @@ def _cake_kda_affine_resources(
         map_out=map_out,
         correction_out=correction_out,
         state_indices_i64=state_indices_i64,
+        state_indices_source=state_indices,
+        state_indices_version=state_indices_version,
         split_cu_seqlens=split_cu_seqlens,
         tail_cu_seqlens=tail_cu_seqlens,
         main_seq_order=_identity_seq_order(device=device, num_sequences=num_parts),
@@ -1485,6 +1501,7 @@ def _run_cake_kda_affine_route(
         affine_route=affine_route,
         device=q.device,
         num_heads=num_heads,
+        state_indices=state_indices,
         capturing=capturing,
     )
     empty_bf16 = resources.empty_bf16
@@ -1503,7 +1520,15 @@ def _run_cake_kda_affine_route(
     k_tail = k_flat[resources.tail_start :].view_as(q_tail)
     g_tail = g_flat[resources.tail_start :].view_as(q_tail)
     beta_tail = beta_flat[resources.tail_start :].view(1, tail_tokens, num_heads)
-    main_beta_source = _cake_kda_beta_source(beta, workspace, chunk_tokens=32)
+    scalar_beta = (
+        affine_route.family == "bounded_fp32_affine_prefix" and num_heads == 12
+    )
+    main_beta_source = _cake_kda_beta_source(
+        beta,
+        workspace,
+        chunk_tokens=32,
+        refresh=not scalar_beta,
+    )
     compact_stride = num_heads * _FLASH_KDA_HEAD_DIM * _FLASH_KDA_HEAD_DIM
     external_state_is_fp32 = affine_route.external_state_dtype == torch.float32
 
@@ -1552,6 +1577,7 @@ def _run_cake_kda_affine_route(
         workspace,
         chunk_tokens=32,
         workspace_attribute="_cake_export_beta_tail_padding",
+        refresh=not scalar_beta,
     )
     map_args = _cake_kda_direct_export_args(
         q=q_tail,
@@ -1644,7 +1670,6 @@ def _run_cake_kda_affine_route(
     )
     if not external_state_is_fp32:
         resources.final_external.copy_(resources.final_compact)
-    resources.state_indices_i64.copy_(state_indices)
     final_state.index_copy_(0, resources.state_indices_i64, resources.final_external)
 
 
