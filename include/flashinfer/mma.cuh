@@ -205,6 +205,25 @@ __device__ __forceinline__ void stmatrix_m8n8x4(uint32_t* R, T* smem_ptr) {
 }
 
 /*!
+ * \brief Wrapper of PTX stmatrix m8n8.x4 transposed instruction, stores each 8x8
+ *   fragment to shared memory transposed (fragment rows become shared memory columns)
+ * \tparam T data type of the fragment
+ * \param R pointer to the fragment
+ * \param smem_ptr pointer to the shared memory
+ */
+template <typename T>
+__device__ __forceinline__ void stmatrix_m8n8x4_trans(uint32_t* R, T* smem_ptr) {
+#ifdef FLASHINFER_STMATRIX_M8N8X4_ENABLED
+  uint32_t smem_int_ptr = static_cast<uint32_t>(__cvta_generic_to_shared(smem_ptr));
+  asm volatile("stmatrix.sync.aligned.trans.m8n8.x4.shared.b16 [%0], {%1, %2, %3, %4};\n"
+               :
+               : "r"(smem_int_ptr), "r"(R[0]), "r"(R[1]), "r"(R[2]), "r"(R[3]));
+#else
+  FLASHINFER_RUNTIME_ASSERT("Unsupported CUDA architecture for stmatrix instruction");
+#endif
+}
+
+/*!
  * \brief Wrapper of two mma m16n8k32 instructions for row major and column major f8 matrix
  *   multiplication, accumulated in f32.
  * \tparam T data type of the fragment

@@ -144,6 +144,11 @@ struct smem_t {
     mma::stmatrix_m8n8x4(R, smem_ptr);
   }
 
+  __device__ __forceinline__ void stmatrix_m8n8x4_trans(uint32_t offset, uint32_t* R) {
+    b128_t* smem_ptr = base + offset;
+    mma::stmatrix_m8n8x4_trans(R, smem_ptr);
+  }
+
   __device__ __forceinline__ void ldmatrix_m8n8x4_trans(uint32_t offset, uint32_t* R) {
     b128_t* smem_ptr = base + offset;
     mma::ldmatrix_m8n8x4_trans(R, smem_ptr);

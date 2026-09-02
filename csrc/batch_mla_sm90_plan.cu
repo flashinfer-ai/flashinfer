@@ -28,7 +28,8 @@ using tvm::ffi::Tuple;
 Tuple<Array<int64_t>, int64_t> BatchMLAPagedAttentionSM90Plan(
     TensorView float_workspace_buffer, TensorView int_workspace_buffer,
     TensorView page_locked_int_workspace_buffer, TensorView qo_indptr, TensorView kv_indptr,
-    TensorView kv_len, int64_t num_heads, int64_t head_dim_o, bool causal) {
+    TensorView kv_len, int64_t num_heads, int64_t head_dim_o, bool causal, int64_t graph_num_blks_x,
+    int64_t graph_cta_tile_q) {
   size_t float_workspace_size_in_bytes =
       float_workspace_buffer.size(0) * get_element_size(float_workspace_buffer);
   size_t int_workspace_size_in_bytes =
@@ -47,7 +48,8 @@ Tuple<Array<int64_t>, int64_t> BatchMLAPagedAttentionSM90Plan(
       int_workspace_buffer.data_ptr(), page_locked_int_workspace_buffer.data_ptr(),
       int_workspace_size_in_bytes, plan_info, staged_int_workspace_bytes,
       static_cast<IdType*>(qo_indptr.data_ptr()), static_cast<IdType*>(kv_indptr.data_ptr()),
-      static_cast<IdType*>(kv_len.data_ptr()), batch_size, num_heads, head_dim_o, causal, stream);
+      static_cast<IdType*>(kv_len.data_ptr()), batch_size, num_heads, head_dim_o, causal,
+      /*min_cta_tile_q=*/16, graph_num_blks_x, graph_cta_tile_q, stream);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan MLA, error: " << cudaGetErrorString(status);

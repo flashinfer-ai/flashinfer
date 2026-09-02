@@ -527,6 +527,7 @@ class BatchMLAPagedAttentionWrapper:
 
         previous_backend = getattr(self, "_planned_backend", None)
         graph_plan_int_workspace_buffer = None
+        graph_plan_info = None
         if (
             self._use_cuda_graph
             and previous_backend is not None
@@ -534,6 +535,7 @@ class BatchMLAPagedAttentionWrapper:
             and getattr(previous_backend, "_backend", None) in ("fa2", "fa3")
         ):
             graph_plan_int_workspace_buffer = previous_backend._int_workspace_buffer
+            graph_plan_info = getattr(previous_backend, "_plan_info", None)
 
         backend_type = _BACKEND_TYPES[self._backend]
         planned_capabilities = backend_type._plan_capabilities
@@ -589,6 +591,7 @@ class BatchMLAPagedAttentionWrapper:
             _kv_indices_buf=self._kv_indices_buf,
             _kv_len_arr_buf=self._kv_len_arr_buf,
             _graph_plan_int_workspace_buffer=graph_plan_int_workspace_buffer,
+            _graph_plan_info=graph_plan_info,
         )
 
         # ---------------------------------------------------------------------------
