@@ -116,6 +116,14 @@ void qsa_pre_indexer(TensorView q, TensorView k, TensorView positions, TensorVie
   // table has to run one past the last of them.
   TVM_FFI_ICHECK_EQ(query_start_loc.size(0), state_block_table.size(0) + 1)
       << "query_start_loc runs one entry past the requests the ring table holds";
+  // A lane reads its slice of the norm weight by head_dim, unconditionally, so
+  // a shorter one is read past its end however contiguous it is.
+  TVM_FFI_ICHECK_EQ(q_norm_weight.numel(), head_dim) << "q_norm_weight is one weight per feature";
+  TVM_FFI_ICHECK_EQ(k_norm_weight.numel(), head_dim) << "k_norm_weight is one weight per feature";
+  // One ring block per request: the kernel reads the first entry of the row it
+  // is given, so a row of no entries reads off the table.
+  TVM_FFI_ICHECK_EQ(state_block_table.size(1), 1)
+      << "state_block_table holds one ring block per request";
 
   // Every half-width tensor is read through one pointer type.
   TVM_FFI_ICHECK_EQ(k.dtype(), q.dtype());
