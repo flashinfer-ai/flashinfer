@@ -42,6 +42,7 @@ Exit codes: 0 ok, 1 missing or invalid declaration (message on stderr).
 from __future__ import annotations
 
 import argparse
+import pathlib
 import re
 import sys
 
@@ -84,6 +85,23 @@ def parse(body: str) -> list[str]:
     return targets
 
 
+def check_exists(targets: list[str], repo_root: str) -> None:
+    """Verify each declared target exists. Raises ValueError listing what is missing.
+
+    A declared path that does not exist makes the lane collect nothing and pass,
+    which is a false green -- the most expensive way for this to fail, because it
+    looks like coverage.
+    """
+    root = pathlib.Path(repo_root)
+    missing = [t for t in targets if not (root / t.split("::", 1)[0]).exists()]
+    if missing:
+        raise ValueError(
+            "declared targets do not exist in the repo: "
+            + ", ".join(missing)
+            + " (a path that does not exist collects no tests and passes silently)"
+        )
+
+
 def _selftest() -> int:
     ok = [
         (
@@ -121,6 +139,28 @@ def _selftest() -> int:
         ("```\ntests/experimental/a.py\n```", "untagged fence"),
     ]
     failures = 0
+    # check_exists is covered separately: parse() is shape-only by design, so the
+    # synthetic bodies above name paths that do not exist.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        real = pathlib.Path(td) / ROOT
+        real.mkdir(parents=True)
+        (real / "test_real.py").write_text("")
+        try:
+            check_exists(
+                [f"{ROOT}test_real.py", f"{ROOT}test_real.py::test_x", ROOT], td
+            )
+        except ValueError as e:
+            print(f"FAIL (existing paths rejected): {e}", file=sys.stderr)
+            failures += 1
+        try:
+            check_exists([f"{ROOT}test_missing.py"], td)
+            print("FAIL (missing path accepted)", file=sys.stderr)
+            failures += 1
+        except ValueError:
+            pass
+
     for body, want in ok:
         try:
             got = parse(body)
@@ -150,6 +190,16 @@ def main() -> int:
         action="store_true",
         help="print targets space-separated as a TEST_PATH value for the CI scripts",
     )
+    ap.add_argument(
+        "--repo-root",
+        default=".",
+        help="repo root used to verify declared targets exist (default: cwd)",
+    )
+    ap.add_argument(
+        "--no-check-exists",
+        action="store_true",
+        help="skip the existence check (parsing/validation only)",
+    )
     ap.add_argument("--selftest", action="store_true")
     args = ap.parse_args()
 
@@ -162,6 +212,8 @@ def main() -> int:
         body = fh.read()
     try:
         targets = parse(body)
+        if not args.no_check_exists:
+            check_exists(targets, args.repo_root)
     except ValueError as e:
         print(f"experimental test scope: {e}", file=sys.stderr)
         return 1

@@ -162,6 +162,11 @@ jobs:
           SKIP_AOT: ${{ github.event.inputs.skip_aot }}
           SKIP_GPU: ${{ github.event.inputs.skip_gpu }}
           RUNTIME_CUDA_MATRIX: ${{ steps.cuda-versions.outputs.runtime }}
+          # PR body is attacker-controlled: it is passed through env and read from a
+          # file, never interpolated into the script text. See the experimental lane
+          # below.
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
           {
             if [ "$SKIP_AOT" != "true" ]; then
@@ -208,6 +213,37 @@ jobs:
                 script: "task_run_unit_tests.sh",
                 timeout: 480
               }'
+
+              # Experimental track: one extra H100 lane running only the targets the
+              # PR declares (see .github/pull_request_template.md). Additive - the
+              # lanes above are untouched, so a normal PR cannot be affected.
+              #
+              # The declared scope is validated by experimental_test_scope.py, which
+              # rejects paths outside tests/experimental/, path traversal and targets
+              # that do not exist in the checkout. A nonexistent path would otherwise
+              # collect nothing and pass, which looks like coverage.
+              #
+              # Trust: whether this PR's code (including its tests) may run on our
+              # runners is decided upstream, by the screening that gates the run-ci
+              # label. This step decides *scope*, not trust.
+              if jq -e 'index("experimental")' <<< "$PR_LABELS" > /dev/null 2>&1; then
+                printf '%s' "$PR_BODY" > /tmp/pr_body.md
+                if EXP_TEST_PATH=$(python3 scripts/pr_checks/experimental_test_scope.py \
+                      --body-file /tmp/pr_body.md --test-path 2>/tmp/exp_err); then
+                  jq -nc --arg test_path "$EXP_TEST_PATH" '{
+                    name: "Experimental Unittest (H100)",
+                    kind: "h100",
+                    runner: ["self-hosted", "linux", "x64", "gpu", "h100"],
+                    cuda: "cu129",
+                    script: "task_run_unit_tests.sh",
+                    test_path: $test_path,
+                    timeout: 480
+                  }'
+                else
+                  echo "::error::experimental PR without a valid test scope: $(cat /tmp/exp_err)" >&2
+                  exit 1
+                fi
+              fi
             fi
           } | jq -sc '{include: .}' > matrix.json
 
@@ -240,6 +276,9 @@ jobs:
       MATRIX_ARCH: ${{ matrix.runner[2] }}
       MATRIX_CUDA: ${{ matrix.cuda }}
       TEST_SCRIPT: ${{ matrix.script }}
+      # Empty for every lane except the experimental one. Quoted at the use site and
+      # never interpolated into script text - it originates from the PR body.
+      TEST_PATH_ARG: ${{ matrix.test_path }}
     steps:
       - name: Cleanup
         if: matrix.kind != 'h100'
@@ -351,7 +390,13 @@ jobs:
               exit 1
               ;;
           esac
-          bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}"
+          if [ -n "${TEST_PATH_ARG:-}" ]; then
+            # shellcheck disable=SC2086 - TEST_PATH_ARG is a validated, space-separated
+            # list of targets and must word-split into separate arguments.
+            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}" ${TEST_PATH_ARG}
+          else
+            bash ci/bash.sh "${DOCKER_IMAGE}" "./scripts/${TEST_SCRIPT}"
+          fi
 
       - name: Make JUnit XML readable
         if: ${{ always() && matrix.kind == 'h100' }}
