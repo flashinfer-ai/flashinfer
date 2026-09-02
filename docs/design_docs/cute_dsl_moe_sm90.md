@@ -238,7 +238,7 @@ The public API carries an `@flashinfer_api` trace template
 
 | tier | what | where |
 |---|---|---|
-| kernel + e2e unit | tiles/clusters/boundary tiles; bf16+fp16 e2e, auto-select, EP shards (incl. all-routed-outside-shard), autotune (tactic profiling and cached-winner recall), process-local compile reuse, deterministic mode (bitwise), CUDA-graph capture/replay, tiny/empty batch, fail-fast bad inputs | `tests/moe/test_cute_dsl_bf16_gather_grouped_gemm.py`, `test_cute_dsl_bf16_moe.py`, `test_sm90_moe_kernel_cache.py` |
+| kernel + e2e unit | tiles/clusters/boundary tiles; bf16+fp16 e2e, auto-select, EP shards (incl. all-routed-outside-shard), autotune (tactic profiling and cached-winner recall), process-local compile reuse, deterministic mode (bitwise), CUDA-graph capture/replay, tiny/empty batch, fail-fast bad inputs | `tests/moe/test_cute_dsl_bf16_gather_grouped_gemm.py`, `test_cute_dsl_bf16_grouped_gemm_finalize.py`, `test_cute_dsl_bf16_moe.py` |
 
 ## 8. Performance
 

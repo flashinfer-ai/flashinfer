@@ -25,7 +25,7 @@ import cutlass
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 
-from ...cute_dsl.utils import get_max_active_clusters, get_num_sm, make_ptr
+from ...cute_dsl.utils import get_max_active_clusters, make_ptr
 from ...utils import get_compute_capability
 from .hopper.contiguous_gather_grouped_gemm_act_fusion import (
     Sm90ContiguousGatherGroupedGemmActFusionKernel,
@@ -153,7 +153,6 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
     tile_shape_mn: Tuple[int, int] = (128, 128),
     cluster_shape_mn: Tuple[int, int] = (1, 1),
     raster_along_m: bool = False,
-    sm_count: Optional[int] = None,
     enable_pdl: bool = True,
 ) -> torch.Tensor:
     """MoE GEMM1 on SM90: gather + grouped GEMM + SiLU-gating, bf16/fp16.
@@ -222,12 +221,14 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
     ab_dtype = TORCH_TO_CUTLASS_DTYPE[x.dtype]
     if out is None:
         out = torch.empty(permuted_m, n // 2, dtype=x.dtype, device=x.device)
+    elif out.shape != (permuted_m, n // 2):
+        raise ValueError(f"out shape {tuple(out.shape)} != ({permuted_m}, {n // 2})")
+    elif not out.is_contiguous() or out.device != x.device:
+        raise ValueError("out must be a contiguous tensor on x's device")
     c_dtype = TORCH_TO_CUTLASS_DTYPE[out.dtype]
 
     if cluster_shape_mn == (2, 1) and (permuted_m // tile_shape_mn[0]) % 2 != 0:
         cluster_shape_mn = (1, 1)  # odd M-tile count cannot pair
-    if sm_count is None:
-        sm_count = get_num_sm(x.device)
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )

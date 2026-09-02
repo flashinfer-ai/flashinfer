@@ -23,7 +23,7 @@ Three kernels per MoE layer:
 Design doc: docs/design_docs/cute_dsl_moe_sm90.md.
 """
 
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -63,17 +63,20 @@ class _CudaGraphResources(NamedTuple):
 
 
 # Created lazily during warmup, before CUDA-graph capture, and reused for the
-# process lifetime.
-_cuda_graph_resources: Optional[_CudaGraphResources] = None
+# process lifetime (one set per device — streams bind to their creation
+# device, so a process driving multiple GPUs needs distinct sets).
+_cuda_graph_resources: Dict[int, _CudaGraphResources] = {}
 
 
-def _get_cuda_graph_resources() -> _CudaGraphResources:
-    global _cuda_graph_resources
-    if _cuda_graph_resources is None:
-        _cuda_graph_resources = _CudaGraphResources(
-            torch.cuda.Stream(), torch.cuda.Event(), torch.cuda.Event()
-        )
-    return _cuda_graph_resources
+def _get_cuda_graph_resources(device: torch.device) -> _CudaGraphResources:
+    resources = _cuda_graph_resources.get(device.index)
+    if resources is None:
+        with torch.cuda.device(device):
+            resources = _CudaGraphResources(
+                torch.cuda.Stream(), torch.cuda.Event(), torch.cuda.Event()
+            )
+        _cuda_graph_resources[device.index] = resources
+    return resources
 
 
 def _moe_core_impl(
@@ -225,7 +228,7 @@ def _moe_core_impl(
         moe_output = torch.empty(num_tokens, hidden, dtype=x.dtype, device=x.device)
     main_stream = torch.cuda.current_stream()
     if use_fused_finalize:
-        aux_stream, main_event, memset_event = _get_cuda_graph_resources()
+        aux_stream, main_event, memset_event = _get_cuda_graph_resources(x.device)
         # Fork/join via events only. Tensor.record_stream is illegal during
         # CUDA-graph capture and redundant here: the join orders later
         # main-stream reuse of moe_output after the auxiliary-stream write.
