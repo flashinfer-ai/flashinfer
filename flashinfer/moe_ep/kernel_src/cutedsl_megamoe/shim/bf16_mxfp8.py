@@ -135,10 +135,17 @@ class MegaMoEBf16Mxfp8Frontend:
 
     def apply_knobs(self, knobs: dict) -> None:
         """Apply mixed MegaMoE tuning knobs and invalidate the compiled kernel."""
-        from .tuner import is_valid_bf16_mxfp8_for_config, with_knobs
+        from .tuner import (
+            describe_invalid_knobs,
+            is_valid_bf16_mxfp8_for_config,
+            with_knobs,
+        )
 
         if not is_valid_bf16_mxfp8_for_config(self.config, knobs):
-            raise ValueError(f"unsupported mixed MegaMoE knobs: {knobs}.")
+            raise ValueError(
+                f"unsupported mixed MegaMoE knobs {knobs}: "
+                f"{describe_invalid_knobs(self.config, knobs, is_valid_bf16_mxfp8_for_config)}."
+            )
         new_config = with_knobs(self._config, knobs)
         if new_config != self._config:
             ensure_not_capturing("apply_knobs (config change)")
@@ -429,11 +436,21 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
         token_back_mode=token_back_mode,
     )
     if knobs:
-        from .tuner import is_valid_bf16_mxfp8_for_config, with_knobs
+        from .tuner import (
+            describe_invalid_knobs,
+            is_valid_bf16_mxfp8_for_config,
+            warn_if_knobs_override_session,
+            with_knobs,
+        )
 
         if not is_valid_bf16_mxfp8_for_config(config, knobs):
-            raise ValueError(f"unsupported mixed MegaMoE knobs: {knobs}.")
-        config = with_knobs(config, knobs)
+            raise ValueError(
+                f"unsupported mixed MegaMoE knobs {knobs}: "
+                f"{describe_invalid_knobs(config, knobs, is_valid_bf16_mxfp8_for_config)}."
+            )
+        pinned = with_knobs(config, knobs)
+        warn_if_knobs_override_session(config, pinned, what="mixed MegaMoE")
+        config = pinned
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)

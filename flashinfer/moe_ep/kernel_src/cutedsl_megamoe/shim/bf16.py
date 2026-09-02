@@ -121,10 +121,13 @@ class MegaMoEBf16Frontend:
 
     def apply_knobs(self, knobs: dict) -> None:
         """Apply a validated BF16 tuning configuration and invalidate its compile."""
-        from .tuner import is_valid_bf16_for_config, with_knobs
+        from .tuner import describe_invalid_knobs, is_valid_bf16_for_config, with_knobs
 
         if not is_valid_bf16_for_config(self.config, knobs):
-            raise ValueError(f"unsupported BF16 MegaMoE knobs: {knobs}.")
+            raise ValueError(
+                f"unsupported BF16 MegaMoE knobs {knobs}: "
+                f"{describe_invalid_knobs(self.config, knobs, is_valid_bf16_for_config)}."
+            )
         new_config = with_knobs(self.config, knobs)
         if new_config != self._config:
             ensure_not_capturing("apply_knobs (config change)")
@@ -434,11 +437,21 @@ def get_symm_buffer_for_bf16_mega_moe(
         token_back_mode=token_back_mode,
     )
     if knobs:
-        from .tuner import is_valid_bf16_for_config, with_knobs
+        from .tuner import (
+            describe_invalid_knobs,
+            is_valid_bf16_for_config,
+            warn_if_knobs_override_session,
+            with_knobs,
+        )
 
         if not is_valid_bf16_for_config(cfg, knobs):
-            raise ValueError(f"unsupported BF16 MegaMoE knobs: {knobs}.")
-        cfg = with_knobs(cfg, knobs)
+            raise ValueError(
+                f"unsupported BF16 MegaMoE knobs {knobs}: "
+                f"{describe_invalid_knobs(cfg, knobs, is_valid_bf16_for_config)}."
+            )
+        pinned = with_knobs(cfg, knobs)
+        warn_if_knobs_override_session(cfg, pinned, what="BF16 MegaMoE")
+        cfg = pinned
     x = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
     topk_idx = sym_zeros((num_max_tokens, num_topk), torch.int64)
     topk_idx.fill_(-1)
