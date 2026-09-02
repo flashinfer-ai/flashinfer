@@ -1552,9 +1552,13 @@ class BlockSparseAttentionWrapper:
         q : torch.Tensor
             The query tensor with shape ``(M, num_qo_heads, head_dim)``.
         k : torch.Tensor
-            The key tensor with shape ``(N, num_kv_heads, head_dim)``.
+            The key tensor with shape ``(N, num_kv_heads, head_dim)``, or, when
+            ``plan`` was given ``kv_cache_page_size``, a paged cache with shape
+            ``(num_pages, page_size, num_kv_heads, head_dim)`` in NHD layout or
+            ``(num_pages, num_kv_heads, page_size, head_dim)`` in HND. The route
+            indexes it by entry and the wrapper resolves the page.
         v : torch.Tensor
-            The value tensor with shape ``(N, num_kv_heads, head_dim)``.
+            The value tensor, laid out as ``k``.
         scale_q : Optional[torch.Tensor]
             The scale tensor for query, per-head quantization with shape: ``[num_qo_heads]``.
             Used with FP8 Quantization. If not provided, will be set to ``1.0``.
