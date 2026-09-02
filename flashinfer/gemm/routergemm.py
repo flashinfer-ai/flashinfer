@@ -84,7 +84,7 @@ def _router_gemm_shape_checks(
 
 
 # TODO: other compute capabilities may be supported but are untested
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([90, 100, 103, 107])
 def _mm_M1_16_K7168_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _router_gemm_shape_checks(
         mat_a,
@@ -98,7 +98,7 @@ def _mm_M1_16_K7168_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
 
 
 # TODO: other compute capabilities may be supported but are untested
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([90, 100, 103, 107])
 def _mm_M1_16_K7168_N128_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _router_gemm_shape_checks(
         mat_a,
@@ -112,7 +112,7 @@ def _mm_M1_16_K7168_N128_shape_checks(mat_a, mat_b, out, launch_with_pdl):
 
 
 # TODO: other compute capabilities may be supported but are untested
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([90, 100, 103, 107])
 def _mm_M1_16_K6144_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
     return _router_gemm_shape_checks(
         mat_a,
@@ -122,6 +122,76 @@ def _mm_M1_16_K6144_N256_shape_checks(mat_a, mat_b, out, launch_with_pdl):
         expected_hidden_dim=6144,
         expected_num_experts=256,
         expected_out_dtype=torch.float32,
+    )
+
+
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([90, 100, 103, 107])
+def _mm_M1_16_K7168_N256_bf16_shape_checks(mat_a, mat_b, out, launch_with_pdl):
+    return _router_gemm_shape_checks(
+        mat_a,
+        mat_b,
+        out,
+        launch_with_pdl,
+        expected_hidden_dim=7168,
+        expected_num_experts=256,
+        expected_out_dtype=torch.bfloat16,
+    )
+
+
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([90, 100, 103, 107])
+def _mm_M1_16_K7168_N384_shape_checks(mat_a, mat_b, out, launch_with_pdl):
+    return _router_gemm_shape_checks(
+        mat_a,
+        mat_b,
+        out,
+        launch_with_pdl,
+        expected_hidden_dim=7168,
+        expected_num_experts=384,
+        expected_out_dtype=torch.float32,
+    )
+
+
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([90, 100, 103, 107])
+def _mm_M1_16_K7168_N384_bf16_shape_checks(mat_a, mat_b, out, launch_with_pdl):
+    return _router_gemm_shape_checks(
+        mat_a,
+        mat_b,
+        out,
+        launch_with_pdl,
+        expected_hidden_dim=7168,
+        expected_num_experts=384,
+        expected_out_dtype=torch.bfloat16,
+    )
+
+
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([90, 100, 103, 107])
+def _mm_M1_16_K7168_N896_shape_checks(mat_a, mat_b, out, launch_with_pdl):
+    return _router_gemm_shape_checks(
+        mat_a,
+        mat_b,
+        out,
+        launch_with_pdl,
+        expected_hidden_dim=7168,
+        expected_num_experts=896,
+        expected_out_dtype=torch.float32,
+    )
+
+
+# TODO: other compute capabilities may be supported but are untested
+@supported_compute_capability([90, 100, 103, 107])
+def _mm_M1_16_K7168_N896_bf16_shape_checks(mat_a, mat_b, out, launch_with_pdl):
+    return _router_gemm_shape_checks(
+        mat_a,
+        mat_b,
+        out,
+        launch_with_pdl,
+        expected_hidden_dim=7168,
+        expected_num_experts=896,
+        expected_out_dtype=torch.bfloat16,
     )
 
 
@@ -165,10 +235,75 @@ def get_dsv3_router_gemm_module():
     ) -> None:
         module.glm_dsa_router_gemm_op(mat_a, mat_b, out, launch_with_pdl)
 
+    @register_custom_op(
+        "flashinfer::dsv3_bf16_router_gemm_op",
+        mutates_args=["out"],
+    )
+    def mm_M1_16_K7168_N256_bf16(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        out: torch.Tensor,
+        launch_with_pdl: bool = True,
+    ) -> None:
+        module.dsv3_bf16_router_gemm_op(mat_a, mat_b, out, launch_with_pdl)
+
+    @register_custom_op(
+        "flashinfer::kimi_k2_router_gemm_op",
+        mutates_args=["out"],
+    )
+    def mm_M1_16_K7168_N384(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        out: torch.Tensor,
+        launch_with_pdl: bool = True,
+    ) -> None:
+        module.kimi_k2_router_gemm_op(mat_a, mat_b, out, launch_with_pdl)
+
+    @register_custom_op(
+        "flashinfer::kimi_k2_bf16_router_gemm_op",
+        mutates_args=["out"],
+    )
+    def mm_M1_16_K7168_N384_bf16(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        out: torch.Tensor,
+        launch_with_pdl: bool = True,
+    ) -> None:
+        module.kimi_k2_bf16_router_gemm_op(mat_a, mat_b, out, launch_with_pdl)
+
+    @register_custom_op(
+        "flashinfer::kimi_k3_router_gemm_op",
+        mutates_args=["out"],
+    )
+    def mm_M1_16_K7168_N896(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        out: torch.Tensor,
+        launch_with_pdl: bool = True,
+    ) -> None:
+        module.kimi_k3_router_gemm_op(mat_a, mat_b, out, launch_with_pdl)
+
+    @register_custom_op(
+        "flashinfer::kimi_k3_bf16_router_gemm_op",
+        mutates_args=["out"],
+    )
+    def mm_M1_16_K7168_N896_bf16(
+        mat_a: torch.Tensor,
+        mat_b: torch.Tensor,
+        out: torch.Tensor,
+        launch_with_pdl: bool = True,
+    ) -> None:
+        module.kimi_k3_bf16_router_gemm_op(mat_a, mat_b, out, launch_with_pdl)
+
     return SimpleNamespace(
         mm_M1_16_K7168_N128=mm_M1_16_K7168_N128,
         mm_M1_16_K7168_N256=mm_M1_16_K7168_N256,
         mm_M1_16_K6144_N256=mm_M1_16_K6144_N256,
+        mm_M1_16_K7168_N256_bf16=mm_M1_16_K7168_N256_bf16,
+        mm_M1_16_K7168_N384=mm_M1_16_K7168_N384,
+        mm_M1_16_K7168_N384_bf16=mm_M1_16_K7168_N384_bf16,
+        mm_M1_16_K7168_N896=mm_M1_16_K7168_N896,
+        mm_M1_16_K7168_N896_bf16=mm_M1_16_K7168_N896_bf16,
     )
 
 
@@ -362,6 +497,250 @@ def mm_M1_16_K6144_N256(
     expected GLM-MoE-DSA configuration.
     """
     get_router_gemm_module(backend="cake").mm_M1_16_K6144_N256(
+        mat_a, mat_b, out, launch_with_pdl
+    )
+
+
+@backend_requirement({}, common_check=_mm_M1_16_K7168_N256_bf16_shape_checks)
+@flashinfer_api
+def mm_M1_16_K7168_N256_bf16(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    out: torch.Tensor,
+    launch_with_pdl: bool = True,
+) -> None:
+    r"""Optimized GEMM for the router operation in DeepSeek-V3.
+
+    Performs a highly optimized matrix multiplication specifically tailored
+    for the expert routing GEMM in DeepSeek-V3's Mixture-of-Experts (MoE)
+    architecture.  Computes ``out = mat_a @ mat_b`` where ``mat_a`` is a
+    small batch of token embeddings (1-16 rows) and ``mat_b`` is the expert
+    routing weight matrix.  Specialized for the dimensions used in
+    DeepSeek-V3 MoE (``K = 7168``, ``N = 256``).
+
+    Produces bfloat16 router logits (as opposed to the float32 produced by
+    :func:`mm_M1_16_K7168_N256`).
+
+    Parameters
+    ----------
+    mat_a : torch.Tensor
+        Input token embeddings of shape ``(M, K)`` where ``M`` is the number of
+        tokens (1-16) and ``K`` is the hidden dimension (7168).  Must be bfloat16,
+        row-major (contiguous).
+    mat_b : torch.Tensor
+        Expert routing weights of shape ``(K, N)`` where ``N`` is the number of
+        experts (256).  Must be bfloat16, column-major (transposed layout).
+    out : torch.Tensor
+        Pre-allocated output tensor of shape ``(M, N)`` containing the routing
+        scores.  Must be bfloat16, row-major (contiguous).  Mutated in place.
+    launch_with_pdl : bool
+        Whether to launch the kernel using Programmatic Dependent Launch.
+        Defaults to ``True``.
+
+    Notes
+    -----
+    Requires SM90 (Hopper) or newer.  The specialized problem-size
+    optimization makes this significantly faster than general-purpose GEMM
+    implementations for the router op, for small token counts; past roughly
+    4-8 tokens (shape dependent) a general-purpose GEMM is faster.  Raises
+    ``ValueError`` if tensor dimensions, strides, or dtypes do not match the
+    expected DeepSeek-V3 router configuration.
+    """
+    get_dsv3_router_gemm_module().mm_M1_16_K7168_N256_bf16(
+        mat_a, mat_b, out, launch_with_pdl
+    )
+
+
+@backend_requirement({}, common_check=_mm_M1_16_K7168_N384_shape_checks)
+@flashinfer_api
+def mm_M1_16_K7168_N384(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    out: torch.Tensor,
+    launch_with_pdl: bool = True,
+) -> None:
+    r"""Optimized GEMM for the router operation in Kimi-K2.
+
+    Performs a highly optimized matrix multiplication specifically tailored
+    for the expert routing GEMM in the Kimi-K2 family's (K2/K2.5/K2.6) Mixture-of-Experts (MoE)
+    architecture.  Computes ``out = mat_a @ mat_b`` where ``mat_a`` is a
+    small batch of token embeddings (1-16 rows) and ``mat_b`` is the expert
+    routing weight matrix.  Specialized for the dimensions used in
+    Kimi-K2 MoE (``K = 7168``, ``N = 384``).
+
+    Parameters
+    ----------
+    mat_a : torch.Tensor
+        Input token embeddings of shape ``(M, K)`` where ``M`` is the number of
+        tokens (1-16) and ``K`` is the hidden dimension (7168).  Must be bfloat16,
+        row-major (contiguous).
+    mat_b : torch.Tensor
+        Expert routing weights of shape ``(K, N)`` where ``N`` is the number of
+        experts (384).  Must be bfloat16, column-major (transposed layout).
+    out : torch.Tensor
+        Pre-allocated output tensor of shape ``(M, N)`` containing the routing
+        scores.  Must be float32, row-major (contiguous).  Mutated in place.
+    launch_with_pdl : bool
+        Whether to launch the kernel using Programmatic Dependent Launch.
+        Defaults to ``True``.
+
+    Notes
+    -----
+    Requires SM90 (Hopper) or newer.  The specialized problem-size
+    optimization makes this significantly faster than general-purpose GEMM
+    implementations for the router op, for small token counts; past roughly
+    4-8 tokens (shape dependent) a general-purpose GEMM is faster.  Raises
+    ``ValueError`` if tensor dimensions, strides, or dtypes do not match the
+    expected Kimi-K2 router configuration.
+    """
+    get_dsv3_router_gemm_module().mm_M1_16_K7168_N384(
+        mat_a, mat_b, out, launch_with_pdl
+    )
+
+
+@backend_requirement({}, common_check=_mm_M1_16_K7168_N384_bf16_shape_checks)
+@flashinfer_api
+def mm_M1_16_K7168_N384_bf16(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    out: torch.Tensor,
+    launch_with_pdl: bool = True,
+) -> None:
+    r"""Optimized GEMM for the router operation in Kimi-K2.
+
+    Performs a highly optimized matrix multiplication specifically tailored
+    for the expert routing GEMM in the Kimi-K2 family's (K2/K2.5/K2.6) Mixture-of-Experts (MoE)
+    architecture.  Computes ``out = mat_a @ mat_b`` where ``mat_a`` is a
+    small batch of token embeddings (1-16 rows) and ``mat_b`` is the expert
+    routing weight matrix.  Specialized for the dimensions used in
+    Kimi-K2 MoE (``K = 7168``, ``N = 384``).
+
+    Produces bfloat16 router logits (as opposed to the float32 produced by
+    :func:`mm_M1_16_K7168_N384`).
+
+    Parameters
+    ----------
+    mat_a : torch.Tensor
+        Input token embeddings of shape ``(M, K)`` where ``M`` is the number of
+        tokens (1-16) and ``K`` is the hidden dimension (7168).  Must be bfloat16,
+        row-major (contiguous).
+    mat_b : torch.Tensor
+        Expert routing weights of shape ``(K, N)`` where ``N`` is the number of
+        experts (384).  Must be bfloat16, column-major (transposed layout).
+    out : torch.Tensor
+        Pre-allocated output tensor of shape ``(M, N)`` containing the routing
+        scores.  Must be bfloat16, row-major (contiguous).  Mutated in place.
+    launch_with_pdl : bool
+        Whether to launch the kernel using Programmatic Dependent Launch.
+        Defaults to ``True``.
+
+    Notes
+    -----
+    Requires SM90 (Hopper) or newer.  The specialized problem-size
+    optimization makes this significantly faster than general-purpose GEMM
+    implementations for the router op, for small token counts; past roughly
+    4-8 tokens (shape dependent) a general-purpose GEMM is faster.  Raises
+    ``ValueError`` if tensor dimensions, strides, or dtypes do not match the
+    expected Kimi-K2 router configuration.
+    """
+    get_dsv3_router_gemm_module().mm_M1_16_K7168_N384_bf16(
+        mat_a, mat_b, out, launch_with_pdl
+    )
+
+
+@backend_requirement({}, common_check=_mm_M1_16_K7168_N896_shape_checks)
+@flashinfer_api
+def mm_M1_16_K7168_N896(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    out: torch.Tensor,
+    launch_with_pdl: bool = True,
+) -> None:
+    r"""Optimized GEMM for the router operation in Kimi-K3.
+
+    Performs a highly optimized matrix multiplication specifically tailored
+    for the expert routing GEMM in Kimi-K3's Mixture-of-Experts (MoE)
+    architecture.  Computes ``out = mat_a @ mat_b`` where ``mat_a`` is a
+    small batch of token embeddings (1-16 rows) and ``mat_b`` is the expert
+    routing weight matrix.  Specialized for the dimensions used in
+    Kimi-K3 MoE (``K = 7168``, ``N = 896``).
+
+    Parameters
+    ----------
+    mat_a : torch.Tensor
+        Input token embeddings of shape ``(M, K)`` where ``M`` is the number of
+        tokens (1-16) and ``K`` is the hidden dimension (7168).  Must be bfloat16,
+        row-major (contiguous).
+    mat_b : torch.Tensor
+        Expert routing weights of shape ``(K, N)`` where ``N`` is the number of
+        experts (896).  Must be bfloat16, column-major (transposed layout).
+    out : torch.Tensor
+        Pre-allocated output tensor of shape ``(M, N)`` containing the routing
+        scores.  Must be float32, row-major (contiguous).  Mutated in place.
+    launch_with_pdl : bool
+        Whether to launch the kernel using Programmatic Dependent Launch.
+        Defaults to ``True``.
+
+    Notes
+    -----
+    Requires SM90 (Hopper) or newer.  The specialized problem-size
+    optimization makes this significantly faster than general-purpose GEMM
+    implementations for the router op, for small token counts; past roughly
+    4-8 tokens (shape dependent) a general-purpose GEMM is faster.  Raises
+    ``ValueError`` if tensor dimensions, strides, or dtypes do not match the
+    expected Kimi-K3 router configuration.
+    """
+    get_dsv3_router_gemm_module().mm_M1_16_K7168_N896(
+        mat_a, mat_b, out, launch_with_pdl
+    )
+
+
+@backend_requirement({}, common_check=_mm_M1_16_K7168_N896_bf16_shape_checks)
+@flashinfer_api
+def mm_M1_16_K7168_N896_bf16(
+    mat_a: torch.Tensor,
+    mat_b: torch.Tensor,
+    out: torch.Tensor,
+    launch_with_pdl: bool = True,
+) -> None:
+    r"""Optimized GEMM for the router operation in Kimi-K3.
+
+    Performs a highly optimized matrix multiplication specifically tailored
+    for the expert routing GEMM in Kimi-K3's Mixture-of-Experts (MoE)
+    architecture.  Computes ``out = mat_a @ mat_b`` where ``mat_a`` is a
+    small batch of token embeddings (1-16 rows) and ``mat_b`` is the expert
+    routing weight matrix.  Specialized for the dimensions used in
+    Kimi-K3 MoE (``K = 7168``, ``N = 896``).
+
+    Produces bfloat16 router logits (as opposed to the float32 produced by
+    :func:`mm_M1_16_K7168_N896`).
+
+    Parameters
+    ----------
+    mat_a : torch.Tensor
+        Input token embeddings of shape ``(M, K)`` where ``M`` is the number of
+        tokens (1-16) and ``K`` is the hidden dimension (7168).  Must be bfloat16,
+        row-major (contiguous).
+    mat_b : torch.Tensor
+        Expert routing weights of shape ``(K, N)`` where ``N`` is the number of
+        experts (896).  Must be bfloat16, column-major (transposed layout).
+    out : torch.Tensor
+        Pre-allocated output tensor of shape ``(M, N)`` containing the routing
+        scores.  Must be bfloat16, row-major (contiguous).  Mutated in place.
+    launch_with_pdl : bool
+        Whether to launch the kernel using Programmatic Dependent Launch.
+        Defaults to ``True``.
+
+    Notes
+    -----
+    Requires SM90 (Hopper) or newer.  The specialized problem-size
+    optimization makes this significantly faster than general-purpose GEMM
+    implementations for the router op, for small token counts; past roughly
+    4-8 tokens (shape dependent) a general-purpose GEMM is faster.  Raises
+    ``ValueError`` if tensor dimensions, strides, or dtypes do not match the
+    expected Kimi-K3 router configuration.
+    """
+    get_dsv3_router_gemm_module().mm_M1_16_K7168_N896_bf16(
         mat_a, mat_b, out, launch_with_pdl
     )
 
