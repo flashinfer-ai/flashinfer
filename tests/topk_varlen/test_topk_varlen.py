@@ -1259,6 +1259,64 @@ def test_backend_heuristic_priority():
         "radix",
     ]
     assert order(["radix_cutlass"], torch.float32, 1, 4096) == ["radix_cutlass"]
+
+    # radix_filter admission (auto-vs-oracle study, PR #4811): hint-free fp32
+    # from 32K columns up, except the single-row case at >= 512K, and at every
+    # N once B >= 256 (ahead of the fp32 radix_cutlass corner).
+    hf = ["radix_cutlass", "radix", "radix_filter"]
+    assert order(hf, torch.float32, 16, 32768) == [
+        "radix_filter",
+        "radix",
+        "radix_cutlass",
+    ]
+    assert order(hf, torch.float32, 16, 8192) == ["radix", "radix_cutlass"]
+    assert order(hf, torch.float32, 1, 65536) == [
+        "radix_filter",
+        "radix",
+        "radix_cutlass",
+    ]
+    assert order(hf, torch.float32, 1, 524288) == ["radix", "radix_cutlass"]
+    assert order(hf, torch.float32, 256, 8192) == [
+        "radix_filter",
+        "radix",
+        "radix_cutlass",
+    ]
+    assert order(hf, torch.float32, 256, 131072) == [
+        "radix_filter",
+        "radix_cutlass",
+        "radix",
+    ]
+    # fp32 with a hint but gvr_2 unsuitable: radix_filter ranks ahead of gvr.
+    assert order(hf + ["gvr"], torch.float32, 64, 131072)[:2] == ["radix_filter", "gvr"]
+    # half precision: gvr only for B >= 256 with 32K-512K columns (the old
+    # B*N >= 2^23 rule picked it at B=16 x 2M, a 7x loss to radix); radix_filter
+    # in the mid band for small batches and from 128K up for B >= 64.
+    hh = ["gvr", "radix", "radix_cutlass", "radix_filter"]
+    assert order(hh, torch.bfloat16, 16, 2097152) == ["radix", "gvr", "radix_cutlass"]
+    assert order(hh, torch.bfloat16, 256, 131072) == [
+        "gvr",
+        "radix_filter",
+        "radix",
+        "radix_cutlass",
+    ]
+    assert order(hh, torch.bfloat16, 256, 32768) == ["gvr", "radix", "radix_cutlass"]
+    assert order(hh, torch.bfloat16, 64, 524288) == [
+        "radix_filter",
+        "radix",
+        "gvr",
+        "radix_cutlass",
+    ]
+    assert order(hf, torch.float16, 16, 65536) == [
+        "radix_filter",
+        "radix",
+        "radix_cutlass",
+    ]
+    assert order(hf, torch.bfloat16, 64, 8192) == ["radix", "radix_cutlass"]
+    assert order(hf, torch.bfloat16, 256, 8192) == [
+        "radix_filter",
+        "radix",
+        "radix_cutlass",
+    ]
     # None tensors (skip_check / doc examples): static fallback order.
     assert _top_k_varlen_heuristic(all4, None, None, None) == [
         "gvr_2",

@@ -39,14 +39,18 @@ Backend choices
 ``"radix_filter"``   — filtered-radix (coarse histogram → filter → on-chip
                        refine); hint-free like ``"radix"``, large-N specialist.
                        Datacentre Blackwell-class (sm_100/103/107) only;
-                       requires nvidia-cutlass-dsl >= 4.8 (see below);
-                       opt-in — never chosen by ``"auto"``.
+                       requires nvidia-cutlass-dsl >= 4.8 (see below).
+                       ``"auto"`` admits it in the measured large-N regions
+                       (see ``_top_k_varlen_heuristic``); a ``pre_idx`` is
+                       accepted and ignored (the kernel takes no hint).
 ``"auto"``           — shape/dtype-aware ranking that tracks the measured
                        per-config winner (see ``_top_k_varlen_heuristic``):
-                       gvr_2 for hinted fp32; gvr only for large hinted
-                       batches of long rows; radix otherwise, with
-                       radix_cutlass preferred in its fp32 big-batch/long-row
-                       corner and as the universal fallback.
+                       gvr_2 for hinted fp32; radix_filter for hint-free
+                       fp32 from 32K columns up and for the mid/large bf16 and
+                       fp16 regions; gvr only for large hinted batches of
+                       mid/long rows; radix otherwise, with radix_cutlass
+                       preferred in its fp32 big-batch/long-row corner and as
+                       the universal fallback.
 """
 
 import functools
@@ -287,6 +291,27 @@ def _top_k_varlen_heuristic(
        fp32 big corner (N >= 65536 AND B*N >= 2^23, by up to 2.8x); radix
        wins everywhere else, and always wins for bf16/fp16 (1.2-3.2x).
 
+    Refined by the auto-vs-oracle study (B100/B200 and Rubin; N 8K..1M,
+    K in {1024, 2048}, fp32/bf16, hinted and hint-free, uniform/mixed/short
+    lengths, CUDA-graph timing; PR #4811, section 7), which measured auto's
+    efficiency = best-of-all / auto per cell:
+
+    4. radix_filter is admitted ahead of radix/radix_cutlass where it was the
+       fastest hint-free backend on SM100 (hint-free fp32 efficiency
+       0.83 -> ~0.98, bf16 0.86 -> ~0.97):
+         fp32: N >= 32K, except the single-row case at N >= 512K (radix
+               wins there); and every N once B >= 256;
+         half: 32K <= N <= 128K for B <= 16; N >= 128K for B >= 64;
+               N <= 8K for B >= 256.
+       One rule for every arch: radix_filter's margins are larger on SM107,
+       so the SM100 crossover is conservative there.
+    5. gvr (V1) for half precision only when B >= 256 and 32K <= N <= 512K
+       (it beats radix/radix_filter there by 1.1-1.4x); the previous
+       B*N >= 2^23 rule picked it at B <= 64 for N >= 512K, where it loses
+       1.5-7x to radix. The fp32 gvr rule (B*N >= 2^22) is unchanged and
+       only matters when gvr_2 is unsuitable; radix_filter ranks ahead of
+       gvr there (1.2-3x faster in fp32).
+
     Known static blind spot: batches whose rows are mostly FAR shorter than
     N (detectable only by reading seq_lens contents — a D2H sync auto must
     not pay) favor radix over gvr_2 at large N; callers in that regime
@@ -298,19 +323,11 @@ def _top_k_varlen_heuristic(
     Tolerates logits/seq_lens=None (hardware-independent unit tests) by
     falling back to a static order.
     """
-    # "radix_filter" is deliberately absent: its checker accepts a strict
-    # subset of radix's configurations and its CC list is a subset of
-    # radix's, so listed after radix it could never be chosen (a dead
-    # entry), and listed before radix it would regress the small-row and
-    # small-batch regions where radix wins. Making it auto-selectable needs
-    # a shape/architecture-aware crossover rule (it wins at large N --
-    # roughly N >= 64K with enough rows on SM100, wider on SM107); until
-    # that rule exists it is explicit-only, as documented in the module
-    # docstring.
     if logits is None or seq_lens is None or logits.dim() != 2 or seq_lens.dim() != 1:
-        # None / malformed tensors: static fallback order. Malformed shapes
-        # must fall through so the API's own validation asserts fire (the
-        # heuristic must never be the thing that rejects bad input).
+        # None / malformed tensors: static fallback order (no shape to justify
+        # radix_filter, so it stays out). Malformed shapes must fall through
+        # so the API's own validation asserts fire (the heuristic must never
+        # be the thing that rejects bad input).
         order = ["gvr_2", "gvr", "radix", "radix_cutlass"]
         return [b for b in order if b in suitable_backends]
 
@@ -318,12 +335,31 @@ def _top_k_varlen_heuristic(
     n_cols = logits.shape[1]
     batch = seq_lens.shape[0]
     elems = batch * n_cols
-    gvr_first = elems >= ((1 << 22) if fp32 else (1 << 23))
+    if fp32:
+        rf_first = batch >= 256 or (n_cols >= 32768 and (batch > 1 or n_cols <= 131072))
+        gvr_first = elems >= (1 << 22)
+    else:
+        rf_first = (
+            (batch <= 16 and 32768 <= n_cols <= 131072)
+            or (batch >= 64 and n_cols >= 131072)
+            or (batch >= 256 and n_cols <= 8192)
+        )
+        gvr_first = batch >= 256 and 32768 <= n_cols <= 524288
     cutlass_first = fp32 and n_cols >= 65536 and elems >= (1 << 23)
 
     order = ["gvr_2"]
-    if gvr_first:
-        order.append("gvr")
+    if fp32:
+        # radix_filter beats gvr in every measured fp32 cell (1.2-3x)
+        if rf_first:
+            order.append("radix_filter")
+        if gvr_first:
+            order.append("gvr")
+    else:
+        # in its half-precision window gvr edges radix_filter (B=256, 32K-512K)
+        if gvr_first:
+            order.append("gvr")
+        if rf_first:
+            order.append("radix_filter")
     if cutlass_first:
         order += ["radix_cutlass", "radix"]
     else:
@@ -1216,17 +1252,18 @@ def _radix_filter_top_k_varlen_check(
 ):
     """Return True only when the vendored DKG kernel covers this configuration.
 
-    Upstream's decode wrapper has no ``compress_ratio`` and no ``pre_idx``
-    parameter at all, so those are hard exclusions rather than tuning knobs --
-    returning False here makes an explicit ``backend="radix_filter"`` call fail
-    at backend validation instead of silently ignoring the argument or failing
-    deep inside the kernel constructor.
+    Upstream's decode wrapper has no ``compress_ratio`` parameter, so that is
+    a hard exclusion rather than a tuning knob -- returning False here makes
+    an explicit ``backend="radix_filter"`` call fail at backend validation
+    instead of failing deep inside the kernel constructor. A ``pre_idx`` is
+    accepted and ignored, exactly as ``radix`` and ``radix_cutlass`` treat it:
+    the hint is optional steering for the GVR family, never a correctness
+    input, so a hinted caller can use (or be routed by ``auto`` to) any
+    hint-free backend.
     """
     if not _cute_dsl_ready(logits.device):
         return False
     if not _radix_filter_kernel_dsl_ok():
-        return False
-    if pre_idx is not None:
         return False
     # Vendored kernel bound: FilteredTopKKernelVarlen rejects top_k outside
     # [1, 16384]; enforce it here so the failure is a backend-validation error.
@@ -1348,10 +1385,15 @@ def top_k_varlen(
 
     Backend selection
     -----------------
-    ``backend="auto"`` (default) chooses GVR when available (Blackwell +
-    ``pre_idx`` supplied), else the CuTe DSL ``radix`` backend on Blackwell,
-    else the ``radix_cutlass`` masked fallback.  Force a specific backend with
-    ``backend="radix"``, ``backend="gvr"``, or ``backend="radix_cutlass"``.
+    ``backend="auto"`` (default) ranks the backends that can run the call by
+    shape and dtype (see ``_top_k_varlen_heuristic``): ``gvr_2`` for hinted
+    fp32 on datacentre Blackwell-class GPUs, ``radix_filter`` in the
+    measured large-N regions, ``gvr`` for large hinted half-precision
+    batches of mid-length rows, otherwise the CuTe DSL ``radix`` backend on
+    Blackwell, with the ``radix_cutlass`` masked fallback in its fp32 big
+    corner and on every other GPU.  Force a specific backend with
+    ``backend="radix"``, ``"gvr"``, ``"gvr_2"``, ``"radix_filter"`` or
+    ``"radix_cutlass"``.
 
     Parameters
     ----------
@@ -1392,7 +1434,7 @@ def top_k_varlen(
     out_values : torch.Tensor, optional
         Pre-allocated values buffer (same dtype as ``logits``).
         Only used when ``return_values=True``.
-    backend : {"radix", "gvr", "gvr_2", "radix_cutlass", "auto"}, optional
+    backend : {"radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "auto"}, optional
         Backend to use.  Default ``"auto"``.
 
         ``"radix"``         — CuTe DSL single-pass multi-CTA radix top-K
@@ -1425,16 +1467,31 @@ def top_k_varlen(
                               implementation-specific.
         ``"radix_cutlass"`` — Masked CUTLASS radix top-K (all GPUs, no
                               ``pre_idx`` needed).
+        ``"radix_filter"``  — DKG filtered-radix top-K (coarse histogram →
+                              filter → on-chip refine): hint-free like
+                              ``"radix"``, fp32/fp16/bf16, ``top_k`` in
+                              [1, 16384], ``compress_ratio == 1`` only,
+                              row-relative indices only (no fused page-table
+                              transform, nondeterministic ties). Datacentre
+                              Blackwell-class (sm_100/103/107); requires
+                              nvidia-cutlass-dsl >= 4.8. ``pre_idx`` is
+                              accepted and ignored (the kernel takes no
+                              hint), as for ``"radix"`` and
+                              ``"radix_cutlass"``.
         ``"auto"``          — shape/dtype-aware selection tracking the
                               measured per-config winner: gvr_2 for hinted
-                              fp32; gvr only when ``batch * max_seq_len`` is
-                              large (>= 2^22 fp32 / 2^23 half precision);
-                              radix otherwise, with radix_cutlass preferred
-                              in its fp32 big-batch/long-row corner. Batches
-                              whose rows are mostly far shorter than
-                              ``max_seq_len`` are a known blind spot (auto
-                              cannot read ``seq_lens`` without a sync);
-                              prefer ``backend="radix"`` there.
+                              fp32; radix_filter for hint-free fp32 from 32K
+                              columns up (all N once ``batch >= 256``) and
+                              for the bf16/fp16 mid/large regions; gvr for
+                              fp32 when ``batch * max_seq_len >= 2^22`` and
+                              for half precision only when ``batch >= 256``
+                              with 32K-512K columns; radix otherwise, with
+                              radix_cutlass preferred in its fp32
+                              big-batch/long-row corner. Batches whose rows
+                              are mostly far shorter than ``max_seq_len`` are
+                              a known blind spot (auto cannot read
+                              ``seq_lens`` without a sync); prefer
+                              ``backend="radix"`` there.
     load_balance : bool, optional
         Selects the GVR kernel path (ignored by the radix backend).  Default
         ``True``.
