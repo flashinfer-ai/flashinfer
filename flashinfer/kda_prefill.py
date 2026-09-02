@@ -4667,7 +4667,14 @@ def _run_flash_kda_prefill(
             )
     use_bt16 = route == _FLASH_KDA_ROUTE_BT16_M64
     use_tensor_state_decay = (
-        state_indices is None
+        (
+            state_indices is None
+            or (
+                use_cake_export
+                and initial_state is not None
+                and initial_state.dtype == torch.float32
+            )
+        )
         and checkpoint_every_n_tokens == 0
         and _should_use_n32_tensor_state_decay(
             compute_capability=compute_capability,
@@ -5183,8 +5190,11 @@ def _run_flash_kda_prefill(
                         "the exported bounded Cake serving portfolio requires "
                         "FP32 indexed state without checkpoints"
                     )
-                cake_beta_source = _cake_kda_beta_source(
-                    beta, workspace, chunk_tokens=32
+                cake_beta_tma = (
+                    beta_tma
+                    if variant
+                    in {"m128_h12_short", "m128_h12_long", "m128_n16"}
+                    else _cake_kda_beta_source(beta, workspace, chunk_tokens=32)
                 )
                 launched = _run_cake_kda_fp32_serving_export(
                     target=shared_target,
@@ -5194,8 +5204,8 @@ def _run_flash_kda_prefill(
                     k=k,
                     v=v,
                     g=g,
-                    beta=cake_beta_source,
-                    beta_tma=cake_beta_source,
+                    beta=beta,
+                    beta_tma=cake_beta_tma,
                     A_log=A_log,
                     dt_bias=dt_bias,
                     cu_seqlens=cu_seqlens_i64,
