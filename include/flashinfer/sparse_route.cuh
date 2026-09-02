@@ -100,12 +100,26 @@ __global__ void __launch_bounds__(THREADS)
   if (row >= rows || tile_base >= output_width) return;
 
   // Every column of this row shares them, so they are read once per block.
-  const int32_t query_position = static_cast<int32_t>(query_positions[row]);
-  const int32_t request = static_cast<int32_t>(token_to_req[row]);
-  const bool request_valid = request >= 0 && request < static_cast<int32_t>(num_requests);
-  const int32_t safe_request = min(max(request, 0), static_cast<int32_t>(num_requests) - 1);
-  const int32_t sequence_length =
-      request_valid ? static_cast<int32_t>(sequence_lengths[safe_request]) : 0;
+  // The index tensors may be int64 and everything below is int32, so each value
+  // is bounded in its own width before it is narrowed. The request is already
+  // compared against its count in IdType, which rejects anything an int32 could
+  // not hold; the position and the length are not bounded from above by
+  // anything else, and a value of exactly 2^32 narrows to zero. The bound is
+  // written out for all three so the next one cannot regress quietly.
+  constexpr IdType kInt32Max = static_cast<IdType>(2147483647);
+  const IdType position_raw = query_positions[row];
+  const int32_t query_position = (position_raw >= IdType(0) && position_raw <= kInt32Max)
+                                     ? static_cast<int32_t>(position_raw)
+                                     : -1;
+  const IdType request_raw = token_to_req[row];
+  const bool request_valid = request_raw >= IdType(0) && request_raw <= kInt32Max &&
+                             request_raw < static_cast<IdType>(num_requests);
+  const int32_t request = request_valid ? static_cast<int32_t>(request_raw) : -1;
+  const int32_t safe_request =
+      request_valid ? min(request, static_cast<int32_t>(num_requests) - 1) : 0;
+  IdType length_raw = request_valid ? sequence_lengths[safe_request] : IdType(0);
+  if (length_raw < IdType(0) || length_raw > kInt32Max) length_raw = IdType(0);
+  const int32_t sequence_length = static_cast<int32_t>(length_raw);
 
   // Blocks entirely in the past, capped by what the selector produced.
   // One past the last block the query has entirely behind it. A selection is
@@ -135,7 +149,9 @@ __global__ void __launch_bounds__(THREADS)
     if (column < expanded_count) {
       const int32_t rank = column / static_cast<int32_t>(COMPRESS_RATIO);
       const int32_t offset = column - rank * static_cast<int32_t>(COMPRESS_RATIO);
-      const int32_t block = static_cast<int32_t>(row_blocks[rank * blocks_stride]);
+      const IdType block_raw = row_blocks[rank * blocks_stride];
+      const int32_t block =
+          (block_raw >= IdType(0) && block_raw <= kInt32Max) ? static_cast<int32_t>(block_raw) : -1;
       token = block * static_cast<int32_t>(COMPRESS_RATIO) + offset;
       // The whole block, not the token: keeping only the seen half of a block
       // the query sits in would repeat exactly what the tail appends.
@@ -191,12 +207,26 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
   const uint32_t tile_base = blockIdx.x * TILE;
   if (row >= rows || tile_base >= output_width) return;
 
-  const int32_t query_position = static_cast<int32_t>(query_positions[row]);
-  const int32_t request = static_cast<int32_t>(token_to_req[row]);
-  const bool request_valid = request >= 0 && request < static_cast<int32_t>(num_requests);
-  const int32_t safe_request = min(max(request, 0), static_cast<int32_t>(num_requests) - 1);
-  const int32_t sequence_length =
-      request_valid ? static_cast<int32_t>(sequence_lengths[safe_request]) : 0;
+  // The index tensors may be int64 and everything below is int32, so each value
+  // is bounded in its own width before it is narrowed. The request is already
+  // compared against its count in IdType, which rejects anything an int32 could
+  // not hold; the position and the length are not bounded from above by
+  // anything else, and a value of exactly 2^32 narrows to zero. The bound is
+  // written out for all three so the next one cannot regress quietly.
+  constexpr IdType kInt32Max = static_cast<IdType>(2147483647);
+  const IdType position_raw = query_positions[row];
+  const int32_t query_position = (position_raw >= IdType(0) && position_raw <= kInt32Max)
+                                     ? static_cast<int32_t>(position_raw)
+                                     : -1;
+  const IdType request_raw = token_to_req[row];
+  const bool request_valid = request_raw >= IdType(0) && request_raw <= kInt32Max &&
+                             request_raw < static_cast<IdType>(num_requests);
+  const int32_t request = request_valid ? static_cast<int32_t>(request_raw) : -1;
+  const int32_t safe_request =
+      request_valid ? min(request, static_cast<int32_t>(num_requests) - 1) : 0;
+  IdType length_raw = request_valid ? sequence_lengths[safe_request] : IdType(0);
+  if (length_raw < IdType(0) || length_raw > kInt32Max) length_raw = IdType(0);
+  const int32_t sequence_length = static_cast<int32_t>(length_raw);
 
   // One past the last block the query has entirely behind it. A selection is
   // only expandable while it names one of these: the block the query sits in
@@ -232,7 +262,10 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
       if (column < expanded_count) {
         const int32_t rank = column / static_cast<int32_t>(COMPRESS_RATIO);
         const int32_t offset = column - rank * static_cast<int32_t>(COMPRESS_RATIO);
-        const int32_t block = static_cast<int32_t>(row_blocks[rank * blocks_stride]);
+        const IdType block_raw = row_blocks[rank * blocks_stride];
+        const int32_t block = (block_raw >= IdType(0) && block_raw <= kInt32Max)
+                                  ? static_cast<int32_t>(block_raw)
+                                  : -1;
         token = block * static_cast<int32_t>(COMPRESS_RATIO) + offset;
         // Same whole-block rule as the standalone expansion above.
         valid = block >= 0 && block < past_blocks;
