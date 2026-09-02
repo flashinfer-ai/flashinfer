@@ -442,3 +442,29 @@ def test_scores_reject_a_compress_ratio_that_is_not_a_uint32():
             q.shape[2] ** 0.5,
             num_columns=columns,
         )
+
+
+@requires_cuda_sm80
+@pytest.mark.parametrize(
+    "field", ["token_to_req", "positions", "seq_lens", "visible_blocks"]
+)
+def test_scores_reject_a_per_row_index_with_a_second_axis(field):
+    """A row of each of these is one entry. A second axis passes a contiguity
+    check and a size(0) equality, and the kernel then reads the flattened
+    buffer -- scoring against the wrong request and writing the wrong row."""
+    q, k_cache, table, t2r, pos, lens = _scores_case()
+    columns = table.shape[1] * k_cache.shape[1]
+    rows = q.shape[0]
+    kwargs = dict(num_columns=columns)
+    if field == "token_to_req":
+        t2r = t2r.reshape(rows, 1).repeat(1, 2).contiguous()
+    elif field == "positions":
+        pos = pos.reshape(rows, 1).repeat(1, 2).contiguous()
+    elif field == "seq_lens":
+        lens = lens.reshape(1, 1).repeat(1, 2).contiguous()
+    else:
+        kwargs["visible_blocks"] = torch.empty(rows, 2, dtype=table.dtype, device=DEV)
+    with pytest.raises(Exception, match="has one axis"):
+        flashinfer.sparse_paged_scores(
+            q, k_cache, table, t2r, pos, lens, 1, q.shape[2] ** 0.5, **kwargs
+        )

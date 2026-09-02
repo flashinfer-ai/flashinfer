@@ -64,6 +64,17 @@ void sparse_paged_scores(TensorView q, TensorView k_cache, TensorView page_table
   // A page holds at least one entry: the kernel divides a column by this to
   // reach its page, and a cache with no pages at all is still a page size.
   TVM_FFI_ICHECK_GT(k_cache.size(1), 0) << "a page holds at least one entry";
+  // Checked here rather than read back out of a cudaErrorInvalidValue: the
+  // launch returns that for a bad grid or a rejected shared-memory size too,
+  // and blaming the head count for those points at the wrong input.
+  TVM_FFI_ICHECK_LE(num_heads, 16)
+      << "unsupported query head count " << num_heads << "; expected at most 16";
+  // A row of each of these is one entry per row, so a second axis would be
+  // read as more rows and score against the wrong request.
+  TVM_FFI_ICHECK_EQ(token_to_req.ndim(), 1) << "token_to_req has one axis";
+  TVM_FFI_ICHECK_EQ(query_positions.ndim(), 1) << "query_positions has one axis";
+  TVM_FFI_ICHECK_EQ(sequence_lengths.ndim(), 1) << "sequence_lengths has one axis";
+  TVM_FFI_ICHECK_EQ(visible_blocks.ndim(), 1) << "visible_blocks has one axis";
   TVM_FFI_ICHECK_EQ(logits.size(0), rows);
   TVM_FFI_ICHECK_EQ(token_to_req.size(0), rows);
   TVM_FFI_ICHECK_EQ(query_positions.size(0), rows);
@@ -118,8 +129,6 @@ void sparse_paged_scores(TensorView q, TensorView k_cache, TensorView page_table
           TVM_FFI_ICHECK(false) << "unsupported head_dim " << head_dim
                                 << "; expected 64, 128, 192 or 256";
       }
-      TVM_FFI_ICHECK(status != cudaErrorInvalidValue)
-          << "unsupported query head count " << num_heads << "; expected at most 16";
       TVM_FFI_ICHECK(status == cudaSuccess)
           << "SparsePagedScores failed: " << cudaGetErrorString(status);
       return true;
