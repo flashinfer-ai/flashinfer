@@ -70,6 +70,7 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 import torch
+from filelock import FileLock
 
 logger = logging.getLogger(__name__)
 
@@ -489,6 +490,12 @@ def calibrate(
     """
     if family not in _BYTES_PER_TOKEN:
         raise ValueError(f"unknown sparse-MLA family {family!r}")
+    if torch.cuda.is_current_stream_capturing():
+        # Capture-fatal: calibration synchronizes, empties the cache, and
+        # allocates GiB-scale pools.
+        raise CalibrationError(
+            "sparse-MLA SM120 calibration must not run under CUDA graph capture"
+        )
     from ._sparse_mla_sm120_plan import (
         _MODEL_TYPE_DSV3_2,
         _MODEL_TYPE_GLM53_NOPE,
@@ -667,6 +674,12 @@ def calibrate_crossover(
     )
 
     device = torch.device(device)
+    if torch.cuda.is_current_stream_capturing():
+        # Same capture-fatal profile as calibrate().
+        raise CalibrationError(
+            "sparse-MLA SM120 crossover calibration must not run under CUDA "
+            "graph capture"
+        )
     grid: Optional[list[tuple[int, int]]] = (
         sorted(grid_override) if grid_override is not None else None
     )
@@ -908,17 +921,21 @@ def save_constants(device: torch.device, family: str, c: CpbConstants) -> None:
     global _cache_mtime, _constants_version
     key = (_device_key(device), family)
     path = default_cache_path()
-    payload = _read_payload_for_merge(path)
-    if not isinstance(payload.get("devices"), dict):
-        payload["devices"] = {}
-    if not isinstance(payload["devices"].get(key[0]), dict):
-        payload["devices"][key[0]] = {}
-    payload["devices"][key[0]][family] = asdict(c)
+    # Serialize the read-modify-write across processes (multi-GPU tuning saves
+    # sibling device keys into the same file); reads stay lock-free because
+    # the write is an atomic replace.
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n")
-        os.replace(tmp, path)
+        with FileLock(str(path.with_name(path.name + ".lock"))):
+            payload = _read_payload_for_merge(path)
+            if not isinstance(payload.get("devices"), dict):
+                payload["devices"] = {}
+            if not isinstance(payload["devices"].get(key[0]), dict):
+                payload["devices"][key[0]] = {}
+            payload["devices"][key[0]][family] = asdict(c)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2) + "\n")
+            os.replace(tmp, path)
     except OSError as e:
         logger.warning(
             "SM120 sparse-MLA cpb constants not persisted to %s (%s); "
@@ -926,6 +943,7 @@ def save_constants(device: torch.device, family: str, c: CpbConstants) -> None:
             path,
             e,
         )
+        payload = {"devices": {}}
     # Publish the whole merged document, not only the family just saved: the
     # merge may have carried on-disk sibling entries written by other
     # processes, and _cache_mtime now asserts we hold the file's content.
@@ -958,21 +976,23 @@ def save_crossover(device: torch.device, table: dict[str, int]) -> None:
     global _cache_mtime, _constants_version
     dev_key = _device_key(device)
     path = default_cache_path()
-    payload = _read_payload_for_merge(path)
-    if not isinstance(payload.get("devices"), dict):
-        payload["devices"] = {}
-    dev = payload["devices"].setdefault(dev_key, {})
-    if not isinstance(dev, dict):
-        dev = payload["devices"][dev_key] = {}
-    xo = dev.setdefault(_DECODE_MAX_TOKENS_KEY, {})
-    if not isinstance(xo, dict):
-        xo = dev[_DECODE_MAX_TOKENS_KEY] = {}
-    xo.update(table)
+    # Same cross-process serialization as save_constants.
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2) + "\n")
-        os.replace(tmp, path)
+        with FileLock(str(path.with_name(path.name + ".lock"))):
+            payload = _read_payload_for_merge(path)
+            if not isinstance(payload.get("devices"), dict):
+                payload["devices"] = {}
+            dev = payload["devices"].setdefault(dev_key, {})
+            if not isinstance(dev, dict):
+                dev = payload["devices"][dev_key] = {}
+            xo = dev.setdefault(_DECODE_MAX_TOKENS_KEY, {})
+            if not isinstance(xo, dict):
+                xo = dev[_DECODE_MAX_TOKENS_KEY] = {}
+            xo.update(table)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2) + "\n")
+            os.replace(tmp, path)
     except OSError as e:
         logger.warning(
             "SM120 sparse-MLA crossover table not persisted to %s (%s); "
@@ -980,6 +1000,7 @@ def save_crossover(device: torch.device, table: dict[str, int]) -> None:
             path,
             e,
         )
+        payload = {"devices": {}}
     # Same sibling-entry reasoning as save_constants.
     try:
         new_constants, new_crossover = _parse_payload_devices(payload["devices"])
@@ -1161,6 +1182,11 @@ def calibrate_sparse_mla_sm120(
     unconditionally on every startup warmup. ``force=True`` re-measures even
     present entries — the escape hatch after a kernel upgrade changes the
     measured optimum.
+
+    Calibration also runs lazily on the first decode call under
+    ``autotune(tuning_mode=True)`` when entries are absent;
+    ``autotune(..., skip_ops={"sparse_mla_sm120"})`` opts out of those
+    passes. Neither entry point may run under CUDA graph capture.
 
     Measure on an idle GPU (the protocol is timing-sensitive), and calibrate
     per machine — the constants are device-local. A full default sweep (all

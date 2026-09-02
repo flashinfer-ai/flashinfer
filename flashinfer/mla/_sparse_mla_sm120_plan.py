@@ -435,9 +435,16 @@ def _resolve_cpb(
     """Model-picked chunks_per_block; -1 selects the C++ heuristic fallback."""
     cpb_family = _CPB_FAMILY_ALIAS.get(family, family)
     c = _cpb.get_constants(device, cpb_family)
+    tuner = AutoTuner.get()
+    tuning = tuner.is_tuning_mode
+    # autotune(skip_ops={"sparse_mla_sm120"}) opts out of the multi-second
+    # calibration passes too, not only of choose_one.
+    skip_stack = tuner._get_skip_ops_stack()
+    skipped = bool(skip_stack) and "sparse_mla_sm120" in skip_stack[-1]
     if (
         c is None
-        and AutoTuner.get().is_tuning_mode
+        and tuning
+        and not skipped
         and not _cpb.is_calibration_failed(device, cpb_family)
     ):
         from ._sparse_mla_sm120 import _get_sparse_mla_sm120_decode_module
@@ -456,7 +463,8 @@ def _resolve_cpb(
             _cpb.save_constants(device, cpb_family, c)
     if (
         c is not None
-        and AutoTuner.get().is_tuning_mode
+        and tuning
+        and not skipped
         and not _cpb.is_crossover_failed(device, family)
         and not _cpb.crossover_grid_complete(device, family)
     ):

@@ -793,3 +793,68 @@ def test_public_calibrate_report_type_is_public(clean_cpb_state) -> None:
         flashinfer.mla.SparseMLASm120CalibrationReport
         is SparseMLASm120CalibrationReport
     )
+
+
+def test_calibration_refused_under_graph_capture(monkeypatch) -> None:
+    """Calibration synchronizes and allocates GiB-scale pools; under CUDA
+    graph capture it must refuse loudly instead of corrupting the capture."""
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    with pytest.raises(cpb_mod.CalibrationError, match="capture"):
+        cpb_mod.calibrate(None, "dsv4", torch.device("cuda"))
+    with pytest.raises(cpb_mod.CalibrationError, match="capture"):
+        cpb_mod.calibrate_crossover(None, torch.device("cuda"), "dsv4", _C)
+
+
+@requires_sm12x
+def test_tuning_calibration_honors_skip_ops(clean_cpb_state, monkeypatch) -> None:
+    """autotune(skip_ops={"sparse_mla_sm120"}) opts out of the lazy
+    calibration passes, not only of choose_one."""
+    from flashinfer.autotuner import autotune
+    from flashinfer.mla import _sparse_mla_sm120 as sm
+
+    device = torch.device("cuda")
+    num_tokens, num_heads, topk = 2, 64, 512
+    d_qk, d_v = 512, 512
+    num_splits = -(-topk // 64)
+
+    kv_cache = torch.empty(256, 64 * 584, dtype=torch.uint8, device=device)
+    q = torch.randn(num_tokens, num_heads, d_qk, device=device).to(torch.bfloat16)
+    indices = torch.randint(
+        0, kv_cache.shape[0] * 64, (num_tokens, topk), dtype=torch.int32, device=device
+    )
+    mid_out = torch.empty(
+        num_tokens, num_heads, num_splits, d_v, dtype=torch.bfloat16, device=device
+    )
+    mid_lse = torch.empty(
+        num_tokens, num_heads, num_splits, dtype=torch.float32, device=device
+    )
+    output = torch.empty(
+        num_tokens, num_heads, d_v, dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device=device)
+
+    seen = {}
+
+    def fake_calibrate(module_getter, family, dev):
+        seen["calibrate"] = family
+        return _C
+
+    def fake_calibrate_crossover(module, dev, family, c):
+        seen["calibrate_crossover"] = family
+        return {}
+
+    monkeypatch.setattr(cpb_mod, "calibrate", fake_calibrate)
+    monkeypatch.setattr(cpb_mod, "calibrate_crossover", fake_calibrate_crossover)
+
+    def call() -> None:
+        sm.sparse_mla_sm120_decode_dsv4(
+            q, kv_cache, indices, mid_out, mid_lse, output, out_lse, d_qk**-0.5
+        )
+
+    with autotune(True, skip_ops={"sparse_mla_sm120"}):
+        call()
+    assert seen == {}
+
+    with autotune(True):
+        call()
+    assert seen == {"calibrate": "dsv4", "calibrate_crossover": "dsv4"}
