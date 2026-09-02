@@ -339,6 +339,10 @@ class TllmGenFmhaKernel {
     return meta.mFp16Softmax;
   }
 
+  // Existing metadata headers use semantic mFp16Softmax/mUsesSpcompress names, while the current
+  // public-release exporter intentionally calls the same stable ABI slots mReserved1/mReserved2.
+  // No header version macro distinguishes the layouts, so prefer semantic names when present and
+  // retain this field-presence fallback until all supported public artifacts use one spelling.
   template <typename Meta>
   static auto getFp16Softmax(Meta const& meta, long) -> decltype(meta.mReserved1) {
     return meta.mReserved1;
@@ -663,10 +667,12 @@ class TllmGenFmhaKernel {
           int const targetMaxNumCtasPerSeqKv =
               std::min(maxNumCtasPerSeqKv, std::min(maxKvSplitsPerCgaCluster, residentSplitBudget));
           if (targetMaxNumCtasPerSeqKv > 1 && targetMaxNumCtasPerSeqKv < maxNumCtasPerSeqKv) {
+            int const leftReachKv =
+                params.mLeftSlidingWindow >= 0 ? params.mLeftSlidingWindow + 1 : maxAttentionWindow;
             int const targetTileSizePerCtaKv =
-                isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType)
-                    ? flashinfer::ceil_div(params.mLeftSlidingWindow + 1,
-                                           targetMaxNumCtasPerSeqKv - 1)
+                isSlidingOrChunkedCausalMask(selectKernelParams.mMaskType) &&
+                        params.mLeftSlidingWindow >= 0
+                    ? flashinfer::ceil_div(leftReachKv, targetMaxNumCtasPerSeqKv - 1)
                     : flashinfer::ceil_div(maxAttentionWindow, targetMaxNumCtasPerSeqKv);
             if (targetTileSizePerCtaKv <= 1024) {
               tunedMaxNumCtasPerSeqKv = targetMaxNumCtasPerSeqKv;

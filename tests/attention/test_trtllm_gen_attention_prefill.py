@@ -960,7 +960,7 @@ def test_trtllm_batch_prefill_two_sided_window(window_left: int, window_right: i
     )
 
 
-def test_trtllm_batch_prefill_window_validation():
+def test_trtllm_batch_prefill_window_validation(monkeypatch):
     _skip_if_not_blackwell()
     query = torch.empty((2, 2, 128), dtype=torch.bfloat16, device=GPU_DEVICE)
     kv_cache = torch.empty((1, 2, 2, 16, 128), dtype=torch.bfloat16, device=GPU_DEVICE)
@@ -1005,6 +1005,67 @@ def test_trtllm_batch_prefill_window_validation():
     with pytest.raises(ValueError, match="requires window_right >= 0"):
         flashinfer.prefill.trtllm_batch_context_with_kv_cache(
             **common, causal=False, window_left=1
+        )
+    with pytest.raises(ValueError, match="right-only"):
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            **common, causal=False, window_right=1
+        )
+
+    monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
+    with pytest.raises(ValueError, match="must be >= 0"):
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            **common,
+            variable_window_token_starts=torch.tensor(
+                [-1, 0], dtype=torch.int32, device=GPU_DEVICE
+            ),
+            variable_window_token_ends=ends,
+        )
+    with pytest.raises(ValueError, match="must be <="):
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            **common,
+            variable_window_token_starts=torch.tensor(
+                [1, 0], dtype=torch.int32, device=GPU_DEVICE
+            ),
+            variable_window_token_ends=torch.tensor(
+                [0, 1], dtype=torch.int32, device=GPU_DEVICE
+            ),
+        )
+    with pytest.raises(ValueError, match="nondecreasing"):
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            **common,
+            variable_window_token_starts=torch.tensor(
+                [1, 0], dtype=torch.int32, device=GPU_DEVICE
+            ),
+            variable_window_token_ends=ends,
+        )
+    with pytest.raises(ValueError, match="exceed seq_len"):
+        flashinfer.prefill.trtllm_batch_context_with_kv_cache(
+            **common,
+            variable_window_token_starts=starts,
+            variable_window_token_ends=torch.tensor(
+                [0, 2], dtype=torch.int32, device=GPU_DEVICE
+            ),
+        )
+
+
+def test_trtllm_batch_prefill_wrapper_rejects_noncausal_sliding_window():
+    _skip_if_not_blackwell()
+    workspace = torch.empty(1 << 20, dtype=torch.uint8, device=GPU_DEVICE)
+    wrapper = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
+        workspace, "HND", backend="trtllm-gen"
+    )
+    with pytest.raises(NotImplementedError, match="non-causal"):
+        wrapper.plan(
+            torch.tensor([0, 2], dtype=torch.int32, device=GPU_DEVICE),
+            torch.tensor([0, 1], dtype=torch.int32, device=GPU_DEVICE),
+            torch.tensor([0], dtype=torch.int32, device=GPU_DEVICE),
+            torch.tensor([2], dtype=torch.int32, device=GPU_DEVICE),
+            num_qo_heads=2,
+            num_kv_heads=2,
+            head_dim_qk=128,
+            page_size=16,
+            causal=False,
+            window_left=1,
         )
 
 

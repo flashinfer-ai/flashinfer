@@ -64,6 +64,24 @@ inline size_t getTrtllmGenMultiCtasKvCounterBytes(int64_t batch_size, int64_t nu
   return num_semaphores * sizeof(uint32_t);
 }
 
+inline void validateTrtllmGenWindowConfig(bool is_causal, int64_t window_left, int64_t window_right,
+                                          bool has_variable_window) {
+  TVM_FFI_CHECK(window_left >= -1 && window_right >= -1,
+                "window_left and window_right must be at least -1");
+  if (has_variable_window) {
+    TVM_FFI_CHECK(window_left == -1 && window_right == -1,
+                  "VariableWindow cannot be combined with fixed window bounds");
+    return;
+  }
+  if (is_causal) {
+    TVM_FFI_CHECK(window_right == -1 || window_right == 0,
+                  "causal attention requires window_right to be -1 or 0");
+  } else {
+    TVM_FFI_CHECK((window_left == -1) == (window_right == -1),
+                  "non-causal fixed-window attention requires both window bounds to be >= 0");
+  }
+}
+
 class TllmGenFmhaRunnerCache {
  public:
   using Key = std::tuple<Data_type, Data_type, Data_type, Data_type, int, int, int, int>;
@@ -124,6 +142,11 @@ void trtllm_paged_attention_launcher(
     int64_t v_sf_stride_heads, int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens,
     int64_t lse_stride_heads, int64_t bf16q_fp8kv_transform_mode, bool use_fp16_softmax,
     bool uses_spcompress, cudaStream_t stream) {
+  TVM_FFI_CHECK(
+      (variable_window_token_starts == nullptr) == (variable_window_token_ends == nullptr),
+      "variable window starts and ends must be provided together");
+  validateTrtllmGenWindowConfig(is_causal, window_left, window_right,
+                                variable_window_token_starts != nullptr);
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -195,6 +218,8 @@ void trtllm_paged_attention_launcher(
   runner_params.mScaleSfO = o_sf_scale;
   TVM_FFI_ICHECK(o_sf_vec_size == 16 || o_sf_vec_size == -1)
       << "Only support o_sf_vec_size == 16 or -1(not used)";
+  // FlashInfer does not expose chunked attention; zero disables it. The downstream chunked paths
+  // remain for parity with upstream TRT-LLM.
   runner_params.mChunkedAttentionSize = 0;
   runner_params.mLeftSlidingWindow = window_left;
   runner_params.mRightSlidingWindow = window_right;
@@ -244,7 +269,7 @@ void trtllm_paged_attention_launcher(
   if (mode == TllmPagedAttentionMode::Context) {
     if (variable_window_token_starts != nullptr) {
       runner_params.mMaskType = TrtllmGenAttentionMaskType::VariableWindow;
-    } else if (window_left != -1 || window_right != -1) {
+    } else if (window_left >= 0 || window_right >= 0) {
       runner_params.mMaskType = TrtllmGenAttentionMaskType::SlidingOrChunkedCausal;
     } else {
       runner_params.mMaskType =
@@ -696,8 +721,8 @@ void trtllm_paged_attention_context(
     variable_window_token_starts_ptr = static_cast<int*>(starts.data_ptr());
     variable_window_token_ends_ptr = static_cast<int*>(ends.data_ptr());
   }
-  TVM_FFI_CHECK(!is_causal || window_right <= 0,
-                "causal attention does not support a positive window_right");
+  validateTrtllmGenWindowConfig(is_causal, window_left, window_right,
+                                variable_window_token_starts.has_value());
 
   trtllm_paged_attention_launcher(
       out.data_ptr(), output_sf_ptr, query.data_ptr(), key_cache.data_ptr(), value_cache.data_ptr(),
@@ -737,6 +762,9 @@ void trtllm_ragged_attention_launcher(
     const float* sage_attn_sfs_q, const float* sage_attn_sfs_k, const float* sage_attn_sfs_p,
     const float* sage_attn_sfs_v, int num_elts_sage_q, int num_elts_sage_k, int num_elts_sage_p,
     int num_elts_sage_v, int64_t lse_stride_tokens, int64_t lse_stride_heads, cudaStream_t stream) {
+  int64_t const window_right = is_causal && window_left >= 0 ? 0 : -1;
+  validateTrtllmGenWindowConfig(is_causal, window_left, window_right,
+                                /*has_variable_window=*/false);
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -771,9 +799,11 @@ void trtllm_ragged_attention_launcher(
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
   runner_params.scaleSoftmaxLog2Ptr = bmm1_scale_log2_ptr;
   runner_params.mScaleSfO = o_sf_scale;
+  // FlashInfer does not expose chunked attention; zero disables it. The downstream chunked paths
+  // remain for parity with upstream TRT-LLM.
   runner_params.mChunkedAttentionSize = 0;
   runner_params.mLeftSlidingWindow = window_left;
-  runner_params.mRightSlidingWindow = window_left >= 0 ? 0 : -1;
+  runner_params.mRightSlidingWindow = window_right;
   runner_params.mMaxSeqLenQ = max_q_len;
   runner_params.mSumOfSeqLensQ = sum_seq_q;
   runner_params.mSumOfSeqLensKv = sum_seq_kv;
@@ -931,6 +961,9 @@ void trtllm_ragged_attention(
   bool const skips_softmax = skip_softmax_threshold_scale_factor_value != 0.0f;
   bool const use_fp16_softmax_value = use_fp16_softmax.value_or(false);
   bool const uses_spcompress_value = uses_spcompress.value_or(false);
+
+  validateTrtllmGenWindowConfig(is_causal, window_left, is_causal && window_left >= 0 ? 0 : -1,
+                                /*has_variable_window=*/false);
 
   trtllm_ragged_attention_launcher(
       out.data_ptr(), query.data_ptr(), key.data_ptr(), value.data_ptr(),

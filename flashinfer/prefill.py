@@ -17,6 +17,7 @@ limitations under the License.
 import functools
 import logging
 import math
+import os
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, overload
 
@@ -254,6 +255,12 @@ def get_trtllm_gen_prefill_module():
         lse: Optional[torch.Tensor] = None,
         multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if not is_causal and window_left >= 0:
+            raise NotImplementedError(
+                "trtllm-gen wrapper does not support non-causal sliding-window "
+                "attention; use trtllm_batch_context_with_kv_cache with explicit "
+                "window_left and window_right bounds"
+            )
         sm_count = get_device_sm_count(query.device)
         if out is None:
             out = torch.empty_like(query)
@@ -297,7 +304,7 @@ def get_trtllm_gen_prefill_module():
             0,  # o_sf_start_index
             batch_size,
             window_left,
-            0 if is_causal and window_left >= 0 else -1,
+            0 if window_left >= 0 else -1,
             cum_seq_lens_q,
             cum_seq_lens_kv,
             None,
@@ -2014,6 +2021,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
 
+        # Reject this before module construction so an unsupported request cannot reach the
+        # lower-level trtllm-gen run closure even if plan-time setup changes later.
+        if self._backend == "trtllm-gen" and not causal and window_left >= 0:
+            raise NotImplementedError(
+                "Sliding-window non-causal attention is not supported for trtllm-gen "
+                "paged KV cache. Use window_left=-1 for dense bidirectional attention."
+            )
+
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         if head_dim_vo is None:
@@ -2291,6 +2306,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
+
+        if self._backend == "trtllm-gen" and not causal and window_left >= 0:
+            raise NotImplementedError(
+                "Sliding-window non-causal attention is not supported for trtllm-gen "
+                "paged KV cache. Use window_left=-1 for dense bidirectional attention."
+            )
 
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
@@ -5345,6 +5366,47 @@ def trtllm_ragged_attention_deepseek(
         return out
 
 
+def _validate_trtllm_variable_window_bounds(
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    cum_seq_lens_q: torch.Tensor,
+    seq_lens: torch.Tensor,
+    batch_size: int,
+) -> None:
+    """Run opt-in VariableWindow checks that require a device-to-host sync."""
+    if os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") in ("", "0"):
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+
+    starts_cpu = starts.cpu()
+    ends_cpu = ends.cpu()
+    q_indptr = cum_seq_lens_q.cpu().tolist()
+    kv_lens = seq_lens.cpu().tolist()
+
+    if bool((starts_cpu < 0).any()):
+        raise ValueError("variable_window_token_starts must be >= 0")
+    if bool((starts_cpu > ends_cpu).any()):
+        raise ValueError(
+            "variable_window_token_starts must be <= variable_window_token_ends elementwise"
+        )
+    for batch_idx in range(batch_size):
+        q_start, q_end = q_indptr[batch_idx : batch_idx + 2]
+        seq_starts = starts_cpu[q_start:q_end]
+        seq_ends = ends_cpu[q_start:q_end]
+        if bool((seq_starts[1:] < seq_starts[:-1]).any()) or bool(
+            (seq_ends[1:] < seq_ends[:-1]).any()
+        ):
+            raise ValueError(
+                "variable window bounds must be nondecreasing within sequence "
+                f"{batch_idx}"
+            )
+        if bool((seq_ends >= kv_lens[batch_idx]).any()):
+            raise ValueError(
+                f"variable_window_token_ends exceed seq_len for sequence {batch_idx}"
+            )
+
+
 @flashinfer_api(trace=trtllm_batch_context_trace)
 def trtllm_batch_context_with_kv_cache(
     query: torch.Tensor,
@@ -5437,7 +5499,9 @@ def trtllm_batch_context_with_kv_cache(
         Contiguous int32 tensor with one entry per packed query token. Together with
         ``variable_window_token_ends``, supplies the inclusive K/V interval visible to every query
         token. Bounds use positions within each batch item's full K/V sequence and must be
-        nondecreasing within a sequence.
+        nondecreasing within a sequence. These value invariants are the caller's responsibility;
+        they are checked with a device-to-host synchronization only when
+        ``FLASHINFER_VALIDATE_INPUTS=1`` and CUDA graph capture is not active.
     variable_window_token_ends : Optional[torch.Tensor]
         Inclusive interval ends paired with ``variable_window_token_starts``. Variable windows
         cannot be combined with fixed ``window_left``/``window_right`` bounds; when supplied, they
@@ -5576,13 +5640,22 @@ def trtllm_batch_context_with_kv_cache(
             or not variable_window_token_ends.is_contiguous()
         ):
             raise ValueError("variable window bounds must be contiguous")
+        _validate_trtllm_variable_window_bounds(
+            variable_window_token_starts,
+            variable_window_token_ends,
+            cum_seq_lens_q,
+            seq_lens,
+            batch_size,
+        )
         effective_window_right = -1
     elif causal:
         if window_right not in (-1, 0):
             raise ValueError("causal attention requires window_right to be -1 or 0")
         effective_window_right = 0 if window_left >= 0 else -1
     else:
-        if window_left != -1 and window_right == -1:
+        if window_left == -1 and window_right >= 0:
+            raise ValueError("right-only non-causal windows are unsupported")
+        if window_left >= 0 and window_right == -1:
             raise ValueError(
                 "non-causal fixed-window attention requires window_right >= 0"
             )

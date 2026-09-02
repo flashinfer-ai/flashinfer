@@ -37,6 +37,8 @@ enum class TrtllmGenAttentionMaskType {
   // Custom mask.
   Custom,
   // Sliding window mask combined with a custom packed mask.
+  // FlashInfer does not produce this mode. Its value is retained to match
+  // tensorrt_llm::kernels::ContextAttentionMaskType and the CUBIN metadata encoding.
   SlidingWindowCustom,
   // Per-query-token inclusive K/V bounds.
   VariableWindow
@@ -55,7 +57,6 @@ ATTENTION_MASK_TYPE_FUNCTION(Dense)
 ATTENTION_MASK_TYPE_FUNCTION(Causal)
 ATTENTION_MASK_TYPE_FUNCTION(SlidingOrChunkedCausal)
 ATTENTION_MASK_TYPE_FUNCTION(Custom)
-ATTENTION_MASK_TYPE_FUNCTION(SlidingWindowCustom)
 ATTENTION_MASK_TYPE_FUNCTION(VariableWindow)
 
 #undef ATTENTION_MASK_TYPE_FUNCTION
@@ -409,6 +410,9 @@ struct TllmGenFmhaRunnerParams {
                   "TllmGenFmhaRunnerParams must be a POD type (standard layout) for memset to be "
                   "safe.");
     memset(this, 0, sizeof(TllmGenFmhaRunnerParams));
+    // Zero is a one-token window. Restore the explicit unbounded sentinel after memset.
+    mLeftSlidingWindow = -1;
+    mRightSlidingWindow = -1;
   }
 };
 

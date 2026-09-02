@@ -131,11 +131,13 @@ struct KernelParams {
   int32_t const* ptrSparseMlaTopKLens;
 
   // Sliding-window reaches excluding the current token. -1 means unbounded.
-  int32_t mLeftSlidingWindow{-1};
-  int32_t mRightSlidingWindow{-1};
+  // setKernelParams() zeroes this struct and then assigns all four fields explicitly; do not rely
+  // on default member initializers here.
+  int32_t mLeftSlidingWindow;
+  int32_t mRightSlidingWindow;
   // Inclusive VariableWindow bounds, one pair per packed Q token.
-  int32_t const* ptrVariableWindowTokenStarts{nullptr};
-  int32_t const* ptrVariableWindowTokenEnds{nullptr};
+  int32_t const* ptrVariableWindowTokenStarts;
+  int32_t const* ptrVariableWindowTokenEnds;
   // The batch size
   int32_t mBatchSize;
   // The chunked attention size in log2.
