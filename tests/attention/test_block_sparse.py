@@ -668,3 +668,88 @@ def test_paged_route_reads_a_wide_quantized_head(head_dim, kv_dtype):
     out = run(keys, values, kv_dtype, **run_kwargs)
     expected = run(ref_keys, ref_values, torch.bfloat16)
     torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("layout", ["NHD", "HND"])
+def test_paged_fp8_cache_sizes_its_default_scales_by_the_head_count(layout):
+    """A higher-precision query over an FP8 paged cache, with no explicit
+    per-head scales.
+
+    The defaults were sized from ``k.shape[1]``. For a raw paged cache that
+    axis is the page size under NHD and the head count only by coincidence, so
+    a page size below the head count handed the kernel a scale tensor shorter
+    than the head it indexes by. The shape here is page_size 1 against four KV
+    heads, the smallest that axis gets.
+
+    What it checks is the tensor the wrapper builds, not the attention output:
+    the FA2 module this runs on takes the scales in its signature and does not
+    apply them, so a short one is passed but never dereferenced and nothing
+    downstream moves. Reading them is the FA3 path, which needs SM90.
+    """
+    torch.manual_seed(7)
+    num_qo_heads, num_kv_heads, head_dim = 8, 4, 128
+    page_size, pages, rows, width = 1, 32, 4, 8
+    entries = pages * page_size
+    device = "cuda:0"
+    shape = (
+        (pages, page_size, num_kv_heads, head_dim)
+        if layout == "NHD"
+        else (pages, num_kv_heads, page_size, head_dim)
+    )
+    k_cache = torch.randn(*shape, dtype=torch.float16, device=device).to(
+        torch.float8_e4m3fn
+    )
+    v_cache = torch.randn(*shape, dtype=torch.float16, device=device).to(
+        torch.float8_e4m3fn
+    )
+    q = torch.randn(rows, num_qo_heads, head_dim, dtype=torch.bfloat16, device=device)
+    route = torch.randint(0, entries, (rows, width), dtype=torch.int32, device=device)
+    indptr = torch.arange(
+        0, (rows + 1) * width, width, dtype=torch.int32, device=device
+    )
+
+    wrapper = flashinfer.BlockSparseAttentionWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device),
+        kv_layout=layout,
+    )
+    wrapper.plan(
+        indptr,
+        route.reshape(-1).contiguous(),
+        rows,
+        entries,
+        1,
+        1,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        mask=torch.ones(rows * width, 1, 1, dtype=torch.bool, device=device),
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.float8_e4m3fn,
+        o_data_type=torch.bfloat16,
+        kv_cache_page_size=page_size,
+    )
+
+    seen = []
+    inner = wrapper._cached_module.paged_run
+
+    def spy(*args, **kwargs):
+        seen.extend(
+            a
+            for a in args
+            if isinstance(a, torch.Tensor) and a.dtype == torch.float32 and a.ndim == 1
+        )
+        return inner(*args, **kwargs)
+
+    wrapper._cached_module.paged_run = spy
+    try:
+        wrapper.run(q, k_cache, v_cache)
+    finally:
+        wrapper._cached_module.paged_run = inner
+
+    # The module takes other float vectors too, so the check is that the two
+    # KV scales are there rather than that every vector is one of them. Sized
+    # from k.shape[1] they would be page_size long under NHD -- one element for
+    # four heads. HND puts the head count on that axis, so it passes either way
+    # and is here to show the coincidence rather than to catch anything.
+    widths = [t.numel() for t in seen]
+    assert widths.count(num_kv_heads) >= 2, widths
