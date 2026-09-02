@@ -576,13 +576,14 @@ def test_qsa_route_from_blocks_does_not_wrap_an_index_that_is_not_an_int32(field
     every guard, so the same values are injected here and not only into the
     standalone slot kernel.
 
-    Removing those copies does not fail this: in the fused path the request is
-    compared against its count, the block against the past-block bound and the
-    page against num_slots, all in IdType, so a value an int32 could not hold is
-    rejected before the cast either way. The explicit bounds are belt and
-    braces and this is coverage of the path, not a pin on them. What the
-    boundary test above pins is the one value nothing else bounds -- the query
-    position, and the plus one taken from it.
+    Removing those copies does not fail this, for different reasons per guard.
+    The block bound is genuinely redundant: block < past_blocks is applied in
+    IdType and past_blocks is an int32 count. The request bound is not -- it is
+    compared against num_requests, which is a tensor extent with no int32 cap of
+    its own, so a large enough request count would let a wrapped id through.
+    This case cannot show that, since building a request table of two billion
+    rows is not a test. What the boundary test above pins is the query position,
+    which nothing else bounds.
     """
     ratio, page_size, num_slots = 4, 16, 4096
     blocks = torch.tensor([[0, 1, 2, 3]], dtype=torch.int64, device=DEV)
@@ -628,3 +629,50 @@ def test_qsa_route_from_blocks_does_not_wrap_an_index_that_is_not_an_int32(field
         # Only the rank or the page that carried it goes; the rest still route.
         assert all(t <= 31 for t in routed), routed
         assert 0 not in live, f"a wrapped index routed: {route[0].tolist()}"
+
+
+@pytest.mark.parametrize("path", ["logical", "blocks"])
+def test_qsa_route_keeps_a_page_an_int64_route_can_hold(path):
+    """A route of int64 is allowed a slot space past what an int32 holds, so a
+    page that lands inside it is a page the caller is entitled to. Bounding the
+    page id at INT32_MAX instead of at the slot space would mask it: page 2^31
+    at a page size of one is slot 2^31, inside a space of 2^31 + 1."""
+    page_size, num_slots = 1, 2147483649
+    big_page = 2147483648
+    if path == "logical":
+        width = 4
+        logical = torch.zeros(1, width, dtype=torch.int64, device=DEV)
+        token_to_req = torch.zeros(1, dtype=torch.int64, device=DEV)
+        table = torch.full((1, 1), big_page, dtype=torch.int64, device=DEV)
+        route = torch.empty(1, width, dtype=torch.int64, device=DEV)
+        mask = torch.empty(1, dtype=torch.uint8, device=DEV)
+        flashinfer.qsa_route_from_logical(
+            logical, token_to_req, table, route, mask, 1, page_size, num_slots
+        )
+    else:
+        ratio = 1
+        width = 4 * ratio + ratio - 1
+        blocks = torch.zeros(1, 4, dtype=torch.int64, device=DEV)
+        positions = torch.tensor([7], dtype=torch.int64, device=DEV)
+        lengths = torch.tensor([8], dtype=torch.int64, device=DEV)
+        token_to_req = torch.zeros(1, dtype=torch.int64, device=DEV)
+        table = torch.full((1, 8), big_page, dtype=torch.int64, device=DEV)
+        logical = torch.empty(1, width, dtype=torch.int64, device=DEV)
+        route = torch.empty(1, width, dtype=torch.int64, device=DEV)
+        mask = torch.empty(-(-width // 8), dtype=torch.uint8, device=DEV)
+        flashinfer.qsa_route_from_blocks(
+            blocks,
+            positions,
+            lengths,
+            token_to_req,
+            table,
+            logical,
+            route,
+            mask,
+            ratio,
+            page_size,
+            num_slots,
+        )
+    torch.cuda.synchronize()
+    assert int(mask[0]) & 1, "a page inside the slot space was masked out"
+    assert int(route[0, 0]) == big_page, route[0, 0].item()
