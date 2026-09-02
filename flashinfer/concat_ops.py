@@ -79,12 +79,9 @@ def _validate_cake_concat_mla_k(
         raise ValueError("k, k_nope, and k_rope must have the same dtype")
     if k_nope.device != k.device or k_rope.device != k.device:
         raise ValueError("k, k_nope, and k_rope must be on the same device")
-    capability = torch.cuda.get_device_capability(k.device)
-    if capability != (10, 3):
-        raise RuntimeError(
-            "the Cake concat_mla_k backend requires exact compute capability "
-            f"10.3, got {capability[0]}.{capability[1]}"
-        )
+    from .jit.cake_concat_mla_k import cake_concat_mla_k_target
+
+    cake_concat_mla_k_target(k.device)
 
     tokens = int(k.shape[0])
     if tuple(k.shape) != (tokens, _NUM_HEADS, _OUTPUT_DIM):
@@ -143,7 +140,7 @@ def _concat_mla_k_cake(
     from .jit.cake_concat_mla_k import get_cake_concat_mla_k_module
 
     with torch.cuda.device(k.device):
-        get_cake_concat_mla_k_module().run(
+        get_cake_concat_mla_k_module(k.device).run(
             k.view(torch.uint8),
             k_nope.view(torch.uint8),
             k_rope.view(torch.uint8),
@@ -197,7 +194,8 @@ def concat_mla_k(
         This is broadcast to all heads.
     backend : {"default", "cake"}, optional
         Backend implementation. The source-only ``"cake"`` backend is
-        available on exact SM103a for the documented fixed shape and layouts.
+        available on SM100f and exact SM103a for the documented fixed shape
+        and layouts.
 
     Example
     -------

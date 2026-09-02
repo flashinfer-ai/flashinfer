@@ -1,4 +1,4 @@
-"""JIT loader for the source-only SM103a concat MLA K backend."""
+"""JIT loader for the source-only Blackwell concat MLA K backend."""
 
 from __future__ import annotations
 
@@ -7,10 +7,22 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, logger, sm103a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    logger,
+    sm100f_nvcc_flags,
+    sm103a_nvcc_flags,
+)
+
+CakeConcatMLAKTarget = Literal["sm100f", "sm103a"]
+_TARGET_FLAGS = {
+    "sm100f": sm100f_nvcc_flags,
+    "sm103a": sm103a_nvcc_flags,
+}
 
 _MANIFEST_NAME = "cake_concat_mla_k_import_manifest.json"
 _EXPECTED_CONTRACT = {
@@ -54,7 +66,7 @@ _EXPECTED_BUILD_CONTRACT = {
 
 @dataclass(frozen=True)
 class CakeConcatMLAKModuleSpec:
-    """Verified source closure and cache identity for the SM103a module."""
+    """Verified source closure and cache identity for the exported module."""
 
     module_ident: str
     closure_sha256: str
@@ -271,41 +283,70 @@ def get_cake_concat_mla_k_module_spec() -> CakeConcatMLAKModuleSpec:
     )
 
 
-def get_cake_concat_mla_k_uri() -> str:
+def cake_concat_mla_k_target(device) -> CakeConcatMLAKTarget:
+    """Select the physical JIT target for one supported Blackwell device."""
+
+    import torch
+
+    from .cpp_ext import is_cuda_version_at_least
+
+    capability = tuple(int(value) for value in torch.cuda.get_device_capability(device))
+    if capability == (10, 0):
+        if not is_cuda_version_at_least("12.9"):
+            raise RuntimeError(
+                "Cake concat MLA K on compute capability 10.0 requires CUDA "
+                "12.9 or newer for the sm_100f family target"
+            )
+        return "sm100f"
+    if capability == (10, 3):
+        return "sm103a"
+    raise RuntimeError(
+        "the Cake concat MLA K backend requires compute capability 10.0 "
+        f"(SM100f) or 10.3 (SM103a), got {capability[0]}.{capability[1]}"
+    )
+
+
+def get_cake_concat_mla_k_uri(target: CakeConcatMLAKTarget) -> str:
+    if target not in _TARGET_FLAGS:
+        raise ValueError(f"unsupported Cake concat MLA K target: {target}")
     spec = get_cake_concat_mla_k_module_spec()
-    return f"{spec.module_ident}_sm103a_{spec.closure_sha256}"
+    return f"{spec.module_ident}_{target}_{spec.closure_sha256}"
 
 
 @functools.cache
-def gen_cake_concat_mla_k_module() -> JitSpec:
-    """Generate the exact-SM103a JIT module from separate source units."""
+def gen_cake_concat_mla_k_module(target: CakeConcatMLAKTarget) -> JitSpec:
+    """Generate one target-specific JIT module from separate source units."""
 
+    if target not in _TARGET_FLAGS:
+        raise ValueError(f"unsupported Cake concat MLA K target: {target}")
     spec = get_cake_concat_mla_k_module_spec()
     csrc_dir = _get_csrc_dir()
     jit_spec = gen_jit_spec(
-        name=get_cake_concat_mla_k_uri(),
+        name=get_cake_concat_mla_k_uri(target),
         sources=[spec.device_path, spec.binding_path],
-        extra_cuda_cflags=[*sm103a_nvcc_flags],
+        extra_cuda_cflags=[*_TARGET_FLAGS[target]],
         extra_include_paths=[csrc_dir, csrc_dir.parent, _get_include_dir()],
         needs_device_linking=True,
     )
-    logger.info("Generated Cake concat MLA K SM103a JIT spec: %s", jit_spec.name)
+    logger.info("Generated Cake concat MLA K %s JIT spec: %s", target, jit_spec.name)
     return jit_spec
 
 
 @functools.cache
-def load_cake_concat_mla_k_module():
-    module = gen_cake_concat_mla_k_module().build_and_load()
-    logger.info("Loaded Cake concat MLA K SM103a module")
+def load_cake_concat_mla_k_module(target: CakeConcatMLAKTarget):
+    module = gen_cake_concat_mla_k_module(target).build_and_load()
+    logger.info("Loaded Cake concat MLA K %s module", target)
     return module
 
 
-def get_cake_concat_mla_k_module():
-    return load_cake_concat_mla_k_module()
+def get_cake_concat_mla_k_module(device):
+    return load_cake_concat_mla_k_module(cake_concat_mla_k_target(device))
 
 
 __all__ = [
+    "CakeConcatMLAKTarget",
     "CakeConcatMLAKModuleSpec",
+    "cake_concat_mla_k_target",
     "gen_cake_concat_mla_k_module",
     "get_cake_concat_mla_k_module",
     "get_cake_concat_mla_k_module_spec",

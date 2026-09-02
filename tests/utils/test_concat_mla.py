@@ -175,8 +175,8 @@ def _make_cake_tensors(
 def _require_cake_concat_mla_k() -> None:
     if not torch.cuda.is_available():
         pytest.skip("Cake concat MLA K requires CUDA")
-    if get_compute_capability(torch.device("cuda")) != (10, 3):
-        pytest.skip("Cake concat MLA K requires exact SM103a")
+    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3)):
+        pytest.skip("Cake concat MLA K requires SM100 or SM103")
 
 
 # ────────────────────────── Core correctness tests ──────────────────────────
@@ -321,7 +321,7 @@ def test_cake_concat_mla_k_full_contract(
     input_layout: str,
     padded_output: bool,
 ):
-    """Run all 39 byte-exact SM103a source-backend contract rows."""
+    """Run all 39 byte-exact SM100-family source-backend contract rows."""
 
     _require_cake_concat_mla_k()
     torch.manual_seed(17)
@@ -358,11 +358,56 @@ def test_cake_concat_mla_k_full_contract(
     )
 
 
-def test_cake_concat_mla_k_rejects_non_sm103a(monkeypatch):
+def test_cake_concat_mla_k_selects_sm100f_on_cc100(monkeypatch):
+    from flashinfer.jit import cake_concat_mla_k
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
+    monkeypatch.setattr(
+        "flashinfer.jit.cpp_ext.is_cuda_version_at_least",
+        lambda version: version == "12.9",
+    )
+
+    assert cake_concat_mla_k.cake_concat_mla_k_target(torch.device("cuda")) == (
+        "sm100f"
+    )
+
+
+@pytest.mark.parametrize(
+    ("target", "target_arch", "expected_compute", "forbidden_compute"),
+    [
+        ("sm100f", (10, "0f"), "compute_100f", "compute_103a"),
+        ("sm103a", (10, "3a"), "compute_103a", "compute_100f"),
+    ],
+)
+def test_cake_concat_mla_k_jit_target_isolated(
+    monkeypatch,
+    target,
+    target_arch,
+    expected_compute,
+    forbidden_compute,
+):
+    from flashinfer.jit import cake_concat_mla_k
+    from flashinfer.jit import core as jit_core
+
+    monkeypatch.setattr(
+        jit_core.current_compilation_context,
+        "TARGET_CUDA_ARCHS",
+        {target_arch},
+    )
+    cake_concat_mla_k.gen_cake_concat_mla_k_module.cache_clear()
+
+    spec = cake_concat_mla_k.gen_cake_concat_mla_k_module(target)
+
+    assert f"_{target}_" in spec.name
+    assert any(expected_compute in flag for flag in spec.extra_cuda_cflags)
+    assert not any(forbidden_compute in flag for flag in spec.extra_cuda_cflags)
+
+
+def test_cake_concat_mla_k_rejects_unsupported_arch(monkeypatch):
     _require_cake_concat_mla_k()
     k, k_nope, k_rope = _make_cake_tensors(1, torch.bfloat16, "contiguous", False)
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
-    with pytest.raises(RuntimeError, match="exact compute capability 10.3"):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (12, 0))
+    with pytest.raises(RuntimeError, match="requires compute capability 10.0"):
         concat_mla_k(k, k_nope, k_rope, backend="cake")
 
 
