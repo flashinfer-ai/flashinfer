@@ -47,11 +47,10 @@ from .fmha_resources import (
     GmemOResource,
     GmemQKVResource,
     S0S1SequenceResource,
-    SmemKResource,
+    SmemKVResource,
     SmemOResource,
     SmemPageOffsetsKvResource,
     SmemQResource,
-    SmemVResource,
     TmemOResource,
     TmemPResource,
     TmemSPResource,
@@ -181,8 +180,8 @@ def _captured_loop_bounds(
 def create_load_task(
     gmem_qkv: GmemQKVResource,
     smem_q: SmemQResource,
-    smem_k: SmemKResource,
-    smem_v: SmemVResource,
+    smem_k_or_kv: SmemKVResource,
+    smem_v: SmemKVResource | None,
     work_queue: WorkQueue | None,
     task_class: type[Task] = Task,
     smem_page_offsets_kv: SmemPageOffsetsKvResource | None = None,
@@ -198,20 +197,29 @@ def create_load_task(
     loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     skip_work_tile_if = _packed_context_skip_predicate(work_queue)
     src = _src_resources(gmem_qkv, work_queue=work_queue)
-    dst = [smem_q, smem_k, smem_v]
+    # One K/V resource when they share a buffer, two when their dtypes split it.
+    split_kv = smem_k_or_kv.cfg.split_kv_pipelines
+    if split_kv and smem_v is None:
+        raise ValueError("split K/V staging requires a separate V buffer")
+    kv_resources = (smem_k_or_kv, smem_v) if split_kv else (smem_k_or_kv,)
+    dst = [smem_q, *kv_resources]
     if smem_page_offsets_kv is not None:
         src.append(smem_page_offsets_kv)
     if smem_page_offsets_v is not None:
         src.append(smem_page_offsets_v)
     if smem_q.cfg.single_qkv_instance and smem_q.cfg.has_tmem_p_pipeline:
-        num_head_dim_stages_k = smem_k.cfg.num_head_dim_stages_k
-        num_head_dim_stages_v = smem_v.cfg.num_head_dim_stages_v
+        num_head_dim_stages_k = smem_k_or_kv.cfg.num_head_dim_stages_k
+        num_head_dim_stages_v = smem_k_or_kv.cfg.num_head_dim_stages_v
 
         if smem_page_offsets_v is not None:
             if smem_page_offsets_kv is None:
                 raise ValueError("a V page window requires a matching K page window")
-            pages_per_tile = smem_k.cfg.kv_tile_n // smem_k.cfg.num_tokens_per_page
-            page_window_period = smem_k.cfg.page_table_window_entries // pages_per_tile
+            pages_per_tile = (
+                smem_k_or_kv.cfg.kv_tile_n // smem_k_or_kv.cfg.num_tokens_per_page
+            )
+            page_window_period = (
+                smem_k_or_kv.cfg.page_table_window_entries // pages_per_tile
+            )
             if (
                 not isinstance(loop_start, int)
                 or not isinstance(loop_end, int)
@@ -229,8 +237,8 @@ def create_load_task(
             def load_reused_page_windows_schedule_body(
                 gqkv: GmemQKVResource,
                 sq: SmemQResource,
-                sk: SmemKResource,
-                sv: SmemVResource,
+                sk: SmemKVResource,
+                sv: SmemKVResource,
                 spok: SmemPageOffsetsKvResource,
                 spov: SmemPageOffsetsKvResource,
                 wq: WorkQueue | None,
@@ -366,22 +374,36 @@ def create_load_task(
             def load_reused_page_windows_schedule(
                 gqkv: GmemQKVResource,
                 sq: SmemQResource,
-                sk: SmemKResource,
-                sv: SmemVResource,
+                skv: SmemKVResource,
                 spok: SmemPageOffsetsKvResource,
                 spov: SmemPageOffsetsKvResource,
                 wq: WorkQueue | None = None,
             ) -> None:
+                """Shared-buffer captured schedule."""
                 load_reused_page_windows_schedule_body(
-                    gqkv, sq, sk, sv, spok, spov, wq
+                    gqkv, sq, skv, skv, spok, spov, wq
                 )
 
+            @schedule
+            def load_reused_page_windows_split_schedule(
+                gqkv: GmemQKVResource,
+                sq: SmemQResource,
+                sk: SmemKVResource,
+                sv: SmemKVResource,
+                spok: SmemPageOffsetsKvResource,
+                spov: SmemPageOffsetsKvResource,
+                wq: WorkQueue | None = None,
+            ) -> None:
+                """Split K/V captured schedule."""
+                load_reused_page_windows_schedule_body(gqkv, sq, sk, sv, spok, spov, wq)
+
             captured_schedule = _schedule_with_work_queue(
-                load_reused_page_windows_schedule,
+                load_reused_page_windows_split_schedule
+                if split_kv
+                else load_reused_page_windows_schedule,
                 gmem_qkv,
                 smem_q,
-                smem_k,
-                smem_v,
+                *kv_resources,
                 smem_page_offsets_kv,
                 smem_page_offsets_v,
                 work_queue=work_queue,
@@ -389,10 +411,10 @@ def create_load_task(
             return task_class(
                 src_resources=src,
                 dst_resources=dst,
-                warp_idx=smem_k.cfg.load_warp_id,
+                warp_idx=smem_k_or_kv.cfg.load_warp_id,
                 num_warps=1,
                 schedule=captured_schedule,
-                num_registers=smem_k.cfg.num_regs_other,
+                num_registers=smem_k_or_kv.cfg.num_regs_other,
                 name="LoadTask",
                 **task_kwargs,
             )
@@ -400,8 +422,8 @@ def create_load_task(
         def load_schedule_body(
             gqkv: GmemQKVResource,
             sq: SmemQResource,
-            sk: SmemKResource,
-            sv: SmemVResource,
+            sk: SmemKVResource,
+            sv: SmemKVResource,
             spo: SmemPageOffsetsKvResource | None,
             wq: WorkQueue | None,
         ) -> None:
@@ -511,44 +533,72 @@ def create_load_task(
         def load_schedule(
             gqkv: GmemQKVResource,
             sq: SmemQResource,
-            sk: SmemKResource,
-            sv: SmemVResource,
+            skv: SmemKVResource,
             wq: WorkQueue | None = None,
         ) -> None:
+            """Shared-buffer captured schedule."""
+            load_schedule_body(gqkv, sq, skv, skv, None, wq)
+
+        @schedule
+        def load_split_schedule(
+            gqkv: GmemQKVResource,
+            sq: SmemQResource,
+            sk: SmemKVResource,
+            sv: SmemKVResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            """Split K/V captured schedule."""
             load_schedule_body(gqkv, sq, sk, sv, None, wq)
 
         @schedule
         def load_page_offsets_schedule(
             gqkv: GmemQKVResource,
             sq: SmemQResource,
-            sk: SmemKResource,
-            sv: SmemVResource,
+            skv: SmemKVResource,
             spo: SmemPageOffsetsKvResource,
             wq: WorkQueue | None = None,
         ) -> None:
+            """Shared-buffer captured schedule with a page-ID ring."""
+            load_schedule_body(gqkv, sq, skv, skv, spo, wq)
+
+        @schedule
+        def load_page_offsets_split_schedule(
+            gqkv: GmemQKVResource,
+            sq: SmemQResource,
+            sk: SmemKVResource,
+            sv: SmemKVResource,
+            spo: SmemPageOffsetsKvResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            """Split K/V captured schedule with a page-ID ring."""
             load_schedule_body(gqkv, sq, sk, sv, spo, wq)
 
         if smem_page_offsets_kv is None:
             captured_schedule = _schedule_with_work_queue(
-                load_schedule, gmem_qkv, smem_q, smem_k, smem_v, work_queue=work_queue
+                load_split_schedule if split_kv else load_schedule,
+                gmem_qkv,
+                smem_q,
+                *kv_resources,
+                work_queue=work_queue,
             )
         else:
             captured_schedule = _schedule_with_work_queue(
-                load_page_offsets_schedule,
+                load_page_offsets_split_schedule
+                if split_kv
+                else load_page_offsets_schedule,
                 gmem_qkv,
                 smem_q,
-                smem_k,
-                smem_v,
+                *kv_resources,
                 smem_page_offsets_kv,
                 work_queue=work_queue,
             )
         return task_class(
             src_resources=src,
             dst_resources=dst,
-            warp_idx=smem_k.cfg.load_warp_id,
+            warp_idx=smem_k_or_kv.cfg.load_warp_id,
             num_warps=1,
             schedule=captured_schedule,
-            num_registers=smem_k.cfg.num_regs_other,
+            num_registers=smem_k_or_kv.cfg.num_regs_other,
             name="LoadTask",
             **task_kwargs,
         )
@@ -561,8 +611,8 @@ def create_load_task(
     def load_schedule_body(
         gqkv: GmemQKVResource,
         sq: SmemQResource,
-        sk: SmemKResource,
-        sv: SmemVResource,
+        sk: SmemKVResource,
+        sv: SmemKVResource,
         wq: WorkQueue | None,
     ) -> None:
         """Load paired Q instances and their directly addressed K/V tiles."""
@@ -637,24 +687,38 @@ def create_load_task(
     def load_schedule(
         gqkv: GmemQKVResource,
         sq: SmemQResource,
-        sk: SmemKResource,
-        sv: SmemVResource,
+        skv: SmemKVResource,
         wq: WorkQueue | None = None,
     ) -> None:
-        """Contiguous-KV captured schedule."""
+        """Contiguous-KV captured schedule over a shared K/V buffer."""
         # Mypy retains the earlier branch's five-argument closure signature.
+        load_schedule_body(gqkv, sq, skv, skv, wq)  # type: ignore[call-arg]
+
+    @schedule
+    def load_split_schedule(
+        gqkv: GmemQKVResource,
+        sq: SmemQResource,
+        sk: SmemKVResource,
+        sv: SmemKVResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Contiguous-KV captured schedule over split K and V buffers."""
         load_schedule_body(gqkv, sq, sk, sv, wq)  # type: ignore[call-arg]
 
     captured_schedule = _schedule_with_work_queue(
-        load_schedule, gmem_qkv, smem_q, smem_k, smem_v, work_queue=work_queue
+        load_split_schedule if split_kv else load_schedule,
+        gmem_qkv,
+        smem_q,
+        *kv_resources,
+        work_queue=work_queue,
     )
     return task_class(
         src_resources=src,
         dst_resources=dst,
-        warp_idx=smem_k.cfg.load_warp_id,
+        warp_idx=smem_k_or_kv.cfg.load_warp_id,
         num_warps=1,
         schedule=captured_schedule,
-        num_registers=smem_k.cfg.num_regs_other,
+        num_registers=smem_k_or_kv.cfg.num_regs_other,
         name="LoadTask",
         **task_kwargs,
     )
@@ -662,8 +726,8 @@ def create_load_task(
 
 def create_mma_task(
     smem_q: SmemQResource,
-    smem_k: SmemKResource,
-    smem_v: SmemVResource,
+    smem_k_or_kv: SmemKVResource,
+    smem_v: SmemKVResource | None,
     tmem_sp0: TmemSPResource,
     tmem_sp1: TmemSPResource | None,
     tmem_p0: TmemPResource | None,
@@ -677,7 +741,11 @@ def create_mma_task(
     """Create the one-warp MMA compute task."""
     loop_start, loop_end, loop_step = _captured_loop_bounds(task_class, task_kwargs)
     skip_work_tile_if = _packed_context_skip_predicate(work_queue)
-    src = _src_resources(smem_q, smem_k, smem_v, work_queue=work_queue)
+    split_kv = smem_k_or_kv.cfg.split_kv_pipelines
+    if split_kv and smem_v is None:
+        raise ValueError("split K/V staging requires a separate V buffer")
+    kv_resources = (smem_k_or_kv, smem_v) if split_kv else (smem_k_or_kv,)
+    src = _src_resources(smem_q, *kv_resources, work_queue=work_queue)
 
     if (
         smem_q.cfg.single_qkv_instance
@@ -685,10 +753,10 @@ def create_mma_task(
         and tmem_p0 is not None
     ):
         split_src = _src_resources(
-            smem_q, smem_k, smem_v, tmem_p0, work_queue=work_queue
+            smem_q, *kv_resources, tmem_p0, work_queue=work_queue
         )
-        num_head_dim_stages_k = smem_k.cfg.num_head_dim_stages_k
-        num_head_dim_stages_v = smem_v.cfg.num_head_dim_stages_v
+        num_head_dim_stages_k = smem_k_or_kv.cfg.num_head_dim_stages_k
+        num_head_dim_stages_v = smem_k_or_kv.cfg.num_head_dim_stages_v
         loop_carried_head_dim_stages = 2
         if (
             num_head_dim_stages_k != loop_carried_head_dim_stages
@@ -696,11 +764,10 @@ def create_mma_task(
         ):
             raise ValueError("loop-carried split S/P scheduling expects two K/V stages")
 
-        @schedule
-        def mma_schedule(
+        def mma_schedule_body(
             sq: SmemQResource,
-            sk: SmemKResource,
-            sv: SmemVResource,
+            sk: SmemKVResource,
+            sv: SmemKVResource,
             sp0: TmemSPResource,
             tp0: TmemPResource,
             to: TmemOResource,
@@ -820,11 +887,37 @@ def create_mma_task(
                 tp0.wait()
                 tp0.release()
 
+        @schedule
+        def mma_schedule(
+            sq: SmemQResource,
+            skv: SmemKVResource,
+            sp0: TmemSPResource,
+            tp0: TmemPResource,
+            to: TmemOResource,
+            vd0: TmemStatsDoneResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            """Shared-buffer captured schedule."""
+            mma_schedule_body(sq, skv, skv, sp0, tp0, to, vd0, wq)
+
+        @schedule
+        def mma_split_schedule(
+            sq: SmemQResource,
+            sk: SmemKVResource,
+            sv: SmemKVResource,
+            sp0: TmemSPResource,
+            tp0: TmemPResource,
+            to: TmemOResource,
+            vd0: TmemStatsDoneResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            """Split K/V captured schedule."""
+            mma_schedule_body(sq, sk, sv, sp0, tp0, to, vd0, wq)
+
         captured_schedule = _schedule_with_work_queue(
-            mma_schedule,
+            mma_split_schedule if split_kv else mma_schedule,
             smem_q,
-            smem_k,
-            smem_v,
+            *kv_resources,
             tmem_sp0,
             tmem_p0,
             tmem_o,
@@ -844,22 +937,23 @@ def create_mma_task(
         )
 
     if smem_q.cfg.single_qkv_instance:
-        num_head_dim_stages_k = smem_k.cfg.num_head_dim_stages_k
-        num_head_dim_stages_v = smem_v.cfg.num_head_dim_stages_v
+        num_head_dim_stages_k = smem_k_or_kv.cfg.num_head_dim_stages_k
+        num_head_dim_stages_v = smem_k_or_kv.cfg.num_head_dim_stages_v
 
-        @schedule
-        def mma_schedule(
+        def mma_schedule_body(
             sq: SmemQResource,
-            sk: SmemKResource,
-            sv: SmemVResource,
+            sk: SmemKVResource,
+            sv: SmemKVResource,
             sp0: TmemSPResource,
             to: TmemOResource,
             vd0: TmemStatsDoneResource,
             wq: WorkQueue | None = None,
         ) -> None:
             desc_q0_base, _desc_q1_base = sq.create_function_variables()
-            desc_k_base = sk.create_function_variables()
-            desc_v_base = sv.create_function_variables()
+            # Every instance declares both descriptor slots; a split buffer
+            # only ever fills the half matching its role.
+            desc_k_base, _desc_v_base = sk.create_function_variables()
+            _desc_k_base, desc_v_base = sv.create_function_variables()
             sp0.create_function_variables()
             to.create_function_variables()
             vd0.create_function_variables()
@@ -904,11 +998,35 @@ def create_mma_task(
                 sq.release()
                 sp0.commit()
 
+        @schedule
+        def mma_schedule(
+            sq: SmemQResource,
+            skv: SmemKVResource,
+            sp0: TmemSPResource,
+            to: TmemOResource,
+            vd0: TmemStatsDoneResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            """Shared-buffer captured schedule."""
+            mma_schedule_body(sq, skv, skv, sp0, to, vd0, wq)
+
+        @schedule
+        def mma_split_schedule(
+            sq: SmemQResource,
+            sk: SmemKVResource,
+            sv: SmemKVResource,
+            sp0: TmemSPResource,
+            to: TmemOResource,
+            vd0: TmemStatsDoneResource,
+            wq: WorkQueue | None = None,
+        ) -> None:
+            """Split K/V captured schedule."""
+            mma_schedule_body(sq, sk, sv, sp0, to, vd0, wq)
+
         captured_schedule = _schedule_with_work_queue(
-            mma_schedule,
+            mma_split_schedule if split_kv else mma_schedule,
             smem_q,
-            smem_k,
-            smem_v,
+            *kv_resources,
             tmem_sp0,
             tmem_o,
             tmem_vec_done_0,
@@ -928,11 +1046,10 @@ def create_mma_task(
     if tmem_sp1 is None or tmem_vec_done_1 is None:
         raise ValueError("paired MMA scheduling requires peer-1 resources")
 
-    @schedule
-    def mma_schedule(
+    def mma_schedule_body(
         sq: SmemQResource,
-        sk: SmemKResource,
-        sv: SmemVResource,
+        sk: SmemKVResource,
+        sv: SmemKVResource,
         sp0: TmemSPResource,
         sp1: TmemSPResource,
         to: TmemOResource,
@@ -940,7 +1057,7 @@ def create_mma_task(
         vd1: TmemStatsDoneResource,
         wq: WorkQueue | None = None,
     ) -> None:
-        """Captured schedule for interleaved QK and PV MMA work."""
+        """Schedule body for interleaved QK and PV MMA work."""
         sq.init_descriptor_state()
         sk.init_descriptor_state()
         sv.init_descriptor_state()
@@ -1061,11 +1178,39 @@ def create_mma_task(
             sv.release()
             sp1.commit()
 
+    @schedule
+    def mma_schedule(
+        sq: SmemQResource,
+        skv: SmemKVResource,
+        sp0: TmemSPResource,
+        sp1: TmemSPResource,
+        to: TmemOResource,
+        vd0: TmemStatsDoneResource,
+        vd1: TmemStatsDoneResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Shared-buffer captured schedule."""
+        mma_schedule_body(sq, skv, skv, sp0, sp1, to, vd0, vd1, wq)
+
+    @schedule
+    def mma_split_schedule(
+        sq: SmemQResource,
+        sk: SmemKVResource,
+        sv: SmemKVResource,
+        sp0: TmemSPResource,
+        sp1: TmemSPResource,
+        to: TmemOResource,
+        vd0: TmemStatsDoneResource,
+        vd1: TmemStatsDoneResource,
+        wq: WorkQueue | None = None,
+    ) -> None:
+        """Split K/V captured schedule."""
+        mma_schedule_body(sq, sk, sv, sp0, sp1, to, vd0, vd1, wq)
+
     captured_schedule = _schedule_with_work_queue(
-        mma_schedule,
+        mma_split_schedule if split_kv else mma_schedule,
         smem_q,
-        smem_k,
-        smem_v,
+        *kv_resources,
         tmem_sp0,
         tmem_sp1,
         tmem_o,

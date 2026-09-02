@@ -190,13 +190,18 @@ def _make_paged_context_case(
     head_dim: int,
     qkv_dtype: torch.dtype,
     mask_type: str,
+    v_dtype: Optional[torch.dtype] = None,
     page_size: int = 32,
     window_left: int = -1,
     output_dtype: Optional[torch.dtype] = None,
     output_scale: float = 0.75,
     seed: int = 0,
 ) -> _PagedContextCase:
-    """Create nonidentity HND pages and the matching packed logical tensors."""
+    """Create nonidentity HND pages and the matching packed logical tensors.
+
+    ``v_dtype`` overrides the V cache element type for mixed QK/PV cases. The
+    reference V is quantized the same way.
+    """
 
     q_lengths = tuple(int(length) for length in q_lengths)
     k_lengths = tuple(int(length) for length in k_lengths)
@@ -208,6 +213,8 @@ def _make_paged_context_case(
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(seed)
     input_scale = 0.125 if qkv_dtype == _FP8 else 0.2
+    if v_dtype is None:
+        v_dtype = qkv_dtype
 
     def random_tensor(shape: tuple[int, ...]) -> torch.Tensor:
         return (
@@ -264,7 +271,7 @@ def _make_paged_context_case(
     reference = _ContextCase(
         q=q,
         k=logical_k,
-        v=logical_v,
+        v=logical_v.to(v_dtype),
         qo_indptr=qo_indptr,
         kv_indptr=torch.tensor(
             _cumulative(k_lengths), dtype=torch.int32, device=device
@@ -280,7 +287,7 @@ def _make_paged_context_case(
     return _PagedContextCase(
         reference=reference,
         k_cache=k_staging.to(qkv_dtype),
-        v_cache=v_staging.to(qkv_dtype),
+        v_cache=v_staging.to(v_dtype),
         qo_indptr=qo_indptr,
         paged_kv_indptr=paged_kv_indptr,
         paged_kv_indices=paged_kv_indices,
@@ -412,7 +419,9 @@ def _assert_context_correct(
     assert torch.isfinite(actual.float()).all()
     # Select by the least precise input/output type. FP8 includes the kernel's
     # E4M3 probability quantization as well as optional E4M3 output rounding.
-    if case.q.dtype == _FP8 or case.output_dtype == _FP8:
+    # A QK-BF16/PV-FP8 case should use FP8 error as the E4M3 V cache and the kernel
+    # P-cast dominate the error budget.
+    if _FP8 in (case.q.dtype, case.v.dtype, case.output_dtype):
         rtol, atol, max_relative_l2 = 5e-2, 1.3e-1, 1e-1
     elif case.q.dtype == torch.bfloat16 or case.output_dtype == torch.bfloat16:
         rtol, atol, max_relative_l2 = 2e-2, 1e-2, 2e-2
@@ -2205,81 +2214,73 @@ def test_attention_ts_context_uniform_packed_window_offsets_accuracy():
     _assert_context_correct(wrapper.run(case.q, case.k, case.v), case)
 
 
-
+@pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
+@pytest.mark.parametrize("mask_type", ("dense", "causal"))
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_d128_qkbf16_pvfp8_dense_accuracy():
-    """QK-BF16/PV-FP8 mixed precision with d=128.
-    
-    Q/K stays BF16 and V is quantized to FP8 before the PV GEMM. 
-    This tests the k_dtype != v_dtype SMEM staging path across 
-    SmemKResource and SmemVResource.
+def test_attention_ts_context_qkbf16_pvfp8_accuracy(head_dim: int, mask_type: str):
+    """QK-BF16/PV-FP8 stays accurate on both D topologies and both masks.
+
+    Paired D128 runs the k_dtype != v_dtype staging path under the early
+    tile-sum cadence, staged D256 under the split head-dimension cadence.
     """
     case = _make_context_case(
         q_lengths=(64, 96),
         k_lengths=(192, 160),
         num_qo_heads=4,
         num_kv_heads=4,
-        head_dim=256,
+        head_dim=head_dim,
         qkv_dtype=torch.bfloat16,
         packed=True,
-        mask_type="causal",
+        mask_type=mask_type,
         output_dtype=torch.bfloat16,
         device="cuda",
-        seed=2026082701,
+        seed=2026082701 + head_dim,
     )
     case = replace(case, v=case.v.to(_FP8))
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, case)
-    actual = wrapper.run(case.q, case.k, case.v)
-    expected = _context_reference(case)
-    assert actual.shape == case.q.shape
-    assert actual.dtype == case.output_dtype
-    assert torch.isfinite(actual.float()).all()
-    # V's E4M3 quantization (both storage and the kernel's internal P-cast)
-    # dominates the error budget here, so use the FP8-tier tolerance
-    torch.testing.assert_close(actual.float(), expected, rtol=5e-2, atol=1.3e-1)
-    denominator = torch.linalg.vector_norm(expected).clamp_min(1e-6)
-    relative_l2 = torch.linalg.vector_norm(actual.float() - expected) / denominator
-    assert float(relative_l2) <= 1e-1
+    _assert_context_correct(wrapper.run(case.q, case.k, case.v), case)
 
 
+@pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
+@pytest.mark.parametrize("mask_type", ("dense", "causal"))
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_d256_qkbf16_pvfp8_dense_accuracy():
-    """QK-BF16/PV-FP8 mixed precision with d=256. 
-    
-    Q/K stays BF16 and V is quantized to FP8 before the PV GEMM. 
-    This tests the k_dtype != v_dtype SMEM staging path across 
-    SmemKResource and SmemVResource.
-    """
-    case = _make_context_case(
-        q_lengths=(64, 96),
-        k_lengths=(192, 160),
-        num_qo_heads=4,
-        num_kv_heads=4,
-        head_dim=256,
+def test_attention_ts_context_paged_qkbf16_pvfp8_accuracy(
+    head_dim: int, mask_type: str
+):
+    """A paged FP8 V cache reads through the same split staging path."""
+    case = _make_paged_context_case(
+        q_lengths=(33, 17),
+        k_lengths=(129, 97),
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=head_dim,
         qkv_dtype=torch.bfloat16,
-        packed=True,
-        mask_type="causal",
+        v_dtype=_FP8,
+        mask_type=mask_type,
         output_dtype=torch.bfloat16,
-        device="cuda",
-        seed=2026082701,
+        output_scale=1.0,
+        seed=2026082702 + head_dim,
     )
-    case = replace(case, v=case.v.to(_FP8))
-    wrapper = BatchPrefillTSWrapper()
-    _plan_wrapper(wrapper, case)
-    actual = wrapper.run(case.q, case.k, case.v)
-    expected = _context_reference(case)
-    assert actual.shape == case.q.shape
-    assert actual.dtype == case.output_dtype
-    assert torch.isfinite(actual.float()).all()
-    # V's E4M3 quantization (both storage and the kernel's internal P-cast)
-    # dominates the error budget here, so use the FP8-tier tolerance
-    torch.testing.assert_close(actual.float(), expected, rtol=5e-2, atol=1.3e-1)
-    denominator = torch.linalg.vector_norm(expected).clamp_min(1e-6)
-    relative_l2 = torch.linalg.vector_norm(actual.float() - expected) / denominator
-    assert float(relative_l2) <= 1e-1
+    wrapper = BatchPrefillPagedTSWrapper()
+    wrapper.plan(
+        case.reference.q,
+        case.k_cache,
+        case.v_cache,
+        case.qo_indptr,
+        case.paged_kv_indptr,
+        case.paged_kv_indices,
+        case.paged_kv_last_page_len,
+        page_size=case.page_size,
+        mask_type=case.reference.mask_type,
+        sm_scale=case.reference.sm_scale,
+        output_scale=case.reference.output_scale,
+        out_dtype=case.reference.output_dtype,
+    )
+    out = wrapper.run(case.reference.q, case.k_cache, case.v_cache)
+    _assert_context_correct(out, case.reference)
 
 
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
