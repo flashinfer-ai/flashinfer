@@ -137,6 +137,8 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
 
   const int num_tokens = static_cast<int>(q.size(0));
   const int num_heads = static_cast<int>(q.size(1));
+  TVM_FFI_ICHECK_EQ(indices.size(0), num_tokens)
+      << "indices leading dimension must match num_tokens";
   const int topk = static_cast<int>(indices.size(-1));
   const int d_qk = static_cast<int>(q.size(2));
   // This kernel serves the footer-scale model types. d_qk selects between them:
@@ -151,6 +153,9 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
       << "decode-dsv4 (dots3_swa) requires topk >= 513 to hold the 513-wide "
          "sliding window; got indices width topk="
       << topk;
+  TVM_FFI_ICHECK(mt != ModelType::DOTS3_SWA || !extra_kv_cache.has_value())
+      << "decode-dsv4 (dots3_swa) has no dual-cache form; extra_kv_cache is "
+         "DSV4-only";
 
   // topk_length is optional for DOTS3_SWA: DecodeTileCfg<DOTS3_SWA>::WINDOW caps
   // the per-token candidate count inside the kernel, so omitting it costs
@@ -190,6 +195,8 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
     const auto& ekv = extra_kv_cache.value();
     const auto& eidx = extra_indices.value();
     CHECK_INPUT_TYPE(eidx, dl_int32);
+    TVM_FFI_ICHECK_EQ(eidx.size(0), num_tokens)
+        << "extra_indices leading dimension must match num_tokens";
     TVM_FFI_ICHECK_EQ(eidx.stride(-1), 1) << "extra_indices last dimension must be contiguous";
     extra_topk_arg = static_cast<int>(eidx.size(-1));
     stride_extra_indices_token = static_cast<size_t>(eidx.stride(0));
@@ -246,6 +253,8 @@ void SparseMlaSm120DecodeDsv3_2(TensorView q, TensorView kv_cache, TensorView in
 
   const int num_tokens = static_cast<int>(q.size(0));
   const int num_heads = static_cast<int>(q.size(1));
+  TVM_FFI_ICHECK_EQ(indices.size(0), num_tokens)
+      << "indices leading dimension must match num_tokens";
   const int topk = static_cast<int>(indices.size(-1));
   const int d_qk = static_cast<int>(q.size(2));
   const auto mt = static_cast<ModelType>(model_type);

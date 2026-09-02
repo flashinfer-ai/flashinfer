@@ -166,6 +166,10 @@ bool launch_sparse_mla_decode_dsv4(
     float sm_scale, size_t stride_kv_block, size_t stride_indices_token,
     size_t stride_extra_indices_token, size_t stride_out_lse, cudaStream_t stream) {
   if (mt != ModelType::DSV4 && mt != ModelType::DOTS3_SWA) return false;
+  // DOTS3_SWA has no dual-cache instantiation; the planner never routes one
+  // here, and the launcher rejects it so a direct FFI caller cannot silently
+  // run an untested path.
+  if (mt == ModelType::DOTS3_SWA && extra_KV_cache != nullptr) return false;
   if (page_block_size != 64) return false;
   if (num_splits <= 0) return false;
   if (num_heads < 1 || num_heads > 128) return false;

@@ -596,6 +596,104 @@ def test_sparse_mla_sm120_decode_dsv4_padded_row_rejected() -> None:
         )
 
 
+def test_sparse_mla_sm120_decode_dsv4_indices_rows_checked() -> None:
+    """The decode binding rejects an indices tensor whose leading dimension
+    does not match num_tokens (mirrors the prefill-side guard)."""
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk = d_v = 512
+    page_block_size, num_blocks, topk = 64, 64, 640
+    num_tokens, num_heads = 8, 64
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dsv4(kv_bf16)
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0,
+        num_blocks * page_block_size,
+        (num_tokens, topk),
+        device=device,
+        dtype=torch.int32,
+    )
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+
+    with pytest.raises(
+        RuntimeError, match="indices leading dimension must match num_tokens"
+    ):
+        sparse_mla_sm120_paged_attention(
+            q,
+            kv_packed,
+            indices[: num_tokens - 1],
+            output,
+            out_lse,
+            d_qk**-0.5,
+            d_v=d_v,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+        )
+
+
+def test_sparse_mla_sm120_decode_dsv4_dots3_swa_rejects_dual_cache() -> None:
+    """DOTS3_SWA has no dual-cache instantiation; the standalone decode entry
+    rejects extra_kv_cache instead of running an untested path."""
+    from flashinfer.mla import _sparse_mla_sm120 as sm
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    d_qk, d_v, topk = 1088, 1024, 576
+    page_block_size, num_blocks, num_tokens, num_heads = 64, 64, 8, 16
+
+    kv_bf16 = (
+        torch.randn(
+            num_blocks, page_block_size, 1, d_qk, device=device, dtype=torch.bfloat16
+        )
+        / 10.0
+    ).clamp(-1, 1)
+    kv_packed = quantize_kv_dots3_swa(kv_bf16)
+    q = (
+        torch.randn(num_tokens, num_heads, d_qk, device=device, dtype=torch.bfloat16)
+        / 10.0
+    ).clamp(-1, 1)
+    indices = torch.randint(
+        0,
+        num_blocks * page_block_size,
+        (num_tokens, topk),
+        device=device,
+        dtype=torch.int32,
+    )
+    output = torch.zeros(
+        (num_tokens, num_heads, d_v), dtype=torch.bfloat16, device=device
+    )
+    out_lse = torch.zeros((num_tokens, num_heads), dtype=torch.float32, device=device)
+    mid_out, mid_lse = _make_decode_scratch(num_tokens, num_heads, topk, d_v, device)
+
+    with pytest.raises(RuntimeError, match="no dual-cache form"):
+        sm.sparse_mla_sm120_decode_dsv4(
+            q,
+            kv_packed,
+            indices,
+            mid_out,
+            mid_lse,
+            output,
+            out_lse,
+            d_qk**-0.5,
+            extra_kv_cache=kv_packed,
+            extra_indices=indices,
+        )
+
+
 @pytest.mark.parametrize("num_heads", [8, 64])
 def test_sparse_mla_sm120_decode_dots3_swa_no_topk_length(num_heads: int) -> None:
     """DOTS3_SWA with -1 padding and no topk_length.
