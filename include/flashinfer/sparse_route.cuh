@@ -302,8 +302,15 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
         // The page id keeps its own width until it is bounded, and the slot is
         // formed in 64 bits: page * page_size overflows a uint32 long before
         // either factor does, and a wrapped product can land under num_slots.
+        //
+        // What bounds the page is the slot space, not an int32. A route of
+        // int64 can hold a slot of 2^31 and the caller is allowed to ask for
+        // one, so capping the page at INT32_MAX would mask a page it is
+        // entitled to. The cap is the largest page whose first slot is still
+        // inside num_slots, which is also what keeps the product below 64 bits.
+        const uint64_t max_page = (static_cast<uint64_t>(num_slots) - 1) / page_size;
         const IdType page = row_table[logical_page];
-        if (page >= IdType(0) && page <= kInt32Max) {
+        if (page >= IdType(0) && static_cast<uint64_t>(page) <= max_page) {
           const uint64_t candidate =
               static_cast<uint64_t>(page) * page_size + static_cast<uint32_t>(token) % page_size;
           if (candidate < static_cast<uint64_t>(num_slots)) {
@@ -393,8 +400,12 @@ __global__ void __launch_bounds__(THREADS)
         uint32_t logical_page, entry;
         page_size.divmod(static_cast<uint32_t>(token), logical_page, entry);
         if (logical_page < table_width) {
+          // Bounded by the slot space rather than by an int32, for the same
+          // reason as the fused kernel above.
+          const uint64_t max_page =
+              (static_cast<uint64_t>(num_slots) - 1) / static_cast<uint32_t>(page_size);
           const IdType page = row_table[logical_page];
-          if (page >= IdType(0) && page <= kInt32Max) {
+          if (page >= IdType(0) && static_cast<uint64_t>(page) <= max_page) {
             const uint64_t candidate =
                 static_cast<uint64_t>(page) * static_cast<uint32_t>(page_size) + entry;
             if (candidate < static_cast<uint64_t>(num_slots)) {
