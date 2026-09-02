@@ -428,7 +428,8 @@ def test_expand_block_route_takes_a_value_at_the_top_of_the_int32_range(field):
     torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
-def test_qsa_route_from_logical_does_not_let_a_slot_wrap_into_range():
+@pytest.mark.parametrize("path", ["logical", "blocks"])
+def test_qsa_route_does_not_let_a_slot_wrap_into_range(path):
     """The physical slot is page * page_size + entry. Both factors fit a uint32
     while their product does not, and a product computed in 32 bits wraps to a
     small number that passes the num_slots bound -- page 65536 of a 65536-entry
@@ -438,20 +439,46 @@ def test_qsa_route_from_logical_does_not_let_a_slot_wrap_into_range():
     the multiply lets it through and the width of the multiply is what decides
     the case. That needs the largest slot space a route can be given, which is
     an int64 one.
-    """
-    page_size, num_slots, width = 65536, 4294967295, 8
-    rows = 1
-    logical = torch.arange(width, dtype=torch.int64, device=DEV).reshape(rows, width)
-    token_to_req = torch.zeros(rows, dtype=torch.int64, device=DEV)
-    # One page, mapped to a page id whose product with the page size is 2^32.
-    table = torch.tensor([[65536]], dtype=torch.int64, device=DEV)
-    nbytes = -(-width // 8)
-    route = torch.empty(rows, width, dtype=torch.int64, device=DEV)
-    mask = torch.empty(rows * nbytes, dtype=torch.uint8, device=DEV)
 
-    flashinfer.qsa_route_from_logical(
-        logical, token_to_req, table, route, mask, rows, page_size, num_slots
-    )
+    Both paths, because the fused kernel carries its own copy of the multiply:
+    narrowing one of them is not caught by exercising the other.
+    """
+    page_size, num_slots = 65536, 4294967295
+    big_page = 65536  # times the page size, exactly 2^32
+    if path == "logical":
+        width = 8
+        logical = torch.arange(width, dtype=torch.int64, device=DEV).reshape(1, width)
+        token_to_req = torch.zeros(1, dtype=torch.int64, device=DEV)
+        table = torch.tensor([[big_page]], dtype=torch.int64, device=DEV)
+        route = torch.empty(1, width, dtype=torch.int64, device=DEV)
+        mask = torch.empty(-(-width // 8), dtype=torch.uint8, device=DEV)
+        flashinfer.qsa_route_from_logical(
+            logical, token_to_req, table, route, mask, 1, page_size, num_slots
+        )
+    else:
+        ratio = 1
+        width = 4 * ratio + ratio - 1
+        blocks = torch.zeros(1, 4, dtype=torch.int64, device=DEV)
+        positions = torch.tensor([7], dtype=torch.int64, device=DEV)
+        lengths = torch.tensor([8], dtype=torch.int64, device=DEV)
+        token_to_req = torch.zeros(1, dtype=torch.int64, device=DEV)
+        table = torch.tensor([[big_page]], dtype=torch.int64, device=DEV)
+        logical = torch.empty(1, width, dtype=torch.int64, device=DEV)
+        route = torch.empty(1, width, dtype=torch.int64, device=DEV)
+        mask = torch.empty(-(-width // 8), dtype=torch.uint8, device=DEV)
+        flashinfer.qsa_route_from_blocks(
+            blocks,
+            positions,
+            lengths,
+            token_to_req,
+            table,
+            logical,
+            route,
+            mask,
+            ratio,
+            page_size,
+            num_slots,
+        )
     torch.cuda.synchronize()
     assert int(mask[0]) == 0, (
         f"a slot past num_slots was accepted: route={route.tolist()} mask={mask.tolist()}"
