@@ -62,6 +62,7 @@ _EVOLUTION_POLICIES = {
     "direct_m128_generic",
     "direct_m128_h96_commit_order",
     "persistent_m128_h64_lpt",
+    "persistent_m128_h96_lpt",
     "direct_vtile_m128_generic",
     "direct_vtile_m128_h64_gate_order",
     "persistent_vtile_m128_h96_six_task",
@@ -201,7 +202,7 @@ def _resolve_source(csrc_dir: Path, raw_path: object, label: str) -> Path:
 
 @functools.cache
 def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
-    """Load and verify the complete 89-shape, 60-module source closure."""
+    """Load and verify the complete manifest-sealed source closure."""
 
     csrc_dir = get_kda_csrc_dir()
     payload: Any = json.loads((csrc_dir / _MANIFEST).read_text())
@@ -262,7 +263,7 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
     )
 
     files = payload.get("files")
-    _require(isinstance(files, list) and len(files) == 68, "file inventory mismatch")
+    _require(isinstance(files, list) and files, "file inventory missing")
     file_sha256: dict[str, str] = {}
     for index, item in enumerate(files):
         _require(isinstance(item, dict), f"files[{index}] must be an object")
@@ -281,11 +282,12 @@ def get_cake_kda_module_specs() -> tuple[CakeKDAModuleSpec, ...]:
         file_sha256[raw_path] = digest
 
     modules = payload.get("modules")
-    _require(
-        isinstance(modules, list) and len(modules) == 60, "module inventory mismatch"
-    )
     target_by_arch = {arch: target for target, arch in _TARGET_ARCH.items()}
     expected = _expected_module_keys()
+    _require(
+        isinstance(modules, list) and len(modules) == len(expected),
+        "module inventory does not match the expected route set",
+    )
     observed: set[tuple[str, str, str, str]] = set()
     specs: list[CakeKDAModuleSpec] = []
     for index, item in enumerate(modules):
@@ -542,7 +544,7 @@ def get_cake_kda_sequence_specs() -> tuple[CakeKDASequenceSpec, ...]:
 
 def cake_kda_is_available() -> bool:
     return (
-        len(get_cake_kda_module_specs()) == 60
+        len(get_cake_kda_module_specs()) == len(_expected_module_keys())
         and len(get_cake_kda_sequence_specs()) == 4
     )
 

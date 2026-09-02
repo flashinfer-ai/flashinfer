@@ -197,6 +197,13 @@ def _valid_cake_kda_shared_selector_kwargs(
             152,
         ),
         (
+            (1300, 547, 2048, 963, 271, 3063),
+            96,
+            False,
+            "persistent_m128_h96_lpt",
+            152,
+        ),
+        (
             (8192, 4096, 2048, 1024, 512, 256),
             96,
             False,
@@ -206,7 +213,7 @@ def _valid_cake_kda_shared_selector_kwargs(
         ((15, 14, 13, 12), 4, False, "direct_m128_generic", 16),
     ),
 )
-def test_cake_kda_shared_selector_reuses_eight_physical_policies(
+def test_cake_kda_shared_selector_reuses_variable_shape_physical_policies(
     sequence_lengths, num_heads, fixed_layout, expected_policy, grid_x
 ):
     kwargs = _valid_cake_kda_shared_selector_kwargs(
@@ -219,8 +226,13 @@ def test_cake_kda_shared_selector_reuses_eight_physical_policies(
     assert route.policy == expected_policy
     assert route.grid_x == grid_x
     assert sorted(route.sequence_order) == list(range(len(sequence_lengths)))
-    if expected_policy == "persistent_m128_h64_lpt":
-        expected_chunks = sum((length + 31) // 32 for length in sequence_lengths) * 64
+    if expected_policy in {
+        "persistent_m128_h64_lpt",
+        "persistent_m128_h96_lpt",
+    }:
+        expected_chunks = (
+            sum((length + 31) // 32 for length in sequence_lengths) * num_heads
+        )
         assert len(route.tile_schedule_counts) == grid_x
         assert sum(route.tile_schedule_counts) == expected_chunks
         assert len(route.tile_schedule) == grid_x * route.schedule_stride

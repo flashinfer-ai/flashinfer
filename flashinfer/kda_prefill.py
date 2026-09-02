@@ -892,16 +892,16 @@ def _select_cake_kda_bounded_evolution_route(
         < 256
     )
     if use_persistent_scalar:
-        # The exported closure contains the measured H64 persistent policy.
-        # Other persistent-policy combinations fail closed to the incumbent.
-        if num_heads != 64:
-            return None
         schedule, counts, stride = _build_cake_kda_shared_scalar_schedule(
             sequence_lengths, num_heads, persistent_ctas
         )
         return _CakeKDABoundedEvolutionRoute(
             target=target,
-            policy="persistent_m128_h64_lpt",
+            policy=(
+                "persistent_m128_h64_lpt"
+                if num_heads == 64
+                else "persistent_m128_h96_lpt"
+            ),
             sequence_order=sequence_order,
             grid_x=persistent_ctas,
             tile_schedule=schedule,
@@ -3954,6 +3954,7 @@ def _run_cake_kda_bounded_evolution(
         "direct_m128_generic",
         "direct_m128_h96_commit_order",
         "persistent_m128_h64_lpt",
+        "persistent_m128_h96_lpt",
     ):
         tile_schedule = (
             _cached_int32_metadata(
