@@ -129,12 +129,30 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
   const uint32_t row = blockIdx.x;
   if (row >= rows) return;
 
-  const int32_t request = static_cast<int32_t>(token_to_req[row]);
-  const bool request_valid = request >= 0 && request < static_cast<int32_t>(num_requests);
-  const int32_t safe_request = min(max(request, 0), static_cast<int32_t>(num_requests) - 1);
-  const int32_t query_position = static_cast<int32_t>(query_positions[row]);
-  const int32_t sequence_length =
-      request_valid ? static_cast<int32_t>(sequence_lengths[safe_request]) : 0;
+  // The index tensors may be int64 and everything below is int32, so each value
+  // is bounded in its own width before it is narrowed.
+  //
+  // The request and the page ids were already safe by construction: they are
+  // compared against their counts in IdType, which rejects anything an int32
+  // could not hold before the cast happens. The position was not -- nothing
+  // bounded it from above, and a position of exactly 2^32 narrows to zero,
+  // which is a query that sees nothing where it should have been rejected. The
+  // explicit bound is kept on all three so the next one cannot regress
+  // silently.
+  constexpr IdType kInt32Max = static_cast<IdType>(2147483647);
+  const IdType request_raw = token_to_req[row];
+  const bool request_valid = request_raw >= IdType(0) && request_raw <= kInt32Max &&
+                             request_raw < static_cast<IdType>(num_requests);
+  const int32_t request = request_valid ? static_cast<int32_t>(request_raw) : -1;
+  const int32_t safe_request =
+      request_valid ? min(request, static_cast<int32_t>(num_requests) - 1) : 0;
+  const IdType position_raw = query_positions[row];
+  const int32_t query_position = (position_raw >= IdType(0) && position_raw <= kInt32Max)
+                                     ? static_cast<int32_t>(position_raw)
+                                     : -1;
+  IdType length_raw = request_valid ? sequence_lengths[safe_request] : IdType(0);
+  if (length_raw < IdType(0) || length_raw > kInt32Max) length_raw = IdType(0);
+  const int32_t sequence_length = request_valid ? static_cast<int32_t>(length_raw) : 0;
 
   // A query sees only the compressed entries whose tokens are all behind it.
   // Clamp before the unsigned divide: a row with no request carries a length of
@@ -198,9 +216,12 @@ __global__ void __launch_bounds__(WARPS * 32) SparsePagedScoresKernel(
       uint32_t logical_page;
       page_size.divmod(column, logical_page, entry);
       if (logical_page < table_width) {
-        const int32_t mapped =
-            static_cast<int32_t>(page_table[safe_request * stride_table_req + logical_page]);
-        if (mapped >= 0 && mapped < static_cast<int32_t>(num_pages)) page = mapped;
+        // Bounded in the table's own width before it is narrowed: a page id
+        // past an int32 would wrap into a mapped-looking one.
+        const IdType mapped = page_table[safe_request * stride_table_req + logical_page];
+        if (mapped >= IdType(0) && mapped <= kInt32Max && mapped < static_cast<IdType>(num_pages)) {
+          page = static_cast<int32_t>(mapped);
+        }
       }
     }
     bases_smem[i] =
